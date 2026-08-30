@@ -5,7 +5,8 @@
 //! 传播真假事实。事实只改写 `not/and/or` 条件骨架，不进入值表达式，也不把 truthy 原值
 //! 替换成布尔结果。proto 若仍有活跃 goto/label 流，则只分析与它隔离的结构化子树与
 //! 连续 clean fallthrough run；clean `If` arm 及其 tainted child 前缀可继承唯一入口的
-//! header truthiness，遇到活跃 label/goto 后立即清空，出口事实也不会泄漏回污染父级。
+//! header truthiness。当前 block 的 direct goto 与单臂 goto guard 会为前向 label 合流完整
+//! predecessor facts；复杂嵌套或后向入边仍清空，出口事实也不会泄漏回污染父级。
 //!
 //! 例如 `if flag then break end; if flag then body end` 可删除第二个分支；若 flag 可能被
 //! 赋值、闭包回写则仍保守停用。被引用 label 与任意 goto 会污染所在结构化祖先，未引用
@@ -14,11 +15,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirUnaryOpKind, LocalId, ParamId,
+    HirBlock, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirProto, HirStmt, HirUnaryOpKind,
+    LocalId, ParamId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::expr_facts::expr_truthiness;
+use super::super::label_refs::count_label_references;
 use super::super::logical_simplify::{
     simplify_condition_truthiness_shape_with_safety, simplify_logical_shape_with_safety,
 };
@@ -162,6 +165,12 @@ struct Flow {
     falls_through: bool,
 }
 
+#[derive(Default)]
+struct LabelPredecessors {
+    accounted_refs: usize,
+    reachable_facts: Vec<PathFacts>,
+}
+
 pub(super) fn specialize_stable_path_conditions(
     proto: &mut HirProto,
     discard_facts: &DiscardBoundaryFacts,
@@ -199,6 +208,8 @@ fn rewrite_clean_islands_in_tainted_block(
     discard_facts: &DiscardBoundaryFacts,
     changed: &mut bool,
 ) {
+    let label_refs = count_label_references(&block.stmts);
+    let mut label_predecessors = BTreeMap::<HirLabelId, LabelPredecessors>::new();
     let mut run_facts = Some(entry_facts);
     for stmt in &mut block.stmts {
         if !discard_facts.stmt_boundary(stmt).has_live_label_flow() {
@@ -214,10 +225,76 @@ fn rewrite_clean_islands_in_tainted_block(
             continue;
         }
 
-        // 分析停用[ProofIncomplete]：活跃 label graph 缺少 predecessor facts 合流；clean `If` arm 由唯一结构化入口单独消费 header facts，含 label/goto 的子图仍从空事实递归（regress_374）。
+        if let HirStmt::Goto(goto) = stmt {
+            let predecessor = label_predecessors.entry(goto.target).or_default();
+            predecessor.accounted_refs += 1;
+            predecessor.reachable_facts.extend(run_facts.take());
+            continue;
+        }
+
+        if let Some((target, goto_truthy)) = single_guarded_goto(stmt) {
+            let predecessor = label_predecessors.entry(target).or_default();
+            predecessor.accounted_refs += 1;
+            let mut fallthrough_facts = None;
+            if let Some(entry_facts) = run_facts.take() {
+                predecessor.reachable_facts.extend(facts_for_condition(
+                    &entry_facts,
+                    if_condition(stmt),
+                    goto_truthy,
+                    stable,
+                ));
+                fallthrough_facts =
+                    facts_for_condition(&entry_facts, if_condition(stmt), !goto_truthy, stable);
+            }
+            rewrite_clean_child_blocks(stmt, stable, discard_facts, changed);
+            run_facts = fallthrough_facts;
+            continue;
+        }
+
+        if let HirStmt::Label(label) = stmt {
+            let mut predecessor = label_predecessors.remove(&label.id).unwrap_or_default();
+            let all_refs = label_refs.get(&label.id).copied().unwrap_or_default();
+            if predecessor.accounted_refs == all_refs {
+                predecessor.reachable_facts.extend(run_facts.take());
+                run_facts = (!predecessor.reachable_facts.is_empty())
+                    .then(|| PathFacts::intersection(predecessor.reachable_facts));
+            } else {
+                // 候选拒绝[ProofIncomplete]：该 label 仍有复杂嵌套或后向 predecessor，当前
+                // block 的单向 transfer 尚未为每条引用生成出口事实，不能只合流已见入边。
+                run_facts = Some(PathFacts::default());
+            }
+            continue;
+        }
+
+        // 候选拒绝[ProofIncomplete]：复杂活跃 child graph 尚无逐出口 predecessor facts；
+        // clean `If` arm 仍可由唯一结构化入口消费 header facts（regress_374）。
         rewrite_clean_child_blocks(stmt, stable, discard_facts, changed);
         run_facts = Some(PathFacts::default());
     }
+}
+
+fn single_guarded_goto(stmt: &HirStmt) -> Option<(HirLabelId, bool)> {
+    let HirStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    match (
+        if_stmt.then_block.stmts.as_slice(),
+        if_stmt
+            .else_block
+            .as_ref()
+            .map(|block| block.stmts.as_slice()),
+    ) {
+        ([HirStmt::Goto(goto)], None | Some([])) => Some((goto.target, true)),
+        ([], Some([HirStmt::Goto(goto)])) => Some((goto.target, false)),
+        _ => None,
+    }
+}
+
+fn if_condition(stmt: &HirStmt) -> &HirExpr {
+    let HirStmt::If(if_stmt) = stmt else {
+        unreachable!("single guarded goto must be an if")
+    };
+    &if_stmt.cond
 }
 
 fn rewrite_clean_child_blocks(

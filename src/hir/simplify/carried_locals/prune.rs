@@ -259,19 +259,28 @@ fn prune_dead_for_binding_temp_mirror_components(
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
-    if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
-        return false;
-    }
-
     let mut changed = false;
     let old_targets = std::mem::take(&mut assign.targets);
     let old_values = std::mem::take(&mut assign.values.fixed);
     let mut new_targets = Vec::with_capacity(old_targets.len());
     let mut new_values = Vec::with_capacity(old_values.len());
+    let mut removed_pairs = Vec::new();
+    let mut targets = old_targets.into_iter();
+    let mut values = old_values.into_iter();
 
-    for (target, value) in old_targets.into_iter().zip(old_values) {
+    loop {
+        let Some(target) = targets.next() else {
+            new_values.extend(values);
+            break;
+        };
+        let Some(value) = values.next() else {
+            new_targets.push(target);
+            new_targets.extend(targets);
+            break;
+        };
         // 逐对移除是安全的：被删 RHS 只是纯 LocalRef，target temp 又已证明无读者，
-        // 因此不会改变其余并行分量的求值、副作用或相互可见顺序。
+        // 因此不会改变其余并行分量的求值、副作用或相互可见顺序。fixed pair 与
+        // target 同时缩短后，后续 fixed/open-tail 的投影位置保持不变。
         if dead_for_binding_temp_mirror_can_be_pruned(
             &target,
             &value,
@@ -282,10 +291,27 @@ fn prune_dead_for_binding_temp_mirror_components(
             promotion_facts,
         ) {
             changed = true;
+            removed_pairs.push((target, value));
             continue;
         }
         new_targets.push(target);
         new_values.push(value);
+    }
+
+    if changed && new_targets.is_empty() && (!new_values.is_empty() || assign.values.tail.is_some())
+    {
+        // 零 target assign 会由后续空赋值裁剪整句；若值包仍有额外 fixed/open tail，
+        // 删除最后一个 mirror 会连带丢失这些表达式的求值。此时保持原赋值。
+        assign.targets = removed_pairs
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect();
+        assign.values.fixed = removed_pairs
+            .into_iter()
+            .map(|(_, value)| value)
+            .chain(new_values)
+            .collect();
+        return false;
     }
 
     assign.targets = new_targets;
@@ -321,7 +347,8 @@ fn dead_for_binding_temp_mirror_can_be_pruned(
         return false;
     }
     if write_audit.has_unproven_write(*temp) {
-        // 候选拒绝[ProofIncomplete]：至少一次写缺少 fixed-arity 对位或 trusted exact-home，无法证明该 temp 的所有写都由本事务删除。
+        // 候选拒绝[ProofIncomplete]：至少一次显式 mirror 写缺少 trusted exact-home，
+        // 无法证明该 temp 的所有写都属于同一物理 for-binding 事务。
         return false;
     }
 
@@ -344,7 +371,7 @@ impl TempWriteAudit {
             MirrorWriteDisposition::Survives => {
                 self.surviving_writes.insert(temp);
             }
-            MirrorWriteDisposition::ProofIncomplete => {
+            MirrorWriteDisposition::UnknownHome => {
                 self.unproven_writes.insert(temp);
             }
         }
@@ -369,7 +396,7 @@ impl TempWriteAudit {
 enum MirrorWriteDisposition {
     Prunable,
     Survives,
-    ProofIncomplete,
+    UnknownHome,
 }
 
 fn collect_temp_write_audit_in_proto(
@@ -474,17 +501,14 @@ fn note_assign_writes(
     active_for_bindings: &BTreeSet<LocalId>,
     audit: &mut TempWriteAudit,
 ) {
-    if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
-        for target in &assign.targets {
-            if let HirLValue::Temp(temp) = target {
-                audit.note_write(*temp, MirrorWriteDisposition::ProofIncomplete);
-            }
-        }
-        return;
-    }
-
-    for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+    for (index, target) in assign.targets.iter().enumerate() {
         let HirLValue::Temp(temp) = target else {
+            continue;
+        };
+        let Some(value) = assign.values.fixed.get(index) else {
+            // 候选拒绝[SemanticBarrier:ValueArity]：该 target 从 open tail 或 closed nil
+            // padding 取值，不是显式 `LocalRef(for_binding)` mirror；写入必须保留。
+            audit.note_write(*temp, MirrorWriteDisposition::Survives);
             continue;
         };
         let disposition =
@@ -505,19 +529,17 @@ fn mirror_write_disposition(
     if !active_for_bindings.contains(local) || !promotion_facts.is_loop_carrier_temp(*temp) {
         return MirrorWriteDisposition::Survives;
     }
-    let (Some(target), Some(source)) = (
-        carry_binding_from_lvalue(target),
-        carry_binding_from_expr(value),
-    ) else {
-        return MirrorWriteDisposition::ProofIncomplete;
-    };
+    let target =
+        carry_binding_from_lvalue(target).expect("temp mirror target must have a carry binding");
+    let source =
+        carry_binding_from_expr(value).expect("local mirror source must have a carry binding");
     match (
         binding_home_slot(target, promotion_facts),
         binding_home_slot(source, promotion_facts),
     ) {
         (Some(target), Some(source)) if target == source => MirrorWriteDisposition::Prunable,
         (Some(_), Some(_)) => MirrorWriteDisposition::Survives,
-        _ => MirrorWriteDisposition::ProofIncomplete,
+        _ => MirrorWriteDisposition::UnknownHome,
     }
 }
 
@@ -1095,4 +1117,81 @@ fn redundant_self_assign_binding(target: &HirLValue, value: &HirExpr) -> Option<
 
 fn is_empty_assign_stmt(stmt: &HirStmt) -> bool {
     matches!(stmt, HirStmt::Assign(assign) if assign.targets.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirPackTail, HirValuePack};
+    use crate::hir::promotion::HomeSlotKey;
+
+    fn mirror_facts(temp: TempId, local: LocalId) -> ProtoPromotionFacts {
+        let mut facts = ProtoPromotionFacts::default();
+        let home = HomeSlotKey::new(0, 0);
+        facts.record_temp_home_slot_for_test(temp, home);
+        facts.record_local_home_slot(local, home);
+        facts.record_loop_carrier_temp_for_test(temp);
+        facts
+    }
+
+    fn prunable_audit(temp: TempId) -> TempWriteAudit {
+        let mut audit = TempWriteAudit::default();
+        audit.note_write(temp, MirrorWriteDisposition::Prunable);
+        audit
+    }
+
+    #[test]
+    fn dead_mirror_component_preserves_open_tail_projection() {
+        let mirror = TempId(0);
+        let tail_target = TempId(1);
+        let binding = LocalId(0);
+        let tail = HirPackTail::open(HirExpr::VarArg);
+        let mut stmt = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(mirror), HirLValue::Temp(tail_target)],
+            values: HirValuePack::expanding(vec![HirExpr::LocalRef(binding)], tail.clone()),
+        }));
+        let facts = mirror_facts(mirror, binding);
+
+        assert!(prune_dead_for_binding_temp_mirror_components(
+            &mut stmt,
+            &BTreeSet::new(),
+            &prunable_audit(mirror),
+            &[false, false],
+            &BTreeSet::from([binding]),
+            &facts,
+        ));
+
+        assert_eq!(
+            stmt,
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(tail_target)],
+                values: HirValuePack::expanding(Vec::new(), tail),
+            }))
+        );
+    }
+
+    #[test]
+    fn last_dead_mirror_keeps_residual_open_tail_evaluation() {
+        let mirror = TempId(0);
+        let binding = LocalId(0);
+        let mut stmt = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(mirror)],
+            values: HirValuePack::expanding(
+                vec![HirExpr::LocalRef(binding)],
+                HirPackTail::open(HirExpr::VarArg),
+            ),
+        }));
+        let before = stmt.clone();
+        let facts = mirror_facts(mirror, binding);
+
+        assert!(!prune_dead_for_binding_temp_mirror_components(
+            &mut stmt,
+            &BTreeSet::new(),
+            &prunable_audit(mirror),
+            &[false],
+            &BTreeSet::from([binding]),
+            &facts,
+        ));
+        assert_eq!(stmt, before);
+    }
 }

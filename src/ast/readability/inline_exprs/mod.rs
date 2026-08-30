@@ -124,6 +124,10 @@ impl BindingWriteIndex {
             .is_some_and(|(_, last_write)| *last_write > stmt_index)
     }
 
+    fn writes_only_at(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
+        self.write_bounds_by_binding.get(&binding) == Some(&(stmt_index, stmt_index))
+    }
+
     fn name_has_write_after(&self, stmt_index: usize, name: &AstNameRef) -> bool {
         self.write_bounds_by_name
             .get(name)
@@ -294,6 +298,16 @@ fn rewrite_current_block(
         } else {
             InlinePolicy::Conservative
         };
+        if matches!(policy, InlinePolicy::AliasInitializerChain)
+            && alias_initializer_shortens_root(&old_stmts, index + 1, value, &write_index)
+        {
+            // 候选拒绝[SemanticBarrier:Lifetime]：删除 source declaration 后，sink 的后续
+            // 覆盖会提前释放原 source root。只有 `if sink == nil then sink = ... end`
+            // 能证明发生覆盖的路径旧值必为 nil；regress_36 是该安全反例。
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
         if matches!(policy, InlinePolicy::AliasInitializerChain)
             && candidate::is_lookup_inline_expr(value)
             && stmt_starts_lookup_mechanical_run(&old_stmts, index, candidate.binding())
@@ -469,6 +483,60 @@ fn rewrite_current_block(
         trailing_condition,
     );
     changed
+}
+
+fn alias_initializer_shortens_root(
+    stmts: &[AstStmt],
+    sink_index: usize,
+    value: &AstExpr,
+    write_index: &BindingWriteIndex,
+) -> bool {
+    if result_cannot_root_collectable(value) {
+        return false;
+    }
+    let Some((sink, _)) = stmts.get(sink_index).and_then(inline_candidate) else {
+        return false;
+    };
+    write_index.has_write_after(sink_index, sink.binding())
+        && !alias_sink_has_nil_only_overwrite(stmts, sink_index, sink.binding(), write_index)
+}
+
+fn alias_sink_has_nil_only_overwrite(
+    stmts: &[AstStmt],
+    sink_index: usize,
+    sink: AstBindingRef,
+    write_index: &BindingWriteIndex,
+) -> bool {
+    let Some(fallback_index) = sink_index.checked_add(1) else {
+        return false;
+    };
+    if !write_index.writes_only_at(fallback_index, sink) {
+        return false;
+    }
+    let Some(AstStmt::If(if_stmt)) = stmts.get(fallback_index) else {
+        return false;
+    };
+    if if_stmt.else_block.is_some() || !condition_is_binding_nil(&if_stmt.cond, sink) {
+        return false;
+    }
+    let [AstStmt::Assign(assign)] = if_stmt.then_block.stmts.as_slice() else {
+        return false;
+    };
+    matches!(assign.targets.as_slice(), [AstLValue::Name(name)] if sink.matches_name_ref(name))
+        && assign.values.len() == 1
+}
+
+fn condition_is_binding_nil(condition: &AstExpr, binding: AstBindingRef) -> bool {
+    let AstExpr::Binary(binary) = condition else {
+        return false;
+    };
+    if binary.op != crate::ast::common::AstBinaryOpKind::Eq {
+        return false;
+    }
+    (matches!(&binary.lhs, AstExpr::Var(name) if binding.matches_name_ref(name))
+        && matches!(&binary.rhs, AstExpr::Nil))
+        || (matches!(&binary.rhs, AstExpr::Var(name) if binding.matches_name_ref(name))
+            && matches!(&binary.lhs, AstExpr::Nil))
 }
 
 /// 收回跨越无关语句的稳定 local copy 与无事件 truthiness 快照。
@@ -1080,6 +1148,37 @@ mod tests {
                     if call.args == vec![AstExpr::Var(source.to_name_ref())])
                     && ret.values == vec![AstExpr::Var(source.to_name_ref())]
         ));
+    }
+
+    #[test]
+    fn adjacent_alias_keeps_source_root_when_sink_is_unconditionally_overwritten() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let sink = AstBindingRef::Local(LocalId(1));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(
+                    source,
+                    AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                        text: "value".to_owned(),
+                    })),
+                ),
+                recovered_local(sink, AstExpr::Var(source.to_name_ref())),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(sink.to_name_ref())],
+                    values: vec![AstExpr::Nil],
+                })),
+            ],
+        };
+        let original = block.clone();
+
+        assert!(!rewrite_current_block(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(block, original);
     }
 
     #[test]

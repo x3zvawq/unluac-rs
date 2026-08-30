@@ -445,6 +445,11 @@ fn collect_lexical_close_scope_starts(
     captured_uses: &[CapturedSlotUse],
 ) -> BTreeMap<usize, usize> {
     let mut starts_by_key = BTreeMap::<CapturedSlotKey, BTreeSet<usize>>::new();
+    let local_keys = captured_uses
+        .iter()
+        .filter(|captured| captured.requires_local)
+        .map(|captured| captured.key)
+        .collect::<BTreeSet<_>>();
     for captured in captured_uses {
         starts_by_key
             .entry(captured.key)
@@ -495,7 +500,14 @@ fn collect_lexical_close_scope_starts(
         }
         if exact
             && let Some(start) = start
-            && !scope_window_fixed_def_escapes(dataflow, start, close_instr, close.from)
+            && !scope_window_local_def_escapes(
+                dataflow,
+                epochs,
+                &local_keys,
+                start,
+                close_instr,
+                close.from,
+            )
             && !scope_window_open_def_escapes(dataflow, start, close_instr, close.from)
         {
             candidates.push((start, close_instr));
@@ -528,20 +540,30 @@ fn collect_lexical_close_scope_starts(
         .collect()
 }
 
-fn scope_window_fixed_def_escapes(
+fn scope_window_local_def_escapes(
     dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    local_keys: &BTreeSet<CapturedSlotKey>,
     start: usize,
     close: usize,
     from: Reg,
 ) -> bool {
     (start..close)
         .flat_map(|instr| dataflow.instr_defs.get(instr).into_iter().flatten())
-        .filter(|def| dataflow.def_reg(**def).index() >= from.index())
+        .filter(|def| {
+            let reg = dataflow.def_reg(**def);
+            reg.index() >= from.index()
+                && local_keys.contains(&CapturedSlotKey::new(
+                    reg.index(),
+                    epochs.epoch_at(reg, dataflow.def_instr(**def)),
+                ))
+        })
         .any(|def| {
-            // 候选拒绝[ProofIncomplete]：逃逸 def 可能是 `Close r0; return r0` 中不能
-            // 提前结束的 captured local（regress342 二次反编译会从 false 变 nil），也可能
-            // 只是可安全跨块的 raw-temp handoff（regress154）。当前缺 declaration-owner
-            // 事实来拆分两者；在此之前不能声称新词法块精确。
+            // 候选拒绝[SemanticBarrier:Scope]：`requires_local` 的精确 slot epoch 会在
+            // 窗口内降低成 LocalDecl；若其 def/phi use 逃到 Close 后，提前结束词法块会
+            // 让 `Close r0; return r0` 的读取失去同一 binding（regress342）。不属于这些
+            // key 的 fixed def 仍是函数级 TempId，跨 HIR Block handoff 不改变身份
+            // （regress154）。
             dataflow.def_uses.get(def.index()).is_none_or(|uses| {
                 uses.iter()
                     .any(|site| site.instr.index() < start || site.instr.index() >= close)

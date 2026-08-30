@@ -56,20 +56,12 @@ pub(super) fn inline_constructor_value(
     context: &mut InlineContext<'_>,
     value: &HirExpr,
 ) -> Option<HirExpr> {
-    inline_constructor_value_at_site(context, value, ConstructorInlineSite::Neutral)
+    inline_constructor_value_inner(context, value)
 }
 
-#[derive(Clone, Copy)]
-enum ConstructorInlineSite {
-    Neutral,
-    CallCallee,
-    AccessBase,
-}
-
-fn inline_constructor_value_at_site(
+fn inline_constructor_value_inner(
     context: &mut InlineContext<'_>,
     value: &HirExpr,
-    site: ConstructorInlineSite,
 ) -> Option<HirExpr> {
     if let Some(binding) = binding_from_expr(value)
         && let Some(binding_id) = context.binding_index.id_of(binding)
@@ -90,28 +82,13 @@ fn inline_constructor_value_at_site(
             return None;
         }
         let producer_value = pending_producer_value(context.block, producer)?;
-        if !matches!(site, ConstructorInlineSite::Neutral)
-            && !producer_value_reaches_access_base_shape(context, producer_value)
-        {
-            // 候选拒绝[ProofIncomplete]：callee/access-base 只接受当前可直接生成的前缀形状；
-            // 其它可加括号或继续展开的表达式尚未由 Generate 语法事实证明。
-            return None;
-        }
         context.consumed_bindings[producer.binding_id] = true;
         let producer_value = producer_value.clone();
-        // 已经决定把这个 producer 值内联到当前站点，接下来要继续展开它内部的
-        // 子表达式。被内联进来的表达式的内部位置在语法上没有 callee/access-base
-        // 级别的形状约束（它们是这个值的内部组合），所以这里把站点重置为
-        // Neutral 再递归。不然像 `trailing=t47 → call(t4)` 这类形状会因为
-        // `t4` 出现在 CallCallee 位置时被 access-base 过滤掉，导致 producer
-        // t4 仍然未消费，整段 region 回滚而无法折回构造器。
+        // producer 值继续递归展开；callee/access-base 的括号由 Generate 的
+        // `PREC_PREFIX` 规则统一承载，不需要在 HIR 限制表达式形状。
         let was_inside_producer_value = context.inside_producer_value;
         context.inside_producer_value = true;
-        let inlined = inline_constructor_value_at_site(
-            context,
-            &producer_value,
-            ConstructorInlineSite::Neutral,
-        );
+        let inlined = inline_constructor_value_inner(context, &producer_value);
         context.inside_producer_value = was_inside_producer_value;
         let inlined = inlined?;
         if expr_requires_ordered_snapshot(&producer_value) {
@@ -126,37 +103,17 @@ fn inline_constructor_value_at_site(
     let inlined = match value {
         HirExpr::Unary(unary) => HirExpr::Unary(Box::new(HirUnaryExpr {
             op: unary.op,
-            expr: inline_constructor_value_at_site(
-                context,
-                &unary.expr,
-                ConstructorInlineSite::Neutral,
-            )?,
+            expr: inline_constructor_value_inner(context, &unary.expr)?,
         })),
         HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {
             op: binary.op,
-            lhs: inline_constructor_value_at_site(
-                context,
-                &binary.lhs,
-                ConstructorInlineSite::Neutral,
-            )?,
-            rhs: inline_constructor_value_at_site(
-                context,
-                &binary.rhs,
-                ConstructorInlineSite::Neutral,
-            )?,
+            lhs: inline_constructor_value_inner(context, &binary.lhs)?,
+            rhs: inline_constructor_value_inner(context, &binary.rhs)?,
         })),
         HirExpr::TableAccess(access) => {
             HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
-                base: inline_constructor_value_at_site(
-                    context,
-                    &access.base,
-                    ConstructorInlineSite::AccessBase,
-                )?,
-                key: inline_constructor_value_at_site(
-                    context,
-                    &access.key,
-                    ConstructorInlineSite::Neutral,
-                )?,
+                base: inline_constructor_value_inner(context, &access.base)?,
+                key: inline_constructor_value_inner(context, &access.key)?,
             }))
         }
         HirExpr::Call(call) => HirExpr::Call(Box::new(inline_constructor_call(context, call)?)),
@@ -193,9 +150,7 @@ pub(super) fn inline_constructor_call(
         let fixed = args
             .fixed
             .iter()
-            .map(|arg| {
-                inline_constructor_value_at_site(context, arg, ConstructorInlineSite::Neutral)
-            })
+            .map(|arg| inline_constructor_value_inner(context, arg))
             .collect::<Option<Vec<_>>>()?;
         let tail = match &args.tail {
             Some(tail) => Some(tail.clone().try_map_call(|nested| {
@@ -214,18 +169,10 @@ pub(super) fn inline_constructor_call(
     // is part of HIR's evaluation-order contract even though AST still prints a normal call.
     let (callee, args) = if call.fastcall.is_some() {
         let args = inline_args(context, &call.args)?;
-        let callee = inline_constructor_value_at_site(
-            context,
-            &call.callee,
-            ConstructorInlineSite::CallCallee,
-        )?;
+        let callee = inline_constructor_value_inner(context, &call.callee)?;
         (callee, args)
     } else {
-        let callee = inline_constructor_value_at_site(
-            context,
-            &call.callee,
-            ConstructorInlineSite::CallCallee,
-        )?;
+        let callee = inline_constructor_value_inner(context, &call.callee)?;
         let args = inline_args(context, &call.args)?;
         (callee, args)
     };
@@ -256,11 +203,7 @@ fn inline_short_circuit_expr(
     }
 
     Some(ctor(Box::new(HirLogicalExpr {
-        lhs: inline_constructor_value_at_site(
-            context,
-            &logical.lhs,
-            ConstructorInlineSite::Neutral,
-        )?,
+        lhs: inline_constructor_value_inner(context, &logical.lhs)?,
         rhs: logical.rhs.clone(),
     })))
 }
@@ -410,61 +353,4 @@ fn expr_depends_on_any_pending_binding(
             .is_some_and(Option::is_some)
             && !consumed_bindings[binding_id]
     })
-}
-
-/// 判断一个 producer-value 内联到 callee / access-base 位置后，经过后续
-/// 内联展开，最终形态是否是合法的 access-base 形状。
-///
-/// 这个谓词是 `is_constructor_access_base_inline_expr` 的“透视版”：当值中
-/// 出现 `TempRef`/`LocalRef` 时，若该绑定是 pending 的 producer 且尚未消费，
-/// 我们会沿着 producer chain 再判一次；这样像
-/// `call(t4)` ← `t4=t3["status"]` ← `t3=require("jit")` 这种形状也可以被
-/// 接受 —— 因为最终折出的是 `require("jit")["status"](...)`，访问基本身
-/// 本就是合法 access-base。
-///
-/// 不做修改（不消费 consumed_bindings），只做只读判定。
-fn producer_value_reaches_access_base_shape(context: &InlineContext<'_>, expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_) => true,
-        HirExpr::TableAccess(access) => {
-            producer_value_reaches_access_base_shape(context, &access.base)
-        }
-        // Lua 的 prefixexp 语法允许 `Call` 结果继续作为下标/调用前缀
-        // （例如 `require("jit")["status"]()`）。因此 Call 本身也是合法的
-        // callee / access-base 形状，只要其 callee 本身是合法前缀表达式。
-        HirExpr::Call(call) => producer_value_reaches_access_base_shape(context, &call.callee),
-        HirExpr::TempRef(_) => {
-            // TempRef 对应的 binding 如果还在 pending producer 列表里，
-            // 说明它有机会被继续内联展开；透视到它的 producer 值再次判断一次。
-            if let Some(binding) = binding_from_expr(expr)
-                && let Some(binding_id) = context.binding_index.id_of(binding)
-                && let Some(producer_index) = context
-                    .producer_index_by_binding
-                    .get(binding_id)
-                    .and_then(|producer_index| *producer_index)
-            {
-                let producer = &context.pending_producers[producer_index];
-                if context.remaining_uses.contains(producer.binding_id) {
-                    return false;
-                }
-                if let Some(inner) = pending_producer_value(context.block, producer) {
-                    return producer_value_reaches_access_base_shape(context, inner);
-                }
-            }
-            false
-        }
-        _ => false,
-    }
 }

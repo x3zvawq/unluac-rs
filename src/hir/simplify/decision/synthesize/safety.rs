@@ -8,7 +8,9 @@ use crate::hir::common::{HirDecisionExpr, HirDecisionTarget, HirExpr};
 use crate::hir::expr_safety::HirExprSafety;
 
 pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr, safety: HirExprSafety) -> bool {
-    // 候选拒绝[ProofIncomplete]：当前 synthesis 只会证明全树 repeatable；需补候选级 eval-trace 对照，才能接纳未被复制/删除的单次 `f()`/lookup。
+    // 候选拒绝[LayerBoundary]：effectful `f()`/lookup 的候选级求值次数与次序应由
+    // synthesize::domain 的 eval-trace verifier owner 对照；当前 MDD 只证明返回值，
+    // 而 structured candidate 可能复制 subject 或删掉 arm，不能据值相等放行。
     decision.nodes.iter().all(|node| {
         expr_is_synth_safe(&node.test, safety)
             && target_is_synth_safe(&node.truthy, safety)
@@ -17,8 +19,9 @@ pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr, safety: HirExpr
 }
 
 pub(super) fn expr_is_synth_safe(expr: &HirExpr, safety: HirExprSafety) -> bool {
-    // 候选拒绝[ProofIncomplete]：当前 naturalize 只会证明全树 repeatable；需按候选对照 occurrence，区分被删除的 `f()` 与仍原位单次求值的 `f()`。
-    safety.is_repeatable(expr)
+    // 单值 Decision/logical operand 中的 vararg 是函数入口已冻结的首值，可以和普通
+    // ref 一样进入 MDD；调用、lookup、动态环境与元方法仍由上面的 trace owner 拒绝。
+    safety.is_repeatable_in_single_value_context(expr)
 }
 
 fn target_is_synth_safe(target: &HirDecisionTarget, safety: HirExprSafety) -> bool {

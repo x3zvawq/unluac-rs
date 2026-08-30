@@ -16,11 +16,10 @@
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
 //! 独立区域，不能接收循环外快照。跨边界折叠现在有四个窄合同：repeat body 尾写入与
 //! until 属于同一轮；open return 的 fixed alias 必须先于完整保留的 tail setup；终态
-//! fixed return 前的纯 nil 并行写可在无资源边界的 proto 内直接并入 return；PUC Lua
+//! fixed return 前的纯 nil 并行写可在候选自身无 physical-root/capture 冲突时直接并入 return；PUC Lua
 //! 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。四项仍要求唯一消费
-//! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，nil pack 还
-//! 拒绝任何 `<close>`/`Close` 资源事实与 home compaction，table key 则继续服从内部
-//! 前缀顺序证明。
+//! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，nil pack 的
+//! raw temp 必须保有未失效的 `(slot, close epoch)`，table key 则继续服从内部前缀顺序证明。
 //! numeric-for 前的连续 materialization run 还允许越过保留下来的状态赋值收回稳定字面量
 //! header temp；未被引用 capture、且区间内没有其它同 home 写的 LocalRef/ParamRef 也可沿纯
 //! TempRef 链收回。例如 `t0 = source; t1 = setup(); t2 = t0; for i = t2, 3` 在 setup
@@ -69,15 +68,14 @@ use self::site::{
     temp_precedes_observable_eval_in_stmt, transparent_block_head,
 };
 use self::usage::{
-    TempUseScratch, collect_expr_temp_uses_summary, collect_stmt_temp_uses, inline_candidate,
-    max_temp_index_in_block,
+    TempUseScratch, TempUseSummary, collect_expr_temp_uses_summary, collect_stmt_temp_uses,
+    inline_candidate, max_temp_index_in_block,
 };
 use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
 use super::root_lifetimes::{
     CallRootLifetimeIndices, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
 };
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
-use super::visit::{HirVisitor, visit_stmts};
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -90,7 +88,6 @@ struct TempInlineWorkspace<'a> {
     safety: HirExprSafety,
     readability: ReadabilityOptions,
     substantial_closure_bodies: &'a [bool],
-    has_resource_boundary: bool,
 }
 
 enum TempInlineScope {
@@ -153,7 +150,6 @@ impl<'a> TempInlineWorkspace<'a> {
         dialect: DecompileDialect,
         readability: ReadabilityOptions,
         substantial_closure_bodies: &'a [bool],
-        has_resource_boundary: bool,
     ) -> Self {
         Self {
             uses: TempUseScratch::new(proto, temp_count),
@@ -164,7 +160,6 @@ impl<'a> TempInlineWorkspace<'a> {
             safety: HirExprSafety::for_dialect(dialect),
             readability,
             substantial_closure_bodies,
-            has_resource_boundary,
         }
     }
 }
@@ -225,7 +220,6 @@ fn inline_temps_in_proto_with_scope(
     substantial_closure_bodies: &[bool],
 ) -> bool {
     let temp_count = temp_count_for_proto(proto);
-    let has_resource_boundary = proto_contains_resource_boundary(proto);
     let mut workspace = TempInlineWorkspace::new(
         proto,
         temp_count,
@@ -233,7 +227,6 @@ fn inline_temps_in_proto_with_scope(
         dialect,
         readability,
         substantial_closure_bodies,
-        has_resource_boundary,
     );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
@@ -257,21 +250,6 @@ fn temp_count_for_proto(proto: &HirProto) -> usize {
         .map_or(0, |max_index| max_index + 1);
     let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
     proto_temp_count.max(body_temp_count)
-}
-
-fn proto_contains_resource_boundary(proto: &HirProto) -> bool {
-    #[derive(Default)]
-    struct ResourceBoundaryProbe(bool);
-
-    impl HirVisitor for ResourceBoundaryProbe {
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
-            self.0 |= matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_));
-        }
-    }
-
-    let mut probe = ResourceBoundaryProbe::default();
-    visit_stmts(&proto.body.stmts, &mut probe);
-    probe.0
 }
 
 fn collect_temp_root_lifetimes(
@@ -350,7 +328,6 @@ fn inline_temps_in_block(
         live_use_counts,
         facts,
         &captured_slots_before_stmt,
-        workspace.has_resource_boundary,
         &physical_root_lifetimes,
     ) {
         changed = true;
@@ -381,6 +358,7 @@ fn inline_temps_in_block(
             block,
             &workspace.uses,
             live_use_counts,
+            facts,
             &captured_slots_before_stmt,
             &call_root_indices,
         )
@@ -398,6 +376,7 @@ fn inline_temps_in_block(
     // 因此不会被当成可删的 forwarding temp。
     let mut kept_rev = Vec::with_capacity(block.stmts.len());
     let mut callee_materialized_at = None;
+    let mut adjacent_changed = false;
 
     for (index, stmt) in std::mem::take(&mut block.stmts)
         .into_iter()
@@ -488,6 +467,7 @@ fn inline_temps_in_block(
                 remove_live_use(live_use_counts, temp);
             }
             changed = true;
+            adjacent_changed = true;
             continue;
         }
 
@@ -504,6 +484,23 @@ fn inline_temps_in_block(
 
     kept_rev.reverse();
     block.stmts = kept_rev;
+
+    // 相邻逆向扫描可能刚把 `rhs_temp = g()` 收进 same-home overwrite，形成
+    // `root = f(); overwrite = root + g()`。若等下一轮，locals 会先把这对 temp 固化为
+    // source binding；因此在同一坐标压缩完成后重算 root/capture 事实，并交回同一个
+    // call-root owner 原子消费。
+    if adjacent_changed && matches!(workspace.scope, TempInlineScope::All) {
+        let (call_roots, _) = collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
+        let captured_slots = captured_slots_before_stmts(block, facts, inherited_captured_slots);
+        changed |= inline_adjacent_call_root_expression_overwrites(
+            block,
+            &workspace.uses,
+            live_use_counts,
+            facts,
+            &captured_slots,
+            &call_roots,
+        );
+    }
 
     workspace.block_depth -= 1;
     changed
@@ -658,8 +655,7 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
         }
         HirStmt::GlobalDecl(global_decl) => global_decl.values.fixed.iter().any(|value| {
             matches!(value, HirExpr::TempRef(value_temp) if *value_temp == temp)
-                || (matches!(value, HirExpr::TableConstructor(_))
-                    && expr_touches_temp(value, temp))
+                || (matches!(value, HirExpr::TableConstructor(_)) && expr_touches_temp(value, temp))
         }),
         HirStmt::TableSetList(set_list) => {
             expr_touches_temp(&set_list.base, temp)
@@ -679,6 +675,7 @@ fn inline_adjacent_call_root_expression_overwrites(
     block: &mut HirBlock,
     scratch: &TempUseScratch,
     live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
     call_roots: &CallRootLifetimeIndices,
 ) -> bool {
@@ -708,16 +705,20 @@ fn inline_adjacent_call_root_expression_overwrites(
         if scratch.has_debug_local_hint(root) || scratch.has_debug_local_hint(target) {
             continue;
         }
-        // 候选拒绝[ProofIncomplete]：RHS 含 lookup/call/allocation/closure 等事件时，尚无同句事件与新 capture 的完整证明。
         if !call_root_overwrite_is_inlineable(overwrite, root) {
             continue;
         }
-        // 候选拒绝[SemanticBarrier:Capture]：已引用捕获 root home 时，删除 producer 会让 closure 看不到 call result。
-        if captured_slots_before_stmt
+        let mut captured_slots = captured_slots_before_stmt
             .get(overwrite_index)
             .expect("capture snapshots must cover the call-root overwrite")
-            .contains(&pair.home())
-        {
+            .clone();
+        facts.collect_captured_home_slots_in_stmt(
+            &block.stmts[overwrite_index],
+            &mut captured_slots,
+        );
+        // 候选拒绝[SemanticBarrier:Capture]：已有 capture 或 overwrite RHS 新建的 closure
+        // 若引用 root home，删除 producer 会让它观察 overwrite 前的旧 cell。
+        if captured_slots.contains(&pair.home()) {
             continue;
         }
 
@@ -741,28 +742,10 @@ fn call_root_overwrite_is_inlineable(expr: &HirExpr, root: TempId) -> bool {
     match expr {
         HirExpr::Binary(binary) => {
             matches!(&binary.lhs, HirExpr::TempRef(source) if *source == root)
-                && call_root_rhs_is_stable_direct_value(&binary.rhs)
         }
         HirExpr::LogicalOr(logical) => {
             matches!(&logical.lhs, HirExpr::TempRef(source) if *source == root)
-                && call_root_rhs_is_stable_direct_value(&logical.rhs)
         }
-        _ => false,
-    }
-}
-
-fn call_root_rhs_is_stable_direct_value(expr: &HirExpr) -> bool {
-    call_root_rhs_is_primitive_literal(expr)
-        || matches!(
-            expr,
-            HirExpr::ParamRef(_) | HirExpr::LocalRef(_) | HirExpr::UpvalueRef(_)
-        )
-}
-
-fn call_root_rhs_is_primitive_literal(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Number(value) => value.is_finite(),
-        HirExpr::Nil | HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::String(_) => true,
         _ => false,
     }
 }
@@ -1126,7 +1109,24 @@ fn inline_materialization_runs(
             }
             let Some(site) = inline_site_in_stmt(&rewritten_sink, temp) else {
                 if collect_stmt_temp_uses(&rewritten_sink, uses).count(temp) == 0 {
-                    // 候选拒绝[ProofIncomplete]：sink 外 live use 或 planned discard 的暂存 use 会阻断整包融合；当前计划缺少 call 依赖切片与计划内 use delta。
+                    let planned_discard_use_count = discarded_uses
+                        .iter()
+                        .map(|discarded: &TempUseSummary| discarded.count(temp))
+                        .sum::<usize>();
+                    if planned_discard_use_count == use_count
+                        && candidate_is_safe
+                        && safety.is_discard_safe(value)
+                    {
+                        // 逆序扫描已经证明该 temp 的全部 use 都位于随后将删除的纯表达式中；
+                        // 把当前 value 的依赖继续并入 discard delta，整段提交时统一扣除。
+                        discarded_uses.push(collect_expr_temp_uses_summary(value, uses));
+                        continue;
+                    }
+                    // 候选拒绝[SemanticBarrier:Lifetime]：至少一份 live use 位于本次 sink/计划删除集之外，
+                    // 删除 producer 会让该 use 失去原值。
+                    // 候选拒绝[SemanticBarrier:EvalOrder]：即使唯一 use 位于计划删除集，带事件的 value 也不能随之丢弃。
+                    // 候选拒绝[SemanticBarrier:Capture]：被捕获/self-rebinding 的 producer 不能作为纯依赖删除。
+                    // 候选拒绝[LayerBoundary]：debug temp 属于 source binding。
                     complete_run = false;
                     break;
                 }
@@ -1300,10 +1300,6 @@ fn root_open_return_nil_pack_plan(
     captured_slots_before_stmt: &CapturedSlotSnapshots,
     physical_root_lifetimes: &[bool],
 ) -> Option<RootOpenReturnNilPackPlan> {
-    // 分析停用[ProofIncomplete]：home compaction 下缺少跨 gap 的稳定物理槽证明；应让 promotion 暴露最终 slot epoch。
-    if facts.compacts_home_slots() {
-        return None;
-    }
     let return_index = block.stmts.len().checked_sub(1)?;
     let HirStmt::Return(ret) = &block.stmts[return_index] else {
         return None;
@@ -1400,7 +1396,7 @@ fn root_open_return_nil_pack_plan(
 ///
 /// 这条路径与 open-tail 的 root handoff 分开：return 本身仍在原 statement 位置产生
 /// 同样宽度的 nil pack，因而没有把 nil 跨过 call/lookup 或其它求值事件。只有临时槽、
-/// 非压缩 home、无 debug/capture 且每个目标只有唯一 return 读取时才成立；带 tail 的
+/// 未失效的 home、无 debug/capture 且每个目标只有唯一 return 读取时才成立；带 tail 的
 /// return、局部/参数目标和任何不可信 home 继续保留原始并行写。
 fn inline_terminal_nil_return_pack(
     block: &mut HirBlock,
@@ -1408,13 +1404,8 @@ fn inline_terminal_nil_return_pack(
     live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
-    has_resource_boundary: bool,
     physical_root_lifetimes: &[bool],
 ) -> bool {
-    // 分析停用[ProofIncomplete]：home compaction 或 proto 内任意 resource boundary 会 blanket 禁用本规则；应改用候选区间的精确 slot/lifetime 事实。
-    if facts.compacts_home_slots() || has_resource_boundary {
-        return false;
-    }
     let Some(return_index) = block.stmts.len().checked_sub(1) else {
         return false;
     };

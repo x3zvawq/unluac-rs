@@ -14,7 +14,7 @@
 //! 输入形状：`if c then t1 = a else t1 = b end; use(t1)`。
 //! 输出形状：候选 temp 集合 `{ t1 }`，后续由主 pass 物化成 `local l; if c then l = a else l = b end`。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::expr_facts::expr_truthiness;
 use super::super::temp_touch::{
@@ -49,8 +49,9 @@ pub(super) fn candidate_temps(
         summarize_block_fallthrough_assignments(&if_stmt.then_block, safety),
         summarize_block_fallthrough_assignments(else_block, safety),
     ) else {
-        // 候选拒绝[ProofIncomplete]：任一 arm 的 goto 可能重新汇入当前 if，也可能逃逸；
-        // HIR 缺少目标到当前 region merge 的 owner/reaching-def，不能把 unknown arm 当作已终结。
+        // 候选拒绝[LayerBoundary]：跨出当前 arm、嵌套语句内或回边 goto
+        // 需要 region CFG owner 的逃逸/重入与迭代 reaching-def，不属于本层
+        // forward-label 摘要能证明的路径。
         return Vec::new();
     };
     let Some(common_temps) = intersect_fallthrough_assignment_sets([&then_summary, &else_summary])
@@ -105,14 +106,36 @@ fn summarize_block_fallthrough_assignments(
     block: &HirBlock,
     safety: HirExprSafety,
 ) -> Option<FallthroughSummary> {
+    let mut label_indices = BTreeMap::new();
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let HirStmt::Label(label) = stmt else {
+            continue;
+        };
+        if label_indices.insert(label.id, index).is_some() {
+            return None;
+        }
+    }
+
     let mut assigned_temps = BTreeSet::new();
     let mut reads_before_assignment = BTreeSet::new();
     let mut break_assigned_temps = None;
     let mut falls_through = true;
+    let mut index = 0;
 
-    for stmt in &block.stmts {
+    while let Some(stmt) = block.stmts.get(index) {
         if !falls_through {
             break;
+        }
+
+        if let HirStmt::Goto(goto) = stmt {
+            let target_index = *label_indices.get(&goto.target)?;
+            // 本层只认领同 arm 的单调 forward edge；回边需要迭代 reaching-def，
+            // 交给拥有 loop/region 事实的结构 owner。
+            if target_index <= index {
+                return None;
+            }
+            index = target_index;
+            continue;
         }
 
         let stmt_summary = summarize_stmt_fallthrough_assignments(stmt, safety)?;
@@ -131,6 +154,7 @@ fn summarize_block_fallthrough_assignments(
         } else {
             falls_through = false;
         }
+        index += 1;
     }
 
     Some(FallthroughSummary {
@@ -341,7 +365,7 @@ fn intersect_fallthrough_assignment_sets<'a>(
 mod tests {
     use super::*;
     use crate::hir::common::{
-        HirAssign, HirExpr, HirGoto, HirIf, HirLabelId, HirReturn, HirValuePack,
+        HirAssign, HirExpr, HirGoto, HirIf, HirLabel, HirLabelId, HirReturn, HirValuePack,
     };
 
     fn block(stmts: Vec<HirStmt>) -> HirBlock {
@@ -349,9 +373,24 @@ mod tests {
     }
 
     fn assign_temp(temp: TempId) -> HirStmt {
+        assign_temp_value(temp, HirExpr::Integer(1))
+    }
+
+    fn assign_temp_value(temp: TempId, value: HirExpr) -> HirStmt {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(temp)],
-            values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn goto(label: HirLabelId) -> HirStmt {
+        HirStmt::Goto(Box::new(HirGoto { target: label }))
+    }
+
+    fn label(id: HirLabelId) -> HirStmt {
+        HirStmt::Label(Box::new(HirLabel {
+            id,
+            tbc_barriers: Vec::new(),
         }))
     }
 
@@ -377,10 +416,47 @@ mod tests {
     #[test]
     fn goto_unknown_arm_cannot_be_ignored_during_merge() {
         let temp = TempId(0);
+        let stmt = branch(vec![goto(HirLabelId(0))], vec![assign_temp(temp)]);
+
+        assert!(candidates(&stmt, temp).is_empty());
+    }
+
+    #[test]
+    fn local_forward_goto_follows_the_reachable_assignment_path() {
+        let temp = TempId(0);
+        let skipped = TempId(1);
+        let join = HirLabelId(0);
         let stmt = branch(
-            vec![HirStmt::Goto(Box::new(HirGoto {
-                target: HirLabelId(0),
-            }))],
+            vec![
+                goto(join),
+                assign_temp_value(skipped, HirExpr::TempRef(temp)),
+                label(join),
+                assign_temp(temp),
+            ],
+            vec![assign_temp(temp)],
+        );
+
+        assert_eq!(candidates(&stmt, temp), vec![temp]);
+    }
+
+    #[test]
+    fn local_forward_goto_does_not_count_a_skipped_assignment() {
+        let temp = TempId(0);
+        let join = HirLabelId(0);
+        let stmt = branch(
+            vec![goto(join), assign_temp(temp), label(join)],
+            vec![assign_temp(temp)],
+        );
+
+        assert!(candidates(&stmt, temp).is_empty());
+    }
+
+    #[test]
+    fn backward_goto_stays_with_the_region_cfg_owner() {
+        let temp = TempId(0);
+        let head = HirLabelId(0);
+        let stmt = branch(
+            vec![label(head), assign_temp(temp), goto(head)],
             vec![assign_temp(temp)],
         );
 

@@ -76,10 +76,12 @@ pub(super) fn fold_branch_values_in_proto(
         dialect,
     );
     let label_refs = count_label_references(&proto.body.stmts);
+    let local_scope_facts = BranchValueLocalScopeFacts::collect(proto);
     let other_changed = rewrite_proto(
         proto,
         &mut BranchValuePass {
             label_refs: &label_refs,
+            local_scope_facts: &local_scope_facts,
             safety,
         },
     );
@@ -88,6 +90,7 @@ pub(super) fn fold_branch_values_in_proto(
 
 struct BranchValuePass<'a> {
     label_refs: &'a BTreeMap<HirLabelId, usize>,
+    local_scope_facts: &'a BranchValueLocalScopeFacts,
     safety: HirExprSafety,
 }
 
@@ -95,10 +98,54 @@ impl HirRewritePass for BranchValuePass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let goto_changed =
             fold_branch_value_goto_labels_in_block(&mut block.stmts, self.label_refs);
-        let nil_decision_changed = fold_nil_fallback_decision_locals_in_block(&mut block.stmts);
-        let nil_fallback_changed = fold_nil_fallback_alias_locals_in_block(&mut block.stmts);
-        let local_changed = fold_branch_value_locals_in_block(&mut block.stmts, self.safety);
+        let nil_decision_changed = fold_nil_fallback_decision_locals_in_block(
+            &mut block.stmts,
+            self.local_scope_facts,
+            self.safety,
+        );
+        let nil_fallback_changed =
+            fold_nil_fallback_alias_locals_in_block(&mut block.stmts, self.local_scope_facts);
+        let local_changed = fold_branch_value_locals_in_block(
+            &mut block.stmts,
+            self.local_scope_facts,
+            self.safety,
+        );
         goto_changed || nil_decision_changed || nil_fallback_changed || local_changed
+    }
+}
+
+#[derive(Default)]
+struct BranchValueLocalScopeFacts {
+    debug_locals: BTreeSet<LocalId>,
+    physical_root_locals: BTreeSet<LocalId>,
+}
+
+impl BranchValueLocalScopeFacts {
+    fn collect(proto: &HirProto) -> Self {
+        Self {
+            debug_locals: proto
+                .locals
+                .iter()
+                .copied()
+                .zip(&proto.local_debug_hints)
+                .filter_map(|(local, hint)| hint.is_some().then_some(local))
+                .collect(),
+            physical_root_locals: proto.physical_root_locals.clone(),
+        }
+    }
+
+    fn can_move_scope(&self, local: LocalId) -> bool {
+        if self.debug_locals.contains(&local) {
+            // 候选拒绝[PolicyBoundary]：retain-debug local 的声明边界是源码身份；把空声明
+            // 并入 initializer，或删除 guard local，会改变 debug.getlocal 可见区间。
+            return false;
+        }
+        if self.physical_root_locals.contains(&local) {
+            // 候选拒绝[SemanticBarrier:Lifetime]：`local root; if collect() then root=v end`
+            // 的空声明先用 nil 结束旧 slot root；并入 initializer 会让旧资源活过 collect。
+            return false;
+        }
+        true
     }
 }
 
@@ -107,13 +154,18 @@ impl HirRewritePass for BranchValuePass<'_> {
 ///
 /// 结构化 HIR 有时会把已经恢复过的 nil fallback 重新编码成一个单节点 Decision，
 /// 尤其是在源码经过一轮反编译后再次编译时。把它留给 Decision elimination 会丢掉
-/// 原本已经证明的“无 else fallback”形状；这里仅接受 direct local、单节点 DAG 和
-/// 不读取 target 的 fallback，因此不会重复求值 source，也不会改变 fallback 的时序。
-fn fold_nil_fallback_decision_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
+/// 原本已经证明的“无 else fallback”形状；这里接受 direct local，并把 root truthy edge
+/// 的完整可达子图投影为 fallback；target 不能被 fallback 读取，因此不会改变词法解析。
+fn fold_nil_fallback_decision_locals_in_block(
+    stmts: &mut Vec<HirStmt>,
+    local_scope_facts: &BranchValueLocalScopeFacts,
+    safety: HirExprSafety,
+) -> bool {
     let mut changed = false;
     let mut index = 0;
     while index < stmts.len() {
-        let Some(rewrite) = nil_fallback_decision_rewrite(&stmts[index]) else {
+        let Some(rewrite) = nil_fallback_decision_rewrite(&stmts[index], local_scope_facts, safety)
+        else {
             index += 1;
             continue;
         };
@@ -147,7 +199,11 @@ struct NilFallbackDecisionRewrite {
     fallback: HirExpr,
 }
 
-fn nil_fallback_decision_rewrite(stmt: &HirStmt) -> Option<NilFallbackDecisionRewrite> {
+fn nil_fallback_decision_rewrite(
+    stmt: &HirStmt,
+    local_scope_facts: &BranchValueLocalScopeFacts,
+    safety: HirExprSafety,
+) -> Option<NilFallbackDecisionRewrite> {
     let HirStmt::LocalDecl(local_decl) = stmt else {
         return None;
     };
@@ -158,24 +214,22 @@ fn nil_fallback_decision_rewrite(stmt: &HirStmt) -> Option<NilFallbackDecisionRe
         return None;
     };
     // 候选拒绝[SemanticBarrier:ValueArity]：fixed Decision 后仍有 tail 时，改写成单值 local 会丢失 tail 的值宽度。
-    // 候选拒绝[ProofIncomplete]：多节点 nil Decision 尚未证明可物化成单个无 else fallback；应消费完整 Decision 路径事实。
-    if local_decl.values.tail.is_some() || decision.nodes.len() != 1 {
+    if local_decl.values.tail.is_some() || !local_scope_facts.can_move_scope(*target) {
         return None;
     }
-    assert_eq!(
-        decision.entry.index(),
-        0,
-        "single-node HIR Decision entry must reference its only node"
-    );
-    let node = &decision.nodes[0];
+    crate::hir::simplify::decision::assert_valid_decision(decision);
+    let node = decision.nodes.get(decision.entry.index())?;
     let source = nil_check_local(&node.test)?;
-    let (fallback, source_target) = match (&node.truthy, &node.falsy) {
-        (
-            HirDecisionTarget::Expr(fallback),
-            HirDecisionTarget::Expr(HirExpr::LocalRef(source_target)),
-        ) => (fallback.clone(), *source_target),
+    let source_target = match &node.falsy {
+        HirDecisionTarget::Expr(HirExpr::LocalRef(source_target)) => *source_target,
         _ => return None,
     };
+    let fallback = crate::hir::simplify::decision::project_value_decision_target(
+        decision,
+        &node.truthy,
+        HirExpr::Boolean(true),
+        safety,
+    );
     // 候选拒绝[SemanticBarrier:Scope]：`target == source` 或 fallback 读取 target 时，移到声明后的 if 会把 RHS 的外层读取改成新局部读取。
     if source_target != source || *target == source || expr_mentions_local(&fallback, *target) {
         return None;
@@ -202,16 +256,19 @@ fn fold_branch_value_goto_labels_in_block(
 
 /// 扫描 block 中的 `local X; if cond then X=a else X=b end` 形状，
 /// 尝试把它收回 `local X = cond and a or b` 一类的值表达式。
-fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>, safety: HirExprSafety) -> bool {
+fn fold_branch_value_locals_in_block(
+    stmts: &mut Vec<HirStmt>,
+    local_scope_facts: &BranchValueLocalScopeFacts,
+    safety: HirExprSafety,
+) -> bool {
     let mut changed = false;
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
     let mut original = original.into_iter().peekable();
     while let Some(stmt) = original.next() {
-        let Some((binding, value)) = original
-            .peek()
-            .and_then(|next| collapsible_branch_value_local(&stmt, next, safety))
-        else {
+        let Some((binding, value)) = original.peek().and_then(|next| {
+            collapsible_branch_value_local(&stmt, next, local_scope_facts, safety)
+        }) else {
             rewritten.push(stmt);
             continue;
         };
@@ -271,12 +328,17 @@ fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> 
 
 /// 扫描 block 中相邻的 `local X; if A == nil then X=b else X=A end` 形状，
 /// 改写成 `local X=A; if X == nil then X=b end`。
-fn fold_nil_fallback_alias_locals_in_block(stmts: &mut [HirStmt]) -> bool {
+fn fold_nil_fallback_alias_locals_in_block(
+    stmts: &mut [HirStmt],
+    local_scope_facts: &BranchValueLocalScopeFacts,
+) -> bool {
     let mut changed = false;
     let mut index = 0;
 
     while index + 1 < stmts.len() {
-        let Some(rewrite) = nil_fallback_alias_rewrite(&stmts[index], &stmts[index + 1]) else {
+        let Some(rewrite) =
+            nil_fallback_alias_rewrite(&stmts[index], &stmts[index + 1], local_scope_facts)
+        else {
             index += 1;
             continue;
         };
@@ -306,33 +368,36 @@ struct NilFallbackAliasRewrite {
 fn nil_fallback_alias_rewrite(
     decl_stmt: &HirStmt,
     if_stmt: &HirStmt,
+    local_scope_facts: &BranchValueLocalScopeFacts,
 ) -> Option<NilFallbackAliasRewrite> {
     let target = empty_single_local_decl_binding(decl_stmt)?;
+    if !local_scope_facts.can_move_scope(target) {
+        return None;
+    }
     let HirStmt::If(if_stmt) = if_stmt else {
         return None;
     };
     // 候选拒绝[SemanticBarrier:ControlFlow]：`local x; if a==nil then x=b end` 的 a 非 nil 路径保留 nil，改写成 `local x=a` 会变成 a。
     let else_block = if_stmt.else_block.as_ref()?;
     let (source, fallback_block) = if let Some(source) = nil_check_local(&if_stmt.cond) {
-        let then_value = terminal_local_assign_value(&if_stmt.then_block, target)?;
+        terminal_local_assign_value(&if_stmt.then_block, target)?;
         let else_value = single_local_assign_value(else_block, target)?;
-        if !matches!(else_value, HirExpr::LocalRef(local) if *local == source)
-            || expr_mentions_local(then_value, target)
-        {
-            // 候选拒绝[ProofIncomplete]：fallback 读取空声明 target 时理论上仍见 nil，但需先证明 source != target 与整个 prefix 不改写 target。
+        if !matches!(else_value, HirExpr::LocalRef(local) if *local == source) {
             return None;
         }
+        // 只有 source == nil 才进入 fallback；空声明 target 与新 initializer
+        // 因此都在该路径上产生 nil。prefix 读写 target，以及末句 RHS 再读取它，
+        // 都从同一 nil epoch 出发并保持原顺序，无需禁止 target mention。
         (source, if_stmt.then_block.clone())
     } else {
         let source = negated_nil_check_local(&if_stmt.cond)?;
         let then_value = single_local_assign_value(&if_stmt.then_block, target)?;
-        let else_value = terminal_local_assign_value(else_block, target)?;
-        if !matches!(then_value, HirExpr::LocalRef(local) if *local == source)
-            || expr_mentions_local(else_value, target)
-        {
-            // 候选拒绝[ProofIncomplete]：negated fallback 读取空声明 target 时需证明 source != target 与 fallback prefix 的 target epoch。
+        if !matches!(then_value, HirExpr::LocalRef(local) if *local == source) {
             return None;
         }
+        terminal_local_assign_value(else_block, target)?;
+        // negated 形状的 fallback 仍只在 source == nil 时执行；因此与上面相同，
+        // prefix 和末句 RHS 看到的 target 初始 epoch 都是 nil。
         (source, else_block.clone())
     };
     if target == source {
@@ -428,13 +493,22 @@ fn terminal_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&Hir
 fn collapsible_branch_value_local(
     local_decl_stmt: &HirStmt,
     if_stmt: &HirStmt,
+    local_scope_facts: &BranchValueLocalScopeFacts,
     safety: HirExprSafety,
 ) -> Option<(LocalId, HirExpr)> {
     let binding = empty_single_local_decl_binding(local_decl_stmt)?;
+    if !local_scope_facts.can_move_scope(binding) {
+        return None;
+    }
     let HirStmt::If(if_stmt) = if_stmt else {
         return None;
     };
-    let value = branch_value_expr(BranchValueBinding::Local(binding), if_stmt, safety)?;
+    let value = branch_value_expr(
+        BranchValueBinding::Local(binding),
+        if_stmt,
+        local_scope_facts,
+        safety,
+    )?;
     Some((binding, value))
 }
 
@@ -454,7 +528,7 @@ fn collapsible_branch_value_temp(
     // raw temp 没有 local 壳提供稳定的中间边界；若整棵树尚不能收成值表达式，
     // 只折叠内层会生成一份新的控制形状，并可能让下一次反编译失去原短路 owner。
     // 因此这里全有或全无，保持原树交给 locals 后的路径继续处理。
-    let (value, guards) = builder.finish(root, binding)?;
+    let (value, guards) = builder.finish(root)?;
     let replacement = assign_binding_value(binding, value);
     Some((target, replacement, guards))
 }
@@ -462,11 +536,18 @@ fn collapsible_branch_value_temp(
 fn branch_value_expr(
     binding: BranchValueBinding,
     if_stmt: &HirIf,
+    local_scope_facts: &BranchValueLocalScopeFacts,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
-    let truthy = try_collapse_block_to_value(&if_stmt.then_block, binding, safety)?;
-    // 候选拒绝[ProofIncomplete]：空 local 的无 else 路径可取 nil，但当前 builder 没有把“未赋值 epoch == nil”作为 falsy target 事实。
-    let falsy = try_collapse_block_to_value(if_stmt.else_block.as_ref()?, binding, safety)?;
+    let truthy =
+        try_collapse_block_to_value(&if_stmt.then_block, binding, local_scope_facts, safety)?;
+    let falsy = if let Some(else_block) = &if_stmt.else_block {
+        try_collapse_block_to_value(else_block, binding, local_scope_facts, safety)?
+    } else {
+        // 入口是外层空 local 声明，且该 block grammar 在叶子前不写 output；
+        // 无 else 路径因此精确保留声明产生的 nil epoch。
+        HirExpr::Nil
+    };
     if binding.mentions_expr(&if_stmt.cond)
         || binding.mentions_expr(&truthy)
         || binding.mentions_expr(&falsy)
@@ -485,15 +566,17 @@ fn branch_value_expr(
 fn try_collapse_block_to_value(
     block: &HirBlock,
     binding: BranchValueBinding,
+    local_scope_facts: &BranchValueLocalScopeFacts,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     match block.stmts.as_slice() {
         [HirStmt::Assign(assign)] => single_assign_value(assign, binding).cloned(),
-        [HirStmt::If(if_stmt)] => branch_value_expr(binding, if_stmt, safety),
+        [HirStmt::If(if_stmt)] => branch_value_expr(binding, if_stmt, local_scope_facts, safety),
         [HirStmt::LocalDecl(decl), HirStmt::If(if_stmt)] => {
-            collapse_local_guard_pattern(decl, if_stmt, binding, safety)
+            collapse_local_guard_pattern(decl, if_stmt, binding, local_scope_facts, safety)
         }
-        // 候选拒绝[ProofIncomplete]：其它叶块可能仅含可搬移的中性语句，也可能有 call/control effect；需逐句路径 effect summary，不能按长度 blanket 判定。
+        // 其它语句序列不属于 branch-value 的终端叶 grammar；effectful prefix 由保留
+        // 控制树执行，普通结构化语句交各自 owner，不在这里建立候选。
         _ => None,
     }
 }
@@ -502,11 +585,15 @@ fn collapse_local_guard_pattern(
     decl: &HirLocalDecl,
     if_stmt: &HirIf,
     binding: BranchValueBinding,
+    local_scope_facts: &BranchValueLocalScopeFacts,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let [guard] = decl.bindings.as_slice() else {
         return None;
     };
+    if !local_scope_facts.can_move_scope(*guard) {
+        return None;
+    }
     let [value] = decl.values.fixed.as_slice() else {
         return None;
     };
@@ -523,16 +610,20 @@ fn collapse_local_guard_pattern(
         return None;
     }
 
-    // 候选拒绝[ProofIncomplete]：空 output local 的 guard 无 else 路径可取 nil；当前折叠器尚未携带该初始化 epoch 作为 rest target。
-    let rest_block = if_stmt.else_block.as_ref()?;
+    let rest_block = if_stmt.else_block.as_ref();
     if expr_mentions_local(value, *guard)
         || binding.mentions_expr(value)
-        || block_mentions_local(rest_block, *guard)
+        || rest_block.is_some_and(|rest| block_mentions_local(rest, *guard))
     {
         // 候选拒绝[SemanticBarrier:Scope]：删除 guard/local 壳会让 value/rest 中对 guard 或 output binding 的读取改指外层或丢失当前快照。
         return None;
     }
-    let rest_value = try_collapse_block_to_value(rest_block, binding, safety)?;
+    let rest_value = if let Some(rest_block) = rest_block {
+        try_collapse_block_to_value(rest_block, binding, local_scope_facts, safety)?
+    } else {
+        // output 来自外层空 local；guard 假臂没有写入时仍是同一 nil epoch。
+        HirExpr::Nil
+    };
     if binding.mentions_expr(&rest_value) || expr_mentions_local(&rest_value, *guard) {
         // 候选拒绝[SemanticBarrier:Scope]：rest value 仍读取被删除 guard/output binding，直接内联会改变读取的 lexical identity。
         return None;
@@ -561,7 +652,9 @@ fn finalize_branch_value_targets(
         }],
     };
     let value = crate::hir::decision::finalize_value_decision_expr(decision, safety);
-    // 候选拒绝[ProofIncomplete]：共享/不可表达 Decision 尚未收成普通逻辑表达式；应增强 decision collapse，而非把内部 DAG 泄露给 local initializer。
+    // 候选拒绝[LayerBoundary]：Lua 没有一般三元值表达式；例如
+    // `local x; if probe() then x=false end` 既要区分 false/nil，又只能调用 probe 一次；
+    // 无额外 local 的 `and/or` 无法承载。保留控制树，避免与 eliminate-decisions 振荡。
     (!matches!(value, HirExpr::Decision(_))).then_some(value)
 }
 
@@ -934,8 +1027,10 @@ fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt 
 /// 处理 `local LX = v; if LX then assign binding = LX else REST end` 这一短路守卫形态。
 ///
 /// 该形态来自结构恢复阶段把 `binding = v or RESTV` 这种短路赋值展开成"先把 `v` 物化到
-/// 新 temp `LX`，再用 `LX` 做条件判断"的中间形态。如果 `LX` 在这之外没有被引用过，
+/// temp `LX`，再用 `LX` 做条件判断"的中间形态。如果 `LX` 在这之外没有被引用过，
 /// 就可以重新折回 `binding = v or RESTV`，避免给最终输出留下毫无意义的物化壳。
+/// `LX == binding` 时则是原地短路更新；它不删除 output identity，但必须由
+/// Decision builder 证明 fallback 不读 producer 已写入的新 epoch。
 struct RawTempGuardShape<'a> {
     guard: TempId,
     binding: BranchValueBinding,
@@ -967,10 +1062,6 @@ fn raw_temp_guard_shape<'a>(
             let binding = block_assigns_binding_from_temp(else_block, guard)?;
             (binding, &if_stmt.then_block, false)
         };
-    // 候选拒绝[ProofIncomplete]：binding 与 guard 相同时可形成原地短路更新，但需证明 CurrentValue 指向赋值后的 guard epoch 才能折叠。
-    if binding == BranchValueBinding::Temp(guard) {
-        return None;
-    }
     Some(RawTempGuardShape {
         guard,
         binding,
@@ -987,4 +1078,195 @@ fn block_assigns_binding_from_temp(block: &HirBlock, temp: TempId) -> Option<Bra
     let binding = single_assign_binding(assign)?;
     matches!(single_assign_value(assign, binding)?, HirExpr::TempRef(value) if *value == temp)
         .then_some(binding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(stmts: Vec<HirStmt>) -> HirBlock {
+        HirBlock { stmts }
+    }
+
+    fn empty_local(local: LocalId) -> HirStmt {
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![local],
+            values: HirValuePack::default(),
+        }))
+    }
+
+    fn assign(local: LocalId, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Local(local)],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn nil_fallback_if(
+        source: LocalId,
+        target: LocalId,
+        fallback: HirBlock,
+        negated: bool,
+    ) -> HirStmt {
+        let success = block(vec![assign(target, HirExpr::LocalRef(source))]);
+        let cond = if negated {
+            nil_check_for_local(source).negate()
+        } else {
+            nil_check_for_local(source)
+        };
+        let (then_block, else_block) = if negated {
+            (success, fallback)
+        } else {
+            (fallback, success)
+        };
+        HirStmt::If(Box::new(HirIf {
+            cond,
+            then_block,
+            else_block: Some(else_block),
+        }))
+    }
+
+    #[test]
+    fn nil_fallback_alias_preserves_target_epoch_through_prefix() {
+        let target = LocalId(0);
+        let source = LocalId(1);
+        for negated in [false, true] {
+            let fallback = block(vec![
+                assign(target, HirExpr::Integer(7)),
+                assign(target, HirExpr::LocalRef(target)),
+            ]);
+            let if_stmt = nil_fallback_if(source, target, fallback.clone(), negated);
+
+            let rewrite = nil_fallback_alias_rewrite(
+                &empty_local(target),
+                &if_stmt,
+                &BranchValueLocalScopeFacts::default(),
+            )
+            .expect("distinct source and target share the same nil fallback epoch");
+
+            assert_eq!(rewrite.target, target);
+            assert_eq!(rewrite.source, source);
+            assert_eq!(rewrite.then_block, fallback);
+        }
+    }
+
+    #[test]
+    fn nil_fallback_alias_rejects_same_source_and_target_binding() {
+        let target = LocalId(0);
+        let fallback = block(vec![assign(target, HirExpr::LocalRef(target))]);
+        let if_stmt = nil_fallback_if(target, target, fallback, false);
+
+        assert!(
+            nil_fallback_alias_rewrite(
+                &empty_local(target),
+                &if_stmt,
+                &BranchValueLocalScopeFacts::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn multi_node_nil_fallback_projects_the_complete_truthy_subgraph() {
+        let target = LocalId(0);
+        let source = LocalId(1);
+        let decision = HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![
+                HirDecisionNode {
+                    id: HirDecisionNodeRef(0),
+                    test: nil_check_for_local(source),
+                    truthy: HirDecisionTarget::Node(HirDecisionNodeRef(1)),
+                    falsy: HirDecisionTarget::Expr(HirExpr::LocalRef(source)),
+                },
+                HirDecisionNode {
+                    id: HirDecisionNodeRef(1),
+                    test: HirExpr::ParamRef(crate::hir::ParamId(0)),
+                    truthy: HirDecisionTarget::Expr(HirExpr::Integer(7)),
+                    falsy: HirDecisionTarget::Expr(HirExpr::Integer(9)),
+                },
+            ],
+        }));
+        let stmt = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![target],
+            values: HirValuePack::fixed(vec![decision]),
+        }));
+
+        let rewrite = nil_fallback_decision_rewrite(
+            &stmt,
+            &BranchValueLocalScopeFacts::default(),
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        )
+        .expect("the truthy subtree is a complete fallback value decision");
+
+        assert_eq!(rewrite.target, target);
+        assert_eq!(rewrite.source, source);
+        assert!(!matches!(rewrite.fallback, HirExpr::Decision(_)));
+    }
+
+    #[test]
+    fn missing_else_uses_nil_only_when_the_value_is_expressible() {
+        let target = LocalId(0);
+        let then_block = block(vec![assign(target, HirExpr::Boolean(false))]);
+        let dynamic_if = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::GlobalRef(crate::hir::HirGlobalRef {
+                name: "dynamic_guard".to_owned(),
+            }),
+            then_block: then_block.clone(),
+            else_block: None,
+        }));
+        let constant_if = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block,
+            else_block: None,
+        }));
+        let scope_facts = BranchValueLocalScopeFacts::default();
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+
+        let dynamic =
+            collapsible_branch_value_local(&empty_local(target), &dynamic_if, &scope_facts, safety);
+        assert!(
+            dynamic.is_none(),
+            "dynamic false must remain nil rather than become boolean false: {dynamic:?}"
+        );
+        let (_, value) = collapsible_branch_value_local(
+            &empty_local(target),
+            &constant_if,
+            &scope_facts,
+            safety,
+        )
+        .expect("a statically selected arm does not need a ternary value expression");
+        assert_eq!(value, HirExpr::Boolean(false));
+    }
+
+    #[test]
+    fn protected_output_local_keeps_its_empty_declaration_boundary() {
+        let target = LocalId(0);
+        let if_stmt = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: block(vec![assign(target, HirExpr::Integer(7))]),
+            else_block: None,
+        }));
+        let physical = BranchValueLocalScopeFacts {
+            physical_root_locals: BTreeSet::from([target]),
+            ..BranchValueLocalScopeFacts::default()
+        };
+        let debug = BranchValueLocalScopeFacts {
+            debug_locals: BTreeSet::from([target]),
+            ..BranchValueLocalScopeFacts::default()
+        };
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+
+        for scope_facts in [&physical, &debug] {
+            assert!(
+                collapsible_branch_value_local(
+                    &empty_local(target),
+                    &if_stmt,
+                    scope_facts,
+                    safety,
+                )
+                .is_none()
+            );
+        }
+    }
 }

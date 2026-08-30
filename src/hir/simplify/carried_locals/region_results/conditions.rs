@@ -2,6 +2,29 @@
 
 use super::*;
 
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ExitValue {
+    Expr { expr: HirExpr, target: usize },
+    TailProjection { projection: usize, target: usize },
+}
+
+impl ExitValue {
+    pub(super) fn exact_binding(&self) -> Option<CarryBinding> {
+        let Self::Expr { expr, .. } = self else {
+            return None;
+        };
+        carry_binding_from_expr(expr)
+    }
+
+    pub(super) fn target_index(&self) -> usize {
+        match self {
+            Self::Expr { target, .. } | Self::TailProjection { target, .. } => *target,
+        }
+    }
+}
+
+pub(super) type ExitValues = BTreeMap<CarryBinding, ExitValue>;
+
 pub(super) fn inline_owned_branch_conditions(
     block: &mut HirBlock,
     candidates: &BTreeSet<LocalId>,
@@ -104,14 +127,16 @@ pub(super) fn condition_scratch_producer(stmt: &HirStmt) -> Option<(LocalId, &Hi
         }
         _ => return None,
     };
-    let [value] = values.fixed.as_slice() else {
-        return None;
+    let value = match (values.fixed.as_slice(), values.tail.as_ref()) {
+        ([value], None) => value,
+        ([], Some(tail)) => tail.as_expr(),
+        _ => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：scratch 之外的 fixed/tail 表达式也会被求值；只把首值移入 condition 会删掉其求值。
+            return None;
+        }
     };
-    if values.tail.is_some()
-        || collect_binding_mentions_in_expr(value).contains(&CarryBinding::Local(binding))
-    {
+    if collect_binding_mentions_in_expr(value).contains(&CarryBinding::Local(binding)) {
         // 候选拒绝[SemanticBarrier:Scope]：producer RHS 自读 local 时，内联到 if 后会从声明前/旧 epoch 改为当前 binding 读取。
-        // 候选拒绝[ProofIncomplete]：open-tail condition producer 尚未用单值截断事实证明可内联。
         return None;
     }
     Some((binding, value))
@@ -135,7 +160,7 @@ pub(super) fn condition_if_uses_only(stmt: &HirStmt, local: LocalId) -> bool {
 pub(super) fn collect_fallthrough_assignments(
     block: &HirBlock,
     results: &[CarryBinding],
-    exits: &mut Vec<BTreeMap<CarryBinding, HirExpr>>,
+    exits: &mut Vec<ExitValues>,
 ) -> Option<bool> {
     let (last, prefix) = block.stmts.split_last()?;
     if bindings_are_mentioned_in_stmts(prefix, results) {
@@ -162,29 +187,212 @@ pub(super) fn collect_fallthrough_assignments(
 pub(super) fn result_assignment_values(
     assign: &HirAssign,
     results: &[CarryBinding],
-) -> Option<BTreeMap<CarryBinding, HirExpr>> {
-    let values = assignment_values(assign)?;
-    let result_values = results
-        .iter()
-        .map(|result| Some((*result, values.get(result)?.clone())))
-        .collect::<Option<BTreeMap<_, _>>>()?;
-    (!bindings_are_mentioned_in_exprs(result_values.values(), results)).then_some(result_values)
-}
-
-pub(super) fn assignment_values(assign: &HirAssign) -> Option<BTreeMap<CarryBinding, HirExpr>> {
-    // 候选拒绝[ProofIncomplete]：open-tail/非等宽 assignment 缺完整 value-pack 与 target 对位事实。
-    if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
+) -> Option<ExitValues> {
+    if assignment_reads_bindings(assign, results) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：fallthrough assignment 的其它 RHS/左值地址也在并行写前读取旧 result，不能随 result 一起改名。
         return None;
     }
-    let mut values = BTreeMap::new();
-    for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+    let values = assignment_values(assign);
+    results
+        .iter()
+        .map(|result| values.get(result))
+        .collect::<Option<Vec<_>>>()?;
+    Some(values)
+}
+
+pub(super) fn assignment_values(assign: &HirAssign) -> ExitValues {
+    let mut values = ExitValues::new();
+    for (index, target) in assign.targets.iter().enumerate() {
         let Some(binding) = carry_binding_from_lvalue(target) else {
             continue;
         };
-        if values.insert(binding, value.clone()).is_some() {
-            // 候选拒绝[SemanticBarrier:EvalOrder]：同一 binding 多次出现在并行 targets 时，最后写胜出；Map 合并会丢失位置语义。
-            return None;
-        }
+        let value = if let Some(value) = assign.values.fixed.get(index) {
+            ExitValue::Expr {
+                expr: value.clone(),
+                target: index,
+            }
+        } else if assign.values.tail.is_some() {
+            ExitValue::TailProjection {
+                projection: index - assign.values.fixed.len(),
+                target: index,
+            }
+        } else {
+            ExitValue::Expr {
+                expr: HirExpr::Nil,
+                target: index,
+            }
+        };
+        values.insert(binding, value);
     }
-    Some(values)
+    values
+}
+
+pub(super) fn assignment_reads_bindings(assign: &HirAssign, bindings: &[CarryBinding]) -> bool {
+    bindings_are_mentioned_in_exprs(assign.values.iter(), bindings)
+        || assign.targets.iter().any(|target| {
+            let HirLValue::TableAccess(access) = target else {
+                return false;
+            };
+            bindings.iter().any(|binding| {
+                collect_binding_mentions_in_expr(&access.base).contains(binding)
+                    || collect_binding_mentions_in_expr(&access.key).contains(binding)
+            })
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirPackTail, HirTableAccess, TempId};
+
+    #[test]
+    fn tail_only_condition_producer_preserves_scalar_consumption() {
+        let local = LocalId(0);
+        let stmt = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![local],
+            values: HirValuePack::expanding(Vec::new(), HirPackTail::open(HirExpr::VarArg)),
+        }));
+
+        assert_eq!(
+            condition_scratch_producer(&stmt),
+            Some((local, &HirExpr::VarArg))
+        );
+    }
+
+    #[test]
+    fn condition_producer_rejects_extra_tail_evaluation() {
+        let stmt = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![LocalId(0)],
+            values: HirValuePack::expanding(
+                vec![HirExpr::Boolean(true)],
+                HirPackTail::open(HirExpr::VarArg),
+            ),
+        }));
+
+        assert!(condition_scratch_producer(&stmt).is_none());
+    }
+
+    #[test]
+    fn closed_assignment_values_follow_lua_padding_and_truncation() {
+        let padded = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+        };
+        let truncated = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(8)]),
+        };
+
+        let padded = assignment_values(&padded);
+        let truncated = assignment_values(&truncated);
+
+        assert_eq!(
+            padded.get(&CarryBinding::Local(LocalId(1))),
+            Some(&ExitValue::Expr {
+                expr: HirExpr::Nil,
+                target: 1,
+            })
+        );
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(
+            truncated.get(&CarryBinding::Local(LocalId(0))),
+            Some(&ExitValue::Expr {
+                expr: HirExpr::Integer(7),
+                target: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn open_tail_values_retain_target_projection_positions() {
+        let assign = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
+            values: HirValuePack::expanding(Vec::new(), HirPackTail::open(HirExpr::VarArg)),
+        };
+
+        let values = assignment_values(&assign);
+
+        assert_eq!(
+            values.get(&CarryBinding::Local(LocalId(0))),
+            Some(&ExitValue::TailProjection {
+                projection: 0,
+                target: 0,
+            })
+        );
+        assert_eq!(
+            values.get(&CarryBinding::Local(LocalId(1))),
+            Some(&ExitValue::TailProjection {
+                projection: 1,
+                target: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_targets_keep_the_last_parallel_write() {
+        let result = CarryBinding::Local(LocalId(0));
+        let assign = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(0))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(8)]),
+        };
+
+        let values = assignment_values(&assign);
+
+        assert_eq!(
+            values.get(&result),
+            Some(&ExitValue::Expr {
+                expr: HirExpr::Integer(8),
+                target: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn result_mapping_rejects_parallel_sibling_rhs_read() {
+        let result = CarryBinding::Local(LocalId(0));
+        let assign = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Temp(TempId(0))],
+            values: HirValuePack::fixed(vec![
+                HirExpr::LocalRef(LocalId(1)),
+                HirExpr::LocalRef(LocalId(0)),
+            ]),
+        };
+
+        assert!(result_assignment_values(&assign, &[result]).is_none());
+        assert!(complete_result_assignment_values(&assign, &[result]).is_none());
+    }
+
+    #[test]
+    fn result_mapping_keeps_side_writes_for_seed_order_proof() {
+        let result = CarryBinding::Local(LocalId(0));
+        let seed = CarryBinding::Local(LocalId(1));
+        let assign = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
+            values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1)), HirExpr::Integer(7)]),
+        };
+
+        let values = result_assignment_values(&assign, &[result])
+            .expect("side writes are exit facts, not discarded targets");
+
+        assert!(values.contains_key(&result));
+        assert!(values.contains_key(&seed));
+        assert!(values[&seed].target_index() > values[&result].target_index());
+    }
+
+    #[test]
+    fn result_mapping_rejects_parallel_lvalue_address_read() {
+        let result = CarryBinding::Local(LocalId(0));
+        let assign = HirAssign {
+            targets: vec![
+                HirLValue::Local(LocalId(0)),
+                HirLValue::TableAccess(Box::new(HirTableAccess {
+                    base: HirExpr::LocalRef(LocalId(0)),
+                    key: HirExpr::Integer(1),
+                })),
+            ],
+            values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1)), HirExpr::Integer(7)]),
+        };
+
+        assert!(result_assignment_values(&assign, &[result]).is_none());
+    }
 }

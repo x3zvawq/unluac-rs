@@ -16,11 +16,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::decompile::DecompileDialect;
 use crate::hir::common::{
-    HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack, TempId,
+    HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack, LocalId, ParamId,
+    TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::collect_temp_use_counts;
+use super::visit::{HirVisitor, visit_expr};
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn fold_generic_for_iterators_in_proto(
@@ -214,31 +216,28 @@ fn iterator_pack_can_cross_assignment(
         return false;
     }
 
-    let gap_target_slots = match direct_target_home_slots(&gap.targets, context.facts) {
-        Ok(slots) => slots,
-        Err(CrossGapFactError::MissingHome) => {
-            // 候选拒绝[ProofIncomplete]：gap direct target 缺可信 home 时，尚不能证明它不覆盖 iterator 的 source/target；应由 promotion provenance 补齐。
-            return false;
-        }
-        Err(CrossGapFactError::Observable) => {
+    let gap_targets = match direct_target_locations(&gap.targets, context.facts) {
+        Ok(locations) => locations,
+        Err(LocationFactError::Observable) => {
             // 候选拒绝[SemanticBarrier:EvalOrder]：upvalue/global/table 左值可执行 user code 或改变 loop head 可观察状态，iterator 求值不能跨过它。
             return false;
         }
+        Err(LocationFactError::Opaque) => unreachable!("lvalue cannot be opaque"),
     };
-    let gap_source_slots = match stable_value_home_slots(&gap.values.fixed, context.facts) {
-        Ok(slots) => slots,
-        Err(CrossGapFactError::MissingHome) => {
-            // 候选拒绝[ProofIncomplete]：gap source 缺可信 home 时，尚不能证明它不读取已删除的 iterator target；应由 promotion provenance 补齐。
+    let gap_sources = match stable_value_locations(&gap.values.fixed, context.facts) {
+        Ok(locations) => locations,
+        Err(LocationFactError::Observable) => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：call、lookup、closure 或运算表达式跨 iterator producer 可执行 user code/读取可变状态；这里只移动字面量和可信直接 binding。
             return false;
         }
-        Err(CrossGapFactError::Observable) => {
-            // 候选拒绝[SemanticBarrier:EvalOrder]：call、lookup、closure 或运算表达式跨 iterator producer 可执行 user code/读取可变状态；这里只移动字面量和可信直接 binding。
+        Err(LocationFactError::Opaque) => {
+            // 候选拒绝[LayerBoundary]：Decision/Unresolved 由 residual/decision owner 消解，本 pass 不把它们延迟进 loop head。
             return false;
         }
     };
 
-    let mut iterator_target_slots = BTreeSet::new();
-    let mut iterator_source_slots = BTreeSet::new();
+    let mut iterator_targets = BindingLocations::default();
+    let mut iterator_sources = BindingLocations::default();
     for stmt in assignments {
         let HirStmt::Assign(assign) = stmt else {
             return false;
@@ -252,78 +251,126 @@ fn iterator_pack_can_cross_assignment(
             // 候选拒绝[SemanticBarrier:EvalOrder]：`factory()<exact:N>; gap; for ...` 合并后会把 factory call 延迟到 gap 后；factory 可观察 gap 前后的状态。
             return false;
         }
-        for target in &assign.targets {
-            let HirLValue::Temp(temp) = target else {
-                return false;
-            };
-            let Some(slot) = context.facts.trusted_temp_home_slot(*temp) else {
-                // 候选拒绝[ProofIncomplete]：iterator target 缺可信 home，无法排除与 gap assignment 同槽；应由 promotion provenance 补齐。
-                return false;
-            };
-            iterator_target_slots.insert(slot);
-        }
-        let source_slots = match stable_value_home_slots(&assign.values.fixed, context.facts) {
-            Ok(slots) => slots,
-            Err(CrossGapFactError::MissingHome) => {
-                // 候选拒绝[ProofIncomplete]：iterator source 缺可信 home 时，尚不能证明 gap 不会覆盖延迟读取；应由 promotion provenance 补齐。
-                return false;
-            }
-            Err(CrossGapFactError::Observable) => {
+        let Ok(targets) = direct_target_locations(&assign.targets, context.facts) else {
+            return false;
+        };
+        iterator_targets.extend(targets);
+        let sources = match stable_value_locations(&assign.values.fixed, context.facts) {
+            Ok(locations) => locations,
+            Err(LocationFactError::Observable) => {
                 // 候选拒绝[SemanticBarrier:EvalOrder]：可观察 iterator RHS 延迟到 gap 后会重排 call/lookup/metamethod；只接纳字面量和可信直接 binding。
                 return false;
             }
+            Err(LocationFactError::Opaque) => {
+                // 候选拒绝[LayerBoundary]：Decision/Unresolved 不能随 producer 延迟跨过 gap，交给 residual/decision owner。
+                return false;
+            }
         };
-        iterator_source_slots.extend(source_slots);
+        iterator_sources.extend(sources);
     }
 
-    // 候选拒绝[SemanticBarrier:EvalOrder]：若 gap 读写槽与 iterator source/target 重叠，移动 pack 到 gap 后会改变被复制或被循环读取的值。
-    iterator_target_slots.is_disjoint(&gap_target_slots)
-        && iterator_source_slots.is_disjoint(&gap_target_slots)
-        && iterator_target_slots.is_disjoint(&gap_source_slots)
+    let dependency = locations_are_disjoint(&iterator_targets, &gap_targets)
+        .and(locations_are_disjoint(&iterator_sources, &gap_targets))
+        .and(locations_are_disjoint(&iterator_targets, &gap_sources));
+    match dependency {
+        LocationDisjointness::Proven => true,
+        LocationDisjointness::Overlap => {
+            // 候选拒绝[SemanticBarrier:ValueFlow]：gap 若读写 iterator source/target 的同一 binding 或 exact home，延迟 producer 会改变 gap 快照或 loop 输入。
+            false
+        }
+        LocationDisjointness::MissingHome => {
+            // 候选拒绝[ProofIncomplete]：跨 gap 的两端仍有可能来自物理槽、但至少一端缺 trusted home；promotion provenance 尚不能排除 raw-home alias。
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum DirectBinding {
+    Param(ParamId),
+    Local(LocalId),
+    Temp(TempId),
+}
+
+#[derive(Default)]
+struct BindingLocations {
+    bindings: BTreeSet<DirectBinding>,
+    physical_homes: BTreeSet<HomeSlotKey>,
+    has_unknown_physical_home: bool,
+}
+
+impl BindingLocations {
+    fn insert(&mut self, binding: DirectBinding, facts: &ProtoPromotionFacts) {
+        self.bindings.insert(binding);
+        match binding {
+            DirectBinding::Param(param) => match facts.trusted_param_home_slot(param) {
+                Some(home) => {
+                    self.physical_homes.insert(home);
+                }
+                None => self.has_unknown_physical_home = true,
+            },
+            DirectBinding::Local(local) => match facts.trusted_local_home_slot(local) {
+                Some(home) => {
+                    self.physical_homes.insert(home);
+                }
+                None if facts.local_has_no_physical_home(local) => {}
+                None => self.has_unknown_physical_home = true,
+            },
+            DirectBinding::Temp(temp) => match facts.trusted_temp_home_slot(temp) {
+                Some(home) => {
+                    self.physical_homes.insert(home);
+                }
+                None => self.has_unknown_physical_home = true,
+            },
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.bindings.extend(other.bindings);
+        self.physical_homes.extend(other.physical_homes);
+        self.has_unknown_physical_home |= other.has_unknown_physical_home;
+    }
+
+    fn can_have_physical_home(&self) -> bool {
+        self.has_unknown_physical_home || !self.physical_homes.is_empty()
+    }
 }
 
 #[derive(Clone, Copy)]
-enum CrossGapFactError {
-    MissingHome,
+enum LocationFactError {
     Observable,
+    Opaque,
 }
 
-fn direct_target_home_slots(
+fn direct_target_locations(
     targets: &[HirLValue],
     facts: &ProtoPromotionFacts,
-) -> Result<BTreeSet<HomeSlotKey>, CrossGapFactError> {
-    let mut slots = BTreeSet::new();
+) -> Result<BindingLocations, LocationFactError> {
+    let mut locations = BindingLocations::default();
     for target in targets {
-        let slot = match target {
-            HirLValue::Param(param) => facts.trusted_param_home_slot(*param),
-            HirLValue::Local(local) => facts.trusted_local_home_slot(*local),
-            HirLValue::Temp(temp) => facts.trusted_temp_home_slot(*temp),
+        let binding = match target {
+            HirLValue::Param(param) => DirectBinding::Param(*param),
+            HirLValue::Local(local) => DirectBinding::Local(*local),
+            HirLValue::Temp(temp) => DirectBinding::Temp(*temp),
             HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
-                return Err(CrossGapFactError::Observable);
+                return Err(LocationFactError::Observable);
             }
-        }
-        .ok_or(CrossGapFactError::MissingHome)?;
-        slots.insert(slot);
+        };
+        locations.insert(binding, facts);
     }
-    Ok(slots)
+    Ok(locations)
 }
 
-fn stable_value_home_slots(
+fn stable_value_locations(
     values: &[HirExpr],
     facts: &ProtoPromotionFacts,
-) -> Result<BTreeSet<HomeSlotKey>, CrossGapFactError> {
-    let mut slots = BTreeSet::new();
+) -> Result<BindingLocations, LocationFactError> {
+    let mut locations = BindingLocations::default();
     for value in values {
-        let slot = match value {
-            HirExpr::ParamRef(param) => facts
-                .trusted_param_home_slot(*param)
-                .ok_or(CrossGapFactError::MissingHome)?,
-            HirExpr::LocalRef(local) => facts
-                .trusted_local_home_slot(*local)
-                .ok_or(CrossGapFactError::MissingHome)?,
-            HirExpr::TempRef(temp) => facts
-                .trusted_temp_home_slot(*temp)
-                .ok_or(CrossGapFactError::MissingHome)?,
+        let binding = match value {
+            HirExpr::ParamRef(param) => Some(DirectBinding::Param(*param)),
+            HirExpr::LocalRef(local) => Some(DirectBinding::Local(*local)),
+            HirExpr::TempRef(temp) => Some(DirectBinding::Temp(*temp)),
             HirExpr::Nil
             | HirExpr::Boolean(_)
             | HirExpr::Integer(_)
@@ -333,23 +380,144 @@ fn stable_value_home_slots(
             | HirExpr::UInt64(_)
             | HirExpr::Complex { .. }
             | HirExpr::Vector(_)
-            | HirExpr::UpvalueRef(_) => continue,
+            | HirExpr::UpvalueRef(_) => None,
+            HirExpr::Decision(_) | HirExpr::Unresolved(_) => {
+                return Err(LocationFactError::Opaque);
+            }
             HirExpr::GlobalRef(_)
             | HirExpr::TableAccess(_)
             | HirExpr::Unary(_)
             | HirExpr::Binary(_)
             | HirExpr::LogicalAnd(_)
             | HirExpr::LogicalOr(_)
-            | HirExpr::Decision(_)
             | HirExpr::Call(_)
             | HirExpr::VarArg
             | HirExpr::TableConstructor(_)
-            | HirExpr::Closure(_)
-            | HirExpr::Unresolved(_) => return Err(CrossGapFactError::Observable),
+            | HirExpr::Closure(_) => return Err(LocationFactError::Observable),
         };
-        slots.insert(slot);
+        if let Some(binding) = binding {
+            locations.insert(binding, facts);
+        }
     }
-    Ok(slots)
+    Ok(locations)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LocationDisjointness {
+    Proven,
+    MissingHome,
+    Overlap,
+}
+
+impl LocationDisjointness {
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Overlap, _) | (_, Self::Overlap) => Self::Overlap,
+            (Self::MissingHome, _) | (_, Self::MissingHome) => Self::MissingHome,
+            (Self::Proven, Self::Proven) => Self::Proven,
+        }
+    }
+}
+
+fn locations_are_disjoint(
+    left: &BindingLocations,
+    right: &BindingLocations,
+) -> LocationDisjointness {
+    if !left.bindings.is_disjoint(&right.bindings)
+        || !left.physical_homes.is_disjoint(&right.physical_homes)
+    {
+        return LocationDisjointness::Overlap;
+    }
+    if left.has_unknown_physical_home && right.can_have_physical_home()
+        || right.has_unknown_physical_home && left.can_have_physical_home()
+    {
+        return LocationDisjointness::MissingHome;
+    }
+    LocationDisjointness::Proven
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProducerFlowFailure {
+    TargetOverlap,
+    SourceOverlap,
+    MissingHome,
+}
+
+fn iterator_assignments_preserve_value_flow(
+    assignments: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+) -> Result<(), ProducerFlowFailure> {
+    let mut prior_targets = BindingLocations::default();
+    for stmt in assignments {
+        let HirStmt::Assign(assign) = stmt else {
+            return Err(ProducerFlowFailure::MissingHome);
+        };
+        let mut current_targets = BindingLocations::default();
+        for target in &assign.targets {
+            let Ok(target) = direct_target_locations(std::slice::from_ref(target), facts) else {
+                return Err(ProducerFlowFailure::MissingHome);
+            };
+            let target_dependency = locations_are_disjoint(&prior_targets, &target)
+                .and(locations_are_disjoint(&current_targets, &target));
+            match target_dependency {
+                LocationDisjointness::Proven => {}
+                LocationDisjointness::Overlap => {
+                    return Err(ProducerFlowFailure::TargetOverlap);
+                }
+                LocationDisjointness::MissingHome => {
+                    return Err(ProducerFlowFailure::MissingHome);
+                }
+            }
+            current_targets.extend(target);
+        }
+
+        let sources = value_pack_binding_locations(&assign.values, facts);
+        match locations_are_disjoint(&prior_targets, &sources) {
+            LocationDisjointness::Proven => {}
+            LocationDisjointness::Overlap => return Err(ProducerFlowFailure::SourceOverlap),
+            LocationDisjointness::MissingHome => {
+                return Err(ProducerFlowFailure::MissingHome);
+            }
+        }
+        prior_targets.extend(current_targets);
+    }
+    Ok(())
+}
+
+fn value_pack_binding_locations(
+    values: &HirValuePack,
+    facts: &ProtoPromotionFacts,
+) -> BindingLocations {
+    let mut collector = BindingLocationCollector {
+        locations: BindingLocations::default(),
+        facts,
+    };
+    for value in &values.fixed {
+        visit_expr(value, &mut collector);
+    }
+    if let Some(tail) = &values.tail {
+        visit_expr(tail.as_expr(), &mut collector);
+    }
+    collector.locations
+}
+
+struct BindingLocationCollector<'a> {
+    locations: BindingLocations,
+    facts: &'a ProtoPromotionFacts,
+}
+
+impl HirVisitor for BindingLocationCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let binding = match expr {
+            HirExpr::ParamRef(param) => Some(DirectBinding::Param(*param)),
+            HirExpr::LocalRef(local) => Some(DirectBinding::Local(*local)),
+            HirExpr::TempRef(temp) => Some(DirectBinding::Temp(*temp)),
+            _ => None,
+        };
+        if let Some(binding) = binding {
+            self.locations.insert(binding, self.facts);
+        }
+    }
 }
 
 fn assignments_match_iterator(
@@ -410,7 +578,24 @@ fn assignments_match_iterator(
         }
         protocol_prefix_width += assign.targets.len();
     }
-    expected.next().is_none()
+    if expected.next().is_some() {
+        return false;
+    }
+    match iterator_assignments_preserve_value_flow(assignments, context.facts) {
+        Ok(()) => true,
+        Err(ProducerFlowFailure::TargetOverlap) => {
+            // 候选拒绝[SemanticBarrier:ValueFlow]：两个 producer target 若是同一 binding/exact home，原 loop 的两个 TempRef 都读最终覆盖值；合并 pack 会分别保留两个 RHS。
+            false
+        }
+        Err(ProducerFlowFailure::SourceOverlap) => {
+            // 候选拒绝[SemanticBarrier:ValueFlow]：后续 producer RHS 读取先前 target 的同一 binding/exact home 时，删除中间写会让它改读覆盖前的旧值。
+            false
+        }
+        Err(ProducerFlowFailure::MissingHome) => {
+            // 候选拒绝[ProofIncomplete]：多个 producer 之间仍有可能来自物理槽、但至少一端缺 trusted home；promotion provenance 尚不能证明中间写无人读取或覆盖。
+            false
+        }
+    }
 }
 
 fn generic_for_protocol_width(dialect: DecompileDialect) -> usize {
@@ -485,4 +670,161 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
     trim_trailing_nil_iterators(&mut iterator);
     generic_for.iterator = iterator;
     new_stmts.push(HirStmt::GenericFor(generic_for));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::HirAssign;
+
+    fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![target],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn generic_for(iterator: Vec<HirExpr>) -> HirStmt {
+        HirStmt::GenericFor(Box::new(HirGenericFor {
+            bindings: Vec::new(),
+            iterator: HirValuePack::fixed(iterator),
+            body: HirBlock::default(),
+        }))
+    }
+
+    fn context(
+        facts: &ProtoPromotionFacts,
+        used_temps: impl IntoIterator<Item = TempId>,
+    ) -> GenericForIteratorPass<'_> {
+        GenericForIteratorPass {
+            use_counts: used_temps.into_iter().map(|temp| (temp, 1)).collect(),
+            debug_temps: Vec::new(),
+            facts,
+            dialect: DecompileDialect::Lua54,
+        }
+    }
+
+    #[test]
+    fn cross_gap_accepts_unknown_temp_against_home_free_local() {
+        let iterator = TempId(0);
+        let gap_local = LocalId(0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(gap_local);
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            assign(HirLValue::Local(gap_local), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+        let context = context(&facts, [iterator]);
+
+        let plan = fold_plan(&stmts, &context).expect("home-free gap cannot alias raw temp");
+        assert_eq!((plan.assignment_count, plan.gap_count), (1, 1));
+
+        let mut pending = VecDeque::from(stmts);
+        let mut folded = Vec::new();
+        fold_front(&mut pending, plan, &mut folded);
+        assert_eq!(
+            folded,
+            vec![
+                assign(HirLValue::Local(gap_local), HirExpr::Integer(2)),
+                generic_for(vec![HirExpr::Integer(1)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_gap_rejects_exact_home_target_overlap() {
+        let iterator = TempId(0);
+        let gap_local = LocalId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        facts.record_local_home_slot(gap_local, home);
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            assign(HirLValue::Local(gap_local), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_none());
+    }
+
+    #[test]
+    fn cross_gap_rejects_unknown_physical_alias() {
+        let iterator = TempId(0);
+        let gap = TempId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(gap, HomeSlotKey::new(1, 0));
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(gap), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_none());
+    }
+
+    #[test]
+    fn cross_gap_rejects_same_target_by_occurrence_without_home() {
+        let iterator = TempId(0);
+        let facts = ProtoPromotionFacts::default();
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_none());
+    }
+
+    #[test]
+    fn adjacent_producers_reject_same_home_targets() {
+        let first = TempId(0);
+        let second = TempId(1);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(first, home);
+        facts.record_temp_home_slot_for_test(second, home);
+        let stmts = vec![
+            assign(HirLValue::Temp(first), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(second), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(first), HirExpr::TempRef(second)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [first, second])).is_none());
+    }
+
+    #[test]
+    fn adjacent_producer_rejects_read_of_prior_target_home() {
+        let first = TempId(0);
+        let second = TempId(1);
+        let alias = LocalId(0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(first, HomeSlotKey::new(0, 0));
+        facts.record_local_home_slot(alias, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_slot_for_test(second, HomeSlotKey::new(1, 0));
+        let stmts = vec![
+            assign(HirLValue::Temp(first), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(second), HirExpr::LocalRef(alias)),
+            generic_for(vec![HirExpr::TempRef(first), HirExpr::TempRef(second)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [first, second])).is_none());
+    }
+
+    #[test]
+    fn single_producer_allows_source_in_its_target_home() {
+        let iterator = TempId(0);
+        let source = LocalId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        facts.record_local_home_slot(source, home);
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::LocalRef(source)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_some());
+    }
 }

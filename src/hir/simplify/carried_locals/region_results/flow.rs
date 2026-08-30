@@ -93,8 +93,11 @@ fn find_candidate(
         }
         let state_candidates =
             writeback_targets(&block.stmts[declaration + 1..=last_mention], result_binding);
+        if state_candidates.is_empty() {
+            continue;
+        }
         let [state] = state_candidates.as_slice() else {
-            // 候选拒绝[ProofIncomplete]：零/多个 writeback target 需要 reaching-def/phi 对应关系，当前 verifier 只建模唯一 state。
+            // 候选拒绝[ProofIncomplete]：多个 writeback target 需要 reaching-def/phi 对应关系，当前 verifier 只建模唯一 state。
             continue;
         };
         let state = *state;
@@ -124,7 +127,6 @@ fn find_candidate(
             state,
         };
         let Some(states) = verifier.validate_initializer(initializer) else {
-            // 候选拒绝[ProofIncomplete]：initializer 的宽值/opaque/候选读取关系未被三态 verifier 表达。
             continue;
         };
         let Some(states) =
@@ -155,12 +157,9 @@ fn candidate_declaration(stmt: &HirStmt) -> Option<(LocalId, Option<&HirValuePac
     let [result] = local_decl.bindings.as_slice() else {
         return None;
     };
-    if local_decl.values.tail.is_some() || local_decl.values.fixed.len() > 1 {
-        return None;
-    }
     Some((
         *result,
-        (!local_decl.values.fixed.is_empty()).then_some(&local_decl.values),
+        (!local_decl.values.is_empty()).then_some(&local_decl.values),
     ))
 }
 
@@ -183,18 +182,18 @@ impl HirVisitor for WritebackTargetCollector {
         let HirStmt::Assign(assign) = stmt else {
             return;
         };
-        let ([target], [value], None) = (
-            assign.targets.as_slice(),
-            assign.values.fixed.as_slice(),
-            &assign.values.tail,
-        ) else {
-            return;
-        };
-        if binding_reads_in_expr(value).contains(&self.result)
-            && let Some(target) = carry_binding_from_lvalue(target)
-            && target != self.result
-        {
-            self.targets.insert(target);
+        for (index, target) in assign.targets.iter().enumerate() {
+            let value = assign
+                .values
+                .fixed
+                .get(index)
+                .or_else(|| assign.values.tail.as_ref().map(|tail| tail.as_expr()));
+            if value.is_some_and(|value| binding_reads_in_expr(value).contains(&self.result))
+                && let Some(target) = carry_binding_from_lvalue(target)
+                && target != self.result
+            {
+                self.targets.insert(target);
+            }
         }
     }
 }
@@ -247,12 +246,11 @@ impl FlowVerifier {
         let Some(initializer) = initializer else {
             return Some(RelationSet::only(Relation::Unproduced));
         };
-        let [value] = initializer.fixed.as_slice() else {
-            // 候选拒绝[ProofIncomplete]：多 fixed initializer 尚未建立 result 对应 value 的精确宽度映射。
-            return None;
-        };
         let states = RelationSet::only(Relation::Unproduced);
-        self.validate_expr(value, states)?;
+        self.validate_pack(initializer, states)?;
+        let value = initializer
+            .first()
+            .expect("non-empty result initializer must provide a first value");
         Some(if carry_binding_from_expr(value) == Some(self.state) {
             RelationSet::only(Relation::Synced)
         } else {
@@ -307,11 +305,8 @@ impl FlowVerifier {
                     .iter()
                     .copied()
                     .any(|local| [self.result, self.state].contains(&CarryBinding::Local(local)))
-                    || local_decl.values.tail.is_some()
-                        && self.pack_mentions_candidate(&local_decl.values)
                 {
                     // 候选拒绝[SemanticBarrier:Scope]：region 内重声明 result/state 会让批量 LocalId 改名跨越 lexical owner。
-                    // 候选拒绝[ProofIncomplete]：open-tail local pack 提及候选时缺逐目标 value-width 关系。
                     return None;
                 }
                 self.validate_pack(&local_decl.values, states)?;
@@ -326,46 +321,66 @@ impl FlowVerifier {
     }
 
     fn validate_assign(&self, assign: &HirAssign, states: RelationSet) -> Option<RelationSet> {
-        let ([target], [value], None) = (
-            assign.targets.as_slice(),
-            assign.values.fixed.as_slice(),
-            &assign.values.tail,
-        ) else {
-            // 候选拒绝[ProofIncomplete]：复杂 assignment 只有在完全不提候选时可穿过；候选相关并行/value-pack 转移尚未建模。
-            return (!self.assign_mentions_candidate(assign)).then_some(states);
+        self.validate_pack(&assign.values, states)?;
+        for target in &assign.targets {
+            self.validate_lvalue_address(target, states)?;
+        }
+
+        let mut next = RelationSet::EMPTY;
+        for relation in [Relation::Unproduced, Relation::Pending, Relation::Synced] {
+            if states.contains(relation) {
+                next = next.union(RelationSet::only(
+                    self.assignment_relation(assign, relation)?,
+                ));
+            }
+        }
+        Some(next)
+    }
+
+    fn assignment_relation(&self, assign: &HirAssign, relation: Relation) -> Option<Relation> {
+        let mut result_value = AssignmentValue::OldResult;
+        let mut state_value = AssignmentValue::OldState;
+        let mut merged_value = match relation {
+            Relation::Unproduced => AssignmentValue::OldState,
+            Relation::Pending | Relation::Synced => AssignmentValue::OldResult,
         };
-        self.validate_expr(value, states)?;
-        self.validate_lvalue_address(target, states)?;
-        match carry_binding_from_lvalue(target) {
-            Some(target) if target == self.result => {
-                if carry_binding_from_expr(value) == Some(self.result) {
-                    Some(states)
-                } else if carry_binding_from_expr(value) == Some(self.state) {
-                    Some(RelationSet::only(Relation::Synced))
-                } else {
-                    Some(RelationSet::only(Relation::Pending))
-                }
+
+        for (index, target) in assign.targets.iter().enumerate() {
+            let Some(target) = carry_binding_from_lvalue(target) else {
+                continue;
+            };
+            let value = self.assignment_value(assign, index);
+            if target == self.result {
+                result_value = value;
+                merged_value = value;
+            } else if target == self.state {
+                state_value = value;
+                merged_value = value;
             }
-            Some(target) if target == self.state => {
-                let reads = binding_reads_in_expr(value);
-                let reads_result = reads.contains(&self.result);
-                let reads_state = reads.contains(&self.state);
-                if reads_result && !reads_state {
-                    Some(RelationSet::only(
-                        if carry_binding_from_expr(value) == Some(self.result) {
-                            Relation::Synced
-                        } else {
-                            Relation::Unproduced
-                        },
-                    ))
-                } else if !reads_result {
-                    Some(RelationSet::only(Relation::Unproduced))
-                } else {
-                    // 候选拒绝[ProofIncomplete]：state RHS 同时读取 pending result 与旧 state 时，改名后两者同名，需表达式级双 epoch substitution。
-                    None
-                }
-            }
-            _ => Some(states),
+        }
+
+        let preserves_result = assignment_values_equal(merged_value, result_value, relation);
+        let preserves_state = assignment_values_equal(merged_value, state_value, relation);
+        match (preserves_result, preserves_state) {
+            (true, true) => Some(Relation::Synced),
+            (true, false) => Some(Relation::Pending),
+            (false, true) => Some(Relation::Unproduced),
+            (false, false) => None,
+        }
+    }
+
+    fn assignment_value(&self, assign: &HirAssign, target: usize) -> AssignmentValue {
+        if let Some(value) = assign.values.fixed.get(target) {
+            return match carry_binding_from_expr(value) {
+                Some(binding) if binding == self.result => AssignmentValue::OldResult,
+                Some(binding) if binding == self.state => AssignmentValue::OldState,
+                _ => AssignmentValue::Fixed(target),
+            };
+        }
+        if assign.values.tail.is_some() {
+            AssignmentValue::Tail(target - assign.values.fixed.len())
+        } else {
+            AssignmentValue::Nil
         }
     }
 
@@ -455,10 +470,6 @@ impl FlowVerifier {
     }
 
     fn validate_pack(&self, pack: &HirValuePack, states: RelationSet) -> Option<()> {
-        if pack.tail.is_some() && self.pack_mentions_candidate(pack) {
-            // 候选拒绝[ProofIncomplete]：open-tail 中候选值的多返回宽度与消费位置尚未建模。
-            return None;
-        }
         for value in pack {
             self.validate_expr(value, states)?;
         }
@@ -486,30 +497,36 @@ impl FlowVerifier {
         (!reads.contains(&self.result) || !states.contains(Relation::Unproduced)).then_some(())?;
         (!reads.contains(&self.state) || !states.contains(Relation::Pending)).then_some(())
     }
-
-    fn stmt_mentions_candidate(&self, stmt: &HirStmt) -> bool {
-        let mentions = collect_binding_mentions_by_stmt(std::slice::from_ref(stmt));
-        mentions[0].contains(&self.result) || mentions[0].contains(&self.state)
-    }
-
-    fn assign_mentions_candidate(&self, assign: &HirAssign) -> bool {
-        let stmt = HirStmt::Assign(Box::new(assign.clone()));
-        self.stmt_mentions_candidate(&stmt)
-    }
-
-    fn pack_mentions_candidate(&self, pack: &HirValuePack) -> bool {
-        pack.into_iter().any(|expr| {
-            let reads = binding_reads_in_expr(expr);
-            reads.contains(&self.result) || reads.contains(&self.state)
-        })
-    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Relation {
     Unproduced = 1,
     Pending = 2,
     Synced = 4,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AssignmentValue {
+    OldResult,
+    OldState,
+    Fixed(usize),
+    Tail(usize),
+    Nil,
+}
+
+fn assignment_values_equal(
+    left: AssignmentValue,
+    right: AssignmentValue,
+    relation: Relation,
+) -> bool {
+    left == right
+        || relation == Relation::Synced
+            && matches!(
+                (left, right),
+                (AssignmentValue::OldResult, AssignmentValue::OldState)
+                    | (AssignmentValue::OldState, AssignmentValue::OldResult)
+            )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -654,5 +671,129 @@ fn binding_lvalue(binding: CarryBinding) -> HirLValue {
         CarryBinding::Param(param) => HirLValue::Param(param),
         CarryBinding::Local(local) => HirLValue::Local(local),
         CarryBinding::Temp(temp) => HirLValue::Temp(temp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirPackTail, TempId};
+
+    fn verifier() -> FlowVerifier {
+        FlowVerifier {
+            result: CarryBinding::Local(LocalId(0)),
+            state: CarryBinding::Local(LocalId(1)),
+        }
+    }
+
+    #[test]
+    fn initializer_uses_first_slot_but_validates_the_complete_pack() {
+        let verifier = verifier();
+        let initializer = HirValuePack::expanding(
+            vec![HirExpr::LocalRef(LocalId(1)), HirExpr::Integer(7)],
+            HirPackTail::open(HirExpr::VarArg),
+        );
+
+        let states = verifier
+            .validate_initializer(Some(&initializer))
+            .expect("multi-expression initializer has an exact first target slot");
+
+        assert!(states.contains(Relation::Synced));
+        assert!(!states.contains(Relation::Pending));
+    }
+
+    #[test]
+    fn parallel_assignment_tracks_the_last_merged_target() {
+        let verifier = verifier();
+        let assign = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::LocalRef(LocalId(0))]),
+        };
+
+        let states = verifier
+            .validate_assign(&assign, RelationSet::only(Relation::Pending))
+            .expect("the final merged slot retains the original state write");
+
+        assert!(states.contains(Relation::Unproduced));
+        assert!(!states.contains(Relation::Pending));
+    }
+
+    #[test]
+    fn parallel_assignment_rejects_old_state_read_during_pending_epoch() {
+        let verifier = verifier();
+        let assign = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::LocalRef(LocalId(1))]),
+        };
+
+        assert!(
+            verifier
+                .validate_assign(&assign, RelationSet::only(Relation::Pending))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn open_tail_assignment_tracks_each_consumed_target_slot() {
+        let verifier = verifier();
+        let assign = HirAssign {
+            targets: vec![HirLValue::Temp(TempId(0)), HirLValue::Local(LocalId(1))],
+            values: HirValuePack::expanding(Vec::new(), HirPackTail::open(HirExpr::VarArg)),
+        };
+
+        let states = verifier
+            .validate_assign(&assign, RelationSet::only(Relation::Pending))
+            .expect("tail result positions remain unchanged by the binding rewrite");
+
+        assert!(states.contains(Relation::Unproduced));
+        assert!(!states.contains(Relation::Pending));
+    }
+
+    #[test]
+    fn parallel_writeback_target_is_discovered_from_its_rhs_slot() {
+        let result = CarryBinding::Local(LocalId(0));
+        let assign = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(TempId(0)), HirLValue::Local(LocalId(1))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::LocalRef(LocalId(0))]),
+        }));
+
+        assert!(writeback_targets(&[assign], result) == vec![CarryBinding::Local(LocalId(1))]);
+    }
+
+    #[test]
+    fn apply_keeps_parallel_last_write_after_result_merge() {
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![LocalId(0)],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
+                    values: HirValuePack::fixed(vec![
+                        HirExpr::Integer(7),
+                        HirExpr::LocalRef(LocalId(0)),
+                    ]),
+                })),
+            ],
+        };
+
+        apply_candidate(
+            &mut block,
+            Candidate {
+                declaration: 0,
+                last_mention: 1,
+                result: LocalId(0),
+                state: CarryBinding::Local(LocalId(1)),
+                initializer: None,
+            },
+            &mut ProtoPromotionFacts::default(),
+        );
+
+        let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+            panic!("result declaration should be removed without splitting the assignment");
+        };
+        assert!(assign.targets == vec![HirLValue::Local(LocalId(1)), HirLValue::Local(LocalId(1))]);
+        assert!(assign.values.fixed == vec![HirExpr::Integer(7), HirExpr::LocalRef(LocalId(1))]);
     }
 }

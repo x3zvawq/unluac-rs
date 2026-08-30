@@ -309,6 +309,29 @@ fn rebuild_decision(
     )
 }
 
+/// 把某条 Decision edge 投影为独立的值表达式。
+///
+/// `CurrentValue` 属于 edge 的父节点，调用方必须传入该已选路径上的精确值；Node edge
+/// 则只保留其可达子图并重编号，避免构造带不可达 root 的非法 Decision。
+pub(super) fn project_value_decision_target(
+    decision: &HirDecisionExpr,
+    target: &HirDecisionTarget,
+    current_value: HirExpr,
+    safety: HirExprSafety,
+) -> HirExpr {
+    assert_valid_decision(decision);
+    match target {
+        HirDecisionTarget::Expr(expr) => expr.clone(),
+        HirDecisionTarget::CurrentValue => current_value,
+        HirDecisionTarget::Node(entry) => {
+            let (projected, _) = rebuild_decision(*entry, &decision.nodes);
+            assert_valid_decision(&projected);
+            collapse_value_decision_expr(&projected, safety)
+                .unwrap_or_else(|| HirExpr::Decision(Box::new(projected)))
+        }
+    }
+}
+
 fn remap_target(
     target: &HirDecisionTarget,
     remap: &BTreeMap<HirDecisionNodeRef, HirDecisionNodeRef>,
@@ -863,7 +886,8 @@ fn combine_condition_expr(
             logical_and(falsy_guard, falsy),
         ));
     }
-    // 候选拒绝[ProofIncomplete]：非稳定条件/分支需要 eliminate-decisions 提供条件前缀物化，当前纯表达式通道无法只求值选中臂一次。
+    // 候选拒绝[LayerBoundary]：非稳定条件/分支需要 statement prefix 才能只求值选中臂
+    // 一次；纯表达式 collapse 返回 None，由 eliminate-decisions 的语句 owner 物化。
     None
 }
 

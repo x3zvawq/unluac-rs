@@ -58,9 +58,8 @@ struct ExactNilHomeOverwrite {
     eligible: bool,
 }
 
-struct ExactBranchHomeOverwrite {
+struct ExactHomeOverwrite {
     temps: BTreeSet<TempId>,
-    home: HomeSlotKey,
     eligible: bool,
 }
 
@@ -303,12 +302,11 @@ pub(super) fn collect_call_root_lifetimes(
         }
         let reads = uses.reads_at(index);
         let read_observations = active
-            .values()
-            .filter(|root| {
-                reads
-                    .is_some_and(|reads| root.aliases.iter().any(|temp| reads.contains(temp)))
+            .iter()
+            .filter(|(_, root)| {
+                reads.is_some_and(|reads| root.aliases.iter().any(|temp| reads.contains(temp)))
             })
-            .filter_map(|root| {
+            .filter_map(|(home, root)| {
                 // A read still needs the same-local overwrite pairing, but a loop predicate or
                 // a direct `if temp`/`if not temp` test only consumes the value as control flow.
                 // Treating those forwarding reads as observations materializes ordinary loop
@@ -322,9 +320,21 @@ pub(super) fn collect_call_root_lifetimes(
                         | HirStmt::NumericFor(_)
                         | HirStmt::GenericFor(_)
                 );
+                let current_read_is_gc_inert_grouped_overwrite =
+                    !stmt_may_observe_gc_roots(stmt, safety) && {
+                        let mut every_temp_is_eligible = |_| true;
+                        definite_grouped_home_overwrite(
+                            stmt,
+                            *home,
+                            facts,
+                            &mut every_temp_is_eligible,
+                        )
+                        .is_some()
+                    };
                 ((!is_loop_control
                     && !stmt_is_direct_if_control_read(stmt, &root.aliases)
-                    && !stmt_is_transparent_temp_copy(stmt, &root.aliases))
+                    && !stmt_is_transparent_temp_copy(stmt, &root.aliases)
+                    && !current_read_is_gc_inert_grouped_overwrite)
                     || uses.has_gc_fence_after(index))
                 .then_some(root.value_id)
             })
@@ -420,17 +430,47 @@ pub(super) fn collect_call_root_lifetimes(
                 }
                 continue;
             }
-            if let Some(overwrite) = definite_gc_inert_branch_home_overwrite(
-                stmt,
-                facts,
-                &mut overwrite_temp_is_eligible,
-                safety,
-            ) {
-                if let Some(root) = active.remove(&overwrite.home) {
+            let mut proven_homes = BTreeSet::new();
+            let active_homes = active
+                .keys()
+                .copied()
+                .chain(
+                    active_allocations
+                        .iter()
+                        .flat_map(|root| root.homes.iter().copied()),
+                )
+                .collect::<BTreeSet<_>>();
+            let grouped_assignment_is_complete =
+                grouped_assignment_targets_are_active(stmt, facts, &active_homes);
+            for home in active_homes {
+                if !grouped_assignment_is_complete {
+                    break;
+                }
+                let Some(overwrite) = definite_grouped_home_overwrite(
+                    stmt,
+                    home,
+                    facts,
+                    &mut overwrite_temp_is_eligible,
+                ) else {
+                    continue;
+                };
+                proven_homes.insert(home);
+                let active_root_is_read = active.get(&home).is_some_and(|root| {
+                    reads
+                        .is_some_and(|reads| root.aliases.iter().any(|alias| reads.contains(alias)))
+                });
+                for temp in &overwrite.temps {
+                    for root in active.values_mut() {
+                        root.aliases.remove(temp);
+                    }
+                }
+                if let Some(root) = active.remove(&home)
+                    && !active_root_is_read
+                {
                     record_call_root_overwrite(
                         root,
                         index,
-                        overwrite.home,
+                        home,
                         overwrite.eligible,
                         &uses,
                         &mut lifetimes,
@@ -442,12 +482,12 @@ pub(super) fn collect_call_root_lifetimes(
                     &uses,
                     facts,
                     index,
-                    overwrite.home,
+                    home,
                     overwrite.eligible,
                 );
-                continue;
             }
-            let writes = StackWriteSummary::for_stmt(stmt, facts);
+            let mut writes = StackWriteSummary::for_stmt(stmt, facts);
+            writes.homes.retain(|home| !proven_homes.contains(home));
             if writes.has_boundary || writes.has_unknown_home {
                 active.clear();
                 active_allocations.clear();
@@ -615,7 +655,7 @@ pub(super) fn collect_call_root_lifetimes(
 pub(super) fn collect_lookup_gc_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
+    _safety: HirExprSafety,
     mut temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> LookupGcRootLifetimeIndices {
     let uses = TempUseEvents::new(stmts);
@@ -670,39 +710,49 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 }
                 continue;
             }
-            if let Some(overwrite) =
-                definite_gc_inert_branch_home_overwrite(stmt, facts, &mut temp_is_eligible, safety)
-            {
+            let mut proven_homes = BTreeSet::new();
+            let active_homes = active.keys().copied().collect::<Vec<_>>();
+            let active_home_set = active_homes.iter().copied().collect::<BTreeSet<_>>();
+            let grouped_assignment_is_complete =
+                grouped_assignment_targets_are_active(stmt, facts, &active_home_set);
+            for home in active_homes {
+                if !grouped_assignment_is_complete {
+                    break;
+                }
+                let Some(overwrite) =
+                    definite_grouped_home_overwrite(stmt, home, facts, &mut temp_is_eligible)
+                else {
+                    continue;
+                };
+                proven_homes.insert(home);
                 for temp in &overwrite.temps {
                     value_by_temp.remove(temp);
                     for root in active.values_mut() {
                         root.aliases.remove(temp);
                     }
                 }
-                if let Some(mut root) = active.remove(&overwrite.home) {
-                    for alias in &root.aliases {
-                        value_by_temp.remove(alias);
-                    }
-                    // The VM releases this lookup home on every arm before the later GC. Mark
-                    // that future observation here; ordinary scalar/copy overwrites stay on the
-                    // narrower crossed-fence contract to avoid materializing mechanical chains.
-                    root.crossed_gc_fence |= uses.has_gc_fence_after(index);
-                    record_lookup_root_overwrite(
-                        root,
-                        index,
-                        overwrite.home,
-                        overwrite.eligible,
-                        &uses,
-                        facts,
-                        &mut lifetimes,
-                    );
+                let Some(mut root) = active.remove(&home) else {
+                    continue;
+                };
+                for alias in &root.aliases {
+                    value_by_temp.remove(alias);
                 }
-                continue;
+                // Grouped assignment evaluates every RHS and branch/block prefix while the old
+                // physical home is still owned by this local. Each proven path then commits a
+                // target for the same home, so the old lookup can terminate at this statement.
+                root.crossed_gc_fence |= uses.has_gc_fence_after(index);
+                record_lookup_root_overwrite(
+                    root,
+                    index,
+                    home,
+                    overwrite.eligible,
+                    &uses,
+                    facts,
+                    &mut lifetimes,
+                );
             }
-            // 分析停用[ProofIncomplete]：非 GC-inert 分支覆盖会同时开始新的资源生命周期；
-            // 当前 collector 没有结构化 successor root 状态，不能只登记旧 root 的终止 pair。
-            // 分析停用[ProofIncomplete]：一般 parallel assignment 缺少各 RHS 求值与物理 target 提交顺序事实；当前只配对无 tail、全 trusted temp、RHS 全 nil 的无求值形状。
-            let writes = StackWriteSummary::for_stmt(stmt, facts);
+            let mut writes = StackWriteSummary::for_stmt(stmt, facts);
+            writes.homes.retain(|home| !proven_homes.contains(home));
             if writes.has_boundary || writes.has_unknown_home {
                 active.clear();
                 value_by_temp.clear();
@@ -906,32 +956,102 @@ fn exact_multi_call_root_targets(
     )
 }
 
-fn definite_gc_inert_branch_home_overwrite(
+fn definite_grouped_home_overwrite(
     stmt: &HirStmt,
+    home: HomeSlotKey,
     facts: &ProtoPromotionFacts,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
-    safety: HirExprSafety,
-) -> Option<ExactBranchHomeOverwrite> {
-    let HirStmt::If(if_stmt) = stmt else {
-        return None;
+) -> Option<ExactHomeOverwrite> {
+    let temps = match stmt {
+        HirStmt::Assign(assign) if assign.targets.len() > 1 => {
+            let writes = StackWriteSummary::for_stmt(stmt, facts);
+            if writes.has_boundary
+                || writes.has_unknown_home
+                || !writes.homes.contains(&home)
+                || !assign.targets.iter().all(|target| {
+                    matches!(target, HirLValue::Temp(temp) if facts.trusted_temp_home_slot(*temp).is_some())
+                })
+            {
+                return None;
+            }
+            assign
+                .targets
+                .iter()
+                .filter_map(|target| {
+                    let HirLValue::Temp(temp) = target else {
+                        return None;
+                    };
+                    (facts.trusted_temp_home_slot(*temp) == Some(home)).then_some(*temp)
+                })
+                .collect::<BTreeSet<_>>()
+        }
+        HirStmt::If(if_stmt) => {
+            let else_block = if_stmt.else_block.as_ref()?;
+            let then_temps = definite_block_home_overwrite(&if_stmt.then_block, home, facts)?;
+            let else_temps = definite_block_home_overwrite(else_block, home, facts)?;
+            then_temps.union(&else_temps).copied().collect()
+        }
+        HirStmt::Block(block) => definite_block_home_overwrite(block, home, facts)?,
+        _ => return None,
     };
-    let else_block = if_stmt.else_block.as_ref()?;
-    let (then_temp, then_value) = single_scalar_temp_write(&if_stmt.then_block)?;
-    let (else_temp, else_value) = single_scalar_temp_write(else_block)?;
-    if !safety.result_is_gc_inert(then_value) || !safety.result_is_gc_inert(else_value) {
+    if temps.is_empty() {
         return None;
     }
-    let then_home = facts.trusted_temp_home_slot(then_temp)?;
-    let else_home = facts.trusted_temp_home_slot(else_temp)?;
-    (then_home == else_home).then(|| ExactBranchHomeOverwrite {
-        temps: BTreeSet::from([then_temp, else_temp]),
-        home: then_home,
-        eligible: temp_is_eligible(then_temp) && temp_is_eligible(else_temp),
-    })
+    let eligible = temps.iter().copied().all(temp_is_eligible);
+    Some(ExactHomeOverwrite { temps, eligible })
 }
 
-fn single_scalar_temp_write(block: &HirBlock) -> Option<(TempId, &HirExpr)> {
-    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+fn grouped_assignment_targets_are_active(
+    stmt: &HirStmt,
+    facts: &ProtoPromotionFacts,
+    active_homes: &BTreeSet<HomeSlotKey>,
+) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return true;
+    };
+    if assign.targets.len() <= 1 {
+        return true;
+    }
+    let Some(target_homes) = assign
+        .targets
+        .iter()
+        .map(|target| {
+            let HirLValue::Temp(temp) = target else {
+                return None;
+            };
+            facts.trusted_temp_home_slot(*temp)
+        })
+        .collect::<Option<BTreeSet<_>>>()
+    else {
+        return false;
+    };
+    target_homes.len() == assign.targets.len()
+        && target_homes.iter().all(|home| active_homes.contains(home))
+}
+
+fn definite_block_home_overwrite(
+    block: &HirBlock,
+    home: HomeSlotKey,
+    facts: &ProtoPromotionFacts,
+) -> Option<BTreeSet<TempId>> {
+    let (first_index, first_temp) = block.stmts.iter().enumerate().find_map(|(index, stmt)| {
+        let (temp, _) = scalar_temp_write(stmt)?;
+        (facts.trusted_temp_home_slot(temp) == Some(home)).then_some((index, temp))
+    })?;
+    if !stmts_preserve_home(&block.stmts[..first_index], home, facts)
+        || !stmts_rewrite_home_only_through_scalar_temps(
+            &block.stmts[(first_index + 1)..],
+            home,
+            facts,
+        )
+    {
+        return None;
+    }
+    Some(BTreeSet::from([first_temp]))
+}
+
+fn scalar_temp_write(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
+    let HirStmt::Assign(assign) = stmt else {
         return None;
     };
     let ([HirLValue::Temp(temp)], [value], None) = (
@@ -942,6 +1062,27 @@ fn single_scalar_temp_write(block: &HirBlock) -> Option<(TempId, &HirExpr)> {
         return None;
     };
     Some((*temp, value))
+}
+
+fn stmts_preserve_home(stmts: &[HirStmt], home: HomeSlotKey, facts: &ProtoPromotionFacts) -> bool {
+    let writes = StackWriteSummary::for_stmts(stmts, facts);
+    !writes.has_boundary && !writes.has_unknown_home && !writes.homes.contains(&home)
+}
+
+fn stmts_rewrite_home_only_through_scalar_temps(
+    stmts: &[HirStmt],
+    home: HomeSlotKey,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    stmts.iter().all(|stmt| {
+        let writes = StackWriteSummary::for_stmt(stmt, facts);
+        if writes.has_boundary || writes.has_unknown_home {
+            return false;
+        }
+        !writes.homes.contains(&home)
+            || scalar_temp_write(stmt)
+                .is_some_and(|(temp, _)| facts.trusted_temp_home_slot(temp) == Some(home))
+    })
 }
 
 fn stmt_is_transparent_temp_copy(stmt: &HirStmt, aliases: &BTreeSet<TempId>) -> bool {
@@ -1450,8 +1591,9 @@ fn terminate_allocation_home(
     home: HomeSlotKey,
     eligible: bool,
 ) {
-    // Caller has already proved every branch arm writes a GC-inert value, so this overwrite
-    // terminates the old allocation root without starting an untracked collectable owner.
+    // The caller has proved that every path commits this home through targets which are mapped
+    // to the old physical-root local. The successor value therefore remains owned by that same
+    // local even when it is collectable; this helper only closes the preceding allocation epoch.
     for root in active.iter_mut() {
         if root.homes.remove(&home) {
             record_allocation_root_overwrite(root, index, home, eligible, uses, lifetimes);
@@ -1522,6 +1664,10 @@ struct StackWriteSummary {
 
 impl StackWriteSummary {
     fn for_stmt(stmt: &HirStmt, facts: &ProtoPromotionFacts) -> Self {
+        Self::for_stmts(std::slice::from_ref(stmt), facts)
+    }
+
+    fn for_stmts(stmts: &[HirStmt], facts: &ProtoPromotionFacts) -> Self {
         let mut summary = Self {
             homes: BTreeSet::new(),
             has_unknown_home: false,
@@ -1531,7 +1677,7 @@ impl StackWriteSummary {
             facts,
             summary: &mut summary,
         };
-        visit_stmts(std::slice::from_ref(stmt), &mut collector);
+        visit_stmts(stmts, &mut collector);
         summary
     }
 

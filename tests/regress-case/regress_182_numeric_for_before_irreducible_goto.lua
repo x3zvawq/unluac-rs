@@ -2,6 +2,28 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-contains [[local r1_3 = "prefix"]]
+
+local function prefix_before_irreducible(entry, cycle)
+    local prefix = "prefix"
+    print(prefix)
+    print(prefix)
+
+    local value = 0
+    if entry then
+        goto second
+    end
+    ::first::
+    value = value + 1
+    ::second::
+    value = value + 10
+    if cycle then
+        goto first
+    end
+    return value
+end
+
+assert(prefix_before_irreducible(true, false) == 10)
 
 local total = 0
 for i = 1, 3 do

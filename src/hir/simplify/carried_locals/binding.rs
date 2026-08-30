@@ -77,10 +77,18 @@ pub(super) fn bindings_may_share_raw_home_slot(
     right: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
+    if left == right {
+        return true;
+    }
     if binding_home_slot_provenance_is_invalid(left, promotion_facts)
         || binding_home_slot_provenance_is_invalid(right, promotion_facts)
     {
         return true;
+    }
+    if binding_has_no_physical_home(left, promotion_facts)
+        || binding_has_no_physical_home(right, promotion_facts)
+    {
+        return false;
     }
     match (
         raw_binding_home_slot(left, promotion_facts),
@@ -88,6 +96,16 @@ pub(super) fn bindings_may_share_raw_home_slot(
     ) {
         (Some(left), Some(right)) => left == right,
         _ => true,
+    }
+}
+
+fn binding_has_no_physical_home(
+    binding: CarryBinding,
+    promotion_facts: &ProtoPromotionFacts,
+) -> bool {
+    match binding {
+        CarryBinding::Local(local) => promotion_facts.local_has_no_physical_home(local),
+        CarryBinding::Param(_) | CarryBinding::Temp(_) => false,
     }
 }
 

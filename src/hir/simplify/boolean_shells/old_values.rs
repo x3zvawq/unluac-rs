@@ -4,7 +4,8 @@
 //! 与 raw home 的 `GC-inert / 可承载资源 / 证明不完整`；分支合流保留任一路径上的资源
 //! 可能，循环对回边求有限不动点。
 //! 分析阶段只记录完整语句路径，验证结束后才一次性应用删除，避免边改边算让 reaching
-//! value 漂移。label/goto 与 residual 仍由各自 owner 维护，本分析不在线性 HIR 上猜 CFG。
+//! value 漂移。同 block 单调 forward goto 可直接跳到唯一 label；跨 block、跳出与回边仍由
+//! region CFG owner 维护，本分析不在线性 HIR 上猜 predecessor。
 //! 值是否 GC-inert 由外层传入的目标方言安全上下文判定，避免 reaching class 与删除证明漂移。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,7 +48,8 @@ impl DeadShellPlan {
         let mut boundary = AnalysisBoundary::default();
         visit::visit_proto(proto, &mut boundary);
         if boundary.unstructured_control {
-            // 分析停用[ProofIncomplete]：label/goto 存在非局部 predecessor，当前线性 HIR 分析缺少候选点的 CFG reaching-state；dead-labels/branch-control 改写 LabelGoto 后会重跑本 pass。
+            // 分析停用[LayerBoundary]：跨 block、嵌套跳出或回边 goto 需要 region CFG
+            // owner 的 predecessor/reaching-state；本层只消费同 block 单调 forward edge。
             return Self::default();
         }
 
@@ -94,9 +96,33 @@ struct AnalysisBoundary {
 }
 
 impl HirVisitor for AnalysisBoundary {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.unstructured_control |= matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_));
+    fn visit_block(&mut self, block: &HirBlock) {
+        self.unstructured_control |= forward_label_indices(block).is_none();
     }
+}
+
+fn forward_label_indices(block: &HirBlock) -> Option<BTreeMap<crate::hir::HirLabelId, usize>> {
+    let mut labels = BTreeMap::new();
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let HirStmt::Label(label) = stmt else {
+            continue;
+        };
+        if labels.insert(label.id, index).is_some() {
+            return None;
+        }
+    }
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let HirStmt::Goto(goto) = stmt else {
+            continue;
+        };
+        if labels
+            .get(&goto.target)
+            .is_none_or(|target| *target <= index)
+        {
+            return None;
+        }
+    }
+    Some(labels)
 }
 
 struct CandidateValues<'a> {
@@ -241,11 +267,20 @@ impl OldValueAnalyzer<'_> {
         prefix: &[PathComponent],
         mut state: Option<OldValueState>,
     ) -> InertFlow {
+        let label_indices = forward_label_indices(block)
+            .expect("old-value analysis boundary must validate local forward labels");
         let mut breaks = None;
         let mut continues = None;
-        for (index, stmt) in block.stmts.iter().enumerate() {
+        let mut index = 0;
+        while let Some(stmt) = block.stmts.get(index) {
             if state.is_none() {
                 break;
+            }
+            if let HirStmt::Goto(goto) = stmt {
+                index = *label_indices
+                    .get(&goto.target)
+                    .expect("validated forward goto must retain its local label");
+                continue;
             }
             let mut path = prefix.to_vec();
             path.push(PathComponent::Stmt(index));
@@ -253,6 +288,7 @@ impl OldValueAnalyzer<'_> {
             state = flow.fallthrough;
             breaks = join_optional_states(breaks, flow.breaks);
             continues = join_optional_states(continues, flow.continues);
+            index += 1;
         }
         InertFlow {
             fallthrough: state,
@@ -351,7 +387,10 @@ impl OldValueAnalyzer<'_> {
                     &binding_values,
                 )
             }
-            HirStmt::Return(_) | HirStmt::Goto(_) => InertFlow::default(),
+            HirStmt::Return(_) => InertFlow::default(),
+            HirStmt::Goto(_) => {
+                unreachable!("block analyzer must consume validated forward gotos")
+            }
             HirStmt::Break => InertFlow {
                 breaks: Some(state),
                 ..InertFlow::default()
@@ -537,12 +576,22 @@ impl OldValueAnalyzer<'_> {
 
     fn local_binding_relation(&self, target: &HirLValue, candidate: LocalId) -> BindingRelation {
         let candidate_home = self.promotion_facts.trusted_local_home_slot(candidate);
+        let candidate_is_home_free = self.promotion_facts.local_has_no_physical_home(candidate);
         match target {
             HirLValue::Local(local) if *local == candidate => BindingRelation::Definite,
+            HirLValue::Local(local)
+                if candidate_is_home_free
+                    || self.promotion_facts.local_has_no_physical_home(*local) =>
+            {
+                BindingRelation::None
+            }
             HirLValue::Local(local) => home_relation(
                 candidate_home,
                 self.promotion_facts.trusted_local_home_slot(*local),
             ),
+            HirLValue::Param(_) | HirLValue::Temp(_) if candidate_is_home_free => {
+                BindingRelation::None
+            }
             HirLValue::Param(param) => home_relation(
                 candidate_home,
                 self.promotion_facts.trusted_param_home_slot(*param),
@@ -568,6 +617,9 @@ impl OldValueAnalyzer<'_> {
                 Some(candidate),
                 self.promotion_facts.trusted_param_home_slot(*param),
             ),
+            HirLValue::Local(local) if self.promotion_facts.local_has_no_physical_home(*local) => {
+                BindingRelation::None
+            }
             HirLValue::Local(local) => home_relation(
                 Some(candidate),
                 self.promotion_facts.trusted_local_home_slot(*local),

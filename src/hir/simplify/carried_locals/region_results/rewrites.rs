@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) fn collect_break_assignments(
     block: &HirBlock,
-    exits: &mut Vec<BTreeMap<CarryBinding, HirExpr>>,
+    exits: &mut Vec<ExitValues>,
     reject_untracked_transfers: bool,
 ) -> bool {
     for (index, stmt) in block.stmts.iter().enumerate() {
@@ -17,11 +17,7 @@ pub(super) fn collect_break_assignments(
                     // 候选拒绝[ProofIncomplete]：break 前没有紧邻 assignment 时，需路径 reaching-def 证明而非固定相邻形状。
                     return false;
                 };
-                let Some(exit) = assignment_values(assign) else {
-                    // 候选拒绝[ProofIncomplete]：复杂/open-tail break writeback 缺 value-pack 出口映射。
-                    return false;
-                };
-                exits.push(exit);
+                exits.push(assignment_values(assign));
             }
             HirStmt::If(if_stmt) => {
                 if !collect_break_assignments(
@@ -71,7 +67,7 @@ pub(super) fn block_may_fall_through(block: &HirBlock) -> bool {
 
 pub(super) fn infer_rewrites(
     results: &[CarryBinding],
-    exits: &[BTreeMap<CarryBinding, HirExpr>],
+    exits: &[ExitValues],
     region_index: usize,
     result_index: &RegionResultIndex<'_>,
     promotion_facts: &ProtoPromotionFacts,
@@ -83,7 +79,7 @@ pub(super) fn infer_rewrites(
         let candidates = exits
             .iter()
             .filter_map(|exit| exit.get(result))
-            .filter_map(carry_binding_from_expr)
+            .filter_map(ExitValue::exact_binding)
             .filter(|binding| result_index.is_available_before(*binding, region_index))
             .collect::<BTreeSet<_>>();
         let mut candidates = candidates.into_iter();
@@ -96,6 +92,10 @@ pub(super) fn infer_rewrites(
             // 候选拒绝[ProofIncomplete]：多个 result 共享同一 seed 时需并行 identity/epoch 合并证明，当前一对一 claimed 模型无法表达。
             return None;
         }
+        if !rewritten_result_keeps_exit_values(*result, seed, exits) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：同批 assignment 在 result 后再次写 seed 时，改名后的最后写会覆盖原 result 出口值；反最小见 seed_write_after_result_is_rejected。
+            return None;
+        }
         if require_home_slot && !bindings_share_home_slot(*result, seed, promotion_facts) {
             // 候选拒绝[SemanticBarrier:Lifetime]：异槽或 compaction 下 result/state 是两个 GC/close 可观察 root，不能只凭值相同合并。
             return None;
@@ -103,6 +103,27 @@ pub(super) fn infer_rewrites(
         rewrites.insert(*result, seed);
     }
     Some(rewrites)
+}
+
+pub(super) fn rewritten_results_keep_exit_values(
+    rewrites: &BTreeMap<CarryBinding, CarryBinding>,
+    exits: &[ExitValues],
+) -> bool {
+    rewrites
+        .iter()
+        .all(|(result, seed)| rewritten_result_keeps_exit_values(*result, *seed, exits))
+}
+
+fn rewritten_result_keeps_exit_values(
+    result: CarryBinding,
+    seed: CarryBinding,
+    exits: &[ExitValues],
+) -> bool {
+    exits.iter().all(|exit| {
+        exit.get(&result)
+            .zip(exit.get(&seed))
+            .is_none_or(|(result, seed)| result.target_index() > seed.target_index())
+    })
 }
 
 pub(super) fn rewrites_preserve_home_slots(
@@ -162,4 +183,50 @@ pub(super) fn apply_rewrites(
         block.stmts.drain(declarations);
     }
     prune_empty_assign_stmts(block);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{LocalId, ParamId};
+
+    #[test]
+    fn seed_write_after_result_is_rejected() {
+        let result = CarryBinding::Local(LocalId(0));
+        let overwritten = HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Param(ParamId(0))],
+            values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0)), HirExpr::Integer(7)]),
+        };
+        let preserved = HirAssign {
+            targets: vec![HirLValue::Param(ParamId(0)), HirLValue::Local(LocalId(0))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::ParamRef(ParamId(0))]),
+        };
+        let overwritten = assignment_values(&overwritten);
+        let preserved = assignment_values(&preserved);
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&[], &captured);
+
+        assert!(
+            infer_rewrites(
+                &[result],
+                &[overwritten],
+                0,
+                &index,
+                &ProtoPromotionFacts::default(),
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            infer_rewrites(
+                &[result],
+                &[preserved],
+                0,
+                &index,
+                &ProtoPromotionFacts::default(),
+                false,
+            )
+            .is_some()
+        );
+    }
 }

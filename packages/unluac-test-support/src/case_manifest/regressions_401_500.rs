@@ -149,4 +149,28 @@ LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_428_method_alias_capture_writes.lua",
         &[LuaCaseDialect::Lua54],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_429_constructor_nil_local_prefix.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_430_constructor_eventless_assignment_prefix.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_431_dead_temp_stable_local.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_432_open_constructor_multiple_setlists.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_433_terminal_nil_pack_unrelated_tbc.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_434_call_root_effectful_rhs.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
 ];

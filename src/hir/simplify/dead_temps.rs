@@ -7,21 +7,26 @@
 //!
 //! 清理范围：目标 temp 全局无读者，且 RHS 不含潜在副作用（调用、metamethod 触发、
 //! table 构造等）的赋值语句。它依赖 promotion 保存的物理 home 与 entry-nil provenance：
-//! 无物理 home 的纯死写可直接删除；参数同槽写改回参数赋值；proto 根直线前缀中
-//! `entry nil -> GC-inert value` 的写入也可删除。其余有 home 的写入不在这里猜 reaching
-//! value，因为它仍可能决定旧对象或新对象的 GC root 生命周期。
+//! 无物理 home 的纯死写可直接删除；参数同槽写改回参数赋值；不经过循环或非局部跳转的
+//! 结构化前缀中，`entry nil -> GC-inert value` 的写入也可删除；复制无 capture-home
+//! 别名、无后写且后缀仍读取的可见 binding 同样不需要建立第二个 root。其余有 home 的
+//! 写入不在这里猜 reaching value，因为它仍可能决定旧对象或新对象的 GC root 生命周期。
 //! RHS 的可删除性与 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
 //!
 //! 例子：根前缀里的机械 `t = false` 若 `t` 是非参数槽首个 fixed def，可删成空；
-//! `t = p` 即使没有值读取也不能删，因为该物理槽可能让 `p` 指向的对象继续存活。
+//! `t = stable_local` 若目标覆盖 entry nil 可删；`t = p; p = nil` 则必须保留 `t` 的 root。
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, ParamId, TempId};
+use crate::hir::common::{
+    HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
+};
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use super::mention::stmts_reference_captured_bindings;
+use super::mention::{
+    ReferenceCapturedBindings, stmts_protected_locals, stmts_reference_captured_bindings,
+};
 use super::temp_touch::{collect_temp_reads_in_proto, stmt_contains_nested_nonlocal_control};
 use super::visit::{self, HirVisitor};
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -64,6 +69,9 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         .filter_map(|(temp, hint)| hint.as_ref().map(|_| *temp))
         .collect();
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
+    let reference_captured_homes =
+        trusted_reference_capture_home_slots(&reference_captured, promotion_facts);
+    let protected_locals = stmts_protected_locals(&proto.body.stmts);
     // 参数覆盖在本 pass 入口可能仍是写同 home 的 Local/Temp，不能只扫描已经语法化成
     // HirLValue::Param 的目标；缺可信 home 的直接 binding 写也不能用于稳定性正证明。
     let overwritten_visible_params = proto
@@ -76,34 +84,65 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         })
         .copied()
         .collect::<BTreeSet<_>>();
-    let stable_visible_params = proto
+    let params = proto
         .params
         .iter()
         .filter(|param| {
-            promotion_facts.trusted_param_home_slot(**param).is_some()
-                && !reference_captured.params.contains(param)
+            promotion_facts
+                .trusted_param_home_slot(**param)
+                .is_some_and(|home| {
+                    reference_captured_homes
+                        .as_ref()
+                        .is_some_and(|captured| !captured.contains(&home))
+                })
                 && !overwritten_visible_params.contains(param)
         })
         .copied()
         .collect();
+    let locals = proto
+        .locals
+        .iter()
+        .filter(|local| {
+            promotion_facts
+                .trusted_local_home_slot(**local)
+                .is_some_and(|home| {
+                    reference_captured_homes
+                        .as_ref()
+                        .is_some_and(|captured| !captured.contains(&home))
+                })
+                // TBC/loop binding 有独立资源或迭代生命周期，不能只按普通 root 证明。
+                && !protected_locals.contains(local)
+                && !proto_may_write_visible_home(
+                    proto,
+                    VisibleBinding::Local(**local),
+                    promotion_facts,
+                )
+        })
+        .copied()
+        .collect();
+    let stable_visible_bindings = StableVisibleBindings {
+        params,
+        locals,
+        reference_captured_homes,
+    };
     let mut pass = DeadTempPass {
         live_reads: &live_reads,
         parameter_by_temp,
         physical_home_temps,
         debug_temps,
         facts: promotion_facts,
-        stable_visible_params,
+        stable_visible_bindings,
         overwritten_visible_params,
         physical_root_temps: BTreeSet::new(),
         safety,
     };
     let mut changed = rewrite_proto(proto, &mut pass);
-    changed |= remove_dead_entry_nil_writes_from_root_prefix(
+    changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
         &mut proto.body,
         &live_reads,
         &pass.debug_temps,
         &proto.physical_root_temps,
-        &pass.stable_visible_params,
+        &pass.stable_visible_bindings,
         promotion_facts,
         safety,
     );
@@ -128,6 +167,85 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         .physical_root_temps
         .extend(pass.physical_root_temps.iter().copied());
     changed |= proto.physical_root_temps.len() != original_physical_root_count;
+    changed
+}
+
+fn remove_dead_entry_nil_writes_from_acyclic_prefixes(
+    block: &mut HirBlock,
+    live_reads: &BTreeSet<TempId>,
+    debug_temps: &BTreeSet<TempId>,
+    physical_root_temps: &BTreeSet<TempId>,
+    stable_visible_bindings: &StableVisibleBindings,
+    facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+) -> bool {
+    let mut changed = remove_dead_entry_nil_writes_from_root_prefix(
+        block,
+        live_reads,
+        debug_temps,
+        physical_root_temps,
+        stable_visible_bindings,
+        facts,
+        safety,
+    );
+
+    for stmt in &mut block.stmts {
+        if stmt_contains_nested_nonlocal_control(stmt) {
+            continue;
+        }
+        match stmt {
+            HirStmt::If(if_stmt) => {
+                changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
+                    &mut if_stmt.then_block,
+                    live_reads,
+                    debug_temps,
+                    physical_root_temps,
+                    stable_visible_bindings,
+                    facts,
+                    safety,
+                );
+                if let Some(else_block) = &mut if_stmt.else_block {
+                    changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
+                        else_block,
+                        live_reads,
+                        debug_temps,
+                        physical_root_temps,
+                        stable_visible_bindings,
+                        facts,
+                        safety,
+                    );
+                }
+            }
+            HirStmt::Block(nested) => {
+                changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
+                    nested,
+                    live_reads,
+                    debug_temps,
+                    physical_root_temps,
+                    stable_visible_bindings,
+                    facts,
+                    safety,
+                );
+            }
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::NumericFor(_)
+            | HirStmt::GenericFor(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_) => {}
+        }
+    }
     changed
 }
 
@@ -281,20 +399,20 @@ fn preserve_adjacent_dead_physical_overwrites(
         };
         let Some((previous, previous_value)) = single_temp_assignment(&block.stmts[index - 1])
         else {
-            // 候选拒绝[ProofIncomplete]：非相邻 producer 需要区间 reaching-def、控制流与同槽写入证明。
             continue;
         };
         if safety.result_is_gc_inert(previous_value) {
             continue;
         }
-        let Some(home) = facts.trusted_temp_home_slot(previous) else {
-            // 候选拒绝[ProofIncomplete]：producer 缺可信 home 时无法证明两次物理写命中同一 root cell。
+        let Some(home) = facts.home_slot(previous) else {
+            // 候选拒绝[LayerBoundary]：没有 raw target home 的 synthetic temp 不代表 VM
+            // 物理写；它的死定义由普通 dead-temp 路径消费，不能充当 root overwrite owner。
             continue;
         };
         if current == previous {
             continue;
         }
-        if facts.trusted_temp_home_slot(current) != Some(home) {
+        if facts.home_slot(current) != Some(home) {
             // 候选拒绝[SemanticBarrier:Lifetime]：异槽写没有共享物理 root cell，合并会错误延长 previous home 的生命周期。
             continue;
         }
@@ -338,17 +456,32 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
     live_reads: &BTreeSet<TempId>,
     debug_temps: &BTreeSet<TempId>,
     physical_root_temps: &BTreeSet<TempId>,
-    stable_visible_params: &BTreeSet<ParamId>,
+    stable_visible_bindings: &StableVisibleBindings,
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> bool {
     let mut changed = false;
     let mut in_single_pass_prefix = true;
-    let mut captured_homes = BTreeSet::new();
-    for stmt in &block.stmts {
-        facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_homes);
+    let adjacent_visible_handoffs = block
+        .stmts
+        .windows(2)
+        .filter_map(|pair| adjacent_same_value_visible_handoff(pair, facts))
+        .collect::<BTreeSet<_>>();
+    let mut last_local_read = BTreeMap::new();
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let mut collector = LastLocalReadCollector {
+            index,
+            reads: &mut last_local_read,
+        };
+        visit::visit_stmts(std::slice::from_ref(stmt), &mut collector);
+        if !root_prefix_stmt_preserves_single_pass_continuation(stmt) {
+            break;
+        }
     }
+    let mut index = 0;
     block.stmts.retain(|stmt| {
+        let current_index = index;
+        index += 1;
         if !in_single_pass_prefix {
             return true;
         }
@@ -359,17 +492,41 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
 
         let removable = dead_pure_temp_assignment(stmt, live_reads, safety).is_some_and(|temp| {
             let home = facts.home_slot(temp);
-            facts.overwrites_entry_nil(temp)
+            let has_adjacent_visible_handoff = adjacent_visible_handoffs.contains(&temp);
+            let overwrites_entry_nil_with_nil =
+                facts.overwrites_entry_nil(temp) && dead_write_value_is_nil(stmt);
+            (facts.overwrites_entry_nil(temp) || has_adjacent_visible_handoff)
                 // 候选拒绝[SemanticBarrier:DebugScope]：debug temp 是已保留的源码 binding；删除定义会抹掉其声明可见期。
                 && !debug_temps.contains(&temp)
                 // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot temp 可能已由精确
                 // overwrite handoff 复用；删除其 GC-inert 写会丢失原 root 终止点。
-                && !physical_root_temps.contains(&temp)
-                // 候选拒绝[ProofIncomplete]：entry-nil 只证明旧值非资源；除 GC 惰性值和全函数稳定参数外，RHS 仍可能需要目标槽作为新 root。
+                && (!physical_root_temps.contains(&temp) || has_adjacent_visible_handoff)
+                // 候选拒绝[SemanticBarrier:Lifetime]：entry-nil 只证明旧值非资源；新 RHS
+                // 若可持有 collectable value，删除目标槽写会丢失它的独立 GC root。
+                // regress_431 的 overwritten/only_root/captured 三组分别覆盖来源后写、唯一
+                // root 与 capture cell；只有下列不建立新 root 的证明分支可以删除。
                 && (dead_write_value_is_gc_inert(stmt, safety)
-                    || dead_write_copies_stable_param(stmt, stable_visible_params))
+                    // 候选接受[NoOpRootProof]：下一句把同一个 visible value 交给同一
+                    // trusted home；两次写之间无求值、GC 或 capture 观察点，首写不建立
+                    // 额外 root epoch。regress_36 覆盖该分支 handoff。
+                    || has_adjacent_visible_handoff
+                    || dead_write_copies_stable_binding(
+                        stmt,
+                        stable_visible_bindings,
+                        current_index,
+                        &last_local_read,
+                    ))
                 // 候选拒绝[SemanticBarrier:Capture]：候选前后任一 closure 若捕获同槽，删除写入都会让它观察 nil 而非新值。
-                && home.is_some_and(|home| !captured_homes.contains(&home))
+                && stable_visible_bindings
+                    .reference_captured_homes
+                    .as_ref()
+                    .is_some_and(|captured| {
+                        has_adjacent_visible_handoff
+                            // 候选接受[NoOpRootProof]：入口旧值与新值均为 nil；稍后创建
+                            // 的同 home capture 观察不到这次无值、无 root 的写回。
+                            || overwrites_entry_nil_with_nil
+                            || home.is_some_and(|home| !captured.contains(&home))
+                    })
         });
         changed |= removable;
         !removable
@@ -377,20 +534,47 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
     changed
 }
 
+fn adjacent_same_value_visible_handoff(
+    pair: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+) -> Option<TempId> {
+    let [first, HirStmt::Assign(second)] = pair else {
+        return None;
+    };
+    let (temp, first_value) = single_temp_assignment(first)?;
+    let [second_value] = second.values.fixed.as_slice() else {
+        return None;
+    };
+    if !matches!(first_value, HirExpr::ParamRef(_) | HirExpr::LocalRef(_))
+        || second.values.tail.is_some()
+        || second_value != first_value
+    {
+        return None;
+    }
+    let [target] = second.targets.as_slice() else {
+        return None;
+    };
+    let target_home = match target {
+        HirLValue::Param(param) => facts.trusted_param_home_slot(*param),
+        HirLValue::Local(local) => facts.trusted_local_home_slot(*local),
+        HirLValue::Temp(_)
+        | HirLValue::Upvalue(_)
+        | HirLValue::Global(_)
+        | HirLValue::TableAccess(_) => None,
+    };
+    (facts.home_slot(temp).is_some() && facts.home_slot(temp) == target_home).then_some(temp)
+}
+
 fn root_prefix_stmt_preserves_single_pass_continuation(stmt: &HirStmt) -> bool {
     match stmt {
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_) => true,
-        HirStmt::GlobalDecl(_) => {
-            // 分析停用[ProofIncomplete]：全局声明的种子与后续赋值共享源码 identity；
-            // 当前证明只覆盖 temp 写，不能让扫描越过该 AST-owned 声明边界。
-            false
-        }
         HirStmt::If(_)
         | HirStmt::While(_)
         | HirStmt::Repeat(_)
@@ -419,14 +603,51 @@ fn dead_write_value_is_gc_inert(stmt: &HirStmt, safety: HirExprSafety) -> bool {
     safety.result_is_gc_inert(value)
 }
 
-fn dead_write_copies_stable_param(
+fn dead_write_value_is_nil(stmt: &HirStmt) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    matches!(assign.values.fixed.as_slice(), [HirExpr::Nil])
+}
+
+fn dead_write_copies_stable_binding(
     stmt: &HirStmt,
-    stable_visible_params: &BTreeSet<ParamId>,
+    stable_visible_bindings: &StableVisibleBindings,
+    current_index: usize,
+    last_local_read: &BTreeMap<LocalId, usize>,
 ) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
-    matches!(assign.values.fixed.as_slice(), [HirExpr::ParamRef(param)] if stable_visible_params.contains(param))
+    match assign.values.fixed.as_slice() {
+        [HirExpr::ParamRef(param)] => stable_visible_bindings.params.contains(param),
+        [HirExpr::LocalRef(local)] => {
+            stable_visible_bindings.locals.contains(local)
+                && last_local_read
+                    .get(local)
+                    .is_some_and(|last| *last > current_index)
+        }
+        _ => false,
+    }
+}
+
+struct StableVisibleBindings {
+    params: BTreeSet<ParamId>,
+    locals: BTreeSet<LocalId>,
+    reference_captured_homes: Option<BTreeSet<HomeSlotKey>>,
+}
+
+struct LastLocalReadCollector<'a> {
+    index: usize,
+    reads: &'a mut BTreeMap<LocalId, usize>,
+}
+
+impl HirVisitor for LastLocalReadCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::LocalRef(local) = expr {
+            self.reads.insert(*local, self.index);
+        }
+    }
 }
 
 struct DeadTempPass<'a> {
@@ -435,7 +656,7 @@ struct DeadTempPass<'a> {
     physical_home_temps: BTreeSet<TempId>,
     debug_temps: BTreeSet<TempId>,
     facts: &'a ProtoPromotionFacts,
-    stable_visible_params: BTreeSet<ParamId>,
+    stable_visible_bindings: StableVisibleBindings,
     overwritten_visible_params: BTreeSet<ParamId>,
     physical_root_temps: BTreeSet<TempId>,
     safety: HirExprSafety,
@@ -475,7 +696,9 @@ impl HirRewritePass for DeadTempPass<'_> {
                     // copy-root owner 统一处理。
                     self.physical_root_temps.insert(temp);
                 }
-                // 候选拒绝[ProofIncomplete]：root-prefix entry-nil/inert 子集已在专用证明中删除；其余 raw-home 写仍可能释放旧 root，或让 RHS 引用成为新 root，需双向 reaching resource-value 与可见 binding 映射。
+                // 候选拒绝[SemanticBarrier:Lifetime]：其余 raw-home 写不能删除；
+                // regress_398 证明 inert/稳定副本写会在原点释放旧 root，regress_377
+                // 证明不同 home 的副本会在源参数覆盖后成为唯一新 root。
                 return true;
             }
             changed = true;
@@ -550,40 +773,81 @@ fn proto_may_write_param_home(
     param: ParamId,
     facts: &ProtoPromotionFacts,
 ) -> bool {
-    let Some(home) = facts.trusted_param_home_slot(param) else {
+    proto_may_write_visible_home(proto, VisibleBinding::Param(param), facts)
+}
+
+#[derive(Clone, Copy)]
+enum VisibleBinding {
+    Param(ParamId),
+    Local(LocalId),
+}
+
+fn trusted_reference_capture_home_slots(
+    captured: &ReferenceCapturedBindings,
+    facts: &ProtoPromotionFacts,
+) -> Option<BTreeSet<HomeSlotKey>> {
+    let mut homes = BTreeSet::new();
+    for param in &captured.params {
+        homes.insert(facts.trusted_param_home_slot(*param)?);
+    }
+    for local in &captured.locals {
+        if facts.local_has_no_physical_home(*local) {
+            continue;
+        }
+        homes.insert(facts.trusted_local_home_slot(*local)?);
+    }
+    for temp in &captured.temps {
+        homes.insert(facts.trusted_temp_home_slot(*temp)?);
+    }
+    Some(homes)
+}
+
+fn proto_may_write_visible_home(
+    proto: &HirProto,
+    binding: VisibleBinding,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let home = match binding {
+        VisibleBinding::Param(param) => facts.trusted_param_home_slot(param),
+        VisibleBinding::Local(local) => facts.trusted_local_home_slot(local),
+    };
+    let Some(home) = home else {
         return true;
     };
-    let mut collector = ParamHomeWriteCollector {
+    let mut collector = VisibleHomeWriteCollector {
         facts,
         home,
-        param,
+        binding,
         written: false,
     };
     visit::visit_stmts(&proto.body.stmts, &mut collector);
     collector.written
 }
 
-struct ParamHomeWriteCollector<'a> {
+struct VisibleHomeWriteCollector<'a> {
     facts: &'a ProtoPromotionFacts,
     home: HomeSlotKey,
-    param: ParamId,
+    binding: VisibleBinding,
     written: bool,
 }
 
-impl HirVisitor for ParamHomeWriteCollector<'_> {
+impl HirVisitor for VisibleHomeWriteCollector<'_> {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.written |= match lvalue {
             HirLValue::Param(param) => {
-                *param == self.param
+                matches!(self.binding, VisibleBinding::Param(binding) if binding == *param)
                     || self
                         .facts
                         .trusted_param_home_slot(*param)
                         .is_none_or(|home| home == self.home)
             }
-            HirLValue::Local(local) => self
-                .facts
-                .trusted_local_home_slot(*local)
-                .is_none_or(|home| home == self.home),
+            HirLValue::Local(local) => {
+                matches!(self.binding, VisibleBinding::Local(binding) if binding == *local)
+                    || self
+                        .facts
+                        .trusted_local_home_slot(*local)
+                        .is_none_or(|home| home == self.home)
+            }
             HirLValue::Temp(temp) => self
                 .facts
                 .trusted_temp_home_slot(*temp)
@@ -596,10 +860,98 @@ impl HirVisitor for ParamHomeWriteCollector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::common::{HirGoto, HirIf, HirLabelId, HirReturn, HirValuePack, HirWhile};
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{
+        HirAssign, HirGlobalDecl, HirGoto, HirIf, HirLabelId, HirReturn, HirValuePack, HirWhile,
+    };
 
     fn block(stmts: Vec<HirStmt>) -> HirBlock {
         HirBlock { stmts }
+    }
+
+    #[test]
+    fn reference_capture_homes_cover_all_physical_binding_kinds() {
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(LocalId(0), home);
+        facts.record_local_home_slot(LocalId(1), home);
+        facts.record_temp_home_slot_for_test(TempId(0), home);
+        let mut captured = ReferenceCapturedBindings::default();
+        captured.params.insert(ParamId(0));
+        captured.locals.insert(LocalId(0));
+        captured.temps.insert(TempId(0));
+
+        let captured_homes = trusted_reference_capture_home_slots(&captured, &facts)
+            .expect("all captured bindings have trusted homes");
+        assert_eq!(captured_homes, BTreeSet::from([home]));
+        assert!(
+            captured_homes.contains(
+                &facts
+                    .trusted_local_home_slot(LocalId(1))
+                    .expect("candidate has a trusted home")
+            ),
+            "a different LocalId sharing the captured home must be rejected"
+        );
+    }
+
+    #[test]
+    fn unknown_capture_home_blocks_the_complete_capture_proof() {
+        let mut captured = ReferenceCapturedBindings::default();
+        captured.temps.insert(TempId(0));
+
+        assert_eq!(
+            trusted_reference_capture_home_slots(&captured, &ProtoPromotionFacts::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn home_free_captured_local_cannot_alias_a_physical_home() {
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(LocalId(0));
+        let mut captured = ReferenceCapturedBindings::default();
+        captured.locals.insert(LocalId(0));
+
+        assert_eq!(
+            trusted_reference_capture_home_slots(&captured, &facts),
+            Some(BTreeSet::new())
+        );
+    }
+
+    #[test]
+    fn adjacent_root_overwrite_uses_raw_target_home_after_value_provenance_invalidation() {
+        let previous = TempId(0);
+        let current = TempId(1);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(previous, home);
+        facts.record_temp_home_slot_for_test(current, home);
+        facts.invalidate_temp_home(previous);
+        let assign = |temp, value| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(temp)],
+                values: HirValuePack::fixed(vec![value]),
+            }))
+        };
+        let mut block = block(vec![
+            assign(previous, HirExpr::ParamRef(ParamId(0))),
+            assign(current, HirExpr::Nil),
+        ]);
+        let mut physical_roots = BTreeSet::new();
+
+        assert!(preserve_adjacent_dead_physical_overwrites(
+            &mut block,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &mut physical_roots,
+        ));
+        let HirStmt::Assign(overwrite) = &block.stmts[1] else {
+            panic!("overwrite must remain an assignment");
+        };
+        assert_eq!(overwrite.targets, vec![HirLValue::Temp(previous)]);
+        assert_eq!(physical_roots, BTreeSet::from([previous]));
     }
 
     #[test]
@@ -619,6 +971,21 @@ mod tests {
         ));
         assert!(root_prefix_stmt_preserves_single_pass_continuation(
             &closed_loop
+        ));
+    }
+
+    #[test]
+    fn root_prefix_crosses_global_declaration_without_rewriting_its_identity() {
+        let global_decl = HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+            names: vec!["value".to_owned()],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+        }));
+
+        // Prefix scanning only decides whether a later dead temp write is reached once. The
+        // declaration remains in place; success continues linearly and failure never reaches the
+        // candidate in either program.
+        assert!(root_prefix_stmt_preserves_single_pass_continuation(
+            &global_decl
         ));
     }
 

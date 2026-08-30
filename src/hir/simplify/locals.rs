@@ -14,7 +14,8 @@
 //! 否则 closure 会继续指向旧 local，后半段写回却被拆到新绑定里，或把 close 后的
 //! 普通临时值误写进已关闭 upvalue，直接改掉源码语义。
 //! fallback label/goto 还可能让 loop 回边快照在文本上早于 temp 定义出现；这种 temp
-//! 不能在定义点提升成 `local`，否则前缀快照会读到尚未初始化的局部变量。
+//! 不能在定义点提升成 `local`，否则前缀快照会读到尚未初始化的局部变量。首个 label/goto
+//! 之前、不再跨边界存活的 GC-inert 只读链则不受回边影响，可以继续消除前缀版本噪音。
 //! 参数别名收敛是 locals 的收尾步骤：如果提升后只得到 `local L = param` / `local L; L = param`
 //! 这类函数入口机械别名，且后续不会观察到参数原值和 alias local 的差异，就直接把
 //! 后续读写改回参数身份。它不重新推断 phi 或 loop state，只处理 locals 自己稳定暴露的
@@ -48,11 +49,11 @@ use std::{
 };
 
 use super::mention::{
-    stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
+    stmt_writes_temp, stmts_reference_captured_bindings, stmts_to_be_closed_temps,
+    stmts_value_captured_bindings,
 };
 use super::root_lifetimes::{
-    collect_call_result_local_roots, collect_call_root_lifetimes,
-    collect_lookup_gc_root_lifetimes,
+    collect_call_result_local_roots, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
 };
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
@@ -86,10 +87,13 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut promoted_bindings = Vec::new();
     let mut direct_seed_promotions = Vec::new();
     let mut debug_scope_locals = BTreeMap::new();
-    let mut identity_sensitive_temps = stmts_reference_captured_bindings(&proto.body.stmts).temps;
+    let reference_captured_temps = stmts_reference_captured_bindings(&proto.body.stmts).temps;
+    let mut identity_sensitive_temps = reference_captured_temps.clone();
     identity_sensitive_temps.extend(stmts_value_captured_bindings(&proto.body.stmts).temps);
     let to_be_closed_temps = stmts_to_be_closed_temps(&proto.body.stmts);
     identity_sensitive_temps.extend(to_be_closed_temps.iter().copied());
+    let mut cell_sensitive_temps = reference_captured_temps;
+    cell_sensitive_temps.extend(to_be_closed_temps.iter().copied());
     let result = {
         let mut ctx = PromotionCtx {
             facts,
@@ -104,6 +108,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             promoted_bindings: &mut promoted_bindings,
             direct_seed_promotions: &mut direct_seed_promotions,
             identity_sensitive_temps: &identity_sensitive_temps,
+            cell_sensitive_temps: &cell_sensitive_temps,
             to_be_closed_temps: &to_be_closed_temps,
             debug_scope_locals: &mut debug_scope_locals,
             compact_home_slots,
@@ -204,6 +209,19 @@ fn trusted_home_slot_for_group(
         .then_some(slot)
 }
 
+/// 缺物理 home 时，只有无 alias 的单节点 ByValue capture 可以继续提升。
+///
+/// closure 在原求值点读取该 local 并立刻保存值快照，不会持续观察 cell；引用捕获与
+/// TBC 则分别观察后续写入和 close owner，多节点组也可能把不同物理 epoch 合成一个 local。
+fn identity_sensitive_group_requires_home(
+    group: &BTreeSet<TempId>,
+    identity_sensitive: &BTreeSet<TempId>,
+    cell_sensitive: &BTreeSet<TempId>,
+) -> bool {
+    group.iter().any(|temp| identity_sensitive.contains(temp))
+        && (group.len() != 1 || group.iter().any(|temp| cell_sensitive.contains(temp)))
+}
+
 struct PromotionCtx<'a> {
     facts: &'a ProtoPromotionFacts,
     safety: HirExprSafety,
@@ -217,6 +235,7 @@ struct PromotionCtx<'a> {
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
     direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
     identity_sensitive_temps: &'a BTreeSet<TempId>,
+    cell_sensitive_temps: &'a BTreeSet<TempId>,
     to_be_closed_temps: &'a BTreeSet<TempId>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
     compact_home_slots: bool,
@@ -374,11 +393,12 @@ fn promote_block_with_protection(
     outer_uses_temp: &dyn Fn(TempId) -> bool,
     protection: BlockProtection<'_>,
 ) -> PromotionResult {
-    ctx.physical_root_locals.extend(collect_call_result_local_roots(
-        &block.stmts,
-        protection.trailing_root_condition,
-        ctx.safety,
-    ));
+    ctx.physical_root_locals
+        .extend(collect_call_result_local_roots(
+            &block.stmts,
+            protection.trailing_root_condition,
+            ctx.safety,
+        ));
 
     // 每轮控制头等 block 外消费者先保护当前 block；递归进入子作用域时再叠加当前语句
     // 之后的引用。tracker 用引用计数维护后缀集合，避免按 index 克隆完整集合。
@@ -528,14 +548,19 @@ fn collect_plans(
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> Vec<PromotionPlan> {
-    if block
+    let label_flow_boundary = block
         .stmts
         .iter()
-        .any(|stmt| matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_)))
-    {
-        // 分析停用[ProofIncomplete]：当前 promotion 只有结构化作用域后缀事实，没有 label/goto 的 reaching-def 与声明可见区间；应接入 CFG dominance 后按可证明区间继续提升。
-        return Vec::new();
-    }
+        .position(stmt_contains_nested_nonlocal_control);
+    let planning_end = label_flow_boundary.unwrap_or(block.stmts.len());
+    let lifetime_stmts = if label_flow_boundary.is_some() {
+        // 分析停用[ProofIncomplete]：label/goto graph 本体及后续 region 仍缺 reaching-def、
+        // declaration dominance 与逐路径 root overwrite 事实；这里只消费其前方不跨边界
+        // 存活的 GC-inert 只读链，不能把 island 内候选或 resource root 按文本顺序提升。
+        &[]
+    } else {
+        block.stmts.as_slice()
+    };
 
     let facts = ctx.facts;
     let temp_debug_locals = ctx.temp_debug_locals;
@@ -544,7 +569,7 @@ fn collect_plans(
     let mut plans = Vec::new();
     let temp_touches = TempTouchIndex::new(stmt_temp_refs);
     let call_root_lifetimes = collect_call_root_lifetimes(
-        &block.stmts,
+        lifetime_stmts,
         facts,
         ctx.safety,
         true,
@@ -567,7 +592,7 @@ fn collect_plans(
         },
     );
     let lookup_gc_root_lifetimes =
-        collect_lookup_gc_root_lifetimes(&block.stmts, facts, ctx.safety, |temp| {
+        collect_lookup_gc_root_lifetimes(lifetime_stmts, facts, ctx.safety, |temp| {
             !ctx.identity_sensitive_temps.contains(&temp)
                 && !inherited.contains_key(&temp)
                 && !outer_uses_temp(temp)
@@ -581,7 +606,7 @@ fn collect_plans(
     let mut sticky_slots = inherited_sticky_slots.clone();
     let mut physical_root_locals = BTreeMap::<usize, LocalId>::new();
     let mut physical_root_locals_by_home = BTreeMap::<(usize, HomeSlotKey), LocalId>::new();
-    for (decl_index, stmt) in block.stmts.iter().enumerate() {
+    for (decl_index, stmt) in block.stmts.iter().take(planning_end).enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
             activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
@@ -748,11 +773,7 @@ fn collect_plans(
         }
 
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
-        let PromotionGroup {
-            temps: group,
-            removable_aliases,
-            touching_stmt_indices,
-        } = collect_promotion_group(
+        let promotion_group = collect_promotion_group(
             block,
             decl_index,
             root_temp,
@@ -760,6 +781,27 @@ fn collect_plans(
             &is_reserved,
             &temp_touches,
         );
+
+        if let Some(boundary) = label_flow_boundary
+            && !label_flow_prefix_group_is_safe(
+                block,
+                decl_index,
+                root_temp,
+                boundary,
+                &promotion_group,
+                ctx.safety,
+            )
+        {
+            // 候选拒绝[ProofIncomplete]：该前缀候选会把动态写入或 temp 身份带过
+            // label/goto；缺逐路径 reaching-def 与 physical-root overwrite，不能证明新 local
+            // 的声明和值生命周期覆盖所有跳转路径。
+            continue;
+        }
+        let PromotionGroup {
+            temps: group,
+            removable_aliases,
+            touching_stmt_indices,
+        } = promotion_group;
 
         // 别名扩张后的任一 temp 仍被外层读取时，整个组都不能在子作用域提升；
         // 只检查 root 会让内层 local 吞掉外层 loop state 的别名。
@@ -770,13 +812,15 @@ fn collect_plans(
 
         let home_slot = trusted_home_slot_for_group(&group, facts);
         if home_slot.is_none()
-            && group
-                .iter()
-                .any(|temp| ctx.identity_sensitive_temps.contains(temp))
+            && identity_sensitive_group_requires_home(
+                &group,
+                ctx.identity_sensitive_temps,
+                ctx.cell_sensitive_temps,
+            )
         {
             // 候选拒绝[SemanticBarrier:Capture]：`f` 引用捕获 t0、move 后 `g` 捕获 t1、再覆盖 t0 时，缺同一 trusted home 却合并会让 f/g 错误共享 cell；
             // 候选拒绝[SemanticBarrier:Resource]：TBC 跨同样的不可信合并会更换 close owner。
-            // 候选拒绝[ProofIncomplete]：该 blanket 也包含按值 capture 与无 alias 的单节点组；应按 capture kind、组大小与实际 home 收窄。
+            // 单节点 ByValue capture 已按快照点放行；多节点组仍可能合并异槽 value epoch。
             continue;
         }
         let sticky_local = home_slot.and_then(|slot| sticky_slots.get(&slot).copied());
@@ -850,14 +894,6 @@ fn collect_plans(
                 // 候选拒绝[LayerBoundary]：单次 global table-base/string call-arg seed 由 table-constructors 或 temp-inline 的具体消费站点收敛。
                 continue;
             }
-            if touching_stmt_indices
-                .iter()
-                .copied()
-                .any(|stmt_index| stmt_contains_nested_nonlocal_control(&block.stmts[stmt_index]))
-            {
-                // 候选拒绝[ProofIncomplete]：候选 touch 位于含 nested exit/control 的语句时，当前顶层索引缺少必达路径与声明支配事实；应复用结构化 CFG exit summary。
-                continue;
-            }
         }
 
         let mut allocator = PlanAllocator {
@@ -925,6 +961,10 @@ fn collect_plans(
     ctx.physical_root_locals
         .extend(physical_root_locals_by_home.values().copied());
 
+    if label_flow_boundary.is_some() {
+        return plans;
+    }
+
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
@@ -959,8 +999,15 @@ fn collect_plans(
                 continue;
             }
             let home_slot = facts.trusted_temp_home_slot(temp);
-            if home_slot.is_none() && ctx.identity_sensitive_temps.contains(&temp) {
-                // 候选拒绝[ProofIncomplete]：单个 branch result 被 capture/TBC 观察但缺 trusted home 时，当前没有 cell/close-owner provenance；按值 capture 应再按快照点证明后放行。
+            if home_slot.is_none()
+                && identity_sensitive_group_requires_home(
+                    &BTreeSet::from([temp]),
+                    ctx.identity_sensitive_temps,
+                    ctx.cell_sensitive_temps,
+                )
+            {
+                // 候选拒绝[SemanticBarrier:Capture]：引用捕获持续观察原 cell，缺 trusted home 时不能把 branch result 改成新 local。
+                // 候选拒绝[SemanticBarrier:Resource]：TBC 需要精确 close owner；按值 capture 只在 closure 点保存单次快照，已由单节点分支放行。
                 continue;
             }
             let preceding_lookup_root = home_slot
@@ -1093,6 +1140,31 @@ fn collect_promotion_group(
     }
 }
 
+fn label_flow_prefix_group_is_safe(
+    block: &HirBlock,
+    decl_index: usize,
+    root_temp: TempId,
+    boundary: usize,
+    group: &PromotionGroup,
+    safety: HirExprSafety,
+) -> bool {
+    let Some(value) = single_temp_assign_value(&block.stmts[decl_index], root_temp) else {
+        return false;
+    };
+    safety.result_is_gc_inert(value)
+        && group
+            .removable_aliases
+            .iter()
+            .chain(&group.touching_stmt_indices)
+            .all(|index| *index < boundary)
+        && group.touching_stmt_indices.iter().all(|index| {
+            group
+                .temps
+                .iter()
+                .all(|temp| !stmt_writes_temp(&block.stmts[*index], *temp))
+        })
+}
+
 fn activate_captured_slots_in_stmt(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
@@ -1142,32 +1214,38 @@ fn temp_assign_targets_for_home(
             .collect::<BTreeSet<_>>(),
         HirStmt::If(if_stmt) => {
             let else_block = if_stmt.else_block.as_ref()?;
-            BTreeSet::from([
-                scalar_temp_assign_target_for_home(&if_stmt.then_block, facts, home)?,
-                scalar_temp_assign_target_for_home(else_block, facts, home)?,
-            ])
+            let mut temps = scalar_temp_assign_targets_for_home(&if_stmt.then_block, facts, home);
+            temps.extend(scalar_temp_assign_targets_for_home(else_block, facts, home));
+            temps
         }
+        HirStmt::Block(block) => scalar_temp_assign_targets_for_home(block, facts, home),
         _ => return None,
     };
     (!temps.is_empty()).then_some(temps)
 }
 
-fn scalar_temp_assign_target_for_home(
+fn scalar_temp_assign_targets_for_home(
     block: &HirBlock,
     facts: &ProtoPromotionFacts,
     home: HomeSlotKey,
-) -> Option<TempId> {
-    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
-        return None;
-    };
-    let ([HirLValue::Temp(temp)], [_], None) = (
-        assign.targets.as_slice(),
-        assign.values.fixed.as_slice(),
-        &assign.values.tail,
-    ) else {
-        return None;
-    };
-    (facts.trusted_temp_home_slot(*temp) == Some(home)).then_some(*temp)
+) -> BTreeSet<TempId> {
+    block
+        .stmts
+        .iter()
+        .filter_map(|stmt| {
+            let HirStmt::Assign(assign) = stmt else {
+                return None;
+            };
+            let ([HirLValue::Temp(temp)], [_], None) = (
+                assign.targets.as_slice(),
+                assign.values.fixed.as_slice(),
+                &assign.values.tail,
+            ) else {
+                return None;
+            };
+            (facts.trusted_temp_home_slot(*temp) == Some(home)).then_some(*temp)
+        })
+        .collect()
 }
 
 fn is_redundant_binding_self_assign(stmt: &HirStmt) -> bool {
@@ -1478,4 +1556,32 @@ fn debug_scope_for_temp_group(
         .filter_map(|temp| temp_debug_scopes.get(temp.index()).copied().flatten());
     let scope = scopes.next()?;
     scopes.all(|candidate| candidate == scope).then_some(scope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_single_value_capture_can_promote_without_a_home() {
+        let first = TempId(0);
+        let second = TempId(1);
+        let value_captured = BTreeSet::from([first]);
+
+        assert!(!identity_sensitive_group_requires_home(
+            &BTreeSet::from([first]),
+            &value_captured,
+            &BTreeSet::new(),
+        ));
+        assert!(identity_sensitive_group_requires_home(
+            &BTreeSet::from([first]),
+            &value_captured,
+            &BTreeSet::from([first]),
+        ));
+        assert!(identity_sensitive_group_requires_home(
+            &BTreeSet::from([first, second]),
+            &value_captured,
+            &BTreeSet::new(),
+        ));
+    }
 }

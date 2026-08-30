@@ -282,8 +282,10 @@ pub(super) fn simplify_hir(
                         7 => locals::promote_temps_to_locals_in_proto_with_facts(
                             proto, facts, safety,
                         ),
-                        8 => branch_control_folding::fold_branch_control_in_proto(proto, safety),
-                        9 => decision::eliminate_remaining_decisions_in_proto(proto, safety),
+                        8 => branch_control_folding::fold_branch_control_in_proto(
+                            proto, facts, safety,
+                        ),
+                        9 => decision::eliminate_remaining_decisions_in_proto(proto, facts, safety),
                         10 => debug_scopes::materialize_tail_debug_scopes_in_proto(proto),
                         11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
                         12 => carried_locals::collapse_carried_local_handoffs_in_proto(

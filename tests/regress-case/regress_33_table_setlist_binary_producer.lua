@@ -1,5 +1,7 @@
 -- regress_33_table_setlist_binary_producer#1: SETLIST 尾部多返回中的嵌套表字段可消费二元表达式 producer
 -- unluac: expect-contains [[x = p5_0.w * 1.5]]
+-- unluac: expect-contains [[.callback or]]
+-- unluac: expect-contains [[.move)(4)]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[table-set-list]]
 local tweens = {}
@@ -41,3 +43,15 @@ end
 
 local result = build_sequence({ w = 2 })
 print("regress_33_table_setlist_binary_producer#1", #result, result[2].interval.x)
+
+local function build_choice(flag)
+    return { (flag and tweens.callback or tweens.move)(4) }
+end
+
+local true_choice = build_choice(true)
+local false_choice = build_choice(false)
+print(
+    "regress_33_table_setlist_binary_producer#2",
+    true_choice[1],
+    false_choice[1]
+)

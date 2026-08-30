@@ -161,8 +161,9 @@ pub(super) fn validate_candidate_for_node(
 mod tests {
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirBinaryExpr, HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
-        HirDecisionTarget, HirExpr, HirLogicalExpr, LocalId,
+        HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirDecisionExpr, HirDecisionNode,
+        HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirGlobalRef, HirLogicalExpr, HirValuePack,
+        LocalId,
     };
     use crate::hir::expr_safety::HirExprSafety;
 
@@ -198,6 +199,57 @@ mod tests {
                 HirExprSafety::for_dialect(DecompileDialect::Lua54),
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn single_value_vararg_can_participate_in_synthesis() {
+        let decision = HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: HirExpr::VarArg,
+                truthy: HirDecisionTarget::CurrentValue,
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
+        };
+
+        assert!(
+            synthesize_value_decision_expr(
+                &decision,
+                HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn effectful_call_stays_outside_value_only_synthesis() {
+        let call = HirExpr::Call(Box::new(HirCallExpr {
+            callee: HirExpr::GlobalRef(HirGlobalRef {
+                name: "effect".to_owned(),
+            }),
+            args: HirValuePack::default(),
+            method: false,
+            fastcall: None,
+            method_name: None,
+        }));
+        let decision = HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: call,
+                truthy: HirDecisionTarget::CurrentValue,
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
+        };
+
+        assert!(
+            synthesize_value_decision_expr(
+                &decision,
+                HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            )
+            .is_none()
         );
     }
 }

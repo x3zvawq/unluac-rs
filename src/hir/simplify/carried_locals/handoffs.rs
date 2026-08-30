@@ -130,25 +130,27 @@ fn try_collapse_pure_binding_handoffs(
     }) {
         return false;
     }
-    // 候选拒绝[SemanticBarrier:ControlFlow]：prior goto 可从 seed 之前直达下一 label；删除 seed 后该入口会使用未初始化的重写 binding。
-    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
+    // 候选拒绝[SemanticBarrier:ControlFlow]：prior goto 可从 seed 之前直达 suffix 内任一
+    // label；删除 seed 后该入口会使用未初始化的重写 binding。
+    if label_jumps.suffix_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
+    let active_rewrites = seed
+        .rewrites
+        .iter()
+        .copied()
+        .filter(|rewrite| temp_touches.touches_after(index + 1, rewrite.from))
+        .collect::<Vec<_>>();
     let suffix = &block.stmts[index + 1..];
-    // 候选拒绝[SemanticBarrier:Lifetime]：suffix 仍读取 source 或以非直接写回改写 source 时，temp 快照与 source epoch 不再等价。
-    // 候选拒绝[ProofIncomplete]：temp 在 suffix 无 touch 时 seed 常可直接死写删除；当前 owner 没有独立 dead-seed 证明。
-    if suffix.is_empty()
-        || seed.rewrites.iter().any(|rewrite| {
-            suffix_reads_binding(suffix, rewrite.to)
-                || !suffix_writes_binding_only_via_direct_writeback(
-                    suffix,
-                    rewrite.to,
-                    rewrite.from,
-                )
-                || !temp_touches.touches_after(index + 1, rewrite.from)
-        })
-    {
+    // suffix 未触碰的 rewrite 只是把 binding 当前值写回已证明相同的物理 cell；它没有
+    // 创建独立 value epoch，也没有可被后文消费的 temp identity，因此可随 seed pair
+    // 直接删除。只有仍有 temp use 的 handoff 才需要证明 suffix 不观察旧 binding epoch，
+    // 且对 binding 的写入全部是该 temp 的直接写回。
+    if active_rewrites.iter().any(|rewrite| {
+        suffix_reads_binding(suffix, rewrite.to)
+            || !suffix_writes_binding_only_via_direct_writeback(suffix, rewrite.to, rewrite.from)
+    }) {
         return false;
     }
 
@@ -163,15 +165,22 @@ fn try_collapse_pure_binding_handoffs(
         Some(rewritten_seed)
     };
 
-    let mut pass = TempToBindingPass {
-        rewrites: seed.rewrites.clone(),
-        promotion_facts: safety.promotion_facts,
-    };
-    assert!(
-        rewrite_stmts(&mut block.stmts[index + 1..], &mut pass),
-        "binding handoff suffix must contain a planned temp rewrite"
-    );
+    if !active_rewrites.is_empty() {
+        let mut pass = TempToBindingPass {
+            rewrites: active_rewrites.clone(),
+            promotion_facts: safety.promotion_facts,
+        };
+        assert!(
+            rewrite_stmts(&mut block.stmts[index + 1..], &mut pass),
+            "binding handoff suffix must contain a planned temp rewrite"
+        );
+    }
 
+    let rewritten_suffix_start = if rewritten_seed.is_some() {
+        index + 1
+    } else {
+        index
+    };
     if let Some(rewritten_seed) = rewritten_seed {
         block.stmts[index] = rewritten_seed;
     } else {
@@ -179,8 +188,8 @@ fn try_collapse_pure_binding_handoffs(
     }
 
     prune_redundant_self_assigns_in_stmts(
-        &mut block.stmts[index + 1..],
-        collect_prunable_bindings(seed.rewrites.iter().map(|rewrite| rewrite.to)),
+        &mut block.stmts[rewritten_suffix_start..],
+        collect_prunable_bindings(active_rewrites.iter().map(|rewrite| rewrite.to)),
     );
     prune_empty_assign_stmts(block);
     true
@@ -294,18 +303,21 @@ fn try_collapse_single_binding_handoff(
         // 候选拒绝[SemanticBarrier:Lifetime]：异槽或资源 identity 的 temp/binding 同值仍是两个可被 GC/close 观察的 root。
         return false;
     }
-    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
+    if label_jumps.suffix_has_prior_goto(&block.stmts, index) {
         // 候选拒绝[SemanticBarrier:ControlFlow]：外部 goto 可绕过 seed 后进入 suffix，改名会把未定义 temp 路径变成已有 binding。
         return false;
     }
 
+    if !temp_touches.touches_after(index + 1, temp) {
+        // exact-home 与 identity guards 已证明该赋值是同一 cell 的 self-copy；suffix 没有
+        // temp use，删除 seed 不会消除值、root 或 close epoch 的消费者。
+        block.stmts.remove(index);
+        return true;
+    }
+
     let suffix = &block.stmts[index + 1..];
     // 候选拒绝[SemanticBarrier:Lifetime]：suffix 仍 mention binding 时，重写 temp 的读写会与 binding 原有 epoch 干涉。
-    // 候选拒绝[ProofIncomplete]：suffix 无 temp touch 时可考虑 dead seed 删除，但当前 handoff owner 不拥有该证明。
-    if suffix.is_empty()
-        || suffix_mentions_binding(suffix, binding)
-        || !temp_touches.touches_after(index + 1, temp)
-    {
+    if suffix_mentions_binding(suffix, binding) {
         return false;
     }
 
@@ -350,42 +362,36 @@ fn try_collapse_binding_update_handoff(
     {
         return false;
     }
-    if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
+    if label_jumps.suffix_has_prior_goto(&block.stmts, index) {
         // 候选拒绝[SemanticBarrier:ControlFlow]：prior goto 绕过 update seed 后进入 suffix，不能把未定义 temp 替换成 carried。
         return false;
     }
 
-    let suffix = &block.stmts[index + 1..];
-    // 候选拒绝[SemanticBarrier:EvalOrder]：suffix 读取旧 carried 时，将 seed RHS 直接写 carried 会让该读取提前看到 next 值。
-    // 候选拒绝[ProofIncomplete]：只接受线性前缀+末尾直接写回；一般结构化路径需 path-complete writeback facts。
-    if suffix.is_empty()
-        || suffix_reads_binding(suffix, carried)
-        || !suffix_ends_with_linear_direct_writeback(suffix, carried, target_temp)
-        || !temp_touches.touches_after(index + 1, target_temp)
-    {
-        return false;
-    }
-
+    // exact-home + identity proof 意味着 seed 的 temp target 本来就写入 carried 的物理
+    // cell；末尾 writeback 只是机械名字交接，不是运行语义前提。排除外部入边后，把
+    // suffix 中该 temp 的所有嵌套读写统一命名为 carried 不会移动求值、写入或 root
+    // 生命周期，因此结构化分支不需要额外的 path-complete writeback 形状。
     let mut rewritten_seed = block.stmts[index].clone();
     assert!(
         rewrite_update_handoff_seed(&mut rewritten_seed, carried),
         "parsed update handoff seed must remain rewritable while planning"
     );
 
-    let rewritten = rewrite_stmts(
-        &mut block.stmts[index + 1..],
-        &mut TempToBindingPass {
-            rewrites: vec![TempBindingRewrite {
-                from: target_temp,
-                to: carried,
-            }],
-            promotion_facts: safety.promotion_facts,
-        },
-    );
-    assert!(
-        rewritten,
-        "binding update suffix must contain its planned temp rewrite"
-    );
+    if temp_touches.touches_after(index + 1, target_temp) {
+        assert!(
+            rewrite_stmts(
+                &mut block.stmts[index + 1..],
+                &mut TempToBindingPass {
+                    rewrites: vec![TempBindingRewrite {
+                        from: target_temp,
+                        to: carried,
+                    }],
+                    promotion_facts: safety.promotion_facts,
+                },
+            ),
+            "binding update suffix must contain its planned temp rewrite"
+        );
+    }
     block.stmts[index] = rewritten_seed;
 
     rewrite_stmts(
@@ -424,7 +430,7 @@ fn retained_target_conflicts_with_rewrite(
         return true;
     }
     if bindings_may_share_raw_home_slot(target, rewrite.to, promotion_facts) {
-        // 候选拒绝[ProofIncomplete]：retained target 与 rewrite destination 的 raw home 关系未知；无法证明删除并行写不改变 target 覆盖顺序。
+        // 候选拒绝[ProofIncomplete]：retained physical binding 在 promotion 合流后缺少本次 lvalue occurrence 的 raw home；无法证明删除并行写不改变 target 覆盖顺序。明确无物理 home 的 synthetic local 已由 promotion facts 放行。
         return true;
     }
     false
@@ -458,31 +464,6 @@ fn suffix_reads_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
     let mut collector = BindingReadCollector::default();
     collector.collect_stmts(stmts);
     collector.reads.contains(&binding)
-}
-
-fn suffix_ends_with_linear_direct_writeback(
-    stmts: &[HirStmt],
-    binding: CarryBinding,
-    target_temp: TempId,
-) -> bool {
-    let Some((writeback, prefix)) = stmts.split_last() else {
-        return false;
-    };
-    prefix.iter().all(stmt_is_linear_handoff_prefix)
-        && direct_temp_writeback_stmt(writeback) == Some((binding, target_temp))
-}
-
-fn stmt_is_linear_handoff_prefix(stmt: &HirStmt) -> bool {
-    matches!(
-        stmt,
-        HirStmt::LocalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-    )
 }
 
 fn suffix_writes_binding_only_via_direct_writeback(
@@ -607,7 +588,10 @@ fn stmt_reads_binding(stmt: &HirStmt, binding: CarryBinding) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::common::{HirAssign, HirTableAccess, HirValuePack, LocalId, ParamId};
+    use crate::hir::common::{
+        HirAssign, HirBinaryExpr, HirBinaryOpKind, HirGoto, HirIf, HirLabel, HirLabelId,
+        HirTableAccess, HirValuePack, LocalId, ParamId,
+    };
     use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
     struct PanickingBindingProtection;
@@ -616,6 +600,24 @@ mod tests {
         fn contains(&self, _binding: &CarryBinding) -> bool {
             panic!("effectful retained-target guard must run before suffix/storage proofs");
         }
+    }
+
+    fn empty_identity_facts() -> super::super::HandoffIdentityFacts {
+        super::super::HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            captured: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+        }
+    }
+
+    fn assign(targets: Vec<HirLValue>, values: Vec<HirExpr>) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets,
+            values: HirValuePack::fixed(values),
+        }))
     }
 
     fn effectful_parallel_seed(rewrite_first: bool) -> HirStmt {
@@ -655,8 +657,42 @@ mod tests {
     }
 
     #[test]
-    fn retained_target_conflicts_with_rewrite_when_home_relation_is_unknown() {
+    fn retained_target_conflicts_with_rewrite_when_physical_home_relation_is_unknown() {
         let promotion_facts = ProtoPromotionFacts::default();
+        let rewrite = TempBindingRewrite {
+            from: TempId(0),
+            to: CarryBinding::Param(ParamId(0)),
+        };
+
+        assert!(retained_target_conflicts_with_rewrite(
+            rewrite,
+            &HirLValue::Local(LocalId(0)),
+            &promotion_facts,
+        ));
+    }
+
+    #[test]
+    fn retained_home_free_target_does_not_conflict_with_physical_rewrite_destination() {
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_home_free_local(LocalId(0));
+        let rewrite = TempBindingRewrite {
+            from: TempId(0),
+            to: CarryBinding::Param(ParamId(0)),
+        };
+
+        assert!(!retained_target_conflicts_with_rewrite(
+            rewrite,
+            &HirLValue::Local(LocalId(0)),
+            &promotion_facts,
+        ));
+    }
+
+    #[test]
+    fn retained_home_free_target_conflicts_after_absorbing_conflicting_physical_homes() {
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_home_free_local(LocalId(0));
+        promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(1, 0));
+        promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(2, 0));
         let rewrite = TempBindingRewrite {
             from: TempId(0),
             to: CarryBinding::Param(ParamId(0)),
@@ -716,14 +752,7 @@ mod tests {
             super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
         let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
-        let identity_facts = super::super::HandoffIdentityFacts {
-            debug: BTreeSet::new(),
-            for_bindings: BTreeSet::new(),
-            physical_roots: BTreeSet::new(),
-            captured: BTreeSet::new(),
-            reference_captured: BTreeSet::new(),
-            to_be_closed: BTreeSet::new(),
-        };
+        let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
         let mut safety = HandoffSafety {
             promotion_facts: &mut promotion_facts,
@@ -734,6 +763,186 @@ mod tests {
             &mut block,
             0,
             &PanickingBindingProtection,
+            &temp_touches,
+            &label_jumps,
+            &BTreeSet::new(),
+            &mut safety,
+        ));
+    }
+
+    #[test]
+    fn single_handoff_deletes_exact_home_seed_without_temp_consumer() {
+        let mut block = HirBlock {
+            stmts: vec![
+                assign(
+                    vec![HirLValue::Temp(TempId(0))],
+                    vec![HirExpr::ParamRef(ParamId(0))],
+                ),
+                HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
+                })),
+            ],
+        };
+        let stmt_temp_refs =
+            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
+        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let label_jumps = LabelJumpIndex::new(&block.stmts);
+        let identity_facts = empty_identity_facts();
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        let mut safety = HandoffSafety {
+            promotion_facts: &mut promotion_facts,
+            identity_facts: &identity_facts,
+        };
+
+        assert!(try_collapse_single_binding_handoff(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &temp_touches,
+            &label_jumps,
+            &BTreeSet::new(),
+            &mut safety,
+        ));
+        assert_eq!(block.stmts.len(), 1);
+        assert!(matches!(block.stmts[0], HirStmt::Return(_)));
+    }
+
+    #[test]
+    fn pure_handoff_partitions_live_rewrite_from_dead_exact_home_seed() {
+        let mut block = HirBlock {
+            stmts: vec![
+                assign(
+                    vec![HirLValue::Temp(TempId(0)), HirLValue::Temp(TempId(1))],
+                    vec![HirExpr::ParamRef(ParamId(0)), HirExpr::LocalRef(LocalId(1))],
+                ),
+                assign(
+                    vec![HirLValue::Param(ParamId(0))],
+                    vec![HirExpr::TempRef(TempId(0))],
+                ),
+            ],
+        };
+        let stmt_temp_refs =
+            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
+        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let label_jumps = LabelJumpIndex::new(&block.stmts);
+        let identity_facts = empty_identity_facts();
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        promotion_facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(1, 0));
+        promotion_facts.record_local_home_slot(LocalId(1), HomeSlotKey::new(1, 0));
+        let mut safety = HandoffSafety {
+            promotion_facts: &mut promotion_facts,
+            identity_facts: &identity_facts,
+        };
+
+        assert!(try_collapse_pure_binding_handoffs(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &temp_touches,
+            &label_jumps,
+            &BTreeSet::new(),
+            &mut safety,
+        ));
+        assert!(block.stmts.is_empty());
+    }
+
+    #[test]
+    fn update_handoff_rewrites_exact_home_temp_through_structured_suffix() {
+        let update = HirExpr::Binary(Box::new(HirBinaryExpr {
+            op: HirBinaryOpKind::Add,
+            lhs: HirExpr::ParamRef(ParamId(0)),
+            rhs: HirExpr::Integer(1),
+        }));
+        let mut block = HirBlock {
+            stmts: vec![
+                assign(vec![HirLValue::Temp(TempId(0))], vec![update]),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::Boolean(true),
+                    then_block: HirBlock {
+                        stmts: vec![HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                            values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+                        }))],
+                    },
+                    else_block: Some(HirBlock {
+                        stmts: vec![HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                            values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+                        }))],
+                    }),
+                })),
+            ],
+        };
+        let stmt_temp_refs =
+            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
+        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let label_jumps = LabelJumpIndex::new(&block.stmts);
+        let identity_facts = empty_identity_facts();
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        let mut safety = HandoffSafety {
+            promotion_facts: &mut promotion_facts,
+            identity_facts: &identity_facts,
+        };
+
+        assert!(try_collapse_binding_update_handoff(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &temp_touches,
+            &label_jumps,
+            &BTreeSet::new(),
+            &mut safety,
+        ));
+        let refs = super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
+        assert!(refs.iter().all(BTreeSet::is_empty));
+        let HirStmt::Assign(seed) = &block.stmts[0] else {
+            panic!("expected rewritten update seed");
+        };
+        assert_eq!(seed.targets, vec![HirLValue::Param(ParamId(0))]);
+    }
+
+    #[test]
+    fn update_handoff_rejects_non_adjacent_suffix_label_with_prior_goto() {
+        let label = HirLabelId(0);
+        let update = HirExpr::Binary(Box::new(HirBinaryExpr {
+            op: HirBinaryOpKind::Add,
+            lhs: HirExpr::ParamRef(ParamId(0)),
+            rhs: HirExpr::Integer(1),
+        }));
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::Goto(Box::new(HirGoto { target: label })),
+                assign(vec![HirLValue::Temp(TempId(0))], vec![update]),
+                assign(
+                    vec![HirLValue::Local(LocalId(1))],
+                    vec![HirExpr::Integer(0)],
+                ),
+                HirStmt::Label(Box::new(HirLabel {
+                    id: label,
+                    tbc_barriers: Vec::new(),
+                })),
+                HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+                })),
+            ],
+        };
+        let stmt_temp_refs =
+            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
+        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let label_jumps = LabelJumpIndex::new(&block.stmts);
+        let identity_facts = empty_identity_facts();
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        let mut safety = HandoffSafety {
+            promotion_facts: &mut promotion_facts,
+            identity_facts: &identity_facts,
+        };
+
+        assert!(!try_collapse_binding_update_handoff(
+            &mut block,
+            1,
+            &BTreeSet::new(),
             &temp_touches,
             &label_jumps,
             &BTreeSet::new(),

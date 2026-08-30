@@ -148,3 +148,27 @@ assert(clean_run(true, false, false) == "early")
 assert(clean_run(false, false, false) == "left")
 assert(clean_run(false, true, false) == "right")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm", table.concat(events, ","))
+
+-- regress_374_path_condition_clean_islands#5: a forward label with one guarded predecessor
+-- inherits that edge's stable truthiness when lexical fallthrough is closed.
+-- unluac: expect-contains [[if not mark("label-pred", true) then]]
+-- unluac: expect-not-contains [[not flag or mark("label-pred", true)]]
+
+local function unique_label_predecessor(flag)
+    if flag then
+        goto known_true
+    end
+    do
+        return "false"
+    end
+
+    ::known_true::
+    if not flag or mark("label-pred", true) then
+        return "true"
+    end
+    return "miss"
+end
+
+assert(unique_label_predecessor(false) == "false")
+assert(unique_label_predecessor(true) == "true")
+assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,label-pred", table.concat(events, ","))

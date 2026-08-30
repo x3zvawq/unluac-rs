@@ -1,6 +1,12 @@
 -- regress_206_luau_home_slot_compaction#1: stripped 大函数应按 home slot 复用 local，避免源码局部槽膨胀
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[do]]
+-- unluac: expect-contains [[return nil, nil]]
+-- unluac: expect-not-contains [[= nil, nil]]
+local function tail()
+    return "tail"
+end
+
 local function churn(x)
     x = bit32.bxor(bit32.lrotate(x, 1), bit32.rrotate(x, 1)); x = bit32.bxor(bit32.lrotate(x, 2), bit32.rrotate(x, 8)); x = bit32.bxor(bit32.lrotate(x, 3), bit32.rrotate(x, 15)); x = bit32.bxor(bit32.lrotate(x, 4), bit32.rrotate(x, 22))
     x = bit32.bxor(bit32.lrotate(x, 5), bit32.rrotate(x, 29)); x = bit32.bxor(bit32.lrotate(x, 6), bit32.rrotate(x, 5)); x = bit32.bxor(bit32.lrotate(x, 7), bit32.rrotate(x, 12)); x = bit32.bxor(bit32.lrotate(x, 8), bit32.rrotate(x, 19))
@@ -18,7 +24,10 @@ local function churn(x)
     x = bit32.bxor(bit32.lrotate(x, 22), bit32.rrotate(x, 24)); x = bit32.bxor(bit32.lrotate(x, 23), bit32.rrotate(x, 31)); x = bit32.bxor(bit32.lrotate(x, 24), bit32.rrotate(x, 7)); x = bit32.bxor(bit32.lrotate(x, 25), bit32.rrotate(x, 14))
     x = bit32.bxor(bit32.lrotate(x, 26), bit32.rrotate(x, 21)); x = bit32.bxor(bit32.lrotate(x, 27), bit32.rrotate(x, 28)); x = bit32.bxor(bit32.lrotate(x, 28), bit32.rrotate(x, 4)); x = bit32.bxor(bit32.lrotate(x, 29), bit32.rrotate(x, 11))
     x = bit32.bxor(bit32.lrotate(x, 30), bit32.rrotate(x, 18)); x = bit32.bxor(bit32.lrotate(x, 31), bit32.rrotate(x, 25)); x = bit32.bxor(bit32.lrotate(x, 1), bit32.rrotate(x, 1)); x = bit32.bxor(bit32.lrotate(x, 2), bit32.rrotate(x, 8))
-    return x
+    if x ~= 0 then
+        return x, 1
+    end
+    return nil, nil, tail()
 end
 
 print("regress_206_luau_home_slot_compaction#1", churn(12345))

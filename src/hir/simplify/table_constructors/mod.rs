@@ -233,11 +233,12 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     &binding_index,
                     &binding_occurrences,
                     &materialized_binding_counts,
+                    &self.debug_identity_bindings,
                     &stmt_ids,
                     self.dialect,
                     &mut scratch,
                 );
-                candidate.filter(|(rebuilt_constructor, end_index)| {
+                candidate.filter(|(rebuilt_constructor, end_index, preserved_stmt_indices)| {
                     let open_local_owner = rebuilt_constructor.trailing_multivalue.is_some()
                         && self.open_local_constructor_region_is_safe(
                             block,
@@ -256,7 +257,12 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 候选拒绝[ProofIncomplete]：当前对任意嵌套/direct nil 与 exact-width tail
                     // 整体停用；其中存在等价形状，应按实际 array slot 与 pack width 建模。
                     let unsupported_nil_or_width = constructor_has_nil_field(&seed_ctor)
-                        || region_has_direct_nil_field(block, index, *end_index)
+                        || region_has_direct_nil_field(
+                            block,
+                            index,
+                            *end_index,
+                            preserved_stmt_indices,
+                        )
                         || region_has_exact_width_tail(block, index, *end_index);
                     // Check the completed constructor as well as the original seed.  A seed
                     // whose last array value may be nil is safe only while it remains the last
@@ -303,9 +309,11 @@ impl HirRewritePass for TableConstructorPass<'_> {
             } else {
                 None
             };
-            let (constructor, end_index, rebuilt_region) = match rebuilt {
-                Some((rebuilt_ctor, end_index)) => (rebuilt_ctor, end_index, true),
-                None => (seed_ctor, index, false),
+            let (constructor, end_index, preserved_stmt_indices, rebuilt_region) = match rebuilt {
+                Some((rebuilt_ctor, end_index, preserved_stmt_indices)) => {
+                    (rebuilt_ctor, end_index, preserved_stmt_indices, true)
+                }
+                None => (seed_ctor, index, Vec::new(), false),
             };
 
             if !rebuilt_region {
@@ -316,12 +324,15 @@ impl HirRewritePass for TableConstructorPass<'_> {
             install_constructor_seed(&mut block.stmts[index], constructor);
             let drain_end = end_index;
             if drain_end > index {
-                for i in index + 1..=drain_end {
+                for i in (index + 1..=drain_end).rev() {
+                    if preserved_stmt_indices.binary_search(&i).is_ok() {
+                        continue;
+                    }
                     binding_occurrences.remove_stmt(stmt_ids[i], &stmt_bindings[i]);
+                    block.stmts.remove(i);
+                    stmt_bindings.remove(i);
+                    stmt_ids.remove(i);
                 }
-                block.stmts.drain(index + 1..=drain_end);
-                stmt_bindings.drain(index + 1..=drain_end);
-                stmt_ids.drain(index + 1..=drain_end);
             }
             changed = true;
             index += 1;
@@ -1111,9 +1122,10 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // owner 的 LocalDecl/LocalId 不会被删除；下方逐句证明又拒绝任何在 drain 区间内
-        // 读取 owner 的 producer、key 或 value（closure capture 也通过 capture value 命中）。
-        // 因此只有区间后的 reference capture 可达，它仍捕获同一个 table owner。
+        // owner 的 LocalDecl/LocalId 不会被删除；下方逐句证明拒绝任何在 drain 区间内
+        // 读取 owner 的 producer、key 或 value，并按 trusted home 排除不同 binding 对同一
+        // 物理 cell 的 capture。因此只有区间后的 reference capture 可达，它仍捕获同一个
+        // table owner。
         let tail = set_list.values.tail.as_ref().expect("checked open tail");
         // 候选拒绝[ProofIncomplete]：exact-width carrier 尚无 constructor-tail 精确表示。
         if tail.exact_width().is_some() {
@@ -1153,16 +1165,26 @@ impl TableConstructorPass<'_> {
             return false;
         }
         // 候选拒绝[LayerBoundary]：trusted home 由 promotion owner 提供。
-        if self
-            .promotion_facts
-            .trusted_local_home_slot(local)
-            .is_none()
-        {
+        let Some(seed_home) = self.promotion_facts.trusted_local_home_slot(local) else {
             return false;
-        }
+        };
 
         let mut object_record_names = BTreeSet::new();
         for stmt in &block.stmts[seed_index + 1..end_index] {
+            let stmt_slice = std::slice::from_ref(stmt);
+            if self.captures_may_share_seed_home(
+                &stmts_reference_captured_bindings(stmt_slice),
+                local,
+                seed_home,
+            ) || self.captures_may_share_seed_home(
+                &stmts_value_captured_bindings(stmt_slice),
+                local,
+                seed_home,
+            ) {
+                // 候选拒绝[SemanticBarrier:Scope]：不同 binding 仍可能捕获 owner 的同一物理
+                // cell；缺 trusted home 的 capture 也不能证明与 owner 分离。
+                return false;
+            }
             match stmt {
                 HirStmt::LocalDecl(decl) => {
                     // 候选拒绝[ProofIncomplete]：producer 的 open pack 尚未按每个目标槽位
@@ -1262,11 +1284,23 @@ impl TableConstructorPass<'_> {
                         }
                     }
                 }
-                _ => {
-                    // 分析停用[ProofIncomplete]：open-owner region 只建模 LocalDecl/Assign，
-                    // 其他语句缺少路径、effect 与资源生命周期摘要。
-                    return false;
+                HirStmt::TableSetList(prefix_set_list) => {
+                    // scanner/rebuild 已证明每个 SETLIST 的精确起点与 table shape；这里只补
+                    // open-owner 特有的词法 owner、value effect 和 open-pack 边界。前置 open
+                    // pack 不可能再接末尾 batch，而 owner 自引用不能搬进其 LocalDecl initializer。
+                    if binding_from_expr(&prefix_set_list.base) != Some(binding)
+                        || prefix_set_list.values.tail.is_some()
+                        || prefix_set_list.values.fixed.iter().any(|value| {
+                            expr_uses_binding(value, binding)
+                                || !expr_is_fixed_set_list_value_safe(value)
+                        })
+                    {
+                        return false;
+                    }
                 }
+                _ => unreachable!(
+                    "constructor region scanner only admits local declarations, assignments, and SETLIST"
+                ),
             }
         }
         true
@@ -1672,14 +1706,26 @@ fn region_has_direct_nil_field(
     block: &crate::hir::common::HirBlock,
     seed_index: usize,
     end_index: usize,
+    preserved_stmt_indices: &[usize],
 ) -> bool {
     block.stmts[(seed_index + 1)..=end_index]
         .iter()
-        .any(|stmt| match stmt {
-            HirStmt::Assign(assign) => assign.values.fixed.iter().any(expr_contains_nil),
-            HirStmt::LocalDecl(local_decl) => local_decl.values.fixed.iter().any(expr_contains_nil),
-            HirStmt::TableSetList(set_list) => set_list.values.fixed.iter().any(expr_contains_nil),
-            _ => false,
+        .enumerate()
+        .any(|(offset, stmt)| {
+            let stmt_index = seed_index + 1 + offset;
+            if preserved_stmt_indices.binary_search(&stmt_index).is_ok() {
+                return false;
+            }
+            match stmt {
+                HirStmt::Assign(assign) => assign.values.fixed.iter().any(expr_contains_nil),
+                HirStmt::LocalDecl(local_decl) => {
+                    local_decl.values.fixed.iter().any(expr_contains_nil)
+                }
+                HirStmt::TableSetList(set_list) => {
+                    set_list.values.fixed.iter().any(expr_contains_nil)
+                }
+                _ => false,
+            }
         })
 }
 

@@ -291,6 +291,7 @@ pub(super) struct ProtoPromotionFacts {
     invalidated_param_homes: BTreeSet<ParamId>,
     invalidated_local_homes: BTreeSet<LocalId>,
     invalidated_temp_homes: BTreeSet<TempId>,
+    home_free_locals: BTreeSet<LocalId>,
     compact_home_slots: bool,
 }
 
@@ -298,6 +299,7 @@ impl ProtoPromotionFacts {
     /// 从 canonical def 与最终 value plan 提取当前 proto 的 temp -> home slot 对照表。
     pub(super) fn from_plan(
         proto: &LoweredProto,
+        cfg: &Cfg,
         dataflow: &DataflowFacts,
         plan: &StructurePlan,
         slot_epochs: &SlotEpochFacts,
@@ -317,7 +319,7 @@ impl ProtoPromotionFacts {
             phi_temps,
             total_temps,
         );
-        let copy_roots = collect_copy_root_facts(proto, dataflow, fixed_temps);
+        let copy_roots = collect_copy_root_facts(proto, cfg, dataflow, fixed_temps);
 
         Self {
             temp_home_slots,
@@ -344,6 +346,7 @@ impl ProtoPromotionFacts {
             invalidated_param_homes: BTreeSet::new(),
             invalidated_local_homes: BTreeSet::new(),
             invalidated_temp_homes: BTreeSet::new(),
+            home_free_locals: BTreeSet::new(),
             compact_home_slots: false,
         }
     }
@@ -434,6 +437,19 @@ impl ProtoPromotionFacts {
         self.temp_home_slots.iter().flatten().count()
     }
 
+    #[cfg(test)]
+    pub(super) fn record_temp_home_slot_for_test(&mut self, temp: TempId, home_slot: HomeSlotKey) {
+        if self.temp_home_slots.len() <= temp.index() {
+            self.temp_home_slots.resize(temp.index() + 1, None);
+        }
+        self.temp_home_slots[temp.index()] = Some(home_slot);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_loop_carrier_temp_for_test(&mut self, temp: TempId) {
+        self.loop_carrier_temps.insert(temp);
+    }
+
     /// 返回 temp 提升后 local 仍对应的原始词法槽位。
     ///
     /// 同一 local 若吸收过不同槽位会永久标为 conflict；后续 pass 不能再把它作为
@@ -453,6 +469,7 @@ impl ProtoPromotionFacts {
         local: crate::hir::common::LocalId,
         home_slot: HomeSlotKey,
     ) {
+        self.home_free_locals.remove(&local);
         if self.local_home_slots.len() <= local.index() {
             self.local_home_slots
                 .resize(local.index() + 1, HomeSlotResolution::Unknown);
@@ -460,6 +477,18 @@ impl ProtoPromotionFacts {
         let resolution = &mut self.local_home_slots[local.index()];
         *resolution =
             merge_home_slot_resolutions(*resolution, HomeSlotResolution::Known(home_slot));
+    }
+
+    /// 记录由 HIR pass 新建、并不对应任何原始 VM 槽位的 local。
+    ///
+    /// 这与 `HomeSlotResolution::Unknown` 不同：后者仍可能来自 provenance 冲突或缺失的
+    /// 物理 binding，不能据此排除 raw-home alias。
+    pub(super) fn record_home_free_local(&mut self, local: LocalId) {
+        self.home_free_locals.insert(local);
+    }
+
+    pub(super) fn local_has_no_physical_home(&self, local: LocalId) -> bool {
+        self.home_free_locals.contains(&local)
     }
 
     pub(super) fn enable_home_slot_compaction(&mut self) {
@@ -1105,13 +1134,14 @@ fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTr
 
 /// 从 low-IR 正证一个 direct `GETUPVAL`/跨槽 `MOVE` copy 的物理槽在后续所有潜在
 /// 用户代码/GC 观察点
-/// 都仍位于 VM active stack top 以下，并沿同一 basic block 活到 Return 或一个精确的
-/// scalar-nil overwrite。
+/// 都仍位于 VM active stack top 以下，并沿同一 basic block 或严格前向的单入口 CFG
+/// 链活到 Return，或在原 block 内活到一个精确的 scalar-nil overwrite。
 ///
 /// HIR 会丢失 block 结束时的隐式 stack-top 收缩；只看“后缀没有同槽写”会把已经到期
-/// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实，且不跨任何控制
-/// terminator、TBC 标记、专用调用协议或无法计算活动栈下界的事件；`Close` 本身不
-/// 覆盖槽位，因此可以在已证明的活动 caller prefix 内继续到原始 `Return`。
+/// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实；只跨 CFG 能证明
+/// 单入口且无回边的 successor，且不跨分支或无法计算活动栈下界的事件；TBC 与专用调用协议
+/// 只消费各自的固定输入 root prefix。`Close` 本身不覆盖槽位，因此可以在已证明的活动
+/// caller prefix 内继续到原始 `Return`。
 #[derive(Default)]
 struct CopyRootFacts {
     scope_end: BTreeSet<TempId>,
@@ -1125,6 +1155,7 @@ enum CopyRootEnd {
 
 fn collect_copy_root_facts(
     proto: &LoweredProto,
+    cfg: &Cfg,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
 ) -> CopyRootFacts {
@@ -1145,7 +1176,7 @@ fn collect_copy_root_facts(
         if fixed_temps.get(def.id.index()) != Some(&direct) {
             continue;
         }
-        match copy_root_end(proto, dataflow, fixed_temps, def.instr, def.reg) {
+        match copy_root_end(proto, cfg, dataflow, fixed_temps, def.instr, def.reg) {
             Some(CopyRootEnd::ScopeEnd) => {
                 facts.scope_end.insert(direct);
             }
@@ -1160,19 +1191,39 @@ fn collect_copy_root_facts(
 
 fn copy_root_end(
     proto: &LoweredProto,
+    cfg: &Cfg,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
     producer: InstrRef,
     home: Reg,
 ) -> Option<CopyRootEnd> {
     let mut observed = false;
+    let mut crossed_block = false;
+    let mut current_block = *cfg.instr_to_block.get(producer.index())?;
+    let mut index = producer.index() + 1;
 
-    for index in producer.index() + 1..proto.instrs.len() {
+    while index < proto.instrs.len() {
+        let instr_block = *cfg.instr_to_block.get(index)?;
+        if instr_block != current_block {
+            if copy_root_forward_block_successor(cfg, current_block) != Some(instr_block)
+                || cfg.blocks.get(instr_block.index())?.instrs.start != InstrRef(index)
+            {
+                return None;
+            }
+            crossed_block = true;
+            current_block = instr_block;
+        }
         let instr = proto.instrs.get(index)?;
         let effect = dataflow.instr_effects.get(index)?;
 
         // 当前值若被覆盖，同一 root transaction 要么在精确 nil 写处终止，要么失去证明。
         if effect.must_define(home) {
+            if crossed_block {
+                // 候选拒绝[LayerBoundary]：跨 low block 的 overwrite 还需 dead_temps/HIR
+                // root-lifetime owner 证明 producer 与终止写落在同一可改写 HirBlock；
+                // 否则当前 consumer 找不到精确 overwrite pair，不能发布该事实。
+                return None;
+            }
             if observed
                 && let Some(overwrite) =
                     direct_scalar_nil_overwrite_temp(proto, dataflow, fixed_temps, index, home)
@@ -1202,18 +1253,48 @@ fn copy_root_end(
                 // 证明 home 位于活动 caller prefix，保留同一物理 local 穿过 CLOSE
                 // 只复现 VM 原有 root。继续扫描到原始 Return 才冻结作用域终点。
             }
-            LowInstr::Tbc(_) | LowInstr::TailCall(_) | LowInstr::GenericForCall(_) => {
-                // 候选拒绝[ProofIncomplete]：resource 标记与专用调用协议需要各自的
-                // frame/root 区间事实，不能复用普通 CALL 的 caller-prefix 证明。
-                return None;
+            LowInstr::Tbc(tbc) => {
+                let active_top = fixed_input_root_prefix_top([tbc.reg]);
+                if active_top <= home.index() {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：TBC 的异常/cleanup 路径只保证
+                    // 标记槽以下仍属于活动 caller prefix；更高 copy home 已过期。
+                    return None;
+                }
+                observed = true;
+            }
+            LowInstr::GenericForCall(call) => {
+                // 迭代器调用执行期间只把 iterator/state/control 作为 caller roots；result
+                // targets 尚未产生，不能用通用 InstrEffect 的 must-def 抬高 active top。
+                let active_top =
+                    fixed_input_root_prefix_top([call.iterator, call.state, call.control]);
+                if active_top <= home.index() {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：copy 位于 TFORCALL 的三个活动
+                    // 输入以上时，迭代器中的 GC 可观察其已经失活（同 regress_416 的
+                    // block-end 高槽到期边界）。
+                    return None;
+                }
+                observed = true;
+            }
+            LowInstr::TailCall(_) => {
+                // tail callee 执行前 caller frame 已结束，不能把它当成新的 root 观察点；
+                // 但此前已被普通调用观察过的 transaction 可精确在此结束作用域。
+                return observed.then_some(CopyRootEnd::ScopeEnd);
+            }
+            LowInstr::Jump(_) => {
+                let successor = copy_root_forward_jump_successor(cfg, InstrRef(index))?;
+                crossed_block = true;
+                current_block = successor;
+                index = cfg.blocks.get(successor.index())?.instrs.start.index();
+                continue;
             }
             _ if instr.is_control_terminator() => {
-                // 候选拒绝[ProofIncomplete]：不跨 basic-block terminator 猜测每条后继
-                // 路径的 stack-top 与 root 终止点。
+                // 候选拒绝[LayerBoundary]：branch/loop 的每条 successor active-top 与
+                // HIR root 终止作用域应由 Structure CFG root-lifetime summary owner 汇总；
+                // regress_416 证明高槽可在另一后继先失活，不能按线性 PC 或任选一路延长。
                 return None;
             }
             _ if low_instr_may_observe_gc_roots(dataflow, index) => {
-                if effect_active_top_lower_bound(effect) <= home.index() {
+                if !effect_keeps_copy_home_rooted(effect, home) {
                     // 候选拒绝[SemanticBarrier:Lifetime]：当前观察点不能正证 copy home
                     // 位于活动栈下界内；block-end 高槽到期反例会在这里被排除。
                     return None;
@@ -1222,9 +1303,35 @@ fn copy_root_end(
             }
             _ => {}
         }
+        index += 1;
     }
 
     None
+}
+
+fn copy_root_forward_jump_successor(cfg: &Cfg, terminator: InstrRef) -> Option<BlockRef> {
+    let block = *cfg.instr_to_block.get(terminator.index())?;
+    if cfg.blocks.get(block.index())?.instrs.last() != Some(terminator) {
+        return None;
+    }
+    copy_root_forward_block_successor(cfg, block)
+}
+
+fn copy_root_forward_block_successor(cfg: &Cfg, block: BlockRef) -> Option<BlockRef> {
+    let successor = cfg.unique_reachable_successor(block)?;
+    if cfg.unique_reachable_predecessor_matching(successor, |_| true) != Some(block) {
+        // 候选拒绝[LayerBoundary]：join successor 需要 Structure CFG owner 合流每个
+        // predecessor 的 root/top 状态；只沿当前 copy 路径会漏掉另一入口的槽生命周期。
+        return None;
+    }
+    let successor_range = cfg.blocks.get(successor.index())?.instrs;
+    let block_end = cfg.blocks.get(block.index())?.instrs.end();
+    if successor_range.is_empty() || successor_range.start.index() < block_end {
+        // 候选拒绝[SemanticBarrier:Lifetime]：回边会再次执行同一静态 copy def；把首轮
+        // reaching root 冻结到函数作用域会混同迭代 transaction，并越过真实覆盖/失活点。
+        return None;
+    }
+    Some(successor)
 }
 
 fn direct_scalar_nil_overwrite_temp(
@@ -1258,6 +1365,17 @@ fn effect_active_top_lower_bound(effect: &crate::structure::InstrEffect) -> usiz
         .map(|reg| reg.index().saturating_add(1))
         .chain(effect.open_use.map(Reg::index))
         .chain(effect.open_must_def.map(Reg::index))
+        .max()
+        .unwrap_or_default()
+}
+
+fn effect_keeps_copy_home_rooted(effect: &crate::structure::InstrEffect, home: Reg) -> bool {
+    effect_active_top_lower_bound(effect) > home.index()
+}
+
+fn fixed_input_root_prefix_top<const N: usize>(regs: [Reg; N]) -> usize {
+    regs.into_iter()
+        .map(|reg| reg.index().saturating_add(1))
         .max()
         .unwrap_or_default()
 }
@@ -1410,5 +1528,116 @@ fn merge_home_slot_resolutions(
         (HomeSlotResolution::Known(_), HomeSlotResolution::Known(_)) => {
             HomeSlotResolution::Conflict
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structure::{
+        BasicBlock, BlockKind, CfgEdge, EdgeKind, EdgeRef, InstrEffect, InstrRange,
+    };
+
+    #[test]
+    fn dedicated_protocol_root_prefix_excludes_future_result_slots() {
+        assert_eq!(fixed_input_root_prefix_top([Reg(4)]), 5);
+        assert_eq!(fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]), 7);
+        assert!(Reg(6).index() < fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]));
+        assert!(Reg(7).index() >= fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]));
+    }
+
+    #[test]
+    fn copy_root_crosses_only_a_forward_single_entry_jump() {
+        let forward = Cfg {
+            blocks: vec![
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(0), 2),
+                },
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(2), 1),
+                },
+                BasicBlock {
+                    kind: BlockKind::SyntheticExit,
+                    instrs: InstrRange::new(InstrRef(3), 0),
+                },
+            ],
+            edges: vec![
+                CfgEdge {
+                    from: BlockRef(0),
+                    to: BlockRef(1),
+                    kind: EdgeKind::Jump,
+                },
+                CfgEdge {
+                    from: BlockRef(1),
+                    to: BlockRef(2),
+                    kind: EdgeKind::Return,
+                },
+            ],
+            entry_block: BlockRef(0),
+            exit_block: BlockRef(2),
+            block_order: vec![BlockRef(0), BlockRef(1)],
+            instr_to_block: vec![BlockRef(0), BlockRef(0), BlockRef(1)],
+            preds: vec![vec![], vec![EdgeRef(0)], vec![EdgeRef(1)]],
+            succs: vec![vec![EdgeRef(0)], vec![EdgeRef(1)], vec![]],
+            reachable_blocks: BTreeSet::from([BlockRef(0), BlockRef(1), BlockRef(2)]),
+        };
+        assert_eq!(
+            copy_root_forward_jump_successor(&forward, InstrRef(1)),
+            Some(BlockRef(1))
+        );
+
+        let backedge = Cfg {
+            blocks: vec![
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(0), 1),
+                },
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(1), 1),
+                },
+                BasicBlock {
+                    kind: BlockKind::SyntheticExit,
+                    instrs: InstrRange::new(InstrRef(2), 0),
+                },
+            ],
+            edges: vec![
+                CfgEdge {
+                    from: BlockRef(0),
+                    to: BlockRef(1),
+                    kind: EdgeKind::Fallthrough,
+                },
+                CfgEdge {
+                    from: BlockRef(1),
+                    to: BlockRef(0),
+                    kind: EdgeKind::Jump,
+                },
+            ],
+            entry_block: BlockRef(0),
+            exit_block: BlockRef(2),
+            block_order: vec![BlockRef(0), BlockRef(1)],
+            instr_to_block: vec![BlockRef(0), BlockRef(1)],
+            preds: vec![vec![EdgeRef(1)], vec![EdgeRef(0)], vec![]],
+            succs: vec![vec![EdgeRef(0)], vec![EdgeRef(1)], vec![]],
+            reachable_blocks: BTreeSet::from([BlockRef(0), BlockRef(1)]),
+        };
+        assert_eq!(
+            copy_root_forward_jump_successor(&backedge, InstrRef(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_root_successor_observation_requires_active_top_above_home() {
+        let home = Reg(1);
+        let mut expired = InstrEffect::default();
+        expired.fixed_uses.insert(Reg(0));
+        assert!(!effect_keeps_copy_home_rooted(&expired, home));
+
+        let mut rooted = InstrEffect::default();
+        rooted.fixed_uses.insert(Reg(2));
+        assert!(effect_keeps_copy_home_rooted(&rooted, home));
     }
 }

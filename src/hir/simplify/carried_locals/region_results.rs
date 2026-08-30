@@ -282,7 +282,7 @@ pub(super) fn collapse_written_back_if_results(
         let facts = binding_facts(std::slice::from_ref(&block.stmts[index + 1]));
         let state_writes_preserve_result = exits.iter().all(|exit| {
             !exit.contains_key(&state)
-                && exit.get(&result).and_then(carry_binding_from_expr) == Some(state)
+                && exit.get(&result).and_then(ExitValue::exact_binding) == Some(state)
         });
         if exits.len() < 2
             || !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
@@ -439,10 +439,14 @@ fn try_collapse_seeded_if_results(
         .copied()
         .zip(seeds.iter().copied().map(CarryBinding::Local))
         .collect::<BTreeMap<_, _>>();
+    if !rewritten_results_keep_exit_values(&rewrites, &exits) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：seeded exit 在 result 后写 seed 时，改名后的最后写不再保留原 result 出口值；反最小见 seed_write_after_result_is_rejected。
+        return false;
+    }
     if !rewrites.iter().all(|(result, seed)| {
         exits
             .iter()
-            .any(|exit| exit.get(result).and_then(carry_binding_from_expr) == Some(*seed))
+            .any(|exit| exit.get(result).and_then(ExitValue::exact_binding) == Some(*seed))
     }) {
         // 候选拒绝[ProofIncomplete]：某 result 没有任何出口精确复制对应 seed 时，seed/result 关系需更一般的路径证明。
         return false;
@@ -551,10 +555,7 @@ fn try_collapse_loop_results(
         let Some(HirStmt::Assign(assign)) = body.stmts.last() else {
             return false;
         };
-        let Some(exit) = assignment_values(assign) else {
-            return false;
-        };
-        exits.push(exit);
+        exits.push(assignment_values(assign));
     }
     if exits.is_empty() {
         // 候选拒绝[ProofIncomplete]：没有显式 break/fallthrough assignment 时尚无 loop result reaching-def。
@@ -606,7 +607,7 @@ fn try_collapse_loop_results(
         && !rewrites.iter().all(|(result, seed)| {
             exits.iter().all(|exit| {
                 !exit.contains_key(seed)
-                    && exit.get(result).and_then(carry_binding_from_expr) == Some(*seed)
+                    && exit.get(result).and_then(ExitValue::exact_binding) == Some(*seed)
             })
         })
     {

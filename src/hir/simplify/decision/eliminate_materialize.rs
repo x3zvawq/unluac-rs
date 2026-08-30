@@ -862,7 +862,8 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety
                 *expr = replacement;
                 true
             } else {
-                // 候选拒绝[ProofIncomplete]：纯表达式通道无法物化非稳定 Decision；If/While owner 会抽取短作用域 truthiness，Repeat 仍缺让 continue 先执行尾条件前缀的布局。
+                // 候选拒绝[LayerBoundary]：这个递归入口只返回表达式；需要 statement
+                // prefix 的非稳定 Decision 由 If/While/Repeat owner 原位物化。
                 false
             }
         }

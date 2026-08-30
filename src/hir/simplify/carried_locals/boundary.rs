@@ -42,6 +42,14 @@ impl LabelJumpIndex {
         self.has_goto_before(index, label.id)
     }
 
+    pub(super) fn suffix_has_prior_goto(&self, stmts: &[HirStmt], index: usize) -> bool {
+        stmts[index + 1..].iter().any(|stmt| {
+            label_targets(stmt)
+                .iter()
+                .any(|label| self.has_goto_before(index, *label))
+        })
+    }
+
     pub(super) fn nearest_prior_label(&self, index: usize) -> Option<HirLabelId> {
         self.nearest_prior_labels.get(index).copied().flatten()
     }
@@ -65,6 +73,49 @@ fn goto_targets(stmt: &HirStmt) -> BTreeSet<HirLabelId> {
     let mut targets = BTreeSet::new();
     collect_goto_targets(stmt, &mut targets);
     targets
+}
+
+fn label_targets(stmt: &HirStmt) -> BTreeSet<HirLabelId> {
+    let mut targets = BTreeSet::new();
+    collect_label_targets(stmt, &mut targets);
+    targets
+}
+
+fn collect_label_targets(stmt: &HirStmt, targets: &mut BTreeSet<HirLabelId>) {
+    match stmt {
+        HirStmt::Label(label) => {
+            targets.insert(label.id);
+        }
+        HirStmt::If(if_stmt) => {
+            collect_block_label_targets(&if_stmt.then_block, targets);
+            if let Some(else_block) = &if_stmt.else_block {
+                collect_block_label_targets(else_block, targets);
+            }
+        }
+        HirStmt::While(while_stmt) => collect_block_label_targets(&while_stmt.body, targets),
+        HirStmt::Repeat(repeat_stmt) => collect_block_label_targets(&repeat_stmt.body, targets),
+        HirStmt::Block(block) => collect_block_label_targets(block, targets),
+        HirStmt::NumericFor(numeric_for) => collect_block_label_targets(&numeric_for.body, targets),
+        HirStmt::GenericFor(generic_for) => collect_block_label_targets(&generic_for.body, targets),
+        HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_) => {}
+    }
+}
+
+fn collect_block_label_targets(block: &HirBlock, targets: &mut BTreeSet<HirLabelId>) {
+    for stmt in &block.stmts {
+        collect_label_targets(stmt, targets);
+    }
 }
 
 fn collect_goto_targets(stmt: &HirStmt, targets: &mut BTreeSet<HirLabelId>) {

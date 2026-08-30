@@ -28,6 +28,7 @@ pub(super) enum RefKey {
     Local(LocalId),
     Upvalue(UpvalueId),
     Temp(TempId),
+    VarArg,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -135,6 +136,7 @@ impl SymbolicVerifier {
             HirExpr::LocalRef(local) => self.ref_value(RefKey::Local(*local)),
             HirExpr::UpvalueRef(upvalue) => self.ref_value(RefKey::Upvalue(*upvalue)),
             HirExpr::TempRef(temp) => self.ref_value(RefKey::Temp(*temp)),
+            HirExpr::VarArg => self.ref_value(RefKey::VarArg),
             HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Not => {
                 let value = self.eval_expr(&unary.expr)?;
                 Some(self.apply_not(value))
@@ -171,7 +173,6 @@ impl SymbolicVerifier {
             | HirExpr::Unary(_)
             | HirExpr::Binary(_)
             | HirExpr::Call(_)
-            | HirExpr::VarArg
             | HirExpr::TableConstructor(_)
             | HirExpr::Closure(_)
             | HirExpr::Unresolved(_) => None,
@@ -491,6 +492,9 @@ pub(super) fn collect_refs_from_expr(expr: &HirExpr, refs: &mut BTreeSet<RefKey>
         HirExpr::TempRef(temp) => {
             refs.insert(RefKey::Temp(*temp));
         }
+        HirExpr::VarArg => {
+            refs.insert(RefKey::VarArg);
+        }
         HirExpr::Unary(unary) => collect_refs_from_expr(&unary.expr, refs),
         HirExpr::Binary(binary) => {
             collect_refs_from_expr(&binary.lhs, refs);
@@ -513,7 +517,6 @@ pub(super) fn collect_refs_from_expr(expr: &HirExpr, refs: &mut BTreeSet<RefKey>
         | HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
         | HirExpr::Call(_)
-        | HirExpr::VarArg
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => {}

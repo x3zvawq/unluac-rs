@@ -32,7 +32,7 @@ pub(super) fn empty_local(stmt: &HirStmt) -> Option<LocalId> {
 pub(super) fn if_fallthrough_assignments(
     if_stmt: &HirIf,
     results: &[CarryBinding],
-) -> Option<Vec<BTreeMap<CarryBinding, HirExpr>>> {
+) -> Option<Vec<ExitValues>> {
     // 候选拒绝[ProofIncomplete]：无 else 的 fallthrough path 可能沿用 initializer/nil；helper 未携带入口 relation，不能判定是否完整定义。
     let else_block = if_stmt.else_block.as_ref()?;
     let mut exits = Vec::new();
@@ -44,7 +44,7 @@ pub(super) fn if_fallthrough_assignments(
 pub(super) fn complete_if_assignments(
     if_stmt: &HirIf,
     results: &[CarryBinding],
-) -> Option<Vec<BTreeMap<CarryBinding, HirExpr>>> {
+) -> Option<Vec<ExitValues>> {
     // 候选拒绝[SemanticBarrier:ControlFlow]：complete owner 无 else 时存在未赋值路径，改名会把该路径变成已有 state 值。
     let else_block = if_stmt.else_block.as_ref()?;
     let mut exits = Vec::new();
@@ -56,7 +56,7 @@ pub(super) fn complete_if_assignments(
 pub(super) fn collect_complete_assignments(
     block: &HirBlock,
     results: &[CarryBinding],
-    exits: &mut Vec<BTreeMap<CarryBinding, HirExpr>>,
+    exits: &mut Vec<ExitValues>,
 ) -> Option<()> {
     let (last, prefix) = block.stmts.split_last()?;
     if bindings_are_mentioned_in_stmts(prefix, results) {
@@ -81,14 +81,17 @@ pub(super) fn collect_complete_assignments(
 pub(super) fn complete_result_assignment_values(
     assign: &HirAssign,
     results: &[CarryBinding],
-) -> Option<BTreeMap<CarryBinding, HirExpr>> {
-    let values = assignment_values(assign)?;
-    let result_values = results
+) -> Option<ExitValues> {
+    if assignment_reads_bindings(assign, results) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：并行 RHS/左值地址在写入前读取旧 result；整段改名会把该读取切到 seed epoch。
+        return None;
+    }
+    let values = assignment_values(assign);
+    results
         .iter()
         .map(|result| values.get(result))
         .collect::<Option<Vec<_>>>()?;
-    // 候选拒绝[SemanticBarrier:EvalOrder]：result RHS 读取同批 result 时，并行快照不能逐 binding 改名成 state 后再按标量理解。
-    (!bindings_are_mentioned_in_exprs(result_values, results)).then_some(values)
+    Some(values)
 }
 
 pub(super) fn exact_state_writeback(stmt: &HirStmt, result: CarryBinding) -> Option<CarryBinding> {

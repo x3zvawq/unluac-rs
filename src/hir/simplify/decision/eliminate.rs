@@ -16,6 +16,7 @@ use crate::hir::common::{
     HirStmt, HirTableSetList, HirToBeClosed, LocalId,
 };
 use crate::hir::expr_safety::HirExprSafety;
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::walk::rewrite_nested_blocks_in_stmt;
 use super::eliminate_materialize::{
@@ -28,6 +29,7 @@ use super::eliminate_state::EliminationState;
 
 pub(crate) fn eliminate_remaining_decisions_in_proto(
     proto: &mut HirProto,
+    promotion_facts: &mut ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> bool {
     let mut next_local_index = proto.locals.len();
@@ -40,6 +42,9 @@ pub(crate) fn eliminate_remaining_decisions_in_proto(
         &mut new_local_debug_hints,
         safety,
     );
+    for local in new_locals.iter().copied() {
+        promotion_facts.record_home_free_local(local);
+    }
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
     proto.local_debug_scopes.resize(proto.locals.len(), None);
@@ -237,10 +242,39 @@ fn eliminate_stmt(
             (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::Repeat(mut repeat_stmt) => {
-            let cond_changed = eliminate_condition_expr(&mut repeat_stmt.cond, safety);
+            let mut cond_changed = eliminate_condition_expr(&mut repeat_stmt.cond, safety);
+            let mut prefix = Vec::new();
+            if expr_contains_eliminable_decision(&repeat_stmt.cond) {
+                if repeat_continue_precedes_condition_local(&repeat_stmt.body, &repeat_stmt.cond) {
+                    // 候选拒绝[SemanticBarrier:Scope]：continue 若位于 condition 读取的
+                    // repeat-body local 声明之前，提前物化会生成越界读取并观察错误 epoch。
+                } else if repeat_continue_crosses_live_nested_scope(&repeat_stmt.body, false, true)
+                {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：嵌套 scope 中已声明的 local/TBC
+                    // 原本会在 continue 到达 repeat latch 前退出；把条件物化到 continue
+                    // 前会让条件观察仍存活的根/未关闭资源（见下面的 lifetime 回归）。
+                } else {
+                    let condition = mem::replace(&mut repeat_stmt.cond, HirExpr::Boolean(false));
+                    let flag = state.alloc_local();
+                    prefix.push(empty_local_decl(flag));
+                    materialize_repeat_continues(
+                        &mut repeat_stmt.body,
+                        &condition,
+                        flag,
+                        state,
+                        safety,
+                    );
+                    repeat_stmt.body.stmts.push(materialize_condition_into_flag(
+                        condition, flag, state, safety,
+                    ));
+                    repeat_stmt.cond = HirExpr::LocalRef(flag);
+                    cond_changed = true;
+                }
+            }
             let mut stmt = HirStmt::Repeat(repeat_stmt);
             let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
-            (vec![stmt], nested_changed || cond_changed)
+            prefix.push(stmt);
+            (prefix, nested_changed || cond_changed)
         }
         HirStmt::NumericFor(numeric_for) => {
             let (mut prefix, numeric_for, changed) =
@@ -271,6 +305,175 @@ fn eliminate_stmt(
     }
 }
 
+fn repeat_continue_precedes_condition_local(block: &HirBlock, condition: &HirExpr) -> bool {
+    let condition_locals = block
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            HirStmt::LocalDecl(decl) => Some(decl.bindings.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .filter(|local| super::super::mention::expr_mentions_local(condition, *local))
+        .collect::<Vec<_>>();
+    if condition_locals.is_empty() {
+        return false;
+    }
+
+    let mut declared = Vec::new();
+    for stmt in &block.stmts {
+        if stmt_has_current_owner_continue(stmt)
+            && condition_locals
+                .iter()
+                .any(|local| !declared.contains(local))
+        {
+            return true;
+        }
+        if let HirStmt::LocalDecl(decl) = stmt {
+            declared.extend(decl.bindings.iter().copied());
+        }
+    }
+    false
+}
+
+fn stmt_has_current_owner_continue(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Continue => true,
+        HirStmt::If(if_stmt) => {
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .any(stmt_has_current_owner_continue)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(|block| block.stmts.iter().any(stmt_has_current_owner_continue))
+        }
+        HirStmt::Block(block) => block.stmts.iter().any(stmt_has_current_owner_continue),
+        HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_)
+        | HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
+    }
+}
+
+fn repeat_continue_crosses_live_nested_scope(
+    block: &HirBlock,
+    inherited_live_scope: bool,
+    repeat_body: bool,
+) -> bool {
+    let mut local_root_is_live = false;
+    for stmt in &block.stmts {
+        match stmt {
+            HirStmt::Continue if inherited_live_scope || (!repeat_body && local_root_is_live) => {
+                return true;
+            }
+            HirStmt::If(if_stmt) => {
+                let inherited = inherited_live_scope || (!repeat_body && local_root_is_live);
+                if repeat_continue_crosses_live_nested_scope(&if_stmt.then_block, inherited, false)
+                    || if_stmt.else_block.as_ref().is_some_and(|block| {
+                        repeat_continue_crosses_live_nested_scope(block, inherited, false)
+                    })
+                {
+                    return true;
+                }
+            }
+            HirStmt::Block(block)
+                if repeat_continue_crosses_live_nested_scope(
+                    block,
+                    inherited_live_scope || (!repeat_body && local_root_is_live),
+                    false,
+                ) =>
+            {
+                return true;
+            }
+            HirStmt::LocalDecl(_) | HirStmt::ToBeClosed(_) => local_root_is_live = true,
+            HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::NumericFor(_)
+            | HirStmt::GenericFor(_) => {}
+            HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_)
+            | HirStmt::Block(_) => {}
+        }
+    }
+    false
+}
+
+fn materialize_repeat_continues(
+    block: &mut HirBlock,
+    condition: &HirExpr,
+    flag: LocalId,
+    state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
+) {
+    for stmt in &mut block.stmts {
+        match stmt {
+            HirStmt::Continue => {
+                let condition_scope =
+                    materialize_condition_into_flag(condition.clone(), flag, state, safety);
+                *stmt = HirStmt::Block(Box::new(HirBlock {
+                    stmts: vec![condition_scope, HirStmt::Continue],
+                }));
+            }
+            HirStmt::If(if_stmt) => {
+                materialize_repeat_continues(
+                    &mut if_stmt.then_block,
+                    condition,
+                    flag,
+                    state,
+                    safety,
+                );
+                if let Some(else_block) = &mut if_stmt.else_block {
+                    materialize_repeat_continues(else_block, condition, flag, state, safety);
+                }
+            }
+            HirStmt::Block(block) => {
+                materialize_repeat_continues(block, condition, flag, state, safety);
+            }
+            HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::NumericFor(_)
+            | HirStmt::GenericFor(_)
+            | HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
+        }
+    }
+}
+
 fn eliminate_nested_blocks_in_stmt(
     stmt: &mut HirStmt,
     state: &mut EliminationState<'_>,
@@ -293,6 +496,16 @@ fn materialize_condition_flag(
     safety: HirExprSafety,
 ) -> (LocalId, HirStmt) {
     let flag = state.alloc_local();
+    let scope = materialize_condition_into_flag(condition, flag, state, safety);
+    (flag, scope)
+}
+
+fn materialize_condition_into_flag(
+    condition: HirExpr,
+    flag: LocalId,
+    state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
+) -> HirStmt {
     let (mut prefix, value, extracted) = extract_value_expr(condition, state, safety);
     assert!(
         extracted && !expr_contains_eliminable_decision(&value),
@@ -302,7 +515,7 @@ fn materialize_condition_flag(
         targets: vec![HirLValue::Local(flag)],
         values: crate::hir::common::HirValuePack::fixed(vec![value.negate().negate()]),
     })));
-    (flag, HirStmt::Block(Box::new(HirBlock { stmts: prefix })))
+    HirStmt::Block(Box::new(HirBlock { stmts: prefix }))
 }
 
 #[cfg(test)]
@@ -310,9 +523,10 @@ mod tests {
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
         HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
-        HirGlobalRef, HirIf, HirStmt, LocalId,
+        HirGlobalRef, HirIf, HirLocalDecl, HirStmt, HirToBeClosed, HirValuePack, LocalId,
     };
     use crate::hir::expr_safety::HirExprSafety;
+    use crate::transformer::InstrRef;
 
     use super::{EliminationState, eliminate_stmt};
 
@@ -412,6 +626,260 @@ mod tests {
             unreachable!();
         };
         assert!(matches!(guard_scope.stmts[2], HirStmt::If(_)));
+    }
+
+    #[test]
+    fn nonstable_repeat_decision_runs_at_the_body_tail() {
+        let stmt = HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+            body: HirBlock {
+                stmts: vec![HirStmt::CallStmt(Box::new(
+                    crate::hir::common::HirCallStmt {
+                        call: crate::hir::common::HirCallExpr {
+                            callee: global("body"),
+                            args: crate::hir::common::HirValuePack::default(),
+                            method: false,
+                            fastcall: None,
+                            method_name: None,
+                        },
+                    },
+                ))],
+            },
+            cond: nonstable_decision(),
+        }));
+        let mut next_local_index = 0;
+        let mut new_locals = Vec::new();
+        let mut new_local_debug_hints = Vec::new();
+        let mut state = EliminationState {
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+        };
+
+        let (lowered, changed) = eliminate_stmt(
+            stmt,
+            &mut state,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(changed);
+        let [HirStmt::LocalDecl(flag), HirStmt::Repeat(repeat)] = lowered.as_slice() else {
+            panic!("repeat condition flag must be declared outside the loop");
+        };
+        let [flag] = flag.bindings.as_slice() else {
+            panic!("repeat condition must use one boolean flag");
+        };
+        assert!(matches!(repeat.body.stmts[0], HirStmt::CallStmt(_)));
+        assert!(matches!(repeat.body.stmts[1], HirStmt::Block(_)));
+        assert!(matches!(repeat.cond, HirExpr::LocalRef(local) if local == *flag));
+        assert!(
+            !super::super::eliminate_materialize::expr_contains_eliminable_decision(&repeat.cond)
+        );
+    }
+
+    #[test]
+    fn top_level_repeat_continue_materializes_at_each_latch_path() {
+        let stmt = HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+            body: HirBlock {
+                stmts: vec![HirStmt::Continue],
+            },
+            cond: nonstable_decision(),
+        }));
+        let mut next_local_index = 0;
+        let mut new_locals = Vec::new();
+        let mut new_local_debug_hints = Vec::new();
+        let mut state = EliminationState {
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+        };
+
+        let (lowered, changed) = eliminate_stmt(
+            stmt,
+            &mut state,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(changed);
+        let [HirStmt::LocalDecl(flag), HirStmt::Repeat(repeat)] = lowered.as_slice() else {
+            panic!("repeat continue materialization must declare one outer flag");
+        };
+        let [flag] = flag.bindings.as_slice() else {
+            panic!("repeat condition must use one boolean flag");
+        };
+        let [HirStmt::Block(continue_route), HirStmt::Block(_tail)] = repeat.body.stmts.as_slice()
+        else {
+            panic!("continue and fallthrough must each materialize the latch condition");
+        };
+        assert!(matches!(continue_route.stmts[0], HirStmt::Block(_)));
+        assert!(matches!(continue_route.stmts[1], HirStmt::Continue));
+        assert!(matches!(repeat.cond, HirExpr::LocalRef(local) if local == *flag));
+        assert!(!new_locals.is_empty());
+    }
+
+    #[test]
+    fn root_free_nested_repeat_continue_materializes_in_its_branch() {
+        let body_root = LocalId(0);
+        let stmt = HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+            body: HirBlock {
+                stmts: vec![
+                    HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: vec![body_root],
+                        values: HirValuePack::fixed(vec![global("body_root")]),
+                    })),
+                    HirStmt::If(Box::new(HirIf {
+                        cond: HirExpr::Boolean(true),
+                        then_block: HirBlock {
+                            stmts: vec![HirStmt::Continue],
+                        },
+                        else_block: None,
+                    })),
+                ],
+            },
+            cond: nonstable_decision(),
+        }));
+        let mut next_local_index = 1;
+        let mut new_locals = Vec::new();
+        let mut new_local_debug_hints = Vec::new();
+        let mut state = EliminationState {
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+        };
+
+        let (lowered, changed) = eliminate_stmt(
+            stmt,
+            &mut state,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(changed);
+        let [HirStmt::LocalDecl(flag), HirStmt::Repeat(repeat)] = lowered.as_slice() else {
+            panic!("root-free nested continue must share one latch flag");
+        };
+        let [flag] = flag.bindings.as_slice() else {
+            panic!("repeat condition must use one boolean flag");
+        };
+        assert!(matches!(repeat.body.stmts[0], HirStmt::LocalDecl(_)));
+        let HirStmt::If(if_stmt) = &repeat.body.stmts[1] else {
+            panic!("nested continue must remain in its original branch");
+        };
+        let [HirStmt::Block(continue_route)] = if_stmt.then_block.stmts.as_slice() else {
+            panic!("nested continue path must materialize the condition before transfer");
+        };
+        assert!(matches!(continue_route.stmts[0], HirStmt::Block(_)));
+        assert!(matches!(continue_route.stmts[1], HirStmt::Continue));
+        assert!(matches!(repeat.cond, HirExpr::LocalRef(local) if local == *flag));
+    }
+
+    #[test]
+    fn nested_repeat_continue_with_live_tbc_keeps_original_latch() {
+        let resource = LocalId(0);
+        let stmt = HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+            body: HirBlock {
+                stmts: vec![HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::Boolean(true),
+                    then_block: HirBlock {
+                        stmts: vec![
+                            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                                bindings: vec![resource],
+                                values: HirValuePack::fixed(vec![global("resource")]),
+                            })),
+                            HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+                                origin: InstrRef(0),
+                                reg_index: 0,
+                                value: HirExpr::LocalRef(resource),
+                            })),
+                            HirStmt::Continue,
+                        ],
+                    },
+                    else_block: None,
+                }))],
+            },
+            cond: nonstable_decision(),
+        }));
+        let mut next_local_index = 1;
+        let mut new_locals = Vec::new();
+        let mut new_local_debug_hints = Vec::new();
+        let mut state = EliminationState {
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+        };
+
+        let (lowered, changed) = eliminate_stmt(
+            stmt,
+            &mut state,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(!changed);
+        let [HirStmt::Repeat(repeat)] = lowered.as_slice() else {
+            panic!("live TBC path must keep the condition at the real repeat latch");
+        };
+        assert!(matches!(repeat.cond, HirExpr::Decision(_)));
+        assert!(new_locals.is_empty());
+    }
+
+    #[test]
+    fn repeat_continue_before_condition_local_keeps_original_latch() {
+        let future = LocalId(0);
+        let stmt = HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+            body: HirBlock {
+                stmts: vec![
+                    HirStmt::Continue,
+                    HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: vec![future],
+                        values: HirValuePack::fixed(vec![global("future")]),
+                    })),
+                ],
+            },
+            cond: nonstable_decision_with_local(future),
+        }));
+        let mut next_local_index = 1;
+        let mut new_locals = Vec::new();
+        let mut new_local_debug_hints = Vec::new();
+        let mut state = EliminationState {
+            next_local_index: &mut next_local_index,
+            new_locals: &mut new_locals,
+            new_local_debug_hints: &mut new_local_debug_hints,
+        };
+
+        let (lowered, changed) = eliminate_stmt(
+            stmt,
+            &mut state,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(!changed);
+        let [HirStmt::Repeat(repeat)] = lowered.as_slice() else {
+            panic!("future condition local must keep the condition at the real repeat latch");
+        };
+        assert!(matches!(repeat.cond, HirExpr::Decision(_)));
+        assert!(new_locals.is_empty());
+    }
+
+    fn nonstable_decision() -> HirExpr {
+        HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: global("guard"),
+                truthy: HirDecisionTarget::Expr(global("truthy")),
+                falsy: HirDecisionTarget::Expr(global("falsy")),
+            }],
+        }))
+    }
+
+    fn nonstable_decision_with_local(local: LocalId) -> HirExpr {
+        HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: global("guard"),
+                truthy: HirDecisionTarget::Expr(HirExpr::LocalRef(local)),
+                falsy: HirDecisionTarget::Expr(global("falsy")),
+            }],
+        }))
     }
 
     fn global(name: &str) -> HirExpr {

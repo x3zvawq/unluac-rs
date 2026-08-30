@@ -503,6 +503,7 @@ fn lower_proto_one(
     };
     let mut promotion_facts = ProtoPromotionFacts::from_plan(
         proto,
+        cfg,
         dataflow,
         structure.plan(),
         &slot_epochs,

@@ -103,6 +103,10 @@ impl BranchValueDecisionBuilder {
         block: &HirBlock,
         binding: BranchValueBinding,
     ) -> Option<CollapsedBranchValueTarget> {
+        // 这个 block grammar 只把 binding 写在终端叶上，因此树中收集到的
+        // binding ref 都读候选入口 epoch，可以原样留在最终单次赋值的 RHS。
+        // 唯一会提前写 binding 的原地 raw guard 在 collapse_raw_temp_guard
+        // 单独证明其 continuation 不再读该 epoch。
         match block.stmts.as_slice() {
             [HirStmt::Assign(assign)] => {
                 let expr = single_assign_value(assign, binding)?;
@@ -118,7 +122,8 @@ impl BranchValueDecisionBuilder {
             [assign_stmt @ HirStmt::Assign(_), if_stmt @ HirStmt::If(_)] => {
                 self.collapse_raw_temp_guard(assign_stmt, if_stmt, binding)
             }
-            // 候选拒绝[ProofIncomplete]：其它叶块可能含可安全搬移的前缀，也可能含 effect/control；需逐句路径 effect summary 后再扩展构建器。
+            // 其它语句序列不属于 raw branch-value 的终端叶 grammar；保留控制树后，
+            // effect/control prefix 仍在原路径执行，不在这个 builder 内建立候选。
             _ => None,
         }
     }
@@ -178,8 +183,12 @@ impl BranchValueDecisionBuilder {
         let (node_ref, mut refs) = self.reserve_node(shape.value);
         let rest = self.collapse_block(shape.rest_block, binding)?;
         let guard = BranchValueBinding::Temp(shape.guard);
-        // 候选拒绝[SemanticBarrier:ValueFlow]：删除 raw guard 赋值后，候选内部仍读取该 temp 会改读旧 epoch 或未定义值。
-        if refs.mentions(guard) || rest.refs.mentions(guard) {
+        let updates_binding = guard == binding;
+        // 候选拒绝[SemanticBarrier:ValueFlow]：独立 raw guard 的 producer 会被删除，
+        // value/rest 若再读 guard 会改读旧 epoch 或未定义值。原地 guard 则会被合并
+        // 成同一个 binding 的最终赋值：value 还在写前读入站 epoch，但 rest 原本在
+        // guard 写后读新 epoch，不能移进还未完成赋值的 RHS。
+        if rest.refs.mentions(guard) || (!updates_binding && refs.mentions(guard)) {
             return None;
         }
         let rest_target = rest.target;
@@ -189,7 +198,9 @@ impl BranchValueDecisionBuilder {
             (rest_target, HirDecisionTarget::CurrentValue)
         };
         self.complete_node(node_ref, truthy, falsy);
-        self.raw_guards.insert(shape.guard);
+        if !updates_binding {
+            self.raw_guards.insert(shape.guard);
+        }
         refs.merge(rest.refs);
         Some(CollapsedBranchValueTarget {
             target: HirDecisionTarget::Node(node_ref),
@@ -222,15 +233,12 @@ impl BranchValueDecisionBuilder {
     pub(super) fn finish(
         self,
         root: CollapsedBranchValueTarget,
-        binding: BranchValueBinding,
     ) -> Option<(HirExpr, BTreeSet<TempId>)> {
-        // 候选拒绝[ProofIncomplete]：leaf 对 output binding 的读取通常仍是赋值前 epoch，但 builder 尚未显式证明树内没有更早的 output write。
         // 候选拒绝[SemanticBarrier:ValueFlow]：结果若仍读将删除的 raw guard（如 `g=v; if g then out=g+1`），会改读旧 g epoch 或未定义值。
-        if root.refs.mentions(binding)
-            || self
-                .raw_guards
-                .iter()
-                .any(|guard| root.refs.mentions(BranchValueBinding::Temp(*guard)))
+        if self
+            .raw_guards
+            .iter()
+            .any(|guard| root.refs.mentions(BranchValueBinding::Temp(*guard)))
         {
             return None;
         }
@@ -247,7 +255,9 @@ impl BranchValueDecisionBuilder {
                 unreachable!("branch-value root cannot borrow a parent test value")
             }
         };
-        // 候选拒绝[ProofIncomplete]：finalize 后仍是 Decision 表示当前表达式层无法承载该 DAG；应增强 decision collapse 再删除控制树。
+        // 候选拒绝[LayerBoundary]：Lua `and/or` 不能承载一般三元值 DAG；这里若把
+        // residual Decision 安装回 raw temp assignment，eliminate-decisions 物化后会与
+        // 本 pass 来回振荡，因此保留原控制树由它直接表达互斥求值。
         (!matches!(value, HirExpr::Decision(_))).then_some((value, self.raw_guards))
     }
 }
@@ -263,5 +273,110 @@ fn normalize_current_value_target(
             HirDecisionTarget::CurrentValue
         }
         target => target,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::DecompileDialect;
+    use crate::hir::common::{HirAssign, HirLValue, HirValuePack};
+
+    fn block(stmts: Vec<HirStmt>) -> HirBlock {
+        HirBlock { stmts }
+    }
+
+    fn assign_temp(temp: TempId, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(temp)],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn if_expr(cond: HirExpr, then_block: HirBlock, else_block: HirBlock) -> HirIf {
+        HirIf {
+            cond,
+            then_block,
+            else_block: Some(else_block),
+        }
+    }
+
+    fn builder() -> BranchValueDecisionBuilder {
+        BranchValueDecisionBuilder::new(HirExprSafety::for_dialect(DecompileDialect::Lua54))
+    }
+
+    #[test]
+    fn output_leaf_reads_preserve_the_incoming_binding_epoch() {
+        let output = TempId(0);
+        let root = if_expr(
+            HirExpr::TempRef(TempId(1)),
+            block(vec![assign_temp(output, HirExpr::TempRef(output))]),
+            block(vec![assign_temp(output, HirExpr::Integer(7))]),
+        );
+        let mut builder = builder();
+        let collapsed = builder
+            .collapse_if(&root, BranchValueBinding::Temp(output))
+            .expect("terminal output reads still observe the candidate entry epoch");
+
+        let (value, guards) = builder
+            .finish(collapsed)
+            .expect("entry-epoch reads can remain on the replacement assignment RHS");
+
+        assert!(BranchValueBinding::Temp(output).mentions_expr(&value));
+        assert!(guards.is_empty());
+    }
+
+    #[test]
+    fn in_place_raw_guard_keeps_only_pre_write_output_reads() {
+        let output = TempId(0);
+        let in_place_guard = block(vec![
+            assign_temp(output, HirExpr::TempRef(output)),
+            HirStmt::If(Box::new(if_expr(
+                HirExpr::TempRef(output),
+                block(vec![assign_temp(output, HirExpr::TempRef(output))]),
+                block(vec![assign_temp(output, HirExpr::Integer(7))]),
+            ))),
+        ]);
+        let root = if_expr(
+            HirExpr::TempRef(TempId(1)),
+            in_place_guard,
+            block(vec![assign_temp(output, HirExpr::Integer(9))]),
+        );
+        let mut builder = builder();
+        let collapsed = builder
+            .collapse_if(&root, BranchValueBinding::Temp(output))
+            .expect("the producer RHS reads output before the in-place write");
+
+        let (_, guards) = builder
+            .finish(collapsed)
+            .expect("an in-place guard can collapse without deleting its output binding");
+
+        assert!(!guards.contains(&output));
+    }
+
+    #[test]
+    fn in_place_raw_guard_rejects_post_write_output_reads() {
+        let output = TempId(0);
+        let in_place_guard = block(vec![
+            assign_temp(output, HirExpr::Boolean(false)),
+            HirStmt::If(Box::new(if_expr(
+                HirExpr::TempRef(output),
+                block(vec![assign_temp(output, HirExpr::TempRef(output))]),
+                block(vec![assign_temp(output, HirExpr::TempRef(output))]),
+            ))),
+        ]);
+        let root = if_expr(
+            HirExpr::TempRef(TempId(1)),
+            in_place_guard,
+            block(vec![assign_temp(output, HirExpr::Integer(9))]),
+        );
+        let mut builder = builder();
+
+        assert!(
+            builder
+                .collapse_if(&root, BranchValueBinding::Temp(output))
+                .is_none(),
+            "the continuation reads the epoch written by the guard producer"
+        );
     }
 }
