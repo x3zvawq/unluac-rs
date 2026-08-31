@@ -7,6 +7,7 @@ use super::*;
 pub(super) struct CapturedSlotTargets {
     pub(super) slot_targets: BTreeMap<CapturedSlotKey, CapturedSlotBinding>,
     pub(super) capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+    pub(super) lexical_close_scope_starts: BTreeMap<usize, usize>,
     pub(super) entry_local_decls: Vec<LocalId>,
     pub(super) region_local_decls: BTreeMap<RegionId, Vec<LocalId>>,
 }
@@ -323,6 +324,14 @@ pub(super) fn collect_captured_slot_targets(
         &mut write_queries,
         &mut captured_uses,
     );
+    let lexical_close_scope_starts = collect_lexical_close_scope_starts(
+        proto,
+        cfg,
+        dataflow,
+        structure.plan(),
+        epochs,
+        &captured_uses,
+    );
     for captured in &captured_uses {
         entry_safe_by_key
             .entry(captured.key)
@@ -421,9 +430,218 @@ pub(super) fn collect_captured_slot_targets(
     CapturedSlotTargets {
         slot_targets,
         capture_targets,
+        lexical_close_scope_starts,
         entry_local_decls,
         region_local_decls,
     }
+}
+
+fn collect_lexical_close_scope_starts(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    epochs: &SlotEpochFacts,
+    captured_uses: &[CapturedSlotUse],
+) -> BTreeMap<usize, usize> {
+    let mut starts_by_key = BTreeMap::<CapturedSlotKey, BTreeSet<usize>>::new();
+    for captured in captured_uses {
+        starts_by_key
+            .entry(captured.key)
+            .or_default()
+            .insert(captured.start_instr);
+    }
+
+    let mut candidates = Vec::new();
+    for (close_instr, instr) in proto.instrs.iter().enumerate() {
+        let LowInstr::Close(close) = instr else {
+            continue;
+        };
+        if !matches!(
+            plan.cleanup_disposition(InstrRef(close_instr)),
+            Some(CleanupDisposition::LexicalScope(_))
+        ) {
+            continue;
+        }
+        let close_block = cfg.instr_to_block[close_instr];
+        let mut start = None;
+        let mut exact = true;
+        for (key, slot_starts) in &starts_by_key {
+            if key.slot < close.from.index()
+                || key.epoch != epochs.epoch_at(Reg(key.slot), InstrRef(close_instr))
+            {
+                continue;
+            }
+            for &slot_start in slot_starts {
+                if slot_start >= close_instr || cfg.instr_to_block[slot_start] != close_block {
+                    exact = false;
+                    break;
+                }
+                let Some(scope_start) = lexical_scope_evaluation_start(
+                    dataflow,
+                    cfg,
+                    close_block,
+                    close.from,
+                    slot_start,
+                ) else {
+                    exact = false;
+                    break;
+                };
+                start = Some(start.map_or(scope_start, |current: usize| current.min(scope_start)));
+            }
+            if !exact {
+                break;
+            }
+        }
+        if exact
+            && let Some(start) = start
+            && !scope_window_fixed_def_escapes(dataflow, start, close_instr, close.from)
+            && !scope_window_open_def_escapes(dataflow, start, close_instr, close.from)
+        {
+            candidates.push((start, close_instr));
+        }
+    }
+
+    // VM close ranges are nested or disjoint. If recovered capture starts would make two
+    // intervals cross, neither interval is precise enough to materialize at HIR level.
+    let mut retained = vec![true; candidates.len()];
+    for left in 0..candidates.len() {
+        for right in left + 1..candidates.len() {
+            let (left_start, left_close) = candidates[left];
+            let (right_start, right_close) = candidates[right];
+            let crosses =
+                (left_start < right_start && right_start < left_close && left_close < right_close)
+                    || (right_start < left_start
+                        && left_start < right_close
+                        && right_close < left_close);
+            if crosses {
+                retained[left] = false;
+                retained[right] = false;
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .zip(retained)
+        .filter_map(|((start, close), retained)| retained.then_some((close, start)))
+        .collect()
+}
+
+fn scope_window_fixed_def_escapes(
+    dataflow: &DataflowFacts,
+    start: usize,
+    close: usize,
+    from: Reg,
+) -> bool {
+    (start..close)
+        .flat_map(|instr| dataflow.instr_defs.get(instr).into_iter().flatten())
+        .filter(|def| dataflow.def_reg(**def).index() >= from.index())
+        .any(|def| {
+            // 候选拒绝[ProofIncomplete]：逃逸 def 可能是 `Close r0; return r0` 中不能
+            // 提前结束的 captured local（regress342 二次反编译会从 false 变 nil），也可能
+            // 只是可安全跨块的 raw-temp handoff（regress154）。当前缺 declaration-owner
+            // 事实来拆分两者；在此之前不能声称新词法块精确。
+            dataflow.def_uses.get(def.index()).is_none_or(|uses| {
+                uses.iter()
+                    .any(|site| site.instr.index() < start || site.instr.index() >= close)
+            }) || dataflow
+                .def_phi_uses
+                .get(def.index())
+                .is_none_or(|uses| uses.iter().any(|phi| !dataflow.phi_is_truly_dead(*phi)))
+        })
+}
+
+fn scope_window_open_def_escapes(
+    dataflow: &DataflowFacts,
+    start: usize,
+    close: usize,
+    from: Reg,
+) -> bool {
+    let candidates = dataflow
+        .open_defs
+        .iter()
+        .filter(|def| {
+            (start..close).contains(&def.instr.index()) && def.start_reg.index() >= from.index()
+        })
+        .map(|def| def.id)
+        .collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return false;
+    }
+
+    dataflow
+        .instr_effects
+        .iter()
+        .enumerate()
+        .filter(|(instr, effect)| !((start..close).contains(instr)) && effect.open_use.is_some())
+        .any(|(instr, _)| {
+            // 候选拒绝[SemanticBarrier:ValueArity]：块内 open producer 的动态尾包若由
+            // Close 后的 call/return 消费，块边界不能把该 VM value pack 截断或根声明化。
+            !dataflow
+                .open_use_sources_at(InstrRef(instr))
+                .defs()
+                .is_disjoint(&candidates)
+        })
+}
+
+fn lexical_scope_evaluation_start(
+    dataflow: &DataflowFacts,
+    cfg: &Cfg,
+    block: BlockRef,
+    from: Reg,
+    slot_start: usize,
+) -> Option<usize> {
+    // A source local's scope starts before its initializer, not at the result write. Recover the
+    // complete fixed-register evaluation slice above `Close.from`; declining on phi/open inputs
+    // or lower-slot writes prevents the new block from swallowing an outer lexical owner.
+    let mut included = BTreeSet::from([slot_start]);
+    let mut pending = vec![slot_start];
+    while let Some(instr_index) = pending.pop() {
+        let effect = dataflow.instr_effects.get(instr_index)?;
+        if effect.open_use.is_some() || effect.open_must_def.is_some() {
+            return None;
+        }
+        for &reg in effect
+            .fixed_uses
+            .iter()
+            .filter(|reg| reg.index() >= from.index())
+        {
+            let SsaValue::Def(def) = dataflow.use_value(InstrRef(instr_index), reg) else {
+                return None;
+            };
+            let dependency = dataflow.def_instr(def).index();
+            if dependency >= instr_index || cfg.instr_to_block.get(dependency) != Some(&block) {
+                return None;
+            }
+            if included.insert(dependency) {
+                pending.push(dependency);
+            }
+        }
+    }
+
+    let earliest = included.iter().next().copied()?;
+    for instr_index in earliest..=slot_start {
+        let effect = dataflow.instr_effects.get(instr_index)?;
+        if effect
+            .fixed_must_defs
+            .iter()
+            .any(|reg| reg.index() < from.index())
+            || effect.open_use.is_some()
+            || effect.open_must_def.is_some()
+        {
+            return None;
+        }
+        let touches_scope_window = effect
+            .fixed_uses
+            .iter()
+            .chain(effect.fixed_must_defs.iter())
+            .any(|reg| reg.index() >= from.index());
+        if !included.contains(&instr_index) && !touches_scope_window {
+            return None;
+        }
+    }
+    Some(earliest)
 }
 
 pub(super) fn captured_slot_declaration_region(

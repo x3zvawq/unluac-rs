@@ -344,6 +344,10 @@ impl DiscardBoundaryFacts {
         visit_stmts(stmts, &mut visitor);
         visitor.finish()
     }
+
+    pub(super) fn stmt_boundary(&self, stmt: &HirStmt) -> DiscardBoundary {
+        self.stmts_boundary(std::slice::from_ref(stmt))
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -352,6 +356,7 @@ pub(super) struct DiscardBoundary {
     diagnostic: bool,
     control_entry: bool,
     closed_label_flow: bool,
+    live_label_flow: bool,
 }
 
 impl DiscardBoundary {
@@ -365,6 +370,10 @@ impl DiscardBoundary {
 
     pub(super) fn has_control_entry(self) -> bool {
         self.control_entry
+    }
+
+    pub(super) fn has_live_label_flow(self) -> bool {
+        self.live_label_flow
     }
 
     fn control_is_closed(self) -> bool {
@@ -428,9 +437,15 @@ impl HirVisitor for DiscardBoundaryVisitor<'_> {
             HirStmt::ErrNil(_) => self.boundary.diagnostic = true,
             HirStmt::ToBeClosed(_) | HirStmt::Close(_) => self.boundary.identity = true,
             HirStmt::Goto(goto) => {
+                self.boundary.live_label_flow = true;
                 *self.internal_label_refs.entry(goto.target).or_default() += 1;
             }
             HirStmt::Label(label) => {
+                self.boundary.live_label_flow |= self
+                    .facts
+                    .label_refs
+                    .get(&label.id)
+                    .is_some_and(|references| *references > 0);
                 self.labels.insert(label.id);
             }
             _ => {}

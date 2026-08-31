@@ -17,22 +17,16 @@ pub(super) fn lower_direct_function_stmt(
     stmt: &AstStmt,
     target: AstTargetDialect,
     method_fields: &BTreeSet<String>,
-    blocked_bindings: &BTreeSet<AstBindingRef>,
 ) -> Option<AstStmt> {
     match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            try_lower_local_function_decl(local_decl, blocked_bindings)
-        }
+        AstStmt::LocalDecl(local_decl) => try_lower_local_function_decl(local_decl),
         AstStmt::GlobalDecl(global_decl) => try_lower_global_function_decl(global_decl, target),
         AstStmt::Assign(assign) => try_lower_function_assign(assign, method_fields),
         _ => None,
     }
 }
 
-fn try_lower_local_function_decl(
-    local_decl: &AstLocalDecl,
-    blocked_bindings: &BTreeSet<AstBindingRef>,
-) -> Option<AstStmt> {
+fn try_lower_local_function_decl(local_decl: &AstLocalDecl) -> Option<AstStmt> {
     if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
         return None;
     }
@@ -50,15 +44,9 @@ fn try_lower_local_function_decl(
     let AstExpr::FunctionExpr(func) = &local_decl.values[0] else {
         return None;
     };
-    // 互递归/前向声明模式：如果当前 binding 在 blocked_bindings 中（由
-    // collect_forward_capture_blocked 计算），说明它参与了一个互递归前向声明组，
-    // 不能使用 `local function` 语法。必须保持 `local X = function() end` 形式。
-    if blocked_bindings.contains(&name) {
-        // 候选拒绝[SemanticBarrier:Scope]：互递归 `local a=function() return b() end; local b=...` 改成逐条 `local function` 会让前一闭包解析不到后声明槽位。
-        return None;
-    }
     Some(AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
         name,
+        origin: binding.origin,
         func: func.as_ref().clone(),
     })))
 }
@@ -159,5 +147,47 @@ fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
             Some((root, fields))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::common::AstLocalOrigin;
+    use crate::hir::{HirProtoRef, LocalId};
+
+    fn local_function(origin: AstLocalOrigin) -> AstLocalDecl {
+        AstLocalDecl {
+            bindings: vec![crate::ast::common::AstLocalBinding {
+                id: AstBindingRef::Local(LocalId(0)),
+                attr: AstLocalAttr::None,
+                origin,
+            }],
+            values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                function: HirProtoRef(0),
+                params: Vec::new(),
+                is_vararg: false,
+                named_vararg: None,
+                body: crate::ast::common::AstBlock::default(),
+                captured_bindings: BTreeSet::new(),
+                captured_params: BTreeSet::new(),
+            }))],
+        }
+    }
+
+    #[test]
+    fn local_function_sugar_preserves_origin() {
+        for origin in [
+            AstLocalOrigin::Recovered,
+            AstLocalOrigin::DebugHinted,
+            AstLocalOrigin::PhysicalRoot,
+        ] {
+            let Some(AstStmt::LocalFunctionDecl(decl)) =
+                try_lower_local_function_decl(&local_function(origin))
+            else {
+                panic!("eligible local function should retain sugar")
+            };
+            assert_eq!(decl.origin, origin);
+        }
     }
 }

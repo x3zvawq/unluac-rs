@@ -192,10 +192,12 @@ impl<'a> AstLowerer<'a> {
 
     fn lower_module(&mut self) -> Result<AstModule, AstLowerError> {
         let body = self.lower_proto_body(self.module.entry.index())?;
-        Ok(AstModule {
+        let module = AstModule {
             entry_function: self.module.entry,
             body,
-        })
+        };
+        super::capture_scope::verify_forward_local_captures(&module)?;
+        Ok(module)
     }
 
     fn lower_proto_body(&mut self, proto_index: usize) -> Result<AstBlock, AstLowerError> {
@@ -255,9 +257,7 @@ impl<'a> AstLowerer<'a> {
             let temp_bindings = collect_referenced_temps_in_encounter_order(block)
                 .into_iter()
                 .filter(|temp| !close_temps.contains(temp))
-                .map(|temp| {
-                    self.recovered_local_binding(AstBindingRef::Temp(temp), AstLocalAttr::None)
-                })
+                .map(|temp| self.lower_temp_binding(proto_index, temp))
                 .collect::<Vec<_>>();
             if !temp_bindings.is_empty() {
                 stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -570,6 +570,20 @@ impl<'a> AstLowerer<'a> {
         AstLocalBinding {
             id: AstBindingRef::Local(binding),
             attr,
+            origin,
+        }
+    }
+
+    fn lower_temp_binding(&self, proto_index: usize, temp: TempId) -> AstLocalBinding {
+        let proto = &self.module.protos[proto_index];
+        let origin = if proto.physical_root_temps.contains(&temp) {
+            AstLocalOrigin::PhysicalRoot
+        } else {
+            AstLocalOrigin::Recovered
+        };
+        AstLocalBinding {
+            id: AstBindingRef::Temp(temp),
+            attr: AstLocalAttr::None,
             origin,
         }
     }

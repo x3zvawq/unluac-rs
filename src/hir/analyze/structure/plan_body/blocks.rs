@@ -90,13 +90,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         "label cleanup placement is outside the regular block prefix",
                     );
                 }
-                for instr_index in prefix_start..=last.index() {
-                    stmts.extend(self.lower_planned_regular(
-                        owner,
-                        block,
-                        InstrRef(instr_index),
-                    )?);
-                }
+                stmts.extend(self.lower_regular_range(
+                    owner,
+                    block,
+                    prefix_start,
+                    last.index() + 1,
+                )?);
                 self.emit_label(block, LabelPlacement::AfterCleanup(last), &mut stmts)?;
                 stmts.extend(self.lower_unresolved_phis(owner, block)?);
                 last.index() + 1
@@ -111,10 +110,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 prefix_start
             }
         };
-        for instr_index in regular_start..regular_end {
-            let instr_ref = InstrRef(instr_index);
-            stmts.extend(self.lower_planned_regular(owner, block, instr_ref)?);
-        }
+        stmts.extend(self.lower_regular_range(owner, block, regular_start, regular_end)?);
 
         if let Some(cleanup) = trailing_cleanup {
             let Some(edge) = jump_edge else {
@@ -122,9 +118,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             };
             let edge_plan = self.planned_edge(owner, edge)?;
             stmts.extend(self.lower_edge_effects(owner, edge)?);
-            for instr_index in cleanup.start.index()..cleanup.end() {
-                stmts.extend(self.lower_planned_regular(owner, block, InstrRef(instr_index))?);
-            }
+            stmts.extend(self.lower_regular_range(
+                owner,
+                block,
+                cleanup.start.index(),
+                cleanup.end(),
+            )?);
             stmts.extend(self.lower_edge_after_effects(owner, edge, edge_plan)?);
             return Ok(HirBlock { stmts });
         }
@@ -213,11 +212,65 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let mut stmts = Vec::new();
         self.emit_label(block, LabelPlacement::BeforeBlock, &mut stmts)?;
         stmts.extend(self.lower_unresolved_phis(owner, block)?);
-        for instr_index in terminator.instrs.start.index()..instr.index() {
-            let instr_ref = InstrRef(instr_index);
-            stmts.extend(self.lower_planned_regular(owner, block, instr_ref)?);
-        }
+        stmts.extend(self.lower_regular_range(
+            owner,
+            block,
+            terminator.instrs.start.index(),
+            instr.index(),
+        )?);
         Ok(stmts)
+    }
+
+    fn lower_regular_range(
+        &self,
+        owner: RegionId,
+        block: BlockRef,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<HirStmt>, HirLowerError> {
+        let mut starts = BTreeMap::<usize, Vec<usize>>::new();
+        for (&close, &scope_start) in &self.lowering.bindings.lexical_close_scope_starts {
+            if scope_start >= start
+                && close < end
+                && self.lowering.cfg.instr_to_block.get(scope_start) == Some(&block)
+                && self.lowering.cfg.instr_to_block.get(close) == Some(&block)
+            {
+                starts.entry(scope_start).or_default().push(close);
+            }
+        }
+        for closes in starts.values_mut() {
+            closes.sort_unstable_by(|left, right| right.cmp(left));
+        }
+
+        let mut root = Vec::new();
+        let mut scopes = Vec::<(usize, Vec<HirStmt>)>::new();
+        for instr_index in start..end {
+            if let Some(closes) = starts.get(&instr_index) {
+                scopes.extend(closes.iter().map(|&close| (close, Vec::new())));
+            }
+            let lowered = self.lower_planned_regular(owner, block, InstrRef(instr_index))?;
+            if let Some((_, stmts)) = scopes.last_mut() {
+                stmts.extend(lowered);
+            } else {
+                root.extend(lowered);
+            }
+            while scopes
+                .last()
+                .is_some_and(|(close, _)| *close == instr_index)
+            {
+                let (_, stmts) = scopes
+                    .pop()
+                    .expect("lexical close scope stack is non-empty");
+                let block = HirStmt::Block(Box::new(HirBlock { stmts }));
+                if let Some((_, parent)) = scopes.last_mut() {
+                    parent.push(block);
+                } else {
+                    root.push(block);
+                }
+            }
+        }
+        debug_assert!(scopes.is_empty());
+        Ok(root)
     }
 
     pub(super) fn lower_planned_regular(

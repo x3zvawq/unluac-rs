@@ -41,18 +41,21 @@ pub(super) fn candidate_temps(
         return Vec::new();
     };
 
-    let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block);
-    let else_summary = summarize_block_fallthrough_assignments(else_block);
-    let Some(common_temps) =
-        intersect_fallthrough_assignment_sets([then_summary.as_ref(), else_summary.as_ref()])
+    let (Some(then_summary), Some(else_summary)) = (
+        summarize_block_fallthrough_assignments(&if_stmt.then_block),
+        summarize_block_fallthrough_assignments(else_block),
+    ) else {
+        // 候选拒绝[ProofIncomplete]：任一 arm 的 goto 可能重新汇入当前 if，也可能逃逸；
+        // HIR 缺少目标到当前 region merge 的 owner/reaching-def，不能把 unknown arm 当作已终结。
+        return Vec::new();
+    };
+    let Some(common_temps) = intersect_fallthrough_assignment_sets([&then_summary, &else_summary])
     else {
-        // 候选拒绝[ProofIncomplete]：分支含非局部 goto 时缺少目标边与合流点事实；应接入 CFG reaching-def 摘要。
         return Vec::new();
     };
     let condition_reads = collect_temp_refs_in_expr(&if_stmt.cond);
-    let reads_before_assignment = then_summary
-        .iter()
-        .chain(else_summary.iter())
+    let reads_before_assignment = [&then_summary, &else_summary]
+        .into_iter()
         .flat_map(|summary| summary.reads_before_assignment.iter())
         .copied()
         .chain(condition_reads)
@@ -199,7 +202,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
                 },
             };
             let assigned_temps =
-                intersect_fallthrough_assignment_sets([Some(&then_summary), Some(&else_summary)])
+                intersect_fallthrough_assignment_sets([&then_summary, &else_summary])
                     .unwrap_or_default();
             let reads_before_assignment = collect_temp_refs_in_expr(&if_stmt.cond)
                 .into_iter()
@@ -306,11 +309,10 @@ fn intersect_optional_assignment_set(
 }
 
 fn intersect_fallthrough_assignment_sets<'a>(
-    summaries: impl IntoIterator<Item = Option<&'a FallthroughSummary>>,
+    summaries: impl IntoIterator<Item = &'a FallthroughSummary>,
 ) -> Option<BTreeSet<TempId>> {
     let mut fallthrough_sets = summaries
         .into_iter()
-        .flatten()
         .filter(|summary| summary.falls_through)
         .map(|summary| summary.assigned_temps.clone());
     let mut intersection = fallthrough_sets.next()?;
@@ -321,4 +323,62 @@ fn intersect_fallthrough_assignment_sets<'a>(
             .collect::<BTreeSet<_>>();
     }
     Some(intersection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{
+        HirAssign, HirExpr, HirGoto, HirIf, HirLabelId, HirReturn, HirValuePack,
+    };
+
+    fn block(stmts: Vec<HirStmt>) -> HirBlock {
+        HirBlock { stmts }
+    }
+
+    fn assign_temp(temp: TempId) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(temp)],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+        }))
+    }
+
+    fn branch(then_stmts: Vec<HirStmt>, else_stmts: Vec<HirStmt>) -> HirStmt {
+        HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: block(then_stmts),
+            else_block: Some(block(else_stmts)),
+        }))
+    }
+
+    fn candidates(stmt: &HirStmt, temp: TempId) -> Vec<TempId> {
+        let stmt_refs = [BTreeSet::from([temp]), BTreeSet::from([temp])];
+        candidate_temps(stmt, &TempTouchIndex::new(&stmt_refs), 0, &|_| false)
+    }
+
+    #[test]
+    fn goto_unknown_arm_cannot_be_ignored_during_merge() {
+        let temp = TempId(0);
+        let stmt = branch(
+            vec![HirStmt::Goto(Box::new(HirGoto {
+                target: HirLabelId(0),
+            }))],
+            vec![assign_temp(temp)],
+        );
+
+        assert!(candidates(&stmt, temp).is_empty());
+    }
+
+    #[test]
+    fn proven_terminal_arm_does_not_block_clean_fallthrough_merge() {
+        let temp = TempId(0);
+        let stmt = branch(
+            vec![HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::default(),
+            }))],
+            vec![assign_temp(temp)],
+        );
+
+        assert_eq!(candidates(&stmt, temp), vec![temp]);
+    }
 }

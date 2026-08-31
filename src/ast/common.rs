@@ -192,6 +192,7 @@ pub struct AstFunctionDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstLocalFunctionDecl {
     pub name: AstBindingRef,
+    pub origin: AstLocalOrigin,
     pub func: AstFunctionExpr,
 }
 

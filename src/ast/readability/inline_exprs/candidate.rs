@@ -161,7 +161,7 @@ pub(super) enum InlinePolicy {
     BooleanReturnValue,
     MechanicalRun,
     LoopHeaderCall,
-    /// 单次后续使用的稳定 local copy；不会重复 RHS，也不会移动 producer。
+    /// 同一语句内使用的稳定 local copy；不会重复有事件的 RHS，也不会移动 producer。
     StableCopy,
 }
 

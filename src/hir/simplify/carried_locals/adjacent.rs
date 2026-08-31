@@ -74,11 +74,11 @@ pub(super) fn try_collapse_guarded_local_update(
     let Some(else_block) = if_stmt.else_block.as_ref() else {
         return false;
     };
-    // 候选拒绝[ProofIncomplete]：当前只证明单 Return 的终结 false-path；其它等价终结壳需统一 terminal-flow facts。
     // 候选拒绝[SemanticBarrier:Lifetime]：return/后缀仍读 state 或 next 时，可观察 false-path 上 state 是否被提前覆盖或 next 是否被删除。
-    if !matches!(else_block.stmts.as_slice(), [HirStmt::Return(_)])
-        || collect_binding_mentions_by_stmt(&else_block.stmts)[0]
+    if !block_is_return_shell(else_block)
+        || collect_binding_mentions_by_stmt(&else_block.stmts)
             .iter()
+            .flatten()
             .any(|binding| *binding == state || *binding == next_binding)
         || collect_binding_mentions_by_stmt(&block.stmts[index + 2..])
             .iter()
@@ -110,6 +110,39 @@ pub(super) fn try_collapse_guarded_local_update(
         collect_prunable_bindings([state]),
     );
     true
+}
+
+/// 只接受结构本身保证离开当前函数的单节点壳。
+///
+/// `break`、`continue` 和 `goto` 虽然终结当前 block，仍可能进入函数内 continuation，
+/// 因而不能证明 guarded update 的 false path 不再观察旧 state。
+fn block_is_return_shell(block: &HirBlock) -> bool {
+    matches!(block.stmts.as_slice(), [stmt] if stmt_is_return_shell(stmt))
+}
+
+fn stmt_is_return_shell(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Return(_) => true,
+        HirStmt::Block(block) => block_is_return_shell(block),
+        HirStmt::If(if_stmt) => if_stmt.else_block.as_ref().is_some_and(|else_block| {
+            block_is_return_shell(&if_stmt.then_block) && block_is_return_shell(else_block)
+        }),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
+    }
 }
 
 pub(super) fn try_collapse_adjacent_local_seed_handoff(
@@ -731,5 +764,56 @@ fn binding_lvalue(binding: CarryBinding) -> HirLValue {
         CarryBinding::Param(param) => HirLValue::Param(param),
         CarryBinding::Local(local) => HirLValue::Local(local),
         CarryBinding::Temp(temp) => HirLValue::Temp(temp),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirGoto, HirIf, HirLabelId, HirReturn, HirValuePack};
+
+    fn empty_return() -> HirStmt {
+        HirStmt::Return(Box::new(HirReturn {
+            values: HirValuePack::default(),
+        }))
+    }
+
+    fn block(stmt: HirStmt) -> HirBlock {
+        HirBlock { stmts: vec![stmt] }
+    }
+
+    #[test]
+    fn return_shell_accepts_nested_block_and_complete_if() {
+        let nested_return = HirStmt::Block(Box::new(block(HirStmt::Block(Box::new(block(
+            empty_return(),
+        ))))));
+        assert!(stmt_is_return_shell(&nested_return));
+
+        let complete_if = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: block(empty_return()),
+            else_block: Some(block(HirStmt::Block(Box::new(block(empty_return()))))),
+        }));
+        assert!(stmt_is_return_shell(&complete_if));
+    }
+
+    #[test]
+    fn return_shell_rejects_function_local_control_and_prefixes() {
+        let incomplete_if = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: block(empty_return()),
+            else_block: None,
+        }));
+        let prefixed_return = HirStmt::Block(Box::new(HirBlock {
+            stmts: vec![empty_return(), empty_return()],
+        }));
+
+        assert!(!stmt_is_return_shell(&HirStmt::Break));
+        assert!(!stmt_is_return_shell(&HirStmt::Continue));
+        assert!(!stmt_is_return_shell(&HirStmt::Goto(Box::new(HirGoto {
+            target: HirLabelId(0),
+        }))));
+        assert!(!stmt_is_return_shell(&incomplete_if));
+        assert!(!stmt_is_return_shell(&prefixed_return));
     }
 }

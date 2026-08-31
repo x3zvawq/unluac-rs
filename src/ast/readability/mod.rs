@@ -289,6 +289,7 @@ pub(crate) fn make_readable_module(
         });
     }
 
+    super::capture_scope::verify_forward_local_captures(&module)?;
     Ok(module)
 }
 

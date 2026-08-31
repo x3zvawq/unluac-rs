@@ -14,6 +14,7 @@ use super::super::visit::{HirVisitor, visit_stmts};
 use super::*;
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
+    let stmt = transparent_block_head(stmt)?;
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             find_site_in_exprs(&local_decl.values, temp, InlineSite::Direct)
@@ -64,8 +65,17 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => None,
-        // 候选拒绝[ProofIncomplete]：Block 可能来自必达的常量分支，也可能承载 close 词法范围；当前 HIR 未记录 origin/scope effect，不能统一跨边界内联。
-        HirStmt::Block(_) => None,
+        HirStmt::Block(_) => unreachable!("transparent block head must be fully unwrapped"),
+    }
+}
+
+pub(super) fn transparent_block_head(mut stmt: &HirStmt) -> Option<&HirStmt> {
+    loop {
+        let HirStmt::Block(block) = stmt else {
+            return Some(stmt);
+        };
+        // 候选拒绝[ProofIncomplete]：第二条及更晚消费仍需 block-prefix 的求值、写入、capture 与外部控制流摘要；当前只把零前缀的首语句视为透明。
+        stmt = block.stmts.first()?;
     }
 }
 
@@ -257,14 +267,14 @@ impl EvalOrderProbe<'_> {
                 self.exprs([&numeric_for.start, &numeric_for.limit, &numeric_for.step])
             }
             HirStmt::GenericFor(generic_for) => self.exprs(&generic_for.iterator),
+            HirStmt::Block(_) => transparent_block_head(stmt).is_some_and(|stmt| self.stmt(stmt)),
             HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
             | HirStmt::Close(_)
             | HirStmt::Break
             | HirStmt::Continue
             | HirStmt::Goto(_)
-            | HirStmt::Label(_)
-            | HirStmt::Block(_) => false,
+            | HirStmt::Label(_) => false,
         }
     }
 

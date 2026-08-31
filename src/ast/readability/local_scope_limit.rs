@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstLocalBinding, AstModule,
-    AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstLocalBinding,
+    AstLocalOrigin, AstModule, AstStmt,
 };
 use super::binding_flow::{binding_mentions_in_expr, binding_mentions_in_stmt};
 use super::{ReadabilityContext, walk};
@@ -168,22 +168,26 @@ fn scopeable_bindings(stmt: &AstStmt) -> Option<ScopeableBindings<'_>> {
     match stmt {
         AstStmt::LocalDecl(decl)
             if !decl.bindings.is_empty()
-                && decl
-                    .bindings
-                    .iter()
-                    .all(|binding| binding.attr == AstLocalAttr::None) =>
+                && decl.bindings.iter().all(|binding| {
+                    binding.attr == AstLocalAttr::None
+                        && binding.origin == AstLocalOrigin::Recovered
+                }) =>
         {
             Some(ScopeableBindings {
                 locals: &decl.bindings,
                 local_function: None,
             })
         }
-        AstStmt::LocalFunctionDecl(decl) => Some(ScopeableBindings {
-            locals: &[],
-            local_function: Some(decl.name),
-        }),
-        AstStmt::LocalDecl(_) => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：`local x <close>=v; work()` 若只包声明会把 `__close` 从 block 末端提前到 `work()` 前；候选拒绝[PolicyBoundary]：`<const>` 声明身份不由资源 pass 重排。
+        AstStmt::LocalFunctionDecl(decl) if decl.origin == AstLocalOrigin::Recovered => {
+            Some(ScopeableBindings {
+                locals: &[],
+                local_function: Some(decl.name),
+            })
+        }
+        AstStmt::LocalDecl(_) | AstStmt::LocalFunctionDecl(_) => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 与 `<close>` 若提前离开原 block，会改变 GC root/关闭时点。
+            // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted local 的原词法可见期可被 debug API 观察。
+            // 候选拒绝[PolicyBoundary]：`<const>` 声明身份不由 local-budget pass 重排。
             None
         }
         _ => None,

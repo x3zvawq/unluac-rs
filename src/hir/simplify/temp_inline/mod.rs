@@ -39,6 +39,8 @@
 //! 裸 binding 或命名字段链快照可在严格匹配这对 use 后原子收回，例如
 //! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；终结调用的连续物化 run
 //! 还可收回 owner 保持存活的裸 receiver，普通点调用仍按两次读取处理。
+//! 相邻 sink 若是无条件 `Block`，只递归穿过零前缀的第一条语句；第二条及更晚消费仍需
+//! block-prefix 的求值、写入、capture 与控制流摘要，不能把整个词法块视为透明。
 //! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
 //! 单值 terminal return，不递归，也不开放其它普通内联 site。
 
@@ -66,7 +68,7 @@ use self::site::{
     inline_site_in_repeat_condition, inline_site_in_stmt, is_bare_method_receiver_snapshot_in_stmt,
     is_method_receiver_snapshot, is_stable_inline_value,
     puc_upvalue_table_key_with_deferred_base_read, temp_precedes_observable_eval_in_expr,
-    temp_precedes_observable_eval_in_stmt,
+    temp_precedes_observable_eval_in_stmt, transparent_block_head,
 };
 use self::usage::{
     TempUseScratch, collect_expr_temp_uses_summary, collect_stmt_temp_uses, inline_candidate,
@@ -508,6 +510,9 @@ fn substantial_result_closure_prefers_binding(
     sink: &HirStmt,
     substantial_closure_bodies: &[bool],
 ) -> bool {
+    let Some(sink) = transparent_block_head(sink) else {
+        return false;
+    };
     let HirExpr::Closure(closure) = value else {
         return false;
     };
@@ -618,6 +623,9 @@ impl CapturedSlotSnapshots {
 }
 
 fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
+    let Some(stmt) = transparent_block_head(stmt) else {
+        return false;
+    };
     match stmt {
         HirStmt::Assign(assign) => {
             let table_lvalue = assign.targets.iter().any(|target| {
@@ -1348,11 +1356,14 @@ fn root_open_return_nil_pack_plan(
                 || total_use_count(*target, live_use_counts) != 1
                 // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
                 || scratch.has_debug_local_hint(*target)
-                // 候选拒绝[ProofIncomplete]：缺可信 home 或同值 nil targets 共享 home 时，当前计划缺少精确 slot epoch 证明。
+                // 候选拒绝[ProofIncomplete]：缺可信 home 时，当前计划没有精确 slot epoch 证明。
                 // 候选拒绝[SemanticBarrier:Capture]：已引用捕获 target home 时，删除写入会让 closure 观察旧值。
                 || facts
                     .trusted_temp_home_slot(*target)
-                    .is_none_or(|slot| captured_slots.contains(&slot) || !target_slots.insert(slot))
+                    .is_none_or(|slot| {
+                        target_slots.insert(slot);
+                        captured_slots.contains(&slot)
+                    })
         }) || !block.stmts[assignment_index + 1..return_index]
             .iter()
             .all(|stmt| root_nil_pack_gap_preserves_slots(stmt, &target_slots, facts))
@@ -1449,16 +1460,11 @@ fn inline_terminal_nil_return_pack(
     let captured_slots = captured_slots_before_stmt
         .get(assign_index)
         .expect("capture snapshots must cover the terminal nil-pack assignment");
-    let mut target_slots = BTreeSet::new();
     for target in &targets {
         let Some(slot) = facts.trusted_temp_home_slot(*target) else {
             // 候选拒绝[ProofIncomplete]：目标缺可信 home，无法证明 nil 写与 return 读取保持同槽同 epoch。
             return false;
         };
-        // 候选拒绝[ProofIncomplete]：多个 nil target 共享 home 看似仍等价，但当前计划要求一一槽映射；应补同值并行写的 epoch 证明。
-        if !target_slots.insert(slot) {
-            return false;
-        }
         // 候选拒绝[SemanticBarrier:Capture]：closure 已引用捕获目标 home 时，删除 nil 写会让其继续观察旧值。
         if captured_slots.contains(&slot) {
             return false;

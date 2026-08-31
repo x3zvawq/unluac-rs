@@ -236,6 +236,7 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 run_end,
                 &removed,
                 mutable_snapshots,
+                &write_index,
             )
         {
             changed = true;
@@ -425,6 +426,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 sink_index,
                 &removed,
                 mutable_snapshots,
+                &write_index,
             )
         {
             changed = true;
@@ -589,6 +591,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                     run_end,
                     &removed,
                     mutable_snapshots,
+                    &write_index,
                 )
         }) {
             changed = true;
@@ -725,6 +728,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 run_end - 1,
                 &removed,
                 mutable_snapshots,
+                &write_index,
             )
         {
             changed = true;

@@ -5,6 +5,8 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[r1_0 = r1_0 + 1]]
+-- unluac: expect-contains [[local r0_0]]
+-- unluac: expect-contains [[local r0_3 = r0_0]]
 local x = 0
 while true do
     if x == 1 then

@@ -59,6 +59,7 @@ pub(super) struct ProtoBindings {
     pub(super) debug_entry_local_decls: Vec<LocalId>,
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+    pub(super) lexical_close_scope_starts: BTreeMap<usize, usize>,
     pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
@@ -476,6 +477,7 @@ fn lower_proto_one(
         param_debug_hints: lowering.bindings.param_debug_hints.clone(),
         locals: lowering.bindings.locals.clone(),
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
+        physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: lowering.bindings.upvalues.clone(),
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
@@ -633,6 +635,7 @@ fn fill_failed_proto(
         param_debug_hints: vec![None; usize::from(proto.signature.num_params)],
         locals,
         local_debug_hints,
+        physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: (0..usize::from(proto.upvalues.common.count))
             .map(UpvalueId)
@@ -976,6 +979,7 @@ fn build_composite_factory_proto(
         param_debug_hints: Vec::new(),
         locals: (0..plan.nodes.len()).map(LocalId).collect(),
         local_debug_hints: vec![None; plan.nodes.len()],
+        physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],

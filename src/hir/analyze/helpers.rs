@@ -101,6 +101,7 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
         param_debug_hints: Vec::new(),
         locals: Vec::new(),
         local_debug_hints: Vec::new(),
+        physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         upvalues: Vec::new(),
         upvalue_debug_hints: Vec::new(),

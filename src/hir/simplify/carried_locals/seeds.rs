@@ -34,7 +34,6 @@ pub(super) fn binding_handoff_seed(stmt: &HirStmt) -> Option<BindingHandoffSeed>
     }
 
     let mut seen_targets = BTreeSet::new();
-    let mut seen_bindings = BTreeSet::new();
     let mut rewrites = Vec::with_capacity(assign.targets.len());
     let mut retained_pairs = Vec::new();
     for (target, value) in assign.targets.iter().zip(&assign.values) {
@@ -52,8 +51,7 @@ pub(super) fn binding_handoff_seed(stmt: &HirStmt) -> Option<BindingHandoffSeed>
             continue;
         };
         // 候选拒绝[SemanticBarrier:EvalOrder]：同一 temp 在并行 targets 重复出现时最后写胜出，单一 rewrite 会丢失位置语义。
-        // 候选拒绝[ProofIncomplete]：多个 temp 复制同一 source 可能可合并，但需证明后续 writeback 不把这些快照作为独立 epoch 使用。
-        if !seen_targets.insert(rewrite.from) || !seen_bindings.insert(rewrite.to) {
+        if !seen_targets.insert(rewrite.from) {
             return None;
         }
         rewrites.push(rewrite);
@@ -165,4 +163,38 @@ pub(super) fn single_binding_handoff_seed(stmt: &HirStmt) -> Option<(TempId, Car
     }
     let binding = carry_binding_from_expr(value)?;
     Some((*temp, binding))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirAssign, HirValuePack, LocalId};
+
+    fn parallel_copy(left: TempId, right: TempId) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(left), HirLValue::Temp(right)],
+            values: HirValuePack::fixed(vec![
+                HirExpr::LocalRef(LocalId(0)),
+                HirExpr::LocalRef(LocalId(0)),
+            ]),
+        }))
+    }
+
+    #[test]
+    fn binding_handoff_seed_accepts_repeated_source() {
+        let seed = binding_handoff_seed(&parallel_copy(TempId(0), TempId(1)))
+            .expect("independent targets may defer repeated-source safety to handoff proofs");
+
+        assert_eq!(seed.rewrites.len(), 2);
+        assert!(
+            seed.rewrites
+                .iter()
+                .all(|rewrite| { matches!(rewrite.to, CarryBinding::Local(LocalId(0))) })
+        );
+    }
+
+    #[test]
+    fn binding_handoff_seed_rejects_repeated_target() {
+        assert!(binding_handoff_seed(&parallel_copy(TempId(0), TempId(0))).is_none());
+    }
 }

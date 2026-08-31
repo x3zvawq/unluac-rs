@@ -29,6 +29,11 @@ pub struct HirProto {
     pub param_debug_hints: Vec<Option<String>>,
     pub locals: Vec<LocalId>,
     pub local_debug_hints: Vec<Option<String>>,
+    /// Temps retained solely because their physical slot keeps an aliased object rooted.
+    ///
+    /// These have not been promoted to HIR locals, so AST build must transfer the root identity
+    /// when it materializes the temp as a source local.
+    pub physical_root_temps: BTreeSet<TempId>,
     /// Locals materialized solely to preserve a physical GC root proven by HIR.
     ///
     /// AST cleanup must not turn these declarations back into bare calls: the VM stack slot

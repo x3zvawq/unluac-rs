@@ -2,23 +2,25 @@
 //!
 //! 这里只处理非常窄的一类模式：
 //! - 单值 local 别名；原生 temp 的语义内联归 HIR
-//! - 后续只使用一次
+//! - 通用候选只使用一次；稳定 local copy 可原子替换多个顶层语句内的全部后续读取
 //! - 使用点出现在 return / 调用参数 / 索引位 / 调用目标
 //! - 被内联表达式必须是我们能证明“纯且无元方法副作用”的安全子集
 //! - 相邻调用准备 run 中的简单表构造参数，可以随同 receiver/callee 一起收回调用位
 //! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
+//! - while/repeat 条件只接收无事件且循环不变的机械 RHS；依赖候选会递归展开，
+//!   外部 local/param 则必须未捕获且循环体没有直接写入
 //! - generic-for 的 method receiver 允许收回一个紧邻的 recovered binding 别名
 //! - repeat body 的 use index 把 until 条件计作尾随表达式，不删除仍对条件可见的 local
 //! - 多值 return 顶层只收回 context-safe 或已证明为单值布尔比较的唯一 alias；可变快照仍通过求值前缀证明
 //! - 单值 return 短路树只收回最左、必达位置的布尔比较 alias；右臂仍保留原 binding
-//! - 稳定 local copy 可跨越无关语句收回到唯一后续 use；只替换名字读取，不搬动 RHS
+//! - 稳定 local copy 可跨越无关语句收回到全部后续 use；primitive 多 use 仍只在同一 owner 内替换，避免跨业务语句复制概念值
 //! - 完整 call-alias run 先于单项相邻内联取得所有权；run 拒绝后，单项规则仍可消费局部安全形状
 
 mod candidate;
 mod eval_order;
 mod use_sites;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::ReadabilityOptions;
 
@@ -68,11 +70,15 @@ struct InlineExprsPass {
 #[derive(Default)]
 struct BindingWriteIndex {
     write_bounds_by_binding: BTreeMap<AstBindingRef, (usize, usize)>,
+    direct_write_names_by_stmt: Vec<BTreeSet<AstNameRef>>,
 }
 
 impl BindingWriteIndex {
     fn for_stmts(stmts: &[AstStmt]) -> Self {
-        let mut index = Self::default();
+        let mut index = Self {
+            write_bounds_by_binding: BTreeMap::new(),
+            direct_write_names_by_stmt: vec![BTreeSet::new(); stmts.len()],
+        };
         for (stmt_index, stmt) in stmts.iter().enumerate() {
             let mut collector = BindingWriteCollector {
                 stmt_index,
@@ -88,6 +94,19 @@ impl BindingWriteIndex {
             .entry(binding)
             .and_modify(|bounds| bounds.1 = stmt_index)
             .or_insert((stmt_index, stmt_index));
+    }
+
+    fn record_name(&mut self, stmt_index: usize, name: &AstNameRef) {
+        self.direct_write_names_by_stmt[stmt_index].insert(name.clone());
+        if let Some(binding) = binding_from_name_ref(name) {
+            self.record(stmt_index, binding);
+        }
+    }
+
+    fn stmt_directly_writes_name(&self, stmt_index: usize, name: &AstNameRef) -> bool {
+        self.direct_write_names_by_stmt
+            .get(stmt_index)
+            .is_some_and(|names| names.contains(name))
     }
 
     fn has_write_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
@@ -129,10 +148,8 @@ impl AstVisitor for BindingWriteCollector<'_> {
         let AstFunctionName::Plain(path) = &function.target else {
             return;
         };
-        if path.fields.is_empty()
-            && let Some(binding) = binding_from_name_ref(&path.root)
-        {
-            self.index.record(self.stmt_index, binding);
+        if path.fields.is_empty() {
+            self.index.record_name(self.stmt_index, &path.root);
         }
     }
 
@@ -140,9 +157,7 @@ impl AstVisitor for BindingWriteCollector<'_> {
         let AstLValue::Name(name) = lvalue else {
             return;
         };
-        if let Some(binding) = binding_from_name_ref(name) {
-            self.index.record(self.stmt_index, binding);
-        }
+        self.index.record_name(self.stmt_index, name);
     }
 
     fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
@@ -410,8 +425,8 @@ fn rewrite_current_block(
 ///
 /// 这条规则与相邻表达式内联故意分开：相邻规则可以凭 sink 形状证明调用/lookup 的
 /// 求值前缀，而这里只接受 `local alias = source`。source 在候选声明之前已经声明、
-/// 候选之后没有任何 direct write，也没有 closure capture；因此把唯一后续读取改回
-/// source 只改变 binding 名；primitive literal 则没有求值事件且只替换一次读取。
+/// 候选之后没有任何 direct write，也没有 closure capture；因此把同一语句内的全部后续
+/// 读取改回 source 只改变 binding 名；primitive literal 则没有求值事件。
 /// repeat 的精确 trailing handoff 允许 source 在 use 后写入，因为 target 会接管 root
 /// 直到 `until` 条件；两条路径都不改变调用顺序或对象存活期。
 fn collapse_stable_copy_aliases(
@@ -444,22 +459,23 @@ fn collapse_stable_copy_aliases(
             continue;
         }
 
-        let suffix_uses = use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
-        if suffix_uses == 0 {
+        let use_stmt_indices =
+            use_index.use_stmt_indices_in_suffix(candidate_index + 1, candidate.binding());
+        if use_stmt_indices.is_empty() {
             // 候选拒绝[LayerBoundary]：未使用声明的删除归 cleanup/dead-local，不属于 copy-inline。
             continue;
         }
-        if suffix_uses > 1 {
-            // 候选拒绝[SemanticBarrier:EvalCount]：多次 use 会复制 RHS；例如 `local x=f(); g(x,x)` 不能改成 `g(f(),f())`。
+        if use_stmt_indices
+            .iter()
+            .any(|use_stmt_index| *use_stmt_index >= stmts.len())
+        {
+            // 候选拒绝[LayerBoundary]：repeat trailing condition 位于当前 block 的 statement
+            // rewrite 边界之外；不能只提交正文 use 而留下条件中的悬空 binding。
             continue;
         }
-        let Some(use_stmt_index) =
-            use_index.unique_use_stmt_in_suffix(candidate_index + 1, candidate.binding())
-        else {
-            unreachable!("one suffix use must have an indexed owner");
-        };
-        if use_stmt_index >= stmts.len() {
-            // 候选拒绝[LayerBoundary]：repeat trailing condition 位于当前 block 的 statement rewrite 边界之外。
+        if use_stmt_indices.len() > 1 && !matches!(value, AstExpr::Var(_)) {
+            // 候选拒绝[PolicyBoundary]：把 primitive 复制进多个业务语句会抹掉复用概念并
+            // 增加重复；同一 owner 仍可内联，多 owner 只删除纯名字 alias（regress_80/316）。
             continue;
         }
 
@@ -481,29 +497,48 @@ fn collapse_stable_copy_aliases(
                 continue;
             }
             if write_index.has_write_after(candidate_index, source_binding)
-                && !stable_copy_has_trailing_root_handoff(
-                    &stmts,
-                    trailing_condition,
-                    &write_index,
-                    mutable_snapshots,
-                    use_stmt_index,
-                    candidate.binding(),
-                    source_binding,
-                )
+                && (use_stmt_indices.len() != 1
+                    || !stable_copy_has_trailing_root_handoff(
+                        &stmts,
+                        trailing_condition,
+                        &write_index,
+                        mutable_snapshots,
+                        use_stmt_indices[0],
+                        candidate.binding(),
+                        source_binding,
+                    ))
             {
-                // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：source 在 use 前后写入时 alias 保存的是旧快照/root；除精确 repeat handoff 外直接替换会读取新值或缩短 root。
+                // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：source 在 use 前后写入时 alias
+                // 保存的是旧快照/root；只有单 owner 的精确 repeat handoff 已证明安全。
                 continue;
             }
         }
 
         let replacement = value.clone();
-        if rewrite_stmt_use_sites_with_policy(
-            &mut stmts[use_stmt_index],
-            candidate,
-            &replacement,
-            options,
-            InlinePolicy::StableCopy,
-        ) {
+        let mut rewritten_stmts = Vec::with_capacity(use_stmt_indices.len());
+        let all_rewritten = use_stmt_indices.iter().all(|use_stmt_index| {
+            let mut rewritten_stmt = stmts[*use_stmt_index].clone();
+            if !rewrite_stmt_use_sites_with_policy(
+                &mut rewritten_stmt,
+                candidate,
+                &replacement,
+                options,
+                InlinePolicy::StableCopy,
+            ) || BindingUseIndex::for_stmts(std::slice::from_ref(&rewritten_stmt))
+                .count_uses_in_suffix(0, candidate.binding())
+                != 0
+            {
+                return false;
+            }
+            rewritten_stmts.push((*use_stmt_index, rewritten_stmt));
+            true
+        });
+        if all_rewritten {
+            // 候选接受：所有顶层 owner 都已在副本中完整替换且没有 residual use；统一写回
+            // 后再删除 recovered 声明，primitive/local copy 的求值与 root owner 均未移动。
+            for (use_stmt_index, rewritten_stmt) in rewritten_stmts {
+                stmts[use_stmt_index] = rewritten_stmt;
+            }
             *is_removed = true;
         }
     }
@@ -624,6 +659,17 @@ mod tests {
         }))
     }
 
+    fn debug_local(binding: AstBindingRef, value: AstExpr) -> AstStmt {
+        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: binding,
+                attr: AstLocalAttr::None,
+                origin: AstLocalOrigin::DebugHinted,
+            }],
+            values: vec![value],
+        }))
+    }
+
     fn equals(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
         AstExpr::Binary(Box::new(AstBinaryExpr {
             op: AstBinaryOpKind::Eq,
@@ -638,6 +684,94 @@ mod tests {
 
     fn indexed(base: AstExpr, index: AstExpr) -> AstExpr {
         AstExpr::IndexAccess(Box::new(AstIndexAccess { base, index }))
+    }
+
+    fn call_with_arg(name: &str, arg: AstExpr) -> AstStmt {
+        AstStmt::CallStmt(Box::new(AstCallStmt {
+            call: AstCallKind::Call(Box::new(AstCallExpr {
+                callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                    text: name.to_owned(),
+                })),
+                args: vec![arg],
+                method_name: None,
+            })),
+        }))
+    }
+
+    #[test]
+    fn stable_copy_rewrites_all_top_level_use_owners_atomically() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let binding = AstBindingRef::Local(LocalId(1));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(binding, AstExpr::Var(source.to_name_ref())),
+                call_with_arg("sink", AstExpr::Var(binding.to_name_ref())),
+                return_values(vec![AstExpr::Var(binding.to_name_ref())]),
+            ],
+        };
+
+        assert!(collapse_stable_copy_aliases(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::LocalDecl(_), AstStmt::CallStmt(call), AstStmt::Return(ret)]
+                if matches!(&call.call, AstCallKind::Call(call)
+                    if call.args == vec![AstExpr::Var(source.to_name_ref())])
+                    && ret.values == vec![AstExpr::Var(source.to_name_ref())]
+        ));
+    }
+
+    #[test]
+    fn stable_copy_keeps_all_owners_when_a_nested_use_cannot_rewrite() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let binding = AstBindingRef::Local(LocalId(1));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(binding, AstExpr::Var(source.to_name_ref())),
+                call_with_arg("sink", AstExpr::Var(binding.to_name_ref())),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![call_with_arg("nested", AstExpr::Var(binding.to_name_ref()))],
+                })),
+            ],
+        };
+        let original = block.clone();
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn stable_copy_keeps_body_uses_when_until_is_outside_rewrite_boundary() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let binding = AstBindingRef::Local(LocalId(1));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(binding, AstExpr::Var(source.to_name_ref())),
+                call_with_arg("sink", AstExpr::Var(binding.to_name_ref())),
+            ],
+        };
+        let original = block.clone();
+        let condition = equals(AstExpr::Var(binding.to_name_ref()), AstExpr::Integer(7));
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&condition),
+        ));
+        assert_eq!(block, original);
     }
 
     #[test]

@@ -3,10 +3,13 @@
 //! 本模块只服务 branch-control：它依赖已经结构化的 HIR block，并预先证明 Param/Local
 //! 在整个 proto 内没有写入、for binder 或 ByReference capture，随后沿真实 fallthrough
 //! 传播真假事实。事实只改写 `not/and/or` 条件骨架，不进入值表达式，也不把 truthy 原值
-//! 替换成布尔结果。
+//! 替换成布尔结果。proto 若仍有活跃 goto/label 流，则只分析与它隔离的结构化子树与
+//! 连续 clean fallthrough run；clean `If` arm 及其 tainted child 前缀可继承唯一入口的
+//! header truthiness，遇到活跃 label/goto 后立即清空，出口事实也不会泄漏回污染父级。
 //!
 //! 例如 `if flag then break end; if flag then body end` 可删除第二个分支；若 flag 可能被
-//! 赋值、闭包回写，或控制流仍含 goto/label，则整个规则保守停用。
+//! 赋值、闭包回写则仍保守停用。被引用 label 与任意 goto 会污染所在结构化祖先，未引用
+//! label 不影响词法 fallthrough 证明。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,7 +77,6 @@ struct StableBindingIndex {
     candidates: BTreeSet<StableBinding>,
     unstable: BTreeSet<StableBinding>,
     candidate_budget_exceeded: bool,
-    has_label_or_goto: bool,
 }
 
 impl StableBindingIndex {
@@ -139,7 +141,6 @@ impl HirVisitor for StableBindingIndex {
                         .map(StableBinding::Local),
                 );
             }
-            HirStmt::Goto(_) | HirStmt::Label(_) => self.has_label_or_goto = true,
             _ => {}
         }
     }
@@ -167,25 +168,111 @@ pub(super) fn specialize_stable_path_conditions(
     discard_facts: &DiscardBoundaryFacts,
 ) -> bool {
     let stable = StableBindingIndex::new(proto);
-    if stable.has_label_or_goto {
-        // 分析停用[ProofIncomplete]：路径事实传播尚无 CFG label/goto 边合流；当前按整个 proto
-        // 停用，尽管不受跳转影响的结构化子树仍可能安全专门化。
-        return false;
-    }
     if stable.candidate_budget_exceeded {
         // 分析停用[ResourceLimit]：单 proto 最多追踪 256 个条件 binding，后续应改为按 block/活跃事实裁剪而非放弃整个 proto。
         return false;
     }
 
     let mut changed = false;
-    rewrite_block(
-        &mut proto.body,
-        PathFacts::default(),
-        &stable,
-        discard_facts,
-        &mut changed,
-    );
+    if discard_facts
+        .block_boundary(&proto.body)
+        .has_live_label_flow()
+    {
+        rewrite_clean_islands_in_tainted_block(
+            &mut proto.body,
+            PathFacts::default(),
+            &stable,
+            discard_facts,
+            &mut changed,
+        );
+    } else {
+        rewrite_block(
+            &mut proto.body,
+            PathFacts::default(),
+            &stable,
+            discard_facts,
+            &mut changed,
+        );
+    }
     changed
+}
+
+fn rewrite_clean_islands_in_tainted_block(
+    block: &mut HirBlock,
+    entry_facts: PathFacts,
+    stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
+    changed: &mut bool,
+) {
+    let mut run_facts = Some(entry_facts);
+    for stmt in &mut block.stmts {
+        if !discard_facts.stmt_boundary(stmt).has_live_label_flow() {
+            let run_is_reachable = run_facts.is_some();
+            let flow = rewrite_stmt(
+                stmt,
+                run_facts.take().unwrap_or_default(),
+                stable,
+                discard_facts,
+                changed,
+            );
+            run_facts = (run_is_reachable && flow.falls_through).then_some(flow.facts);
+            continue;
+        }
+
+        // 分析停用[ProofIncomplete]：活跃 label graph 缺少 predecessor facts 合流；clean `If` arm 由唯一结构化入口单独消费 header facts，含 label/goto 的子图仍从空事实递归（regress_374）。
+        rewrite_clean_child_blocks(stmt, stable, discard_facts, changed);
+        run_facts = Some(PathFacts::default());
+    }
+}
+
+fn rewrite_clean_child_blocks(
+    stmt: &mut HirStmt,
+    stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
+    changed: &mut bool,
+) {
+    let mut rewrite_child = |block: &mut HirBlock, facts: PathFacts| {
+        if discard_facts.block_boundary(block).has_live_label_flow() {
+            rewrite_clean_islands_in_tainted_block(block, facts, stable, discard_facts, changed);
+        } else {
+            let _ = rewrite_block(block, facts, stable, discard_facts, changed);
+        }
+    };
+
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            let empty = PathFacts::default();
+            let then_facts = facts_for_condition(&empty, &if_stmt.cond, true, stable)
+                .unwrap_or_else(|| empty.clone());
+            let else_facts = facts_for_condition(&empty, &if_stmt.cond, false, stable)
+                .unwrap_or_else(|| empty.clone());
+            rewrite_child(&mut if_stmt.then_block, then_facts);
+            if let Some(else_block) = &mut if_stmt.else_block {
+                rewrite_child(else_block, else_facts);
+            }
+        }
+        HirStmt::While(while_stmt) => rewrite_child(&mut while_stmt.body, PathFacts::default()),
+        HirStmt::Repeat(repeat_stmt) => rewrite_child(&mut repeat_stmt.body, PathFacts::default()),
+        HirStmt::NumericFor(numeric_for) => {
+            rewrite_child(&mut numeric_for.body, PathFacts::default());
+        }
+        HirStmt::GenericFor(generic_for) => {
+            rewrite_child(&mut generic_for.body, PathFacts::default());
+        }
+        HirStmt::Block(block) => rewrite_child(block, PathFacts::default()),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_) => {}
+    }
 }
 
 fn rewrite_block(

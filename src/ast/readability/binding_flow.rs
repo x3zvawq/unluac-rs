@@ -179,17 +179,21 @@ impl BindingUseIndex {
             .unwrap_or(0)
     }
 
-    pub(super) fn unique_use_stmt_in_suffix(
+    /// 返回 suffix 中所有承载该 binding 读取的顶层语句索引。
+    ///
+    /// 同一语句内的多次读取只出现一个索引；trailing expression 仍以末尾虚拟语句表示。
+    pub(super) fn use_stmt_indices_in_suffix(
         &self,
         start: usize,
         binding: AstBindingRef,
-    ) -> Option<usize> {
-        let counts = self.suffix_counts.get(&binding)?;
+    ) -> &[usize] {
+        let Some(counts) = self.suffix_counts.get(&binding) else {
+            return &[];
+        };
         let index = counts
             .stmt_indices
             .partition_point(|stmt_index| *stmt_index < start);
-        let stmt_index = *counts.stmt_indices.get(index)?;
-        (counts.suffix_totals.get(index) == Some(&1)).then_some(stmt_index)
+        &counts.stmt_indices[index..]
     }
 
     pub(super) fn count_uses_in_range(

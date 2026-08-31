@@ -40,6 +40,13 @@ pub enum AstLowerError {
     InvalidGlobalDeclPattern { proto: usize },
     #[error("HIR proto#{proto} has invalid method call lowering shape: {reason}")]
     InvalidMethodCallPattern { proto: usize, reason: &'static str },
+    #[error(
+        "AST function#{function} closure captures local binding {binding:?} before its declaration"
+    )]
+    InvalidForwardLocalCapture {
+        function: usize,
+        binding: AstBindingRef,
+    },
     #[error("AST function#{function} defines goto label#{label} more than once")]
     DuplicateGotoLabel { function: usize, label: usize },
     #[error("AST function#{function} goto references missing label#{label} in the same function")]

@@ -21,8 +21,8 @@ use crate::structure::{
     GraphFacts, PhiId, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan, SsaValue,
 };
 use crate::structure::{
-    LoopPlanId, LoopSourceBindings, LoopVmProtocol, ReadyStructureFacts, RegionId, RegionPlan,
-    StructurePlan, UnstructuredLayoutItem,
+    CleanupDisposition, LoopPlanId, LoopSourceBindings, LoopVmProtocol, ReadyStructureFacts,
+    RegionId, RegionPlan, StructurePlan, UnstructuredLayoutItem,
 };
 use crate::transformer::{
     AccessBase, CaptureSource, GetTableKind, InstrRef, LowInstr, LoweredProto, Reg,
@@ -428,6 +428,7 @@ pub(super) fn build_bindings(
         debug_entry_local_decls,
         capture_region_local_decls: captured_slots.region_local_decls,
         closure_capture_targets: captured_slots.capture_targets,
+        lexical_close_scope_starts: captured_slots.lexical_close_scope_starts,
         reference_captured_regs,
         entry_local_regs,
         numeric_for_locals,

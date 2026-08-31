@@ -94,6 +94,17 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
         let mut merged_bindings = bindings.to_vec();
         let mut consumed = 0;
         for next_bindings in old_stmts.iter().map_while(empty_local_decl_bindings) {
+            match local_attr_merge_barrier(&merged_bindings, next_bindings) {
+                Some(LocalAttrMergeBarrier::MultipleClose) => {
+                    // 候选拒绝[TargetConstraint]：Lua 5.4/5.5 的同一 local list 最多只能声明一个 `<close>` binding。
+                    break;
+                }
+                Some(LocalAttrMergeBarrier::NonTrailingClose) => {
+                    // 候选拒绝[LayerBoundary]：HIR close-scope 与 AST build 目前只稳定恢复列表末位的 `<close>`，不能生成无法重编译恢复的非末位形状。
+                    break;
+                }
+                None => {}
+            }
             merged_bindings.extend_from_slice(next_bindings);
             consumed += 1;
         }
@@ -118,17 +129,40 @@ fn empty_local_decl_bindings(stmt: &AstStmt) -> Option<&[AstLocalBinding]> {
     let AstStmt::LocalDecl(local_decl) = stmt else {
         return None;
     };
-    if !local_decl.values.is_empty()
-        || local_decl
-            .bindings
-            .iter()
-            .any(|binding| binding.attr != AstLocalAttr::None)
-    {
-        // 候选拒绝[ProofIncomplete]：非空声明不属于本规则；相邻空属性声明本可保留每个
-        // binding 的 attr 且中间无求值事件，当前 blanket gate 仍缺目标语法验证后再放宽。
+    if !local_decl.values.is_empty() {
         return None;
     }
     Some(&local_decl.bindings)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalAttrMergeBarrier {
+    MultipleClose,
+    NonTrailingClose,
+}
+
+fn local_attr_merge_barrier(
+    current: &[AstLocalBinding],
+    next: &[AstLocalBinding],
+) -> Option<LocalAttrMergeBarrier> {
+    let close_count = current
+        .iter()
+        .chain(next)
+        .filter(|binding| binding.attr == AstLocalAttr::Close)
+        .count();
+    if close_count > 1 {
+        return Some(LocalAttrMergeBarrier::MultipleClose);
+    }
+    if close_count == 1
+        && current
+            .iter()
+            .chain(next)
+            .next_back()
+            .is_none_or(|binding| binding.attr != AstLocalAttr::Close)
+    {
+        return Some(LocalAttrMergeBarrier::NonTrailingClose);
+    }
+    None
 }
 
 fn merge_adjacent_single_value_local_decls(
@@ -168,6 +202,24 @@ fn merge_adjacent_single_value_local_decls(
             if !is_mergeable_adjacent_local_value(next_value) {
                 // 候选拒绝[PolicyBoundary]：复杂 RHS 受展示预算限制。
                 break;
+            }
+            if bindings
+                .iter()
+                .any(|binding| binding.attr == AstLocalAttr::Const)
+            {
+                // 候选拒绝[SemanticBarrier:DebugScope]：PUC 只把 local list 末项的 const literal 提升为无栈槽常量；继续追加会让原 `<const>` 变成 debug 可见的真实 local。
+                break;
+            }
+            match local_attr_merge_barrier(&bindings, std::slice::from_ref(next_binding)) {
+                Some(LocalAttrMergeBarrier::MultipleClose) => {
+                    // 候选拒绝[TargetConstraint]：Lua 5.4/5.5 的同一 local list 最多只能声明一个 `<close>` binding。
+                    break;
+                }
+                Some(LocalAttrMergeBarrier::NonTrailingClose) => {
+                    // 候选拒绝[LayerBoundary]：HIR close-scope 与 AST build 目前只稳定恢复列表末位的 `<close>`，不能生成无法重编译恢复的非末位形状。
+                    break;
+                }
+                None => {}
             }
             if expr_references_any_binding(next_value, &bindings) {
                 // 候选拒绝[SemanticBarrier:Scope]：`local a=x; local b=a` 合成并行声明后 RHS 的 `a` 会解析到外层。
@@ -248,16 +300,18 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
                 lookahead += 1;
                 continue;
             }
-            if let Some(merged) = try_sink_hoisted_decl_into_stmt(
+            if let Some(attempt) = try_sink_hoisted_decl_into_stmt(
+                &remaining,
                 &remaining,
                 &block.stmts[lookahead],
                 &use_index,
                 index + 1,
                 lookahead,
             ) {
-                let consumed = merged.bindings.len();
-                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(merged));
+                let consumed = attempt.merged.bindings.len();
+                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(attempt.merged));
                 remaining.drain(..consumed);
+                pin_sink_dependencies(&mut remaining, &mut pinned, &attempt.dependencies);
                 sink_changed = true;
                 lookahead += 1;
                 continue;
@@ -270,13 +324,15 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
             ) {
                 block.stmts[lookahead] = attempt.rewritten;
                 remaining.drain(attempt.start..(attempt.start + attempt.consumed));
+                pin_sink_dependencies(&mut remaining, &mut pinned, &attempt.dependencies);
                 sink_changed = true;
                 // 不要前进 lookahead：同一条 if / loop 语句可能还有其它分支可以
                 // 接收剩余 binding。例如 `local t12, t7; if ... then t12 = A else
                 // t7 = B end` —— 第一轮把 t12 沉进 then，第二轮把 t7 沉进 else。
                 continue;
             }
-            if let Some((start, merged)) = try_sink_hoisted_decl_into_stmt_anywhere(
+            if let Some(attempt) = try_sink_hoisted_decl_into_stmt_anywhere(
+                &remaining,
                 &remaining,
                 &block.stmts[lookahead],
                 &use_index,
@@ -284,9 +340,10 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
                 lookahead,
                 lookahead + 1,
             ) {
-                let consumed = merged.bindings.len();
-                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(merged));
-                remaining.drain(start..start + consumed);
+                let consumed = attempt.merged.bindings.len();
+                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(attempt.merged));
+                remaining.drain(attempt.start..attempt.start + consumed);
+                pin_sink_dependencies(&mut remaining, &mut pinned, &attempt.dependencies);
                 sink_changed = true;
                 lookahead += 1;
                 continue;
@@ -342,6 +399,18 @@ struct NestedSinkAttempt {
     rewritten: AstStmt,
     start: usize,
     consumed: usize,
+    dependencies: Vec<AstBindingRef>,
+}
+
+struct BlockSinkAttempt {
+    consumed: usize,
+    dependencies: Vec<AstBindingRef>,
+}
+
+struct DirectSinkAttempt {
+    start: usize,
+    merged: AstLocalDecl,
+    dependencies: Vec<AstBindingRef>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -503,8 +572,12 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
         // 对每个真实 mention 起点只尝试 owner 改变前的最大切片。未提及 binding
         // 继续随同该组下沉，以保留并行赋值的声明/RHS 词法边界。
         for (slice_start, slice_end) in candidates {
-            if let Some((rewritten, consumed)) = try_sink_hoisted_decl_into_nested_stmt(
+            // owner 分组只能缩窄 candidate 的落点，不能缩窄 initializer 的依赖全集：
+            // `if cond then a=b else use(b)` 会让 a 属于 Then、b 属于 Blocked，传入的
+            // candidate slice 只有 a，但 b 仍必须固定在原 hoist 点。
+            if let Some((rewritten, attempt)) = try_sink_hoisted_decl_into_nested_stmt(
                 &pending[slice_start..slice_end],
+                pending,
                 stmt,
                 use_index,
                 suffix_start,
@@ -512,7 +585,8 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
                 return Some(NestedSinkAttempt {
                     rewritten,
                     start: slice_start,
-                    consumed,
+                    consumed: attempt.consumed,
+                    dependencies: attempt.dependencies,
                 });
             }
         }
@@ -525,10 +599,11 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
 
 fn try_sink_hoisted_decl_into_nested_stmt(
     pending: &[super::super::common::AstLocalBinding],
+    dependency_universe: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
     use_index: &BindingUseIndex,
     suffix_start: usize,
-) -> Option<(AstStmt, usize)> {
+) -> Option<(AstStmt, BlockSinkAttempt)> {
     if !stmt_can_accept_nested_hoisted_sink(stmt) {
         return None;
     }
@@ -572,8 +647,9 @@ fn try_sink_hoisted_decl_into_nested_stmt(
                     .expect("else refs imply else block"),
                 _ => unreachable!("rewritten stmt must remain if"),
             };
-            let consumed = sink_pending_bindings_into_block(target_block, sinkable);
-            (consumed > 0).then_some((rewritten, consumed))
+            let attempt =
+                sink_pending_bindings_into_block(target_block, sinkable, dependency_universe);
+            (attempt.consumed > 0).then_some((rewritten, attempt))
         }
         AstStmt::While(while_stmt) => {
             if expr_references_binding_set(&while_stmt.cond, &sinkable_refs) {
@@ -584,8 +660,12 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             let AstStmt::While(while_stmt) = &mut rewritten else {
                 unreachable!("rewritten stmt must remain while");
             };
-            let consumed = sink_pending_bindings_into_block(&mut while_stmt.body, sinkable);
-            (consumed > 0).then_some((rewritten, consumed))
+            let attempt = sink_pending_bindings_into_block(
+                &mut while_stmt.body,
+                sinkable,
+                dependency_universe,
+            );
+            (attempt.consumed > 0).then_some((rewritten, attempt))
         }
         AstStmt::Repeat(repeat_stmt) => {
             if expr_references_binding_set(&repeat_stmt.cond, &sinkable_refs) {
@@ -596,8 +676,12 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             let AstStmt::Repeat(repeat_stmt) = &mut rewritten else {
                 unreachable!("rewritten stmt must remain repeat");
             };
-            let consumed = sink_pending_bindings_into_block(&mut repeat_stmt.body, sinkable);
-            (consumed > 0).then_some((rewritten, consumed))
+            let attempt = sink_pending_bindings_into_block(
+                &mut repeat_stmt.body,
+                sinkable,
+                dependency_universe,
+            );
+            (attempt.consumed > 0).then_some((rewritten, attempt))
         }
         AstStmt::NumericFor(numeric_for) => {
             if expr_references_binding_set(&numeric_for.start, &sinkable_refs)
@@ -611,8 +695,12 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             let AstStmt::NumericFor(numeric_for) = &mut rewritten else {
                 unreachable!("rewritten stmt must remain numeric-for");
             };
-            let consumed = sink_pending_bindings_into_block(&mut numeric_for.body, sinkable);
-            (consumed > 0).then_some((rewritten, consumed))
+            let attempt = sink_pending_bindings_into_block(
+                &mut numeric_for.body,
+                sinkable,
+                dependency_universe,
+            );
+            (attempt.consumed > 0).then_some((rewritten, attempt))
         }
         AstStmt::GenericFor(generic_for) => {
             if generic_for
@@ -627,15 +715,20 @@ fn try_sink_hoisted_decl_into_nested_stmt(
             let AstStmt::GenericFor(generic_for) = &mut rewritten else {
                 unreachable!("rewritten stmt must remain generic-for");
             };
-            let consumed = sink_pending_bindings_into_block(&mut generic_for.body, sinkable);
-            (consumed > 0).then_some((rewritten, consumed))
+            let attempt = sink_pending_bindings_into_block(
+                &mut generic_for.body,
+                sinkable,
+                dependency_universe,
+            );
+            (attempt.consumed > 0).then_some((rewritten, attempt))
         }
         AstStmt::DoBlock(inner) => {
             let mut rewritten = AstBlock {
                 stmts: inner.stmts.clone(),
             };
-            let consumed = sink_pending_bindings_into_block(&mut rewritten, sinkable);
-            (consumed > 0).then_some((AstStmt::DoBlock(Box::new(rewritten)), consumed))
+            let attempt =
+                sink_pending_bindings_into_block(&mut rewritten, sinkable, dependency_universe);
+            (attempt.consumed > 0).then_some((AstStmt::DoBlock(Box::new(rewritten)), attempt))
         }
         AstStmt::FunctionDecl(_)
         | AstStmt::LocalFunctionDecl(_)
@@ -669,7 +762,8 @@ fn stmt_can_accept_nested_hoisted_sink(stmt: &AstStmt) -> bool {
 fn sink_pending_bindings_into_block(
     block: &mut AstBlock,
     pending: &[super::super::common::AstLocalBinding],
-) -> usize {
+    dependency_universe: &[super::super::common::AstLocalBinding],
+) -> BlockSinkAttempt {
     let use_index = BindingUseIndex::for_stmts(&block.stmts);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     let mut consumed = 0usize;
@@ -681,23 +775,43 @@ fn sink_pending_bindings_into_block(
             index += 1;
             continue;
         }
-        if let Some(merged) =
-            try_sink_hoisted_decl_into_stmt(remaining, &block.stmts[index], &use_index, 0, index)
-        {
-            let merged_len = merged.bindings.len();
-            block.stmts[index] = AstStmt::LocalDecl(Box::new(merged));
+        if let Some(attempt) = try_sink_hoisted_decl_into_stmt(
+            remaining,
+            dependency_universe,
+            &block.stmts[index],
+            &use_index,
+            0,
+            index,
+        ) {
+            let merged_len = attempt.merged.bindings.len();
+            block.stmts[index] = AstStmt::LocalDecl(Box::new(attempt.merged));
             consumed += merged_len;
+            if !attempt.dependencies.is_empty() {
+                // 依赖仍须由最外层 hoisted 声明支配 RHS；立即上送，避免本次子块扫描
+                // 把它继续沉到 initializer 之后。
+                return BlockSinkAttempt {
+                    consumed,
+                    dependencies: attempt.dependencies,
+                };
+            }
             index += 1;
             continue;
         }
-        if let Some((rewritten, nested_consumed)) = try_sink_hoisted_decl_into_nested_stmt(
+        if let Some((rewritten, nested_attempt)) = try_sink_hoisted_decl_into_nested_stmt(
             remaining,
+            dependency_universe,
             &block.stmts[index],
             &use_index,
             index + 1,
         ) {
             block.stmts[index] = rewritten;
-            consumed += nested_consumed;
+            consumed += nested_attempt.consumed;
+            if !nested_attempt.dependencies.is_empty() {
+                return BlockSinkAttempt {
+                    consumed,
+                    dependencies: nested_attempt.dependencies,
+                };
+            }
             continue;
         }
         let remaining_refs = BindingRefSet::from_bindings(remaining);
@@ -715,7 +829,10 @@ fn sink_pending_bindings_into_block(
         }
         index += 1;
     }
-    consumed
+    BlockSinkAttempt {
+        consumed,
+        dependencies: Vec::new(),
+    }
 }
 
 fn single_value_local_decl(
@@ -733,11 +850,6 @@ fn single_value_local_decl(
     let [value] = local_decl.values.as_slice() else {
         return None;
     };
-    if binding.attr != AstLocalAttr::None {
-        // 候选拒绝[ProofIncomplete]：`<close>` 在后续 lookup/call 前的注册时点可被
-        // `__close`/GC 观察，但 `<const>` 或无事件后缀存在安全子集；需按 attr 与后续事件拆分。
-        return None;
-    }
     Some((binding, value))
 }
 
@@ -810,11 +922,12 @@ fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::Ast
 
 fn try_sink_hoisted_decl_into_stmt(
     pending: &[super::super::common::AstLocalBinding],
+    dependency_universe: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
     use_index: &BindingUseIndex,
     prior_start: usize,
     target_index: usize,
-) -> Option<AstLocalDecl> {
+) -> Option<DirectSinkAttempt> {
     let AstStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -841,14 +954,13 @@ fn try_sink_hoisted_decl_into_stmt(
         // 候选拒绝[SemanticBarrier:Scope]：赋值 RHS 读取候选 binding 时，改成 local initializer 会把读取解析到新声明之前的外层绑定。
         return None;
     }
-    if stmt_references_any_binding_in_assign(assign, &pending[assign.targets.len()..]) {
-        // 候选拒绝[ProofIncomplete]：剩余 binding 仍由原 hoisted 声明支配，`local a,b;
-        // a=b` 下沉为 `local b; local a=b` 等价；当前 gate 未利用这一支配事实。
-        return None;
-    }
-    Some(AstLocalDecl {
-        bindings: candidate.to_vec(),
-        values: assign.values.clone(),
+    Some(DirectSinkAttempt {
+        start: 0,
+        merged: AstLocalDecl {
+            bindings: candidate.to_vec(),
+            values: assign.values.clone(),
+        },
+        dependencies: rhs_dependencies_outside_candidate(assign, dependency_universe, candidate),
     })
 }
 
@@ -860,16 +972,17 @@ fn is_temp_like_binding(binding: AstBindingRef) -> bool {
 }
 
 /// 与 [`try_sink_hoisted_decl_into_stmt`] 类似，但在 `pending` 中任意位置搜索
-/// 匹配的 binding，而非仅要求它们位于头部。成功时返回 `(start_index, AstLocalDecl)`，
-/// 其中 `start_index` 是匹配 binding 在 `pending` 中的起始位置。
+/// 匹配的 binding，而非仅要求它们位于头部。成功时 attempt 同时携带匹配起点、
+/// 合并声明和必须留在原 hoist 点的 RHS 依赖。
 fn try_sink_hoisted_decl_into_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
+    dependency_universe: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
     use_index: &BindingUseIndex,
     prior_start: usize,
     target_index: usize,
     suffix_start: usize,
-) -> Option<(usize, AstLocalDecl)> {
+) -> Option<DirectSinkAttempt> {
     let AstStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -905,30 +1018,52 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
             // 候选拒绝[SemanticBarrier:Scope]：候选在赋值后仍活跃，沉入当前位置会缩窄其作用域并破坏后缀读取。
             continue;
         }
-        // RHS 不得引用 consumed 切片之后的其他待处理 binding
-        // （与前序变体相同的安全检查）。
-        let after = &pending[start + target_len..];
-        if !after.is_empty() && stmt_references_any_binding_in_assign(assign, after) {
-            // 候选拒绝[ProofIncomplete]：切片后的 binding 仍在原 hoisted 声明中，读取解析
-            // 不变；应证明声明重建顺序后移除此 gate。
-            continue;
-        }
-        // 同样检查 consumed 切片之前的 binding。
-        let before = &pending[..start];
-        if !before.is_empty() && stmt_references_any_binding_in_assign(assign, before) {
-            // 候选拒绝[ProofIncomplete]：切片前 binding 同样仍由 hoisted 声明支配；
-            // `local a,b; b=a` 是安全子集，当前 gate 缺少重建后支配关系证明。
-            continue;
-        }
-        return Some((
+        return Some(DirectSinkAttempt {
             start,
-            AstLocalDecl {
+            merged: AstLocalDecl {
                 bindings: candidate.to_vec(),
                 values: assign.values.clone(),
             },
-        ));
+            dependencies: rhs_dependencies_outside_candidate(
+                assign,
+                dependency_universe,
+                candidate,
+            ),
+        });
     }
     None
+}
+
+fn rhs_dependencies_outside_candidate(
+    assign: &super::super::common::AstAssign,
+    dependency_universe: &[super::super::common::AstLocalBinding],
+    candidate: &[super::super::common::AstLocalBinding],
+) -> Vec<AstBindingRef> {
+    // candidate 自引用由调用方拒绝；其余 RHS 引用随成功 attempt 返回，并在下一次
+    // sink 前固定到原 hoist 点，因而 initializer 的词法解析保持不变。
+    dependency_universe
+        .iter()
+        .filter(|binding| !candidate.iter().any(|item| item.id == binding.id))
+        .filter(|binding| {
+            stmt_references_any_binding_in_assign(assign, std::slice::from_ref(binding))
+        })
+        .map(|binding| binding.id)
+        .collect()
+}
+
+fn pin_sink_dependencies(
+    remaining: &mut Vec<super::super::common::AstLocalBinding>,
+    pinned: &mut Vec<super::super::common::AstLocalBinding>,
+    dependencies: &[AstBindingRef],
+) {
+    let mut index = 0;
+    while index < remaining.len() {
+        if dependencies.contains(&remaining[index].id) {
+            pinned.push(remaining.remove(index));
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn stmt_references_any_binding_in_assign(
