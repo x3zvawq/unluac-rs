@@ -14,9 +14,10 @@
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::expr_requires_ordered_snapshot;
+use super::super::visit::{self, AstVisitor};
 use crate::ast::common::{
-    AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstGlobalDecl, AstIf,
-    AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstReturn, AstStmt,
+    AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFunctionName, AstGlobalDecl,
+    AstIf, AstLValue, AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstReturn, AstStmt,
 };
 
 pub(super) fn try_recover_method_alias_stmt(
@@ -46,6 +47,7 @@ pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
         return false;
     };
     if matches!(sink, AstStmt::GenericFor(_)) {
+        // 候选拒绝[LayerBoundary]：generic-for 的单 receiver 例外由 inline-exprs owner 消费，method-alias 不跨该 sink 抢占所有权。
         return false;
     }
     let run = &stmts[index..];
@@ -78,6 +80,12 @@ fn try_recover_with_receiver_alias(
     if !name_matches_binding(receiver_name, receiver_binding) {
         return None;
     }
+    if binding_is_written_in_suffix(stmts, stmt_base + 1, receiver_binding)
+        || binding_is_written_in_suffix(stmts, stmt_base + 2, field_binding)
+    {
+        // 候选拒绝[SemanticBarrier:Scope]：删除 alias declaration 会让后续 direct write 解析到外层 binding，不能只按读取次数判断。
+        return None;
+    }
     if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2
         || use_index.count_uses_in_suffix(stmt_base + 2, field_binding) != 1
     {
@@ -108,27 +116,30 @@ fn try_recover_receiver_alias_direct_method_call(
         return None;
     };
     let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
+    if binding_is_written_in_suffix(stmts, stmt_base + 1, receiver_binding) {
+        // 候选拒绝[SemanticBarrier:Scope]：删除 receiver local 会把 sink/后缀的 direct write 绑定到外层名称。
+        return None;
+    }
     if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2 {
         // 候选拒绝[SemanticBarrier:EvalCount]：direct 形状仍要求 receiver 恰好用于 lookup 和首参，额外 use 不能随 alias 删除。
         return None;
     }
-    Some((
-        rewrite_single_expr_sink_stmt(sink, |value| {
-            rewrite_method_call_expr_in_order(
-                value,
-                mutable_snapshots,
-                expr_prefix_is_stable(receiver_expr, mutable_snapshots),
-                |expr| {
-                    recover_direct_method_call_with_receiver_alias_expr(
-                        expr,
-                        receiver_binding,
-                        receiver_expr,
-                    )
-                },
-            )
-        })?,
-        2,
-    ))
+    let rewritten = rewrite_single_expr_sink_stmt(sink, |value| {
+        rewrite_method_call_expr_in_order(
+            value,
+            mutable_snapshots,
+            expr_prefix_is_stable(receiver_expr, mutable_snapshots),
+            |expr| {
+                recover_direct_method_call_with_receiver_alias_expr(
+                    expr,
+                    receiver_binding,
+                    receiver_expr,
+                )
+            },
+        )
+    })
+    .or_else(|| recover_direct_method_call_sink(sink, receiver_binding, receiver_expr))?;
+    Some((rewritten, 2))
 }
 
 fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> {
@@ -153,6 +164,51 @@ fn single_field_alias_decl(
         return None;
     };
     Some((binding, access))
+}
+
+fn binding_is_written_in_suffix(stmts: &[AstStmt], start: usize, binding: AstBindingRef) -> bool {
+    stmts.get(start..).is_some_and(|suffix| {
+        suffix.iter().any(|stmt| {
+            let mut finder = BindingWriteFinder {
+                binding,
+                found: false,
+            };
+            visit::visit_stmt(stmt, &mut finder);
+            finder.found
+        })
+    })
+}
+
+struct BindingWriteFinder {
+    binding: AstBindingRef,
+    found: bool,
+}
+
+impl AstVisitor for BindingWriteFinder {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        match stmt {
+            AstStmt::FunctionDecl(function_decl) => {
+                let AstFunctionName::Plain(path) = &function_decl.target else {
+                    return;
+                };
+                if path.fields.is_empty() && name_matches_binding(&path.root, self.binding) {
+                    self.found = true;
+                }
+            }
+            AstStmt::LocalFunctionDecl(function_decl) if function_decl.name == self.binding => {
+                self.found = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &AstLValue) {
+        if let AstLValue::Name(name) = lvalue
+            && name_matches_binding(name, self.binding)
+        {
+            self.found = true;
+        }
+    }
 }
 
 fn recover_method_call_sink(
@@ -206,6 +262,30 @@ fn recover_method_call_sink(
         | AstStmt::Return(_)
         | AstStmt::Error(_) => None,
     })
+}
+
+fn recover_direct_method_call_sink(
+    stmt: &AstStmt,
+    receiver_binding: AstBindingRef,
+    receiver_expr: &AstExpr,
+) -> Option<AstStmt> {
+    let AstStmt::CallStmt(call_stmt) = stmt else {
+        return None;
+    };
+    let AstCallKind::Call(call) = &call_stmt.call else {
+        return None;
+    };
+    let AstExpr::MethodCall(method_call) = recover_direct_method_call_with_receiver_alias_expr(
+        &AstExpr::Call(call.clone()),
+        receiver_binding,
+        receiver_expr,
+    )?
+    else {
+        return None;
+    };
+    Some(AstStmt::CallStmt(Box::new(AstCallStmt {
+        call: AstCallKind::MethodCall(method_call),
+    })))
 }
 
 fn recover_method_call_expr(
@@ -553,8 +633,11 @@ fn rewrite_single_expr_sink_stmt(
             then_block: if_stmt.then_block.clone(),
             else_block: if_stmt.else_block.clone(),
         }))),
-        AstStmt::CallStmt(_)
-        | AstStmt::While(_)
+        AstStmt::CallStmt(_) => {
+            // 候选拒绝[LayerBoundary]：通用表达式 sink 不改写调用语句；精确的 direct/field-alias 调用由上层 owner 的专用 fallback 处理。
+            None
+        }
+        AstStmt::While(_)
         | AstStmt::Repeat(_)
         | AstStmt::NumericFor(_)
         | AstStmt::GenericFor(_)

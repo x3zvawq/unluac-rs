@@ -1,5 +1,6 @@
 -- Attribute-bearing locals may share one declaration when their RHS suffix is eventless.
--- unluac: expect-contains [[copy, owned <close>]]
+-- retain_debug 保留逐条 local 的可观察作用域，因此带 DebugHinted 来源的 copy/owned 不合并。
+-- unluac: expect-not-contains [[copy, owned <close>]]
 -- unluac: expect-not-contains [[early <close>, late]]
 -- unluac: expect-not-contains [[first <close>, second <close>]]
 

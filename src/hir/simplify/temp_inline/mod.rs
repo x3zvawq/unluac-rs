@@ -2138,13 +2138,14 @@ fn inline_repeat_head_scalar_temp(
     let Some((temp, value)) = repeat_stmt.body.stmts.first().and_then(inline_candidate) else {
         return false;
     };
-    // 候选拒绝[ProofIncomplete]：home compaction、缺 prefix/home fact 时不能证明首句 producer 就是 continue 重定位出的 latch prefix；应补 slot epoch/provenance。
-    // 候选拒绝[ProofIncomplete]：这里只证明 rootless 标量；local/lookup/call 依赖在 body 后是否稳定需要表达式 read/effect summary。
+    // 这里的 producer 已由 structure fact 证明是 continue 重定位出的 latch prefix；其 RHS
+    // 仅为不携带 home identity 的 rootless 标量，因此 home compaction/缺 trusted home 不
+    // 会改变替换结果。非标量路径仍由其它规则保留 slot/epoch 证明。
+    // 候选拒绝[ProofIncomplete]：local/lookup/call 依赖在 body 后是否稳定仍需要表达式
+    // read/effect summary，不能沿用 rootless 标量证明。
     // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
     // 候选拒绝[SemanticBarrier:Lifetime]：非唯一 condition use 仍需要原 temp。
-    if facts.compacts_home_slots()
-        || !facts.is_repeat_condition_prefix_temp(temp)
-        || facts.trusted_temp_home_slot(temp).is_none()
+    if !facts.is_repeat_condition_prefix_temp(temp)
         || !is_repeat_header_rootless_scalar(value)
         || scratch.has_debug_local_hint(temp)
         || total_use_count(temp, live_use_counts) != 1

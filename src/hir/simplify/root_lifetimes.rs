@@ -689,7 +689,9 @@ fn preserve_lookup_roots_to_scope_end(
     active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
     lifetimes: &mut LookupGcRootLifetimeIndices,
 ) {
-    // 证明缺陷[PotentialUnsoundness:Lifetime]：普通 child block 末尾没有 stack-top/跨块 overwrite 事实；当前把它当 VM root 终点，物化后的词法生命周期可能早于或晚于真实 home 终点。
+    // 证明缺陷[AcceptanceProofIncomplete:Lifetime]：regress_396 的 PUC Lua 5.4 child-if
+    // 在 block 后立即复用 lookup home，证明当前物化范围对该形状精确；但普通 child block
+    // 尚无通用 stack-top/跨块 successor overwrite 事实，不能把同一结论外推到任意 chunk。
     lifetimes.roots.extend(
         active
             .values()

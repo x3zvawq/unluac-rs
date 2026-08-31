@@ -74,7 +74,11 @@ pub(super) fn transparent_block_head(mut stmt: &HirStmt) -> Option<&HirStmt> {
         let HirStmt::Block(block) = stmt else {
             return Some(stmt);
         };
-        // 候选拒绝[ProofIncomplete]：第二条及更晚消费仍需 block-prefix 的求值、写入、capture 与外部控制流摘要；当前只把零前缀的首语句视为透明。
+        // 候选拒绝[ProofIncomplete]：第二条及更晚消费仍需 block-prefix 的求值、写入、capture、
+        // 词法遮蔽与外部控制流摘要；当前只把零前缀的首语句视为透明。缺少这些事实时，
+        // `local t=f(); do g(); return t end` 会把 f/g 顺序倒置，`local x=1; local t=x;
+        // do local x; return t end` 则可能把 x 解析成内层 nil；因此不能仅按“前缀未使用
+        // candidate temp”就继续扫描后续语句。
         stmt = block.stmts.first()?;
     }
 }

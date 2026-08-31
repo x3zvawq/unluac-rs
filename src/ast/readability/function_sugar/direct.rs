@@ -4,9 +4,6 @@
 //! `function ... end` 形式，不会处理转发壳或 method alias。
 //! 例如：`local f = function() end` 会在这里变成 `local function f() end`。
 
-use std::collections::BTreeSet;
-
-use super::analysis::function_uses_global_name;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName,
     AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
@@ -16,12 +13,11 @@ use crate::ast::common::{
 pub(super) fn lower_direct_function_stmt(
     stmt: &AstStmt,
     target: AstTargetDialect,
-    method_fields: &BTreeSet<String>,
 ) -> Option<AstStmt> {
     match stmt {
         AstStmt::LocalDecl(local_decl) => try_lower_local_function_decl(local_decl),
         AstStmt::GlobalDecl(global_decl) => try_lower_global_function_decl(global_decl, target),
-        AstStmt::Assign(assign) => try_lower_function_assign(assign, method_fields),
+        AstStmt::Assign(assign) => try_lower_function_assign(assign),
         _ => None,
     }
 }
@@ -77,17 +73,14 @@ fn try_lower_global_function_decl(
     })))
 }
 
-fn try_lower_function_assign(
-    assign: &AstAssign,
-    method_fields: &BTreeSet<String>,
-) -> Option<AstStmt> {
+fn try_lower_function_assign(assign: &AstAssign) -> Option<AstStmt> {
     if assign.targets.len() != 1 || assign.values.len() != 1 {
         return None;
     }
     let AstExpr::FunctionExpr(func) = &assign.values[0] else {
         return None;
     };
-    let (target, func) = function_decl_target_from_lvalue(&assign.targets[0], func, method_fields)?;
+    let (target, func) = function_decl_target_from_lvalue(&assign.targets[0], func)?;
     Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
         target,
         func,
@@ -97,7 +90,6 @@ fn try_lower_function_assign(
 pub(super) fn function_decl_target_from_lvalue(
     target: &AstLValue,
     func: &AstFunctionExpr,
-    method_fields: &BTreeSet<String>,
 ) -> Option<(AstFunctionName, AstFunctionExpr)> {
     match target {
         AstLValue::Name(AstNameRef::Global(global)) => Some((
@@ -109,19 +101,9 @@ pub(super) fn function_decl_target_from_lvalue(
         )),
         AstLValue::Name(_) => None,
         AstLValue::FieldAccess(access) => {
-            let (root, mut fields) = name_path_from_expr(&access.base)?;
-            if method_fields.contains(&access.field) {
-                if func.params.is_empty() {
-                    // 候选拒绝[SemanticBarrier:Vararg]：零显式参数的 vararg 函数若改成 method，隐式 self 会把 receiver 从 `...` 中消费掉；非 vararg 也缺少首参 provenance。
-                } else if function_uses_global_name(func, "self") {
-                    // 候选拒绝[SemanticBarrier:Scope]：原函数体的全局 `self` 会被冒号声明隐式创建的局部 self 遮蔽。
-                } else {
-                    return Some((
-                        AstFunctionName::Method(AstNamePath { root, fields }, access.field.clone()),
-                        func.clone(),
-                    ));
-                }
-            }
+            // 候选拒绝[ProofIncomplete]：assignment 与 method 的字节码形状相同，缺少绑定到
+            // 该函数定义的语法 provenance；保留显式首参，避免隐式 `self` 改变调用结果。
+            let AstNamePath { root, mut fields } = name_path_from_expr(&access.base)?;
             fields.push(access.field.clone());
             Some((
                 AstFunctionName::Plain(AstNamePath { root, fields }),
@@ -132,7 +114,7 @@ pub(super) fn function_decl_target_from_lvalue(
     }
 }
 
-fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
+fn name_path_from_expr(expr: &AstExpr) -> Option<AstNamePath> {
     match expr {
         AstExpr::Var(
             name @ (AstNameRef::Param(_)
@@ -140,11 +122,14 @@ fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
             | AstNameRef::SyntheticLocal(_)
             | AstNameRef::Upvalue(_)
             | AstNameRef::Global(_)),
-        ) => Some((name.clone(), Vec::new())),
+        ) => Some(AstNamePath {
+            root: name.clone(),
+            fields: Vec::new(),
+        }),
         AstExpr::FieldAccess(access) => {
-            let (root, mut fields) = name_path_from_expr(&access.base)?;
-            fields.push(access.field.clone());
-            Some((root, fields))
+            let mut path = name_path_from_expr(&access.base)?;
+            path.fields.push(access.field.clone());
+            Some(path)
         }
         _ => None,
     }
@@ -152,6 +137,8 @@ fn name_path_from_expr(expr: &AstExpr) -> Option<(AstNameRef, Vec<String>)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::ast::common::AstLocalOrigin;
     use crate::hir::{HirProtoRef, LocalId};

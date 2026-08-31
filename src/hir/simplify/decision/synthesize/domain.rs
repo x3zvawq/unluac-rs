@@ -376,7 +376,9 @@ pub(super) fn enumerate_environments(
     domain: &[AbstractValue],
 ) -> Option<Vec<Vec<AbstractValue>>> {
     // 候选拒绝[ResourceLimit]：环境数溢出 usize 时无法分配穷举表；后续应改用符号验证。
-    let total = domain.len().checked_pow(ref_count as u32)?;
+    // u32 是 checked_pow 的指数类型；超出它时直接拒绝，不能截断成较小指数。
+    let exponent = u32::try_from(ref_count).ok()?;
+    let total = domain.len().checked_pow(exponent)?;
     // 候选拒绝[ResourceLimit]：完整环境枚举上限为 4096；后续应改用符号验证或按依赖分区。
     if total > 4096 {
         return None;
@@ -435,5 +437,34 @@ fn enumerate_envs_recursive(
         current.push(value.clone());
         enumerate_envs_recursive(remaining - 1, domain, current, out);
         current.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AbstractValue, enumerate_environments};
+
+    #[test]
+    fn environment_cap_allows_five_base_domain_references() {
+        let domain = [
+            AbstractValue::Nil,
+            AbstractValue::False,
+            AbstractValue::True,
+            AbstractValue::TruthySymbol(0),
+            AbstractValue::TruthySymbol(1),
+        ];
+        assert_eq!(
+            enumerate_environments(5, &domain).map(|envs| envs.len()),
+            Some(3125)
+        );
+        assert!(enumerate_environments(6, &domain).is_none());
+    }
+
+    #[test]
+    fn environment_exponent_does_not_truncate() {
+        let Some(ref_count) = usize::try_from(u64::from(u32::MAX) + 1).ok() else {
+            return;
+        };
+        assert!(enumerate_environments(ref_count, &[AbstractValue::Nil]).is_none());
     }
 }

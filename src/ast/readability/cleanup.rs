@@ -305,7 +305,7 @@ fn split_overwritten_call_result(
         return None;
     }
     let [call_value] = local_decl.values.as_slice() else {
-        // 分析停用[ProofIncomplete]：多 value declaration 需要 Lua 尾值展开与 initializer
+        // 候选拒绝[ProofIncomplete]：多 value declaration 需要 Lua 尾值展开与 initializer
         // 中间结果的临时 root 事实，不能简单拆成多个独立求值语句。
         return None;
     };
@@ -317,7 +317,7 @@ fn split_overwritten_call_result(
         }
     };
     if assign.targets.len() != local_decl.bindings.len() {
-        // 分析停用[ProofIncomplete]：只有完整覆盖全部 binding 的并行赋值才能把 replacement
+        // 候选拒绝[ProofIncomplete]：只有完整覆盖全部 binding 的并行赋值才能把 replacement
         // 原样转成新声明；缺少或额外 target 仍需外部写入与值槽映射证明。
         return None;
     }

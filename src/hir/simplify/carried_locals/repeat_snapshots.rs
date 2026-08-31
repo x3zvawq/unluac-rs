@@ -99,8 +99,9 @@ fn try_rewrite_repeat(
     return_temp: TempId,
     facts: &RepeatSnapshotFacts<'_>,
 ) -> Option<LocalId> {
-    // 候选拒绝[SemanticBarrier:ControlFlow]：break/continue/return/goto 可绕过尾 copy；删除 temp 会改变对应出口的 live-out。
-    // 候选拒绝[ProofIncomplete]：嵌套 loop 被同一 control 检查 blanket 拒绝；需区分内层自有 transfer 并证明其写集合。
+    // 候选拒绝[SemanticBarrier:ControlFlow]：当前 repeat 的 break/continue/return/goto 可绕过尾 copy；删除 temp 会改变对应出口的 live-out。
+    // 内层 loop 的 break/continue 只消费内层控制边，不会绕过外层尾 copy；depth-aware helper
+    // 仅在内层没有 goto/label/cleanup 时放行，避免把非结构化跳转误当作局部 transfer。
     // 候选拒绝[SemanticBarrier:Capture]：捕获 return temp 时，删除其唯一写会让 closure 观察旧值。
     // 候选拒绝[SemanticBarrier:Lifetime]：TBC temp 或非唯一 use/write 仍有额外 epoch/close 观察者。
     // 候选拒绝[LayerBoundary]：debug temp 的源码身份由 locals owner 保留。
@@ -167,42 +168,64 @@ fn value_mentions_temp(value: &HirExpr, temp: crate::hir::common::TempId) -> boo
 }
 
 fn stmt_contains_loop_exit(block: &HirBlock) -> bool {
-    block.stmts.iter().any(stmt_contains_unsafe_control)
+    block
+        .stmts
+        .iter()
+        .any(|stmt| stmt_contains_unsafe_control(stmt, 0))
 }
 
-/// A nested loop can consume `break`/`continue` without leaving the repeat, but it also
-/// introduces another state machine whose writes are not covered by this local two-statement
-/// proof.  Reject the whole nested control subtree; this keeps the rewrite structural instead
-/// of trying to infer path coverage from HIR alone.
-fn stmt_contains_unsafe_control(stmt: &HirStmt) -> bool {
+/// `break`/`continue` are scoped to the innermost loop.  A nested loop therefore cannot bypass
+/// the outer repeat's tail copy; only non-local control and cleanup remain barriers here.
+fn stmt_contains_unsafe_control(stmt: &HirStmt, loop_depth: usize) -> bool {
     match stmt {
-        HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Return(_)
+        HirStmt::Break | HirStmt::Continue if loop_depth == 0 => true,
+        HirStmt::Return(_)
         | HirStmt::Goto(_)
         | HirStmt::Label(_)
         | HirStmt::Close(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::While(_)
-        | HirStmt::Repeat(_)
-        | HirStmt::NumericFor(_)
-        | HirStmt::GenericFor(_) => true,
+        | HirStmt::ToBeClosed(_) => true,
+        HirStmt::Break | HirStmt::Continue => false,
+        HirStmt::While(while_stmt) => while_stmt
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
+        HirStmt::Repeat(repeat_stmt) => repeat_stmt
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
+        HirStmt::NumericFor(numeric_for) => numeric_for
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
+        HirStmt::GenericFor(generic_for) => generic_for
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth + 1)),
         HirStmt::If(if_stmt) => {
-            block_contains_unsafe_control(&if_stmt.then_block)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(block_contains_unsafe_control)
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth))
+                || if_stmt.else_block.as_ref().is_some_and(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth))
+                })
         }
-        HirStmt::Block(block) => block_contains_unsafe_control(block),
+        HirStmt::Block(block) => block
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_unsafe_control(stmt, loop_depth)),
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
         | HirStmt::CallStmt(_) => false,
     }
-}
-
-fn block_contains_unsafe_control(block: &HirBlock) -> bool {
-    block.stmts.iter().any(stmt_contains_unsafe_control)
 }

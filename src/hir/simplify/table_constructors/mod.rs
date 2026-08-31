@@ -664,17 +664,8 @@ impl TableConstructorPass<'_> {
         if set_list.values.tail.is_some() {
             return None;
         }
-        // 候选拒绝[ProofIncomplete]：capture 是 proto 全局事实；相邻 batch 保持 LocalDecl/
-        // seed 时点，不能假设任意后续 capture 都受影响，应改为区间化 provenance。
-        if self
-            .reference_captured_bindings
-            .get(binding)
-            .copied()
-            .unwrap_or_default()
-        {
-            return None;
-        }
-
+        // seed 与 fixed 值仍在原求值点执行，且改写保留 seed binding/root；后续 capture 观察到的
+        // 仍是同一个 table identity，不构成这条窄 direct path 的拒绝理由。
         // Direct origin is a single SSA def (or the corresponding source LocalDecl), and the
         // materialization count above excludes an earlier write.  Do not rescan the whole prefix
         // here; large compiler-generated tables can contain thousands of SETLIST batches.

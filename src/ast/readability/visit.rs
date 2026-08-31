@@ -6,9 +6,7 @@
 //! 更专注在“看到某个节点时记录什么”，而不是重复维护递归。需要保持词法边界的分析
 //! 可以在 `visit_block` 返回 false，裁掉由 scoped walker 另行处理的子 block。
 
-use crate::ast::common::{
-    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
-};
+use crate::ast::common::{AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstStmt};
 
 use super::traverse::BlockKind;
 use crate::ast::traverse::{
@@ -40,10 +38,6 @@ pub(super) trait AstVisitor {
     fn visit_condition_expr(&mut self, expr: &AstExpr) {
         self.visit_expr(expr);
     }
-}
-
-pub(super) fn visit_module(module: &AstModule, visitor: &mut impl AstVisitor) {
-    visit_block_with_kind(&module.body, BlockKind::ModuleBody, visitor);
 }
 
 pub(super) fn visit_block(block: &AstBlock, visitor: &mut impl AstVisitor) {

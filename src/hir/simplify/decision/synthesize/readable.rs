@@ -14,12 +14,11 @@ use super::domain::{
     AbstractValue, collect_literals_from_expr, collect_refs_from_expr, enumerate_environments,
     validate_pure_expr_equivalence,
 };
+use super::normalize_candidate_expr;
 use super::safety::expr_is_synth_safe;
-use super::{MAX_SYNTH_REFS, normalize_candidate_expr};
 
 const MAX_NATURALIZE_OR_TERMS: usize = 16;
 const MAX_NATURALIZE_NESTED_CANDIDATES: usize = 128;
-const MAX_NATURALIZE_ROUNDS: usize = 8;
 
 pub(crate) fn naturalize_pure_logical_expr(
     expr: &HirExpr,
@@ -36,11 +35,6 @@ pub(crate) fn naturalize_pure_logical_expr(
     let mut refs = BTreeSet::new();
     collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
-    // 候选拒绝[ResourceLimit]：穷举域目前只接纳 4 个独立引用；后续应改用符号等价或依赖分区。
-    if refs.len() > MAX_SYNTH_REFS {
-        return None;
-    }
-
     let ref_positions = refs
         .iter()
         .enumerate()
@@ -60,8 +54,9 @@ pub(crate) fn naturalize_pure_logical_expr(
     // 候选拒绝[ResourceLimit]：抽象环境笛卡尔积超过 4096 时停止 naturalize；后续应避免完整枚举。
     let environments = enumerate_environments(refs.len(), &domain)?;
     let mut changed = false;
-    // 候选搜索裁剪[ResourceLimit]：最多 8 轮单调降成本改写；更深机会交给更强的规范形算法。
-    for _ in 0..MAX_NATURALIZE_ROUNDS {
+    // 每次提交都严格降低有限的 expr_cost；因此即使深层候选需要超过八轮，也会在有限步内
+    // 收敛，不需要用任意轮数截断已证明安全的改写。
+    loop {
         let current_cost = super::expr_cost(&current);
         let Some(next) = pure_logical_rewrite_candidates(&current)
             .into_iter()

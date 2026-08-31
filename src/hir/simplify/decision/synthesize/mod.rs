@@ -22,7 +22,6 @@ pub(crate) use value::synthesize_value_decision_expr;
 use crate::hir::common::{HirBinaryExpr, HirExpr, HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind};
 use crate::hir::expr_safety::HirExprSafety;
 
-const MAX_SYNTH_REFS: usize = 4;
 const EXTRA_TRUTHY_SYMBOLS: usize = 2;
 
 fn normalize_candidate_expr(expr: HirExpr, safety: HirExprSafety) -> HirExpr {

@@ -804,8 +804,16 @@ impl InlineSite {
                 is_access_base_inline_expr(replacement) || is_lookup_inline_expr(replacement)
             }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
-            // 候选拒绝[ProofIncomplete]：adjacent-value 尚未细分直接 return/index 的单值与无事件子集。
-            Self::ReturnValue | Self::Index => false,
+            Self::ReturnValue => {
+                // 候选拒绝[LayerBoundary]：直接 return 由 DirectReturnValue/MultiReturnValue/
+                // BooleanReturnValue policy 负责，AdjacentValueSink 不拥有该站点。
+                false
+            }
+            Self::Index => {
+                // 候选拒绝[ProofIncomplete]：index 位置仍缺 base 求值顺序与 key root
+                // lifetime 的联合证明，不能把 call/lookup 结果直接移入索引。
+                false
+            }
         }
     }
 

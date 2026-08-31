@@ -94,6 +94,14 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
         let mut merged_bindings = bindings.to_vec();
         let mut consumed = 0;
         for next_bindings in old_stmts.iter().map_while(empty_local_decl_bindings) {
+            if next_bindings
+                .iter()
+                .any(|binding| binding.origin == AstLocalOrigin::DebugHinted)
+            {
+                // 候选拒绝[SemanticBarrier:DebugScope]：line hook 能在相邻声明间观察
+                // DebugHinted local 的边界，不能把后续声明提前到同一 local list。
+                break;
+            }
             match local_attr_merge_barrier(&merged_bindings, next_bindings) {
                 Some(LocalAttrMergeBarrier::MultipleClose) => {
                     // 候选拒绝[TargetConstraint]：Lua 5.4/5.5 的同一 local list 最多只能声明一个 `<close>` binding。
@@ -182,6 +190,13 @@ fn merge_adjacent_single_value_local_decls(
             index += 1;
             continue;
         };
+        if binding.origin == AstLocalOrigin::DebugHinted {
+            // 候选拒绝[SemanticBarrier:DebugScope]：后续 RHS 求值期间 line hook/元方法可观察
+            // 当前 DebugHinted local；并行声明会把它的作用域起点推迟到整组 RHS 之后。
+            new_stmts.push(stmt);
+            index += 1;
+            continue;
+        }
         if !is_mergeable_adjacent_local_value(value) {
             // 候选拒绝[PolicyBoundary]：相邻声明合并只接受复杂度不超过 4 的 copy-like RHS，避免把阶段性复杂声明压成难读的并行列表。
             new_stmts.push(stmt);
@@ -196,6 +211,11 @@ fn merge_adjacent_single_value_local_decls(
             .get(lookahead - index - 1)
             .and_then(single_value_local_decl)
         {
+            if next_binding.origin == AstLocalOrigin::DebugHinted {
+                // 候选拒绝[SemanticBarrier:DebugScope]：line hook 可在相邻声明间观察
+                // DebugHinted local；并行声明会让该名字提前可见。
+                break;
+            }
             // 这里故意只收“连续复制/lookup”式的 local：
             // 目标是把 `local a = x; local b = y; local c = t[k]` 这类明显属于同一段
             // 源码声明的机械拆分重新压回去，而不是把有阶段语义的复杂 local 都并成一行。

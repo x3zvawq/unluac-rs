@@ -1,4 +1,10 @@
 -- Function-sugar guards must preserve nested global lookup semantics and source identities.
+-- unluac: expect-contains [[plain = function(value)]]
+-- unluac: expect-contains [[method = function]]
+-- unluac: expect-contains [[after = function]]
+-- unluac: expect-not-contains [[prefix_owner.plain = function]]
+-- unluac: expect-not-contains [[function prefix_owner:method()]]
+-- unluac: expect-not-contains [[.after = function]]
 
 self = "global-self"
 
@@ -68,5 +74,39 @@ assert(constructor_result.value == 31)
 assert(kept_callee == identity and kept_arg == constructor_arg)
 assert(caller_has_local("constructor_callee"))
 assert(caller_has_local("constructor_arg"))
+
+local function prefix_constructor_result()
+    local prefix_owner = {}
+    prefix_owner.plain = function(value)
+        return value
+    end
+    function prefix_owner:method()
+        return 1
+    end
+    return prefix_owner:method()
+end
+assert(prefix_constructor_result() == 1)
+
+local function nonterminal_constructor_consumer()
+    local nonterminal_owner = {}
+    nonterminal_owner.after = function(value)
+        return value
+    end
+    local observed = nonterminal_owner.after(1)
+    return observed
+end
+assert(nonterminal_constructor_consumer() == 1)
+
+-- Method provenance is receiver-specific: a plain field with the same name must retain its
+-- explicit first parameter (and debug-visible local identity).
+local provenance_a, provenance_b = {}, {}
+function provenance_a:m()
+    return debug.getlocal(1, 1)
+end
+provenance_b.m = function(x)
+    return debug.getlocal(1, 1)
+end
+assert(provenance_a:m() == "self")
+assert(provenance_b.m(5) == "x")
 
 print("function-sugar-guards", nested_self, constructor_result.value)

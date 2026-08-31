@@ -147,6 +147,9 @@ pub(super) fn try_rebuild_constructor_region(
         } else {
             // 分析停用[ProofIncomplete]：scanner 尚未区分可跨越的无事件语句与真正的
             // 求值/作用域边界；遇到任意未建模 stmt 都结束后缀候选，后续应按 stmt 事件分类。
+            // 例如 `setmetatable(t, mt); t.x = 1` 若跨过前置 CallStmt，会把字段写入移到
+            // 元表安装之前；`if flag then t.x = 1 end` 则会把条件写变成无条件字段。即使
+            // 某个中间语句本身无事件，当前整体 drain 也没有保留其作用域/声明的事务形状。
             break;
         };
         steps.push(boundary_step);
@@ -230,7 +233,9 @@ fn producer_steps(
         }
         // 分析停用[ProofIncomplete]：scanner 尚未区分 harmless assignment 与会移动物理
         // 覆盖点的 producer；后者确有 Lifetime 反例（lua54_01_close#9），但不能据此把
-        // `x = 1` 等全部 assignment 都升级为永久语义屏障。
+        // `x = 1` 等全部 assignment 都升级为永久语义屏障。即使 RHS 是 primitive，
+        // `local x=0; local function get() return x end; x=1; t.v=x; return get()` 也要求
+        // 保留捕获 cell 的写入；还需旧槽值类型、capture/TBC 与后续 use 的完整事实才能放行。
         HirStmt::Assign(_) => None,
         _ => None,
     }

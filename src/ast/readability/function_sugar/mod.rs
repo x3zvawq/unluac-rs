@@ -1,10 +1,10 @@
 //! 函数声明相关的 readability sugar。
 //!
-//! 例如把 `obj.field = function(self, x) ... end` 收回成更接近源码的
-//! `function obj:field(x) ... end`，把 `local f = obj.method; f(obj)` 这类局部 method-alias
-//! 壳收回 `obj:method()`，以及把纯转发的局部函数壳吸收到下一条语句里。
+//! 这里保留 AST 已明确携带的 method 声明边界，并处理 `local f = obj.method; f(obj)` 这类
+//! 局部 method-alias 壳，以及把纯转发的局部函数壳吸收到下一条语句里。普通
+//! `obj.field = function(...) ... end` 的字节码无法证明原始语法是否为 method，因此保持
+//! plain field 形式，避免隐式 `self` 改变调用语义。
 
-mod analysis;
 mod chain;
 mod constructor;
 mod direct;

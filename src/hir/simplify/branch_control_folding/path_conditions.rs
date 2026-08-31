@@ -78,7 +78,6 @@ impl PathFacts {
 struct StableBindingIndex {
     candidates: BTreeSet<StableBinding>,
     unstable: BTreeSet<StableBinding>,
-    candidate_budget_exceeded: bool,
     safety: HirExprSafety,
 }
 
@@ -87,7 +86,6 @@ impl StableBindingIndex {
         let mut index = Self {
             candidates: BTreeSet::new(),
             unstable: BTreeSet::new(),
-            candidate_budget_exceeded: false,
             safety,
         };
         visit_proto(proto, &mut index);
@@ -110,7 +108,9 @@ impl StableBindingIndex {
         if let Some(binding) = stable_binding(expr) {
             if self.candidates.len() == MAX_TRACKED_BINDINGS && !self.candidates.contains(&binding)
             {
-                self.candidate_budget_exceeded = true;
+                // 候选搜索裁剪[ResourceLimit]：超过 256 个独立 binding 时只跳过该 binding，
+                // 保留已有候选的路径事实，避免无关条件让整个 proto 停止专门化。
+                self.unstable.insert(binding);
             } else {
                 self.candidates.insert(binding);
             }
@@ -177,11 +177,6 @@ pub(super) fn specialize_stable_path_conditions(
     safety: HirExprSafety,
 ) -> bool {
     let stable = StableBindingIndex::new(proto, safety);
-    if stable.candidate_budget_exceeded {
-        // 分析停用[ResourceLimit]：单 proto 最多追踪 256 个条件 binding，后续应改为按 block/活跃事实裁剪而非放弃整个 proto。
-        return false;
-    }
-
     let mut changed = false;
     if discard_facts
         .block_boundary(&proto.body)
@@ -550,5 +545,30 @@ fn extend_condition_facts(
                 && extend_condition_facts(facts, &logical.rhs, false, stable)
         }
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TRACKED_BINDINGS, StableBinding, StableBindingIndex};
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{HirExpr, ParamId};
+    use crate::hir::expr_safety::HirExprSafety;
+
+    #[test]
+    fn condition_budget_prunes_only_new_bindings() {
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let mut index = StableBindingIndex {
+            candidates: Default::default(),
+            unstable: Default::default(),
+            safety,
+        };
+        for param in 0..=MAX_TRACKED_BINDINGS {
+            index.track_condition(&HirExpr::ParamRef(ParamId(param)));
+        }
+
+        assert_eq!(index.candidates.len(), MAX_TRACKED_BINDINGS);
+        assert!(index.contains(StableBinding::Param(ParamId(0))));
+        assert!(!index.contains(StableBinding::Param(ParamId(MAX_TRACKED_BINDINGS))));
     }
 }

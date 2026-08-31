@@ -22,11 +22,6 @@ pub(crate) fn synthesize_value_decision_expr(
     }
 
     let refs = collect_refs_from_decision(decision);
-    // 候选拒绝[ResourceLimit]：穷举域目前只接纳 4 个独立引用；后续应改用符号等价或按依赖分区验证。
-    if refs.len() > super::MAX_SYNTH_REFS {
-        return None;
-    }
-
     // 候选拒绝[ResourceLimit]：抽象环境笛卡尔积超过 4096 时停止综合；后续应避免完整枚举。
     let context = SynthesisContext::new(decision, refs, safety)?;
     let mut memo = BTreeMap::new();

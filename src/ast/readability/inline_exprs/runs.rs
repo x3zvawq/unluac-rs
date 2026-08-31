@@ -228,7 +228,8 @@ pub(super) fn collapse_adjacent_call_alias_runs(
         // 单项只接受 method fact 已经冻结后的直接 receiver binding；若迭代器仍引用
         // 待物化 temp，则留到下一轮与整个调用准备包一起收回。
         let allows_single_receiver_alias = collapsed_count == 1
-            && single_generic_for_method_receiver_alias(&old_stmts, index, run_end);
+            && (single_generic_for_method_receiver_alias(&old_stmts, index, run_end)
+                || single_call_callee_alias(&old_stmts, index, run_end));
         if (collapsed_count >= 2 || allows_single_receiver_alias)
             && eval_order::run_preserves_eval_order(
                 &old_stmts,
@@ -250,7 +251,9 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             continue;
         }
 
-        // 候选拒绝[PolicyBoundary]：普通 run 至少收回两项（仅 generic-for method receiver 例外）；候选拒绝[SemanticBarrier:EvalOrder]：移动事件必须仍是 sink 的同序前缀；多值 return 的前置快照/事件会改变可观察顺序（regress_352、regress_353）。
+        // 候选拒绝[PolicyBoundary]：普通 run 至少收回两项（仅 generic-for method receiver
+        // 与单项 terminal call-callee 例外）；候选拒绝[SemanticBarrier:EvalOrder]：移动事件
+        // 必须仍是 sink 的同序前缀；多值 return 的前置快照/事件会改变可观察顺序（regress_352、regress_353）。
 
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
@@ -298,6 +301,74 @@ pub(super) fn single_generic_for_method_receiver_alias(
         && !binding_mentions_in_expr(&generic_for.iterator[0])
             .iter()
             .any(|binding| matches!(binding, AstBindingRef::Temp(_)))
+}
+
+pub(super) fn single_call_callee_alias(
+    stmts: &[AstStmt],
+    run_start: usize,
+    sink_index: usize,
+) -> bool {
+    let Some((candidate, value)) = (sink_index == run_start + 1)
+        .then(|| inline_candidate(&stmts[run_start]))
+        .flatten()
+    else {
+        // 候选拒绝[LayerBoundary]：单项例外只消费紧邻的 local + terminal call 两句。
+        return false;
+    };
+    if candidate.origin() != super::super::super::common::AstLocalOrigin::Recovered
+        || !matches!(value, AstExpr::Call(_) | AstExpr::MethodCall(_))
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：仅 recovered call producer 有 callee 栈槽接管
+        // 证明；其它 origin 或非 call RHS 仍需普通多项 run 证明。
+        return false;
+    }
+    let callee_matches = match &stmts[sink_index] {
+        AstStmt::CallStmt(call_stmt) => {
+            let AstCallKind::Call(call) = &call_stmt.call else {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：method call 的隐式 self/lookup 顺序不属于
+                // 该直接 callee 证明。
+                return false;
+            };
+            let AstExpr::Var(callee) = &call.callee else {
+                // 候选拒绝[ProofIncomplete]：非直接 binding callee 没有唯一 use-site 位置证明。
+                return false;
+            };
+            candidate.binding().matches_name_ref(callee)
+        }
+        AstStmt::GenericFor(generic_for) => {
+            let [AstExpr::Call(call)] = generic_for.iterator.as_slice() else {
+                // 候选拒绝[LayerBoundary]：return/assign/多项 iterator 等 sink 仍由各自
+                // value-width policy 负责。
+                return false;
+            };
+            let AstExpr::Var(callee) = &call.callee else {
+                // 候选拒绝[ProofIncomplete]：非直接 binding callee 没有唯一 loop-header
+                // use-site 位置证明。
+                return false;
+            };
+            candidate.binding().matches_name_ref(callee)
+        }
+        _ => {
+            // 候选拒绝[LayerBoundary]：return/assign 等 sink 仍由各自 value-width policy 负责。
+            return false;
+        }
+    };
+    if !callee_matches {
+        // 候选拒绝[SemanticBarrier:Scope]：callee 必须正是该 local binding，避免误吞其它变量。
+        return false;
+    }
+    if matches!(&stmts[sink_index], AstStmt::CallStmt(_))
+        && !call_stmt_hands_off_root(&stmts[sink_index], candidate.binding())
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：普通调用未证明 callee 槽接管 producer root，
+        // 删除 local 可能让函数值在参数求值前失去唯一强引用。
+        return false;
+    }
+    // callee 位在调用参数之前求值，并在调用帧或 generic-for loop header 中继续持有
+    // producer 结果；结合外层 suffix-use/write、run_preserves_eval_order 与 sink 的
+    // 直接 callee 形状检查，移除 local 只把同一次 call 放回 callee 槽，不复制 producer
+    // 或缩短 root 生命周期。
+    true
 }
 
 pub(super) fn stmt_is_terminal_call_alias_sink(stmt: &AstStmt) -> bool {

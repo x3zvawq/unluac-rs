@@ -18,4 +18,12 @@ end
 local value, index = first_positive({ -2, 0 })
 assert(value == nil)
 assert(index == nil)
+
+local captured_table = { -2, 0 }
+local function read_captured_table()
+    return captured_table[1], captured_table[2]
+end
+assert(read_captured_table() == -2)
+assert(select(2, read_captured_table()) == 0)
+
 print("regress_323_terminal_nil_return_pack", value, index)

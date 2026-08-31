@@ -4,8 +4,6 @@
 //! 真正有闭包依赖的 local function 折叠掉。
 //! 例如：`local f = function() ... end; t.f = f` 会在这里尝试合成 `function t.f() ... end`。
 
-use std::collections::BTreeSet;
-
 use super::super::binding_flow::{BindingUseIndex, count_binding_uses_in_block_deep};
 use super::super::binding_ref::name_matches_binding;
 use super::direct::function_decl_target_from_lvalue;
@@ -19,7 +17,6 @@ pub(super) fn try_lower_forwarded_function_stmt(
     use_index: &BindingUseIndex,
     stmt_base: usize,
     target: AstTargetDialect,
-    method_fields: &BTreeSet<String>,
 ) -> Option<(AstStmt, usize)> {
     let [AstStmt::LocalDecl(local_decl), next, ..] = stmts else {
         return None;
@@ -53,7 +50,7 @@ pub(super) fn try_lower_forwarded_function_stmt(
         return None;
     }
     let function = function.as_ref().clone();
-    let stmt = inline_function_into_stmt(next, binding, function, target, method_fields)?;
+    let stmt = inline_function_into_stmt(next, binding, function, target)?;
     Some((stmt, 2))
 }
 
@@ -62,7 +59,6 @@ fn inline_function_into_stmt(
     binding: AstBindingRef,
     function: AstFunctionExpr,
     target: AstTargetDialect,
-    method_fields: &BTreeSet<String>,
 ) -> Option<AstStmt> {
     match stmt {
         AstStmt::GlobalDecl(global_decl)
@@ -101,7 +97,7 @@ fn inline_function_into_stmt(
                 return None;
             }
             if let Some((target_name, function)) =
-                function_decl_target_from_lvalue(&assign.targets[0], &function, method_fields)
+                function_decl_target_from_lvalue(&assign.targets[0], &function)
             {
                 return Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
                     target: target_name,

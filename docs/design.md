@@ -67,12 +67,13 @@ bytecode lowering 留下的机械形状。候选一旦形成，拒绝改写就�
 | `ConvergenceGuard` | fixed-point 不收敛或内部不变量保护 | 属于实现正确性错误，不是候选不等价证明 |
 
 拒绝 guard 之外还必须审计候选的接受证明。若 pass 会提交改写，但所依赖的语义模型、
-provenance 或 plan/apply 不变量已知不成立，必须在提交点前写一行 `证明缺陷[...]`，不能把它
-记成 `ProofIncomplete`（后者表示拒绝了尚未证明的候选）：
+provenance 或 plan/apply 不变量尚未完整证明或已知不成立，必须在提交点前写一行
+`证明缺陷[...]`，不能把它记成 `ProofIncomplete`（后者表示拒绝了尚未证明的候选）：
 
 | 分类 | 含义 | 长期处理 |
 | --- | --- | --- |
 | `PotentialUnsoundness:<subtype>` | 已有最小反例或明确的错误模型，表明当前接受路径可能生成运行语义不等价源码 | 优先修复或收紧接受条件，并补回归 case；修复前不得宣称该 pass 已精确证明 |
+| `AcceptanceProofIncomplete:<subtype>` | 接受路径仍缺少完整的语义事实，但当前没有具体不等价反例或足以确认错误的模型 | 必须补齐事实或停用该接受路径；只能用于区分待证明项，不能把它描述成已知不等价或已完成审计 |
 | `PotentialPolicyViolation` | 接受路径会删除 debug/source identity 等项目明确保留的证据，但尚无运行语义反例 | 补齐 origin/identity gate 或明确修改项目策略 |
 | `InvariantMismatch` | candidate plan 与 apply/rewrite 阶段的形状假设可能漂移，失败时仍提交部分删除 | 改为校验失败不提交，或用 assert/fail-fast 固化内部不变量 |
 

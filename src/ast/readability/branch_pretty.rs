@@ -35,9 +35,9 @@ impl AstRewritePass for BranchPrettyPass {
         let mut flattened_stmts = Vec::with_capacity(old_stmts.len());
         let mut changed = false;
         for stmt in old_stmts {
-            // `fold_constant_if` deliberately refuses protected arms.  Do not pass such a
-            // constant if to the older terminating-if rewrite, which could otherwise consume
-            // the same shell through a different path before the next fixed-point round.
+            // 候选拒绝[ConvergenceGuard/LayerBoundary]：`fold_constant_if` deliberately refuses
+            // protected arms；不要把该 constant-if 交给旧 terminating-if rewrite，否则同一
+            // shell 可能沿另一条 owner 路径被消费，直到下一轮 fixed-point 才暴露归属漂移。
             if let AstStmt::If(if_stmt) = &stmt
                 && matches!(if_stmt.cond, AstExpr::Boolean(_))
                 && constant_if_has_protected_nodes(if_stmt)
