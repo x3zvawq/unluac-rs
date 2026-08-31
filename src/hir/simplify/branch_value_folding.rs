@@ -153,14 +153,16 @@ fn nil_fallback_decision_rewrite(stmt: &HirStmt) -> Option<NilFallbackDecisionRe
         return None;
     };
     // 候选拒绝[SemanticBarrier:ValueArity]：fixed Decision 后仍有 tail 时，改写成单值 local 会丢失 tail 的值宽度。
-    // 候选拒绝[ConvergenceGuard]：单节点 Decision 的 entry 必须为 0；否则是 HIR node index 不变量损坏。
     // 候选拒绝[ProofIncomplete]：多节点 nil Decision 尚未证明可物化成单个无 else fallback；应消费完整 Decision 路径事实。
-    if local_decl.values.tail.is_some() || decision.entry.index() != 0 || decision.nodes.len() != 1
-    {
+    if local_decl.values.tail.is_some() || decision.nodes.len() != 1 {
         return None;
     }
-    // 候选拒绝[ConvergenceGuard]：上方已证明 nodes.len()==1；取不到首节点表示 Decision 容器不变量损坏。
-    let node = decision.nodes.first()?;
+    assert_eq!(
+        decision.entry.index(),
+        0,
+        "single-node HIR Decision entry must reference its only node"
+    );
+    let node = &decision.nodes[0];
     let source = nil_check_local(&node.test)?;
     let (fallback, source_target) = match (&node.truthy, &node.falsy) {
         (
@@ -743,17 +745,13 @@ fn direct_goto_value_matches(
     if has_non_empty_else(if_stmt) {
         return false;
     }
-    let Some((fallback_target, fallback_value)) = single_assign(fallback_stmt) else {
+    let HirStmt::Assign(fallback_assign) = fallback_stmt else {
         return false;
     };
-    // 候选拒绝[ProofIncomplete]：direct 改写并不复制 fallback，但仍沿用只准简单 target/value 的保守白名单；应按语句原样搬移事实放宽。
-    if !target_allows_default_duplication(fallback_target)
-        || !is_branch_default_value_expr(fallback_value)
-    {
-        return false;
-    }
-    terminal_goto_assign_target(&if_stmt.then_block, label)
-        .is_some_and(|success_target| success_target == fallback_target)
+    // Direct fold 只把 fallback 原样移入唯一 false arm；targets 相同即可，RHS 与
+    // value-pack 的求值/宽度都留在原 assignment 内，不需要 nested 复制白名单。
+    terminal_goto_assign(&if_stmt.then_block, label)
+        .is_some_and(|success_assign| success_assign.targets == fallback_assign.targets)
 }
 
 fn nested_default_goto_value_matches(
@@ -849,13 +847,7 @@ fn has_non_empty_else(if_stmt: &HirIf) -> bool {
 }
 
 fn terminal_goto_assign_target(block: &HirBlock, label: HirLabelId) -> Option<&HirLValue> {
-    let [.., HirStmt::Assign(assign), HirStmt::Goto(goto)] = block.stmts.as_slice() else {
-        return None;
-    };
-    if goto.target != label {
-        return None;
-    }
-    // 候选拒绝[ProofIncomplete]：整条 assignment 会原样搬移，当前仅接受单 target/单 fixed value；需证明一般 value-pack 的赋值宽度也不受位置变化影响。
+    let assign = terminal_goto_assign(block, label)?;
     let [target] = assign.targets.as_slice() else {
         return None;
     };
@@ -868,6 +860,16 @@ fn terminal_goto_assign_target(block: &HirBlock, label: HirLabelId) -> Option<&H
     Some(target)
 }
 
+fn terminal_goto_assign(block: &HirBlock, label: HirLabelId) -> Option<&HirAssign> {
+    let [.., HirStmt::Assign(assign), HirStmt::Goto(goto)] = block.stmts.as_slice() else {
+        return None;
+    };
+    if goto.target != label {
+        return None;
+    }
+    Some(assign)
+}
+
 fn label_ref_count(label_refs: &BTreeMap<HirLabelId, usize>, label: HirLabelId) -> usize {
     label_refs.get(&label).copied().unwrap_or(0)
 }
@@ -876,7 +878,6 @@ fn single_assign(stmt: &HirStmt) -> Option<(&HirLValue, &HirExpr)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
-    // 候选拒绝[ProofIncomplete]：goto 壳改写搬移完整 fallback statement，当前 extractor 对多 target/value-pack 的限制尚未由语义反例支持。
     let [target] = assign.targets.as_slice() else {
         return None;
     };

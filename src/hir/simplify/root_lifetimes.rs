@@ -1,6 +1,9 @@
 //! 这个文件识别普通 HIR 值活跃性看不到的物理槽 root 生命周期。
 //!
-//! fixed call result 即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当 VM GC root。
+//! fixed call result、已逃逸 table allocation，以及已跨显式 GC 的 lookup result，即使没有
+//! HIR 读取，也会在同一 stack home 被覆盖前继续充当 VM GC root。copy 共享值 identity，
+//! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
+//! 消费者只能把 producer 与同 home 的精确覆盖配对。
 //! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
 //! 或 cleanup 边界时才允许穿过。消费者可以保留已配对的两次 materialization，也可以在
 //! 更窄的改写仍保持同一覆盖事务时，连同 owner 已证明的 physical home 一起消费该 pair。
@@ -21,6 +24,17 @@ struct ActiveCallRoot {
     observed: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct LookupValueId(usize);
+
+struct ActiveLookupGcHome {
+    value_id: LookupValueId,
+    root_index: usize,
+    aliases: BTreeSet<TempId>,
+    eligible: bool,
+    crossed_gc_fence: bool,
+}
+
 struct ActiveAllocationRoot {
     root_index: usize,
     aliases: BTreeSet<TempId>,
@@ -33,12 +47,24 @@ struct ActiveAllocationRoot {
 #[derive(Default)]
 pub(super) struct CallRootLifetimeIndices {
     roots: BTreeSet<usize>,
-    root_by_overwrite: BTreeMap<usize, CallRootOverwritePair>,
+    roots_by_overwrite: BTreeMap<usize, Vec<CallRootOverwritePair>>,
     root_by_protected: BTreeMap<usize, usize>,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct CallRootOverwritePair {
+    root_index: usize,
+    home: HomeSlotKey,
+}
+
+#[derive(Default)]
+pub(super) struct LookupGcRootLifetimeIndices {
+    roots: BTreeSet<usize>,
+    roots_by_overwrite: BTreeMap<usize, Vec<LookupGcRootOverwritePair>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LookupGcRootOverwritePair {
     root_index: usize,
     home: HomeSlotKey,
 }
@@ -58,13 +84,34 @@ impl CallRootLifetimeIndices {
         self.roots.contains(&index)
     }
 
-    pub(super) fn root_for_overwrite(&self, index: usize) -> Option<usize> {
-        self.overwrite_pair(index)
-            .map(CallRootOverwritePair::root_index)
+    pub(super) fn overwrite_pair_for_home(
+        &self,
+        index: usize,
+        home: HomeSlotKey,
+    ) -> Option<CallRootOverwritePair> {
+        self.roots_by_overwrite
+            .get(&index)?
+            .iter()
+            .find(|pair| pair.home == home)
+            .copied()
     }
 
-    pub(super) fn overwrite_pair(&self, index: usize) -> Option<CallRootOverwritePair> {
-        self.root_by_overwrite.get(&index).copied()
+    pub(super) fn overwrite_pairs(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = CallRootOverwritePair> + '_ {
+        self.roots_by_overwrite
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+
+    pub(super) fn unambiguous_root_for_overwrite(&self, index: usize) -> Option<usize> {
+        let [pair] = self.roots_by_overwrite.get(&index)?.as_slice() else {
+            return None;
+        };
+        Some(pair.root_index)
     }
 
     pub(super) fn root_for_protected(&self, index: usize) -> Option<usize> {
@@ -73,10 +120,55 @@ impl CallRootLifetimeIndices {
 
     pub(super) fn marked_stmts(&self, stmt_count: usize) -> Vec<bool> {
         let mut marked = vec![false; stmt_count];
-        for index in self.roots.iter().chain(self.root_by_overwrite.keys()) {
+        for index in self.roots.iter().chain(self.roots_by_overwrite.keys()) {
             marked[*index] = true;
         }
         marked
+    }
+}
+
+impl LookupGcRootLifetimeIndices {
+    pub(super) fn is_root(&self, index: usize) -> bool {
+        self.roots.contains(&index)
+    }
+
+    pub(super) fn overwrite_pair_for_home(
+        &self,
+        index: usize,
+        home: HomeSlotKey,
+    ) -> Option<LookupGcRootOverwritePair> {
+        self.roots_by_overwrite
+            .get(&index)?
+            .iter()
+            .find(|pair| pair.home == home)
+            .copied()
+    }
+
+    pub(super) fn overwrite_pairs(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = LookupGcRootOverwritePair> + '_ {
+        self.roots_by_overwrite
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+
+    pub(super) fn mark_stmts(&self, marked: &mut [bool]) {
+        for index in self.roots.iter().chain(self.roots_by_overwrite.keys()) {
+            marked[*index] = true;
+        }
+    }
+}
+
+impl LookupGcRootOverwritePair {
+    pub(super) fn root_index(self) -> usize {
+        self.root_index
+    }
+
+    pub(super) fn home(self) -> HomeSlotKey {
+        self.home
     }
 }
 
@@ -88,6 +180,9 @@ pub(super) fn collect_call_root_lifetimes(
     let uses = TempUseEvents::new(stmts);
     let mut active = BTreeMap::<HomeSlotKey, ActiveCallRoot>::new();
     let mut active_allocations = Vec::<ActiveAllocationRoot>::new();
+    // Lua 编译器会用 literal nil 的纯 temp copy 清除同 home 的 allocation root；只沿这条
+    // 无副作用链传播 nil 事实，其余写入必须先让旧事实失效。
+    let mut known_nil_temps = BTreeSet::<TempId>::new();
     let mut lifetimes = CallRootLifetimeIndices::default();
 
     for (index, stmt) in stmts.iter().enumerate() {
@@ -127,6 +222,40 @@ pub(super) fn collect_call_root_lifetimes(
                 .any(|alias| escaped_temps.contains(alias));
         }
         let Some((temp, value)) = scalar_temp_definition(stmt) else {
+            forget_written_known_nil_temps(stmt, &mut known_nil_temps);
+            if let Some(overwrites) =
+                exact_multi_nil_temp_overwrites(stmt, facts, &mut temp_is_eligible)
+            {
+                for (temp, home, eligible) in overwrites {
+                    known_nil_temps.insert(temp);
+                    if let Some(root) = active.remove(&home) {
+                        record_call_root_overwrite(
+                            root,
+                            index,
+                            home,
+                            eligible,
+                            &uses,
+                            &mut lifetimes,
+                        );
+                    }
+                    let mut allocation_state = AllocationRootState {
+                        active: &mut active_allocations,
+                        lifetimes: &mut lifetimes,
+                        uses: &uses,
+                        facts,
+                    };
+                    update_allocation_roots(
+                        &mut allocation_state,
+                        index,
+                        temp,
+                        &HirExpr::Nil,
+                        true,
+                        home,
+                        eligible,
+                    );
+                }
+                continue;
+            }
             if let Some((home, eligible)) =
                 definite_branch_temp_home_overwrite(stmt, facts, &mut temp_is_eligible)
             {
@@ -153,6 +282,12 @@ pub(super) fn collect_call_root_lifetimes(
             }
             continue;
         };
+        let value_is_known_nil = matches!(value, HirExpr::Nil)
+            || matches!(value, HirExpr::TempRef(source) if known_nil_temps.contains(source));
+        known_nil_temps.remove(&temp);
+        if value_is_known_nil {
+            known_nil_temps.insert(temp);
+        }
         let Some(slot) = facts.trusted_temp_home_slot(temp) else {
             active.clear();
             active_allocations.clear();
@@ -166,7 +301,15 @@ pub(super) fn collect_call_root_lifetimes(
             uses: &uses,
             facts,
         };
-        update_allocation_roots(&mut allocation_state, index, temp, value, slot, eligible);
+        update_allocation_roots(
+            &mut allocation_state,
+            index,
+            temp,
+            value,
+            value_is_known_nil,
+            slot,
+            eligible,
+        );
         let same_value_in_target_home = matches!(value, HirExpr::TempRef(source)
             if active
                 .get(&slot)
@@ -236,6 +379,227 @@ pub(super) fn collect_call_root_lifetimes(
     }
 
     lifetimes
+}
+
+/// 只识别已经跨过显式 `collectgarbage` 的 lookup 物理 root。
+///
+/// Call 的观察、allocation owner 与相邻 overwrite 合同保持在既有 collector 中；这里不把
+/// 普通 lookup 一概提升为 source local。标量与无求值 multi-nil 只按同 home 精确配对；
+/// 无 overwrite 的 block-end 路径仍有下方标出的终止事实缺陷，不能视为已完成证明。
+pub(super) fn collect_lookup_gc_root_lifetimes(
+    stmts: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+    mut temp_is_eligible: impl FnMut(TempId) -> bool,
+) -> LookupGcRootLifetimeIndices {
+    let uses = TempUseEvents::new(stmts);
+    if uses.gc_fence_indices.is_empty() {
+        return LookupGcRootLifetimeIndices::default();
+    }
+    let mut active = BTreeMap::<HomeSlotKey, ActiveLookupGcHome>::new();
+    let mut value_by_temp = BTreeMap::<TempId, LookupValueId>::new();
+    let mut next_value_id = 0;
+    let mut lifetimes = LookupGcRootLifetimeIndices::default();
+
+    for (index, stmt) in stmts.iter().enumerate() {
+        if uses.is_gc_fence(index) {
+            for root in active.values_mut() {
+                root.crossed_gc_fence = true;
+            }
+        }
+
+        let Some((temp, value)) = scalar_temp_definition(stmt) else {
+            if matches!(stmt, HirStmt::Return(_)) {
+                preserve_lookup_roots_to_scope_end(&active, &mut lifetimes);
+                active.clear();
+                value_by_temp.clear();
+                continue;
+            }
+            if let Some(overwrites) =
+                exact_multi_nil_temp_overwrites(stmt, facts, &mut temp_is_eligible)
+            {
+                for (temp, _, _) in &overwrites {
+                    value_by_temp.remove(temp);
+                    for root in active.values_mut() {
+                        root.aliases.remove(temp);
+                    }
+                }
+                for (_, home, eligible) in overwrites {
+                    if let Some(root) = active.remove(&home) {
+                        for alias in &root.aliases {
+                            value_by_temp.remove(alias);
+                        }
+                        record_lookup_root_overwrite(
+                            root,
+                            index,
+                            home,
+                            eligible,
+                            &uses,
+                            facts,
+                            &mut lifetimes,
+                        );
+                    }
+                }
+                continue;
+            }
+            // 分析停用[ProofIncomplete]：一般 parallel assignment 缺少各 RHS 求值与物理 target 提交顺序事实；当前只配对无 tail、全 trusted temp、RHS 全 nil 的无求值形状。
+            let writes = StackWriteSummary::for_stmt(stmt, facts);
+            if writes.has_boundary || writes.has_unknown_home {
+                active.clear();
+                value_by_temp.clear();
+            } else {
+                active.retain(|home, _| !writes.homes.contains(home));
+                value_by_temp.retain(|temp, _| {
+                    facts
+                        .trusted_temp_home_slot(*temp)
+                        .is_none_or(|home| !writes.homes.contains(&home))
+                });
+            }
+            continue;
+        };
+        let Some(home) = facts.trusted_temp_home_slot(temp) else {
+            active.clear();
+            value_by_temp.clear();
+            continue;
+        };
+        let eligible = temp_is_eligible(temp);
+        let incoming_value = match value {
+            HirExpr::TableAccess(_) => {
+                let value_id = LookupValueId(next_value_id);
+                next_value_id += 1;
+                Some(value_id)
+            }
+            HirExpr::TempRef(source) => value_by_temp.get(source).copied(),
+            _ => None,
+        };
+        let continues_same_home = incoming_value.is_some_and(|value_id| {
+            active
+                .get(&home)
+                .is_some_and(|root| root.value_id == value_id)
+        });
+        for root in active.values_mut() {
+            root.aliases.remove(&temp);
+        }
+        value_by_temp.remove(&temp);
+
+        if continues_same_home {
+            let root = active
+                .get_mut(&home)
+                .expect("same-home active lookup root must exist");
+            root.aliases.insert(temp);
+            root.eligible &= eligible;
+            value_by_temp.insert(temp, root.value_id);
+            continue;
+        }
+
+        if let Some(root) = active.remove(&home) {
+            for alias in &root.aliases {
+                value_by_temp.remove(alias);
+            }
+            record_lookup_root_overwrite(root, index, home, eligible, &uses, facts, &mut lifetimes);
+        }
+
+        if let Some(value_id) = incoming_value {
+            value_by_temp.insert(temp, value_id);
+            active.insert(
+                home,
+                ActiveLookupGcHome {
+                    value_id,
+                    root_index: index,
+                    aliases: BTreeSet::from([temp]),
+                    eligible,
+                    crossed_gc_fence: false,
+                },
+            );
+        }
+    }
+
+    preserve_lookup_roots_to_scope_end(&active, &mut lifetimes);
+    lifetimes
+}
+
+fn record_lookup_root_overwrite(
+    root: ActiveLookupGcHome,
+    index: usize,
+    home: HomeSlotKey,
+    overwrite_is_eligible: bool,
+    uses: &TempUseEvents,
+    facts: &ProtoPromotionFacts,
+    lifetimes: &mut LookupGcRootLifetimeIndices,
+) {
+    if root.crossed_gc_fence
+        && root.eligible
+        && overwrite_is_eligible
+        && !root
+            .aliases
+            .iter()
+            .filter(|alias| facts.trusted_temp_home_slot(**alias) == Some(home))
+            .any(|alias| uses.has_live_read_after(*alias, index))
+    {
+        lifetimes.roots.insert(root.root_index);
+        lifetimes
+            .roots_by_overwrite
+            .entry(index)
+            .or_default()
+            .push(LookupGcRootOverwritePair {
+                root_index: root.root_index,
+                home,
+            });
+    }
+}
+
+fn preserve_lookup_roots_to_scope_end(
+    active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
+    lifetimes: &mut LookupGcRootLifetimeIndices,
+) {
+    // 证明缺陷[PotentialUnsoundness:Lifetime]：普通 child block 末尾没有 stack-top/跨块 overwrite 事实；当前把它当 VM root 终点，物化后的词法生命周期可能早于或晚于真实 home 终点。
+    lifetimes.roots.extend(
+        active
+            .values()
+            .filter(|root| root.eligible && root.crossed_gc_fence)
+            .map(|root| root.root_index),
+    );
+}
+
+fn exact_multi_nil_temp_overwrites(
+    stmt: &HirStmt,
+    facts: &ProtoPromotionFacts,
+    temp_is_eligible: &mut impl FnMut(TempId) -> bool,
+) -> Option<Vec<(TempId, HomeSlotKey, bool)>> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    if assign.targets.len() < 2
+        || assign.targets.len() != assign.values.fixed.len()
+        || assign.values.tail.is_some()
+        || !assign
+            .values
+            .fixed
+            .iter()
+            .all(|value| matches!(value, HirExpr::Nil))
+    {
+        return None;
+    }
+    let overwrites = assign
+        .targets
+        .iter()
+        .map(|target| {
+            let HirLValue::Temp(temp) = target else {
+                return None;
+            };
+            Some((
+                *temp,
+                facts.trusted_temp_home_slot(*temp)?,
+                temp_is_eligible(*temp),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // 候选拒绝[ProofIncomplete]：同一 parallel assignment 的多个 SSA target 若映射到同一
+    // home，仅凭 home pair 无法证明应由哪个 target 承接物理 root overwrite。
+    let unique_homes = overwrites
+        .iter()
+        .map(|(_, home, _)| *home)
+        .collect::<BTreeSet<_>>();
+    (unique_homes.len() == overwrites.len()).then_some(overwrites)
 }
 
 fn definite_branch_temp_home_overwrite(
@@ -316,13 +680,14 @@ fn record_call_root_overwrite(
             .any(|alias| uses.has_live_read_after(*alias, index))
     {
         lifetimes.roots.insert(root.root_index);
-        lifetimes.root_by_overwrite.insert(
-            index,
-            CallRootOverwritePair {
+        lifetimes
+            .roots_by_overwrite
+            .entry(index)
+            .or_default()
+            .push(CallRootOverwritePair {
                 root_index: root.root_index,
                 home,
-            },
-        );
+            });
     }
 }
 
@@ -488,6 +853,14 @@ impl HirVisitor for TempWriteCollector {
     }
 }
 
+fn forget_written_known_nil_temps(stmt: &HirStmt, known_nil_temps: &mut BTreeSet<TempId>) {
+    let mut collector = TempWriteCollector::default();
+    visit_stmts(std::slice::from_ref(stmt), &mut collector);
+    for temp in collector.temps {
+        known_nil_temps.remove(&temp);
+    }
+}
+
 fn scalar_temp_definition(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
@@ -535,6 +908,7 @@ fn update_allocation_roots(
     index: usize,
     temp: TempId,
     value: &HirExpr,
+    value_is_known_nil: bool,
     slot: HomeSlotKey,
     eligible: bool,
 ) {
@@ -559,7 +933,7 @@ fn update_allocation_roots(
 
         root.aliases.remove(&temp);
         if root.homes.remove(&slot) {
-            if matches!(value, HirExpr::Nil)
+            if value_is_known_nil
                 && root.escaped
                 && root.eligible
                 && eligible
@@ -578,13 +952,15 @@ fn update_allocation_roots(
                         .root_by_protected
                         .insert(*def_index, root.root_index);
                 }
-                state.lifetimes.root_by_overwrite.insert(
-                    index,
-                    CallRootOverwritePair {
+                state
+                    .lifetimes
+                    .roots_by_overwrite
+                    .entry(index)
+                    .or_default()
+                    .push(CallRootOverwritePair {
                         root_index: root.root_index,
                         home: slot,
-                    },
-                );
+                    });
             }
             root.aliases.retain(|alias| {
                 state

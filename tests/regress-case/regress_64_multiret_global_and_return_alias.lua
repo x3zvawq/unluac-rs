@@ -4,9 +4,7 @@
 -- unluac: expect-contains [[ymax = r1_3]]
 -- unluac: expect-contains [[xmin = r1_0]]
 -- unluac: expect-contains [[local r2_4 = math.abs(r2_2 - r2_0)]]
--- unluac: expect-contains [[local r2_5 = math.abs(r2_3 - r2_1)]]
--- unluac: expect-contains [[return r2_4, r2_5]]
--- unluac: expect-not-contains [[return r2_4, (r2_5(]]
+-- unluac: expect-contains [[return r2_4, (math.abs(r2_3 - r2_1))]]
 -- unluac: expect-not-contains [[unluac error]]
 
 local function circle(self, x, y, radius)

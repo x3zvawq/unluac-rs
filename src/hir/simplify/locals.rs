@@ -50,7 +50,9 @@ use std::{
 use super::mention::{
     stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
 };
-use super::root_lifetimes::{collect_call_root_lifetimes, collect_gc_fence_indices};
+use super::root_lifetimes::{
+    collect_call_root_lifetimes, collect_gc_fence_indices, collect_lookup_gc_root_lifetimes,
+};
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
     collect_temp_refs_in_expr, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
@@ -309,7 +311,7 @@ fn promote_block_with_protection(
     current_plan_protected_temps: &BTreeSet<TempId>,
     descendant_protected_temps: &BTreeSet<TempId>,
 ) -> PromotionResult {
-    record_gc_fenced_local_roots(block, ctx.physical_root_locals);
+    record_gc_fenced_call_roots(block, ctx.physical_root_locals);
 
     // 每轮控制头等 block 外消费者先保护当前 block；递归进入子作用域时再叠加当前语句
     // 之后的引用。tracker 用引用计数维护后缀集合，避免按 index 克隆完整集合。
@@ -431,13 +433,13 @@ fn promote_block_with_protection(
     }
 }
 
-fn record_gc_fenced_local_roots(block: &HirBlock, roots: &mut BTreeSet<LocalId>) {
+fn record_gc_fenced_call_roots(block: &HirBlock, roots: &mut BTreeSet<LocalId>) {
     let mut active = BTreeSet::new();
     let fences = collect_gc_fence_indices(&block.stmts);
     for (index, stmt) in block.stmts.iter().enumerate() {
         if fences.contains(&index) {
-            // Binding liveness may end after an earlier read, but the VM slot remains a root
-            // until overwritten or until the lexical scope ends.
+            // Call local 的普通读取已结束时，fixed result 仍在原 VM home 里充当 root；lookup
+            // 必须由 per-home overwrite collector 提供事实，不能在 fixed point 中 blanket 标记。
             roots.extend(active.iter().copied());
         }
 
@@ -502,11 +504,19 @@ fn collect_plans(
                 .get(temp.index())
                 .is_none_or(Option::is_none)
     });
+    let lookup_gc_root_lifetimes = collect_lookup_gc_root_lifetimes(&block.stmts, facts, |temp| {
+        !ctx.identity_sensitive_temps.contains(&temp)
+            && !inherited.contains_key(&temp)
+            && !outer_uses_temp(temp)
+            && temp_debug_locals
+                .get(temp.index())
+                .is_none_or(Option::is_none)
+    });
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
     let mut sticky_slots = inherited_sticky_slots.clone();
-    let mut call_root_locals = BTreeMap::<usize, LocalId>::new();
+    let mut physical_root_locals = BTreeMap::<usize, LocalId>::new();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
             activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
@@ -514,6 +524,62 @@ fn collect_plans(
         }
 
         activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+
+        let has_parallel_targets =
+            matches!(stmt, HirStmt::Assign(assign) if assign.targets.len() > 1);
+        let physical_root_pairs = call_root_lifetimes
+            .overwrite_pairs(decl_index)
+            .filter(|_| has_parallel_targets)
+            .map(|pair| (pair.root_index(), pair.home()))
+            .chain(
+                lookup_gc_root_lifetimes
+                    .overwrite_pairs(decl_index)
+                    .map(|pair| (pair.root_index(), pair.home())),
+            )
+            .collect::<Vec<_>>();
+        let physical_root_handoffs = physical_root_pairs
+            .iter()
+            .map(|(root_index, home)| {
+                let local = physical_root_locals.get(root_index).copied().unwrap_or_else(|| {
+                    panic!(
+                        "physical root producer {root_index} must be promoted before overwrite {decl_index} for home {home:?}"
+                    )
+                });
+                let temp = temp_assign_target_for_home(stmt, facts, *home).unwrap_or_else(|| {
+                    panic!(
+                        "physical root overwrite {decl_index} must retain a target for home {home:?} (producer {root_index})"
+                    )
+                });
+                (temp, *home, local)
+            })
+            .collect::<Vec<_>>();
+        // 多 home overwrite 必须整条语句一起提交；任一 producer/target 无法对应时，不能只
+        // 改写部分 target，留下一半仍写 temp、一半已写 local 的物理生命周期。
+        for (temp, home, local) in physical_root_handoffs {
+            let mut allocator = PlanAllocator {
+                temp_debug_locals,
+                temp_debug_scopes,
+                plans: &mut plans,
+                reserved_temps: &mut reserved_temps,
+                reserved_alias_indices: &mut reserved_alias_indices,
+                next_local_index: ctx.next_local_index,
+                new_locals: ctx.new_locals,
+                new_local_debug_hints: ctx.new_local_debug_hints,
+                promoted_bindings: ctx.promoted_bindings,
+                direct_seed_promotions: ctx.direct_seed_promotions,
+                debug_scope_locals: ctx.debug_scope_locals,
+            };
+            // 原 scalar/parallel nil 语句继续留在原位；这里只把已证明 home 的 target
+            // 映射到既有 root local，不重新求值 RHS。
+            allocator.reuse_existing_local(
+                decl_index,
+                local,
+                Some(home),
+                BTreeSet::from([temp]),
+                BTreeSet::new(),
+                PromotionInit::Empty,
+            );
+        }
 
         let Some(root_temp) = simple_temp_assign_target(stmt) else {
             continue;
@@ -570,16 +636,24 @@ fn collect_plans(
             debug_scope_for_temp_group(temp_debug_scopes, &group)
                 .and_then(|scope| ctx.debug_scope_locals.get(&(slot, scope)).copied())
         });
-        let preceding_call_root = call_root_lifetimes
-            .root_for_overwrite(decl_index)
+        let preceding_lookup_root = home_slot
+            .and_then(|home| lookup_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
+            .map(|pair| pair.root_index());
+        let preceding_call_root = home_slot
+            .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))
+            .map(|pair| pair.root_index())
+            .or_else(|| call_root_lifetimes.unambiguous_root_for_overwrite(decl_index));
+        let preceding_physical_root = preceding_call_root
+            .or(preceding_lookup_root)
             .or_else(|| call_root_lifetimes.root_for_protected(decl_index));
-        let preceding_call_root_local =
-            preceding_call_root.and_then(|root| call_root_locals.get(&root).copied());
-        let force_call_root_local =
-            call_root_lifetimes.is_root(decl_index) || preceding_call_root_local.is_some();
+        let preceding_physical_root_local =
+            preceding_physical_root.and_then(|root| physical_root_locals.get(&root).copied());
+        let force_physical_root_local = call_root_lifetimes.is_root(decl_index)
+            || lookup_gc_root_lifetimes.is_root(decl_index)
+            || preceding_physical_root_local.is_some();
         let reusable_local = sticky_local
             .or(debug_local)
-            .or(preceding_call_root_local)
+            .or(preceding_physical_root_local)
             .or_else(|| {
                 ctx.compact_home_slots
                     .then(|| home_slot.and_then(|slot| slot_candidates.get(&slot).copied()))
@@ -587,7 +661,7 @@ fn collect_plans(
             });
 
         if sticky_local.is_none()
-            && !force_call_root_local
+            && !force_physical_root_local
             && touching_stmt_indices.is_empty()
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
         {
@@ -595,16 +669,16 @@ fn collect_plans(
             continue;
         }
         if sticky_local.is_none()
-            && !force_call_root_local
+            && !force_physical_root_local
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
             && std::iter::once(decl_index)
                 .chain(touching_stmt_indices.iter().copied())
                 .all(|index| stmt_temp_reads[index].is_disjoint(&group))
         {
-            // 候选拒绝[LayerBoundary]：只有写 touch、没有表达式读取且无 debug/capture/call-root 身份的链交给 dead-temps 清理。
+            // 候选拒绝[LayerBoundary]：只有写 touch、没有表达式读取且无 debug/capture/physical-root 身份的链交给 dead-temps 清理。
             continue;
         }
-        if sticky_local.is_none() && !force_call_root_local {
+        if sticky_local.is_none() && !force_physical_root_local {
             let first_touch_index = touching_stmt_indices.first().copied();
             // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
             // 只有一次后续消费的全局别名或字符串常量，必须结合消费站点判定：
@@ -683,9 +757,9 @@ fn collect_plans(
             }
             local
         };
-        if call_root_lifetimes.is_root(decl_index) {
-            call_root_locals.insert(decl_index, selected_local);
-            // This local must stay dedicated to the call result until its proven physical
+        if call_root_lifetimes.is_root(decl_index) || lookup_gc_root_lifetimes.is_root(decl_index) {
+            physical_root_locals.insert(decl_index, selected_local);
+            // This local must stay dedicated to the root result until its proven physical
             // overwrite partner reuses it. Home-slot compaction may otherwise lend the same
             // source local to a simultaneously-live value before that overwrite occurs.
             slot_candidates.retain(|_, candidate| *candidate != selected_local);
@@ -695,14 +769,21 @@ fn collect_plans(
     // The AST cleanup pass cannot infer physical-slot lifetime from ordinary binding mentions.
     // Carry the proven root identity across the HIR -> AST boundary explicitly.
     ctx.physical_root_locals
-        .extend(call_root_locals.values().copied());
+        .extend(physical_root_locals.values().copied());
 
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
         let mut merge_temps =
             branch_merge::candidate_temps(stmt, &temp_touches, decl_index, &is_reserved);
-        if call_root_lifetimes.root_for_overwrite(decl_index).is_some()
+        if (call_root_lifetimes
+            .overwrite_pairs(decl_index)
+            .next()
+            .is_some()
+            || lookup_gc_root_lifetimes
+                .overwrite_pairs(decl_index)
+                .next()
+                .is_some())
             && let Some(branch_temps) = branch_merge::definite_if_arm_temp_writes(stmt)
         {
             for temp in branch_temps {
@@ -723,9 +804,16 @@ fn collect_plans(
                 // 候选拒绝[ProofIncomplete]：单个 branch result 被 capture/TBC 观察但缺 trusted home 时，当前没有 cell/close-owner provenance；按值 capture 应再按快照点证明后放行。
                 continue;
             }
-            let preceding_call_root_local = call_root_lifetimes
-                .root_for_overwrite(decl_index)
-                .and_then(|root| call_root_locals.get(&root).copied());
+            let preceding_lookup_root = home_slot
+                .and_then(|home| lookup_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
+                .map(|pair| pair.root_index());
+            let preceding_call_root = home_slot
+                .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))
+                .map(|pair| pair.root_index())
+                .or_else(|| call_root_lifetimes.unambiguous_root_for_overwrite(decl_index));
+            let preceding_physical_root_local = preceding_call_root
+                .or(preceding_lookup_root)
+                .and_then(|root| physical_root_locals.get(&root).copied());
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
                 temp_debug_scopes,
@@ -739,7 +827,7 @@ fn collect_plans(
                 direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,
             };
-            if let Some(local) = preceding_call_root_local.or_else(|| {
+            if let Some(local) = preceding_physical_root_local.or_else(|| {
                 home_slot.and_then(|slot| {
                     sticky_slots
                         .get(&slot)
@@ -870,6 +958,24 @@ fn simple_temp_assign_target(stmt: &HirStmt) -> Option<TempId> {
         return None;
     }
     Some(*temp)
+}
+
+fn temp_assign_target_for_home(
+    stmt: &HirStmt,
+    facts: &ProtoPromotionFacts,
+    home: HomeSlotKey,
+) -> Option<TempId> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let mut matches = assign.targets.iter().filter_map(|target| {
+        let HirLValue::Temp(temp) = target else {
+            return None;
+        };
+        (facts.trusted_temp_home_slot(*temp) == Some(home)).then_some(*temp)
+    });
+    let temp = matches.next()?;
+    matches.next().is_none().then_some(temp)
 }
 
 fn is_redundant_binding_self_assign(stmt: &HirStmt) -> bool {

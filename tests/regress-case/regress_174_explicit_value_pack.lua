@@ -1,4 +1,5 @@
 -- regress_174_explicit_value_pack#1: open tail 与括号截断在所有 value-list 上保持不同语义
+-- unluac: expect-contains [[return "head", (]]
 local function pair()
     return "a", "b"
 end
