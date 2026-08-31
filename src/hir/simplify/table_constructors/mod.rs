@@ -63,6 +63,7 @@ enum RegionStep {
     Producer {
         stmt_index: usize,
         slot_index: usize,
+        source_preservation: ProducerSourcePreservation,
     },
     Record {
         stmt_index: usize,
@@ -77,6 +78,16 @@ struct PendingProducer {
     binding: TableBinding,
     binding_id: BindingId,
     source: PendingProducerSource,
+    source_preservation: ProducerSourcePreservation,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProducerSourcePreservation {
+    Safe,
+    InertWholeStatement,
+    DebugIdentity,
+    ObservableReplay,
+    UnsupportedShape,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +95,10 @@ enum PendingProducerSource {
     Value {
         stmt_index: usize,
         value_index: usize,
+    },
+    ImplicitNil {
+        // Closed Lua assignments pad every target after the fixed RHS with nil.
+        stmt_index: usize,
     },
 }
 
@@ -238,7 +253,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     self.dialect,
                     &mut scratch,
                 );
-                candidate.filter(|(rebuilt_constructor, end_index, preserved_stmt_indices)| {
+                candidate.filter(|(rebuilt_constructor, end_index, _)| {
                     let open_local_owner = rebuilt_constructor.trailing_multivalue.is_some()
                         && self.open_local_constructor_region_is_safe(
                             block,
@@ -247,23 +262,26 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             binding,
                             rebuilt_constructor,
                         );
-                    // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil 槽之后再出现确定数组值，
-                    // 或 open tail 覆盖不确定前缀，会改变键集合/`#table`；反例见
-                    // lua54_01_close#10/#11/#15 与 regress_237。
-                    let invalid_array_shape = constructor_has_uncertain_array_field(&seed_ctor)
-                        || constructor_has_uncertain_array_field(rebuilt_constructor)
-                        || (rebuilt_constructor.trailing_multivalue.is_some()
-                            && array_fields_contain_uncertain_value(&rebuilt_constructor.fields));
-                    // 候选拒绝[ProofIncomplete]：当前对任意嵌套/direct nil 与 exact-width tail
-                    // 整体停用；其中存在等价形状，应按实际 array slot 与 pack width 建模。
-                    let unsupported_nil_or_width = constructor_has_nil_field(&seed_ctor)
-                        || region_has_direct_nil_field(
-                            block,
-                            index,
-                            *end_index,
-                            preserved_stmt_indices,
-                        )
-                        || region_has_exact_width_tail(block, index, *end_index);
+                    // Value-position nil is governed by the completed table shape, not by whether
+                    // a nil literal happened to occur in a producer. A final absent array slot and
+                    // a nil-valued record field preserve the same key set as the original writes.
+                    let nil_shape_is_supported =
+                        constructor_nil_shape_is_supported(&seed_ctor, rebuilt_constructor);
+                    // Lua emits constructor array fields through a deferred SETLIST batch.  A
+                    // later numeric record that aliases an earlier array field therefore cannot
+                    // represent a later overwrite: `{ value, [1] = nil }` leaves `value` at key
+                    // 1 on Lua 5.4/5.5.  Keep the explicit post-constructor write when rebuilding
+                    // would introduce that source shape; lua54_01_close#13 observes the value.
+                    // 候选拒绝[SemanticBarrier:TableShape]：constructor codegen 的 array batch
+                    // 会覆盖源码中更晚的同键 record，不能表达原语句的最终 table 内容。
+                    let adds_late_array_overwrite =
+                        !constructor_has_late_record_overwriting_array(&seed_ctor)
+                            && constructor_has_late_record_overwriting_array(rebuilt_constructor);
+                    // 候选拒绝[SemanticBarrier:ValueArity]：`HirTableConstructor` 只有 open
+                    // trailing pack，AST lowering 也拒绝 exact-width tail。若 `f()` 返回三个值，
+                    // 原 SETLIST 的 exact width 2 只写两个槽，而 `{ f() }` 会写入三个槽。
+                    let unsupported_exact_width =
+                        region_has_exact_width_tail(block, index, *end_index);
                     // Check the completed constructor as well as the original seed.  A seed
                     // whose last array value may be nil is safe only while it remains the last
                     // slot; appending a later definite value must stay as an indexed write.
@@ -300,8 +318,9 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 也包含保持顺序的安全子集，应改为精确 overwrite/eval-event 证明。
                     let overwrite_timing_is_safe = open_local_owner
                         || seed_overwrite_delay_is_unobservable(block, index, *end_index, binding);
-                    !invalid_array_shape
-                        && !unsupported_nil_or_width
+                    nil_shape_is_supported
+                        && !adds_late_array_overwrite
+                        && !unsupported_exact_width
                         && !producer_root_is_observable
                         && (open_local_owner || !has_followup_object_write)
                         && overwrite_timing_is_safe
@@ -577,8 +596,8 @@ impl TableConstructorPass<'_> {
             return None;
         }
         if let Some(tail) = &set_list.values.tail {
-            // 候选拒绝[ProofIncomplete]：exact-width tail 还没有到 constructor multivalue 的
-            // 精确表示映射；不能把 carrier 缺失描述成不等价证明。
+            // 候选拒绝[SemanticBarrier:ValueArity]：constructor/AST 只有 open tail；若
+            // `f()` 返回三个值，exact width 2 只能取前两个，直接写成 `{ f() }` 会多写一槽。
             if tail.exact_width().is_some() {
                 return None;
             }
@@ -991,7 +1010,8 @@ impl TableConstructorPass<'_> {
         let Some(tail) = &set_list.values.tail else {
             return false;
         };
-        // 候选拒绝[ProofIncomplete]：exact-width carrier 尚未精确映射到 constructor tail。
+        // 候选拒绝[SemanticBarrier:ValueArity]：constructor/AST 只有 open tail；若
+        // `f()` 返回三个值，exact width 2 只能取前两个，直接写成 `{ f() }` 会多写一槽。
         if tail.exact_width().is_some() {
             return false;
         }
@@ -1127,7 +1147,8 @@ impl TableConstructorPass<'_> {
         // 物理 cell 的 capture。因此只有区间后的 reference capture 可达，它仍捕获同一个
         // table owner。
         let tail = set_list.values.tail.as_ref().expect("checked open tail");
-        // 候选拒绝[ProofIncomplete]：exact-width carrier 尚无 constructor-tail 精确表示。
+        // 候选拒绝[SemanticBarrier:ValueArity]：constructor/AST 只有 open tail；若
+        // `f()` 返回三个值，exact width 2 只能取前两个，直接写成 `{ f() }` 会多写一槽。
         if tail.exact_width().is_some() {
             return false;
         }
@@ -1702,33 +1723,6 @@ fn is_direct_constructor_candidate(stmt: &HirStmt) -> bool {
     constructor_seed(stmt).is_some()
 }
 
-fn region_has_direct_nil_field(
-    block: &crate::hir::common::HirBlock,
-    seed_index: usize,
-    end_index: usize,
-    preserved_stmt_indices: &[usize],
-) -> bool {
-    block.stmts[(seed_index + 1)..=end_index]
-        .iter()
-        .enumerate()
-        .any(|(offset, stmt)| {
-            let stmt_index = seed_index + 1 + offset;
-            if preserved_stmt_indices.binary_search(&stmt_index).is_ok() {
-                return false;
-            }
-            match stmt {
-                HirStmt::Assign(assign) => assign.values.fixed.iter().any(expr_contains_nil),
-                HirStmt::LocalDecl(local_decl) => {
-                    local_decl.values.fixed.iter().any(expr_contains_nil)
-                }
-                HirStmt::TableSetList(set_list) => {
-                    set_list.values.fixed.iter().any(expr_contains_nil)
-                }
-                _ => false,
-            }
-        })
-}
-
 fn constructor_has_nil_field(constructor: &HirTableConstructor) -> bool {
     constructor.fields.iter().any(table_field_contains_nil)
         || constructor
@@ -1748,6 +1742,72 @@ fn constructor_has_numeric_record(constructor: &HirTableConstructor) -> bool {
 
 fn constructor_has_uncertain_array_field(constructor: &HirTableConstructor) -> bool {
     !array_fields_have_safe_nil_shape(&constructor.fields)
+}
+
+fn constructor_has_late_record_overwriting_array(constructor: &HirTableConstructor) -> bool {
+    let mut array_fields = 0_i64;
+    for field in &constructor.fields {
+        match field {
+            HirTableField::Array(_) => array_fields += 1,
+            HirTableField::Record(record) => {
+                let matches_prior_array = match &record.key {
+                    HirTableKey::Expr(HirExpr::Integer(index)) => {
+                        (1..=array_fields).contains(index)
+                    }
+                    HirTableKey::Expr(HirExpr::Number(index)) => {
+                        index.is_finite()
+                            && index.fract() == 0.0
+                            && *index >= 1.0
+                            && *index <= array_fields as f64
+                    }
+                    _ => false,
+                };
+                if matches_prior_array {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn constructor_nil_shape_is_supported(
+    seed: &HirTableConstructor,
+    rebuilt: &HirTableConstructor,
+) -> bool {
+    // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil 槽之后再出现确定数组值，
+    // 或 open tail 覆盖不确定前缀，会改变键集合/`#table`；反例见
+    // lua54_01_close#10/#11/#15 与 regress_237。
+    if constructor_has_uncertain_array_field(seed)
+        || constructor_has_uncertain_array_field(rebuilt)
+        || (rebuilt.trailing_multivalue.is_some()
+            && array_fields_contain_uncertain_value(&rebuilt.fields))
+    {
+        return false;
+    }
+
+    // 候选拒绝[SemanticBarrier:EvalOrder]：`t = {}; t[nil] = value` 先保存 fresh owner
+    // 再因 nil key 抛错；`t = { [nil] = value }` 则在保存 owner 前抛错。只识别静态必为
+    // nil 的 key；例如 `[nil or "key"]` 并不属于这个反例。
+    !constructor_adds_definite_nil_record_key(seed, rebuilt)
+}
+
+fn constructor_adds_definite_nil_record_key(
+    seed: &HirTableConstructor,
+    rebuilt: &HirTableConstructor,
+) -> bool {
+    !constructor_has_definite_nil_record_key(seed)
+        && constructor_has_definite_nil_record_key(rebuilt)
+}
+
+fn constructor_has_definite_nil_record_key(constructor: &HirTableConstructor) -> bool {
+    constructor.fields.iter().any(|field| {
+        matches!(
+            field,
+            HirTableField::Record(record)
+                if matches!(&record.key, HirTableKey::Expr(HirExpr::Nil))
+        )
+    })
 }
 
 /// An array constructor may contain one value whose runtime nil-ness is unknown only when it
@@ -1902,4 +1962,199 @@ fn expr_contains_nil(expr: &HirExpr) -> bool {
     let mut probe = NilProbe { found: false };
     crate::hir::simplify::visit::visit_expr(expr, &mut probe);
     probe.found
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hir::common::{
+        HirBlock, HirLocalDecl, HirPackTail, HirRecordField, HirTableSetList,
+    };
+
+    use super::*;
+
+    #[test]
+    fn nil_values_are_supported_when_the_completed_array_shape_is_stable() {
+        let seed = HirTableConstructor::default();
+        let rebuilt = HirTableConstructor {
+            fields: vec![
+                HirTableField::Record(HirRecordField {
+                    key: HirTableKey::Name("absent".into()),
+                    value: HirExpr::Nil,
+                }),
+                HirTableField::Array(HirExpr::Nil),
+            ],
+            trailing_multivalue: None,
+        };
+
+        assert!(constructor_nil_shape_is_supported(&seed, &rebuilt));
+    }
+
+    #[test]
+    fn pass_folds_nil_record_value_into_the_seed_constructor() {
+        let owner = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(owner)],
+                    values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                        base: HirExpr::TempRef(owner),
+                        key: HirExpr::String("missing".into()),
+                    }))],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                })),
+            ],
+        };
+        let promotion_facts = ProtoPromotionFacts::default();
+        let BindingFacts {
+            materialized,
+            reference_captured,
+            reference_captured_home_slots,
+        } = collect_binding_facts(&block, &promotion_facts, 1, 0);
+        let mut pass = TableConstructorPass {
+            materialized_bindings: materialized,
+            reference_captured_bindings: reference_captured,
+            reference_captured_home_slots,
+            debug_identity_bindings: BindingSlots::from_debug_hints(&[None], &[]),
+            promotion_facts: &promotion_facts,
+            dialect: DecompileDialect::Lua54,
+            temp_count: 1,
+            next_local_index: 0,
+        };
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 1);
+        let (_, constructor) = constructor_seed(&block.stmts[0]).expect("rewritten seed");
+        assert_eq!(
+            constructor.fields,
+            vec![HirTableField::Record(HirRecordField {
+                key: HirTableKey::Name("missing".into()),
+                value: HirExpr::Nil,
+            })]
+        );
+    }
+
+    #[test]
+    fn pass_consumes_every_slot_of_a_closed_short_pack() {
+        let owner = TempId(0);
+        let record = |key: &str, value| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                    base: HirExpr::TempRef(owner),
+                    key: HirExpr::String(key.into()),
+                }))],
+                values: HirValuePack::fixed(vec![value]),
+            }))
+        };
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(owner)],
+                    values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(0), LocalId(1)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                })),
+                record("first", HirExpr::LocalRef(LocalId(0))),
+                record("second", HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+        let promotion_facts = ProtoPromotionFacts::default();
+        let BindingFacts {
+            materialized,
+            reference_captured,
+            reference_captured_home_slots,
+        } = collect_binding_facts(&block, &promotion_facts, 1, 2);
+        let mut pass = TableConstructorPass {
+            materialized_bindings: materialized,
+            reference_captured_bindings: reference_captured,
+            reference_captured_home_slots,
+            debug_identity_bindings: BindingSlots::from_debug_hints(&[None], &[None, None]),
+            promotion_facts: &promotion_facts,
+            dialect: DecompileDialect::Lua54,
+            temp_count: 1,
+            next_local_index: 2,
+        };
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 1);
+        let (_, constructor) = constructor_seed(&block.stmts[0]).expect("rewritten seed");
+        assert_eq!(
+            constructor.fields,
+            vec![
+                HirTableField::Record(HirRecordField {
+                    key: HirTableKey::Name("first".into()),
+                    value: HirExpr::Integer(7),
+                }),
+                HirTableField::Record(HirRecordField {
+                    key: HirTableKey::Name("second".into()),
+                    value: HirExpr::Nil,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn nil_shape_rejects_holes_and_new_definite_nil_keys() {
+        let seed = HirTableConstructor::default();
+        let array_hole = HirTableConstructor {
+            fields: vec![
+                HirTableField::Array(HirExpr::Nil),
+                HirTableField::Array(HirExpr::Integer(1)),
+            ],
+            trailing_multivalue: None,
+        };
+        let nil_key = HirTableConstructor {
+            fields: vec![HirTableField::Record(HirRecordField {
+                key: HirTableKey::Expr(HirExpr::Nil),
+                value: HirExpr::Integer(1),
+            })],
+            trailing_multivalue: None,
+        };
+
+        assert!(!constructor_nil_shape_is_supported(&seed, &array_hole));
+        assert!(!constructor_nil_shape_is_supported(&seed, &nil_key));
+    }
+
+    #[test]
+    fn late_numeric_record_cannot_overwrite_constructor_array_batch() {
+        let constructor = HirTableConstructor {
+            fields: vec![
+                HirTableField::Array(HirExpr::LocalRef(LocalId(0))),
+                HirTableField::Record(HirRecordField {
+                    key: HirTableKey::Expr(HirExpr::Integer(1)),
+                    value: HirExpr::Nil,
+                }),
+            ],
+            trailing_multivalue: None,
+        };
+
+        assert!(constructor_has_late_record_overwriting_array(&constructor));
+    }
+
+    #[test]
+    fn exact_width_set_list_tail_remains_unrepresentable() {
+        let owner = LocalId(0);
+        let block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![owner],
+                    values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::expanding(
+                        Vec::new(),
+                        HirPackTail::exact(HirExpr::VarArg, 2),
+                    ),
+                })),
+            ],
+        };
+
+        assert!(region_has_exact_width_tail(&block, 0, 1));
+    }
 }

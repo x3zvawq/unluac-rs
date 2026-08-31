@@ -185,6 +185,13 @@ enum PromotionAction {
     ReuseExistingLocal,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MoveHomeRelation {
+    SameExact,
+    ProvenDistinct,
+    ProofIncomplete,
+}
+
 struct PromotionResult {
     changed: bool,
     trailing_mapping: LocalMapping,
@@ -220,6 +227,16 @@ fn identity_sensitive_group_requires_home(
 ) -> bool {
     group.iter().any(|temp| identity_sensitive.contains(temp))
         && (group.len() != 1 || group.iter().any(|temp| cell_sensitive.contains(temp)))
+}
+
+fn capture_kind_allows_call_root_owner(
+    temp: TempId,
+    identity_sensitive: &BTreeSet<TempId>,
+    cell_sensitive: &BTreeSet<TempId>,
+    to_be_closed: &BTreeSet<TempId>,
+) -> bool {
+    !to_be_closed.contains(&temp)
+        && (!identity_sensitive.contains(&temp) || cell_sensitive.contains(&temp))
 }
 
 struct PromotionCtx<'a> {
@@ -556,7 +573,7 @@ fn collect_plans(
     let lifetime_stmts = if label_flow_boundary.is_some() {
         // 分析停用[ProofIncomplete]：label/goto graph 本体及后续 region 仍缺 reaching-def、
         // declaration dominance 与逐路径 root overwrite 事实；这里只消费其前方不跨边界
-        // 存活的 GC-inert 只读链，不能把 island 内候选或 resource root 按文本顺序提升。
+        // 存活的 GC-inert 链，不能把 island 内候选或 resource root 按文本顺序提升。
         &[]
     } else {
         block.stmts.as_slice()
@@ -575,12 +592,19 @@ fn collect_plans(
         true,
         |temp| {
             // 候选拒绝[SemanticBarrier:Resource]：TBC producer 若提前声明 owner，会改变 close 起点与被关闭的值。
-            // 候选拒绝[ProofIncomplete]：capture producer 仍缺少按 capture mode/cell epoch 的分组声明证明。
+            // 候选接受：call-root collector 只认 trusted exact `(slot, close epoch)`；ByReference
+            // capture 因而绑定同一 cell，后续 exact-home overwrite 继续复用该 owner。
+            // 候选拒绝[SemanticBarrier:Capture]：Luau ByValue capture 是 VM 值快照；若匿名
+            // root local 后续按同槽复用，源码 closure 会改为观察 replacement（regress_219）。
             // 候选拒绝[PolicyBoundary]：debug temp 的源码身份不由匿名 physical-root owner 取代。
-            !ctx.identity_sensitive_temps.contains(&temp)
-                && temp_debug_locals
-                    .get(temp.index())
-                    .is_none_or(Option::is_none)
+            capture_kind_allows_call_root_owner(
+                temp,
+                ctx.identity_sensitive_temps,
+                ctx.cell_sensitive_temps,
+                ctx.to_be_closed_temps,
+            ) && temp_debug_locals
+                .get(temp.index())
+                .is_none_or(Option::is_none)
         },
         |temp| {
             // 候选拒绝[SemanticBarrier:Resource]：TBC overwrite 必须在原位置建立新的 close owner，不能复用更早声明的 root local。
@@ -761,7 +785,8 @@ fn collect_plans(
             continue;
         }
         if temp_touches.touches_before(decl_index, root_temp) {
-            // 候选拒绝[ProofIncomplete]：候选定义前已有同 temp touch，但当前线性索引没有 reaching-def/循环迭代事实，无法证明从此处分裂源码 binding 仍覆盖全部路径。
+            // 候选拒绝[SemanticBarrier:ValueFlow]：backedge/goto 可让文本前方读取同一
+            // TempId 的入口或上一轮值；在此定义点新建 local 会把该读取切到未初始化 binding。
             continue;
         }
         // 目标 temp 自己又出现在 RHS 里时，这条赋值表达的是“沿用同一状态槽位继续更新”，
@@ -792,9 +817,9 @@ fn collect_plans(
                 ctx.safety,
             )
         {
-            // 候选拒绝[ProofIncomplete]：该前缀候选会把动态写入或 temp 身份带过
-            // label/goto；缺逐路径 reaching-def 与 physical-root overwrite，不能证明新 local
-            // 的声明和值生命周期覆盖所有跳转路径。
+            // 候选拒绝[ProofIncomplete]：该前缀候选含 GC-bearing/structured write，或 temp
+            // 身份延伸到 label/goto 边界；缺逐路径 reaching-def 与 physical-root overwrite，
+            // 不能证明新 local 的声明和值生命周期覆盖所有跳转路径。
             continue;
         }
         let PromotionGroup {
@@ -1093,7 +1118,6 @@ fn collect_promotion_group(
     is_reserved: &dyn Fn(TempId) -> bool,
     temp_touches: &TempTouchIndex<'_>,
 ) -> PromotionGroup {
-    let root_slot = facts.trusted_temp_home_slot(root_temp);
     let mut temps = BTreeSet::from([root_temp]);
     let mut removable_aliases = BTreeSet::new();
     let mut touching_stmt_indices = BTreeSet::new();
@@ -1106,15 +1130,23 @@ fn collect_promotion_group(
         }
         let future_stmt = &block.stmts[future_index];
         let alias = alias_temp_for_group(future_stmt, &temps).filter(|alias_temp| {
-            let alias_slot = facts.trusted_temp_home_slot(*alias_temp);
-            let shared_home = root_slot.zip(alias_slot);
             // 已认领或已在组内的 alias 不再形成新候选。
-            // 候选拒绝[ProofIncomplete]：move 任一端缺 trusted home 时，当前事实不能证明物理 GC root、capture cell 与跨块 value epoch 相同。
-            // 候选拒绝[SemanticBarrier:Lifetime]：两个已知不同 home 的 move 是独立 GC root；合并后覆盖 source 会让 alias 对象提前不可达。
             // 候选拒绝[SemanticBarrier:ValueFlow]：`next=f(carried); carried=next` 中 alias 在 root 定义前已被读取；删除写回会让下一轮继续读取入口 seed。
             !is_reserved(*alias_temp)
                 && !temps.contains(alias_temp)
-                && shared_home.is_some_and(|(root, alias)| root == alias)
+                && match move_home_relation(root_temp, *alias_temp, facts) {
+                    MoveHomeRelation::SameExact => true,
+                    MoveHomeRelation::ProvenDistinct => {
+                        // 候选拒绝[SemanticBarrier:Lifetime]：完整 possible-home 集合已证明
+                        // MOVE 两端异槽；它是值快照与两个独立 GC root，不能合并 cell。
+                        false
+                    }
+                    MoveHomeRelation::ProofIncomplete => {
+                        // 候选拒绝[ProofIncomplete]：集合相交只表示可能同槽，集合缺失则有
+                        // unknown merge；两者都不能替代逐路径 exact cell identity。
+                        false
+                    }
+                }
                 // `next = f(carried); carried = next` 是 loop 回边写回，不是可删除
                 // alias。若 alias 的旧值已在 root 定义语句中参与求值，合并二者会删掉
                 // 下一轮所需的写回，只留下每轮都读取入口 seed 的局部变量。
@@ -1140,6 +1172,34 @@ fn collect_promotion_group(
     }
 }
 
+fn move_home_relation(
+    root: TempId,
+    alias: TempId,
+    facts: &ProtoPromotionFacts,
+) -> MoveHomeRelation {
+    if let (Some(root), Some(alias)) = (
+        facts.trusted_temp_home_slot(root),
+        facts.trusted_temp_home_slot(alias),
+    ) {
+        return if root == alias {
+            MoveHomeRelation::SameExact
+        } else {
+            MoveHomeRelation::ProvenDistinct
+        };
+    }
+    match (
+        facts.possible_temp_home_slots(root),
+        facts.possible_temp_home_slots(alias),
+    ) {
+        (Some(root), Some(alias))
+            if !root.is_empty() && !alias.is_empty() && root.is_disjoint(&alias) =>
+        {
+            MoveHomeRelation::ProvenDistinct
+        }
+        _ => MoveHomeRelation::ProofIncomplete,
+    }
+}
+
 fn label_flow_prefix_group_is_safe(
     block: &HirBlock,
     decl_index: usize,
@@ -1158,11 +1218,31 @@ fn label_flow_prefix_group_is_safe(
             .chain(&group.touching_stmt_indices)
             .all(|index| *index < boundary)
         && group.touching_stmt_indices.iter().all(|index| {
+            let stmt = &block.stmts[*index];
             group
                 .temps
                 .iter()
-                .all(|temp| !stmt_writes_temp(&block.stmts[*index], *temp))
+                .all(|temp| !stmt_writes_temp(stmt, *temp))
+                || scalar_group_write_is_gc_inert(stmt, &group.temps, safety)
         })
+}
+
+fn scalar_group_write_is_gc_inert(
+    stmt: &HirStmt,
+    group: &BTreeSet<TempId>,
+    safety: HirExprSafety,
+) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    let ([HirLValue::Temp(target)], [value], None) = (
+        assign.targets.as_slice(),
+        assign.values.fixed.as_slice(),
+        &assign.values.tail,
+    ) else {
+        return false;
+    };
+    group.contains(target) && safety.result_is_gc_inert(value)
 }
 
 fn activate_captured_slots_in_stmt(
@@ -1561,6 +1641,14 @@ fn debug_scope_for_temp_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompile::DecompileDialect;
+
+    fn assign(target: TempId, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(target)],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
 
     #[test]
     fn only_single_value_capture_can_promote_without_a_home() {
@@ -1582,6 +1670,101 @@ mod tests {
             &BTreeSet::from([first, second]),
             &value_captured,
             &BTreeSet::new(),
+        ));
+    }
+
+    #[test]
+    fn call_root_owner_accepts_reference_capture_but_not_value_snapshot_or_tbc() {
+        let reference = TempId(0);
+        let value = TempId(1);
+        let tbc = TempId(2);
+        let identity_sensitive = BTreeSet::from([reference, value, tbc]);
+        let cell_sensitive = BTreeSet::from([reference, tbc]);
+        let to_be_closed = BTreeSet::from([tbc]);
+
+        assert!(capture_kind_allows_call_root_owner(
+            reference,
+            &identity_sensitive,
+            &cell_sensitive,
+            &to_be_closed,
+        ));
+        assert!(!capture_kind_allows_call_root_owner(
+            value,
+            &identity_sensitive,
+            &cell_sensitive,
+            &to_be_closed,
+        ));
+        assert!(!capture_kind_allows_call_root_owner(
+            tbc,
+            &identity_sensitive,
+            &cell_sensitive,
+            &to_be_closed,
+        ));
+    }
+
+    #[test]
+    fn move_home_relation_uses_complete_sets_only_to_prove_disjointness() {
+        let exact_root = TempId(0);
+        let exact_alias = TempId(1);
+        let disjoint_alias = TempId(2);
+        let overlapping_alias = TempId(3);
+        let root_home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(exact_root, root_home);
+        facts.record_temp_home_slot_for_test(exact_alias, root_home);
+        facts.record_temp_home_slot_for_test(disjoint_alias, HomeSlotKey::new(1, 0));
+        facts.record_temp_home_merge(
+            disjoint_alias,
+            Some(BTreeSet::from([HomeSlotKey::new(2, 0)])),
+        );
+        facts.record_temp_home_slot_for_test(overlapping_alias, HomeSlotKey::new(3, 0));
+        facts.record_temp_home_merge(overlapping_alias, Some(BTreeSet::from([root_home])));
+
+        assert_eq!(
+            move_home_relation(exact_root, exact_alias, &facts),
+            MoveHomeRelation::SameExact
+        );
+        assert_eq!(
+            move_home_relation(exact_root, disjoint_alias, &facts),
+            MoveHomeRelation::ProvenDistinct
+        );
+        assert_eq!(
+            move_home_relation(exact_root, overlapping_alias, &facts),
+            MoveHomeRelation::ProofIncomplete
+        );
+        assert_eq!(
+            move_home_relation(exact_root, TempId(4), &facts),
+            MoveHomeRelation::ProofIncomplete
+        );
+    }
+
+    #[test]
+    fn label_prefix_accepts_only_gc_inert_group_writes() {
+        let temp = TempId(0);
+        let group = PromotionGroup {
+            temps: BTreeSet::from([temp]),
+            removable_aliases: BTreeSet::new(),
+            touching_stmt_indices: BTreeSet::from([1]),
+        };
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let inert = HirBlock {
+            stmts: vec![
+                assign(temp, HirExpr::Integer(1)),
+                assign(temp, HirExpr::Integer(2)),
+            ],
+        };
+        let resource = HirBlock {
+            stmts: vec![
+                assign(temp, HirExpr::Integer(1)),
+                assign(temp, HirExpr::TempRef(TempId(1))),
+            ],
+        };
+
+        assert!(label_flow_prefix_group_is_safe(
+            &inert, 0, temp, 2, &group, safety
+        ));
+        assert!(!label_flow_prefix_group_is_safe(
+            &resource, 0, temp, 2, &group, safety
         ));
     }
 }

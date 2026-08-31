@@ -51,6 +51,7 @@ pub(super) struct ProtoBindings {
     pub(super) temp_debug_scopes: Vec<Option<usize>>,
     pub(super) fixed_temps: Vec<TempId>,
     pub(super) phi_temps: Vec<TempId>,
+    pub(super) home_free_temps: BTreeSet<TempId>,
     pub(super) loop_guard_temps: Vec<Option<TempId>>,
     pub(super) repeat_staged_temps: Vec<Vec<TempId>>,
     pub(super) instr_fixed_defs: Vec<Vec<TempId>>,
@@ -510,6 +511,9 @@ fn lower_proto_one(
         &lowering.bindings.fixed_temps,
         &lowering.bindings.phi_temps,
     );
+    for &temp in &lowering.bindings.home_free_temps {
+        promotion_facts.record_home_free_temp(temp);
+    }
     // `entry_local_regs` 是 Entry(reg) 的可见 binding；它与 SSA entry leaf 一样属于
     // `(reg, epoch 0)`。把这份已知身份带入 simplify，避免异槽 reference capture 被误判
     // 为可能观察任意 local 写入。后续异槽合并仍会通过 promotion invalidation 使其失效。

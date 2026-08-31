@@ -359,7 +359,6 @@ mod tests {
         };
 
         assert!(result_assignment_values(&assign, &[result]).is_none());
-        assert!(complete_result_assignment_values(&assign, &[result]).is_none());
     }
 
     #[test]

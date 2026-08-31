@@ -23,12 +23,10 @@ use super::bindings::{
     table_key_from_expr,
 };
 use super::builder::{ConstructorBuilder, RecordPromotionPolicy};
-use super::inline_value::{
-    InlineContext, InlineRewriteState, expr_mentions_any_pending_binding, inline_constructor_value,
-};
+use super::inline_value::{InlineContext, InlineRewriteState, inline_constructor_value};
 use super::{
-    ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord, RebuildScratch,
-    RegionStep, SegmentToken, TableBinding,
+    ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord,
+    ProducerSourcePreservation, RebuildScratch, RegionStep, SegmentToken, TableBinding,
 };
 
 pub(super) struct RegionRebuildContext<'a> {
@@ -64,9 +62,10 @@ pub(super) fn try_extend_constructor_from_steps(
     builder: &mut ConstructorBuilder,
     steps: &[RegionStep],
     context: &mut RegionRebuildContext<'_>,
-) -> bool {
+) -> Option<Vec<usize>> {
     let checkpoint = builder.checkpoint(context.scratch);
     let mut segment_start = 0;
+    let mut preserved_producer_sources = Vec::new();
 
     for (index, step) in steps.iter().enumerate() {
         if let RegionStep::SetList { stmt_index } = step {
@@ -75,23 +74,32 @@ pub(super) fn try_extend_constructor_from_steps(
                 &steps[segment_start..index],
                 Some(*stmt_index),
                 context,
+                &mut preserved_producer_sources,
             )
             .is_none()
             {
                 builder.rollback(checkpoint, context.scratch);
-                return false;
+                return None;
             }
             segment_start = index + 1;
         }
     }
 
-    if flush_constructor_segment(builder, &steps[segment_start..], None, context).is_none() {
+    if flush_constructor_segment(
+        builder,
+        &steps[segment_start..],
+        None,
+        context,
+        &mut preserved_producer_sources,
+    )
+    .is_none()
+    {
         builder.rollback(checkpoint, context.scratch);
-        return false;
+        return None;
     }
 
     builder.commit(&checkpoint, context.scratch);
-    true
+    Some(preserved_producer_sources)
 }
 
 fn flush_constructor_segment(
@@ -99,6 +107,7 @@ fn flush_constructor_segment(
     segment: &[RegionStep],
     set_list_stmt_index: Option<usize>,
     context: &mut RegionRebuildContext<'_>,
+    preserved_producer_sources: &mut Vec<usize>,
 ) -> Option<()> {
     prepare_scratch(context.scratch, context.binding_index.len());
     if builder.trailing_multivalue.is_some()
@@ -164,11 +173,13 @@ fn flush_constructor_segment(
             RegionStep::Producer {
                 stmt_index,
                 slot_index,
+                source_preservation,
             } => register_single_producer(
                 context.block,
                 context.binding_index,
                 *stmt_index,
                 *slot_index,
+                *source_preservation,
                 context.scratch,
             )?,
             RegionStep::Record { stmt_index } => prepare_record_step(*stmt_index, context)?,
@@ -259,15 +270,12 @@ fn flush_constructor_segment(
         }
     }
 
-    if context
-        .scratch
-        .pending_producers
-        .iter()
-        .any(|producer| !context.scratch.consumed_bindings[producer.binding_id])
-    {
-        // 候选拒绝[ProofIncomplete]：仍有 use 或未消费的单值 producer 时，当前事务只能
-        // 删除整个声明；应支持保留 producer 的 partial rebuild。
-        return None;
+    for producer in &context.scratch.pending_producers {
+        if !context.scratch.consumed_bindings[producer.binding_id]
+            || context.remaining_uses.contains(producer.binding_id)
+        {
+            preserve_producer_source(producer, preserved_producer_sources)?;
+        }
     }
 
     if !constructor_eval_order_is_preserved(set_list_stmt_index, context) {
@@ -297,17 +305,10 @@ fn flush_set_list_values_before_producer(
     };
 
     for _ in 0..target_offset {
-        let front = queued_values.front()?;
-        if expr_mentions_any_pending_binding(
-            front,
-            context.binding_index,
-            &context.scratch.producer_index_by_binding,
-        ) {
-            // 候选拒绝[ProofIncomplete]：SETLIST 队首存在跨 producer 依赖时，当前队列计划
-            // 不能拓扑展开全部依赖；应扩展 producer DAG，而不是永久拒绝该 region。
-            return None;
-        }
         let value = queued_values.pop_front()?;
+        // 所有 producer 已在 segment 预注册；允许队首递归消费稍后 token 的依赖，随后
+        // token 会因 consumed 跳过。source/generated event 序列在事务末比较，因此 effectful
+        // producer 若被拓扑重排仍会回滚，eventless 依赖则无需 blanket 拒绝。
         let value = inline_set_list_value(context, value)?;
         builder.push_array_value(value);
     }
@@ -436,6 +437,52 @@ fn collect_source_eval_events(
                 events,
             );
         }
+        HirExpr::Decision(decision) => {
+            if let Some(entry) = decision.nodes.get(decision.entry.index()) {
+                collect_source_eval_events(
+                    &entry.test,
+                    binding_index,
+                    producer_index_by_binding,
+                    events,
+                );
+            }
+        }
+        HirExpr::TableConstructor(table) => {
+            for field in &table.fields {
+                match field {
+                    HirTableField::Array(value) => collect_source_eval_events(
+                        value,
+                        binding_index,
+                        producer_index_by_binding,
+                        events,
+                    ),
+                    HirTableField::Record(field) => {
+                        if let HirTableKey::Expr(key) = &field.key {
+                            collect_source_eval_events(
+                                key,
+                                binding_index,
+                                producer_index_by_binding,
+                                events,
+                            );
+                        }
+                        collect_source_eval_events(
+                            &field.value,
+                            binding_index,
+                            producer_index_by_binding,
+                            events,
+                        );
+                    }
+                }
+            }
+            if let Some(tail) = &table.trailing_multivalue {
+                collect_source_eval_events(
+                    tail.as_expr(),
+                    binding_index,
+                    producer_index_by_binding,
+                    events,
+                );
+            }
+        }
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
@@ -451,9 +498,7 @@ fn collect_source_eval_events(
         | HirExpr::TempRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)
-        | HirExpr::Decision(_)
         | HirExpr::Unresolved(_) => {}
     }
     if expr_requires_ordered_snapshot(expr) {
@@ -505,9 +550,11 @@ fn register_single_producer(
     binding_index: &BindingIndex,
     stmt_index: usize,
     slot_index: usize,
+    source_preservation: ProducerSourcePreservation,
     scratch: &mut RebuildScratch,
 ) -> Option<()> {
-    let producer = single_producer(block, binding_index, stmt_index, slot_index)?;
+    let mut producer = single_producer(block, binding_index, stmt_index, slot_index)?;
+    producer.source_preservation = source_preservation;
     let producer_index = scratch.pending_producers.len();
     mark_binding_active(scratch, producer.binding_id);
     scratch.producer_index_by_binding[producer.binding_id] = Some(producer_index);
@@ -651,28 +698,74 @@ fn single_producer(
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             let binding = TableBinding::Local(*local_decl.bindings.get(slot_index)?);
+            let source = if local_decl.values.fixed.get(slot_index).is_some() {
+                PendingProducerSource::Value {
+                    stmt_index,
+                    value_index: slot_index,
+                }
+            } else {
+                PendingProducerSource::ImplicitNil { stmt_index }
+            };
             Some(PendingProducer {
                 binding,
                 binding_id: binding_index.id_of(binding)?,
-                source: PendingProducerSource::Value {
-                    stmt_index,
-                    value_index: slot_index,
-                },
+                source,
+                source_preservation: ProducerSourcePreservation::UnsupportedShape,
             })
         }
         HirStmt::Assign(assign) => {
             let binding = binding_from_lvalue(assign.targets.get(slot_index)?)?;
+            let source = if assign.values.fixed.get(slot_index).is_some() {
+                PendingProducerSource::Value {
+                    stmt_index,
+                    value_index: slot_index,
+                }
+            } else {
+                PendingProducerSource::ImplicitNil { stmt_index }
+            };
             Some(PendingProducer {
                 binding,
                 binding_id: binding_index.id_of(binding)?,
-                source: PendingProducerSource::Value {
-                    stmt_index,
-                    value_index: slot_index,
-                },
+                source,
+                source_preservation: ProducerSourcePreservation::UnsupportedShape,
             })
         }
         _ => None,
     }
+}
+
+fn preserve_producer_source(
+    producer: &PendingProducer,
+    preserved_stmt_indices: &mut Vec<usize>,
+) -> Option<()> {
+    match producer.source_preservation {
+        ProducerSourcePreservation::Safe => {}
+        ProducerSourcePreservation::InertWholeStatement => {}
+        ProducerSourcePreservation::DebugIdentity => {
+            // 候选拒绝[PolicyBoundary]：把字段提前到 source-visible producer 声明之前会让
+            // hook 在该声明行观察到已填充的 table；debug identity 声明必须保持原边界。
+            return None;
+        }
+        ProducerSourcePreservation::ObservableReplay => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：保留并内联 effectful producer 会重复求值，
+            // 未消费时保留又会让后续字段越过它；`mark()` 次数/顺序由 regress_235 观察。
+            return None;
+        }
+        ProducerSourcePreservation::UnsupportedShape => {
+            // 候选拒绝[ProofIncomplete]：多槽声明或无事件 alias 值需要整句逐槽
+            // preserve/remove 与 root facts；owner 是 producer source preservation plan。
+            return None;
+        }
+    }
+
+    let stmt_index = match producer.source {
+        PendingProducerSource::Value { stmt_index, .. }
+        | PendingProducerSource::ImplicitNil { stmt_index } => stmt_index,
+    };
+    if !preserved_stmt_indices.contains(&stmt_index) {
+        preserved_stmt_indices.push(stmt_index);
+    }
+    Some(())
 }
 
 /// A producer declaration is removable only when its value cannot carry a source-visible
@@ -709,5 +802,107 @@ fn pending_producer_value<'a>(
             HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
             _ => None,
         },
+        PendingProducerSource::ImplicitNil { .. } => Some(&HirExpr::Nil),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::ast::DecompileDialect;
+    use crate::hir::common::{
+        HirBlock, HirExpr, HirLocalDecl, HirStmt, HirTableConstructor, HirTableField,
+        HirTableSetList, HirValuePack, LocalId,
+    };
+    use crate::hir::promotion::ProtoPromotionFacts;
+
+    use super::super::bindings::{
+        BindingIndex, BindingOccurrenceIndex, BindingSlots, collect_stmt_binding_summary,
+    };
+    use super::super::builder::ConstructorBuilder;
+    use super::super::{ProducerSourcePreservation, RebuildScratch, RegionStep};
+    use super::{RegionRebuildContext, try_extend_constructor_from_steps};
+
+    #[test]
+    fn set_list_topologically_consumes_eventless_later_producer() {
+        let table = LocalId(0);
+        let first = LocalId(1);
+        let second = LocalId(2);
+        let local = |binding, value| {
+            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![binding],
+                values: HirValuePack::fixed(vec![value]),
+            }))
+        };
+        let block = HirBlock {
+            stmts: vec![
+                local(table, HirExpr::TableConstructor(Box::default())),
+                local(first, HirExpr::Integer(1)),
+                local(second, HirExpr::Integer(2)),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(table),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![
+                        HirExpr::LocalRef(second),
+                        HirExpr::LocalRef(first),
+                    ]),
+                })),
+            ],
+        };
+        let mut binding_index = BindingIndex::new(0, 3);
+        let summaries = block
+            .stmts
+            .iter()
+            .map(|stmt| collect_stmt_binding_summary(stmt, &mut binding_index))
+            .collect::<Vec<_>>();
+        let empty_binding_flags = BindingSlots::from_debug_hints(&[], &[None, None, None]);
+        let occurrences = BindingOccurrenceIndex::new(
+            &binding_index,
+            &summaries,
+            &empty_binding_flags,
+            &BTreeSet::new(),
+            &empty_binding_flags,
+            &ProtoPromotionFacts::default(),
+        );
+        let mut scratch = RebuildScratch::default();
+        let mut builder = ConstructorBuilder::from_constructor(HirTableConstructor::default());
+        let materialized_counts = vec![1; binding_index.len()];
+        let mut context = RegionRebuildContext::new(
+            &block,
+            &binding_index,
+            occurrences.remaining_uses_after(3),
+            &materialized_counts,
+            DecompileDialect::Lua54,
+            &mut scratch,
+        );
+
+        assert!(
+            try_extend_constructor_from_steps(
+                &mut builder,
+                &[
+                    RegionStep::Producer {
+                        stmt_index: 1,
+                        slot_index: 0,
+                        source_preservation: ProducerSourcePreservation::Safe,
+                    },
+                    RegionStep::Producer {
+                        stmt_index: 2,
+                        slot_index: 0,
+                        source_preservation: ProducerSourcePreservation::Safe,
+                    },
+                    RegionStep::SetList { stmt_index: 3 },
+                ],
+                &mut context,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            builder.into_constructor().fields,
+            vec![
+                HirTableField::Array(HirExpr::Integer(2)),
+                HirTableField::Array(HirExpr::Integer(1)),
+            ]
+        );
     }
 }

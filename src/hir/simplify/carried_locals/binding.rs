@@ -40,25 +40,43 @@ pub(super) fn binding_home_slot(
     }
 }
 
-fn raw_binding_home_slot(
+fn possible_binding_home_slots(
     binding: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
-) -> Option<HomeSlotKey> {
+) -> Option<BTreeSet<HomeSlotKey>> {
     match binding {
-        CarryBinding::Param(param) => Some(HomeSlotKey::new(param.index(), 0)),
-        CarryBinding::Local(local) => promotion_facts.local_home_slot(local),
-        CarryBinding::Temp(temp) => promotion_facts.home_slot(temp),
+        CarryBinding::Param(param) => promotion_facts.possible_param_home_slots(param),
+        CarryBinding::Local(local) => promotion_facts.possible_local_home_slots(local),
+        CarryBinding::Temp(temp) => promotion_facts.possible_temp_home_slots(temp),
     }
 }
 
-pub(super) fn binding_home_slot_provenance_is_invalid(
-    binding: CarryBinding,
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum BindingHomeOverlap {
+    Disjoint,
+    Overlap,
+    /// `ProtoPromotionFacts` lacks a complete possible-home set for at least one binding.
+    Unknown,
+}
+
+pub(super) fn binding_home_overlap(
+    left: CarryBinding,
+    right: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
-) -> bool {
-    match binding {
-        CarryBinding::Param(param) => promotion_facts.param_home_was_invalidated(param),
-        CarryBinding::Local(local) => promotion_facts.local_home_was_invalidated(local),
-        CarryBinding::Temp(temp) => promotion_facts.temp_home_was_invalidated(temp),
+) -> BindingHomeOverlap {
+    if left == right {
+        return BindingHomeOverlap::Overlap;
+    }
+    let (Some(left), Some(right)) = (
+        possible_binding_home_slots(left, promotion_facts),
+        possible_binding_home_slots(right, promotion_facts),
+    ) else {
+        return BindingHomeOverlap::Unknown;
+    };
+    if left.is_disjoint(&right) {
+        BindingHomeOverlap::Disjoint
+    } else {
+        BindingHomeOverlap::Overlap
     }
 }
 
@@ -77,36 +95,12 @@ pub(super) fn bindings_may_share_raw_home_slot(
     right: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
-    if left == right {
-        return true;
-    }
-    if binding_home_slot_provenance_is_invalid(left, promotion_facts)
-        || binding_home_slot_provenance_is_invalid(right, promotion_facts)
-    {
-        return true;
-    }
-    if binding_has_no_physical_home(left, promotion_facts)
-        || binding_has_no_physical_home(right, promotion_facts)
-    {
-        return false;
-    }
-    match (
-        raw_binding_home_slot(left, promotion_facts),
-        raw_binding_home_slot(right, promotion_facts),
-    ) {
-        (Some(left), Some(right)) => left == right,
-        _ => true,
-    }
-}
-
-fn binding_has_no_physical_home(
-    binding: CarryBinding,
-    promotion_facts: &ProtoPromotionFacts,
-) -> bool {
-    match binding {
-        CarryBinding::Local(local) => promotion_facts.local_has_no_physical_home(local),
-        CarryBinding::Param(_) | CarryBinding::Temp(_) => false,
-    }
+    // Identity gates are conservative on genuinely incomplete provenance, but an invalidated
+    // single-home fact is not itself a permanent barrier when its complete finite union survives.
+    !matches!(
+        binding_home_overlap(left, right, promotion_facts),
+        BindingHomeOverlap::Disjoint
+    )
 }
 
 pub(super) trait BindingProtection {
@@ -244,10 +238,15 @@ pub(super) fn record_binding_merge(
     if source_home.is_some() && source_home == target_home {
         return;
     }
+    let source_homes = match source {
+        CarryBinding::Param(param) => promotion_facts.possible_param_home_slots(param),
+        CarryBinding::Local(local) => promotion_facts.possible_local_home_slots(local),
+        CarryBinding::Temp(temp) => promotion_facts.possible_temp_home_slots(temp),
+    };
     match target {
-        CarryBinding::Param(param) => promotion_facts.invalidate_param_home(param),
-        CarryBinding::Local(local) => promotion_facts.invalidate_local_home(local),
-        CarryBinding::Temp(temp) => promotion_facts.invalidate_temp_home(temp),
+        CarryBinding::Param(param) => promotion_facts.record_param_home_merge(param, source_homes),
+        CarryBinding::Local(local) => promotion_facts.record_local_home_merge(local, source_homes),
+        CarryBinding::Temp(temp) => promotion_facts.record_temp_home_merge(temp, source_homes),
     }
 }
 
@@ -280,5 +279,33 @@ impl HirRewritePass for TempToBindingPass<'_> {
             CarryBinding::Temp(temp) => HirLValue::Temp(temp),
         };
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_merge_propagates_finite_possible_home_union() {
+        let source = TempId(0);
+        let target = TempId(1);
+        let source_home = HomeSlotKey::new(0, 0);
+        let target_home = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(source, source_home);
+        facts.record_temp_home_slot_for_test(target, target_home);
+
+        record_binding_merge(
+            CarryBinding::Temp(source),
+            CarryBinding::Temp(target),
+            &mut facts,
+        );
+
+        assert_eq!(facts.trusted_temp_home_slot(target), None);
+        assert_eq!(
+            facts.possible_temp_home_slots(target),
+            Some(BTreeSet::from([source_home, target_home]))
+        );
     }
 }

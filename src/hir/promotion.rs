@@ -13,8 +13,9 @@
 //! - 例子：`t0(slot 0, epoch 0)` 被闭包 capture 之后，后续同 epoch 的
 //!   `t7(slot 0, epoch 0)` 与同槽 phi 会被 locals 认成同一个源码 local 的写回；
 //!   若中间经过 `close from r0`，后续 `t8(slot 0, epoch 1)` 会被视为新的词法槽位
-//! - carried-local 后续若把不同或未知 home 的 binding 并入同一目标，会持久失效该目标
-//!   binding 的正向 provenance；原始物理槽事实仍保留给 capture/TBC 等负向保护
+//! - carried-local 后续若把不同 home 的 binding 并入同一目标，会失效单一 home
+//!   的正向 provenance，但保留完整有限的可能 home 并集；未知来源则传播未知。原始
+//!   物理槽事实仍保留给 capture/TBC 等负向保护
 //! - 由 `NewTable` canonical def 直接产生的 temp 单独保留 constructor origin；MOVE、
 //!   phi 或后续 local 物化不能冒充分配本身
 
@@ -264,18 +265,40 @@ impl HomeSlotKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 enum HomeSlotResolution {
     #[default]
+    Pending,
+    Known(BTreeSet<HomeSlotKey>),
     Unknown,
-    Known(HomeSlotKey),
-    Conflict,
+}
+
+impl HomeSlotResolution {
+    fn from_home(home: HomeSlotKey) -> Self {
+        Self::Known(BTreeSet::from([home]))
+    }
+
+    fn exact_home(&self) -> Option<HomeSlotKey> {
+        let Self::Known(homes) = self else {
+            return None;
+        };
+        let mut homes = homes.iter().copied();
+        let home = homes.next()?;
+        homes.next().is_none().then_some(home)
+    }
+
+    fn complete_homes(&self) -> Option<BTreeSet<HomeSlotKey>> {
+        match self {
+            Self::Known(homes) => Some(homes.clone()),
+            Self::Pending | Self::Unknown => None,
+        }
+    }
 }
 
 /// 单个 proto 的 temp promotion 与后续 binding provenance 辅助事实。
 #[derive(Debug, Clone, Default)]
 pub(super) struct ProtoPromotionFacts {
-    temp_home_slots: Vec<Option<HomeSlotKey>>,
+    temp_home_slots: Vec<HomeSlotResolution>,
     immediate_move_write_homes: Vec<BTreeSet<HomeSlotKey>>,
     entry_nil_overwrite_temps: BTreeSet<TempId>,
     entry_nil_phi_temps: BTreeSet<TempId>,
@@ -292,6 +315,9 @@ pub(super) struct ProtoPromotionFacts {
     invalidated_local_homes: BTreeSet<LocalId>,
     invalidated_temp_homes: BTreeSet<TempId>,
     home_free_locals: BTreeSet<LocalId>,
+    possible_param_homes: BTreeMap<ParamId, Option<BTreeSet<HomeSlotKey>>>,
+    possible_local_homes: BTreeMap<LocalId, Option<BTreeSet<HomeSlotKey>>>,
+    possible_temp_homes: BTreeMap<TempId, Option<BTreeSet<HomeSlotKey>>>,
     compact_home_slots: bool,
 }
 
@@ -307,7 +333,7 @@ impl ProtoPromotionFacts {
         phi_temps: &[TempId],
     ) -> Self {
         let total_temps = dataflow.defs.len() + plan.phis().len();
-        let mut temp_home_slots = vec![None; total_temps];
+        let mut temp_home_slots = vec![HomeSlotResolution::Pending; total_temps];
 
         fill_fixed_def_home_slots(dataflow, slot_epochs, &mut temp_home_slots);
         fill_phi_home_slots(dataflow, plan, &mut temp_home_slots);
@@ -347,6 +373,9 @@ impl ProtoPromotionFacts {
             invalidated_local_homes: BTreeSet::new(),
             invalidated_temp_homes: BTreeSet::new(),
             home_free_locals: BTreeSet::new(),
+            possible_param_homes: BTreeMap::new(),
+            possible_local_homes: BTreeMap::new(),
+            possible_temp_homes: BTreeMap::new(),
             compact_home_slots: false,
         }
     }
@@ -430,19 +459,23 @@ impl ProtoPromotionFacts {
 
     /// 返回某个 temp 对应的原始寄存器槽位。
     pub(super) fn home_slot(&self, temp: TempId) -> Option<HomeSlotKey> {
-        self.temp_home_slots.get(temp.index()).copied().flatten()
+        self.temp_home_slots.get(temp.index())?.exact_home()
     }
 
     pub(super) fn home_slot_definition_count(&self) -> usize {
-        self.temp_home_slots.iter().flatten().count()
+        self.temp_home_slots
+            .iter()
+            .filter(|resolution| resolution.exact_home().is_some())
+            .count()
     }
 
     #[cfg(test)]
     pub(super) fn record_temp_home_slot_for_test(&mut self, temp: TempId, home_slot: HomeSlotKey) {
         if self.temp_home_slots.len() <= temp.index() {
-            self.temp_home_slots.resize(temp.index() + 1, None);
+            self.temp_home_slots
+                .resize(temp.index() + 1, HomeSlotResolution::Pending);
         }
-        self.temp_home_slots[temp.index()] = Some(home_slot);
+        self.temp_home_slots[temp.index()] = HomeSlotResolution::from_home(home_slot);
     }
 
     #[cfg(test)]
@@ -452,16 +485,13 @@ impl ProtoPromotionFacts {
 
     /// 返回 temp 提升后 local 仍对应的原始词法槽位。
     ///
-    /// 同一 local 若吸收过不同槽位会永久标为 conflict；后续 pass 不能再把它作为
-    /// 跨 region 合并的物理身份依据。
+    /// 同一 local 若吸收过不同槽位，不再具有单一 home；后续 pass 不能再把它
+    /// 作为跨 region 合并的单一物理身份依据。
     pub(super) fn local_home_slot(
         &self,
         local: crate::hir::common::LocalId,
     ) -> Option<HomeSlotKey> {
-        match self.local_home_slots.get(local.index()) {
-            Some(HomeSlotResolution::Known(slot)) => Some(*slot),
-            Some(HomeSlotResolution::Unknown | HomeSlotResolution::Conflict) | None => None,
-        }
+        self.local_home_slots.get(local.index())?.exact_home()
     }
 
     pub(super) fn record_local_home_slot(
@@ -472,23 +502,119 @@ impl ProtoPromotionFacts {
         self.home_free_locals.remove(&local);
         if self.local_home_slots.len() <= local.index() {
             self.local_home_slots
-                .resize(local.index() + 1, HomeSlotResolution::Unknown);
+                .resize(local.index() + 1, HomeSlotResolution::Pending);
         }
         let resolution = &mut self.local_home_slots[local.index()];
-        *resolution =
-            merge_home_slot_resolutions(*resolution, HomeSlotResolution::Known(home_slot));
+        *resolution = merge_home_slot_resolutions(
+            resolution.clone(),
+            HomeSlotResolution::from_home(home_slot),
+        );
+        if let Some(possible) = self.possible_local_homes.get_mut(&local)
+            && let Some(homes) = possible
+        {
+            homes.insert(home_slot);
+        }
     }
 
     /// 记录由 HIR pass 新建、并不对应任何原始 VM 槽位的 local。
     ///
-    /// 这与 `HomeSlotResolution::Unknown` 不同：后者仍可能来自 provenance 冲突或缺失的
+    /// 这与 `HomeSlotResolution::Unknown` 不同：后者仍可能来自 provenance 缺失的
     /// 物理 binding，不能据此排除 raw-home alias。
     pub(super) fn record_home_free_local(&mut self, local: LocalId) {
         self.home_free_locals.insert(local);
+        self.possible_local_homes
+            .insert(local, Some(BTreeSet::new()));
+    }
+
+    /// 记录由 HIR lowering owner 新建、并不对应任何原始 VM 槽位的 temp。
+    ///
+    /// 调用方必须在分配该 synthetic temp 的位置显式登记；未知或越界的普通 temp
+    /// 仍保留为 `None`，不能仅凭编号推断为 home-free。
+    pub(super) fn record_home_free_temp(&mut self, temp: TempId) {
+        debug_assert!(
+            self.temp_home_slots.get(temp.index()).is_none(),
+            "canonical VM temp cannot be marked home-free"
+        );
+        self.possible_temp_homes.insert(temp, Some(BTreeSet::new()));
     }
 
     pub(super) fn local_has_no_physical_home(&self, local: LocalId) -> bool {
         self.home_free_locals.contains(&local)
+    }
+
+    /// 返回 binding 在当前 HIR 改写后可能对应的完整物理 home 集合。
+    ///
+    /// `Some(empty)` 表示由 HIR 合成且明确 home-free；`None` 表示某次
+    /// merge 的来源本身就缺 provenance，不得用 raw home 冒充完整集合。
+    pub(super) fn possible_param_home_slots(
+        &self,
+        param: ParamId,
+    ) -> Option<BTreeSet<HomeSlotKey>> {
+        match self.possible_param_homes.get(&param) {
+            Some(homes) => homes.clone(),
+            None => Some(BTreeSet::from([HomeSlotKey::new(param.index(), 0)])),
+        }
+    }
+
+    pub(super) fn possible_local_home_slots(
+        &self,
+        local: LocalId,
+    ) -> Option<BTreeSet<HomeSlotKey>> {
+        match self.possible_local_homes.get(&local) {
+            Some(homes) => homes.clone(),
+            None if self.local_has_no_physical_home(local) => Some(BTreeSet::new()),
+            None => self
+                .local_home_slots
+                .get(local.index())
+                .and_then(HomeSlotResolution::complete_homes),
+        }
+    }
+
+    pub(super) fn possible_temp_home_slots(&self, temp: TempId) -> Option<BTreeSet<HomeSlotKey>> {
+        match self.possible_temp_homes.get(&temp) {
+            Some(homes) => homes.clone(),
+            None => self
+                .temp_home_slots
+                .get(temp.index())
+                .and_then(HomeSlotResolution::complete_homes),
+        }
+    }
+
+    pub(super) fn record_param_home_merge(
+        &mut self,
+        param: ParamId,
+        source_homes: Option<BTreeSet<HomeSlotKey>>,
+    ) {
+        let merged = merge_possible_home_slots(self.possible_param_home_slots(param), source_homes);
+        self.possible_param_homes.insert(param, merged);
+        self.invalidated_param_homes.insert(param);
+    }
+
+    pub(super) fn record_local_home_merge(
+        &mut self,
+        local: LocalId,
+        source_homes: Option<BTreeSet<HomeSlotKey>>,
+    ) {
+        let merged = merge_possible_home_slots(self.possible_local_home_slots(local), source_homes);
+        if merged.as_ref().is_some_and(BTreeSet::is_empty) {
+            self.home_free_locals.insert(local);
+        } else {
+            self.home_free_locals.remove(&local);
+        }
+        self.possible_local_homes.insert(local, merged);
+        self.invalidated_local_homes.insert(local);
+        self.direct_table_seed_locals.remove(&local);
+        self.entry_nil_phi_locals.remove(&local);
+    }
+
+    pub(super) fn record_temp_home_merge(
+        &mut self,
+        temp: TempId,
+        source_homes: Option<BTreeSet<HomeSlotKey>>,
+    ) {
+        let merged = merge_possible_home_slots(self.possible_temp_home_slots(temp), source_homes);
+        self.possible_temp_homes.insert(temp, merged);
+        self.invalidated_temp_homes.insert(temp);
     }
 
     pub(super) fn enable_home_slot_compaction(&mut self) {
@@ -580,25 +706,17 @@ impl ProtoPromotionFacts {
         self.invalidated_temp_homes.contains(&temp)
     }
 
-    pub(super) fn invalidate_param_home(&mut self, param: ParamId) {
-        self.invalidated_param_homes.insert(param);
-    }
-
-    pub(super) fn invalidate_local_home(&mut self, local: LocalId) {
-        self.invalidated_local_homes.insert(local);
-        self.direct_table_seed_locals.remove(&local);
-        self.entry_nil_phi_locals.remove(&local);
-    }
-
+    #[cfg(test)]
     pub(super) fn invalidate_temp_home(&mut self, temp: TempId) {
         self.invalidated_temp_homes.insert(temp);
+        self.possible_temp_homes.insert(temp, None);
     }
 
     pub(super) fn record_temp_to_local_merge(&mut self, temp: TempId, local: LocalId) {
         let source_home = self.trusted_temp_home_slot(temp);
         let target_home = self.trusted_local_home_slot(local);
         if source_home.is_none() || source_home != target_home {
-            self.invalidate_local_home(local);
+            self.record_local_home_merge(local, self.possible_temp_home_slots(temp));
         }
     }
 
@@ -606,7 +724,7 @@ impl ProtoPromotionFacts {
         let source_home = self.trusted_local_home_slot(local);
         let target_home = self.trusted_param_home_slot(param);
         if source_home.is_none() || source_home != target_home {
-            self.invalidate_param_home(param);
+            self.record_param_home_merge(param, self.possible_local_home_slots(local));
         }
     }
 
@@ -921,11 +1039,12 @@ impl ProtoPromotionFacts {
 fn fill_fixed_def_home_slots(
     dataflow: &DataflowFacts,
     slot_epochs: &SlotEpochFacts,
-    temp_home_slots: &mut [Option<HomeSlotKey>],
+    temp_home_slots: &mut [HomeSlotResolution],
 ) {
     for def in &dataflow.defs {
         let epoch = slot_epochs.epoch_at(def.reg, def.instr);
-        temp_home_slots[def.id.index()] = Some(HomeSlotKey::new(def.reg.index(), epoch));
+        temp_home_slots[def.id.index()] =
+            HomeSlotResolution::from_home(HomeSlotKey::new(def.reg.index(), epoch));
     }
 }
 
@@ -1401,20 +1520,20 @@ fn low_instr_may_observe_gc_roots(dataflow: &DataflowFacts, index: usize) -> boo
 fn fill_phi_home_slots(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
-    temp_home_slots: &mut [Option<HomeSlotKey>],
+    temp_home_slots: &mut [HomeSlotResolution],
 ) {
     let phi_count = plan.phis().len();
-    let mut resolutions = vec![HomeSlotResolution::Unknown; phi_count];
+    let mut resolutions = vec![HomeSlotResolution::Pending; phi_count];
     let mut consumers = vec![Vec::<PhiId>::new(); phi_count];
     let mut pending = VecDeque::<(PhiId, HomeSlotResolution)>::new();
 
     for phi in plan.phis() {
-        let mut resolution = HomeSlotResolution::Unknown;
+        let mut resolution = HomeSlotResolution::Pending;
         for incoming in &phi.incomings {
             match incoming.disposition {
                 PhiIncomingDisposition::Dead => continue,
                 PhiIncomingDisposition::DiagnosticUnresolved => {
-                    resolution = HomeSlotResolution::Conflict;
+                    resolution = HomeSlotResolution::Unknown;
                     continue;
                 }
                 PhiIncomingDisposition::RegionInput(_)
@@ -1436,13 +1555,13 @@ fn fill_phi_home_slots(
         let Some(slot) = resolutions.get_mut(phi.phi.index()) else {
             continue;
         };
-        *slot = resolution;
-        if !matches!(resolution, HomeSlotResolution::Unknown) {
+        *slot = resolution.clone();
+        if !matches!(resolution, HomeSlotResolution::Pending) {
             pending.push_back((phi.phi, resolution));
         }
     }
 
-    // resolution 只会 Unknown -> Known -> Conflict，每条依赖边最多处理两次。
+    // resolution 只会由 Pending 增长为有限集，或传播为 Unknown；集合有限，因此必然收敛。
     while let Some((phi_id, source_resolution)) = pending.pop_front() {
         let Some(phi_consumers) = consumers.get(phi_id.index()) else {
             continue;
@@ -1451,9 +1570,9 @@ fn fill_phi_home_slots(
             let Some(resolution) = resolutions.get_mut(consumer.index()) else {
                 continue;
             };
-            let merged = merge_home_slot_resolutions(*resolution, source_resolution);
+            let merged = merge_home_slot_resolutions(resolution.clone(), source_resolution.clone());
             if merged != *resolution {
-                *resolution = merged;
+                *resolution = merged.clone();
                 pending.push_back((*consumer, merged));
             }
         }
@@ -1464,7 +1583,7 @@ fn fill_phi_home_slots(
     let mut unresolved = VecDeque::new();
     let mut invalid = vec![false; phi_count];
     for (index, resolution) in resolutions.iter().enumerate() {
-        if matches!(resolution, HomeSlotResolution::Unknown) {
+        if matches!(resolution, HomeSlotResolution::Pending) {
             invalid[index] = true;
             unresolved.push_back(PhiId(index));
         }
@@ -1482,7 +1601,7 @@ fn fill_phi_home_slots(
             }
             *is_invalid = true;
             if let Some(resolution) = resolutions.get_mut(consumer.index()) {
-                *resolution = HomeSlotResolution::Conflict;
+                *resolution = HomeSlotResolution::Unknown;
             }
             unresolved.push_back(*consumer);
         }
@@ -1490,26 +1609,23 @@ fn fill_phi_home_slots(
 
     let phi_temp_offset = dataflow.defs.len();
     for (phi_index, resolution) in resolutions.into_iter().enumerate() {
-        if let HomeSlotResolution::Known(slot) = resolution
-            && let Some(home_slot) = temp_home_slots.get_mut(phi_temp_offset + phi_index)
-        {
-            *home_slot = Some(slot);
+        if let Some(home_slot) = temp_home_slots.get_mut(phi_temp_offset + phi_index) {
+            *home_slot = resolution;
         }
     }
 }
 
 fn home_slot_resolution_for_leaf(
     value: SsaValue,
-    temp_home_slots: &[Option<HomeSlotKey>],
+    temp_home_slots: &[HomeSlotResolution],
 ) -> HomeSlotResolution {
     match value {
-        SsaValue::Entry(reg) => HomeSlotResolution::Known(HomeSlotKey::new(reg.index(), 0)),
+        SsaValue::Entry(reg) => HomeSlotResolution::from_home(HomeSlotKey::new(reg.index(), 0)),
         SsaValue::Def(def) => temp_home_slots
             .get(def.index())
-            .copied()
-            .flatten()
-            .map_or(HomeSlotResolution::Unknown, HomeSlotResolution::Known),
-        SsaValue::Phi(_) => HomeSlotResolution::Unknown,
+            .cloned()
+            .unwrap_or(HomeSlotResolution::Unknown),
+        SsaValue::Phi(_) => HomeSlotResolution::Pending,
     }
 }
 
@@ -1518,17 +1634,26 @@ fn merge_home_slot_resolutions(
     right: HomeSlotResolution,
 ) -> HomeSlotResolution {
     match (left, right) {
-        (HomeSlotResolution::Conflict, _) | (_, HomeSlotResolution::Conflict) => {
-            HomeSlotResolution::Conflict
+        (HomeSlotResolution::Unknown, _) | (_, HomeSlotResolution::Unknown) => {
+            HomeSlotResolution::Unknown
         }
-        (HomeSlotResolution::Unknown, known) | (known, HomeSlotResolution::Unknown) => known,
-        (HomeSlotResolution::Known(left), HomeSlotResolution::Known(right)) if left == right => {
+        (HomeSlotResolution::Pending, known) | (known, HomeSlotResolution::Pending) => known,
+        (HomeSlotResolution::Known(mut left), HomeSlotResolution::Known(right)) => {
+            left.extend(right);
             HomeSlotResolution::Known(left)
         }
-        (HomeSlotResolution::Known(_), HomeSlotResolution::Known(_)) => {
-            HomeSlotResolution::Conflict
-        }
     }
+}
+
+fn merge_possible_home_slots(
+    left: Option<BTreeSet<HomeSlotKey>>,
+    right: Option<BTreeSet<HomeSlotKey>>,
+) -> Option<BTreeSet<HomeSlotKey>> {
+    let (Some(mut left), Some(right)) = (left, right) else {
+        return None;
+    };
+    left.extend(right);
+    Some(left)
 }
 
 #[cfg(test)]
@@ -1537,6 +1662,45 @@ mod tests {
     use crate::structure::{
         BasicBlock, BlockKind, CfgEdge, EdgeKind, EdgeRef, InstrEffect, InstrRange,
     };
+
+    #[test]
+    fn home_resolution_retains_finite_multi_home_union() {
+        let first = HomeSlotKey::new(0, 0);
+        let second = HomeSlotKey::new(1, 0);
+        let merged = merge_home_slot_resolutions(
+            HomeSlotResolution::from_home(first),
+            HomeSlotResolution::from_home(second),
+        );
+
+        assert_eq!(merged.exact_home(), None);
+        assert_eq!(
+            merged.complete_homes(),
+            Some(BTreeSet::from([first, second]))
+        );
+        assert_eq!(
+            merge_home_slot_resolutions(merged, HomeSlotResolution::Unknown),
+            HomeSlotResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn binding_merge_retains_complete_home_union_but_invalidates_exact_home() {
+        let source = TempId(0);
+        let target = LocalId(0);
+        let source_home = HomeSlotKey::new(1, 0);
+        let target_home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(source, source_home);
+        facts.record_local_home_slot(target, target_home);
+
+        facts.record_temp_to_local_merge(source, target);
+
+        assert_eq!(facts.trusted_local_home_slot(target), None);
+        assert_eq!(
+            facts.possible_local_home_slots(target),
+            Some(BTreeSet::from([target_home, source_home]))
+        );
+    }
 
     #[test]
     fn dedicated_protocol_root_prefix_excludes_future_result_slots() {

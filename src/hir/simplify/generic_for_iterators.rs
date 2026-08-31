@@ -279,7 +279,9 @@ fn iterator_pack_can_cross_assignment(
             false
         }
         LocationDisjointness::MissingHome => {
-            // 候选拒绝[ProofIncomplete]：跨 gap 的两端仍有可能来自物理槽、但至少一端缺 trusted home；promotion provenance 尚不能排除 raw-home alias。
+            // 候选拒绝[SemanticBarrier:ValueFlow]：`t(slot1)=1; t1(slot1)=2; for ... in t`
+            // 原循环读取 gap 覆盖后的 2，折叠会把字面量 1 延迟到 gap 后并改成 1；任一
+            // 完整 home 集缺失时仍可能命中该同槽反例（home-free synthetic 已登记为空集）。
             false
         }
     }
@@ -302,26 +304,15 @@ struct BindingLocations {
 impl BindingLocations {
     fn insert(&mut self, binding: DirectBinding, facts: &ProtoPromotionFacts) {
         self.bindings.insert(binding);
-        match binding {
-            DirectBinding::Param(param) => match facts.trusted_param_home_slot(param) {
-                Some(home) => {
-                    self.physical_homes.insert(home);
-                }
-                None => self.has_unknown_physical_home = true,
-            },
-            DirectBinding::Local(local) => match facts.trusted_local_home_slot(local) {
-                Some(home) => {
-                    self.physical_homes.insert(home);
-                }
-                None if facts.local_has_no_physical_home(local) => {}
-                None => self.has_unknown_physical_home = true,
-            },
-            DirectBinding::Temp(temp) => match facts.trusted_temp_home_slot(temp) {
-                Some(home) => {
-                    self.physical_homes.insert(home);
-                }
-                None => self.has_unknown_physical_home = true,
-            },
+        let possible_homes = match binding {
+            DirectBinding::Param(param) => facts.possible_param_home_slots(param),
+            DirectBinding::Local(local) => facts.possible_local_home_slots(local),
+            DirectBinding::Temp(temp) => facts.possible_temp_home_slots(temp),
+        };
+        if let Some(homes) = possible_homes {
+            self.physical_homes.extend(homes);
+        } else {
+            self.has_unknown_physical_home = true;
         }
     }
 
@@ -592,7 +583,9 @@ fn assignments_match_iterator(
             false
         }
         Err(ProducerFlowFailure::MissingHome) => {
-            // 候选拒绝[ProofIncomplete]：多个 producer 之间仍有可能来自物理槽、但至少一端缺 trusted home；promotion provenance 尚不能证明中间写无人读取或覆盖。
+            // 候选拒绝[SemanticBarrier:ValueFlow]：`t0(slot1)=1; t1(slot1)=2; for ... in t0,t1`
+            // 原 iterator 两项都读最终覆盖值 2，折叠 pack 则保留 1,2；缺完整 home 集的
+            // producer 仍可能命中该同槽反例（home-free synthetic 已登记为空集）。
             false
         }
     }
@@ -733,6 +726,23 @@ mod tests {
     }
 
     #[test]
+    fn cross_gap_accepts_unknown_temp_against_home_free_temp() {
+        let iterator = TempId(0);
+        let gap = TempId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(gap);
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(gap), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        let plan = fold_plan(&stmts, &context(&facts, [iterator]))
+            .expect("synthetic gap temp cannot alias a raw temp home");
+        assert_eq!((plan.assignment_count, plan.gap_count), (1, 1));
+    }
+
+    #[test]
     fn cross_gap_rejects_exact_home_target_overlap() {
         let iterator = TempId(0);
         let gap_local = LocalId(0);
@@ -754,7 +764,10 @@ mod tests {
         let iterator = TempId(0);
         let gap = TempId(1);
         let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(gap, HomeSlotKey::new(1, 0));
+        let shared = HomeSlotKey::new(1, 0);
+        facts.record_temp_home_slot_for_test(iterator, shared);
+        facts.record_temp_home_merge(iterator, None);
+        facts.record_temp_home_slot_for_test(gap, shared);
         let stmts = vec![
             assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
             assign(HirLValue::Temp(gap), HirExpr::Integer(2)),
@@ -762,6 +775,38 @@ mod tests {
         ];
 
         assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_none());
+    }
+
+    #[test]
+    fn cross_gap_rejects_unknown_out_of_range_temp() {
+        let iterator = TempId(42);
+        let gap_local = LocalId(0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(gap_local, HomeSlotKey::new(1, 0));
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            assign(HirLValue::Local(gap_local), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_none());
+    }
+
+    #[test]
+    fn cross_gap_accepts_disjoint_finite_home_union() {
+        let iterator = TempId(0);
+        let gap = TempId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_merge(iterator, Some(BTreeSet::from([HomeSlotKey::new(1, 0)])));
+        facts.record_temp_home_slot_for_test(gap, HomeSlotKey::new(2, 0));
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(gap), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_some());
     }
 
     #[test]
@@ -785,6 +830,78 @@ mod tests {
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(first, home);
         facts.record_temp_home_slot_for_test(second, home);
+        let stmts = vec![
+            assign(HirLValue::Temp(first), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(second), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(first), HirExpr::TempRef(second)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [first, second])).is_none());
+    }
+
+    #[test]
+    fn adjacent_producers_reject_unknown_home_set() {
+        let first = TempId(0);
+        let second = TempId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        let shared = HomeSlotKey::new(1, 0);
+        facts.record_temp_home_slot_for_test(first, shared);
+        facts.record_temp_home_merge(first, None);
+        facts.record_temp_home_slot_for_test(second, shared);
+        let stmts = vec![
+            assign(HirLValue::Temp(first), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(second), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(first), HirExpr::TempRef(second)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [first, second])).is_none());
+    }
+
+    #[test]
+    fn adjacent_producers_accept_home_free_synthetic_temp() {
+        let first = TempId(0);
+        let second = TempId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(second);
+        let stmts = vec![
+            assign(HirLValue::Temp(first), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(second), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(first), HirExpr::TempRef(second)]),
+        ];
+
+        let plan = fold_plan(&stmts, &context(&facts, [first, second]))
+            .expect("synthetic producer target cannot overlap a raw temp home");
+        assert_eq!((plan.assignment_count, plan.gap_count), (2, 0));
+    }
+
+    #[test]
+    fn adjacent_producers_accept_disjoint_finite_home_unions() {
+        let first = TempId(0);
+        let second = TempId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(first, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_merge(first, Some(BTreeSet::from([HomeSlotKey::new(1, 0)])));
+        facts.record_temp_home_slot_for_test(second, HomeSlotKey::new(2, 0));
+        facts.record_temp_home_merge(second, Some(BTreeSet::from([HomeSlotKey::new(3, 0)])));
+        let stmts = vec![
+            assign(HirLValue::Temp(first), HirExpr::Integer(1)),
+            assign(HirLValue::Temp(second), HirExpr::Integer(2)),
+            generic_for(vec![HirExpr::TempRef(first), HirExpr::TempRef(second)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [first, second])).is_some());
+    }
+
+    #[test]
+    fn adjacent_producers_reject_intersecting_finite_home_unions() {
+        let first = TempId(0);
+        let second = TempId(1);
+        let shared = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(first, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_merge(first, Some(BTreeSet::from([shared])));
+        facts.record_temp_home_slot_for_test(second, HomeSlotKey::new(2, 0));
+        facts.record_temp_home_merge(second, Some(BTreeSet::from([shared])));
         let stmts = vec![
             assign(HirLValue::Temp(first), HirExpr::Integer(1)),
             assign(HirLValue::Temp(second), HirExpr::Integer(2)),

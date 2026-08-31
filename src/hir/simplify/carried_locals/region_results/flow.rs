@@ -91,54 +91,48 @@ fn find_candidate(
             // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可引入未被结构化 verifier 覆盖的入口与出口。
             continue;
         }
-        let state_candidates =
-            writeback_targets(&block.stmts[declaration + 1..=last_mention], result_binding);
-        if state_candidates.is_empty() {
+        let eligible_states =
+            writeback_targets(&block.stmts[declaration + 1..=last_mention], result_binding)
+                .into_iter()
+                .filter(|state| {
+                    *state != result_binding
+                        && identity_facts.binding_merge_preserves_identity(
+                            result_binding,
+                            *state,
+                            promotion_facts,
+                        )
+                        && !state
+                            .local()
+                            .is_some_and(|local| identity_facts.for_bindings.contains(&local))
+                        && binding_available_before(
+                            block,
+                            declaration,
+                            *state,
+                            outer_bindings,
+                            inherited_locals,
+                        )
+                        && same_exact_home_slot(result_binding, *state, promotion_facts)
+                })
+                .collect::<Vec<_>>();
+        if eligible_states.is_empty() {
+            // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/不可用/异槽 state 与 result
+            // 具有可区分的作用域或 root epoch。
             continue;
         }
-        let [state] = state_candidates.as_slice() else {
-            // 候选拒绝[ProofIncomplete]：多个 writeback target 需要 reaching-def/phi 对应关系，当前 verifier 只建模唯一 state。
-            continue;
-        };
-        let state = *state;
-        // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/不可用/异槽 state 与 result 具有可区分的作用域或 root epoch。
-        if state == result_binding
-            || !identity_facts.binding_merge_preserves_identity(
-                result_binding,
-                state,
-                promotion_facts,
-            )
-            || state
-                .local()
-                .is_some_and(|local| identity_facts.for_bindings.contains(&local))
-            || !binding_available_before(
-                block,
-                declaration,
-                state,
-                outer_bindings,
-                inherited_locals,
-            )
-            || !same_exact_home_slot(result_binding, state, promotion_facts)
-        {
+        let completed_states = completed_writeback_states(
+            result_binding,
+            &eligible_states,
+            initializer,
+            &block.stmts[declaration + 1..=last_mention],
+        );
+        if completed_states.is_empty() {
+            // 候选拒绝[SemanticBarrier:Lifetime]：每个 eligible target 都在某条路径
+            // 读取错误 epoch、丢失 result，或以 Pending 退出；改名会提前覆盖旧 state。
             continue;
         }
-        let verifier = FlowVerifier {
-            result: result_binding,
-            state,
-        };
-        let Some(states) = verifier.validate_initializer(initializer) else {
-            continue;
-        };
-        let Some(states) =
-            verifier.validate_stmts(&block.stmts[declaration + 1..=last_mention], states)
-        else {
-            // 候选拒绝[ProofIncomplete]：region 含当前三态转移表未覆盖的 assignment/loop/opaque 组合；需增强路径 relation。
-            continue;
-        };
-        if states.contains(Relation::Pending) {
-            // 候选拒绝[SemanticBarrier:Lifetime]：存在出口上 result 已产出而 state 未同步；改名会让该路径提前覆盖旧 state。
-            continue;
-        }
+        // `completed_writeback_states` 对每个 target 独立跑完整三态 verifier；因此列表中
+        // 每一个 target 都是全路径 owner，选择稳定排序的首个不会混合不同候选的局部证明。
+        let state = completed_states[0];
         return Some(Candidate {
             declaration,
             last_mention,
@@ -170,6 +164,30 @@ fn writeback_targets(stmts: &[HirStmt], result: CarryBinding) -> Vec<CarryBindin
     };
     visit_stmts(stmts, &mut collector);
     collector.targets.into_iter().collect()
+}
+
+fn completed_writeback_states(
+    result: CarryBinding,
+    eligible_states: &[CarryBinding],
+    initializer: Option<&HirValuePack>,
+    stmts: &[HirStmt],
+) -> Vec<CarryBinding> {
+    eligible_states
+        .iter()
+        .copied()
+        .filter(|state| {
+            let verifier = FlowVerifier {
+                result,
+                state: *state,
+            };
+            let Some(states) = verifier.validate_initializer(initializer) else {
+                return false;
+            };
+            verifier
+                .validate_stmts(stmts, states)
+                .is_some_and(|states| !states.contains(Relation::Pending))
+        })
+        .collect()
 }
 
 struct WritebackTargetCollector {
@@ -386,14 +404,14 @@ impl FlowVerifier {
 
     fn validate_loop(&self, stmt: &HirStmt, states: RelationSet) -> Option<RelationSet> {
         let mentions = collect_binding_mentions_by_stmt(std::slice::from_ref(stmt));
-        if mentions[0].contains(&self.state) {
-            // 候选拒绝[ProofIncomplete]：loop 内 state mention 被 blanket 拒绝；需 loop-carried relation fixed-point 区分安全同步读写。
-            return None;
-        }
-        if !mentions[0].contains(&self.result) {
+        let mentions_result = mentions[0].contains(&self.result);
+        let mentions_state = mentions[0].contains(&self.state);
+        if !mentions_result && !mentions_state {
             return Some(states);
         }
-        if states.contains(Relation::Unproduced) || stmt_has_nested_transfer(stmt) {
+        if (mentions_result && states.contains(Relation::Unproduced))
+            || stmt_has_nested_transfer(stmt)
+        {
             // 候选拒绝[SemanticBarrier:ControlFlow]：未产出 result 进入 loop 或 nested break/continue/return 会形成当前 fixed-point 未记录的出口/回边。
             return None;
         }
@@ -677,7 +695,8 @@ fn binding_lvalue(binding: CarryBinding) -> HirLValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::common::{HirPackTail, TempId};
+    use crate::hir::common::{HirBinaryExpr, HirBinaryOpKind, HirIf, HirPackTail, TempId};
+    use crate::hir::promotion::HomeSlotKey;
 
     fn verifier() -> FlowVerifier {
         FlowVerifier {
@@ -758,6 +777,152 @@ mod tests {
         }));
 
         assert!(writeback_targets(&[assign], result) == vec![CarryBinding::Local(LocalId(1))]);
+    }
+
+    #[test]
+    fn completed_writeback_filter_excludes_parallel_side_copy() {
+        let result = CarryBinding::Local(LocalId(0));
+        let first = CarryBinding::Local(LocalId(1));
+        let second = CarryBinding::Local(LocalId(2));
+        let stmts = vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(1)), HirLValue::Local(LocalId(2))],
+                values: HirValuePack::fixed(vec![
+                    HirExpr::LocalRef(LocalId(0)),
+                    HirExpr::Binary(Box::new(HirBinaryExpr {
+                        op: HirBinaryOpKind::Add,
+                        lhs: HirExpr::LocalRef(LocalId(0)),
+                        rhs: HirExpr::LocalRef(LocalId(2)),
+                    })),
+                ]),
+            })),
+        ];
+        let eligible = writeback_targets(&stmts, result);
+
+        assert!(eligible == vec![first, second]);
+        assert!(completed_writeback_states(result, &eligible, None, &stmts) == vec![first]);
+    }
+
+    #[test]
+    fn completed_writeback_filter_reports_each_fully_verified_owner() {
+        let result = CarryBinding::Local(LocalId(0));
+        let first = CarryBinding::Local(LocalId(1));
+        let second = CarryBinding::Local(LocalId(2));
+        let write_both = |targets| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets,
+                values: HirValuePack::fixed(vec![
+                    HirExpr::LocalRef(LocalId(0)),
+                    HirExpr::LocalRef(LocalId(0)),
+                ]),
+            }))
+        };
+        let stmts = vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+            })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::TempRef(TempId(0)),
+                then_block: HirBlock {
+                    stmts: vec![write_both(vec![
+                        HirLValue::Local(LocalId(1)),
+                        HirLValue::Local(LocalId(2)),
+                    ])],
+                },
+                else_block: Some(HirBlock {
+                    stmts: vec![write_both(vec![
+                        HirLValue::Local(LocalId(2)),
+                        HirLValue::Local(LocalId(1)),
+                    ])],
+                }),
+            })),
+        ];
+        let eligible = writeback_targets(&stmts, result);
+
+        assert!(eligible == vec![first, second]);
+        assert!(completed_writeback_states(result, &eligible, None, &stmts) == vec![first, second]);
+    }
+
+    #[test]
+    fn multiple_completed_targets_choose_one_fully_verified_owner() {
+        let write_both = |targets| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets,
+                values: HirValuePack::fixed(vec![
+                    HirExpr::LocalRef(LocalId(0)),
+                    HirExpr::LocalRef(LocalId(0)),
+                ]),
+            }))
+        };
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![LocalId(1)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![LocalId(2)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![LocalId(0)],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                })),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::TempRef(TempId(0)),
+                    then_block: HirBlock {
+                        stmts: vec![write_both(vec![
+                            HirLValue::Local(LocalId(1)),
+                            HirLValue::Local(LocalId(2)),
+                        ])],
+                    },
+                    else_block: Some(HirBlock {
+                        stmts: vec![write_both(vec![
+                            HirLValue::Local(LocalId(2)),
+                            HirLValue::Local(LocalId(1)),
+                        ])],
+                    }),
+                })),
+            ],
+        };
+        let mut facts = ProtoPromotionFacts::default();
+        for local in [LocalId(0), LocalId(1), LocalId(2)] {
+            facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
+        }
+        let identity = HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            captured: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+        };
+
+        let candidate = find_candidate(
+            &block,
+            &BTreeSet::new(),
+            &facts,
+            &identity,
+            &BTreeSet::new(),
+        )
+        .expect("each completed target is independently safe as the transaction owner");
+        assert!(candidate.state == CarryBinding::Local(LocalId(1)));
+
+        apply_candidate(&mut block, candidate, &mut facts);
+        assert!(
+            collect_binding_mentions_by_stmt(&block.stmts)
+                .iter()
+                .all(|mentions| !mentions.contains(&CarryBinding::Local(LocalId(0))))
+        );
     }
 
     #[test]

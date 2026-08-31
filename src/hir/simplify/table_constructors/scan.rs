@@ -5,11 +5,14 @@
 //! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
 //! 全 nil 且没有 debug identity 的 local 声明不产生求值事件；scanner 会把它记入保留计划，
 //! 只有后续 constructor step 不读取这些 binding 时才继续，commit 因而能保留声明本身。
+//! closed short pack 的缺失槽则显式投影为 `ImplicitNil` producer；同一声明的槽要么全部删除，
+//! 要么由 source preservation plan 整句保留，不能只删一部分 materialization。
 //! 旧值已证明为 nil 的简单 local assignment 也可保留，但从该点起只允许独立、无事件的
 //! constructor step 前移；赋值仍在原位完成 capture cell 更新和物理 root handoff。
 
 use crate::ast::DecompileDialect;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack};
+use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 
 use super::bindings::{
     BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue, expr_uses_binding,
@@ -17,7 +20,9 @@ use super::bindings::{
 use super::builder::ConstructorBuilder;
 use super::rebuild::producer_value_can_be_dropped;
 use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
-use super::{BindingId, BindingSlots, RebuildScratch, RegionStep, TableBinding};
+use super::{
+    BindingId, BindingSlots, ProducerSourcePreservation, RebuildScratch, RegionStep, TableBinding,
+};
 
 /// 按稳定 stmt id 记录每个 binding 最后可能扩展构造器的位置。
 ///
@@ -170,12 +175,16 @@ pub(super) fn try_rebuild_constructor_region(
         }
         let boundary_step = if keyed_write_step(stmt, binding) {
             RegionStep::Record { stmt_index: index }
-        } else if let Some(producer_bindings) = producer_steps(stmt, index, binding, &mut steps) {
+        } else if let Some((producer_bindings, source_preservation)) =
+            producer_steps(stmt, index, binding, debug_identity_bindings, &mut steps)
+        {
             for producer_binding in producer_bindings {
                 let binding_id = binding_index
                     .id_of(producer_binding)
                     .expect("producer binding should be indexed");
-                if let Some(last_use) = binding_occurrences.last_use(binding_id) {
+                if source_preservation != ProducerSourcePreservation::Safe
+                    && let Some(last_use) = binding_occurrences.last_use(binding_id)
+                {
                     use_horizon =
                         Some(use_horizon.map_or(last_use, |horizon| horizon.max(last_use)));
                 }
@@ -204,7 +213,24 @@ pub(super) fn try_rebuild_constructor_region(
             dialect,
             scratch,
         );
-        if try_extend_constructor_from_steps(&mut committed_builder, &steps, &mut rebuild_context) {
+        if let Some(preserved_producer_sources) =
+            try_extend_constructor_from_steps(&mut committed_builder, &steps, &mut rebuild_context)
+        {
+            for stmt_index in preserved_producer_sources {
+                if preserved_stmt_indices.binary_search(&stmt_index).is_err() {
+                    preserved_stmt_indices.push(stmt_index);
+                    preserved_stmt_indices.sort_unstable();
+                }
+                let HirStmt::LocalDecl(local_decl) = &block.stmts[stmt_index] else {
+                    unreachable!("preservable producer source must be a local declaration")
+                };
+                for local in &local_decl.bindings {
+                    let binding = TableBinding::Local(*local);
+                    if !preserved_scope_bindings.contains(&binding) {
+                        preserved_scope_bindings.push(binding);
+                    }
+                }
+            }
             best_end = Some((index, preserved_stmt_indices.clone()));
             steps.clear();
             use_horizon = None;
@@ -228,8 +254,9 @@ pub(super) fn try_rebuild_constructor_region(
     })
 }
 
-/// 全 nil 声明没有求值事件，但它的词法 binding 仍可能在区间后使用；声明保持原位，
-/// caller 只移动与这些 binding 独立的 constructor work。
+/// 显式全 nil 声明没有求值事件，但它的词法 binding 仍可能在区间后使用；声明保持原位，
+/// caller 只移动与这些 binding 独立的 constructor work。无 RHS 的 closed pack 交给 producer
+/// transaction，以便所有被消费槽一起投影成隐式 nil。
 fn preserved_nil_local_bindings(
     stmt: &HirStmt,
     debug_identity_bindings: &BindingSlots<bool>,
@@ -239,6 +266,7 @@ fn preserved_nil_local_bindings(
     };
     if local_decl.bindings.is_empty()
         || local_decl.values.tail.is_some()
+        || local_decl.values.fixed.is_empty()
         || local_decl
             .values
             .fixed
@@ -465,22 +493,31 @@ fn producer_steps(
     stmt: &HirStmt,
     stmt_index: usize,
     constructor_binding: TableBinding,
+    debug_identity_bindings: &BindingSlots<bool>,
     steps: &mut Vec<RegionStep>,
-) -> Option<Vec<TableBinding>> {
+) -> Option<(Vec<TableBinding>, ProducerSourcePreservation)> {
     match stmt {
-        HirStmt::LocalDecl(local_decl) if local_decl.values.tail.is_none() => {
+        HirStmt::LocalDecl(local_decl) => {
+            let bindings = local_decl
+                .bindings
+                .iter()
+                .copied()
+                .map(TableBinding::Local)
+                .collect::<Vec<_>>();
+            let source_preservation = producer_source_preservation(
+                &bindings,
+                &local_decl.values,
+                debug_identity_bindings,
+            );
             producer_steps_from_bindings(
-                local_decl
-                    .bindings
-                    .iter()
-                    .copied()
-                    .map(TableBinding::Local)
-                    .collect::<Vec<_>>(),
+                bindings,
                 &local_decl.values,
                 constructor_binding,
                 stmt_index,
+                source_preservation,
                 steps,
             )
+            .map(|bindings| (bindings, source_preservation))
         }
         // entry-nil、保留原写且只跨无事件字段的 assignment 已由 scanner 提前消费；
         // 其余 assignment 不是 producer declaration，并可能带独立 root/写后读语义。
@@ -496,9 +533,10 @@ fn producer_steps_from_bindings(
     values: &HirValuePack,
     constructor_binding: TableBinding,
     stmt_index: usize,
+    source_preservation: ProducerSourcePreservation,
     steps: &mut Vec<RegionStep>,
 ) -> Option<Vec<TableBinding>> {
-    if bindings.is_empty() || values.is_empty() {
+    if bindings.is_empty() {
         return None;
     }
     // 候选拒绝[SemanticBarrier:Scope]：`local t = t` 或 producer RHS 读取 owner 时，
@@ -511,16 +549,78 @@ fn producer_steps_from_bindings(
         return None;
     }
 
-    if values.tail.is_some() || bindings.len() != values.fixed.len() {
-        // 候选拒绝[ProofIncomplete]：open/mismatched pack 缺少逐 slot value-width 与 owner 事实。
+    if values.tail.is_some() {
+        // 候选拒绝[ProofIncomplete]：open tail 的运行时宽度决定每个后续 binding 是结果还是
+        // nil padding；exact-width tail 虽有总宽度，也仍缺少单个结果的 scalar projection
+        // carrier。不能把任一形状按 closed pack 的缺失槽直接映射为 nil。
         return None;
+    }
+    if let Some(surplus) = values.fixed.get(bindings.len()..) {
+        if surplus.iter().any(expr_observes_eval_order) {
+            // 候选拒绝[SemanticBarrier:EvalCount]：多余 RHS 仍必须按源码顺序求值；直接
+            // zip 并删除 `local value = 1, mark()` 会丢掉 mark 调用。
+            return None;
+        }
+        if surplus
+            .iter()
+            .any(|value| !seed_delay_expr_is_unobservable(value))
+        {
+            // 候选拒绝[ProofIncomplete]：无可观察求值事件但会分配临时对象、携带 open
+            // value arity 或保留 capture snapshot 的 discarded RHS，仍缺 statement 内
+            // temporary-root lifetime/value-width 事实；literal 与直接 binding read 已放行。
+            return None;
+        }
     }
 
     steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
         stmt_index,
         slot_index,
+        source_preservation,
     }));
     Some(bindings)
+}
+
+fn producer_source_preservation(
+    bindings: &[TableBinding],
+    values: &HirValuePack,
+    debug_identity_bindings: &BindingSlots<bool>,
+) -> ProducerSourcePreservation {
+    if bindings.iter().any(|binding| {
+        debug_identity_bindings
+            .get(*binding)
+            .copied()
+            .unwrap_or_default()
+    }) {
+        return ProducerSourcePreservation::DebugIdentity;
+    }
+    if values.fixed.iter().any(expr_requires_ordered_snapshot) {
+        return ProducerSourcePreservation::ObservableReplay;
+    }
+    if values.fixed.iter().all(|value| {
+        matches!(
+            value,
+            HirExpr::Nil
+                | HirExpr::Boolean(_)
+                | HirExpr::Integer(_)
+                | HirExpr::Number(_)
+                | HirExpr::String(_)
+                | HirExpr::Int64(_)
+                | HirExpr::UInt64(_)
+                | HirExpr::Vector(_)
+                | HirExpr::Complex { .. }
+        )
+    }) {
+        if bindings.len() == 1 && values.fixed.len() == 1 {
+            ProducerSourcePreservation::Safe
+        } else {
+            // Multi-slot, nil-padded, and primitive-surplus declarations are safe to retain only
+            // as one statement. The distinct plan also keeps scanner's last-use horizon active so
+            // every consumable slot gets a chance to join the same removal transaction.
+            ProducerSourcePreservation::InertWholeStatement
+        }
+    } else {
+        ProducerSourcePreservation::UnsupportedShape
+    }
 }
 
 pub(super) fn seed_overwrite_delay_is_unobservable(
@@ -534,7 +634,6 @@ pub(super) fn seed_overwrite_delay_is_unobservable(
         .all(|stmt| match stmt {
             HirStmt::LocalDecl(decl) => {
                 decl.values.tail.is_none()
-                    && decl.values.fixed.len() == decl.bindings.len()
                     && decl.values.fixed.iter().all(producer_value_can_be_dropped)
                     && decl
                         .values
@@ -613,4 +712,299 @@ fn table_set_list_binding(stmt: &HirStmt) -> Option<TableBinding> {
         return None;
     }
     Some(binding)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::ast::DecompileDialect;
+    use crate::hir::common::{
+        HirAssign, HirBlock, HirCallExpr, HirExpr, HirGlobalRef, HirLValue, HirLocalDecl,
+        HirPackTail, HirReturn, HirStmt, HirTableAccess, HirTableConstructor, HirTableField,
+        HirValuePack, LocalId,
+    };
+    use crate::hir::promotion::ProtoPromotionFacts;
+
+    use super::super::bindings::{
+        BindingIndex, BindingOccurrenceIndex, BindingSlots, collect_stmt_binding_summary,
+    };
+    use super::{TableBinding, try_rebuild_constructor_region};
+
+    fn local(binding: LocalId, value: HirExpr) -> HirStmt {
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![binding],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn record(table: LocalId, value: HirExpr) -> HirStmt {
+        record_named(table, "field", value)
+    }
+
+    fn record_named(table: LocalId, key: &str, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                base: HirExpr::LocalRef(table),
+                key: HirExpr::String(key.into()),
+            }))],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn call(name: &str) -> HirExpr {
+        HirExpr::Call(Box::new(HirCallExpr {
+            callee: HirExpr::GlobalRef(HirGlobalRef { name: name.into() }),
+            args: HirValuePack::default(),
+            method: false,
+            fastcall: None,
+            method_name: None,
+        }))
+    }
+
+    fn returned(value: HirExpr) -> HirStmt {
+        HirStmt::Return(Box::new(HirReturn {
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn rebuild(block: &HirBlock) -> Option<(HirTableConstructor, usize, Vec<usize>)> {
+        let mut binding_index = BindingIndex::new(0, 3);
+        let summaries = block
+            .stmts
+            .iter()
+            .map(|stmt| collect_stmt_binding_summary(stmt, &mut binding_index))
+            .collect::<Vec<_>>();
+        let debug_identities = BindingSlots::from_debug_hints(&[], &[None, None, None]);
+        let occurrences = BindingOccurrenceIndex::new(
+            &binding_index,
+            &summaries,
+            &debug_identities,
+            &BTreeSet::new(),
+            &debug_identities,
+            &ProtoPromotionFacts::default(),
+        );
+        let stmt_ids = (0..block.stmts.len()).collect::<Vec<_>>();
+        let materialized_counts = vec![1; binding_index.len()];
+        let mut scratch = Default::default();
+        try_rebuild_constructor_region(
+            block,
+            0,
+            TableBinding::Local(LocalId(0)),
+            HirTableConstructor::default(),
+            &binding_index,
+            &occurrences,
+            &materialized_counts,
+            &debug_identities,
+            &stmt_ids,
+            DecompileDialect::Lua54,
+            &mut scratch,
+        )
+    }
+
+    #[test]
+    fn scalar_producer_with_later_use_is_preserved_after_partial_rebuild() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                local(LocalId(1), HirExpr::Integer(7)),
+                record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
+                returned(HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+
+        let (constructor, end_index, preserved) =
+            rebuild(&block).expect("eventless scalar source should support partial rebuild");
+
+        assert_eq!(end_index, 2);
+        assert_eq!(preserved, vec![1]);
+        assert_eq!(
+            constructor.fields,
+            vec![HirTableField::Record(crate::hir::common::HirRecordField {
+                key: crate::hir::common::HirTableKey::Name("field".into()),
+                value: HirExpr::Integer(7),
+            })]
+        );
+    }
+
+    #[test]
+    fn unconsumed_scalar_producer_is_preserved_around_rebuilt_field() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                local(LocalId(1), HirExpr::Integer(7)),
+                record(LocalId(0), HirExpr::Integer(9)),
+            ],
+        };
+
+        let (constructor, end_index, preserved) =
+            rebuild(&block).expect("unconsumed eventless source should remain in the block");
+
+        assert_eq!(end_index, 2);
+        assert_eq!(preserved, vec![1]);
+        assert_eq!(constructor.fields.len(), 1);
+    }
+
+    #[test]
+    fn allocated_producer_with_later_use_keeps_the_original_region() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                local(LocalId(1), HirExpr::TableConstructor(Box::default())),
+                record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
+                returned(HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+
+        assert!(rebuild(&block).is_none());
+    }
+
+    #[test]
+    fn closed_short_pack_projects_missing_binding_as_nil() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1), LocalId(2)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                })),
+                record_named(LocalId(0), "first", HirExpr::LocalRef(LocalId(1))),
+                record_named(LocalId(0), "second", HirExpr::LocalRef(LocalId(2))),
+            ],
+        };
+
+        let (constructor, end_index, preserved) =
+            rebuild(&block).expect("closed short pack should provide nil for missing slots");
+
+        assert_eq!(end_index, 3);
+        assert!(preserved.is_empty());
+        assert_eq!(
+            constructor.fields,
+            vec![
+                HirTableField::Record(crate::hir::common::HirRecordField {
+                    key: crate::hir::common::HirTableKey::Name("first".into()),
+                    value: HirExpr::Integer(7),
+                }),
+                HirTableField::Record(crate::hir::common::HirRecordField {
+                    key: crate::hir::common::HirTableKey::Name("second".into()),
+                    value: HirExpr::Nil,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_rhs_projects_every_consumed_binding_as_nil() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1), LocalId(2)],
+                    values: HirValuePack::default(),
+                })),
+                record_named(LocalId(0), "first", HirExpr::LocalRef(LocalId(1))),
+                record_named(LocalId(0), "second", HirExpr::LocalRef(LocalId(2))),
+            ],
+        };
+
+        let (constructor, end_index, preserved) =
+            rebuild(&block).expect("zero RHS should nil-pad every consumed binding");
+
+        assert_eq!(end_index, 3);
+        assert!(preserved.is_empty());
+        assert_eq!(
+            constructor
+                .fields
+                .iter()
+                .map(|field| match field {
+                    HirTableField::Record(field) => &field.value,
+                    HirTableField::Array(_) => panic!("expected record field"),
+                })
+                .collect::<Vec<_>>(),
+            vec![&HirExpr::Nil, &HirExpr::Nil]
+        );
+    }
+
+    #[test]
+    fn short_pack_preserves_the_whole_declaration_when_a_slot_is_unconsumed() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1), LocalId(2)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                })),
+                record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+
+        let (constructor, end_index, preserved) =
+            rebuild(&block).expect("inert multi-slot source may remain as one declaration");
+
+        assert_eq!(end_index, 2);
+        assert_eq!(preserved, vec![1]);
+        assert_eq!(constructor.fields.len(), 1);
+    }
+
+    #[test]
+    fn surplus_primitive_rhs_can_be_discarded() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(8)]),
+                })),
+                record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+
+        let (constructor, end_index, preserved) =
+            rebuild(&block).expect("primitive discarded RHS has no event or surviving root");
+
+        assert_eq!(end_index, 2);
+        assert!(preserved.is_empty());
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [HirTableField::Record(field)] if field.value == HirExpr::Integer(7)
+        ));
+    }
+
+    #[test]
+    fn surplus_effectful_rhs_keeps_the_original_region() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(7), call("mark")]),
+                })),
+                record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+
+        assert!(rebuild(&block).is_none());
+    }
+
+    #[test]
+    fn pack_tail_is_not_treated_as_closed_nil_padding() {
+        for tail in [
+            HirPackTail::open(HirExpr::VarArg),
+            HirPackTail::exact(HirExpr::VarArg, 2),
+        ] {
+            let block = HirBlock {
+                stmts: vec![
+                    local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                    HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: vec![LocalId(1), LocalId(2)],
+                        values: HirValuePack::expanding(Vec::new(), tail),
+                    })),
+                    record_named(LocalId(0), "first", HirExpr::LocalRef(LocalId(1))),
+                    record_named(LocalId(0), "second", HirExpr::LocalRef(LocalId(2))),
+                ],
+            };
+
+            assert!(rebuild(&block).is_none());
+        }
+    }
 }

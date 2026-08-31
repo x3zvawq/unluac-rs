@@ -1361,24 +1361,43 @@ fn root_open_return_nil_pack_plan(
         };
 
         let mut target_slots = BTreeSet::new();
-        if targets.iter().any(|target| {
+        let mut targets_are_safe = true;
+        for target in &targets {
             // 候选拒绝[ProofIncomplete]：非 entry-nil materialization 尚未证明可跨整段 root 前缀消除；应以目标 epoch 的完整 def/use 取代来源形状。
-            !facts.overwrites_entry_nil(*target)
+            if !facts.overwrites_entry_nil(*target)
                 // 候选拒绝[SemanticBarrier:Lifetime]：额外 use 会继续观察原 nil 写入后的 temp。
                 || total_use_count(*target, live_use_counts) != 1
                 // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
                 || scratch.has_debug_local_hint(*target)
-                // 候选拒绝[ProofIncomplete]：缺可信 home 时，当前计划没有精确 slot epoch 证明。
-                // 候选拒绝[SemanticBarrier:Capture]：已引用捕获 target home 时，删除写入会让 closure 观察旧值。
-                || facts
-                    .trusted_temp_home_slot(*target)
-                    .is_none_or(|slot| {
-                        target_slots.insert(slot);
-                        captured_slots.contains(&slot)
-                    })
-        }) || !block.stmts[assignment_index + 1..return_index]
-            .iter()
-            .all(|stmt| root_nil_pack_gap_preserves_slots(stmt, &target_slots, facts))
+            {
+                targets_are_safe = false;
+                break;
+            }
+            let Some(possible_homes) = facts.possible_temp_home_slots(*target) else {
+                // 候选拒绝[ProofIncomplete]：target 的 merge 来源缺完整 possible-home 集，
+                // 无法排除被删除 nil 写命中 captured cell；lowering synthetic temp 的空集
+                // 与 invalidated 但 complete 的有限并集均已由 promotion owner 放行。
+                targets_are_safe = false;
+                break;
+            };
+            // 候选拒绝[SemanticBarrier:Capture]：任一可能 target home 已被引用捕获时，
+            // 删除 nil 写会让 closure 继续观察旧值。
+            if possible_homes
+                .iter()
+                .any(|slot| captured_slots.contains(slot))
+            {
+                targets_are_safe = false;
+                break;
+            }
+            target_slots.extend(possible_homes);
+        }
+        let protected_temps = targets.iter().copied().collect::<BTreeSet<_>>();
+        if !targets_are_safe
+            || !block.stmts[assignment_index + 1..return_index]
+                .iter()
+                .all(|stmt| {
+                    root_nil_pack_gap_preserves_slots(stmt, &protected_temps, &target_slots, facts)
+                })
         {
             continue;
         }
@@ -1468,12 +1487,17 @@ fn inline_terminal_nil_return_pack(
         .get(assign_index)
         .expect("capture snapshots must cover the terminal nil-pack assignment");
     for target in &targets {
-        let Some(slot) = facts.trusted_temp_home_slot(*target) else {
-            // 候选拒绝[ProofIncomplete]：目标缺可信 home，无法证明 nil 写与 return 读取保持同槽同 epoch。
+        let Some(possible_homes) = facts.possible_temp_home_slots(*target) else {
+            // 候选拒绝[ProofIncomplete]：target 的 merge 来源缺完整 possible-home 集，
+            // 无法排除 nil 写命中 captured cell；同一 HIR temp 的 return use 不要求单一 home。
             return false;
         };
-        // 候选拒绝[SemanticBarrier:Capture]：closure 已引用捕获目标 home 时，删除 nil 写会让其继续观察旧值。
-        if captured_slots.contains(&slot) {
+        // 候选拒绝[SemanticBarrier:Capture]：closure 已引用捕获任一可能 target home 时，
+        // 删除 nil 写会让其继续观察旧值。
+        if possible_homes
+            .iter()
+            .any(|slot| captured_slots.contains(slot))
+        {
             return false;
         }
         // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
@@ -1499,25 +1523,35 @@ fn inline_terminal_nil_return_pack(
 
 fn root_nil_pack_gap_preserves_slots(
     stmt: &HirStmt,
-    protected: &BTreeSet<HomeSlotKey>,
+    protected_temps: &BTreeSet<TempId>,
+    protected_slots: &BTreeSet<HomeSlotKey>,
     facts: &ProtoPromotionFacts,
 ) -> bool {
+    // 候选拒绝[ProofIncomplete]：gap direct binding 的 merge 来源若缺完整 possible-home
+    // 集合，无法排除它覆盖 protected epoch；home-free 与 complete finite union 均可判定。
     match stmt {
         HirStmt::Assign(assign) => {
-            // 候选拒绝[ProofIncomplete]：gap 目标缺可信 home 时没有区间 clobber 证明；应消费统一 stmt write-set。
             // 候选拒绝[SemanticBarrier:EvalOrder]：`t=nil; t=x; return t` 若跨过同槽写，会错误恢复成 `return nil`。
             assign.targets.iter().all(|target| {
-                direct_lvalue_home_slot(target, facts)
-                    .is_some_and(|slot| slot.is_none_or(|slot| !protected.contains(&slot)))
+                if matches!(target, HirLValue::Temp(temp) if protected_temps.contains(temp)) {
+                    return false;
+                }
+                if protected_slots.is_empty() {
+                    return true;
+                }
+                direct_lvalue_possible_home_slots(target, facts)
+                    .is_some_and(|homes| homes.is_disjoint(protected_slots))
             })
         }
         HirStmt::LocalDecl(local_decl) => {
-            // 候选拒绝[ProofIncomplete]：local 缺可信 home 时没有区间 clobber 证明。
             // 候选拒绝[SemanticBarrier:EvalOrder]：gap local 写复用 protected home 会覆盖 return 应读取的 nil temp。
+            if protected_slots.is_empty() {
+                return true;
+            }
             local_decl.bindings.iter().all(|local| {
                 facts
-                    .trusted_local_home_slot(*local)
-                    .is_some_and(|slot| !protected.contains(&slot))
+                    .possible_local_home_slots(*local)
+                    .is_some_and(|homes| homes.is_disjoint(protected_slots))
             })
         }
         HirStmt::TableSetList(_) | HirStmt::CallStmt(_) => true,
@@ -1540,15 +1574,17 @@ fn root_nil_pack_gap_preserves_slots(
     }
 }
 
-fn direct_lvalue_home_slot(
+fn direct_lvalue_possible_home_slots(
     target: &HirLValue,
     facts: &ProtoPromotionFacts,
-) -> Option<Option<HomeSlotKey>> {
+) -> Option<BTreeSet<HomeSlotKey>> {
     match target {
-        HirLValue::Param(param) => facts.trusted_param_home_slot(*param).map(Some),
-        HirLValue::Temp(temp) => facts.trusted_temp_home_slot(*temp).map(Some),
-        HirLValue::Local(local) => facts.trusted_local_home_slot(*local).map(Some),
-        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => Some(None),
+        HirLValue::Param(param) => facts.possible_param_home_slots(*param),
+        HirLValue::Temp(temp) => facts.possible_temp_home_slots(*temp),
+        HirLValue::Local(local) => facts.possible_local_home_slots(*local),
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
+            Some(BTreeSet::new())
+        }
     }
 }
 
@@ -1822,6 +1858,8 @@ fn inline_open_return_fixed_alias_run(
     let captured_slots = captured_slots_before_stmt
         .get(run_end)
         .expect("capture snapshots must cover the planned open-return sink");
+    let mut target_temps = BTreeSet::new();
+    let mut source_temps = BTreeSet::new();
     let mut target_slots = BTreeSet::new();
     let mut source_slots = BTreeSet::new();
     for (stmt, fixed) in block.stmts[run_start..(run_start + alias_count)]
@@ -1839,23 +1877,30 @@ fn inline_open_return_fixed_alias_run(
             // 候选拒绝[LayerBoundary]：debug alias 是源码 binding。
             return false;
         }
-        let (Some(target_slot), Some(source_slot)) = (
-            facts.trusted_temp_home_slot(target),
-            facts.trusted_temp_home_slot(*source),
+        let (Some(target_homes), Some(source_homes)) = (
+            facts.possible_temp_home_slots(target),
+            facts.possible_temp_home_slots(*source),
         ) else {
-            // 候选拒绝[ProofIncomplete]：alias source/target 缺可信 home，不能证明 open tail setup 不覆盖它们。
+            // 候选拒绝[ProofIncomplete]：alias source/target 的 merge 来源缺完整 possible-home
+            // 集，不能证明 open tail setup 不覆盖它们；home-free 与 complete finite union 已放行。
             return false;
         };
-        if captured_slots.contains(&target_slot)
-            || captured_slots.contains(&source_slot)
-            || !target_slots.insert(target_slot)
+        if target_homes
+            .iter()
+            .chain(&source_homes)
+            .any(|home| captured_slots.contains(home))
+            || !target_temps.insert(target)
+            || !target_slots.is_disjoint(&target_homes)
         {
-            // 候选拒绝[SemanticBarrier:Capture]：source/target home 已捕获，或多个 target 共享槽时，移动读取会改变 closure/slot 生命周期。
+            // 候选拒绝[SemanticBarrier:Capture]：source/target 的任一可能 home 已捕获，
+            // 或多个 target 可能共享 HIR/物理槽时，移动读取会改变 closure/slot 生命周期。
             return false;
         }
-        source_slots.insert(source_slot);
+        source_temps.insert(*source);
+        target_slots.extend(target_homes);
+        source_slots.extend(source_homes);
     }
-    if !target_slots.is_disjoint(&source_slots) {
+    if !target_temps.is_disjoint(&source_temps) || !target_slots.is_disjoint(&source_slots) {
         // 候选拒绝[SemanticBarrier:EvalOrder]：source/target 同槽会让 fixed return 读到 tail setup 后的新值；见 regress_310。
         return false;
     }
@@ -1864,11 +1909,21 @@ fn inline_open_return_fixed_alias_run(
         let Some((target, _)) = inline_candidate(stmt) else {
             return false;
         };
-        let Some(slot) = facts.trusted_temp_home_slot(target) else {
-            // 候选拒绝[ProofIncomplete]：tail setup 目标缺可信 home，无法证明它不覆盖 fixed source/target。
+        if target_temps.contains(&target) || source_temps.contains(&target) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：tail setup 直接重写 fixed alias 的 source/target
+            // HIR binding 时，延后读取会切到 setup 后的新值。
             return false;
-        };
-        if target_slots.contains(&slot) || source_slots.contains(&slot) {
+        }
+        let protected_slots_are_empty = target_slots.is_empty() && source_slots.is_empty();
+        let possible_homes = facts.possible_temp_home_slots(target);
+        if !protected_slots_are_empty && possible_homes.is_none() {
+            // 候选拒绝[ProofIncomplete]：tail setup target 的 merge 来源缺完整 possible-home
+            // 集，无法排除覆盖 fixed source/target；若 alias 双方均 home-free 则无需物理证明。
+            return false;
+        }
+        if possible_homes.is_some_and(|homes| {
+            !homes.is_disjoint(&target_slots) || !homes.is_disjoint(&source_slots)
+        }) {
             // 候选拒绝[SemanticBarrier:EvalOrder]：tail setup 覆盖 fixed alias 槽时，内联会把读取延后到覆盖之后。
             return false;
         }
@@ -2275,4 +2330,274 @@ fn temp_rebinds_captured_slot(
     facts
         .home_slot(temp)
         .is_some_and(|slot| captured_slots.contains(&slot))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirAssign, HirGlobalRef, HirPackTail, HirReturn, HirValuePack};
+    use crate::parser::{ProtoLineRange, ProtoSignature};
+
+    fn empty_proto(body: HirBlock, temps: Vec<TempId>) -> HirProto {
+        let temp_count = temps.len();
+        HirProto {
+            id: crate::hir::common::HirProtoRef(0),
+            source: None,
+            line_range: ProtoLineRange {
+                defined_start: 0,
+                defined_end: 0,
+            },
+            signature: ProtoSignature {
+                num_params: 0,
+                is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
+                legacy_arg_slot: false,
+            },
+            params: Vec::new(),
+            param_debug_hints: Vec::new(),
+            locals: Vec::new(),
+            local_debug_hints: Vec::new(),
+            local_debug_scopes: Vec::new(),
+            debug_scopes: Vec::new(),
+            physical_root_temps: BTreeSet::new(),
+            physical_root_locals: BTreeSet::new(),
+            upvalues: Vec::new(),
+            mutable_upvalues: BTreeSet::new(),
+            upvalue_debug_hints: Vec::new(),
+            temps,
+            temp_debug_locals: vec![None; temp_count],
+            temp_debug_scopes: vec![None; temp_count],
+            body,
+            children: Vec::new(),
+            failure: None,
+            detached_children: Vec::new(),
+        }
+    }
+
+    fn terminal_nil_pack_block() -> HirBlock {
+        HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(TempId(0)), HirLValue::Temp(TempId(1))],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil, HirExpr::Nil]),
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![
+                        HirExpr::TempRef(TempId(0)),
+                        HirExpr::TempRef(TempId(1)),
+                    ]),
+                })),
+            ],
+        }
+    }
+
+    fn open_return_alias_block(setup_target: TempId) -> HirBlock {
+        let alias = |target, source| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(target)],
+                values: HirValuePack::fixed(vec![HirExpr::TempRef(source)]),
+            }))
+        };
+        HirBlock {
+            stmts: vec![
+                alias(TempId(0), TempId(2)),
+                alias(TempId(1), TempId(3)),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(setup_target)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::expanding(
+                        vec![HirExpr::TempRef(TempId(0)), HirExpr::TempRef(TempId(1))],
+                        HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                            callee: HirExpr::GlobalRef(HirGlobalRef {
+                                name: "tail".into(),
+                            }),
+                            args: HirValuePack::default(),
+                            method: false,
+                            fastcall: None,
+                            method_name: None,
+                        }))),
+                    ),
+                })),
+            ],
+        }
+    }
+
+    fn empty_capture_snapshots(stmt_count: usize) -> CapturedSlotSnapshots {
+        let empty = BTreeSet::new();
+        let mut snapshots = CapturedSlotSnapshots::new(stmt_count, &empty);
+        for _ in 0..stmt_count {
+            snapshots.push(&empty);
+        }
+        snapshots
+    }
+
+    #[test]
+    fn terminal_nil_pack_accepts_explicitly_home_free_temps() {
+        let mut block = terminal_nil_pack_block();
+        let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
+        let scratch = TempUseScratch::new(&proto, 2);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(TempId(0));
+        facts.record_home_free_temp(TempId(1));
+        let snapshots = empty_capture_snapshots(2);
+        let mut live_uses = vec![1, 1];
+
+        assert!(inline_terminal_nil_return_pack(
+            &mut block,
+            &scratch,
+            &mut live_uses,
+            &facts,
+            &snapshots,
+            &[false, false],
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [HirStmt::Return(ret)]
+                if ret.values.fixed == vec![HirExpr::Nil, HirExpr::Nil]
+                    && ret.values.tail.is_none()
+        ));
+    }
+
+    #[test]
+    fn terminal_nil_pack_accepts_complete_invalidated_home_unions() {
+        let mut block = terminal_nil_pack_block();
+        let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
+        let scratch = TempUseScratch::new(&proto, 2);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(1, 0));
+        facts.record_temp_home_merge(TempId(0), Some(BTreeSet::from([HomeSlotKey::new(2, 0)])));
+        facts.record_temp_home_merge(TempId(1), Some(BTreeSet::from([HomeSlotKey::new(3, 0)])));
+        let snapshots = empty_capture_snapshots(2);
+        let mut live_uses = vec![1, 1];
+
+        assert!(inline_terminal_nil_return_pack(
+            &mut block,
+            &scratch,
+            &mut live_uses,
+            &facts,
+            &snapshots,
+            &[false, false],
+        ));
+    }
+
+    #[test]
+    fn terminal_nil_pack_rejects_unknown_out_of_range_temps() {
+        let mut block = terminal_nil_pack_block();
+        let original = block.clone();
+        let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
+        let scratch = TempUseScratch::new(&proto, 2);
+        let snapshots = empty_capture_snapshots(2);
+        let mut live_uses = vec![1, 1];
+
+        assert!(!inline_terminal_nil_return_pack(
+            &mut block,
+            &scratch,
+            &mut live_uses,
+            &ProtoPromotionFacts::default(),
+            &snapshots,
+            &[false, false],
+        ));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn root_nil_gap_uses_complete_possible_home_sets_for_clobbers() {
+        let gap = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(TempId(2))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+        }));
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(TempId(2), HomeSlotKey::new(2, 0));
+        facts.record_temp_home_merge(TempId(2), Some(BTreeSet::from([HomeSlotKey::new(3, 0)])));
+
+        assert!(root_nil_pack_gap_preserves_slots(
+            &gap,
+            &BTreeSet::from([TempId(0)]),
+            &BTreeSet::from([HomeSlotKey::new(0, 0)]),
+            &facts,
+        ));
+        assert!(!root_nil_pack_gap_preserves_slots(
+            &gap,
+            &BTreeSet::from([TempId(0)]),
+            &BTreeSet::from([HomeSlotKey::new(3, 0)]),
+            &facts,
+        ));
+        assert!(!root_nil_pack_gap_preserves_slots(
+            &HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(9))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
+            })),
+            &BTreeSet::from([TempId(0)]),
+            &BTreeSet::from([HomeSlotKey::new(0, 0)]),
+            &facts,
+        ));
+        assert!(root_nil_pack_gap_preserves_slots(
+            &HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(9))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
+            })),
+            &BTreeSet::from([TempId(0)]),
+            &BTreeSet::new(),
+            &facts,
+        ));
+        assert!(!root_nil_pack_gap_preserves_slots(
+            &HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+            })),
+            &BTreeSet::from([TempId(0)]),
+            &BTreeSet::new(),
+            &facts,
+        ));
+    }
+
+    #[test]
+    fn open_return_aliases_accept_home_free_bindings_but_not_identity_clobbers() {
+        let mut block = open_return_alias_block(TempId(4));
+        let mut facts = ProtoPromotionFacts::default();
+        for temp in [TempId(0), TempId(1), TempId(2), TempId(3)] {
+            facts.record_home_free_temp(temp);
+        }
+        let snapshots = empty_capture_snapshots(4);
+        let mut live_uses = vec![1; 5];
+        let mut removed = vec![false; 4];
+        let proto = empty_proto(block.clone(), (0..5).map(TempId).collect());
+        let scratch = TempUseScratch::new(&proto, 5);
+
+        assert!(inline_open_return_fixed_alias_run(
+            &mut block,
+            0..3,
+            &scratch,
+            &mut live_uses,
+            &facts,
+            &snapshots,
+            &mut removed,
+        ));
+        let HirStmt::Return(ret) = &block.stmts[3] else {
+            panic!("validated alias run must keep the return sink")
+        };
+        assert!(ret.values.fixed == vec![HirExpr::TempRef(TempId(2)), HirExpr::TempRef(TempId(3))]);
+        assert_eq!(removed, vec![true, true, false, false]);
+
+        let mut clobbered = open_return_alias_block(TempId(2));
+        let original = clobbered.clone();
+        let mut live_uses = vec![1; 5];
+        let mut removed = vec![false; 4];
+        let proto = empty_proto(clobbered.clone(), (0..5).map(TempId).collect());
+        let scratch = TempUseScratch::new(&proto, 5);
+        assert!(!inline_open_return_fixed_alias_run(
+            &mut clobbered,
+            0..3,
+            &scratch,
+            &mut live_uses,
+            &facts,
+            &snapshots,
+            &mut removed,
+        ));
+        assert_eq!(clobbered, original);
+    }
 }

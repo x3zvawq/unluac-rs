@@ -271,7 +271,7 @@ pub(super) fn collapse_written_back_if_results(
             index += 1;
             continue;
         };
-        let Some(exits) = complete_if_assignments(if_stmt, &[result]) else {
+        let Some(exits) = if_fallthrough_assignments(if_stmt, &[result]) else {
             index += 1;
             continue;
         };
@@ -284,8 +284,7 @@ pub(super) fn collapse_written_back_if_results(
             !exit.contains_key(&state)
                 && exit.get(&result).and_then(ExitValue::exact_binding) == Some(state)
         });
-        if exits.len() < 2
-            || !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
+        if !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
             || state == result
             || outer_bindings.contains(&result)
             || captured_bindings.contains(&result)
@@ -300,7 +299,7 @@ pub(super) fn collapse_written_back_if_results(
             || region_has_forbidden_nodes(&block.stmts[index + 1..=index + 1])
         {
             // 候选拒绝[SemanticBarrier:Lifetime]：capture/outer use、异槽、额外 result mention 或 state 被独立写入时，改名会合并可区分 epoch。
-            // 候选拒绝[ProofIncomplete]：单出口 if 与 forbidden-node region 需要更一般的路径/owner 事实，当前 exact arm 计数不覆盖。
+            // 候选拒绝[LayerBoundary]：forbidden-node region 的 goto/cleanup/Decision 分别由 CFG、资源与 decision owner 消费。
             index += 1;
             continue;
         }
@@ -582,12 +581,35 @@ fn try_collapse_loop_results(
     }
 
     let loop_facts = binding_facts(std::slice::from_ref(stmt));
+    results.retain(|result| loop_facts.reads.get(result).copied().unwrap_or(0) == 0);
+    if results.is_empty() {
+        // 候选拒绝[SemanticBarrier:Lifetime]：loop 内读 result 会观察它在本次/上次迭代的独立 epoch，改名为 seed 会切换该读取。
+        return false;
+    }
+    let require_home_slot = !requires_exact_exits;
     results.retain(|result| {
-        loop_facts.reads.get(result).copied().unwrap_or(0) == 0
-            && loop_facts.writes.get(result).copied().unwrap_or(0) == exits.len()
+        let writes = loop_facts.writes.get(result).copied().unwrap_or(0);
+        if writes == exits.len() {
+            return true;
+        }
+        let Some(rewrite) = infer_rewrites(
+            std::slice::from_ref(result),
+            &exits,
+            index,
+            result_index,
+            promotion_facts,
+            require_home_slot,
+        ) else {
+            return false;
+        };
+        rewrite.get(result).is_some_and(|seed| {
+            !loop_facts.writes.contains_key(seed)
+                && result_writes_are_standalone_seed_copies(&body.stmts, *result, *seed, writes)
+        })
     });
     if results.is_empty() {
-        // 候选拒绝[ProofIncomplete]：loop 内读 result 或写次数不等于出口数时，当前 exact-exit 模型无法配对路径。
+        // 候选拒绝[ProofIncomplete]：非出口 result 写入若不是独立的 exact seed copy，或 seed 会在 loop 内改写，
+        // 尚缺 reaching-def/root-lifetime 证明其改名不会改写 seed 或提前释放 result 保活的旧值。
         return false;
     }
     let results = results.into_iter().collect::<Vec<_>>();
@@ -597,7 +619,7 @@ fn try_collapse_loop_results(
         index,
         result_index,
         promotion_facts,
-        !requires_exact_exits,
+        require_home_slot,
     ) else {
         return false;
     };
@@ -635,4 +657,236 @@ fn rewrites_preserve_identity(
     rewrites.iter().all(|(source, target)| {
         identity_facts.binding_merge_preserves_identity(*source, *target, promotion_facts)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{
+        HirCallExpr, HirCallStmt, HirGlobalRef, HirRepeat, HirReturn, HirWhile, ParamId, TempId,
+    };
+    use crate::hir::promotion::HomeSlotKey;
+
+    fn empty_identity_facts() -> HandoffIdentityFacts {
+        HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            captured: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+        }
+    }
+
+    fn single_fallthrough_result_block(terminating_value: HirExpr) -> HirBlock {
+        HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(0)],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::TempRef(TempId(0)),
+                    then_block: HirBlock {
+                        stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Local(LocalId(0))],
+                            values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                        }))],
+                    },
+                    else_block: Some(HirBlock {
+                        stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                            values: HirValuePack::fixed(vec![terminating_value]),
+                        }))],
+                    }),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Param(ParamId(0))],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+                })),
+            ],
+        }
+    }
+
+    fn same_home_facts() -> ProtoPromotionFacts {
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(0, 0));
+        facts
+    }
+
+    fn loop_result_block(extra_value: HirExpr) -> HirBlock {
+        let result_copy = |value| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(0))],
+                values: HirValuePack::fixed(vec![value]),
+            }))
+        };
+        HirBlock {
+            stmts: vec![
+                HirStmt::While(Box::new(HirWhile {
+                    cond: HirExpr::Boolean(true),
+                    body: HirBlock {
+                        stmts: vec![
+                            result_copy(extra_value),
+                            result_copy(HirExpr::ParamRef(ParamId(0))),
+                            HirStmt::Break,
+                        ],
+                    },
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+                })),
+            ],
+        }
+    }
+
+    fn loop_result_facts() -> ProtoPromotionFacts {
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        facts
+    }
+
+    fn dynamic_loop_result_with_seed_overwrite() -> HirBlock {
+        let result_copy = || {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
+            }))
+        };
+        HirBlock {
+            stmts: vec![
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            result_copy(),
+                            HirStmt::Assign(Box::new(HirAssign {
+                                targets: vec![HirLValue::Param(ParamId(0))],
+                                values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                            })),
+                            HirStmt::CallStmt(Box::new(HirCallStmt {
+                                call: HirCallExpr {
+                                    callee: HirExpr::GlobalRef(HirGlobalRef {
+                                        name: "collectgarbage".to_owned(),
+                                    }),
+                                    args: HirValuePack::default(),
+                                    method: false,
+                                    fastcall: None,
+                                    method_name: None,
+                                },
+                            })),
+                            result_copy(),
+                            HirStmt::Break,
+                        ],
+                    },
+                    cond: HirExpr::TempRef(TempId(1)),
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+                })),
+            ],
+        }
+    }
+
+    #[test]
+    fn written_back_if_accepts_one_fallthrough_result_exit() {
+        let mut block = single_fallthrough_result_block(HirExpr::Integer(9));
+        let mut facts = same_home_facts();
+        let identity_facts = empty_identity_facts();
+
+        assert!(collapse_written_back_if_results(
+            &mut block,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut facts,
+            &identity_facts,
+        ));
+
+        let [HirStmt::If(if_stmt)] = block.stmts.as_slice() else {
+            panic!("result declaration and terminal writeback should be removed");
+        };
+        let [HirStmt::Assign(assign)] = if_stmt.then_block.stmts.as_slice() else {
+            panic!("the fallthrough arm should retain its producer assignment");
+        };
+        assert!(assign.targets == vec![HirLValue::Param(ParamId(0))]);
+    }
+
+    #[test]
+    fn written_back_if_rejects_terminating_arm_reading_unproduced_result() {
+        let mut block = single_fallthrough_result_block(HirExpr::LocalRef(LocalId(0)));
+        let original = block.clone();
+        let mut facts = same_home_facts();
+        let identity_facts = empty_identity_facts();
+
+        assert!(!collapse_written_back_if_results(
+            &mut block,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut facts,
+            &identity_facts,
+        ));
+        assert!(block == original);
+    }
+
+    #[test]
+    fn loop_result_accepts_redundant_standalone_seed_copy() {
+        let mut block = loop_result_block(HirExpr::ParamRef(ParamId(0)));
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = loop_result_facts();
+
+        assert!(try_collapse_loop_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+
+        let [HirStmt::While(while_stmt), HirStmt::Return(return_stmt)] = block.stmts.as_slice()
+        else {
+            panic!("the loop result should be rewritten without changing control flow");
+        };
+        assert!(while_stmt.body.stmts == vec![HirStmt::Break]);
+        assert!(
+            return_stmt.values.fixed == vec![HirExpr::ParamRef(ParamId(0))]
+                && return_stmt.values.tail.is_none()
+        );
+    }
+
+    #[test]
+    fn loop_result_rejects_non_seed_write_before_exit_copy() {
+        let mut block = loop_result_block(HirExpr::Integer(7));
+        let original = block.clone();
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = loop_result_facts();
+
+        assert!(!try_collapse_loop_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+        assert!(block == original);
+    }
+
+    #[test]
+    fn loop_result_rejects_extra_copy_across_seed_overwrite() {
+        let mut block = dynamic_loop_result_with_seed_overwrite();
+        let original = block.clone();
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+
+        assert!(!try_collapse_loop_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut ProtoPromotionFacts::default(),
+            &index,
+            &empty_identity_facts(),
+        ));
+        assert!(block == original);
+    }
 }

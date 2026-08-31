@@ -8,7 +8,7 @@
 //! 首轮入口与所有自然/continue 回边的交集；它不会跨未知 goto 或 reference capture 猜测。
 //! 多目标赋值默认仍不拆分；唯一例外是这里证明过的 dead loop-carrier mirror 分量：
 //! 被删 RHS 只能是纯 `LocalRef`，且目标 temp 的每一次写都必须属于同一 active-for、
-//! same-exact-home 删除事务，因此不会留下旧值写而改变并行求值、副作用或 GC root 行为。
+//! same-sole-possible-home 删除事务，因此不会留下旧值写而改变并行求值、副作用或 GC root 行为。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,8 +23,7 @@ use super::super::temp_touch::collect_temp_reads_in_proto;
 use super::super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::super::walk::{HirRewritePass, rewrite_stmts};
 use super::binding::{
-    CarryBinding, binding_home_slot, carry_binding_from_expr, carry_binding_from_lvalue,
-    single_binding_copy,
+    CarryBinding, carry_binding_from_expr, carry_binding_from_lvalue, single_binding_copy,
 };
 
 pub(super) struct RedundantSelfAssignPrunePass {
@@ -343,12 +342,8 @@ fn dead_for_binding_temp_mirror_can_be_pruned(
         return false;
     }
     if write_audit.has_surviving_write(*temp) {
-        // 候选拒绝[SemanticBarrier:Lifetime]：`t=A; for binding=B do t=binding; GC end` 若只删 mirror，会让 A 多活并改变终结时机。
-        return false;
-    }
-    if write_audit.has_unproven_write(*temp) {
-        // 候选拒绝[ProofIncomplete]：至少一次显式 mirror 写缺少 trusted exact-home，
-        // 无法证明该 temp 的所有写都属于同一物理 for-binding 事务。
+        // 候选拒绝[SemanticBarrier:Lifetime]：regress_347 的 `t=A; for binding=B do t=binding; GC end`
+        // 若任一写不是同一唯一可能 home 的 no-op，删 mirror 会让 A 多活并改变弱表/终结观察。
         return false;
     }
 
@@ -359,7 +354,6 @@ fn dead_for_binding_temp_mirror_can_be_pruned(
 struct TempWriteAudit {
     all_prunable_writes: BTreeSet<TempId>,
     surviving_writes: BTreeSet<TempId>,
-    unproven_writes: BTreeSet<TempId>,
 }
 
 impl TempWriteAudit {
@@ -371,24 +365,15 @@ impl TempWriteAudit {
             MirrorWriteDisposition::Survives => {
                 self.surviving_writes.insert(temp);
             }
-            MirrorWriteDisposition::UnknownHome => {
-                self.unproven_writes.insert(temp);
-            }
         }
     }
 
     fn all_writes_are_prunable_mirrors(&self, temp: TempId) -> bool {
-        self.all_prunable_writes.contains(&temp)
-            && !self.has_surviving_write(temp)
-            && !self.has_unproven_write(temp)
+        self.all_prunable_writes.contains(&temp) && !self.has_surviving_write(temp)
     }
 
     fn has_surviving_write(&self, temp: TempId) -> bool {
         self.surviving_writes.contains(&temp)
-    }
-
-    fn has_unproven_write(&self, temp: TempId) -> bool {
-        self.unproven_writes.contains(&temp)
     }
 }
 
@@ -396,7 +381,6 @@ impl TempWriteAudit {
 enum MirrorWriteDisposition {
     Prunable,
     Survives,
-    UnknownHome,
 }
 
 fn collect_temp_write_audit_in_proto(
@@ -529,17 +513,18 @@ fn mirror_write_disposition(
     if !active_for_bindings.contains(local) || !promotion_facts.is_loop_carrier_temp(*temp) {
         return MirrorWriteDisposition::Survives;
     }
-    let target =
-        carry_binding_from_lvalue(target).expect("temp mirror target must have a carry binding");
-    let source =
-        carry_binding_from_expr(value).expect("local mirror source must have a carry binding");
-    match (
-        binding_home_slot(target, promotion_facts),
-        binding_home_slot(source, promotion_facts),
-    ) {
-        (Some(target), Some(source)) if target == source => MirrorWriteDisposition::Prunable,
-        (Some(_), Some(_)) => MirrorWriteDisposition::Survives,
-        _ => MirrorWriteDisposition::UnknownHome,
+    let Some(target_home) = promotion_facts.home_slot(*temp) else {
+        return MirrorWriteDisposition::Survives;
+    };
+    let Some(source_homes) = promotion_facts.possible_local_home_slots(*local) else {
+        return MirrorWriteDisposition::Survives;
+    };
+    if source_homes == BTreeSet::from([target_home]) {
+        // LValue 的 raw home 不随 binding rewrite 改变；RHS 即使失去 trusted provenance，
+        // 完整可能集合仍为同一单槽时，每条路径上的写都只是该物理 cell 自写回。
+        MirrorWriteDisposition::Prunable
+    } else {
+        MirrorWriteDisposition::Survives
     }
 }
 
@@ -1138,6 +1123,45 @@ mod tests {
         let mut audit = TempWriteAudit::default();
         audit.note_write(temp, MirrorWriteDisposition::Prunable);
         audit
+    }
+
+    #[test]
+    fn dead_mirror_accepts_invalidated_single_home_provenance() {
+        let mirror = TempId(0);
+        let binding = LocalId(0);
+        let mut facts = mirror_facts(mirror, binding);
+        facts.record_temp_home_merge(mirror, Some(BTreeSet::new()));
+        facts.record_local_home_merge(binding, Some(BTreeSet::new()));
+
+        assert_eq!(facts.trusted_temp_home_slot(mirror), None);
+        assert_eq!(facts.trusted_local_home_slot(binding), None);
+        assert!(matches!(
+            mirror_write_disposition(
+                &HirLValue::Temp(mirror),
+                &HirExpr::LocalRef(binding),
+                &BTreeSet::from([binding]),
+                &facts,
+            ),
+            MirrorWriteDisposition::Prunable
+        ));
+    }
+
+    #[test]
+    fn dead_mirror_rejects_multi_home_source_lifetime_change() {
+        let mirror = TempId(0);
+        let binding = LocalId(0);
+        let mut facts = mirror_facts(mirror, binding);
+        facts.record_local_home_merge(binding, Some(BTreeSet::from([HomeSlotKey::new(1, 0)])));
+
+        assert!(matches!(
+            mirror_write_disposition(
+                &HirLValue::Temp(mirror),
+                &HirExpr::LocalRef(binding),
+                &BTreeSet::from([binding]),
+                &facts,
+            ),
+            MirrorWriteDisposition::Survives
+        ));
     }
 
     #[test]

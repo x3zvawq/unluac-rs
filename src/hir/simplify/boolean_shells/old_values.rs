@@ -17,7 +17,8 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::{
-    BindingRelation, BooleanShellFacts, DeadShellOldValueFacts, OldValueClass, home_relation,
+    BindingRelation, BooleanShellFacts, DeadShellOldValueFacts, OldValueClass,
+    possible_home_relation,
 };
 use crate::hir::simplify::expr_facts::expr_truthiness;
 use crate::hir::simplify::visit::{self, HirVisitor};
@@ -56,6 +57,7 @@ impl DeadShellPlan {
         let mut candidates = CandidateValues {
             locals: BTreeSet::new(),
             homes: BTreeSet::new(),
+            entry_nil_homes: BTreeSet::new(),
             promotion_facts,
         };
         visit::visit_proto(proto, &mut candidates);
@@ -128,6 +130,7 @@ fn forward_label_indices(block: &HirBlock) -> Option<BTreeMap<crate::hir::HirLab
 struct CandidateValues<'a> {
     locals: BTreeSet<LocalId>,
     homes: BTreeSet<HomeSlotKey>,
+    entry_nil_homes: BTreeSet<HomeSlotKey>,
     promotion_facts: &'a ProtoPromotionFacts,
 }
 
@@ -149,17 +152,23 @@ impl HirVisitor for CandidateValues<'_> {
             self.locals.insert(*local);
         }
         if let HirLValue::Temp(temp) = then_target
-            && let Some(home) = self.promotion_facts.home_slot(*temp)
+            && let Some(homes) = self.promotion_facts.possible_temp_home_slots(*temp)
         {
-            self.homes.insert(home);
+            self.homes.extend(homes.iter().copied());
+            if homes.len() == 1 && self.promotion_facts.overwrites_entry_nil(*temp) {
+                self.entry_nil_homes.extend(homes);
+            }
         }
         if let HirLValue::Local(local) = else_target {
             self.locals.insert(*local);
         }
         if let HirLValue::Temp(temp) = else_target
-            && let Some(home) = self.promotion_facts.home_slot(*temp)
+            && let Some(homes) = self.promotion_facts.possible_temp_home_slots(*temp)
         {
-            self.homes.insert(home);
+            self.homes.extend(homes.iter().copied());
+            if homes.len() == 1 && self.promotion_facts.overwrites_entry_nil(*temp) {
+                self.entry_nil_homes.extend(homes);
+            }
         }
     }
 }
@@ -178,13 +187,20 @@ impl OldValueState {
                 .iter()
                 .copied()
                 .map(|local| {
-                    let class = candidates
+                    let class = if candidates
+                        .promotion_facts
+                        .entry_nil_writes_were_pruned(local)
+                    {
+                        OldValueClass::GcInert
+                    } else if candidates
                         .promotion_facts
                         .local_home_slot(local)
-                        .filter(|home| parameter_homes.contains(home))
-                        .map_or(OldValueClass::ProofIncomplete, |_| {
-                            OldValueClass::MayCarryResource
-                        });
+                        .is_some_and(|home| parameter_homes.contains(&home))
+                    {
+                        OldValueClass::MayCarryResource
+                    } else {
+                        OldValueClass::Unknown
+                    };
                     (local, class)
                 })
                 .collect(),
@@ -195,8 +211,10 @@ impl OldValueState {
                 .map(|home| {
                     let class = if parameter_homes.contains(&home) {
                         OldValueClass::MayCarryResource
+                    } else if candidates.entry_nil_homes.contains(&home) {
+                        OldValueClass::GcInert
                     } else {
-                        OldValueClass::ProofIncomplete
+                        OldValueClass::Unknown
                     };
                     (home, class)
                 })
@@ -215,7 +233,7 @@ impl OldValueState {
         let current = self
             .local_classes
             .entry(local)
-            .or_insert(OldValueClass::ProofIncomplete);
+            .or_insert(OldValueClass::Unknown);
         *current = join_value_classes(*current, written);
     }
 
@@ -223,7 +241,7 @@ impl OldValueState {
         let current = self
             .home_classes
             .entry(home)
-            .or_insert(OldValueClass::ProofIncomplete);
+            .or_insert(OldValueClass::Unknown);
         *current = join_value_classes(*current, written);
     }
 
@@ -552,7 +570,7 @@ impl OldValueAnalyzer<'_> {
                 BindingRelation::None => {}
                 BindingRelation::Possible => {
                     // `Possible` 表示该写可能命中 candidate，也可能完全不命中；后态必须
-                    // 合流“保留旧值”和“写入新值”，不能用 ProofIncomplete 覆盖两端事实。
+                    // 合流“保留旧值”和“写入新值”，不能用 Unknown 覆盖两端事实。
                     state.merge_possible_local_write(*candidate, value_class);
                 }
                 BindingRelation::Definite => {
@@ -576,29 +594,32 @@ impl OldValueAnalyzer<'_> {
 
     fn local_binding_relation(&self, target: &HirLValue, candidate: LocalId) -> BindingRelation {
         let candidate_home = self.promotion_facts.trusted_local_home_slot(candidate);
-        let candidate_is_home_free = self.promotion_facts.local_has_no_physical_home(candidate);
+        let candidate_homes = self.promotion_facts.possible_local_home_slots(candidate);
         match target {
             HirLValue::Local(local) if *local == candidate => BindingRelation::Definite,
-            HirLValue::Local(local)
-                if candidate_is_home_free
-                    || self.promotion_facts.local_has_no_physical_home(*local) =>
-            {
-                BindingRelation::None
-            }
-            HirLValue::Local(local) => home_relation(
+            HirLValue::Local(local) => possible_home_relation(
                 candidate_home,
+                candidate_homes.as_ref(),
                 self.promotion_facts.trusted_local_home_slot(*local),
+                self.promotion_facts
+                    .possible_local_home_slots(*local)
+                    .as_ref(),
             ),
-            HirLValue::Param(_) | HirLValue::Temp(_) if candidate_is_home_free => {
-                BindingRelation::None
-            }
-            HirLValue::Param(param) => home_relation(
+            HirLValue::Param(param) => possible_home_relation(
                 candidate_home,
+                candidate_homes.as_ref(),
                 self.promotion_facts.trusted_param_home_slot(*param),
+                self.promotion_facts
+                    .possible_param_home_slots(*param)
+                    .as_ref(),
             ),
-            HirLValue::Temp(temp) => home_relation(
+            HirLValue::Temp(temp) => possible_home_relation(
                 candidate_home,
+                candidate_homes.as_ref(),
                 self.promotion_facts.trusted_temp_home_slot(*temp),
+                self.promotion_facts
+                    .possible_temp_home_slots(*temp)
+                    .as_ref(),
             ),
             HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
                 BindingRelation::None
@@ -608,21 +629,29 @@ impl OldValueAnalyzer<'_> {
 
     fn home_binding_relation(&self, target: &HirLValue, candidate: HomeSlotKey) -> BindingRelation {
         match target {
-            HirLValue::Temp(temp) => match self.promotion_facts.home_slot(*temp) {
-                Some(home) if home == candidate => BindingRelation::Definite,
-                Some(_) => BindingRelation::None,
-                None => BindingRelation::Possible,
-            },
-            HirLValue::Param(param) => home_relation(
+            HirLValue::Temp(temp) => possible_home_relation(
                 Some(candidate),
-                self.promotion_facts.trusted_param_home_slot(*param),
+                None,
+                self.promotion_facts.trusted_temp_home_slot(*temp),
+                self.promotion_facts
+                    .possible_temp_home_slots(*temp)
+                    .as_ref(),
             ),
-            HirLValue::Local(local) if self.promotion_facts.local_has_no_physical_home(*local) => {
-                BindingRelation::None
-            }
-            HirLValue::Local(local) => home_relation(
+            HirLValue::Param(param) => possible_home_relation(
                 Some(candidate),
+                None,
+                self.promotion_facts.trusted_param_home_slot(*param),
+                self.promotion_facts
+                    .possible_param_home_slots(*param)
+                    .as_ref(),
+            ),
+            HirLValue::Local(local) => possible_home_relation(
+                Some(candidate),
+                None,
                 self.promotion_facts.trusted_local_home_slot(*local),
+                self.promotion_facts
+                    .possible_local_home_slots(*local)
+                    .as_ref(),
             ),
             HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
                 BindingRelation::None
@@ -746,12 +775,12 @@ fn join_class_maps<K: Ord>(
         let right_class = right
             .get(binding)
             .copied()
-            .unwrap_or(OldValueClass::ProofIncomplete);
+            .unwrap_or(OldValueClass::Unknown);
         *left_class = join_value_classes(*left_class, right_class);
     }
     for (binding, right_class) in right {
         left.entry(binding)
-            .or_insert_with(|| join_value_classes(OldValueClass::ProofIncomplete, right_class));
+            .or_insert_with(|| join_value_classes(OldValueClass::Unknown, right_class));
     }
 }
 
@@ -761,9 +790,7 @@ fn join_value_classes(left: OldValueClass, right: OldValueClass) -> OldValueClas
         (OldValueClass::MayCarryResource, _) | (_, OldValueClass::MayCarryResource) => {
             OldValueClass::MayCarryResource
         }
-        (OldValueClass::ProofIncomplete, _) | (_, OldValueClass::ProofIncomplete) => {
-            OldValueClass::ProofIncomplete
-        }
+        (OldValueClass::Unknown, _) | (_, OldValueClass::Unknown) => OldValueClass::Unknown,
     }
 }
 
@@ -847,5 +874,55 @@ fn apply_block_plan(block: &mut HirBlock, prefix: &[PathComponent], plan: &BTree
     }
     for index in remove.into_iter().rev() {
         block.stmts.remove(index);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::hir::common::LocalId;
+    use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+
+    use super::{CandidateValues, OldValueClass, OldValueState};
+
+    #[test]
+    fn entry_nil_provenance_seeds_only_proven_candidates_as_gc_inert() {
+        let pruned_local = LocalId(0);
+        let unknown_local = LocalId(1);
+        let entry_nil_home = HomeSlotKey::new(2, 0);
+        let unknown_home = HomeSlotKey::new(3, 0);
+        let parameter_home = HomeSlotKey::new(0, 0);
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.mark_entry_nil_writes_pruned(pruned_local);
+        let candidates = CandidateValues {
+            locals: BTreeSet::from([pruned_local, unknown_local]),
+            homes: BTreeSet::from([entry_nil_home, unknown_home, parameter_home]),
+            entry_nil_homes: BTreeSet::from([entry_nil_home]),
+            promotion_facts: &promotion_facts,
+        };
+
+        let state = OldValueState::initial(&candidates, &BTreeSet::from([parameter_home]));
+
+        assert_eq!(
+            state.local_classes.get(&pruned_local),
+            Some(&OldValueClass::GcInert)
+        );
+        assert_eq!(
+            state.local_classes.get(&unknown_local),
+            Some(&OldValueClass::Unknown)
+        );
+        assert_eq!(
+            state.home_classes.get(&entry_nil_home),
+            Some(&OldValueClass::GcInert)
+        );
+        assert_eq!(
+            state.home_classes.get(&unknown_home),
+            Some(&OldValueClass::Unknown)
+        );
+        assert_eq!(
+            state.home_classes.get(&parameter_home),
+            Some(&OldValueClass::MayCarryResource)
+        );
     }
 }

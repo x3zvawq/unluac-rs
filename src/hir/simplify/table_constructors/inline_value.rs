@@ -6,13 +6,17 @@
 //! 未变后才提交。例如：`local v = f(); t.x = v` 只在 `f()` 仍位于同一事件位置时折叠。
 
 use crate::hir::common::{
-    HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionTarget, HirExpr, HirLogicalExpr,
-    HirTableField, HirTableKey, HirUnaryExpr, HirValuePack,
+    HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionTarget, HirExpr,
+    HirLogicalExpr, HirRecordField, HirTableConstructor, HirTableField, HirTableKey, HirUnaryExpr,
+    HirValuePack,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
-use super::{BindingId, ConstructorEvalEvent, PendingProducer, PendingProducerSource};
+use super::{
+    BindingId, ConstructorEvalEvent, PendingProducer, PendingProducerSource,
+    ProducerSourcePreservation,
+};
 
 pub(super) struct InlineContext<'a> {
     block: &'a HirBlock,
@@ -71,10 +75,26 @@ fn inline_constructor_value_inner(
             .and_then(|producer_index| *producer_index)
     {
         let producer = &context.pending_producers[producer_index];
-        // 候选拒绝[ProofIncomplete]：producer 有 region 后续 use 时，当前事务只能整句删除
-        // 它；保留声明并仅重建 table write 本可继续优化，需扩展 partial-consume 计划。
         if context.remaining_uses.contains(producer.binding_id) {
-            return None;
+            match producer.source_preservation {
+                ProducerSourcePreservation::Safe => {}
+                ProducerSourcePreservation::InertWholeStatement => {}
+                ProducerSourcePreservation::DebugIdentity => {
+                    // 候选拒绝[PolicyBoundary]：producer 声明虽可保留，但把 table field 提前
+                    // 到 source-visible 声明之前会改变 hook 在该行观察到的 table 内容。
+                    return None;
+                }
+                ProducerSourcePreservation::ObservableReplay => {
+                    // 候选拒绝[SemanticBarrier:EvalCount]：保留声明并把 `mark()` producer
+                    // 内联到 field 会执行两次；删除声明又会断开后续 use（regress_235）。
+                    return None;
+                }
+                ProducerSourcePreservation::UnsupportedShape => {
+                    // 候选拒绝[ProofIncomplete]：多槽声明或无事件 alias 尚缺整句逐槽
+                    // preserve/remove 与 root facts；owner 是 producer source preservation plan。
+                    return None;
+                }
+            }
         }
         // 候选拒绝[SemanticBarrier:EvalCount]：同一 producer 被第二次消费时再次展开会
         // 重复求值；`local v = mark(); t[v] = v` 必须只调用一次，见 regress_235。
@@ -123,15 +143,23 @@ fn inline_constructor_value_inner(
         HirExpr::LogicalOr(logical) => {
             inline_short_circuit_expr(context, logical, HirExpr::LogicalOr)?
         }
-        _ if expr_depends_on_any_pending_binding(
-            value,
-            context.binding_index,
-            context.producer_index_by_binding,
-            context.consumed_bindings,
-        ) =>
+        HirExpr::TableConstructor(table) => {
+            HirExpr::TableConstructor(Box::new(inline_nested_constructor(context, table)?))
+        }
+        HirExpr::Decision(decision) => {
+            HirExpr::Decision(Box::new(inline_decision_entry(context, decision)?))
+        }
+        HirExpr::Closure(_)
+            if expr_mentions_any_pending_binding(
+                value,
+                context.binding_index,
+                context.producer_index_by_binding,
+            ) =>
         {
-            // 候选拒绝[ProofIncomplete]：Decision、嵌套 constructor、closure capture 等节点
-            // 尚未实现 pending-binding 的结构化替换，不能把“未支持”当成不等价证明。
+            // 候选拒绝[SemanticBarrier:Capture]：closure capture 是 upvalue 绑定元数据，
+            // AST lowering 只读取 capture 的 binding/name，不会求值任意替换表达式；把
+            // producer 塞进 capture 会既删除原求值又无法在源码中重放，并破坏
+            // `local v = mark(); t.x = function() return v end` 的 ByReference 身份。
             return None;
         }
         _ => value.clone(),
@@ -140,6 +168,86 @@ fn inline_constructor_value_inner(
         context.eval_events.push(ConstructorEvalEvent::Barrier);
     }
     Some(inlined)
+}
+
+fn inline_nested_constructor(
+    context: &mut InlineContext<'_>,
+    table: &HirTableConstructor,
+) -> Option<HirTableConstructor> {
+    // HIR/AST 都按 field 顺序求值，record 内先 key 后 value；逐槽递归可让 event proof
+    // 比较 producer 与既有 call/lookup 的完整相对次序，而不是把嵌套 constructor 当黑盒。
+    let fields = table
+        .fields
+        .iter()
+        .map(|field| match field {
+            HirTableField::Array(value) => Some(HirTableField::Array(
+                inline_constructor_value_inner(context, value)?,
+            )),
+            HirTableField::Record(field) => {
+                let key = match &field.key {
+                    HirTableKey::Name(name) => HirTableKey::Name(name.clone()),
+                    HirTableKey::Expr(key) => {
+                        HirTableKey::Expr(inline_constructor_value_inner(context, key)?)
+                    }
+                };
+                let value = inline_constructor_value_inner(context, &field.value)?;
+                Some(HirTableField::Record(HirRecordField { key, value }))
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let trailing_multivalue = match &table.trailing_multivalue {
+        Some(tail) => Some(tail.clone().try_map_call(|call| {
+            let mapped = inline_constructor_call(context, &call)?;
+            // `try_map_call` 绕过表达式 wrapper；尾调用自身仍是一个有序事件。
+            context.eval_events.push(ConstructorEvalEvent::Barrier);
+            Some(mapped)
+        })?),
+        None => None,
+    };
+    Some(HirTableConstructor {
+        fields,
+        trailing_multivalue,
+    })
+}
+
+fn inline_decision_entry(
+    context: &mut InlineContext<'_>,
+    decision: &HirDecisionExpr,
+) -> Option<HirDecisionExpr> {
+    let entry_index = decision.entry.index();
+    let entry = decision.nodes.get(entry_index)?;
+    for (index, node) in decision.nodes.iter().enumerate() {
+        let conditional_test_mentions = index != entry_index
+            && expr_mentions_any_pending_binding(
+                &node.test,
+                context.binding_index,
+                context.producer_index_by_binding,
+            );
+        let conditional_target_mentions = [&node.truthy, &node.falsy].iter().any(|target| {
+            matches!(
+                target,
+                HirDecisionTarget::Expr(expr)
+                    if expr_mentions_any_pending_binding(
+                        expr,
+                        context.binding_index,
+                        context.producer_index_by_binding,
+                    )
+            )
+        });
+        if conditional_test_mentions || conditional_target_mentions {
+            // 候选拒绝[SemanticBarrier:EvalCount]：只有 entry test 必达；把
+            // `local v = mark(); result = cond and v or false` 的 producer 移进后继
+            // test/target 会把一次无条件求值变为条件求值。共享 DAG 不改变该路径事实。
+            return None;
+        }
+    }
+
+    let mut nodes = decision.nodes.clone();
+    nodes[entry_index].test = inline_constructor_value_inner(context, &entry.test)?;
+    Some(HirDecisionExpr {
+        entry: decision.entry,
+        nodes,
+    })
 }
 
 pub(super) fn inline_constructor_call(
@@ -323,6 +431,7 @@ fn pending_producer_value<'a>(
             stmt_index,
             value_index,
         } => producer_source_value(block, stmt_index, value_index),
+        PendingProducerSource::ImplicitNil { .. } => Some(&HirExpr::Nil),
     }
 }
 
@@ -341,16 +450,203 @@ fn producer_source_value(
     }
 }
 
-fn expr_depends_on_any_pending_binding(
-    expr: &HirExpr,
-    binding_index: &BindingIndex,
-    producer_index_by_binding: &[Option<usize>],
-    consumed_bindings: &[bool],
-) -> bool {
-    expr_mentions_binding_where(expr, binding_index, |binding_id| {
-        producer_index_by_binding
-            .get(binding_id)
-            .is_some_and(Option::is_some)
-            && !consumed_bindings[binding_id]
-    })
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::hir::common::{
+        HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirDecisionExpr, HirDecisionNode,
+        HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirLocalDecl, HirProtoRef, HirStmt,
+        HirTableConstructor, HirTableField, HirValuePack, LocalId,
+    };
+    use crate::hir::promotion::ProtoPromotionFacts;
+
+    use super::super::bindings::{
+        BindingIndex, BindingOccurrenceIndex, BindingSlots, collect_stmt_binding_summary,
+    };
+    use super::super::{
+        ConstructorEvalEvent, PendingProducer, PendingProducerSource, ProducerSourcePreservation,
+        TableBinding,
+    };
+    use super::{InlineContext, InlineRewriteState, inline_constructor_value};
+
+    fn inline_context_fixture() -> (
+        HirBlock,
+        BindingIndex,
+        BindingOccurrenceIndex,
+        Vec<PendingProducer>,
+        Vec<Option<usize>>,
+    ) {
+        let local = LocalId(0);
+        let block = HirBlock {
+            stmts: vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![local],
+                values: HirValuePack::fixed(vec![HirExpr::String("value".into())]),
+            }))],
+        };
+        let mut binding_index = BindingIndex::new(0, 1);
+        let summary = collect_stmt_binding_summary(&block.stmts[0], &mut binding_index);
+        let occurrence_index = BindingOccurrenceIndex::new(
+            &binding_index,
+            &[summary],
+            &BindingSlots::from_debug_hints(&[], &[None]),
+            &BTreeSet::new(),
+            &BindingSlots::from_debug_hints(&[], &[None]),
+            &ProtoPromotionFacts::default(),
+        );
+        let binding = TableBinding::Local(local);
+        let binding_id = binding_index
+            .id_of(binding)
+            .expect("producer binding must be interned");
+        (
+            block,
+            binding_index,
+            occurrence_index,
+            vec![PendingProducer {
+                binding,
+                binding_id,
+                source: PendingProducerSource::Value {
+                    stmt_index: 0,
+                    value_index: 0,
+                },
+                source_preservation: ProducerSourcePreservation::Safe,
+            }],
+            vec![Some(0)],
+        )
+    }
+
+    #[test]
+    fn pending_value_is_rewritten_inside_nested_constructor() {
+        // Decision elimination can leave extracted scalar producers before a populated table
+        // expression; the next fixed-point table pass must consume those references recursively.
+        let (block, binding_index, occurrence_index, producers, producer_map) =
+            inline_context_fixture();
+        let mut consumed = vec![false];
+        let mut events = Vec::new();
+        let mut context = InlineContext::new(
+            &block,
+            &binding_index,
+            &producers,
+            &producer_map,
+            InlineRewriteState {
+                consumed_bindings: &mut consumed,
+                eval_events: &mut events,
+            },
+            occurrence_index.remaining_uses_after(0),
+        );
+        let value = HirExpr::TableConstructor(Box::new(HirTableConstructor {
+            fields: vec![HirTableField::Array(HirExpr::LocalRef(LocalId(0)))],
+            trailing_multivalue: None,
+        }));
+
+        let rewritten = inline_constructor_value(&mut context, &value);
+
+        assert_eq!(
+            rewritten,
+            Some(HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                fields: vec![HirTableField::Array(HirExpr::String("value".into()))],
+                trailing_multivalue: None,
+            })))
+        );
+        assert_eq!(consumed, vec![true]);
+        assert_eq!(events, vec![ConstructorEvalEvent::Barrier]);
+    }
+
+    #[test]
+    fn pending_value_is_not_moved_into_closure_capture_metadata() {
+        let (block, binding_index, occurrence_index, producers, producer_map) =
+            inline_context_fixture();
+        let mut consumed = vec![false];
+        let mut events = Vec::new();
+        let mut context = InlineContext::new(
+            &block,
+            &binding_index,
+            &producers,
+            &producer_map,
+            InlineRewriteState {
+                consumed_bindings: &mut consumed,
+                eval_events: &mut events,
+            },
+            occurrence_index.remaining_uses_after(0),
+        );
+        let value = HirExpr::Closure(Box::new(HirClosureExpr {
+            proto: HirProtoRef(1),
+            captures: vec![HirCapture {
+                mode: HirCaptureMode::ByReference,
+                value: HirExpr::LocalRef(LocalId(0)),
+            }],
+        }));
+
+        assert_eq!(inline_constructor_value(&mut context, &value), None);
+        assert_eq!(consumed, vec![false]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn pending_value_is_rewritten_in_unconditional_decision_entry_test() {
+        let (block, binding_index, occurrence_index, producers, producer_map) =
+            inline_context_fixture();
+        let mut consumed = vec![false];
+        let mut events = Vec::new();
+        let mut context = InlineContext::new(
+            &block,
+            &binding_index,
+            &producers,
+            &producer_map,
+            InlineRewriteState {
+                consumed_bindings: &mut consumed,
+                eval_events: &mut events,
+            },
+            occurrence_index.remaining_uses_after(0),
+        );
+        let value = HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: HirExpr::LocalRef(LocalId(0)),
+                truthy: HirDecisionTarget::CurrentValue,
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
+        }));
+
+        let rewritten = inline_constructor_value(&mut context, &value);
+        let Some(HirExpr::Decision(decision)) = rewritten else {
+            panic!("unconditional decision entry must remain a decision")
+        };
+        assert_eq!(decision.nodes[0].test, HirExpr::String("value".into()));
+        assert_eq!(consumed, vec![true]);
+        assert_eq!(events, vec![ConstructorEvalEvent::Barrier]);
+    }
+
+    #[test]
+    fn pending_value_is_not_moved_into_conditional_decision_target() {
+        let (block, binding_index, occurrence_index, producers, producer_map) =
+            inline_context_fixture();
+        let mut consumed = vec![false];
+        let mut events = Vec::new();
+        let mut context = InlineContext::new(
+            &block,
+            &binding_index,
+            &producers,
+            &producer_map,
+            InlineRewriteState {
+                consumed_bindings: &mut consumed,
+                eval_events: &mut events,
+            },
+            occurrence_index.remaining_uses_after(0),
+        );
+        let value = HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test: HirExpr::Boolean(true),
+                truthy: HirDecisionTarget::Expr(HirExpr::LocalRef(LocalId(0))),
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
+        }));
+
+        assert_eq!(inline_constructor_value(&mut context, &value), None);
+        assert_eq!(consumed, vec![false]);
+        assert!(events.is_empty());
+    }
 }

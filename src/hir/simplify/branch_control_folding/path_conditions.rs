@@ -5,8 +5,9 @@
 //! 传播真假事实。事实只改写 `not/and/or` 条件骨架，不进入值表达式，也不把 truthy 原值
 //! 替换成布尔结果。proto 若仍有活跃 goto/label 流，则只分析与它隔离的结构化子树与
 //! 连续 clean fallthrough run；clean `If` arm 及其 tainted child 前缀可继承唯一入口的
-//! header truthiness。当前 block 的 direct goto 与单臂 goto guard 会为前向 label 合流完整
-//! predecessor facts；复杂嵌套或后向入边仍清空，出口事实也不会泄漏回污染父级。
+//! header truthiness。当前 block 的 direct goto 与末端单臂 goto guard（允许 goto 前有 clean
+//! prefix）会为前向 label 合流完整 predecessor facts；复杂嵌套或后向入边仍清空，出口事实
+//! 也不会泄漏回污染父级。
 //!
 //! 例如 `if flag then break end; if flag then body end` 可删除第二个分支；若 flag 可能被
 //! 赋值、闭包回写则仍保守停用。被引用 label 与任意 goto 会污染所在结构化祖先，未引用
@@ -171,6 +172,12 @@ struct LabelPredecessors {
     reachable_facts: Vec<PathFacts>,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalIfExits {
+    then_target: Option<HirLabelId>,
+    else_target: Option<HirLabelId>,
+}
+
 pub(super) fn specialize_stable_path_conditions(
     proto: &mut HirProto,
     discard_facts: &DiscardBoundaryFacts,
@@ -232,21 +239,14 @@ fn rewrite_clean_islands_in_tainted_block(
             continue;
         }
 
-        if let Some((target, goto_truthy)) = single_guarded_goto(stmt) {
-            let predecessor = label_predecessors.entry(target).or_default();
-            predecessor.accounted_refs += 1;
-            let mut fallthrough_facts = None;
-            if let Some(entry_facts) = run_facts.take() {
-                predecessor.reachable_facts.extend(facts_for_condition(
-                    &entry_facts,
-                    if_condition(stmt),
-                    goto_truthy,
-                    stable,
-                ));
-                fallthrough_facts =
-                    facts_for_condition(&entry_facts, if_condition(stmt), !goto_truthy, stable);
-            }
-            rewrite_clean_child_blocks(stmt, stable, discard_facts, changed);
+        if let Some(fallthrough_facts) = rewrite_terminal_if_exits(
+            stmt,
+            run_facts.clone(),
+            stable,
+            discard_facts,
+            changed,
+            &mut label_predecessors,
+        ) {
             run_facts = fallthrough_facts;
             continue;
         }
@@ -259,42 +259,172 @@ fn rewrite_clean_islands_in_tainted_block(
                 run_facts = (!predecessor.reachable_facts.is_empty())
                     .then(|| PathFacts::intersection(predecessor.reachable_facts));
             } else {
-                // 候选拒绝[ProofIncomplete]：该 label 仍有复杂嵌套或后向 predecessor，当前
-                // block 的单向 transfer 尚未为每条引用生成出口事实，不能只合流已见入边。
+                // 候选拒绝[ProofIncomplete]：已越过该 label 的后向 goto，或嵌套在非末端/循环
+                // child 内的 goto，尚未在此单向扫描点产出逐出口 facts；只合流已见入边会在
+                // 真假 predecessor 并存时误专门化（regress_374 #2）。owner 是本模块的递归
+                // child-exit summary；后向边还需要 predecessor fixed point。
                 run_facts = Some(PathFacts::default());
             }
             continue;
         }
 
-        // 候选拒绝[ProofIncomplete]：复杂活跃 child graph 尚无逐出口 predecessor facts；
-        // clean `If` arm 仍可由唯一结构化入口消费 header facts（regress_374）。
+        // 候选拒绝[ProofIncomplete]：goto 位于循环、嵌套非末端 child 或其后仍有语句时，
+        // 当前 HIR island scanner 尚无递归 child-exit summary（循环/后向边还需要 fixed
+        // point）；不能把任一 child path 的 truthiness 泄漏到污染父级。clean fallthrough
+        // 与双臂 terminal goto 已由 `rewrite_terminal_if_exits` 完整枚举。
         rewrite_clean_child_blocks(stmt, stable, discard_facts, changed);
         run_facts = Some(PathFacts::default());
     }
 }
 
-fn single_guarded_goto(stmt: &HirStmt) -> Option<(HirLabelId, bool)> {
+fn rewrite_terminal_if_exits(
+    stmt: &mut HirStmt,
+    entry_facts: Option<PathFacts>,
+    stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
+    changed: &mut bool,
+    label_predecessors: &mut BTreeMap<HirLabelId, LabelPredecessors>,
+) -> Option<Option<PathFacts>> {
+    let exits = terminal_if_exits(stmt, discard_facts)?;
     let HirStmt::If(if_stmt) = stmt else {
-        return None;
+        unreachable!("terminal if exits must belong to an if")
     };
-    match (
-        if_stmt.then_block.stmts.as_slice(),
-        if_stmt
-            .else_block
-            .as_ref()
-            .map(|block| block.stmts.as_slice()),
-    ) {
-        ([HirStmt::Goto(goto)], None | Some([])) => Some((goto.target, true)),
-        ([], Some([HirStmt::Goto(goto)])) => Some((goto.target, false)),
-        _ => None,
+    let reachable = entry_facts.is_some();
+    let entry_facts = entry_facts.unwrap_or_default();
+    if reachable {
+        *changed |= specialize_condition(&mut if_stmt.cond, &entry_facts, stable);
+    }
+    let then_facts = reachable
+        .then(|| facts_for_condition(&entry_facts, &if_stmt.cond, true, stable))
+        .flatten();
+    let else_facts = reachable
+        .then(|| facts_for_condition(&entry_facts, &if_stmt.cond, false, stable))
+        .flatten();
+
+    let then_fallthrough = rewrite_terminal_if_arm(
+        &mut if_stmt.then_block,
+        exits.then_target,
+        then_facts,
+        stable,
+        discard_facts,
+        changed,
+        label_predecessors,
+    );
+    let else_fallthrough = if let Some(else_block) = &mut if_stmt.else_block {
+        rewrite_terminal_if_arm(
+            else_block,
+            exits.else_target,
+            else_facts,
+            stable,
+            discard_facts,
+            changed,
+            label_predecessors,
+        )
+    } else {
+        debug_assert!(exits.else_target.is_none());
+        else_facts
+    };
+    let fallthroughs = [then_fallthrough, else_fallthrough]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Some((!fallthroughs.is_empty()).then(|| PathFacts::intersection(fallthroughs)))
+}
+
+fn rewrite_terminal_if_arm(
+    block: &mut HirBlock,
+    target: Option<HirLabelId>,
+    facts: Option<PathFacts>,
+    stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
+    changed: &mut bool,
+    label_predecessors: &mut BTreeMap<HirLabelId, LabelPredecessors>,
+) -> Option<PathFacts> {
+    let reachable = facts.is_some();
+    let flow = if target.is_some() {
+        rewrite_terminal_goto_prefix(
+            block,
+            facts.unwrap_or_default(),
+            stable,
+            discard_facts,
+            changed,
+        )
+    } else {
+        rewrite_block(
+            block,
+            facts.unwrap_or_default(),
+            stable,
+            discard_facts,
+            changed,
+        )
+    };
+    if let Some(target) = target {
+        let predecessor = label_predecessors.entry(target).or_default();
+        predecessor.accounted_refs += 1;
+        if reachable && flow.falls_through {
+            predecessor.reachable_facts.push(flow.facts);
+        }
+        None
+    } else {
+        (reachable && flow.falls_through).then_some(flow.facts)
     }
 }
 
-fn if_condition(stmt: &HirStmt) -> &HirExpr {
+fn terminal_if_exits(
+    stmt: &HirStmt,
+    discard_facts: &DiscardBoundaryFacts,
+) -> Option<TerminalIfExits> {
     let HirStmt::If(if_stmt) = stmt else {
-        unreachable!("single guarded goto must be an if")
+        return None;
     };
-    &if_stmt.cond
+    let then_target = terminal_or_clean_arm(&if_stmt.then_block, discard_facts)?;
+    let else_target = if let Some(else_block) = &if_stmt.else_block {
+        terminal_or_clean_arm(else_block, discard_facts)?
+    } else {
+        None
+    };
+    (then_target.is_some() || else_target.is_some()).then_some(TerminalIfExits {
+        then_target,
+        else_target,
+    })
+}
+
+fn terminal_or_clean_arm(
+    block: &HirBlock,
+    discard_facts: &DiscardBoundaryFacts,
+) -> Option<Option<HirLabelId>> {
+    if !discard_facts.block_boundary(block).has_live_label_flow() {
+        Some(None)
+    } else {
+        terminal_clean_goto(block, discard_facts).map(Some)
+    }
+}
+
+fn terminal_clean_goto(
+    block: &HirBlock,
+    discard_facts: &DiscardBoundaryFacts,
+) -> Option<HirLabelId> {
+    let (HirStmt::Goto(goto), prefix) = block.stmts.split_last()? else {
+        return None;
+    };
+    (!discard_facts.stmts_boundary(prefix).has_live_label_flow()).then_some(goto.target)
+}
+
+fn rewrite_terminal_goto_prefix(
+    block: &mut HirBlock,
+    facts: PathFacts,
+    stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
+    changed: &mut bool,
+) -> Flow {
+    let goto = block
+        .stmts
+        .pop()
+        .expect("terminal guarded goto block must end in goto");
+    debug_assert!(matches!(goto, HirStmt::Goto(_)));
+    let flow = rewrite_block(block, facts, stable, discard_facts, changed);
+    block.stmts.push(goto);
+    flow
 }
 
 fn rewrite_clean_child_blocks(
@@ -620,10 +750,63 @@ fn extend_condition_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::{StableBinding, StableBindingIndex};
+    use super::super::DiscardBoundaryFacts;
+    use super::*;
     use crate::decompile::DecompileDialect;
-    use crate::hir::common::{HirExpr, ParamId};
+    use crate::hir::common::{HirGoto, HirIf, HirLabel, HirReturn, HirValuePack, ParamId};
     use crate::hir::expr_safety::HirExprSafety;
+
+    fn stable_params(params: impl IntoIterator<Item = ParamId>) -> StableBindingIndex {
+        StableBindingIndex {
+            candidates: params.into_iter().map(StableBinding::Param).collect(),
+            unstable: BTreeSet::new(),
+            safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        }
+    }
+
+    fn discard_facts(block: &HirBlock) -> DiscardBoundaryFacts {
+        DiscardBoundaryFacts {
+            protected_locals: BTreeSet::new(),
+            protected_temps: BTreeSet::new(),
+            label_refs: count_label_references(&block.stmts),
+        }
+    }
+
+    fn goto(target: HirLabelId) -> HirStmt {
+        HirStmt::Goto(Box::new(HirGoto { target }))
+    }
+
+    fn label(id: HirLabelId) -> HirStmt {
+        HirStmt::Label(Box::new(HirLabel {
+            id,
+            tbc_barriers: Vec::new(),
+        }))
+    }
+
+    fn if_stmt(
+        cond: HirExpr,
+        then_stmts: Vec<HirStmt>,
+        else_stmts: Option<Vec<HirStmt>>,
+    ) -> HirStmt {
+        HirStmt::If(Box::new(HirIf {
+            cond,
+            then_block: HirBlock { stmts: then_stmts },
+            else_block: else_stmts.map(|stmts| HirBlock { stmts }),
+        }))
+    }
+
+    fn return_stmt() -> HirStmt {
+        HirStmt::Return(Box::new(HirReturn {
+            values: HirValuePack::default(),
+        }))
+    }
+
+    fn condition_at(block: &HirBlock, index: usize) -> &HirExpr {
+        let HirStmt::If(if_stmt) = &block.stmts[index] else {
+            panic!("expected if statement at index {index}")
+        };
+        &if_stmt.cond
+    }
 
     #[test]
     fn tracks_every_condition_binding() {
@@ -640,5 +823,73 @@ mod tests {
         assert_eq!(index.candidates.len(), 257);
         assert!(index.contains(StableBinding::Param(ParamId(0))));
         assert!(index.contains(StableBinding::Param(ParamId(256))));
+    }
+
+    #[test]
+    fn double_terminal_goto_propagates_each_arm_fact_to_its_label() {
+        let flag = ParamId(0);
+        let truthy = HirLabelId(0);
+        let falsy = HirLabelId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                if_stmt(
+                    HirExpr::ParamRef(flag),
+                    vec![goto(truthy)],
+                    Some(vec![goto(falsy)]),
+                ),
+                label(truthy),
+                if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
+                return_stmt(),
+                label(falsy),
+                if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
+            ],
+        };
+        let stable = stable_params([flag]);
+        let discard_facts = discard_facts(&block);
+        let mut changed = false;
+
+        rewrite_clean_islands_in_tainted_block(
+            &mut block,
+            PathFacts::default(),
+            &stable,
+            &discard_facts,
+            &mut changed,
+        );
+
+        assert!(changed);
+        assert_eq!(condition_at(&block, 2), &HirExpr::Boolean(true));
+        assert_eq!(condition_at(&block, 5), &HirExpr::Boolean(false));
+    }
+
+    #[test]
+    fn backward_goto_prevents_using_only_the_seen_forward_predecessor() {
+        let flag = ParamId(0);
+        let loop_label = HirLabelId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                if_stmt(HirExpr::ParamRef(flag), vec![goto(loop_label)], None),
+                return_stmt(),
+                label(loop_label),
+                if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
+                if_stmt(
+                    HirExpr::ParamRef(flag).negate(),
+                    vec![goto(loop_label)],
+                    None,
+                ),
+            ],
+        };
+        let stable = stable_params([flag]);
+        let discard_facts = discard_facts(&block);
+        let mut changed = false;
+
+        rewrite_clean_islands_in_tainted_block(
+            &mut block,
+            PathFacts::default(),
+            &stable,
+            &discard_facts,
+            &mut changed,
+        );
+
+        assert_eq!(condition_at(&block, 3), &HirExpr::ParamRef(flag));
     }
 }

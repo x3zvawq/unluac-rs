@@ -23,8 +23,8 @@ use super::super::temp_touch::TempTouchIndex;
 use super::super::walk::rewrite_stmts;
 use super::HandoffSafety;
 use super::binding::{
-    BindingProtection, CarryBinding, TempBindingRewrite, TempToBindingPass,
-    bindings_may_share_raw_home_slot, bindings_share_exact_home_slot, carry_binding_from_lvalue,
+    BindingHomeOverlap, BindingProtection, CarryBinding, TempBindingRewrite, TempToBindingPass,
+    binding_home_overlap, bindings_share_exact_home_slot, carry_binding_from_lvalue,
 };
 use super::boundary::LabelJumpIndex;
 use super::prune::{
@@ -429,11 +429,19 @@ fn retained_target_conflicts_with_rewrite(
         // 候选拒绝[SemanticBarrier:EvalOrder]：删除 rewrite pair 会移除同一物理 target 的一次并行写，改变重复 target 的覆盖顺序。
         return true;
     }
-    if bindings_may_share_raw_home_slot(target, rewrite.to, promotion_facts) {
-        // 候选拒绝[ProofIncomplete]：retained physical binding 在 promotion 合流后缺少本次 lvalue occurrence 的 raw home；无法证明删除并行写不改变 target 覆盖顺序。明确无物理 home 的 synthetic local 已由 promotion facts 放行。
-        return true;
+    match binding_home_overlap(target, rewrite.to, promotion_facts) {
+        BindingHomeOverlap::Overlap => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：retained target 的完整可能 home 集与 rewrite destination 相交；删除 pair 可能移除同一物理 target 的一次并行写。
+            true
+        }
+        BindingHomeOverlap::Unknown => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：`t(slot0), l(slot0) = p0, other`
+            // 先以逆序 target 写入 other、再由 self-copy 恢复 p0；任一端 provenance
+            // 不完整时仍可能是该同槽反例，删除 rewrite pair 会把最终值改成 other。
+            true
+        }
+        BindingHomeOverlap::Disjoint => false,
     }
-    false
 }
 
 fn effectful_retained_target_precedes_rewrite_commit(
@@ -658,7 +666,9 @@ mod tests {
 
     #[test]
     fn retained_target_conflicts_with_rewrite_when_physical_home_relation_is_unknown() {
-        let promotion_facts = ProtoPromotionFacts::default();
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_merge(LocalId(0), None);
         let rewrite = TempBindingRewrite {
             from: TempId(0),
             to: CarryBinding::Param(ParamId(0)),
@@ -688,11 +698,29 @@ mod tests {
     }
 
     #[test]
-    fn retained_home_free_target_conflicts_after_absorbing_conflicting_physical_homes() {
+    fn retained_invalidated_target_does_not_conflict_when_complete_home_union_is_disjoint() {
         let mut promotion_facts = ProtoPromotionFacts::default();
-        promotion_facts.record_home_free_local(LocalId(0));
         promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(1, 0));
-        promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(2, 0));
+        promotion_facts
+            .record_local_home_merge(LocalId(0), Some(BTreeSet::from([HomeSlotKey::new(2, 0)])));
+        let rewrite = TempBindingRewrite {
+            from: TempId(0),
+            to: CarryBinding::Param(ParamId(0)),
+        };
+
+        assert!(!retained_target_conflicts_with_rewrite(
+            rewrite,
+            &HirLValue::Local(LocalId(0)),
+            &promotion_facts,
+        ));
+    }
+
+    #[test]
+    fn retained_invalidated_target_conflicts_when_complete_home_union_intersects() {
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(1, 0));
+        promotion_facts
+            .record_local_home_merge(LocalId(0), Some(BTreeSet::from([HomeSlotKey::new(0, 0)])));
         let rewrite = TempBindingRewrite {
             from: TempId(0),
             to: CarryBinding::Param(ParamId(0)),

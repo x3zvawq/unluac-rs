@@ -172,3 +172,28 @@ end
 assert(unique_label_predecessor(false) == "false")
 assert(unique_label_predecessor(true) == "true")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,label-pred", table.concat(events, ","))
+
+-- regress_374_path_condition_clean_islands#6: a clean prefix before the terminal
+-- guarded goto contributes its fallthrough facts to the unique forward label.
+-- unluac: expect-contains [[if not mark("prefixed-label", true) then]]
+-- unluac: expect-not-contains [[not flag or mark("prefixed-label", true)]]
+
+local function prefixed_label_predecessor(flag)
+    if flag then
+        mark("goto-prefix", true)
+        goto known_true
+    end
+    do
+        return "false"
+    end
+
+    ::known_true::
+    if not flag or mark("prefixed-label", true) then
+        return "true"
+    end
+    return "miss"
+end
+
+assert(prefixed_label_predecessor(false) == "false")
+assert(prefixed_label_predecessor(true) == "true")
+assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,label-pred,goto-prefix,prefixed-label", table.concat(events, ","))

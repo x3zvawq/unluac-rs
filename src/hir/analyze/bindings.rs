@@ -275,6 +275,9 @@ pub(super) fn build_bindings(
         (&numeric_binding_phis.bindings, &phi_debug_hints),
         (&mut phi_temps, &mut fixed_temps),
     );
+    // 只有下面实际分配 HIR staging 身份的 owner 才登记；复用 carried temp 的
+    // repeat stage 保留其 canonical physical provenance。
+    let mut home_free_temps = BTreeSet::new();
     let loop_guard_temps = structure
         .plan()
         .loops()
@@ -282,6 +285,7 @@ pub(super) fn build_bindings(
             loop_plan.normal_tail.as_ref().map(|_| {
                 let temp = TempId(next_temp_index);
                 next_temp_index += 1;
+                home_free_temps.insert(temp);
                 temp
             })
         })
@@ -320,8 +324,10 @@ pub(super) fn build_bindings(
                 ) {
                     temps.push(temp);
                 } else {
-                    temps.push(TempId(next_temp_index));
+                    let temp = TempId(next_temp_index);
                     next_temp_index += 1;
+                    home_free_temps.insert(temp);
+                    temps.push(temp);
                 }
             }
             temps
@@ -448,6 +454,7 @@ pub(super) fn build_bindings(
         temp_debug_scopes,
         fixed_temps,
         phi_temps,
+        home_free_temps,
         loop_guard_temps,
         repeat_staged_temps,
         instr_fixed_defs,
