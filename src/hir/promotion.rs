@@ -22,12 +22,12 @@ use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, LocalId, ParamId, TempId,
 };
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, GraphFacts,
+    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EffectTag, GraphFacts,
     LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, SsaValue,
     StructurePlan,
 };
-use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
-use std::collections::{BTreeSet, VecDeque};
+use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg, UpvalueOperand};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// temp promotion 使用的词法槽位身份。
 ///
@@ -271,6 +271,8 @@ pub(super) struct ProtoPromotionFacts {
     direct_table_seed_temps: BTreeSet<TempId>,
     direct_table_seed_locals: BTreeSet<LocalId>,
     loop_carrier_temps: BTreeSet<TempId>,
+    scope_end_upvalue_copy_root_temps: BTreeSet<TempId>,
+    upvalue_copy_root_overwrites: BTreeMap<TempId, TempId>,
     local_home_slots: Vec<HomeSlotResolution>,
     invalidated_param_homes: BTreeSet<ParamId>,
     invalidated_local_homes: BTreeSet<LocalId>,
@@ -301,6 +303,8 @@ impl ProtoPromotionFacts {
             phi_temps,
             total_temps,
         );
+        let upvalue_copy_roots =
+            collect_upvalue_copy_root_facts(proto, dataflow, fixed_temps);
 
         Self {
             temp_home_slots,
@@ -321,6 +325,8 @@ impl ProtoPromotionFacts {
             direct_table_seed_temps: collect_direct_table_seed_temps(proto, dataflow, fixed_temps),
             direct_table_seed_locals: BTreeSet::new(),
             loop_carrier_temps: collect_loop_carrier_temps(plan, phi_temps),
+            scope_end_upvalue_copy_root_temps: upvalue_copy_roots.scope_end,
+            upvalue_copy_root_overwrites: upvalue_copy_roots.overwrites,
             local_home_slots: Vec::new(),
             invalidated_param_homes: BTreeSet::new(),
             invalidated_local_homes: BTreeSet::new(),
@@ -385,6 +391,26 @@ impl ProtoPromotionFacts {
     /// 且未被 debug/source identity 占用时，才可继续消去对应 mirror。
     pub(super) fn is_loop_carrier_temp(&self, temp: TempId) -> bool {
         self.loop_carrier_temps.contains(&temp)
+    }
+
+    /// 该 temp 的 `GETUPVAL` copy home 在同一 low-IR block 内一直活跃到 Return。
+    ///
+    /// 这份事实只服务于“源码读取已经结束、物理栈槽仍作为 GC root”的负向保护；若
+    /// 后续 binding 合并使 home provenance 失效，就不能再消费原始证明。
+    pub(super) fn is_scope_end_upvalue_copy_root_temp(&self, temp: TempId) -> bool {
+        !self.temp_home_was_invalidated(temp)
+            && self.scope_end_upvalue_copy_root_temps.contains(&temp)
+    }
+
+    /// 返回结束该 upvalue copy root transaction 的精确 scalar-nil overwrite temp。
+    pub(super) fn upvalue_copy_root_overwrite(&self, temp: TempId) -> Option<TempId> {
+        if self.temp_home_was_invalidated(temp) {
+            return None;
+        }
+        let overwrite = self.upvalue_copy_root_overwrites.get(&temp).copied()?;
+        (!self.temp_home_was_invalidated(overwrite)
+            && self.trusted_temp_home_slot(temp) == self.trusted_temp_home_slot(overwrite))
+        .then_some(overwrite)
     }
 
     /// 返回某个 temp 对应的原始寄存器槽位。
@@ -1063,6 +1089,185 @@ fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTr
         .flatten()
     }));
     temps
+}
+
+/// 从 low-IR 正证一个 `GETUPVAL` copy 的物理槽在后续所有潜在用户代码/GC 观察点
+/// 都仍位于 VM active stack top 以下，并沿同一 basic block 活到 Return 或一个精确的
+/// scalar-nil overwrite。
+///
+/// HIR 会丢失 block 结束时的隐式 stack-top 收缩；只看“后缀没有同槽写”会把已经到期
+/// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实，且不跨任何控制
+/// terminator、Close/TBC 或无法计算活动栈下界的事件。
+#[derive(Default)]
+struct UpvalueCopyRootFacts {
+    scope_end: BTreeSet<TempId>,
+    overwrites: BTreeMap<TempId, TempId>,
+}
+
+enum UpvalueCopyRootEnd {
+    ScopeEnd,
+    NilOverwrite(TempId),
+}
+
+fn collect_upvalue_copy_root_facts(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+) -> UpvalueCopyRootFacts {
+    let mut facts = UpvalueCopyRootFacts::default();
+    for def in &dataflow.defs {
+        let Some(LowInstr::GetUpvalue(get_upvalue)) = proto.instrs.get(def.instr.index()) else {
+            continue;
+        };
+        if get_upvalue.dst != def.reg
+            || !matches!(get_upvalue.src, UpvalueOperand::Upvalue(_))
+        {
+            continue;
+        }
+
+        let direct = TempId(def.id.index());
+        if fixed_temps.get(def.id.index()) != Some(&direct) {
+            continue;
+        }
+        match copy_root_end(proto, dataflow, fixed_temps, def.instr, def.reg) {
+            Some(UpvalueCopyRootEnd::ScopeEnd) => {
+                facts.scope_end.insert(direct);
+            }
+            Some(UpvalueCopyRootEnd::NilOverwrite(overwrite)) => {
+                facts.overwrites.insert(direct, overwrite);
+            }
+            None => {}
+        }
+    }
+    facts
+}
+
+fn copy_root_end(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+    producer: InstrRef,
+    home: Reg,
+) -> Option<UpvalueCopyRootEnd> {
+    let mut observed = false;
+
+    for index in producer.index() + 1..proto.instrs.len() {
+        let instr = proto.instrs.get(index)?;
+        let effect = dataflow.instr_effects.get(index)?;
+
+        // 当前值若被覆盖，同一 root transaction 要么在精确 nil 写处终止，要么失去证明。
+        if effect.must_define(home) {
+            if observed
+                && let Some(overwrite) = direct_scalar_nil_overwrite_temp(
+                    proto,
+                    dataflow,
+                    fixed_temps,
+                    index,
+                    home,
+                )
+            {
+                return Some(UpvalueCopyRootEnd::NilOverwrite(overwrite));
+            }
+            // 候选拒绝[SemanticBarrier:Lifetime]：同槽覆盖会在原位置结束旧 root；
+            // 只有 direct scalar nil overwrite 能在 HIR 精确复现该终止点。
+            return None;
+        }
+
+        match instr {
+            LowInstr::Return(_) => return observed.then_some(UpvalueCopyRootEnd::ScopeEnd),
+            LowInstr::Call(call) => {
+                // 只消费跨方言共同成立的 caller-prefix：callee base 以下的槽在被调
+                // 函数执行期间仍属于 caller frame。LuaJIT 的 FR1/FR2 frame link 会让
+                // args.start 与真实 TValue root 区间不同，不能用参数 range 推 active top。
+                if call.callee.index() <= home.index() {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：callee base 不高于 copy home
+                    // 时，该槽不属于被调函数执行期间的 caller root 前缀。
+                    return None;
+                }
+                observed = true;
+            }
+            LowInstr::Close(_)
+            | LowInstr::Tbc(_)
+            | LowInstr::TailCall(_)
+            | LowInstr::GenericForCall(_) => {
+                // 候选拒绝[ProofIncomplete]：close/resource 与专用调用协议需要各自的
+                // frame/root 区间事实，不能复用普通 CALL 的 caller-prefix 证明。
+                return None;
+            }
+            _ if instr.is_control_terminator() => {
+                // 候选拒绝[ProofIncomplete]：不跨 basic-block terminator 猜测每条后继
+                // 路径的 stack-top 与 root 终止点。
+                return None;
+            }
+            _ if low_instr_may_observe_gc_roots(dataflow, index) => {
+                if effect_active_top_lower_bound(effect) <= home.index() {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：当前观察点不能正证 copy home
+                    // 位于活动栈下界内；block-end 高槽到期反例会在这里被排除。
+                    return None;
+                }
+                observed = true;
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn direct_scalar_nil_overwrite_temp(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+    index: usize,
+    home: Reg,
+) -> Option<TempId> {
+    let LowInstr::LoadNil(load_nil) = proto.instrs.get(index)? else {
+        return None;
+    };
+    if load_nil.dst.start != home || load_nil.dst.len != 1 {
+        return None;
+    }
+    let [def] = dataflow.instr_defs.get(index)?.as_slice() else {
+        return None;
+    };
+    if dataflow.defs.get(def.index())?.reg != home {
+        return None;
+    }
+    let direct = TempId(def.index());
+    (fixed_temps.get(def.index()) == Some(&direct)).then_some(direct)
+}
+
+fn effect_active_top_lower_bound(effect: &crate::structure::InstrEffect) -> usize {
+    effect
+        .fixed_uses
+        .iter()
+        .chain(&effect.fixed_must_defs)
+        .map(|reg| reg.index().saturating_add(1))
+        .chain(effect.open_use.map(Reg::index))
+        .chain(effect.open_must_def.map(Reg::index))
+        .max()
+        .unwrap_or_default()
+}
+
+fn low_instr_may_observe_gc_roots(dataflow: &DataflowFacts, index: usize) -> bool {
+    const OBSERVATION_TAGS: &[EffectTag] = &[
+        EffectTag::Alloc,
+        EffectTag::ReadTable,
+        EffectTag::WriteTable,
+        EffectTag::ReadEnv,
+        EffectTag::WriteEnv,
+        EffectTag::Call,
+        EffectTag::Metamethod,
+    ];
+
+    dataflow
+        .effect_summaries
+        .get(index)
+        .is_some_and(|summary| {
+            OBSERVATION_TAGS
+                .iter()
+                .any(|tag| summary.tags.contains(tag))
+        })
 }
 
 fn fill_phi_home_slots(
