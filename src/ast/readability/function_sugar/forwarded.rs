@@ -104,7 +104,7 @@ fn inline_function_into_stmt(
                 return None;
             }
             if let Some((target_name, function)) =
-                function_decl_target_from_lvalue(&assign.targets[0], &function)
+                function_decl_target_from_lvalue(&assign.targets[0], &function, target)
             {
                 return Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
                     target: target_name,

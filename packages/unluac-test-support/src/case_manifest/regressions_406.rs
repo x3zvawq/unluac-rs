@@ -1,4 +1,4 @@
-//! 回归 case 406；GenericFor 唯一 iterator 可原子收回 receiver alias。
+//! 回归 case 406；GenericFor 首个 iterator 可原子收回 receiver alias。
 
 use super::*;
 

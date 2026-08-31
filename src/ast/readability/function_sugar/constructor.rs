@@ -9,10 +9,9 @@
 //!    local ctor = ffi.metatype("x", meta)`
 //!   -> `local ctor = ffi.metatype("x", { __index = { bump = function(...) end } })`
 //!
-//! 这里不会去猜任意跨语句的数据流；只有“构造器 local -> 构造器字段接线 -> 终端链或已知
-//! method boundary 前缀”仍保持机械脚手架形状时，才会收回源码结构。已经明确成形的
-//! `FunctionDecl(Method)` 由本 pass 保留在边界之后，避免把声明再次折回匿名 constructor
-//! field；普通字段函数没有足够 provenance 时则保持 plain 形式。
+//! 这里不会去猜任意跨语句的数据流；只有“构造器 local -> 构造器字段接线”仍保持机械
+//! 脚手架形状时，才会收回源码结构。非 plain 字段函数的语句自然终止连续前缀，不由本
+//! pass 改写。
 
 use std::collections::BTreeSet;
 
@@ -21,8 +20,9 @@ use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
 use super::super::expr_analysis::is_eventless_primitive_literal;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
-    AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstReturn, AstStmt, AstTableField, AstTableKey,
+    AstAssign, AstBindingRef, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName,
+    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstReturn, AstStmt, AstTableField,
+    AstTableKey,
 };
 
 pub(super) fn try_inline_terminal_constructor_fields(
@@ -48,17 +48,13 @@ pub(super) fn try_inline_terminal_constructor_fields(
     let AstExpr::TableConstructor(table) = &mut rewritten.values[0] else {
         unreachable!("matched constructor value above")
     };
+    if !table_can_append_record_field(table) {
+        return None;
+    }
 
     let mut consumed = 1usize;
     let mut inlined_any = false;
     while let Some(stmt) = stmts.get(consumed) {
-        // Preserve an already formed method declaration. Folding it into the constructor would
-        // erase the declaration boundary before its owning pass can emit the same method form.
-        if stmt_is_recoverable_method_decl(stmt, binding) {
-            // 候选拒绝[LayerBoundary]：已有 `FunctionDecl(Method)` 属于声明 owner；此前已
-            // 提交的 plain-field 前缀仍由本 pass 保留。
-            break;
-        }
         let Some((field, func)) = inlineable_local_table_function_stmt(stmt, binding) else {
             break;
         };
@@ -76,16 +72,6 @@ pub(super) fn try_inline_terminal_constructor_fields(
     }
 
     Some((AstStmt::LocalDecl(Box::new(rewritten)), consumed))
-}
-
-fn stmt_is_recoverable_method_decl(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    if let AstStmt::FunctionDecl(function_decl) = stmt {
-        let AstFunctionName::Method(path, _) = &function_decl.target else {
-            return false;
-        };
-        return path.fields.len() == 1 && name_matches_binding(&path.root, binding);
-    }
-    false
 }
 
 pub(super) fn try_inline_terminal_constructor_call(
@@ -268,6 +254,9 @@ fn inline_arg_local_table_function(stmt: &AstStmt, arg_locals: &mut [Constructor
         let AstExpr::TableConstructor(table) = &mut arg_local.value else {
             continue;
         };
+        if !table_can_append_record_field(table) {
+            return false;
+        }
         table
             .fields
             .push(AstTableField::Record(crate::ast::common::AstRecordField {
@@ -311,6 +300,9 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     let AstExpr::TableConstructor(table) = &mut arg_locals[outer_index].value else {
         return false;
     };
+    if !table_can_append_record_field(table) {
+        return false;
+    }
 
     // 这里专门收回“先建内层 methods table，再接到外层 metadata 字段”的机械接线。
     // 它只在内层 table 仍是独立 constructor local 时触发，不会把任意普通变量赋值猜成
@@ -323,6 +315,16 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
         }));
     arg_locals[inner_index].pass_to_sink = false;
     true
+}
+
+fn table_can_append_record_field(table: &crate::ast::common::AstTableConstructor) -> bool {
+    // 候选拒绝[SemanticBarrier:ValueArity]：追加字段会让原末尾 open call/vararg 不再展开，具体反例见 regress_401。
+    !matches!(
+        table.fields.last(),
+        Some(AstTableField::Array(
+            AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
+        ))
+    )
 }
 
 fn inlineable_nested_table_assign(
@@ -376,6 +378,62 @@ fn rewrite_terminal_constructor_call_sink(
                 arg_locals,
             )?;
             Some(AstStmt::LocalDecl(Box::new(rewritten)))
+        }
+        AstStmt::CallStmt(call_stmt) => {
+            let AstCallKind::Call(call) = &call_stmt.call else {
+                return None;
+            };
+            let AstExpr::Call(call) = rewrite_terminal_constructor_call_expr(
+                &AstExpr::Call(call.clone()),
+                callee_binding,
+                callee_expr,
+                arg_locals,
+            )?
+            else {
+                unreachable!("terminal constructor helper preserves the outer call")
+            };
+            let mut rewritten = call_stmt.as_ref().clone();
+            rewritten.call = AstCallKind::Call(call);
+            // 候选接受[EvalOrderProof]：CallStmt 没有外层求值前缀，constructor initializer 仍在 callee/实参位置按原顺序执行一次。
+            Some(AstStmt::CallStmt(Box::new(rewritten)))
+        }
+        AstStmt::If(if_stmt) => {
+            let mut rewritten = if_stmt.as_ref().clone();
+            rewritten.cond = rewrite_terminal_constructor_call_expr(
+                &if_stmt.cond,
+                callee_binding,
+                callee_expr,
+                arg_locals,
+            )?;
+            // 候选接受[EvalOrderProof/ValueArityProof]：if 条件是一次性标量 owner，且没有先行运行时事件。
+            Some(AstStmt::If(Box::new(rewritten)))
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            let mut rewritten = numeric_for.as_ref().clone();
+            rewritten.start = rewrite_terminal_constructor_call_expr(
+                &numeric_for.start,
+                callee_binding,
+                callee_expr,
+                arg_locals,
+            )?;
+            // 候选接受[EvalOrderProof/ValueArityProof]：start 是 header 首个一次性标量事件，limit/step 顺序不动。
+            Some(AstStmt::NumericFor(Box::new(rewritten)))
+        }
+        AstStmt::GenericFor(generic_for) => {
+            let mut rewritten = generic_for.as_ref().clone();
+            let first = rewrite_terminal_constructor_call_expr(
+                generic_for.iterator.first()?,
+                callee_binding,
+                callee_expr,
+                arg_locals,
+            )?;
+            rewritten.iterator[0] = first;
+            // 候选接受[EvalOrderProof/ValueArityProof]：首 iterator 无前缀；单项时保留 open pack，多项时前后都截成单值。
+            Some(AstStmt::GenericFor(Box::new(rewritten)))
+        }
+        AstStmt::While(_) | AstStmt::Repeat(_) => {
+            // 候选拒绝[SemanticBarrier:EvalCount]：搬入循环条件会把一次 constructor/callee 初始化改成逐轮执行。
+            None
         }
         _ => None,
     }

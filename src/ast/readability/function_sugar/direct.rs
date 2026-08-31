@@ -5,9 +5,9 @@
 //! 例如：`local f = function() end` 会在这里变成 `local function f() end`。
 
 use crate::ast::common::{
-    AstAssign, AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName,
-    AstGlobalBindingTarget, AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl,
-    AstLocalFunctionDecl, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
+    AstAssign, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalBindingTarget,
+    AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstNamePath,
+    AstNameRef, AstStmt, AstTargetDialect,
 };
 
 pub(super) fn lower_direct_function_stmt(
@@ -17,7 +17,7 @@ pub(super) fn lower_direct_function_stmt(
     match stmt {
         AstStmt::LocalDecl(local_decl) => try_lower_local_function_decl(local_decl),
         AstStmt::GlobalDecl(global_decl) => try_lower_global_function_decl(global_decl, target),
-        AstStmt::Assign(assign) => try_lower_function_assign(assign),
+        AstStmt::Assign(assign) => try_lower_function_assign(assign, target),
         _ => None,
     }
 }
@@ -30,13 +30,7 @@ fn try_lower_local_function_decl(local_decl: &AstLocalDecl) -> Option<AstStmt> {
     if binding.attr != AstLocalAttr::None {
         return None;
     }
-    let name = match binding.id {
-        AstBindingRef::Local(name) => AstBindingRef::Local(name),
-        AstBindingRef::SyntheticLocal(name) => AstBindingRef::SyntheticLocal(name),
-        crate::ast::common::AstBindingRef::Temp(_) => {
-            return None;
-        }
-    };
+    let name = binding.id;
     let AstExpr::FunctionExpr(func) = &local_decl.values[0] else {
         return None;
     };
@@ -73,14 +67,14 @@ fn try_lower_global_function_decl(
     })))
 }
 
-fn try_lower_function_assign(assign: &AstAssign) -> Option<AstStmt> {
+fn try_lower_function_assign(assign: &AstAssign, target: AstTargetDialect) -> Option<AstStmt> {
     if assign.targets.len() != 1 || assign.values.len() != 1 {
         return None;
     }
     let AstExpr::FunctionExpr(func) = &assign.values[0] else {
         return None;
     };
-    let (target, func) = function_decl_target_from_lvalue(&assign.targets[0], func)?;
+    let (target, func) = function_decl_target_from_lvalue(&assign.targets[0], func, target)?;
     Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
         target,
         func,
@@ -90,17 +84,16 @@ fn try_lower_function_assign(assign: &AstAssign) -> Option<AstStmt> {
 pub(super) fn function_decl_target_from_lvalue(
     target: &AstLValue,
     func: &AstFunctionExpr,
+    dialect: AstTargetDialect,
 ) -> Option<(AstFunctionName, AstFunctionExpr)> {
     match target {
-        AstLValue::Name(
-            name @ (AstNameRef::Param(_)
-            | AstNameRef::Local(_)
-            | AstNameRef::SyntheticLocal(_)
-            | AstNameRef::Upvalue(_)
-            | AstNameRef::Global(_)),
-        ) => {
+        AstLValue::Name(AstNameRef::Global(_)) if dialect.caps.global_decl => {
+            // 候选拒绝[SemanticBarrier:DeclarationIdentity]：普通赋值若输出成 `global function` 会重复声明已有 global，反例见 regress_411。
+            None
+        }
+        AstLValue::Name(name) => {
             // 候选接受[BindingIdentityProof]：Lua 的 plain `function name()` 正是对当前
-            // 词法 name binding 的函数赋值，不限于 global。
+            // binding 的函数赋值；流水线中的 Temp 已由前置 materialize pass 物化。
             Some((
                 AstFunctionName::Plain(AstNamePath {
                     root: name.clone(),
@@ -109,13 +102,8 @@ pub(super) fn function_decl_target_from_lvalue(
                 func.clone(),
             ))
         }
-        AstLValue::Name(AstNameRef::Temp(_)) => {
-            // 候选拒绝[LayerBoundary]：Temp 必须先由 materialize owner 建立源码 binding。
-            None
-        }
         AstLValue::FieldAccess(access) => {
-            // 候选拒绝[ProofIncomplete]：assignment 与 method 的字节码形状相同，缺少绑定到
-            // 该函数定义的语法 provenance；保留显式首参，避免隐式 `self` 改变调用结果。
+            // 候选拒绝[SemanticBarrier:ParameterBinding]：无定义 provenance 时改成 method 会删除显式首参；同名 receiver 的可达反例见 regress_333。
             let AstNamePath { root, mut fields } = name_path_from_expr(&access.base)?;
             fields.push(access.field.clone());
             Some((
@@ -153,7 +141,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::ast::common::AstLocalOrigin;
+    use crate::ast::common::{AstBindingRef, AstLocalOrigin};
     use crate::hir::{HirProtoRef, LocalId};
 
     fn local_function(origin: AstLocalOrigin) -> AstLocalDecl {

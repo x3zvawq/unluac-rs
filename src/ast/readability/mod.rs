@@ -333,3 +333,59 @@ fn emit_ast_pass_diff_if_requested(name: &str, before: AstPassSnapshot, module: 
 
 #[cfg(not(feature = "decompile-debug"))]
 fn emit_ast_pass_diff_if_requested(_name: &str, _before: AstPassSnapshot, _module: &AstModule) {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::ast::common::{
+        AstAssign, AstBlock, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstNameRef,
+        AstStmt, AstSyntheticLocalId,
+    };
+    use crate::decompile::DecompileDialect;
+    use crate::hir::{HirProtoRef, TempId};
+    use crate::timing::TimingCollector;
+
+    #[test]
+    fn deferred_pipeline_materializes_temp_before_function_sugar() {
+        let temp = TempId(7);
+        let module = AstModule {
+            entry_function: HirProtoRef(0),
+            body: AstBlock {
+                stmts: vec![AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Temp(temp))],
+                    values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                        function: HirProtoRef(1),
+                        params: Vec::new(),
+                        is_vararg: false,
+                        named_vararg: None,
+                        body: AstBlock::default(),
+                        captured_bindings: BTreeSet::new(),
+                        captured_params: BTreeSet::new(),
+                    }))],
+                }))],
+            },
+        };
+
+        let readable = make_readable_module(
+            &module,
+            AstTargetDialect::new(DecompileDialect::Lua54),
+            ReadabilityOptions::default(),
+            &TimingCollector::new(false),
+            &[],
+        )
+        .expect("readability should converge");
+
+        let [AstStmt::FunctionDecl(decl)] = readable.body.stmts.as_slice() else {
+            panic!("function sugar should consume the materialized assignment")
+        };
+        let AstFunctionName::Plain(path) = &decl.target else {
+            panic!("direct assignment must remain a plain function")
+        };
+        assert_eq!(
+            path.root,
+            AstNameRef::SyntheticLocal(AstSyntheticLocalId(temp))
+        );
+    }
+}
