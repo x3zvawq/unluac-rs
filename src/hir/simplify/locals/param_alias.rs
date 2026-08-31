@@ -362,6 +362,7 @@ fn validate_alias_stmt(
             ..AliasFlow::default()
         }),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
@@ -606,6 +607,10 @@ impl AliasEvaluationFacts {
 }
 
 impl HirVisitor for AliasEvaluationFacts {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.has_opaque_callback |= matches!(stmt, HirStmt::GlobalDecl(_));
+    }
+
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
             HirExpr::LocalRef(local) if *local == self.local => self.reads_local = true,

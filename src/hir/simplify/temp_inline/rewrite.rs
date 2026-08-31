@@ -17,6 +17,9 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
         HirStmt::LocalDecl(local_decl) => {
             replace_temp_in_value_pack(&mut local_decl.values, temp, replacement);
         }
+        HirStmt::GlobalDecl(global_decl) => {
+            replace_temp_in_value_pack(&mut global_decl.values, temp, replacement);
+        }
         HirStmt::Assign(assign) => {
             for target in &mut assign.targets {
                 replace_temp_in_lvalue(target, temp, replacement);
@@ -80,6 +83,9 @@ pub(super) fn replace_temps_in_stmt(
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             replace_temps_in_value_pack(&mut local_decl.values, replacements)
+        }
+        HirStmt::GlobalDecl(global_decl) => {
+            replace_temps_in_value_pack(&mut global_decl.values, replacements)
         }
         HirStmt::Assign(assign) => {
             let targets = assign

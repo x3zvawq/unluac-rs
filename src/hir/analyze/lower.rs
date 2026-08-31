@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::promotion::{HomeSlotKey, ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
+use super::global_decls::GlobalDeclProtocols;
 use super::helpers::{decode_raw_string, empty_proto, return_stmt};
 use super::instrs::local_decl_stmts;
 use super::shared_closures::{
@@ -173,6 +174,7 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) captured_shared_closures: CapturedSharedClosureLowering,
     pub(super) open_pack_owners: Vec<Option<InstrRef>>,
     pub(super) owned_open_producers: Vec<bool>,
+    pub(super) global_decls: GlobalDeclProtocols,
 }
 
 pub(super) struct CapturedSharedClosureLowering {
@@ -454,6 +456,7 @@ fn lower_proto_one(
             owned_open_producers[def.instr.index()] = true;
         }
     }
+    let global_decls = GlobalDeclProtocols::analyze(target, proto, cfg, dataflow);
     let lowering = ProtoLowering {
         target,
         proto,
@@ -467,6 +470,7 @@ fn lower_proto_one(
         captured_shared_closures,
         open_pack_owners,
         owned_open_producers,
+        global_decls,
     };
 
     artifacts.protos[id.index()] = HirProto {

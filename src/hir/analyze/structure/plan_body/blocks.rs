@@ -244,19 +244,49 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
 
         let mut root = Vec::new();
         let mut scopes = Vec::<(usize, Vec<HirStmt>)>::new();
-        for instr_index in start..end {
+        let mut instr_index = start;
+        while instr_index < end {
             if let Some(closes) = starts.get(&instr_index) {
                 scopes.extend(closes.iter().map(|&close| (close, Vec::new())));
             }
-            let lowered = self.lower_planned_regular(owner, block, InstrRef(instr_index))?;
+            let mut consumed_end = instr_index + 1;
+            let lowered = if let Some(protocol) = self
+                .lowering
+                .global_decls
+                .owner(InstrRef(instr_index))
+                .filter(|protocol| {
+                    protocol.end <= end
+                        && starts
+                            .range((instr_index + 1)..protocol.end)
+                            .next()
+                            .is_none()
+                        && scopes.iter().all(|(close, _)| *close + 1 >= protocol.end)
+                }) {
+                let stmt = super::super::super::instrs::lower_global_decl_owner(
+                    self.lowering,
+                    block,
+                    InstrRef(instr_index),
+                    protocol,
+                )
+                .ok_or(HirLowerError::InvalidPlanRegion {
+                    proto: self.proto.index(),
+                    region: owner.index(),
+                    detail: "frozen global declaration protocol no longer matches its owner",
+                })?;
+                consumed_end = protocol.end;
+                vec![stmt]
+            } else {
+                self.lower_planned_regular(owner, block, InstrRef(instr_index))?
+            };
             if let Some((_, stmts)) = scopes.last_mut() {
                 stmts.extend(lowered);
             } else {
                 root.extend(lowered);
             }
+            instr_index = consumed_end;
             while scopes
                 .last()
-                .is_some_and(|(close, _)| *close == instr_index)
+                .is_some_and(|(close, _)| *close + 1 == instr_index)
             {
                 let (_, stmts) = scopes
                     .pop()

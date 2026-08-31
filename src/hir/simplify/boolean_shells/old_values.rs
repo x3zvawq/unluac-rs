@@ -209,6 +209,13 @@ impl OldValueState {
             .or_insert(OldValueClass::ProofIncomplete);
         *current = join_value_classes(*current, written);
     }
+
+    fn obscure_physical_homes(mut self) -> Self {
+        self.home_classes
+            .values_mut()
+            .for_each(|class| *class = OldValueClass::MayCarryResource);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -362,6 +369,12 @@ impl OldValueAnalyzer<'_> {
                 continues: Some(state),
                 ..InertFlow::default()
             },
+            HirStmt::GlobalDecl(_) => {
+                // The syntax node hides call-result/probe writes to raw VM slots, so home facts
+                // cannot cross it. Lexical locals remain distinct bindings; reference-captured
+                // locals are already rejected by the enclosing boolean-shell facts.
+                InertFlow::fallthrough(Some(state.obscure_physical_homes()))
+            }
             HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
@@ -772,6 +785,7 @@ fn apply_block_plan(block: &mut HirBlock, prefix: &[PathComponent], plan: &BTree
                 apply_block_plan(nested, &body_prefix, plan);
             }
             HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::Assign(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)

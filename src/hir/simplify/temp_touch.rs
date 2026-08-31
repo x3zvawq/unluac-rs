@@ -72,6 +72,7 @@ pub(super) fn stmt_consumes_temps_only_in_control_head(
                 && !stmts_touch_any_temp(&generic_for.body.stmts, temps)
         }
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
@@ -103,6 +104,7 @@ pub(super) fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
         HirStmt::Block(block) => block_contains_nonlocal_control(block),
         HirStmt::Goto(_) | HirStmt::Label(_) => true,
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)

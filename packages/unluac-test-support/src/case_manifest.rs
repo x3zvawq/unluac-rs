@@ -100,6 +100,8 @@ mod regressions_405;
 mod regressions_406;
 mod regressions_407;
 mod regressions_408;
+mod regressions_409;
+mod regressions_410;
 mod unit_cases;
 
 use regressions_001_100::REGRESSION_CASES_001_100;
@@ -194,6 +196,8 @@ use regressions_405::REGRESSION_CASES_405;
 use regressions_406::REGRESSION_CASES_406;
 use regressions_407::REGRESSION_CASES_407;
 use regressions_408::REGRESSION_CASES_408;
+use regressions_409::REGRESSION_CASES_409;
+use regressions_410::REGRESSION_CASES_410;
 use unit_cases::UNIT_CASES;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Display, IntoStaticStr)]
@@ -278,6 +282,7 @@ impl LuaCaseMatrixEntry {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum LuaCaseExpectation {
     Source,
+    GlobalDeclResidual,
     TableSetListResidual,
     InvalidDebugStillRejected,
     LuaJitBuiltinTableRemove,
@@ -590,6 +595,8 @@ pub(crate) fn regression_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
         REGRESSION_CASES_406,
         REGRESSION_CASES_407,
         REGRESSION_CASES_408,
+        REGRESSION_CASES_409,
+        REGRESSION_CASES_410,
     ]
     .into_iter()
     .flat_map(manifest_entries)

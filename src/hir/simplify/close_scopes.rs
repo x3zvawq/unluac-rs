@@ -597,6 +597,7 @@ impl HirVisitor for ScopeActivityCollector {
                     .any(|local| self.binding_matches_local(local));
             }
             HirStmt::Assign(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)

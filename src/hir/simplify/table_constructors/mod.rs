@@ -1653,6 +1653,7 @@ fn stmt_has_table_constructor_candidate(stmt: &HirStmt) -> bool {
         }
         HirStmt::Block(block) => block_has_table_constructor_candidate(block),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)

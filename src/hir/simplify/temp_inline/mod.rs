@@ -656,6 +656,11 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
                         .iter()
                         .any(|value| expr_touches_temp(value, temp)))
         }
+        HirStmt::GlobalDecl(global_decl) => global_decl.values.fixed.iter().any(|value| {
+            matches!(value, HirExpr::TempRef(value_temp) if *value_temp == temp)
+                || (matches!(value, HirExpr::TableConstructor(_))
+                    && expr_touches_temp(value, temp))
+        }),
         HirStmt::TableSetList(set_list) => {
             expr_touches_temp(&set_list.base, temp)
                 || set_list
@@ -1526,7 +1531,8 @@ fn root_nil_pack_gap_preserves_slots(
         }
         HirStmt::TableSetList(_) | HirStmt::CallStmt(_) => true,
         // 候选拒绝[ProofIncomplete]：结构化/资源/control gap 当前没有精确 may-write 与路径事实，blanket 停止跨越；应由结构区域 effect summary 替代。
-        HirStmt::ErrNil(_)
+        HirStmt::GlobalDecl(_)
+        | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::Return(_)
@@ -2107,6 +2113,7 @@ fn inline_temps_in_nested_blocks(
             inherited_captured_slots,
         ),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)

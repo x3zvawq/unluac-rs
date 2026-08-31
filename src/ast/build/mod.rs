@@ -12,7 +12,9 @@ use std::collections::BTreeSet;
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::generate::GenerateMode;
-use crate::hir::{HirBlock, HirClosureExpr, HirGenericFor, HirModule, HirStmt, TempId};
+use crate::hir::{
+    HirBlock, HirClosureExpr, HirGenericFor, HirGlobalDecl, HirModule, HirStmt, TempId,
+};
 use crate::structure::{BlockRef, ControlFlowFeature, PhiId, PlanRequirement, StructureFacts};
 use crate::transformer::Reg;
 
@@ -22,9 +24,10 @@ use self::analysis::{
 };
 use self::exprs::PackLoweringContext;
 use super::common::{
-    AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGoto, AstIf, AstLabel,
-    AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule,
-    AstNumericFor, AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
+    AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
+    AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstLabel, AstLabelId,
+    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNumericFor,
+    AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
 };
 use super::error::AstLowerError;
 
@@ -320,6 +323,12 @@ impl<'a> AstLowerer<'a> {
                 ))],
                 1,
             )),
+            HirStmt::GlobalDecl(global_decl) => Ok((
+                vec![AstStmt::GlobalDecl(Box::new(
+                    self.lower_hir_global_decl(proto_index, global_decl)?,
+                ))],
+                1,
+            )),
             HirStmt::Assign(assign) => Ok((
                 vec![AstStmt::Assign(Box::new(
                     self.lower_assign(proto_index, assign)?,
@@ -501,6 +510,36 @@ impl<'a> AstLowerer<'a> {
                 1,
             )),
         }
+    }
+
+    fn lower_hir_global_decl(
+        &mut self,
+        proto_index: usize,
+        global_decl: &HirGlobalDecl,
+    ) -> Result<AstGlobalDecl, AstLowerError> {
+        if !self.target.caps.global_decl {
+            return Err(AstLowerError::UnsupportedFeature {
+                dialect: self.target.version,
+                feature: "global",
+                context: "global declaration",
+            });
+        }
+        Ok(AstGlobalDecl {
+            bindings: global_decl
+                .names
+                .iter()
+                .cloned()
+                .map(|text| AstGlobalBinding {
+                    target: AstGlobalBindingTarget::Name(AstGlobalName { text }),
+                    attr: AstGlobalAttr::None,
+                })
+                .collect(),
+            values: self.lower_value_pack(
+                proto_index,
+                &global_decl.values,
+                PackLoweringContext::TargetCounted(global_decl.names.len()),
+            )?,
+        })
     }
 
     fn lower_generic_for_stmt(

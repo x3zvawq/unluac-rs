@@ -150,6 +150,7 @@ fn summarize_stmt_fallthrough_assignments(
             .unwrap_or_default()
     };
     match stmt {
+        HirStmt::GlobalDecl(_) => None,
         HirStmt::LocalDecl(_)
         | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)

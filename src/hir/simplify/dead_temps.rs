@@ -242,6 +242,7 @@ fn root_prefix_stmt_preserves_single_pass_continuation(stmt: &HirStmt) -> bool {
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::CallStmt(_) => true,
+        HirStmt::GlobalDecl(_) => false,
         HirStmt::If(_)
         | HirStmt::While(_)
         | HirStmt::Repeat(_)

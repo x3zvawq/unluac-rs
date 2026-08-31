@@ -379,6 +379,7 @@ impl EntryNilAnalyzer<'_> {
             HirStmt::Goto(_) | HirStmt::Label(_) => Err(PruneError::UnstructuredControl),
             HirStmt::Close(_) => Ok(NilFlow::fallthrough(states.opaque_callback())),
             HirStmt::TableSetList(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
             | HirStmt::CallStmt(_) => Ok(NilFlow::fallthrough(
@@ -669,6 +670,10 @@ impl<'a> ExprEffects<'a> {
 }
 
 impl HirVisitor for ExprEffects<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.has_call |= matches!(stmt, HirStmt::GlobalDecl(_));
+    }
+
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
             HirExpr::GlobalRef(_)
@@ -781,6 +786,7 @@ fn apply_block_plan(
                 apply_block_plan(nested, &body_prefix, redundant);
             }
             HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::Assign(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)

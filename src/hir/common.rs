@@ -123,6 +123,7 @@ pub struct HirBlock {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirStmt {
     LocalDecl(Box<HirLocalDecl>),
+    GlobalDecl(Box<HirGlobalDecl>),
     Assign(Box<HirAssign>),
     TableSetList(Box<HirTableSetList>),
     ErrNil(Box<HirErrNil>),
@@ -514,6 +515,16 @@ pub struct HirCallStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirLocalDecl {
     pub bindings: Vec<LocalId>,
+    pub values: HirValuePack,
+}
+
+/// Lua 5.5 `global` 初始化声明。
+///
+/// `ERRNNIL` 是编译器为该语法发出的显式协议；初始化先完整求值 RHS，再按 names 逆序
+/// probe/store。HIR 直接保留源码顺序，避免把 exact-tail 结果物化成会漂移的局部根。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HirGlobalDecl {
+    pub names: Vec<String>,
     pub values: HirValuePack,
 }
 

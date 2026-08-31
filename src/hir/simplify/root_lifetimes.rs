@@ -1004,7 +1004,7 @@ struct GcRootObservationCollector {
 
 impl HirVisitor for GcRootObservationCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(stmt, HirStmt::Close(_));
+        self.found |= matches!(stmt, HirStmt::GlobalDecl(_) | HirStmt::Close(_));
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {
@@ -1405,6 +1405,7 @@ impl HirVisitor for StackWriteCollector<'_> {
                 }
             }
             HirStmt::ToBeClosed(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::Close(_)
             | HirStmt::Return(_)
             | HirStmt::Break

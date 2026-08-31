@@ -91,6 +91,11 @@ fn collect_referenced_temps_in_stmt(stmt: &HirStmt, temps: &mut ReferencedTempCo
                 collect_referenced_temps_in_expr(value, temps);
             }
         }
+        HirStmt::GlobalDecl(global_decl) => {
+            for value in &global_decl.values {
+                collect_referenced_temps_in_expr(value, temps);
+            }
+        }
         HirStmt::Assign(assign) => {
             for target in &assign.targets {
                 collect_referenced_temps_in_lvalue(target, temps);
@@ -331,6 +336,11 @@ pub(super) fn count_local_uses_in_stmts(stmts: &[HirStmt], local: LocalId) -> us
 fn count_local_uses_in_stmt(stmt: &HirStmt, local: LocalId) -> usize {
     match stmt {
         HirStmt::LocalDecl(local_decl) => local_decl
+            .values
+            .iter()
+            .map(|value| count_local_uses_in_expr(value, local))
+            .sum(),
+        HirStmt::GlobalDecl(global_decl) => global_decl
             .values
             .iter()
             .map(|value| count_local_uses_in_expr(value, local))

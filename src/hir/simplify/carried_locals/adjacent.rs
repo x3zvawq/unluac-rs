@@ -129,6 +129,7 @@ fn stmt_is_return_shell(stmt: &HirStmt) -> bool {
             block_is_return_shell(&if_stmt.then_block) && block_is_return_shell(else_block)
         }),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
@@ -318,6 +319,10 @@ fn analyze_dominance_stmt(
         HirStmt::LocalDecl(local_decl) => {
             ensure_pack_is_initialized(&local_decl.values, states, carried)?;
             Ok(DominanceFlow::fallthrough(states))
+        }
+        HirStmt::GlobalDecl(global_decl) => {
+            ensure_pack_is_initialized(&global_decl.values, states, carried)?;
+            Err(DominanceError::UnstructuredControl)
         }
         HirStmt::Assign(assign) => {
             for target in &assign.targets {
@@ -584,6 +589,7 @@ fn stmt_has_unstructured_control(stmt: &HirStmt) -> bool {
             .any(stmt_has_unstructured_control),
         HirStmt::Block(block) => block.stmts.iter().any(stmt_has_unstructured_control),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
@@ -627,6 +633,7 @@ fn stmt_allows_seed_to_absorb_carried(stmt: &HirStmt, seed: LocalId, carried: Lo
                     .iter()
                     .all(|value| !expr_mentions_local(value, seed))
         }
+        HirStmt::GlobalDecl(_) => false,
         HirStmt::Assign(assign) => {
             if is_exact_local_copy_assign(assign, carried, seed) {
                 true

@@ -17,15 +17,16 @@ use super::exprs::{
     lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
     lower_upvalue_operand_target, lower_value_pack,
 };
+use super::global_decls::GlobalDeclProtocol;
 use super::helpers::{
     assign_stmt, binary_expr, concat_expr, decode_raw_string, return_stmt, unresolved_expr,
 };
 use super::lower::ProtoLowering;
 use super::shared_closures::CompositeFactoryRef;
 use crate::hir::common::{
-    HirCallExpr, HirCallStmt, HirClose, HirExpr, HirLValue, HirLocalDecl, HirPackTail, HirStmt,
-    HirTableAccess, HirTableConstructor, HirTableField, HirTableSetList, HirToBeClosed,
-    HirUnaryExpr, HirValuePack, LocalId,
+    HirCallExpr, HirCallStmt, HirClose, HirExpr, HirGlobalDecl, HirLValue, HirLocalDecl,
+    HirPackTail, HirStmt, HirTableAccess, HirTableConstructor, HirTableField, HirTableSetList,
+    HirToBeClosed, HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::structure::BlockRef;
 use crate::transformer::{
@@ -422,18 +423,7 @@ fn lower_call(
     call: &crate::transformer::CallInstr,
 ) -> Vec<HirStmt> {
     let results = call.results;
-    let method_name = lower_method_name(lowering, call.method_name);
-    let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
-    let call_expr = HirCallExpr {
-        callee,
-        args: lower_value_pack(lowering, block, instr_ref, call.args),
-        method: matches!(call.kind, CallKind::Method),
-        fastcall: match call.kind {
-            CallKind::FastCall(args) => Some(args),
-            CallKind::Normal | CallKind::Method => None,
-        },
-        method_name,
-    };
+    let call_expr = lower_call_expr(lowering, block, instr_ref, call);
 
     match results {
         ResultPack::Ignore => call_stmt(call_expr),
@@ -446,6 +436,53 @@ fn lower_call(
             results,
         ),
     }
+}
+
+fn lower_call_expr(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    call: &crate::transformer::CallInstr,
+) -> HirCallExpr {
+    let method_name = lower_method_name(lowering, call.method_name);
+    let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
+    HirCallExpr {
+        callee,
+        args: lower_value_pack(lowering, block, instr_ref, call.args),
+        method: matches!(call.kind, CallKind::Method),
+        fastcall: match call.kind {
+            CallKind::FastCall(args) => Some(args),
+            CallKind::Normal | CallKind::Method => None,
+        },
+        method_name,
+    }
+}
+
+pub(super) fn lower_global_decl_owner(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    protocol: &GlobalDeclProtocol,
+) -> Option<HirStmt> {
+    let LowInstr::Call(call) = lowering.proto.instrs.get(instr_ref.index())? else {
+        return None;
+    };
+    let ResultPack::Fixed(results) = call.results else {
+        return None;
+    };
+    if results != protocol.results || results.len < 2 {
+        return None;
+    }
+    Some(HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+        names: protocol.names.clone(),
+        values: HirValuePack::expanding(
+            Vec::new(),
+            HirPackTail::exact(
+                HirExpr::Call(Box::new(lower_call_expr(lowering, block, instr_ref, call))),
+                results.len,
+            ),
+        ),
+    })))
 }
 
 fn lower_vararg(

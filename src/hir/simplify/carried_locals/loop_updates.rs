@@ -360,7 +360,10 @@ struct CleanupOrOpaqueCollector {
 
 impl HirVisitor for CleanupOrOpaqueCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_));
+        self.found |= matches!(
+            stmt,
+            HirStmt::GlobalDecl(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
+        );
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {
@@ -512,6 +515,7 @@ fn stmt_allows_dead_update_fold(stmt: &HirStmt) -> bool {
         | HirStmt::CallStmt(_)
         | HirStmt::Return(_)
         | HirStmt::Break => true,
+        HirStmt::GlobalDecl(_) => false,
         HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
         | HirStmt::While(_)

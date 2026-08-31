@@ -321,6 +321,7 @@ impl FlowVerifier {
                 self.validate_leaf(stmt, states)?;
                 Some(states)
             }
+            HirStmt::GlobalDecl(_) => None,
         }
     }
 

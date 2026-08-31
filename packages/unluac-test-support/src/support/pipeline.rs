@@ -189,6 +189,9 @@ pub(crate) fn run_pipeline_case(
     suite: UnitSuite,
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
+    if entry.expectation == LuaCaseExpectation::GlobalDeclResidual {
+        return run_global_decl_residual_contract(suite, entry);
+    }
     if entry.expectation == LuaCaseExpectation::TableSetListResidual {
         return run_table_set_list_residual_contract(suite, entry);
     }
@@ -677,6 +680,7 @@ pub(crate) fn run_pipeline_case(
             ));
         }
         LuaCaseExpectation::Source
+        | LuaCaseExpectation::GlobalDeclResidual
         | LuaCaseExpectation::TableSetListResidual
         | LuaCaseExpectation::LuauSelfValueCaptureCarrier { .. }
         | LuaCaseExpectation::UnsupportedIsland { .. } => {}
@@ -684,6 +688,108 @@ pub(crate) fn run_pipeline_case(
 
     let proto_count = count_output_tags(&baseline.source_output.stdout);
     Ok(TestSuccess { proto_count })
+}
+
+fn run_global_decl_residual_contract(
+    suite: UnitSuite,
+    entry: &LuaCaseManifestEntry,
+) -> Result<TestSuccess, TestFailure> {
+    use unluac::hir::HirStmt;
+
+    let baseline = build_case_baseline(entry, suite.label()).map_err(|failure| {
+        TestFailure::new(
+            FailureKind::BaselineFailed,
+            format!("baseline failed first: {}", failure.summary()),
+            format!("baseline failed first\n{}", failure.detail()),
+        )
+    })?;
+    let chunk = compile_manifest_case(entry);
+
+    let mut hir_options = decompile_options(entry);
+    hir_options.target_stage = DecompileStage::Hir;
+    hir_options.generate.mode = GenerateMode::Permissive;
+    let hir_result = decompile(&chunk, hir_options).map_err(|error| {
+        global_decl_residual_contract_failure(entry, format!("HIR lowering failed: {error}"))
+    })?;
+    let module = hir_result.state.hir.ok_or_else(|| {
+        global_decl_residual_contract_failure(entry, "HIR lowering returned no module")
+    })?;
+    let root = module.protos.get(module.entry.index()).ok_or_else(|| {
+        global_decl_residual_contract_failure(entry, "HIR entry references a missing proto")
+    })?;
+    if root
+        .body
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt, HirStmt::GlobalDecl(_)))
+    {
+        return Err(global_decl_residual_contract_failure(
+            entry,
+            "mixed RHS was partially claimed as a global declaration",
+        ));
+    }
+
+    let mut strict_options = decompile_options(entry);
+    strict_options.generate.mode = GenerateMode::Strict;
+    match decompile(&chunk, strict_options) {
+        Err(DecompileError::Ast(AstLowerError::InvalidGlobalDeclPattern { proto: 0 })) => {}
+        Err(error) => {
+            return Err(global_decl_residual_contract_failure(
+                entry,
+                format!("strict mode returned the wrong error: {error}"),
+            ));
+        }
+        Ok(_) => {
+            return Err(global_decl_residual_contract_failure(
+                entry,
+                "strict mode accepted a partially recoverable global declaration",
+            ));
+        }
+    }
+
+    let mut permissive_options = decompile_options(entry);
+    permissive_options.generate.mode = GenerateMode::Permissive;
+    let permissive = decompile(&chunk, permissive_options).map_err(|error| {
+        global_decl_residual_contract_failure(
+            entry,
+            format!("permissive mode rejected mixed global declaration: {error}"),
+        )
+    })?;
+    let generated = permissive.state.generated.as_ref().ok_or_else(|| {
+        global_decl_residual_contract_failure(entry, "permissive mode returned no generated chunk")
+    })?;
+    if generated.kind != GeneratedChunkKind::DiagnosticPseudocode
+        || !generated.source.contains("err-nnil")
+    {
+        return Err(global_decl_residual_contract_failure(
+            entry,
+            format!(
+                "permissive mode lost the global declaration diagnostic: kind={:?}\n{}",
+                generated.kind, generated.source
+            ),
+        ));
+    }
+    let assertions = read_readability_assertions(entry.path)?;
+    assert_readability("permissive", &generated.source, &assertions, false)?;
+
+    Ok(TestSuccess {
+        proto_count: count_output_tags(&baseline.source_output.stdout),
+    })
+}
+
+fn global_decl_residual_contract_failure(
+    entry: &LuaCaseManifestEntry,
+    detail: impl Into<String>,
+) -> TestFailure {
+    TestFailure::new(
+        FailureKind::ResidualContractAssertionFailed,
+        "global declaration residual contract failed",
+        format!(
+            "global declaration residual contract failed for {}: {}",
+            entry.path,
+            detail.into()
+        ),
+    )
 }
 
 fn run_proto_failure_recovery_contract(

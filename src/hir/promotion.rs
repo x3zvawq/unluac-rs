@@ -555,6 +555,11 @@ impl ProtoPromotionFacts {
                     self.collect_captured_home_slots_in_expr(value, slots);
                 }
             }
+            HirStmt::GlobalDecl(global_decl) => {
+                for value in &global_decl.values {
+                    self.collect_captured_home_slots_in_expr(value, slots);
+                }
+            }
             HirStmt::Assign(assign) => {
                 for target in &assign.targets {
                     if let HirLValue::TableAccess(access) = target {
@@ -647,6 +652,7 @@ impl ProtoPromotionFacts {
                 }
             }
             HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::Assign(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)

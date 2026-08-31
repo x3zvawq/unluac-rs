@@ -131,6 +131,15 @@ fn eliminate_stmt(
             })));
             (prefix, changed)
         }
+        HirStmt::GlobalDecl(global_decl) => {
+            let (mut prefix, values, changed) =
+                extract_value_pack(global_decl.values, state, safety);
+            prefix.push(HirStmt::GlobalDecl(Box::new(crate::hir::HirGlobalDecl {
+                names: global_decl.names,
+                values,
+            })));
+            (prefix, changed)
+        }
         HirStmt::Assign(assign) => {
             let (mut prefix, assign, changed) = extract_assign(*assign, state, safety);
             prefix.push(HirStmt::Assign(Box::new(assign)));

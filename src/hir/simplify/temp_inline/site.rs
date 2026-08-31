@@ -19,6 +19,9 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::LocalDecl(local_decl) => {
             find_site_in_exprs(&local_decl.values, temp, InlineSite::Direct)
         }
+        HirStmt::GlobalDecl(global_decl) => {
+            find_site_in_exprs(&global_decl.values, temp, InlineSite::Direct)
+        }
         HirStmt::Assign(assign) => assign
             .targets
             .iter()
@@ -255,6 +258,7 @@ impl EvalOrderProbe<'_> {
     fn stmt(&self, stmt: &HirStmt) -> bool {
         match stmt {
             HirStmt::LocalDecl(local_decl) => self.exprs(&local_decl.values),
+            HirStmt::GlobalDecl(global_decl) => self.exprs(&global_decl.values),
             HirStmt::Assign(assign) => {
                 let (found, prefix_clear) = self.lvalues(&assign.targets);
                 found.unwrap_or_else(|| prefix_clear && self.exprs(&assign.values))

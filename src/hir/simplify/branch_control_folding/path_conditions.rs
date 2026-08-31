@@ -265,6 +265,7 @@ fn rewrite_clean_child_blocks(
         }
         HirStmt::Block(block) => rewrite_child(block, PathFacts::default()),
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::Return(_)
@@ -432,6 +433,7 @@ fn rewrite_stmt(
             };
         }
         HirStmt::Assign(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)

@@ -118,6 +118,12 @@ fn try_merge_seed_global_run(
         merged_values.push(value.clone());
     }
 
+    if merged_bindings.len() > 1 {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：Lua 5.5 的多目标 global 声明按目标
+        // 逆序写入；合并顺序 singleton handoff 会反转 `_ENV.__newindex` 可观察顺序。
+        return None;
+    }
+
     Some((
         AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
             bindings: merged_bindings,

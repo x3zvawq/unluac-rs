@@ -564,6 +564,7 @@ fn stmt_writes_binding_only_via_direct_writeback(
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => true,
+        HirStmt::GlobalDecl(_) => false,
     }
 }
 

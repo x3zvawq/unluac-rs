@@ -206,6 +206,7 @@ fn stmt_contains_unsafe_control(stmt: &HirStmt, loop_depth: usize) -> bool {
         HirStmt::Return(_)
         | HirStmt::Goto(_)
         | HirStmt::Label(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Close(_)
         | HirStmt::ToBeClosed(_) => true,
         HirStmt::Break | HirStmt::Continue => false,

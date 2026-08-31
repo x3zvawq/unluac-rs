@@ -280,6 +280,14 @@ macro_rules! traverse_hir_stmt_children {
                     $(, call($tail_call) => $on_tail_call)?
                 );
             }
+            crate::hir::HirStmt::GlobalDecl(global_decl) => {
+                crate::hir::traverse::traverse_hir_value_pack_children!(
+                    global_decl.values,
+                    iter = $iter,
+                    expr($expr) => $on_expr
+                    $(, call($tail_call) => $on_tail_call)?
+                );
+            }
             crate::hir::HirStmt::Assign(assign) => {
                 for $lvalue in assign.targets.$iter() {
                     $on_lvalue

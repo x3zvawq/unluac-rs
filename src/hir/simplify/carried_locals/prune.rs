@@ -214,6 +214,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                 promotion_facts,
             ),
             HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::Assign(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)
@@ -452,6 +453,7 @@ fn collect_temp_write_audit_in_block(
                 );
             }
             HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
@@ -986,7 +988,7 @@ impl UserCodeEffectCollector {
 
 impl HirVisitor for UserCodeEffectCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(stmt, HirStmt::Close(_));
+        self.found |= matches!(stmt, HirStmt::GlobalDecl(_) | HirStmt::Close(_));
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {

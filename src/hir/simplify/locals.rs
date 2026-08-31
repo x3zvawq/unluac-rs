@@ -1355,6 +1355,9 @@ fn rewrite_stmt(
         HirStmt::LocalDecl(local_decl) => {
             rewrite::value_pack(&mut local_decl.values, mapping.as_ref())
         }
+        HirStmt::GlobalDecl(global_decl) => {
+            rewrite::value_pack(&mut global_decl.values, mapping.as_ref())
+        }
         HirStmt::Assign(assign) => {
             let mut targets_changed = false;
             for target in &mut assign.targets {

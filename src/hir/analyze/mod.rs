@@ -7,6 +7,7 @@
 mod artifact_recovery;
 mod bindings;
 mod exprs;
+mod global_decls;
 mod helpers;
 mod instrs;
 mod lower;

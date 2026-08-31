@@ -813,6 +813,7 @@ fn collect_repeat_prefix_ownership(
             ownership.current_repeat_region_resource |= resource_scope_depth == 0;
         }
         HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
