@@ -148,7 +148,7 @@ impl BooleanShellFacts {
                     return false;
                 }
                 if self.temp_homes.contains_key(temp) {
-                    // 候选拒绝[ProofIncomplete]：raw home temp 的死写可能释放旧槽位中的 GC root；需接入 reaching resource-value 事实后才能放行已知非资源前值。
+                    // 候选拒绝[SemanticBarrier:Lifetime]：boolean-shells 首轮早于 locals 的 root 物化；若先删 raw-home 覆盖写，root-lifetimes 将失去 overwrite owner，旧 call result 会跨显式 GC 继续存活（regress_342 local-gc）。
                     return false;
                 }
                 // 候选拒绝[SemanticBarrier:ValueFlow]：shell 外仍读取或 capture 该 temp 时，删除写入会改变后续值。
