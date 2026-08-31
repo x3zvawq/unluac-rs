@@ -266,6 +266,7 @@ pub(super) struct ProtoPromotionFacts {
     repeat_condition_prefix_temps: BTreeSet<TempId>,
     direct_table_seed_temps: BTreeSet<TempId>,
     direct_table_seed_locals: BTreeSet<LocalId>,
+    loop_carrier_temps: BTreeSet<TempId>,
     local_home_slots: Vec<HomeSlotResolution>,
     invalidated_param_homes: BTreeSet<ParamId>,
     invalidated_local_homes: BTreeSet<LocalId>,
@@ -315,6 +316,7 @@ impl ProtoPromotionFacts {
             ),
             direct_table_seed_temps: collect_direct_table_seed_temps(proto, dataflow, fixed_temps),
             direct_table_seed_locals: BTreeSet::new(),
+            loop_carrier_temps: collect_loop_carrier_temps(plan, phi_temps),
             local_home_slots: Vec::new(),
             invalidated_param_homes: BTreeSet::new(),
             invalidated_local_homes: BTreeSet::new(),
@@ -367,6 +369,18 @@ impl ProtoPromotionFacts {
         if self.is_direct_table_seed_temp(temp) {
             self.direct_table_seed_locals.insert(local);
         }
+    }
+
+    /// HIR lowering 为 loop carried protocol 合成的 carrier temp。
+    ///
+    /// 包括两类来源：
+    /// - `LoopValueSource::Binding` 在 body/latch phase 上给 carried owner 补的协议写回
+    /// - loop region synthetic input 为 header phi materialize 的一次性 carrier copy
+    ///
+    /// 这些 temp 不是源码作者声明的 root alias。后续 pass 只有在 temp 也已证明无读者、
+    /// 且未被 debug/source identity 占用时，才可继续消去对应 mirror。
+    pub(super) fn is_loop_carrier_temp(&self, temp: TempId) -> bool {
+        self.loop_carrier_temps.contains(&temp)
     }
 
     /// 返回某个 temp 对应的原始寄存器槽位。
@@ -428,6 +442,45 @@ impl ProtoPromotionFacts {
         (!self.temp_home_was_invalidated(temp))
             .then(|| self.home_slot(temp))
             .flatten()
+    }
+
+    /// 证明一个 dead temp 赋值只是把同一个可见 binding 的当前值写回它自己的物理槽。
+    ///
+    /// 这里故意只相信 RHS 的 visible binding provenance：目标 temp 自己可以已经失去
+    /// trusted home，但 raw `home_slot` 仍足以说明“它写向哪个物理 cell”。只有当
+    /// `ParamRef/LocalRef` 这边仍保有同一 trusted home 时，删除写入才不会缩短 GC root
+    /// 生命周期，也不会把别的 cell 误当成同值 no-op。
+    pub(super) fn copies_same_visible_home_value(&self, temp: TempId, value: &HirExpr) -> bool {
+        let Some(target_home) = self.home_slot(temp) else {
+            return false;
+        };
+        match value {
+            HirExpr::ParamRef(param) => self.trusted_param_home_slot(*param) == Some(target_home),
+            HirExpr::LocalRef(local) => self.trusted_local_home_slot(*local) == Some(target_home),
+            HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Vector(_)
+            | HirExpr::Complex { .. }
+            | HirExpr::UpvalueRef(_)
+            | HirExpr::TempRef(_)
+            | HirExpr::GlobalRef(_)
+            | HirExpr::TableAccess(_)
+            | HirExpr::Unary(_)
+            | HirExpr::Binary(_)
+            | HirExpr::LogicalAnd(_)
+            | HirExpr::LogicalOr(_)
+            | HirExpr::Decision(_)
+            | HirExpr::Call(_)
+            | HirExpr::VarArg
+            | HirExpr::TableConstructor(_)
+            | HirExpr::Closure(_)
+            | HirExpr::Unresolved(_) => false,
+        }
     }
 
     /// Returns physical homes written by an immediately following transparent MOVE chain.
@@ -981,6 +1034,25 @@ fn collect_direct_table_seed_temps(
                 })
         })
         .collect()
+}
+
+fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTreeSet<TempId> {
+    let mut temps = plan
+        .loops()
+        .filter_map(|(loop_id, _)| plan.loop_value_actions(loop_id))
+        .flat_map(|actions| actions.batches.iter())
+        .flat_map(|batch| batch.writes.iter())
+        .filter(|write| matches!(write.source, crate::structure::LoopValueSource::Binding(_)))
+        .filter_map(|write| phi_temps.get(write.target.index()).copied())
+        .collect::<BTreeSet<_>>();
+    temps.extend(plan.phis().filter_map(|phi| {
+        phi.incomings.iter().any(|incoming| {
+            matches!(incoming.disposition, PhiIncomingDisposition::RegionInput(region) if matches!(plan.region(region), Some(crate::structure::RegionPlan::Loop { .. })))
+        })
+        .then(|| phi_temps.get(phi.phi.index()).copied())
+        .flatten()
+    }));
+    temps
 }
 
 fn fill_phi_home_slots(

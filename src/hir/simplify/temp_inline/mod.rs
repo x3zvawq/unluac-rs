@@ -30,6 +30,9 @@
 //! 普通 `local function iter()` 应保留为独立声明，避免生成多行匿名 iterator。
 //! 具有返回值的 call 同样按 child proto 当前 body 判断：复杂 callee 保留 producer binding，
 //! 单条简单 body 才继续内联，避免把命名函数压回赋值或 return 中的多行 IIFE。
+//! call-root 的相邻同槽表达式覆盖直接消费 root-lifetime owner 冻结的配对 home；二元
+//! RHS 只额外接受 primitive 或 param/local/upvalue 直接读取，保持 call、RHS、运算与覆盖
+//! 的原顺序，不把 lookup、调用、分配或 closure 搬进该事务。
 //! method 协议的 callee base 与隐式首参虽是两个语法 use，却只求值一次 receiver；相邻
 //! 裸 binding 或命名字段链快照可在严格匹配这对 use 后原子收回，例如
 //! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；终结调用的连续物化 run
@@ -357,7 +360,6 @@ fn inline_temps_in_block(
             block,
             &workspace.uses,
             live_use_counts,
-            facts,
             &captured_slots_before_stmt,
             &call_root_indices,
         )
@@ -655,31 +657,25 @@ fn inline_adjacent_call_root_expression_overwrites(
     block: &mut HirBlock,
     scratch: &TempUseScratch,
     live_use_counts: &mut [usize],
-    facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
     call_roots: &CallRootLifetimeIndices,
 ) -> bool {
     let mut removed = vec![false; block.stmts.len()];
     for overwrite_index in 1..block.stmts.len() {
         let root_index = overwrite_index - 1;
-        if call_roots.root_for_overwrite(overwrite_index) != Some(root_index) {
+        let Some(pair) = call_roots
+            .overwrite_pair(overwrite_index)
+            .filter(|pair| pair.root_index() == root_index)
+        else {
             continue;
-        }
+        };
         let Some((root, HirExpr::Call(call))) = inline_candidate(&block.stmts[root_index]) else {
             continue;
         };
         let Some((target, overwrite)) = inline_candidate(&block.stmts[overwrite_index]) else {
             continue;
         };
-        // 候选拒绝[ProofIncomplete]：call root/overwrite 缺可信 home 时无法证明二者是同一物理 owner；应补 promotion provenance。
-        let (Some(root_slot), Some(target_slot)) = (
-            facts.trusted_temp_home_slot(root),
-            facts.trusted_temp_home_slot(target),
-        ) else {
-            continue;
-        };
-        // 候选拒绝[ProofIncomplete]：root/target identity 或 home 不同的 adjacent overwrite 尚未证明通用等价替换；应复用普通站点证明。
-        if root == target || root_slot != target_slot {
+        if root == target {
             continue;
         }
         // 候选拒绝[SemanticBarrier:Lifetime]：例如 overwrite 后再次读取 root 时，删除 producer 会丢失原 call result。
@@ -690,14 +686,14 @@ fn inline_adjacent_call_root_expression_overwrites(
         if scratch.has_debug_local_hint(root) || scratch.has_debug_local_hint(target) {
             continue;
         }
-        // 候选拒绝[ProofIncomplete]：非 primitive binary/logical overwrite 尚无通用单次求值证明，应扩展 expression overwrite analyzer。
+        // 候选拒绝[ProofIncomplete]：RHS 含 lookup/call/allocation/closure 等事件时，尚无同句事件与新 capture 的完整证明。
         if !call_root_overwrite_is_inlineable(overwrite, root) {
             continue;
         }
         // 候选拒绝[SemanticBarrier:Capture]：已引用捕获 root home 时，删除 producer 会让 closure 看不到 call result。
         if captured_slots_before_stmt
             .get(overwrite_index)
-            .is_none_or(|captured| captured.contains(&root_slot))
+            .is_none_or(|captured| captured.contains(&pair.home()))
         {
             continue;
         }
@@ -722,18 +718,22 @@ fn call_root_overwrite_is_inlineable(expr: &HirExpr, root: TempId) -> bool {
     match expr {
         HirExpr::Binary(binary) => {
             matches!(&binary.lhs, HirExpr::TempRef(source) if *source == root)
-                && call_root_rhs_is_primitive_literal(&binary.rhs)
+                && call_root_rhs_is_stable_direct_value(&binary.rhs)
         }
         HirExpr::LogicalOr(logical) => {
             matches!(&logical.lhs, HirExpr::TempRef(source) if *source == root)
-                && (call_root_rhs_is_primitive_literal(&logical.rhs)
-                    || matches!(
-                        logical.rhs,
-                        HirExpr::ParamRef(_) | HirExpr::LocalRef(_) | HirExpr::UpvalueRef(_)
-                    ))
+                && call_root_rhs_is_stable_direct_value(&logical.rhs)
         }
         _ => false,
     }
+}
+
+fn call_root_rhs_is_stable_direct_value(expr: &HirExpr) -> bool {
+    call_root_rhs_is_primitive_literal(expr)
+        || matches!(
+            expr,
+            HirExpr::ParamRef(_) | HirExpr::LocalRef(_) | HirExpr::UpvalueRef(_)
+        )
 }
 
 fn call_root_rhs_is_primitive_literal(expr: &HirExpr) -> bool {

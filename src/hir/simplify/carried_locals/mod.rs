@@ -13,6 +13,9 @@
 //! 所有 owner 还共享 proto 级 source/capture/resource 身份门：debug、for、physical-root、
 //! direct capture/TBC binding 与其 raw home may-alias 都不得成为改写两端，避免先改坏
 //! source identity、closure cell 或 root/close 生命周期再靠 provenance 兜底。
+//! 唯一例外是 proven internal loop-carrier temp mirror：它先在 `prune.rs` 里被要求满足
+//! no-read、non-debug、loop-carrier owner、same-exact-home write audit 之后，才会在冻结
+//! identity 前删除；源码作者可见的 for binding 身份本身仍继续受这里的保护。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -45,7 +48,10 @@ pub(super) use self::binding::{CarryBinding, single_binding_copy};
 use self::boundary::LabelJumpIndex;
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
 use self::loop_updates::collapse_dead_loop_update_handoffs;
-use self::prune::{prune_redundant_branch_state_copies, prune_redundant_copy_stmts};
+use self::prune::{
+    prune_dead_for_binding_temp_mirrors, prune_redundant_branch_state_copies,
+    prune_redundant_copy_stmts,
+};
 use self::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
 use self::region_results::{
     RegionResultIndex, collapse_inferred_if_result_chains, collapse_result_writeback_transactions,
@@ -65,12 +71,15 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
 ) -> bool {
     let branch_copies_changed = prune_redundant_branch_state_copies(proto);
     let snapshots_changed = repeat_snapshots::coalesce_repeat_terminal_snapshots(proto);
+    let dead_for_binding_mirrors_changed =
+        prune_dead_for_binding_temp_mirrors(proto, promotion_facts);
     // Both structural rewrites above can remove a materialization that would otherwise be
     // recorded as an active identity.  Freeze protection facts only after those rewrites so the
     // handoff owner never reasons over a stale binding set.
     let identity_facts = HandoffIdentityFacts::new(proto);
     branch_copies_changed
         | snapshots_changed
+        | dead_for_binding_mirrors_changed
         | collapse_handoffs_recursive(
             &mut proto.body,
             &BTreeSet::new(),

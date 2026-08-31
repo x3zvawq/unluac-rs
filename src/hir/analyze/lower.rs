@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::promotion::{ProtoPromotionFacts, SlotEpochFacts};
+use super::super::promotion::{HomeSlotKey, ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
 use super::helpers::{decode_raw_string, empty_proto, return_stmt};
 use super::instrs::local_decl_stmts;
@@ -27,8 +27,8 @@ use crate::hir::common::{
 };
 use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts, OpenDefId, PhiId,
-    SsaValue,
+    BlockRef, BlockTerminatorKind, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts,
+    LoopSourceBindings, LoopVmProtocol, OpenDefId, PhiId, SsaValue, StructurePlan,
 };
 use crate::structure::{ReadyStructureFacts, StructureFacts};
 use crate::transformer::{
@@ -487,7 +487,7 @@ fn lower_proto_one(
         failure: None,
         detached_children: Vec::new(),
     };
-    artifacts.promotion_facts[id.index()] = ProtoPromotionFacts::from_plan(
+    let mut promotion_facts = ProtoPromotionFacts::from_plan(
         proto,
         dataflow,
         structure.plan(),
@@ -495,12 +495,73 @@ fn lower_proto_one(
         &lowering.bindings.fixed_temps,
         &lowering.bindings.phi_temps,
     );
+    record_loop_binding_local_homes(
+        structure.plan(),
+        &slot_epochs,
+        &lowering.bindings,
+        &mut promotion_facts,
+    );
+    artifacts.promotion_facts[id.index()] = promotion_facts;
 
     Ok(LoweredProtoResult {
         id,
         source_proto_id: frame.source_proto_id,
         mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
     })
+}
+
+fn record_loop_binding_local_homes(
+    plan: &StructurePlan,
+    slot_epochs: &SlotEpochFacts,
+    bindings: &ProtoBindings,
+    facts: &mut ProtoPromotionFacts,
+) {
+    for (loop_id, loop_plan) in plan.loops() {
+        match (loop_plan.source_bindings, plan.loop_protocol(loop_id)) {
+            (
+                Some(LoopSourceBindings::Numeric(reg)),
+                Some(LoopVmProtocol::NumericFor(protocol)),
+            ) => {
+                let Some(local) = bindings.numeric_for_locals.get(&loop_plan.header).copied()
+                else {
+                    continue;
+                };
+                facts.record_local_home_slot(
+                    local,
+                    HomeSlotKey::new(reg.index(), slot_epochs.epoch_at(reg, protocol.init_instr)),
+                );
+                let Some(BlockTerminatorKind::NumericForLoop { instr, .. }) = plan
+                    .block_terminator(loop_plan.header)
+                    .map(|terminator| terminator.kind)
+                else {
+                    continue;
+                };
+                facts.record_local_home_slot(
+                    local,
+                    HomeSlotKey::new(reg.index(), slot_epochs.epoch_at(reg, instr)),
+                );
+            }
+            (
+                Some(LoopSourceBindings::Generic(regs)),
+                Some(LoopVmProtocol::GenericFor(protocol)),
+            ) => {
+                let Some(locals) = bindings.generic_for_locals.get(&loop_plan.header) else {
+                    continue;
+                };
+                for (offset, local) in locals.iter().copied().enumerate() {
+                    let reg = Reg(regs.start.index() + offset);
+                    facts.record_local_home_slot(
+                        local,
+                        HomeSlotKey::new(
+                            reg.index(),
+                            slot_epochs.epoch_at(reg, protocol.call_instr),
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn build_self_value_capture_locals(

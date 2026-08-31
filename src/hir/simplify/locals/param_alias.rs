@@ -14,22 +14,23 @@
 //! ```
 //!
 //! 这里不重新推断前层 phi，也不处理任意 local 对；它只沿结构化语句证明参数与 alias
-//! 从入口相同值开始不会被分别观察。alias 一旦在某条路径写入，该路径后续不得再读取
-//! 原参数；循环还会用“alias 已写入”的状态验证下一轮。参数写入、引用 capture 与 goto
-//! 会直接拒绝，alias local 被任意 closure 捕获时也不会改写。
+//! 从入口相同值开始不会被分别观察。分析逐路径记录最后写入的一侧以及已经逃逸的 reference
+//! capture；`return/break/continue` 不参与错误的普通合流，循环则对回边状态求有限不动点。
+//! 残留 goto/label 仍交给持有 CFG owner 的 Structure island/branch-control 收敛。
 //! alias 后续写入会提前覆盖参数，因此还要求两者属于同一可信物理 home；仅有显式读写
 //! 等价不足以排除弱表、`__gc` 或异常 cleanup 对旧参数存活期的观察。
 //! 实际发生的 `Local -> Param` 引用改写还会把失效的 home provenance 传播到参数，避免
 //! deferred carried-local 的下一轮把换壳后的参数重新当作可信物理槽。
 
+use std::collections::BTreeSet;
+
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
+    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
 };
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::super::mention::{
-    expr_mentions_local, stmt_captures_local, stmts_reference_captured_bindings,
-};
+use super::super::expr_facts::expr_truthiness;
+use super::super::mention::expr_mentions_local;
 use super::super::visit::{self, HirVisitor};
 use super::super::walk::{self, HirRewritePass};
 
@@ -45,28 +46,36 @@ pub(super) fn coalesce_param_aliases_in_proto(
         .zip(promotion_facts.trusted_param_home_slot(alias.param))
         .is_some_and(|(local, param)| local == param);
     let rest = &proto.body.stmts[alias.consumed..];
-    if promotion_facts.compacts_home_slots() {
-        // 候选拒绝[SemanticBarrier:Lifetime]：regress lua54_01_close#7 中跨槽把 alias 写回 param 会提前释放原参数 GC root；compaction 下 trusted 同槽不能作为正向证明。
-        return false;
-    }
-    if promotion_facts.entry_nil_writes_were_pruned(alias.local) {
-        // 候选拒绝[ProofIncomplete]：entry-nil 已改变 alias 的写入历史，当前 flow state 未携带被裁剪路径；应把 nil-prune provenance 纳入 alias 初态后再判定。
-        return false;
-    }
     if !shares_exact_home {
         // 候选拒绝[SemanticBarrier:Lifetime]：`local l=p; weak[p]=true; l={}; GC` 中跨槽合并会覆盖 p 并让原对象提前回收，原程序的参数槽仍应持有它。
         return false;
     }
-    if rest
-        .iter()
-        .any(|stmt| stmt_captures_local(stmt, alias.local))
+    if proto
+        .local_debug_hints
+        .get(alias.local.index())
+        .is_some_and(Option::is_some)
     {
-        // 候选拒绝[ProofIncomplete]：alias local 的任意 capture 被 blanket 拒绝；当前没有证明该 capture cell 与同 home 参数 cell 在全部写入路径上可合并。
+        // 候选拒绝[PolicyBoundary]：带 source debug identity 的 alias local 保留独立声明，不把其名称与词法范围折入参数。
         return false;
     }
-    if !rest_preserves_param_alias_identity(rest, alias.local, alias.param) {
-        // 候选拒绝[SemanticBarrier:ValueFlow]：flow proof 发现 alias 写入后仍可读旧参数时，`local l=p; l=1; return p` 合并后会错误返回 1。
-        // 候选拒绝[ProofIncomplete]：同一出口也包含 goto/label 与 path-insensitive join 等尚未分析形状，不能把所有失败都视为已证不等价。
+    if let Err(error) = validate_alias_flow(rest, alias.local, alias.param, AliasStates::entry()) {
+        match error {
+            AliasFlowError::ValueFlow => {
+                // 候选拒绝[SemanticBarrier:ValueFlow]：同一路径写一侧后读取另一侧会区分两个 binding；如 `l=1; return p` 或 `p=2; return l`，合并后返回新值而非旧值。
+            }
+            AliasFlowError::Capture => {
+                // 候选拒绝[SemanticBarrier:Capture]：reference capture 暴露一侧 cell 后再写另一侧时，逃逸 closure 可观察原 cell；合并会让它观察后续写入。
+            }
+            AliasFlowError::Resource => {
+                // 候选拒绝[SemanticBarrier:Resource]：`local l=p; <TBC l>; l=q` 若改为参数，会更换 close owner，并可能关闭错误值或改变关闭时点。
+            }
+            AliasFlowError::UnstructuredControl => {
+                // 候选拒绝[LayerBoundary]：残留 label/goto 的 predecessor 与目标边由 Structure island/branch-control owner 维护；locals 不在线性 HIR 上重建 CFG。
+            }
+            AliasFlowError::BindingInvariant => {
+                // 候选拒绝[ConvergenceGuard]：alias LocalId 在后缀再次充当声明或 for binder 违反唯一 binding 身份；删除入口声明会改变异常 HIR 的作用域。
+            }
+        }
         return false;
     }
 
@@ -156,144 +165,452 @@ fn single_local_binding(local_decl: &HirLocalDecl) -> Option<LocalId> {
     Some(*local)
 }
 
-fn rest_preserves_param_alias_identity(stmts: &[HirStmt], local: LocalId, param: ParamId) -> bool {
-    if stmts_reference_captured_bindings(stmts)
-        .params
-        .contains(&param)
-    {
-        // 候选拒绝[SemanticBarrier:Capture]：`local l=p; local f=function() return p end; l=1; return f()` 若合并，f 会观察 1 而非原参数值。
-        return false;
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Divergence {
+    Equal,
+    LocalWritten,
+    ParamWritten,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct AliasState {
+    divergence: Divergence,
+    local_reference_exposed: bool,
+    param_reference_exposed: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AliasStates(BTreeSet<AliasState>);
+
+impl AliasStates {
+    fn entry() -> Self {
+        Self(BTreeSet::from([AliasState {
+            divergence: Divergence::Equal,
+            local_reference_exposed: false,
+            param_reference_exposed: false,
+        }]))
     }
-    if stmts_write_param(stmts, param) {
-        // 候选拒绝[SemanticBarrier:ValueFlow]：`local l=p; p=2; return l` 若删除 alias 并统一为 p，会从原值变成 2。
-        return false;
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
-    validate_alias_flow(stmts, local, param, false).is_some()
+
+    fn union(mut self, other: Self) -> Self {
+        self.0.extend(other.0);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct AliasFlow {
+    fallthrough: AliasStates,
+    breaks: AliasStates,
+    continues: AliasStates,
+}
+
+impl AliasFlow {
+    fn fallthrough(states: AliasStates) -> Self {
+        Self {
+            fallthrough: states,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AliasFlowError {
+    ValueFlow,
+    Capture,
+    Resource,
+    UnstructuredControl,
+    BindingInvariant,
 }
 
 fn validate_alias_flow(
     stmts: &[HirStmt],
     local: LocalId,
     param: ParamId,
-    mut local_written: bool,
-) -> Option<bool> {
+    mut states: AliasStates,
+) -> Result<AliasFlow, AliasFlowError> {
+    let mut breaks = AliasStates::default();
+    let mut continues = AliasStates::default();
     for stmt in stmts {
-        local_written = validate_alias_stmt(stmt, local, param, local_written)?;
+        if states.is_empty() {
+            break;
+        }
+        let flow = validate_alias_stmt(stmt, local, param, states)?;
+        states = flow.fallthrough;
+        breaks = breaks.union(flow.breaks);
+        continues = continues.union(flow.continues);
     }
-    Some(local_written)
+    Ok(AliasFlow {
+        fallthrough: states,
+        breaks,
+        continues,
+    })
 }
 
 fn validate_alias_stmt(
     stmt: &HirStmt,
     local: LocalId,
     param: ParamId,
-    local_written: bool,
-) -> Option<bool> {
+    states: AliasStates,
+) -> Result<AliasFlow, AliasFlowError> {
     match stmt {
         HirStmt::If(if_stmt) => {
-            reject_param_read_after_local_write(&if_stmt.cond, param, local_written)?;
-            let then_written =
-                validate_alias_flow(&if_stmt.then_block.stmts, local, param, local_written)?;
-            let else_written = if let Some(else_block) = &if_stmt.else_block {
-                validate_alias_flow(&else_block.stmts, local, param, local_written)?
+            let states = evaluate_expr(&if_stmt.cond, local, param, states)?;
+            let then_flow = if expr_truthiness(&if_stmt.cond) == Some(false) {
+                AliasFlow::fallthrough(AliasStates::default())
             } else {
-                local_written
+                validate_alias_flow(&if_stmt.then_block.stmts, local, param, states.clone())?
             };
-            // 候选拒绝[ProofIncomplete]：这里用 may-written OR 合流，导致一臂写后退出、另一臂未写后继续的安全路径也被后续 param-read guard 拒绝；应传播逐出口状态集合。
-            Some(then_written || else_written)
+            let else_flow = if expr_truthiness(&if_stmt.cond) == Some(true) {
+                AliasFlow::fallthrough(AliasStates::default())
+            } else if let Some(else_block) = &if_stmt.else_block {
+                validate_alias_flow(&else_block.stmts, local, param, states)?
+            } else {
+                AliasFlow::fallthrough(states)
+            };
+            Ok(union_alias_flows(then_flow, else_flow))
         }
         HirStmt::While(while_stmt) => {
-            reject_param_read_after_local_write(&while_stmt.cond, param, local_written)?;
-            let body_written =
-                validate_repeating_body(&while_stmt.body, local, param, local_written)?;
-            if body_written && !local_written {
-                reject_param_read_after_local_write(&while_stmt.cond, param, true)?;
-            }
-            Some(body_written)
+            validate_while_alias(&while_stmt.body, &while_stmt.cond, local, param, states)
         }
         HirStmt::Repeat(repeat_stmt) => {
-            let body_written =
-                validate_repeating_body(&repeat_stmt.body, local, param, local_written)?;
-            reject_param_read_after_local_write(&repeat_stmt.cond, param, body_written)?;
-            Some(body_written)
+            validate_repeat_alias(&repeat_stmt.body, &repeat_stmt.cond, local, param, states)
         }
         HirStmt::NumericFor(numeric_for) => {
             if numeric_for.binding == local {
-                // 候选拒绝[ConvergenceGuard]：alias LocalId 同时作为 numeric-for 新 binding 违反唯一声明身份；rewriter 也不能把 LocalId binder 改成 ParamId。
-                return None;
+                return Err(AliasFlowError::BindingInvariant);
             }
+            let mut evaluated = states;
             for expr in [&numeric_for.start, &numeric_for.limit, &numeric_for.step] {
-                reject_param_read_after_local_write(expr, param, local_written)?;
+                evaluated = evaluate_expr(expr, local, param, evaluated)?;
             }
-            validate_repeating_body(&numeric_for.body, local, param, local_written)
+            validate_zero_or_more_alias(
+                &numeric_for.body,
+                local,
+                param,
+                evaluated.clone(),
+                evaluated,
+                false,
+            )
         }
         HirStmt::GenericFor(generic_for) => {
             if generic_for.bindings.contains(&local) {
-                // 候选拒绝[ConvergenceGuard]：alias LocalId 同时出现在 generic-for binding 列表违反唯一声明身份，不能在删除入口声明后继续复用。
-                return None;
+                return Err(AliasFlowError::BindingInvariant);
             }
+            let mut evaluated = states;
             for expr in &generic_for.iterator {
-                reject_param_read_after_local_write(expr, param, local_written)?;
+                evaluated = evaluate_expr(expr, local, param, evaluated)?;
             }
-            validate_repeating_body(&generic_for.body, local, param, local_written)
+            // Generic-for invokes the iterator once even on the zero-iteration path and once
+            // after every completed body iteration. The iterator may observe or mutate either
+            // side through a reference capture that escaped while constructing the iterator.
+            let zero_exit = evaluate_opaque_callback(local, param, evaluated)?;
+            validate_zero_or_more_alias(
+                &generic_for.body,
+                local,
+                param,
+                zero_exit.clone(),
+                zero_exit,
+                true,
+            )
         }
-        HirStmt::Block(block) => validate_alias_flow(&block.stmts, local, param, local_written),
-        HirStmt::ToBeClosed(to_be_closed) => {
-            // close-scopes 依赖 direct local/temp 身份配对 TBC；参数不能替代该 binding。
-            if expr_mentions_local(&to_be_closed.value, local) {
-                // 候选拒绝[SemanticBarrier:Resource]：`local l=p; <TBC l>; l=q` 若改为参数，会更换 close owner，并可能关闭错误值或改变关闭时点。
-                return None;
-            }
-            reject_param_read_after_local_write(&to_be_closed.value, param, local_written)?;
-            Some(local_written)
+        HirStmt::Block(block) => validate_alias_flow(&block.stmts, local, param, states),
+        HirStmt::ToBeClosed(to_be_closed) if expr_mentions_local(&to_be_closed.value, local) => {
+            Err(AliasFlowError::Resource)
         }
-        HirStmt::Goto(_) | HirStmt::Label(_) => {
-            // 候选拒绝[ProofIncomplete]：结构化 flow state 没有 label/goto 的 predecessor 合流，无法证明跳转路径上的 alias/param 同步状态。
-            None
-        }
+        HirStmt::Goto(_) | HirStmt::Label(_) => Err(AliasFlowError::UnstructuredControl),
         HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => {
-            // 候选拒绝[ConvergenceGuard]：候选 LocalId 在后缀再次声明违反唯一 binding 不变量；删除前缀会改变该异常 HIR 的作用域。
-            None
+            Err(AliasFlowError::BindingInvariant)
         }
+        HirStmt::Return(_) => {
+            evaluate_leaf_stmt(stmt, local, param, states)?;
+            Ok(AliasFlow::default())
+        }
+        HirStmt::Break => Ok(AliasFlow {
+            breaks: states,
+            ..AliasFlow::default()
+        }),
+        HirStmt::Continue => Ok(AliasFlow {
+            continues: states,
+            ..AliasFlow::default()
+        }),
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
         | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Close(_)
-        | HirStmt::Break
-        | HirStmt::Continue => {
-            if local_written && stmt_reads_param(stmt, param) {
-                // 候选拒绝[SemanticBarrier:ValueFlow]：`l=1; return p` 的 p 仍应是入口值，合并后却会读取刚写入的 1。
-                return None;
+        | HirStmt::Close(_) => Ok(AliasFlow::fallthrough(evaluate_leaf_stmt(
+            stmt, local, param, states,
+        )?)),
+    }
+}
+
+fn validate_while_alias(
+    body: &HirBlock,
+    condition: &HirExpr,
+    local: LocalId,
+    param: ParamId,
+    incoming: AliasStates,
+) -> Result<AliasFlow, AliasFlowError> {
+    let truthiness = expr_truthiness(condition);
+    let mut entries = incoming.clone();
+    let mut break_exits = AliasStates::default();
+    loop {
+        let condition_states = evaluate_expr(condition, local, param, entries.clone())?;
+        let body_flow = if truthiness == Some(false) {
+            AliasFlow::default()
+        } else {
+            validate_alias_flow(&body.stmts, local, param, condition_states.clone())?
+        };
+        let next_entries = incoming
+            .clone()
+            .union(body_flow.fallthrough)
+            .union(body_flow.continues);
+        let next_break_exits = break_exits.clone().union(body_flow.breaks);
+        if next_entries == entries && next_break_exits == break_exits {
+            let normal_exits = if truthiness == Some(true) {
+                AliasStates::default()
+            } else {
+                condition_states
+            };
+            return Ok(AliasFlow::fallthrough(normal_exits.union(break_exits)));
+        }
+        entries = next_entries;
+        break_exits = next_break_exits;
+    }
+}
+
+fn validate_repeat_alias(
+    body: &HirBlock,
+    condition: &HirExpr,
+    local: LocalId,
+    param: ParamId,
+    incoming: AliasStates,
+) -> Result<AliasFlow, AliasFlowError> {
+    let truthiness = expr_truthiness(condition);
+    let mut entries = incoming.clone();
+    let mut break_exits = AliasStates::default();
+    loop {
+        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone())?;
+        let condition_states = evaluate_expr(
+            condition,
+            local,
+            param,
+            body_flow.fallthrough.union(body_flow.continues),
+        )?;
+        let back_edges = if truthiness == Some(true) {
+            AliasStates::default()
+        } else {
+            condition_states.clone()
+        };
+        let next_entries = incoming.clone().union(back_edges);
+        let next_break_exits = break_exits.clone().union(body_flow.breaks);
+        if next_entries == entries && next_break_exits == break_exits {
+            let normal_exits = if truthiness == Some(false) {
+                AliasStates::default()
+            } else {
+                condition_states
+            };
+            return Ok(AliasFlow::fallthrough(normal_exits.union(break_exits)));
+        }
+        entries = next_entries;
+        break_exits = next_break_exits;
+    }
+}
+
+fn validate_zero_or_more_alias(
+    body: &HirBlock,
+    local: LocalId,
+    param: ParamId,
+    zero_exit: AliasStates,
+    initial_body_entry: AliasStates,
+    opaque_each_iteration: bool,
+) -> Result<AliasFlow, AliasFlowError> {
+    let mut entries = initial_body_entry.clone();
+    let mut break_exits = AliasStates::default();
+    loop {
+        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone())?;
+        let iteration_exits = body_flow.fallthrough.union(body_flow.continues);
+        let callback_exits = if opaque_each_iteration {
+            evaluate_opaque_callback(local, param, iteration_exits)?
+        } else {
+            iteration_exits
+        };
+        let next_entries = initial_body_entry.clone().union(callback_exits.clone());
+        let next_break_exits = break_exits.clone().union(body_flow.breaks);
+        if next_entries == entries && next_break_exits == break_exits {
+            return Ok(AliasFlow::fallthrough(
+                zero_exit.union(callback_exits).union(break_exits),
+            ));
+        }
+        entries = next_entries;
+        break_exits = next_break_exits;
+    }
+}
+
+fn union_alias_flows(left: AliasFlow, right: AliasFlow) -> AliasFlow {
+    AliasFlow {
+        fallthrough: left.fallthrough.union(right.fallthrough),
+        breaks: left.breaks.union(right.breaks),
+        continues: left.continues.union(right.continues),
+    }
+}
+
+fn evaluate_expr(
+    expr: &HirExpr,
+    local: LocalId,
+    param: ParamId,
+    states: AliasStates,
+) -> Result<AliasStates, AliasFlowError> {
+    let mut facts = AliasEvaluationFacts::new(local, param);
+    visit::visit_expr(expr, &mut facts);
+    apply_evaluation_facts(facts, false, false, states)
+}
+
+fn evaluate_opaque_callback(
+    local: LocalId,
+    param: ParamId,
+    states: AliasStates,
+) -> Result<AliasStates, AliasFlowError> {
+    let mut facts = AliasEvaluationFacts::new(local, param);
+    facts.has_opaque_callback = true;
+    apply_evaluation_facts(facts, false, false, states)
+}
+
+fn evaluate_leaf_stmt(
+    stmt: &HirStmt,
+    local: LocalId,
+    param: ParamId,
+    states: AliasStates,
+) -> Result<AliasStates, AliasFlowError> {
+    let mut facts = AliasEvaluationFacts::new(local, param);
+    visit::visit_stmts(std::slice::from_ref(stmt), &mut facts);
+    facts.has_opaque_callback |= matches!(stmt, HirStmt::Close(_));
+    let writes_local = stmt_writes_local(stmt, local);
+    let writes_param = stmt_writes_param(stmt, param);
+    apply_evaluation_facts(facts, writes_local, writes_param, states)
+}
+
+fn apply_evaluation_facts(
+    facts: AliasEvaluationFacts,
+    writes_local: bool,
+    writes_param: bool,
+    states: AliasStates,
+) -> Result<AliasStates, AliasFlowError> {
+    if writes_local && writes_param {
+        return Err(AliasFlowError::ValueFlow);
+    }
+    let mut after_callbacks = BTreeSet::new();
+    for mut state in states.0 {
+        if (state.divergence == Divergence::LocalWritten && facts.reads_param)
+            || (state.divergence == Divergence::ParamWritten && facts.reads_local)
+        {
+            return Err(AliasFlowError::ValueFlow);
+        }
+        state.local_reference_exposed |= facts.reference_captures_local;
+        state.param_reference_exposed |= facts.reference_captures_param;
+        if facts.has_opaque_callback
+            && ((state.divergence == Divergence::LocalWritten && state.param_reference_exposed)
+                || (state.divergence == Divergence::ParamWritten && state.local_reference_exposed))
+        {
+            return Err(AliasFlowError::ValueFlow);
+        }
+        after_callbacks.insert(state);
+        if facts.has_opaque_callback {
+            if state.local_reference_exposed {
+                after_callbacks.insert(AliasState {
+                    divergence: Divergence::LocalWritten,
+                    ..state
+                });
             }
-            Some(local_written || stmt_writes_local(stmt, local))
+            if state.param_reference_exposed {
+                after_callbacks.insert(AliasState {
+                    divergence: Divergence::ParamWritten,
+                    ..state
+                });
+            }
+        }
+    }
+
+    let mut next = BTreeSet::new();
+    for mut state in after_callbacks {
+        if writes_local {
+            if state.param_reference_exposed {
+                return Err(AliasFlowError::Capture);
+            }
+            state.divergence = Divergence::LocalWritten;
+        } else if writes_param {
+            if state.local_reference_exposed {
+                return Err(AliasFlowError::Capture);
+            }
+            state.divergence = Divergence::ParamWritten;
+        }
+        next.insert(state);
+    }
+    Ok(AliasStates(next))
+}
+
+struct AliasEvaluationFacts {
+    local: LocalId,
+    param: ParamId,
+    reads_local: bool,
+    reads_param: bool,
+    reference_captures_local: bool,
+    reference_captures_param: bool,
+    has_opaque_callback: bool,
+}
+
+impl AliasEvaluationFacts {
+    fn new(local: LocalId, param: ParamId) -> Self {
+        Self {
+            local,
+            param,
+            reads_local: false,
+            reads_param: false,
+            reference_captures_local: false,
+            reference_captures_param: false,
+            has_opaque_callback: false,
         }
     }
 }
 
-fn validate_repeating_body(
-    body: &HirBlock,
-    local: LocalId,
-    param: ParamId,
-    local_written: bool,
-) -> Option<bool> {
-    let body_written = validate_alias_flow(&body.stmts, local, param, local_written)?;
-    if body_written && !local_written {
-        // 候选拒绝[SemanticBarrier:ValueFlow]：循环首轮写 alias 后，下一轮若读取原 param，合并会把旧入口值替换为上一轮 alias 值。
-        validate_alias_flow(&body.stmts, local, param, true)?;
+impl HirVisitor for AliasEvaluationFacts {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        match expr {
+            HirExpr::LocalRef(local) if *local == self.local => self.reads_local = true,
+            HirExpr::ParamRef(param) if *param == self.param => self.reads_param = true,
+            HirExpr::GlobalRef(_)
+            | HirExpr::TableAccess(_)
+            | HirExpr::Unary(_)
+            | HirExpr::Binary(_)
+            | HirExpr::Call(_) => self.has_opaque_callback = true,
+            HirExpr::Closure(closure) => {
+                for capture in &closure.captures {
+                    if capture.mode != HirCaptureMode::ByReference {
+                        continue;
+                    }
+                    self.reference_captures_local |=
+                        expr_mentions_local(&capture.value, self.local);
+                    self.reference_captures_param |=
+                        expr_mentions_param(&capture.value, self.param);
+                }
+            }
+            _ => {}
+        }
     }
-    Some(body_written)
-}
 
-fn reject_param_read_after_local_write(
-    expr: &HirExpr,
-    param: ParamId,
-    local_written: bool,
-) -> Option<()> {
-    // 候选拒绝[SemanticBarrier:ValueFlow]：任一路径写 alias 后再读 param（如 `l=1; use(p)`）可观察两个 binding，不能收敛为同一参数。
-    (!local_written || !expr_reads_param(expr, param)).then_some(())
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.has_opaque_callback |=
+            matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
+    }
+
+    fn visit_call(&mut self, _call: &crate::hir::common::HirCallExpr) {
+        self.has_opaque_callback = true;
+    }
 }
 
 fn stmt_writes_local(stmt: &HirStmt, local: LocalId) -> bool {
@@ -310,12 +627,12 @@ struct LocalWriteCollector {
     written: bool,
 }
 
-fn stmts_write_param(stmts: &[HirStmt], param: ParamId) -> bool {
+fn stmt_writes_param(stmt: &HirStmt, param: ParamId) -> bool {
     let mut collector = ParamWriteCollector {
         param,
         written: false,
     };
-    visit::visit_stmts(stmts, &mut collector);
+    visit::visit_stmts(std::slice::from_ref(stmt), &mut collector);
     collector.written
 }
 
@@ -336,13 +653,7 @@ impl HirVisitor for LocalWriteCollector {
     }
 }
 
-fn stmt_reads_param(stmt: &HirStmt, param: ParamId) -> bool {
-    let mut collector = ParamReadCollector { param, read: false };
-    visit::visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.read
-}
-
-fn expr_reads_param(expr: &HirExpr, param: ParamId) -> bool {
+fn expr_mentions_param(expr: &HirExpr, param: ParamId) -> bool {
     let mut collector = ParamReadCollector { param, read: false };
     visit::visit_expr(expr, &mut collector);
     collector.read

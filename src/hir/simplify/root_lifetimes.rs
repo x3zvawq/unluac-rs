@@ -1,9 +1,9 @@
-//! Identify the narrow physical-slot lifetime that HIR value liveness misses.
+//! 这个文件识别普通 HIR 值活跃性看不到的物理槽 root 生命周期。
 //!
-//! A fixed call result remains a VM GC root until the same stack home is overwritten, even when
-//! no HIR expression reads that result. The analysis stays local to one block. Nested structure
-//! may be crossed only when it has no write to the active home and no opaque transfer or cleanup
-//! boundary. Consumers preserve both materializations in each proven pair.
+//! fixed call result 即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当 VM GC root。
+//! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
+//! 或 cleanup 边界时才允许穿过。消费者可以保留已配对的两次 materialization，也可以在
+//! 更窄的改写仍保持同一覆盖事务时，连同 owner 已证明的 physical home 一起消费该 pair。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,8 +33,24 @@ struct ActiveAllocationRoot {
 #[derive(Default)]
 pub(super) struct CallRootLifetimeIndices {
     roots: BTreeSet<usize>,
-    root_by_overwrite: BTreeMap<usize, usize>,
+    root_by_overwrite: BTreeMap<usize, CallRootOverwritePair>,
     root_by_protected: BTreeMap<usize, usize>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CallRootOverwritePair {
+    root_index: usize,
+    home: HomeSlotKey,
+}
+
+impl CallRootOverwritePair {
+    pub(super) fn root_index(self) -> usize {
+        self.root_index
+    }
+
+    pub(super) fn home(self) -> HomeSlotKey {
+        self.home
+    }
 }
 
 impl CallRootLifetimeIndices {
@@ -43,6 +59,11 @@ impl CallRootLifetimeIndices {
     }
 
     pub(super) fn root_for_overwrite(&self, index: usize) -> Option<usize> {
+        self.overwrite_pair(index)
+            .map(CallRootOverwritePair::root_index)
+    }
+
+    pub(super) fn overwrite_pair(&self, index: usize) -> Option<CallRootOverwritePair> {
         self.root_by_overwrite.get(&index).copied()
     }
 
@@ -110,7 +131,7 @@ pub(super) fn collect_call_root_lifetimes(
                 definite_branch_temp_home_overwrite(stmt, facts, &mut temp_is_eligible)
             {
                 if let Some(root) = active.remove(&home) {
-                    record_call_root_overwrite(root, index, eligible, &uses, &mut lifetimes);
+                    record_call_root_overwrite(root, index, home, eligible, &uses, &mut lifetimes);
                 }
                 remove_allocation_homes(&mut active_allocations, &BTreeSet::from([home]), facts);
                 continue;
@@ -164,7 +185,14 @@ pub(super) fn collect_call_root_lifetimes(
                 .collect::<BTreeSet<_>>();
             for write_home in &extra_write_homes {
                 if let Some(root) = active.remove(write_home) {
-                    record_call_root_overwrite(root, index, eligible, &uses, &mut lifetimes);
+                    record_call_root_overwrite(
+                        root,
+                        index,
+                        *write_home,
+                        eligible,
+                        &uses,
+                        &mut lifetimes,
+                    );
                 }
             }
             remove_allocation_homes(&mut active_allocations, &extra_write_homes, facts);
@@ -183,7 +211,7 @@ pub(super) fn collect_call_root_lifetimes(
         }
 
         if let Some(root) = active.remove(&slot) {
-            record_call_root_overwrite(root, index, eligible, &uses, &mut lifetimes);
+            record_call_root_overwrite(root, index, slot, eligible, &uses, &mut lifetimes);
         }
 
         if let HirExpr::TempRef(source) = value {
@@ -275,6 +303,7 @@ fn stmt_is_direct_if_control_read(stmt: &HirStmt, aliases: &BTreeSet<TempId>) ->
 fn record_call_root_overwrite(
     root: ActiveCallRoot,
     index: usize,
+    home: HomeSlotKey,
     eligible: bool,
     uses: &TempUseEvents,
     lifetimes: &mut CallRootLifetimeIndices,
@@ -287,7 +316,13 @@ fn record_call_root_overwrite(
             .any(|alias| uses.has_live_read_after(*alias, index))
     {
         lifetimes.roots.insert(root.root_index);
-        lifetimes.root_by_overwrite.insert(index, root.root_index);
+        lifetimes.root_by_overwrite.insert(
+            index,
+            CallRootOverwritePair {
+                root_index: root.root_index,
+                home,
+            },
+        );
     }
 }
 
@@ -543,10 +578,13 @@ fn update_allocation_roots(
                         .root_by_protected
                         .insert(*def_index, root.root_index);
                 }
-                state
-                    .lifetimes
-                    .root_by_overwrite
-                    .insert(index, root.root_index);
+                state.lifetimes.root_by_overwrite.insert(
+                    index,
+                    CallRootOverwritePair {
+                        root_index: root.root_index,
+                        home: slot,
+                    },
+                );
             }
             root.aliases.retain(|alias| {
                 state
