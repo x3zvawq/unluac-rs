@@ -424,14 +424,11 @@ impl TableConstructorPass<'_> {
                 continue;
             };
 
-            // A source LocalDecl immediately followed by its SETLIST is already one
-            // constructor split by the VM encoder.  The values are not moved across any
-            // producer statement and no producer binding is removed; keeping the seed at the
-            // same statement index therefore preserves allocation and field-evaluation order.
-            // This path intentionally accepts observable field expressions (unlike the
-            // cross-stmt folding paths below): direct-seed provenance plus the no-mention,
-            // capture and debug gates establish that the fresh owner is still only an
-            // initializer result while those expressions run.
+            // 相邻的源码 LocalDecl 与 fixed SETLIST 是 VM 对同一个构造器初始化的拆分编码。
+            // direct-seed provenance 证明 allocation 仍在原声明位置，SETLIST start 又证明数组
+            // 段连续，因此合并不会跨 producer，也不会改变字段求值、nil 槽或 fixed-call 宽度。
+            // debug local 仍由同一 LocalDecl 持有，而且 Lua initializer 求值时该 binding 尚不可见；
+            // 把 batch 放回 initializer 正好恢复这条词法边界。open tail 仍走更窄的独立证明。
             if let Some(seed_index) =
                 self.find_adjacent_local_constructor_seed(block, index, binding, &set_list)
             {
@@ -599,6 +596,7 @@ impl TableConstructorPass<'_> {
         let HirStmt::LocalDecl(local_decl) = block.stmts.get(seed_index)? else {
             return None;
         };
+        let has_open_tail = set_list.values.tail.is_some();
         if seed_binding != binding
             || local_decl.bindings.as_slice() != [local]
             || seed.trailing_multivalue.is_some()
@@ -610,11 +608,12 @@ impl TableConstructorPass<'_> {
                 .get(binding)
                 .copied()
                 .unwrap_or_default()
-            || self
-                .debug_identity_bindings
-                .get(binding)
-                .copied()
-                .unwrap_or_default()
+            || (has_open_tail
+                && self
+                    .debug_identity_bindings
+                    .get(binding)
+                    .copied()
+                    .unwrap_or_default())
             || self.materialized_bindings.get(binding).copied() != Some(1)
             || self.promotion_facts.compacts_home_slots()
             || self
@@ -622,7 +621,7 @@ impl TableConstructorPass<'_> {
                 .trusted_local_home_slot(local)
                 .is_none()
             || !self.promotion_facts.is_direct_table_seed_local(local)
-            || !self.adjacent_set_list_array_shape_is_safe(seed, set_list)
+            || (has_open_tail && !self.adjacent_set_list_array_shape_is_safe(seed, set_list))
             || (set_list.values.fixed.is_empty() && set_list.values.tail.is_none())
             || set_list.values.tail.as_ref().is_some_and(|tail| {
                 tail.exact_width().is_some()
