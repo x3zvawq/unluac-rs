@@ -236,6 +236,69 @@ pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {
     }
 }
 
+/// 判断表达式是否既没有运行时事件，又能在循环条件中安全地重复物化。
+pub(super) fn is_eventless_primitive_literal(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_) | AstExpr::String(_) => true,
+        AstExpr::Number(value) => value.is_finite(),
+        AstExpr::SingleValue(value) => is_eventless_primitive_literal(value),
+        AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
+}
+
+/// 判断表达式结果是否不可能成为可回收对象的强引用。
+///
+/// 这里只描述结果值，不描述求值事件：`not value` 仍会读取 `value`，但结果一定是布尔值。
+pub(super) fn result_cannot_root_collectable(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_) => true,
+        AstExpr::Unary(unary) => matches!(unary.op, AstUnaryOpKind::Not),
+        AstExpr::Binary(binary) => matches!(
+            binary.op,
+            AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le
+        ),
+        AstExpr::LogicalAnd(logical) => result_cannot_root_collectable(&logical.rhs),
+        AstExpr::LogicalOr(logical) => {
+            result_cannot_root_collectable(&logical.lhs)
+                && result_cannot_root_collectable(&logical.rhs)
+        }
+        AstExpr::SingleValue(value) => result_cannot_root_collectable(value),
+        AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
+}
+
 pub(super) fn is_access_base_inline_expr(expr: &AstExpr) -> bool {
     is_atomic_access_base_expr(expr) || is_named_field_chain_expr(expr)
 }

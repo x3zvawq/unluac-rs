@@ -12,6 +12,7 @@
 //! - 多值 return 顶层只收回 context-safe 或已证明为单值布尔比较的唯一 alias；可变快照仍通过求值前缀证明
 //! - 单值 return 短路树只收回最左、必达位置的布尔比较 alias；右臂仍保留原 binding
 //! - 稳定 local copy 可跨越无关语句收回到唯一后续 use；只替换名字读取，不搬动 RHS
+//! - 完整 call-alias run 先于单项相邻内联取得所有权；run 拒绝后，单项规则仍可消费局部安全形状
 
 mod candidate;
 mod eval_order;
@@ -29,8 +30,8 @@ use self::candidate::{
 };
 use self::use_sites::rewrite_stmt_use_sites_with_policy;
 use super::super::common::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstLocalAttr,
-    AstLocalOrigin, AstModule, AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
+    AstLocalAttr, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -39,7 +40,7 @@ use super::binding_flow::{
 };
 use super::binding_ref::binding_from_name_ref;
 use super::binding_tree::{
-    expr_references_binding, stmt_has_access_base_binding_use, stmt_has_call_callee_binding_use,
+    expr_references_binding, stmt_has_access_base_binding_use,
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
     stmt_has_nested_binding_value_use, stmt_stores_binding_in_table,
 };
@@ -189,6 +190,8 @@ fn rewrite_current_block(
     trailing_condition: Option<&AstExpr>,
 ) -> bool {
     let mut changed = collapse_adjacent_self_call_updates(block, trailing_condition);
+    changed |=
+        collapse_adjacent_call_alias_runs(block, options, mutable_snapshots, trailing_condition);
 
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
@@ -278,7 +281,6 @@ fn rewrite_current_block(
                 InlinePolicy::Conservative | InlinePolicy::AliasInitializerChain
             )
             && matches!(next_stmt, AstStmt::Assign(_) | AstStmt::LocalDecl(_))
-            && stmt_sink_binding_allows_adjacent_value_inline(&old_stmts, index + 1)
             && ((candidate::is_raw_global_alias_expr(value)
                 && stmt_has_direct_call_arg_binding_use(next_stmt, candidate.binding()))
                 || (stmt_has_nested_binding_value_use(next_stmt, candidate.binding())
@@ -383,8 +385,6 @@ fn rewrite_current_block(
 
     block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed |= collapse_stable_copy_aliases(block, options, mutable_snapshots, trailing_condition);
-    changed |=
-        collapse_adjacent_call_alias_runs(block, options, mutable_snapshots, trailing_condition);
     changed |= collapse_terminal_call_result_alias_runs(
         block,
         options,
@@ -432,7 +432,7 @@ fn collapse_stable_copy_aliases(
             continue;
         };
         if candidate.origin() != super::super::common::AstLocalOrigin::Recovered {
-            // 候选拒绝[PolicyBoundary]：DebugHinted 保留源码身份；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 若在 use 后仍处于原词法作用域，会延后弱表消失或 `__gc`。
+            // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted 会改变 debug.getlocal 可观察的作用域（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 若在 use 后仍处于原词法作用域，会延后弱表消失或 `__gc`。
             continue;
         }
         if !candidate.allows_expr_with_policy(value, InlinePolicy::StableCopy) {

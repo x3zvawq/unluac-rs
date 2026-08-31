@@ -12,7 +12,9 @@ use crate::ast::common::{
 };
 
 use super::super::binding_ref::binding_from_name_ref;
-use super::super::expr_analysis::{expr_observes_eval_order, expr_requires_ordered_snapshot};
+use super::super::expr_analysis::{
+    expr_observes_eval_order, expr_requires_ordered_snapshot, is_eventless_primitive_literal,
+};
 use super::candidate::inline_candidate;
 
 pub(super) fn preserves_adjacent_eval_order(
@@ -50,6 +52,14 @@ pub(super) fn run_preserves_eval_order(
             (*removed).then_some((candidate.binding(), value))
         })
         .collect::<Vec<_>>();
+    if matches!(stmts[sink_index], AstStmt::While(_) | AstStmt::Repeat(_))
+        && candidates
+            .iter()
+            .any(|(_, value)| !is_eventless_primitive_literal(value))
+    {
+        // 候选拒绝[SemanticBarrier:EvalCount]：可变读取搬入 while/repeat 会从一次快照变成逐轮/体后求值（regress_355）；候选拒绝[ProofIncomplete]：其余非 primitive RHS 尚缺 loop-invariant 依赖事实。
+        return false;
+    }
     let expected = candidates
         .iter()
         .filter_map(|(binding, value)| {

@@ -3,6 +3,10 @@
 //! 它依赖 `candidate` 已经给好的候选类型和策略，只在允许的位置替换引用，不会回头重判
 //! 候选本身是否安全。
 //! 例如：`local r0 = print; r0(1)` 选中后，会在这里把调用位点改成 `print(1)`。
+//! mechanical run 的顶层 return 复用候选层的单值表达式集合；extended call run 在
+//! 非尾 return 复用候选集合并由 run 级事件前缀约束顺序，index 则保留跨调用的 key root。
+//! local initializer 中的裸调用已经被赋值收窄为单值；移入最终调用参数时用
+//! `SingleValue` 保留该宽度，避免重新变成开放多返回值。
 
 use crate::ast::ReadabilityOptions;
 
@@ -19,8 +23,9 @@ use super::super::expr_analysis::{
 };
 use super::candidate::{
     InlineCandidate, InlinePolicy, is_call_callee_inline_expr,
-    is_extended_call_arg_local_alias_expr, is_extended_neutral_local_alias_expr,
-    is_lookup_inline_expr, is_raw_global_alias_expr, is_recallable_inline_expr,
+    is_extended_call_arg_local_alias_expr, is_extended_call_chain_inline_expr,
+    is_extended_neutral_local_alias_expr, is_lookup_inline_expr, is_raw_global_alias_expr,
+    is_recallable_inline_expr,
 };
 
 pub(super) fn rewrite_stmt_use_sites_with_policy(
@@ -373,7 +378,7 @@ fn rewrite_expr_use_sites(
     policy: InlinePolicy,
 ) -> bool {
     if site.allows(candidate, expr, replacement, options, policy) {
-        *expr = replacement.clone();
+        *expr = site.replacement_preserving_value_width(replacement);
         return true;
     }
 
@@ -539,6 +544,14 @@ enum InlineSite {
 }
 
 impl InlineSite {
+    fn replacement_preserving_value_width(self, replacement: &AstExpr) -> AstExpr {
+        if matches!(self, Self::CallArgFinal) && is_recallable_inline_expr(replacement) {
+            AstExpr::SingleValue(Box::new(replacement.clone()))
+        } else {
+            replacement.clone()
+        }
+    }
+
     fn allows(
         self,
         candidate: InlineCandidate,
@@ -576,7 +589,7 @@ impl InlineSite {
                     && is_stable_copy_alias_expr(replacement)
             }
             InlinePolicy::Conservative => match candidate.origin() {
-                // 候选拒绝[PolicyBoundary]：debug 身份按源码策略保留；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 可能被弱表/`__gc` 观察，不能走通用 use-site 内联。
+                // 候选拒绝[SemanticBarrier:DebugScope]：删除 debug local 会改变 debug.getlocal 可观察的作用域（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 可能被弱表/`__gc` 观察，不能走通用 use-site 内联。
                 super::super::super::common::AstLocalOrigin::DebugHinted
                 | super::super::super::common::AstLocalOrigin::PhysicalRoot => false,
                 super::super::super::common::AstLocalOrigin::Recovered => match self {
@@ -726,16 +739,19 @@ impl InlineSite {
                     || is_recallable_inline_expr(replacement)
                     || is_call_arg_constructor_inline_expr(replacement)
             }
-            // 这里只有在“局部别名包折回最终调用”时，才允许把纯 lookup 收回参数位。
-            // 这能把 `local x = t[1]; local y = t.a; print(x, y)` 这类机械展开收回去，
-            // 同时仍然不放宽到任意调用结果，避免把阶段 local 继续吞掉。
+            // 最终参数只接受不会重新打开返回值的 lookup/constructor。
             Self::CallArgFinal => {
                 is_extended_call_arg_local_alias_expr(replacement)
                     || is_call_arg_constructor_inline_expr(replacement)
             }
             Self::AccessBase => is_access_base_inline_expr(replacement),
-            // 候选拒绝[ProofIncomplete]：extended-alias 尚未为直接 return/index 建立值宽度与地址求值次序证明，安全子集仍可能存在。
-            Self::ReturnValue | Self::Index => false,
+            // terminal call run 的直接 return use 必然位于最终 tail call 之前；local
+            // 初始化与非尾 return 都把裸 call 收窄为单值，完整事件顺序再由 run 前缀证明。
+            Self::ReturnValue => is_extended_call_chain_inline_expr(replacement),
+            Self::Index => {
+                // 候选拒绝[LayerBoundary]：primitive/copy-like index alias 由 stable-copy 或 HIR locals 消费；候选拒绝[SemanticBarrier:Lifetime]：把 call/method/field 结果移入 index 会让 key root 在参数求值前失活，弱表与强制 GC 可观察差异（regress_353_extended_index_key_lifetime）。
+                false
+            }
         }
     }
 
@@ -828,9 +844,11 @@ impl InlineSite {
 
     fn allows_mechanical_run_expr(self, replacement: &AstExpr) -> bool {
         match self {
-            Self::Neutral | Self::ComparisonOperand | Self::ReturnNestedValue | Self::Index => {
-                is_mechanical_run_inline_expr(replacement)
-            }
+            Self::Neutral
+            | Self::ComparisonOperand
+            | Self::ReturnValue
+            | Self::ReturnNestedValue
+            | Self::Index => is_mechanical_run_inline_expr(replacement),
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::AccessBase => {
                 is_access_base_inline_expr(replacement) || is_lookup_inline_expr(replacement)
@@ -838,8 +856,6 @@ impl InlineSite {
             Self::CallArgNonFinal | Self::CallArgFinal => {
                 is_mechanical_run_inline_expr(replacement)
             }
-            // 候选拒绝[ProofIncomplete]：bare call/vararg 在顶层 return 有具体 ValueArity 反例，但稳定标量子集尚未从此 blanket guard 中拆出。
-            Self::ReturnValue => false,
         }
     }
 }

@@ -82,6 +82,10 @@ provenance 或 plan/apply 不变量已知不成立，必须在提交点前写一
 存在 capture/debug 信息或“理论上可能有副作用”不能升级为语义屏障。无法给出反例时，
 应标为 `ProofIncomplete`。
 
+`DebugScope` 只保护 IR 已保留的 debug/source identity（例如 `DebugHinted` binding）。
+stripped chunk 中 `debug.getlocal/setlocal` 对数字寄存器槽的反射不属于源码等价合同：槽位
+身份已经不可恢复，否则任何 recovered local 的删除、合并或重排都会天然违反合同。
+
 普通形状不属于该 pass 时是 `NotApplicable`，不需要标记。候选尚未逐项形成但整项分析
 被停用时写 `分析停用[...]`；搜索空间被截断但已有候选仍可改写时写
 `候选搜索裁剪[...]`。这些名字用于区分真实拒绝点，避免把所有 `None` / `false` 都误报为

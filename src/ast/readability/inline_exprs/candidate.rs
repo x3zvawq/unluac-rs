@@ -70,9 +70,20 @@ pub(super) fn stmt_is_multi_return_value_sink(stmt: &AstStmt, binding: AstBindin
         stmt,
         AstStmt::Return(ret)
             if ret.values.len() > 1
-                && ret.values.iter().any(
-                    |value| matches!(value, AstExpr::Var(name) if binding.matches_name_ref(name))
-                )
+                && stmt_has_top_level_return_binding_use(stmt, binding)
+    )
+}
+
+pub(super) fn stmt_has_top_level_return_binding_use(
+    stmt: &AstStmt,
+    binding: AstBindingRef,
+) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Return(ret)
+            if ret.values.iter().any(
+                |value| matches!(value, AstExpr::Var(name) if binding.matches_name_ref(name))
+            )
     )
 }
 
@@ -168,7 +179,7 @@ impl InlineCandidate {
         // 生命周期证据。编译器内部 for 槽已经在 Transformer 归一化时排除，因而这里
         // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
-            // 候选拒绝[PolicyBoundary]：DebugHinted 是已知源码 local 身份，内联会抹掉名字与源码生命周期证据。
+            // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted local 会改变调用中 debug.getlocal 可观察的名字与作用域（regress_351）。
             AstLocalOrigin::DebugHinted => false,
             AstLocalOrigin::PhysicalRoot => {
                 // 物理根若只是紧邻普通调用的全局 callee，调用帧会在参数求值期间继续
@@ -211,9 +222,7 @@ impl InlineCandidate {
                         || is_access_base_inline_expr(expr)
                         || is_recallable_inline_expr(expr)
                 }
-                InlinePolicy::ExtendedCallChain => {
-                    is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr)
-                }
+                InlinePolicy::ExtendedCallChain => is_extended_call_chain_inline_expr(expr),
             },
         }
     }
@@ -231,6 +240,10 @@ pub(super) fn is_call_callee_inline_expr(expr: &AstExpr) -> bool {
     is_access_base_inline_expr(expr)
         || is_lookup_inline_expr(expr)
         || is_recallable_inline_expr(expr)
+}
+
+pub(super) fn is_extended_call_chain_inline_expr(expr: &AstExpr) -> bool {
+    is_access_base_inline_expr(expr) || is_recallable_inline_expr(expr)
 }
 
 pub(super) fn is_extended_neutral_local_alias_expr(expr: &AstExpr) -> bool {
