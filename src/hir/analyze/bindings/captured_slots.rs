@@ -231,7 +231,11 @@ pub(super) fn collect_captured_slot_targets(
         };
         for &block in body_blocks {
             match loop_plan.source_bindings {
-                Some(LoopSourceBindings::Numeric(_)) => {}
+                Some(LoopSourceBindings::Numeric(binding)) => {
+                    // `block_local_regs` 已为该槽分配 numeric-for local，其词法 cell 会逐轮
+                    // 重建并关闭；body capture 必须复用这个 owner，不能另分配 epoch local。
+                    loop_owned_slots.insert((block, binding));
+                }
                 Some(LoopSourceBindings::Generic(bindings)) => {
                     for offset in 0..bindings.len {
                         loop_owned_slots.insert((block, Reg(bindings.start.index() + offset)));

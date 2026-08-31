@@ -23,8 +23,7 @@ use super::forwarded::try_lower_forwarded_function_stmt;
 use super::method_alias::try_recover_method_alias_stmt;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue,
-    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstStmt, AstTableField,
-    AstTableKey, AstTargetDialect,
+    AstLocalAttr, AstLocalDecl, AstModule, AstStmt, AstTableField, AstTableKey, AstTargetDialect,
 };
 
 pub(in crate::ast::readability) fn apply(
@@ -411,22 +410,21 @@ fn split_forward_capture_locals(
         }
         if group_bindings.len() < 2 {
             // 不足 2 个 blocked local，不需要拆分
-            // 候选拒绝[ProofIncomplete]：前向捕获成员若不连续，当前只放弃拆分而没有构造覆盖间隔的前向声明；缺少跨语句分组/作用域证明。
+            // 候选拒绝[ProofIncomplete]：非连续成员需要把后声明 local 的作用域前移并覆盖中间语句；当前缺少 component span、跨 lexical block 的 capture 边界，以及目标方言同时存活 local 预算，无法证明不会改绑或超过 local 上限。
             i = group_start + 1;
             continue;
         }
-        // 证明缺陷[PotentialUnsoundness:Attribute]：group 只按 blocked binding 选择，未检查原 binding attr；若含 `<close>`/`<const>`，下面统一改成 attr=None 会改变关闭/赋值约束。
-        // 证明缺陷[PotentialPolicyViolation]：下面还把所有 origin 重建为 Recovered，未保留 DebugHinted 身份。
+        if group_bindings
+            .iter()
+            .any(|binding| binding.attr != AstLocalAttr::None)
+        {
+            // 候选拒绝[SemanticBarrier:Attribute]：`<const>` 不能先声明后赋值，`<close>` 的 initializer 又决定资源注册；两者都不能拆成普通前向声明。
+            i = group_start + group_bindings.len();
+            continue;
+        }
         // 构建前向声明：`local X, Y, ...`（无初始值）
         let forward_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
-            bindings: group_bindings
-                .iter()
-                .map(|b| AstLocalBinding {
-                    id: b.id,
-                    attr: AstLocalAttr::None,
-                    origin: AstLocalOrigin::Recovered,
-                })
-                .collect(),
+            bindings: group_bindings.clone(),
             values: Vec::new(),
         }));
         // 把每个 `local X = expr` 转成 `X = expr`

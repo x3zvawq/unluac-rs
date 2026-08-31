@@ -166,6 +166,7 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) structure: &'a ReadyStructureFacts,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
+    pub(super) self_value_capture_locals: BTreeMap<InstrRef, LocalId>,
     pub(super) shared_closure_locals: BTreeMap<SharedClosureRef, (LocalId, ProtoRef)>,
     pub(super) captured_shared_closures: CapturedSharedClosureLowering,
     pub(super) open_pack_owners: Vec<Option<InstrRef>>,
@@ -434,6 +435,7 @@ fn lower_proto_one(
         &slot_epochs,
         &child_mutable_upvalues,
     );
+    let self_value_capture_locals = build_self_value_capture_locals(proto, &mut bindings);
     let shared_closure_locals =
         build_shared_closure_locals(proto, &captured_shared_plan, &mut bindings);
     let captured_shared_closures = CapturedSharedClosureLowering::new(
@@ -458,6 +460,7 @@ fn lower_proto_one(
         structure,
         child_refs: &child_refs,
         bindings,
+        self_value_capture_locals,
         shared_closure_locals,
         captured_shared_closures,
         open_pack_owners,
@@ -498,6 +501,34 @@ fn lower_proto_one(
         source_proto_id: frame.source_proto_id,
         mutable_upvalues: mutable_upvalues_for_proto(proto, &child_mutable_upvalues),
     })
+}
+
+fn build_self_value_capture_locals(
+    proto: &LoweredProto,
+    bindings: &mut ProtoBindings,
+) -> BTreeMap<InstrRef, LocalId> {
+    proto
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| {
+            let LowInstr::Closure(closure) = instr else {
+                return None;
+            };
+            closure
+                .captures
+                .iter()
+                .any(|capture| {
+                    matches!(capture.source, CaptureSource::ByValue(reg) if reg == closure.dst)
+                })
+                .then(|| {
+                    let local = LocalId(bindings.locals.len());
+                    bindings.locals.push(local);
+                    bindings.local_debug_hints.push(None);
+                    (InstrRef(index), local)
+                })
+        })
+        .collect()
 }
 
 fn fill_failed_proto(

@@ -92,6 +92,182 @@ pub(super) fn patch_lua51_main_jump(
     Ok(())
 }
 
+pub(super) fn patch_luau_self_value_capture_carrier(
+    chunk: &mut [u8],
+    closure_pc: usize,
+    save_pc: usize,
+    overwrite_pc: usize,
+    target_reg: u8,
+) -> Result<(), String> {
+    use unluac::decompile::DecompileDialect;
+    use unluac::parser::{
+        LuauCaptureKind, LuauOpcode, LuauOperands, ParseOptions, RawInstrOpcode, RawInstrOperands,
+        parse_chunk_with_dialect,
+    };
+
+    let parsed = parse_chunk_with_dialect(DecompileDialect::Luau, chunk, ParseOptions::default())
+        .map_err(|error| format!("parse Luau carrier before patch: {error}"))?;
+    let layout = parsed
+        .header
+        .luau_layout()
+        .ok_or_else(|| "self-value carrier is not a Luau chunk".to_owned())?;
+    if !(3..=7).contains(&layout.bytecode_version) {
+        return Err(format!(
+            "unsupported Luau self-value carrier bytecode version {}",
+            layout.bytecode_version
+        ));
+    }
+    if usize::from(target_reg) >= usize::from(parsed.main.common.frame.max_stack_size) {
+        return Err(format!(
+            "Luau self-value carrier target R{target_reg} exceeds max stack {}",
+            parsed.main.common.frame.max_stack_size
+        ));
+    }
+    if closure_pc.checked_add(2) != Some(save_pc) {
+        return Err(format!(
+            "Luau self-value carrier must keep closure/capture/save adjacent: closure={closure_pc}, save={save_pc}"
+        ));
+    }
+
+    let instrs = &parsed.main.common.instructions;
+    let closure = instrs.get(closure_pc).ok_or_else(|| {
+        format!("Luau self-value carrier closure pc {closure_pc} is out of bounds")
+    })?;
+    let capture_pc = closure_pc + 1;
+    let capture = instrs.get(capture_pc).ok_or_else(|| {
+        format!("Luau self-value carrier capture pc {capture_pc} is out of bounds")
+    })?;
+    let save = instrs
+        .get(save_pc)
+        .ok_or_else(|| format!("Luau self-value carrier save pc {save_pc} is out of bounds"))?;
+    let overwrite = instrs.get(overwrite_pc).ok_or_else(|| {
+        format!("Luau self-value carrier overwrite pc {overwrite_pc} is out of bounds")
+    })?;
+
+    let closure_reg = match (&closure.opcode, &closure.operands) {
+        (
+            RawInstrOpcode::Luau(LuauOpcode::NewClosure | LuauOpcode::DupClosure),
+            RawInstrOperands::Luau(LuauOperands::AD { a, .. }),
+        ) => *a,
+        _ => {
+            return Err(format!(
+                "Luau self-value carrier pc {closure_pc} is not NEWCLOSURE/DUPCLOSURE AD"
+            ));
+        }
+    };
+    match (&capture.opcode, &capture.operands) {
+        (
+            RawInstrOpcode::Luau(LuauOpcode::Capture),
+            RawInstrOperands::Luau(LuauOperands::AB { a, b }),
+        ) if *a == LuauCaptureKind::Val as u8 && *b == closure_reg => {}
+        _ => {
+            return Err(format!(
+                "Luau self-value carrier pc {capture_pc} is not CAPTURE VAL R{closure_reg}"
+            ));
+        }
+    }
+    match (&save.opcode, &save.operands) {
+        (
+            RawInstrOpcode::Luau(LuauOpcode::Move),
+            RawInstrOperands::Luau(LuauOperands::AB { b, .. }),
+        ) if *b == closure_reg => {}
+        _ => {
+            return Err(format!(
+                "Luau self-value carrier pc {save_pc} is not MOVE from R{closure_reg}"
+            ));
+        }
+    }
+    let overwritten_reg = match (&overwrite.opcode, &overwrite.operands) {
+        (
+            RawInstrOpcode::Luau(LuauOpcode::LoadN),
+            RawInstrOperands::Luau(LuauOperands::AD { a, d }),
+        ) if *d == 99 => *a,
+        _ => {
+            return Err(format!(
+                "Luau self-value carrier pc {overwrite_pc} is not LOADN <reg> 99"
+            ));
+        }
+    };
+    if closure_reg == target_reg || overwritten_reg == target_reg {
+        return Err(format!(
+            "Luau self-value carrier already uses target R{target_reg}"
+        ));
+    }
+
+    let closure_offset = closure.origin.span.offset;
+    let capture_offset = capture.origin.span.offset;
+    let save_offset = save.origin.span.offset;
+    let overwrite_offset = overwrite.origin.span.offset;
+    patch_luau_operand_byte(
+        chunk,
+        closure_offset + 1,
+        closure_reg,
+        target_reg,
+        "closure A",
+    )?;
+    patch_luau_operand_byte(
+        chunk,
+        capture_offset + 2,
+        closure_reg,
+        target_reg,
+        "capture B",
+    )?;
+    patch_luau_operand_byte(chunk, save_offset + 2, closure_reg, target_reg, "save B")?;
+    patch_luau_operand_byte(
+        chunk,
+        overwrite_offset + 1,
+        overwritten_reg,
+        target_reg,
+        "overwrite A",
+    )?;
+
+    let reparsed = parse_chunk_with_dialect(DecompileDialect::Luau, chunk, ParseOptions::default())
+        .map_err(|error| format!("parse Luau carrier after patch: {error}"))?;
+    let reparsed_instrs = &reparsed.main.common.instructions;
+    match (
+        reparsed_instrs.get(closure_pc).map(|instr| &instr.operands),
+        reparsed_instrs.get(capture_pc).map(|instr| &instr.operands),
+        reparsed_instrs.get(save_pc).map(|instr| &instr.operands),
+        reparsed_instrs
+            .get(overwrite_pc)
+            .map(|instr| &instr.operands),
+    ) {
+        (
+            Some(RawInstrOperands::Luau(LuauOperands::AD { a, .. })),
+            Some(RawInstrOperands::Luau(LuauOperands::AB { b: capture, .. })),
+            Some(RawInstrOperands::Luau(LuauOperands::AB { b: save, .. })),
+            Some(RawInstrOperands::Luau(LuauOperands::AD { a: overwrite, .. })),
+        ) if *a == target_reg
+            && *capture == target_reg
+            && *save == target_reg
+            && *overwrite == target_reg =>
+        {
+            Ok(())
+        }
+        _ => Err("Luau self-value carrier operands disagree after patch".to_owned()),
+    }
+}
+
+fn patch_luau_operand_byte(
+    chunk: &mut [u8],
+    offset: usize,
+    expected: u8,
+    replacement: u8,
+    field: &str,
+) -> Result<(), String> {
+    let byte = chunk
+        .get_mut(offset)
+        .ok_or_else(|| format!("Luau self-value carrier {field} offset {offset} is truncated"))?;
+    if *byte != expected {
+        return Err(format!(
+            "Luau self-value carrier {field} byte is {}, expected {expected}",
+            *byte
+        ));
+    }
+    *byte = replacement;
+    Ok(())
+}
+
 pub(super) fn read_lua_uint(
     bytes: &[u8],
     cursor: &mut usize,

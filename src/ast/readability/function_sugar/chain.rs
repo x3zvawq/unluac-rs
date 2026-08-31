@@ -7,7 +7,9 @@
 use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_discard_safe_expr;
-use crate::ast::common::{AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstStmt};
+use crate::ast::common::{
+    AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalOrigin, AstStmt,
+};
 
 pub(super) fn try_chain_local_method_call_stmt(
     stmts: &[AstStmt],
@@ -24,6 +26,7 @@ pub(super) fn try_chain_local_method_call_stmt(
     if dead_alias.bindings.len() != 1
         || dead_alias.values.len() != 1
         || dead_alias.bindings[0].attr != AstLocalAttr::None
+        || dead_alias.bindings[0].origin != AstLocalOrigin::Recovered
     {
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
@@ -35,8 +38,6 @@ pub(super) fn try_chain_local_method_call_stmt(
         // 候选拒绝[SemanticBarrier:EvalCount]：`local dead=f()` 即使结果未用也必须执行调用；只有无事件表达式可删除。
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
-    // 证明缺陷[PotentialPolicyViolation]：dead alias 的 DebugHinted origin 未检查；即使 RHS 可安全丢弃，也不应无证据抹掉源码身份。
-
     let chained_binding = single_method_call_local_binding(second)?;
     if use_index.count_uses_in_suffix(stmt_base + 3, chained_binding) != 0 {
         // 候选拒绝[SemanticBarrier:Lifetime]：链中间值在第二次调用后仍被读取，压入 receiver 会删除该共享 local。
@@ -73,14 +74,13 @@ fn single_method_call_local_binding(stmt: &AstStmt) -> Option<AstBindingRef> {
     if local_decl.bindings.len() != 1
         || local_decl.values.len() != 1
         || local_decl.bindings[0].attr != AstLocalAttr::None
+        || local_decl.bindings[0].origin != AstLocalOrigin::Recovered
     {
         return None;
     }
     if !matches!(local_decl.values[0], AstExpr::MethodCall(_)) {
         return None;
     }
-    // 证明缺陷[PotentialUnsoundness:Lifetime]：这里只检查 attr，未拒绝 PhysicalRoot；链化会把原本活到 block 末的 local 提前释放，弱表/`__gc` 可观察。
-    // 证明缺陷[PotentialPolicyViolation]：DebugHinted 的源码身份也会被无条件删去。
     Some(local_decl.bindings[0].id)
 }
 

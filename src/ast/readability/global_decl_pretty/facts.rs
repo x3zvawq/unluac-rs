@@ -1,7 +1,9 @@
 //! 这个子模块负责 `global_decl_pretty` pass 的事实收集。
 //!
-//! 它依赖共享 visitor 在一次遍历里收集“显式 global、嵌套函数写入、读写观测”，不会在这里
-//! 直接插入或合并声明。
+//! 它依赖共享 visitor 的 block pruning 在一次遍历里收集“当前 block 的显式 global、直属
+//! 闭包写入、当前 block 的读写观测”，不会把普通子 block 的 gate 提升到父作用域，也不会
+//! 在这里直接插入或合并声明。观测还会记录它位于当前 block 首个显式 gate 的前后，避免
+//! 把隐式 `global *` 区域误算成受后续声明约束。
 //! 例如：块里读到 `print`、写到 `installer` 时，这里会分别记成常量/可写观测；
 //! 如果块里显式出现了 `global *`，这里也会把 collective gate 作为正式作用域事实留下来。
 
@@ -13,6 +15,7 @@ use crate::ast::common::{
 };
 
 use super::super::visit::{self, AstVisitor};
+use super::super::walk::BlockKind;
 
 #[derive(Clone, Default)]
 pub(super) struct VisibleGlobals {
@@ -32,6 +35,24 @@ impl VisibleGlobals {
     fn collective(&self) -> Option<AstGlobalAttr> {
         self.collective
     }
+
+    pub(super) fn after_stmt(&self, stmt: &AstStmt) -> Self {
+        let mut visible = self.clone();
+        match stmt {
+            AstStmt::GlobalDecl(decl) => GlobalFactsCollector::note_global_decl_bindings(
+                &decl.bindings,
+                &mut visible.names,
+                &mut visible.collective,
+            ),
+            AstStmt::FunctionDecl(function) => {
+                if let Some(name) = global_declared_name(function) {
+                    visible.names.insert(name.to_owned());
+                }
+            }
+            _ => {}
+        }
+        visible
+    }
 }
 
 pub(super) struct BlockFacts {
@@ -39,12 +60,12 @@ pub(super) struct BlockFacts {
     explicit_collective_here: Option<AstGlobalAttr>,
     nested_written_here: BTreeSet<String>,
     observations: Vec<GlobalObservation>,
+    first_explicit_index: Option<usize>,
 }
 
 impl BlockFacts {
     pub(super) fn collect(block: &AstBlock) -> Self {
         let mut collector = GlobalFactsCollector::default();
-        // 证明缺陷[PotentialUnsoundness:Scope]：共享 visitor 会递归普通子 block，导致分支内的显式 `global` 被当成父 block 的 `explicit_here`；随后父作用域 use 可能被错误认定已有 gate。
         visit::visit_block(block, &mut collector);
 
         Self {
@@ -52,19 +73,23 @@ impl BlockFacts {
             explicit_collective_here: collector.explicit_collective_here,
             nested_written_here: collector.nested_written_here,
             observations: collector.observations,
+            first_explicit_index: block.stmts.iter().position(stmt_opens_global_gate),
         }
     }
 
     pub(super) fn infer_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
         let mut missing = MissingGlobals::default();
-        let visible_collective =
-            merge_collective_attr(outer_visible.collective(), self.explicit_collective_here);
         for observation in &self.observations {
-            if outer_visible.contains_name(&observation.name)
-                || self.explicit_here.contains(&observation.name)
-            {
+            if !outer_visible.has_explicit_gate() && !observation.after_explicit_here {
                 continue;
             }
+            if outer_visible.contains_name(&observation.name) || observation.explicit_name_here {
+                continue;
+            }
+            let visible_collective = merge_collective_attr(
+                outer_visible.collective(),
+                observation.explicit_collective_here,
+            );
             match visible_collective {
                 Some(AstGlobalAttr::None) => continue,
                 Some(AstGlobalAttr::Const)
@@ -90,18 +115,12 @@ impl BlockFacts {
         self.explicit_collective_here.is_some() || !self.explicit_here.is_empty()
     }
 
-    pub(super) fn visible_globals(
-        &self,
-        outer_visible: &VisibleGlobals,
-        missing: &MissingGlobals,
-    ) -> VisibleGlobals {
-        let mut visible = outer_visible.clone();
-        visible.names.extend(self.explicit_here.iter().cloned());
-        visible.names.extend(missing.none.iter().cloned());
-        visible.names.extend(missing.const_.iter().cloned());
-        visible.collective =
-            merge_collective_attr(visible.collective, self.explicit_collective_here);
-        visible
+    pub(super) fn missing_insert_at(&self, outer_visible: &VisibleGlobals) -> usize {
+        if outer_visible.has_explicit_gate() {
+            0
+        } else {
+            self.first_explicit_index.map_or(0, |index| index + 1)
+        }
     }
 }
 
@@ -143,6 +162,9 @@ enum GlobalObservationKind {
 struct GlobalObservation {
     name: String,
     kind: GlobalObservationKind,
+    after_explicit_here: bool,
+    explicit_name_here: bool,
+    explicit_collective_here: Option<AstGlobalAttr>,
 }
 
 #[derive(Default)]
@@ -152,6 +174,11 @@ struct GlobalFactsCollector {
     nested_written_here: BTreeSet<String>,
     observations: Vec<GlobalObservation>,
     function_depth: usize,
+    root_seen: bool,
+    direct_explicit_active: bool,
+    pending_direct_global_decl: bool,
+    active_explicit_names: BTreeSet<String>,
+    active_explicit_collective: Option<AstGlobalAttr>,
 }
 
 impl GlobalFactsCollector {
@@ -159,6 +186,9 @@ impl GlobalFactsCollector {
         self.observations.push(GlobalObservation {
             name: name.to_owned(),
             kind,
+            after_explicit_here: self.direct_explicit_active,
+            explicit_name_here: self.active_explicit_names.contains(name),
+            explicit_collective_here: self.active_explicit_collective,
         });
     }
 
@@ -181,6 +211,17 @@ impl GlobalFactsCollector {
 }
 
 impl AstVisitor for GlobalFactsCollector {
+    fn visit_block(&mut self, _block: &AstBlock, _kind: BlockKind) -> bool {
+        if self.function_depth > 0 {
+            return true;
+        }
+        if self.root_seen {
+            return false;
+        }
+        self.root_seen = true;
+        true
+    }
+
     fn visit_stmt(&mut self, stmt: &AstStmt) {
         match stmt {
             AstStmt::GlobalDecl(global_decl) => {
@@ -190,6 +231,7 @@ impl AstVisitor for GlobalFactsCollector {
                         &mut self.explicit_here,
                         &mut self.explicit_collective_here,
                     );
+                    self.pending_direct_global_decl = true;
                 } else {
                     let mut nested_collective = None;
                     Self::note_global_decl_bindings(
@@ -202,10 +244,16 @@ impl AstVisitor for GlobalFactsCollector {
             AstStmt::FunctionDecl(function_decl) => {
                 if let Some(name) = global_declared_name(function_decl) {
                     if self.function_depth == 0 {
-                        self.explicit_here.insert(name);
+                        self.explicit_here.insert(name.to_owned());
+                        self.active_explicit_names.insert(name.to_owned());
+                        self.direct_explicit_active = true;
                     } else {
-                        self.nested_written_here.insert(name);
+                        self.nested_written_here.insert(name.to_owned());
                     }
+                } else if self.function_depth == 0
+                    && let Some(name) = global_function_root_read(function_decl)
+                {
+                    self.note_observation(name, GlobalObservationKind::Read);
                 }
             }
             AstStmt::LocalDecl(_)
@@ -224,6 +272,24 @@ impl AstVisitor for GlobalFactsCollector {
             | AstStmt::Goto(_)
             | AstStmt::Label(_)
             | AstStmt::Error(_) => {}
+        }
+    }
+
+    fn leave_stmt(&mut self, stmt: &AstStmt) {
+        if self.function_depth == 0
+            && matches!(stmt, AstStmt::GlobalDecl(_))
+            && self.pending_direct_global_decl
+        {
+            let AstStmt::GlobalDecl(decl) = stmt else {
+                unreachable!("global declaration shape checked above");
+            };
+            Self::note_global_decl_bindings(
+                &decl.bindings,
+                &mut self.active_explicit_names,
+                &mut self.active_explicit_collective,
+            );
+            self.direct_explicit_active = true;
+            self.pending_direct_global_decl = false;
         }
     }
 
@@ -258,15 +324,34 @@ impl AstVisitor for GlobalFactsCollector {
     }
 }
 
-fn global_declared_name(function_decl: &AstFunctionDecl) -> Option<String> {
-    let path = match &function_decl.target {
-        AstFunctionName::Plain(path) | AstFunctionName::Method(path, _) => path,
+fn global_declared_name(function_decl: &AstFunctionDecl) -> Option<&str> {
+    let AstFunctionName::Plain(path) = &function_decl.target else {
+        return None;
     };
-    // 证明缺陷[PotentialUnsoundness:Scope]：带 fields 的 `function g.f()` 只是读取 `g` 后写字段，并不声明 root global；当前却把 `g` 记成 explicit gate，可能抑制必须的 global 声明。
+    if !path.fields.is_empty() {
+        return None;
+    }
     match &path.root {
-        AstNameRef::Global(global) => Some(global.text.clone()),
+        AstNameRef::Global(global) => Some(global.text.as_str()),
         _ => None,
     }
+}
+
+fn global_function_root_read(function_decl: &AstFunctionDecl) -> Option<&str> {
+    let path = match &function_decl.target {
+        AstFunctionName::Plain(path) if !path.fields.is_empty() => path,
+        AstFunctionName::Method(path, _) => path,
+        AstFunctionName::Plain(_) => return None,
+    };
+    match &path.root {
+        AstNameRef::Global(global) => Some(global.text.as_str()),
+        _ => None,
+    }
+}
+
+fn stmt_opens_global_gate(stmt: &AstStmt) -> bool {
+    matches!(stmt, AstStmt::GlobalDecl(_))
+        || matches!(stmt, AstStmt::FunctionDecl(function) if global_declared_name(function).is_some())
 }
 
 fn merge_collective_attr(

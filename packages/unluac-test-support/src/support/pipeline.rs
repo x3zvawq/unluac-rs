@@ -208,7 +208,7 @@ pub(crate) fn run_pipeline_case(
         )
     })?;
     let assertions = read_readability_assertions(entry.path)?;
-    let baseline = build_case_baseline(entry, suite_label).map_err(|failure| {
+    let mut baseline = build_case_baseline(entry, suite_label).map_err(|failure| {
         TestFailure::new(
             FailureKind::BaselineFailed,
             format!("baseline failed first: {}", failure.summary()),
@@ -217,7 +217,90 @@ pub(crate) fn run_pipeline_case(
     })?;
     let expected_dialect = entry.dialect.decompile_dialect();
 
-    let chunk = compile_manifest_case(entry);
+    let mut chunk = compile_manifest_case(entry);
+    if let LuaCaseExpectation::LuauSelfValueCaptureCarrier {
+        closure_pc,
+        save_pc,
+        overwrite_pc,
+        target_reg,
+    } = entry.expectation
+    {
+        patch_luau_self_value_capture_carrier(
+            &mut chunk,
+            closure_pc,
+            save_pc,
+            overwrite_pc,
+            target_reg,
+        )
+        .map_err(|detail| {
+            TestFailure::new(
+                FailureKind::CompileSourceFailed,
+                "patch Luau self-value carrier failed",
+                detail,
+            )
+        })?;
+        let carrier_path = suite_artifact_path(
+            suite_label,
+            dialect_label,
+            entry.variant,
+            "patched-self-value-carrier",
+            entry.path,
+            toolchain.chunk_extension,
+        );
+        write_output_file(&carrier_path, &chunk).map_err(|detail| {
+            TestFailure::new(
+                FailureKind::CompileSourceFailed,
+                "write patched Luau self-value carrier failed",
+                detail,
+            )
+        })?;
+        let runner = lua_tool_path("luau", "luau-bytecode-runner").map_err(|detail| {
+            TestFailure::new(
+                FailureKind::RunCompiledChunkFailed,
+                "locate Luau bytecode runner failed",
+                detail,
+            )
+        })?;
+        let carrier_output =
+            run_command(&runner, [carrier_path.as_os_str()], "luau-bytecode-runner").map_err(
+                |detail| {
+                    TestFailure::new(
+                        FailureKind::RunCompiledChunkFailed,
+                        "run patched Luau self-value carrier failed",
+                        detail,
+                    )
+                },
+            )?;
+        if !carrier_output.success() {
+            let summary = format!(
+                "patched Luau self-value carrier execution failed (artifact: {}, status: {})",
+                repo_relative_display(&carrier_path),
+                render_status_code(carrier_output.status_code),
+            );
+            return Err(TestFailure::new(
+                FailureKind::CompiledChunkExecutionFailed,
+                summary.clone(),
+                format!("{summary}\n{}", carrier_output.render()),
+            ));
+        }
+        if let Some(diff) = diff_command_outputs(
+            "source",
+            &baseline.source_output,
+            "patched-chunk",
+            &carrier_output,
+        ) {
+            let summary = format!(
+                "source/patched Luau carrier output mismatch (artifact: {})",
+                repo_relative_display(&carrier_path),
+            );
+            return Err(TestFailure::new(
+                FailureKind::SourceChunkOutputMismatch,
+                summary.clone(),
+                format!("{summary}\n{diff}"),
+            ));
+        }
+        baseline.source_output = carrier_output;
+    }
     let result = decompile(&chunk, decompile_options(entry)).map_err(|error| {
         TestFailure::new(
             FailureKind::DecompileFailed,
@@ -595,6 +678,7 @@ pub(crate) fn run_pipeline_case(
         }
         LuaCaseExpectation::Source
         | LuaCaseExpectation::TableSetListResidual
+        | LuaCaseExpectation::LuauSelfValueCaptureCarrier { .. }
         | LuaCaseExpectation::UnsupportedIsland { .. } => {}
     }
 

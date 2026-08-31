@@ -6,7 +6,6 @@
 
 use std::collections::BTreeSet;
 
-use super::super::binding_ref::binding_from_name_ref;
 use super::analysis::function_uses_global_name;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName,
@@ -126,8 +125,6 @@ pub(super) fn function_decl_target_from_lvalue(
             if method_fields.contains(&access.field) {
                 if func.params.is_empty() {
                     // 候选拒绝[SemanticBarrier:Vararg]：零显式参数的 vararg 函数若改成 method，隐式 self 会把 receiver 从 `...` 中消费掉；非 vararg 也缺少首参 provenance。
-                } else if function_captures_name_path_root(func, &root) {
-                    // 候选拒绝[ProofIncomplete]：`obj.f=function(p) return obj end` 与 `function obj:f() return obj end` 看似保留同一 capture；当前没有给出 root capture 必须拒绝的具体不等价反例。
                 } else if function_uses_global_name(func, "self") {
                     // 候选拒绝[SemanticBarrier:Scope]：原函数体的全局 `self` 会被冒号声明隐式创建的局部 self 遮蔽。
                 } else {
@@ -144,14 +141,6 @@ pub(super) fn function_decl_target_from_lvalue(
             ))
         }
         AstLValue::IndexAccess(_) => None,
-    }
-}
-
-fn function_captures_name_path_root(func: &AstFunctionExpr, root: &AstNameRef) -> bool {
-    match root {
-        AstNameRef::Param(param) => func.captured_params.contains(param),
-        _ => binding_from_name_ref(root)
-            .is_some_and(|binding| func.captured_bindings.contains(&binding)),
     }
 }
 

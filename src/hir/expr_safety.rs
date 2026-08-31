@@ -41,44 +41,26 @@ pub(crate) fn primitive_literal_comparison_value(
     }
 }
 
-/// Luau 的 number 加法在两个原始数字操作数上走 VM 数值路径，不查用户元方法。
+/// Luau 的 number 加法在两个原始数字操作数上走 VM 的 IEEE 754 binary64 路径，
+/// 不查用户元方法。
 ///
 /// `HirExpr::Integer` 也可能来自 Luau 的 `LOADN`，并不代表 PUC Lua 的
-/// `lua_Integer` 语义；因此这里只在调用方已确认目标是 Luau 时使用，并把两种
-/// HIR 数字都先放进可精确表示的整数范围。超出范围、非有限数和负零都保留原
-/// 运算，避免宿主 `f64` 舍入或符号位成为可观察差异。
+/// `lua_Integer` 语义；因此这里只在调用方已确认目标是 Luau 时使用，并先把两种
+/// HIR 数字统一到 Luau 唯一的 `f64` 数值域。这样由宿主执行同一次 binary64 加法，
+/// 会自然保留舍入、溢出和负零结果。
 pub(crate) fn luau_literal_addition_value(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    const MAX_EXACT_INTEGER: i128 = 1_i128 << 53;
-
-    fn exact_integer(expr: &HirExpr) -> Option<i128> {
+    fn number(expr: &HirExpr) -> Option<f64> {
         match expr {
-            HirExpr::Integer(value) => {
-                let value = i128::from(*value);
-                (-(MAX_EXACT_INTEGER)..=MAX_EXACT_INTEGER)
-                    .contains(&value)
-                    .then_some(value)
-            }
-            HirExpr::Number(value)
-                if value.is_finite()
-                    && !(*value == 0.0 && value.is_sign_negative())
-                    && value.fract() == 0.0
-                    && value.abs() <= MAX_EXACT_INTEGER as f64 =>
-            {
-                let integer = *value as i128;
-                (integer as f64 == *value
-                    && (-(MAX_EXACT_INTEGER)..=MAX_EXACT_INTEGER).contains(&integer))
-                .then_some(integer)
+            HirExpr::Integer(value) => Some(*value as f64),
+            HirExpr::Number(value) => Some(*value),
+            HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Neg => {
+                number(&unary.expr).map(std::ops::Neg::neg)
             }
             _ => None,
         }
     }
 
-    let value = exact_integer(lhs)?.checked_add(exact_integer(rhs)?)?;
-    if !(-(MAX_EXACT_INTEGER)..=MAX_EXACT_INTEGER).contains(&value) {
-        return None;
-    }
-    let result = value as f64;
-    (result as i128 == value).then_some(HirExpr::Number(result))
+    Some(HirExpr::Number(number(lhs)? + number(rhs)?))
 }
 
 /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
@@ -131,6 +113,18 @@ pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
 /// 该谓词不等同于“可丢弃”：它只接纳不会调用元方法、不会读取动态环境、也不会
 /// 产生新对象身份的稳定值。代数改写仍需保证被跨越的其他表达式也满足本谓词。
 pub(crate) fn expr_is_repeatable(expr: &HirExpr) -> bool {
+    expr_is_repeatable_with_context(expr, false)
+}
+
+/// 表达式作为普通单值操作数时，是否可以合并重复求值。
+///
+/// `HirExpr::VarArg` 在这里已经由逻辑/比较等外层表达式收成首个值，不再具有
+/// value-pack tail 的展开宽度，因此同一函数调用中的两次读取稳定且无事件。
+pub(crate) fn expr_is_repeatable_in_single_value_context(expr: &HirExpr) -> bool {
+    expr_is_repeatable_with_context(expr, true)
+}
+
+fn expr_is_repeatable_with_context(expr: &HirExpr, single_value_vararg: bool) -> bool {
     match expr {
         HirExpr::Nil
         | HirExpr::Boolean(_)
@@ -145,7 +139,10 @@ pub(crate) fn expr_is_repeatable(expr: &HirExpr) -> bool {
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_) => true,
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => expr_is_repeatable(&unary.expr),
+        HirExpr::VarArg => single_value_vararg,
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            expr_is_repeatable_with_context(&unary.expr, single_value_vararg)
+        }
         HirExpr::Binary(binary)
             if primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
                 .is_some() =>
@@ -153,10 +150,12 @@ pub(crate) fn expr_is_repeatable(expr: &HirExpr) -> bool {
             true
         }
         HirExpr::Binary(binary) if stable_literal_equality(binary.op, &binary.lhs, &binary.rhs) => {
-            expr_is_repeatable(&binary.lhs) && expr_is_repeatable(&binary.rhs)
+            expr_is_repeatable_with_context(&binary.lhs, single_value_vararg)
+                && expr_is_repeatable_with_context(&binary.rhs, single_value_vararg)
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_is_repeatable(&logical.lhs) && expr_is_repeatable(&logical.rhs)
+            expr_is_repeatable_with_context(&logical.lhs, single_value_vararg)
+                && expr_is_repeatable_with_context(&logical.rhs, single_value_vararg)
         }
         HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
@@ -164,7 +163,6 @@ pub(crate) fn expr_is_repeatable(expr: &HirExpr) -> bool {
         | HirExpr::Binary(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)
-        | HirExpr::VarArg
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => false,
@@ -191,6 +189,55 @@ fn is_metamethod_inert_literal(expr: &HirExpr) -> bool {
             | HirExpr::Vector(_)
             | HirExpr::Complex { .. }
     )
+}
+
+/// 单值表达式的结果是否不会被夹在两次读取之间的任意 Lua 求值改写。
+///
+/// local、param 与 upvalue 都可能被中间调用经 closure capture 写入；temp 是 HIR
+/// 已物化且 Lua 代码无法按名字访问的快照，vararg 则在函数入口固定。
+pub(crate) fn expr_is_effect_invariant_in_single_value_context(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::TempRef(_)
+        | HirExpr::VarArg => true,
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            expr_is_effect_invariant_in_single_value_context(&unary.expr)
+        }
+        HirExpr::Binary(binary)
+            if primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
+                .is_some() =>
+        {
+            true
+        }
+        HirExpr::Binary(binary) if stable_literal_equality(binary.op, &binary.lhs, &binary.rhs) => {
+            expr_is_effect_invariant_in_single_value_context(&binary.lhs)
+                && expr_is_effect_invariant_in_single_value_context(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_is_effect_invariant_in_single_value_context(&logical.lhs)
+                && expr_is_effect_invariant_in_single_value_context(&logical.rhs)
+        }
+        HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::Unary(_)
+        | HirExpr::Binary(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Call(_)
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => false,
+    }
 }
 
 pub(crate) fn expr_observes_eval_order(expr: &HirExpr) -> bool {

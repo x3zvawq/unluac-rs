@@ -4,6 +4,7 @@
 //! - `local r = expr; local f = r.method; local x = f(r)` -> `local x = expr:method()`
 //! - `local r = expr; local f = r.method; local x = wrap(f(r))` 在外层前缀稳定时收回嵌套调用
 //! - `local r = expr; local x = r.method(r)` -> `local x = expr:method()`
+//! - `local r = ...; local x = { r.method(r) }` -> `local x = { (...):method() }`
 //!
 //! 普通 `obj.method(obj)` 不足以证明 method call：字段查询可能通过 `__index` 改写
 //! `obj`，而冒号调用只会求值一次 receiver。没有独立 receiver 快照的形状必须保留。
@@ -12,10 +13,10 @@
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
 use super::super::binding_ref::name_matches_binding;
-use super::super::expr_analysis::{expr_requires_ordered_snapshot, is_context_safe_expr};
+use super::super::expr_analysis::expr_requires_ordered_snapshot;
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstGlobalDecl, AstIf,
-    AstLocalAttr, AstMethodCallExpr, AstReturn, AstStmt,
+    AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstReturn, AstStmt,
 };
 
 pub(super) fn try_recover_method_alias_stmt(
@@ -111,20 +112,20 @@ fn try_recover_receiver_alias_direct_method_call(
         // 候选拒绝[SemanticBarrier:EvalCount]：direct 形状仍要求 receiver 恰好用于 lookup 和首参，额外 use 不能随 alias 删除。
         return None;
     }
-    if !is_context_safe_expr(receiver_expr) {
-        // 候选拒绝[ProofIncomplete]：相邻 `local r=expr; r.m(r)` 与 `expr:m()` 都只求值一次且事件次序一致；当前纯度白名单缺少必须排除任意 expr 的具体反例，可扩展为基于事件序列的证明。
-        return None;
-    }
-
     Some((
         rewrite_single_expr_sink_stmt(sink, |value| {
-            rewrite_method_call_expr_in_order(value, mutable_snapshots, |expr| {
-                recover_direct_method_call_with_receiver_alias_expr(
-                    expr,
-                    receiver_binding,
-                    receiver_expr,
-                )
-            })
+            rewrite_method_call_expr_in_order(
+                value,
+                mutable_snapshots,
+                expr_prefix_is_stable(receiver_expr, mutable_snapshots),
+                |expr| {
+                    recover_direct_method_call_with_receiver_alias_expr(
+                        expr,
+                        receiver_binding,
+                        receiver_expr,
+                    )
+                },
+            )
         })?,
         2,
     ))
@@ -137,11 +138,10 @@ fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> 
     if local_decl.bindings.len() != 1
         || local_decl.values.len() != 1
         || local_decl.bindings[0].attr != AstLocalAttr::None
+        || local_decl.bindings[0].origin != AstLocalOrigin::Recovered
     {
         return None;
     }
-    // 证明缺陷[PotentialUnsoundness:Lifetime]：未检查 PhysicalRoot；删除 alias 会把本应活到 block 末的 root 缩短到调用结束，弱表/`__gc` 可观察。
-    // 证明缺陷[PotentialPolicyViolation]：未检查 DebugHinted，带调试身份的源码 local 也会被删除。
     Some((local_decl.bindings[0].id, &local_decl.values[0]))
 }
 
@@ -216,7 +216,7 @@ fn recover_method_call_expr(
     mutable_snapshots: &MutableSnapshotNames,
     receiver_matches: &dyn Fn(&AstExpr) -> bool,
 ) -> Option<AstExpr> {
-    rewrite_method_call_expr_in_order(expr, mutable_snapshots, |expr| {
+    rewrite_method_call_expr_in_order(expr, mutable_snapshots, false, |expr| {
         if let AstExpr::Call(call) = expr
             && let Some(method_call) = recover_method_call(
                 call,
@@ -262,6 +262,7 @@ fn recover_method_call(
 fn rewrite_method_call_expr_in_order<F>(
     expr: &AstExpr,
     mutable_snapshots: &MutableSnapshotNames,
+    can_cross_table_allocation: bool,
     try_rewrite_here: F,
 ) -> Option<AstExpr>
 where
@@ -277,14 +278,18 @@ where
             unary.expr = rewrite_method_call_expr_in_order(
                 &unary.expr,
                 mutable_snapshots,
+                can_cross_table_allocation,
                 try_rewrite_here,
             )?;
             Some(rewritten)
         }
         AstExpr::Binary(binary) => {
-            if let Some(lhs) =
-                rewrite_method_call_expr_in_order(&binary.lhs, mutable_snapshots, try_rewrite_here)
-            {
+            if let Some(lhs) = rewrite_method_call_expr_in_order(
+                &binary.lhs,
+                mutable_snapshots,
+                can_cross_table_allocation,
+                try_rewrite_here,
+            ) {
                 binary.lhs = lhs;
                 return Some(rewritten);
             }
@@ -295,6 +300,7 @@ where
             binary.rhs = rewrite_method_call_expr_in_order(
                 &binary.rhs,
                 mutable_snapshots,
+                can_cross_table_allocation,
                 try_rewrite_here,
             )?;
             Some(rewritten)
@@ -304,14 +310,18 @@ where
             logical.lhs = rewrite_method_call_expr_in_order(
                 &logical.lhs,
                 mutable_snapshots,
+                can_cross_table_allocation,
                 try_rewrite_here,
             )?;
             Some(rewritten)
         }
         AstExpr::Call(call) => {
-            if let Some(callee) =
-                rewrite_method_call_expr_in_order(&call.callee, mutable_snapshots, try_rewrite_here)
-            {
+            if let Some(callee) = rewrite_method_call_expr_in_order(
+                &call.callee,
+                mutable_snapshots,
+                can_cross_table_allocation,
+                try_rewrite_here,
+            ) {
                 call.callee = callee;
                 return Some(rewritten);
             }
@@ -320,9 +330,12 @@ where
                 return None;
             }
             for arg in &mut call.args {
-                if let Some(value) =
-                    rewrite_method_call_expr_in_order(arg, mutable_snapshots, try_rewrite_here)
-                {
+                if let Some(value) = rewrite_method_call_expr_in_order(
+                    arg,
+                    mutable_snapshots,
+                    can_cross_table_allocation,
+                    try_rewrite_here,
+                ) {
                     *arg = value;
                     return Some(rewritten);
                 }
@@ -338,6 +351,7 @@ where
             call.receiver = rewrite_method_call_expr_in_order(
                 &call.receiver,
                 mutable_snapshots,
+                can_cross_table_allocation,
                 try_rewrite_here,
             )?;
             Some(rewritten)
@@ -346,14 +360,18 @@ where
             access.base = rewrite_method_call_expr_in_order(
                 &access.base,
                 mutable_snapshots,
+                can_cross_table_allocation,
                 try_rewrite_here,
             )?;
             Some(rewritten)
         }
         AstExpr::IndexAccess(access) => {
-            if let Some(base) =
-                rewrite_method_call_expr_in_order(&access.base, mutable_snapshots, try_rewrite_here)
-            {
+            if let Some(base) = rewrite_method_call_expr_in_order(
+                &access.base,
+                mutable_snapshots,
+                can_cross_table_allocation,
+                try_rewrite_here,
+            ) {
                 access.base = base;
                 return Some(rewritten);
             }
@@ -364,13 +382,18 @@ where
             access.index = rewrite_method_call_expr_in_order(
                 &access.index,
                 mutable_snapshots,
+                can_cross_table_allocation,
                 try_rewrite_here,
             )?;
             Some(rewritten)
         }
         AstExpr::SingleValue(inner) => {
-            **inner =
-                rewrite_method_call_expr_in_order(inner, mutable_snapshots, try_rewrite_here)?;
+            **inner = rewrite_method_call_expr_in_order(
+                inner,
+                mutable_snapshots,
+                can_cross_table_allocation,
+                try_rewrite_here,
+            )?;
             Some(rewritten)
         }
         AstExpr::Nil
@@ -386,8 +409,57 @@ where
         | AstExpr::VarArg
         | AstExpr::FunctionExpr(_)
         | AstExpr::Error(_) => None,
-        AstExpr::TableConstructor(_) => {
-            // 候选拒绝[ProofIncomplete]：table 字段有严格的 key/value 与尾部多值顺序；当前没有字段级稳定前缀 walker，故整类拒绝，未来可复用 ordered-event 证明。
+        AstExpr::TableConstructor(table) => {
+            if !can_cross_table_allocation {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：table 在首字段前已分配；三语句 alias 会把先前的 `r.method` lookup 搬到分配后，两语句 direct 形状也只有稳定 receiver initializer 才能跨过它。
+                return None;
+            }
+            for field in &mut table.fields {
+                match field {
+                    crate::ast::common::AstTableField::Array(value) => {
+                        if let Some(next) = rewrite_method_call_expr_in_order(
+                            value,
+                            mutable_snapshots,
+                            can_cross_table_allocation,
+                            try_rewrite_here,
+                        ) {
+                            *value = next;
+                            return Some(rewritten);
+                        }
+                        if !expr_prefix_is_stable(value, mutable_snapshots) {
+                            return None;
+                        }
+                    }
+                    crate::ast::common::AstTableField::Record(record) => {
+                        if let crate::ast::common::AstTableKey::Expr(key) = &mut record.key {
+                            if let Some(next) = rewrite_method_call_expr_in_order(
+                                key,
+                                mutable_snapshots,
+                                can_cross_table_allocation,
+                                try_rewrite_here,
+                            ) {
+                                *key = next;
+                                return Some(rewritten);
+                            }
+                            if !expr_prefix_is_stable(key, mutable_snapshots) {
+                                return None;
+                            }
+                        }
+                        if let Some(next) = rewrite_method_call_expr_in_order(
+                            &record.value,
+                            mutable_snapshots,
+                            can_cross_table_allocation,
+                            try_rewrite_here,
+                        ) {
+                            record.value = next;
+                            return Some(rewritten);
+                        }
+                        if !expr_prefix_is_stable(&record.value, mutable_snapshots) {
+                            return None;
+                        }
+                    }
+                }
+            }
             None
         }
     }

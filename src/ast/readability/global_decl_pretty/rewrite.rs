@@ -3,8 +3,8 @@
 //! 它依赖 `facts/insert/merge` 和共享 scoped walker，只负责在 block 作用域链上协调
 //! merge + 可见 global 集维护，不会在这里重写普通表达式 sugar。
 //! 例如：块前缀上一串 seed local + `global` run 会在这里先合并；Lua 5.5 的 missing
-//! global 前导只会在“当前作用域已经有显式 global 证据”时才从观测推断，因为默认
-//! `global *` 与 stripped bytecode 下的纯声明形式并不总是可区分。
+//! global 声明只会在“当前作用域已经有显式 global 证据”时才从观测推断，并放回原 gate
+//! 的激活点；默认 `global *` 与 stripped bytecode 下的纯声明形式并不总是可区分。
 
 use super::super::ReadabilityContext;
 use super::super::walk::{BlockKind, ScopedAstRewritePass, rewrite_module_scoped};
@@ -67,11 +67,31 @@ impl ScopedAstRewritePass for GlobalDeclPrettyPass {
             changed = true;
         }
         if !missing.is_empty() {
-            insert_missing_global_decls(block, &missing);
+            let insert_at = facts.missing_insert_at(outer_declared);
+            insert_missing_global_decls(block, &missing, insert_at);
             changed = true;
         }
 
-        let visible = facts.visible_globals(outer_declared, &missing);
-        (changed, visible)
+        (changed, outer_declared.clone())
+    }
+
+    fn scope_for_stmt_children(
+        &mut self,
+        stmt: &crate::ast::common::AstStmt,
+        scope: &Self::Scope,
+    ) -> Self::Scope {
+        if matches!(stmt, crate::ast::common::AstStmt::FunctionDecl(_)) {
+            scope.after_stmt(stmt)
+        } else {
+            scope.clone()
+        }
+    }
+
+    fn scope_after_stmt(
+        &mut self,
+        stmt: &crate::ast::common::AstStmt,
+        scope: &Self::Scope,
+    ) -> Self::Scope {
+        scope.after_stmt(stmt)
     }
 }

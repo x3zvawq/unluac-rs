@@ -21,7 +21,7 @@ use super::super::installer_iife::function_expr_is_substantial;
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField, AstTableKey,
+    AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstReturn, AstStmt, AstTableField, AstTableKey,
 };
 
 pub(super) fn try_inline_terminal_constructor_fields(
@@ -166,6 +166,22 @@ pub(super) fn try_inline_terminal_constructor_call(
     }
 
     let sink = stmts.get(consumed)?;
+    if use_index.count_uses_in_range(
+        stmt_base + consumed,
+        stmt_base + consumed + 1,
+        callee_binding,
+    ) != 1
+        || arg_locals.iter().any(|arg| {
+            use_index.count_uses_in_range(
+                stmt_base + consumed,
+                stmt_base + consumed + 1,
+                arg.binding,
+            ) != usize::from(arg.pass_to_sink)
+        })
+    {
+        // 候选拒绝[SemanticBarrier:Scope]：sink 内除目标 call 外再读 callee/arg 时，删除声明会留下未绑定 use；每个 active handoff 必须恰好出现一次，已嵌套消费的 arg 必须为零次。
+        return None;
+    }
     let rewritten_sink =
         rewrite_terminal_constructor_call_sink(sink, callee_binding, callee_expr, &arg_locals)?;
     if !matches!(sink, AstStmt::Return(_))
@@ -179,8 +195,6 @@ pub(super) fn try_inline_terminal_constructor_call(
         // 候选拒绝[SemanticBarrier:Scope]：非终端 sink 后若仍引用被消除的 callee/arg local，内联会留下未绑定 use。
         return None;
     }
-    // 证明缺陷[PotentialUnsoundness:Lifetime]：dead-after-sink 不等于词法 root 已死亡；PhysicalRoot local 原本活到 block 末，内联可提前触发弱表消失或 `__gc`。
-    // 证明缺陷[PotentialPolicyViolation]：callee/arg 的 DebugHinted origin 未检查，源码身份会被无条件抹掉。
     Some((rewritten_sink, consumed + 1))
 }
 
@@ -199,6 +213,10 @@ fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> 
         return None;
     }
     if local_decl.bindings[0].attr != AstLocalAttr::None {
+        return None;
+    }
+    if local_decl.bindings[0].origin != AstLocalOrigin::Recovered {
+        // 候选拒绝[PolicyBoundary]：DebugHinted 的源码声明身份保留；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须活到原 block 末。
         return None;
     }
     Some((local_decl.bindings[0].id, &local_decl.values[0]))
@@ -297,6 +315,10 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
         // 候选拒绝[SemanticBarrier:Identity]：不能把 table 接到自身，且已被某次嵌套接线消费的 inner 不能再复制到第二个字段。
         return false;
     }
+    if outer_index + 1 != inner_index {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：只有 `outer` 紧邻先于 `inner` 时，折入字段仍按 outer、inner 的原顺序构造；反向或跨 initializer 会重排事件。
+        return false;
+    }
 
     let inner_value = arg_locals[inner_index].value.clone();
     let AstExpr::TableConstructor(_) = inner_value else {
@@ -305,8 +327,6 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     let AstExpr::TableConstructor(table) = &mut arg_locals[outer_index].value else {
         return false;
     };
-
-    // 证明缺陷[PotentialUnsoundness:EvalOrder]：未证明 inner/outer 在 arg-local run 中相邻且同序；把 inner constructor 搬入 outer 字段会跨过中间 initializer（如 `h()`），可把 `outer; h(); inner` 的事件改成 `outer(inner); h()`。
 
     // 这里专门收回“先建内层 methods table，再接到外层 metadata 字段”的机械接线。
     // 它只在内层 table 仍是独立 constructor local 时触发，不会把任意普通变量赋值猜成

@@ -142,8 +142,8 @@ impl<'a> Emitter<'a> {
         self.target.caps.global_decl
             && matches!(
                 &function_decl.target,
-                AstFunctionName::Plain(path) | AstFunctionName::Method(path, _)
-                    if matches!(path.root, AstNameRef::Global(_))
+                AstFunctionName::Plain(path)
+                    if path.fields.is_empty() && matches!(path.root, AstNameRef::Global(_))
             )
     }
 }

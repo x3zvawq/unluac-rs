@@ -4,7 +4,7 @@
 //! `msvcbuild.bat` 和 Luau 的 CMake，统一输出到 `lua/build`，供 CLI 与测试复用。
 
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -19,13 +19,21 @@ const LUAJIT_REV: &str = "659a61693aa3b87661864ad0f12eee14c865cd7f";
 const LUAJIT_BRANCH: &str = "v2.1";
 const LUAU_URL: &str = "https://github.com/luau-lang/luau/archive/refs/tags/0.713.tar.gz";
 const LUAU_EXTRACTED_DIR: &str = "luau-0.713";
-const LUAU_TARGETS: &[&str] = &["luau", "luau-analyze", "luau-compile", "luau-bytecode"];
+const LUAU_UPSTREAM_TARGETS: &[&str] = &["luau", "luau-analyze", "luau-compile", "luau-bytecode"];
+const LUAU_TARGETS: &[&str] = &[
+    "luau",
+    "luau-analyze",
+    "luau-compile",
+    "luau-bytecode",
+    "luau-bytecode-runner",
+];
 #[cfg(windows)]
 const LUAU_CMAKE_TARGETS: &[&str] = &[
     "Luau.Repl.CLI",
     "Luau.Analyze.CLI",
     "Luau.Compile.CLI",
     "Luau.Bytecode.CLI",
+    "Luau.BytecodeRunner.CLI",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -482,12 +490,13 @@ fn build_luau(root: &Path, toolchain: &Toolchain) -> Result<()> {
     let source = source_dir(root, toolchain);
     let build = build_dir(root, toolchain);
 
-    run_command("make", ["clean"], &source)?;
+    run_command("make", ["config=release", "clean"], &source)?;
     run_command(
         "make",
-        std::iter::once("config=release").chain(LUAU_TARGETS.iter().copied()),
+        std::iter::once("config=release").chain(LUAU_UPSTREAM_TARGETS.iter().copied()),
         &source,
     )?;
+    build_luau_bytecode_runner_unix(root, &source)?;
 
     reset_build_dir(&build)?;
     for target in LUAU_TARGETS {
@@ -498,6 +507,28 @@ fn build_luau(root: &Path, toolchain: &Toolchain) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn build_luau_bytecode_runner_unix(root: &Path, source: &Path) -> Result<()> {
+    let compiler = env::var("CXX").unwrap_or_else(|_| "c++".to_owned());
+    let output = source.join("build/release/luau-bytecode-runner");
+    let args = vec![
+        OsString::from("-std=c++17"),
+        OsString::from("-O2"),
+        OsString::from("-DNDEBUG"),
+        OsString::from("-ICommon/include"),
+        OsString::from("-IVM/include"),
+        root.join("lua/patches/luau/BytecodeRunner.cpp")
+            .into_os_string(),
+        source.join("build/release/libluauvm.a").into_os_string(),
+        source
+            .join("build/release/libluaucommon.a")
+            .into_os_string(),
+        OsString::from("-o"),
+        output.into_os_string(),
+    ];
+    run_command(&compiler, args, source)
 }
 
 #[cfg(windows)]
@@ -512,11 +543,12 @@ fn build_luau(root: &Path, toolchain: &Toolchain) -> Result<()> {
     // 该选项让上游启用 longjmp 错误路径。固定源码是 UTF-8，显式指定编码以避免本地代码页
     // 触发 C4819 并误读源文件。
     let command = format!(
-        "call {} -arch={} -no_logo && cmake -S {} -B {} -G Ninja -DCMAKE_BUILD_TYPE=Release -DLUAU_BUILD_TESTS=OFF -DLUAU_BUILD_WEB=OFF -DLUAU_BUILD_CLI=ON -DLUAU_EXTERN_C=ON -DCMAKE_CXX_FLAGS=/utf-8 -DCMAKE_C_FLAGS=/utf-8 && cmake --build {} --target {} --parallel",
+        "call {} -arch={} -no_logo && cmake -S {} -B {} -G Ninja -DCMAKE_BUILD_TYPE=Release -DLUAU_SOURCE_DIR={} -DLUAU_EXTERN_C=ON -DCMAKE_CXX_FLAGS=/utf-8 -DCMAKE_C_FLAGS=/utf-8 && cmake --build {} --target {} --parallel",
         windows_cmd_path(&vsdevcmd),
         windows_visual_studio_architecture(),
-        windows_cmd_path(&source),
+        windows_cmd_path(&root.join("lua/patches/luau")),
         windows_cmd_path(&temporary),
+        windows_cmd_path(&source),
         windows_cmd_path(&temporary),
         LUAU_CMAKE_TARGETS.join(" "),
     );

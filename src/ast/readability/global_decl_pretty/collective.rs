@@ -14,11 +14,9 @@
 use std::collections::BTreeSet;
 
 use crate::ast::common::{
-    AstBlock, AstExpr, AstFunctionExpr, AstGlobalAttr, AstLValue, AstLocalAttr, AstLocalBinding,
-    AstLocalFunctionDecl, AstLocalOrigin, AstNameRef, AstStmt,
+    AstBlock, AstExpr, AstFunctionExpr, AstGlobalAttr, AstLValue, AstNameRef, AstStmt,
 };
 
-use super::super::binding_flow::{BindingRefSet, stmt_references_binding_set};
 use super::super::visit::{self, AstVisitor};
 use super::super::walk::BlockKind;
 use super::facts::MissingGlobals;
@@ -43,31 +41,10 @@ pub(super) fn try_wrap_missing_collective_suffix(
     let Some(start) = start else {
         return false;
     };
-    let end = block
-        .stmts
-        .iter()
-        .rposition(|stmt| stmt_mentions_any_missing_global(stmt, &names));
-    let Some(mut end) = end else {
-        return false;
-    };
-
-    loop {
-        let bindings = collect_declared_bindings(&block.stmts[start..=end]);
-        let binding_refs = BindingRefSet::from_bindings(&bindings);
-        let Some(next_offset) = block.stmts[(end + 1)..]
-            .iter()
-            .position(|stmt| stmt_references_binding_set(stmt, &binding_refs))
-        else {
-            break;
-        };
-        end += next_offset + 1;
-    }
-
-    if end + 1 != block.stmts.len() {
-        // 候选拒绝[SemanticBarrier:Scope]：非终端区间包进 `do` 会让其中 local 在后续语句前离开作用域；例如后缀外 `use(local_from_range)` 将失去绑定。
-        return false;
-    }
-    if !suffix_is_safe_to_wrap(&block.stmts[start..]) {
+    if has_incoming_goto(block, start) {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：`goto L; use(missing); ::L::` 若把
+        // suffix 改成 `do; global *; use(missing); ::L::; end`，会令原本合法的 goto
+        // 跳入新 gate，生成源码无法编译。
         return false;
     }
 
@@ -88,65 +65,50 @@ fn collective_candidate(missing: &MissingGlobals) -> Option<(AstGlobalAttr, BTre
             missing.const_.iter().cloned().collect(),
         )),
         (false, true) => Some((AstGlobalAttr::None, missing.none.iter().cloned().collect())),
-        _ => {
-            // 候选拒绝[ProofIncomplete]：可写与 const 缺失名混合时，一个 wildcard gate 无法表达两种属性；尚未实现双层最小 gate/逐名声明的 canonical 代价证明。
+        (false, false) => {
+            // 候选拒绝[TargetConstraint]：Lua 5.5 的单个 wildcard gate 只能携带一种属性，无法同时表达可写与 const 缺失名；混合形状由逐名声明精确表达。
             None
         }
+        (true, true) => None,
     }
 }
 
-fn suffix_is_safe_to_wrap(stmts: &[AstStmt]) -> bool {
-    if stmts
+fn has_incoming_goto(block: &AstBlock, start: usize) -> bool {
+    let suffix_labels = block.stmts[start..]
         .iter()
-        .any(|stmt| matches!(stmt, AstStmt::Goto(_) | AstStmt::Label(_)))
-    {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：外部 goto 可能跳入新增 global gate/local 作用域，或 suffix 内跳转跨越新边界；没有全 block 跳转配对证明时不能包 `do`。
+        .filter_map(|stmt| match stmt {
+            AstStmt::Label(label) => Some(label.id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if suffix_labels.is_empty() {
         return false;
     }
-    if stmts
-        .iter()
-        .any(|stmt| matches!(stmt, AstStmt::Break | AstStmt::Continue))
-    {
-        // 候选拒绝[ProofIncomplete]：`do` 本身不拥有 loop-control，直接 break/continue 很可能可保留；当前缺少 goto-syntax-safety/owner 联合证明，整类保守拒绝。
-        return false;
+
+    let mut visitor = IncomingGotoVisitor {
+        suffix_labels: &suffix_labels,
+        found: false,
+    };
+    for stmt in &block.stmts[..start] {
+        visit::visit_stmt(stmt, &mut visitor);
     }
-    true
+    visitor.found
 }
 
-fn collect_declared_bindings(stmts: &[AstStmt]) -> Vec<AstLocalBinding> {
-    let mut bindings = Vec::new();
-    for stmt in stmts {
-        match stmt {
-            AstStmt::LocalDecl(local_decl) => bindings.extend(local_decl.bindings.iter().cloned()),
-            AstStmt::LocalFunctionDecl(function_decl) => {
-                bindings.push(synthetic_binding_for_local_function(function_decl.as_ref()));
-            }
-            AstStmt::Assign(_)
-            | AstStmt::CallStmt(_)
-            | AstStmt::Return(_)
-            | AstStmt::GlobalDecl(_)
-            | AstStmt::If(_)
-            | AstStmt::While(_)
-            | AstStmt::Repeat(_)
-            | AstStmt::NumericFor(_)
-            | AstStmt::GenericFor(_)
-            | AstStmt::DoBlock(_)
-            | AstStmt::FunctionDecl(_)
-            | AstStmt::Break
-            | AstStmt::Continue
-            | AstStmt::Goto(_)
-            | AstStmt::Label(_)
-            | AstStmt::Error(_) => {}
+struct IncomingGotoVisitor<'a> {
+    suffix_labels: &'a BTreeSet<crate::ast::common::AstLabelId>,
+    found: bool,
+}
+
+impl AstVisitor for IncomingGotoVisitor<'_> {
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        if let AstStmt::Goto(goto_) = stmt {
+            self.found |= self.suffix_labels.contains(&goto_.target);
         }
     }
-    bindings
-}
 
-fn synthetic_binding_for_local_function(function_decl: &AstLocalFunctionDecl) -> AstLocalBinding {
-    AstLocalBinding {
-        id: function_decl.name,
-        attr: AstLocalAttr::None,
-        origin: AstLocalOrigin::Recovered,
+    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
+        false
     }
 }
 

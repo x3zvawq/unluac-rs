@@ -2,7 +2,13 @@
 
 use super::*;
 
-pub(super) const REGRESSION_CASES_329: &[LuaCaseMatrixEntry] = &[LuaCaseMatrixEntry::new(
-    "tests/regress-case/regress_329_closure_self_capture.lua",
-    PUC_LUA_51,
-)];
+pub(super) const REGRESSION_CASES_329: &[LuaCaseMatrixEntry] = &[
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_329_closure_self_capture.lua",
+        PUC_LUA_51,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_329_closure_self_capture.lua",
+        PUC_LUA_54,
+    ),
+];

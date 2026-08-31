@@ -1,15 +1,15 @@
 //! 这个子模块负责把一串 seed local 运行合并成更自然的 global decl 形状。
 //!
 //! 它依赖 binding-flow/binding-tree 已确认这些 local 只是过渡壳，不会越权去推断缺失的
-//! global 名称来源。
+//! global 名称来源。接受候选必须是同序精确双射，且只删除无 provenance/lifetime 约束的
+//! Recovered seed。
 //! 例如：连续的 `local g = _ENV.g` seed 运行，会在这里尝试折成一条更紧凑的 global 声明。
-
-use std::collections::BTreeSet;
 
 use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::binding_from_name_ref;
 use crate::ast::common::{
-    AstBindingRef, AstBlock, AstExpr, AstGlobalBinding, AstGlobalDecl, AstLocalAttr, AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstGlobalBinding, AstGlobalDecl, AstLocalAttr,
+    AstLocalBinding, AstLocalOrigin, AstStmt,
 };
 
 pub(super) fn merge_seed_global_runs(block: &mut AstBlock) -> bool {
@@ -39,7 +39,7 @@ fn try_merge_seed_global_run(
     use_index: &BindingUseIndex,
     start: usize,
 ) -> Option<(AstStmt, usize)> {
-    let mut seeds = Vec::<(AstBindingRef, AstExpr)>::new();
+    let mut seeds = Vec::<(AstLocalBinding, AstExpr)>::new();
     let mut index = start;
     while let Some(stmt) = stmts.get(index) {
         let AstStmt::LocalDecl(local_decl) = stmt else {
@@ -51,7 +51,7 @@ fn try_merge_seed_global_run(
         {
             break;
         }
-        seeds.push((local_decl.bindings[0].id, local_decl.values[0].clone()));
+        seeds.push((local_decl.bindings[0].clone(), local_decl.values[0].clone()));
         index += 1;
     }
     if seeds.is_empty() {
@@ -87,33 +87,36 @@ fn try_merge_seed_global_run(
         return None;
     }
 
-    let mut merged_bindings = Vec::new();
-    let mut merged_values = Vec::new();
-    let mut matched = BTreeSet::new();
-    for (binding, value) in &seeds {
-        if use_index.count_uses_in_suffix(index, *binding) != 0 {
-            // 候选拒绝[SemanticBarrier:Scope]：seed local 在 global run 后仍被读取，合并删除它会留下未绑定 use。
+    if seeds.len() != globals.len() {
+        // 候选拒绝[SemanticBarrier:Identity]：seed/global 不是精确双射时，合并会删除未交接 seed 的 initializer，或丢掉没有来源的 global 写入；regress335 的 captured_seed 会因此失去闭包 owner。
+        return None;
+    }
+
+    let mut merged_bindings = Vec::with_capacity(globals.len());
+    let mut merged_values = Vec::with_capacity(globals.len());
+    for ((seed, value), (global_source, global_binding)) in seeds.iter().zip(&globals) {
+        if seed.id != *global_source {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：seed 与 global handoff 次序不一致时，合成多声明会把 initializer/global 写入重排；regress335 通过 `_ENV.__newindex` 区分 `y,x` 与 `x,y`。
             return None;
         }
-        let Some((_, global_binding)) = globals.iter().find(|(candidate, _)| candidate == binding)
-        else {
-            continue;
-        };
-        if !matched.insert(*binding) {
-            // 候选拒绝[SemanticBarrier:Identity]：同一 seed 不能初始化两个声明槽；合并会把共享值误写成单槽并删除另一份 handoff。
+        match seed.origin {
+            AstLocalOrigin::Recovered => {}
+            AstLocalOrigin::DebugHinted => {
+                // 候选拒绝[PolicyBoundary]：DebugHinted seed 是显式源码 local 身份；regress335 通过 debug.getlocal 观察该名字，声明合并不得抹掉它。
+                return None;
+            }
+            AstLocalOrigin::PhysicalRoot => {
+                // 候选拒绝[SemanticBarrier:Lifetime]：global 随后被覆盖时，PhysicalRoot seed 仍须把旧值保活到原 block 末端；regress335 用弱表/GC 观察提前消失。
+                return None;
+            }
+        }
+        if use_index.count_uses_in_suffix(start, seed.id) != 1 {
+            // 候选拒绝[SemanticBarrier:Capture]：唯一允许的 seed use 是对应 global handoff；initializer capture 或 run 后 use 都依赖被删 local，regress335 的闭包 seed 会变成未绑定引用。
             return None;
         }
         merged_bindings.push(global_binding.clone());
         merged_values.push(value.clone());
     }
-    if merged_bindings.len() != globals.len() {
-        // 候选拒绝[SemanticBarrier:Identity]：每个 global initializer 都必须一一对应某个 seed；否则合并会丢掉未匹配声明或凭空补值。
-        return None;
-    }
-
-    // 证明缺陷[PotentialUnsoundness:EvalOrder]：globals 通过 binding 查找后按 seed 顺序输出，未证明原 global run 也是同序；`global y=b; global x=a` 可被改成 `global x,y=a,b`，带可观察 global 写入时次序相反。
-    // 证明缺陷[PotentialUnsoundness:Lifetime]：未拒绝 PhysicalRoot seed；删除词法 local 会提前弱表消失或 `__gc`。
-    // 证明缺陷[PotentialPolicyViolation]：未拒绝 DebugHinted seed，显式源码身份会被合并抹掉。
 
     Some((
         AstStmt::GlobalDecl(Box::new(AstGlobalDecl {

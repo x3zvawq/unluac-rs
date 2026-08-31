@@ -15,3 +15,29 @@ end
 
 assert(recurse_through_loop_binding() == "done")
 print("regress_329_closure_self_capture#1", recurse_through_loop_binding())
+
+-- regress_329_closure_self_capture#2: numeric-for 每轮 capture 必须写回当前 binding，且 CLOSE 后各轮身份独立
+local function capture_each_loop_binding()
+    local closures = {}
+    for binding = 1, 3 do
+        closures[binding] = function(delta)
+            if delta ~= nil then
+                binding = binding + delta
+            end
+            return binding
+        end
+    end
+    return closures
+end
+
+local closures = capture_each_loop_binding()
+assert(closures[1](10) == 11)
+assert(closures[2]() == 2)
+assert(closures[3](-1) == 2)
+assert(closures[1]() == 11)
+print(
+    "regress_329_closure_self_capture#2",
+    closures[1](),
+    closures[2](),
+    closures[3]()
+)

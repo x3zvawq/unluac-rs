@@ -29,7 +29,12 @@ pub(crate) fn lower_closure_capture(
     let (mode, value) = match source {
         crate::transformer::CaptureSource::ByValue(reg) if reg == dst => (
             HirCaptureMode::ByValue,
-            closure_result_expr(lowering, block, instr_ref),
+            HirExpr::LocalRef(
+                *lowering
+                    .self_value_capture_locals
+                    .get(&instr_ref)
+                    .expect("self value capture must have a snapshot local"),
+            ),
         ),
         crate::transformer::CaptureSource::ByValue(reg) => (
             HirCaptureMode::ByValue,

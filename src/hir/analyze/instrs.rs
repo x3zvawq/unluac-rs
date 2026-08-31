@@ -216,6 +216,23 @@ pub(super) fn lower_regular_instr(
                 return Some(Vec::new());
             }
             let mut stmts = capture_empty_local_decl_stmts(lowering, instr_ref);
+            if let Some(snapshot) = lowering.self_value_capture_locals.get(&instr_ref).copied() {
+                // Luau 在处理 CAPTURE VAL 前先把新 closure 写入 dst，因此 reflexive
+                // capture 保存的是 closure 对象本身。先用独立 binding 固定这个快照，
+                // 再写真实 dst；AST capture 元数据不保留 VM capture mode，且 dst 可重绑。
+                debug_assert!(owner.is_none() && !consumed);
+                stmts.extend(local_decl_stmts(vec![snapshot]));
+                stmts.push(assign_stmt(
+                    vec![HirLValue::Local(snapshot)],
+                    vec![lower_closure_expr(lowering, block, instr_ref, closure)],
+                ));
+                stmts.extend(fixed_assign(
+                    lowering,
+                    instr_ref,
+                    vec![HirExpr::LocalRef(snapshot)],
+                ));
+                return Some(stmts);
+            }
             match owner {
                 Some(factory) => {
                     let plan = lowering.captured_shared_closures.composite_plan(factory);

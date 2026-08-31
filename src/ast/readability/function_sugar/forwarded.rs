@@ -10,8 +10,8 @@ use super::super::binding_flow::{BindingUseIndex, count_binding_uses_in_block_de
 use super::super::binding_ref::name_matches_binding;
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
-    AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalBindingTarget, AstNamePath,
-    AstNameRef, AstStmt, AstTargetDialect,
+    AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalBindingTarget,
+    AstLocalOrigin, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
 };
 
 pub(super) fn try_lower_forwarded_function_stmt(
@@ -29,6 +29,10 @@ pub(super) fn try_lower_forwarded_function_stmt(
     }
     let binding = local_decl.bindings[0].id;
     if local_decl.bindings[0].attr != crate::ast::common::AstLocalAttr::None {
+        return None;
+    }
+    if local_decl.bindings[0].origin != AstLocalOrigin::Recovered {
+        // 候选拒绝[PolicyBoundary]：DebugHinted 是源码声明身份；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 的词法根不能随转发壳提前消失。
         return None;
     }
     let AstExpr::FunctionExpr(function) = &local_decl.values[0] else {
@@ -50,7 +54,6 @@ pub(super) fn try_lower_forwarded_function_stmt(
     }
     let function = function.as_ref().clone();
     let stmt = inline_function_into_stmt(next, binding, function, target, method_fields)?;
-    // 证明缺陷[PotentialPolicyViolation]：转发 local 的 DebugHinted origin 未检查；即使 closure 仅使用一次，吸收到目标仍会抹掉源码可见身份。
     Some((stmt, 2))
 }
 

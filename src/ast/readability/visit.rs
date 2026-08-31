@@ -3,7 +3,8 @@
 //! 很多 readability pass 只是想“遍历 AST 收集一批事实”，例如统计 method 名、
 //! 扫描 temp、寻找 synthetic local。过去这些分析各自复制了一整套
 //! `block/stmt/lvalue/call/expr` 递归骨架；这里把只读遍历收成共享设施，让分析代码
-//! 更专注在“看到某个节点时记录什么”，而不是重复维护递归。
+//! 更专注在“看到某个节点时记录什么”，而不是重复维护递归。需要保持词法边界的分析
+//! 可以在 `visit_block` 返回 false，裁掉由 scoped walker 另行处理的子 block。
 
 use crate::ast::common::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
@@ -16,9 +17,13 @@ use crate::ast::traverse::{
 };
 
 pub(super) trait AstVisitor {
-    fn visit_block(&mut self, _block: &AstBlock, _kind: BlockKind) {}
+    fn visit_block(&mut self, _block: &AstBlock, _kind: BlockKind) -> bool {
+        true
+    }
 
     fn visit_stmt(&mut self, _stmt: &AstStmt) {}
+
+    fn leave_stmt(&mut self, _stmt: &AstStmt) {}
 
     fn visit_expr(&mut self, _expr: &AstExpr) {}
 
@@ -50,7 +55,9 @@ pub(super) fn visit_stmt(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
 }
 
 fn visit_block_with_kind(block: &AstBlock, kind: BlockKind, visitor: &mut impl AstVisitor) {
-    visitor.visit_block(block, kind);
+    if !visitor.visit_block(block, kind) {
+        return;
+    }
     for stmt in &block.stmts {
         visit_stmt_impl(stmt, visitor);
     }
@@ -82,6 +89,7 @@ fn visit_stmt_impl(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
             visit_call(call, visitor);
         }
     );
+    visitor.leave_stmt(stmt);
 }
 
 fn visit_call(call: &AstCallKind, visitor: &mut impl AstVisitor) {
