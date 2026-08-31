@@ -19,6 +19,7 @@ use super::super::temp_touch::{
     TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_in_expr,
 };
 use crate::hir::common::{HirBlock, HirLValue, HirStmt, TempId};
+use crate::hir::expr_safety::HirExprSafety;
 
 #[derive(Debug, Clone, Default)]
 struct FallthroughSummary {
@@ -33,6 +34,7 @@ pub(super) fn candidate_temps(
     temp_touches: &TempTouchIndex,
     stmt_index: usize,
     is_reserved: &dyn Fn(TempId) -> bool,
+    safety: HirExprSafety,
 ) -> Vec<TempId> {
     let HirStmt::If(if_stmt) = stmt else {
         return Vec::new();
@@ -42,8 +44,8 @@ pub(super) fn candidate_temps(
     };
 
     let (Some(then_summary), Some(else_summary)) = (
-        summarize_block_fallthrough_assignments(&if_stmt.then_block),
-        summarize_block_fallthrough_assignments(else_block),
+        summarize_block_fallthrough_assignments(&if_stmt.then_block, safety),
+        summarize_block_fallthrough_assignments(else_block, safety),
     ) else {
         // 候选拒绝[ProofIncomplete]：任一 arm 的 goto 可能重新汇入当前 if，也可能逃逸；
         // HIR 缺少目标到当前 region merge 的 owner/reaching-def，不能把 unknown arm 当作已终结。
@@ -97,7 +99,10 @@ fn single_scalar_temp_write(block: &HirBlock) -> Option<TempId> {
     Some(*temp)
 }
 
-fn summarize_block_fallthrough_assignments(block: &HirBlock) -> Option<FallthroughSummary> {
+fn summarize_block_fallthrough_assignments(
+    block: &HirBlock,
+    safety: HirExprSafety,
+) -> Option<FallthroughSummary> {
     let mut assigned_temps = BTreeSet::new();
     let mut reads_before_assignment = BTreeSet::new();
     let mut break_assigned_temps = None;
@@ -108,7 +113,7 @@ fn summarize_block_fallthrough_assignments(block: &HirBlock) -> Option<Fallthrou
             break;
         }
 
-        let stmt_summary = summarize_stmt_fallthrough_assignments(stmt)?;
+        let stmt_summary = summarize_stmt_fallthrough_assignments(stmt, safety)?;
         reads_before_assignment.extend(
             stmt_summary
                 .reads_before_assignment
@@ -134,7 +139,10 @@ fn summarize_block_fallthrough_assignments(block: &HirBlock) -> Option<Fallthrou
     })
 }
 
-fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughSummary> {
+fn summarize_stmt_fallthrough_assignments(
+    stmt: &HirStmt,
+    safety: HirExprSafety,
+) -> Option<FallthroughSummary> {
     let reads = || {
         collect_temp_reads_by_stmt(std::slice::from_ref(stmt))
             .into_iter()
@@ -191,9 +199,10 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
             break_assigned_temps: None,
         }),
         HirStmt::If(if_stmt) => {
-            let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block)?;
+            let then_summary =
+                summarize_block_fallthrough_assignments(&if_stmt.then_block, safety)?;
             let else_summary = match if_stmt.else_block.as_ref() {
-                Some(else_block) => summarize_block_fallthrough_assignments(else_block)?,
+                Some(else_block) => summarize_block_fallthrough_assignments(else_block, safety)?,
                 None => FallthroughSummary {
                     falls_through: true,
                     assigned_temps: BTreeSet::new(),
@@ -224,10 +233,10 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
                 break_assigned_temps,
             })
         }
-        HirStmt::Block(block) => summarize_block_fallthrough_assignments(block),
+        HirStmt::Block(block) => summarize_block_fallthrough_assignments(block, safety),
         HirStmt::While(while_stmt) => {
-            let body = summarize_block_fallthrough_assignments(&while_stmt.body)?;
-            let condition_is_true = expr_truthiness(&while_stmt.cond) == Some(true);
+            let body = summarize_block_fallthrough_assignments(&while_stmt.body, safety)?;
+            let condition_is_true = expr_truthiness(&while_stmt.cond, safety) == Some(true);
             let assigned_temps = condition_is_true
                 .then(|| body.break_assigned_temps.clone())
                 .flatten()
@@ -245,7 +254,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
             })
         }
         HirStmt::Repeat(repeat_stmt) => {
-            let body = summarize_block_fallthrough_assignments(&repeat_stmt.body)?;
+            let body = summarize_block_fallthrough_assignments(&repeat_stmt.body, safety)?;
             let mut reads_before_assignment = body.reads_before_assignment;
             if body.falls_through {
                 reads_before_assignment.extend(
@@ -267,7 +276,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
             })
         }
         HirStmt::NumericFor(numeric_for) => {
-            let body = summarize_block_fallthrough_assignments(&numeric_for.body)?;
+            let body = summarize_block_fallthrough_assignments(&numeric_for.body, safety)?;
             Some(FallthroughSummary {
                 falls_through: true,
                 assigned_temps: BTreeSet::new(),
@@ -281,7 +290,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
             })
         }
         HirStmt::GenericFor(generic_for) => {
-            let body = summarize_block_fallthrough_assignments(&generic_for.body)?;
+            let body = summarize_block_fallthrough_assignments(&generic_for.body, safety)?;
             let iterator_reads = generic_for
                 .iterator
                 .iter()
@@ -353,7 +362,13 @@ mod tests {
 
     fn candidates(stmt: &HirStmt, temp: TempId) -> Vec<TempId> {
         let stmt_refs = [BTreeSet::from([temp]), BTreeSet::from([temp])];
-        candidate_temps(stmt, &TempTouchIndex::new(&stmt_refs), 0, &|_| false)
+        candidate_temps(
+            stmt,
+            &TempTouchIndex::new(&stmt_refs),
+            0,
+            &|_| false,
+            HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Auto),
+        )
     }
 
     #[test]

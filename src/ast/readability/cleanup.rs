@@ -16,19 +16,26 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
     AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstFunctionName, AstLValue,
-    AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstModule, AstStmt,
+    AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstModule, AstStmt, AstTargetDialect,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{BindingUseIndex, binding_mentions_in_expr, binding_mentions_in_stmt};
-use super::expr_analysis::is_discard_safe_expr;
+use super::expr_analysis::{is_discard_safe_expr_for_target, is_eventless_primitive_literal};
 use super::walk::{self, AstRewritePass, BlockKind};
 use crate::ast::traverse::traverse_expr_children;
 
-pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    walk::rewrite_module(module, &mut CleanupPass)
+pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
+    walk::rewrite_module(
+        module,
+        &mut CleanupPass {
+            target: context.target,
+        },
+    )
 }
 
-struct CleanupPass;
+struct CleanupPass {
+    target: AstTargetDialect,
+}
 
 impl AstRewritePass for CleanupPass {
     fn rewrite_block(&mut self, block: &mut AstBlock, kind: BlockKind) -> bool {
@@ -36,11 +43,12 @@ impl AstRewritePass for CleanupPass {
             block,
             matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody),
             None,
+            self.target,
         )
     }
 
     fn rewrite_repeat_body(&mut self, block: &mut AstBlock, condition: &AstExpr) -> bool {
-        cleanup_block(block, false, Some(condition))
+        cleanup_block(block, false, Some(condition), self.target)
     }
 }
 
@@ -48,6 +56,7 @@ fn cleanup_block(
     block: &mut AstBlock,
     allow_trailing_empty_return_elision: bool,
     trailing_condition: Option<&AstExpr>,
+    target: AstTargetDialect,
 ) -> bool {
     let mut changed = false;
 
@@ -115,7 +124,7 @@ fn cleanup_block(
                     && local_decl.bindings[0].origin == AstLocalOrigin::Recovered
                     && !binding_flow.keeps_decl_alive(local_decl.bindings[0].id) =>
             {
-                if is_discard_safe_expr(&local_decl.values[0]) {
+                if is_discard_safe_expr_for_target(&local_decl.values[0], target) {
                     // 候选接受：表达式无求值副作用，且 binding-flow 已证明域内外均无读取、
                     // capture 或写入；删除声明不会移除可观察求值或词法槽。
                     changed = true;
@@ -131,9 +140,19 @@ fn cleanup_block(
                             changed = true;
                         }
                         Err(value) => {
-                            // 候选拒绝[SemanticBarrier:EvalCount]：如 `local _ = obj[key]` 的
-                            // 查表可能触发 `__index`；删除会少求值一次且 Lua 无通用表达式
-                            // 语句承载它，regress178 的 unused global read 直接统计该观察量。
+                            // 候选拒绝[SemanticBarrier:EvalCount]：删除 global/field/index 读取会
+                            // 少一次可观察 lookup（regress178）。
+                            // 候选拒绝[SemanticBarrier:Metamethod]：删除动态运算会少一次元方法
+                            // 调用（regress245）；LuaJIT cdata 与 primitive equality 也会调用
+                            // cdata `__eq`（regress390）。
+                            // 候选拒绝[SemanticBarrier:ControlFlow]：错误类型组合及整数零除会
+                            // 删除原求值抛错；regress390 以 pcall 覆盖 length、ordering、bitop、
+                            // floor-div 与 modulo 的最小反例。
+                            // 候选拒绝[ProofIncomplete]：literal concat、table/closure 分配以及
+                            // 非字面量除数尚缺无分配事件或确定非零事实，不能删除。
+                            // 候选拒绝[LayerBoundary]：Lua 5.1/5.2 integral-number layout 需由
+                            // parser/HIR 经 ast::build 传入 AstTargetDialect 后才能证明 Integer 算术。
+                            // 候选拒绝[LayerBoundary]：Error 由 ast::build 的诊断 owner 保留。
                             local_decl.values.push(value);
                             retained_stmts.push(AstStmt::LocalDecl(local_decl));
                         }
@@ -277,64 +296,19 @@ fn split_overwritten_call_result(
         // 候选忽略[NotApplicable]：相邻后继不是 overwrite assignment。
         return None;
     };
-    let [binding] = local_decl.bindings.as_slice() else {
-        // 分析停用[ProofIncomplete]：多 binding declaration 需要 value-pack 到槽的逐项对应；
-        // 空 declaration 不产生 call-result 候选。
+    if local_decl.bindings.is_empty() {
+        // 候选忽略[NotApplicable]：空 declaration 不产生 call-result 候选。
         return None;
-    };
+    }
+    if local_decl.values.is_empty() {
+        // 候选忽略[NotApplicable]：空 value declaration 不产生 call-result 候选。
+        return None;
+    }
     let [call_value] = local_decl.values.as_slice() else {
-        // 分析停用[ProofIncomplete]：多 value declaration 需要 Lua 尾值展开事实；空 value
-        // declaration 不产生 call-result 候选。
+        // 分析停用[ProofIncomplete]：多 value declaration 需要 Lua 尾值展开与 initializer
+        // 中间结果的临时 root 事实，不能简单拆成多个独立求值语句。
         return None;
     };
-    match binding.attr {
-        AstLocalAttr::None => {}
-        AstLocalAttr::Close => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：`<close>` 的退出动作不可从 call result
-            // 移到 replacement；regress246 证明 `__close` 时点可由后继 condition 观察。
-            return None;
-        }
-        AstLocalAttr::Const => {
-            // 候选拒绝[TargetConstraint]：`<const>` binding 不允许后继 overwrite；这种 pair
-            // 不是可生成的合法 Lua 源码形状，cleanup 不把它改写成另一种声明。
-            return None;
-        }
-    }
-    match binding.origin {
-        AstLocalOrigin::Recovered => {}
-        AstLocalOrigin::PhysicalRoot => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot call result 必须活到 overwrite
-            // RHS 完成；lua54_01_close#17 用 `__gc` 观察同槽 clear 前的旧值仍存活。
-            return None;
-        }
-        AstLocalOrigin::DebugHinted => {
-            // 候选拒绝[PolicyBoundary]：DebugHinted initializer 是项目选择保留的源码声明身份。
-            return None;
-        }
-    }
-    let [target] = assign.targets.as_slice() else {
-        // 分析停用[ProofIncomplete]：并行赋值需要全部 target/RHS 的快照与覆盖关系。
-        return None;
-    };
-    if assign.values.is_empty() {
-        // 候选忽略[NotApplicable]：空 RHS 不产生可转入 local declaration 的 replacement。
-        return None;
-    }
-    if !matches!(target, super::super::common::AstLValue::Name(name) if binding.id.matches_name_ref(name))
-    {
-        // 候选忽略[NotApplicable]：后继没有直接覆盖所声明的同一 binding。
-        return None;
-    }
-    if assign
-        .values
-        .iter()
-        .any(|value| binding_mentions_in_expr(value).contains(&binding.id))
-    {
-        // 候选拒绝[SemanticBarrier:Scope]：`local x=f(); x=1,use(x)` 改成
-        // `f(); local x=1,use(x)` 后 RHS 的 `x` 会解析到外层而非 call result。
-        return None;
-    }
-
     let call = match into_call_kind(call_value.clone()) {
         Ok(call) => call,
         Err(_) => {
@@ -342,11 +316,77 @@ fn split_overwritten_call_result(
             return None;
         }
     };
+    if assign.targets.len() != local_decl.bindings.len() {
+        // 分析停用[ProofIncomplete]：只有完整覆盖全部 binding 的并行赋值才能把 replacement
+        // 原样转成新声明；缺少或额外 target 仍需外部写入与值槽映射证明。
+        return None;
+    }
+    if assign.values.is_empty() {
+        // 候选忽略[NotApplicable]：空 RHS 不产生可转入 local declaration 的 replacement。
+        return None;
+    }
+    if !local_decl
+        .bindings
+        .iter()
+        .zip(&assign.targets)
+        .all(|(binding, target)| {
+            matches!(target, AstLValue::Name(name) if binding.id.matches_name_ref(name))
+        })
+    {
+        // 候选忽略[NotApplicable]：后继不是按声明顺序直接覆盖每一个同 ID binding；乱序、
+        // field/index target 或部分外部写入都不属于本事务。
+        return None;
+    }
 
-    // 候选接受：call 与单目标 overwrite 相邻；binding 是无属性 recovered local，且所有
-    // overwrite RHS 都不读取它。call 在原 initializer 和改写后的独立语句中都位于 binding
-    // 的词法起点之前，即使表达式异常地标成同一 ID，名字解析环境也不变。完整 RHS 列表
-    // 原样转入单 binding local declaration，Lua 的求值顺序、值宽度和最终 binding 值保持不变。
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.attr != AstLocalAttr::None)
+    {
+        // 候选拒绝[TargetConstraint]：`<const>` 与 `<close>` 都不允许合法 Lua 源码中的后继
+        // overwrite；这种 AST pair 不是可改写候选，不能借 cleanup 消除非法 target。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.origin == AstLocalOrigin::DebugHinted)
+    {
+        // 候选拒绝[PolicyBoundary]：任一 DebugHinted initializer 都保留整组源码声明身份。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.origin == AstLocalOrigin::PhysicalRoot)
+        && !assign.values.iter().all(is_eventless_primitive_literal)
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：事件性 RHS 求值期间 PhysicalRoot call result
+        // 必须仍存活；regress388 用 RHS call 内 GC 同时证明 scalar 与 multi-home 反例。
+        // 候选拒绝[ProofIncomplete]：当前只放行 finite primitive literal；更宽的 eventless
+        // local/param/copy 仍需 suffix write 与 capture 快照事实。
+        return None;
+    }
+
+    let binding_ids = local_decl
+        .bindings
+        .iter()
+        .map(|binding| binding.id)
+        .collect::<BTreeSet<_>>();
+    if assign
+        .values
+        .iter()
+        .any(|value| !binding_mentions_in_expr(value).is_disjoint(&binding_ids))
+    {
+        // 候选拒绝[SemanticBarrier:Scope]：`local a,b=f(); a,b=1,use(a)` 改成
+        // `f(); local a,b=1,use(a)` 后 RHS 的旧 binding 引用会解析到外层。
+        return None;
+    }
+
+    // 候选接受：单 call initializer 与同序完整 overwrite 相邻；所有 binding 无属性且不是
+    // debug identity，RHS 不读取任一旧 binding。call 保持在原求值点，完整 RHS 原样转入
+    // multi-local declaration，所以求值顺序、nil fill、尾值截断和最终 binding 映射不变。
+    // PhysicalRoot 额外要求 RHS 全是无事件 primitive，提前结束的几条纯加载间隔不可观察。
     Some((
         call,
         AstLocalDecl {

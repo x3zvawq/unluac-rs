@@ -51,6 +51,7 @@ use crate::hir::common::{
     HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto,
     HirStmt, HirUnaryOpKind, HirValuePack, LocalId, TempId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 mod decision_builder;
@@ -63,7 +64,8 @@ pub(super) fn fold_branch_values_in_proto(
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
 ) -> bool {
-    let exposed_temps = fold_root_branch_value_temps(proto);
+    let safety = HirExprSafety::for_dialect(dialect);
+    let exposed_temps = fold_root_branch_value_temps(proto, safety);
     let raw_temp_changed = !exposed_temps.is_empty();
     inline_exposed_branch_value_sinks_in_proto_with_facts(
         proto,
@@ -77,6 +79,7 @@ pub(super) fn fold_branch_values_in_proto(
         proto,
         &mut BranchValuePass {
             label_refs: &label_refs,
+            safety,
         },
     );
     raw_temp_changed || other_changed
@@ -84,6 +87,7 @@ pub(super) fn fold_branch_values_in_proto(
 
 struct BranchValuePass<'a> {
     label_refs: &'a BTreeMap<HirLabelId, usize>,
+    safety: HirExprSafety,
 }
 
 impl HirRewritePass for BranchValuePass<'_> {
@@ -92,7 +96,7 @@ impl HirRewritePass for BranchValuePass<'_> {
             fold_branch_value_goto_labels_in_block(&mut block.stmts, self.label_refs);
         let nil_decision_changed = fold_nil_fallback_decision_locals_in_block(&mut block.stmts);
         let nil_fallback_changed = fold_nil_fallback_alias_locals_in_block(&mut block.stmts);
-        let local_changed = fold_branch_value_locals_in_block(&mut block.stmts);
+        let local_changed = fold_branch_value_locals_in_block(&mut block.stmts, self.safety);
         goto_changed || nil_decision_changed || nil_fallback_changed || local_changed
     }
 }
@@ -197,7 +201,7 @@ fn fold_branch_value_goto_labels_in_block(
 
 /// 扫描 block 中的 `local X; if cond then X=a else X=b end` 形状，
 /// 尝试把它收回 `local X = cond and a or b` 一类的值表达式。
-fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
+fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>, safety: HirExprSafety) -> bool {
     let mut changed = false;
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
@@ -205,7 +209,7 @@ fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
     while let Some(stmt) = original.next() {
         let Some((binding, value)) = original
             .peek()
-            .and_then(|next| collapsible_branch_value_local(&stmt, next))
+            .and_then(|next| collapsible_branch_value_local(&stmt, next, safety))
         else {
             rewritten.push(stmt);
             continue;
@@ -223,7 +227,7 @@ fn fold_branch_value_locals_in_block(stmts: &mut Vec<HirStmt>) -> bool {
 
 /// `locals` 之前只处理 proto 根 block 的机械 temp 值树。每个 proto 单独调用，因此同号
 /// TempId 不会跨 child proto 混合；现有 per-stmt touch facts 证明 guard 没有逃出候选语句。
-fn fold_root_branch_value_temps(proto: &mut HirProto) -> Vec<TempId> {
+fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> Vec<TempId> {
     if !proto
         .body
         .stmts
@@ -243,7 +247,8 @@ fn fold_root_branch_value_temps(proto: &mut HirProto) -> Vec<TempId> {
 
     let mut exposed_temps = Vec::new();
     for stmt in &mut proto.body.stmts {
-        let Some((target, replacement, guards)) = collapsible_branch_value_temp(stmt) else {
+        let Some((target, replacement, guards)) = collapsible_branch_value_temp(stmt, safety)
+        else {
             continue;
         };
         let guards_are_mechanical = guards.iter().all(|guard| {
@@ -422,16 +427,20 @@ fn terminal_local_assign_value(block: &HirBlock, target: LocalId) -> Option<&Hir
 fn collapsible_branch_value_local(
     local_decl_stmt: &HirStmt,
     if_stmt: &HirStmt,
+    safety: HirExprSafety,
 ) -> Option<(LocalId, HirExpr)> {
     let binding = empty_single_local_decl_binding(local_decl_stmt)?;
     let HirStmt::If(if_stmt) = if_stmt else {
         return None;
     };
-    let value = branch_value_expr(BranchValueBinding::Local(binding), if_stmt)?;
+    let value = branch_value_expr(BranchValueBinding::Local(binding), if_stmt, safety)?;
     Some((binding, value))
 }
 
-fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(TempId, HirStmt, BTreeSet<TempId>)> {
+fn collapsible_branch_value_temp(
+    stmt: &HirStmt,
+    safety: HirExprSafety,
+) -> Option<(TempId, HirStmt, BTreeSet<TempId>)> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
     };
@@ -439,7 +448,7 @@ fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(TempId, HirStmt, BTr
     let BranchValueBinding::Temp(target) = binding else {
         return None;
     };
-    let mut builder = BranchValueDecisionBuilder::new();
+    let mut builder = BranchValueDecisionBuilder::new(safety);
     let root = builder.collapse_if(if_stmt, binding)?;
     // raw temp 没有 local 壳提供稳定的中间边界；若整棵树尚不能收成值表达式，
     // 只折叠内层会生成一份新的控制形状，并可能让下一次反编译失去原短路 owner。
@@ -449,10 +458,14 @@ fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(TempId, HirStmt, BTr
     Some((target, replacement, guards))
 }
 
-fn branch_value_expr(binding: BranchValueBinding, if_stmt: &HirIf) -> Option<HirExpr> {
-    let truthy = try_collapse_block_to_value(&if_stmt.then_block, binding)?;
+fn branch_value_expr(
+    binding: BranchValueBinding,
+    if_stmt: &HirIf,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
+    let truthy = try_collapse_block_to_value(&if_stmt.then_block, binding, safety)?;
     // 候选拒绝[ProofIncomplete]：空 local 的无 else 路径可取 nil，但当前 builder 没有把“未赋值 epoch == nil”作为 falsy target 事实。
-    let falsy = try_collapse_block_to_value(if_stmt.else_block.as_ref()?, binding)?;
+    let falsy = try_collapse_block_to_value(if_stmt.else_block.as_ref()?, binding, safety)?;
     if binding.mentions_expr(&if_stmt.cond)
         || binding.mentions_expr(&truthy)
         || binding.mentions_expr(&falsy)
@@ -464,15 +477,20 @@ fn branch_value_expr(binding: BranchValueBinding, if_stmt: &HirIf) -> Option<Hir
         &if_stmt.cond,
         HirDecisionTarget::Expr(truthy),
         HirDecisionTarget::Expr(falsy),
+        safety,
     )
 }
 
-fn try_collapse_block_to_value(block: &HirBlock, binding: BranchValueBinding) -> Option<HirExpr> {
+fn try_collapse_block_to_value(
+    block: &HirBlock,
+    binding: BranchValueBinding,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
     match block.stmts.as_slice() {
         [HirStmt::Assign(assign)] => single_assign_value(assign, binding).cloned(),
-        [HirStmt::If(if_stmt)] => branch_value_expr(binding, if_stmt),
+        [HirStmt::If(if_stmt)] => branch_value_expr(binding, if_stmt, safety),
         [HirStmt::LocalDecl(decl), HirStmt::If(if_stmt)] => {
-            collapse_local_guard_pattern(decl, if_stmt, binding)
+            collapse_local_guard_pattern(decl, if_stmt, binding, safety)
         }
         // 候选拒绝[ProofIncomplete]：其它叶块可能仅含可搬移的中性语句，也可能有 call/control effect；需逐句路径 effect summary，不能按长度 blanket 判定。
         _ => None,
@@ -483,6 +501,7 @@ fn collapse_local_guard_pattern(
     decl: &HirLocalDecl,
     if_stmt: &HirIf,
     binding: BranchValueBinding,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let [guard] = decl.bindings.as_slice() else {
         return None;
@@ -512,7 +531,7 @@ fn collapse_local_guard_pattern(
         // 候选拒绝[SemanticBarrier:Scope]：删除 guard/local 壳会让 value/rest 中对 guard 或 output binding 的读取改指外层或丢失当前快照。
         return None;
     }
-    let rest_value = try_collapse_block_to_value(rest_block, binding)?;
+    let rest_value = try_collapse_block_to_value(rest_block, binding, safety)?;
     if binding.mentions_expr(&rest_value) || expr_mentions_local(&rest_value, *guard) {
         // 候选拒绝[SemanticBarrier:Scope]：rest value 仍读取被删除 guard/output binding，直接内联会改变读取的 lexical identity。
         return None;
@@ -521,6 +540,7 @@ fn collapse_local_guard_pattern(
         value,
         HirDecisionTarget::CurrentValue,
         HirDecisionTarget::Expr(rest_value),
+        safety,
     )
 }
 
@@ -528,6 +548,7 @@ fn finalize_branch_value_targets(
     cond: &HirExpr,
     truthy: HirDecisionTarget,
     falsy: HirDecisionTarget,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let decision = HirDecisionExpr {
         entry: HirDecisionNodeRef(0),
@@ -538,7 +559,7 @@ fn finalize_branch_value_targets(
             falsy,
         }],
     };
-    let value = crate::hir::decision::finalize_value_decision_expr(decision);
+    let value = crate::hir::decision::finalize_value_decision_expr(decision, safety);
     // 候选拒绝[ProofIncomplete]：共享/不可表达 Decision 尚未收成普通逻辑表达式；应增强 decision collapse，而非把内部 DAG 泄露给 local initializer。
     (!matches!(value, HirExpr::Decision(_))).then_some(value)
 }

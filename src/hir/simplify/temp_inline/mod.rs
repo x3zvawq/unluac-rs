@@ -56,9 +56,7 @@ use crate::hir::common::{
     TempId,
 };
 use crate::hir::expr_safety::{
-    expr_is_discard_safe, expr_is_effect_invariant_in_single_value_context, expr_is_repeatable,
-    expr_is_repeatable_in_single_value_context, expr_observes_eval_order,
-    expr_requires_ordered_snapshot,
+    HirExprSafety, expr_observes_eval_order, expr_requires_ordered_snapshot,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -89,6 +87,7 @@ struct TempInlineWorkspace<'a> {
     block_depth: usize,
     scope: TempInlineScope,
     dialect: DecompileDialect,
+    safety: HirExprSafety,
     readability: ReadabilityOptions,
     substantial_closure_bodies: &'a [bool],
     has_resource_boundary: bool,
@@ -162,6 +161,7 @@ impl<'a> TempInlineWorkspace<'a> {
             block_depth: 0,
             scope,
             dialect,
+            safety: HirExprSafety::for_dialect(dialect),
             readability,
             substantial_closure_bodies,
             has_resource_boundary,
@@ -277,12 +277,13 @@ fn proto_contains_resource_boundary(proto: &HirProto) -> bool {
 fn collect_temp_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
 ) -> (CallRootLifetimeIndices, Vec<bool>) {
     // 分析停用[LayerBoundary]：普通潜在事件只形成 locals 的待配对 owner 事实；temp-inline
     // 只消费显式 GC fence 与已完成 overwrite pair，避免把尚未物化的观察扩成全局 inline barrier。
-    let call_roots = collect_call_root_lifetimes(stmts, facts, false, |_| true, |_| true);
+    let call_roots = collect_call_root_lifetimes(stmts, facts, safety, false, |_| true, |_| true);
     let mut marked = call_roots.marked_stmts(stmts.len());
-    collect_lookup_gc_root_lifetimes(stmts, facts, |_| true).mark_stmts(&mut marked);
+    collect_lookup_gc_root_lifetimes(stmts, facts, safety, |_| true).mark_stmts(&mut marked);
     (call_roots, marked)
 }
 
@@ -299,7 +300,7 @@ fn inline_temps_in_block(
     workspace.block_depth += 1;
     let mut changed = false;
     let (mut call_root_indices, mut physical_root_lifetimes) =
-        collect_temp_root_lifetimes(&block.stmts, facts);
+        collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
     let mut captured_slots_before_stmt =
         CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
@@ -340,7 +341,7 @@ fn inline_temps_in_block(
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
         (call_root_indices, physical_root_lifetimes) =
-            collect_temp_root_lifetimes(&block.stmts, facts);
+            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
     }
 
     if inline_terminal_nil_return_pack(
@@ -356,7 +357,7 @@ fn inline_temps_in_block(
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
         (call_root_indices, physical_root_lifetimes) =
-            collect_temp_root_lifetimes(&block.stmts, facts);
+            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
     }
 
     if inline_materialization_runs(
@@ -372,7 +373,7 @@ fn inline_temps_in_block(
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
         (call_root_indices, physical_root_lifetimes) =
-            collect_temp_root_lifetimes(&block.stmts, facts);
+            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
     }
 
     if matches!(workspace.scope, TempInlineScope::All)
@@ -387,7 +388,8 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (_, physical_root_lifetimes) = collect_temp_root_lifetimes(&block.stmts, facts);
+        (_, physical_root_lifetimes) =
+            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
     }
 
     // proto 级 live use count 会随成功内联同步减少；当前 block 只需保留下一条
@@ -459,6 +461,7 @@ fn inline_temps_in_block(
                 temp,
                 reference_captured,
                 workspace.dialect,
+                workspace.safety,
             )
             // 候选拒绝[PolicyBoundary]：复杂 child closure 保留命名 binding，避免生成多行 IIFE。
             && !substantial_result_closure_prefers_binding(
@@ -467,7 +470,7 @@ fn inline_temps_in_block(
                 next_stmt,
                 workspace.substantial_closure_bodies,
             )
-            && site.allows(value, readability)
+            && site.allows(value, readability, workspace.safety)
         {
             let next_stmt = kept_rev
                 .last_mut()
@@ -557,13 +560,14 @@ fn inline_crosses_evaluation_boundary(
     temp: TempId,
     reference_captured: &ReferenceCapturedBindings,
     dialect: DecompileDialect,
+    safety: HirExprSafety,
 ) -> bool {
     // 候选拒绝[SemanticBarrier:ControlFlow]：循环外 `t=f()` 不能内联进 while 条件而改成每轮调用；见 regress_172#1/#2。
     // 候选拒绝[SemanticBarrier:EvalOrder]：无 capture closure 仍会分配新 identity；`a=f(); t=function() end; g(a,t)` 不能把分配移到 `f()` 之后。
     let producer_requires_order =
-        expr_requires_ordered_snapshot(value) || !expr_is_discard_safe(value);
+        expr_requires_ordered_snapshot(value) || !safety.is_discard_safe(value);
     let producer_has_observable_eval =
-        expr_observes_eval_order(value) || !expr_is_discard_safe(value);
+        expr_observes_eval_order(value) || !safety.is_discard_safe(value);
     (site.is_repeated_region() && !is_stable_inline_value(value))
         || (producer_requires_order
             && !puc_upvalue_table_key_with_deferred_base_read(site, next_stmt, dialect)
@@ -772,6 +776,7 @@ struct PureMaterializationContext<'a> {
     captured_slots_before_stmt: &'a CapturedSlotSnapshots,
     order_sensitive_defs: &'a OrderSensitiveDefWorkspace,
     readability: ReadabilityOptions,
+    safety: HirExprSafety,
     removed_stmts: &'a mut [bool],
 }
 
@@ -799,8 +804,8 @@ fn inline_pure_materialization_run(
         // 候选拒绝[SemanticBarrier:Capture]：capture/self-rebind 改写会改变闭包或状态所见值。
         // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
         if total_use_count(temp, context.live_use_counts) != 1
-            || !expr_is_repeatable(value)
-            || !InlineSite::Nested.allows(value, context.readability)
+            || !context.safety.is_repeatable(value)
+            || !InlineSite::Nested.allows(value, context.readability, context.safety)
             || !materialization_run_candidate_is_safe(
                 temp,
                 value,
@@ -913,6 +918,7 @@ fn inline_materialization_runs(
         order_sensitive_defs,
         scope,
         dialect,
+        safety,
         readability,
         ..
     } = workspace;
@@ -1037,6 +1043,7 @@ fn inline_materialization_runs(
             captured_slots_before_stmt,
             order_sensitive_defs,
             readability: *readability,
+            safety: *safety,
             removed_stmts: &mut removed_stmts,
         };
         if inline_pure_materialization_run(
@@ -1102,7 +1109,7 @@ fn inline_materialization_runs(
                 break;
             }
             if use_count == 0 {
-                if candidate_is_safe && expr_is_discard_safe(value) {
+                if candidate_is_safe && safety.is_discard_safe(value) {
                     discarded_uses.push(collect_expr_temp_uses_summary(value, uses));
                     continue;
                 }
@@ -1137,6 +1144,7 @@ fn inline_materialization_runs(
                         temp,
                         reference_captured,
                         *dialect,
+                        *safety,
                     ))
             {
                 // 候选拒绝[SemanticBarrier:Capture]：candidate home capture/self-rebind 会改变 closure 或状态所见值。
@@ -1172,6 +1180,7 @@ fn inline_materialization_runs(
             callee_temp,
             reference_captured,
             *dialect,
+            *safety,
         ) {
             // 候选拒绝[SemanticBarrier:EvalOrder]：callee 前有可观察事件时，内联会把其求值延后。
             index = run_end + 1;
@@ -2038,6 +2047,10 @@ fn inline_temps_in_nested_blocks(
             inherited_captured_slots,
         ),
         HirStmt::Repeat(repeat_stmt) => {
+            let policy = RepeatInlinePolicy {
+                readability,
+                safety: workspace.safety,
+            };
             let mut changed = inline_temps_in_block(
                 &mut repeat_stmt.body,
                 workspace,
@@ -2051,7 +2064,7 @@ fn inline_temps_in_nested_blocks(
                 repeat_stmt,
                 &mut workspace.uses,
                 live_use_counts,
-                readability,
+                policy,
                 facts,
                 inherited_captured_slots,
             );
@@ -2060,7 +2073,7 @@ fn inline_temps_in_nested_blocks(
                 &mut workspace.uses,
                 live_use_counts,
                 reference_captured,
-                readability,
+                policy,
                 facts,
                 inherited_captured_slots,
             );
@@ -2108,11 +2121,17 @@ fn inline_temps_in_nested_blocks(
     }
 }
 
+#[derive(Clone, Copy)]
+struct RepeatInlinePolicy {
+    readability: ReadabilityOptions,
+    safety: HirExprSafety,
+}
+
 fn inline_repeat_head_scalar_temp(
     repeat_stmt: &mut crate::hir::common::HirRepeat,
     scratch: &mut TempUseScratch,
     live_use_counts: &mut [usize],
-    readability: ReadabilityOptions,
+    policy: RepeatInlinePolicy,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
@@ -2137,7 +2156,7 @@ fn inline_repeat_head_scalar_temp(
         // 候选拒绝[LayerBoundary]：condition 的唯一 use 位于 closure capture；其 source identity 由 locals/promotion owner 消费。
         return false;
     };
-    if !site.allows(value, readability) {
+    if !site.allows(value, policy.readability, policy.safety) {
         // 候选拒绝[PolicyBoundary]：repeat condition 服从控制头复杂度展示阈值。
         return false;
     }
@@ -2186,7 +2205,7 @@ fn inline_repeat_tail_temp(
     scratch: &mut TempUseScratch,
     live_use_counts: &mut [usize],
     reference_captured: &ReferenceCapturedBindings,
-    readability: ReadabilityOptions,
+    policy: RepeatInlinePolicy,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
@@ -2209,7 +2228,7 @@ fn inline_repeat_tail_temp(
         // 候选拒绝[LayerBoundary]：condition 的唯一 use 位于 closure capture；其 source identity 由 locals/promotion owner 消费。
         return false;
     };
-    if !site.allows(value, readability)
+    if !site.allows(value, policy.readability, policy.safety)
         || expr_requires_ordered_snapshot(value)
             && !temp_precedes_observable_eval_in_expr(
                 &repeat_stmt.cond,

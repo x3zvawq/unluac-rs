@@ -16,9 +16,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirUnaryOpKind, LocalId, ParamId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::expr_facts::expr_truthiness;
-use super::super::logical_simplify::{simplify_condition_truthiness_shape, simplify_logical_shape};
+use super::super::logical_simplify::{
+    simplify_condition_truthiness_shape_with_safety, simplify_logical_shape_with_safety,
+};
 use super::super::mention::stmts_reference_captured_bindings;
 use super::super::visit::{HirVisitor, visit_proto};
 use super::DiscardBoundaryFacts;
@@ -72,16 +75,21 @@ impl PathFacts {
     }
 }
 
-#[derive(Default)]
 struct StableBindingIndex {
     candidates: BTreeSet<StableBinding>,
     unstable: BTreeSet<StableBinding>,
     candidate_budget_exceeded: bool,
+    safety: HirExprSafety,
 }
 
 impl StableBindingIndex {
-    fn new(proto: &HirProto) -> Self {
-        let mut index = Self::default();
+    fn new(proto: &HirProto, safety: HirExprSafety) -> Self {
+        let mut index = Self {
+            candidates: BTreeSet::new(),
+            unstable: BTreeSet::new(),
+            candidate_budget_exceeded: false,
+            safety,
+        };
         visit_proto(proto, &mut index);
 
         let captured = stmts_reference_captured_bindings(&proto.body.stmts);
@@ -166,8 +174,9 @@ struct Flow {
 pub(super) fn specialize_stable_path_conditions(
     proto: &mut HirProto,
     discard_facts: &DiscardBoundaryFacts,
+    safety: HirExprSafety,
 ) -> bool {
-    let stable = StableBindingIndex::new(proto);
+    let stable = StableBindingIndex::new(proto, safety);
     if stable.candidate_budget_exceeded {
         // 分析停用[ResourceLimit]：单 proto 最多追踪 256 个条件 binding，后续应改为按 block/活跃事实裁剪而非放弃整个 proto。
         return false;
@@ -334,7 +343,7 @@ fn rewrite_stmt(
         }
         HirStmt::If(if_stmt) => {
             *changed |= specialize_condition(&mut if_stmt.cond, &facts, stable);
-            let condition_truthiness = expr_truthiness(&if_stmt.cond);
+            let condition_truthiness = expr_truthiness(&if_stmt.cond, stable.safety);
             let then_facts = facts_for_condition(&facts, &if_stmt.cond, true, stable);
             let else_facts = facts_for_condition(&facts, &if_stmt.cond, false, stable);
             let then_reachable = condition_truthiness != Some(false) && then_facts.is_some();
@@ -459,7 +468,7 @@ fn record_local_declaration(
     };
     let binding = StableBinding::Local(*local);
     if stable.contains(binding)
-        && let Some(truthy) = expr_truthiness(value)
+        && let Some(truthy) = expr_truthiness(value, stable.safety)
     {
         let inserted = facts.insert(binding, truthy);
         debug_assert!(
@@ -493,8 +502,8 @@ fn specialize_condition(
         _ => false,
     };
     loop {
-        let replacement =
-            simplify_logical_shape(expr).or_else(|| simplify_condition_truthiness_shape(expr));
+        let replacement = simplify_logical_shape_with_safety(expr, stable.safety)
+            .or_else(|| simplify_condition_truthiness_shape_with_safety(expr, stable.safety));
         let Some(replacement) = replacement.filter(|replacement| replacement != expr) else {
             break;
         };
@@ -520,7 +529,7 @@ fn extend_condition_facts(
     truthy: bool,
     stable: &StableBindingIndex,
 ) -> bool {
-    if let Some(known) = expr_truthiness(expr) {
+    if let Some(known) = expr_truthiness(expr, stable.safety) {
         return known == truthy;
     }
 

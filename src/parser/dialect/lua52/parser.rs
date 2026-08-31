@@ -11,8 +11,7 @@ use crate::parser::family::puc_lua::{
     collect_counted, count_u8, decode_instruction_word, define_puc_lua_instruction_codec,
     finish_puc_lua_proto, inherit_source, parse_classic_debug_sections,
     parse_puc_lua_instruction_section, parse_tagged_literal_pool, parse_upvalue_descriptors,
-    read_proto_prelude, read_sized_i64, read_sized_u32, require_present,
-    validate_instruction_word_size,
+    read_proto_prelude, read_sized_u32, require_present, validate_instruction_word_size,
 };
 use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
@@ -249,7 +248,13 @@ impl Lua52Parser {
                     LUA_TBOOLEAN => RawLiteralConst::Boolean(reader.read_u8()? != 0),
                     LUA_TNUMBER => {
                         if layout.integral_number {
-                            RawLiteralConst::Integer(read_sized_i64(reader, layout, "lua_Number")?)
+                            // integral-number chunk 按 number_size 编码 lua_Number，不能使用
+                            // header 中代表 sizeof(int) 的 integer_size。
+                            RawLiteralConst::Integer(reader.read_i64_sized(
+                                layout.number_size,
+                                layout.endianness,
+                                "lua_Number",
+                            )?)
                         } else {
                             RawLiteralConst::Number(
                                 reader.read_f64_sized(layout.number_size, layout.endianness)?,

@@ -37,6 +37,7 @@ mod seeds;
 use std::collections::BTreeSet;
 
 use crate::hir::common::{HirBlock, HirProto, HirStmt, LocalId};
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::temp_touch::{RefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt};
@@ -68,6 +69,7 @@ struct HandoffSafety<'a> {
 pub(super) fn collapse_carried_local_handoffs_in_proto(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
+    expr_safety: HirExprSafety,
 ) -> bool {
     let branch_copies_changed = prune_redundant_branch_state_copies(proto);
     let snapshots_changed = repeat_snapshots::coalesce_repeat_terminal_snapshots(proto);
@@ -86,6 +88,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
             promotion_facts,
             &identity_facts,
             &BTreeSet::new(),
+            expr_safety,
         )
 }
 
@@ -97,6 +100,7 @@ fn collapse_handoffs_recursive(
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
     inherited_locals: &BTreeSet<LocalId>,
+    expr_safety: HirExprSafety,
 ) -> bool {
     let mut changed = false;
     let mut visible_locals = inherited_locals.clone();
@@ -138,6 +142,7 @@ fn collapse_handoffs_recursive(
                 promotion_facts,
                 identity_facts,
                 &child_locals,
+                expr_safety,
             );
         });
 
@@ -164,6 +169,7 @@ fn collapse_handoffs_recursive(
         promotion_facts,
         identity_facts,
         inherited_locals,
+        expr_safety,
     );
     changed |= prune_redundant_copy_stmts(block);
     changed
@@ -175,6 +181,7 @@ fn collapse_block_handoffs(
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
     inherited_locals: &BTreeSet<LocalId>,
+    expr_safety: HirExprSafety,
 ) -> bool {
     let mut changed = collapse_result_writeback_transactions(
         block,
@@ -237,6 +244,7 @@ fn collapse_block_handoffs(
                     index,
                     promotion_facts,
                     identity_facts,
+                    expr_safety,
                 ) {
                     action = Some(HandoffAction::RetrySameIndex);
                     break;

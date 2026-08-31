@@ -15,6 +15,7 @@ use crate::hir::common::{
     HirBlock, HirCallStmt, HirErrNil, HirLValue, HirLocalDecl, HirProto, HirReturn, HirStmt,
     HirTableSetList, HirToBeClosed, LocalId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::walk::rewrite_nested_blocks_in_stmt;
 use super::eliminate_materialize::{
@@ -25,7 +26,10 @@ use super::eliminate_materialize::{
 };
 use super::eliminate_state::EliminationState;
 
-pub(crate) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bool {
+pub(crate) fn eliminate_remaining_decisions_in_proto(
+    proto: &mut HirProto,
+    safety: HirExprSafety,
+) -> bool {
     let mut next_local_index = proto.locals.len();
     let mut new_locals = Vec::new();
     let mut new_local_debug_hints = Vec::new();
@@ -34,6 +38,7 @@ pub(crate) fn eliminate_remaining_decisions_in_proto(proto: &mut HirProto) -> bo
         &mut next_local_index,
         &mut new_locals,
         &mut new_local_debug_hints,
+        safety,
     );
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
@@ -45,6 +50,7 @@ fn eliminate_block(
     next_local_index: &mut usize,
     new_locals: &mut Vec<LocalId>,
     new_local_debug_hints: &mut Vec<Option<String>>,
+    safety: HirExprSafety,
 ) -> bool {
     let mut changed = false;
     let mut rewritten = Vec::with_capacity(block.stmts.len());
@@ -56,7 +62,7 @@ fn eliminate_block(
     };
 
     for stmt in original {
-        let (mut lowered, stmt_changed) = eliminate_stmt(stmt, &mut state);
+        let (mut lowered, stmt_changed) = eliminate_stmt(stmt, &mut state, safety);
         changed |= stmt_changed;
         rewritten.append(&mut lowered);
     }
@@ -65,7 +71,11 @@ fn eliminate_block(
     changed
 }
 
-fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirStmt>, bool) {
+fn eliminate_stmt(
+    stmt: HirStmt,
+    state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
+) -> (Vec<HirStmt>, bool) {
     match stmt {
         HirStmt::LocalDecl(local_decl)
             if local_decl.bindings.len() == 1
@@ -85,6 +95,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 value,
                 HirLValue::Local(binding),
                 state,
+                safety,
             ));
             (stmts, true)
         }
@@ -106,10 +117,14 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
                 .into_iter()
                 .next()
                 .expect("single-value assign should stay non-empty");
-            (materialize_expr_for_assignment(value, target, state), true)
+            (
+                materialize_expr_for_assignment(value, target, state, safety),
+                true,
+            )
         }
         HirStmt::LocalDecl(local_decl) => {
-            let (mut prefix, values, changed) = extract_value_pack(local_decl.values, state);
+            let (mut prefix, values, changed) =
+                extract_value_pack(local_decl.values, state, safety);
             prefix.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: local_decl.bindings,
                 values,
@@ -117,13 +132,17 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::Assign(assign) => {
-            let (mut prefix, assign, changed) = extract_assign(*assign, state);
+            let (mut prefix, assign, changed) = extract_assign(*assign, state, safety);
             prefix.push(HirStmt::Assign(Box::new(assign)));
             (prefix, changed)
         }
         HirStmt::TableSetList(set_list) => {
-            let (mut prefix, mut leading, values, changed) =
-                extract_value_pack_with_leading(vec![set_list.base], set_list.values, state);
+            let (mut prefix, mut leading, values, changed) = extract_value_pack_with_leading(
+                vec![set_list.base],
+                set_list.values,
+                state,
+                safety,
+            );
             let base = leading
                 .pop()
                 .expect("table-set-list extraction should preserve its base");
@@ -135,7 +154,7 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::ErrNil(err_nil) => {
-            let (mut prefix, value, changed) = extract_value_expr(err_nil.value, state);
+            let (mut prefix, value, changed) = extract_value_expr(err_nil.value, state, safety);
             prefix.push(HirStmt::ErrNil(Box::new(HirErrNil {
                 value,
                 name: err_nil.name,
@@ -143,7 +162,8 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::ToBeClosed(to_be_closed) => {
-            let (mut prefix, value, changed) = extract_value_expr(to_be_closed.value, state);
+            let (mut prefix, value, changed) =
+                extract_value_expr(to_be_closed.value, state, safety);
             prefix.push(HirStmt::ToBeClosed(Box::new(HirToBeClosed {
                 origin: to_be_closed.origin,
                 reg_index: to_be_closed.reg_index,
@@ -152,50 +172,52 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
             (prefix, changed)
         }
         HirStmt::CallStmt(call_stmt) => {
-            let (mut prefix, call, changed) = extract_call_expr(call_stmt.call, state);
+            let (mut prefix, call, changed) = extract_call_expr(call_stmt.call, state, safety);
             prefix.push(HirStmt::CallStmt(Box::new(HirCallStmt { call })));
             (prefix, changed)
         }
         HirStmt::Return(ret) => {
-            let (mut prefix, values, changed) = extract_value_pack(ret.values, state);
+            let (mut prefix, values, changed) = extract_value_pack(ret.values, state, safety);
             prefix.push(HirStmt::Return(Box::new(HirReturn { values })));
             (prefix, changed)
         }
         HirStmt::If(mut if_stmt) => {
-            let cond_changed = eliminate_condition_expr(&mut if_stmt.cond);
+            let cond_changed = eliminate_condition_expr(&mut if_stmt.cond, safety);
             let mut stmt = HirStmt::If(if_stmt);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::While(mut while_stmt) => {
-            let cond_changed = eliminate_condition_expr(&mut while_stmt.cond);
+            let cond_changed = eliminate_condition_expr(&mut while_stmt.cond, safety);
             let mut stmt = HirStmt::While(while_stmt);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             (vec![stmt], cond_changed || nested_changed)
         }
         HirStmt::Repeat(mut repeat_stmt) => {
-            let cond_changed = eliminate_condition_expr(&mut repeat_stmt.cond);
+            let cond_changed = eliminate_condition_expr(&mut repeat_stmt.cond, safety);
             let mut stmt = HirStmt::Repeat(repeat_stmt);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             (vec![stmt], nested_changed || cond_changed)
         }
         HirStmt::NumericFor(numeric_for) => {
-            let (mut prefix, numeric_for, changed) = extract_numeric_for(numeric_for, state);
+            let (mut prefix, numeric_for, changed) =
+                extract_numeric_for(numeric_for, state, safety);
             let mut stmt = HirStmt::NumericFor(numeric_for);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             prefix.push(stmt);
             (prefix, changed || nested_changed)
         }
         HirStmt::GenericFor(generic_for) => {
-            let (mut prefix, generic_for, changed) = extract_generic_for(generic_for, state);
+            let (mut prefix, generic_for, changed) =
+                extract_generic_for(generic_for, state, safety);
             let mut stmt = HirStmt::GenericFor(generic_for);
-            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            let nested_changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             prefix.push(stmt);
             (prefix, changed || nested_changed)
         }
         HirStmt::Block(block) => {
             let mut stmt = HirStmt::Block(block);
-            let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state);
+            let changed = eliminate_nested_blocks_in_stmt(&mut stmt, state, safety);
             (vec![stmt], changed)
         }
         HirStmt::Break
@@ -206,13 +228,18 @@ fn eliminate_stmt(stmt: HirStmt, state: &mut EliminationState<'_>) -> (Vec<HirSt
     }
 }
 
-fn eliminate_nested_blocks_in_stmt(stmt: &mut HirStmt, state: &mut EliminationState<'_>) -> bool {
+fn eliminate_nested_blocks_in_stmt(
+    stmt: &mut HirStmt,
+    state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
+) -> bool {
     rewrite_nested_blocks_in_stmt(stmt, &mut |block| {
         eliminate_block(
             block,
             state.next_local_index,
             state.new_locals,
             state.new_local_debug_hints,
+            safety,
         )
     })
 }

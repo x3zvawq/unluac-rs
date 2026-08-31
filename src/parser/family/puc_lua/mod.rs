@@ -24,9 +24,7 @@ pub(crate) use self::instruction::{
     PucLuaInstructionCodec, decode_instruction_word, decode_instruction_word_54,
     decode_instruction_word_55, parse_puc_lua_instruction_section,
 };
-pub(crate) use self::layout::{
-    RawInstructionWord, read_layout_lua_integer, read_sized_i64, read_sized_u32,
-};
+pub(crate) use self::layout::{RawInstructionWord, read_layout_lua_integer, read_sized_u32};
 pub(crate) use self::macros::{define_puc_lua_instruction_codec, define_puc_lua_opcodes};
 pub(crate) use self::proto::{
     PucLuaProtoSections, finish_puc_lua_proto, inherit_source, read_proto_prelude,

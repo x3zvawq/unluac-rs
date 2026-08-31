@@ -12,30 +12,63 @@
 use std::collections::BTreeSet;
 
 use super::super::common::{
-    AstBinaryOpKind, AstExpr, AstNameRef, AstTableField, AstTableKey, AstUnaryOpKind,
+    AstBinaryOpKind, AstExpr, AstNameRef, AstTableField, AstTableKey, AstTargetDialect,
+    AstUnaryOpKind,
 };
+use crate::decompile::DecompileDialect;
 
-/// 只计算同类型原始字面量比较。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MixedNumericMode {
+    Unknown,
+    ExactIntegerFloat,
+    LuaJitBinary64,
+    LuauBinary64,
+}
+
+/// 计算目标方言能够证明的原始字面量比较。
 ///
-/// 这份证明与 HIR 的同名规则保持一致：不跨数值表示，不触碰 cdata/vector/complex，
-/// 也不把非有限 number 当成无运行时事件的字面量。调用方只能把 `Some` 当作可安全
-/// 删除比较壳的事实，`None` 必须保留原表达式。
+/// 混合 Integer/Number 仅在目标数值域可精确模拟时折叠；cdata/vector/complex 与非有限
+/// number 仍保留原表达式。调用方只能把 `Some` 当作可安全删除比较壳的事实。
 pub(super) fn primitive_literal_comparison_value(
     op: AstBinaryOpKind,
     lhs: &AstExpr,
     rhs: &AstExpr,
+    target: AstTargetDialect,
 ) -> Option<bool> {
     if op == AstBinaryOpKind::Eq {
-        return match (lhs, rhs) {
+        let value = match (lhs, rhs) {
             (AstExpr::Integer(lhs), AstExpr::Integer(rhs)) => Some(lhs == rhs),
             (AstExpr::Number(lhs), AstExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
                 Some(lhs == rhs)
+            }
+            (AstExpr::Integer(integer), AstExpr::Number(number))
+            | (AstExpr::Number(number), AstExpr::Integer(integer)) => {
+                mixed_integer_number_equal(mixed_numeric_mode(target), *integer, *number)
             }
             (AstExpr::String(lhs), AstExpr::String(rhs)) => Some(lhs == rhs),
             (AstExpr::Boolean(lhs), AstExpr::Boolean(rhs)) => Some(lhs == rhs),
             (AstExpr::Nil, AstExpr::Nil) => Some(true),
             _ => None,
         };
+        if value.is_some() {
+            return value;
+        }
+        if matches!(
+            (lhs, rhs),
+            (AstExpr::Integer(_), AstExpr::Number(_))
+                | (AstExpr::Number(_), AstExpr::Integer(_))
+                | (AstExpr::Number(_), AstExpr::Number(_))
+        ) || matches!(lhs, AstExpr::Number(value) if !value.is_finite())
+            || matches!(rhs, AstExpr::Number(value) if !value.is_finite())
+        {
+            // 候选拒绝[TargetConstraint]：Integer/Number 的目标数值域或源码物化无法精确证明，不能按宿主表示直接判等。
+            return None;
+        }
+        if is_metamethod_inert_literal(lhs) && is_metamethod_inert_literal(rhs) {
+            return Some(false);
+        }
+        // 候选拒绝[TargetConstraint]：cdata、vector 与 complex 的 equality 及源码物化是方言专属语义，不能按普通 primitive 类型不匹配处理。
+        return None;
     }
 
     let ordering = match (lhs, rhs) {
@@ -43,13 +76,130 @@ pub(super) fn primitive_literal_comparison_value(
         (AstExpr::Number(lhs), AstExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
             lhs.partial_cmp(rhs)?
         }
-        (AstExpr::String(lhs), AstExpr::String(rhs)) => lhs.cmp(rhs),
+        (AstExpr::Integer(integer), AstExpr::Number(number)) => {
+            mixed_integer_number_ordering(mixed_numeric_mode(target), *integer, *number)?
+        }
+        (AstExpr::Number(number), AstExpr::Integer(integer)) => {
+            mixed_integer_number_ordering(mixed_numeric_mode(target), *integer, *number)?.reverse()
+        }
+        (AstExpr::String(lhs), AstExpr::String(rhs)) => {
+            // 候选拒绝[SemanticBarrier:Locale]：PUC Lua 的 `strcoll` 结果可被 `os.setlocale` 改写，regress_392 证明不能用宿主字节序替代。
+            if !target.version.literal_string_order_is_binary() {
+                return None;
+            }
+            lhs.cmp(rhs)
+        }
         _ => return None,
     };
     match op {
         AstBinaryOpKind::Lt => Some(ordering == std::cmp::Ordering::Less),
         AstBinaryOpKind::Le => Some(ordering != std::cmp::Ordering::Greater),
         _ => None,
+    }
+}
+
+fn mixed_numeric_mode(target: AstTargetDialect) -> MixedNumericMode {
+    match target.version {
+        DecompileDialect::Lua53 | DecompileDialect::Lua54 | DecompileDialect::Lua55 => {
+            MixedNumericMode::ExactIntegerFloat
+        }
+        DecompileDialect::Luajit => MixedNumericMode::LuaJitBinary64,
+        DecompileDialect::Luau => MixedNumericMode::LuauBinary64,
+        DecompileDialect::Auto | DecompileDialect::Lua51 | DecompileDialect::Lua52 => {
+            MixedNumericMode::Unknown
+        }
+    }
+}
+
+fn mixed_integer_number_equal(mode: MixedNumericMode, integer: i64, number: f64) -> Option<bool> {
+    if !number.is_finite() {
+        return None;
+    }
+    match mode {
+        MixedNumericMode::ExactIntegerFloat => {
+            const UPPER: f64 = 9_223_372_036_854_775_808.0;
+            Some(
+                number.fract() == 0.0
+                    && number >= i64::MIN as f64
+                    && number < UPPER
+                    && number as i64 == integer,
+            )
+        }
+        MixedNumericMode::LuaJitBinary64 | MixedNumericMode::LuauBinary64 => {
+            const MAX_EXACT: i64 = 9_007_199_254_740_992;
+            let max_integer = if mode == MixedNumericMode::LuaJitBinary64 {
+                i64::from(i32::MAX)
+            } else {
+                MAX_EXACT
+            };
+            let min_integer = if mode == MixedNumericMode::LuaJitBinary64 {
+                i64::from(i32::MIN)
+            } else {
+                -MAX_EXACT
+            };
+            (integer >= min_integer && integer <= max_integer).then_some(integer as f64 == number)
+        }
+        MixedNumericMode::Unknown => {
+            // 候选拒绝[TargetConstraint]：目标未声明 Integer/Number 的共同数值域，不能证明比较结果。
+            None
+        }
+    }
+}
+
+fn mixed_integer_number_ordering(
+    mode: MixedNumericMode,
+    integer: i64,
+    number: f64,
+) -> Option<std::cmp::Ordering> {
+    if !number.is_finite() {
+        return None;
+    }
+    match mode {
+        MixedNumericMode::LuaJitBinary64 | MixedNumericMode::LuauBinary64 => {
+            const MAX_EXACT: i64 = 9_007_199_254_740_992;
+            let max_integer = if mode == MixedNumericMode::LuaJitBinary64 {
+                i64::from(i32::MAX)
+            } else {
+                MAX_EXACT
+            };
+            let min_integer = if mode == MixedNumericMode::LuaJitBinary64 {
+                i64::from(i32::MIN)
+            } else {
+                -MAX_EXACT
+            };
+            (integer >= min_integer && integer <= max_integer)
+                .then(|| (integer as f64).partial_cmp(&number))
+                .flatten()
+        }
+        MixedNumericMode::ExactIntegerFloat => {
+            const UPPER: f64 = 9_223_372_036_854_775_808.0;
+            const LOWER: f64 = -9_223_372_036_854_775_808.0;
+            if number >= UPPER {
+                return Some(std::cmp::Ordering::Less);
+            }
+            if number < LOWER {
+                return Some(std::cmp::Ordering::Greater);
+            }
+            let ceil = number.ceil();
+            if ceil >= UPPER {
+                return Some(std::cmp::Ordering::Less);
+            }
+            let floor = number.floor();
+            if floor < LOWER {
+                return Some(std::cmp::Ordering::Greater);
+            }
+            if integer < ceil as i64 {
+                Some(std::cmp::Ordering::Less)
+            } else if integer > floor as i64 {
+                Some(std::cmp::Ordering::Greater)
+            } else {
+                Some(std::cmp::Ordering::Equal)
+            }
+        }
+        MixedNumericMode::Unknown => {
+            // 候选拒绝[TargetConstraint]：目标未声明 Integer/Number 的共同数值域，不能证明比较结果。
+            None
+        }
     }
 }
 
@@ -127,11 +277,12 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
         | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. } => true,
+        | AstExpr::String(_) => true,
+        // 这些 AST 节点表示原 proto 的常量加载；generator 为重建常量选择的
+        // cdata/vector constructor 不是原 VM 求值事件，不能反向阻止删除死加载。
+        AstExpr::Int64(_) | AstExpr::UInt64(_) | AstExpr::Vector(_) | AstExpr::Complex { .. } => {
+            true
+        }
         AstExpr::Var(
             AstNameRef::Param(_)
             | AstNameRef::Local(_)
@@ -388,7 +539,256 @@ pub(super) fn is_stable_copy_alias_expr(expr: &AstExpr) -> bool {
     collect_stable_copy_snapshot_names(expr, &mut BTreeSet::new())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventlessLiteralKind {
+    Nil,
+    Boolean,
+    Integer(ZeroKnowledge),
+    Number(ZeroKnowledge),
+    String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZeroKnowledge {
+    Zero,
+    NonZero,
+    Unknown,
+}
+
+impl EventlessLiteralKind {
+    fn integer_pair_arithmetic_is_defined(
+        lhs: Self,
+        rhs: Self,
+        integer_arithmetic_is_defined: bool,
+    ) -> bool {
+        integer_arithmetic_is_defined || !matches!((lhs, rhs), (Self::Integer(_), Self::Integer(_)))
+    }
+
+    fn numeric_result(lhs: Self, rhs: Self, integer_arithmetic_is_defined: bool) -> Option<Self> {
+        match (lhs, rhs) {
+            (Self::Integer(_), Self::Integer(_)) => {
+                integer_arithmetic_is_defined.then_some(Self::Integer(ZeroKnowledge::Unknown))
+            }
+            (Self::Integer(_), Self::Number(_))
+            | (Self::Number(_), Self::Integer(_))
+            | (Self::Number(_), Self::Number(_)) => Some(Self::Number(ZeroKnowledge::Unknown)),
+            _ => None,
+        }
+    }
+
+    fn number_result(lhs: Self, rhs: Self, integer_arithmetic_is_defined: bool) -> Option<Self> {
+        (lhs.is_numeric()
+            && rhs.is_numeric()
+            && Self::integer_pair_arithmetic_is_defined(lhs, rhs, integer_arithmetic_is_defined))
+        .then_some(Self::Number(ZeroKnowledge::Unknown))
+    }
+
+    fn is_numeric(self) -> bool {
+        matches!(self, Self::Integer(_) | Self::Number(_))
+    }
+
+    fn is_definitely_nonzero_numeric(self) -> bool {
+        matches!(
+            self,
+            Self::Integer(ZeroKnowledge::NonZero) | Self::Number(ZeroKnowledge::NonZero)
+        )
+    }
+}
+
+/// 递归证明 primitive literal 运算树的求值不会 lookup、调用元方法或抛错。
+///
+/// 这里只保留求值所需的类型与“确定非零”事实，不计算结果；因此字符串排序采用何种
+/// locale 不影响丢弃证明。Lua 5.1/5.2 chunk 可以声明自定义 integral-number 布局，
+/// 但该布局事实尚未进入 AST target；目标无关调用和这两个目标都会拒绝 Integer 算术。
+fn eventless_literal_kind(
+    expr: &AstExpr,
+    integer_arithmetic_is_defined: bool,
+) -> Option<EventlessLiteralKind> {
+    match expr {
+        AstExpr::Nil => Some(EventlessLiteralKind::Nil),
+        AstExpr::Boolean(_) => Some(EventlessLiteralKind::Boolean),
+        AstExpr::Integer(value) => Some(EventlessLiteralKind::Integer(if *value == 0 {
+            ZeroKnowledge::Zero
+        } else {
+            ZeroKnowledge::NonZero
+        })),
+        AstExpr::Number(value) => Some(EventlessLiteralKind::Number(if *value == 0.0 {
+            ZeroKnowledge::Zero
+        } else {
+            ZeroKnowledge::NonZero
+        })),
+        AstExpr::String(_) => Some(EventlessLiteralKind::String),
+        AstExpr::SingleValue(inner) => eventless_literal_kind(inner, integer_arithmetic_is_defined),
+        AstExpr::Unary(unary) => {
+            let operand = eventless_literal_kind(&unary.expr, integer_arithmetic_is_defined)?;
+            match unary.op {
+                AstUnaryOpKind::Not => Some(EventlessLiteralKind::Boolean),
+                AstUnaryOpKind::Neg
+                    if operand.is_numeric()
+                        && (integer_arithmetic_is_defined
+                            || !matches!(operand, EventlessLiteralKind::Integer(_))) =>
+                {
+                    Some(operand)
+                }
+                AstUnaryOpKind::BitNot if matches!(operand, EventlessLiteralKind::Integer(_)) => {
+                    Some(EventlessLiteralKind::Integer(ZeroKnowledge::Unknown))
+                }
+                AstUnaryOpKind::Length if operand == EventlessLiteralKind::String => {
+                    Some(EventlessLiteralKind::Integer(ZeroKnowledge::Unknown))
+                }
+                AstUnaryOpKind::Neg | AstUnaryOpKind::BitNot | AstUnaryOpKind::Length => None,
+            }
+        }
+        AstExpr::Binary(binary) => {
+            let lhs = eventless_literal_kind(&binary.lhs, integer_arithmetic_is_defined)?;
+            let rhs = eventless_literal_kind(&binary.rhs, integer_arithmetic_is_defined)?;
+            match binary.op {
+                AstBinaryOpKind::Add | AstBinaryOpKind::Sub | AstBinaryOpKind::Mul => {
+                    EventlessLiteralKind::numeric_result(lhs, rhs, integer_arithmetic_is_defined)
+                }
+                AstBinaryOpKind::Div if lhs.is_numeric() && rhs.is_definitely_nonzero_numeric() => {
+                    EventlessLiteralKind::number_result(lhs, rhs, integer_arithmetic_is_defined)
+                }
+                AstBinaryOpKind::Pow => {
+                    EventlessLiteralKind::number_result(lhs, rhs, integer_arithmetic_is_defined)
+                }
+                AstBinaryOpKind::FloorDiv | AstBinaryOpKind::Mod
+                    if rhs.is_definitely_nonzero_numeric() =>
+                {
+                    EventlessLiteralKind::numeric_result(lhs, rhs, integer_arithmetic_is_defined)
+                }
+                AstBinaryOpKind::BitAnd
+                | AstBinaryOpKind::BitOr
+                | AstBinaryOpKind::BitXor
+                | AstBinaryOpKind::Shl
+                | AstBinaryOpKind::Shr
+                    if matches!(lhs, EventlessLiteralKind::Integer(_))
+                        && matches!(rhs, EventlessLiteralKind::Integer(_)) =>
+                {
+                    Some(EventlessLiteralKind::Integer(ZeroKnowledge::Unknown))
+                }
+                AstBinaryOpKind::Eq => Some(EventlessLiteralKind::Boolean),
+                AstBinaryOpKind::Lt | AstBinaryOpKind::Le
+                    if (lhs.is_numeric() && rhs.is_numeric())
+                        || (lhs == EventlessLiteralKind::String
+                            && rhs == EventlessLiteralKind::String) =>
+                {
+                    Some(EventlessLiteralKind::Boolean)
+                }
+                AstBinaryOpKind::Div
+                | AstBinaryOpKind::FloorDiv
+                | AstBinaryOpKind::Mod
+                | AstBinaryOpKind::BitAnd
+                | AstBinaryOpKind::BitOr
+                | AstBinaryOpKind::BitXor
+                | AstBinaryOpKind::Shl
+                | AstBinaryOpKind::Shr
+                | AstBinaryOpKind::Concat
+                | AstBinaryOpKind::Lt
+                | AstBinaryOpKind::Le => None,
+            }
+        }
+        AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => None,
+    }
+}
+
+fn stable_literal_equality(
+    op: AstBinaryOpKind,
+    lhs: &AstExpr,
+    rhs: &AstExpr,
+    dynamic_primitive_equality_is_eventless: bool,
+) -> bool {
+    dynamic_primitive_equality_is_eventless
+        && op == AstBinaryOpKind::Eq
+        && (is_metamethod_inert_literal(lhs) || is_metamethod_inert_literal(rhs))
+}
+
+fn is_metamethod_inert_literal(expr: &AstExpr) -> bool {
+    matches!(
+        expr,
+        AstExpr::Nil
+            | AstExpr::Boolean(_)
+            | AstExpr::Integer(_)
+            | AstExpr::Number(_)
+            | AstExpr::String(_)
+    )
+}
+
+fn target_defines_integer_literal_arithmetic(target: AstTargetDialect) -> bool {
+    matches!(
+        target.version,
+        DecompileDialect::Lua53
+            | DecompileDialect::Lua54
+            | DecompileDialect::Lua55
+            | DecompileDialect::Luajit
+            | DecompileDialect::Luau
+    )
+}
+
+fn target_defines_dynamic_primitive_equality(target: AstTargetDialect) -> bool {
+    matches!(
+        target.version,
+        DecompileDialect::Lua51
+            | DecompileDialect::Lua52
+            | DecompileDialect::Lua53
+            | DecompileDialect::Lua54
+            | DecompileDialect::Lua55
+            | DecompileDialect::Luau
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiscardSafetyFacts {
+    integer_arithmetic_is_defined: bool,
+    dynamic_primitive_equality_is_eventless: bool,
+}
+
+/// 表达式的整次求值能否在结果无人使用时删除。
+///
+/// `not` 只测试 truthiness，短路逻辑只选择已有操作数，裸 vararg 只读取当前调用帧；
+/// primitive literal 运算树按类型、错误条件和目标整数语义递归证明。其它访问、调用和
+/// 对象构造仍需由各自的事件/生命周期证明处理。目标无关调用会保守拒绝 Integer 算术
+/// 以及 dynamic/primitive equality。
 pub(super) fn is_discard_safe_expr(expr: &AstExpr) -> bool {
+    is_discard_safe_expr_with_facts(
+        expr,
+        DiscardSafetyFacts {
+            integer_arithmetic_is_defined: false,
+            dynamic_primitive_equality_is_eventless: false,
+        },
+    )
+}
+
+pub(super) fn is_discard_safe_expr_for_target(expr: &AstExpr, target: AstTargetDialect) -> bool {
+    is_discard_safe_expr_with_facts(
+        expr,
+        DiscardSafetyFacts {
+            integer_arithmetic_is_defined: target_defines_integer_literal_arithmetic(target),
+            // LuaJIT cdata metatypes may invoke `__eq` even when the other operand is nil,
+            // boolean, number, or string. PUC/Luau use the standard primitive mismatch path;
+            // unresolved Auto has no target proof and remains conservative.
+            dynamic_primitive_equality_is_eventless: target_defines_dynamic_primitive_equality(
+                target,
+            ),
+        },
+    )
+}
+
+fn is_discard_safe_expr_with_facts(expr: &AstExpr, facts: DiscardSafetyFacts) -> bool {
     match expr {
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -406,17 +806,38 @@ pub(super) fn is_discard_safe_expr(expr: &AstExpr) -> bool {
             | AstNameRef::Temp(_)
             | AstNameRef::Upvalue(_),
         ) => true,
-        AstExpr::SingleValue(expr) => is_discard_safe_expr(expr),
+        AstExpr::VarArg => true,
+        AstExpr::SingleValue(expr) => is_discard_safe_expr_with_facts(expr, facts),
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
+            is_discard_safe_expr_with_facts(&unary.expr, facts)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            is_discard_safe_expr_with_facts(&logical.lhs, facts)
+                && is_discard_safe_expr_with_facts(&logical.rhs, facts)
+        }
+        AstExpr::Binary(binary)
+            if stable_literal_equality(
+                binary.op,
+                &binary.lhs,
+                &binary.rhs,
+                facts.dynamic_primitive_equality_is_eventless,
+            ) =>
+        {
+            is_discard_safe_expr_with_facts(&binary.lhs, facts)
+                && is_discard_safe_expr_with_facts(&binary.rhs, facts)
+        }
+        AstExpr::Unary(_) | AstExpr::Binary(_)
+            if eventless_literal_kind(expr, facts.integer_arithmetic_is_defined).is_some() =>
+        {
+            true
+        }
         AstExpr::Var(AstNameRef::Global(_))
         | AstExpr::FieldAccess(_)
         | AstExpr::IndexAccess(_)
         | AstExpr::Unary(_)
         | AstExpr::Binary(_)
-        | AstExpr::LogicalAnd(_)
-        | AstExpr::LogicalOr(_)
         | AstExpr::Call(_)
         | AstExpr::MethodCall(_)
-        | AstExpr::VarArg
         | AstExpr::TableConstructor(_)
         | AstExpr::FunctionExpr(_)
         | AstExpr::Error(_) => false,

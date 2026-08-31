@@ -76,6 +76,14 @@ impl DecompileDialect {
             },
         }
     }
+
+    /// 目标 VM 的字符串顺序比较是否固定为无符号字节词典序。
+    ///
+    /// PUC Lua 5.1-5.5 使用当前 `LC_COLLATE` 下的 `strcoll`；只有 LuaJIT 与 Luau
+    /// 的 VM 顺序与反编译器内部 [`crate::LuaString`] 的字节序严格一致。
+    pub(crate) const fn literal_string_order_is_binary(self) -> bool {
+        matches!(self, Self::Luajit | Self::Luau)
+    }
 }
 
 /// 一次主反编译调用的顶层选项。

@@ -7,13 +7,14 @@
 //! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
 //! 或 cleanup 边界时才允许穿过。消费者可以保留已配对的两次 materialization，也可以在
 //! 更窄的改写仍保持同一覆盖事务时，连同 owner 已证明的 physical home 一起消费该 pair。
+//! 潜在求值事件与分支覆盖值的 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId,
 };
-use crate::hir::expr_safety::{expr_is_discard_safe_without_residual, expr_result_is_gc_inert};
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
@@ -198,6 +199,7 @@ impl LookupGcRootOverwritePair {
 pub(super) fn collect_call_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
     observe_potential_events: bool,
     mut producer_temp_is_eligible: impl FnMut(TempId) -> bool,
     mut overwrite_temp_is_eligible: impl FnMut(TempId) -> bool,
@@ -213,7 +215,7 @@ pub(super) fn collect_call_root_lifetimes(
     for (index, stmt) in stmts.iter().enumerate() {
         if uses.is_gc_fence(index) {
             preserve_active_call_roots(&mut active, &mut lifetimes);
-        } else if observe_potential_events && stmt_may_observe_gc_roots(stmt) {
+        } else if observe_potential_events && stmt_may_observe_gc_roots(stmt, safety) {
             // A potential user-code/GC event matters only if a later same-home overwrite proves
             // the end of this transaction. Unlike an explicit collection fence, this does not
             // by itself justify materializing every still-active call result.
@@ -336,6 +338,7 @@ pub(super) fn collect_call_root_lifetimes(
                 stmt,
                 facts,
                 &mut overwrite_temp_is_eligible,
+                safety,
             ) {
                 if let Some(root) = active.remove(&overwrite.home) {
                     record_call_root_overwrite(
@@ -490,6 +493,7 @@ pub(super) fn collect_call_root_lifetimes(
 pub(super) fn collect_lookup_gc_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
     mut temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> LookupGcRootLifetimeIndices {
     let uses = TempUseEvents::new(stmts);
@@ -545,7 +549,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 continue;
             }
             if let Some(overwrite) =
-                definite_gc_inert_branch_home_overwrite(stmt, facts, &mut temp_is_eligible)
+                definite_gc_inert_branch_home_overwrite(stmt, facts, &mut temp_is_eligible, safety)
             {
                 for temp in &overwrite.temps {
                     value_by_temp.remove(temp);
@@ -781,6 +785,7 @@ fn definite_gc_inert_branch_home_overwrite(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
+    safety: HirExprSafety,
 ) -> Option<ExactBranchHomeOverwrite> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
@@ -788,7 +793,7 @@ fn definite_gc_inert_branch_home_overwrite(
     let else_block = if_stmt.else_block.as_ref()?;
     let (then_temp, then_value) = single_scalar_temp_write(&if_stmt.then_block)?;
     let (else_temp, else_value) = single_scalar_temp_write(else_block)?;
-    if !expr_result_is_gc_inert(then_value) || !expr_result_is_gc_inert(else_value) {
+    if !safety.result_is_gc_inert(then_value) || !safety.result_is_gc_inert(else_value) {
         return None;
     }
     let then_home = facts.trusted_temp_home_slot(then_temp)?;
@@ -890,15 +895,18 @@ fn preserve_active_call_roots(
     }
 }
 
-fn stmt_may_observe_gc_roots(stmt: &HirStmt) -> bool {
-    let mut collector = GcRootObservationCollector::default();
+fn stmt_may_observe_gc_roots(stmt: &HirStmt, safety: HirExprSafety) -> bool {
+    let mut collector = GcRootObservationCollector {
+        found: false,
+        safety,
+    };
     visit_stmts(std::slice::from_ref(stmt), &mut collector);
     collector.found
 }
 
-#[derive(Default)]
 struct GcRootObservationCollector {
     found: bool,
+    safety: HirExprSafety,
 }
 
 impl HirVisitor for GcRootObservationCollector {
@@ -910,7 +918,7 @@ impl HirVisitor for GcRootObservationCollector {
         // The shared discard-safety boundary already classifies dynamic environment/table
         // access, metamethod-capable operators, calls, and allocating expressions as eventful;
         // residual diagnostics stay conservative instead of being treated as executable no-ops.
-        self.found |= !expr_is_discard_safe_without_residual(expr);
+        self.found |= !self.safety.is_discard_safe_without_residual(expr);
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {

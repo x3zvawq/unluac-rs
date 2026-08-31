@@ -20,14 +20,15 @@ pub(crate) use readable::naturalize_pure_logical_expr;
 pub(crate) use value::synthesize_value_decision_expr;
 
 use crate::hir::common::{HirBinaryExpr, HirExpr, HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind};
+use crate::hir::expr_safety::HirExprSafety;
 
 const MAX_SYNTH_REFS: usize = 4;
 const EXTRA_TRUTHY_SYMBOLS: usize = 2;
 
-fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
+fn normalize_candidate_expr(expr: HirExpr, safety: HirExprSafety) -> HirExpr {
     match expr {
         HirExpr::Unary(unary) => match unary.op {
-            HirUnaryOpKind::Not => match normalize_candidate_expr(unary.expr) {
+            HirUnaryOpKind::Not => match normalize_candidate_expr(unary.expr, safety) {
                 HirExpr::Boolean(value) => HirExpr::Boolean(!value),
                 inner => HirExpr::Unary(Box::new(HirUnaryExpr {
                     op: HirUnaryOpKind::Not,
@@ -36,13 +37,13 @@ fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
             },
             _ => HirExpr::Unary(Box::new(HirUnaryExpr {
                 op: unary.op,
-                expr: normalize_candidate_expr(unary.expr),
+                expr: normalize_candidate_expr(unary.expr, safety),
             })),
         },
         HirExpr::LogicalAnd(logical) => {
-            let lhs = normalize_candidate_expr(logical.lhs);
-            let rhs = normalize_candidate_expr(logical.rhs);
-            if let Some(lhs_truthy) = super::expr_truthiness(&lhs) {
+            let lhs = normalize_candidate_expr(logical.lhs, safety);
+            let rhs = normalize_candidate_expr(logical.rhs, safety);
+            if let Some(lhs_truthy) = super::expr_truthiness(&lhs, safety) {
                 if lhs_truthy { rhs } else { lhs }
             } else if super::expr_is_boolean_valued(&lhs) && matches!(rhs, HirExpr::Boolean(true)) {
                 lhs
@@ -51,13 +52,14 @@ fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
                 HirExpr::Boolean(false)
             } else {
                 let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }));
-                super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr)
+                super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
+                    .unwrap_or(expr)
             }
         }
         HirExpr::LogicalOr(logical) => {
-            let lhs = normalize_candidate_expr(logical.lhs);
-            let rhs = normalize_candidate_expr(logical.rhs);
-            if let Some(lhs_truthy) = super::expr_truthiness(&lhs) {
+            let lhs = normalize_candidate_expr(logical.lhs, safety);
+            let rhs = normalize_candidate_expr(logical.rhs, safety);
+            if let Some(lhs_truthy) = super::expr_truthiness(&lhs, safety) {
                 if lhs_truthy { lhs } else { rhs }
             } else if super::expr_is_boolean_valued(&lhs) && matches!(rhs, HirExpr::Boolean(false))
             {
@@ -66,13 +68,14 @@ fn normalize_candidate_expr(expr: HirExpr) -> HirExpr {
                 HirExpr::Boolean(true)
             } else {
                 let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
-                super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr)
+                super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
+                    .unwrap_or(expr)
             }
         }
         HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {
             op: binary.op,
-            lhs: normalize_candidate_expr(binary.lhs),
-            rhs: normalize_candidate_expr(binary.rhs),
+            lhs: normalize_candidate_expr(binary.lhs, safety),
+            rhs: normalize_candidate_expr(binary.rhs, safety),
         })),
         other => other,
     }

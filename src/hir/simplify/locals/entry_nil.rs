@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::super::expr_facts::expr_truthiness;
@@ -139,6 +140,7 @@ impl PrunePlan {
 pub(super) fn prune_redundant_entry_nil_writes(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
+    safety: HirExprSafety,
 ) -> bool {
     if proto.body.stmts.len() < 2 {
         return false;
@@ -169,6 +171,7 @@ pub(super) fn prune_redundant_entry_nil_writes(
             local,
             candidate_home,
             facts,
+            safety,
             plan: PrunePlan::default(),
         };
         if let Err(error) = analyzer.analyze_if(if_stmt, NilStates::entry()) {
@@ -212,18 +215,19 @@ struct EntryNilAnalyzer<'a> {
     local: LocalId,
     candidate_home: HomeSlotKey,
     facts: &'a ProtoPromotionFacts,
+    safety: HirExprSafety,
     plan: PrunePlan,
 }
 
 impl EntryNilAnalyzer<'_> {
     fn analyze_if(&mut self, if_stmt: &HirIf, incoming: NilStates) -> Result<NilFlow, PruneError> {
         let states = self.evaluate_expr(&if_stmt.cond, incoming)?;
-        let then_flow = if expr_truthiness(&if_stmt.cond) == Some(false) {
+        let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
             NilFlow::default()
         } else {
             self.analyze_block(&if_stmt.then_block, &[PathComponent::Then], states.clone())?
         };
-        let else_flow = if expr_truthiness(&if_stmt.cond) == Some(true) {
+        let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
             NilFlow::default()
         } else if let Some(else_block) = &if_stmt.else_block {
             self.analyze_block(else_block, &[PathComponent::Else], states)?
@@ -286,12 +290,12 @@ impl EntryNilAnalyzer<'_> {
                 let states = self.evaluate_expr(&if_stmt.cond, states)?;
                 let mut then_prefix = path.clone();
                 then_prefix.push(PathComponent::Then);
-                let then_flow = if expr_truthiness(&if_stmt.cond) == Some(false) {
+                let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
                     NilFlow::default()
                 } else {
                     self.analyze_block(&if_stmt.then_block, &then_prefix, states.clone())?
                 };
-                let else_flow = if expr_truthiness(&if_stmt.cond) == Some(true) {
+                let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
                     NilFlow::default()
                 } else if let Some(else_block) = &if_stmt.else_block {
                     let mut else_prefix = path.clone();
@@ -390,7 +394,7 @@ impl EntryNilAnalyzer<'_> {
         body_prefix: &[PathComponent],
         incoming: NilStates,
     ) -> Result<NilFlow, PruneError> {
-        let truthiness = expr_truthiness(condition);
+        let truthiness = expr_truthiness(condition, self.safety);
         let mut entries = incoming.clone();
         let mut break_exits = NilStates::default();
         loop {
@@ -425,7 +429,7 @@ impl EntryNilAnalyzer<'_> {
         body_prefix: &[PathComponent],
         incoming: NilStates,
     ) -> Result<NilFlow, PruneError> {
-        let truthiness = expr_truthiness(condition);
+        let truthiness = expr_truthiness(condition, self.safety);
         let mut entries = incoming.clone();
         let mut break_exits = NilStates::default();
         loop {

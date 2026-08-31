@@ -5,6 +5,7 @@
 //! branch-value 形状仍由 `branch_value_folding` 先处理。每轮先为当前 block 建一次 label
 //! 位置和引用计数，再按不交叉区间从右向左改写，避免多个 guard 共用 label 时反复全块
 //! 扫描和重建。
+//! 条件能否删除或合并重复求值统一消费入口按目标方言构造的表达式安全上下文。
 //!
 //! 例如 `if false then body end` 会被删除，`if true then body end` 会保留原 branch block
 //! 的词法作用域后去掉条件壳；动态 lookup、调用、table 构造与元方法比较都不进入该规则。
@@ -14,29 +15,34 @@ mod path_conditions;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLValue, HirLabelId, HirLogicalExpr,
-    HirProto, HirStmt, HirUnaryOpKind, LocalId, TempId,
+    HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLValue, HirLabelId,
+    HirLogicalExpr, HirProto, HirStmt, HirUnaryOpKind, LocalId, TempId,
 };
-use crate::hir::expr_safety::{expr_is_discard_safe_without_residual, expr_is_repeatable};
+use crate::hir::expr_safety::HirExprSafety;
 
 use super::carried_locals::{CarryBinding, single_binding_copy};
 use super::expr_facts::expr_truthiness;
 use super::label_refs::count_label_references;
-use super::logical_simplify::{normalize_condition_context, simplify_condition_truthiness_shape};
+use super::logical_simplify::{
+    normalize_condition_context, simplify_condition_truthiness_shape_with_safety,
+};
 use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
 
-pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
+pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto, safety: HirExprSafety) -> bool {
     let mut changed = false;
     loop {
+        let primitive_locals = ImmutablePrimitiveLocals::new(proto);
         let discard_facts = DiscardBoundaryFacts::new(proto);
         let path_changed =
-            path_conditions::specialize_stable_path_conditions(proto, &discard_facts);
+            path_conditions::specialize_stable_path_conditions(proto, &discard_facts, safety);
         changed |= path_changed
             | rewrite_proto(
                 proto,
                 &mut BranchControlPass {
                     discard_facts: &discard_facts,
+                    primitive_locals: &primitive_locals,
+                    safety,
                 },
             );
         // 删除不可达写可能让下一项 local 立刻满足稳定性证明。这里收完本 pass 自己的
@@ -49,13 +55,17 @@ pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
 
 struct BranchControlPass<'a> {
     discard_facts: &'a DiscardBoundaryFacts,
+    primitive_locals: &'a ImmutablePrimitiveLocals,
+    safety: HirExprSafety,
 }
 
 impl HirRewritePass for BranchControlPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        let constant_changed = fold_constant_control(&mut block.stmts, self.discard_facts);
+        let constant_changed =
+            fold_constant_control(&mut block.stmts, self.discard_facts, self.safety);
         let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
-        let empty_changed = remove_discard_safe_empty_ifs(&mut block.stmts);
+        let empty_changed =
+            remove_discard_safe_empty_ifs(&mut block.stmts, self.safety, self.primitive_locals);
         let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
         let guard_changed = fold_forward_gotos(&mut block.stmts, FoldKind::Guard);
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
@@ -68,7 +78,7 @@ impl HirRewritePass for BranchControlPass<'_> {
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
-        fold_trailing_repeat_break_condition(stmt, self.discard_facts)
+        fold_trailing_repeat_break_condition(stmt, self.discard_facts, self.safety)
             || fold_effect_only_call(stmt)
             || fold_leading_while_break_guard(stmt)
             || naturalize_if_polarity(stmt)
@@ -184,7 +194,11 @@ impl HirVisitor for DirectCopySinkBoundary {
     }
 }
 
-fn fold_constant_control(stmts: &mut Vec<HirStmt>, discard_facts: &DiscardBoundaryFacts) -> bool {
+fn fold_constant_control(
+    stmts: &mut Vec<HirStmt>,
+    discard_facts: &DiscardBoundaryFacts,
+    safety: HirExprSafety,
+) -> bool {
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
     let mut changed = false;
@@ -192,7 +206,8 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>, discard_facts: &DiscardBounda
     for stmt in original {
         if let HirStmt::While(current) = &stmt
             && current.body.stmts.is_empty()
-            && expr_is_repeatable(&current.cond)
+            // 候选拒绝[SemanticBarrier:Metamethod]：LuaJIT cdata equality 可调用 ctype `__eq`；合并两个空 while 会少求值一次（regress_391）。
+            && safety.is_repeatable(&current.cond)
             && matches!(rewritten.last(),
                 Some(HirStmt::While(previous))
                     if previous.body.stmts.is_empty() && previous.cond == current.cond)
@@ -230,8 +245,9 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>, discard_facts: &DiscardBounda
             rewritten.push(stmt);
             continue;
         };
-        let selected_then = if expr_is_discard_safe_without_residual(&if_stmt.cond) {
-            expr_truthiness(&if_stmt.cond).or_else(|| {
+        // 候选拒绝[SemanticBarrier:Metamethod]：LuaJIT cdata equality 可调用 ctype `__eq`；选定常量 arm 时不能删除该条件求值（regress_391）。
+        let selected_then = if safety.is_discard_safe_without_residual(&if_stmt.cond) {
+            expr_truthiness(&if_stmt.cond, safety).or_else(|| {
                 if_stmt
                     .else_block
                     .as_ref()
@@ -475,14 +491,109 @@ fn fold_effect_only_call(stmt: &mut HirStmt) -> bool {
     true
 }
 
-fn remove_discard_safe_empty_ifs(stmts: &mut Vec<HirStmt>) -> bool {
+#[derive(Default)]
+struct ImmutablePrimitiveLocals {
+    candidates: BTreeSet<LocalId>,
+    written: BTreeSet<LocalId>,
+}
+
+impl ImmutablePrimitiveLocals {
+    fn new(proto: &HirProto) -> Self {
+        let mut index = Self::default();
+        super::visit::visit_proto(proto, &mut index);
+        let captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
+        index.written.extend(captured.locals);
+        index
+            .candidates
+            .retain(|local| !index.written.contains(local));
+        index
+    }
+
+    fn contains(&self, local: LocalId) -> bool {
+        self.candidates.contains(&local)
+    }
+}
+
+impl HirVisitor for ImmutablePrimitiveLocals {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        let HirStmt::LocalDecl(decl) = stmt else {
+            return;
+        };
+        if let ([local], [value], None) = (
+            decl.bindings.as_slice(),
+            decl.values.fixed.as_slice(),
+            &decl.values.tail,
+        ) && is_primitive_literal(value)
+        {
+            self.candidates.insert(*local);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let HirLValue::Local(local) = lvalue {
+            self.written.insert(*local);
+        }
+    }
+}
+
+fn is_primitive_literal(expr: &HirExpr) -> bool {
+    matches!(
+        expr,
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+    )
+}
+
+fn primitive_value_is_known(expr: &HirExpr, locals: &ImmutablePrimitiveLocals) -> bool {
+    is_primitive_literal(expr)
+        || matches!(expr, HirExpr::LocalRef(local) if locals.contains(*local))
+}
+
+fn is_discard_safe_with_primitive_locals(
+    expr: &HirExpr,
+    safety: HirExprSafety,
+    primitive_locals: &ImmutablePrimitiveLocals,
+) -> bool {
+    if safety.is_discard_safe_without_residual(expr) {
+        return true;
+    }
+    match expr {
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            is_discard_safe_with_primitive_locals(&unary.expr, safety, primitive_locals)
+        }
+        HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
+            primitive_value_is_known(&binary.lhs, primitive_locals)
+                && primitive_value_is_known(&binary.rhs, primitive_locals)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            is_discard_safe_with_primitive_locals(&logical.lhs, safety, primitive_locals)
+                && is_discard_safe_with_primitive_locals(&logical.rhs, safety, primitive_locals)
+        }
+        _ => false,
+    }
+}
+
+fn remove_discard_safe_empty_ifs(
+    stmts: &mut Vec<HirStmt>,
+    safety: HirExprSafety,
+    primitive_locals: &ImmutablePrimitiveLocals,
+) -> bool {
     let original_len = stmts.len();
     stmts.retain(|stmt| {
         !matches!(
             stmt,
             HirStmt::If(if_stmt)
                 if if_arms_are_empty(if_stmt)
-                    && expr_is_discard_safe_without_residual(&if_stmt.cond)
+                    // 候选拒绝[SemanticBarrier:Metamethod]：LuaJIT cdata equality 可调用 ctype `__eq`；删除空 if 会漏掉这次调用（regress_391）。
+                    // 候选接受：若 equality 两侧都由 immutable primitive local/literal 证明为原始值，LuaJIT 也不会进入 ctype `__eq`。
+                    && is_discard_safe_with_primitive_locals(
+                        &if_stmt.cond,
+                        safety,
+                        primitive_locals,
+                    )
         )
     });
     stmts.len() != original_len
@@ -516,6 +627,7 @@ fn take_effect_only_call(mut expr: &mut HirExpr) -> Option<Box<HirCallExpr>> {
 fn fold_trailing_repeat_break_condition(
     stmt: &mut HirStmt,
     discard_facts: &DiscardBoundaryFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let HirStmt::Repeat(repeat_stmt) = stmt else {
         return false;
@@ -577,7 +689,8 @@ fn fold_trailing_repeat_break_condition(
     // branch-control synthesizes this condition after the general logical pass.  Re-run only
     // the condition-safe normalizer here so shared stable guards are absorbed without changing
     // Lua value semantics in ordinary expression positions.
-    repeat_stmt.cond = simplify_condition_truthiness_shape(&folded).unwrap_or(folded);
+    repeat_stmt.cond =
+        simplify_condition_truthiness_shape_with_safety(&folded, safety).unwrap_or(folded);
     true
 }
 

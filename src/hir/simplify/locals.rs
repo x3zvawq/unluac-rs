@@ -62,12 +62,14 @@ use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirValuePack,
     LocalId, TempId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 /// 对单个 proto 执行带 promotion facts 的 temp -> local 提升。
 pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let compact_home_slots = hir_block_local_pressure(&proto.body) > crate::SOURCE_LOCAL_LIMIT
         && facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
@@ -89,6 +91,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let result = {
         let mut ctx = PromotionCtx {
             facts,
+            safety,
             temp_debug_locals: &proto.temp_debug_locals,
             temp_debug_scopes: &proto.temp_debug_scopes,
             next_local_index: &mut next_local_index,
@@ -128,8 +131,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto.locals.extend(new_locals);
     proto.local_debug_hints.extend(new_local_debug_hints);
     proto.physical_root_locals.extend(physical_root_locals);
-    let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts);
-    let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts);
+    let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, safety);
+    let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, safety);
     result.changed || entry_nil_changed || alias_changed
 }
 
@@ -199,6 +202,7 @@ fn trusted_home_slot_for_group(
 
 struct PromotionCtx<'a> {
     facts: &'a ProtoPromotionFacts,
+    safety: HirExprSafety,
     temp_debug_locals: &'a [Option<String>],
     temp_debug_scopes: &'a [Option<usize>],
     next_local_index: &'a mut usize,
@@ -557,6 +561,7 @@ fn collect_plans(
     let call_root_lifetimes = collect_call_root_lifetimes(
         &block.stmts,
         facts,
+        ctx.safety,
         true,
         |temp| {
             // 候选拒绝[SemanticBarrier:Resource]：TBC producer 若提前声明 owner，会改变 close 起点与被关闭的值。
@@ -576,14 +581,15 @@ fn collect_plans(
                     .is_none_or(Option::is_none)
         },
     );
-    let lookup_gc_root_lifetimes = collect_lookup_gc_root_lifetimes(&block.stmts, facts, |temp| {
-        !ctx.identity_sensitive_temps.contains(&temp)
-            && !inherited.contains_key(&temp)
-            && !outer_uses_temp(temp)
-            && temp_debug_locals
-                .get(temp.index())
-                .is_none_or(Option::is_none)
-    });
+    let lookup_gc_root_lifetimes =
+        collect_lookup_gc_root_lifetimes(&block.stmts, facts, ctx.safety, |temp| {
+            !ctx.identity_sensitive_temps.contains(&temp)
+                && !inherited.contains_key(&temp)
+                && !outer_uses_temp(temp)
+                && temp_debug_locals
+                    .get(temp.index())
+                    .is_none_or(Option::is_none)
+        });
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
@@ -933,8 +939,13 @@ fn collect_plans(
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
-        let mut merge_temps =
-            branch_merge::candidate_temps(stmt, &temp_touches, decl_index, &is_reserved);
+        let mut merge_temps = branch_merge::candidate_temps(
+            stmt,
+            &temp_touches,
+            decl_index,
+            &is_reserved,
+            ctx.safety,
+        );
         if (call_root_lifetimes
             .overwrite_pairs(decl_index)
             .next()

@@ -647,7 +647,10 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         }
         Ok(PlannedLoopCondition {
             prefix: self.lower_condition_prefix(owner, header)?,
-            cond: finalize_condition_decision_expr(decision),
+            cond: finalize_condition_decision_expr(
+                decision,
+                crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target.version),
+            ),
         })
     }
 

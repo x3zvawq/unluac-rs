@@ -5,17 +5,24 @@
 //! 那条共享入口固定下来，避免两边因为局部实现分叉而把同一棵决策图恢复成两种风格。
 
 use crate::hir::common::{HirDecisionExpr, HirExpr};
+use crate::hir::expr_safety::HirExprSafety;
 
-pub(in crate::hir) fn finalize_condition_decision_expr(decision: HirDecisionExpr) -> HirExpr {
+pub(in crate::hir) fn finalize_condition_decision_expr(
+    decision: HirDecisionExpr,
+    safety: HirExprSafety,
+) -> HirExpr {
     if super::simplify::decision::decision_has_shared_nodes(&decision) {
         HirExpr::Decision(Box::new(decision))
     } else {
-        super::simplify::decision::collapse_condition_decision_expr(&decision)
+        super::simplify::decision::collapse_condition_decision_expr(&decision, safety)
             .unwrap_or_else(|| HirExpr::Decision(Box::new(decision)))
     }
 }
 
-pub(in crate::hir) fn finalize_value_decision_expr(decision: HirDecisionExpr) -> HirExpr {
-    super::simplify::decision::collapse_value_decision_expr(&decision)
+pub(in crate::hir) fn finalize_value_decision_expr(
+    decision: HirDecisionExpr,
+    safety: HirExprSafety,
+) -> HirExpr {
+    super::simplify::decision::collapse_value_decision_expr(&decision, safety)
         .unwrap_or_else(|| HirExpr::Decision(Box::new(decision)))
 }

@@ -5,6 +5,7 @@
 //! 这里专门删除这一类纯值壳，或者把它们折回单条赋值，避免把真正承担控制语义的
 //! `if/else` 结构误删掉。删除死写前还要证明目标没有外部读取、capture、debug identity
 //! 或物理根职责；把相邻空声明吸收到初始化器时，则必须保留条件求值期间的词法作用域。
+//! 条件是否可删除、arm 结果是否承载 GC root 统一消费入口按目标方言构造的表达式安全上下文。
 //!
 //! 它不会越权去重新判断 branch/loop 是否应该结构化，也不会替前层补决策。
 //! 这里唯一关心的是：当前 `if` 是否已经退化成“无副作用的布尔值搬运壳”。table
@@ -23,7 +24,7 @@ use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
     HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId, ParamId, TempId,
 };
-use crate::hir::expr_safety::{expr_is_discard_safe_without_residual, expr_result_is_gc_inert};
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::expr_facts::expr_is_boolean_valued;
@@ -35,21 +36,27 @@ use super::walk::{HirRewritePass, rewrite_proto};
 pub(super) fn remove_boolean_materialization_shells_in_proto(
     proto: &mut HirProto,
     promotion_facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let facts = BooleanShellFacts::collect(proto, promotion_facts);
-    let old_value_plan = old_values::DeadShellPlan::collect(proto, &facts, promotion_facts);
+    let old_value_plan = old_values::DeadShellPlan::collect(proto, &facts, promotion_facts, safety);
     let old_value_changed = old_value_plan.apply(&mut proto.body);
-    let mut pass = BooleanShellPass { facts: &facts };
+    let mut pass = BooleanShellPass {
+        facts: &facts,
+        safety,
+    };
     old_value_changed | rewrite_proto(proto, &mut pass)
 }
 
 struct BooleanShellPass<'a> {
     facts: &'a BooleanShellFacts,
+    safety: HirExprSafety,
 }
 
 impl HirRewritePass for BooleanShellPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        let dead_changed = remove_dead_materialization_shells_from_block(block, self.facts);
+        let dead_changed =
+            remove_dead_materialization_shells_from_block(block, self.facts, self.safety);
         let collapse_changed =
             collapse_live_boolean_materialization_shells_in_block(block, self.facts);
         dead_changed || collapse_changed
@@ -483,6 +490,7 @@ fn use_is_internal_only<K: Ord + Copy>(
 fn remove_dead_materialization_shells_from_block(
     block: &mut HirBlock,
     facts: &BooleanShellFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let no_old_value_facts = DeadShellOldValueFacts::default();
     let old_len = block.stmts.len();
@@ -501,7 +509,13 @@ fn remove_dead_materialization_shells_from_block(
     block.stmts.retain(|stmt| {
         let adjacent_nil_local = adjacent_nil_locals[index];
         index += 1;
-        !removable_dead_materialization_shell(stmt, facts, adjacent_nil_local, &no_old_value_facts)
+        !removable_dead_materialization_shell(
+            stmt,
+            facts,
+            adjacent_nil_local,
+            &no_old_value_facts,
+            safety,
+        )
     });
     block.stmts.len() != old_len
 }
@@ -603,6 +617,7 @@ fn removable_dead_materialization_shell(
     facts: &BooleanShellFacts,
     adjacent_nil_local: Option<LocalId>,
     old_values: &DeadShellOldValueFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let HirStmt::If(if_stmt) = stmt else {
         return false;
@@ -624,14 +639,14 @@ fn removable_dead_materialization_shell(
     );
     if !facts.target_write_is_unobservable(
         then_target,
-        expr_result_is_gc_inert(then_value),
+        safety.result_is_gc_inert(then_value),
         &internal_uses,
         &internal_home_uses,
         adjacent_nil_local,
         old_values,
     ) || !facts.target_write_is_unobservable(
         else_target,
-        expr_result_is_gc_inert(else_value),
+        safety.result_is_gc_inert(else_value),
         &internal_uses,
         &internal_home_uses,
         adjacent_nil_local,
@@ -640,15 +655,16 @@ fn removable_dead_materialization_shell(
         return false;
     }
     // 候选拒绝[SemanticBarrier:EvalCount]：删除 `if f() then t=true else t=false end` 会漏掉仍需执行一次的 `f()`。
+    // 候选拒绝[SemanticBarrier:Metamethod]：LuaJIT cdata 与 primitive 的 equality 可能调用 ctype `__eq`；删除布尔壳会漏掉这次调用（regress_391）。
     // 候选拒绝[LayerBoundary]：Unresolved 是 residual owner 的显式诊断，不能随死布尔壳静默删除。
-    if !expr_is_discard_safe_without_residual(&if_stmt.cond) {
+    if !safety.is_discard_safe_without_residual(&if_stmt.cond) {
         return false;
     }
 
     // 候选拒绝[SemanticBarrier:EvalCount]：死 binding 的 `t=f()` 仍必须调用一次 `f()`，不能随布尔壳一起丢弃。
     // 候选拒绝[LayerBoundary]：任一 arm 的 Unresolved 必须继续交给 residual owner。
-    expr_is_discard_safe_without_residual(then_value)
-        && expr_is_discard_safe_without_residual(else_value)
+    safety.is_discard_safe_without_residual(then_value)
+        && safety.is_discard_safe_without_residual(else_value)
 }
 
 fn single_fixed_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {

@@ -10,6 +10,7 @@
 //! 无物理 home 的纯死写可直接删除；参数同槽写改回参数赋值；proto 根直线前缀中
 //! `entry nil -> GC-inert value` 的写入也可删除。其余有 home 的写入不在这里猜 reaching
 //! value，因为它仍可能决定旧对象或新对象的 GC root 生命周期。
+//! RHS 的可删除性与 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
 //!
 //! 例子：根前缀里的机械 `t = false` 若 `t` 是非参数槽首个 fixed def，可删成空；
 //! `t = p` 即使没有值读取也不能删，因为该物理槽可能让 `p` 指向的对象继续存活。
@@ -17,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, ParamId, TempId};
-use crate::hir::expr_safety::{expr_is_discard_safe, expr_result_is_gc_inert};
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::stmts_reference_captured_bindings;
@@ -28,6 +29,7 @@ use super::walk::{HirRewritePass, rewrite_proto};
 pub(super) fn remove_dead_temp_materializations_in_proto(
     proto: &mut HirProto,
     promotion_facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let live_reads = collect_temp_reads_in_proto(proto);
     let parameters_by_home = proto
@@ -93,6 +95,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         stable_visible_params,
         overwritten_visible_params,
         physical_root_temps: BTreeSet::new(),
+        safety,
     };
     let mut changed = rewrite_proto(proto, &mut pass);
     let original_physical_root_count = proto.physical_root_temps.len();
@@ -105,6 +108,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         &live_reads,
         &pass.debug_temps,
         promotion_facts,
+        safety,
     );
     changed
 }
@@ -114,6 +118,7 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
     live_reads: &BTreeSet<TempId>,
     debug_temps: &BTreeSet<TempId>,
     facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let mut changed = false;
     let mut in_single_pass_prefix = true;
@@ -129,13 +134,13 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
             return true;
         }
 
-        let removable = dead_pure_temp_assignment(stmt, live_reads).is_some_and(|temp| {
+        let removable = dead_pure_temp_assignment(stmt, live_reads, safety).is_some_and(|temp| {
             let home = facts.home_slot(temp);
             facts.overwrites_entry_nil(temp)
                 // 候选拒绝[PolicyBoundary]：debug temp 是源码 binding；即使入口旧值为 nil，删除定义也会抹掉项目选择保留的 source identity。
                 && !debug_temps.contains(&temp)
                 // 候选拒绝[ProofIncomplete]：entry-nil 只证明旧值非资源；RHS 若可能引用对象，删除物理写会缩短新对象作为 VM root 的存活期。
-                && dead_write_value_is_gc_inert(stmt)
+                && dead_write_value_is_gc_inert(stmt, safety)
                 // 候选拒绝[SemanticBarrier:Capture]：`local x; f=function() return x end; x=false` 中先建立的 closure 会观察同槽写入；删除后返回 nil。
                 && home.is_some_and(|home| !captured_homes.contains(&home))
         });
@@ -169,14 +174,14 @@ fn root_prefix_stmt_preserves_single_pass_continuation(stmt: &HirStmt) -> bool {
     }
 }
 
-fn dead_write_value_is_gc_inert(stmt: &HirStmt) -> bool {
+fn dead_write_value_is_gc_inert(stmt: &HirStmt, safety: HirExprSafety) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
     let [value] = assign.values.fixed.as_slice() else {
         return false;
     };
-    expr_result_is_gc_inert(value)
+    safety.result_is_gc_inert(value)
 }
 
 struct DeadTempPass<'a> {
@@ -188,13 +193,14 @@ struct DeadTempPass<'a> {
     stable_visible_params: BTreeSet<ParamId>,
     overwritten_visible_params: BTreeSet<ParamId>,
     physical_root_temps: BTreeSet<TempId>,
+    safety: HirExprSafety,
 }
 
 impl HirRewritePass for DeadTempPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let mut changed = false;
         block.stmts.retain_mut(|stmt| {
-            let Some(temp) = dead_pure_temp_assignment(stmt, self.live_reads) else {
+            let Some(temp) = dead_pure_temp_assignment(stmt, self.live_reads, self.safety) else {
                 return true;
             };
             // 候选拒绝[PolicyBoundary]：debug temp 是源码 binding；即使值无读取，删除定义也会抹掉项目选择保留的 source identity。
@@ -271,7 +277,11 @@ fn expr_may_alias_overwritten_param(expr: &HirExpr, params: &BTreeSet<ParamId>) 
     }
 }
 
-fn dead_pure_temp_assignment(stmt: &HirStmt, live_reads: &BTreeSet<TempId>) -> Option<TempId> {
+fn dead_pure_temp_assignment(
+    stmt: &HirStmt,
+    live_reads: &BTreeSet<TempId>,
+    safety: HirExprSafety,
+) -> Option<TempId> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -292,7 +302,7 @@ fn dead_pure_temp_assignment(stmt: &HirStmt, live_reads: &BTreeSet<TempId>) -> O
     }
     // 候选拒绝[SemanticBarrier:EvalMultiplicity]：不可丢弃 RHS 必须求值一次；调用、
     // table/global lookup 或分配即使结果未读也可能执行用户代码、抛错或产生对象身份。
-    expr_is_discard_safe(value).then_some(*temp)
+    safety.is_discard_safe(value).then_some(*temp)
 }
 
 fn proto_may_write_param_home(

@@ -5,13 +5,14 @@
 //! 可能，循环对回边求有限不动点。
 //! 分析阶段只记录完整语句路径，验证结束后才一次性应用删除，避免边改边算让 reaching
 //! value 漂移。label/goto 与 residual 仍由各自 owner 维护，本分析不在线性 HIR 上猜 CFG。
+//! 值是否 GC-inert 由外层传入的目标方言安全上下文判定，避免 reaching class 与删除证明漂移。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
 };
-use crate::hir::expr_safety::expr_result_is_gc_inert;
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::{
@@ -41,6 +42,7 @@ impl DeadShellPlan {
         proto: &HirProto,
         facts: &BooleanShellFacts,
         promotion_facts: &ProtoPromotionFacts,
+        safety: HirExprSafety,
     ) -> Self {
         let mut boundary = AnalysisBoundary::default();
         visit::visit_proto(proto, &mut boundary);
@@ -72,6 +74,7 @@ impl DeadShellPlan {
         let mut analyzer = OldValueAnalyzer {
             facts,
             promotion_facts,
+            safety,
             candidate_locals: candidates.locals,
             candidate_homes: candidates.homes,
             plan: Self::default(),
@@ -227,6 +230,7 @@ impl InertFlow {
 struct OldValueAnalyzer<'a> {
     facts: &'a BooleanShellFacts,
     promotion_facts: &'a ProtoPromotionFacts,
+    safety: HirExprSafety,
     candidate_locals: BTreeSet<LocalId>,
     candidate_homes: BTreeSet<HomeSlotKey>,
     plan: DeadShellPlan,
@@ -274,6 +278,7 @@ impl OldValueAnalyzer<'_> {
                     self.facts,
                     None,
                     &old_values,
+                    self.safety,
                 );
                 if shell_has_old_value_target(stmt, self.promotion_facts) {
                     self.plan.observe(path, removable);
@@ -281,12 +286,12 @@ impl OldValueAnalyzer<'_> {
 
                 let mut then_prefix = path.clone();
                 then_prefix.push(PathComponent::Then);
-                let then_flow = if expr_truthiness(&if_stmt.cond) == Some(false) {
+                let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
                     InertFlow::default()
                 } else {
                     self.analyze_block(&if_stmt.then_block, &then_prefix, Some(state.clone()))
                 };
-                let else_flow = if expr_truthiness(&if_stmt.cond) == Some(true) {
+                let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
                     InertFlow::default()
                 } else if let Some(else_block) = &if_stmt.else_block {
                     let mut else_prefix = path.clone();
@@ -373,7 +378,7 @@ impl OldValueAnalyzer<'_> {
         body_prefix: &[PathComponent],
         incoming: OldValueState,
     ) -> InertFlow {
-        let truthiness = expr_truthiness(condition);
+        let truthiness = expr_truthiness(condition, self.safety);
         let mut entries = incoming.clone();
         let mut break_exits = None;
         loop {
@@ -402,7 +407,7 @@ impl OldValueAnalyzer<'_> {
         body_prefix: &[PathComponent],
         incoming: OldValueState,
     ) -> InertFlow {
-        let truthiness = expr_truthiness(condition);
+        let truthiness = expr_truthiness(condition, self.safety);
         let mut entries = incoming.clone();
         let mut break_exits = None;
         loop {
@@ -464,14 +469,22 @@ impl OldValueAnalyzer<'_> {
 
     fn apply_assignment(&self, assign: &HirAssign, mut state: OldValueState) -> OldValueState {
         for (index, target) in assign.targets.iter().enumerate() {
-            state = self.write_target(target, assigned_value_class(assign, index), state);
+            state = self.write_target(
+                target,
+                assigned_value_class(assign, index, self.safety),
+                state,
+            );
         }
         state
     }
 
     fn apply_local_decl(&self, decl: &HirLocalDecl, mut state: OldValueState) -> OldValueState {
         for (index, binding) in decl.bindings.iter().enumerate() {
-            state = self.write_local_binding(*binding, declared_value_class(decl, index), state);
+            state = self.write_local_binding(
+                *binding,
+                declared_value_class(decl, index, self.safety),
+                state,
+            );
         }
         state
     }
@@ -592,23 +605,38 @@ fn shell_has_old_value_target(stmt: &HirStmt, facts: &ProtoPromotionFacts) -> bo
         || matches!(else_target, HirLValue::Temp(temp) if facts.home_slot(*temp).is_some())
 }
 
-fn assigned_value_class(assign: &HirAssign, target_index: usize) -> OldValueClass {
+fn assigned_value_class(
+    assign: &HirAssign,
+    target_index: usize,
+    safety: HirExprSafety,
+) -> OldValueClass {
     value_at_class(
         &assign.values.fixed,
         assign.values.tail.is_some(),
         target_index,
+        safety,
     )
 }
 
-fn declared_value_class(decl: &HirLocalDecl, binding_index: usize) -> OldValueClass {
+fn declared_value_class(
+    decl: &HirLocalDecl,
+    binding_index: usize,
+    safety: HirExprSafety,
+) -> OldValueClass {
     value_at_class(
         &decl.values.fixed,
         decl.values.tail.is_some(),
         binding_index,
+        safety,
     )
 }
 
-fn value_at_class(fixed: &[HirExpr], has_tail: bool, index: usize) -> OldValueClass {
+fn value_at_class(
+    fixed: &[HirExpr],
+    has_tail: bool,
+    index: usize,
+    safety: HirExprSafety,
+) -> OldValueClass {
     let Some(value) = fixed.get(index) else {
         return if has_tail {
             OldValueClass::MayCarryResource
@@ -616,7 +644,7 @@ fn value_at_class(fixed: &[HirExpr], has_tail: bool, index: usize) -> OldValueCl
             OldValueClass::GcInert
         };
     };
-    if expr_result_is_gc_inert(value) {
+    if safety.result_is_gc_inert(value) {
         return OldValueClass::GcInert;
     }
     match value {

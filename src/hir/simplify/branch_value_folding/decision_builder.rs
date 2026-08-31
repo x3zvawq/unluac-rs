@@ -15,7 +15,7 @@ use crate::hir::common::{
     HirBlock, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
     HirIf, HirLocalDecl, HirStmt, TempId,
 };
-use crate::hir::expr_safety::expr_is_repeatable;
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::simplify::visit::{HirVisitor, visit_expr};
 
 #[derive(Default)]
@@ -68,13 +68,15 @@ pub(super) struct CollapsedBranchValueTarget {
 pub(super) struct BranchValueDecisionBuilder {
     nodes: Vec<HirDecisionNode>,
     raw_guards: BTreeSet<TempId>,
+    safety: HirExprSafety,
 }
 
 impl BranchValueDecisionBuilder {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(safety: HirExprSafety) -> Self {
         Self {
             nodes: Vec::new(),
             raw_guards: BTreeSet::new(),
+            safety,
         }
     }
 
@@ -213,8 +215,8 @@ impl BranchValueDecisionBuilder {
         falsy: HirDecisionTarget,
     ) {
         let node = &mut self.nodes[node_ref.index()];
-        node.truthy = normalize_current_value_target(&node.test, truthy);
-        node.falsy = normalize_current_value_target(&node.test, falsy);
+        node.truthy = normalize_current_value_target(&node.test, truthy, self.safety);
+        node.falsy = normalize_current_value_target(&node.test, falsy, self.safety);
     }
 
     pub(super) fn finish(
@@ -233,12 +235,13 @@ impl BranchValueDecisionBuilder {
             return None;
         }
         let value = match root.target {
-            HirDecisionTarget::Node(entry) => {
-                crate::hir::decision::finalize_value_decision_expr(HirDecisionExpr {
+            HirDecisionTarget::Node(entry) => crate::hir::decision::finalize_value_decision_expr(
+                HirDecisionExpr {
                     entry,
                     nodes: self.nodes,
-                })
-            }
+                },
+                self.safety,
+            ),
             HirDecisionTarget::Expr(expr) => expr,
             // 候选拒绝[ConvergenceGuard]：root 没有父 test 可提供 CurrentValue；出现该 target 表示 builder 不变量未闭合。
             HirDecisionTarget::CurrentValue => return None,
@@ -248,10 +251,14 @@ impl BranchValueDecisionBuilder {
     }
 }
 
-fn normalize_current_value_target(test: &HirExpr, target: HirDecisionTarget) -> HirDecisionTarget {
+fn normalize_current_value_target(
+    test: &HirExpr,
+    target: HirDecisionTarget,
+    safety: HirExprSafety,
+) -> HirDecisionTarget {
     match target {
         // 候选拒绝[SemanticBarrier:EvalCount]：`if f() then out=f()` 原本调用两次，非 repeatable test 归一成 CurrentValue 会错误复用第一次结果；见 regress_241。
-        HirDecisionTarget::Expr(expr) if expr == *test && expr_is_repeatable(test) => {
+        HirDecisionTarget::Expr(expr) if expr == *test && safety.is_repeatable(test) => {
             HirDecisionTarget::CurrentValue
         }
         target => target,

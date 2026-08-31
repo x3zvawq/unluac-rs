@@ -8,7 +8,7 @@ use crate::parser::error::ParseError;
 use crate::parser::family::puc_lua::{
     DecodedInstructionFields, LUA_SIGNATURE, PucLuaInstructionCodec, RawInstructionWord,
     build_raw_string, collect_counted, decode_instruction_word, parse_puc_lua_instruction_section,
-    read_sized_i64, read_sized_u32,
+    read_sized_u32,
 };
 use crate::parser::limits::check_proto_depth;
 use crate::parser::options::ParseOptions;
@@ -216,7 +216,13 @@ impl Lua51Parser {
                 LUA_TBOOLEAN => RawLiteralConst::Boolean(reader.read_u8()? != 0),
                 LUA_TNUMBER => {
                     if layout.integral_number {
-                        RawLiteralConst::Integer(read_sized_i64(reader, layout, "lua_Number")?)
+                        // Lua 5.1 header 将 lua_Number 宽度与 sizeof(int) 分开声明；
+                        // integral-number 常量必须按 number_size 读取，而不是 integer_size。
+                        RawLiteralConst::Integer(reader.read_i64_sized(
+                            layout.number_size,
+                            layout.endianness,
+                            "lua_Number",
+                        )?)
                     } else {
                         RawLiteralConst::Number(
                             reader.read_f64_sized(layout.number_size, layout.endianness)?,

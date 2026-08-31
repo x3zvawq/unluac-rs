@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 use crate::hir::common::{
     HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::expr_facts::expr_truthiness;
@@ -37,6 +38,7 @@ use super::super::walk::{self, HirRewritePass};
 pub(super) fn coalesce_param_aliases_in_proto(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
+    safety: HirExprSafety,
 ) -> bool {
     let Some(alias) = match_param_alias_prefix(&proto.body) else {
         return false;
@@ -58,7 +60,9 @@ pub(super) fn coalesce_param_aliases_in_proto(
         // 候选拒绝[PolicyBoundary]：带 source debug identity 的 alias local 保留独立声明，不把其名称与词法范围折入参数。
         return false;
     }
-    if let Err(error) = validate_alias_flow(rest, alias.local, alias.param, AliasStates::entry()) {
+    if let Err(error) =
+        validate_alias_flow(rest, alias.local, alias.param, AliasStates::entry(), safety)
+    {
         match error {
             AliasFlowError::ValueFlow => {
                 // 候选拒绝[SemanticBarrier:ValueFlow]：同一路径写一侧后读取另一侧会区分两个 binding；如 `l=1; return p` 或 `p=2; return l`，合并后返回新值而非旧值。
@@ -231,6 +235,7 @@ fn validate_alias_flow(
     local: LocalId,
     param: ParamId,
     mut states: AliasStates,
+    safety: HirExprSafety,
 ) -> Result<AliasFlow, AliasFlowError> {
     let mut breaks = AliasStates::default();
     let mut continues = AliasStates::default();
@@ -238,7 +243,7 @@ fn validate_alias_flow(
         if states.is_empty() {
             break;
         }
-        let flow = validate_alias_stmt(stmt, local, param, states)?;
+        let flow = validate_alias_stmt(stmt, local, param, states, safety)?;
         states = flow.fallthrough;
         breaks = breaks.union(flow.breaks);
         continues = continues.union(flow.continues);
@@ -255,30 +260,47 @@ fn validate_alias_stmt(
     local: LocalId,
     param: ParamId,
     states: AliasStates,
+    safety: HirExprSafety,
 ) -> Result<AliasFlow, AliasFlowError> {
     match stmt {
         HirStmt::If(if_stmt) => {
             let states = evaluate_expr(&if_stmt.cond, local, param, states)?;
-            let then_flow = if expr_truthiness(&if_stmt.cond) == Some(false) {
+            let then_flow = if expr_truthiness(&if_stmt.cond, safety) == Some(false) {
                 AliasFlow::fallthrough(AliasStates::default())
             } else {
-                validate_alias_flow(&if_stmt.then_block.stmts, local, param, states.clone())?
+                validate_alias_flow(
+                    &if_stmt.then_block.stmts,
+                    local,
+                    param,
+                    states.clone(),
+                    safety,
+                )?
             };
-            let else_flow = if expr_truthiness(&if_stmt.cond) == Some(true) {
+            let else_flow = if expr_truthiness(&if_stmt.cond, safety) == Some(true) {
                 AliasFlow::fallthrough(AliasStates::default())
             } else if let Some(else_block) = &if_stmt.else_block {
-                validate_alias_flow(&else_block.stmts, local, param, states)?
+                validate_alias_flow(&else_block.stmts, local, param, states, safety)?
             } else {
                 AliasFlow::fallthrough(states)
             };
             Ok(union_alias_flows(then_flow, else_flow))
         }
-        HirStmt::While(while_stmt) => {
-            validate_while_alias(&while_stmt.body, &while_stmt.cond, local, param, states)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            validate_repeat_alias(&repeat_stmt.body, &repeat_stmt.cond, local, param, states)
-        }
+        HirStmt::While(while_stmt) => validate_while_alias(
+            &while_stmt.body,
+            &while_stmt.cond,
+            local,
+            param,
+            states,
+            safety,
+        ),
+        HirStmt::Repeat(repeat_stmt) => validate_repeat_alias(
+            &repeat_stmt.body,
+            &repeat_stmt.cond,
+            local,
+            param,
+            states,
+            safety,
+        ),
         HirStmt::NumericFor(numeric_for) => {
             if numeric_for.binding == local {
                 return Err(AliasFlowError::BindingInvariant);
@@ -294,6 +316,7 @@ fn validate_alias_stmt(
                 evaluated.clone(),
                 evaluated,
                 false,
+                safety,
             )
         }
         HirStmt::GenericFor(generic_for) => {
@@ -315,9 +338,10 @@ fn validate_alias_stmt(
                 zero_exit.clone(),
                 zero_exit,
                 true,
+                safety,
             )
         }
-        HirStmt::Block(block) => validate_alias_flow(&block.stmts, local, param, states),
+        HirStmt::Block(block) => validate_alias_flow(&block.stmts, local, param, states, safety),
         HirStmt::ToBeClosed(to_be_closed) if expr_mentions_local(&to_be_closed.value, local) => {
             Err(AliasFlowError::Resource)
         }
@@ -355,8 +379,9 @@ fn validate_while_alias(
     local: LocalId,
     param: ParamId,
     incoming: AliasStates,
+    safety: HirExprSafety,
 ) -> Result<AliasFlow, AliasFlowError> {
-    let truthiness = expr_truthiness(condition);
+    let truthiness = expr_truthiness(condition, safety);
     let mut entries = incoming.clone();
     let mut break_exits = AliasStates::default();
     loop {
@@ -364,7 +389,7 @@ fn validate_while_alias(
         let body_flow = if truthiness == Some(false) {
             AliasFlow::default()
         } else {
-            validate_alias_flow(&body.stmts, local, param, condition_states.clone())?
+            validate_alias_flow(&body.stmts, local, param, condition_states.clone(), safety)?
         };
         let next_entries = incoming
             .clone()
@@ -390,12 +415,13 @@ fn validate_repeat_alias(
     local: LocalId,
     param: ParamId,
     incoming: AliasStates,
+    safety: HirExprSafety,
 ) -> Result<AliasFlow, AliasFlowError> {
-    let truthiness = expr_truthiness(condition);
+    let truthiness = expr_truthiness(condition, safety);
     let mut entries = incoming.clone();
     let mut break_exits = AliasStates::default();
     loop {
-        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone())?;
+        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone(), safety)?;
         let condition_states = evaluate_expr(
             condition,
             local,
@@ -429,11 +455,12 @@ fn validate_zero_or_more_alias(
     zero_exit: AliasStates,
     initial_body_entry: AliasStates,
     opaque_each_iteration: bool,
+    safety: HirExprSafety,
 ) -> Result<AliasFlow, AliasFlowError> {
     let mut entries = initial_body_entry.clone();
     let mut break_exits = AliasStates::default();
     loop {
-        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone())?;
+        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone(), safety)?;
         let iteration_exits = body_flow.fallthrough.union(body_flow.continues);
         let callback_exits = if opaque_each_iteration {
             evaluate_opaque_callback(local, param, iteration_exits)?

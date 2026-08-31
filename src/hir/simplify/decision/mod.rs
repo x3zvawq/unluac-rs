@@ -20,12 +20,15 @@ use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirProto,
 };
-use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
+use crate::hir::expr_safety::HirExprSafety;
 use helpers::{logical_and, logical_or};
 
 /// 对单个 proto 递归执行 decision DAG 归一化。
-pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
-    rewrite_proto_exprs(proto, &mut DecisionExprPass)
+pub(super) fn simplify_decision_exprs_in_proto(
+    proto: &mut HirProto,
+    safety: HirExprSafety,
+) -> bool {
+    rewrite_proto_exprs(proto, &mut DecisionExprPass { safety })
 }
 
 /// 把前面保留在 HIR 内部的 `Decision` 彻底消掉。
@@ -36,14 +39,16 @@ pub(super) fn simplify_decision_exprs_in_proto(proto: &mut HirProto) -> bool {
 pub(crate) use eliminate::eliminate_remaining_decisions_in_proto;
 pub(crate) use synthesize::naturalize_pure_logical_expr;
 
-struct DecisionExprPass;
+struct DecisionExprPass {
+    safety: HirExprSafety,
+}
 
 impl ExprRewritePass for DecisionExprPass {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut decision_replacement = None;
         let mut changed = false;
         if let HirExpr::Decision(decision) = expr {
-            let (decision_changed, replacement) = simplify_decision_expr(decision);
+            let (decision_changed, replacement) = simplify_decision_expr(decision, self.safety);
             decision_replacement = replacement;
             changed |= decision_changed;
         }
@@ -61,7 +66,7 @@ impl ExprRewritePass for DecisionExprPass {
         if let HirExpr::Decision(decision) = expr
             // 候选拒绝[ProofIncomplete]：循环 Decision 缺少可物化为结构化 loop 的 owner/fact，直接递归展开会重复求值并且不终止。
             && !decision_has_cycles(decision)
-            && let Some(replacement) = collapse_condition_decision_expr(decision)
+            && let Some(replacement) = collapse_condition_decision_expr(decision, self.safety)
         {
             *expr = replacement;
             changed = true;
@@ -70,8 +75,11 @@ impl ExprRewritePass for DecisionExprPass {
     }
 }
 
-fn simplify_decision_expr(decision: &mut HirDecisionExpr) -> (bool, Option<HirExpr>) {
-    let Some(reduced) = reduce_decision_expr(decision) else {
+fn simplify_decision_expr(
+    decision: &mut HirDecisionExpr,
+    safety: HirExprSafety,
+) -> (bool, Option<HirExpr>) {
+    let Some(reduced) = reduce_decision_expr(decision, safety) else {
         return (false, None);
     };
 
@@ -95,7 +103,10 @@ pub(super) enum ResolvedDecisionTarget {
     Expr(HirExpr),
 }
 
-fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
+fn reduce_decision_expr(
+    decision: &HirDecisionExpr,
+    safety: HirExprSafety,
+) -> Option<ReducedDecision> {
     // 候选拒绝[ProofIncomplete]：循环 Decision 缺少可物化为结构化 loop 的 owner/fact，不能用递归树化代替控制流证明。
     // 循环 DAG 目前只允许“原样保留为 Decision”，不能继续走 value-collapse /
     // known-test specialize 这条树化路径。否则会把同一条环上的节点反复递归展开，
@@ -118,7 +129,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             && nodes
                 .get(child_ref.index())
                 .is_some_and(|child| child.test == node.test)
-            && expr_is_repeatable(&node.test)
+            && safety.is_repeatable(&node.test)
         {
             node.truthy = resolve_child_branch(&nodes, &replacements, *child_ref, true);
             node_changed = true;
@@ -133,7 +144,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             && nodes
                 .get(child_ref.index())
                 .is_some_and(|child| child.test == node.test)
-            && expr_is_repeatable(&node.test)
+            && safety.is_repeatable(&node.test)
         {
             node.falsy = resolve_child_branch(&nodes, &replacements, *child_ref, false);
             node_changed = true;
@@ -144,8 +155,8 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         }
 
         // 候选拒绝[SemanticBarrier:EvalCount]：即使 truthiness 已知，删除 `{ f() }` test 也会漏掉字段表达式中的一次 `f()`。
-        if let Some(constant_truthy) = expr_truthiness(&node.test)
-            && expr_is_discard_safe(&node.test)
+        if let Some(constant_truthy) = expr_truthiness(&node.test, safety)
+            && safety.is_discard_safe(&node.test)
         {
             replacements[node_ref.index()] = Some(resolve_target_in_node_context(
                 &replacements,
@@ -161,7 +172,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         }
 
         // 候选拒绝[SemanticBarrier:EvalCount]：两臂相同也不能删除 `f()` test，否则原来必达的一次调用消失。
-        if node.truthy == node.falsy && expr_is_discard_safe(&node.test) {
+        if node.truthy == node.falsy && safety.is_discard_safe(&node.test) {
             replacements[node_ref.index()] = Some(resolve_target_in_node_context(
                 &replacements,
                 &node,
@@ -186,7 +197,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         ResolvedDecisionTarget::Node(entry) => {
             let (rebuilt, topology_changed) = rebuild_decision(entry, &nodes);
             changed |= topology_changed;
-            if let Some(expr) = collapse_value_decision_expr(&rebuilt) {
+            if let Some(expr) = collapse_value_decision_expr(&rebuilt, safety) {
                 return Some(ReducedDecision::Expr(expr));
             }
             if changed {
@@ -317,24 +328,27 @@ fn remap_target(
     }
 }
 
-pub(in crate::hir) fn collapse_value_decision_expr(decision: &HirDecisionExpr) -> Option<HirExpr> {
+pub(in crate::hir) fn collapse_value_decision_expr(
+    decision: &HirDecisionExpr,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
     // 候选拒绝[ProofIncomplete]：循环 Decision 缺少结构化 loop owner/fact，有限 `and/or` 表达式不能直接承载回边。
     if decision_has_cycles(decision) {
         return None;
     }
 
     if decision_has_shared_nodes(decision) {
-        synthesize::synthesize_value_decision_expr(decision).or_else(|| {
+        synthesize::synthesize_value_decision_expr(decision, safety).or_else(|| {
             let mut memo = BTreeMap::new();
-            collapse_value_node(decision, decision.entry, &mut memo)
+            collapse_value_node(decision, decision.entry, &mut memo, safety)
         })
     } else {
         if let Some(expr) = collapse_linear_value_chain(decision) {
             return Some(expr);
         }
         let mut memo = BTreeMap::new();
-        collapse_value_node(decision, decision.entry, &mut memo)
-            .or_else(|| synthesize::synthesize_value_decision_expr(decision))
+        collapse_value_node(decision, decision.entry, &mut memo, safety)
+            .or_else(|| synthesize::synthesize_value_decision_expr(decision, safety))
     }
 }
 
@@ -414,20 +428,21 @@ fn collapse_value_node(
     decision: &HirDecisionExpr,
     node_ref: HirDecisionNodeRef,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     if let Some(expr) = memo.get(&node_ref) {
         return Some(expr.clone());
     }
 
-    if let Some(expr) = collapse_shared_falsy_chain(decision, node_ref, memo) {
+    if let Some(expr) = collapse_shared_falsy_chain(decision, node_ref, memo, safety) {
         memo.insert(node_ref, expr.clone());
         return Some(expr);
     }
 
     let node = decision.nodes.get(node_ref.index())?;
-    let truthy = collapse_value_target(decision, &node.truthy, memo)?;
-    let falsy = collapse_value_target(decision, &node.falsy, memo)?;
-    let expr = combine_value_expr(node.test.clone(), truthy, falsy)?;
+    let truthy = collapse_value_target(decision, &node.truthy, memo, safety)?;
+    let falsy = collapse_value_target(decision, &node.falsy, memo, safety)?;
+    let expr = combine_value_expr(node.test.clone(), truthy, falsy, safety)?;
     memo.insert(node_ref, expr.clone());
     Some(expr)
 }
@@ -436,6 +451,7 @@ fn collapse_shared_falsy_chain(
     decision: &HirDecisionExpr,
     node_ref: HirDecisionNodeRef,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let mut next_ref = node_ref;
     let mut terms = Vec::new();
@@ -444,7 +460,7 @@ fn collapse_shared_falsy_chain(
             if terms.is_empty() {
                 return None;
             }
-            break collapse_value_node(decision, next_ref, memo)?;
+            break collapse_value_node(decision, next_ref, memo, safety)?;
         };
         terms.push(term);
         match fallback {
@@ -459,6 +475,7 @@ fn collapse_shared_falsy_chain(
             term,
             CollapsedValueTarget::CurrentValue,
             CollapsedValueTarget::Expr(fallback),
+            safety,
         )
     })
 }
@@ -504,10 +521,11 @@ fn collapse_value_target(
     decision: &HirDecisionExpr,
     target: &HirDecisionTarget,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+    safety: HirExprSafety,
 ) -> Option<CollapsedValueTarget> {
     match target {
         HirDecisionTarget::Node(next_ref) => Some(CollapsedValueTarget::Expr(collapse_value_node(
-            decision, *next_ref, memo,
+            decision, *next_ref, memo, safety,
         )?)),
         HirDecisionTarget::CurrentValue => Some(CollapsedValueTarget::CurrentValue),
         HirDecisionTarget::Expr(expr) => Some(CollapsedValueTarget::Expr(expr.clone())),
@@ -518,9 +536,10 @@ fn combine_value_expr(
     subject: HirExpr,
     truthy: CollapsedValueTarget,
     falsy: CollapsedValueTarget,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
-    let truthy = normalize_collapsed_target(&subject, truthy);
-    let falsy = normalize_collapsed_target(&subject, falsy);
+    let truthy = normalize_collapsed_target(&subject, truthy, safety);
+    let falsy = normalize_collapsed_target(&subject, falsy, safety);
 
     if expr_is_boolean_valued(&subject) {
         match (&truthy, &falsy) {
@@ -577,22 +596,22 @@ fn combine_value_expr(
             Some(logical_and(subject, lhs))
         }
         (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs)) => {
-            if expr_truthiness(&lhs) == Some(true) {
+            if expr_truthiness(&lhs, safety) == Some(true) {
                 Some(logical_or(logical_and(subject, lhs), rhs))
-            } else if expr_truthiness(&rhs) == Some(true) {
+            } else if expr_truthiness(&rhs, safety) == Some(true) {
                 Some(logical_or(logical_and(subject.negate(), rhs), lhs))
-            } else if expr_is_repeatable(&subject)
-                && expr_is_repeatable(&lhs)
-                && expr_truthiness_assuming(&lhs, &subject, true) == Some(true)
+            } else if safety.is_repeatable(&subject)
+                && safety.is_repeatable(&lhs)
+                && expr_truthiness_assuming(&lhs, &subject, true, safety) == Some(true)
             {
                 // 分支值可能只在当前 guard 成立时恒真。把这种路径约束留在
                 // Decision 外就会误判成普通三元式并物化为 if；guard 与被跨越的
                 // 分支都可重复时，原顺序的 `subject and lhs or rhs` 才不会因求值中
                 // 改写 guard 而误入 fallback。
                 Some(logical_or(logical_and(subject, lhs), rhs))
-            } else if expr_is_repeatable(&subject)
-                && expr_is_repeatable(&rhs)
-                && expr_truthiness_assuming(&rhs, &subject, false) == Some(true)
+            } else if safety.is_repeatable(&subject)
+                && safety.is_repeatable(&rhs)
+                && expr_truthiness_assuming(&rhs, &subject, false, safety) == Some(true)
             {
                 Some(logical_or(logical_and(subject.negate(), rhs), lhs))
             } else {
@@ -607,17 +626,19 @@ fn expr_truthiness_assuming(
     expr: &HirExpr,
     subject: &HirExpr,
     subject_truthy: bool,
+    safety: HirExprSafety,
 ) -> Option<bool> {
     if expr == subject {
         return Some(subject_truthy);
     }
     match expr {
         HirExpr::Unary(unary) if unary.op == crate::hir::HirUnaryOpKind::Not => {
-            expr_truthiness_assuming(&unary.expr, subject, subject_truthy).map(|value| !value)
+            expr_truthiness_assuming(&unary.expr, subject, subject_truthy, safety)
+                .map(|value| !value)
         }
         HirExpr::LogicalOr(logical) => {
-            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy);
-            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy);
+            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy, safety);
+            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy, safety);
             match (lhs, rhs) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), rhs) => rhs,
@@ -625,25 +646,26 @@ fn expr_truthiness_assuming(
             }
         }
         HirExpr::LogicalAnd(logical) => {
-            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy);
-            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy);
+            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy, safety);
+            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy, safety);
             match (lhs, rhs) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), rhs) => rhs,
                 _ => None,
             }
         }
-        _ => expr_truthiness(expr),
+        _ => expr_truthiness(expr, safety),
     }
 }
 
 fn normalize_collapsed_target(
     subject: &HirExpr,
     target: CollapsedValueTarget,
+    safety: HirExprSafety,
 ) -> CollapsedValueTarget {
     match target {
         CollapsedValueTarget::Expr(expr) if &expr == subject => {
-            if expr_is_repeatable(subject) {
+            if safety.is_repeatable(subject) {
                 CollapsedValueTarget::CurrentValue
             } else {
                 // 候选拒绝[SemanticBarrier:EvalCount]：把两次同形 `f()` 归一成 CurrentValue 会把后一次调用错误复用为前一次结果。
@@ -656,6 +678,7 @@ fn normalize_collapsed_target(
 
 pub(in crate::hir) fn collapse_condition_decision_expr(
     decision: &HirDecisionExpr,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     // 候选拒绝[ProofIncomplete]：循环 Decision 需要前层提供 loop owner，条件表达式递归展开无法保持回边与求值次数。
     if decision_has_cycles(decision) {
@@ -663,27 +686,28 @@ pub(in crate::hir) fn collapse_condition_decision_expr(
     }
 
     let mut memo = BTreeMap::new();
-    collapse_condition_node(decision, decision.entry, &mut memo)
+    collapse_condition_node(decision, decision.entry, &mut memo, safety)
 }
 
 fn collapse_condition_node(
     decision: &HirDecisionExpr,
     node_ref: HirDecisionNodeRef,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     if let Some(expr) = memo.get(&node_ref) {
         return Some(expr.clone());
     }
 
-    if let Some(expr) = collapse_shared_condition_chain(decision, node_ref, memo) {
+    if let Some(expr) = collapse_shared_condition_chain(decision, node_ref, memo, safety) {
         memo.insert(node_ref, expr.clone());
         return Some(expr);
     }
 
     let node = decision.nodes.get(node_ref.index())?;
-    let truthy = collapse_condition_target(decision, node, &node.truthy, memo)?;
-    let falsy = collapse_condition_target(decision, node, &node.falsy, memo)?;
-    let expr = combine_condition_expr(node.test.clone(), truthy, falsy)?;
+    let truthy = collapse_condition_target(decision, node, &node.truthy, memo, safety)?;
+    let falsy = collapse_condition_target(decision, node, &node.falsy, memo, safety)?;
+    let expr = combine_condition_expr(node.test.clone(), truthy, falsy, safety)?;
     memo.insert(node_ref, expr.clone());
     Some(expr)
 }
@@ -692,11 +716,18 @@ fn collapse_shared_condition_chain(
     decision: &HirDecisionExpr,
     node_ref: HirDecisionNodeRef,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let node = decision.nodes.get(node_ref.index())?;
     if matches!(node.truthy, HirDecisionTarget::Node(_))
-        && let Some(expr) =
-            collapse_condition_chain_with_fallback(decision, node_ref, true, &node.falsy, memo)
+        && let Some(expr) = collapse_condition_chain_with_fallback(
+            decision,
+            node_ref,
+            true,
+            &node.falsy,
+            memo,
+            safety,
+        )
     {
         return Some(expr);
     }
@@ -707,6 +738,7 @@ fn collapse_shared_condition_chain(
             false,
             &node.truthy,
             memo,
+            safety,
         );
     }
     None
@@ -718,6 +750,7 @@ fn collapse_condition_chain_with_fallback(
     mut follow_truthy: bool,
     shared: &HirDecisionTarget,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     if matches!(shared, HirDecisionTarget::CurrentValue) {
         return None;
@@ -768,12 +801,12 @@ fn collapse_condition_chain_with_fallback(
     }
     let shared = match shared {
         HirDecisionTarget::Node(shared_ref) => {
-            collapse_condition_node(decision, *shared_ref, memo)?
+            collapse_condition_node(decision, *shared_ref, memo, safety)?
         }
         HirDecisionTarget::Expr(expr) => expr.clone(),
         HirDecisionTarget::CurrentValue => return None,
     };
-    combine_condition_expr(balanced_logical_and(guard_terms)?, terminal, shared)
+    combine_condition_expr(balanced_logical_and(guard_terms)?, terminal, shared, safety)
 }
 
 fn balanced_logical_and(mut terms: Vec<HirExpr>) -> Option<HirExpr> {
@@ -796,15 +829,23 @@ fn collapse_condition_target(
     node: &HirDecisionNode,
     target: &HirDecisionTarget,
     memo: &mut BTreeMap<HirDecisionNodeRef, HirExpr>,
+    safety: HirExprSafety,
 ) -> Option<HirExpr> {
     match target {
-        HirDecisionTarget::Node(next_ref) => collapse_condition_node(decision, *next_ref, memo),
+        HirDecisionTarget::Node(next_ref) => {
+            collapse_condition_node(decision, *next_ref, memo, safety)
+        }
         HirDecisionTarget::CurrentValue => Some(node.test.clone()),
         HirDecisionTarget::Expr(expr) => Some(expr.clone()),
     }
 }
 
-fn combine_condition_expr(subject: HirExpr, truthy: HirExpr, falsy: HirExpr) -> Option<HirExpr> {
+fn combine_condition_expr(
+    subject: HirExpr,
+    truthy: HirExpr,
+    falsy: HirExpr,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
     if is_true(&truthy) && is_false(&falsy) {
         return Some(subject);
     }
@@ -826,7 +867,10 @@ fn combine_condition_expr(subject: HirExpr, truthy: HirExpr, falsy: HirExpr) -> 
     // 条件位置只观察 truthiness。guard 与两臂都不会在求值间改写状态时，互斥 guard
     // 才能保证只求值原 decision 选中的 value arm；这覆盖 phi/value decision 随后
     // 立刻作为 branch 条件的通用形状，避免把内部 Decision 泄漏到 AST。
-    if expr_is_repeatable(&subject) && expr_is_repeatable(&truthy) && expr_is_repeatable(&falsy) {
+    if safety.is_repeatable(&subject)
+        && safety.is_repeatable(&truthy)
+        && safety.is_repeatable(&falsy)
+    {
         let falsy_guard = subject.clone().negate();
         return Some(logical_or(
             logical_and(subject, truthy),

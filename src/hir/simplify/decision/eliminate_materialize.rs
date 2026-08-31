@@ -20,7 +20,7 @@ use crate::hir::common::{
     HirTableAccess, HirTableConstructor, HirTableField, HirTableKey, HirUnaryExpr, HirValuePack,
     LocalId,
 };
-use crate::hir::expr_safety::{expr_is_discard_safe, expr_requires_ordered_snapshot};
+use crate::hir::expr_safety::{HirExprSafety, expr_requires_ordered_snapshot};
 
 use super::super::visit::{HirVisitor, visit_expr};
 use super::eliminate_state::EliminationState;
@@ -35,10 +35,12 @@ pub(super) fn assign_target_supports_direct_materialization(target: &HirLValue) 
 pub(super) fn extract_numeric_for(
     mut numeric_for: Box<HirNumericFor>,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, Box<HirNumericFor>, bool) {
     let (prefix, mut exprs, exprs_changed) = extract_value_exprs(
         vec![numeric_for.start, numeric_for.limit, numeric_for.step],
         state,
+        safety,
     );
     numeric_for.start = exprs.remove(0);
     numeric_for.limit = exprs.remove(0);
@@ -49,8 +51,10 @@ pub(super) fn extract_numeric_for(
 pub(super) fn extract_generic_for(
     mut generic_for: Box<HirGenericFor>,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, Box<HirGenericFor>, bool) {
-    let (prefix, iterator, iterator_changed) = extract_value_pack(generic_for.iterator, state);
+    let (prefix, iterator, iterator_changed) =
+        extract_value_pack(generic_for.iterator, state, safety);
     generic_for.iterator = iterator;
     (prefix, generic_for, iterator_changed)
 }
@@ -58,6 +62,7 @@ pub(super) fn extract_generic_for(
 pub(super) fn extract_call_expr(
     call: HirCallExpr,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirCallExpr, bool) {
     let HirCallExpr {
         callee,
@@ -67,7 +72,7 @@ pub(super) fn extract_call_expr(
         method_name,
     } = call;
     let (prefix, mut leading, args, changed) =
-        extract_value_pack_with_leading(vec![callee], args, state);
+        extract_value_pack_with_leading(vec![callee], args, state, safety);
     let callee = leading
         .pop()
         .expect("call extraction should preserve its callee");
@@ -87,8 +92,10 @@ pub(super) fn extract_call_expr(
 pub(super) fn extract_value_pack(
     pack: HirValuePack,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirValuePack, bool) {
-    let (prefix, leading, pack, changed) = extract_value_pack_with_leading(Vec::new(), pack, state);
+    let (prefix, leading, pack, changed) =
+        extract_value_pack_with_leading(Vec::new(), pack, state, safety);
     debug_assert!(leading.is_empty());
     (prefix, pack, changed)
 }
@@ -97,15 +104,16 @@ pub(super) fn extract_value_pack_with_leading(
     mut leading: Vec<HirExpr>,
     pack: HirValuePack,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, Vec<HirExpr>, HirValuePack, bool) {
     let leading_len = leading.len();
     leading.extend(pack.fixed);
-    let mut extracted = extract_ordered_exprs(leading, state, extract_value_expr);
+    let mut extracted = extract_ordered_exprs(leading, state, safety, extract_value_expr);
     let mut tail_prefix = Vec::new();
     let mut tail_changed = false;
     let tail = pack.tail.map(|tail| {
         tail.map_call(|call| {
-            let (prefix, call, changed) = extract_call_expr(call, state);
+            let (prefix, call, changed) = extract_call_expr(call, state, safety);
             tail_prefix = prefix;
             tail_changed = changed;
             call
@@ -126,19 +134,25 @@ pub(super) fn extract_value_pack_with_leading(
 pub(super) fn extract_value_exprs(
     exprs: Vec<HirExpr>,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, Vec<HirExpr>, bool) {
-    let extracted = extract_ordered_exprs(exprs, state, extract_value_expr);
+    let extracted = extract_ordered_exprs(exprs, state, safety, extract_value_expr);
     (extracted.prefix, extracted.exprs, extracted.changed)
 }
 
 fn extract_ordered_exprs(
     exprs: Vec<HirExpr>,
     state: &mut EliminationState<'_>,
-    mut extract: impl FnMut(HirExpr, &mut EliminationState<'_>) -> (Vec<HirStmt>, HirExpr, bool),
+    safety: HirExprSafety,
+    mut extract: impl FnMut(
+        HirExpr,
+        &mut EliminationState<'_>,
+        HirExprSafety,
+    ) -> (Vec<HirStmt>, HirExpr, bool),
 ) -> OrderedExprExtraction {
     let mut extracted = OrderedExprExtraction::with_capacity(exprs.len());
     for expr in exprs {
-        let (prefix, expr, changed) = extract(expr, state);
+        let (prefix, expr, changed) = extract(expr, state, safety);
         let stable = !prefix.is_empty() && matches!(expr, HirExpr::LocalRef(_));
         extracted.push(prefix, expr, changed, stable, true, state);
     }
@@ -206,6 +220,7 @@ impl OrderedExprExtraction {
 pub(super) fn extract_assign(
     assign: HirAssign,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirAssign, bool) {
     let mut leading = Vec::new();
     let mut target_shapes = Vec::with_capacity(assign.targets.len());
@@ -221,7 +236,7 @@ pub(super) fn extract_assign(
     }
 
     let (prefix, leading, values, changed) =
-        extract_value_pack_with_leading(leading, assign.values, state);
+        extract_value_pack_with_leading(leading, assign.values, state, safety);
     let mut leading = leading.into_iter();
     let targets = target_shapes
         .into_iter()
@@ -246,11 +261,12 @@ pub(super) fn extract_assign(
 pub(super) fn extract_value_expr(
     expr: HirExpr,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirExpr, bool) {
     if !expr_contains_eliminable_decision(&expr) {
         return (Vec::new(), expr, false);
     }
-    if let Some(collapsed) = collapse_expr_to_pure(expr.clone()) {
+    if let Some(collapsed) = collapse_expr_to_pure(expr.clone(), safety) {
         return (Vec::new(), collapsed, true);
     }
 
@@ -260,6 +276,7 @@ pub(super) fn extract_value_expr(
         expr,
         HirLValue::Local(local),
         state,
+        safety,
     ));
     (prefix, HirExpr::LocalRef(local), true)
 }
@@ -268,17 +285,20 @@ pub(super) fn materialize_expr_into_target(
     expr: HirExpr,
     target: HirLValue,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> Vec<HirStmt> {
     match expr {
-        HirExpr::Decision(decision) => materialize_decision_into_target(*decision, target, state),
+        HirExpr::Decision(decision) => {
+            materialize_decision_into_target(*decision, target, state, safety)
+        }
         HirExpr::LogicalAnd(logical) => {
-            materialize_logical_expr_into_target(true, *logical, target, state)
+            materialize_logical_expr_into_target(true, *logical, target, state, safety)
         }
         HirExpr::LogicalOr(logical) => {
-            materialize_logical_expr_into_target(false, *logical, target, state)
+            materialize_logical_expr_into_target(false, *logical, target, state, safety)
         }
         expr => {
-            let (mut prefix, expr) = prepare_pure_expr(expr, state);
+            let (mut prefix, expr) = prepare_pure_expr(expr, state, safety);
             prefix.push(assign_stmt(target, expr));
             prefix
         }
@@ -289,9 +309,10 @@ pub(super) fn materialize_expr_for_assignment(
     expr: HirExpr,
     target: HirLValue,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> Vec<HirStmt> {
     if matches!(target, HirLValue::Temp(_)) {
-        return materialize_expr_into_target(expr, target, state);
+        return materialize_expr_into_target(expr, target, state, safety);
     }
 
     let result = state.alloc_local();
@@ -300,6 +321,7 @@ pub(super) fn materialize_expr_for_assignment(
         expr,
         HirLValue::Local(result),
         state,
+        safety,
     ));
     stmts.push(assign_stmt(target, HirExpr::LocalRef(result)));
     stmts
@@ -310,16 +332,17 @@ fn materialize_logical_expr_into_target(
     logical: HirLogicalExpr,
     target: HirLValue,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> Vec<HirStmt> {
-    if let Some(lhs_truthy) = super::expr_truthiness(&logical.lhs) {
+    if let Some(lhs_truthy) = super::expr_truthiness(&logical.lhs, safety) {
         let selects_rhs = lhs_truthy == is_and;
-        if !selects_rhs || expr_is_discard_safe(&logical.lhs) {
+        if !selects_rhs || safety.is_discard_safe(&logical.lhs) {
             let selected = if selects_rhs {
                 logical.rhs
             } else {
                 logical.lhs
             };
-            return materialize_expr_into_target(selected, target, state);
+            return materialize_expr_into_target(selected, target, state, safety);
         }
     }
 
@@ -329,6 +352,7 @@ fn materialize_logical_expr_into_target(
         logical.lhs,
         HirLValue::Local(lhs_local),
         state,
+        safety,
     ));
     stmts.push(assign_stmt(target.clone(), HirExpr::LocalRef(lhs_local)));
 
@@ -338,7 +362,7 @@ fn materialize_logical_expr_into_target(
         HirExpr::LocalRef(lhs_local).negate()
     };
     let then_block = HirBlock {
-        stmts: materialize_expr_into_target(logical.rhs, target, state),
+        stmts: materialize_expr_into_target(logical.rhs, target, state, safety),
     };
     stmts.push(HirStmt::If(Box::new(HirIf {
         cond: guard,
@@ -352,12 +376,13 @@ fn materialize_decision_into_target(
     decision: HirDecisionExpr,
     target: HirLValue,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> Vec<HirStmt> {
-    if let Some(expr) = super::collapse_value_decision_expr(&decision) {
-        return materialize_expr_into_target(expr, target, state);
+    if let Some(expr) = super::collapse_value_decision_expr(&decision, safety) {
+        return materialize_expr_into_target(expr, target, state, safety);
     }
 
-    materialize_decision_node(&decision, decision.entry.index(), target, state)
+    materialize_decision_node(&decision, decision.entry.index(), target, state, safety)
 }
 
 fn materialize_decision_node(
@@ -365,11 +390,12 @@ fn materialize_decision_node(
     node_index: usize,
     target: HirLValue,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> Vec<HirStmt> {
     let node = &decision.nodes[node_index];
     let captures_current = matches!(node.truthy, HirDecisionTarget::CurrentValue)
         || matches!(node.falsy, HirDecisionTarget::CurrentValue);
-    let (mut prefix, prepared_test) = prepare_pure_expr(node.test.clone(), state);
+    let (mut prefix, prepared_test) = prepare_pure_expr(node.test.clone(), state, safety);
     let (cond, current_value) = if captures_current {
         let current_local = state.alloc_local();
         prefix.push(local_decl_with_value(current_local, prepared_test));
@@ -389,6 +415,7 @@ fn materialize_decision_node(
             current_value.as_ref(),
             target.clone(),
             state,
+            safety,
         ),
     };
     let else_stmts = materialize_decision_target(
@@ -398,15 +425,16 @@ fn materialize_decision_node(
         current_value.as_ref(),
         target,
         state,
+        safety,
     );
-    let cond_discard_safe = expr_is_discard_safe(&cond);
+    let cond_discard_safe = safety.is_discard_safe(&cond);
 
     if cond_discard_safe && then_block.stmts == else_stmts {
         prefix.extend(then_block.stmts);
         return prefix;
     }
 
-    if cond_discard_safe && let Some(cond_truthy) = super::expr_truthiness(&cond) {
+    if cond_discard_safe && let Some(cond_truthy) = super::expr_truthiness(&cond, safety) {
         prefix.extend(if cond_truthy {
             then_block.stmts
         } else {
@@ -442,24 +470,31 @@ fn materialize_decision_target(
     current_value: Option<&HirExpr>,
     target: HirLValue,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> Vec<HirStmt> {
     match target_branch {
         HirDecisionTarget::Node(next_ref) => {
-            materialize_decision_node(decision, next_ref.index(), target, state)
+            materialize_decision_node(decision, next_ref.index(), target, state, safety)
         }
         HirDecisionTarget::CurrentValue => vec![assign_stmt(
             target,
             current_value.cloned().unwrap_or_else(|| node.test.clone()),
         )],
-        HirDecisionTarget::Expr(expr) => materialize_expr_into_target(expr.clone(), target, state),
+        HirDecisionTarget::Expr(expr) => {
+            materialize_expr_into_target(expr.clone(), target, state, safety)
+        }
     }
 }
 
-fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<HirStmt>, HirExpr) {
+fn prepare_pure_expr(
+    expr: HirExpr,
+    state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
+) -> (Vec<HirStmt>, HirExpr) {
     if expr_contains_eliminable_decision(&expr)
-        && let Some(collapsed) = collapse_expr_to_pure(expr.clone())
+        && let Some(collapsed) = collapse_expr_to_pure(expr.clone(), safety)
     {
-        return prepare_pure_expr(collapsed, state);
+        return prepare_pure_expr(collapsed, state, safety);
     }
 
     match expr {
@@ -472,11 +507,13 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
                 expr,
                 HirLValue::Local(local),
                 state,
+                safety,
             ));
             (prefix, HirExpr::LocalRef(local))
         }
         HirExpr::TableAccess(access) => {
-            let (prefix, exprs) = prepare_ordered_exprs(vec![access.base, access.key], state);
+            let (prefix, exprs) =
+                prepare_ordered_exprs(vec![access.base, access.key], state, safety);
             let mut exprs = exprs.into_iter();
             let base = exprs
                 .next()
@@ -490,14 +527,15 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             )
         }
         HirExpr::Unary(unary) => {
-            let (prefix, expr) = prepare_pure_expr(unary.expr, state);
+            let (prefix, expr) = prepare_pure_expr(unary.expr, state, safety);
             (
                 prefix,
                 HirExpr::Unary(Box::new(HirUnaryExpr { op: unary.op, expr })),
             )
         }
         HirExpr::Binary(binary) => {
-            let (prefix, exprs) = prepare_ordered_exprs(vec![binary.lhs, binary.rhs], state);
+            let (prefix, exprs) =
+                prepare_ordered_exprs(vec![binary.lhs, binary.rhs], state, safety);
             let mut exprs = exprs.into_iter();
             let lhs = exprs
                 .next()
@@ -515,7 +553,8 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             )
         }
         HirExpr::LogicalAnd(logical) => {
-            let (prefix, exprs) = prepare_ordered_exprs(vec![logical.lhs, logical.rhs], state);
+            let (prefix, exprs) =
+                prepare_ordered_exprs(vec![logical.lhs, logical.rhs], state, safety);
             let mut exprs = exprs.into_iter();
             let lhs = exprs
                 .next()
@@ -529,7 +568,8 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             )
         }
         HirExpr::LogicalOr(logical) => {
-            let (prefix, exprs) = prepare_ordered_exprs(vec![logical.lhs, logical.rhs], state);
+            let (prefix, exprs) =
+                prepare_ordered_exprs(vec![logical.lhs, logical.rhs], state, safety);
             let mut exprs = exprs.into_iter();
             let lhs = exprs
                 .next()
@@ -543,15 +583,15 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
             )
         }
         HirExpr::Call(call) => {
-            let (prefix, call, _) = extract_call_expr(*call, state);
+            let (prefix, call, _) = extract_call_expr(*call, state, safety);
             (prefix, HirExpr::Call(Box::new(call)))
         }
         HirExpr::TableConstructor(table) => {
-            let (prefix, table) = prepare_table_constructor(*table, state);
+            let (prefix, table) = prepare_table_constructor(*table, state, safety);
             (prefix, HirExpr::TableConstructor(Box::new(table)))
         }
         HirExpr::Closure(closure) => {
-            let (prefix, closure) = prepare_closure(*closure, state);
+            let (prefix, closure) = prepare_closure(*closure, state, safety);
             (prefix, HirExpr::Closure(Box::new(closure)))
         }
         expr => (Vec::new(), expr),
@@ -561,67 +601,76 @@ fn prepare_pure_expr(expr: HirExpr, state: &mut EliminationState<'_>) -> (Vec<Hi
 fn prepare_ordered_exprs(
     exprs: Vec<HirExpr>,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, Vec<HirExpr>) {
-    let extracted = extract_ordered_exprs(exprs, state, |expr, state| {
-        let (prefix, expr) = prepare_pure_expr(expr, state);
+    let extracted = extract_ordered_exprs(exprs, state, safety, |expr, state, safety| {
+        let (prefix, expr) = prepare_pure_expr(expr, state, safety);
         let changed = !prefix.is_empty();
         (prefix, expr, changed)
     });
     (extracted.prefix, extracted.exprs)
 }
 
-fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
+fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
     match expr {
-        HirExpr::Decision(decision) => super::collapse_value_decision_expr(&decision),
+        HirExpr::Decision(decision) => super::collapse_value_decision_expr(&decision, safety),
         HirExpr::TableAccess(access) => Some(HirExpr::TableAccess(Box::new(HirTableAccess {
-            base: collapse_expr_to_pure(access.base)?,
-            key: collapse_expr_to_pure(access.key)?,
+            base: collapse_expr_to_pure(access.base, safety)?,
+            key: collapse_expr_to_pure(access.key, safety)?,
         }))),
         HirExpr::Unary(unary) => Some(HirExpr::Unary(Box::new(HirUnaryExpr {
             op: unary.op,
-            expr: collapse_expr_to_pure(unary.expr)?,
+            expr: collapse_expr_to_pure(unary.expr, safety)?,
         }))),
         HirExpr::Binary(binary) => Some(HirExpr::Binary(Box::new(HirBinaryExpr {
             op: binary.op,
-            lhs: collapse_expr_to_pure(binary.lhs)?,
-            rhs: collapse_expr_to_pure(binary.rhs)?,
+            lhs: collapse_expr_to_pure(binary.lhs, safety)?,
+            rhs: collapse_expr_to_pure(binary.rhs, safety)?,
         }))),
         HirExpr::LogicalAnd(logical) => {
-            let lhs = collapse_expr_to_pure(logical.lhs)?;
-            let rhs = collapse_expr_to_pure(logical.rhs)?;
+            let lhs = collapse_expr_to_pure(logical.lhs, safety)?;
+            let rhs = collapse_expr_to_pure(logical.rhs, safety)?;
             let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }));
-            Some(super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr))
+            Some(
+                super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
+                    .unwrap_or(expr),
+            )
         }
         HirExpr::LogicalOr(logical) => {
-            let lhs = collapse_expr_to_pure(logical.lhs)?;
-            let rhs = collapse_expr_to_pure(logical.rhs)?;
+            let lhs = collapse_expr_to_pure(logical.lhs, safety)?;
+            let rhs = collapse_expr_to_pure(logical.rhs, safety)?;
             let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
-            Some(super::super::logical_simplify::simplify_logical_shape(&expr).unwrap_or(expr))
+            Some(
+                super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
+                    .unwrap_or(expr),
+            )
         }
-        HirExpr::Call(call) => Some(HirExpr::Call(Box::new(collapse_call_to_pure(*call)?))),
+        HirExpr::Call(call) => Some(HirExpr::Call(Box::new(collapse_call_to_pure(
+            *call, safety,
+        )?))),
         HirExpr::TableConstructor(table) => {
             let mut fields = Vec::with_capacity(table.fields.len());
             for field in table.fields {
                 match field {
                     HirTableField::Array(expr) => {
-                        fields.push(HirTableField::Array(collapse_expr_to_pure(expr)?));
+                        fields.push(HirTableField::Array(collapse_expr_to_pure(expr, safety)?));
                     }
                     HirTableField::Record(field) => {
                         let key = match field.key {
                             HirTableKey::Name(name) => HirTableKey::Name(name),
                             HirTableKey::Expr(expr) => {
-                                HirTableKey::Expr(collapse_expr_to_pure(expr)?)
+                                HirTableKey::Expr(collapse_expr_to_pure(expr, safety)?)
                             }
                         };
                         fields.push(HirTableField::Record(HirRecordField {
                             key,
-                            value: collapse_expr_to_pure(field.value)?,
+                            value: collapse_expr_to_pure(field.value, safety)?,
                         }));
                     }
                 }
             }
             let trailing_multivalue = match table.trailing_multivalue {
-                Some(tail) => Some(tail.try_map_call(collapse_call_to_pure)?),
+                Some(tail) => Some(tail.try_map_call(|call| collapse_call_to_pure(call, safety))?),
                 None => None,
             };
             Some(HirExpr::TableConstructor(Box::new(HirTableConstructor {
@@ -632,7 +681,7 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
         HirExpr::Closure(closure) => {
             let mut closure = *closure;
             for capture in &mut closure.captures {
-                capture.value = collapse_expr_to_pure(capture.value.clone())?;
+                capture.value = collapse_expr_to_pure(capture.value.clone(), safety)?;
             }
             Some(HirExpr::Closure(Box::new(closure)))
         }
@@ -640,16 +689,16 @@ fn collapse_expr_to_pure(expr: HirExpr) -> Option<HirExpr> {
     }
 }
 
-fn collapse_call_to_pure(call: HirCallExpr) -> Option<HirCallExpr> {
-    let callee = collapse_expr_to_pure(call.callee)?;
+fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<HirCallExpr> {
+    let callee = collapse_expr_to_pure(call.callee, safety)?;
     let fixed = call
         .args
         .fixed
         .into_iter()
-        .map(collapse_expr_to_pure)
+        .map(|expr| collapse_expr_to_pure(expr, safety))
         .collect::<Option<Vec<_>>>()?;
     let tail = match call.args.tail {
-        Some(tail) => Some(tail.try_map_call(collapse_call_to_pure)?),
+        Some(tail) => Some(tail.try_map_call(|call| collapse_call_to_pure(call, safety))?),
         None => None,
     };
     Some(HirCallExpr {
@@ -664,6 +713,7 @@ fn collapse_call_to_pure(call: HirCallExpr) -> Option<HirCallExpr> {
 fn prepare_table_constructor(
     table: HirTableConstructor,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirTableConstructor) {
     let mut shapes = Vec::with_capacity(table.fields.len());
     let mut exprs = Vec::new();
@@ -688,8 +738,8 @@ fn prepare_table_constructor(
         }
     }
 
-    let mut extracted = extract_ordered_exprs(exprs, state, |expr, state| {
-        let (prefix, expr) = prepare_pure_expr(expr, state);
+    let mut extracted = extract_ordered_exprs(exprs, state, safety, |expr, state, safety| {
+        let (prefix, expr) = prepare_pure_expr(expr, state, safety);
         let changed = !prefix.is_empty();
         (prefix, expr, changed)
     });
@@ -699,7 +749,7 @@ fn prepare_table_constructor(
         .map(|tail| {
             let mut prefix = Vec::new();
             let tail = tail.map_call(|call| {
-                let (tail_prefix, call, _) = extract_call_expr(call, state);
+                let (tail_prefix, call, _) = extract_call_expr(call, state, safety);
                 prefix = tail_prefix;
                 call
             });
@@ -755,13 +805,14 @@ enum PreparedTableFieldShape {
 fn prepare_closure(
     mut closure: HirClosureExpr,
     state: &mut EliminationState<'_>,
+    safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirClosureExpr) {
     let mut extracted = OrderedExprExtraction::with_capacity(closure.captures.len());
     for capture in &mut closure.captures {
         let value = mem::replace(&mut capture.value, HirExpr::Nil);
         let by_value = capture.mode == HirCaptureMode::ByValue;
         let (prefix, value) = if by_value {
-            prepare_pure_expr(value, state)
+            prepare_pure_expr(value, state, safety)
         } else {
             debug_assert!(!expr_contains_eliminable_decision(&value));
             (Vec::new(), value)
@@ -776,26 +827,26 @@ fn prepare_closure(
     (extracted.prefix, closure)
 }
 
-pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
+pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety) -> bool {
     let mut changed = match expr {
         HirExpr::TableAccess(access) => {
-            let base_changed = eliminate_condition_expr(&mut access.base);
-            let key_changed = eliminate_condition_expr(&mut access.key);
+            let base_changed = eliminate_condition_expr(&mut access.base, safety);
+            let key_changed = eliminate_condition_expr(&mut access.key, safety);
             base_changed || key_changed
         }
-        HirExpr::Unary(unary) => eliminate_condition_expr(&mut unary.expr),
+        HirExpr::Unary(unary) => eliminate_condition_expr(&mut unary.expr, safety),
         HirExpr::Binary(binary) => {
-            let lhs_changed = eliminate_condition_expr(&mut binary.lhs);
-            let rhs_changed = eliminate_condition_expr(&mut binary.rhs);
+            let lhs_changed = eliminate_condition_expr(&mut binary.lhs, safety);
+            let rhs_changed = eliminate_condition_expr(&mut binary.rhs, safety);
             lhs_changed || rhs_changed
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            let lhs_changed = eliminate_condition_expr(&mut logical.lhs);
-            let rhs_changed = eliminate_condition_expr(&mut logical.rhs);
+            let lhs_changed = eliminate_condition_expr(&mut logical.lhs, safety);
+            let rhs_changed = eliminate_condition_expr(&mut logical.rhs, safety);
             lhs_changed || rhs_changed
         }
         HirExpr::Decision(decision) => {
-            if let Some(replacement) = super::collapse_condition_decision_expr(decision) {
+            if let Some(replacement) = super::collapse_condition_decision_expr(decision, safety) {
                 *expr = replacement;
                 true
             } else {
@@ -803,19 +854,19 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
                 false
             }
         }
-        HirExpr::Call(call) => eliminate_condition_call(call),
+        HirExpr::Call(call) => eliminate_condition_call(call, safety),
         HirExpr::TableConstructor(table) => {
             let mut changed = false;
             for field in &mut table.fields {
                 match field {
                     HirTableField::Array(expr) => {
-                        changed |= eliminate_condition_expr(expr);
+                        changed |= eliminate_condition_expr(expr, safety);
                     }
                     HirTableField::Record(field) => {
                         if let HirTableKey::Expr(expr) = &mut field.key {
-                            changed |= eliminate_condition_expr(expr);
+                            changed |= eliminate_condition_expr(expr, safety);
                         }
-                        changed |= eliminate_condition_expr(&mut field.value);
+                        changed |= eliminate_condition_expr(&mut field.value, safety);
                     }
                 }
             }
@@ -824,14 +875,14 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
                 .as_mut()
                 .and_then(HirPackTail::call_mut)
             {
-                changed |= eliminate_condition_call(call);
+                changed |= eliminate_condition_call(call, safety);
             }
             changed
         }
         HirExpr::Closure(closure) => {
             let mut changed = false;
             for capture in &mut closure.captures {
-                changed |= eliminate_condition_expr(&mut capture.value);
+                changed |= eliminate_condition_expr(&mut capture.value, safety);
             }
             changed
         }
@@ -853,12 +904,16 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
         | HirExpr::Unresolved(_) => false,
     };
 
-    if let Some(replacement) = super::super::logical_simplify::simplify_logical_shape(expr) {
+    if let Some(replacement) =
+        super::super::logical_simplify::simplify_logical_shape_with_safety(expr, safety)
+    {
         *expr = replacement;
         changed = true;
     }
     if let Some(replacement) =
-        super::super::logical_simplify::simplify_condition_truthiness_shape(expr)
+        super::super::logical_simplify::simplify_condition_truthiness_shape_with_safety(
+            expr, safety,
+        )
     {
         *expr = replacement;
         changed = true;
@@ -867,13 +922,13 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
     changed
 }
 
-fn eliminate_condition_call(call: &mut HirCallExpr) -> bool {
-    let mut changed = eliminate_condition_expr(&mut call.callee);
+fn eliminate_condition_call(call: &mut HirCallExpr, safety: HirExprSafety) -> bool {
+    let mut changed = eliminate_condition_expr(&mut call.callee, safety);
     for arg in &mut call.args.fixed {
-        changed |= eliminate_condition_expr(arg);
+        changed |= eliminate_condition_expr(arg, safety);
     }
     if let Some(call) = call.args.tail.as_mut().and_then(HirPackTail::call_mut) {
-        changed |= eliminate_condition_call(call);
+        changed |= eliminate_condition_call(call, safety);
     }
     changed
 }

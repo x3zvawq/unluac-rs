@@ -777,7 +777,12 @@ pub(super) enum InlineSite {
 }
 
 impl InlineSite {
-    pub(super) fn allows(self, replacement: &HirExpr, options: ReadabilityOptions) -> bool {
+    pub(super) fn allows(
+        self,
+        replacement: &HirExpr,
+        options: ReadabilityOptions,
+        safety: HirExprSafety,
+    ) -> bool {
         match self {
             Self::Direct => true,
             Self::CallCallee | Self::FastCallCallee => true,
@@ -801,7 +806,7 @@ impl InlineSite {
                 // 候选拒绝[SemanticBarrier:Lifetime]：`t=x; return mutate() and t` 若延后可变 binding 快照，会读取 mutate 后的新值。
                 // 候选拒绝[PolicyBoundary]：可跳过且 effect-invariant 的 nested 值仍受固定复杂度阈值限制。
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
-                    && is_safe_conditional_nested_inline_expr(replacement)
+                    && is_safe_conditional_nested_inline_expr(replacement, safety)
             }
             Self::AccessBase => {
                 // 候选拒绝[PolicyBoundary]：access base 只展示原子值或命名字段链，并服从用户配置的复杂度上限。
@@ -962,10 +967,10 @@ fn is_atomic_nested_inline_expr(expr: &HirExpr) -> bool {
     )
 }
 
-fn is_safe_conditional_nested_inline_expr(expr: &HirExpr) -> bool {
-    expr_is_discard_safe(expr)
-        && expr_is_effect_invariant_in_single_value_context(expr)
-        && expr_is_repeatable_in_single_value_context(expr)
+fn is_safe_conditional_nested_inline_expr(expr: &HirExpr, safety: HirExprSafety) -> bool {
+    safety.is_discard_safe(expr)
+        && safety.is_effect_invariant_in_single_value_context(expr)
+        && safety.is_repeatable_in_single_value_context(expr)
 }
 
 fn is_small_pure_nested_inline_expr(expr: &HirExpr) -> bool {

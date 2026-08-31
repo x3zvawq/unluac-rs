@@ -4,22 +4,29 @@
 //! 非布尔值的 truthy 结果都保留原形状。Boolean 的 `not` 也只做无事件的字面量归一，
 //! 不改写循环/分支 owner。
 
-use super::super::common::{AstExpr, AstModule, AstUnaryOpKind};
+use super::super::common::{AstExpr, AstModule, AstTargetDialect, AstUnaryOpKind};
 use super::ReadabilityContext;
 use super::expr_analysis::{expr_is_boolean_valued, primitive_literal_comparison_value};
 use super::walk::{self, AstRewritePass};
 
-pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    walk::rewrite_module(module, &mut LiteralFoldPass)
+pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
+    walk::rewrite_module(
+        module,
+        &mut LiteralFoldPass {
+            target: context.target,
+        },
+    )
 }
 
-struct LiteralFoldPass;
+struct LiteralFoldPass {
+    target: AstTargetDialect,
+}
 
 impl AstRewritePass for LiteralFoldPass {
     fn rewrite_expr(&mut self, expr: &mut AstExpr) -> bool {
         let replacement = match expr {
             AstExpr::Binary(binary) => {
-                primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
+                primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs, self.target)
                     .map(AstExpr::Boolean)
             }
             AstExpr::LogicalAnd(logical)
@@ -54,20 +61,26 @@ mod tests {
     use super::*;
     use crate::ast::common::AstUnaryExpr;
 
+    fn pass() -> LiteralFoldPass {
+        LiteralFoldPass {
+            target: AstTargetDialect::new(crate::decompile::DecompileDialect::Auto),
+        }
+    }
+
     #[test]
     fn folds_boolean_not_without_guessing_truthy_values() {
         let mut expr = AstExpr::Unary(Box::new(AstUnaryExpr {
             op: AstUnaryOpKind::Not,
             expr: AstExpr::Boolean(true),
         }));
-        assert!(LiteralFoldPass.rewrite_expr(&mut expr));
+        assert!(pass().rewrite_expr(&mut expr));
         assert_eq!(expr, AstExpr::Boolean(false));
 
         let mut dynamic = AstExpr::Unary(Box::new(AstUnaryExpr {
             op: AstUnaryOpKind::Not,
             expr: AstExpr::Integer(0),
         }));
-        assert!(!LiteralFoldPass.rewrite_expr(&mut dynamic));
+        assert!(!pass().rewrite_expr(&mut dynamic));
         assert!(matches!(dynamic, AstExpr::Unary(_)));
     }
 
@@ -77,7 +90,7 @@ mod tests {
             op: AstUnaryOpKind::Not,
             expr: AstExpr::Boolean(false),
         }));
-        assert!(LiteralFoldPass.rewrite_expr(&mut expr));
+        assert!(pass().rewrite_expr(&mut expr));
         assert_eq!(expr, AstExpr::Boolean(true));
     }
 }

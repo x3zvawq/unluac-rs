@@ -32,6 +32,7 @@ use crate::ast::ReadabilityOptions;
 use crate::debug::DebugFilters;
 use crate::generate::GenerateMode;
 use crate::hir::common::HirModule;
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 use crate::scheduler::{
     InvalidationConvergence, InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop,
@@ -229,6 +230,7 @@ pub(super) fn simplify_hir(
     dump_config: &PassDumpConfig,
 ) -> Result<(), crate::decompile::DecompileError> {
     let mut empty_facts = ProtoPromotionFacts::default();
+    let safety = HirExprSafety::for_dialect(dialect);
 
     let convergence = run_invalidation_loop(
         PASS_DESCRIPTORS,
@@ -252,9 +254,9 @@ pub(super) fn simplify_hir(
                         .get_mut(proto.id.index())
                         .unwrap_or(&mut empty_facts);
                     match index {
-                        0 => decision::simplify_decision_exprs_in_proto(proto),
+                        0 => decision::simplify_decision_exprs_in_proto(proto, safety),
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(
-                            proto, facts,
+                            proto, facts, safety,
                         ),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto, dialect),
                         3 => table_constructors::stabilize_table_constructors_in_proto(
@@ -270,14 +272,18 @@ pub(super) fn simplify_hir(
                             facts,
                             dialect,
                         ),
-                        7 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
-                        8 => branch_control_folding::fold_branch_control_in_proto(proto),
-                        9 => decision::eliminate_remaining_decisions_in_proto(proto),
+                        7 => locals::promote_temps_to_locals_in_proto_with_facts(
+                            proto, facts, safety,
+                        ),
+                        8 => branch_control_folding::fold_branch_control_in_proto(proto, safety),
+                        9 => decision::eliminate_remaining_decisions_in_proto(proto, safety),
                         10 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        11 => {
-                            carried_locals::collapse_carried_local_handoffs_in_proto(proto, facts)
-                        }
-                        12 => dead_temps::remove_dead_temp_materializations_in_proto(proto, facts),
+                        11 => carried_locals::collapse_carried_local_handoffs_in_proto(
+                            proto, facts, safety,
+                        ),
+                        12 => dead_temps::remove_dead_temp_materializations_in_proto(
+                            proto, facts, safety,
+                        ),
                         13 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }

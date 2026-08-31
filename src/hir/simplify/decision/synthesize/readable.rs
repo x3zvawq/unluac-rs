@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::HirExpr;
+use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::{logical_and, logical_or};
 use super::domain::{
@@ -20,15 +21,18 @@ const MAX_NATURALIZE_OR_TERMS: usize = 16;
 const MAX_NATURALIZE_NESTED_CANDIDATES: usize = 128;
 const MAX_NATURALIZE_ROUNDS: usize = 8;
 
-pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
+pub(crate) fn naturalize_pure_logical_expr(
+    expr: &HirExpr,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
     if !matches!(expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
         return None;
     }
-    if !expr_is_synth_safe(expr) {
+    if !expr_is_synth_safe(expr, safety) {
         return None;
     }
 
-    let mut current = normalize_candidate_expr(expr.clone());
+    let mut current = normalize_candidate_expr(expr.clone(), safety);
     let mut refs = BTreeSet::new();
     collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
@@ -61,10 +65,16 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
         let current_cost = super::expr_cost(&current);
         let Some(next) = pure_logical_rewrite_candidates(&current)
             .into_iter()
-            .map(normalize_candidate_expr)
+            .map(|candidate| normalize_candidate_expr(candidate, safety))
             // 候选拒绝[ProofIncomplete]：有限抽象域当前只能筛掉已见反例；错误路径与跨数值表示尚未精确建模，不能据此宣称完整等价证明。
             .filter(|candidate| {
-                validate_pure_expr_equivalence(expr, candidate, &environments, &ref_positions)
+                validate_pure_expr_equivalence(
+                    expr,
+                    candidate,
+                    &environments,
+                    &ref_positions,
+                    safety,
+                )
             })
             // 候选拒绝[PolicyBoundary]：等价但不严格降低可读性成本的形状不提交。
             .filter(|candidate| super::expr_cost(candidate) < current_cost)
