@@ -4,11 +4,12 @@
 //! 真正有闭包依赖的 local function 折叠掉。
 //! 例如：`local f = function() ... end; t.f = f` 会在这里尝试合成 `function t.f() ... end`。
 
-use super::super::binding_flow::{BindingUseIndex, count_binding_uses_in_block_deep};
+use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::name_matches_binding;
+use super::super::expr_analysis::is_context_safe_expr;
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
-    AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalBindingTarget,
+    AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalBindingTarget, AstLValue,
     AstLocalOrigin, AstNamePath, AstNameRef, AstStmt, AstTargetDialect,
 };
 
@@ -26,6 +27,8 @@ pub(super) fn try_lower_forwarded_function_stmt(
     }
     let binding = local_decl.bindings[0].id;
     if local_decl.bindings[0].attr != crate::ast::common::AstLocalAttr::None {
+        // 候选拒绝[SemanticBarrier:Lifetime]：`<close>` owner 不能随转发壳删除；
+        // 候选拒绝[PolicyBoundary]：`<const>` 声明身份继续由声明 owner 保留。
         return None;
     }
     if local_decl.bindings[0].origin != AstLocalOrigin::Recovered {
@@ -39,9 +42,7 @@ pub(super) fn try_lower_forwarded_function_stmt(
     // 递归 local function 这类 case 在 AST 函数体里往往已经只剩 `u0` 之类的 upvalue 引用，
     // 直接扫 body 看不到它对当前 binding 槽位的依赖；所以这里优先使用 AST build
     // 带下来的 capture provenance，确认这个局部槽位是不是闭包初始化的一部分。
-    if function.captured_bindings.contains(&binding)
-        || count_binding_uses_in_block_deep(&function.body, binding) != 0
-    {
+    if function.captured_bindings.contains(&binding) {
         // 候选拒绝[SemanticBarrier:Capture]：递归闭包依赖这个 local 槽；吸收到外部赋值会让自引用解析成别的 binding。
         return None;
     }
@@ -96,6 +97,12 @@ fn inline_function_into_stmt(
             if !name_matches_binding(name, binding) {
                 return None;
             }
+            if !lvalue_prefix_can_move_before_closure(&assign.targets[0]) {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：转发会把 lvalue 的地址求值
+                // 搬到 closure 分配之前；lookup、global 读取或其它运行时事件可观察到
+                // 相反顺序。
+                return None;
+            }
             if let Some((target_name, function)) =
                 function_decl_target_from_lvalue(&assign.targets[0], &function)
             {
@@ -110,5 +117,15 @@ fn inline_function_into_stmt(
             Some(AstStmt::Assign(Box::new(assign)))
         }
         _ => None,
+    }
+}
+
+fn lvalue_prefix_can_move_before_closure(target: &AstLValue) -> bool {
+    match target {
+        AstLValue::Name(_) => true,
+        AstLValue::FieldAccess(access) => is_context_safe_expr(&access.base),
+        AstLValue::IndexAccess(access) => {
+            is_context_safe_expr(&access.base) && is_context_safe_expr(&access.index)
+        }
     }
 }

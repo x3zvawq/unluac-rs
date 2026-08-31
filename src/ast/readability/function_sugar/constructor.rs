@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 
 use super::super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
 use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
+use super::super::expr_analysis::is_eventless_primitive_literal;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName, AstLValue,
@@ -186,10 +187,17 @@ fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> 
     if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
         return None;
     }
-    if local_decl.bindings[0].attr != AstLocalAttr::None {
-        // 候选拒绝[PolicyBoundary]：带声明属性的 alias 仍由声明 owner 管理，不能在
-        // constructor handoff 中改变 `<const>`/`<close>` 的归属与生命周期。
-        return None;
+    match local_decl.bindings[0].attr {
+        AstLocalAttr::None => {}
+        AstLocalAttr::Close => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：删除 `<close>` alias 会同时删除其
+            // 离域 close 动作与资源 owner。
+            return None;
+        }
+        AstLocalAttr::Const => {
+            // 候选拒绝[PolicyBoundary]：`<const>` 的源码声明身份继续由声明 owner 保留。
+            return None;
+        }
     }
     if local_decl.bindings[0].origin != AstLocalOrigin::Recovered {
         // 候选拒绝[PolicyBoundary]：DebugHinted 的源码声明身份保留；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须活到原 block 末。
@@ -389,27 +397,50 @@ fn rewrite_terminal_constructor_call_expr(
         .iter()
         .filter(|arg| arg.pass_to_sink)
         .collect::<Vec<_>>();
-    if !name_matches_binding(name, callee_binding) || call.args.len() != active_args.len() {
-        // 候选拒绝[SemanticBarrier:Identity]：sink 必须调用同一 callee，且逐一承接全部未被嵌套消费的 constructor local。
+    if !name_matches_binding(name, callee_binding) {
+        // 候选拒绝[SemanticBarrier:Identity]：sink 必须调用被删除 alias 所指向的同一 callee。
         return None;
     }
-    for (arg, expected) in call.args.iter().zip(active_args.iter()) {
-        let AstExpr::Var(name) = arg else {
-            // 候选拒绝[SemanticBarrier:EvalOrder]：arg 若不是纯 binding handoff，替换会删除或重排它自身的求值事件。
-            return None;
-        };
-        if !name_matches_binding(name, expected.binding) {
-            // 候选拒绝[SemanticBarrier:EvalOrder]：constructor locals 的实参顺序必须与原 call 一致，否则 initializer/参数求值顺序改变。
+
+    let mut expected_args = active_args.iter().copied().peekable();
+    let mut rewritten_args = Vec::with_capacity(call.args.len());
+    for arg in &call.args {
+        if let Some(expected) = expected_args.peek()
+            && matches!(arg, AstExpr::Var(name) if name_matches_binding(name, expected.binding))
+        {
+            rewritten_args.push(expected.value.clone());
+            expected_args.next();
+            continue;
+        }
+        if !is_eventless_primitive_literal(arg) {
+            // 候选拒绝[ProofIncomplete]：额外实参若含 binding、lookup、调用或分配，
+            // 仍需证明把 constructor initializer 搬到其后不会改变快照与求值顺序。
             return None;
         }
+        // 候选接受[EvalOrderProof]：primitive literal 没有读取、分配或运行时事件，
+        // 保留在原参数位置不会与被搬入的 constructor initializer 交换可观察行为。
+        rewritten_args.push(arg.clone());
+    }
+    if expected_args.next().is_some() {
+        // 候选拒绝[SemanticBarrier:Scope/EvalOrder]：每个 active constructor local 都必须
+        // 按声明顺序由 sink 承接一次，否则删除声明会丢失 handoff 或改变 initializer 顺序。
+        return None;
     }
 
     let mut rewritten = call.as_ref().clone();
     rewritten.callee = callee_expr.clone();
-    rewritten.args = active_args
-        .into_iter()
-        .map(|arg| arg.value.clone())
-        .collect();
+    rewritten.args = rewritten_args;
+    if let Some(last) = rewritten.args.last_mut()
+        && matches!(
+            last,
+            AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
+        )
+    {
+        // 候选接受[ValueArityProof]：constructor local 的 initializer 原本被单目标声明
+        // 截成一个值；移到最终实参位置后必须显式保留该边界，不能恢复 open tail。
+        let value = std::mem::replace(last, AstExpr::Nil);
+        *last = AstExpr::SingleValue(Box::new(value));
+    }
     Some(AstExpr::Call(Box::new(rewritten)))
 }
 

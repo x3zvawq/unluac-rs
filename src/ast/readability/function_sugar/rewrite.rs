@@ -43,7 +43,10 @@ fn rewrite_block(
     }
 
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_deep(&old_stmts);
+    // LocalId/SyntheticLocalId are numbered per function. Current-function counting still
+    // records explicit capture provenance, while descending into child bodies would conflate
+    // unrelated bindings that happen to reuse the same numeric id.
+    let use_index = BindingUseIndex::for_stmts(&old_stmts);
 
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;

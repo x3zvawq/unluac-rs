@@ -92,14 +92,27 @@ pub(super) fn function_decl_target_from_lvalue(
     func: &AstFunctionExpr,
 ) -> Option<(AstFunctionName, AstFunctionExpr)> {
     match target {
-        AstLValue::Name(AstNameRef::Global(global)) => Some((
-            AstFunctionName::Plain(AstNamePath {
-                root: AstNameRef::Global(global.clone()),
-                fields: Vec::new(),
-            }),
-            func.clone(),
-        )),
-        AstLValue::Name(_) => None,
+        AstLValue::Name(
+            name @ (AstNameRef::Param(_)
+            | AstNameRef::Local(_)
+            | AstNameRef::SyntheticLocal(_)
+            | AstNameRef::Upvalue(_)
+            | AstNameRef::Global(_)),
+        ) => {
+            // 候选接受[BindingIdentityProof]：Lua 的 plain `function name()` 正是对当前
+            // 词法 name binding 的函数赋值，不限于 global。
+            Some((
+                AstFunctionName::Plain(AstNamePath {
+                    root: name.clone(),
+                    fields: Vec::new(),
+                }),
+                func.clone(),
+            ))
+        }
+        AstLValue::Name(AstNameRef::Temp(_)) => {
+            // 候选拒绝[LayerBoundary]：Temp 必须先由 materialize owner 建立源码 binding。
+            None
+        }
         AstLValue::FieldAccess(access) => {
             // 候选拒绝[ProofIncomplete]：assignment 与 method 的字节码形状相同，缺少绑定到
             // 该函数定义的语法 provenance；保留显式首参，避免隐式 `self` 改变调用结果。

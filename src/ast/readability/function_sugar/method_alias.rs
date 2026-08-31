@@ -17,7 +17,8 @@ use super::super::expr_analysis::expr_requires_ordered_snapshot;
 use super::super::visit::{self, AstVisitor};
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFunctionName, AstGlobalDecl,
-    AstIf, AstLValue, AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstReturn, AstStmt,
+    AstIf, AstLValue, AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstNameRef, AstReturn,
+    AstStmt,
 };
 
 pub(super) fn try_recover_method_alias_stmt(
@@ -43,11 +44,7 @@ pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
     use_index: &BindingUseIndex,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
-    let Some(sink) = stmts.get(sink_index) else {
-        return false;
-    };
-    if matches!(sink, AstStmt::GenericFor(_)) {
-        // 候选拒绝[LayerBoundary]：generic-for 的单 receiver 例外由 inline-exprs owner 消费，method-alias 不跨该 sink 抢占所有权。
+    if stmts.get(sink_index).is_none() {
         return false;
     }
     let run = &stmts[index..];
@@ -80,8 +77,8 @@ fn try_recover_with_receiver_alias(
     if !name_matches_binding(receiver_name, receiver_binding) {
         return None;
     }
-    if binding_is_written_in_suffix(stmts, stmt_base + 1, receiver_binding)
-        || binding_is_written_in_suffix(stmts, stmt_base + 2, field_binding)
+    if binding_is_written_in_suffix(stmts, 1, receiver_binding)
+        || binding_is_written_in_suffix(stmts, 2, field_binding)
     {
         // 候选拒绝[SemanticBarrier:Scope]：删除 alias declaration 会让后续 direct write 解析到外层 binding，不能只按读取次数判断。
         return None;
@@ -116,7 +113,7 @@ fn try_recover_receiver_alias_direct_method_call(
         return None;
     };
     let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
-    if binding_is_written_in_suffix(stmts, stmt_base + 1, receiver_binding) {
+    if binding_is_written_in_suffix(stmts, 1, receiver_binding) {
         // 候选拒绝[SemanticBarrier:Scope]：删除 receiver local 会把 sink/后缀的 direct write 绑定到外层名称。
         return None;
     }
@@ -185,6 +182,12 @@ struct BindingWriteFinder {
 }
 
 impl AstVisitor for BindingWriteFinder {
+    fn visit_function_expr(&mut self, _function: &crate::ast::common::AstFunctionExpr) -> bool {
+        // LocalId/SyntheticLocalId are function-local. Child bodies can only refer to the
+        // outer binding through capture provenance, not through a same-numbered direct write.
+        false
+    }
+
     fn visit_stmt(&mut self, stmt: &AstStmt) {
         match stmt {
             AstStmt::FunctionDecl(function_decl) => {
@@ -269,23 +272,62 @@ fn recover_direct_method_call_sink(
     receiver_binding: AstBindingRef,
     receiver_expr: &AstExpr,
 ) -> Option<AstStmt> {
-    let AstStmt::CallStmt(call_stmt) = stmt else {
-        return None;
-    };
-    let AstCallKind::Call(call) = &call_stmt.call else {
-        return None;
-    };
-    let AstExpr::MethodCall(method_call) = recover_direct_method_call_with_receiver_alias_expr(
-        &AstExpr::Call(call.clone()),
-        receiver_binding,
-        receiver_expr,
-    )?
-    else {
-        return None;
-    };
-    Some(AstStmt::CallStmt(Box::new(AstCallStmt {
-        call: AstCallKind::MethodCall(method_call),
-    })))
+    match stmt {
+        AstStmt::CallStmt(call_stmt) => {
+            let AstCallKind::Call(call) = &call_stmt.call else {
+                return None;
+            };
+            let AstExpr::MethodCall(method_call) =
+                recover_direct_method_call_with_receiver_alias_expr(
+                    &AstExpr::Call(call.clone()),
+                    receiver_binding,
+                    receiver_expr,
+                )?
+            else {
+                return None;
+            };
+            Some(AstStmt::CallStmt(Box::new(AstCallStmt {
+                call: AstCallKind::MethodCall(method_call),
+            })))
+        }
+        AstStmt::GenericFor(generic_for) => {
+            let AstExpr::Var(source) = receiver_expr else {
+                return None;
+            };
+            match source {
+                AstNameRef::Global(_) => {
+                    // 候选拒绝[ProofIncomplete]：最小证明只接管已有词法 binding 快照；
+                    // global 读取尚未纳入该 GenericFor 所有权规则。
+                    return None;
+                }
+                AstNameRef::Temp(_) => {
+                    // 候选拒绝[LayerBoundary]：Temp 必须先由 materialize owner 建立源码 binding。
+                    return None;
+                }
+                _ => {}
+            }
+            let [AstExpr::Call(call)] = generic_for.iterator.as_slice() else {
+                // 候选拒绝[ProofIncomplete]：多 iterator 的前缀顺序与 value-pack 边界
+                // 尚未纳入该原子规则；这里只收回唯一且末尾的 open call。
+                return None;
+            };
+            let AstExpr::MethodCall(method_call) =
+                recover_direct_method_call_with_receiver_alias_expr(
+                    &AstExpr::Call(call.clone()),
+                    receiver_binding,
+                    receiver_expr,
+                )?
+            else {
+                return None;
+            };
+            let mut rewritten = (**generic_for).clone();
+            rewritten.iterator[0] = AstExpr::MethodCall(method_call);
+            // 候选接受[EvalOrderProof/ValueArityProof]：唯一 iterator 是 header 的首个
+            // 事件，Call→MethodCall 仍保留末尾 open pack，且 receiver 只求值一次。
+            Some(AstStmt::GenericFor(Box::new(rewritten)))
+        }
+        _ => None,
+    }
 }
 
 fn recover_method_call_expr(
@@ -605,9 +647,7 @@ fn rewrite_single_expr_sink_stmt(
             Some(AstStmt::GlobalDecl(Box::new(rewritten)))
         }
         AstStmt::Assign(assign) => {
-            let [value] = assign.values.as_slice() else {
-                return None;
-            };
+            let value = assign.values.first()?;
             if assign
                 .targets
                 .iter()
@@ -618,14 +658,16 @@ fn rewrite_single_expr_sink_stmt(
             }
             let mut rewritten = (**assign).clone();
             rewritten.values[0] = rewrite_expr(value)?;
+            // 候选接受[EvalOrderProof/ValueArityProof]：纯 Name targets 没有地址求值，
+            // 首 RHS 前无运行时前缀；存在后续 RHS 时该位置前后都截成单值。
             Some(AstStmt::Assign(Box::new(rewritten)))
         }
         AstStmt::Return(ret) => {
-            let [value] = ret.values.as_slice() else {
-                return None;
-            };
+            let value = ret.values.first()?;
             let mut rewritten: AstReturn = (**ret).clone();
             rewritten.values[0] = rewrite_expr(value)?;
+            // 候选接受[EvalOrderProof/ValueArityProof]：首项前没有求值前缀；存在后续
+            // return value 时该位置前后都截成单值，作为唯一项时则都保留 open tail。
             Some(AstStmt::Return(Box::new(rewritten)))
         }
         AstStmt::If(if_stmt) => Some(AstStmt::If(Box::new(AstIf {
@@ -633,13 +675,31 @@ fn rewrite_single_expr_sink_stmt(
             then_block: if_stmt.then_block.clone(),
             else_block: if_stmt.else_block.clone(),
         }))),
-        AstStmt::CallStmt(_) => {
-            // 候选拒绝[LayerBoundary]：通用表达式 sink 不改写调用语句；精确的 direct/field-alias 调用由上层 owner 的专用 fallback 处理。
-            None
+        AstStmt::CallStmt(call_stmt) => {
+            let call_expr = match &call_stmt.call {
+                AstCallKind::Call(call) => AstExpr::Call(call.clone()),
+                AstCallKind::MethodCall(call) => AstExpr::MethodCall(call.clone()),
+            };
+            let rewritten_call = match rewrite_expr(&call_expr)? {
+                AstExpr::Call(call) => AstCallKind::Call(call),
+                AstExpr::MethodCall(call) => AstCallKind::MethodCall(call),
+                _ => return None,
+            };
+            // 候选接受[EvalOrderProof]：CallStmt 只提供表达式容器；callee、先行实参、
+            // method lookup 与短路边界仍全部由 ordered walker 逐项验证。
+            Some(AstStmt::CallStmt(Box::new(AstCallStmt {
+                call: rewritten_call,
+            })))
+        }
+        AstStmt::NumericFor(numeric_for) => {
+            let mut rewritten = (**numeric_for).clone();
+            rewritten.start = rewrite_expr(&numeric_for.start)?;
+            // 候选接受[EvalOrderProof/ValueArityProof]：start 是 NumericFor header 的
+            // 首个且只执行一次的事件；该标量位置的调用宽度前后均为一个值。
+            Some(AstStmt::NumericFor(Box::new(rewritten)))
         }
         AstStmt::While(_)
         | AstStmt::Repeat(_)
-        | AstStmt::NumericFor(_)
         | AstStmt::GenericFor(_)
         | AstStmt::DoBlock(_)
         | AstStmt::FunctionDecl(_)

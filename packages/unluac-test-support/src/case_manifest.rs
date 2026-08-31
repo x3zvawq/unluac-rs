@@ -92,6 +92,14 @@ mod regressions_397;
 mod regressions_398;
 mod regressions_399;
 mod regressions_400;
+mod regressions_401;
+mod regressions_402;
+mod regressions_403;
+mod regressions_404;
+mod regressions_405;
+mod regressions_406;
+mod regressions_407;
+mod regressions_408;
 mod unit_cases;
 
 use regressions_001_100::REGRESSION_CASES_001_100;
@@ -178,6 +186,14 @@ use regressions_397::REGRESSION_CASES_397;
 use regressions_398::REGRESSION_CASES_398;
 use regressions_399::REGRESSION_CASES_399;
 use regressions_400::REGRESSION_CASES_400;
+use regressions_401::REGRESSION_CASES_401;
+use regressions_402::REGRESSION_CASES_402;
+use regressions_403::REGRESSION_CASES_403;
+use regressions_404::REGRESSION_CASES_404;
+use regressions_405::REGRESSION_CASES_405;
+use regressions_406::REGRESSION_CASES_406;
+use regressions_407::REGRESSION_CASES_407;
+use regressions_408::REGRESSION_CASES_408;
 use unit_cases::UNIT_CASES;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Display, IntoStaticStr)]
@@ -566,6 +582,14 @@ pub(crate) fn regression_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
         REGRESSION_CASES_398,
         REGRESSION_CASES_399,
         REGRESSION_CASES_400,
+        REGRESSION_CASES_401,
+        REGRESSION_CASES_402,
+        REGRESSION_CASES_403,
+        REGRESSION_CASES_404,
+        REGRESSION_CASES_405,
+        REGRESSION_CASES_406,
+        REGRESSION_CASES_407,
+        REGRESSION_CASES_408,
     ]
     .into_iter()
     .flat_map(manifest_entries)

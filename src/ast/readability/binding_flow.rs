@@ -18,10 +18,10 @@ mod refs;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFunctionExpr, AstLValue,
-    AstMethodCallExpr, AstNameRef, AstStmt, AstTableField, AstTableKey,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstNameRef, AstStmt,
+    AstTableField, AstTableKey,
 };
-use super::binding_ref::{binding_from_name_ref, name_matches_binding};
+use super::binding_ref::binding_from_name_ref;
 
 pub(super) use refs::{
     BindingRefSet, block_references_binding_set, expr_references_any_binding,
@@ -59,12 +59,6 @@ pub(super) fn mutable_snapshot_names_in_block(block: &AstBlock) -> MutableSnapsh
     collector.0
 }
 
-#[derive(Clone, Copy)]
-enum BindingUseScope {
-    CurrentFunctionOnly,
-    IncludingNestedFunctions,
-}
-
 #[derive(Debug, Default, Clone)]
 pub(super) struct BindingUseIndex {
     stmt_len: usize,
@@ -80,24 +74,12 @@ struct BindingUseSuffixCounts {
 
 impl BindingUseIndex {
     pub(super) fn for_stmts(stmts: &[AstStmt]) -> Self {
-        Self::for_stmts_with_scope(stmts, None, BindingUseScope::CurrentFunctionOnly)
+        Self::for_stmts_with_trailing_expr(stmts, None)
     }
 
     pub(super) fn for_stmts_with_trailing_expr(
         stmts: &[AstStmt],
         trailing_expr: Option<&AstExpr>,
-    ) -> Self {
-        Self::for_stmts_with_scope(stmts, trailing_expr, BindingUseScope::CurrentFunctionOnly)
-    }
-
-    pub(super) fn for_stmts_deep(stmts: &[AstStmt]) -> Self {
-        Self::for_stmts_with_scope(stmts, None, BindingUseScope::IncludingNestedFunctions)
-    }
-
-    fn for_stmts_with_scope(
-        stmts: &[AstStmt],
-        trailing_expr: Option<&AstExpr>,
-        scope: BindingUseScope,
     ) -> Self {
         let stmt_len = stmts.len() + usize::from(trailing_expr.is_some());
         let mut stmt_counts = Vec::with_capacity(stmt_len);
@@ -105,7 +87,7 @@ impl BindingUseIndex {
 
         for (stmt_index, stmt) in stmts.iter().enumerate() {
             let mut counts = BTreeMap::new();
-            collect_binding_uses_in_stmt_with_scope(stmt, scope, &mut counts);
+            collect_binding_uses_in_stmt(stmt, &mut counts);
             for (&binding, &count) in &counts {
                 occurrences
                     .entry(binding)
@@ -118,7 +100,7 @@ impl BindingUseIndex {
         if let Some(expr) = trailing_expr {
             let stmt_index = stmts.len();
             let mut counts = BTreeMap::new();
-            collect_binding_uses_in_expr_with_scope(expr, scope, &mut counts);
+            collect_binding_uses_in_expr(expr, &mut counts);
             for (&binding, &count) in &counts {
                 occurrences
                     .entry(binding)
@@ -219,14 +201,6 @@ impl BindingUseIndex {
     }
 }
 
-pub(super) fn count_binding_uses_in_block_deep(block: &AstBlock, binding: AstBindingRef) -> usize {
-    count_binding_uses_in_block_with_scope(
-        block,
-        binding,
-        BindingUseScope::IncludingNestedFunctions,
-    )
-}
-
 pub(super) fn binding_mentions_in_stmt(stmt: &AstStmt) -> BTreeSet<AstBindingRef> {
     let mut mentions = BTreeSet::new();
     collect_binding_mentions_in_stmt(stmt, &mut mentions);
@@ -245,200 +219,73 @@ pub(super) fn binding_mentions_in_expr(expr: &AstExpr) -> BTreeSet<AstBindingRef
     mentions
 }
 
-fn count_binding_uses_in_stmts_with_scope(
-    stmts: &[AstStmt],
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| count_binding_uses_in_stmt_with_scope(stmt, binding, scope))
-        .sum()
-}
-
-fn count_binding_uses_in_block_with_scope(
-    block: &AstBlock,
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    count_binding_uses_in_stmts_with_scope(&block.stmts, binding, scope)
-}
-
-fn count_binding_uses_in_stmt_with_scope(
-    stmt: &AstStmt,
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr_with_scope(value, binding, scope))
-            .sum(),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr_with_scope(value, binding, scope))
-            .sum(),
-        AstStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .map(|target| count_binding_uses_in_lvalue_with_scope(target, binding, scope))
-                .sum::<usize>()
-                + assign
-                    .values
-                    .iter()
-                    .map(|value| count_binding_uses_in_expr_with_scope(value, binding, scope))
-                    .sum::<usize>()
-        }
-        AstStmt::CallStmt(call_stmt) => {
-            count_binding_uses_in_call_with_scope(&call_stmt.call, binding, scope)
-        }
-        AstStmt::Return(ret) => ret
-            .values
-            .iter()
-            .map(|value| count_binding_uses_in_expr_with_scope(value, binding, scope))
-            .sum(),
-        AstStmt::If(if_stmt) => {
-            count_binding_uses_in_expr_with_scope(&if_stmt.cond, binding, scope)
-                + count_binding_uses_in_block_with_scope(&if_stmt.then_block, binding, scope)
-                + if_stmt
-                    .else_block
-                    .as_ref()
-                    .map(|else_block| {
-                        count_binding_uses_in_block_with_scope(else_block, binding, scope)
-                    })
-                    .unwrap_or(0)
-        }
-        AstStmt::While(while_stmt) => {
-            count_binding_uses_in_expr_with_scope(&while_stmt.cond, binding, scope)
-                + count_binding_uses_in_block_with_scope(&while_stmt.body, binding, scope)
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            count_binding_uses_in_block_with_scope(&repeat_stmt.body, binding, scope)
-                + count_binding_uses_in_expr_with_scope(&repeat_stmt.cond, binding, scope)
-        }
-        AstStmt::NumericFor(numeric_for) => {
-            count_binding_uses_in_expr_with_scope(&numeric_for.start, binding, scope)
-                + count_binding_uses_in_expr_with_scope(&numeric_for.limit, binding, scope)
-                + count_binding_uses_in_expr_with_scope(&numeric_for.step, binding, scope)
-                + count_binding_uses_in_block_with_scope(&numeric_for.body, binding, scope)
-        }
-        AstStmt::GenericFor(generic_for) => {
-            generic_for
-                .iterator
-                .iter()
-                .map(|expr| count_binding_uses_in_expr_with_scope(expr, binding, scope))
-                .sum::<usize>()
-                + count_binding_uses_in_block_with_scope(&generic_for.body, binding, scope)
-        }
-        AstStmt::DoBlock(block) => count_binding_uses_in_block_with_scope(block, binding, scope),
-        AstStmt::FunctionDecl(function_decl) => {
-            count_function_capture_use(&function_decl.func, binding)
-                + if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                    count_binding_uses_in_block_with_scope(&function_decl.func.body, binding, scope)
-                } else {
-                    0
-                }
-        }
-        AstStmt::LocalFunctionDecl(function_decl) => {
-            count_function_capture_use(&function_decl.func, binding)
-                + if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                    count_binding_uses_in_block_with_scope(&function_decl.func.body, binding, scope)
-                } else {
-                    0
-                }
-        }
-        AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => 0,
-    }
-}
-
-fn collect_binding_uses_in_block_with_scope(
-    block: &AstBlock,
-    scope: BindingUseScope,
-    counts: &mut BTreeMap<AstBindingRef, usize>,
-) {
+fn collect_binding_uses_in_block(block: &AstBlock, counts: &mut BTreeMap<AstBindingRef, usize>) {
     for stmt in &block.stmts {
-        collect_binding_uses_in_stmt_with_scope(stmt, scope, counts);
+        collect_binding_uses_in_stmt(stmt, counts);
     }
 }
 
-fn collect_binding_uses_in_stmt_with_scope(
-    stmt: &AstStmt,
-    scope: BindingUseScope,
-    counts: &mut BTreeMap<AstBindingRef, usize>,
-) {
+fn collect_binding_uses_in_stmt(stmt: &AstStmt, counts: &mut BTreeMap<AstBindingRef, usize>) {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             for value in &local_decl.values {
-                collect_binding_uses_in_expr_with_scope(value, scope, counts);
+                collect_binding_uses_in_expr(value, counts);
             }
         }
         AstStmt::GlobalDecl(global_decl) => {
             for value in &global_decl.values {
-                collect_binding_uses_in_expr_with_scope(value, scope, counts);
+                collect_binding_uses_in_expr(value, counts);
             }
         }
         AstStmt::Assign(assign) => {
             for target in &assign.targets {
-                collect_binding_uses_in_lvalue_with_scope(target, scope, counts);
+                collect_binding_uses_in_lvalue(target, counts);
             }
             for value in &assign.values {
-                collect_binding_uses_in_expr_with_scope(value, scope, counts);
+                collect_binding_uses_in_expr(value, counts);
             }
         }
         AstStmt::CallStmt(call_stmt) => {
-            collect_binding_uses_in_call_with_scope(&call_stmt.call, scope, counts);
+            collect_binding_uses_in_call(&call_stmt.call, counts);
         }
         AstStmt::Return(ret) => {
             for value in &ret.values {
-                collect_binding_uses_in_expr_with_scope(value, scope, counts);
+                collect_binding_uses_in_expr(value, counts);
             }
         }
         AstStmt::If(if_stmt) => {
-            collect_binding_uses_in_expr_with_scope(&if_stmt.cond, scope, counts);
-            collect_binding_uses_in_block_with_scope(&if_stmt.then_block, scope, counts);
+            collect_binding_uses_in_expr(&if_stmt.cond, counts);
+            collect_binding_uses_in_block(&if_stmt.then_block, counts);
             if let Some(else_block) = &if_stmt.else_block {
-                collect_binding_uses_in_block_with_scope(else_block, scope, counts);
+                collect_binding_uses_in_block(else_block, counts);
             }
         }
         AstStmt::While(while_stmt) => {
-            collect_binding_uses_in_expr_with_scope(&while_stmt.cond, scope, counts);
-            collect_binding_uses_in_block_with_scope(&while_stmt.body, scope, counts);
+            collect_binding_uses_in_expr(&while_stmt.cond, counts);
+            collect_binding_uses_in_block(&while_stmt.body, counts);
         }
         AstStmt::Repeat(repeat_stmt) => {
-            collect_binding_uses_in_block_with_scope(&repeat_stmt.body, scope, counts);
-            collect_binding_uses_in_expr_with_scope(&repeat_stmt.cond, scope, counts);
+            collect_binding_uses_in_block(&repeat_stmt.body, counts);
+            collect_binding_uses_in_expr(&repeat_stmt.cond, counts);
         }
         AstStmt::NumericFor(numeric_for) => {
-            collect_binding_uses_in_expr_with_scope(&numeric_for.start, scope, counts);
-            collect_binding_uses_in_expr_with_scope(&numeric_for.limit, scope, counts);
-            collect_binding_uses_in_expr_with_scope(&numeric_for.step, scope, counts);
-            collect_binding_uses_in_block_with_scope(&numeric_for.body, scope, counts);
+            collect_binding_uses_in_expr(&numeric_for.start, counts);
+            collect_binding_uses_in_expr(&numeric_for.limit, counts);
+            collect_binding_uses_in_expr(&numeric_for.step, counts);
+            collect_binding_uses_in_block(&numeric_for.body, counts);
         }
         AstStmt::GenericFor(generic_for) => {
             for expr in &generic_for.iterator {
-                collect_binding_uses_in_expr_with_scope(expr, scope, counts);
+                collect_binding_uses_in_expr(expr, counts);
             }
-            collect_binding_uses_in_block_with_scope(&generic_for.body, scope, counts);
+            collect_binding_uses_in_block(&generic_for.body, counts);
         }
-        AstStmt::DoBlock(block) => collect_binding_uses_in_block_with_scope(block, scope, counts),
+        AstStmt::DoBlock(block) => collect_binding_uses_in_block(block, counts),
         AstStmt::FunctionDecl(function_decl) => {
             collect_function_capture_uses(&function_decl.func, counts);
-            if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                collect_binding_uses_in_block_with_scope(&function_decl.func.body, scope, counts);
-            }
         }
         AstStmt::LocalFunctionDecl(function_decl) => {
             collect_function_capture_uses(&function_decl.func, counts);
-            if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                collect_binding_uses_in_block_with_scope(&function_decl.func.body, scope, counts);
-            }
         }
         AstStmt::Break
         | AstStmt::Continue
@@ -638,174 +485,37 @@ fn collect_function_name_mentions(
     }
 }
 
-fn count_binding_uses_in_call_with_scope(
-    call: &AstCallKind,
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    match call {
-        AstCallKind::Call(call) => count_call_expr_uses_with_scope(call, binding, scope),
-        AstCallKind::MethodCall(call) => {
-            count_method_call_expr_uses_with_scope(call, binding, scope)
-        }
-    }
-}
-
-fn count_call_expr_uses_with_scope(
-    call: &AstCallExpr,
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    count_binding_uses_in_expr_with_scope(&call.callee, binding, scope)
-        + count_expr_list_uses_with_scope(&call.args, binding, scope)
-}
-
-fn count_method_call_expr_uses_with_scope(
-    call: &AstMethodCallExpr,
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    count_binding_uses_in_expr_with_scope(&call.receiver, binding, scope)
-        + count_expr_list_uses_with_scope(&call.args, binding, scope)
-}
-
-fn count_expr_list_uses_with_scope(
-    exprs: &[AstExpr],
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    exprs
-        .iter()
-        .map(|expr| count_binding_uses_in_expr_with_scope(expr, binding, scope))
-        .sum()
-}
-
-fn collect_binding_uses_in_call_with_scope(
-    call: &AstCallKind,
-    scope: BindingUseScope,
-    counts: &mut BTreeMap<AstBindingRef, usize>,
-) {
+fn collect_binding_uses_in_call(call: &AstCallKind, counts: &mut BTreeMap<AstBindingRef, usize>) {
     match call {
         AstCallKind::Call(call) => {
-            collect_binding_uses_in_expr_with_scope(&call.callee, scope, counts);
+            collect_binding_uses_in_expr(&call.callee, counts);
             for arg in &call.args {
-                collect_binding_uses_in_expr_with_scope(arg, scope, counts);
+                collect_binding_uses_in_expr(arg, counts);
             }
         }
         AstCallKind::MethodCall(call) => {
-            collect_binding_uses_in_expr_with_scope(&call.receiver, scope, counts);
+            collect_binding_uses_in_expr(&call.receiver, counts);
             for arg in &call.args {
-                collect_binding_uses_in_expr_with_scope(arg, scope, counts);
+                collect_binding_uses_in_expr(arg, counts);
             }
         }
     }
 }
 
-fn count_binding_uses_in_lvalue_with_scope(
-    target: &AstLValue,
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    match target {
-        AstLValue::Name(_) => 0,
-        AstLValue::FieldAccess(access) => {
-            count_binding_uses_in_expr_with_scope(&access.base, binding, scope)
-        }
-        AstLValue::IndexAccess(access) => {
-            count_binding_uses_in_expr_with_scope(&access.base, binding, scope)
-                + count_binding_uses_in_expr_with_scope(&access.index, binding, scope)
-        }
-    }
-}
-
-fn collect_binding_uses_in_lvalue_with_scope(
-    target: &AstLValue,
-    scope: BindingUseScope,
-    counts: &mut BTreeMap<AstBindingRef, usize>,
-) {
+fn collect_binding_uses_in_lvalue(target: &AstLValue, counts: &mut BTreeMap<AstBindingRef, usize>) {
     match target {
         AstLValue::Name(_) => {}
         AstLValue::FieldAccess(access) => {
-            collect_binding_uses_in_expr_with_scope(&access.base, scope, counts);
+            collect_binding_uses_in_expr(&access.base, counts);
         }
         AstLValue::IndexAccess(access) => {
-            collect_binding_uses_in_expr_with_scope(&access.base, scope, counts);
-            collect_binding_uses_in_expr_with_scope(&access.index, scope, counts);
+            collect_binding_uses_in_expr(&access.base, counts);
+            collect_binding_uses_in_expr(&access.index, counts);
         }
     }
 }
 
-fn count_binding_uses_in_expr_with_scope(
-    expr: &AstExpr,
-    binding: AstBindingRef,
-    scope: BindingUseScope,
-) -> usize {
-    match expr {
-        AstExpr::Var(name) if name_matches_binding(name, binding) => 1,
-        AstExpr::FieldAccess(access) => {
-            count_binding_uses_in_expr_with_scope(&access.base, binding, scope)
-        }
-        AstExpr::IndexAccess(access) => {
-            count_binding_uses_in_expr_with_scope(&access.base, binding, scope)
-                + count_binding_uses_in_expr_with_scope(&access.index, binding, scope)
-        }
-        AstExpr::Unary(unary) => count_binding_uses_in_expr_with_scope(&unary.expr, binding, scope),
-        AstExpr::Binary(binary) => {
-            count_binding_uses_in_expr_with_scope(&binary.lhs, binding, scope)
-                + count_binding_uses_in_expr_with_scope(&binary.rhs, binding, scope)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            count_binding_uses_in_expr_with_scope(&logical.lhs, binding, scope)
-                + count_binding_uses_in_expr_with_scope(&logical.rhs, binding, scope)
-        }
-        AstExpr::Call(call) => count_call_expr_uses_with_scope(call, binding, scope),
-        AstExpr::MethodCall(call) => count_method_call_expr_uses_with_scope(call, binding, scope),
-        AstExpr::SingleValue(expr) => count_binding_uses_in_expr_with_scope(expr, binding, scope),
-        AstExpr::TableConstructor(table) => table
-            .fields
-            .iter()
-            .map(|field| match field {
-                AstTableField::Array(value) => {
-                    count_binding_uses_in_expr_with_scope(value, binding, scope)
-                }
-                AstTableField::Record(record) => {
-                    let key_count = if let AstTableKey::Expr(key) = &record.key {
-                        count_binding_uses_in_expr_with_scope(key, binding, scope)
-                    } else {
-                        0
-                    };
-                    key_count + count_binding_uses_in_expr_with_scope(&record.value, binding, scope)
-                }
-            })
-            .sum(),
-        AstExpr::FunctionExpr(function) => {
-            count_function_capture_use(function, binding)
-                + if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                    count_binding_uses_in_block_with_scope(&function.body, binding, scope)
-                } else {
-                    0
-                }
-        }
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => 0,
-    }
-}
-
-fn collect_binding_uses_in_expr_with_scope(
-    expr: &AstExpr,
-    scope: BindingUseScope,
-    counts: &mut BTreeMap<AstBindingRef, usize>,
-) {
+fn collect_binding_uses_in_expr(expr: &AstExpr, counts: &mut BTreeMap<AstBindingRef, usize>) {
     match expr {
         AstExpr::Var(name) => {
             if let Some(binding) = binding_from_name_ref(name) {
@@ -813,58 +523,55 @@ fn collect_binding_uses_in_expr_with_scope(
             }
         }
         AstExpr::FieldAccess(access) => {
-            collect_binding_uses_in_expr_with_scope(&access.base, scope, counts);
+            collect_binding_uses_in_expr(&access.base, counts);
         }
         AstExpr::IndexAccess(access) => {
-            collect_binding_uses_in_expr_with_scope(&access.base, scope, counts);
-            collect_binding_uses_in_expr_with_scope(&access.index, scope, counts);
+            collect_binding_uses_in_expr(&access.base, counts);
+            collect_binding_uses_in_expr(&access.index, counts);
         }
         AstExpr::Unary(unary) => {
-            collect_binding_uses_in_expr_with_scope(&unary.expr, scope, counts);
+            collect_binding_uses_in_expr(&unary.expr, counts);
         }
         AstExpr::Binary(binary) => {
-            collect_binding_uses_in_expr_with_scope(&binary.lhs, scope, counts);
-            collect_binding_uses_in_expr_with_scope(&binary.rhs, scope, counts);
+            collect_binding_uses_in_expr(&binary.lhs, counts);
+            collect_binding_uses_in_expr(&binary.rhs, counts);
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            collect_binding_uses_in_expr_with_scope(&logical.lhs, scope, counts);
-            collect_binding_uses_in_expr_with_scope(&logical.rhs, scope, counts);
+            collect_binding_uses_in_expr(&logical.lhs, counts);
+            collect_binding_uses_in_expr(&logical.rhs, counts);
         }
         AstExpr::Call(call) => {
-            collect_binding_uses_in_expr_with_scope(&call.callee, scope, counts);
+            collect_binding_uses_in_expr(&call.callee, counts);
             for arg in &call.args {
-                collect_binding_uses_in_expr_with_scope(arg, scope, counts);
+                collect_binding_uses_in_expr(arg, counts);
             }
         }
         AstExpr::MethodCall(call) => {
-            collect_binding_uses_in_expr_with_scope(&call.receiver, scope, counts);
+            collect_binding_uses_in_expr(&call.receiver, counts);
             for arg in &call.args {
-                collect_binding_uses_in_expr_with_scope(arg, scope, counts);
+                collect_binding_uses_in_expr(arg, counts);
             }
         }
         AstExpr::SingleValue(expr) => {
-            collect_binding_uses_in_expr_with_scope(expr, scope, counts);
+            collect_binding_uses_in_expr(expr, counts);
         }
         AstExpr::TableConstructor(table) => {
             for field in &table.fields {
                 match field {
                     AstTableField::Array(value) => {
-                        collect_binding_uses_in_expr_with_scope(value, scope, counts);
+                        collect_binding_uses_in_expr(value, counts);
                     }
                     AstTableField::Record(record) => {
                         if let AstTableKey::Expr(key) = &record.key {
-                            collect_binding_uses_in_expr_with_scope(key, scope, counts);
+                            collect_binding_uses_in_expr(key, counts);
                         }
-                        collect_binding_uses_in_expr_with_scope(&record.value, scope, counts);
+                        collect_binding_uses_in_expr(&record.value, counts);
                     }
                 }
             }
         }
         AstExpr::FunctionExpr(function) => {
             collect_function_capture_uses(function, counts);
-            if matches!(scope, BindingUseScope::IncludingNestedFunctions) {
-                collect_binding_uses_in_block_with_scope(&function.body, scope, counts);
-            }
         }
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -878,13 +585,6 @@ fn collect_binding_uses_in_expr_with_scope(
         | AstExpr::VarArg
         | AstExpr::Error(_) => {}
     }
-}
-
-fn count_function_capture_use(
-    function: &super::super::common::AstFunctionExpr,
-    binding: AstBindingRef,
-) -> usize {
-    usize::from(function.captured_bindings.contains(&binding))
 }
 
 fn collect_function_capture_uses(
