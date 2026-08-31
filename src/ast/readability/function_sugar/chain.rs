@@ -2,13 +2,14 @@
 //!
 //! 它依赖 binding-flow 已统计好的使用次数，只处理纯机械 alias 链，不会越权推断新的
 //! 函数 sugar。
-//! 例如：`local f = obj.m; f(obj, 1)` 会在这里尝试折回 `obj:m(1)`。
+//! 例如：`local x = obj:first(); x:finish()` 会在这里尝试折回
+//! `obj:first():finish()`。
+//! 无用声明由前置 cleanup/fixed-point 删除；这里不跨越其它语句寻找链段。
 
 use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::name_matches_binding;
-use super::super::expr_analysis::is_discard_safe_expr;
 use crate::ast::common::{
-    AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalOrigin, AstStmt,
+    AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstStmt,
 };
 
 pub(super) fn try_chain_local_method_call_stmt(
@@ -16,104 +17,84 @@ pub(super) fn try_chain_local_method_call_stmt(
     use_index: &BindingUseIndex,
     stmt_base: usize,
 ) -> Option<(AstStmt, usize)> {
-    let [first, second, third, ..] = stmts else {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
-    };
-
-    let AstStmt::LocalDecl(dead_alias) = first else {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
-    };
-    if dead_alias.bindings.len() != 1
-        || dead_alias.values.len() != 1
-        || dead_alias.bindings[0].attr != AstLocalAttr::None
-        || dead_alias.bindings[0].origin != AstLocalOrigin::Recovered
-    {
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
-    }
-    if use_index.count_uses_in_suffix(stmt_base + 1, dead_alias.bindings[0].id) != 0 {
-        // 候选拒绝[SemanticBarrier:Scope]：所谓 dead alias 仍有后续引用，删除会留下未绑定 use。
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
-    }
-    if !is_discard_safe_expr(&dead_alias.values[0]) {
-        // 候选拒绝[SemanticBarrier:EvalCount]：`local dead=f()` 即使结果未用也必须执行调用；只有无事件表达式可删除。
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
-    }
-    let chained_binding = single_method_call_local_binding(second)?;
-    if use_index.count_uses_in_suffix(stmt_base + 3, chained_binding) != 0 {
-        // 候选拒绝[SemanticBarrier:Lifetime]：链中间值在第二次调用后仍被读取，压入 receiver 会删除该共享 local。
-        return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
-    }
-
-    let chained = chain_local_method_call_stmt(second, third, use_index, stmt_base + 2)?;
-    Some((chained, 3))
-}
-
-fn try_chain_local_method_call_stmt_without_dead_alias(
-    stmts: &[AstStmt],
-    use_index: &BindingUseIndex,
-    stmt_base: usize,
-) -> Option<(AstStmt, usize)> {
     let [first, second, ..] = stmts else {
+        // 候选忽略[NotApplicable]：method chain 至少需要结果声明和紧邻的后续调用两句。
         return None;
     };
-    let chained_binding = single_method_call_local_binding(first)?;
+    let (chained_binding, first_call) = single_method_call_local(first)?;
     if use_index.count_uses_in_suffix(stmt_base + 2, chained_binding) != 0 {
         // 候选拒绝[SemanticBarrier:Lifetime]：`local x=a:b(); x:c(); use(x)` 不能压成链后删除仍存活的 `x`。
         return None;
     }
     Some((
-        chain_local_method_call_stmt(first, second, use_index, stmt_base + 1)?,
+        chain_local_method_call_stmt(
+            first_call,
+            chained_binding,
+            second,
+            use_index,
+            stmt_base + 1,
+        )?,
         2,
     ))
 }
 
-fn single_method_call_local_binding(stmt: &AstStmt) -> Option<AstBindingRef> {
+fn single_method_call_local(stmt: &AstStmt) -> Option<(AstBindingRef, &AstMethodCallExpr)> {
     let AstStmt::LocalDecl(local_decl) = stmt else {
+        // 候选忽略[NotApplicable]：首句不是 local call-result 声明。
         return None;
     };
-    if local_decl.bindings.len() != 1
-        || local_decl.values.len() != 1
-        || local_decl.bindings[0].attr != AstLocalAttr::None
-        || local_decl.bindings[0].origin != AstLocalOrigin::Recovered
-    {
+    let ([binding], [AstExpr::MethodCall(call)]) =
+        (local_decl.bindings.as_slice(), local_decl.values.as_slice())
+    else {
+        // 候选忽略[NotApplicable]：这里只拥有单 binding、单 method-call initializer。
         return None;
+    };
+    match binding.attr {
+        AstLocalAttr::None => {}
+        AstLocalAttr::Close => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：链化会删除 `<close>` binding 及其离域关闭动作。
+            return None;
+        }
+        AstLocalAttr::Const => {
+            // 候选拒绝[PolicyBoundary]：`<const>` 声明身份继续由声明 owner 保留。
+            return None;
+        }
     }
-    if !matches!(local_decl.values[0], AstExpr::MethodCall(_)) {
-        return None;
+    match binding.origin {
+        AstLocalOrigin::Recovered => {}
+        AstLocalOrigin::DebugHinted => {
+            // 候选拒绝[SemanticBarrier:DebugScope]：删除 debug local 会改变 debug.getlocal 可观察的名字与作用域。
+            return None;
+        }
+        AstLocalOrigin::PhysicalRoot => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须继续保活 call result 到原词法域末端。
+            return None;
+        }
     }
-    Some(local_decl.bindings[0].id)
+    Some((binding.id, call))
 }
 
 fn chain_local_method_call_stmt(
-    first: &AstStmt,
+    first_call: &AstMethodCallExpr,
+    binding: AstBindingRef,
     second: &AstStmt,
     use_index: &BindingUseIndex,
     second_index: usize,
 ) -> Option<AstStmt> {
-    let AstStmt::LocalDecl(local_decl) = first else {
-        return None;
-    };
-    if local_decl.bindings.len() != 1
-        || local_decl.values.len() != 1
-        || local_decl.bindings[0].attr != AstLocalAttr::None
-    {
-        return None;
-    }
-    let AstExpr::MethodCall(first_call) = &local_decl.values[0] else {
-        return None;
-    };
     let AstStmt::CallStmt(call_stmt) = second else {
+        // 候选忽略[NotApplicable]：第二句不是可直接接到 receiver 的调用语句。
         return None;
     };
     let AstCallKind::MethodCall(second_call) = &call_stmt.call else {
+        // 候选忽略[NotApplicable]：普通 call 没有可附着的 method receiver 链。
         return None;
     };
     let AstExpr::Var(name) = &second_call.receiver else {
+        // 候选忽略[NotApplicable]：第二段 receiver 不是首句声明的直接 binding use。
         return None;
     };
-    if !name_matches_binding(name, local_decl.bindings[0].id)
-        || use_index.count_uses_in_range(second_index, second_index + 1, local_decl.bindings[0].id)
-            != 1
+    if !name_matches_binding(name, binding)
+        || use_index.count_uses_in_range(second_index, second_index + 1, binding) != 1
     {
         // 候选拒绝[SemanticBarrier:EvalCount]：第二句必须恰好把同一快照用作唯一 receiver；额外 use 不能随链化消失。
         return None;
@@ -126,7 +107,7 @@ fn chain_local_method_call_stmt(
     Some(AstStmt::CallStmt(Box::new(
         crate::ast::common::AstCallStmt {
             call: AstCallKind::MethodCall(Box::new(crate::ast::common::AstMethodCallExpr {
-                receiver: AstExpr::MethodCall(first_call.clone()),
+                receiver: AstExpr::MethodCall(Box::new(first_call.clone())),
                 method: second_call.method.clone(),
                 args: second_call.args.clone(),
             })),

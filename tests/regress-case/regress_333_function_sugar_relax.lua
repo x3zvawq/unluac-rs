@@ -22,8 +22,12 @@ local function make_method_owner()
     return method_owner
 end
 
-local effect_receiver = make_method_owner()
-local effect_result = effect_receiver.effectful_relaxed(effect_receiver, 43)
+local function call_effectful_receiver()
+    local effect_receiver = make_method_owner()
+    return effect_receiver.effectful_relaxed(effect_receiver, 43)
+end
+
+local effect_result = call_effectful_receiver()
 assert(effect_result == 43 and effect_count == 1)
 
 -- A direct call statement has the same two-use receiver snapshot as an assigned call.
@@ -36,8 +40,12 @@ local function make_direct_call_receiver()
         end,
     }
 end
-local direct_receiver = make_direct_call_receiver()
-direct_receiver.direct_statement_only(direct_receiver)
+local function call_direct_receiver()
+    local direct_receiver = make_direct_call_receiver()
+    direct_receiver.direct_statement_only(direct_receiver)
+end
+
+call_direct_receiver()
 assert(direct_call_count == 2)
 
 -- A write target is not a read use; removing its alias declaration would retarget the write.
@@ -92,6 +100,10 @@ local function make_terminal_callee()
     end
 end
 
-local terminal_callee = make_terminal_callee()
-terminal_callee()
+local function call_terminal_callee()
+    local terminal_callee = make_terminal_callee()
+    terminal_callee()
+end
+
+call_terminal_callee()
 assert(terminal_callee_events == 2)

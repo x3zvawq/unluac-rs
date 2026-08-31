@@ -1,7 +1,8 @@
 //! 这个文件识别普通 HIR 值活跃性看不到的物理槽 root 生命周期。
 //!
-//! fixed call result、已逃逸 table allocation，以及已跨显式 GC 的 lookup result，即使没有
-//! HIR 读取，也会在同一 stack home 被覆盖前继续充当 VM GC root。copy 共享值 identity，
+//! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨显式 GC 的
+//! lookup result，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当 VM GC root。
+//! copy 共享值 identity，
 //! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
 //! 消费者只能把 producer 与同 home 的精确覆盖配对。
 //! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
@@ -18,7 +19,7 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
-use super::visit::{HirVisitor, visit_stmts};
+use super::visit::{HirVisitor, visit_expr, visit_stmts};
 
 struct ActiveCallRoot {
     value_id: CallValueId,
@@ -86,6 +87,79 @@ pub(super) struct CallRootOverwritePair {
 pub(super) struct LookupGcRootLifetimeIndices {
     roots: BTreeSet<usize>,
     roots_by_overwrite: BTreeMap<usize, Vec<LookupGcRootOverwritePair>>,
+}
+
+/// 收集已经物化成 HIR local、但在最后一次显式读取后仍跨过潜在用户代码/GC 事件的
+/// fixed call result。
+///
+/// 当前或后续语句仍有同一 value epoch 的读取时，已有 binding/use owner 会保留该 local；
+/// 这里专门补足最后一次读取已经结束、但物理槽仍保活的后缀。这样不会阻断安全的
+/// `local x = a:m(); x:n()` 链化，而 `local x = a:m(); x:n(); side()` 会保留词法 root。
+pub(super) fn collect_call_result_local_roots(
+    stmts: &[HirStmt],
+    trailing_condition: Option<&HirExpr>,
+    safety: HirExprSafety,
+) -> BTreeSet<LocalId> {
+    let uses = LocalUseEvents::new(stmts, trailing_condition);
+    let explicit_fences = collect_gc_fence_indices(stmts);
+    let mut active = BTreeSet::<LocalId>::new();
+    let mut roots = BTreeSet::<LocalId>::new();
+
+    for (index, stmt) in stmts.iter().enumerate() {
+        if explicit_fences.contains(&index) {
+            // 显式 GC 是强观察点；沿用既有合同，不依赖后续源码读取来证明 root。
+            roots.extend(active.iter().copied());
+        } else if stmt_may_observe_gc_roots(stmt, safety) {
+            roots.extend(
+                active
+                    .iter()
+                    .copied()
+                    .filter(|local| !uses.has_live_read_from(*local, index)),
+            );
+        }
+
+        match stmt {
+            HirStmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let HirLValue::Local(local) = target {
+                        active.remove(local);
+                    }
+                }
+                if let ([HirLValue::Local(local)], [HirExpr::Call(_)], None) = (
+                    assign.targets.as_slice(),
+                    assign.values.fixed.as_slice(),
+                    &assign.values.tail,
+                ) {
+                    active.insert(*local);
+                }
+            }
+            HirStmt::LocalDecl(decl) => {
+                for local in &decl.bindings {
+                    active.remove(local);
+                }
+                if let ([local], [HirExpr::Call(_)], None) = (
+                    decl.bindings.as_slice(),
+                    decl.values.fixed.as_slice(),
+                    &decl.values.tail,
+                ) {
+                    active.insert(*local);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if trailing_condition.is_some_and(|condition| expr_may_observe_gc_roots(condition, safety)) {
+        let condition_index = stmts.len();
+        roots.extend(
+            active
+                .iter()
+                .copied()
+                .filter(|local| !uses.has_live_read_from(*local, condition_index)),
+        );
+    }
+
+    roots
 }
 
 #[derive(Clone, Copy)]
@@ -997,6 +1071,77 @@ fn stmt_may_observe_gc_roots(stmt: &HirStmt, safety: HirExprSafety) -> bool {
     collector.found
 }
 
+fn expr_may_observe_gc_roots(expr: &HirExpr, safety: HirExprSafety) -> bool {
+    let mut collector = GcRootObservationCollector {
+        found: false,
+        safety,
+    };
+    visit_expr(expr, &mut collector);
+    collector.found
+}
+
+struct LocalUseEvents {
+    reads: BTreeMap<LocalId, Vec<usize>>,
+    writes: BTreeMap<LocalId, Vec<usize>>,
+}
+
+impl LocalUseEvents {
+    fn new(stmts: &[HirStmt], trailing_condition: Option<&HirExpr>) -> Self {
+        let mut reads = BTreeMap::<LocalId, Vec<usize>>::new();
+        let mut writes = BTreeMap::<LocalId, Vec<usize>>::new();
+        for (index, stmt) in stmts.iter().enumerate() {
+            let mut collector = LocalUseCollector::default();
+            visit_stmts(std::slice::from_ref(stmt), &mut collector);
+            for local in collector.reads {
+                reads.entry(local).or_default().push(index);
+            }
+            for local in collector.writes {
+                writes.entry(local).or_default().push(index);
+            }
+        }
+        if let Some(condition) = trailing_condition {
+            let mut collector = LocalUseCollector::default();
+            visit_expr(condition, &mut collector);
+            for local in collector.reads {
+                reads.entry(local).or_default().push(stmts.len());
+            }
+        }
+        Self { reads, writes }
+    }
+
+    fn has_live_read_from(&self, local: LocalId, index: usize) -> bool {
+        let next_read = next_event_at_or_after(self.reads.get(&local), index);
+        let next_write = next_event_at_or_after(self.writes.get(&local), index);
+        next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
+    }
+}
+
+#[derive(Default)]
+struct LocalUseCollector {
+    reads: BTreeSet<LocalId>,
+    writes: BTreeSet<LocalId>,
+}
+
+impl HirVisitor for LocalUseCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        if let HirStmt::LocalDecl(decl) = stmt {
+            self.writes.extend(decl.bindings.iter().copied());
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::LocalRef(local) = expr {
+            self.reads.insert(*local);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let HirLValue::Local(local) = lvalue {
+            self.writes.insert(*local);
+        }
+    }
+}
+
 struct GcRootObservationCollector {
     found: bool,
     safety: HirExprSafety,
@@ -1158,6 +1303,13 @@ fn next_event_after(events: Option<&Vec<usize>>, index: usize) -> Option<usize> 
     let events = events?;
     events
         .get(events.partition_point(|event| *event <= index))
+        .copied()
+}
+
+fn next_event_at_or_after(events: Option<&Vec<usize>>, index: usize) -> Option<usize> {
+    let events = events?;
+    events
+        .get(events.partition_point(|event| *event < index))
         .copied()
 }
 

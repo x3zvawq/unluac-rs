@@ -51,7 +51,8 @@ use super::mention::{
     stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
 };
 use super::root_lifetimes::{
-    collect_call_root_lifetimes, collect_gc_fence_indices, collect_lookup_gc_root_lifetimes,
+    collect_call_result_local_roots, collect_call_root_lifetimes,
+    collect_lookup_gc_root_lifetimes,
 };
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
@@ -331,15 +332,25 @@ fn promote_block(
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> PromotionResult {
+    let empty = BTreeSet::new();
     promote_block_with_protection(
         ctx,
         block,
         inherited,
         inherited_sticky_slots,
         outer_uses_temp,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
+        BlockProtection {
+            current_plan_temps: &empty,
+            descendant_temps: &empty,
+            trailing_root_condition: None,
+        },
     )
+}
+
+struct BlockProtection<'a> {
+    current_plan_temps: &'a BTreeSet<TempId>,
+    descendant_temps: &'a BTreeSet<TempId>,
+    trailing_root_condition: Option<&'a HirExpr>,
 }
 
 fn promote_block_with_protection(
@@ -348,10 +359,13 @@ fn promote_block_with_protection(
     inherited: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
-    current_plan_protected_temps: &BTreeSet<TempId>,
-    descendant_protected_temps: &BTreeSet<TempId>,
+    protection: BlockProtection<'_>,
 ) -> PromotionResult {
-    record_gc_fenced_call_roots(block, ctx.physical_root_locals);
+    ctx.physical_root_locals.extend(collect_call_result_local_roots(
+        &block.stmts,
+        protection.trailing_root_condition,
+        ctx.safety,
+    ));
 
     // 每轮控制头等 block 外消费者先保护当前 block；递归进入子作用域时再叠加当前语句
     // 之后的引用。tracker 用引用计数维护后缀集合，避免按 index 克隆完整集合。
@@ -359,7 +373,7 @@ fn promote_block_with_protection(
     let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
 
     let block_uses_outer_temp =
-        |temp| outer_uses_temp(temp) || current_plan_protected_temps.contains(&temp);
+        |temp| outer_uses_temp(temp) || protection.current_plan_temps.contains(&temp);
     let plans = collect_plans(
         ctx,
         block,
@@ -456,7 +470,7 @@ fn promote_block_with_protection(
         // 子作用域的 outer temps = 当前块后续语句的 temp 引用 ∪ 来自祖先作用域的保护集
         let child_uses_outer_temp = |temp| {
             block_uses_outer_temp(temp)
-                || descendant_protected_temps.contains(&temp)
+                || protection.descendant_temps.contains(&temp)
                 || temp_refs.suffix_contains(temp)
         };
         let stmt_changed = rewrite_stmt(
@@ -490,48 +504,6 @@ fn promote_block_with_protection(
     PromotionResult {
         changed,
         trailing_mapping: mapping,
-    }
-}
-
-fn record_gc_fenced_call_roots(block: &HirBlock, roots: &mut BTreeSet<LocalId>) {
-    let mut active = BTreeSet::new();
-    let fences = collect_gc_fence_indices(&block.stmts);
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        if fences.contains(&index) {
-            // Call local 的普通读取已结束时，fixed result 仍在原 VM home 里充当 root；lookup
-            // 必须由 per-home overwrite collector 提供事实，不能在 fixed point 中 blanket 标记。
-            roots.extend(active.iter().copied());
-        }
-
-        match stmt {
-            HirStmt::Assign(assign) => {
-                for target in &assign.targets {
-                    if let HirLValue::Local(local) = target {
-                        active.remove(local);
-                    }
-                }
-                if let ([HirLValue::Local(local)], [HirExpr::Call(_)], None) = (
-                    assign.targets.as_slice(),
-                    assign.values.fixed.as_slice(),
-                    &assign.values.tail,
-                ) {
-                    active.insert(*local);
-                }
-            }
-            HirStmt::LocalDecl(decl) => {
-                for local in &decl.bindings {
-                    active.remove(local);
-                }
-                if let ([local], [HirExpr::Call(_)], None) = (
-                    decl.bindings.as_slice(),
-                    decl.values.fixed.as_slice(),
-                    &decl.values.tail,
-                ) {
-                    active.insert(*local);
-                }
-            }
-            _ => {}
-        }
     }
 }
 
@@ -1402,8 +1374,11 @@ fn rewrite_stmt(
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
-                &condition_temps,
-                &condition_temps,
+                BlockProtection {
+                    current_plan_temps: &condition_temps,
+                    descendant_temps: &condition_temps,
+                    trailing_root_condition: None,
+                },
             )
             .changed;
             cond_changed || body_changed
@@ -1420,8 +1395,11 @@ fn rewrite_stmt(
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
-                &BTreeSet::new(),
-                &condition_temps,
+                BlockProtection {
+                    current_plan_temps: &BTreeSet::new(),
+                    descendant_temps: &condition_temps,
+                    trailing_root_condition: Some(&repeat_stmt.cond),
+                },
             );
             let cond_changed =
                 rewrite::expr(&mut repeat_stmt.cond, body_result.trailing_mapping.as_ref());

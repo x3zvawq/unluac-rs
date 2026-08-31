@@ -13,13 +13,13 @@ local function wrap(...)
     end
 end
 
-local function interrupted(pair_fn, wrap_fn, mark_fn)
-    local seed = pair_fn()
-    local callee = wrap_fn(seed)
+local function adjacent(pair_fn, wrap_fn, mark_fn)
     mark_fn()
-    return callee()
+    local seed = pair_fn()
+    return wrap_fn(seed)
 end
 
-local value, argc = interrupted(pair, wrap, function() end)
+local callee = adjacent(pair, wrap, function() end)
+local value, argc = callee()
 assert(value == 7 and argc == 1)
 print("regress_354_adjacent_final_arg_value_arity")

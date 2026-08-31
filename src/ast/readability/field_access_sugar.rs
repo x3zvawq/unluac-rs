@@ -1,4 +1,4 @@
-//! 把等价的字符串索引收敛成字段访问。
+//! 把等价的字符串索引与 constructor key 收敛成字段形式。
 //!
 //! `obj["name"]` 和 `obj.name` 在 `name` 是合法标识符时语义等价。
 //! 这里尽早把它规整成字段访问，是为了让后续的 alias inline / method sugar
@@ -7,7 +7,8 @@
 use crate::ast::DecompileDialect;
 
 use super::super::common::{
-    AstExpr, AstFieldAccess, AstIndexAccess, AstLValue, AstModule, is_lua_identifier_name,
+    AstExpr, AstFieldAccess, AstIndexAccess, AstLValue, AstModule, AstTableField, AstTableKey,
+    is_lua_identifier_name,
 };
 use super::ReadabilityContext;
 use super::walk::{self, AstRewritePass};
@@ -27,14 +28,33 @@ struct FieldAccessSugarPass {
 
 impl AstRewritePass for FieldAccessSugarPass {
     fn rewrite_expr(&mut self, expr: &mut AstExpr) -> bool {
-        let AstExpr::IndexAccess(access) = expr else {
-            return false;
-        };
-        let Some(field_access) = field_access_from_index(access, self.dialect) else {
-            return false;
-        };
-        *expr = AstExpr::FieldAccess(Box::new(field_access));
-        true
+        match expr {
+            AstExpr::IndexAccess(access) => {
+                let Some(field_access) = field_access_from_index(access, self.dialect) else {
+                    return false;
+                };
+                *expr = AstExpr::FieldAccess(Box::new(field_access));
+                true
+            }
+            AstExpr::TableConstructor(table) => {
+                let mut changed = false;
+                for field in &mut table.fields {
+                    let AstTableField::Record(record) = field else {
+                        continue;
+                    };
+                    let AstTableKey::Expr(key) = &record.key else {
+                        continue;
+                    };
+                    let Some(field_name) = field_name_from_key_expr(key, self.dialect) else {
+                        continue;
+                    };
+                    record.key = AstTableKey::Name(field_name);
+                    changed = true;
+                }
+                changed
+            }
+            _ => false,
+        }
     }
 
     fn rewrite_lvalue(&mut self, lvalue: &mut AstLValue) -> bool {
@@ -53,7 +73,15 @@ fn field_access_from_index(
     access: &AstIndexAccess,
     dialect: DecompileDialect,
 ) -> Option<AstFieldAccess> {
-    let AstExpr::String(field_value) = &access.index else {
+    let field = field_name_from_key_expr(&access.index, dialect)?;
+    Some(AstFieldAccess {
+        base: access.base.clone(),
+        field,
+    })
+}
+
+fn field_name_from_key_expr(expr: &AstExpr, dialect: DecompileDialect) -> Option<String> {
+    let AstExpr::String(field_value) = expr else {
         return None;
     };
     // 候选拒绝[TargetConstraint]：Lua 裸字段名必须是目标方言可表示的 UTF-8 标识符；原始字节键只能保留 `obj["..."]`。
@@ -62,8 +90,5 @@ fn field_access_from_index(
         // 候选拒绝[TargetConstraint]：关键字或非法标识符不能生成 `obj.field`，否则目标方言源码无法解析。
         return None;
     }
-    Some(AstFieldAccess {
-        base: access.base.clone(),
-        field: field.to_owned(),
-    })
+    Some(field.to_owned())
 }

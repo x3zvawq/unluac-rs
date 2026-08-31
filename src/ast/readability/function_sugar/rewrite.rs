@@ -29,13 +29,14 @@ pub(in crate::ast::readability) fn apply(
     context: ReadabilityContext,
 ) -> bool {
     let mutable_snapshots = mutable_snapshot_names_in_block(&module.body);
-    rewrite_block(&mut module.body, context.target, &mutable_snapshots)
+    rewrite_block(&mut module.body, context.target, &mutable_snapshots, None)
 }
 
 fn rewrite_block(
     block: &mut AstBlock,
     target: AstTargetDialect,
     mutable_snapshots: &MutableSnapshotNames,
+    trailing_expr: Option<&AstExpr>,
 ) -> bool {
     let mut changed = false;
     for stmt in &mut block.stmts {
@@ -46,7 +47,7 @@ fn rewrite_block(
     // LocalId/SyntheticLocalId are numbered per function. Current-function counting still
     // records explicit capture provenance, while descending into child bodies would conflate
     // unrelated bindings that happen to reuse the same numeric id.
-    let use_index = BindingUseIndex::for_stmts(&old_stmts);
+    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_expr);
 
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
@@ -115,26 +116,33 @@ fn rewrite_nested(
 ) -> bool {
     match stmt {
         AstStmt::If(if_stmt) => {
-            let mut changed = rewrite_block(&mut if_stmt.then_block, target, mutable_snapshots);
+            let mut changed =
+                rewrite_block(&mut if_stmt.then_block, target, mutable_snapshots, None);
             if let Some(else_block) = &mut if_stmt.else_block {
-                changed |= rewrite_block(else_block, target, mutable_snapshots);
+                changed |= rewrite_block(else_block, target, mutable_snapshots, None);
             }
             changed |= rewrite_function_exprs_in_expr(&mut if_stmt.cond, target);
             changed
         }
         AstStmt::While(while_stmt) => {
             rewrite_function_exprs_in_expr(&mut while_stmt.cond, target)
-                | rewrite_block(&mut while_stmt.body, target, mutable_snapshots)
+                | rewrite_block(&mut while_stmt.body, target, mutable_snapshots, None)
         }
         AstStmt::Repeat(repeat_stmt) => {
-            rewrite_block(&mut repeat_stmt.body, target, mutable_snapshots)
-                | rewrite_function_exprs_in_expr(&mut repeat_stmt.cond, target)
+            // `until` 与 repeat body 共用词法作用域；条件 use 必须参与正文候选的删除证明。
+            let body_changed = rewrite_block(
+                &mut repeat_stmt.body,
+                target,
+                mutable_snapshots,
+                Some(&repeat_stmt.cond),
+            );
+            body_changed | rewrite_function_exprs_in_expr(&mut repeat_stmt.cond, target)
         }
         AstStmt::NumericFor(numeric_for) => {
             let mut changed = rewrite_function_exprs_in_expr(&mut numeric_for.start, target);
             changed |= rewrite_function_exprs_in_expr(&mut numeric_for.limit, target);
             changed |= rewrite_function_exprs_in_expr(&mut numeric_for.step, target);
-            changed |= rewrite_block(&mut numeric_for.body, target, mutable_snapshots);
+            changed |= rewrite_block(&mut numeric_for.body, target, mutable_snapshots, None);
             changed
         }
         AstStmt::GenericFor(generic_for) => {
@@ -142,10 +150,10 @@ fn rewrite_nested(
             for expr in &mut generic_for.iterator {
                 changed |= rewrite_function_exprs_in_expr(expr, target);
             }
-            changed |= rewrite_block(&mut generic_for.body, target, mutable_snapshots);
+            changed |= rewrite_block(&mut generic_for.body, target, mutable_snapshots, None);
             changed
         }
-        AstStmt::DoBlock(block) => rewrite_block(block, target, mutable_snapshots),
+        AstStmt::DoBlock(block) => rewrite_block(block, target, mutable_snapshots, None),
         AstStmt::FunctionDecl(function_decl) => {
             rewrite_function_expr(&mut function_decl.func, target)
         }
@@ -194,7 +202,7 @@ fn rewrite_nested(
 
 fn rewrite_function_expr(function: &mut AstFunctionExpr, target: AstTargetDialect) -> bool {
     let mutable_snapshots = mutable_snapshot_names_in_block(&function.body);
-    rewrite_block(&mut function.body, target, &mutable_snapshots)
+    rewrite_block(&mut function.body, target, &mutable_snapshots, None)
 }
 
 fn rewrite_function_exprs_in_call(call: &mut AstCallKind, target: AstTargetDialect) -> bool {
