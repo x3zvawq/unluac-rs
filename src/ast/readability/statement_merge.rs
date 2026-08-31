@@ -30,7 +30,7 @@ use super::binding_flow::{
     block_references_binding_set, expr_references_any_binding, expr_references_binding_set,
     stmt_references_any_binding, stmt_references_binding_set,
 };
-use super::expr_analysis::{expr_complexity, is_copy_like_expr};
+use super::expr_analysis::{expr_complexity, is_copy_like_expr, is_discard_safe_expr};
 use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
 
@@ -165,10 +165,17 @@ fn merge_adjacent_single_value_local_decls(
             // 这里故意只收“连续复制/lookup”式的 local：
             // 目标是把 `local a = x; local b = y; local c = t[k]` 这类明显属于同一段
             // 源码声明的机械拆分重新压回去，而不是把有阶段语义的复杂 local 都并成一行。
-            if !is_mergeable_adjacent_local_value(next_value)
-                || expr_references_any_binding(next_value, &bindings)
-            {
-                // 候选拒绝[SemanticBarrier:Scope]：`local a=x; local b=a` 合成并行声明后 RHS 的 `a` 会解析到外层；候选拒绝[PolicyBoundary]：复杂 RHS 受展示预算限制。
+            if !is_mergeable_adjacent_local_value(next_value) {
+                // 候选拒绝[PolicyBoundary]：复杂 RHS 受展示预算限制。
+                break;
+            }
+            if expr_references_any_binding(next_value, &bindings) {
+                // 候选拒绝[SemanticBarrier:Scope]：`local a=x; local b=a` 合成并行声明后 RHS 的 `a` 会解析到外层。
+                break;
+            }
+            if !is_discard_safe_expr(next_value) {
+                // 候选拒绝[SemanticBarrier:DebugScope]：regress_341 的 `probe.value` 可在
+                // `__index` 中用 debug.getlocal 观察前一个顺序 local；并行声明会把它推迟到 RHS 全部求值之后。
                 break;
             }
             bindings.push(next_binding.clone());
@@ -195,9 +202,6 @@ fn merge_adjacent_single_value_local_decls(
                 .iter()
                 .any(|b| use_index.count_uses_in_suffix(lookahead, b.id) > 1)
         {
-            // 证明缺陷[PotentialUnsoundness:DebugScope]：顺序声明会让较早 local 在后续 RHS
-            // 求值时进入调用者活动局部；合成并行声明后所有 binding 都到 RHS 全部求值后才生效。
-            // `debug.getlocal` 可从后续 lookup 的元方法观察该差异；当前 proof 未排除此类事件。
             new_stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings,
                 values,
