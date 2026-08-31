@@ -278,7 +278,9 @@ fn collect_temp_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
 ) -> (CallRootLifetimeIndices, Vec<bool>) {
-    let call_roots = collect_call_root_lifetimes(stmts, facts, |_| true);
+    // 分析停用[LayerBoundary]：普通潜在事件只形成 locals 的待配对 owner 事实；temp-inline
+    // 只消费显式 GC fence 与已完成 overwrite pair，避免把尚未物化的观察扩成全局 inline barrier。
+    let call_roots = collect_call_root_lifetimes(stmts, facts, false, |_| true, |_| true);
     let mut marked = call_roots.marked_stmts(stmts.len());
     collect_lookup_gc_root_lifetimes(stmts, facts, |_| true).mark_stmts(&mut marked);
     (call_roots, marked)

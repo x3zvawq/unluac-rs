@@ -244,6 +244,10 @@ impl HomeSlotKey {
     pub(super) const fn new(slot: usize, epoch: usize) -> Self {
         Self { slot, epoch }
     }
+
+    pub(super) const fn slot(self) -> usize {
+        self.slot
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]

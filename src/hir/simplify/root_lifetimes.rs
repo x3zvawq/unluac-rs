@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId,
 };
+use crate::hir::expr_safety::{expr_is_discard_safe_without_residual, expr_result_is_gc_inert};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
@@ -44,9 +45,27 @@ struct ActiveAllocationRoot {
     eligible: bool,
 }
 
+struct ExactNilHomeOverwrite {
+    temps: BTreeSet<TempId>,
+    home: HomeSlotKey,
+    eligible: bool,
+}
+
+struct ExactBranchHomeOverwrite {
+    temps: BTreeSet<TempId>,
+    home: HomeSlotKey,
+    eligible: bool,
+}
+
+struct ExactMultiCallRootTarget {
+    temp: TempId,
+    home: HomeSlotKey,
+}
+
 #[derive(Default)]
 pub(super) struct CallRootLifetimeIndices {
     roots: BTreeSet<usize>,
+    root_homes: BTreeMap<usize, BTreeSet<HomeSlotKey>>,
     roots_by_overwrite: BTreeMap<usize, Vec<CallRootOverwritePair>>,
     root_by_protected: BTreeMap<usize, usize>,
 }
@@ -82,6 +101,10 @@ impl CallRootOverwritePair {
 impl CallRootLifetimeIndices {
     pub(super) fn is_root(&self, index: usize) -> bool {
         self.roots.contains(&index)
+    }
+
+    pub(super) fn root_homes(&self, index: usize) -> impl Iterator<Item = HomeSlotKey> + '_ {
+        self.root_homes.get(&index).into_iter().flatten().copied()
     }
 
     pub(super) fn overwrite_pair_for_home(
@@ -175,7 +198,9 @@ impl LookupGcRootOverwritePair {
 pub(super) fn collect_call_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
-    mut temp_is_eligible: impl FnMut(TempId) -> bool,
+    observe_potential_events: bool,
+    mut producer_temp_is_eligible: impl FnMut(TempId) -> bool,
+    mut overwrite_temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> CallRootLifetimeIndices {
     let uses = TempUseEvents::new(stmts);
     let mut active = BTreeMap::<HomeSlotKey, ActiveCallRoot>::new();
@@ -188,6 +213,13 @@ pub(super) fn collect_call_root_lifetimes(
     for (index, stmt) in stmts.iter().enumerate() {
         if uses.is_gc_fence(index) {
             preserve_active_call_roots(&mut active, &mut lifetimes);
+        } else if observe_potential_events && stmt_may_observe_gc_roots(stmt) {
+            // A potential user-code/GC event matters only if a later same-home overwrite proves
+            // the end of this transaction. Unlike an explicit collection fence, this does not
+            // by itself justify materializing every still-active call result.
+            for root in active.values_mut() {
+                root.observed = true;
+            }
         }
         let reads = uses.reads_at(index);
         for root in active.values_mut() {
@@ -223,11 +255,53 @@ pub(super) fn collect_call_root_lifetimes(
         }
         let Some((temp, value)) = scalar_temp_definition(stmt) else {
             forget_written_known_nil_temps(stmt, &mut known_nil_temps);
-            if let Some(overwrites) =
-                exact_multi_nil_temp_overwrites(stmt, facts, &mut temp_is_eligible)
+            if let Some(targets) =
+                exact_multi_call_root_targets(stmt, facts, &mut producer_temp_is_eligible)
             {
-                for (temp, home, eligible) in overwrites {
-                    known_nil_temps.insert(temp);
+                let target_homes = targets
+                    .iter()
+                    .map(|target| target.home)
+                    .collect::<BTreeSet<_>>();
+                for target in &targets {
+                    if let Some(root) = active.remove(&target.home) {
+                        record_call_root_overwrite(
+                            root,
+                            index,
+                            target.home,
+                            true,
+                            &uses,
+                            &mut lifetimes,
+                        );
+                    }
+                }
+                for root in active.values_mut() {
+                    for target in &targets {
+                        root.aliases.remove(&target.temp);
+                    }
+                }
+                remove_allocation_homes(&mut active_allocations, &target_homes, facts);
+                for target in targets {
+                    active.insert(
+                        target.home,
+                        ActiveCallRoot {
+                            root_index: index,
+                            aliases: BTreeSet::from([target.temp]),
+                            observed: false,
+                        },
+                    );
+                }
+                continue;
+            }
+            if let Some(overwrites) =
+                exact_multi_nil_temp_overwrites(stmt, facts, &mut overwrite_temp_is_eligible)
+            {
+                for ExactNilHomeOverwrite {
+                    temps,
+                    home,
+                    eligible,
+                } in overwrites
+                {
+                    known_nil_temps.extend(temps.iter().copied());
                     if let Some(root) = active.remove(&home) {
                         record_call_root_overwrite(
                             root,
@@ -244,25 +318,44 @@ pub(super) fn collect_call_root_lifetimes(
                         uses: &uses,
                         facts,
                     };
-                    update_allocation_roots(
-                        &mut allocation_state,
-                        index,
-                        temp,
-                        &HirExpr::Nil,
-                        true,
-                        home,
-                        eligible,
-                    );
+                    for temp in temps {
+                        update_allocation_roots(
+                            &mut allocation_state,
+                            index,
+                            temp,
+                            &HirExpr::Nil,
+                            true,
+                            home,
+                            eligible,
+                        );
+                    }
                 }
                 continue;
             }
-            if let Some((home, eligible)) =
-                definite_branch_temp_home_overwrite(stmt, facts, &mut temp_is_eligible)
-            {
-                if let Some(root) = active.remove(&home) {
-                    record_call_root_overwrite(root, index, home, eligible, &uses, &mut lifetimes);
+            if let Some(overwrite) = definite_gc_inert_branch_home_overwrite(
+                stmt,
+                facts,
+                &mut overwrite_temp_is_eligible,
+            ) {
+                if let Some(root) = active.remove(&overwrite.home) {
+                    record_call_root_overwrite(
+                        root,
+                        index,
+                        overwrite.home,
+                        overwrite.eligible,
+                        &uses,
+                        &mut lifetimes,
+                    );
                 }
-                remove_allocation_homes(&mut active_allocations, &BTreeSet::from([home]), facts);
+                terminate_allocation_home(
+                    &mut active_allocations,
+                    &mut lifetimes,
+                    &uses,
+                    facts,
+                    index,
+                    overwrite.home,
+                    overwrite.eligible,
+                );
                 continue;
             }
             let writes = StackWriteSummary::for_stmt(stmt, facts);
@@ -294,7 +387,8 @@ pub(super) fn collect_call_root_lifetimes(
             continue;
         };
 
-        let eligible = temp_is_eligible(temp);
+        let producer_eligible = producer_temp_is_eligible(temp);
+        let overwrite_eligible = overwrite_temp_is_eligible(temp);
         let mut allocation_state = AllocationRootState {
             active: &mut active_allocations,
             lifetimes: &mut lifetimes,
@@ -308,7 +402,7 @@ pub(super) fn collect_call_root_lifetimes(
             value,
             value_is_known_nil,
             slot,
-            eligible,
+            producer_eligible,
         );
         let same_value_in_target_home = matches!(value, HirExpr::TempRef(source)
             if active
@@ -332,7 +426,7 @@ pub(super) fn collect_call_root_lifetimes(
                         root,
                         index,
                         *write_home,
-                        eligible,
+                        overwrite_eligible,
                         &uses,
                         &mut lifetimes,
                     );
@@ -354,7 +448,14 @@ pub(super) fn collect_call_root_lifetimes(
         }
 
         if let Some(root) = active.remove(&slot) {
-            record_call_root_overwrite(root, index, slot, eligible, &uses, &mut lifetimes);
+            record_call_root_overwrite(
+                root,
+                index,
+                slot,
+                overwrite_eligible,
+                &uses,
+                &mut lifetimes,
+            );
         }
 
         if let HirExpr::TempRef(source) = value {
@@ -366,7 +467,7 @@ pub(super) fn collect_call_root_lifetimes(
             continue;
         }
 
-        if eligible && matches!(value, HirExpr::Call(_)) {
+        if producer_eligible && matches!(value, HirExpr::Call(_)) {
             active.insert(
                 slot,
                 ActiveCallRoot {
@@ -381,7 +482,7 @@ pub(super) fn collect_call_root_lifetimes(
     lifetimes
 }
 
-/// 只识别已经跨过显式 `collectgarbage` 的 lookup 物理 root。
+/// 只识别与显式 `collectgarbage` 相关的 lookup 物理 root。
 ///
 /// Call 的观察、allocation owner 与相邻 overwrite 合同保持在既有 collector 中；这里不把
 /// 普通 lookup 一概提升为 source local。标量与无求值 multi-nil 只按同 home 精确配对；
@@ -417,22 +518,24 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
             if let Some(overwrites) =
                 exact_multi_nil_temp_overwrites(stmt, facts, &mut temp_is_eligible)
             {
-                for (temp, _, _) in &overwrites {
-                    value_by_temp.remove(temp);
-                    for root in active.values_mut() {
-                        root.aliases.remove(temp);
+                for overwrite in &overwrites {
+                    for temp in &overwrite.temps {
+                        value_by_temp.remove(temp);
+                        for root in active.values_mut() {
+                            root.aliases.remove(temp);
+                        }
                     }
                 }
-                for (_, home, eligible) in overwrites {
-                    if let Some(root) = active.remove(&home) {
+                for overwrite in overwrites {
+                    if let Some(root) = active.remove(&overwrite.home) {
                         for alias in &root.aliases {
                             value_by_temp.remove(alias);
                         }
                         record_lookup_root_overwrite(
                             root,
                             index,
-                            home,
-                            eligible,
+                            overwrite.home,
+                            overwrite.eligible,
                             &uses,
                             facts,
                             &mut lifetimes,
@@ -441,6 +544,37 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 }
                 continue;
             }
+            if let Some(overwrite) =
+                definite_gc_inert_branch_home_overwrite(stmt, facts, &mut temp_is_eligible)
+            {
+                for temp in &overwrite.temps {
+                    value_by_temp.remove(temp);
+                    for root in active.values_mut() {
+                        root.aliases.remove(temp);
+                    }
+                }
+                if let Some(mut root) = active.remove(&overwrite.home) {
+                    for alias in &root.aliases {
+                        value_by_temp.remove(alias);
+                    }
+                    // The VM releases this lookup home on every arm before the later GC. Mark
+                    // that future observation here; ordinary scalar/copy overwrites stay on the
+                    // narrower crossed-fence contract to avoid materializing mechanical chains.
+                    root.crossed_gc_fence |= uses.has_gc_fence_after(index);
+                    record_lookup_root_overwrite(
+                        root,
+                        index,
+                        overwrite.home,
+                        overwrite.eligible,
+                        &uses,
+                        facts,
+                        &mut lifetimes,
+                    );
+                }
+                continue;
+            }
+            // 分析停用[ProofIncomplete]：非 GC-inert 分支覆盖会同时开始新的资源生命周期；
+            // 当前 collector 没有结构化 successor root 状态，不能只登记旧 root 的终止 pair。
             // 分析停用[ProofIncomplete]：一般 parallel assignment 缺少各 RHS 求值与物理 target 提交顺序事实；当前只配对无 tail、全 trusted temp、RHS 全 nil 的无求值形状。
             let writes = StackWriteSummary::for_stmt(stmt, facts);
             if writes.has_boundary || writes.has_unknown_home {
@@ -564,7 +698,7 @@ fn exact_multi_nil_temp_overwrites(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
-) -> Option<Vec<(TempId, HomeSlotKey, bool)>> {
+) -> Option<Vec<ExactNilHomeOverwrite>> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -579,62 +713,105 @@ fn exact_multi_nil_temp_overwrites(
     {
         return None;
     }
-    let overwrites = assign
-        .targets
-        .iter()
-        .map(|target| {
-            let HirLValue::Temp(temp) = target else {
-                return None;
-            };
-            Some((
-                *temp,
-                facts.trusted_temp_home_slot(*temp)?,
-                temp_is_eligible(*temp),
-            ))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    // 候选拒绝[ProofIncomplete]：同一 parallel assignment 的多个 SSA target 若映射到同一
-    // home，仅凭 home pair 无法证明应由哪个 target 承接物理 root overwrite。
-    let unique_homes = overwrites
-        .iter()
-        .map(|(_, home, _)| *home)
-        .collect::<BTreeSet<_>>();
-    (unique_homes.len() == overwrites.len()).then_some(overwrites)
+    let mut overwrites = BTreeMap::<HomeSlotKey, ExactNilHomeOverwrite>::new();
+    for target in &assign.targets {
+        let HirLValue::Temp(temp) = target else {
+            return None;
+        };
+        let home = facts.trusted_temp_home_slot(*temp)?;
+        let eligible = temp_is_eligible(*temp);
+        let overwrite = overwrites
+            .entry(home)
+            .or_insert_with(|| ExactNilHomeOverwrite {
+                temps: BTreeSet::new(),
+                home,
+                eligible: true,
+            });
+        overwrite.temps.insert(*temp);
+        overwrite.eligible &= eligible;
+    }
+    // Literal nil 没有求值事件；同 home 的全部 target 是同一次物理覆盖事务，并共同
+    // 承接相同的 nil 后态。资格按组取交集，避免只提升其中一部分 identity-sensitive temp。
+    Some(overwrites.into_values().collect())
 }
 
-fn definite_branch_temp_home_overwrite(
+fn exact_multi_call_root_targets(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
-) -> Option<(HomeSlotKey, bool)> {
+) -> Option<Vec<ExactMultiCallRootTarget>> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let tail = assign.values.tail.as_ref()?;
+    if assign.targets.len() < 2
+        || !assign.values.fixed.is_empty()
+        || tail.exact_width() != Some(assign.targets.len())
+        || !matches!(tail.as_expr(), HirExpr::Call(_))
+    {
+        return None;
+    }
+
+    let mut temp_homes = Vec::with_capacity(assign.targets.len());
+    let mut distinct_homes = BTreeSet::new();
+    for target in &assign.targets {
+        let HirLValue::Temp(temp) = target else {
+            return None;
+        };
+        let home = facts.trusted_temp_home_slot(*temp)?;
+        if !distinct_homes.insert(home) {
+            return None;
+        }
+        temp_homes.push((*temp, home));
+    }
+
+    if !temp_homes.iter().all(|(temp, _)| temp_is_eligible(*temp)) {
+        return None;
+    }
+
+    Some(
+        temp_homes
+            .into_iter()
+            .map(|(temp, home)| ExactMultiCallRootTarget { temp, home })
+            .collect(),
+    )
+}
+
+fn definite_gc_inert_branch_home_overwrite(
+    stmt: &HirStmt,
+    facts: &ProtoPromotionFacts,
+    temp_is_eligible: &mut impl FnMut(TempId) -> bool,
+) -> Option<ExactBranchHomeOverwrite> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
     };
     let else_block = if_stmt.else_block.as_ref()?;
-    let then_temp = single_scalar_temp_write(&if_stmt.then_block)?;
-    let else_temp = single_scalar_temp_write(else_block)?;
-    let then_home = facts.home_slot(then_temp)?;
-    let else_home = facts.home_slot(else_temp)?;
-    (then_home == else_home).then(|| {
-        (
-            then_home,
-            temp_is_eligible(then_temp) && temp_is_eligible(else_temp),
-        )
+    let (then_temp, then_value) = single_scalar_temp_write(&if_stmt.then_block)?;
+    let (else_temp, else_value) = single_scalar_temp_write(else_block)?;
+    if !expr_result_is_gc_inert(then_value) || !expr_result_is_gc_inert(else_value) {
+        return None;
+    }
+    let then_home = facts.trusted_temp_home_slot(then_temp)?;
+    let else_home = facts.trusted_temp_home_slot(else_temp)?;
+    (then_home == else_home).then(|| ExactBranchHomeOverwrite {
+        temps: BTreeSet::from([then_temp, else_temp]),
+        home: then_home,
+        eligible: temp_is_eligible(then_temp) && temp_is_eligible(else_temp),
     })
 }
 
-fn single_scalar_temp_write(block: &HirBlock) -> Option<TempId> {
+fn single_scalar_temp_write(block: &HirBlock) -> Option<(TempId, &HirExpr)> {
     let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
         return None;
     };
-    let ([HirLValue::Temp(temp)], [_], None) = (
+    let ([HirLValue::Temp(temp)], [value], None) = (
         assign.targets.as_slice(),
         assign.values.fixed.as_slice(),
         &assign.values.tail,
     ) else {
         return None;
     };
-    Some(*temp)
+    Some((*temp, value))
 }
 
 fn stmt_is_transparent_temp_copy(stmt: &HirStmt, aliases: &BTreeSet<TempId>) -> bool {
@@ -681,6 +858,11 @@ fn record_call_root_overwrite(
     {
         lifetimes.roots.insert(root.root_index);
         lifetimes
+            .root_homes
+            .entry(root.root_index)
+            .or_default()
+            .insert(home);
+        lifetimes
             .roots_by_overwrite
             .entry(index)
             .or_default()
@@ -695,11 +877,49 @@ fn preserve_active_call_roots(
     active: &mut BTreeMap<HomeSlotKey, ActiveCallRoot>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
-    for root in active.values_mut() {
-        // Any value still occupying its physical home at an explicit collection point is a
-        // root, even if ordinary value liveness ended after an earlier read.
+    for (home, root) in active.iter_mut() {
+        // Any value still occupying its physical home while this statement may run user code
+        // or GC is a root, even if ordinary value liveness ended after an earlier read.
         root.observed = true;
         lifetimes.roots.insert(root.root_index);
+        lifetimes
+            .root_homes
+            .entry(root.root_index)
+            .or_default()
+            .insert(*home);
+    }
+}
+
+fn stmt_may_observe_gc_roots(stmt: &HirStmt) -> bool {
+    let mut collector = GcRootObservationCollector::default();
+    visit_stmts(std::slice::from_ref(stmt), &mut collector);
+    collector.found
+}
+
+#[derive(Default)]
+struct GcRootObservationCollector {
+    found: bool,
+}
+
+impl HirVisitor for GcRootObservationCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.found |= matches!(stmt, HirStmt::Close(_));
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        // The shared discard-safety boundary already classifies dynamic environment/table
+        // access, metamethod-capable operators, calls, and allocating expressions as eventful;
+        // residual diagnostics stay conservative instead of being treated as executable no-ops.
+        self.found |= !expr_is_discard_safe_without_residual(expr);
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
+    }
+
+    fn visit_call(&mut self, _call: &HirCallExpr) {
+        // CallStmt exposes a HirCallExpr directly instead of wrapping it in HirExpr::Call.
+        self.found = true;
     }
 }
 
@@ -933,34 +1153,15 @@ fn update_allocation_roots(
 
         root.aliases.remove(&temp);
         if root.homes.remove(&slot) {
-            if value_is_known_nil
-                && root.escaped
-                && root.eligible
-                && eligible
-                && root
-                    .aliases
-                    .iter()
-                    .all(|alias| !state.uses.has_live_read_after(*alias, index))
-            {
-                state
-                    .lifetimes
-                    .roots
-                    .extend(root.def_indices.iter().copied());
-                for def_index in &root.def_indices {
-                    state
-                        .lifetimes
-                        .root_by_protected
-                        .insert(*def_index, root.root_index);
-                }
-                state
-                    .lifetimes
-                    .roots_by_overwrite
-                    .entry(index)
-                    .or_default()
-                    .push(CallRootOverwritePair {
-                        root_index: root.root_index,
-                        home: slot,
-                    });
+            if value_is_known_nil {
+                record_allocation_root_overwrite(
+                    root,
+                    index,
+                    slot,
+                    eligible,
+                    state.uses,
+                    state.lifetimes,
+                );
             }
             root.aliases.retain(|alias| {
                 state
@@ -982,6 +1183,63 @@ fn update_allocation_roots(
             escaped: false,
             eligible,
         });
+    }
+}
+
+fn terminate_allocation_home(
+    active: &mut Vec<ActiveAllocationRoot>,
+    lifetimes: &mut CallRootLifetimeIndices,
+    uses: &TempUseEvents,
+    facts: &ProtoPromotionFacts,
+    index: usize,
+    home: HomeSlotKey,
+    eligible: bool,
+) {
+    // Caller has already proved every branch arm writes a GC-inert value, so this overwrite
+    // terminates the old allocation root without starting an untracked collectable owner.
+    for root in active.iter_mut() {
+        if root.homes.remove(&home) {
+            record_allocation_root_overwrite(root, index, home, eligible, uses, lifetimes);
+            root.aliases.retain(|alias| {
+                facts
+                    .trusted_temp_home_slot(*alias)
+                    .is_none_or(|alias_home| alias_home != home)
+            });
+        }
+    }
+    active.retain(|root| !root.homes.is_empty());
+}
+
+fn record_allocation_root_overwrite(
+    root: &ActiveAllocationRoot,
+    index: usize,
+    home: HomeSlotKey,
+    eligible: bool,
+    uses: &TempUseEvents,
+    lifetimes: &mut CallRootLifetimeIndices,
+) {
+    if root.escaped
+        && root.eligible
+        && eligible
+        && root
+            .aliases
+            .iter()
+            .all(|alias| !uses.has_live_read_after(*alias, index))
+    {
+        lifetimes.roots.extend(root.def_indices.iter().copied());
+        for def_index in &root.def_indices {
+            lifetimes
+                .root_by_protected
+                .insert(*def_index, root.root_index);
+        }
+        lifetimes
+            .roots_by_overwrite
+            .entry(index)
+            .or_default()
+            .push(CallRootOverwritePair {
+                root_index: root.root_index,
+                home,
+            });
     }
 }
 

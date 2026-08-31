@@ -108,6 +108,83 @@ pub(crate) fn expr_is_discard_safe(expr: &HirExpr) -> bool {
     }
 }
 
+/// 表达式既可删除求值，也不承载必须交给 residual owner 的未解析诊断。
+pub(crate) fn expr_is_discard_safe_without_residual(expr: &HirExpr) -> bool {
+    if !expr_is_discard_safe(expr) {
+        return false;
+    }
+    match expr {
+        HirExpr::Unresolved(_) => false,
+        HirExpr::Unary(unary) => expr_is_discard_safe_without_residual(&unary.expr),
+        HirExpr::Binary(binary) => {
+            expr_is_discard_safe_without_residual(&binary.lhs)
+                && expr_is_discard_safe_without_residual(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_is_discard_safe_without_residual(&logical.lhs)
+                && expr_is_discard_safe_without_residual(&logical.rhs)
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::VarArg => true,
+        HirExpr::GlobalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Call(_)
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_) => false,
+    }
+}
+
+/// 表达式的单值结果是否不会承载可观察的 GC 资源生命周期。
+///
+/// 这个谓词比“可丢弃求值”更窄：`not` 和原始比较的结果恒为 boolean，逻辑表达式
+/// 则可能直接返回任一操作数。String 常量由 chunk 常量表持有，不会因为某个栈槽覆盖
+/// 触发用户可观察的终结行为。LuaJIT 的 Int64/UInt64/Complex 虽由 GCcdata 表示，但
+/// BC_KCDATA 指向 proto 的 KGC 常量且 proto 遍历会持续标记它；Luau vector 同样先由
+/// proto 常量表持有。无论 vector 的宿主表示是内嵌值还是 boxed GC 对象，这些常量的
+/// 存活期都不由某个栈槽是否继续引用决定。
+pub(crate) fn expr_result_is_gc_inert(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. } => true,
+        HirExpr::Unary(_) | HirExpr::Binary(_) => expr_is_discard_safe(expr),
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            expr_result_is_gc_inert(&logical.lhs) && expr_result_is_gc_inert(&logical.rhs)
+        }
+        HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Call(_)
+        | HirExpr::VarArg
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => false,
+    }
+}
+
 /// 表达式是否可以在同一个无副作用逻辑区域内合并重复求值。
 ///
 /// 该谓词不等同于“可丢弃”：它只接纳不会调用元方法、不会读取动态环境、也不会

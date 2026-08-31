@@ -17,7 +17,7 @@ use crate::hir::common::{
     HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLValue, HirLabelId, HirLogicalExpr,
     HirProto, HirStmt, HirUnaryOpKind, LocalId, TempId,
 };
-use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
+use crate::hir::expr_safety::{expr_is_discard_safe_without_residual, expr_is_repeatable};
 
 use super::carried_locals::{CarryBinding, single_binding_copy};
 use super::expr_facts::expr_truthiness;
@@ -230,9 +230,7 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>, discard_facts: &DiscardBounda
             rewritten.push(stmt);
             continue;
         };
-        let selected_then = if expr_is_discard_safe(&if_stmt.cond)
-            && !discard_safe_expr_has_unresolved(&if_stmt.cond)
-        {
+        let selected_then = if expr_is_discard_safe_without_residual(&if_stmt.cond) {
             expr_truthiness(&if_stmt.cond).or_else(|| {
                 if_stmt
                     .else_block
@@ -484,28 +482,10 @@ fn remove_discard_safe_empty_ifs(stmts: &mut Vec<HirStmt>) -> bool {
             stmt,
             HirStmt::If(if_stmt)
                 if if_arms_are_empty(if_stmt)
-                    && expr_is_discard_safe(&if_stmt.cond)
-                    && !discard_safe_expr_has_unresolved(&if_stmt.cond)
+                    && expr_is_discard_safe_without_residual(&if_stmt.cond)
         )
     });
     stmts.len() != original_len
-}
-
-/// `expr_is_discard_safe` 可递归接纳的表达式形状中是否仍携带显式诊断。
-fn discard_safe_expr_has_unresolved(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Unresolved(_) => true,
-        HirExpr::Unary(unary) => discard_safe_expr_has_unresolved(&unary.expr),
-        HirExpr::Binary(binary) => {
-            discard_safe_expr_has_unresolved(&binary.lhs)
-                || discard_safe_expr_has_unresolved(&binary.rhs)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            discard_safe_expr_has_unresolved(&logical.lhs)
-                || discard_safe_expr_has_unresolved(&logical.rhs)
-        }
-        _ => false,
-    }
 }
 
 fn if_arms_are_empty(if_stmt: &HirIf) -> bool {

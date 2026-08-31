@@ -54,6 +54,7 @@ pub(super) struct ProtoBindings {
     pub(super) debug_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
+    pub(super) captured_local_home_slots: Vec<(LocalId, HomeSlotKey)>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) capture_entry_local_decls: Vec<LocalId>,
     pub(super) debug_entry_local_decls: Vec<LocalId>,
@@ -497,6 +498,15 @@ fn lower_proto_one(
         &lowering.bindings.fixed_temps,
         &lowering.bindings.phi_temps,
     );
+    // `entry_local_regs` 是 Entry(reg) 的可见 binding；它与 SSA entry leaf 一样属于
+    // `(reg, epoch 0)`。把这份已知身份带入 simplify，避免异槽 reference capture 被误判
+    // 为可能观察任意 local 写入。后续异槽合并仍会通过 promotion invalidation 使其失效。
+    for (&reg, &local) in &lowering.bindings.entry_local_regs {
+        promotion_facts.record_local_home_slot(local, HomeSlotKey::new(reg.index(), 0));
+    }
+    for &(local, home) in &lowering.bindings.captured_local_home_slots {
+        promotion_facts.record_local_home_slot(local, home);
+    }
     record_loop_binding_local_homes(
         structure.plan(),
         &slot_epochs,

@@ -649,7 +649,7 @@ impl InlineSite {
     ) -> Option<usize> {
         match self {
             Self::Neutral => match policy {
-                InlinePolicy::StableCopy => Some(1),
+                InlinePolicy::StableCopy => Some(options.return_inline_max_complexity),
                 InlinePolicy::AliasInitializerChain => {
                     Some(options.access_base_inline_max_complexity)
                 }
@@ -665,7 +665,7 @@ impl InlineSite {
             },
             Self::ComparisonOperand => Some(options.args_inline_max_complexity),
             Self::ReturnValue => match policy {
-                InlinePolicy::StableCopy => Some(1),
+                InlinePolicy::StableCopy => Some(options.return_inline_max_complexity),
                 InlinePolicy::DirectReturnValue => {
                     if matches!(replacement, AstExpr::TableConstructor(_)) {
                         Some(usize::MAX)
@@ -680,7 +680,7 @@ impl InlineSite {
             Self::ReturnNestedValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArgNonFinal | Self::CallArgFinal => match policy {
-                InlinePolicy::StableCopy => Some(1),
+                InlinePolicy::StableCopy => Some(options.args_inline_max_complexity),
                 InlinePolicy::LoopHeaderCall => Some(usize::MAX),
                 // MechanicalRun 已经证明这一组相邻 local 只服务于同一个消费点；
                 // 这里适度放宽到 return 阈值，让长 lookup 迭代器不会残留成两行脚手架。

@@ -30,7 +30,7 @@ use crate::transformer::{
 
 use super::helpers::decode_raw_string;
 use super::lower::{BoundSlotTarget, ProtoBindings};
-use crate::hir::promotion::SlotEpochFacts;
+use crate::hir::promotion::{HomeSlotKey, SlotEpochFacts};
 
 mod captured_slots;
 mod captured_temps;
@@ -401,6 +401,16 @@ pub(super) fn build_bindings(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    // CapturedSlotKey 与 HomeSlotKey 使用同一 `(reg, close epoch)` 坐标；保留全部 pair，
+    // 若未来一个 local 吸收多个 key，promotion facts 会把它合流成 Conflict。
+    let captured_local_home_slots = captured_slots
+        .slot_targets
+        .iter()
+        .map(|(key, binding)| {
+            let BoundSlotTarget::Local(local) = binding.target;
+            (local, HomeSlotKey::new(key.slot, key.epoch))
+        })
+        .collect();
 
     // 这一层默认只消费 reachable 子图，所以 label/temp 也贴着 shared CFG/Dataflow 的约定。
     let _ = cfg;
@@ -423,6 +433,7 @@ pub(super) fn build_bindings(
         debug_temp_targets,
         captured_temp_targets: captured_temp_facts.targets,
         captured_temp_decl_locals: captured_temp_facts.decl_temps,
+        captured_local_home_slots,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
         capture_entry_local_decls: captured_slots.entry_local_decls,
         debug_entry_local_decls,

@@ -350,23 +350,42 @@ pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
     }
 }
 
-/// A direct local copy or primitive Lua literal has no expression-level work to repeat.
+/// 收集 stable-copy 可以重复读取的声明点快照依赖。
 ///
-/// This is intentionally narrower than [`is_copy_like_expr`].  The latter is used by
-/// run-level heuristics and also accepts dialect-specific literals and lookup-shaped
-/// expressions. Int64/UInt64/Vector/Complex stay excluded because materializing those
-/// can create a cdata/vector value rather than merely load a primitive Lua constant;
-/// non-finite numbers are emitted as division expressions and therefore are not event-free.
-pub(super) fn is_stable_copy_alias_expr(expr: &AstExpr) -> bool {
+/// 这里只接受不会调用元方法、分配对象或读取外部可变状态的表达式。`not` 与短路逻辑只做
+/// truthiness 测试并返回已有操作数；调用方还必须证明这里收集的每个名字在候选之后没有
+/// direct write、也没有被 closure 捕获，才能把声明点求值安全地搬到使用点。
+///
+/// 该集合故意比 [`is_copy_like_expr`] 窄：Int64/UInt64/Vector/Complex 的物化可能创建
+/// cdata/vector，非有限 number 会渲染成除法，算术/比较和除 `not` 外的一元运算都可能
+/// 触发元方法。
+pub(super) fn collect_stable_copy_snapshot_names(
+    expr: &AstExpr,
+    names: &mut BTreeSet<AstNameRef>,
+) -> bool {
     match expr {
         AstExpr::Number(value) => value.is_finite(),
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::String(_)
-        | AstExpr::Var(AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_)) => true,
+        AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_) | AstExpr::String(_) => true,
+        AstExpr::Var(
+            name @ (AstNameRef::Param(_) | AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_)),
+        ) => {
+            names.insert(name.clone());
+            true
+        }
+        AstExpr::SingleValue(expr) => collect_stable_copy_snapshot_names(expr, names),
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
+            collect_stable_copy_snapshot_names(&unary.expr, names)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            collect_stable_copy_snapshot_names(&logical.lhs, names)
+                && collect_stable_copy_snapshot_names(&logical.rhs, names)
+        }
         _ => false,
     }
+}
+
+pub(super) fn is_stable_copy_alias_expr(expr: &AstExpr) -> bool {
+    collect_stable_copy_snapshot_names(expr, &mut BTreeSet::new())
 }
 
 pub(super) fn is_discard_safe_expr(expr: &AstExpr) -> bool {

@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, ParamId, TempId};
-use crate::hir::expr_safety::expr_is_discard_safe;
+use crate::hir::expr_safety::{expr_is_discard_safe, expr_result_is_gc_inert};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::stmts_reference_captured_bindings;
@@ -177,36 +177,6 @@ fn dead_write_value_is_gc_inert(stmt: &HirStmt) -> bool {
         return false;
     };
     expr_result_is_gc_inert(value)
-}
-
-fn expr_result_is_gc_inert(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_) => true,
-        HirExpr::Unary(_) | HirExpr::Binary(_) => expr_is_discard_safe(expr),
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_result_is_gc_inert(&logical.lhs) && expr_result_is_gc_inert(&logical.rhs)
-        }
-        HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Decision(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => false,
-    }
 }
 
 struct DeadTempPass<'a> {

@@ -13,7 +13,8 @@
 //! - repeat body 的 use index 把 until 条件计作尾随表达式，不删除仍对条件可见的 local
 //! - 多值 return 顶层只收回 context-safe 或已证明为单值布尔比较的唯一 alias；可变快照仍通过求值前缀证明
 //! - 单值 return 短路树只收回最左、必达位置的布尔比较 alias；右臂仍保留原 binding
-//! - 稳定 local copy 可跨越无关语句收回到全部后续 use；primitive 多 use 仍只在同一 owner 内替换，避免跨业务语句复制概念值
+//! - 稳定 local copy 与无事件 truthiness 快照可跨越无关语句收回；复合/primitive 多 use
+//!   仍只在同一 owner 内替换，避免跨业务语句复制概念值
 //! - 完整 call-alias run 先于单项相邻内联取得所有权；run 拒绝后，单项规则仍可消费局部安全形状
 
 mod candidate;
@@ -46,6 +47,7 @@ use super::binding_tree::{
     stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
     stmt_has_nested_binding_value_use, stmt_stores_binding_in_table,
 };
+use super::expr_analysis::collect_stable_copy_snapshot_names;
 use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
 use super::visit::AstVisitor;
 use super::walk::{self, AstRewritePass, BlockKind};
@@ -70,6 +72,7 @@ struct InlineExprsPass {
 #[derive(Default)]
 struct BindingWriteIndex {
     write_bounds_by_binding: BTreeMap<AstBindingRef, (usize, usize)>,
+    write_bounds_by_name: BTreeMap<AstNameRef, (usize, usize)>,
     direct_write_names_by_stmt: Vec<BTreeSet<AstNameRef>>,
 }
 
@@ -77,6 +80,7 @@ impl BindingWriteIndex {
     fn for_stmts(stmts: &[AstStmt]) -> Self {
         let mut index = Self {
             write_bounds_by_binding: BTreeMap::new(),
+            write_bounds_by_name: BTreeMap::new(),
             direct_write_names_by_stmt: vec![BTreeSet::new(); stmts.len()],
         };
         for (stmt_index, stmt) in stmts.iter().enumerate() {
@@ -98,6 +102,10 @@ impl BindingWriteIndex {
 
     fn record_name(&mut self, stmt_index: usize, name: &AstNameRef) {
         self.direct_write_names_by_stmt[stmt_index].insert(name.clone());
+        self.write_bounds_by_name
+            .entry(name.clone())
+            .and_modify(|bounds| bounds.1 = stmt_index)
+            .or_insert((stmt_index, stmt_index));
         if let Some(binding) = binding_from_name_ref(name) {
             self.record(stmt_index, binding);
         }
@@ -112,6 +120,12 @@ impl BindingWriteIndex {
     fn has_write_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
         self.write_bounds_by_binding
             .get(&binding)
+            .is_some_and(|(_, last_write)| *last_write > stmt_index)
+    }
+
+    fn name_has_write_after(&self, stmt_index: usize, name: &AstNameRef) -> bool {
+        self.write_bounds_by_name
+            .get(name)
             .is_some_and(|(_, last_write)| *last_write > stmt_index)
     }
 
@@ -421,14 +435,14 @@ fn rewrite_current_block(
     changed
 }
 
-/// 收回跨越无关语句的直接 local copy。
+/// 收回跨越无关语句的稳定 local copy 与无事件 truthiness 快照。
 ///
 /// 这条规则与相邻表达式内联故意分开：相邻规则可以凭 sink 形状证明调用/lookup 的
-/// 求值前缀，而这里只接受 `local alias = source`。source 在候选声明之前已经声明、
-/// 候选之后没有任何 direct write，也没有 closure capture；因此把同一语句内的全部后续
-/// 读取改回 source 只改变 binding 名；primitive literal 则没有求值事件。
-/// repeat 的精确 trailing handoff 允许 source 在 use 后写入，因为 target 会接管 root
-/// 直到 `until` 条件；两条路径都不改变调用顺序或对象存活期。
+/// 求值前缀，而这里只接受 local/param、primitive 以及由它们组成的 `not` / `and` / `or`。
+/// 复合快照的所有依赖在候选之后没有 direct write 或 closure capture，因此 use 点重复读取
+/// 不改变值；若逻辑结果是 collectable，未改写的 source binding 也会继续持有同一 root。
+/// 直接 local copy 另有精确 repeat trailing handoff：source 在 use 后写入时由 target 接管
+/// root 直到 `until` 条件。两条路径都不改变调用顺序或对象存活期。
 fn collapse_stable_copy_aliases(
     block: &mut AstBlock,
     options: ReadabilityOptions,
@@ -450,12 +464,24 @@ fn collapse_stable_copy_aliases(
             // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted 会改变 debug.getlocal 可观察的作用域（regress_351）；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 若在 use 后仍处于原词法作用域，会延后弱表消失或 `__gc`。
             continue;
         }
-        if !candidate.allows_expr_with_policy(value, InlinePolicy::StableCopy) {
-            // 候选拒绝[ProofIncomplete]：stable-copy 当前只证明变量与 primitive literal，尚未按纯度扩展其它事件为空的表达式。
+        let mut snapshot_names = BTreeSet::new();
+        if !candidate.allows_expr_with_policy(value, InlinePolicy::StableCopy)
+            || !collect_stable_copy_snapshot_names(value, &mut snapshot_names)
+        {
+            // 候选拒绝[SemanticBarrier:EvalTime/EvalCount/ValueArity/Metamethod/Lifetime]：带可观察调用、lookup、元方法、vararg 或分配的输入搬到 use 会改变次数、快照、值宽度、对象身份或 root 生命周期（regress_387）；候选拒绝[ProofIncomplete]：该形状 guard 仍 blanket 覆盖稳定 global/upvalue、已知 primitive 运算、非有限 number 与 Int64/UInt64/Vector/Complex，当前缺外部写入、操作数类型及目标方言物化事实；候选拒绝[LayerBoundary]：残留 Temp/Error 分别归 HIR/materialize 与错误输出 owner。
             continue;
         }
         if mutable_snapshots.contains(&candidate.binding().to_name_ref()) {
             // 候选拒绝[SemanticBarrier:EvalOrder]：captured/mutable snapshot 的值可能被中间调用改写，直接替换会读取新值。
+            continue;
+        }
+        if !matches!(value, AstExpr::Var(_))
+            && snapshot_names.iter().any(|name| {
+                mutable_snapshots.contains(name)
+                    || write_index.name_has_write_after(candidate_index, name)
+            })
+        {
+            // 候选拒绝[ProofIncomplete]：当前用 suffix-wide write/capture 保证复合快照稳定，尚不能区分最后 use 后的无关写或不会改写的 closure；声明到 use 之间的改写会从 use 点读到新值（regress_387）。
             continue;
         }
 
@@ -535,7 +561,8 @@ fn collapse_stable_copy_aliases(
         });
         if all_rewritten {
             // 候选接受：所有顶层 owner 都已在副本中完整替换且没有 residual use；统一写回
-            // 后再删除 recovered 声明，primitive/local copy 的求值与 root owner 均未移动。
+            // 后再删除 recovered 声明；primitive/local 与稳定 truthiness 快照的值和 root
+            // 均由未改写依赖保持，且没有求值事件被移动。
             for (use_stmt_index, rewritten_stmt) in rewritten_stmts {
                 stmts[use_stmt_index] = rewritten_stmt;
             }
@@ -564,9 +591,12 @@ fn stable_copy_has_trailing_root_handoff(
     if stmts
         .iter()
         .any(super::control_flow::stmt_contains_label_or_goto)
-        || !write_index.writes_start_after(use_stmt_index, source)
     {
-        // 候选拒绝[SemanticBarrier:ControlFlow/EvalOrder]：goto 可绕过 handoff；source 若非只在 handoff 后写入，alias 与 source 在 use 点不保证同值。
+        // 候选拒绝[ProofIncomplete]：当前 AST write index 没有 CFG 可达性，不能区分无关 goto 与可绕过或重入 handoff 的路径。
+        return false;
+    }
+    if !write_index.writes_start_after(use_stmt_index, source) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：source 若非只在 handoff 后写入，alias 与 source 在 use 点不保证同值。
         return false;
     }
     let AstStmt::Assign(assign) = &stmts[use_stmt_index] else {
@@ -584,10 +614,6 @@ fn stable_copy_has_trailing_root_handoff(
         // 候选拒绝[ProofIncomplete]：只有 `target = candidate` 的直接接管形状纳入当前证明。
         return false;
     };
-    if target == source {
-        // 候选拒绝[ProofIncomplete]：同 binding 回写不是当前“新 target 接管旧 root”证明的形状。
-        return false;
-    }
     if mutable_snapshots.contains(&target.to_name_ref()) {
         // 候选拒绝[SemanticBarrier:Capture]：target 被 closure 捕获时，接管前后的 binding 写入可被观察。
         return false;
