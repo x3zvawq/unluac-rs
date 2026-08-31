@@ -661,6 +661,7 @@ fn collapse_stable_copy_aliases(
             continue;
         }
 
+        let mut trailing_root_handoff = None;
         if let AstExpr::Var(source_name) = value {
             match source_name {
                 AstNameRef::Param(_) => {
@@ -676,17 +677,23 @@ fn collapse_stable_copy_aliases(
                         .expect("local-like name must have an AST binding identity");
                     // A bound local/synthetic name can only appear while its lexical declaration
                     // is active, so the AST binding identity itself supplies the dominance proof.
+                    if write_index.has_write_after(candidate_index, source_binding) {
+                        trailing_root_handoff = (use_stmt_indices.len() == 1)
+                            .then(|| {
+                                stable_copy_trailing_root_handoff(
+                                    &stmts,
+                                    trailing_condition,
+                                    &write_index,
+                                    mutable_snapshots,
+                                    candidate_index,
+                                    use_stmt_indices[0],
+                                    source_binding,
+                                )
+                            })
+                            .flatten();
+                    }
                     if write_index.has_write_after(candidate_index, source_binding)
-                        && (use_stmt_indices.len() != 1
-                            || !stable_copy_has_trailing_root_handoff(
-                                &stmts,
-                                trailing_condition,
-                                &write_index,
-                                mutable_snapshots,
-                                candidate_index,
-                                use_stmt_indices[0],
-                                source_binding,
-                            ))
+                        && trailing_root_handoff.is_none()
                     {
                         // 候选拒绝[SemanticBarrier:EvalOrder]：source 写入会让 alias 保存旧快照；
                         // 候选拒绝[SemanticBarrier:Lifetime]：旧值若是对象，alias 还保存旧 root。
@@ -704,15 +711,26 @@ fn collapse_stable_copy_aliases(
         let mut rewritten_stmts = Vec::with_capacity(use_stmt_indices.len());
         let all_rewritten = use_stmt_indices.iter().all(|use_stmt_index| {
             let mut rewritten_stmt = stmts[*use_stmt_index].clone();
-            if !rewrite_stmt_use_sites_with_policy(
+            let rewritten = trailing_root_handoff.as_ref().is_some_and(|handoff| {
+                handoff.structured
+                    && handoff.use_stmt_index == *use_stmt_index
+                    && rewrite_structured_handoff_stmt(
+                        &mut rewritten_stmt,
+                        candidate.binding(),
+                        &replacement,
+                        &handoff.target,
+                    )
+            }) || rewrite_stmt_use_sites_with_policy(
                 &mut rewritten_stmt,
                 candidate,
                 &replacement,
                 options,
                 InlinePolicy::StableCopy,
-            ) || BindingUseIndex::for_stmts(std::slice::from_ref(&rewritten_stmt))
-                .count_uses_in_suffix(0, candidate.binding())
-                != 0
+            );
+            if !rewritten
+                || BindingUseIndex::for_stmts(std::slice::from_ref(&rewritten_stmt))
+                    .count_uses_in_suffix(0, candidate.binding())
+                    != 0
             {
                 return false;
             }
@@ -739,7 +757,13 @@ fn collapse_stable_copy_aliases(
     changed
 }
 
-fn stable_copy_has_trailing_root_handoff(
+struct StableCopyRootHandoff {
+    use_stmt_index: usize,
+    target: AstNameRef,
+    structured: bool,
+}
+
+fn stable_copy_trailing_root_handoff(
     stmts: &[AstStmt],
     trailing_condition: Option<&AstExpr>,
     write_index: &BindingWriteIndex,
@@ -747,97 +771,61 @@ fn stable_copy_has_trailing_root_handoff(
     candidate_index: usize,
     use_stmt_index: usize,
     source: AstBindingRef,
-) -> bool {
+) -> Option<StableCopyRootHandoff> {
     let candidate = inline_candidate(&stmts[candidate_index])
         .expect("planned stable-copy handoff must retain its candidate declaration")
         .0
         .binding();
-    let goto_index = super::control_flow::BlockGotoIndex::new(stmts);
-    if goto_index.has_external_entry(candidate_index, use_stmt_index + 1) {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：区间外 goto 若从 alias 声明后或
-        // handoff 后重入，会绕过 snapshot 初始化或用更新后的 source 重走接管。
-        return false;
-    }
-    if stmts[candidate_index..=use_stmt_index]
-        .iter()
-        .any(super::control_flow::stmt_contains_label_or_goto)
-    {
-        // 候选拒绝[LayerBoundary]：handoff 区间内部的 goto 出口/回边需要 CFG
-        // path owner 证明每条到 source write 的路径都先执行接管；区间外封闭 goto 不阻塞。
-        return false;
-    }
     if !write_index.writes_start_after(use_stmt_index, source) {
         // 候选拒绝[SemanticBarrier:EvalOrder]：source 若非只在 handoff 后写入，alias 与 source 在 use 点不保证同值。
-        return false;
+        return None;
     }
-    let target = match &stmts[use_stmt_index] {
+    let (target, structured) = match &stmts[use_stmt_index] {
         AstStmt::Assign(assign) => {
-            let Some(value_index) = direct_candidate_value_index(&assign.values, candidate) else {
+            let Some(target) = direct_assign_handoff_target(assign, candidate) else {
                 // 候选拒绝[SemanticBarrier:Lifetime]：candidate 只作为 nested value 使用时，
                 // call/constructor/table store 不保证在 source 覆盖后继续持有同一强 root。
-                return false;
+                return None;
             };
-            let Some(AstLValue::Name(target)) = assign.targets.get(value_index) else {
-                // 候选拒绝[SemanticBarrier:Lifetime]：被丢弃的 RHS 或 field/index target
-                // 不提供无元方法、可追踪到 repeat latch 的 binding root。
-                return false;
-            };
-            if assign
-                .targets
-                .iter()
-                .filter(|other| matches!(other, AstLValue::Name(name) if name == target))
-                .count()
-                != 1
-            {
-                // 候选拒绝[SemanticBarrier:EvalOrder]：同一 target 在并行赋值中再次出现时，
-                // 后续 store 可能覆盖刚接管的旧 root。
-                return false;
-            }
-            target.clone()
+            (target, false)
         }
         AstStmt::LocalDecl(local_decl) => {
-            let Some(value_index) = direct_candidate_value_index(&local_decl.values, candidate)
-            else {
+            let Some(target) = direct_local_handoff_target(local_decl, candidate) else {
                 // 候选拒绝[SemanticBarrier:Lifetime]：nested initializer 不等同于把旧值
                 // 直接交给一个可追踪至 latch 的 local binding。
-                return false;
+                return None;
             };
-            let Some(target) = local_decl.bindings.get(value_index) else {
-                // 候选拒绝[SemanticBarrier:Lifetime]：超过 binding 宽度的 initializer
-                // 会被丢弃，不能承接旧 root。
-                return false;
-            };
-            target.id.to_name_ref()
+            (target, false)
         }
+        AstStmt::If(if_stmt) => (structured_if_handoff_target(if_stmt, candidate)?, true),
         AstStmt::GlobalDecl(_) => {
             // 候选拒绝[SemanticBarrier:Metamethod]：global declaration/store 可经 _ENV
             // __newindex 截获而不保存值，不能充当强 root handoff。
-            return false;
+            return None;
         }
         AstStmt::Return(_) => {
             // 候选忽略[NotApplicable]：合法 AST block 的 return 是终结语句，不会同时
             // 满足“同一 block 内 source 在其后写入”的 handoff 入口条件。
-            return false;
+            return None;
         }
-        AstStmt::If(_)
-        | AstStmt::While(_)
+        AstStmt::While(_)
         | AstStmt::Repeat(_)
         | AstStmt::NumericFor(_)
         | AstStmt::GenericFor(_)
         | AstStmt::DoBlock(_) => {
-            // 候选拒绝[LayerBoundary]：branch/loop 内部的终结 handoff 需要 CFG path
-            // owner 证明每条 source-write 路径都先建立同一 carrier。
-            return false;
+            // 候选拒绝[LayerBoundary]：loop/do 内部 handoff 需要其迭代/作用域 owner；本规则
+            // 只拥有 block CFG 与逐分支终结证明完整的 structured If。
+            return None;
         }
         AstStmt::CallStmt(_) => {
             // 候选拒绝[SemanticBarrier:Lifetime]：callee 不保证保存参数强 root；调用返回后
             // 覆盖 source 时，原 alias 仍存活而实参可能已经失活。
-            return false;
+            return None;
         }
         AstStmt::FunctionDecl(_) | AstStmt::LocalFunctionDecl(_) => {
             // 候选拒绝[SemanticBarrier:Capture]：把 closure capture 从 snapshot binding 改为
             // source binding 后，后续 source write 会改变 closure 观察值。
-            return false;
+            return None;
         }
         AstStmt::Break
         | AstStmt::Continue
@@ -851,12 +839,12 @@ fn stable_copy_has_trailing_root_handoff(
         AstNameRef::Global(_) => {
             // 候选拒绝[SemanticBarrier:Metamethod]：global store 可经 _ENV.__newindex
             // 截获而不保存值，不能充当强 root handoff。
-            return false;
+            return None;
         }
         AstNameRef::Upvalue(_) => {
             // 候选拒绝[LayerBoundary]：AST 没有父函数及 sibling closure 的 upvalue write
             // provenance，无法证明 carrier 在 latch 前不被外部路径覆盖。
-            return false;
+            return None;
         }
         AstNameRef::Param(_)
         | AstNameRef::Local(_)
@@ -865,15 +853,46 @@ fn stable_copy_has_trailing_root_handoff(
     }
     if mutable_snapshots.contains(&target) {
         // 候选拒绝[SemanticBarrier:Capture]：target 被 closure 捕获时，接管前后的 binding 写入可被观察。
-        return false;
+        return None;
+    }
+    let local_like_target = binding_from_name_ref(&target).is_some();
+    if structured && !local_like_target {
+        return None;
+    }
+    if local_like_target {
+        let cfg = super::control_flow::RepeatBodyControlFlow::new(stmts)?;
+        if !cfg.dominates(candidate_index, use_stmt_index)
+            || !cfg.dominates(use_stmt_index, cfg.exit())
+            || ((use_stmt_index + 1)..stmts.len())
+                .filter(|stmt_index| {
+                    write_index.stmt_directly_writes_name(*stmt_index, &source.to_name_ref())
+                })
+                .any(|write_stmt_index| !cfg.dominates(use_stmt_index, write_stmt_index))
+        {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：goto 可绕过 alias 初始化或 handoff，
+            // 使 source 覆盖/latch 路径重读新值或失去旧 root；block CFG 必须证明双重支配。
+            return None;
+        }
+    } else {
+        let goto_index = super::control_flow::BlockGotoIndex::new(stmts);
+        if goto_index.has_external_entry(candidate_index, use_stmt_index + 1)
+            || stmts[candidate_index..=use_stmt_index]
+                .iter()
+                .any(super::control_flow::stmt_contains_label_or_goto)
+        {
+            // Param carriers retain the pre-existing lexical interval proof: without a
+            // binding identity, neither an internal edge nor an external entry may bypass
+            // snapshot initialization or the handoff.
+            return None;
+        }
     }
     if write_index.name_has_write_after(use_stmt_index, &target) {
         // 候选拒绝[SemanticBarrier:EvalOrder]：target 在 latch 前再次写入时不能继续承载同一快照/root。
-        return false;
+        return None;
     }
     let Some(condition) = trailing_condition else {
         // 候选拒绝[LayerBoundary]：没有 repeat trailing condition 时不属于此 handoff 规则。
-        return false;
+        return None;
     };
     let condition_references_target = binding_from_name_ref(&target).map_or_else(
         || condition_references_param(condition, &target),
@@ -882,15 +901,217 @@ fn stable_copy_has_trailing_root_handoff(
     if !condition_references_target {
         // 候选拒绝[LayerBoundary]：cleanup 会继续删除 dead target；只有 latch 读取才能在
         // 当前 pass 组合中保证 carrier 持有旧 root 到 repeat 尾端。
-        return false;
+        return None;
     }
-    true
+    Some(StableCopyRootHandoff {
+        use_stmt_index,
+        target,
+        structured,
+    })
 }
 
-fn direct_candidate_value_index(values: &[AstExpr], candidate: AstBindingRef) -> Option<usize> {
-    values
+#[derive(Clone, Eq, PartialEq)]
+enum StructuredHandoffState {
+    Pending,
+    HandedOff(AstNameRef),
+}
+
+fn structured_if_handoff_target(
+    if_stmt: &super::super::common::AstIf,
+    candidate: AstBindingRef,
+) -> Option<AstNameRef> {
+    if super::control_flow::block_contains_label_or_goto(&if_stmt.then_block)
+        || if_stmt
+            .else_block
+            .as_ref()
+            .is_some_and(super::control_flow::block_contains_label_or_goto)
+    {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：top-level CFG 只能证明 structured owner
+        // 整体支配；外部 goto 可进入内部 label 并绕过 owner 内的 handoff。
+        return None;
+    }
+    let mut outcomes = structured_handoff_block_outcomes(
+        &if_stmt.then_block,
+        candidate,
+        StructuredHandoffState::Pending,
+    )?;
+    if let Some(else_block) = &if_stmt.else_block {
+        outcomes.extend(structured_handoff_block_outcomes(
+            else_block,
+            candidate,
+            StructuredHandoffState::Pending,
+        )?);
+    } else {
+        outcomes.push(StructuredHandoffState::Pending);
+    }
+    let mut targets = outcomes.into_iter().map(|state| match state {
+        StructuredHandoffState::Pending => None,
+        StructuredHandoffState::HandedOff(target) => Some(target),
+    });
+    let target = targets.next().flatten()?;
+    targets
+        .all(|other| other.as_ref() == Some(&target))
+        .then_some(target)
+}
+
+fn structured_handoff_block_outcomes(
+    block: &AstBlock,
+    candidate: AstBindingRef,
+    initial: StructuredHandoffState,
+) -> Option<Vec<StructuredHandoffState>> {
+    let mut states = vec![initial];
+    for stmt in &block.stmts {
+        let mut next = Vec::new();
+        for state in states {
+            structured_handoff_stmt_outcomes(stmt, candidate, state, &mut next)?;
+        }
+        states = dedup_handoff_states(next);
+        if states.is_empty() {
+            break;
+        }
+    }
+    Some(states)
+}
+
+fn structured_handoff_stmt_outcomes(
+    stmt: &AstStmt,
+    candidate: AstBindingRef,
+    state: StructuredHandoffState,
+    outcomes: &mut Vec<StructuredHandoffState>,
+) -> Option<()> {
+    if let Some(target) = direct_handoff_target(stmt, candidate) {
+        if state != StructuredHandoffState::Pending {
+            return None;
+        }
+        outcomes.push(StructuredHandoffState::HandedOff(target));
+        return Some(());
+    }
+    if BindingUseIndex::for_stmts(std::slice::from_ref(stmt)).count_uses_in_suffix(0, candidate)
+        != 0
+    {
+        return None;
+    }
+    if let StructuredHandoffState::HandedOff(target) = &state
+        && BindingWriteIndex::for_stmts(std::slice::from_ref(stmt))
+            .stmt_directly_writes_name(0, target)
+    {
+        return None;
+    }
+    match stmt {
+        AstStmt::If(if_stmt) => {
+            outcomes.extend(structured_handoff_block_outcomes(
+                &if_stmt.then_block,
+                candidate,
+                state.clone(),
+            )?);
+            if let Some(else_block) = &if_stmt.else_block {
+                outcomes.extend(structured_handoff_block_outcomes(
+                    else_block, candidate, state,
+                )?);
+            } else {
+                outcomes.push(state);
+            }
+        }
+        AstStmt::Return(_) | AstStmt::Break => {}
+        AstStmt::Continue if matches!(state, StructuredHandoffState::HandedOff(_)) => {}
+        AstStmt::Continue | AstStmt::Goto(_) => return None,
+        _ => outcomes.push(state),
+    }
+    Some(())
+}
+
+fn dedup_handoff_states(states: Vec<StructuredHandoffState>) -> Vec<StructuredHandoffState> {
+    states.into_iter().fold(Vec::new(), |mut unique, state| {
+        if !unique.contains(&state) {
+            unique.push(state);
+        }
+        unique
+    })
+}
+
+fn direct_handoff_target(stmt: &AstStmt, candidate: AstBindingRef) -> Option<AstNameRef> {
+    match stmt {
+        AstStmt::Assign(assign) => direct_assign_handoff_target(assign, candidate),
+        AstStmt::LocalDecl(local_decl) => direct_local_handoff_target(local_decl, candidate),
+        _ => None,
+    }
+}
+
+fn direct_assign_handoff_target(
+    assign: &super::super::common::AstAssign,
+    candidate: AstBindingRef,
+) -> Option<AstNameRef> {
+    let value_index = unique_direct_candidate_value_index(&assign.values, candidate)?;
+    let AstLValue::Name(target) = assign.targets.get(value_index)? else {
+        return None;
+    };
+    (assign
+        .targets
         .iter()
-        .position(|value| matches!(value, AstExpr::Var(name) if candidate.matches_name_ref(name)))
+        .filter(|other| matches!(other, AstLValue::Name(name) if name == target))
+        .count()
+        == 1)
+        .then(|| target.clone())
+}
+
+fn direct_local_handoff_target(
+    local_decl: &super::super::common::AstLocalDecl,
+    candidate: AstBindingRef,
+) -> Option<AstNameRef> {
+    let value_index = unique_direct_candidate_value_index(&local_decl.values, candidate)?;
+    Some(local_decl.bindings.get(value_index)?.id.to_name_ref())
+}
+
+fn unique_direct_candidate_value_index(
+    values: &[AstExpr],
+    candidate: AstBindingRef,
+) -> Option<usize> {
+    let mut indices = values.iter().enumerate().filter_map(|(index, value)| {
+        matches!(value, AstExpr::Var(name) if candidate.matches_name_ref(name)).then_some(index)
+    });
+    let index = indices.next()?;
+    indices.next().is_none().then_some(index)
+}
+
+fn rewrite_structured_handoff_stmt(
+    stmt: &mut AstStmt,
+    candidate: AstBindingRef,
+    replacement: &AstExpr,
+    target: &AstNameRef,
+) -> bool {
+    if direct_handoff_target(stmt, candidate).as_ref() == Some(target) {
+        let values = match stmt {
+            AstStmt::Assign(assign) => &mut assign.values,
+            AstStmt::LocalDecl(local_decl) => &mut local_decl.values,
+            _ => unreachable!("direct handoff target requires assignment-like statement"),
+        };
+        let index = unique_direct_candidate_value_index(values, candidate)
+            .expect("validated handoff must retain its unique candidate value");
+        values[index] = replacement.clone();
+        return true;
+    }
+    let AstStmt::If(if_stmt) = stmt else {
+        return false;
+    };
+    let mut changed =
+        rewrite_structured_handoff_block(&mut if_stmt.then_block, candidate, replacement, target);
+    if let Some(else_block) = &mut if_stmt.else_block {
+        changed |= rewrite_structured_handoff_block(else_block, candidate, replacement, target);
+    }
+    changed
+}
+
+fn rewrite_structured_handoff_block(
+    block: &mut AstBlock,
+    candidate: AstBindingRef,
+    replacement: &AstExpr,
+    target: &AstNameRef,
+) -> bool {
+    let mut changed = false;
+    for stmt in &mut block.stmts {
+        changed |= rewrite_structured_handoff_stmt(stmt, candidate, replacement, target);
+    }
+    changed
 }
 
 fn condition_references_param(condition: &AstExpr, target: &AstNameRef) -> bool {
@@ -960,9 +1181,9 @@ mod tests {
 
     use crate::ast::common::{
         AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstCallStmt,
-        AstFieldAccess, AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLocalAttr,
-        AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstLogicalExpr, AstNameRef, AstReturn,
-        AstWhile,
+        AstFieldAccess, AstFunctionExpr, AstGlobalName, AstGoto, AstIf, AstIndexAccess, AstLabel,
+        AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstLogicalExpr,
+        AstNameRef, AstReturn, AstWhile,
     };
     use crate::decompile::DecompileDialect;
     use crate::hir::{HirProtoRef, LocalId, ParamId};
@@ -1031,6 +1252,21 @@ mod tests {
             args: vec![arg],
             method_name: None,
         }))
+    }
+
+    fn assign_name(target: AstBindingRef, value: AstExpr) -> AstStmt {
+        AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![AstLValue::Name(target.to_name_ref())],
+            values: vec![value],
+        }))
+    }
+
+    fn goto(target: AstLabelId) -> AstStmt {
+        AstStmt::Goto(Box::new(AstGoto { target }))
+    }
+
+    fn label(id: AstLabelId) -> AstStmt {
+        AstStmt::Label(Box::new(AstLabel { id }))
     }
 
     #[test]
@@ -1148,6 +1384,190 @@ mod tests {
                     if call.args == vec![AstExpr::Var(source.to_name_ref())])
                     && ret.values == vec![AstExpr::Var(source.to_name_ref())]
         ));
+    }
+
+    #[test]
+    fn stable_copy_handoff_follows_a_dominated_forward_goto() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let join = AstLabelId(0);
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                goto(join),
+                call_with_arg("dead", AstExpr::Integer(0)),
+                label(join),
+                assign_name(target, AstExpr::Var(snapshot.to_name_ref())),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&condition),
+        ));
+        assert!(matches!(
+            &block.stmts[5],
+            AstStmt::Assign(assign)
+                if assign.values == vec![AstExpr::Var(source.to_name_ref())]
+        ));
+    }
+
+    #[test]
+    fn stable_copy_handoff_rejects_a_goto_that_bypasses_the_carrier() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let join = AstLabelId(0);
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                    then_block: AstBlock {
+                        stmts: vec![goto(join)],
+                    },
+                    else_block: None,
+                })),
+                assign_name(target, AstExpr::Var(snapshot.to_name_ref())),
+                label(join),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let original = block.clone();
+        let condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&condition),
+        ));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn stable_copy_handoff_accepts_if_when_unhanded_paths_terminate() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                    then_block: AstBlock {
+                        stmts: vec![assign_name(target, AstExpr::Var(snapshot.to_name_ref()))],
+                    },
+                    else_block: Some(AstBlock {
+                        stmts: vec![return_values(Vec::new())],
+                    }),
+                })),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&condition),
+        ));
+        let AstStmt::If(if_stmt) = &block.stmts[2] else {
+            panic!("stable-copy handoff must retain the structured owner")
+        };
+        assert!(matches!(
+            if_stmt.then_block.stmts.as_slice(),
+            [AstStmt::Assign(assign)]
+                if assign.values == vec![AstExpr::Var(source.to_name_ref())]
+        ));
+    }
+
+    #[test]
+    fn stable_copy_handoff_rejects_if_with_an_unhanded_fallthrough() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                    then_block: AstBlock {
+                        stmts: vec![assign_name(target, AstExpr::Var(snapshot.to_name_ref()))],
+                    },
+                    else_block: None,
+                })),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let original = block.clone();
+        let condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&condition),
+        ));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn stable_copy_handoff_rejects_external_entry_after_an_internal_handoff() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let internal = AstLabelId(0);
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                goto(internal),
+                AstStmt::If(Box::new(AstIf {
+                    cond: AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                    then_block: AstBlock {
+                        stmts: vec![
+                            assign_name(target, AstExpr::Var(snapshot.to_name_ref())),
+                            label(internal),
+                        ],
+                    },
+                    else_block: Some(AstBlock {
+                        stmts: vec![return_values(Vec::new())],
+                    }),
+                })),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let original = block.clone();
+        let condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&condition),
+        ));
+        assert_eq!(block, original);
     }
 
     #[test]

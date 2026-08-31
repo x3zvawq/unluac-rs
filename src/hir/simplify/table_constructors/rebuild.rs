@@ -752,8 +752,8 @@ fn preserve_producer_source(
             return None;
         }
         ProducerSourcePreservation::UnsupportedShape => {
-            // 候选拒绝[ProofIncomplete]：多槽声明或无事件 alias 值需要整句逐槽
-            // preserve/remove 与 root facts；owner 是 producer source preservation plan。
+            // 候选拒绝[LayerBoundary]：scanner 已把逐槽 primitive/vararg、snapshot 与
+            // allocation 分流；这里只剩 residual owner 必须原样保留的 Unresolved。
             return None;
         }
     }

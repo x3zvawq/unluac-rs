@@ -75,6 +75,11 @@ fn inline_constructor_value_inner(
             .and_then(|producer_index| *producer_index)
     {
         let producer = &context.pending_producers[producer_index];
+        if producer.source_preservation == ProducerSourcePreservation::UnsupportedShape {
+            // 候选拒绝[LayerBoundary]：scanner 已把逐槽 primitive/vararg、snapshot 与
+            // allocation 分流；这里只剩 residual owner 必须原样保留的 Unresolved。
+            return None;
+        }
         if context.remaining_uses.contains(producer.binding_id) {
             match producer.source_preservation {
                 ProducerSourcePreservation::Safe => {}
@@ -90,9 +95,7 @@ fn inline_constructor_value_inner(
                     return None;
                 }
                 ProducerSourcePreservation::UnsupportedShape => {
-                    // 候选拒绝[ProofIncomplete]：多槽声明或无事件 alias 尚缺整句逐槽
-                    // preserve/remove 与 root facts；owner 是 producer source preservation plan。
-                    return None;
+                    unreachable!("unsupported producer must stay with the residual owner")
                 }
             }
         }
@@ -457,7 +460,7 @@ mod tests {
     use crate::hir::common::{
         HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirDecisionExpr, HirDecisionNode,
         HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirLocalDecl, HirProtoRef, HirStmt,
-        HirTableConstructor, HirTableField, HirValuePack, LocalId,
+        HirTableConstructor, HirTableField, HirUnresolvedExpr, HirValuePack, LocalId,
     };
     use crate::hir::promotion::ProtoPromotionFacts;
 
@@ -646,6 +649,39 @@ mod tests {
         }));
 
         assert_eq!(inline_constructor_value(&mut context, &value), None);
+        assert_eq!(consumed, vec![false]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn unresolved_producer_stays_with_the_residual_owner() {
+        let (mut block, binding_index, occurrence_index, mut producers, producer_map) =
+            inline_context_fixture();
+        let HirStmt::LocalDecl(decl) = &mut block.stmts[0] else {
+            unreachable!("fixture producer must be a local declaration")
+        };
+        decl.values.fixed[0] = HirExpr::Unresolved(Box::new(HirUnresolvedExpr {
+            summary: "residual".into(),
+        }));
+        producers[0].source_preservation = ProducerSourcePreservation::UnsupportedShape;
+        let mut consumed = vec![false];
+        let mut events = Vec::new();
+        let mut context = InlineContext::new(
+            &block,
+            &binding_index,
+            &producers,
+            &producer_map,
+            InlineRewriteState {
+                consumed_bindings: &mut consumed,
+                eval_events: &mut events,
+            },
+            occurrence_index.remaining_uses_after(0),
+        );
+
+        assert_eq!(
+            inline_constructor_value(&mut context, &HirExpr::LocalRef(LocalId(0))),
+            None
+        );
         assert_eq!(consumed, vec![false]);
         assert!(events.is_empty());
     }

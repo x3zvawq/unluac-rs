@@ -36,13 +36,14 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use self::bindings::{
     BindingFacts, BindingIndex, BindingOccurrenceIndex, BindingSlots, StmtBindingSummary,
     binding_from_expr, binding_from_lvalue, collect_binding_facts, collect_stmt_binding_summary,
-    expr_uses_binding, table_key_from_expr,
+    expr_uses_binding,
 };
 use self::builder::expr_is_definitely_non_nil;
 use self::rebuild::producer_value_can_be_dropped;
 use self::scan::{
     ConstructorWriteIndex, constructor_seed, constructor_uses_binding, install_constructor_seed,
-    seed_overwrite_delay_is_unobservable, try_rebuild_constructor_region,
+    seed_delay_expr_is_unobservable, seed_overwrite_delay_is_unobservable,
+    try_rebuild_constructor_region,
 };
 use super::mention::{
     ReferenceCapturedBindings, stmts_reference_captured_bindings, stmts_value_captured_bindings,
@@ -177,6 +178,8 @@ pub(super) fn stabilize_table_constructors_in_proto(
         dialect,
         temp_count,
         next_local_index: first_new_local,
+        #[cfg(test)]
+        direct_set_list_rebuilds: 0,
     };
     let changed = rewrite_proto(proto, &mut pass);
     proto
@@ -197,6 +200,8 @@ struct TableConstructorPass<'a> {
     dialect: DecompileDialect,
     temp_count: usize,
     next_local_index: usize,
+    #[cfg(test)]
+    direct_set_list_rebuilds: usize,
 }
 
 impl HirRewritePass for TableConstructorPass<'_> {
@@ -253,7 +258,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     self.dialect,
                     &mut scratch,
                 );
-                candidate.filter(|(rebuilt_constructor, end_index, _)| {
+                candidate.filter(|(rebuilt_constructor, end_index, preserved_stmt_indices)| {
                     let open_local_owner = rebuilt_constructor.trailing_multivalue.is_some()
                         && self.open_local_constructor_region_is_safe(
                             block,
@@ -261,6 +266,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             *end_index,
                             binding,
                             rebuilt_constructor,
+                            preserved_stmt_indices,
                         );
                     // Value-position nil is governed by the completed table shape, not by whether
                     // a nil literal happened to occur in a producer. A final absent array slot and
@@ -294,35 +300,48 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // boundary, dropping the temporary does not change its observable life.
                     // 候选拒绝[SemanticBarrier:Lifetime]：反例见
                     // tests/unit-case/lua54_01_close.lua#lua54_01_close#13/#14/#16。
-                    let producer_root_is_observable =
-                        region_has_non_drop_safe_producer(block, index, *end_index)
-                            && !open_local_owner
-                            && collect_range_binding_mentions(
-                                block,
-                                *end_index + 1,
-                                block.stmts.len(),
-                            )
-                            .contains(&binding);
+                    let producer_root_is_observable = region_has_non_drop_safe_producer(
+                        block,
+                        index,
+                        *end_index,
+                        preserved_stmt_indices,
+                    ) && collect_range_binding_mentions(
+                        block,
+                        *end_index + 1,
+                        block.stmts.len(),
+                    )
+                    .contains(&binding);
                     // 候选拒绝[SemanticBarrier:Lifetime]：对象 producer 后再覆盖 table field
                     // 时，删除 producer 会提前释放最后一个强引用；反例同上。
                     let has_followup_object_write =
                         region_has_followup_table_write_after_object_producer(
-                            block, index, *end_index, binding,
+                            block,
+                            index,
+                            *end_index,
+                            binding,
+                            preserved_stmt_indices,
                         );
-                    // The constructor RHS is evaluated before an ordinary assignment stores
-                    // its result.  Keep the explicit seed whenever the region does not prove
-                    // that the original seed overwrite already precedes every observable RHS;
-                    // direct NewTable provenance alone is not such proof.
-                    // 候选拒绝[ProofIncomplete]：当前 `seed_overwrite_delay_is_unobservable`
-                    // 是表达式白名单；其中确有覆盖延后反例（lua54_01_close#8），但 false
-                    // 也包含保持顺序的安全子集，应改为精确 overwrite/eval-event 证明。
+                    // A source LocalDecl has no visible owner before its initializer completes;
+                    // with no debug identity, folding later fields into that initializer cannot
+                    // expose a delayed store.  Temp seeds do overwrite an existing VM slot, so an
+                    // observable region must retain the explicit store before later evaluation.
+                    // 候选拒绝[SemanticBarrier:EvalOrder]：lua54_01_close#8 通过调用观察 temp
+                    // seed overwrite 被延后；eventless region 仍由下方精确 helper 放行。
+                    let source_local_owner = matches!(binding, TableBinding::Local(_))
+                        && matches!(block.stmts[index], HirStmt::LocalDecl(_))
+                        && !self
+                            .debug_identity_bindings
+                            .get(binding)
+                            .copied()
+                            .unwrap_or_default();
                     let overwrite_timing_is_safe = open_local_owner
+                        || source_local_owner
                         || seed_overwrite_delay_is_unobservable(block, index, *end_index, binding);
                     nil_shape_is_supported
                         && !adds_late_array_overwrite
                         && !unsupported_exact_width
                         && !producer_root_is_observable
-                        && (open_local_owner || !has_followup_object_write)
+                        && !has_followup_object_write
                         && overwrite_timing_is_safe
                 })
             } else {
@@ -366,10 +385,16 @@ fn region_has_non_drop_safe_producer(
     block: &crate::hir::common::HirBlock,
     start_index: usize,
     end_index: usize,
+    preserved_stmt_indices: &[usize],
 ) -> bool {
     block.stmts[start_index + 1..=end_index]
         .iter()
-        .any(stmt_has_non_drop_safe_producer)
+        .enumerate()
+        .any(|(offset, stmt)| {
+            let stmt_index = start_index + 1 + offset;
+            preserved_stmt_indices.binary_search(&stmt_index).is_err()
+                && stmt_has_non_drop_safe_producer(stmt)
+        })
 }
 
 fn region_has_followup_table_write_after_object_producer(
@@ -377,14 +402,18 @@ fn region_has_followup_table_write_after_object_producer(
     start_index: usize,
     end_index: usize,
     binding: TableBinding,
+    preserved_stmt_indices: &[usize],
 ) -> bool {
     if end_index <= start_index {
         return false;
     }
     let mut object_producer_seen = false;
     let mut first_table_write_after_producer = false;
-    for stmt in &block.stmts[start_index + 1..=end_index] {
-        if stmt_has_non_drop_safe_producer(stmt) {
+    for (offset, stmt) in block.stmts[start_index + 1..=end_index].iter().enumerate() {
+        let stmt_index = start_index + 1 + offset;
+        if preserved_stmt_indices.binary_search(&stmt_index).is_err()
+            && stmt_has_non_drop_safe_producer(stmt)
+        {
             object_producer_seen = true;
         }
         if stmt_writes_table_binding(stmt, binding) && object_producer_seen {
@@ -469,7 +498,7 @@ impl TableConstructorPass<'_> {
             // A fixed SETLIST immediately following the canonical NewTable definition is the
             // compiler's own constructor encoding, rather than a write into an existing table.
             // Rebuilding this narrow shape preserves the original allocation/evaluation point,
-            // but only for data-only, definitely non-nil fixed values and a hole-free seed.
+            // while the helper below separately proves value events and a hole-free seed.
             if let Some(seed_index) =
                 self.find_direct_set_list_seed(block, index, binding, &set_list)
             {
@@ -479,6 +508,10 @@ impl TableConstructorPass<'_> {
                 let constructor = constructor_with_set_list(seed, &set_list);
                 install_constructor_seed(&mut block.stmts[seed_index], constructor);
                 block.stmts.remove(index);
+                #[cfg(test)]
+                {
+                    self.direct_set_list_rebuilds += 1;
+                }
                 changed = true;
                 continue;
             }
@@ -542,8 +575,8 @@ impl TableConstructorPass<'_> {
             // the former bypasses `__newindex` and has distinct nil-hole/array-part rules.
             // If the seed proof above did not let us rebuild it as a constructor, leave the
             // semantic node for a dialect-aware lowering instead of silently changing it.
-            // 候选拒绝[ProofIncomplete]：当前没有后续 owner 能消费剩余 TableSetList；保留
-            // residual 只暴露缺口，不构成等价性证明，必须继续逐 guard 收敛。
+            // Every failed candidate was rejected by its provenance, shape, arity, or event guard
+            // above; this branch only retains the already-classified residual node.
             index += 1;
         }
         changed
@@ -638,11 +671,6 @@ impl TableConstructorPass<'_> {
         if seed_binding != binding {
             return None;
         }
-        // 候选拒绝[ProofIncomplete]：numeric record 与后续 array key 的别名关系尚未复用
-        // builder 精确分析，当前 direct path 整体停用。
-        if constructor_has_numeric_record(seed) {
-            return None;
-        }
         let next_array_index = u32::try_from(
             seed.fields
                 .iter()
@@ -661,15 +689,24 @@ impl TableConstructorPass<'_> {
         if seed.trailing_multivalue.is_some() {
             return None;
         }
-        // 候选拒绝[ProofIncomplete]：seed/fixed 值的 data-only 与 definitely-non-nil 要求宽于
-        // 实际等价条件；相邻 direct encoding 保持 allocation 和求值点，应继续扩展事件证明。
-        if !constructor_is_data_only(seed)
-            || set_list
+        // 候选拒绝[LayerBoundary]：Decision/Unresolved 必须先由各自 owner 收敛。
+        if set_list
+            .values
+            .fixed
+            .iter()
+            .any(|value| !expr_is_open_tail_safe(value))
+        {
+            return None;
+        }
+        if matches!(binding, TableBinding::Temp(_))
+            && set_list
                 .values
                 .fixed
                 .iter()
-                .any(|value| !expr_is_definitely_non_nil(value) || !expr_is_data_only(value))
+                .any(|value| !seed_delay_expr_is_unobservable(value))
         {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：把相邻 SETLIST value 收进 temp assignment
+            // 会把 seed slot overwrite 延后到 value 求值之后；lua54_01_close#8 可观察该差异。
             return None;
         }
         // 候选拒绝[SemanticBarrier:TableShape]：seed 的不确定 nil 槽后追加确定 batch 会改变
@@ -696,18 +733,11 @@ impl TableConstructorPass<'_> {
         }
         // seed 与 fixed 值仍在原求值点执行，且改写保留 seed binding/root；后续 capture 观察到的
         // 仍是同一个 table identity，不构成这条窄 direct path 的拒绝理由。
-        // Direct origin is a single SSA def (or the corresponding source LocalDecl), and the
-        // materialization count above excludes an earlier write.  Do not rescan the whole prefix
-        // here; large compiler-generated tables can contain thousands of SETLIST batches.
+        // Syntactic adjacency plus direct origin identifies this exact fresh seed statement. Do not
+        // rescan the whole prefix here; large compiler-generated tables can contain thousands of
+        // SETLIST batches.
         match binding {
             TableBinding::Temp(temp) => {
-                // 候选拒绝[ProofIncomplete]：home compaction/多次 materialization 当前整体
-                // 拒绝，尚未按该 seed 的精确 def-use 与 root lifetime 区分安全子集。
-                if self.promotion_facts.compacts_home_slots()
-                    || self.materialized_bindings.get(binding).copied() != Some(1)
-                {
-                    return None;
-                }
                 // 候选拒绝[LayerBoundary]：direct seed 与 trusted home 由 promotion owner 提供。
                 (self.promotion_facts.is_direct_table_seed_temp(temp)
                     && self.promotion_facts.trusted_temp_home_slot(temp).is_some())
@@ -715,12 +745,6 @@ impl TableConstructorPass<'_> {
             }
             TableBinding::Local(local) => {
                 if !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_)) {
-                    return None;
-                }
-                // 候选拒绝[ProofIncomplete]：同上，compaction/多 materialization 需要区间化证明。
-                if self.promotion_facts.compacts_home_slots()
-                    || self.materialized_bindings.get(binding).copied() != Some(1)
-                {
                     return None;
                 }
                 // 候选拒绝[LayerBoundary]：direct seed 与 trusted home 由 promotion owner 提供。
@@ -777,9 +801,11 @@ impl TableConstructorPass<'_> {
             if !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_)) {
                 return None;
             }
-            // 候选拒绝[ProofIncomplete]：该路径只替换 SETLIST、并不移动 seed；已有 open
-            // tail 当前仍整项停用，缺少的是对后续批量写入的 array-shape 证明。
             if seed.trailing_multivalue.is_some() {
+                // 候选拒绝[LayerBoundary]：HIR constructor 只能把 open pack 放在最后；
+                // source compiler 也只会在 fixed batches 后生成最终 open batch。若 scanner
+                // 留下 open seed 后的 fixed SETLIST，应由 region owner 先恢复 batch 顺序，
+                // indexed fallback 不凭未建模的 array-part 行为猜测等价性。
                 return None;
             }
             // 候选拒绝[SemanticBarrier:Scope]：owner 自引用不能参与 fresh-seed 证明。
@@ -830,33 +856,20 @@ impl TableConstructorPass<'_> {
             .get(binding)
             .copied()
             .unwrap_or_default();
-        let prefix = &block.stmts[seed_index..set_list_index];
-        if self.captures_may_share_seed_home(
-            &stmts_reference_captured_bindings(prefix),
-            seed_local,
-            seed_home,
-        ) || self.captures_may_share_seed_home(
-            &stmts_value_captured_bindings(prefix),
-            seed_local,
-            seed_home,
-        ) {
-            // 候选拒绝[ProofIncomplete]：capture/home-slot 的全局相交只是别名可能性；应证明
-            // 该 capture 是否在 SETLIST 区间可观察 owner，而不是整段停用。
-            return false;
-        }
         // The LocalDecl at `seed_index` is the fresh owner whose allocation remains in place.
         // Prefix writes may target it directly; without seeding this set, the final membership
         // check could never accept the very owner the proof started from.
         let mut fresh_tables = BTreeSet::from([binding]);
         for (offset, stmt) in block.stmts[seed_index..set_list_index].iter().enumerate() {
             let stmt_index = seed_index + offset;
+            if stmt_index != seed_index && debug_seed && !debug_prefix_stmt_is_inert(stmt) {
+                // 候选拒绝[SemanticBarrier:DebugScope]：effectful prefix 可通过
+                // `debug.getlocal(2, 1)` 取得 source-visible seed 并安装 metatable；原始 raw
+                // SETLIST 绕过 `__newindex`，拆成 indexed writes 后会触发它。
+                return false;
+            }
             match stmt {
                 HirStmt::LocalDecl(decl) => {
-                    if debug_seed && !debug_prefix_stmt_is_inert(stmt) {
-                        // 候选拒绝[ProofIncomplete]：debug identity 尚未按具体可观察点建模；
-                        // 前缀语句保持原位，复杂形状本身不是不等价反例。
-                        return false;
-                    }
                     if decl.bindings.contains(&seed_local) && stmt_index != seed_index {
                         // A second declaration of the seed binding would create a new lexical
                         // owner, so the indexed-write proof must stop at that boundary.
@@ -867,87 +880,121 @@ impl TableConstructorPass<'_> {
                     if decl
                         .values
                         .iter()
-                        .any(|value| expr_uses_binding(value, binding))
+                        .any(|value| self.expr_may_share_seed_home(value, seed_local, seed_home))
                     {
-                        // 候选拒绝[ProofIncomplete]：前缀读取 owner 可能形成 alias/escape，但
-                        // 当前未区分仅快照读取与真正使后续 indexed writes 可观察的逃逸。
+                        // 候选拒绝[LayerBoundary]：initializer 对 seed/home 的读取可能只是
+                        // snapshot，也可能经 constructor/closure/call 形成逃逸；值别名与区间
+                        // escape 摘要应由 binding provenance owner 提供。
                         return false;
                     }
                     for local in &decl.bindings {
                         if *local == seed_local {
                             continue;
                         }
-                        let Some(candidate_home) =
-                            self.promotion_facts.trusted_local_home_slot(*local)
-                        else {
-                            // 候选拒绝[LayerBoundary]：candidate home 由 promotion owner 提供。
-                            return false;
-                        };
-                        if candidate_home == seed_home {
+                        if self.promotion_facts.trusted_local_home_slot(*local) == Some(seed_home) {
                             // 候选拒绝[SemanticBarrier:Lifetime]：区间内复用 seed 的物理 home
                             // 会覆盖 owner；不能再把 SETLIST 证明为对原 fresh table 的写入。
                             return false;
                         }
-                    }
-                    if let Some((candidate, constructor)) = constructor_seed(stmt) {
-                        if !matches!(candidate, TableBinding::Local(_))
-                            || !constructor_is_data_only(constructor)
-                            || constructor_uses_binding(constructor, candidate)
-                            || constructor_uses_binding(constructor, binding)
-                        {
-                            // 候选拒绝[ProofIncomplete]：嵌套 constructor 当前仅接受 data-only
-                            // fresh seed；需要独立的 escape/effect 事实后再放宽。
+                        let Some(candidate_homes) =
+                            self.promotion_facts.possible_local_home_slots(*local)
+                        else {
+                            // 候选拒绝[LayerBoundary]：candidate 的完整 possible-home 集合由
+                            // promotion owner 提供；未知集合不能证明 declaration 不覆盖 seed。
+                            return false;
+                        };
+                        if candidate_homes.contains(&seed_home) {
+                            // 候选拒绝[LayerBoundary]：合并 binding 仅在部分 CFG 路径复用 seed
+                            // home；由 reaching-home owner 判定当前平坦区间实际到达的 epoch。
                             return false;
                         }
+                    }
+                    if let Some((candidate, constructor)) = constructor_seed(stmt) {
+                        debug_assert!(matches!(candidate, TableBinding::Local(_)));
+                        debug_assert!(!constructor_uses_binding(constructor, binding));
                         fresh_tables.insert(candidate);
                     }
                 }
-                HirStmt::ToBeClosed(_)
-                | HirStmt::Close(_)
-                | HirStmt::Goto(_)
-                | HirStmt::Label(_) => {
-                    // 候选拒绝[ProofIncomplete]：控制/关闭语句保持原位，但当前前缀证明没有
-                    // 路径与资源状态，无法证明末尾 SETLIST 仍由同一 owner 支配。
+                HirStmt::Goto(_) | HirStmt::Label(_) => {
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：backward goto 可在首次 SETLIST 后
+                    // 安装 metatable 再跳回 label；raw SETLIST 仍绕过 `__newindex`，indexed
+                    // writes 则会触发它，因此必须先有单次执行/dominance 证明。
                     return false;
                 }
-                HirStmt::Assign(assign) => {
-                    if debug_seed && !debug_prefix_stmt_is_inert(stmt) {
-                        // 候选拒绝[ProofIncomplete]：同上，缺少 debug 可观察点的区间证明。
+                HirStmt::ToBeClosed(_) | HirStmt::Close(_) => {
+                    if self.stmt_may_share_seed_home(stmt, seed_local, seed_home) {
+                        // 候选拒绝[SemanticBarrier:Close]：resource 若持有 seed/home，`__close`
+                        // 可在 SETLIST 前安装 metatable；raw SETLIST 绕过 `__newindex`，indexed
+                        // writes 会触发它。seed-disjoint close 保持原位且 owner root 仍存活。
                         return false;
                     }
-                    let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
-                        // 候选拒绝[ProofIncomplete]：前缀证明只建模单 table write，其他保持
-                        // 原位的 assignment 尚未通过 effect/escape summary 判定。
-                        return false;
-                    };
-                    let [value] = assign.values.fixed.as_slice() else {
-                        // 候选拒绝[ProofIncomplete]：parallel/open assignment 尚无区间 effect
-                        // summary，不能仅凭语法证明 owner 未逃逸。
-                        return false;
-                    };
-                    if assign.values.tail.is_some()
-                        || expr_uses_binding(&access.key, binding)
-                        || expr_uses_binding(value, binding)
-                        || !expr_is_prefix_read_only(&access.key)
-                        || !expr_is_prefix_read_only(value)
+                }
+                HirStmt::Assign(assign) => {
+                    if assign
+                        .values
+                        .iter()
+                        .any(|value| self.expr_may_share_seed_home(value, seed_local, seed_home))
                     {
-                        // 候选拒绝[ProofIncomplete]：key/value 的只读白名单过窄；需要证明的是
-                        // 是否改变或泄露 seed，而非表达式是否 data-only。
+                        // 候选拒绝[LayerBoundary]：RHS 对 seed/home 的读取可能形成 alias 或
+                        // escape；binding provenance owner 必须先提供区间 escape 摘要。
                         return false;
                     }
-                    let Some(base) = binding_from_expr(&access.base) else {
-                        // 候选拒绝[ProofIncomplete]：复合 base 尚无 fresh-table alias 事实。
-                        return false;
-                    };
-                    if base != binding && !fresh_tables.contains(&base) {
-                        // 候选拒绝[ProofIncomplete]：外部 base 可能触发 metamethod，但该写入
-                        // 保持原位；仍需 effect summary 证明它不改变/泄露 seed。
-                        return false;
+                    for target in &assign.targets {
+                        match target {
+                            HirLValue::TableAccess(access) => {
+                                if self.expr_may_share_seed_home(&access.key, seed_local, seed_home)
+                                {
+                                    // 候选拒绝[LayerBoundary]：key 读取 seed/home 的 lookup、call
+                                    // 或 closure escape 由 binding provenance owner 判定。
+                                    return false;
+                                }
+                                if let Some(base) = binding_from_expr(&access.base)
+                                    && (base == binding || fresh_tables.contains(&base))
+                                {
+                                    continue;
+                                }
+                                if self.expr_may_share_seed_home(
+                                    &access.base,
+                                    seed_local,
+                                    seed_home,
+                                ) {
+                                    // 候选拒绝[LayerBoundary]：复合 base 若依赖 seed/home，需要
+                                    // alias owner 证明它仍是 fresh owner；seed-disjoint external
+                                    // base 即使触发 metamethod也无法取得尚未逃逸的 seed。
+                                    return false;
+                                }
+                            }
+                            _ if self.lvalue_may_share_seed_home(target, seed_local, seed_home) => {
+                                // 候选拒绝[SemanticBarrier:Lifetime]：parallel/scalar target 若写
+                                // seed home，会在后续 SETLIST 前覆盖 fresh owner。
+                                return false;
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                _ => {
-                    // 候选拒绝[ProofIncomplete]：未建模前缀语句缺少 owner escape/effect 摘要。
+                HirStmt::If(_)
+                | HirStmt::While(_)
+                | HirStmt::Repeat(_)
+                | HirStmt::NumericFor(_)
+                | HirStmt::GenericFor(_)
+                | HirStmt::Block(_)
+                | HirStmt::Return(_)
+                | HirStmt::Break
+                | HirStmt::Continue => {
+                    // 候选拒绝[LayerBoundary]：结构化/终止控制需要 CFG owner 证明 SETLIST 的
+                    // dominance 与单次执行；prefix fallback 不在线性切片里重建路径事实。
                     return false;
+                }
+                HirStmt::GlobalDecl(_)
+                | HirStmt::TableSetList(_)
+                | HirStmt::ErrNil(_)
+                | HirStmt::CallStmt(_) => {
+                    if self.stmt_may_share_seed_home(stmt, seed_local, seed_home) {
+                        // 候选拒绝[LayerBoundary]：语句直接接触 seed/home 时，call、capture 或
+                        // external store 可能暴露 owner；区间 escape 摘要归 binding owner。
+                        return false;
+                    }
                 }
             }
         }
@@ -964,17 +1011,155 @@ impl TableConstructorPass<'_> {
             *local == seed_local
                 || self
                     .promotion_facts
-                    .trusted_local_home_slot(*local)
-                    .is_none_or(|home| home == seed_home)
+                    .possible_local_home_slots(*local)
+                    .is_none_or(|homes| homes.contains(&seed_home))
         }) || captured.temps.iter().any(|temp| {
             self.promotion_facts
-                .trusted_temp_home_slot(*temp)
-                .is_none_or(|home| home == seed_home)
+                .possible_temp_home_slots(*temp)
+                .is_none_or(|homes| homes.contains(&seed_home))
         }) || captured.params.iter().any(|param| {
             self.promotion_facts
-                .trusted_param_home_slot(*param)
-                .is_none_or(|home| home == seed_home)
+                .possible_param_home_slots(*param)
+                .is_none_or(|homes| homes.contains(&seed_home))
         })
+    }
+
+    fn expr_may_share_seed_home(
+        &self,
+        expr: &HirExpr,
+        seed_local: LocalId,
+        seed_home: HomeSlotKey,
+    ) -> bool {
+        struct Probe<'a> {
+            promotion_facts: &'a ProtoPromotionFacts,
+            seed_local: LocalId,
+            seed_home: HomeSlotKey,
+            found: bool,
+        }
+
+        impl HirVisitor for Probe<'_> {
+            fn visit_expr(&mut self, expr: &HirExpr) {
+                self.found |= match expr {
+                    HirExpr::LocalRef(local) => {
+                        *local == self.seed_local
+                            || self
+                                .promotion_facts
+                                .possible_local_home_slots(*local)
+                                .is_none_or(|homes| homes.contains(&self.seed_home))
+                    }
+                    HirExpr::TempRef(temp) => self
+                        .promotion_facts
+                        .possible_temp_home_slots(*temp)
+                        .is_none_or(|homes| homes.contains(&self.seed_home)),
+                    HirExpr::ParamRef(param) => self
+                        .promotion_facts
+                        .possible_param_home_slots(*param)
+                        .is_none_or(|homes| homes.contains(&self.seed_home)),
+                    _ => false,
+                };
+            }
+        }
+
+        let mut probe = Probe {
+            promotion_facts: self.promotion_facts,
+            seed_local,
+            seed_home,
+            found: false,
+        };
+        crate::hir::simplify::visit::visit_expr(expr, &mut probe);
+        probe.found
+    }
+
+    fn lvalue_may_share_seed_home(
+        &self,
+        lvalue: &HirLValue,
+        seed_local: LocalId,
+        seed_home: HomeSlotKey,
+    ) -> bool {
+        match lvalue {
+            HirLValue::Param(param) => self
+                .promotion_facts
+                .possible_param_home_slots(*param)
+                .is_none_or(|homes| homes.contains(&seed_home)),
+            HirLValue::Local(local) => {
+                *local == seed_local
+                    || self
+                        .promotion_facts
+                        .possible_local_home_slots(*local)
+                        .is_none_or(|homes| homes.contains(&seed_home))
+            }
+            HirLValue::Temp(temp) => self
+                .promotion_facts
+                .possible_temp_home_slots(*temp)
+                .is_none_or(|homes| homes.contains(&seed_home)),
+            HirLValue::TableAccess(access) => {
+                self.expr_may_share_seed_home(&access.base, seed_local, seed_home)
+                    || self.expr_may_share_seed_home(&access.key, seed_local, seed_home)
+            }
+            HirLValue::Upvalue(_) | HirLValue::Global(_) => false,
+        }
+    }
+
+    fn stmt_may_share_seed_home(
+        &self,
+        stmt: &HirStmt,
+        seed_local: LocalId,
+        seed_home: HomeSlotKey,
+    ) -> bool {
+        struct Probe<'pass, 'facts> {
+            pass: &'pass TableConstructorPass<'facts>,
+            seed_local: LocalId,
+            seed_home: HomeSlotKey,
+            found: bool,
+        }
+
+        impl HirVisitor for Probe<'_, '_> {
+            fn visit_stmt(&mut self, stmt: &HirStmt) {
+                self.found |= match stmt {
+                    HirStmt::LocalDecl(decl) => decl.bindings.iter().any(|local| {
+                        self.pass.lvalue_may_share_seed_home(
+                            &HirLValue::Local(*local),
+                            self.seed_local,
+                            self.seed_home,
+                        )
+                    }),
+                    HirStmt::NumericFor(numeric_for) => self.pass.lvalue_may_share_seed_home(
+                        &HirLValue::Local(numeric_for.binding),
+                        self.seed_local,
+                        self.seed_home,
+                    ),
+                    HirStmt::GenericFor(generic_for) => generic_for.bindings.iter().any(|local| {
+                        self.pass.lvalue_may_share_seed_home(
+                            &HirLValue::Local(*local),
+                            self.seed_local,
+                            self.seed_home,
+                        )
+                    }),
+                    _ => false,
+                };
+            }
+
+            fn visit_expr(&mut self, expr: &HirExpr) {
+                self.found |=
+                    self.pass
+                        .expr_may_share_seed_home(expr, self.seed_local, self.seed_home);
+            }
+
+            fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+                self.found |=
+                    self.pass
+                        .lvalue_may_share_seed_home(lvalue, self.seed_local, self.seed_home);
+            }
+        }
+
+        let mut probe = Probe {
+            pass: self,
+            seed_local,
+            seed_home,
+            found: false,
+        };
+        crate::hir::simplify::visit::visit_stmts(std::slice::from_ref(stmt), &mut probe);
+        probe.found
     }
 
     fn open_set_list_seed_is_safe(
@@ -993,18 +1178,22 @@ impl TableConstructorPass<'_> {
         if seed_binding != binding || !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_)) {
             return false;
         }
-        // 候选拒绝[ProofIncomplete]：该 fallback 只支持空 seed；非空连续 seed 已有安全子集，
-        // 应与 adjacent path 共用精确 overlap 证明。
-        if !seed.fields.is_empty() {
-            return false;
-        }
         // 候选拒绝[SemanticBarrier:ValueArity]：已有 open tail 后再追加 open SETLIST 会改变
         // 多返回值占用的数组槽；反例见 regress_52。
         if seed.trailing_multivalue.is_some() {
             return false;
         }
-        // 候选拒绝[SemanticBarrier:TableShape]：空 seed 的 open batch 只能从数组键 1 开始。
-        if set_list.start_index != 1 {
+        let next_array_index = u32::try_from(
+            seed.fields
+                .iter()
+                .filter(|field| matches!(field, HirTableField::Array(_)))
+                .count(),
+        )
+        .ok()
+        .and_then(|array_len| array_len.checked_add(1));
+        // 候选拒绝[SemanticBarrier:TableShape]：raw SETLIST 必须从 seed 的下一个隐式数组键
+        // 开始；否则直接追加 constructor array field 会改变实际 key 或覆盖关系。
+        if Some(set_list.start_index) != next_array_index {
             return false;
         }
         let Some(tail) = &set_list.values.tail else {
@@ -1015,8 +1204,15 @@ impl TableConstructorPass<'_> {
         if tail.exact_width().is_some() {
             return false;
         }
-        // 候选拒绝[LayerBoundary]：Decision/Unresolved 由各自 owner 先收敛。
-        if !expr_is_open_tail_safe(tail.as_expr()) {
+        // 候选拒绝[LayerBoundary]：Decision/Unresolved 由各自 owner 先收敛。fixed 与 open
+        // 值仍按原 SETLIST 顺序留在同一个 constructor batch，不需要 data-only 白名单。
+        if !expr_is_open_tail_safe(tail.as_expr())
+            || set_list
+                .values
+                .fixed
+                .iter()
+                .any(|value| !expr_is_open_tail_safe(value))
+        {
             return false;
         }
         // 候选拒绝[SemanticBarrier:Scope]：`local t = { ..., t }` 中的 t 属于外层作用域，
@@ -1030,14 +1226,11 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // 候选拒绝[ProofIncomplete]：fixed 前缀的 data-only/definitely-non-nil 白名单宽于
-        // 实际等价条件；应按事件顺序和 array slot 精确证明。
-        if !set_list
-            .values
-            .fixed
-            .iter()
-            .all(|value| expr_is_data_only(value) && expr_is_definitely_non_nil(value))
-        {
+        let rebuilt = constructor_with_set_list(seed, set_list);
+        // 候选拒绝[SemanticBarrier:TableShape]：合并前后 SETLIST batch 的 array
+        // preallocation/边界可能不同；seed 尾部或 open tail 前的运行时 nil 会让 `#table`
+        // 观察到不同边界。复用 completed-constructor shape proof，而不是按表达式种类猜测。
+        if !constructor_nil_shape_is_supported(seed, &rebuilt) {
             return false;
         }
         // 候选拒绝[SemanticBarrier:DebugScope]：把后置 SETLIST 收进 LocalDecl initializer
@@ -1050,20 +1243,11 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // seed LocalDecl 与 LocalId 都保留，且相邻 SETLIST 之间没有 closure 创建点；区间后
-        // 的 reference capture 仍观察同一个已初始化 table owner，无需 proto 级 capture gate。
-        // A branch-local LocalDecl may originate from a coalesced fixed temp rather than retain
-        // the direct-SSA marker. The declaration is fresh only when no earlier statement mentions
-        // this LocalId; eventually this should consume precise promotion provenance.
-        // 候选拒绝[ProofIncomplete]：prefix mention、home compaction 与多 materialization 仍是
-        // 全局近似，需改成 seed 区间的 def-use/lifetime 证明。
-        if self.binding_is_shared_before_seed(block, seed_index, binding)
-            || self.promotion_facts.compacts_home_slots()
-            || self.materialized_bindings.get(binding).copied() != Some(1)
-        {
-            return false;
-        }
-        // 候选拒绝[LayerBoundary]：trusted home 由 promotion owner 提供。
+        // The exact source LocalDecl is retained and the SETLIST is adjacent, so the rewritten
+        // interval contains no independent owner use, capture, overwrite, or lifetime boundary.
+        // Earlier mentions cannot resolve to this lexical definition, and later re-materializations
+        // remain after the folded batch; home compaction cannot alias the trusted owner in the gap.
+        // 候选拒绝[LayerBoundary]：trusted home provenance 由 promotion owner 提供。
         self.promotion_facts
             .trusted_local_home_slot(local)
             .is_some()
@@ -1080,6 +1264,7 @@ impl TableConstructorPass<'_> {
         end_index: usize,
         binding: TableBinding,
         constructor: &HirTableConstructor,
+        preserved_stmt_indices: &[usize],
     ) -> bool {
         let TableBinding::Local(local) = binding else {
             return false;
@@ -1098,16 +1283,8 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // 候选拒绝[ProofIncomplete]：seed 字段表达式白名单尚未复用 rebuild 的事件证明。
-        if seed.fields.iter().any(|field| match field {
-            HirTableField::Array(value) => !expr_is_fixed_set_list_value_safe(value),
-            HirTableField::Record(record) => {
-                !record_key_is_data_only(&record.key)
-                    || !expr_is_fixed_set_list_value_safe(&record.value)
-            }
-        }) {
-            return false;
-        }
+        // Seed fields stay in their original constructor and evaluation order. The region rebuild
+        // transaction only appends later fields, so no expression-class whitelist is needed here.
         // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil seed/结果或越界 SETLIST 起点会
         // 改变键集合、覆盖关系或 `#table`；反例见 regress_237、lua54_01_close#10/#11/#15。
         if seed.fields.iter().any(|field| match field {
@@ -1168,30 +1345,17 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // 候选拒绝[ProofIncomplete]：fixed SETLIST value 白名单未复用完整 eval-event 证明。
-        if set_list
-            .values
-            .fixed
-            .iter()
-            .any(|value| !expr_is_fixed_set_list_value_safe(value))
-        {
-            return false;
-        }
-        // 候选拒绝[ProofIncomplete]：prefix mention、home compaction 与 materialization count
-        // 仍是全局 freshness 近似，应改成该 seed 区间的 provenance/lifetime 证明。
-        if self.binding_is_shared_before_seed(block, seed_index, binding)
-            || self.promotion_facts.compacts_home_slots()
-            || self.materialized_bindings.get(binding).copied() != Some(1)
-        {
-            return false;
-        }
-        // 候选拒绝[LayerBoundary]：trusted home 由 promotion owner 提供。
+        // `try_rebuild_constructor_region` already compared the complete source/generated event
+        // sequences, including every fixed SETLIST value and the open tail. The exact LocalDecl is
+        // retained; earlier mentions cannot resolve to it, while later materializations remain
+        // outside the committed region. Home compaction therefore does not require a global gate.
+        // 候选拒绝[LayerBoundary]：trusted home provenance 由 promotion owner 提供。
         let Some(seed_home) = self.promotion_facts.trusted_local_home_slot(local) else {
             return false;
         };
 
-        let mut object_record_names = BTreeSet::new();
-        for stmt in &block.stmts[seed_index + 1..end_index] {
+        for (offset, stmt) in block.stmts[seed_index + 1..end_index].iter().enumerate() {
+            let stmt_index = seed_index + 1 + offset;
             let stmt_slice = std::slice::from_ref(stmt);
             if self.captures_may_share_seed_home(
                 &stmts_reference_captured_bindings(stmt_slice),
@@ -1208,8 +1372,8 @@ impl TableConstructorPass<'_> {
             }
             match stmt {
                 HirStmt::LocalDecl(decl) => {
-                    // 候选拒绝[ProofIncomplete]：producer 的 open pack 尚未按每个目标槽位
-                    // 建模，当前只消费 fixed 单值快照。
+                    // 候选拒绝[LayerBoundary]：scanner 的 value-pack owner 尚不生成 open/exact
+                    // tail 的逐槽 producer projection；成功的 region 当前不可达此形状。
                     if decl.values.tail.is_some() {
                         return false;
                     }
@@ -1222,32 +1386,33 @@ impl TableConstructorPass<'_> {
                     {
                         return false;
                     }
-                    // 候选拒绝[ProofIncomplete]：producer debug/capture 的 blanket gate 尚未按
-                    // 本次删除是否真的改变可观察 identity 分类。
                     if decl.bindings.iter().any(|candidate| {
                         let candidate = TableBinding::Local(*candidate);
                         self.debug_identity_bindings
                             .get(candidate)
                             .copied()
                             .unwrap_or_default()
-                            || self
-                                .reference_captured_bindings
-                                .get(candidate)
-                                .copied()
-                                .unwrap_or_default()
                     }) {
+                        // 候选拒绝[PolicyBoundary]：删除 source-visible producer declaration，
+                        // 或把其消费写提前到声明行之前，会改变 debug hook 观察到的 local/table。
                         return false;
                     }
-                    // 候选拒绝[ProofIncomplete]：snapshot 白名单替代了事件与 root-lifetime
-                    // 证明；call/closure/constructor 中仍存在可安全内联的子集。
-                    if decl
-                        .values
-                        .fixed
-                        .iter()
-                        .any(|value| !expr_is_open_owner_snapshot(value))
+                    let has_reference_capture = decl.bindings.iter().any(|candidate| {
+                        self.reference_captured_bindings
+                            .get(TableBinding::Local(*candidate))
+                            .copied()
+                            .unwrap_or_default()
+                    });
+                    if has_reference_capture
+                        && preserved_stmt_indices.binary_search(&stmt_index).is_err()
                     {
+                        // 候选拒绝[LayerBoundary]：BindingOccurrenceIndex/source-preservation
+                        // transaction 必须保留 reference-captured producer 的声明 owner。
                         return false;
                     }
+                    // Eventful snapshots are admitted only after rebuild proves identical source
+                    // and generated event sequences. Removed object roots are checked by the
+                    // enclosing region lifetime transaction; preserved sources stay in place.
                     // 候选拒绝[SemanticBarrier:Scope]：producer 读取 owner 后搬入 initializer
                     // 会越过 owner 的词法生效点。
                     if decl
@@ -1261,17 +1426,20 @@ impl TableConstructorPass<'_> {
                 }
                 HirStmt::Assign(assign) => {
                     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
-                        // 候选拒绝[ProofIncomplete]：open-owner proof 尚未建模 parallel/非 table
-                        // assignment；需要复用 rebuild 的 lvalue/event summary。
+                        // 候选拒绝[LayerBoundary]：`scan::keyed_write_binding` 只为单一 table
+                        // target 生成 Record step；parallel/非 table assignment 不属于成功 region。
+                        // preserved eventless assignment 也不会漏到这里：其后 open SETLIST 因
+                        // `constructor_step_is_unobservable` 要求 closed tail 而在 scanner 中止。
                         return false;
                     };
                     let [value] = assign.values.fixed.as_slice() else {
-                        // 候选拒绝[ProofIncomplete]：多值/open assignment 尚无精确 value-pack
-                        // 与目标槽位映射。
+                        // 候选拒绝[LayerBoundary]：`scan::keyed_write_binding` 与
+                        // `rebuild::record_field_parts` 共同拥有 closed 单值 pack 投影；其它 pack
+                        // 在 scanner 边界终止，不应到达本后置证明。
                         return false;
                     };
-                    // 候选拒绝[ProofIncomplete]：非目标 base 或 open tail 表明 scanner/rebuild
-                    // 尚未提供本区间需要的精确 write/value-pack 事实。
+                    // 候选拒绝[LayerBoundary]：scanner grammar 保证 Record step 写入当前 owner，
+                    // 且没有 open tail；此处保留防御性合同检查。
                     if assign.values.tail.is_some()
                         || binding_from_expr(&access.base) != Some(binding)
                     {
@@ -1283,27 +1451,10 @@ impl TableConstructorPass<'_> {
                     {
                         return false;
                     }
-                    // 候选拒绝[ProofIncomplete]：key/value 白名单尚未复用完整 eval-event 与
-                    // effect 证明，存在可安全的复杂表达式子集。
-                    if !expr_is_data_only(&access.key) || !expr_is_fixed_set_list_value_safe(value)
-                    {
-                        return false;
-                    }
-                    if !producer_value_can_be_dropped(value) {
-                        let HirTableKey::Name(name) =
-                            table_key_from_expr(&access.key, self.dialect)
-                        else {
-                            // 候选拒绝[ProofIncomplete]：有 root 的对象值目前只跟踪静态字段
-                            // 名；动态 key 需要精确 alias/overwrite 集合。
-                            return false;
-                        };
-                        if !object_record_names.insert(name) {
-                            // 候选拒绝[SemanticBarrier:Lifetime]：同名字段后写覆盖前一个对象时，
-                            // 合入 constructor 并删除 producer 可能提前释放旧对象；反例见
-                            // lua54_01_close#13/#14/#16。
-                            return false;
-                        }
-                    }
+                    // `prepare_record_step` collected key then value source events and the inline
+                    // transaction emitted the generated events in exactly that order. Dynamic
+                    // calls/lookups are therefore safe here. Independent object roots are owned by
+                    // the enclosing removed-producer lifetime checks, not by expression syntax.
                 }
                 HirStmt::TableSetList(prefix_set_list) => {
                     // scanner/rebuild 已证明每个 SETLIST 的精确起点与 table shape；这里只补
@@ -1326,15 +1477,6 @@ impl TableConstructorPass<'_> {
         }
         true
     }
-
-    fn binding_is_shared_before_seed(
-        &self,
-        block: &crate::hir::common::HirBlock,
-        seed_index: usize,
-        binding: TableBinding,
-    ) -> bool {
-        block_prefix_mentions_binding(block, seed_index, binding)
-    }
 }
 
 fn constructor_with_set_list(
@@ -1352,32 +1494,6 @@ fn constructor_with_set_list(
     );
     constructor.trailing_multivalue = set_list.values.tail.clone();
     constructor
-}
-
-fn block_prefix_mentions_binding(
-    block: &crate::hir::common::HirBlock,
-    end: usize,
-    binding: TableBinding,
-) -> bool {
-    struct Probe {
-        binding: TableBinding,
-        found: bool,
-    }
-    impl HirVisitor for Probe {
-        fn visit_expr(&mut self, expr: &HirExpr) {
-            self.found |= expr_uses_binding(expr, self.binding);
-        }
-
-        fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-            self.found |= lvalue_uses_binding(lvalue, self.binding);
-        }
-    }
-    let mut probe = Probe {
-        binding,
-        found: false,
-    };
-    visit_stmts(&block.stmts[..end], &mut probe);
-    probe.found
 }
 
 fn collect_range_binding_mentions(
@@ -1429,15 +1545,6 @@ fn collect_range_binding_mentions(
         visit_stmts(stmts, &mut probe);
     }
     probe.bindings
-}
-
-fn lvalue_uses_binding(lvalue: &HirLValue, binding: TableBinding) -> bool {
-    match lvalue {
-        HirLValue::TableAccess(access) => {
-            expr_uses_binding(&access.base, binding) || expr_uses_binding(&access.key, binding)
-        }
-        _ => binding_from_lvalue(lvalue) == Some(binding),
-    }
 }
 
 fn expr_is_data_only(expr: &HirExpr) -> bool {
@@ -1524,59 +1631,6 @@ fn expr_is_open_tail_safe(expr: &HirExpr) -> bool {
     }
 }
 
-/// A producer local may be removed from the narrow open-tail owner only when its initializer is
-/// a direct snapshot read or an inert literal.  Calls, table access, constructors, and closures
-/// remain explicit statements: moving those evaluations into the tail can change object roots or
-/// observe a different binding even though the final constructor keeps the seed allocation point.
-fn expr_is_open_owner_snapshot(expr: &HirExpr) -> bool {
-    match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_) => true,
-        HirExpr::TableAccess(access) => {
-            expr_is_open_owner_snapshot(&access.base) && expr_is_open_owner_snapshot(&access.key)
-        }
-        HirExpr::Unary(unary) => expr_is_open_owner_snapshot(&unary.expr),
-        HirExpr::Binary(binary) => {
-            expr_is_open_owner_snapshot(&binary.lhs) && expr_is_open_owner_snapshot(&binary.rhs)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_is_open_owner_snapshot(&logical.lhs) && expr_is_open_owner_snapshot(&logical.rhs)
-        }
-        HirExpr::Call(_)
-        | HirExpr::Closure(_)
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Decision(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    }
-}
-
-/// Prefix expressions may read an already-created table, but they must not execute a call,
-/// decision, closure creation, or other user code while the fresh SETLIST owner is still private.
-/// Keeping this separate from `expr_is_data_only` admits the field reads emitted by nested table
-/// constructors without treating an arbitrary producer as inert.
-fn expr_is_prefix_read_only(expr: &HirExpr) -> bool {
-    expr_is_data_only(expr)
-        || matches!(
-            expr,
-            HirExpr::TableAccess(access)
-                if expr_is_prefix_read_only(&access.base)
-                    && expr_is_prefix_read_only(&access.key)
-        )
-}
-
 fn debug_prefix_stmt_is_inert(stmt: &HirStmt) -> bool {
     match stmt {
         HirStmt::LocalDecl(decl) => {
@@ -1657,18 +1711,6 @@ fn expr_is_fixed_set_list_value_safe(expr: &HirExpr) -> bool {
     }
 }
 
-fn constructor_is_data_only(constructor: &HirTableConstructor) -> bool {
-    constructor.fields.iter().all(|field| match field {
-        HirTableField::Array(value) => expr_is_data_only(value),
-        HirTableField::Record(record) => {
-            record_key_is_data_only(&record.key) && expr_is_data_only(&record.value)
-        }
-    }) && constructor
-        .trailing_multivalue
-        .as_ref()
-        .is_none_or(|tail| expr_is_data_only(tail.as_expr()))
-}
-
 fn record_key_is_data_only(key: &crate::hir::common::HirTableKey) -> bool {
     match key {
         crate::hir::common::HirTableKey::Name(_) => true,
@@ -1729,15 +1771,6 @@ fn constructor_has_nil_field(constructor: &HirTableConstructor) -> bool {
             .trailing_multivalue
             .as_ref()
             .is_some_and(|tail| expr_contains_nil(tail.as_expr()))
-}
-
-fn constructor_has_numeric_record(constructor: &HirTableConstructor) -> bool {
-    constructor.fields.iter().any(|field| {
-        matches!(
-            field,
-            HirTableField::Record(record) if matches!(record.key, HirTableKey::Expr(_))
-        )
-    })
 }
 
 fn constructor_has_uncertain_array_field(constructor: &HirTableConstructor) -> bool {
@@ -1966,11 +1999,55 @@ fn expr_contains_nil(expr: &HirExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::hir::common::{
-        HirBlock, HirLocalDecl, HirPackTail, HirRecordField, HirTableSetList,
+        HirBlock, HirCallExpr, HirCallStmt, HirClose, HirGlobalRef, HirLocalDecl, HirPackTail,
+        HirRecordField, HirTableSetList, HirToBeClosed,
     };
+    use crate::transformer::InstrRef;
 
     use super::*;
+
+    fn call(name: &str) -> HirExpr {
+        HirExpr::Call(Box::new(HirCallExpr {
+            callee: HirExpr::GlobalRef(HirGlobalRef { name: name.into() }),
+            args: HirValuePack::default(),
+            method: false,
+            fastcall: None,
+            method_name: None,
+        }))
+    }
+
+    fn local_table(local: LocalId, constructor: HirTableConstructor) -> HirStmt {
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![local],
+            values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::new(constructor))]),
+        }))
+    }
+
+    fn table_pass<'a>(
+        block: &HirBlock,
+        promotion_facts: &'a ProtoPromotionFacts,
+        local_debug_hints: &[Option<String>],
+    ) -> TableConstructorPass<'a> {
+        let BindingFacts {
+            materialized,
+            reference_captured,
+            reference_captured_home_slots,
+        } = collect_binding_facts(block, promotion_facts, 0, local_debug_hints.len());
+        TableConstructorPass {
+            materialized_bindings: materialized,
+            reference_captured_bindings: reference_captured,
+            reference_captured_home_slots,
+            debug_identity_bindings: BindingSlots::from_debug_hints(&[], local_debug_hints),
+            promotion_facts,
+            dialect: DecompileDialect::Lua54,
+            temp_count: 0,
+            next_local_index: local_debug_hints.len(),
+            direct_set_list_rebuilds: 0,
+        }
+    }
 
     #[test]
     fn nil_values_are_supported_when_the_completed_array_shape_is_stable() {
@@ -2022,6 +2099,7 @@ mod tests {
             dialect: DecompileDialect::Lua54,
             temp_count: 1,
             next_local_index: 0,
+            direct_set_list_rebuilds: 0,
         };
 
         assert!(pass.rewrite_block(&mut block));
@@ -2077,6 +2155,7 @@ mod tests {
             dialect: DecompileDialect::Lua54,
             temp_count: 1,
             next_local_index: 2,
+            direct_set_list_rebuilds: 0,
         };
 
         assert!(pass.rewrite_block(&mut block));
@@ -2156,5 +2235,666 @@ mod tests {
         };
 
         assert!(region_has_exact_width_tail(&block, 0, 1));
+    }
+
+    #[test]
+    fn source_local_seed_accepts_effectful_record_region() {
+        let owner = LocalId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                        base: HirExpr::LocalRef(owner),
+                        key: HirExpr::String("value".into()),
+                    }))],
+                    values: HirValuePack::fixed(vec![call("make_value")]),
+                })),
+            ],
+        };
+        let promotion_facts = ProtoPromotionFacts::default();
+        let mut pass = table_pass(&block, &promotion_facts, &[None]);
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 1);
+        let (_, constructor) = constructor_seed(&block.stmts[0]).expect("rewritten seed");
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [HirTableField::Record(HirRecordField {
+                key: HirTableKey::Name(key),
+                value: HirExpr::Call(_),
+            })] if key == "value"
+        ));
+    }
+
+    #[test]
+    fn direct_temp_set_list_accepts_numeric_record_under_compaction_and_reuse() {
+        let owner = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(owner)],
+                    values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::new(
+                        HirTableConstructor {
+                            fields: vec![HirTableField::Record(HirRecordField {
+                                key: HirTableKey::Expr(HirExpr::Integer(1)),
+                                value: HirExpr::Integer(10),
+                            })],
+                            trailing_multivalue: None,
+                        },
+                    ))]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::TempRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Nil, HirExpr::Integer(20)]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Temp(owner)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(30)]),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_temp_home_slot_for_test(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_direct_table_seed_for_test(owner);
+        promotion_facts.enable_home_slot_compaction();
+        let BindingFacts {
+            materialized,
+            reference_captured,
+            reference_captured_home_slots,
+        } = collect_binding_facts(&block, &promotion_facts, 1, 0);
+        let mut pass = TableConstructorPass {
+            materialized_bindings: materialized,
+            reference_captured_bindings: reference_captured,
+            reference_captured_home_slots,
+            debug_identity_bindings: BindingSlots::from_debug_hints(&[None], &[]),
+            promotion_facts: &promotion_facts,
+            dialect: DecompileDialect::Lua54,
+            temp_count: 1,
+            next_local_index: 0,
+            direct_set_list_rebuilds: 0,
+        };
+        assert!(promotion_facts.compacts_home_slots());
+        assert_eq!(
+            pass.materialized_bindings
+                .get(TableBinding::Temp(owner))
+                .copied(),
+            Some(2)
+        );
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(pass.direct_set_list_rebuilds, 1);
+        assert_eq!(block.stmts.len(), 2);
+        let (_, constructor) = constructor_seed(&block.stmts[0]).expect("rewritten seed");
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [
+                HirTableField::Record(HirRecordField {
+                    key: HirTableKey::Expr(HirExpr::Integer(1)),
+                    value: HirExpr::Integer(10),
+                }),
+                HirTableField::Array(HirExpr::Nil),
+                HirTableField::Array(HirExpr::Integer(20)),
+            ]
+        ));
+        assert!(matches!(
+            block.stmts[1],
+            HirStmt::Assign(ref assign)
+                if matches!(assign.values.fixed.as_slice(), [HirExpr::Integer(30)])
+        ));
+    }
+
+    #[test]
+    fn open_local_fallback_accepts_exact_interval_under_compaction_and_reuse() {
+        let owner = LocalId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(
+                    owner,
+                    HirTableConstructor {
+                        fields: vec![HirTableField::Array(HirExpr::Integer(10))],
+                        trailing_multivalue: None,
+                    },
+                ),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 2,
+                    values: HirValuePack::expanding(
+                        vec![HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                            fields: vec![HirTableField::Array(call("fixed_value"))],
+                            trailing_multivalue: None,
+                        }))],
+                        HirPackTail::open(call("open_tail")),
+                    ),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(owner)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(30)]),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.enable_home_slot_compaction();
+        let mut pass = table_pass(&block, &promotion_facts, &[None]);
+        assert!(!promotion_facts.is_direct_table_seed_local(owner));
+        assert_eq!(
+            pass.materialized_bindings
+                .get(TableBinding::Local(owner))
+                .copied(),
+            Some(2)
+        );
+
+        assert!(pass.materialize_safe_fixed_set_lists(&mut block));
+        assert_eq!(block.stmts.len(), 2);
+        let (_, constructor) = constructor_seed(&block.stmts[0]).expect("rewritten seed");
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [
+                HirTableField::Array(HirExpr::Integer(10)),
+                HirTableField::Array(HirExpr::TableConstructor(_)),
+            ]
+        ));
+        assert!(
+            constructor
+                .trailing_multivalue
+                .as_ref()
+                .is_some_and(|tail| matches!(tail.as_expr(), HirExpr::Call(_)))
+        );
+        assert!(matches!(block.stmts[1], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn open_region_rebuild_uses_event_and_interval_facts_under_compaction() {
+        let owner = LocalId(0);
+        let producer = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(
+                    owner,
+                    HirTableConstructor {
+                        fields: vec![HirTableField::Array(HirExpr::Integer(10))],
+                        trailing_multivalue: None,
+                    },
+                ),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![producer],
+                    values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::new(
+                        HirTableConstructor {
+                            fields: vec![HirTableField::Array(HirExpr::Integer(20))],
+                            trailing_multivalue: None,
+                        },
+                    ))]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 2,
+                    values: HirValuePack::expanding(
+                        vec![
+                            HirExpr::LocalRef(producer),
+                            HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                                fields: vec![HirTableField::Array(call("fixed_value"))],
+                                trailing_multivalue: None,
+                            })),
+                        ],
+                        HirPackTail::open(call("open_tail")),
+                    ),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_slot(producer, HomeSlotKey::new(1, 0));
+        promotion_facts.enable_home_slot_compaction();
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None]);
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 1);
+        let (_, constructor) = constructor_seed(&block.stmts[0]).expect("rewritten seed");
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [
+                HirTableField::Array(HirExpr::Integer(10)),
+                HirTableField::Array(HirExpr::TableConstructor(_)),
+                HirTableField::Array(HirExpr::TableConstructor(_)),
+            ]
+        ));
+        assert!(
+            constructor
+                .trailing_multivalue
+                .as_ref()
+                .is_some_and(|tail| matches!(tail.as_expr(), HirExpr::Call(_)))
+        );
+    }
+
+    #[test]
+    fn open_region_accepts_complex_dynamic_record_events() {
+        let owner = LocalId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                        base: HirExpr::LocalRef(owner),
+                        key: call("make_key"),
+                    }))],
+                    values: HirValuePack::fixed(vec![call("make_value")]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::expanding(
+                        vec![HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                            fields: vec![HirTableField::Array(HirExpr::Integer(10))],
+                            trailing_multivalue: None,
+                        }))],
+                        HirPackTail::open(call("open_tail")),
+                    ),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[None]);
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 1);
+        let (_, constructor) = constructor_seed(&block.stmts[0]).expect("rewritten seed");
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [
+                HirTableField::Record(HirRecordField {
+                    key: HirTableKey::Expr(HirExpr::Call(_)),
+                    value: HirExpr::Call(_),
+                }),
+                HirTableField::Array(HirExpr::TableConstructor(_)),
+            ]
+        ));
+        assert!(constructor.trailing_multivalue.is_some());
+    }
+
+    #[test]
+    fn open_region_keeps_parallel_open_assignment_outside_scanner_grammar() {
+        let owner = LocalId(0);
+        let side = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![
+                        HirLValue::TableAccess(Box::new(HirTableAccess {
+                            base: HirExpr::LocalRef(owner),
+                            key: HirExpr::String("value".into()),
+                        })),
+                        HirLValue::Local(side),
+                    ],
+                    values: HirValuePack::expanding(
+                        vec![HirExpr::Integer(1)],
+                        HirPackTail::open(call("parallel_tail")),
+                    ),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::expanding(
+                        vec![HirExpr::TableConstructor(Box::default())],
+                        HirPackTail::open(call("open_tail")),
+                    ),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_slot(side, HomeSlotKey::new(1, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None]);
+
+        assert!(!pass.rewrite_block(&mut block));
+        assert!(matches!(block.stmts[1], HirStmt::Assign(ref assign) if assign.targets.len() == 2));
+        assert!(matches!(block.stmts[2], HirStmt::TableSetList(_)));
+    }
+
+    #[test]
+    fn dynamic_record_key_keeps_removed_object_root_before_later_batch() {
+        let owner = LocalId(0);
+        let producer = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                local_table(
+                    producer,
+                    HirTableConstructor {
+                        fields: vec![HirTableField::Array(HirExpr::Integer(20))],
+                        trailing_multivalue: None,
+                    },
+                ),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                        base: HirExpr::LocalRef(owner),
+                        key: call("dynamic_key"),
+                    }))],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(producer)]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::expanding(
+                        vec![HirExpr::TableConstructor(Box::default())],
+                        HirPackTail::open(call("observe_lifetime")),
+                    ),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_slot(producer, HomeSlotKey::new(1, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None]);
+
+        assert!(region_has_followup_table_write_after_object_producer(
+            &block,
+            0,
+            3,
+            TableBinding::Local(owner),
+            &[],
+        ));
+        assert!(!pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 4);
+        assert!(matches!(block.stmts[3], HirStmt::TableSetList(_)));
+    }
+
+    #[test]
+    fn indexed_fallback_defers_open_seed_tail_to_region_owner() {
+        let owner = LocalId(0);
+        let prefix = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(
+                    owner,
+                    HirTableConstructor {
+                        fields: Vec::new(),
+                        trailing_multivalue: Some(HirPackTail::open(HirExpr::VarArg)),
+                    },
+                ),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![prefix],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_slot(prefix, HomeSlotKey::new(1, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None]);
+
+        assert!(!pass.materialize_safe_fixed_set_lists(&mut block));
+        assert!(matches!(block.stmts[2], HirStmt::TableSetList(_)));
+    }
+
+    #[test]
+    fn fixed_set_list_accepts_effectful_prefix_on_disjoint_complete_homes() {
+        let owner = LocalId(0);
+        let nested = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                local_table(
+                    nested,
+                    HirTableConstructor {
+                        fields: vec![HirTableField::Array(call("make_nested_value"))],
+                        trailing_multivalue: None,
+                    },
+                ),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                        base: HirExpr::LocalRef(nested),
+                        key: call("make_key"),
+                    }))],
+                    values: HirValuePack::fixed(vec![call("make_value")]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(10), HirExpr::Integer(20)]),
+                })),
+            ],
+        };
+        let owner_home = HomeSlotKey::new(0, 0);
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, owner_home);
+        promotion_facts.record_local_home_slot(nested, HomeSlotKey::new(1, 0));
+        promotion_facts
+            .record_local_home_merge(nested, Some(BTreeSet::from([HomeSlotKey::new(2, 0)])));
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None]);
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 4);
+        assert!(
+            !block
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, HirStmt::TableSetList(_)))
+        );
+        assert!(matches!(
+            &block.stmts[1],
+            HirStmt::LocalDecl(decl)
+                if matches!(decl.values.fixed.as_slice(), [HirExpr::TableConstructor(constructor)]
+                    if matches!(constructor.fields.as_slice(), [
+                        HirTableField::Array(HirExpr::Call(_)),
+                        HirTableField::Record(HirRecordField {
+                            key: HirTableKey::Expr(HirExpr::Call(_)),
+                            value: HirExpr::Call(_),
+                        }),
+                    ]))
+        ));
+    }
+
+    #[test]
+    fn debug_visible_seed_rejects_effectful_prefix_before_fixed_set_list() {
+        let owner = LocalId(0);
+        let producer = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![producer],
+                    values: HirValuePack::fixed(vec![call("inspect_owner")]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_slot(producer, HomeSlotKey::new(1, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[Some("owner".into()), None]);
+
+        assert!(!pass.rewrite_block(&mut block));
+        assert!(matches!(block.stmts[2], HirStmt::TableSetList(_)));
+    }
+
+    #[test]
+    fn debug_visible_seed_accepts_its_own_effectful_initializer() {
+        let owner = LocalId(0);
+        let inert_prefix = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(
+                    owner,
+                    HirTableConstructor {
+                        fields: vec![HirTableField::Array(call("make_initial_value"))],
+                        trailing_multivalue: None,
+                    },
+                ),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![inert_prefix],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_slot(inert_prefix, HomeSlotKey::new(1, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[Some("owner".into()), None]);
+
+        assert!(pass.materialize_safe_fixed_set_lists(&mut block));
+        assert!(matches!(block.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn possible_home_alias_keeps_fixed_set_list_raw() {
+        let owner = LocalId(0);
+        let merged_alias = LocalId(1);
+        let snapshot = LocalId(2);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![snapshot],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(merged_alias)]),
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                })),
+            ],
+        };
+        let owner_home = HomeSlotKey::new(0, 0);
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, owner_home);
+        promotion_facts.record_local_home_slot(merged_alias, HomeSlotKey::new(1, 0));
+        promotion_facts.record_local_home_merge(merged_alias, Some(BTreeSet::from([owner_home])));
+        promotion_facts.record_local_home_slot(snapshot, HomeSlotKey::new(2, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None, None]);
+
+        assert!(!pass.rewrite_block(&mut block));
+        assert!(matches!(block.stmts[2], HirStmt::TableSetList(_)));
+    }
+
+    #[test]
+    fn fixed_set_list_prefix_accepts_seed_disjoint_preserved_statements() {
+        let owner = LocalId(0);
+        let left = LocalId(1);
+        let right = LocalId(2);
+        let resource = LocalId(3);
+        let external_base = HirExpr::TableAccess(Box::new(HirTableAccess {
+            base: HirExpr::GlobalRef(HirGlobalRef {
+                name: "registry".into(),
+            }),
+            key: HirExpr::String("target".into()),
+        }));
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![left],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![right],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![resource],
+                    values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(left), HirLValue::Local(right)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
+                        base: external_base,
+                        key: HirExpr::String("value".into()),
+                    }))],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(3)]),
+                })),
+                HirStmt::CallStmt(Box::new(HirCallStmt {
+                    call: match call("tick") {
+                        HirExpr::Call(call) => *call,
+                        _ => unreachable!("call helper returns a call"),
+                    },
+                })),
+                HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+                    origin: InstrRef(0),
+                    reg_index: 3,
+                    value: HirExpr::LocalRef(resource),
+                })),
+                HirStmt::Close(Box::new(HirClose { from_reg: 3 })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(10)]),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        for (local, slot) in [(owner, 0), (left, 1), (right, 2), (resource, 3)] {
+            promotion_facts.record_local_home_slot(local, HomeSlotKey::new(slot, 0));
+        }
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None, None, None]);
+
+        assert!(pass.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 10);
+        assert!(
+            !block
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, HirStmt::TableSetList(_)))
+        );
+        assert!(matches!(block.stmts[4], HirStmt::Assign(ref assign) if assign.targets.len() == 2));
+        assert!(matches!(block.stmts[6], HirStmt::CallStmt(_)));
+        assert!(matches!(block.stmts[8], HirStmt::Close(_)));
+    }
+
+    #[test]
+    fn escaped_seed_keeps_raw_set_list_before_metamethod_capable_call() {
+        let owner = LocalId(0);
+        let alias = LocalId(1);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_table(owner, HirTableConstructor::default()),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![alias],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(owner)]),
+                })),
+                HirStmt::CallStmt(Box::new(HirCallStmt {
+                    call: HirCallExpr {
+                        callee: HirExpr::GlobalRef(HirGlobalRef {
+                            name: "install_metatable".into(),
+                        }),
+                        args: HirValuePack::fixed(vec![HirExpr::LocalRef(alias)]),
+                        method: false,
+                        fastcall: None,
+                        method_name: None,
+                    },
+                })),
+                HirStmt::TableSetList(Box::new(HirTableSetList {
+                    base: HirExpr::LocalRef(owner),
+                    start_index: 1,
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(10)]),
+                })),
+            ],
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_slot(alias, HomeSlotKey::new(1, 0));
+        let mut pass = table_pass(&block, &promotion_facts, &[None, None]);
+
+        assert!(!pass.rewrite_block(&mut block));
+        assert!(matches!(block.stmts[3], HirStmt::TableSetList(_)));
     }
 }

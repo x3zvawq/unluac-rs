@@ -23,9 +23,9 @@ use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, LocalId, ParamId, TempId,
 };
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EffectTag, GraphFacts,
-    LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, SsaValue,
-    StructurePlan,
+    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EffectTag, GraphFacts, InstrEffect,
+    LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, SideEffectSummary,
+    SsaValue, StructurePlan,
 };
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg, UpvalueOperand};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -476,6 +476,11 @@ impl ProtoPromotionFacts {
                 .resize(temp.index() + 1, HomeSlotResolution::Pending);
         }
         self.temp_home_slots[temp.index()] = HomeSlotResolution::from_home(home_slot);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_direct_table_seed_for_test(&mut self, temp: TempId) {
+        self.direct_table_seed_temps.insert(temp);
     }
 
     #[cfg(test)]
@@ -1252,15 +1257,16 @@ fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTr
 }
 
 /// 从 low-IR 正证一个 direct `GETUPVAL`/跨槽 `MOVE` copy 的物理槽在后续所有潜在
-/// 用户代码/GC 观察点
-/// 都仍位于 VM active stack top 以下，并沿同一 basic block 或严格前向的单入口 CFG
-/// 链活到 Return，或在原 block 内活到一个精确的 scalar-nil overwrite。
+/// 用户代码/GC 观察点都仍位于 VM active stack top 以下，并沿同一 basic block、线性
+/// single-entry fast path，或 predecessor-closed 的严格前向 CFG DAG 活到每条路径的
+/// Return/TailCall；原 block 内还可活到一个精确的 scalar-nil overwrite。
 ///
 /// HIR 会丢失 block 结束时的隐式 stack-top 收缩；只看“后缀没有同槽写”会把已经到期
-/// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实；只跨 CFG 能证明
-/// 单入口且无回边的 successor，且不跨分支或无法计算活动栈下界的事件；TBC 与专用调用协议
-/// 只消费各自的固定输入 root prefix。`Close` 本身不覆盖槽位，因此可以在已证明的活动
-/// caller prefix 内继续到原始 `Return`。
+/// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实；分支 successor 与
+/// join 用 entry-driven must-state 合流，只有 producer 支配的前向闭合子图才能发布
+/// all-successor scope-end。回边、外部 join 入口、路径 overwrite 与无法计算活动栈下界的
+/// 事件仍拒绝；TBC 与专用调用协议只消费各自的固定输入 root prefix。`Close` 本身不覆盖
+/// 槽位，因此可以在已证明的活动 caller prefix 内继续到原始 `Return`。
 #[derive(Default)]
 struct CopyRootFacts {
     scope_end: BTreeSet<TempId>,
@@ -1327,7 +1333,16 @@ fn copy_root_end(
             if copy_root_forward_block_successor(cfg, current_block) != Some(instr_block)
                 || cfg.blocks.get(instr_block.index())?.instrs.start != InstrRef(index)
             {
-                return None;
+                return copy_root_cfg_scope_end(
+                    &proto.instrs,
+                    cfg,
+                    &dataflow.instr_effects,
+                    &dataflow.effect_summaries,
+                    current_block,
+                    observed,
+                    home,
+                )
+                .map(|()| CopyRootEnd::ScopeEnd);
             }
             crossed_block = true;
             current_block = instr_block;
@@ -1338,9 +1353,10 @@ fn copy_root_end(
         // 当前值若被覆盖，同一 root transaction 要么在精确 nil 写处终止，要么失去证明。
         if effect.must_define(home) {
             if crossed_block {
-                // 候选拒绝[LayerBoundary]：跨 low block 的 overwrite 还需 dead_temps/HIR
-                // root-lifetime owner 证明 producer 与终止写落在同一可改写 HirBlock；
-                // 否则当前 consumer 找不到精确 overwrite pair，不能发布该事实。
+                // 候选拒绝[ProofIncomplete]：raw CFG 已定位到跨 low block 的终止写，
+                // 但 dead_temps::preserve_copy_roots_in_block 只会在 producer 所在 HirBlock
+                // 内查找 overwrite assignment；在 HIR location mapping owner 发布精确 pair
+                // 前不能把这个 raw fact 交给 consumer。
                 return None;
             }
             if observed
@@ -1349,76 +1365,49 @@ fn copy_root_end(
             {
                 return Some(CopyRootEnd::NilOverwrite(overwrite));
             }
-            // 候选拒绝[SemanticBarrier:Lifetime]：同槽覆盖会在原位置结束旧 root；
-            // 只有 direct scalar nil overwrite 能在 HIR 精确复现该终止点。
+            // 候选拒绝[ProofIncomplete]：direct boolean/integer/number 等 GC-inert scalar
+            // overwrite 也能在原位置结束旧 root，但当前 promotion fact 与 dead_temps
+            // consumer 只共同编码了 Nil assignment；扩展前不能发布 consumer 无法重放的事实。
+            // 候选拒绝[SemanticBarrier:Lifetime]：collectable/effectful overwrite 若直接改写为
+            // PhysicalRoot local，会把新 RHS 的生命周期延长到 raw home 失活点之后。
             return None;
         }
 
+        match copy_root_instr_progress(
+            instr,
+            effect,
+            low_instr_may_observe_gc_roots(&dataflow.effect_summaries, index),
+            home,
+            &mut observed,
+        )? {
+            CopyRootInstrProgress::Continue => {}
+            CopyRootInstrProgress::ScopeEnd => return Some(CopyRootEnd::ScopeEnd),
+        }
+
         match instr {
-            LowInstr::Return(_) => return observed.then_some(CopyRootEnd::ScopeEnd),
-            LowInstr::Call(call) => {
-                // 只消费跨方言共同成立的 caller-prefix：callee base 以下的槽在被调
-                // 函数执行期间仍属于 caller frame。LuaJIT 的 FR1/FR2 frame link 会让
-                // args.start 与真实 TValue root 区间不同，不能用参数 range 推 active top。
-                if call.callee.index() <= home.index() {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：callee base 不高于 copy home
-                    // 时，该槽不属于被调函数执行期间的 caller root 前缀。
-                    return None;
-                }
-                observed = true;
-            }
-            LowInstr::Close(_) => {
-                // CLOSE 结束 open-upvalue / TBC 事务，但不覆盖当前槽；前序观察点已经
-                // 证明 home 位于活动 caller prefix，保留同一物理 local 穿过 CLOSE
-                // 只复现 VM 原有 root。继续扫描到原始 Return 才冻结作用域终点。
-            }
-            LowInstr::Tbc(tbc) => {
-                let active_top = fixed_input_root_prefix_top([tbc.reg]);
-                if active_top <= home.index() {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：TBC 的异常/cleanup 路径只保证
-                    // 标记槽以下仍属于活动 caller prefix；更高 copy home 已过期。
-                    return None;
-                }
-                observed = true;
-            }
-            LowInstr::GenericForCall(call) => {
-                // 迭代器调用执行期间只把 iterator/state/control 作为 caller roots；result
-                // targets 尚未产生，不能用通用 InstrEffect 的 must-def 抬高 active top。
-                let active_top =
-                    fixed_input_root_prefix_top([call.iterator, call.state, call.control]);
-                if active_top <= home.index() {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：copy 位于 TFORCALL 的三个活动
-                    // 输入以上时，迭代器中的 GC 可观察其已经失活（同 regress_416 的
-                    // block-end 高槽到期边界）。
-                    return None;
-                }
-                observed = true;
-            }
-            LowInstr::TailCall(_) => {
-                // tail callee 执行前 caller frame 已结束，不能把它当成新的 root 观察点；
-                // 但此前已被普通调用观察过的 transaction 可精确在此结束作用域。
-                return observed.then_some(CopyRootEnd::ScopeEnd);
-            }
             LowInstr::Jump(_) => {
-                let successor = copy_root_forward_jump_successor(cfg, InstrRef(index))?;
-                crossed_block = true;
-                current_block = successor;
-                index = cfg.blocks.get(successor.index())?.instrs.start.index();
-                continue;
+                return copy_root_cfg_scope_end(
+                    &proto.instrs,
+                    cfg,
+                    &dataflow.instr_effects,
+                    &dataflow.effect_summaries,
+                    current_block,
+                    observed,
+                    home,
+                )
+                .map(|()| CopyRootEnd::ScopeEnd);
             }
             _ if instr.is_control_terminator() => {
-                // 候选拒绝[LayerBoundary]：branch/loop 的每条 successor active-top 与
-                // HIR root 终止作用域应由 Structure CFG root-lifetime summary owner 汇总；
-                // regress_416 证明高槽可在另一后继先失活，不能按线性 PC 或任选一路延长。
-                return None;
-            }
-            _ if low_instr_may_observe_gc_roots(dataflow, index) => {
-                if !effect_keeps_copy_home_rooted(effect, home) {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：当前观察点不能正证 copy home
-                    // 位于活动栈下界内；block-end 高槽到期反例会在这里被排除。
-                    return None;
-                }
-                observed = true;
+                return copy_root_cfg_scope_end(
+                    &proto.instrs,
+                    cfg,
+                    &dataflow.instr_effects,
+                    &dataflow.effect_summaries,
+                    current_block,
+                    observed,
+                    home,
+                )
+                .map(|()| CopyRootEnd::ScopeEnd);
             }
             _ => {}
         }
@@ -1428,19 +1417,248 @@ fn copy_root_end(
     None
 }
 
-fn copy_root_forward_jump_successor(cfg: &Cfg, terminator: InstrRef) -> Option<BlockRef> {
-    let block = *cfg.instr_to_block.get(terminator.index())?;
-    if cfg.blocks.get(block.index())?.instrs.last() != Some(terminator) {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CopyRootInstrProgress {
+    Continue,
+    ScopeEnd,
+}
+
+fn copy_root_instr_progress(
+    instr: &LowInstr,
+    effect: &InstrEffect,
+    may_observe_gc_roots: bool,
+    home: Reg,
+    observed: &mut bool,
+) -> Option<CopyRootInstrProgress> {
+    match instr {
+        LowInstr::Return(_) => observed.then_some(CopyRootInstrProgress::ScopeEnd),
+        LowInstr::Call(call) => {
+            // 只消费跨方言共同成立的 caller-prefix：callee base 以下的槽在被调
+            // 函数执行期间仍属于 caller frame。LuaJIT 的 FR1/FR2 frame link 会让
+            // args.start 与真实 TValue root 区间不同，不能用参数 range 推 active top。
+            if call.callee.index() <= home.index() {
+                // 候选拒绝[SemanticBarrier:Lifetime]：callee base 不高于 copy home
+                // 时，该槽不属于被调函数执行期间的 caller root 前缀。
+                return None;
+            }
+            *observed = true;
+            Some(CopyRootInstrProgress::Continue)
+        }
+        LowInstr::Close(_) => {
+            // CLOSE 结束 open-upvalue / TBC 事务，但不覆盖当前槽；前序观察点已经
+            // 证明 home 位于活动 caller prefix，保留同一物理 local 穿过 CLOSE
+            // 只复现 VM 原有 root。继续扫描到原始 Return 才冻结作用域终点。
+            Some(CopyRootInstrProgress::Continue)
+        }
+        LowInstr::Tbc(tbc) => {
+            let active_top = fixed_input_root_prefix_top([tbc.reg]);
+            if active_top <= home.index() {
+                // 候选拒绝[SemanticBarrier:Lifetime]：TBC 的异常/cleanup 路径只保证
+                // 标记槽以下仍属于活动 caller prefix；更高 copy home 已过期。
+                return None;
+            }
+            *observed = true;
+            Some(CopyRootInstrProgress::Continue)
+        }
+        LowInstr::GenericForCall(call) => {
+            // 迭代器调用执行期间只把 iterator/state/control 作为 caller roots；result
+            // targets 尚未产生，不能用通用 InstrEffect 的 must-def 抬高 active top。
+            let active_top = fixed_input_root_prefix_top([call.iterator, call.state, call.control]);
+            if active_top <= home.index() {
+                // 候选拒绝[SemanticBarrier:Lifetime]：copy 位于 TFORCALL 的三个活动
+                // 输入以上时，迭代器中的 GC 可观察其已经失活（同 regress_416 的
+                // block-end 高槽到期边界）。
+                return None;
+            }
+            *observed = true;
+            Some(CopyRootInstrProgress::Continue)
+        }
+        LowInstr::TailCall(_) => {
+            // tail callee 执行前 caller frame 已结束，不能把它当成新的 root 观察点；
+            // 但此前已被普通调用观察过的 transaction 可精确在此结束作用域。
+            observed.then_some(CopyRootInstrProgress::ScopeEnd)
+        }
+        _ if instr.is_control_terminator() => Some(CopyRootInstrProgress::Continue),
+        _ if may_observe_gc_roots => {
+            if !effect_keeps_copy_home_rooted(effect, home) {
+                // 候选拒绝[SemanticBarrier:Lifetime]：当前观察点不能正证 copy home
+                // 位于活动栈下界内；block-end 高槽到期反例会在这里被排除。
+                return None;
+            }
+            *observed = true;
+            Some(CopyRootInstrProgress::Continue)
+        }
+        _ => Some(CopyRootInstrProgress::Continue),
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CopyRootCfgBlockEnd {
+    Continue { observed: bool },
+    ScopeEnd,
+}
+
+/// 从一个已执行的 control terminator 出发，只接受严格前向、无环且每条动态路径都在
+/// scope end 前观察过同一 active home 的 CFG。incoming observation 在 join 取交集；
+/// 状态只会由 true 变为 false，有限 DAG 上的 worklist 因而必然收敛。
+fn copy_root_cfg_scope_end(
+    instrs: &[LowInstr],
+    cfg: &Cfg,
+    instr_effects: &[InstrEffect],
+    effect_summaries: &[SideEffectSummary],
+    source: BlockRef,
+    observed: bool,
+    home: Reg,
+) -> Option<()> {
+    let region = copy_root_forward_cfg_region(instrs, cfg, source)?;
+    if region.iter().any(|block| {
+        cfg.reachable_predecessors(*block)
+            .into_iter()
+            .any(|predecessor| predecessor != source && !region.contains(&predecessor))
+    }) {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：子图外 predecessor 会在未执行 producer
+        // 的情况下进入 join；把该 raw def 提升为 join 后仍活跃的 root 会伪造支配关系。
         return None;
     }
-    copy_root_forward_block_successor(cfg, block)
+
+    let mut incoming = BTreeMap::<BlockRef, bool>::new();
+    let mut pending = VecDeque::new();
+    for successor in copy_root_forward_cfg_successors(cfg, source)? {
+        merge_copy_root_cfg_incoming(&mut incoming, &mut pending, successor, observed);
+    }
+
+    let mut reached_scope_end = false;
+    while let Some(block) = pending.pop_front() {
+        let observed = incoming.get(&block).copied()?;
+        match scan_copy_root_cfg_block(
+            instrs,
+            cfg,
+            instr_effects,
+            effect_summaries,
+            block,
+            observed,
+            home,
+        )? {
+            CopyRootCfgBlockEnd::ScopeEnd => reached_scope_end = true,
+            CopyRootCfgBlockEnd::Continue { observed } => {
+                for successor in copy_root_forward_cfg_successors(cfg, block)? {
+                    merge_copy_root_cfg_incoming(&mut incoming, &mut pending, successor, observed);
+                }
+            }
+        }
+    }
+
+    reached_scope_end.then_some(())
+}
+
+fn copy_root_forward_cfg_region(
+    instrs: &[LowInstr],
+    cfg: &Cfg,
+    source: BlockRef,
+) -> Option<BTreeSet<BlockRef>> {
+    let mut region = BTreeSet::new();
+    let mut pending = VecDeque::from(copy_root_forward_cfg_successors(cfg, source)?);
+    while let Some(block) = pending.pop_front() {
+        if !region.insert(block) {
+            continue;
+        }
+        if matches!(
+            cfg.terminator(instrs, block),
+            Some(LowInstr::Return(_) | LowInstr::TailCall(_))
+        ) {
+            continue;
+        }
+        pending.extend(copy_root_forward_cfg_successors(cfg, block)?);
+    }
+    Some(region)
+}
+
+fn merge_copy_root_cfg_incoming(
+    incoming: &mut BTreeMap<BlockRef, bool>,
+    pending: &mut VecDeque<BlockRef>,
+    block: BlockRef,
+    observed: bool,
+) {
+    match incoming.get_mut(&block) {
+        None => {
+            incoming.insert(block, observed);
+            pending.push_back(block);
+        }
+        Some(previous) => {
+            let merged = *previous && observed;
+            if merged != *previous {
+                *previous = merged;
+                pending.push_back(block);
+            }
+        }
+    }
+}
+
+fn scan_copy_root_cfg_block(
+    instrs: &[LowInstr],
+    cfg: &Cfg,
+    instr_effects: &[InstrEffect],
+    effect_summaries: &[SideEffectSummary],
+    block: BlockRef,
+    mut observed: bool,
+    home: Reg,
+) -> Option<CopyRootCfgBlockEnd> {
+    let range = cfg.blocks.get(block.index())?.instrs;
+    if range.is_empty() {
+        return None;
+    }
+    for index in range.start.index()..range.end() {
+        let instr = instrs.get(index)?;
+        let effect = instr_effects.get(index)?;
+        if effect.must_define(home) {
+            // 候选拒绝[ProofIncomplete]：分支路径上的 overwrite 需要路径专属 HIR
+            // terminator location；当前 consumer 只能重放同块单一 overwrite。
+            return None;
+        }
+        match copy_root_instr_progress(
+            instr,
+            effect,
+            low_instr_may_observe_gc_roots(effect_summaries, index),
+            home,
+            &mut observed,
+        )? {
+            CopyRootInstrProgress::Continue => {}
+            CopyRootInstrProgress::ScopeEnd => return Some(CopyRootCfgBlockEnd::ScopeEnd),
+        }
+        if instr.is_control_terminator() {
+            if range.last() != Some(InstrRef(index)) {
+                return None;
+            }
+            return Some(CopyRootCfgBlockEnd::Continue { observed });
+        }
+    }
+    Some(CopyRootCfgBlockEnd::Continue { observed })
+}
+
+fn copy_root_forward_cfg_successors(cfg: &Cfg, block: BlockRef) -> Option<Vec<BlockRef>> {
+    let block_end = cfg.blocks.get(block.index())?.instrs.end();
+    let successors = cfg.reachable_successors(block);
+    if successors.is_empty()
+        || successors.iter().any(|successor| {
+            let Some(range) = cfg.blocks.get(successor.index()).map(|block| block.instrs) else {
+                return true;
+            };
+            range.is_empty() || range.start.index() < block_end
+        })
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：回边会重用同一静态 copy def，空/synthetic
+        // successor 也没有可扫描的 scope-end transaction，均不能冻结成本轮 root。
+        return None;
+    }
+    Some(successors)
 }
 
 fn copy_root_forward_block_successor(cfg: &Cfg, block: BlockRef) -> Option<BlockRef> {
     let successor = cfg.unique_reachable_successor(block)?;
     if cfg.unique_reachable_predecessor_matching(successor, |_| true) != Some(block) {
-        // 候选拒绝[LayerBoundary]：join successor 需要 Structure CFG owner 合流每个
-        // predecessor 的 root/top 状态；只沿当前 copy 路径会漏掉另一入口的槽生命周期。
+        // 候选拒绝[SemanticBarrier:ControlFlow]：线性 Jump/fallthrough 进入多前驱 join
+        // 时，另一入口可能没有执行 producer；只有 copy_root_cfg_scope_end 证明整个
+        // 前向子图 predecessor-closed 的 branch join 才能合流。
         return None;
     }
     let successor_range = cfg.blocks.get(successor.index())?.instrs;
@@ -1499,7 +1717,7 @@ fn fixed_input_root_prefix_top<const N: usize>(regs: [Reg; N]) -> usize {
         .unwrap_or_default()
 }
 
-fn low_instr_may_observe_gc_roots(dataflow: &DataflowFacts, index: usize) -> bool {
+fn low_instr_may_observe_gc_roots(effect_summaries: &[SideEffectSummary], index: usize) -> bool {
     const OBSERVATION_TAGS: &[EffectTag] = &[
         EffectTag::Alloc,
         EffectTag::ReadTable,
@@ -1510,7 +1728,7 @@ fn low_instr_may_observe_gc_roots(dataflow: &DataflowFacts, index: usize) -> boo
         EffectTag::Metamethod,
     ];
 
-    dataflow.effect_summaries.get(index).is_some_and(|summary| {
+    effect_summaries.get(index).is_some_and(|summary| {
         OBSERVATION_TAGS
             .iter()
             .any(|tag| summary.tags.contains(tag))
@@ -1662,6 +1880,10 @@ mod tests {
     use crate::structure::{
         BasicBlock, BlockKind, CfgEdge, EdgeKind, EdgeRef, InstrEffect, InstrRange,
     };
+    use crate::transformer::{
+        BranchCond, BranchInstr, CallInstr, CallKind, CondOperand, JumpInstr, MoveInstr, RegRange,
+        ResultPack, ReturnInstr, ValuePack,
+    };
 
     #[test]
     fn home_resolution_retains_finite_multi_home_union() {
@@ -1711,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_root_crosses_only_a_forward_single_entry_jump() {
+    fn copy_root_linear_fast_path_crosses_only_a_forward_single_entry_block() {
         let forward = Cfg {
             blocks: vec![
                 BasicBlock {
@@ -1748,7 +1970,7 @@ mod tests {
             reachable_blocks: BTreeSet::from([BlockRef(0), BlockRef(1), BlockRef(2)]),
         };
         assert_eq!(
-            copy_root_forward_jump_successor(&forward, InstrRef(1)),
+            copy_root_forward_block_successor(&forward, BlockRef(0)),
             Some(BlockRef(1))
         );
 
@@ -1788,7 +2010,172 @@ mod tests {
             reachable_blocks: BTreeSet::from([BlockRef(0), BlockRef(1)]),
         };
         assert_eq!(
-            copy_root_forward_jump_successor(&backedge, InstrRef(1)),
+            copy_root_forward_block_successor(&backedge, BlockRef(1)),
+            None
+        );
+        assert_eq!(
+            copy_root_cfg_scope_end(
+                &[
+                    LowInstr::Jump(JumpInstr {
+                        target: InstrRef(1),
+                    }),
+                    LowInstr::Jump(JumpInstr {
+                        target: InstrRef(0),
+                    }),
+                ],
+                &backedge,
+                &[InstrEffect::default(), InstrEffect::default()],
+                &[SideEffectSummary::default(), SideEffectSummary::default()],
+                BlockRef(0),
+                true,
+                Reg(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_root_cfg_join_meets_observation_from_every_predecessor() {
+        let cfg = Cfg {
+            blocks: vec![
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(0), 1),
+                },
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(1), 2),
+                },
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(3), 2),
+                },
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(5), 1),
+                },
+                BasicBlock {
+                    kind: BlockKind::SyntheticExit,
+                    instrs: InstrRange::new(InstrRef(6), 0),
+                },
+            ],
+            edges: vec![
+                CfgEdge {
+                    from: BlockRef(0),
+                    to: BlockRef(1),
+                    kind: EdgeKind::BranchTrue,
+                },
+                CfgEdge {
+                    from: BlockRef(0),
+                    to: BlockRef(2),
+                    kind: EdgeKind::BranchFalse,
+                },
+                CfgEdge {
+                    from: BlockRef(1),
+                    to: BlockRef(3),
+                    kind: EdgeKind::Jump,
+                },
+                CfgEdge {
+                    from: BlockRef(2),
+                    to: BlockRef(3),
+                    kind: EdgeKind::Jump,
+                },
+                CfgEdge {
+                    from: BlockRef(3),
+                    to: BlockRef(4),
+                    kind: EdgeKind::Return,
+                },
+            ],
+            entry_block: BlockRef(0),
+            exit_block: BlockRef(4),
+            block_order: vec![BlockRef(0), BlockRef(1), BlockRef(2), BlockRef(3)],
+            instr_to_block: vec![
+                BlockRef(0),
+                BlockRef(1),
+                BlockRef(1),
+                BlockRef(2),
+                BlockRef(2),
+                BlockRef(3),
+            ],
+            preds: vec![
+                vec![],
+                vec![EdgeRef(0)],
+                vec![EdgeRef(1)],
+                vec![EdgeRef(2), EdgeRef(3)],
+                vec![EdgeRef(4)],
+            ],
+            succs: vec![
+                vec![EdgeRef(0), EdgeRef(1)],
+                vec![EdgeRef(2)],
+                vec![EdgeRef(3)],
+                vec![EdgeRef(4)],
+                vec![],
+            ],
+            reachable_blocks: BTreeSet::from([
+                BlockRef(0),
+                BlockRef(1),
+                BlockRef(2),
+                BlockRef(3),
+                BlockRef(4),
+            ]),
+        };
+        let observing_call = || {
+            LowInstr::Call(CallInstr {
+                callee: Reg(2),
+                args: ValuePack::Fixed(RegRange::new(Reg(3), 0)),
+                results: ResultPack::Ignore,
+                kind: CallKind::Normal,
+                method_name: None,
+            })
+        };
+        let mut instrs = vec![
+            LowInstr::Branch(BranchInstr {
+                cond: BranchCond::truthy(CondOperand::Reg(Reg(0)), false),
+                then_target: InstrRef(1),
+                else_target: InstrRef(3),
+            }),
+            observing_call(),
+            LowInstr::Jump(JumpInstr {
+                target: InstrRef(5),
+            }),
+            observing_call(),
+            LowInstr::Jump(JumpInstr {
+                target: InstrRef(5),
+            }),
+            LowInstr::Return(ReturnInstr {
+                values: ValuePack::Fixed(RegRange::new(Reg(0), 0)),
+            }),
+        ];
+        let effects = vec![InstrEffect::default(); instrs.len()];
+        let summaries = vec![SideEffectSummary::default(); instrs.len()];
+
+        assert_eq!(
+            copy_root_cfg_scope_end(
+                &instrs,
+                &cfg,
+                &effects,
+                &summaries,
+                BlockRef(0),
+                false,
+                Reg(1),
+            ),
+            Some(())
+        );
+
+        instrs[3] = LowInstr::Move(MoveInstr {
+            dst: Reg(3),
+            src: Reg(4),
+        });
+        assert_eq!(
+            copy_root_cfg_scope_end(
+                &instrs,
+                &cfg,
+                &effects,
+                &summaries,
+                BlockRef(0),
+                false,
+                Reg(1),
+            ),
             None
         );
     }

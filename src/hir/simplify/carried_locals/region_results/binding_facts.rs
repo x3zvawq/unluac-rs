@@ -28,24 +28,6 @@ pub(super) fn binding_facts(stmts: &[HirStmt]) -> BindingFacts {
     facts
 }
 
-pub(super) fn binding_is_read_in_stmts(stmts: &[HirStmt], binding: CarryBinding) -> bool {
-    binding_facts(stmts)
-        .reads
-        .get(&binding)
-        .copied()
-        .unwrap_or(0)
-        != 0
-}
-
-pub(super) fn binding_is_written_in_stmts(stmts: &[HirStmt], binding: CarryBinding) -> bool {
-    binding_facts(stmts)
-        .writes
-        .get(&binding)
-        .copied()
-        .unwrap_or(0)
-        != 0
-}
-
 pub(super) fn binding_is_mentioned_in_stmts(stmts: &[HirStmt], binding: CarryBinding) -> bool {
     let facts = binding_facts(stmts);
     facts.reads.contains_key(&binding) || facts.writes.contains_key(&binding)

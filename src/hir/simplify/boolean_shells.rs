@@ -937,13 +937,14 @@ fn removable_dead_materialization_shell(
     }
     // 候选拒绝[SemanticBarrier:EvalCount]：删除 `if f() then t=true else t=false end` 会漏掉仍需执行一次的 `f()`。
     // 候选拒绝[SemanticBarrier:Metamethod]：LuaJIT cdata 与 primitive 的 equality 可能调用 ctype `__eq`；删除布尔壳会漏掉这次调用（regress_391）。
-    // 候选拒绝[LayerBoundary]：Unresolved 是 residual owner 的显式诊断，不能随死布尔壳静默删除。
+    // 候选拒绝[PolicyBoundary]：项目在 permissive 输出中保留 Unresolved 诊断，不能随
+    // 死布尔壳静默删除失败证据。
     if !safety.is_discard_safe_without_residual(&if_stmt.cond) {
         return false;
     }
 
     // 候选拒绝[SemanticBarrier:EvalCount]：死 binding 的 `t=f()` 仍必须调用一次 `f()`，不能随布尔壳一起丢弃。
-    // 候选拒绝[LayerBoundary]：任一 arm 的 Unresolved 必须继续交给 residual owner。
+    // 候选拒绝[PolicyBoundary]：任一 arm 的 Unresolved 都是 permissive 输出保留的失败证据。
     safety.is_discard_safe_without_residual(then_value)
         && safety.is_discard_safe_without_residual(else_value)
 }

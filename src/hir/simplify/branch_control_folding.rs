@@ -253,7 +253,8 @@ fn fold_constant_control(
                 continue;
             }
             if boundary.has_diagnostic() {
-                // 候选拒绝[LayerBoundary]：ErrNil/Unresolved 是前层显式诊断，branch-control 不得静默吞掉（regress339 Lua 5.5 ERRNNIL）。
+                // 候选拒绝[PolicyBoundary]：项目保留未执行 body 中的 ErrNil/Unresolved
+                // 失败证据，branch-control 不静默吞掉（regress339 Lua 5.5 ERRNNIL）。
                 rewritten.push(stmt);
                 continue;
             }
@@ -293,7 +294,8 @@ fn fold_constant_control(
             continue;
         }
         if discarded_boundary.is_some_and(DiscardBoundary::has_diagnostic) {
-            // 候选拒绝[LayerBoundary]：ErrNil/Unresolved 由诊断 owner 生成，branch-control 不删除其承载 arm（regress339 Lua 5.5 ERRNNIL）。
+            // 候选拒绝[PolicyBoundary]：项目保留未选 arm 中的 ErrNil/Unresolved
+            // 失败证据及其承载边界（regress339 Lua 5.5 ERRNNIL）。
             rewritten.push(HirStmt::If(if_stmt));
             continue;
         }
@@ -720,7 +722,8 @@ fn repeat_condition_fold_is_safe<'a>(
         return false;
     }
     if boundary.unresolved {
-        // 候选拒绝[LayerBoundary]：被重挂到 latch 的 Unresolved 是显式诊断残差，必须保留给 residual owner；它没有可声明等价的 Lua 求值语义。
+        // 候选拒绝[PolicyBoundary]：Unresolved 没有可声明等价的 Lua 求值语义；项目选择
+        // 原位保留 permissive 诊断，而不是把失败节点重挂进普通 latch 表达式。
         return false;
     }
     true

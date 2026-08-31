@@ -442,14 +442,6 @@ fn try_collapse_seeded_if_results(
         // 候选拒绝[SemanticBarrier:EvalOrder]：seeded exit 在 result 后写 seed 时，改名后的最后写不再保留原 result 出口值；反最小见 seed_write_after_result_is_rejected。
         return false;
     }
-    if !rewrites.iter().all(|(result, seed)| {
-        exits
-            .iter()
-            .any(|exit| exit.get(result).and_then(ExitValue::exact_binding) == Some(*seed))
-    }) {
-        // 候选拒绝[ProofIncomplete]：某 result 没有任何出口精确复制对应 seed 时，seed/result 关系需更一般的路径证明。
-        return false;
-    }
     if rewrites
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
@@ -512,7 +504,23 @@ fn try_collapse_inferred_if_results(
         // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，result 改名会影响 region 外或 closure 可见 epoch。
         return false;
     }
-    apply_rewrites(block, index..cursor, cursor, rewrites, promotion_facts);
+    let declarations = (index..cursor)
+        .filter(|declaration| {
+            block
+                .stmts
+                .get(*declaration)
+                .and_then(empty_local)
+                .is_some_and(|local| rewrites.contains_key(&CarryBinding::Local(local)))
+        })
+        .collect();
+    let rewrite_end = block.stmts.len();
+    apply_rewrites_with_declarations(
+        block,
+        declarations,
+        cursor..rewrite_end,
+        rewrites,
+        promotion_facts,
+    );
     true
 }
 
@@ -547,7 +555,9 @@ fn try_collapse_loop_results(
         || !collect_break_assignments(body, &mut exits, requires_exact_exits)
     {
         // 候选拒绝[SemanticBarrier:ControlFlow]：未跟踪 transfer 会漏掉 loop 出口，提交不完整 result->state 映射。
-        // 候选拒绝[LayerBoundary]：cleanup/Decision/Unresolved 分别由资源与 decision owner 处理。
+        // 候选拒绝[LayerBoundary]：cleanup/Decision 分别由资源与 decision/eliminate owner 处理。
+        // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
+        // region-result 不把未知路径并入普通 state 映射。
         return false;
     }
     if include_fallthrough && block_may_fall_through(body) {
@@ -557,7 +567,8 @@ fn try_collapse_loop_results(
         exits.push(assignment_values(assign));
     }
     if exits.is_empty() {
-        // 候选拒绝[ProofIncomplete]：没有显式 break/fallthrough assignment 时尚无 loop result reaching-def。
+        // 无 tracked break，且 while true/repeat false 没有 fallthrough；region 后缀不可达，
+        // 因而这里没有可提交的 live-out result candidate。
         return false;
     }
     let mut results = exits
@@ -569,16 +580,22 @@ fn try_collapse_loop_results(
     for exit in &exits[1..] {
         results.retain(|result| exit.contains_key(result));
     }
-    let suffix = &block.stmts[index + 1..];
+    let mut rewrite_ends = BTreeMap::new();
     results.retain(|result| {
-        binding_is_read_in_stmts(suffix, *result)
-            && !binding_is_written_in_stmts(suffix, *result)
-            && !binding_is_mentioned_in_stmts(&block.stmts[..index], *result)
+        loop_result_rewrite_end(block, index, *result).is_some_and(|rewrite_end| {
+            rewrite_ends.insert(*result, rewrite_end);
+            true
+        })
     });
     if results.is_empty() {
-        // 候选拒绝[ProofIncomplete]：无“suffix 只读且 prefix 不提”的 temp result；其它 live-out 形态需跨区间 def-use。
+        // 候选拒绝[SemanticBarrier:ControlFlow]：result 在后缀无 live-out 读取，或首个写是
+        // 路径相关的结构化写；后者可能在未写分支继续观察 loop 产生的旧 result epoch。
         return false;
     }
+    let rewrite_end = *rewrite_ends
+        .get(results.first().expect("non-empty result set"))
+        .expect("every retained result has a rewrite boundary");
+    results.retain(|result| rewrite_ends.get(result) == Some(&rewrite_end));
 
     let loop_facts = binding_facts(std::slice::from_ref(stmt));
     results.retain(|result| loop_facts.reads.get(result).copied().unwrap_or(0) == 0);
@@ -587,31 +604,6 @@ fn try_collapse_loop_results(
         return false;
     }
     let require_home_slot = !requires_exact_exits;
-    results.retain(|result| {
-        let writes = loop_facts.writes.get(result).copied().unwrap_or(0);
-        if writes == exits.len() {
-            return true;
-        }
-        let Some(rewrite) = infer_rewrites(
-            std::slice::from_ref(result),
-            &exits,
-            index,
-            result_index,
-            promotion_facts,
-            require_home_slot,
-        ) else {
-            return false;
-        };
-        rewrite.get(result).is_some_and(|seed| {
-            !loop_facts.writes.contains_key(seed)
-                && result_writes_are_standalone_seed_copies(&body.stmts, *result, *seed, writes)
-        })
-    });
-    if results.is_empty() {
-        // 候选拒绝[ProofIncomplete]：非出口 result 写入若不是独立的 exact seed copy，或 seed 会在 loop 内改写，
-        // 尚缺 reaching-def/root-lifetime 证明其改名不会改写 seed 或提前释放 result 保活的旧值。
-        return false;
-    }
     let results = results.into_iter().collect::<Vec<_>>();
     let Some(rewrites) = infer_rewrites(
         &results,
@@ -645,8 +637,49 @@ fn try_collapse_loop_results(
         // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，loop 外或 closure 可观察独立 result/state epoch。
         return false;
     }
-    apply_rewrites(block, index..index, index, rewrites, promotion_facts);
+    let can_rewrite_every_occurrence = rewrite_end == block.stmts.len()
+        && rewrites.iter().all(|(result, seed)| {
+            !loop_facts.writes.contains_key(seed)
+                && result_writes_are_standalone_seed_copies(
+                    &body.stmts,
+                    *result,
+                    *seed,
+                    loop_facts.writes.get(result).copied().unwrap_or(0),
+                )
+        });
+    if can_rewrite_every_occurrence {
+        apply_rewrites_in_range(
+            block,
+            index..index,
+            index..rewrite_end,
+            rewrites,
+            promotion_facts,
+        );
+    } else {
+        // 非出口 result 写保留为独立旧 epoch；只改 tracked exit producer 与其 live-out reads，
+        // 避免把中间值误写到 seed，且保留它在 seed overwrite/GC 之间的 root 生命周期。
+        apply_loop_result_rewrites(block, index, rewrite_end, rewrites, promotion_facts);
+    }
     true
+}
+
+fn loop_result_rewrite_end(
+    block: &HirBlock,
+    loop_index: usize,
+    result: CarryBinding,
+) -> Option<usize> {
+    let mut saw_read = false;
+    for (index, stmt) in block.stmts.iter().enumerate().skip(loop_index + 1) {
+        let facts = binding_facts(std::slice::from_ref(stmt));
+        let reads = facts.reads.contains_key(&result);
+        if facts.writes.contains_key(&result) {
+            let direct_overwrite = matches!(stmt, HirStmt::Assign(assign)
+                if assign.targets.iter().any(|target| carry_binding_from_lvalue(target) == Some(result)));
+            return ((saw_read || reads) && direct_overwrite).then_some(index);
+        }
+        saw_read |= reads;
+    }
+    saw_read.then_some(block.stmts.len())
 }
 
 fn rewrites_preserve_identity(
@@ -711,6 +744,81 @@ mod tests {
         let mut facts = ProtoPromotionFacts::default();
         facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(0, 0));
         facts
+    }
+
+    fn seeded_if_without_copy_block() -> HirBlock {
+        let branch = |value| HirBlock {
+            stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(1))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
+            }))],
+        };
+        HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(0)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(10)]),
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1)],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::TempRef(TempId(1)),
+                    then_block: branch(1),
+                    else_block: Some(branch(2)),
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
+                })),
+            ],
+        }
+    }
+
+    fn seeded_if_facts(result_home: HomeSlotKey) -> ProtoPromotionFacts {
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(0, 0));
+        facts.record_local_home_slot(LocalId(1), result_home);
+        facts
+    }
+
+    fn inferred_if_with_distinct_shared_seed_values() -> HirBlock {
+        let assignment = |first, second| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
+                values: HirValuePack::fixed(vec![first, second]),
+            }))
+        };
+        HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(0)],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1)],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::TempRef(TempId(1)),
+                    then_block: HirBlock {
+                        stmts: vec![assignment(
+                            HirExpr::ParamRef(ParamId(0)),
+                            HirExpr::ParamRef(ParamId(0)),
+                        )],
+                    },
+                    else_block: Some(HirBlock {
+                        stmts: vec![assignment(HirExpr::Integer(1), HirExpr::Integer(2))],
+                    }),
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![
+                        HirExpr::LocalRef(LocalId(0)),
+                        HirExpr::LocalRef(LocalId(1)),
+                    ]),
+                })),
+            ],
+        }
     }
 
     fn loop_result_block(extra_value: HirExpr) -> HirBlock {
@@ -827,6 +935,74 @@ mod tests {
     }
 
     #[test]
+    fn seeded_if_accepts_complete_paths_without_exact_seed_copy() {
+        let mut block = seeded_if_without_copy_block();
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = seeded_if_facts(HomeSlotKey::new(0, 0));
+
+        assert!(try_collapse_seeded_if_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+
+        assert!(!binding_is_mentioned_in_stmts(
+            &block.stmts,
+            CarryBinding::Local(LocalId(1)),
+        ));
+    }
+
+    #[test]
+    fn seeded_if_without_copy_rejects_distinct_home_slots() {
+        let mut block = seeded_if_without_copy_block();
+        let original = block.clone();
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = seeded_if_facts(HomeSlotKey::new(1, 0));
+
+        assert!(!try_collapse_seeded_if_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+        assert!(block == original);
+    }
+
+    #[test]
+    fn selective_if_rewrite_keeps_unmerged_result_declaration() {
+        let mut block = inferred_if_with_distinct_shared_seed_values();
+        let mut facts = ProtoPromotionFacts::default();
+        let rewrite_end = block.stmts.len();
+
+        apply_rewrites_with_declarations(
+            &mut block,
+            vec![0],
+            2..rewrite_end,
+            BTreeMap::from([(
+                CarryBinding::Local(LocalId(0)),
+                CarryBinding::Param(ParamId(0)),
+            )]),
+            &mut facts,
+        );
+
+        assert!(!binding_is_mentioned_in_stmts(
+            &block.stmts,
+            CarryBinding::Local(LocalId(0)),
+        ));
+        assert!(binding_is_mentioned_in_stmts(
+            &block.stmts,
+            CarryBinding::Local(LocalId(1)),
+        ));
+    }
+
+    #[test]
     fn loop_result_accepts_redundant_standalone_seed_copy() {
         let mut block = loop_result_block(HirExpr::ParamRef(ParamId(0)));
         let captured = BTreeSet::new();
@@ -854,8 +1030,185 @@ mod tests {
     }
 
     #[test]
-    fn loop_result_rejects_non_seed_write_before_exit_copy() {
+    fn loop_result_preserves_non_exit_write_as_an_unobserved_old_epoch() {
         let mut block = loop_result_block(HirExpr::Integer(7));
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = loop_result_facts();
+
+        assert!(try_collapse_loop_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+        let [HirStmt::While(while_stmt), HirStmt::Return(return_stmt)] = block.stmts.as_slice()
+        else {
+            panic!("targeted rewrite preserves only the non-exit old-epoch write");
+        };
+        assert!(while_stmt.body.stmts.len() == 2);
+        assert!(matches!(while_stmt.body.stmts[0], HirStmt::Assign(_)));
+        assert!(matches!(while_stmt.body.stmts[1], HirStmt::Break));
+        assert!(return_stmt.values.fixed == vec![HirExpr::ParamRef(ParamId(0))]);
+    }
+
+    #[test]
+    fn loop_result_preserves_root_copy_across_seed_overwrite() {
+        let mut block = dynamic_loop_result_with_seed_overwrite();
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+
+        assert!(try_collapse_loop_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut ProtoPromotionFacts::default(),
+            &index,
+            &empty_identity_facts(),
+        ));
+        let [HirStmt::Repeat(repeat_stmt), HirStmt::Return(return_stmt)] = block.stmts.as_slice()
+        else {
+            panic!("targeted rewrite keeps the pre-overwrite root transaction");
+        };
+        assert!(matches!(repeat_stmt.body.stmts[0], HirStmt::Assign(_)));
+        assert!(
+            repeat_stmt
+                .body
+                .stmts
+                .iter()
+                .any(|stmt| matches!(stmt, HirStmt::CallStmt(_)))
+        );
+        assert!(matches!(
+            repeat_stmt.body.stmts.last(),
+            Some(HirStmt::Break)
+        ));
+        assert!(return_stmt.values.fixed == vec![HirExpr::ParamRef(ParamId(0))]);
+    }
+
+    #[test]
+    fn loop_result_keeps_prior_temp_epoch_outside_rewrite_range() {
+        let mut block = loop_result_block(HirExpr::ParamRef(ParamId(0)));
+        block.stmts.insert(
+            0,
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(99)]),
+            })),
+        );
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = loop_result_facts();
+
+        assert!(try_collapse_loop_results(
+            &mut block,
+            1,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+
+        let HirStmt::Assign(prefix) = &block.stmts[0] else {
+            panic!("the prior temp epoch must remain outside the rewrite range");
+        };
+        assert!(prefix.targets == vec![HirLValue::Temp(TempId(0))]);
+    }
+
+    #[test]
+    fn loop_result_stops_at_clean_suffix_redefinition() {
+        let mut block = loop_result_block(HirExpr::ParamRef(ParamId(0)));
+        block.stmts.insert(
+            1,
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Param(ParamId(1))],
+                values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+            })),
+        );
+        block.stmts.insert(
+            2,
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+            })),
+        );
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = loop_result_facts();
+
+        assert!(try_collapse_loop_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+
+        let HirStmt::Assign(read) = &block.stmts[1] else {
+            panic!("the live-out read must remain");
+        };
+        assert!(read.values.fixed == vec![HirExpr::ParamRef(ParamId(0))]);
+        let HirStmt::Assign(overwrite) = &block.stmts[2] else {
+            panic!("the next temp epoch must remain");
+        };
+        assert!(overwrite.targets == vec![HirLValue::Temp(TempId(0))]);
+        let HirStmt::Return(return_stmt) = &block.stmts[3] else {
+            panic!("the next temp epoch remains observable");
+        };
+        assert!(return_stmt.values.fixed == vec![HirExpr::TempRef(TempId(0))]);
+    }
+
+    #[test]
+    fn loop_result_rewrites_reads_in_parallel_suffix_epoch_boundary() {
+        let mut block = loop_result_block(HirExpr::ParamRef(ParamId(0)));
+        block.stmts[1] = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Param(ParamId(1)), HirLValue::Temp(TempId(0))],
+            values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0)), HirExpr::Integer(7)]),
+        }));
+        let captured = BTreeSet::new();
+        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let mut facts = loop_result_facts();
+
+        assert!(try_collapse_loop_results(
+            &mut block,
+            0,
+            &BTreeSet::new(),
+            &mut facts,
+            &index,
+            &empty_identity_facts(),
+        ));
+        let HirStmt::Assign(boundary) = &block.stmts[1] else {
+            panic!("parallel boundary remains an assignment");
+        };
+        assert!(boundary.targets[1] == HirLValue::Temp(TempId(0)));
+        assert!(boundary.values.fixed[0] == HirExpr::ParamRef(ParamId(0)));
+    }
+
+    #[test]
+    fn loop_result_rejects_path_dependent_suffix_redefinition() {
+        let mut block = loop_result_block(HirExpr::ParamRef(ParamId(0)));
+        block.stmts.insert(
+            1,
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Param(ParamId(1))],
+                values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+            })),
+        );
+        block.stmts.insert(
+            2,
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::TempRef(TempId(1)),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Temp(TempId(0))],
+                        values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                    }))],
+                },
+                else_block: None,
+            })),
+        );
         let original = block.clone();
         let captured = BTreeSet::new();
         let index = RegionResultIndex::new(&block.stmts, &captured);
@@ -866,24 +1219,6 @@ mod tests {
             0,
             &BTreeSet::new(),
             &mut facts,
-            &index,
-            &empty_identity_facts(),
-        ));
-        assert!(block == original);
-    }
-
-    #[test]
-    fn loop_result_rejects_extra_copy_across_seed_overwrite() {
-        let mut block = dynamic_loop_result_with_seed_overwrite();
-        let original = block.clone();
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
-
-        assert!(!try_collapse_loop_results(
-            &mut block,
-            0,
-            &BTreeSet::new(),
-            &mut ProtoPromotionFacts::default(),
             &index,
             &empty_identity_facts(),
         ));

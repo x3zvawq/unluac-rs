@@ -22,19 +22,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLabelId, HirStmt, LocalId, TempId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::label_refs::count_label_references;
+use super::super::lexical_cfg::LexicalCfg;
 use super::super::mention::{stmts_captured_locals, stmts_mention_local};
-use super::super::visit::{visit_stmts, HirVisitor};
+use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::{rewrite_expr, rewrite_stmts};
+use super::HandoffIdentityFacts;
 use super::binding::{
-    binding_home_slot, bindings_share_exact_home_slot, carry_binding_from_lvalue,
-    record_binding_merge, BindingClassRewritePass, BindingProtection, CarryBinding,
+    BindingClassRewritePass, BindingHomeOverlap, BindingProtection, CarryBinding,
+    binding_home_overlap, bindings_share_exact_home_slot, carry_binding_from_lvalue,
+    record_binding_merge,
 };
 use super::prune::RedundantSelfAssignPrunePass;
 use super::reads::BindingReadCollector;
-use super::HandoffIdentityFacts;
 
 struct LoopUpdateFold {
     seed_index: usize,
@@ -47,6 +50,15 @@ struct LoopUpdateFold {
 struct LoopUpdateBlockFacts {
     last_local_mentions: BTreeMap<LocalId, usize>,
     label_refs: BTreeMap<HirLabelId, usize>,
+    expr_safety: HirExprSafety,
+}
+
+struct RepeatUpdateSafety<'a> {
+    outer_bindings: &'a dyn BindingProtection,
+    captured_locals: &'a BTreeSet<LocalId>,
+    identity_facts: &'a HandoffIdentityFacts,
+    inherited_locals: &'a BTreeSet<LocalId>,
+    expr_safety: HirExprSafety,
 }
 
 pub(super) fn collapse_dead_loop_update_handoffs(
@@ -56,16 +68,20 @@ pub(super) fn collapse_dead_loop_update_handoffs(
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
     inherited_locals: &BTreeSet<LocalId>,
+    expr_safety: HirExprSafety,
 ) -> bool {
     let captured_locals = stmts_captured_locals(&block.stmts);
     if collapse_repeat_tail_temp_updates(
         block,
         stmt_mentions,
-        outer_bindings,
-        &captured_locals,
         promotion_facts,
-        identity_facts,
-        inherited_locals,
+        &RepeatUpdateSafety {
+            outer_bindings,
+            captured_locals: &captured_locals,
+            identity_facts,
+            inherited_locals,
+            expr_safety,
+        },
     ) {
         return true;
     }
@@ -73,6 +89,7 @@ pub(super) fn collapse_dead_loop_update_handoffs(
     let block_facts = LoopUpdateBlockFacts {
         last_local_mentions: last_local_mentions(stmt_mentions),
         label_refs: count_label_references(&block.stmts),
+        expr_safety,
     };
     let mut changed = false;
 
@@ -97,11 +114,8 @@ pub(super) fn collapse_dead_loop_update_handoffs(
 fn collapse_repeat_tail_temp_updates(
     block: &mut HirBlock,
     stmt_mentions: &[BTreeSet<CarryBinding>],
-    outer_bindings: &dyn BindingProtection,
-    captured_locals: &BTreeSet<LocalId>,
     promotion_facts: &mut ProtoPromotionFacts,
-    identity_facts: &HandoffIdentityFacts,
-    inherited_locals: &BTreeSet<LocalId>,
+    safety: &RepeatUpdateSafety<'_>,
 ) -> bool {
     let owner_label_refs = count_label_references(&block.stmts);
     let mut first_mentions = BTreeMap::new();
@@ -130,52 +144,56 @@ fn collapse_repeat_tail_temp_updates(
         let prefix_mentions = super::reads::collect_binding_mentions_by_stmt(prefix);
         let between_mentions = super::reads::collect_binding_mentions_by_stmt(between);
         let condition_mentions = super::reads::collect_binding_mentions_in_expr(&repeat_stmt.cond);
-        let next_home = binding_home_slot(next_binding, promotion_facts);
-        let state_home = binding_home_slot(state_binding, promotion_facts);
-        let between_crosses_distinct_homes = !between.is_empty()
-            && next_home
-                .zip(state_home)
-                .is_some_and(|(next_home, state_home)| next_home != state_home);
-        let between_lacks_same_home_proof = !between.is_empty()
-            && !between_crosses_distinct_homes
-            && (next_home.is_none() || state_home.is_none());
         if reads.reads.contains(&next_binding) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：RHS 读取旧 next 时，整块 rewrite 会把它改读旧 state。
             continue;
         }
-        if captured_locals.contains(&state) {
+        if safety.captured_locals.contains(&state) {
             // 候选拒绝[SemanticBarrier:Capture]：state capture 可区分合并前后的 cell/write epoch。
             continue;
         }
-        if !local_available_before(block, index, state, inherited_locals) {
+        if !local_available_before(block, index, state, safety.inherited_locals) {
             // 候选拒绝[SemanticBarrier:Scope]：state 在 repeat 入口不可见，改写会生成越界 local use。
             continue;
         }
-        if identity_facts.for_bindings.contains(&state) {
+        if safety.identity_facts.for_bindings.contains(&state) {
             // 候选拒绝[PolicyBoundary]：for binding 的迭代 identity 由 loop owner 保留。
             continue;
         }
-        if outer_bindings.contains(&next_binding) {
+        if safety.outer_bindings.contains(&next_binding) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：loop 外仍读取 next，合并会删除其独立值 identity。
             continue;
         }
-        if !identity_facts.binding_merge_preserves_identity(
+        if !safety.identity_facts.binding_merge_preserves_identity(
             next_binding,
             state_binding,
             promotion_facts,
         ) {
             continue;
         }
-        if between_crosses_distinct_homes {
-            // 候选拒绝[SemanticBarrier:Lifetime]：异槽提前写 state 会让旧 state root 在 between 中提前回收。
-            continue;
-        }
-        if between_lacks_same_home_proof {
-            // 候选拒绝[ProofIncomplete]：between 非空时至少一端缺 promotion 提供的 trusted
-            // 精确 home（包括 provenance 已失效）；possible-home overlap 只能证明可能 alias，
-            // 不能证明两端必为同一 slot/epoch。若实际异槽，提前写 state 会改变 between 内
-            // 可观察的 root 生命周期。
-            continue;
+        match repeat_gap_safety(
+            next_binding,
+            state_binding,
+            between,
+            promotion_facts,
+            safety.expr_safety,
+        ) {
+            Ok(()) => {}
+            Err(RepeatGapFailure::ObservedDistinctHomes) => {
+                // 候选拒绝[SemanticBarrier:Lifetime]：两端可能位于不同物理 home，提前写
+                // state 会让旧 state root 在 between 的调用/分配/close 事件前回收。
+                continue;
+            }
+            Err(RepeatGapFailure::AliasingWrite) => {
+                // 候选拒绝[SemanticBarrier:ValueFlow]：between 的 binding 写可能命中
+                // state/next home；删除尾 writeback 会让该别名写成为最终 state 值。
+                continue;
+            }
+            Err(RepeatGapFailure::MissingHomeFacts) => {
+                // 候选拒绝[LayerBoundary]：promotion 未提供 candidate 或 between 写入的完整
+                // possible-home 集，当前 owner 不能把未知 raw slot 证明成无事件/无别名 gap。
+                continue;
+            }
         }
         if first_mentions.get(&next_binding).copied() != Some(index)
             || writes.counts.get(&next_binding).copied() != Some(1)
@@ -206,7 +224,8 @@ fn collapse_repeat_tail_temp_updates(
             continue;
         }
         if stmts_have_decision_or_unresolved(between) {
-            // 候选拒绝[LayerBoundary]：Decision/Unresolved 由 decision owner 消解。
+            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
+            // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
             continue;
         }
         if prefix_mentions
@@ -219,7 +238,12 @@ fn collapse_repeat_tail_temp_updates(
             // 候选拒绝[SemanticBarrier:ValueFlow]：seed 前读取 next 或 between 读取旧 state 会因合并改读另一 epoch。
             continue;
         }
-        match local_forward_label_flow(&repeat_stmt.body.stmts, prefix.len(), &owner_label_refs) {
+        match local_forward_label_flow(
+            &repeat_stmt.body.stmts,
+            prefix.len(),
+            &owner_label_refs,
+            safety.expr_safety,
+        ) {
             Ok(()) => {}
             Err(LabelFlowFailure::CrossesSeed) => {
                 // 候选拒绝[SemanticBarrier:ControlFlow]：跨 seed 的前向边会跳过本轮 next
@@ -227,9 +251,9 @@ fn collapse_repeat_tail_temp_updates(
                 // 读取 writeback 前的旧 state。
                 continue;
             }
-            Err(LabelFlowFailure::NeedsCfg) => {
-                // 候选拒绝[ProofIncomplete]：owner 外重入、嵌套边或同侧后向边缺逐边
-                // reaching-write/fixed-point；当前只接受 owner-complete 的顶层局部前向边。
+            Err(LabelFlowFailure::ExternalEdge) => {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：跨 owner 的入口/出口或歧义 label
+                // 可绕过 seed/尾 writeback；例如 suffix goto 外层 label 会暴露提前写入的 state。
                 continue;
             }
         }
@@ -310,6 +334,137 @@ fn repeat_tail_temp_update(body: &HirBlock) -> Option<RepeatTailTempUpdate<'_>> 
         &before_writeback[..seed_index],
         &before_writeback[seed_index + 1..],
     ))
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RepeatGapFailure {
+    ObservedDistinctHomes,
+    AliasingWrite,
+    MissingHomeFacts,
+}
+
+fn repeat_gap_safety(
+    next: CarryBinding,
+    state: CarryBinding,
+    between: &[HirStmt],
+    promotion_facts: &ProtoPromotionFacts,
+    expr_safety: HirExprSafety,
+) -> Result<(), RepeatGapFailure> {
+    if between.is_empty() || bindings_share_exact_home_slot(next, state, promotion_facts) {
+        return Ok(());
+    }
+    let next_homes = possible_binding_homes(next, promotion_facts);
+    let state_homes = possible_binding_homes(state, promotion_facts);
+    if matches!((&next_homes, &state_homes),
+        (Some(next_homes), Some(state_homes))
+            if next_homes == state_homes && next_homes.len() <= 1)
+    {
+        return Ok(());
+    }
+    if between_may_observe_gc_roots(between, expr_safety) {
+        return if next_homes.is_some() && state_homes.is_some() {
+            Err(RepeatGapFailure::ObservedDistinctHomes)
+        } else {
+            Err(RepeatGapFailure::MissingHomeFacts)
+        };
+    }
+
+    let mut writes = PhysicalBindingWriteCollector::default();
+    visit_stmts(between, &mut writes);
+    for write in writes.bindings {
+        for candidate in [next, state] {
+            match binding_home_overlap(write, candidate, promotion_facts) {
+                BindingHomeOverlap::Disjoint => {}
+                BindingHomeOverlap::Overlap => return Err(RepeatGapFailure::AliasingWrite),
+                BindingHomeOverlap::Unknown => {
+                    return Err(RepeatGapFailure::MissingHomeFacts);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn possible_binding_homes(
+    binding: CarryBinding,
+    promotion_facts: &ProtoPromotionFacts,
+) -> Option<BTreeSet<crate::hir::promotion::HomeSlotKey>> {
+    match binding {
+        CarryBinding::Param(param) => promotion_facts.possible_param_home_slots(param),
+        CarryBinding::Local(local) => promotion_facts.possible_local_home_slots(local),
+        CarryBinding::Temp(temp) => promotion_facts.possible_temp_home_slots(temp),
+    }
+}
+
+#[derive(Default)]
+struct PhysicalBindingWriteCollector {
+    bindings: BTreeSet<CarryBinding>,
+}
+
+impl HirVisitor for PhysicalBindingWriteCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(local_decl) => self
+                .bindings
+                .extend(local_decl.bindings.iter().copied().map(CarryBinding::Local)),
+            HirStmt::NumericFor(numeric_for) => {
+                self.bindings
+                    .insert(CarryBinding::Local(numeric_for.binding));
+            }
+            HirStmt::GenericFor(generic_for) => self.bindings.extend(
+                generic_for
+                    .bindings
+                    .iter()
+                    .copied()
+                    .map(CarryBinding::Local),
+            ),
+            _ => {}
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let Some(binding) = carry_binding_from_lvalue(lvalue) {
+            self.bindings.insert(binding);
+        }
+    }
+}
+
+fn between_may_observe_gc_roots(stmts: &[HirStmt], safety: HirExprSafety) -> bool {
+    let mut collector = GapRootObservationCollector {
+        found: false,
+        safety,
+    };
+    visit_stmts(stmts, &mut collector);
+    collector.found
+}
+
+struct GapRootObservationCollector {
+    found: bool,
+    safety: HirExprSafety,
+}
+
+impl HirVisitor for GapRootObservationCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.found |= matches!(
+            stmt,
+            HirStmt::GlobalDecl(_)
+                | HirStmt::ErrNil(_)
+                | HirStmt::ToBeClosed(_)
+                | HirStmt::Close(_)
+        );
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.found |= !self.safety.is_discard_safe_without_residual(expr);
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
+    }
+
+    fn visit_call(&mut self, _call: &crate::hir::common::HirCallExpr) {
+        self.found = true;
+    }
 }
 
 #[derive(Default)]
@@ -408,77 +563,58 @@ fn stmt_has_nonlocal_transfer(stmt: &HirStmt, inside_nested_loop: bool) -> bool 
     }
 }
 
-fn stmt_has_label_or_goto(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::Goto(_) | HirStmt::Label(_) => true,
-        HirStmt::If(if_stmt) => {
-            if_stmt.then_block.stmts.iter().any(stmt_has_label_or_goto)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(|block| block.stmts.iter().any(stmt_has_label_or_goto))
-        }
-        HirStmt::While(while_stmt) => while_stmt.body.stmts.iter().any(stmt_has_label_or_goto),
-        HirStmt::Repeat(repeat_stmt) => repeat_stmt.body.stmts.iter().any(stmt_has_label_or_goto),
-        HirStmt::NumericFor(numeric_for) => {
-            numeric_for.body.stmts.iter().any(stmt_has_label_or_goto)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            generic_for.body.stmts.iter().any(stmt_has_label_or_goto)
-        }
-        HirStmt::Block(block) => block.stmts.iter().any(stmt_has_label_or_goto),
-        _ => false,
-    }
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum LabelFlowFailure {
     CrossesSeed,
-    NeedsCfg,
+    ExternalEdge,
 }
 
 fn local_forward_label_flow(
     stmts: &[HirStmt],
     seed_index: usize,
     owner_label_refs: &BTreeMap<HirLabelId, usize>,
+    expr_safety: HirExprSafety,
 ) -> Result<(), LabelFlowFailure> {
-    let mut labels = BTreeMap::<HirLabelId, usize>::new();
-    let mut gotos = Vec::<(usize, HirLabelId)>::new();
-    for (index, stmt) in stmts.iter().enumerate() {
-        match stmt {
-            HirStmt::Label(label) => {
-                if labels.insert(label.id, index).is_some() {
-                    return Err(LabelFlowFailure::NeedsCfg);
-                }
-            }
-            HirStmt::Goto(goto_stmt) => gotos.push((index, goto_stmt.target)),
-            _ if stmt_has_label_or_goto(stmt) => return Err(LabelFlowFailure::NeedsCfg),
-            _ => {}
-        }
+    let cfg = LexicalCfg::analyze(stmts, owner_label_refs, expr_safety)
+        .map_err(|_| LabelFlowFailure::ExternalEdge)?;
+    if cfg.has_external_exit() {
+        return Err(LabelFlowFailure::ExternalEdge);
     }
+    seed_reaches_consistent_epoch(cfg.successors(), seed_index)
+}
 
-    let internal_refs = count_label_references(stmts);
-    for (&label, &target_index) in &labels {
-        if owner_label_refs.get(&label).copied().unwrap_or_default()
-            != internal_refs.get(&label).copied().unwrap_or_default()
+fn seed_reaches_consistent_epoch(
+    successors: &[BTreeSet<usize>],
+    seed_index: usize,
+) -> Result<(), LabelFlowFailure> {
+    const BEFORE_SEED: u8 = 1;
+    const AFTER_SEED: u8 = 2;
+
+    if successors.is_empty() {
+        return Ok(());
+    }
+    let mut incoming = vec![0u8; successors.len()];
+    incoming[0] = BEFORE_SEED;
+    let mut pending = vec![0usize];
+    while let Some(index) = pending.pop() {
+        let state = incoming[index];
+        if (index < seed_index && state & AFTER_SEED != 0)
+            || (index == seed_index && state & AFTER_SEED != 0)
+            || (index > seed_index && state & BEFORE_SEED != 0)
         {
-            return Err(if target_index > seed_index {
-                LabelFlowFailure::CrossesSeed
-            } else {
-                LabelFlowFailure::NeedsCfg
-            });
-        }
-    }
-
-    for (source_index, target) in gotos {
-        let Some(&target_index) = labels.get(&target) else {
-            return Err(LabelFlowFailure::NeedsCfg);
-        };
-        if (source_index > seed_index) != (target_index > seed_index) {
             return Err(LabelFlowFailure::CrossesSeed);
         }
-        if source_index >= target_index {
-            return Err(LabelFlowFailure::NeedsCfg);
+        let outgoing = if index == seed_index {
+            AFTER_SEED
+        } else {
+            state
+        };
+        for &successor in &successors[index] {
+            let merged = incoming[successor] | outgoing;
+            if merged != incoming[successor] {
+                incoming[successor] = merged;
+                pending.push(successor);
+            }
         }
     }
     Ok(())
@@ -565,7 +701,12 @@ fn find_fold(
             // 候选拒绝[SemanticBarrier:Lifetime]：seed 前读 next 或 seed 后读旧 carried 会因 binding 合并改读另一 epoch。
             continue;
         }
-        match local_forward_label_flow(&body.stmts, seed_index, &block_facts.label_refs) {
+        match local_forward_label_flow(
+            &body.stmts,
+            seed_index,
+            &block_facts.label_refs,
+            block_facts.expr_safety,
+        ) {
             Ok(()) => {}
             Err(LabelFlowFailure::CrossesSeed) => {
                 // 候选拒绝[SemanticBarrier:ControlFlow]：跨 seed 的前向边会绕过 next
@@ -573,9 +714,9 @@ fn find_fold(
                 // 读取尾 writeback 前的旧 carried。
                 continue;
             }
-            Err(LabelFlowFailure::NeedsCfg) => {
-                // 候选拒绝[ProofIncomplete]：owner 外重入、嵌套边或同侧后向边缺逐边
-                // reaching-write/fixed-point；当前只接受 owner-complete 的顶层局部前向边。
+            Err(LabelFlowFailure::ExternalEdge) => {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：跨 owner 的入口/出口或歧义 label
+                // 可绕过 seed/尾 writeback；例如 suffix goto 外层 label 会跳过 carried 提交。
                 continue;
             }
         }
@@ -743,9 +884,10 @@ fn apply_fold(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirBinaryExpr, HirBinaryOpKind, HirClose, HirGlobalDecl, HirGoto, HirLabel, HirLocalDecl,
-        HirRepeat, HirValuePack, HirWhile,
+        HirBinaryExpr, HirBinaryOpKind, HirClose, HirGlobalDecl, HirGoto, HirIf, HirLabel,
+        HirLocalDecl, HirRepeat, HirValuePack, HirWhile,
     };
     use crate::hir::promotion::HomeSlotKey;
 
@@ -813,6 +955,13 @@ mod tests {
         facts
     }
 
+    fn distinct_home_facts(local: LocalId, temp: TempId) -> ProtoPromotionFacts {
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_slot_for_test(temp, HomeSlotKey::new(1, 0));
+        facts
+    }
+
     fn run_fold(block: &mut HirBlock, promotion_facts: &mut ProtoPromotionFacts) -> bool {
         let stmt_mentions = super::super::reads::collect_binding_mentions_by_stmt(&block.stmts);
         collapse_dead_loop_update_handoffs(
@@ -822,6 +971,7 @@ mod tests {
             promotion_facts,
             &empty_identity_facts(),
             &BTreeSet::new(),
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
         )
     }
 
@@ -854,6 +1004,7 @@ mod tests {
             &mut promotion_facts,
             &identity_facts,
             &inherited_locals,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
         );
 
         let expected = HirBlock {
@@ -904,6 +1055,7 @@ mod tests {
             &mut promotion_facts,
             &identity_facts,
             &inherited_locals,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
         );
 
         assert_eq!((changed, block), (false, before));
@@ -959,6 +1111,132 @@ mod tests {
     }
 
     #[test]
+    fn repeat_tail_update_accepts_invalidated_complete_single_home() {
+        let state = LocalId(0);
+        let next = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+                                names: vec!["snapshot".to_owned()],
+                                values: HirValuePack::fixed(vec![HirExpr::TempRef(next)]),
+                            })),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let home = HomeSlotKey::new(0, 0);
+        let mut promotion_facts = exact_home_facts(state, next);
+        promotion_facts.record_temp_home_merge(next, Some(BTreeSet::from([home])));
+
+        assert!(run_fold(&mut block, &mut promotion_facts));
+    }
+
+    #[test]
+    fn repeat_tail_update_accepts_effect_free_gap_with_disjoint_writes() {
+        let state = LocalId(0);
+        let scratch = LocalId(1);
+        let next = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                local_decl(scratch),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            assign(HirLValue::Local(scratch), HirExpr::Integer(7)),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let mut promotion_facts = distinct_home_facts(state, next);
+        promotion_facts.record_local_home_slot(scratch, HomeSlotKey::new(2, 0));
+
+        assert!(run_fold(&mut block, &mut promotion_facts));
+    }
+
+    #[test]
+    fn repeat_tail_update_rejects_gap_write_aliasing_state_home() {
+        let state = LocalId(0);
+        let alias = LocalId(1);
+        let next = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                local_decl(alias),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            assign(HirLValue::Local(alias), HirExpr::Integer(7)),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let before = block.clone();
+        let mut promotion_facts = distinct_home_facts(state, next);
+        promotion_facts.record_local_home_slot(alias, HomeSlotKey::new(0, 0));
+
+        assert!(!run_fold(&mut block, &mut promotion_facts));
+        assert_eq!(block, before);
+    }
+
+    #[test]
+    fn repeat_tail_update_rejects_observed_distinct_home_gap() {
+        let state = LocalId(0);
+        let next = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+                                names: vec!["snapshot".to_owned()],
+                                values: HirValuePack::fixed(vec![HirExpr::TempRef(next)]),
+                            })),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let before = block.clone();
+        let mut promotion_facts = distinct_home_facts(state, next);
+
+        assert!(!run_fold(&mut block, &mut promotion_facts));
+        assert_eq!(block, before);
+    }
+
+    #[test]
     fn repeat_tail_update_accepts_owner_complete_forward_goto_after_seed() {
         let state = LocalId(0);
         let next = TempId(0);
@@ -1010,6 +1288,159 @@ mod tests {
             ]
         );
         assert_eq!(repeat_stmt.cond, HirExpr::LocalRef(state));
+    }
+
+    #[test]
+    fn repeat_tail_update_accepts_nested_same_side_backedge_fixed_point() {
+        let state = LocalId(0);
+        let next = TempId(0);
+        let target = HirLabelId(0);
+        let nested_backedge = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: HirBlock {
+                stmts: vec![goto(target)],
+            },
+            else_block: None,
+        }));
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            label(target),
+                            nested_backedge.clone(),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let mut promotion_facts = exact_home_facts(state, next);
+
+        assert!(run_fold(&mut block, &mut promotion_facts));
+
+        let HirStmt::Repeat(repeat_stmt) = &block.stmts[1] else {
+            panic!("repeat owner must remain")
+        };
+        assert_eq!(
+            repeat_stmt.body.stmts,
+            vec![
+                assign(
+                    HirLValue::Local(state),
+                    add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                ),
+                label(target),
+                nested_backedge,
+            ]
+        );
+        assert_eq!(repeat_stmt.cond, HirExpr::LocalRef(state));
+    }
+
+    #[test]
+    fn repeat_tail_update_rejects_cross_seed_backedge_after_nested_block_fallthrough() {
+        let state = LocalId(0);
+        let next = TempId(0);
+        let before_seed = HirLabelId(0);
+        let inside_block = HirLabelId(1);
+        let nested = HirStmt::Block(Box::new(HirBlock {
+            stmts: vec![goto(inside_block), label(inside_block)],
+        }));
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            label(before_seed),
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            nested,
+                            goto(before_seed),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let before = block.clone();
+        let mut promotion_facts = exact_home_facts(state, next);
+
+        assert!(!run_fold(&mut block, &mut promotion_facts));
+        assert_eq!(block, before);
+    }
+
+    #[test]
+    fn repeat_tail_update_ignores_dead_backedge_after_infinite_nested_loop() {
+        let state = LocalId(0);
+        let next = TempId(0);
+        let before_seed = HirLabelId(0);
+        let infinite_loop = HirStmt::While(Box::new(HirWhile {
+            cond: HirExpr::Boolean(true),
+            body: HirBlock { stmts: Vec::new() },
+        }));
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            label(before_seed),
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            infinite_loop,
+                            goto(before_seed),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let mut promotion_facts = exact_home_facts(state, next);
+
+        assert!(run_fold(&mut block, &mut promotion_facts));
+    }
+
+    #[test]
+    fn repeat_tail_update_rejects_owner_external_entry_after_seed() {
+        let state = LocalId(0);
+        let next = TempId(0);
+        let target = HirLabelId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            label(target),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+                goto(target),
+            ],
+        };
+        let before = block.clone();
+        let mut promotion_facts = exact_home_facts(state, next);
+
+        assert!(!run_fold(&mut block, &mut promotion_facts));
+        assert_eq!(block, before);
     }
 
     #[test]

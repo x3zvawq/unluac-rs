@@ -231,7 +231,10 @@ fn iterator_pack_can_cross_assignment(
             return false;
         }
         Err(LocationFactError::Opaque) => {
-            // 候选拒绝[LayerBoundary]：Decision/Unresolved 由 residual/decision owner 消解，本 pass 不把它们延迟进 loop head。
+            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化，本 pass
+            // 不把它延迟进 loop head。
+            // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
+            // 不把它埋入普通 iterator 表达式。
             return false;
         }
     };
@@ -262,7 +265,9 @@ fn iterator_pack_can_cross_assignment(
                 return false;
             }
             Err(LocationFactError::Opaque) => {
-                // 候选拒绝[LayerBoundary]：Decision/Unresolved 不能随 producer 延迟跨过 gap，交给 residual/decision owner。
+                // 候选拒绝[LayerBoundary]：Decision 交给 decision/eliminate owner 原位物化，
+                // 不能随 producer 延迟跨过 gap。
+                // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
                 return false;
             }
         };

@@ -267,7 +267,8 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 // 候选忽略[NotApplicable]：call 已由当前 policy 接受；loop-header 的 lookup/构造器也已进入逐 site 审查。
                 // 候选拒绝[SemanticBarrier:ValueArity]：Extended run 的裸 vararg 仅在直接 call 参数位由下方单值特例接管；loop-header/其它开放尾位继续保留。
                 // 候选拒绝[SemanticBarrier:Capture]：closure 搬到 sink 会改变分配/capture 时点；安全的直接 return 由相邻 DirectReturnValue owner 消费。
-                // 候选拒绝[LayerBoundary]：Error residual 由错误输出 owner 保留，不由 call-alias run 消费。
+                // 候选拒绝[PolicyBoundary]：Error residual 是 best-effort 输出保留的失败证据，
+                // call-alias run 不把它埋入普通调用表达式。
                 continue;
             }
             let suffix_uses =
@@ -546,7 +547,8 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 // 候选忽略[NotApplicable]：call 已由 ExtendedCallChain 接受；lookup、context-safe 运算与受限构造器由逐 site 合同审查。
                 // 候选拒绝[SemanticBarrier:ValueArity]：裸 vararg 仅在直接 call 参数位由下方单值特例接管。
                 // 候选拒绝[SemanticBarrier:Capture]：closure 的分配/capture 时点不能由 call-result run 搬移；直接 return 归相邻 owner。
-                // 候选拒绝[LayerBoundary]：Error residual 由错误输出 owner 保留，不由 call-result run 消费。
+                // 候选拒绝[PolicyBoundary]：Error residual 是 best-effort 输出保留的失败证据，
+                // call-result run 不把它埋入普通调用表达式。
                 continue;
             }
             let suffix_uses =
@@ -701,7 +703,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 // 候选忽略[NotApplicable]：call/受限 table/标量 vararg 的调用消费点由前置 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
                 // 候选拒绝[SemanticBarrier:ValueArity]：其它 call/vararg 尾位可能重新打开多值。
                 // 候选拒绝[SemanticBarrier:Capture]：nested closure 会改变分配/capture 时点。
-                // 候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
+                // 候选拒绝[PolicyBoundary]：Error residual 是项目保留的 best-effort 失败证据。
                 continue;
             }
             let run_uses = use_index.count_uses_in_range(
@@ -868,7 +870,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 // 候选忽略[NotApplicable]：call/受限 table/标量 vararg 的调用消费点由 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
                 // 候选拒绝[SemanticBarrier:ValueArity]：其它 call/vararg 尾位可能重新打开多值。
                 // 候选拒绝[SemanticBarrier:Capture]：nested closure 会改变分配/capture 时点。
-                // 候选拒绝[LayerBoundary]：Error residual 不由 readability 消费。
+                // 候选拒绝[PolicyBoundary]：Error residual 是项目保留的 best-effort 失败证据。
                 continue;
             }
             let suffix_uses =

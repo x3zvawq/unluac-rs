@@ -48,12 +48,15 @@ use std::{
     rc::Rc,
 };
 
+use super::label_refs::count_label_references;
+use super::lexical_cfg::LexicalCfg;
 use super::mention::{
     stmt_writes_temp, stmts_reference_captured_bindings, stmts_to_be_closed_temps,
     stmts_value_captured_bindings,
 };
 use super::root_lifetimes::{
-    collect_call_result_local_roots, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
+    CallRootLifetimeIndices, LookupGcRootLifetimeIndices, collect_call_result_local_roots,
+    collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
 };
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
@@ -91,6 +94,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut identity_sensitive_temps = reference_captured_temps.clone();
     identity_sensitive_temps.extend(stmts_value_captured_bindings(&proto.body.stmts).temps);
     let to_be_closed_temps = stmts_to_be_closed_temps(&proto.body.stmts);
+    let label_refs = count_label_references(&proto.body.stmts);
     identity_sensitive_temps.extend(to_be_closed_temps.iter().copied());
     let mut cell_sensitive_temps = reference_captured_temps;
     cell_sensitive_temps.extend(to_be_closed_temps.iter().copied());
@@ -110,6 +114,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             identity_sensitive_temps: &identity_sensitive_temps,
             cell_sensitive_temps: &cell_sensitive_temps,
             to_be_closed_temps: &to_be_closed_temps,
+            label_refs: &label_refs,
             debug_scope_locals: &mut debug_scope_locals,
             compact_home_slots,
         };
@@ -189,7 +194,7 @@ enum PromotionAction {
 enum MoveHomeRelation {
     SameExact,
     ProvenDistinct,
-    ProofIncomplete,
+    MayDiffer,
 }
 
 struct PromotionResult {
@@ -254,6 +259,7 @@ struct PromotionCtx<'a> {
     identity_sensitive_temps: &'a BTreeSet<TempId>,
     cell_sensitive_temps: &'a BTreeSet<TempId>,
     to_be_closed_temps: &'a BTreeSet<TempId>,
+    label_refs: &'a BTreeMap<crate::hir::common::HirLabelId, usize>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
     compact_home_slots: bool,
 }
@@ -569,15 +575,11 @@ fn collect_plans(
         .stmts
         .iter()
         .position(stmt_contains_nested_nonlocal_control);
-    let planning_end = label_flow_boundary.unwrap_or(block.stmts.len());
-    let lifetime_stmts = if label_flow_boundary.is_some() {
-        // 分析停用[ProofIncomplete]：label/goto graph 本体及后续 region 仍缺 reaching-def、
-        // declaration dominance 与逐路径 root overwrite 事实；这里只消费其前方不跨边界
-        // 存活的 GC-inert 链，不能把 island 内候选或 resource root 按文本顺序提升。
-        &[]
-    } else {
-        block.stmts.as_slice()
-    };
+    let linear_prefix_end = label_flow_boundary.unwrap_or(block.stmts.len());
+    let lifetime_stmts = &block.stmts[..linear_prefix_end];
+    let label_cfg = LexicalCfg::analyze(&block.stmts, ctx.label_refs, ctx.safety).ok();
+    let has_label_flow =
+        label_cfg.as_ref().is_some_and(LexicalCfg::has_label_flow) || label_flow_boundary.is_some();
 
     let facts = ctx.facts;
     let temp_debug_locals = ctx.temp_debug_locals;
@@ -624,13 +626,22 @@ fn collect_plans(
                     .get(temp.index())
                     .is_none_or(Option::is_none)
         });
+    let label_flow_proof = LabelFlowGroupProof {
+        block,
+        linear_prefix_end,
+        cfg: label_cfg.as_ref(),
+        facts,
+        call_roots: &call_root_lifetimes,
+        lookup_roots: &lookup_gc_root_lifetimes,
+        safety: ctx.safety,
+    };
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
     let mut sticky_slots = inherited_sticky_slots.clone();
     let mut physical_root_locals = BTreeMap::<usize, LocalId>::new();
     let mut physical_root_locals_by_home = BTreeMap::<(usize, HomeSlotKey), LocalId>::new();
-    for (decl_index, stmt) in block.stmts.iter().take(planning_end).enumerate() {
+    for (decl_index, stmt) in block.stmts.iter().enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
             activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
             continue;
@@ -807,20 +818,21 @@ fn collect_plans(
             &temp_touches,
         );
 
-        if let Some(boundary) = label_flow_boundary
-            && !label_flow_prefix_group_is_safe(
-                block,
-                decl_index,
-                root_temp,
-                boundary,
-                &promotion_group,
-                ctx.safety,
-            )
-        {
-            // 候选拒绝[ProofIncomplete]：该前缀候选含 GC-bearing/structured write，或 temp
-            // 身份延伸到 label/goto 边界；缺逐路径 reaching-def 与 physical-root overwrite，
-            // 不能证明新 local 的声明和值生命周期覆盖所有跳转路径。
-            continue;
+        if has_label_flow {
+            match label_flow_proof.group_safety(decl_index, root_temp, &promotion_group) {
+                Ok(()) => {}
+                Err(LabelFlowGroupFailure::ControlFlow) => {
+                    // 候选拒绝[SemanticBarrier:Scope]：若入口 goto 绕过 temp 定义抵达后缀
+                    // label，新声明会令该入口跳入 local scope，且后续读取观察未初始化值。
+                    continue;
+                }
+                Err(LabelFlowGroupFailure::Lifetime) => {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：label island 前最后一个 GC-bearing
+                    // temp 值若没有同 home 的已配对覆盖，提升后的 lexical local 会把它保活到
+                    // block 末尾；后续显式 GC/弱引用可观察原 VM root 已被覆盖的差异。
+                    continue;
+                }
+            }
         }
         let PromotionGroup {
             temps: group,
@@ -986,12 +998,8 @@ fn collect_plans(
     ctx.physical_root_locals
         .extend(physical_root_locals_by_home.values().copied());
 
-    if label_flow_boundary.is_some() {
-        return plans;
-    }
-
     let mut sticky_slots = inherited_sticky_slots.clone();
-    for (decl_index, stmt) in block.stmts.iter().enumerate() {
+    for (decl_index, stmt) in block.stmts[..linear_prefix_end].iter().enumerate() {
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
         let mut merge_temps = branch_merge::candidate_temps(
             stmt,
@@ -1141,9 +1149,10 @@ fn collect_promotion_group(
                         // MOVE 两端异槽；它是值快照与两个独立 GC root，不能合并 cell。
                         false
                     }
-                    MoveHomeRelation::ProofIncomplete => {
-                        // 候选拒绝[ProofIncomplete]：集合相交只表示可能同槽，集合缺失则有
-                        // unknown merge；两者都不能替代逐路径 exact cell identity。
+                    MoveHomeRelation::MayDiffer => {
+                        // 候选拒绝[SemanticBarrier:ValueFlow]：root/alias 的多槽集合即使相交，
+                        // 仍可在两条路径上分别取 `(slot0,slot1)` 与 `(slot1,slot0)`；合并会把
+                        // 原本独立快照改成同一 local。缺集合时也包含该异槽反例。
                         false
                     }
                 }
@@ -1191,58 +1200,179 @@ fn move_home_relation(
         facts.possible_temp_home_slots(root),
         facts.possible_temp_home_slots(alias),
     ) {
+        (Some(root), Some(alias)) if root.len() == 1 && root == alias => {
+            MoveHomeRelation::SameExact
+        }
         (Some(root), Some(alias))
             if !root.is_empty() && !alias.is_empty() && root.is_disjoint(&alias) =>
         {
             MoveHomeRelation::ProvenDistinct
         }
-        _ => MoveHomeRelation::ProofIncomplete,
+        _ => MoveHomeRelation::MayDiffer,
     }
 }
 
-fn label_flow_prefix_group_is_safe(
-    block: &HirBlock,
-    decl_index: usize,
-    root_temp: TempId,
-    boundary: usize,
-    group: &PromotionGroup,
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LabelFlowGroupFailure {
+    ControlFlow,
+    Lifetime,
+}
+
+struct LabelFlowGroupProof<'a> {
+    block: &'a HirBlock,
+    linear_prefix_end: usize,
+    cfg: Option<&'a LexicalCfg>,
+    facts: &'a ProtoPromotionFacts,
+    call_roots: &'a CallRootLifetimeIndices,
+    lookup_roots: &'a LookupGcRootLifetimeIndices,
     safety: HirExprSafety,
-) -> bool {
-    let Some(value) = single_temp_assign_value(&block.stmts[decl_index], root_temp) else {
-        return false;
-    };
-    safety.result_is_gc_inert(value)
-        && group
-            .removable_aliases
-            .iter()
-            .chain(&group.touching_stmt_indices)
-            .all(|index| *index < boundary)
-        && group.touching_stmt_indices.iter().all(|index| {
-            let stmt = &block.stmts[*index];
-            group
+}
+
+impl LabelFlowGroupProof<'_> {
+    fn group_safety(
+        &self,
+        decl_index: usize,
+        root_temp: TempId,
+        group: &PromotionGroup,
+    ) -> Result<(), LabelFlowGroupFailure> {
+        let Some(cfg) = self.cfg else {
+            return Err(LabelFlowGroupFailure::ControlFlow);
+        };
+        if !cfg.statement_dominates_suffix(decl_index) {
+            return Err(LabelFlowGroupFailure::ControlFlow);
+        }
+        let Some(value) = single_temp_assign_value(&self.block.stmts[decl_index], root_temp) else {
+            return Err(LabelFlowGroupFailure::ControlFlow);
+        };
+        let exact_home = trusted_home_slot_for_group(&group.temps, self.facts);
+        if !self.safety.result_is_gc_inert(value) {
+            let Some(home) = exact_home else {
+                return Err(LabelFlowGroupFailure::Lifetime);
+            };
+            if !root_lifetime_closes_in_prefix(
+                decl_index,
+                home,
+                self.linear_prefix_end,
+                self.call_roots,
+                self.lookup_roots,
+            ) {
+                return Err(LabelFlowGroupFailure::Lifetime);
+            }
+        }
+        for &index in &group.touching_stmt_indices {
+            let stmt = &self.block.stmts[index];
+            if group
                 .temps
                 .iter()
                 .all(|temp| !stmt_writes_temp(stmt, *temp))
-                || scalar_group_write_is_gc_inert(stmt, &group.temps, safety)
-        })
+                || group_writes_are_gc_inert(stmt, &group.temps, self.safety)
+            {
+                continue;
+            }
+            let Some(home) = exact_home else {
+                return Err(LabelFlowGroupFailure::Lifetime);
+            };
+            if index >= self.linear_prefix_end
+                || !root_lifetime_closes_in_prefix(
+                    index,
+                    home,
+                    self.linear_prefix_end,
+                    self.call_roots,
+                    self.lookup_roots,
+                )
+            {
+                return Err(LabelFlowGroupFailure::Lifetime);
+            }
+        }
+        Ok(())
+    }
 }
 
-fn scalar_group_write_is_gc_inert(
+fn group_writes_are_gc_inert(
     stmt: &HirStmt,
     group: &BTreeSet<TempId>,
     safety: HirExprSafety,
 ) -> bool {
-    let HirStmt::Assign(assign) = stmt else {
-        return false;
-    };
-    let ([HirLValue::Temp(target)], [value], None) = (
-        assign.targets.as_slice(),
-        assign.values.fixed.as_slice(),
-        &assign.values.tail,
-    ) else {
-        return false;
-    };
-    group.contains(target) && safety.result_is_gc_inert(value)
+    match stmt {
+        HirStmt::Assign(assign) => {
+            let writes_group = assign
+                .targets
+                .iter()
+                .any(|target| matches!(target, HirLValue::Temp(temp) if group.contains(temp)));
+            !writes_group
+                || matches!(
+                    (assign.targets.as_slice(), assign.values.fixed.as_slice(), &assign.values.tail),
+                    ([HirLValue::Temp(target)], [value], None)
+                        if group.contains(target) && safety.result_is_gc_inert(value)
+                )
+        }
+        HirStmt::If(if_stmt) => {
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .all(|stmt| group_writes_are_gc_inert(stmt, group, safety))
+                && if_stmt.else_block.as_ref().is_none_or(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .all(|stmt| group_writes_are_gc_inert(stmt, group, safety))
+                })
+        }
+        HirStmt::While(while_stmt) => while_stmt
+            .body
+            .stmts
+            .iter()
+            .all(|stmt| group_writes_are_gc_inert(stmt, group, safety)),
+        HirStmt::Repeat(repeat_stmt) => repeat_stmt
+            .body
+            .stmts
+            .iter()
+            .all(|stmt| group_writes_are_gc_inert(stmt, group, safety)),
+        HirStmt::NumericFor(numeric_for) => numeric_for
+            .body
+            .stmts
+            .iter()
+            .all(|stmt| group_writes_are_gc_inert(stmt, group, safety)),
+        HirStmt::GenericFor(generic_for) => generic_for
+            .body
+            .stmts
+            .iter()
+            .all(|stmt| group_writes_are_gc_inert(stmt, group, safety)),
+        HirStmt::Block(block) => block
+            .stmts
+            .iter()
+            .all(|stmt| group_writes_are_gc_inert(stmt, group, safety)),
+        HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => true,
+    }
+}
+
+fn root_lifetime_closes_in_prefix(
+    root_index: usize,
+    home: HomeSlotKey,
+    linear_prefix_end: usize,
+    call_roots: &CallRootLifetimeIndices,
+    lookup_roots: &LookupGcRootLifetimeIndices,
+) -> bool {
+    (root_index + 1..linear_prefix_end).any(|overwrite_index| {
+        call_roots
+            .overwrite_pairs(overwrite_index)
+            .any(|pair| pair.root_index() == root_index && pair.home() == home)
+            || lookup_roots
+                .overwrite_pairs(overwrite_index)
+                .any(|pair| pair.root_index() == root_index && pair.home() == home)
+    })
 }
 
 fn activate_captured_slots_in_stmt(
@@ -1642,11 +1772,35 @@ fn debug_scope_for_temp_group(
 mod tests {
     use super::*;
     use crate::decompile::DecompileDialect;
+    use crate::hir::common::{
+        HirCallExpr, HirCallStmt, HirGlobalRef, HirGoto, HirIf, HirLabel, HirLabelId, HirPackTail,
+    };
 
     fn assign(target: TempId, value: HirExpr) -> HirStmt {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(target)],
             values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn goto(target: HirLabelId) -> HirStmt {
+        HirStmt::Goto(Box::new(HirGoto { target }))
+    }
+
+    fn label(id: HirLabelId) -> HirStmt {
+        HirStmt::Label(Box::new(HirLabel {
+            id,
+            tbc_barriers: Vec::new(),
+        }))
+    }
+
+    fn call(name: &str) -> HirExpr {
+        HirExpr::Call(Box::new(HirCallExpr {
+            callee: HirExpr::GlobalRef(HirGlobalRef { name: name.into() }),
+            args: HirValuePack::default(),
+            method: false,
+            fastcall: None,
+            method_name: None,
         }))
     }
 
@@ -1703,11 +1857,12 @@ mod tests {
     }
 
     #[test]
-    fn move_home_relation_uses_complete_sets_only_to_prove_disjointness() {
+    fn move_home_relation_accepts_only_one_shared_possible_home() {
         let exact_root = TempId(0);
         let exact_alias = TempId(1);
         let disjoint_alias = TempId(2);
         let overlapping_alias = TempId(3);
+        let invalidated_single_alias = TempId(4);
         let root_home = HomeSlotKey::new(0, 0);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(exact_root, root_home);
@@ -1719,6 +1874,8 @@ mod tests {
         );
         facts.record_temp_home_slot_for_test(overlapping_alias, HomeSlotKey::new(3, 0));
         facts.record_temp_home_merge(overlapping_alias, Some(BTreeSet::from([root_home])));
+        facts.record_temp_home_slot_for_test(invalidated_single_alias, root_home);
+        facts.record_temp_home_merge(invalidated_single_alias, Some(BTreeSet::new()));
 
         assert_eq!(
             move_home_relation(exact_root, exact_alias, &facts),
@@ -1730,41 +1887,177 @@ mod tests {
         );
         assert_eq!(
             move_home_relation(exact_root, overlapping_alias, &facts),
-            MoveHomeRelation::ProofIncomplete
+            MoveHomeRelation::MayDiffer
         );
         assert_eq!(
-            move_home_relation(exact_root, TempId(4), &facts),
-            MoveHomeRelation::ProofIncomplete
+            move_home_relation(exact_root, invalidated_single_alias, &facts),
+            MoveHomeRelation::SameExact
+        );
+        assert_eq!(
+            move_home_relation(exact_root, TempId(5), &facts),
+            MoveHomeRelation::MayDiffer
         );
     }
 
     #[test]
-    fn label_prefix_accepts_only_gc_inert_group_writes() {
+    fn label_flow_accepts_dominated_structured_gc_inert_writes() {
         let temp = TempId(0);
+        let sink = TempId(1);
+        let target = HirLabelId(0);
         let group = PromotionGroup {
             temps: BTreeSet::from([temp]),
             removable_aliases: BTreeSet::new(),
-            touching_stmt_indices: BTreeSet::from([1]),
+            touching_stmt_indices: BTreeSet::from([1, 4]),
         };
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
         let inert = HirBlock {
             stmts: vec![
                 assign(temp, HirExpr::Integer(1)),
-                assign(temp, HirExpr::Integer(2)),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
+                    then_block: HirBlock {
+                        stmts: vec![assign(temp, HirExpr::Integer(2))],
+                    },
+                    else_block: None,
+                })),
+                goto(target),
+                assign(sink, HirExpr::Integer(0)),
+                label(target),
+                assign(sink, HirExpr::TempRef(temp)),
             ],
         };
-        let resource = HirBlock {
-            stmts: vec![
-                assign(temp, HirExpr::Integer(1)),
-                assign(temp, HirExpr::TempRef(TempId(1))),
-            ],
+        let owner_refs = count_label_references(&inert.stmts);
+        let inert_cfg = LexicalCfg::analyze(&inert.stmts, &owner_refs, safety).unwrap();
+        let call_roots = CallRootLifetimeIndices::default();
+        let lookup_roots = LookupGcRootLifetimeIndices::default();
+        let facts = ProtoPromotionFacts::default();
+        let proof = LabelFlowGroupProof {
+            block: &inert,
+            linear_prefix_end: 2,
+            cfg: Some(&inert_cfg),
+            facts: &facts,
+            call_roots: &call_roots,
+            lookup_roots: &lookup_roots,
+            safety,
         };
 
-        assert!(label_flow_prefix_group_is_safe(
-            &inert, 0, temp, 2, &group, safety
+        assert_eq!(proof.group_safety(0, temp, &group), Ok(()));
+    }
+
+    #[test]
+    fn label_flow_rejects_bypassed_declaration_and_unclosed_gc_value() {
+        let temp = TempId(0);
+        let resource = TempId(1);
+        let sink = TempId(2);
+        let target = HirLabelId(0);
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let bypassed = HirBlock {
+            stmts: vec![
+                goto(target),
+                assign(temp, HirExpr::Integer(1)),
+                label(target),
+                assign(sink, HirExpr::TempRef(temp)),
+            ],
+        };
+        let bypassed_group = PromotionGroup {
+            temps: BTreeSet::from([temp]),
+            removable_aliases: BTreeSet::new(),
+            touching_stmt_indices: BTreeSet::from([3]),
+        };
+        let bypassed_refs = count_label_references(&bypassed.stmts);
+        let bypassed_cfg = LexicalCfg::analyze(&bypassed.stmts, &bypassed_refs, safety).unwrap();
+        let call_roots = CallRootLifetimeIndices::default();
+        let lookup_roots = LookupGcRootLifetimeIndices::default();
+        let facts = ProtoPromotionFacts::default();
+        let bypassed_proof = LabelFlowGroupProof {
+            block: &bypassed,
+            linear_prefix_end: 0,
+            cfg: Some(&bypassed_cfg),
+            facts: &facts,
+            call_roots: &call_roots,
+            lookup_roots: &lookup_roots,
+            safety,
+        };
+        assert_eq!(
+            bypassed_proof.group_safety(1, temp, &bypassed_group),
+            Err(LabelFlowGroupFailure::ControlFlow)
+        );
+
+        let unclosed = HirBlock {
+            stmts: vec![
+                assign(temp, HirExpr::TempRef(resource)),
+                goto(target),
+                label(target),
+                assign(sink, HirExpr::TempRef(temp)),
+            ],
+        };
+        let unclosed_group = PromotionGroup {
+            temps: BTreeSet::from([temp]),
+            removable_aliases: BTreeSet::new(),
+            touching_stmt_indices: BTreeSet::from([3]),
+        };
+        let unclosed_refs = count_label_references(&unclosed.stmts);
+        let unclosed_cfg = LexicalCfg::analyze(&unclosed.stmts, &unclosed_refs, safety).unwrap();
+        let unclosed_proof = LabelFlowGroupProof {
+            block: &unclosed,
+            linear_prefix_end: 1,
+            cfg: Some(&unclosed_cfg),
+            facts: &facts,
+            call_roots: &call_roots,
+            lookup_roots: &lookup_roots,
+            safety,
+        };
+        assert_eq!(
+            unclosed_proof.group_safety(0, temp, &unclosed_group),
+            Err(LabelFlowGroupFailure::Lifetime)
+        );
+    }
+
+    #[test]
+    fn root_lifetime_pair_must_match_the_candidate_home() {
+        let left = TempId(0);
+        let right = TempId(1);
+        let left_overwrite = TempId(2);
+        let left_home = HomeSlotKey::new(0, 0);
+        let right_home = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(left, left_home);
+        facts.record_temp_home_slot_for_test(right, right_home);
+        facts.record_temp_home_slot_for_test(left_overwrite, left_home);
+        let stmts = vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(left), HirLValue::Temp(right)],
+                values: HirValuePack::expanding(
+                    Vec::new(),
+                    HirPackTail::exact(call("producer"), 2),
+                ),
+            })),
+            HirStmt::CallStmt(Box::new(HirCallStmt {
+                call: match call("collectgarbage") {
+                    HirExpr::Call(call) => *call,
+                    _ => unreachable!(),
+                },
+            })),
+            assign(left_overwrite, HirExpr::Integer(0)),
+        ];
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let call_roots =
+            collect_call_root_lifetimes(&stmts, &facts, safety, true, |_| true, |_| true);
+        let lookup_roots = LookupGcRootLifetimeIndices::default();
+
+        assert!(root_lifetime_closes_in_prefix(
+            0,
+            left_home,
+            stmts.len(),
+            &call_roots,
+            &lookup_roots,
         ));
-        assert!(!label_flow_prefix_group_is_safe(
-            &resource, 0, temp, 2, &group, safety
+        assert!(!root_lifetime_closes_in_prefix(
+            0,
+            right_home,
+            stmts.len(),
+            &call_roots,
+            &lookup_roots,
         ));
     }
 }

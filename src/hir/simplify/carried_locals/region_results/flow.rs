@@ -87,7 +87,9 @@ fn find_candidate(
             continue;
         };
         if region_has_forbidden_nodes(&block.stmts[declaration + 1..=last_mention]) {
-            // 候选拒绝[LayerBoundary]：Decision/Unresolved 交给 decision/elimination owner；TBC/Close 交给资源身份 owner。
+            // 候选拒绝[LayerBoundary]：Decision 交给 decision/eliminate owner；TBC/Close
+            // 交给资源身份 owner。
+            // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
             // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可引入未被结构化 verifier 覆盖的入口与出口。
             continue;
         }
@@ -479,7 +481,9 @@ impl FlowVerifier {
 
     fn validate_leaf(&self, stmt: &HirStmt, states: RelationSet) -> Option<()> {
         if stmt_contains_opaque_expr(stmt) {
-            // 候选拒绝[LayerBoundary]：Decision/Unresolved 的内部读取路径由 decision owner 解析，leaf verifier 不展开。
+            // 候选拒绝[LayerBoundary]：Decision 的内部读取路径由 decision/eliminate owner 解析，
+            // leaf verifier 不展开。
+            // 候选拒绝[PolicyBoundary]：Unresolved 的未知读取属于 permissive 失败证据。
             return None;
         }
         let mut reads = BindingReadCollector::default();
@@ -496,7 +500,9 @@ impl FlowVerifier {
 
     fn validate_expr(&self, expr: &HirExpr, states: RelationSet) -> Option<()> {
         if expr_contains_opaque(expr) {
-            // 候选拒绝[LayerBoundary]：opaque Decision/Unresolved 的路径读取交由其 owner 消解后再审计。
+            // 候选拒绝[LayerBoundary]：opaque Decision 的路径读取交由 decision/eliminate owner
+            // 消解后再审计。
+            // 候选拒绝[PolicyBoundary]：Unresolved 的未知读取属于 permissive 失败证据。
             return None;
         }
         self.validate_reads(&binding_reads_in_expr(expr), states)

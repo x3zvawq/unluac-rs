@@ -108,7 +108,7 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
                     break;
                 }
                 Some(LocalAttrMergeBarrier::NonTrailingClose) => {
-                    // 候选拒绝[LayerBoundary]：HIR close-scope 与 AST build 目前只稳定恢复列表末位的 `<close>`，不能生成无法重编译恢复的非末位形状。
+                    // 候选拒绝[TargetConstraint]：Lua 5.4/5.5 要求 `<close>` binding 位于 local list 末位；继续合并会生成目标语法不允许的非末位 `<close>`（regress_379）。
                     break;
                 }
                 None => {}
@@ -236,7 +236,7 @@ fn merge_adjacent_single_value_local_decls(
                     break;
                 }
                 Some(LocalAttrMergeBarrier::NonTrailingClose) => {
-                    // 候选拒绝[LayerBoundary]：HIR close-scope 与 AST build 目前只稳定恢复列表末位的 `<close>`，不能生成无法重编译恢复的非末位形状。
+                    // 候选拒绝[TargetConstraint]：Lua 5.4/5.5 要求 `<close>` binding 位于 local list 末位；继续合并会生成目标语法不允许的非末位 `<close>`（regress_379）。
                     break;
                 }
                 None => {}

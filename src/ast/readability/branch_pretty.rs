@@ -189,7 +189,8 @@ fn single_pass_stmt_flow(stmt: &AstStmt) -> Option<SinglePassFlow> {
         // goto/label 已由 single-pass 候选入口的 forbidden-node 预检拒绝；这里保留
         // None 只是让 flow helper 对全部 AST 节点保持封闭。
         AstStmt::Goto(_) | AstStmt::Label(_) => None,
-        // 候选拒绝[LayerBoundary]：Error 是必须保留的前层诊断。
+        // 候选拒绝[PolicyBoundary]：项目保留 Error 作为 best-effort 反编译诊断，不把它
+        // 当成可执行语句参与 single-pass 控制流美化。
         AstStmt::Error(_) => None,
         AstStmt::LocalDecl(_)
         | AstStmt::GlobalDecl(_)
@@ -408,7 +409,7 @@ fn stmt_contains_single_pass_forbidden_nodes(stmt: &AstStmt, loop_depth: usize) 
         // Structure/HIR reducible-control 恢复；branch-pretty 只消费已结构化的 break tree，
         // 不在 AST 重新解释 CFG（regress_368）。
         AstStmt::Goto(_) | AstStmt::Label(_) => true,
-        // 候选拒绝[LayerBoundary]：Error 是前层诊断，不参与展示层控制重建。
+        // 候选拒绝[PolicyBoundary]：项目要求 Error 诊断原位保留，不参与展示层控制重建。
         AstStmt::Error(_) => true,
         AstStmt::LocalDecl(_)
         | AstStmt::GlobalDecl(_)
@@ -540,7 +541,8 @@ fn constant_if_has_protected_nodes(if_stmt: &AstIf) -> bool {
     // 候选拒绝[SemanticBarrier:ControlFlow]：label/goto 可从条件壳外进入 arm，删除 Boolean if 会删除合法入口或改变目标。
     block_contains_label_or_goto(&if_stmt.then_block)
         || else_block.is_some_and(block_contains_label_or_goto)
-        // 候选拒绝[LayerBoundary]：Error 节点是前层失败诊断，readability 不删除其承载外壳。
+        // 候选拒绝[PolicyBoundary]：删除常量 arm 外壳会连同 best-effort Error 诊断一起
+        // 消失；项目选择保留失败证据，即使该 arm 按运行语义不可达。
         || block_contains_diagnostic(&if_stmt.then_block)
         || else_block.is_some_and(block_contains_diagnostic)
         // 候选拒绝[PolicyBoundary]：方言 global 声明作为源码级编译期证据保留；选中 arm

@@ -163,6 +163,7 @@ fn collapse_handoffs_recursive(
         promotion_facts,
         identity_facts,
         inherited_locals,
+        expr_safety,
     );
     changed |= collapse_block_handoffs(
         block,

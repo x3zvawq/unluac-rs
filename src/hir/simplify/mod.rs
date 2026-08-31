@@ -17,6 +17,7 @@ pub(super) mod decision;
 mod expr_facts;
 mod generic_for_iterators;
 mod label_refs;
+mod lexical_cfg;
 mod local_shapes;
 mod locals;
 mod logical_simplify;

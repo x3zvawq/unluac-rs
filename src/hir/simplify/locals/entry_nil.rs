@@ -177,7 +177,10 @@ pub(super) fn prune_redundant_entry_nil_writes(
         if let Err(error) = analyzer.analyze_if(if_stmt, NilStates::entry()) {
             match error {
                 PruneError::ResidualExpr => {
-                    // 候选拒绝[LayerBoundary]：Decision/Unresolved 的执行路径由 decision/dead-unresolved owner 收敛，本 pass 不解释残留表达式。
+                    // 候选拒绝[LayerBoundary]：Decision 的执行路径由 decision/eliminate owner
+                    // 收敛，本 pass 不展开其内部控制流。
+                    // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
+                    // entry-nil 不据未知路径删除边写。
                 }
                 PruneError::UnstructuredControl => {
                     // 候选拒绝[LayerBoundary]：label/goto 的 predecessor 与目标边由 Structure island/branch-control owner 维护，本 pass 不在线性 HIR 上重建 CFG。

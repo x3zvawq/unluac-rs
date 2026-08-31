@@ -550,9 +550,9 @@ fn producer_steps_from_bindings(
     }
 
     if values.tail.is_some() {
-        // 候选拒绝[ProofIncomplete]：open tail 的运行时宽度决定每个后续 binding 是结果还是
-        // nil padding；exact-width tail 虽有总宽度，也仍缺少单个结果的 scalar projection
-        // carrier。不能把任一形状按 closed pack 的缺失槽直接映射为 nil。
+        // 候选拒绝[LayerBoundary]：`hir::analyze::instrs::lower_result_assign` 与
+        // `analyze::exprs` 是 value-pack owner；open tail 的运行时宽度不固定，exact tail 也只
+        // 保存一个 pack carrier 而没有逐槽 scalar projection，本 pass 不能伪造 nil 或重复 tail。
         return None;
     }
     if let Some(surplus) = values.fixed.get(bindings.len()..) {
@@ -563,13 +563,21 @@ fn producer_steps_from_bindings(
         }
         if surplus
             .iter()
-            .any(|value| !seed_delay_expr_is_unobservable(value))
+            .any(|value| matches!(value, HirExpr::Closure(_)))
         {
-            // 候选拒绝[ProofIncomplete]：无可观察求值事件但会分配临时对象、携带 open
-            // value arity 或保留 capture snapshot 的 discarded RHS，仍缺 statement 内
-            // temporary-root lifetime/value-width 事实；literal 与直接 binding read 已放行。
+            // 候选拒绝[SemanticBarrier:Lifetime]：discarded closure 仍会建立 ByReference
+            // upvalue/root；删除整句会改变被捕获对象跨后续 GC/Close 的存活期。
             return None;
         }
+        if surplus
+            .iter()
+            .any(|value| matches!(value, HirExpr::Unresolved(_)))
+        {
+            // 候选拒绝[LayerBoundary]：Unresolved 由 residual owner 保留诊断，本 pass 不把它
+            // 当成可静默丢弃的 closed scalar RHS。
+            return None;
+        }
+        debug_assert!(surplus.iter().all(seed_delay_expr_is_unobservable));
     }
 
     steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
@@ -585,6 +593,13 @@ fn producer_source_preservation(
     values: &HirValuePack,
     debug_identity_bindings: &BindingSlots<bool>,
 ) -> ProducerSourcePreservation {
+    if values
+        .fixed
+        .iter()
+        .any(|value| matches!(value, HirExpr::Unresolved(_)))
+    {
+        return ProducerSourcePreservation::UnsupportedShape;
+    }
     if bindings.iter().any(|binding| {
         debug_identity_bindings
             .get(*binding)
@@ -594,6 +609,16 @@ fn producer_source_preservation(
         return ProducerSourcePreservation::DebugIdentity;
     }
     if values.fixed.iter().any(expr_requires_ordered_snapshot) {
+        return ProducerSourcePreservation::ObservableReplay;
+    }
+    if values
+        .fixed
+        .iter()
+        .any(|value| matches!(value, HirExpr::Closure(_)))
+    {
+        // Closure allocation creates one identity/root even when all captures are eventless.
+        // A preserved source plus an inlined field would allocate it twice; a removed partial
+        // declaration would instead drop another slot's root.
         return ProducerSourcePreservation::ObservableReplay;
     }
     if values.fixed.iter().all(|value| {
@@ -608,18 +633,22 @@ fn producer_source_preservation(
                 | HirExpr::UInt64(_)
                 | HirExpr::Vector(_)
                 | HirExpr::Complex { .. }
+                | HirExpr::VarArg
         )
     }) {
         if bindings.len() == 1 && values.fixed.len() == 1 {
             ProducerSourcePreservation::Safe
         } else {
-            // Multi-slot, nil-padded, and primitive-surplus declarations are safe to retain only
-            // as one statement. The distinct plan also keeps scanner's last-use horizon active so
-            // every consumable slot gets a chance to join the same removal transaction.
+            // Multi-slot, nil-padded, primitive-surplus, and scalar-vararg declarations are safe
+            // to retain only as one statement. The distinct plan also keeps scanner's last-use
+            // horizon active so every consumable slot joins the same removal transaction.
             ProducerSourcePreservation::InertWholeStatement
         }
     } else {
-        ProducerSourcePreservation::UnsupportedShape
+        // Every current non-residual HIR expression outside the scalar set above either requires
+        // an ordered snapshot or allocates a closure. Keep future expression kinds on the same
+        // replay-safe side until they provide a narrower source-preservation proof.
+        ProducerSourcePreservation::ObservableReplay
     }
 }
 
@@ -684,6 +713,7 @@ pub(super) fn seed_delay_expr_is_unobservable(expr: &HirExpr) -> bool {
             | HirExpr::LocalRef(_)
             | HirExpr::UpvalueRef(_)
             | HirExpr::TempRef(_)
+            | HirExpr::VarArg
     )
 }
 
@@ -828,6 +858,30 @@ mod tests {
     }
 
     #[test]
+    fn multi_slot_scalar_vararg_preserves_the_whole_source_for_an_unconsumed_slot() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1), LocalId(2)],
+                    values: HirValuePack::fixed(vec![HirExpr::VarArg, HirExpr::Integer(7)]),
+                })),
+                record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+
+        let (constructor, end_index, preserved) = rebuild(&block)
+            .expect("scalar vararg slots should share the whole-statement preservation plan");
+
+        assert_eq!(end_index, 2);
+        assert_eq!(preserved, vec![1]);
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [HirTableField::Record(field)] if field.value == HirExpr::VarArg
+        ));
+    }
+
+    #[test]
     fn unconsumed_scalar_producer_is_preserved_around_rebuilt_field() {
         let block = HirBlock {
             stmts: vec![
@@ -961,6 +1015,35 @@ mod tests {
 
         let (constructor, end_index, preserved) =
             rebuild(&block).expect("primitive discarded RHS has no event or surviving root");
+
+        assert_eq!(end_index, 2);
+        assert!(preserved.is_empty());
+        assert!(matches!(
+            constructor.fields.as_slice(),
+            [HirTableField::Record(field)] if field.value == HirExpr::Integer(7)
+        ));
+    }
+
+    #[test]
+    fn surplus_scalar_vararg_rhs_can_be_discarded() {
+        let block = HirBlock {
+            stmts: vec![
+                local(LocalId(0), HirExpr::TableConstructor(Box::default())),
+                HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![LocalId(1)],
+                    // 非末槽 vararg 处于 scalar context；它不读取可变 binding，也不产生事件。
+                    values: HirValuePack::fixed(vec![
+                        HirExpr::Integer(7),
+                        HirExpr::VarArg,
+                        HirExpr::Integer(8),
+                    ]),
+                })),
+                record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
+            ],
+        };
+
+        let (constructor, end_index, preserved) =
+            rebuild(&block).expect("discarded scalar vararg has no event or surviving root");
 
         assert_eq!(end_index, 2);
         assert!(preserved.is_empty());

@@ -77,11 +77,11 @@ pub(super) fn transparent_block_head(mut stmt: &HirStmt) -> Option<&HirStmt> {
         let HirStmt::Block(block) = stmt else {
             return Some(stmt);
         };
-        // 候选拒绝[ProofIncomplete]：第二条及更晚消费仍需 block-prefix 的求值、写入、capture、
-        // 词法遮蔽与外部控制流摘要；当前只把零前缀的首语句视为透明。缺少这些事实时，
-        // `local t=f(); do g(); return t end` 会把 f/g 顺序倒置，`local x=1; local t=x;
-        // do local x; return t end` 则可能把 x 解析成内层 nil；因此不能仅按“前缀未使用
-        // candidate temp”就继续扫描后续语句。
+        // 候选拒绝[LayerBoundary]：这个分类器只描述零前缀消费站点，不拥有 moved value、
+        // possible-home 或 block-prefix effect/capture/CFG 事实。第二条及更晚消费应由
+        // `inline_temps_in_block` 的结构前缀 owner 在证明求值顺序与 source value epoch 后
+        // 先拆出可移动站点；否则 `local t=x; do x=2; return t end` 会把旧快照改读成新值，
+        // `local t=f(); do g(); return t end` 也会把 f/g 顺序倒置。
         stmt = block.stmts.first()?;
     }
 }

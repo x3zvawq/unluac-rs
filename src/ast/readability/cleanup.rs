@@ -155,7 +155,8 @@ fn cleanup_block(
                             // 除数还会触发除法元方法，regress390 覆盖动态错误运算不能删除。
                             // 候选拒绝[TargetConstraint]：AstTargetDialect 只有 Lua 5.1/5.2 版本，
                             // 未携带 chunk 的 integral-number 位宽/溢出语义，不能从版本猜测 Integer 算术。
-                            // 候选拒绝[LayerBoundary]：Error 由 ast::build 的诊断 owner 保留。
+                            // 候选拒绝[PolicyBoundary]：AstExpr::Error 是 best-effort 输出必须
+                            // 保留的失败证据，cleanup 不把它当作可丢弃的纯值。
                             local_decl.values.push(value);
                             retained_stmts.push(AstStmt::LocalDecl(local_decl));
                         }
@@ -612,7 +613,8 @@ fn can_elide_single_stmt_do_block(stmt: &AstStmt) -> bool {
         // 候选接受：外层 do 内只有另一个 do，所有声明/label/goto 仍受内层 block 约束；
         // 删除空的外层词法层不扩大任何内部 binding 或控制流实体的作用域。
         AstStmt::DoBlock(_) => true,
-        // 候选拒绝[LayerBoundary]：Error 由前层诊断 owner 保留，readability 不消费。
+        // 候选拒绝[PolicyBoundary]：项目保留 best-effort Error 诊断及其 do 外壳，
+        // readability 不以“单句无 binding”为由拍平失败证据。
         AstStmt::Error(_) => false,
     }
 }
