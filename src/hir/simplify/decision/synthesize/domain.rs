@@ -2,7 +2,8 @@
 //!
 //! 它依赖前面已经规范化的 HIR decision 表达式，只表达“候选式子在抽象环境里代表什么”，
 //! 不会在这里决定哪一种源码形状更可读。
-//! 例如：`temp == nil` 会在这里被解释成可枚举的抽象真假环境。
+//! 例如：`temp == nil` 会在这里被解释成可枚举的抽象真假环境；整数与浮点数的判等
+//! 则按 Lua 数值语义计算，而不是按抽象值枚举项的 Rust 身份计算。
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +68,34 @@ fn abstract_value_partial_cmp(
         (AbstractValue::TruthySymbol(a), AbstractValue::TruthySymbol(b)) => Some(a.cmp(b)),
         _ => None,
     }
+}
+
+/// 模拟 Lua `==` 对抽象值的原始判等语义。
+///
+/// 结果值等价性仍需区分 Integer/Number，因为 Lua 5.3+ 的 `math.type` 能观察表示；只有
+/// `==` 运算本身会在整数与浮点数之间做精确数值比较。浮点同类比较直接使用 IEEE 754
+/// `==`，从而让正负零相等、NaN 与任何值（包括自身）都不相等。
+fn abstract_value_eq(lhs: &AbstractValue, rhs: &AbstractValue) -> bool {
+    match (lhs, rhs) {
+        (AbstractValue::Number(lhs), AbstractValue::Number(rhs)) => {
+            f64::from_bits(*lhs) == f64::from_bits(*rhs)
+        }
+        (AbstractValue::Integer(integer), AbstractValue::Number(number))
+        | (AbstractValue::Number(number), AbstractValue::Integer(integer)) => {
+            integer_equals_number(*integer, f64::from_bits(*number))
+        }
+        _ => lhs == rhs,
+    }
+}
+
+fn integer_equals_number(integer: i64, number: f64) -> bool {
+    const I64_EXCLUSIVE_UPPER_BOUND: f64 = 9_223_372_036_854_775_808.0;
+
+    number.is_finite()
+        && number.fract() == 0.0
+        && number >= i64::MIN as f64
+        && number < I64_EXCLUSIVE_UPPER_BOUND
+        && number as i64 == integer
 }
 
 #[derive(Clone)]
@@ -165,9 +194,7 @@ pub(super) fn eval_pure_expr(
         HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
             let lhs = eval_pure_expr(&binary.lhs, env, ref_positions)?;
             let rhs = eval_pure_expr(&binary.rhs, env, ref_positions)?;
-            // 证明缺陷[PotentialUnsoundness:Numeric]：派生 Eq 把 enum 判等当 Lua `==`；共享 DAG 可据此误接纳
-            // `(x==1) and A or X`，其中 `A=(x==1.0) ? false : X`，使 `x=1.0` 时原式返回 false、候选返回真值 X。
-            Some(if lhs == rhs {
+            Some(if abstract_value_eq(&lhs, &rhs) {
                 AbstractValue::True
             } else {
                 AbstractValue::False

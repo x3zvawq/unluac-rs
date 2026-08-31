@@ -327,7 +327,10 @@ fn nil_fallback_alias_rewrite(
         }
         (source, else_block.clone())
     };
-    // 证明缺陷[PotentialUnsoundness:Scope]：未排除 target==source；外层 x=7 时原 `local x; if x==nil then x=1 else x=x end` 得 1，改写 `local x=x` 得 7。
+    if target == source {
+        // 候选拒绝[SemanticBarrier:Scope]：最小 HIR `outer x=7; local x; if x==nil then x=1 else x=x end` 得 1，改成 `local x=x` 后得 7；官方编译器会先消去 `x=x`，尚无能命中该接受点的源码回归。
+        return None;
+    }
     Some(NilFallbackAliasRewrite {
         target,
         source,

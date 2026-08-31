@@ -20,7 +20,8 @@
 //! 后续读写改回参数身份。它不重新推断 phi 或 loop state，只处理 locals 自己稳定暴露的
 //! binding 形状。
 //! 不同 home slot 上的 move alias 是当时值的快照，不能与来源槽位后续的状态合并；
-//! 没有 home slot 的 phi temp 仍可沿同一状态链归并。
+//! 没有 trusted home slot 的 phi temp 可以单独提升，但不能吸收 move alias：缺少未污染的
+//! 物理身份时无法证明两个槽位的 GC root、capture cell 与跨块 value epoch 相同。
 //! 对没有 debug local 证据、home-slot 定义和根 block 直接 temp 绑定压力都已经超过
 //! 源码局部槽上限的大函数，同一 `(slot, close epoch)` 会复用一个 local；两个门同时
 //! 成立才能证明这是源码层的局部数压力，而不是单纯由 SSA 拆分制造的定义数。物理覆盖
@@ -32,6 +33,9 @@
 //! 建立源码 local，但不能借原始槽号复用 sticky/debug local：raw home 只登记给 capture/TBC
 //! 保护，组内所有 temp 的 trusted home 完全一致时才参与正向复用，taint 再传播到新 local；
 //! 含引用 capture 的 temp 组若不能证明同槽，则保持 temp，避免丢失 capture cell 身份。
+//! promotion plan 会在候选形成时冻结初始化值；apply 只消费已验证的 plan，不再重新匹配
+//! anchor 语句。`while` 条件里的 temp 则作为跨迭代消费者保护到 body，避免把回边写回
+//! 误删成一次性的 move alias。
 //!
 mod branch_merge;
 mod entry_nil;
@@ -53,7 +57,8 @@ use super::temp_touch::{
     stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, TempId,
+    HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirValuePack,
+    LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -151,9 +156,9 @@ struct PromotionPlan {
     action: PromotionAction,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone)]
 enum PromotionInit {
-    FromAssign,
+    FromAssign(HirValuePack),
     Empty,
 }
 
@@ -284,38 +289,42 @@ fn promote_block(
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> PromotionResult {
-    promote_block_with_child_protection(
+    promote_block_with_protection(
         ctx,
         block,
         inherited,
         inherited_sticky_slots,
         outer_uses_temp,
         &BTreeSet::new(),
+        &BTreeSet::new(),
     )
 }
 
-fn promote_block_with_child_protection(
+fn promote_block_with_protection(
     ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
     inherited: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
-    child_protected_temps: &BTreeSet<TempId>,
+    current_plan_protected_temps: &BTreeSet<TempId>,
+    descendant_protected_temps: &BTreeSet<TempId>,
 ) -> PromotionResult {
     record_gc_fenced_local_roots(block, ctx.physical_root_locals);
 
-    // 递归进入子作用域时，把当前语句之后仍被外层引用的 temp 传给子 block。
-    // tracker 用引用计数维护后缀集合，避免为每个 index 克隆一份成长中的 BTreeSet。
+    // 每轮控制头等 block 外消费者先保护当前 block；递归进入子作用域时再叠加当前语句
+    // 之后的引用。tracker 用引用计数维护后缀集合，避免按 index 克隆完整集合。
     let stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
     let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
 
+    let block_uses_outer_temp =
+        |temp| outer_uses_temp(temp) || current_plan_protected_temps.contains(&temp);
     let plans = collect_plans(
         ctx,
         block,
         &stmt_temp_refs,
         inherited.as_ref(),
         inherited_sticky_slots,
-        outer_uses_temp,
+        &block_uses_outer_temp,
     );
     let plan_by_decl = plans.iter().fold(
         BTreeMap::<usize, Vec<&PromotionPlan>>::new(),
@@ -340,8 +349,16 @@ fn promote_block_with_child_protection(
         temp_refs.enter_stmt(index);
         let mut replaced_stmt = false;
         if let Some(plans) = plan_by_decl.get(&index) {
+            assert!(
+                plans
+                    .iter()
+                    .filter(|plan| plan_replaces_original_stmt(plan))
+                    .count()
+                    <= 1,
+                "one anchor cannot own multiple evaluating promotion plans"
+            );
             for plan in plans {
-                if let Some(anchor_stmt) = rewrite_plan_anchor_stmt(&stmt, plan, mapping.as_ref()) {
+                if let Some(anchor_stmt) = rewrite_plan_anchor_stmt(plan, mapping.as_ref()) {
                     rewritten.push(anchor_stmt);
                 }
             }
@@ -376,9 +393,9 @@ fn promote_block_with_child_protection(
 
         // 子作用域的 outer temps = 当前块后续语句的 temp 引用 ∪ 来自祖先作用域的保护集
         let child_uses_outer_temp = |temp| {
-            outer_uses_temp(temp)
+            block_uses_outer_temp(temp)
+                || descendant_protected_temps.contains(&temp)
                 || temp_refs.suffix_contains(temp)
-                || child_protected_temps.contains(&temp)
         };
         let stmt_changed = rewrite_stmt(
             ctx,
@@ -502,7 +519,7 @@ fn collect_plans(
             continue;
         };
         if inherited.contains_key(&root_temp) || reserved_temps.contains(&root_temp) {
-            // 候选拒绝[ConvergenceGuard]：该 temp 已由祖先或本 block 的既有 plan 认领；再次建 plan 会产生重复声明或冲突映射。
+            // 已被祖先映射或当前 plan 认领的 temp 不再形成新候选。
             continue;
         }
         if temp_touches.touches_before(decl_index, root_temp) {
@@ -527,7 +544,6 @@ fn collect_plans(
             decl_index,
             root_temp,
             facts,
-            &sticky_slots,
             &is_reserved,
             &temp_touches,
         );
@@ -628,6 +644,10 @@ fn collect_plans(
             direct_seed_promotions: ctx.direct_seed_promotions,
             debug_scope_locals: ctx.debug_scope_locals,
         };
+        let init = PromotionInit::FromAssign(
+            simple_temp_assign_values(stmt)
+                .expect("promotion root must retain its validated single-assignment shape"),
+        );
         let selected_local = if let Some(local) = reusable_local {
             allocator.reuse_existing_local(
                 decl_index,
@@ -635,7 +655,7 @@ fn collect_plans(
                 home_slot,
                 group.clone(),
                 removable_aliases,
-                PromotionInit::FromAssign,
+                init,
             );
             local
         } else {
@@ -644,7 +664,7 @@ fn collect_plans(
                 home_slot,
                 group.clone(),
                 removable_aliases,
-                PromotionInit::FromAssign,
+                init,
             );
             let local = allocator
                 .plans
@@ -753,11 +773,10 @@ fn collect_promotion_group(
     decl_index: usize,
     root_temp: TempId,
     facts: &ProtoPromotionFacts,
-    sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     is_reserved: &dyn Fn(TempId) -> bool,
     temp_touches: &TempTouchIndex<'_>,
 ) -> PromotionGroup {
-    let root_slot = facts.home_slot(root_temp);
+    let root_slot = facts.trusted_temp_home_slot(root_temp);
     let mut temps = BTreeSet::from([root_temp]);
     let mut removable_aliases = BTreeSet::new();
     let mut touching_stmt_indices = BTreeSet::new();
@@ -770,21 +789,15 @@ fn collect_promotion_group(
         }
         let future_stmt = &block.stmts[future_index];
         let alias = alias_temp_for_group(future_stmt, &temps).filter(|alias_temp| {
-            let alias_slot = facts.home_slot(*alias_temp);
-            // 证明缺陷[PotentialUnsoundness:ValueFlow]：raw home 任一端缺失时仍会吸收 alias；`while t1(phi home unknown) do t0=next(); t1=t0; use(t1) end` 会删掉回写并让下轮 condition 继续读旧 t1。
-            let same_slot = root_slot
-                .zip(alias_slot)
-                .is_none_or(|(root, alias)| root == alias);
-            let slot_is_available = root_slot.is_some()
-                || alias_slot.is_none_or(|slot| !sticky_slots.contains_key(&slot));
-            // 候选拒绝[ConvergenceGuard]：已认领或已在组内的 alias 不能重复加入同一/另一 promotion plan。
+            let alias_slot = facts.trusted_temp_home_slot(*alias_temp);
+            let shared_home = root_slot.zip(alias_slot);
+            // 已认领或已在组内的 alias 不再形成新候选。
+            // 候选拒绝[ProofIncomplete]：move 任一端缺 trusted home 时，当前事实不能证明物理 GC root、capture cell 与跨块 value epoch 相同。
             // 候选拒绝[SemanticBarrier:Lifetime]：两个已知不同 home 的 move 是独立 GC root；合并后覆盖 source 会让 alias 对象提前不可达。
-            // 候选拒绝[SemanticBarrier:Capture]：root home 未知而 alias home 已绑定 sticky closure cell 时，吸收 alias 会把此前捕获的 cell 改写成 root 身份。
             // 候选拒绝[SemanticBarrier:ValueFlow]：`next=f(carried); carried=next` 中 alias 在 root 定义前已被读取；删除写回会让下一轮继续读取入口 seed。
             !is_reserved(*alias_temp)
                 && !temps.contains(alias_temp)
-                && same_slot
-                && slot_is_available
+                && shared_home.is_some_and(|(root, alias)| root == alias)
                 // `next = f(carried); carried = next` 是 loop 回边写回，不是可删除
                 // alias。若 alias 的旧值已在 root 定义语句中参与求值，合并二者会删掉
                 // 下一轮所需的写回，只留下每轮都读取入口 seed 的局部变量。
@@ -911,6 +924,19 @@ fn single_temp_assign_value(stmt: &HirStmt, temp: TempId) -> Option<&HirExpr> {
     Some(value)
 }
 
+fn simple_temp_assign_values(stmt: &HirStmt) -> Option<HirValuePack> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let [HirLValue::Temp(_)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [_] = assign.values.fixed.as_slice() else {
+        return None;
+    };
+    assign.values.tail.is_none().then(|| assign.values.clone())
+}
+
 fn stmt_uses_temp_as_assign_table_base(stmt: &HirStmt, temp: TempId) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return false;
@@ -961,34 +987,24 @@ fn expr_is_temp_ref(expr: &HirExpr, temp: TempId) -> bool {
 }
 
 fn rewrite_plan_anchor_stmt(
-    stmt: &HirStmt,
     plan: &PromotionPlan,
     mapping: &BTreeMap<TempId, LocalId>,
 ) -> Option<HirStmt> {
-    let values = match plan.init {
-        PromotionInit::FromAssign => {
-            let HirStmt::Assign(assign) = stmt else {
-                // 证明缺陷[InvariantMismatch]：accepted FromAssign plan 若与冻结 anchor 失配会静默不发射初始化、随后仍删除原语句；这里应 assert plan/anchor 不变量。
-                return None;
-            };
-            let [HirLValue::Temp(_temp)] = assign.targets.as_slice() else {
-                // 证明缺陷[InvariantMismatch]：accepted FromAssign plan 若不再是单 temp target 会静默丢掉原赋值；这里应 assert matcher 与应用阶段形状一致。
-                return None;
-            };
-
-            let mut values = assign.values.clone();
+    let values = match &plan.init {
+        PromotionInit::FromAssign(values) => {
+            let mut values = values.clone();
             rewrite::value_pack(&mut values, mapping);
             values
         }
         PromotionInit::Empty => crate::hir::common::HirValuePack::fixed(Vec::new()),
     };
 
-    match (plan.action, plan.init) {
+    match (plan.action, &plan.init) {
         (PromotionAction::AllocateLocal, _) => Some(HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![plan.local],
             values,
         }))),
-        (PromotionAction::ReuseExistingLocal, PromotionInit::FromAssign) => {
+        (PromotionAction::ReuseExistingLocal, PromotionInit::FromAssign(_)) => {
             Some(HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Local(plan.local)],
                 values,
@@ -999,7 +1015,7 @@ fn rewrite_plan_anchor_stmt(
 }
 
 fn plan_replaces_original_stmt(plan: &PromotionPlan) -> bool {
-    matches!(plan.init, PromotionInit::FromAssign)
+    matches!(plan.init, PromotionInit::FromAssign(_))
 }
 
 fn rewrite_stmt(
@@ -1049,12 +1065,16 @@ fn rewrite_stmt(
         }
         HirStmt::While(while_stmt) => {
             let cond_changed = rewrite::expr(&mut while_stmt.cond, mapping.as_ref());
-            let body_changed = promote_block(
+            // while 条件在每轮 body 之前重新读取；body 内的回边 alias 不能吞掉条件状态。
+            let condition_temps = collect_temp_refs_in_expr(&while_stmt.cond);
+            let body_changed = promote_block_with_protection(
                 ctx,
                 &mut while_stmt.body,
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
+                &condition_temps,
+                &condition_temps,
             )
             .changed;
             cond_changed || body_changed
@@ -1065,12 +1085,13 @@ fn rewrite_stmt(
             // 最后得到“body 已经是 l2，until 里还是 t3”这种半截 HIR。条件引用同时是
             // 更深子块的外部消费者，不能让嵌套 block 抢先声明同一个 temp。
             let condition_temps = collect_temp_refs_in_expr(&repeat_stmt.cond);
-            let body_result = promote_block_with_child_protection(
+            let body_result = promote_block_with_protection(
                 ctx,
                 &mut repeat_stmt.body,
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
+                &BTreeSet::new(),
                 &condition_temps,
             );
             let cond_changed =

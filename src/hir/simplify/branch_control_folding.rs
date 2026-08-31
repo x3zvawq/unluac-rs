@@ -11,11 +11,11 @@
 
 mod path_conditions;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLabelId, HirLogicalExpr, HirProto,
-    HirStmt, HirUnaryOpKind, LocalId,
+    HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLValue, HirLabelId, HirLogicalExpr,
+    HirProto, HirStmt, HirUnaryOpKind, LocalId, TempId,
 };
 use crate::hir::expr_safety::{expr_is_discard_safe, expr_is_repeatable};
 
@@ -29,8 +29,16 @@ use super::walk::{HirRewritePass, rewrite_proto};
 pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
     let mut changed = false;
     loop {
-        let path_changed = path_conditions::specialize_stable_path_conditions(proto);
-        changed |= path_changed | rewrite_proto(proto, &mut BranchControlPass);
+        let discard_facts = DiscardBoundaryFacts::new(proto);
+        let path_changed =
+            path_conditions::specialize_stable_path_conditions(proto, &discard_facts);
+        changed |= path_changed
+            | rewrite_proto(
+                proto,
+                &mut BranchControlPass {
+                    discard_facts: &discard_facts,
+                },
+            );
         // 删除不可达写可能让下一项 local 立刻满足稳定性证明。这里收完本 pass 自己的
         // 单调链，避免合法的长链逐项消耗全局 scheduler 的固定轮次预算。
         if !path_changed {
@@ -39,11 +47,13 @@ pub(super) fn fold_branch_control_in_proto(proto: &mut HirProto) -> bool {
     }
 }
 
-struct BranchControlPass;
+struct BranchControlPass<'a> {
+    discard_facts: &'a DiscardBoundaryFacts,
+}
 
-impl HirRewritePass for BranchControlPass {
+impl HirRewritePass for BranchControlPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        let constant_changed = fold_constant_control(&mut block.stmts);
+        let constant_changed = fold_constant_control(&mut block.stmts, self.discard_facts);
         let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
         let empty_changed = remove_discard_safe_empty_ifs(&mut block.stmts);
         let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
@@ -153,7 +163,7 @@ impl HirVisitor for DirectCopySinkBoundary {
     }
 }
 
-fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
+fn fold_constant_control(stmts: &mut Vec<HirStmt>, discard_facts: &DiscardBoundaryFacts) -> bool {
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
     let mut changed = false;
@@ -169,13 +179,29 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
             changed = true;
             continue;
         }
-        if matches!(&stmt, HirStmt::Block(block) if block.stmts.is_empty())
-            || matches!(
-                &stmt,
-                HirStmt::While(while_stmt) if while_stmt.cond == HirExpr::Boolean(false)
-            )
+        if matches!(&stmt, HirStmt::Block(block) if block.stmts.is_empty()) {
+            changed = true;
+            continue;
+        }
+        if let HirStmt::While(while_stmt) = &stmt
+            && while_stmt.cond == HirExpr::Boolean(false)
         {
-            // 证明缺陷[PotentialPolicyViolation]：constant-false while 的不可达 body 可能含 debug local 或显式诊断；当前接受点没有 proto identity/diagnostic gate。
+            let boundary = discard_facts.block_boundary(&while_stmt.body);
+            if boundary.has_control_entry() {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：全局 label 引用数大于 body 内部引用数，如外部 `goto L` 指向 body 内 `::L::`；删除 body 会丢失确定的跳转目标。
+                rewritten.push(stmt);
+                continue;
+            }
+            if boundary.has_identity() {
+                // 候选拒绝[PolicyBoundary]：未执行 body 内的 debug/PhysicalRoot/TBC 身份按源码证据策略保留（regress339 retain-debug）。
+                rewritten.push(stmt);
+                continue;
+            }
+            if boundary.has_diagnostic() {
+                // 候选拒绝[LayerBoundary]：ErrNil/Unresolved 是前层显式诊断，branch-control 不得静默吞掉（regress339 Lua 5.5 ERRNNIL）。
+                rewritten.push(stmt);
+                continue;
+            }
             changed = true;
             continue;
         }
@@ -203,6 +229,28 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
             continue;
         };
 
+        let discarded = if selected_then {
+            if_stmt.else_block.as_ref()
+        } else {
+            Some(&if_stmt.then_block)
+        };
+        let discarded_boundary = discarded.map(|block| discard_facts.block_boundary(block));
+        if discarded_boundary.is_some_and(DiscardBoundary::has_control_entry) {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：全局 label 引用数大于 arm 内部引用数，如外部 `goto L` 指向 arm 内 `::L::`；删除 arm 会丢失确定入边。
+            rewritten.push(HirStmt::If(if_stmt));
+            continue;
+        }
+        if discarded_boundary.is_some_and(DiscardBoundary::has_identity) {
+            // 候选拒绝[PolicyBoundary]：未选 arm 的 debug/PhysicalRoot/TBC 身份仍属于项目要保留的源码证据（regress339 retain-debug）。
+            rewritten.push(HirStmt::If(if_stmt));
+            continue;
+        }
+        if discarded_boundary.is_some_and(DiscardBoundary::has_diagnostic) {
+            // 候选拒绝[LayerBoundary]：ErrNil/Unresolved 由诊断 owner 生成，branch-control 不删除其承载 arm（regress339 Lua 5.5 ERRNNIL）。
+            rewritten.push(HirStmt::If(if_stmt));
+            continue;
+        }
+
         let selected = if selected_then {
             if_stmt.then_block
         } else {
@@ -211,12 +259,149 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
         if !selected.stmts.is_empty() {
             rewritten.push(HirStmt::Block(Box::new(selected)));
         }
-        // 证明缺陷[PotentialPolicyViolation]：未选 arm 可能承载 debug local 或 ErrNil/Unresolved 诊断；这里只证明运行不可达，未证明可丢弃源码身份/诊断。
         changed = true;
     }
 
     *stmts = rewritten;
     changed
+}
+
+/// branch-control 只在丢弃不可达代码时消费的 proto 身份与诊断边界。
+///
+/// `locals` 已经把可保留的源码 local 稳定成 `LocalId`；尚未物化的
+/// debug temp 仍以 `temp_debug_locals` 标记。这里冻结两类身份，不重建 debug scope。
+pub(super) struct DiscardBoundaryFacts {
+    protected_locals: BTreeSet<LocalId>,
+    protected_temps: BTreeSet<TempId>,
+    label_refs: BTreeMap<HirLabelId, usize>,
+}
+
+impl DiscardBoundaryFacts {
+    fn new(proto: &HirProto) -> Self {
+        let mut protected_locals = proto.physical_root_locals.clone();
+        protected_locals.extend(
+            proto
+                .locals
+                .iter()
+                .copied()
+                .zip(&proto.local_debug_hints)
+                .filter_map(|(local, hint)| hint.is_some().then_some(local)),
+        );
+        let protected_temps = proto
+            .temps
+            .iter()
+            .copied()
+            .zip(&proto.temp_debug_locals)
+            .filter_map(|(temp, hint)| hint.is_some().then_some(temp))
+            .collect();
+        let label_refs = count_label_references(&proto.body.stmts);
+        Self {
+            protected_locals,
+            protected_temps,
+            label_refs,
+        }
+    }
+
+    pub(super) fn block_boundary(&self, block: &HirBlock) -> DiscardBoundary {
+        let mut visitor = DiscardBoundaryVisitor {
+            facts: self,
+            boundary: DiscardBoundary::default(),
+            labels: BTreeSet::new(),
+            internal_label_refs: BTreeMap::new(),
+        };
+        visit_block(block, &mut visitor);
+        visitor.finish()
+    }
+
+    pub(super) fn stmts_boundary(&self, stmts: &[HirStmt]) -> DiscardBoundary {
+        let mut visitor = DiscardBoundaryVisitor {
+            facts: self,
+            boundary: DiscardBoundary::default(),
+            labels: BTreeSet::new(),
+            internal_label_refs: BTreeMap::new(),
+        };
+        visit_stmts(stmts, &mut visitor);
+        visitor.finish()
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct DiscardBoundary {
+    identity: bool,
+    diagnostic: bool,
+    control_entry: bool,
+}
+
+impl DiscardBoundary {
+    pub(super) fn has_identity(self) -> bool {
+        self.identity
+    }
+
+    pub(super) fn has_diagnostic(self) -> bool {
+        self.diagnostic
+    }
+
+    pub(super) fn has_control_entry(self) -> bool {
+        self.control_entry
+    }
+}
+
+struct DiscardBoundaryVisitor<'a> {
+    facts: &'a DiscardBoundaryFacts,
+    boundary: DiscardBoundary,
+    labels: BTreeSet<HirLabelId>,
+    internal_label_refs: BTreeMap<HirLabelId, usize>,
+}
+
+impl DiscardBoundaryVisitor<'_> {
+    fn finish(mut self) -> DiscardBoundary {
+        self.boundary.control_entry = self.labels.iter().any(|label| {
+            let all_refs = self
+                .facts
+                .label_refs
+                .get(label)
+                .copied()
+                .unwrap_or_default();
+            let internal_refs = self
+                .internal_label_refs
+                .get(label)
+                .copied()
+                .unwrap_or_default();
+            all_refs > internal_refs
+        });
+        self.boundary
+    }
+}
+
+impl HirVisitor for DiscardBoundaryVisitor<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(local_decl) => {
+                self.boundary.identity |= local_decl
+                    .bindings
+                    .iter()
+                    .any(|local| self.facts.protected_locals.contains(local));
+            }
+            HirStmt::ErrNil(_) => self.boundary.diagnostic = true,
+            HirStmt::ToBeClosed(_) | HirStmt::Close(_) => self.boundary.identity = true,
+            HirStmt::Goto(goto) => {
+                *self.internal_label_refs.entry(goto.target).or_default() += 1;
+            }
+            HirStmt::Label(label) => {
+                self.labels.insert(label.id);
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.boundary.diagnostic |= matches!(expr, HirExpr::Unresolved(_));
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.boundary.identity |=
+            matches!(lvalue, HirLValue::Temp(temp) if self.facts.protected_temps.contains(temp));
+    }
 }
 
 fn fold_effect_only_call(stmt: &mut HirStmt) -> bool {

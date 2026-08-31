@@ -256,22 +256,16 @@ fn producer_steps_from_bindings(
         return None;
     }
 
-    if values.tail.is_none() && bindings.len() == values.fixed.len() {
-        steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
-            stmt_index,
-            slot_index,
-        }));
-        return Some(bindings);
+    if values.tail.is_some() || bindings.len() != values.fixed.len() {
+        // 候选拒绝[ProofIncomplete]：open/mismatched pack 缺少逐 slot value-width 与 owner 事实。
+        return None;
     }
 
-    if bindings.len() > 1 && values.fixed.is_empty() && values.tail.is_some() {
-        steps.push(RegionStep::ProducerGroup { stmt_index });
-        return Some(bindings);
-    }
-
-    // 候选拒绝[ProofIncomplete]：混合 fixed + open 的 producer pack 已被识别，但 region
-    // 还不能逐 slot 表达其值宽度与 owner；应扩展 ProducerGroup，而不是永久保留机械声明。
-    None
+    steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
+        stmt_index,
+        slot_index,
+    }));
+    Some(bindings)
 }
 
 pub(super) fn seed_overwrite_delay_is_unobservable(

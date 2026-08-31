@@ -12,7 +12,7 @@ use captures::*;
 
 use crate::ast::DecompileDialect;
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirPackTail, HirStmt,
+    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirStmt,
     HirTableField, HirTableKey, HirTableSetList,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
@@ -27,8 +27,8 @@ use super::inline_value::{
     InlineContext, InlineRewriteState, expr_mentions_any_pending_binding, inline_constructor_value,
 };
 use super::{
-    ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord,
-    ProducerGroupMeta, RebuildScratch, RegionStep, SegmentToken, TableBinding,
+    ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord, RebuildScratch,
+    RegionStep, SegmentToken, TableBinding,
 };
 
 pub(super) struct RegionRebuildContext<'a> {
@@ -171,12 +171,6 @@ fn flush_constructor_segment(
                 *slot_index,
                 context.scratch,
             )?,
-            RegionStep::ProducerGroup { stmt_index } => register_producer_group(
-                context.block,
-                context.binding_index,
-                *stmt_index,
-                context.scratch,
-            )?,
             RegionStep::Record { stmt_index } => prepare_record_step(*stmt_index, context)?,
             RegionStep::SetList { .. } => {
                 unreachable!("set-list should terminate constructor segment")
@@ -265,34 +259,14 @@ fn flush_constructor_segment(
         }
     }
 
-    if context.scratch.pending_producers.iter().any(|producer| {
-        if context.scratch.consumed_bindings[producer.binding_id] {
-            return false;
-        }
-        if context.remaining_uses.contains(producer.binding_id) {
-            return true;
-        }
-        match producer.group {
-            // 证明缺陷[PotentialUnsoundness:Lifetime]：open group 仅消费一个结果就允许
-            // 删掉其余 local；`local a,b=f(); t.x=a` 中 b 可能是带 finalizer 对象的唯一 GC root。
-            Some(group) if context.scratch.consumed_groups[group] => false,
-            Some(_) => false,
-            None => true,
-        }
-    }) {
+    if context
+        .scratch
+        .pending_producers
+        .iter()
+        .any(|producer| !context.scratch.consumed_bindings[producer.binding_id])
+    {
         // 候选拒绝[ProofIncomplete]：仍有 use 或未消费的单值 producer 时，当前事务只能
         // 删除整个声明；应支持保留 producer 的 partial rebuild。
-        return None;
-    }
-    if context.scratch.pending_producers.iter().any(|producer| {
-        !context.scratch.consumed_bindings[producer.binding_id]
-            && producer.group.is_some_and(|group| {
-                !context.scratch.consumed_groups[group]
-                    && !context.scratch.producer_groups[group].drop_without_consumption_is_safe
-            })
-    }) {
-        // 候选拒绝[SemanticBarrier:EvalMultiplicity]：未消费的 open producer group 若来自
-        // call，删除声明会删除一次调用；只有无事件的 vararg source 可以丢弃。
         return None;
     }
 
@@ -352,7 +326,6 @@ fn inline_set_list_value(
         &scratch.producer_index_by_binding,
         InlineRewriteState {
             consumed_bindings: &mut scratch.consumed_bindings,
-            consumed_groups: &mut scratch.consumed_groups,
             eval_events: &mut scratch.generated_eval_events,
         },
         context.remaining_uses,
@@ -490,13 +463,11 @@ fn collect_source_eval_events(
 
 fn prepare_scratch(scratch: &mut RebuildScratch, binding_count: usize) {
     scratch.pending_producers.clear();
-    scratch.producer_groups.clear();
     scratch.tokens.clear();
     scratch.prepared_records.clear();
     scratch.prepared_eval_events.clear();
     scratch.source_eval_events.clear();
     scratch.generated_eval_events.clear();
-    scratch.consumed_groups.clear();
     reset_touched_bindings(scratch);
     ensure_binding_capacity(scratch, binding_count);
 }
@@ -555,51 +526,6 @@ fn register_single_producer(
     Some(())
 }
 
-fn register_producer_group(
-    block: &HirBlock,
-    binding_index: &BindingIndex,
-    stmt_index: usize,
-    scratch: &mut RebuildScratch,
-) -> Option<()> {
-    let (bindings, source) = producer_group_stmt(block, stmt_index)?;
-    let group_id = scratch.producer_groups.len();
-    scratch.producer_groups.push(ProducerGroupMeta {
-        drop_without_consumption_is_safe: can_drop_open_pack_source_if_unused(source),
-    });
-    scratch.consumed_groups.push(false);
-
-    for (slot_index, binding) in bindings.into_iter().enumerate() {
-        let binding_id = binding_index.id_of(binding)?;
-        let source = if slot_index == 0 {
-            PendingProducerSource::Tail { stmt_index }
-        } else {
-            PendingProducerSource::Empty
-        };
-        let producer_index = scratch.pending_producers.len();
-        mark_binding_active(scratch, binding_id);
-        scratch.producer_index_by_binding[binding_id] = Some(producer_index);
-        scratch.removed_materializations[binding_id] += 1;
-        scratch.pending_producers.push(PendingProducer {
-            binding,
-            binding_id,
-            source,
-            group: Some(group_id),
-        });
-        if pending_producer_value(block, &scratch.pending_producers[producer_index])
-            .is_some_and(expr_requires_ordered_snapshot)
-        {
-            scratch
-                .source_eval_events
-                .push(ConstructorEvalEvent::Producer(producer_index));
-        }
-        scratch
-            .tokens
-            .push(SegmentToken::Producer { producer_index });
-    }
-
-    Some(())
-}
-
 fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>) -> Option<()> {
     let (key, value) = record_field_parts(context.block, stmt_index, context.dialect)?;
     if let HirTableKey::Expr(key_expr) = &key {
@@ -630,7 +556,6 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
                     &scratch.producer_index_by_binding,
                     InlineRewriteState {
                         consumed_bindings: &mut scratch.consumed_bindings,
-                        consumed_groups: &mut scratch.consumed_groups,
                         eval_events: &mut scratch.prepared_eval_events,
                     },
                     context.remaining_uses,
@@ -657,7 +582,6 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
             &scratch.producer_index_by_binding,
             InlineRewriteState {
                 consumed_bindings: &mut scratch.consumed_bindings,
-                consumed_groups: &mut scratch.consumed_groups,
                 eval_events: &mut scratch.prepared_eval_events,
             },
             context.remaining_uses,
@@ -734,7 +658,6 @@ fn single_producer(
                     stmt_index,
                     value_index: slot_index,
                 },
-                group: None,
             })
         }
         HirStmt::Assign(assign) => {
@@ -746,7 +669,6 @@ fn single_producer(
                     stmt_index,
                     value_index: slot_index,
                 },
-                group: None,
             })
         }
         _ => None,
@@ -774,47 +696,6 @@ pub(super) fn producer_value_can_be_dropped(expr: &HirExpr) -> bool {
     ) || expr_is_boolean_valued(expr)
 }
 
-fn producer_group_stmt(
-    block: &HirBlock,
-    stmt_index: usize,
-) -> Option<(Vec<TableBinding>, &HirPackTail)> {
-    let stmt = block.stmts.get(stmt_index)?;
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            if !local_decl.values.fixed.is_empty() {
-                return None;
-            }
-            let source = local_decl.values.tail.as_ref()?;
-            Some((
-                local_decl
-                    .bindings
-                    .iter()
-                    .copied()
-                    .map(TableBinding::Local)
-                    .collect(),
-                source,
-            ))
-        }
-        HirStmt::Assign(assign) => {
-            if !assign.values.fixed.is_empty() {
-                return None;
-            }
-            let source = assign.values.tail.as_ref()?;
-            let bindings = assign
-                .targets
-                .iter()
-                .map(binding_from_lvalue)
-                .collect::<Option<Vec<_>>>()?;
-            Some((bindings, source))
-        }
-        _ => None,
-    }
-}
-
-fn can_drop_open_pack_source_if_unused(tail: &HirPackTail) -> bool {
-    matches!(tail.as_expr(), HirExpr::VarArg)
-}
-
 fn pending_producer_value<'a>(
     block: &'a HirBlock,
     producer: &PendingProducer,
@@ -828,13 +709,5 @@ fn pending_producer_value<'a>(
             HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
             _ => None,
         },
-        PendingProducerSource::Tail { stmt_index } => match block.stmts.get(stmt_index)? {
-            HirStmt::LocalDecl(local_decl) => {
-                local_decl.values.tail.as_ref().map(HirPackTail::as_expr)
-            }
-            HirStmt::Assign(assign) => assign.values.tail.as_ref().map(HirPackTail::as_expr),
-            _ => None,
-        },
-        PendingProducerSource::Empty => None,
     }
 }

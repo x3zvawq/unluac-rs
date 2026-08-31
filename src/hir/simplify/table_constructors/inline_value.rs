@@ -6,7 +6,7 @@
 //! 未变后才提交。例如：`local v = f(); t.x = v` 只在 `f()` 仍位于同一事件位置时折叠。
 
 use crate::hir::common::{
-    HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionTarget, HirExpr, HirLogicalExpr, HirPackTail,
+    HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionTarget, HirExpr, HirLogicalExpr,
     HirTableField, HirTableKey, HirUnaryExpr, HirValuePack,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
@@ -20,7 +20,6 @@ pub(super) struct InlineContext<'a> {
     pending_producers: &'a [PendingProducer],
     producer_index_by_binding: &'a [Option<usize>],
     consumed_bindings: &'a mut [bool],
-    consumed_groups: &'a mut [bool],
     eval_events: &'a mut Vec<ConstructorEvalEvent>,
     inside_producer_value: bool,
     remaining_uses: BindingUseSummary<'a>,
@@ -28,7 +27,6 @@ pub(super) struct InlineContext<'a> {
 
 pub(super) struct InlineRewriteState<'a> {
     pub(super) consumed_bindings: &'a mut [bool],
-    pub(super) consumed_groups: &'a mut [bool],
     pub(super) eval_events: &'a mut Vec<ConstructorEvalEvent>,
 }
 
@@ -47,7 +45,6 @@ impl<'a> InlineContext<'a> {
             pending_producers,
             producer_index_by_binding,
             consumed_bindings: state.consumed_bindings,
-            consumed_groups: state.consumed_groups,
             eval_events: state.eval_events,
             inside_producer_value: false,
             remaining_uses,
@@ -101,9 +98,6 @@ fn inline_constructor_value_at_site(
             return None;
         }
         context.consumed_bindings[producer.binding_id] = true;
-        if let Some(group) = producer.group {
-            context.consumed_groups[group] = true;
-        }
         let producer_value = producer_value.clone();
         // 已经决定把这个 producer 值内联到当前站点，接下来要继续展开它内部的
         // 子表达式。被内联进来的表达式的内部位置在语法上没有 callee/access-base
@@ -386,21 +380,6 @@ fn pending_producer_value<'a>(
             stmt_index,
             value_index,
         } => producer_source_value(block, stmt_index, value_index),
-        PendingProducerSource::Tail { stmt_index } => producer_tail_source_value(block, stmt_index),
-        PendingProducerSource::Empty => None,
-    }
-}
-
-fn producer_tail_source_value(block: &HirBlock, stmt_index: usize) -> Option<&HirExpr> {
-    let stmt = block.stmts.get(stmt_index)?;
-    match stmt {
-        crate::hir::common::HirStmt::LocalDecl(local_decl) => {
-            local_decl.values.tail.as_ref().map(HirPackTail::as_expr)
-        }
-        crate::hir::common::HirStmt::Assign(assign) => {
-            assign.values.tail.as_ref().map(HirPackTail::as_expr)
-        }
-        _ => None,
     }
 }
 

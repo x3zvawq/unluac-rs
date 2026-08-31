@@ -18,6 +18,7 @@ use super::super::expr_facts::expr_truthiness;
 use super::super::logical_simplify::{simplify_condition_truthiness_shape, simplify_logical_shape};
 use super::super::mention::stmts_reference_captured_bindings;
 use super::super::visit::{HirVisitor, visit_proto};
+use super::DiscardBoundaryFacts;
 
 const MAX_TRACKED_BINDINGS: usize = 256;
 
@@ -161,7 +162,10 @@ struct Flow {
     falls_through: bool,
 }
 
-pub(super) fn specialize_stable_path_conditions(proto: &mut HirProto) -> bool {
+pub(super) fn specialize_stable_path_conditions(
+    proto: &mut HirProto,
+    discard_facts: &DiscardBoundaryFacts,
+) -> bool {
     let stable = StableBindingIndex::new(proto);
     if stable.has_label_or_goto {
         // 分析停用[ProofIncomplete]：路径事实传播尚无 CFG label/goto 边合流；当前按整个 proto
@@ -174,7 +178,13 @@ pub(super) fn specialize_stable_path_conditions(proto: &mut HirProto) -> bool {
     }
 
     let mut changed = false;
-    rewrite_block(&mut proto.body, PathFacts::default(), &stable, &mut changed);
+    rewrite_block(
+        &mut proto.body,
+        PathFacts::default(),
+        &stable,
+        discard_facts,
+        &mut changed,
+    );
     changed
 }
 
@@ -182,6 +192,7 @@ fn rewrite_block(
     block: &mut HirBlock,
     mut facts: PathFacts,
     stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
     changed: &mut bool,
 ) -> Flow {
     let mut scoped_locals = Vec::new();
@@ -192,7 +203,7 @@ fn rewrite_block(
         if let HirStmt::LocalDecl(local_decl) = stmt {
             scoped_locals.extend(local_decl.bindings.iter().copied());
         }
-        let flow = rewrite_stmt(stmt, facts, stable, changed);
+        let flow = rewrite_stmt(stmt, facts, stable, discard_facts, changed);
         facts = flow.facts;
         falls_through = flow.falls_through;
         if !falls_through {
@@ -201,9 +212,17 @@ fn rewrite_block(
         }
     }
     if retained_len != block.stmts.len() {
-        // 证明缺陷[PotentialPolicyViolation]：不可达尾部可能仍承载 debug local 或 ErrNil/Unresolved 诊断；当前只按运行可达性截断，未检查源码身份/诊断保留策略。
-        block.stmts.truncate(retained_len);
-        *changed = true;
+        let boundary = discard_facts.stmts_boundary(&block.stmts[retained_len..]);
+        if boundary.has_control_entry() {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：全局 label 引用数大于尾部内部引用数，如前缀 `goto L` 指向被截尾的 `::L::`；删除尾部会丢失确定入边。
+        } else if boundary.has_identity() {
+            // 候选拒绝[PolicyBoundary]：尾部 debug/PhysicalRoot/TBC 身份按源码证据策略保留（regress339 retain-debug）。
+        } else if boundary.has_diagnostic() {
+            // 候选拒绝[LayerBoundary]：ErrNil/Unresolved 显式诊断由其 owner 保留，路径专门化不吞掉该尾部（regress339 Lua 5.5 ERRNNIL）。
+        } else {
+            block.stmts.truncate(retained_len);
+            *changed = true;
+        }
     }
 
     for local in scoped_locals {
@@ -219,6 +238,7 @@ fn rewrite_stmt(
     stmt: &mut HirStmt,
     mut facts: PathFacts,
     stable: &StableBindingIndex,
+    discard_facts: &DiscardBoundaryFacts,
     changed: &mut bool,
 ) -> Flow {
     match stmt {
@@ -237,6 +257,7 @@ fn rewrite_stmt(
                 &mut if_stmt.then_block,
                 then_facts.unwrap_or_else(|| facts.clone()),
                 stable,
+                discard_facts,
                 changed,
             );
             let else_flow = if_stmt.else_block.as_mut().map(|else_block| {
@@ -244,6 +265,7 @@ fn rewrite_stmt(
                     else_block,
                     else_facts.clone().unwrap_or_else(|| facts.clone()),
                     stable,
+                    discard_facts,
                     changed,
                 )
             });
@@ -273,19 +295,45 @@ fn rewrite_stmt(
             *changed |= specialize_condition(&mut while_stmt.cond, &facts, stable);
             let body_facts = facts_for_condition(&facts, &while_stmt.cond, true, stable)
                 .unwrap_or_else(|| facts.clone());
-            rewrite_block(&mut while_stmt.body, body_facts, stable, changed);
+            rewrite_block(
+                &mut while_stmt.body,
+                body_facts,
+                stable,
+                discard_facts,
+                changed,
+            );
         }
         HirStmt::Repeat(repeat_stmt) => {
-            rewrite_block(&mut repeat_stmt.body, facts.clone(), stable, changed);
+            rewrite_block(
+                &mut repeat_stmt.body,
+                facts.clone(),
+                stable,
+                discard_facts,
+                changed,
+            );
             *changed |= specialize_condition(&mut repeat_stmt.cond, &facts, stable);
         }
         HirStmt::NumericFor(numeric_for) => {
-            rewrite_block(&mut numeric_for.body, facts.clone(), stable, changed);
+            rewrite_block(
+                &mut numeric_for.body,
+                facts.clone(),
+                stable,
+                discard_facts,
+                changed,
+            );
         }
         HirStmt::GenericFor(generic_for) => {
-            rewrite_block(&mut generic_for.body, facts.clone(), stable, changed);
+            rewrite_block(
+                &mut generic_for.body,
+                facts.clone(),
+                stable,
+                discard_facts,
+                changed,
+            );
         }
-        HirStmt::Block(block) => return rewrite_block(block, facts, stable, changed),
+        HirStmt::Block(block) => {
+            return rewrite_block(block, facts, stable, discard_facts, changed);
+        }
         HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) => {
             return Flow {
                 facts,

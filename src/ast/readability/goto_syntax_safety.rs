@@ -1,18 +1,18 @@
-//! goto 方言中 `return`/`break` 后仍有 label 时的块尾语法合法化。
+//! 终止语句之后仍需保留 sibling 时的块尾语法合法化。
 //!
-//! `return` 必须是当前 block 的最后一条语句；LuaJIT 对 `break` 也有同类限制。
-//! island 的多个 terminal target 会让同层 block 在终止语句后继续发射 label，因此
-//! 把非末尾终止语句包进窄 `do ... end`，既保留控制流，也满足所有 goto 方言语法。
+//! Lua 要求 `return`/`break`/`continue` 位于所属语法块的尾部。island 的
+//! terminal target 会在后面留下 label；branch-control 也会按项目策略保留
+//! 不可达的 debug/diagnostic sibling。本 pass 在 cleanup 完成后查看最终相邻关系，
+//! 只把非末尾终止语句包进窄 `do ... end`，不重建 HIR 控制 owner。
+//!
+//! 例如 `break; local kept` 会生成 `do break end; local kept`；本就在 block
+//! 尾部的 `break` 保持不变。
 
 use super::super::common::{AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
 use super::walk::{self, AstRewritePass, BlockKind};
 
-pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
-    if !context.target.caps.goto_label {
-        // 分析停用[TargetConstraint]：无 goto/label 的目标方言不会生成同层 terminal 后继 label，也不需要这层语法包装。
-        return false;
-    }
+pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
     walk::rewrite_module(module, &mut GotoSyntaxSafetyPass)
 }
 
@@ -24,7 +24,7 @@ impl AstRewritePass for GotoSyntaxSafetyPass {
         if statement_count < 2
             || !block.stmts[..statement_count - 1]
                 .iter()
-                .any(|stmt| matches!(stmt, AstStmt::Return(_) | AstStmt::Break))
+                .any(is_terminal_last_statement)
         {
             return false;
         }
@@ -33,9 +33,7 @@ impl AstRewritePass for GotoSyntaxSafetyPass {
             .into_iter()
             .enumerate()
             .map(|(index, stmt)| {
-                if index + 1 < statement_count
-                    && matches!(&stmt, AstStmt::Return(_) | AstStmt::Break)
-                {
+                if index + 1 < statement_count && is_terminal_last_statement(&stmt) {
                     AstStmt::DoBlock(Box::new(AstBlock { stmts: vec![stmt] }))
                 } else {
                     stmt
@@ -44,4 +42,11 @@ impl AstRewritePass for GotoSyntaxSafetyPass {
             .collect();
         true
     }
+}
+
+fn is_terminal_last_statement(stmt: &AstStmt) -> bool {
+    matches!(
+        stmt,
+        AstStmt::Return(_) | AstStmt::Break | AstStmt::Continue
+    )
 }

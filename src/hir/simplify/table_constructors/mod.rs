@@ -14,6 +14,8 @@
 //! HIR 形状，为后续 AST 降低继续减负。
 //! 全量 binding facts 只服务这些候选；没有 seed/SETLIST 根形状的 proto 先通过
 //! statement/block 骨架门跳过，不递归扫描无关表达式。
+//! fixed SETLIST 的非相邻 local 路径只改写 SETLIST 本身，producer LocalDecl 保持原位；
+//! 该边界同时保留 initializer 的求值次数与独立 GC root，不用复制表达式来换取展示折叠。
 
 mod bindings;
 mod builder;
@@ -56,20 +58,11 @@ enum TableBinding {
 
 type BindingId = usize;
 
-// Cross-statement fixed SETLIST folding is a readability optimization.  Its proof scans the
-// producer interval and is deliberately disabled for very large blocks so a generated chunk
-// with many SETLIST batches cannot turn the pass into a quadratic walk.  The immediate canonical
-// NewTable path below remains available and is linear in the block size.
-const MAX_GENERIC_SET_LIST_SCAN_STMTS: usize = 4096;
-
 #[derive(Debug, Clone, Copy)]
 enum RegionStep {
     Producer {
         stmt_index: usize,
         slot_index: usize,
-    },
-    ProducerGroup {
-        stmt_index: usize,
     },
     Record {
         stmt_index: usize,
@@ -84,7 +77,6 @@ struct PendingProducer {
     binding: TableBinding,
     binding_id: BindingId,
     source: PendingProducerSource,
-    group: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,15 +85,6 @@ enum PendingProducerSource {
         stmt_index: usize,
         value_index: usize,
     },
-    Tail {
-        stmt_index: usize,
-    },
-    Empty,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProducerGroupMeta {
-    drop_without_consumption_is_safe: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +121,6 @@ struct RestoredArrayField {
 #[derive(Debug, Clone, Default)]
 struct RebuildScratch {
     pending_producers: Vec<PendingProducer>,
-    producer_groups: Vec<ProducerGroupMeta>,
     tokens: Vec<SegmentToken>,
     prepared_records: Vec<PreparedRecord>,
     prepared_eval_events: Vec<ConstructorEvalEvent>,
@@ -146,7 +128,6 @@ struct RebuildScratch {
     generated_eval_events: Vec<ConstructorEvalEvent>,
     producer_index_by_binding: Vec<Option<usize>>,
     consumed_bindings: Vec<bool>,
-    consumed_groups: Vec<bool>,
     removed_materializations: Vec<u32>,
     touched_binding_ids: Vec<BindingId>,
     restored_pending_integer_fields: Vec<RestoredPendingIntegerField>,
@@ -458,8 +439,7 @@ impl TableConstructorPass<'_> {
             // A fixed SETLIST immediately following the canonical NewTable definition is the
             // compiler's own constructor encoding, rather than a write into an existing table.
             // Rebuilding this narrow shape preserves the original allocation/evaluation point,
-            // but only for data-only, definitely non-nil fixed values and a hole-free seed. Open
-            // tails and uncertain/nil array shapes use the separate seed-anchored proof below.
+            // but only for data-only, definitely non-nil fixed values and a hole-free seed.
             if let Some(seed_index) =
                 self.find_direct_set_list_seed(block, index, binding, &set_list)
             {
@@ -470,41 +450,6 @@ impl TableConstructorPass<'_> {
                 install_constructor_seed(&mut block.stmts[seed_index], constructor);
                 block.stmts.remove(index);
                 changed = true;
-                continue;
-            }
-
-            // A canonical fresh seed with a fixed, data-only SETLIST can also be lowered to
-            // ordinary indexed writes without moving the seed allocation.  This is deliberately
-            // separate from constructor folding: unknown/nil values retain their original write
-            // semantics, while the fresh seed proof rules out metatable dispatch.
-            if let Some(seed_index) =
-                self.find_direct_set_list_seed_for_indexed_writes(block, index, binding, &set_list)
-            {
-                let base = set_list.base.clone();
-                let assignments = set_list
-                    .values
-                    .fixed
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, value)| {
-                        let key = set_list
-                            .start_index
-                            .checked_add(u32::try_from(offset).expect("SETLIST offset fits u32"))
-                            .expect("SETLIST index overflow");
-                        HirStmt::Assign(Box::new(HirAssign {
-                            targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
-                                base: base.clone(),
-                                key: HirExpr::Integer(i64::from(key)),
-                            }))],
-                            values: HirValuePack::fixed(vec![value.clone()]),
-                        }))
-                    })
-                    .collect::<Vec<_>>();
-                block.stmts.splice(index..=index, assignments);
-                changed = true;
-                // The replacement statements are already in final form; skip over them so the
-                // loop does not immediately reconsider the same seed as a new region.
-                index = seed_index + 1;
                 continue;
             }
 
@@ -541,13 +486,6 @@ impl TableConstructorPass<'_> {
                 continue;
             }
 
-            if block.stmts.len() > MAX_GENERIC_SET_LIST_SCAN_STMTS {
-                // 候选拒绝[ResourceLimit]：SETLIST 已识别，仅因整个 block 超过固定长度停用
-                // generic scan；应改用 seed/mention 索引限定局部窗口后删除该阈值。
-                index += 1;
-                continue;
-            }
-
             // An open pack is only folded for the narrow, seed-anchored LocalDecl shape
             // proved above.  Do this before the fixed-list scanner: that scanner deliberately
             // rejects open tails and must not make this independent proof unreachable.
@@ -567,23 +505,6 @@ impl TableConstructorPass<'_> {
                     continue;
                 }
                 index += 1;
-                continue;
-            }
-
-            let Some(seed_index) = self.find_fixed_set_list_seed(block, index, binding) else {
-                index += 1;
-                continue;
-            };
-
-            if let Some((constructor, removed)) =
-                self.fold_fixed_set_list_into_seed(block, index, seed_index, binding, &set_list)
-            {
-                install_constructor_seed(&mut block.stmts[seed_index], constructor);
-                for remove_index in removed.into_iter().rev() {
-                    block.stmts.remove(remove_index);
-                }
-                changed = true;
-                index = seed_index + 1;
                 continue;
             }
 
@@ -792,92 +713,6 @@ impl TableConstructorPass<'_> {
         }
     }
 
-    fn find_direct_set_list_seed_for_indexed_writes(
-        &self,
-        block: &crate::hir::common::HirBlock,
-        set_list_index: usize,
-        binding: TableBinding,
-        set_list: &crate::hir::common::HirTableSetList,
-    ) -> Option<usize> {
-        let seed_index = set_list_index.checked_sub(1)?;
-        let (seed_binding, seed) = constructor_seed(&block.stmts[seed_index])?;
-        let TableBinding::Local(local) = binding else {
-            return None;
-        };
-        if seed_binding != binding || !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_)) {
-            return None;
-        }
-        // 候选拒绝[ProofIncomplete]：indexed-write 路径不移动 seed；已有 open tail 当前仍
-        // 被整体停用，缺少的是后续 raw SETLIST 与 SETTABLE 的 table-shape 证明。
-        if seed.trailing_multivalue.is_some() {
-            return None;
-        }
-        if set_list.values.tail.is_some() || set_list.values.fixed.is_empty() {
-            return None;
-        }
-        // 候选拒绝[SemanticBarrier:EvalOrder]：raw SETLIST 先求完所有值再批量写表，拆成
-        // indexed writes 会在下一值求值前写入上一槽；能读取目标表的调用可观察该差异。
-        if set_list
-            .values
-            .fixed
-            .iter()
-            .any(|value| !expr_is_indexed_set_list_value_safe(value))
-        {
-            return None;
-        }
-        // 候选拒绝[ProofIncomplete]：seed 保持原 LocalDecl 且值均不可观察中间写入，当前仍
-        // 按 debug/capture 全局事实停用，尚未证明这些身份在本区间是否真的改变。
-        if self
-            .debug_identity_bindings
-            .get(binding)
-            .copied()
-            .unwrap_or_default()
-            || self
-                .reference_captured_bindings
-                .get(binding)
-                .copied()
-                .unwrap_or_default()
-        {
-            return None;
-        }
-        // 候选拒绝[ProofIncomplete]：多 materialization/home compaction 尚未按 seed 到
-        // SETLIST 的局部 def-use 区间证明 fresh owner。
-        if self.materialized_bindings.get(binding).copied() != Some(1)
-            || self.promotion_facts.compacts_home_slots()
-        {
-            return None;
-        }
-        // 候选拒绝[LayerBoundary]：fresh seed 与 trusted home 由 promotion owner 提供。
-        if self
-            .promotion_facts
-            .trusted_local_home_slot(local)
-            .is_none()
-            || !self.promotion_facts.is_direct_table_seed_local(local)
-        {
-            return None;
-        }
-        let next_array_index = u32::try_from(
-            seed.fields
-                .iter()
-                .filter(|field| matches!(field, HirTableField::Array(_)))
-                .count(),
-        )
-        .ok()?
-        .checked_add(1)?;
-        // 候选拒绝[SemanticBarrier:TableShape]：非连续起点或不确定 nil seed 下，raw
-        // SETLIST 与逐项 SETTABLE 可能形成不同 array part/`#table`；反例见 regress_237。
-        if set_list.start_index != next_array_index
-            || !array_fields_have_safe_nil_shape(&seed.fields)
-        {
-            return None;
-        }
-        // 候选拒绝[SemanticBarrier:Scope]：owner 自引用不能被当作普通 fresh seed。
-        if constructor_uses_binding(seed, binding) {
-            return None;
-        }
-        Some(seed_index)
-    }
-
     fn find_local_set_list_seed_for_indexed_writes(
         &self,
         block: &crate::hir::common::HirBlock,
@@ -891,8 +726,8 @@ impl TableConstructorPass<'_> {
         if set_list.values.tail.is_some() || set_list.values.fixed.is_empty() {
             return None;
         }
-        // 候选拒绝[SemanticBarrier:EvalOrder]：同 direct indexed-write 路径，逐项写入会与
-        // 后续值求值交错，而 raw SETLIST 在所有值求完后才写表。
+        // 候选拒绝[SemanticBarrier:EvalOrder]：逐项写入会与后续值求值交错，而 raw
+        // SETLIST 在所有值求完后才写表。
         if set_list
             .values
             .fixed
@@ -933,6 +768,16 @@ impl TableConstructorPass<'_> {
             // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil seed 或越过连续数组边界的
             // raw SETLIST 与逐项 SETTABLE 可能形成不同 array part/`#table`。
             if !array_fields_have_safe_nil_shape(&seed.fields) || !set_list_can_overwrite_seed {
+                return None;
+            }
+            if !local_set_list_values_have_safe_nil_shape(
+                block,
+                seed_index,
+                set_list_index,
+                &set_list.values.fixed,
+            ) {
+                // 候选拒绝[SemanticBarrier:TableShape]：raw SETLIST 与逐项 SETTABLE 对中间
+                // nil hole 的 array part/`#table` 不等价；官方 Lua 5.4 反例见 regress_337。
                 return None;
             }
             return self
@@ -1109,43 +954,6 @@ impl TableConstructorPass<'_> {
                 .trusted_param_home_slot(*param)
                 .is_none_or(|home| home == seed_home)
         })
-    }
-
-    fn find_fixed_set_list_seed(
-        &self,
-        block: &crate::hir::common::HirBlock,
-        set_list_index: usize,
-        binding: TableBinding,
-    ) -> Option<usize> {
-        for seed_index in (0..set_list_index).rev() {
-            if let Some((seed_binding, seed)) = constructor_seed(&block.stmts[seed_index]) {
-                if self.binding_is_shared_before_seed(block, seed_index, binding) {
-                    // 候选拒绝[ProofIncomplete]：前缀 mention 被当作全局 freshness 否证，
-                    // 尚未消费 promotion 的精确 def/alias provenance。
-                    return None;
-                }
-                if seed_binding == binding {
-                    return (self.fixed_set_list_seed_is_safe(block, seed_index, binding)
-                        && set_list_can_start_at(
-                            seed,
-                            current_set_list_start(block, set_list_index)?,
-                        ))
-                    .then_some(seed_index);
-                }
-                if !constructor_is_data_only(seed) || constructor_uses_binding(seed, binding) {
-                    // 候选搜索裁剪[ProofIncomplete]：遇到其他复杂 constructor 即停止向前找
-                    // owner；需要 occurrence/effect 索引判断它是否真的影响目标 binding。
-                    return None;
-                }
-                continue;
-            }
-            if !fixed_set_list_intermediate_is_safe(&block.stmts[seed_index], binding) {
-                // 候选搜索裁剪[ProofIncomplete]：intermediate 白名单只覆盖 data-only 声明/
-                // assignment/SETLIST，尚未按目标 owner 的 effect summary 继续扫描。
-                return None;
-            }
-        }
-        None
     }
 
     fn open_set_list_seed_is_safe(
@@ -1477,220 +1285,6 @@ impl TableConstructorPass<'_> {
         true
     }
 
-    fn fixed_set_list_seed_is_safe(
-        &self,
-        block: &crate::hir::common::HirBlock,
-        seed_index: usize,
-        binding: TableBinding,
-    ) -> bool {
-        let Some((seed_binding, seed)) = constructor_seed(&block.stmts[seed_index]) else {
-            return false;
-        };
-        if seed_binding != binding {
-            return false;
-        }
-        // 候选拒绝[SemanticBarrier:ValueArity]：已有 open tail 后不能按固定数组长度追加；
-        // 反例见 regress_52。
-        if seed.trailing_multivalue.is_some() {
-            return false;
-        }
-        // 候选拒绝[ProofIncomplete]：任意嵌套/record nil 被整体停用；应只按相关 array
-        // slot 与后续覆盖关系判定。
-        if seed.fields.iter().any(table_field_contains_nil) {
-            return false;
-        }
-        // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil 数组槽后追加确定值会改变
-        // array part/`#table`；反例见 regress_237。
-        if !array_fields_have_safe_nil_shape(&seed.fields) {
-            return false;
-        }
-        // 候选拒绝[ProofIncomplete]：numeric record 与 SETLIST key 的 alias/overwrite 关系
-        // 尚未复用 builder 的精确分析。
-        if constructor_has_numeric_record(seed) {
-            return false;
-        }
-        // 候选拒绝[SemanticBarrier:Scope]：owner 自引用不能搬进自身 LocalDecl initializer。
-        if constructor_uses_binding(seed, binding) {
-            return false;
-        }
-        // 候选拒绝[ProofIncomplete]：debug/capture 仍按 proto 级事实整体停用，尚未按本次
-        // producer 删除和 seed identity 的实际变化分类。
-        if self
-            .debug_identity_bindings
-            .get(binding)
-            .copied()
-            .unwrap_or_default()
-            || self
-                .reference_captured_bindings
-                .get(binding)
-                .copied()
-                .unwrap_or_default()
-        {
-            return false;
-        }
-        // Raw temps have no lexical declaration whose lifetime we can preserve. They are only
-        // accepted by the separate canonical-adjacent path above; never let the generic scan
-        // infer freshness from a home slot alone.
-        if matches!(binding, TableBinding::Temp(_)) {
-            // 候选拒绝[LayerBoundary]：raw temp 仅由上面的 canonical-adjacent owner 消费；
-            // generic scan 不从 home slot 反推 fresh allocation。
-            return false;
-        }
-        // The LocalDecl remains the allocation owner. This fixed SETLIST fold currently consumes
-        // only private data-only producer declarations; the guards below record where its proof
-        // is still narrower than the actual equivalence boundary.
-        if !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_)) {
-            return false;
-        }
-        // 候选拒绝[ProofIncomplete]：home compaction/materialization count 仍是全局近似，
-        // 需要 seed 区间的 def-use 与 root-lifetime 证明。
-        !self.promotion_facts.compacts_home_slots()
-            && self.materialized_bindings.get(binding).copied() == Some(1)
-    }
-
-    fn fold_fixed_set_list_into_seed(
-        &self,
-        block: &crate::hir::common::HirBlock,
-        set_list_index: usize,
-        seed_index: usize,
-        binding: TableBinding,
-        set_list: &crate::hir::common::HirTableSetList,
-    ) -> Option<(HirTableConstructor, Vec<usize>)> {
-        if set_list.values.tail.is_some()
-            || set_list.values.fixed.is_empty()
-            || !self.fixed_set_list_seed_is_safe(block, seed_index, binding)
-        {
-            return None;
-        }
-        let (_, seed) = constructor_seed(&block.stmts[seed_index])?;
-        if !set_list_can_start_at(seed, set_list.start_index) {
-            return None;
-        }
-
-        let mut definitions = BTreeMap::<TableBinding, (usize, HirExpr)>::new();
-        for stmt_index in seed_index + 1..set_list_index {
-            let (defined_binding, value) = match &block.stmts[stmt_index] {
-                HirStmt::LocalDecl(decl)
-                    if decl.bindings.len() == 1
-                        && decl.values.tail.is_none()
-                        && decl.values.fixed.len() == 1 =>
-                {
-                    (
-                        TableBinding::Local(decl.bindings[0]),
-                        decl.values.fixed[0].clone(),
-                    )
-                }
-                // An existing assignment owns the physical overwrite point of its target.
-                // Moving it into the constructor can keep an old GC root alive (or change
-                // parallel/lvalue evaluation), even when the assigned value is data-only.
-                // The main region scanner already treats Assign as a hard producer barrier;
-                // keep this fixed-SETLIST path on the same contract.
-                HirStmt::Assign(_) => {
-                    // 候选拒绝[ProofIncomplete]：assignment 中有移动覆盖点的 Lifetime 反例，
-                    // 也有可保留声明的安全子集；当前事务尚未区分并只会消费 LocalDecl。
-                    return None;
-                }
-                _ => {
-                    // 候选拒绝[ProofIncomplete]：多 binding/open LocalDecl 与其他语句尚未由
-                    // producer/effect summary 精确建模。
-                    return None;
-                }
-            };
-            // 候选拒绝[SemanticBarrier:Scope]：重定义 owner 或 producer 自引用后删除声明，
-            // 会改变 initializer 的 lexical binding。
-            if defined_binding == binding || expr_uses_binding(&value, defined_binding) {
-                return None;
-            }
-            // 候选拒绝[ProofIncomplete]：data-only 白名单尚未复用通用 eval-event/effect
-            // 证明，复杂 producer 中存在可保持顺序的安全子集。
-            if !expr_is_data_only(&value) {
-                return None;
-            }
-            // 候选拒绝[ProofIncomplete]：删除 producer 的 debug/capture 影响尚未按实际
-            // identity 与 capture replacement 分类。
-            if self
-                .debug_identity_bindings
-                .get(defined_binding)
-                .copied()
-                .unwrap_or_default()
-                || self
-                    .reference_captured_bindings
-                    .get(defined_binding)
-                    .copied()
-                    .unwrap_or_default()
-            {
-                return None;
-            }
-            // 候选拒绝[ProofIncomplete]：同 binding 多定义不能由当前删除式事务合并；应先
-            // 区分可保留最终定义的 partial-consume 子集。
-            if definitions
-                .insert(defined_binding, (stmt_index, value))
-                .is_some()
-            {
-                return None;
-            }
-        }
-
-        // A producer can be removed only when it is private to this seed/SETLIST interval.
-        // Build the prefix/suffix mention sets once: checking each producer by recursively
-        // visiting the whole block made a large SETLIST quadratic in the number of producers.
-        let prefix_mentions = collect_range_binding_mentions(block, 0, seed_index);
-        let suffix_mentions =
-            collect_range_binding_mentions(block, set_list_index + 1, block.stmts.len());
-        if definitions
-            .keys()
-            .any(|binding| prefix_mentions.contains(binding) || suffix_mentions.contains(binding))
-        {
-            // 候选拒绝[ProofIncomplete]：当前事务会删除 producer LocalDecl；区间外有引用时
-            // 应切换为“保留声明、仅复制值”的 partial-consume 计划。
-            return None;
-        }
-
-        let mut resolved_values = Vec::with_capacity(set_list.values.fixed.len());
-        // 证明缺陷[PotentialUnsoundness:EvalMultiplicity]：resolver 会按每个引用 clone producer 表达式；
-        // `local v={}; SETLIST t,[v,v]` 因此会从共享同一 table identity 变成分配两张表。
-        for value in &set_list.values.fixed {
-            let mut resolving = BTreeSet::new();
-            let resolved = resolve_fold_expr(value, &definitions, &mut resolving)?;
-            if expr_uses_binding(&resolved, binding) {
-                // 候选拒绝[SemanticBarrier:Scope]：解析后 owner 自引用不能进入自身 initializer。
-                return None;
-            }
-            resolved_values.push(resolved);
-        }
-        if !expressions_have_safe_nil_shape(&resolved_values) {
-            // 候选拒绝[SemanticBarrier:TableShape]：SETLIST 值中的不确定 nil 槽会改变
-            // constructor array part/`#table`；反例见 regress_237。
-            return None;
-        }
-
-        let mut constructor = seed.clone();
-        constructor
-            .fields
-            .extend(resolved_values.into_iter().map(HirTableField::Array));
-        // The seed and the SETLIST values must be checked as one array run.  A final
-        // maybe-nil seed slot is harmless only when it remains the final slot; appending a
-        // definitely populated value changes `#t`/array-part semantics (for example,
-        // `t[1] = x; t[2] = 1` with `x == nil` must not become `{ x, 1 }`).
-        if !array_fields_have_safe_nil_shape(&constructor.fields) {
-            // 候选拒绝[SemanticBarrier:TableShape]：seed 与 batch 合并后的整段 array run
-            // 必须保持 nil/后续确定值关系；反例见 regress_237。
-            return None;
-        }
-        let mut removed = definitions
-            .values()
-            .map(|(stmt_index, _)| *stmt_index)
-            .collect::<Vec<_>>();
-        // 证明缺陷[PotentialUnsoundness:Lifetime]：删除式计划未证明 producer local 的 root 可转移；
-        // `local v=x; SETLIST t,[v]; t[1]=nil; x=nil` 中 v 原本仍保持对象存活。
-        removed.push(set_list_index);
-        // `definitions` is keyed by binding identity, not source position.  The caller removes
-        // these statements from the end so indices remain stable; sort by statement index
-        // explicitly instead of relying on the unrelated binding ordering.
-        removed.sort_unstable();
-        Some((constructor, removed))
-    }
-
     fn binding_is_shared_before_seed(
         &self,
         block: &crate::hir::common::HirBlock,
@@ -1795,172 +1389,6 @@ fn collect_range_binding_mentions(
     probe.bindings
 }
 
-fn current_set_list_start(block: &crate::hir::common::HirBlock, index: usize) -> Option<u32> {
-    match block.stmts.get(index) {
-        Some(HirStmt::TableSetList(set_list)) => Some(set_list.start_index),
-        _ => None,
-    }
-}
-
-fn set_list_can_start_at(seed: &HirTableConstructor, start_index: u32) -> bool {
-    // 候选拒绝[SemanticBarrier:ValueArity]：open tail 后不存在固定的下一数组键；反例见
-    // regress_52。
-    if seed.trailing_multivalue.is_some() {
-        return false;
-    }
-    // 候选拒绝[ProofIncomplete]：任意嵌套/record nil 被整体停用，应只检查相关 array slot。
-    if seed.fields.iter().any(table_field_contains_nil) {
-        return false;
-    }
-    // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil array slot 后追加确定槽会改变
-    // array part/`#table`；反例见 regress_237。
-    if !array_fields_have_safe_nil_shape(&seed.fields) {
-        return false;
-    }
-    // 候选拒绝[ProofIncomplete]：动态/numeric record key 与 SETLIST 范围的 alias 尚未精确
-    // 判定，当前只接受 name record。
-    if seed.fields.iter().any(|field| {
-        matches!(
-            field,
-            HirTableField::Record(record) if !matches!(record.key, HirTableKey::Name(_))
-        )
-    }) {
-        return false;
-    }
-    let array_len = seed
-        .fields
-        .iter()
-        .filter(|field| matches!(field, HirTableField::Array(_)))
-        .count();
-    let next_array_index = u32::try_from(array_len)
-        .ok()
-        .and_then(|length| length.checked_add(1));
-    // 候选拒绝[SemanticBarrier:TableShape]：固定 batch 只能接在下一个隐式数组键；否则
-    // 直接 append 会改变 raw SETLIST 的实际 key/覆盖范围。
-    next_array_index == Some(start_index)
-}
-
-fn resolve_fold_expr(
-    expr: &HirExpr,
-    definitions: &BTreeMap<TableBinding, (usize, HirExpr)>,
-    resolving: &mut BTreeSet<TableBinding>,
-) -> Option<HirExpr> {
-    if let Some(binding) = binding_from_expr(expr)
-        && let Some((_, value)) = definitions.get(&binding)
-    {
-        if !resolving.insert(binding) {
-            // 候选拒绝[ConvergenceGuard]：producer 依赖图出现环时递归替换无法终止；合法
-            // lexical LocalDecl 理应无环，出现时应由定义图校验报告。
-            return None;
-        }
-        let resolved = resolve_fold_expr(value, definitions, resolving);
-        resolving.remove(&binding);
-        return resolved;
-    }
-
-    match expr {
-        HirExpr::TableConstructor(constructor) => {
-            if constructor.trailing_multivalue.is_some() {
-                // 候选拒绝[ProofIncomplete]：嵌套 constructor open tail 的 value-pack 宽度
-                // 尚未在递归 producer 替换中建模。
-                return None;
-            }
-            let mut resolved = HirTableConstructor::default();
-            for field in &constructor.fields {
-                resolved.fields.push(match field {
-                    HirTableField::Array(value) => {
-                        HirTableField::Array(resolve_fold_expr(value, definitions, resolving)?)
-                    }
-                    HirTableField::Record(record) => {
-                        HirTableField::Record(crate::hir::common::HirRecordField {
-                            key: match &record.key {
-                                HirTableKey::Name(name) => HirTableKey::Name(name.clone()),
-                                HirTableKey::Expr(key) => HirTableKey::Expr(resolve_fold_expr(
-                                    key,
-                                    definitions,
-                                    resolving,
-                                )?),
-                            },
-                            value: resolve_fold_expr(&record.value, definitions, resolving)?,
-                        })
-                    }
-                });
-            }
-            Some(HirExpr::TableConstructor(Box::new(resolved)))
-        }
-        HirExpr::Closure(closure)
-            if closure.captures.iter().all(|capture| {
-                expr_is_data_only(&capture.value)
-                    && definitions
-                        .keys()
-                        .all(|binding| !expr_uses_binding(&capture.value, *binding))
-            }) =>
-        {
-            Some(expr.clone())
-        }
-        _ if expr_is_data_only(expr) => Some(expr.clone()),
-        _ => {
-            // 候选拒绝[ProofIncomplete]：递归 resolver 仅支持 data-only constructor 与不依赖
-            // 待删 producer 的 closure，其他表达式缺少 event/effect 保序证明。
-            None
-        }
-    }
-}
-
-fn fixed_set_list_intermediate_is_safe(stmt: &HirStmt, binding: TableBinding) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(decl) => {
-            !decl
-                .bindings
-                .iter()
-                .copied()
-                .map(TableBinding::Local)
-                .any(|candidate| candidate == binding)
-                && decl.values.tail.is_none()
-                && decl.values.fixed.iter().all(expr_is_data_only)
-                && !decl
-                    .values
-                    .fixed
-                    .iter()
-                    .any(|value| expr_uses_binding(value, binding))
-        }
-        HirStmt::Assign(assign) => {
-            if assign.targets.iter().all(|target| {
-                matches!(target, HirLValue::TableAccess(access)
-                        if binding_from_expr(&access.base) == Some(binding)
-                            && matches!(access.key, HirExpr::Integer(_)))
-            }) && assign.values.tail.is_none()
-                && assign.values.fixed.len() == assign.targets.len()
-                && assign.values.fixed.iter().all(expr_is_data_only)
-            {
-                return true;
-            }
-            assign.targets.iter().all(|target| {
-                binding_from_lvalue(target) != Some(binding)
-                    && !lvalue_uses_binding(target, binding)
-            }) && assign.values.tail.is_none()
-                && assign.values.fixed.iter().all(expr_is_data_only)
-                && !assign
-                    .values
-                    .fixed
-                    .iter()
-                    .any(|value| expr_uses_binding(value, binding))
-        }
-        HirStmt::TableSetList(set_list) => {
-            binding_from_expr(&set_list.base) != Some(binding)
-                && !expr_uses_binding(&set_list.base, binding)
-                && set_list.values.tail.is_none()
-                && set_list.values.fixed.iter().all(expr_is_data_only)
-                && !set_list
-                    .values
-                    .fixed
-                    .iter()
-                    .any(|value| expr_uses_binding(value, binding))
-        }
-        _ => false,
-    }
-}
-
 fn lvalue_uses_binding(lvalue: &HirLValue, binding: TableBinding) -> bool {
     match lvalue {
         HirLValue::TableAccess(access) => {
@@ -2023,10 +1451,9 @@ fn expr_is_open_tail_safe(expr: &HirExpr) -> bool {
         {
             HirTableField::Array(value) => expr_is_open_tail_safe(value),
             HirTableField::Record(record) => {
-                // 证明缺陷[InvariantMismatch]：这里只递归了 record key，与接受门
-                // “普通 constructor 不含未收敛节点”的假设不一致；value 中的 Decision/Unresolved 会被提交。
-                matches!(&record.key, HirTableKey::Name(_))
-                    || matches!(&record.key, HirTableKey::Expr(key) if expr_is_open_tail_safe(key))
+                (matches!(&record.key, HirTableKey::Name(_))
+                    || matches!(&record.key, HirTableKey::Expr(key) if expr_is_open_tail_safe(key)))
+                    && expr_is_open_tail_safe(&record.value)
             }
         })
             && constructor
@@ -2133,8 +1560,6 @@ fn debug_prefix_stmt_is_inert(stmt: &HirStmt) -> bool {
 /// value.  Scalar values and data-only nested constructors are safe: they cannot observe the
 /// target table between writes, and the fresh-seed proof rules out metatable dispatch.
 fn expr_is_indexed_set_list_value_safe(expr: &HirExpr) -> bool {
-    // 证明缺陷[PotentialUnsoundness:TableShape]：该接受模型允许 Nil/不确定值，却没有证明
-    // raw `SETLIST [nil, 1]` 与逐项 `t[1]=nil; t[2]=1` 的 array part/`#t` 一致。
     if matches!(
         expr,
         HirExpr::Nil
@@ -2308,6 +1733,69 @@ fn expressions_have_safe_nil_shape(values: &[HirExpr]) -> bool {
         }
     }
     true
+}
+
+/// 这里只沿 exact local producer 槽追踪 nil 性；producer 语句保持原位，因此不会继承 generic
+/// fold transaction 的表达式 clone 或 root lifetime 风险。
+fn local_set_list_values_have_safe_nil_shape(
+    block: &crate::hir::common::HirBlock,
+    seed_index: usize,
+    set_list_index: usize,
+    values: &[HirExpr],
+) -> bool {
+    let mut definitions = BTreeMap::new();
+    for stmt in &block.stmts[seed_index + 1..set_list_index] {
+        let HirStmt::LocalDecl(decl) = stmt else {
+            continue;
+        };
+        if decl.values.tail.is_some() || decl.bindings.len() != decl.values.fixed.len() {
+            continue;
+        }
+        for (local, value) in decl.bindings.iter().zip(&decl.values.fixed) {
+            if definitions
+                .insert(TableBinding::Local(*local), value)
+                .is_some()
+            {
+                return false;
+            }
+        }
+    }
+
+    let mut saw_uncertain = false;
+    for value in values {
+        let mut resolving = BTreeSet::new();
+        if expr_is_definitely_non_nil_from_local_definitions(value, &definitions, &mut resolving) {
+            if saw_uncertain {
+                return false;
+            }
+        } else if saw_uncertain {
+            return false;
+        } else {
+            saw_uncertain = true;
+        }
+    }
+    true
+}
+
+fn expr_is_definitely_non_nil_from_local_definitions(
+    expr: &HirExpr,
+    definitions: &BTreeMap<TableBinding, &HirExpr>,
+    resolving: &mut BTreeSet<TableBinding>,
+) -> bool {
+    if expr_is_definitely_non_nil(expr) {
+        return true;
+    }
+    let Some(binding) = binding_from_expr(expr) else {
+        return false;
+    };
+    if !resolving.insert(binding) {
+        return false;
+    }
+    let result = definitions.get(&binding).is_some_and(|definition| {
+        expr_is_definitely_non_nil_from_local_definitions(definition, definitions, resolving)
+    });
+    resolving.remove(&binding);
+    result
 }
 
 fn array_fields_have_safe_nil_shape(fields: &[HirTableField]) -> bool {
