@@ -29,7 +29,7 @@ pub(crate) fn lower_closure_capture(
     let (mode, value) = match source {
         crate::transformer::CaptureSource::ByValue(reg) if reg == dst => (
             HirCaptureMode::ByValue,
-            closure_result_expr(lowering, instr_ref),
+            closure_result_expr(lowering, block, instr_ref),
         ),
         crate::transformer::CaptureSource::ByValue(reg) => (
             HirCaptureMode::ByValue,
@@ -37,7 +37,7 @@ pub(crate) fn lower_closure_capture(
         ),
         crate::transformer::CaptureSource::ByReference(reg) if reg == dst => (
             HirCaptureMode::ByReference,
-            closure_result_expr(lowering, instr_ref),
+            closure_result_expr(lowering, block, instr_ref),
         ),
         crate::transformer::CaptureSource::ByReference(reg) => {
             if let Some(target) = lowering.bindings.closure_capture_target(instr_ref, reg) {
@@ -80,11 +80,19 @@ pub(crate) fn lower_closure_capture(
     HirCapture { mode, value }
 }
 
-fn closure_result_expr(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> HirExpr {
-    lowering.bindings.instr_fixed_defs[instr_ref.index()]
+fn closure_result_expr(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+) -> HirExpr {
+    lowering.dataflow.instr_defs[instr_ref.index()]
         .first()
-        .copied()
-        .map(|self_temp| lowering.bindings.expr_for_temp(self_temp))
+        .zip(lowering.bindings.instr_fixed_defs[instr_ref.index()].first())
+        .map(|(def, temp)| {
+            lowering
+                .bindings
+                .expr_for_fixed_def(block, lowering.dataflow.def_reg(*def), *temp)
+        })
         .unwrap_or_else(|| {
             HirExpr::Unresolved(Box::new(HirUnresolvedExpr {
                 summary: format!("closure at {instr_ref} has no fixed result"),

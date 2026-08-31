@@ -111,6 +111,24 @@ impl ProtoBindings {
             .map_or(HirLValue::Temp(temp), BoundSlotTarget::lvalue)
     }
 
+    /// 固定定义优先投影到当前 block 的 local owner，否则回退到 temp target。
+    /// 同一个 VM 结果的读写必须使用这对投影，避免 closure 的 self capture 与接收
+    /// closure 的 binding 分裂成两个身份。
+    pub(super) fn expr_for_fixed_def(&self, block: BlockRef, reg: Reg, temp: TempId) -> HirExpr {
+        self.local_for_reg_in_block(block, reg)
+            .map_or_else(|| self.expr_for_temp(temp), HirExpr::LocalRef)
+    }
+
+    pub(super) fn lvalue_for_fixed_def(
+        &self,
+        block: BlockRef,
+        reg: Reg,
+        temp: TempId,
+    ) -> HirLValue {
+        self.local_for_reg_in_block(block, reg)
+            .map_or_else(|| self.lvalue_for_temp(temp), HirLValue::Local)
+    }
+
     pub(super) fn expr_for_phi(&self, phi: PhiId) -> HirExpr {
         self.numeric_binding_phi_locals
             .get(phi.index())

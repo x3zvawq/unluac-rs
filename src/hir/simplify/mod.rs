@@ -10,7 +10,6 @@ mod branch_control_folding;
 mod branch_value_folding;
 mod carried_locals;
 mod close_scopes;
-mod closure_self_capture;
 mod dead_labels;
 mod dead_temps;
 pub(super) mod decision;
@@ -130,12 +129,6 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[TablePattern],
     },
     PassDescriptor {
-        name: "closure-self-capture",
-        phase: PassPhase::Normal,
-        depends_on: &[ClosureCapture],
-        invalidates: &[ClosureCapture],
-    },
-    PassDescriptor {
         name: "temp-inline",
         phase: PassPhase::Normal,
         depends_on: &[TempChain, DecisionShape, BooleanPattern, LogicalExpr],
@@ -245,7 +238,7 @@ pub(super) fn simplify_hir(
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
-                if index == 5 {
+                if index == 4 {
                     return apply_temp_inline_pass(
                         module,
                         readability,
@@ -265,30 +258,25 @@ pub(super) fn simplify_hir(
                         3 => table_constructors::stabilize_table_constructors_in_proto(
                             proto, dialect, facts,
                         ),
-                        4 => {
-                            closure_self_capture::resolve_recursive_closure_self_captures_in_proto(
-                                proto,
-                            )
-                        }
-                        5 => unreachable!("temp-inline needs child proto body facts"),
-                        6 => {
+                        4 => unreachable!("temp-inline needs child proto body facts"),
+                        5 => {
                             generic_for_iterators::fold_generic_for_iterators_in_proto(proto, facts)
                         }
-                        7 => branch_value_folding::fold_branch_values_in_proto(
+                        6 => branch_value_folding::fold_branch_values_in_proto(
                             proto,
                             readability,
                             facts,
                             dialect,
                         ),
-                        8 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
-                        9 => branch_control_folding::fold_branch_control_in_proto(proto),
-                        10 => decision::eliminate_remaining_decisions_in_proto(proto),
-                        11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
-                        12 => {
+                        7 => locals::promote_temps_to_locals_in_proto_with_facts(proto, facts),
+                        8 => branch_control_folding::fold_branch_control_in_proto(proto),
+                        9 => decision::eliminate_remaining_decisions_in_proto(proto),
+                        10 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        11 => {
                             carried_locals::collapse_carried_local_handoffs_in_proto(proto, facts)
                         }
-                        13 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
-                        14 => dead_labels::remove_unused_labels_in_proto(proto),
+                        12 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
+                        13 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

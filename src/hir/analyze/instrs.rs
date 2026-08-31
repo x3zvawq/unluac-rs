@@ -586,11 +586,7 @@ fn lower_fixed_targets(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> Vec
             // 随后 dead-temp 清理会静默删除真实赋值。
             lowering
                 .bindings
-                .local_for_reg_in_block(block, lowering.dataflow.def_reg(*def))
-                .map_or_else(
-                    || lowering.bindings.lvalue_for_temp(*temp),
-                    HirLValue::Local,
-                )
+                .lvalue_for_fixed_def(block, lowering.dataflow.def_reg(*def), *temp)
         })
         .collect()
 }

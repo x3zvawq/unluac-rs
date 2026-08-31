@@ -1,19 +1,21 @@
 //! `installer_iife`：把需要独立展示的匿名立即调用从合法 AST 收回成局部函数名。
 //!
-//! 这个 pass 处理两类 IIFE。匿名安装器沿用父 block 中的局部名：
+//! 这个 pass 处理两类 IIFE。匿名安装器会先得到一个局部函数名：
 //!
 //! ` (function(x) local f = function(y) return x, y end; emit = f end)("ax") `
 //!
 //! 会收成
 //!
-//! ` local l0 = function(x) local f = function(y) return x, y end; emit = f end; l0("ax") `
+//! ` do local l0 = function(x) local f = function(y) return x, y end; emit = f end; l0("ax") end `
 //!
-//! 其它包含多条语句或复合控制流的 IIFE 则放进最小 `do` 作用域：
+//! 其它包含多条语句或复合控制流的 IIFE 同样放进最小 `do` 作用域：
 //!
 //! ` do local l0 = function() BODY end; l0() end `
 //!
-//! 这样新增 closure binding 会在原调用点后立即死亡，不会把 captured value 的 root
-//! 生命周期延长到父 block 末尾。单条简单语句的短 IIFE 保留原样。两类结果都交给后面的
+//! 这样新增 closure binding 会在原调用点后立即死亡，不会把 closure root 生命周期延长到
+//! 父 block 末尾。改写只新增一个 `Recovered`、无 attr 的 synthetic binding；原 function 与
+//! 调用参数以完整 AST 节点克隆，既有 PhysicalRoot/DebugHinted origin、local attr、binding ref
+//! 与 capture 身份都不重建。单条简单语句的短 IIFE 保留原样。两类结果都交给后面的
 //! `function_sugar` 再决定是否继续变成 `local function l0(...) ... end`。
 //!
 //! 它依赖 AST build 已经把直接调用的 callee 落成合法 `FunctionExpr`，也依赖
@@ -104,14 +106,9 @@ fn rewrite_installer_iife_stmt(
         })),
     ];
 
-    if is_named_installer {
-        // 证明缺陷[PotentialUnsoundness:Lifetime]：结构只证明“末句导出函数”，未证明外层 closure/capture 可活到父 block 末；弱表或 `__gc` 可观察原 IIFE 调用后即死亡的 root。
-        Some(rewritten)
-    } else {
-        Some(vec![AstStmt::DoBlock(Box::new(AstBlock {
-            stmts: rewritten,
-        }))])
-    }
+    Some(vec![AstStmt::DoBlock(Box::new(AstBlock {
+        stmts: rewritten,
+    }))])
 }
 
 pub(super) fn function_expr_is_substantial(function: &AstFunctionExpr) -> bool {
