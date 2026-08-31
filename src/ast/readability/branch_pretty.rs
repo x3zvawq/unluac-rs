@@ -11,6 +11,7 @@
 //! - `repeat if cond then break end; tail() until true` 会整理成 `if not cond then tail() end`
 //! - `repeat ...; if G then continue; if B then break until C` 会整理成
 //!   `repeat ... until not G and B or C`
+//! - 嵌套循环自己的 `continue` 保留原 owner，不会阻止外层 `repeat` 的尾部整理
 
 use super::super::common::{
     AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLocalOrigin, AstLogicalExpr,
@@ -103,10 +104,9 @@ fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
     }
     if repeat_stmt.body.stmts[..len - 2]
         .iter()
-        .any(stmt_contains_single_pass_forbidden_nodes)
+        .any(|stmt| stmt_contains_single_pass_forbidden_nodes(stmt, 0))
     {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：prefix 中较早的 `continue` 原本直接进入旧 latch；折叠后会额外求值尾部 G/B，改变控制路径与副作用。
-        // 候选拒绝[ProofIncomplete]：当前 helper 不区分嵌套真实循环的 continue owner；嵌套 continue 本可不影响外层 latch，需消费显式 loop-owner 事实。
+        // 候选拒绝[SemanticBarrier:ControlFlow]：prefix 中较早的 `continue` 原本直接进入旧 latch；折叠后会额外求值尾部 G/B（regress_294）。
         return false;
     }
     let [AstStmt::If(continue_if), AstStmt::If(break_if)] = &repeat_stmt.body.stmts[len - 2..]
@@ -330,36 +330,57 @@ fn fold_single_pass_block(block: AstBlock, tail: Option<AstBlock>) -> AstBlock {
 }
 
 fn block_contains_single_pass_forbidden_nodes(block: &AstBlock) -> bool {
+    block_contains_single_pass_forbidden_nodes_at_loop_depth(block, 0)
+}
+
+fn block_contains_single_pass_forbidden_nodes_at_loop_depth(
+    block: &AstBlock,
+    loop_depth: usize,
+) -> bool {
     block
         .stmts
         .iter()
-        .any(stmt_contains_single_pass_forbidden_nodes)
+        .any(|stmt| stmt_contains_single_pass_forbidden_nodes(stmt, loop_depth))
 }
 
-fn stmt_contains_single_pass_forbidden_nodes(stmt: &AstStmt) -> bool {
+fn stmt_contains_single_pass_forbidden_nodes(stmt: &AstStmt, loop_depth: usize) -> bool {
     match stmt {
         AstStmt::If(if_stmt) => {
-            block_contains_single_pass_forbidden_nodes(&if_stmt.then_block)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(block_contains_single_pass_forbidden_nodes)
+            block_contains_single_pass_forbidden_nodes_at_loop_depth(
+                &if_stmt.then_block,
+                loop_depth,
+            ) || if_stmt.else_block.as_ref().is_some_and(|else_block| {
+                block_contains_single_pass_forbidden_nodes_at_loop_depth(else_block, loop_depth)
+            })
         }
-        AstStmt::While(while_stmt) => block_contains_single_pass_forbidden_nodes(&while_stmt.body),
-        AstStmt::Repeat(repeat_stmt) => {
-            block_contains_single_pass_forbidden_nodes(&repeat_stmt.body)
-        }
+        AstStmt::While(while_stmt) => block_contains_single_pass_forbidden_nodes_at_loop_depth(
+            &while_stmt.body,
+            loop_depth + 1,
+        ),
+        AstStmt::Repeat(repeat_stmt) => block_contains_single_pass_forbidden_nodes_at_loop_depth(
+            &repeat_stmt.body,
+            loop_depth + 1,
+        ),
         AstStmt::NumericFor(numeric_for) => {
-            block_contains_single_pass_forbidden_nodes(&numeric_for.body)
+            block_contains_single_pass_forbidden_nodes_at_loop_depth(
+                &numeric_for.body,
+                loop_depth + 1,
+            )
         }
         AstStmt::GenericFor(generic_for) => {
-            block_contains_single_pass_forbidden_nodes(&generic_for.body)
+            block_contains_single_pass_forbidden_nodes_at_loop_depth(
+                &generic_for.body,
+                loop_depth + 1,
+            )
         }
-        AstStmt::DoBlock(block) => block_contains_single_pass_forbidden_nodes(block),
-        // 分析停用[ProofIncomplete]：嵌套真实循环的 continue 不属于外层 repeat，本 blanket
-        // 扫描缺少 loop owner；goto/label 则需保留精确入口事实后才能重建 single-pass fence。
-        AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => true,
-        // 分析停用[LayerBoundary]：Error 是前层诊断，不参与展示层控制重建。
+        AstStmt::DoBlock(block) => {
+            block_contains_single_pass_forbidden_nodes_at_loop_depth(block, loop_depth)
+        }
+        // 候选拒绝[SemanticBarrier:ControlFlow]：当前 loop owner 的 continue 会绕过外层 latch/fence 尾部求值（regress_294）；嵌套 owner 则原位保留。
+        AstStmt::Continue => loop_depth == 0,
+        // 候选拒绝[ProofIncomplete]：goto/label 仍缺少相对当前 repeat 的精确入口与目标 owner，不能重建 single-pass fence。
+        AstStmt::Goto(_) | AstStmt::Label(_) => true,
+        // 候选拒绝[LayerBoundary]：Error 是前层诊断，不参与展示层控制重建。
         AstStmt::Error(_) => true,
         AstStmt::LocalDecl(_)
         | AstStmt::GlobalDecl(_)
