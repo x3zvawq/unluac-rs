@@ -88,6 +88,7 @@ fn rewrite_stmt_slice(stmts: &[HirStmt]) -> Option<Vec<HirStmt>> {
         {
             return None;
         }
+        // 证明缺陷[InvariantMismatch]：这里假定所有 `Close(0)` 都仍紧邻 lowering 生成的 return/tailcall；matcher 未校验终结位置，若前层移动或暴露中段 Close(0)，删除会提前丢失 upvalue/TBC cleanup。
         return Some(
             stmts
                 .iter()
@@ -117,6 +118,8 @@ fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
     let mut intervals: Vec<_> = (0..stmts.len())
         .filter_map(|index| {
             let scope_start = scope_start(stmts, index)?;
+            // 候选拒绝[ProofIncomplete]：已识别 TBC 声明却找不到可归属的 close/label
+            // 终点；缺少 Structure 冻结的精确 scope-end 事实，不能猜测关闭时点。
             let scope_end = find_scope_end(
                 stmts,
                 scope_start.start,
@@ -125,6 +128,8 @@ fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
                 scope_start.origin,
                 scope_start.reg_index,
             )?;
+            // 候选拒绝[ConvergenceGuard]：零长/反向 interval 违反“声明必须位于其词法块内”
+            // 的内部不变量，也会让 fixed-point 重复命中同一 TBC 起点。
             (scope_start.start < scope_end.end).then_some(ScopeInterval {
                 start: scope_start.start,
                 end: scope_end.end,
@@ -139,6 +144,8 @@ fn collect_scope_intervals(stmts: &[HirStmt]) -> Vec<ScopeInterval> {
     if well_nested_scope_intervals(&intervals) {
         intervals
     } else {
+        // 候选拒绝[ProofIncomplete]：交叉 interval 不能直接表示成 Lua 嵌套词法块；应由
+        // Structure 提供正确 owner/end，不能把全部候选静默降级为“语义不安全”。
         Vec::new()
     }
 }
@@ -148,12 +155,15 @@ fn scope_start(stmts: &[HirStmt], index: usize) -> Option<ScopeStart> {
         (
             Some(HirStmt::LocalDecl(_) | HirStmt::Assign(_)),
             Some(HirStmt::ToBeClosed(to_be_closed)),
-        ) => binding_from_expr(&to_be_closed.value).map(|binding| ScopeStart {
-            start: index,
-            origin: to_be_closed.origin,
-            reg_index: to_be_closed.reg_index,
-            binding,
-        }),
+        ) => {
+            // 证明缺陷[InvariantMismatch]：matcher 依赖“前一语句必定义 TBC binding”的 lowering 不变量却未校验；若漂移成 `local x; TBC(y); Close(y); return x`，会把 x 包进提前结束的块。
+            binding_from_expr(&to_be_closed.value).map(|binding| ScopeStart {
+                start: index,
+                origin: to_be_closed.origin,
+                reg_index: to_be_closed.reg_index,
+                binding,
+            })
+        }
         _ => None,
     }
 }
@@ -191,6 +201,7 @@ fn find_scope_end(
     let mut covering_close_indices = Vec::new();
     let label_scope_end = active_label_scope_end(stmts, start_index, origin);
 
+    // 证明缺陷[PotentialUnsoundness:Resource]：扫描未在“同 reg 的新 TBC origin”处终止而总取最后一次 covering close；`TBC a(r1); Close r1; TBC b(r1); Close r1` 会把 a 错误延寿到 b 的末端并改变关闭顺序。
     for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
         if let HirStmt::Close(close) = stmt
             && close.from_reg != 0
@@ -248,6 +259,7 @@ fn active_label_scope_end(
         };
         if label.tbc_barriers.contains(&origin) {
             if saw_inactive {
+                // 证明缺陷[PotentialUnsoundness:Scope]：inactive 后重新 active 确实不能由同一 Lua block 表示，但返回 None 会被调用方当成“无 label end”并继续按最后 Close 接受候选，而非真正拒绝。
                 // 一个词法 block 无法跨过 inactive label 后再次激活同一声明；保留旧
                 // 边界，让最终 verifier 明确拒绝，而不是猜一个错误的包围范围。
                 return None;
@@ -272,6 +284,7 @@ fn externally_entered_scope_end(
     // 以匹配的 VM Close 开始，该 label 就是作用域硬边界。其他可消费 Close 只取
     // 块内真实 goto 出口，避免同一物理寄存器后续复用时误删 sibling cleanup。
     let external_targets = goto_targets(&stmts[..scope_start]);
+    // 证明缺陷[PotentialUnsoundness:Scope]：`find_map` 会跳过第一个“外部 goto 可达但无可证 boundary”的 label，转而接受更晚的 target；重建区间因而仍可能包住较早外部入口，生成 goto 跳入 `<close>` scope。
     let (scope_end, external_target) =
         stmts
             .iter()
@@ -327,6 +340,8 @@ fn scope_boundary_for_external_label(
         });
     }
 
+    // 外部 goto 的目标不能被包进新建的 `<close>` local 作用域；这里只接受能证明
+    // cleanup 位于目标 label 之前或紧邻其后的布局。
     // PUC 5.4 也会把离开 `<close>` 块的 cleanup 放在目标 label 之前。label 本身
     // 已在局部作用域之外，interval 必须截止到第一条 cleanup，并把这段 cleanup
     // 作为词法块 owner 消费，不能把外部 goto 的目标一起包进 do block。
@@ -343,10 +358,15 @@ fn scope_boundary_for_external_label(
         });
     }
 
+    // 候选拒绝[ProofIncomplete]：外部目标附近既无直接 covering close，又找不到独立
+    // cleanup label；缺少显式 edge-cleanup owner，无法证明应在何处结束词法块。
     let cleanup_label = (search_start..label_index)
         .rev()
         .find(|index| matches!(stmts[*index], HirStmt::Label(_)))?;
     let cleanup = &stmts[cleanup_label + 1..label_index];
+    // 候选拒绝[ProofIncomplete]：cleanup 区间为空时没有任何 edge-close owner，尚不能证明仅靠新词法块会保持该外部入口的关闭时点。
+    // 候选拒绝[SemanticBarrier:ControlFlow]：cleanup label 与外部目标之间若夹有非 Close
+    // 语句，把该段当 cleanup 消费会删除或跨越真实求值/跳转；最小反例是其中含一次 call。
     let covering_close_indices = (!cleanup.is_empty()
         && cleanup.iter().all(|stmt| {
             matches!(stmt, HirStmt::Close(close) if close.from_reg != 0 && close.from_reg <= reg_index)
@@ -363,6 +383,7 @@ fn covering_closes_after_label(
     label_index: usize,
     reg_index: usize,
 ) -> Vec<usize> {
+    // 证明缺陷[PotentialUnsoundness:Resource]：这里只在下一 label 截止并跳过任意中间语句；`goto L; ::L:: side(); Close r1` 会把 close 移到 goto 离块时、提前到 side() 之前。
     stmts
         .iter()
         .enumerate()

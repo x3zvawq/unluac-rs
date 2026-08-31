@@ -33,6 +33,7 @@ pub(super) fn if_fallthrough_assignments(
     if_stmt: &HirIf,
     results: &[CarryBinding],
 ) -> Option<Vec<BTreeMap<CarryBinding, HirExpr>>> {
+    // 候选拒绝[ProofIncomplete]：无 else 的 fallthrough path 可能沿用 initializer/nil；helper 未携带入口 relation，不能判定是否完整定义。
     let else_block = if_stmt.else_block.as_ref()?;
     let mut exits = Vec::new();
     let then_falls = collect_fallthrough_assignments(&if_stmt.then_block, results, &mut exits)?;
@@ -44,6 +45,7 @@ pub(super) fn complete_if_assignments(
     if_stmt: &HirIf,
     results: &[CarryBinding],
 ) -> Option<Vec<BTreeMap<CarryBinding, HirExpr>>> {
+    // 候选拒绝[SemanticBarrier:ControlFlow]：complete owner 无 else 时存在未赋值路径，改名会把该路径变成已有 state 值。
     let else_block = if_stmt.else_block.as_ref()?;
     let mut exits = Vec::new();
     collect_complete_assignments(&if_stmt.then_block, results, &mut exits)?;
@@ -58,6 +60,7 @@ pub(super) fn collect_complete_assignments(
 ) -> Option<()> {
     let (last, prefix) = block.stmts.split_last()?;
     if bindings_are_mentioned_in_stmts(prefix, results) {
+        // 候选拒绝[SemanticBarrier:Lifetime]：terminal assignment 前已观察/改写 result 时，删除独立 result 会合并中间 epoch。
         return None;
     }
     match last {
@@ -84,6 +87,7 @@ pub(super) fn complete_result_assignment_values(
         .iter()
         .map(|result| values.get(result))
         .collect::<Option<Vec<_>>>()?;
+    // 候选拒绝[SemanticBarrier:EvalOrder]：result RHS 读取同批 result 时，并行快照不能逐 binding 改名成 state 后再按标量理解。
     (!bindings_are_mentioned_in_exprs(result_values, results)).then_some(values)
 }
 

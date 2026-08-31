@@ -48,8 +48,17 @@ fn is_dead_pure_temp_assignment(stmt: &HirStmt, live_reads: &BTreeSet<TempId>) -
     else {
         return false;
     };
+    // 候选拒绝[SemanticBarrier:ValueArity]：tail 即使不供目标取值仍必须求值；删除
+    // `t = nil, side()` 会漏掉 `side()` 的调用和它的可观察结果宽度协议。
     if assign.values.tail.is_some() {
         return false;
     }
-    !live_reads.contains(temp) && expr_is_discard_safe(value)
+    // 候选拒绝[SemanticBarrier:Value]：仍被读取的 temp 定义决定后续值；删除
+    // `t = 1; return t` 会把读取变成未定义槽。
+    if live_reads.contains(temp) {
+        return false;
+    }
+    // 候选拒绝[SemanticBarrier:EvalMultiplicity]：不可丢弃 RHS 必须求值一次；调用、
+    // table/global lookup 或分配即使结果未读也可能执行用户代码、抛错或产生对象身份。
+    expr_is_discard_safe(value)
 }

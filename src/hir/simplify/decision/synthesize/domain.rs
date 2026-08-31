@@ -53,6 +53,7 @@ fn abstract_value_partial_cmp(
         (AbstractValue::Number(a), AbstractValue::Number(b)) => {
             f64::from_bits(*a).partial_cmp(&f64::from_bits(*b))
         }
+        // 模型边界：任意 i64 转 f64 不能精确模拟 mixed numeric 比较；当前 repeatable 安全门不接纳这类表达式。
         (AbstractValue::Integer(a), AbstractValue::Number(b)) => {
             (*a as f64).partial_cmp(&f64::from_bits(*b))
         }
@@ -62,6 +63,7 @@ fn abstract_value_partial_cmp(
         (AbstractValue::String(a), AbstractValue::String(b)) => Some(a.cmp(b)),
         (AbstractValue::Int64(a), AbstractValue::Int64(b)) => Some(a.cmp(b)),
         (AbstractValue::UInt64(a), AbstractValue::UInt64(b)) => Some(a.cmp(b)),
+        // 模型边界：TruthySymbol 的全序不是 Lua 语义；当前 repeatable 安全门会拒绝两个非字面量的顺序比较。
         (AbstractValue::TruthySymbol(a), AbstractValue::TruthySymbol(b)) => Some(a.cmp(b)),
         _ => None,
     }
@@ -163,6 +165,8 @@ pub(super) fn eval_pure_expr(
         HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
             let lhs = eval_pure_expr(&binary.lhs, env, ref_positions)?;
             let rhs = eval_pure_expr(&binary.rhs, env, ref_positions)?;
+            // 证明缺陷[PotentialUnsoundness:Numeric]：派生 Eq 把 enum 判等当 Lua `==`；共享 DAG 可据此误接纳
+            // `(x==1) and A or X`，其中 `A=(x==1.0) ? false : X`，使 `x=1.0` 时原式返回 false、候选返回真值 X。
             Some(if lhs == rhs {
                 AbstractValue::True
             } else {
@@ -335,7 +339,9 @@ pub(super) fn enumerate_environments(
     ref_count: usize,
     domain: &[AbstractValue],
 ) -> Option<Vec<Vec<AbstractValue>>> {
+    // 候选拒绝[ResourceLimit]：环境数溢出 usize 时无法分配穷举表；后续应改用符号验证。
     let total = domain.len().checked_pow(ref_count as u32)?;
+    // 候选拒绝[ResourceLimit]：完整环境枚举上限为 4096；后续应改用符号验证或按依赖分区。
     if total > 4096 {
         return None;
     }

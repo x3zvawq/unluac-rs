@@ -54,6 +54,7 @@ pub(super) fn try_inline_terminal_constructor_fields(
         // method declaration.  Folding it into the constructor would erase the lvalue/closure
         // pair before `direct` gets a chance to consume the already-proven method field fact.
         if stmt_is_recoverable_method_decl(stmt, binding, method_fields) {
+            // 候选拒绝[LayerBoundary]：该字段已有 method provenance，必须留给 direct owner 生成冒号声明，不能先折回匿名 table field。
             return None;
         }
         let Some((field, func)) = inlineable_local_table_function_stmt(stmt, binding) else {
@@ -79,6 +80,7 @@ pub(super) fn try_inline_terminal_constructor_fields(
         return None;
     };
     if !name_matches_binding(name, binding) {
+        // 候选拒绝[SemanticBarrier:Identity]：终端 return 必须交回同一 constructor local；换成别的 binding 会删除仍需返回的对象。
         return None;
     }
 
@@ -130,6 +132,7 @@ pub(super) fn try_inline_terminal_constructor_call(
     if let AstExpr::FunctionExpr(function) = callee_expr
         && function_expr_is_substantial(function)
     {
+        // 候选拒绝[PolicyBoundary]：多语句/控制流 closure 内联到结果位置会制造难读 IIFE，语义上并非禁止。
         return None;
     }
     let mut consumed = 1usize;
@@ -173,8 +176,11 @@ pub(super) fn try_inline_terminal_constructor_call(
             &arg_locals,
         )
     {
+        // 候选拒绝[SemanticBarrier:Scope]：非终端 sink 后若仍引用被消除的 callee/arg local，内联会留下未绑定 use。
         return None;
     }
+    // 证明缺陷[PotentialUnsoundness:Lifetime]：dead-after-sink 不等于词法 root 已死亡；PhysicalRoot local 原本活到 block 末，内联可提前触发弱表消失或 `__gc`。
+    // 证明缺陷[PotentialPolicyViolation]：callee/arg 的 DebugHinted origin 未检查，源码身份会被无条件抹掉。
     Some((rewritten_sink, consumed + 1))
 }
 
@@ -213,6 +219,7 @@ fn inlineable_local_table_function_stmt(
             }
             // 同 assign 分支：闭包捕获了 constructor binding 时不能折入
             if function_decl.func.captured_bindings.contains(&binding) {
+                // 候选拒绝[SemanticBarrier:Capture]：`function obj.f() return obj end` 折进字面量并消除 `obj` 后，闭包捕获会悬空或改绑。
                 return None;
             }
             Some((path.fields[0].clone(), function_decl.func.clone()))
@@ -244,6 +251,7 @@ fn inlineable_local_table_function_assign(
     // 如果闭包体捕获了 constructor binding 自身（如 `obj.inc = function() obj.count = ... end`），
     // 折入 constructor 后 binding 可能因 return-handoff 被消除，导致闭包中引用悬空。
     if function.captured_bindings.contains(&binding) {
+        // 候选拒绝[SemanticBarrier:Capture]：`obj.f=function() return obj end` 需要 constructor binding 作为 upvalue，不能在 return handoff 中删除。
         return None;
     }
     Some((field.clone(), function.as_ref().clone()))
@@ -286,6 +294,7 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
         return false;
     };
     if inner_index == outer_index || !arg_locals[inner_index].pass_to_sink {
+        // 候选拒绝[SemanticBarrier:Identity]：不能把 table 接到自身，且已被某次嵌套接线消费的 inner 不能再复制到第二个字段。
         return false;
     }
 
@@ -296,6 +305,8 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     let AstExpr::TableConstructor(table) = &mut arg_locals[outer_index].value else {
         return false;
     };
+
+    // 证明缺陷[PotentialUnsoundness:EvalOrder]：未证明 inner/outer 在 arg-local run 中相邻且同序；把 inner constructor 搬入 outer 字段会跨过中间 initializer（如 `h()`），可把 `outer; h(); inner` 的事件改成 `outer(inner); h()`。
 
     // 这里专门收回“先建内层 methods table，再接到外层 metadata 字段”的机械接线。
     // 它只在内层 table 仍是独立 constructor local 时触发，不会把任意普通变量赋值猜成
@@ -383,13 +394,16 @@ fn rewrite_terminal_constructor_call_expr(
         .filter(|arg| arg.pass_to_sink)
         .collect::<Vec<_>>();
     if !name_matches_binding(name, callee_binding) || call.args.len() != active_args.len() {
+        // 候选拒绝[SemanticBarrier:Identity]：sink 必须调用同一 callee，且逐一承接全部未被嵌套消费的 constructor local。
         return None;
     }
     for (arg, expected) in call.args.iter().zip(active_args.iter()) {
         let AstExpr::Var(name) = arg else {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：arg 若不是纯 binding handoff，替换会删除或重排它自身的求值事件。
             return None;
         };
         if !name_matches_binding(name, expected.binding) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：constructor locals 的实参顺序必须与原 call 一致，否则 initializer/参数求值顺序改变。
             return None;
         }
     }
@@ -410,8 +424,10 @@ fn removed_constructor_locals_are_dead_after_sink(
     arg_locals: &[ConstructorArg],
 ) -> bool {
     if use_index.count_uses_in_suffix(suffix_start, callee_binding) != 0 {
+        // 候选拒绝[SemanticBarrier:Scope]：callee local 在 sink 后仍有 use，不能随 constructor 壳一起删除。
         return false;
     }
+    // 候选拒绝[SemanticBarrier:Scope]：任一 constructor arg local 在 sink 后仍有 use，都不能从词法作用域删除。
     arg_locals
         .iter()
         .all(|arg| use_index.count_uses_in_suffix(suffix_start, arg.binding) == 0)

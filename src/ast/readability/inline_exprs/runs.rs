@@ -30,11 +30,25 @@ pub(super) fn collapse_adjacent_self_call_updates(
             index += 1;
             continue;
         };
-        if binding.attr != AstLocalAttr::None
-            || binding.origin == AstLocalOrigin::DebugHinted
-            || use_index.count_uses_in_range(index, index + 1, binding.id) != 0
-            || !matches!(initial, AstExpr::Call(_) | AstExpr::MethodCall(_))
-        {
+        if binding.attr == AstLocalAttr::Close {
+            // 候选拒绝[SemanticBarrier:Lifetime]：吞掉 `<close>` binding 会删除退出作用域时的关闭动作。
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
+        if binding.attr == AstLocalAttr::Const || binding.origin == AstLocalOrigin::DebugHinted {
+            // 候选拒绝[PolicyBoundary]：`<const>` 与 DebugHinted 的源码声明身份按保真策略保留。
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
+        if use_index.count_uses_in_range(index, index + 1, binding.id) != 0 {
+            // 候选拒绝[SemanticBarrier:Scope]：initializer 自引用时 `local x = x()` 的 `x` 解析到外层；折叠后续更新会改变该绑定。
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
+        if !matches!(initial, AstExpr::Call(_) | AstExpr::MethodCall(_)) {
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -136,6 +150,7 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             &use_index,
             mutable_snapshots,
         ) {
+            // 候选拒绝[LayerBoundary]：完整 method receiver/field/call run 由 function-sugar 原子消费，不能先删除其中 alias。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -165,7 +180,14 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             else {
                 continue;
             };
-            if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
+            let suffix_uses =
+                use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
+            if suffix_uses == 0 {
+                // 候选拒绝[LayerBoundary]：零 use 的声明归 cleanup/dead-local，不属于 run inline。
+                continue;
+            }
+            if suffix_uses > 1 {
+                // 候选拒绝[SemanticBarrier:EvalCount]：alias 多次使用会复制 lookup/call producer。
                 continue;
             }
             let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
@@ -177,6 +199,7 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 use_index.count_uses_in_range(candidate_index + 1, run_end, candidate.binding())
             };
             if intermediate_uses != 0 {
+                // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：候选在抵达 sink 前已有读取，删除声明会改变快照时点或重复 producer。
                 continue;
             }
 
@@ -222,6 +245,8 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             continue;
         }
 
+        // 候选拒绝[PolicyBoundary]：普通 run 至少收回两项（仅 generic-for method receiver 例外）；候选拒绝[SemanticBarrier:EvalOrder]：移动事件必须仍是 sink 的同序前缀。
+
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
@@ -261,6 +286,7 @@ pub(super) fn single_generic_for_method_receiver_alias(
     let AstExpr::Var(receiver) = &call.receiver else {
         return false;
     };
+    // 候选拒绝[LayerBoundary]：Temp 归 HIR；候选拒绝[SemanticBarrier:EvalOrder]：global/source 或非直接 receiver 缺少稳定快照证明，不能走单项例外。
     candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
         && !matches!(source, AstNameRef::Global(_) | AstNameRef::Temp(_))
         && candidate.binding().matches_name_ref(receiver)
@@ -280,6 +306,7 @@ pub(super) fn stmt_is_terminal_call_alias_sink(stmt: &AstStmt) -> bool {
         // `return f(...)` 在字节码里也常由同一段调用准备 run 供给 callee/args。
         // 这里只接单个返回值，避免把别名内联进 `return a(), f(x)` 这类多返回式时
         // 改变 alias 求值相对前置返回值的顺序。
+        // 候选拒绝[SemanticBarrier:EvalOrder/ValueArity]：多值 return 的前置值与尾 call 有固定次序/展开协议，当前 run 只证明单个 call 返回位。
         AstStmt::Return(ret) => matches!(
             ret.values.as_slice(),
             [super::super::super::common::AstExpr::Call(_)]
@@ -314,6 +341,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             &use_index,
             mutable_snapshots,
         ) {
+            // 候选拒绝[LayerBoundary]：method alias transaction 归 function-sugar，不能由 call-result run 局部消费。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -338,7 +366,14 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             else {
                 continue;
             };
-            if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
+            let suffix_uses =
+                use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
+            if suffix_uses == 0 {
+                // 候选拒绝[LayerBoundary]：零 use 的声明归 cleanup/dead-local。
+                continue;
+            }
+            if suffix_uses > 1 {
+                // 候选拒绝[SemanticBarrier:EvalCount]：多次 use 会复制 call-result producer。
                 continue;
             }
             let intermediate_uses = if candidate::is_lookup_inline_expr(value) {
@@ -353,6 +388,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             if intermediate_uses != 0
                 || !stmt_has_nested_binding_use(current_sink, candidate.binding())
             {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：中间读取会改变快照/次数；候选拒绝[ProofIncomplete]：非 nested sink 位置缺少该 run 的位置级证明。
                 continue;
             }
 
@@ -393,6 +429,8 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             continue;
         }
 
+        // 候选拒绝[PolicyBoundary]：call-result 只收回至少两个机械阶段；候选拒绝[SemanticBarrier:EvalOrder]：完整事件前缀必须同序。
+
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
@@ -430,6 +468,7 @@ pub(super) fn stmt_sink_binding_allows_adjacent_value_inline(
     };
     !stmts[(sink_index + 1)..]
         .iter()
+        // 候选拒绝[ProofIncomplete]：sink local 后续还作为 callee 时，当前相邻值规则未证明删掉前置 alias 后的调用身份链。
         .any(|stmt| stmt_has_call_callee_binding_use(stmt, sink_candidate.binding()))
 }
 
@@ -483,24 +522,36 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
+                // 候选拒绝[ProofIncomplete]：该 RHS 不在 mechanical-run 已证明的 copy/lookup/call 子集，缺少值宽度与事件事实。
                 continue;
             }
-            if use_index.count_uses_in_range(candidate_index + 1, run_end + 1, candidate.binding())
-                != 1
-            {
+            let run_uses = use_index.count_uses_in_range(
+                candidate_index + 1,
+                run_end + 1,
+                candidate.binding(),
+            );
+            if run_uses == 0 {
+                // 候选拒绝[LayerBoundary]：未被当前 run/sink 消费的声明不属于本规则。
+                continue;
+            }
+            if run_uses > 1 {
+                // 候选拒绝[SemanticBarrier:EvalCount]：候选在 run+sink 中多次读取时，替换会复制 RHS。
                 continue;
             }
             if use_index.count_uses_in_suffix(run_end + 1, candidate.binding()) != 0 {
+                // 候选拒绝[SemanticBarrier:Scope]：binding 在 sink 后仍活跃，删除声明会使后缀读取失去 local 身份。
                 continue;
             }
             if remaining_run_uses
                 .get(&candidate.binding())
                 .is_some_and(|count| *count != 0)
             {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：保留的中间语句仍读取候选快照，不能只在最终 sink 替换。
                 continue;
             }
             let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end]);
             if !stmt_has_mechanical_run_sink_binding_use(current_sink, candidate.binding()) {
+                // 候选拒绝[ProofIncomplete]：候选 use 不在 mechanical-run 拥有的位置集合，需扩展 use-site 证明后再消费。
                 continue;
             }
 
@@ -550,6 +601,8 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             continue;
         }
 
+        // 候选拒绝[PolicyBoundary]：至少两项且形状值得收回；候选拒绝[SemanticBarrier:EvalOrder]：全部 producer 必须仍构成 sink 的同序可观察前缀。
+
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
@@ -592,6 +645,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
         // 前面的 recovered local 只是为了把最终表达式拆成多个机械阶段，
         // 但末尾这个 binding 仍然是后续语句要继续引用的源码锚点。
         if use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0 {
+            // 候选拒绝[LayerBoundary]：末项不跨语句存活时不属于 terminal-local 规则，交由其它 run/single-item owner。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -617,22 +671,33 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
+                // 候选拒绝[ProofIncomplete]：RHS 超出 terminal mechanical-run 已证明的表达式集合。
                 continue;
             }
-            if use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding()) != 1 {
+            let suffix_uses =
+                use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
+            if suffix_uses == 0 {
+                // 候选拒绝[LayerBoundary]：零 use 的声明归 cleanup/dead-local。
+                continue;
+            }
+            if suffix_uses > 1 {
+                // 候选拒绝[SemanticBarrier:EvalCount]：多次 use 会复制 producer。
                 continue;
             }
             if use_index.count_uses_in_suffix(run_end, candidate.binding()) != 0 {
+                // 候选拒绝[SemanticBarrier:Scope]：前置 binding 在 terminal local 之后仍活跃，不能随准备阶段一起删除。
                 continue;
             }
             if remaining_run_uses
                 .get(&candidate.binding())
                 .is_some_and(|count| *count != 0)
             {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：保留的 run 片段仍读取候选，不能只重写 terminal local。
                 continue;
             }
             let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end - 1]);
             if !stmt_has_nested_binding_use(current_sink, candidate.binding()) {
+                // 候选拒绝[ProofIncomplete]：候选 use 不在 terminal-local 当前拥有的 nested value 位置。
                 continue;
             }
 
@@ -669,6 +734,8 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
             index = run_end;
             continue;
         }
+
+        // 候选拒绝[PolicyBoundary]：少于两个机械阶段不做展示折叠；候选拒绝[SemanticBarrier:EvalOrder]：事件前缀不一致会改变调用/lookup/快照次序。
 
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;

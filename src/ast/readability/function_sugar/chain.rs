@@ -28,14 +28,18 @@ pub(super) fn try_chain_local_method_call_stmt(
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
     if use_index.count_uses_in_suffix(stmt_base + 1, dead_alias.bindings[0].id) != 0 {
+        // 候选拒绝[SemanticBarrier:Scope]：所谓 dead alias 仍有后续引用，删除会留下未绑定 use。
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
     if !is_discard_safe_expr(&dead_alias.values[0]) {
+        // 候选拒绝[SemanticBarrier:EvalCount]：`local dead=f()` 即使结果未用也必须执行调用；只有无事件表达式可删除。
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
+    // 证明缺陷[PotentialPolicyViolation]：dead alias 的 DebugHinted origin 未检查；即使 RHS 可安全丢弃，也不应无证据抹掉源码身份。
 
     let chained_binding = single_method_call_local_binding(second)?;
     if use_index.count_uses_in_suffix(stmt_base + 3, chained_binding) != 0 {
+        // 候选拒绝[SemanticBarrier:Lifetime]：链中间值在第二次调用后仍被读取，压入 receiver 会删除该共享 local。
         return try_chain_local_method_call_stmt_without_dead_alias(stmts, use_index, stmt_base);
     }
 
@@ -53,6 +57,7 @@ fn try_chain_local_method_call_stmt_without_dead_alias(
     };
     let chained_binding = single_method_call_local_binding(first)?;
     if use_index.count_uses_in_suffix(stmt_base + 2, chained_binding) != 0 {
+        // 候选拒绝[SemanticBarrier:Lifetime]：`local x=a:b(); x:c(); use(x)` 不能压成链后删除仍存活的 `x`。
         return None;
     }
     Some((
@@ -74,6 +79,8 @@ fn single_method_call_local_binding(stmt: &AstStmt) -> Option<AstBindingRef> {
     if !matches!(local_decl.values[0], AstExpr::MethodCall(_)) {
         return None;
     }
+    // 证明缺陷[PotentialUnsoundness:Lifetime]：这里只检查 attr，未拒绝 PhysicalRoot；链化会把原本活到 block 末的 local 提前释放，弱表/`__gc` 可观察。
+    // 证明缺陷[PotentialPolicyViolation]：DebugHinted 的源码身份也会被无条件删去。
     Some(local_decl.bindings[0].id)
 }
 
@@ -108,6 +115,7 @@ fn chain_local_method_call_stmt(
         || use_index.count_uses_in_range(second_index, second_index + 1, local_decl.bindings[0].id)
             != 1
     {
+        // 候选拒绝[SemanticBarrier:EvalCount]：第二句必须恰好把同一快照用作唯一 receiver；额外 use 不能随链化消失。
         return None;
     }
 

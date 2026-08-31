@@ -63,7 +63,11 @@ pub(super) fn try_wrap_missing_collective_suffix(
         end += next_offset + 1;
     }
 
-    if end + 1 != block.stmts.len() || !suffix_is_safe_to_wrap(&block.stmts[start..]) {
+    if end + 1 != block.stmts.len() {
+        // 候选拒绝[SemanticBarrier:Scope]：非终端区间包进 `do` 会让其中 local 在后续语句前离开作用域；例如后缀外 `use(local_from_range)` 将失去绑定。
+        return false;
+    }
+    if !suffix_is_safe_to_wrap(&block.stmts[start..]) {
         return false;
     }
 
@@ -84,17 +88,29 @@ fn collective_candidate(missing: &MissingGlobals) -> Option<(AstGlobalAttr, BTre
             missing.const_.iter().cloned().collect(),
         )),
         (false, true) => Some((AstGlobalAttr::None, missing.none.iter().cloned().collect())),
-        _ => None,
+        _ => {
+            // 候选拒绝[ProofIncomplete]：可写与 const 缺失名混合时，一个 wildcard gate 无法表达两种属性；尚未实现双层最小 gate/逐名声明的 canonical 代价证明。
+            None
+        }
     }
 }
 
 fn suffix_is_safe_to_wrap(stmts: &[AstStmt]) -> bool {
-    stmts.iter().all(|stmt| {
-        !matches!(
-            stmt,
-            AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Break | AstStmt::Continue
-        )
-    })
+    if stmts
+        .iter()
+        .any(|stmt| matches!(stmt, AstStmt::Goto(_) | AstStmt::Label(_)))
+    {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：外部 goto 可能跳入新增 global gate/local 作用域，或 suffix 内跳转跨越新边界；没有全 block 跳转配对证明时不能包 `do`。
+        return false;
+    }
+    if stmts
+        .iter()
+        .any(|stmt| matches!(stmt, AstStmt::Break | AstStmt::Continue))
+    {
+        // 候选拒绝[ProofIncomplete]：`do` 本身不拥有 loop-control，直接 break/continue 很可能可保留；当前缺少 goto-syntax-safety/owner 联合证明，整类保守拒绝。
+        return false;
+    }
+    true
 }
 
 fn collect_declared_bindings(stmts: &[AstStmt]) -> Vec<AstLocalBinding> {

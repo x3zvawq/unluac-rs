@@ -469,6 +469,7 @@ fn collect_plans(
         .iter()
         .any(|stmt| matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_)))
     {
+        // 分析停用[ProofIncomplete]：当前 promotion 只有结构化作用域后缀事实，没有 label/goto 的 reaching-def 与声明可见区间；应接入 CFG dominance 后按可证明区间继续提升。
         return Vec::new();
     }
 
@@ -501,15 +502,18 @@ fn collect_plans(
             continue;
         };
         if inherited.contains_key(&root_temp) || reserved_temps.contains(&root_temp) {
+            // 候选拒绝[ConvergenceGuard]：该 temp 已由祖先或本 block 的既有 plan 认领；再次建 plan 会产生重复声明或冲突映射。
             continue;
         }
         if temp_touches.touches_before(decl_index, root_temp) {
+            // 候选拒绝[ProofIncomplete]：候选定义前已有同 temp touch，但当前线性索引没有 reaching-def/循环迭代事实，无法证明从此处分裂源码 binding 仍覆盖全部路径。
             continue;
         }
         // 目标 temp 自己又出现在 RHS 里时，这条赋值表达的是“沿用同一状态槽位继续更新”，
         // 不能在 locals pass 里把它误提升成新的 block-local。否则像 loop carried state
         // 或分支内的状态写回，会被拆成 `local next = step(state)`，原状态槽位反而失去写回。
         if stmt_self_updates_temp(stmt, root_temp) {
+            // 候选拒绝[SemanticBarrier:Lifetime]：`while c do t = t + 1 end; return t` 若在循环体新建 local，会丢失每轮对外层状态 t 的写回。
             continue;
         }
 
@@ -531,6 +535,7 @@ fn collect_plans(
         // 别名扩张后的任一 temp 仍被外层读取时，整个组都不能在子作用域提升；
         // 只检查 root 会让内层 local 吞掉外层 loop state 的别名。
         if group.iter().copied().any(outer_uses_temp) {
+            // 候选拒绝[SemanticBarrier:Scope]：`while c do t = next end; return t` 若在循环体声明 t 的替代 local，循环外仍会读取未写回的旧 binding。
             continue;
         }
 
@@ -540,6 +545,8 @@ fn collect_plans(
                 .iter()
                 .any(|temp| ctx.identity_sensitive_temps.contains(temp))
         {
+            // 候选拒绝[SemanticBarrier:Capture/Resource]：`f` 引用捕获 t0、move 后 `g` 捕获 t1、再覆盖 t0 时，缺同一 trusted home 却合并会让 f/g 错误共享 cell；TBC 同理会更换 close owner。
+            // 候选拒绝[ProofIncomplete]：该 blanket 也包含按值 capture 与无 alias 的单节点组；应按 capture kind、组大小与实际 home 收窄。
             continue;
         }
         let sticky_local = home_slot.and_then(|slot| sticky_slots.get(&slot).copied());
@@ -564,6 +571,7 @@ fn collect_plans(
             });
 
         if sticky_local.is_none() && !force_call_root_local && touching_stmt_indices.is_empty() {
+            // 候选拒绝[LayerBoundary]：零后续 touch 的匿名 temp 属于 dead-temps 的 effect-preserving 删除职责，locals 不把死 SSA 壳固化为 local。
             continue;
         }
         if sticky_local.is_none()
@@ -573,6 +581,7 @@ fn collect_plans(
                 .chain(touching_stmt_indices.iter().copied())
                 .all(|index| stmt_temp_reads[index].is_disjoint(&group))
         {
+            // 候选拒绝[LayerBoundary]：只有写 touch、没有表达式读取且无 debug/capture/call-root 身份的链交给 dead-temps 清理。
             continue;
         }
         if sticky_local.is_none() && !force_call_root_local {
@@ -592,6 +601,8 @@ fn collect_plans(
                     &block.stmts[first_touch_index.expect("single touch must exist")],
                 ))
             {
+                // 候选拒绝[PolicyBoundary]：只在控制头消费一次的匿名 temp 保持低密度展示；这不是运行语义边界。
+                // 候选拒绝[LayerBoundary]：单次 global table-base/string call-arg seed 由 table-constructors 或 temp-inline 的具体消费站点收敛。
                 continue;
             }
             if touching_stmt_indices
@@ -599,6 +610,7 @@ fn collect_plans(
                 .copied()
                 .any(|stmt_index| stmt_contains_nested_nonlocal_control(&block.stmts[stmt_index]))
             {
+                // 候选拒绝[ProofIncomplete]：候选 touch 位于含 nested exit/control 的语句时，当前顶层索引缺少必达路径与声明支配事实；应复用结构化 CFG exit summary。
                 continue;
             }
         }
@@ -670,10 +682,12 @@ fn collect_plans(
         for temp in merge_temps {
             // 分支合流也不能在子作用域重新声明外层仍在使用的状态 temp。
             if outer_uses_temp(temp) {
+                // 候选拒绝[SemanticBarrier:Scope]：分支后的 temp 若仍由外层读取，在子 block 前声明替代 local 会让该读取继续观察旧 binding。
                 continue;
             }
             let home_slot = facts.trusted_temp_home_slot(temp);
             if home_slot.is_none() && ctx.identity_sensitive_temps.contains(&temp) {
+                // 候选拒绝[ProofIncomplete]：单个 branch result 被 capture/TBC 观察但缺 trusted home 时，当前没有 cell/close-owner provenance；按值 capture 应再按快照点证明后放行。
                 continue;
             }
             let mut allocator = PlanAllocator {
@@ -757,11 +771,16 @@ fn collect_promotion_group(
         let future_stmt = &block.stmts[future_index];
         let alias = alias_temp_for_group(future_stmt, &temps).filter(|alias_temp| {
             let alias_slot = facts.home_slot(*alias_temp);
+            // 证明缺陷[PotentialUnsoundness:ValueFlow]：raw home 任一端缺失时仍会吸收 alias；`while t1(phi home unknown) do t0=next(); t1=t0; use(t1) end` 会删掉回写并让下轮 condition 继续读旧 t1。
             let same_slot = root_slot
                 .zip(alias_slot)
                 .is_none_or(|(root, alias)| root == alias);
             let slot_is_available = root_slot.is_some()
                 || alias_slot.is_none_or(|slot| !sticky_slots.contains_key(&slot));
+            // 候选拒绝[ConvergenceGuard]：已认领或已在组内的 alias 不能重复加入同一/另一 promotion plan。
+            // 候选拒绝[SemanticBarrier:Lifetime]：两个已知不同 home 的 move 是独立 GC root；合并后覆盖 source 会让 alias 对象提前不可达。
+            // 候选拒绝[SemanticBarrier:Capture]：root home 未知而 alias home 已绑定 sticky closure cell 时，吸收 alias 会把此前捕获的 cell 改写成 root 身份。
+            // 候选拒绝[SemanticBarrier:ValueFlow]：`next=f(carried); carried=next` 中 alias 在 root 定义前已被读取；删除写回会让下一轮继续读取入口 seed。
             !is_reserved(*alias_temp)
                 && !temps.contains(alias_temp)
                 && same_slot
@@ -949,9 +968,11 @@ fn rewrite_plan_anchor_stmt(
     let values = match plan.init {
         PromotionInit::FromAssign => {
             let HirStmt::Assign(assign) = stmt else {
+                // 证明缺陷[InvariantMismatch]：accepted FromAssign plan 若与冻结 anchor 失配会静默不发射初始化、随后仍删除原语句；这里应 assert plan/anchor 不变量。
                 return None;
             };
             let [HirLValue::Temp(_temp)] = assign.targets.as_slice() else {
+                // 证明缺陷[InvariantMismatch]：accepted FromAssign plan 若不再是单 temp target 会静默丢掉原赋值；这里应 assert matcher 与应用阶段形状一致。
                 return None;
             };
 

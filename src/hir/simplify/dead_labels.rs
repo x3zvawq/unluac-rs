@@ -37,6 +37,9 @@ struct DeadLabelPass<'a> {
 impl HirRewritePass for DeadLabelPass<'_> {
     fn rewrite_block(&mut self, block: &mut crate::hir::common::HirBlock) -> bool {
         let original_len = block.stmts.len();
+        // 候选拒绝[SemanticBarrier:ControlFlow]：`goto L; ::L::` 中仍被引用的 label
+        // 是跳转目标；删除它会生成悬空 goto，并失去原控制流目的地。
+        // 证明缺陷[PotentialUnsoundness:Resource]：接受删除只查 goto 引用，未保护 `label.tbc_barriers`；close-scopes 拒绝 active/inactive/active region 后，本轮删掉这些无 goto label 会让下一 fixed-point 丢失 TBC active-set 证据并错误扩大 scope。
         block.stmts.retain(
             |stmt| !matches!(stmt, HirStmt::Label(label) if !self.referenced.contains(&label.id)),
         );

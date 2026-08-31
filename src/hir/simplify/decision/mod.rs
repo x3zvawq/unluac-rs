@@ -59,6 +59,7 @@ impl ExprRewritePass for DecisionExprPass {
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut changed = false;
         if let HirExpr::Decision(decision) = expr
+            // 候选拒绝[ProofIncomplete]：循环 Decision 缺少可物化为结构化 loop 的 owner/fact，直接递归展开会重复求值并且不终止。
             && !decision_has_cycles(decision)
             && let Some(replacement) = collapse_condition_decision_expr(decision)
         {
@@ -95,6 +96,7 @@ pub(super) enum ResolvedDecisionTarget {
 }
 
 fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
+    // 候选拒绝[ProofIncomplete]：循环 Decision 缺少可物化为结构化 loop 的 owner/fact，不能用递归树化代替控制流证明。
     // 循环 DAG 目前只允许“原样保留为 Decision”，不能继续走 value-collapse /
     // known-test specialize 这条树化路径。否则会把同一条环上的节点反复递归展开，
     // 最后在 simplify 阶段自己把栈打穿。
@@ -111,6 +113,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
         let mut node = nodes[index].clone();
         let mut node_changed = false;
 
+        // 候选拒绝[SemanticBarrier:EvalCount]：父子同为 `f()` 时跳过子 test 会把两次调用缩成一次。
         if let HirDecisionTarget::Node(child_ref) = &node.truthy
             && nodes
                 .get(child_ref.index())
@@ -125,6 +128,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             node_changed |= resolved;
         }
 
+        // 候选拒绝[SemanticBarrier:EvalCount]：父子同为 `f()` 时跳过子 test 会把两次调用缩成一次。
         if let HirDecisionTarget::Node(child_ref) = &node.falsy
             && nodes
                 .get(child_ref.index())
@@ -139,6 +143,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             node_changed |= resolved;
         }
 
+        // 候选拒绝[SemanticBarrier:EvalCount]：即使 truthiness 已知，删除 `{ f() }` test 也会漏掉字段表达式中的一次 `f()`。
         if let Some(constant_truthy) = expr_truthiness(&node.test)
             && expr_is_discard_safe(&node.test)
         {
@@ -155,6 +160,7 @@ fn reduce_decision_expr(decision: &HirDecisionExpr) -> Option<ReducedDecision> {
             continue;
         }
 
+        // 候选拒绝[SemanticBarrier:EvalCount]：两臂相同也不能删除 `f()` test，否则原来必达的一次调用消失。
         if node.truthy == node.falsy && expr_is_discard_safe(&node.test) {
             replacements[node_ref.index()] = Some(resolve_target_in_node_context(
                 &replacements,
@@ -312,6 +318,7 @@ fn remap_target(
 }
 
 pub(in crate::hir) fn collapse_value_decision_expr(decision: &HirDecisionExpr) -> Option<HirExpr> {
+    // 候选拒绝[ProofIncomplete]：循环 Decision 缺少结构化 loop owner/fact，有限 `and/or` 表达式不能直接承载回边。
     if decision_has_cycles(decision) {
         return None;
     }
@@ -589,6 +596,7 @@ fn combine_value_expr(
             {
                 Some(logical_or(logical_and(subject.negate(), rhs), lhs))
             } else {
+                // 候选拒绝[LayerBoundary]：一般 Lua 三元值不能总由单个 `and/or` 精确承载；保留 Decision 交给 eliminate-decisions 原位物化。
                 None
             }
         }
@@ -634,8 +642,13 @@ fn normalize_collapsed_target(
     target: CollapsedValueTarget,
 ) -> CollapsedValueTarget {
     match target {
-        CollapsedValueTarget::Expr(expr) if &expr == subject && expr_is_repeatable(subject) => {
-            CollapsedValueTarget::CurrentValue
+        CollapsedValueTarget::Expr(expr) if &expr == subject => {
+            if expr_is_repeatable(subject) {
+                CollapsedValueTarget::CurrentValue
+            } else {
+                // 候选拒绝[SemanticBarrier:EvalCount]：把两次同形 `f()` 归一成 CurrentValue 会把后一次调用错误复用为前一次结果。
+                CollapsedValueTarget::Expr(expr)
+            }
         }
         other => other,
     }
@@ -644,6 +657,7 @@ fn normalize_collapsed_target(
 pub(in crate::hir) fn collapse_condition_decision_expr(
     decision: &HirDecisionExpr,
 ) -> Option<HirExpr> {
+    // 候选拒绝[ProofIncomplete]：循环 Decision 需要前层提供 loop owner，条件表达式递归展开无法保持回边与求值次数。
     if decision_has_cycles(decision) {
         return None;
     }
@@ -819,6 +833,7 @@ fn combine_condition_expr(subject: HirExpr, truthy: HirExpr, falsy: HirExpr) -> 
             logical_and(falsy_guard, falsy),
         ));
     }
+    // 候选拒绝[ProofIncomplete]：非稳定条件/分支需要 eliminate-decisions 提供条件前缀物化，当前纯表达式通道无法只求值选中臂一次。
     None
 }
 

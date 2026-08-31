@@ -168,11 +168,13 @@ impl InlineCandidate {
         // 生命周期证据。编译器内部 for 槽已经在 Transformer 归一化时排除，因而这里
         // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
+            // 候选拒绝[PolicyBoundary]：DebugHinted 是已知源码 local 身份，内联会抹掉名字与源码生命周期证据。
             AstLocalOrigin::DebugHinted => false,
             AstLocalOrigin::PhysicalRoot => {
                 // 物理根若只是紧邻普通调用的全局 callee，调用帧会在参数求值期间继续
                 // 持有同一函数值；把前置别名收回 callee 位不会缩短 GC 根，也不会改变
                 // callee-before-argument 的求值顺序。其它物理根仍必须保留原声明。
+                // 候选拒绝[SemanticBarrier:Lifetime]：除紧邻 global callee 外，弱表/`__gc` 可观察物理 root 因内联而提前失活。
                 matches!(policy, InlinePolicy::AdjacentCallResultCallee)
                     && is_raw_global_alias_expr(expr)
             }
@@ -252,10 +254,19 @@ fn inline_candidate_from_local_decl(
     let [value] = local_decl.values.as_slice() else {
         return None;
     };
-    if binding.attr != AstLocalAttr::None {
-        return None;
+    match binding.attr {
+        AstLocalAttr::None => {}
+        AstLocalAttr::Close => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：内联 `<close>` 会删除离开作用域时的关闭动作。
+            return None;
+        }
+        AstLocalAttr::Const => {
+            // 候选拒绝[PolicyBoundary]：`<const>` 的声明身份按源码保真策略保留；当前变换并不需要靠它阻止运行时不等价。
+            return None;
+        }
     }
     match binding.id {
+        // 分析停用[LayerBoundary]：原生 TempId 的 producer/use 与 capture 生命周期只由 HIR temp-inline 证明。
         AstBindingRef::Temp(_) => None,
         AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => Some((
             InlineCandidate {

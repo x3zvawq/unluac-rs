@@ -128,6 +128,9 @@ fn collapse_repeat_tail_temp_updates(
         let between_mentions = super::reads::collect_binding_mentions_by_stmt(between);
         let condition_mentions = super::reads::collect_binding_mentions_in_expr(&repeat_stmt.cond);
         let last_next_mention = last_mentions.get(&next_binding).copied().unwrap_or(index);
+        // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/outer use、无可信 home 或重复 write/use 会让 next 与 state 代表可区分 epoch/root。
+        // 候选拒绝[SemanticBarrier:EvalOrder]：between 读取旧 state、prefix 提前写 state 或存在 early transfer 时，直接写 state 会改变读取/出口顺序。
+        // 候选拒绝[ProofIncomplete]：between 非空且异槽、cleanup/Decision、或 label 区间目前缺路径与 root-lifetime 证明。
         if reads.single_read() != Some(state_binding)
             || captured_locals.contains(&state)
             || !local_available_before(block, index, state, inherited_locals)
@@ -375,6 +378,8 @@ fn find_fold(
     let body = loop_body(stmt)?;
     let (writeback, prefix) = body.stmts.split_last()?;
     let (carried, next) = exact_local_writeback(writeback)?;
+    // 候选拒绝[SemanticBarrier:Lifetime]：loop 后仍活跃、capture/outer use、异槽或资源 identity 会观察 carried/next 的独立 epoch。
+    // 候选拒绝[ProofIncomplete]：prefix 中嵌套 loop/continue/goto/cleanup 被 blanket 拒绝；需 path-complete exit/write facts。
     if carried == next
         || last_mentions.get(&carried).copied() != Some(stmt_index)
         || last_mentions.get(&next).copied() != Some(stmt_index)
@@ -407,6 +412,8 @@ fn find_fold(
             || stmts_mention_local(&prefix[seed_index + 1..], carried)
             || !stmts_contain_terminal_exit(&prefix[seed_index + 1..])
         {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：seed 后若并非由 terminal exit 截断，提前写 carried 会让原本未 writeback 的路径观察新值。
+            // 候选拒绝[SemanticBarrier:Lifetime]：seed 前读 next 或 seed 后读旧 carried 会因 binding 合并改读另一 epoch。
             continue;
         }
         let mut reads = BindingReadCollector::default();
@@ -521,6 +528,7 @@ fn stmt_contains_terminal_exit(stmt: &HirStmt) -> bool {
 }
 
 fn apply_fold(stmt: &mut HirStmt, fold: LoopUpdateFold, promotion_facts: &mut ProtoPromotionFacts) {
+    // 证明缺陷[InvariantMismatch]：caller 在本函数提前返回时仍记 changed=true；find/apply 形状漂移会静默漏改并污染 fixed-point 信号。
     let Some((body, repeat_cond)) = loop_body_mut(stmt) else {
         return;
     };

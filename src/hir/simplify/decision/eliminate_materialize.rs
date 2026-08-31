@@ -799,6 +799,7 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr) -> bool {
                 *expr = replacement;
                 true
             } else {
+                // 候选拒绝[ProofIncomplete]：条件位置尚无 statement-prefix 物化通道，非稳定或循环 Decision 只能暂留，需由前层补 loop owner 或本 pass 抽取条件前缀。
                 false
             }
         }
@@ -889,6 +890,7 @@ struct EliminableDecisionCollector {
 
 impl HirVisitor for EliminableDecisionCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
+        // 候选拒绝[ProofIncomplete]：循环 Decision 不能进入递归物化；缺少把回边映射为结构化 loop 的 owner/fact。
         self.found |=
             matches!(expr, HirExpr::Decision(decision) if !super::decision_has_cycles(decision));
     }

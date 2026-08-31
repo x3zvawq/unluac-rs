@@ -36,16 +36,20 @@ pub(super) fn candidate_temps(
 
     let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block);
     let else_summary = summarize_block_fallthrough_assignments(else_block);
+    // 证明缺陷[PotentialUnsoundness:ValueFlow]：summary 只证明两臂“曾写入”，未排除 condition/首次写前读取；`while t do if t then t=1 else t=2 end; use(t) end` 会在体内接受并把 if condition 改成读取新建的 nil local。
     let Some(common_temps) =
         intersect_fallthrough_assignment_sets([then_summary.as_ref(), else_summary.as_ref()])
     else {
+        // 候选拒绝[ProofIncomplete]：两臂任一含当前 summary 不支持的 loop/SETLIST/nested-if-without-else 时整项放弃；应补 must-def/fallthrough CFG 摘要。
         return Vec::new();
     };
 
     common_temps
         .into_iter()
         .filter(|temp| !is_reserved(*temp))
+        // 候选拒绝[SemanticBarrier:Lifetime]：`t=obj; if c then t=a else t=b end; GC` 若在 if 前另建 local，旧 t 物理槽不再按原时点覆盖，弱表/`__gc` 可观察旧对象延寿。
         .filter(|temp| !temp_touches.touches_before(stmt_index, *temp))
+        // 候选拒绝[LayerBoundary]：合流后没有 touch 的 branch temp 是 dead-temps 的删除候选，不应物化为空 local。
         .filter(|temp| temp_touches.touches_after(stmt_index + 1, *temp))
         .collect()
 }
@@ -99,6 +103,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
                 })
                 .collect(),
         }),
+        // 候选拒绝[ProofIncomplete]：SETLIST 本身不改 temp binding，但当前 summary 未证明其异常/控制效果后仍可继续收集 must-def；应接入语句 effect 摘要。
         HirStmt::TableSetList(_) => None,
         HirStmt::Return(_) | HirStmt::Goto(_) | HirStmt::Break | HirStmt::Continue => {
             Some(FallthroughSummary {
@@ -107,6 +112,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
             })
         }
         HirStmt::If(if_stmt) => {
+            // 候选拒绝[ProofIncomplete]：nested if 缺 else 时尚未计算其 fallthrough must-def，不能因为局部路径写入就宣称外层每条合流路径都有值。
             let else_block = if_stmt.else_block.as_ref()?;
             let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block)?;
             let else_summary = summarize_block_fallthrough_assignments(else_block)?;
@@ -120,6 +126,7 @@ fn summarize_stmt_fallthrough_assignments(stmt: &HirStmt) -> Option<FallthroughS
             })
         }
         HirStmt::Block(block) => summarize_block_fallthrough_assignments(block),
+        // 候选拒绝[ProofIncomplete]：loop 尚无 fallthrough 与 must-def 摘要；应复用 carried-locals 的结构化 exit 分析后继续扫描后缀。
         HirStmt::While(_)
         | HirStmt::Repeat(_)
         | HirStmt::NumericFor(_)

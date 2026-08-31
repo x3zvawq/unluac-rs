@@ -20,6 +20,7 @@ pub(in crate::ast::readability) fn apply(
     context: ReadabilityContext,
 ) -> bool {
     if !context.target.caps.global_decl {
+        // 分析停用[TargetConstraint]：目标方言没有 `global` 声明语法，整个 pass 不得生成不可编译节点。
         return false;
     }
 

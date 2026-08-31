@@ -98,11 +98,15 @@ impl AstRewritePass for BranchPrettyPass {
 
 fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
     let len = repeat_stmt.body.stmts.len();
-    if len < 2
-        || repeat_stmt.body.stmts[..len - 2]
-            .iter()
-            .any(stmt_contains_single_pass_forbidden_nodes)
+    if len < 2 {
+        return false;
+    }
+    if repeat_stmt.body.stmts[..len - 2]
+        .iter()
+        .any(stmt_contains_single_pass_forbidden_nodes)
     {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：prefix 中较早的 `continue` 原本直接进入旧 latch；折叠后会额外求值尾部 G/B，改变控制路径与副作用。
+        // 候选拒绝[ProofIncomplete]：当前 helper 不区分嵌套真实循环的 continue owner；嵌套 continue 本可不影响外层 latch，需消费显式 loop-owner 事实。
         return false;
     }
     let [AstStmt::If(continue_if), AstStmt::If(break_if)] = &repeat_stmt.body.stmts[len - 2..]
@@ -119,6 +123,7 @@ fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
 
     let continued = negate_guard_condition(continue_if.cond.clone());
     if continued == repeat_stmt.cond {
+        // 候选拒绝[PolicyBoundary]：折叠会生成与原 latch 重复的条件，只增加源码复杂度而无可读性收益。
         return false;
     }
     let broken = break_if.cond.clone();
@@ -178,9 +183,14 @@ fn single_pass_stmt_flow(stmt: &AstStmt) -> Option<SinglePassFlow> {
         }
         AstStmt::DoBlock(block) => {
             let flow = single_pass_block_flow(block)?;
+            // 候选拒绝[ProofIncomplete]：当前 single-pass 证明不把 do 内 break 映射回外层 fence owner；需显式 break-owner/作用域事实后才能放行。
             (!flow.contains_break).then_some(flow)
         }
-        AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => None,
+        // 候选拒绝[SemanticBarrier:ControlFlow]：continue/goto/label 有独立 owner/入口，
+        // 不能按当前 repeat 的单次 break fence 重写。
+        AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => None,
+        // 候选拒绝[LayerBoundary]：Error 是必须保留的前层诊断。
+        AstStmt::Error(_) => None,
         AstStmt::LocalDecl(_)
         | AstStmt::GlobalDecl(_)
         | AstStmt::Assign(_)
@@ -202,6 +212,7 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
         }
 
         let Some(stmt_flow) = single_pass_stmt_flow(stmt) else {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：当前子树含 goto/continue/label 时不能用线性后缀传播模型重写；候选拒绝[LayerBoundary]：前层诊断必须原位保留。
             return false;
         };
         if !stmt_flow.contains_break {
@@ -210,14 +221,19 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
         }
 
         let AstStmt::If(if_stmt) = stmt else {
+            // 候选拒绝[ProofIncomplete]：当前证明只会把 break 所在的 if 分配给唯一后缀；缺少其它复合语句的精确路径 owner 分析。
             return false;
         };
         let Some(then_flow) = single_pass_block_flow(&if_stmt.then_block) else {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：then 内含未归属到本 repeat 的
+            // continue/goto/label；候选拒绝[LayerBoundary]：Error 诊断不得被重建吞掉。
             return false;
         };
         let else_flow = match &if_stmt.else_block {
             Some(else_block) => {
                 let Some(flow) = single_pass_block_flow(else_block) else {
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：else 内未归属的非局部控制不能
+                    // 进入线性 fence；候选拒绝[LayerBoundary]：Error 必须原位保留。
                     return false;
                 };
                 flow
@@ -225,11 +241,14 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
             None => FALLTHROUGH_FLOW,
         };
         if then_flow.falls_through && else_flow.falls_through {
+            // 候选拒绝[ProofIncomplete]：两臂互斥，复制 tail 不会增加单条运行路径的求值
+            // 次数；当前算法只是不具备共享 continuation 的无复制表示与成本模型。
             return false;
         }
 
         if then_flow.falls_through {
             if tail_is_nonempty && block_requires_scope_barrier(&if_stmt.then_block) {
+                // 候选拒绝[SemanticBarrier:Scope/Lifetime]：把后缀塞进含 local/global 的 arm 会延长声明、`<close>` 或 closure root 生命周期。
                 return false;
             }
             if !single_pass_block_is_foldable(&if_stmt.then_block, tail_is_nonempty) {
@@ -242,6 +261,7 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
         if let Some(else_block) = &if_stmt.else_block {
             let else_tail_is_nonempty = else_flow.falls_through && tail_is_nonempty;
             if else_tail_is_nonempty && block_requires_scope_barrier(else_block) {
+                // 候选拒绝[SemanticBarrier:Scope/Lifetime]：把后缀塞进 else 的 local/global 作用域会扩大声明可见性并推迟资源退出。
                 return false;
             }
             if !single_pass_block_is_foldable(else_block, else_tail_is_nonempty) {
@@ -336,7 +356,11 @@ fn stmt_contains_single_pass_forbidden_nodes(stmt: &AstStmt) -> bool {
             block_contains_single_pass_forbidden_nodes(&generic_for.body)
         }
         AstStmt::DoBlock(block) => block_contains_single_pass_forbidden_nodes(block),
-        AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => true,
+        // 分析停用[ProofIncomplete]：嵌套真实循环的 continue 不属于外层 repeat，本 blanket
+        // 扫描缺少 loop owner；goto/label 则需保留精确入口事实后才能重建 single-pass fence。
+        AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) => true,
+        // 分析停用[LayerBoundary]：Error 是前层诊断，不参与展示层控制重建。
+        AstStmt::Error(_) => true,
         AstStmt::LocalDecl(_)
         | AstStmt::GlobalDecl(_)
         | AstStmt::Assign(_)
@@ -356,6 +380,7 @@ fn merge_exact_nested_if(if_stmt: &mut AstIf) -> bool {
         || inner.else_block.is_some()
         || block_contains_label_or_goto(&inner.then_block)
     {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：存在 else 时 `A and B` 不能表达两层独立分支；label/goto 还可从外部进入被删除的内层 block。
         return false;
     }
 
@@ -461,14 +486,20 @@ fn fold_constant_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
 
 fn constant_if_has_protected_nodes(if_stmt: &AstIf) -> bool {
     let else_block = if_stmt.else_block.as_ref();
+    // 候选拒绝[SemanticBarrier:ControlFlow]：label/goto 可从条件壳外进入 arm，删除 Boolean if 会删除合法入口或改变目标。
     block_contains_label_or_goto(&if_stmt.then_block)
         || else_block.is_some_and(block_contains_label_or_goto)
+        // 候选拒绝[ProofIncomplete]：break/continue 目前只按“存在”保护，缺少选中 arm 与精确 loop owner 区分。
         || block_contains_loop_control(&if_stmt.then_block)
         || else_block.is_some_and(block_contains_loop_control)
+        // 候选拒绝[LayerBoundary]：Error 节点是前层失败诊断，readability 不删除其承载外壳。
         || block_contains_diagnostic(&if_stmt.then_block)
         || else_block.is_some_and(block_contains_diagnostic)
+        // 候选拒绝[PolicyBoundary]：方言 global 声明作为源码级编译期证据保留；选中 arm
+        // 可用 do 保持范围、未选 arm 也可删除，因此这不是运行语义不等价证明。
         || block_contains_global_decl(&if_stmt.then_block)
         || else_block.is_some_and(block_contains_global_decl)
+        // 候选拒绝[PolicyBoundary]：debug/physical/local-function/capture 身份即使位于未选 arm 也按项目的源码证据保留策略记账。
         || block_contains_identity_boundary(&if_stmt.then_block)
         || else_block.is_some_and(block_contains_identity_boundary)
 }
@@ -537,6 +568,8 @@ fn block_contains_identity_boundary(block: &AstBlock) -> bool {
 
 fn fold_terminal_guard_return(block: &mut AstBlock, kind: BlockKind) -> bool {
     if !matches!(kind, BlockKind::ModuleBody | BlockKind::FunctionBody) {
+        // 候选拒绝[ProofIncomplete]：普通 nested block 尾部的 return 同样终止函数，但当前
+        // pass 没有携带父级 scope/tail owner，尚未证明提升主体仍留在原 nested 词法域。
         return false;
     }
 
@@ -576,18 +609,29 @@ fn terminal_guard_return_candidate(block: &AstBlock) -> Option<(usize, bool)> {
     let AstStmt::If(if_stmt) = block.stmts.get(if_index)? else {
         return None;
     };
-    if if_stmt.else_block.is_some()
-        || !block_always_terminates(&if_stmt.then_block)
+    // 候选拒绝[LayerBoundary]：带 else 的终止分支由同 pass 的 flatten_terminating_if owner
+    // 消费，terminal-guard 只处理单臂函数尾。
+    if if_stmt.else_block.is_some() {
+        return None;
+    }
+    if !block_always_terminates(&if_stmt.then_block)
         || !matches!(if_stmt.then_block.stmts.last(), Some(AstStmt::Return(_)))
-        // 单独的空 return 没有可提升主体；取反只会与 cleanup 的尾 return 省略来回振荡。
-        || matches!(if_stmt.then_block.stmts.as_slice(), [stmt] if is_empty_return_stmt(stmt))
-        || block_contains_label_or_goto(&if_stmt.then_block)
-        // The ordinary statement loop fences protected constant-if nodes.  Keep the same
-        // boundary here because terminal-guard folding runs after that loop and would
-        // otherwise consume the shell through a second path.
-        || (matches!(if_stmt.cond, AstExpr::Boolean(_))
-            && constant_if_has_protected_nodes(if_stmt))
     {
+        return None;
+    }
+    // 候选拒绝[ConvergenceGuard]：单独空 return 没有可提升主体，取反后会与 cleanup 的
+    // 尾 return 省略来回振荡。
+    if matches!(if_stmt.then_block.stmts.as_slice(), [stmt] if is_empty_return_stmt(stmt)) {
+        return None;
+    }
+    // 候选拒绝[SemanticBarrier:ControlFlow]：label/goto 可从外部进入将被提升的 arm，
+    // 删除 if block 会改变入口与目标词法范围。
+    if block_contains_label_or_goto(&if_stmt.then_block) {
+        return None;
+    }
+    // The ordinary statement loop fences protected constant-if nodes. Keep the same boundary
+    // here because terminal-guard folding runs after that loop and could consume a second path.
+    if matches!(if_stmt.cond, AstExpr::Boolean(_)) && constant_if_has_protected_nodes(if_stmt) {
         return None;
     }
 

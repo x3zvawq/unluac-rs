@@ -18,10 +18,12 @@ pub(crate) fn synthesize_value_decision_expr(decision: &HirDecisionExpr) -> Opti
     }
 
     let refs = collect_refs_from_decision(decision);
+    // 候选拒绝[ResourceLimit]：穷举域目前只接纳 4 个独立引用；后续应改用符号等价或按依赖分区验证。
     if refs.len() > super::MAX_SYNTH_REFS {
         return None;
     }
 
+    // 候选拒绝[ResourceLimit]：抽象环境笛卡尔积超过 4096 时停止综合；后续应避免完整枚举。
     let context = SynthesisContext::new(decision, refs)?;
     let mut memo = BTreeMap::new();
     synthesize_value_node_expr(&context, decision.entry, &mut memo)
@@ -77,6 +79,7 @@ fn choose_best_structured_candidate(
     structured_candidates(subject, truthy, falsy)
         .into_iter()
         .map(normalize_candidate_expr)
+        // 候选拒绝[ProofIncomplete]：有限抽象域当前只能提供筛选反例；错误路径与跨数值表示尚未精确建模，不能据此宣称完整等价证明。
         .filter(|candidate| validate_candidate_for_node(context, node_ref, candidate))
         .min_by_key(expr_cost)
 }
@@ -148,9 +151,7 @@ pub(super) fn validate_candidate_for_node(
 ) -> bool {
     context.environments.iter().all(|env| {
         let decision_value = context.eval_node(node_ref, env);
-        // 当 decision_value 为 None 时，表示原始 Decision 在该环境下会因类型不兼容
-        // （如 nil <= nil）而运行时报错；任何候选表达式在该环境下也同样会报错或产生
-        // 不可达的值，因此这类环境对等价性判定没有区分意义，可以安全跳过。
+        // 模型边界：这里没有对照错误类型；当前 repeatable 安全门使合法候选的求值总是 Some，放宽入口时必须同步补证明。
         let Some(decision_value) = decision_value else {
             return true;
         };

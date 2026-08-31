@@ -80,6 +80,7 @@ fn try_recover_with_receiver_alias(
     if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2
         || use_index.count_uses_in_suffix(stmt_base + 2, field_binding) != 1
     {
+        // 候选拒绝[SemanticBarrier:EvalCount]：receiver 必须只供字段 lookup 与首参各一次，field alias 也只能作为唯一 callee；否则删除 local 会复制/丢失 use。
         return None;
     }
 
@@ -107,9 +108,11 @@ fn try_recover_receiver_alias_direct_method_call(
     };
     let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
     if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2 {
+        // 候选拒绝[SemanticBarrier:EvalCount]：direct 形状仍要求 receiver 恰好用于 lookup 和首参，额外 use 不能随 alias 删除。
         return None;
     }
     if !is_context_safe_expr(receiver_expr) {
+        // 候选拒绝[ProofIncomplete]：相邻 `local r=expr; r.m(r)` 与 `expr:m()` 都只求值一次且事件次序一致；当前纯度白名单缺少必须排除任意 expr 的具体反例，可扩展为基于事件序列的证明。
         return None;
     }
 
@@ -137,6 +140,8 @@ fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> 
     {
         return None;
     }
+    // 证明缺陷[PotentialUnsoundness:Lifetime]：未检查 PhysicalRoot；删除 alias 会把本应活到 block 末的 root 缩短到调用结束，弱表/`__gc` 可观察。
+    // 证明缺陷[PotentialPolicyViolation]：未检查 DebugHinted，带调试身份的源码 local 也会被删除。
     Some((local_decl.bindings[0].id, &local_decl.values[0]))
 }
 
@@ -284,6 +289,7 @@ where
                 return Some(rewritten);
             }
             if !expr_prefix_is_stable(&binary.lhs, mutable_snapshots) {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：把 alias initializer 搬到 rhs 会越过 lhs；`f()` 或可变快照读取可改变调用/lookup 顺序与读值。
                 return None;
             }
             binary.rhs = rewrite_method_call_expr_in_order(
@@ -294,6 +300,7 @@ where
             Some(rewritten)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：只搜索必求值的 lhs；若搬入短路 rhs，原先无条件执行的 alias initializer 会变成条件执行。
             logical.lhs = rewrite_method_call_expr_in_order(
                 &logical.lhs,
                 mutable_snapshots,
@@ -309,6 +316,7 @@ where
                 return Some(rewritten);
             }
             if !expr_prefix_is_stable(&call.callee, mutable_snapshots) {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：嵌入某个 arg 前必须越过 callee 求值；调用/lookup 或可变快照不能交换。
                 return None;
             }
             for arg in &mut call.args {
@@ -319,12 +327,14 @@ where
                     return Some(rewritten);
                 }
                 if !expr_prefix_is_stable(arg, mutable_snapshots) {
+                    // 候选拒绝[SemanticBarrier:EvalOrder]：目标位于后续 arg 时，所有前缀 arg 必须无可观察事件且不读取可变快照。
                     return None;
                 }
             }
             None
         }
         AstExpr::MethodCall(call) => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：只搜索 receiver；冒号调用的 method lookup 位于 args 之前，把 alias initializer 搬进 args 会跨越 lookup。
             call.receiver = rewrite_method_call_expr_in_order(
                 &call.receiver,
                 mutable_snapshots,
@@ -348,6 +358,7 @@ where
                 return Some(rewritten);
             }
             if !expr_prefix_is_stable(&access.base, mutable_snapshots) {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：搬入 index 前会跨过 base 求值，必须证明该前缀没有调用/lookup/可变快照读取。
                 return None;
             }
             access.index = rewrite_method_call_expr_in_order(
@@ -373,9 +384,12 @@ where
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
         | AstExpr::VarArg
-        | AstExpr::TableConstructor(_)
         | AstExpr::FunctionExpr(_)
         | AstExpr::Error(_) => None,
+        AstExpr::TableConstructor(_) => {
+            // 候选拒绝[ProofIncomplete]：table 字段有严格的 key/value 与尾部多值顺序；当前没有字段级稳定前缀 walker，故整类拒绝，未来可复用 ordered-event 证明。
+            None
+        }
     }
 }
 
@@ -447,6 +461,7 @@ fn rewrite_single_expr_sink_stmt(
                 .iter()
                 .any(|target| !matches!(target, crate::ast::common::AstLValue::Name(_)))
             {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：Lua 先求值复杂 lvalue 地址再求 RHS；把 alias initializer 移入 RHS 会越过 table/key lookup（如 `t[f()] = alias()`）。
                 return None;
             }
             let mut rewritten = (**assign).clone();

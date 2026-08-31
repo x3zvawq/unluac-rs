@@ -83,6 +83,7 @@ impl HirRewritePass for GenericForIteratorPass<'_> {
 }
 
 fn trim_trailing_nil_iterators(iterator: &mut HirValuePack) -> bool {
+    // 候选拒绝[SemanticBarrier:ValueArity]：`for _ in nil, f() do` 的 fixed nil 位于 open tail 前，删除会把 iterator/state 位置左移。
     if iterator.tail.is_some() {
         return false;
     }
@@ -131,7 +132,9 @@ fn fold_adjacent_nil_iterators(
                                     HirLValue::Temp(expected),
                                     HirExpr::Nil
                                 ) if actual == expected
+                                    // 候选拒绝[SemanticBarrier:Lifetime]：额外读取仍需观察 nil 写入后的 temp，删除 producer 会留下旧值。
                                     && context.use_counts.get(expected) == Some(&1)
+                                    // 候选拒绝[LayerBoundary]：带 debug identity 的目标由 locals/source-binding owner 消费，本 pass 只接管匿名 temp。
                                     && !context
                                         .debug_temps
                                         .get(expected.index())
@@ -207,8 +210,10 @@ fn parameter_pack_can_cross_temp_copy(
         gap.values.fixed.as_slice(),
         gap.values.tail.as_ref(),
     ) else {
+        // 候选拒绝[ProofIncomplete]：非标量 temp copy gap 尚无完整读写集，无法证明 iterator pack 跨越后求值顺序不变。
         return false;
     };
+    // 候选拒绝[ProofIncomplete]：缺少 gap 两端可信 home 时，尚不能证明延后 iterator pack 不会越过同槽快照；应补齐 promotion provenance。
     let (Some(gap_target_slot), Some(gap_source_slot)) = (
         context.facts.trusted_temp_home_slot(*gap_target),
         context.facts.trusted_temp_home_slot(*gap_source),
@@ -223,6 +228,7 @@ fn parameter_pack_can_cross_temp_copy(
             return false;
         };
         if assign.values.tail.is_some() {
+            // 候选拒绝[ProofIncomplete]：跨 gap 的 open pack 尚未建立完整读写集，当前只有 parameter+nil 的稳定值证明。
             return false;
         }
         for target in &assign.targets {
@@ -230,8 +236,12 @@ fn parameter_pack_can_cross_temp_copy(
                 return false;
             };
             let Some(slot) = context.facts.trusted_temp_home_slot(*temp) else {
+                // 候选拒绝[ProofIncomplete]：iterator 目标缺少可信 home，无法排除与 gap copy 同槽；应由 promotion 补 provenance。
                 return false;
             };
+            // 候选拒绝[SemanticBarrier:Lifetime]：多处读取会继续观察已删除的 iterator temp；例如循环后再次返回该 temp。
+            // 候选拒绝[LayerBoundary]：debug temp 是源码 binding，不由 iterator-pack pass 删除。
+            // 候选拒绝[SemanticBarrier:EvalOrder]：同一 home 的两个目标会被顺序覆盖，延后整包会改变 gap 所见快照。
             if context.use_counts.get(temp) != Some(&1)
                 || context
                     .debug_temps
@@ -249,15 +259,18 @@ fn parameter_pack_can_cross_temp_copy(
                 HirExpr::Nil => {}
                 HirExpr::ParamRef(param) => {
                     let Some(slot) = context.facts.trusted_param_home_slot(*param) else {
+                        // 候选拒绝[ProofIncomplete]：参数缺少可信 home，无法证明它与被删目标及 gap copy 不别名。
                         return false;
                     };
                     iterator_source_slots.push(slot);
                 }
+                // 候选拒绝[ProofIncomplete]：非 parameter/nil 值尚无跨 gap 的稳定读取与 effect 证明；应复用表达式读写集分析。
                 _ => return false,
             }
         }
     }
 
+    // 候选拒绝[SemanticBarrier:EvalOrder]：若 gap 读写槽与 iterator source/target 重叠，移动 pack 到 gap 后会改变被复制或被循环读取的值。
     !iterator_target_slots.contains(&gap_target_slot)
         && !iterator_source_slots.contains(&gap_target_slot)
         && !iterator_target_slots.contains(&gap_source_slot)
@@ -267,6 +280,7 @@ fn parameter_pack_can_cross_temp_copy(
 }
 
 fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericFor) -> bool {
+    // 候选拒绝[ProofIncomplete]：已有 open iterator tail 时，matcher 尚未证明前置 targets 与 fixed/open pack 的逐项对应；应扩展 pack provenance。
     if generic_for.iterator.tail.is_some() {
         return false;
     }
@@ -276,6 +290,8 @@ fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericF
         let HirStmt::Assign(assign) = stmt else {
             return false;
         };
+        // 候选拒绝[SemanticBarrier:ValueArity]：非精确宽度或非末尾 open pack 在合并后会采用不同的 Lua 调整规则。
+        // 候选拒绝[PolicyBoundary]：closure producer 保留命名 binding，避免把完整 child body 压成 loop head 内的多行 IIFE。
         if assign.values.exact_result_len() != Some(assign.targets.len())
             || (assign.values.tail.is_some() && index + 1 != assignments.len())
             || assign

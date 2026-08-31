@@ -164,18 +164,21 @@ fn rewrite_branch_state_block(
                 }
             }
             HirStmt::While(while_stmt) => {
+                // 证明缺陷[PotentialUnsoundness:ControlFlow]：这里只把首轮入口 known 带进循环；`local l=t; while c do l=t; use(l); l=u end` 的恢复写在第二轮仍必需，却会被删。
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut while_stmt.body, facts, known.clone(), true);
                 changed |= body_changed;
                 invalidate_written_locals(&mut known, &while_stmt.body);
             }
             HirStmt::Repeat(repeat_stmt) => {
+                // 证明缺陷[PotentialUnsoundness:ControlFlow]：repeat 回边没有参与 known fixed-point，首轮前成立的 local=temp 不能证明每轮入口仍成立。
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut repeat_stmt.body, facts, known.clone(), true);
                 changed |= body_changed;
                 invalidate_written_locals(&mut known, &repeat_stmt.body);
             }
             HirStmt::NumericFor(for_stmt) => {
+                // 证明缺陷[PotentialUnsoundness:ControlFlow]：numeric-for body 的 known 仅来自循环外，未与上一轮 body exit 相交便会提交删除。
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut for_stmt.body, facts, known.clone(), true);
                 changed |= body_changed;
@@ -183,6 +186,7 @@ fn rewrite_branch_state_block(
                 known.remove(&for_stmt.binding);
             }
             HirStmt::GenericFor(for_stmt) => {
+                // 证明缺陷[PotentialUnsoundness:ControlFlow]：generic-for body 的跨迭代 local 状态未建模，入口 duplicate-copy 删除缺少回边证明。
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut for_stmt.body, facts, known.clone(), true);
                 changed |= body_changed;
@@ -217,6 +221,9 @@ fn rewrite_branch_state_block(
 
 impl BranchStateCopyFacts<'_> {
     fn can_remove(&self, local: LocalId, temp: TempId) -> bool {
+        // 候选拒绝[SemanticBarrier:Capture]：local/temp 被闭包捕获时，删写会让闭包继续观察旧 cell/value。
+        // 候选拒绝[SemanticBarrier:Lifetime]：TBC/protected/physical-root 或 temp 非单写时，删除快照会改变资源/值 epoch 的可观察存活期。
+        // 候选拒绝[LayerBoundary]：debug local/temp 的源码身份由 locals/source owner 保留。
         !self.captured_locals.contains(&local)
             && !self.captured_temps.contains(&temp)
             && !self.protected_locals.contains(&local)
@@ -322,6 +329,7 @@ impl HirVisitor for LocalWriteCollector {
 }
 
 fn redundant_parallel_self_copy(assign: &HirAssign) -> bool {
+    // 候选拒绝[ProofIncomplete]：非等宽或 open-tail 并行赋值不能由逐 pair 自复制证明覆盖；需完整 value-pack 对位事实。
     if assign.values.tail.is_some()
         || assign.targets.len() < 2
         || assign.targets.len() != assign.values.fixed.len()

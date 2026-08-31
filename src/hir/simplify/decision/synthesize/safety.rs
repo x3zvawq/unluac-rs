@@ -8,6 +8,7 @@ use crate::hir::common::{HirDecisionExpr, HirDecisionTarget, HirExpr};
 use crate::hir::expr_safety::expr_is_repeatable;
 
 pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr) -> bool {
+    // 候选拒绝[ProofIncomplete]：当前 synthesis 只会证明全树 repeatable；需补候选级 eval-trace 对照，才能接纳未被复制/删除的单次 `f()`/lookup。
     decision.nodes.iter().all(|node| {
         expr_is_synth_safe(&node.test)
             && target_is_synth_safe(&node.truthy)
@@ -16,6 +17,7 @@ pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr) -> bool {
 }
 
 pub(super) fn expr_is_synth_safe(expr: &HirExpr) -> bool {
+    // 候选拒绝[ProofIncomplete]：当前 naturalize 只会证明全树 repeatable；需按候选对照 occurrence，区分被删除的 `f()` 与仍原位单次求值的 `f()`。
     expr_is_repeatable(expr)
 }
 

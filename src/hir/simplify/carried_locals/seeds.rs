@@ -51,6 +51,8 @@ pub(super) fn binding_handoff_seed(stmt: &HirStmt) -> Option<BindingHandoffSeed>
             retained_pairs.push((target.clone(), value.clone()));
             continue;
         };
+        // 候选拒绝[SemanticBarrier:EvalOrder]：同一 temp 在并行 targets 重复出现时最后写胜出，单一 rewrite 会丢失位置语义。
+        // 候选拒绝[ProofIncomplete]：多个 temp 复制同一 source 可能可合并，但需证明后续 writeback 不把这些快照作为独立 epoch 使用。
         if !seen_targets.insert(rewrite.from) || !seen_bindings.insert(rewrite.to) {
             return None;
         }
@@ -69,6 +71,7 @@ pub(super) fn rewrite_binding_handoff_seed(
     stmt: &mut HirStmt,
     retained_pairs: &[(HirLValue, HirExpr)],
 ) -> bool {
+    // 候选拒绝[ConvergenceGuard]：seed parser 已证明当前语句为 Assign；apply 形状不符表示 plan/apply 契约漂移。
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
@@ -131,10 +134,12 @@ pub(super) fn update_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBindin
 }
 
 pub(super) fn rewrite_update_handoff_seed(stmt: &mut HirStmt, carried: CarryBinding) -> bool {
+    // 候选拒绝[ConvergenceGuard]：update seed parser 已证明单 target Assign；apply 失败表示 shape 契约漂移。
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
     let [target] = assign.targets.as_mut_slice() else {
+        // 候选拒绝[ConvergenceGuard]：已解析的 update seed 不应失去唯一 target。
         return false;
     };
     *target = match carried {

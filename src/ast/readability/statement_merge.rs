@@ -124,6 +124,8 @@ fn empty_local_decl_bindings(stmt: &AstStmt) -> Option<&[AstLocalBinding]> {
             .iter()
             .any(|binding| binding.attr != AstLocalAttr::None)
     {
+        // 候选拒绝[ProofIncomplete]：非空声明不属于本规则；相邻空属性声明本可保留每个
+        // binding 的 attr 且中间无求值事件，当前 blanket gate 仍缺目标语法验证后再放宽。
         return None;
     }
     Some(&local_decl.bindings)
@@ -147,6 +149,7 @@ fn merge_adjacent_single_value_local_decls(
             continue;
         };
         if !is_mergeable_adjacent_local_value(value) {
+            // 候选拒绝[PolicyBoundary]：相邻声明合并只接受复杂度不超过 4 的 copy-like RHS，避免把阶段性复杂声明压成难读的并行列表。
             new_stmts.push(stmt);
             index += 1;
             continue;
@@ -165,6 +168,7 @@ fn merge_adjacent_single_value_local_decls(
             if !is_mergeable_adjacent_local_value(next_value)
                 || expr_references_any_binding(next_value, &bindings)
             {
+                // 候选拒绝[SemanticBarrier:Scope]：`local a=x; local b=a` 合成并行声明后 RHS 的 `a` 会解析到外层；候选拒绝[PolicyBoundary]：复杂 RHS 受展示预算限制。
                 break;
             }
             bindings.push(next_binding.clone());
@@ -179,6 +183,8 @@ fn merge_adjacent_single_value_local_decls(
         while bindings.len() >= 2
             && use_index.count_uses_in_suffix(lookahead, bindings.last().unwrap().id) <= 1
         {
+            // 候选拒绝[LayerBoundary]：尾部单次-use binding 留给 inline-exprs 消费；这是
+            // owner 分工而非合并会不等价的证明。
             bindings.pop();
             values.pop();
             lookahead -= 1;
@@ -189,6 +195,9 @@ fn merge_adjacent_single_value_local_decls(
                 .iter()
                 .any(|b| use_index.count_uses_in_suffix(lookahead, b.id) > 1)
         {
+            // 证明缺陷[PotentialUnsoundness:DebugScope]：顺序声明会让较早 local 在后续 RHS
+            // 求值时进入调用者活动局部；合成并行声明后所有 binding 都到 RHS 全部求值后才生效。
+            // `debug.getlocal` 可从后续 lookup 的元方法观察该差异；当前 proof 未排除此类事件。
             new_stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings,
                 values,
@@ -199,6 +208,8 @@ fn merge_adjacent_single_value_local_decls(
             continue;
         }
 
+        // 候选拒绝[PolicyBoundary]：不足两个 multi-use binding 时不生成并行声明；该展示
+        // 密度门不说明顺序合并存在语义差异。
         new_stmts.push(stmt);
         index += 1;
     }
@@ -213,6 +224,7 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
     if forward_gotos.has_backward_goto {
         // backward goto 把当前 block 变成显式 CFG：hoisted temp 可能是回边上的 phi
         // 槽。把声明沉进任一分支会创建不同的词法 local，破坏 label 后读取的值。
+        // 分析停用[SemanticBarrier:ControlFlow]：`::L::; use(t); ...; goto L` 中 hoisted `t` 可能是回边 phi，沉入单一路径会产生不同词法 local。
         return false;
     }
     let mut index = 0;
@@ -228,6 +240,7 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
         let mut lookahead = index + 1;
         while lookahead < block.stmts.len() && !remaining.is_empty() {
             if forward_gotos.has_forward_goto_past_index(lookahead) {
+                // 候选拒绝[SemanticBarrier:Scope]：`goto L; local t; ...; ::L:: use(t)` 若把声明沉到 label 前后，会让跳转进入 local 作用域或改变读取绑定。
                 lookahead += 1;
                 continue;
             }
@@ -278,6 +291,7 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
             if stmt_references_binding_set(&block.stmts[lookahead], &remaining_refs) {
                 // 钉住被引用但无法下沉的 binding：它们的声明必须留在提升位置，
                 // 但其他 binding 仍然可能被下沉到后续语句里。
+                // 候选拒绝[SemanticBarrier:Scope]：当前语句已经读取却无法成为声明 sink 的 binding 必须继续由 hoisted 声明支配。
                 let mut i = 0;
                 while i < remaining.len() {
                     if stmt_references_any_binding(
@@ -438,6 +452,7 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
     let mut start = 0usize;
     while start < pending.len() {
         if use_index.count_uses_in_suffix(suffix_start, pending[start].id) != 0 {
+            // 候选拒绝[SemanticBarrier:Scope]：binding 在候选嵌套语句之后仍被读取，沉入该子 block 会使后缀读取越出词法作用域。
             start += 1;
             continue;
         }
@@ -477,6 +492,7 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
                     .filter(|((index, _), _)| *index != run_start)
                     .map(|((index, owner), end)| (index, owner, end)),
             )
+            // 候选拒绝[SemanticBarrier:ControlFlow/Scope]：header 或多个 arm 同时 mention 的 binding 没有唯一 nested owner，声明必须留在共同支配点。
             .filter(|(_, owner, _)| *owner != NestedSinkOwner::Blocked)
             .map(|(index, _, end)| (index, end));
 
@@ -518,6 +534,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
         .take_while(|binding| use_index.count_uses_in_suffix(suffix_start, binding.id) == 0)
         .count();
     if sinkable_len == 0 {
+        // 候选拒绝[SemanticBarrier:Scope]：所有 pending binding 都在 nested stmt 后仍有 use，沉入子 block 会让后缀读取越出作用域。
         return None;
     }
     let sinkable = &pending[..sinkable_len];
@@ -526,6 +543,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
     match stmt {
         AstStmt::If(if_stmt) => {
             if expr_references_binding_set(&if_stmt.cond, &sinkable_refs) {
+                // 候选拒绝[SemanticBarrier:Scope]：条件先于 arm 执行；把条件读取的 binding 声明沉进 arm 会令该读取失去原绑定。
                 return None;
             }
             let then_refs = block_references_binding_set(&if_stmt.then_block, &sinkable_refs);
@@ -533,7 +551,11 @@ fn try_sink_hoisted_decl_into_nested_stmt(
                 .else_block
                 .as_ref()
                 .is_some_and(|block| block_references_binding_set(block, &sinkable_refs));
-            if then_refs == else_refs {
+            if !then_refs && !else_refs {
+                return None;
+            }
+            if then_refs && else_refs {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：两臂都读取 binding 时声明必须支配整个 if；沉入任一臂都会破坏另一条路径。
                 return None;
             }
 
@@ -551,6 +573,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
         }
         AstStmt::While(while_stmt) => {
             if expr_references_binding_set(&while_stmt.cond, &sinkable_refs) {
+                // 候选拒绝[SemanticBarrier:Scope]：`while t do ... end` 的条件在 body 外且逐轮先求值，声明不能沉入 body。
                 return None;
             }
             let mut rewritten = stmt.clone();
@@ -562,6 +585,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
         }
         AstStmt::Repeat(repeat_stmt) => {
             if expr_references_binding_set(&repeat_stmt.cond, &sinkable_refs) {
+                // 候选拒绝[SemanticBarrier:Scope]：`until t` 与 body 共享外层词法域；把 `t` 声明沉入更窄子块会让条件不可见。
                 return None;
             }
             let mut rewritten = stmt.clone();
@@ -576,6 +600,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
                 || expr_references_binding_set(&numeric_for.limit, &sinkable_refs)
                 || expr_references_binding_set(&numeric_for.step, &sinkable_refs)
             {
+                // 候选拒绝[SemanticBarrier:Scope]：numeric-for header 在循环 binding/body 作用域建立前求值，声明不能沉入 body。
                 return None;
             }
             let mut rewritten = stmt.clone();
@@ -591,6 +616,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
                 .iter()
                 .any(|expr| expr_references_binding_set(expr, &sinkable_refs))
             {
+                // 候选拒绝[SemanticBarrier:Scope]：generic-for iterator 在 body 外求值，沉入 body 会改变 header 的绑定解析。
                 return None;
             }
             let mut rewritten = stmt.clone();
@@ -647,6 +673,7 @@ fn sink_pending_bindings_into_block(
     while index < block.stmts.len() && consumed < pending.len() {
         let remaining = &pending[consumed..];
         if forward_gotos.has_forward_goto_past_index(index) {
+            // 候选拒绝[SemanticBarrier:Scope]：已有 forward goto 跨过此点时新增 local 会制造非法的“跳入 local 作用域”。
             index += 1;
             continue;
         }
@@ -702,7 +729,12 @@ fn single_value_local_decl(
     let [value] = local_decl.values.as_slice() else {
         return None;
     };
-    (binding.attr == AstLocalAttr::None).then_some((binding, value))
+    if binding.attr != AstLocalAttr::None {
+        // 候选拒绝[ProofIncomplete]：`<close>` 在后续 lookup/call 前的注册时点可被
+        // `__close`/GC 观察，但 `<const>` 或无事件后缀存在安全子集；需按 attr 与后续事件拆分。
+        return None;
+    }
+    Some((binding, value))
 }
 
 fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option<AstLocalDecl> {
@@ -720,6 +752,8 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
         .iter()
         .any(|binding| binding.attr != AstLocalAttr::None)
     {
+        // 候选拒绝[TargetConstraint]：`<const>`/`<close>` local 在目标 Lua 中不可在声明后
+        // 普通赋值；该异常 AST 不能用无属性 hoist 规则静默合法化。
         return None;
     }
     if local_decl.bindings.len() != assign.targets.len() || assign.values.is_empty() {
@@ -734,6 +768,7 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
         return None;
     }
     if stmt_references_any_binding_in_assign(assign, &local_decl.bindings) {
+        // 候选拒绝[SemanticBarrier:Scope]：`local x; x = function() return x end` 合成 initializer 后 closure 捕获点的词法绑定会改变。
         return None;
     }
 
@@ -779,6 +814,7 @@ fn try_sink_hoisted_decl_into_stmt(
         .iter()
         .any(|binding| use_index.count_uses_in_range(prior_start, target_index, binding.id) != 0)
     {
+        // 候选拒绝[SemanticBarrier:Scope]：binding 在声明点与赋值点之间已经被读过；下沉后这些读取会落到外层或未声明名字。
         return None;
     }
     if !candidate
@@ -789,9 +825,12 @@ fn try_sink_hoisted_decl_into_stmt(
         return None;
     }
     if stmt_references_any_binding_in_assign(assign, candidate) {
+        // 候选拒绝[SemanticBarrier:Scope]：赋值 RHS 读取候选 binding 时，改成 local initializer 会把读取解析到新声明之前的外层绑定。
         return None;
     }
     if stmt_references_any_binding_in_assign(assign, &pending[assign.targets.len()..]) {
+        // 候选拒绝[ProofIncomplete]：剩余 binding 仍由原 hoisted 声明支配，`local a,b;
+        // a=b` 下沉为 `local b; local a=b` 等价；当前 gate 未利用这一支配事实。
         return None;
     }
     Some(AstLocalDecl {
@@ -831,6 +870,7 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
         if candidate.iter().any(|binding| {
             use_index.count_uses_in_range(prior_start, target_index, binding.id) != 0
         }) {
+            // 候选拒绝[SemanticBarrier:Scope]：候选 binding 在下沉区间已被读取，移动声明会让先前读取失去原 local。
             continue;
         }
         if !candidate
@@ -841,6 +881,7 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
             continue;
         }
         if stmt_references_any_binding_in_assign(assign, candidate) {
+            // 候选拒绝[SemanticBarrier:Scope]：RHS 自引用在 local initializer 中解析到外层，不能与后置赋值等同。
             continue;
         }
         // 只有当所有候选 binding 在此语句之后不再被使用时才允许下沉。
@@ -848,17 +889,22 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
             .iter()
             .any(|b| use_index.count_uses_in_suffix(suffix_start, b.id) != 0)
         {
+            // 候选拒绝[SemanticBarrier:Scope]：候选在赋值后仍活跃，沉入当前位置会缩窄其作用域并破坏后缀读取。
             continue;
         }
         // RHS 不得引用 consumed 切片之后的其他待处理 binding
         // （与前序变体相同的安全检查）。
         let after = &pending[start + target_len..];
         if !after.is_empty() && stmt_references_any_binding_in_assign(assign, after) {
+            // 候选拒绝[ProofIncomplete]：切片后的 binding 仍在原 hoisted 声明中，读取解析
+            // 不变；应证明声明重建顺序后移除此 gate。
             continue;
         }
         // 同样检查 consumed 切片之前的 binding。
         let before = &pending[..start];
         if !before.is_empty() && stmt_references_any_binding_in_assign(assign, before) {
+            // 候选拒绝[ProofIncomplete]：切片前 binding 同样仍由 hoisted 声明支配；
+            // `local a,b; b=a` 是安全子集，当前 gate 缺少重建后支配关系证明。
             continue;
         }
         return Some((

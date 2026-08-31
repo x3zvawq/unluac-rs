@@ -47,6 +47,11 @@ pub(super) fn try_collapse_guarded_local_update(
     let Some(state) = exact_binding_copy(&if_stmt.then_block.stmts, next) else {
         return false;
     };
+    // 候选拒绝[ProofIncomplete]：temp state 尚未接入 local/param 的可用性与声明 owner 证明。
+    // 候选拒绝[SemanticBarrier:Lifetime]：外层仍活跃的 state 或 next 被合并后会让 false-return 路径提前覆盖旧 state。
+    // 候选拒绝[SemanticBarrier:Capture]：捕获任一 binding 时，false path 上 closure 可区分“只写 next”和“已写 state”。
+    // 候选拒绝[LayerBoundary]：debug/TBC/for/raw-home identity 由 identity facts owner 保留。
+    // 候选拒绝[SemanticBarrier:Scope]：initializer 自读 next 时，删除其 local 声明会把读取改指另一 lexical identity。
     if !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
         || state == next_binding
         || matches!(state, CarryBinding::Local(_)) && outer_bindings.contains(&state)
@@ -57,9 +62,12 @@ pub(super) fn try_collapse_guarded_local_update(
     {
         return false;
     }
+    // 候选拒绝[SemanticBarrier:ControlFlow]：无 else 时 next=false 会继续执行后缀；提前写 state 会令后缀观察 false 而非旧 state。
     let Some(else_block) = if_stmt.else_block.as_ref() else {
         return false;
     };
+    // 候选拒绝[ProofIncomplete]：当前只证明单 Return 的终结 false-path；其它等价终结壳需统一 terminal-flow facts。
+    // 候选拒绝[SemanticBarrier:Lifetime]：return/后缀仍读 state 或 next 时，可观察 false-path 上 state 是否被提前覆盖或 next 是否被删除。
     if !matches!(else_block.stmts.as_slice(), [HirStmt::Return(_)])
         || collect_binding_mentions_by_stmt(&else_block.stmts)[0]
             .iter()
@@ -114,6 +122,9 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
     };
 
     let tail = &block.stmts[index + 2..];
+    // 候选拒绝[SemanticBarrier:Lifetime]：异槽/compaction 时合并两个 root 会改变弱表、finalizer 或 cleanup 可见的存活期。
+    // 候选拒绝[LayerBoundary]：debug/capture/TBC/for identity 由 proto identity owner 保留。
+    // 候选拒绝[SemanticBarrier:Lifetime]：tail 仍读取旧 seed 时，carried 写入改名为 seed 会让该读取看到新 epoch。
     if promotion_facts.compacts_home_slots()
         || !bindings_share_exact_home_slot(
             CarryBinding::Local(carried),
@@ -136,6 +147,7 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
         return false;
     }
 
+    // 证明缺陷[PotentialUnsoundness:Lifetime]：未证明 carried 的每次读取都受 handoff 写支配；`local s=1; local c; print(c); c=s` 会把 nil 读取改成 1。
     let mut tail = block.stmts.split_off(index + 2);
     rewrite_carried_local_in_stmts(&mut tail, carried, seed, promotion_facts);
     block.stmts.append(&mut tail);

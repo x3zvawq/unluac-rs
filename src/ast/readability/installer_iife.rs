@@ -79,6 +79,7 @@ fn rewrite_installer_iife_stmt(
     };
     let is_named_installer = function_expr_looks_like_named_installer(function);
     if !is_named_installer && !function_expr_is_substantial(function) {
+        // 候选拒绝[PolicyBoundary]：单条简单 IIFE 保留紧凑原形；这是展示阈值，不是等价性要求。
         return None;
     }
 
@@ -104,6 +105,7 @@ fn rewrite_installer_iife_stmt(
     ];
 
     if is_named_installer {
+        // 证明缺陷[PotentialUnsoundness:Lifetime]：结构只证明“末句导出函数”，未证明外层 closure/capture 可活到父 block 末；弱表或 `__gc` 可观察原 IIFE 调用后即死亡的 root。
         Some(rewritten)
     } else {
         Some(vec![AstStmt::DoBlock(Box::new(AstBlock {

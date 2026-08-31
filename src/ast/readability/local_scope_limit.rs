@@ -75,7 +75,11 @@ fn scope_locals(
     trailing_condition: Option<&AstExpr>,
 ) -> bool {
     let direct_local_count = block.stmts.iter().map(direct_local_count).sum::<usize>();
-    if available_locals == 0 || direct_local_count <= available_locals {
+    if available_locals == 0 {
+        // 分析停用[LayerBoundary]：外层/参数已耗尽全部源码 local 预算时，内层 `do` 不能降低同时活跃的外层数量；需由 HIR home compaction 减少 persistent locals。
+        return false;
+    }
+    if direct_local_count <= available_locals {
         return false;
     }
 
@@ -92,8 +96,10 @@ fn scope_locals(
         .map(|(index, stmt)| {
             scopeable_bindings(stmt).is_some_and(|bindings| {
                 bindings.ids().all(|binding| {
+                    // 候选拒绝[SemanticBarrier:Scope]：repeat 的 `until binding` 在 body 直属作用域读取，包进内层 `do` 会使条件失去该 local。
                     !trailing_mentions.contains(&binding) && {
                         let last = last_mentions.get(&binding).copied().unwrap_or(index);
+                        // 候选拒绝[ProofIncomplete]：生命周期跨过超过 64 个 scopeable local 的 binding 暂不分组；需按区间图/峰值活跃数规划重叠作用域，而非固定窗口。
                         scopeable_prefix[last + 1] - scopeable_prefix[index] <= lifetime_limit
                     }
                 })
@@ -112,6 +118,7 @@ fn scope_locals(
         SCOPE_LOCAL_TARGET.min(available_locals.saturating_sub(persistent_locals).max(1));
     let ranges = scope_ranges(&block.stmts, &last_mentions, &short_lived, scope_target);
     if ranges.is_empty() {
+        // 候选拒绝[ProofIncomplete]：函数已超 local 预算但当前连续区间算法找不到安全范围；需报告不可缩减的 persistent 集合并由前层压缩身份。
         return false;
     }
 
@@ -175,6 +182,10 @@ fn scopeable_bindings(stmt: &AstStmt) -> Option<ScopeableBindings<'_>> {
             locals: &[],
             local_function: Some(decl.name),
         }),
+        AstStmt::LocalDecl(_) => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：`local x <close>=v; work()` 若只包声明会把 `__close` 从 block 末端提前到 `work()` 前；候选拒绝[PolicyBoundary]：`<const>` 声明身份不由资源 pass 重排。
+            None
+        }
         _ => None,
     }
 }
@@ -227,9 +238,11 @@ fn scope_ranges(
         while index < stmts.len() && !is_scope_barrier(&stmts[index]) {
             if let Some(bindings) = scopeable_bindings(&stmts[index]) {
                 if !short_lived[index] {
+                    // 候选拒绝[ProofIncomplete]：当前区间只容纳全部 short-lived 的连续声明；遇到长生命周期声明即停止，缺少交错区间分配证明。
                     break;
                 }
                 if scoped_locals + bindings.len() > scope_target && safe_end.is_some() {
+                    // 候选拒绝[PolicyBoundary]：单个生成作用域最多承载 64 个 local，控制缩进块密度并为外层活跃 binding 留余量。
                     break;
                 }
                 scoped_locals += bindings.len();
@@ -256,6 +269,7 @@ fn scope_ranges(
             ranges.push((start, end));
             index = end;
         } else {
+            // 候选拒绝[ProofIncomplete]：候选起点到 barrier/扫描终点前没有同时闭合且不超预算的安全区间；需更精确的活跃区间切分。
             index = start + 1;
         }
     }
@@ -263,6 +277,7 @@ fn scope_ranges(
 }
 
 fn is_scope_barrier(stmt: &AstStmt) -> bool {
+    // 候选拒绝[SemanticBarrier:Scope]：新增 `do` 若跨 label/goto 会改变 label 可见性或制造跳入 local 作用域；候选拒绝[SemanticBarrier:Lifetime]：也不能跨 `<close>` 资源边界。
     matches!(stmt, AstStmt::Goto(_) | AstStmt::Label(_))
         || (direct_local_count(stmt) != 0 && scopeable_bindings(stmt).is_none())
 }

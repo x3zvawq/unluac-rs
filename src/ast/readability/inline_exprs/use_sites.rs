@@ -553,6 +553,7 @@ impl InlineSite {
         }
 
         let Some(limit) = self.complexity_limit(options, policy, replacement) else {
+            // 候选拒绝[ProofIncomplete]：该 policy/site 组合尚无位置级值宽度与求值顺序证明；不能因找到同名 use 就直接替换。
             return false;
         };
         let complexity_ok = expr_complexity(replacement) <= limit
@@ -565,6 +566,7 @@ impl InlineSite {
                 && direct_return_logical_cost(replacement)
                     .is_some_and(|cost| cost <= options.return_inline_max_complexity));
         if !complexity_ok {
+            // 候选拒绝[PolicyBoundary]：表达式超过用户配置的 index/arg/access-base/return 展示预算；这是源码密度选择，不是语义不等价证明。
             return false;
         }
 
@@ -574,6 +576,7 @@ impl InlineSite {
                     && is_stable_copy_alias_expr(replacement)
             }
             InlinePolicy::Conservative => match candidate.origin() {
+                // 候选拒绝[PolicyBoundary]：debug 身份按源码策略保留；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 可能被弱表/`__gc` 观察，不能走通用 use-site 内联。
                 super::super::super::common::AstLocalOrigin::DebugHinted
                 | super::super::super::common::AstLocalOrigin::PhysicalRoot => false,
                 super::super::super::common::AstLocalOrigin::Recovered => match self {
@@ -731,6 +734,7 @@ impl InlineSite {
                     || is_call_arg_constructor_inline_expr(replacement)
             }
             Self::AccessBase => is_access_base_inline_expr(replacement),
+            // 候选拒绝[ProofIncomplete]：extended-alias 尚未为直接 return/index 建立值宽度与地址求值次序证明，安全子集仍可能存在。
             Self::ReturnValue | Self::Index => false,
         }
     }
@@ -755,7 +759,10 @@ impl InlineSite {
             | Self::ReturnNestedValue
             | Self::Index
             | Self::CallArgNonFinal
-            | Self::CallArgFinal => false,
+            | Self::CallArgFinal => {
+                // 候选拒绝[LayerBoundary]：alias-initializer 策略只拥有紧邻 initializer 内部，return/index/call 参数由其它 sink policy 证明。
+                false
+            }
         }
     }
 
@@ -781,6 +788,7 @@ impl InlineSite {
                 is_access_base_inline_expr(replacement) || is_lookup_inline_expr(replacement)
             }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
+            // 候选拒绝[ProofIncomplete]：adjacent-value 尚未细分直接 return/index 的单值与无事件子集。
             Self::ReturnValue | Self::Index => false,
         }
     }
@@ -800,6 +808,7 @@ impl InlineSite {
                 is_extended_neutral_local_alias_expr(replacement)
                     || is_recallable_inline_expr(replacement)
             }
+            // 候选拒绝[LayerBoundary]：loop-header policy 只服务循环头；return/index 由各自 sink policy 判断。
             Self::ReturnValue | Self::Index => false,
         }
     }
@@ -829,6 +838,7 @@ impl InlineSite {
             Self::CallArgNonFinal | Self::CallArgFinal => {
                 is_mechanical_run_inline_expr(replacement)
             }
+            // 候选拒绝[ProofIncomplete]：bare call/vararg 在顶层 return 有具体 ValueArity 反例，但稳定标量子集尚未从此 blanket guard 中拆出。
             Self::ReturnValue => false,
         }
     }

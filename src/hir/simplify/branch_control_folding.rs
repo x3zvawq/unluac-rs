@@ -99,6 +99,9 @@ fn take_common_direct_copy_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
     if !arm_allows_direct_copy_sink(&if_stmt.then_block, target, source)
         || !arm_allows_direct_copy_sink(else_block, target, source)
     {
+        // 候选拒绝[SemanticBarrier:Scope/Lifetime]：arm 内若重绑 source/target 或跨过 Close/TBC，
+        // 把公共 copy 移到分支外会改变名字解析、关闭时点或对象存活期。
+        // 候选拒绝[ProofIncomplete]：boundary 深度不敏感，嵌套子块中与 copy 无关的 Close/TBC 也会整项拒绝；需记录 owner/执行路径后缩小屏障。
         return None;
     }
 
@@ -172,6 +175,7 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
                 HirStmt::While(while_stmt) if while_stmt.cond == HirExpr::Boolean(false)
             )
         {
+            // 证明缺陷[PotentialPolicyViolation]：constant-false while 的不可达 body 可能含 debug local 或显式诊断；当前接受点没有 proto identity/diagnostic gate。
             changed = true;
             continue;
         }
@@ -193,6 +197,8 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
             None
         };
         let Some(selected_then) = selected_then else {
+            // 候选拒绝[ProofIncomplete]：条件若不在 discard-safe 且 truthiness 已知的子集，
+            // 当前规则没有“保留一次条件求值再选臂”的表示；Unresolved 另按诊断策略保留。
             rewritten.push(HirStmt::If(if_stmt));
             continue;
         };
@@ -205,6 +211,7 @@ fn fold_constant_control(stmts: &mut Vec<HirStmt>) -> bool {
         if !selected.stmts.is_empty() {
             rewritten.push(HirStmt::Block(Box::new(selected)));
         }
+        // 证明缺陷[PotentialPolicyViolation]：未选 arm 可能承载 debug local 或 ErrNil/Unresolved 诊断；这里只证明运行不可达，未证明可丢弃源码身份/诊断。
         changed = true;
     }
 
@@ -312,13 +319,19 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
     };
     if matches!(moved_cond, HirExpr::LogicalOr(_))
         || matches!(repeat_stmt.cond, HirExpr::LogicalOr(_))
-        || !repeat_condition_fold_is_safe(
-            prefix,
-            outer_cond
-                .into_iter()
-                .chain([moved_cond, &repeat_stmt.cond]),
-        )
     {
+        // 候选拒绝[PolicyBoundary]：条件语境下 `A or (B or C)` 的短路可精确保持；这里只选择每轮最多吸收一个尾部 break stage，避免把独立退出阶段过度压平。
+        return false;
+    }
+    if !repeat_condition_fold_is_safe(
+        prefix,
+        outer_cond
+            .into_iter()
+            .chain([moved_cond, &repeat_stmt.cond]),
+    ) {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：prefix 的当前 repeat continue 会从“跳过 moved 条件、只测原 latch”变成测试合成条件；跨尾部 goto/label 同样改变可达路径。
+        // 候选拒绝[ProofIncomplete]：共享 visitor 未区分 nested loop/jump owner，且 Close/TBC 的 break-vs-normal-exit 关闭序尚无精确 owner 证明，安全子集也被一并拒绝；
+        // 候选拒绝[LayerBoundary]：Decision/Unresolved 应先由上游消除或保留诊断。
         return false;
     }
 
@@ -459,16 +472,22 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
             continue;
         };
         let Some(label_index) = label_indices.get(&target).copied() else {
+            // 候选拒绝[LayerBoundary]：目标 label 不在当前顶层 block，不能由局部 forward-fold 重建。
             continue;
         };
         if label_index <= if_index + 1 {
+            // 候选拒绝[LayerBoundary]：反向跳转属于循环恢复，紧邻跳转属于 nop-label 清理。
             continue;
         }
         let body = &stmts[(if_index + 1)..label_index];
-        if !can_move_into_branch(body, kind)
-            || matches!(kind, FoldKind::TerminalElse)
-                && is_branch_value_assignment(stmt, body, invert_cond)
+        if !can_move_into_branch(body, kind) {
+            // 候选拒绝[SemanticBarrier:Scope/ControlFlow]：区间 local 若在 label 后仍被引用，移入 arm 会使 use 失去作用域；区间 goto/label 则可能改变跳转配对或跳入 local 的合法性。
+            continue;
+        }
+        if matches!(kind, FoldKind::TerminalElse)
+            && is_branch_value_assignment(stmt, body, invert_cond)
         {
+            // 候选拒绝[LayerBoundary]：同 lvalue 的两臂赋值是 branch-values 的值选择候选，本 pass 不抢先改成控制流 else。
             continue;
         }
         groups

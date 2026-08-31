@@ -44,6 +44,7 @@ pub(super) struct BlockFacts {
 impl BlockFacts {
     pub(super) fn collect(block: &AstBlock) -> Self {
         let mut collector = GlobalFactsCollector::default();
+        // 证明缺陷[PotentialUnsoundness:Scope]：共享 visitor 会递归普通子 block，导致分支内的显式 `global` 被当成父 block 的 `explicit_here`；随后父作用域 use 可能被错误认定已有 gate。
         visit::visit_block(block, &mut collector);
 
         Self {
@@ -261,6 +262,7 @@ fn global_declared_name(function_decl: &AstFunctionDecl) -> Option<String> {
     let path = match &function_decl.target {
         AstFunctionName::Plain(path) | AstFunctionName::Method(path, _) => path,
     };
+    // 证明缺陷[PotentialUnsoundness:Scope]：带 fields 的 `function g.f()` 只是读取 `g` 后写字段，并不声明 root global；当前却把 `g` 记成 explicit gate，可能抑制必须的 global 声明。
     match &path.root {
         AstNameRef::Global(global) => Some(global.text.clone()),
         _ => None,

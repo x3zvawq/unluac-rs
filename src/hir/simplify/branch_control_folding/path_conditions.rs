@@ -163,7 +163,13 @@ struct Flow {
 
 pub(super) fn specialize_stable_path_conditions(proto: &mut HirProto) -> bool {
     let stable = StableBindingIndex::new(proto);
-    if stable.has_label_or_goto || stable.candidate_budget_exceeded {
+    if stable.has_label_or_goto {
+        // 分析停用[ProofIncomplete]：路径事实传播尚无 CFG label/goto 边合流；当前按整个 proto
+        // 停用，尽管不受跳转影响的结构化子树仍可能安全专门化。
+        return false;
+    }
+    if stable.candidate_budget_exceeded {
+        // 分析停用[ResourceLimit]：单 proto 最多追踪 256 个条件 binding，后续应改为按 block/活跃事实裁剪而非放弃整个 proto。
         return false;
     }
 
@@ -195,6 +201,7 @@ fn rewrite_block(
         }
     }
     if retained_len != block.stmts.len() {
+        // 证明缺陷[PotentialPolicyViolation]：不可达尾部可能仍承载 debug local 或 ErrNil/Unresolved 诊断；当前只按运行可达性截断，未检查源码身份/诊断保留策略。
         block.stmts.truncate(retained_len);
         *changed = true;
     }

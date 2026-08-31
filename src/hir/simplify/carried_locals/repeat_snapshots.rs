@@ -99,6 +99,11 @@ fn try_rewrite_repeat(
     return_temp: TempId,
     facts: &RepeatSnapshotFacts<'_>,
 ) -> Option<LocalId> {
+    // 候选拒绝[SemanticBarrier:ControlFlow]：break/continue/return/goto 可绕过尾 copy；删除 temp 会改变对应出口的 live-out。
+    // 候选拒绝[ProofIncomplete]：嵌套 loop 被同一 control 检查 blanket 拒绝；需区分内层自有 transfer 并证明其写集合。
+    // 候选拒绝[SemanticBarrier:Capture]：捕获 return temp 时，删除其唯一写会让 closure 观察旧值。
+    // 候选拒绝[SemanticBarrier:Lifetime]：TBC temp 或非唯一 use/write 仍有额外 epoch/close 观察者。
+    // 候选拒绝[LayerBoundary]：debug temp 的源码身份由 locals owner 保留。
     if repeat.body.stmts.len() < 2
         || stmt_contains_loop_exit(&repeat.body)
         || facts.captured_temps.contains(&return_temp)
@@ -121,6 +126,7 @@ fn try_rewrite_repeat(
         },
         _ => return None,
     };
+    // 候选拒绝[ProofIncomplete]：producer 自读 temp 已被全局 use-count 间接排除；应由统一 def-use epoch 证明取代重复形状门。
     if temp != return_temp
         || value_mentions_temp(&value, temp)
         || !matches!(
@@ -138,6 +144,7 @@ fn try_rewrite_repeat(
         },
         _ => return None,
     };
+    // 候选拒绝[LayerBoundary]：captured/protected local 的 cell/resource identity 不由 snapshot owner 合并。
     if facts.captured_locals.contains(&local) || facts.protected_locals.contains(&local) {
         return None;
     }

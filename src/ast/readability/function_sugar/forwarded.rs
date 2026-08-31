@@ -41,13 +41,16 @@ pub(super) fn try_lower_forwarded_function_stmt(
     if function.captured_bindings.contains(&binding)
         || count_binding_uses_in_block_deep(&function.body, binding) != 0
     {
+        // 候选拒绝[SemanticBarrier:Capture]：递归闭包依赖这个 local 槽；吸收到外部赋值会让自引用解析成别的 binding。
         return None;
     }
     if use_index.count_uses_in_suffix(stmt_base + 1, binding) != 1 {
+        // 候选拒绝[SemanticBarrier:EvalCount]：零次 use 不属于转发，二次以上吸收会复制 closure 或删除仍需共享的函数对象。
         return None;
     }
     let function = function.as_ref().clone();
     let stmt = inline_function_into_stmt(next, binding, function, target, method_fields)?;
+    // 证明缺陷[PotentialPolicyViolation]：转发 local 的 DebugHinted origin 未检查；即使 closure 仅使用一次，吸收到目标仍会抹掉源码可见身份。
     Some((stmt, 2))
 }
 

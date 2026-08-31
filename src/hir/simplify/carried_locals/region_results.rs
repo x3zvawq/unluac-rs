@@ -124,6 +124,7 @@ pub(super) fn collapse_inferred_if_result_chains(
                 return None;
             };
             if region_has_forbidden_nodes(&block.stmts[region_index..=region_index]) {
+                // 候选拒绝[LayerBoundary]：goto/close/Decision 等边界分别由 CFG/resource/decision owner 消费。
                 return None;
             }
             let exits = if_fallthrough_assignments(if_stmt, &results)?;
@@ -139,6 +140,7 @@ pub(super) fn collapse_inferred_if_result_chains(
                 outer_bindings.contains(result) || outer_bindings.contains(seed)
             }) && rewrites_preserve_identity(&inferred, promotion_facts, identity_facts)
                 && rewrite_is_private_and_uncaptured(region_index, &inferred, &result_index))
+            // 候选拒绝[SemanticBarrier:Lifetime]：outer/capture/identity 或 region 后仍活跃的 seed/result 可观察合并前的独立 epoch/root。
             .then_some(inferred)
         })();
         let Some(inferred) = candidate else {
@@ -297,6 +299,8 @@ pub(super) fn collapse_written_back_if_results(
             || (facts.writes.contains_key(&state) && !state_writes_preserve_result)
             || region_has_forbidden_nodes(&block.stmts[index + 1..=index + 1])
         {
+            // 候选拒绝[SemanticBarrier:Lifetime]：capture/outer use、异槽、额外 result mention 或 state 被独立写入时，改名会合并可区分 epoch。
+            // 候选拒绝[ProofIncomplete]：单出口 if 与 forbidden-node region 需要更一般的路径/owner 事实，当前 exact arm 计数不覆盖。
             index += 1;
             continue;
         }
@@ -418,6 +422,7 @@ fn try_collapse_seeded_if_results(
         return false;
     };
     if region_has_forbidden_nodes(&block.stmts[cursor..=cursor]) {
+        // 候选拒绝[LayerBoundary]：非结构控制、cleanup 与残留 Decision 不由 seeded-if owner 展开。
         return false;
     }
     let Some(exits) = if_fallthrough_assignments(if_stmt, &results) else {
@@ -433,6 +438,7 @@ fn try_collapse_seeded_if_results(
             .iter()
             .any(|exit| exit.get(result).and_then(carry_binding_from_expr) == Some(*seed))
     }) {
+        // 候选拒绝[ProofIncomplete]：某 result 没有任何出口精确复制对应 seed 时，seed/result 关系需更一般的路径证明。
         return false;
     }
     if rewrites
@@ -442,6 +448,7 @@ fn try_collapse_seeded_if_results(
         || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
         || !rewrite_is_private_and_uncaptured(cursor, &rewrites, result_index)
     {
+        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/异槽或资源 identity 会观察 seed/result 的独立生命周期。
         return false;
     }
     if !apply_rewrites(
@@ -451,6 +458,7 @@ fn try_collapse_seeded_if_results(
         rewrites,
         promotion_facts,
     ) {
+        // 候选拒绝[ConvergenceGuard]：exits 已证明 region 中存在每个 result 写；apply 无命中表示分析/rewriter 契约漂移。
         return false;
     }
     merge_initialized_local_declarations(block, index, seeds.len());
@@ -478,6 +486,7 @@ fn try_collapse_inferred_if_results(
         return false;
     };
     if region_has_forbidden_nodes(&block.stmts[cursor..=cursor]) {
+        // 候选拒绝[LayerBoundary]：goto/close/Decision 等边界需先由各自 owner 消费。
         return false;
     }
     let Some(exits) = if_fallthrough_assignments(if_stmt, &results) else {
@@ -494,6 +503,7 @@ fn try_collapse_inferred_if_results(
         || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
         || !rewrite_is_private_and_uncaptured(cursor, &rewrites, result_index)
     {
+        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，result 改名会影响 region 外或 closure 可见 epoch。
         return false;
     }
     apply_rewrites(block, index..cursor, cursor, rewrites, promotion_facts)
@@ -529,6 +539,8 @@ fn try_collapse_loop_results(
         || region_has_forbidden_nodes(&body.stmts)
         || !collect_break_assignments(body, &mut exits, requires_exact_exits)
     {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：未跟踪 transfer 会漏掉 loop 出口，提交不完整 result->state 映射。
+        // 候选拒绝[LayerBoundary]：cleanup/Decision/Unresolved 分别由资源与 decision owner 处理。
         return false;
     }
     if include_fallthrough && block_may_fall_through(body) {
@@ -541,6 +553,7 @@ fn try_collapse_loop_results(
         exits.push(exit);
     }
     if exits.is_empty() {
+        // 候选拒绝[ProofIncomplete]：没有显式 break/fallthrough assignment 时尚无 loop result reaching-def。
         return false;
     }
     let mut results = exits
@@ -559,6 +572,7 @@ fn try_collapse_loop_results(
             && !binding_is_mentioned_in_stmts(&block.stmts[..index], *result)
     });
     if results.is_empty() {
+        // 候选拒绝[ProofIncomplete]：无“suffix 只读且 prefix 不提”的 temp result；其它 live-out 形态需跨区间 def-use。
         return false;
     }
 
@@ -568,6 +582,7 @@ fn try_collapse_loop_results(
             && loop_facts.writes.get(result).copied().unwrap_or(0) == exits.len()
     });
     if results.is_empty() {
+        // 候选拒绝[ProofIncomplete]：loop 内读 result 或写次数不等于出口数时，当前 exact-exit 模型无法配对路径。
         return false;
     }
     let results = results.into_iter().collect::<Vec<_>>();
@@ -591,6 +606,7 @@ fn try_collapse_loop_results(
             })
         })
     {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：动态 repeat 某出口不是 state 精确快照或同时写 state 时，改名会改变该出口 live-out。
         return false;
     }
     if rewrites
@@ -599,6 +615,7 @@ fn try_collapse_loop_results(
         || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
         || !rewrite_is_private_and_uncaptured(index, &rewrites, result_index)
     {
+        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，loop 外或 closure 可观察独立 result/state epoch。
         return false;
     }
     apply_rewrites(block, index..index, index, rewrites, promotion_facts)

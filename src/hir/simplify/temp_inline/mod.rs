@@ -1,6 +1,7 @@
 //! 这个文件实现 HIR 的第一批 temp inlining。
 //!
-//! 我们故意把规则收得很保守：常规路径只折叠“单目标 temp 赋值，并且被紧邻下一条
+//! 常规路径以 use-count、home/capture 与求值区域事实证明等价性，只折叠“单目标 temp
+//! 赋值，并且被紧邻下一条
 //! 简单语句使用一次”的情况。调用表达式另有一条更窄的连续融合规则，用来处理
 //! `callee_temp = f; arg_temp = expr; callee_temp(arg_temp)` 这种 bytecode 为保持 Lua
 //! “先求 callee、再求参数”而拆出的形状；融合时必须把 callee 和参数一起放回同一条
@@ -381,7 +382,9 @@ fn inline_temps_in_block(
         .rev()
     {
         if let Some((temp, value)) = inline_candidate(&stmt)
+            // 候选拒绝[SemanticBarrier:Lifetime]：被 call-root lifetime 标记的结果仍承担 VM root；提前删除会改变对象存活期。
             && !call_root_lifetimes[index]
+            // 候选拒绝[SemanticBarrier:Lifetime]：`t=f(); box.x=t` 中 t 是写入完成前的唯一 VM root，删除可能改变 GC/析构可观察时机。
             // A call result stored in a table can outlive the immediate write. Removing the
             // temp would remove the only lexical/VM root before a later rawset or table clear;
             // keep that producer unless a separate lifetime proof exists.
@@ -389,7 +392,9 @@ fn inline_temps_in_block(
                 && kept_rev
                     .last()
                     .is_some_and(|next_stmt| stmt_stores_temp_in_table(next_stmt, temp)))
+            // 候选拒绝[LayerBoundary]：debug temp 是显式源码 binding，交给 locals/source identity owner。
             && !workspace.uses.has_debug_local_hint(temp)
+            // 候选拒绝[SemanticBarrier:Capture]：若 closure 已按引用捕获该 home，删除写入会让 closure 观察旧值；见 regress_310。
             && !temp_rebinds_captured_slot(
                 temp,
                 facts,
@@ -402,22 +407,29 @@ fn inline_temps_in_block(
             // 一旦把它内联进下一条 `yield/return/call`，当前赋值本身就会消失，
             // 后续再也没有地方记录“状态已经更新过”。
             // 因此这里只允许折叠真正的 forwarding temp，不折叠自引用状态槽位。
+            // 候选拒绝[SemanticBarrier:Lifetime]：`t=t+1; return t` 若删 producer，状态槽不再完成本次更新。
             && !expr_touches_temp(value, temp)
             && let Some(next_stmt) = kept_rev.last()
             && let use_count = total_use_count(temp, live_use_counts)
+            // 候选拒绝[SemanticBarrier:Lifetime]：两个以上消费不能随 producer 一并替换；零消费属于 dead-temps owner。
+            // 候选拒绝[LayerBoundary]：零消费 producer 的 effect-preserving 删除由 dead-temps pass 负责。
             && (use_count == 1
                 || (use_count == 2
                     && is_method_receiver_snapshot(next_stmt, temp, value)))
+            // 候选拒绝[ProofIncomplete]：有 live use 但站点分类器不能定位时，缺少该 HIR 站点的必达/求值区域事实。
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
+            // 候选拒绝[LayerBoundary]：branch-value 定向入口只消费 terminal return，完整相邻内联由正常 temp-inline 轮次负责。
             && workspace
                 .scope
                 .allows_adjacent(temp, site, next_stmt, kept_rev.len() == 1)
+            // 候选拒绝[SemanticBarrier:EvalOrder]：`callee=f; arg=g(); callee(arg)` 不能只把 arg 移到 callee 物化之前。
             && !call_arg_inline_crosses_materialized_callee(
                 site,
                 value,
                 index,
                 callee_materialized_at,
             )
+            // 候选拒绝[SemanticBarrier:EvalOrder]：sink 中 temp 之前的 call/lookup/可变快照会观察 producer 移动；见 regress_172、regress_211。
             && !inline_crosses_evaluation_boundary(
                 site,
                 value,
@@ -426,6 +438,7 @@ fn inline_temps_in_block(
                 reference_captured,
                 workspace.dialect,
             )
+            // 候选拒绝[PolicyBoundary]：复杂 child closure 保留命名 binding，避免生成多行 IIFE。
             && !substantial_result_closure_prefers_binding(
                 site,
                 value,
@@ -520,6 +533,8 @@ fn inline_crosses_evaluation_boundary(
     reference_captured: &ReferenceCapturedBindings,
     dialect: DecompileDialect,
 ) -> bool {
+    // 候选拒绝[SemanticBarrier:ValueArity]：`t=f(); return x,t` 直接变成 `return x,f()` 会把末尾 call 从单值改为 open tail。
+    // 候选拒绝[SemanticBarrier:ControlFlow]：循环外 `t=f()` 不能内联进 while 条件而改成每轮调用；见 regress_172#1/#2。
     fixed_return_tail_call_prefers_materialization(site, value, next_stmt, temp)
         || (site == InlineSite::LoopCondition && !is_stable_inline_value(value))
         || (expr_requires_ordered_snapshot(value)
@@ -656,21 +671,33 @@ fn inline_adjacent_call_root_expression_overwrites(
         let Some((target, overwrite)) = inline_candidate(&block.stmts[overwrite_index]) else {
             continue;
         };
+        // 候选拒绝[ProofIncomplete]：call root/overwrite 缺可信 home 时无法证明二者是同一物理 owner；应补 promotion provenance。
         let (Some(root_slot), Some(target_slot)) = (
             facts.trusted_temp_home_slot(root),
             facts.trusted_temp_home_slot(target),
         ) else {
             continue;
         };
-        if root == target
-            || root_slot != target_slot
-            || total_use_count(root, live_use_counts) != 1
-            || scratch.has_debug_local_hint(root)
-            || scratch.has_debug_local_hint(target)
-            || !call_root_overwrite_is_inlineable(overwrite, root)
-            || captured_slots_before_stmt
-                .get(overwrite_index)
-                .is_none_or(|captured| captured.contains(&root_slot))
+        // 候选拒绝[ProofIncomplete]：root/target identity 或 home 不同的 adjacent overwrite 尚未证明通用等价替换；应复用普通站点证明。
+        if root == target || root_slot != target_slot {
+            continue;
+        }
+        // 候选拒绝[SemanticBarrier:Lifetime]：例如 overwrite 后再次读取 root 时，删除 producer 会丢失原 call result。
+        if total_use_count(root, live_use_counts) != 1 {
+            continue;
+        }
+        // 候选拒绝[LayerBoundary]：debug identity 由 locals/source-binding owner 保留。
+        if scratch.has_debug_local_hint(root) || scratch.has_debug_local_hint(target) {
+            continue;
+        }
+        // 候选拒绝[ProofIncomplete]：非 primitive binary/logical overwrite 尚无通用单次求值证明，应扩展 expression overwrite analyzer。
+        if !call_root_overwrite_is_inlineable(overwrite, root) {
+            continue;
+        }
+        // 候选拒绝[SemanticBarrier:Capture]：已引用捕获 root home 时，删除 producer 会让 closure 看不到 call result。
+        if captured_slots_before_stmt
+            .get(overwrite_index)
+            .is_none_or(|captured| captured.contains(&root_slot))
         {
             continue;
         }
@@ -752,6 +779,11 @@ fn inline_pure_materialization_run(
         let Some((temp, value)) = inline_candidate(&block.stmts[index]) else {
             return false;
         };
+        // 候选拒绝[SemanticBarrier:Lifetime]：alias 链节点有额外 use 时不能随 run 整段删除。
+        // 候选拒绝[SemanticBarrier:EvalOrder]：非 repeatable 值或转发更早 observable def 会被延后/重复求值。
+        // 候选拒绝[PolicyBoundary]：nested sink 继续服从固定复杂度展示阈值。
+        // 候选拒绝[SemanticBarrier:Capture]：capture/self-rebind 改写会改变闭包或状态所见值。
+        // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
         if total_use_count(temp, context.live_use_counts) != 1
             || !expr_is_repeatable(value)
             || !InlineSite::Nested.allows(value, context.readability)
@@ -793,6 +825,7 @@ fn inline_pure_materialization_run(
         });
     }
     if positions.keys().any(|temp| !needed.contains(temp)) {
+        // 候选拒绝[LayerBoundary]：不在 sink 依赖闭包内的是 dead assignment，由 dead-temps owner 处理。
         return false;
     }
 
@@ -812,6 +845,7 @@ fn inline_pure_materialization_run(
             }
         });
         if !valid {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：forward edge/cycle 会把依赖移动到其定义之前或改变求值拓扑。
             return false;
         }
     }
@@ -825,6 +859,7 @@ fn inline_pure_materialization_run(
         remaining |= positions.contains_key(&temp);
     });
     if remaining {
+        // 候选拒绝[ProofIncomplete]：substitution 后仍残留 run temp，说明当前替换器未覆盖该 sink 形状。
         return false;
     }
 
@@ -880,6 +915,7 @@ fn inline_materialization_runs(
             .iter()
             .any(|preserve| *preserve)
         {
+            // 候选拒绝[SemanticBarrier:Lifetime]：run 内仍有 call result 充当后续 raw/table 写的唯一 VM root，不能整段删除。
             index = run_end;
             continue;
         }
@@ -941,6 +977,7 @@ fn inline_materialization_runs(
             terminal_candidate,
             &block.stmts[run_end],
         ) {
+            // 候选拒绝[LayerBoundary]：branch-value 定向轮次仅接管 root global call + terminal exposed sink，其余留给完整 temp-inline。
             index = run_end + 1;
             continue;
         }
@@ -953,6 +990,9 @@ fn inline_materialization_runs(
             captured_slots_before_stmt,
         ) || total_use_count(callee_temp, live_use_counts) != 1
         {
+            // 候选拒绝[SemanticBarrier:Capture]：callee home 被引用捕获或 producer 自引用时，删写会改变 closure/状态所见值。
+            // 候选拒绝[LayerBoundary]：debug callee 是源码 binding；由 locals owner 保留。
+            // 候选拒绝[SemanticBarrier:Lifetime]：callee 存在额外消费时不能随本 call 一并删除。
             index = run_end + 1;
             continue;
         }
@@ -1014,6 +1054,7 @@ fn inline_materialization_runs(
                 && is_bare_method_receiver_snapshot_in_stmt(&rewritten_sink, temp, value);
             let stable_method_run_alias =
                 forwarded_owner_survives && (method_receiver_pair || method_receiver_pair_seen);
+            // 候选拒绝[SemanticBarrier:Lifetime]：除 method 协议的同次 receiver 求值外，多 use 仍需原 temp 值。
             if use_count > 1 && !method_receiver_pair {
                 complete_run = false;
                 break;
@@ -1028,6 +1069,7 @@ fn inline_materialization_runs(
             );
             if matches!(value, HirExpr::Call(_)) && stmt_stores_temp_in_table(&rewritten_sink, temp)
             {
+                // 候选拒绝[SemanticBarrier:Lifetime]：call result 写表前由 temp 保持存活，删除会改变 VM root 生命周期。
                 complete_run = false;
                 break;
             }
@@ -1036,10 +1078,14 @@ fn inline_materialization_runs(
                     discarded_uses.push(collect_expr_temp_uses_summary(value, uses));
                     continue;
                 }
+                // 候选拒绝[SemanticBarrier:EvalOrder]：零 use 但不可安全丢弃的 call/lookup/allocation 仍是原序列中的可观察事件。
+                // 候选拒绝[SemanticBarrier:Capture]：被捕获/self-rebinding 的零 use 写也不能由 run 删除。
+                // 候选拒绝[LayerBoundary]：debug temp 即使零 use 也属于 source binding。
                 complete_run = false;
                 break;
             }
             let Some(site) = inline_site_in_stmt(&rewritten_sink, temp) else {
+                // 候选拒绝[ProofIncomplete]：run temp 有唯一 sink use 但站点分类缺少对应必达区域事实。
                 complete_run = false;
                 break;
             };
@@ -1060,6 +1106,9 @@ fn inline_materialization_runs(
                         *dialect,
                     ))
             {
+                // 候选拒绝[SemanticBarrier:Capture]：candidate home capture/self-rebind 会改变 closure 或状态所见值。
+                // 候选拒绝[LayerBoundary]：debug candidate 是源码 binding。
+                // 候选拒绝[SemanticBarrier:EvalOrder]：参数转发更早的 order-sensitive def，或 sink 前缀含 observable eval，移动会重排事件。
                 complete_run = false;
                 break;
             }
@@ -1078,6 +1127,7 @@ fn inline_materialization_runs(
             continue;
         }
         let Some(callee_site) = inline_site_in_stmt(&rewritten_sink, callee_temp) else {
+            // 候选拒绝[ProofIncomplete]：替换参数后无法重新定位 callee use，缺少组合 sink 的站点稳定性事实。
             index = run_end + 1;
             continue;
         };
@@ -1091,6 +1141,7 @@ fn inline_materialization_runs(
                 *dialect,
             )
         {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：callee 不再是直接调用位，或其前有可观察事件；内联会把 callee 求值延后。
             index = run_end + 1;
             continue;
         }
@@ -1200,6 +1251,7 @@ fn root_open_return_nil_pack_plan(
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
 ) -> Option<RootOpenReturnNilPackPlan> {
+    // 分析停用[ProofIncomplete]：home compaction 下缺少跨 gap 的稳定物理槽证明；应让 promotion 暴露最终 slot epoch。
     if facts.compacts_home_slots() {
         return None;
     }
@@ -1211,6 +1263,7 @@ fn root_open_return_nil_pack_plan(
     if tail.exact_width().is_some() || !matches!(tail.as_expr(), HirExpr::Call(_)) {
         return None;
     }
+    // 分析停用[ConvergenceGuard]：capture 快照应覆盖 root return；缺项表示本 pass 的语句索引失配。
     let captured_slots = captured_slots_before_stmt.get(return_index)?;
 
     for assignment_index in (0..return_index).rev() {
@@ -1225,6 +1278,7 @@ fn root_open_return_nil_pack_plan(
                 .fixed
                 .iter()
                 .all(|value| matches!(value, HirExpr::Nil))
+            // 候选拒绝[ProofIncomplete]：候选前存在 structured/resource stmt 时 blanket 放弃 root 扫描；应以 target epoch 的路径事实替代语句种类限制。
             || !block.stmts[..assignment_index]
                 .iter()
                 .all(root_nil_pack_prefix_stmt_is_single_pass)
@@ -1244,6 +1298,7 @@ fn root_open_return_nil_pack_plan(
             })
             .collect::<Option<Vec<_>>>()
         else {
+            // 候选拒绝[LayerBoundary]：local/param/upvalue 等源码 identity 不由 raw-temp nil-pack 规则删除。
             continue;
         };
         let fixed_start = ret.values.fixed.windows(targets.len()).position(|window| {
@@ -1258,9 +1313,14 @@ fn root_open_return_nil_pack_plan(
 
         let mut target_slots = BTreeSet::new();
         if targets.iter().any(|target| {
+            // 候选拒绝[ProofIncomplete]：非 entry-nil materialization 尚未证明可跨整段 root 前缀消除；应以目标 epoch 的完整 def/use 取代来源形状。
             !facts.overwrites_entry_nil(*target)
+                // 候选拒绝[SemanticBarrier:Lifetime]：额外 use 会继续观察原 nil 写入后的 temp。
                 || total_use_count(*target, live_use_counts) != 1
+                // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
                 || scratch.has_debug_local_hint(*target)
+                // 候选拒绝[ProofIncomplete]：缺可信 home 或同值 nil targets 共享 home 时，当前计划缺少精确 slot epoch 证明。
+                // 候选拒绝[SemanticBarrier:Capture]：已引用捕获 target home 时，删除写入会让 closure 观察旧值。
                 || facts
                     .trusted_temp_home_slot(*target)
                     .is_none_or(|slot| captured_slots.contains(&slot) || !target_slots.insert(slot))
@@ -1295,6 +1355,7 @@ fn inline_terminal_nil_return_pack(
     has_resource_boundary: bool,
     call_root_lifetimes: &[bool],
 ) -> bool {
+    // 分析停用[ProofIncomplete]：home compaction 或 proto 内任意 resource boundary 会 blanket 禁用本规则；应改用候选区间的精确 slot/lifetime 事实。
     if facts.compacts_home_slots() || has_resource_boundary {
         return false;
     }
@@ -1309,6 +1370,7 @@ fn inline_terminal_nil_return_pack(
         .copied()
         .unwrap_or(true)
     {
+        // 候选拒绝[SemanticBarrier:Lifetime]：nil producer 仍是 call-root lifetime owner，删除会提前释放其先前值。
         return false;
     }
     let (HirStmt::Assign(assign), HirStmt::Return(ret)) =
@@ -1343,6 +1405,7 @@ fn inline_terminal_nil_return_pack(
         })
         .collect::<Option<Vec<_>>>()
     else {
+        // 候选拒绝[LayerBoundary]：并行写含 local/param/upvalue 等 identity 时由 locals/resource owner 处理，不删其声明或写入。
         return false;
     };
     if !ret
@@ -1356,18 +1419,29 @@ fn inline_terminal_nil_return_pack(
     }
 
     let Some(captured_slots) = captured_slots_before_stmt.get(assign_index) else {
+        // 候选拒绝[ConvergenceGuard]：capture 快照应覆盖每条原语句；缺项表示 pass 内部索引失配。
         return false;
     };
     let mut target_slots = BTreeSet::new();
     for target in &targets {
         let Some(slot) = facts.trusted_temp_home_slot(*target) else {
+            // 候选拒绝[ProofIncomplete]：目标缺可信 home，无法证明 nil 写与 return 读取保持同槽同 epoch。
             return false;
         };
-        if !target_slots.insert(slot)
-            || captured_slots.contains(&slot)
-            || scratch.has_debug_local_hint(*target)
-            || total_use_count(*target, live_use_counts) != 1
-        {
+        // 候选拒绝[ProofIncomplete]：多个 nil target 共享 home 看似仍等价，但当前计划要求一一槽映射；应补同值并行写的 epoch 证明。
+        if !target_slots.insert(slot) {
+            return false;
+        }
+        // 候选拒绝[SemanticBarrier:Capture]：closure 已引用捕获目标 home 时，删除 nil 写会让其继续观察旧值。
+        if captured_slots.contains(&slot) {
+            return false;
+        }
+        // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+        if scratch.has_debug_local_hint(*target) {
+            return false;
+        }
+        // 候选拒绝[SemanticBarrier:Lifetime]：额外 use 会继续观察被删除的 nil 写或 temp identity。
+        if total_use_count(*target, live_use_counts) != 1 {
             return false;
         }
     }
@@ -1399,16 +1473,25 @@ fn root_nil_pack_gap_preserves_slots(
     facts: &ProtoPromotionFacts,
 ) -> bool {
     match stmt {
-        HirStmt::Assign(assign) => assign.targets.iter().all(|target| {
-            direct_lvalue_home_slot(target, facts)
-                .is_some_and(|slot| slot.is_none_or(|slot| !protected.contains(&slot)))
-        }),
-        HirStmt::LocalDecl(local_decl) => local_decl.bindings.iter().all(|local| {
-            facts
-                .trusted_local_home_slot(*local)
-                .is_some_and(|slot| !protected.contains(&slot))
-        }),
+        HirStmt::Assign(assign) => {
+            // 候选拒绝[ProofIncomplete]：gap 目标缺可信 home 时没有区间 clobber 证明；应消费统一 stmt write-set。
+            // 候选拒绝[SemanticBarrier:EvalOrder]：`t=nil; t=x; return t` 若跨过同槽写，会错误恢复成 `return nil`。
+            assign.targets.iter().all(|target| {
+                direct_lvalue_home_slot(target, facts)
+                    .is_some_and(|slot| slot.is_none_or(|slot| !protected.contains(&slot)))
+            })
+        }
+        HirStmt::LocalDecl(local_decl) => {
+            // 候选拒绝[ProofIncomplete]：local 缺可信 home 时没有区间 clobber 证明。
+            // 候选拒绝[SemanticBarrier:EvalOrder]：gap local 写复用 protected home 会覆盖 return 应读取的 nil temp。
+            local_decl.bindings.iter().all(|local| {
+                facts
+                    .trusted_local_home_slot(*local)
+                    .is_some_and(|slot| !protected.contains(&slot))
+            })
+        }
         HirStmt::TableSetList(_) | HirStmt::CallStmt(_) => true,
+        // 候选拒绝[ProofIncomplete]：结构化/资源/control gap 当前没有精确 may-write 与路径事实，blanket 停止跨越；应由结构区域 effect summary 替代。
         HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
@@ -1463,6 +1546,9 @@ fn inline_numeric_for_stable_header_aliases(
         let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
             continue;
         };
+        // 候选拒绝[ProofIncomplete]：numeric-for 跨状态赋值目前只证明 rootless 稳定字面量；其它值需要区间读写/求值顺序事实。
+        // 候选拒绝[SemanticBarrier:Lifetime]：额外 use、capture 或 self-rebind 仍要求 producer 存在。
+        // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
         if !is_stable_inline_value(value)
             || total_use_count(temp, live_use_counts) != 1
             || !materialization_run_candidate_is_safe(
@@ -1513,6 +1599,7 @@ fn inline_open_return_fixed_alias_run(
     }
 
     let Some(captured_slots) = captured_slots_before_stmt.get(run_end) else {
+        // 候选拒绝[ConvergenceGuard]：capture 快照必须覆盖 open-return sink；缺项表示语句索引失配。
         return false;
     };
     let mut target_slots = BTreeSet::new();
@@ -1528,23 +1615,28 @@ fn inline_open_return_fixed_alias_run(
             || total_use_count(target, live_use_counts) != 1
             || scratch.has_debug_local_hint(target)
         {
+            // 候选拒绝[SemanticBarrier:Lifetime]：fixed prefix 非对应唯一 target use 时，删除 alias 会改变其它消费者所见值。
+            // 候选拒绝[LayerBoundary]：debug alias 是源码 binding。
             return false;
         }
         let (Some(target_slot), Some(source_slot)) = (
             facts.trusted_temp_home_slot(target),
             facts.trusted_temp_home_slot(*source),
         ) else {
+            // 候选拒绝[ProofIncomplete]：alias source/target 缺可信 home，不能证明 open tail setup 不覆盖它们。
             return false;
         };
         if captured_slots.contains(&target_slot)
             || captured_slots.contains(&source_slot)
             || !target_slots.insert(target_slot)
         {
+            // 候选拒绝[SemanticBarrier:Capture]：source/target home 已捕获，或多个 target 共享槽时，移动读取会改变 closure/slot 生命周期。
             return false;
         }
         source_slots.insert(source_slot);
     }
     if !target_slots.is_disjoint(&source_slots) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：source/target 同槽会让 fixed return 读到 tail setup 后的新值；见 regress_310。
         return false;
     }
 
@@ -1553,9 +1645,11 @@ fn inline_open_return_fixed_alias_run(
             return false;
         };
         let Some(slot) = facts.trusted_temp_home_slot(target) else {
+            // 候选拒绝[ProofIncomplete]：tail setup 目标缺可信 home，无法证明它不覆盖 fixed source/target。
             return false;
         };
         if target_slots.contains(&slot) || source_slots.contains(&slot) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：tail setup 覆盖 fixed alias 槽时，内联会把读取延后到覆盖之后。
             return false;
         }
     }
@@ -1648,7 +1742,9 @@ fn materialization_run_candidate_is_safe(
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
 ) -> bool {
+    // 候选拒绝[LayerBoundary]：debug temp 是源码 binding，由 locals/source identity owner 保留。
     !scratch.has_debug_local_hint(temp)
+        // 候选拒绝[SemanticBarrier:Capture]：引用捕获该 home 的 closure 必须观察 producer 写入后的值；见 regress_310。
         && !temp_rebinds_captured_slot(
             temp,
             facts,
@@ -1656,6 +1752,7 @@ fn materialization_run_candidate_is_safe(
                 .get(stmt_index)
                 .expect("captured slot scan should cover every statement"),
         )
+        // 候选拒绝[SemanticBarrier:Lifetime]：`t=t+1; sink(t)` 的 producer 是状态更新而非 forwarding temp；见 regress_263#2。
         && !expr_touches_temp(value, temp)
 }
 
@@ -1807,6 +1904,10 @@ fn inline_repeat_head_scalar_temp(
     let Some((temp, value)) = repeat_stmt.body.stmts.first().and_then(inline_candidate) else {
         return false;
     };
+    // 候选拒绝[ProofIncomplete]：home compaction、缺 prefix/home fact 时不能证明首句 producer 就是 continue 重定位出的 latch prefix；应补 slot epoch/provenance。
+    // 候选拒绝[ProofIncomplete]：这里只证明 rootless 标量；local/lookup/call 依赖在 body 后是否稳定需要表达式 read/effect summary。
+    // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+    // 候选拒绝[SemanticBarrier:Lifetime]：非唯一 condition use 仍需要原 temp。
     if facts.compacts_home_slots()
         || !facts.is_repeat_condition_prefix_temp(temp)
         || facts.trusted_temp_home_slot(temp).is_none()
@@ -1818,9 +1919,11 @@ fn inline_repeat_head_scalar_temp(
         return false;
     }
     let Some(site) = inline_site_in_repeat_condition(&repeat_stmt.cond, temp) else {
+        // 候选拒绝[ProofIncomplete]：condition 计数为一但站点分类无法定位，缺少 Decision 必达节点事实。
         return false;
     };
     if !site.allows(value, readability) {
+        // 候选拒绝[PolicyBoundary]：repeat condition 服从控制头复杂度展示阈值。
         return false;
     }
 
@@ -1830,11 +1933,13 @@ fn inline_repeat_head_scalar_temp(
             || stmt_writes_temp(stmt, temp)
             || stmt_contains_nested_nonlocal_control(stmt)
         {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：中间 use/write 或 break/return/goto 会让 producer 与 condition 不再位于每轮同一路径；见 regress_263#2。
             return false;
         }
         facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_slots);
     }
     if temp_rebinds_captured_slot(temp, facts, &captured_slots) {
+        // 候选拒绝[SemanticBarrier:Capture]：closure 已引用捕获该 home，删除首句写入会让其观察上一轮值。
         return false;
     }
 
@@ -1872,6 +1977,8 @@ fn inline_repeat_tail_temp(
     let Some((temp, value)) = inline_candidate(&repeat_stmt.body.stmts[tail_index]) else {
         return false;
     };
+    // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+    // 候选拒绝[SemanticBarrier:Lifetime]：self-reference 或额外 use 需要保留状态写入/temp 值。
     if scratch.has_debug_local_hint(temp)
         || expr_touches_temp(value, temp)
         || total_use_count(temp, live_use_counts) != 1
@@ -1880,6 +1987,7 @@ fn inline_repeat_tail_temp(
         return false;
     }
     let Some(site) = inline_site_in_repeat_condition(&repeat_stmt.cond, temp) else {
+        // 候选拒绝[ProofIncomplete]：condition 唯一 use 无法定位时缺少 Decision 必达站点事实。
         return false;
     };
     if !site.allows(value, readability)
@@ -1891,6 +1999,8 @@ fn inline_repeat_tail_temp(
                 reference_captured,
             )
     {
+        // 候选拒绝[PolicyBoundary]：repeat condition 服从控制头复杂度展示阈值。
+        // 候选拒绝[SemanticBarrier:EvalOrder]：condition 中 temp 前的 observable eval 会在内联后先于 producer value 执行。
         return false;
     }
 
@@ -1900,11 +2010,13 @@ fn inline_repeat_tail_temp(
             || stmt_writes_temp(stmt, temp)
             || stmt_contains_nested_nonlocal_control(stmt)
         {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：中间 use/write 或非局部控制转移破坏同轮路径证明；见 regress_263#2。
             return false;
         }
         facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_slots);
     }
     if temp_rebinds_captured_slot(temp, facts, &captured_slots) {
+        // 候选拒绝[SemanticBarrier:Capture]：closure 引用捕获该 home 时，删除尾写会改变闭包观察值。
         return false;
     }
 

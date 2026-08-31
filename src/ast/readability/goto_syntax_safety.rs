@@ -10,6 +10,7 @@ use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     if !context.target.caps.goto_label {
+        // 分析停用[TargetConstraint]：无 goto/label 的目标方言不会生成同层 terminal 后继 label，也不需要这层语法包装。
         return false;
     }
     walk::rewrite_module(module, &mut GotoSyntaxSafetyPass)

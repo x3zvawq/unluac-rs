@@ -16,6 +16,7 @@ pub(super) fn inline_owned_branch_conditions(
             !outer_bindings.contains(&binding) && !captured_bindings.contains(&binding)
         })
         .collect::<BTreeSet<_>>();
+    // 候选拒绝[SemanticBarrier:Capture]：outer/captured condition local 可能被分支外或 closure 观察，不能删除 producer identity。
     if eligible.is_empty() {
         return false;
     }
@@ -50,6 +51,7 @@ pub(super) fn inline_owned_branch_conditions(
         let HirStmt::If(if_stmt) = &mut block.stmts[index + 1] else {
             continue;
         };
+        // 证明缺陷[PotentialPolicyViolation]：此 owner 没有 HandoffIdentityFacts/debug gate；带 debug hint 的 condition local 也会被直接删除。
         if_stmt.cond = value;
         *remove = true;
     }
@@ -104,6 +106,8 @@ pub(super) fn condition_scratch_producer(stmt: &HirStmt) -> Option<(LocalId, &Hi
     if values.tail.is_some()
         || collect_binding_mentions_in_expr(value).contains(&CarryBinding::Local(binding))
     {
+        // 候选拒绝[SemanticBarrier:Scope]：producer RHS 自读 local 时，内联到 if 后会从声明前/旧 epoch 改为当前 binding 读取。
+        // 候选拒绝[ProofIncomplete]：open-tail condition producer 尚未用单值截断事实证明可内联。
         return None;
     }
     Some((binding, value))
@@ -131,6 +135,7 @@ pub(super) fn collect_fallthrough_assignments(
 ) -> Option<bool> {
     let (last, prefix) = block.stmts.split_last()?;
     if bindings_are_mentioned_in_stmts(prefix, results) {
+        // 候选拒绝[SemanticBarrier:Lifetime]：fallthrough assignment 前已读写 result 时，整段改名会合并未产出/中间 epoch。
         return None;
     }
     match last {
@@ -163,6 +168,7 @@ pub(super) fn result_assignment_values(
 }
 
 pub(super) fn assignment_values(assign: &HirAssign) -> Option<BTreeMap<CarryBinding, HirExpr>> {
+    // 候选拒绝[ProofIncomplete]：open-tail/非等宽 assignment 缺完整 value-pack 与 target 对位事实。
     if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
         return None;
     }
@@ -172,6 +178,7 @@ pub(super) fn assignment_values(assign: &HirAssign) -> Option<BTreeMap<CarryBind
             continue;
         };
         if values.insert(binding, value.clone()).is_some() {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：同一 binding 多次出现在并行 targets 时，最后写胜出；Map 合并会丢失位置语义。
             return None;
         }
     }

@@ -21,6 +21,7 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
             .iter()
             .find_map(|target| find_site_in_lvalue(target, temp, InlineSite::Direct))
             .or_else(|| find_site_in_exprs(&assign.values, temp, InlineSite::Direct)),
+        // 候选拒绝[LayerBoundary]：SETLIST base 的 NewTable origin/home 由 table-constructors 消费，temp-inline 只处理 values。
         // SETLIST carries raw table-write semantics and the physical lifetime of its base
         // register.  Keep that base as a direct binding so the table-constructor pass can prove
         // its NewTable origin/home slot; inlining the producer here loses both facts and used to
@@ -50,6 +51,8 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::GenericFor(generic_for) => {
             find_site_in_exprs(&generic_for.iterator, temp, InlineSite::LoopHead)
         }
+        // 候选拒绝[LayerBoundary]：ErrNil、TBC/Close 等 VM/resource 站点由对应 lowering owner 保留，不作为普通表达式 sink。
+        // 候选拒绝[SemanticBarrier:ControlFlow]：嵌套 Block 或控制转移内的 use 不是必达站点；把 producer 移入其中会变成条件求值。
         HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
         | HirStmt::Close(_)
@@ -719,10 +722,13 @@ impl InlineSite {
             Self::Direct => true,
             Self::CallCallee | Self::FastCallCallee => true,
             Self::Nested => {
+                // 候选拒绝[ProofIncomplete]：nested 分类未区分必达与短路路径；`t=f(); return c and t` 会把 eager call 改成条件求值，应补执行区域事实。
+                // 候选拒绝[PolicyBoundary]：纯 nested 表达式仍受固定复杂度阈值限制，避免把机械 temp 换成更难读的嵌套树。
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
                     && is_small_pure_nested_inline_expr(replacement)
             }
             Self::AccessBase => {
+                // 候选拒绝[PolicyBoundary]：access base 只展示原子值或命名字段链，并服从用户配置的复杂度上限。
                 self.complexity_limit(options)
                     .is_some_and(|limit| expr_complexity(replacement) <= limit)
                     && is_access_base_inline_expr(replacement)
@@ -730,17 +736,21 @@ impl InlineSite {
             // 条件头 / for 头属于源码结构骨架，保留少量低复杂度表达式能明显减少
             // 机械 temp 噪音；但这里仍然用固定的小阈值，避免把整坨复杂逻辑塞回控制头。
             Self::Condition | Self::LoopCondition => {
+                // 候选拒绝[PolicyBoundary]：控制头使用固定展示复杂度上限；该限制不表示表达式不等价。
                 expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
             // closure 的复杂度无法概括 child proto 函数体；保留独立 producer，避免把普通
             // local function 压成 loop head 里的多行匿名 iterator。
             Self::LoopHead => {
+                // 候选拒绝[PolicyBoundary]：closure 保留命名 producer，避免多行 IIFE；其它 loop-head 值仅受展示复杂度限制。
                 !matches!(replacement, HirExpr::Closure(_))
                     && expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
-            Self::ReturnValue | Self::Index | Self::CallArg | Self::FastCallArg => self
-                .complexity_limit(options)
-                .is_some_and(|limit| expr_complexity(replacement) <= limit),
+            Self::ReturnValue | Self::Index | Self::CallArg | Self::FastCallArg => {
+                // 候选拒绝[PolicyBoundary]：return/index/arg 的用户可配置复杂度阈值只控制源码展示密度。
+                self.complexity_limit(options)
+                    .is_some_and(|limit| expr_complexity(replacement) <= limit)
+            }
         }
     }
 

@@ -104,6 +104,9 @@ fn try_collapse_pure_binding_handoffs(
     };
 
     // 外层仍提及的 source/target，或 seed 前已有路径触碰的 temp，都不是当前块私有身份。
+    // 候选拒绝[SemanticBarrier:Lifetime]：外层/seed 前已活跃的 temp 或 source 是独立快照，改名会把旧 epoch 与 carried 状态合并。
+    // 候选拒绝[SemanticBarrier:Capture]：source 被引用捕获时，closure 调用可在无显式 suffix 读取处改写/观察它。
+    // 候选拒绝[SemanticBarrier:Lifetime]：异槽、compaction 或资源 identity 合并会改变 weak-root/finalizer/close 可见存活期。
     if seed.rewrites.iter().any(|rewrite| {
         outer_bindings.contains(&CarryBinding::Temp(rewrite.from))
             || outer_bindings.contains(&rewrite.to)
@@ -113,11 +116,14 @@ fn try_collapse_pure_binding_handoffs(
     }) {
         return false;
     }
+    // 候选拒绝[SemanticBarrier:ControlFlow]：prior goto 可从 seed 之前直达下一 label；删除 seed 后该入口会使用未初始化的重写 binding。
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
 
     let suffix = &block.stmts[index + 1..];
+    // 候选拒绝[SemanticBarrier:Lifetime]：suffix 仍读取 source 或以非直接写回改写 source 时，temp 快照与 source epoch 不再等价。
+    // 候选拒绝[ProofIncomplete]：temp 在 suffix 无 touch 时 seed 常可直接死写删除；当前 owner 没有独立 dead-seed 证明。
     if suffix.is_empty()
         || seed.rewrites.iter().any(|rewrite| {
             suffix_reads_binding(suffix, rewrite.to)
@@ -137,12 +143,14 @@ fn try_collapse_pure_binding_handoffs(
         promotion_facts: safety.promotion_facts,
     };
     if !rewrite_stmts(&mut block.stmts[index + 1..], &mut pass) {
+        // 候选拒绝[ConvergenceGuard]：touch/writeback facts 已证明 suffix 存在 temp；rewrite 无命中表示 collector 与 rewriter 不变量漂移。
         return false;
     }
 
     if seed.retained_pairs.is_empty() {
         block.stmts.remove(index);
     } else if !rewrite_binding_handoff_seed(&mut block.stmts[index], &seed.retained_pairs) {
+        // 证明缺陷[InvariantMismatch]：suffix 已提交改名后 seed apply 仍可失败，plan/apply 漂移时会留下半提交 transaction。
         return false;
     }
 
@@ -165,12 +173,14 @@ fn try_collapse_label_loop_update_handoff(
     let Some((carried, update_temp)) = direct_temp_writeback_stmt(&block.stmts[index]) else {
         return false;
     };
+    // 候选拒绝[SemanticBarrier:Lifetime]：update temp 有 seed 前入口 use 或与 carried 不同 storage identity 时，改名会合并不同 epoch/root。
     if outer_bindings.contains(&CarryBinding::Temp(update_temp))
         || temp_touches.touches_before(index, update_temp)
         || !temp_handoff_preserves_storage(update_temp, carried, safety)
     {
         return false;
     }
+    // 候选拒绝[SemanticBarrier:ControlFlow]：此 owner 只处理回到 prior label 的 handoff；没有该回边时 writeback 是普通顺序赋值。
     if !label_jumps.next_label_has_prior_goto(&block.stmts, index) {
         return false;
     }
@@ -190,6 +200,7 @@ fn try_collapse_label_loop_update_handoff(
         .iter()
         .any(|stmt| stmt_writes_temp(stmt, update_temp))
     {
+        // 候选拒绝[SemanticBarrier:Lifetime]：update 后再次写 temp 时，全 suffix 改名会把后续独立 temp epoch 覆盖到 carried。
         return false;
     }
 
@@ -201,6 +212,7 @@ fn try_collapse_label_loop_update_handoff(
         promotion_facts: safety.promotion_facts,
     };
     if !rewrite_stmts(&mut block.stmts[index..], &mut pass) {
+        // 候选拒绝[ConvergenceGuard]：已定位 seed/update/writeback；无 rewrite 命中表示 touch index 与 rewriter 契约漂移。
         return false;
     }
 
@@ -243,6 +255,7 @@ fn try_collapse_single_binding_handoff(
     };
 
     // 外层仍提及 source/target 时，这只是当前块的值快照，不能升级成同一状态身份。
+    // 候选拒绝[SemanticBarrier:Lifetime]：outer/source 前 touch 证明 temp 是独立快照；合并会让跨块读取看到 binding 的后续 epoch。
     if outer_bindings.contains(&CarryBinding::Temp(temp))
         || outer_bindings.contains(&binding)
         || temp_touches.touches_before(index, temp)
@@ -250,16 +263,21 @@ fn try_collapse_single_binding_handoff(
         return false;
     }
     if captured_bindings.contains(&binding) {
+        // 候选拒绝[SemanticBarrier:Capture]：closure 可在 suffix 中隐式读写 binding，文本 mention 不能证明快照等价。
         return false;
     }
     if !temp_handoff_preserves_storage(temp, binding, safety) {
+        // 候选拒绝[SemanticBarrier:Lifetime]：异槽或资源 identity 的 temp/binding 同值仍是两个可被 GC/close 观察的 root。
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：外部 goto 可绕过 seed 后进入 suffix，改名会把未定义 temp 路径变成已有 binding。
         return false;
     }
 
     let suffix = &block.stmts[index + 1..];
+    // 候选拒绝[SemanticBarrier:Lifetime]：suffix 仍 mention binding 时，重写 temp 的读写会与 binding 原有 epoch 干涉。
+    // 候选拒绝[ProofIncomplete]：suffix 无 temp touch 时可考虑 dead seed 删除，但当前 handoff owner 不拥有该证明。
     if suffix.is_empty()
         || suffix_mentions_binding(suffix, binding)
         || !temp_touches.touches_after(index + 1, temp)
@@ -278,6 +296,7 @@ fn try_collapse_single_binding_handoff(
         },
     );
     if !rewritten {
+        // 候选拒绝[ConvergenceGuard]：touch facts 已证明 suffix 命中 temp；无 rewrite 表示索引/visitor 不变量漂移。
         return false;
     }
 
@@ -299,6 +318,8 @@ fn try_collapse_binding_update_handoff(
     };
 
     // 如果被折叠的 temp 在外层作用域中仍被引用，不能消除。
+    // 候选拒绝[SemanticBarrier:Lifetime]：outer temp use 或异槽/resource identity 会观察被删除 target temp 的独立 epoch/root。
+    // 候选拒绝[SemanticBarrier:Capture]：carried 被 closure 隐式访问时，把 update 提前写入 carried 会改变 closure 观察值。
     if outer_bindings.contains(&CarryBinding::Temp(target_temp))
         || captured_bindings.contains(&carried)
         || !temp_handoff_preserves_storage(target_temp, carried, safety)
@@ -306,10 +327,13 @@ fn try_collapse_binding_update_handoff(
         return false;
     }
     if label_jumps.next_label_has_prior_goto(&block.stmts, index) {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：prior goto 绕过 update seed 后进入 suffix，不能把未定义 temp 替换成 carried。
         return false;
     }
 
     let suffix = &block.stmts[index + 1..];
+    // 候选拒绝[SemanticBarrier:EvalOrder]：suffix 读取旧 carried 时，将 seed RHS 直接写 carried 会让该读取提前看到 next 值。
+    // 候选拒绝[ProofIncomplete]：只接受线性前缀+末尾直接写回；一般结构化路径需 path-complete writeback facts。
     if suffix.is_empty()
         || suffix_reads_binding(suffix, carried)
         || !suffix_ends_with_linear_direct_writeback(suffix, carried, target_temp)
@@ -329,9 +353,11 @@ fn try_collapse_binding_update_handoff(
         },
     );
     if !rewritten {
+        // 候选拒绝[ConvergenceGuard]：suffix touch/writeback 已证明 temp 存在；无 rewrite 命中表示 plan facts 漂移。
         return false;
     }
     if !rewrite_update_handoff_seed(&mut block.stmts[index], carried) {
+        // 证明缺陷[InvariantMismatch]：suffix 已改写后 seed apply 可失败且没有 rollback，plan/apply 漂移会半提交。
         return false;
     }
 

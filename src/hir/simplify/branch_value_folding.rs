@@ -152,10 +152,14 @@ fn nil_fallback_decision_rewrite(stmt: &HirStmt) -> Option<NilFallbackDecisionRe
     let [HirExpr::Decision(decision)] = local_decl.values.fixed.as_slice() else {
         return None;
     };
+    // 候选拒绝[SemanticBarrier:ValueArity]：fixed Decision 后仍有 tail 时，改写成单值 local 会丢失 tail 的值宽度。
+    // 候选拒绝[ConvergenceGuard]：单节点 Decision 的 entry 必须为 0；否则是 HIR node index 不变量损坏。
+    // 候选拒绝[ProofIncomplete]：多节点 nil Decision 尚未证明可物化成单个无 else fallback；应消费完整 Decision 路径事实。
     if local_decl.values.tail.is_some() || decision.entry.index() != 0 || decision.nodes.len() != 1
     {
         return None;
     }
+    // 候选拒绝[ConvergenceGuard]：上方已证明 nodes.len()==1；取不到首节点表示 Decision 容器不变量损坏。
     let node = decision.nodes.first()?;
     let source = nil_check_local(&node.test)?;
     let (fallback, source_target) = match (&node.truthy, &node.falsy) {
@@ -165,6 +169,7 @@ fn nil_fallback_decision_rewrite(stmt: &HirStmt) -> Option<NilFallbackDecisionRe
         ) => (fallback.clone(), *source_target),
         _ => return None,
     };
+    // 候选拒绝[SemanticBarrier:Scope]：`target == source` 或 fallback 读取 target 时，移到声明后的 if 会把 RHS 的外层读取改成新局部读取。
     if source_target != source || *target == source || expr_mentions_local(&fallback, *target) {
         return None;
     }
@@ -240,7 +245,9 @@ fn fold_root_branch_value_temps(proto: &mut HirProto) -> Vec<TempId> {
             continue;
         };
         let guards_are_mechanical = guards.iter().all(|guard| {
+            // 候选拒绝[SemanticBarrier:Lifetime]：guard 若还被其它根语句读取，删除其赋值会留下未定义/旧 epoch 的 temp 读取。
             stmt_touch_counts.get(guard) == Some(&1)
+                // 候选拒绝[LayerBoundary]：带 debug-local identity 的 temp 由 locals/source identity 层决定，HIR 值折叠不能抢先删除。
                 && proto
                     .temp_debug_locals
                     .get(guard.index())
@@ -296,6 +303,7 @@ fn nil_fallback_alias_rewrite(
     let HirStmt::If(if_stmt) = if_stmt else {
         return None;
     };
+    // 候选拒绝[SemanticBarrier:ControlFlow]：`local x; if a==nil then x=b end` 的 a 非 nil 路径保留 nil，改写成 `local x=a` 会变成 a。
     let else_block = if_stmt.else_block.as_ref()?;
     let (source, fallback_block) = if let Some(source) = nil_check_local(&if_stmt.cond) {
         let then_value = terminal_local_assign_value(&if_stmt.then_block, target)?;
@@ -303,6 +311,7 @@ fn nil_fallback_alias_rewrite(
         if !matches!(else_value, HirExpr::LocalRef(local) if *local == source)
             || expr_mentions_local(then_value, target)
         {
+            // 候选拒绝[ProofIncomplete]：fallback 读取空声明 target 时理论上仍见 nil，但需先证明 source != target 与整个 prefix 不改写 target。
             return None;
         }
         (source, if_stmt.then_block.clone())
@@ -313,10 +322,12 @@ fn nil_fallback_alias_rewrite(
         if !matches!(then_value, HirExpr::LocalRef(local) if *local == source)
             || expr_mentions_local(else_value, target)
         {
+            // 候选拒绝[ProofIncomplete]：negated fallback 读取空声明 target 时需证明 source != target 与 fallback prefix 的 target epoch。
             return None;
         }
         (source, else_block.clone())
     };
+    // 证明缺陷[PotentialUnsoundness:Scope]：未排除 target==source；外层 x=7 时原 `local x; if x==nil then x=1 else x=x end` 得 1，改写 `local x=x` 得 7。
     Some(NilFallbackAliasRewrite {
         target,
         source,
@@ -435,11 +446,13 @@ fn collapsible_branch_value_temp(stmt: &HirStmt) -> Option<(TempId, HirStmt, BTr
 
 fn branch_value_expr(binding: BranchValueBinding, if_stmt: &HirIf) -> Option<HirExpr> {
     let truthy = try_collapse_block_to_value(&if_stmt.then_block, binding)?;
+    // 候选拒绝[ProofIncomplete]：空 local 的无 else 路径可取 nil，但当前 builder 没有把“未赋值 epoch == nil”作为 falsy target 事实。
     let falsy = try_collapse_block_to_value(if_stmt.else_block.as_ref()?, binding)?;
     if binding.mentions_expr(&if_stmt.cond)
         || binding.mentions_expr(&truthy)
         || binding.mentions_expr(&falsy)
     {
+        // 候选拒绝[SemanticBarrier:Scope]：`local x; if x then x=a else x=b end` 若改成 initializer，RHS 的 x 会解析到外层而非已声明的 nil local。
         return None;
     }
     finalize_branch_value_targets(
@@ -456,6 +469,7 @@ fn try_collapse_block_to_value(block: &HirBlock, binding: BranchValueBinding) ->
         [HirStmt::LocalDecl(decl), HirStmt::If(if_stmt)] => {
             collapse_local_guard_pattern(decl, if_stmt, binding)
         }
+        // 候选拒绝[ProofIncomplete]：其它叶块可能仅含可搬移的中性语句，也可能有 call/control effect；需逐句路径 effect summary，不能按长度 blanket 判定。
         _ => None,
     }
 }
@@ -484,15 +498,18 @@ fn collapse_local_guard_pattern(
         return None;
     }
 
+    // 候选拒绝[ProofIncomplete]：空 output local 的 guard 无 else 路径可取 nil；当前折叠器尚未携带该初始化 epoch 作为 rest target。
     let rest_block = if_stmt.else_block.as_ref()?;
     if expr_mentions_local(value, *guard)
         || binding.mentions_expr(value)
         || block_mentions_local(rest_block, *guard)
     {
+        // 候选拒绝[SemanticBarrier:Scope]：删除 guard/local 壳会让 value/rest 中对 guard 或 output binding 的读取改指外层或丢失当前快照。
         return None;
     }
     let rest_value = try_collapse_block_to_value(rest_block, binding)?;
     if binding.mentions_expr(&rest_value) || expr_mentions_local(&rest_value, *guard) {
+        // 候选拒绝[SemanticBarrier:Scope]：rest value 仍读取被删除 guard/output binding，直接内联会改变读取的 lexical identity。
         return None;
     }
     finalize_branch_value_targets(
@@ -517,6 +534,7 @@ fn finalize_branch_value_targets(
         }],
     };
     let value = crate::hir::decision::finalize_value_decision_expr(decision);
+    // 候选拒绝[ProofIncomplete]：共享/不可表达 Decision 尚未收成普通逻辑表达式；应增强 decision collapse，而非把内部 DAG 泄露给 local initializer。
     (!matches!(value, HirExpr::Decision(_))).then_some(value)
 }
 
@@ -575,6 +593,7 @@ fn plan_branch_value_goto_folds(
     let mut next_start = stmts.len();
     let mut selected = Vec::new();
     for fold in candidates.into_iter().rev() {
+        // 候选搜索裁剪[ConvergenceGuard]：与右侧已选区间交叉/包含的候选留给 fixed-point 下一轮，不是语义拒绝。
         if fold.label_index < next_start {
             next_start = fold.if_index;
             selected.push(fold);
@@ -596,6 +615,7 @@ fn direct_goto_label_fold_at(
     let HirStmt::Label(label) = stmts.get(label_index)? else {
         return None;
     };
+    // 候选拒绝[SemanticBarrier:ControlFlow]：join label 若有第二个 goto 入口，删掉 label 会破坏该入口的控制流目标。
     if label_ref_count(label_refs, label.id) != 1
         || !direct_goto_value_matches(stmts.get(if_index)?, stmts.get(if_index + 1)?, label.id)
     {
@@ -617,6 +637,7 @@ fn nested_default_goto_label_fold_at(
 ) -> Option<BranchValueGotoFold> {
     let default_label = single_goto_if_target(stmts.get(if_index)?)?;
     let default_label_index = label_indices.get(&default_label).copied()?;
+    // 候选拒绝[SemanticBarrier:ControlFlow]：default label 位于 if 之前时是回边；把它内联成 else 会把循环执行改成单次分支。
     if default_label_index <= if_index {
         return None;
     }
@@ -624,6 +645,7 @@ fn nested_default_goto_label_fold_at(
     let HirStmt::Label(join_label) = stmts.get(label_index)? else {
         return None;
     };
+    // 候选拒绝[SemanticBarrier:ControlFlow]：default/join 任一 label 有额外入口时，删除 label 会截断该入口可达路径。
     if label_ref_count(label_refs, default_label) != 1
         || label_ref_count(label_refs, join_label.id) != 1
         || !nested_default_goto_value_matches(
@@ -647,6 +669,7 @@ fn prepare_branch_value_goto_fold(
     stmts: &[HirStmt],
     fold: BranchValueGotoFold,
 ) -> Option<PreparedBranchValueGotoFold> {
+    // 候选拒绝[ConvergenceGuard]：matcher 已验证 if/terminal goto 形状；rewrite 返回 None 表示 plan 与 rewrite 的内部契约漂移。
     let replacement = match fold.kind {
         BranchValueGotoFoldKind::Direct => rewrite_direct_goto_value_if(
             stmts[fold.if_index].clone(),
@@ -713,12 +736,14 @@ fn direct_goto_value_matches(
     let HirStmt::If(if_stmt) = if_stmt else {
         return false;
     };
+    // 候选拒绝[SemanticBarrier:ControlFlow]：候选 if 已有非空 else 时，安装 fallback else 会覆盖原 false-path 行为。
     if has_non_empty_else(if_stmt) {
         return false;
     }
     let Some((fallback_target, fallback_value)) = single_assign(fallback_stmt) else {
         return false;
     };
+    // 候选拒绝[ProofIncomplete]：direct 改写并不复制 fallback，但仍沿用只准简单 target/value 的保守白名单；应按语句原样搬移事实放宽。
     if !target_allows_default_duplication(fallback_target)
         || !is_branch_default_value_expr(fallback_value)
     {
@@ -737,12 +762,14 @@ fn nested_default_goto_value_matches(
     let HirStmt::If(outer_if) = outer_stmt else {
         return false;
     };
+    // 候选拒绝[SemanticBarrier:ControlFlow]：outer if 已有 false-path 时，改写生成的 fallback else 会覆盖这条既有路径。
     if has_non_empty_else(outer_if) || single_goto_if_target(outer_stmt).is_none() {
         return false;
     }
     let Some((fallback_target, fallback_value)) = single_assign(fallback_stmt) else {
         return false;
     };
+    // 候选拒绝[ProofIncomplete]：fallback 只复制到互斥分支且每条路径一次；当前 target/value 白名单缺少路径互斥与 lvalue 求值时点证明。
     if !target_allows_default_duplication(fallback_target)
         || !is_branch_default_value_expr(fallback_value)
     {
@@ -751,6 +778,7 @@ fn nested_default_goto_value_matches(
     let [.., HirStmt::If(inner_if)] = prefix_stmts else {
         return false;
     };
+    // 候选拒绝[SemanticBarrier:ControlFlow]：inner if 已有 else 时，写入 fallback else 会覆盖原 false-path 行为。
     if has_non_empty_else(inner_if) {
         return false;
     }
@@ -759,6 +787,7 @@ fn nested_default_goto_value_matches(
 }
 
 fn rewrite_direct_goto_value_if(if_stmt: HirStmt, fallback_stmt: HirStmt) -> Option<HirStmt> {
+    // 候选拒绝[ConvergenceGuard]：direct matcher 已证明输入是 if 且 then 以目标 goto 终结，以下失败仅表示内部不变量损坏。
     let HirStmt::If(mut if_stmt) = if_stmt else {
         return None;
     };
@@ -774,6 +803,7 @@ fn rewrite_nested_default_goto_value_if(
     prefix_stmts: Vec<HirStmt>,
     fallback_stmt: HirStmt,
 ) -> Option<HirStmt> {
+    // 候选拒绝[ConvergenceGuard]：nested matcher 已证明 outer/inner if 与 terminal goto；以下失败仅表示 plan/rewrite 不变量损坏。
     let HirStmt::If(mut outer_if) = outer_stmt else {
         return None;
     };
@@ -822,6 +852,7 @@ fn terminal_goto_assign_target(block: &HirBlock, label: HirLabelId) -> Option<&H
     if goto.target != label {
         return None;
     }
+    // 候选拒绝[ProofIncomplete]：整条 assignment 会原样搬移，当前仅接受单 target/单 fixed value；需证明一般 value-pack 的赋值宽度也不受位置变化影响。
     let [target] = assign.targets.as_slice() else {
         return None;
     };
@@ -842,6 +873,7 @@ fn single_assign(stmt: &HirStmt) -> Option<(&HirLValue, &HirExpr)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
+    // 候选拒绝[ProofIncomplete]：goto 壳改写搬移完整 fallback statement，当前 extractor 对多 target/value-pack 的限制尚未由语义反例支持。
     let [target] = assign.targets.as_slice() else {
         return None;
     };
@@ -938,6 +970,7 @@ fn raw_temp_guard_shape<'a>(
     if !matches!(if_stmt.cond, HirExpr::TempRef(temp) if temp == guard) {
         return None;
     }
+    // 候选拒绝[SemanticBarrier:ControlFlow]：`t=v; if t then out=t end` 的 false-path 保留 out 旧值，不能构造成总有结果的短路值。
     let else_block = if_stmt.else_block.as_ref()?;
     let (binding, rest_block, guard_is_truthy_value) =
         if let Some(binding) = block_assigns_binding_from_temp(&if_stmt.then_block, guard) {
@@ -946,6 +979,7 @@ fn raw_temp_guard_shape<'a>(
             let binding = block_assigns_binding_from_temp(else_block, guard)?;
             (binding, &if_stmt.then_block, false)
         };
+    // 候选拒绝[ProofIncomplete]：binding 与 guard 相同时可形成原地短路更新，但需证明 CurrentValue 指向赋值后的 guard epoch 才能折叠。
     if binding == BranchValueBinding::Temp(guard) {
         return None;
     }

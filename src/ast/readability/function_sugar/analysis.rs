@@ -29,6 +29,7 @@ pub(super) fn collect_method_field_names_in_block(block: &AstBlock, fields: &mut
 
 pub(super) fn function_uses_global_name(function: &AstFunctionExpr, name: &str) -> bool {
     let mut visitor = GlobalNameFinder { name, found: false };
+    // 证明缺陷[PotentialUnsoundness:Scope]：finder 在嵌套 closure 处停止；`function(x) return function() return self end end` 改成 method 后，嵌套的全局 `self` 也会被外层隐式 self 遮蔽。
     visit::visit_block(&function.body, &mut visitor);
     visitor.found
 }

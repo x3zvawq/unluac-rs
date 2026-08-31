@@ -108,7 +108,11 @@ fn removable_inline_candidate<'a>(
     write_index: &BindingWriteIndex,
 ) -> Option<(InlineCandidate, &'a AstExpr)> {
     let (candidate, value) = inline_candidate(stmts.get(stmt_index)?)?;
-    (!write_index.has_write_after(stmt_index, candidate.binding())).then_some((candidate, value))
+    if write_index.has_write_after(stmt_index, candidate.binding()) {
+        // 候选拒绝[SemanticBarrier:Scope]：删除仍有后续 direct write 的 local 声明，会把保留赋值渲染成外层/global 写入。
+        return None;
+    }
+    Some((candidate, value))
 }
 
 struct BindingWriteCollector<'a> {
@@ -215,6 +219,7 @@ fn rewrite_current_block(
         }) {
             // Preserve the field alias until function-sugar can consume the receiver snapshot,
             // lookup, and call atomically. Inlining only the lookup loses the method proof.
+            // 候选拒绝[LayerBoundary]：receiver + field alias + call 必须由 function-sugar 原子消费，单独内联 lookup 会销毁 method 证明。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -224,6 +229,7 @@ fn rewrite_current_block(
         {
             // Keep a call result local while it is the table's only strong root.  A later
             // rawset/clear may otherwise make the generated expression collectable earlier.
+            // 候选拒绝[SemanticBarrier:Lifetime]：`local x=f(); t[k]=x` 中 local 可能是弱表外唯一强 root，内联会让 `x` 在 rawset/clear 前提前可回收。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -250,6 +256,7 @@ fn rewrite_current_block(
             // 如果太早收成 `local weight = items[i].weight`，后面的机械 run 就只剩一层，
             // 无法再判断“整条链都只是脚手架”。让它留到 run-collapse 一次性处理，
             // 才能既收回 for-loop 里的机械局部，又保住 return 场景下的阶段 local。
+            // 候选拒绝[LayerBoundary]：连续 lookup 由本 pass 的 mechanical-run 事务统一证明，单项先吞会丢掉整段候选边界。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -295,6 +302,7 @@ fn rewrite_current_block(
             // A closure capture or self-reference would still depend on the local's lexical
             // identity after the declaration is removed.  The ordinary use index starts after
             // this declaration, so reject that case explicitly before the unique-use check.
+            // 候选拒绝[SemanticBarrier:Scope]：`local x=function() return x end; return x` 删除声明会改变 closure 捕获的词法身份。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -302,11 +310,20 @@ fn rewrite_current_block(
         if !candidate.allows_expr_with_policy(value, effective_policy)
             && !allows_special_lookup_access_base
         {
+            // 候选拒绝[ProofIncomplete]：当前策略缺少把此 RHS 放入该 sink 后的值宽度、求值时点或 root 生命周期证明；需扩展对应 expr/site 事实而非猜测。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
-        if use_index.count_uses_in_suffix(index + 1, candidate.binding()) != 1 {
+        let suffix_uses = use_index.count_uses_in_suffix(index + 1, candidate.binding());
+        if suffix_uses == 0 {
+            // 候选拒绝[LayerBoundary]：未使用声明的删除归 cleanup/dead-local，不属于表达式内联。
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
+        if suffix_uses > 1 {
+            // 候选拒绝[SemanticBarrier:EvalCount]：多次使用会复制 RHS，如 `local x=f(); g(x,x)` 会把 `f()` 从一次变两次。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -318,6 +335,7 @@ fn rewrite_current_block(
             mutable_snapshots,
             effective_policy,
         ) {
+            // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：producer 不能跨过 sink 的调用、lookup、循环重求值或 mutable snapshot；如 `v=side(); guard()==v` 不等价于 `guard()==side()`。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -345,11 +363,13 @@ fn rewrite_current_block(
                     options,
                     rewrite_policy,
                 ) {
+                    // 候选拒绝[ProofIncomplete]：扩展调用链仍找不到已证明安全的唯一 use-site；需要更精确的位置/值宽度事实。
                     stmt_plan.push(PlannedStmt::Original(index));
                     index += 1;
                     continue;
                 }
             } else {
+                // 候选拒绝[ProofIncomplete]：候选通过表达式级检查但当前 sink 没有可证明安全的替换位置，需补 use-site 分类。
                 stmt_plan.push(PlannedStmt::Original(index));
                 index += 1;
                 continue;
@@ -411,25 +431,43 @@ fn collapse_stable_copy_aliases(
         else {
             continue;
         };
-        if candidate.origin() != super::super::common::AstLocalOrigin::Recovered
-            || !candidate.allows_expr_with_policy(value, InlinePolicy::StableCopy)
-            || mutable_snapshots.contains(&candidate.binding().to_name_ref())
-        {
+        if candidate.origin() != super::super::common::AstLocalOrigin::Recovered {
+            // 候选拒绝[PolicyBoundary]：DebugHinted 保留源码身份；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 若在 use 后仍处于原词法作用域，会延后弱表消失或 `__gc`。
+            continue;
+        }
+        if !candidate.allows_expr_with_policy(value, InlinePolicy::StableCopy) {
+            // 候选拒绝[ProofIncomplete]：stable-copy 当前只证明变量与 primitive literal，尚未按纯度扩展其它事件为空的表达式。
+            continue;
+        }
+        if mutable_snapshots.contains(&candidate.binding().to_name_ref()) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：captured/mutable snapshot 的值可能被中间调用改写，直接替换会读取新值。
             continue;
         }
 
-        let Some(use_stmt_index) = use_index
-            .unique_use_stmt_in_suffix(candidate_index + 1, candidate.binding())
-            .filter(|use_stmt_index| *use_stmt_index < stmts.len())
-        else {
-            // A repeat's trailing condition is outside this block's statement rewrite boundary.
+        let suffix_uses = use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
+        if suffix_uses == 0 {
+            // 候选拒绝[LayerBoundary]：未使用声明的删除归 cleanup/dead-local，不属于 copy-inline。
             continue;
+        }
+        if suffix_uses > 1 {
+            // 候选拒绝[SemanticBarrier:EvalCount]：多次 use 会复制 RHS；例如 `local x=f(); g(x,x)` 不能改成 `g(f(),f())`。
+            continue;
+        }
+        let Some(use_stmt_index) =
+            use_index.unique_use_stmt_in_suffix(candidate_index + 1, candidate.binding())
+        else {
+            unreachable!("one suffix use must have an indexed owner");
         };
+        if use_stmt_index >= stmts.len() {
+            // 候选拒绝[LayerBoundary]：repeat trailing condition 位于当前 block 的 statement rewrite 边界之外。
+            continue;
+        }
 
         if let AstExpr::Var(source_name) = value {
             let Some(source_binding) = binding_from_name_ref(source_name) else {
                 // Parameters are intentionally owned by HIR local convergence; globals,
                 // upvalues and temps have no stable copy proof at this AST stage.
+                // 候选拒绝[LayerBoundary]：参数 alias 归 HIR locals；候选拒绝[ProofIncomplete]：global/upvalue 缺少声明点快照与写入事实，AST 不能跨语句猜测。
                 continue;
             };
             // A bound local/synthetic name can only appear while its lexical declaration is
@@ -439,6 +477,7 @@ fn collapse_stable_copy_aliases(
                 AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_)
             ) || mutable_snapshots.contains(source_name)
             {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：captured/upvalue/global/temp source 可在中间调用中改变；只允许当前词法域内未捕获 local/synthetic 快照。
                 continue;
             }
             if write_index.has_write_after(candidate_index, source_binding)
@@ -452,6 +491,7 @@ fn collapse_stable_copy_aliases(
                     source_binding,
                 )
             {
+                // 候选拒绝[SemanticBarrier:EvalOrder/Lifetime]：source 在 use 前后写入时 alias 保存的是旧快照/root；除精确 repeat handoff 外直接替换会读取新值或缩短 root。
                 continue;
             }
         }
@@ -491,24 +531,45 @@ fn stable_copy_has_trailing_root_handoff(
         .any(super::control_flow::stmt_contains_label_or_goto)
         || !write_index.writes_start_after(use_stmt_index, source)
     {
+        // 候选拒绝[SemanticBarrier:ControlFlow/EvalOrder]：goto 可绕过 handoff；source 若非只在 handoff 后写入，alias 与 source 在 use 点不保证同值。
         return false;
     }
     let AstStmt::Assign(assign) = &stmts[use_stmt_index] else {
+        // 候选拒绝[ProofIncomplete]：trailing root handoff 目前只证明单目标赋值形状。
         return false;
     };
     let ([AstLValue::Name(target)], [AstExpr::Var(value)]) =
         (assign.targets.as_slice(), assign.values.as_slice())
     else {
+        // 候选拒绝[ProofIncomplete]：多目标/非变量 handoff 尚无精确的 root 接管证明。
         return false;
     };
     let Some(target) = binding_from_name_ref(target).filter(|_| candidate.matches_name_ref(value))
     else {
+        // 候选拒绝[ProofIncomplete]：只有 `target = candidate` 的直接接管形状纳入当前证明。
         return false;
     };
-    target != source
-        && !mutable_snapshots.contains(&target.to_name_ref())
-        && !write_index.has_write_after(use_stmt_index, target)
-        && trailing_condition.is_some_and(|condition| expr_references_binding(condition, target))
+    if target == source {
+        // 候选拒绝[ProofIncomplete]：同 binding 回写不是当前“新 target 接管旧 root”证明的形状。
+        return false;
+    }
+    if mutable_snapshots.contains(&target.to_name_ref()) {
+        // 候选拒绝[SemanticBarrier:Capture]：target 被 closure 捕获时，接管前后的 binding 写入可被观察。
+        return false;
+    }
+    if write_index.has_write_after(use_stmt_index, target) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：target 在 latch 前再次写入时不能继续承载同一快照/root。
+        return false;
+    }
+    let Some(condition) = trailing_condition else {
+        // 候选拒绝[LayerBoundary]：没有 repeat trailing condition 时不属于此 handoff 规则。
+        return false;
+    };
+    if !expr_references_binding(condition, target) {
+        // 候选拒绝[ProofIncomplete]：当前证明要求 latch 条件消费 target，以确认 root 接管覆盖到循环尾。
+        return false;
+    }
+    true
 }
 
 fn inline_crosses_evaluation_boundary(

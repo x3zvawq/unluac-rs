@@ -7,6 +7,7 @@ pub(super) fn merge_initialized_local_declarations(
     start: usize,
     count: usize,
 ) -> bool {
+    // 候选拒绝[ProofIncomplete]：单声明无需合并，越界表示 caller 的 declaration group 不变量漂移。
     if count < 2 || start + count > block.stmts.len() {
         return false;
     }
@@ -22,6 +23,7 @@ pub(super) fn merge_initialized_local_declarations(
             .map(CarryBinding::Local)
             .collect::<Vec<_>>();
         if bindings_are_mentioned_in_exprs(std::iter::once(value), &earlier) {
+            // 候选拒绝[SemanticBarrier:Scope]：顺序 `local a=v; local b=a` 合成并行声明后，b 的 RHS 会解析到外层 a。
             return false;
         }
         bindings.push(binding);

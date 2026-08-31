@@ -49,6 +49,10 @@ impl HirRewritePass for RecursiveClosureSelfCapturePass<'_> {
                     && assign.values.tail.is_none()
                     && assign.values.fixed.len() == 1 =>
             {
+                // 证明缺陷[PotentialUnsoundness:Capture]：仅凭“closure 当前被赋给该 lvalue”就把 target 当原 self slot，缺少 closure-result origin/home；producer 被前轮内联到 global/upvalue/另一 local 后会把稳定 self cell 错换成可变目标 binding。
+                // 候选拒绝[SemanticBarrier:Capture]：table lvalue 不建立可捕获 binding；把
+                // `t[k] = closure` 的悬空 capture 改成 `t[k]` 会新增可触发 `__index` 的读取，
+                // 且该读取不保证仍返回刚写入的 closure。
                 let Some(binding_expr) = lvalue_as_expr(&assign.targets[0]) else {
                     return false;
                 };
@@ -77,9 +81,13 @@ fn rewrite_closure_self_captures(
         let HirExpr::TempRef(temp) = capture.value else {
             continue;
         };
+        // 候选拒绝[SemanticBarrier:Capture]：已定义 temp 是普通捕获值而非递归 self 槽；
+        // `temp = 1; local f = function() return temp end` 不能把 capture 改成 `f`。
         if defined_temps.contains(&temp) {
+            // 候选拒绝[ProofIncomplete]：全 proto defined 集不区分定义在 capture 前后或是否可达；后置/互递归 self def 也会被 blanket 当成普通值，应改用 reaching-def 与 closure-result origin。
             continue;
         }
+        // 证明缺陷[PotentialUnsoundness:Capture]：未校验 capture mode 与唯一 self provenance；ByValue self 在目标后来重绑时仍应指向原 closure，改成目标 binding 会观察新值，多个未定义 capture 也会被错误折成同一 cell。
         capture.value = replacement.clone();
         changed = true;
     }

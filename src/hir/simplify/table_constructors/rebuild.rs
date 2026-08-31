@@ -104,6 +104,8 @@ fn flush_constructor_segment(
     if builder.trailing_multivalue.is_some()
         && (!segment.is_empty() || set_list_stmt_index.is_some())
     {
+        // 候选拒绝[SemanticBarrier:ValueArity]：constructor 的 open tail 已决定后续数组槽；
+        // 再吸收字段会改变多返回值覆盖范围，反例见 regress_52_table_trailing_multivalue_boundary。
         return None;
     }
 
@@ -119,11 +121,15 @@ fn flush_constructor_segment(
                     &mut context.scratch.restored_array_fields,
                 )
             {
+                // 候选拒绝[SemanticBarrier:TableShape]：重叠 SETLIST 只有在既有 array 后缀可
+                // 精确降为整数 record 时才能表示；反例见 regress_237_table_constructor_open_overlap。
                 return None;
             }
             builder
                 .drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
             if set_list.start_index != builder.next_array_index() {
+                // 候选拒绝[SemanticBarrier:TableShape]：SETLIST 起点与隐式数组下标不连续，
+                // 直接追加会改写键集合与 `#table` 结果。
                 return None;
             }
             for value in &set_list.values.fixed {
@@ -144,6 +150,8 @@ fn flush_constructor_segment(
         if start_index < builder.next_array_index()
             && !builder.demote_array_suffix(start_index, &mut context.scratch.restored_array_fields)
         {
+            // 候选拒绝[SemanticBarrier:TableShape]：不能表示的 SETLIST overlap 会改变旧后缀
+            // 是否被 open pack 覆盖；反例见 regress_237_table_constructor_open_overlap。
             return None;
         }
         builder.next_array_index()
@@ -179,6 +187,8 @@ fn flush_constructor_segment(
     if let Some(stmt_index) = set_list_stmt_index {
         let set_list = set_list_stmt(context.block, stmt_index)?;
         if set_list.start_index != expected_set_list_start {
+            // 候选拒绝[SemanticBarrier:TableShape]：producer/record 不能改变 raw SETLIST 的
+            // 固定起点；否则隐式 array key 与原字节码不一致。
             return None;
         }
 
@@ -263,15 +273,32 @@ fn flush_constructor_segment(
             return true;
         }
         match producer.group {
+            // 证明缺陷[PotentialUnsoundness:Lifetime]：open group 仅消费一个结果就允许
+            // 删掉其余 local；`local a,b=f(); t.x=a` 中 b 可能是带 finalizer 对象的唯一 GC root。
             Some(group) if context.scratch.consumed_groups[group] => false,
-            Some(group) => !context.scratch.producer_groups[group].drop_without_consumption_is_safe,
+            Some(_) => false,
             None => true,
         }
     }) {
+        // 候选拒绝[ProofIncomplete]：仍有 use 或未消费的单值 producer 时，当前事务只能
+        // 删除整个声明；应支持保留 producer 的 partial rebuild。
+        return None;
+    }
+    if context.scratch.pending_producers.iter().any(|producer| {
+        !context.scratch.consumed_bindings[producer.binding_id]
+            && producer.group.is_some_and(|group| {
+                !context.scratch.consumed_groups[group]
+                    && !context.scratch.producer_groups[group].drop_without_consumption_is_safe
+            })
+    }) {
+        // 候选拒绝[SemanticBarrier:EvalMultiplicity]：未消费的 open producer group 若来自
+        // call，删除声明会删除一次调用；只有无事件的 vararg source 可以丢弃。
         return None;
     }
 
     if !constructor_eval_order_is_preserved(set_list_stmt_index, context) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：source/generated 事件序列不同会重排 lookup、
+        // call 或元方法；反例见 regress_212 与 regress_235。
         return None;
     }
 
@@ -302,6 +329,8 @@ fn flush_set_list_values_before_producer(
             context.binding_index,
             &context.scratch.producer_index_by_binding,
         ) {
+            // 候选拒绝[ProofIncomplete]：SETLIST 队首存在跨 producer 依赖时，当前队列计划
+            // 不能拓扑展开全部依赖；应扩展 producer DAG，而不是永久拒绝该 region。
             return None;
         }
         let value = queued_values.pop_front()?;
@@ -636,6 +665,8 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
         inline_constructor_value(&mut inline_context, value)?
     };
     if matches!(value, HirExpr::Closure(_)) && recursive_closure_slot {
+        // 候选拒绝[SemanticBarrier:Capture]：删除递归 closure 的独立 binding 会让 closure
+        // 捕获失去自身 owner，例如 `local f; f = function() return f end; t.x = f`。
         return None;
     }
     if expr_captures_orphaned_binding(
@@ -644,6 +675,8 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
         context.materialized_binding_counts,
         &context.scratch.removed_materializations,
     ) {
+        // 候选拒绝[SemanticBarrier:Capture]：被删除的最后一次 materialization 仍被 closure
+        // 捕获会产生 orphan upvalue；反例见 regress_224_table_capture_writeback。
         return None;
     }
     let prepared_record_index = context.scratch.prepared_records.len();

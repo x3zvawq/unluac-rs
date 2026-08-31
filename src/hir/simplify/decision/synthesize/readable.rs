@@ -32,6 +32,7 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     let mut refs = BTreeSet::new();
     collect_refs_from_expr(&current, &mut refs);
     let refs = refs.into_iter().collect::<Vec<_>>();
+    // 候选拒绝[ResourceLimit]：穷举域目前只接纳 4 个独立引用；后续应改用符号等价或依赖分区。
     if refs.len() > MAX_SYNTH_REFS {
         return None;
     }
@@ -52,16 +53,20 @@ pub(crate) fn naturalize_pure_logical_expr(expr: &HirExpr) -> Option<HirExpr> {
     domain.extend(
         (0..super::EXTRA_TRUTHY_SYMBOLS).map(|index| AbstractValue::TruthySymbol(index as u8)),
     );
+    // 候选拒绝[ResourceLimit]：抽象环境笛卡尔积超过 4096 时停止 naturalize；后续应避免完整枚举。
     let environments = enumerate_environments(refs.len(), &domain)?;
     let mut changed = false;
+    // 候选搜索裁剪[ResourceLimit]：最多 8 轮单调降成本改写；更深机会交给更强的规范形算法。
     for _ in 0..MAX_NATURALIZE_ROUNDS {
         let current_cost = super::expr_cost(&current);
         let Some(next) = pure_logical_rewrite_candidates(&current)
             .into_iter()
             .map(normalize_candidate_expr)
+            // 候选拒绝[ProofIncomplete]：有限抽象域当前只能筛掉已见反例；错误路径与跨数值表示尚未精确建模，不能据此宣称完整等价证明。
             .filter(|candidate| {
                 validate_pure_expr_equivalence(expr, candidate, &environments, &ref_positions)
             })
+            // 候选拒绝[PolicyBoundary]：等价但不严格降低可读性成本的形状不提交。
             .filter(|candidate| super::expr_cost(candidate) < current_cost)
             .min_by_key(super::expr_cost)
         else {
@@ -105,11 +110,13 @@ fn pure_logical_rewrite_candidates(expr: &HirExpr) -> Vec<HirExpr> {
                 candidates.push(rebuilt);
             }
             if candidates.len() >= MAX_NATURALIZE_NESTED_CANDIDATES {
+                // 候选搜索裁剪[ResourceLimit]：单轮最多保留 128 个一层子树候选；后续应使用去重工作队列。
                 return candidates;
             }
         }
     }
 
+    // 候选搜索裁剪[ResourceLimit]：root 直接生成的候选同样最多保留 128 个；后续应使用增量最小成本队列。
     candidates.truncate(MAX_NATURALIZE_NESTED_CANDIDATES);
     candidates
 }
@@ -233,6 +240,7 @@ fn factor_or_of_ands(lhs: &HirExpr, rhs: &HirExpr) -> Vec<HirExpr> {
 
 fn factor_or_chain_of_ands(expr: &HirExpr) -> Vec<HirExpr> {
     let terms = flatten_or_chain(expr);
+    // 候选搜索裁剪[ResourceLimit]：超过 16 项的 or 链不做两两因式分解，避免二次候选爆炸。
     if !(3..=MAX_NATURALIZE_OR_TERMS).contains(&terms.len()) {
         return Vec::new();
     }

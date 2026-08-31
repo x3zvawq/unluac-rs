@@ -55,6 +55,7 @@ fn try_lower_local_function_decl(
     // collect_forward_capture_blocked 计算），说明它参与了一个互递归前向声明组，
     // 不能使用 `local function` 语法。必须保持 `local X = function() end` 形式。
     if blocked_bindings.contains(&name) {
+        // 候选拒绝[SemanticBarrier:Scope]：互递归 `local a=function() return b() end; local b=...` 改成逐条 `local function` 会让前一闭包解析不到后声明槽位。
         return None;
     }
     Some(AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
@@ -122,15 +123,19 @@ pub(super) fn function_decl_target_from_lvalue(
         AstLValue::Name(_) => None,
         AstLValue::FieldAccess(access) => {
             let (root, mut fields) = name_path_from_expr(&access.base)?;
-            if method_fields.contains(&access.field)
-                && !func.params.is_empty()
-                && !function_captures_name_path_root(func, &root)
-                && !function_uses_global_name(func, "self")
-            {
-                return Some((
-                    AstFunctionName::Method(AstNamePath { root, fields }, access.field.clone()),
-                    func.clone(),
-                ));
+            if method_fields.contains(&access.field) {
+                if func.params.is_empty() {
+                    // 候选拒绝[SemanticBarrier:Vararg]：零显式参数的 vararg 函数若改成 method，隐式 self 会把 receiver 从 `...` 中消费掉；非 vararg 也缺少首参 provenance。
+                } else if function_captures_name_path_root(func, &root) {
+                    // 候选拒绝[ProofIncomplete]：`obj.f=function(p) return obj end` 与 `function obj:f() return obj end` 看似保留同一 capture；当前没有给出 root capture 必须拒绝的具体不等价反例。
+                } else if function_uses_global_name(func, "self") {
+                    // 候选拒绝[SemanticBarrier:Scope]：原函数体的全局 `self` 会被冒号声明隐式创建的局部 self 遮蔽。
+                } else {
+                    return Some((
+                        AstFunctionName::Method(AstNamePath { root, fields }, access.field.clone()),
+                        func.clone(),
+                    ));
+                }
             }
             fields.push(access.field.clone());
             Some((

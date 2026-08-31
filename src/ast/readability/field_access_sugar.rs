@@ -56,8 +56,10 @@ fn field_access_from_index(
     let AstExpr::String(field_value) = &access.index else {
         return None;
     };
+    // 候选拒绝[TargetConstraint]：Lua 裸字段名必须是目标方言可表示的 UTF-8 标识符；原始字节键只能保留 `obj["..."]`。
     let field = field_value.as_utf8()?;
     if !is_lua_identifier_name(field, dialect) {
+        // 候选拒绝[TargetConstraint]：关键字或非法标识符不能生成 `obj.field`，否则目标方言源码无法解析。
         return None;
     }
     Some(AstFieldAccess {

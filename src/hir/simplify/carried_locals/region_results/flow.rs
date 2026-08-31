@@ -68,6 +68,8 @@ fn find_candidate(
             continue;
         };
         let result_binding = CarryBinding::Local(result);
+        // 候选拒绝[LayerBoundary]：debug/source identity 的 result 由 locals owner 保留。
+        // 候选拒绝[SemanticBarrier:Capture]：captured/outer result 可在 region 外被观察，不能删除其 cell identity。
         if identity_facts.contains(result)
             || outer_bindings.contains(&result_binding)
             || identity_facts.captured.contains(&result_binding)
@@ -85,14 +87,18 @@ fn find_candidate(
             continue;
         };
         if region_has_forbidden_nodes(&block.stmts[declaration + 1..=last_mention]) {
+            // 候选拒绝[LayerBoundary]：Decision/Unresolved 交给 decision/elimination owner；TBC/Close 交给资源身份 owner。
+            // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可引入未被结构化 verifier 覆盖的入口与出口。
             continue;
         }
         let state_candidates =
             writeback_targets(&block.stmts[declaration + 1..=last_mention], result_binding);
         let [state] = state_candidates.as_slice() else {
+            // 候选拒绝[ProofIncomplete]：零/多个 writeback target 需要 reaching-def/phi 对应关系，当前 verifier 只建模唯一 state。
             continue;
         };
         let state = *state;
+        // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/不可用/异槽 state 与 result 具有可区分的作用域或 root epoch。
         if state == result_binding
             || !identity_facts.binding_merge_preserves_identity(
                 result_binding,
@@ -118,14 +124,17 @@ fn find_candidate(
             state,
         };
         let Some(states) = verifier.validate_initializer(initializer) else {
+            // 候选拒绝[ProofIncomplete]：initializer 的宽值/opaque/候选读取关系未被三态 verifier 表达。
             continue;
         };
         let Some(states) =
             verifier.validate_stmts(&block.stmts[declaration + 1..=last_mention], states)
         else {
+            // 候选拒绝[ProofIncomplete]：region 含当前三态转移表未覆盖的 assignment/loop/opaque 组合；需增强路径 relation。
             continue;
         };
         if states.contains(Relation::Pending) {
+            // 候选拒绝[SemanticBarrier:Lifetime]：存在出口上 result 已产出而 state 未同步；改名会让该路径提前覆盖旧 state。
             continue;
         }
         return Some(Candidate {
@@ -239,6 +248,7 @@ impl FlowVerifier {
             return Some(RelationSet::only(Relation::Unproduced));
         };
         let [value] = initializer.fixed.as_slice() else {
+            // 候选拒绝[ProofIncomplete]：多 fixed initializer 尚未建立 result 对应 value 的精确宽度映射。
             return None;
         };
         let states = RelationSet::only(Relation::Unproduced);
@@ -276,9 +286,11 @@ impl FlowVerifier {
             HirStmt::Block(block) => self.validate_stmts(&block.stmts, states),
             HirStmt::Return(return_stmt) => {
                 self.validate_pack(&return_stmt.values, states)?;
+                // 候选拒绝[SemanticBarrier:ControlFlow]：Pending 路径 return 时原 state 仍旧，result 改名会在返回前提前覆盖 state/capture。
                 (!states.contains(Relation::Pending)).then_some(RelationSet::EMPTY)
             }
             HirStmt::Break | HirStmt::Continue => {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：Pending 路径提前转移时没有执行 writeback，不能把 result producer 直接改成 state write。
                 (!states.contains(Relation::Pending)).then_some(RelationSet::EMPTY)
             }
             HirStmt::While(_)
@@ -286,6 +298,7 @@ impl FlowVerifier {
             | HirStmt::NumericFor(_)
             | HirStmt::GenericFor(_) => self.validate_loop(stmt, states),
             HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_) => {
+                // 候选拒绝[LayerBoundary]：非结构跳转与 close epoch 不属于三态 verifier；分别由 CFG/resource owner 消费。
                 None
             }
             HirStmt::LocalDecl(local_decl) => {
@@ -297,6 +310,8 @@ impl FlowVerifier {
                     || local_decl.values.tail.is_some()
                         && self.pack_mentions_candidate(&local_decl.values)
                 {
+                    // 候选拒绝[SemanticBarrier:Scope]：region 内重声明 result/state 会让批量 LocalId 改名跨越 lexical owner。
+                    // 候选拒绝[ProofIncomplete]：open-tail local pack 提及候选时缺逐目标 value-width 关系。
                     return None;
                 }
                 self.validate_pack(&local_decl.values, states)?;
@@ -315,6 +330,7 @@ impl FlowVerifier {
             assign.values.fixed.as_slice(),
             &assign.values.tail,
         ) else {
+            // 候选拒绝[ProofIncomplete]：复杂 assignment 只有在完全不提候选时可穿过；候选相关并行/value-pack 转移尚未建模。
             return (!self.assign_mentions_candidate(assign)).then_some(states);
         };
         self.validate_expr(value, states)?;
@@ -344,6 +360,7 @@ impl FlowVerifier {
                 } else if !reads_result {
                     Some(RelationSet::only(Relation::Unproduced))
                 } else {
+                    // 候选拒绝[ProofIncomplete]：state RHS 同时读取 pending result 与旧 state 时，改名后两者同名，需表达式级双 epoch substitution。
                     None
                 }
             }
@@ -354,12 +371,14 @@ impl FlowVerifier {
     fn validate_loop(&self, stmt: &HirStmt, states: RelationSet) -> Option<RelationSet> {
         let mentions = collect_binding_mentions_by_stmt(std::slice::from_ref(stmt));
         if mentions[0].contains(&self.state) {
+            // 候选拒绝[ProofIncomplete]：loop 内 state mention 被 blanket 拒绝；需 loop-carried relation fixed-point 区分安全同步读写。
             return None;
         }
         if !mentions[0].contains(&self.result) {
             return Some(states);
         }
         if states.contains(Relation::Unproduced) || stmt_has_nested_transfer(stmt) {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：未产出 result 进入 loop 或 nested break/continue/return 会形成当前 fixed-point 未记录的出口/回边。
             return None;
         }
         match stmt {
@@ -393,6 +412,7 @@ impl FlowVerifier {
             }
             entries = next;
         }
+        // 候选拒绝[ConvergenceGuard]：RelationSet 仅三位且 union 单调，四轮仍不稳定表示 transfer 不变量损坏。
         None
     }
 
@@ -421,11 +441,13 @@ impl FlowVerifier {
             }
             entries = next;
         }
+        // 候选拒绝[ConvergenceGuard]：三态单调 fixed-point 四轮仍不收敛表示 relation transfer 不变量损坏。
         None
     }
 
     fn validate_leaf(&self, stmt: &HirStmt, states: RelationSet) -> Option<()> {
         if stmt_contains_opaque_expr(stmt) {
+            // 候选拒绝[LayerBoundary]：Decision/Unresolved 的内部读取路径由 decision owner 解析，leaf verifier 不展开。
             return None;
         }
         let mut reads = BindingReadCollector::default();
@@ -435,6 +457,7 @@ impl FlowVerifier {
 
     fn validate_pack(&self, pack: &HirValuePack, states: RelationSet) -> Option<()> {
         if pack.tail.is_some() && self.pack_mentions_candidate(pack) {
+            // 候选拒绝[ProofIncomplete]：open-tail 中候选值的多返回宽度与消费位置尚未建模。
             return None;
         }
         for value in pack {
@@ -445,6 +468,7 @@ impl FlowVerifier {
 
     fn validate_expr(&self, expr: &HirExpr, states: RelationSet) -> Option<()> {
         if expr_contains_opaque(expr) {
+            // 候选拒绝[LayerBoundary]：opaque Decision/Unresolved 的路径读取交由其 owner 消解后再审计。
             return None;
         }
         self.validate_reads(&binding_reads_in_expr(expr), states)
@@ -459,6 +483,7 @@ impl FlowVerifier {
     }
 
     fn validate_reads(&self, reads: &BTreeSet<CarryBinding>, states: RelationSet) -> Option<()> {
+        // 候选拒绝[SemanticBarrier:Lifetime]：读取未产出的 result 或 Pending 期间的旧 state 时，二者改名会把读取切到错误 epoch。
         (!reads.contains(&self.result) || !states.contains(Relation::Unproduced)).then_some(())?;
         (!reads.contains(&self.state) || !states.contains(Relation::Pending)).then_some(())
     }

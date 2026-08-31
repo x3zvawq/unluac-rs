@@ -57,6 +57,9 @@ impl ExprRewritePass for LogicalExprPass {
             changed = true;
         }
 
+        // 候选拒绝[TargetConstraint]：非 Luau 方言的整数/浮点算术与结果类型合同不同，不能套用 Luau number 快路径。
+        // 候选拒绝[SemanticBarrier:Numeric]：把 `-0.0 + -0.0` 经整数域折成 `0.0` 会丢失可观察的负零符号位。
+        // 候选拒绝[ProofIncomplete]：其余有限小数及大整数尚未直接按 Luau f64 语义求值，应扩展 helper 而非永久保留。
         if self.fold_luau_literal_addition
             && let HirExpr::Binary(binary) = expr
             && binary.op == HirBinaryOpKind::Add
@@ -106,6 +109,7 @@ pub(super) fn simplify_logical_shape(expr: &HirExpr) -> Option<HirExpr> {
 }
 
 fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    // 候选拒绝[SemanticBarrier:EvalCount]：`f() and f()` 折成 `f()` 会在首个结果 truthy 时少调用一次。
     if lhs == rhs && expr_is_repeatable(lhs) {
         return Some(lhs.clone());
     }
@@ -118,10 +122,14 @@ fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
         return Some(replacement);
     }
 
-    if expr_is_boolean_valued(lhs) && matches!(rhs, HirExpr::Boolean(true)) {
-        return Some(lhs.clone());
+    match (rhs, expr_is_boolean_valued(lhs)) {
+        (HirExpr::Boolean(true), true) => return Some(lhs.clone()),
+        // 候选拒绝[SemanticBarrier:Value]：`1 and true` 返回 true，而直接改成 `1` 返回原始数值。
+        (HirExpr::Boolean(true), false) => {}
+        _ => {}
     }
 
+    // 候选拒绝[ProofIncomplete]：以下 blanket gate 连未被删除的单次子式也要求 repeatable；需按吸收形状只核验实际重复 occurrence。
     if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
         return None;
     }
@@ -134,6 +142,7 @@ fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
 }
 
 fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    // 候选拒绝[SemanticBarrier:EvalCount]：`f() or f()` 折成 `f()` 会在首个结果 falsy 时少调用一次。
     if lhs == rhs && expr_is_repeatable(lhs) {
         return Some(lhs.clone());
     }
@@ -146,8 +155,11 @@ fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
         return Some(replacement);
     }
 
-    if expr_is_boolean_valued(lhs) && matches!(rhs, HirExpr::Boolean(false)) {
-        return Some(lhs.clone());
+    match (rhs, expr_is_boolean_valued(lhs)) {
+        (HirExpr::Boolean(false), true) => return Some(lhs.clone()),
+        // 候选拒绝[SemanticBarrier:Value]：`nil or false` 返回 false，而直接改成 lhs 会返回 nil。
+        (HirExpr::Boolean(false), false) => {}
+        _ => {}
     }
     if let Some(replacement) = naturalize_truthy_ternary(lhs, rhs) {
         return Some(replacement);
@@ -162,6 +174,7 @@ fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
         return Some(replacement);
     }
 
+    // 候选拒绝[ProofIncomplete]：以下 blanket gate 连未被删除的单次子式也要求 repeatable；需按吸收形状只核验实际重复 occurrence。
     if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
         return None;
     }
@@ -184,10 +197,11 @@ fn naturalize_truthy_ternary(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
     let HirExpr::Unary(guard) = &and_expr.lhs else {
         return None;
     };
-    if guard.op != HirUnaryOpKind::Not
-        || expr_truthiness(&and_expr.rhs) != Some(true)
-        || expr_truthiness(rhs) != Some(true)
-    {
+    if guard.op != HirUnaryOpKind::Not {
+        return None;
+    }
+    // 候选拒绝[SemanticBarrier:Value]：分支非恒真时两式会返回不同 falsy 原值；`a=false,x=false,y=1` 时原式为 1、候选为 false。
+    if expr_truthiness(&and_expr.rhs) != Some(true) || expr_truthiness(rhs) != Some(true) {
         return None;
     }
 
@@ -201,6 +215,7 @@ fn naturalize_truthy_ternary(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
 }
 
 fn fold_associative_duplicate_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    // 候选拒绝[SemanticBarrier:EvalCount]：匹配到重复项但其为 `f()` 时，删除一项会减少一次可能调用。
     match (lhs, rhs) {
         (HirExpr::LogicalAnd(inner), rhs) if rhs == &inner.rhs && expr_is_repeatable(rhs) => {
             Some(lhs.clone())
@@ -213,6 +228,7 @@ fn fold_associative_duplicate_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExp
 }
 
 fn fold_associative_duplicate_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    // 候选拒绝[SemanticBarrier:EvalCount]：匹配到重复项但其为 `f()` 时，删除一项会减少一次可能调用。
     match (lhs, rhs) {
         (HirExpr::LogicalOr(inner), rhs) if rhs == &inner.rhs && expr_is_repeatable(rhs) => {
             Some(lhs.clone())
@@ -229,9 +245,6 @@ fn factor_shared_and_guards(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
 }
 
 fn factor_shared_and_guards_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
-        return None;
-    }
     let HirExpr::LogicalAnd(lhs_and) = lhs else {
         return None;
     };
@@ -240,6 +253,10 @@ fn factor_shared_and_guards_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<Hir
     };
 
     if lhs_and.lhs == rhs_and.lhs {
+        // 候选拒绝[ProofIncomplete]：只需证明共享 guard 可重复；当前整臂 gate 会连仅求值一次的 b/c call 一并拒绝，应改为 occurrence 级证明。
+        if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
+            return None;
+        }
         return Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
             lhs: lhs_and.lhs.clone(),
             rhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
@@ -257,9 +274,6 @@ fn pull_shared_or_tail(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
 }
 
 fn pull_shared_or_tail_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
-        return None;
-    }
     let HirExpr::LogicalAnd(lhs_and) = lhs else {
         return None;
     };
@@ -267,6 +281,10 @@ fn pull_shared_or_tail_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr>
         return None;
     };
     if rhs != &inner_or.rhs {
+        return None;
+    }
+    // 候选拒绝[ProofIncomplete]：只需证明被删除的共享 tail 可重复；当前整臂 gate 会拒绝未移动且仅求值一次的 guard/前缀 call。
+    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
         return None;
     }
 
@@ -284,6 +302,7 @@ fn fold_constant_short_circuit_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirEx
     match expr_truthiness(lhs) {
         Some(true) if expr_is_discard_safe(lhs) => Some(rhs.clone()),
         Some(false) => Some(lhs.clone()),
+        // 候选拒绝[SemanticBarrier:EvalCount]：已知 truthy 的 `{ f() }` 仍不可删除，否则字段表达式中的一次 `f()` 消失。
         Some(true) => None,
         None => None,
     }
@@ -293,6 +312,7 @@ fn fold_constant_short_circuit_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExp
     match expr_truthiness(lhs) {
         Some(true) => Some(lhs.clone()),
         Some(false) if expr_is_discard_safe(lhs) => Some(rhs.clone()),
+        // 候选拒绝[SemanticBarrier:EvalCount]：已知 falsy 但不可丢弃的 lhs 仍必须求值一次，不能直接选 rhs。
         Some(false) => None,
         None => None,
     }
@@ -310,9 +330,6 @@ fn fold_shared_fallback_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
 }
 
 fn shared_fallback_or_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
-        return None;
-    }
     let HirExpr::LogicalAnd(lhs_and) = lhs else {
         return None;
     };
@@ -321,6 +338,10 @@ fn shared_fallback_or_one_side(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> 
     };
     let guard = strip_negation(&lhs_and.lhs)?;
     if guard != rhs_or.lhs || lhs_and.rhs != rhs_or.rhs {
+        return None;
+    }
+    // 候选拒绝[SemanticBarrier:EvalCount]：fallback 为 `f()` 且返回 falsy 时，机械展开可能调用两次，合并后只调用一次。
+    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
         return None;
     }
     Some(rhs.clone())
@@ -446,8 +467,11 @@ fn simplify_condition_logical_and(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExp
     if matches!(rhs, HirExpr::Boolean(true)) {
         return Some(lhs.clone());
     }
-    if matches!(rhs, HirExpr::Boolean(false)) && expr_is_discard_safe(lhs) {
-        return Some(HirExpr::Boolean(false));
+    match (rhs, expr_is_discard_safe(lhs)) {
+        (HirExpr::Boolean(false), true) => return Some(HirExpr::Boolean(false)),
+        // 候选拒绝[SemanticBarrier:EvalCount]：`f() and false` 在条件中仍调用 `f()`，不能直接变成 false。
+        (HirExpr::Boolean(false), false) => {}
+        _ => {}
     }
     if matches!(lhs, HirExpr::Boolean(true)) {
         return Some(rhs.clone());
@@ -468,8 +492,11 @@ fn simplify_condition_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr
     if matches!(rhs, HirExpr::Boolean(false)) {
         return Some(lhs.clone());
     }
-    if matches!(rhs, HirExpr::Boolean(true)) && expr_is_discard_safe(lhs) {
-        return Some(HirExpr::Boolean(true));
+    match (rhs, expr_is_discard_safe(lhs)) {
+        (HirExpr::Boolean(true), true) => return Some(HirExpr::Boolean(true)),
+        // 候选拒绝[SemanticBarrier:EvalCount]：`f() or true` 在条件中仍调用 `f()`，不能直接变成 true。
+        (HirExpr::Boolean(true), false) => {}
+        _ => {}
     }
     if matches!(lhs, HirExpr::Boolean(false)) {
         return Some(rhs.clone());
@@ -485,22 +512,23 @@ fn simplify_condition_logical_or(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr
 /// 两臂均可重复时，被删除的 `b` 或第二次 `c` 读取没有可观察事件；这里只保持 truthiness，
 /// 所以不能进入会返回原始 Lua 操作数的普通值语境。
 fn factor_condition_shared_and_tail(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
-        return None;
-    }
-    let (HirExpr::LogicalAnd(lhs), HirExpr::LogicalAnd(rhs)) = (lhs, rhs) else {
+    let (HirExpr::LogicalAnd(lhs_and), HirExpr::LogicalAnd(rhs_and)) = (lhs, rhs) else {
         return None;
     };
-    if lhs.rhs != rhs.rhs {
+    if lhs_and.rhs != rhs_and.rhs {
+        return None;
+    }
+    // 候选拒绝[ProofIncomplete]：当前整臂 repeatable gate 未区分被合并 occurrence 与仍单次原位求值的子式，需候选级 eval-trace 对照。
+    if !expr_is_repeatable(lhs) || !expr_is_repeatable(rhs) {
         return None;
     }
 
     Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
         lhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
-            lhs: lhs.lhs.clone(),
-            rhs: rhs.lhs.clone(),
+            lhs: lhs_and.lhs.clone(),
+            rhs: rhs_and.lhs.clone(),
         })),
-        rhs: lhs.rhs.clone(),
+        rhs: lhs_and.rhs.clone(),
     })))
 }
 
@@ -516,7 +544,11 @@ fn absorb_stable_or_guard(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
     let HirExpr::LogicalOr(inner_or) = &and_expr.lhs else {
         return None;
     };
-    if lhs != &inner_or.lhs || !expr_is_repeatable(lhs) {
+    if lhs != &inner_or.lhs {
+        return None;
+    }
+    // 候选拒绝[SemanticBarrier:EvalCount]：重复 guard 为 `f()` 时，吸收会在某些路径把两次调用缩成一次。
+    if !expr_is_repeatable(lhs) {
         return None;
     }
 

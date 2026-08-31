@@ -104,7 +104,11 @@ fn collapsible_live_boolean_materialization_shell(stmt: &HirStmt) -> Option<(Hir
 
     let (then_target, then_value) = single_fixed_assign_pattern(&if_stmt.then_block)?;
     let (else_target, else_value) = single_fixed_assign_pattern(else_block)?;
-    if then_target != else_target || !target_address_can_follow_condition_eval(then_target) {
+    if then_target != else_target {
+        return None;
+    }
+    // 候选拒绝[SemanticBarrier:EvalOrder]：regress_249 中 table 左值会把地址求值移出已选分支，条件改写的 holder 因而指向不同 table。
+    if !target_address_can_follow_condition_eval(then_target) {
         return None;
     }
 
@@ -134,10 +138,6 @@ fn removable_dead_materialization_shell(
     let Some(else_block) = &if_stmt.else_block else {
         return false;
     };
-    if !expr_is_discard_safe(&if_stmt.cond) {
-        return false;
-    }
-
     let Some((then_target, then_value)) = single_fixed_assign_pattern(&if_stmt.then_block) else {
         return false;
     };
@@ -146,15 +146,22 @@ fn removable_dead_materialization_shell(
     };
     let (HirLValue::Temp(then_temp), HirLValue::Temp(else_temp)) = (then_target, else_target)
     else {
+        // 候选拒绝[ProofIncomplete]：当前 use-count 只覆盖 Temp；需补 local/param/upvalue/global 的读取、debug 与 capture 事实后再区分真正可删的死写。
         return false;
     };
+    // 候选拒绝[SemanticBarrier:EvalCount]：删除 `if f() then t=true else t=false end` 会漏掉仍需执行一次的 `f()`。
+    if !expr_is_discard_safe(&if_stmt.cond) {
+        return false;
+    }
 
+    // 候选拒绝[SemanticBarrier:ValueFlow]：任一分支 temp 后续仍被读取时，删除写入会改变该读取到的值。
     if use_counts.get(then_temp).copied().unwrap_or(0) != 0
         || use_counts.get(else_temp).copied().unwrap_or(0) != 0
     {
         return false;
     }
 
+    // 候选拒绝[SemanticBarrier:EvalCount]：死 temp 的 `t=f()` 仍必须调用一次 `f()`，不能随布尔壳一起丢弃。
     expr_is_discard_safe(then_value) && expr_is_discard_safe(else_value)
 }
 

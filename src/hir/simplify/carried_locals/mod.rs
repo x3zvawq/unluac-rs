@@ -304,6 +304,10 @@ impl HandoffIdentityFacts {
         target: CarryBinding,
         promotion_facts: &ProtoPromotionFacts,
     ) -> bool {
+        // 证明缺陷[PotentialPolicyViolation]：共享 identity gate 未检查 self.debug/for_bindings；未额外调用 contains 的 handoff owner 可删除 debug/for binding 身份。
+        // 候选拒绝[LayerBoundary]：entry-nil provenance 已被前层裁剪时，promotion owner 无法再证明原 binding identity。
+        // 候选拒绝[SemanticBarrier:Capture]：capture 任一端或 raw-home may-alias reference capture 时，closure 可区分合并前的 cell。
+        // 候选拒绝[SemanticBarrier:Lifetime]：TBC 任一端或 raw-home may-alias resource binding 时，合并会改变 close/root epoch。
         !source
             .local()
             .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))

@@ -24,7 +24,11 @@ pub(super) fn prune_redundant_entry_nil_writes(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
 ) -> bool {
-    if facts.compacts_home_slots() || proto.body.stmts.len() < 2 {
+    if facts.compacts_home_slots() {
+        // 分析停用[ProofIncomplete]：当前用全 proto compaction flag 阻断所有候选；应按候选 local 的完整 home 历史证明是否跨槽，仅跨槽者才有漏删真实覆盖的生命周期风险。
+        return false;
+    }
+    if proto.body.stmts.len() < 2 {
         return false;
     }
 
@@ -38,29 +42,51 @@ pub(super) fn prune_redundant_entry_nil_writes(
         let Some(local) = empty_local(&proto.body.stmts[index]) else {
             continue;
         };
-        if !facts.is_entry_nil_phi_local(local)
-            || facts.trusted_local_home_slot(local).is_none()
-            || bindings_may_alias_local(&reference_captured, local, facts)
-            || bindings_may_alias_local(&value_captured, local, facts)
-            || bindings_may_alias_local(&to_be_closed, local, facts)
-            || bindings_may_alias_local(&debug_identity, local, facts)
-            || proto
-                .local_debug_hints
-                .get(local.index())
-                .is_some_and(Option::is_some)
+        if !facts.is_entry_nil_phi_local(local) {
+            // 候选拒绝[LayerBoundary]：普通空 local 的 nil 写没有 canonical Entry(nil) phi provenance，不属于本定向裁剪器。
+            continue;
+        }
+        if facts.trusted_local_home_slot(local).is_none() {
+            // 候选拒绝[ProofIncomplete]：缺 trusted `(slot, close epoch)` 时无法把 HIR KnownNil 对齐到被删除写的物理 home；应由 promotion 补齐 provenance。
+            continue;
+        }
+        if bindings_may_alias_local(&reference_captured, local, facts) {
+            // 候选拒绝[ProofIncomplete]：reference capture 与候选可能同槽时当前未证明重复 nil 写对 closure cell 的观测不可见；应区分 direct candidate capture 与仅因 home 缺失的 may-alias。
+            continue;
+        }
+        if bindings_may_alias_local(&value_captured, local, facts) {
+            // 候选拒绝[ProofIncomplete]：按值 capture 被 blanket may-alias 阻断；应按 capture snapshot 的实际语句位置证明 KnownNil 后放行。
+            continue;
+        }
+        if bindings_may_alias_local(&to_be_closed, local, facts) {
+            // 候选拒绝[ProofIncomplete]：候选与 TBC binding 可能同槽时缺少 close-owner epoch 的逐写证明，尚不能确认该 nil 是资源边界后的真正冗余写。
+            continue;
+        }
+        if bindings_may_alias_local(&debug_identity, local, facts) {
+            // 候选拒绝[PolicyBoundary]：带 source debug identity 或与其 may-alias 的槽保留原始写入形状，维护源码/调试信息保真度。
+            continue;
+        }
+        if proto
+            .local_debug_hints
+            .get(local.index())
+            .is_some_and(Option::is_some)
         {
+            // 候选拒绝[PolicyBoundary]：候选 local 自身有 debug 名称时保留显式 nil branch 写，避免压缩源码调试形状。
             continue;
         }
         let HirStmt::If(if_stmt) = &proto.body.stmts[index + 1] else {
             continue;
         };
         if !if_region_is_supported(if_stmt, local) {
+            // 候选拒绝[ProofIncomplete]：loop/exit/cleanup/shadow 等 region 尚无路径敏感 NilState 与 close epoch；应按真实 fallthrough 分别裁剪可达臂。
+            // 候选拒绝[LayerBoundary]：残留 Decision/Unresolved 先由 decision/unresolved owner 消除，本 pass 不解释其执行路径。
             continue;
         }
 
         let mut rewritten = (**if_stmt).clone();
         let Some((_, candidate_changed)) = prune_if(&mut rewritten, local, NilState::KnownNil)
         else {
+            // 候选拒绝[ConvergenceGuard]：validator/rewriter 支持集合失配时只丢弃 clone 上的候选，原 if 尚未提交；应共享遍历结果消除双轨。
             continue;
         };
         if candidate_changed {
@@ -127,7 +153,10 @@ fn prune_block(
                 state = next;
                 changed |= nested_changed;
             }
-            HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => return None,
+            HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => {
+                // 候选拒绝[ConvergenceGuard]：重复 LocalId 声明与前置 validator 失配时终止 clone 重写，不向原 region 提交已裁剪语句。
+                return None;
+            }
             HirStmt::LocalDecl(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)
@@ -142,7 +171,10 @@ fn prune_block(
             | HirStmt::Break
             | HirStmt::Continue
             | HirStmt::Goto(_)
-            | HirStmt::Label(_) => return None,
+            | HirStmt::Label(_) => {
+                // 候选拒绝[ConvergenceGuard]：不支持节点与前置 validator 失配时终止 clone 重写，不向原 region 提交部分结果。
+                return None;
+            }
         }
         rewritten.push(stmt);
     }
@@ -324,8 +356,10 @@ fn bindings_may_alias_local(
     facts: &ProtoPromotionFacts,
 ) -> bool {
     let Some(candidate) = facts.trusted_local_home_slot(local) else {
+        // 候选拒绝[ProofIncomplete]：候选 local 自身缺 trusted home 时 may-alias 只能返回 true；应由 promotion provenance 区分未知与确定不同槽。
         return true;
     };
+    // 候选拒绝[ProofIncomplete]：任一被保护 binding 的 home 未知/失效时当前按 may-alias 拒绝；需要完整 raw-home 集合与 close epoch 才能证明确定不相交。
     bindings.locals.iter().any(|binding| {
         facts.local_home_was_invalidated(*binding)
             || facts

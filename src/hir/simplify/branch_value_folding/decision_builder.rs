@@ -85,6 +85,7 @@ impl BranchValueDecisionBuilder {
     ) -> Option<CollapsedBranchValueTarget> {
         let (node_ref, mut refs) = self.reserve_node(&if_stmt.cond);
         let truthy = self.collapse_block(&if_stmt.then_block, binding)?;
+        // 候选拒绝[SemanticBarrier:ControlFlow]：无 else 时 false-path 保留 binding 旧值；改成有值 Decision 会凭空定义该路径。
         let falsy = self.collapse_block(if_stmt.else_block.as_ref()?, binding)?;
         self.complete_node(node_ref, truthy.target, falsy.target);
         refs.merge(truthy.refs);
@@ -115,6 +116,7 @@ impl BranchValueDecisionBuilder {
             [assign_stmt @ HirStmt::Assign(_), if_stmt @ HirStmt::If(_)] => {
                 self.collapse_raw_temp_guard(assign_stmt, if_stmt, binding)
             }
+            // 候选拒绝[ProofIncomplete]：其它叶块可能含可安全搬移的前缀，也可能含 effect/control；需逐句路径 effect summary 后再扩展构建器。
             _ => None,
         }
     }
@@ -145,8 +147,10 @@ impl BranchValueDecisionBuilder {
         }
 
         let (node_ref, mut refs) = self.reserve_node(value);
+        // 候选拒绝[SemanticBarrier:ControlFlow]：local guard 无 else 时 false-path 保留 binding 旧值，不能构造成总有结果的 Decision。
         let rest = self.collapse_block(if_stmt.else_block.as_ref()?, binding)?;
         let guard = BranchValueBinding::Local(*guard);
+        // 候选拒绝[SemanticBarrier:Scope]：删除 local guard 壳后，对该 guard 的剩余读取会改指外层或失去其声明 identity。
         if refs.mentions(guard) || rest.refs.mentions(guard) {
             return None;
         }
@@ -172,6 +176,7 @@ impl BranchValueDecisionBuilder {
         let (node_ref, mut refs) = self.reserve_node(shape.value);
         let rest = self.collapse_block(shape.rest_block, binding)?;
         let guard = BranchValueBinding::Temp(shape.guard);
+        // 候选拒绝[SemanticBarrier:Lifetime]：删除 raw guard 赋值后，候选内部仍读取该 temp 会改读旧 epoch 或未定义值。
         if refs.mentions(guard) || rest.refs.mentions(guard) {
             return None;
         }
@@ -217,6 +222,8 @@ impl BranchValueDecisionBuilder {
         root: CollapsedBranchValueTarget,
         binding: BranchValueBinding,
     ) -> Option<(HirExpr, BTreeSet<TempId>)> {
+        // 候选拒绝[ProofIncomplete]：leaf 对 output binding 的读取通常仍是赋值前 epoch，但 builder 尚未显式证明树内没有更早的 output write。
+        // 候选拒绝[SemanticBarrier:Lifetime]：结果若仍读将删除的 raw guard（如 `g=v; if g then out=g+1`），会改读旧 g epoch 或未定义值。
         if root.refs.mentions(binding)
             || self
                 .raw_guards
@@ -233,14 +240,17 @@ impl BranchValueDecisionBuilder {
                 })
             }
             HirDecisionTarget::Expr(expr) => expr,
+            // 候选拒绝[ConvergenceGuard]：root 没有父 test 可提供 CurrentValue；出现该 target 表示 builder 不变量未闭合。
             HirDecisionTarget::CurrentValue => return None,
         };
+        // 候选拒绝[ProofIncomplete]：finalize 后仍是 Decision 表示当前表达式层无法承载该 DAG；应增强 decision collapse 再删除控制树。
         (!matches!(value, HirExpr::Decision(_))).then_some((value, self.raw_guards))
     }
 }
 
 fn normalize_current_value_target(test: &HirExpr, target: HirDecisionTarget) -> HirDecisionTarget {
     match target {
+        // 候选拒绝[SemanticBarrier:EvalCount]：`if f() then out=f()` 原本调用两次，非 repeatable test 归一成 CurrentValue 会错误复用第一次结果；见 regress_241。
         HirDecisionTarget::Expr(expr) if expr == *test && expr_is_repeatable(test) => {
             HirDecisionTarget::CurrentValue
         }

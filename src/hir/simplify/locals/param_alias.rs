@@ -45,14 +45,28 @@ pub(super) fn coalesce_param_aliases_in_proto(
         .zip(promotion_facts.trusted_param_home_slot(alias.param))
         .is_some_and(|(local, param)| local == param);
     let rest = &proto.body.stmts[alias.consumed..];
-    if promotion_facts.compacts_home_slots()
-        || promotion_facts.entry_nil_writes_were_pruned(alias.local)
-        || !shares_exact_home
-        || rest
-            .iter()
-            .any(|stmt| stmt_captures_local(stmt, alias.local))
-        || !rest_preserves_param_alias_identity(rest, alias.local, alias.param)
+    if promotion_facts.compacts_home_slots() {
+        // 候选拒绝[SemanticBarrier:Lifetime]：regress lua54_01_close#7 中跨槽把 alias 写回 param 会提前释放原参数 GC root；compaction 下 trusted 同槽不能作为正向证明。
+        return false;
+    }
+    if promotion_facts.entry_nil_writes_were_pruned(alias.local) {
+        // 候选拒绝[ProofIncomplete]：entry-nil 已改变 alias 的写入历史，当前 flow state 未携带被裁剪路径；应把 nil-prune provenance 纳入 alias 初态后再判定。
+        return false;
+    }
+    if !shares_exact_home {
+        // 候选拒绝[SemanticBarrier:Lifetime]：`local l=p; weak[p]=true; l={}; GC` 中跨槽合并会覆盖 p 并让原对象提前回收，原程序的参数槽仍应持有它。
+        return false;
+    }
+    if rest
+        .iter()
+        .any(|stmt| stmt_captures_local(stmt, alias.local))
     {
+        // 候选拒绝[ProofIncomplete]：alias local 的任意 capture 被 blanket 拒绝；当前没有证明该 capture cell 与同 home 参数 cell 在全部写入路径上可合并。
+        return false;
+    }
+    if !rest_preserves_param_alias_identity(rest, alias.local, alias.param) {
+        // 候选拒绝[SemanticBarrier:ValueFlow]：flow proof 发现 alias 写入后仍可读旧参数时，`local l=p; l=1; return p` 合并后会错误返回 1。
+        // 候选拒绝[ProofIncomplete]：同一出口也包含 goto/label 与 path-insensitive join 等尚未分析形状，不能把所有失败都视为已证不等价。
         return false;
     }
 
@@ -146,8 +160,12 @@ fn rest_preserves_param_alias_identity(stmts: &[HirStmt], local: LocalId, param:
     if stmts_reference_captured_bindings(stmts)
         .params
         .contains(&param)
-        || stmts_write_param(stmts, param)
     {
+        // 候选拒绝[SemanticBarrier:Capture]：`local l=p; local f=function() return p end; l=1; return f()` 若合并，f 会观察 1 而非原参数值。
+        return false;
+    }
+    if stmts_write_param(stmts, param) {
+        // 候选拒绝[SemanticBarrier:ValueFlow]：`local l=p; p=2; return l` 若删除 alias 并统一为 p，会从原值变成 2。
         return false;
     }
     validate_alias_flow(stmts, local, param, false).is_some()
@@ -181,6 +199,7 @@ fn validate_alias_stmt(
             } else {
                 local_written
             };
+            // 候选拒绝[ProofIncomplete]：这里用 may-written OR 合流，导致一臂写后退出、另一臂未写后继续的安全路径也被后续 param-read guard 拒绝；应传播逐出口状态集合。
             Some(then_written || else_written)
         }
         HirStmt::While(while_stmt) => {
@@ -200,6 +219,7 @@ fn validate_alias_stmt(
         }
         HirStmt::NumericFor(numeric_for) => {
             if numeric_for.binding == local {
+                // 候选拒绝[ConvergenceGuard]：alias LocalId 同时作为 numeric-for 新 binding 违反唯一声明身份；rewriter 也不能把 LocalId binder 改成 ParamId。
                 return None;
             }
             for expr in [&numeric_for.start, &numeric_for.limit, &numeric_for.step] {
@@ -209,6 +229,7 @@ fn validate_alias_stmt(
         }
         HirStmt::GenericFor(generic_for) => {
             if generic_for.bindings.contains(&local) {
+                // 候选拒绝[ConvergenceGuard]：alias LocalId 同时出现在 generic-for binding 列表违反唯一声明身份，不能在删除入口声明后继续复用。
                 return None;
             }
             for expr in &generic_for.iterator {
@@ -220,13 +241,20 @@ fn validate_alias_stmt(
         HirStmt::ToBeClosed(to_be_closed) => {
             // close-scopes 依赖 direct local/temp 身份配对 TBC；参数不能替代该 binding。
             if expr_mentions_local(&to_be_closed.value, local) {
+                // 候选拒绝[SemanticBarrier:Resource]：`local l=p; <TBC l>; l=q` 若改为参数，会更换 close owner，并可能关闭错误值或改变关闭时点。
                 return None;
             }
             reject_param_read_after_local_write(&to_be_closed.value, param, local_written)?;
             Some(local_written)
         }
-        HirStmt::Goto(_) | HirStmt::Label(_) => None,
-        HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => None,
+        HirStmt::Goto(_) | HirStmt::Label(_) => {
+            // 候选拒绝[ProofIncomplete]：结构化 flow state 没有 label/goto 的 predecessor 合流，无法证明跳转路径上的 alias/param 同步状态。
+            None
+        }
+        HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => {
+            // 候选拒绝[ConvergenceGuard]：候选 LocalId 在后缀再次声明违反唯一 binding 不变量；删除前缀会改变该异常 HIR 的作用域。
+            None
+        }
         HirStmt::LocalDecl(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
@@ -237,6 +265,7 @@ fn validate_alias_stmt(
         | HirStmt::Break
         | HirStmt::Continue => {
             if local_written && stmt_reads_param(stmt, param) {
+                // 候选拒绝[SemanticBarrier:ValueFlow]：`l=1; return p` 的 p 仍应是入口值，合并后却会读取刚写入的 1。
                 return None;
             }
             Some(local_written || stmt_writes_local(stmt, local))
@@ -252,6 +281,7 @@ fn validate_repeating_body(
 ) -> Option<bool> {
     let body_written = validate_alias_flow(&body.stmts, local, param, local_written)?;
     if body_written && !local_written {
+        // 候选拒绝[SemanticBarrier:ValueFlow]：循环首轮写 alias 后，下一轮若读取原 param，合并会把旧入口值替换为上一轮 alias 值。
         validate_alias_flow(&body.stmts, local, param, true)?;
     }
     Some(body_written)
@@ -262,6 +292,7 @@ fn reject_param_read_after_local_write(
     param: ParamId,
     local_written: bool,
 ) -> Option<()> {
+    // 候选拒绝[SemanticBarrier:ValueFlow]：任一路径写 alias 后再读 param（如 `l=1; use(p)`）可观察两个 binding，不能收敛为同一参数。
     (!local_written || !expr_reads_param(expr, param)).then_some(())
 }
 

@@ -95,6 +95,14 @@ fn cleanup_block(
     let mut retained_stmts = Vec::with_capacity(original_stmts.len());
     for stmt in original_stmts {
         match stmt {
+            // 分析停用[ProofIncomplete]：unused-local 清理目前只拥有单 binding/单 value
+            // 事务；多目标声明中可能有可删除子集，需逐 binding 的 value-pack/use 对齐事实。
+            // 候选拒绝[SemanticBarrier:Lifetime]：`<close>` 即使无普通 use 也必须在域末执行
+            // `__close`；候选拒绝[PolicyBoundary]：未使用 `<const>` 的源码声明身份按策略保留。
+            // 候选拒绝[PolicyBoundary]：DebugHinted 身份保留；候选拒绝[SemanticBarrier:Lifetime]：
+            // PhysicalRoot 可能由弱表/`__gc` 观察，不能按普通未使用 local 删除。
+            // 候选拒绝[SemanticBarrier:Scope]：声明外仍有读取、capture 或写入时，删除 local
+            // 会改变读取值、捕获 cell，或让后续 name target 解析成外层/global。
             AstStmt::LocalDecl(mut local_decl)
                 if local_decl.bindings.len() == 1
                     && local_decl.values.len() == 1
@@ -115,6 +123,7 @@ fn cleanup_block(
                             changed = true;
                         }
                         Err(value) => {
+                            // 候选拒绝[SemanticBarrier:EvalCount]：如 `local _ = obj[key]` 的查表可能触发 `__index`；删除声明会少求值一次，且 Lua 没有通用表达式语句可承载它。
                             local_decl.values.push(value);
                             retained_stmts.push(AstStmt::LocalDecl(local_decl));
                         }
@@ -138,6 +147,8 @@ fn cleanup_block(
         let original_len = local_decl.bindings.len();
         local_decl.bindings.retain(|binding| match binding.id {
             AstBindingRef::Temp(_) | AstBindingRef::SyntheticLocal(_) => {
+                // 候选拒绝[SemanticBarrier:Scope]：仍有读取、capture 或写入的机械 binding
+                // 必须保留声明，否则引用会失去原词法槽或写到外层名字。
                 live_mechanical_bindings.contains(&binding.id)
             }
             AstBindingRef::Local(_) => true,
@@ -215,7 +226,12 @@ fn split_overwritten_call_result(
     let [call_value] = local_decl.values.as_slice() else {
         return None;
     };
-    if binding.attr != AstLocalAttr::None || binding.origin != AstLocalOrigin::Recovered {
+    if binding.attr != AstLocalAttr::None {
+        // 候选拒绝[SemanticBarrier:Lifetime]：`<close>` 的退出动作不可移除；`<const>` 也不能改成后置可写声明。
+        return None;
+    }
+    if binding.origin != AstLocalOrigin::Recovered {
+        // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 的 call result 必须活到 overwrite RHS 完成；候选拒绝[PolicyBoundary]：DebugHinted initializer 身份按项目策略保留。
         return None;
     }
     let [target] = assign.targets.as_slice() else {
@@ -225,9 +241,15 @@ fn split_overwritten_call_result(
         return None;
     };
     if !matches!(target, super::super::common::AstLValue::Name(name) if binding.id.matches_name_ref(name))
-        || binding_mentions_in_expr(call_value).contains(&binding.id)
-        || binding_mentions_in_expr(replacement).contains(&binding.id)
     {
+        return None;
+    }
+    if binding_mentions_in_expr(call_value).contains(&binding.id) {
+        // 候选拒绝[ProofIncomplete]：initializer 提及同 ID 时当前 AST 无法证明它表示外层读取还是异常自引用；需显式 initializer-scope binding 事实。
+        return None;
+    }
+    if binding_mentions_in_expr(replacement).contains(&binding.id) {
+        // 候选拒绝[SemanticBarrier:Scope]：`local x=f(); x=x+1` 改成 `f(); local x=x+1` 后 RHS 的 `x` 会解析到外层而非 call result。
         return None;
     }
 
@@ -244,38 +266,56 @@ fn split_overwritten_call_result(
 
 fn trailing_do_block_is_scope_neutral(block: &AstBlock) -> bool {
     !block.stmts.iter().any(|stmt| match stmt {
+        // 候选拒绝[ProofIncomplete]：repeat 尾部的 `global` 若提升，会影响 `until` 中名字的
+        // 方言级解析；普通函数尾没有后继，是安全子集，需把父块尾条件传入后再放宽。
         AstStmt::GlobalDecl(_) => true,
         AstStmt::LocalDecl(local_decl) => {
+            // 候选拒绝[ProofIncomplete]：`repeat do local x <close> = v end until cond()` 拍平
+            // 会把 `__close` 推迟到 cond 后；普通函数尾与父块同时结束，应按上下文放宽。
             local_decl
                 .bindings
                 .iter()
                 .any(|binding| binding.attr == AstLocalAttr::Close)
+                // 候选拒绝[ProofIncomplete]：repeat 尾 closure 拍平会让 condition 新增 local
+                // 可见性并延长 capture root；无尾条件父块是安全子集，当前 blanket gate 过宽。
                 || local_decl
                     .values
                     .iter()
                     .any(|value| matches!(value, AstExpr::FunctionExpr(_)))
         }
+        // 候选拒绝[ProofIncomplete]：local function 与上述 closure 同理；缺少父块 tail-use/
+        // trailing-condition 事实，当前同时拒绝了普通函数尾的安全形状。
         AstStmt::LocalFunctionDecl(_) => true,
         _ => false,
     })
 }
 
 fn can_elide_single_stmt_do_block(stmt: &AstStmt) -> bool {
-    matches!(
-        stmt,
+    match stmt {
         AstStmt::Assign(_)
-            | AstStmt::CallStmt(_)
-            | AstStmt::Return(_)
-            | AstStmt::If(_)
-            | AstStmt::While(_)
-            | AstStmt::Repeat(_)
-            | AstStmt::NumericFor(_)
-            | AstStmt::GenericFor(_)
-            | AstStmt::Break
-            | AstStmt::Continue
-            | AstStmt::Goto(_)
-            | AstStmt::FunctionDecl(_)
-    )
+        | AstStmt::CallStmt(_)
+        | AstStmt::Return(_)
+        | AstStmt::If(_)
+        | AstStmt::While(_)
+        | AstStmt::Repeat(_)
+        | AstStmt::NumericFor(_)
+        | AstStmt::GenericFor(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::FunctionDecl(_) => true,
+        // 候选拒绝[SemanticBarrier:Scope]：单句 local/global/local-function 若移出 do，
+        // 会进入父块作用域并可能改变后续名字解析、capture 或 `<close>` 退出点。
+        AstStmt::LocalDecl(_) | AstStmt::GlobalDecl(_) | AstStmt::LocalFunctionDecl(_) => false,
+        // 候选拒绝[ProofIncomplete]：`do do S end end` 可安全少一层壳，当前 helper 尚未
+        // 递归证明这类嵌套 scope，因此留下纯可读性缺口。
+        AstStmt::DoBlock(_) => false,
+        // 候选拒绝[SemanticBarrier:ControlFlow]：label 移出 do 会扩大可跳转范围并改变 goto
+        // 目标的词法边界。
+        AstStmt::Label(_) => false,
+        // 候选拒绝[LayerBoundary]：Error 由前层诊断 owner 保留，readability 不消费。
+        AstStmt::Error(_) => false,
+    }
 }
 
 struct BlockBindingFlow {

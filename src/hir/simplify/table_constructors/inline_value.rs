@@ -82,15 +82,22 @@ fn inline_constructor_value_at_site(
             .and_then(|producer_index| *producer_index)
     {
         let producer = &context.pending_producers[producer_index];
-        if context.remaining_uses.contains(producer.binding_id)
-            || context.consumed_bindings[producer.binding_id]
-        {
+        // 候选拒绝[ProofIncomplete]：producer 有 region 后续 use 时，当前事务只能整句删除
+        // 它；保留声明并仅重建 table write 本可继续优化，需扩展 partial-consume 计划。
+        if context.remaining_uses.contains(producer.binding_id) {
+            return None;
+        }
+        // 候选拒绝[SemanticBarrier:EvalMultiplicity]：同一 producer 被第二次消费时再次展开会
+        // 重复求值；`local v = mark(); t[v] = v` 必须只调用一次，见 regress_235。
+        if context.consumed_bindings[producer.binding_id] {
             return None;
         }
         let producer_value = pending_producer_value(context.block, producer)?;
         if !matches!(site, ConstructorInlineSite::Neutral)
             && !producer_value_reaches_access_base_shape(context, producer_value)
         {
+            // 候选拒绝[ProofIncomplete]：callee/access-base 只接受当前可直接生成的前缀形状；
+            // 其它可加括号或继续展开的表达式尚未由 Generate 语法事实证明。
             return None;
         }
         context.consumed_bindings[producer.binding_id] = true;
@@ -172,6 +179,8 @@ fn inline_constructor_value_at_site(
             context.consumed_bindings,
         ) =>
         {
+            // 候选拒绝[ProofIncomplete]：Decision、嵌套 constructor、closure capture 等节点
+            // 尚未实现 pending-binding 的结构化替换，不能把“未支持”当成不等价证明。
             return None;
         }
         _ => value.clone(),
@@ -247,6 +256,8 @@ fn inline_short_circuit_expr(
         context.binding_index,
         context.producer_index_by_binding,
     ) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：producer 原本无条件先求值；搬入短路右臂会
+        // 变成条件求值，例如 `v = mark(); t.x = false and v` 不能内联为一次表达式。
         return None;
     }
 

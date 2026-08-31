@@ -92,6 +92,7 @@ fn try_merge_seed_global_run(
     let mut matched = BTreeSet::new();
     for (binding, value) in &seeds {
         if use_index.count_uses_in_suffix(index, *binding) != 0 {
+            // 候选拒绝[SemanticBarrier:Scope]：seed local 在 global run 后仍被读取，合并删除它会留下未绑定 use。
             return None;
         }
         let Some((_, global_binding)) = globals.iter().find(|(candidate, _)| candidate == binding)
@@ -99,14 +100,20 @@ fn try_merge_seed_global_run(
             continue;
         };
         if !matched.insert(*binding) {
+            // 候选拒绝[SemanticBarrier:Identity]：同一 seed 不能初始化两个声明槽；合并会把共享值误写成单槽并删除另一份 handoff。
             return None;
         }
         merged_bindings.push(global_binding.clone());
         merged_values.push(value.clone());
     }
     if merged_bindings.len() != globals.len() {
+        // 候选拒绝[SemanticBarrier:Identity]：每个 global initializer 都必须一一对应某个 seed；否则合并会丢掉未匹配声明或凭空补值。
         return None;
     }
+
+    // 证明缺陷[PotentialUnsoundness:EvalOrder]：globals 通过 binding 查找后按 seed 顺序输出，未证明原 global run 也是同序；`global y=b; global x=a` 可被改成 `global x,y=a,b`，带可观察 global 写入时次序相反。
+    // 证明缺陷[PotentialUnsoundness:Lifetime]：未拒绝 PhysicalRoot seed；删除词法 local 会提前弱表消失或 `__gc`。
+    // 证明缺陷[PotentialPolicyViolation]：未拒绝 DebugHinted seed，显式源码身份会被合并抹掉。
 
     Some((
         AstStmt::GlobalDecl(Box::new(AstGlobalDecl {

@@ -68,6 +68,7 @@ pub(super) fn run_preserves_eval_order(
         };
         reached_first |= candidate.binding() == first_moved;
         if reached_first && !removed && expr_requires_ordered_snapshot(value, mutable_snapshots) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：已移动事件之后仍保留有序 producer，会把原声明顺序交错成 sink 内的另一顺序。
             return false;
         }
     }
@@ -98,6 +99,7 @@ struct EvalPrefixCollector<'a> {
 
 impl EvalPrefixCollector<'_> {
     fn barrier(&mut self) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：尚未发射的 producer 若位于该调用/lookup/控制事件之后，内联会改变可观察事件前缀。
         self.blocked |= self.prefix.len() < self.ordered.len();
     }
 
@@ -206,6 +208,7 @@ impl EvalPrefixCollector<'_> {
                 if matches!(mode, WalkMode::Dependency)
                     && contains_moved_binding(&logical.rhs, self.values)
                 {
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：把必达声明搬进 `and/or` 右臂会让 producer 受左值 truthiness 控制。
                     self.barrier();
                 }
             }
@@ -239,7 +242,10 @@ impl EvalPrefixCollector<'_> {
                     }
                 }
             }
-            AstExpr::FunctionExpr(_) if matches!(mode, WalkMode::Dependency) => self.barrier(),
+            AstExpr::FunctionExpr(_) if matches!(mode, WalkMode::Dependency) => {
+                // 候选拒绝[SemanticBarrier:Capture]：closure dependency 会把声明时捕获改成 sink 时创建/捕获，生命周期与值快照均可能改变。
+                self.barrier();
+            }
             AstExpr::Nil
             | AstExpr::Boolean(_)
             | AstExpr::Integer(_)
@@ -265,6 +271,7 @@ impl EvalPrefixCollector<'_> {
 
     fn candidate(&mut self, binding: AstBindingRef) {
         if !self.visiting.insert(binding) || !self.emitted.insert(binding) {
+            // 候选拒绝[SemanticBarrier:EvalCount]：循环依赖或同一候选在 sink 出现多次会递归/复制 RHS，不能保持一次求值。
             self.barrier();
             return;
         }
