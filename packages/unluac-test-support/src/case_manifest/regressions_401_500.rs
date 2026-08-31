@@ -1,0 +1,104 @@
+//! 回归 case 401–417；保持按历史编号的稳定执行顺序，不负责 case 展开。
+
+use super::*;
+
+pub(super) const REGRESSION_CASES_401_500: &[LuaCaseMatrixEntry] = &[
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_401_forwarded_lvalue_eval_order.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_401_constructor_value_arity.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_402_function_sugar_nested_local_ids.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_402_upvalue_function_decl.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_402_method_alias_nested_write_ids.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_403_constructor_literal_args.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_404_method_alias_nested_call_stmt.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_405_method_alias_multi_return_head.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_406_method_alias_generic_for.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_407_method_alias_numeric_for_start.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_408_method_alias_multi_assign_head.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_409_lua55_multi_global_decl.lua",
+    &[LuaCaseDialect::Lua55],
+),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_410_lua55_multi_global_tail_call.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_410_lua55_mixed_global_rhs.lua",
+        &[LuaCaseDialect::Lua55],
+    )
+    .with_expectation(LuaCaseExpectation::GlobalDeclResidual),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_410_lua55_wide_mixed_global_rhs.lua",
+        &[LuaCaseDialect::Lua55],
+    )
+    .with_expectation(LuaCaseExpectation::GlobalDeclResidual),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_410_lua55_global_nested_callee.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_411_lua55_global_function_assignment.lua",
+    &[LuaCaseDialect::Lua55],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_412_method_chain_callback_root.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_413_repeat_condition_binding_use.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_414_constructor_field_name_sugar.lua",
+    &[LuaCaseDialect::Lua54],
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_415_method_chain_receiver_extra_use.lua",
+    &[LuaCaseDialect::Lua54],
+),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_416_copy_local_callback_root.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_416_expired_copy_root.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_417_copy_root_before_overwrite.lua",
+    ALL_NON_LUAU_DIALECTS,
+),
+];
