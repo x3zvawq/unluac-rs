@@ -13,9 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirUnaryOpKind,
-    LocalId, TempId,
+    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
 };
+use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::mention::stmts_reference_captured_bindings;
@@ -88,7 +88,10 @@ pub(super) fn prune_redundant_copy_stmts(block: &mut HirBlock) -> bool {
     changed
 }
 
-pub(super) fn prune_redundant_branch_state_copies(proto: &mut HirProto) -> bool {
+pub(super) fn prune_redundant_branch_state_copies(
+    proto: &mut HirProto,
+    safety: HirExprSafety,
+) -> bool {
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
     let debug_locals = proto
         .locals
@@ -102,6 +105,7 @@ pub(super) fn prune_redundant_branch_state_copies(proto: &mut HirProto) -> bool 
         reference_captured_temps: &reference_captured.temps,
         debug_locals: &debug_locals,
         debug_temps: &proto.temp_debug_locals,
+        safety,
     };
     let (changed, _) = rewrite_branch_state_block(&mut proto.body, &facts, BTreeMap::new(), false);
     changed
@@ -312,7 +316,7 @@ fn dead_for_binding_temp_mirror_can_be_pruned(
         return false;
     }
     if write_audit.has_surviving_write(*temp) {
-        // 候选拒绝[ProofIncomplete]：事务外写尚未证明可一并删除；`t=A; for binding=B do t=binding; GC end` 表明局部删除会让 A 多活。
+        // 候选拒绝[SemanticBarrier:Lifetime]：`t=A; for binding=B do t=binding; GC end` 若只删 mirror，会让 A 多活并改变终结时机。
         return false;
     }
     if write_audit.has_unproven_write(*temp) {
@@ -520,6 +524,7 @@ struct BranchStateCopyFacts<'a> {
     reference_captured_temps: &'a BTreeSet<TempId>,
     debug_locals: &'a BTreeSet<LocalId>,
     debug_temps: &'a [Option<String>],
+    safety: HirExprSafety,
 }
 
 fn rewrite_branch_state_block(
@@ -565,7 +570,7 @@ fn rewrite_branch_state_block(
                     &while_stmt.body,
                     &known,
                     facts,
-                    expr_may_execute_user_code(&while_stmt.cond),
+                    expr_may_execute_user_code(&while_stmt.cond, facts.safety),
                 );
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut while_stmt.body, facts, loop_entry, true);
@@ -579,7 +584,7 @@ fn rewrite_branch_state_block(
                     &repeat_stmt.body,
                     &known,
                     facts,
-                    expr_may_execute_user_code(&repeat_stmt.cond),
+                    expr_may_execute_user_code(&repeat_stmt.cond, facts.safety),
                 );
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut repeat_stmt.body, facts, loop_entry, true);
@@ -855,7 +860,7 @@ fn invalidate_capture_writes_from_stmt(
     stmt: &HirStmt,
     facts: &BranchStateCopyFacts<'_>,
 ) {
-    let mut effects = UserCodeEffectCollector::default();
+    let mut effects = UserCodeEffectCollector::new(facts.safety);
     visit_stmts(std::slice::from_ref(stmt), &mut effects);
     if effects.found {
         invalidate_reference_captured_state(known, facts);
@@ -867,7 +872,7 @@ fn invalidate_capture_writes_from_block(
     block: &HirBlock,
     facts: &BranchStateCopyFacts<'_>,
 ) {
-    let mut effects = UserCodeEffectCollector::default();
+    let mut effects = UserCodeEffectCollector::new(facts.safety);
     visit_block(block, &mut effects);
     if effects.found {
         invalidate_reference_captured_state(known, facts);
@@ -879,13 +884,13 @@ fn invalidate_capture_writes_from_expr(
     expr: &HirExpr,
     facts: &BranchStateCopyFacts<'_>,
 ) {
-    if expr_may_execute_user_code(expr) {
+    if expr_may_execute_user_code(expr, facts.safety) {
         invalidate_reference_captured_state(known, facts);
     }
 }
 
-fn expr_may_execute_user_code(expr: &HirExpr) -> bool {
-    let mut effects = UserCodeEffectCollector::default();
+fn expr_may_execute_user_code(expr: &HirExpr, safety: HirExprSafety) -> bool {
+    let mut effects = UserCodeEffectCollector::new(safety);
     visit_expr(expr, &mut effects);
     effects.found
 }
@@ -965,9 +970,18 @@ impl HirVisitor for BindingWriteCollector {
     }
 }
 
-#[derive(Default)]
 struct UserCodeEffectCollector {
     found: bool,
+    safety: HirExprSafety,
+}
+
+impl UserCodeEffectCollector {
+    fn new(safety: HirExprSafety) -> Self {
+        Self {
+            found: false,
+            safety,
+        }
+    }
 }
 
 impl HirVisitor for UserCodeEffectCollector {
@@ -976,33 +990,10 @@ impl HirVisitor for UserCodeEffectCollector {
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= match expr {
-            HirExpr::GlobalRef(_)
-            | HirExpr::TableAccess(_)
-            | HirExpr::Binary(_)
-            | HirExpr::Call(_)
-            | HirExpr::Unresolved(_) => true,
-            HirExpr::Unary(unary) => unary.op != HirUnaryOpKind::Not,
-            HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::Vector(_)
-            | HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::TempRef(_)
-            | HirExpr::LogicalAnd(_)
-            | HirExpr::LogicalOr(_)
-            | HirExpr::Decision(_)
-            | HirExpr::VarArg
-            | HirExpr::TableConstructor(_)
-            | HirExpr::Closure(_) => false,
-        };
+        // Allocation, dynamic access, calls and metamethod-capable expressions can run GC or
+        // user code that mutates a captured binding. Reuse the shared dialect-aware boundary so
+        // branch-state facts cannot survive an event omitted by a second ad-hoc classifier.
+        self.found |= !self.safety.is_discard_safe_without_residual(expr);
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {

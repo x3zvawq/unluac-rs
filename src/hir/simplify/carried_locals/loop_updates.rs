@@ -27,7 +27,7 @@ use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::{rewrite_expr, rewrite_stmts};
 use super::HandoffIdentityFacts;
 use super::binding::{
-    BindingClassRewritePass, BindingProtection, CarryBinding,
+    BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
     binding_home_slot_provenance_is_invalid, bindings_share_exact_home_slot,
     carry_binding_from_lvalue, record_binding_merge,
 };
@@ -130,10 +130,27 @@ fn collapse_repeat_tail_temp_updates(
         let between_mentions = super::reads::collect_binding_mentions_by_stmt(between);
         let condition_mentions = super::reads::collect_binding_mentions_in_expr(&repeat_stmt.cond);
         let last_next_mention = last_mentions.get(&next_binding).copied().unwrap_or(index);
-        // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/outer use、无可信 home 或重复 write/use 会让 next 与 state 代表可区分 epoch/root。
+        let next_home = binding_home_slot(next_binding, promotion_facts);
+        let state_home = binding_home_slot(state_binding, promotion_facts);
+        let between_crosses_distinct_homes = !between.is_empty()
+            && next_home
+                .zip(state_home)
+                .is_some_and(|(next_home, state_home)| next_home != state_home);
+        let between_lacks_same_home_proof = !between.is_empty()
+            && !between_crosses_distinct_homes
+            && (promotion_facts.compacts_home_slots()
+                || next_home.is_none()
+                || state_home.is_none());
+        // 候选拒绝[SemanticBarrier:ValueFlow]：RHS 读取旧 next 时，整块 rewrite 会把它改读旧 state；其它 binding 读取保持原求值。
+        // 候选拒绝[SemanticBarrier:Capture]：state 被 closure 捕获时，closure 可区分合并前后的 cell/write epoch。
+        // 候选拒绝[SemanticBarrier:Scope]：state 在 repeat 入口不可见时，改写会生成越界 local use。
+        // 候选拒绝[PolicyBoundary]：for binding 的迭代 identity 由 loop owner 保留。
+        // 候选拒绝[SemanticBarrier:Lifetime]：outer use 或重复 write/use 会暴露独立 identity；异槽的 `next=v; collectgarbage(); state=next` 若提前写 state，会让旧 state root 提前回收。
         // 候选拒绝[SemanticBarrier:EvalOrder]：between 读取旧 state、prefix 提前写 state 或存在 early transfer 时，直接写 state 会改变读取/出口顺序。
-        // 候选拒绝[ProofIncomplete]：between 非空且异槽、cleanup/Decision、或 label 区间目前缺路径与 root-lifetime 证明。
-        if reads.single_read() != Some(state_binding)
+        // 候选拒绝[LayerBoundary]：Decision/Unresolved 由其 owner 消解。
+        // 候选拒绝[ProofIncomplete]：invalid/缺失 home、compaction、label 区间或 blanket
+        // TBC/Close 阻断目前缺精确 provenance、同槽、路径与 resource-alias 证明。
+        if reads.reads.contains(&next_binding)
             || captured_locals.contains(&state)
             || !local_available_before(block, index, state, inherited_locals)
             || identity_facts.for_bindings.contains(&state)
@@ -145,13 +162,8 @@ fn collapse_repeat_tail_temp_updates(
             )
             || binding_home_slot_provenance_is_invalid(next_binding, promotion_facts)
             || binding_home_slot_provenance_is_invalid(state_binding, promotion_facts)
-            || !between.is_empty()
-                && (promotion_facts.compacts_home_slots()
-                    || !bindings_share_exact_home_slot(
-                        next_binding,
-                        state_binding,
-                        promotion_facts,
-                    ))
+            || between_crosses_distinct_homes
+            || between_lacks_same_home_proof
             || first_mentions.get(&next_binding).copied() != Some(index)
             || writes.counts.get(&next_binding).copied() != Some(1)
             || writes.last_stmt.get(&state_binding).copied() != Some(index)
@@ -577,4 +589,141 @@ fn apply_fold(
         rewrite_expr(cond, &mut pass);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{
+        HirBinaryExpr, HirBinaryOpKind, HirLocalDecl, HirRepeat, HirValuePack,
+    };
+
+    fn local_decl(local: LocalId) -> HirStmt {
+        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: vec![local],
+            values: HirValuePack::fixed(vec![HirExpr::Nil]),
+        }))
+    }
+
+    fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![target],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn add(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
+        HirExpr::Binary(Box::new(HirBinaryExpr {
+            op: HirBinaryOpKind::Add,
+            lhs,
+            rhs,
+        }))
+    }
+
+    fn repeat_update(state: LocalId, next: TempId, value: HirExpr) -> HirStmt {
+        HirStmt::Repeat(Box::new(HirRepeat {
+            body: HirBlock {
+                stmts: vec![
+                    assign(HirLValue::Temp(next), value),
+                    assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                ],
+            },
+            cond: HirExpr::TempRef(next),
+        }))
+    }
+
+    fn empty_identity_facts() -> HandoffIdentityFacts {
+        HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            captured: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn repeat_tail_update_accepts_rhs_reading_an_additional_local() {
+        let state = LocalId(0);
+        let extra = LocalId(1);
+        let next = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                local_decl(extra),
+                repeat_update(
+                    state,
+                    next,
+                    add(HirExpr::LocalRef(state), HirExpr::LocalRef(extra)),
+                ),
+            ],
+        };
+        let stmt_mentions = super::super::reads::collect_binding_mentions_by_stmt(&block.stmts);
+        let outer_bindings = BTreeSet::<CarryBinding>::new();
+        let inherited_locals = BTreeSet::new();
+        let identity_facts = empty_identity_facts();
+        let mut promotion_facts = ProtoPromotionFacts::default();
+
+        let changed = collapse_dead_loop_update_handoffs(
+            &mut block,
+            &stmt_mentions,
+            &outer_bindings,
+            &mut promotion_facts,
+            &identity_facts,
+            &inherited_locals,
+        );
+
+        let expected = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                local_decl(extra),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![assign(
+                            HirLValue::Local(state),
+                            add(HirExpr::LocalRef(state), HirExpr::LocalRef(extra)),
+                        )],
+                    },
+                    cond: HirExpr::LocalRef(state),
+                })),
+            ],
+        };
+        assert_eq!((changed, block), (true, expected));
+    }
+
+    #[test]
+    fn repeat_tail_update_rejects_rhs_reading_old_next() {
+        let state = LocalId(0);
+        let extra = LocalId(1);
+        let next = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                local_decl(extra),
+                repeat_update(
+                    state,
+                    next,
+                    add(HirExpr::TempRef(next), HirExpr::LocalRef(extra)),
+                ),
+            ],
+        };
+        let before = block.clone();
+        let stmt_mentions = super::super::reads::collect_binding_mentions_by_stmt(&block.stmts);
+        let outer_bindings = BTreeSet::<CarryBinding>::new();
+        let inherited_locals = BTreeSet::new();
+        let identity_facts = empty_identity_facts();
+        let mut promotion_facts = ProtoPromotionFacts::default();
+
+        let changed = collapse_dead_loop_update_handoffs(
+            &mut block,
+            &stmt_mentions,
+            &outer_bindings,
+            &mut promotion_facts,
+            &identity_facts,
+            &inherited_locals,
+        );
+
+        assert_eq!((changed, block), (false, before));
+    }
 }

@@ -263,9 +263,9 @@ pub(super) fn simplify_hir(
                             proto, dialect, facts,
                         ),
                         4 => unreachable!("temp-inline needs child proto body facts"),
-                        5 => {
-                            generic_for_iterators::fold_generic_for_iterators_in_proto(proto, facts)
-                        }
+                        5 => generic_for_iterators::fold_generic_for_iterators_in_proto(
+                            proto, facts, dialect,
+                        ),
                         6 => branch_value_folding::fold_branch_values_in_proto(
                             proto,
                             readability,

@@ -34,9 +34,15 @@ pub(super) fn binding_handoff_seed(stmt: &HirStmt) -> Option<BindingHandoffSeed>
     }
 
     let mut seen_targets = BTreeSet::new();
+    let mut repeated_targets = BTreeSet::new();
     let mut rewrites = Vec::with_capacity(assign.targets.len());
     let mut retained_pairs = Vec::new();
     for (target, value) in assign.targets.iter().zip(&assign.values) {
+        if let HirLValue::Temp(target_temp) = target
+            && !seen_targets.insert(*target_temp)
+        {
+            repeated_targets.insert(*target_temp);
+        }
         let rewrite = match target {
             HirLValue::Temp(target_temp) => {
                 carry_binding_from_expr(value).map(|binding| TempBindingRewrite {
@@ -50,13 +56,25 @@ pub(super) fn binding_handoff_seed(stmt: &HirStmt) -> Option<BindingHandoffSeed>
             retained_pairs.push((target.clone(), value.clone()));
             continue;
         };
-        // 候选拒绝[SemanticBarrier:EvalOrder]：同一 temp 在并行 targets 重复出现时最后写胜出，单一 rewrite 会丢失位置语义。
-        if !seen_targets.insert(rewrite.from) {
-            return None;
-        }
         rewrites.push(rewrite);
     }
     if rewrites.is_empty() {
+        return None;
+    }
+    if rewrites
+        .iter()
+        .any(|rewrite| repeated_targets.contains(&rewrite.from))
+    {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：同一 temp 的并行 targets 中只要有一项
+        // 会被删除，保留的最后写覆盖关系就会改变；全部 retained 的重复 target 不受影响。
+        return None;
+    }
+    if rewrites.iter().any(|rewrite| {
+        retained_pairs.iter().any(|(target, _)| {
+            carry_binding_from_lvalue(target).is_some_and(|target| target == rewrite.to)
+        })
+    }) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：`s, t = value, s` 中删除 `t -> s` 会改变同一并行赋值对 `s` 的覆盖顺序。
         return None;
     }
     Some(BindingHandoffSeed {
@@ -196,5 +214,46 @@ mod tests {
     #[test]
     fn binding_handoff_seed_rejects_repeated_target() {
         assert!(binding_handoff_seed(&parallel_copy(TempId(0), TempId(0))).is_none());
+    }
+
+    #[test]
+    fn binding_handoff_seed_rejects_rewrite_destination_retained_as_target() {
+        let stmt = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Temp(TempId(0))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::LocalRef(LocalId(0))]),
+        }));
+
+        assert!(binding_handoff_seed(&stmt).is_none());
+    }
+
+    #[test]
+    fn binding_handoff_seed_rejects_repeated_target_split_between_retained_and_rewrite() {
+        let stmt = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(TempId(0)), HirLValue::Temp(TempId(0))],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::LocalRef(LocalId(0))]),
+        }));
+
+        assert!(binding_handoff_seed(&stmt).is_none());
+    }
+
+    #[test]
+    fn binding_handoff_seed_keeps_repeated_retained_targets() {
+        let stmt = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![
+                HirLValue::Temp(TempId(0)),
+                HirLValue::Temp(TempId(0)),
+                HirLValue::Temp(TempId(1)),
+            ],
+            values: HirValuePack::fixed(vec![
+                HirExpr::Integer(1),
+                HirExpr::Integer(2),
+                HirExpr::LocalRef(LocalId(0)),
+            ]),
+        }));
+
+        let seed = binding_handoff_seed(&stmt)
+            .expect("unrelated retained target ordering must not block the handoff");
+        assert_eq!(seed.rewrites.len(), 1);
+        assert_eq!(seed.retained_pairs.len(), 2);
     }
 }

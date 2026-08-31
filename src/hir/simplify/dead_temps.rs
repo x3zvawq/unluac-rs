@@ -98,31 +98,113 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         safety,
     };
     let mut changed = rewrite_proto(proto, &mut pass);
-    let original_physical_root_count = proto.physical_root_temps.len();
-    proto
-        .physical_root_temps
-        .extend(pass.physical_root_temps.iter().copied());
-    changed |= proto.physical_root_temps.len() != original_physical_root_count;
     changed |= remove_dead_entry_nil_writes_from_root_prefix(
+        &mut proto.body,
+        &live_reads,
+        &pass.debug_temps,
+        &pass.stable_visible_params,
+        promotion_facts,
+        safety,
+    );
+    changed |= preserve_adjacent_dead_physical_overwrites(
         &mut proto.body,
         &live_reads,
         &pass.debug_temps,
         promotion_facts,
         safety,
+        &mut pass.physical_root_temps,
     );
+    let original_physical_root_count = proto.physical_root_temps.len();
+    proto
+        .physical_root_temps
+        .extend(pass.physical_root_temps.iter().copied());
+    changed |= proto.physical_root_temps.len() != original_physical_root_count;
     changed
+}
+
+fn preserve_adjacent_dead_physical_overwrites(
+    block: &mut HirBlock,
+    live_reads: &BTreeSet<TempId>,
+    debug_temps: &BTreeSet<TempId>,
+    facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+    physical_root_temps: &mut BTreeSet<TempId>,
+) -> bool {
+    let mut captured_homes = BTreeSet::new();
+    for stmt in &block.stmts {
+        facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_homes);
+    }
+
+    let mut changed = false;
+    for index in 1..block.stmts.len() {
+        let Some(current) = dead_pure_temp_assignment(&block.stmts[index], live_reads, safety)
+        else {
+            continue;
+        };
+        let Some((previous, previous_value)) =
+            single_temp_assignment(&block.stmts[index - 1])
+        else {
+            // 候选拒绝[ProofIncomplete]：非相邻 producer 需要区间 reaching-def、控制流与同槽写入证明。
+            continue;
+        };
+        if safety.result_is_gc_inert(previous_value) {
+            continue;
+        }
+        let Some(home) = facts.trusted_temp_home_slot(previous) else {
+            // 候选拒绝[ProofIncomplete]：producer 缺可信 home 时无法证明两次物理写命中同一 root cell。
+            continue;
+        };
+        if current == previous
+            || facts.trusted_temp_home_slot(current) != Some(home)
+            || live_reads.contains(&previous)
+        {
+            // 候选拒绝[SemanticBarrier:ValueFlow/Lifetime]：异槽或任一旧 identity 仍有读取时，合并会改变值 epoch 或 root 生命周期。
+            continue;
+        }
+        if debug_temps.contains(&current)
+            || debug_temps.contains(&previous)
+            || captured_homes.contains(&home)
+        {
+            // 候选拒绝[LayerBoundary]：debug identity 由 locals owner 保留；候选拒绝[SemanticBarrier:Capture]：同槽 capture 可观察每次写入。
+            continue;
+        }
+        let HirStmt::Assign(assign) = &mut block.stmts[index] else {
+            unreachable!("dead temp candidate must remain an assignment")
+        };
+        assign.targets[0] = HirLValue::Temp(previous);
+        physical_root_temps.insert(previous);
+        changed = true;
+    }
+    changed
+}
+
+fn single_temp_assignment(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
+    let HirStmt::Assign(assign) = stmt else {
+        return None;
+    };
+    let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.fixed.as_slice() else {
+        return None;
+    };
+    assign.values.tail.is_none().then_some((*temp, value))
 }
 
 fn remove_dead_entry_nil_writes_from_root_prefix(
     block: &mut HirBlock,
     live_reads: &BTreeSet<TempId>,
     debug_temps: &BTreeSet<TempId>,
+    stable_visible_params: &BTreeSet<ParamId>,
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> bool {
     let mut changed = false;
     let mut in_single_pass_prefix = true;
     let mut captured_homes = BTreeSet::new();
+    for stmt in &block.stmts {
+        facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_homes);
+    }
     block.stmts.retain(|stmt| {
         if !in_single_pass_prefix {
             return true;
@@ -139,12 +221,12 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
             facts.overwrites_entry_nil(temp)
                 // 候选拒绝[PolicyBoundary]：debug temp 是源码 binding；即使入口旧值为 nil，删除定义也会抹掉项目选择保留的 source identity。
                 && !debug_temps.contains(&temp)
-                // 候选拒绝[ProofIncomplete]：entry-nil 只证明旧值非资源；RHS 若可能引用对象，删除物理写会缩短新对象作为 VM root 的存活期。
-                && dead_write_value_is_gc_inert(stmt, safety)
-                // 候选拒绝[SemanticBarrier:Capture]：`local x; f=function() return x end; x=false` 中先建立的 closure 会观察同槽写入；删除后返回 nil。
+                // 候选拒绝[ProofIncomplete]：entry-nil 只证明旧值非资源；除 GC 惰性值和全函数稳定参数外，RHS 仍可能需要目标槽作为新 root。
+                && (dead_write_value_is_gc_inert(stmt, safety)
+                    || dead_write_copies_stable_param(stmt, stable_visible_params))
+                // 候选拒绝[SemanticBarrier:Capture]：候选前后任一 closure 若捕获同槽，删除写入都会让它观察 nil 而非新值。
                 && home.is_some_and(|home| !captured_homes.contains(&home))
         });
-        facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_homes);
         changed |= removable;
         !removable
     });
@@ -184,6 +266,16 @@ fn dead_write_value_is_gc_inert(stmt: &HirStmt, safety: HirExprSafety) -> bool {
     safety.result_is_gc_inert(value)
 }
 
+fn dead_write_copies_stable_param(
+    stmt: &HirStmt,
+    stable_visible_params: &BTreeSet<ParamId>,
+) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    matches!(assign.values.fixed.as_slice(), [HirExpr::ParamRef(param)] if stable_visible_params.contains(param))
+}
+
 struct DeadTempPass<'a> {
     live_reads: &'a BTreeSet<TempId>,
     parameter_by_temp: BTreeMap<TempId, ParamId>,
@@ -213,12 +305,6 @@ impl HirRewritePass for DeadTempPass<'_> {
             let value = &assign.values.fixed[0];
             if self.facts.copies_same_visible_home_value(temp, value) {
                 // 候选接受[NoOpRootProof]：目标 raw home 与可见 Param/Local 的 trusted home 相同，删除只是去掉同一 cell 的自写回，不改变 root 集或别名含义。
-                changed = true;
-                return false;
-            }
-            if matches!(value, HirExpr::ParamRef(param) if self.stable_visible_params.contains(param))
-            {
-                // 候选接受[VisibleRootProof]：RHS 参数仍是 trusted visible root，且整个 proto 无同 physical-home 写入/ByReference capture，删除只会去掉冗余 alias root。
                 changed = true;
                 return false;
             }

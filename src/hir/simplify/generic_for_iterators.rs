@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::decompile::DecompileDialect;
 use crate::hir::common::{
     HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack, TempId,
 };
@@ -25,6 +26,7 @@ use super::walk::{HirRewritePass, rewrite_proto};
 pub(super) fn fold_generic_for_iterators_in_proto(
     proto: &mut HirProto,
     facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
 ) -> bool {
     let use_counts = collect_temp_use_counts(proto);
     let debug_temps = proto
@@ -38,6 +40,7 @@ pub(super) fn fold_generic_for_iterators_in_proto(
             use_counts,
             debug_temps,
             facts,
+            dialect,
         },
     )
 }
@@ -46,6 +49,7 @@ struct GenericForIteratorPass<'a> {
     use_counts: BTreeMap<TempId, usize>,
     debug_temps: Vec<bool>,
     facts: &'a ProtoPromotionFacts,
+    dialect: DecompileDialect,
 }
 
 impl HirRewritePass for GenericForIteratorPass<'_> {
@@ -354,6 +358,7 @@ fn assignments_match_iterator(
     context: &GenericForIteratorPass<'_>,
 ) -> bool {
     let mut expected = generic_for.iterator.fixed.iter();
+    let mut protocol_prefix_width = 0;
     for (index, stmt) in assignments.iter().enumerate() {
         let HirStmt::Assign(assign) = stmt else {
             return false;
@@ -366,6 +371,19 @@ fn assignments_match_iterator(
         if assign.values.tail.is_some()
             && (index + 1 != assignments.len() || generic_for.iterator.tail.is_some())
         {
+            return false;
+        }
+        if assign
+            .values
+            .tail
+            .as_ref()
+            .and_then(|tail| tail.exact_width())
+            .is_some_and(|width| {
+                protocol_prefix_width + assign.values.fixed.len() + width
+                    < generic_for_protocol_width(context.dialect)
+            })
+        {
+            // 候选拒绝[SemanticBarrier:ValueArity]：exact tail 未覆盖完整 generic-for 协议；改成 open tail 会把被截掉的返回值带入 control/closing 槽。
             return false;
         }
         // 候选拒绝[PolicyBoundary]：closure producer 保留命名 binding，避免把完整 child body 压成 loop head 内的多行 IIFE。
@@ -390,8 +408,20 @@ fn assignments_match_iterator(
                 return false;
             }
         }
+        protocol_prefix_width += assign.targets.len();
     }
     expected.next().is_none()
+}
+
+fn generic_for_protocol_width(dialect: DecompileDialect) -> usize {
+    match dialect {
+        DecompileDialect::Lua54 | DecompileDialect::Lua55 | DecompileDialect::Auto => 4,
+        DecompileDialect::Lua51
+        | DecompileDialect::Lua52
+        | DecompileDialect::Lua53
+        | DecompileDialect::Luajit
+        | DecompileDialect::Luau => 3,
+    }
 }
 
 fn iterator_target_can_be_deleted(target: TempId, context: &GenericForIteratorPass<'_>) -> bool {

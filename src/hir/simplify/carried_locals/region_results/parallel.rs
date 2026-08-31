@@ -7,8 +7,11 @@ pub(super) fn merge_initialized_local_declarations(
     start: usize,
     count: usize,
 ) -> bool {
-    // 候选拒绝[ProofIncomplete]：单声明无需合并，越界表示 caller 的 declaration group 不变量漂移。
-    if count < 2 || start + count > block.stmts.len() {
+    if count < 2 {
+        return false;
+    }
+    // 候选拒绝[ConvergenceGuard]：越界表示 caller 提供的 declaration group 与当前 block 漂移，不是语义候选缺少证明。
+    if start + count > block.stmts.len() {
         return false;
     }
     let mut bindings = Vec::with_capacity(count);

@@ -21,10 +21,15 @@ use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_
 use super::visit::{HirVisitor, visit_stmts};
 
 struct ActiveCallRoot {
+    value_id: CallValueId,
     root_index: usize,
     aliases: BTreeSet<TempId>,
     observed: bool,
+    explicit_fence_only: bool,
 }
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct CallValueId(usize);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct LookupValueId(usize);
@@ -206,6 +211,7 @@ pub(super) fn collect_call_root_lifetimes(
 ) -> CallRootLifetimeIndices {
     let uses = TempUseEvents::new(stmts);
     let mut active = BTreeMap::<HomeSlotKey, ActiveCallRoot>::new();
+    let mut next_call_value_id = 0;
     let mut active_allocations = Vec::<ActiveAllocationRoot>::new();
     // Lua 编译器会用 literal nil 的纯 temp copy 清除同 home 的 allocation root；只沿这条
     // 无副作用链传播 nil 事实，其余写入必须先让旧事实失效。
@@ -219,13 +225,16 @@ pub(super) fn collect_call_root_lifetimes(
             // A potential user-code/GC event matters only if a later same-home overwrite proves
             // the end of this transaction. Unlike an explicit collection fence, this does not
             // by itself justify materializing every still-active call result.
-            for root in active.values_mut() {
-                root.observed = true;
-            }
+            observe_active_call_values(&mut active, None);
         }
         let reads = uses.reads_at(index);
-        for root in active.values_mut() {
-            if reads.is_some_and(|reads| root.aliases.iter().any(|temp| reads.contains(temp))) {
+        let read_observations = active
+            .values()
+            .filter(|root| {
+                reads
+                    .is_some_and(|reads| root.aliases.iter().any(|temp| reads.contains(temp)))
+            })
+            .filter_map(|root| {
                 // A read still needs the same-local overwrite pairing, but a loop predicate or
                 // a direct `if temp`/`if not temp` test only consumes the value as control flow.
                 // Treating those forwarding reads as observations materializes ordinary loop
@@ -239,15 +248,14 @@ pub(super) fn collect_call_root_lifetimes(
                         | HirStmt::NumericFor(_)
                         | HirStmt::GenericFor(_)
                 );
-                if (!is_loop_control
+                ((!is_loop_control
                     && !stmt_is_direct_if_control_read(stmt, &root.aliases)
                     && !stmt_is_transparent_temp_copy(stmt, &root.aliases))
-                    || uses.has_gc_fence_after(index)
-                {
-                    root.observed = true;
-                }
-            }
-        }
+                    || uses.has_gc_fence_after(index))
+                .then_some(root.value_id)
+            })
+            .collect::<BTreeSet<_>>();
+        observe_active_call_values(&mut active, Some(&read_observations));
         let escaped_temps = direct_table_assignment_temps(stmt);
         for root in &mut active_allocations {
             root.escaped |= root
@@ -283,12 +291,16 @@ pub(super) fn collect_call_root_lifetimes(
                 }
                 remove_allocation_homes(&mut active_allocations, &target_homes, facts);
                 for target in targets {
+                    let value_id = CallValueId(next_call_value_id);
+                    next_call_value_id += 1;
                     active.insert(
                         target.home,
                         ActiveCallRoot {
+                            value_id,
                             root_index: index,
                             aliases: BTreeSet::from([target.temp]),
                             observed: false,
+                            explicit_fence_only: false,
                         },
                     );
                 }
@@ -462,21 +474,56 @@ pub(super) fn collect_call_root_lifetimes(
         }
 
         if let HirExpr::TempRef(source) = value {
-            for root in active.values_mut() {
-                if root.aliases.contains(source) {
-                    root.aliases.insert(temp);
+            let copied_value_id = active
+                .values()
+                .find(|root| root.aliases.contains(source))
+                .map(|root| root.value_id);
+            if let Some(value_id) = copied_value_id {
+                let copied_root_aliases = active
+                    .values()
+                    .filter(|root| root.value_id == value_id)
+                    .flat_map(|root| root.aliases.iter().copied())
+                    .chain(std::iter::once(temp))
+                    .collect::<BTreeSet<_>>();
+                for root in active.values_mut() {
+                    if root.value_id == value_id {
+                        root.aliases.insert(temp);
+                    }
                 }
+                if !producer_eligible {
+                    continue;
+                }
+                // A cross-home copy starts an independent physical root transaction. The
+                // source home can be overwritten before a later GC fence while this target
+                // home still retains the call result, so alias propagation alone is not enough.
+                active.insert(
+                    slot,
+                    ActiveCallRoot {
+                        value_id,
+                        root_index: index,
+                        aliases: copied_root_aliases,
+                        observed: false,
+                        // Transparent compiler forwarding can normally be reconstructed inside
+                        // its consuming expression. Only an explicit collection fence proves
+                        // that the otherwise unread target home needs a standalone source owner.
+                        explicit_fence_only: true,
+                    },
+                );
             }
             continue;
         }
 
         if producer_eligible && matches!(value, HirExpr::Call(_)) {
+            let value_id = CallValueId(next_call_value_id);
+            next_call_value_id += 1;
             active.insert(
                 slot,
                 ActiveCallRoot {
+                    value_id,
                     root_index: index,
                     aliases: BTreeSet::from([temp]),
                     observed: false,
+                    explicit_fence_only: false,
                 },
             );
         }
@@ -884,17 +931,61 @@ fn preserve_active_call_roots(
     active: &mut BTreeMap<HomeSlotKey, ActiveCallRoot>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
-    for (home, root) in active.iter_mut() {
-        // Any value still occupying its physical home while this statement may run user code
-        // or GC is a root, even if ordinary value liveness ended after an earlier read.
+    let representatives = active_call_value_representatives(active, None, true);
+    for home in representatives.into_values() {
+        let root = active
+            .get_mut(&home)
+            .expect("active call representative must retain its home");
+        // One live home is enough to retain a shared result at this observation point. If that
+        // home is overwritten, a later observation can select another still-active transaction.
         root.observed = true;
         lifetimes.roots.insert(root.root_index);
         lifetimes
             .root_homes
             .entry(root.root_index)
             .or_default()
-            .insert(*home);
+            .insert(home);
     }
+}
+
+fn observe_active_call_values(
+    active: &mut BTreeMap<HomeSlotKey, ActiveCallRoot>,
+    values: Option<&BTreeSet<CallValueId>>,
+) {
+    let representatives = active_call_value_representatives(active, values, false);
+    for home in representatives.into_values() {
+        active
+            .get_mut(&home)
+            .expect("active call representative must retain its home")
+            .observed = true;
+    }
+}
+
+fn active_call_value_representatives(
+    active: &BTreeMap<HomeSlotKey, ActiveCallRoot>,
+    values: Option<&BTreeSet<CallValueId>>,
+    include_explicit_fence_only: bool,
+) -> BTreeMap<CallValueId, HomeSlotKey> {
+    let mut representatives = BTreeMap::<CallValueId, HomeSlotKey>::new();
+    for (home, root) in active {
+        if (!include_explicit_fence_only && root.explicit_fence_only)
+            || values.is_some_and(|values| !values.contains(&root.value_id))
+        {
+            continue;
+        }
+        representatives
+            .entry(root.value_id)
+            .and_modify(|representative_home| {
+                let representative = active
+                    .get(representative_home)
+                    .expect("selected call representative must remain active");
+                if root.observed && !representative.observed {
+                    *representative_home = *home;
+                }
+            })
+            .or_insert(*home);
+    }
+    representatives
 }
 
 fn stmt_may_observe_gc_roots(stmt: &HirStmt, safety: HirExprSafety) -> bool {

@@ -24,7 +24,7 @@ use super::super::walk::rewrite_stmts;
 use super::HandoffSafety;
 use super::binding::{
     BindingProtection, CarryBinding, TempBindingRewrite, TempToBindingPass,
-    bindings_share_exact_home_slot,
+    bindings_may_share_raw_home_slot, bindings_share_exact_home_slot, carry_binding_from_lvalue,
 };
 use super::boundary::LabelJumpIndex;
 use super::prune::{
@@ -104,6 +104,18 @@ fn try_collapse_pure_binding_handoffs(
     let Some(seed) = binding_handoff_seed(&block.stmts[index]) else {
         return false;
     };
+
+    if effectful_retained_target_precedes_rewrite_commit(&block.stmts[index], &seed.rewrites) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：Lua 逆序提交并行 targets；后置 global/table target 可先通过 `__newindex` 改写 carried home，原 self-copy 随后会恢复 RHS 快照，删除 rewrite pair 则会留下该改写。
+        return false;
+    }
+    if seed.rewrites.iter().any(|rewrite| {
+        seed.retained_pairs.iter().any(|(target, _)| {
+            retained_target_conflicts_with_rewrite(*rewrite, target, safety.promotion_facts)
+        })
+    }) {
+        return false;
+    }
 
     // 外层仍提及的 source/target，或 seed 前已有路径触碰的 temp，都不是当前块私有身份。
     // 候选拒绝[SemanticBarrier:Lifetime]：外层/seed 前已活跃的 temp 或 source 是独立快照，改名会把旧 epoch 与 carried 状态合并。
@@ -399,6 +411,49 @@ fn temp_handoff_preserves_storage(
         )
 }
 
+fn retained_target_conflicts_with_rewrite(
+    rewrite: TempBindingRewrite,
+    target: &HirLValue,
+    promotion_facts: &crate::hir::promotion::ProtoPromotionFacts,
+) -> bool {
+    let Some(target) = carry_binding_from_lvalue(target) else {
+        return false;
+    };
+    if target == rewrite.to || bindings_share_exact_home_slot(target, rewrite.to, promotion_facts) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：删除 rewrite pair 会移除同一物理 target 的一次并行写，改变重复 target 的覆盖顺序。
+        return true;
+    }
+    if bindings_may_share_raw_home_slot(target, rewrite.to, promotion_facts) {
+        // 候选拒绝[ProofIncomplete]：retained target 与 rewrite destination 的 raw home 关系未知；无法证明删除并行写不改变 target 覆盖顺序。
+        return true;
+    }
+    false
+}
+
+fn effectful_retained_target_precedes_rewrite_commit(
+    stmt: &HirStmt,
+    rewrites: &[TempBindingRewrite],
+) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    let mut earlier_rewrite = false;
+    for target in &assign.targets {
+        match target {
+            HirLValue::Temp(temp) => {
+                earlier_rewrite |= rewrites.iter().any(|rewrite| rewrite.from == *temp);
+            }
+            HirLValue::Global(_) | HirLValue::TableAccess(_) if earlier_rewrite => return true,
+            HirLValue::Param(_)
+            | HirLValue::Local(_)
+            | HirLValue::Upvalue(_)
+            | HirLValue::Global(_)
+            | HirLValue::TableAccess(_) => {}
+        }
+    }
+    false
+}
+
 fn suffix_reads_binding(stmts: &[HirStmt], binding: CarryBinding) -> bool {
     let mut collector = BindingReadCollector::default();
     collector.collect_stmts(stmts);
@@ -546,4 +601,142 @@ fn stmt_reads_binding(stmt: &HirStmt, binding: CarryBinding) -> bool {
     let mut collector = BindingReadCollector::default();
     collector.collect_stmts(std::slice::from_ref(stmt));
     collector.reads.contains(&binding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::common::{HirAssign, HirTableAccess, HirValuePack, LocalId, ParamId};
+    use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+
+    struct PanickingBindingProtection;
+
+    impl BindingProtection for PanickingBindingProtection {
+        fn contains(&self, _binding: &CarryBinding) -> bool {
+            panic!("effectful retained-target guard must run before suffix/storage proofs");
+        }
+    }
+
+    fn effectful_parallel_seed(rewrite_first: bool) -> HirStmt {
+        let rewrite = (HirLValue::Temp(TempId(0)), HirExpr::LocalRef(LocalId(0)));
+        let table_write = (
+            HirLValue::TableAccess(Box::new(HirTableAccess {
+                base: HirExpr::LocalRef(LocalId(1)),
+                key: HirExpr::Integer(1),
+            })),
+            HirExpr::Integer(0),
+        );
+        let pairs = if rewrite_first {
+            [rewrite, table_write]
+        } else {
+            [table_write, rewrite]
+        };
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: pairs.iter().map(|(target, _)| target.clone()).collect(),
+            values: HirValuePack::fixed(pairs.into_iter().map(|(_, value)| value).collect()),
+        }))
+    }
+
+    #[test]
+    fn retained_target_conflicts_with_rewrite_when_different_bindings_share_exact_home() {
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(0, 0));
+        let rewrite = TempBindingRewrite {
+            from: TempId(0),
+            to: CarryBinding::Param(ParamId(0)),
+        };
+
+        assert!(retained_target_conflicts_with_rewrite(
+            rewrite,
+            &HirLValue::Local(LocalId(0)),
+            &promotion_facts,
+        ));
+    }
+
+    #[test]
+    fn retained_target_conflicts_with_rewrite_when_home_relation_is_unknown() {
+        let promotion_facts = ProtoPromotionFacts::default();
+        let rewrite = TempBindingRewrite {
+            from: TempId(0),
+            to: CarryBinding::Param(ParamId(0)),
+        };
+
+        assert!(retained_target_conflicts_with_rewrite(
+            rewrite,
+            &HirLValue::Local(LocalId(0)),
+            &promotion_facts,
+        ));
+    }
+
+    #[test]
+    fn retained_target_does_not_conflict_with_rewrite_when_homes_are_distinct() {
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        promotion_facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(1, 0));
+        let rewrite = TempBindingRewrite {
+            from: TempId(0),
+            to: CarryBinding::Param(ParamId(0)),
+        };
+
+        assert!(!retained_target_conflicts_with_rewrite(
+            rewrite,
+            &HirLValue::Local(LocalId(0)),
+            &promotion_facts,
+        ));
+    }
+
+    #[test]
+    fn effectful_retained_target_precedes_rewrite_commit_when_it_is_later_in_target_list() {
+        let stmt = effectful_parallel_seed(true);
+        let seed = binding_handoff_seed(&stmt).expect("parallel seed should parse");
+
+        assert!(effectful_retained_target_precedes_rewrite_commit(
+            &stmt,
+            &seed.rewrites,
+        ));
+    }
+
+    #[test]
+    fn effectful_retained_target_follows_rewrite_commit_when_it_is_earlier_in_target_list() {
+        let stmt = effectful_parallel_seed(false);
+        let seed = binding_handoff_seed(&stmt).expect("parallel seed should parse");
+
+        assert!(!effectful_retained_target_precedes_rewrite_commit(
+            &stmt,
+            &seed.rewrites,
+        ));
+    }
+
+    #[test]
+    fn pure_handoff_rejects_effectful_retained_target_before_other_proofs() {
+        let mut block = HirBlock {
+            stmts: vec![effectful_parallel_seed(true)],
+        };
+        let stmt_temp_refs =
+            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
+        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let label_jumps = LabelJumpIndex::new(&block.stmts);
+        let identity_facts = super::super::HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            captured: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+        };
+        let mut promotion_facts = ProtoPromotionFacts::default();
+        let mut safety = HandoffSafety {
+            promotion_facts: &mut promotion_facts,
+            identity_facts: &identity_facts,
+        };
+
+        assert!(!try_collapse_pure_binding_handoffs(
+            &mut block,
+            0,
+            &PanickingBindingProtection,
+            &temp_touches,
+            &label_jumps,
+            &BTreeSet::new(),
+            &mut safety,
+        ));
+    }
 }
