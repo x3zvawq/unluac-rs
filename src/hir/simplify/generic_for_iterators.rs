@@ -12,12 +12,12 @@
 //! direct closure producer 保留为独立 local function；child proto 的体量无法由 HIR
 //! 表达式复杂度概括，不应恢复成 loop head 内的多行匿名函数。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack, TempId,
 };
-use crate::hir::promotion::ProtoPromotionFacts;
+use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::collect_temp_use_counts;
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -132,14 +132,7 @@ fn fold_adjacent_nil_iterators(
                                     HirLValue::Temp(expected),
                                     HirExpr::Nil
                                 ) if actual == expected
-                                    // 候选拒绝[SemanticBarrier:Lifetime]：额外读取仍需观察 nil 写入后的 temp，删除 producer 会留下旧值。
-                                    && context.use_counts.get(expected) == Some(&1)
-                                    // 候选拒绝[LayerBoundary]：带 debug identity 的目标由 locals/source-binding owner 消费，本 pass 只接管匿名 temp。
-                                    && !context
-                                        .debug_temps
-                                        .get(expected.index())
-                                        .copied()
-                                        .unwrap_or(false)
+                                    && iterator_target_can_be_deleted(*expected, context)
                             )
                         })
                 })
@@ -175,16 +168,18 @@ fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<
         }
         let assignments = &stmts[..assignment_count];
         if let Some(HirStmt::GenericFor(generic_for)) = stmts.get(assignment_count) {
-            return assignments_match_iterator(assignments, generic_for).then_some(FoldPlan {
-                assignment_count,
-                gap_count: 0,
-            });
+            return assignments_match_iterator(assignments, generic_for, context).then_some(
+                FoldPlan {
+                    assignment_count,
+                    gap_count: 0,
+                },
+            );
         }
         if let (Some(gap @ HirStmt::Assign(_)), Some(HirStmt::GenericFor(generic_for))) =
             (stmts.get(assignment_count), stmts.get(assignment_count + 1))
-            && assignments_match_iterator(assignments, generic_for)
+            && assignments_match_iterator(assignments, generic_for, context)
         {
-            return parameter_pack_can_cross_temp_copy(assignments, gap, context).then_some(
+            return iterator_pack_can_cross_assignment(assignments, gap, context).then_some(
                 FoldPlan {
                     assignment_count,
                     gap_count: 1,
@@ -195,9 +190,9 @@ fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<
     None
 }
 
-// 跨 gap 比相邻折叠多一次求值重排；这里只接纳 VM 的 parameter+nil pack，
-// 并以唯一 use/debug identity/home slot 同时证明被删 temp 与保留 copy 相互独立。
-fn parameter_pack_can_cross_temp_copy(
+// 跨 gap 比相邻折叠多一次求值重排。稳定标量的求值没有 user-code effect；只要 producer、
+// gap 的直接读写 home 两两满足依赖顺序，就可以保留 gap 并把 iterator pack 延后到 loop head。
+fn iterator_pack_can_cross_assignment(
     assignments: &[HirStmt],
     gap: &HirStmt,
     context: &GenericForIteratorPass<'_>,
@@ -205,30 +200,52 @@ fn parameter_pack_can_cross_temp_copy(
     let HirStmt::Assign(gap) = gap else {
         return false;
     };
-    let ([HirLValue::Temp(gap_target)], [HirExpr::TempRef(gap_source)], None) = (
-        gap.targets.as_slice(),
-        gap.values.fixed.as_slice(),
-        gap.values.tail.as_ref(),
-    ) else {
-        // 候选拒绝[ProofIncomplete]：非标量 temp copy gap 尚无完整读写集，无法证明 iterator pack 跨越后求值顺序不变。
+    if gap
+        .values
+        .tail
+        .as_ref()
+        .is_some_and(|tail| matches!(tail.as_expr(), HirExpr::Call(_)))
+    {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：open/exact call gap 可执行 user code；iterator 求值跨过它会颠倒 producer 与 call 的事件顺序。
         return false;
+    }
+
+    let gap_target_slots = match direct_target_home_slots(&gap.targets, context.facts) {
+        Ok(slots) => slots,
+        Err(CrossGapFactError::MissingHome) => {
+            // 候选拒绝[ProofIncomplete]：gap direct target 缺可信 home 时，尚不能证明它不覆盖 iterator 的 source/target；应由 promotion provenance 补齐。
+            return false;
+        }
+        Err(CrossGapFactError::Observable) => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：upvalue/global/table 左值可执行 user code 或改变 loop head 可观察状态，iterator 求值不能跨过它。
+            return false;
+        }
     };
-    // 候选拒绝[ProofIncomplete]：缺少 gap 两端可信 home 时，尚不能证明延后 iterator pack 不会越过同槽快照；应补齐 promotion provenance。
-    let (Some(gap_target_slot), Some(gap_source_slot)) = (
-        context.facts.trusted_temp_home_slot(*gap_target),
-        context.facts.trusted_temp_home_slot(*gap_source),
-    ) else {
-        return false;
+    let gap_source_slots = match stable_value_home_slots(&gap.values.fixed, context.facts) {
+        Ok(slots) => slots,
+        Err(CrossGapFactError::MissingHome) => {
+            // 候选拒绝[ProofIncomplete]：gap source 缺可信 home 时，尚不能证明它不读取已删除的 iterator target；应由 promotion provenance 补齐。
+            return false;
+        }
+        Err(CrossGapFactError::Observable) => {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：call、lookup、closure 或运算表达式跨 iterator producer 可执行 user code/读取可变状态；这里只移动字面量和可信直接 binding。
+            return false;
+        }
     };
 
-    let mut iterator_target_slots = Vec::new();
-    let mut iterator_source_slots = Vec::new();
+    let mut iterator_target_slots = BTreeSet::new();
+    let mut iterator_source_slots = BTreeSet::new();
     for stmt in assignments {
         let HirStmt::Assign(assign) = stmt else {
             return false;
         };
-        if assign.values.tail.is_some() {
-            // 候选拒绝[ProofIncomplete]：跨 gap 的 open pack 尚未建立完整读写集，当前只有 parameter+nil 的稳定值证明。
+        if assign
+            .values
+            .tail
+            .as_ref()
+            .is_some_and(|tail| matches!(tail.as_expr(), HirExpr::Call(_)))
+        {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：`factory()<exact:N>; gap; for ...` 合并后会把 factory call 延迟到 gap 后；factory 可观察 gap 前后的状态。
             return false;
         }
         for target in &assign.targets {
@@ -236,69 +253,127 @@ fn parameter_pack_can_cross_temp_copy(
                 return false;
             };
             let Some(slot) = context.facts.trusted_temp_home_slot(*temp) else {
-                // 候选拒绝[ProofIncomplete]：iterator 目标缺少可信 home，无法排除与 gap copy 同槽；应由 promotion 补 provenance。
+                // 候选拒绝[ProofIncomplete]：iterator target 缺可信 home，无法排除与 gap assignment 同槽；应由 promotion provenance 补齐。
                 return false;
             };
-            // 候选拒绝[SemanticBarrier:Lifetime]：多处读取会继续观察已删除的 iterator temp；例如循环后再次返回该 temp。
-            // 候选拒绝[LayerBoundary]：debug temp 是源码 binding，不由 iterator-pack pass 删除。
-            // 候选拒绝[SemanticBarrier:EvalOrder]：同一 home 的两个目标会被顺序覆盖，延后整包会改变 gap 所见快照。
-            if context.use_counts.get(temp) != Some(&1)
-                || context
-                    .debug_temps
-                    .get(temp.index())
-                    .copied()
-                    .unwrap_or(false)
-                || iterator_target_slots.contains(&slot)
-            {
+            iterator_target_slots.insert(slot);
+        }
+        let source_slots = match stable_value_home_slots(&assign.values.fixed, context.facts) {
+            Ok(slots) => slots,
+            Err(CrossGapFactError::MissingHome) => {
+                // 候选拒绝[ProofIncomplete]：iterator source 缺可信 home 时，尚不能证明 gap 不会覆盖延迟读取；应由 promotion provenance 补齐。
                 return false;
             }
-            iterator_target_slots.push(slot);
-        }
-        for value in &assign.values.fixed {
-            match value {
-                HirExpr::Nil => {}
-                HirExpr::ParamRef(param) => {
-                    let Some(slot) = context.facts.trusted_param_home_slot(*param) else {
-                        // 候选拒绝[ProofIncomplete]：参数缺少可信 home，无法证明它与被删目标及 gap copy 不别名。
-                        return false;
-                    };
-                    iterator_source_slots.push(slot);
-                }
-                // 候选拒绝[ProofIncomplete]：非 parameter/nil 值尚无跨 gap 的稳定读取与 effect 证明；应复用表达式读写集分析。
-                _ => return false,
+            Err(CrossGapFactError::Observable) => {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：可观察 iterator RHS 延迟到 gap 后会重排 call/lookup/metamethod；只接纳字面量和可信直接 binding。
+                return false;
             }
-        }
+        };
+        iterator_source_slots.extend(source_slots);
     }
 
     // 候选拒绝[SemanticBarrier:EvalOrder]：若 gap 读写槽与 iterator source/target 重叠，移动 pack 到 gap 后会改变被复制或被循环读取的值。
-    !iterator_target_slots.contains(&gap_target_slot)
-        && !iterator_source_slots.contains(&gap_target_slot)
-        && !iterator_target_slots.contains(&gap_source_slot)
-        && iterator_source_slots
-            .iter()
-            .all(|slot| !iterator_target_slots.contains(slot))
+    iterator_target_slots.is_disjoint(&gap_target_slots)
+        && iterator_source_slots.is_disjoint(&gap_target_slots)
+        && iterator_target_slots.is_disjoint(&gap_source_slots)
 }
 
-fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericFor) -> bool {
-    // 候选拒绝[ProofIncomplete]：已有 open iterator tail 时，matcher 尚未证明前置 targets 与 fixed/open pack 的逐项对应；应扩展 pack provenance。
-    if generic_for.iterator.tail.is_some() {
-        return false;
-    }
+#[derive(Clone, Copy)]
+enum CrossGapFactError {
+    MissingHome,
+    Observable,
+}
 
+fn direct_target_home_slots(
+    targets: &[HirLValue],
+    facts: &ProtoPromotionFacts,
+) -> Result<BTreeSet<HomeSlotKey>, CrossGapFactError> {
+    let mut slots = BTreeSet::new();
+    for target in targets {
+        let slot = match target {
+            HirLValue::Param(param) => facts.trusted_param_home_slot(*param),
+            HirLValue::Local(local) => facts.trusted_local_home_slot(*local),
+            HirLValue::Temp(temp) => facts.trusted_temp_home_slot(*temp),
+            HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
+                return Err(CrossGapFactError::Observable);
+            }
+        }
+        .ok_or(CrossGapFactError::MissingHome)?;
+        slots.insert(slot);
+    }
+    Ok(slots)
+}
+
+fn stable_value_home_slots(
+    values: &[HirExpr],
+    facts: &ProtoPromotionFacts,
+) -> Result<BTreeSet<HomeSlotKey>, CrossGapFactError> {
+    let mut slots = BTreeSet::new();
+    for value in values {
+        let slot = match value {
+            HirExpr::ParamRef(param) => facts
+                .trusted_param_home_slot(*param)
+                .ok_or(CrossGapFactError::MissingHome)?,
+            HirExpr::LocalRef(local) => facts
+                .trusted_local_home_slot(*local)
+                .ok_or(CrossGapFactError::MissingHome)?,
+            HirExpr::TempRef(temp) => facts
+                .trusted_temp_home_slot(*temp)
+                .ok_or(CrossGapFactError::MissingHome)?,
+            HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+            | HirExpr::Int64(_)
+            | HirExpr::UInt64(_)
+            | HirExpr::Complex { .. }
+            | HirExpr::Vector(_)
+            | HirExpr::UpvalueRef(_) => continue,
+            HirExpr::GlobalRef(_)
+            | HirExpr::TableAccess(_)
+            | HirExpr::Unary(_)
+            | HirExpr::Binary(_)
+            | HirExpr::LogicalAnd(_)
+            | HirExpr::LogicalOr(_)
+            | HirExpr::Decision(_)
+            | HirExpr::Call(_)
+            | HirExpr::VarArg
+            | HirExpr::TableConstructor(_)
+            | HirExpr::Closure(_)
+            | HirExpr::Unresolved(_) => return Err(CrossGapFactError::Observable),
+        };
+        slots.insert(slot);
+    }
+    Ok(slots)
+}
+
+fn assignments_match_iterator(
+    assignments: &[HirStmt],
+    generic_for: &HirGenericFor,
+    context: &GenericForIteratorPass<'_>,
+) -> bool {
     let mut expected = generic_for.iterator.fixed.iter();
     for (index, stmt) in assignments.iter().enumerate() {
         let HirStmt::Assign(assign) = stmt else {
             return false;
         };
-        // 候选拒绝[SemanticBarrier:ValueArity]：非精确宽度或非末尾 open pack 在合并后会采用不同的 Lua 调整规则。
+        // 候选拒绝[SemanticBarrier:ValueArity]：target 之后的 fixed RHS 仍会求值但不占赋值槽；直接拼进 loop pack 会占据并移动后续 protocol 槽。
+        if assign.values.fixed.len() > assign.targets.len() {
+            return false;
+        }
+        // 候选拒绝[SemanticBarrier:ValueArity]：非末尾 open tail 在源码列表中会被后续表达式截成单值；两个 tail 也不能保持各自的展开边界。
+        if assign.values.tail.is_some()
+            && (index + 1 != assignments.len() || generic_for.iterator.tail.is_some())
+        {
+            return false;
+        }
         // 候选拒绝[PolicyBoundary]：closure producer 保留命名 binding，避免把完整 child body 压成 loop head 内的多行 IIFE。
-        if assign.values.exact_result_len() != Some(assign.targets.len())
-            || (assign.values.tail.is_some() && index + 1 != assignments.len())
-            || assign
-                .values
-                .fixed
-                .iter()
-                .any(|value| matches!(value, HirExpr::Closure(_)))
+        if assign
+            .values
+            .fixed
+            .iter()
+            .any(|value| matches!(value, HirExpr::Closure(_)))
         {
             return false;
         }
@@ -311,9 +386,29 @@ fn assignments_match_iterator(assignments: &[HirStmt], generic_for: &HirGenericF
             if actual != expected {
                 return false;
             }
+            if !iterator_target_can_be_deleted(*actual, context) {
+                return false;
+            }
         }
     }
     expected.next().is_none()
+}
+
+fn iterator_target_can_be_deleted(target: TempId, context: &GenericForIteratorPass<'_>) -> bool {
+    // 候选拒绝[SemanticBarrier:ValueFlow]：producer target 的额外读取仍需原 materialization；regress_343 的 loop 后 live-out 会变成未定义值。
+    if context.use_counts.get(&target) != Some(&1) {
+        return false;
+    }
+    // 候选拒绝[SemanticBarrier:Scope]：debug.getlocal 可观察 source iterator/state/control 的词法身份；见 regress_343。
+    if context
+        .debug_temps
+        .get(target.index())
+        .copied()
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    true
 }
 
 fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut Vec<HirStmt>) {
@@ -325,13 +420,18 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
         else {
             unreachable!("fold plan only counts assignments");
         };
+        let target_count = assign.targets.len();
+        let fixed_count = assign.values.fixed.len();
         iterator.fixed.extend(assign.values.fixed);
         if let Some(tail) = assign.values.tail {
             iterator.tail = Some(tail.into_open());
+        } else {
+            iterator.fixed.resize(
+                iterator.fixed.len() + target_count - fixed_count,
+                HirExpr::Nil,
+            );
         }
     }
-
-    trim_trailing_nil_iterators(&mut iterator);
 
     for _ in 0..plan.gap_count {
         new_stmts.push(
@@ -344,6 +444,15 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
     let Some(HirStmt::GenericFor(mut generic_for)) = pending.pop_front() else {
         unreachable!("validated generic-for owner");
     };
+    if iterator.tail.is_none() {
+        iterator.tail = generic_for.iterator.tail.take();
+    } else {
+        assert!(
+            generic_for.iterator.tail.is_none(),
+            "validated generic-for fold cannot merge two value-pack tails"
+        );
+    }
+    trim_trailing_nil_iterators(&mut iterator);
     generic_for.iterator = iterator;
     new_stmts.push(HirStmt::GenericFor(generic_for));
 }

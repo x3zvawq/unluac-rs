@@ -349,7 +349,13 @@ pub(super) fn collapse_written_back_if_results(
         cursor += 1;
         keep
     });
-    inline_owned_branch_conditions(block, &condition_scratch, outer_bindings, captured_bindings);
+    inline_owned_branch_conditions(
+        block,
+        &condition_scratch,
+        outer_bindings,
+        captured_bindings,
+        identity_facts,
+    );
     true
 }
 

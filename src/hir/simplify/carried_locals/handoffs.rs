@@ -7,6 +7,8 @@
 //! 共用物理 home，会在父模块冻结的 proto 身份事实下保留原形。任何把 temp 的求值提前
 //! 写入已有 binding 的 handoff 还必须证明两端属于相同的 `(slot, close epoch)`，避免改变
 //! 弱表、`__gc` 或异常 cleanup 可观察到的旧值存活期。
+//! seed 与 suffix 作为一个事务提交：seed 的替换形状先在副本上冻结，suffix rewrite 命中后
+//! 才执行不可失败的替换或删除，避免 plan/apply 漂移留下半提交状态。
 //!
 //! 例子：
 //! - 输入：`assign t = s; ... t = t + 1`
@@ -138,6 +140,17 @@ fn try_collapse_pure_binding_handoffs(
         return false;
     }
 
+    let rewritten_seed = if seed.retained_pairs.is_empty() {
+        None
+    } else {
+        let mut rewritten_seed = block.stmts[index].clone();
+        assert!(
+            rewrite_binding_handoff_seed(&mut rewritten_seed, &seed.retained_pairs),
+            "parsed binding handoff seed must remain rewritable while planning"
+        );
+        Some(rewritten_seed)
+    };
+
     let mut pass = TempToBindingPass {
         rewrites: seed.rewrites.clone(),
         promotion_facts: safety.promotion_facts,
@@ -147,11 +160,10 @@ fn try_collapse_pure_binding_handoffs(
         return false;
     }
 
-    if seed.retained_pairs.is_empty() {
+    if let Some(rewritten_seed) = rewritten_seed {
+        block.stmts[index] = rewritten_seed;
+    } else {
         block.stmts.remove(index);
-    } else if !rewrite_binding_handoff_seed(&mut block.stmts[index], &seed.retained_pairs) {
-        // 证明缺陷[InvariantMismatch]：suffix 已提交改名后 seed apply 仍可失败，plan/apply 漂移时会留下半提交 transaction。
-        return false;
     }
 
     prune_redundant_self_assigns_in_stmts(
@@ -342,6 +354,12 @@ fn try_collapse_binding_update_handoff(
         return false;
     }
 
+    let mut rewritten_seed = block.stmts[index].clone();
+    assert!(
+        rewrite_update_handoff_seed(&mut rewritten_seed, carried),
+        "parsed update handoff seed must remain rewritable while planning"
+    );
+
     let rewritten = rewrite_stmts(
         &mut block.stmts[index + 1..],
         &mut TempToBindingPass {
@@ -356,10 +374,7 @@ fn try_collapse_binding_update_handoff(
         // 候选拒绝[ConvergenceGuard]：suffix touch/writeback 已证明 temp 存在；无 rewrite 命中表示 plan facts 漂移。
         return false;
     }
-    if !rewrite_update_handoff_seed(&mut block.stmts[index], carried) {
-        // 证明缺陷[InvariantMismatch]：suffix 已改写后 seed apply 可失败且没有 rollback，plan/apply 漂移会半提交。
-        return false;
-    }
+    block.stmts[index] = rewritten_seed;
 
     rewrite_stmts(
         &mut block.stmts[index + 1..],

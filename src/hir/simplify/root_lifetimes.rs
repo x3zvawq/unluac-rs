@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirCallExpr, HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId};
+use crate::hir::common::{
+    HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId,
+};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
@@ -104,6 +106,15 @@ pub(super) fn collect_call_root_lifetimes(
                 .any(|alias| escaped_temps.contains(alias));
         }
         let Some((temp, value)) = scalar_temp_definition(stmt) else {
+            if let Some((home, eligible)) =
+                definite_branch_temp_home_overwrite(stmt, facts, &mut temp_is_eligible)
+            {
+                if let Some(root) = active.remove(&home) {
+                    record_call_root_overwrite(root, index, eligible, &uses, &mut lifetimes);
+                }
+                remove_allocation_homes(&mut active_allocations, &BTreeSet::from([home]), facts);
+                continue;
+            }
             let writes = StackWriteSummary::for_stmt(stmt, facts);
             if writes.has_boundary || writes.has_unknown_home {
                 active.clear();
@@ -197,6 +208,41 @@ pub(super) fn collect_call_root_lifetimes(
     }
 
     lifetimes
+}
+
+fn definite_branch_temp_home_overwrite(
+    stmt: &HirStmt,
+    facts: &ProtoPromotionFacts,
+    temp_is_eligible: &mut impl FnMut(TempId) -> bool,
+) -> Option<(HomeSlotKey, bool)> {
+    let HirStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    let else_block = if_stmt.else_block.as_ref()?;
+    let then_temp = single_scalar_temp_write(&if_stmt.then_block)?;
+    let else_temp = single_scalar_temp_write(else_block)?;
+    let then_home = facts.home_slot(then_temp)?;
+    let else_home = facts.home_slot(else_temp)?;
+    (then_home == else_home).then(|| {
+        (
+            then_home,
+            temp_is_eligible(then_temp) && temp_is_eligible(else_temp),
+        )
+    })
+}
+
+fn single_scalar_temp_write(block: &HirBlock) -> Option<TempId> {
+    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+        return None;
+    };
+    let ([HirLValue::Temp(temp)], [_], None) = (
+        assign.targets.as_slice(),
+        assign.values.fixed.as_slice(),
+        &assign.values.tail,
+    ) else {
+        return None;
+    };
+    Some(*temp)
 }
 
 fn stmt_is_transparent_temp_copy(stmt: &HirStmt, aliases: &BTreeSet<TempId>) -> bool {

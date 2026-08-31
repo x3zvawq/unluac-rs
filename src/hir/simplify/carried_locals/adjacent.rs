@@ -6,12 +6,20 @@
 //! 明确时，把 carried 的使用点认回 seed。相邻 owner 只接受单目标 `carried = seed`
 //! 复制；`seed = carried` 尤其是多目标并行写回会保守保留两个 binding。
 //! capture/TBC direct 身份及 raw-home may-alias 由父模块统一保护，不在这里改写资源 cell。
+//! 接受相邻 local 合并前，本 owner 还在结构化 HIR 上计算 `Unwritten/Written` 路径事实：
+//! 分支合并可能状态，循环通过有限状态不动点消费自然/continue 回边和 break 出口，赋值按
+//! “先读 RHS/左值地址、再同时写 targets”转移。goto/label 的额外入口仍属于 CFG dominance
+//! owner，本文件不会从线性位置猜测它们是否绕过写入。
+//!
+//! - 接受：`local s=1; local c; c=s; print(c)` -> `local s=1; print(s)`
+//! - 拒绝：`local s=1; local c; print(c); c=s`，因为 nil 读取不受 handoff 写支配
 
 use std::collections::BTreeMap;
 
 use crate::hir::common::{HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, LocalId};
 use crate::hir::promotion::ProtoPromotionFacts;
 
+use super::super::expr_facts::expr_truthiness;
 use super::super::local_shapes::{
     empty_single_local_decl_binding, initialized_single_local_decl_binding,
 };
@@ -147,13 +155,397 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
         return false;
     }
 
-    // 证明缺陷[PotentialUnsoundness:Lifetime]：未证明 carried 的每次读取都受 handoff 写支配；`local s=1; local c; print(c); c=s` 会把 nil 读取改成 1。
+    match carried_write_dominance(tail, carried) {
+        CarriedWriteDominance::Proven => {}
+        CarriedWriteDominance::ReadBeforeWrite => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：carried 在 handoff 写前可读时，改名会把 nil/旧 epoch 改成 seed；`local s=1; local c; print(c); c=s` 可观察 nil 变为 1。
+            return false;
+        }
+        CarriedWriteDominance::UnstructuredControl => {
+            // 候选拒绝[LayerBoundary]：goto/label 的额外入口需要 CFG dominance owner 证明不会绕过 handoff 写。
+            return false;
+        }
+    }
+
     let mut tail = block.stmts.split_off(index + 2);
     rewrite_carried_local_in_stmts(&mut tail, carried, seed, promotion_facts);
     block.stmts.append(&mut tail);
     block.stmts.remove(index + 1);
     prune_empty_assign_stmts(block);
     true
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CarriedWriteDominance {
+    Proven,
+    ReadBeforeWrite,
+    UnstructuredControl,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct WriteStates(u8);
+
+impl WriteStates {
+    const EMPTY: Self = Self(0);
+    const UNWRITTEN: Self = Self(1);
+    const WRITTEN: Self = Self(2);
+
+    const fn contains_unwritten(self) -> bool {
+        self.0 & Self::UNWRITTEN.0 != 0
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    const fn after_write(self) -> Self {
+        if self.is_empty() {
+            Self::EMPTY
+        } else {
+            Self::WRITTEN
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct DominanceFlow {
+    fallthrough: WriteStates,
+    breaks: WriteStates,
+    continues: WriteStates,
+}
+
+impl DominanceFlow {
+    const fn fallthrough(states: WriteStates) -> Self {
+        Self {
+            fallthrough: states,
+            breaks: WriteStates::EMPTY,
+            continues: WriteStates::EMPTY,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DominanceError {
+    ReadBeforeWrite,
+    UnstructuredControl,
+}
+
+fn carried_write_dominance(stmts: &[HirStmt], carried: LocalId) -> CarriedWriteDominance {
+    if stmts.iter().any(stmt_has_unstructured_control) {
+        return CarriedWriteDominance::UnstructuredControl;
+    }
+    match analyze_dominance_stmts(stmts, WriteStates::UNWRITTEN, carried) {
+        Ok(_) => CarriedWriteDominance::Proven,
+        Err(DominanceError::ReadBeforeWrite) => CarriedWriteDominance::ReadBeforeWrite,
+        Err(DominanceError::UnstructuredControl) => CarriedWriteDominance::UnstructuredControl,
+    }
+}
+
+fn analyze_dominance_stmts(
+    stmts: &[HirStmt],
+    mut states: WriteStates,
+    carried: LocalId,
+) -> Result<DominanceFlow, DominanceError> {
+    let mut breaks = WriteStates::EMPTY;
+    let mut continues = WriteStates::EMPTY;
+    for stmt in stmts {
+        if states.is_empty() {
+            break;
+        }
+        let flow = analyze_dominance_stmt(stmt, states, carried)?;
+        states = flow.fallthrough;
+        breaks = breaks.union(flow.breaks);
+        continues = continues.union(flow.continues);
+    }
+    Ok(DominanceFlow {
+        fallthrough: states,
+        breaks,
+        continues,
+    })
+}
+
+fn analyze_dominance_stmt(
+    stmt: &HirStmt,
+    states: WriteStates,
+    carried: LocalId,
+) -> Result<DominanceFlow, DominanceError> {
+    match stmt {
+        HirStmt::LocalDecl(local_decl) => {
+            ensure_pack_is_initialized(&local_decl.values, states, carried)?;
+            Ok(DominanceFlow::fallthrough(states))
+        }
+        HirStmt::Assign(assign) => {
+            for target in &assign.targets {
+                ensure_lvalue_address_is_initialized(target, states, carried)?;
+            }
+            ensure_pack_is_initialized(&assign.values, states, carried)?;
+            let writes_carried = assign
+                .targets
+                .iter()
+                .any(|target| matches!(target, HirLValue::Local(local) if *local == carried));
+            Ok(DominanceFlow::fallthrough(if writes_carried {
+                states.after_write()
+            } else {
+                states
+            }))
+        }
+        HirStmt::TableSetList(set_list) => {
+            ensure_expr_is_initialized(&set_list.base, states, carried)?;
+            ensure_pack_is_initialized(&set_list.values, states, carried)?;
+            Ok(DominanceFlow::fallthrough(states))
+        }
+        HirStmt::ErrNil(err_nil) => {
+            ensure_expr_is_initialized(&err_nil.value, states, carried)?;
+            Ok(DominanceFlow::fallthrough(states))
+        }
+        HirStmt::ToBeClosed(to_be_closed) => {
+            ensure_expr_is_initialized(&to_be_closed.value, states, carried)?;
+            Ok(DominanceFlow::fallthrough(states))
+        }
+        HirStmt::CallStmt(call_stmt) => {
+            ensure_call_is_initialized(&call_stmt.call, states, carried)?;
+            Ok(DominanceFlow::fallthrough(states))
+        }
+        HirStmt::Return(return_stmt) => {
+            ensure_pack_is_initialized(&return_stmt.values, states, carried)?;
+            Ok(DominanceFlow::fallthrough(WriteStates::EMPTY))
+        }
+        HirStmt::If(if_stmt) => {
+            ensure_expr_is_initialized(&if_stmt.cond, states, carried)?;
+            let then_flow = if expr_truthiness(&if_stmt.cond) == Some(false) {
+                DominanceFlow::fallthrough(WriteStates::EMPTY)
+            } else {
+                analyze_dominance_stmts(&if_stmt.then_block.stmts, states, carried)?
+            };
+            let else_flow = if expr_truthiness(&if_stmt.cond) == Some(true) {
+                DominanceFlow::fallthrough(WriteStates::EMPTY)
+            } else if let Some(else_block) = &if_stmt.else_block {
+                analyze_dominance_stmts(&else_block.stmts, states, carried)?
+            } else {
+                DominanceFlow::fallthrough(states)
+            };
+            Ok(union_dominance_flows(then_flow, else_flow))
+        }
+        HirStmt::While(while_stmt) => {
+            analyze_while_dominance(&while_stmt.body, &while_stmt.cond, states, carried)
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            analyze_repeat_dominance(&repeat_stmt.body, &repeat_stmt.cond, states, carried)
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            ensure_expr_is_initialized(&numeric_for.start, states, carried)?;
+            ensure_expr_is_initialized(&numeric_for.limit, states, carried)?;
+            ensure_expr_is_initialized(&numeric_for.step, states, carried)?;
+            analyze_zero_or_more_dominance(&numeric_for.body, states, carried)
+        }
+        HirStmt::GenericFor(generic_for) => {
+            ensure_pack_is_initialized(&generic_for.iterator, states, carried)?;
+            analyze_zero_or_more_dominance(&generic_for.body, states, carried)
+        }
+        HirStmt::Block(block) => analyze_dominance_stmts(&block.stmts, states, carried),
+        HirStmt::Break => Ok(DominanceFlow {
+            fallthrough: WriteStates::EMPTY,
+            breaks: states,
+            continues: WriteStates::EMPTY,
+        }),
+        HirStmt::Continue => Ok(DominanceFlow {
+            fallthrough: WriteStates::EMPTY,
+            breaks: WriteStates::EMPTY,
+            continues: states,
+        }),
+        HirStmt::Goto(_) | HirStmt::Label(_) => Err(DominanceError::UnstructuredControl),
+        HirStmt::Close(_) => Ok(DominanceFlow::fallthrough(states)),
+    }
+}
+
+fn analyze_while_dominance(
+    body: &HirBlock,
+    condition: &HirExpr,
+    incoming: WriteStates,
+    carried: LocalId,
+) -> Result<DominanceFlow, DominanceError> {
+    let truthiness = expr_truthiness(condition);
+    let mut entries = incoming;
+    let mut break_exits = WriteStates::EMPTY;
+    loop {
+        ensure_expr_is_initialized(condition, entries, carried)?;
+        let body_flow = if truthiness == Some(false) {
+            DominanceFlow::fallthrough(WriteStates::EMPTY)
+        } else {
+            analyze_dominance_stmts(&body.stmts, entries, carried)?
+        };
+        let next_entries = incoming
+            .union(body_flow.fallthrough)
+            .union(body_flow.continues);
+        let next_break_exits = break_exits.union(body_flow.breaks);
+        if next_entries == entries && next_break_exits == break_exits {
+            let normal_exits = if truthiness == Some(true) {
+                WriteStates::EMPTY
+            } else {
+                entries
+            };
+            return Ok(DominanceFlow::fallthrough(normal_exits.union(break_exits)));
+        }
+        entries = next_entries;
+        break_exits = next_break_exits;
+    }
+}
+
+fn analyze_repeat_dominance(
+    body: &HirBlock,
+    condition: &HirExpr,
+    incoming: WriteStates,
+    carried: LocalId,
+) -> Result<DominanceFlow, DominanceError> {
+    let truthiness = expr_truthiness(condition);
+    let mut entries = incoming;
+    let mut break_exits = WriteStates::EMPTY;
+    loop {
+        let body_flow = analyze_dominance_stmts(&body.stmts, entries, carried)?;
+        let condition_states = body_flow.fallthrough.union(body_flow.continues);
+        ensure_expr_is_initialized(condition, condition_states, carried)?;
+        let back_edges = if truthiness == Some(true) {
+            WriteStates::EMPTY
+        } else {
+            condition_states
+        };
+        let next_entries = incoming.union(back_edges);
+        let next_break_exits = break_exits.union(body_flow.breaks);
+        if next_entries == entries && next_break_exits == break_exits {
+            let normal_exits = if truthiness == Some(false) {
+                WriteStates::EMPTY
+            } else {
+                condition_states
+            };
+            return Ok(DominanceFlow::fallthrough(normal_exits.union(break_exits)));
+        }
+        entries = next_entries;
+        break_exits = next_break_exits;
+    }
+}
+
+fn analyze_zero_or_more_dominance(
+    body: &HirBlock,
+    incoming: WriteStates,
+    carried: LocalId,
+) -> Result<DominanceFlow, DominanceError> {
+    let mut entries = incoming;
+    let mut break_exits = WriteStates::EMPTY;
+    loop {
+        let body_flow = analyze_dominance_stmts(&body.stmts, entries, carried)?;
+        let next_entries = incoming
+            .union(body_flow.fallthrough)
+            .union(body_flow.continues);
+        let next_break_exits = break_exits.union(body_flow.breaks);
+        if next_entries == entries && next_break_exits == break_exits {
+            return Ok(DominanceFlow::fallthrough(entries.union(break_exits)));
+        }
+        entries = next_entries;
+        break_exits = next_break_exits;
+    }
+}
+
+fn union_dominance_flows(left: DominanceFlow, right: DominanceFlow) -> DominanceFlow {
+    DominanceFlow {
+        fallthrough: left.fallthrough.union(right.fallthrough),
+        breaks: left.breaks.union(right.breaks),
+        continues: left.continues.union(right.continues),
+    }
+}
+
+fn ensure_pack_is_initialized(
+    pack: &crate::hir::common::HirValuePack,
+    states: WriteStates,
+    carried: LocalId,
+) -> Result<(), DominanceError> {
+    for expr in pack {
+        ensure_expr_is_initialized(expr, states, carried)?;
+    }
+    Ok(())
+}
+
+fn ensure_call_is_initialized(
+    call: &HirCallExpr,
+    states: WriteStates,
+    carried: LocalId,
+) -> Result<(), DominanceError> {
+    ensure_expr_is_initialized(&call.callee, states, carried)?;
+    ensure_pack_is_initialized(&call.args, states, carried)
+}
+
+fn ensure_lvalue_address_is_initialized(
+    lvalue: &HirLValue,
+    states: WriteStates,
+    carried: LocalId,
+) -> Result<(), DominanceError> {
+    let HirLValue::TableAccess(access) = lvalue else {
+        return Ok(());
+    };
+    ensure_expr_is_initialized(&access.base, states, carried)?;
+    ensure_expr_is_initialized(&access.key, states, carried)
+}
+
+fn ensure_expr_is_initialized(
+    expr: &HirExpr,
+    states: WriteStates,
+    carried: LocalId,
+) -> Result<(), DominanceError> {
+    if states.contains_unwritten() && expr_mentions_local(expr, carried) {
+        Err(DominanceError::ReadBeforeWrite)
+    } else {
+        Ok(())
+    }
+}
+
+fn stmt_has_unstructured_control(stmt: &HirStmt) -> bool {
+    match stmt {
+        HirStmt::Goto(_) | HirStmt::Label(_) => true,
+        HirStmt::If(if_stmt) => {
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .any(stmt_has_unstructured_control)
+                || if_stmt.else_block.as_ref().is_some_and(|else_block| {
+                    else_block.stmts.iter().any(stmt_has_unstructured_control)
+                })
+        }
+        HirStmt::While(while_stmt) => while_stmt
+            .body
+            .stmts
+            .iter()
+            .any(stmt_has_unstructured_control),
+        HirStmt::Repeat(repeat_stmt) => repeat_stmt
+            .body
+            .stmts
+            .iter()
+            .any(stmt_has_unstructured_control),
+        HirStmt::NumericFor(numeric_for) => numeric_for
+            .body
+            .stmts
+            .iter()
+            .any(stmt_has_unstructured_control),
+        HirStmt::GenericFor(generic_for) => generic_for
+            .body
+            .stmts
+            .iter()
+            .any(stmt_has_unstructured_control),
+        HirStmt::Block(block) => block.stmts.iter().any(stmt_has_unstructured_control),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue => false,
+    }
 }
 
 fn rewrite_carried_local_in_stmts(

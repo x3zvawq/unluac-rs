@@ -253,7 +253,9 @@ pub(super) fn simplify_hir(
                         .unwrap_or(&mut empty_facts);
                     match index {
                         0 => decision::simplify_decision_exprs_in_proto(proto),
-                        1 => boolean_shells::remove_boolean_materialization_shells_in_proto(proto),
+                        1 => boolean_shells::remove_boolean_materialization_shells_in_proto(
+                            proto, facts,
+                        ),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto, dialect),
                         3 => table_constructors::stabilize_table_constructors_in_proto(
                             proto, dialect, facts,
@@ -275,7 +277,7 @@ pub(super) fn simplify_hir(
                         11 => {
                             carried_locals::collapse_carried_local_handoffs_in_proto(proto, facts)
                         }
-                        12 => dead_temps::remove_dead_temp_materializations_in_proto(proto),
+                        12 => dead_temps::remove_dead_temp_materializations_in_proto(proto, facts),
                         13 => dead_labels::remove_unused_labels_in_proto(proto),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }

@@ -7,16 +7,21 @@ pub(super) fn inline_owned_branch_conditions(
     candidates: &BTreeSet<LocalId>,
     outer_bindings: &dyn BindingProtection,
     captured_bindings: &BTreeSet<CarryBinding>,
+    identity_facts: &HandoffIdentityFacts,
 ) -> bool {
     let mut eligible = candidates
         .iter()
         .copied()
         .filter(|local| {
             let binding = CarryBinding::Local(*local);
-            !outer_bindings.contains(&binding) && !captured_bindings.contains(&binding)
+            !outer_bindings.contains(&binding)
+                && !captured_bindings.contains(&binding)
+                && !identity_facts.contains(*local)
         })
         .collect::<BTreeSet<_>>();
     // 候选拒绝[SemanticBarrier:Capture]：outer/captured condition local 可能被分支外或 closure 观察，不能删除 producer identity。
+    // 候选拒绝[PolicyBoundary]：debug/for condition local 是项目选择保留的源码身份。
+    // 候选拒绝[SemanticBarrier:Lifetime]：内联后删除 physical-root condition producer 会移除其 VM root declaration；lua54_01_close#17 用 __gc + collectgarbage 观察同槽清空前失去 root 的对象提前析构。
     if eligible.is_empty() {
         return false;
     }
@@ -51,7 +56,6 @@ pub(super) fn inline_owned_branch_conditions(
         let HirStmt::If(if_stmt) = &mut block.stmts[index + 1] else {
             continue;
         };
-        // 证明缺陷[PotentialPolicyViolation]：此 owner 没有 HandoffIdentityFacts/debug gate；带 debug hint 的 condition local 也会被直接删除。
         if_stmt.cond = value;
         *remove = true;
     }

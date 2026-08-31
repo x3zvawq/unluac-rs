@@ -69,6 +69,31 @@ pub(super) fn candidate_temps(
         .collect()
 }
 
+pub(super) fn definite_if_arm_temp_writes(stmt: &HirStmt) -> Option<[TempId; 2]> {
+    let HirStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    let else_block = if_stmt.else_block.as_ref()?;
+    Some([
+        single_scalar_temp_write(&if_stmt.then_block)?,
+        single_scalar_temp_write(else_block)?,
+    ])
+}
+
+fn single_scalar_temp_write(block: &HirBlock) -> Option<TempId> {
+    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+        return None;
+    };
+    let ([HirLValue::Temp(temp)], [_], None) = (
+        assign.targets.as_slice(),
+        assign.values.fixed.as_slice(),
+        &assign.values.tail,
+    ) else {
+        return None;
+    };
+    Some(*temp)
+}
+
 fn summarize_block_fallthrough_assignments(block: &HirBlock) -> Option<FallthroughSummary> {
     let mut assigned_temps = BTreeSet::new();
     let mut reads_before_assignment = BTreeSet::new();

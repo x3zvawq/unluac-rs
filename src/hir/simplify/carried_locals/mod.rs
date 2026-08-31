@@ -10,8 +10,9 @@
 //! 先证明 seed 在后续不再可观察、temp 不被外层作用域消费，并且写回形状可证明。
 //! captured local 也不能作为纯 alias handoff 的来源：闭包调用可能在后缀没有显式提及
 //! 该 local 时写回它，跨过这类调用消除快照会改变后续读值。
-//! 所有 owner 还共享 proto 级 capture/TBC 身份门：direct 资源 binding 与其 raw home
-//! may-alias 都不得成为改写两端，避免先改坏 closure cell/close 身份再靠 provenance 兜底。
+//! 所有 owner 还共享 proto 级 source/capture/resource 身份门：debug、for、physical-root、
+//! direct capture/TBC binding 与其 raw home may-alias 都不得成为改写两端，避免先改坏
+//! source identity、closure cell 或 root/close 生命周期再靠 provenance 兜底。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -269,6 +270,7 @@ fn collapse_block_handoffs(
 struct HandoffIdentityFacts {
     debug: BTreeSet<LocalId>,
     for_bindings: BTreeSet<LocalId>,
+    physical_roots: BTreeSet<LocalId>,
     captured: BTreeSet<CarryBinding>,
     reference_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
@@ -288,6 +290,7 @@ impl HandoffIdentityFacts {
         Self {
             debug,
             for_bindings: collector.for_bindings,
+            physical_roots: proto.physical_root_locals.clone(),
             captured: collector.captured,
             reference_captured: collector.reference_captured,
             to_be_closed: collector.to_be_closed,
@@ -295,7 +298,9 @@ impl HandoffIdentityFacts {
     }
 
     fn contains(&self, local: LocalId) -> bool {
-        self.debug.contains(&local) || self.for_bindings.contains(&local)
+        self.debug.contains(&local)
+            || self.for_bindings.contains(&local)
+            || self.physical_roots.contains(&local)
     }
 
     fn binding_merge_preserves_identity(
@@ -304,13 +309,16 @@ impl HandoffIdentityFacts {
         target: CarryBinding,
         promotion_facts: &ProtoPromotionFacts,
     ) -> bool {
-        // 证明缺陷[PotentialPolicyViolation]：共享 identity gate 未检查 self.debug/for_bindings；未额外调用 contains 的 handoff owner 可删除 debug/for binding 身份。
         // 候选拒绝[LayerBoundary]：entry-nil provenance 已被前层裁剪时，promotion owner 无法再证明原 binding identity。
+        // 候选拒绝[PolicyBoundary]：debug/for source identity 由 proto identity owner 保留。
+        // 候选拒绝[SemanticBarrier:Lifetime]：把 physical-root result 合并到 state 会删除其 VM root declaration；lua54_01_close#17 用 __gc + collectgarbage 观察同槽清空前的对象若失去该 root 会提前析构。
         // 候选拒绝[SemanticBarrier:Capture]：capture 任一端或 raw-home may-alias reference capture 时，closure 可区分合并前的 cell。
         // 候选拒绝[SemanticBarrier:Lifetime]：TBC 任一端或 raw-home may-alias resource binding 时，合并会改变 close/root epoch。
-        !source
-            .local()
-            .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
+        !source.local().is_some_and(|local| self.contains(local))
+            && !target.local().is_some_and(|local| self.contains(local))
+            && !source
+                .local()
+                .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
             && !target
                 .local()
                 .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))

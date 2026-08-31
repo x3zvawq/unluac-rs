@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::super::common::{
     AstBindingRef, AstBlock, AstExpr, AstLValue, AstLabelId, AstLocalAttr, AstLocalBinding,
-    AstLocalDecl, AstModule, AstStmt,
+    AstLocalDecl, AstLocalOrigin, AstModule, AstStmt,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
@@ -758,6 +758,15 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     {
         // 候选拒绝[TargetConstraint]：`<const>`/`<close>` local 在目标 Lua 中不可在声明后
         // 普通赋值；该异常 AST 不能用无属性 hoist 规则静默合法化。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.origin == AstLocalOrigin::DebugHinted)
+    {
+        // 候选拒绝[SemanticBarrier:DebugScope]：regress_342 中条件调用通过 `debug.getlocal`
+        // 观察空声明；合并到 initializer 会把 debug local 的作用域起点后移到调用之后。
         return None;
     }
     if local_decl.bindings.len() != assign.targets.len() || assign.values.is_empty() {

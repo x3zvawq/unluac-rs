@@ -586,8 +586,12 @@ fn collect_plans(
                     .flatten()
             });
 
-        if sticky_local.is_none() && !force_call_root_local && touching_stmt_indices.is_empty() {
-            // 候选拒绝[LayerBoundary]：零后续 touch 的匿名 temp 属于 dead-temps 的 effect-preserving 删除职责，locals 不把死 SSA 壳固化为 local。
+        if sticky_local.is_none()
+            && !force_call_root_local
+            && touching_stmt_indices.is_empty()
+            && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+        {
+            // 候选拒绝[LayerBoundary]：零后续 touch 且无 debug identity 的匿名 temp 属于 dead-temps 的 effect-preserving 删除职责，locals 不把死 SSA 壳固化为 local。
             continue;
         }
         if sticky_local.is_none()
@@ -696,8 +700,17 @@ fn collect_plans(
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
-        let merge_temps =
+        let mut merge_temps =
             branch_merge::candidate_temps(stmt, &temp_touches, decl_index, &is_reserved);
+        if call_root_lifetimes.root_for_overwrite(decl_index).is_some()
+            && let Some(branch_temps) = branch_merge::definite_if_arm_temp_writes(stmt)
+        {
+            for temp in branch_temps {
+                if !merge_temps.contains(&temp) && !is_reserved(temp) {
+                    merge_temps.push(temp);
+                }
+            }
+        }
 
         for temp in merge_temps {
             // 分支合流也不能在子作用域重新声明外层仍在使用的状态 temp。
@@ -710,6 +723,9 @@ fn collect_plans(
                 // 候选拒绝[ProofIncomplete]：单个 branch result 被 capture/TBC 观察但缺 trusted home 时，当前没有 cell/close-owner provenance；按值 capture 应再按快照点证明后放行。
                 continue;
             }
+            let preceding_call_root_local = call_root_lifetimes
+                .root_for_overwrite(decl_index)
+                .and_then(|root| call_root_locals.get(&root).copied());
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
                 temp_debug_scopes,
@@ -723,21 +739,23 @@ fn collect_plans(
                 direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,
             };
-            if let Some(local) = home_slot.and_then(|slot| {
-                sticky_slots
-                    .get(&slot)
-                    .copied()
-                    .or_else(|| {
-                        debug_scope_for_temp_group(temp_debug_scopes, &BTreeSet::from([temp]))
-                            .and_then(|scope| {
-                                allocator.debug_scope_locals.get(&(slot, scope)).copied()
-                            })
-                    })
-                    .or_else(|| {
-                        ctx.compact_home_slots
-                            .then(|| slot_candidates.get(&slot).copied())
-                            .flatten()
-                    })
+            if let Some(local) = preceding_call_root_local.or_else(|| {
+                home_slot.and_then(|slot| {
+                    sticky_slots
+                        .get(&slot)
+                        .copied()
+                        .or_else(|| {
+                            debug_scope_for_temp_group(temp_debug_scopes, &BTreeSet::from([temp]))
+                                .and_then(|scope| {
+                                    allocator.debug_scope_locals.get(&(slot, scope)).copied()
+                                })
+                        })
+                        .or_else(|| {
+                            ctx.compact_home_slots
+                                .then(|| slot_candidates.get(&slot).copied())
+                                .flatten()
+                        })
+                })
             }) {
                 allocator.reuse_existing_local(
                     decl_index,

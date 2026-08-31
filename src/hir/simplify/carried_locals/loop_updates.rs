@@ -14,6 +14,8 @@
 //! 才恢复为 `carried = carried + 1; guard = xs[carried]`。capture、for binding、TBC、提前退出
 //! 或 label barrier 均保留原形。旧 local 形状即使尾写回前只有提前退出，也必须同槽且未启用
 //! compaction；否则弱表、finalizer 或外层 cleanup 仍能观察旧 carried root 的生命周期。
+//! local fold 的 apply 会在任何修改前重验 seed 与尾写回；只有完整提交才返回 changed，避免
+//! candidate 形状漂移污染 fixed-point 信号。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,11 +34,12 @@ use super::binding::{
 use super::prune::RedundantSelfAssignPrunePass;
 use super::reads::BindingReadCollector;
 
-#[derive(Clone, Copy)]
 struct LoopUpdateFold {
     seed_index: usize,
     carried: LocalId,
     next: LocalId,
+    seed: HirStmt,
+    writeback: HirStmt,
 }
 
 pub(super) fn collapse_dead_loop_update_handoffs(
@@ -75,8 +78,7 @@ pub(super) fn collapse_dead_loop_update_handoffs(
         ) else {
             continue;
         };
-        apply_fold(&mut block.stmts[index], fold, promotion_facts);
-        changed = true;
+        changed |= apply_fold(&mut block.stmts[index], fold, promotion_facts);
     }
 
     changed
@@ -423,6 +425,8 @@ fn find_fold(
                 seed_index,
                 carried,
                 next,
+                seed: seed.clone(),
+                writeback: writeback.clone(),
             });
         }
     }
@@ -527,15 +531,27 @@ fn stmt_contains_terminal_exit(stmt: &HirStmt) -> bool {
     }
 }
 
-fn apply_fold(stmt: &mut HirStmt, fold: LoopUpdateFold, promotion_facts: &mut ProtoPromotionFacts) {
-    // 证明缺陷[InvariantMismatch]：caller 在本函数提前返回时仍记 changed=true；find/apply 形状漂移会静默漏改并污染 fixed-point 信号。
+fn apply_fold(
+    stmt: &mut HirStmt,
+    fold: LoopUpdateFold,
+    promotion_facts: &mut ProtoPromotionFacts,
+) -> bool {
     let Some((body, repeat_cond)) = loop_body_mut(stmt) else {
-        return;
+        // 候选拒绝[ConvergenceGuard]：candidate 的 loop owner 已漂移；重验发生在所有修改之前。
+        return false;
     };
-    let values = match &mut body.stmts[fold.seed_index] {
-        HirStmt::LocalDecl(local_decl) => std::mem::take(&mut local_decl.values),
-        _ => return,
+
+    if body.stmts.get(fold.seed_index) != Some(&fold.seed)
+        || body.stmts.last() != Some(&fold.writeback)
+    {
+        // 候选拒绝[ConvergenceGuard]：candidate 的 seed 或尾写回已漂移；重验发生在所有修改之前。
+        return false;
+    }
+
+    let HirStmt::LocalDecl(local_decl) = &mut body.stmts[fold.seed_index] else {
+        unreachable!("exactly matched loop-update seed must remain a local declaration")
     };
+    let values = std::mem::take(&mut local_decl.values);
     record_binding_merge(
         CarryBinding::Local(fold.next),
         CarryBinding::Local(fold.carried),
@@ -560,4 +576,5 @@ fn apply_fold(stmt: &mut HirStmt, fold: LoopUpdateFold, promotion_facts: &mut Pr
     if let Some(cond) = repeat_cond {
         rewrite_expr(cond, &mut pass);
     }
+    true
 }
