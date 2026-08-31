@@ -15,7 +15,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
 use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
 use super::super::installer_iife::function_expr_is_substantial;
 use super::direct::function_decl_target_from_lvalue;
@@ -73,16 +73,9 @@ pub(super) fn try_inline_terminal_constructor_fields(
         return None;
     }
 
-    let AstStmt::Return(ret) = stmts.get(consumed)? else {
+    let AstStmt::Return(_) = stmts.get(consumed)? else {
         return None;
     };
-    let [AstExpr::Var(name)] = ret.values.as_slice() else {
-        return None;
-    };
-    if !name_matches_binding(name, binding) {
-        // 候选拒绝[SemanticBarrier:Identity]：终端 return 必须交回同一 constructor local；换成别的 binding 会删除仍需返回的对象。
-        return None;
-    }
 
     Some((AstStmt::LocalDecl(Box::new(rewritten)), consumed))
 }
@@ -184,6 +177,13 @@ pub(super) fn try_inline_terminal_constructor_call(
     }
     let rewritten_sink =
         rewrite_terminal_constructor_call_sink(sink, callee_binding, callee_expr, &arg_locals)?;
+    let removed_bindings = std::iter::once(callee_binding)
+        .chain(arg_locals.iter().map(|arg| arg.binding))
+        .collect::<BTreeSet<_>>();
+    if !binding_mentions_in_stmt(&rewritten_sink).is_disjoint(&removed_bindings) {
+        // 候选拒绝[SemanticBarrier:Capture]：折叠后 sink 若仍直接或经字段闭包引用任一被删 binding，消除声明会留下悬空引用；regress_362 是闭包捕获 arg 的具体反例。
+        return None;
+    }
     if !matches!(sink, AstStmt::Return(_))
         && !removed_constructor_locals_are_dead_after_sink(
             use_index,

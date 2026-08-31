@@ -109,15 +109,25 @@ fn take_common_direct_copy_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
     if !arm_allows_direct_copy_sink(&if_stmt.then_block, target, source)
         || !arm_allows_direct_copy_sink(else_block, target, source)
     {
-        // 候选拒绝[SemanticBarrier:Scope/Lifetime]：arm 内若重绑 source/target 或跨过 Close/TBC，
-        // 把公共 copy 移到分支外会改变名字解析、关闭时点或对象存活期。
-        // 候选拒绝[ProofIncomplete]：boundary 深度不敏感，嵌套子块中与 copy 无关的 Close/TBC 也会整项拒绝；需记录 owner/执行路径后缩小屏障。
         return None;
     }
 
-    let common_tail = if_stmt.then_block.stmts.pop()?;
-    let removed_else_tail = if_stmt.else_block.as_mut()?.stmts.pop();
-    debug_assert_eq!(removed_else_tail.as_ref(), Some(&common_tail));
+    let common_tail = if_stmt
+        .then_block
+        .stmts
+        .pop()
+        .expect("validated common-copy then arm must have a tail");
+    let removed_else_tail = if_stmt
+        .else_block
+        .as_mut()
+        .expect("validated common-copy candidate must have an else arm")
+        .stmts
+        .pop()
+        .expect("validated common-copy else arm must have a tail");
+    assert_eq!(
+        removed_else_tail, common_tail,
+        "validated common-copy arm tails must remain equal until apply"
+    );
     Some(common_tail)
 }
 
@@ -126,12 +136,24 @@ fn arm_allows_direct_copy_sink(
     target: CarryBinding,
     source: CarryBinding,
 ) -> bool {
+    if block
+        .stmts
+        .iter()
+        .any(|stmt| matches!(stmt, HirStmt::ToBeClosed(_)))
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：arm 顶层 TBC 在原 copy 之后、arm 退出时关闭；把 copy 移到分支外会改成先 close 后 copy（regress_175#3）。
+        return false;
+    }
     let mut visitor = DirectCopySinkBoundary {
         locals: [target.local(), source.local()],
         safe: true,
     };
     visit_block(block, &mut visitor);
-    visitor.safe
+    assert!(
+        visitor.safe,
+        "equal common-copy tails cannot redeclare their LocalId in either arm"
+    );
+    true
 }
 
 struct DirectCopySinkBoundary {
@@ -157,7 +179,6 @@ impl HirVisitor for DirectCopySinkBoundary {
                 .bindings
                 .iter()
                 .any(|local| self.introduces(*local)),
-            HirStmt::ToBeClosed(_) | HirStmt::Close(_) => false,
             _ => true,
         };
     }
@@ -665,7 +686,7 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
             continue;
         }
         let body = &stmts[(if_index + 1)..label_index];
-        if !can_move_into_branch(body, kind) {
+        if !can_move_into_branch(body) {
             // 候选拒绝[SemanticBarrier:Scope/ControlFlow]：区间 local 若在 label 后仍被引用，移入 arm 会使 use 失去作用域；区间 goto/label 则可能改变跳转配对或跳入 local 的合法性。
             continue;
         }
@@ -745,8 +766,15 @@ fn rewrite_if(mut if_stmt: HirIf, body: Vec<HirStmt>, kind: FoldKind, invert_con
     }
     match kind {
         FoldKind::TerminalElse => {
-            let popped = if_stmt.then_block.stmts.pop();
-            debug_assert!(matches!(popped, Some(HirStmt::Goto(_))));
+            assert!(
+                matches!(if_stmt.then_block.stmts.last(), Some(HirStmt::Goto(_))),
+                "validated terminal-else fold must retain its terminal goto until apply"
+            );
+            if_stmt
+                .then_block
+                .stmts
+                .pop()
+                .expect("validated terminal-else fold must have a branch tail");
             if_stmt.else_block = Some(HirBlock { stmts: body });
         }
         FoldKind::Guard => {
@@ -788,11 +816,11 @@ fn fold_target(stmt: &HirStmt, kind: FoldKind) -> Option<(HirLabelId, bool)> {
     }
 }
 
-fn can_move_into_branch(stmts: &[HirStmt], kind: FoldKind) -> bool {
-    // `if cond then goto A end; goto B; ::A::` 是 island 常见的双向 guard。
-    // 把唯一的备用 goto 收进反向 arm 不改变 transfer，只减少一层壳；最终 AST
-    // scope verifier 仍负责确认目标 label 对嵌套 arm 可见且没有跳进 local/TBC。
-    if matches!(kind, FoldKind::Guard) && matches!(stmts, [HirStmt::Goto(_)]) {
+fn can_move_into_branch(stmts: &[HirStmt]) -> bool {
+    // `if cond then prefix; goto A end; goto B; ::A::` 是 island 常见的双向出口。
+    // Guard/TerminalElse 都可把唯一的备用 goto 收进反向 arm；没有 binding 被搬动，
+    // 最终 AST scope verifier 仍确认目标 label 对嵌套 arm 可见且没有跳进 local/TBC。
+    if matches!(stmts, [HirStmt::Goto(_)]) {
         return true;
     }
     stmts.iter().all(|stmt| {
