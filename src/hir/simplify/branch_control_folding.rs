@@ -68,7 +68,7 @@ impl HirRewritePass for BranchControlPass<'_> {
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
-        fold_trailing_repeat_break_condition(stmt)
+        fold_trailing_repeat_break_condition(stmt, self.discard_facts)
             || fold_effect_only_call(stmt)
             || fold_leading_while_break_guard(stmt)
             || naturalize_if_polarity(stmt)
@@ -351,6 +351,7 @@ pub(super) struct DiscardBoundary {
     identity: bool,
     diagnostic: bool,
     control_entry: bool,
+    closed_label_flow: bool,
 }
 
 impl DiscardBoundary {
@@ -364,6 +365,10 @@ impl DiscardBoundary {
 
     pub(super) fn has_control_entry(self) -> bool {
         self.control_entry
+    }
+
+    fn control_is_closed(self) -> bool {
+        self.closed_label_flow
     }
 }
 
@@ -390,6 +395,23 @@ impl DiscardBoundaryVisitor<'_> {
                 .unwrap_or_default();
             all_refs > internal_refs
         });
+        let no_inbound = self.labels.iter().all(|label| {
+            self.facts
+                .label_refs
+                .get(label)
+                .copied()
+                .unwrap_or_default()
+                == self
+                    .internal_label_refs
+                    .get(label)
+                    .copied()
+                    .unwrap_or_default()
+        });
+        let no_outbound = self
+            .internal_label_refs
+            .keys()
+            .all(|label| self.labels.contains(label));
+        self.boundary.closed_label_flow = no_inbound && no_outbound;
         self.boundary
     }
 }
@@ -496,7 +518,10 @@ fn take_effect_only_call(mut expr: &mut HirExpr) -> Option<Box<HirCallExpr>> {
     }
 }
 
-fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
+fn fold_trailing_repeat_break_condition(
+    stmt: &mut HirStmt,
+    discard_facts: &DiscardBoundaryFacts,
+) -> bool {
     let HirStmt::Repeat(repeat_stmt) = stmt else {
         return false;
     };
@@ -510,7 +535,7 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
         return false;
     }
 
-    let (nested_else, outer_cond, moved_cond) = if let Some(else_block) = &outer.else_block {
+    let (nested_else, moved_cond) = if let Some(else_block) = &outer.else_block {
         let [HirStmt::If(nested)] = else_block.stmts.as_slice() else {
             return false;
         };
@@ -519,9 +544,9 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
         {
             return false;
         }
-        (true, Some(&outer.cond), &nested.cond)
+        (true, &nested.cond)
     } else {
-        (false, None, &outer.cond)
+        (false, &outer.cond)
     };
     if matches!(moved_cond, HirExpr::LogicalOr(_))
         || matches!(repeat_stmt.cond, HirExpr::LogicalOr(_))
@@ -529,15 +554,7 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
         // 候选拒绝[PolicyBoundary]：条件语境下 `A or (B or C)` 的短路可精确保持；这里只选择每轮最多吸收一个尾部 break stage，避免把独立退出阶段过度压平。
         return false;
     }
-    if !repeat_condition_fold_is_safe(
-        prefix,
-        outer_cond
-            .into_iter()
-            .chain([moved_cond, &repeat_stmt.cond]),
-    ) {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：prefix 的当前 repeat continue 会从“跳过 moved 条件、只测原 latch”变成测试合成条件；跨尾部 goto/label 同样改变可达路径。
-        // 候选拒绝[ProofIncomplete]：共享 visitor 未区分 nested loop/jump owner，且 Close/TBC 的 break-vs-normal-exit 关闭序尚无精确 owner 证明，安全子集也被一并拒绝；
-        // 候选拒绝[LayerBoundary]：Decision/Unresolved 应先由上游消除或保留诊断。
+    if !repeat_condition_fold_is_safe(prefix, [moved_cond, &repeat_stmt.cond], discard_facts) {
         return false;
     }
 
@@ -572,33 +589,154 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt) -> bool {
 fn repeat_condition_fold_is_safe<'a>(
     prefix: &[HirStmt],
     exprs: impl IntoIterator<Item = &'a HirExpr>,
+    discard_facts: &DiscardBoundaryFacts,
 ) -> bool {
-    let mut boundary = RepeatConditionFoldBoundary { safe: true };
-    visit_stmts(prefix, &mut boundary);
+    let ownership = repeat_prefix_ownership(prefix, 0, 0);
+    if ownership.current_loop_continue {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：当前 repeat owner 的 continue 会从“跳过 moved 条件、只测原 latch”变成测试合成条件（regress_294）；嵌套 loop owner 原位消费自己的 continue。
+        return false;
+    }
+    if ownership.current_repeat_region_resource {
+        // 候选拒绝[SemanticBarrier:Resource]：当前 repeat owner 的 TBC 在 Lua 5.5 会由 close-scopes 围住尾部 break；折进 latch 会把条件从 close 前移到 close 后（regress_369）。嵌套 loop 的资源已在进入外层 tail 前关闭。
+        return false;
+    }
+    if !discard_facts.stmts_boundary(prefix).control_is_closed() {
+        // 候选拒绝[ProofIncomplete]：prefix 的 goto/label 若有外部入口或外部出口，仍缺相对当前 repeat tail 的跨边界 owner 证明；内部闭合子图原位执行。
+        return false;
+    }
+    let mut boundary = RepeatConditionFoldMovedExprBoundary::default();
     for expr in exprs {
         visit_expr(expr, &mut boundary);
     }
-    boundary.safe
-}
-
-struct RepeatConditionFoldBoundary {
-    safe: bool,
-}
-
-impl HirVisitor for RepeatConditionFoldBoundary {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.safe &= !matches!(
-            stmt,
-            HirStmt::ToBeClosed(_)
-                | HirStmt::Close(_)
-                | HirStmt::Continue
-                | HirStmt::Goto(_)
-                | HirStmt::Label(_)
-        );
+    if boundary.decision {
+        // 候选拒绝[LayerBoundary]：被重挂到 latch 的 Decision 由 eliminate-decisions 原位物化；候选拒绝[ConvergenceGuard]：其 invalidation 会让 branch-control 在 owner 收敛后重跑（regress_370）。
+        return false;
     }
+    if boundary.unresolved {
+        // 候选拒绝[LayerBoundary]：被重挂到 latch 的 Unresolved 是显式诊断残差，必须保留给 residual owner；它没有可声明等价的 Lua 求值语义。
+        return false;
+    }
+    true
+}
 
+#[derive(Default)]
+struct RepeatPrefixOwnership {
+    current_loop_continue: bool,
+    current_repeat_region_resource: bool,
+}
+
+fn repeat_prefix_ownership(
+    stmts: &[HirStmt],
+    loop_depth: usize,
+    resource_scope_depth: usize,
+) -> RepeatPrefixOwnership {
+    let mut ownership = RepeatPrefixOwnership::default();
+    for stmt in stmts {
+        collect_repeat_prefix_ownership(stmt, loop_depth, resource_scope_depth, &mut ownership);
+    }
+    ownership
+}
+
+fn collect_repeat_prefix_ownership(
+    stmt: &HirStmt,
+    loop_depth: usize,
+    resource_scope_depth: usize,
+    ownership: &mut RepeatPrefixOwnership,
+) {
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            collect_repeat_prefix_ownership_stmts(
+                &if_stmt.then_block.stmts,
+                loop_depth,
+                resource_scope_depth + 1,
+                ownership,
+            );
+            if let Some(else_block) = &if_stmt.else_block {
+                collect_repeat_prefix_ownership_stmts(
+                    &else_block.stmts,
+                    loop_depth,
+                    resource_scope_depth + 1,
+                    ownership,
+                );
+            }
+        }
+        HirStmt::While(while_stmt) => {
+            collect_repeat_prefix_ownership_stmts(
+                &while_stmt.body.stmts,
+                loop_depth + 1,
+                resource_scope_depth + 1,
+                ownership,
+            );
+        }
+        HirStmt::Repeat(repeat_stmt) => {
+            collect_repeat_prefix_ownership_stmts(
+                &repeat_stmt.body.stmts,
+                loop_depth + 1,
+                resource_scope_depth + 1,
+                ownership,
+            );
+        }
+        HirStmt::NumericFor(numeric_for) => {
+            collect_repeat_prefix_ownership_stmts(
+                &numeric_for.body.stmts,
+                loop_depth + 1,
+                resource_scope_depth + 1,
+                ownership,
+            );
+        }
+        HirStmt::GenericFor(generic_for) => {
+            collect_repeat_prefix_ownership_stmts(
+                &generic_for.body.stmts,
+                loop_depth + 1,
+                resource_scope_depth + 1,
+                ownership,
+            );
+        }
+        HirStmt::Block(block) => {
+            collect_repeat_prefix_ownership_stmts(
+                &block.stmts,
+                loop_depth,
+                resource_scope_depth + 1,
+                ownership,
+            );
+        }
+        HirStmt::Continue => ownership.current_loop_continue |= loop_depth == 0,
+        HirStmt::ToBeClosed(_) | HirStmt::Close(_) => {
+            ownership.current_repeat_region_resource |= resource_scope_depth == 0;
+        }
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
+    }
+}
+
+fn collect_repeat_prefix_ownership_stmts(
+    stmts: &[HirStmt],
+    loop_depth: usize,
+    resource_scope_depth: usize,
+    ownership: &mut RepeatPrefixOwnership,
+) {
+    for stmt in stmts {
+        collect_repeat_prefix_ownership(stmt, loop_depth, resource_scope_depth, ownership);
+    }
+}
+
+#[derive(Default)]
+struct RepeatConditionFoldMovedExprBoundary {
+    decision: bool,
+    unresolved: bool,
+}
+
+impl HirVisitor for RepeatConditionFoldMovedExprBoundary {
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.safe &= !matches!(expr, HirExpr::Decision(_) | HirExpr::Unresolved(_));
+        self.decision |= matches!(expr, HirExpr::Decision(_));
+        self.unresolved |= matches!(expr, HirExpr::Unresolved(_));
     }
 }
 
