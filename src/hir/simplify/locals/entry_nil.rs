@@ -16,6 +16,7 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::super::expr_facts::expr_truthiness;
 use super::super::mention::ReferenceCapturedBindings;
+use super::super::temp_touch::stmt_contains_nested_nonlocal_control;
 use super::super::visit::{self, HirVisitor};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -32,6 +33,13 @@ impl NilStates {
         Self(BTreeSet::from([NilPathState {
             known_nil: true,
             reference_exposed: false,
+        }]))
+    }
+
+    fn unknown() -> Self {
+        Self(BTreeSet::from([NilPathState {
+            known_nil: false,
+            reference_exposed: true,
         }]))
     }
 
@@ -106,7 +114,6 @@ impl NilFlow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PruneError {
     ResidualExpr,
-    UnstructuredControl,
     BindingInvariant,
 }
 
@@ -153,7 +160,8 @@ pub(super) fn prune_redundant_entry_nil_writes(
             continue;
         };
         if !facts.is_entry_nil_phi_local(local) {
-            // 候选拒绝[LayerBoundary]：普通空 local 没有 canonical Entry(nil) phi provenance，不属于本定向裁剪器。
+            // 普通空 local 没有 canonical Entry(nil) phi provenance，不属于
+            // 这个定向裁剪器的候选集；这里没有待交给其他 pass 的候选。
             continue;
         }
         let candidate_home = facts
@@ -182,9 +190,6 @@ pub(super) fn prune_redundant_entry_nil_writes(
                     // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
                     // entry-nil 不据未知路径删除边写。
                 }
-                PruneError::UnstructuredControl => {
-                    // 候选拒绝[LayerBoundary]：label/goto 的 predecessor 与目标边由 Structure island/branch-control owner 维护，本 pass 不在线性 HIR 上重建 CFG。
-                }
                 PruneError::BindingInvariant => {
                     panic!("entry-nil local must not be redeclared or reused as a for binding")
                 }
@@ -212,6 +217,63 @@ fn empty_local(stmt: &HirStmt) -> Option<LocalId> {
         return None;
     };
     local_decl.values.is_empty().then_some(*local)
+}
+
+fn forward_label_indices(
+    block: &HirBlock,
+) -> Option<std::collections::BTreeMap<crate::hir::HirLabelId, usize>> {
+    let mut labels = std::collections::BTreeMap::new();
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let HirStmt::Label(label) = stmt else {
+            continue;
+        };
+        if labels.insert(label.id, index).is_some() {
+            return None;
+        }
+    }
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let HirStmt::Goto(goto) = stmt else {
+            continue;
+        };
+        if labels
+            .get(&goto.target)
+            .is_none_or(|target| *target <= index)
+        {
+            return None;
+        }
+    }
+    Some(labels)
+}
+
+fn forward_control_is_self_contained(block: &HirBlock) -> bool {
+    forward_label_indices(block).is_some()
+        && block.stmts.iter().all(|stmt| match stmt {
+            HirStmt::If(if_stmt) => {
+                forward_control_is_self_contained(&if_stmt.then_block)
+                    && if_stmt
+                        .else_block
+                        .as_ref()
+                        .is_none_or(forward_control_is_self_contained)
+            }
+            HirStmt::While(while_stmt) => forward_control_is_self_contained(&while_stmt.body),
+            HirStmt::Repeat(repeat_stmt) => forward_control_is_self_contained(&repeat_stmt.body),
+            HirStmt::NumericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
+            HirStmt::GenericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
+            HirStmt::Block(nested) => forward_control_is_self_contained(nested),
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => true,
+        })
 }
 
 struct EntryNilAnalyzer<'a> {
@@ -246,11 +308,23 @@ impl EntryNilAnalyzer<'_> {
         prefix: &[PathComponent],
         mut states: NilStates,
     ) -> Result<NilFlow, PruneError> {
+        if !forward_control_is_self_contained(block) {
+            return self.analyze_unstructured_block(block, prefix);
+        }
+        let label_indices = forward_label_indices(block)
+            .expect("self-contained forward control must retain local labels");
         let mut breaks = NilStates::default();
         let mut continues = NilStates::default();
-        for (index, stmt) in block.stmts.iter().enumerate() {
+        let mut index = 0;
+        while let Some(stmt) = block.stmts.get(index) {
             if states.is_empty() {
                 break;
+            }
+            if let HirStmt::Goto(goto) = stmt {
+                index = *label_indices
+                    .get(&goto.target)
+                    .expect("validated forward goto must retain its local label");
+                continue;
             }
             let mut path = prefix.to_vec();
             path.push(PathComponent::Stmt(index));
@@ -258,12 +332,81 @@ impl EntryNilAnalyzer<'_> {
             states = flow.fallthrough;
             breaks = breaks.union(flow.breaks);
             continues = continues.union(flow.continues);
+            index += 1;
         }
         Ok(NilFlow {
             fallthrough: states,
             breaks,
             continues,
         })
+    }
+
+    fn analyze_unstructured_block(
+        &mut self,
+        block: &HirBlock,
+        prefix: &[PathComponent],
+    ) -> Result<NilFlow, PruneError> {
+        let conservative = NilStates::unknown();
+        let mut states = conservative.clone();
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            let mut path = prefix.to_vec();
+            path.push(PathComponent::Stmt(index));
+            if stmt_contains_nested_nonlocal_control(stmt) {
+                self.analyze_unstructured_children(stmt, &path)?;
+                // 分析停用[SemanticBarrier:ControlFlow]：label/goto 可绕过此前 nil 写，回边
+                // 还会带入上一轮值；`::L:: x=nil; x={}; goto L` 的第二轮旧值并非 nil。
+                states = conservative.clone();
+                continue;
+            }
+            if states.is_empty() {
+                continue;
+            }
+            states = self.analyze_stmt(stmt, &path, states)?.fallthrough;
+        }
+        Ok(NilFlow {
+            fallthrough: conservative.clone(),
+            breaks: conservative.clone(),
+            continues: conservative,
+        })
+    }
+
+    fn analyze_unstructured_children(
+        &mut self,
+        stmt: &HirStmt,
+        path: &StmtPath,
+    ) -> Result<(), PruneError> {
+        let mut analyze = |block: &HirBlock, component| {
+            let mut prefix = path.clone();
+            prefix.push(component);
+            self.analyze_unstructured_block(block, &prefix).map(|_| ())
+        };
+        match stmt {
+            HirStmt::If(if_stmt) => {
+                analyze(&if_stmt.then_block, PathComponent::Then)?;
+                if let Some(else_block) = &if_stmt.else_block {
+                    analyze(else_block, PathComponent::Else)?;
+                }
+            }
+            HirStmt::While(while_stmt) => analyze(&while_stmt.body, PathComponent::Body)?,
+            HirStmt::Repeat(repeat_stmt) => analyze(&repeat_stmt.body, PathComponent::Body)?,
+            HirStmt::NumericFor(for_stmt) => analyze(&for_stmt.body, PathComponent::Body)?,
+            HirStmt::GenericFor(for_stmt) => analyze(&for_stmt.body, PathComponent::Body)?,
+            HirStmt::Block(nested) => analyze(nested, PathComponent::Body)?,
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
+        }
+        Ok(())
     }
 
     fn analyze_stmt(
@@ -379,7 +522,10 @@ impl EntryNilAnalyzer<'_> {
                 continues: states,
                 ..NilFlow::default()
             }),
-            HirStmt::Goto(_) | HirStmt::Label(_) => Err(PruneError::UnstructuredControl),
+            HirStmt::Goto(_) => {
+                unreachable!("block analyzer must consume validated forward gotos")
+            }
+            HirStmt::Label(_) => Ok(NilFlow::fallthrough(states)),
             HirStmt::Close(_) => Ok(NilFlow::fallthrough(states.opaque_callback())),
             HirStmt::TableSetList(_)
             | HirStmt::GlobalDecl(_)
@@ -857,4 +1003,98 @@ fn bindings_share_home(
             .temps
             .iter()
             .any(|binding| facts.trusted_temp_home_slot(*binding) == Some(candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{HirGoto, HirLabel, HirLabelId, HirValuePack};
+
+    fn assign(local: LocalId, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Local(local)],
+            values: HirValuePack::fixed(vec![value]),
+        }))
+    }
+
+    fn label(id: HirLabelId) -> HirStmt {
+        HirStmt::Label(Box::new(HirLabel {
+            id,
+            tbc_barriers: Vec::new(),
+        }))
+    }
+
+    fn goto(target: HirLabelId) -> HirStmt {
+        HirStmt::Goto(Box::new(HirGoto { target }))
+    }
+
+    fn analyze(then_block: HirBlock) -> PrunePlan {
+        let facts = ProtoPromotionFacts::default();
+        let mut analyzer = EntryNilAnalyzer {
+            local: LocalId(0),
+            candidate_home: HomeSlotKey::new(0, 0),
+            facts: &facts,
+            safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            plan: PrunePlan::default(),
+        };
+        analyzer
+            .analyze_if(
+                &HirIf {
+                    cond: HirExpr::Boolean(true),
+                    then_block,
+                    else_block: None,
+                },
+                NilStates::entry(),
+            )
+            .unwrap();
+        analyzer.plan
+    }
+
+    #[test]
+    fn unstructured_entry_nil_prunes_only_after_an_island_local_nil_write() {
+        let local = LocalId(0);
+        let loop_header = HirLabelId(0);
+        let plan = analyze(HirBlock {
+            stmts: vec![
+                label(loop_header),
+                HirStmt::Block(Box::new(HirBlock {
+                    stmts: vec![assign(local, HirExpr::Nil), assign(local, HirExpr::Nil)],
+                })),
+                goto(loop_header),
+            ],
+        });
+
+        let first = vec![
+            PathComponent::Then,
+            PathComponent::Stmt(1),
+            PathComponent::Body,
+            PathComponent::Stmt(0),
+        ];
+        let second = vec![
+            PathComponent::Then,
+            PathComponent::Stmt(1),
+            PathComponent::Body,
+            PathComponent::Stmt(1),
+        ];
+        assert!(!plan.redundant.contains(&first));
+        assert!(plan.redundant.contains(&second));
+    }
+
+    #[test]
+    fn unstructured_entry_nil_does_not_reuse_entry_fact_across_a_backedge() {
+        let local = LocalId(0);
+        let loop_header = HirLabelId(0);
+        let plan = analyze(HirBlock {
+            stmts: vec![
+                label(loop_header),
+                assign(local, HirExpr::Nil),
+                assign(local, HirExpr::TableConstructor(Box::default())),
+                goto(loop_header),
+            ],
+        });
+
+        let first = vec![PathComponent::Then, PathComponent::Stmt(1)];
+        assert!(!plan.redundant.contains(&first));
+    }
 }

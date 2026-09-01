@@ -76,8 +76,8 @@ fn inline_constructor_value_inner(
     {
         let producer = &context.pending_producers[producer_index];
         if producer.source_preservation == ProducerSourcePreservation::UnsupportedShape {
-            // 候选拒绝[LayerBoundary]：scanner 已把逐槽 primitive/vararg、snapshot 与
-            // allocation 分流；这里只剩 residual owner 必须原样保留的 Unresolved。
+            // 候选拒绝[PolicyBoundary]：scanner 已把逐槽 primitive/vararg、snapshot 与
+            // allocation 分流；这里只剩 permissive 输出必须原样保留的 Unresolved 失败证据。
             return None;
         }
         if context.remaining_uses.contains(producer.binding_id) {
@@ -95,7 +95,7 @@ fn inline_constructor_value_inner(
                     return None;
                 }
                 ProducerSourcePreservation::UnsupportedShape => {
-                    unreachable!("unsupported producer must stay with the residual owner")
+                    unreachable!("unsupported failure evidence must keep its original producer")
                 }
             }
         }
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_producer_stays_with_the_residual_owner() {
+    fn unresolved_producer_stays_as_independent_failure_evidence() {
         let (mut block, binding_index, occurrence_index, mut producers, producer_map) =
             inline_context_fixture();
         let HirStmt::LocalDecl(decl) = &mut block.stmts[0] else {

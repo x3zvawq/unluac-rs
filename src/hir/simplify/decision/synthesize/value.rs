@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::hir::common::{HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget, HirExpr};
+use crate::hir::common::{HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind};
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::domain::{SynthesisContext, collect_refs_from_decision};
@@ -18,13 +19,125 @@ pub(crate) fn synthesize_value_decision_expr(
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     if !decision_is_synth_safe(decision, safety) {
-        return None;
+        return exact_trace_candidate(decision, safety);
     }
 
     let refs = collect_refs_from_decision(decision);
     let mut context = SynthesisContext::new(decision, refs, safety);
     let mut memo = BTreeMap::new();
     synthesize_value_node_expr(&mut context, decision.entry, &mut memo, safety)
+}
+
+/// Effectful synthesis is intentionally a proof-carrying grammar rather than algebraic search.
+///
+/// A node whose two edges are the same target has one unconditional trace: evaluate its test,
+/// then evaluate that target. `not test or true` evaluates `test` exactly once, immediately
+/// booleanizes its result (so no test root is retained across the continuation), and is always
+/// truthy; the surrounding `and` therefore evaluates the continuation exactly once and returns it.
+#[derive(Clone)]
+enum ExactEvalTrace {
+    Value(HirExpr),
+    Then {
+        discarded: HirExpr,
+        continuation: Box<ExactEvalTrace>,
+    },
+}
+
+impl ExactEvalTrace {
+    fn into_expr(self) -> HirExpr {
+        match self {
+            Self::Value(expr) => expr,
+            Self::Then {
+                discarded,
+                continuation,
+            } => trace_sequence_expr(discarded, continuation.into_expr()),
+        }
+    }
+
+    fn matches_expr(&self, candidate: &HirExpr) -> bool {
+        match (self, candidate) {
+            (Self::Value(expected), candidate) => expected == candidate,
+            (
+                Self::Then {
+                    discarded,
+                    continuation,
+                },
+                HirExpr::LogicalAnd(sequence),
+            ) => {
+                let HirExpr::LogicalOr(prefix) = &sequence.lhs else {
+                    return false;
+                };
+                matches!(
+                    &prefix.lhs,
+                    HirExpr::Unary(negated)
+                        if negated.op == HirUnaryOpKind::Not && negated.expr == *discarded
+                ) && matches!(prefix.rhs, HirExpr::Boolean(true))
+                    && continuation.matches_expr(&sequence.rhs)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn exact_trace_candidate(decision: &HirDecisionExpr, safety: HirExprSafety) -> Option<HirExpr> {
+    let trace = exact_eval_trace(decision, decision.entry, safety)?;
+    let candidate = trace.clone().into_expr();
+    // Keep the trace certificate at the commit boundary. Candidate normalization must not be
+    // inserted between construction and this check: it may delete or duplicate observable nodes.
+    trace.matches_expr(&candidate).then_some(candidate)
+}
+
+fn exact_eval_trace(
+    decision: &HirDecisionExpr,
+    node_ref: HirDecisionNodeRef,
+    safety: HirExprSafety,
+) -> Option<ExactEvalTrace> {
+    let node = decision.nodes.get(node_ref.index())?;
+    if node.truthy != node.falsy {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：effectful 分叉没有无条件 continuation；
+        // `f() and g() or h()` 还会在 g 返回 falsy 时错误执行未选中的 h。
+        return None;
+    }
+    match &node.truthy {
+        HirDecisionTarget::CurrentValue => Some(ExactEvalTrace::Value(node.test.clone())),
+        HirDecisionTarget::Expr(expr) => {
+            if !safety.result_is_gc_inert(&node.test) {
+                // 候选拒绝[SemanticBarrier:Lifetime]：`f()` 的 collectable 返回值可能仍由
+                // 原 guard slot 持有；先 booleanize 再执行 `g()` 会提前断根，使 g 内的
+                // weak-table/GC observation 与原程序不同。Decision 没有 test home/root 终止事实。
+                return None;
+            }
+            Some(ExactEvalTrace::Then {
+                discarded: node.test.clone(),
+                continuation: Box::new(ExactEvalTrace::Value(expr.clone())),
+            })
+        }
+        HirDecisionTarget::Node(next_ref) => {
+            if !safety.result_is_gc_inert(&node.test) {
+                // 候选拒绝[SemanticBarrier:Lifetime]：进入 child 前丢弃 collectable test
+                // 会改变 child effect 可观察的 root 生命周期；当前 Decision 不携带 home 事实。
+                return None;
+            }
+            Some(ExactEvalTrace::Then {
+                discarded: node.test.clone(),
+                continuation: Box::new(exact_eval_trace(decision, *next_ref, safety)?),
+            })
+        }
+    }
+}
+
+fn trace_sequence_expr(discarded: HirExpr, continuation: HirExpr) -> HirExpr {
+    let booleanized = HirExpr::Unary(Box::new(HirUnaryExpr {
+        op: HirUnaryOpKind::Not,
+        expr: discarded,
+    }));
+    HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+        lhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: booleanized,
+            rhs: HirExpr::Boolean(true),
+        })),
+        rhs: continuation,
+    }))
 }
 
 #[derive(Clone, PartialEq)]
@@ -162,12 +275,40 @@ mod tests {
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
         HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirDecisionExpr, HirDecisionNode,
-        HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirGlobalRef, HirLogicalExpr, HirValuePack,
-        LocalId,
+        HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirGlobalRef, HirLogicalExpr, HirUnaryExpr,
+        HirUnaryOpKind, HirValuePack, LocalId,
     };
+    use crate::hir::decision::finalize_value_decision_expr;
     use crate::hir::expr_safety::HirExprSafety;
 
-    use super::synthesize_value_decision_expr;
+    use super::{exact_eval_trace, synthesize_value_decision_expr, trace_sequence_expr};
+
+    fn call(name: &str) -> HirExpr {
+        HirExpr::Call(Box::new(HirCallExpr {
+            callee: HirExpr::GlobalRef(HirGlobalRef {
+                name: name.to_owned(),
+            }),
+            args: HirValuePack::default(),
+            method: false,
+            fastcall: None,
+            method_name: None,
+        }))
+    }
+
+    fn logical_and(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
+        HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }))
+    }
+
+    fn logical_or(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
+        HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }))
+    }
+
+    fn not(expr: HirExpr) -> HirExpr {
+        HirExpr::Unary(Box::new(HirUnaryExpr {
+            op: HirUnaryOpKind::Not,
+            expr,
+        }))
+    }
 
     #[test]
     fn mixed_numeric_value_identity_uses_equality_closed_domain() {
@@ -225,15 +366,7 @@ mod tests {
 
     #[test]
     fn effectful_call_stays_outside_value_only_synthesis() {
-        let call = HirExpr::Call(Box::new(HirCallExpr {
-            callee: HirExpr::GlobalRef(HirGlobalRef {
-                name: "effect".to_owned(),
-            }),
-            args: HirValuePack::default(),
-            method: false,
-            fastcall: None,
-            method_name: None,
-        }));
+        let call = call("effect");
         let decision = HirDecisionExpr {
             entry: HirDecisionNodeRef(0),
             nodes: vec![HirDecisionNode {
@@ -251,5 +384,110 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn effectful_gc_inert_subject_precedes_the_continuation_once() {
+        let subject = not(call("f"));
+        let continuation = call("g");
+        let child = HirDecisionNodeRef(1);
+        let decision = HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![
+                HirDecisionNode {
+                    id: HirDecisionNodeRef(0),
+                    test: subject.clone(),
+                    truthy: HirDecisionTarget::Node(child),
+                    falsy: HirDecisionTarget::Node(child),
+                },
+                HirDecisionNode {
+                    id: child,
+                    test: continuation.clone(),
+                    truthy: HirDecisionTarget::CurrentValue,
+                    falsy: HirDecisionTarget::CurrentValue,
+                },
+            ],
+        };
+
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        assert!(safety.result_is_gc_inert(&subject));
+        assert!(!super::super::safety::decision_is_synth_safe(
+            &decision, safety
+        ));
+        assert_eq!(
+            finalize_value_decision_expr(decision, safety,),
+            trace_sequence_expr(subject, continuation)
+        );
+    }
+
+    #[test]
+    fn exact_trace_gate_rejects_naive_subject_and_continuation_duplication() {
+        let subject = not(call("f"));
+        let continuation = call("g");
+        let child = HirDecisionNodeRef(1);
+        let decision = HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![
+                HirDecisionNode {
+                    id: HirDecisionNodeRef(0),
+                    test: subject.clone(),
+                    truthy: HirDecisionTarget::Node(child),
+                    falsy: HirDecisionTarget::Node(child),
+                },
+                HirDecisionNode {
+                    id: child,
+                    test: continuation.clone(),
+                    truthy: HirDecisionTarget::CurrentValue,
+                    falsy: HirDecisionTarget::CurrentValue,
+                },
+            ],
+        };
+        let trace = exact_eval_trace(
+            &decision,
+            decision.entry,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        )
+        .expect("shared continuation with a GC-inert prefix must have an exact trace");
+        let duplicates_both = logical_or(
+            logical_and(subject.clone(), continuation.clone()),
+            logical_and(subject.clone().negate(), continuation.clone()),
+        );
+        let duplicates_continuation =
+            trace_sequence_expr(subject, logical_or(continuation.clone(), continuation));
+
+        assert!(!trace.matches_expr(&duplicates_both));
+        assert!(!trace.matches_expr(&duplicates_continuation));
+    }
+
+    #[test]
+    fn collectable_subject_stays_for_the_statement_owner_before_observing_call() {
+        let subject = call("f");
+        let continuation = call("observe_gc");
+        let child = HirDecisionNodeRef(1);
+        let decision = HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![
+                HirDecisionNode {
+                    id: HirDecisionNodeRef(0),
+                    test: subject,
+                    truthy: HirDecisionTarget::Node(child),
+                    falsy: HirDecisionTarget::Node(child),
+                },
+                HirDecisionNode {
+                    id: child,
+                    test: continuation,
+                    truthy: HirDecisionTarget::CurrentValue,
+                    falsy: HirDecisionTarget::CurrentValue,
+                },
+            ],
+        };
+
+        assert!(matches!(
+            finalize_value_decision_expr(
+                decision,
+                HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            ),
+            HirExpr::Decision(_)
+        ));
     }
 }

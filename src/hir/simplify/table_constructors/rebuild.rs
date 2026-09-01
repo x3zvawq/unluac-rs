@@ -752,8 +752,8 @@ fn preserve_producer_source(
             return None;
         }
         ProducerSourcePreservation::UnsupportedShape => {
-            // 候选拒绝[LayerBoundary]：scanner 已把逐槽 primitive/vararg、snapshot 与
-            // allocation 分流；这里只剩 residual owner 必须原样保留的 Unresolved。
+            // 候选拒绝[PolicyBoundary]：scanner 已把逐槽 primitive/vararg、snapshot 与
+            // allocation 分流；这里只剩 permissive 输出必须原样保留的 Unresolved 失败证据。
             return None;
         }
     }

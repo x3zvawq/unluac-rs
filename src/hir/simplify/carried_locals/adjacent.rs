@@ -8,8 +8,8 @@
 //! capture/TBC direct 身份及 raw-home may-alias 由父模块统一保护，不在这里改写资源 cell。
 //! 接受相邻 local 合并前，本 owner 还在结构化 HIR 上计算 `Unwritten/Written` 路径事实：
 //! 分支合并可能状态，循环通过有限状态不动点消费自然/continue 回边和 break 出口，赋值按
-//! “先读 RHS/左值地址、再同时写 targets”转移。goto/label 的额外入口仍属于 CFG dominance
-//! owner，本文件不会从线性位置猜测它们是否绕过写入。
+//! “先读 RHS/左值地址、再同时写 targets”转移。goto/label 若能绕过 handoff 写，改名会让
+//! 未初始化路径读取 seed 的旧值；本 owner 不在这种非结构路径上提交。
 //!
 //! - 接受：`local s=1; local c; c=s; print(c)` -> `local s=1; print(s)`
 //! - 拒绝：`local s=1; local c; print(c); c=s`，因为 nil 读取不受 handoff 写支配
@@ -58,7 +58,9 @@ pub(super) fn try_collapse_guarded_local_update(
     };
     // 候选拒绝[SemanticBarrier:Lifetime]：外层仍活跃的 state 或 next 被合并后会让 false-return 路径提前覆盖旧 state。
     // 候选拒绝[SemanticBarrier:Capture]：捕获任一 binding 时，false path 上 closure 可区分“只写 next”和“已写 state”。
-    // 候选拒绝[LayerBoundary]：debug/TBC/for/raw-home identity 由 identity facts owner 保留。
+    // 候选拒绝[PolicyBoundary]：debug binding 是项目选择保留的源码身份。
+    // 候选拒绝[SemanticBarrier:Scope]：for binding 每轮重建且只在 loop body 可见；
+    // 合并会把 per-iteration refresh 改成外层/跨轮状态。
     // 候选拒绝[SemanticBarrier:Scope]：initializer 自读 next 时，删除其 local 声明会把读取改指另一 lexical identity。
     if state == next_binding
         || matches!(state, CarryBinding::Local(_)) && outer_bindings.contains(&state)
@@ -165,7 +167,9 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
 
     let tail = &block.stmts[index + 2..];
     // 候选拒绝[SemanticBarrier:Lifetime]：异槽/compaction 时合并两个 root 会改变弱表、finalizer 或 cleanup 可见的存活期。
-    // 候选拒绝[LayerBoundary]：debug/capture/TBC/for identity 由 proto identity owner 保留。
+    // 候选拒绝[PolicyBoundary]：debug binding 是项目选择保留的源码身份。
+    // 候选拒绝[SemanticBarrier:Scope]：for binding 每轮重建且只在 loop body 可见；
+    // 合并会把 per-iteration refresh 改成外层/跨轮状态。
     // 候选拒绝[SemanticBarrier:Lifetime]：tail 仍读取旧 seed 时，carried 写入改名为 seed 会让该读取看到新 epoch。
     if promotion_facts.compacts_home_slots()
         || !bindings_share_exact_home_slot(
@@ -196,7 +200,8 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
             return false;
         }
         CarriedWriteDominance::UnstructuredControl => {
-            // 候选拒绝[LayerBoundary]：goto/label 的额外入口需要 CFG dominance owner 证明不会绕过 handoff 写。
+            // 候选拒绝[SemanticBarrier:ControlFlow]：`goto L; carried=seed; ::L:: use(carried)`
+            // 会绕过 handoff；改名后该路径从 nil/旧 carried 改读 seed 的旧值。
             return false;
         }
     }

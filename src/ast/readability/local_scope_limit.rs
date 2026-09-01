@@ -99,7 +99,8 @@ fn scope_locals(
 ) -> bool {
     let direct_local_count = block.stmts.iter().map(direct_local_count).sum::<usize>();
     if available_locals == 0 {
-        // 分析停用[LayerBoundary]：外层/参数已耗尽全部源码 local 预算时，内层 `do` 不能降低同时活跃的外层数量；需由 HIR home compaction 减少 persistent locals。
+        // 外层/参数已耗尽全部源码 local 预算；内层 `do` 只能缩短
+        // 当前 block 自己的 binding，不能降低已活跃的外层数量，因而没有可执行计划。
         return false;
     }
     if direct_local_pressure(&block.stmts) <= available_locals {
@@ -142,8 +143,8 @@ fn scope_locals(
             .map(|(_, stmt)| scopeable_bindings(stmt).map_or(0, ScopeableBindings::len))
             .sum::<usize>();
     if persistent_locals >= available_locals {
-        // 分析停用[LayerBoundary]：不可缩短的同时活跃 binding 已耗尽当前 block 的源码
-        // local 预算；新增 `do` 无法降低该峰值，owner 是 HIR home/binding compaction。
+        // 不可缩短的同时活跃 binding 已耗尽当前 block 的源码 local 预算；
+        // 新增 `do` 也不会降低该峰值，因而这里是无候选计划，不是跨 pass 的待办证明。
         return false;
     }
     let scope_target =

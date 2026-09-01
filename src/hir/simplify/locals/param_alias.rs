@@ -13,16 +13,17 @@
 //! return l0
 //! ```
 //!
-//! 这里不重新推断前层 phi，也不处理任意 local 对；它只沿结构化语句证明参数与 alias
-//! 从入口相同值开始不会被分别观察。分析逐路径记录最后写入的一侧以及已经逃逸的 reference
-//! capture；`return/break/continue` 不参与错误的普通合流，循环则对回边状态求有限不动点。
-//! 残留 goto/label 仍交给持有 CFG owner 的 Structure island/branch-control 收敛。
+//! 这里不重新推断前层 phi，也不处理任意 local 对；它只沿可闭合的结构化/严格前向控制
+//! 证明参数与 alias 从入口相同值开始不会被分别观察。分析逐路径记录最后写入的一侧以及
+//! 已经逃逸的 reference capture；`return/break/continue` 不参与错误的普通合流，循环则对
+//! 回边状态求有限不动点。其余 label/goto 仅在整个公共区域对两侧只读、无 capture/resource
+//! 时放行；此时任意路径都不能让两个 binding 从入口等值状态分叉。
 //! alias 后续写入会提前覆盖参数，因此还要求两者属于同一可信物理 home；仅有显式读写
 //! 等价不足以排除弱表、`__gc` 或异常 cleanup 对旧参数存活期的观察。
 //! 实际发生的 `Local -> Param` 引用改写还会把失效的 home provenance 传播到参数，避免
 //! deferred carried-local 的下一轮把换壳后的参数重新当作可信物理槽。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
@@ -74,7 +75,7 @@ pub(super) fn coalesce_param_aliases_in_proto(
                 // 候选拒绝[SemanticBarrier:Resource]：`local l=p; <TBC l>; l=q` 若改为参数，会更换 close owner，并可能关闭错误值或改变关闭时点。
             }
             AliasFlowError::UnstructuredControl => {
-                // 候选拒绝[LayerBoundary]：残留 label/goto 的 predecessor 与目标边由 Structure island/branch-control owner 维护；locals 不在线性 HIR 上重建 CFG。
+                // 候选拒绝[SemanticBarrier:ControlFlow]：残留回边若写 alias/param，下一轮可从分叉值开始；如 `::L:: use(p); l=1; goto L`，改写后第二轮会观察 1。
             }
             AliasFlowError::BindingInvariant => {
                 panic!("alias local must not be redeclared or reused as a for binding")
@@ -230,6 +231,169 @@ enum AliasFlowError {
     BindingInvariant,
 }
 
+fn forward_label_indices(stmts: &[HirStmt]) -> Option<BTreeMap<crate::hir::HirLabelId, usize>> {
+    let mut labels = BTreeMap::new();
+    for (index, stmt) in stmts.iter().enumerate() {
+        let HirStmt::Label(label) = stmt else {
+            continue;
+        };
+        if labels.insert(label.id, index).is_some() {
+            return None;
+        }
+    }
+    for (index, stmt) in stmts.iter().enumerate() {
+        let HirStmt::Goto(goto) = stmt else {
+            continue;
+        };
+        if labels
+            .get(&goto.target)
+            .is_none_or(|target| *target <= index)
+        {
+            return None;
+        }
+    }
+    Some(labels)
+}
+
+fn forward_control_is_self_contained(stmts: &[HirStmt]) -> bool {
+    forward_label_indices(stmts).is_some()
+        && stmts.iter().all(|stmt| match stmt {
+            HirStmt::If(if_stmt) => {
+                forward_control_is_self_contained(&if_stmt.then_block.stmts)
+                    && if_stmt
+                        .else_block
+                        .as_ref()
+                        .is_none_or(|block| forward_control_is_self_contained(&block.stmts))
+            }
+            HirStmt::While(while_stmt) => forward_control_is_self_contained(&while_stmt.body.stmts),
+            HirStmt::Repeat(repeat_stmt) => {
+                forward_control_is_self_contained(&repeat_stmt.body.stmts)
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                forward_control_is_self_contained(&for_stmt.body.stmts)
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                forward_control_is_self_contained(&for_stmt.body.stmts)
+            }
+            HirStmt::Block(block) => forward_control_is_self_contained(&block.stmts),
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => true,
+        })
+}
+
+fn validate_read_only_unstructured_alias_region(
+    stmts: &[HirStmt],
+    local: LocalId,
+    param: ParamId,
+    states: AliasStates,
+) -> Result<AliasFlow, AliasFlowError> {
+    let mut facts = UnstructuredAliasFacts::new(local, param);
+    visit::visit_stmts(stmts, &mut facts);
+    if facts.binding_reused {
+        return Err(AliasFlowError::BindingInvariant);
+    }
+    if facts.local_is_to_be_closed {
+        return Err(AliasFlowError::Resource);
+    }
+    if facts.writes_local
+        || facts.writes_param
+        || facts.reference_captures_local
+        || facts.reference_captures_param
+    {
+        return Err(AliasFlowError::UnstructuredControl);
+    }
+    Ok(AliasFlow::fallthrough(states))
+}
+
+struct UnstructuredAliasFacts {
+    local: LocalId,
+    param: ParamId,
+    writes_local: bool,
+    writes_param: bool,
+    reference_captures_local: bool,
+    reference_captures_param: bool,
+    local_is_to_be_closed: bool,
+    binding_reused: bool,
+}
+
+impl UnstructuredAliasFacts {
+    fn new(local: LocalId, param: ParamId) -> Self {
+        Self {
+            local,
+            param,
+            writes_local: false,
+            writes_param: false,
+            reference_captures_local: false,
+            reference_captures_param: false,
+            local_is_to_be_closed: false,
+            binding_reused: false,
+        }
+    }
+}
+
+impl HirVisitor for UnstructuredAliasFacts {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(local_decl) => {
+                self.binding_reused |= local_decl.bindings.contains(&self.local);
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                self.binding_reused |= for_stmt.binding == self.local;
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                self.binding_reused |= for_stmt.bindings.contains(&self.local);
+            }
+            HirStmt::ToBeClosed(to_be_closed) => {
+                self.local_is_to_be_closed |= expr_mentions_local(&to_be_closed.value, self.local);
+            }
+            HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::If(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_)
+            | HirStmt::Block(_) => {}
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let HirExpr::Closure(closure) = expr else {
+            return;
+        };
+        for capture in &closure.captures {
+            if capture.mode != HirCaptureMode::ByReference {
+                continue;
+            }
+            self.reference_captures_local |= expr_mentions_local(&capture.value, self.local);
+            self.reference_captures_param |= expr_mentions_param(&capture.value, self.param);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.writes_local |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
+        self.writes_param |= matches!(lvalue, HirLValue::Param(param) if *param == self.param);
+    }
+}
+
 fn validate_alias_flow(
     stmts: &[HirStmt],
     local: LocalId,
@@ -237,16 +401,29 @@ fn validate_alias_flow(
     mut states: AliasStates,
     safety: HirExprSafety,
 ) -> Result<AliasFlow, AliasFlowError> {
+    if !forward_control_is_self_contained(stmts) {
+        return validate_read_only_unstructured_alias_region(stmts, local, param, states);
+    }
+    let label_indices = forward_label_indices(stmts)
+        .expect("self-contained forward control must retain local labels");
     let mut breaks = AliasStates::default();
     let mut continues = AliasStates::default();
-    for stmt in stmts {
+    let mut index = 0;
+    while let Some(stmt) = stmts.get(index) {
         if states.is_empty() {
             break;
+        }
+        if let HirStmt::Goto(goto) = stmt {
+            index = *label_indices
+                .get(&goto.target)
+                .expect("validated forward goto must retain its local label");
+            continue;
         }
         let flow = validate_alias_stmt(stmt, local, param, states, safety)?;
         states = flow.fallthrough;
         breaks = breaks.union(flow.breaks);
         continues = continues.union(flow.continues);
+        index += 1;
     }
     Ok(AliasFlow {
         fallthrough: states,
@@ -345,7 +522,8 @@ fn validate_alias_stmt(
         HirStmt::ToBeClosed(to_be_closed) if expr_mentions_local(&to_be_closed.value, local) => {
             Err(AliasFlowError::Resource)
         }
-        HirStmt::Goto(_) | HirStmt::Label(_) => Err(AliasFlowError::UnstructuredControl),
+        HirStmt::Goto(_) => unreachable!("block analyzer must consume validated forward gotos"),
+        HirStmt::Label(_) => Ok(AliasFlow::fallthrough(states)),
         HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => {
             Err(AliasFlowError::BindingInvariant)
         }
@@ -722,5 +900,83 @@ impl HirRewritePass for LocalToParamRewrite {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompile::DecompileDialect;
+    use crate::hir::common::{
+        HirAssign, HirGoto, HirIf, HirLabel, HirLabelId, HirReturn, HirValuePack,
+    };
+
+    fn goto(target: HirLabelId) -> HirStmt {
+        HirStmt::Goto(Box::new(HirGoto { target }))
+    }
+
+    fn label(id: HirLabelId) -> HirStmt {
+        HirStmt::Label(Box::new(HirLabel {
+            id,
+            tbc_barriers: Vec::new(),
+        }))
+    }
+
+    fn return_expr(expr: HirExpr) -> HirStmt {
+        HirStmt::Return(Box::new(HirReturn {
+            values: HirValuePack::fixed(vec![expr]),
+        }))
+    }
+
+    fn safety() -> HirExprSafety {
+        HirExprSafety::for_dialect(DecompileDialect::Lua54)
+    }
+
+    #[test]
+    fn read_only_alias_region_accepts_a_cross_layer_forward_goto() {
+        let local = LocalId(0);
+        let param = ParamId(0);
+        let target = HirLabelId(0);
+        let stmts = vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Boolean(true),
+                then_block: HirBlock {
+                    stmts: vec![goto(target)],
+                },
+                else_block: None,
+            })),
+            return_expr(HirExpr::LocalRef(local)),
+            label(target),
+            return_expr(HirExpr::LocalRef(local)),
+        ];
+
+        assert!(validate_alias_flow(&stmts, local, param, AliasStates::entry(), safety()).is_ok());
+    }
+
+    #[test]
+    fn alias_region_rejects_a_write_that_can_reenter_through_a_backedge() {
+        let local = LocalId(0);
+        let param = ParamId(0);
+        let header = HirLabelId(0);
+        let stmts = vec![
+            label(header),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::LocalRef(local),
+                then_block: HirBlock {
+                    stmts: vec![return_expr(HirExpr::ParamRef(param))],
+                },
+                else_block: None,
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(local)],
+                values: HirValuePack::fixed(vec![HirExpr::Boolean(true)]),
+            })),
+            goto(header),
+        ];
+
+        assert_eq!(
+            validate_alias_flow(&stmts, local, param, AliasStates::entry(), safety()),
+            Err(AliasFlowError::UnstructuredControl)
+        );
     }
 }

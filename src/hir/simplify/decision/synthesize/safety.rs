@@ -8,9 +8,9 @@ use crate::hir::common::{HirDecisionExpr, HirDecisionTarget, HirExpr};
 use crate::hir::expr_safety::HirExprSafety;
 
 pub(crate) fn decision_is_synth_safe(decision: &HirDecisionExpr, safety: HirExprSafety) -> bool {
-    // 候选拒绝[LayerBoundary]：effectful `f()`/lookup 的候选级求值次数与次序应由
-    // synthesize::domain 的 eval-trace verifier owner 对照；当前 MDD 只证明返回值，
-    // 而 structured candidate 可能复制 subject 或删掉 arm，不能据值相等放行。
+    // 候选拒绝[SemanticBarrier:EvalCount]：一般 structured candidate 会把 `f()` subject
+    // 或共享的 `g()` continuation 复制进互斥逻辑臂；返回 falsy 时会多调用一次，代数 MDD
+    // 只证明值映射，不能放行。effectful 图只由 value 的 exact-trace grammar 消费。
     decision.nodes.iter().all(|node| {
         expr_is_synth_safe(&node.test, safety)
             && target_is_synth_safe(&node.truthy, safety)

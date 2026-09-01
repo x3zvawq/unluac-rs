@@ -897,7 +897,9 @@ fn collect_plans(
             && touching_stmt_indices.is_empty()
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
         {
-            // 候选拒绝[LayerBoundary]：零后续 touch 且无 debug identity 的匿名 temp 属于 dead-temps 的 effect-preserving 删除职责，locals 不把死 SSA 壳固化为 local。
+            // 候选忽略[NotApplicable]：零后续 touch 的匿名 temp 没有跨语句值流，不是
+            // locals 的源码 binding 候选。dead-temps 只会另行删除其中 discard-safe、无受保护
+            // raw-home 的子集；其余形状不能借一个并不覆盖它们的 owner 伪装成 LayerBoundary。
             continue;
         }
         if sticky_local.is_none()
@@ -907,7 +909,9 @@ fn collect_plans(
                 .chain(touching_stmt_indices.iter().copied())
                 .all(|index| stmt_temp_reads[index].is_disjoint(&group))
         {
-            // 候选拒绝[LayerBoundary]：只有写 touch、没有表达式读取且无 debug/capture/physical-root 身份的链交给 dead-temps 清理。
+            // 候选忽略[NotApplicable]：只有写 touch、没有表达式读取的链不承载可恢复的
+            // 跨语句 binding。dead-temps 仍按自己的 discard-safe/raw-home 合同清理可删写入；
+            // locals 不把未被读取的 SSA 版本固化成源码 local。
             continue;
         }
         if sticky_local.is_none() && !force_physical_root_local {
@@ -917,19 +921,20 @@ fn collect_plans(
             // 全局别名只有作为表字段安装的 base，字符串常量只有作为调用实参，
             // 才更像寄存器级脚手架而不是源码 local。数字/布尔/nil 等也可能是
             // 捕获 local 的重绑定值，仍按原规则保守提升。
-            if touching_stmt_indices.len() == 1
-                && (stmt_consumes_temps_only_in_control_head(
-                    &block.stmts[first_touch_index.expect("single touch must exist")],
-                    &group,
-                ) || single_use_seed_can_stay_temp(
-                    stmt,
-                    root_temp,
-                    &block.stmts[first_touch_index.expect("single touch must exist")],
-                ))
-            {
-                // 候选拒绝[PolicyBoundary]：只在控制头消费一次的匿名 temp 保持低密度展示；这不是运行语义边界。
-                // 候选拒绝[LayerBoundary]：单次 global table-base/string call-arg seed 由 table-constructors 或 temp-inline 的具体消费站点收敛。
-                continue;
+            if touching_stmt_indices.len() == 1 {
+                let use_stmt = &block.stmts[first_touch_index.expect("single touch must exist")];
+                if stmt_consumes_temps_only_in_control_head(use_stmt, &group) {
+                    // 候选拒绝[PolicyBoundary]：只在控制头消费一次的匿名 temp 保持低密度展示；这不是运行语义边界。
+                    continue;
+                }
+                if single_use_seed_can_stay_temp(stmt, root_temp, use_stmt) {
+                    // 候选拒绝[LayerBoundary]：global table-base 与 string call-arg 分别属于
+                    // temp-inline 的 AccessBase / CallArg 站点。该 Normal owner 在 locals 之前
+                    // 已执行具体求值顺序、lifetime 与展示策略 gate；locals 不把其拒绝结果改成
+                    // 一个更长寿的 local。成功内联产生 TempChain/LocalBinding invalidation 后，
+                    // table-constructors 才可能消费随之暴露的表构造形状。
+                    continue;
+                }
             }
         }
 

@@ -452,6 +452,7 @@ impl HirExprSafety {
             | HirExpr::UInt64(_)
             | HirExpr::Vector(_)
             | HirExpr::Complex { .. } => true,
+            HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => true,
             HirExpr::Unary(_) | HirExpr::Binary(_) => self.is_discard_safe(expr),
             HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
                 self.result_is_gc_inert(&logical.lhs) && self.result_is_gc_inert(&logical.rhs)

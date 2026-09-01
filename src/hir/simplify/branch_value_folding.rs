@@ -652,7 +652,7 @@ fn finalize_branch_value_targets(
         }],
     };
     let value = crate::hir::decision::finalize_value_decision_expr(decision, safety);
-    // 候选拒绝[LayerBoundary]：Lua 没有一般三元值表达式；例如
+    // 候选拒绝[TargetConstraint]：Lua 没有一般三元值表达式；例如
     // `local x; if probe() then x=false end` 既要区分 false/nil，又只能调用 probe 一次；
     // 无额外 local 的 `and/or` 无法承载。保留控制树，避免与 eliminate-decisions 振荡。
     (!matches!(value, HirExpr::Decision(_))).then_some(value)

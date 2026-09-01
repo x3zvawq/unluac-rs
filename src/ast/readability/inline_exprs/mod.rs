@@ -10,7 +10,8 @@
 //! - while/repeat 条件只接收无事件且循环不变的机械 RHS；依赖候选会递归展开，
 //!   外部 local/param 则必须未捕获且循环体没有直接写入
 //! - generic-for 的 method receiver 允许收回一个紧邻的 recovered binding 别名
-//! - repeat body 的 use index 把 until 条件计作尾随表达式，不删除仍对条件可见的 local
+//! - repeat body 的 stable-copy 事务把 until 条件计作可改写的尾随 owner，正文、条件与
+//!   declaration removal 必须一起提交
 //! - 多值 return 顶层只收回 context-safe 或已证明为单值布尔比较的唯一 alias；可变快照仍通过求值前缀证明
 //! - 单值 return 短路树只收回最左、必达位置的布尔比较 alias；右臂仍保留原 binding
 //! - 稳定 local copy 与无事件 truthiness 快照可跨越无关语句收回；复合/primitive 多 use
@@ -31,7 +32,9 @@ use self::candidate::{
     stmt_is_boolean_return_value_sink, stmt_is_direct_return_value_sink,
     stmt_is_multi_return_value_sink, stmt_is_terminal_lookup_return_sink,
 };
-use self::use_sites::rewrite_stmt_use_sites_with_policy;
+use self::use_sites::{
+    rewrite_condition_use_sites_with_policy, rewrite_stmt_use_sites_with_policy,
+};
 use super::super::common::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
     AstLocalAttr, AstModule, AstNameRef, AstStmt, AstTargetDialect,
@@ -212,7 +215,11 @@ impl AstRewritePass for InlineExprsPass {
         )
     }
 
-    fn rewrite_repeat_body(&mut self, block: &mut AstBlock, condition: &AstExpr) -> bool {
+    fn rewrite_repeat_body_and_condition(
+        &mut self,
+        block: &mut AstBlock,
+        condition: &mut AstExpr,
+    ) -> bool {
         rewrite_current_block(
             block,
             self.target,
@@ -230,19 +237,20 @@ fn rewrite_current_block(
     target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
-    trailing_condition: Option<&AstExpr>,
+    mut trailing_condition: Option<&mut AstExpr>,
 ) -> bool {
-    let mut changed = collapse_adjacent_self_call_updates(block, trailing_condition);
+    let mut changed = collapse_adjacent_self_call_updates(block, trailing_condition.as_deref());
     changed |= collapse_adjacent_call_alias_runs(
         block,
         target,
         options,
         mutable_snapshots,
-        trailing_condition,
+        trailing_condition.as_deref(),
     );
 
     let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
+    let use_index =
+        BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition.as_deref());
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
@@ -270,7 +278,9 @@ fn rewrite_current_block(
         }) {
             // Preserve the field alias until function-sugar can consume the receiver snapshot,
             // lookup, and call atomically. Inlining only the lookup loses the method proof.
-            // 候选拒绝[LayerBoundary]：receiver + field alias + call 必须由 function-sugar 原子消费，单独内联 lookup 会销毁 method 证明。
+            // 候选拒绝[LayerBoundary]：Deferred function-sugar 的 method-alias owner 必须
+            // 原子消费 receiver + field alias + call；它在 Normal inline-exprs 收敛后运行，
+            // 成功时发出 StatementAdjacency/ExprShape，使调度器返回 Normal cleanup/inline。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -317,7 +327,9 @@ fn rewrite_current_block(
             // 如果太早收成 `local weight = items[i].weight`，后面的机械 run 就只剩一层，
             // 无法再判断“整条链都只是脚手架”。让它留到 run-collapse 一次性处理，
             // 才能既收回 for-loop 里的机械局部，又保住 return 场景下的阶段 local。
-            // 候选拒绝[LayerBoundary]：连续 lookup 由本 pass 的 mechanical-run 事务统一证明，单项先吞会丢掉整段候选边界。
+            // 候选拒绝[LayerBoundary]：连续 lookup 由 rewrite_current_block 尾部的
+            // collapse_adjacent_mechanical_alias_runs 在同一次调用中原子证明；相邻单项
+            // scanner 必须先保留完整 run，随后无需依赖外部 pass 或下一轮。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -384,7 +396,9 @@ fn rewrite_current_block(
         }
         let suffix_uses = use_index.count_uses_in_suffix(index + 1, candidate.binding());
         if suffix_uses == 0 {
-            // 候选拒绝[LayerBoundary]：未使用声明的删除归 cleanup/dead-local，不属于表达式内联。
+            // 候选忽略[NotApplicable]：没有 use site 就不是表达式内联事务；本轮之前的
+            // cleanup 已消费可安全丢弃的 initializer/裸 call，仍保留者具有 lookup、
+            // metamethod、allocation 或失败证据等可观察求值，不能在这里删除。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -433,15 +447,16 @@ fn rewrite_current_block(
                     rewrite_policy,
                 ) {
                     // 候选拒绝[PolicyBoundary]：已证明的 call-arg/callee 位置仍可能超过展示复杂度预算；
-                    // 候选拒绝[LayerBoundary]：其它嵌套 owner 不属于相邻调用链事务。
                     stmt_plan.push(PlannedStmt::Original(index));
                     index += 1;
                     continue;
                 }
             } else {
                 // 候选拒绝[PolicyBoundary]：精确 use-site 仍可能超过对应展示复杂度预算；
-                // 候选拒绝[LayerBoundary]：bare stable copy 由后续 copy-inline 消费，
-                // nested block/capture 则不属于当前相邻 statement 的 rewrite owner。
+                // 候选忽略[NotApplicable]：bare stable copy 及其直接 nested-block use 由
+                // 本函数稍后的 copy-inline 原子消费；其它 policy 不拥有该位置。
+                // 候选拒绝[SemanticBarrier:Capture]：FunctionExpr capture 需要 alias 的
+                // 独立 cell identity，不能把捕获元数据改写成 source binding。
                 stmt_plan.push(PlannedStmt::Original(index));
                 index += 1;
                 continue;
@@ -459,28 +474,28 @@ fn rewrite_current_block(
         target,
         options,
         mutable_snapshots,
-        trailing_condition,
+        trailing_condition.as_deref_mut(),
     );
     changed |= collapse_terminal_call_result_alias_runs(
         block,
         target,
         options,
         mutable_snapshots,
-        trailing_condition,
+        trailing_condition.as_deref(),
     );
     changed |= collapse_terminal_local_mechanical_runs(
         block,
         target,
         options,
         mutable_snapshots,
-        trailing_condition,
+        trailing_condition.as_deref(),
     );
     changed |= collapse_adjacent_mechanical_alias_runs(
         block,
         target,
         options,
         mutable_snapshots,
-        trailing_condition,
+        trailing_condition.as_deref(),
     );
     changed
 }
@@ -552,10 +567,11 @@ fn collapse_stable_copy_aliases(
     target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
-    trailing_condition: Option<&AstExpr>,
+    mut trailing_condition: Option<&mut AstExpr>,
 ) -> bool {
     let mut stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&stmts, trailing_condition);
+    let use_index =
+        BindingUseIndex::for_stmts_with_trailing_expr(&stmts, trailing_condition.as_deref());
     let write_index = BindingWriteIndex::for_stmts(&stmts);
     let mut removed = vec![false; stmts.len()];
 
@@ -577,8 +593,9 @@ fn collapse_stable_copy_aliases(
                 )
             })
         {
-            // 候选拒绝[LayerBoundary]：receiver snapshot 与 direct/field method sink 必须由
-            // function-sugar 原子消费；提前删除 alias 会丢失 `:` 恢复所需的双 use 证明。
+            // 候选拒绝[LayerBoundary]：Deferred function-sugar 的 method-alias owner 原子
+            // 消费 receiver snapshot 与 direct/field method sink；它在 Normal 收敛后运行，
+            // 并以 StatementAdjacency/ExprShape invalidation 触发后续 Normal cleanup/inline。
             continue;
         }
         if candidate.origin() != super::super::common::AstLocalOrigin::Recovered {
@@ -615,7 +632,8 @@ fn collapse_stable_copy_aliases(
         let use_stmt_indices =
             use_index.use_stmt_indices_in_suffix(candidate_index + 1, candidate.binding());
         if use_stmt_indices.is_empty() {
-            // 候选拒绝[LayerBoundary]：未使用声明的删除归 cleanup/dead-local，不属于 copy-inline。
+            // 候选忽略[NotApplicable]：没有读取就不存在 copy-inline site；cleanup 在
+            // inline-exprs 之前及其 invalidation 后重跑，负责删除无 use 的安全 initializer。
             continue;
         }
         if !matches!(value, AstExpr::Var(_)) {
@@ -647,14 +665,6 @@ fn collapse_stable_copy_aliases(
                 continue;
             }
         }
-        if use_stmt_indices
-            .iter()
-            .any(|use_stmt_index| *use_stmt_index >= stmts.len())
-        {
-            // 候选拒绝[LayerBoundary]：repeat trailing condition 位于当前 block 的 statement
-            // rewrite 边界之外；不能只提交正文 use 而留下条件中的悬空 binding。
-            continue;
-        }
         if use_stmt_indices.len() > 1 && !matches!(value, AstExpr::Var(_)) {
             // 候选拒绝[PolicyBoundary]：把 primitive 复制进多个业务语句会抹掉复用概念并
             // 增加重复；同一 owner 仍可内联，多 owner 只删除纯名字 alias（regress_80/316）。
@@ -678,19 +688,20 @@ fn collapse_stable_copy_aliases(
                     // A bound local/synthetic name can only appear while its lexical declaration
                     // is active, so the AST binding identity itself supplies the dominance proof.
                     if write_index.has_write_after(candidate_index, source_binding) {
-                        trailing_root_handoff = (use_stmt_indices.len() == 1)
-                            .then(|| {
-                                stable_copy_trailing_root_handoff(
-                                    &stmts,
-                                    trailing_condition,
-                                    &write_index,
-                                    mutable_snapshots,
-                                    candidate_index,
-                                    use_stmt_indices[0],
-                                    source_binding,
-                                )
-                            })
-                            .flatten();
+                        trailing_root_handoff = (use_stmt_indices.len() == 1
+                            && use_stmt_indices[0] < stmts.len())
+                        .then(|| {
+                            stable_copy_trailing_root_handoff(
+                                &stmts,
+                                trailing_condition.as_deref(),
+                                &write_index,
+                                mutable_snapshots,
+                                candidate_index,
+                                use_stmt_indices[0],
+                                source_binding,
+                            )
+                        })
+                        .flatten();
                     }
                     if write_index.has_write_after(candidate_index, source_binding)
                         && trailing_root_handoff.is_none()
@@ -709,7 +720,31 @@ fn collapse_stable_copy_aliases(
 
         let replacement = value.clone();
         let mut rewritten_stmts = Vec::with_capacity(use_stmt_indices.len());
+        let mut rewritten_condition = None;
         let all_rewritten = use_stmt_indices.iter().all(|use_stmt_index| {
+            if *use_stmt_index == stmts.len() {
+                let Some(condition) = trailing_condition.as_deref() else {
+                    return false;
+                };
+                let mut rewritten = condition.clone();
+                if !rewrite_condition_use_sites_with_policy(
+                    &mut rewritten,
+                    candidate,
+                    &replacement,
+                    options,
+                    InlinePolicy::StableCopy,
+                ) || BindingUseIndex::for_stmts_with_trailing_expr(&[], Some(&rewritten))
+                    .count_uses_in_suffix(0, candidate.binding())
+                    != 0
+                {
+                    return false;
+                }
+                rewritten_condition = Some(rewritten);
+                return true;
+            }
+            if *use_stmt_index > stmts.len() {
+                return false;
+            }
             let mut rewritten_stmt = stmts[*use_stmt_index].clone();
             let rewritten = trailing_root_handoff.as_ref().is_some_and(|handoff| {
                 handoff.structured
@@ -743,6 +778,12 @@ fn collapse_stable_copy_aliases(
             // 均由未改写依赖保持，且没有求值事件被移动。
             for (use_stmt_index, rewritten_stmt) in rewritten_stmts {
                 stmts[use_stmt_index] = rewritten_stmt;
+            }
+            if let Some(rewritten_condition) = rewritten_condition {
+                *trailing_condition
+                    .as_deref_mut()
+                    .expect("planned trailing rewrite must retain its condition") =
+                    rewritten_condition;
             }
             *is_removed = true;
         }
@@ -798,6 +839,7 @@ fn stable_copy_trailing_root_handoff(
             (target, false)
         }
         AstStmt::If(if_stmt) => (structured_if_handoff_target(if_stmt, candidate)?, true),
+        AstStmt::DoBlock(block) => (structured_do_handoff_target(block, candidate)?, true),
         AstStmt::GlobalDecl(_) => {
             // 候选拒绝[SemanticBarrier:Metamethod]：global declaration/store 可经 _ENV
             // __newindex 截获而不保存值，不能充当强 root handoff。
@@ -811,10 +853,12 @@ fn stable_copy_trailing_root_handoff(
         AstStmt::While(_)
         | AstStmt::Repeat(_)
         | AstStmt::NumericFor(_)
-        | AstStmt::GenericFor(_)
-        | AstStmt::DoBlock(_) => {
-            // 候选拒绝[LayerBoundary]：loop/do 内部 handoff 需要其迭代/作用域 owner；本规则
-            // 只拥有 block CFG 与逐分支终结证明完整的 structured If。
+        | AstStmt::GenericFor(_) => {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：while/for 可以零次执行，repeat 首轮
+            // continue 也可绕过内部 handoff 后直接求值 inner latch；删除 alias 会让这些
+            // 路径在 source 覆盖前没有旧值 carrier。迭代 owner 不能按单次 statement 支配处理。
+            // 候选拒绝[SemanticBarrier:Lifetime]：上述绕过路径会让旧对象 root 在外层 latch
+            // 前提前消失，弱表或 `__gc` 可观察。
             return None;
         }
         AstStmt::CallStmt(_) => {
@@ -842,8 +886,9 @@ fn stable_copy_trailing_root_handoff(
             return None;
         }
         AstNameRef::Upvalue(_) => {
-            // 候选拒绝[LayerBoundary]：AST 没有父函数及 sibling closure 的 upvalue write
-            // provenance，无法证明 carrier 在 latch 前不被外部路径覆盖。
+            // 候选拒绝[SemanticBarrier:Capture]：sibling closure 可在 handoff 后、latch 前
+            // 覆盖同一 upvalue；当前函数内的 write index 无法把该外部写排除，target 因而
+            // 不保证继续承载旧快照/root。
             return None;
         }
         AstNameRef::Param(_)
@@ -891,7 +936,8 @@ fn stable_copy_trailing_root_handoff(
         return None;
     }
     let Some(condition) = trailing_condition else {
-        // 候选拒绝[LayerBoundary]：没有 repeat trailing condition 时不属于此 handoff 规则。
+        // 候选拒绝[SemanticBarrier:Lifetime]：没有 repeat latch 的保留读取时，后续 cleanup
+        // 可删除 dead carrier assignment；原 alias 本会让旧对象活到词法 block 末尾。
         return None;
     };
     let condition_references_target = binding_from_name_ref(&target).map_or_else(
@@ -899,8 +945,8 @@ fn stable_copy_trailing_root_handoff(
         |target| expr_references_binding(condition, target),
     );
     if !condition_references_target {
-        // 候选拒绝[LayerBoundary]：cleanup 会继续删除 dead target；只有 latch 读取才能在
-        // 当前 pass 组合中保证 carrier 持有旧 root 到 repeat 尾端。
+        // 候选拒绝[SemanticBarrier:Lifetime]：cleanup 会继续删除 dead target；只有 latch
+        // 的保留读取能在当前 pass 组合中保证 carrier 持有旧 root 到 repeat 尾端。
         return None;
     }
     Some(StableCopyRootHandoff {
@@ -944,6 +990,28 @@ fn structured_if_handoff_target(
     } else {
         outcomes.push(StructuredHandoffState::Pending);
     }
+    let mut targets = outcomes.into_iter().map(|state| match state {
+        StructuredHandoffState::Pending => None,
+        StructuredHandoffState::HandedOff(target) => Some(target),
+    });
+    let target = targets.next().flatten()?;
+    targets
+        .all(|other| other.as_ref() == Some(&target))
+        .then_some(target)
+}
+
+fn structured_do_handoff_target(block: &AstBlock, candidate: AstBindingRef) -> Option<AstNameRef> {
+    if super::control_flow::block_contains_label_or_goto(block) {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：外部 goto 可直接进入 do 内部 label，
+        // 顶层 owner 的支配关系不能证明 owner 内的 handoff 已执行。
+        return None;
+    }
+    let outcomes =
+        structured_handoff_block_outcomes(block, candidate, StructuredHandoffState::Pending)?;
+    common_structured_handoff_target(outcomes)
+}
+
+fn common_structured_handoff_target(outcomes: Vec<StructuredHandoffState>) -> Option<AstNameRef> {
     let mut targets = outcomes.into_iter().map(|state| match state {
         StructuredHandoffState::Pending => None,
         StructuredHandoffState::HandedOff(target) => Some(target),
@@ -1011,6 +1079,9 @@ fn structured_handoff_stmt_outcomes(
             } else {
                 outcomes.push(state);
             }
+        }
+        AstStmt::DoBlock(block) => {
+            outcomes.extend(structured_handoff_block_outcomes(block, candidate, state)?);
         }
         AstStmt::Return(_) | AstStmt::Break => {}
         AstStmt::Continue if matches!(state, StructuredHandoffState::HandedOff(_)) => {}
@@ -1090,15 +1161,25 @@ fn rewrite_structured_handoff_stmt(
         values[index] = replacement.clone();
         return true;
     }
-    let AstStmt::If(if_stmt) = stmt else {
-        return false;
-    };
-    let mut changed =
-        rewrite_structured_handoff_block(&mut if_stmt.then_block, candidate, replacement, target);
-    if let Some(else_block) = &mut if_stmt.else_block {
-        changed |= rewrite_structured_handoff_block(else_block, candidate, replacement, target);
+    match stmt {
+        AstStmt::If(if_stmt) => {
+            let mut changed = rewrite_structured_handoff_block(
+                &mut if_stmt.then_block,
+                candidate,
+                replacement,
+                target,
+            );
+            if let Some(else_block) = &mut if_stmt.else_block {
+                changed |=
+                    rewrite_structured_handoff_block(else_block, candidate, replacement, target);
+            }
+            changed
+        }
+        AstStmt::DoBlock(block) => {
+            rewrite_structured_handoff_block(block, candidate, replacement, target)
+        }
+        _ => false,
     }
-    changed
 }
 
 fn rewrite_structured_handoff_block(
@@ -1183,10 +1264,10 @@ mod tests {
         AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstCallStmt,
         AstFieldAccess, AstFunctionExpr, AstGlobalName, AstGoto, AstIf, AstIndexAccess, AstLabel,
         AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstLogicalExpr,
-        AstNameRef, AstReturn, AstWhile,
+        AstNameRef, AstRepeat, AstReturn, AstWhile,
     };
     use crate::decompile::DecompileDialect;
-    use crate::hir::{HirProtoRef, LocalId, ParamId};
+    use crate::hir::{HirProtoRef, LocalId, ParamId, UpvalueId};
 
     use super::*;
 
@@ -1404,14 +1485,14 @@ mod tests {
                 assign_name(source, AstExpr::Nil),
             ],
         };
-        let condition = AstExpr::Var(target.to_name_ref());
+        let mut condition = AstExpr::Var(target.to_name_ref());
 
         assert!(collapse_stable_copy_aliases(
             &mut block,
             lua54_target(),
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),
-            Some(&condition),
+            Some(&mut condition),
         ));
         assert!(matches!(
             &block.stmts[5],
@@ -1444,14 +1525,14 @@ mod tests {
             ],
         };
         let original = block.clone();
-        let condition = AstExpr::Var(target.to_name_ref());
+        let mut condition = AstExpr::Var(target.to_name_ref());
 
         assert!(!collapse_stable_copy_aliases(
             &mut block,
             lua54_target(),
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),
-            Some(&condition),
+            Some(&mut condition),
         ));
         assert_eq!(block, original);
     }
@@ -1478,14 +1559,14 @@ mod tests {
                 assign_name(source, AstExpr::Nil),
             ],
         };
-        let condition = AstExpr::Var(target.to_name_ref());
+        let mut condition = AstExpr::Var(target.to_name_ref());
 
         assert!(collapse_stable_copy_aliases(
             &mut block,
             lua54_target(),
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),
-            Some(&condition),
+            Some(&mut condition),
         ));
         let AstStmt::If(if_stmt) = &block.stmts[2] else {
             panic!("stable-copy handoff must retain the structured owner")
@@ -1518,14 +1599,14 @@ mod tests {
             ],
         };
         let original = block.clone();
-        let condition = AstExpr::Var(target.to_name_ref());
+        let mut condition = AstExpr::Var(target.to_name_ref());
 
         assert!(!collapse_stable_copy_aliases(
             &mut block,
             lua54_target(),
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),
-            Some(&condition),
+            Some(&mut condition),
         ));
         assert_eq!(block, original);
     }
@@ -1558,16 +1639,183 @@ mod tests {
             ],
         };
         let original = block.clone();
-        let condition = AstExpr::Var(target.to_name_ref());
+        let mut condition = AstExpr::Var(target.to_name_ref());
 
         assert!(!collapse_stable_copy_aliases(
             &mut block,
             lua54_target(),
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),
-            Some(&condition),
+            Some(&mut condition),
         ));
         assert_eq!(block, original);
+    }
+
+    #[test]
+    fn stable_copy_handoff_accepts_single_pass_do_owner() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![assign_name(target, AstExpr::Var(snapshot.to_name_ref()))],
+                })),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let mut condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&mut condition),
+        ));
+        assert!(matches!(
+            &block.stmts[2],
+            AstStmt::DoBlock(do_block)
+                if matches!(do_block.stmts.as_slice(), [AstStmt::Assign(assign)]
+                    if assign.values == vec![AstExpr::Var(source.to_name_ref())])
+        ));
+    }
+
+    #[test]
+    fn stable_copy_handoff_rejects_zero_iteration_loop_owner() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                AstStmt::While(Box::new(AstWhile {
+                    cond: AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                    body: AstBlock {
+                        stmts: vec![assign_name(target, AstExpr::Var(snapshot.to_name_ref()))],
+                    },
+                })),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let original = block.clone();
+        let mut condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&mut condition),
+        ));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn stable_copy_handoff_rejects_do_path_that_continues_before_handoff() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![
+                        AstStmt::DoBlock(Box::new(AstBlock {
+                            stmts: vec![AstStmt::Continue],
+                        })),
+                        assign_name(target, AstExpr::Var(snapshot.to_name_ref())),
+                    ],
+                })),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let original = block.clone();
+        let mut condition = AstExpr::Var(target.to_name_ref());
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&mut condition),
+        ));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn stable_copy_handoff_rejects_upvalue_carrier_without_sibling_write_facts() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let snapshot = AstBindingRef::Local(LocalId(1));
+        let target = AstNameRef::Upvalue(UpvalueId(0));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(target.clone())],
+                    values: vec![AstExpr::Var(snapshot.to_name_ref())],
+                })),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+        let original = block.clone();
+        let mut condition = AstExpr::Var(target);
+
+        assert!(!collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&mut condition),
+        ));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn stable_copy_handoff_requires_a_repeat_latch_carrier_read() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let target = AstBindingRef::Local(LocalId(1));
+        let snapshot = AstBindingRef::Local(LocalId(2));
+        let make_block = || AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(target, AstExpr::Nil),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                assign_name(target, AstExpr::Var(snapshot.to_name_ref())),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
+
+        let mut without_repeat = make_block();
+        let original = without_repeat.clone();
+        assert!(!collapse_stable_copy_aliases(
+            &mut without_repeat,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(without_repeat, original);
+
+        let mut unread_carrier = make_block();
+        let original = unread_carrier.clone();
+        let mut condition = AstExpr::Boolean(true);
+        assert!(!collapse_stable_copy_aliases(
+            &mut unread_carrier,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&mut condition),
+        ));
+        assert_eq!(unread_carrier, original);
     }
 
     #[test]
@@ -1757,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_copy_keeps_all_owners_when_a_nested_use_cannot_rewrite() {
+    fn stable_copy_rewrites_top_level_and_nested_block_owners_atomically() {
         let source = AstBindingRef::Local(LocalId(0));
         let binding = AstBindingRef::Local(LocalId(1));
         let mut block = AstBlock {
@@ -1768,6 +2016,48 @@ mod tests {
                 AstStmt::DoBlock(Box::new(AstBlock {
                     stmts: vec![call_with_arg("nested", AstExpr::Var(binding.to_name_ref()))],
                 })),
+            ],
+        };
+        assert!(collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::LocalDecl(_), AstStmt::CallStmt(call), AstStmt::DoBlock(nested)]
+                if matches!(&call.call, AstCallKind::Call(call)
+                    if call.args == vec![AstExpr::Var(source.to_name_ref())])
+                    && matches!(nested.stmts.as_slice(), [AstStmt::CallStmt(call)]
+                        if matches!(&call.call, AstCallKind::Call(call)
+                            if call.args == vec![AstExpr::Var(source.to_name_ref())]))
+        ));
+    }
+
+    #[test]
+    fn stable_copy_keeps_alias_cell_when_a_closure_captures_it() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let binding = AstBindingRef::Local(LocalId(1));
+        let closure = AstBindingRef::Local(LocalId(2));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(binding, AstExpr::Var(source.to_name_ref())),
+                recovered_local(
+                    closure,
+                    AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                        function: HirProtoRef(1),
+                        params: Vec::new(),
+                        is_vararg: false,
+                        named_vararg: None,
+                        body: AstBlock::default(),
+                        captured_bindings: BTreeSet::from([binding]),
+                        captured_params: BTreeSet::new(),
+                        capture_write_names: BTreeSet::new(),
+                    })),
+                ),
             ],
         };
         let original = block.clone();
@@ -1783,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_copy_keeps_body_uses_when_until_is_outside_rewrite_boundary() {
+    fn stable_copy_rewrites_body_and_until_uses_atomically() {
         let source = AstBindingRef::Local(LocalId(0));
         let binding = AstBindingRef::Local(LocalId(1));
         let mut block = AstBlock {
@@ -1793,17 +2083,84 @@ mod tests {
                 call_with_arg("sink", AstExpr::Var(binding.to_name_ref())),
             ],
         };
+        let mut condition = equals(AstExpr::Var(binding.to_name_ref()), AstExpr::Integer(7));
+
+        assert!(collapse_stable_copy_aliases(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            Some(&mut condition),
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::LocalDecl(_), AstStmt::CallStmt(call)]
+                if matches!(&call.call, AstCallKind::Call(call)
+                    if call.args == vec![AstExpr::Var(source.to_name_ref())])
+        ));
+        assert_eq!(
+            condition,
+            equals(AstExpr::Var(source.to_name_ref()), AstExpr::Integer(7))
+        );
+    }
+
+    #[test]
+    fn inline_pass_commits_repeat_body_and_condition_together() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let snapshot = AstBindingRef::Local(LocalId(1));
+        let mut module = AstModule {
+            entry_function: HirProtoRef(0),
+            body: AstBlock {
+                stmts: vec![AstStmt::Repeat(Box::new(AstRepeat {
+                    body: AstBlock {
+                        stmts: vec![
+                            debug_local(source, AstExpr::Integer(7)),
+                            recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                        ],
+                    },
+                    cond: AstExpr::Var(snapshot.to_name_ref()),
+                }))],
+            },
+        };
+
+        assert!(apply(
+            &mut module,
+            ReadabilityContext {
+                target: lua54_target(),
+                options: ReadabilityOptions::default(),
+            },
+        ));
+        assert!(matches!(
+            module.body.stmts.as_slice(),
+            [AstStmt::Repeat(repeat)]
+                if matches!(repeat.body.stmts.as_slice(), [AstStmt::LocalDecl(_)])
+                    && repeat.cond == AstExpr::Var(source.to_name_ref())
+        ));
+    }
+
+    #[test]
+    fn stable_copy_keeps_until_snapshot_before_source_overwrite() {
+        let source = AstBindingRef::Local(LocalId(0));
+        let snapshot = AstBindingRef::Local(LocalId(1));
+        let mut block = AstBlock {
+            stmts: vec![
+                debug_local(source, AstExpr::Integer(7)),
+                recovered_local(snapshot, AstExpr::Var(source.to_name_ref())),
+                assign_name(source, AstExpr::Nil),
+            ],
+        };
         let original = block.clone();
-        let condition = equals(AstExpr::Var(binding.to_name_ref()), AstExpr::Integer(7));
+        let mut condition = AstExpr::Var(snapshot.to_name_ref());
 
         assert!(!collapse_stable_copy_aliases(
             &mut block,
             lua54_target(),
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),
-            Some(&condition),
+            Some(&mut condition),
         ));
         assert_eq!(block, original);
+        assert_eq!(condition, AstExpr::Var(snapshot.to_name_ref()));
     }
 
     #[test]

@@ -328,19 +328,14 @@ impl HandoffIdentityFacts {
         target: CarryBinding,
         promotion_facts: &ProtoPromotionFacts,
     ) -> bool {
-        // 候选拒绝[LayerBoundary]：entry-nil provenance 已被前层裁剪时，promotion owner 无法再证明原 binding identity。
-        // 候选拒绝[PolicyBoundary]：debug/for source identity 由 proto identity owner 保留。
+        // 候选拒绝[PolicyBoundary]：debug binding 是项目选择保留的源码身份。
+        // 候选拒绝[SemanticBarrier:Scope]：for binding 每轮重建且只在 loop body 可见；
+        // 与外层/跨轮 binding 合并会改变迭代 refresh 和词法作用域。
         // 候选拒绝[SemanticBarrier:Lifetime]：把 physical-root result 合并到 state 会删除其 VM root declaration；lua54_01_close#17 用 __gc + collectgarbage 观察同槽清空前的对象若失去该 root 会提前析构。
         // 候选拒绝[SemanticBarrier:Capture]：capture 任一端或 raw-home may-alias reference capture 时，closure 可区分合并前的 cell。
         // 候选拒绝[SemanticBarrier:Lifetime]：TBC 任一端或 raw-home may-alias resource binding 时，合并会改变 close/root epoch。
         !source.local().is_some_and(|local| self.contains(local))
             && !target.local().is_some_and(|local| self.contains(local))
-            && !source
-                .local()
-                .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
-            && !target
-                .local()
-                .is_some_and(|local| promotion_facts.entry_nil_writes_were_pruned(local))
             && !self.captured.contains(&source)
             && !self.captured.contains(&target)
             && !self.to_be_closed.contains(&source)

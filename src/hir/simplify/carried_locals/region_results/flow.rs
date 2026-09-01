@@ -3,8 +3,8 @@
 //! Structure/HIR 已经提供结构化分支与循环、binding 的 `(slot, close epoch)`、capture 和
 //! source debug 身份；这里在这些事实之上证明两个 HIR binding 只是同一物理状态的阶段性
 //! 名称，不重新推断 CFG owner，也不移动或复制 RHS。证明只接受同一精确 home-slot，并沿
-//! 每条结构化路径跟踪 `Unproduced/Pending/Synced`，所以多值、goto、cleanup 或残留 Decision
-//! 等未建模边界会保留原形。
+//! 每条结构化路径跟踪 `Unproduced/Pending/Synced`；Decision 的全部 test/target 读取按并集
+//! 保守验证，而多值、goto、cleanup 或 Unresolved 等未建模边界会保留原形。
 //!
 //! 例如 `local r; if c then r = s + 1 else r = s + 2 end; s = r` 会收成两臂直接更新
 //! `s`；若任一路在同步前读取旧 `s`、跳出循环，或随后仍读取已经被消费的 `r`，则整项拒绝。
@@ -68,7 +68,9 @@ fn find_candidate(
             continue;
         };
         let result_binding = CarryBinding::Local(result);
-        // 候选拒绝[LayerBoundary]：debug/source identity 的 result 由 locals owner 保留。
+        // 候选拒绝[PolicyBoundary]：debug result 是项目选择保留的源码身份。
+        // 候选拒绝[SemanticBarrier:Scope]：for result 每轮重建且只在 loop body 可见；
+        // 合并到跨轮 state 会改变迭代 refresh 和词法作用域。
         // 候选拒绝[SemanticBarrier:Capture]：captured/outer result 可在 region 外被观察，不能删除其 cell identity。
         if identity_facts.contains(result)
             || outer_bindings.contains(&result_binding)
@@ -86,11 +88,11 @@ fn find_candidate(
         else {
             continue;
         };
-        if region_has_forbidden_nodes(&block.stmts[declaration + 1..=last_mention]) {
-            // 候选拒绝[LayerBoundary]：Decision 交给 decision/eliminate owner；TBC/Close
-            // 交给资源身份 owner。
+        if writeback_region_has_barrier(&block.stmts[declaration + 1..=last_mention]) {
             // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
             // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可引入未被结构化 verifier 覆盖的入口与出口。
+            // 候选拒绝[SemanticBarrier:Lifetime]：跨过 TBC/Close 后合并 result/state 会改变
+            // resource 所属 cell 的 close epoch；close owner 已先运行，残余节点就是活边界。
             continue;
         }
         let eligible_states =
@@ -316,7 +318,10 @@ impl FlowVerifier {
             | HirStmt::NumericFor(_)
             | HirStmt::GenericFor(_) => self.validate_loop(stmt, states),
             HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_) => {
-                // 候选拒绝[LayerBoundary]：非结构跳转与 close epoch 不属于三态 verifier；分别由 CFG/resource owner 消费。
+                // 候选拒绝[SemanticBarrier:ControlFlow]：goto 可从 Pending 路径跳过 writeback，
+                // 或从外部 label 入口绕过 producer；三态结构流不能把这种路径当作 Synced。
+                // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 位于 result producer 与
+                // writeback 之间时，合并 cell 会改变 resource 的 close/root epoch。
                 None
             }
             HirStmt::LocalDecl(local_decl) => {
@@ -480,9 +485,7 @@ impl FlowVerifier {
     }
 
     fn validate_leaf(&self, stmt: &HirStmt, states: RelationSet) -> Option<()> {
-        if stmt_contains_opaque_expr(stmt) {
-            // 候选拒绝[LayerBoundary]：Decision 的内部读取路径由 decision/eliminate owner 解析，
-            // leaf verifier 不展开。
+        if stmt_contains_unresolved_expr(stmt) {
             // 候选拒绝[PolicyBoundary]：Unresolved 的未知读取属于 permissive 失败证据。
             return None;
         }
@@ -499,12 +502,12 @@ impl FlowVerifier {
     }
 
     fn validate_expr(&self, expr: &HirExpr, states: RelationSet) -> Option<()> {
-        if expr_contains_opaque(expr) {
-            // 候选拒绝[LayerBoundary]：opaque Decision 的路径读取交由 decision/eliminate owner
-            // 消解后再审计。
+        if expr_contains_unresolved(expr) {
             // 候选拒绝[PolicyBoundary]：Unresolved 的未知读取属于 permissive 失败证据。
             return None;
         }
+        // BindingReadCollector 递归覆盖 Decision 的每个 test 与 expression target。按读取并集
+        // 验证会保守拒绝任一路径上的错误 epoch，同时允许与 result/state 无关的残留 Decision。
         self.validate_reads(&binding_reads_in_expr(expr), states)
     }
 
@@ -582,31 +585,55 @@ fn binding_reads_in_expr(expr: &HirExpr) -> BTreeSet<CarryBinding> {
     reads.reads
 }
 
-fn expr_contains_opaque(expr: &HirExpr) -> bool {
-    let mut collector = OpaqueExprCollector::default();
+fn expr_contains_unresolved(expr: &HirExpr) -> bool {
+    let mut collector = UnresolvedExprCollector::default();
     visit_expr(expr, &mut collector);
     collector.found
 }
 
-fn stmt_contains_opaque_expr(stmt: &HirStmt) -> bool {
-    let mut collector = OpaqueExprCollector::default();
+fn stmt_contains_unresolved_expr(stmt: &HirStmt) -> bool {
+    let mut collector = UnresolvedExprCollector::default();
     visit_stmts(std::slice::from_ref(stmt), &mut collector);
     collector.found
 }
 
 #[derive(Default)]
-struct OpaqueExprCollector {
+struct UnresolvedExprCollector {
     found: bool,
 }
 
-pub(super) fn region_has_forbidden_nodes(stmts: &[HirStmt]) -> bool {
-    let mut collector = ForbiddenNodeCollector::default();
+fn writeback_region_has_barrier(stmts: &[HirStmt]) -> bool {
+    let mut collector = WritebackBarrierCollector::default();
     visit_stmts(stmts, &mut collector);
     collector.found
 }
 
-pub(super) fn expr_has_forbidden_nodes(expr: &HirExpr) -> bool {
-    let mut collector = ForbiddenNodeCollector::default();
+#[derive(Default)]
+struct WritebackBarrierCollector {
+    found: bool,
+}
+
+impl HirVisitor for WritebackBarrierCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.found |= matches!(
+            stmt,
+            HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
+        );
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.found |= matches!(expr, HirExpr::Unresolved(_));
+    }
+}
+
+pub(super) fn region_has_hard_barrier(stmts: &[HirStmt]) -> bool {
+    let mut collector = RegionBarrierCollector::default();
+    visit_stmts(stmts, &mut collector);
+    collector.found
+}
+
+pub(super) fn expr_has_hard_barrier(expr: &HirExpr) -> bool {
+    let mut collector = RegionBarrierCollector::default();
     visit_expr(expr, &mut collector);
     collector.found
 }
@@ -632,11 +659,11 @@ impl HirVisitor for NestedTransferCollector {
 }
 
 #[derive(Default)]
-struct ForbiddenNodeCollector {
+struct RegionBarrierCollector {
     found: bool,
 }
 
-impl HirVisitor for ForbiddenNodeCollector {
+impl HirVisitor for RegionBarrierCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         self.found |= matches!(
             stmt,
@@ -645,13 +672,13 @@ impl HirVisitor for ForbiddenNodeCollector {
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= matches!(expr, HirExpr::Decision(_) | HirExpr::Unresolved(_));
+        self.found |= matches!(expr, HirExpr::Unresolved(_));
     }
 }
 
-impl HirVisitor for OpaqueExprCollector {
+impl HirVisitor for UnresolvedExprCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= matches!(expr, HirExpr::Decision(_) | HirExpr::Unresolved(_));
+        self.found |= matches!(expr, HirExpr::Unresolved(_));
     }
 }
 
@@ -701,7 +728,10 @@ fn binding_lvalue(binding: CarryBinding) -> HirLValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::common::{HirBinaryExpr, HirBinaryOpKind, HirIf, HirPackTail, TempId};
+    use crate::hir::common::{
+        HirBinaryExpr, HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
+        HirDecisionTarget, HirIf, HirPackTail, TempId,
+    };
     use crate::hir::promotion::HomeSlotKey;
 
     fn verifier() -> FlowVerifier {
@@ -709,6 +739,102 @@ mod tests {
             result: CarryBinding::Local(LocalId(0)),
             state: CarryBinding::Local(LocalId(1)),
         }
+    }
+
+    fn decision(test: HirExpr) -> HirExpr {
+        HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test,
+                truthy: HirDecisionTarget::CurrentValue,
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
+        }))
+    }
+
+    fn identity_facts() -> HandoffIdentityFacts {
+        HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            captured: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn writeback_transaction_accepts_disjoint_decision_reads() {
+        let result = LocalId(0);
+        let state = LocalId(1);
+        let write_result = |value| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(result)],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
+            }))
+        };
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![state],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(0)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![result],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::If(Box::new(HirIf {
+                    cond: decision(HirExpr::TempRef(TempId(0))),
+                    then_block: HirBlock {
+                        stmts: vec![write_result(1)],
+                    },
+                    else_block: Some(HirBlock {
+                        stmts: vec![write_result(2)],
+                    }),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(state)],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
+                })),
+            ],
+        };
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(result, HomeSlotKey::new(0, 0));
+        facts.record_local_home_slot(state, HomeSlotKey::new(0, 0));
+        facts.mark_entry_nil_writes_pruned(result);
+
+        let candidate = find_candidate(
+            &block,
+            &BTreeSet::new(),
+            &facts,
+            &identity_facts(),
+            &BTreeSet::new(),
+        )
+        .expect("all Decision paths are disjoint from the carried bindings");
+        apply_candidate(&mut block, candidate, &mut facts);
+
+        assert!(
+            collect_binding_mentions_by_stmt(&block.stmts)
+                .iter()
+                .all(|mentions| !mentions.contains(&CarryBinding::Local(result)))
+        );
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [HirStmt::LocalDecl(_), HirStmt::If(_)]
+        ));
+    }
+
+    #[test]
+    fn decision_read_of_pending_state_remains_a_barrier() {
+        assert!(
+            verifier()
+                .validate_expr(
+                    &decision(HirExpr::LocalRef(LocalId(1))),
+                    RelationSet::only(Relation::Pending),
+                )
+                .is_none()
+        );
     }
 
     #[test]

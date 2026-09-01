@@ -82,6 +82,7 @@ impl HirRewritePass for BranchControlPass<'_> {
             &mut self.next_local_index,
         );
         let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
+        let adjacent_goto_changed = fold_adjacent_conditional_gotos(&mut block.stmts);
         let empty_changed =
             remove_discard_safe_empty_ifs(&mut block.stmts, self.safety, self.primitive_locals);
         let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
@@ -89,6 +90,7 @@ impl HirRewritePass for BranchControlPass<'_> {
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         constant_changed
             || common_tail_changed
+            || adjacent_goto_changed
             || empty_changed
             || terminal_changed
             || guard_changed
@@ -927,11 +929,19 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
             continue;
         };
         let Some(label_index) = label_indices.get(&target).copied() else {
-            // 候选拒绝[LayerBoundary]：目标 label 不在当前顶层 block，不能由局部 forward-fold 重建。
+            // 候选拒绝[SemanticBarrier:ControlFlow]：目标 label 不在当前词法 block
+            // 时，goto 可能跳出外层或进入另一个局部区域；将当前后缀搬入 arm
+            // 会把本来不在该边上的语句变成条件执行，并改变跳转的词法作用域。
             continue;
         };
-        if label_index <= if_index + 1 {
-            // 候选拒绝[LayerBoundary]：反向跳转属于循环恢复，紧邻跳转属于 nop-label 清理。
+        if label_index <= if_index {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：反向边会重入 if 之前的区域；
+            // forward-fold 只会构造单次前向执行的 arm，会删除后续迭代的回边语义。
+            continue;
+        }
+        if label_index == if_index + 1 {
+            // 这条无操作边已由 fold_adjacent_conditional_gotos 原位删除；若同一 label
+            // 仍有其它入口，它会继续保留为真实目标，否则 deferred dead-labels 清扫它。
             continue;
         }
         let body = &stmts[(if_index + 1)..label_index];
@@ -972,6 +982,44 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
         rewrite_fold_group(stmts, group, kind, keep_label);
     }
     true
+}
+
+fn fold_adjacent_conditional_gotos(stmts: &mut [HirStmt]) -> bool {
+    let mut changed = false;
+    for index in 0..stmts.len().saturating_sub(1) {
+        let Some(HirStmt::Label(label)) = stmts.get(index + 1) else {
+            continue;
+        };
+        let target = label.id;
+        let Some(HirStmt::If(if_stmt)) = stmts.get_mut(index) else {
+            continue;
+        };
+
+        let then_is_target = matches!(if_stmt.then_block.stmts.as_slice(), [HirStmt::Goto(goto)] if goto.target == target);
+        let else_is_target = if_stmt.else_block.as_ref().is_some_and(|else_block| {
+            matches!(else_block.stmts.as_slice(), [HirStmt::Goto(goto)] if goto.target == target)
+        });
+        let else_is_empty = if_stmt
+            .else_block
+            .as_ref()
+            .is_none_or(|else_block| else_block.stmts.is_empty());
+
+        if then_is_target && else_is_empty {
+            // `goto` 与普通 fallthrough 都紧接着进入同一 label；只删除无操作边，保留
+            // condition 的一次求值。后续 empty-if/effect-only 规则决定它能否继续收敛。
+            if_stmt.then_block.stmts.clear();
+            changed = true;
+        } else if else_is_target && if_stmt.then_block.stmts.is_empty() {
+            if_stmt
+                .else_block
+                .as_mut()
+                .expect("matched else target must remain present")
+                .stmts
+                .clear();
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn rewrite_fold_group(
@@ -1154,6 +1202,57 @@ mod tests {
         HirStmt::Return(Box::new(HirReturn {
             values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
         }))
+    }
+
+    #[test]
+    fn adjacent_conditional_goto_preserves_effectful_condition_once() {
+        let target = HirLabelId(3);
+        let call = HirCallExpr {
+            callee: HirExpr::ParamRef(ParamId(0)),
+            args: HirValuePack::default(),
+            method: false,
+            fastcall: None,
+            method_name: None,
+        };
+        let mut stmts = vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Call(Box::new(call.clone())),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Goto(Box::new(crate::hir::common::HirGoto {
+                        target,
+                    }))],
+                },
+                else_block: None,
+            })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: target,
+                tbc_barriers: Vec::new(),
+            })),
+        ];
+
+        assert!(fold_adjacent_conditional_gotos(&mut stmts));
+        assert!(matches!(&stmts[0], HirStmt::If(if_stmt) if if_arms_are_empty(if_stmt)));
+        assert!(fold_effect_only_call(&mut stmts[0]));
+        assert!(matches!(&stmts[0], HirStmt::CallStmt(stmt) if stmt.call == call));
+        assert!(matches!(&stmts[1], HirStmt::Label(label) if label.id == target));
+
+        let other = HirLabelId(4);
+        let mut non_adjacent_target = vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Boolean(true),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Goto(Box::new(crate::hir::common::HirGoto {
+                        target: other,
+                    }))],
+                },
+                else_block: None,
+            })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: target,
+                tbc_barriers: Vec::new(),
+            })),
+        ];
+        assert!(!fold_adjacent_conditional_gotos(&mut non_adjacent_target));
     }
 
     #[test]

@@ -90,6 +90,16 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
             new_stmts.push(stmt);
             continue;
         };
+        if bindings
+            .iter()
+            .any(|binding| binding.origin.is_debug_hinted())
+        {
+            // 候选拒绝[SemanticBarrier:DebugScope]：`local debug_name; local t` 合并后，
+            // 首个 binding 要到第二条声明之后才进入作用域；原第二行的 line hook 本可
+            // 通过 debug.getlocal 观察它，合并会丢失这段已保留的源码可见期。
+            new_stmts.push(stmt);
+            continue;
+        }
 
         let mut merged_bindings = bindings.to_vec();
         let mut consumed = 0;
@@ -931,11 +941,15 @@ fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::Ast
     if !local_decl.values.is_empty() || local_decl.bindings.is_empty() {
         return None;
     }
-    if local_decl
-        .bindings
-        .iter()
-        .any(|binding| binding.attr != AstLocalAttr::None || !is_temp_like_binding(binding.id))
-    {
+    if local_decl.bindings.iter().any(|binding| {
+        binding.attr != AstLocalAttr::None
+            || !is_temp_like_binding(binding.id)
+            || binding.origin != super::super::common::AstLocalOrigin::Recovered
+    }) {
+        // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted temp 的原声明起点是已保留的
+        // source identity，下沉会缩短 debug.getlocal 可见期。
+        // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 的空声明在 hoist 点清空旧 VM
+        // root；下沉到赋值点会让旧对象跨过中间 GC/弱表观察继续存活。
         return None;
     }
     Some(local_decl.bindings.clone())
@@ -1195,5 +1209,97 @@ impl AstVisitor for GotoTargetCollector {
 
     fn visit_function_expr(&mut self, _function: &super::super::common::AstFunctionExpr) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::common::{AstAssign, AstLocalOrigin};
+    use crate::hir::{LocalId, TempId};
+
+    fn empty_local(id: usize, origin: AstLocalOrigin) -> AstStmt {
+        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: AstBindingRef::Local(LocalId(id)),
+                attr: AstLocalAttr::None,
+                origin,
+            }],
+            values: Vec::new(),
+        }))
+    }
+
+    fn temp_decl_with_following_write(origin: AstLocalOrigin) -> AstBlock {
+        let binding = AstBindingRef::Temp(TempId(0));
+        AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: binding,
+                        attr: AstLocalAttr::None,
+                        origin,
+                    }],
+                    values: Vec::new(),
+                })),
+                AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(binding.to_name_ref())],
+                    values: vec![AstExpr::Integer(1)],
+                })),
+            ],
+        }
+    }
+
+    #[test]
+    fn empty_local_merge_preserves_each_debug_scope_boundary() {
+        let debug_first = AstBlock {
+            stmts: vec![
+                empty_local(0, AstLocalOrigin::DebugHinted),
+                empty_local(1, AstLocalOrigin::Recovered),
+            ],
+        };
+        let debug_second = AstBlock {
+            stmts: vec![
+                empty_local(0, AstLocalOrigin::Recovered),
+                empty_local(1, AstLocalOrigin::DebugHinted),
+            ],
+        };
+        let mut recovered = AstBlock {
+            stmts: vec![
+                empty_local(0, AstLocalOrigin::Recovered),
+                empty_local(1, AstLocalOrigin::Recovered),
+            ],
+        };
+
+        let mut debug_first_after = debug_first.clone();
+        let mut debug_second_after = debug_second.clone();
+        assert!(!merge_adjacent_empty_local_decls(&mut debug_first_after));
+        assert!(!merge_adjacent_empty_local_decls(&mut debug_second_after));
+        assert_eq!(debug_first_after, debug_first);
+        assert_eq!(debug_second_after, debug_second);
+
+        assert!(merge_adjacent_empty_local_decls(&mut recovered));
+        assert_eq!(recovered.stmts.len(), 1);
+    }
+
+    #[test]
+    fn hoisted_temp_sink_preserves_debug_and_physical_root_origins() {
+        for origin in [
+            AstLocalOrigin::DebugHinted,
+            AstLocalOrigin::PhysicalRoot,
+            AstLocalOrigin::DebugHintedPhysicalRoot,
+        ] {
+            let original = temp_decl_with_following_write(origin);
+            let mut block = original.clone();
+            assert!(!sink_hoisted_temp_decls(&mut block, None));
+            assert_eq!(block, original);
+        }
+
+        let mut recovered = temp_decl_with_following_write(AstLocalOrigin::Recovered);
+        assert!(sink_hoisted_temp_decls(&mut recovered, None));
+        assert_eq!(recovered.stmts.len(), 1);
+        let AstStmt::LocalDecl(decl) = &recovered.stmts[0] else {
+            panic!("recovered hoisted temp should sink into its assignment");
+        };
+        assert_eq!(decl.values, vec![AstExpr::Integer(1)]);
     }
 }

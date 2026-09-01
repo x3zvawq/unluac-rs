@@ -189,11 +189,6 @@ fn collapse_repeat_tail_temp_updates(
                 // state/next home；删除尾 writeback 会让该别名写成为最终 state 值。
                 continue;
             }
-            Err(RepeatGapFailure::MissingHomeFacts) => {
-                // 候选拒绝[LayerBoundary]：promotion 未提供 candidate 或 between 写入的完整
-                // possible-home 集，当前 owner 不能把未知 raw slot 证明成无事件/无别名 gap。
-                continue;
-            }
         }
         if first_mentions.get(&next_binding).copied() != Some(index)
             || writes.counts.get(&next_binding).copied() != Some(1)
@@ -223,8 +218,7 @@ fn collapse_repeat_tail_temp_updates(
             // break/continue 不离开 candidate，本 guard 不再 blanket 拒绝它们。
             continue;
         }
-        if stmts_have_decision_or_unresolved(between) {
-            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
+        if stmts_have_unresolved(between) {
             // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
             continue;
         }
@@ -340,7 +334,6 @@ fn repeat_tail_temp_update(body: &HirBlock) -> Option<RepeatTailTempUpdate<'_>> 
 enum RepeatGapFailure {
     ObservedDistinctHomes,
     AliasingWrite,
-    MissingHomeFacts,
 }
 
 fn repeat_gap_safety(
@@ -353,20 +346,13 @@ fn repeat_gap_safety(
     if between.is_empty() || bindings_share_exact_home_slot(next, state, promotion_facts) {
         return Ok(());
     }
-    let next_homes = possible_binding_homes(next, promotion_facts);
-    let state_homes = possible_binding_homes(state, promotion_facts);
-    if matches!((&next_homes, &state_homes),
-        (Some(next_homes), Some(state_homes))
-            if next_homes == state_homes && next_homes.len() <= 1)
-    {
+    let next_homes = conservative_binding_homes(next, promotion_facts);
+    let state_homes = conservative_binding_homes(state, promotion_facts);
+    if next_homes == state_homes && next_homes.len() <= 1 {
         return Ok(());
     }
     if between_may_observe_gc_roots(between, expr_safety) {
-        return if next_homes.is_some() && state_homes.is_some() {
-            Err(RepeatGapFailure::ObservedDistinctHomes)
-        } else {
-            Err(RepeatGapFailure::MissingHomeFacts)
-        };
+        return Err(RepeatGapFailure::ObservedDistinctHomes);
     }
 
     let mut writes = PhysicalBindingWriteCollector::default();
@@ -377,7 +363,11 @@ fn repeat_gap_safety(
                 BindingHomeOverlap::Disjoint => {}
                 BindingHomeOverlap::Overlap => return Err(RepeatGapFailure::AliasingWrite),
                 BindingHomeOverlap::Unknown => {
-                    return Err(RepeatGapFailure::MissingHomeFacts);
+                    let write_homes = conservative_binding_homes(write, promotion_facts);
+                    let candidate_homes = conservative_binding_homes(candidate, promotion_facts);
+                    if !write_homes.is_disjoint(&candidate_homes) {
+                        return Err(RepeatGapFailure::AliasingWrite);
+                    }
                 }
             }
         }
@@ -385,15 +375,16 @@ fn repeat_gap_safety(
     Ok(())
 }
 
-fn possible_binding_homes(
+fn conservative_binding_homes(
     binding: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
-) -> Option<BTreeSet<crate::hir::promotion::HomeSlotKey>> {
-    match binding {
+) -> BTreeSet<crate::hir::promotion::HomeSlotKey> {
+    let homes = match binding {
         CarryBinding::Param(param) => promotion_facts.possible_param_home_slots(param),
         CarryBinding::Local(local) => promotion_facts.possible_local_home_slots(local),
         CarryBinding::Temp(temp) => promotion_facts.possible_temp_home_slots(temp),
-    }
+    };
+    homes.unwrap_or_else(|| promotion_facts.physical_home_universe().clone())
 }
 
 #[derive(Default)]
@@ -620,20 +611,20 @@ fn seed_reaches_consistent_epoch(
     Ok(())
 }
 
-fn stmts_have_decision_or_unresolved(stmts: &[HirStmt]) -> bool {
-    let mut collector = OpaqueCollector::default();
+fn stmts_have_unresolved(stmts: &[HirStmt]) -> bool {
+    let mut collector = UnresolvedCollector::default();
     visit_stmts(stmts, &mut collector);
-    collector.opaque
+    collector.found
 }
 
 #[derive(Default)]
-struct OpaqueCollector {
-    opaque: bool,
+struct UnresolvedCollector {
+    found: bool,
 }
 
-impl HirVisitor for OpaqueCollector {
+impl HirVisitor for UnresolvedCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.opaque |= matches!(expr, HirExpr::Decision(_) | HirExpr::Unresolved(_));
+        self.found |= matches!(expr, HirExpr::Unresolved(_));
     }
 }
 
@@ -886,7 +877,8 @@ mod tests {
     use super::*;
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirBinaryExpr, HirBinaryOpKind, HirClose, HirGlobalDecl, HirGoto, HirIf, HirLabel,
+        HirBinaryExpr, HirBinaryOpKind, HirClose, HirDecisionExpr, HirDecisionNode,
+        HirDecisionNodeRef, HirDecisionTarget, HirGlobalDecl, HirGoto, HirIf, HirLabel,
         HirLocalDecl, HirRepeat, HirValuePack, HirWhile,
     };
     use crate::hir::promotion::HomeSlotKey;
@@ -910,6 +902,18 @@ mod tests {
             op: HirBinaryOpKind::Add,
             lhs,
             rhs,
+        }))
+    }
+
+    fn decision(test: HirExpr) -> HirExpr {
+        HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test,
+                truthy: HirDecisionTarget::CurrentValue,
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
         }))
     }
 
@@ -1143,6 +1147,45 @@ mod tests {
     }
 
     #[test]
+    fn repeat_tail_update_rewrites_disjoint_decision_gap() {
+        let state = LocalId(0);
+        let next = TempId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                local_decl(state),
+                HirStmt::Repeat(Box::new(HirRepeat {
+                    body: HirBlock {
+                        stmts: vec![
+                            assign(
+                                HirLValue::Temp(next),
+                                add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
+                            ),
+                            HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+                                names: vec!["snapshot".to_owned()],
+                                values: HirValuePack::fixed(vec![decision(HirExpr::TempRef(next))]),
+                            })),
+                            assign(HirLValue::Local(state), HirExpr::TempRef(next)),
+                        ],
+                    },
+                    cond: HirExpr::TempRef(next),
+                })),
+            ],
+        };
+        let mut promotion_facts = exact_home_facts(state, next);
+
+        assert!(run_fold(&mut block, &mut promotion_facts));
+        let HirStmt::Repeat(repeat_stmt) = &block.stmts[1] else {
+            unreachable!()
+        };
+        let mentions =
+            super::super::reads::collect_binding_mentions_by_stmt(&repeat_stmt.body.stmts);
+        assert!(mentions.iter().all(|mentions| {
+            !mentions.contains(&CarryBinding::Temp(next))
+                && mentions.contains(&CarryBinding::Local(state))
+        }));
+    }
+
+    #[test]
     fn repeat_tail_update_accepts_effect_free_gap_with_disjoint_writes() {
         let state = LocalId(0);
         let scratch = LocalId(1);
@@ -1199,6 +1242,7 @@ mod tests {
         let before = block.clone();
         let mut promotion_facts = distinct_home_facts(state, next);
         promotion_facts.record_local_home_slot(alias, HomeSlotKey::new(0, 0));
+        promotion_facts.record_local_home_merge(alias, None);
 
         assert!(!run_fold(&mut block, &mut promotion_facts));
         assert_eq!(block, before);
@@ -1231,6 +1275,7 @@ mod tests {
         };
         let before = block.clone();
         let mut promotion_facts = distinct_home_facts(state, next);
+        promotion_facts.invalidate_temp_home(next);
 
         assert!(!run_fold(&mut block, &mut promotion_facts));
         assert_eq!(block, before);
@@ -1567,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn nonadjacent_repeat_tail_update_keeps_invalid_home_provenance() {
+    fn nonadjacent_repeat_tail_update_accepts_unknown_home_in_single_home_proto() {
         let state = LocalId(0);
         let next = TempId(0);
         let mut block = HirBlock {
@@ -1591,12 +1636,10 @@ mod tests {
                 })),
             ],
         };
-        let before = block.clone();
         let mut promotion_facts = exact_home_facts(state, next);
         promotion_facts.invalidate_temp_home(next);
 
-        assert!(!run_fold(&mut block, &mut promotion_facts));
-        assert_eq!(block, before);
+        assert!(run_fold(&mut block, &mut promotion_facts));
     }
 
     fn local_update_with_prefix(prefix: Vec<HirStmt>) -> (HirBlock, LocalId, LocalId) {

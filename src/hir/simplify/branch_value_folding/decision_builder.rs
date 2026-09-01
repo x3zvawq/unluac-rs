@@ -255,7 +255,7 @@ impl BranchValueDecisionBuilder {
                 unreachable!("branch-value root cannot borrow a parent test value")
             }
         };
-        // 候选拒绝[LayerBoundary]：Lua `and/or` 不能承载一般三元值 DAG；这里若把
+        // 候选拒绝[TargetConstraint]：Lua `and/or` 不能承载一般三元值 DAG；这里若把
         // residual Decision 安装回 raw temp assignment，eliminate-decisions 物化后会与
         // 本 pass 来回振荡，因此保留原控制树由它直接表达互斥求值。
         (!matches!(value, HirExpr::Decision(_))).then_some((value, self.raw_guards))

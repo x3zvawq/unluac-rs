@@ -405,9 +405,9 @@ fn stmt_contains_single_pass_forbidden_nodes(stmt: &AstStmt, loop_depth: usize) 
         }
         // 候选拒绝[SemanticBarrier:ControlFlow]：当前 loop owner 的 continue 会绕过外层 latch/fence 尾部求值（regress_294）；嵌套 owner 则原位保留。
         AstStmt::Continue => loop_depth == 0,
-        // 候选拒绝[LayerBoundary]：显式 goto/label 子图的入口、回边与 owner 属于
-        // Structure/HIR reducible-control 恢复；branch-pretty 只消费已结构化的 break tree，
-        // 不在 AST 重新解释 CFG（regress_368）。
+        // 候选拒绝[SemanticBarrier:ControlFlow]：显式 goto 可从待搬动区间外进入
+        // label，也可回跳到区间头；把线性尾部收入单次 break arm 会删除
+        // 外部入口或后续迭代（regress_368）。
         AstStmt::Goto(_) | AstStmt::Label(_) => true,
         // 候选拒绝[PolicyBoundary]：项目要求 Error 诊断原位保留，不参与展示层控制重建。
         AstStmt::Error(_) => true,

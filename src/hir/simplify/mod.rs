@@ -193,7 +193,18 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "eliminate-decisions",
         phase: PassPhase::Deferred,
         depends_on: &[DecisionShape],
-        invalidates: &[DecisionShape],
+        // Decision 线性化不只是删掉一个表达式节点：它会插入 if/block、home-free local、
+        // temp/local assignment，并暴露新的逻辑、布尔壳和 table 相邻形状。把这些真实产出
+        // 全部标脏，Normal consumers 才能在 owner 消费后重新审计原候选。
+        invalidates: &[
+            DecisionShape,
+            BooleanPattern,
+            LogicalExpr,
+            TablePattern,
+            TempChain,
+            LocalBinding,
+            BlockStructure,
+        ],
     },
     PassDescriptor {
         name: "debug-scopes",
@@ -472,4 +483,32 @@ fn emit_hir_pass_diff_if_requested(
     _module: &HirModule,
     _filters: &DebugFilters,
 ) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_elimination_invalidates_every_materialized_shape() {
+        let descriptor = PASS_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.name == "eliminate-decisions")
+            .expect("eliminate-decisions descriptor must exist");
+
+        for shape in [
+            DecisionShape,
+            BooleanPattern,
+            LogicalExpr,
+            TablePattern,
+            TempChain,
+            LocalBinding,
+            BlockStructure,
+        ] {
+            assert!(
+                descriptor.invalidates.contains(&shape),
+                "materialized shape {shape:?} must wake its Normal consumers"
+            );
+        }
+    }
 }

@@ -4,8 +4,9 @@
 //! 与 raw home 的 `GC-inert / 可承载资源 / 证明不完整`；分支合流保留任一路径上的资源
 //! 可能，循环对回边求有限不动点。
 //! 分析阶段只记录完整语句路径，验证结束后才一次性应用删除，避免边改边算让 reaching
-//! value 漂移。同 block 单调 forward goto 可直接跳到唯一 label；跨 block、跳出与回边仍由
-//! region CFG owner 维护，本分析不在线性 HIR 上猜 predecessor。
+//! value 漂移。同 block 单调 forward goto 可直接跳到唯一 label；含跨层或回边 goto 的
+//! 区域按显式控制边界切成独立小岛，每个小岛从资源保守状态重新证明，避免一个非结构化
+//! 区域停用整个 proto，也避免在线性 HIR 上猜 predecessor。
 //! 值是否 GC-inert 由外层传入的目标方言安全上下文判定，避免 reaching class 与删除证明漂移。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,9 +19,10 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::{
     BindingRelation, BooleanShellFacts, DeadShellOldValueFacts, OldValueClass,
-    possible_home_relation,
+    complete_possible_home_slots, possible_home_relation,
 };
 use crate::hir::simplify::expr_facts::expr_truthiness;
+use crate::hir::simplify::temp_touch::stmt_contains_nested_nonlocal_control;
 use crate::hir::simplify::visit::{self, HirVisitor};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -46,14 +48,6 @@ impl DeadShellPlan {
         promotion_facts: &ProtoPromotionFacts,
         safety: HirExprSafety,
     ) -> Self {
-        let mut boundary = AnalysisBoundary::default();
-        visit::visit_proto(proto, &mut boundary);
-        if boundary.unstructured_control {
-            // 分析停用[LayerBoundary]：跨 block、嵌套跳出或回边 goto 需要 region CFG
-            // owner 的 predecessor/reaching-state；本层只消费同 block 单调 forward edge。
-            return Self::default();
-        }
-
         let mut candidates = CandidateValues {
             locals: BTreeSet::new(),
             homes: BTreeSet::new(),
@@ -92,17 +86,6 @@ impl DeadShellPlan {
     }
 }
 
-#[derive(Default)]
-struct AnalysisBoundary {
-    unstructured_control: bool,
-}
-
-impl HirVisitor for AnalysisBoundary {
-    fn visit_block(&mut self, block: &HirBlock) {
-        self.unstructured_control |= forward_label_indices(block).is_none();
-    }
-}
-
 fn forward_label_indices(block: &HirBlock) -> Option<BTreeMap<crate::hir::HirLabelId, usize>> {
     let mut labels = BTreeMap::new();
     for (index, stmt) in block.stmts.iter().enumerate() {
@@ -125,6 +108,37 @@ fn forward_label_indices(block: &HirBlock) -> Option<BTreeMap<crate::hir::HirLab
         }
     }
     Some(labels)
+}
+
+fn forward_control_is_self_contained(block: &HirBlock) -> bool {
+    forward_label_indices(block).is_some()
+        && block.stmts.iter().all(|stmt| match stmt {
+            HirStmt::If(if_stmt) => {
+                forward_control_is_self_contained(&if_stmt.then_block)
+                    && if_stmt
+                        .else_block
+                        .as_ref()
+                        .is_none_or(forward_control_is_self_contained)
+            }
+            HirStmt::While(while_stmt) => forward_control_is_self_contained(&while_stmt.body),
+            HirStmt::Repeat(repeat_stmt) => forward_control_is_self_contained(&repeat_stmt.body),
+            HirStmt::NumericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
+            HirStmt::GenericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
+            HirStmt::Block(nested) => forward_control_is_self_contained(nested),
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => true,
+        })
 }
 
 struct CandidateValues<'a> {
@@ -151,9 +165,11 @@ impl HirVisitor for CandidateValues<'_> {
         if let HirLValue::Local(local) = then_target {
             self.locals.insert(*local);
         }
-        if let HirLValue::Temp(temp) = then_target
-            && let Some(homes) = self.promotion_facts.possible_temp_home_slots(*temp)
-        {
+        if let HirLValue::Temp(temp) = then_target {
+            let homes = complete_possible_home_slots(
+                self.promotion_facts.possible_temp_home_slots(*temp),
+                self.promotion_facts,
+            );
             self.homes.extend(homes.iter().copied());
             if homes.len() == 1 && self.promotion_facts.overwrites_entry_nil(*temp) {
                 self.entry_nil_homes.extend(homes);
@@ -162,9 +178,11 @@ impl HirVisitor for CandidateValues<'_> {
         if let HirLValue::Local(local) = else_target {
             self.locals.insert(*local);
         }
-        if let HirLValue::Temp(temp) = else_target
-            && let Some(homes) = self.promotion_facts.possible_temp_home_slots(*temp)
-        {
+        if let HirLValue::Temp(temp) = else_target {
+            let homes = complete_possible_home_slots(
+                self.promotion_facts.possible_temp_home_slots(*temp),
+                self.promotion_facts,
+            );
             self.homes.extend(homes.iter().copied());
             if homes.len() == 1 && self.promotion_facts.overwrites_entry_nil(*temp) {
                 self.entry_nil_homes.extend(homes);
@@ -285,8 +303,11 @@ impl OldValueAnalyzer<'_> {
         prefix: &[PathComponent],
         mut state: Option<OldValueState>,
     ) -> InertFlow {
+        if !forward_control_is_self_contained(block) {
+            return self.analyze_unstructured_block(block, prefix);
+        }
         let label_indices = forward_label_indices(block)
-            .expect("old-value analysis boundary must validate local forward labels");
+            .expect("self-contained forward control must retain local labels");
         let mut breaks = None;
         let mut continues = None;
         let mut index = 0;
@@ -312,6 +333,101 @@ impl OldValueAnalyzer<'_> {
             fallthrough: state,
             breaks,
             continues,
+        }
+    }
+
+    fn analyze_unstructured_block(
+        &mut self,
+        block: &HirBlock,
+        prefix: &[PathComponent],
+    ) -> InertFlow {
+        let conservative = OldValueState {
+            local_classes: self
+                .candidate_locals
+                .iter()
+                .copied()
+                .map(|local| (local, OldValueClass::MayCarryResource))
+                .collect(),
+            home_classes: self
+                .candidate_homes
+                .iter()
+                .copied()
+                .map(|home| (home, OldValueClass::MayCarryResource))
+                .collect(),
+        };
+        let mut state = Some(conservative.clone());
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            let mut path = prefix.to_vec();
+            path.push(PathComponent::Stmt(index));
+            if stmt_contains_nested_nonlocal_control(stmt) {
+                self.analyze_unstructured_children(stmt, &path);
+                // 分析停用[SemanticBarrier:ControlFlow]：label/goto 可绕过此前写入，回边还
+                // 会带入上一轮值；`::L:: shell(x); x = {}; goto L` 的第二轮旧值可承载资源。
+                state = Some(conservative.clone());
+                continue;
+            }
+            let Some(incoming) = state.take() else {
+                continue;
+            };
+            state = self.analyze_stmt(stmt, &path, incoming).fallthrough;
+        }
+        InertFlow {
+            fallthrough: Some(conservative.clone()),
+            breaks: Some(conservative.clone()),
+            continues: Some(conservative),
+        }
+    }
+
+    fn analyze_unstructured_children(&mut self, stmt: &HirStmt, path: &StmtPath) {
+        match stmt {
+            HirStmt::If(if_stmt) => {
+                let mut then_prefix = path.clone();
+                then_prefix.push(PathComponent::Then);
+                let _ = self.analyze_unstructured_block(&if_stmt.then_block, &then_prefix);
+                if let Some(else_block) = &if_stmt.else_block {
+                    let mut else_prefix = path.clone();
+                    else_prefix.push(PathComponent::Else);
+                    let _ = self.analyze_unstructured_block(else_block, &else_prefix);
+                }
+            }
+            HirStmt::While(while_stmt) => {
+                let mut body_prefix = path.clone();
+                body_prefix.push(PathComponent::Body);
+                let _ = self.analyze_unstructured_block(&while_stmt.body, &body_prefix);
+            }
+            HirStmt::Repeat(repeat_stmt) => {
+                let mut body_prefix = path.clone();
+                body_prefix.push(PathComponent::Body);
+                let _ = self.analyze_unstructured_block(&repeat_stmt.body, &body_prefix);
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                let mut body_prefix = path.clone();
+                body_prefix.push(PathComponent::Body);
+                let _ = self.analyze_unstructured_block(&for_stmt.body, &body_prefix);
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                let mut body_prefix = path.clone();
+                body_prefix.push(PathComponent::Body);
+                let _ = self.analyze_unstructured_block(&for_stmt.body, &body_prefix);
+            }
+            HirStmt::Block(nested) => {
+                let mut body_prefix = path.clone();
+                body_prefix.push(PathComponent::Body);
+                let _ = self.analyze_unstructured_block(nested, &body_prefix);
+            }
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
         }
     }
 
@@ -594,32 +710,38 @@ impl OldValueAnalyzer<'_> {
 
     fn local_binding_relation(&self, target: &HirLValue, candidate: LocalId) -> BindingRelation {
         let candidate_home = self.promotion_facts.trusted_local_home_slot(candidate);
-        let candidate_homes = self.promotion_facts.possible_local_home_slots(candidate);
+        let candidate_homes = complete_possible_home_slots(
+            self.promotion_facts.possible_local_home_slots(candidate),
+            self.promotion_facts,
+        );
         match target {
             HirLValue::Local(local) if *local == candidate => BindingRelation::Definite,
             HirLValue::Local(local) => possible_home_relation(
                 candidate_home,
-                candidate_homes.as_ref(),
+                Some(&candidate_homes),
                 self.promotion_facts.trusted_local_home_slot(*local),
-                self.promotion_facts
-                    .possible_local_home_slots(*local)
-                    .as_ref(),
+                Some(&complete_possible_home_slots(
+                    self.promotion_facts.possible_local_home_slots(*local),
+                    self.promotion_facts,
+                )),
             ),
             HirLValue::Param(param) => possible_home_relation(
                 candidate_home,
-                candidate_homes.as_ref(),
+                Some(&candidate_homes),
                 self.promotion_facts.trusted_param_home_slot(*param),
-                self.promotion_facts
-                    .possible_param_home_slots(*param)
-                    .as_ref(),
+                Some(&complete_possible_home_slots(
+                    self.promotion_facts.possible_param_home_slots(*param),
+                    self.promotion_facts,
+                )),
             ),
             HirLValue::Temp(temp) => possible_home_relation(
                 candidate_home,
-                candidate_homes.as_ref(),
+                Some(&candidate_homes),
                 self.promotion_facts.trusted_temp_home_slot(*temp),
-                self.promotion_facts
-                    .possible_temp_home_slots(*temp)
-                    .as_ref(),
+                Some(&complete_possible_home_slots(
+                    self.promotion_facts.possible_temp_home_slots(*temp),
+                    self.promotion_facts,
+                )),
             ),
             HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
                 BindingRelation::None
@@ -633,25 +755,28 @@ impl OldValueAnalyzer<'_> {
                 Some(candidate),
                 None,
                 self.promotion_facts.trusted_temp_home_slot(*temp),
-                self.promotion_facts
-                    .possible_temp_home_slots(*temp)
-                    .as_ref(),
+                Some(&complete_possible_home_slots(
+                    self.promotion_facts.possible_temp_home_slots(*temp),
+                    self.promotion_facts,
+                )),
             ),
             HirLValue::Param(param) => possible_home_relation(
                 Some(candidate),
                 None,
                 self.promotion_facts.trusted_param_home_slot(*param),
-                self.promotion_facts
-                    .possible_param_home_slots(*param)
-                    .as_ref(),
+                Some(&complete_possible_home_slots(
+                    self.promotion_facts.possible_param_home_slots(*param),
+                    self.promotion_facts,
+                )),
             ),
             HirLValue::Local(local) => possible_home_relation(
                 Some(candidate),
                 None,
                 self.promotion_facts.trusted_local_home_slot(*local),
-                self.promotion_facts
-                    .possible_local_home_slots(*local)
-                    .as_ref(),
+                Some(&complete_possible_home_slots(
+                    self.promotion_facts.possible_local_home_slots(*local),
+                    self.promotion_facts,
+                )),
             ),
             HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
                 BindingRelation::None
@@ -686,8 +811,8 @@ fn shell_has_old_value_target(stmt: &HirStmt, facts: &ProtoPromotionFacts) -> bo
     };
     matches!(then_target, HirLValue::Local(_))
         || matches!(else_target, HirLValue::Local(_))
-        || matches!(then_target, HirLValue::Temp(temp) if facts.home_slot(*temp).is_some())
-        || matches!(else_target, HirLValue::Temp(temp) if facts.home_slot(*temp).is_some())
+        || matches!(then_target, HirLValue::Temp(temp) if !complete_possible_home_slots(facts.possible_temp_home_slots(*temp), facts).is_empty())
+        || matches!(else_target, HirLValue::Temp(temp) if !complete_possible_home_slots(facts.possible_temp_home_slots(*temp), facts).is_empty())
 }
 
 fn assigned_value_class(

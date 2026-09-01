@@ -36,7 +36,7 @@ use assignments::*;
 use binding_facts::*;
 use conditions::*;
 pub(super) use flow::collapse_result_writeback_transactions;
-use flow::{expr_has_forbidden_nodes, region_has_forbidden_nodes};
+use flow::{expr_has_hard_barrier, region_has_hard_barrier};
 use parallel::*;
 use rewrites::*;
 
@@ -123,8 +123,16 @@ pub(super) fn collapse_inferred_if_result_chains(
             let HirStmt::If(if_stmt) = block.stmts.get(region_index)? else {
                 return None;
             };
-            if region_has_forbidden_nodes(&block.stmts[region_index..=region_index]) {
-                // 候选拒绝[LayerBoundary]：goto/close/Decision 等边界分别由 CFG/resource/decision owner 消费。
+            if region_has_hard_barrier(&block.stmts[region_index..=region_index])
+                || bindings_are_mentioned_in_exprs(std::iter::once(&if_stmt.cond), &results)
+            {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过 tracked fallthrough
+                // assignment，使改名后的 seed 在未产出 result 的路径上保持旧值。
+                // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变
+                // resource 所属 cell 的 close/root epoch。
+                // 候选拒绝[SemanticBarrier:ValueFlow]：condition 读取空 result 时原值为 nil；
+                // 改名后会读取 seed 的旧值并可能选择另一分支。
+                // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
                 return None;
             }
             let exits = if_fallthrough_assignments(if_stmt, &results)?;
@@ -296,10 +304,12 @@ pub(super) fn collapse_written_back_if_results(
             || facts.reads.contains_key(&result)
             || facts.writes.get(&result).copied() != Some(exits.len())
             || (facts.writes.contains_key(&state) && !state_writes_preserve_result)
-            || region_has_forbidden_nodes(&block.stmts[index + 1..=index + 1])
+            || region_has_hard_barrier(&block.stmts[index + 1..=index + 1])
         {
             // 候选拒绝[SemanticBarrier:Lifetime]：capture/outer use、异槽、额外 result mention 或 state 被独立写入时，改名会合并可区分 epoch。
-            // 候选拒绝[LayerBoundary]：forbidden-node region 的 goto/cleanup/Decision 分别由 CFG、资源与 decision owner 消费。
+            // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过 tracked result write。
+            // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
+            // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
             index += 1;
             continue;
         }
@@ -426,8 +436,14 @@ fn try_collapse_seeded_if_results(
     let Some(HirStmt::If(if_stmt)) = block.stmts.get(cursor) else {
         return false;
     };
-    if region_has_forbidden_nodes(&block.stmts[cursor..=cursor]) {
-        // 候选拒绝[LayerBoundary]：非结构控制、cleanup 与残留 Decision 不由 seeded-if owner 展开。
+    if region_has_hard_barrier(&block.stmts[cursor..=cursor])
+        || bindings_are_mentioned_in_exprs(std::iter::once(&if_stmt.cond), &results)
+    {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过某条 tracked exit assignment。
+        // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
+        // 候选拒绝[SemanticBarrier:ValueFlow]：condition 读取空 result 时，改名会把 nil
+        // 换成 seed 旧值并可能选择另一分支。
+        // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
         return false;
     }
     let Some(exits) = if_fallthrough_assignments(if_stmt, &results) else {
@@ -483,8 +499,14 @@ fn try_collapse_inferred_if_results(
     let Some(HirStmt::If(if_stmt)) = block.stmts.get(cursor) else {
         return false;
     };
-    if region_has_forbidden_nodes(&block.stmts[cursor..=cursor]) {
-        // 候选拒绝[LayerBoundary]：goto/close/Decision 等边界需先由各自 owner 消费。
+    if region_has_hard_barrier(&block.stmts[cursor..=cursor])
+        || bindings_are_mentioned_in_exprs(std::iter::once(&if_stmt.cond), &results)
+    {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过某条 tracked exit assignment。
+        // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
+        // 候选拒绝[SemanticBarrier:ValueFlow]：condition 读取空 result 时，改名会把 nil
+        // 换成 seed 旧值并可能选择另一分支。
+        // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
         return false;
     }
     let Some(exits) = if_fallthrough_assignments(if_stmt, &results) else {
@@ -543,19 +565,19 @@ fn try_collapse_loop_results(
             &repeat_stmt.body,
             repeat_stmt.cond != HirExpr::Boolean(false),
             repeat_stmt.cond != HirExpr::Boolean(true),
-            expr_has_forbidden_nodes(&repeat_stmt.cond),
+            expr_has_hard_barrier(&repeat_stmt.cond),
         ),
         _ => return false,
     };
     let mut exits = Vec::new();
-    // 内层 loop 的 break/continue 归内层 owner，但跳转、cleanup 或残留 Decision 都
-    // 可能绕过 result 写回；这类边界不能交给 `collect_break_assignments` 猜测。
+    // 内层 loop 的 break/continue 归内层 owner，但跳转、cleanup 或 Unresolved 可能
+    // 绕过/隐藏 result 写回；这类边界不能交给 `collect_break_assignments` 猜测。
     if condition_forbidden
-        || region_has_forbidden_nodes(&body.stmts)
+        || region_has_hard_barrier(&body.stmts)
         || !collect_break_assignments(body, &mut exits, requires_exact_exits)
     {
         // 候选拒绝[SemanticBarrier:ControlFlow]：未跟踪 transfer 会漏掉 loop 出口，提交不完整 result->state 映射。
-        // 候选拒绝[LayerBoundary]：cleanup/Decision 分别由资源与 decision/eliminate owner 处理。
+        // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
         // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
         // region-result 不把未知路径并入普通 state 映射。
         return false;
@@ -696,7 +718,8 @@ fn rewrites_preserve_identity(
 mod tests {
     use super::*;
     use crate::hir::common::{
-        HirCallExpr, HirCallStmt, HirGlobalRef, HirRepeat, HirReturn, HirWhile, ParamId, TempId,
+        HirCallExpr, HirCallStmt, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
+        HirDecisionTarget, HirGlobalRef, HirRepeat, HirReturn, HirWhile, ParamId, TempId,
     };
     use crate::hir::promotion::HomeSlotKey;
 
@@ -709,6 +732,18 @@ mod tests {
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
         }
+    }
+
+    fn decision(test: HirExpr) -> HirExpr {
+        HirExpr::Decision(Box::new(HirDecisionExpr {
+            entry: HirDecisionNodeRef(0),
+            nodes: vec![HirDecisionNode {
+                id: HirDecisionNodeRef(0),
+                test,
+                truthy: HirDecisionTarget::CurrentValue,
+                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
+            }],
+        }))
     }
 
     fn single_fallthrough_result_block(terminating_value: HirExpr) -> HirBlock {
@@ -915,6 +950,45 @@ mod tests {
             panic!("the fallthrough arm should retain its producer assignment");
         };
         assert!(assign.targets == vec![HirLValue::Param(ParamId(0))]);
+    }
+
+    #[test]
+    fn written_back_if_accepts_disjoint_decision_condition() {
+        let mut block = single_fallthrough_result_block(HirExpr::Integer(9));
+        let HirStmt::If(if_stmt) = &mut block.stmts[1] else {
+            unreachable!()
+        };
+        if_stmt.cond = decision(HirExpr::TempRef(TempId(1)));
+        let mut facts = same_home_facts();
+
+        assert!(collapse_written_back_if_results(
+            &mut block,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut facts,
+            &empty_identity_facts(),
+        ));
+        assert!(matches!(block.stmts.as_slice(), [HirStmt::If(_)]));
+    }
+
+    #[test]
+    fn written_back_if_rejects_decision_condition_reading_empty_result() {
+        let mut block = single_fallthrough_result_block(HirExpr::Integer(9));
+        let HirStmt::If(if_stmt) = &mut block.stmts[1] else {
+            unreachable!()
+        };
+        if_stmt.cond = decision(HirExpr::LocalRef(LocalId(0)));
+        let original = block.clone();
+        let mut facts = same_home_facts();
+
+        assert!(!collapse_written_back_if_results(
+            &mut block,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut facts,
+            &empty_identity_facts(),
+        ));
+        assert!(block == original);
     }
 
     #[test]

@@ -29,6 +29,14 @@ pub(super) trait AstRewritePass {
         self.rewrite_block(block, BlockKind::Regular)
     }
 
+    fn rewrite_repeat_body_and_condition(
+        &mut self,
+        block: &mut AstBlock,
+        condition: &mut AstExpr,
+    ) -> bool {
+        self.rewrite_repeat_body(block, condition)
+    }
+
     fn rewrite_stmt(&mut self, _stmt: &mut AstStmt) -> bool {
         false
     }
@@ -152,7 +160,8 @@ pub(super) fn rewrite_stmt(stmt: &mut AstStmt, pass: &mut impl AstRewritePass) -
         for stmt in &mut repeat_stmt.body.stmts {
             nested_changed |= rewrite_stmt(stmt, pass);
         }
-        nested_changed |= pass.rewrite_repeat_body(&mut repeat_stmt.body, &repeat_stmt.cond);
+        nested_changed |=
+            pass.rewrite_repeat_body_and_condition(&mut repeat_stmt.body, &mut repeat_stmt.cond);
         nested_changed |= rewrite_condition_expr(&mut repeat_stmt.cond, pass);
         return pass.rewrite_stmt(stmt) || nested_changed;
     }
@@ -203,8 +212,7 @@ fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
             nested_changed |= rewrite_stmt_scoped(stmt, &child_scope, pass);
             body_scope = pass.scope_after_stmt(stmt, &body_scope);
         }
-        nested_changed |=
-            rewrite_condition_expr_scoped(&mut repeat_stmt.cond, &body_scope, pass);
+        nested_changed |= rewrite_condition_expr_scoped(&mut repeat_stmt.cond, &body_scope, pass);
         return pass.rewrite_stmt(stmt, scope) || block_changed || nested_changed;
     }
 

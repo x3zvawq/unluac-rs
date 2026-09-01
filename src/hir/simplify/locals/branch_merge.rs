@@ -14,7 +14,7 @@
 //! 输入形状：`if c then t1 = a else t1 = b end; use(t1)`。
 //! 输出形状：候选 temp 集合 `{ t1 }`，后续由主 pass 物化成 `local l; if c then l = a else l = b end`。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::super::expr_facts::expr_truthiness;
 use super::super::temp_touch::{
@@ -28,7 +28,6 @@ struct FallthroughSummary {
     falls_through: bool,
     assigned_temps: BTreeSet<TempId>,
     reads_before_assignment: BTreeSet<TempId>,
-    break_assigned_temps: Option<BTreeSet<TempId>>,
 }
 
 pub(super) fn candidate_temps(
@@ -45,15 +44,18 @@ pub(super) fn candidate_temps(
         return Vec::new();
     };
 
-    let (Some(then_summary), Some(else_summary)) = (
-        summarize_block_fallthrough_assignments(&if_stmt.then_block, safety),
-        summarize_block_fallthrough_assignments(else_block, safety),
-    ) else {
-        // 候选拒绝[LayerBoundary]：跨出当前 arm、嵌套语句内或回边 goto
-        // 需要 region CFG owner 的逃逸/重入与迭代 reaching-def，不属于本层
-        // forward-label 摘要能证明的路径。
+    let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block, safety);
+    let else_summary = summarize_block_fallthrough_assignments(else_block, safety);
+    if matches!(then_summary, Err(RegionCfgFailure::ExternalGoto))
+        || matches!(else_summary, Err(RegionCfgFailure::ExternalGoto))
+    {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：`if c then goto L else t=1 end;
+        // ::L:: use(t)` 的 arm 外 goto 可能重入当前 if 的外层后缀；这里没有目标边，
+        // 若把该路径当成终止路径会凭另一 arm 的写入错误物化 branch local。
         return Vec::new();
-    };
+    }
+    let then_summary = then_summary.expect("HIR label ids must be unique within a branch region");
+    let else_summary = else_summary.expect("HIR label ids must be unique within a branch region");
     let Some(common_temps) = intersect_fallthrough_assignment_sets([&then_summary, &else_summary])
     else {
         return Vec::new();
@@ -105,243 +107,339 @@ fn single_scalar_temp_write(block: &HirBlock) -> Option<TempId> {
 fn summarize_block_fallthrough_assignments(
     block: &HirBlock,
     safety: HirExprSafety,
-) -> Option<FallthroughSummary> {
-    let mut label_indices = BTreeMap::new();
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        let HirStmt::Label(label) = stmt else {
-            continue;
+) -> Result<FallthroughSummary, RegionCfgFailure> {
+    Ok(RegionCfg::build(block, safety)?.summarize())
+}
+
+type FlowNodeId = usize;
+
+#[derive(Default)]
+struct FlowNode {
+    reads: BTreeSet<TempId>,
+    writes: BTreeSet<TempId>,
+    successors: BTreeSet<FlowNodeId>,
+}
+
+struct RegionCfg {
+    nodes: Vec<FlowNode>,
+    entry: FlowNodeId,
+    exit: FlowNodeId,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RegionCfgFailure {
+    AmbiguousLabel,
+    ExternalGoto,
+}
+
+impl RegionCfg {
+    fn build(block: &HirBlock, safety: HirExprSafety) -> Result<Self, RegionCfgFailure> {
+        let mut builder = RegionCfgBuilder {
+            nodes: vec![FlowNode::default()],
+            labels: BTreeMap::new(),
+            pending_gotos: Vec::new(),
+            safety,
         };
-        if label_indices.insert(label.id, index).is_some() {
-            return None;
-        }
-    }
-
-    let mut assigned_temps = BTreeSet::new();
-    let mut reads_before_assignment = BTreeSet::new();
-    let mut break_assigned_temps = None;
-    let mut falls_through = true;
-    let mut index = 0;
-
-    while let Some(stmt) = block.stmts.get(index) {
-        if !falls_through {
-            break;
-        }
-
-        if let HirStmt::Goto(goto) = stmt {
-            let target_index = *label_indices.get(&goto.target)?;
-            // 本层只认领同 arm 的单调 forward edge；回边需要迭代 reaching-def，
-            // 交给拥有 loop/region 事实的结构 owner。
-            if target_index <= index {
-                return None;
-            }
-            index = target_index;
-            continue;
-        }
-
-        let stmt_summary = summarize_stmt_fallthrough_assignments(stmt, safety)?;
-        reads_before_assignment.extend(
-            stmt_summary
-                .reads_before_assignment
-                .difference(&assigned_temps)
-                .copied(),
-        );
-        if let Some(mut break_assignments) = stmt_summary.break_assigned_temps {
-            break_assignments.extend(assigned_temps.iter().copied());
-            intersect_optional_assignment_set(&mut break_assigned_temps, break_assignments);
-        }
-        if stmt_summary.falls_through {
-            assigned_temps.extend(stmt_summary.assigned_temps);
-        } else {
-            falls_through = false;
-        }
-        index += 1;
-    }
-
-    Some(FallthroughSummary {
-        falls_through,
-        assigned_temps,
-        reads_before_assignment,
-        break_assigned_temps,
-    })
-}
-
-fn summarize_stmt_fallthrough_assignments(
-    stmt: &HirStmt,
-    safety: HirExprSafety,
-) -> Option<FallthroughSummary> {
-    let reads = || {
-        collect_temp_reads_by_stmt(std::slice::from_ref(stmt))
-            .into_iter()
-            .next()
-            .unwrap_or_default()
-    };
-    match stmt {
-        HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Label(_) => Some(FallthroughSummary {
-            falls_through: true,
-            assigned_temps: BTreeSet::new(),
-            reads_before_assignment: reads(),
-            break_assigned_temps: None,
-        }),
-        HirStmt::Assign(assign) => Some(FallthroughSummary {
-            falls_through: true,
-            assigned_temps: assign
-                .targets
-                .iter()
-                .filter_map(|target| match target {
-                    HirLValue::Temp(temp) => Some(*temp),
-                    HirLValue::Param(_)
-                    | HirLValue::Local(_)
-                    | HirLValue::Upvalue(_)
-                    | HirLValue::Global(_)
-                    | HirLValue::TableAccess(_) => None,
-                })
-                .collect(),
-            // Lua 平行赋值先求完全部 RHS/复合左值，再提交直接 binding 写入。
-            reads_before_assignment: reads(),
-            break_assigned_temps: None,
-        }),
-        HirStmt::TableSetList(_) => Some(FallthroughSummary {
-            falls_through: true,
-            assigned_temps: BTreeSet::new(),
-            reads_before_assignment: reads(),
-            break_assigned_temps: None,
-        }),
-        HirStmt::Goto(_) => None,
-        HirStmt::Break => Some(FallthroughSummary {
-            falls_through: false,
-            assigned_temps: BTreeSet::new(),
-            reads_before_assignment: BTreeSet::new(),
-            break_assigned_temps: Some(BTreeSet::new()),
-        }),
-        HirStmt::Return(_) | HirStmt::Continue => Some(FallthroughSummary {
-            falls_through: false,
-            assigned_temps: BTreeSet::new(),
-            reads_before_assignment: reads(),
-            break_assigned_temps: None,
-        }),
-        HirStmt::If(if_stmt) => {
-            let then_summary =
-                summarize_block_fallthrough_assignments(&if_stmt.then_block, safety)?;
-            let else_summary = match if_stmt.else_block.as_ref() {
-                Some(else_block) => summarize_block_fallthrough_assignments(else_block, safety)?,
-                None => FallthroughSummary {
-                    falls_through: true,
-                    assigned_temps: BTreeSet::new(),
-                    reads_before_assignment: BTreeSet::new(),
-                    break_assigned_temps: None,
-                },
-            };
-            let assigned_temps =
-                intersect_fallthrough_assignment_sets([&then_summary, &else_summary])
-                    .unwrap_or_default();
-            let reads_before_assignment = collect_temp_refs_in_expr(&if_stmt.cond)
-                .into_iter()
-                .chain(then_summary.reads_before_assignment.iter().copied())
-                .chain(else_summary.reads_before_assignment.iter().copied())
-                .collect();
-            let mut break_assigned_temps = None;
-            if let Some(assignments) = then_summary.break_assigned_temps {
-                intersect_optional_assignment_set(&mut break_assigned_temps, assignments);
-            }
-            if let Some(assignments) = else_summary.break_assigned_temps {
-                intersect_optional_assignment_set(&mut break_assigned_temps, assignments);
-            }
-
-            Some(FallthroughSummary {
-                falls_through: then_summary.falls_through || else_summary.falls_through,
-                assigned_temps,
-                reads_before_assignment,
-                break_assigned_temps,
-            })
-        }
-        HirStmt::Block(block) => summarize_block_fallthrough_assignments(block, safety),
-        HirStmt::While(while_stmt) => {
-            let body = summarize_block_fallthrough_assignments(&while_stmt.body, safety)?;
-            let condition_is_true = expr_truthiness(&while_stmt.cond, safety) == Some(true);
-            let assigned_temps = condition_is_true
-                .then(|| body.break_assigned_temps.clone())
-                .flatten()
-                .unwrap_or_default();
-            Some(FallthroughSummary {
-                // 常真 while 只经 break 合流；其它 while 保留零次执行路径。
-                falls_through: !condition_is_true || body.break_assigned_temps.is_some(),
-                assigned_temps,
-                reads_before_assignment: collect_temp_refs_in_expr(&while_stmt.cond)
-                    .into_iter()
-                    .chain(body.reads_before_assignment)
-                    .collect(),
-                // 当前 loop 消费 body 的 break，不能把它传播给外层 loop。
-                break_assigned_temps: None,
-            })
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            let body = summarize_block_fallthrough_assignments(&repeat_stmt.body, safety)?;
-            let mut reads_before_assignment = body.reads_before_assignment;
-            if body.falls_through {
-                reads_before_assignment.extend(
-                    collect_temp_refs_in_expr(&repeat_stmt.cond)
-                        .difference(&body.assigned_temps)
-                        .copied(),
-                );
+        let exit = 0;
+        let entry = builder
+            .build_block(&block.stmts, exit, None, None)
+            .ok_or(RegionCfgFailure::AmbiguousLabel)?;
+        let mut external_goto_sources = Vec::new();
+        for (source, target) in builder.pending_gotos {
+            // Direct and nested local labels are resolved against the complete region
+            // map, including backward edges. An outer target cannot be classified as
+            // a terminal edge without the owner block, so report it to the caller.
+            if let Some(&target) = builder.labels.get(&target) {
+                builder.nodes[source].successors.insert(target);
             } else {
-                // continue 也会到达 repeat condition；当前 summary 不区分 continue 与
-                // return/break，因此无普通 fallthrough 时保守保留全部 condition 读取。
-                reads_before_assignment.extend(collect_temp_refs_in_expr(&repeat_stmt.cond));
+                external_goto_sources.push(source);
             }
-            Some(FallthroughSummary {
-                // break 路径可能绕过 body 后缀，当前摘要不把 body 写入承诺为 loop must-def。
-                falls_through: true,
-                assigned_temps: BTreeSet::new(),
-                reads_before_assignment,
-                break_assigned_temps: None,
-            })
         }
-        HirStmt::NumericFor(numeric_for) => {
-            let body = summarize_block_fallthrough_assignments(&numeric_for.body, safety)?;
-            Some(FallthroughSummary {
-                falls_through: true,
-                assigned_temps: BTreeSet::new(),
-                reads_before_assignment: collect_temp_refs_in_expr(&numeric_for.start)
-                    .into_iter()
-                    .chain(collect_temp_refs_in_expr(&numeric_for.limit))
-                    .chain(collect_temp_refs_in_expr(&numeric_for.step))
-                    .chain(body.reads_before_assignment)
-                    .collect(),
-                break_assigned_temps: None,
-            })
+        let reachable = reachable_flow_nodes(&builder.nodes, entry);
+        if external_goto_sources
+            .into_iter()
+            .any(|source| reachable[source])
+        {
+            return Err(RegionCfgFailure::ExternalGoto);
         }
-        HirStmt::GenericFor(generic_for) => {
-            let body = summarize_block_fallthrough_assignments(&generic_for.body, safety)?;
-            let iterator_reads = generic_for
-                .iterator
-                .iter()
-                .flat_map(collect_temp_refs_in_expr);
-            Some(FallthroughSummary {
-                falls_through: true,
-                assigned_temps: BTreeSet::new(),
-                reads_before_assignment: iterator_reads
-                    .chain(body.reads_before_assignment)
-                    .collect(),
-                break_assigned_temps: None,
-            })
+        Ok(Self {
+            nodes: builder.nodes,
+            entry,
+            exit,
+        })
+    }
+
+    fn summarize(&self) -> FallthroughSummary {
+        let mut incoming = vec![None::<BTreeSet<TempId>>; self.nodes.len()];
+        incoming[self.entry] = Some(BTreeSet::new());
+        let mut pending = VecDeque::from([self.entry]);
+
+        while let Some(node_id) = pending.pop_front() {
+            let mut outgoing = incoming[node_id]
+                .clone()
+                .expect("worklist only contains reachable CFG nodes");
+            outgoing.extend(self.nodes[node_id].writes.iter().copied());
+            for &successor in &self.nodes[node_id].successors {
+                let changed = match &mut incoming[successor] {
+                    Some(current) => {
+                        let intersection = current
+                            .intersection(&outgoing)
+                            .copied()
+                            .collect::<BTreeSet<_>>();
+                        if *current == intersection {
+                            false
+                        } else {
+                            *current = intersection;
+                            true
+                        }
+                    }
+                    slot @ None => {
+                        *slot = Some(outgoing.clone());
+                        true
+                    }
+                };
+                if changed {
+                    pending.push_back(successor);
+                }
+            }
+        }
+
+        let reads_before_assignment = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(node_id, node)| incoming[node_id].as_ref().map(|defs| (node, defs)))
+            .flat_map(|(node, defs)| node.reads.difference(defs).copied())
+            .collect();
+        let assigned_temps = incoming[self.exit].clone().unwrap_or_default();
+        FallthroughSummary {
+            falls_through: incoming[self.exit].is_some(),
+            assigned_temps,
+            reads_before_assignment,
         }
     }
 }
 
-fn intersect_optional_assignment_set(
-    intersection: &mut Option<BTreeSet<TempId>>,
-    assignments: BTreeSet<TempId>,
-) {
-    match intersection {
-        Some(current) => current.retain(|temp| assignments.contains(temp)),
-        None => *intersection = Some(assignments),
+fn reachable_flow_nodes(nodes: &[FlowNode], entry: FlowNodeId) -> Vec<bool> {
+    let mut reachable = vec![false; nodes.len()];
+    reachable[entry] = true;
+    let mut pending = vec![entry];
+    while let Some(node) = pending.pop() {
+        for &successor in &nodes[node].successors {
+            if !reachable[successor] {
+                reachable[successor] = true;
+                pending.push(successor);
+            }
+        }
     }
+    reachable
+}
+
+struct RegionCfgBuilder {
+    nodes: Vec<FlowNode>,
+    labels: BTreeMap<crate::hir::common::HirLabelId, FlowNodeId>,
+    pending_gotos: Vec<(FlowNodeId, crate::hir::common::HirLabelId)>,
+    safety: HirExprSafety,
+}
+
+impl RegionCfgBuilder {
+    fn new_node(
+        &mut self,
+        reads: BTreeSet<TempId>,
+        writes: BTreeSet<TempId>,
+        successors: impl IntoIterator<Item = FlowNodeId>,
+    ) -> FlowNodeId {
+        let id = self.nodes.len();
+        self.nodes.push(FlowNode {
+            reads,
+            writes,
+            successors: successors.into_iter().collect(),
+        });
+        id
+    }
+
+    fn build_block(
+        &mut self,
+        stmts: &[HirStmt],
+        next: FlowNodeId,
+        break_target: Option<FlowNodeId>,
+        continue_target: Option<FlowNodeId>,
+    ) -> Option<FlowNodeId> {
+        let mut entry = next;
+        for stmt in stmts.iter().rev() {
+            entry = self.build_stmt(stmt, entry, break_target, continue_target)?;
+        }
+        Some(entry)
+    }
+
+    fn build_stmt(
+        &mut self,
+        stmt: &HirStmt,
+        next: FlowNodeId,
+        break_target: Option<FlowNodeId>,
+        continue_target: Option<FlowNodeId>,
+    ) -> Option<FlowNodeId> {
+        match stmt {
+            HirStmt::Label(label) => {
+                let node = self.new_node(BTreeSet::new(), BTreeSet::new(), [next]);
+                if self.labels.insert(label.id, node).is_some() {
+                    return None;
+                }
+                Some(node)
+            }
+            HirStmt::Goto(goto) => {
+                let node = self.new_node(BTreeSet::new(), BTreeSet::new(), []);
+                self.pending_gotos.push((node, goto.target));
+                Some(node)
+            }
+            HirStmt::Break => Some(self.new_node(BTreeSet::new(), BTreeSet::new(), break_target)),
+            HirStmt::Continue => {
+                Some(self.new_node(BTreeSet::new(), BTreeSet::new(), continue_target))
+            }
+            HirStmt::Return(_) => Some(self.new_node(stmt_reads(stmt), BTreeSet::new(), [])),
+            HirStmt::Block(block) => {
+                self.build_block(&block.stmts, next, break_target, continue_target)
+            }
+            HirStmt::If(if_stmt) => {
+                let then_entry = self.build_block(
+                    &if_stmt.then_block.stmts,
+                    next,
+                    break_target,
+                    continue_target,
+                )?;
+                let else_entry = match &if_stmt.else_block {
+                    Some(block) => {
+                        self.build_block(&block.stmts, next, break_target, continue_target)?
+                    }
+                    None => next,
+                };
+                let successors = match expr_truthiness(&if_stmt.cond, self.safety) {
+                    Some(true) => vec![then_entry],
+                    Some(false) => vec![else_entry],
+                    None => vec![then_entry, else_entry],
+                };
+                Some(self.new_node(
+                    collect_temp_refs_in_expr(&if_stmt.cond),
+                    BTreeSet::new(),
+                    successors,
+                ))
+            }
+            HirStmt::While(while_stmt) => {
+                let condition = self.new_node(BTreeSet::new(), BTreeSet::new(), []);
+                let body = self.build_block(
+                    &while_stmt.body.stmts,
+                    condition,
+                    Some(next),
+                    Some(condition),
+                )?;
+                self.nodes[condition].reads = collect_temp_refs_in_expr(&while_stmt.cond);
+                match expr_truthiness(&while_stmt.cond, self.safety) {
+                    Some(true) => self.nodes[condition].successors.insert(body),
+                    Some(false) => self.nodes[condition].successors.insert(next),
+                    None => {
+                        self.nodes[condition].successors.extend([body, next]);
+                        true
+                    }
+                };
+                Some(condition)
+            }
+            HirStmt::Repeat(repeat_stmt) => {
+                let condition = self.new_node(BTreeSet::new(), BTreeSet::new(), []);
+                let body = self.build_block(
+                    &repeat_stmt.body.stmts,
+                    condition,
+                    Some(next),
+                    Some(condition),
+                )?;
+                self.nodes[condition].reads = collect_temp_refs_in_expr(&repeat_stmt.cond);
+                match expr_truthiness(&repeat_stmt.cond, self.safety) {
+                    Some(true) => self.nodes[condition].successors.insert(next),
+                    Some(false) => self.nodes[condition].successors.insert(body),
+                    None => {
+                        self.nodes[condition].successors.extend([body, next]);
+                        true
+                    }
+                };
+                Some(body)
+            }
+            HirStmt::NumericFor(numeric_for) => {
+                let dispatch = self.new_node(BTreeSet::new(), BTreeSet::new(), []);
+                let body = self.build_block(
+                    &numeric_for.body.stmts,
+                    dispatch,
+                    Some(next),
+                    Some(dispatch),
+                )?;
+                self.nodes[dispatch].successors.extend([body, next]);
+                Some(
+                    self.new_node(
+                        collect_temp_refs_in_expr(&numeric_for.start)
+                            .into_iter()
+                            .chain(collect_temp_refs_in_expr(&numeric_for.limit))
+                            .chain(collect_temp_refs_in_expr(&numeric_for.step))
+                            .collect(),
+                        BTreeSet::new(),
+                        [dispatch],
+                    ),
+                )
+            }
+            HirStmt::GenericFor(generic_for) => {
+                let dispatch = self.new_node(BTreeSet::new(), BTreeSet::new(), []);
+                let body = self.build_block(
+                    &generic_for.body.stmts,
+                    dispatch,
+                    Some(next),
+                    Some(dispatch),
+                )?;
+                self.nodes[dispatch].successors.extend([body, next]);
+                Some(
+                    self.new_node(
+                        generic_for
+                            .iterator
+                            .iter()
+                            .flat_map(collect_temp_refs_in_expr)
+                            .collect(),
+                        BTreeSet::new(),
+                        [dispatch],
+                    ),
+                )
+            }
+            HirStmt::Assign(assign) => Some(
+                self.new_node(
+                    stmt_reads(stmt),
+                    assign
+                        .targets
+                        .iter()
+                        .filter_map(|target| match target {
+                            HirLValue::Temp(temp) => Some(*temp),
+                            HirLValue::Param(_)
+                            | HirLValue::Local(_)
+                            | HirLValue::Upvalue(_)
+                            | HirLValue::Global(_)
+                            | HirLValue::TableAccess(_) => None,
+                        })
+                        .collect(),
+                    [next],
+                ),
+            ),
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::TableSetList(_) => {
+                Some(self.new_node(stmt_reads(stmt), BTreeSet::new(), [next]))
+            }
+        }
+    }
+}
+
+fn stmt_reads(stmt: &HirStmt) -> BTreeSet<TempId> {
+    collect_temp_reads_by_stmt(std::slice::from_ref(stmt))
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn intersect_fallthrough_assignment_sets<'a>(
@@ -422,6 +520,24 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_external_goto_does_not_disable_the_region_proof() {
+        let temp = TempId(0);
+        let stmt = branch(
+            vec![
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::Boolean(false),
+                    then_block: block(vec![goto(HirLabelId(9))]),
+                    else_block: None,
+                })),
+                assign_temp(temp),
+            ],
+            vec![assign_temp(temp)],
+        );
+
+        assert_eq!(candidates(&stmt, temp), vec![temp]);
+    }
+
+    #[test]
     fn local_forward_goto_follows_the_reachable_assignment_path() {
         let temp = TempId(0);
         let skipped = TempId(1);
@@ -452,11 +568,54 @@ mod tests {
     }
 
     #[test]
-    fn backward_goto_stays_with_the_region_cfg_owner() {
+    fn local_backward_loop_that_never_falls_through_does_not_block_other_arm() {
         let temp = TempId(0);
         let head = HirLabelId(0);
         let stmt = branch(
             vec![label(head), assign_temp(temp), goto(head)],
+            vec![assign_temp(temp)],
+        );
+
+        assert_eq!(candidates(&stmt, temp), vec![temp]);
+    }
+
+    #[test]
+    fn nested_backward_edge_uses_region_wide_must_def() {
+        let temp = TempId(0);
+        let condition = TempId(1);
+        let head = HirLabelId(0);
+        let stmt = branch(
+            vec![
+                label(head),
+                assign_temp(temp),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::TempRef(condition),
+                    then_block: block(vec![goto(head)]),
+                    else_block: Some(block(Vec::new())),
+                })),
+            ],
+            vec![assign_temp(temp)],
+        );
+
+        assert_eq!(candidates(&stmt, temp), vec![temp]);
+    }
+
+    #[test]
+    fn nested_backward_edge_keeps_first_iteration_read_before_def() {
+        let temp = TempId(0);
+        let condition = TempId(1);
+        let head = HirLabelId(0);
+        let stmt = branch(
+            vec![
+                label(head),
+                assign_temp_value(TempId(2), HirExpr::TempRef(temp)),
+                assign_temp(temp),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::TempRef(condition),
+                    then_block: block(vec![goto(head)]),
+                    else_block: Some(block(Vec::new())),
+                })),
+            ],
             vec![assign_temp(temp)],
         );
 

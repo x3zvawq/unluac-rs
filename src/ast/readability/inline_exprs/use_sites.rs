@@ -34,7 +34,7 @@ pub(super) fn rewrite_stmt_use_sites_with_policy(
     options: ReadabilityOptions,
     policy: InlinePolicy,
 ) -> bool {
-    match stmt {
+    let mut changed = match stmt {
         AstStmt::LocalDecl(local_decl) => rewrite_expr_list_context(
             &mut local_decl.values,
             candidate,
@@ -140,7 +140,131 @@ pub(super) fn rewrite_stmt_use_sites_with_policy(
         | AstStmt::Goto(_)
         | AstStmt::Label(_)
         | AstStmt::Error(_) => false,
+    };
+    if stable_copy_owns_nested_block(replacement, policy) {
+        changed |= rewrite_nested_stmt_blocks(stmt, candidate, replacement, options, policy);
     }
+    changed
+}
+
+fn stable_copy_owns_nested_block(replacement: &AstExpr, policy: InlinePolicy) -> bool {
+    // Direct lexical names are already covered by stable-copy's whole-block write/capture proof;
+    // literals have no dependency epoch. Composite snapshots stay header-only until the owner
+    // supplies ordering facts for reads and writes inside the same nested statement.
+    matches!(policy, InlinePolicy::StableCopy)
+        && matches!(
+            replacement,
+            AstExpr::Var(_)
+                | AstExpr::Nil
+                | AstExpr::Boolean(_)
+                | AstExpr::Integer(_)
+                | AstExpr::Number(_)
+                | AstExpr::String(_)
+                | AstExpr::Int64(_)
+                | AstExpr::UInt64(_)
+                | AstExpr::Vector(_)
+                | AstExpr::Complex { .. }
+        )
+}
+
+fn rewrite_nested_stmt_blocks(
+    stmt: &mut AstStmt,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+) -> bool {
+    match stmt {
+        AstStmt::If(if_stmt) => {
+            let mut changed = rewrite_block_use_sites(
+                &mut if_stmt.then_block,
+                candidate,
+                replacement,
+                options,
+                policy,
+            );
+            if let Some(else_block) = &mut if_stmt.else_block {
+                changed |=
+                    rewrite_block_use_sites(else_block, candidate, replacement, options, policy);
+            }
+            changed
+        }
+        AstStmt::While(while_stmt) => rewrite_block_use_sites(
+            &mut while_stmt.body,
+            candidate,
+            replacement,
+            options,
+            policy,
+        ),
+        AstStmt::Repeat(repeat_stmt) => rewrite_block_use_sites(
+            &mut repeat_stmt.body,
+            candidate,
+            replacement,
+            options,
+            policy,
+        ),
+        AstStmt::NumericFor(numeric_for) => rewrite_block_use_sites(
+            &mut numeric_for.body,
+            candidate,
+            replacement,
+            options,
+            policy,
+        ),
+        AstStmt::GenericFor(generic_for) => rewrite_block_use_sites(
+            &mut generic_for.body,
+            candidate,
+            replacement,
+            options,
+            policy,
+        ),
+        AstStmt::DoBlock(block) => {
+            rewrite_block_use_sites(block, candidate, replacement, options, policy)
+        }
+        AstStmt::LocalDecl(_)
+        | AstStmt::GlobalDecl(_)
+        | AstStmt::Assign(_)
+        | AstStmt::CallStmt(_)
+        | AstStmt::Return(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Break
+        | AstStmt::Continue
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::Error(_) => false,
+    }
+}
+
+fn rewrite_block_use_sites(
+    block: &mut super::super::super::common::AstBlock,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+) -> bool {
+    let mut changed = false;
+    for stmt in &mut block.stmts {
+        changed |=
+            rewrite_stmt_use_sites_with_policy(stmt, candidate, replacement, options, policy);
+    }
+    changed
+}
+
+pub(super) fn rewrite_condition_use_sites_with_policy(
+    condition: &mut AstExpr,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+) -> bool {
+    rewrite_top_level_expr_use_sites(
+        condition,
+        candidate,
+        replacement,
+        InlineSite::Neutral,
+        options,
+        policy,
+    )
 }
 
 fn rewrite_global_decl_use_sites(
@@ -763,7 +887,9 @@ impl InlineSite {
             // 初始化与非尾 return 都把裸 call 收窄为单值，完整事件顺序再由 run 前缀证明。
             Self::ReturnValue => is_extended_call_chain_inline_expr(replacement),
             Self::Index => {
-                // 候选拒绝[LayerBoundary]：primitive/copy-like index alias 由 stable-copy 或 HIR locals 消费；候选拒绝[SemanticBarrier:Lifetime]：把 call/method/field 结果移入 index 会让 key root 在参数求值前失活，弱表与强制 GC 可观察差异（regress_353_extended_index_key_lifetime）。
+                // 候选忽略[NotApplicable]：ExtendedCallChain 不拥有 primitive/copy-like index alias；
+                // 它们在本 pass 随后的 stable-copy 事务中按 snapshot 事实重审。
+                // 候选拒绝[SemanticBarrier:Lifetime]：把 call/method/field 结果移入 index 会让 key root 在参数求值前失活，弱表与强制 GC 可观察差异（regress_353_extended_index_key_lifetime）。
                 false
             }
         }
@@ -790,7 +916,9 @@ impl InlineSite {
             | Self::Index
             | Self::CallArgNonFinal
             | Self::CallArgFinal => {
-                // 候选拒绝[LayerBoundary]：alias-initializer 策略只拥有紧邻 initializer 内部，return/index/call 参数由其它 sink policy 证明。
+                // 候选忽略[NotApplicable]：AliasInitializerChain 只拥有紧邻 initializer
+                // 的 neutral/access-base；call 参数会先由 AdjacentValueSink 特例筛选，
+                // 其余 return/index 不是该 scanner 生成的 sink。
                 false
             }
         }
@@ -819,8 +947,8 @@ impl InlineSite {
             }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::ReturnValue => {
-                // 候选拒绝[LayerBoundary]：直接 return 由 DirectReturnValue/MultiReturnValue/
-                // BooleanReturnValue policy 负责，AdjacentValueSink 不拥有该站点。
+                // 候选忽略[NotApplicable]：AdjacentValueSink 只由相邻 assign/local-decl
+                // scanner 产生，直接 return 不会以此 policy 进入 rewriter。
                 false
             }
             Self::Index => {
@@ -847,7 +975,9 @@ impl InlineSite {
                 is_extended_neutral_local_alias_expr(replacement)
                     || is_recallable_inline_expr(replacement)
             }
-            // 候选拒绝[LayerBoundary]：loop-header policy 只服务循环头；return/index 由各自 sink policy 判断。
+            // 候选忽略[NotApplicable]：LoopHeaderCall 只由 generic-for call sink scanner
+            // 产生；直接 return 不可达，primitive index copy 留给随后 stable-copy，
+            // eventful index producer 仍受 ExtendedCallChain 的 lifetime 反例约束。
             Self::ReturnValue | Self::Index => false,
         }
     }

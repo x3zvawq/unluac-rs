@@ -14,7 +14,8 @@
 //! RHS 的可删除性与 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
 //!
 //! 例子：根前缀里的机械 `t = false` 若 `t` 是非参数槽首个 fixed def，可删成空；
-//! `t = stable_local` 若目标覆盖 entry nil 可删；`t = p; p = nil` 则必须保留 `t` 的 root。
+//! `t = stable_local` 若目标覆盖 entry nil 可删；`t = p; p = false` 则必须把后写精确
+//! 接回同一个 PhysicalRoot，不能把 `t` 的 root 无条件延长到函数结束。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +23,7 @@ use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::{CopyRootOverwrite, HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::{
     ReferenceCapturedBindings, stmts_protected_locals, stmts_reference_captured_bindings,
@@ -257,125 +258,216 @@ fn preserve_copy_roots_in_proto(
     safety: HirExprSafety,
     physical_root_temps: &mut BTreeSet<TempId>,
 ) -> bool {
-    rewrite_proto(
-        proto,
-        &mut CopyRootPass {
-            live_reads,
-            debug_temps,
-            facts,
-            safety,
-            physical_root_temps,
-        },
-    )
-}
-
-struct CopyRootPass<'a> {
-    live_reads: &'a BTreeSet<TempId>,
-    debug_temps: &'a BTreeSet<TempId>,
-    facts: &'a ProtoPromotionFacts,
-    safety: HirExprSafety,
-    physical_root_temps: &'a mut BTreeSet<TempId>,
-}
-
-impl HirRewritePass for CopyRootPass<'_> {
-    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        preserve_copy_roots_in_block(
-            block,
-            self.live_reads,
-            self.debug_temps,
-            self.facts,
-            self.safety,
-            self.physical_root_temps,
-        )
-    }
-}
-
-enum CopyRootPlan {
-    ScopeEnd { producer: TempId },
-    NilOverwrite { producer: TempId, index: usize },
-}
-
-fn preserve_copy_roots_in_block(
-    block: &mut HirBlock,
-    live_reads: &BTreeSet<TempId>,
-    debug_temps: &BTreeSet<TempId>,
-    facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
-    physical_root_temps: &mut BTreeSet<TempId>,
-) -> bool {
     let mut captured_homes = BTreeSet::new();
-    for stmt in &block.stmts {
+    for stmt in &proto.body.stmts {
         facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_homes);
     }
 
-    let mut plans = Vec::new();
-    for (producer_index, stmt) in block.stmts.iter().enumerate() {
-        let Some((producer, value)) = single_temp_assignment(stmt) else {
+    let mut sites = BTreeMap::new();
+    collect_copy_root_assignment_sites(
+        &proto.body,
+        live_reads,
+        safety,
+        &mut Vec::new(),
+        &mut sites,
+    );
+
+    let mut rewrite_targets = BTreeMap::<TempId, TempId>::new();
+    let mut roots = BTreeSet::new();
+    for (&producer, producer_site) in &sites {
+        let Some(producer_value) = producer_site.unique_dead_pure_value() else {
             continue;
         };
-        if dead_pure_temp_assignment(stmt, live_reads, safety) != Some(producer) {
-            continue;
-        }
-        if safety.result_is_gc_inert(value) {
+        if safety.result_is_gc_inert(producer_value) {
             continue;
         }
         let scope_end = facts.is_scope_end_copy_root_temp(producer);
-        let overwrite = facts.copy_root_overwrite(producer);
-        if !scope_end && overwrite.is_none() {
+        let overwrites = facts.copy_root_overwrites(producer);
+        if !scope_end && overwrites.is_none() {
             continue;
         }
-        let home = facts
-            .trusted_temp_home_slot(producer)
-            .expect("validated copy-root fact must retain producer home");
+        let Some(home) = facts.trusted_temp_home_slot(producer) else {
+            continue;
+        };
         if captured_homes.contains(&home) {
             // 候选拒绝[SemanticBarrier:Capture]：同槽 capture 可观察独立 cell identity。
             continue;
         }
 
-        if let Some(overwrite) = overwrite {
-            let (overwrite_index, hir_overwrite) = block.stmts[producer_index + 1..]
-                .iter()
-                .enumerate()
-                .find_map(|(offset, suffix)| {
-                    let Some((temp, HirExpr::Nil)) = single_temp_assignment(suffix) else {
-                        return None;
-                    };
-                    ((temp == overwrite || temp == producer)
-                        && dead_pure_temp_assignment(suffix, live_reads, safety) == Some(temp))
-                    .then_some((producer_index + 1 + offset, temp))
-                })
-                .expect("copy-root overwrite fact must retain its direct scalar nil assignment");
-            if hir_overwrite == overwrite && debug_temps.contains(&overwrite) {
-                // 候选拒绝[SemanticBarrier:DebugScope]：把仍独立存在的 debug overwrite
-                // 改写为 producer 会抹掉它自己的源码 local identity。
-                continue;
-            }
-            plans.push(CopyRootPlan::NilOverwrite {
+        let mut candidate_rewrites = BTreeMap::new();
+        let all_overwrites_match = overwrites.into_iter().flatten().all(|overwrite| {
+            copy_root_overwrite_matches_hir(
+                *overwrite,
                 producer,
-                index: overwrite_index,
-            });
-        } else {
-            plans.push(CopyRootPlan::ScopeEnd { producer });
+                producer_site,
+                &sites,
+                debug_temps,
+                &rewrite_targets,
+                &mut candidate_rewrites,
+            )
+        });
+        if !all_overwrites_match {
+            continue;
         }
+        roots.insert(producer);
+        rewrite_targets.extend(candidate_rewrites);
     }
 
-    let mut changed = false;
-    for plan in plans {
-        match plan {
-            CopyRootPlan::ScopeEnd { producer } => {
-                physical_root_temps.insert(producer);
+    let original = proto.body.clone();
+    let rewritten = rewrite_copy_root_overwrites(&mut proto.body, &rewrite_targets);
+    if rewritten != rewrite_targets.len() {
+        proto.body = original;
+        return false;
+    }
+    physical_root_temps.extend(roots);
+    rewritten != 0
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CopyRootHirLocation {
+    block_path: Vec<(usize, u8)>,
+    stmt_index: usize,
+}
+
+impl CopyRootHirLocation {
+    fn owns(&self, other: &Self) -> bool {
+        if !other.block_path.starts_with(&self.block_path) {
+            return false;
+        }
+        if other.block_path.len() == self.block_path.len() {
+            return other.stmt_index > self.stmt_index;
+        }
+        other.block_path[self.block_path.len()].0 > self.stmt_index
+    }
+}
+
+#[derive(Default)]
+struct CopyRootAssignmentSite {
+    writes: usize,
+    dead_pure_value: Option<HirExpr>,
+    location: Option<CopyRootHirLocation>,
+}
+
+impl CopyRootAssignmentSite {
+    fn unique_dead_pure_value(&self) -> Option<&HirExpr> {
+        (self.writes == 1)
+            .then_some(self.dead_pure_value.as_ref())
+            .flatten()
+    }
+}
+
+fn collect_copy_root_assignment_sites(
+    block: &HirBlock,
+    live_reads: &BTreeSet<TempId>,
+    safety: HirExprSafety,
+    block_path: &mut Vec<(usize, u8)>,
+    sites: &mut BTreeMap<TempId, CopyRootAssignmentSite>,
+) {
+    for (stmt_index, stmt) in block.stmts.iter().enumerate() {
+        if let HirStmt::Assign(assign) = stmt {
+            for target in &assign.targets {
+                if let HirLValue::Temp(temp) = target {
+                    sites.entry(*temp).or_default().writes += 1;
+                }
             }
-            CopyRootPlan::NilOverwrite { producer, index } => {
-                let HirStmt::Assign(assign) = &mut block.stmts[index] else {
-                    unreachable!("validated copy-root overwrite must remain an assignment")
-                };
-                changed |= assign.targets[0] != HirLValue::Temp(producer);
-                assign.targets[0] = HirLValue::Temp(producer);
-                physical_root_temps.insert(producer);
+            if let Some((temp, value)) = single_temp_assignment(stmt)
+                && dead_pure_temp_assignment(stmt, live_reads, safety) == Some(temp)
+            {
+                let site = sites.entry(temp).or_default();
+                site.dead_pure_value = Some(value.clone());
+                site.location = Some(CopyRootHirLocation {
+                    block_path: block_path.clone(),
+                    stmt_index,
+                });
             }
         }
+        for_each_copy_root_child_block(stmt, &mut |child, child_kind| {
+            block_path.push((stmt_index, child_kind));
+            collect_copy_root_assignment_sites(child, live_reads, safety, block_path, sites);
+            block_path.pop();
+        });
     }
-    changed
+}
+
+fn for_each_copy_root_child_block(stmt: &HirStmt, visit: &mut impl FnMut(&HirBlock, u8)) {
+    match stmt {
+        HirStmt::If(if_stmt) => {
+            visit(&if_stmt.then_block, 0);
+            if let Some(else_block) = &if_stmt.else_block {
+                visit(else_block, 1);
+            }
+        }
+        HirStmt::While(while_stmt) => visit(&while_stmt.body, 2),
+        HirStmt::Repeat(repeat_stmt) => visit(&repeat_stmt.body, 3),
+        HirStmt::NumericFor(numeric_for) => visit(&numeric_for.body, 4),
+        HirStmt::GenericFor(generic_for) => visit(&generic_for.body, 5),
+        HirStmt::Block(block) => visit(block, 6),
+        HirStmt::LocalDecl(_)
+        | HirStmt::GlobalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
+    }
+}
+
+fn copy_root_overwrite_matches_hir(
+    overwrite: CopyRootOverwrite,
+    producer: TempId,
+    producer_site: &CopyRootAssignmentSite,
+    sites: &BTreeMap<TempId, CopyRootAssignmentSite>,
+    debug_temps: &BTreeSet<TempId>,
+    existing_rewrites: &BTreeMap<TempId, TempId>,
+    candidate_rewrites: &mut BTreeMap<TempId, TempId>,
+) -> bool {
+    let temp = overwrite.temp();
+    let Some(site) = sites.get(&temp) else {
+        return false;
+    };
+    let Some(value) = site.unique_dead_pure_value() else {
+        return false;
+    };
+    let Some(producer_location) = &producer_site.location else {
+        return false;
+    };
+    let Some(overwrite_location) = &site.location else {
+        return false;
+    };
+    if debug_temps.contains(&temp)
+        || !overwrite.matches_hir_expr(value)
+        || !producer_location.owns(overwrite_location)
+        || existing_rewrites.contains_key(&temp)
+    {
+        return false;
+    }
+    candidate_rewrites.insert(temp, producer).is_none()
+}
+
+fn rewrite_copy_root_overwrites(
+    block: &mut HirBlock,
+    rewrites: &BTreeMap<TempId, TempId>,
+) -> usize {
+    let mut rewritten = 0;
+    for stmt in &mut block.stmts {
+        if let HirStmt::Assign(assign) = stmt
+            && let [HirLValue::Temp(temp)] = assign.targets.as_mut_slice()
+            && let Some(producer) = rewrites.get(temp).copied()
+        {
+            *temp = producer;
+            rewritten += 1;
+        }
+        super::walk::for_each_nested_block_mut(stmt, &mut |child| {
+            rewritten += rewrite_copy_root_overwrites(child, rewrites);
+        });
+    }
+    rewritten
 }
 
 fn preserve_adjacent_dead_physical_overwrites(
@@ -405,8 +497,8 @@ fn preserve_adjacent_dead_physical_overwrites(
             continue;
         }
         let Some(home) = facts.home_slot(previous) else {
-            // 候选拒绝[LayerBoundary]：没有 raw target home 的 synthetic temp 不代表 VM
-            // 物理写；它的死定义由普通 dead-temp 路径消费，不能充当 root overwrite owner。
+            // 候选忽略[NotApplicable]：没有 raw target home 的 synthetic temp 不代表 VM
+            // 物理写，不是这条“把后继写接回旧 root cell”的候选。
             continue;
         };
         if current == previous {
@@ -474,7 +566,7 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
             reads: &mut last_local_read,
         };
         visit::visit_stmts(std::slice::from_ref(stmt), &mut collector);
-        if !root_prefix_stmt_preserves_single_pass_continuation(stmt) {
+        if !root_prefix_scan_can_cross(stmt) {
             break;
         }
     }
@@ -485,7 +577,7 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
         if !in_single_pass_prefix {
             return true;
         }
-        if !root_prefix_stmt_preserves_single_pass_continuation(stmt) {
+        if !root_prefix_scan_can_cross(stmt) {
             in_single_pass_prefix = false;
             return true;
         }
@@ -565,7 +657,7 @@ fn adjacent_same_value_visible_handoff(
     (facts.home_slot(temp).is_some() && facts.home_slot(temp) == target_home).then_some(temp)
 }
 
-fn root_prefix_stmt_preserves_single_pass_continuation(stmt: &HirStmt) -> bool {
+fn root_prefix_scan_can_cross(stmt: &HirStmt) -> bool {
     match stmt {
         HirStmt::LocalDecl(_)
         | HirStmt::GlobalDecl(_)
@@ -582,8 +674,10 @@ fn root_prefix_stmt_preserves_single_pass_continuation(stmt: &HirStmt) -> bool {
         | HirStmt::GenericFor(_)
         | HirStmt::Block(_) => !stmt_contains_nested_nonlocal_control(stmt),
         HirStmt::Return(_) => {
-            // 分析停用[LayerBoundary]：Return 后缀的不可达性属于 CFG/dead-code owner。
-            false
+            // Return 终止当前函数的顺序 fallthrough；同一直接 block 中的后缀只有经过
+            // 显式 label 才可能重新可达。继续扫描不可达后缀是安全的，而下方的
+            // Label/Goto guard 与 nested-nonlocal guard 会在任何真实重入边界前停住。
+            true
         }
         HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {
             // 分析停用[SemanticBarrier:ControlFlow]：非局部跳转或可重入 label 会破坏
@@ -862,11 +956,56 @@ mod tests {
     use super::*;
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirAssign, HirGlobalDecl, HirGoto, HirIf, HirLabelId, HirReturn, HirValuePack, HirWhile,
+        HirAssign, HirClose, HirGlobalDecl, HirGoto, HirIf, HirLabel, HirLabelId, HirProtoRef,
+        HirReturn, HirTableConstructor, HirValuePack, HirWhile,
     };
+    use crate::parser::{ProtoLineRange, ProtoSignature};
 
     fn block(stmts: Vec<HirStmt>) -> HirBlock {
         HirBlock { stmts }
+    }
+
+    fn proto(body: HirBlock, temps: Vec<TempId>) -> HirProto {
+        HirProto {
+            id: HirProtoRef(0),
+            source: None,
+            line_range: ProtoLineRange {
+                defined_start: 0,
+                defined_end: 0,
+            },
+            signature: ProtoSignature {
+                num_params: 0,
+                is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
+                legacy_arg_slot: false,
+            },
+            params: Vec::new(),
+            param_debug_hints: Vec::new(),
+            locals: Vec::new(),
+            local_debug_hints: Vec::new(),
+            local_debug_scopes: Vec::new(),
+            debug_scopes: Vec::new(),
+            physical_root_temps: BTreeSet::new(),
+            physical_root_locals: BTreeSet::new(),
+            upvalues: Vec::new(),
+            mutable_upvalues: BTreeSet::new(),
+            upvalue_debug_hints: Vec::new(),
+            temp_debug_locals: vec![None; temps.len()],
+            temp_debug_scopes: vec![None; temps.len()],
+            temps,
+            body,
+            children: Vec::new(),
+            failure: None,
+            detached_children: Vec::new(),
+        }
+    }
+
+    fn assign(temp: TempId, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(temp)],
+            values: HirValuePack::fixed(vec![value]),
+        }))
     }
 
     #[test]
@@ -955,6 +1094,160 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_root_overwrite_ignores_a_nonphysical_previous_definition() {
+        let previous = TempId(0);
+        let current = TempId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(current, HomeSlotKey::new(0, 0));
+        let mut block = block(vec![
+            assign(previous, HirExpr::ParamRef(ParamId(0))),
+            assign(current, HirExpr::Nil),
+        ]);
+        let original = block.clone();
+        let mut physical_roots = BTreeSet::new();
+
+        assert!(!preserve_adjacent_dead_physical_overwrites(
+            &mut block,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &mut physical_roots,
+        ));
+        assert_eq!(block, original);
+        assert!(physical_roots.is_empty());
+    }
+
+    #[test]
+    fn copy_root_rewrites_exact_scalar_overwrites_across_structured_paths() {
+        let producer = TempId(0);
+        let truthy_overwrite = TempId(1);
+        let falsy_overwrite = TempId(2);
+        let home = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        for temp in [producer, truthy_overwrite, falsy_overwrite] {
+            facts.record_temp_home_slot_for_test(temp, home);
+        }
+        facts.record_copy_root_overwrites_for_test(
+            producer,
+            vec![
+                (truthy_overwrite, HirExpr::Boolean(false)),
+                (falsy_overwrite, HirExpr::Integer(0)),
+            ],
+        );
+        let mut proto = proto(
+            block(vec![
+                assign(producer, HirExpr::ParamRef(ParamId(0))),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::Boolean(true),
+                    then_block: block(vec![assign(truthy_overwrite, HirExpr::Boolean(false))]),
+                    else_block: Some(block(vec![assign(falsy_overwrite, HirExpr::Integer(0))])),
+                })),
+            ]),
+            vec![producer, truthy_overwrite, falsy_overwrite],
+        );
+        let mut physical_roots = BTreeSet::new();
+
+        assert!(preserve_copy_roots_in_proto(
+            &mut proto,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &mut physical_roots,
+        ));
+        let HirStmt::If(if_stmt) = &proto.body.stmts[1] else {
+            panic!("structured overwrite owner must remain an if");
+        };
+        for child in [
+            &if_stmt.then_block,
+            if_stmt
+                .else_block
+                .as_ref()
+                .expect("test has a false-path overwrite"),
+        ] {
+            let HirStmt::Assign(overwrite) = &child.stmts[0] else {
+                panic!("overwrite owner must remain an assignment");
+            };
+            assert_eq!(overwrite.targets, vec![HirLValue::Temp(producer)]);
+        }
+        assert_eq!(physical_roots, BTreeSet::from([producer]));
+    }
+
+    #[test]
+    fn copy_root_rewrites_same_block_direct_boolean_overwrite() {
+        let producer = TempId(0);
+        let overwrite = TempId(1);
+        let home = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(producer, home);
+        facts.record_temp_home_slot_for_test(overwrite, home);
+        facts.record_copy_root_overwrites_for_test(
+            producer,
+            vec![(overwrite, HirExpr::Boolean(false))],
+        );
+        let mut proto = proto(
+            block(vec![
+                assign(producer, HirExpr::ParamRef(ParamId(0))),
+                assign(overwrite, HirExpr::Boolean(false)),
+            ]),
+            vec![producer, overwrite],
+        );
+        let mut physical_roots = BTreeSet::new();
+
+        assert!(preserve_copy_roots_in_proto(
+            &mut proto,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &mut physical_roots,
+        ));
+        let HirStmt::Assign(overwrite) = &proto.body.stmts[1] else {
+            panic!("overwrite must remain an assignment");
+        };
+        assert_eq!(overwrite.targets, vec![HirLValue::Temp(producer)]);
+        assert_eq!(physical_roots, BTreeSet::from([producer]));
+    }
+
+    #[test]
+    fn copy_root_rejects_a_collectable_or_mismatched_hir_overwrite_atomically() {
+        let producer = TempId(0);
+        let overwrite = TempId(1);
+        let home = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(producer, home);
+        facts.record_temp_home_slot_for_test(overwrite, home);
+        facts.record_copy_root_overwrites_for_test(
+            producer,
+            vec![(overwrite, HirExpr::Boolean(false))],
+        );
+        let mut proto = proto(
+            block(vec![
+                assign(producer, HirExpr::ParamRef(ParamId(0))),
+                assign(
+                    overwrite,
+                    HirExpr::TableConstructor(Box::<HirTableConstructor>::default()),
+                ),
+            ]),
+            vec![producer, overwrite],
+        );
+        let original = proto.body.clone();
+        let mut physical_roots = BTreeSet::new();
+
+        assert!(!preserve_copy_roots_in_proto(
+            &mut proto,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &mut physical_roots,
+        ));
+        assert_eq!(proto.body, original);
+        assert!(physical_roots.is_empty());
+    }
+
+    #[test]
     fn root_prefix_crosses_closed_structures_and_owned_loop_control() {
         let closed_if = HirStmt::If(Box::new(HirIf {
             cond: HirExpr::Boolean(true),
@@ -966,12 +1259,8 @@ mod tests {
             body: block(vec![HirStmt::Continue, HirStmt::Break]),
         }));
 
-        assert!(root_prefix_stmt_preserves_single_pass_continuation(
-            &closed_if
-        ));
-        assert!(root_prefix_stmt_preserves_single_pass_continuation(
-            &closed_loop
-        ));
+        assert!(root_prefix_scan_can_cross(&closed_if));
+        assert!(root_prefix_scan_can_cross(&closed_loop));
     }
 
     #[test]
@@ -984,13 +1273,11 @@ mod tests {
         // Prefix scanning only decides whether a later dead temp write is reached once. The
         // declaration remains in place; success continues linearly and failure never reaches the
         // candidate in either program.
-        assert!(root_prefix_stmt_preserves_single_pass_continuation(
-            &global_decl
-        ));
+        assert!(root_prefix_scan_can_cross(&global_decl));
     }
 
     #[test]
-    fn root_prefix_stops_at_nested_nonlocal_control_and_terminal() {
+    fn root_prefix_crosses_terminal_but_stops_at_nested_nonlocal_control() {
         let nested_goto = HirStmt::If(Box::new(HirIf {
             cond: HirExpr::Boolean(true),
             then_block: block(vec![HirStmt::Goto(Box::new(HirGoto {
@@ -1002,11 +1289,94 @@ mod tests {
             values: HirValuePack::default(),
         }));
 
-        assert!(!root_prefix_stmt_preserves_single_pass_continuation(
-            &nested_goto
+        assert!(!root_prefix_scan_can_cross(&nested_goto));
+        assert!(root_prefix_scan_can_cross(&terminal));
+    }
+
+    #[test]
+    fn return_suffix_consumes_dead_handoff_across_close_and_closed_block() {
+        let temp = TempId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(temp, home);
+        let mut body = block(vec![
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::default(),
+            })),
+            HirStmt::Close(Box::new(HirClose { from_reg: 0 })),
+            HirStmt::Block(Box::default()),
+            assign(temp, HirExpr::ParamRef(ParamId(0))),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Param(ParamId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
+            })),
+        ]);
+        let stable_visible_bindings = StableVisibleBindings {
+            params: BTreeSet::new(),
+            locals: BTreeSet::new(),
+            reference_captured_homes: Some(BTreeSet::new()),
+        };
+
+        assert!(remove_dead_entry_nil_writes_from_root_prefix(
+            &mut body,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &stable_visible_bindings,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
         ));
-        assert!(!root_prefix_stmt_preserves_single_pass_continuation(
-            &terminal
+        assert_eq!(body.stmts.len(), 4);
+        assert!(matches!(body.stmts[0], HirStmt::Return(_)));
+        assert!(matches!(body.stmts[1], HirStmt::Close(_)));
+        assert!(matches!(body.stmts[2], HirStmt::Block(_)));
+        assert!(matches!(body.stmts[3], HirStmt::Assign(ref assign)
+            if assign.targets == [HirLValue::Param(ParamId(0))]));
+    }
+
+    #[test]
+    fn reachable_label_suffix_stops_dead_handoff_cleanup_after_return() {
+        let temp = TempId(0);
+        let target = HirLabelId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(temp, home);
+        let mut body = block(vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Boolean(true),
+                then_block: block(vec![HirStmt::Goto(Box::new(HirGoto { target }))]),
+                else_block: None,
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::default(),
+            })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: target,
+                tbc_barriers: Vec::new(),
+            })),
+            HirStmt::Close(Box::new(HirClose { from_reg: 0 })),
+            assign(temp, HirExpr::ParamRef(ParamId(0))),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Param(ParamId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
+            })),
+        ]);
+        let original = body.clone();
+        let stable_visible_bindings = StableVisibleBindings {
+            params: BTreeSet::new(),
+            locals: BTreeSet::new(),
+            reference_captured_homes: Some(BTreeSet::new()),
+        };
+
+        assert!(!remove_dead_entry_nil_writes_from_root_prefix(
+            &mut body,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &stable_visible_bindings,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
         ));
+        assert_eq!(body, original);
     }
 }

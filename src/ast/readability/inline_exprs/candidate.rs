@@ -279,7 +279,10 @@ fn inline_candidate_from_local_decl(
         }
     }
     match binding.id {
-        // 分析停用[LayerBoundary]：原生 TempId 的 producer/use 与 capture 生命周期只由 HIR temp-inline 证明。
+        // 候选拒绝[LayerBoundary]：Normal inline-exprs 不把原生 TempId 当作源码 local；
+        // Deferred materialize-temps 把残留 temp 建成 SyntheticLocal，并发出 TempPresence、
+        // BindingStructure 与 StatementAdjacency。调度器因此回到 Normal phase，cleanup
+        // 先清理新声明，inline-exprs 再以 SyntheticLocal candidate 重审。
         AstBindingRef::Temp(_) => None,
         AstBindingRef::Local(_) | AstBindingRef::SyntheticLocal(_) => Some((
             InlineCandidate {

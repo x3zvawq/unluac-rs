@@ -229,7 +229,8 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             &use_index,
             mutable_snapshots,
         ) {
-            // 候选拒绝[LayerBoundary]：完整 method receiver/field/call run 由 function-sugar 原子消费，不能先删除其中 alias。
+            // 候选拒绝[LayerBoundary]：Deferred function-sugar 的 method_alias owner 会把
+            // receiver/field/call 整段原子消费；scheduler 随后重跑 Normal phase，不能先删除 alias。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -274,7 +275,11 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             let suffix_uses =
                 use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
             if suffix_uses == 0 {
-                // 候选拒绝[LayerBoundary]：零 use 的声明归 cleanup/dead-local，不属于 run inline。
+                // 候选拒绝[SemanticBarrier:EvalCount]：cleanup 已在本轮先行；可丢弃值和
+                // 可降为 CallStmt 的 producer 不会抵达这里。残留零-use lookup/dynamic
+                // initializer 没有合法 expression-statement 载体，删除会少一次求值。
+                // 候选拒绝[SemanticBarrier:Metamethod]：例如 `local dead = proxy.key` 的
+                // `__index` 必须继续执行，当前 sink 又没有该 binding 的替换位置。
                 continue;
             }
             if suffix_uses > 1 {
@@ -385,7 +390,11 @@ pub(super) fn single_generic_for_method_receiver_alias(
     let AstExpr::Var(receiver) = &call.receiver else {
         return false;
     };
-    // 候选拒绝[LayerBoundary]：Temp 归 HIR；候选拒绝[SemanticBarrier:EvalOrder]：global/source 或非直接 receiver 缺少稳定快照证明，不能走单项例外。
+    // 候选拒绝[LayerBoundary]：Temp 由 Deferred materialize_temps 转成 synthetic local，
+    // scheduler 随后重跑 inline_exprs。
+    // 候选拒绝[SemanticBarrier:Lifetime]：global receiver 的 alias 原本在整个 generic-for
+    // 词法域保持强 root；`iter()` 可清空该 global 且不让 iterator 捕获 receiver，内联会让
+    // receiver 在 loop body 的 collectgarbage 前失活，使弱表或 `__gc` 可观察。
     candidate.origin() == super::super::super::common::AstLocalOrigin::Recovered
         && !matches!(source, AstNameRef::Global(_) | AstNameRef::Temp(_))
         && candidate.binding().matches_name_ref(receiver)
@@ -403,7 +412,7 @@ pub(super) fn single_call_callee_alias(
         .then(|| inline_candidate(&stmts[run_start]))
         .flatten()
     else {
-        // 候选拒绝[LayerBoundary]：单项例外只消费紧邻的 local + terminal call 两句。
+        // 候选忽略[NotApplicable]：这不是紧邻 local + terminal call 的单项 run。
         return false;
     };
     if candidate.origin() != super::super::super::common::AstLocalOrigin::Recovered
@@ -428,8 +437,8 @@ pub(super) fn single_call_callee_alias(
         }
         AstStmt::GenericFor(generic_for) => {
             let [AstExpr::Call(call)] = generic_for.iterator.as_slice() else {
-                // 候选拒绝[LayerBoundary]：return/assign/多项 iterator 等 sink 仍由各自
-                // value-width policy 负责。
+                // 候选忽略[NotApplicable]：method iterator 由 receiver 单项规则判断；
+                // 多项 iterator 不是 terminal call-alias sink。
                 return false;
             };
             let AstExpr::Var(callee) = &call.callee else {
@@ -439,8 +448,21 @@ pub(super) fn single_call_callee_alias(
             };
             candidate.binding().matches_name_ref(callee)
         }
+        AstStmt::Return(ret) => {
+            let Some(AstExpr::Call(call)) = ret.values.last() else {
+                // 候选忽略[NotApplicable]：terminal method-call 没有独立 direct callee binding。
+                return false;
+            };
+            let AstExpr::Var(callee) = &call.callee else {
+                // 候选拒绝[PolicyBoundary]：单项展示例外只收回直接 callee；嵌套 callee
+                // 需要普通多项 run 证明其结构值得折叠。
+                return false;
+            };
+            candidate.binding().matches_name_ref(callee)
+        }
         _ => {
-            // 候选拒绝[LayerBoundary]：return/assign 等 sink 仍由各自 value-width policy 负责。
+            // 候选忽略[NotApplicable]：dispatcher 只把 call statement、generic-for 与
+            // terminal return call 交给该单项证明。
             return false;
         }
     };
@@ -510,7 +532,8 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             &use_index,
             mutable_snapshots,
         ) {
-            // 候选拒绝[LayerBoundary]：method alias transaction 归 function-sugar，不能由 call-result run 局部消费。
+            // 候选拒绝[LayerBoundary]：Deferred function-sugar 的 method_alias owner 会原子
+            // 消费该 transaction；scheduler 随后重跑 Normal phase，call-result run 不能先拆段。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -554,7 +577,10 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             let suffix_uses =
                 use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
             if suffix_uses == 0 {
-                // 候选拒绝[LayerBoundary]：零 use 的声明归 cleanup/dead-local。
+                // 候选拒绝[SemanticBarrier:EvalCount]：cleanup 已先删除无事件值并把裸 call
+                // 降为 CallStmt；残留零-use lookup/dynamic initializer 没有 sink use-site，
+                // 删除会少一次求值。
+                // 候选拒绝[SemanticBarrier:Metamethod]：proxy[key] 等残留读取可能调用协议。
                 continue;
             }
             if suffix_uses > 1 {
@@ -575,7 +601,8 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 continue;
             }
             if !stmt_has_nested_binding_use(current_sink, candidate.binding()) {
-                // 候选拒绝[LayerBoundary]：当前 call-result sink 不消费该唯一 suffix use；它属于后续 owner，不是本 run 的替换位置。
+                // 候选忽略[NotApplicable]：当前 call-result sink 不读取该 binding；scanner
+                // 只是越过了一个与 sink 无关、在更后面才使用的声明，本 run 没有替换位置。
                 continue;
             }
 
@@ -712,7 +739,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 candidate.binding(),
             );
             if run_uses == 0 {
-                // 候选拒绝[LayerBoundary]：未被当前 run/sink 消费的声明不属于本规则。
+                // 候选忽略[NotApplicable]：声明未被当前 run 或 sink 读取，不是该 transaction 的成员。
                 continue;
             }
             if run_uses > 1 {
@@ -839,7 +866,9 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
         // 前面的 recovered local 只是为了把最终表达式拆成多个机械阶段，
         // 但末尾这个 binding 仍然是后续语句要继续引用的源码锚点。
         if use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0 {
-            // 候选拒绝[LayerBoundary]：末项不跨语句存活时不属于 terminal-local 规则，交由其它 run/single-item owner。
+            // 候选忽略[NotApplicable]：末项没有后续读取，不是 terminal-local 源码锚点。
+            // cleanup 已先删除无事件值或把裸 call 降为 CallStmt；若声明仍存在，其 lookup/
+            // dynamic initializer 必须保留求值，不能假借 terminal-local run 删除。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -876,7 +905,9 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
             let suffix_uses =
                 use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
             if suffix_uses == 0 {
-                // 候选拒绝[LayerBoundary]：零 use 的声明归 cleanup/dead-local。
+                // 候选拒绝[SemanticBarrier:EvalCount]：cleanup 已先处理可丢弃值与裸 call；
+                // 残留零-use lookup/dynamic initializer 没有 rewrite site，删除会少一次求值。
+                // 候选拒绝[SemanticBarrier:Metamethod]：动态读取/运算可能触发协议。
                 continue;
             }
             if suffix_uses > 1 {
@@ -1144,7 +1175,7 @@ mod tests {
 
     use crate::ast::common::{
         AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallStmt, AstFunctionExpr, AstLocalBinding,
-        AstLocalDecl, AstLocalOrigin, AstTableConstructor, AstTableField,
+        AstLocalDecl, AstLocalOrigin, AstReturn, AstTableConstructor, AstTableField,
     };
     use crate::decompile::DecompileDialect;
     use crate::hir::{HirProtoRef, LocalId, ParamId};
@@ -1169,6 +1200,14 @@ mod tests {
                 args: vec![arg],
                 method_name: None,
             })),
+        }))
+    }
+
+    fn call_expr(callee: AstExpr) -> AstExpr {
+        AstExpr::Call(Box::new(AstCallExpr {
+            callee,
+            args: Vec::new(),
+            method_name: None,
         }))
     }
 
@@ -1229,6 +1268,51 @@ mod tests {
                 if matches!(&call.call, AstCallKind::Call(call)
                     if call.args == vec![AstExpr::SingleValue(Box::new(AstExpr::VarArg))])
         ));
+    }
+
+    #[test]
+    fn single_call_result_can_become_a_terminal_return_callee() {
+        let callee = AstBindingRef::Local(LocalId(0));
+        let producer = call_expr(AstExpr::Var(AstNameRef::Param(ParamId(0))));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(callee, producer.clone()),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![call_expr(AstExpr::Var(callee.to_name_ref()))],
+                })),
+            ],
+        };
+
+        assert!(collapse_call_run(&mut block));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::Return(ret)]
+                if matches!(ret.values.as_slice(), [AstExpr::Call(call)]
+                    if call.callee == producer)
+        ));
+    }
+
+    #[test]
+    fn single_return_callee_keeps_producer_before_an_effectful_prefix() {
+        let callee = AstBindingRef::Local(LocalId(0));
+        let mut block = AstBlock {
+            stmts: vec![
+                recovered_local(
+                    callee,
+                    call_expr(AstExpr::Var(AstNameRef::Param(ParamId(0)))),
+                ),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![
+                        call_expr(AstExpr::Var(AstNameRef::Param(ParamId(1)))),
+                        call_expr(AstExpr::Var(callee.to_name_ref())),
+                    ],
+                })),
+            ],
+        };
+        let original = block.clone();
+
+        assert!(!collapse_call_run(&mut block));
+        assert_eq!(block, original);
     }
 
     #[test]

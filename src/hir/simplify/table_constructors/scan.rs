@@ -550,9 +550,9 @@ fn producer_steps_from_bindings(
     }
 
     if values.tail.is_some() {
-        // 候选拒绝[LayerBoundary]：`hir::analyze::instrs::lower_result_assign` 与
-        // `analyze::exprs` 是 value-pack owner；open tail 的运行时宽度不固定，exact tail 也只
-        // 保存一个 pack carrier 而没有逐槽 scalar projection，本 pass 不能伪造 nil 或重复 tail。
+        // 候选拒绝[SemanticBarrier:ValueArity]：open tail 的运行时宽度不固定；
+        // exact tail 也只保存一个 pack carrier 而没有逐槽 scalar projection。把它当作
+        // closed producer 会伪造 nil 槽或重复整个 tail。
         return None;
     }
     if let Some(surplus) = values.fixed.get(bindings.len()..) {
@@ -573,8 +573,8 @@ fn producer_steps_from_bindings(
             .iter()
             .any(|value| matches!(value, HirExpr::Unresolved(_)))
         {
-            // 候选拒绝[LayerBoundary]：Unresolved 由 residual owner 保留诊断，本 pass 不把它
-            // 当成可静默丢弃的 closed scalar RHS。
+            // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出的失败证据，
+            // 本 pass 不把它当成可静默丢弃的 closed scalar RHS。
             return None;
         }
         debug_assert!(surplus.iter().all(seed_delay_expr_is_unobservable));

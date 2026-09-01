@@ -43,7 +43,9 @@ pub(super) fn inline_owned_branch_conditions(
         })
         .collect::<BTreeSet<_>>();
     // 候选拒绝[SemanticBarrier:Capture]：outer/captured condition local 可能被分支外或 closure 观察，不能删除 producer identity。
-    // 候选拒绝[PolicyBoundary]：debug/for condition local 是项目选择保留的源码身份。
+    // 候选拒绝[PolicyBoundary]：debug condition local 是项目选择保留的源码身份。
+    // 候选拒绝[SemanticBarrier:Scope]：for condition local 每轮重建且只在 loop body
+    // 可见；删除 producer 会把 per-iteration binder 改成跨轮值。
     // 候选拒绝[SemanticBarrier:Lifetime]：内联后删除 physical-root condition producer 会移除其 VM root declaration；lua54_01_close#17 用 __gc + collectgarbage 观察同槽清空前失去 root 的对象提前析构。
     if eligible.is_empty() {
         return false;

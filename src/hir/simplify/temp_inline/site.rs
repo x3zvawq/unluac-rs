@@ -14,7 +14,9 @@ use super::super::visit::{HirVisitor, visit_stmts};
 use super::*;
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
-    let stmt = transparent_block_head(stmt)?;
+    if let HirStmt::Block(block) = stmt {
+        return find_site_in_sequential_block(block, temp);
+    }
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
             find_site_in_exprs(&local_decl.values, temp, InlineSite::Direct)
@@ -59,17 +61,55 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::GenericFor(generic_for) => {
             find_site_in_exprs(&generic_for.iterator, temp, InlineSite::LoopHead)
         }
-        // 候选拒绝[LayerBoundary]：ErrNil 是 AST build global-decl syntax pattern 的显式诊断标记，temp-inline 不改写其 probe identity（regress_244）。
+        // 候选拒绝[PolicyBoundary]：项目选择保留 ErrNil 的显式诊断/probe identity，
+        // 供 AST build 恢复 global-decl 失败证据；temp-inline 不把 producer 埋进该协议（regress_244）。
         HirStmt::ErrNil(_) => None,
-        // 候选拒绝[LayerBoundary]：TBC value 与声明的配对由 AST build syntax pattern/close-scopes 消费，temp-inline 不改写该 resource identity（regress_244）。
+        // 候选拒绝[LayerBoundary]：close-scopes 需要相邻 definition + TBC binding 来物化
+        // `<close>` 词法 owner；它消费协议后会 invalidates TempChain 并重跑 temp-inline，
+        // 因而这里先保留独立 resource identity（regress_244）。
         HirStmt::ToBeClosed(_) => None,
         HirStmt::Close(_)
         | HirStmt::Break
         | HirStmt::Continue
         | HirStmt::Goto(_)
         | HirStmt::Label(_) => None,
-        HirStmt::Block(_) => unreachable!("transparent block head must be fully unwrapped"),
+        HirStmt::Block(_) => unreachable!("blocks are handled before ordinary statement sites"),
     }
+}
+
+fn find_site_in_sequential_block(block: &HirBlock, temp: TempId) -> Option<InlineSite> {
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        if stmt_writes_temp(stmt, temp) {
+            return None;
+        }
+        if !stmt_reads_temp(stmt, temp) {
+            continue;
+        }
+        let site = inline_site_in_stmt(stmt, temp)?;
+        return Some(if index == 0 {
+            site
+        } else {
+            InlineSite::PrefixedBlock
+        });
+    }
+    None
+}
+
+fn stmt_reads_temp(stmt: &HirStmt, temp: TempId) -> bool {
+    struct TempReadProbe {
+        temp: TempId,
+        found: bool,
+    }
+
+    impl HirVisitor for TempReadProbe {
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            self.found |= matches!(expr, HirExpr::TempRef(temp) if *temp == self.temp);
+        }
+    }
+
+    let mut probe = TempReadProbe { temp, found: false };
+    visit_stmts(std::slice::from_ref(stmt), &mut probe);
+    probe.found
 }
 
 pub(super) fn transparent_block_head(mut stmt: &HirStmt) -> Option<&HirStmt> {
@@ -77,11 +117,8 @@ pub(super) fn transparent_block_head(mut stmt: &HirStmt) -> Option<&HirStmt> {
         let HirStmt::Block(block) = stmt else {
             return Some(stmt);
         };
-        // 候选拒绝[LayerBoundary]：这个分类器只描述零前缀消费站点，不拥有 moved value、
-        // possible-home 或 block-prefix effect/capture/CFG 事实。第二条及更晚消费应由
-        // `inline_temps_in_block` 的结构前缀 owner 在证明求值顺序与 source value epoch 后
-        // 先拆出可移动站点；否则 `local t=x; do x=2; return t end` 会把旧快照改读成新值，
-        // `local t=f(); do g(); return t end` 也会把 f/g 顺序倒置。
+        // 部分专用 helper 的合同只接受零前缀 block；普通 site classification 另行扫描
+        // 顺序 block，并把 later use 降为只接受 proto 稳定常量的 PrefixedBlock site。
         stmt = block.stmts.first()?;
     }
 }
@@ -584,7 +621,8 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
                 })
         }
         HirExpr::Closure(_) => {
-            // 候选拒绝[LayerBoundary]：closure capture 的 source identity/upvalue provenance 由后续 locals/promotion owner 消费。
+            // 候选拒绝[SemanticBarrier:Capture]：把 producer 埋入 closure capture 会把定义点快照改成
+            // closure 创建/调用时读取，并可能把按引用 cell 改成按值表达式。
             // capture 一旦跨过函数边界，就会直接决定子 proto 的 upvalue provenance。
             // 如果这里把 temp 内联进 capture，后面的 locals / naming 就再也看不到
             // “这是一个单独的局部变量被捕获”这层结构事实了，像
@@ -634,7 +672,8 @@ fn find_site_in_decision(
         | InlineSite::FastCallArg
         | InlineSite::CallCallee
         | InlineSite::FastCallCallee
-        | InlineSite::AccessBase => InlineSite::Nested,
+        | InlineSite::AccessBase
+        | InlineSite::PrefixedBlock => InlineSite::Nested,
     };
     let conditional_site = outer_site.conditional();
     find_site_in_expr(&entry.test, temp, entry_site).or_else(|| {
@@ -768,6 +807,7 @@ pub(super) enum InlineSite {
     Condition,
     LoopCondition,
     LoopHead,
+    PrefixedBlock,
 }
 
 impl InlineSite {
@@ -780,6 +820,12 @@ impl InlineSite {
         match self {
             Self::Direct => true,
             Self::CallCallee | Self::FastCallCallee => true,
+            Self::PrefixedBlock => {
+                // block prefix 可能写任意 binding/home、触发事件或提前终止；只有不读取
+                // identity 且由 proto 持有、无事件的稳定常量能不依赖 prefix 摘要
+                // 安全移入 later use。
+                is_stable_inline_value(replacement)
+            }
             Self::Nested => {
                 // 候选拒绝[PolicyBoundary]：普通 nested 只收回无事件小表达式；effectful producer 需要先归入已证明的具体 eager 位置。
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
@@ -787,7 +833,9 @@ impl InlineSite {
             }
             Self::EagerOperand | Self::EagerAccessBase => {
                 // 候选拒绝[PolicyBoundary]：已证明必达的直接操作数/access base 仍受固定复杂度阈值限制。
-                // 候选拒绝[LayerBoundary]：Decision/Unresolved 由 decision/eliminate 与 residual owner 消费；temp-inline 不把中间恢复节点埋入普通表达式。
+                // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 消费；temp-inline 不把中间恢复节点埋入普通表达式。
+                // 候选拒绝[PolicyBoundary]：Unresolved 是 strict 失败/permissive Error 的显式证据，
+                // 不存在后续 simplify consumer，项目选择保留其独立 producer 形状。
                 // 候选拒绝[PolicyBoundary]：closure child body 不计入表达式复杂度，保留独立 producer 避免多行 IIFE。
                 expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
                     && !matches!(
@@ -841,7 +889,8 @@ impl InlineSite {
             | Self::FastCallCallee
             | Self::Condition
             | Self::LoopCondition
-            | Self::LoopHead => None,
+            | Self::LoopHead
+            | Self::PrefixedBlock => None,
             Self::ReturnValue => Some(options.return_inline_max_complexity),
             Self::Index => Some(options.index_inline_max_complexity),
             Self::CallArg => Some(options.args_inline_max_complexity),
@@ -863,7 +912,8 @@ impl InlineSite {
             | Self::FastCallArg
             | Self::AccessBase
             | Self::Condition
-            | Self::LoopHead => Self::Nested,
+            | Self::LoopHead
+            | Self::PrefixedBlock => Self::Nested,
         }
     }
 
@@ -889,7 +939,8 @@ impl InlineSite {
             | Self::FastCallArg
             | Self::CallCallee
             | Self::FastCallCallee
-            | Self::AccessBase => Self::Nested,
+            | Self::AccessBase
+            | Self::PrefixedBlock => Self::Nested,
         }
     }
 

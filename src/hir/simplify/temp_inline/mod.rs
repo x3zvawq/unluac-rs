@@ -42,6 +42,9 @@
 //! block-prefix 的求值、写入、capture 与控制流摘要，不能把整个词法块视为透明。
 //! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
 //! 单值 terminal return，不递归，也不开放其它普通内联 site。
+//! promotion 已失去单一 binding home 时，本 pass 使用 proto 的完整 `(slot, close epoch)`
+//! 全集继续做 may-alias；Unknown 因而只能命中既有 capture/value-flow/lifetime 屏障，不能
+//! 被不同 HIR identity 误当成物理不相交。
 
 mod rewrite;
 mod site;
@@ -259,8 +262,10 @@ fn collect_temp_root_lifetimes(
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> (CallRootLifetimeIndices, Vec<bool>) {
-    // 分析停用[LayerBoundary]：普通潜在事件只形成 locals 的待配对 owner 事实；temp-inline
-    // 只消费显式 GC fence 与已完成 overwrite pair，避免把尚未物化的观察扩成全局 inline barrier。
+    // 分析停用[LayerBoundary]：普通潜在事件由后续 locals 以
+    // `collect_call_root_lifetimes(..., true, ...)` 配对并物化 owner；locals 的 TempChain
+    // invalidation 会让 temp-inline 针对已物化 owner 重跑。本轮只消费显式 GC fence 与已完成
+    // overwrite pair，避免把尚未配对的观察扩成全局 inline barrier。
     let call_roots = collect_call_root_lifetimes(stmts, facts, safety, false, |_| true, |_| true);
     let mut marked = call_roots.marked_stmts(stmts.len());
     collect_lookup_gc_root_lifetimes(stmts, facts, safety, |_| true).mark_stmts(&mut marked);
@@ -396,7 +401,7 @@ fn inline_temps_in_block(
                 && kept_rev
                     .last()
                     .is_some_and(|next_stmt| stmt_stores_temp_in_table(next_stmt, temp)))
-            // 候选拒绝[LayerBoundary]：debug temp 是显式源码 binding，交给 locals/source identity owner。
+            // 候选拒绝[PolicyBoundary]：DebugScope 标注该 temp 是显式源码 binding，保留其独立声明身份。
             && !workspace.uses.has_debug_local_hint(temp)
             // 候选拒绝[SemanticBarrier:Capture]：若 closure 已按引用捕获该 home，删除写入会让 closure 观察旧值；见 regress_310。
             && !temp_rebinds_captured_slot(
@@ -423,6 +428,13 @@ fn inline_temps_in_block(
             // 下一条语句没有受支持的直接消费站点时，不形成相邻候选；proto 内更晚的
             // 唯一 use 属于非紧邻形状，具体站点边界由 `inline_site_in_stmt` 标记。
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
+            && prefixed_block_candidate_is_safe(
+                site,
+                temp,
+                value,
+                reference_captured,
+                workspace.safety,
+            )
             // 候选拒绝[LayerBoundary]：branch-value 定向入口只消费 terminal return，完整相邻内联由正常 temp-inline 轮次负责。
             && workspace
                 .scope
@@ -586,6 +598,21 @@ fn inline_crosses_evaluation_boundary(
             ))
 }
 
+fn prefixed_block_candidate_is_safe(
+    site: InlineSite,
+    temp: TempId,
+    value: &HirExpr,
+    reference_captured: &ReferenceCapturedBindings,
+    safety: HirExprSafety,
+) -> bool {
+    // 候选拒绝[SemanticBarrier:Capture]：`t = 1; closure = function() return t end;
+    // return t` 中删除 producer 会让按引用捕获的 closure 失去其 cell，即使 replacement
+    // 本身没有 GC lifetime。其它 PrefixedBlock 候选由 site 限制为 proto 常量持有的
+    // stable value；它们的结果不依赖 target physical home 是否继续作为 root。
+    site != InlineSite::PrefixedBlock
+        || (!reference_captured.temps.contains(&temp) && safety.result_is_gc_inert(value))
+}
+
 fn captured_slots_before_stmts(
     block: &HirBlock,
     facts: &ProtoPromotionFacts,
@@ -703,7 +730,7 @@ fn inline_adjacent_call_root_expression_overwrites(
         if total_use_count(root, live_use_counts) != 1 {
             continue;
         }
-        // 候选拒绝[LayerBoundary]：debug identity 由 locals/source-binding owner 保留。
+        // 候选拒绝[PolicyBoundary]：DebugScope 标注的 root/target 保留独立源码 binding 身份。
         if scratch.has_debug_local_hint(root) || scratch.has_debug_local_hint(target) {
             continue;
         }
@@ -792,7 +819,7 @@ fn inline_pure_materialization_run(
         // 候选拒绝[SemanticBarrier:EvalOrder]：非 repeatable 值或转发更早 observable def 会被延后/重复求值。
         // 候选拒绝[PolicyBoundary]：nested sink 继续服从固定复杂度展示阈值。
         // 候选拒绝[SemanticBarrier:Capture]：capture/self-rebind 改写会改变闭包或状态所见值。
-        // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+        // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
         if total_use_count(temp, context.live_use_counts) != 1
             || !context.safety.is_repeatable(value)
             || !InlineSite::Nested.allows(value, context.readability, context.safety)
@@ -946,7 +973,7 @@ fn inline_materialization_runs(
                     scratch: uses,
                     facts,
                     captured_slots_before_stmt,
-                    reference_captured_home_slots: reference_captured_home_slots.as_ref(),
+                    reference_captured_home_slots: &reference_captured_home_slots,
                 },
                 &mut removed_stmts,
             )
@@ -965,7 +992,7 @@ fn inline_materialization_runs(
                 safety: *safety,
                 reference_captured,
                 captured_slots_before_stmt,
-                reference_captured_home_slots: reference_captured_home_slots.as_ref(),
+                reference_captured_home_slots: &reference_captured_home_slots,
             },
             &mut removed_stmts,
         ) {
@@ -1019,7 +1046,7 @@ fn inline_materialization_runs(
         ) || total_use_count(callee_temp, live_use_counts) != 1
         {
             // 候选拒绝[SemanticBarrier:Capture]：callee home 被引用捕获或 producer 自引用时，删写会改变 closure/状态所见值。
-            // 候选拒绝[LayerBoundary]：debug callee 是源码 binding；由 locals owner 保留。
+            // 候选拒绝[PolicyBoundary]：DebugScope 标注的 callee 保留独立源码 binding 身份。
             // 候选拒绝[SemanticBarrier:Lifetime]：callee 存在额外消费时不能随本 call 一并删除。
             index = run_end + 1;
             continue;
@@ -1109,7 +1136,7 @@ fn inline_materialization_runs(
                 }
                 // 候选拒绝[SemanticBarrier:EvalOrder]：零 use 但不可安全丢弃的 call/lookup/allocation 仍是原序列中的可观察事件。
                 // 候选拒绝[SemanticBarrier:Capture]：被捕获/self-rebinding 的零 use 写也不能由 run 删除。
-                // 候选拒绝[LayerBoundary]：debug temp 即使零 use 也属于 source binding。
+                // 候选拒绝[PolicyBoundary]：DebugScope 标注的零 use temp 仍保留源码 binding 身份。
                 complete_run = false;
                 break;
             }
@@ -1132,7 +1159,7 @@ fn inline_materialization_runs(
                     // 删除 producer 会让该 use 失去原值。
                     // 候选拒绝[SemanticBarrier:EvalOrder]：即使唯一 use 位于计划删除集，带事件的 value 也不能随之丢弃。
                     // 候选拒绝[SemanticBarrier:Capture]：被捕获/self-rebinding 的 producer 不能作为纯依赖删除。
-                    // 候选拒绝[LayerBoundary]：debug temp 属于 source binding。
+                    // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留源码 binding 身份。
                     complete_run = false;
                     break;
                 }
@@ -1141,6 +1168,7 @@ fn inline_materialization_runs(
                 break;
             };
             if !candidate_is_safe
+                || !prefixed_block_candidate_is_safe(site, temp, value, reference_captured, *safety)
                 || (!stable_method_run_alias
                     && arg_value_forwards_prior_order_sensitive_expr(
                         value,
@@ -1159,7 +1187,7 @@ fn inline_materialization_runs(
                     ))
             {
                 // 候选拒绝[SemanticBarrier:Capture]：candidate home capture/self-rebind 会改变 closure 或状态所见值。
-                // 候选拒绝[LayerBoundary]：debug candidate 是源码 binding。
+                // 候选拒绝[PolicyBoundary]：DebugScope 标注的 candidate 保留源码 binding 身份。
                 // 候选拒绝[SemanticBarrier:EvalOrder]：参数转发更早的 order-sensitive def，或 sink 前缀含 observable eval，移动会重排事件。
                 complete_run = false;
                 break;
@@ -1353,7 +1381,6 @@ fn root_open_return_nil_pack_plan(
             })
             .collect::<Option<Vec<_>>>()
         else {
-            // 候选拒绝[LayerBoundary]：local/param/upvalue 等源码 identity 不由 raw-temp nil-pack 规则删除。
             continue;
         };
         let fixed_start = ret.values.fixed.windows(targets.len()).position(|window| {
@@ -1370,22 +1397,17 @@ fn root_open_return_nil_pack_plan(
         let mut non_entry_physical_read_protected_slots = BTreeSet::new();
         let mut targets_are_safe = true;
         let mut has_non_entry_physical_target = false;
-        let mut all_targets_have_exact_homes = true;
+        let mut all_physical_targets_have_exact_homes = true;
         for target in &targets {
             // 候选拒绝[SemanticBarrier:Lifetime]：额外 use 会继续观察原 nil 写入后的 temp。
             if total_use_count(*target, live_use_counts) != 1
-                // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+                // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
                 || scratch.has_debug_local_hint(*target)
             {
                 targets_are_safe = false;
                 break;
             }
-            let Some(possible_homes) = facts.possible_temp_home_slots(*target) else {
-                // 候选拒绝[LayerBoundary]：promotion owner 必须为 canonical target 给出完整
-                // possible-home，或把 lowering synthetic target 显式登记为 home-free；本层不猜 raw slot。
-                targets_are_safe = false;
-                break;
-            };
+            let possible_homes = conservative_temp_home_slots(*target, facts);
             // 候选拒绝[SemanticBarrier:Capture]：任一可能 target home 已被引用捕获时，
             // 删除 nil 写会让 closure 继续观察旧值。
             if possible_homes
@@ -1401,13 +1423,14 @@ fn root_open_return_nil_pack_plan(
             if is_non_entry_physical {
                 non_entry_physical_read_protected_slots.extend(possible_homes.iter().copied());
             }
-            all_targets_have_exact_homes &= facts.trusted_temp_home_slot(*target).is_some();
+            all_physical_targets_have_exact_homes &=
+                possible_homes.is_empty() || facts.trusted_temp_home_slot(*target).is_some();
             target_slots.extend(possible_homes);
         }
-        if has_non_entry_physical_target && !all_targets_have_exact_homes {
-            // 候选拒绝[LayerBoundary]：非 entry 的 physical target 只有在整组 nil 写形成
-            // root_lifetimes 的 exact-home overwrite transaction 时才能消费其未标记结论；
-            // merged/home-free 混组先由该 owner 拆清物理 root 事务。
+        if has_non_entry_physical_target && !all_physical_targets_have_exact_homes {
+            // 候选拒绝[SemanticBarrier:Lifetime]：merged physical target 可沿不同路径落入
+            // 不同 raw home；删除 nil 写会让实际 home 的旧资源继续跨 tail call/GC 存活，
+            // 而单个静态 target 无法指认应结束的 root epoch。明确 home-free target 不参与。
             targets_are_safe = false;
         }
         if targets_are_safe {
@@ -1422,10 +1445,6 @@ fn root_open_return_nil_pack_plan(
                 RootNilPackGapReadRelation::Overlap => {
                     // 候选拒绝[SemanticBarrier:ValueFlow]：return 的其它 fixed/tail 表达式若通过
                     // alias binding 读取 target home，删除 nil 写会让它读到此前 value。
-                    targets_are_safe = false;
-                }
-                RootNilPackGapReadRelation::Unknown => {
-                    // 候选拒绝[LayerBoundary]：return alias read 的完整 possible-home 由 promotion owner 提供。
                     targets_are_safe = false;
                 }
             }
@@ -1519,7 +1538,6 @@ fn inline_terminal_nil_return_pack(
         })
         .collect::<Option<Vec<_>>>()
     else {
-        // 候选拒绝[LayerBoundary]：并行写含 local/param/upvalue 等 identity 时由 locals/resource owner 处理，不删其声明或写入。
         return false;
     };
     if !ret
@@ -1536,11 +1554,7 @@ fn inline_terminal_nil_return_pack(
         .get(assign_index)
         .expect("capture snapshots must cover the terminal nil-pack assignment");
     for target in &targets {
-        let Some(possible_homes) = facts.possible_temp_home_slots(*target) else {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须为 canonical target 给出完整
-            // possible-home，或把 lowering synthetic target 显式登记为 home-free；本层不猜 raw slot。
-            return false;
-        };
+        let possible_homes = conservative_temp_home_slots(*target, facts);
         // 候选拒绝[SemanticBarrier:Capture]：closure 已引用捕获任一可能 target home 时，
         // 删除 nil 写会让其继续观察旧值。
         if possible_homes
@@ -1549,7 +1563,7 @@ fn inline_terminal_nil_return_pack(
         {
             return false;
         }
-        // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+        // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
         if scratch.has_debug_local_hint(*target) {
             return false;
         }
@@ -1585,11 +1599,6 @@ fn root_nil_pack_gap_preserves_slots_with_context(
             // 原程序看到 nil overwrite，删除后却会看到此前 value；target 的唯一 use 不能覆盖 alias read。
             return false;
         }
-        RootNilPackGapReadRelation::Unknown => {
-            // 候选拒绝[LayerBoundary]：gap read 的完整 possible-home 由 promotion owner 提供；
-            // 缺 provenance 时本层不能用不同 HIR identity 推断 value epoch 不相交。
-            return false;
-        }
     }
     match stmt {
         HirStmt::Assign(assign) => {
@@ -1601,10 +1610,7 @@ fn root_nil_pack_gap_preserves_slots_with_context(
                 if protected_slots.is_empty() {
                     return true;
                 }
-                // 候选拒绝[LayerBoundary]：direct binding 的 possible-home 由 promotion owner
-                // 完整提供；缺 provenance 时本层不能把 raw identity 当成不相交证明。
-                direct_lvalue_possible_home_slots(target, facts)
-                    .is_some_and(|homes| homes.is_disjoint(protected_slots))
+                direct_lvalue_possible_home_slots(target, facts).is_disjoint(protected_slots)
             })
         }
         HirStmt::LocalDecl(local_decl) => {
@@ -1613,10 +1619,7 @@ fn root_nil_pack_gap_preserves_slots_with_context(
                 return true;
             }
             local_decl.bindings.iter().all(|local| {
-                // 候选拒绝[LayerBoundary]：local merge 的完整 possible-home 由 promotion owner 提供。
-                facts
-                    .possible_local_home_slots(*local)
-                    .is_some_and(|homes| homes.is_disjoint(protected_slots))
+                conservative_local_home_slots(*local, facts).is_disjoint(protected_slots)
             })
         }
         HirStmt::GlobalDecl(_)
@@ -1669,9 +1672,7 @@ fn root_nil_pack_gap_preserves_slots_with_context(
             facts,
         ),
         HirStmt::NumericFor(numeric_for) => {
-            facts
-                .possible_local_home_slots(numeric_for.binding)
-                .is_some_and(|homes| homes.is_disjoint(protected_slots))
+            conservative_local_home_slots(numeric_for.binding, facts).is_disjoint(protected_slots)
                 && root_nil_pack_gap_block_preserves_slots(
                     &numeric_for.body,
                     protected_temps,
@@ -1683,9 +1684,7 @@ fn root_nil_pack_gap_preserves_slots_with_context(
         }
         HirStmt::GenericFor(generic_for) => {
             generic_for.bindings.iter().all(|binding| {
-                facts
-                    .possible_local_home_slots(*binding)
-                    .is_some_and(|homes| homes.is_disjoint(protected_slots))
+                conservative_local_home_slots(*binding, facts).is_disjoint(protected_slots)
             }) && root_nil_pack_gap_block_preserves_slots(
                 &generic_for.body,
                 protected_temps,
@@ -1720,7 +1719,6 @@ fn root_nil_pack_gap_preserves_slots_with_context(
 enum RootNilPackGapReadRelation {
     Disjoint,
     Overlap,
-    Unknown,
 }
 
 fn root_nil_pack_gap_read_relation(
@@ -1731,10 +1729,10 @@ fn root_nil_pack_gap_read_relation(
     if protected_slots.is_empty() {
         return RootNilPackGapReadRelation::Disjoint;
     }
-    match complete_direct_binding_read_homes_in_stmt(stmt, facts) {
-        Some(homes) if homes.is_disjoint(protected_slots) => RootNilPackGapReadRelation::Disjoint,
-        Some(_) => RootNilPackGapReadRelation::Overlap,
-        None => RootNilPackGapReadRelation::Unknown,
+    if direct_binding_read_homes_in_stmt(stmt, facts).is_disjoint(protected_slots) {
+        RootNilPackGapReadRelation::Disjoint
+    } else {
+        RootNilPackGapReadRelation::Overlap
     }
 }
 
@@ -1751,7 +1749,6 @@ fn root_open_return_remaining_read_relation(
     let mut collector = DirectBindingReadHomeCollector {
         facts,
         homes: BTreeSet::new(),
-        complete: true,
     };
     for (index, value) in ret.values.fixed.iter().enumerate() {
         if index < fixed_start || index >= fixed_start + target_count {
@@ -1761,54 +1758,46 @@ fn root_open_return_remaining_read_relation(
     if let Some(tail) = &ret.values.tail {
         visit_expr(tail.as_expr(), &mut collector);
     }
-    if !collector.complete {
-        RootNilPackGapReadRelation::Unknown
-    } else if collector.homes.is_disjoint(protected_slots) {
+    if collector.homes.is_disjoint(protected_slots) {
         RootNilPackGapReadRelation::Disjoint
     } else {
         RootNilPackGapReadRelation::Overlap
     }
 }
 
-fn complete_direct_binding_read_homes_in_stmt(
+fn direct_binding_read_homes_in_stmt(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
-) -> Option<BTreeSet<HomeSlotKey>> {
+) -> BTreeSet<HomeSlotKey> {
     let mut collector = DirectBindingReadHomeCollector {
         facts,
         homes: BTreeSet::new(),
-        complete: true,
     };
     visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.complete.then_some(collector.homes)
+    collector.homes
 }
 
-fn complete_direct_binding_read_homes_in_expr(
+fn direct_binding_read_homes_in_expr(
     expr: &HirExpr,
     facts: &ProtoPromotionFacts,
-) -> Option<BTreeSet<HomeSlotKey>> {
+) -> BTreeSet<HomeSlotKey> {
     let mut collector = DirectBindingReadHomeCollector {
         facts,
         homes: BTreeSet::new(),
-        complete: true,
     };
     visit_expr(expr, &mut collector);
-    collector.complete.then_some(collector.homes)
+    collector.homes
 }
 
 struct DirectBindingReadHomeCollector<'a> {
     facts: &'a ProtoPromotionFacts,
     homes: BTreeSet<HomeSlotKey>,
-    complete: bool,
 }
 
 impl DirectBindingReadHomeCollector<'_> {
     fn note_homes(&mut self, homes: Option<BTreeSet<HomeSlotKey>>) {
-        let Some(homes) = homes else {
-            self.complete = false;
-            return;
-        };
-        self.homes.extend(homes);
+        self.homes
+            .extend(homes.unwrap_or_else(|| physical_home_universe_for_unknown(self.facts)));
     }
 }
 
@@ -1869,15 +1858,49 @@ fn root_nil_pack_gap_preserves_slots(
 fn direct_lvalue_possible_home_slots(
     target: &HirLValue,
     facts: &ProtoPromotionFacts,
-) -> Option<BTreeSet<HomeSlotKey>> {
+) -> BTreeSet<HomeSlotKey> {
     match target {
-        HirLValue::Param(param) => facts.possible_param_home_slots(*param),
-        HirLValue::Temp(temp) => facts.possible_temp_home_slots(*temp),
-        HirLValue::Local(local) => facts.possible_local_home_slots(*local),
-        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
-            Some(BTreeSet::new())
-        }
+        HirLValue::Param(param) => conservative_param_home_slots(*param, facts),
+        HirLValue::Temp(temp) => conservative_temp_home_slots(*temp, facts),
+        HirLValue::Local(local) => conservative_local_home_slots(*local, facts),
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => BTreeSet::new(),
     }
+}
+
+fn conservative_param_home_slots(
+    param: crate::hir::common::ParamId,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    facts
+        .possible_param_home_slots(param)
+        .unwrap_or_else(|| physical_home_universe_for_unknown(facts))
+}
+
+fn conservative_local_home_slots(
+    local: crate::hir::common::LocalId,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    facts
+        .possible_local_home_slots(local)
+        .unwrap_or_else(|| physical_home_universe_for_unknown(facts))
+}
+
+fn conservative_temp_home_slots(
+    temp: TempId,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    facts
+        .possible_temp_home_slots(temp)
+        .unwrap_or_else(|| physical_home_universe_for_unknown(facts))
+}
+
+fn physical_home_universe_for_unknown(facts: &ProtoPromotionFacts) -> BTreeSet<HomeSlotKey> {
+    let universe = facts.physical_home_universe();
+    assert!(
+        !universe.is_empty(),
+        "unknown physical home requires a non-empty proto home universe"
+    );
+    universe.clone()
 }
 
 fn inline_numeric_for_stable_header_aliases(
@@ -1925,7 +1948,7 @@ fn inline_numeric_for_stable_header_aliases(
             && dependencies_are_stable
         {
             // 候选拒绝[SemanticBarrier:Lifetime]：额外 use、capture 或 self-rebind 仍要求 producer 存在。
-            // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+            // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
             if total_use_count(temp, live_use_counts) != 1
                 || !materialization_run_candidate_is_safe(
                     temp,
@@ -1955,7 +1978,7 @@ fn inline_numeric_for_stable_header_aliases(
             continue;
         }
         // 候选拒绝[SemanticBarrier:Lifetime]：额外 use、capture 或 self-rebind 仍要求 producer 存在。
-        // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+        // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
         if site != Some(InlineSite::LoopHead) {
             continue;
         }
@@ -1995,10 +2018,7 @@ fn materialization_run_preserves_value_reads(
     value: &HirExpr,
     facts: &ProtoPromotionFacts,
 ) -> bool {
-    let Some(read_homes) = complete_direct_binding_read_homes_in_expr(value, facts) else {
-        // 候选拒绝[LayerBoundary]：stable expression 的完整 direct-binding read homes 由 promotion owner 提供。
-        return false;
-    };
+    let read_homes = direct_binding_read_homes_in_expr(value, facts);
     if read_homes.is_empty() {
         return true;
     }
@@ -2008,18 +2028,13 @@ fn materialization_run_preserves_value_reads(
         if expr_touches_temp(value, target) {
             return false;
         }
-        let Some(target_homes) = facts.possible_temp_home_slots(target) else {
-            return false;
-        };
-        if !target_homes.is_disjoint(&read_homes) {
+        let target_write_homes = complete_materialization_write_homes(target, facts);
+        if !target_write_homes.is_disjoint(&read_homes) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：后续 run target 覆盖 expression source home 时，
             // producer 保存的是旧快照，移入 loop header 会改读新 epoch。
             return false;
         }
-        target_homes.is_empty()
-            || facts
-                .trusted_immediate_move_write_homes(target)
-                .is_some_and(|homes| homes.is_disjoint(&read_homes))
+        true
     })
 }
 
@@ -2034,46 +2049,41 @@ struct NumericForHeaderProof<'a> {
     safety: HirExprSafety,
     reference_captured: &'a ReferenceCapturedBindings,
     captured_slots_before_stmt: &'a CapturedSlotSnapshots,
-    reference_captured_home_slots: Option<&'a BTreeSet<HomeSlotKey>>,
+    reference_captured_home_slots: &'a BTreeSet<HomeSlotKey>,
 }
 
 fn complete_reference_captured_home_slots(
     captured: &ReferenceCapturedBindings,
     facts: &ProtoPromotionFacts,
-) -> Option<BTreeSet<HomeSlotKey>> {
+) -> BTreeSet<HomeSlotKey> {
     let mut homes = BTreeSet::new();
-    for possible in captured
-        .params
-        .iter()
-        .map(|param| facts.possible_param_home_slots(*param))
-        .chain(
-            captured
-                .locals
-                .iter()
-                .map(|local| facts.possible_local_home_slots(*local)),
-        )
-        .chain(
-            captured
-                .temps
-                .iter()
-                .map(|temp| facts.possible_temp_home_slots(*temp)),
-        )
-    {
-        homes.extend(possible?);
+    for param in &captured.params {
+        homes.extend(conservative_param_home_slots(*param, facts));
     }
-    Some(homes)
+    for local in &captured.locals {
+        homes.extend(conservative_local_home_slots(*local, facts));
+    }
+    for temp in &captured.temps {
+        homes.extend(conservative_temp_home_slots(*temp, facts));
+    }
+    homes
 }
 
 fn complete_materialization_write_homes(
     temp: TempId,
     facts: &ProtoPromotionFacts,
-) -> Option<BTreeSet<HomeSlotKey>> {
-    let mut homes = facts.possible_temp_home_slots(temp)?;
+) -> BTreeSet<HomeSlotKey> {
+    let mut homes = conservative_temp_home_slots(temp, facts);
     if homes.is_empty() {
-        return Some(homes);
+        return homes;
     }
-    homes.extend(facts.trusted_immediate_move_write_homes(temp)?);
-    Some(homes)
+    homes.extend(
+        facts
+            .trusted_immediate_move_write_homes(temp)
+            .cloned()
+            .unwrap_or_else(|| physical_home_universe_for_unknown(facts)),
+    );
+    homes
 }
 
 fn numeric_for_binding_header_alias_plan(
@@ -2097,45 +2107,29 @@ fn numeric_for_binding_header_alias_plan(
             return None;
         }
         if proof.scratch.has_debug_local_hint(temp) {
-            // 候选拒绝[LayerBoundary]：debug temp 是源码 binding，由 locals/source identity owner 保留。
+            // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
             return None;
         }
-        let Some(chain_write_homes) = complete_materialization_write_homes(temp, proof.facts)
-        else {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须提供 chain target 的完整
-            // possible-home 与 hidden immediate-MOVE 写集合；本层不从 canonical identity 猜物理写集。
-            return None;
-        };
+        let chain_write_homes = complete_materialization_write_homes(temp, proof.facts);
         if !chain_write_homes.is_disjoint(sink_captured_slots) {
             // 候选拒绝[SemanticBarrier:Capture]：chain primary/hidden-MOVE 写入了 sink 前已捕获的 home；删除 producer 会让 closure 继续观察旧 cell 值。
             return None;
         }
-        if !chain_write_homes.is_empty() {
-            let Some(reference_captured_home_slots) = proof.reference_captured_home_slots else {
-                // 候选拒绝[LayerBoundary]：promotion owner 必须给出所有引用 capture binding
-                // 的完整 possible-home；home-free chain 无物理写时不需要该事实。
-                return None;
-            };
-            if !chain_write_homes.is_disjoint(reference_captured_home_slots) {
-                // 候选拒绝[SemanticBarrier:Capture]：删除写入 captured home 的 chain producer
-                // 会让现有或随后创建的 closure 观察此前 cell value（regress_310）。
-                return None;
-            }
+        if !chain_write_homes.is_empty()
+            && !chain_write_homes.is_disjoint(proof.reference_captured_home_slots)
+        {
+            // 候选拒绝[SemanticBarrier:Capture]：删除写入 captured home 的 chain producer
+            // 会让现有或随后创建的 closure 观察此前 cell value（regress_310）。
+            return None;
         }
         chain.push((current_index, temp));
         match value {
             HirExpr::ParamRef(param) => {
-                let Some(homes) = proof.facts.possible_param_home_slots(*param) else {
-                    // 候选拒绝[LayerBoundary]：promotion owner 必须提供参数的完整 possible-home。
-                    return None;
-                };
+                let homes = conservative_param_home_slots(*param, proof.facts);
                 break (value.clone(), homes, None, false, current_index);
             }
             HirExpr::LocalRef(local) => {
-                let Some(homes) = proof.facts.possible_local_home_slots(*local) else {
-                    // 候选拒绝[LayerBoundary]：promotion owner 必须提供 local 的完整 possible-home。
-                    return None;
-                };
+                let homes = conservative_local_home_slots(*local, proof.facts);
                 break (value.clone(), homes, None, false, current_index);
             }
             HirExpr::TempRef(source) => {
@@ -2145,10 +2139,7 @@ fn numeric_for_binding_header_alias_plan(
                 }) {
                     current_index = source_index;
                 } else {
-                    let Some(homes) = proof.facts.possible_temp_home_slots(*source) else {
-                        // 候选拒绝[LayerBoundary]：run 外 source temp 的完整 possible-home 由 promotion owner 提供。
-                        return None;
-                    };
+                    let homes = conservative_temp_home_slots(*source, proof.facts);
                     break (value.clone(), homes, Some(*source), false, current_index);
                 }
             }
@@ -2168,12 +2159,7 @@ fn numeric_for_binding_header_alias_plan(
     let source_is_reference_captured = if source_homes.is_empty() {
         false
     } else {
-        let Some(reference_captured_home_slots) = proof.reference_captured_home_slots else {
-            // 候选拒绝[LayerBoundary]：physical source 的 capture relation 需要 promotion owner
-            // 提供全部引用 capture binding 的完整 possible-home。
-            return None;
-        };
-        !source_homes.is_disjoint(reference_captured_home_slots)
+        !source_homes.is_disjoint(proof.reference_captured_home_slots)
     };
 
     let chain_indices = chain
@@ -2191,12 +2177,7 @@ fn numeric_for_binding_header_alias_plan(
             // 重写 source 时，原 producer 保留旧快照，延后读取会切到新 value epoch。
             return None;
         }
-        let Some(target_write_homes) = complete_materialization_write_homes(target, proof.facts)
-        else {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须提供链外 target 的完整
-            // possible-home 与 hidden immediate-MOVE 写集合。
-            return None;
-        };
+        let target_write_homes = complete_materialization_write_homes(target, proof.facts);
         if !target_write_homes.is_disjoint(&source_homes) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：链外状态准备写覆盖 source possible-home 时，
             // 原 temp 冻结旧值；延后读取会切到新 epoch。
@@ -2232,7 +2213,7 @@ struct OpenReturnFixedAliasProof<'a> {
     scratch: &'a TempUseScratch,
     facts: &'a ProtoPromotionFacts,
     captured_slots_before_stmt: &'a CapturedSlotSnapshots,
-    reference_captured_home_slots: Option<&'a BTreeSet<HomeSlotKey>>,
+    reference_captured_home_slots: &'a BTreeSet<HomeSlotKey>,
 }
 
 fn inline_open_return_fixed_alias_run(
@@ -2277,17 +2258,11 @@ fn inline_open_return_fixed_alias_run(
             || proof.scratch.has_debug_local_hint(target)
         {
             // 候选拒绝[SemanticBarrier:Lifetime]：fixed prefix 非对应唯一 target use 时，删除 alias 会改变其它消费者所见值。
-            // 候选拒绝[LayerBoundary]：debug alias 是源码 binding。
+            // 候选拒绝[PolicyBoundary]：DebugScope 标注的 alias 保留独立源码 binding 身份。
             return false;
         }
-        let (Some(target_homes), Some(source_homes)) = (
-            proof.facts.possible_temp_home_slots(target),
-            proof.facts.possible_temp_home_slots(*source),
-        ) else {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须为 alias source/target 提供完整
-            // possible-home；home-free 与 complete finite union 均由本层直接消费。
-            return false;
-        };
+        let target_homes = conservative_temp_home_slots(target, proof.facts);
+        let source_homes = conservative_temp_home_slots(*source, proof.facts);
         if target_homes
             .iter()
             .chain(&source_homes)
@@ -2303,19 +2278,13 @@ fn inline_open_return_fixed_alias_run(
         target_slots.extend(target_homes);
         source_slots.extend(source_homes);
     }
-    if !(target_slots.is_empty() && source_slots.is_empty()) {
-        let Some(reference_captured_home_slots) = proof.reference_captured_home_slots else {
-            // 候选拒绝[LayerBoundary]：physical alias 的 capture relation 需要 promotion owner
-            // 给出全部引用 capture binding 的完整 possible-home。
-            return false;
-        };
-        if !target_slots.is_disjoint(reference_captured_home_slots)
-            || !source_slots.is_disjoint(reference_captured_home_slots)
-        {
-            // 候选拒绝[SemanticBarrier:Capture]：删除 captured target 写或把 captured source
-            // 读取延到 open tail setup 之后，会改变 closure/return 观察的 value epoch（regress_310）。
-            return false;
-        }
+    if !(target_slots.is_empty() && source_slots.is_empty())
+        && (!target_slots.is_disjoint(proof.reference_captured_home_slots)
+            || !source_slots.is_disjoint(proof.reference_captured_home_slots))
+    {
+        // 候选拒绝[SemanticBarrier:Capture]：删除 captured target 写或把 captured source
+        // 读取延到 open tail setup 之后，会改变 closure/return 观察的 value epoch（regress_310）。
+        return false;
     }
     if !target_temps.is_disjoint(&source_temps) || !target_slots.is_disjoint(&source_slots) {
         // 候选拒绝[SemanticBarrier:EvalOrder]：source/target 同槽会让 fixed return 读到 tail setup 后的新值；见 regress_310。
@@ -2332,15 +2301,11 @@ fn inline_open_return_fixed_alias_run(
             return false;
         }
         let protected_slots_are_empty = target_slots.is_empty() && source_slots.is_empty();
-        let possible_homes = proof.facts.possible_temp_home_slots(target);
-        if !protected_slots_are_empty && possible_homes.is_none() {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须提供 tail setup target 的完整
-            // possible-home；alias 双方均 home-free 时无需物理证明。
-            return false;
-        }
-        if possible_homes.is_some_and(|homes| {
-            !homes.is_disjoint(&target_slots) || !homes.is_disjoint(&source_slots)
-        }) {
+        let possible_homes = conservative_temp_home_slots(target, proof.facts);
+        if !protected_slots_are_empty
+            && (!possible_homes.is_disjoint(&target_slots)
+                || !possible_homes.is_disjoint(&source_slots))
+        {
             // 候选拒绝[SemanticBarrier:EvalOrder]：tail setup 覆盖 fixed alias 槽时，内联会把读取延后到覆盖之后。
             return false;
         }
@@ -2434,7 +2399,7 @@ fn materialization_run_candidate_is_safe(
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
 ) -> bool {
-    // 候选拒绝[LayerBoundary]：debug temp 是源码 binding，由 locals/source identity owner 保留。
+    // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
     !scratch.has_debug_local_hint(temp)
         // 候选拒绝[SemanticBarrier:Capture]：引用捕获该 home 的 closure 必须观察 producer 写入后的值；见 regress_310。
         && !temp_rebinds_captured_slot(
@@ -2612,8 +2577,8 @@ fn inline_repeat_head_scalar_temp(
     // 这里的 producer 已由 structure fact 证明是 continue 重定位出的 latch prefix；
     // 删除它会把 RHS 从每轮 body 前移动到 body 后的 until 求值点。
     if !facts.is_repeat_condition_prefix_temp(temp) {
-        // 候选拒绝[LayerBoundary]：只有 structure owner 标注的 before-body condition
-        // prefix 才能沿本事务移回 until；普通 body 首句不具备该路径语义。
+        // 普通 body 首句不形成 repeat-prefix 候选；只有 structure 已标注的 before-body
+        // condition prefix 才属于本事务。
         return false;
     }
     inline_repeat_head_scalar_temp_with_proven_prefix(
@@ -2639,7 +2604,7 @@ fn inline_repeat_head_scalar_temp_with_proven_prefix(
     let Some((temp, value)) = repeat_stmt.body.stmts.first().and_then(inline_candidate) else {
         return false;
     };
-    // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+    // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
     // 候选拒绝[SemanticBarrier:Lifetime]：非唯一 condition use 仍需要原 temp。
     if scratch.has_debug_local_hint(temp)
         || total_use_count(temp, live_use_counts) != 1
@@ -2648,7 +2613,8 @@ fn inline_repeat_head_scalar_temp_with_proven_prefix(
         return false;
     }
     let Some(site) = inline_site_in_repeat_condition(&repeat_stmt.cond, temp) else {
-        // 候选拒绝[LayerBoundary]：condition 的唯一 use 位于 closure capture；其 source identity 由 locals/promotion owner 消费。
+        // 候选拒绝[SemanticBarrier:Capture]：唯一 use 位于 closure capture 时，内联会把定义点快照
+        // 改成 closure 的按引用 cell/value capture。
         return false;
     };
     if !site.allows(value, policy.readability, policy.safety) {
@@ -2734,19 +2700,9 @@ fn repeat_head_dependencies_are_stable(
             return false;
         }
 
-        let Some(read_homes) = complete_direct_binding_read_homes_in_expr(value, proof.facts)
-        else {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须为 RHS 的全部 direct binding
-            // 提供完整 possible-home；本层不从 HIR identity 猜物理依赖。
-            return false;
-        };
+        let read_homes = direct_binding_read_homes_in_expr(value, proof.facts);
         let read_identities = direct_binding_identities_in_expr(value);
-        let Some(body_writes) = complete_direct_binding_writes_in_stmts(body_suffix, proof.facts)
-        else {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须为 body direct writes 提供完整
-            // possible-home 与 hidden immediate-MOVE 写集合。
-            return false;
-        };
+        let body_writes = direct_binding_writes_in_stmts(body_suffix, proof.facts);
         if read_identities.overlaps(&body_writes.identities)
             || !read_homes.is_disjoint(&body_writes.homes)
         {
@@ -2778,13 +2734,8 @@ fn repeat_head_dependencies_are_stable(
             let source_is_home_captured = if read_homes.is_empty() {
                 false
             } else {
-                let Some(reference_captured_homes) =
-                    complete_reference_captured_home_slots(proof.reference_captured, proof.facts)
-                else {
-                    // 候选拒绝[LayerBoundary]：promotion owner 必须提供全部引用 capture binding
-                    // 的完整 possible-home，才能排除不同 binding 共槽改写 source。
-                    return false;
-                };
+                let reference_captured_homes =
+                    complete_reference_captured_home_slots(proof.reference_captured, proof.facts);
                 !read_homes.is_disjoint(&reference_captured_homes)
             };
             if source_is_identity_captured || source_is_home_captured {
@@ -2795,11 +2746,7 @@ fn repeat_head_dependencies_are_stable(
         }
     }
 
-    let Some(target_write_homes) = complete_materialization_write_homes(temp, proof.facts) else {
-        // 候选拒绝[LayerBoundary]：promotion owner 必须提供 condition-prefix target 的
-        // primary 与 hidden immediate-MOVE 完整写集合。
-        return false;
-    };
+    let target_write_homes = complete_materialization_write_homes(temp, proof.facts);
     if proof.reference_captured.temps.contains(&temp)
         || !target_write_homes.is_disjoint(proof.captured_slots)
     {
@@ -2808,13 +2755,8 @@ fn repeat_head_dependencies_are_stable(
         return false;
     }
     if !target_write_homes.is_empty() {
-        let Some(reference_captured_homes) =
-            complete_reference_captured_home_slots(proof.reference_captured, proof.facts)
-        else {
-            // 候选拒绝[LayerBoundary]：promotion owner 必须提供全部引用 capture binding
-            // 的完整 possible-home；home-free target 不需要物理 capture 证明。
-            return false;
-        };
+        let reference_captured_homes =
+            complete_reference_captured_home_slots(proof.reference_captured, proof.facts);
         if !target_write_homes.is_disjoint(&reference_captured_homes) {
             // 候选拒绝[SemanticBarrier:Capture]：prefix target 的 primary/hidden write 命中
             // captured home 时，删除 producer 会改变 closure 观察值。
@@ -2884,23 +2826,22 @@ struct DirectBindingWriteSummary {
     close_from_regs: BTreeSet<usize>,
 }
 
-fn complete_direct_binding_writes_in_stmts(
+fn direct_binding_writes_in_stmts(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
-) -> Option<DirectBindingWriteSummary> {
+) -> DirectBindingWriteSummary {
     let mut collector = DirectBindingWriteCollector {
         facts,
         identities: DirectBindingIdentities::default(),
         homes: BTreeSet::new(),
         close_from_regs: BTreeSet::new(),
-        complete: true,
     };
     visit_stmts(stmts, &mut collector);
-    collector.complete.then_some(DirectBindingWriteSummary {
+    DirectBindingWriteSummary {
         identities: collector.identities,
         homes: collector.homes,
         close_from_regs: collector.close_from_regs,
-    })
+    }
 }
 
 struct DirectBindingWriteCollector<'a> {
@@ -2908,16 +2849,12 @@ struct DirectBindingWriteCollector<'a> {
     identities: DirectBindingIdentities,
     homes: BTreeSet<HomeSlotKey>,
     close_from_regs: BTreeSet<usize>,
-    complete: bool,
 }
 
 impl DirectBindingWriteCollector<'_> {
     fn note_homes(&mut self, homes: Option<BTreeSet<HomeSlotKey>>) {
-        let Some(homes) = homes else {
-            self.complete = false;
-            return;
-        };
-        self.homes.extend(homes);
+        self.homes
+            .extend(homes.unwrap_or_else(|| physical_home_universe_for_unknown(self.facts)));
     }
 }
 
@@ -2959,7 +2896,8 @@ impl HirVisitor for DirectBindingWriteCollector<'_> {
             }
             HirLValue::Temp(temp) => {
                 self.identities.temps.insert(*temp);
-                self.note_homes(complete_materialization_write_homes(*temp, self.facts));
+                self.homes
+                    .extend(complete_materialization_write_homes(*temp, self.facts));
             }
             HirLValue::Upvalue(upvalue) => {
                 self.identities.upvalues.insert(*upvalue);
@@ -3022,7 +2960,7 @@ fn inline_repeat_tail_temp(
     let Some((temp, value)) = inline_candidate(&repeat_stmt.body.stmts[tail_index]) else {
         return false;
     };
-    // 候选拒绝[LayerBoundary]：debug temp 是源码 binding。
+    // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
     // 候选拒绝[SemanticBarrier:Lifetime]：self-reference 或额外 use 需要保留状态写入/temp 值。
     if scratch.has_debug_local_hint(temp)
         || expr_touches_temp(value, temp)
@@ -3032,7 +2970,8 @@ fn inline_repeat_tail_temp(
         return false;
     }
     let Some(site) = inline_site_in_repeat_condition(&repeat_stmt.cond, temp) else {
-        // 候选拒绝[LayerBoundary]：condition 的唯一 use 位于 closure capture；其 source identity 由 locals/promotion owner 消费。
+        // 候选拒绝[SemanticBarrier:Capture]：唯一 use 位于 closure capture 时，内联会把定义点快照
+        // 改成 closure 的按引用 cell/value capture。
         return false;
     };
     if !site.allows(value, policy.readability, policy.safety)
@@ -3081,9 +3020,7 @@ fn temp_rebinds_captured_slot(
     facts: &ProtoPromotionFacts,
     captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
-    facts
-        .home_slot(temp)
-        .is_some_and(|slot| captured_slots.contains(&slot))
+    !conservative_temp_home_slots(temp, facts).is_disjoint(captured_slots)
 }
 
 #[cfg(test)]
@@ -3217,6 +3154,147 @@ mod tests {
                 method_name: None,
             },
         }))
+    }
+
+    fn prefixed_block_sink(temp: TempId, prefix: HirStmt) -> HirStmt {
+        HirStmt::Block(Box::new(HirBlock {
+            stmts: vec![
+                prefix,
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
+                })),
+            ],
+        }))
+    }
+
+    #[test]
+    fn later_block_site_accepts_gc_inert_physical_producers() {
+        let target = TempId(0);
+        let prefix_temp = TempId(1);
+        let prefix = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(prefix_temp)],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+        }));
+        let producer = |value| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(target)],
+                values: HirValuePack::fixed(vec![value]),
+            }))
+        };
+
+        let mut literal = empty_proto(
+            HirBlock {
+                stmts: vec![
+                    producer(HirExpr::Integer(7)),
+                    prefixed_block_sink(target, prefix.clone()),
+                ],
+            },
+            vec![target, prefix_temp],
+        );
+        let mut literal_facts = ProtoPromotionFacts::default();
+        literal_facts.record_temp_home_slot_for_test(target, HomeSlotKey::new(0, 0));
+        assert!(inline_temps_in_proto_with_facts(
+            &mut literal,
+            ReadabilityOptions::default(),
+            &literal_facts,
+            DecompileDialect::Lua54,
+            &[],
+        ));
+        assert!(matches!(
+            literal.body.stmts.as_slice(),
+            [HirStmt::Block(block)]
+                if matches!(block.stmts.as_slice(),
+                    [HirStmt::Assign(_), HirStmt::Return(ret)]
+                        if ret.values.fixed == vec![HirExpr::Integer(7)])
+        ));
+
+        let string_value = HirExpr::String("stable".into());
+        let mut string = empty_proto(
+            HirBlock {
+                stmts: vec![
+                    producer(string_value.clone()),
+                    prefixed_block_sink(
+                        target,
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(prefix_temp)],
+                            values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                        })),
+                    ),
+                ],
+            },
+            vec![target, prefix_temp],
+        );
+        let mut string_facts = ProtoPromotionFacts::default();
+        string_facts.record_temp_home_slot_for_test(target, HomeSlotKey::new(0, 0));
+        assert!(inline_temps_in_proto_with_facts(
+            &mut string,
+            ReadabilityOptions::default(),
+            &string_facts,
+            DecompileDialect::Lua54,
+            &[],
+        ));
+        assert!(matches!(
+            string.body.stmts.as_slice(),
+            [HirStmt::Block(block)]
+                if matches!(block.stmts.as_slice(),
+                    [HirStmt::Assign(_), HirStmt::Return(ret)]
+                        if ret.values.fixed == vec![string_value])
+        ));
+
+        let source = LocalId(0);
+        let source_write = HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Local(source)],
+            values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
+        }));
+        let mut local = empty_proto(
+            HirBlock {
+                stmts: vec![
+                    producer(HirExpr::LocalRef(source)),
+                    prefixed_block_sink(target, source_write),
+                ],
+            },
+            vec![target],
+        );
+        local.locals.push(source);
+        local.local_debug_hints.push(None);
+        local.local_debug_scopes.push(None);
+        let original = local.body.clone();
+        let mut local_facts = ProtoPromotionFacts::default();
+        local_facts.record_temp_home_slot_for_test(target, HomeSlotKey::new(0, 0));
+        local_facts.record_local_home_slot(source, HomeSlotKey::new(1, 0));
+        assert!(!inline_temps_in_proto_with_facts(
+            &mut local,
+            ReadabilityOptions::default(),
+            &local_facts,
+            DecompileDialect::Lua54,
+            &[],
+        ));
+        assert_eq!(local.body, original);
+
+        let sink = prefixed_block_sink(target, prefix);
+        let site = inline_site_in_stmt(&sink, target)
+            .expect("later unconditional return must expose a prefixed block site");
+        assert!(matches!(site, InlineSite::PrefixedBlock));
+        assert!(!site.allows(
+            &HirExpr::Call(Box::new(HirCallExpr {
+                callee: HirExpr::GlobalRef(HirGlobalRef { name: "f".into() }),
+                args: HirValuePack::default(),
+                method: false,
+                fastcall: None,
+                method_name: None,
+            })),
+            ReadabilityOptions::default(),
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+
+        let rewritten_prefix = prefixed_block_sink(
+            target,
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(target)],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
+            })),
+        );
+        assert!(inline_site_in_stmt(&rewritten_prefix, target).is_none());
     }
 
     #[test]
@@ -3544,23 +3622,122 @@ mod tests {
     }
 
     #[test]
-    fn terminal_nil_pack_rejects_unknown_out_of_range_temps() {
-        let mut block = terminal_nil_pack_block();
-        let original = block.clone();
+    fn root_open_nil_pack_mixed_homefree_target_uses_physical_root_fact() {
+        let mut block = root_open_nil_pack_block();
         let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
         let scratch = TempUseScratch::new(&proto, 2);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        facts.record_home_free_temp(TempId(1));
         let snapshots = empty_capture_snapshots(2);
         let mut live_uses = vec![1, 1];
+        let (_, physical_roots) = collect_temp_root_lifetimes(
+            &block.stmts,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
 
-        assert!(!inline_terminal_nil_return_pack(
+        assert!(!physical_roots[0]);
+        assert!(inline_root_open_return_nil_pack(
             &mut block,
             &scratch,
             &mut live_uses,
-            &ProtoPromotionFacts::default(),
+            &facts,
+            &snapshots,
+            &physical_roots,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [HirStmt::Return(ret)]
+                if ret.values.fixed == vec![HirExpr::Nil, HirExpr::Nil]
+                    && ret.values.tail.is_some()
+        ));
+
+        let mut rooted = root_open_nil_pack_block();
+        rooted.stmts.insert(
+            0,
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(TempId(2))],
+                values: HirValuePack::fixed(vec![HirExpr::Call(Box::new(HirCallExpr {
+                    callee: HirExpr::GlobalRef(HirGlobalRef {
+                        name: "resource".into(),
+                    }),
+                    args: HirValuePack::default(),
+                    method: false,
+                    fastcall: None,
+                    method_name: None,
+                }))]),
+            })),
+        );
+        rooted.stmts.insert(1, call_stmt("collectgarbage"));
+        let rooted_proto = empty_proto(rooted.clone(), vec![TempId(0), TempId(1), TempId(2)]);
+        let rooted_scratch = TempUseScratch::new(&rooted_proto, 3);
+        let mut rooted_facts = facts;
+        rooted_facts.record_temp_home_slot_for_test(TempId(2), HomeSlotKey::new(0, 0));
+        let rooted_snapshots = empty_capture_snapshots(4);
+        let (_, rooted_physical_roots) = collect_temp_root_lifetimes(
+            &rooted.stmts,
+            &rooted_facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        assert!(rooted_physical_roots[2]);
+        assert!(
+            root_open_return_nil_pack_plan(
+                &rooted,
+                &rooted_scratch,
+                &[1, 1, 0],
+                &rooted_facts,
+                &rooted_snapshots,
+                &rooted_physical_roots,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_nil_pack_uses_home_universe_for_unknown_targets() {
+        let mut block = terminal_nil_pack_block();
+        let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
+        let scratch = TempUseScratch::new(&proto, 2);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
+        facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(1, 0));
+        facts.record_temp_home_merge(TempId(0), None);
+        facts.record_temp_home_merge(TempId(1), None);
+        let mut live_uses = vec![1, 1];
+
+        assert!(inline_terminal_nil_return_pack(
+            &mut block,
+            &scratch,
+            &mut live_uses,
+            &facts,
+            &empty_capture_snapshots(2),
+            &[false, false],
+        ));
+
+        let mut captured = terminal_nil_pack_block();
+        let original = captured.clone();
+        let captured_home = BTreeSet::from([HomeSlotKey::new(0, 0)]);
+        let mut snapshots = CapturedSlotSnapshots::new(2, &captured_home);
+        snapshots.push(&captured_home);
+        snapshots.push(&captured_home);
+        let mut live_uses = vec![1, 1];
+        assert!(!inline_terminal_nil_return_pack(
+            &mut captured,
+            &scratch,
+            &mut live_uses,
+            &facts,
             &snapshots,
             &[false, false],
         ));
-        assert_eq!(block, original);
+        assert_eq!(captured, original);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown physical home requires a non-empty proto home universe")]
+    fn unknown_home_without_a_physical_universe_is_an_invalid_fact_set() {
+        let _ = conservative_temp_home_slots(TempId(0), &ProtoPromotionFacts::default());
     }
 
     #[test]
@@ -3570,6 +3747,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
         }));
         let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
         facts.record_temp_home_slot_for_test(TempId(2), HomeSlotKey::new(2, 0));
         facts.record_temp_home_merge(TempId(2), Some(BTreeSet::from([HomeSlotKey::new(3, 0)])));
         facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(3, 0));
@@ -3742,7 +3920,7 @@ mod tests {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 reference_captured: &ReferenceCapturedBindings::default(),
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));
@@ -3778,7 +3956,7 @@ mod tests {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 reference_captured: &ReferenceCapturedBindings::default(),
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));
@@ -3827,7 +4005,7 @@ mod tests {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 reference_captured: &ReferenceCapturedBindings::default(),
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));
@@ -3852,7 +4030,7 @@ mod tests {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 reference_captured: &ReferenceCapturedBindings::default(),
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));
@@ -3863,7 +4041,7 @@ mod tests {
     fn open_return_aliases_accept_home_free_bindings_but_not_identity_clobbers() {
         let mut block = open_return_alias_block(TempId(4));
         let mut facts = ProtoPromotionFacts::default();
-        for temp in [TempId(0), TempId(1), TempId(2), TempId(3)] {
+        for temp in [TempId(0), TempId(1), TempId(2), TempId(3), TempId(4)] {
             facts.record_home_free_temp(temp);
         }
         let snapshots = empty_capture_snapshots(4);
@@ -3880,7 +4058,7 @@ mod tests {
                 scratch: &scratch,
                 facts: &facts,
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));
@@ -3904,7 +4082,7 @@ mod tests {
                 scratch: &scratch,
                 facts: &facts,
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));
@@ -3956,7 +4134,7 @@ mod tests {
             safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
             reference_captured: &reference_captured,
             captured_slots_before_stmt: &snapshots,
-            reference_captured_home_slots: Some(&captured_homes),
+            reference_captured_home_slots: &captured_homes,
         };
 
         let plan = numeric_for_binding_header_alias_plan(&stable, 0..3, 2, &live_uses, &proof)
@@ -3998,7 +4176,7 @@ mod tests {
     }
 
     #[test]
-    fn numeric_for_binding_chain_accepts_external_temp_until_its_epoch_is_rewritten() {
+    fn numeric_for_binding_chain_accepts_unknown_external_home_without_interference() {
         let candidate = |target, value| {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(target)],
@@ -4030,6 +4208,7 @@ mod tests {
             facts.record_home_free_temp(temp);
         }
         facts.record_temp_home_slot_for_test(TempId(3), HomeSlotKey::new(3, 0));
+        facts.record_temp_home_merge(TempId(3), None);
         let snapshots = empty_capture_snapshots(4);
         let live_uses = vec![1, 0, 1, 1];
         let proof = NumericForHeaderProof {
@@ -4038,7 +4217,7 @@ mod tests {
             safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
             reference_captured: &ReferenceCapturedBindings::default(),
             captured_slots_before_stmt: &snapshots,
-            reference_captured_home_slots: Some(&BTreeSet::new()),
+            reference_captured_home_slots: &BTreeSet::new(),
         };
 
         let plan = numeric_for_binding_header_alias_plan(&stable, 0..3, 2, &live_uses, &proof)
@@ -4080,7 +4259,7 @@ mod tests {
                 scratch: &scratch,
                 facts: &facts,
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));
@@ -4096,7 +4275,7 @@ mod tests {
                 scratch: &scratch,
                 facts: &facts,
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::from([HomeSlotKey::new(2, 0)])),
+                reference_captured_home_slots: &BTreeSet::from([HomeSlotKey::new(2, 0)]),
             },
             &mut removed,
         ));
@@ -4115,7 +4294,7 @@ mod tests {
                 scratch: &scratch,
                 facts: &overlapping_facts,
                 captured_slots_before_stmt: &snapshots,
-                reference_captured_home_slots: Some(&BTreeSet::new()),
+                reference_captured_home_slots: &BTreeSet::new(),
             },
             &mut removed,
         ));

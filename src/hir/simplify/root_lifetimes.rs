@@ -897,6 +897,13 @@ fn exact_multi_nil_temp_overwrites(
         let HirLValue::Temp(temp) = target else {
             return None;
         };
+        let possible_homes = facts.possible_temp_home_slots(*temp)?;
+        if possible_homes.is_empty() {
+            // Synthetic home-free targets participate in the HIR parallel assignment but do not
+            // write a physical VM cell. They therefore cannot prevent the exact physical members
+            // of the same nil transaction from closing their preceding root epochs.
+            continue;
+        }
         let home = facts.trusted_temp_home_slot(*temp)?;
         let eligible = temp_is_eligible(*temp);
         let overwrite = overwrites
@@ -911,7 +918,7 @@ fn exact_multi_nil_temp_overwrites(
     }
     // Literal nil 没有求值事件；同 home 的全部 target 是同一次物理覆盖事务，并共同
     // 承接相同的 nil 后态。资格按组取交集，避免只提升其中一部分 identity-sensitive temp。
-    Some(overwrites.into_values().collect())
+    (!overwrites.is_empty()).then(|| overwrites.into_values().collect())
 }
 
 fn exact_multi_call_root_targets(

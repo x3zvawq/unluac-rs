@@ -100,6 +100,22 @@ impl SlotEpochFacts {
         }
     }
 
+    fn all_home_slots(&self, max_stack_size: usize) -> BTreeSet<HomeSlotKey> {
+        let mut homes = BTreeSet::new();
+        for slot in 0..max_stack_size {
+            homes.insert(HomeSlotKey::new(slot, 0));
+            if let Some(flow) = self.epochs_by_reg.get(slot).and_then(Option::as_ref) {
+                homes.extend(
+                    flow.at_instr
+                        .iter()
+                        .copied()
+                        .map(|epoch| HomeSlotKey::new(slot, epoch)),
+                );
+            }
+        }
+        homes
+    }
+
     pub(super) fn epoch_at(&self, reg: Reg, instr: InstrRef) -> usize {
         self.epochs_by_reg
             .get(reg.index())
@@ -309,7 +325,7 @@ pub(super) struct ProtoPromotionFacts {
     direct_table_seed_locals: BTreeSet<LocalId>,
     loop_carrier_temps: BTreeSet<TempId>,
     scope_end_copy_root_temps: BTreeSet<TempId>,
-    copy_root_overwrites: BTreeMap<TempId, TempId>,
+    copy_root_overwrites: BTreeMap<TempId, Vec<CopyRootOverwrite>>,
     local_home_slots: Vec<HomeSlotResolution>,
     invalidated_param_homes: BTreeSet<ParamId>,
     invalidated_local_homes: BTreeSet<LocalId>,
@@ -318,6 +334,7 @@ pub(super) struct ProtoPromotionFacts {
     possible_param_homes: BTreeMap<ParamId, Option<BTreeSet<HomeSlotKey>>>,
     possible_local_homes: BTreeMap<LocalId, Option<BTreeSet<HomeSlotKey>>>,
     possible_temp_homes: BTreeMap<TempId, Option<BTreeSet<HomeSlotKey>>>,
+    physical_home_universe: BTreeSet<HomeSlotKey>,
     compact_home_slots: bool,
 }
 
@@ -334,6 +351,8 @@ impl ProtoPromotionFacts {
     ) -> Self {
         let total_temps = dataflow.defs.len() + plan.phis().len();
         let mut temp_home_slots = vec![HomeSlotResolution::Pending; total_temps];
+        let physical_home_universe =
+            slot_epochs.all_home_slots(usize::from(proto.frame.max_stack_size));
 
         fill_fixed_def_home_slots(dataflow, slot_epochs, &mut temp_home_slots);
         fill_phi_home_slots(dataflow, plan, &mut temp_home_slots);
@@ -376,6 +395,7 @@ impl ProtoPromotionFacts {
             possible_param_homes: BTreeMap::new(),
             possible_local_homes: BTreeMap::new(),
             possible_temp_homes: BTreeMap::new(),
+            physical_home_universe,
             compact_home_slots: false,
         }
     }
@@ -438,7 +458,7 @@ impl ProtoPromotionFacts {
         self.loop_carrier_temps.contains(&temp)
     }
 
-    /// 该 temp 的 direct copy home 在同一 low-IR block 内一直活跃到 Return。
+    /// 该 temp 的 direct copy home 在已证前向 CFG 的每条路径一直活跃到 scope end。
     ///
     /// 这份事实只服务于“源码读取已经结束、物理栈槽仍作为 GC root”的负向保护；若
     /// 后续 binding 合并使 home provenance 失效，就不能再消费原始证明。
@@ -446,15 +466,36 @@ impl ProtoPromotionFacts {
         !self.temp_home_was_invalidated(temp) && self.scope_end_copy_root_temps.contains(&temp)
     }
 
-    /// 返回结束该 direct copy root transaction 的精确 scalar-nil overwrite temp。
-    pub(super) fn copy_root_overwrite(&self, temp: TempId) -> Option<TempId> {
+    /// 返回结束该 direct copy root transaction 每条路径的精确 GC-inert overwrite。
+    pub(super) fn copy_root_overwrites(&self, temp: TempId) -> Option<&[CopyRootOverwrite]> {
         if self.temp_home_was_invalidated(temp) {
             return None;
         }
-        let overwrite = self.copy_root_overwrites.get(&temp).copied()?;
-        (!self.temp_home_was_invalidated(overwrite)
-            && self.trusted_temp_home_slot(temp) == self.trusted_temp_home_slot(overwrite))
-        .then_some(overwrite)
+        let overwrites = self.copy_root_overwrites.get(&temp)?;
+        (!overwrites.is_empty()
+            && overwrites.iter().all(|overwrite| {
+                !self.temp_home_was_invalidated(overwrite.temp)
+                    && self.trusted_temp_home_slot(temp)
+                        == self.trusted_temp_home_slot(overwrite.temp)
+            }))
+        .then_some(overwrites)
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_copy_root_overwrites_for_test(
+        &mut self,
+        producer: TempId,
+        overwrites: Vec<(TempId, HirExpr)>,
+    ) {
+        let overwrites = overwrites
+            .into_iter()
+            .map(|(temp, value)| CopyRootOverwrite {
+                temp,
+                value: CopyRootScalarValue::from_hir_expr(&value)
+                    .expect("test overwrite must be a direct GC-inert scalar"),
+            })
+            .collect();
+        self.copy_root_overwrites.insert(producer, overwrites);
     }
 
     /// 返回某个 temp 对应的原始寄存器槽位。
@@ -476,6 +517,7 @@ impl ProtoPromotionFacts {
                 .resize(temp.index() + 1, HomeSlotResolution::Pending);
         }
         self.temp_home_slots[temp.index()] = HomeSlotResolution::from_home(home_slot);
+        self.physical_home_universe.insert(home_slot);
     }
 
     #[cfg(test)]
@@ -514,6 +556,7 @@ impl ProtoPromotionFacts {
             resolution.clone(),
             HomeSlotResolution::from_home(home_slot),
         );
+        self.physical_home_universe.insert(home_slot);
         if let Some(possible) = self.possible_local_homes.get_mut(&local)
             && let Some(homes) = possible
         {
@@ -583,6 +626,15 @@ impl ProtoPromotionFacts {
                 .get(temp.index())
                 .and_then(HomeSlotResolution::complete_homes),
         }
+    }
+
+    /// 当前 proto 中任一物理 binding 可能占用的完整 `(slot, close epoch)` 全集。
+    ///
+    /// 某个 binding 的 provenance 若已退化为 Unknown，consumer 可以用该全集继续做
+    /// 保守 may-alias：它不会证明两个物理 binding 异槽，但能在单 home proto 中保留
+    /// 精确结论，也能把多 home 情况归入已有 alias/lifetime barrier。
+    pub(super) fn physical_home_universe(&self) -> &BTreeSet<HomeSlotKey> {
+        &self.physical_home_universe
     }
 
     pub(super) fn record_param_home_merge(
@@ -1259,23 +1311,94 @@ fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTr
 /// 从 low-IR 正证一个 direct `GETUPVAL`/跨槽 `MOVE` copy 的物理槽在后续所有潜在
 /// 用户代码/GC 观察点都仍位于 VM active stack top 以下，并沿同一 basic block、线性
 /// single-entry fast path，或 predecessor-closed 的严格前向 CFG DAG 活到每条路径的
-/// Return/TailCall；原 block 内还可活到一个精确的 scalar-nil overwrite。
+/// Return/TailCall 或精确的 direct nil/boolean/integer/number overwrite。
 ///
 /// HIR 会丢失 block 结束时的隐式 stack-top 收缩；只看“后缀没有同槽写”会把已经到期
 /// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实；分支 successor 与
 /// join 用 entry-driven must-state 合流，只有 producer 支配的前向闭合子图才能发布
-/// all-successor scope-end。回边、外部 join 入口、路径 overwrite 与无法计算活动栈下界的
-/// 事件仍拒绝；TBC 与专用调用协议只消费各自的固定输入 root prefix。`Close` 本身不覆盖
-/// 槽位，因此可以在已证明的活动 caller prefix 内继续到原始 `Return`。
+/// all-successor 终点。overwrite 的 raw DefId/TempId 与值类会一同发布，HIR consumer
+/// 必须重新定位唯一赋值 owner 并原子重放；回边、外部 join 入口、collectable/effectful
+/// overwrite 与无法计算活动栈下界的事件仍拒绝。TBC 与专用调用协议只消费各自的固定
+/// 输入 root prefix；`Close` 本身不覆盖槽位，因此可以继续到原始终点。
 #[derive(Default)]
 struct CopyRootFacts {
     scope_end: BTreeSet<TempId>,
-    overwrites: BTreeMap<TempId, TempId>,
+    overwrites: BTreeMap<TempId, Vec<CopyRootOverwrite>>,
 }
 
-enum CopyRootEnd {
-    ScopeEnd,
-    NilOverwrite(TempId),
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum CopyRootScalarValue {
+    Nil,
+    Boolean(bool),
+    Integer(i64),
+    Number(f64),
+}
+
+impl CopyRootScalarValue {
+    #[cfg(test)]
+    fn from_hir_expr(value: &HirExpr) -> Option<Self> {
+        match value {
+            HirExpr::Nil => Some(Self::Nil),
+            HirExpr::Boolean(value) => Some(Self::Boolean(*value)),
+            HirExpr::Integer(value) => Some(Self::Integer(*value)),
+            HirExpr::Number(value) => Some(Self::Number(*value)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn matches_hir_expr(self, value: &HirExpr) -> bool {
+        match (self, value) {
+            (Self::Nil, HirExpr::Nil) => true,
+            (Self::Boolean(expected), HirExpr::Boolean(actual)) => expected == *actual,
+            (Self::Integer(expected), HirExpr::Integer(actual)) => expected == *actual,
+            (Self::Number(expected), HirExpr::Number(actual)) => {
+                expected.to_bits() == actual.to_bits()
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct CopyRootOverwrite {
+    temp: TempId,
+    value: CopyRootScalarValue,
+}
+
+impl CopyRootOverwrite {
+    pub(super) const fn temp(self) -> TempId {
+        self.temp
+    }
+
+    pub(super) fn matches_hir_expr(self, value: &HirExpr) -> bool {
+        self.value.matches_hir_expr(value)
+    }
+}
+
+#[derive(Default)]
+struct CopyRootEnd {
+    scope_end: bool,
+    overwrites: BTreeMap<TempId, CopyRootOverwrite>,
+}
+
+impl CopyRootEnd {
+    fn scope_end() -> Self {
+        Self {
+            scope_end: true,
+            overwrites: BTreeMap::new(),
+        }
+    }
+
+    fn overwrite(overwrite: CopyRootOverwrite) -> Self {
+        Self {
+            scope_end: false,
+            overwrites: BTreeMap::from([(overwrite.temp, overwrite)]),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.scope_end || !self.overwrites.is_empty()
+    }
 }
 
 fn collect_copy_root_facts(
@@ -1301,14 +1424,16 @@ fn collect_copy_root_facts(
         if fixed_temps.get(def.id.index()) != Some(&direct) {
             continue;
         }
-        match copy_root_end(proto, cfg, dataflow, fixed_temps, def.instr, def.reg) {
-            Some(CopyRootEnd::ScopeEnd) => {
+        if let Some(root_end) = copy_root_end(proto, cfg, dataflow, fixed_temps, def.instr, def.reg)
+        {
+            if root_end.scope_end {
                 facts.scope_end.insert(direct);
             }
-            Some(CopyRootEnd::NilOverwrite(overwrite)) => {
-                facts.overwrites.insert(direct, overwrite);
+            if !root_end.overwrites.is_empty() {
+                facts
+                    .overwrites
+                    .insert(direct, root_end.overwrites.into_values().collect());
             }
-            None => {}
         }
     }
     facts
@@ -1323,7 +1448,6 @@ fn copy_root_end(
     home: Reg,
 ) -> Option<CopyRootEnd> {
     let mut observed = false;
-    let mut crossed_block = false;
     let mut current_block = *cfg.instr_to_block.get(producer.index())?;
     let mut index = producer.index() + 1;
 
@@ -1333,44 +1457,28 @@ fn copy_root_end(
             if copy_root_forward_block_successor(cfg, current_block) != Some(instr_block)
                 || cfg.blocks.get(instr_block.index())?.instrs.start != InstrRef(index)
             {
-                return copy_root_cfg_scope_end(
-                    &proto.instrs,
+                return copy_root_cfg_end(
+                    proto,
                     cfg,
-                    &dataflow.instr_effects,
-                    &dataflow.effect_summaries,
+                    dataflow,
+                    fixed_temps,
                     current_block,
                     observed,
                     home,
-                )
-                .map(|()| CopyRootEnd::ScopeEnd);
+                );
             }
-            crossed_block = true;
             current_block = instr_block;
         }
         let instr = proto.instrs.get(index)?;
         let effect = dataflow.instr_effects.get(index)?;
 
-        // 当前值若被覆盖，同一 root transaction 要么在精确 nil 写处终止，要么失去证明。
+        // 当前值若被覆盖，同一 root transaction 要么在精确 direct GC-inert 写处终止，
+        // 要么因新值可能建立独立生命周期而失去证明。
         if effect.must_define(home) {
-            if crossed_block {
-                // 候选拒绝[ProofIncomplete]：raw CFG 已定位到跨 low block 的终止写，
-                // 但 dead_temps::preserve_copy_roots_in_block 只会在 producer 所在 HirBlock
-                // 内查找 overwrite assignment；在 HIR location mapping owner 发布精确 pair
-                // 前不能把这个 raw fact 交给 consumer。
-                return None;
-            }
-            if observed
-                && let Some(overwrite) =
-                    direct_scalar_nil_overwrite_temp(proto, dataflow, fixed_temps, index, home)
-            {
-                return Some(CopyRootEnd::NilOverwrite(overwrite));
-            }
-            // 候选拒绝[ProofIncomplete]：direct boolean/integer/number 等 GC-inert scalar
-            // overwrite 也能在原位置结束旧 root，但当前 promotion fact 与 dead_temps
-            // consumer 只共同编码了 Nil assignment；扩展前不能发布 consumer 无法重放的事实。
-            // 候选拒绝[SemanticBarrier:Lifetime]：collectable/effectful overwrite 若直接改写为
-            // PhysicalRoot local，会把新 RHS 的生命周期延长到 raw home 失活点之后。
-            return None;
+            return observed
+                .then(|| direct_scalar_overwrite(proto, dataflow, fixed_temps, index, home))
+                .flatten()
+                .map(CopyRootEnd::overwrite);
         }
 
         match copy_root_instr_progress(
@@ -1381,33 +1489,31 @@ fn copy_root_end(
             &mut observed,
         )? {
             CopyRootInstrProgress::Continue => {}
-            CopyRootInstrProgress::ScopeEnd => return Some(CopyRootEnd::ScopeEnd),
+            CopyRootInstrProgress::ScopeEnd => return Some(CopyRootEnd::scope_end()),
         }
 
         match instr {
             LowInstr::Jump(_) => {
-                return copy_root_cfg_scope_end(
-                    &proto.instrs,
+                return copy_root_cfg_end(
+                    proto,
                     cfg,
-                    &dataflow.instr_effects,
-                    &dataflow.effect_summaries,
+                    dataflow,
+                    fixed_temps,
                     current_block,
                     observed,
                     home,
-                )
-                .map(|()| CopyRootEnd::ScopeEnd);
+                );
             }
             _ if instr.is_control_terminator() => {
-                return copy_root_cfg_scope_end(
-                    &proto.instrs,
+                return copy_root_cfg_end(
+                    proto,
                     cfg,
-                    &dataflow.instr_effects,
-                    &dataflow.effect_summaries,
+                    dataflow,
+                    fixed_temps,
                     current_block,
                     observed,
                     home,
-                )
-                .map(|()| CopyRootEnd::ScopeEnd);
+                );
             }
             _ => {}
         }
@@ -1492,27 +1598,64 @@ fn copy_root_instr_progress(
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
 enum CopyRootCfgBlockEnd {
     Continue { observed: bool },
-    ScopeEnd,
+    End(CopyRootEnd),
 }
 
 /// 从一个已执行的 control terminator 出发，只接受严格前向、无环且每条动态路径都在
-/// scope end 前观察过同一 active home 的 CFG。incoming observation 在 join 取交集；
-/// 状态只会由 true 变为 false，有限 DAG 上的 worklist 因而必然收敛。
-fn copy_root_cfg_scope_end(
-    instrs: &[LowInstr],
+/// scope end 或 direct GC-inert overwrite 前观察过同一 active home 的 CFG。incoming
+/// observation 在 join 取交集；状态只会由 true 变为 false，有限 DAG 上的 worklist
+/// 因而必然收敛。
+fn copy_root_cfg_end(
+    proto: &LoweredProto,
     cfg: &Cfg,
-    instr_effects: &[InstrEffect],
-    effect_summaries: &[SideEffectSummary],
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
     source: BlockRef,
     observed: bool,
     home: Reg,
-) -> Option<()> {
-    let region = copy_root_forward_cfg_region(instrs, cfg, source)?;
+) -> Option<CopyRootEnd> {
+    copy_root_cfg_end_with(
+        CopyRootCfgInputs {
+            instrs: &proto.instrs,
+            cfg,
+            instr_effects: &dataflow.instr_effects,
+            effect_summaries: &dataflow.effect_summaries,
+            home,
+        },
+        source,
+        observed,
+        |index, home| direct_scalar_overwrite(proto, dataflow, fixed_temps, index, home),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CopyRootCfgInputs<'a> {
+    instrs: &'a [LowInstr],
+    cfg: &'a Cfg,
+    instr_effects: &'a [InstrEffect],
+    effect_summaries: &'a [SideEffectSummary],
+    home: Reg,
+}
+
+fn copy_root_cfg_end_with(
+    inputs: CopyRootCfgInputs<'_>,
+    source: BlockRef,
+    observed: bool,
+    mut overwrite_at: impl FnMut(usize, Reg) -> Option<CopyRootOverwrite>,
+) -> Option<CopyRootEnd> {
+    let region = copy_root_forward_cfg_region(
+        inputs.instrs,
+        inputs.cfg,
+        inputs.instr_effects,
+        source,
+        inputs.home,
+    )?;
     if region.iter().any(|block| {
-        cfg.reachable_predecessors(*block)
+        inputs
+            .cfg
+            .reachable_predecessors(*block)
             .into_iter()
             .any(|predecessor| predecessor != source && !region.contains(&predecessor))
     }) {
@@ -1523,38 +1666,60 @@ fn copy_root_cfg_scope_end(
 
     let mut incoming = BTreeMap::<BlockRef, bool>::new();
     let mut pending = VecDeque::new();
-    for successor in copy_root_forward_cfg_successors(cfg, source)? {
+    for successor in copy_root_forward_cfg_successors(inputs.cfg, source)? {
         merge_copy_root_cfg_incoming(&mut incoming, &mut pending, successor, observed);
     }
 
-    let mut reached_scope_end = false;
+    let mut ends = CopyRootEnd::default();
     while let Some(block) = pending.pop_front() {
         let observed = incoming.get(&block).copied()?;
-        match scan_copy_root_cfg_block(
-            instrs,
-            cfg,
-            instr_effects,
-            effect_summaries,
-            block,
-            observed,
-            home,
-        )? {
-            CopyRootCfgBlockEnd::ScopeEnd => reached_scope_end = true,
+        match scan_copy_root_cfg_block(inputs, block, observed, &mut overwrite_at)? {
+            CopyRootCfgBlockEnd::End(block_ends) => {
+                ends.scope_end |= block_ends.scope_end;
+                ends.overwrites.extend(block_ends.overwrites);
+            }
             CopyRootCfgBlockEnd::Continue { observed } => {
-                for successor in copy_root_forward_cfg_successors(cfg, block)? {
+                for successor in copy_root_forward_cfg_successors(inputs.cfg, block)? {
                     merge_copy_root_cfg_incoming(&mut incoming, &mut pending, successor, observed);
                 }
             }
         }
     }
 
-    reached_scope_end.then_some(())
+    ends.is_complete().then_some(ends)
+}
+
+#[cfg(test)]
+fn copy_root_cfg_scope_end(
+    instrs: &[LowInstr],
+    cfg: &Cfg,
+    instr_effects: &[InstrEffect],
+    effect_summaries: &[SideEffectSummary],
+    source: BlockRef,
+    observed: bool,
+    home: Reg,
+) -> Option<()> {
+    let ends = copy_root_cfg_end_with(
+        CopyRootCfgInputs {
+            instrs,
+            cfg,
+            instr_effects,
+            effect_summaries,
+            home,
+        },
+        source,
+        observed,
+        |_index, _home| None,
+    )?;
+    (ends.scope_end && ends.overwrites.is_empty()).then_some(())
 }
 
 fn copy_root_forward_cfg_region(
     instrs: &[LowInstr],
     cfg: &Cfg,
+    instr_effects: &[InstrEffect],
     source: BlockRef,
+    home: Reg,
 ) -> Option<BTreeSet<BlockRef>> {
     let mut region = BTreeSet::new();
     let mut pending = VecDeque::from(copy_root_forward_cfg_successors(cfg, source)?);
@@ -1562,10 +1727,15 @@ fn copy_root_forward_cfg_region(
         if !region.insert(block) {
             continue;
         }
+        let range = cfg.blocks.get(block.index())?.instrs;
         if matches!(
             cfg.terminator(instrs, block),
             Some(LowInstr::Return(_) | LowInstr::TailCall(_))
-        ) {
+        ) || (range.start.index()..range.end()).any(|index| {
+            instr_effects
+                .get(index)
+                .is_some_and(|effect| effect.must_define(home))
+        }) {
             continue;
         }
         pending.extend(copy_root_forward_cfg_successors(cfg, block)?);
@@ -1595,35 +1765,35 @@ fn merge_copy_root_cfg_incoming(
 }
 
 fn scan_copy_root_cfg_block(
-    instrs: &[LowInstr],
-    cfg: &Cfg,
-    instr_effects: &[InstrEffect],
-    effect_summaries: &[SideEffectSummary],
+    inputs: CopyRootCfgInputs<'_>,
     block: BlockRef,
     mut observed: bool,
-    home: Reg,
+    overwrite_at: &mut impl FnMut(usize, Reg) -> Option<CopyRootOverwrite>,
 ) -> Option<CopyRootCfgBlockEnd> {
-    let range = cfg.blocks.get(block.index())?.instrs;
+    let range = inputs.cfg.blocks.get(block.index())?.instrs;
     if range.is_empty() {
         return None;
     }
     for index in range.start.index()..range.end() {
-        let instr = instrs.get(index)?;
-        let effect = instr_effects.get(index)?;
-        if effect.must_define(home) {
-            // 候选拒绝[ProofIncomplete]：分支路径上的 overwrite 需要路径专属 HIR
-            // terminator location；当前 consumer 只能重放同块单一 overwrite。
-            return None;
+        let instr = inputs.instrs.get(index)?;
+        let effect = inputs.instr_effects.get(index)?;
+        if effect.must_define(inputs.home) {
+            let overwrite = observed
+                .then(|| overwrite_at(index, inputs.home))
+                .flatten()?;
+            return Some(CopyRootCfgBlockEnd::End(CopyRootEnd::overwrite(overwrite)));
         }
         match copy_root_instr_progress(
             instr,
             effect,
-            low_instr_may_observe_gc_roots(effect_summaries, index),
-            home,
+            low_instr_may_observe_gc_roots(inputs.effect_summaries, index),
+            inputs.home,
             &mut observed,
         )? {
             CopyRootInstrProgress::Continue => {}
-            CopyRootInstrProgress::ScopeEnd => return Some(CopyRootCfgBlockEnd::ScopeEnd),
+            CopyRootInstrProgress::ScopeEnd => {
+                return Some(CopyRootCfgBlockEnd::End(CopyRootEnd::scope_end()));
+            }
         }
         if instr.is_control_terminator() {
             if range.last() != Some(InstrRef(index)) {
@@ -1671,27 +1841,40 @@ fn copy_root_forward_block_successor(cfg: &Cfg, block: BlockRef) -> Option<Block
     Some(successor)
 }
 
-fn direct_scalar_nil_overwrite_temp(
+fn direct_scalar_overwrite(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
     index: usize,
     home: Reg,
-) -> Option<TempId> {
-    let LowInstr::LoadNil(load_nil) = proto.instrs.get(index)? else {
-        return None;
-    };
-    if load_nil.dst.start != home || load_nil.dst.len != 1 {
-        return None;
-    }
-    let [def] = dataflow.instr_defs.get(index)?.as_slice() else {
-        return None;
-    };
-    if dataflow.defs.get(def.index())?.reg != home {
-        return None;
-    }
+) -> Option<CopyRootOverwrite> {
+    let value = direct_scalar_overwrite_value(proto.instrs.get(index)?, home)?;
+    let def = dataflow.instr_def_for_reg(InstrRef(index), home)?;
     let direct = TempId(def.index());
-    (fixed_temps.get(def.index()) == Some(&direct)).then_some(direct)
+    (fixed_temps.get(def.index()) == Some(&direct)).then_some(CopyRootOverwrite {
+        temp: direct,
+        value,
+    })
+}
+
+fn direct_scalar_overwrite_value(instr: &LowInstr, home: Reg) -> Option<CopyRootScalarValue> {
+    match instr {
+        LowInstr::LoadNil(load_nil) if load_nil.dst.start == home && load_nil.dst.len == 1 => {
+            Some(CopyRootScalarValue::Nil)
+        }
+        LowInstr::LoadBool(load_bool) if load_bool.dst == home => {
+            Some(CopyRootScalarValue::Boolean(load_bool.value))
+        }
+        LowInstr::LoadInteger(load_integer) if load_integer.dst == home => {
+            Some(CopyRootScalarValue::Integer(load_integer.value))
+        }
+        LowInstr::LoadNumber(load_number) if load_number.dst == home => {
+            Some(CopyRootScalarValue::Number(load_number.value))
+        }
+        // 候选拒绝[SemanticBarrier:Lifetime]：collectable/effectful overwrite 若改写为
+        // PhysicalRoot local，会把新 RHS 的生命周期延长到 raw home 失活点之后。
+        _ => None,
+    }
 }
 
 fn effect_active_top_lower_bound(effect: &crate::structure::InstrEffect) -> usize {
@@ -1881,9 +2064,35 @@ mod tests {
         BasicBlock, BlockKind, CfgEdge, EdgeKind, EdgeRef, InstrEffect, InstrRange,
     };
     use crate::transformer::{
-        BranchCond, BranchInstr, CallInstr, CallKind, CondOperand, JumpInstr, MoveInstr, RegRange,
+        BranchCond, BranchInstr, CallInstr, CallKind, CondOperand, JumpInstr, LoadBoolInstr,
+        LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, MoveInstr, NewTableInstr, RegRange,
         ResultPack, ReturnInstr, ValuePack,
     };
+
+    #[test]
+    fn physical_home_universe_covers_entry_and_close_epochs() {
+        let facts = SlotEpochFacts {
+            epochs_by_reg: vec![
+                None,
+                Some(SlotEpochFlow {
+                    at_instr: vec![0, 1, 1, 2],
+                    spans_entry: true,
+                }),
+            ],
+            reference_captured_regs: vec![false, true],
+        };
+
+        assert_eq!(
+            facts.all_home_slots(3),
+            BTreeSet::from([
+                HomeSlotKey::new(0, 0),
+                HomeSlotKey::new(1, 0),
+                HomeSlotKey::new(1, 1),
+                HomeSlotKey::new(1, 2),
+                HomeSlotKey::new(2, 0),
+            ])
+        );
+    }
 
     #[test]
     fn home_resolution_retains_finite_multi_home_union() {
@@ -2175,6 +2384,183 @@ mod tests {
                 BlockRef(0),
                 false,
                 Reg(1),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_root_cfg_collects_each_forward_branch_scalar_overwrite() {
+        let cfg = Cfg {
+            blocks: vec![
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(0), 1),
+                },
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(1), 2),
+                },
+                BasicBlock {
+                    kind: BlockKind::Normal,
+                    instrs: InstrRange::new(InstrRef(3), 2),
+                },
+                BasicBlock {
+                    kind: BlockKind::SyntheticExit,
+                    instrs: InstrRange::new(InstrRef(5), 0),
+                },
+            ],
+            edges: vec![
+                CfgEdge {
+                    from: BlockRef(0),
+                    to: BlockRef(1),
+                    kind: EdgeKind::BranchTrue,
+                },
+                CfgEdge {
+                    from: BlockRef(0),
+                    to: BlockRef(2),
+                    kind: EdgeKind::BranchFalse,
+                },
+            ],
+            entry_block: BlockRef(0),
+            exit_block: BlockRef(3),
+            block_order: vec![BlockRef(0), BlockRef(1), BlockRef(2)],
+            instr_to_block: vec![
+                BlockRef(0),
+                BlockRef(1),
+                BlockRef(1),
+                BlockRef(2),
+                BlockRef(2),
+            ],
+            preds: vec![vec![], vec![EdgeRef(0)], vec![EdgeRef(1)], vec![]],
+            succs: vec![vec![EdgeRef(0), EdgeRef(1)], vec![], vec![], vec![]],
+            reachable_blocks: BTreeSet::from([BlockRef(0), BlockRef(1), BlockRef(2)]),
+        };
+        let observing_call = || {
+            LowInstr::Call(CallInstr {
+                callee: Reg(2),
+                args: ValuePack::Fixed(RegRange::new(Reg(3), 0)),
+                results: ResultPack::Ignore,
+                kind: CallKind::Normal,
+                method_name: None,
+            })
+        };
+        let instrs = vec![
+            LowInstr::Branch(BranchInstr {
+                cond: BranchCond::truthy(CondOperand::Reg(Reg(0)), false),
+                then_target: InstrRef(1),
+                else_target: InstrRef(3),
+            }),
+            observing_call(),
+            LowInstr::LoadBool(LoadBoolInstr {
+                dst: Reg(1),
+                value: false,
+            }),
+            observing_call(),
+            LowInstr::LoadInteger(LoadIntegerInstr {
+                dst: Reg(1),
+                value: 0,
+            }),
+        ];
+        let mut effects = vec![InstrEffect::default(); instrs.len()];
+        effects[2].fixed_must_defs.insert(Reg(1));
+        effects[4].fixed_must_defs.insert(Reg(1));
+        let summaries = vec![SideEffectSummary::default(); instrs.len()];
+        let overwrite = |index, _home| match index {
+            2 => Some(CopyRootOverwrite {
+                temp: TempId(2),
+                value: CopyRootScalarValue::Boolean(false),
+            }),
+            4 => Some(CopyRootOverwrite {
+                temp: TempId(4),
+                value: CopyRootScalarValue::Integer(0),
+            }),
+            _ => None,
+        };
+
+        let ends = copy_root_cfg_end_with(
+            CopyRootCfgInputs {
+                instrs: &instrs,
+                cfg: &cfg,
+                instr_effects: &effects,
+                effect_summaries: &summaries,
+                home: Reg(1),
+            },
+            BlockRef(0),
+            false,
+            overwrite,
+        )
+        .expect("both dominated paths observe then overwrite the root home");
+        assert!(!ends.scope_end);
+        assert_eq!(
+            ends.overwrites.keys().copied().collect::<Vec<_>>(),
+            vec![TempId(2), TempId(4)]
+        );
+
+        assert!(
+            copy_root_cfg_end_with(
+                CopyRootCfgInputs {
+                    instrs: &instrs,
+                    cfg: &cfg,
+                    instr_effects: &effects,
+                    effect_summaries: &summaries,
+                    home: Reg(1),
+                },
+                BlockRef(0),
+                false,
+                |index, home| (index == 2).then(|| overwrite(index, home)).flatten(),
+            )
+            .is_none(),
+            "a collectable/effectful overwrite on either path must reject the whole transaction"
+        );
+    }
+
+    #[test]
+    fn copy_root_direct_scalar_overwrite_excludes_collectable_and_effectful_values() {
+        let home = Reg(1);
+        assert_eq!(
+            direct_scalar_overwrite_value(
+                &LowInstr::LoadNil(LoadNilInstr {
+                    dst: RegRange::new(home, 1),
+                }),
+                home,
+            ),
+            Some(CopyRootScalarValue::Nil)
+        );
+        assert_eq!(
+            direct_scalar_overwrite_value(
+                &LowInstr::LoadBool(LoadBoolInstr {
+                    dst: home,
+                    value: true,
+                }),
+                home,
+            ),
+            Some(CopyRootScalarValue::Boolean(true))
+        );
+        assert_eq!(
+            direct_scalar_overwrite_value(
+                &LowInstr::LoadNumber(LoadNumberInstr {
+                    dst: home,
+                    value: -0.0,
+                }),
+                home,
+            ),
+            Some(CopyRootScalarValue::Number(-0.0))
+        );
+        assert_eq!(
+            direct_scalar_overwrite_value(&LowInstr::NewTable(NewTableInstr { dst: home }), home,),
+            None
+        );
+        assert_eq!(
+            direct_scalar_overwrite_value(
+                &LowInstr::Call(CallInstr {
+                    callee: Reg(0),
+                    args: ValuePack::Fixed(RegRange::new(Reg(1), 0)),
+                    results: ResultPack::Fixed(RegRange::new(home, 1)),
+                    kind: CallKind::Normal,
+                    method_name: None,
+                }),
+                home,
             ),
             None
         );

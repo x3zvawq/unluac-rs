@@ -134,7 +134,7 @@ fn try_rewrite_repeat(
     // 另一 HIR binding 仍可能在 return temp 的 raw home 上持有 resource identity。
     // 候选拒绝[SemanticBarrier:Capture]：捕获 return temp 时，删除其唯一写会让 closure 观察旧值。
     // 候选拒绝[SemanticBarrier:Lifetime]：TBC temp 或非唯一 use/write 仍有额外 epoch/close 观察者。
-    // 候选拒绝[LayerBoundary]：debug temp 的源码身份由 locals owner 保留。
+    // 候选拒绝[PolicyBoundary]：debug temp 是项目选择保留的源码身份。
     if repeat.body.stmts.len() < 2
         || facts.captured_temps.contains(&return_temp)
         || facts.closed_temps.contains(&return_temp)
