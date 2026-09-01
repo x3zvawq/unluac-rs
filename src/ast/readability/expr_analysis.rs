@@ -3,6 +3,7 @@
 //! 这些 helper 故意只回答“readability 是否值得继续收”的问题：
 //! - 表达式复杂度
 //! - 是否属于保守安全子集
+//! - 跨过回调事件时名字快照是否仍稳定
 //! - 是否是 copy-like / lookup-like / 机械纯值表达式
 //! - 是否是能安全收回调用参数位的简单表构造
 //!
@@ -311,6 +312,46 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
     }
 }
 
+/// 表达式是否可以跨过可能触发回调的运行时事件而保持同一个值。
+///
+/// `is_context_safe_expr` 只证明表达式自身没有运行时协议；这里还要求它读取的名字不会被
+/// 当前函数里的可写 capture 改变。Upvalue 的其它共享 owner 不在当前 AST 中，无法证明
+/// 分配触发的 `__gc` 回调不会改写它，因此不属于稳定快照。
+pub(super) fn is_stable_context_expr(
+    expr: &AstExpr,
+    mutable_snapshots: &BTreeSet<AstNameRef>,
+) -> bool {
+    // 这些调用点都把前缀放在后续表达式之前，因此 vararg 仍处于单值语境；参数包自身
+    // 不可写且持续持有原值，可以像普通 parameter 一样跨过回调事件。
+    if matches!(expr, AstExpr::VarArg) {
+        return true;
+    }
+    if let AstExpr::SingleValue(inner) = expr {
+        return is_stable_context_expr(inner, mutable_snapshots);
+    }
+    if !is_context_safe_expr(expr) {
+        return false;
+    }
+    match expr {
+        AstExpr::Var(
+            name @ (AstNameRef::Param(_)
+            | AstNameRef::Local(_)
+            | AstNameRef::SyntheticLocal(_)
+            | AstNameRef::Temp(_)),
+        ) => !mutable_snapshots.contains(name),
+        AstExpr::Unary(unary) => {
+            matches!(unary.op, super::super::common::AstUnaryOpKind::Not)
+                && is_stable_context_expr(&unary.expr, mutable_snapshots)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            is_stable_context_expr(&logical.lhs, mutable_snapshots)
+                && is_stable_context_expr(&logical.rhs, mutable_snapshots)
+        }
+        AstExpr::Var(AstNameRef::Upvalue(_) | AstNameRef::Global(_)) => false,
+        _ => true,
+    }
+}
+
 pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
     match expr {
         AstExpr::Var(AstNameRef::Global(_))
@@ -387,32 +428,6 @@ pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {
     }
 }
 
-/// 判断表达式是否既没有运行时事件，又能在循环条件中安全地重复物化。
-pub(super) fn is_eventless_primitive_literal(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::Nil | AstExpr::Boolean(_) | AstExpr::Integer(_) | AstExpr::String(_) => true,
-        AstExpr::Number(value) => value.is_finite(),
-        AstExpr::SingleValue(value) => is_eventless_primitive_literal(value),
-        AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Unary(_)
-        | AstExpr::Binary(_)
-        | AstExpr::LogicalAnd(_)
-        | AstExpr::LogicalOr(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::VarArg
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_)
-        | AstExpr::Error(_) => false,
-    }
-}
-
 /// 判断表达式结果是否不可能成为可回收对象的强引用。
 ///
 /// 这里只描述结果值，不描述求值事件：`not value` 仍会读取 `value`，但结果一定是布尔值。
@@ -447,6 +462,48 @@ pub(super) fn result_cannot_root_collectable(expr: &AstExpr) -> bool {
         | AstExpr::TableConstructor(_)
         | AstExpr::FunctionExpr(_)
         | AstExpr::Error(_) => false,
+    }
+}
+
+/// 返回无需求值即可由 Lua 值种类证明的 truthiness。
+pub(super) fn constant_truthiness(expr: &AstExpr) -> Option<bool> {
+    match expr {
+        AstExpr::Nil => Some(false),
+        AstExpr::Boolean(value) => Some(*value),
+        AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_) => Some(true),
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
+            constant_truthiness(&unary.expr).map(|value| !value)
+        }
+        AstExpr::LogicalAnd(logical) => match constant_truthiness(&logical.lhs) {
+            Some(false) => Some(false),
+            Some(true) => constant_truthiness(&logical.rhs),
+            None if constant_truthiness(&logical.rhs) == Some(false) => Some(false),
+            None => None,
+        },
+        AstExpr::LogicalOr(logical) => match constant_truthiness(&logical.lhs) {
+            Some(true) => Some(true),
+            Some(false) => constant_truthiness(&logical.rhs),
+            None if constant_truthiness(&logical.rhs) == Some(true) => Some(true),
+            None => None,
+        },
+        AstExpr::SingleValue(expr) => constant_truthiness(expr),
+        AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::Var(_)
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::Error(_) => None,
     }
 }
 

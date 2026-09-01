@@ -211,7 +211,7 @@ fn direct_global_name(
     base: AccessBase,
     key: AccessKey,
 ) -> Option<String> {
-    // 候选忽略[NotApplicable]：transformer 会把任意宽度的隐式环境 upvalue 统一规范化为
+    // transformer 会把任意宽度的隐式环境 upvalue 统一规范化为
     // `AccessBase::Env`；Reg 或普通 Upvalue 则是显式表对象访问，不能冒充 `global` 声明 owner。
     let (AccessBase::Env, AccessKey::Const(key)) = (base, key) else {
         return None;

@@ -78,6 +78,7 @@ use super::label_refs::count_label_references;
 use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
 use super::root_lifetimes::{
     CallRootLifetimeIndices, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
+    scope_end_copy_roots_needing_materialization,
 };
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
 use super::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -93,6 +94,7 @@ struct TempInlineWorkspace<'a> {
     safety: HirExprSafety,
     readability: ReadabilityOptions,
     substantial_closure_bodies: &'a [bool],
+    physical_root_temps: Vec<bool>,
 }
 
 enum TempInlineScope {
@@ -156,6 +158,12 @@ impl<'a> TempInlineWorkspace<'a> {
         readability: ReadabilityOptions,
         substantial_closure_bodies: &'a [bool],
     ) -> Self {
+        let mut physical_root_temps = vec![false; temp_count];
+        for temp in &proto.physical_root_temps {
+            if let Some(protected) = physical_root_temps.get_mut(temp.index()) {
+                *protected = true;
+            }
+        }
         Self {
             uses: TempUseScratch::new(proto, temp_count),
             order_sensitive_defs: OrderSensitiveDefWorkspace::new(temp_count),
@@ -165,6 +173,7 @@ impl<'a> TempInlineWorkspace<'a> {
             safety: HirExprSafety::for_dialect(dialect),
             readability,
             substantial_closure_bodies,
+            physical_root_temps,
         }
     }
 }
@@ -224,6 +233,19 @@ fn inline_temps_in_proto_with_scope(
     dialect: DecompileDialect,
     substantial_closure_bodies: &[bool],
 ) -> bool {
+    let handoff_roots = collect_lookup_gc_root_lifetimes(
+        &proto.body.stmts,
+        facts,
+        HirExprSafety::for_dialect(dialect),
+        |_| true,
+    )
+    .into_handoff_roots();
+    let scope_roots = scope_end_copy_roots_needing_materialization(&proto.body.stmts, facts);
+    let original_root_count = proto.physical_root_temps.len();
+    proto
+        .physical_root_temps
+        .extend(scope_roots.into_iter().chain(handoff_roots));
+    let mut changed = proto.physical_root_temps.len() != original_root_count;
     let temp_count = temp_count_for_proto(proto);
     let mut workspace = TempInlineWorkspace::new(
         proto,
@@ -235,7 +257,7 @@ fn inline_temps_in_proto_with_scope(
     );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
-    inline_temps_in_block(
+    changed |= inline_temps_in_block(
         &mut proto.body,
         &mut workspace,
         &mut live_use_counts,
@@ -243,7 +265,8 @@ fn inline_temps_in_proto_with_scope(
         readability,
         facts,
         &BTreeSet::new(),
-    )
+    );
+    changed
 }
 
 fn temp_count_for_proto(proto: &HirProto) -> usize {
@@ -261,14 +284,33 @@ fn collect_temp_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
+    protected_temps: &[bool],
 ) -> (CallRootLifetimeIndices, Vec<bool>) {
     // 分析停用[LayerBoundary]：普通潜在事件由后续 locals 以
     // `collect_call_root_lifetimes(..., true, ...)` 配对并物化 owner；locals 的 TempChain
-    // invalidation 会让 temp-inline 针对已物化 owner 重跑。本轮只消费显式 GC fence 与已完成
-    // overwrite pair，避免把尚未配对的观察扩成全局 inline barrier。
+    // invalidation 会让 temp-inline 针对已物化 owner 重跑。本轮只消费 lookup 的显式 GC/
+    // return 后缀证明与已完成 overwrite pair，避免把尚未配对的普通观察扩成全局 barrier。
     let call_roots = collect_call_root_lifetimes(stmts, facts, safety, false, |_| true, |_| true);
     let mut marked = call_roots.marked_stmts(stmts.len());
     collect_lookup_gc_root_lifetimes(stmts, facts, safety, |_| true).mark_stmts(&mut marked);
+    for (index, stmt) in stmts.iter().enumerate() {
+        if !marked[index]
+            && inline_candidate(stmt).is_some_and(|(temp, _)| {
+                facts.is_copy_root_endpoint(temp)
+                    || protected_temps.get(temp.index()).copied().unwrap_or(false)
+            })
+        {
+            // Raw CFG facts can pair a producer in the parent block with exact overwrites in
+            // multiple terminal children. The block-local collector above cannot represent that
+            // relation. Same-block pairs stay owned by the precise collector (including its
+            // effectful-RHS fusion); only an otherwise unrepresented endpoint is protected here.
+            // A scope-end copy root is protected here only when a direct if test controls a later
+            // observing arm, or when a generic-for producer consumes it before a loop-body
+            // observation. Direct return/protocol result slots already transfer the same value
+            // into VM-owned homes and remain eligible for their dedicated inline owners.
+            marked[index] = true;
+        }
+    }
     (call_roots, marked)
 }
 
@@ -284,8 +326,12 @@ fn inline_temps_in_block(
     let is_proto_root = workspace.block_depth == 0;
     workspace.block_depth += 1;
     let mut changed = false;
-    let (mut call_root_indices, mut physical_root_lifetimes) =
-        collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
+    let (mut call_root_indices, mut physical_root_lifetimes) = collect_temp_root_lifetimes(
+        &block.stmts,
+        facts,
+        workspace.safety,
+        &workspace.physical_root_temps,
+    );
     let mut captured_slots_before_stmt =
         CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
@@ -325,8 +371,12 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (call_root_indices, physical_root_lifetimes) =
-            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
+        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
+            &block.stmts,
+            facts,
+            workspace.safety,
+            &workspace.physical_root_temps,
+        );
     }
 
     if inline_terminal_nil_return_pack(
@@ -340,8 +390,12 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (call_root_indices, physical_root_lifetimes) =
-            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
+        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
+            &block.stmts,
+            facts,
+            workspace.safety,
+            &workspace.physical_root_temps,
+        );
     }
 
     if inline_materialization_runs(
@@ -356,8 +410,12 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (call_root_indices, physical_root_lifetimes) =
-            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
+        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
+            &block.stmts,
+            facts,
+            workspace.safety,
+            &workspace.physical_root_temps,
+        );
     }
 
     if matches!(workspace.scope, TempInlineScope::All)
@@ -373,8 +431,12 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (_, physical_root_lifetimes) =
-            collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
+        (_, physical_root_lifetimes) = collect_temp_root_lifetimes(
+            &block.stmts,
+            facts,
+            workspace.safety,
+            &workspace.physical_root_temps,
+        );
     }
 
     // proto 级 live use count 会随成功内联同步减少；当前 block 只需保留下一条
@@ -393,6 +455,11 @@ fn inline_temps_in_block(
         if let Some((temp, value)) = inline_candidate(&stmt)
             // 候选拒绝[SemanticBarrier:Lifetime]：被 physical-root lifetime 标记的 call/lookup 结果仍承担 VM root；提前删除会改变对象存活期（regress_356）。
             && !physical_root_lifetimes[index]
+            && !workspace
+                .physical_root_temps
+                .get(temp.index())
+                .copied()
+                .unwrap_or(false)
             // 候选拒绝[SemanticBarrier:Lifetime]：`t=f(); box.x=t` 中 t 是写入完成前的唯一 VM root，删除可能改变 GC/析构可观察时机。
             // A call result stored in a table can outlive the immediate write. Removing the
             // temp would remove the only lexical/VM root before a later rawset or table clear;
@@ -504,7 +571,12 @@ fn inline_temps_in_block(
     // source binding；因此在同一坐标压缩完成后重算 root/capture 事实，并交回同一个
     // call-root owner 原子消费。
     if adjacent_changed && matches!(workspace.scope, TempInlineScope::All) {
-        let (call_roots, _) = collect_temp_root_lifetimes(&block.stmts, facts, workspace.safety);
+        let (call_roots, _) = collect_temp_root_lifetimes(
+            &block.stmts,
+            facts,
+            workspace.safety,
+            &workspace.physical_root_temps,
+        );
         let captured_slots = captured_slots_before_stmts(block, facts, inherited_captured_slots);
         changed |= inline_adjacent_call_root_expression_overwrites(
             block,
@@ -3635,6 +3707,7 @@ mod tests {
             &block.stmts,
             &facts,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &[],
         );
 
         assert!(!physical_roots[0]);
@@ -3679,6 +3752,7 @@ mod tests {
             &rooted.stmts,
             &rooted_facts,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &[],
         );
 
         assert!(rooted_physical_roots[2]);

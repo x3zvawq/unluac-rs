@@ -1,13 +1,15 @@
 //! 这个子模块负责把“构造器尾部立刻安装方法/字段函数”的模式收成更自然的函数 sugar。
 //!
-//! 它依赖前缀 local alias 证据和已经合法化的 AST，只吸收终端构造器链上的局部模式，
-//! 不会在这里重写一般赋值语句。
+//! 它依赖前缀 local alias、可写 capture 快照和已经合法化的 AST，只吸收终端构造器链
+//! 上的局部模式，不会在这里重写一般赋值语句。
 //! 例如：
 //! - `local t = {}; t.pick = function(...) end; return t`
 //!   -> `local t = { pick = function(...) end }; return t`
 //! - `local meta = {}; local methods = {}; function methods.bump(...) end; meta.__index = methods;
 //!    local ctor = ffi.metatype("x", meta)`
 //!   -> `local ctor = ffi.metatype("x", { __index = { bump = function(...) end } })`
+//! - `local f=ctor; local t={}; return f(stable, t)`
+//!   -> `return ctor(stable, {})`，其中 `stable` 必须是不受 initializer 回调影响的快照
 //!
 //! 这里不会去猜任意跨语句的数据流；只有“构造器 local -> 构造器字段接线”仍保持机械
 //! 脚手架形状时，才会收回源码结构。非 plain 字段函数的语句自然终止连续前缀，不由本
@@ -15,9 +17,9 @@
 
 use std::collections::BTreeSet;
 
-use super::super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
+use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames, binding_mentions_in_stmt};
 use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
-use super::super::expr_analysis::is_eventless_primitive_literal;
+use super::super::expr_analysis::is_stable_context_expr;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr,
@@ -76,6 +78,7 @@ pub(super) fn try_inline_terminal_constructor_call(
     stmts: &[AstStmt],
     use_index: &BindingUseIndex,
     stmt_base: usize,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<(AstStmt, usize)> {
     let callee = single_local_alias_decl(stmts.first()?)?;
     let mut consumed = 1usize;
@@ -114,6 +117,7 @@ pub(super) fn try_inline_terminal_constructor_call(
         callee.binding.id,
         &callee.value,
         &arg_locals,
+        mutable_snapshots,
     )?;
 
     // Removal-only gates intentionally run after the exact sink call has accepted the local
@@ -389,6 +393,7 @@ fn rewrite_terminal_constructor_call_sink(
     callee_binding: AstBindingRef,
     callee_expr: &AstExpr,
     arg_locals: &[ConstructorArg],
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<AstStmt> {
     match stmt {
         AstStmt::Return(ret) => {
@@ -398,6 +403,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?;
             Some(AstStmt::Return(Box::new(rewritten)))
         }
@@ -408,6 +414,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?;
             Some(AstStmt::LocalDecl(Box::new(rewritten)))
         }
@@ -420,6 +427,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?
             else {
                 unreachable!("terminal constructor helper preserves the outer call")
@@ -436,6 +444,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?;
             // 候选接受[EvalOrderProof/ValueArityProof]：if 条件是一次性标量 owner，且没有先行运行时事件。
             Some(AstStmt::If(Box::new(rewritten)))
@@ -447,6 +456,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?;
             // 候选接受[EvalOrderProof/ValueArityProof]：start 是 header 首个一次性标量事件，limit/step 顺序不动。
             Some(AstStmt::NumericFor(Box::new(rewritten)))
@@ -458,6 +468,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?;
             rewritten.iterator[0] = first;
             // 候选接受[EvalOrderProof/ValueArityProof]：首 iterator 无前缀；单项时保留 open pack，多项时前后都截成单值。
@@ -469,6 +480,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?;
             // 候选拒绝[SemanticBarrier:EvalCount]：`local f=make_f(); local a=make_a(); while f(a) do end` 中两个 initializer 原本各执行一次，搬入条件后会逐轮执行。
             None
@@ -479,6 +491,7 @@ fn rewrite_terminal_constructor_call_sink(
                 callee_binding,
                 callee_expr,
                 arg_locals,
+                mutable_snapshots,
             )?;
             // 候选拒绝[SemanticBarrier:EvalCount]：`local f=make_f(); local a=make_a(); repeat until f(a)` 中两个 initializer 原本各执行一次，搬入条件后会逐轮执行。
             None
@@ -492,6 +505,7 @@ fn rewrite_terminal_constructor_call_expr(
     callee_binding: AstBindingRef,
     callee_expr: &AstExpr,
     arg_locals: &[ConstructorArg],
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<AstExpr> {
     let AstExpr::Call(call) = expr else {
         return None;
@@ -535,12 +549,13 @@ fn rewrite_terminal_constructor_call_expr(
             last_arg_is_inlined_constructor = true;
             continue;
         }
-        if expected_args.peek().is_some() && !is_eventless_primitive_literal(arg) {
-            // 候选拒绝[SemanticBarrier:EvalOrder]：尚有 constructor handoff 时，事件型额外实参会从其后移到其前；regress_423 的 prefix case 可观察到顺序反转。
+        if expected_args.peek().is_some() && !is_stable_context_expr(arg, mutable_snapshots) {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：尚有 constructor handoff 时，额外实参会从其后移到其前；调用/lookup、global/upvalue 或可写 capture 的快照都可能被 initializer 改变，regress_423 的 prefix case 可观察到顺序反转。
             return None;
         }
-        // 候选接受[EvalOrderProof]：primitive literal 可安全位于待下沉 initializer 前；
-        // 最后一个 handoff 之后的实参没有被任何 initializer 跨越，可按原位保留任意表达式。
+        // 候选接受[EvalOrderProof]：无协议且不读取可写 capture/upvalue 的稳定表达式可安全
+        // 位于待下沉 initializer 前；最后一个 handoff 之后的实参没有被任何 initializer
+        // 跨越，可按原位保留任意表达式。
         rewritten_args.push(arg.clone());
         last_arg_is_inlined_constructor = false;
     }
@@ -597,6 +612,7 @@ mod tests {
             body: AstBlock::default(),
             captured_bindings: BTreeSet::new(),
             captured_params: BTreeSet::new(),
+            capture_names_by_upvalue: std::collections::BTreeMap::new(),
             capture_write_names: BTreeSet::new(),
         }))
     }

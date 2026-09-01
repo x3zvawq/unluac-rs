@@ -26,11 +26,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::ReadabilityOptions;
 
+pub(super) use self::candidate::local_attr_belongs_to_inline_pipeline;
 use self::candidate::{
-    InlineCandidate, InlinePolicy, inline_candidate, is_lookup_inline_expr,
+    InlineCandidate, InlineExprRejection, InlinePolicy, inline_candidate, is_lookup_inline_expr,
     stmt_is_adjacent_call_result_sink, stmt_is_alias_initializer_sink,
     stmt_is_boolean_return_value_sink, stmt_is_direct_return_value_sink,
     stmt_is_multi_return_value_sink, stmt_is_terminal_lookup_return_sink,
+    stmt_uses_binding_as_direct_call_callee,
 };
 use self::use_sites::{
     rewrite_condition_use_sites_with_policy, rewrite_stmt_use_sites_with_policy,
@@ -71,6 +73,48 @@ struct InlineExprsPass {
     target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshot_stack: Vec<MutableSnapshotNames>,
+}
+
+#[derive(Clone, Copy)]
+enum AdjacentInlineRejection {
+    DebugScope,
+    Lifetime,
+    ValueArity,
+    PolicyBoundary,
+}
+
+fn adjacent_inline_rejection(
+    candidate: InlineCandidate,
+    value: &AstExpr,
+    policy: InlinePolicy,
+) -> Option<AdjacentInlineRejection> {
+    match candidate.expr_rejection_with_policy(value, policy)? {
+        InlineExprRejection::DebugScope => Some(AdjacentInlineRejection::DebugScope),
+        InlineExprRejection::Lifetime => Some(AdjacentInlineRejection::Lifetime),
+        InlineExprRejection::PolicyMismatch
+            if matches!(
+                policy,
+                InlinePolicy::DirectReturnValue | InlinePolicy::MultiReturnValue
+            ) && matches!(
+                value,
+                AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
+            ) =>
+        {
+            Some(AdjacentInlineRejection::ValueArity)
+        }
+        InlineExprRejection::PolicyMismatch
+            if matches!(
+                policy,
+                InlinePolicy::Conservative | InlinePolicy::AliasInitializerChain
+            ) && matches!(
+                value,
+                AstExpr::TableConstructor(_) | AstExpr::FunctionExpr(_)
+            ) =>
+        {
+            Some(AdjacentInlineRejection::Lifetime)
+        }
+        InlineExprRejection::PolicyMismatch => Some(AdjacentInlineRejection::PolicyBoundary),
+    }
 }
 
 #[derive(Default)]
@@ -295,10 +339,10 @@ fn rewrite_current_block(
             index += 1;
             continue;
         }
-        let policy = if stmt_is_alias_initializer_sink(next_stmt) {
-            InlinePolicy::AliasInitializerChain
-        } else if stmt_is_adjacent_call_result_sink(next_stmt) {
+        let policy = if stmt_uses_binding_as_direct_call_callee(next_stmt, candidate.binding()) {
             InlinePolicy::AdjacentCallResultCallee
+        } else if stmt_is_alias_initializer_sink(next_stmt) {
+            InlinePolicy::AliasInitializerChain
         } else if stmt_is_direct_return_value_sink(next_stmt) {
             InlinePolicy::DirectReturnValue
         } else if stmt_is_multi_return_value_sink(next_stmt, candidate.binding()) {
@@ -379,24 +423,35 @@ fn rewrite_current_block(
             index += 1;
             continue;
         }
-        if !candidate.allows_expr_with_policy(value, effective_policy)
-            && !allows_special_lookup_access_base
+        if let Some(rejection) = (!allows_special_lookup_access_base)
+            .then(|| adjacent_inline_rejection(candidate, value, effective_policy))
+            .flatten()
         {
-            // 候选忽略[NotApplicable]：VarArg/Error、closure/table 以及非本 policy 所有的
-            // call/lookup site 不属于这条相邻 rewrite transaction。
-            // 候选拒绝[PolicyBoundary]：语义允许但超过当前 policy 展示集合的表达式留给
-            // stable-copy、mechanical-run 或对应 terminal owner。
-            // 候选拒绝[TargetConstraint]：方言专属常量、非有限 number 及未证明 operand
-            // 类型的运算不能仅按 AST 形状搬移；literal-only 安全集由 target-aware fact 放行。
-            // 候选拒绝[SemanticBarrier:ValueArity]：裸 call/method/vararg 移到开放尾位会改变值宽。
-            // 候选拒绝[SemanticBarrier:Lifetime]：分配结果移入非终态 sink 会缩短原 local root。
+            match rejection {
+                AdjacentInlineRejection::DebugScope => {
+                    // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted local 会改变
+                    // 调用中 debug.getlocal 可观察的名字与作用域（regress_351）。
+                }
+                AdjacentInlineRejection::Lifetime => {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须保留原强根区间；
+                    // 普通 recovered allocation 移入非终态 sink 也会缩短原 local root。
+                }
+                AdjacentInlineRejection::ValueArity => {
+                    // 候选拒绝[SemanticBarrier:ValueArity]：裸 call/method/vararg 从单值
+                    // initializer 移到 return 开放尾位可能重新展开。
+                }
+                AdjacentInlineRejection::PolicyBoundary => {
+                    // 候选拒绝[PolicyBoundary]：Error、非本 policy 所有的表达式形状与超过
+                    // 当前展示集合的候选留给 stable-copy、mechanical-run 或 terminal owner。
+                }
+            }
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
         }
         let suffix_uses = use_index.count_uses_in_suffix(index + 1, candidate.binding());
         if suffix_uses == 0 {
-            // 候选忽略[NotApplicable]：没有 use site 就不是表达式内联事务；本轮之前的
+            // 没有 use site 就不是表达式内联事务；本轮之前的
             // cleanup 已消费可安全丢弃的 initializer/裸 call，仍保留者具有 lookup、
             // metamethod、allocation 或失败证据等可观察求值，不能在这里删除。
             stmt_plan.push(PlannedStmt::Original(index));
@@ -453,7 +508,7 @@ fn rewrite_current_block(
                 }
             } else {
                 // 候选拒绝[PolicyBoundary]：精确 use-site 仍可能超过对应展示复杂度预算；
-                // 候选忽略[NotApplicable]：bare stable copy 及其直接 nested-block use 由
+                // bare stable copy 及其直接 nested-block use 由
                 // 本函数稍后的 copy-inline 原子消费；其它 policy 不拥有该位置。
                 // 候选拒绝[SemanticBarrier:Capture]：FunctionExpr capture 需要 alias 的
                 // 独立 cell identity，不能把捕获元数据改写成 source binding。
@@ -613,7 +668,7 @@ fn collapse_stable_copy_aliases(
             // 重读不等价于声明点快照；带名字的算术/比较也缺少稳定 operand 类型。
             // 候选拒绝[TargetConstraint]：非有限 number 与 Int64/UInt64/Vector/Complex 的
             // 源码物化可能增加运算或对象 identity；目标已定义的 literal-only 运算已放行。
-            // 候选忽略[NotApplicable]：Temp/Error 分别归 HIR/materialize 与错误输出 owner；
+            // Temp/Error 分别归 HIR/materialize 与错误输出 owner；
             // call/lookup/table/closure 不是 stable-copy。
             continue;
         }
@@ -632,7 +687,7 @@ fn collapse_stable_copy_aliases(
         let use_stmt_indices =
             use_index.use_stmt_indices_in_suffix(candidate_index + 1, candidate.binding());
         if use_stmt_indices.is_empty() {
-            // 候选忽略[NotApplicable]：没有读取就不存在 copy-inline site；cleanup 在
+            // 没有读取就不存在 copy-inline site；cleanup 在
             // inline-exprs 之前及其 invalidation 后重跑，负责删除无 use 的安全 initializer。
             continue;
         }
@@ -846,7 +901,7 @@ fn stable_copy_trailing_root_handoff(
             return None;
         }
         AstStmt::Return(_) => {
-            // 候选忽略[NotApplicable]：合法 AST block 的 return 是终结语句，不会同时
+            // 合法 AST block 的 return 是终结语句，不会同时
             // 满足“同一 block 内 source 在其后写入”的 handoff 入口条件。
             return None;
         }
@@ -1233,14 +1288,16 @@ fn inline_crosses_evaluation_boundary(
     mutable_snapshots: &MutableSnapshotNames,
     policy: InlinePolicy,
 ) -> bool {
-    if matches!(policy, InlinePolicy::BooleanReturnValue)
-        && is_lookup_inline_expr(value)
-        && stmt_is_terminal_lookup_return_sink(next_stmt, binding)
-    {
-        // The lookup is the first and only observable producer in the return expression.  The
-        // remaining short-circuit suffix is context-safe, so the expression temporary itself
-        // carries the value through the same truthiness/return operation as the old local root.
-        return false;
+    if matches!(policy, InlinePolicy::BooleanReturnValue) && is_lookup_inline_expr(value) {
+        if stmt_is_terminal_lookup_return_sink(next_stmt, binding) {
+            // The lookup is the first and only observable producer in the return expression.  The
+            // remaining short-circuit suffix is context-safe, so the expression temporary itself
+            // carries the value through the same truthiness/return operation as the old local root.
+            return false;
+        }
+        // 候选拒绝[SemanticBarrier:Lifetime]：非终态短路尾部可调用或分配；删除 lookup
+        // alias 后，左值临时槽不保证把旧对象 root 保留到右臂完成，弱表或 `__gc` 可观察。
+        return true;
     }
     (matches!(next_stmt, AstStmt::While(_) | AstStmt::Repeat(_))
         && !super::expr_analysis::is_stable_inline_value(value))
@@ -1264,7 +1321,7 @@ mod tests {
         AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstCallStmt,
         AstFieldAccess, AstFunctionExpr, AstGlobalName, AstGoto, AstIf, AstIndexAccess, AstLabel,
         AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstLogicalExpr,
-        AstNameRef, AstRepeat, AstReturn, AstWhile,
+        AstNameRef, AstRepeat, AstReturn, AstTableConstructor, AstTableField, AstWhile,
     };
     use crate::decompile::DecompileDialect;
     use crate::hir::{HirProtoRef, LocalId, ParamId, UpvalueId};
@@ -1967,6 +2024,7 @@ mod tests {
                             body: AstBlock::default(),
                             captured_bindings: BTreeSet::from([source]),
                             captured_params: BTreeSet::new(),
+                            capture_names_by_upvalue: std::collections::BTreeMap::new(),
                             capture_write_names,
                         })),
                     ),
@@ -2055,6 +2113,7 @@ mod tests {
                         body: AstBlock::default(),
                         captured_bindings: BTreeSet::from([binding]),
                         captured_params: BTreeSet::new(),
+                        capture_names_by_upvalue: std::collections::BTreeMap::new(),
                         capture_write_names: BTreeSet::new(),
                     })),
                 ),
@@ -2208,48 +2267,83 @@ mod tests {
 
     #[test]
     fn inlines_global_callee_when_the_call_is_adjacent() {
-        for origin in [AstLocalOrigin::Recovered, AstLocalOrigin::PhysicalRoot] {
-            let binding = AstBindingRef::Local(LocalId(0));
-            let global = AstExpr::Var(AstNameRef::Global(AstGlobalName {
-                text: "assert".to_owned(),
-            }));
-            let mut block = AstBlock {
-                stmts: vec![
-                    AstStmt::LocalDecl(Box::new(AstLocalDecl {
-                        bindings: vec![AstLocalBinding {
-                            id: binding,
-                            attr: AstLocalAttr::None,
-                            origin,
-                        }],
-                        values: vec![global],
+        let binding = AstBindingRef::Local(LocalId(0));
+        let global = AstExpr::Var(AstNameRef::Global(AstGlobalName {
+            text: "assert".to_owned(),
+        }));
+        let mut block = AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: binding,
+                        attr: AstLocalAttr::None,
+                        origin: AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![global],
+                })),
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(binding.to_name_ref()),
+                        args: vec![AstExpr::Boolean(true)],
+                        method_name: None,
                     })),
-                    AstStmt::CallStmt(Box::new(AstCallStmt {
-                        call: AstCallKind::Call(Box::new(AstCallExpr {
-                            callee: AstExpr::Var(binding.to_name_ref()),
-                            args: vec![AstExpr::Boolean(true)],
-                            method_name: None,
-                        })),
-                    })),
-                ],
-            };
+                })),
+            ],
+        };
 
-            assert!(rewrite_current_block(
-                &mut block,
-                lua54_target(),
-                ReadabilityOptions::default(),
-                &MutableSnapshotNames::new(),
-                None,
-            ));
-            assert!(matches!(
-                block.stmts.as_slice(),
-                [AstStmt::CallStmt(call)]
-                    if matches!(
-                        &call.call,
-                        AstCallKind::Call(call)
-                            if matches!(call.callee, AstExpr::Var(AstNameRef::Global(_)))
-                    )
-            ));
-        }
+        assert!(rewrite_current_block(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::CallStmt(call)]
+                if matches!(
+                    &call.call,
+                    AstCallKind::Call(call)
+                        if matches!(call.callee, AstExpr::Var(AstNameRef::Global(_)))
+                )
+        ));
+    }
+
+    #[test]
+    fn keeps_physical_root_global_callee() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let global = AstExpr::Var(AstNameRef::Global(AstGlobalName {
+            text: "assert".to_owned(),
+        }));
+        let mut block = AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: binding,
+                        attr: AstLocalAttr::None,
+                        origin: AstLocalOrigin::PhysicalRoot,
+                    }],
+                    values: vec![global],
+                })),
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(binding.to_name_ref()),
+                        args: vec![AstExpr::Boolean(true)],
+                        method_name: None,
+                    })),
+                })),
+            ],
+        };
+        let expected = block.clone();
+
+        assert!(!rewrite_current_block(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(block, expected);
     }
 
     #[test]
@@ -2260,11 +2354,14 @@ mod tests {
             stmts: vec![
                 recovered_local(
                     binding,
-                    equals(parameter, AstExpr::String("target".to_owned().into())),
+                    equals(
+                        parameter.clone(),
+                        AstExpr::String("target".to_owned().into()),
+                    ),
                 ),
                 return_values(vec![
                     AstExpr::Var(binding.to_name_ref()),
-                    AstExpr::Integer(1),
+                    call_expr("identity", parameter),
                 ]),
             ],
         };
@@ -2281,7 +2378,7 @@ mod tests {
             [AstStmt::Return(ret)]
                 if matches!(
                     ret.values.as_slice(),
-                    [AstExpr::Binary(binary), AstExpr::Integer(1)]
+                    [AstExpr::Binary(binary), AstExpr::Call(_)]
                         if binary.op == AstBinaryOpKind::Eq
                 )
         ));
@@ -2361,6 +2458,55 @@ mod tests {
                 if matches!(&ret.values[0], AstExpr::LogicalOr(logical)
                     if matches!(&logical.lhs, AstExpr::IndexAccess(_)))
         ));
+
+        let table_binding = AstBindingRef::Local(LocalId(2));
+        let table_sink = return_values(vec![AstExpr::TableConstructor(Box::new(
+            AstTableConstructor {
+                fields: vec![AstTableField::Array(AstExpr::Var(
+                    table_binding.to_name_ref(),
+                ))],
+            },
+        ))]);
+        let table_lookup = indexed(
+            AstExpr::Var(AstNameRef::Local(LocalId(3))),
+            AstExpr::String("key".to_owned().into()),
+        );
+        assert!(!eval_order::preserves_adjacent_eval_order(
+            &table_sink,
+            table_binding,
+            &table_lookup,
+            &MutableSnapshotNames::new(),
+        ));
+
+        let closure_binding = AstBindingRef::Local(LocalId(4));
+        let closure = AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+            function: HirProtoRef(1),
+            params: Vec::new(),
+            is_vararg: false,
+            named_vararg: None,
+            body: AstBlock::default(),
+            captured_bindings: BTreeSet::new(),
+            captured_params: BTreeSet::new(),
+            capture_names_by_upvalue: std::collections::BTreeMap::new(),
+            capture_write_names: BTreeSet::new(),
+        }));
+        let mut closure_block = AstBlock {
+            stmts: vec![
+                recovered_local(closure_binding, closure),
+                return_values(vec![AstExpr::Var(closure_binding.to_name_ref())]),
+            ],
+        };
+        assert!(rewrite_current_block(
+            &mut closure_block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert!(matches!(
+            closure_block.stmts.as_slice(),
+            [AstStmt::Return(ret)] if matches!(ret.values.as_slice(), [AstExpr::FunctionExpr(_)])
+        ));
     }
 
     #[test]
@@ -2371,8 +2517,11 @@ mod tests {
             AstExpr::Var(AstNameRef::Param(ParamId(0))),
         );
         let fallback = AstExpr::Call(Box::new(AstCallExpr {
-            callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
-                text: "fallback".to_owned(),
+            callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                base: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                    text: "observer".to_owned(),
+                })),
+                field: "fallback".to_owned(),
             })),
             args: Vec::new(),
             method_name: None,

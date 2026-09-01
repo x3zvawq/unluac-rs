@@ -127,7 +127,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         name: "statement-merge",
         phase: PassPhase::Normal,
         depends_on: &[StatementAdjacency, ControlFlowShape],
-        invalidates: &[StatementAdjacency, ExprShape],
+        invalidates: &[StatementAdjacency, ExprShape, BindingStructure],
     },
     PassDescriptor {
         name: "branch-pretty",
@@ -179,8 +179,13 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
     PassDescriptor {
         name: "global-decl-pretty",
         phase: PassPhase::Deferred,
-        depends_on: &[StatementAdjacency],
-        invalidates: &[StatementAdjacency],
+        depends_on: &[
+            StatementAdjacency,
+            ControlFlowShape,
+            ExprShape,
+            BindingStructure,
+        ],
+        invalidates: &[StatementAdjacency, ControlFlowShape, BindingStructure],
     },
     PassDescriptor {
         name: "goto-syntax-safety",
@@ -192,7 +197,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         name: "local-scope-limit",
         phase: PassPhase::Deferred,
         depends_on: &[StatementAdjacency, BindingStructure],
-        invalidates: &[],
+        invalidates: &[StatementAdjacency, ControlFlowShape, BindingStructure],
     },
 ];
 
@@ -365,6 +370,7 @@ mod tests {
                         body: AstBlock::default(),
                         captured_bindings: BTreeSet::new(),
                         captured_params: BTreeSet::new(),
+                        capture_names_by_upvalue: std::collections::BTreeMap::new(),
                         capture_write_names: BTreeSet::new(),
                     }))],
                 }))],
@@ -398,6 +404,16 @@ mod tests {
             .iter()
             .find(|descriptor| descriptor.name == "function-sugar")
             .expect("function-sugar descriptor must exist");
+
+        assert!(descriptor.invalidates.contains(&BindingStructure));
+    }
+
+    #[test]
+    fn statement_merge_reawakens_binding_structure_consumers() {
+        let descriptor = PASS_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.name == "statement-merge")
+            .expect("statement-merge descriptor must exist");
 
         assert!(descriptor.invalidates.contains(&BindingStructure));
     }

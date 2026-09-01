@@ -172,6 +172,7 @@ mod tests {
                 body: crate::ast::common::AstBlock::default(),
                 captured_bindings: BTreeSet::new(),
                 captured_params: BTreeSet::new(),
+                capture_names_by_upvalue: std::collections::BTreeMap::new(),
                 capture_write_names: BTreeSet::new(),
             }))],
         }

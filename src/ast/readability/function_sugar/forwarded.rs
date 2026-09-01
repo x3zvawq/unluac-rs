@@ -1,12 +1,13 @@
 //! 这个子模块负责吸收“先放进 local，再立刻转发出去”的函数壳。
 //!
-//! 它依赖 binding-flow 和 capture provenance 已确认这个局部只是纯转发壳，不会越权把
-//! 真正有闭包依赖的 local function 折叠掉。
+//! 它依赖 binding-flow、可写 capture 快照和 capture provenance 已确认这个局部只是纯
+//! 转发壳，不会越权把真正有闭包依赖的 local function 折叠掉，也不会把可变 lvalue
+//! 地址的读取搬到 closure 分配之前。
 //! 例如：`local f = function() ... end; t.f = f` 会在这里尝试合成 `function t.f() ... end`。
 
-use super::super::binding_flow::BindingUseIndex;
+use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
 use super::super::binding_ref::name_matches_binding;
-use super::super::expr_analysis::is_context_safe_expr;
+use super::super::expr_analysis::is_stable_context_expr;
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
     AstBindingRef, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalBindingTarget, AstLValue,
@@ -18,6 +19,7 @@ pub(super) fn try_lower_forwarded_function_stmt(
     use_index: &BindingUseIndex,
     stmt_base: usize,
     target: AstTargetDialect,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<(AstStmt, usize)> {
     let [AstStmt::LocalDecl(local_decl), next, ..] = stmts else {
         return None;
@@ -30,7 +32,13 @@ pub(super) fn try_lower_forwarded_function_stmt(
     let AstExpr::FunctionExpr(function) = &local_decl.values[0] else {
         return None;
     };
-    let stmt = inline_function_into_stmt(next, binding, function.as_ref().clone(), target)?;
+    let stmt = inline_function_into_stmt(
+        next,
+        binding,
+        function.as_ref().clone(),
+        target,
+        mutable_snapshots,
+    )?;
 
     // 精确转发 sink 已经形成；从这里开始的退出才会拒绝真实候选。
     match local_binding.attr {
@@ -72,6 +80,7 @@ fn inline_function_into_stmt(
     binding: AstBindingRef,
     function: AstFunctionExpr,
     target: AstTargetDialect,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<AstStmt> {
     match stmt {
         AstStmt::GlobalDecl(global_decl)
@@ -109,7 +118,7 @@ fn inline_function_into_stmt(
             if !name_matches_binding(name, binding) {
                 return None;
             }
-            if !lvalue_prefix_can_move_before_closure(&assign.targets[0]) {
+            if !lvalue_prefix_can_move_before_closure(&assign.targets[0], mutable_snapshots) {
                 // 候选拒绝[SemanticBarrier:EvalOrder]：转发会把 lvalue 的地址求值
                 // 搬到 closure 分配之前；lookup、global 读取或其它运行时事件可观察到
                 // 相反顺序，反例见 regress_401。
@@ -132,12 +141,16 @@ fn inline_function_into_stmt(
     }
 }
 
-fn lvalue_prefix_can_move_before_closure(target: &AstLValue) -> bool {
+fn lvalue_prefix_can_move_before_closure(
+    target: &AstLValue,
+    mutable_snapshots: &MutableSnapshotNames,
+) -> bool {
     match target {
         AstLValue::Name(_) => true,
-        AstLValue::FieldAccess(access) => is_context_safe_expr(&access.base),
+        AstLValue::FieldAccess(access) => is_stable_context_expr(&access.base, mutable_snapshots),
         AstLValue::IndexAccess(access) => {
-            is_context_safe_expr(&access.base) && is_context_safe_expr(&access.index)
+            is_stable_context_expr(&access.base, mutable_snapshots)
+                && is_stable_context_expr(&access.index, mutable_snapshots)
         }
     }
 }

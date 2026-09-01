@@ -7,8 +7,9 @@
 //!
 //! 清理范围：目标 temp 全局无读者，且 RHS 不含潜在副作用（调用、metamethod 触发、
 //! table 构造等）的赋值语句。它依赖 promotion 保存的物理 home 与 entry-nil provenance：
-//! 无物理 home 的纯死写可直接删除；参数同槽写改回参数赋值；不经过循环或非局部跳转的
-//! 结构化前缀中，`entry nil -> GC-inert value` 的写入也可删除；复制无 capture-home
+//! 无物理 home 的纯死写可直接删除；参数同槽写改回参数赋值；不经过循环或可达反向边的
+//! 结构化前缀中，`entry nil -> GC-inert value` 的写入也可删除；只被前向 goto 引用的
+//! label 不会停用整段证明。复制无 capture-home
 //! 别名、无后写且后缀仍读取的可见 binding 同样不需要建立第二个 root。其余有 home 的
 //! 写入不在这里猜 reaching value，因为它仍可能决定旧对象或新对象的 GC root 生命周期。
 //! RHS 的可删除性与 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
@@ -25,10 +26,14 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{CopyRootOverwrite, HomeSlotKey, ProtoPromotionFacts};
 
+use super::lexical_cfg::{
+    LexicalBlockKind, LexicalBlockPath, LexicalCfgFailure, OwnerReentryFacts,
+};
 use super::mention::{
     ReferenceCapturedBindings, stmts_protected_locals, stmts_reference_captured_bindings,
 };
-use super::temp_touch::{collect_temp_reads_in_proto, stmt_contains_nested_nonlocal_control};
+use super::root_lifetimes::stmt_may_observe_gc_roots;
+use super::temp_touch::collect_temp_reads_in_proto;
 use super::visit::{self, HirVisitor};
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -130,14 +135,30 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         safety,
     };
     let mut changed = rewrite_proto(proto, &mut pass);
+    // rewrite_proto 可能删除或重写同一 owner 内的语句；后续 CFG 必须消费改写后的
+    // goto/label 关系，否则会把已经消失的重入边误判为仍然存在。
+    let owner_reentry =
+        OwnerReentryFacts::collect(&proto.body, safety).unwrap_or_else(|failure| match failure {
+            LexicalCfgFailure::AmbiguousLabel => {
+                panic!("HIR label identity must have one lexical owner per proto")
+            }
+            LexicalCfgFailure::ExternalEntry => {
+                unreachable!("owner-wide CFG cannot have a parent entry")
+            }
+        });
+    let dead_entry_context = DeadEntryNilContext {
+        owner_reentry: &owner_reentry,
+        live_reads: &live_reads,
+        debug_temps: &pass.debug_temps,
+        physical_root_temps: &proto.physical_root_temps,
+        stable_visible_bindings: &pass.stable_visible_bindings,
+        facts: promotion_facts,
+        safety,
+    };
     changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
         &mut proto.body,
-        &live_reads,
-        &pass.debug_temps,
-        &proto.physical_root_temps,
-        &pass.stable_visible_bindings,
-        promotion_facts,
-        safety,
+        &LexicalBlockPath::root(),
+        &dead_entry_context,
     );
     changed |= preserve_copy_roots_in_proto(
         proto,
@@ -165,61 +186,52 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
     changed
 }
 
+struct DeadEntryNilContext<'a> {
+    owner_reentry: &'a OwnerReentryFacts,
+    live_reads: &'a BTreeSet<TempId>,
+    debug_temps: &'a BTreeSet<TempId>,
+    physical_root_temps: &'a BTreeSet<TempId>,
+    stable_visible_bindings: &'a StableVisibleBindings,
+    facts: &'a ProtoPromotionFacts,
+    safety: HirExprSafety,
+}
+
 fn remove_dead_entry_nil_writes_from_acyclic_prefixes(
     block: &mut HirBlock,
-    live_reads: &BTreeSet<TempId>,
-    debug_temps: &BTreeSet<TempId>,
-    physical_root_temps: &BTreeSet<TempId>,
-    stable_visible_bindings: &StableVisibleBindings,
-    facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
+    path: &LexicalBlockPath,
+    context: &DeadEntryNilContext<'_>,
 ) -> bool {
-    let mut changed = remove_dead_entry_nil_writes_from_root_prefix(
-        block,
-        live_reads,
-        debug_temps,
-        physical_root_temps,
-        stable_visible_bindings,
-        facts,
-        safety,
-    );
-
-    for stmt in &mut block.stmts {
-        if stmt_contains_nested_nonlocal_control(stmt) {
-            continue;
+    let reentry_start = context
+        .owner_reentry
+        .first_reentry_target(path)
+        .unwrap_or(block.stmts.len());
+    let mut changed = false;
+    for (index, stmt) in block.stmts.iter_mut().enumerate() {
+        // 若当前语句位于 owner 的可达回边区域，它的嵌套 block 也可能重复执行；即使
+        // 嵌套 block 自身没有 label，也不能把它当成单次入口继续递归证明。
+        if index >= reentry_start {
+            break;
         }
         match stmt {
             HirStmt::If(if_stmt) => {
                 changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
                     &mut if_stmt.then_block,
-                    live_reads,
-                    debug_temps,
-                    physical_root_temps,
-                    stable_visible_bindings,
-                    facts,
-                    safety,
+                    &path.child(index, LexicalBlockKind::Then),
+                    context,
                 );
                 if let Some(else_block) = &mut if_stmt.else_block {
                     changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
                         else_block,
-                        live_reads,
-                        debug_temps,
-                        physical_root_temps,
-                        stable_visible_bindings,
-                        facts,
-                        safety,
+                        &path.child(index, LexicalBlockKind::Else),
+                        context,
                     );
                 }
             }
             HirStmt::Block(nested) => {
                 changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
                     nested,
-                    live_reads,
-                    debug_temps,
-                    physical_root_temps,
-                    stable_visible_bindings,
-                    facts,
-                    safety,
+                    &path.child(index, LexicalBlockKind::Body),
+                    context,
                 );
             }
             HirStmt::LocalDecl(_)
@@ -241,6 +253,7 @@ fn remove_dead_entry_nil_writes_from_acyclic_prefixes(
             | HirStmt::CallStmt(_) => {}
         }
     }
+    changed |= remove_dead_entry_nil_writes_from_root_prefix(block, reentry_start, context);
     changed
 }
 
@@ -254,12 +267,14 @@ fn preserve_copy_roots_in_proto(
     physical_root_temps: &mut BTreeSet<TempId>,
 ) -> bool {
     let mut sites = BTreeMap::new();
+    let mut local_sites = BTreeMap::new();
     collect_copy_root_assignment_sites(
         &proto.body,
         live_reads,
         safety,
         &mut Vec::new(),
         &mut sites,
+        &mut local_sites,
     );
 
     let mut rewrite_targets = BTreeMap::<TempId, TempId>::new();
@@ -286,14 +301,19 @@ fn preserve_copy_roots_in_proto(
         }
 
         let mut candidate_rewrites = BTreeMap::new();
+        let match_context = CopyRootMatchContext {
+            sites: &sites,
+            local_sites: &local_sites,
+            debug_temps,
+            facts,
+            existing_rewrites: &rewrite_targets,
+        };
         let all_overwrites_match = overwrites.into_iter().flatten().all(|overwrite| {
             copy_root_overwrite_matches_hir(
                 *overwrite,
                 producer,
                 producer_site,
-                &sites,
-                debug_temps,
-                &rewrite_targets,
+                &match_context,
                 &mut candidate_rewrites,
             )
         });
@@ -335,12 +355,18 @@ impl CopyRootHirLocation {
 #[derive(Default)]
 struct CopyRootAssignmentSite {
     writes: usize,
+    value: Option<HirExpr>,
     dead_value: Option<HirExpr>,
     dead_pure_value: Option<HirExpr>,
     location: Option<CopyRootHirLocation>,
+    separate_endpoint_is_unobservable: bool,
 }
 
 impl CopyRootAssignmentSite {
+    fn unique_value(&self) -> Option<&HirExpr> {
+        (self.writes == 1).then_some(self.value.as_ref()).flatten()
+    }
+
     fn unique_dead_value(&self) -> Option<&HirExpr> {
         (self.writes == 1)
             .then_some(self.dead_value.as_ref())
@@ -360,34 +386,85 @@ fn collect_copy_root_assignment_sites(
     safety: HirExprSafety,
     block_path: &mut Vec<(usize, u8)>,
     sites: &mut BTreeMap<TempId, CopyRootAssignmentSite>,
+    local_sites: &mut BTreeMap<LocalId, CopyRootAssignmentSite>,
 ) {
     for (stmt_index, stmt) in block.stmts.iter().enumerate() {
         if let HirStmt::Assign(assign) = stmt {
             for target in &assign.targets {
-                if let HirLValue::Temp(temp) = target {
-                    sites.entry(*temp).or_default().writes += 1;
+                match target {
+                    HirLValue::Temp(temp) => sites.entry(*temp).or_default().writes += 1,
+                    HirLValue::Local(local) => local_sites.entry(*local).or_default().writes += 1,
+                    HirLValue::Param(_)
+                    | HirLValue::Upvalue(_)
+                    | HirLValue::TableAccess(_)
+                    | HirLValue::Global(_) => {}
                 }
             }
-            if let Some((temp, value)) = single_temp_assignment(stmt)
-                && !live_reads.contains(&temp)
-            {
+            if let Some((temp, value)) = single_temp_assignment(stmt) {
                 let site = sites.entry(temp).or_default();
-                site.dead_value = Some(value.clone());
-                if dead_pure_temp_assignment(stmt, live_reads, safety) == Some(temp) {
-                    site.dead_pure_value = Some(value.clone());
+                site.value = Some(value.clone());
+                if !live_reads.contains(&temp) {
+                    site.dead_value = Some(value.clone());
+                    if dead_pure_temp_assignment(stmt, live_reads, safety) == Some(temp) {
+                        site.dead_pure_value = Some(value.clone());
+                    }
                 }
                 site.location = Some(CopyRootHirLocation {
                     block_path: block_path.clone(),
                     stmt_index,
                 });
+                site.separate_endpoint_is_unobservable = straight_line_suffix_is_gc_inert_to_return(
+                    &block.stmts[(stmt_index + 1)..],
+                    safety,
+                );
+            }
+        }
+        if let HirStmt::LocalDecl(decl) = stmt {
+            for local in &decl.bindings {
+                local_sites.entry(*local).or_default().writes += 1;
+            }
+            if let ([local], [value], None) = (
+                decl.bindings.as_slice(),
+                decl.values.fixed.as_slice(),
+                &decl.values.tail,
+            ) {
+                let site = local_sites.entry(*local).or_default();
+                site.value = Some(value.clone());
+                site.location = Some(CopyRootHirLocation {
+                    block_path: block_path.clone(),
+                    stmt_index,
+                });
+                site.separate_endpoint_is_unobservable = straight_line_suffix_is_gc_inert_to_return(
+                    &block.stmts[(stmt_index + 1)..],
+                    safety,
+                );
             }
         }
         for_each_copy_root_child_block(stmt, &mut |child, child_kind| {
             block_path.push((stmt_index, child_kind));
-            collect_copy_root_assignment_sites(child, live_reads, safety, block_path, sites);
+            collect_copy_root_assignment_sites(
+                child,
+                live_reads,
+                safety,
+                block_path,
+                sites,
+                local_sites,
+            );
             block_path.pop();
         });
     }
+}
+
+fn straight_line_suffix_is_gc_inert_to_return(suffix: &[HirStmt], safety: HirExprSafety) -> bool {
+    let Some((last, prefix)) = suffix.split_last() else {
+        return false;
+    };
+    matches!(last, HirStmt::Return(_))
+        && !stmt_may_observe_gc_roots(last, safety)
+        && prefix.iter().all(|stmt| {
+            matches!(stmt, HirStmt::Assign(_) | HirStmt::LocalDecl(_))
+                && !stmt_may_observe_gc_roots(stmt, safety)
+        })
 }
 
 fn for_each_copy_root_child_block(stmt: &HirStmt, visit: &mut impl FnMut(&HirBlock, u8)) {
@@ -419,20 +496,32 @@ fn for_each_copy_root_child_block(stmt: &HirStmt, visit: &mut impl FnMut(&HirBlo
     }
 }
 
+struct CopyRootMatchContext<'a> {
+    sites: &'a BTreeMap<TempId, CopyRootAssignmentSite>,
+    local_sites: &'a BTreeMap<LocalId, CopyRootAssignmentSite>,
+    debug_temps: &'a BTreeSet<TempId>,
+    facts: &'a ProtoPromotionFacts,
+    existing_rewrites: &'a BTreeMap<TempId, TempId>,
+}
+
 fn copy_root_overwrite_matches_hir(
     overwrite: CopyRootOverwrite,
     producer: TempId,
     producer_site: &CopyRootAssignmentSite,
-    sites: &BTreeMap<TempId, CopyRootAssignmentSite>,
-    debug_temps: &BTreeSet<TempId>,
-    existing_rewrites: &BTreeMap<TempId, TempId>,
+    context: &CopyRootMatchContext<'_>,
     candidate_rewrites: &mut BTreeMap<TempId, TempId>,
 ) -> bool {
     let temp = overwrite.temp();
-    let Some(site) = sites.get(&temp) else {
+    let temp_site = context.sites.get(&temp);
+    let Some(site) = temp_site.or_else(|| {
+        context
+            .facts
+            .promoted_local_for_temp(temp)
+            .and_then(|local| context.local_sites.get(&local))
+    }) else {
         return false;
     };
-    let Some(value) = site.unique_dead_pure_value() else {
+    let Some(value) = site.unique_value() else {
         return false;
     };
     let Some(producer_location) = &producer_site.location else {
@@ -441,14 +530,22 @@ fn copy_root_overwrite_matches_hir(
     let Some(overwrite_location) = &site.location else {
         return false;
     };
-    if debug_temps.contains(&temp)
+    if context.debug_temps.contains(&temp)
         || !overwrite.matches_hir_expr(value)
         || !producer_location.owns(overwrite_location)
-        || existing_rewrites.contains_key(&temp)
+        || context.existing_rewrites.contains_key(&temp)
     {
         return false;
     }
-    candidate_rewrites.insert(temp, producer).is_none()
+    if temp_site.is_some() && site.unique_dead_pure_value().is_some() {
+        candidate_rewrites.insert(temp, producer).is_none()
+    } else {
+        // Keeping the producer local alive past this raw primitive overwrite is observable only
+        // if the remaining path can allocate, call user code, inspect a weak table, or otherwise
+        // run before the frame returns. A live endpoint on a straight GC-inert return suffix may
+        // retain its own source binding; dead endpoints still have to reuse the producer owner.
+        site.separate_endpoint_is_unobservable
+    }
 }
 
 fn rewrite_copy_root_overwrites(
@@ -494,7 +591,7 @@ fn preserve_adjacent_dead_physical_overwrites(
             continue;
         }
         let Some(home) = facts.home_slot(previous) else {
-            // 候选忽略[NotApplicable]：没有 raw target home 的 synthetic temp 不代表 VM
+            // 没有 raw target home 的 synthetic temp 不代表 VM
             // 物理写，不是这条“把后继写接回旧 root cell”的候选。
             continue;
         };
@@ -502,7 +599,7 @@ fn preserve_adjacent_dead_physical_overwrites(
             continue;
         }
         if facts.home_slot(current) != Some(home) {
-            // 候选忽略[NotApplicable]：异槽相邻写不属于“把后继覆盖接回同一物理 root
+            // 异槽相邻写不属于“把后继覆盖接回同一物理 root
             // cell”的候选；它们各自拥有独立的生命周期事务。
             continue;
         }
@@ -543,21 +640,17 @@ fn single_temp_assignment(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
 
 fn remove_dead_entry_nil_writes_from_root_prefix(
     block: &mut HirBlock,
-    live_reads: &BTreeSet<TempId>,
-    debug_temps: &BTreeSet<TempId>,
-    physical_root_temps: &BTreeSet<TempId>,
-    stable_visible_bindings: &StableVisibleBindings,
-    facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
+    reentry_start: usize,
+    context: &DeadEntryNilContext<'_>,
 ) -> bool {
     let mut changed = false;
     let mut in_single_pass_prefix = true;
     let adjacent_visible_handoffs = block
         .stmts
         .windows(2)
-        .filter_map(|pair| adjacent_same_value_visible_handoff(pair, facts))
+        .filter_map(|pair| adjacent_same_value_visible_handoff(pair, context.facts))
         .collect::<BTreeSet<_>>();
-    let last_local_read = root_prefix_last_local_reads(block);
+    let last_local_read = root_prefix_last_local_reads(block, reentry_start);
     let mut index = 0;
     block.stmts.retain(|stmt| {
         let current_index = index;
@@ -565,34 +658,35 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
         if !in_single_pass_prefix {
             return true;
         }
-        if !root_prefix_scan_can_cross(stmt) {
+        if current_index >= reentry_start || !root_prefix_scan_can_cross(stmt) {
             in_single_pass_prefix = false;
             return true;
         }
 
-        let removable = dead_pure_temp_assignment(stmt, live_reads, safety).is_some_and(|temp| {
-            let home = facts.home_slot(temp);
-            let has_adjacent_visible_handoff = adjacent_visible_handoffs.contains(&temp);
-            let overwrites_entry_nil_with_nil =
-                facts.overwrites_entry_nil(temp) && dead_write_value_is_nil(stmt);
-            (facts.overwrites_entry_nil(temp) || has_adjacent_visible_handoff)
+        let removable = dead_pure_temp_assignment(stmt, context.live_reads, context.safety)
+            .is_some_and(|temp| {
+                let home = context.facts.home_slot(temp);
+                let has_adjacent_visible_handoff = adjacent_visible_handoffs.contains(&temp);
+                let overwrites_entry_nil_with_nil =
+                    context.facts.overwrites_entry_nil(temp) && dead_write_value_is_nil(stmt);
+                (context.facts.overwrites_entry_nil(temp) || has_adjacent_visible_handoff)
                 // 候选拒绝[SemanticBarrier:DebugScope]：debug temp 是已保留的源码 binding；删除定义会抹掉其声明可见期。
-                && !debug_temps.contains(&temp)
+                && !context.debug_temps.contains(&temp)
                 // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot temp 可能已由精确
                 // overwrite handoff 复用；删除其 GC-inert 写会丢失原 root 终止点。
-                && (!physical_root_temps.contains(&temp) || has_adjacent_visible_handoff)
+                && (!context.physical_root_temps.contains(&temp) || has_adjacent_visible_handoff)
                 // 候选拒绝[SemanticBarrier:Lifetime]：entry-nil 只证明旧值非资源；新 RHS
                 // 若可持有 collectable value，删除目标槽写会丢失它的独立 GC root。
                 // regress_431 的 overwritten/only_root/captured 三组分别覆盖来源后写、唯一
                 // root 与 capture cell；只有下列不建立新 root 的证明分支可以删除。
-                && (dead_write_value_is_gc_inert(stmt, safety)
+                && (dead_write_value_is_gc_inert(stmt, context.safety)
                     // 候选接受[NoOpRootProof]：下一句把同一个 visible value 交给同一
                     // trusted home；两次写之间无求值、GC 或 capture 观察点，首写不建立
                     // 额外 root epoch。regress_36 覆盖该分支 handoff。
                     || has_adjacent_visible_handoff
                     || dead_write_copies_stable_binding(
                         stmt,
-                        stable_visible_bindings,
+                        context.stable_visible_bindings,
                         current_index,
                         &last_local_read,
                     ))
@@ -602,11 +696,12 @@ fn remove_dead_entry_nil_writes_from_root_prefix(
                     // 的同 home capture 观察不到这次无值、无 root 的写回。
                     || overwrites_entry_nil_with_nil
                     || home.is_some_and(|home| {
-                        !stable_visible_bindings
+                        !context
+                            .stable_visible_bindings
                             .reference_captured_homes
                             .contains(&home)
                     }))
-        });
+            });
         changed |= removable;
         !removable
     });
@@ -659,18 +754,16 @@ fn root_prefix_scan_can_cross(stmt: &HirStmt) -> bool {
         | HirStmt::Repeat(_)
         | HirStmt::NumericFor(_)
         | HirStmt::GenericFor(_)
-        | HirStmt::Block(_) => !stmt_contains_nested_nonlocal_control(stmt),
+        | HirStmt::Block(_) => true,
         HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) => {
             // 直接终止语句不会顺序进入当前 block 的后缀；后缀只有经过显式 label 才可能
-            // 重新可达。继续扫描不可达区间是安全的，而下方 Label guard 与递归入口的
-            // nested-nonlocal guard 会在任何真实重入边界前停住。
+            // 重新可达。继续扫描不可达区间是安全的；owner-wide CFG 会在任何真实重入
+            // 边界前停住删除与嵌套递归。
             true
         }
-        HirStmt::Label(_) => {
-            // 分析停用[SemanticBarrier:ControlFlow]：可重入 label 会让后缀绕过当前 block
-            // 的唯一顺序入口，破坏“每条候选至多执行一次”的 entry-nil 证明。
-            false
-        }
+        // label 自身没有求值或写入；是否形成回边由 owner-wide CFG 的精确
+        // `first_reentry_target` 决定。只被前向 goto 引用的 label 仍属于单次执行前缀。
+        HirStmt::Label(_) => true,
     }
 }
 
@@ -682,9 +775,15 @@ fn root_prefix_read_scan_can_continue(stmt: &HirStmt) -> bool {
         )
 }
 
-fn root_prefix_last_local_reads(block: &HirBlock) -> BTreeMap<LocalId, usize> {
+fn root_prefix_last_local_reads(
+    block: &HirBlock,
+    reentry_start: usize,
+) -> BTreeMap<LocalId, usize> {
     let mut last_local_read = BTreeMap::new();
     for (index, stmt) in block.stmts.iter().enumerate() {
+        if index >= reentry_start {
+            break;
+        }
         let mut collector = LastLocalReadCollector {
             index,
             reads: &mut last_local_read,
@@ -1354,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn root_prefix_crosses_direct_terminals_but_stops_at_reentry_boundaries() {
+    fn root_prefix_distinguishes_forward_labels_from_reentry_boundaries() {
         let target = HirLabelId(0);
         let nested_goto = HirStmt::If(Box::new(HirIf {
             cond: HirExpr::Boolean(true),
@@ -1370,13 +1469,50 @@ mod tests {
             tbc_barriers: Vec::new(),
         }));
 
-        assert!(!root_prefix_scan_can_cross(&nested_goto));
-        for terminal in [return_stmt, HirStmt::Break, HirStmt::Continue, goto_stmt] {
+        // The statement-level CFG, rather than a blanket nested-goto shape check, decides whether
+        // this forward transfer can re-enter a candidate.
+        assert!(root_prefix_scan_can_cross(&nested_goto));
+        for terminal in [
+            return_stmt,
+            HirStmt::Break,
+            HirStmt::Continue,
+            goto_stmt.clone(),
+        ] {
             assert!(root_prefix_scan_can_cross(&terminal));
             assert!(!root_prefix_read_scan_can_continue(&terminal));
         }
-        assert!(!root_prefix_scan_can_cross(&label));
-        assert!(!root_prefix_read_scan_can_continue(&label));
+        assert!(root_prefix_scan_can_cross(&label));
+        assert!(root_prefix_read_scan_can_continue(&label));
+
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let root = LexicalBlockPath::root();
+        let forward = block(vec![goto_stmt.clone(), label.clone()]);
+        let forward_reentry = OwnerReentryFacts::collect(&forward, safety).unwrap();
+        assert_eq!(forward_reentry.first_reentry_target(&root), None);
+        let backward = block(vec![label, goto_stmt]);
+        let backward_reentry = OwnerReentryFacts::collect(&backward, safety).unwrap();
+        assert_eq!(backward_reentry.first_reentry_target(&root), Some(0));
+
+        let nested_target = HirLabelId(1);
+        let external_backward = block(vec![
+            HirStmt::Block(Box::new(block(vec![HirStmt::Label(Box::new(HirLabel {
+                id: nested_target,
+                tbc_barriers: Vec::new(),
+            }))]))),
+            HirStmt::Goto(Box::new(HirGoto {
+                target: nested_target,
+            })),
+        ]);
+        let external_backward_reentry =
+            OwnerReentryFacts::collect(&external_backward, safety).unwrap();
+        assert_eq!(
+            external_backward_reentry.first_reentry_target(&root),
+            Some(0)
+        );
+        assert_eq!(
+            external_backward_reentry.first_reentry_target(&root.child(0, LexicalBlockKind::Body)),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1390,7 +1526,10 @@ mod tests {
             assign(TempId(1), HirExpr::LocalRef(local)),
         ]);
 
-        assert_eq!(root_prefix_last_local_reads(&body).get(&local), Some(&0));
+        assert_eq!(
+            root_prefix_last_local_reads(&body, body.stmts.len()).get(&local),
+            Some(&0)
+        );
     }
 
     #[test]
@@ -1416,15 +1555,26 @@ mod tests {
             locals: BTreeSet::new(),
             reference_captured_homes: BTreeSet::new(),
         };
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let owner_reentry = OwnerReentryFacts::collect(&body, safety).unwrap();
+        let reentry_start = owner_reentry
+            .first_reentry_target(&LexicalBlockPath::root())
+            .unwrap_or(body.stmts.len());
+        let empty_temps = BTreeSet::new();
+        let context = DeadEntryNilContext {
+            owner_reentry: &owner_reentry,
+            live_reads: &empty_temps,
+            debug_temps: &empty_temps,
+            physical_root_temps: &empty_temps,
+            stable_visible_bindings: &stable_visible_bindings,
+            facts: &facts,
+            safety,
+        };
 
         assert!(remove_dead_entry_nil_writes_from_root_prefix(
             &mut body,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &stable_visible_bindings,
-            &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            reentry_start,
+            &context,
         ));
         assert_eq!(body.stmts.len(), 4);
         assert!(matches!(body.stmts[0], HirStmt::Return(_)));
@@ -1435,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn reachable_label_suffix_stops_dead_handoff_cleanup_after_return() {
+    fn external_forward_entry_keeps_the_single_pass_cleanup_proof() {
         let temp = TempId(0);
         let target = HirLabelId(0);
         let home = HomeSlotKey::new(0, 0);
@@ -1443,23 +1593,22 @@ mod tests {
         facts.record_temp_home_slot_for_test(temp, home);
         let mut body = block(vec![
             HirStmt::If(Box::new(HirIf {
-                cond: HirExpr::Boolean(true),
+                cond: HirExpr::ParamRef(ParamId(1)),
                 then_block: block(vec![HirStmt::Goto(Box::new(HirGoto { target }))]),
                 else_block: None,
             })),
-            HirStmt::Return(Box::new(HirReturn {
-                values: HirValuePack::default(),
-            })),
-            HirStmt::Label(Box::new(HirLabel {
-                id: target,
-                tbc_barriers: Vec::new(),
-            })),
-            HirStmt::Close(Box::new(HirClose { from_reg: 0 })),
-            assign(temp, HirExpr::ParamRef(ParamId(0))),
-            HirStmt::Assign(Box::new(HirAssign {
-                targets: vec![HirLValue::Param(ParamId(0))],
-                values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
-            })),
+            HirStmt::Block(Box::new(block(vec![
+                HirStmt::Label(Box::new(HirLabel {
+                    id: target,
+                    tbc_barriers: Vec::new(),
+                })),
+                HirStmt::Close(Box::new(HirClose { from_reg: 0 })),
+                assign(temp, HirExpr::ParamRef(ParamId(0))),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Param(ParamId(0))],
+                    values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
+                })),
+            ]))),
         ]);
         let original = body.clone();
         let stable_visible_bindings = StableVisibleBindings {
@@ -1467,16 +1616,28 @@ mod tests {
             locals: BTreeSet::new(),
             reference_captured_homes: BTreeSet::new(),
         };
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        let owner_reentry = OwnerReentryFacts::collect(&body, safety).unwrap();
+        let empty_temps = BTreeSet::new();
+        let context = DeadEntryNilContext {
+            owner_reentry: &owner_reentry,
+            live_reads: &empty_temps,
+            debug_temps: &empty_temps,
+            physical_root_temps: &empty_temps,
+            stable_visible_bindings: &stable_visible_bindings,
+            facts: &facts,
+            safety,
+        };
 
-        assert!(!remove_dead_entry_nil_writes_from_root_prefix(
+        assert!(remove_dead_entry_nil_writes_from_acyclic_prefixes(
             &mut body,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &stable_visible_bindings,
-            &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &LexicalBlockPath::root(),
+            &context,
         ));
-        assert_eq!(body, original);
+        assert_ne!(body, original);
+        let HirStmt::Block(nested) = &body.stmts[1] else {
+            panic!("expected nested forward-entry block");
+        };
+        assert_eq!(nested.stmts.len(), 3);
     }
 }

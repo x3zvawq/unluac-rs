@@ -14,8 +14,8 @@
 //! HIR 形状，为后续 AST 降低继续减负。
 //! 全量 binding facts 只服务这些候选；没有 seed/SETLIST 根形状的 proto 先通过
 //! statement/block 骨架门跳过，不递归扫描无关表达式。
-//! fixed SETLIST 的非相邻 local 路径只改写 SETLIST 本身，producer LocalDecl 保持原位；
-//! 该边界同时保留 initializer 的求值次数与独立 GC root，不用复制表达式来换取展示折叠。
+//! fixed SETLIST 的 local 路径只改写 SETLIST 本身，fresh seed 的声明或重赋值保持原位；
+//! 该边界同时保留 initializer/overwrite 的求值时点与独立 GC root，不用复制表达式来换取展示折叠。
 
 mod bindings;
 mod builder;
@@ -522,9 +522,9 @@ impl TableConstructorPass<'_> {
                 continue;
             }
 
-            // Source LocalDecl seeds can have harmless scalar/keyed setup statements between
-            // the declaration and SETLIST. Preserve those statements and replace only the raw
-            // fixed batch, so neither the table allocation nor a producer overwrite moves.
+            // Fresh local seeds can have harmless scalar/keyed setup statements between the
+            // allocation and SETLIST. Preserve those statements and replace only the raw fixed
+            // batch, so neither the table allocation nor a physical-root overwrite moves.
             if let Some(_seed_index) =
                 self.find_local_set_list_seed_for_indexed_writes(block, index, binding, &set_list)
             {
@@ -633,21 +633,24 @@ impl TableConstructorPass<'_> {
             if tail.exact_width().is_some() {
                 return None;
             }
-            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
-            // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出的失败证据；
-            // table pass 不把它埋进普通 constructor 表达式。
-            if !expr_is_open_tail_safe(tail.as_expr()) {
+            let residuals = expr_open_tail_residuals(tail.as_expr());
+            if residuals.decision {
+                // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
+                return None;
+            }
+            if residuals.unresolved {
+                // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出的失败证据；
+                // table pass 不把它埋进普通 constructor 表达式。
                 return None;
             }
         }
-        // 候选拒绝[LayerBoundary]：fixed 值中的 Decision 由 decision/eliminate 消费。
-        // 候选拒绝[PolicyBoundary]：fixed Unresolved 保留为 permissive 失败证据。
-        if set_list
-            .values
-            .fixed
-            .iter()
-            .any(|value| !expr_is_open_tail_safe(value))
-        {
+        let residuals = exprs_open_tail_residuals(&set_list.values.fixed);
+        if residuals.decision {
+            // 候选拒绝[LayerBoundary]：fixed 值中的 Decision 由 decision/eliminate 消费。
+            return None;
+        }
+        if residuals.unresolved {
+            // 候选拒绝[PolicyBoundary]：fixed Unresolved 保留为 permissive 失败证据。
             return None;
         }
 
@@ -690,14 +693,13 @@ impl TableConstructorPass<'_> {
         if seed.trailing_multivalue.is_some() {
             return None;
         }
-        // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
-        // 候选拒绝[PolicyBoundary]：Unresolved 保留为 permissive 失败证据。
-        if set_list
-            .values
-            .fixed
-            .iter()
-            .any(|value| !expr_is_open_tail_safe(value))
-        {
+        let residuals = exprs_open_tail_residuals(&set_list.values.fixed);
+        if residuals.decision {
+            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
+            return None;
+        }
+        if residuals.unresolved {
+            // 候选拒绝[PolicyBoundary]：Unresolved 保留为 permissive 失败证据。
             return None;
         }
         if matches!(binding, TableBinding::Temp(_))
@@ -800,7 +802,10 @@ impl TableConstructorPass<'_> {
             let set_list_can_overwrite_seed = usize::try_from(set_list.start_index)
                 .ok()
                 .is_some_and(|start| start >= 1 && start <= seed_array_len.saturating_add(1));
-            if !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_)) {
+            if !matches!(
+                block.stmts[seed_index],
+                HirStmt::LocalDecl(_) | HirStmt::Assign(_)
+            ) {
                 return None;
             }
             if seed.trailing_multivalue.is_some() {
@@ -860,7 +865,9 @@ impl TableConstructorPass<'_> {
             .get(binding)
             .copied()
             .unwrap_or_default();
-        // The LocalDecl at `seed_index` is the fresh owner whose allocation remains in place.
+        // The seed at `seed_index` installs a fresh value epoch whose allocation remains in place.
+        // It may be a LocalDecl or an assignment that deliberately overwrites an older physical
+        // root before evaluating the SETLIST values; the indexed rewrite preserves that timing.
         // Prefix writes may target it directly; without seeding this set, the final membership
         // check could never accept the very owner the proof started from.
         let mut fresh_tables = BTreeSet::from([binding]);
@@ -869,6 +876,9 @@ impl TableConstructorPass<'_> {
         let mut seed_tbc_active = false;
         for (offset, stmt) in block.stmts[seed_index..set_list_index].iter().enumerate() {
             let stmt_index = seed_index + offset;
+            if stmt_index == seed_index {
+                continue;
+            }
             if stmt_index != seed_index && debug_seed && !debug_prefix_stmt_is_inert(stmt) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：effectful prefix 可通过
                 // `debug.getlocal(2, 1)` 取得 source-visible seed 并安装 metatable；原始 raw
@@ -1556,16 +1566,15 @@ impl TableConstructorPass<'_> {
         if tail.exact_width().is_some() {
             return false;
         }
-        // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
-        // 候选拒绝[PolicyBoundary]：Unresolved 保留为 permissive 失败证据。fixed 与
-        // open 值仍按原 SETLIST 顺序留在同一个 constructor batch，不需要 data-only 白名单。
-        if !expr_is_open_tail_safe(tail.as_expr())
-            || set_list
-                .values
-                .fixed
-                .iter()
-                .any(|value| !expr_is_open_tail_safe(value))
-        {
+        let residuals = expr_open_tail_residuals(tail.as_expr())
+            .union(exprs_open_tail_residuals(&set_list.values.fixed));
+        if residuals.decision {
+            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
+            return false;
+        }
+        if residuals.unresolved {
+            // 候选拒绝[PolicyBoundary]：Unresolved 保留为 permissive 失败证据。fixed 与
+            // open 值仍按原 SETLIST 顺序留在同一个 constructor batch。
             return false;
         }
         // 候选拒绝[SemanticBarrier:Scope]：`local t = { ..., t }` 中的 t 属于外层作用域，
@@ -1678,9 +1687,13 @@ impl TableConstructorPass<'_> {
         if tail.exact_width().is_some() {
             return false;
         }
-        // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
-        // 候选拒绝[PolicyBoundary]：Unresolved 保留为 permissive 失败证据。
-        if !expr_is_open_tail_safe(tail.as_expr()) {
+        let residuals = expr_open_tail_residuals(tail.as_expr());
+        if residuals.decision {
+            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化。
+            return false;
+        }
+        if residuals.unresolved {
+            // 候选拒绝[PolicyBoundary]：Unresolved 保留为 permissive 失败证据。
             return false;
         }
         // 候选拒绝[SemanticBarrier:Scope]：owner 自引用搬进 LocalDecl initializer 会解析到
@@ -1898,43 +1911,73 @@ fn expr_is_data_only(expr: &HirExpr) -> bool {
     }
 }
 
-fn expr_is_open_tail_safe(expr: &HirExpr) -> bool {
+#[derive(Clone, Copy, Default)]
+struct OpenTailResiduals {
+    decision: bool,
+    unresolved: bool,
+}
+
+impl OpenTailResiduals {
+    fn union(self, other: Self) -> Self {
+        Self {
+            decision: self.decision || other.decision,
+            unresolved: self.unresolved || other.unresolved,
+        }
+    }
+}
+
+fn expr_open_tail_residuals(expr: &HirExpr) -> OpenTailResiduals {
     // The LocalDecl/direct-owner proof keeps the allocation at the original seed statement, so
     // ordinary calls and lookups in the constructor tail retain their source evaluation point.
-    // Unresolved/Decision nodes are different: they are unfinished HIR control and cannot be
-    // moved into a normal constructor expression without a separate lowering proof.
+    // Decision awaits its statement owner, while Unresolved is retained diagnostic evidence.
+    // Track them independently so each acceptance guard records its actual rejection contract.
     match expr {
-        HirExpr::Decision(_) | HirExpr::Unresolved(_) => false,
+        HirExpr::Decision(_) => OpenTailResiduals {
+            decision: true,
+            unresolved: false,
+        },
+        HirExpr::Unresolved(_) => OpenTailResiduals {
+            decision: false,
+            unresolved: true,
+        },
         HirExpr::TableAccess(access) => {
-            expr_is_open_tail_safe(&access.base) && expr_is_open_tail_safe(&access.key)
+            expr_open_tail_residuals(&access.base).union(expr_open_tail_residuals(&access.key))
         }
-        HirExpr::Unary(unary) => expr_is_open_tail_safe(&unary.expr),
+        HirExpr::Unary(unary) => expr_open_tail_residuals(&unary.expr),
         HirExpr::Binary(binary) => {
-            expr_is_open_tail_safe(&binary.lhs) && expr_is_open_tail_safe(&binary.rhs)
+            expr_open_tail_residuals(&binary.lhs).union(expr_open_tail_residuals(&binary.rhs))
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_is_open_tail_safe(&logical.lhs) && expr_is_open_tail_safe(&logical.rhs)
+            expr_open_tail_residuals(&logical.lhs).union(expr_open_tail_residuals(&logical.rhs))
         }
         HirExpr::Call(call) => {
-            expr_is_open_tail_safe(&call.callee) && call.args.iter().all(expr_is_open_tail_safe)
+            expr_open_tail_residuals(&call.callee).union(exprs_open_tail_residuals(&call.args))
         }
-        HirExpr::TableConstructor(constructor) => constructor.fields.iter().all(|field| match field
-        {
-            HirTableField::Array(value) => expr_is_open_tail_safe(value),
-            HirTableField::Record(record) => {
-                (matches!(&record.key, HirTableKey::Name(_))
-                    || matches!(&record.key, HirTableKey::Expr(key) if expr_is_open_tail_safe(key)))
-                    && expr_is_open_tail_safe(&record.value)
-            }
-        })
-            && constructor
-                .trailing_multivalue
-                .as_ref()
-                .is_none_or(|tail| expr_is_open_tail_safe(tail.as_expr())),
-        HirExpr::Closure(closure) => closure
-            .captures
+        HirExpr::TableConstructor(constructor) => constructor
+            .fields
             .iter()
-            .all(|capture| expr_is_open_tail_safe(&capture.value)),
+            .fold(OpenTailResiduals::default(), |residuals, field| {
+                residuals.union(match field {
+                    HirTableField::Array(value) => expr_open_tail_residuals(value),
+                    HirTableField::Record(record) => {
+                        let key = match &record.key {
+                            HirTableKey::Name(_) => OpenTailResiduals::default(),
+                            HirTableKey::Expr(key) => expr_open_tail_residuals(key),
+                        };
+                        key.union(expr_open_tail_residuals(&record.value))
+                    }
+                })
+            })
+            .union(
+                constructor
+                    .trailing_multivalue
+                    .as_ref()
+                    .map(|tail| expr_open_tail_residuals(tail.as_expr()))
+                    .unwrap_or_default(),
+            ),
+        HirExpr::Closure(closure) => {
+            exprs_open_tail_residuals(closure.captures.iter().map(|capture| &capture.value))
+        }
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
@@ -1949,8 +1992,18 @@ fn expr_is_open_tail_safe(expr: &HirExpr) -> bool {
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg => true,
+        | HirExpr::VarArg => OpenTailResiduals::default(),
     }
+}
+
+fn exprs_open_tail_residuals<'a>(
+    exprs: impl IntoIterator<Item = &'a HirExpr>,
+) -> OpenTailResiduals {
+    exprs
+        .into_iter()
+        .fold(OpenTailResiduals::default(), |residuals, expr| {
+            residuals.union(expr_open_tail_residuals(expr))
+        })
 }
 
 fn debug_prefix_stmt_is_inert(stmt: &HirStmt) -> bool {

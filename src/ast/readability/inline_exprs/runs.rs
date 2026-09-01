@@ -265,7 +265,7 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             {
                 // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted local 可被调用中的 debug.getlocal 观察（regress_351）。
                 // 候选拒绝[SemanticBarrier:Lifetime]：当前 run policy 不接管 PhysicalRoot 的原词法根。
-                // 候选忽略[NotApplicable]：call 已由当前 policy 接受；loop-header 的 lookup/构造器也已进入逐 site 审查。
+                // call 已由当前 policy 接受；loop-header 的 lookup/构造器也已进入逐 site 审查。
                 // 候选拒绝[SemanticBarrier:ValueArity]：Extended run 的裸 vararg 仅在直接 call 参数位由下方单值特例接管；loop-header/其它开放尾位继续保留。
                 // 候选拒绝[SemanticBarrier:Capture]：closure 搬到 sink 会改变分配/capture 时点；安全的直接 return 由相邻 DirectReturnValue owner 消费。
                 // 候选拒绝[PolicyBoundary]：Error residual 是 best-effort 输出保留的失败证据，
@@ -414,7 +414,7 @@ pub(super) fn single_call_callee_alias(
         .then(|| inline_candidate(&stmts[run_start]))
         .flatten()
     else {
-        // 候选忽略[NotApplicable]：这不是紧邻 local + terminal call 的单项 run。
+        // 这不是紧邻 local + terminal call 的单项 run。
         return false;
     };
     if candidate.origin() != super::super::super::common::AstLocalOrigin::Recovered
@@ -439,7 +439,7 @@ pub(super) fn single_call_callee_alias(
         }
         AstStmt::GenericFor(generic_for) => {
             let [AstExpr::Call(call)] = generic_for.iterator.as_slice() else {
-                // 候选忽略[NotApplicable]：method iterator 由 receiver 单项规则判断；
+                // method iterator 由 receiver 单项规则判断；
                 // 多项 iterator 不是 terminal call-alias sink。
                 return false;
             };
@@ -452,7 +452,7 @@ pub(super) fn single_call_callee_alias(
         }
         AstStmt::Return(ret) => {
             let Some(AstExpr::Call(call)) = ret.values.last() else {
-                // 候选忽略[NotApplicable]：terminal method-call 没有独立 direct callee binding。
+                // terminal method-call 没有独立 direct callee binding。
                 return false;
             };
             let AstExpr::Var(callee) = &call.callee else {
@@ -463,7 +463,7 @@ pub(super) fn single_call_callee_alias(
             candidate.binding().matches_name_ref(callee)
         }
         _ => {
-            // 候选忽略[NotApplicable]：dispatcher 只把 call statement、generic-for 与
+            // dispatcher 只把 call statement、generic-for 与
             // terminal return call 交给该单项证明。
             return false;
         }
@@ -569,7 +569,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             {
                 // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted local 可被调用中的 debug.getlocal 观察（regress_351）。
                 // 候选拒绝[SemanticBarrier:Lifetime]：call-result run 不接管 PhysicalRoot 的原词法根。
-                // 候选忽略[NotApplicable]：call 已由 ExtendedCallChain 接受；lookup、context-safe 运算与受限构造器由逐 site 合同审查。
+                // call 已由 ExtendedCallChain 接受；lookup、context-safe 运算与受限构造器由逐 site 合同审查。
                 // 候选拒绝[SemanticBarrier:ValueArity]：裸 vararg 仅在直接 call 参数位由下方单值特例接管。
                 // 候选拒绝[SemanticBarrier:Capture]：closure 的分配/capture 时点不能由 call-result run 搬移；直接 return 归相邻 owner。
                 // 候选拒绝[PolicyBoundary]：Error residual 是 best-effort 输出保留的失败证据，
@@ -603,7 +603,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 continue;
             }
             if !stmt_has_nested_binding_use(current_sink, candidate.binding()) {
-                // 候选忽略[NotApplicable]：当前 call-result sink 不读取该 binding；scanner
+                // 当前 call-result sink 不读取该 binding；scanner
                 // 只是越过了一个与 sink 无关、在更后面才使用的声明，本 run 没有替换位置。
                 continue;
             }
@@ -731,7 +731,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 不能删除（regress_351）；
                 // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root（regress_353）；
-                // 候选忽略[NotApplicable]：call/受限 table/标量 vararg 的调用消费点由前置 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
+                // call/受限 table/标量 vararg 的调用消费点由前置 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
                 // 候选拒绝[SemanticBarrier:ValueArity]：其它 call/vararg 尾位可能重新打开多值。
                 // 候选拒绝[SemanticBarrier:Capture]：nested closure 会改变分配/capture 时点。
                 // 候选拒绝[PolicyBoundary]：Error residual 是项目保留的 best-effort 失败证据。
@@ -743,7 +743,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 candidate.binding(),
             );
             if run_uses == 0 {
-                // 候选忽略[NotApplicable]：声明未被当前 run 或 sink 读取，不是该 transaction 的成员。
+                // 声明未被当前 run 或 sink 读取，不是该 transaction 的成员。
                 continue;
             }
             if run_uses > 1 {
@@ -874,7 +874,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
         // 前面的 recovered local 只是为了把最终表达式拆成多个机械阶段，
         // 但末尾这个 binding 仍然是后续语句要继续引用的源码锚点。
         if use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0 {
-            // 候选忽略[NotApplicable]：末项没有后续读取，不是 terminal-local 源码锚点。
+            // 末项没有后续读取，不是 terminal-local 源码锚点。
             // cleanup 已先删除无事件值或把裸 call 降为 CallStmt；若声明仍存在，其 lookup/
             // dynamic initializer 必须保留求值，不能假借 terminal-local run 删除。
             stmt_plan.push(PlannedStmt::Original(index));
@@ -904,7 +904,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 不能删除（regress_351）；
                 // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root（regress_353）；
-                // 候选忽略[NotApplicable]：call/受限 table/标量 vararg 的调用消费点由 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
+                // call/受限 table/标量 vararg 的调用消费点由 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
                 // 候选拒绝[SemanticBarrier:ValueArity]：其它 call/vararg 尾位可能重新打开多值。
                 // 候选拒绝[SemanticBarrier:Capture]：nested closure 会改变分配/capture 时点。
                 // 候选拒绝[PolicyBoundary]：Error residual 是项目保留的 best-effort 失败证据。
@@ -939,7 +939,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                     || write_index.has_write_after(run_end - 1, sink_candidate.binding()))
             {
                 // 候选拒绝[SemanticBarrier:Lifetime]：nested terminal initializer 可能在后续语句前释放 recovered lookup/object root（regress_355）；只有无后续写入的顶层 copy 仍直接持有同一对象。
-                // 候选拒绝[SemanticBarrier:Resource]：table/container 后续可被设为 weak 或经 alias 清空，不能等同于 local 的持续强 root。
+                // 候选拒绝[SemanticBarrier:Lifetime]：table/container 后续可被设为 weak 或经 alias 清空，不能等同于 local 的持续强 root。
                 continue;
             }
             let mut trial_sink = current_sink.clone();
@@ -1337,6 +1337,7 @@ mod tests {
             body: AstBlock::default(),
             captured_bindings: BTreeSet::new(),
             captured_params: BTreeSet::new(),
+            capture_names_by_upvalue: std::collections::BTreeMap::new(),
             capture_write_names: BTreeSet::new(),
         }));
         let mut block = AstBlock {

@@ -15,23 +15,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstFunctionName, AstLValue,
-    AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstStmt, AstTargetDialect,
-    AstUnaryOpKind,
+    AstBinaryOpKind, AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstFunctionName,
+    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
+    AstTargetDialect, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{BindingUseIndex, binding_mentions_in_expr, binding_mentions_in_stmt};
-use super::expr_analysis::{is_discard_safe_expr_for_target, is_eventless_primitive_literal};
-use super::walk::{self, AstRewritePass, BlockKind};
+use super::expr_analysis::{is_discard_safe_expr_for_target, result_cannot_root_collectable};
+use super::global_decl_pretty::{VisibleGlobals, extending_global_scope_preserves_expr};
+use super::walk::{self, AstRewritePass, BlockKind, ScopedAstRewritePass};
 use crate::ast::traverse::traverse_expr_children;
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
-    walk::rewrite_module(
+    let mut changed = walk::rewrite_module(
         module,
         &mut CleanupPass {
             target: context.target,
         },
-    )
+    );
+    changed |= walk::rewrite_module_scoped(
+        module,
+        &VisibleGlobals::default(),
+        &mut RepeatTailCleanupPass,
+    );
+    changed
 }
 
 struct CleanupPass {
@@ -53,6 +60,47 @@ impl AstRewritePass for CleanupPass {
     }
 }
 
+struct RepeatTailCleanupPass;
+
+impl ScopedAstRewritePass for RepeatTailCleanupPass {
+    type Scope = VisibleGlobals;
+
+    fn enter_block(
+        &mut self,
+        _block: &mut AstBlock,
+        _kind: BlockKind,
+        incoming: &Self::Scope,
+    ) -> (bool, Self::Scope) {
+        (false, incoming.clone())
+    }
+
+    fn enter_repeat_body(
+        &mut self,
+        block: &mut AstBlock,
+        condition: &AstExpr,
+        incoming: &Self::Scope,
+    ) -> (bool, Self::Scope) {
+        (
+            flatten_repeat_tail_do_blocks(block, condition, incoming),
+            incoming.clone(),
+        )
+    }
+
+    fn scope_for_stmt_children(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
+        // `global function f()` 的名字在函数体内即可见；普通 global declaration 的
+        // initializer 则必须继续使用声明前环境。与 global-decl-pretty 共用同一规则。
+        if matches!(stmt, AstStmt::FunctionDecl(_)) {
+            scope.after_stmt(stmt)
+        } else {
+            scope.clone()
+        }
+    }
+
+    fn scope_after_stmt(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
+        scope.after_stmt(stmt)
+    }
+}
+
 fn cleanup_block(
     block: &mut AstBlock,
     allow_trailing_empty_return_elision: bool,
@@ -63,10 +111,15 @@ fn cleanup_block(
 
     let old_stmts = std::mem::take(&mut block.stmts);
     let mut flattened_stmts = Vec::with_capacity(old_stmts.len());
-    for stmt in old_stmts {
+    let stmt_count = old_stmts.len();
+    for (index, stmt) in old_stmts.into_iter().enumerate() {
         match stmt {
             AstStmt::DoBlock(nested)
-                if nested.stmts.len() == 1 && can_elide_single_stmt_do_block(&nested.stmts[0]) =>
+                if nested.stmts.len() == 1
+                    && can_elide_single_stmt_do_block(&nested.stmts[0])
+                    // repeat 条件在正文末句之后求值；尾 do 必须交给下方携带 condition
+                    // 的证明，否则通用单句清理会抢先删除唯一能在条件前释放 root 的作用域。
+                    && !(trailing_condition.is_some() && index + 1 == stmt_count) =>
             {
                 // 这里专门清理“只剩一条非局部作用域语句”的机械 do-end。
                 // 它通常是前层为了暂存中间 local 范围而留下来的壳；一旦内部局部已经被
@@ -83,7 +136,7 @@ fn cleanup_block(
     // overwritten before any read. Keep the call at its original evaluation point, but
     // declare the binding with the value that actually survives. This removes a misleading
     // `local x = f(); x = value` pair without moving a call across another statement.
-    changed |= split_overwritten_call_result_locals(block);
+    changed |= split_overwritten_call_result_locals(block, target);
 
     // A capture owner may force the producer and its final temp assignment into a lexical
     // block while the one-value return remains immediately outside it.  Return the value from
@@ -97,8 +150,9 @@ fn cleanup_block(
     // repeat body 与 until 条件共享外层作用域；只有这种尾条件存在时，global、`<close>`
     // local 和局部 closure 才需要额外边界。普通 block 的尾 do 与父 block 同时退出，
     // 因而可安全去掉缩进壳（regress344 覆盖函数尾 `<close>` + return）。
-    while let Some(AstStmt::DoBlock(nested)) = block.stmts.last()
-        && trailing_do_block_is_scope_neutral(nested, trailing_condition.is_some())
+    while trailing_condition.is_none()
+        && let Some(AstStmt::DoBlock(nested)) = block.stmts.last()
+        && trailing_do_block_is_scope_neutral(nested, false)
     {
         let Some(AstStmt::DoBlock(nested)) = block.stmts.pop() else {
             unreachable!();
@@ -148,22 +202,29 @@ fn cleanup_block(
                             changed = true;
                         }
                         Err(value) => {
-                            // 候选拒绝[SemanticBarrier:EvalCount]：删除 global/field/index 读取会
-                            // 少一次可观察 lookup（regress178）。
-                            // 候选拒绝[SemanticBarrier:Metamethod]：删除动态运算会少一次元方法
-                            // 调用（regress245）；LuaJIT cdata 与 primitive equality 也会调用
-                            // cdata `__eq`（regress390）。
-                            // 候选拒绝[SemanticBarrier:ControlFlow]：错误类型组合及整数零除会
-                            // 删除原求值抛错；regress390 以 pcall 覆盖 length、ordering、bitop、
-                            // floor-div 与 modulo 的最小反例。
-                            // 候选拒绝[SemanticBarrier:Allocation]：literal concat、table 与 closure
-                            // 都会分配；删除会改变 collectgarbage("count")、GC 推进或内存错误事件。
-                            // 候选拒绝[SemanticBarrier:ControlFlow]：非字面量除数可能为零；对象
-                            // 除数还会触发除法元方法，regress390 覆盖动态错误运算不能删除。
-                            // 候选拒绝[TargetConstraint]：AstTargetDialect 只有 Lua 5.1/5.2 版本，
-                            // 未携带 chunk 的 integral-number 位宽/溢出语义，不能从版本猜测 Integer 算术。
-                            // 候选拒绝[PolicyBoundary]：AstExpr::Error 是 best-effort 输出必须
-                            // 保留的失败证据，cleanup 不把它当作可丢弃的纯值。
+                            match unused_value_rejection(&value, target) {
+                                UnusedValueRejection::EvalCount => {
+                                    // 候选拒绝[SemanticBarrier:EvalCount]：删除 lookup 或嵌套 call
+                                    // 会少一次可观察求值（regress178）。
+                                }
+                                UnusedValueRejection::ControlFlow => {
+                                    // 候选拒绝[SemanticBarrier:ControlFlow]：未证明类型的动态运算
+                                    // 可能调用元方法或抛错；regress245/regress390 覆盖两类反例。
+                                }
+                                UnusedValueRejection::Allocation => {
+                                    // 候选拒绝[SemanticBarrier:Allocation]：literal concat、table 与
+                                    // closure 会分配；删除会改变 GC 推进或内存错误事件。
+                                }
+                                UnusedValueRejection::TargetConstraint => {
+                                    // 候选拒绝[TargetConstraint]：Lua 5.1/5.2 没有携带
+                                    // integral-number 位宽与溢出语义；Auto 还没有确定 dynamic
+                                    // primitive equality 是否可能进入方言专属元方法。
+                                }
+                                UnusedValueRejection::PolicyBoundary => {
+                                    // 候选拒绝[PolicyBoundary]：AstExpr::Error 是 best-effort 输出
+                                    // 必须保留的失败证据，cleanup 不把它当作可丢弃的纯值。
+                                }
+                            }
                             local_decl.values.push(value);
                             retained_stmts.push(AstStmt::LocalDecl(local_decl));
                         }
@@ -360,17 +421,19 @@ fn trim_unused_initialized_local_suffix(
     changed
 }
 
-fn split_overwritten_call_result_locals(block: &mut AstBlock) -> bool {
+fn split_overwritten_call_result_locals(block: &mut AstBlock, target: AstTargetDialect) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let mut rewritten = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
     while index < old_stmts.len() {
-        if let Some((call, declaration)) =
-            old_stmts.get(index).zip(old_stmts.get(index + 1)).and_then(
-                |(declaration, overwrite)| split_overwritten_call_result(declaration, overwrite),
-            )
+        if let Some((call, declaration)) = old_stmts
+            .get(index)
+            .zip(old_stmts.get(index + 1))
+            .and_then(|(declaration, overwrite)| {
+                split_overwritten_call_result(declaration, overwrite, target)
+            })
         {
             rewritten.push(AstStmt::CallStmt(Box::new(AstCallStmt { call })));
             rewritten.push(AstStmt::LocalDecl(Box::new(declaration)));
@@ -394,44 +457,50 @@ fn split_overwritten_call_result_locals(block: &mut AstBlock) -> bool {
 fn split_overwritten_call_result(
     declaration: &AstStmt,
     overwrite: &AstStmt,
+    target: AstTargetDialect,
 ) -> Option<(AstCallKind, AstLocalDecl)> {
     let AstStmt::LocalDecl(local_decl) = declaration else {
-        // 候选忽略[NotApplicable]：pair 首句不是 local declaration。
+        // pair 首句不是 local declaration。
         return None;
     };
     let AstStmt::Assign(assign) = overwrite else {
-        // 候选忽略[NotApplicable]：相邻后继不是 overwrite assignment。
+        // 相邻后继不是 overwrite assignment。
         return None;
     };
     if local_decl.bindings.is_empty() {
-        // 候选忽略[NotApplicable]：空 declaration 不产生 call-result 候选。
+        // 空 declaration 不产生 call-result 候选。
         return None;
     }
     if local_decl.values.is_empty() {
-        // 候选忽略[NotApplicable]：空 value declaration 不产生 call-result 候选。
+        // 空 value declaration 不产生 call-result 候选。
         return None;
     }
-    let [call_value] = local_decl.values.as_slice() else {
-        // 候选拒绝[SemanticBarrier:Lifetime]：多 initializer 的前序结果必须作为 pending
-        // RHS root 活过后续 initializer；拆成独立 call 会允许 GC 提前回收（regress388）。
-        // 候选拒绝[SemanticBarrier:ValueArity]：只有最后一个 initializer 会展开多返回值，
-        // 当前单 CallStmt + LocalDecl 事务无法保持各槽 adjustment。
-        return None;
-    };
-    let call = match into_call_kind(call_value.clone()) {
-        Ok(call) => call,
-        Err(_) => {
-            // 候选忽略[NotApplicable]：initializer 不是可独立保留的 call statement。
-            return None;
+    let mut call = None;
+    for value in &local_decl.values {
+        match into_call_kind(value.clone()) {
+            Ok(candidate) if call.is_none() => call = Some(candidate),
+            Ok(_) => {
+                // 候选拒绝[SemanticBarrier:Lifetime]：第一个 call 的结果原本作为 pending
+                // RHS root 活过第二个 call；拆成两个 statement 会允许 GC 提前回收
+                // （regress388）。
+                return None;
+            }
+            Err(_) if is_discard_safe_expr_for_target(value, target) => {}
+            Err(_) => {
+                // 候选拒绝[SemanticBarrier:EvalCount]：非 call sibling 的 lookup、分配、
+                // 元方法或错误事件不能随 overwritten value 一起删除。
+                return None;
+            }
         }
-    };
+    }
+    let call = call?;
     if assign.targets.len() != local_decl.bindings.len() {
-        // 候选忽略[NotApplicable]：当前事务只消费按声明顺序完整覆盖全部 binding 的 overwrite；
+        // 当前事务只消费按声明顺序完整覆盖全部 binding 的 overwrite；
         // 缺少 target 必须保留未覆盖 call result，额外 target 则包含外部写入。
         return None;
     }
     if assign.values.is_empty() {
-        // 候选忽略[NotApplicable]：空 RHS 不产生可转入 local declaration 的 replacement。
+        // 空 RHS 不产生可转入 local declaration 的 replacement。
         return None;
     }
     if !local_decl
@@ -442,7 +511,7 @@ fn split_overwritten_call_result(
             matches!(target, AstLValue::Name(name) if binding.id.matches_name_ref(name))
         })
     {
-        // 候选忽略[NotApplicable]：后继不是按声明顺序直接覆盖每一个同 ID binding；乱序、
+        // 后继不是按声明顺序直接覆盖每一个同 ID binding；乱序、
         // field/index target 或部分外部写入都不属于本事务。
         return None;
     }
@@ -452,7 +521,7 @@ fn split_overwritten_call_result(
         .iter()
         .any(|binding| binding.attr != AstLocalAttr::None)
     {
-        // 候选忽略[NotApplicable]：`<const>` 与 `<close>` 都不允许合法 Lua 源码中的后继
+        // `<const>` 与 `<close>` 都不允许合法 Lua 源码中的后继
         // overwrite；这种非法 AST pair 不属于 call-result split 候选。
         return None;
     }
@@ -469,11 +538,19 @@ fn split_overwritten_call_result(
     if local_decl
         .bindings
         .iter()
-        .any(|binding| binding.origin.is_physical_root())
-        && !assign.values.iter().all(is_eventless_root_release_rhs)
+        .enumerate()
+        .any(|(index, binding)| {
+            binding.origin.is_physical_root()
+                && initializer_slot_may_root_collectable(&local_decl.values, index)
+        })
+        && !assign
+            .values
+            .iter()
+            .all(|value| is_discard_safe_expr_for_target(value, target))
     {
-        // 候选拒绝[SemanticBarrier:Lifetime]：事件性 RHS 求值期间 PhysicalRoot call result
-        // 必须仍存活；regress388 用 RHS call 内 GC 同时证明 scalar 与 multi-home 反例。
+        // 候选拒绝[SemanticBarrier:Lifetime]：事件性 RHS 求值期间，确实接到潜在可回收
+        // initializer 的 PhysicalRoot 槽必须仍存活；regress388 用 RHS call 内 GC 同时
+        // 证明 scalar 与 multi-home 反例。只接到 primitive/nil-fill 的 root 槽不构成屏障。
         return None;
     }
 
@@ -492,11 +569,16 @@ fn split_overwritten_call_result(
         return None;
     }
 
-    // 候选接受：单 call initializer 与同序完整 overwrite 相邻；所有 binding 无属性且不是
-    // debug identity，RHS 不读取任一旧 binding。call 保持在原求值点，完整 RHS 原样转入
-    // multi-local declaration，所以求值顺序、nil fill、尾值截断和最终 binding 映射不变。
-    // PhysicalRoot 额外要求 RHS 全是无事件 literal/copy；它们仍在原 overwrite 位置读取，
-    // 所以旧 root 在这些纯加载期间提前结束不可观察。
+    // 候选接受：initializer 恰有一个 call，其余 sibling 都是无事件读取/primitive；完整
+    // overwrite 相邻且 RHS 不读取任一旧 binding。非尾 call 原本被 scalarize，尾 call 原本
+    // 可展开，但两者的全部结果都会在下一语句覆盖；CallStmt 同样只执行一次并丢弃结果，
+    // 因此无需保留结果宽度。原 sibling 已由共享 target-aware discard proof 证明无事件；
+    // copy/vararg 的来源 binding 或调用帧仍跨 call 存活，其余可丢弃 literal/运算也不产生
+    // 可由 call 观察的独占 pending root，所以删除 sibling 不改变求值轨迹或生命周期。
+    // replacement RHS 仍在新 local declaration 的 initializer 位置求值，同批 binding 在
+    // 求值期间仍不可见，完整 RHS 的 nil fill、尾值截断和最终 binding 映射保持不变。
+    // PhysicalRoot 额外要求 RHS 全部通过 target-aware 的无事件、无分配 discard proof；
+    // 它们仍在原 overwrite 位置求值，所以旧 root 在这段纯求值期间提前结束不可观察。
     Some((
         call,
         AstLocalDecl {
@@ -506,51 +588,57 @@ fn split_overwritten_call_result(
     ))
 }
 
-fn is_eventless_root_release_rhs(expr: &AstExpr) -> bool {
-    if is_eventless_primitive_literal(expr) {
-        return true;
+fn initializer_slot_may_root_collectable(values: &[AstExpr], slot: usize) -> bool {
+    let Some((tail, prefix)) = values.split_last() else {
+        return false;
+    };
+    if let Some(value) = prefix.get(slot) {
+        return !result_cannot_root_collectable(value);
     }
-    match expr {
-        AstExpr::Var(
-            AstNameRef::Param(_)
-            | AstNameRef::Local(_)
-            | AstNameRef::Temp(_)
-            | AstNameRef::SyntheticLocal(_)
-            | AstNameRef::Upvalue(_),
-        ) => true,
-        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
-            is_eventless_root_release_rhs(&unary.expr)
-        }
-        AstExpr::SingleValue(value) => is_eventless_root_release_rhs(value),
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            is_eventless_root_release_rhs(&logical.lhs)
-                && is_eventless_root_release_rhs(&logical.rhs)
-        }
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(AstNameRef::Global(_))
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Unary(_)
-        | AstExpr::Binary(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::VarArg
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_)
-        | AstExpr::Error(_) => false,
+    if slot == prefix.len() {
+        return !result_cannot_root_collectable(tail);
     }
+    matches!(
+        tail,
+        AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
+    )
 }
 
-fn trailing_do_block_is_scope_neutral(block: &AstBlock, has_trailing_condition: bool) -> bool {
-    if !has_trailing_condition {
+fn flatten_repeat_tail_do_blocks(
+    block: &mut AstBlock,
+    condition: &AstExpr,
+    incoming_globals: &VisibleGlobals,
+) -> bool {
+    let mut changed = false;
+    while let Some(AstStmt::DoBlock(nested)) = block.stmts.last() {
+        if !trailing_do_block_is_scope_neutral(nested, true) {
+            break;
+        }
+
+        let globals_before_tail = block.stmts[..block.stmts.len() - 1]
+            .iter()
+            .fold(incoming_globals.clone(), |globals, stmt| {
+                globals.after_stmt(stmt)
+            });
+        if !extending_global_scope_preserves_expr(&globals_before_tail, &nested.stmts, condition) {
+            // 候选拒绝[SemanticBarrier:Scope]：展开会把尾 do 的直属 global/global-function
+            // 声明延伸到 repeat condition。先从 repeat body incoming 环境只推进未移动的
+            // 直属 prefix，再由共享词法解释器逐访问比较 condition 在扩域前后的许可；
+            // 与 tail 无关、尚待 Deferred owner 补齐的 missing global 不会挡住本候选。
+            break;
+        }
+
+        let Some(AstStmt::DoBlock(nested)) = block.stmts.pop() else {
+            unreachable!("repeat tail candidate was checked above");
+        };
+        block.stmts.extend(nested.stmts);
+        changed = true;
+    }
+    changed
+}
+
+fn trailing_do_block_is_scope_neutral(block: &AstBlock, crosses_trailing_condition: bool) -> bool {
+    if !crosses_trailing_condition {
         if block.stmts.iter().any(stmt_declares_debug_binding) {
             // 候选拒绝[SemanticBarrier:DebugScope]：函数 Return hook 可以在 return event
             // 观察直属 local。拍平尾 do 会把原本在 Return 前结束的 debug local 延长到
@@ -578,10 +666,9 @@ fn trailing_do_block_is_scope_neutral(block: &AstBlock, has_trailing_condition: 
         .collect::<BTreeSet<_>>();
 
     !block.stmts.iter().any(|stmt| match stmt {
-        // 候选拒绝[SemanticBarrier:Scope]：Lua 5.5 repeat block 的词法范围包含 `until`
-        // 条件；`local stop=true; repeat do global stop end until stop` 读取 local，拍平后
-        // 却读取同名 global（direct AST unit 覆盖该拒绝形状）。
-        AstStmt::GlobalDecl(_) => true,
+        // global/global-function 的词法环境由 scoped repeat-tail owner 在 mutation 前通过
+        // shared global-scope query 验证；这里仅负责正交的 lifetime/debug 边界。
+        AstStmt::GlobalDecl(_) => false,
         AstStmt::LocalDecl(local_decl) => {
             // 候选拒绝[SemanticBarrier:Lifetime]：`repeat do local x <close> = v end until cond()`
             // 拍平会把 `__close` 推迟到 cond 后；regress246 由 cond 断言逐轮 close 已发生。
@@ -718,9 +805,9 @@ fn can_elide_single_stmt_do_block(stmt: &AstStmt) -> bool {
         // 候选接受：外层 do 内只有另一个 do，所有声明/label/goto 仍受内层 block 约束；
         // 删除空的外层词法层不扩大任何内部 binding 或控制流实体的作用域。
         AstStmt::DoBlock(_) => true,
-        // 候选拒绝[PolicyBoundary]：项目保留 best-effort Error 诊断及其 do 外壳，
-        // readability 不以“单句无 binding”为由拍平失败证据。
-        AstStmt::Error(_) => false,
+        // 候选接受：Error statement 本体仍原位保留；do 壳不承载额外诊断内容或词法
+        // identity，删除它不会丢失 best-effort 失败证据。
+        AstStmt::Error(_) => true,
     }
 }
 
@@ -793,12 +880,92 @@ fn into_call_kind(expr: AstExpr) -> Result<AstCallKind, AstExpr> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum UnusedValueRejection {
+    EvalCount,
+    ControlFlow,
+    Allocation,
+    TargetConstraint,
+    PolicyBoundary,
+}
+
+fn unused_value_rejection(expr: &AstExpr, target: AstTargetDialect) -> UnusedValueRejection {
+    debug_assert!(!is_discard_safe_expr_for_target(expr, target));
+
+    let rejected_child = |child: &AstExpr| {
+        (!is_discard_safe_expr_for_target(child, target))
+            .then(|| unused_value_rejection(child, target))
+    };
+    match expr {
+        AstExpr::SingleValue(inner) => unused_value_rejection(inner, target),
+        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
+            unused_value_rejection(&unary.expr, target)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => rejected_child(&logical.lhs)
+            .or_else(|| rejected_child(&logical.rhs))
+            .unwrap_or(UnusedValueRejection::ControlFlow),
+        AstExpr::Unary(unary) => {
+            rejected_child(&unary.expr).unwrap_or_else(|| operation_rejection(expr, target))
+        }
+        AstExpr::Binary(binary) => rejected_child(&binary.lhs)
+            .or_else(|| rejected_child(&binary.rhs))
+            .unwrap_or_else(|| {
+                if binary.op == AstBinaryOpKind::Concat {
+                    UnusedValueRejection::Allocation
+                } else {
+                    operation_rejection(expr, target)
+                }
+            }),
+        AstExpr::Var(AstNameRef::Global(_))
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_) => UnusedValueRejection::EvalCount,
+        AstExpr::TableConstructor(_) | AstExpr::FunctionExpr(_) => UnusedValueRejection::Allocation,
+        AstExpr::Error(_) => UnusedValueRejection::PolicyBoundary,
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::VarArg => {
+            debug_assert!(
+                is_discard_safe_expr_for_target(expr, target),
+                "discard-safe leaf reached rejection classifier"
+            );
+            UnusedValueRejection::PolicyBoundary
+        }
+    }
+}
+
+fn operation_rejection(expr: &AstExpr, target: AstTargetDialect) -> UnusedValueRejection {
+    if matches!(
+        target.version,
+        crate::decompile::DecompileDialect::Auto
+            | crate::decompile::DecompileDialect::Lua51
+            | crate::decompile::DecompileDialect::Lua52
+    ) && is_discard_safe_expr_for_target(
+        expr,
+        AstTargetDialect::new(crate::decompile::DecompileDialect::Lua53),
+    ) {
+        UnusedValueRejection::TargetConstraint
+    } else {
+        UnusedValueRejection::ControlFlow
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::common::{
-        AstAssign, AstCallExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalDecl, AstGlobalName,
-        AstLValue, AstLocalBinding, AstLocalFunctionDecl, AstNamePath, AstNameRef, AstReturn,
+        AstAssign, AstCallExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalAttr, AstGlobalBinding,
+        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLValue, AstLocalBinding,
+        AstLocalFunctionDecl, AstLogicalExpr, AstNamePath, AstNameRef, AstRepeat, AstReturn,
     };
     use crate::hir::{HirProtoRef, LocalId, ParamId, TempId};
 
@@ -829,12 +996,14 @@ mod tests {
             body: AstBlock::default(),
             captured_bindings: BTreeSet::new(),
             captured_params: BTreeSet::new(),
+            capture_names_by_upvalue: std::collections::BTreeMap::new(),
             capture_write_names: BTreeSet::new(),
         }))
     }
 
     #[test]
     fn splits_recovered_call_result_before_direct_overwrite() {
+        let target = AstTargetDialect::new(crate::decompile::DecompileDialect::Lua54);
         let binding = recovered_binding();
         let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],
@@ -845,7 +1014,7 @@ mod tests {
             values: vec![AstExpr::Integer(9), call_value()],
         }));
 
-        let (call, rewritten) = split_overwritten_call_result(&declaration, &overwrite)
+        let (call, rewritten) = split_overwritten_call_result(&declaration, &overwrite, target)
             .expect("a recovered call result with a direct overwrite is safe to split");
         assert!(matches!(call, AstCallKind::Call(_)));
         assert_eq!(rewritten.bindings, vec![binding.clone()]);
@@ -855,7 +1024,7 @@ mod tests {
             targets: vec![],
             values: vec![AstExpr::Integer(9)],
         }));
-        assert!(split_overwritten_call_result(&declaration, &missing_target).is_none());
+        assert!(split_overwritten_call_result(&declaration, &missing_target, target).is_none());
         let extra_target = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![
                 AstLValue::Name(binding.id.to_name_ref()),
@@ -865,17 +1034,29 @@ mod tests {
             ],
             values: vec![AstExpr::Integer(9), AstExpr::Integer(10)],
         }));
-        assert!(split_overwritten_call_result(&declaration, &extra_target).is_none());
+        assert!(split_overwritten_call_result(&declaration, &extra_target, target).is_none());
 
         let multiple_initializers = AstStmt::LocalDecl(Box::new(AstLocalDecl {
-            bindings: vec![binding],
+            bindings: vec![binding.clone()],
             values: vec![call_value(), call_value()],
         }));
-        assert!(split_overwritten_call_result(&multiple_initializers, &overwrite).is_none());
+        assert!(
+            split_overwritten_call_result(&multiple_initializers, &overwrite, target).is_none()
+        );
+
+        let one_call_with_primitive_sibling = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![binding],
+            values: vec![AstExpr::Integer(0), call_value()],
+        }));
+        assert!(
+            split_overwritten_call_result(&one_call_with_primitive_sibling, &overwrite, target)
+                .is_some()
+        );
     }
 
     #[test]
     fn keeps_debug_and_later_rhs_reads_but_splits_same_id_initializer() {
+        let target = AstTargetDialect::new(crate::decompile::DecompileDialect::Lua54);
         let mut debug_binding = recovered_binding();
         debug_binding.origin = AstLocalOrigin::DebugHinted;
         let debug_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -886,7 +1067,7 @@ mod tests {
             targets: vec![AstLValue::Name(debug_binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9)],
         }));
-        assert!(split_overwritten_call_result(&debug_decl, &debug_write).is_none());
+        assert!(split_overwritten_call_result(&debug_decl, &debug_write, target).is_none());
 
         let binding = recovered_binding();
         let self_call = AstExpr::Call(Box::new(AstCallExpr {
@@ -902,7 +1083,7 @@ mod tests {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9)],
         }));
-        let (call, _) = split_overwritten_call_result(&declaration, &overwrite)
+        let (call, _) = split_overwritten_call_result(&declaration, &overwrite, target)
             .expect("the call stays before the local lexical scope in both shapes");
         let AstCallKind::Call(call) = call else {
             panic!("same-id initializer should preserve the direct call");
@@ -917,7 +1098,7 @@ mod tests {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9), AstExpr::Var(binding.id.to_name_ref())],
         }));
-        assert!(split_overwritten_call_result(&declaration, &later_rhs_read).is_none());
+        assert!(split_overwritten_call_result(&declaration, &later_rhs_read, target).is_none());
 
         let mut physical_binding = recovered_binding();
         physical_binding.origin = AstLocalOrigin::PhysicalRoot;
@@ -929,7 +1110,7 @@ mod tests {
             targets: vec![AstLValue::Name(physical_binding.id.to_name_ref())],
             values: vec![AstExpr::Var(AstNameRef::Param(ParamId(0)))],
         }));
-        let (_, rewritten) = split_overwritten_call_result(&physical_decl, &copy_overwrite)
+        let (_, rewritten) = split_overwritten_call_result(&physical_decl, &copy_overwrite, target)
             .expect("an eventless parameter copy cannot observe early root release");
         assert_eq!(
             rewritten.values,
@@ -940,7 +1121,62 @@ mod tests {
             targets: vec![AstLValue::Name(physical_binding.id.to_name_ref())],
             values: vec![call_value()],
         }));
-        assert!(split_overwritten_call_result(&physical_decl, &eventful_overwrite).is_none());
+        assert!(
+            split_overwritten_call_result(&physical_decl, &eventful_overwrite, target).is_none()
+        );
+
+        let recovered_second = AstLocalBinding {
+            id: AstBindingRef::Local(LocalId(1)),
+            attr: AstLocalAttr::None,
+            origin: AstLocalOrigin::Recovered,
+        };
+        let primitive_physical_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![physical_binding.clone(), recovered_second.clone()],
+            values: vec![AstExpr::Integer(0), call_value()],
+        }));
+        let eventful_full_overwrite = AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![
+                AstLValue::Name(physical_binding.id.to_name_ref()),
+                AstLValue::Name(recovered_second.id.to_name_ref()),
+            ],
+            values: vec![call_value()],
+        }));
+        assert!(
+            split_overwritten_call_result(
+                &primitive_physical_decl,
+                &eventful_full_overwrite,
+                target,
+            )
+            .is_some()
+        );
+
+        let mut physical_second = recovered_second;
+        physical_second.origin = AstLocalOrigin::PhysicalRoot;
+        let expanded_tail_physical_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![recovered_binding(), physical_second.clone()],
+            values: vec![call_value()],
+        }));
+        assert!(
+            split_overwritten_call_result(
+                &expanded_tail_physical_decl,
+                &eventful_full_overwrite,
+                target,
+            )
+            .is_none()
+        );
+
+        let scalar_tail_physical_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![recovered_binding(), physical_second],
+            values: vec![AstExpr::SingleValue(Box::new(call_value()))],
+        }));
+        assert!(
+            split_overwritten_call_result(
+                &scalar_tail_physical_decl,
+                &eventful_full_overwrite,
+                target,
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1013,15 +1249,143 @@ mod tests {
 
     #[test]
     fn keeps_repeat_tail_global_declaration_scope() {
-        let block = AstBlock {
-            stmts: vec![AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
-                bindings: vec![],
+        assert!(can_elide_single_stmt_do_block(&AstStmt::Error(
+            "diagnostic".to_owned()
+        )));
+
+        let global_name = |text: &str| AstGlobalName {
+            text: text.to_owned(),
+        };
+        let named_decl = |name: &AstGlobalName, attr| {
+            AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+                bindings: vec![AstGlobalBinding {
+                    target: AstGlobalBindingTarget::Name(name.clone()),
+                    attr,
+                }],
                 values: vec![],
-            }))],
+            }))
+        };
+        let wildcard_decl = |attr| {
+            AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+                bindings: vec![AstGlobalBinding {
+                    target: AstGlobalBindingTarget::Wildcard,
+                    attr,
+                }],
+                values: vec![],
+            }))
+        };
+        let nested_write = |name: &AstGlobalName| {
+            AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                function: HirProtoRef(2),
+                params: vec![],
+                is_vararg: false,
+                named_vararg: None,
+                body: AstBlock {
+                    stmts: vec![AstStmt::Assign(Box::new(AstAssign {
+                        targets: vec![AstLValue::Name(AstNameRef::Global(name.clone()))],
+                        values: vec![AstExpr::Integer(1)],
+                    }))],
+                },
+                captured_bindings: BTreeSet::new(),
+                captured_params: BTreeSet::new(),
+                capture_names_by_upvalue: BTreeMap::new(),
+                capture_write_names: BTreeSet::new(),
+            }))
         };
 
-        assert!(!trailing_do_block_is_scope_neutral(&block, true));
-        assert!(trailing_do_block_is_scope_neutral(&block, false));
+        let stop = global_name("stop");
+        let missing = global_name("missing");
+        let mut named_const_extension = AstBlock {
+            stmts: vec![
+                named_decl(&stop, AstGlobalAttr::None),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![named_decl(&stop, AstGlobalAttr::Const)],
+                })),
+            ],
+        };
+        assert!(!flatten_repeat_tail_do_blocks(
+            &mut named_const_extension,
+            &AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
+                lhs: AstExpr::Var(AstNameRef::Global(missing.clone())),
+                rhs: nested_write(&stop),
+            })),
+            &VisibleGlobals::default(),
+        ));
+        assert!(matches!(
+            named_const_extension.stmts.last(),
+            Some(AstStmt::DoBlock(_))
+        ));
+
+        let mut named_none_extension = AstBlock {
+            stmts: vec![
+                named_decl(&stop, AstGlobalAttr::Const),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![named_decl(&stop, AstGlobalAttr::None)],
+                })),
+            ],
+        };
+        assert!(flatten_repeat_tail_do_blocks(
+            &mut named_none_extension,
+            &AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
+                lhs: AstExpr::Var(AstNameRef::Global(missing)),
+                rhs: AstExpr::Var(AstNameRef::Global(stop)),
+            })),
+            &VisibleGlobals::default(),
+        ));
+
+        let marker = global_name("marker");
+        let mut wildcard_extension = AstModule {
+            entry_function: HirProtoRef(0),
+            body: AstBlock {
+                stmts: vec![
+                    wildcard_decl(AstGlobalAttr::None),
+                    AstStmt::Repeat(Box::new(AstRepeat {
+                        body: AstBlock {
+                            stmts: vec![AstStmt::DoBlock(Box::new(AstBlock {
+                                stmts: vec![wildcard_decl(AstGlobalAttr::Const)],
+                            }))],
+                        },
+                        cond: nested_write(&marker),
+                    })),
+                ],
+            },
+        };
+        assert!(!walk::rewrite_module_scoped(
+            &mut wildcard_extension,
+            &VisibleGlobals::default(),
+            &mut RepeatTailCleanupPass,
+        ));
+        let AstStmt::Repeat(repeat_stmt) = &wildcard_extension.body.stmts[1] else {
+            panic!("repeat statement should remain in place");
+        };
+        assert!(matches!(
+            repeat_stmt.body.stmts.as_slice(),
+            [AstStmt::DoBlock(_)]
+        ));
+
+        let function_name = global_name("recur");
+        let AstExpr::FunctionExpr(function) = nested_write(&function_name) else {
+            unreachable!("test helper always returns a function expression");
+        };
+        let mut global_function_extension = AstBlock {
+            stmts: vec![
+                wildcard_decl(AstGlobalAttr::Const),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
+                        target: AstFunctionName::Plain(AstNamePath {
+                            root: AstNameRef::Global(function_name.clone()),
+                            fields: vec![],
+                        }),
+                        func: *function,
+                    }))],
+                })),
+            ],
+        };
+        assert!(flatten_repeat_tail_do_blocks(
+            &mut global_function_extension,
+            &AstExpr::Var(AstNameRef::Global(function_name)),
+            &VisibleGlobals::default(),
+        ));
     }
 
     #[test]
@@ -1073,6 +1437,7 @@ mod tests {
 
     #[test]
     fn keeps_repeat_tail_closure_roots_owned_by_nested_locals() {
+        let condition = AstExpr::Boolean(true);
         let binding = recovered_binding();
         let assigned_closure = AstBlock {
             stmts: vec![
@@ -1096,6 +1461,19 @@ mod tests {
             }))],
         };
         assert!(!trailing_do_block_is_scope_neutral(&hoisted_closure, true));
+        let mut repeat_body = AstBlock {
+            stmts: vec![AstStmt::DoBlock(Box::new(hoisted_closure))],
+        };
+        assert!(!cleanup_block(
+            &mut repeat_body,
+            false,
+            Some(&condition),
+            AstTargetDialect::new(crate::decompile::DecompileDialect::Lua54),
+        ));
+        assert!(matches!(
+            repeat_body.stmts.as_slice(),
+            [AstStmt::DoBlock(_)]
+        ));
 
         let rooted_function_decl = AstBlock {
             stmts: vec![

@@ -167,5 +167,9 @@ fn rewrite_function_metadata(function: &mut AstFunctionExpr) -> bool {
         changed = true;
     }
 
+    for name in function.capture_names_by_upvalue.values_mut() {
+        changed |= rewrite_name_ref(name);
+    }
+
     changed
 }

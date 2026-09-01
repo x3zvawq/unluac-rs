@@ -24,4 +24,8 @@ mod insert;
 mod merge;
 mod rewrite;
 
+pub(in crate::ast::readability) use facts::{
+    VisibleGlobals, extending_global_scope_preserves_expr,
+};
+
 pub(super) use rewrite::apply;

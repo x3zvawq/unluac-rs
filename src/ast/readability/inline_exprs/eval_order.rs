@@ -29,6 +29,12 @@ pub(super) fn preserves_adjacent_eval_order(
     value: &AstExpr,
     mutable_snapshots: &BTreeSet<AstNameRef>,
 ) -> bool {
+    let allows_direct_return_function = matches!(
+        (value, sink),
+        (AstExpr::FunctionExpr(function), AstStmt::Return(ret))
+            if !function.captured_bindings.contains(&binding)
+                && matches!(ret.values.as_slice(), [AstExpr::Var(name)] if binding.matches_name_ref(name))
+    );
     let values = BTreeMap::from([(binding, value)]);
     let mut collector = EvalPrefixCollector {
         values: &values,
@@ -38,6 +44,7 @@ pub(super) fn preserves_adjacent_eval_order(
         emitted: BTreeSet::new(),
         prefix: Vec::new(),
         blocked: false,
+        allows_direct_return_function,
     };
     collector.stmt(sink);
     !collector.blocked && collector.prefix == [binding]
@@ -78,7 +85,7 @@ pub(super) fn run_preserves_eval_order(
         // 候选拒绝[SemanticBarrier:EvalCount]：lookup/call/元方法事件会从一次变成逐轮执行（regress_355、regress_373_loop_lookup_eval_count）；
         // 候选拒绝[SemanticBarrier:EvalTime]：upvalue 可能由当前 block 外部写入，不能作为循环不变量。
         // 候选拒绝[TargetConstraint]：目标未定义的整数运算或方言专属常量物化不能重复搬入循环头。
-        // 候选忽略[NotApplicable]：VarArg 已被所有可形成 removed run 的 expression policy 拒绝，不会抵达此 guard。
+        // VarArg 已被所有可形成 removed run 的 expression policy 拒绝，不会抵达此 guard。
         return false;
     }
     let expected = candidates
@@ -112,6 +119,7 @@ pub(super) fn run_preserves_eval_order(
         emitted: BTreeSet::new(),
         prefix: Vec::new(),
         blocked: false,
+        allows_direct_return_function: false,
     };
     collector.stmt(&stmts[sink_index]);
     !collector.blocked && collector.prefix == expected
@@ -225,6 +233,7 @@ struct EvalPrefixCollector<'a> {
     emitted: BTreeSet<AstBindingRef>,
     prefix: Vec<AstBindingRef>,
     blocked: bool,
+    allows_direct_return_function: bool,
 }
 
 impl EvalPrefixCollector<'_> {
@@ -234,6 +243,8 @@ impl EvalPrefixCollector<'_> {
     }
 
     fn snapshot_barrier(&mut self) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：sink 中先读取的 mutable snapshot 可能被
+        // 尚未发射的 call/lookup producer 改写，搬运后两者的读取顺序会反转。
         self.blocked |= self.values.iter().any(|(binding, value)| {
             self.ordered.contains(binding)
                 && !self.emitted.contains(binding)
@@ -360,6 +371,11 @@ impl EvalPrefixCollector<'_> {
             }
             AstExpr::SingleValue(value) => self.expr(value, mode),
             AstExpr::TableConstructor(table) => {
+                if matches!(mode, WalkMode::Sink) {
+                    // 候选拒绝[SemanticBarrier:EvalOrder]：table 在字段表达式前分配；把更早的
+                    // lookup/call producer 移入字段会把 allocation 放到 producer 之前。
+                    self.barrier();
+                }
                 for field in &table.fields {
                     match field {
                         AstTableField::Array(value) => self.expr(value, mode),
@@ -372,9 +388,13 @@ impl EvalPrefixCollector<'_> {
                     }
                 }
             }
-            AstExpr::FunctionExpr(_) if matches!(mode, WalkMode::Dependency) => {
-                // 候选拒绝[SemanticBarrier:Capture]：closure dependency 会把声明时捕获改成 sink 时创建/捕获，生命周期与值快照均可能改变。
-                self.barrier();
+            AstExpr::FunctionExpr(_) => {
+                if matches!(mode, WalkMode::Dependency) && !self.allows_direct_return_function {
+                    // 候选拒绝[SemanticBarrier:Capture]：一般 sink 中延后 closure 创建会改变
+                    // 捕获/分配时点。这里只放行无 self-capture 且唯一 use 为相邻直接 return；
+                    // 该形状没有中间事件，捕获的其它 binding 仍指向同一 lexical cell。
+                    self.barrier();
+                }
             }
             AstExpr::Nil
             | AstExpr::Boolean(_)
@@ -387,7 +407,6 @@ impl EvalPrefixCollector<'_> {
             | AstExpr::Complex { .. }
             | AstExpr::Var(_)
             | AstExpr::VarArg
-            | AstExpr::FunctionExpr(_)
             | AstExpr::Error(_) => {}
         }
         if matches!(mode, WalkMode::Sink) {
@@ -400,15 +419,24 @@ impl EvalPrefixCollector<'_> {
     }
 
     fn candidate(&mut self, binding: AstBindingRef) {
-        if !self.visiting.insert(binding) || !self.emitted.insert(binding) {
-            // 候选拒绝[SemanticBarrier:EvalCount]：循环依赖或同一候选在 sink 出现多次会递归/复制 RHS，不能保持一次求值。
+        assert!(
+            self.visiting.insert(binding),
+            "inline candidate dependency must point to an earlier local declaration"
+        );
+        if !self.emitted.insert(binding) {
+            // 候选拒绝[SemanticBarrier:EvalCount]：同一候选在 sink 出现多次会复制 RHS，不能保持一次求值。
             self.barrier();
+            self.visiting.remove(&binding);
             return;
         }
         let value = self.values[&binding];
+        let event_precedes_dependencies = matches!(value, AstExpr::TableConstructor(_));
+        if event_precedes_dependencies && self.ordered.contains(&binding) {
+            self.prefix.push(binding);
+        }
         self.expr(value, WalkMode::Dependency);
         self.visiting.remove(&binding);
-        if !self.blocked && self.ordered.contains(&binding) {
+        if !self.blocked && !event_precedes_dependencies && self.ordered.contains(&binding) {
             self.prefix.push(binding);
         }
     }

@@ -60,9 +60,12 @@ fn rewrite_block(
             continue;
         }
 
-        if let Some((stmt, consumed)) =
-            try_inline_terminal_constructor_call(&old_stmts[index..], &use_index, index)
-        {
+        if let Some((stmt, consumed)) = try_inline_terminal_constructor_call(
+            &old_stmts[index..],
+            &use_index,
+            index,
+            mutable_snapshots,
+        ) {
             new_stmts.push(stmt);
             changed = true;
             index += consumed;
@@ -87,9 +90,13 @@ fn rewrite_block(
             continue;
         }
 
-        if let Some((stmt, consumed)) =
-            try_lower_forwarded_function_stmt(&old_stmts[index..], &use_index, index, target)
-        {
+        if let Some((stmt, consumed)) = try_lower_forwarded_function_stmt(
+            &old_stmts[index..],
+            &use_index,
+            index,
+            target,
+            mutable_snapshots,
+        ) {
             new_stmts.push(stmt);
             changed = true;
             index += consumed;

@@ -109,6 +109,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             new_local_debug_hints: &mut new_local_debug_hints,
             new_local_debug_scopes: &mut new_local_debug_scopes,
             physical_root_locals: &mut physical_root_locals,
+            physical_root_temps: &proto.physical_root_temps,
             promoted_bindings: &mut promoted_bindings,
             direct_seed_promotions: &mut direct_seed_promotions,
             identity_sensitive_temps: &identity_sensitive_temps,
@@ -254,6 +255,7 @@ struct PromotionCtx<'a> {
     new_local_debug_hints: &'a mut Vec<Option<String>>,
     new_local_debug_scopes: &'a mut Vec<Option<usize>>,
     physical_root_locals: &'a mut BTreeSet<LocalId>,
+    physical_root_temps: &'a BTreeSet<TempId>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
     direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
     identity_sensitive_temps: &'a BTreeSet<TempId>,
@@ -639,7 +641,6 @@ fn collect_plans(
     let mut reserved_alias_indices = BTreeSet::new();
     let mut slot_candidates = inherited_sticky_slots.clone();
     let mut sticky_slots = inherited_sticky_slots.clone();
-    let mut physical_root_locals = BTreeMap::<usize, LocalId>::new();
     let mut physical_root_locals_by_home = BTreeMap::<(usize, HomeSlotKey), LocalId>::new();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
@@ -667,7 +668,6 @@ fn collect_plans(
                 let local = physical_root_locals_by_home
                     .get(&(*root_index, *home))
                     .copied()
-                    .or_else(|| physical_root_locals.get(root_index).copied())
                     .unwrap_or_else(|| {
                         panic!(
                             "physical root producer {root_index} must be promoted before overwrite {decl_index} for home {home:?}"
@@ -839,7 +839,9 @@ fn collect_plans(
             removable_aliases,
             touching_stmt_indices,
         } = promotion_group;
-
+        let group_has_physical_root = group
+            .iter()
+            .any(|temp| ctx.physical_root_temps.contains(temp));
         // 别名扩张后的任一 temp 仍被外层读取时，整个组都不能在子作用域提升；
         // 只检查 root 会让内层 local 吞掉外层 loop state 的别名。
         if group.iter().copied().any(outer_uses_temp) {
@@ -876,9 +878,7 @@ fn collect_plans(
             .or(preceding_lookup_root)
             .or_else(|| call_root_lifetimes.root_for_protected(decl_index));
         let preceding_physical_root_local = preceding_physical_root.and_then(|root| {
-            home_slot
-                .and_then(|home| physical_root_locals_by_home.get(&(root, home)).copied())
-                .or_else(|| physical_root_locals.get(&root).copied())
+            home_slot.and_then(|home| physical_root_locals_by_home.get(&(root, home)).copied())
         });
         let force_physical_root_local = call_root_lifetimes.is_root(decl_index)
             || lookup_gc_root_lifetimes.is_root(decl_index)
@@ -897,7 +897,7 @@ fn collect_plans(
             && touching_stmt_indices.is_empty()
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
         {
-            // 候选忽略[NotApplicable]：零后续 touch 的匿名 temp 没有跨语句值流，不是
+            // 零后续 touch 的匿名 temp 没有跨语句值流，不是
             // locals 的源码 binding 候选。dead-temps 只会另行删除其中 discard-safe、无受保护
             // raw-home 的子集；其余形状不能借一个并不覆盖它们的 owner 伪装成 LayerBoundary。
             continue;
@@ -909,7 +909,7 @@ fn collect_plans(
                 .chain(touching_stmt_indices.iter().copied())
                 .all(|index| stmt_temp_reads[index].is_disjoint(&group))
         {
-            // 候选忽略[NotApplicable]：只有写 touch、没有表达式读取的链不承载可恢复的
+            // 只有写 touch、没有表达式读取的链不承载可恢复的
             // 跨语句 binding。dead-temps 仍按自己的 discard-safe/raw-home 合同清理可删写入；
             // locals 不把未被读取的 SSA 版本固化成源码 local。
             continue;
@@ -987,8 +987,17 @@ fn collect_plans(
             }
             local
         };
-        if call_root_lifetimes.is_root(decl_index) || lookup_gc_root_lifetimes.is_root(decl_index) {
-            physical_root_locals.insert(decl_index, selected_local);
+        let collected_root =
+            call_root_lifetimes.is_root(decl_index) || lookup_gc_root_lifetimes.is_root(decl_index);
+        if (collected_root || group_has_physical_root)
+            && let Some(home) = home_slot
+        {
+            // Root ownership is keyed by both producer epoch and physical home. A value may be
+            // copied through several homes; indexing only by its producer would let a later
+            // endpoint reuse an unrelated local and collapse callee/argument identities.
+            physical_root_locals_by_home.insert((decl_index, home), selected_local);
+        }
+        if collected_root || (group_has_physical_root && home_slot.is_some()) {
             // This local must stay dedicated to the root result until its proven physical
             // overwrite partner reuses it. Home-slot compaction may otherwise lend the same
             // source local to a simultaneously-live value before that overwrite occurs.
@@ -998,8 +1007,6 @@ fn collect_plans(
 
     // The AST cleanup pass cannot infer physical-slot lifetime from ordinary binding mentions.
     // Carry the proven root identity across the HIR -> AST boundary explicitly.
-    ctx.physical_root_locals
-        .extend(physical_root_locals.values().copied());
     ctx.physical_root_locals
         .extend(physical_root_locals_by_home.values().copied());
 
@@ -1061,7 +1068,6 @@ fn collect_plans(
                 .and_then(|root| {
                     home_slot
                         .and_then(|home| physical_root_locals_by_home.get(&(root, home)).copied())
-                        .or_else(|| physical_root_locals.get(&root).copied())
                 });
             let mut allocator = PlanAllocator {
                 temp_debug_locals,

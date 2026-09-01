@@ -36,8 +36,7 @@ pub(super) fn fold_generic_for_iterators_in_proto(
     let use_counts = collect_temp_use_counts(proto);
     let reference_capture_homes = iterator_reference_capture_homes(&proto.body, facts);
     let tbc_protected_homes = iterator_tbc_protected_homes(&proto.body, facts);
-    let physical_root_homes = iterator_physical_root_homes(proto, facts);
-    let physical_root_temps = proto.physical_root_temps.clone();
+    let physical_root_bindings = iterator_physical_root_bindings(proto);
     let debug_temps = proto
         .temp_debug_locals
         .iter()
@@ -49,8 +48,7 @@ pub(super) fn fold_generic_for_iterators_in_proto(
             use_counts,
             reference_capture_homes,
             tbc_protected_homes,
-            physical_root_homes,
-            physical_root_temps,
+            physical_root_bindings,
             debug_temps,
             facts,
             dialect,
@@ -62,8 +60,7 @@ struct GenericForIteratorPass<'a> {
     use_counts: BTreeMap<TempId, usize>,
     reference_capture_homes: BTreeSet<HomeSlotKey>,
     tbc_protected_homes: BTreeSet<HomeSlotKey>,
-    physical_root_homes: BTreeSet<HomeSlotKey>,
-    physical_root_temps: BTreeSet<TempId>,
+    physical_root_bindings: BTreeSet<DirectBinding>,
     debug_temps: Vec<bool>,
     facts: &'a ProtoPromotionFacts,
     dialect: DecompileDialect,
@@ -188,9 +185,10 @@ struct FoldPlan {
 
 fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<FoldPlan> {
     // VM 最多给 generic-for 保留 iterator/state/control/closing 四个 source slots。
+    let mut gap_fallback = None;
     for assignment_count in 1..=4 {
         if !matches!(stmts.get(assignment_count - 1), Some(HirStmt::Assign(_))) {
-            return None;
+            return gap_fallback;
         }
         let assignments = &stmts[..assignment_count];
         if let Some(HirStmt::GenericFor(generic_for)) = stmts.get(assignment_count) {
@@ -205,7 +203,8 @@ fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<
             .then_some(FoldPlan {
                 assignment_count,
                 gap_count: 0,
-            });
+            })
+            .or(gap_fallback);
         }
         if let (Some(gap @ HirStmt::Assign(_)), Some(HirStmt::GenericFor(generic_for))) =
             (stmts.get(assignment_count), stmts.get(assignment_count + 1))
@@ -216,15 +215,18 @@ fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<
             {
                 continue;
             }
-            return iterator_pack_can_cross_assignment(assignments, gap, context).then_some(
-                FoldPlan {
+            if iterator_pack_can_cross_assignment(assignments, gap, context) {
+                gap_fallback.get_or_insert(FoldPlan {
                     assignment_count,
                     gap_count: 1,
-                },
-            );
+                });
+            }
+            // The gap may itself be the next protocol producer. Prefer the larger adjacent
+            // transaction; retain a proven reorder only as fallback if that match fails.
+            continue;
         }
     }
-    None
+    gap_fallback
 }
 
 // 跨 gap 比相邻折叠多一次求值重排。稳定标量的求值没有 user-code effect；只要 producer、
@@ -253,7 +255,9 @@ fn iterator_pack_can_cross_assignment(
             // 候选拒绝[SemanticBarrier:EvalOrder]：upvalue/global/table 左值可执行 user code 或改变 loop head 可观察状态，iterator 求值不能跨过它。
             return false;
         }
-        Err(LocationFactError::Opaque) => unreachable!("lvalue cannot be opaque"),
+        Err(LocationFactError::DeferredDecision | LocationFactError::DiagnosticResidual) => {
+            unreachable!("lvalue cannot be an expression residual")
+        }
     };
     let gap_sources = match stable_value_locations(&gap.values.fixed, context.facts) {
         Ok(locations) => locations,
@@ -261,10 +265,13 @@ fn iterator_pack_can_cross_assignment(
             // 候选拒绝[SemanticBarrier:EvalOrder]：call、lookup、closure 或运算表达式跨 iterator producer 可执行 user code/读取可变状态；这里只移动字面量和可信直接 binding。
             return false;
         }
-        Err(LocationFactError::Opaque) => {
+        Err(LocationFactError::DeferredDecision) => {
             // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化；
             // owner 会 invalidates TempChain/BlockStructure，二者都是本 pass 的
             // scheduler dependency，因此物化后候选会被真实重审。
+            return false;
+        }
+        Err(LocationFactError::DiagnosticResidual) => {
             // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
             // 不把它埋入普通 iterator 表达式。
             return false;
@@ -296,10 +303,13 @@ fn iterator_pack_can_cross_assignment(
                 // 候选拒绝[SemanticBarrier:EvalOrder]：可观察 iterator RHS 延迟到 gap 后会重排 call/lookup/metamethod；只接纳字面量和可信直接 binding。
                 return false;
             }
-            Err(LocationFactError::Opaque) => {
+            Err(LocationFactError::DeferredDecision) => {
                 // 候选拒绝[LayerBoundary]：Decision 交给 decision/eliminate owner 原位物化；
                 // owner 会 invalidates 本 pass 依赖的 TempChain/BlockStructure，
                 // 物化后会重审该 producer/gap 候选。
+                return false;
+            }
+            Err(LocationFactError::DiagnosticResidual) => {
                 // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
                 return false;
             }
@@ -440,24 +450,75 @@ fn iterator_value_capture_homes(
     captured_binding_homes(&stmts_value_captured_bindings(stmts_after_producer), facts)
 }
 
-fn iterator_physical_root_homes(
-    proto: &HirProto,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let mut locations = BindingLocations::default();
-    for local in &proto.physical_root_locals {
-        locations.insert(DirectBinding::Local(*local), facts);
+fn iterator_physical_root_bindings(proto: &HirProto) -> BTreeSet<DirectBinding> {
+    let mut materialized = MaterializedBindingCollector::default();
+    visit_stmts(&proto.body.stmts, &mut materialized);
+    proto
+        .physical_root_locals
+        .iter()
+        .copied()
+        .map(DirectBinding::Local)
+        .chain(
+            proto
+                .physical_root_temps
+                .iter()
+                .copied()
+                .map(DirectBinding::Temp),
+        )
+        .filter(|binding| materialized.bindings.contains(binding))
+        .collect()
+}
+
+#[derive(Default)]
+struct MaterializedBindingCollector {
+    bindings: BTreeSet<DirectBinding>,
+}
+
+impl HirVisitor for MaterializedBindingCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(decl) => {
+                self.bindings
+                    .extend(decl.bindings.iter().copied().map(DirectBinding::Local));
+            }
+            HirStmt::NumericFor(numeric_for) => {
+                self.bindings
+                    .insert(DirectBinding::Local(numeric_for.binding));
+            }
+            HirStmt::GenericFor(generic_for) => {
+                self.bindings.extend(
+                    generic_for
+                        .bindings
+                        .iter()
+                        .copied()
+                        .map(DirectBinding::Local),
+                );
+            }
+            _ => {}
+        }
     }
-    for temp in &proto.physical_root_temps {
-        locations.insert(DirectBinding::Temp(*temp), facts);
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        match lvalue {
+            HirLValue::Local(local) => {
+                self.bindings.insert(DirectBinding::Local(*local));
+            }
+            HirLValue::Temp(temp) => {
+                self.bindings.insert(DirectBinding::Temp(*temp));
+            }
+            HirLValue::Param(_)
+            | HirLValue::Upvalue(_)
+            | HirLValue::Global(_)
+            | HirLValue::TableAccess(_) => {}
+        }
     }
-    locations.physical_homes
 }
 
 #[derive(Clone, Copy)]
 enum LocationFactError {
     Observable,
-    Opaque,
+    DeferredDecision,
+    DiagnosticResidual,
 }
 
 fn direct_target_locations(
@@ -499,9 +560,8 @@ fn stable_value_locations(
             | HirExpr::Complex { .. }
             | HirExpr::Vector(_)
             | HirExpr::UpvalueRef(_) => None,
-            HirExpr::Decision(_) | HirExpr::Unresolved(_) => {
-                return Err(LocationFactError::Opaque);
-            }
+            HirExpr::Decision(_) => return Err(LocationFactError::DeferredDecision),
+            HirExpr::Unresolved(_) => return Err(LocationFactError::DiagnosticResidual),
             HirExpr::GlobalRef(_)
             | HirExpr::TableAccess(_)
             | HirExpr::Unary(_)
@@ -683,7 +743,14 @@ fn assignments_match_iterator(
         }
         protocol_prefix_width += assign.targets.len();
     }
-    if expected.next().is_some() {
+    let has_remaining_protocol_values = expected.next().is_some();
+    if assignments
+        .iter()
+        .any(|stmt| matches!(stmt, HirStmt::Assign(assign) if assign.values.tail.is_some()))
+        && has_remaining_protocol_values
+    {
+        // 候选拒绝[SemanticBarrier:ValueArity]：open tail 必须位于 source value list
+        // 末尾；若 protocol 仍有 fixed 后缀，把 exact tail 转成 open 后会吞掉这些槽位。
         return false;
     }
     match iterator_assignments_preserve_value_flow(assignments, context.facts) {
@@ -732,18 +799,15 @@ fn iterator_target_can_be_deleted(
         context.facts.possible_temp_home_slots(target),
         context.facts,
     );
-    if iterator_target_has_root_lifetime(
-        target,
-        &target_homes,
-        context.facts.is_scope_end_copy_root_temp(target),
-        context,
-    ) || !target_homes.is_disjoint(&context.tbc_protected_homes)
+    if iterator_target_has_root_lifetime(target, &target_homes, context)
+        || !target_homes.is_disjoint(&context.tbc_protected_homes)
     {
         // 候选拒绝[SemanticBarrier:Lifetime]：producer 的 raw home 若自身或经
-        // different-binding alias 承担 PhysicalRoot/scope-end copy root，折入 loop
-        // header 会提前结束原槽的强引用。iterator protocol 的逻辑读取不能替代该
-        // raw-home lifetime；TBC raw slot 还必须保留原值到 `__close`。其间
-        // GC/finalizer/cleanup 可观察差异。
+        // different-binding alias 承担 PhysicalRoot，折入 loop header 会提前结束那份
+        // 独立强引用。scope-end copy-root 本身不构成 blanket 拒绝：若当前 target 尚未被
+        // 物化为 PhysicalRoot，折叠会把同一值原子转移给 GenericFor 的隐藏协议槽；一旦
+        // 已有其它 root owner 把 binding 物化进集合，这里仍按实际 binding/home 拒绝。
+        // TBC raw slot 仍必须保留原值到 `__close`；其间 GC/finalizer/cleanup 可观察差异。
         return false;
     }
     if !target_homes.is_disjoint(&context.reference_capture_homes)
@@ -762,16 +826,19 @@ fn iterator_target_can_be_deleted(
 fn iterator_target_has_root_lifetime(
     target: TempId,
     target_homes: &BTreeSet<HomeSlotKey>,
-    scope_end_copy_root: bool,
     context: &GenericForIteratorPass<'_>,
 ) -> bool {
-    scope_end_copy_root
-        || context.physical_root_temps.contains(&target)
-        || !target_homes.is_disjoint(&context.physical_root_homes)
+    context.physical_root_bindings.iter().any(|binding| {
+        let mut locations = BindingLocations::default();
+        locations.insert(*binding, context.facts);
+        *binding == DirectBinding::Temp(target)
+            || !target_homes.is_disjoint(&locations.physical_homes)
+    })
 }
 
 fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut Vec<HirStmt>) {
     let mut iterator = HirValuePack::default();
+    let mut consumed_protocol_values = 0;
     for _ in 0..plan.assignment_count {
         let HirStmt::Assign(assign) = pending
             .pop_front()
@@ -780,6 +847,7 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
             unreachable!("fold plan only counts assignments");
         };
         let target_count = assign.targets.len();
+        consumed_protocol_values += target_count;
         let fixed_count = assign.values.fixed.len();
         iterator.fixed.extend(assign.values.fixed);
         if let Some(tail) = assign.values.tail {
@@ -804,11 +872,15 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
         unreachable!("validated generic-for owner");
     };
     if iterator.tail.is_none() {
+        iterator
+            .fixed
+            .extend(generic_for.iterator.fixed.drain(consumed_protocol_values..));
         iterator.tail = generic_for.iterator.tail.take();
     } else {
         assert!(
-            generic_for.iterator.tail.is_none(),
-            "validated generic-for fold cannot merge two value-pack tails"
+            generic_for.iterator.fixed.len() == consumed_protocol_values
+                && generic_for.iterator.tail.is_none(),
+            "validated open-tail fold must consume the complete generic-for pack"
         );
     }
     trim_trailing_nil_iterators(&mut iterator);
@@ -854,8 +926,7 @@ mod tests {
             use_counts: used_temps.into_iter().map(|temp| (temp, 1)).collect(),
             reference_capture_homes: BTreeSet::new(),
             tbc_protected_homes: BTreeSet::new(),
-            physical_root_homes: BTreeSet::new(),
-            physical_root_temps: BTreeSet::new(),
+            physical_root_bindings: BTreeSet::new(),
             debug_temps: Vec::new(),
             facts,
             dialect: DecompileDialect::Lua54,
@@ -873,7 +944,7 @@ mod tests {
         let stmts = vec![
             assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
             assign(HirLValue::Local(gap_local), HirExpr::Integer(2)),
-            generic_for(vec![HirExpr::TempRef(iterator)]),
+            generic_for(vec![HirExpr::TempRef(iterator), HirExpr::Integer(0)]),
         ];
         let context = context(&facts, [iterator]);
 
@@ -887,7 +958,7 @@ mod tests {
             folded,
             vec![
                 assign(HirLValue::Local(gap_local), HirExpr::Integer(2)),
-                generic_for(vec![HirExpr::Integer(1)]),
+                generic_for(vec![HirExpr::Integer(1), HirExpr::Integer(0)]),
             ]
         );
     }
@@ -1182,7 +1253,9 @@ mod tests {
             generic_for(vec![HirExpr::TempRef(iterator)]),
         ];
         let mut context = context(&facts, [iterator]);
-        context.physical_root_homes.insert(home);
+        context
+            .physical_root_bindings
+            .insert(DirectBinding::Local(physical_root_alias));
 
         assert!(fold_plan(&stmts, &context).is_none());
     }
@@ -1202,22 +1275,6 @@ mod tests {
         ];
 
         assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_some());
-    }
-
-    #[test]
-    fn scope_end_copy_root_rejects_target_deletion() {
-        let iterator = TempId(0);
-        let home = HomeSlotKey::new(0, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(iterator, home);
-        let context = context(&facts, [iterator]);
-
-        assert!(iterator_target_has_root_lifetime(
-            iterator,
-            &BTreeSet::from([home]),
-            true,
-            &context,
-        ));
     }
 
     #[test]

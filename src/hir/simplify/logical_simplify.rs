@@ -317,7 +317,10 @@ fn factor_shared_and_guards_one_side(
             return None;
         }
         // 候选拒绝[SemanticBarrier:EvalOrder]：若 `b()` 把 captured guard 从 true 改成 false，原式会在 b 后重读并跳过 c，提取 guard 后却会求值 c。
+        // 接受路径[SemanticProof:ShortCircuitReachability]：恒真的 b 执行后外层 or 必定短路，
+        // 第二次 guard 读取不可达；即使 b 会分配新身份，也不需要把它误判成可重复表达式。
         if !safety.is_effect_invariant_in_single_value_context(&lhs_and.lhs)
+            && expr_truthiness(&lhs_and.rhs, safety) != Some(true)
             && !safety.is_repeatable_in_single_value_context(&lhs_and.rhs)
         {
             return None;
@@ -353,7 +356,11 @@ fn pull_shared_or_tail_one_side(
         return None;
     }
     // 候选拒绝[SemanticBarrier:EvalCount]：`a and (b or f()) or f()` 在 `a` truthy、`b` falsy且首个 `f()` falsy时调用两次，提取后只调用一次。
-    if !safety.is_repeatable_in_single_value_context(rhs) {
+    // 接受路径[SemanticProof:ShortCircuitReachability]：若共享 tail 恒真，两处 occurrence
+    // 互斥；提取只把所选 occurrence 移到同一求值点，不会合并两次求值。
+    if expr_truthiness(rhs, safety) != Some(true)
+        && !safety.is_repeatable_in_single_value_context(rhs)
+    {
         return None;
     }
 
@@ -632,14 +639,19 @@ fn factor_condition_shared_and_tail(
     if lhs_and.rhs != rhs_and.rhs {
         return None;
     }
-    // 候选拒绝[SemanticBarrier:EvalCount]：条件 `(a and f()) or (b and f())` 在首个 `f()` falsy且 b truthy 时调用两次，提取后只调用一次。
-    if !safety.is_repeatable_in_single_value_context(&lhs_and.rhs) {
-        return None;
+    if expr_truthiness(&lhs_and.rhs, safety) != Some(true) {
+        // 候选拒绝[SemanticBarrier:EvalCount]：条件 `(a and f()) or (b and f())` 在首个 `f()` falsy且 b truthy 时调用两次，提取后只调用一次。
+        if !safety.is_repeatable_in_single_value_context(&lhs_and.rhs) {
+            return None;
+        }
+        // 候选拒绝[SemanticBarrier:EvalCount]：条件 `(true and false) or (mark() and false)` 原本仍调用 `mark()`，提取后直接返回 false。
+        if !safety.is_discard_safe(&rhs_and.lhs) {
+            return None;
+        }
     }
-    // 候选拒绝[SemanticBarrier:EvalCount]：条件 `(true and false) or (mark() and false)` 原本仍调用 `mark()`，提取后直接返回 false。
-    if !safety.is_discard_safe(&rhs_and.lhs) {
-        return None;
-    }
+
+    // 接受路径[SemanticProof:ConditionTruthiness]：恒真 tail 只会在被选中的一臂求值一次；
+    // 首臂一旦到达 tail 就令外层 or 短路，因此不会删除 b，也不会重复求值 tail。
 
     Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
         lhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {

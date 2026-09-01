@@ -6,6 +6,7 @@
 //! - 优先把终端语句尾巴收成最小 `do + global *` / `global<const> *`
 //! - 它不会去猜 block 外是否也存在同一批 global
 //! - 也不会跨越 label/goto 之类高风险控制流去硬包一层 `do`
+//! - repeat suffix 只有在 until 条件仍能看到所需 binding、且局部根/close 生命周期不变时才包裹
 //!
 //! 例子：
 //! - `local ok = ...; local left = math.max(...); return left`
@@ -17,20 +18,18 @@ use crate::ast::common::{
     AstBlock, AstExpr, AstFunctionExpr, AstGlobalAttr, AstLValue, AstNameRef, AstStmt,
 };
 
+use self::lifetime::{suffix_has_preserved_lifetime, suffix_shortens_referenced_binding};
 use super::super::visit::{self, AstVisitor};
-use super::super::walk::BlockKind;
 use super::facts::MissingGlobals;
 use super::insert::build_wildcard_global_decl;
 
+mod lifetime;
+
 pub(super) fn try_wrap_missing_collective_suffix(
     block: &mut AstBlock,
-    kind: BlockKind,
     missing: &MissingGlobals,
+    trailing_expr: Option<&AstExpr>,
 ) -> bool {
-    if matches!(kind, BlockKind::ModuleBody) {
-        return false;
-    }
-
     let names = missing
         .none
         .iter()
@@ -50,6 +49,18 @@ pub(super) fn try_wrap_missing_collective_suffix(
     let Some(attr) = collective_candidate_attr(missing) else {
         return false;
     };
+    if trailing_expr
+        .is_some_and(|expr| suffix_shortens_referenced_binding(&block.stmts[start..], expr))
+    {
+        // 候选拒绝[SemanticBarrier:Scope]：`repeat; local value = use(missing); until done(value)`
+        // 的 `value` 必须在 until 条件中可见；suffix 包进 `do + global *` 会提前结束其词法作用域；见 regress_424。
+        return false;
+    }
+    if trailing_expr.is_some() && suffix_has_preserved_lifetime(&block.stmts, start) {
+        // 候选拒绝[SemanticBarrier:Lifetime]：repeat suffix 中的 `<close>`/source identity 必须跨过条件；
+        // eventful condition 还能用 weak table + collectgarbage 观察普通 local 的 collectable final value；见 regress_436。
+        return false;
+    }
     if has_incoming_goto(block, start) {
         // 候选拒绝[SemanticBarrier:ControlFlow]：`goto L; use(missing); ::L::` 若把
         // suffix 改成 `do; global *; use(missing); ::L::; end`，会令原本合法的 goto
@@ -68,6 +79,11 @@ pub(super) fn try_wrap_missing_collective_suffix(
 }
 
 fn collective_candidate_attr(missing: &MissingGlobals) -> Option<AstGlobalAttr> {
+    if missing.requires_named_decl() {
+        // `global *` 不能遮蔽外层逐名 `global<const> name`；这类可写
+        // 重声明必须由 insert owner 生成精确的 `global name`。
+        return None;
+    }
     match (missing.none.is_empty(), missing.const_.is_empty()) {
         (true, false) => Some(AstGlobalAttr::Const),
         (false, true) => Some(AstGlobalAttr::None),

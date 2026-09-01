@@ -1,6 +1,10 @@
 -- regress_332_logical_simplify: occurrence 级逻辑化简保留求值轨迹、标量宽度与 Luau number 语义
 -- unluac: expect-contains [[return p2_0 and (p2_1 or]]
 -- unluac: expect-contains [[p6_0 and r6_0() or p6_0 and r6_1()]]
+-- unluac: expect-contains [[return p9_0 and {}]]
+-- unluac: expect-not-contains [["unexpected"]]
+-- unluac: expect-contains [[if not ((p11_0 or]]
+-- unluac: expect-contains [[return p12_0 and p12_1 or {}]]
 
 local trace = {}
 
@@ -50,6 +54,40 @@ end
 
 local guarded_value, guarded_trace = mutable_param_guard(true)
 assert(guarded_value == false and guarded_trace == "b")
+
+-- 首臂虽然分配 table、因对象身份而不可重复，但其结果恒真；一旦该臂执行，
+-- 外层 or 不会进入第二臂，也就不存在“effect 后重读 guard”的路径。
+local function truthy_allocating_first_arm(guard)
+    return (guard and {}) or (guard and mark("unexpected", "fallback"))
+end
+
+trace = {}
+local allocated = truthy_allocating_first_arm(true)
+assert(type(allocated) == "table" and #trace == 0)
+
+local function condition_mark()
+    return mark("condition-b", true)
+end
+
+local function truthy_shared_condition_tail(guard)
+    if (guard and {}) or (condition_mark() and {}) then
+        return true
+    end
+    return false
+end
+
+trace = {}
+assert(truthy_shared_condition_tail(true) and #trace == 0)
+trace = {}
+assert(truthy_shared_condition_tail(false) and table.concat(trace, ",") == "condition-b")
+
+local function truthy_effectful_shared_or_tail(guard, first)
+    return (guard and (first or {})) or {}
+end
+
+local shared_tail = truthy_effectful_shared_or_tail(true, false)
+local other_shared_tail = truthy_effectful_shared_or_tail(false, false)
+assert(type(shared_tail) == "table" and shared_tail ~= other_shared_tail)
 
 local function count_values(...)
     return select("#", ...), ...

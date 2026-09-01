@@ -1,12 +1,15 @@
 //! 收回 alias 内联后才暴露的原始字面量比较和布尔逻辑壳。
 //!
-//! 这里只使用 `expr_analysis` 的严格字面量证明；动态值、元方法、跨数值表示和
-//! 非布尔值的 truthy 结果都保留原形状。Boolean 的 `not` 也只做无事件的字面量归一，
-//! 不改写循环/分支 owner。
+//! 这里只使用 `expr_analysis` 的严格常量与无事件证明；动态访问、元方法、跨数值表示和
+//! 会创建可观察对象的 truthy 结果都保留原形状。`not` 可在操作数 truthiness 已知且整次
+//! 求值可删除时归一，不改写循环/分支 owner。
 
 use super::super::common::{AstExpr, AstModule, AstTargetDialect, AstUnaryOpKind};
 use super::ReadabilityContext;
-use super::expr_analysis::{expr_is_boolean_valued, primitive_literal_comparison_value};
+use super::expr_analysis::{
+    constant_truthiness, expr_is_boolean_valued, is_discard_safe_expr_for_target,
+    primitive_literal_comparison_value,
+};
 use super::walk::{self, AstRewritePass};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -41,10 +44,11 @@ impl AstRewritePass for LiteralFoldPass {
             {
                 Some(logical.lhs.clone())
             }
-            AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => match &unary.expr {
-                AstExpr::Boolean(value) => Some(AstExpr::Boolean(!*value)),
-                _ => None,
-            },
+            AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
+                constant_truthiness(&unary.expr)
+                    .filter(|_| is_discard_safe_expr_for_target(&unary.expr, self.target))
+                    .map(|value| AstExpr::Boolean(!value))
+            }
             _ => None,
         };
 
@@ -59,7 +63,7 @@ impl AstRewritePass for LiteralFoldPass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::common::AstUnaryExpr;
+    use crate::ast::common::{AstGlobalName, AstNameRef, AstUnaryExpr};
 
     fn pass() -> LiteralFoldPass {
         LiteralFoldPass {
@@ -68,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn folds_boolean_not_without_guessing_truthy_values() {
+    fn folds_eventless_constant_truthiness_without_dropping_dynamic_access() {
         let mut expr = AstExpr::Unary(Box::new(AstUnaryExpr {
             op: AstUnaryOpKind::Not,
             expr: AstExpr::Boolean(true),
@@ -76,9 +80,18 @@ mod tests {
         assert!(pass().rewrite_expr(&mut expr));
         assert_eq!(expr, AstExpr::Boolean(false));
 
-        let mut dynamic = AstExpr::Unary(Box::new(AstUnaryExpr {
+        let mut truthy_number = AstExpr::Unary(Box::new(AstUnaryExpr {
             op: AstUnaryOpKind::Not,
             expr: AstExpr::Integer(0),
+        }));
+        assert!(pass().rewrite_expr(&mut truthy_number));
+        assert_eq!(truthy_number, AstExpr::Boolean(false));
+
+        let mut dynamic = AstExpr::Unary(Box::new(AstUnaryExpr {
+            op: AstUnaryOpKind::Not,
+            expr: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                text: "value".to_owned(),
+            })),
         }));
         assert!(!pass().rewrite_expr(&mut dynamic));
         assert!(matches!(dynamic, AstExpr::Unary(_)));

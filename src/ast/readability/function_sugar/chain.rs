@@ -19,7 +19,7 @@ pub(super) fn try_chain_local_method_call_stmt(
     stmt_base: usize,
 ) -> Option<(AstStmt, usize)> {
     let [first, second, ..] = stmts else {
-        // 候选忽略[NotApplicable]：method chain 至少需要结果声明和紧邻的后续调用两句。
+        // method chain 至少需要结果声明和紧邻的后续调用两句。
         return None;
     };
     let (binding, first_call) = single_method_call_local(first)?;
@@ -59,13 +59,13 @@ pub(super) fn try_chain_local_method_call_stmt(
 
 fn single_method_call_local(stmt: &AstStmt) -> Option<(&AstLocalBinding, &AstMethodCallExpr)> {
     let AstStmt::LocalDecl(local_decl) = stmt else {
-        // 候选忽略[NotApplicable]：首句不是 local call-result 声明。
+        // 首句不是 local call-result 声明。
         return None;
     };
     let ([binding], [AstExpr::MethodCall(call)]) =
         (local_decl.bindings.as_slice(), local_decl.values.as_slice())
     else {
-        // 候选忽略[NotApplicable]：这里只拥有单 binding、单 method-call initializer。
+        // 这里只拥有单 binding、单 method-call initializer。
         return None;
     };
     Some((binding, call))
@@ -79,15 +79,15 @@ fn chain_local_method_call_stmt(
     second_index: usize,
 ) -> Option<AstStmt> {
     let AstStmt::CallStmt(call_stmt) = second else {
-        // 候选忽略[NotApplicable]：第二句不是可直接接到 receiver 的调用语句。
+        // 第二句不是可直接接到 receiver 的调用语句。
         return None;
     };
     let AstCallKind::MethodCall(second_call) = &call_stmt.call else {
-        // 候选忽略[NotApplicable]：普通 call 没有可附着的 method receiver 链。
+        // 普通 call 没有可附着的 method receiver 链。
         return None;
     };
     let AstExpr::Var(name) = &second_call.receiver else {
-        // 候选忽略[NotApplicable]：第二段 receiver 不是首句声明的直接 binding use。
+        // 第二段 receiver 不是首句声明的直接 binding use。
         return None;
     };
     if !name_matches_binding(name, binding)

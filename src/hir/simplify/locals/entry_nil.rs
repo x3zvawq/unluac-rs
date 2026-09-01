@@ -4,7 +4,9 @@
 //! `(slot, close epoch)` 为身份，分别传播普通落空、`break` 与 `continue` 状态；循环对
 //! 回边求有限不动点。分析阶段只记录路径，验证成功后才在原 HIR 上一次性提交删除。
 //! reference capture 本身不会让 `nil = nil` 变得可观察，但 capture 逃逸后的调用或
-//! `__close` 可能回写该 cell，因此会把值状态降为 unknown。
+//! `__close` 可能回写该 cell，因此会把值状态降为 unknown。当前 block 的单调前向
+//! goto 由共享 `LexicalCfg` 精确消费；后置嵌套 island 的自含回环只停用它自身，不会
+//! 抹掉此前已证明的入口 nil 事实。
 
 use std::collections::BTreeSet;
 
@@ -15,6 +17,8 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::super::expr_facts::expr_truthiness;
+use super::super::label_refs::count_label_references;
+use super::super::lexical_cfg::LexicalCfg;
 use super::super::mention::ReferenceCapturedBindings;
 use super::super::temp_touch::stmt_contains_nested_nonlocal_control;
 use super::super::visit::{self, HirVisitor};
@@ -113,7 +117,8 @@ impl NilFlow {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PruneError {
-    ResidualExpr,
+    DeferredDecision,
+    DiagnosticResidual,
     BindingInvariant,
 }
 
@@ -154,6 +159,7 @@ pub(super) fn prune_redundant_entry_nil_writes(
     }
 
     let debug_identity = debug_identity_bindings(proto);
+    let owner_label_refs = count_label_references(&proto.body.stmts);
     let mut changed = false;
     for index in 0..proto.body.stmts.len() - 1 {
         let Some(local) = empty_local(&proto.body.stmts[index]) else {
@@ -180,13 +186,17 @@ pub(super) fn prune_redundant_entry_nil_writes(
             candidate_home,
             facts,
             safety,
+            owner_label_refs: &owner_label_refs,
             plan: PrunePlan::default(),
         };
         if let Err(error) = analyzer.analyze_if(if_stmt, NilStates::entry()) {
             match error {
-                PruneError::ResidualExpr => {
+                PruneError::DeferredDecision => {
                     // 候选拒绝[LayerBoundary]：Decision 的执行路径由 decision/eliminate owner
-                    // 收敛，本 pass 不展开其内部控制流。
+                    // 收敛；owner 会 invalidates LocalBinding/TempChain/BlockStructure，locals
+                    // 依赖这些 tag，因此物化后会重审本候选。
+                }
+                PruneError::DiagnosticResidual => {
                     // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
                     // entry-nil 不据未知路径删除边写。
                 }
@@ -219,68 +229,12 @@ fn empty_local(stmt: &HirStmt) -> Option<LocalId> {
     local_decl.values.is_empty().then_some(*local)
 }
 
-fn forward_label_indices(
-    block: &HirBlock,
-) -> Option<std::collections::BTreeMap<crate::hir::HirLabelId, usize>> {
-    let mut labels = std::collections::BTreeMap::new();
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        let HirStmt::Label(label) = stmt else {
-            continue;
-        };
-        if labels.insert(label.id, index).is_some() {
-            return None;
-        }
-    }
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        let HirStmt::Goto(goto) = stmt else {
-            continue;
-        };
-        if labels
-            .get(&goto.target)
-            .is_none_or(|target| *target <= index)
-        {
-            return None;
-        }
-    }
-    Some(labels)
-}
-
-fn forward_control_is_self_contained(block: &HirBlock) -> bool {
-    forward_label_indices(block).is_some()
-        && block.stmts.iter().all(|stmt| match stmt {
-            HirStmt::If(if_stmt) => {
-                forward_control_is_self_contained(&if_stmt.then_block)
-                    && if_stmt
-                        .else_block
-                        .as_ref()
-                        .is_none_or(forward_control_is_self_contained)
-            }
-            HirStmt::While(while_stmt) => forward_control_is_self_contained(&while_stmt.body),
-            HirStmt::Repeat(repeat_stmt) => forward_control_is_self_contained(&repeat_stmt.body),
-            HirStmt::NumericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
-            HirStmt::GenericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
-            HirStmt::Block(nested) => forward_control_is_self_contained(nested),
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => true,
-        })
-}
-
 struct EntryNilAnalyzer<'a> {
     local: LocalId,
     candidate_home: HomeSlotKey,
     facts: &'a ProtoPromotionFacts,
     safety: HirExprSafety,
+    owner_label_refs: &'a std::collections::BTreeMap<crate::hir::HirLabelId, usize>,
     plan: PrunePlan,
 }
 
@@ -308,11 +262,12 @@ impl EntryNilAnalyzer<'_> {
         prefix: &[PathComponent],
         mut states: NilStates,
     ) -> Result<NilFlow, PruneError> {
-        if !forward_control_is_self_contained(block) {
+        let Ok(cfg) = LexicalCfg::analyze(&block.stmts, self.owner_label_refs, self.safety) else {
             return self.analyze_unstructured_block(block, prefix);
-        }
-        let label_indices = forward_label_indices(block)
-            .expect("self-contained forward control must retain local labels");
+        };
+        let Some(label_indices) = cfg.linear_forward_labels() else {
+            return self.analyze_unstructured_block(block, prefix);
+        };
         let mut breaks = NilStates::default();
         let mut continues = NilStates::default();
         let mut index = 0;
@@ -787,7 +742,8 @@ struct ExprEffects<'a> {
     facts: &'a ProtoPromotionFacts,
     captures_reference: bool,
     has_call: bool,
-    residual: bool,
+    decision: bool,
+    unresolved: bool,
 }
 
 impl<'a> ExprEffects<'a> {
@@ -797,13 +753,17 @@ impl<'a> ExprEffects<'a> {
             facts,
             captures_reference: false,
             has_call: false,
-            residual: false,
+            decision: false,
+            unresolved: false,
         }
     }
 
     fn apply(self, mut states: NilStates) -> Result<NilStates, PruneError> {
-        if self.residual {
-            return Err(PruneError::ResidualExpr);
+        if self.decision {
+            return Err(PruneError::DeferredDecision);
+        }
+        if self.unresolved {
+            return Err(PruneError::DiagnosticResidual);
         }
         if self.has_call {
             states = states.opaque_callback();
@@ -830,7 +790,8 @@ impl HirVisitor for ExprEffects<'_> {
             | HirExpr::Unary(_)
             | HirExpr::Binary(_)
             | HirExpr::Call(_) => self.has_call = true,
-            HirExpr::Decision(_) | HirExpr::Unresolved(_) => self.residual = true,
+            HirExpr::Decision(_) => self.decision = true,
+            HirExpr::Unresolved(_) => self.unresolved = true,
             HirExpr::Closure(closure) => {
                 self.captures_reference |= closure.captures.iter().any(|capture| {
                     capture.mode == crate::hir::common::HirCaptureMode::ByReference
@@ -1089,11 +1050,13 @@ mod tests {
 
     fn analyze(then_block: HirBlock) -> PrunePlan {
         let facts = ProtoPromotionFacts::default();
+        let owner_label_refs = count_label_references(&then_block.stmts);
         let mut analyzer = EntryNilAnalyzer {
             local: LocalId(0),
             candidate_home: HomeSlotKey::new(0, 0),
             facts: &facts,
             safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            owner_label_refs: &owner_label_refs,
             plan: PrunePlan::default(),
         };
         analyzer

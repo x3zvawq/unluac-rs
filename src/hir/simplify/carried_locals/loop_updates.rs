@@ -945,7 +945,6 @@ mod tests {
             debug: BTreeSet::new(),
             for_bindings: BTreeSet::new(),
             physical_roots: BTreeSet::new(),
-            captured: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
         }

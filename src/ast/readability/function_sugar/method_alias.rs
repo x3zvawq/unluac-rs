@@ -14,7 +14,7 @@
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
 use super::super::binding_ref::name_matches_binding;
-use super::super::expr_analysis::{expr_requires_ordered_snapshot, is_eventless_primitive_literal};
+use super::super::expr_analysis::is_stable_context_expr;
 use super::super::visit::{self, AstVisitor};
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFunctionName, AstGlobalDecl,
@@ -88,8 +88,12 @@ fn try_recover_with_receiver_alias(
         mutable_snapshots,
         |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, receiver_binding)),
     )?;
-    if !method_alias_local_can_be_removed(receiver_local)
-        || !method_alias_local_can_be_removed(field_local)
+    let source_may_drop_receiver_root =
+        receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots);
+    let source_preserves_receiver_root =
+        matches!(receiver_expr, AstExpr::Var(_)) && !source_may_drop_receiver_root;
+    if !method_alias_local_can_be_removed(receiver_local, source_preserves_receiver_root)
+        || !method_alias_local_can_be_removed(field_local, false)
     {
         return None;
     }
@@ -105,7 +109,7 @@ fn try_recover_with_receiver_alias(
         // 候选拒绝[SemanticBarrier:Scope]：receiver 必须只供字段 lookup 与首参各一次，field alias 也只能作为唯一 callee；额外 direct/captured use 会在删除声明后失去 local owner。
         return None;
     }
-    if receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots) {
+    if source_may_drop_receiver_root {
         return None;
     }
 
@@ -139,7 +143,11 @@ fn try_recover_receiver_alias_direct_method_call(
             },
         )
     })?;
-    if !method_alias_local_can_be_removed(receiver_local) {
+    let source_may_drop_receiver_root =
+        receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots);
+    let source_preserves_receiver_root =
+        matches!(receiver_expr, AstExpr::Var(_)) && !source_may_drop_receiver_root;
+    if !method_alias_local_can_be_removed(receiver_local, source_preserves_receiver_root) {
         return None;
     }
     if binding_is_written_in_suffix(stmts, 1, receiver_binding) {
@@ -150,7 +158,7 @@ fn try_recover_receiver_alias_direct_method_call(
         // 候选拒绝[SemanticBarrier:Scope]：direct 形状仍要求 receiver 恰好用于 lookup 和首参，额外 direct/captured use 不能随 alias declaration 删除。
         return None;
     }
-    if receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots) {
+    if source_may_drop_receiver_root {
         return None;
     }
     Some((rewritten, 2))
@@ -176,7 +184,10 @@ fn single_field_alias_decl(
     Some((binding, access))
 }
 
-fn method_alias_local_can_be_removed(binding: &AstLocalBinding) -> bool {
+fn method_alias_local_can_be_removed(
+    binding: &AstLocalBinding,
+    source_preserves_receiver_root: bool,
+) -> bool {
     match binding.attr {
         AstLocalAttr::None => {}
         AstLocalAttr::Close => {
@@ -195,8 +206,11 @@ fn method_alias_local_can_be_removed(binding: &AstLocalBinding) -> bool {
             false
         }
         AstLocalOrigin::PhysicalRoot => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：删除 PhysicalRoot alias 会让 receiver 在原 block 结束前提前离开 GC root，弱表/`__gc` 可观察，见 regress_353/regress_406。
-            false
+            // 候选接受[StableRootHandoff]：receiver 的直接 Param/Local source 若在整个后缀
+            // 无写入且不是可变 reference snapshot，会持续保存同一对象到原 block 末端；
+            // 删除重复 PhysicalRoot alias 不缩短强根区间。否则弱表/`__gc` 可观察提前释放，
+            // regress_406 同时覆盖稳定 source 的可删形状与 loop-body 覆盖 source 的拒绝形状。
+            source_preserves_receiver_root
         }
     }
 }
@@ -640,22 +654,14 @@ where
 }
 
 fn expr_prefix_is_stable(expr: &AstExpr, mutable_snapshots: &MutableSnapshotNames) -> bool {
-    !expr_requires_ordered_snapshot(expr, mutable_snapshots)
+    is_stable_context_expr(expr, mutable_snapshots)
 }
 
 fn direct_receiver_initializer_is_repeatable(
     expr: &AstExpr,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
-    match expr {
-        AstExpr::Var(
-            name @ (AstNameRef::Param(_) | AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_)),
-        ) => !mutable_snapshots.contains(name),
-        AstExpr::SingleValue(inner) => {
-            direct_receiver_initializer_is_repeatable(inner, mutable_snapshots)
-        }
-        _ => is_eventless_primitive_literal(expr),
-    }
+    is_stable_context_expr(expr, mutable_snapshots)
 }
 
 fn recover_direct_method_call_with_receiver_alias_expr(

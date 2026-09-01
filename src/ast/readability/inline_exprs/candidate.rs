@@ -27,20 +27,50 @@ pub(super) fn stmt_is_alias_initializer_sink(stmt: &AstStmt) -> bool {
 }
 
 pub(super) fn stmt_is_adjacent_call_result_sink(stmt: &AstStmt) -> bool {
+    stmt_contains_direct_call_callee(stmt, None)
+}
+
+pub(super) fn stmt_uses_binding_as_direct_call_callee(
+    stmt: &AstStmt,
+    binding: AstBindingRef,
+) -> bool {
+    stmt_contains_direct_call_callee(stmt, Some(binding))
+}
+
+fn stmt_contains_direct_call_callee(stmt: &AstStmt, binding: Option<AstBindingRef>) -> bool {
     match stmt {
         AstStmt::LocalDecl(local_decl) => local_decl
             .values
             .iter()
-            .any(expr_contains_direct_call_callee_var),
+            .any(|expr| expr_contains_direct_call_callee_var(expr, binding)),
         AstStmt::Assign(assign) => assign
             .values
             .iter()
-            .any(expr_contains_direct_call_callee_var),
-        AstStmt::Return(ret) => ret.values.iter().any(expr_contains_direct_call_callee_var),
-        AstStmt::CallStmt(call_stmt) => matches!(
-            &call_stmt.call,
-            AstCallKind::Call(call) if matches!(call.callee, AstExpr::Var(_))
-        ),
+            .any(|expr| expr_contains_direct_call_callee_var(expr, binding)),
+        AstStmt::Return(ret) => ret
+            .values
+            .iter()
+            .any(|expr| expr_contains_direct_call_callee_var(expr, binding)),
+        AstStmt::CallStmt(call_stmt) => match &call_stmt.call {
+            AstCallKind::Call(call) => {
+                matches!(&call.callee, AstExpr::Var(name)
+                    if binding.is_none_or(|binding| binding.matches_name_ref(name)))
+                    || binding.is_some_and(|binding| {
+                        expr_contains_direct_call_callee_var(&call.callee, Some(binding))
+                            || call
+                                .args
+                                .iter()
+                                .any(|arg| expr_contains_direct_call_callee_var(arg, Some(binding)))
+                    })
+            }
+            AstCallKind::MethodCall(call) => binding.is_some_and(|binding| {
+                expr_contains_direct_call_callee_var(&call.receiver, Some(binding))
+                    || call
+                        .args
+                        .iter()
+                        .any(|arg| expr_contains_direct_call_callee_var(arg, Some(binding)))
+            }),
+        },
         AstStmt::GlobalDecl(_)
         | AstStmt::If(_)
         | AstStmt::While(_)
@@ -165,6 +195,13 @@ pub(super) enum InlinePolicy {
     StableCopy,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum InlineExprRejection {
+    DebugScope,
+    Lifetime,
+    PolicyMismatch,
+}
+
 impl InlineCandidate {
     pub(super) fn binding(self) -> AstBindingRef {
         self.binding
@@ -174,22 +211,25 @@ impl InlineCandidate {
         self.origin
     }
 
-    pub(super) fn allows_expr_with_policy(self, expr: &AstExpr, policy: InlinePolicy) -> bool {
+    pub(super) fn expr_rejection_with_policy(
+        self,
+        expr: &AstExpr,
+        policy: InlinePolicy,
+    ) -> Option<InlineExprRejection> {
         // debug local 明确表示源码中存在该 binding；把它内联掉会同时丢失名字和
         // 生命周期证据。编译器内部 for 槽已经在 Transformer 归一化时排除，因而这里
         // 可以完整保护 DebugHinted，普通 recovered alias 则继续按上下文收敛。
         match self.origin {
-            // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted local 会改变调用中 debug.getlocal 可观察的名字与作用域（regress_351）。
-            AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => false,
-            AstLocalOrigin::PhysicalRoot => {
-                // 物理根若只是紧邻普通调用的全局 callee，调用帧会在参数求值期间继续
-                // 持有同一函数值；把前置别名收回 callee 位不会缩短 GC 根，也不会改变
-                // callee-before-argument 的求值顺序。其它物理根仍必须保留原声明。
-                // 候选拒绝[SemanticBarrier:Lifetime]：除紧邻 global callee 外，弱表/`__gc` 可观察物理 root 因内联而提前失活。
-                matches!(policy, InlinePolicy::AdjacentCallResultCallee)
-                    && is_raw_global_alias_expr(expr)
+            AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
+                Some(InlineExprRejection::DebugScope)
             }
-            AstLocalOrigin::Recovered => match policy {
+            AstLocalOrigin::PhysicalRoot => {
+                // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 证明原 VM home 在最后一次
+                // 表达式读取后仍须独立存活；callee operand 只保活到调用返回，不能据 raw
+                // global 的 AST 形状推断两者终点相同（regress_419）。
+                Some(InlineExprRejection::Lifetime)
+            }
+            AstLocalOrigin::Recovered => (!match policy {
                 InlinePolicy::StableCopy => is_stable_copy_alias_expr(expr),
                 InlinePolicy::MechanicalRun => is_mechanical_run_inline_expr(expr),
                 InlinePolicy::AdjacentCallResultCallee => {
@@ -223,8 +263,13 @@ impl InlineCandidate {
                         || is_recallable_inline_expr(expr)
                 }
                 InlinePolicy::ExtendedCallChain => is_extended_call_chain_inline_expr(expr),
-            },
+            })
+            .then_some(InlineExprRejection::PolicyMismatch),
         }
+    }
+
+    pub(super) fn allows_expr_with_policy(self, expr: &AstExpr, policy: InlinePolicy) -> bool {
+        self.expr_rejection_with_policy(expr, policy).is_none()
     }
 }
 
@@ -267,16 +312,8 @@ fn inline_candidate_from_local_decl(
     let [value] = local_decl.values.as_slice() else {
         return None;
     };
-    match binding.attr {
-        AstLocalAttr::None => {}
-        AstLocalAttr::Close => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：内联 `<close>` 会删除离开作用域时的关闭动作。
-            return None;
-        }
-        AstLocalAttr::Const => {
-            // 候选拒绝[PolicyBoundary]：`<const>` 的声明身份按源码保真策略保留；当前变换并不需要靠它阻止运行时不等价。
-            return None;
-        }
+    if !local_attr_belongs_to_inline_pipeline(binding.attr) {
+        return None;
     }
     match binding.id {
         // 候选拒绝[LayerBoundary]：Normal inline-exprs 不把原生 TempId 当作源码 local；
@@ -294,33 +331,65 @@ fn inline_candidate_from_local_decl(
     }
 }
 
-fn expr_contains_direct_call_callee_var(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::Call(call) => matches!(call.callee, AstExpr::Var(_)),
-        AstExpr::MethodCall(_) => false,
-        AstExpr::SingleValue(expr) => expr_contains_direct_call_callee_var(expr),
-        AstExpr::FieldAccess(access) => expr_contains_direct_call_callee_var(&access.base),
-        AstExpr::IndexAccess(access) => {
-            expr_contains_direct_call_callee_var(&access.base)
-                || expr_contains_direct_call_callee_var(&access.index)
+pub(in crate::ast::readability) fn local_attr_belongs_to_inline_pipeline(
+    attr: AstLocalAttr,
+) -> bool {
+    match attr {
+        AstLocalAttr::None => true,
+        AstLocalAttr::Close => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：内联 `<close>` 会删除离开作用域时的关闭动作。
+            false
         }
-        AstExpr::Unary(unary) => expr_contains_direct_call_callee_var(&unary.expr),
+        AstLocalAttr::Const => {
+            // 候选拒绝[PolicyBoundary]：`<const>` 的声明身份按源码保真策略保留；当前变换并不需要靠它阻止运行时不等价。
+            false
+        }
+    }
+}
+
+fn expr_contains_direct_call_callee_var(expr: &AstExpr, binding: Option<AstBindingRef>) -> bool {
+    match expr {
+        AstExpr::Call(call) => {
+            matches!(&call.callee, AstExpr::Var(name)
+                if binding.is_none_or(|binding| binding.matches_name_ref(name)))
+                || binding.is_some_and(|binding| {
+                    expr_contains_direct_call_callee_var(&call.callee, Some(binding))
+                        || call
+                            .args
+                            .iter()
+                            .any(|arg| expr_contains_direct_call_callee_var(arg, Some(binding)))
+                })
+        }
+        AstExpr::MethodCall(call) => binding.is_some_and(|binding| {
+            expr_contains_direct_call_callee_var(&call.receiver, Some(binding))
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_contains_direct_call_callee_var(arg, Some(binding)))
+        }),
+        AstExpr::SingleValue(expr) => expr_contains_direct_call_callee_var(expr, binding),
+        AstExpr::FieldAccess(access) => expr_contains_direct_call_callee_var(&access.base, binding),
+        AstExpr::IndexAccess(access) => {
+            expr_contains_direct_call_callee_var(&access.base, binding)
+                || expr_contains_direct_call_callee_var(&access.index, binding)
+        }
+        AstExpr::Unary(unary) => expr_contains_direct_call_callee_var(&unary.expr, binding),
         AstExpr::Binary(binary) => {
-            expr_contains_direct_call_callee_var(&binary.lhs)
-                || expr_contains_direct_call_callee_var(&binary.rhs)
+            expr_contains_direct_call_callee_var(&binary.lhs, binding)
+                || expr_contains_direct_call_callee_var(&binary.rhs, binding)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            expr_contains_direct_call_callee_var(&logical.lhs)
-                || expr_contains_direct_call_callee_var(&logical.rhs)
+            expr_contains_direct_call_callee_var(&logical.lhs, binding)
+                || expr_contains_direct_call_callee_var(&logical.rhs, binding)
         }
         AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
-            AstTableField::Array(value) => expr_contains_direct_call_callee_var(value),
+            AstTableField::Array(value) => expr_contains_direct_call_callee_var(value, binding),
             AstTableField::Record(record) => {
                 let key_has_call = match &record.key {
                     AstTableKey::Name(_) => false,
-                    AstTableKey::Expr(key) => expr_contains_direct_call_callee_var(key),
+                    AstTableKey::Expr(key) => expr_contains_direct_call_callee_var(key, binding),
                 };
-                key_has_call || expr_contains_direct_call_callee_var(&record.value)
+                key_has_call || expr_contains_direct_call_callee_var(&record.value, binding)
             }
         }),
         AstExpr::FunctionExpr(_)

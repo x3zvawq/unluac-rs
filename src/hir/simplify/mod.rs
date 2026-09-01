@@ -22,6 +22,7 @@ mod local_shapes;
 mod locals;
 mod logical_simplify;
 mod mention;
+mod repeat_root_lifetimes;
 mod residuals;
 mod root_lifetimes;
 mod table_constructors;
@@ -116,8 +117,24 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "boolean-shells",
         phase: PassPhase::Normal,
-        depends_on: &[BooleanPattern, DecisionShape, LabelGoto],
-        invalidates: &[BooleanPattern, TempChain],
+        // Local promotion and handoff rewrites change source identity, physical-home provenance,
+        // capture visibility, and the adjacent declaration shape consumed by this pass.
+        depends_on: &[
+            BooleanPattern,
+            DecisionShape,
+            LabelGoto,
+            TempChain,
+            LocalBinding,
+            ClosureCapture,
+        ],
+        invalidates: &[
+            BooleanPattern,
+            LogicalExpr,
+            TempChain,
+            LocalBinding,
+            BlockStructure,
+            ClosureCapture,
+        ],
     },
     PassDescriptor {
         name: "logical-simplify",
@@ -328,6 +345,10 @@ pub(super) fn simplify_hir(
         });
     }
 
+    timings.record("repeat-root-lifetimes", || {
+        repeat_root_lifetimes::mark_repeat_trailing_condition_roots(module, promotion_facts, safety)
+    });
+
     let residuals = residuals::collect_hir_exit_residuals(module);
     if residuals.has_soft_residuals() && generate_mode != GenerateMode::Permissive {
         residuals::emit_hir_warning(format!(
@@ -508,6 +529,27 @@ mod tests {
             assert!(
                 descriptor.invalidates.contains(&shape),
                 "materialized shape {shape:?} must wake its Normal consumers"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_shells_rechecks_local_binding_changes_and_wakes_shape_consumers() {
+        let descriptor = PASS_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.name == "boolean-shells")
+            .expect("boolean-shells descriptor must exist");
+
+        for input in [TempChain, LocalBinding, ClosureCapture] {
+            assert!(
+                descriptor.depends_on.contains(&input),
+                "boolean shell proof must recheck {input:?} changes"
+            );
+        }
+        for shape in [LogicalExpr, LocalBinding, BlockStructure, ClosureCapture] {
+            assert!(
+                descriptor.invalidates.contains(&shape),
+                "boolean shell rewrite must wake {shape:?} consumers"
             );
         }
     }

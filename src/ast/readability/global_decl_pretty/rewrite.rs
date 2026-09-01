@@ -12,7 +12,6 @@ use super::collective::try_wrap_missing_collective_suffix;
 use super::facts::{BlockFacts, MissingGlobals, VisibleGlobals};
 use super::insert::insert_missing_global_decls;
 use super::merge::merge_seed_global_runs;
-use crate::ast::DecompileDialect;
 use crate::ast::common::{AstBlock, AstModule};
 
 pub(in crate::ast::readability) fn apply(
@@ -20,19 +19,15 @@ pub(in crate::ast::readability) fn apply(
     context: ReadabilityContext,
 ) -> bool {
     if !context.target.caps.global_decl {
-        // 分析停用[TargetConstraint]：目标方言没有 `global` 声明语法，整个 pass 不得生成不可编译节点。
+        // 分析停用[TargetConstraint]：只有 Lua 5.5 语法接受 `global`；Lua 5.1--5.4、LuaJIT 与 Luau 的 AST build 也不会产出本 pass 的声明候选。
         return false;
     }
 
-    let mut pass = GlobalDeclPrettyPass {
-        infer_missing: context.target.version != DecompileDialect::Lua55,
-    };
+    let mut pass = GlobalDeclPrettyPass;
     rewrite_module_scoped(module, &VisibleGlobals::default(), &mut pass)
 }
 
-struct GlobalDeclPrettyPass {
-    infer_missing: bool,
-}
+struct GlobalDeclPrettyPass;
 
 impl ScopedAstRewritePass for GlobalDeclPrettyPass {
     type Scope = VisibleGlobals;
@@ -40,10 +35,10 @@ impl ScopedAstRewritePass for GlobalDeclPrettyPass {
     fn enter_block(
         &mut self,
         block: &mut AstBlock,
-        kind: BlockKind,
+        _kind: BlockKind,
         outer_declared: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        self.enter_scoped_block(block, kind, outer_declared, None, true)
+        self.enter_scoped_block(block, outer_declared, None)
     }
 
     fn enter_repeat_body(
@@ -52,13 +47,7 @@ impl ScopedAstRewritePass for GlobalDeclPrettyPass {
         condition: &crate::ast::common::AstExpr,
         outer_declared: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        self.enter_scoped_block(
-            block,
-            BlockKind::Regular,
-            outer_declared,
-            Some(condition),
-            false,
-        )
+        self.enter_scoped_block(block, outer_declared, Some(condition))
     }
 
     fn scope_for_stmt_children(
@@ -86,34 +75,27 @@ impl GlobalDeclPrettyPass {
     fn enter_scoped_block(
         &mut self,
         block: &mut AstBlock,
-        kind: BlockKind,
         outer_declared: &VisibleGlobals,
         trailing_expr: Option<&crate::ast::common::AstExpr>,
-        allow_collective_suffix: bool,
     ) -> (bool, VisibleGlobals) {
         // AST build 只负责把字节码里显式存在的 `global ... = ...` 降回合法语法；
         // 这里仅合并 seed run，并在“当前作用域已经有显式 global 证据”的情况下再补
         // missing global。Lua 5.5 默认 `global *`，完全没有显式证据时不能凭观测补声明；
-        // repeat condition 与 body 共用事实，但不能用 do 包裹 body suffix，否则会切断
-        // condition 对 body local 的可见性（regress_424）。
+        // repeat condition 与 body 共用事实；collective owner 会按 condition 实际引用的
+        // body local 精确判断 suffix 能否包进 do，而不是停用整个 repeat 候选集。
         let mut changed = merge_seed_global_runs(block);
         let facts = trailing_expr.map_or_else(
             || BlockFacts::collect(block),
             |condition| BlockFacts::collect_repeat(block, condition),
         );
-        let mut missing = if self.infer_missing
-            || facts.has_explicit_globals()
-            || outer_declared.has_explicit_gate()
-        {
+        let mut missing = if facts.has_explicit_globals() || outer_declared.has_explicit_gate() {
             facts.infer_missing(outer_declared)
         } else {
             MissingGlobals::default()
         };
         if !missing.is_empty()
-            && !self.infer_missing
             && !facts.has_explicit_globals()
-            && allow_collective_suffix
-            && try_wrap_missing_collective_suffix(block, kind, &missing)
+            && try_wrap_missing_collective_suffix(block, &missing, trailing_expr)
         {
             missing = MissingGlobals::default();
             changed = true;

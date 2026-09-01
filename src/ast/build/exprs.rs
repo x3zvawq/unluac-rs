@@ -4,8 +4,10 @@
 //! 形状猜多值语义。固定 pack 尾调用只在普通列表或目标槽位会暴露额外返回值时降成
 //! `SingleValue`，open tail 则保持展开；非 target-counted 上下文若仍收到 exact tail，
 //! 说明 HIR 物化尚未完成并直接报错。
+//! closure lowering 同时是 `capture_names_by_upvalue` 的唯一 producer：它按 HIR capture
+//! 顺序保留 child UpvalueId 到父级 Param/Local/Temp/Upvalue 名字的对应，供后续精确分析。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::{
     HirAssign, HirBinaryOpKind, HirCallExpr, HirCaptureMode, HirClosureExpr, HirExpr, HirLValue,
@@ -93,8 +95,12 @@ impl<'a> AstLowerer<'a> {
             };
         let mut captured_bindings = BTreeSet::new();
         let mut captured_params = BTreeSet::new();
+        let mut capture_names_by_upvalue = BTreeMap::new();
         let mut capture_write_names = BTreeSet::new();
         for (capture_index, capture) in closure.captures.iter().enumerate() {
+            if let Some(name) = capture_name_from_hir_expr(&capture.value) {
+                capture_names_by_upvalue.insert(UpvalueId(capture_index), name);
+            }
             match &capture.value {
                 HirExpr::ParamRef(param) => {
                     captured_params.insert(*param);
@@ -120,6 +126,7 @@ impl<'a> AstLowerer<'a> {
             body,
             captured_bindings,
             captured_params,
+            capture_names_by_upvalue,
             capture_write_names,
         })
     }

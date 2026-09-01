@@ -88,7 +88,7 @@ pub(super) fn candidate_temps(
             // 写终结旧 root 时才解除该屏障。
             false
         })
-        // 候选忽略[NotApplicable]：合流后没有任何后续 touch 的 branch temp 不形成跨语句
+        // 合流后没有任何后续 touch 的 branch temp 不形成跨语句
         // 源码 binding；dead-temps 会独立审计其中可删除的写，其余 effect/root 写仍保留原形。
         .filter(|temp| temp_touches.touches_after(stmt_index + 1, *temp))
         .collect()

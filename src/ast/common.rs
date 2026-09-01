@@ -8,7 +8,7 @@
 //! 的 provenance。这样后续 pass 在做 sugar 时可以依赖前层已经确认过的结构事实，
 //! 而不是回头重新猜测。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LuaString;
 use crate::decompile::DecompileDialect;
@@ -179,6 +179,11 @@ pub struct AstFunctionExpr {
     pub captured_bindings: BTreeSet<AstBindingRef>,
     /// 同上，但记录被闭包捕获的当前函数参数。
     pub captured_params: BTreeSet<ParamId>,
+    /// child `UpvalueId` 到创建闭包时父级名字的精确对应。
+    ///
+    /// `captured_bindings` 只回答集合成员关系；需要检查闭包内部某个 upvalue 的具体
+    /// escape/write 时必须使用这份映射，不能把一次访问扩大成所有 capture。
+    pub capture_names_by_upvalue: BTreeMap<UpvalueId, AstNameRef>,
     /// 当前闭包或其后代可能通过 by-reference capture 写入的父级名字。
     ///
     /// 这是 `captured_bindings` / `captured_params` 的写入子集；只读或 by-value capture
@@ -464,7 +469,7 @@ pub enum AstLocalAttr {
 pub enum AstLocalOrigin {
     Recovered,
     DebugHinted,
-    /// HIR proved that this recovered declaration keeps a physical VM root alive.
+    /// HIR proved a physical VM-root lifetime that ordinary AST uses do not express.
     PhysicalRoot,
     /// The source debug identity and the physical VM root are independently observable.
     DebugHintedPhysicalRoot,

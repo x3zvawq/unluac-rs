@@ -29,7 +29,6 @@ pub(super) fn inline_owned_branch_conditions(
     block: &mut HirBlock,
     candidates: &BTreeSet<LocalId>,
     outer_bindings: &dyn BindingProtection,
-    captured_bindings: &BTreeSet<CarryBinding>,
     identity_facts: &HandoffIdentityFacts,
 ) -> bool {
     let mut eligible = candidates
@@ -37,15 +36,15 @@ pub(super) fn inline_owned_branch_conditions(
         .copied()
         .filter(|local| {
             let binding = CarryBinding::Local(*local);
-            !outer_bindings.contains(&binding)
-                && !captured_bindings.contains(&binding)
-                && !identity_facts.contains(*local)
+            !outer_bindings.contains(&binding) && !identity_facts.contains(*local)
         })
         .collect::<BTreeSet<_>>();
-    // 候选拒绝[SemanticBarrier:Capture]：outer/captured condition local 可能被分支外或 closure 观察，不能删除 producer identity。
+    // 候选拒绝[SemanticBarrier:Scope]：outer condition local 可能被分支外观察，不能删除 producer identity。
     // 候选拒绝[PolicyBoundary]：debug condition local 是项目选择保留的源码身份。
     // 候选拒绝[SemanticBarrier:Scope]：for condition local 每轮重建且只在 loop body
     // 可见；删除 producer 会把 per-iteration binder 改成跨轮值。
+    // 所有非 producer/相邻 if-cond mention（包括 closure capture）都会在下面的 ownership
+    // scan 中逐点拒绝，不需要 proto-wide capture blanket。
     // 候选拒绝[SemanticBarrier:Lifetime]：内联后删除 physical-root condition producer 会移除其 VM root declaration；lua54_01_close#17 用 __gc + collectgarbage 观察同槽清空前失去 root 的对象提前析构。
     if eligible.is_empty() {
         return false;

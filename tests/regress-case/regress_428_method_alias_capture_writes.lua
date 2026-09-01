@@ -1,6 +1,7 @@
 -- regress_428_method_alias_capture_writes: read-only captures do not block method sugar, writable captures keep the old receiver root
 -- unluac: expect-contains [[:readonly_each() do]]
 -- unluac: expect-not-contains [[:writable_each() do]]
+-- unluac: expect-not-contains [[function p8_0.field]]
 
 local methods = {}
 
@@ -61,5 +62,22 @@ local readonly = collect_readonly(new_receiver())
 local writable = collect_writable(new_receiver())
 assert(readonly == "10,20", readonly)
 assert(writable == "10,20", writable)
+
+local forwarded_replacement = {}
+local function install_forwarded(target)
+    local function replace()
+        target = forwarded_replacement
+    end
+
+    local forwarded = function()
+        return replace
+    end
+    target.field = forwarded
+    return target
+end
+
+local forwarded_target = {}
+assert(install_forwarded(forwarded_target) == forwarded_target)
+assert(type(forwarded_target.field()) == "function")
 
 print("regress_428_method_alias_capture_writes", readonly, writable)

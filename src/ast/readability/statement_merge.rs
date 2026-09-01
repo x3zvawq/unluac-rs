@@ -8,6 +8,7 @@
 //! - `local a; a = f()` 会合成 `local a = f()`
 //! - `local a = x; local b = y` 在两者确实属于同一组声明且后续使用形状允许时，
 //!   会合成 `local a, b = x, y`
+//! - 单次使用的独立 local 会留给 `inline-exprs`，不会先被并入后层无法拆开的 multi-local
 //! - 提前 hoist 出来的 `local t0; if cond then t0 = x end` 会尽量把 `t0` 下沉回
 //!   真正使用它的分支/循环体里
 //! - 如果同一条 hoisted 声明里前面的 carried binding 还要跨分支后缀继续活着，
@@ -213,6 +214,13 @@ fn merge_adjacent_single_value_local_decls(
             index += 1;
             continue;
         }
+        if binding_is_owned_by_inline_exprs(&use_index, index + 1, binding) {
+            // 候选拒绝[LayerBoundary]：单次-use 的独立 local 保持为 inline-exprs
+            // candidate；若先并入 multi-local，后层将无法再消费该 binding。
+            new_stmts.push(stmt);
+            index += 1;
+            continue;
+        }
 
         let mut bindings = vec![binding.clone()];
         let mut values = vec![value.clone()];
@@ -231,6 +239,11 @@ fn merge_adjacent_single_value_local_decls(
             // 源码声明的机械拆分重新压回去，而不是把有阶段语义的复杂 local 都并成一行。
             if !is_mergeable_adjacent_local_value(next_value) {
                 // 候选拒绝[PolicyBoundary]：复杂 RHS 受展示预算限制。
+                break;
+            }
+            if binding_is_owned_by_inline_exprs(&use_index, lookahead + 1, next_binding) {
+                // 候选拒绝[LayerBoundary]：单次-use 声明是当前连续 merge run 的分段点；
+                // 已形成的前缀仍可合并，该声明及其后缀交给后续扫描与 inline-exprs。
                 break;
             }
             if bindings
@@ -265,22 +278,6 @@ fn merge_adjacent_single_value_local_decls(
             lookahead += 1;
         }
 
-        // 只把多次使用和零显式 use 但仍需保留的 binding 纳入合并组；单次使用的
-        // binding 留给 inline_exprs 去内联。否则 `local a = x; local b = t.f;
-        // local c = T.K` 中 b/c 只用一次，
-        // 却因为 a 多次使用而被一起合并成 multi-local，导致 inline_exprs 无法识别。
-        // 为了不破坏声明顺序，从连续序列尾部剥离单次使用的 binding。
-        while bindings.len() >= 2
-            && use_index.count_uses_in_suffix(lookahead, bindings.last().unwrap().id) == 1
-        {
-            // 候选拒绝[LayerBoundary]：尾部单次-use binding 留给 inline-exprs 消费；这是
-            // 精确 owner 分工而非合并会不等价的证明。零 use 若仍存在，说明 cleanup 已按
-            // identity/lifetime 语义保留，本 pass 仍应把它纳入安全的相邻声明合并。
-            bindings.pop();
-            values.pop();
-            lookahead -= 1;
-        }
-
         if bindings.len() >= 2
             && bindings
                 .iter()
@@ -303,6 +300,15 @@ fn merge_adjacent_single_value_local_decls(
 
     block.stmts = new_stmts;
     changed
+}
+
+fn binding_is_owned_by_inline_exprs(
+    use_index: &BindingUseIndex,
+    suffix_start: usize,
+    binding: &AstLocalBinding,
+) -> bool {
+    super::inline_exprs::local_attr_belongs_to_inline_pipeline(binding.attr)
+        && use_index.count_uses_in_suffix(suffix_start, binding.id) == 1
 }
 
 fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&AstExpr>) -> bool {
@@ -935,7 +941,7 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
         .iter()
         .any(|binding| binding.attr != AstLocalAttr::None)
     {
-        // 候选忽略[NotApplicable]：`<const>`/`<close>` local 在目标 Lua 中不可在声明后
+        // `<const>`/`<close>` local 在目标 Lua 中不可在声明后
         // 普通赋值；该异常 AST pair 不属于 initializer merge 候选。
         return None;
     }
@@ -946,6 +952,16 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     {
         // 候选拒绝[SemanticBarrier:DebugScope]：regress_342 中条件调用通过 `debug.getlocal`
         // 观察空声明；合并到 initializer 会把 debug local 的作用域起点后移到调用之后。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.origin.is_physical_root())
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：空 PhysicalRoot declaration 会先用 nil
+        // 清空复用的 VM home；合并成 initializer 会把清空推迟到 RHS 求值之后，
+        // RHS 内的 GC/弱表观察可以看到旧对象继续存活（regress_435）。
         return None;
     }
     if local_decl.bindings.len() != assign.targets.len() || assign.values.is_empty() {
@@ -1282,7 +1298,7 @@ impl AstVisitor for GotoTargetCollector {
 mod tests {
     use super::*;
     use crate::ast::common::{
-        AstAssign, AstGlobalName, AstGoto, AstIf, AstLabel, AstLocalOrigin, AstNameRef,
+        AstAssign, AstCallExpr, AstGlobalName, AstGoto, AstIf, AstLabel, AstLocalOrigin, AstNameRef,
     };
     use crate::hir::{LocalId, TempId};
 
@@ -1446,6 +1462,24 @@ mod tests {
             panic!("recovered hoisted temp should sink into its assignment");
         };
         assert_eq!(decl.values, vec![AstExpr::Integer(1)]);
+    }
+
+    #[test]
+    fn empty_physical_root_decl_does_not_merge_with_eventful_assignment() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let declaration = empty_local(0, AstLocalOrigin::PhysicalRoot);
+        let assignment = AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![AstLValue::Name(binding.to_name_ref())],
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                    text: "root_is_dead".to_owned(),
+                })),
+                args: Vec::new(),
+                method_name: None,
+            }))],
+        }));
+
+        assert!(try_merge_local_decl_with_assign(&declaration, &assignment).is_none());
     }
 
     #[test]

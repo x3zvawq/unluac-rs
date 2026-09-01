@@ -10,9 +10,9 @@
 //! 先证明 seed 在后续不再可观察、temp 不被外层作用域消费，并且写回形状可证明。
 //! captured local 也不能作为纯 alias handoff 的来源：闭包调用可能在后缀没有显式提及
 //! 该 local 时写回它，跨过这类调用消除快照会改变后续读值。
-//! 所有 owner 还共享 proto 级 source/capture/resource 身份门：debug、for、physical-root、
-//! direct capture/TBC binding 与其 raw home may-alias 都不得成为改写两端，避免先改坏
-//! source identity、closure cell 或 root/close 生命周期再靠 provenance 兜底。
+//! 所有 owner 还共享 proto 级 source/resource 身份门：debug、for、physical-root、
+//! reference capture/TBC binding 与其 raw home may-alias 都不得成为改写两端。By-value
+//! capture 是创建点快照，由具体 transaction 的 reaching relation 验证其读取值。
 //! 唯一例外是 proven internal loop-carrier temp mirror：它先在 `prune.rs` 里被要求满足
 //! no-read、non-debug、loop-carrier owner、same-exact-home write audit 之后，才会在冻结
 //! identity 前删除；源码作者可见的 for binding 身份本身仍继续受这里的保护。
@@ -34,17 +34,20 @@ mod region_results;
 mod repeat_snapshots;
 mod seeds;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirBlock, HirProto, HirStmt, LocalId};
+use crate::hir::common::{HirBlock, HirLabelId, HirProto, HirStmt, LocalId};
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
+use super::label_refs::count_label_references;
 use super::temp_touch::{RefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt};
 use super::walk::for_each_nested_block_mut;
 
 use self::adjacent::{try_collapse_adjacent_local_seed_handoff, try_collapse_guarded_local_update};
-use self::binding::{BindingProtection, bindings_may_share_raw_home_slot, carry_binding_from_expr};
+use self::binding::{
+    BindingProtection, binding_home_slot, bindings_may_share_raw_home_slot, carry_binding_from_expr,
+};
 pub(super) use self::binding::{CarryBinding, single_binding_copy};
 use self::boundary::LabelJumpIndex;
 use self::handoffs::{HandoffAction, try_collapse_handoff_at};
@@ -79,6 +82,10 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
     // Both structural rewrites above can remove a materialization that would otherwise be
     // recorded as an active identity.  Freeze protection facts only after those rewrites so the
     // handoff owner never reasons over a stale binding set.
+    let control_facts = RegionControlFacts {
+        label_refs: count_label_references(&proto.body.stmts),
+        expr_safety,
+    };
     let identity_facts = HandoffIdentityFacts::new(proto);
     branch_copies_changed
         | snapshots_changed
@@ -88,6 +95,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
             &BTreeSet::new(),
             promotion_facts,
             &identity_facts,
+            &control_facts,
             &BTreeSet::new(),
             expr_safety,
         )
@@ -100,6 +108,7 @@ fn collapse_handoffs_recursive(
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
     inherited_locals: &BTreeSet<LocalId>,
     expr_safety: HirExprSafety,
 ) -> bool {
@@ -142,6 +151,7 @@ fn collapse_handoffs_recursive(
                 &child_outer,
                 promotion_facts,
                 identity_facts,
+                control_facts,
                 &child_locals,
                 expr_safety,
             );
@@ -170,6 +180,7 @@ fn collapse_handoffs_recursive(
         outer_bindings,
         promotion_facts,
         identity_facts,
+        control_facts,
         inherited_locals,
         expr_safety,
     );
@@ -182,6 +193,7 @@ fn collapse_block_handoffs(
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
     inherited_locals: &BTreeSet<LocalId>,
     expr_safety: HirExprSafety,
 ) -> bool {
@@ -190,33 +202,33 @@ fn collapse_block_handoffs(
         outer_bindings,
         promotion_facts,
         identity_facts,
+        control_facts,
         inherited_locals,
     );
-    let mut captured_bindings = collect_captured_bindings(&block.stmts);
     changed |= collapse_written_back_if_results(
         block,
         outer_bindings,
-        &captured_bindings,
         promotion_facts,
         identity_facts,
+        control_facts,
     );
-    captured_bindings = collect_captured_bindings(&block.stmts);
     changed |= collapse_inferred_if_result_chains(
         block,
         outer_bindings,
         promotion_facts,
-        &captured_bindings,
         identity_facts,
+        control_facts,
     );
     let mut index = 0;
     let mut stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
+    let mut captured_bindings;
 
     loop {
         let action = {
             let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
             let label_jumps = LabelJumpIndex::new(&block.stmts);
             captured_bindings = collect_captured_bindings(&block.stmts);
-            let region_results = RegionResultIndex::new(&block.stmts, &captured_bindings);
+            let region_results = RegionResultIndex::new(&block.stmts);
             let mut action = None;
             while index < block.stmts.len() {
                 if try_collapse_region_result_handoff(
@@ -226,6 +238,7 @@ fn collapse_block_handoffs(
                     promotion_facts,
                     &region_results,
                     identity_facts,
+                    control_facts,
                 ) {
                     action = Some(HandoffAction::RetrySameIndex);
                     break;
@@ -286,11 +299,17 @@ fn collapse_block_handoffs(
     changed
 }
 
+struct RegionControlFacts {
+    // Region-result candidates are slices of nested owners.  Proto-wide reference counts let
+    // LexicalCfg distinguish an internal label cycle from an entry originating outside the slice.
+    label_refs: BTreeMap<HirLabelId, usize>,
+    expr_safety: HirExprSafety,
+}
+
 struct HandoffIdentityFacts {
     debug: BTreeSet<LocalId>,
     for_bindings: BTreeSet<LocalId>,
     physical_roots: BTreeSet<LocalId>,
-    captured: BTreeSet<CarryBinding>,
     reference_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
 }
@@ -310,7 +329,6 @@ impl HandoffIdentityFacts {
             debug,
             for_bindings: collector.for_bindings,
             physical_roots: proto.physical_root_locals.clone(),
-            captured: collector.captured,
             reference_captured: collector.reference_captured,
             to_be_closed: collector.to_be_closed,
         }
@@ -328,21 +346,30 @@ impl HandoffIdentityFacts {
         target: CarryBinding,
         promotion_facts: &ProtoPromotionFacts,
     ) -> bool {
+        let shares_exact_home = binding_home_slot(source, promotion_facts)
+            .zip(binding_home_slot(target, promotion_facts))
+            .is_some_and(|(source, target)| source == target);
+        let endpoint_is_reference_captured =
+            self.reference_captured.contains(&source) || self.reference_captured.contains(&target);
         // 候选拒绝[PolicyBoundary]：debug binding 是项目选择保留的源码身份。
         // 候选拒绝[SemanticBarrier:Scope]：for binding 每轮重建且只在 loop body 可见；
         // 与外层/跨轮 binding 合并会改变迭代 refresh 和词法作用域。
         // 候选拒绝[SemanticBarrier:Lifetime]：把 physical-root result 合并到 state 会删除其 VM root declaration；lua54_01_close#17 用 __gc + collectgarbage 观察同槽清空前的对象若失去该 root 会提前析构。
-        // 候选拒绝[SemanticBarrier:Capture]：capture 任一端或 raw-home may-alias reference capture 时，closure 可区分合并前的 cell。
+        // 候选拒绝[SemanticBarrier:Capture]：reference-captured endpoint 只有在两端缺少
+        // 同一 `(slot, close epoch)` 证明时才是不同 cell；同一 exact home 指向同一 VM
+        // upvalue cell。其它 may-alias reference capture 仍需保守保护，因为它不在本次
+        // rewrite map 内。By-value capture 只是创建点快照，其值等价性由 transaction 的
+        // reaching relation 验证。
         // 候选拒绝[SemanticBarrier:Lifetime]：TBC 任一端或 raw-home may-alias resource binding 时，合并会改变 close/root epoch。
         !source.local().is_some_and(|local| self.contains(local))
             && !target.local().is_some_and(|local| self.contains(local))
-            && !self.captured.contains(&source)
-            && !self.captured.contains(&target)
+            && (!endpoint_is_reference_captured || shares_exact_home)
             && !self.to_be_closed.contains(&source)
             && !self.to_be_closed.contains(&target)
             && self
                 .reference_captured
                 .iter()
+                .filter(|binding| **binding != source && **binding != target)
                 .chain(&self.to_be_closed)
                 .all(|binding| {
                     !bindings_may_share_raw_home_slot(source, *binding, promotion_facts)
@@ -354,7 +381,6 @@ impl HandoffIdentityFacts {
 #[derive(Default)]
 struct HandoffIdentityCollector {
     for_bindings: BTreeSet<LocalId>,
-    captured: BTreeSet<CarryBinding>,
     reference_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
 }
@@ -383,12 +409,6 @@ impl HirVisitor for HandoffIdentityCollector {
             return;
         };
         for capture in &closure.captures {
-            visit_expr(
-                &capture.value,
-                &mut CapturedValueBindingCollector {
-                    bindings: &mut self.captured,
-                },
-            );
             if capture.mode == crate::hir::common::HirCaptureMode::ByReference {
                 visit_expr(
                     &capture.value,

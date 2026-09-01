@@ -33,15 +33,15 @@ pub struct HirProto {
     pub local_debug_scopes: Vec<Option<usize>>,
     /// Structure 已接受的源码 debug local 区间，按原 debug scope identity 索引。
     pub debug_scopes: Vec<Option<HirDebugScope>>,
-    /// Temps retained solely because their physical slot keeps an aliased object rooted.
+    /// Temps with a HIR-proven physical GC-root lifetime not represented by ordinary uses.
     ///
     /// These have not been promoted to HIR locals, so AST build must transfer the root identity
     /// when it materializes the temp as a source local.
     pub physical_root_temps: BTreeSet<TempId>,
-    /// Locals materialized solely to preserve a physical GC root proven by HIR.
+    /// Locals with a HIR-proven physical GC-root lifetime not represented by ordinary uses.
     ///
-    /// AST cleanup must not turn these declarations back into bare calls: the VM stack slot
-    /// can keep the call result alive even when no HIR expression reads it.
+    /// AST cleanup must not remove or shorten these declarations: the VM stack slot can keep a
+    /// call result, escaped allocation, or closure-observable value alive after its last HIR use.
     pub physical_root_locals: BTreeSet<LocalId>,
     pub upvalues: Vec<UpvalueId>,
     /// Upvalues that this proto or one of its descendant closures may write.

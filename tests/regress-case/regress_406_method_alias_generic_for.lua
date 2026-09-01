@@ -90,6 +90,24 @@ end
 local loop_state = { collected = false }
 preserve_loop_receiver(make_ephemeral_owner(loop_state), loop_state)
 
+local tail_method_weak_values = setmetatable({}, { __mode = "v" })
+local function preserve_tail_method_loop_receiver(source)
+    tail_method_weak_values.key = source
+    local receiver = source
+    for _ in receiver:each() do
+        source = nil
+        collectgarbage("collect")
+        collectgarbage("collect")
+        assert(tail_method_weak_values.key ~= nil, "tail method loop receiver left the weak table early")
+    end
+end
+
+local function launch_tail_method_loop(state)
+    return preserve_tail_method_loop_receiver(make_ephemeral_owner(state))
+end
+
+launch_tail_method_loop({ collected = false })
+
 print(
     "regress_406_method_alias_generic_for",
     result,

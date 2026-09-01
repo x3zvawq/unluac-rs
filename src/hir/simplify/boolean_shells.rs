@@ -22,15 +22,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
-    HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId, ParamId, TempId,
+    HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use super::expr_facts::expr_is_boolean_valued;
+use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::local_shapes::empty_single_local_decl_binding;
-use super::mention::{expr_mentions_local, stmts_reference_captured_bindings};
-use super::visit::{HirVisitor, visit_proto, visit_stmts};
+use super::mention::expr_mentions_local;
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn remove_boolean_materialization_shells_in_proto(
@@ -41,257 +40,36 @@ pub(super) fn remove_boolean_materialization_shells_in_proto(
     let facts = BooleanShellFacts::collect(proto, promotion_facts);
     let old_value_plan = old_values::DeadShellPlan::collect(proto, &facts, promotion_facts, safety);
     let old_value_changed = old_value_plan.apply(&mut proto.body);
-    let mut pass = BooleanShellPass {
-        facts: &facts,
-        safety,
-    };
+    let mut pass = BooleanShellPass { facts: &facts };
     old_value_changed | rewrite_proto(proto, &mut pass)
 }
 
 struct BooleanShellPass<'a> {
     facts: &'a BooleanShellFacts,
-    safety: HirExprSafety,
 }
 
 impl HirRewritePass for BooleanShellPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        let dead_changed =
-            remove_dead_materialization_shells_from_block(block, self.facts, self.safety);
-        let collapse_changed =
-            collapse_live_boolean_materialization_shells_in_block(block, self.facts);
-        dead_changed || collapse_changed
-    }
-}
-
-#[derive(Default)]
-struct BindingUseCounts {
-    temps: BTreeMap<TempId, usize>,
-    locals: BTreeMap<LocalId, usize>,
-}
-
-#[derive(Default)]
-struct VisibleHomeUseCounts {
-    definite_counts: BTreeMap<HomeSlotKey, usize>,
-    possible_counts: BTreeMap<HomeSlotKey, usize>,
-}
-
-impl VisibleHomeUseCounts {
-    fn collect_from_proto(
-        proto: &HirProto,
-        param_homes: &BTreeMap<ParamId, HomeSlotKey>,
-        local_homes: &BTreeMap<LocalId, HomeSlotKey>,
-        possible_param_homes: &BTreeMap<ParamId, BTreeSet<HomeSlotKey>>,
-        possible_local_homes: &BTreeMap<LocalId, BTreeSet<HomeSlotKey>>,
-    ) -> Self {
-        let mut collector = VisibleHomeUseCollector {
-            uses: Self {
-                definite_counts: BTreeMap::new(),
-                possible_counts: BTreeMap::new(),
-            },
-            param_homes,
-            local_homes,
-            possible_param_homes,
-            possible_local_homes,
-        };
-        visit_proto(proto, &mut collector);
-        collector.uses
-    }
-
-    fn collect_from_stmt(
-        stmt: &HirStmt,
-        param_homes: &BTreeMap<ParamId, HomeSlotKey>,
-        local_homes: &BTreeMap<LocalId, HomeSlotKey>,
-        possible_param_homes: &BTreeMap<ParamId, BTreeSet<HomeSlotKey>>,
-        possible_local_homes: &BTreeMap<LocalId, BTreeSet<HomeSlotKey>>,
-    ) -> Self {
-        let mut collector = VisibleHomeUseCollector {
-            uses: Self {
-                definite_counts: BTreeMap::new(),
-                possible_counts: BTreeMap::new(),
-            },
-            param_homes,
-            local_homes,
-            possible_param_homes,
-            possible_local_homes,
-        };
-        visit_stmts(std::slice::from_ref(stmt), &mut collector);
-        collector.uses
-    }
-}
-
-struct VisibleHomeUseCollector<'a> {
-    uses: VisibleHomeUseCounts,
-    param_homes: &'a BTreeMap<ParamId, HomeSlotKey>,
-    local_homes: &'a BTreeMap<LocalId, HomeSlotKey>,
-    possible_param_homes: &'a BTreeMap<ParamId, BTreeSet<HomeSlotKey>>,
-    possible_local_homes: &'a BTreeMap<LocalId, BTreeSet<HomeSlotKey>>,
-}
-
-#[derive(Default)]
-struct ReferenceCapturedHomes {
-    definite: BTreeSet<HomeSlotKey>,
-    possible: BTreeSet<HomeSlotKey>,
-}
-
-struct ToBeClosedHomes<'a> {
-    definite: BTreeSet<HomeSlotKey>,
-    unresolved_slots: BTreeSet<usize>,
-    promotion_facts: &'a ProtoPromotionFacts,
-}
-
-impl HirVisitor for ToBeClosedHomes<'_> {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        if let HirStmt::ToBeClosed(to_be_closed) = stmt {
-            let (trusted, possible) = match &to_be_closed.value {
-                HirExpr::ParamRef(param) => (
-                    self.promotion_facts.trusted_param_home_slot(*param),
-                    self.promotion_facts.possible_param_home_slots(*param),
-                ),
-                HirExpr::LocalRef(local) => (
-                    self.promotion_facts.trusted_local_home_slot(*local),
-                    self.promotion_facts.possible_local_home_slots(*local),
-                ),
-                HirExpr::TempRef(temp) => (
-                    self.promotion_facts.trusted_temp_home_slot(*temp),
-                    self.promotion_facts.possible_temp_home_slots(*temp),
-                ),
-                _ => (None, None),
-            };
-            let possible_home = possible.and_then(|homes| {
-                let mut matching = homes
-                    .into_iter()
-                    .filter(|home| home.slot() == to_be_closed.reg_index);
-                let home = matching.next()?;
-                matching.next().is_none().then_some(home)
-            });
-            if let Some(home) = trusted
-                .filter(|home| home.slot() == to_be_closed.reg_index)
-                .or(possible_home)
-            {
-                self.definite.insert(home);
-            } else {
-                self.unresolved_slots.insert(to_be_closed.reg_index);
-            }
-        }
-    }
-}
-
-impl HirVisitor for VisibleHomeUseCollector<'_> {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        let (definite, possible) = match expr {
-            HirExpr::ParamRef(param) => (
-                self.param_homes.get(param).copied(),
-                self.possible_param_homes.get(param),
-            ),
-            HirExpr::LocalRef(local) => (
-                self.local_homes.get(local).copied(),
-                self.possible_local_homes.get(local),
-            ),
-            _ => return,
-        };
-        if let Some(home) = definite {
-            *self.uses.definite_counts.entry(home).or_default() += 1;
-            return;
-        }
-        let Some(homes) = possible else {
-            unreachable!("visible binding home provenance must be completed during fact collection")
-        };
-        for home in homes {
-            *self.uses.possible_counts.entry(*home).or_default() += 1;
-        }
-    }
-}
-
-impl BindingUseCounts {
-    fn collect_from_proto(proto: &HirProto) -> Self {
-        let mut counts = Self::default();
-        visit_proto(proto, &mut counts);
-        counts
-    }
-
-    fn collect_from_stmt(stmt: &HirStmt) -> Self {
-        let mut counts = Self::default();
-        visit_stmts(std::slice::from_ref(stmt), &mut counts);
-        counts
-    }
-}
-
-impl HirVisitor for BindingUseCounts {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        match expr {
-            HirExpr::TempRef(temp) => *self.temps.entry(*temp).or_default() += 1,
-            HirExpr::LocalRef(local) => *self.locals.entry(*local).or_default() += 1,
-            _ => {}
-        }
+        collapse_live_boolean_materialization_shells_in_block(block, self.facts)
     }
 }
 
 struct BooleanShellFacts {
-    uses: BindingUseCounts,
     debug_temps: BTreeSet<TempId>,
     debug_locals: BTreeSet<LocalId>,
     physical_root_locals: BTreeSet<LocalId>,
     possible_temp_homes: BTreeMap<TempId, BTreeSet<HomeSlotKey>>,
-    param_homes: BTreeMap<ParamId, HomeSlotKey>,
-    trusted_local_homes: BTreeMap<LocalId, HomeSlotKey>,
-    possible_param_homes: BTreeMap<ParamId, BTreeSet<HomeSlotKey>>,
     possible_local_homes: BTreeMap<LocalId, BTreeSet<HomeSlotKey>>,
-    visible_home_uses: VisibleHomeUseCounts,
-    reference_captured_homes: ReferenceCapturedHomes,
-    to_be_closed_homes: BTreeSet<HomeSlotKey>,
-    unresolved_to_be_closed_slots: BTreeSet<usize>,
-    reference_captured_locals: BTreeSet<LocalId>,
-    possibly_reference_captured_locals: BTreeSet<LocalId>,
+}
+
+struct DeadWriteProof<'a> {
+    live_after: &'a old_values::LiveBindingState,
+    adjacent_nil_local: Option<LocalId>,
+    old_values: &'a DeadShellOldValueFacts,
 }
 
 impl BooleanShellFacts {
     fn collect(proto: &HirProto, promotion_facts: &ProtoPromotionFacts) -> Self {
-        let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
-        let mut reference_captured_locals = BTreeSet::new();
-        let mut possibly_reference_captured_locals = BTreeSet::new();
-        for local in &proto.locals {
-            match local_reference_capture_relation(*local, &reference_captured, promotion_facts) {
-                CaptureRelation::None => {}
-                CaptureRelation::Possible => {
-                    possibly_reference_captured_locals.insert(*local);
-                }
-                CaptureRelation::Definite => {
-                    reference_captured_locals.insert(*local);
-                }
-            }
-        }
-        let param_homes = proto
-            .params
-            .iter()
-            .filter_map(|param| {
-                promotion_facts
-                    .trusted_param_home_slot(*param)
-                    .map(|home| (*param, home))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let trusted_local_homes = proto
-            .locals
-            .iter()
-            .filter_map(|local| {
-                promotion_facts
-                    .trusted_local_home_slot(*local)
-                    .map(|home| (*local, home))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let possible_param_homes = proto
-            .params
-            .iter()
-            .copied()
-            .map(|param| {
-                (
-                    param,
-                    complete_possible_home_slots(
-                        promotion_facts.possible_param_home_slots(param),
-                        promotion_facts,
-                    ),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let possible_local_homes = proto
             .locals
             .iter()
@@ -306,21 +84,7 @@ impl BooleanShellFacts {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let visible_home_uses = VisibleHomeUseCounts::collect_from_proto(
-            proto,
-            &param_homes,
-            &trusted_local_homes,
-            &possible_param_homes,
-            &possible_local_homes,
-        );
-        let mut to_be_closed_homes = ToBeClosedHomes {
-            definite: BTreeSet::new(),
-            unresolved_slots: BTreeSet::new(),
-            promotion_facts,
-        };
-        visit_proto(proto, &mut to_be_closed_homes);
         Self {
-            uses: BindingUseCounts::collect_from_proto(proto),
             debug_temps: proto
                 .temps
                 .iter()
@@ -348,19 +112,7 @@ impl BooleanShellFacts {
                     )
                 })
                 .collect(),
-            param_homes,
-            trusted_local_homes,
-            possible_param_homes,
             possible_local_homes,
-            visible_home_uses,
-            reference_captured_homes: reference_capture_home_slots(
-                &reference_captured,
-                promotion_facts,
-            ),
-            to_be_closed_homes: to_be_closed_homes.definite,
-            unresolved_to_be_closed_slots: to_be_closed_homes.unresolved_slots,
-            reference_captured_locals,
-            possibly_reference_captured_locals,
         }
     }
 
@@ -368,10 +120,7 @@ impl BooleanShellFacts {
         &self,
         target: &HirLValue,
         written_value_is_gc_inert: bool,
-        internal_uses: &BindingUseCounts,
-        internal_home_uses: &VisibleHomeUseCounts,
-        adjacent_nil_local: Option<LocalId>,
-        old_values: &DeadShellOldValueFacts,
+        proof: &DeadWriteProof<'_>,
     ) -> bool {
         match target {
             HirLValue::Temp(temp) => {
@@ -388,39 +137,11 @@ impl BooleanShellFacts {
                     .get(temp)
                     .expect("every proto temp must have a complete possible-home set");
                 for home in homes {
-                    if self.reference_captured_homes.definite.contains(home) {
-                        // 候选拒绝[SemanticBarrier:Capture]：同 home 的 ByReference closure 会观察这次布尔写；删除后它继续读取旧值。
-                        return false;
-                    }
-                    if self.reference_captured_homes.possible.contains(home) {
-                        // 候选拒绝[SemanticBarrier:Capture]：possible-home 与 ByReference capture 相交时，closure 可能观察这次布尔写；`complete_possible_capture_homes_prove_only_disjointness` 覆盖相交/异槽边界。
-                        return false;
-                    }
-                    if self.to_be_closed_homes.contains(home) {
-                        // 候选拒绝[SemanticBarrier:Lifetime]：`TBC t0; shell-write t1; Close r0` 中 t0/t1 同 home 时，Close 读取 shell 新值；删除写入会改为关闭旧 resource（`tbc_protection_is_scoped_to_exact_home_epoch`）。
-                        return false;
-                    }
-                    if self.unresolved_to_be_closed_slots.contains(&home.slot()) {
-                        // 候选拒绝[SemanticBarrier:Lifetime]：未解析 TBC 与 candidate 共用 raw slot 时可能处于同一 close epoch，删除写入会让 Close 改关旧 resource；精确异 epoch 由 `tbc_protection_is_scoped_to_exact_home_epoch` 放行。
-                        return false;
-                    }
-                    if !use_is_internal_only(
-                        &self.visible_home_uses.definite_counts,
-                        &internal_home_uses.definite_counts,
-                        *home,
-                    ) {
+                    if proof.live_after.homes.contains(home) {
                         // 候选拒绝[SemanticBarrier:ValueFlow]：shell 外仍通过同一 trusted home 的 param/local 读取布尔写；仅检查 target TempId 会漏掉该观察者。
                         return false;
                     }
-                    if !use_is_internal_only(
-                        &self.visible_home_uses.possible_counts,
-                        &internal_home_uses.possible_counts,
-                        *home,
-                    ) {
-                        // 候选拒绝[SemanticBarrier:ValueFlow]：外部读取的 possible-home 与 candidate 相交时可能观察布尔写；`overlapping_merged_local_read_keeps_the_raw_home_write` 是最小反例。
-                        return false;
-                    }
-                    match old_values.home(*home) {
+                    match proof.old_values.home(*home) {
                         OldValueClass::GcInert => {
                             // 候选接受：所有 reaching path 上该 raw home 的旧值均为 nil/primitive；布尔新值也不承载 GC root。
                         }
@@ -434,8 +155,8 @@ impl BooleanShellFacts {
                         }
                     }
                 }
-                // 候选拒绝[SemanticBarrier:ValueFlow]：shell 外仍读取或 capture 该 temp 时，删除写入会改变后续值。
-                use_is_internal_only(&self.uses.temps, &internal_uses.temps, *temp)
+                // 候选拒绝[SemanticBarrier:ValueFlow]：shell 后仍有路径读取该 temp 时，删除写入会改变后续值；CFG live-out 会排除只发生在 shell 前的读取，并合流循环回边。
+                !proof.live_after.temps.contains(temp)
             }
             HirLValue::Local(local) => {
                 if !written_value_is_gc_inert {
@@ -450,22 +171,24 @@ impl BooleanShellFacts {
                 if self.physical_root_locals.contains(local) {
                     return false;
                 }
-                if self.reference_captured_locals.contains(local) {
-                    // 候选拒绝[SemanticBarrier:Capture]：`local f=function() return x end; <boolean shell x>; return f()` 中 closure 会观察被删掉的布尔写；同 trusted home 的 reference capture 等价。
-                    return false;
+                let homes = self
+                    .possible_local_homes
+                    .get(local)
+                    .expect("every proto local must have a complete possible-home set");
+                for home in homes {
+                    if proof.live_after.homes.contains(home) {
+                        // 候选拒绝[SemanticBarrier:ValueFlow]：candidate local 的 possible-home 与后续 param/local 读取相交时，raw cell 上的布尔写仍可见；只查 LocalId 会漏掉合流后的别名。
+                        return false;
+                    }
                 }
-                if self.possibly_reference_captured_locals.contains(local) {
-                    // 候选拒绝[SemanticBarrier:Capture]：candidate local 与 ByReference capture 的 possible-home 相交时，closure 可能观察这次布尔写；相邻 nil 只证明旧值，不能消除该观察者。
-                    return false;
-                }
-                if adjacent_nil_local == Some(*local) {
+                if proof.adjacent_nil_local == Some(*local) {
                     // 候选接受：紧邻空声明已把旧值确定为 nil；域外无读取/capture，删除布尔写不会改变值流或 GC root 生命周期。
-                    return use_is_internal_only(&self.uses.locals, &internal_uses.locals, *local);
+                    return !proof.live_after.locals.contains(local);
                 }
-                match old_values.local(*local) {
+                match proof.old_values.local(*local) {
                     OldValueClass::GcInert => {
                         // 候选接受：所有 reaching path 都证明旧值为 nil/primitive；域外无读取/capture，删除布尔写不会改变值流或 GC root 生命周期。
-                        use_is_internal_only(&self.uses.locals, &internal_uses.locals, *local)
+                        !proof.live_after.locals.contains(local)
                     }
                     OldValueClass::Unknown => {
                         // 候选拒绝[SemanticBarrier:Lifetime]：未分类旧值可能是 `regress_342_boolean_shell_local_gc_lifetime` 同类可终结对象；删除覆盖写会延长其 root 生命周期。
@@ -498,13 +221,6 @@ enum BindingRelation {
     Definite,
 }
 
-#[derive(Clone, Copy)]
-enum CaptureRelation {
-    None,
-    Possible,
-    Definite,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OldValueClass {
     GcInert,
@@ -531,142 +247,6 @@ impl DeadShellOldValueFacts {
             .get(&home)
             .copied()
             .unwrap_or(OldValueClass::Unknown)
-    }
-}
-
-fn reference_capture_home_slots(
-    captured: &super::mention::ReferenceCapturedBindings,
-    facts: &ProtoPromotionFacts,
-) -> ReferenceCapturedHomes {
-    let mut homes = ReferenceCapturedHomes::default();
-    for param in &captured.params {
-        record_reference_capture_homes(
-            &mut homes,
-            facts.trusted_param_home_slot(*param),
-            complete_possible_home_slots(facts.possible_param_home_slots(*param), facts),
-        );
-    }
-    for local in &captured.locals {
-        record_reference_capture_homes(
-            &mut homes,
-            facts.trusted_local_home_slot(*local),
-            complete_possible_home_slots(facts.possible_local_home_slots(*local), facts),
-        );
-    }
-    for temp in &captured.temps {
-        record_reference_capture_homes(
-            &mut homes,
-            facts.trusted_temp_home_slot(*temp),
-            complete_possible_home_slots(facts.possible_temp_home_slots(*temp), facts),
-        );
-    }
-    homes
-}
-
-fn record_reference_capture_homes(
-    homes: &mut ReferenceCapturedHomes,
-    trusted: Option<HomeSlotKey>,
-    possible: BTreeSet<HomeSlotKey>,
-) {
-    if let Some(home) = trusted {
-        homes.definite.insert(home);
-    } else {
-        homes.possible.extend(possible);
-    }
-}
-
-fn local_reference_capture_relation(
-    local: LocalId,
-    captured: &super::mention::ReferenceCapturedBindings,
-    facts: &ProtoPromotionFacts,
-) -> CaptureRelation {
-    let candidate_home = facts.trusted_local_home_slot(local);
-    let candidate_homes =
-        complete_possible_home_slots(facts.possible_local_home_slots(local), facts);
-    let mut possible = false;
-    for captured_local in &captured.locals {
-        if *captured_local == local {
-            return CaptureRelation::Definite;
-        }
-        match capture_home_relation(
-            candidate_home,
-            &candidate_homes,
-            facts.trusted_local_home_slot(*captured_local),
-            &complete_possible_home_slots(facts.possible_local_home_slots(*captured_local), facts),
-        ) {
-            CaptureRelation::None => {}
-            CaptureRelation::Possible => possible = true,
-            CaptureRelation::Definite => return CaptureRelation::Definite,
-        }
-    }
-    for captured_param in &captured.params {
-        match capture_home_relation(
-            candidate_home,
-            &candidate_homes,
-            facts.trusted_param_home_slot(*captured_param),
-            &complete_possible_home_slots(facts.possible_param_home_slots(*captured_param), facts),
-        ) {
-            CaptureRelation::None => {}
-            CaptureRelation::Possible => possible = true,
-            CaptureRelation::Definite => return CaptureRelation::Definite,
-        }
-    }
-    for captured_temp in &captured.temps {
-        match capture_home_relation(
-            candidate_home,
-            &candidate_homes,
-            facts.trusted_temp_home_slot(*captured_temp),
-            &complete_possible_home_slots(facts.possible_temp_home_slots(*captured_temp), facts),
-        ) {
-            CaptureRelation::None => {}
-            CaptureRelation::Possible => possible = true,
-            CaptureRelation::Definite => return CaptureRelation::Definite,
-        }
-    }
-    if possible {
-        CaptureRelation::Possible
-    } else {
-        CaptureRelation::None
-    }
-}
-
-fn capture_home_relation(
-    left: Option<HomeSlotKey>,
-    left_possible: &BTreeSet<HomeSlotKey>,
-    right: Option<HomeSlotKey>,
-    right_possible: &BTreeSet<HomeSlotKey>,
-) -> CaptureRelation {
-    match (left, right) {
-        (Some(left), Some(right)) => {
-            return if left == right {
-                CaptureRelation::Definite
-            } else {
-                CaptureRelation::None
-            };
-        }
-        (Some(left), None) => {
-            return if right_possible.contains(&left) {
-                CaptureRelation::Possible
-            } else {
-                CaptureRelation::None
-            };
-        }
-        (None, Some(right)) => {
-            return if left_possible.contains(&right) {
-                CaptureRelation::Possible
-            } else {
-                CaptureRelation::None
-            };
-        }
-        (None, None) => {}
-    }
-    if left_possible.is_empty()
-        || right_possible.is_empty()
-        || left_possible.is_disjoint(right_possible)
-    {
-        CaptureRelation::None
-    } else {
-        CaptureRelation::Possible
     }
 }
 
@@ -736,85 +316,6 @@ fn home_relation(left: Option<HomeSlotKey>, right: Option<HomeSlotKey>) -> Bindi
         (Some(_), Some(_)) => BindingRelation::None,
         (None, _) | (_, None) => BindingRelation::Possible,
     }
-}
-
-fn use_is_internal_only<K: Ord + Copy>(
-    total: &BTreeMap<K, usize>,
-    internal: &BTreeMap<K, usize>,
-    binding: K,
-) -> bool {
-    total.get(&binding).copied().unwrap_or(0) == internal.get(&binding).copied().unwrap_or(0)
-}
-
-fn remove_dead_materialization_shells_from_block(
-    block: &mut HirBlock,
-    facts: &BooleanShellFacts,
-    safety: HirExprSafety,
-) -> bool {
-    let no_old_value_facts = DeadShellOldValueFacts::default();
-    let old_len = block.stmts.len();
-    let adjacent_nil_locals = block
-        .stmts
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            index
-                .checked_sub(1)
-                .and_then(|previous| block.stmts.get(previous))
-                .and_then(empty_single_local_decl_binding)
-        })
-        .collect::<Vec<_>>();
-    let mut index = 0;
-    block.stmts.retain(|stmt| {
-        let adjacent_nil_local = adjacent_nil_locals[index];
-        index += 1;
-        // 分析停用[LayerBoundary]：需要 reaching old-value 的候选只由前置 DeadShellPlan
-        // 事务提交；普通 rewrite 仅拥有相邻 nil local 与明确 home-free temp。
-        if shell_requires_old_value_plan(stmt, facts, adjacent_nil_local) {
-            return true;
-        }
-        !removable_dead_materialization_shell(
-            stmt,
-            facts,
-            adjacent_nil_local,
-            &no_old_value_facts,
-            safety,
-        )
-    });
-    block.stmts.len() != old_len
-}
-
-fn shell_requires_old_value_plan(
-    stmt: &HirStmt,
-    facts: &BooleanShellFacts,
-    adjacent_nil_local: Option<LocalId>,
-) -> bool {
-    let HirStmt::If(if_stmt) = stmt else {
-        return false;
-    };
-    let Some(else_block) = &if_stmt.else_block else {
-        return false;
-    };
-    let Some((then_target, _)) = single_fixed_assign_pattern(&if_stmt.then_block) else {
-        return false;
-    };
-    let Some((else_target, _)) = single_fixed_assign_pattern(else_block) else {
-        return false;
-    };
-
-    [then_target, else_target]
-        .into_iter()
-        .any(|target| match target {
-            HirLValue::Local(local) => adjacent_nil_local != Some(*local),
-            HirLValue::Temp(temp) => facts
-                .possible_temp_homes
-                .get(temp)
-                .is_none_or(|homes| !homes.is_empty()),
-            HirLValue::Param(_)
-            | HirLValue::Upvalue(_)
-            | HirLValue::Global(_)
-            | HirLValue::TableAccess(_) => false,
-        })
 }
 
 fn collapse_live_boolean_materialization_shells_in_block(
@@ -914,6 +415,7 @@ fn removable_dead_materialization_shell(
     facts: &BooleanShellFacts,
     adjacent_nil_local: Option<LocalId>,
     old_values: &DeadShellOldValueFacts,
+    live_after: &old_values::ShellArmLiveOut,
     safety: HirExprSafety,
 ) -> bool {
     let HirStmt::If(if_stmt) = stmt else {
@@ -928,29 +430,28 @@ fn removable_dead_materialization_shell(
     let Some((else_target, else_value)) = single_fixed_assign_pattern(else_block) else {
         return false;
     };
-    let internal_uses = BindingUseCounts::collect_from_stmt(stmt);
-    let internal_home_uses = VisibleHomeUseCounts::collect_from_stmt(
-        stmt,
-        &facts.param_homes,
-        &facts.trusted_local_homes,
-        &facts.possible_param_homes,
-        &facts.possible_local_homes,
-    );
-    if !facts.target_write_is_unobservable(
-        then_target,
-        safety.result_is_gc_inert(then_value),
-        &internal_uses,
-        &internal_home_uses,
-        adjacent_nil_local,
-        old_values,
-    ) || !facts.target_write_is_unobservable(
-        else_target,
-        safety.result_is_gc_inert(else_value),
-        &internal_uses,
-        &internal_home_uses,
-        adjacent_nil_local,
-        old_values,
-    ) {
+    let truthiness = expr_truthiness(&if_stmt.cond, safety);
+    let then_write_is_unobservable = truthiness == Some(false)
+        || facts.target_write_is_unobservable(
+            then_target,
+            safety.result_is_gc_inert(then_value),
+            &DeadWriteProof {
+                live_after: &live_after.then_arm,
+                adjacent_nil_local,
+                old_values,
+            },
+        );
+    let else_write_is_unobservable = truthiness == Some(true)
+        || facts.target_write_is_unobservable(
+            else_target,
+            safety.result_is_gc_inert(else_value),
+            &DeadWriteProof {
+                live_after: &live_after.else_arm,
+                adjacent_nil_local,
+                old_values,
+            },
+        );
+    if !then_write_is_unobservable || !else_write_is_unobservable {
         return false;
     }
     // 候选拒绝[SemanticBarrier:EvalCount]：删除 `if f() then t=true else t=false end` 会漏掉仍需执行一次的 `f()`。
@@ -963,8 +464,8 @@ fn removable_dead_materialization_shell(
 
     // 候选拒绝[SemanticBarrier:EvalCount]：死 binding 的 `t=f()` 仍必须调用一次 `f()`，不能随布尔壳一起丢弃。
     // 候选拒绝[PolicyBoundary]：任一 arm 的 Unresolved 都是 permissive 输出保留的失败证据。
-    safety.is_discard_safe_without_residual(then_value)
-        && safety.is_discard_safe_without_residual(else_value)
+    (truthiness == Some(false) || safety.is_discard_safe_without_residual(then_value))
+        && (truthiness == Some(true) || safety.is_discard_safe_without_residual(else_value))
 }
 
 fn single_fixed_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {
@@ -1011,24 +512,19 @@ fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
 
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirAssign, HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirExpr, HirGoto, HirIf,
-        HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirProto, HirProtoRef, HirStmt,
-        HirTableConstructor, HirToBeClosed, HirUnresolvedExpr, HirValuePack, LocalId, TempId,
+        HirAssign, HirBlock, HirCallExpr, HirCallStmt, HirCapture, HirCaptureMode, HirClose,
+        HirClosureExpr, HirExpr, HirGlobalRef, HirGoto, HirIf, HirLValue, HirLabel, HirLabelId,
+        HirLocalDecl, HirProto, HirProtoRef, HirReturn, HirStmt, HirTableConstructor,
+        HirToBeClosed, HirUnresolvedExpr, HirValuePack, LocalId, ParamId, TempId, UpvalueId,
     };
     use crate::hir::expr_safety::HirExprSafety;
     use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-    use super::{
-        BindingUseCounts, BooleanShellFacts, CaptureRelation, DeadShellOldValueFacts,
-        OldValueClass, ReferenceCapturedHomes, VisibleHomeUseCounts,
-        local_reference_capture_relation, reference_capture_home_slots,
-        remove_boolean_materialization_shells_in_proto, shell_requires_old_value_plan,
-    };
-    use crate::hir::simplify::mention::ReferenceCapturedBindings;
+    use super::{BooleanShellFacts, remove_boolean_materialization_shells_in_proto};
     use crate::transformer::InstrRef;
 
     #[test]
@@ -1062,82 +558,268 @@ mod tests {
     }
 
     #[test]
-    fn tbc_protection_is_scoped_to_exact_home_epoch() {
-        let temp = TempId(0);
-        let closed_home = HomeSlotKey::new(0, 0);
-        let reused_home = HomeSlotKey::new(0, 1);
-        let mut facts = BooleanShellFacts {
-            uses: BindingUseCounts::default(),
-            debug_temps: BTreeSet::new(),
-            debug_locals: BTreeSet::new(),
-            physical_root_locals: BTreeSet::new(),
-            possible_temp_homes: BTreeMap::from([(temp, BTreeSet::from([reused_home]))]),
-            param_homes: BTreeMap::new(),
-            trusted_local_homes: BTreeMap::new(),
-            possible_param_homes: BTreeMap::new(),
-            possible_local_homes: BTreeMap::new(),
-            visible_home_uses: VisibleHomeUseCounts {
-                definite_counts: BTreeMap::new(),
-                possible_counts: BTreeMap::new(),
-            },
-            reference_captured_homes: ReferenceCapturedHomes::default(),
-            to_be_closed_homes: BTreeSet::from([closed_home]),
-            unresolved_to_be_closed_slots: BTreeSet::new(),
-            reference_captured_locals: BTreeSet::new(),
-            possibly_reference_captured_locals: BTreeSet::new(),
-        };
-        let old_values = DeadShellOldValueFacts {
-            locals: BTreeMap::new(),
-            homes: BTreeMap::from([(reused_home, OldValueClass::GcInert)]),
-        };
-        let internal_uses = BindingUseCounts::default();
-        let internal_home_uses = VisibleHomeUseCounts {
-            definite_counts: BTreeMap::new(),
-            possible_counts: BTreeMap::new(),
-        };
+    fn local_shell_keeps_a_same_home_tbc_write() {
+        let candidate = LocalId(0);
+        let resource = TempId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.temps = vec![resource];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(
+                resource,
+                HirExpr::TableConstructor(Box::<HirTableConstructor>::default()),
+            ),
+            HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+                origin: InstrRef(0),
+                reg_index: home.slot(),
+                value: HirExpr::TempRef(resource),
+            })),
+            local_decl(candidate, HirExpr::Nil),
+            boolean_shell(HirLValue::Local(candidate)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(resource, home);
+        facts.record_local_home_slot(candidate, home);
 
-        assert!(facts.target_write_is_unobservable(
-            &HirLValue::Temp(temp),
-            true,
-            &internal_uses,
-            &internal_home_uses,
-            None,
-            &old_values,
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
         ));
-
-        facts.to_be_closed_homes.insert(reused_home);
-        assert!(!facts.target_write_is_unobservable(
-            &HirLValue::Temp(temp),
-            true,
-            &internal_uses,
-            &internal_home_uses,
-            None,
-            &old_values,
-        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[3], HirStmt::Assign(_)));
     }
 
     #[test]
-    fn complete_possible_tbc_homes_are_narrowed_by_the_instruction_slot() {
-        let resource = LocalId(0);
-        let old_home = HomeSlotKey::new(0, 0);
-        let tbc_home = HomeSlotKey::new(1, 0);
+    fn dead_shell_ignores_an_unreachable_arm_target() {
+        let candidate = LocalId(0);
+        let parameter = ParamId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![resource];
+        proto.params = vec![parameter];
+        proto.param_debug_hints = vec![None];
+        proto.locals = vec![candidate];
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
-        proto.body.stmts = vec![HirStmt::ToBeClosed(Box::new(HirToBeClosed {
-            origin: InstrRef(0),
-            reg_index: tbc_home.slot(),
-            value: HirExpr::LocalRef(resource),
-        }))];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::Boolean(true),
+                then_block: HirBlock {
+                    stmts: vec![assign_local(candidate, HirExpr::Boolean(true))],
+                },
+                else_block: Some(HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Param(parameter)],
+                        values: HirValuePack::fixed(vec![HirExpr::Boolean(false)]),
+                    }))],
+                }),
+            })),
+        ];
         let mut facts = ProtoPromotionFacts::default();
-        facts.record_local_home_slot(resource, old_home);
-        facts.record_local_home_merge(resource, Some(BTreeSet::from([tbc_home])));
+        facts.record_home_free_local(candidate);
 
-        let shell_facts = BooleanShellFacts::collect(&proto, &facts);
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 1);
+        assert!(matches!(proto.body.stmts[0], HirStmt::LocalDecl(_)));
+    }
 
-        assert_eq!(shell_facts.to_be_closed_homes, BTreeSet::from([tbc_home]));
-        assert!(shell_facts.unresolved_to_be_closed_slots.is_empty());
+    #[test]
+    fn dead_shell_ignores_a_read_that_only_precedes_the_write() {
+        let candidate = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::LocalRef(candidate),
+                then_block: HirBlock::default(),
+                else_block: None,
+            })),
+            boolean_shell(HirLValue::Local(candidate)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(candidate);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 2);
+        assert!(matches!(proto.body.stmts[1], HirStmt::If(_)));
+    }
+
+    #[test]
+    fn return_does_not_make_a_lexical_suffix_read_live() {
+        let candidate = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            boolean_shell(HirLValue::Local(candidate)),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::default(),
+            })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::LocalRef(candidate),
+                then_block: HirBlock::default(),
+                else_block: None,
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(candidate);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 3);
+        assert!(matches!(proto.body.stmts[1], HirStmt::Return(_)));
+        assert!(matches!(proto.body.stmts[2], HirStmt::If(_)));
+    }
+
+    #[test]
+    fn later_exact_write_kills_the_shell_before_a_read() {
+        let candidate = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            boolean_shell(HirLValue::Local(candidate)),
+            assign_local(candidate, HirExpr::Nil),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::LocalRef(candidate),
+                then_block: HirBlock::default(),
+                else_block: None,
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(candidate);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 3);
+        assert!(matches!(proto.body.stmts[1], HirStmt::Assign(_)));
+        assert!(matches!(proto.body.stmts[2], HirStmt::If(_)));
+    }
+
+    #[test]
+    fn loop_backedge_keeps_a_shell_observed_before_the_next_iteration() {
+        let candidate = LocalId(0);
+        let flag = LocalId(1);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate, flag];
+        proto.local_debug_hints = vec![None, None];
+        proto.local_debug_scopes = vec![None, None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            HirStmt::While(Box::new(crate::hir::common::HirWhile {
+                cond: HirExpr::LocalRef(flag),
+                body: HirBlock {
+                    stmts: vec![
+                        HirStmt::If(Box::new(HirIf {
+                            cond: HirExpr::LocalRef(candidate),
+                            then_block: HirBlock::default(),
+                            else_block: None,
+                        })),
+                        boolean_shell(HirLValue::Local(candidate)),
+                    ],
+                },
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(candidate);
+        facts.record_home_free_local(flag);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        let HirStmt::While(while_stmt) = &proto.body.stmts[1] else {
+            panic!("loop must remain");
+        };
+        assert!(matches!(while_stmt.body.stmts[1], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn external_goto_entry_keeps_a_shell_observed_after_reentry() {
+        let candidate = LocalId(0);
+        let reentry = HirLabelId(0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            HirStmt::Block(Box::new(HirBlock {
+                stmts: vec![
+                    label(reentry),
+                    HirStmt::If(Box::new(HirIf {
+                        cond: HirExpr::LocalRef(candidate),
+                        then_block: HirBlock::default(),
+                        else_block: None,
+                    })),
+                    boolean_shell(HirLValue::Local(candidate)),
+                ],
+            })),
+            goto(reentry),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(candidate);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        let HirStmt::Block(block) = &proto.body.stmts[1] else {
+            panic!("nested entry block must remain");
+        };
+        assert!(matches!(block.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn unresolved_goto_uses_the_unknown_observer_sink() {
+        let candidate = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            boolean_shell(HirLValue::Local(candidate)),
+            goto(HirLabelId(99)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(candidate);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 3);
+        assert!(matches!(proto.body.stmts[1], HirStmt::Assign(_)));
     }
 
     #[test]
@@ -1333,46 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_rewrite_only_owns_nil_adjacent_or_home_free_targets() {
-        let local = LocalId(0);
-        let unknown_temp = TempId(0);
-        let home_free_temp = TempId(1);
-        let local_shell = boolean_shell(HirLValue::Local(local));
-        let unknown_temp_shell = boolean_shell(HirLValue::Temp(unknown_temp));
-        let home_free_temp_shell = boolean_shell(HirLValue::Temp(home_free_temp));
-        let mut proto = empty_test_proto();
-        proto.locals = vec![local];
-        proto.local_debug_hints = vec![None];
-        proto.local_debug_scopes = vec![None];
-        let universe_witness = TempId(2);
-        proto.temps = vec![unknown_temp, home_free_temp, universe_witness];
-        proto.temp_debug_locals = vec![None, None, None];
-        proto.temp_debug_scopes = vec![None, None, None];
-        let mut promotion_facts = ProtoPromotionFacts::default();
-        promotion_facts.record_home_free_local(local);
-        promotion_facts.record_home_free_temp(home_free_temp);
-        promotion_facts.record_temp_home_slot_for_test(universe_witness, HomeSlotKey::new(0, 0));
-        let facts = BooleanShellFacts::collect(&proto, &promotion_facts);
-
-        assert!(shell_requires_old_value_plan(&local_shell, &facts, None));
-        assert!(!shell_requires_old_value_plan(
-            &local_shell,
-            &facts,
-            Some(local),
-        ));
-        assert!(shell_requires_old_value_plan(
-            &unknown_temp_shell,
-            &facts,
-            None,
-        ));
-        assert!(!shell_requires_old_value_plan(
-            &home_free_temp_shell,
-            &facts,
-            None,
-        ));
-    }
-
-    #[test]
     fn overlapping_merged_local_read_keeps_the_raw_home_write() {
         let observer = LocalId(0);
         let target = TempId(0);
@@ -1390,145 +1032,508 @@ mod tests {
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         ));
         assert_eq!(proto.body.stmts.len(), 4);
-        assert!(matches!(proto.body.stmts[3], HirStmt::Assign(_)));
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
     }
 
     #[test]
-    fn home_free_capture_is_exact_by_local_identity() {
-        let candidate = LocalId(0);
-        let unrelated = LocalId(1);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_home_free_local(candidate);
-        facts.record_home_free_local(unrelated);
-        let mut captured = ReferenceCapturedBindings::default();
-        captured.locals.insert(unrelated);
-
-        assert_eq!(
-            reference_capture_home_slots(&captured, &facts).definite,
-            BTreeSet::new()
-        );
-        assert!(matches!(
-            local_reference_capture_relation(candidate, &captured, &facts),
-            CaptureRelation::None
-        ));
-
-        captured.locals.insert(candidate);
-        assert!(matches!(
-            local_reference_capture_relation(candidate, &captured, &facts),
-            CaptureRelation::Definite
-        ));
-    }
-
-    #[test]
-    fn complete_possible_capture_homes_prove_only_disjointness() {
-        let disjoint_candidate = LocalId(0);
-        let overlapping_candidate = LocalId(1);
-        let captured_local = LocalId(2);
-        let captured_home = HomeSlotKey::new(0, 0);
-        let merged_home = HomeSlotKey::new(1, 0);
-        let disjoint_home = HomeSlotKey::new(2, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_local_home_slot(disjoint_candidate, disjoint_home);
-        facts.record_local_home_slot(overlapping_candidate, merged_home);
-        facts.record_local_home_slot(captured_local, captured_home);
-        facts.record_local_home_merge(captured_local, Some(BTreeSet::from([merged_home])));
-        let mut captured = ReferenceCapturedBindings::default();
-        captured.locals.insert(captured_local);
-
-        let captured_homes = reference_capture_home_slots(&captured, &facts);
-        assert!(captured_homes.definite.is_empty());
-        assert_eq!(
-            captured_homes.possible,
-            BTreeSet::from([captured_home, merged_home])
-        );
-        assert!(matches!(
-            local_reference_capture_relation(disjoint_candidate, &captured, &facts),
-            CaptureRelation::None
-        ));
-        assert!(matches!(
-            local_reference_capture_relation(overlapping_candidate, &captured, &facts),
-            CaptureRelation::Possible
-        ));
-    }
-
-    #[test]
-    fn unknown_capture_uses_the_universe_for_home_free_and_physical_candidates() {
-        let home_free_candidate = LocalId(0);
-        let physical_candidate = LocalId(1);
-        let unknown_capture = LocalId(2);
-        let first_home = HomeSlotKey::new(0, 0);
-        let second_home = HomeSlotKey::new(1, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_home_free_local(home_free_candidate);
-        facts.record_local_home_slot(physical_candidate, first_home);
-        facts.record_temp_home_slot_for_test(TempId(0), second_home);
-        let mut captured = ReferenceCapturedBindings::default();
-        captured.locals.insert(unknown_capture);
-
-        assert_eq!(
-            reference_capture_home_slots(&captured, &facts).possible,
-            BTreeSet::from([first_home, second_home])
-        );
-        assert!(matches!(
-            local_reference_capture_relation(home_free_candidate, &captured, &facts),
-            CaptureRelation::None
-        ));
-        assert!(matches!(
-            local_reference_capture_relation(physical_candidate, &captured, &facts),
-            CaptureRelation::Possible
-        ));
-    }
-
-    #[test]
-    fn unknown_capture_allows_only_the_home_free_shell_removal() {
-        let candidate = LocalId(0);
-        let captured = LocalId(1);
-        let closure_holder = LocalId(2);
-        let universe_witness = TempId(0);
-        let first_home = HomeSlotKey::new(0, 0);
-        let second_home = HomeSlotKey::new(1, 0);
+    fn home_free_temp_shell_keeps_a_prior_reference_capture() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate, captured, closure_holder];
-        proto.local_debug_hints = vec![None, None, None];
-        proto.local_debug_scopes = vec![None, None, None];
-        proto.temps = vec![universe_witness];
+        proto.temps = vec![candidate];
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
-            local_decl(candidate, HirExpr::Nil),
+            assign_temp(candidate, HirExpr::Nil),
             local_decl(
-                closure_holder,
+                closure,
                 HirExpr::Closure(Box::new(HirClosureExpr {
                     proto: HirProtoRef(1),
                     captures: vec![HirCapture {
                         mode: HirCaptureMode::ByReference,
-                        value: HirExpr::LocalRef(captured),
+                        value: HirExpr::TempRef(candidate),
                     }],
                 })),
             ),
-            boolean_shell(HirLValue::Local(candidate)),
+            boolean_shell(HirLValue::Temp(candidate)),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::fixed(vec![HirExpr::LocalRef(closure)]),
+            })),
         ];
-        let mut home_free_facts = ProtoPromotionFacts::default();
-        home_free_facts.record_home_free_local(candidate);
-        home_free_facts.record_home_free_local(closure_holder);
-        home_free_facts.record_temp_home_slot_for_test(universe_witness, second_home);
-        let mut home_free_proto = proto.clone();
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
 
-        assert!(remove_boolean_materialization_shells_in_proto(
-            &mut home_free_proto,
-            &home_free_facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
-        ));
-        assert_eq!(home_free_proto.body.stmts.len(), 2);
-
-        let mut physical_facts = home_free_facts;
-        physical_facts.record_local_home_slot(candidate, first_home);
         assert!(remove_boolean_materialization_shells_in_proto(
             &mut proto,
-            &physical_facts,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn reference_capture_then_overwrite_kills_the_shell_before_exit() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            boolean_shell(HirLValue::Temp(candidate)),
+            local_decl(
+                closure,
+                HirExpr::Closure(Box::new(HirClosureExpr {
+                    proto: HirProtoRef(1),
+                    captures: vec![HirCapture {
+                        mode: HirCaptureMode::ByReference,
+                        value: HirExpr::TempRef(candidate),
+                    }],
+                })),
+            ),
+            assign_temp(candidate, HirExpr::Nil),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::fixed(vec![HirExpr::LocalRef(closure)]),
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[1], HirStmt::LocalDecl(_)));
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn unused_named_reference_closure_does_not_observe_the_shell() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            local_decl(
+                closure,
+                HirExpr::Closure(Box::new(HirClosureExpr {
+                    proto: HirProtoRef(1),
+                    captures: vec![HirCapture {
+                        mode: HirCaptureMode::ByReference,
+                        value: HirExpr::TempRef(candidate),
+                    }],
+                })),
+            ),
+            boolean_shell(HirLValue::Temp(candidate)),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::default(),
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         ));
         assert_eq!(proto.body.stmts.len(), 3);
+        assert!(matches!(proto.body.stmts[2], HirStmt::Return(_)));
+    }
+
+    #[test]
+    fn by_value_capture_reads_the_shell_at_creation() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            boolean_shell(HirLValue::Temp(candidate)),
+            local_decl(
+                closure,
+                HirExpr::Closure(Box::new(HirClosureExpr {
+                    proto: HirProtoRef(1),
+                    captures: vec![HirCapture {
+                        mode: HirCaptureMode::ByValue,
+                        value: HirExpr::TempRef(candidate),
+                    }],
+                })),
+            ),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 3);
+        assert!(matches!(proto.body.stmts[1], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn overwritten_closure_holder_does_not_observe_a_later_shell() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            local_decl(closure, reference_closure(HirExpr::TempRef(candidate))),
+            assign_local(closure, HirExpr::Nil),
+            boolean_shell(HirLValue::Temp(candidate)),
+            call_stmt(HirExpr::LocalRef(closure)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
+        assert!(matches!(proto.body.stmts[3], HirStmt::CallStmt(_)));
+    }
+
+    #[test]
+    fn call_before_closure_assignment_does_not_observe_a_later_shell() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            call_stmt(HirExpr::LocalRef(closure)),
+            local_decl(closure, reference_closure(HirExpr::TempRef(candidate))),
+            boolean_shell(HirLValue::Temp(candidate)),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::default(),
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[2], HirStmt::LocalDecl(_)));
+        assert!(matches!(proto.body.stmts[3], HirStmt::Return(_)));
+    }
+
+    #[test]
+    fn reference_capture_after_definite_write_does_not_observe_the_old_shell() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            local_decl(closure, reference_closure(HirExpr::TempRef(candidate))),
+            boolean_shell(HirLValue::Temp(candidate)),
+            assign_temp(candidate, HirExpr::Nil),
+            call_stmt(HirExpr::LocalRef(closure)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
+        assert!(matches!(proto.body.stmts[3], HirStmt::CallStmt(_)));
+    }
+
+    #[test]
+    fn called_named_reference_closure_keeps_the_shell() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            local_decl(closure, reference_closure(HirExpr::TempRef(candidate))),
+            boolean_shell(HirLValue::Temp(candidate)),
+            call_stmt(HirExpr::LocalRef(closure)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn loop_reaching_closure_holder_keeps_the_shell_before_next_call() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let flag = LocalId(1);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure, flag];
+        proto.local_debug_hints = vec![None, None];
+        proto.local_debug_scopes = vec![None, None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            local_decl(closure, HirExpr::Nil),
+            HirStmt::While(Box::new(crate::hir::common::HirWhile {
+                cond: HirExpr::LocalRef(flag),
+                body: HirBlock {
+                    stmts: vec![
+                        call_stmt(HirExpr::LocalRef(closure)),
+                        assign_local(closure, reference_closure(HirExpr::TempRef(candidate))),
+                        boolean_shell(HirLValue::Temp(candidate)),
+                    ],
+                },
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+        facts.record_home_free_local(flag);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        let HirStmt::While(while_stmt) = &proto.body.stmts[2] else {
+            panic!("loop must remain");
+        };
+        assert!(matches!(while_stmt.body.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn parameter_holder_return_keeps_the_captured_shell() {
+        let candidate = TempId(0);
+        let closure = ParamId(0);
+        let mut proto = empty_test_proto();
+        proto.params = vec![closure];
+        proto.param_debug_hints = vec![None];
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Param(closure)],
+                values: HirValuePack::fixed(vec![reference_closure(HirExpr::TempRef(candidate))]),
+            })),
+            boolean_shell(HirLValue::Temp(candidate)),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::fixed(vec![HirExpr::ParamRef(closure)]),
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_param_home_merge(closure, Some(BTreeSet::from([HomeSlotKey::new(0, 0)])));
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn upvalue_store_keeps_the_captured_shell() {
+        let candidate = TempId(0);
+        let upvalue = UpvalueId(0);
+        let mut proto = empty_test_proto();
+        proto.upvalues = vec![upvalue];
+        proto.upvalue_debug_hints = vec![None];
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Upvalue(upvalue)],
+                values: HirValuePack::fixed(vec![reference_closure(HirExpr::TempRef(candidate))]),
+            })),
+            boolean_shell(HirLValue::Temp(candidate)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 3);
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn external_parallel_target_does_not_escape_a_local_sibling_value() {
+        let candidate = TempId(0);
+        let closure = LocalId(0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.locals = vec![closure];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![
+                    HirLValue::Global(HirGlobalRef {
+                        name: "external".to_owned(),
+                    }),
+                    HirLValue::Local(closure),
+                ],
+                values: HirValuePack::fixed(vec![
+                    HirExpr::Nil,
+                    reference_closure(HirExpr::TempRef(candidate)),
+                ]),
+            })),
+            boolean_shell(HirLValue::Temp(candidate)),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(candidate);
+        facts.record_home_free_local(closure);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 2);
+        assert!(matches!(proto.body.stmts[1], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn later_overwrite_kills_the_shell_before_tbc_activation() {
+        let candidate = TempId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut proto = empty_test_proto();
+        proto.temps = vec![candidate];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![None];
+        proto.body.stmts = vec![
+            assign_temp(candidate, HirExpr::Nil),
+            boolean_shell(HirLValue::Temp(candidate)),
+            assign_temp(candidate, HirExpr::Nil),
+            HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+                origin: InstrRef(0),
+                reg_index: home.slot(),
+                value: HirExpr::TempRef(candidate),
+            })),
+            HirStmt::Close(Box::new(HirClose {
+                from_reg: home.slot(),
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(candidate, home);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
+        assert!(matches!(proto.body.stmts[1], HirStmt::Assign(_)));
+    }
+
+    #[test]
+    fn local_shell_keeps_a_later_same_home_visible_read() {
+        let candidate = LocalId(0);
+        let observer = LocalId(1);
+        let home = HomeSlotKey::new(0, 0);
+        let mut proto = empty_test_proto();
+        proto.locals = vec![candidate, observer];
+        proto.local_debug_hints = vec![None, None];
+        proto.local_debug_scopes = vec![None, None];
+        proto.body.stmts = vec![
+            local_decl(candidate, HirExpr::Nil),
+            local_decl(observer, HirExpr::Nil),
+            boolean_shell(HirLValue::Local(candidate)),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::LocalRef(observer),
+                then_block: HirBlock::default(),
+                else_block: None,
+            })),
+        ];
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(candidate, home);
+        facts.record_local_home_slot(observer, home);
+
+        assert!(remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
+        assert_eq!(proto.body.stmts.len(), 4);
         assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
     }
 
@@ -1548,7 +1553,7 @@ mod tests {
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         ));
         assert_eq!(proto.body.stmts.len(), 4);
-        assert!(matches!(proto.body.stmts[3], HirStmt::Assign(_)));
+        assert!(matches!(proto.body.stmts[2], HirStmt::Assign(_)));
     }
 
     #[test]
@@ -1756,12 +1761,12 @@ mod tests {
                 observer,
                 HirExpr::TableConstructor(Box::<HirTableConstructor>::default()),
             ),
+            boolean_shell(HirLValue::Temp(target)),
             HirStmt::If(Box::new(HirIf {
                 cond: HirExpr::LocalRef(observer),
                 then_block: HirBlock::default(),
                 else_block: None,
             })),
-            boolean_shell(HirLValue::Temp(target)),
         ];
         proto
     }
@@ -1792,6 +1797,28 @@ mod tests {
         HirStmt::Label(Box::new(HirLabel {
             id,
             tbc_barriers: Vec::new(),
+        }))
+    }
+
+    fn reference_closure(value: HirExpr) -> HirExpr {
+        HirExpr::Closure(Box::new(HirClosureExpr {
+            proto: HirProtoRef(1),
+            captures: vec![HirCapture {
+                mode: HirCaptureMode::ByReference,
+                value,
+            }],
+        }))
+    }
+
+    fn call_stmt(callee: HirExpr) -> HirStmt {
+        HirStmt::CallStmt(Box::new(HirCallStmt {
+            call: HirCallExpr {
+                callee,
+                args: HirValuePack::default(),
+                method: false,
+                fastcall: None,
+                method_name: None,
+            },
         }))
     }
 

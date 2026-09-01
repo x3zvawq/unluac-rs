@@ -1,7 +1,8 @@
 //! 这个文件识别普通 HIR 值活跃性看不到的物理槽 root 生命周期。
 //!
-//! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨显式 GC 的
-//! lookup result，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当 VM GC root。
+//! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨后续观察点的
+//! table/global lookup result，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
+//! VM GC root。
 //! copy 共享值 identity，
 //! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
 //! 消费者只能把 producer 与同 home 的精确覆盖配对。
@@ -13,13 +14,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId,
+    HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, HirUnaryOpKind, LocalId,
+    ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
-use super::visit::{HirVisitor, visit_expr, visit_stmts};
+use super::visit::{HirVisitor, visit_call, visit_expr, visit_stmts};
 
 struct ActiveCallRoot {
     value_id: CallValueId,
@@ -32,7 +34,7 @@ struct ActiveCallRoot {
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct CallValueId(usize);
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct LookupValueId(usize);
 
 struct ActiveLookupGcHome {
@@ -40,7 +42,16 @@ struct ActiveLookupGcHome {
     root_index: usize,
     aliases: BTreeSet<TempId>,
     eligible: bool,
-    crossed_gc_fence: bool,
+    crossed_observation: bool,
+    /// 该 home 由原始 lookup 写入；跨 home 的机械 copy 不是 return 后缀要保留的独立 owner。
+    direct_lookup_home: bool,
+    /// low CFG 已证明该原始 home 在观察事件后仍活到 frame end。
+    scope_end_copy_root: bool,
+    /// 所有动态路径都到 frame end，不需要同步提交更早的 overwrite endpoint。
+    pure_scope_end_copy_root: bool,
+    /// 该 identity 来自 GlobalRef；当前只消费 pure scope-end low proof，不扩张旧的
+    /// TableAccess overwrite matcher。
+    global_lookup: bool,
 }
 
 struct ActiveAllocationRoot {
@@ -86,6 +97,7 @@ pub(super) struct CallRootOverwritePair {
 pub(super) struct LookupGcRootLifetimeIndices {
     roots: BTreeSet<usize>,
     roots_by_overwrite: BTreeMap<usize, Vec<LookupGcRootOverwritePair>>,
+    handoff_roots: BTreeSet<TempId>,
 }
 
 /// 收集已经物化成 HIR local、但在最后一次显式读取后仍跨过潜在用户代码/GC 事件的
@@ -230,6 +242,10 @@ impl CallRootLifetimeIndices {
 }
 
 impl LookupGcRootLifetimeIndices {
+    pub(super) fn into_handoff_roots(self) -> BTreeSet<TempId> {
+        self.handoff_roots
+    }
+
     pub(super) fn is_root(&self, index: usize) -> bool {
         self.roots.contains(&index)
     }
@@ -422,7 +438,6 @@ pub(super) fn collect_call_root_lifetimes(
                             index,
                             temp,
                             &HirExpr::Nil,
-                            true,
                             home,
                             eligible,
                         );
@@ -529,7 +544,6 @@ pub(super) fn collect_call_root_lifetimes(
             index,
             temp,
             value,
-            value_is_known_nil,
             slot,
             producer_eligible,
         );
@@ -646,40 +660,100 @@ pub(super) fn collect_call_root_lifetimes(
     lifetimes
 }
 
-/// 只识别与显式 `collectgarbage` 相关的 lookup 物理 root。
+/// 识别跨后续用户代码/GC 事件，或 return 表达式内部后续事件的 lookup 物理 root。
 ///
 /// Call 的观察、allocation owner 与相邻 overwrite 合同保持在既有 collector 中；这里不把
-/// 普通 lookup 一概提升为 source local。标量与无求值 multi-nil 只按同 home 精确配对；
-/// 没有可见 overwrite 时，跨过显式 GC 的 lookup 由当前 HIR block 的词法 local 保活到
-/// block end。block 外的 successor 不属于该 local 的可见区间，因此无需猜测跨块 home 复用。
+/// 普通 lookup 一概提升为 source local。GlobalRef 只在 low CFG 已经证明所有路径都活到 scope
+/// end，且 HIR 的最后一次 identity 读取后仍有观察点时，才需要独立物化；TableAccess 的标量
+/// 与无求值 multi-nil 仍沿既有同-home 精确配对。没有可见 overwrite 时，跨过显式 GC/普通
+/// 用户事件，或在 return 子表达式中先被消费、随后又跨过用户事件的 lookup，由当前 HIR
+/// block 的词法 local 保活到 block end。block 外的 successor 不属于该 local 的可见区间，
+/// 因此无需猜测跨块 home 复用。
 pub(super) fn collect_lookup_gc_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
-    _safety: HirExprSafety,
+    safety: HirExprSafety,
     mut temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> LookupGcRootLifetimeIndices {
     let uses = TempUseEvents::new(stmts);
-    if uses.gc_fence_indices.is_empty() {
+    if uses.gc_fence_indices.is_empty()
+        && !stmts.iter().any(|stmt| matches!(stmt, HirStmt::Return(_)))
+    {
         return LookupGcRootLifetimeIndices::default();
     }
+    let definitions = stmts
+        .iter()
+        .filter_map(scalar_temp_definition)
+        .collect::<BTreeMap<_, _>>();
+    let reference_captured_temps = super::mention::stmts_reference_captured_bindings(stmts).temps;
     let mut active = BTreeMap::<HomeSlotKey, ActiveLookupGcHome>::new();
     let mut value_by_temp = BTreeMap::<TempId, LookupValueId>::new();
+    let mut global_lookup_values = BTreeSet::<LookupValueId>::new();
     let mut next_value_id = 0;
     let mut lifetimes = LookupGcRootLifetimeIndices::default();
 
     for (index, stmt) in stmts.iter().enumerate() {
+        let live_read_values = value_by_temp
+            .iter()
+            .filter(|(temp, _)| uses.has_live_read_from(**temp, index))
+            .map(|(_, value)| *value)
+            .collect::<BTreeSet<_>>();
         if uses.is_gc_fence(index) {
             for root in active.values_mut() {
-                root.crossed_gc_fence = true;
+                if (!root.global_lookup || root.pure_scope_end_copy_root)
+                    && !live_read_values.contains(&root.value_id)
+                {
+                    root.crossed_observation = true;
+                }
+            }
+        } else if stmt_may_observe_gc_roots(stmt, safety) {
+            for root in active.values_mut() {
+                if root.pure_scope_end_copy_root && !live_read_values.contains(&root.value_id) {
+                    root.crossed_observation = true;
+                }
             }
         }
 
         let Some((temp, value)) = scalar_temp_definition(stmt) else {
-            if matches!(stmt, HirStmt::Return(_)) {
+            if let HirStmt::Return(return_stmt) = stmt {
+                observe_lookup_return_post_use_roots(
+                    &return_stmt.values,
+                    &definitions,
+                    &value_by_temp,
+                    &mut active,
+                    safety,
+                );
                 preserve_lookup_roots_to_scope_end(&active, &mut lifetimes);
                 active.clear();
                 value_by_temp.clear();
                 continue;
+            }
+            if let HirStmt::ErrNil(err_nil) = stmt
+                && let HirExpr::TempRef(temp) = &err_nil.value
+                && let Some(value_id) = value_by_temp.remove(temp)
+            {
+                // ERRNNIL 的正常后继已经证明该 lookup 结果为 nil；它不再可能承担 GC root。
+                // 只终止同一 value identity，不能把同时活跃的其它 home 一并清空。
+                active.retain(|_, root| root.value_id != value_id);
+                value_by_temp.retain(|_, value| *value != value_id);
+                continue;
+            }
+            if let Some((value_id, handoff_root)) = nil_guarded_global_lookup_handoff(
+                index,
+                stmt,
+                &active,
+                &value_by_temp,
+                &reference_captured_temps,
+                &uses,
+                facts,
+            ) {
+                // `source ~= nil` 的分支已经先把同一 identity 交给另一个 reference-captured
+                // physical home；另一路 source 为 nil，本来就没有待保活对象。原 lookup
+                // home 因而不再是后续观察点所需的独立 root。这个证明必须留在 HIR：AST
+                // 只会看到两个 local，无法恢复分支对应的 VM home 事务（regress_36）。
+                active.retain(|_, root| root.value_id != value_id);
+                value_by_temp.retain(|_, value| *value != value_id);
+                lifetimes.handoff_roots.insert(handoff_root);
             }
             if let Some(overwrites) =
                 exact_multi_nil_temp_overwrites(stmt, facts, &mut temp_is_eligible)
@@ -740,7 +814,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 // Grouped assignment evaluates every RHS and branch/block prefix while the old
                 // physical home is still owned by this local. Each proven path then commits a
                 // target for the same home, so the old lookup can terminate at this statement.
-                root.crossed_gc_fence |= uses.has_gc_fence_after(index);
+                root.crossed_observation |= uses.has_gc_fence_after(index);
                 record_lookup_root_overwrite(
                     root,
                     index,
@@ -776,6 +850,12 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
             HirExpr::TableAccess(_) => {
                 let value_id = LookupValueId(next_value_id);
                 next_value_id += 1;
+                Some(value_id)
+            }
+            HirExpr::GlobalRef(_) if facts.is_pure_scope_end_copy_root_temp(temp) => {
+                let value_id = LookupValueId(next_value_id);
+                next_value_id += 1;
+                global_lookup_values.insert(value_id);
                 Some(value_id)
             }
             HirExpr::TempRef(source) => value_by_temp.get(source).copied(),
@@ -817,7 +897,14 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                     root_index: index,
                     aliases: BTreeSet::from([temp]),
                     eligible,
-                    crossed_gc_fence: false,
+                    crossed_observation: false,
+                    direct_lookup_home: matches!(
+                        value,
+                        HirExpr::TableAccess(_) | HirExpr::GlobalRef(_)
+                    ),
+                    scope_end_copy_root: facts.is_scope_end_copy_root_temp(temp),
+                    pure_scope_end_copy_root: facts.is_pure_scope_end_copy_root_temp(temp),
+                    global_lookup: global_lookup_values.contains(&value_id),
                 },
             );
         }
@@ -825,6 +912,84 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
 
     preserve_lookup_roots_to_scope_end(&active, &mut lifetimes);
     lifetimes
+}
+
+/// 识别 nil fallback 前缀里的条件 root handoff。
+///
+/// 只接受 `lookup ~= nil` 一侧在任何潜在观察前，以纯 copy 把同一 identity 写入另一个
+/// physical home；该 target 必须在 join 后仍以同一 trusted home 被 reference capture，因而
+/// 不能作为 dead temp 消失。nil 一侧不需要 root；non-nil 一侧把 PhysicalRoot provenance
+/// 转交给这个 join owner。普通 callee copy 没有 capture owner，因此不会把
+/// `global; copy; call; gc` 错认成 handoff（regress_419）。
+fn nil_guarded_global_lookup_handoff(
+    index: usize,
+    stmt: &HirStmt,
+    active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
+    value_by_temp: &BTreeMap<TempId, LookupValueId>,
+    reference_captured_temps: &BTreeSet<TempId>,
+    uses: &TempUseEvents,
+    facts: &ProtoPromotionFacts,
+) -> Option<(LookupValueId, TempId)> {
+    let HirStmt::If(if_stmt) = stmt else {
+        return None;
+    };
+    let (checked_temp, non_nil_block) = match &if_stmt.cond {
+        HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
+            let temp = nil_compared_temp(&binary.lhs, &binary.rhs)?;
+            (temp, if_stmt.else_block.as_ref()?)
+        }
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+            let HirExpr::Binary(binary) = &unary.expr else {
+                return None;
+            };
+            if binary.op != HirBinaryOpKind::Eq {
+                return None;
+            }
+            let temp = nil_compared_temp(&binary.lhs, &binary.rhs)?;
+            (temp, &if_stmt.then_block)
+        }
+        _ => return None,
+    };
+    let value_id = value_by_temp.get(&checked_temp).copied()?;
+    let (root_home, _) = active.iter().find(|(_, root)| {
+        root.value_id == value_id
+            && root.direct_lookup_home
+            && root.global_lookup
+            && root.pure_scope_end_copy_root
+    })?;
+
+    let mut aliases = value_by_temp
+        .iter()
+        .filter_map(|(temp, value)| (*value == value_id).then_some(*temp))
+        .collect::<BTreeSet<_>>();
+    let mut handoff_owner = None;
+    for branch_stmt in &non_nil_block.stmts {
+        let (target, value) = scalar_temp_definition(branch_stmt)?;
+        let HirExpr::TempRef(source) = value else {
+            return None;
+        };
+        if !aliases.contains(source) {
+            return None;
+        }
+        aliases.insert(target);
+        let target_home = facts.trusted_temp_home_slot(target)?;
+        if reference_captured_temps.contains(&target)
+            && uses.has_live_read_after(target, index)
+            && target_home != *root_home
+        {
+            handoff_owner = Some(target);
+        }
+    }
+    handoff_owner.map(|owner| (value_id, owner))
+}
+
+fn nil_compared_temp(lhs: &HirExpr, rhs: &HirExpr) -> Option<TempId> {
+    match (lhs, rhs) {
+        (HirExpr::TempRef(temp), HirExpr::Nil) | (HirExpr::Nil, HirExpr::TempRef(temp)) => {
+            Some(*temp)
+        }
+        _ => None,
+    }
 }
 
 fn record_lookup_root_overwrite(
@@ -836,7 +1001,8 @@ fn record_lookup_root_overwrite(
     facts: &ProtoPromotionFacts,
     lifetimes: &mut LookupGcRootLifetimeIndices,
 ) {
-    if root.crossed_gc_fence
+    if !root.global_lookup
+        && root.crossed_observation
         && root.eligible
         && overwrite_is_eligible
         && !root
@@ -868,9 +1034,188 @@ fn preserve_lookup_roots_to_scope_end(
     lifetimes.roots.extend(
         active
             .values()
-            .filter(|root| root.eligible && root.crossed_gc_fence)
+            .filter(|root| {
+                root.eligible
+                    && root.crossed_observation
+                    && (!root.global_lookup || root.pure_scope_end_copy_root)
+            })
             .map(|root| root.root_index),
     );
+}
+
+/// 将 return 表达式里“值已经被子表达式消费、随后仍跨过潜在用户代码/GC 事件”的
+/// lookup transaction 转成显式 root 观察事实。
+///
+/// 普通二元/一元/call 的当前 operands 在 operator/call 执行期间仍由表达式临时槽持有；
+/// 因此当前节点自身的事件只要求保留更早已经消费的 lookup identity。逻辑短路、
+/// constructor、closure 与 Decision 另有条件执行或强引用 handoff，当前证明不跨层猜测。
+fn observe_lookup_return_post_use_roots(
+    values: &crate::hir::common::HirValuePack,
+    definitions: &BTreeMap<TempId, &HirExpr>,
+    value_by_temp: &BTreeMap<TempId, LookupValueId>,
+    active: &mut BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
+    safety: HirExprSafety,
+) {
+    let mut resolving = BTreeSet::new();
+    let Some(flow) = values
+        .iter()
+        .try_fold(ReturnLookupFlow::default(), |flow, value| {
+            Some(flow.then(return_lookup_flow(
+                value,
+                definitions,
+                value_by_temp,
+                safety,
+                &mut resolving,
+            )?))
+        })
+    else {
+        return;
+    };
+
+    for root in active.values_mut() {
+        if root.direct_lookup_home
+            && root.scope_end_copy_root
+            && flow.needs_independent_root.contains(&root.value_id)
+        {
+            root.crossed_observation = true;
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReturnLookupFlow {
+    handed_roots: BTreeSet<LookupValueId>,
+    released_roots: BTreeSet<LookupValueId>,
+    needs_independent_root: BTreeSet<LookupValueId>,
+    has_observation: bool,
+}
+
+impl ReturnLookupFlow {
+    fn lookup(value: LookupValueId) -> Self {
+        Self {
+            handed_roots: BTreeSet::from([value]),
+            ..Self::default()
+        }
+    }
+
+    fn observation() -> Self {
+        Self {
+            has_observation: true,
+            ..Self::default()
+        }
+    }
+
+    fn then(mut self, next: Self) -> Self {
+        if next.has_observation {
+            self.needs_independent_root
+                .extend(self.released_roots.iter().copied());
+        }
+        self.handed_roots.extend(next.handed_roots);
+        self.released_roots.extend(next.released_roots);
+        self.needs_independent_root
+            .extend(next.needs_independent_root);
+        self.has_observation |= next.has_observation;
+        self
+    }
+
+    fn consume_result(mut self, observes: bool) -> Self {
+        if observes {
+            self.needs_independent_root
+                .extend(self.released_roots.iter().copied());
+            self.has_observation = true;
+        }
+        self.released_roots
+            .extend(std::mem::take(&mut self.handed_roots));
+        self
+    }
+}
+
+fn return_lookup_flow(
+    expr: &HirExpr,
+    definitions: &BTreeMap<TempId, &HirExpr>,
+    value_by_temp: &BTreeMap<TempId, LookupValueId>,
+    safety: HirExprSafety,
+    resolving: &mut BTreeSet<TempId>,
+) -> Option<ReturnLookupFlow> {
+    match expr {
+        HirExpr::TempRef(temp) => {
+            if let Some(value) = value_by_temp.get(temp).copied() {
+                return Some(ReturnLookupFlow::lookup(value));
+            }
+            let value = definitions.get(temp).copied()?;
+            if !resolving.insert(*temp) {
+                return None;
+            }
+            let flow = return_lookup_flow(value, definitions, value_by_temp, safety, resolving);
+            resolving.remove(temp);
+            flow
+        }
+        HirExpr::GlobalRef(_) => Some(ReturnLookupFlow::observation()),
+        HirExpr::TableAccess(access) => Some(
+            return_lookup_flow(&access.base, definitions, value_by_temp, safety, resolving)?
+                .then(return_lookup_flow(
+                    &access.key,
+                    definitions,
+                    value_by_temp,
+                    safety,
+                    resolving,
+                )?)
+                .consume_result(true),
+        ),
+        HirExpr::Unary(unary) => Some(
+            return_lookup_flow(&unary.expr, definitions, value_by_temp, safety, resolving)?
+                .consume_result(safety.unary_operator_may_observe_gc_roots(unary.op)),
+        ),
+        HirExpr::Binary(binary) => Some(
+            return_lookup_flow(&binary.lhs, definitions, value_by_temp, safety, resolving)?
+                .then(return_lookup_flow(
+                    &binary.rhs,
+                    definitions,
+                    value_by_temp,
+                    safety,
+                    resolving,
+                )?)
+                .consume_result(safety.binary_operator_may_observe_gc_roots(
+                    binary.op,
+                    &binary.lhs,
+                    &binary.rhs,
+                )),
+        ),
+        HirExpr::Call(call) => {
+            let flow = call.args.iter().try_fold(
+                return_lookup_flow(&call.callee, definitions, value_by_temp, safety, resolving)?,
+                |flow, arg| {
+                    Some(flow.then(return_lookup_flow(
+                        arg,
+                        definitions,
+                        value_by_temp,
+                        safety,
+                        resolving,
+                    )?))
+                },
+            )?;
+            Some(flow.consume_result(true))
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::Vector(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::VarArg => Some(ReturnLookupFlow::default()),
+        HirExpr::LogicalAnd(_)
+        | HirExpr::LogicalOr(_)
+        | HirExpr::Decision(_)
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => None,
+    }
 }
 
 fn exact_multi_nil_temp_overwrites(
@@ -1119,6 +1464,150 @@ fn stmt_is_direct_if_control_read(stmt: &HirStmt, aliases: &BTreeSet<TempId>) ->
     }
 }
 
+pub(super) fn scope_end_copy_roots_needing_materialization(
+    stmts: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<TempId> {
+    let mut collector = ScopeEndRootCollector {
+        roots: BTreeSet::new(),
+        facts,
+    };
+    collector.collect_generic_producer_roots(stmts);
+    visit_stmts(stmts, &mut collector);
+    collector.roots
+}
+
+struct ScopeEndRootCollector<'a> {
+    roots: BTreeSet<TempId>,
+    facts: &'a ProtoPromotionFacts,
+}
+
+impl ScopeEndRootCollector<'_> {
+    fn collect_generic_producer_roots(&mut self, stmts: &[HirStmt]) {
+        let copy_sources = stmts
+            .iter()
+            .filter_map(|stmt| {
+                let HirStmt::Assign(assign) = stmt else {
+                    return None;
+                };
+                match (
+                    assign.targets.as_slice(),
+                    assign.values.fixed.as_slice(),
+                    &assign.values.tail,
+                ) {
+                    ([HirLValue::Temp(target)], [HirExpr::TempRef(source)], None) => {
+                        Some((*target, *source))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (index, stmt) in stmts.iter().enumerate() {
+            let HirStmt::Assign(assign) = stmt else {
+                continue;
+            };
+            let Some(call) = assign.values.iter().find_map(|value| match value {
+                HirExpr::Call(call) => Some(call.as_ref()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let targets = assign
+                .targets
+                .iter()
+                .filter_map(|target| match target {
+                    HirLValue::Temp(temp) => Some(*temp),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if targets.len() != assign.targets.len() {
+                continue;
+            }
+            let mut generic_for = None;
+            for next in stmts[index + 1..].iter().take(5) {
+                match next {
+                    HirStmt::Assign(_) => {}
+                    HirStmt::GenericFor(owner) => {
+                        generic_for = Some(owner.as_ref());
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            let Some(generic_for) = generic_for else {
+                continue;
+            };
+            let consumed = targets.iter().all(|target| {
+                generic_for
+                    .iterator
+                    .fixed
+                    .iter()
+                    .any(|value| matches!(value, HirExpr::TempRef(temp) if temp == target))
+            });
+            if !consumed {
+                continue;
+            }
+            let mut refs = ScopeRootRefCollector {
+                roots: &mut self.roots,
+                facts: self.facts,
+                copy_sources: &copy_sources,
+            };
+            visit_call(call, &mut refs);
+        }
+    }
+}
+
+struct ScopeRootRefCollector<'a> {
+    roots: &'a mut BTreeSet<TempId>,
+    facts: &'a ProtoPromotionFacts,
+    copy_sources: &'a BTreeMap<TempId, TempId>,
+}
+
+impl HirVisitor for ScopeRootRefCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let HirExpr::TempRef(temp) = expr else {
+            return;
+        };
+        let mut current = *temp;
+        let mut seen = BTreeSet::new();
+        while seen.insert(current) {
+            if self.facts.is_scope_end_copy_root_temp(current) {
+                self.roots.insert(current);
+                break;
+            }
+            let Some(source) = self.copy_sources.get(&current).copied() else {
+                break;
+            };
+            current = source;
+        }
+    }
+}
+
+impl HirVisitor for ScopeEndRootCollector<'_> {
+    fn visit_block(&mut self, block: &HirBlock) {
+        self.collect_generic_producer_roots(&block.stmts);
+    }
+
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        let HirStmt::If(if_stmt) = stmt else {
+            return;
+        };
+        let temp = match &if_stmt.cond {
+            HirExpr::TempRef(temp) => Some(*temp),
+            HirExpr::Unary(unary) => match &unary.expr {
+                HirExpr::TempRef(temp) => Some(*temp),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(temp) = temp
+            && self.facts.is_scope_end_copy_root_temp(temp)
+        {
+            self.roots.insert(temp);
+        }
+    }
+}
+
 fn record_call_root_overwrite(
     root: ActiveCallRoot,
     index: usize,
@@ -1212,7 +1701,7 @@ fn active_call_value_representatives(
     representatives
 }
 
-fn stmt_may_observe_gc_roots(stmt: &HirStmt, safety: HirExprSafety) -> bool {
+pub(super) fn stmt_may_observe_gc_roots(stmt: &HirStmt, safety: HirExprSafety) -> bool {
     let mut collector = GcRootObservationCollector {
         found: false,
         safety,
@@ -1355,6 +1844,12 @@ impl TempUseEvents {
     fn has_live_read_after(&self, temp: TempId, index: usize) -> bool {
         let next_read = next_event_after(self.reads.get(&temp), index);
         let next_write = next_event_after(self.writes.get(&temp), index);
+        next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
+    }
+
+    fn has_live_read_from(&self, temp: TempId, index: usize) -> bool {
+        let next_read = next_event_at_or_after(self.reads.get(&temp), index);
+        let next_write = next_event_at_or_after(self.writes.get(&temp), index);
         next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
     }
 
@@ -1531,7 +2026,6 @@ fn update_allocation_roots(
     index: usize,
     temp: TempId,
     value: &HirExpr,
-    value_is_known_nil: bool,
     slot: HomeSlotKey,
     eligible: bool,
 ) {
@@ -1556,16 +2050,17 @@ fn update_allocation_roots(
 
         root.aliases.remove(&temp);
         if root.homes.remove(&slot) {
-            if value_is_known_nil {
-                record_allocation_root_overwrite(
-                    root,
-                    index,
-                    slot,
-                    eligible,
-                    state.uses,
-                    state.lifetimes,
-                );
-            }
+            // Any scalar definition commits a new value to the trusted home after evaluating
+            // its RHS. Literal nil is special only for nil-fact propagation above; a lookup,
+            // primitive, or call is an equally exact end to the preceding allocation root.
+            record_allocation_root_overwrite(
+                root,
+                index,
+                slot,
+                eligible,
+                state.uses,
+                state.lifetimes,
+            );
             root.aliases.retain(|alias| {
                 state
                     .facts

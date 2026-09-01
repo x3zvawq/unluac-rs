@@ -14,8 +14,8 @@
 //! - 嵌套循环自己的 `continue` 保留原 owner，不会阻止外层 `repeat` 的尾部整理
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLocalOrigin,
-    AstLogicalExpr, AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLogicalExpr,
+    AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 use super::control_flow::block_contains_label_or_goto;
@@ -547,8 +547,10 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
 ///
 /// `literal-fold` 只会把无元方法的原始字面量条件变成 `Boolean`；因此选中的 arm
 /// 不再有条件求值事件，未选中的 arm 也不会执行。不过，未选 arm 的 permissive
-/// label/goto 与 Error 都是项目要求保留的诊断证据；`global` 是方言级
-/// 的词法声明，debug/物理根、local-function 与 capture 则携带项目要求保留的 identity。
+/// label/goto 与 Error 都是项目要求保留的诊断证据；DebugHinted local 与显式 local
+/// attr 则携带项目要求保留的源码 identity。纯 PhysicalRoot、recovered local-function、
+/// capture 与 `global` 声明在未选 arm 都不会产生运行期事件；`global` 的词法效力也不会
+/// 越过该 arm，因此它们不构成删除边界。
 /// 这些证据只在未选 arm 会被删除时阻止改写；位于选中 arm 时节点本身继续保留，
 /// 需要词法范围的语句用 `do ... end` 保持原 if block 的边界，包括 `<close>` 的退出点和
 /// captured local 的 root lifetime。`break`/`continue` 只跨过非循环的 `if` 外壳，最近
@@ -594,10 +596,9 @@ fn constant_if_unselected_arm_is_protected(if_stmt: &AstIf, selected_then: bool)
         // 候选拒绝[PolicyBoundary]：删除常量 arm 外壳会连同 best-effort Error 诊断一起
         // 消失；项目选择保留失败证据，即使该 arm 按运行语义不可达。
         || block_contains_diagnostic(unselected)
-        // 候选拒绝[PolicyBoundary]：方言 global 声明作为源码级编译期证据保留；选中 arm
-        // 可用 do 保持范围、未选 arm 也可删除，因此这不是运行语义不等价证明。
-        || block_contains_global_decl(unselected)
-        // 候选拒绝[PolicyBoundary]：debug/physical/local-function/capture 身份即使位于未选 arm 也按项目的源码证据保留策略记账。
+        // 候选拒绝[PolicyBoundary]：DebugHinted（含同时为 PhysicalRoot）的源码身份与
+        // 显式 local attr 即使位于未选 arm 也按项目的源码证据保留策略记账；纯
+        // PhysicalRoot、recovered local-function 与 capture 在恒不可达 arm 没有运行期。
         || block_contains_identity_boundary(unselected)
 }
 
@@ -619,20 +620,6 @@ fn block_contains_diagnostic(block: &AstBlock) -> bool {
     visitor.0
 }
 
-struct GlobalDeclVisitor(bool);
-
-impl AstVisitor for GlobalDeclVisitor {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
-        self.0 |= matches!(stmt, AstStmt::GlobalDecl(_));
-    }
-}
-
-fn block_contains_global_decl(block: &AstBlock) -> bool {
-    let mut visitor = GlobalDeclVisitor(false);
-    visit::visit_block(block, &mut visitor);
-    visitor.0
-}
-
 struct IdentityBoundaryVisitor(bool);
 
 impl AstVisitor for IdentityBoundaryVisitor {
@@ -640,20 +627,14 @@ impl AstVisitor for IdentityBoundaryVisitor {
         match stmt {
             AstStmt::LocalDecl(local_decl) => {
                 self.0 |= local_decl.bindings.iter().any(|binding| {
-                    binding.origin != AstLocalOrigin::Recovered
-                        || !matches!(binding.attr, AstLocalAttr::None)
+                    binding.origin.is_debug_hinted() || !matches!(binding.attr, AstLocalAttr::None)
                 });
             }
-            // A local-function declaration carries a binding identity even when its body has no
-            // explicit capture; dropping it from an unselected arm would erase that evidence.
-            AstStmt::LocalFunctionDecl(_) => self.0 = true,
+            AstStmt::LocalFunctionDecl(local_function) => {
+                self.0 |= local_function.origin.is_debug_hinted();
+            }
             _ => {}
         }
-    }
-
-    fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
-        self.0 |= !function.captured_bindings.is_empty() || !function.captured_params.is_empty();
-        true
     }
 }
 
@@ -998,6 +979,7 @@ mod tests {
                     body: AstBlock::default(),
                     captured_bindings: BTreeSet::from([binding]),
                     captured_params: BTreeSet::new(),
+                    capture_names_by_upvalue: std::collections::BTreeMap::new(),
                     capture_write_names: BTreeSet::new(),
                 }))],
                 method_name: None,

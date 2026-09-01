@@ -32,7 +32,7 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::expr_facts::expr_truthiness;
-use super::super::mention::expr_mentions_local;
+use super::super::mention::{expr_mentions_local, stmts_reference_captured_bindings};
 use super::super::visit::{self, HirVisitor};
 use super::super::walk::{self, HirRewritePass};
 
@@ -59,6 +59,18 @@ pub(super) fn coalesce_param_aliases_in_proto(
         .is_some_and(Option::is_some)
     {
         // 候选拒绝[PolicyBoundary]：带 source debug identity 的 alias local 保留独立声明，不把其名称与词法范围折入参数。
+        return false;
+    }
+    if proto.physical_root_locals.contains(&alias.local)
+        && (rest.iter().any(|stmt| stmt_writes_param(stmt, alias.param))
+            || stmts_reference_captured_bindings(rest)
+                .params
+                .contains(&alias.param))
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：普通 value-flow 允许在 alias 最后一次读取后
+        // 覆盖参数，但 PhysicalRoot 仍须保留旧对象到原 local scope 结束。只有参数在完整
+        // 后缀无写且未被 reference capture 暴露时，参数本身才是同一对象的稳定强根；
+        // regress_406 覆盖 generic-for body 覆盖参数、弱表观察 alias 提前消失的反例。
         return false;
     }
     if let Err(error) =

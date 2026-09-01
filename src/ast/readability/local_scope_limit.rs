@@ -1,17 +1,20 @@
 //! 为超大函数里的短生命周期 local 补充有限词法作用域。
 //!
 //! 本 pass 依赖 Deferred 阶段已经稳定的语句相邻关系和 binding mention，不补 HIR 事实，
-//! 也不为减少 local 做可能改变调用、global lookup 或比较顺序的跨语句内联。它沿词法树
+//! 也不为减少 local 做可能改变调用或比较顺序的跨语句内联。它沿词法树
 //! 携带外层 local 预算，把短生命周期、无属性的声明分批放入 `do ... end`；带属性 local
 //! 与 label/goto 边界保持原状。例如同一函数内 240 个顺序临时声明会变成若干个最多 64
 //! 个 local 的 `do` 块，而闭包捕获或后续仍读取的 binding 会把作用域延长到最后 mention。
 //! repeat body 中被 until 条件读取的 local 必须留在正文直属作用域，不能包进 `do`。
+//! Lua 5.5 的 global 声明由 `global-decl-pretty` 负责 block 级补全；本 pass 不新增
+//! global 访问，只缩短连续区间，并通过 invalidation 让该 owner 在下一 Deferred 固定点
+//! 修复新边界。因此 global 语句不再是永久 scope barrier。
 
 use std::collections::BTreeMap;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstFunctionName, AstLocalAttr,
-    AstLocalBinding, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstLocalBinding,
+    AstLocalOrigin, AstModule, AstStmt,
 };
 use super::binding_flow::{binding_mentions_in_expr, binding_mentions_in_stmt};
 use super::control_flow::BlockGotoIndex;
@@ -20,19 +23,11 @@ use walk::{BlockKind, ScopedAstRewritePass};
 
 const SCOPE_LOCAL_TARGET: usize = 64;
 
-pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
-    walk::rewrite_module_scoped(
-        module,
-        &0,
-        &mut LocalScopeLimitPass {
-            has_global_declarations: context.target.caps.global_decl,
-        },
-    )
+pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
+    walk::rewrite_module_scoped(module, &0, &mut LocalScopeLimitPass)
 }
 
-struct LocalScopeLimitPass {
-    has_global_declarations: bool,
-}
+struct LocalScopeLimitPass;
 
 impl ScopedAstRewritePass for LocalScopeLimitPass {
     type Scope = usize;
@@ -42,7 +37,7 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         function: &mut AstFunctionExpr,
         _outer_scope: &Self::Scope,
     ) -> Self::Scope {
-        function.params.len() + usize::from(function.named_vararg.is_some())
+        function_entry_local_count(function)
     }
 
     fn enter_block(
@@ -51,12 +46,7 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         _kind: BlockKind,
         outer_locals: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        enter_block_with_trailing_condition(
-            block,
-            None,
-            *outer_locals,
-            self.has_global_declarations,
-        )
+        enter_block_with_trailing_condition(block, None, *outer_locals)
     }
 
     fn enter_repeat_body(
@@ -65,12 +55,7 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         condition: &AstExpr,
         outer_locals: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        enter_block_with_trailing_condition(
-            block,
-            Some(condition),
-            *outer_locals,
-            self.has_global_declarations,
-        )
+        enter_block_with_trailing_condition(block, Some(condition), *outer_locals)
     }
 
     fn scope_for_stmt_children(
@@ -80,13 +65,7 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
     ) -> Self::Scope {
         // for 控制变量只在 loop body 内可见；控制表达式里即使出现嵌套函数，
         // enter_function 也会重置预算，因此统一给 statement children 加上它们是精确的。
-        match stmt {
-            AstStmt::NumericFor(_) => outer_locals.saturating_add(1),
-            AstStmt::GenericFor(generic_for) => {
-                outer_locals.saturating_add(generic_for.bindings.len())
-            }
-            _ => *outer_locals,
-        }
+        outer_locals.saturating_add(stmt_child_local_count(stmt))
     }
 
     fn scope_after_stmt(&mut self, stmt: &AstStmt, outer_locals: &Self::Scope) -> Self::Scope {
@@ -99,13 +78,11 @@ fn enter_block_with_trailing_condition(
     block: &mut AstBlock,
     trailing_condition: Option<&AstExpr>,
     outer_locals: usize,
-    has_global_declarations: bool,
 ) -> (bool, usize) {
     let changed = scope_locals(
         block,
         crate::SOURCE_LOCAL_LIMIT.saturating_sub(outer_locals),
         trailing_condition,
-        has_global_declarations,
     );
     // 当前 block 的声明不能在入口一次性加入：它们只应通过 scope_after_stmt
     // 按源码位置影响后续 sibling 及其子 block。
@@ -116,7 +93,6 @@ fn scope_locals(
     block: &mut AstBlock,
     available_locals: usize,
     trailing_condition: Option<&AstExpr>,
-    has_global_declarations: bool,
 ) -> bool {
     let direct_local_count = block.stmts.iter().map(direct_local_count).sum::<usize>();
     if available_locals == 0 {
@@ -170,13 +146,7 @@ fn scope_locals(
     }
     let scope_target =
         SCOPE_LOCAL_TARGET.min(available_locals.saturating_sub(persistent_locals).max(1));
-    let ranges = scope_ranges(
-        &block.stmts,
-        &last_mentions,
-        &short_lived,
-        scope_target,
-        has_global_declarations,
-    );
+    let ranges = scope_ranges(&block.stmts, &last_mentions, &short_lived, scope_target);
     if ranges.is_empty() {
         // 所有形成过的 range 已在 planner 内按具体 density、scope 或 lifetime 原因拒绝；
         // 空计划不是新的候选拒绝点。
@@ -198,7 +168,19 @@ fn scope_locals(
     true
 }
 
-fn direct_local_count(stmt: &AstStmt) -> usize {
+pub(super) fn function_entry_local_count(function: &AstFunctionExpr) -> usize {
+    function.params.len() + usize::from(function.named_vararg.is_some())
+}
+
+pub(super) fn stmt_child_local_count(stmt: &AstStmt) -> usize {
+    match stmt {
+        AstStmt::NumericFor(_) => 1,
+        AstStmt::GenericFor(generic_for) => generic_for.bindings.len(),
+        _ => 0,
+    }
+}
+
+pub(super) fn direct_local_count(stmt: &AstStmt) -> usize {
     match stmt {
         AstStmt::LocalDecl(decl) => decl.bindings.len(),
         AstStmt::LocalFunctionDecl(_) => 1,
@@ -298,7 +280,6 @@ fn scope_ranges(
     last_mentions: &BTreeMap<AstBindingRef, usize>,
     short_lived: &[bool],
     scope_target: usize,
-    has_global_declarations: bool,
 ) -> Vec<(usize, usize)> {
     let goto_index = BlockGotoIndex::new(stmts);
     let mut ranges = Vec::new();
@@ -323,7 +304,7 @@ fn scope_ranges(
             .expect("scopeable declaration must contain a binding");
         let mut scoped_locals = 0usize;
         let mut safe_end = None;
-        while index < stmts.len() && !is_scope_barrier(&stmts[index], has_global_declarations) {
+        while index < stmts.len() && !is_scope_barrier(&stmts[index]) {
             if let Some(bindings) = scopeable_bindings(&stmts[index]) {
                 if !short_lived[index] {
                     // 候选拒绝[PolicyBoundary]：当前 pass 只生成不超过 64-local 的连续
@@ -349,7 +330,13 @@ fn scope_ranges(
                 );
             }
             if index >= required_end {
-                safe_end = Some((index + 1, scoped_locals));
+                let end = index + 1;
+                // 候选接受：当前 pass 不生成 global 访问，只把同序连续语句放入子 do；
+                // 它声明 BindingStructure/ControlFlowShape invalidation，下一 Deferred 固定点
+                // 的 global-decl-pretty 会按新 block 边界、逐名/通配属性及 nested write
+                // 补全后缀所需声明。regress438 锁定 declaration 与 global-function 可跨
+                // local-budget range，最终生成源码仍可重编译运行。
+                safe_end = Some((end, scoped_locals));
                 if scoped_locals >= scope_target {
                     break;
                 }
@@ -380,25 +367,7 @@ fn scope_ranges(
     ranges
 }
 
-fn is_scope_barrier(stmt: &AstStmt, has_global_declarations: bool) -> bool {
-    let opens_global_scope = has_global_declarations
-        && (matches!(stmt, AstStmt::GlobalDecl(_))
-            || matches!(
-                stmt,
-                AstStmt::FunctionDecl(function)
-                    if matches!(
-                        &function.target,
-                        AstFunctionName::Plain(path)
-                            if path.fields.is_empty()
-                                && matches!(path.root, AstNameRef::Global(_))
-                    )
-            ));
-    if opens_global_scope {
-        // 候选拒绝[SemanticBarrier:Scope]：Lua 5.5 的 `global` / `global function`
-        // 声明从当前位置作用到原 block 后缀；随 local range 包进新 `do` 会让后缀
-        // global use 失去声明。没有 global 声明语法的目标仍可移动普通函数赋值糖。
-        return true;
-    }
+fn is_scope_barrier(stmt: &AstStmt) -> bool {
     // 属性/debug/root 声明的具体拒绝理由由 scopeable_bindings 在同一候选点分类。
     direct_local_count(stmt) != 0 && scopeable_bindings(stmt).is_none()
 }
@@ -407,11 +376,9 @@ fn is_scope_barrier(stmt: &AstStmt, has_global_declarations: bool) -> bool {
 mod tests {
     use super::*;
     use crate::ast::common::{
-        AstAssign, AstFunctionDecl, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
-        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstLValue, AstLabel,
-        AstLabelId, AstLocalDecl, AstNamePath, AstNameRef, AstReturn,
+        AstGenericFor, AstGoto, AstLabel, AstLabelId, AstLocalDecl, AstReturn,
     };
-    use crate::hir::{HirProtoRef, LocalId};
+    use crate::hir::LocalId;
 
     fn recovered_local(index: usize) -> AstStmt {
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -452,39 +419,6 @@ mod tests {
         }))
     }
 
-    fn global_decl(name: &str) -> AstStmt {
-        AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
-            bindings: vec![AstGlobalBinding {
-                target: AstGlobalBindingTarget::Name(AstGlobalName {
-                    text: name.to_owned(),
-                }),
-                attr: AstGlobalAttr::None,
-            }],
-            values: Vec::new(),
-        }))
-    }
-
-    fn plain_global_function(name: &str) -> AstStmt {
-        AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
-            target: AstFunctionName::Plain(AstNamePath {
-                root: AstNameRef::Global(AstGlobalName {
-                    text: name.to_owned(),
-                }),
-                fields: Vec::new(),
-            }),
-            func: AstFunctionExpr {
-                function: HirProtoRef(1),
-                params: Vec::new(),
-                is_vararg: false,
-                named_vararg: None,
-                body: AstBlock::default(),
-                captured_bindings: Default::default(),
-                captured_params: Default::default(),
-                capture_write_names: Default::default(),
-            },
-        }))
-    }
-
     #[test]
     fn scopes_preceding_locals_before_generic_for_binder_peak() {
         let mut block = AstBlock {
@@ -503,12 +437,7 @@ mod tests {
                 .collect(),
         };
 
-        assert!(scope_locals(
-            &mut block,
-            crate::SOURCE_LOCAL_LIMIT,
-            None,
-            false,
-        ));
+        assert!(scope_locals(&mut block, crate::SOURCE_LOCAL_LIMIT, None));
         assert!(matches!(block.stmts.first(), Some(AstStmt::DoBlock(_))));
     }
 
@@ -521,7 +450,6 @@ mod tests {
                 &last_binding_mentions(&internal),
                 &[true, false, false, false],
                 SCOPE_LOCAL_TARGET,
-                false,
             ),
             vec![(0, 4)]
         );
@@ -539,7 +467,6 @@ mod tests {
                 &last_binding_mentions(&outgoing),
                 &[true, false, false, false, false],
                 SCOPE_LOCAL_TARGET,
-                false,
             ),
             vec![(0, 3)]
         );
@@ -551,43 +478,8 @@ mod tests {
                 &last_binding_mentions(&incoming),
                 &[false, true, false, false],
                 SCOPE_LOCAL_TARGET,
-                false,
             )
             .is_empty()
         );
-    }
-
-    #[test]
-    fn scope_range_does_not_shorten_a_global_declaration_scope() {
-        let stmts = vec![
-            recovered_local(0),
-            global_decl("exported"),
-            return_binding(0),
-            AstStmt::Assign(Box::new(AstAssign {
-                targets: vec![AstLValue::Name(AstNameRef::Global(AstGlobalName {
-                    text: "exported".to_owned(),
-                }))],
-                values: vec![AstExpr::Integer(1)],
-            })),
-        ];
-
-        assert!(
-            scope_ranges(
-                &stmts,
-                &last_binding_mentions(&stmts),
-                &[true, false, false, false],
-                SCOPE_LOCAL_TARGET,
-                true,
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn only_global_function_syntax_opens_a_function_declaration_barrier() {
-        let function = plain_global_function("install");
-
-        assert!(is_scope_barrier(&function, true));
-        assert!(!is_scope_barrier(&function, false));
     }
 }

@@ -4,25 +4,29 @@
 //! source debug 身份；这里在这些事实之上证明两个 HIR binding 只是同一物理状态的阶段性
 //! 名称，不重新推断 CFG owner，也不移动或复制 RHS。证明只接受同一精确 home-slot，并沿
 //! 每条结构化路径跟踪 `Unproduced/Pending/Synced`；Decision 的全部 test/target 读取按并集
-//! 保守验证，而多值、goto、cleanup 或 Unresolved 等未建模边界会保留原形。
+//! 保守验证。owner-wide label refs 与 lexical CFG 会精确跟踪候选内 goto；外部入口、
+//! 未同步的外跳与 Unresolved 保留原形。cleanup 只有在 possible-home 与改写端点相交时
+//! 才由 proto 级身份门拒绝，不相交的 cleanup 原位保留。
 //!
 //! 例如 `local r; if c then r = s + 1 else r = s + 2 end; s = r` 会收成两臂直接更新
 //! `s`；若任一路在同步前读取旧 `s`、跳出循环，或随后仍读取已经被消费的 `r`，则整项拒绝。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirAssign, HirBlock, HirExpr, HirLValue, HirStmt, HirValuePack, LocalId};
 use crate::hir::promotion::ProtoPromotionFacts;
 
+use super::super::super::expr_facts::expr_truthiness;
+use super::super::super::lexical_cfg::LexicalCfg;
 use super::super::super::visit::{HirVisitor, visit_expr, visit_stmts};
 use super::super::super::walk::rewrite_stmts;
-use super::super::HandoffIdentityFacts;
 use super::super::binding::{
     BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
     carry_binding_from_expr, carry_binding_from_lvalue,
 };
 use super::super::prune::{RedundantSelfAssignPrunePass, prune_empty_assign_stmts};
 use super::super::reads::{BindingReadCollector, collect_binding_mentions_by_stmt};
+use super::super::{HandoffIdentityFacts, RegionControlFacts};
 use super::binding_facts;
 
 pub(in crate::hir::simplify::carried_locals) fn collapse_result_writeback_transactions(
@@ -30,6 +34,7 @@ pub(in crate::hir::simplify::carried_locals) fn collapse_result_writeback_transa
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
     inherited_locals: &BTreeSet<LocalId>,
 ) -> bool {
     let mut changed = false;
@@ -38,6 +43,7 @@ pub(in crate::hir::simplify::carried_locals) fn collapse_result_writeback_transa
         outer_bindings,
         promotion_facts,
         identity_facts,
+        control_facts,
         inherited_locals,
     ) {
         apply_candidate(block, candidate, promotion_facts);
@@ -60,6 +66,7 @@ fn find_candidate(
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
     inherited_locals: &BTreeSet<LocalId>,
 ) -> Option<Candidate> {
     let mentions = collect_binding_mentions_by_stmt(&block.stmts);
@@ -71,10 +78,9 @@ fn find_candidate(
         // 候选拒绝[PolicyBoundary]：debug result 是项目选择保留的源码身份。
         // 候选拒绝[SemanticBarrier:Scope]：for result 每轮重建且只在 loop body 可见；
         // 合并到跨轮 state 会改变迭代 refresh 和词法作用域。
-        // 候选拒绝[SemanticBarrier:Capture]：captured/outer result 可在 region 外被观察，不能删除其 cell identity。
+        // 候选拒绝[SemanticBarrier:Scope]：outer result 可在 region 外被观察，不能删除其 binding identity。
         if identity_facts.contains(result)
             || outer_bindings.contains(&result_binding)
-            || identity_facts.captured.contains(&result_binding)
             || mentions[..declaration]
                 .iter()
                 .any(|bindings| bindings.contains(&result_binding))
@@ -88,39 +94,54 @@ fn find_candidate(
         else {
             continue;
         };
-        if writeback_region_has_barrier(&block.stmts[declaration + 1..=last_mention]) {
+        if writeback_region_has_barrier(&block.stmts[declaration + 1..=last_mention], control_facts)
+        {
             // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
-            // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可引入未被结构化 verifier 覆盖的入口与出口。
-            // 候选拒绝[SemanticBarrier:Lifetime]：跨过 TBC/Close 后合并 result/state 会改变
-            // resource 所属 cell 的 close epoch；close owner 已先运行，残余节点就是活边界。
+            // 候选拒绝[SemanticBarrier:ControlFlow]：owner-wide label refs 证明外部入口时，
+            // producer 可被绕过或重执行；self-contained edge 交给 relation CFG。
             continue;
         }
-        let eligible_states =
+        let target_states =
             writeback_targets(&block.stmts[declaration + 1..=last_mention], result_binding)
                 .into_iter()
-                .filter(|state| {
-                    *state != result_binding
-                        && identity_facts.binding_merge_preserves_identity(
-                            result_binding,
-                            *state,
-                            promotion_facts,
-                        )
-                        && !state
-                            .local()
-                            .is_some_and(|local| identity_facts.for_bindings.contains(&local))
-                        && binding_available_before(
-                            block,
-                            declaration,
-                            *state,
-                            outer_bindings,
-                            inherited_locals,
-                        )
-                        && same_exact_home_slot(result_binding, *state, promotion_facts)
-                })
+                .filter(|state| *state != result_binding)
                 .collect::<Vec<_>>();
+        if target_states.is_empty() {
+            continue;
+        }
+        let available_states = target_states
+            .into_iter()
+            .filter(|state| {
+                binding_available_before(
+                    block,
+                    declaration,
+                    *state,
+                    outer_bindings,
+                    inherited_locals,
+                )
+            })
+            .collect::<Vec<_>>();
+        if available_states.is_empty() {
+            // 候选拒绝[SemanticBarrier:Scope]：writeback target 在 result 声明前不可用时，
+            // 把 producer 直接改写为 target 会制造声明前写入。
+            continue;
+        }
+        let eligible_states = available_states
+            .into_iter()
+            .filter(|state| {
+                identity_facts.binding_merge_preserves_identity(
+                    result_binding,
+                    *state,
+                    promotion_facts,
+                ) && !state
+                    .local()
+                    .is_some_and(|local| identity_facts.for_bindings.contains(&local))
+                    && same_exact_home_slot(result_binding, *state, promotion_facts)
+            })
+            .collect::<Vec<_>>();
         if eligible_states.is_empty() {
-            // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/不可用/异槽 state 与 result
-            // 具有可区分的作用域或 root epoch。
+            // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/异槽 state 与 result 具有
+            // 可区分的 cell 或 root epoch。
             continue;
         }
         let completed_states = completed_writeback_states(
@@ -128,6 +149,7 @@ fn find_candidate(
             &eligible_states,
             initializer,
             &block.stmts[declaration + 1..=last_mention],
+            control_facts,
         );
         if completed_states.is_empty() {
             // 候选拒绝[SemanticBarrier:Lifetime]：每个 eligible target 都在某条路径
@@ -175,6 +197,7 @@ fn completed_writeback_states(
     eligible_states: &[CarryBinding],
     initializer: Option<&HirValuePack>,
     stmts: &[HirStmt],
+    control_facts: &RegionControlFacts,
 ) -> Vec<CarryBinding> {
     eligible_states
         .iter()
@@ -183,15 +206,66 @@ fn completed_writeback_states(
             let verifier = FlowVerifier {
                 result,
                 state: *state,
+                control_facts,
+                validate_rewritten_reads: true,
             };
             let Some(states) = verifier.validate_initializer(initializer) else {
                 return false;
             };
             verifier
-                .validate_stmts(stmts, states)
+                .validate_region(stmts, states)
                 .is_some_and(|states| !states.contains(Relation::Pending))
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ExternalTransferScope {
+    WholeRegion,
+    LoopExitPlan,
+}
+
+pub(super) fn region_rewrites_preserve_external_transfers(
+    stmts: &[HirStmt],
+    rewrites: &BTreeMap<CarryBinding, CarryBinding>,
+    control_facts: &RegionControlFacts,
+    scope: ExternalTransferScope,
+) -> bool {
+    rewrites.iter().all(|(result, state)| {
+        let verifier = FlowVerifier {
+            result: *result,
+            state: *state,
+            control_facts,
+            // Whole-region plans rename every read. Loop plans rename only tracked exit
+            // producers and the live-out suffix, so unrelated body reads remain untouched.
+            validate_rewritten_reads: matches!(scope, ExternalTransferScope::WholeRegion),
+        };
+        let Ok(_) =
+            LexicalCfg::analyze(stmts, &control_facts.label_refs, control_facts.expr_safety)
+        else {
+            return false;
+        };
+        let Some(outcome) = verifier.validate_block(stmts, RelationSet::only(Relation::Unproduced))
+        else {
+            return false;
+        };
+        let has_unsynced = |states: RelationSet| {
+            states.contains(Relation::Unproduced) || states.contains(Relation::Pending)
+        };
+        let unsynced_goto = outcome
+            .outgoing
+            .values()
+            .any(|states| has_unsynced(*states));
+        let unsynced_loop_transfer = matches!(scope, ExternalTransferScope::WholeRegion)
+            && (has_unsynced(outcome.breaks) || has_unsynced(outcome.continues));
+        if unsynced_goto || unsynced_loop_transfer {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：跨 owner transfer 只有在 result/state
+            // 已同步时才等价。Unproduced 改名会把 nil 换成旧 state；Pending 改名会提前
+            // 覆盖旧 state，目标 owner 都可能观察不同 epoch。
+            return false;
+        }
+        true
+    })
 }
 
 struct WritebackTargetCollector {
@@ -258,12 +332,14 @@ fn same_exact_home_slot(
 }
 
 #[derive(Clone, Copy)]
-struct FlowVerifier {
+struct FlowVerifier<'a> {
     result: CarryBinding,
     state: CarryBinding,
+    control_facts: &'a RegionControlFacts,
+    validate_rewritten_reads: bool,
 }
 
-impl FlowVerifier {
+impl FlowVerifier<'_> {
     fn validate_initializer(&self, initializer: Option<&HirValuePack>) -> Option<RelationSet> {
         let Some(initializer) = initializer else {
             return Some(RelationSet::only(Relation::Unproduced));
@@ -280,50 +356,121 @@ impl FlowVerifier {
         })
     }
 
-    fn validate_stmts(&self, stmts: &[HirStmt], mut states: RelationSet) -> Option<RelationSet> {
-        for stmt in stmts {
-            if states.is_empty() {
-                break;
-            }
-            states = self.validate_stmt(stmt, states)?;
+    fn validate_region(&self, stmts: &[HirStmt], states: RelationSet) -> Option<RelationSet> {
+        LexicalCfg::analyze(
+            stmts,
+            &self.control_facts.label_refs,
+            self.control_facts.expr_safety,
+        )
+        .ok()?;
+        let outcome = self.validate_block(stmts, states)?;
+        if outcome.breaks.contains(Relation::Pending)
+            || outcome.continues.contains(Relation::Pending)
+            || outcome
+                .outgoing
+                .values()
+                .any(|states| states.contains(Relation::Pending))
+        {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：离开候选 owner 的 Pending path 未执行
+            // writeback；把 result producer 提前改成 state write 会改变目标 owner 的读取。
+            return None;
         }
-        Some(states)
+        Some(outcome.fallthrough)
     }
 
-    fn validate_stmt(&self, stmt: &HirStmt, states: RelationSet) -> Option<RelationSet> {
+    fn validate_block(&self, stmts: &[HirStmt], states: RelationSet) -> Option<FlowOutcome> {
+        if stmts.is_empty() {
+            return Some(FlowOutcome::fallthrough(states));
+        }
+        let direct_labels = stmts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stmt)| match stmt {
+                HirStmt::Label(label) => Some((label.id, index)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut inputs = vec![RelationSet::EMPTY; stmts.len()];
+        inputs[0] = states;
+        let mut pending = vec![0usize];
+        let mut exits = FlowOutcome::default();
+        while let Some(index) = pending.pop() {
+            let mut output = self.validate_stmt_outcome(&stmts[index], inputs[index])?;
+            if index + 1 < stmts.len() {
+                if !output.fallthrough.is_empty() {
+                    let next = inputs[index + 1].union(output.fallthrough);
+                    if next != inputs[index + 1] {
+                        inputs[index + 1] = next;
+                        pending.push(index + 1);
+                    }
+                }
+            } else {
+                exits.fallthrough = exits.fallthrough.union(output.fallthrough);
+            }
+            for (target, target_states) in std::mem::take(&mut output.outgoing) {
+                if let Some(&target_index) = direct_labels.get(&target) {
+                    let next = inputs[target_index].union(target_states);
+                    if next != inputs[target_index] {
+                        inputs[target_index] = next;
+                        pending.push(target_index);
+                    }
+                } else {
+                    exits.add_outgoing(target, target_states);
+                }
+            }
+            exits.breaks = exits.breaks.union(output.breaks);
+            exits.continues = exits.continues.union(output.continues);
+        }
+        Some(exits)
+    }
+
+    fn validate_stmt_outcome(&self, stmt: &HirStmt, states: RelationSet) -> Option<FlowOutcome> {
         match stmt {
-            HirStmt::Assign(assign) => self.validate_assign(assign, states),
+            HirStmt::Assign(assign) => self
+                .validate_assign(assign, states)
+                .map(FlowOutcome::fallthrough),
             HirStmt::If(if_stmt) => {
                 self.validate_expr(&if_stmt.cond, states)?;
-                let then_states = self.validate_stmts(&if_stmt.then_block.stmts, states)?;
-                let else_states = if let Some(else_block) = &if_stmt.else_block {
-                    self.validate_stmts(&else_block.stmts, states)?
+                let then_outcome = self.validate_block(&if_stmt.then_block.stmts, states)?;
+                let else_outcome = if let Some(else_block) = &if_stmt.else_block {
+                    self.validate_block(&else_block.stmts, states)?
                 } else {
-                    states
+                    FlowOutcome::fallthrough(states)
                 };
-                Some(then_states.union(else_states))
+                Some(then_outcome.union(else_outcome))
             }
-            HirStmt::Block(block) => self.validate_stmts(&block.stmts, states),
+            HirStmt::Block(block) => self.validate_block(&block.stmts, states),
             HirStmt::Return(return_stmt) => {
                 self.validate_pack(&return_stmt.values, states)?;
-                // 候选拒绝[SemanticBarrier:ControlFlow]：Pending 路径 return 时原 state 仍旧，result 改名会在返回前提前覆盖 state/capture。
-                (!states.contains(Relation::Pending)).then_some(RelationSet::EMPTY)
+                // return pack 已验证所有可观察读取，且 identity 门排除了 capture/resource；
+                // 终止后未同步的旧 state 不再有 observer。
+                Some(FlowOutcome::default())
             }
-            HirStmt::Break | HirStmt::Continue => {
-                // 候选拒绝[SemanticBarrier:ControlFlow]：Pending 路径提前转移时没有执行 writeback，不能把 result producer 直接改成 state write。
-                (!states.contains(Relation::Pending)).then_some(RelationSet::EMPTY)
+            HirStmt::Break => Some(FlowOutcome {
+                breaks: states,
+                ..FlowOutcome::default()
+            }),
+            HirStmt::Continue => Some(FlowOutcome {
+                continues: states,
+                ..FlowOutcome::default()
+            }),
+            HirStmt::Goto(goto_stmt) => {
+                let mut outcome = FlowOutcome::default();
+                outcome.add_outgoing(goto_stmt.target, states);
+                Some(outcome)
             }
             HirStmt::While(_)
             | HirStmt::Repeat(_)
             | HirStmt::NumericFor(_)
-            | HirStmt::GenericFor(_) => self.validate_loop(stmt, states),
-            HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_) => {
-                // 候选拒绝[SemanticBarrier:ControlFlow]：goto 可从 Pending 路径跳过 writeback，
-                // 或从外部 label 入口绕过 producer；三态结构流不能把这种路径当作 Synced。
-                // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 位于 result producer 与
-                // writeback 之间时，合并 cell 会改变 resource 的 close/root epoch。
-                None
+            | HirStmt::GenericFor(_) => self.validate_loop_outcome(stmt, states),
+            HirStmt::Label(_) => Some(FlowOutcome::fallthrough(states)),
+            HirStmt::ToBeClosed(to_be_closed) => {
+                // 候选形成前的 proto 身份门已经证明 result/state 与所有 TBC possible-home
+                // 不相交；这里只需保留并验证 TBC value 的读取 epoch。
+                self.validate_expr(&to_be_closed.value, states)?;
+                Some(FlowOutcome::fallthrough(states))
             }
+            HirStmt::Close(_) => Some(FlowOutcome::fallthrough(states)),
             HirStmt::LocalDecl(local_decl) => {
                 if local_decl
                     .bindings
@@ -335,14 +482,24 @@ impl FlowVerifier {
                     return None;
                 }
                 self.validate_pack(&local_decl.values, states)?;
-                Some(states)
+                Some(FlowOutcome::fallthrough(states))
             }
             HirStmt::TableSetList(_) | HirStmt::ErrNil(_) | HirStmt::CallStmt(_) => {
                 self.validate_leaf(stmt, states)?;
-                Some(states)
+                Some(FlowOutcome::fallthrough(states))
             }
-            HirStmt::GlobalDecl(_) => None,
+            HirStmt::GlobalDecl(global_decl) => {
+                self.validate_pack(&global_decl.values, states)?;
+                Some(FlowOutcome::fallthrough(states))
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn validate_stmt(&self, stmt: &HirStmt, states: RelationSet) -> Option<RelationSet> {
+        let outcome = self.validate_stmt_outcome(stmt, states)?;
+        (outcome.breaks.is_empty() && outcome.continues.is_empty() && outcome.outgoing.is_empty())
+            .then_some(outcome.fallthrough)
     }
 
     fn validate_assign(&self, assign: &HirAssign, states: RelationSet) -> Option<RelationSet> {
@@ -409,25 +566,13 @@ impl FlowVerifier {
         }
     }
 
-    fn validate_loop(&self, stmt: &HirStmt, states: RelationSet) -> Option<RelationSet> {
-        let mentions = collect_binding_mentions_by_stmt(std::slice::from_ref(stmt));
-        let mentions_result = mentions[0].contains(&self.result);
-        let mentions_state = mentions[0].contains(&self.state);
-        if !mentions_result && !mentions_state {
-            return Some(states);
-        }
-        if (mentions_result && states.contains(Relation::Unproduced))
-            || stmt_has_nested_transfer(stmt)
-        {
-            // 候选拒绝[SemanticBarrier:ControlFlow]：未产出 result 进入 loop 或 nested break/continue/return 会形成当前 fixed-point 未记录的出口/回边。
-            return None;
-        }
+    fn validate_loop_outcome(&self, stmt: &HirStmt, states: RelationSet) -> Option<FlowOutcome> {
         match stmt {
             HirStmt::While(while_stmt) => {
-                self.validate_loop_condition(&while_stmt.body, &while_stmt.cond, states, true)
+                self.validate_while(&while_stmt.body, &while_stmt.cond, states)
             }
             HirStmt::Repeat(repeat_stmt) => {
-                self.validate_loop_condition(&repeat_stmt.body, &repeat_stmt.cond, states, false)
+                self.validate_repeat(&repeat_stmt.body, &repeat_stmt.cond, states)
             }
             HirStmt::NumericFor(numeric_for) => {
                 self.validate_expr(&numeric_for.start, states)?;
@@ -443,45 +588,82 @@ impl FlowVerifier {
         }
     }
 
-    fn validate_zero_or_more(&self, body: &HirBlock, states: RelationSet) -> Option<RelationSet> {
+    fn validate_zero_or_more(&self, body: &HirBlock, states: RelationSet) -> Option<FlowOutcome> {
         let mut entries = states;
+        let mut exits = FlowOutcome::default();
         for _ in 0..=3 {
-            let exits = self.validate_stmts(&body.stmts, entries)?;
-            let next = entries.union(exits);
+            exits.fallthrough = exits.fallthrough.union(entries);
+            let body_outcome = self.validate_block(&body.stmts, entries)?;
+            exits.fallthrough = exits.fallthrough.union(body_outcome.breaks);
+            exits.add_outgoing_all(body_outcome.outgoing);
+            let backedge = body_outcome.fallthrough.union(body_outcome.continues);
+            let next = entries.union(backedge);
             if next == entries {
-                return Some(entries);
+                return Some(exits);
             }
             entries = next;
         }
         panic!("three-state monotone loop relation must converge within four rounds")
     }
 
-    fn validate_loop_condition(
+    fn validate_while(
         &self,
         body: &HirBlock,
         condition: &HirExpr,
         states: RelationSet,
-        may_run_zero_times: bool,
-    ) -> Option<RelationSet> {
+    ) -> Option<FlowOutcome> {
         let mut entries = states;
-        let mut exits = RelationSet::EMPTY;
+        let mut exits = FlowOutcome::default();
+        let truthiness = expr_truthiness(condition, self.control_facts.expr_safety);
         for _ in 0..=3 {
-            if may_run_zero_times {
-                self.validate_expr(condition, entries)?;
-                exits = exits.union(entries);
+            self.validate_expr(condition, entries)?;
+            if truthiness != Some(true) {
+                exits.fallthrough = exits.fallthrough.union(entries);
             }
-            let body_exits = self.validate_stmts(&body.stmts, entries)?;
-            if !may_run_zero_times {
-                self.validate_expr(condition, body_exits)?;
-                exits = exits.union(body_exits);
+            if truthiness == Some(false) {
+                return Some(exits);
             }
-            let next = entries.union(body_exits);
+            let body_outcome = self.validate_block(&body.stmts, entries)?;
+            exits.fallthrough = exits.fallthrough.union(body_outcome.breaks);
+            exits.add_outgoing_all(body_outcome.outgoing);
+            let backedge = body_outcome.fallthrough.union(body_outcome.continues);
+            let next = entries.union(backedge);
             if next == entries {
                 return Some(exits);
             }
             entries = next;
         }
         panic!("three-state monotone condition relation must converge within four rounds")
+    }
+
+    fn validate_repeat(
+        &self,
+        body: &HirBlock,
+        condition: &HirExpr,
+        states: RelationSet,
+    ) -> Option<FlowOutcome> {
+        let mut entries = states;
+        let mut exits = FlowOutcome::default();
+        let truthiness = expr_truthiness(condition, self.control_facts.expr_safety);
+        for _ in 0..=3 {
+            let body_outcome = self.validate_block(&body.stmts, entries)?;
+            let reaches_condition = body_outcome.fallthrough.union(body_outcome.continues);
+            self.validate_expr(condition, reaches_condition)?;
+            exits.fallthrough = exits.fallthrough.union(body_outcome.breaks);
+            if truthiness != Some(false) {
+                exits.fallthrough = exits.fallthrough.union(reaches_condition);
+            }
+            exits.add_outgoing_all(body_outcome.outgoing);
+            if truthiness == Some(true) {
+                return Some(exits);
+            }
+            let next = entries.union(reaches_condition);
+            if next == entries {
+                return Some(exits);
+            }
+            entries = next;
+        }
+        panic!("three-state monotone repeat relation must converge within four rounds")
     }
 
     fn validate_leaf(&self, stmt: &HirStmt, states: RelationSet) -> Option<()> {
@@ -520,6 +702,9 @@ impl FlowVerifier {
     }
 
     fn validate_reads(&self, reads: &BTreeSet<CarryBinding>, states: RelationSet) -> Option<()> {
+        if !self.validate_rewritten_reads {
+            return Some(());
+        }
         // 候选拒绝[SemanticBarrier:Lifetime]：读取未产出的 result 或 Pending 期间的旧 state 时，二者改名会把读取切到错误 epoch。
         (!reads.contains(&self.result) || !states.contains(Relation::Unproduced)).then_some(())?;
         (!reads.contains(&self.state) || !states.contains(Relation::Pending)).then_some(())
@@ -579,6 +764,53 @@ impl RelationSet {
     }
 }
 
+#[derive(Default)]
+struct FlowOutcome {
+    fallthrough: RelationSet,
+    breaks: RelationSet,
+    continues: RelationSet,
+    outgoing: BTreeMap<crate::hir::common::HirLabelId, RelationSet>,
+}
+
+impl FlowOutcome {
+    fn fallthrough(states: RelationSet) -> Self {
+        Self {
+            fallthrough: states,
+            ..Self::default()
+        }
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        self.fallthrough = self.fallthrough.union(other.fallthrough);
+        self.breaks = self.breaks.union(other.breaks);
+        self.continues = self.continues.union(other.continues);
+        self.add_outgoing_all(other.outgoing);
+        self
+    }
+
+    fn add_outgoing(&mut self, target: crate::hir::common::HirLabelId, states: RelationSet) {
+        self.outgoing
+            .entry(target)
+            .and_modify(|current| *current = current.union(states))
+            .or_insert(states);
+    }
+
+    fn add_outgoing_all(
+        &mut self,
+        outgoing: BTreeMap<crate::hir::common::HirLabelId, RelationSet>,
+    ) {
+        for (target, states) in outgoing {
+            self.add_outgoing(target, states);
+        }
+    }
+}
+
+impl Default for RelationSet {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 fn binding_reads_in_expr(expr: &HirExpr) -> BTreeSet<CarryBinding> {
     let mut reads = BindingReadCollector::default();
     reads.collect_expr(expr);
@@ -602,10 +834,11 @@ struct UnresolvedExprCollector {
     found: bool,
 }
 
-fn writeback_region_has_barrier(stmts: &[HirStmt]) -> bool {
+fn writeback_region_has_barrier(stmts: &[HirStmt], control_facts: &RegionControlFacts) -> bool {
     let mut collector = WritebackBarrierCollector::default();
     visit_stmts(stmts, &mut collector);
     collector.found
+        || LexicalCfg::analyze(stmts, &control_facts.label_refs, control_facts.expr_safety).is_err()
 }
 
 #[derive(Default)]
@@ -614,22 +847,27 @@ struct WritebackBarrierCollector {
 }
 
 impl HirVisitor for WritebackBarrierCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(
-            stmt,
-            HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
-        );
-    }
-
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.found |= matches!(expr, HirExpr::Unresolved(_));
     }
 }
 
-pub(super) fn region_has_hard_barrier(stmts: &[HirStmt]) -> bool {
+pub(super) fn region_has_hard_barrier(
+    stmts: &[HirStmt],
+    control_facts: &RegionControlFacts,
+) -> bool {
     let mut collector = RegionBarrierCollector::default();
     visit_stmts(stmts, &mut collector);
-    collector.found
+    if collector.found {
+        return true;
+    }
+    let Ok(_) = LexicalCfg::analyze(stmts, &control_facts.label_refs, control_facts.expr_safety)
+    else {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：owner-wide label refs 证明候选区域有外部
+        // 入口或重复 label；改写 result 声明/producer 会被该入口绕过或重执行。
+        return true;
+    };
+    false
 }
 
 pub(super) fn expr_has_hard_barrier(expr: &HirExpr) -> bool {
@@ -638,39 +876,12 @@ pub(super) fn expr_has_hard_barrier(expr: &HirExpr) -> bool {
     collector.found
 }
 
-fn stmt_has_nested_transfer(stmt: &HirStmt) -> bool {
-    let mut collector = NestedTransferCollector::default();
-    visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.found
-}
-
-#[derive(Default)]
-struct NestedTransferCollector {
-    found: bool,
-}
-
-impl HirVisitor for NestedTransferCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(
-            stmt,
-            HirStmt::Break | HirStmt::Continue | HirStmt::Return(_)
-        );
-    }
-}
-
 #[derive(Default)]
 struct RegionBarrierCollector {
     found: bool,
 }
 
 impl HirVisitor for RegionBarrierCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(
-            stmt,
-            HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::ToBeClosed(_) | HirStmt::Close(_)
-        );
-    }
-
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.found |= matches!(expr, HirExpr::Unresolved(_));
     }
@@ -727,17 +938,32 @@ fn binding_lvalue(binding: CarryBinding) -> HirLValue {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::HandoffIdentityCollector;
     use super::*;
+    use std::sync::LazyLock;
+
+    use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirBinaryExpr, HirBinaryOpKind, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
-        HirDecisionTarget, HirIf, HirPackTail, TempId,
+        HirBinaryExpr, HirBinaryOpKind, HirCapture, HirCaptureMode, HirClosureExpr,
+        HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirGlobalDecl,
+        HirGoto, HirIf, HirLabel, HirLabelId, HirPackTail, HirRepeat, HirReturn, HirWhile, TempId,
     };
     use crate::hir::promotion::HomeSlotKey;
 
-    fn verifier() -> FlowVerifier {
+    static EMPTY_CONTROL_FACTS: LazyLock<RegionControlFacts> =
+        LazyLock::new(|| RegionControlFacts {
+            label_refs: Default::default(),
+            expr_safety: crate::hir::expr_safety::HirExprSafety::for_dialect(
+                DecompileDialect::Lua54,
+            ),
+        });
+
+    fn verifier() -> FlowVerifier<'static> {
         FlowVerifier {
             result: CarryBinding::Local(LocalId(0)),
             state: CarryBinding::Local(LocalId(1)),
+            control_facts: &EMPTY_CONTROL_FACTS,
+            validate_rewritten_reads: true,
         }
     }
 
@@ -758,10 +984,108 @@ mod tests {
             debug: BTreeSet::new(),
             for_bindings: BTreeSet::new(),
             physical_roots: BTreeSet::new(),
-            captured: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
         }
+    }
+
+    fn identity_facts_for(stmts: &[HirStmt]) -> HandoffIdentityFacts {
+        let mut collector = HandoffIdentityCollector::default();
+        visit_stmts(stmts, &mut collector);
+        HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: collector.for_bindings,
+            physical_roots: BTreeSet::new(),
+            reference_captured: collector.reference_captured,
+            to_be_closed: collector.to_be_closed,
+        }
+    }
+
+    fn capture_closure(mode: HirCaptureMode, value: HirExpr) -> HirExpr {
+        HirExpr::Closure(Box::new(HirClosureExpr {
+            proto: crate::hir::common::HirProtoRef(1),
+            captures: vec![HirCapture { mode, value }],
+        }))
+    }
+
+    fn control_facts(stmts: &[HirStmt]) -> RegionControlFacts {
+        RegionControlFacts {
+            label_refs: crate::hir::simplify::label_refs::count_label_references(stmts),
+            expr_safety: crate::hir::expr_safety::HirExprSafety::for_dialect(
+                DecompileDialect::Lua54,
+            ),
+        }
+    }
+
+    #[test]
+    fn owner_label_refs_distinguish_closed_flow_from_external_entry() {
+        let label = HirLabelId(0);
+        let owner = vec![
+            HirStmt::Goto(Box::new(HirGoto { target: label })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: label,
+                tbc_barriers: Default::default(),
+            })),
+        ];
+        let control = control_facts(&owner);
+
+        assert!(!region_has_hard_barrier(&owner, &control));
+        assert!(region_has_hard_barrier(&owner[1..], &control));
+    }
+
+    #[test]
+    fn region_external_goto_requires_a_synced_relation() {
+        let label = HirLabelId(0);
+        let goto = HirStmt::Goto(Box::new(HirGoto { target: label }));
+        let owner = vec![
+            goto.clone(),
+            HirStmt::Label(Box::new(HirLabel {
+                id: label,
+                tbc_barriers: Default::default(),
+            })),
+        ];
+        let control = control_facts(&owner);
+        let rewrites = BTreeMap::from([(
+            CarryBinding::Local(LocalId(0)),
+            CarryBinding::Local(LocalId(1)),
+        )]);
+
+        assert!(!region_rewrites_preserve_external_transfers(
+            std::slice::from_ref(&goto),
+            &rewrites,
+            &control,
+            ExternalTransferScope::WholeRegion,
+        ));
+        let pending_then_goto = vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+            })),
+            goto.clone(),
+        ];
+        assert!(!region_rewrites_preserve_external_transfers(
+            &pending_then_goto,
+            &rewrites,
+            &control,
+            ExternalTransferScope::WholeRegion,
+        ));
+        let synced_then_goto = vec![
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+            })),
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(1))],
+                values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+            })),
+            goto,
+        ];
+        assert!(region_rewrites_preserve_external_transfers(
+            &synced_then_goto,
+            &rewrites,
+            &control,
+            ExternalTransferScope::WholeRegion,
+        ));
     }
 
     #[test]
@@ -809,6 +1133,7 @@ mod tests {
             &BTreeSet::new(),
             &facts,
             &identity_facts(),
+            &EMPTY_CONTROL_FACTS,
             &BTreeSet::new(),
         )
         .expect("all Decision paths are disjoint from the carried bindings");
@@ -826,6 +1151,242 @@ mod tests {
     }
 
     #[test]
+    fn writeback_transaction_follows_a_self_contained_goto() {
+        let result = LocalId(0);
+        let state = LocalId(1);
+        let label = HirLabelId(0);
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![state],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(0)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![result],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::Goto(Box::new(HirGoto { target: label })),
+                HirStmt::Label(Box::new(HirLabel {
+                    id: label,
+                    tbc_barriers: Default::default(),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(result)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(state)],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
+                })),
+            ],
+        };
+        let mut facts = ProtoPromotionFacts::default();
+        for local in [result, state] {
+            facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
+        }
+        facts.mark_entry_nil_writes_pruned(result);
+        let control = control_facts(&block.stmts);
+
+        let candidate = find_candidate(
+            &block,
+            &BTreeSet::new(),
+            &facts,
+            &identity_facts(),
+            &control,
+            &BTreeSet::new(),
+        )
+        .expect("the internal goto reaches the unique producer and writeback");
+        apply_candidate(&mut block, candidate, &mut facts);
+
+        assert!(matches!(block.stmts[1], HirStmt::Goto(_)));
+        assert!(matches!(block.stmts[2], HirStmt::Label(_)));
+        assert!(
+            collect_binding_mentions_by_stmt(&block.stmts)
+                .iter()
+                .all(|mentions| !mentions.contains(&CarryBinding::Local(result)))
+        );
+    }
+
+    #[test]
+    fn writeback_transaction_rejects_goto_that_bypasses_sync() {
+        let result = LocalId(0);
+        let state = LocalId(1);
+        let label = HirLabelId(0);
+        let block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![state],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(0)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![result],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(result)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                })),
+                HirStmt::Goto(Box::new(HirGoto { target: label })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(state)],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
+                })),
+                HirStmt::Label(Box::new(HirLabel {
+                    id: label,
+                    tbc_barriers: Default::default(),
+                })),
+                HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(state)]),
+                })),
+            ],
+        };
+        let mut facts = ProtoPromotionFacts::default();
+        for local in [result, state] {
+            facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
+        }
+        facts.mark_entry_nil_writes_pruned(result);
+        let control = control_facts(&block.stmts);
+
+        assert!(
+            find_candidate(
+                &block,
+                &BTreeSet::new(),
+                &facts,
+                &identity_facts(),
+                &control,
+                &BTreeSet::new(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn writeback_transaction_accepts_a_by_value_capture_after_sync() {
+        let result = LocalId(0);
+        let state = LocalId(1);
+        let closure = LocalId(2);
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![state],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(0)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![result],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(result)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(state)],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![closure],
+                    values: HirValuePack::fixed(vec![capture_closure(
+                        HirCaptureMode::ByValue,
+                        HirExpr::LocalRef(result),
+                    )]),
+                })),
+            ],
+        };
+        let identity = identity_facts_for(&block.stmts);
+        let mut facts = ProtoPromotionFacts::default();
+        for local in [result, state] {
+            facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
+        }
+        facts.mark_entry_nil_writes_pruned(result);
+
+        let candidate = find_candidate(
+            &block,
+            &BTreeSet::new(),
+            &facts,
+            &identity,
+            &EMPTY_CONTROL_FACTS,
+            &BTreeSet::new(),
+        )
+        .expect("the snapshot observes the already-synchronized value");
+        apply_candidate(&mut block, candidate, &mut facts);
+
+        assert!(
+            collect_binding_mentions_by_stmt(&block.stmts)
+                .iter()
+                .all(|mentions| !mentions.contains(&CarryBinding::Local(result)))
+        );
+    }
+
+    #[test]
+    fn writeback_transaction_accepts_an_exact_home_reference_capture() {
+        let result = LocalId(0);
+        let state = LocalId(1);
+        let closure = LocalId(2);
+        let mut block = HirBlock {
+            stmts: vec![
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![state],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(0)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![result],
+                    values: HirValuePack::default(),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(result)],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(state)],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
+                })),
+                HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                    bindings: vec![closure],
+                    values: HirValuePack::fixed(vec![capture_closure(
+                        HirCaptureMode::ByReference,
+                        HirExpr::LocalRef(result),
+                    )]),
+                })),
+            ],
+        };
+        let identity = identity_facts_for(&block.stmts);
+        let mut facts = ProtoPromotionFacts::default();
+        for local in [result, state] {
+            facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
+        }
+        facts.mark_entry_nil_writes_pruned(result);
+
+        let candidate = find_candidate(
+            &block,
+            &BTreeSet::new(),
+            &facts,
+            &identity,
+            &EMPTY_CONTROL_FACTS,
+            &BTreeSet::new(),
+        )
+        .expect("both names denote the same slot and close epoch upvalue cell");
+        apply_candidate(&mut block, candidate, &mut facts);
+    }
+
+    #[test]
+    fn identity_merge_keeps_a_reference_capture_without_exact_shared_home() {
+        let source = CarryBinding::Local(LocalId(0));
+        let target = CarryBinding::Local(LocalId(1));
+        let identity = HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            reference_captured: BTreeSet::from([source]),
+            to_be_closed: BTreeSet::new(),
+        };
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(LocalId(0), HomeSlotKey::new(0, 0));
+        facts.record_local_home_slot(LocalId(1), HomeSlotKey::new(1, 0));
+
+        assert!(!identity.binding_merge_preserves_identity(source, target, &facts));
+    }
+
+    #[test]
     fn decision_read_of_pending_state_remains_a_barrier() {
         assert!(
             verifier()
@@ -835,6 +1396,206 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn global_declaration_preserves_a_synced_transaction() {
+        let stmt = HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
+            names: vec!["answer".to_owned()],
+            values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+        }));
+
+        let states = verifier()
+            .validate_stmt(&stmt, RelationSet::only(Relation::Synced))
+            .expect("a global declaration only reads the already-synced merged value");
+
+        assert!(states == RelationSet::only(Relation::Synced));
+    }
+
+    #[test]
+    fn terminating_nested_loop_path_does_not_block_synced_state() {
+        let stmt = HirStmt::While(Box::new(HirWhile {
+            cond: HirExpr::Boolean(true),
+            body: HirBlock {
+                stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+                }))],
+            },
+        }));
+
+        let states = verifier()
+            .validate_stmt(&stmt, RelationSet::only(Relation::Synced))
+            .expect("return validates its values and does not rejoin the surrounding loop");
+
+        assert!(states == RelationSet::EMPTY);
+    }
+
+    #[test]
+    fn inner_loop_break_is_consumed_by_its_loop_owner() {
+        let stmt = HirStmt::While(Box::new(HirWhile {
+            cond: HirExpr::Boolean(true),
+            body: HirBlock {
+                stmts: vec![
+                    HirStmt::While(Box::new(HirWhile {
+                        cond: HirExpr::LocalRef(LocalId(0)),
+                        body: HirBlock {
+                            stmts: vec![HirStmt::Break],
+                        },
+                    })),
+                    HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Local(LocalId(1))],
+                        values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+                    })),
+                ],
+            },
+        }));
+
+        assert!(
+            verifier()
+                .validate_stmt(&stmt, RelationSet::only(Relation::Pending))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unknown_while_rejects_pending_state_after_one_iteration() {
+        let stmts = vec![
+            HirStmt::While(Box::new(HirWhile {
+                cond: HirExpr::TempRef(TempId(0)),
+                body: HirBlock {
+                    stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        targets: vec![HirLValue::Local(LocalId(0))],
+                        values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                    }))],
+                },
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
+            })),
+        ];
+
+        assert!(
+            verifier()
+                .validate_region(&stmts, RelationSet::only(Relation::Unproduced))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unknown_while_accepts_a_synced_iteration_exit() {
+        let stmts = vec![
+            HirStmt::While(Box::new(HirWhile {
+                cond: HirExpr::TempRef(TempId(0)),
+                body: HirBlock {
+                    stmts: vec![
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Local(LocalId(0))],
+                            values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                        })),
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Local(LocalId(1))],
+                            values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+                        })),
+                    ],
+                },
+            })),
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
+            })),
+        ];
+
+        assert!(
+            verifier()
+                .validate_region(&stmts, RelationSet::only(Relation::Unproduced))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn zero_or_more_loop_includes_each_iteration_termination_relation() {
+        let pending_body = HirBlock {
+            stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+            }))],
+        };
+        let pending = verifier()
+            .validate_zero_or_more(&pending_body, RelationSet::only(Relation::Unproduced))
+            .expect("loop body itself is valid");
+        assert!(pending.fallthrough.contains(Relation::Unproduced));
+        assert!(pending.fallthrough.contains(Relation::Pending));
+
+        let synced_body = HirBlock {
+            stmts: vec![
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(0))],
+                    values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                })),
+                HirStmt::Assign(Box::new(HirAssign {
+                    targets: vec![HirLValue::Local(LocalId(1))],
+                    values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+                })),
+            ],
+        };
+        let synced = verifier()
+            .validate_zero_or_more(&synced_body, RelationSet::only(Relation::Unproduced))
+            .expect("synchronized loop body is valid");
+        assert!(synced.fallthrough.contains(Relation::Unproduced));
+        assert!(synced.fallthrough.contains(Relation::Synced));
+        assert!(!synced.fallthrough.contains(Relation::Pending));
+    }
+
+    #[test]
+    fn constant_loop_truthiness_does_not_create_unreachable_exits() {
+        let write_pending = || {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Local(LocalId(0))],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+            }))
+        };
+        let return_old_state = || {
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
+            }))
+        };
+        let true_while = vec![
+            HirStmt::While(Box::new(HirWhile {
+                cond: HirExpr::Boolean(true),
+                body: HirBlock {
+                    stmts: vec![write_pending()],
+                },
+            })),
+            return_old_state(),
+        ];
+        let false_repeat = vec![
+            HirStmt::Repeat(Box::new(HirRepeat {
+                body: HirBlock {
+                    stmts: vec![write_pending()],
+                },
+                cond: HirExpr::Boolean(false),
+            })),
+            return_old_state(),
+        ];
+
+        for stmts in [true_while, false_repeat] {
+            let exits = verifier()
+                .validate_region(&stmts, RelationSet::only(Relation::Unproduced))
+                .expect("unreachable suffix cannot observe the pending relation");
+            assert!(exits == RelationSet::EMPTY);
+        }
+    }
+
+    #[test]
+    fn terminating_return_accepts_an_unobserved_pending_state() {
+        let stmt = HirStmt::Return(Box::new(HirReturn {
+            values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+        }));
+
+        let states = verifier()
+            .validate_stmt(&stmt, RelationSet::only(Relation::Pending))
+            .expect("return observes result but no longer observes the unsynced state");
+
+        assert!(states == RelationSet::EMPTY);
     }
 
     #[test]
@@ -936,7 +1697,10 @@ mod tests {
         let eligible = writeback_targets(&stmts, result);
 
         assert!(eligible == vec![first, second]);
-        assert!(completed_writeback_states(result, &eligible, None, &stmts) == vec![first]);
+        assert!(
+            completed_writeback_states(result, &eligible, None, &stmts, &EMPTY_CONTROL_FACTS,)
+                == vec![first]
+        );
     }
 
     #[test]
@@ -977,7 +1741,10 @@ mod tests {
         let eligible = writeback_targets(&stmts, result);
 
         assert!(eligible == vec![first, second]);
-        assert!(completed_writeback_states(result, &eligible, None, &stmts) == vec![first, second]);
+        assert!(
+            completed_writeback_states(result, &eligible, None, &stmts, &EMPTY_CONTROL_FACTS,)
+                == vec![first, second]
+        );
     }
 
     #[test]
@@ -1034,7 +1801,6 @@ mod tests {
             debug: BTreeSet::new(),
             for_bindings: BTreeSet::new(),
             physical_roots: BTreeSet::new(),
-            captured: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
         };
@@ -1044,6 +1810,7 @@ mod tests {
             &BTreeSet::new(),
             &facts,
             &identity,
+            &EMPTY_CONTROL_FACTS,
             &BTreeSet::new(),
         )
         .expect("each completed target is independently safe as the transaction owner");

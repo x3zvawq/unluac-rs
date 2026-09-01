@@ -92,6 +92,28 @@ impl HirExprSafety {
         (lhs_is_primitive && rhs_is_primitive)
             || (self.dynamic_primitive_equality_is_stable && (lhs_is_primitive || rhs_is_primitive))
     }
+
+    /// 当前一元 operator 本身是否可能执行用户代码或触发 GC。
+    ///
+    /// 子表达式事件由调用方按求值顺序单独处理；这里仅描述 operator 节点本身，避免把
+    /// "not table[key]" 的 table lookup 重复算成 not 之后的新观察点。
+    pub(crate) const fn unary_operator_may_observe_gc_roots(self, op: HirUnaryOpKind) -> bool {
+        !matches!(op, HirUnaryOpKind::Not)
+    }
+
+    /// 当前二元 operator 本身是否可能执行用户代码或触发 GC。
+    ///
+    /// 原始字面量比较以及目标方言已证明稳定的 primitive equality 不会调用元方法；
+    /// 其它 operator 保守保留 metamethod 观察边界。子表达式事件不在这里重复计数。
+    pub(crate) fn binary_operator_may_observe_gc_roots(
+        self,
+        op: HirBinaryOpKind,
+        lhs: &HirExpr,
+        rhs: &HirExpr,
+    ) -> bool {
+        !primitive_literal_comparison_is_eventless(op, lhs, rhs)
+            && !self.equality_is_stable(op, lhs, rhs)
+    }
 }
 
 fn is_primitive_literal(expr: &HirExpr) -> bool {

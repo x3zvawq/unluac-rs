@@ -4,15 +4,25 @@
 //! 与 raw home 的 `GC-inert / 可承载资源 / 证明不完整`；分支合流保留任一路径上的资源
 //! 可能，循环对回边求有限不动点。
 //! 分析阶段只记录完整语句路径，验证结束后才一次性应用删除，避免边改边算让 reaching
-//! value 漂移。同 block 单调 forward goto 可直接跳到唯一 label；含跨层或回边 goto 的
-//! 区域按显式控制边界切成独立小岛，每个小岛从资源保守状态重新证明，避免一个非结构化
-//! 区域停用整个 proto，也避免在线性 HIR 上猜 predecessor。
+//! value 漂移。同 block 单调 forward goto 可直接跳到唯一 label；共享 `LexicalCfg` 会把
+//! 后置嵌套 island 的自含回环留给嵌套 analyzer，只在当前层存在跨层或回边 goto 时才把
+//! 该 block 从资源保守状态重新证明，避免一个非结构化区域停用整个 proto，也避免在线性
+//! HIR 上猜 predecessor。
+//! dead write 的读取证明则使用独立的全 proto CFG：label id 统一解析跨 block goto，循环
+//! header/latch 显式建回边，再在有限 binding/home 集上求后向 may-live 不动点。节点先 gen
+//! RHS、条件与左值地址读取，再 kill 精确 local/temp 或唯一 possible-home 写入。
+//! closure payload 另做前向 reaching：Temp/Local/Param holder 的确定覆写 kill 旧 instance，
+//! 分支与回边按 may payload 合流；只有当前 reaching closure 被调用、返回或写到外部位置时，
+//! 其 ByReference cell 才进入 observer。ByValue capture 仍在创建点读取 snapshot。TBC 同样
+//! 在标记点激活 raw home，并由 `Close`/函数出口读取后按 `from_reg` 结束。这样 capture/TBC
+//! 的持久观察不会退化成全 proto blanket guard。
 //! 值是否 GC-inert 由外层传入的目标方言安全上下文判定，避免 reaching class 与删除证明漂移。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
+    HirAssign, HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
+    LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -22,6 +32,8 @@ use super::{
     complete_possible_home_slots, possible_home_relation,
 };
 use crate::hir::simplify::expr_facts::expr_truthiness;
+use crate::hir::simplify::label_refs::count_label_references;
+use crate::hir::simplify::lexical_cfg::LexicalCfg;
 use crate::hir::simplify::temp_touch::stmt_contains_nested_nonlocal_control;
 use crate::hir::simplify::visit::{self, HirVisitor};
 
@@ -34,6 +46,1382 @@ enum PathComponent {
 }
 
 type StmtPath = Vec<PathComponent>;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct LiveBindingState {
+    pub(super) temps: BTreeSet<TempId>,
+    pub(super) locals: BTreeSet<LocalId>,
+    pub(super) homes: BTreeSet<HomeSlotKey>,
+}
+
+impl LiveBindingState {
+    fn union_with(&mut self, other: &Self) {
+        self.temps.extend(other.temps.iter().copied());
+        self.locals.extend(other.locals.iter().copied());
+        self.homes.extend(other.homes.iter().copied());
+    }
+
+    fn without_writes(mut self, writes: &LiveBindingState) -> Self {
+        self.temps.retain(|temp| !writes.temps.contains(temp));
+        self.locals.retain(|local| !writes.locals.contains(local));
+        self.homes.retain(|home| !writes.homes.contains(home));
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ShellArmLiveOut {
+    pub(super) then_arm: LiveBindingState,
+    pub(super) else_arm: LiveBindingState,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LiveAfterFacts {
+    shells: BTreeMap<StmtPath, ShellArmLiveOut>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LiveCfgNode {
+    successors: BTreeSet<usize>,
+    reads: LiveBindingState,
+    writes: LiveBindingState,
+    escaped_gen: ClosurePayloadSeed,
+    escape_holders: BTreeSet<ClosureHolder>,
+    holder_writes: Vec<(ClosureHolder, HolderWrite)>,
+    tbc_gen: BTreeSet<HomeSlotKey>,
+    close_from: Option<usize>,
+    observes_captures: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ActiveObserverState {
+    escaped: ClosurePayload,
+    holder_values: BTreeMap<ClosureHolder, ClosurePayload>,
+    tbc_homes: BTreeSet<HomeSlotKey>,
+}
+
+impl ActiveObserverState {
+    fn union_with(&mut self, other: &Self) {
+        self.escaped.union_with(&other.escaped);
+        for (holder, captures) in &other.holder_values {
+            self.holder_values
+                .entry(*holder)
+                .or_default()
+                .union_with(captures);
+        }
+        self.tbc_homes.extend(other.tbc_homes.iter().copied());
+    }
+
+    fn after(&self, node: &LiveCfgNode) -> Self {
+        let mut next = self.clone();
+        next.escaped
+            .union_with(&node.escaped_gen.resolve(&self.holder_values));
+        for holder in &node.escape_holders {
+            if let Some(captures) = self.holder_values.get(holder) {
+                next.escaped.union_with(captures);
+            }
+        }
+        for (holder, write) in &node.holder_writes {
+            match write {
+                HolderWrite::Clear => {
+                    next.holder_values.remove(holder);
+                }
+                HolderWrite::Capture(captures) => {
+                    next.holder_values
+                        .insert(*holder, captures.resolve(&self.holder_values));
+                }
+            }
+        }
+        next.tbc_homes.extend(node.tbc_gen.iter().copied());
+        if let Some(from_reg) = node.close_from {
+            next.tbc_homes.retain(|home| home.slot() < from_reg);
+        }
+        next
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LoopTargets {
+    break_target: Option<usize>,
+    continue_target: usize,
+}
+
+#[derive(Default)]
+struct LiveCfgBuilder<'a> {
+    nodes: Vec<LiveCfgNode>,
+    stmt_nodes: BTreeMap<StmtPath, usize>,
+    labels: BTreeMap<crate::hir::HirLabelId, BTreeSet<usize>>,
+    loop_binding_nodes: BTreeMap<StmtPath, usize>,
+    loop_latch_nodes: BTreeMap<StmtPath, usize>,
+    exit_node: Option<usize>,
+    unknown_node: Option<usize>,
+    promotion_facts: Option<&'a ProtoPromotionFacts>,
+    safety: Option<HirExprSafety>,
+}
+
+impl LiveAfterFacts {
+    fn collect(
+        proto: &HirProto,
+        promotion_facts: &ProtoPromotionFacts,
+        safety: HirExprSafety,
+    ) -> Self {
+        let mut builder = LiveCfgBuilder {
+            promotion_facts: Some(promotion_facts),
+            safety: Some(safety),
+            ..LiveCfgBuilder::default()
+        };
+        let exit = builder.allocate_node();
+        let unknown = builder.allocate_node();
+        builder.exit_node = Some(exit);
+        builder.unknown_node = Some(unknown);
+        builder.nodes[unknown].successors.insert(exit);
+        builder.nodes[unknown]
+            .reads
+            .temps
+            .extend(proto.temps.iter().copied());
+        builder.nodes[unknown]
+            .reads
+            .locals
+            .extend(proto.locals.iter().copied());
+        builder.nodes[unknown]
+            .reads
+            .homes
+            .extend(promotion_facts.physical_home_universe().iter().copied());
+        builder.allocate_block(&proto.body, &[]);
+        let entry = builder.wire_block(&proto.body, &[], Some(exit), None);
+        let active_observers = solve_active_observers(&builder.nodes, entry);
+        for (id, active) in active_observers.into_iter().enumerate() {
+            if builder.nodes[id].observes_captures || id == exit {
+                builder.nodes[id]
+                    .reads
+                    .union_with(&observable_payload_reads(
+                        &active.escaped,
+                        &active.holder_values,
+                    ));
+            }
+            let mut immediate = builder.nodes[id].escaped_gen.resolve(&active.holder_values);
+            for holder in &builder.nodes[id].escape_holders {
+                if let Some(captures) = active.holder_values.get(holder) {
+                    immediate.union_with(captures);
+                }
+            }
+            builder.nodes[id]
+                .reads
+                .union_with(&observable_payload_reads(&immediate, &active.holder_values));
+            if builder.nodes[id].close_from.is_some() || id == exit {
+                builder.nodes[id]
+                    .reads
+                    .homes
+                    .extend(active.tbc_homes.iter().copied());
+            }
+        }
+        let live_out = solve_live_out(&builder.nodes);
+        let mut shells = BTreeMap::new();
+        collect_shell_live_outs(
+            &proto.body,
+            &[],
+            &builder.stmt_nodes,
+            &live_out,
+            &mut shells,
+        );
+        Self { shells }
+    }
+
+    fn shell(&self, path: &StmtPath) -> Option<&ShellArmLiveOut> {
+        self.shells.get(path)
+    }
+}
+
+impl LiveCfgBuilder<'_> {
+    fn allocate_node(&mut self) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(LiveCfgNode::default());
+        id
+    }
+
+    fn allocate_block(&mut self, block: &HirBlock, prefix: &[PathComponent]) {
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            let mut path = prefix.to_vec();
+            path.push(PathComponent::Stmt(index));
+            let id = self.allocate_node();
+            self.stmt_nodes.insert(path.clone(), id);
+            if let HirStmt::Label(label) = stmt {
+                self.labels.entry(label.id).or_default().insert(id);
+            }
+            if matches!(stmt, HirStmt::NumericFor(_) | HirStmt::GenericFor(_)) {
+                let binding = self.allocate_node();
+                let latch = self.allocate_node();
+                self.loop_binding_nodes.insert(path.clone(), binding);
+                self.loop_latch_nodes.insert(path.clone(), latch);
+            }
+            match stmt {
+                HirStmt::If(if_stmt) => {
+                    let mut then_prefix = path.clone();
+                    then_prefix.push(PathComponent::Then);
+                    self.allocate_block(&if_stmt.then_block, &then_prefix);
+                    if let Some(else_block) = &if_stmt.else_block {
+                        let mut else_prefix = path.clone();
+                        else_prefix.push(PathComponent::Else);
+                        self.allocate_block(else_block, &else_prefix);
+                    }
+                }
+                HirStmt::While(while_stmt) => {
+                    let mut body_prefix = path.clone();
+                    body_prefix.push(PathComponent::Body);
+                    self.allocate_block(&while_stmt.body, &body_prefix);
+                }
+                HirStmt::Repeat(repeat_stmt) => {
+                    let mut body_prefix = path.clone();
+                    body_prefix.push(PathComponent::Body);
+                    self.allocate_block(&repeat_stmt.body, &body_prefix);
+                }
+                HirStmt::NumericFor(for_stmt) => {
+                    let mut body_prefix = path.clone();
+                    body_prefix.push(PathComponent::Body);
+                    self.allocate_block(&for_stmt.body, &body_prefix);
+                }
+                HirStmt::GenericFor(for_stmt) => {
+                    let mut body_prefix = path.clone();
+                    body_prefix.push(PathComponent::Body);
+                    self.allocate_block(&for_stmt.body, &body_prefix);
+                }
+                HirStmt::Block(nested) => {
+                    let mut body_prefix = path.clone();
+                    body_prefix.push(PathComponent::Body);
+                    self.allocate_block(nested, &body_prefix);
+                }
+                HirStmt::LocalDecl(_)
+                | HirStmt::GlobalDecl(_)
+                | HirStmt::Assign(_)
+                | HirStmt::TableSetList(_)
+                | HirStmt::ErrNil(_)
+                | HirStmt::ToBeClosed(_)
+                | HirStmt::Close(_)
+                | HirStmt::CallStmt(_)
+                | HirStmt::Return(_)
+                | HirStmt::Break
+                | HirStmt::Continue
+                | HirStmt::Goto(_)
+                | HirStmt::Label(_) => {}
+            }
+        }
+    }
+
+    fn wire_block(
+        &mut self,
+        block: &HirBlock,
+        prefix: &[PathComponent],
+        continuation: Option<usize>,
+        loop_targets: Option<LoopTargets>,
+    ) -> Option<usize> {
+        let mut next = continuation;
+        for (index, stmt) in block.stmts.iter().enumerate().rev() {
+            let mut path = prefix.to_vec();
+            path.push(PathComponent::Stmt(index));
+            next = Some(self.wire_stmt(stmt, &path, next, loop_targets));
+        }
+        next
+    }
+
+    fn wire_stmt(
+        &mut self,
+        stmt: &HirStmt,
+        path: &StmtPath,
+        next: Option<usize>,
+        loop_targets: Option<LoopTargets>,
+    ) -> usize {
+        let id = self.stmt_nodes[path];
+        self.nodes[id].reads = reads_in_stmt_header(
+            stmt,
+            self.promotion_facts
+                .expect("live CFG needs promotion facts"),
+        );
+        self.nodes[id].writes = writes_in_stmt_header(
+            stmt,
+            self.promotion_facts
+                .expect("live CFG needs promotion facts"),
+        );
+        let safety = self.safety.expect("live CFG needs expression safety");
+        let observer_effects = closure_observer_effects_in_stmt(
+            stmt,
+            self.promotion_facts
+                .expect("live CFG needs promotion facts"),
+            safety,
+        );
+        self.nodes[id].escaped_gen = observer_effects.escaped_gen;
+        self.nodes[id].escape_holders = observer_effects.escape_holders;
+        self.nodes[id].holder_writes = observer_effects.holder_writes;
+        self.nodes[id].tbc_gen = tbc_homes_started_by_stmt(
+            stmt,
+            self.promotion_facts
+                .expect("live CFG needs promotion facts"),
+        );
+        self.nodes[id].close_from = match stmt {
+            HirStmt::Close(close) => Some(close.from_reg),
+            _ => None,
+        };
+        self.nodes[id].observes_captures = stmt_header_may_invoke_user_code(stmt, safety);
+        match stmt {
+            HirStmt::If(if_stmt) => {
+                let then_entry = {
+                    let mut prefix = path.clone();
+                    prefix.push(PathComponent::Then);
+                    self.wire_block(&if_stmt.then_block, &prefix, next, loop_targets)
+                };
+                let else_entry = if let Some(else_block) = &if_stmt.else_block {
+                    let mut prefix = path.clone();
+                    prefix.push(PathComponent::Else);
+                    self.wire_block(else_block, &prefix, next, loop_targets)
+                } else {
+                    next
+                };
+                match expr_truthiness(&if_stmt.cond, safety) {
+                    Some(true) => extend_optional(&mut self.nodes[id].successors, then_entry),
+                    Some(false) => extend_optional(&mut self.nodes[id].successors, else_entry),
+                    None => {
+                        extend_optional(&mut self.nodes[id].successors, then_entry);
+                        extend_optional(&mut self.nodes[id].successors, else_entry);
+                    }
+                }
+                id
+            }
+            HirStmt::While(while_stmt) => {
+                let mut prefix = path.clone();
+                prefix.push(PathComponent::Body);
+                let body_entry = self.wire_block(
+                    &while_stmt.body,
+                    &prefix,
+                    Some(id),
+                    Some(LoopTargets {
+                        break_target: next,
+                        continue_target: id,
+                    }),
+                );
+                if expr_truthiness(&while_stmt.cond, safety) != Some(false) {
+                    extend_optional(&mut self.nodes[id].successors, body_entry);
+                }
+                if expr_truthiness(&while_stmt.cond, safety) != Some(true) {
+                    extend_optional(&mut self.nodes[id].successors, next);
+                }
+                id
+            }
+            HirStmt::Repeat(repeat_stmt) => {
+                let mut prefix = path.clone();
+                prefix.push(PathComponent::Body);
+                let body_entry = self.wire_block(
+                    &repeat_stmt.body,
+                    &prefix,
+                    Some(id),
+                    Some(LoopTargets {
+                        break_target: next,
+                        continue_target: id,
+                    }),
+                );
+                if expr_truthiness(&repeat_stmt.cond, safety) != Some(true) {
+                    extend_optional(&mut self.nodes[id].successors, body_entry);
+                }
+                if expr_truthiness(&repeat_stmt.cond, safety) != Some(false) {
+                    extend_optional(&mut self.nodes[id].successors, next);
+                }
+                body_entry.unwrap_or(id)
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                self.wire_for_loop(path, &for_stmt.body, &[for_stmt.binding], next);
+                id
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                self.wire_for_loop(path, &for_stmt.body, &for_stmt.bindings, next);
+                id
+            }
+            HirStmt::Block(block) => {
+                let mut prefix = path.clone();
+                prefix.push(PathComponent::Body);
+                let entry = self.wire_block(block, &prefix, next, loop_targets);
+                extend_optional(&mut self.nodes[id].successors, entry);
+                id
+            }
+            HirStmt::Goto(goto) => {
+                if let Some(targets) = self.labels.get(&goto.target) {
+                    self.nodes[id].successors.extend(targets.iter().copied());
+                } else {
+                    self.nodes[id].successors.insert(
+                        self.unknown_node
+                            .expect("live CFG must allocate an unknown-control sink"),
+                    );
+                }
+                id
+            }
+            HirStmt::Break => {
+                let target = loop_targets
+                    .and_then(|targets| targets.break_target)
+                    .unwrap_or_else(|| {
+                        self.unknown_node
+                            .expect("live CFG must allocate an unknown-control sink")
+                    });
+                self.nodes[id].successors.insert(target);
+                id
+            }
+            HirStmt::Continue => {
+                let target = loop_targets
+                    .map(|targets| targets.continue_target)
+                    .unwrap_or_else(|| {
+                        self.unknown_node
+                            .expect("live CFG must allocate an unknown-control sink")
+                    });
+                self.nodes[id].successors.insert(target);
+                id
+            }
+            HirStmt::Return(_) => {
+                self.nodes[id].successors.insert(
+                    self.exit_node
+                        .expect("live CFG must allocate a function exit"),
+                );
+                id
+            }
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Label(_) => {
+                extend_optional(&mut self.nodes[id].successors, next);
+                id
+            }
+        }
+    }
+
+    fn wire_for_loop(
+        &mut self,
+        path: &StmtPath,
+        body: &HirBlock,
+        bindings: &[LocalId],
+        next: Option<usize>,
+    ) {
+        let header = self.stmt_nodes[path];
+        let binding = self.loop_binding_nodes[path];
+        let latch = self.loop_latch_nodes[path];
+        let mut prefix = path.clone();
+        prefix.push(PathComponent::Body);
+        let body_entry = self.wire_block(
+            body,
+            &prefix,
+            Some(latch),
+            Some(LoopTargets {
+                break_target: next,
+                continue_target: latch,
+            }),
+        );
+        let facts = self
+            .promotion_facts
+            .expect("live CFG needs promotion facts");
+        for local in bindings {
+            record_local_write(&mut self.nodes[binding].writes, *local, facts);
+            self.nodes[binding]
+                .holder_writes
+                .push((ClosureHolder::Local(*local), HolderWrite::Clear));
+        }
+        extend_optional(
+            &mut self.nodes[binding].successors,
+            body_entry.or(Some(latch)),
+        );
+        extend_optional(&mut self.nodes[latch].successors, Some(binding));
+        extend_optional(&mut self.nodes[latch].successors, next);
+        extend_optional(&mut self.nodes[header].successors, Some(binding));
+        extend_optional(&mut self.nodes[header].successors, next);
+    }
+}
+
+fn extend_optional(targets: &mut BTreeSet<usize>, target: Option<usize>) {
+    if let Some(target) = target {
+        targets.insert(target);
+    }
+}
+
+fn reads_in_stmt_header(stmt: &HirStmt, promotion_facts: &ProtoPromotionFacts) -> LiveBindingState {
+    let mut collector = LiveReadCollector {
+        counts: LiveBindingCounts::default(),
+        promotion_facts,
+    };
+    visit_stmt_header(stmt, &mut collector);
+    let mut reference_captures = ReferenceCaptureReadCollector {
+        counts: LiveBindingCounts::default(),
+        promotion_facts,
+    };
+    visit_stmt_header(stmt, &mut reference_captures);
+    collector.counts.without(&reference_captures.counts)
+}
+
+fn visit_stmt_header(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
+    visitor.visit_stmt(stmt);
+    match stmt {
+        HirStmt::LocalDecl(decl) => {
+            for value in &decl.values {
+                visit::visit_expr(value, visitor);
+            }
+        }
+        HirStmt::GlobalDecl(decl) => {
+            for value in &decl.values {
+                visit::visit_expr(value, visitor);
+            }
+        }
+        HirStmt::Assign(assign) => {
+            for target in &assign.targets {
+                visit::visit_lvalue(target, visitor);
+            }
+            for value in &assign.values {
+                visit::visit_expr(value, visitor);
+            }
+        }
+        HirStmt::TableSetList(set_list) => {
+            visit::visit_expr(&set_list.base, visitor);
+            for value in &set_list.values {
+                visit::visit_expr(value, visitor);
+            }
+        }
+        HirStmt::ErrNil(err_nil) => visit::visit_expr(&err_nil.value, visitor),
+        HirStmt::ToBeClosed(to_be_closed) => {
+            visit::visit_expr(&to_be_closed.value, visitor);
+        }
+        HirStmt::CallStmt(call_stmt) => visit::visit_call(&call_stmt.call, visitor),
+        HirStmt::Return(ret) => {
+            for value in &ret.values {
+                visit::visit_expr(value, visitor);
+            }
+        }
+        HirStmt::If(if_stmt) => visit::visit_expr(&if_stmt.cond, visitor),
+        HirStmt::While(while_stmt) => visit::visit_expr(&while_stmt.cond, visitor),
+        HirStmt::Repeat(repeat_stmt) => visit::visit_expr(&repeat_stmt.cond, visitor),
+        HirStmt::NumericFor(for_stmt) => {
+            visit::visit_expr(&for_stmt.start, visitor);
+            visit::visit_expr(&for_stmt.limit, visitor);
+            visit::visit_expr(&for_stmt.step, visitor);
+        }
+        HirStmt::GenericFor(for_stmt) => {
+            for value in &for_stmt.iterator {
+                visit::visit_expr(value, visitor);
+            }
+        }
+        HirStmt::Close(_)
+        | HirStmt::Block(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ClosureHolder {
+    Temp(TempId),
+    Local(LocalId),
+    Param(ParamId),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ClosurePayload {
+    bindings: LiveBindingState,
+    captured_holder_cells: BTreeSet<ClosureHolder>,
+}
+
+impl ClosurePayload {
+    fn union_with(&mut self, other: &Self) {
+        self.bindings.union_with(&other.bindings);
+        self.captured_holder_cells
+            .extend(other.captured_holder_cells.iter().copied());
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ClosurePayloadSeed {
+    direct: ClosurePayload,
+    sources: BTreeSet<ClosureHolder>,
+}
+
+impl ClosurePayloadSeed {
+    fn union_with(&mut self, other: &Self) {
+        self.direct.union_with(&other.direct);
+        self.sources.extend(other.sources.iter().copied());
+    }
+
+    fn resolve(&self, holder_values: &BTreeMap<ClosureHolder, ClosurePayload>) -> ClosurePayload {
+        let mut payload = self.direct.clone();
+        for source in &self.sources {
+            if let Some(source_payload) = holder_values.get(source) {
+                payload.union_with(source_payload);
+            }
+        }
+        payload
+    }
+}
+
+fn observable_payload_reads(
+    payload: &ClosurePayload,
+    holder_values: &BTreeMap<ClosureHolder, ClosurePayload>,
+) -> LiveBindingState {
+    let mut reads = payload.bindings.clone();
+    let mut pending = payload.captured_holder_cells.clone();
+    let mut visited = BTreeSet::new();
+    while let Some(holder) = pending.pop_first() {
+        if !visited.insert(holder) {
+            continue;
+        }
+        if let Some(value) = holder_values.get(&holder) {
+            reads.union_with(&value.bindings);
+            pending.extend(value.captured_holder_cells.iter().copied());
+        }
+    }
+    reads
+}
+
+#[derive(Clone, Debug)]
+enum HolderWrite {
+    Clear,
+    Capture(ClosurePayloadSeed),
+}
+
+#[derive(Default)]
+struct ClosureObserverEffects {
+    escaped_gen: ClosurePayloadSeed,
+    escape_holders: BTreeSet<ClosureHolder>,
+    holder_writes: Vec<(ClosureHolder, HolderWrite)>,
+}
+
+impl ClosureObserverEffects {
+    fn record_escape(&mut self, seed: ClosurePayloadSeed) {
+        self.escaped_gen.direct.union_with(&seed.direct);
+        self.escape_holders.extend(seed.sources);
+    }
+}
+
+fn closure_observer_effects_in_stmt(
+    stmt: &HirStmt,
+    promotion_facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+) -> ClosureObserverEffects {
+    let mut effects = ClosureObserverEffects::default();
+    match stmt {
+        HirStmt::LocalDecl(decl) => {
+            for (index, local) in decl.bindings.iter().copied().enumerate() {
+                let write =
+                    value_for_target(&decl.values, index).map_or(HolderWrite::Clear, |value| {
+                        HolderWrite::Capture(payload_seed_from_expr(value, promotion_facts, safety))
+                    });
+                effects
+                    .holder_writes
+                    .push((ClosureHolder::Local(local), write));
+            }
+        }
+        HirStmt::Assign(assign) => {
+            for (index, target) in assign.targets.iter().enumerate() {
+                let value = value_for_target(&assign.values, index);
+                if let Some(holder) = holder_from_lvalue(target) {
+                    let write = value.map_or(HolderWrite::Clear, |value| {
+                        HolderWrite::Capture(payload_seed_from_expr(value, promotion_facts, safety))
+                    });
+                    effects.holder_writes.push((holder, write));
+                } else if matches!(
+                    target,
+                    HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_)
+                ) && let Some(value) = value
+                {
+                    effects.record_escape(payload_seed_from_expr(value, promotion_facts, safety));
+                }
+                if let HirLValue::TableAccess(access) = target {
+                    effects.record_escape(payload_seed_from_expr(
+                        &access.base,
+                        promotion_facts,
+                        safety,
+                    ));
+                    effects.record_escape(payload_seed_from_expr(
+                        &access.key,
+                        promotion_facts,
+                        safety,
+                    ));
+                }
+            }
+        }
+        HirStmt::GlobalDecl(decl) => {
+            for index in 0..decl.names.len() {
+                if let Some(value) = value_for_target(&decl.values, index) {
+                    effects.record_escape(payload_seed_from_expr(value, promotion_facts, safety));
+                }
+            }
+        }
+        HirStmt::TableSetList(set_list) => {
+            for value in &set_list.values {
+                effects.record_escape(payload_seed_from_expr(value, promotion_facts, safety));
+            }
+        }
+        HirStmt::Return(ret) => {
+            for value in &ret.values {
+                effects.record_escape(payload_seed_from_expr(value, promotion_facts, safety));
+            }
+        }
+        HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::If(_)
+        | HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_)
+        | HirStmt::Block(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
+    }
+
+    let mut calls = CallEscapeCollector {
+        effects: &mut effects,
+        promotion_facts,
+        safety,
+    };
+    visit_stmt_header(stmt, &mut calls);
+    effects
+}
+
+fn value_for_target(values: &crate::hir::HirValuePack, index: usize) -> Option<&HirExpr> {
+    values.fixed.get(index)
+}
+
+struct CallEscapeCollector<'a> {
+    effects: &'a mut ClosureObserverEffects,
+    promotion_facts: &'a ProtoPromotionFacts,
+    safety: HirExprSafety,
+}
+
+impl HirVisitor for CallEscapeCollector<'_> {
+    fn visit_call(&mut self, call: &crate::hir::HirCallExpr) {
+        self.effects.record_escape(payload_seed_from_expr(
+            &call.callee,
+            self.promotion_facts,
+            self.safety,
+        ));
+        for argument in &call.args {
+            self.effects.record_escape(payload_seed_from_expr(
+                argument,
+                self.promotion_facts,
+                self.safety,
+            ));
+        }
+    }
+}
+
+fn holder_from_lvalue(target: &HirLValue) -> Option<ClosureHolder> {
+    match target {
+        HirLValue::Temp(temp) => Some(ClosureHolder::Temp(*temp)),
+        HirLValue::Local(local) => Some(ClosureHolder::Local(*local)),
+        HirLValue::Param(param) => Some(ClosureHolder::Param(*param)),
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
+    }
+}
+
+fn holder_from_expr(expr: &HirExpr) -> Option<ClosureHolder> {
+    match expr {
+        HirExpr::TempRef(temp) => Some(ClosureHolder::Temp(*temp)),
+        HirExpr::LocalRef(local) => Some(ClosureHolder::Local(*local)),
+        HirExpr::ParamRef(param) => Some(ClosureHolder::Param(*param)),
+        _ => None,
+    }
+}
+
+fn payload_seed_from_expr(
+    expr: &HirExpr,
+    promotion_facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+) -> ClosurePayloadSeed {
+    let mut seed = ClosurePayloadSeed::default();
+    match expr {
+        HirExpr::TempRef(_) | HirExpr::LocalRef(_) | HirExpr::ParamRef(_) => {
+            seed.sources.insert(
+                holder_from_expr(expr).expect("binding references are closure holder candidates"),
+            );
+        }
+        HirExpr::Closure(closure) => {
+            for capture in &closure.captures {
+                match capture.mode {
+                    HirCaptureMode::ByReference => {
+                        let mut bindings = CapturedBindingCollector {
+                            state: &mut seed.direct.bindings,
+                            promotion_facts,
+                        };
+                        visit::visit_expr(&capture.value, &mut bindings);
+                        if let Some(holder) = holder_from_expr(&capture.value) {
+                            seed.direct.captured_holder_cells.insert(holder);
+                        }
+                    }
+                    HirCaptureMode::ByValue => seed.union_with(&payload_seed_from_expr(
+                        &capture.value,
+                        promotion_facts,
+                        safety,
+                    )),
+                }
+            }
+        }
+        HirExpr::LogicalAnd(logical) => match expr_truthiness(&logical.lhs, safety) {
+            Some(true) => seed.union_with(&payload_seed_from_expr(
+                &logical.rhs,
+                promotion_facts,
+                safety,
+            )),
+            Some(false) => seed.union_with(&payload_seed_from_expr(
+                &logical.lhs,
+                promotion_facts,
+                safety,
+            )),
+            None => {
+                seed.union_with(&payload_seed_from_expr(
+                    &logical.lhs,
+                    promotion_facts,
+                    safety,
+                ));
+                seed.union_with(&payload_seed_from_expr(
+                    &logical.rhs,
+                    promotion_facts,
+                    safety,
+                ));
+            }
+        },
+        HirExpr::LogicalOr(logical) => match expr_truthiness(&logical.lhs, safety) {
+            Some(true) => seed.union_with(&payload_seed_from_expr(
+                &logical.lhs,
+                promotion_facts,
+                safety,
+            )),
+            Some(false) => seed.union_with(&payload_seed_from_expr(
+                &logical.rhs,
+                promotion_facts,
+                safety,
+            )),
+            None => {
+                seed.union_with(&payload_seed_from_expr(
+                    &logical.lhs,
+                    promotion_facts,
+                    safety,
+                ));
+                seed.union_with(&payload_seed_from_expr(
+                    &logical.rhs,
+                    promotion_facts,
+                    safety,
+                ));
+            }
+        },
+        HirExpr::TableConstructor(table) => {
+            for field in &table.fields {
+                match field {
+                    crate::hir::HirTableField::Array(value) => {
+                        seed.union_with(&payload_seed_from_expr(value, promotion_facts, safety))
+                    }
+                    crate::hir::HirTableField::Record(record) => {
+                        if let crate::hir::HirTableKey::Expr(key) = &record.key {
+                            seed.union_with(&payload_seed_from_expr(key, promotion_facts, safety));
+                        }
+                        seed.union_with(&payload_seed_from_expr(
+                            &record.value,
+                            promotion_facts,
+                            safety,
+                        ));
+                    }
+                }
+            }
+        }
+        HirExpr::Decision(decision) => {
+            seed.union_with(&decision_payload_seed(decision, promotion_facts, safety));
+        }
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::Vector(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::Unary(_)
+        | HirExpr::Binary(_)
+        | HirExpr::Call(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => {}
+    }
+    seed
+}
+
+fn decision_payload_seed(
+    decision: &crate::hir::HirDecisionExpr,
+    promotion_facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+) -> ClosurePayloadSeed {
+    let mut seed = ClosurePayloadSeed::default();
+    let mut pending = BTreeSet::from([decision.entry]);
+    let mut visited = BTreeSet::new();
+    while let Some(node_ref) = pending.pop_first() {
+        if !visited.insert(node_ref) {
+            continue;
+        }
+        let Some(node) = decision.nodes.iter().find(|node| node.id == node_ref) else {
+            continue;
+        };
+        let truthiness = expr_truthiness(&node.test, safety);
+        for (reachable, target) in [
+            (truthiness != Some(false), &node.truthy),
+            (truthiness != Some(true), &node.falsy),
+        ] {
+            if !reachable {
+                continue;
+            }
+            match target {
+                crate::hir::HirDecisionTarget::Node(next) => {
+                    pending.insert(*next);
+                }
+                crate::hir::HirDecisionTarget::CurrentValue => {
+                    seed.union_with(&payload_seed_from_expr(&node.test, promotion_facts, safety))
+                }
+                crate::hir::HirDecisionTarget::Expr(value) => {
+                    seed.union_with(&payload_seed_from_expr(value, promotion_facts, safety));
+                }
+            }
+        }
+    }
+    seed
+}
+
+struct CapturedBindingCollector<'a> {
+    state: &'a mut LiveBindingState,
+    promotion_facts: &'a ProtoPromotionFacts,
+}
+
+impl HirVisitor for CapturedBindingCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        match expr {
+            HirExpr::TempRef(temp) => {
+                self.state.temps.insert(*temp);
+                self.state.homes.extend(complete_possible_home_slots(
+                    self.promotion_facts.possible_temp_home_slots(*temp),
+                    self.promotion_facts,
+                ));
+            }
+            HirExpr::LocalRef(local) => {
+                self.state.locals.insert(*local);
+                self.state.homes.extend(complete_possible_home_slots(
+                    self.promotion_facts.possible_local_home_slots(*local),
+                    self.promotion_facts,
+                ));
+            }
+            HirExpr::ParamRef(param) => {
+                self.state.homes.extend(complete_possible_home_slots(
+                    self.promotion_facts.possible_param_home_slots(*param),
+                    self.promotion_facts,
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn tbc_homes_started_by_stmt(
+    stmt: &HirStmt,
+    promotion_facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    let HirStmt::ToBeClosed(to_be_closed) = stmt else {
+        return BTreeSet::new();
+    };
+    let possible = match &to_be_closed.value {
+        HirExpr::TempRef(temp) => Some(promotion_facts.possible_temp_home_slots(*temp)),
+        HirExpr::LocalRef(local) => Some(promotion_facts.possible_local_home_slots(*local)),
+        HirExpr::ParamRef(param) => Some(promotion_facts.possible_param_home_slots(*param)),
+        _ => None,
+    };
+    let mut homes = possible
+        .map(|possible| complete_possible_home_slots(possible, promotion_facts))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|home| home.slot() == to_be_closed.reg_index)
+        .collect::<BTreeSet<_>>();
+    if homes.is_empty() {
+        homes.extend(
+            promotion_facts
+                .physical_home_universe()
+                .iter()
+                .copied()
+                .filter(|home| home.slot() == to_be_closed.reg_index),
+        );
+    }
+    homes
+}
+
+fn stmt_header_may_invoke_user_code(stmt: &HirStmt, safety: HirExprSafety) -> bool {
+    let mut collector = UserCodeObserver {
+        safety,
+        found: false,
+    };
+    visit_stmt_header(stmt, &mut collector);
+    collector.found
+}
+
+struct UserCodeObserver {
+    safety: HirExprSafety,
+    found: bool,
+}
+
+impl HirVisitor for UserCodeObserver {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.found |= matches!(stmt, HirStmt::GlobalDecl(_) | HirStmt::Close(_));
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
+    }
+
+    fn visit_call(&mut self, _call: &crate::hir::HirCallExpr) {
+        self.found = true;
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.found |= !self.safety.is_discard_safe_without_residual(expr);
+    }
+}
+
+fn writes_in_stmt_header(
+    stmt: &HirStmt,
+    promotion_facts: &ProtoPromotionFacts,
+) -> LiveBindingState {
+    let mut writes = LiveBindingState::default();
+    match stmt {
+        HirStmt::LocalDecl(decl) => {
+            for local in &decl.bindings {
+                record_local_write(&mut writes, *local, promotion_facts);
+            }
+        }
+        HirStmt::Assign(assign) => {
+            for target in &assign.targets {
+                record_target_write(&mut writes, target, promotion_facts);
+            }
+        }
+        HirStmt::GlobalDecl(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::If(_)
+        | HirStmt::While(_)
+        | HirStmt::Repeat(_)
+        | HirStmt::NumericFor(_)
+        | HirStmt::GenericFor(_)
+        | HirStmt::Block(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => {}
+    }
+    writes
+}
+
+fn record_target_write(
+    writes: &mut LiveBindingState,
+    target: &HirLValue,
+    promotion_facts: &ProtoPromotionFacts,
+) {
+    match target {
+        HirLValue::Temp(temp) => {
+            writes.temps.insert(*temp);
+            record_single_home_write(
+                writes,
+                promotion_facts.possible_temp_home_slots(*temp),
+                promotion_facts,
+            );
+        }
+        HirLValue::Local(local) => record_local_write(writes, *local, promotion_facts),
+        HirLValue::Param(param) => record_single_home_write(
+            writes,
+            promotion_facts.possible_param_home_slots(*param),
+            promotion_facts,
+        ),
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {}
+    }
+}
+
+fn record_local_write(
+    writes: &mut LiveBindingState,
+    local: LocalId,
+    promotion_facts: &ProtoPromotionFacts,
+) {
+    writes.locals.insert(local);
+    record_single_home_write(
+        writes,
+        promotion_facts.possible_local_home_slots(local),
+        promotion_facts,
+    );
+}
+
+fn record_single_home_write(
+    writes: &mut LiveBindingState,
+    homes: Option<BTreeSet<HomeSlotKey>>,
+    promotion_facts: &ProtoPromotionFacts,
+) {
+    let homes = complete_possible_home_slots(homes, promotion_facts);
+    if homes.len() == 1 {
+        writes.homes.extend(homes);
+    }
+}
+
+#[derive(Default)]
+struct LiveBindingCounts {
+    temps: BTreeMap<TempId, usize>,
+    locals: BTreeMap<LocalId, usize>,
+    homes: BTreeMap<HomeSlotKey, usize>,
+}
+
+impl LiveBindingCounts {
+    fn without(self, excluded: &Self) -> LiveBindingState {
+        LiveBindingState {
+            temps: remaining_keys(self.temps, &excluded.temps),
+            locals: remaining_keys(self.locals, &excluded.locals),
+            homes: remaining_keys(self.homes, &excluded.homes),
+        }
+    }
+}
+
+fn remaining_keys<K: Ord + Copy>(
+    total: BTreeMap<K, usize>,
+    excluded: &BTreeMap<K, usize>,
+) -> BTreeSet<K> {
+    total
+        .into_iter()
+        .filter_map(|(key, count)| {
+            (count > excluded.get(&key).copied().unwrap_or(0)).then_some(key)
+        })
+        .collect()
+}
+
+struct LiveReadCollector<'a> {
+    counts: LiveBindingCounts,
+    promotion_facts: &'a ProtoPromotionFacts,
+}
+
+impl HirVisitor for LiveReadCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        record_binding_read(&mut self.counts, expr, self.promotion_facts);
+    }
+}
+
+struct ReferenceCaptureReadCollector<'a> {
+    counts: LiveBindingCounts,
+    promotion_facts: &'a ProtoPromotionFacts,
+}
+
+impl HirVisitor for ReferenceCaptureReadCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        let HirExpr::Closure(closure) = expr else {
+            return;
+        };
+        for capture in &closure.captures {
+            if capture.mode != HirCaptureMode::ByReference {
+                continue;
+            }
+            let mut bindings = CapturedBindingReadCollector {
+                counts: &mut self.counts,
+                promotion_facts: self.promotion_facts,
+            };
+            visit::visit_expr(&capture.value, &mut bindings);
+        }
+    }
+}
+
+struct CapturedBindingReadCollector<'a> {
+    counts: &'a mut LiveBindingCounts,
+    promotion_facts: &'a ProtoPromotionFacts,
+}
+
+impl HirVisitor for CapturedBindingReadCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        record_binding_read(self.counts, expr, self.promotion_facts);
+    }
+}
+
+fn record_binding_read(
+    counts: &mut LiveBindingCounts,
+    expr: &HirExpr,
+    promotion_facts: &ProtoPromotionFacts,
+) {
+    let homes = match expr {
+        HirExpr::TempRef(temp) => {
+            *counts.temps.entry(*temp).or_default() += 1;
+            None
+        }
+        HirExpr::LocalRef(local) => {
+            *counts.locals.entry(*local).or_default() += 1;
+            Some(complete_possible_home_slots(
+                promotion_facts.possible_local_home_slots(*local),
+                promotion_facts,
+            ))
+        }
+        HirExpr::ParamRef(param) => Some(complete_possible_home_slots(
+            promotion_facts.possible_param_home_slots(*param),
+            promotion_facts,
+        )),
+        _ => None,
+    };
+    for home in homes.into_iter().flatten() {
+        *counts.homes.entry(home).or_default() += 1;
+    }
+}
+
+fn solve_active_observers(nodes: &[LiveCfgNode], entry: Option<usize>) -> Vec<ActiveObserverState> {
+    let mut predecessors = vec![BTreeSet::new(); nodes.len()];
+    for (source, node) in nodes.iter().enumerate() {
+        for successor in &node.successors {
+            predecessors[*successor].insert(source);
+        }
+    }
+    let mut active_in = vec![ActiveObserverState::default(); nodes.len()];
+    let mut active_out = vec![ActiveObserverState::default(); nodes.len()];
+    loop {
+        let mut changed = false;
+        for (id, node) in nodes.iter().enumerate() {
+            let mut next_in = ActiveObserverState::default();
+            for predecessor in &predecessors[id] {
+                next_in.union_with(&active_out[*predecessor]);
+            }
+            if Some(id) != entry && predecessors[id].is_empty() {
+                continue;
+            }
+            let next_out = next_in.after(node);
+            changed |= next_in != active_in[id] || next_out != active_out[id];
+            active_in[id] = next_in;
+            active_out[id] = next_out;
+        }
+        if !changed {
+            return active_in;
+        }
+    }
+}
+
+fn solve_live_out(nodes: &[LiveCfgNode]) -> Vec<LiveBindingState> {
+    let mut live_in = vec![LiveBindingState::default(); nodes.len()];
+    let mut live_out = vec![LiveBindingState::default(); nodes.len()];
+    loop {
+        let mut changed = false;
+        for (index, node) in nodes.iter().enumerate().rev() {
+            let mut next_out = LiveBindingState::default();
+            for successor in &node.successors {
+                next_out.union_with(&live_in[*successor]);
+            }
+            let mut next_in = next_out.clone().without_writes(&node.writes);
+            next_in.union_with(&node.reads);
+            changed |= next_out != live_out[index] || next_in != live_in[index];
+            live_out[index] = next_out;
+            live_in[index] = next_in;
+        }
+        if !changed {
+            return live_out;
+        }
+    }
+}
+
+fn collect_shell_live_outs(
+    block: &HirBlock,
+    prefix: &[PathComponent],
+    stmt_nodes: &BTreeMap<StmtPath, usize>,
+    live_out: &[LiveBindingState],
+    shells: &mut BTreeMap<StmtPath, ShellArmLiveOut>,
+) {
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(PathComponent::Stmt(index));
+        match stmt {
+            HirStmt::If(if_stmt) => {
+                if super::single_fixed_assign_pattern(&if_stmt.then_block).is_some()
+                    && if_stmt
+                        .else_block
+                        .as_ref()
+                        .is_some_and(|block| super::single_fixed_assign_pattern(block).is_some())
+                {
+                    let mut then_path = path.clone();
+                    then_path.extend([PathComponent::Then, PathComponent::Stmt(0)]);
+                    let mut else_path = path.clone();
+                    else_path.extend([PathComponent::Else, PathComponent::Stmt(0)]);
+                    shells.insert(
+                        path.clone(),
+                        ShellArmLiveOut {
+                            then_arm: live_out[stmt_nodes[&then_path]].clone(),
+                            else_arm: live_out[stmt_nodes[&else_path]].clone(),
+                        },
+                    );
+                }
+                let mut then_prefix = path.clone();
+                then_prefix.push(PathComponent::Then);
+                collect_shell_live_outs(
+                    &if_stmt.then_block,
+                    &then_prefix,
+                    stmt_nodes,
+                    live_out,
+                    shells,
+                );
+                if let Some(else_block) = &if_stmt.else_block {
+                    let mut else_prefix = path.clone();
+                    else_prefix.push(PathComponent::Else);
+                    collect_shell_live_outs(else_block, &else_prefix, stmt_nodes, live_out, shells);
+                }
+            }
+            HirStmt::While(while_stmt) => {
+                collect_body_shell_live_outs(&while_stmt.body, &path, stmt_nodes, live_out, shells);
+            }
+            HirStmt::Repeat(repeat_stmt) => {
+                collect_body_shell_live_outs(
+                    &repeat_stmt.body,
+                    &path,
+                    stmt_nodes,
+                    live_out,
+                    shells,
+                );
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                collect_body_shell_live_outs(&for_stmt.body, &path, stmt_nodes, live_out, shells);
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                collect_body_shell_live_outs(&for_stmt.body, &path, stmt_nodes, live_out, shells);
+            }
+            HirStmt::Block(nested) => {
+                collect_body_shell_live_outs(nested, &path, stmt_nodes, live_out, shells);
+            }
+            HirStmt::LocalDecl(_)
+            | HirStmt::GlobalDecl(_)
+            | HirStmt::Assign(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
+        }
+    }
+}
+
+fn collect_body_shell_live_outs(
+    body: &HirBlock,
+    path: &StmtPath,
+    stmt_nodes: &BTreeMap<StmtPath, usize>,
+    live_out: &[LiveBindingState],
+    shells: &mut BTreeMap<StmtPath, ShellArmLiveOut>,
+) {
+    let mut prefix = path.clone();
+    prefix.push(PathComponent::Body);
+    collect_shell_live_outs(body, &prefix, stmt_nodes, live_out, shells);
+}
 
 #[derive(Default)]
 pub(super) struct DeadShellPlan {
@@ -55,9 +1443,8 @@ impl DeadShellPlan {
             promotion_facts,
         };
         visit::visit_proto(proto, &mut candidates);
-        if candidates.locals.is_empty() && candidates.homes.is_empty() {
-            return Self::default();
-        }
+        let live_after = LiveAfterFacts::collect(proto, promotion_facts, safety);
+        let owner_label_refs = count_label_references(&proto.body.stmts);
 
         let parameter_homes = proto
             .params
@@ -71,6 +1458,8 @@ impl DeadShellPlan {
             safety,
             candidate_locals: candidates.locals,
             candidate_homes: candidates.homes,
+            live_after,
+            owner_label_refs: &owner_label_refs,
             plan: Self::default(),
         };
         let _ = analyzer.analyze_block(&proto.body, &[], Some(initial_state));
@@ -84,61 +1473,6 @@ impl DeadShellPlan {
         apply_block_plan(block, &[], &self.removable);
         true
     }
-}
-
-fn forward_label_indices(block: &HirBlock) -> Option<BTreeMap<crate::hir::HirLabelId, usize>> {
-    let mut labels = BTreeMap::new();
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        let HirStmt::Label(label) = stmt else {
-            continue;
-        };
-        if labels.insert(label.id, index).is_some() {
-            return None;
-        }
-    }
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        let HirStmt::Goto(goto) = stmt else {
-            continue;
-        };
-        if labels
-            .get(&goto.target)
-            .is_none_or(|target| *target <= index)
-        {
-            return None;
-        }
-    }
-    Some(labels)
-}
-
-fn forward_control_is_self_contained(block: &HirBlock) -> bool {
-    forward_label_indices(block).is_some()
-        && block.stmts.iter().all(|stmt| match stmt {
-            HirStmt::If(if_stmt) => {
-                forward_control_is_self_contained(&if_stmt.then_block)
-                    && if_stmt
-                        .else_block
-                        .as_ref()
-                        .is_none_or(forward_control_is_self_contained)
-            }
-            HirStmt::While(while_stmt) => forward_control_is_self_contained(&while_stmt.body),
-            HirStmt::Repeat(repeat_stmt) => forward_control_is_self_contained(&repeat_stmt.body),
-            HirStmt::NumericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
-            HirStmt::GenericFor(for_stmt) => forward_control_is_self_contained(&for_stmt.body),
-            HirStmt::Block(nested) => forward_control_is_self_contained(nested),
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => true,
-        })
 }
 
 struct CandidateValues<'a> {
@@ -293,6 +1627,8 @@ struct OldValueAnalyzer<'a> {
     safety: HirExprSafety,
     candidate_locals: BTreeSet<LocalId>,
     candidate_homes: BTreeSet<HomeSlotKey>,
+    live_after: LiveAfterFacts,
+    owner_label_refs: &'a BTreeMap<crate::hir::HirLabelId, usize>,
     plan: DeadShellPlan,
 }
 
@@ -303,11 +1639,12 @@ impl OldValueAnalyzer<'_> {
         prefix: &[PathComponent],
         mut state: Option<OldValueState>,
     ) -> InertFlow {
-        if !forward_control_is_self_contained(block) {
+        let Ok(cfg) = LexicalCfg::analyze(&block.stmts, self.owner_label_refs, self.safety) else {
             return self.analyze_unstructured_block(block, prefix);
-        }
-        let label_indices = forward_label_indices(block)
-            .expect("self-contained forward control must retain local labels");
+        };
+        let Some(label_indices) = cfg.linear_forward_labels() else {
+            return self.analyze_unstructured_block(block, prefix);
+        };
         let mut breaks = None;
         let mut continues = None;
         let mut index = 0;
@@ -441,14 +1778,24 @@ impl OldValueAnalyzer<'_> {
             }
             HirStmt::If(if_stmt) => {
                 let old_values = state.as_facts();
-                let removable = super::removable_dead_materialization_shell(
+                let removable = self.live_after.shell(path).is_some_and(|live_after| {
+                    super::removable_dead_materialization_shell(
+                        stmt,
+                        self.facts,
+                        None,
+                        &old_values,
+                        live_after,
+                        self.safety,
+                    )
+                });
+                if matches!(
                     stmt,
-                    self.facts,
-                    None,
-                    &old_values,
-                    self.safety,
-                );
-                if shell_has_old_value_target(stmt, self.promotion_facts) {
+                    HirStmt::If(if_stmt)
+                        if if_stmt.else_block.as_ref().is_some_and(|else_block| {
+                            super::single_fixed_assign_pattern(&if_stmt.then_block).is_some()
+                                && super::single_fixed_assign_pattern(else_block).is_some()
+                        })
+                ) {
                     self.plan.observe(path, removable);
                 }
 
@@ -794,25 +2141,6 @@ impl DeadShellPlan {
             self.not_removable.insert(path.clone());
         }
     }
-}
-
-fn shell_has_old_value_target(stmt: &HirStmt, facts: &ProtoPromotionFacts) -> bool {
-    let HirStmt::If(if_stmt) = stmt else {
-        return false;
-    };
-    let Some(else_block) = &if_stmt.else_block else {
-        return false;
-    };
-    let Some((then_target, _)) = super::single_fixed_assign_pattern(&if_stmt.then_block) else {
-        return false;
-    };
-    let Some((else_target, _)) = super::single_fixed_assign_pattern(else_block) else {
-        return false;
-    };
-    matches!(then_target, HirLValue::Local(_))
-        || matches!(else_target, HirLValue::Local(_))
-        || matches!(then_target, HirLValue::Temp(temp) if !complete_possible_home_slots(facts.possible_temp_home_slots(*temp), facts).is_empty())
-        || matches!(else_target, HirLValue::Temp(temp) if !complete_possible_home_slots(facts.possible_temp_home_slots(*temp), facts).is_empty())
 }
 
 fn assigned_value_class(

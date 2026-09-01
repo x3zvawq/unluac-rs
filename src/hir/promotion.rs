@@ -326,6 +326,8 @@ pub(super) struct ProtoPromotionFacts {
     loop_carrier_temps: BTreeSet<TempId>,
     scope_end_copy_root_temps: BTreeSet<TempId>,
     copy_root_overwrites: BTreeMap<TempId, Vec<CopyRootOverwrite>>,
+    copy_root_endpoint_producers: BTreeMap<TempId, BTreeSet<TempId>>,
+    promoted_local_by_temp: BTreeMap<TempId, LocalId>,
     local_home_slots: Vec<HomeSlotResolution>,
     invalidated_param_homes: BTreeSet<ParamId>,
     invalidated_local_homes: BTreeSet<LocalId>,
@@ -365,6 +367,21 @@ impl ProtoPromotionFacts {
             total_temps,
         );
         let copy_roots = collect_copy_root_facts(proto, cfg, dataflow, fixed_temps);
+        let copy_root_endpoint_producers = copy_roots
+            .overwrites
+            .iter()
+            .flat_map(|(producer, overwrites)| {
+                overwrites
+                    .iter()
+                    .map(move |overwrite| (overwrite.temp, *producer))
+            })
+            .fold(
+                BTreeMap::<TempId, BTreeSet<TempId>>::new(),
+                |mut index, (endpoint, producer)| {
+                    index.entry(endpoint).or_default().insert(producer);
+                    index
+                },
+            );
 
         Self {
             temp_home_slots,
@@ -387,6 +404,8 @@ impl ProtoPromotionFacts {
             loop_carrier_temps: collect_loop_carrier_temps(plan, phi_temps),
             scope_end_copy_root_temps: copy_roots.scope_end,
             copy_root_overwrites: copy_roots.overwrites,
+            copy_root_endpoint_producers,
+            promoted_local_by_temp: BTreeMap::new(),
             local_home_slots: Vec::new(),
             invalidated_param_homes: BTreeSet::new(),
             invalidated_local_homes: BTreeSet::new(),
@@ -458,12 +477,19 @@ impl ProtoPromotionFacts {
         self.loop_carrier_temps.contains(&temp)
     }
 
-    /// 该 temp 的潜在对象 home 在已证前向 CFG 的每条路径一直活跃到 scope end。
+    /// 该 temp 的潜在对象 home 在 producer 支配的 CFG 中沿每条路径精确走到 frame end
+    /// 或已登记 overwrite，且至少一条路径在终点前经过 GC-root 观察事件。
     ///
     /// 这份事实只服务于“源码读取已经结束、物理栈槽仍作为 GC root”的负向保护；若
     /// 后续 binding 合并使 home provenance 失效，就不能再消费原始证明。
     pub(super) fn is_scope_end_copy_root_temp(&self, temp: TempId) -> bool {
         !self.temp_home_was_invalidated(temp) && self.scope_end_copy_root_temps.contains(&temp)
+    }
+
+    /// 该 transaction 的所有动态路径都走到 frame end，不含需要在更早位置提交的 overwrite。
+    /// 只消费 scope-end provenance、却不会同步改写 overwrite endpoint 的分析必须使用这个查询。
+    pub(super) fn is_pure_scope_end_copy_root_temp(&self, temp: TempId) -> bool {
+        self.is_scope_end_copy_root_temp(temp) && !self.copy_root_overwrites.contains_key(&temp)
     }
 
     /// 返回结束该 physical root transaction 各路径的精确 GC-inert overwrite。
@@ -481,13 +507,32 @@ impl ProtoPromotionFacts {
         .then_some(overwrites)
     }
 
+    /// Whether this temp is an exact scalar endpoint of a still-valid raw CFG physical-root
+    /// transaction. This reverse index lets block-local consumers recover cross-child endpoints
+    /// without rescanning every producer transaction for every candidate.
+    pub(super) fn is_copy_root_endpoint(&self, temp: TempId) -> bool {
+        if self.temp_home_was_invalidated(temp) {
+            return false;
+        }
+        self.copy_root_endpoint_producers
+            .get(&temp)
+            .is_some_and(|producers| {
+                producers.iter().any(|producer| {
+                    self.copy_root_overwrites(*producer)
+                        .is_some_and(|overwrites| {
+                            overwrites.iter().any(|overwrite| overwrite.temp == temp)
+                        })
+                })
+            })
+    }
+
     #[cfg(test)]
     pub(super) fn record_copy_root_overwrites_for_test(
         &mut self,
         producer: TempId,
         overwrites: Vec<(TempId, HirExpr)>,
     ) {
-        let overwrites = overwrites
+        let overwrites: Vec<CopyRootOverwrite> = overwrites
             .into_iter()
             .map(|(temp, value)| CopyRootOverwrite {
                 temp,
@@ -495,6 +540,12 @@ impl ProtoPromotionFacts {
                     .expect("test overwrite must be a direct GC-inert scalar"),
             })
             .collect();
+        for overwrite in &overwrites {
+            self.copy_root_endpoint_producers
+                .entry(overwrite.temp)
+                .or_default()
+                .insert(producer);
+        }
         self.copy_root_overwrites.insert(producer, overwrites);
     }
 
@@ -770,11 +821,16 @@ impl ProtoPromotionFacts {
     }
 
     pub(super) fn record_temp_to_local_merge(&mut self, temp: TempId, local: LocalId) {
+        self.promoted_local_by_temp.insert(temp, local);
         let source_home = self.trusted_temp_home_slot(temp);
         let target_home = self.trusted_local_home_slot(local);
         if source_home.is_none() || source_home != target_home {
             self.record_local_home_merge(local, self.possible_temp_home_slots(temp));
         }
+    }
+
+    pub(super) fn promoted_local_for_temp(&self, temp: TempId) -> Option<LocalId> {
+        self.promoted_local_by_temp.get(&temp).copied()
     }
 
     pub(super) fn record_local_to_param_merge(&mut self, local: LocalId, param: ParamId) {
@@ -1382,6 +1438,7 @@ impl CopyRootOverwrite {
 struct CopyRootEnd {
     scope_end: bool,
     overwrites: BTreeMap<TempId, CopyRootOverwrite>,
+    observed_any: bool,
 }
 
 impl CopyRootEnd {
@@ -1389,6 +1446,7 @@ impl CopyRootEnd {
         Self {
             scope_end: true,
             overwrites: BTreeMap::new(),
+            observed_any: true,
         }
     }
 
@@ -1396,11 +1454,17 @@ impl CopyRootEnd {
         Self {
             scope_end: false,
             overwrites: BTreeMap::from([(overwrite.temp, overwrite)]),
+            observed_any: true,
         }
     }
 
+    fn with_observation(mut self, observed: bool) -> Self {
+        self.observed_any = observed;
+        self
+    }
+
     fn is_complete(&self) -> bool {
-        self.scope_end || !self.overwrites.is_empty()
+        self.observed_any && (self.scope_end || !self.overwrites.is_empty())
     }
 }
 
@@ -1632,10 +1696,13 @@ enum CopyRootCfgBlockEnd {
     End(CopyRootEnd),
 }
 
-/// 从一个已执行的 control terminator 出发，只接受严格前向、无环且每条动态路径都在
-/// scope end 或 direct GC-inert overwrite 前观察过同一 active home 的 CFG。incoming
-/// observation 在 join 取交集；状态只会由 true 变为 false，有限 DAG 上的 worklist
-/// 因而必然收敛。
+/// 从一个已执行的 control terminator 出发，只接受 producer 支配且 predecessor-closed 的
+/// CFG region；每条动态路径都必须精确走到 frame end 或 direct GC-inert overwrite。任一路径
+/// 在终点前观察过同一 active home，就需要保留该 root；没有观察的路径是 neutral，因为延续
+/// raw root 到它原本的终点不会新增可观察差异。incoming observation 因此在 join 取并集；
+/// 有限 CFG 上的 bool lattice 只会由 false 单调变为 true，worklist 必然收敛。region 可以
+/// 包含 cycle，但不能回到 producer（否则会产生新的动态 root epoch）；cycle 内若 must-define
+/// home 则在该 overwrite 精确截断，因此所有继续边仍描述同一个 producer value。
 fn copy_root_cfg_end(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -1674,7 +1741,7 @@ fn copy_root_cfg_end_with(
     observed: bool,
     mut end_at: impl FnMut(usize, Reg) -> Option<CopyRootEnd>,
 ) -> Option<CopyRootEnd> {
-    let region = copy_root_forward_cfg_region(
+    let region = copy_root_cfg_region(
         inputs.instrs,
         inputs.cfg,
         inputs.instr_effects,
@@ -1695,7 +1762,7 @@ fn copy_root_cfg_end_with(
 
     let mut incoming = BTreeMap::<BlockRef, bool>::new();
     let mut pending = VecDeque::new();
-    for successor in copy_root_forward_cfg_successors(inputs.cfg, source)? {
+    for successor in copy_root_cfg_successors(inputs.cfg, source)? {
         merge_copy_root_cfg_incoming(&mut incoming, &mut pending, successor, observed);
     }
 
@@ -1706,9 +1773,10 @@ fn copy_root_cfg_end_with(
             CopyRootCfgBlockEnd::End(block_ends) => {
                 ends.scope_end |= block_ends.scope_end;
                 ends.overwrites.extend(block_ends.overwrites);
+                ends.observed_any |= block_ends.observed_any;
             }
             CopyRootCfgBlockEnd::Continue { observed } => {
-                for successor in copy_root_forward_cfg_successors(inputs.cfg, block)? {
+                for successor in copy_root_cfg_successors(inputs.cfg, block)? {
                     merge_copy_root_cfg_incoming(&mut incoming, &mut pending, successor, observed);
                 }
             }
@@ -1743,7 +1811,7 @@ fn copy_root_cfg_scope_end(
     (ends.scope_end && ends.overwrites.is_empty()).then_some(())
 }
 
-fn copy_root_forward_cfg_region(
+fn copy_root_cfg_region(
     instrs: &[LowInstr],
     cfg: &Cfg,
     instr_effects: &[InstrEffect],
@@ -1751,7 +1819,7 @@ fn copy_root_forward_cfg_region(
     home: Reg,
 ) -> Option<BTreeSet<BlockRef>> {
     let mut region = BTreeSet::new();
-    let mut pending = VecDeque::from(copy_root_forward_cfg_successors(cfg, source)?);
+    let mut pending = VecDeque::from(copy_root_cfg_successors(cfg, source)?);
     while let Some(block) = pending.pop_front() {
         if !region.insert(block) {
             continue;
@@ -1767,7 +1835,12 @@ fn copy_root_forward_cfg_region(
         }) {
             continue;
         }
-        pending.extend(copy_root_forward_cfg_successors(cfg, block)?);
+        pending.extend(copy_root_cfg_successors(cfg, block)?);
+    }
+    if region.contains(&source) {
+        // Re-entering the producer block would execute the same static def in a new dynamic
+        // iteration, so one root fact could no longer describe a single value epoch.
+        return None;
     }
     Some(region)
 }
@@ -1784,7 +1857,7 @@ fn merge_copy_root_cfg_incoming(
             pending.push_back(block);
         }
         Some(previous) => {
-            let merged = *previous && observed;
+            let merged = *previous || observed;
             if merged != *previous {
                 *previous = merged;
                 pending.push_back(block);
@@ -1807,7 +1880,17 @@ fn scan_copy_root_cfg_block(
         let instr = inputs.instrs.get(index)?;
         let effect = inputs.instr_effects.get(index)?;
         if effect.must_define(inputs.home) {
-            let end = observed.then(|| end_at(index, inputs.home)).flatten()?;
+            // Every dynamic overwrite path contributes its exact endpoint. Even a neutral path
+            // must overwrite the promoted local there: otherwise a sibling observed path could
+            // publish the root fact and incorrectly keep this path's old value across a later
+            // join observation.
+            let end = end_at(index, inputs.home)?.with_observation(observed);
+            return Some(CopyRootCfgBlockEnd::End(end));
+        }
+        if matches!(instr, LowInstr::Return(_) | LowInstr::TailCall(_)) {
+            // A return/tailcall ends the current frame. An unobserved path is neutral rather than
+            // evidence against a sibling path that did execute a root-observing call.
+            let end = CopyRootEnd::scope_end().with_observation(observed);
             return Some(CopyRootCfgBlockEnd::End(end));
         }
         match copy_root_instr_progress(
@@ -1845,6 +1928,20 @@ fn copy_root_forward_cfg_successors(cfg: &Cfg, block: BlockRef) -> Option<Vec<Bl
     {
         // 候选拒绝[SemanticBarrier:Lifetime]：回边会重用同一静态 copy def，空/synthetic
         // successor 也没有可扫描的 scope-end transaction，均不能冻结成本轮 root。
+        return None;
+    }
+    Some(successors)
+}
+
+fn copy_root_cfg_successors(cfg: &Cfg, block: BlockRef) -> Option<Vec<BlockRef>> {
+    let successors = cfg.reachable_successors(block);
+    if successors.is_empty()
+        || successors.iter().any(|successor| {
+            cfg.blocks
+                .get(successor.index())
+                .is_none_or(|block| block.instrs.is_empty())
+        })
+    {
         return None;
     }
     Some(successors)
@@ -2351,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_root_cfg_join_meets_observation_from_every_predecessor() {
+    fn copy_root_cfg_join_keeps_observation_from_any_dominated_path() {
         let cfg = Cfg {
             blocks: vec![
                 BasicBlock {
@@ -2492,7 +2589,7 @@ mod tests {
                 false,
                 Reg(1),
             ),
-            None
+            Some(())
         );
     }
 
@@ -2558,7 +2655,10 @@ mod tests {
                 then_target: InstrRef(1),
                 else_target: InstrRef(3),
             }),
-            observing_call(),
+            LowInstr::Move(MoveInstr {
+                dst: Reg(3),
+                src: Reg(4),
+            }),
             LowInstr::LoadBool(LoadBoolInstr {
                 dst: Reg(1),
                 value: false,
@@ -2597,7 +2697,7 @@ mod tests {
             false,
             overwrite,
         )
-        .expect("both dominated paths observe then overwrite the root home");
+        .expect("one observed path publishes every dominated path's exact overwrite endpoint");
         assert!(!ends.scope_end);
         assert_eq!(
             ends.overwrites.keys().copied().collect::<Vec<_>>(),

@@ -790,6 +790,27 @@ fn table_key_complexity(key: &HirTableKey) -> usize {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+enum EagerInlineRejection {
+    ComplexityBudget,
+    DeferredDecision,
+    DiagnosticResidual,
+    NamedClosure,
+}
+
+fn eager_inline_rejection(replacement: &HirExpr) -> Option<EagerInlineRejection> {
+    if expr_complexity(replacement) > NESTED_INLINE_MAX_COMPLEXITY {
+        return Some(EagerInlineRejection::ComplexityBudget);
+    }
+
+    match replacement {
+        HirExpr::Decision(_) => Some(EagerInlineRejection::DeferredDecision),
+        HirExpr::Unresolved(_) => Some(EagerInlineRejection::DiagnosticResidual),
+        HirExpr::Closure(_) => Some(EagerInlineRejection::NamedClosure),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum InlineSite {
     Direct,
     Nested,
@@ -832,16 +853,29 @@ impl InlineSite {
                     && is_small_pure_nested_inline_expr(replacement)
             }
             Self::EagerOperand | Self::EagerAccessBase => {
-                // 候选拒绝[PolicyBoundary]：已证明必达的直接操作数/access base 仍受固定复杂度阈值限制。
-                // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 消费；temp-inline 不把中间恢复节点埋入普通表达式。
-                // 候选拒绝[PolicyBoundary]：Unresolved 是 strict 失败/permissive Error 的显式证据，
-                // 不存在后续 simplify consumer，项目选择保留其独立 producer 形状。
-                // 候选拒绝[PolicyBoundary]：closure child body 不计入表达式复杂度，保留独立 producer 避免多行 IIFE。
-                expr_complexity(replacement) <= NESTED_INLINE_MAX_COMPLEXITY
-                    && !matches!(
-                        replacement,
-                        HirExpr::Decision(_) | HirExpr::Closure(_) | HirExpr::Unresolved(_)
-                    )
+                match eager_inline_rejection(replacement) {
+                    None => true,
+                    Some(EagerInlineRejection::ComplexityBudget) => {
+                        // 候选拒绝[PolicyBoundary]：已证明必达的 operand/access base 仍受固定
+                        // 展示复杂度阈值限制；该阈值不表示表达式不等价。
+                        false
+                    }
+                    Some(EagerInlineRejection::DeferredDecision) => {
+                        // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 消费；
+                        // owner invalidates DecisionShape/LogicalExpr/BooleanPattern，均会重审 temp-inline。
+                        false
+                    }
+                    Some(EagerInlineRejection::DiagnosticResidual) => {
+                        // 候选拒绝[PolicyBoundary]：Unresolved 是 strict 失败/permissive Error 的
+                        // 显式诊断证据，项目选择保留其独立 producer 形状。
+                        false
+                    }
+                    Some(EagerInlineRejection::NamedClosure) => {
+                        // 候选拒绝[PolicyBoundary]：closure child body 不计入表达式复杂度，项目
+                        // 选择保留命名 producer，避免生成多行 IIFE。
+                        false
+                    }
+                }
             }
             Self::ConditionalNested | Self::RepeatedNested => {
                 // 候选拒绝[SemanticBarrier:ControlFlow]：`t=f(); return c and t` 若把 call/lookup producer 移进条件区域，会从 eager 求值变成条件求值；重复区域还可能每轮重算。

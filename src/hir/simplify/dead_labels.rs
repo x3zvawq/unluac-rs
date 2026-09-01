@@ -59,8 +59,7 @@ fn label_is_removable(
     referenced: &BTreeSet<HirLabelId>,
     pending_tbc_boundaries: &BTreeSet<HirLabelId>,
 ) -> bool {
-    // 候选拒绝[SemanticBarrier:ControlFlow]：仍被 `goto` 命中的 label 是控制流目的地；
-    // 删除会生成悬空 goto；最小反例为 `goto L; ::L::`。
+    // 仍被 `goto` 命中的 label 不是 dead-label 候选；候选从“全 proto 无引用”形成。
     if referenced.contains(&label.id) {
         return false;
     }

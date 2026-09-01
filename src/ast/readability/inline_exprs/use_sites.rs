@@ -887,7 +887,7 @@ impl InlineSite {
             // 初始化与非尾 return 都把裸 call 收窄为单值，完整事件顺序再由 run 前缀证明。
             Self::ReturnValue => is_extended_call_chain_inline_expr(replacement),
             Self::Index => {
-                // 候选忽略[NotApplicable]：ExtendedCallChain 不拥有 primitive/copy-like index alias；
+                // ExtendedCallChain 不拥有 primitive/copy-like index alias；
                 // 它们在本 pass 随后的 stable-copy 事务中按 snapshot 事实重审。
                 // 候选拒绝[SemanticBarrier:Lifetime]：把 call/method/field 结果移入 index 会让 key root 在参数求值前失活，弱表与强制 GC 可观察差异（regress_353_extended_index_key_lifetime）。
                 false
@@ -916,7 +916,7 @@ impl InlineSite {
             | Self::Index
             | Self::CallArgNonFinal
             | Self::CallArgFinal => {
-                // 候选忽略[NotApplicable]：AliasInitializerChain 只拥有紧邻 initializer
+                // AliasInitializerChain 只拥有紧邻 initializer
                 // 的 neutral/access-base；call 参数会先由 AdjacentValueSink 特例筛选，
                 // 其余 return/index 不是该 scanner 生成的 sink。
                 false
@@ -947,7 +947,7 @@ impl InlineSite {
             }
             Self::CallCallee => is_call_callee_inline_expr(replacement),
             Self::ReturnValue => {
-                // 候选忽略[NotApplicable]：AdjacentValueSink 只由相邻 assign/local-decl
+                // AdjacentValueSink 只由相邻 assign/local-decl
                 // scanner 产生，直接 return 不会以此 policy 进入 rewriter。
                 false
             }
@@ -975,7 +975,7 @@ impl InlineSite {
                 is_extended_neutral_local_alias_expr(replacement)
                     || is_recallable_inline_expr(replacement)
             }
-            // 候选忽略[NotApplicable]：LoopHeaderCall 只由 generic-for call sink scanner
+            // LoopHeaderCall 只由 generic-for call sink scanner
             // 产生；直接 return 不可达，primitive index copy 留给随后 stable-copy，
             // eventful index producer 仍受 ExtendedCallChain 的 lifetime 反例约束。
             Self::ReturnValue | Self::Index => false,

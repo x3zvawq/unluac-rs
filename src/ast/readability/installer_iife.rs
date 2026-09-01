@@ -26,7 +26,9 @@
 //! - 判断多值转发与物化约束，它们由 HIR value-pack owner 负责；
 //! - 把这个局部函数进一步降成方法声明或 `local function`，那属于 `function_sugar`。
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstCallStmt, AstExpr,
@@ -36,66 +38,84 @@ use crate::ast::common::{
 use crate::hir::TempId;
 
 use super::ReadabilityContext;
+use super::local_scope_limit::{
+    direct_local_count, function_entry_local_count, stmt_child_local_count,
+};
 use super::visit::{self, AstVisitor};
-use super::walk::{self, AstRewritePass, BlockKind};
+use super::walk::{self, ScopedAstRewritePass};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
     let next_synthetic_local = next_synthetic_local_index_in_block(&module.body);
-    walk::rewrite_module(
+    walk::rewrite_module_scoped(
         module,
-        &mut InstallerIifePass {
-            next_synthetic_locals: vec![next_synthetic_local],
+        &InstallerIifeScope {
+            active_locals: 0,
+            next_synthetic_local: Rc::new(Cell::new(next_synthetic_local)),
         },
+        &mut InstallerIifePass,
     )
 }
 
-struct InstallerIifePass {
-    /// Synthetic ids are function-local, not block-local. Nested lexical blocks share the
-    /// current counter, while each child function receives its own namespace.
-    next_synthetic_locals: Vec<usize>,
+struct InstallerIifePass;
+
+#[derive(Clone)]
+struct InstallerIifeScope {
+    active_locals: usize,
+    /// Synthetic ids are function-local, not block-local. Nested lexical blocks share this
+    /// counter, while each child function receives its own namespace.
+    next_synthetic_local: Rc<Cell<usize>>,
 }
 
-impl AstRewritePass for InstallerIifePass {
-    fn enter_function(&mut self, function: &AstFunctionExpr) {
-        self.next_synthetic_locals
-            .push(next_synthetic_local_index_in_function(function));
-    }
+impl ScopedAstRewritePass for InstallerIifePass {
+    type Scope = InstallerIifeScope;
 
-    fn leave_function(&mut self, _function: &AstFunctionExpr) {
-        assert!(
-            self.next_synthetic_locals.len() > 1,
-            "installer IIFE function namespace stack must keep the module frame"
-        );
-        self.next_synthetic_locals.pop();
-    }
-
-    fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
-        let next_synthetic_local = self
-            .next_synthetic_locals
-            .last_mut()
-            .expect("installer IIFE rewrite must run inside a function namespace");
-        let mut changed = false;
-        let mut index = 0;
-        while index < block.stmts.len() {
-            let Some(rewritten) =
-                rewrite_installer_iife_stmt(&block.stmts[index], next_synthetic_local)
-            else {
-                index += 1;
-                continue;
-            };
-            let rewritten_len = rewritten.len();
-            block.stmts.splice(index..=index, rewritten);
-            changed = true;
-            index += rewritten_len;
+    fn enter_function(
+        &mut self,
+        function: &mut AstFunctionExpr,
+        _outer_scope: &Self::Scope,
+    ) -> Self::Scope {
+        InstallerIifeScope {
+            active_locals: function_entry_local_count(function),
+            next_synthetic_local: Rc::new(Cell::new(next_synthetic_local_index_in_function(
+                function,
+            ))),
         }
-        changed
+    }
+
+    fn scope_for_stmt_children(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
+        InstallerIifeScope {
+            active_locals: scope
+                .active_locals
+                .saturating_add(stmt_child_local_count(stmt)),
+            next_synthetic_local: Rc::clone(&scope.next_synthetic_local),
+        }
+    }
+
+    fn scope_after_stmt(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
+        InstallerIifeScope {
+            active_locals: scope.active_locals.saturating_add(direct_local_count(stmt)),
+            next_synthetic_local: Rc::clone(&scope.next_synthetic_local),
+        }
+    }
+
+    fn rewrite_stmt(&mut self, stmt: &mut AstStmt, scope: &Self::Scope) -> bool {
+        let next_synthetic_local = scope.next_synthetic_local.get();
+        let Some(rewritten) = rewrite_installer_iife_stmt(stmt, next_synthetic_local) else {
+            return false;
+        };
+        if scope.active_locals >= crate::SOURCE_LOCAL_LIMIT {
+            // 候选拒绝[TargetConstraint]：命名 IIFE 会在调用点新增一个 active local；现有词法 owner 已耗尽项目源码 local 预算时，后置缩域无法保证释放外层或长生命周期槽。
+            return false;
+        }
+        scope
+            .next_synthetic_local
+            .set(next_synthetic_local.saturating_add(1));
+        *stmt = rewritten;
+        true
     }
 }
 
-fn rewrite_installer_iife_stmt(
-    stmt: &AstStmt,
-    next_synthetic_local: &mut usize,
-) -> Option<Vec<AstStmt>> {
+fn rewrite_installer_iife_stmt(stmt: &AstStmt, next_synthetic_local: usize) -> Option<AstStmt> {
     let AstStmt::CallStmt(call_stmt) = stmt else {
         return None;
     };
@@ -111,8 +131,7 @@ fn rewrite_installer_iife_stmt(
         return None;
     }
 
-    let binding_id = AstSyntheticLocalId(TempId(*next_synthetic_local));
-    *next_synthetic_local += 1;
+    let binding_id = AstSyntheticLocalId(TempId(next_synthetic_local));
 
     let rewritten = vec![
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -132,9 +151,7 @@ fn rewrite_installer_iife_stmt(
         })),
     ];
 
-    Some(vec![AstStmt::DoBlock(Box::new(AstBlock {
-        stmts: rewritten,
-    }))])
+    Some(AstStmt::DoBlock(Box::new(AstBlock { stmts: rewritten })))
 }
 
 pub(super) fn function_expr_is_substantial(function: &AstFunctionExpr) -> bool {
@@ -412,7 +429,7 @@ mod tests {
     use super::*;
     use crate::ast::common::{AstIf, AstTargetDialect};
     use crate::decompile::DecompileDialect;
-    use crate::hir::HirProtoRef;
+    use crate::hir::{HirProtoRef, LocalId};
 
     fn substantial_iife_call() -> AstStmt {
         AstStmt::CallStmt(Box::new(AstCallStmt {
@@ -430,6 +447,7 @@ mod tests {
                     },
                     captured_bindings: BTreeSet::new(),
                     captured_params: BTreeSet::new(),
+                    capture_names_by_upvalue: std::collections::BTreeMap::new(),
                     capture_write_names: BTreeSet::new(),
                 })),
                 args: Vec::new(),
@@ -485,5 +503,49 @@ mod tests {
             installer.bindings[0].id,
             AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(1)))
         );
+    }
+
+    #[test]
+    fn nested_iife_keeps_call_shape_when_active_locals_exhaust_budget() {
+        let mut module = AstModule {
+            entry_function: HirProtoRef(0),
+            body: AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                        bindings: (0..crate::SOURCE_LOCAL_LIMIT)
+                            .map(|index| AstLocalBinding {
+                                id: AstBindingRef::Local(LocalId(index)),
+                                attr: AstLocalAttr::None,
+                                origin: AstLocalOrigin::Recovered,
+                            })
+                            .collect(),
+                        values: Vec::new(),
+                    })),
+                    AstStmt::If(Box::new(AstIf {
+                        cond: AstExpr::Boolean(true),
+                        then_block: AstBlock {
+                            stmts: vec![substantial_iife_call()],
+                        },
+                        else_block: None,
+                    })),
+                ],
+            },
+        };
+
+        assert!(!apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(DecompileDialect::Lua54),
+                options: super::super::ReadabilityOptions::default(),
+            },
+        ));
+
+        let AstStmt::If(if_stmt) = &module.body.stmts[1] else {
+            panic!("second statement should remain the containing if");
+        };
+        assert!(matches!(
+            if_stmt.then_block.stmts.as_slice(),
+            [AstStmt::CallStmt(_)]
+        ));
     }
 }

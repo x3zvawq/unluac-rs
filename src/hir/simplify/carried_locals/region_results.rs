@@ -4,9 +4,12 @@
 //! 可能表现为 `local result; if ... result = state ... end`，或在每个 loop break 前把
 //! carried state 复制到 result temp。只有所有能抵达后缀的路径都完整定义 result，
 //! 并能证明同一 home slot，或证明动态 repeat 的匿名 result 在每个出口都只是 state 的
-//! 精确副本时，result 才能安全复用原 local/param；capture、跨 label 与独立状态写入都会
-//! 阻止该折叠。proto 级资源身份门还拒绝 TBC 和 reference-capture raw-home may-alias；
-//! continue/goto 的条件路径不由这个 pass 猜测。
+//! 精确副本时，result 才能安全复用原 local/param；reference capture、外部入口与独立状态
+//! 写入都会阻止该折叠。By-value capture 由创建点的 reaching relation 验证；proto 级资源
+//! 身份门还拒绝 TBC 和 reference-capture raw-home may-alias；
+//! 与改写两端 possible-home 不相交的 cleanup 会原位保留，不会伪装成整个 region 的屏障；
+//! self-contained goto/label 由 owner-wide lexical CFG 证明；跨 owner transfer 只在其
+//! relation 会让目标观察错误 result/state epoch 时保留原形。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,13 +20,13 @@ use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::rewrite_stmts;
-use super::HandoffIdentityFacts;
 use super::binding::{
     BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
     bindings_share_exact_home_slot, carry_binding_from_expr, carry_binding_from_lvalue,
 };
 use super::prune::{RedundantSelfAssignPrunePass, prune_empty_assign_stmts};
 use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
+use super::{HandoffIdentityFacts, RegionControlFacts};
 
 mod assignments;
 mod binding_facts;
@@ -36,21 +39,20 @@ use assignments::*;
 use binding_facts::*;
 use conditions::*;
 pub(super) use flow::collapse_result_writeback_transactions;
-use flow::{expr_has_hard_barrier, region_has_hard_barrier};
+use flow::{
+    ExternalTransferScope, expr_has_hard_barrier, region_has_hard_barrier,
+    region_rewrites_preserve_external_transfers,
+};
 use parallel::*;
 use rewrites::*;
 
-pub(super) struct RegionResultIndex<'a> {
+pub(super) struct RegionResultIndex {
     mentions: BTreeMap<CarryBinding, Vec<usize>>,
     local_declarations: BTreeMap<LocalId, usize>,
-    captured: &'a BTreeSet<CarryBinding>,
 }
 
-impl<'a> RegionResultIndex<'a> {
-    pub(super) fn new(
-        stmts: &[HirStmt],
-        captured: &'a BTreeSet<CarryBinding>,
-    ) -> RegionResultIndex<'a> {
+impl RegionResultIndex {
+    pub(super) fn new(stmts: &[HirStmt]) -> RegionResultIndex {
         let mut mentions = BTreeMap::<CarryBinding, Vec<usize>>::new();
         for (index, bindings) in collect_binding_mentions_by_stmt(stmts)
             .into_iter()
@@ -71,7 +73,6 @@ impl<'a> RegionResultIndex<'a> {
         Self {
             mentions,
             local_declarations,
-            captured,
         }
     }
 
@@ -87,10 +88,9 @@ impl<'a> RegionResultIndex<'a> {
     }
 
     fn is_private_after(&self, binding: CarryBinding, index: usize) -> bool {
-        !self.captured.contains(&binding)
-            && self.mentions.get(&binding).is_none_or(|mentions| {
-                mentions.partition_point(|mention| *mention <= index) == mentions.len()
-            })
+        self.mentions.get(&binding).is_none_or(|mentions| {
+            mentions.partition_point(|mention| *mention <= index) == mentions.len()
+        })
     }
 }
 
@@ -98,10 +98,10 @@ pub(super) fn collapse_inferred_if_result_chains(
     block: &mut HirBlock,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    captured_bindings: &BTreeSet<CarryBinding>,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
 ) -> bool {
-    let result_index = RegionResultIndex::new(&block.stmts, captured_bindings);
+    let result_index = RegionResultIndex::new(&block.stmts);
     let mut rewrites = BTreeMap::<CarryBinding, CarryBinding>::new();
     let mut removed_declarations = vec![false; block.stmts.len()];
     let mut seed_merge_groups = Vec::<Vec<LocalId>>::new();
@@ -123,13 +123,11 @@ pub(super) fn collapse_inferred_if_result_chains(
             let HirStmt::If(if_stmt) = block.stmts.get(region_index)? else {
                 return None;
             };
-            if region_has_hard_barrier(&block.stmts[region_index..=region_index])
+            if region_has_hard_barrier(&block.stmts[region_index..=region_index], control_facts)
                 || bindings_are_mentioned_in_exprs(std::iter::once(&if_stmt.cond), &results)
             {
-                // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过 tracked fallthrough
-                // assignment，使改名后的 seed 在未产出 result 的路径上保持旧值。
-                // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变
-                // resource 所属 cell 的 close/root epoch。
+                // 候选拒绝[SemanticBarrier:ControlFlow]：外部入口可绕过 tracked fallthrough
+                // assignment；外跳 relation 在 rewrite map 形成后另行逐项验证。
                 // 候选拒绝[SemanticBarrier:ValueFlow]：condition 读取空 result 时原值为 nil；
                 // 改名后会读取 seed 的旧值并可能选择另一分支。
                 // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
@@ -139,7 +137,7 @@ pub(super) fn collapse_inferred_if_result_chains(
             let inferred = infer_rewrites(
                 &results,
                 &exits,
-                declaration_start,
+                region_index,
                 &result_index,
                 promotion_facts,
                 true,
@@ -147,8 +145,15 @@ pub(super) fn collapse_inferred_if_result_chains(
             (!inferred.iter().any(|(result, seed)| {
                 outer_bindings.contains(result) || outer_bindings.contains(seed)
             }) && rewrites_preserve_identity(&inferred, promotion_facts, identity_facts)
-                && rewrite_is_private_and_uncaptured(region_index, &inferred, &result_index))
-            // 候选拒绝[SemanticBarrier:Lifetime]：outer/capture/identity 或 region 后仍活跃的 seed/result 可观察合并前的独立 epoch/root。
+                && rewrite_is_private_after(region_index, &inferred, &result_index)
+                && region_rewrites_preserve_external_transfers(
+                    &block.stmts[region_index..=region_index],
+                    &inferred,
+                    control_facts,
+                    ExternalTransferScope::WholeRegion,
+                ))
+            // 候选拒绝[SemanticBarrier:Lifetime]：outer/reference-capture/identity 或 region
+            // 后仍活跃的 seed/result 可观察合并前的独立 epoch/root。
             .then_some(inferred)
         })();
         let Some(inferred) = candidate else {
@@ -185,11 +190,25 @@ pub(super) fn collapse_inferred_if_result_chains(
                 }
             }
         }
+        for result in inferred.keys().copied() {
+            let CarryBinding::Local(local) = result else {
+                continue;
+            };
+            let declaration = result_index
+                .local_declarations
+                .get(&local)
+                .copied()
+                .expect("inferred local result retains its planned declaration");
+            assert!(
+                (declaration_start..region_index).contains(&declaration),
+                "inferred result declaration must belong to the current candidate group"
+            );
+            removed_declarations[declaration] = true;
+        }
         for (result, seed) in inferred {
             let seed = canonical_binding(seed, &rewrites);
             rewrites.insert(result, seed);
         }
-        removed_declarations[declaration_start..region_index].fill(true);
         cursor = region_index + 1;
     }
 
@@ -256,9 +275,9 @@ fn canonical_binding(
 pub(super) fn collapse_written_back_if_results(
     block: &mut HirBlock,
     outer_bindings: &dyn BindingProtection,
-    captured_bindings: &BTreeSet<CarryBinding>,
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
 ) -> bool {
     let mentions = collect_binding_mentions_by_stmt(&block.stmts);
     let mut mention_counts = BTreeMap::<CarryBinding, usize>::new();
@@ -287,29 +306,37 @@ pub(super) fn collapse_written_back_if_results(
             index += 1;
             continue;
         };
+        if state == result {
+            index += 1;
+            continue;
+        }
         let facts = binding_facts(std::slice::from_ref(&block.stmts[index + 1]));
         let state_writes_preserve_result = exits.iter().all(|exit| {
             !exit.contains_key(&state)
                 && exit.get(&result).and_then(ExitValue::exact_binding) == Some(state)
         });
-        if !matches!(state, CarryBinding::Param(_) | CarryBinding::Local(_))
-            || state == result
-            || outer_bindings.contains(&result)
-            || captured_bindings.contains(&result)
-            || captured_bindings.contains(&state)
+        if outer_bindings.contains(&result)
             || promotion_facts.compacts_home_slots()
             || !bindings_share_exact_home_slot(result, state, promotion_facts)
             || !identity_facts.binding_merge_preserves_identity(result, state, promotion_facts)
-            || mention_counts.get(&result).copied() != Some(2)
+        {
+            // 候选拒绝[SemanticBarrier:Lifetime]：outer、异槽或资源 identity 可观察
+            // result/state 合并前的独立 cell/root epoch。
+            index += 1;
+            continue;
+        }
+        if mention_counts.get(&result).copied() != Some(2)
             || facts.reads.contains_key(&result)
             || facts.writes.get(&result).copied() != Some(exits.len())
             || (facts.writes.contains_key(&state) && !state_writes_preserve_result)
-            || region_has_hard_barrier(&block.stmts[index + 1..=index + 1])
         {
-            // 候选拒绝[SemanticBarrier:Lifetime]：capture/outer use、异槽、额外 result mention 或 state 被独立写入时，改名会合并可区分 epoch。
-            // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过 tracked result write。
-            // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
-            // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
+            // 候选拒绝[SemanticBarrier:ValueFlow]：额外 result mention、缺失 producer 或
+            // 独立 state write 会让某条 exit 保留可区分的旧 epoch。
+            index += 1;
+            continue;
+        }
+        if region_has_hard_barrier(&block.stmts[index + 1..=index + 1], control_facts) {
+            // 具体外部入口/Unresolved 原因由 owner-wide region proof 标注；外跳不 blanket 拒绝。
             index += 1;
             continue;
         }
@@ -358,13 +385,7 @@ pub(super) fn collapse_written_back_if_results(
         cursor += 1;
         keep
     });
-    inline_owned_branch_conditions(
-        block,
-        &condition_scratch,
-        outer_bindings,
-        captured_bindings,
-        identity_facts,
-    );
+    inline_owned_branch_conditions(block, &condition_scratch, outer_bindings, identity_facts);
     true
 }
 
@@ -383,8 +404,9 @@ pub(super) fn try_collapse_region_result_handoff(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex<'_>,
+    result_index: &RegionResultIndex,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
 ) -> bool {
     try_collapse_seeded_if_results(
         block,
@@ -393,6 +415,7 @@ pub(super) fn try_collapse_region_result_handoff(
         promotion_facts,
         result_index,
         identity_facts,
+        control_facts,
     ) || try_collapse_inferred_if_results(
         block,
         index,
@@ -400,6 +423,7 @@ pub(super) fn try_collapse_region_result_handoff(
         promotion_facts,
         result_index,
         identity_facts,
+        control_facts,
     ) || try_collapse_loop_results(
         block,
         index,
@@ -407,6 +431,7 @@ pub(super) fn try_collapse_region_result_handoff(
         promotion_facts,
         result_index,
         identity_facts,
+        control_facts,
     )
 }
 
@@ -415,8 +440,9 @@ fn try_collapse_seeded_if_results(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex<'_>,
+    result_index: &RegionResultIndex,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
 ) -> bool {
     let mut cursor = index;
     let mut seeds = Vec::new();
@@ -436,11 +462,11 @@ fn try_collapse_seeded_if_results(
     let Some(HirStmt::If(if_stmt)) = block.stmts.get(cursor) else {
         return false;
     };
-    if region_has_hard_barrier(&block.stmts[cursor..=cursor])
+    if region_has_hard_barrier(&block.stmts[cursor..=cursor], control_facts)
         || bindings_are_mentioned_in_exprs(std::iter::once(&if_stmt.cond), &results)
     {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过某条 tracked exit assignment。
-        // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
+        // 候选拒绝[SemanticBarrier:ControlFlow]：外部入口可绕过 tracked assignment；
+        // 外跳 relation 在 rewrite map 形成后另行逐项验证。
         // 候选拒绝[SemanticBarrier:ValueFlow]：condition 读取空 result 时，改名会把 nil
         // 换成 seed 旧值并可能选择另一分支。
         // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
@@ -458,14 +484,23 @@ fn try_collapse_seeded_if_results(
         // 候选拒绝[SemanticBarrier:EvalOrder]：seeded exit 在 result 后写 seed 时，改名后的最后写不再保留原 result 出口值；反最小见 seed_write_after_result_is_rejected。
         return false;
     }
+    if !region_rewrites_preserve_external_transfers(
+        &block.stmts[cursor..=cursor],
+        &rewrites,
+        control_facts,
+        ExternalTransferScope::WholeRegion,
+    ) {
+        return false;
+    }
     if rewrites
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
         || !rewrites_preserve_home_slots(&rewrites, promotion_facts)
         || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
-        || !rewrite_is_private_and_uncaptured(cursor, &rewrites, result_index)
+        || !rewrite_is_private_after(cursor, &rewrites, result_index)
     {
-        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/异槽或资源 identity 会观察 seed/result 的独立生命周期。
+        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/reference-capture、异槽或资源
+        // identity 会观察 seed/result 的独立生命周期。
         return false;
     }
     apply_rewrites(
@@ -484,8 +519,9 @@ fn try_collapse_inferred_if_results(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex<'_>,
+    result_index: &RegionResultIndex,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
 ) -> bool {
     let mut cursor = index;
     let mut results = Vec::new();
@@ -499,11 +535,11 @@ fn try_collapse_inferred_if_results(
     let Some(HirStmt::If(if_stmt)) = block.stmts.get(cursor) else {
         return false;
     };
-    if region_has_hard_barrier(&block.stmts[cursor..=cursor])
+    if region_has_hard_barrier(&block.stmts[cursor..=cursor], control_facts)
         || bindings_are_mentioned_in_exprs(std::iter::once(&if_stmt.cond), &results)
     {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：goto/label 可绕过某条 tracked exit assignment。
-        // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
+        // 候选拒绝[SemanticBarrier:ControlFlow]：外部入口可绕过 tracked assignment；
+        // 外跳 relation 在 rewrite map 形成后另行逐项验证。
         // 候选拒绝[SemanticBarrier:ValueFlow]：condition 读取空 result 时，改名会把 nil
         // 换成 seed 旧值并可能选择另一分支。
         // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
@@ -517,13 +553,22 @@ fn try_collapse_inferred_if_results(
     else {
         return false;
     };
+    if !region_rewrites_preserve_external_transfers(
+        &block.stmts[cursor..=cursor],
+        &rewrites,
+        control_facts,
+        ExternalTransferScope::WholeRegion,
+    ) {
+        return false;
+    }
     if rewrites
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
         || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
-        || !rewrite_is_private_and_uncaptured(cursor, &rewrites, result_index)
+        || !rewrite_is_private_after(cursor, &rewrites, result_index)
     {
-        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，result 改名会影响 region 外或 closure 可见 epoch。
+        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/reference-capture/identity
+        // 不满足时，result 改名会影响 region 外或 closure 可见 epoch。
         return false;
     }
     let declarations = (index..cursor)
@@ -551,8 +596,9 @@ fn try_collapse_loop_results(
     index: usize,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
-    result_index: &RegionResultIndex<'_>,
+    result_index: &RegionResultIndex,
     identity_facts: &HandoffIdentityFacts,
+    control_facts: &RegionControlFacts,
 ) -> bool {
     let Some(stmt) = block.stmts.get(index) else {
         return false;
@@ -570,14 +616,14 @@ fn try_collapse_loop_results(
         _ => return false,
     };
     let mut exits = Vec::new();
-    // 内层 loop 的 break/continue 归内层 owner，但跳转、cleanup 或 Unresolved 可能
-    // 绕过/隐藏 result 写回；这类边界不能交给 `collect_break_assignments` 猜测。
+    // 内层 loop 的 break/continue 归内层 owner；goto/label 的入口由 owner-wide lexical
+    // CFG 验证，外跳 relation 在 rewrite map 形成后逐项检查。Unresolved 不并入普通 exit
+    // plan；cleanup 别名风险由后面的 proto 身份门按 possible-home 精确处理。
     if condition_forbidden
-        || region_has_hard_barrier(&body.stmts)
+        || region_has_hard_barrier(&body.stmts, control_facts)
         || !collect_break_assignments(body, &mut exits, requires_exact_exits)
     {
         // 候选拒绝[SemanticBarrier:ControlFlow]：未跟踪 transfer 会漏掉 loop 出口，提交不完整 result->state 映射。
-        // 候选拒绝[SemanticBarrier:Lifetime]：TBC/Close 跨 result producer 会改变 close/root epoch。
         // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
         // region-result 不把未知路径并入普通 state 映射。
         return false;
@@ -603,15 +649,25 @@ fn try_collapse_loop_results(
         results.retain(|result| exit.contains_key(result));
     }
     let mut rewrite_ends = BTreeMap::new();
-    results.retain(|result| {
-        loop_result_rewrite_end(block, index, *result).is_some_and(|rewrite_end| {
-            rewrite_ends.insert(*result, rewrite_end);
-            true
-        })
-    });
+    let mut has_path_dependent_live_out = false;
+    results.retain(
+        |result| match loop_result_rewrite_end(block, index, *result) {
+            LoopResultRewriteBoundary::Exact(rewrite_end) => {
+                rewrite_ends.insert(*result, rewrite_end);
+                true
+            }
+            LoopResultRewriteBoundary::PathDependent => {
+                has_path_dependent_live_out = true;
+                false
+            }
+            LoopResultRewriteBoundary::NoLiveOut => false,
+        },
+    );
     if results.is_empty() {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：result 在后缀无 live-out 读取，或首个写是
-        // 路径相关的结构化写；后者可能在未写分支继续观察 loop 产生的旧 result epoch。
+        if has_path_dependent_live_out {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：首个 result 覆盖是路径相关的结构化写，
+            // 未写分支仍会让后续读取观察 loop 产生的旧 result epoch。
+        }
         return false;
     }
     let rewrite_end = *rewrite_ends
@@ -637,6 +693,14 @@ fn try_collapse_loop_results(
     ) else {
         return false;
     };
+    if !region_rewrites_preserve_external_transfers(
+        &body.stmts,
+        &rewrites,
+        control_facts,
+        ExternalTransferScope::LoopExitPlan,
+    ) {
+        return false;
+    }
     // 动态 repeat 的 synthetic result 没有稳定 home slot；只有每条出口都是 state 的
     // 精确快照且不在同一赋值中改写 state，才能把这个跨槽身份安全消掉。
     if requires_exact_exits
@@ -654,9 +718,10 @@ fn try_collapse_loop_results(
         .iter()
         .any(|(result, seed)| outer_bindings.contains(result) || outer_bindings.contains(seed))
         || !rewrites_preserve_identity(&rewrites, promotion_facts, identity_facts)
-        || !rewrite_is_private_and_uncaptured(index, &rewrites, result_index)
+        || !rewrite_is_private_after(index, &rewrites, result_index)
     {
-        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/capture/identity 不满足时，loop 外或 closure 可观察独立 result/state epoch。
+        // 候选拒绝[SemanticBarrier:Lifetime]：outer/private/reference-capture/identity
+        // 不满足时，loop 外或 closure 可观察独立 result/state epoch。
         return false;
     }
     let can_rewrite_every_occurrence = rewrite_end == block.stmts.len()
@@ -685,11 +750,17 @@ fn try_collapse_loop_results(
     true
 }
 
+enum LoopResultRewriteBoundary {
+    Exact(usize),
+    PathDependent,
+    NoLiveOut,
+}
+
 fn loop_result_rewrite_end(
     block: &HirBlock,
     loop_index: usize,
     result: CarryBinding,
-) -> Option<usize> {
+) -> LoopResultRewriteBoundary {
     let mut saw_read = false;
     for (index, stmt) in block.stmts.iter().enumerate().skip(loop_index + 1) {
         let facts = binding_facts(std::slice::from_ref(stmt));
@@ -697,11 +768,31 @@ fn loop_result_rewrite_end(
         if facts.writes.contains_key(&result) {
             let direct_overwrite = matches!(stmt, HirStmt::Assign(assign)
                 if assign.targets.iter().any(|target| carry_binding_from_lvalue(target) == Some(result)));
-            return ((saw_read || reads) && direct_overwrite).then_some(index);
+            if direct_overwrite {
+                return if saw_read || reads {
+                    LoopResultRewriteBoundary::Exact(index)
+                } else {
+                    LoopResultRewriteBoundary::NoLiveOut
+                };
+            }
+            let later_read = block.stmts[index + 1..].iter().any(|stmt| {
+                binding_facts(std::slice::from_ref(stmt))
+                    .reads
+                    .contains_key(&result)
+            });
+            return if saw_read || reads || later_read {
+                LoopResultRewriteBoundary::PathDependent
+            } else {
+                LoopResultRewriteBoundary::NoLiveOut
+            };
         }
         saw_read |= reads;
     }
-    saw_read.then_some(block.stmts.len())
+    if saw_read {
+        LoopResultRewriteBoundary::Exact(block.stmts.len())
+    } else {
+        LoopResultRewriteBoundary::NoLiveOut
+    }
 }
 
 fn rewrites_preserve_identity(
@@ -717,21 +808,35 @@ fn rewrites_preserve_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirCallExpr, HirCallStmt, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
-        HirDecisionTarget, HirGlobalRef, HirRepeat, HirReturn, HirWhile, ParamId, TempId,
+        HirCallExpr, HirCallStmt, HirClose, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
+        HirDecisionTarget, HirGlobalRef, HirGoto, HirLabel, HirLabelId, HirRepeat, HirReturn,
+        HirToBeClosed, HirWhile, ParamId, TempId,
     };
+    use crate::hir::expr_safety::HirExprSafety;
     use crate::hir::promotion::HomeSlotKey;
+    use crate::transformer::InstrRef;
 
     fn empty_identity_facts() -> HandoffIdentityFacts {
         HandoffIdentityFacts {
             debug: BTreeSet::new(),
             for_bindings: BTreeSet::new(),
             physical_roots: BTreeSet::new(),
-            captured: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
         }
+    }
+
+    fn control_facts(stmts: &[HirStmt]) -> RegionControlFacts {
+        RegionControlFacts {
+            label_refs: crate::hir::simplify::label_refs::count_label_references(stmts),
+            expr_safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        }
+    }
+
+    fn empty_control_facts() -> RegionControlFacts {
+        control_facts(&[])
     }
 
     fn decision(test: HirExpr) -> HirExpr {
@@ -938,9 +1043,9 @@ mod tests {
         assert!(collapse_written_back_if_results(
             &mut block,
             &BTreeSet::new(),
-            &BTreeSet::new(),
             &mut facts,
             &identity_facts,
+            &empty_control_facts(),
         ));
 
         let [HirStmt::If(if_stmt)] = block.stmts.as_slice() else {
@@ -950,6 +1055,33 @@ mod tests {
             panic!("the fallthrough arm should retain its producer assignment");
         };
         assert!(assign.targets == vec![HirLValue::Param(ParamId(0))]);
+    }
+
+    #[test]
+    fn written_back_if_accepts_a_temp_state_owner() {
+        let mut block = single_fallthrough_result_block(HirExpr::Integer(9));
+        let HirStmt::Assign(writeback) = &mut block.stmts[2] else {
+            unreachable!()
+        };
+        writeback.targets = vec![HirLValue::Temp(TempId(1))];
+        let mut facts = same_home_facts();
+        facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(0, 0));
+
+        assert!(collapse_written_back_if_results(
+            &mut block,
+            &BTreeSet::new(),
+            &mut facts,
+            &empty_identity_facts(),
+            &empty_control_facts(),
+        ));
+
+        let [HirStmt::If(if_stmt)] = block.stmts.as_slice() else {
+            panic!("result declaration and terminal writeback should be removed");
+        };
+        let [HirStmt::Assign(assign)] = if_stmt.then_block.stmts.as_slice() else {
+            panic!("the fallthrough arm should write the existing temp state");
+        };
+        assert!(assign.targets == vec![HirLValue::Temp(TempId(1))]);
     }
 
     #[test]
@@ -964,11 +1096,128 @@ mod tests {
         assert!(collapse_written_back_if_results(
             &mut block,
             &BTreeSet::new(),
+            &mut facts,
+            &empty_identity_facts(),
+            &empty_control_facts(),
+        ));
+        assert!(matches!(block.stmts.as_slice(), [HirStmt::If(_)]));
+    }
+
+    #[test]
+    fn written_back_if_accepts_self_contained_label_flow() {
+        let mut block = single_fallthrough_result_block(HirExpr::Integer(9));
+        let label = HirLabelId(0);
+        let HirStmt::If(if_stmt) = &mut block.stmts[1] else {
+            unreachable!()
+        };
+        if_stmt
+            .then_block
+            .stmts
+            .insert(0, HirStmt::Goto(Box::new(HirGoto { target: label })));
+        if_stmt.then_block.stmts.insert(
+            1,
+            HirStmt::Label(Box::new(HirLabel {
+                id: label,
+                tbc_barriers: Default::default(),
+            })),
+        );
+        let control = control_facts(&block.stmts);
+        let mut facts = same_home_facts();
+
+        assert!(collapse_written_back_if_results(
+            &mut block,
             &BTreeSet::new(),
             &mut facts,
             &empty_identity_facts(),
+            &control,
         ));
-        assert!(matches!(block.stmts.as_slice(), [HirStmt::If(_)]));
+
+        let [HirStmt::If(if_stmt)] = block.stmts.as_slice() else {
+            panic!("only the mechanical declaration and writeback should disappear");
+        };
+        assert!(matches!(if_stmt.then_block.stmts[0], HirStmt::Goto(_)));
+        assert!(matches!(if_stmt.then_block.stmts[1], HirStmt::Label(_)));
+    }
+
+    #[test]
+    fn written_back_if_accepts_an_unproduced_goto_outside_the_region() {
+        let mut block = single_fallthrough_result_block(HirExpr::Integer(9));
+        let label = HirLabelId(0);
+        let HirStmt::If(if_stmt) = &mut block.stmts[1] else {
+            unreachable!()
+        };
+        if_stmt
+            .then_block
+            .stmts
+            .insert(0, HirStmt::Goto(Box::new(HirGoto { target: label })));
+        block.stmts.push(HirStmt::Label(Box::new(HirLabel {
+            id: label,
+            tbc_barriers: Default::default(),
+        })));
+        let control = control_facts(&block.stmts);
+        let mut facts = same_home_facts();
+
+        assert!(collapse_written_back_if_results(
+            &mut block,
+            &BTreeSet::new(),
+            &mut facts,
+            &empty_identity_facts(),
+            &control,
+        ));
+        assert!(matches!(block.stmts.last(), Some(HirStmt::Label(_))));
+    }
+
+    #[test]
+    fn written_back_if_keeps_disjoint_cleanup_inside_region() {
+        let mut block = single_fallthrough_result_block(HirExpr::Integer(9));
+        block.stmts.insert(
+            0,
+            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![LocalId(2)],
+                values: HirValuePack::fixed(vec![HirExpr::Nil]),
+            })),
+        );
+        let HirStmt::If(if_stmt) = &mut block.stmts[2] else {
+            unreachable!()
+        };
+        if_stmt.then_block.stmts.insert(
+            0,
+            HirStmt::ToBeClosed(Box::new(HirToBeClosed {
+                origin: InstrRef(0),
+                reg_index: 9,
+                value: HirExpr::LocalRef(LocalId(2)),
+            })),
+        );
+        if_stmt
+            .then_block
+            .stmts
+            .insert(1, HirStmt::Close(Box::new(HirClose { from_reg: 9 })));
+        let mut facts = same_home_facts();
+        facts.record_local_home_slot(LocalId(2), HomeSlotKey::new(9, 0));
+        let mut identity = empty_identity_facts();
+        identity
+            .to_be_closed
+            .insert(CarryBinding::Local(LocalId(2)));
+
+        assert!(collapse_written_back_if_results(
+            &mut block,
+            &BTreeSet::new(),
+            &mut facts,
+            &identity,
+            &empty_control_facts(),
+        ));
+
+        let [HirStmt::LocalDecl(_), HirStmt::If(if_stmt)] = block.stmts.as_slice() else {
+            panic!("only the mechanical result declaration and writeback should disappear");
+        };
+        assert!(matches!(
+            if_stmt.then_block.stmts.as_slice(),
+            [
+                HirStmt::ToBeClosed(_),
+                HirStmt::Close(_),
+                HirStmt::Assign(_)
+            ]
+        ));
     }
 
     #[test]
@@ -984,9 +1233,9 @@ mod tests {
         assert!(!collapse_written_back_if_results(
             &mut block,
             &BTreeSet::new(),
-            &BTreeSet::new(),
             &mut facts,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
         assert!(block == original);
     }
@@ -1001,9 +1250,9 @@ mod tests {
         assert!(!collapse_written_back_if_results(
             &mut block,
             &BTreeSet::new(),
-            &BTreeSet::new(),
             &mut facts,
             &identity_facts,
+            &empty_control_facts(),
         ));
         assert!(block == original);
     }
@@ -1011,8 +1260,7 @@ mod tests {
     #[test]
     fn seeded_if_accepts_complete_paths_without_exact_seed_copy() {
         let mut block = seeded_if_without_copy_block();
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = seeded_if_facts(HomeSlotKey::new(0, 0));
 
         assert!(try_collapse_seeded_if_results(
@@ -1022,6 +1270,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
 
         assert!(!binding_is_mentioned_in_stmts(
@@ -1034,8 +1283,7 @@ mod tests {
     fn seeded_if_without_copy_rejects_distinct_home_slots() {
         let mut block = seeded_if_without_copy_block();
         let original = block.clone();
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = seeded_if_facts(HomeSlotKey::new(1, 0));
 
         assert!(!try_collapse_seeded_if_results(
@@ -1045,6 +1293,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
         assert!(block == original);
     }
@@ -1077,10 +1326,58 @@ mod tests {
     }
 
     #[test]
+    fn inferred_chain_keeps_each_unmerged_result_declaration() {
+        let mut block = inferred_if_with_distinct_shared_seed_values();
+        block.stmts.insert(
+            0,
+            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![LocalId(2)],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(0)]),
+            })),
+        );
+        let HirStmt::If(if_stmt) = &mut block.stmts[3] else {
+            unreachable!()
+        };
+        let HirStmt::Assign(assign) = &mut if_stmt.then_block.stmts[0] else {
+            unreachable!()
+        };
+        assign.values = HirValuePack::fixed(vec![
+            HirExpr::LocalRef(LocalId(2)),
+            HirExpr::LocalRef(LocalId(2)),
+        ]);
+        let mut facts = ProtoPromotionFacts::default();
+        for local in [LocalId(0), LocalId(1), LocalId(2)] {
+            facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
+        }
+
+        assert!(collapse_inferred_if_result_chains(
+            &mut block,
+            &BTreeSet::new(),
+            &mut facts,
+            &empty_identity_facts(),
+            &empty_control_facts(),
+        ));
+
+        assert!(!binding_is_mentioned_in_stmts(
+            &block.stmts,
+            CarryBinding::Local(LocalId(0)),
+        ));
+        assert!(
+            block
+                .stmts
+                .iter()
+                .any(|stmt| { empty_local(stmt).is_some_and(|local| local == LocalId(1)) })
+        );
+        assert!(binding_is_mentioned_in_stmts(
+            &block.stmts,
+            CarryBinding::Local(LocalId(1)),
+        ));
+    }
+
+    #[test]
     fn loop_result_accepts_redundant_standalone_seed_copy() {
         let mut block = loop_result_block(HirExpr::ParamRef(ParamId(0)));
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = loop_result_facts();
 
         assert!(try_collapse_loop_results(
@@ -1090,6 +1387,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
 
         let [HirStmt::While(while_stmt), HirStmt::Return(return_stmt)] = block.stmts.as_slice()
@@ -1106,8 +1404,7 @@ mod tests {
     #[test]
     fn loop_result_preserves_non_exit_write_as_an_unobserved_old_epoch() {
         let mut block = loop_result_block(HirExpr::Integer(7));
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = loop_result_facts();
 
         assert!(try_collapse_loop_results(
@@ -1117,6 +1414,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
         let [HirStmt::While(while_stmt), HirStmt::Return(return_stmt)] = block.stmts.as_slice()
         else {
@@ -1131,8 +1429,7 @@ mod tests {
     #[test]
     fn loop_result_preserves_root_copy_across_seed_overwrite() {
         let mut block = dynamic_loop_result_with_seed_overwrite();
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
 
         assert!(try_collapse_loop_results(
             &mut block,
@@ -1141,6 +1438,7 @@ mod tests {
             &mut ProtoPromotionFacts::default(),
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
         let [HirStmt::Repeat(repeat_stmt), HirStmt::Return(return_stmt)] = block.stmts.as_slice()
         else {
@@ -1171,8 +1469,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(99)]),
             })),
         );
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = loop_result_facts();
 
         assert!(try_collapse_loop_results(
@@ -1182,6 +1479,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
 
         let HirStmt::Assign(prefix) = &block.stmts[0] else {
@@ -1207,8 +1505,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
             })),
         );
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = loop_result_facts();
 
         assert!(try_collapse_loop_results(
@@ -1218,6 +1515,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
 
         let HirStmt::Assign(read) = &block.stmts[1] else {
@@ -1241,8 +1539,7 @@ mod tests {
             targets: vec![HirLValue::Param(ParamId(1)), HirLValue::Temp(TempId(0))],
             values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0)), HirExpr::Integer(7)]),
         }));
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = loop_result_facts();
 
         assert!(try_collapse_loop_results(
@@ -1252,6 +1549,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
         let HirStmt::Assign(boundary) = &block.stmts[1] else {
             panic!("parallel boundary remains an assignment");
@@ -1284,8 +1582,7 @@ mod tests {
             })),
         );
         let original = block.clone();
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&block.stmts, &captured);
+        let index = RegionResultIndex::new(&block.stmts);
         let mut facts = loop_result_facts();
 
         assert!(!try_collapse_loop_results(
@@ -1295,6 +1592,7 @@ mod tests {
             &mut facts,
             &index,
             &empty_identity_facts(),
+            &empty_control_facts(),
         ));
         assert!(block == original);
     }

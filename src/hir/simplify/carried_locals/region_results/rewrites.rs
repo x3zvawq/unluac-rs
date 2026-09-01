@@ -42,10 +42,10 @@ pub(super) fn collect_break_assignments(
                     return false;
                 }
             }
-            HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_)
-                if reject_untracked_transfers =>
-            {
-                // 候选拒绝[SemanticBarrier:ControlFlow]：continue/goto/label 可绕过已收集的 break writeback，出口集合不完整会提交错误 state。
+            HirStmt::Continue if reject_untracked_transfers => {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：continue 可绕过已收集的 break
+                // writeback 并从 repeat condition 退出；self-contained goto/label 已由
+                // owner-wide lexical CFG 建边，不再作为整个 body 的 blanket guard。
                 return false;
             }
             HirStmt::While(_)
@@ -171,27 +171,46 @@ pub(super) fn infer_rewrites(
     results: &[CarryBinding],
     exits: &[ExitValues],
     region_index: usize,
-    result_index: &RegionResultIndex<'_>,
+    result_index: &RegionResultIndex,
     promotion_facts: &ProtoPromotionFacts,
     require_home_slot: bool,
 ) -> Option<BTreeMap<CarryBinding, CarryBinding>> {
     let mut rewrites = BTreeMap::new();
     for result in results {
-        let candidates = exits
+        let exact_bindings = exits
             .iter()
             .filter_map(|exit| exit.get(result))
             .filter_map(ExitValue::exact_binding)
+            .collect::<BTreeSet<_>>();
+        if exact_bindings.is_empty() {
+            continue;
+        }
+        let candidates = exact_bindings
+            .iter()
+            .copied()
             .filter(|binding| result_index.is_available_before(*binding, region_index))
             .collect::<BTreeSet<_>>();
+        if candidates.is_empty() {
+            // 候选拒绝[SemanticBarrier:Scope]：出口 owner 在 region 前不可用时，直接把
+            // result producer 改写为该 owner 会制造声明前写入。
+            return None;
+        }
         let Some(seed) = candidates.iter().copied().find(|seed| {
             *seed != *result
                 && !results.contains(seed)
                 && result_index.is_private_after(*seed, region_index)
                 && (!require_home_slot || bindings_share_home_slot(*result, *seed, promotion_facts))
         }) else {
-            // 候选拒绝[SemanticBarrier:Lifetime]：多出口 join owner 若在 region 后仍可观察或与 result 异槽，分支写入会改变其独立 epoch/root。
-            // 候选拒绝[SemanticBarrier:EvalOrder]：result-to-result 出口 RHS 读的是并行写前的旧 result epoch；
-            // 将 rewrite map 做闭包会把它换成下游 seed。if/loop collector 通常会在更早的 result-read guard 拒绝该形状。
+            if candidates
+                .iter()
+                .all(|seed| *seed == *result || results.contains(seed))
+            {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：result-to-result 出口 RHS 读的是并行
+                // 写前的旧 result epoch；将 rewrite map 做闭包会把它换成下游 seed。
+            } else {
+                // 候选拒绝[SemanticBarrier:Lifetime]：多出口 join owner 若在 region 后仍可
+                // 观察或与 result 异槽，分支写入会改变其独立 epoch/root。
+            }
             return None;
         };
         // 每个出口的 result producer 都在原路径原地改写；因此私有 seed 可直接作为 join slot，
@@ -207,7 +226,7 @@ pub(super) fn infer_rewrites(
         rewrites.insert(*result, seed);
     }
     retain_compatible_shared_seed_rewrites(&mut rewrites, exits);
-    Some(rewrites)
+    (!rewrites.is_empty()).then_some(rewrites)
 }
 
 fn retain_compatible_shared_seed_rewrites(
@@ -329,10 +348,10 @@ pub(super) fn bindings_share_home_slot(
             .is_some_and(|(result, seed)| result == seed)
 }
 
-pub(super) fn rewrite_is_private_and_uncaptured(
+pub(super) fn rewrite_is_private_after(
     region_index: usize,
     rewrites: &BTreeMap<CarryBinding, CarryBinding>,
-    result_index: &RegionResultIndex<'_>,
+    result_index: &RegionResultIndex,
 ) -> bool {
     rewrites
         .values()
@@ -654,8 +673,7 @@ mod tests {
         };
         let overwritten = assignment_values(&overwritten);
         let preserved = assignment_values(&preserved);
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&[], &captured);
+        let index = RegionResultIndex::new(&[]);
 
         assert!(
             infer_rewrites(
@@ -708,8 +726,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
             })),
         ];
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&stmts, &captured);
+        let index = RegionResultIndex::new(&stmts);
         let mut facts = ProtoPromotionFacts::default();
         for local in [LocalId(0), LocalId(1), LocalId(2)] {
             facts.record_local_home_slot(local, HomeSlotKey::new(0, 0));
@@ -750,8 +767,7 @@ mod tests {
                 ]),
             })),
         ];
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&stmts, &captured);
+        let index = RegionResultIndex::new(&stmts);
 
         assert!(
             infer_rewrites(
@@ -782,8 +798,7 @@ mod tests {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(7)]),
         });
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&[], &captured);
+        let index = RegionResultIndex::new(&[]);
 
         let rewrites = infer_rewrites(
             &[first, second],
@@ -813,8 +828,7 @@ mod tests {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
         });
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&[], &captured);
+        let index = RegionResultIndex::new(&[]);
 
         let rewrites = infer_rewrites(
             &[first, second],
@@ -840,8 +854,7 @@ mod tests {
                 HirExpr::ParamRef(ParamId(0)),
             ]),
         });
-        let captured = BTreeSet::new();
-        let index = RegionResultIndex::new(&[], &captured);
+        let index = RegionResultIndex::new(&[]);
 
         assert!(
             infer_rewrites(
