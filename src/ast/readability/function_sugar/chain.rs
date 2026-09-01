@@ -9,7 +9,8 @@
 use super::super::binding_flow::BindingUseIndex;
 use super::super::binding_ref::name_matches_binding;
 use crate::ast::common::{
-    AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstStmt,
+    AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalBinding, AstLocalOrigin,
+    AstMethodCallExpr, AstStmt,
 };
 
 pub(super) fn try_chain_local_method_call_stmt(
@@ -21,24 +22,42 @@ pub(super) fn try_chain_local_method_call_stmt(
         // 候选忽略[NotApplicable]：method chain 至少需要结果声明和紧邻的后续调用两句。
         return None;
     };
-    let (chained_binding, first_call) = single_method_call_local(first)?;
-    if use_index.count_uses_in_suffix(stmt_base + 2, chained_binding) != 0 {
-        // 候选拒绝[SemanticBarrier:Lifetime]：`local x=a:b(); x:c(); use(x)` 不能压成链后删除仍存活的 `x`。
+    let (binding, first_call) = single_method_call_local(first)?;
+    let chained =
+        chain_local_method_call_stmt(first_call, binding.id, second, use_index, stmt_base + 1)?;
+
+    // 到这里第二句已经精确形成“同一 binding 作为唯一 receiver”的 chain 候选；
+    // 声明属性、provenance 和后续生命周期才是候选拒绝条件，不能标记普通相邻语句。
+    match binding.attr {
+        AstLocalAttr::None => {}
+        AstLocalAttr::Close => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：链化会删除 `<close>` 的离域关闭动作，反例见 regress_415。
+            return None;
+        }
+        AstLocalAttr::Const => {
+            // 候选拒绝[PolicyBoundary]：项目选择在函数糖中保留显式 `<const>` 声明身份。
+            return None;
+        }
+    }
+    match binding.origin {
+        AstLocalOrigin::Recovered => {}
+        AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
+            // 候选拒绝[SemanticBarrier:DebugScope]：删除 debug local 会改变 debug.getlocal 可见的名字与区间，反例见 regress_333。
+            return None;
+        }
+        AstLocalOrigin::PhysicalRoot => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：提前释放 call-result 强根会让后续 callback 观察到对象已回收，反例见 regress_412。
+            return None;
+        }
+    }
+    if use_index.count_uses_in_suffix(stmt_base + 2, binding.id) != 0 {
+        // 候选拒绝[SemanticBarrier:Lifetime]：链化会删除第二次调用后仍活跃的 receiver，反例见 regress_38。
         return None;
     }
-    Some((
-        chain_local_method_call_stmt(
-            first_call,
-            chained_binding,
-            second,
-            use_index,
-            stmt_base + 1,
-        )?,
-        2,
-    ))
+    Some((chained, 2))
 }
 
-fn single_method_call_local(stmt: &AstStmt) -> Option<(AstBindingRef, &AstMethodCallExpr)> {
+fn single_method_call_local(stmt: &AstStmt) -> Option<(&AstLocalBinding, &AstMethodCallExpr)> {
     let AstStmt::LocalDecl(local_decl) = stmt else {
         // 候选忽略[NotApplicable]：首句不是 local call-result 声明。
         return None;
@@ -49,29 +68,7 @@ fn single_method_call_local(stmt: &AstStmt) -> Option<(AstBindingRef, &AstMethod
         // 候选忽略[NotApplicable]：这里只拥有单 binding、单 method-call initializer。
         return None;
     };
-    match binding.attr {
-        AstLocalAttr::None => {}
-        AstLocalAttr::Close => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：链化会删除 `<close>` binding 及其离域关闭动作。
-            return None;
-        }
-        AstLocalAttr::Const => {
-            // 候选拒绝[PolicyBoundary]：`<const>` 声明身份继续由声明 owner 保留。
-            return None;
-        }
-    }
-    match binding.origin {
-        AstLocalOrigin::Recovered => {}
-        AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
-            // 候选拒绝[SemanticBarrier:DebugScope]：删除 debug local 会改变 debug.getlocal 可观察的名字与作用域。
-            return None;
-        }
-        AstLocalOrigin::PhysicalRoot => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须继续保活 call result 到原词法域末端。
-            return None;
-        }
-    }
-    Some((binding.id, call))
+    Some((binding, call))
 }
 
 fn chain_local_method_call_stmt(

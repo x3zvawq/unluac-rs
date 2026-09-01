@@ -85,6 +85,11 @@ fn cleanup_block(
     // `local x = f(); x = value` pair without moving a call across another statement.
     changed |= split_overwritten_call_result_locals(block);
 
+    // A capture owner may force the producer and its final temp assignment into a lexical
+    // block while the one-value return remains immediately outside it.  Return the value from
+    // that block directly so the synthetic carrier does not survive into final source.
+    changed |= inline_terminal_scoped_temp_return(block);
+
     // 尾部 do-end 展开：当 do-end 是块的最后一条语句时，其内部 local 的作用域
     // 在父块结束处同样终止，do-end 仅是多余的缩进壳。
     // 典型来源：guard-flip 把 `if cond then BODY else return end` 拉平成
@@ -114,8 +119,10 @@ fn cleanup_block(
             // 候选拒绝[SemanticBarrier:Lifetime]：有 initializer 的 `<close>` 即使无普通 use
             // 也必须在域末执行 `__close`（regress246）。`<const>` 没有退出动作，在其 binding
             // 无引用且 initializer 可安全丢弃/保留为 call 时允许清理。
-            // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 身份和可观察词法槽保留；候选拒绝[SemanticBarrier:Lifetime]：
-            // PhysicalRoot 可能由弱表/`__gc` 观察，不能按普通未使用 local 删除。
+            // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 声明的可见期可被 line hook /
+            // debug.getlocal 观察；删除会抹掉源码 binding 身份（regress_341、regress_420）。
+            // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 可能由弱表/`__gc` 观察，
+            // 不能按普通未使用 local 删除。
             // 候选拒绝[SemanticBarrier:Scope]：声明外仍有读取、capture 或写入时，删除 local
             // 会改变读取值、捕获 cell，或让后续 name target 解析成外层/global。
             AstStmt::LocalDecl(mut local_decl)
@@ -179,8 +186,15 @@ fn cleanup_block(
         }
         let original_len = local_decl.bindings.len();
         local_decl.bindings.retain(|binding| {
+            if binding.origin.is_physical_root() {
+                // 候选拒绝[SemanticBarrier:Lifetime]：空 PhysicalRoot declaration 会在 hoist
+                // 点用 nil 清空复用的 VM home；删除后旧对象会跨过后续 GC 继续存活
+                // （regress_435）。
+                return true;
+            }
             if binding.origin.is_debug_hinted() {
-                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 空声明仍是可观察的源码词法槽。
+                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 空声明的可见期可被
+                // line hook / debug.getlocal 观察（regress_341、regress_420）。
                 return true;
             }
 
@@ -189,9 +203,9 @@ fn cleanup_block(
                 // 候选拒绝[SemanticBarrier:Scope]：仍有读取、capture 或写入的 recovered
                 // binding 必须保留，否则引用会失去原词法槽或写到外层名字。
             } else {
-                // 候选接受：空 declaration 只把 binding 初始化为 nil；即使带 `<close>` 或
-                // PhysicalRoot provenance，也没有对象 root/关闭动作。binding-flow 又证明它
-                // 没有域内外引用，因此删除不改变求值、生命周期或名字解析。
+                // 候选接受：普通空 declaration 只把新 binding 初始化为 nil；即使带
+                // `<close>` 也没有对象 root/关闭动作。binding-flow 又证明它没有域内外
+                // 引用，因此删除不改变求值、生命周期或名字解析。
             }
             is_live
         });
@@ -222,6 +236,95 @@ fn cleanup_block(
     }
 
     changed
+}
+
+fn inline_terminal_scoped_temp_return(block: &mut AstBlock) -> bool {
+    let Some(prefix_len) = block.stmts.len().checked_sub(3) else {
+        return false;
+    };
+    let [
+        AstStmt::LocalDecl(decl),
+        AstStmt::DoBlock(scoped),
+        AstStmt::Return(ret),
+    ] = &block.stmts[prefix_len..]
+    else {
+        return false;
+    };
+    let ([binding], [], [AstExpr::Var(returned)]) = (
+        decl.bindings.as_slice(),
+        decl.values.as_slice(),
+        ret.values.as_slice(),
+    ) else {
+        return false;
+    };
+    if !binding.id.matches_name_ref(returned) {
+        return false;
+    }
+    if binding.attr != AstLocalAttr::None || binding.origin != AstLocalOrigin::Recovered {
+        // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted carrier 的函数级可见期可由
+        // debug.getlocal 观察；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot carrier
+        // 在外层 return 前仍承担精确对象 root，不能按普通 synthetic temp 消除。
+        return false;
+    }
+    let Some(AstStmt::Assign(assign)) = scoped.stmts.last() else {
+        return false;
+    };
+    let ([AstLValue::Name(target)], [value]) =
+        (assign.targets.as_slice(), assign.values.as_slice())
+    else {
+        return false;
+    };
+    if !binding.id.matches_name_ref(target) {
+        return false;
+    }
+
+    let candidate = binding.id;
+    if block.stmts[..prefix_len]
+        .iter()
+        .any(|stmt| binding_mentions_in_stmt(stmt).contains(&candidate))
+        || scoped.stmts[..scoped.stmts.len() - 1]
+            .iter()
+            .any(|stmt| binding_mentions_in_stmt(stmt).contains(&candidate))
+        || binding_mentions_in_expr(value).contains(&candidate)
+    {
+        // 候选拒绝[SemanticBarrier:Scope]：carrier 在 producer 之外仍被读取、写入或捕获
+        // 时，删除外层声明会留下未绑定引用，或把返回值固定到错误的 value epoch。
+        return false;
+    }
+    if scoped.stmts.iter().any(|stmt| {
+        stmt_declares_debug_binding(stmt)
+            || matches!(stmt, AstStmt::LocalDecl(local_decl)
+                if local_decl.bindings.iter().any(|binding| binding.attr == AstLocalAttr::Close))
+    }) {
+        // 候选拒绝[SemanticBarrier:DebugScope]：把 return 移进 scope 会让 Return hook 多看到
+        // 直属 debug local；候选拒绝[SemanticBarrier:ValueFlow]：`<close>` 可在离域时改写
+        // 外层 carrier，原程序随后读取新值，而内移 return 会先冻结 producer 值。
+        return false;
+    }
+
+    let mut scoped = scoped.as_ref().clone();
+    let Some(AstStmt::Assign(assign)) = scoped.stmts.pop() else {
+        unreachable!("validated scoped return producer must remain an assignment")
+    };
+    let [value] = assign.values.as_slice() else {
+        unreachable!("validated scoped return producer must remain single-valued")
+    };
+    let value = match value {
+        // The assignment projected one result before the outer return read the carrier.  Keep
+        // that width when the producer itself can reopen a value pack in return position.
+        AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg => {
+            AstExpr::SingleValue(Box::new(value.clone()))
+        }
+        _ => value.clone(),
+    };
+    scoped
+        .stmts
+        .push(AstStmt::Return(Box::new(super::super::common::AstReturn {
+            values: vec![value],
+        })));
+    block.stmts.truncate(prefix_len);
+    block.stmts.push(AstStmt::DoBlock(Box::new(scoped)));
+    true
 }
 
 fn trim_unused_initialized_local_suffix(
@@ -349,8 +452,8 @@ fn split_overwritten_call_result(
         .iter()
         .any(|binding| binding.attr != AstLocalAttr::None)
     {
-        // 候选拒绝[TargetConstraint]：`<const>` 与 `<close>` 都不允许合法 Lua 源码中的后继
-        // overwrite；这种 AST pair 不是可改写候选，不能借 cleanup 消除非法 target。
+        // 候选忽略[NotApplicable]：`<const>` 与 `<close>` 都不允许合法 Lua 源码中的后继
+        // overwrite；这种非法 AST pair 不属于 call-result split 候选。
         return None;
     }
     if local_decl
@@ -358,7 +461,9 @@ fn split_overwritten_call_result(
         .iter()
         .any(|binding| binding.origin.is_debug_hinted())
     {
-        // 候选拒绝[SemanticBarrier:DebugScope]：任一 DebugHinted initializer 都保留整组源码词法槽。
+        // 候选拒绝[SemanticBarrier:DebugScope]：split 会移动整组 DebugHinted 声明起点；
+        // overwrite RHS 内的 line/call hook 可观察旧 local 是否已进入 debug.getlocal 范围
+        // （regress_341）。
         return None;
     }
     if local_decl
@@ -836,6 +941,74 @@ mod tests {
             values: vec![call_value()],
         }));
         assert!(split_overwritten_call_result(&physical_decl, &eventful_overwrite).is_none());
+    }
+
+    #[test]
+    fn returns_terminal_scoped_producer_without_a_hoisted_carrier() {
+        let binding = recovered_binding();
+        let mut block = AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![binding.clone()],
+                    values: vec![],
+                })),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![AstStmt::Assign(Box::new(AstAssign {
+                        targets: vec![AstLValue::Name(binding.id.to_name_ref())],
+                        values: vec![function_value()],
+                    }))],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Var(binding.id.to_name_ref())],
+                })),
+            ],
+        };
+
+        assert!(inline_terminal_scoped_temp_return(&mut block));
+        let [AstStmt::DoBlock(scoped)] = block.stmts.as_slice() else {
+            panic!("the exact producer scope should own the terminal return")
+        };
+        assert!(matches!(
+            scoped.stmts.as_slice(),
+            [AstStmt::Return(ret)] if matches!(ret.values.as_slice(), [AstExpr::FunctionExpr(_)])
+        ));
+    }
+
+    #[test]
+    fn keeps_scoped_carrier_when_close_can_rewrite_it_before_return() {
+        let binding = recovered_binding();
+        let close_binding = AstLocalBinding {
+            id: AstBindingRef::Local(LocalId(1)),
+            attr: AstLocalAttr::Close,
+            origin: AstLocalOrigin::Recovered,
+        };
+        let mut block = AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![binding.clone()],
+                    values: vec![],
+                })),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![
+                        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                            bindings: vec![close_binding],
+                            values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                                text: "resource".to_owned(),
+                            }))],
+                        })),
+                        AstStmt::Assign(Box::new(AstAssign {
+                            targets: vec![AstLValue::Name(binding.id.to_name_ref())],
+                            values: vec![AstExpr::Integer(1)],
+                        })),
+                    ],
+                })),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![AstExpr::Var(binding.id.to_name_ref())],
+                })),
+            ],
+        };
+
+        assert!(!inline_terminal_scoped_temp_return(&mut block));
     }
 
     #[test]

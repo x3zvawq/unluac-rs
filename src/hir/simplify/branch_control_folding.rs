@@ -25,9 +25,11 @@ use crate::hir::promotion::ProtoPromotionFacts;
 use super::carried_locals::{CarryBinding, single_binding_copy};
 use super::expr_facts::expr_truthiness;
 use super::label_refs::count_label_references;
+use super::lexical_cfg::{LexicalCfg, LexicalCfgFailure};
 use super::logical_simplify::{
     normalize_condition_context, simplify_condition_truthiness_shape_with_safety,
 };
+use super::mention::{stmts_mention_local, stmts_protected_locals};
 use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -40,11 +42,13 @@ pub(super) fn fold_branch_control_in_proto(
     loop {
         let primitive_locals = ImmutablePrimitiveLocals::new(proto);
         let discard_facts = DiscardBoundaryFacts::new(proto);
+        let forward_move_facts = ForwardBranchMoveFacts::new(proto);
         let path_changed =
             path_conditions::specialize_stable_path_conditions(proto, &discard_facts, safety);
         let first_new_local = proto.locals.len();
         let mut pass = BranchControlPass {
             discard_facts: &discard_facts,
+            forward_move_facts: &forward_move_facts,
             primitive_locals: &primitive_locals,
             next_local_index: first_new_local,
             safety,
@@ -68,6 +72,7 @@ pub(super) fn fold_branch_control_in_proto(
 
 struct BranchControlPass<'a> {
     discard_facts: &'a DiscardBoundaryFacts,
+    forward_move_facts: &'a ForwardBranchMoveFacts,
     primitive_locals: &'a ImmutablePrimitiveLocals,
     next_local_index: usize,
     safety: HirExprSafety,
@@ -85,8 +90,22 @@ impl HirRewritePass for BranchControlPass<'_> {
         let adjacent_goto_changed = fold_adjacent_conditional_gotos(&mut block.stmts);
         let empty_changed =
             remove_discard_safe_empty_ifs(&mut block.stmts, self.safety, self.primitive_locals);
-        let terminal_changed = fold_forward_gotos(&mut block.stmts, FoldKind::TerminalElse);
-        let guard_changed = fold_forward_gotos(&mut block.stmts, FoldKind::Guard);
+        let terminal_changed = fold_forward_gotos(
+            &mut block.stmts,
+            FoldKind::TerminalElse,
+            self.forward_move_facts,
+            &self.discard_facts.label_refs,
+            self.safety,
+            self.primitive_locals,
+        );
+        let guard_changed = fold_forward_gotos(
+            &mut block.stmts,
+            FoldKind::Guard,
+            self.forward_move_facts,
+            &self.discard_facts.label_refs,
+            self.safety,
+            self.primitive_locals,
+        );
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         constant_changed
             || common_tail_changed
@@ -659,12 +678,6 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt, safety: HirExprSafet
     } else {
         (false, &outer.cond)
     };
-    if matches!(moved_cond, HirExpr::LogicalOr(_))
-        || matches!(repeat_stmt.cond, HirExpr::LogicalOr(_))
-    {
-        // 候选拒绝[PolicyBoundary]：条件语境下 `A or (B or C)` 的短路可精确保持；这里只选择每轮最多吸收一个尾部 break stage，避免把独立退出阶段过度压平。
-        return false;
-    }
     if !repeat_condition_fold_is_safe(prefix, [moved_cond, &repeat_stmt.cond]) {
         return false;
     }
@@ -919,9 +932,61 @@ struct FoldCandidate {
     invert_cond: bool,
 }
 
-fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
+#[derive(Default)]
+struct ForwardBranchMoveFacts {
+    debug_locals: BTreeSet<LocalId>,
+    physical_root_locals: BTreeSet<LocalId>,
+    resource_locals: BTreeSet<LocalId>,
+}
+
+impl ForwardBranchMoveFacts {
+    fn new(proto: &HirProto) -> Self {
+        let mut debug_locals = BTreeSet::new();
+        debug_locals.extend(
+            proto
+                .locals
+                .iter()
+                .copied()
+                .zip(&proto.local_debug_hints)
+                .filter_map(|(local, hint)| hint.is_some().then_some(local)),
+        );
+        debug_locals.extend(
+            proto
+                .locals
+                .iter()
+                .copied()
+                .zip(&proto.local_debug_scopes)
+                .filter_map(|(local, scope)| scope.is_some().then_some(local)),
+        );
+        Self {
+            debug_locals,
+            physical_root_locals: proto.physical_root_locals.clone(),
+            resource_locals: stmts_protected_locals(&proto.body.stmts),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchMoveFailure {
+    AmbiguousControl,
+    ExternalControlEntry,
+    DebugScope,
+    PhysicalRoot,
+    ResourceScope,
+    LiveAfterJoin,
+    CollectableRoot,
+    UnsupportedRootFlow,
+}
+
+fn fold_forward_gotos(
+    stmts: &mut Vec<HirStmt>,
+    kind: FoldKind,
+    move_facts: &ForwardBranchMoveFacts,
+    owner_label_refs: &BTreeMap<HirLabelId, usize>,
+    safety: HirExprSafety,
+    primitive_locals: &ImmutablePrimitiveLocals,
+) -> bool {
     let label_indices = index_top_level_labels(stmts);
-    let label_refs = count_label_references(stmts);
     let mut groups = BTreeMap::<usize, FoldGroup>::new();
 
     for (if_index, stmt) in stmts.iter().enumerate() {
@@ -945,40 +1010,82 @@ fn fold_forward_gotos(stmts: &mut Vec<HirStmt>, kind: FoldKind) -> bool {
             continue;
         }
         let body = &stmts[(if_index + 1)..label_index];
-        if !can_move_into_branch(body) {
-            // 候选拒绝[SemanticBarrier:Scope]：区间 local 若在 label 后仍被引用，移入 arm 会使 use 失去作用域；
-            // 候选拒绝[SemanticBarrier:ControlFlow]：区间 goto/label 可能改变跳转配对或跳入 local 的合法性。
+        let suffix = &stmts[(label_index + 1)..];
+        let Err(failure) = can_move_into_branch(
+            body,
+            suffix,
+            move_facts,
+            owner_label_refs,
+            safety,
+            primitive_locals,
+        ) else {
+            groups
+                .entry(label_index)
+                .or_insert_with(|| FoldGroup {
+                    label: target,
+                    label_index,
+                    candidates: Vec::new(),
+                })
+                .candidates
+                .push(FoldCandidate {
+                    if_index,
+                    invert_cond,
+                });
             continue;
+        };
+        match failure {
+            BranchMoveFailure::AmbiguousControl => {
+                // 重复 label 没有唯一 CFG owner，不属于 forward-fold 的支持输入。
+            }
+            BranchMoveFailure::ExternalControlEntry => {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：区间 label 有外部入口；将 label
+                // 嵌入 arm 会让原入口丢失目标或改为跳入条件作用域。
+            }
+            BranchMoveFailure::DebugScope => {
+                // 候选拒绝[SemanticBarrier:DebugScope]：移动带 debug identity/scope 的
+                // declaration 会改变 line hook/debug.getlocal 可观察的声明起点和终点。
+            }
+            BranchMoveFailure::PhysicalRoot | BranchMoveFailure::CollectableRoot => {
+                // 候选拒绝[SemanticBarrier:Lifetime]：原 local 在 join 后仍保持对象根；移入
+                // arm 会提前结束根生命周期，weak table/finalizer 可观察对象更早回收。
+            }
+            BranchMoveFailure::ResourceScope => {
+                // 候选拒绝[SemanticBarrier:ResourceLifetime]：for binder/<close> identity 的
+                // scope end 是刷新或关闭事件；移入 arm 会把事件提前到 join 之前。
+            }
+            BranchMoveFailure::LiveAfterJoin => {
+                // 候选拒绝[SemanticBarrier:Scope]：join 后仍引用区间 local；移入 arm 会让
+                // 该 use 脱离 declaration 的词法作用域。
+            }
+            BranchMoveFailure::UnsupportedRootFlow => {
+                // 含可能承载对象的后写需要 reaching-root 证明，不属于本 fold 的局部
+                // value-pack grammar；这里不把缺失证明伪装成对象必然存活到 join。
+            }
         }
-        if matches!(kind, FoldKind::TerminalElse)
-            && is_branch_value_assignment(stmt, body, invert_cond)
-        {
-            // 候选拒绝[LayerBoundary]：同 lvalue 的两臂赋值是 branch-values 的值选择候选，本 pass 不抢先改成控制流 else。
-            continue;
-        }
-        groups
-            .entry(label_index)
-            .or_insert_with(|| FoldGroup {
-                label: target,
-                label_index,
-                candidates: Vec::new(),
-            })
-            .candidates
-            .push(FoldCandidate {
-                if_index,
-                invert_cond,
-            });
     }
 
     if groups.is_empty() {
         return false;
     }
 
-    // 可移动区间不含顶层 label，因此不同目标的区间不会交叉。倒序改写可保持更早
-    // 区间的原始索引稳定；同一 label 的多个 guard 在一次改写中直接嵌套。
+    // 区间内的 self-contained label/goto 可以随整个区域移动；因此不同目标的候选可能
+    // 嵌套或交叉。本轮只取从右向左互不重叠的组，未选候选由 scheduler 下一轮消费。
+    let mut selected = Vec::new();
+    let mut next_start = stmts.len();
     for group in groups.into_values().rev() {
-        let keep_label =
-            label_refs.get(&group.label).copied().unwrap_or_default() > group.candidates.len();
+        let start = group.candidates[0].if_index;
+        if group.label_index >= next_start {
+            continue;
+        }
+        next_start = start;
+        selected.push(group);
+    }
+    for group in selected {
+        let keep_label = owner_label_refs
+            .get(&group.label)
+            .copied()
+            .unwrap_or_default()
+            > group.candidates.len();
         rewrite_fold_group(stmts, group, kind, keep_label);
     }
     true
@@ -1114,40 +1221,134 @@ fn fold_target(stmt: &HirStmt, kind: FoldKind) -> Option<(HirLabelId, bool)> {
     }
 }
 
-fn can_move_into_branch(stmts: &[HirStmt]) -> bool {
-    // `if cond then prefix; goto A end; goto B; ::A::` 是 island 常见的双向出口。
-    // Guard/TerminalElse 都可把唯一的备用 goto 收进反向 arm；没有 binding 被搬动，
-    // 最终 AST scope verifier 仍确认目标 label 对嵌套 arm 可见且没有跳进 local/TBC。
-    if matches!(stmts, [HirStmt::Goto(_)]) {
-        return true;
+fn can_move_into_branch(
+    stmts: &[HirStmt],
+    suffix: &[HirStmt],
+    facts: &ForwardBranchMoveFacts,
+    owner_label_refs: &BTreeMap<HirLabelId, usize>,
+    safety: HirExprSafety,
+    primitive_locals: &ImmutablePrimitiveLocals,
+) -> Result<(), BranchMoveFailure> {
+    match LexicalCfg::analyze(stmts, owner_label_refs, safety) {
+        Ok(_) => {}
+        Err(LexicalCfgFailure::AmbiguousLabel) => {
+            return Err(BranchMoveFailure::AmbiguousControl);
+        }
+        Err(LexicalCfgFailure::ExternalEntry) => {
+            return Err(BranchMoveFailure::ExternalControlEntry);
+        }
     }
-    stmts.iter().all(|stmt| {
-        !matches!(
-            stmt,
-            HirStmt::LocalDecl(_) | HirStmt::Goto(_) | HirStmt::Label(_)
-        )
-    })
+
+    for (decl_index, stmt) in stmts.iter().enumerate() {
+        let HirStmt::LocalDecl(decl) = stmt else {
+            continue;
+        };
+        for (binding_index, &local) in decl.bindings.iter().enumerate() {
+            if facts.debug_locals.contains(&local) {
+                return Err(BranchMoveFailure::DebugScope);
+            }
+            if facts.physical_root_locals.contains(&local) {
+                return Err(BranchMoveFailure::PhysicalRoot);
+            }
+            if facts.resource_locals.contains(&local) {
+                return Err(BranchMoveFailure::ResourceScope);
+            }
+            if stmts_mention_local(suffix, local) {
+                return Err(BranchMoveFailure::LiveAfterJoin);
+            }
+            let initial_is_gc_inert =
+                pack_slot_is_gc_inert(&decl.values, binding_index, safety, primitive_locals);
+            let later_writes =
+                summarize_later_writes(&stmts[(decl_index + 1)..], local, safety, primitive_locals);
+            if !initial_is_gc_inert && !later_writes.any {
+                return Err(BranchMoveFailure::CollectableRoot);
+            }
+            if (!initial_is_gc_inert && later_writes.any) || !later_writes.all_gc_inert {
+                return Err(BranchMoveFailure::UnsupportedRootFlow);
+            }
+        }
+    }
+    Ok(())
 }
 
-fn is_branch_value_assignment(if_stmt: &HirStmt, else_body: &[HirStmt], invert_cond: bool) -> bool {
-    let HirStmt::If(if_stmt) = if_stmt else {
-        return false;
+fn pack_slot_is_gc_inert(
+    pack: &HirValuePack,
+    index: usize,
+    safety: HirExprSafety,
+    primitive_locals: &ImmutablePrimitiveLocals,
+) -> bool {
+    pack.fixed.get(index).map_or_else(
+        || pack.tail.is_none(),
+        |expr| {
+            safety.result_is_gc_inert(expr)
+                || matches!(expr, HirExpr::LocalRef(local) if primitive_locals.contains(*local))
+        },
+    )
+}
+
+fn summarize_later_writes(
+    stmts: &[HirStmt],
+    local: LocalId,
+    safety: HirExprSafety,
+    primitive_locals: &ImmutablePrimitiveLocals,
+) -> LocalRootWriteSummary {
+    let mut visitor = LocalRootWriteVisitor {
+        local,
+        safety,
+        primitive_locals,
+        summary: LocalRootWriteSummary {
+            any: false,
+            all_gc_inert: true,
+        },
     };
-    let branch = if invert_cond {
-        let Some(else_block) = if_stmt.else_block.as_ref() else {
-            return false;
-        };
-        else_block
-    } else {
-        &if_stmt.then_block
-    };
-    let [HirStmt::Assign(then_assign), HirStmt::Goto(_)] = branch.stmts.as_slice() else {
-        return false;
-    };
-    let [HirStmt::Assign(else_assign)] = else_body else {
-        return false;
-    };
-    then_assign.targets == else_assign.targets
+    visit_stmts(stmts, &mut visitor);
+    visitor.summary
+}
+
+#[derive(Clone, Copy)]
+struct LocalRootWriteSummary {
+    any: bool,
+    all_gc_inert: bool,
+}
+
+struct LocalRootWriteVisitor<'a> {
+    local: LocalId,
+    safety: HirExprSafety,
+    primitive_locals: &'a ImmutablePrimitiveLocals,
+    summary: LocalRootWriteSummary,
+}
+
+impl HirVisitor for LocalRootWriteVisitor<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::Assign(assign) => {
+                for (index, target) in assign.targets.iter().enumerate() {
+                    if matches!(target, HirLValue::Local(local) if *local == self.local) {
+                        self.summary.any = true;
+                        self.summary.all_gc_inert &= pack_slot_is_gc_inert(
+                            &assign.values,
+                            index,
+                            self.safety,
+                            self.primitive_locals,
+                        );
+                    }
+                }
+            }
+            HirStmt::LocalDecl(decl) if decl.bindings.contains(&self.local) => {
+                self.summary.any = true;
+                self.summary.all_gc_inert = false;
+            }
+            HirStmt::NumericFor(for_stmt) if for_stmt.binding == self.local => {
+                self.summary.any = true;
+                self.summary.all_gc_inert = false;
+            }
+            HirStmt::GenericFor(for_stmt) if for_stmt.bindings.contains(&self.local) => {
+                self.summary.any = true;
+                self.summary.all_gc_inert = false;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn index_top_level_labels(stmts: &[HirStmt]) -> BTreeMap<HirLabelId, usize> {
@@ -1256,6 +1457,191 @@ mod tests {
     }
 
     #[test]
+    fn forward_value_assignment_fold_keeps_an_externally_referenced_join() {
+        let target = HirLabelId(3);
+        let local = LocalId(0);
+        let assign = |value| {
+            HirStmt::Assign(Box::new(crate::hir::common::HirAssign {
+                targets: vec![HirLValue::Local(local)],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
+            }))
+        };
+        let external_entry = HirStmt::Block(Box::new(HirBlock {
+            stmts: vec![HirStmt::Goto(Box::new(crate::hir::common::HirGoto {
+                target,
+            }))],
+        }));
+        let label = HirStmt::Label(Box::new(HirLabel {
+            id: target,
+            tbc_barriers: Vec::new(),
+        }));
+        let mut stmts = vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::ParamRef(ParamId(0)),
+                then_block: HirBlock {
+                    stmts: vec![
+                        assign(1),
+                        HirStmt::Goto(Box::new(crate::hir::common::HirGoto { target })),
+                    ],
+                },
+                else_block: None,
+            })),
+            assign(2),
+            label.clone(),
+            external_entry.clone(),
+        ];
+
+        let label_refs = count_label_references(&stmts);
+        assert!(fold_forward_gotos(
+            &mut stmts,
+            FoldKind::TerminalElse,
+            &ForwardBranchMoveFacts::default(),
+            &label_refs,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &ImmutablePrimitiveLocals::default(),
+        ));
+        let [HirStmt::If(if_stmt), kept_label, kept_entry] = stmts.as_slice() else {
+            panic!("value assignments must become one if while the external join stays live");
+        };
+        assert_eq!(if_stmt.then_block.stmts, vec![assign(1)]);
+        assert_eq!(
+            if_stmt
+                .else_block
+                .as_ref()
+                .expect("fallback assignment must become the else arm")
+                .stmts,
+            vec![assign(2)],
+        );
+        assert_eq!(kept_label, &label);
+        assert_eq!(kept_entry, &external_entry);
+    }
+
+    #[test]
+    fn forward_guard_moves_inert_local_and_self_contained_label_region() {
+        let target = HirLabelId(7);
+        let internal = HirLabelId(8);
+        let local = LocalId(0);
+        let moved = vec![
+            HirStmt::Goto(Box::new(crate::hir::common::HirGoto { target: internal })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: internal,
+                tbc_barriers: Vec::new(),
+            })),
+            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![local],
+                values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+            })),
+        ];
+        let mut stmts = vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::ParamRef(ParamId(0)),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Goto(Box::new(crate::hir::common::HirGoto {
+                        target,
+                    }))],
+                },
+                else_block: None,
+            })),
+            moved[0].clone(),
+            moved[1].clone(),
+            moved[2].clone(),
+            HirStmt::Label(Box::new(HirLabel {
+                id: target,
+                tbc_barriers: Vec::new(),
+            })),
+        ];
+        let label_refs = count_label_references(&stmts);
+
+        assert!(fold_forward_gotos(
+            &mut stmts,
+            FoldKind::Guard,
+            &ForwardBranchMoveFacts::default(),
+            &label_refs,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &ImmutablePrimitiveLocals::default(),
+        ));
+
+        let [HirStmt::If(if_stmt)] = stmts.as_slice() else {
+            panic!("the complete internal-control region must move into the guard arm");
+        };
+        assert_eq!(if_stmt.then_block.stmts, moved);
+    }
+
+    #[test]
+    fn forward_guard_rejects_external_entry_into_moved_region() {
+        let target = HirLabelId(9);
+        let internal = HirLabelId(10);
+        let mut stmts = vec![
+            HirStmt::Goto(Box::new(crate::hir::common::HirGoto { target: internal })),
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::ParamRef(ParamId(0)),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Goto(Box::new(crate::hir::common::HirGoto {
+                        target,
+                    }))],
+                },
+                else_block: None,
+            })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: internal,
+                tbc_barriers: Vec::new(),
+            })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: target,
+                tbc_barriers: Vec::new(),
+            })),
+        ];
+        let original = stmts.clone();
+        let label_refs = count_label_references(&stmts);
+
+        assert!(!fold_forward_gotos(
+            &mut stmts,
+            FoldKind::Guard,
+            &ForwardBranchMoveFacts::default(),
+            &label_refs,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &ImmutablePrimitiveLocals::default(),
+        ));
+        assert_eq!(stmts, original);
+    }
+
+    #[test]
+    fn forward_guard_rejects_collectable_local_root_shortening() {
+        let target = HirLabelId(11);
+        let mut stmts = vec![
+            HirStmt::If(Box::new(HirIf {
+                cond: HirExpr::ParamRef(ParamId(0)),
+                then_block: HirBlock {
+                    stmts: vec![HirStmt::Goto(Box::new(crate::hir::common::HirGoto {
+                        target,
+                    }))],
+                },
+                else_block: None,
+            })),
+            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: vec![LocalId(0)],
+                values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+            })),
+            HirStmt::Label(Box::new(HirLabel {
+                id: target,
+                tbc_barriers: Vec::new(),
+            })),
+        ];
+        let original = stmts.clone();
+        let label_refs = count_label_references(&stmts);
+
+        assert!(!fold_forward_gotos(
+            &mut stmts,
+            FoldKind::Guard,
+            &ForwardBranchMoveFacts::default(),
+            &label_refs,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            &ImmutablePrimitiveLocals::default(),
+        ));
+        assert_eq!(stmts, original);
+    }
+
+    #[test]
     fn effectful_constant_condition_is_evaluated_in_a_short_scope() {
         let condition = HirExpr::TableConstructor(Box::default());
         let mut stmts = vec![HirStmt::If(Box::new(HirIf {
@@ -1294,13 +1680,17 @@ mod tests {
     }
 
     #[test]
-    fn repeat_tail_fold_keeps_prefix_label_in_place() {
+    fn repeat_tail_fold_absorbs_every_safe_stage_and_keeps_prefix_label_in_place() {
         let label = HirStmt::Label(Box::new(HirLabel {
             id: HirLabelId(3),
             tbc_barriers: Vec::new(),
         }));
-        let moved = HirExpr::ParamRef(ParamId(0));
-        let latch = HirExpr::ParamRef(ParamId(1));
+        let first_moved = HirExpr::ParamRef(ParamId(0));
+        let second_moved = HirExpr::ParamRef(ParamId(1));
+        let latch = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            lhs: HirExpr::ParamRef(ParamId(2)),
+            rhs: HirExpr::ParamRef(ParamId(3)),
+        }));
         let mut stmt = HirStmt::Repeat(Box::new(HirRepeat {
             body: HirBlock {
                 // The label may also have a reference outside this repeat. The fold keeps the
@@ -1308,7 +1698,14 @@ mod tests {
                 stmts: vec![
                     label.clone(),
                     HirStmt::If(Box::new(HirIf {
-                        cond: moved.clone(),
+                        cond: first_moved.clone(),
+                        then_block: HirBlock {
+                            stmts: vec![HirStmt::Break],
+                        },
+                        else_block: None,
+                    })),
+                    HirStmt::If(Box::new(HirIf {
+                        cond: second_moved.clone(),
                         then_block: HirBlock {
                             stmts: vec![HirStmt::Break],
                         },
@@ -1323,6 +1720,10 @@ mod tests {
             &mut stmt,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         ));
+        assert!(fold_trailing_repeat_break_condition(
+            &mut stmt,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        ));
 
         let HirStmt::Repeat(repeat) = stmt else {
             unreachable!();
@@ -1331,8 +1732,11 @@ mod tests {
         assert_eq!(
             repeat.cond,
             HirExpr::LogicalOr(Box::new(HirLogicalExpr {
-                lhs: moved,
-                rhs: latch,
+                lhs: first_moved,
+                rhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                    lhs: second_moved,
+                    rhs: latch,
+                })),
             }))
         );
     }

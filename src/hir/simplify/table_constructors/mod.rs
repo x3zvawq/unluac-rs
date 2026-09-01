@@ -45,6 +45,7 @@ use self::scan::{
     seed_delay_expr_is_unobservable, seed_overwrite_delay_is_unobservable,
     try_rebuild_constructor_region,
 };
+use super::boolean_shells::complete_possible_home_slots;
 use super::mention::{
     ReferenceCapturedBindings, stmts_reference_captured_bindings, stmts_value_captured_bindings,
 };
@@ -268,6 +269,10 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             rebuilt_constructor,
                             preserved_stmt_indices,
                         );
+                    let open_capture_is_safe = rebuilt_constructor.trailing_multivalue.is_none()
+                        || self.open_local_constructor_capture_region_is_safe(
+                            block, index, *end_index, binding,
+                        );
                     // Value-position nil is governed by the completed table shape, not by whether
                     // a nil literal happened to occur in a producer. A final absent array slot and
                     // a nil-valued record field preserve the same key set as the original writes.
@@ -337,7 +342,8 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     let overwrite_timing_is_safe = open_local_owner
                         || source_local_owner
                         || seed_overwrite_delay_is_unobservable(block, index, *end_index, binding);
-                    nil_shape_is_supported
+                    open_capture_is_safe
+                        && nil_shape_is_supported
                         && !adds_late_array_overwrite
                         && !unsupported_exact_width
                         && !producer_root_is_observable
@@ -1185,22 +1191,59 @@ impl TableConstructorPass<'_> {
         &self,
         captured: &ReferenceCapturedBindings,
         seed_local: LocalId,
-        seed_home: HomeSlotKey,
+        seed_homes: &BTreeSet<HomeSlotKey>,
     ) -> bool {
         captured.locals.iter().any(|local| {
             *local == seed_local
-                || self
-                    .promotion_facts
-                    .possible_local_home_slots(*local)
-                    .is_none_or(|homes| homes.contains(&seed_home))
+                || !complete_possible_home_slots(
+                    self.promotion_facts.possible_local_home_slots(*local),
+                    self.promotion_facts,
+                )
+                .is_disjoint(seed_homes)
         }) || captured.temps.iter().any(|temp| {
-            self.promotion_facts
-                .possible_temp_home_slots(*temp)
-                .is_none_or(|homes| homes.contains(&seed_home))
+            !complete_possible_home_slots(
+                self.promotion_facts.possible_temp_home_slots(*temp),
+                self.promotion_facts,
+            )
+            .is_disjoint(seed_homes)
         }) || captured.params.iter().any(|param| {
-            self.promotion_facts
-                .possible_param_home_slots(*param)
-                .is_none_or(|homes| homes.contains(&seed_home))
+            !complete_possible_home_slots(
+                self.promotion_facts.possible_param_home_slots(*param),
+                self.promotion_facts,
+            )
+            .is_disjoint(seed_homes)
+        })
+    }
+
+    fn open_local_constructor_capture_region_is_safe(
+        &self,
+        block: &crate::hir::common::HirBlock,
+        seed_index: usize,
+        end_index: usize,
+        binding: TableBinding,
+    ) -> bool {
+        let TableBinding::Local(local) = binding else {
+            return false;
+        };
+        let seed_homes = complete_possible_home_slots(
+            self.promotion_facts.possible_local_home_slots(local),
+            self.promotion_facts,
+        );
+        // 候选拒绝[SemanticBarrier:Capture]：ByReference closure 可持续观察 owner cell，
+        // ByValue closure 则在 producer 原位置冻结该 cell；把 producer 移入 LocalDecl
+        // initializer 会把两者都放到 owner store 之前。complete possible-home 相交时，
+        // captured binding 可指向该 cell，不能改变 snapshot/后续读取到的 table 值。
+        block.stmts[seed_index + 1..end_index].iter().all(|stmt| {
+            let stmt_slice = std::slice::from_ref(stmt);
+            !self.captures_may_share_seed_home(
+                &stmts_reference_captured_bindings(stmt_slice),
+                local,
+                &seed_homes,
+            ) && !self.captures_may_share_seed_home(
+                &stmts_value_captured_bindings(stmt_slice),
+                local,
+                &seed_homes,
+            )
         })
     }
 
@@ -1478,7 +1521,7 @@ impl TableConstructorPass<'_> {
         binding: TableBinding,
         set_list: &crate::hir::common::HirTableSetList,
     ) -> bool {
-        let TableBinding::Local(local) = binding else {
+        let TableBinding::Local(_) = binding else {
             return false;
         };
         let Some((seed_binding, seed)) = constructor_seed(&block.stmts[seed_index]) else {
@@ -1556,11 +1599,8 @@ impl TableConstructorPass<'_> {
         // The exact source LocalDecl is retained and the SETLIST is adjacent, so the rewritten
         // interval contains no independent owner use, capture, overwrite, or lifetime boundary.
         // Earlier mentions cannot resolve to this lexical definition, and later re-materializations
-        // remain after the folded batch; home compaction cannot alias the trusted owner in the gap.
-        // 候选拒绝[LayerBoundary]：trusted home provenance 由 promotion owner 提供。
-        self.promotion_facts
-            .trusted_local_home_slot(local)
-            .is_some()
+        // remain after the folded batch. Physical-home provenance cannot affect this local proof.
+        true
     }
 
     /// Prove the one open-tail region whose allocation owner is an actual LocalDecl at block
@@ -1576,7 +1616,7 @@ impl TableConstructorPass<'_> {
         constructor: &HirTableConstructor,
         preserved_stmt_indices: &[usize],
     ) -> bool {
-        let TableBinding::Local(local) = binding else {
+        let TableBinding::Local(_) = binding else {
             return false;
         };
         let Some((seed_binding, seed)) = constructor_seed(&block.stmts[seed_index]) else {
@@ -1629,10 +1669,9 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // owner 的 LocalDecl/LocalId 不会被删除；下方逐句证明拒绝任何在 drain 区间内
-        // 读取 owner 的 producer、key 或 value，并按 trusted home 排除不同 binding 对同一
-        // 物理 cell 的 capture。因此只有区间后的 reference capture 可达，它仍捕获同一个
-        // table owner。
+        // owner 的 LocalDecl/LocalId 不会被删除；capture/home 已由独立 commit gate 按完整
+        // possible-home 集合证明。下方逐句拒绝 drain 区间内读取 owner 的 producer、key 或
+        // value，因此区间后的 reference capture 仍捕获同一个 table owner。
         let tail = set_list.values.tail.as_ref().expect("checked open tail");
         // 候选拒绝[SemanticBarrier:ValueArity]：constructor/AST 只有 open tail；若
         // `f()` 返回三个值，exact width 2 只能取前两个，直接写成 `{ f() }` 会多写一槽。
@@ -1659,28 +1698,10 @@ impl TableConstructorPass<'_> {
         // `try_rebuild_constructor_region` already compared the complete source/generated event
         // sequences, including every fixed SETLIST value and the open tail. The exact LocalDecl is
         // retained; earlier mentions cannot resolve to it, while later materializations remain
-        // outside the committed region. Home compaction therefore does not require a global gate.
-        // 候选拒绝[LayerBoundary]：trusted home provenance 由 promotion owner 提供。
-        let Some(seed_home) = self.promotion_facts.trusted_local_home_slot(local) else {
-            return false;
-        };
-
+        // outside the committed region. Home identity matters only for captures created inside the
+        // drained interval, so use the complete may-home set instead of requiring one exact home.
         for (offset, stmt) in block.stmts[seed_index + 1..end_index].iter().enumerate() {
             let stmt_index = seed_index + 1 + offset;
-            let stmt_slice = std::slice::from_ref(stmt);
-            if self.captures_may_share_seed_home(
-                &stmts_reference_captured_bindings(stmt_slice),
-                local,
-                seed_home,
-            ) || self.captures_may_share_seed_home(
-                &stmts_value_captured_bindings(stmt_slice),
-                local,
-                seed_home,
-            ) {
-                // 候选拒绝[SemanticBarrier:Scope]：不同 binding 仍可能捕获 owner 的同一物理
-                // cell；缺 trusted home 的 capture 也不能证明与 owner 分离。
-                return false;
-            }
             match stmt {
                 HirStmt::LocalDecl(decl) => {
                     assert!(
@@ -2664,14 +2685,20 @@ mod tests {
     }
 
     #[test]
-    fn open_local_fallback_accepts_exact_interval_under_compaction_and_reuse() {
+    fn open_local_fallback_accepts_self_reference_without_trusted_home() {
         let owner = LocalId(0);
         let mut block = HirBlock {
             stmts: vec![
                 local_table(
                     owner,
                     HirTableConstructor {
-                        fields: vec![HirTableField::Array(HirExpr::Integer(10))],
+                        fields: vec![
+                            HirTableField::Array(HirExpr::Integer(10)),
+                            HirTableField::Record(HirRecordField {
+                                key: HirTableKey::Name("self".into()),
+                                value: HirExpr::LocalRef(owner),
+                            }),
+                        ],
                         trailing_multivalue: None,
                     },
                 ),
@@ -2694,9 +2721,12 @@ mod tests {
         };
         let mut promotion_facts = ProtoPromotionFacts::default();
         promotion_facts.record_local_home_slot(owner, HomeSlotKey::new(0, 0));
+        promotion_facts
+            .record_local_home_merge(owner, Some(BTreeSet::from([HomeSlotKey::new(1, 0)])));
         promotion_facts.enable_home_slot_compaction();
         let mut pass = table_pass(&block, &promotion_facts, &[None]);
         assert!(!promotion_facts.is_direct_table_seed_local(owner));
+        assert_eq!(promotion_facts.trusted_local_home_slot(owner), None);
         assert_eq!(
             pass.materialized_bindings
                 .get(TableBinding::Local(owner))
@@ -2711,8 +2741,12 @@ mod tests {
             constructor.fields.as_slice(),
             [
                 HirTableField::Array(HirExpr::Integer(10)),
+                HirTableField::Record(HirRecordField {
+                    key: HirTableKey::Name(name),
+                    value: HirExpr::LocalRef(local),
+                }),
                 HirTableField::Array(HirExpr::TableConstructor(_)),
-            ]
+            ] if name == "self" && *local == owner
         ));
         assert!(
             constructor
@@ -2784,6 +2818,65 @@ mod tests {
                 .as_ref()
                 .is_some_and(|tail| matches!(tail.as_expr(), HirExpr::Call(_)))
         );
+    }
+
+    #[test]
+    fn open_region_uses_complete_owner_homes_for_capture_aliases() {
+        fn rewrite_with_capture(capture_mode: HirCaptureMode, capture_home: HomeSlotKey) -> bool {
+            let owner = LocalId(0);
+            let captured_alias = LocalId(1);
+            let closure = LocalId(2);
+            let mut block = HirBlock {
+                stmts: vec![
+                    local_table(owner, HirTableConstructor::default()),
+                    HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: vec![closure],
+                        values: HirValuePack::fixed(vec![HirExpr::Closure(Box::new(
+                            HirClosureExpr {
+                                proto: HirProtoRef(1),
+                                captures: vec![HirCapture {
+                                    mode: capture_mode,
+                                    value: HirExpr::LocalRef(captured_alias),
+                                }],
+                            },
+                        ))]),
+                    })),
+                    HirStmt::TableSetList(Box::new(HirTableSetList {
+                        base: HirExpr::LocalRef(owner),
+                        start_index: 1,
+                        values: HirValuePack::expanding(
+                            vec![HirExpr::LocalRef(closure)],
+                            HirPackTail::open(call("open_tail")),
+                        ),
+                    })),
+                ],
+            };
+            let first_owner_home = HomeSlotKey::new(0, 0);
+            let merged_owner_home = HomeSlotKey::new(1, 0);
+            let mut promotion_facts = ProtoPromotionFacts::default();
+            promotion_facts.record_local_home_slot(owner, first_owner_home);
+            promotion_facts
+                .record_local_home_merge(owner, Some(BTreeSet::from([merged_owner_home])));
+            promotion_facts.record_local_home_slot(captured_alias, capture_home);
+            promotion_facts.record_local_home_slot(closure, HomeSlotKey::new(3, 0));
+            assert_eq!(promotion_facts.trusted_local_home_slot(owner), None);
+            let mut pass = table_pass(&block, &promotion_facts, &[None, None, None]);
+
+            let changed = pass.rewrite_block(&mut block);
+            assert_eq!(
+                block
+                    .stmts
+                    .iter()
+                    .any(|stmt| matches!(stmt, HirStmt::TableSetList(_))),
+                !changed
+            );
+            changed
+        }
+
+        for capture_mode in [HirCaptureMode::ByReference, HirCaptureMode::ByValue] {
+            assert!(rewrite_with_capture(capture_mode, HomeSlotKey::new(2, 0)));
+            assert!(!rewrite_with_capture(capture_mode, HomeSlotKey::new(1, 0)));
+        }
     }
 
     #[test]

@@ -67,6 +67,16 @@ assert(receiver == "outer")
 assert(observed_receiver == "inner")
 assert(write_target_receiver.touch(write_target_receiver) == "inner")
 
+-- Forwarding one closure to multiple sinks must preserve one shared object and its local owner.
+local shared_forward_owner = {}
+local shared_forwarded = function()
+    return 47
+end
+shared_forward_owner.first = shared_forwarded
+shared_forward_owner.second = shared_forwarded
+assert(shared_forward_owner.first == shared_forward_owner.second)
+assert(shared_forward_owner.first() == 47)
+
 local constructor_events = {}
 local function mark(name)
     constructor_events[#constructor_events + 1] = name

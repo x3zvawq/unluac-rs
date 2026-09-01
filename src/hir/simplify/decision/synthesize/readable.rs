@@ -45,16 +45,21 @@ pub(crate) fn naturalize_pure_logical_expr(
         visit_pure_logical_rewrite_candidates(&current, &mut |candidate| {
             let candidate = normalize_candidate_expr(candidate, safety);
             let candidate_cost = super::expr_cost(&candidate);
-            if verifier.eval_expr(&candidate) == Some(expected)
-                && candidate_cost < current_cost
-                && next
-                    .as_ref()
-                    .is_none_or(|(best_cost, _)| candidate_cost < *best_cost)
+            if verifier.eval_expr(&candidate) != Some(expected) {
+                return;
+            }
+            if candidate_cost >= current_cost {
+                // 候选拒绝[PolicyBoundary]：候选已由同一 MDD 证明等价，但不严格降低
+                // 可读性成本；自然化 pass 不用等价的高密度形状替换当前表达式。
+                return;
+            }
+            if next
+                .as_ref()
+                .is_none_or(|(best_cost, _)| candidate_cost < *best_cost)
             {
                 next = Some((candidate_cost, candidate));
             }
         });
-        // 候选拒绝[PolicyBoundary]：等价但不严格降低可读性成本的形状不提交。
         let Some((_, next)) = next else {
             break;
         };

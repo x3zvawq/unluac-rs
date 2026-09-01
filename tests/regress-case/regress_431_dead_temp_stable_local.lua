@@ -1,8 +1,9 @@
 -- regress_431_dead_temp_stable_local: an entry-nil dead copy of an unmodified visible local
--- has no independent root duty, while a copy whose source parameter is overwritten must remain.
+-- has no independent root duty, while a copy whose source binding is overwritten must remain;
+-- the physical root may attach directly to the copied value instead of retaining an SSA alias.
 -- unluac: expect-not-contains [[local r1_0 = p1_0]]
 -- unluac: expect-contains [[local r2_0 = p2_0]]
--- unluac: expect-contains [[local r3_1 = r3_0]]
+-- unluac: expect-contains [[local r3_1 = r0_3]]
 
 local function stable(value, callback)
     local source = value

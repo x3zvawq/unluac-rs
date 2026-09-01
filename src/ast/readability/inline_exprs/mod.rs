@@ -327,9 +327,9 @@ fn rewrite_current_block(
             // 如果太早收成 `local weight = items[i].weight`，后面的机械 run 就只剩一层，
             // 无法再判断“整条链都只是脚手架”。让它留到 run-collapse 一次性处理，
             // 才能既收回 for-loop 里的机械局部，又保住 return 场景下的阶段 local。
-            // 候选拒绝[LayerBoundary]：连续 lookup 由 rewrite_current_block 尾部的
-            // collapse_adjacent_mechanical_alias_runs 在同一次调用中原子证明；相邻单项
-            // scanner 必须先保留完整 run，随后无需依赖外部 pass 或下一轮。
+            // 这只是同一个 inline-exprs transaction 内的 helper 交接：相邻单项 scanner
+            // 不拆开完整 run，尾部 collapse_adjacent_mechanical_alias_runs 会在本次调用中
+            // 重新判断整段是否值得且能够原子收回；它不是跨 layer 的候选拒绝。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;

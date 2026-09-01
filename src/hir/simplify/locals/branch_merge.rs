@@ -31,6 +31,7 @@ struct FallthroughSummary {
 }
 
 pub(super) fn candidate_temps(
+    owner_stmts: &[HirStmt],
     stmt: &HirStmt,
     temp_touches: &TempTouchIndex,
     stmt_index: usize,
@@ -67,14 +68,28 @@ pub(super) fn candidate_temps(
         .copied()
         .chain(condition_reads)
         .collect::<BTreeSet<_>>();
+    let prefix_cfg = RegionCfg::build_stmts(&owner_stmts[..stmt_index], safety).ok();
 
     common_temps
         .into_iter()
         .filter(|temp| !is_reserved(*temp))
         .filter(|temp| !reads_before_assignment.contains(temp))
-        // 候选拒绝[SemanticBarrier:Lifetime]：`t=obj; if c then t=a else t=b end; GC` 若在 if 前另建 local，旧 t 物理槽不再按原时点覆盖，弱表/`__gc` 可观察旧对象延寿。
-        .filter(|temp| !temp_touches.touches_before(stmt_index, *temp))
-        // 候选拒绝[LayerBoundary]：合流后没有 touch 的 branch temp 是 dead-temps 的删除候选，不应物化为空 local。
+        .filter(|temp| {
+            if !temp_touches.touches_before(stmt_index, *temp)
+                || prefix_cfg
+                    .as_ref()
+                    .is_some_and(|cfg| cfg.fallthrough_temp_is_gc_inert(*temp))
+            {
+                return true;
+            }
+            // 候选拒绝[SemanticBarrier:Lifetime]：`t=obj; if c then t=a else t=b end; GC`
+            // 若在 if 前另建 local，旧 t owner 不再按 arm 写入点覆盖，弱表/`__gc`
+            // 可观察旧对象延寿。只有完整 prefix CFG 的每条 fallthrough 都以 GC-inert
+            // 写终结旧 root 时才解除该屏障。
+            false
+        })
+        // 候选忽略[NotApplicable]：合流后没有任何后续 touch 的 branch temp 不形成跨语句
+        // 源码 binding；dead-temps 会独立审计其中可删除的写，其余 effect/root 写仍保留原形。
         .filter(|temp| temp_touches.touches_after(stmt_index + 1, *temp))
         .collect()
 }
@@ -117,6 +132,7 @@ type FlowNodeId = usize;
 struct FlowNode {
     reads: BTreeSet<TempId>,
     writes: BTreeSet<TempId>,
+    gc_inert_writes: BTreeSet<TempId>,
     successors: BTreeSet<FlowNodeId>,
 }
 
@@ -134,6 +150,10 @@ enum RegionCfgFailure {
 
 impl RegionCfg {
     fn build(block: &HirBlock, safety: HirExprSafety) -> Result<Self, RegionCfgFailure> {
+        Self::build_stmts(&block.stmts, safety)
+    }
+
+    fn build_stmts(stmts: &[HirStmt], safety: HirExprSafety) -> Result<Self, RegionCfgFailure> {
         let mut builder = RegionCfgBuilder {
             nodes: vec![FlowNode::default()],
             labels: BTreeMap::new(),
@@ -142,7 +162,7 @@ impl RegionCfg {
         };
         let exit = 0;
         let entry = builder
-            .build_block(&block.stmts, exit, None, None)
+            .build_block(stmts, exit, None, None)
             .ok_or(RegionCfgFailure::AmbiguousLabel)?;
         let mut external_goto_sources = Vec::new();
         for (source, target) in builder.pending_gotos {
@@ -167,6 +187,42 @@ impl RegionCfg {
             entry,
             exit,
         })
+    }
+
+    fn fallthrough_temp_is_gc_inert(&self, temp: TempId) -> bool {
+        let mut incoming = vec![None::<bool>; self.nodes.len()];
+        incoming[self.entry] = Some(false);
+        let mut pending = VecDeque::from([self.entry]);
+
+        while let Some(node_id) = pending.pop_front() {
+            let mut outgoing =
+                incoming[node_id].expect("worklist only contains reachable CFG nodes");
+            if self.nodes[node_id].writes.contains(&temp) {
+                outgoing = self.nodes[node_id].gc_inert_writes.contains(&temp);
+            }
+            for &successor in &self.nodes[node_id].successors {
+                let changed = match &mut incoming[successor] {
+                    Some(current) => {
+                        let merged = *current && outgoing;
+                        if *current == merged {
+                            false
+                        } else {
+                            *current = merged;
+                            true
+                        }
+                    }
+                    slot @ None => {
+                        *slot = Some(outgoing);
+                        true
+                    }
+                };
+                if changed {
+                    pending.push_back(successor);
+                }
+            }
+        }
+
+        incoming[self.exit] == Some(true)
     }
 
     fn summarize(&self) -> FallthroughSummary {
@@ -253,6 +309,7 @@ impl RegionCfgBuilder {
         self.nodes.push(FlowNode {
             reads,
             writes,
+            gc_inert_writes: BTreeSet::new(),
             successors: successors.into_iter().collect(),
         });
         id
@@ -404,24 +461,30 @@ impl RegionCfgBuilder {
                     ),
                 )
             }
-            HirStmt::Assign(assign) => Some(
-                self.new_node(
-                    stmt_reads(stmt),
-                    assign
-                        .targets
-                        .iter()
-                        .filter_map(|target| match target {
-                            HirLValue::Temp(temp) => Some(*temp),
-                            HirLValue::Param(_)
-                            | HirLValue::Local(_)
-                            | HirLValue::Upvalue(_)
-                            | HirLValue::Global(_)
-                            | HirLValue::TableAccess(_) => None,
-                        })
-                        .collect(),
-                    [next],
-                ),
-            ),
+            HirStmt::Assign(assign) => {
+                let writes = assign
+                    .targets
+                    .iter()
+                    .filter_map(|target| match target {
+                        HirLValue::Temp(temp) => Some(*temp),
+                        HirLValue::Param(_)
+                        | HirLValue::Local(_)
+                        | HirLValue::Upvalue(_)
+                        | HirLValue::Global(_)
+                        | HirLValue::TableAccess(_) => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                let gc_inert_writes = writes
+                    .iter()
+                    .copied()
+                    .filter(|temp| {
+                        assignment_final_temp_value_is_gc_inert(assign, *temp, self.safety)
+                    })
+                    .collect();
+                let node = self.new_node(stmt_reads(stmt), writes, [next]);
+                self.nodes[node].gc_inert_writes = gc_inert_writes;
+                Some(node)
+            }
             HirStmt::LocalDecl(_)
             | HirStmt::GlobalDecl(_)
             | HirStmt::ErrNil(_)
@@ -433,6 +496,24 @@ impl RegionCfgBuilder {
             }
         }
     }
+}
+
+fn assignment_final_temp_value_is_gc_inert(
+    assign: &crate::hir::common::HirAssign,
+    temp: TempId,
+    safety: HirExprSafety,
+) -> bool {
+    let Some(index) = assign
+        .targets
+        .iter()
+        .rposition(|target| matches!(target, HirLValue::Temp(target) if *target == temp))
+    else {
+        return false;
+    };
+    assign.values.fixed.get(index).map_or_else(
+        || assign.values.tail.is_none(),
+        |value| safety.result_is_gc_inert(value),
+    )
 }
 
 fn stmt_reads(stmt: &HirStmt) -> BTreeSet<TempId> {
@@ -462,6 +543,7 @@ fn intersect_fallthrough_assignment_sets<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hir::ParamId;
     use crate::hir::common::{
         HirAssign, HirExpr, HirGoto, HirIf, HirLabel, HirLabelId, HirReturn, HirValuePack,
     };
@@ -502,13 +584,76 @@ mod tests {
 
     fn candidates(stmt: &HirStmt, temp: TempId) -> Vec<TempId> {
         let stmt_refs = [BTreeSet::from([temp]), BTreeSet::from([temp])];
+        let owner_stmts = [stmt.clone()];
         candidate_temps(
+            &owner_stmts,
             stmt,
             &TempTouchIndex::new(&stmt_refs),
             0,
             &|_| false,
             HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Auto),
         )
+    }
+
+    fn candidates_after_prefix(prefix: HirStmt, temp: TempId) -> Vec<TempId> {
+        let candidate = branch(vec![assign_temp(temp)], vec![assign_temp(temp)]);
+        let stmts = vec![
+            prefix,
+            candidate,
+            HirStmt::Return(Box::new(HirReturn {
+                values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
+            })),
+        ];
+        let stmt_refs = vec![BTreeSet::from([temp]); stmts.len()];
+        candidate_temps(
+            &stmts,
+            &stmts[1],
+            &TempTouchIndex::new(&stmt_refs),
+            1,
+            &|_| false,
+            HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Lua54),
+        )
+    }
+
+    #[test]
+    fn prior_gc_inert_write_does_not_create_a_false_lifetime_barrier() {
+        let temp = TempId(0);
+
+        assert_eq!(
+            candidates_after_prefix(assign_temp_value(temp, HirExpr::Boolean(false)), temp),
+            vec![temp]
+        );
+    }
+
+    #[test]
+    fn prefix_must_end_every_fallthrough_with_a_gc_inert_value() {
+        let temp = TempId(0);
+        let both_inert = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::ParamRef(ParamId(0)),
+            then_block: block(vec![assign_temp_value(temp, HirExpr::Boolean(false))]),
+            else_block: Some(block(vec![assign_temp_value(temp, HirExpr::Integer(0))])),
+        }));
+        assert_eq!(candidates_after_prefix(both_inert, temp), vec![temp]);
+
+        let maybe_old_root = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::ParamRef(ParamId(0)),
+            then_block: block(vec![assign_temp_value(temp, HirExpr::Boolean(false))]),
+            else_block: Some(block(Vec::new())),
+        }));
+        assert!(candidates_after_prefix(maybe_old_root, temp).is_empty());
+    }
+
+    #[test]
+    fn prior_collectable_write_keeps_the_lifetime_barrier() {
+        let temp = TempId(0);
+
+        assert!(
+            candidates_after_prefix(
+                assign_temp_value(temp, HirExpr::TableConstructor(Box::default())),
+                temp,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

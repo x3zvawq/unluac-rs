@@ -130,8 +130,8 @@ fn flush_constructor_segment(
                     &mut context.scratch.restored_array_fields,
                 )
             {
-                // 候选拒绝[SemanticBarrier:TableShape]：重叠 SETLIST 只有在既有 array 后缀可
-                // 精确降为整数 record 时才能表示；反例见 regress_237_table_constructor_open_overlap。
+                // 候选拒绝[SemanticBarrier:TableShape]：唯一失败形状是 raw SETLIST
+                // 起点 0；吸收到 constructor array 会把原键 0 改写成键 1。
                 return None;
             }
             builder
@@ -159,8 +159,8 @@ fn flush_constructor_segment(
         if start_index < builder.next_array_index()
             && !builder.demote_array_suffix(start_index, &mut context.scratch.restored_array_fields)
         {
-            // 候选拒绝[SemanticBarrier:TableShape]：不能表示的 SETLIST overlap 会改变旧后缀
-            // 是否被 open pack 覆盖；反例见 regress_237_table_constructor_open_overlap。
+            // 候选拒绝[SemanticBarrier:TableShape]：唯一失败形状是 raw SETLIST
+            // 起点 0；吸收到 constructor array 会把原键 0 改写成键 1。
             return None;
         }
         builder.next_array_index()

@@ -325,8 +325,8 @@ pub(super) fn collapse_adjacent_call_alias_runs(
         let allows_single_receiver_alias = collapsed_count == 1
             && (single_generic_for_method_receiver_alias(&old_stmts, index, run_end)
                 || single_call_callee_alias(&old_stmts, index, run_end));
-        if (collapsed_count >= 2 || allows_single_receiver_alias)
-            && eval_order::run_preserves_eval_order(
+        if collapsed_count >= 2 || allows_single_receiver_alias {
+            if eval_order::run_preserves_eval_order(
                 &old_stmts,
                 index,
                 run_end,
@@ -334,22 +334,24 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 target,
                 mutable_snapshots,
                 &write_index,
-            )
-        {
-            changed = true;
-            plan_collapsed_run(
-                &mut stmt_plan,
-                index,
-                &removed,
-                rewritten_sink.expect("collapsed alias run must rewrite its sink"),
-            );
-            index = run_end + 1;
-            continue;
+            ) {
+                changed = true;
+                plan_collapsed_run(
+                    &mut stmt_plan,
+                    index,
+                    &removed,
+                    rewritten_sink.expect("collapsed alias run must rewrite its sink"),
+                );
+                index = run_end + 1;
+                continue;
+            }
+            // 候选拒绝[SemanticBarrier:EvalOrder]：已形成足量 rewrite 的移动事件必须仍是
+            // sink 的同序前缀；多值 return 的前置快照/事件会改变可观察顺序
+            // （regress_352、regress_353）。
+        } else if collapsed_count != 0 {
+            // 候选拒绝[PolicyBoundary]：普通 run 至少收回两项；单项仅为 generic-for
+            // method receiver 或 terminal call-callee 时才值得消除独立声明。
         }
-
-        // 候选拒绝[PolicyBoundary]：普通 run 至少收回两项（仅 generic-for method receiver
-        // 与单项 terminal call-callee 例外）；候选拒绝[SemanticBarrier:EvalOrder]：移动事件
-        // 必须仍是 sink 的同序前缀；多值 return 的前置快照/事件会改变可观察顺序（regress_352、regress_353）。
 
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
@@ -625,8 +627,8 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
         // 这里专门处理“调用准备 run 的终点自己还是一个 local/assign”：
         // `local f = obj.m; local x = f(arg)`、`local a = t[i]; local v = call(a, ...)`
         // 这类形状和最终 `call_stmt(...)` 属于同一 owner，只是 sink 还保留在结果声明里。
-        if collapsed_count >= 2
-            && eval_order::run_preserves_eval_order(
+        if collapsed_count >= 2 {
+            if eval_order::run_preserves_eval_order(
                 &old_stmts,
                 index,
                 sink_index,
@@ -634,20 +636,22 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 target,
                 mutable_snapshots,
                 &write_index,
-            )
-        {
-            changed = true;
-            plan_collapsed_run(
-                &mut stmt_plan,
-                index,
-                &removed,
-                rewritten_sink.expect("collapsed call-result run must rewrite its sink"),
-            );
-            index = sink_index + 1;
-            continue;
+            ) {
+                changed = true;
+                plan_collapsed_run(
+                    &mut stmt_plan,
+                    index,
+                    &removed,
+                    rewritten_sink.expect("collapsed call-result run must rewrite its sink"),
+                );
+                index = sink_index + 1;
+                continue;
+            }
+            // 候选拒绝[SemanticBarrier:EvalOrder]：已形成足量 call-result rewrite 时，
+            // 完整事件前缀仍必须保持同序。
+        } else if collapsed_count != 0 {
+            // 候选拒绝[PolicyBoundary]：call-result 只收回至少两个机械准备阶段。
         }
-
-        // 候选拒绝[PolicyBoundary]：call-result 只收回至少两个机械阶段；候选拒绝[SemanticBarrier:EvalOrder]：完整事件前缀必须同序。
 
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
@@ -794,13 +798,13 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             }
         }
 
-        if rewritten_sink.as_ref().is_some_and(|rewritten_sink| {
-            collapsed_count >= 2
-                && (has_non_lookup_piece
-                    || stmt_prefers_pure_lookup_run_collapse(rewritten_sink)
-                    || (has_dependent_lookup_piece
-                        && stmt_prefers_dependent_lookup_run_collapse(rewritten_sink)))
-                && eval_order::run_preserves_eval_order(
+        if let Some(rewritten_sink_ref) = rewritten_sink.as_ref() {
+            let display_worthy = has_non_lookup_piece
+                || stmt_prefers_pure_lookup_run_collapse(rewritten_sink_ref)
+                || (has_dependent_lookup_piece
+                    && stmt_prefers_dependent_lookup_run_collapse(rewritten_sink_ref));
+            if collapsed_count >= 2 && display_worthy {
+                if eval_order::run_preserves_eval_order(
                     &old_stmts,
                     index,
                     run_end,
@@ -808,20 +812,24 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                     target,
                     mutable_snapshots,
                     &write_index,
-                )
-        }) {
-            changed = true;
-            plan_collapsed_run(
-                &mut stmt_plan,
-                index,
-                &removed,
-                rewritten_sink.expect("collapsed mechanical run must rewrite its sink"),
-            );
-            index = run_end + 1;
-            continue;
+                ) {
+                    changed = true;
+                    plan_collapsed_run(
+                        &mut stmt_plan,
+                        index,
+                        &removed,
+                        rewritten_sink.expect("collapsed mechanical run must rewrite its sink"),
+                    );
+                    index = run_end + 1;
+                    continue;
+                }
+                // 候选拒绝[SemanticBarrier:EvalOrder]：已形成足量且值得展示的 mechanical
+                // rewrite 时，全部 producer 必须仍构成 sink 的同序可观察前缀。
+            } else if collapsed_count != 0 {
+                // 候选拒绝[PolicyBoundary]：mechanical run 至少收回两项，且 lookup 组合
+                // 必须达到项目选择的展示收益。
+            }
         }
-
-        // 候选拒绝[PolicyBoundary]：至少两项且形状值得收回；候选拒绝[SemanticBarrier:EvalOrder]：全部 producer 必须仍构成 sink 的同序可观察前缀。
 
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
@@ -948,8 +956,8 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
             }
         }
 
-        if collapsed_count >= 2
-            && eval_order::run_preserves_eval_order(
+        if collapsed_count >= 2 {
+            if eval_order::run_preserves_eval_order(
                 &old_stmts,
                 index,
                 run_end - 1,
@@ -957,20 +965,22 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 target,
                 mutable_snapshots,
                 &write_index,
-            )
-        {
-            changed = true;
-            plan_collapsed_run(
-                &mut stmt_plan,
-                index,
-                &removed,
-                rewritten_sink.expect("collapsed terminal-local run must rewrite its sink"),
-            );
-            index = run_end;
-            continue;
+            ) {
+                changed = true;
+                plan_collapsed_run(
+                    &mut stmt_plan,
+                    index,
+                    &removed,
+                    rewritten_sink.expect("collapsed terminal-local run must rewrite its sink"),
+                );
+                index = run_end;
+                continue;
+            }
+            // 候选拒绝[SemanticBarrier:EvalOrder]：足量 terminal-local rewrite 的事件前缀
+            // 不一致时，会改变调用、lookup 或可变快照的次序。
+        } else if collapsed_count != 0 {
+            // 候选拒绝[PolicyBoundary]：少于两个机械阶段不做 terminal-local 展示折叠。
         }
-
-        // 候选拒绝[PolicyBoundary]：少于两个机械阶段不做展示折叠；候选拒绝[SemanticBarrier:EvalOrder]：事件前缀不一致会改变调用/lookup/快照次序。
 
         stmt_plan.push(PlannedStmt::Original(index));
         index += 1;

@@ -57,14 +57,16 @@ impl ExprRewritePass for LogicalExprPass {
             changed = true;
         }
 
-        // 候选拒绝[TargetConstraint]：非 Luau 方言的整数/浮点算术与结果类型合同不同，不能套用 Luau 唯一的 f64 number 路径。
-        if self.fold_luau_literal_addition
-            && let HirExpr::Binary(binary) = expr
+        if let HirExpr::Binary(binary) = expr
             && binary.op == HirBinaryOpKind::Add
             && let Some(value) = luau_literal_addition_value(&binary.lhs, &binary.rhs)
         {
-            *expr = value;
-            changed = true;
+            if self.fold_luau_literal_addition {
+                *expr = value;
+                changed = true;
+            } else {
+                // 候选拒绝[TargetConstraint]：这个精确的 Luau 字面量加法候选在 PUC Lua 下可能有整数结果，不能套用唯一的 f64 number 路径。
+            }
         }
 
         if let Some(replacement) = simplify_logical_shape_with_safety(expr, self.safety) {

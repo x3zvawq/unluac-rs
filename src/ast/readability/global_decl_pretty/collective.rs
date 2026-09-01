@@ -31,14 +31,23 @@ pub(super) fn try_wrap_missing_collective_suffix(
         return false;
     }
 
-    let Some((attr, names)) = collective_candidate(missing) else {
+    let names = missing
+        .none
+        .iter()
+        .chain(&missing.const_)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if names.is_empty() {
         return false;
-    };
+    }
     let start = block
         .stmts
         .iter()
         .position(|stmt| stmt_mentions_any_missing_global(stmt, &names));
     let Some(start) = start else {
+        return false;
+    };
+    let Some(attr) = collective_candidate_attr(missing) else {
         return false;
     };
     if has_incoming_goto(block, start) {
@@ -58,13 +67,10 @@ pub(super) fn try_wrap_missing_collective_suffix(
     true
 }
 
-fn collective_candidate(missing: &MissingGlobals) -> Option<(AstGlobalAttr, BTreeSet<String>)> {
+fn collective_candidate_attr(missing: &MissingGlobals) -> Option<AstGlobalAttr> {
     match (missing.none.is_empty(), missing.const_.is_empty()) {
-        (true, false) => Some((
-            AstGlobalAttr::Const,
-            missing.const_.iter().cloned().collect(),
-        )),
-        (false, true) => Some((AstGlobalAttr::None, missing.none.iter().cloned().collect())),
+        (true, false) => Some(AstGlobalAttr::Const),
+        (false, true) => Some(AstGlobalAttr::None),
         (false, false) => {
             // 候选拒绝[TargetConstraint]：Lua 5.5 的单个 wildcard gate 只能携带一种属性，无法同时表达可写与 const 缺失名；混合形状由逐名声明精确表达。
             None

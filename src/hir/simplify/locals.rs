@@ -1007,6 +1007,7 @@ fn collect_plans(
     for (decl_index, stmt) in block.stmts[..linear_prefix_end].iter().enumerate() {
         let is_reserved = |temp| inherited.contains_key(&temp) || reserved_temps.contains(&temp);
         let mut merge_temps = branch_merge::candidate_temps(
+            &block.stmts,
             stmt,
             &temp_touches,
             decl_index,

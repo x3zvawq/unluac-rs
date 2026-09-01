@@ -258,14 +258,7 @@ fn collect_scope_intervals(
 
     intervals.sort_by_key(|interval| (interval.start, interval.end));
 
-    if well_nested_scope_intervals(&intervals) {
-        intervals
-    } else {
-        // 候选拒绝[SemanticBarrier:Resource]：`TBC a; TBC b; Close(a); use(b); Close(b)`
-        // 的交叉资源区间无法表示成嵌套 Lua block；强行合并会把 a 延寿到 use(b) 之后，
-        // 强行嵌套则会在 a 之前关闭 b。
-        Vec::new()
-    }
+    retain_well_nested_interval_components(intervals)
 }
 
 fn scope_start(stmts: &[HirStmt], index: usize) -> Option<ScopeStart> {
@@ -615,6 +608,31 @@ fn well_nested_scope_intervals(intervals: &[ScopeInterval]) -> bool {
     true
 }
 
+fn retain_well_nested_interval_components(intervals: Vec<ScopeInterval>) -> Vec<ScopeInterval> {
+    let mut retained = Vec::with_capacity(intervals.len());
+    let mut component_start = 0;
+    while component_start < intervals.len() {
+        let mut component_end = component_start + 1;
+        let mut covered_end = intervals[component_start].end;
+        while component_end < intervals.len() && intervals[component_end].start < covered_end {
+            covered_end = covered_end.max(intervals[component_end].end);
+            component_end += 1;
+        }
+
+        let component = &intervals[component_start..component_end];
+        if well_nested_scope_intervals(component) {
+            retained.extend_from_slice(component);
+        } else {
+            // 候选拒绝[SemanticBarrier:Resource]：`TBC a; TBC b; Close(a); use(b); Close(b)`
+            // 的交叉资源区间无法表示成嵌套 Lua block；强行合并会把 a 延寿到 use(b) 之后，
+            // 强行嵌套则会在 a 之前关闭 b。屏障只覆盖这个重叠连通分量；后续不相交
+            // 的资源区间仍可独立物化。
+        }
+        component_start = component_end;
+    }
+    retained
+}
+
 fn rebuild_slice(
     stmts: &[HirStmt],
     start: usize,
@@ -864,5 +882,25 @@ mod tests {
         collect_pending_tbc_boundary_labels_in_block(&block, &mut boundaries);
 
         assert_eq!(boundaries, BTreeSet::from([HirLabelId(1), HirLabelId(2)]));
+    }
+
+    #[test]
+    fn crossing_resource_component_does_not_reject_disjoint_scope() {
+        let interval = |start, end, reg_index| ScopeInterval {
+            start,
+            end,
+            reg_index,
+            covering_close_indices: Vec::new(),
+        };
+        let disjoint = interval(8, 11, 4);
+
+        assert_eq!(
+            retain_well_nested_interval_components(vec![
+                interval(0, 5, 2),
+                interval(2, 7, 3),
+                disjoint.clone(),
+            ]),
+            vec![disjoint]
+        );
     }
 }

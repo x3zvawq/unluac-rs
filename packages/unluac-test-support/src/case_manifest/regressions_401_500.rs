@@ -173,4 +173,8 @@ LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_434_call_root_effectful_rhs.lua",
         &[LuaCaseDialect::Lua54],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_435_cleanup_empty_physical_root.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
 ];

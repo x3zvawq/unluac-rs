@@ -27,7 +27,7 @@ use crate::structure::{
     LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, SideEffectSummary,
     SsaValue, StructurePlan,
 };
-use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg, UpvalueOperand};
+use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// temp promotion 使用的词法槽位身份。
@@ -458,7 +458,7 @@ impl ProtoPromotionFacts {
         self.loop_carrier_temps.contains(&temp)
     }
 
-    /// 该 temp 的 direct copy home 在已证前向 CFG 的每条路径一直活跃到 scope end。
+    /// 该 temp 的潜在对象 home 在已证前向 CFG 的每条路径一直活跃到 scope end。
     ///
     /// 这份事实只服务于“源码读取已经结束、物理栈槽仍作为 GC root”的负向保护；若
     /// 后续 binding 合并使 home provenance 失效，就不能再消费原始证明。
@@ -466,7 +466,7 @@ impl ProtoPromotionFacts {
         !self.temp_home_was_invalidated(temp) && self.scope_end_copy_root_temps.contains(&temp)
     }
 
-    /// 返回结束该 direct copy root transaction 每条路径的精确 GC-inert overwrite。
+    /// 返回结束该 physical root transaction 各路径的精确 GC-inert overwrite。
     pub(super) fn copy_root_overwrites(&self, temp: TempId) -> Option<&[CopyRootOverwrite]> {
         if self.temp_home_was_invalidated(temp) {
             return None;
@@ -1308,18 +1308,21 @@ fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTr
     temps
 }
 
-/// 从 low-IR 正证一个 direct `GETUPVAL`/跨槽 `MOVE` copy 的物理槽在后续所有潜在
-/// 用户代码/GC 观察点都仍位于 VM active stack top 以下，并沿同一 basic block、线性
-/// single-entry fast path，或 predecessor-closed 的严格前向 CFG DAG 活到每条路径的
-/// Return/TailCall 或精确的 direct nil/boolean/integer/number overwrite。
+/// 从 low-IR 正证一个可能承载 GC root 的 canonical fixed def 在后续所有潜在用户代码 /
+/// GC 观察点都仍位于 VM active stack top 以下，并沿同一 basic block、线性 single-entry
+/// fast path，或 predecessor-closed 的严格前向 CFG DAG 活到每条路径的 Return/TailCall、
+/// 精确 direct nil/boolean/integer/number overwrite，或无观察 suffix 的其它 overwrite。
 ///
+/// low classifier 只排除已知必为 GC-inert 的 primitive/numeric def；HIR consumer 再用
+/// `HirExprSafety::result_is_gc_inert` 复核恢复后的 producer 值，并要求 producer 单写、无读。
 /// HIR 会丢失 block 结束时的隐式 stack-top 收缩；只看“后缀没有同槽写”会把已经到期
 /// 的高槽误提升成函数级 local。这里保留 raw 指令层的最小充分事实；分支 successor 与
 /// join 用 entry-driven must-state 合流，只有 producer 支配的前向闭合子图才能发布
 /// all-successor 终点。overwrite 的 raw DefId/TempId 与值类会一同发布，HIR consumer
-/// 必须重新定位唯一赋值 owner 并原子重放；回边、外部 join 入口、collectable/effectful
-/// overwrite 与无法计算活动栈下界的事件仍拒绝。TBC 与专用调用协议只消费各自的固定
-/// 输入 root prefix；`Close` 本身不覆盖槽位，因此可以继续到原始终点。
+/// 必须重新定位唯一赋值 owner 并原子重放；非 scalar overwrite 只有在其后到 caller
+/// scope end 全路径无 allocation/metamethod/table/env/call/Close 观察时才算安全终点。
+/// 回边、外部 join 入口与无法计算活动栈下界的事件仍拒绝。TBC 与专用调用协议只消费
+/// 各自的固定输入 root prefix；`Close` 本身不覆盖槽位，因此可以继续到原始终点。
 #[derive(Default)]
 struct CopyRootFacts {
     scope_end: BTreeSet<TempId>,
@@ -1409,19 +1412,14 @@ fn collect_copy_root_facts(
 ) -> CopyRootFacts {
     let mut facts = CopyRootFacts::default();
     for def in &dataflow.defs {
-        let is_direct_copy = match proto.instrs.get(def.instr.index()) {
-            Some(LowInstr::GetUpvalue(get_upvalue)) => {
-                get_upvalue.dst == def.reg && matches!(get_upvalue.src, UpvalueOperand::Upvalue(_))
-            }
-            Some(LowInstr::Move(move_)) => move_.dst == def.reg && move_.src != move_.dst,
-            _ => false,
-        };
-        if !is_direct_copy {
+        let Some(instr) = proto.instrs.get(def.instr.index()) else {
             continue;
-        }
+        };
 
         let direct = TempId(def.id.index());
-        if fixed_temps.get(def.id.index()) != Some(&direct) {
+        if fixed_temps.get(def.id.index()) != Some(&direct)
+            || !low_instr_def_may_hold_gc_root(instr, def.reg)
+        {
             continue;
         }
         if let Some(root_end) = copy_root_end(proto, cfg, dataflow, fixed_temps, def.instr, def.reg)
@@ -1437,6 +1435,38 @@ fn collect_copy_root_facts(
         }
     }
     facts
+}
+
+fn low_instr_def_may_hold_gc_root(instr: &LowInstr, reg: Reg) -> bool {
+    match instr {
+        LowInstr::LoadNil(load_nil)
+            if load_nil.dst.start.index() <= reg.index()
+                && reg.index() < load_nil.dst.start.index().saturating_add(load_nil.dst.len) =>
+        {
+            false
+        }
+        LowInstr::LoadBool(load_bool) if load_bool.dst == reg => false,
+        LowInstr::LoadInteger(load_integer) if load_integer.dst == reg => false,
+        LowInstr::LoadNumber(load_number) if load_number.dst == reg => false,
+        LowInstr::UnaryOp(unary)
+            if unary.dst == reg && matches!(unary.op, crate::transformer::UnaryOpKind::Not) =>
+        {
+            false
+        }
+        LowInstr::TypeGuard(guard)
+            if guard.subject == reg
+                && matches!(
+                    guard.kind,
+                    crate::transformer::TypeGuardKind::Integer
+                        | crate::transformer::TypeGuardKind::Number
+                ) =>
+        {
+            false
+        }
+        LowInstr::NumericForInit(init) if init.index == reg || init.binding == reg => false,
+        LowInstr::NumericForLoop(loop_) if loop_.index == reg || loop_.binding == reg => false,
+        _ => true,
+    }
 }
 
 fn copy_root_end(
@@ -1473,12 +1503,11 @@ fn copy_root_end(
         let effect = dataflow.instr_effects.get(index)?;
 
         // 当前值若被覆盖，同一 root transaction 要么在精确 direct GC-inert 写处终止，
-        // 要么因新值可能建立独立生命周期而失去证明。
+        // 要么该 overwrite 到 caller scope end 之间没有任何 GC/用户观察点。
         if effect.must_define(home) {
             return observed
-                .then(|| direct_scalar_overwrite(proto, dataflow, fixed_temps, index, home))
-                .flatten()
-                .map(CopyRootEnd::overwrite);
+                .then(|| root_end_at_overwrite(proto, cfg, dataflow, fixed_temps, index, home))
+                .flatten();
         }
 
         match copy_root_instr_progress(
@@ -1626,7 +1655,7 @@ fn copy_root_cfg_end(
         },
         source,
         observed,
-        |index, home| direct_scalar_overwrite(proto, dataflow, fixed_temps, index, home),
+        |index, home| root_end_at_overwrite(proto, cfg, dataflow, fixed_temps, index, home),
     )
 }
 
@@ -1643,7 +1672,7 @@ fn copy_root_cfg_end_with(
     inputs: CopyRootCfgInputs<'_>,
     source: BlockRef,
     observed: bool,
-    mut overwrite_at: impl FnMut(usize, Reg) -> Option<CopyRootOverwrite>,
+    mut end_at: impl FnMut(usize, Reg) -> Option<CopyRootEnd>,
 ) -> Option<CopyRootEnd> {
     let region = copy_root_forward_cfg_region(
         inputs.instrs,
@@ -1673,7 +1702,7 @@ fn copy_root_cfg_end_with(
     let mut ends = CopyRootEnd::default();
     while let Some(block) = pending.pop_front() {
         let observed = incoming.get(&block).copied()?;
-        match scan_copy_root_cfg_block(inputs, block, observed, &mut overwrite_at)? {
+        match scan_copy_root_cfg_block(inputs, block, observed, &mut end_at)? {
             CopyRootCfgBlockEnd::End(block_ends) => {
                 ends.scope_end |= block_ends.scope_end;
                 ends.overwrites.extend(block_ends.overwrites);
@@ -1768,7 +1797,7 @@ fn scan_copy_root_cfg_block(
     inputs: CopyRootCfgInputs<'_>,
     block: BlockRef,
     mut observed: bool,
-    overwrite_at: &mut impl FnMut(usize, Reg) -> Option<CopyRootOverwrite>,
+    end_at: &mut impl FnMut(usize, Reg) -> Option<CopyRootEnd>,
 ) -> Option<CopyRootCfgBlockEnd> {
     let range = inputs.cfg.blocks.get(block.index())?.instrs;
     if range.is_empty() {
@@ -1778,10 +1807,8 @@ fn scan_copy_root_cfg_block(
         let instr = inputs.instrs.get(index)?;
         let effect = inputs.instr_effects.get(index)?;
         if effect.must_define(inputs.home) {
-            let overwrite = observed
-                .then(|| overwrite_at(index, inputs.home))
-                .flatten()?;
-            return Some(CopyRootCfgBlockEnd::End(CopyRootEnd::overwrite(overwrite)));
+            let end = observed.then(|| end_at(index, inputs.home)).flatten()?;
+            return Some(CopyRootCfgBlockEnd::End(end));
         }
         match copy_root_instr_progress(
             instr,
@@ -1839,6 +1866,86 @@ fn copy_root_forward_block_successor(cfg: &Cfg, block: BlockRef) -> Option<Block
         return None;
     }
     Some(successor)
+}
+
+fn root_end_at_overwrite(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+    index: usize,
+    home: Reg,
+) -> Option<CopyRootEnd> {
+    if let Some(overwrite) = direct_scalar_overwrite(proto, dataflow, fixed_temps, index, home) {
+        return Some(CopyRootEnd::overwrite(overwrite));
+    }
+    overwrite_suffix_is_unobservable_until_scope_end(proto, cfg, dataflow, index)
+        .then(CopyRootEnd::scope_end)
+}
+
+/// Marking the old value as a source local may keep it alive past a non-scalar raw overwrite.
+/// That extension is safe only when every forward path reaches Return/TailCall without an
+/// intervening allocation, metamethod, table/environment access, call, or Close hook.
+fn overwrite_suffix_is_unobservable_until_scope_end(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    overwrite: usize,
+) -> bool {
+    let Some(start_block) = cfg.instr_to_block.get(overwrite).copied() else {
+        return false;
+    };
+    let mut pending = VecDeque::from([(start_block, overwrite.saturating_add(1))]);
+    let mut visited = BTreeSet::new();
+    while let Some((block, begin)) = pending.pop_front() {
+        if !visited.insert(block) {
+            return false;
+        }
+        let Some(range) = cfg.blocks.get(block.index()).map(|block| block.instrs) else {
+            return false;
+        };
+        let mut reached_terminator = false;
+        for index in begin.max(range.start.index())..range.end() {
+            let Some(instr) = proto.instrs.get(index) else {
+                return false;
+            };
+            if matches!(instr, LowInstr::Return(_) | LowInstr::TailCall(_)) {
+                reached_terminator = true;
+                break;
+            }
+            if matches!(instr, LowInstr::Close(_))
+                || low_instr_may_observe_gc_roots(&dataflow.effect_summaries, index)
+            {
+                return false;
+            }
+            if instr.is_control_terminator() {
+                if range.last() != Some(InstrRef(index)) {
+                    return false;
+                }
+                let Some(successors) = copy_root_forward_cfg_successors(cfg, block) else {
+                    return false;
+                };
+                pending.extend(successors.into_iter().filter_map(|successor| {
+                    cfg.blocks
+                        .get(successor.index())
+                        .map(|block| (successor, block.instrs.start.index()))
+                }));
+                reached_terminator = true;
+                break;
+            }
+        }
+        if !reached_terminator {
+            let Some(successors) = copy_root_forward_cfg_successors(cfg, block) else {
+                return false;
+            };
+            pending.extend(successors.into_iter().filter_map(|successor| {
+                cfg.blocks
+                    .get(successor.index())
+                    .map(|block| (successor, block.instrs.start.index()))
+            }));
+        }
+    }
+    true
 }
 
 fn direct_scalar_overwrite(
@@ -2467,14 +2574,14 @@ mod tests {
         effects[4].fixed_must_defs.insert(Reg(1));
         let summaries = vec![SideEffectSummary::default(); instrs.len()];
         let overwrite = |index, _home| match index {
-            2 => Some(CopyRootOverwrite {
+            2 => Some(CopyRootEnd::overwrite(CopyRootOverwrite {
                 temp: TempId(2),
                 value: CopyRootScalarValue::Boolean(false),
-            }),
-            4 => Some(CopyRootOverwrite {
+            })),
+            4 => Some(CopyRootEnd::overwrite(CopyRootOverwrite {
                 temp: TempId(4),
                 value: CopyRootScalarValue::Integer(0),
-            }),
+            })),
             _ => None,
         };
 
@@ -2511,8 +2618,30 @@ mod tests {
                 |index, home| (index == 2).then(|| overwrite(index, home)).flatten(),
             )
             .is_none(),
-            "a collectable/effectful overwrite on either path must reject the whole transaction"
+            "an overwrite without a scalar or unobservable scope-end proof must reject the transaction"
         );
+    }
+
+    #[test]
+    fn copy_root_producer_classifier_excludes_primitives_but_accepts_call_results() {
+        let home = Reg(1);
+        assert!(!low_instr_def_may_hold_gc_root(
+            &LowInstr::LoadInteger(LoadIntegerInstr {
+                dst: home,
+                value: 1,
+            }),
+            home,
+        ));
+        assert!(low_instr_def_may_hold_gc_root(
+            &LowInstr::Call(CallInstr {
+                callee: Reg(0),
+                args: ValuePack::Fixed(RegRange::new(Reg(1), 0)),
+                results: ResultPack::Fixed(RegRange::new(home, 1)),
+                kind: CallKind::Normal,
+                method_name: None,
+            }),
+            home,
+        ));
     }
 
     #[test]

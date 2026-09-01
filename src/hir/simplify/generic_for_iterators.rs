@@ -21,8 +21,11 @@ use crate::hir::common::{
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use super::mention::collect_temp_use_counts;
-use super::visit::{HirVisitor, visit_expr};
+use super::mention::{
+    ReferenceCapturedBindings, collect_temp_use_counts, stmts_reference_captured_bindings,
+    stmts_value_captured_bindings,
+};
+use super::visit::{HirVisitor, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn fold_generic_for_iterators_in_proto(
@@ -31,6 +34,10 @@ pub(super) fn fold_generic_for_iterators_in_proto(
     dialect: DecompileDialect,
 ) -> bool {
     let use_counts = collect_temp_use_counts(proto);
+    let reference_capture_homes = iterator_reference_capture_homes(&proto.body, facts);
+    let tbc_protected_homes = iterator_tbc_protected_homes(&proto.body, facts);
+    let physical_root_homes = iterator_physical_root_homes(proto, facts);
+    let physical_root_temps = proto.physical_root_temps.clone();
     let debug_temps = proto
         .temp_debug_locals
         .iter()
@@ -40,6 +47,10 @@ pub(super) fn fold_generic_for_iterators_in_proto(
         proto,
         &mut GenericForIteratorPass {
             use_counts,
+            reference_capture_homes,
+            tbc_protected_homes,
+            physical_root_homes,
+            physical_root_temps,
             debug_temps,
             facts,
             dialect,
@@ -49,6 +60,10 @@ pub(super) fn fold_generic_for_iterators_in_proto(
 
 struct GenericForIteratorPass<'a> {
     use_counts: BTreeMap<TempId, usize>,
+    reference_capture_homes: BTreeSet<HomeSlotKey>,
+    tbc_protected_homes: BTreeSet<HomeSlotKey>,
+    physical_root_homes: BTreeSet<HomeSlotKey>,
+    physical_root_temps: BTreeSet<TempId>,
     debug_temps: Vec<bool>,
     facts: &'a ProtoPromotionFacts,
     dialect: DecompileDialect,
@@ -120,6 +135,7 @@ fn fold_adjacent_nil_iterators(
         {
             return false;
         }
+        let value_capture_homes = iterator_value_capture_homes(&stmts[1..], context.facts);
         let Some(iterator_start) =
             generic_for
                 .iterator
@@ -138,7 +154,11 @@ fn fold_adjacent_nil_iterators(
                                     HirLValue::Temp(expected),
                                     HirExpr::Nil
                                 ) if actual == expected
-                                    && iterator_target_can_be_deleted(*expected, context)
+                                    && iterator_target_can_be_deleted(
+                                        *expected,
+                                        &value_capture_homes,
+                                        context,
+                                    )
                             )
                         })
                 })
@@ -174,17 +194,28 @@ fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<
         }
         let assignments = &stmts[..assignment_count];
         if let Some(HirStmt::GenericFor(generic_for)) = stmts.get(assignment_count) {
-            return assignments_match_iterator(assignments, generic_for, context).then_some(
-                FoldPlan {
-                    assignment_count,
-                    gap_count: 0,
-                },
-            );
+            let value_capture_homes =
+                iterator_value_capture_homes(&stmts[assignment_count..], context.facts);
+            return assignments_match_iterator(
+                assignments,
+                generic_for,
+                &value_capture_homes,
+                context,
+            )
+            .then_some(FoldPlan {
+                assignment_count,
+                gap_count: 0,
+            });
         }
         if let (Some(gap @ HirStmt::Assign(_)), Some(HirStmt::GenericFor(generic_for))) =
             (stmts.get(assignment_count), stmts.get(assignment_count + 1))
-            && assignments_match_iterator(assignments, generic_for, context)
         {
+            let value_capture_homes =
+                iterator_value_capture_homes(&stmts[assignment_count..], context.facts);
+            if !assignments_match_iterator(assignments, generic_for, &value_capture_homes, context)
+            {
+                continue;
+            }
             return iterator_pack_can_cross_assignment(assignments, gap, context).then_some(
                 FoldPlan {
                     assignment_count,
@@ -231,8 +262,9 @@ fn iterator_pack_can_cross_assignment(
             return false;
         }
         Err(LocationFactError::Opaque) => {
-            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化，本 pass
-            // 不把它延迟进 loop head。
+            // 候选拒绝[LayerBoundary]：Decision 由 decision/eliminate owner 原位物化；
+            // owner 会 invalidates TempChain/BlockStructure，二者都是本 pass 的
+            // scheduler dependency，因此物化后候选会被真实重审。
             // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
             // 不把它埋入普通 iterator 表达式。
             return false;
@@ -265,8 +297,9 @@ fn iterator_pack_can_cross_assignment(
                 return false;
             }
             Err(LocationFactError::Opaque) => {
-                // 候选拒绝[LayerBoundary]：Decision 交给 decision/eliminate owner 原位物化，
-                // 不能随 producer 延迟跨过 gap。
+                // 候选拒绝[LayerBoundary]：Decision 交给 decision/eliminate owner 原位物化；
+                // owner 会 invalidates 本 pass 依赖的 TempChain/BlockStructure，
+                // 物化后会重审该 producer/gap 候选。
                 // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
                 return false;
             }
@@ -280,13 +313,10 @@ fn iterator_pack_can_cross_assignment(
     match dependency {
         LocationDisjointness::Proven => true,
         LocationDisjointness::Overlap => {
-            // 候选拒绝[SemanticBarrier:ValueFlow]：gap 若读写 iterator source/target 的同一 binding 或 exact home，延迟 producer 会改变 gap 快照或 loop 输入。
-            false
-        }
-        LocationDisjointness::MissingHome => {
-            // 候选拒绝[SemanticBarrier:ValueFlow]：`t(slot1)=1; t1(slot1)=2; for ... in t`
-            // 原循环读取 gap 覆盖后的 2，折叠会把字面量 1 延迟到 gap 后并改成 1；任一
-            // 完整 home 集缺失时仍可能命中该同槽反例（home-free synthetic 已登记为空集）。
+            // 候选拒绝[SemanticBarrier:ValueFlow]：gap 若读写 iterator
+            // source/target 的同一 binding 或 possible home，延迟 producer 会改变
+            // gap 快照或 loop 输入。Unknown provenance 已展开为完整 physical-home
+            // universe，不再以缺事实状态永久拒绝。
             false
         }
     }
@@ -303,7 +333,6 @@ enum DirectBinding {
 struct BindingLocations {
     bindings: BTreeSet<DirectBinding>,
     physical_homes: BTreeSet<HomeSlotKey>,
-    has_unknown_physical_home: bool,
 }
 
 impl BindingLocations {
@@ -314,22 +343,115 @@ impl BindingLocations {
             DirectBinding::Local(local) => facts.possible_local_home_slots(local),
             DirectBinding::Temp(temp) => facts.possible_temp_home_slots(temp),
         };
-        if let Some(homes) = possible_homes {
-            self.physical_homes.extend(homes);
-        } else {
-            self.has_unknown_physical_home = true;
-        }
+        self.physical_homes
+            .extend(complete_binding_home_slots(possible_homes, facts));
     }
 
     fn extend(&mut self, other: Self) {
         self.bindings.extend(other.bindings);
         self.physical_homes.extend(other.physical_homes);
-        self.has_unknown_physical_home |= other.has_unknown_physical_home;
+    }
+}
+
+fn complete_binding_home_slots(
+    possible_homes: Option<BTreeSet<HomeSlotKey>>,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    possible_homes.unwrap_or_else(|| {
+        assert!(
+            !facts.physical_home_universe().is_empty(),
+            "unknown physical iterator binding requires a non-empty home universe"
+        );
+        facts.physical_home_universe().clone()
+    })
+}
+
+fn captured_binding_homes(
+    captured: &ReferenceCapturedBindings,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    let mut homes = BTreeSet::new();
+    for local in &captured.locals {
+        homes.extend(complete_binding_home_slots(
+            facts.possible_local_home_slots(*local),
+            facts,
+        ));
+    }
+    for param in &captured.params {
+        homes.extend(complete_binding_home_slots(
+            facts.possible_param_home_slots(*param),
+            facts,
+        ));
+    }
+    for temp in &captured.temps {
+        homes.extend(complete_binding_home_slots(
+            facts.possible_temp_home_slots(*temp),
+            facts,
+        ));
+    }
+    homes
+}
+
+fn iterator_reference_capture_homes(
+    block: &HirBlock,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    captured_binding_homes(&stmts_reference_captured_bindings(&block.stmts), facts)
+}
+
+fn iterator_tbc_protected_homes(
+    block: &HirBlock,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    let mut homes = BTreeSet::new();
+    struct TbcHomeCollector<'a> {
+        homes: &'a mut BTreeSet<HomeSlotKey>,
+        facts: &'a ProtoPromotionFacts,
     }
 
-    fn can_have_physical_home(&self) -> bool {
-        self.has_unknown_physical_home || !self.physical_homes.is_empty()
+    impl HirVisitor for TbcHomeCollector<'_> {
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            let HirStmt::ToBeClosed(tbc) = stmt else {
+                return;
+            };
+            let mut collector = BindingLocationCollector {
+                locations: BindingLocations::default(),
+                facts: self.facts,
+            };
+            visit_expr(&tbc.value, &mut collector);
+            self.homes.extend(collector.locations.physical_homes);
+        }
     }
+
+    visit_stmts(
+        &block.stmts,
+        &mut TbcHomeCollector {
+            homes: &mut homes,
+            facts,
+        },
+    );
+    homes
+}
+
+fn iterator_value_capture_homes(
+    stmts_after_producer: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    captured_binding_homes(&stmts_value_captured_bindings(stmts_after_producer), facts)
+}
+
+fn iterator_physical_root_homes(
+    proto: &HirProto,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    let mut locations = BindingLocations::default();
+    for local in &proto.physical_root_locals {
+        locations.insert(DirectBinding::Local(*local), facts);
+    }
+    for temp in &proto.physical_root_temps {
+        locations.insert(DirectBinding::Temp(*temp), facts);
+    }
+    locations.physical_homes
 }
 
 #[derive(Clone, Copy)]
@@ -401,7 +523,6 @@ fn stable_value_locations(
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum LocationDisjointness {
     Proven,
-    MissingHome,
     Overlap,
 }
 
@@ -409,7 +530,6 @@ impl LocationDisjointness {
     fn and(self, other: Self) -> Self {
         match (self, other) {
             (Self::Overlap, _) | (_, Self::Overlap) => Self::Overlap,
-            (Self::MissingHome, _) | (_, Self::MissingHome) => Self::MissingHome,
             (Self::Proven, Self::Proven) => Self::Proven,
         }
     }
@@ -424,11 +544,6 @@ fn locations_are_disjoint(
     {
         return LocationDisjointness::Overlap;
     }
-    if left.has_unknown_physical_home && right.can_have_physical_home()
-        || right.has_unknown_physical_home && left.can_have_physical_home()
-    {
-        return LocationDisjointness::MissingHome;
-    }
     LocationDisjointness::Proven
 }
 
@@ -436,7 +551,6 @@ fn locations_are_disjoint(
 enum ProducerFlowFailure {
     TargetOverlap,
     SourceOverlap,
-    MissingHome,
 }
 
 fn iterator_assignments_preserve_value_flow(
@@ -446,12 +560,12 @@ fn iterator_assignments_preserve_value_flow(
     let mut prior_targets = BindingLocations::default();
     for stmt in assignments {
         let HirStmt::Assign(assign) = stmt else {
-            return Err(ProducerFlowFailure::MissingHome);
+            unreachable!("generic-for producer flow only receives assignments");
         };
         let mut current_targets = BindingLocations::default();
         for target in &assign.targets {
             let Ok(target) = direct_target_locations(std::slice::from_ref(target), facts) else {
-                return Err(ProducerFlowFailure::MissingHome);
+                unreachable!("matched generic-for producer targets are direct temps");
             };
             let target_dependency = locations_are_disjoint(&prior_targets, &target)
                 .and(locations_are_disjoint(&current_targets, &target));
@@ -459,9 +573,6 @@ fn iterator_assignments_preserve_value_flow(
                 LocationDisjointness::Proven => {}
                 LocationDisjointness::Overlap => {
                     return Err(ProducerFlowFailure::TargetOverlap);
-                }
-                LocationDisjointness::MissingHome => {
-                    return Err(ProducerFlowFailure::MissingHome);
                 }
             }
             current_targets.extend(target);
@@ -471,9 +582,6 @@ fn iterator_assignments_preserve_value_flow(
         match locations_are_disjoint(&prior_targets, &sources) {
             LocationDisjointness::Proven => {}
             LocationDisjointness::Overlap => return Err(ProducerFlowFailure::SourceOverlap),
-            LocationDisjointness::MissingHome => {
-                return Err(ProducerFlowFailure::MissingHome);
-            }
         }
         prior_targets.extend(current_targets);
     }
@@ -519,6 +627,7 @@ impl HirVisitor for BindingLocationCollector<'_> {
 fn assignments_match_iterator(
     assignments: &[HirStmt],
     generic_for: &HirGenericFor,
+    value_capture_homes: &BTreeSet<HomeSlotKey>,
     context: &GenericForIteratorPass<'_>,
 ) -> bool {
     let mut expected = generic_for.iterator.fixed.iter();
@@ -568,7 +677,7 @@ fn assignments_match_iterator(
             if actual != expected {
                 return false;
             }
-            if !iterator_target_can_be_deleted(*actual, context) {
+            if !iterator_target_can_be_deleted(*actual, value_capture_homes, context) {
                 return false;
             }
         }
@@ -587,12 +696,6 @@ fn assignments_match_iterator(
             // 候选拒绝[SemanticBarrier:ValueFlow]：后续 producer RHS 读取先前 target 的同一 binding/exact home 时，删除中间写会让它改读覆盖前的旧值。
             false
         }
-        Err(ProducerFlowFailure::MissingHome) => {
-            // 候选拒绝[SemanticBarrier:ValueFlow]：`t0(slot1)=1; t1(slot1)=2; for ... in t0,t1`
-            // 原 iterator 两项都读最终覆盖值 2，折叠 pack 则保留 1,2；缺完整 home 集的
-            // producer 仍可能命中该同槽反例（home-free synthetic 已登记为空集）。
-            false
-        }
     }
 }
 
@@ -607,7 +710,11 @@ fn generic_for_protocol_width(dialect: DecompileDialect) -> usize {
     }
 }
 
-fn iterator_target_can_be_deleted(target: TempId, context: &GenericForIteratorPass<'_>) -> bool {
+fn iterator_target_can_be_deleted(
+    target: TempId,
+    value_capture_homes: &BTreeSet<HomeSlotKey>,
+    context: &GenericForIteratorPass<'_>,
+) -> bool {
     // 候选拒绝[SemanticBarrier:ValueFlow]：producer target 的额外读取仍需原 materialization；regress_343 的 loop 后 live-out 会变成未定义值。
     if context.use_counts.get(&target) != Some(&1) {
         return false;
@@ -621,7 +728,46 @@ fn iterator_target_can_be_deleted(target: TempId, context: &GenericForIteratorPa
     {
         return false;
     }
+    let target_homes = complete_binding_home_slots(
+        context.facts.possible_temp_home_slots(target),
+        context.facts,
+    );
+    if iterator_target_has_root_lifetime(
+        target,
+        &target_homes,
+        context.facts.is_scope_end_copy_root_temp(target),
+        context,
+    ) || !target_homes.is_disjoint(&context.tbc_protected_homes)
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：producer 的 raw home 若自身或经
+        // different-binding alias 承担 PhysicalRoot/scope-end copy root，折入 loop
+        // header 会提前结束原槽的强引用。iterator protocol 的逻辑读取不能替代该
+        // raw-home lifetime；TBC raw slot 还必须保留原值到 `__close`。其间
+        // GC/finalizer/cleanup 可观察差异。
+        return false;
+    }
+    if !target_homes.is_disjoint(&context.reference_capture_homes)
+        || !target_homes.is_disjoint(value_capture_homes)
+    {
+        // 候选拒绝[SemanticBarrier:Capture]：删除 producer 写会改变同
+        // possible home 的 ByReference capture 或 producer 后 ByValue snapshot 所观察
+        // 的值。直接 target capture 由 use-count
+        // 拦截，这里覆盖 different-binding home alias；producer 前已完成的 ByValue
+        // snapshot 不在后缀集合中，因此不会制造 proto-wide blanket 拒绝。
+        return false;
+    }
     true
+}
+
+fn iterator_target_has_root_lifetime(
+    target: TempId,
+    target_homes: &BTreeSet<HomeSlotKey>,
+    scope_end_copy_root: bool,
+    context: &GenericForIteratorPass<'_>,
+) -> bool {
+    scope_end_copy_root
+        || context.physical_root_temps.contains(&target)
+        || !target_homes.is_disjoint(&context.physical_root_homes)
 }
 
 fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut Vec<HirStmt>) {
@@ -673,7 +819,7 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::common::HirAssign;
+    use crate::hir::common::{HirAssign, HirCapture, HirCaptureMode, HirClosureExpr, HirProtoRef};
 
     fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
         HirStmt::Assign(Box::new(HirAssign {
@@ -690,12 +836,26 @@ mod tests {
         }))
     }
 
+    fn value_capture_closure(value: HirExpr) -> HirExpr {
+        HirExpr::Closure(Box::new(HirClosureExpr {
+            proto: HirProtoRef(1),
+            captures: vec![HirCapture {
+                mode: HirCaptureMode::ByValue,
+                value,
+            }],
+        }))
+    }
+
     fn context(
         facts: &ProtoPromotionFacts,
         used_temps: impl IntoIterator<Item = TempId>,
     ) -> GenericForIteratorPass<'_> {
         GenericForIteratorPass {
             use_counts: used_temps.into_iter().map(|temp| (temp, 1)).collect(),
+            reference_capture_homes: BTreeSet::new(),
+            tbc_protected_homes: BTreeSet::new(),
+            physical_root_homes: BTreeSet::new(),
+            physical_root_temps: BTreeSet::new(),
             debug_temps: Vec::new(),
             facts,
             dialect: DecompileDialect::Lua54,
@@ -707,6 +867,8 @@ mod tests {
         let iterator = TempId(0);
         let gap_local = LocalId(0);
         let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_merge(iterator, None);
         facts.record_home_free_local(gap_local);
         let stmts = vec![
             assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
@@ -735,6 +897,8 @@ mod tests {
         let iterator = TempId(0);
         let gap = TempId(1);
         let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_merge(iterator, None);
         facts.record_home_free_temp(gap);
         let stmts = vec![
             assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
@@ -815,9 +979,10 @@ mod tests {
     }
 
     #[test]
-    fn cross_gap_rejects_same_target_by_occurrence_without_home() {
+    fn cross_gap_rejects_same_home_free_target_by_occurrence() {
         let iterator = TempId(0);
-        let facts = ProtoPromotionFacts::default();
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(iterator);
         let stmts = vec![
             assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
             assign(HirLValue::Temp(iterator), HirExpr::Integer(2)),
@@ -867,6 +1032,8 @@ mod tests {
         let first = TempId(0);
         let second = TempId(1);
         let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(first, HomeSlotKey::new(0, 0));
+        facts.record_temp_home_merge(first, None);
         facts.record_home_free_temp(second);
         let stmts = vec![
             assign(HirLValue::Temp(first), HirExpr::Integer(1)),
@@ -932,6 +1099,125 @@ mod tests {
         ];
 
         assert!(fold_plan(&stmts, &context(&facts, [first, second])).is_none());
+    }
+
+    #[test]
+    fn adjacent_producer_rejects_different_binding_capture_home() {
+        let iterator = TempId(0);
+        let captured_alias = LocalId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        facts.record_local_home_slot(captured_alias, home);
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+        let mut context = context(&facts, [iterator]);
+        context.reference_capture_homes.insert(home);
+
+        assert!(fold_plan(&stmts, &context).is_none());
+    }
+
+    #[test]
+    fn by_value_snapshot_before_producer_does_not_block_fold() {
+        let iterator = TempId(0);
+        let closure_holder = TempId(1);
+        let captured_alias = LocalId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        facts.record_local_home_slot(captured_alias, home);
+        let mut block = HirBlock {
+            stmts: vec![
+                assign(
+                    HirLValue::Temp(closure_holder),
+                    value_capture_closure(HirExpr::LocalRef(captured_alias)),
+                ),
+                assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+                generic_for(vec![HirExpr::TempRef(iterator)]),
+            ],
+        };
+        let mut context = context(&facts, [iterator]);
+
+        assert!(context.rewrite_block(&mut block));
+        assert_eq!(block.stmts.len(), 2);
+        let HirStmt::GenericFor(folded) = &block.stmts[1] else {
+            panic!("producer should fold into generic-for after prior snapshot");
+        };
+        assert_eq!(folded.iterator.fixed, vec![HirExpr::Integer(1)]);
+    }
+
+    #[test]
+    fn by_value_snapshot_after_producer_rejects_same_home_alias() {
+        let iterator = TempId(0);
+        let closure_holder = TempId(1);
+        let captured_alias = LocalId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        facts.record_local_home_slot(captured_alias, home);
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::Integer(1)),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+            assign(
+                HirLValue::Temp(closure_holder),
+                value_capture_closure(HirExpr::LocalRef(captured_alias)),
+            ),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_none());
+    }
+
+    #[test]
+    fn adjacent_producer_rejects_different_binding_physical_root_home() {
+        let iterator = TempId(0);
+        let physical_root_alias = LocalId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        facts.record_local_home_slot(physical_root_alias, home);
+        let stmts = vec![
+            assign(HirLValue::Temp(iterator), HirExpr::String("rooted".into())),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+        let mut context = context(&facts, [iterator]);
+        context.physical_root_homes.insert(home);
+
+        assert!(fold_plan(&stmts, &context).is_none());
+    }
+
+    #[test]
+    fn adjacent_collectable_producer_without_root_is_folded() {
+        let iterator = TempId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        let stmts = vec![
+            assign(
+                HirLValue::Temp(iterator),
+                HirExpr::String("unrooted".into()),
+            ),
+            generic_for(vec![HirExpr::TempRef(iterator)]),
+        ];
+
+        assert!(fold_plan(&stmts, &context(&facts, [iterator])).is_some());
+    }
+
+    #[test]
+    fn scope_end_copy_root_rejects_target_deletion() {
+        let iterator = TempId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(iterator, home);
+        let context = context(&facts, [iterator]);
+
+        assert!(iterator_target_has_root_lifetime(
+            iterator,
+            &BTreeSet::from([home]),
+            true,
+            &context,
+        ));
     }
 
     #[test]

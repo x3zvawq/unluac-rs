@@ -863,13 +863,15 @@ fn expr_may_reference_home(
 
     impl HirVisitor for Collector<'_> {
         fn visit_expr(&mut self, expr: &HirExpr) {
-            let home = match expr {
-                HirExpr::LocalRef(local) => self.facts.trusted_local_home_slot(*local),
-                HirExpr::ParamRef(param) => self.facts.trusted_param_home_slot(*param),
-                HirExpr::TempRef(temp) => self.facts.trusted_temp_home_slot(*temp),
+            let homes = match expr {
+                HirExpr::LocalRef(local) => self.facts.possible_local_home_slots(*local),
+                HirExpr::ParamRef(param) => self.facts.possible_param_home_slots(*param),
+                HirExpr::TempRef(temp) => self.facts.possible_temp_home_slots(*temp),
                 _ => return,
             };
-            self.may_reference |= home.is_none_or(|home| home == self.candidate_home);
+            self.may_reference |= homes
+                .as_ref()
+                .is_none_or(|homes| homes.contains(&self.candidate_home));
         }
     }
 
@@ -967,6 +969,14 @@ fn debug_identity_bindings(proto: &HirProto) -> ReferenceCapturedBindings {
             .zip(&proto.local_debug_hints)
             .filter_map(|(local, hint)| hint.is_some().then_some(local)),
     );
+    bindings.locals.extend(
+        proto
+            .locals
+            .iter()
+            .copied()
+            .zip(&proto.local_debug_scopes)
+            .filter_map(|(local, scope)| scope.is_some().then_some(local)),
+    );
     bindings.params.extend(
         proto
             .params
@@ -983,6 +993,14 @@ fn debug_identity_bindings(proto: &HirProto) -> ReferenceCapturedBindings {
             .zip(&proto.temp_debug_locals)
             .filter_map(|(temp, hint)| hint.is_some().then_some(temp)),
     );
+    bindings.temps.extend(
+        proto
+            .temps
+            .iter()
+            .copied()
+            .zip(&proto.temp_debug_scopes)
+            .filter_map(|(temp, scope)| scope.is_some().then_some(temp)),
+    );
     bindings
 }
 
@@ -991,18 +1009,22 @@ fn bindings_share_home(
     candidate: HomeSlotKey,
     facts: &ProtoPromotionFacts,
 ) -> bool {
-    bindings
-        .locals
-        .iter()
-        .any(|binding| facts.trusted_local_home_slot(*binding) == Some(candidate))
-        || bindings
-            .params
-            .iter()
-            .any(|binding| facts.trusted_param_home_slot(*binding) == Some(candidate))
-        || bindings
-            .temps
-            .iter()
-            .any(|binding| facts.trusted_temp_home_slot(*binding) == Some(candidate))
+    bindings.locals.iter().any(|binding| {
+        facts
+            .possible_local_home_slots(*binding)
+            .as_ref()
+            .is_none_or(|homes| homes.contains(&candidate))
+    }) || bindings.params.iter().any(|binding| {
+        facts
+            .possible_param_home_slots(*binding)
+            .as_ref()
+            .is_none_or(|homes| homes.contains(&candidate))
+    }) || bindings.temps.iter().any(|binding| {
+        facts
+            .possible_temp_home_slots(*binding)
+            .as_ref()
+            .is_none_or(|homes| homes.contains(&candidate))
+    })
 }
 
 #[cfg(test)]
@@ -1029,6 +1051,42 @@ mod tests {
         HirStmt::Goto(Box::new(HirGoto { target }))
     }
 
+    fn empty_proto() -> HirProto {
+        HirProto {
+            id: crate::hir::HirProtoRef(0),
+            source: None,
+            line_range: crate::parser::ProtoLineRange {
+                defined_start: 0,
+                defined_end: 0,
+            },
+            signature: crate::parser::ProtoSignature {
+                num_params: 0,
+                is_vararg: false,
+                has_vararg_param_reg: false,
+                named_vararg_table: false,
+                legacy_arg_slot: false,
+            },
+            params: Vec::new(),
+            param_debug_hints: Vec::new(),
+            locals: Vec::new(),
+            local_debug_hints: Vec::new(),
+            local_debug_scopes: Vec::new(),
+            debug_scopes: Vec::new(),
+            physical_root_temps: BTreeSet::new(),
+            physical_root_locals: BTreeSet::new(),
+            upvalues: Vec::new(),
+            mutable_upvalues: BTreeSet::new(),
+            upvalue_debug_hints: Vec::new(),
+            temps: Vec::new(),
+            temp_debug_locals: Vec::new(),
+            temp_debug_scopes: Vec::new(),
+            body: HirBlock::default(),
+            children: Vec::new(),
+            failure: None,
+            detached_children: Vec::new(),
+        }
+    }
+
     fn analyze(then_block: HirBlock) -> PrunePlan {
         let facts = ProtoPromotionFacts::default();
         let mut analyzer = EntryNilAnalyzer {
@@ -1049,6 +1107,51 @@ mod tests {
             )
             .unwrap();
         analyzer.plan
+    }
+
+    #[test]
+    fn debug_identity_uses_complete_possible_home_aliases() {
+        let debug_local = LocalId(1);
+        let first = HomeSlotKey::new(1, 0);
+        let candidate = HomeSlotKey::new(2, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(debug_local, first);
+        facts.record_local_home_merge(debug_local, Some(BTreeSet::from([candidate])));
+        let mut debug = ReferenceCapturedBindings::default();
+        debug.locals.insert(debug_local);
+
+        assert_eq!(facts.trusted_local_home_slot(debug_local), None);
+        assert!(bindings_share_home(&debug, candidate, &facts));
+    }
+
+    #[test]
+    fn debug_scope_without_a_name_remains_a_source_identity() {
+        let local = LocalId(0);
+        let temp = crate::hir::TempId(0);
+        let mut proto = empty_proto();
+        proto.locals = vec![local];
+        proto.local_debug_hints = vec![None];
+        proto.local_debug_scopes = vec![Some(1)];
+        proto.temps = vec![temp];
+        proto.temp_debug_locals = vec![None];
+        proto.temp_debug_scopes = vec![Some(2)];
+
+        let identities = debug_identity_bindings(&proto);
+        assert!(identities.locals.contains(&local));
+        assert!(identities.temps.contains(&temp));
+    }
+
+    #[test]
+    fn home_free_capture_value_cannot_alias_the_entry_home() {
+        let local = LocalId(1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_local(local);
+
+        assert!(!expr_may_reference_home(
+            &HirExpr::LocalRef(local),
+            HomeSlotKey::new(0, 0),
+            &facts,
+        ));
     }
 
     #[test]

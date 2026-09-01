@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstLocalBinding,
-    AstLocalOrigin, AstModule, AstStmt,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstFunctionName, AstLocalAttr,
+    AstLocalBinding, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
 };
 use super::binding_flow::{binding_mentions_in_expr, binding_mentions_in_stmt};
 use super::control_flow::BlockGotoIndex;
@@ -20,11 +20,19 @@ use walk::{BlockKind, ScopedAstRewritePass};
 
 const SCOPE_LOCAL_TARGET: usize = 64;
 
-pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    walk::rewrite_module_scoped(module, &0, &mut LocalScopeLimitPass)
+pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
+    walk::rewrite_module_scoped(
+        module,
+        &0,
+        &mut LocalScopeLimitPass {
+            has_global_declarations: context.target.caps.global_decl,
+        },
+    )
 }
 
-struct LocalScopeLimitPass;
+struct LocalScopeLimitPass {
+    has_global_declarations: bool,
+}
 
 impl ScopedAstRewritePass for LocalScopeLimitPass {
     type Scope = usize;
@@ -43,7 +51,12 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         _kind: BlockKind,
         outer_locals: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        enter_block_with_trailing_condition(block, None, *outer_locals)
+        enter_block_with_trailing_condition(
+            block,
+            None,
+            *outer_locals,
+            self.has_global_declarations,
+        )
     }
 
     fn enter_repeat_body(
@@ -52,7 +65,12 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         condition: &AstExpr,
         outer_locals: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        enter_block_with_trailing_condition(block, Some(condition), *outer_locals)
+        enter_block_with_trailing_condition(
+            block,
+            Some(condition),
+            *outer_locals,
+            self.has_global_declarations,
+        )
     }
 
     fn scope_for_stmt_children(
@@ -81,11 +99,13 @@ fn enter_block_with_trailing_condition(
     block: &mut AstBlock,
     trailing_condition: Option<&AstExpr>,
     outer_locals: usize,
+    has_global_declarations: bool,
 ) -> (bool, usize) {
     let changed = scope_locals(
         block,
         crate::SOURCE_LOCAL_LIMIT.saturating_sub(outer_locals),
         trailing_condition,
+        has_global_declarations,
     );
     // 当前 block 的声明不能在入口一次性加入：它们只应通过 scope_after_stmt
     // 按源码位置影响后续 sibling 及其子 block。
@@ -96,6 +116,7 @@ fn scope_locals(
     block: &mut AstBlock,
     available_locals: usize,
     trailing_condition: Option<&AstExpr>,
+    has_global_declarations: bool,
 ) -> bool {
     let direct_local_count = block.stmts.iter().map(direct_local_count).sum::<usize>();
     if available_locals == 0 {
@@ -149,7 +170,13 @@ fn scope_locals(
     }
     let scope_target =
         SCOPE_LOCAL_TARGET.min(available_locals.saturating_sub(persistent_locals).max(1));
-    let ranges = scope_ranges(&block.stmts, &last_mentions, &short_lived, scope_target);
+    let ranges = scope_ranges(
+        &block.stmts,
+        &last_mentions,
+        &short_lived,
+        scope_target,
+        has_global_declarations,
+    );
     if ranges.is_empty() {
         // 所有形成过的 range 已在 planner 内按具体 density、scope 或 lifetime 原因拒绝；
         // 空计划不是新的候选拒绝点。
@@ -271,6 +298,7 @@ fn scope_ranges(
     last_mentions: &BTreeMap<AstBindingRef, usize>,
     short_lived: &[bool],
     scope_target: usize,
+    has_global_declarations: bool,
 ) -> Vec<(usize, usize)> {
     let goto_index = BlockGotoIndex::new(stmts);
     let mut ranges = Vec::new();
@@ -295,7 +323,7 @@ fn scope_ranges(
             .expect("scopeable declaration must contain a binding");
         let mut scoped_locals = 0usize;
         let mut safe_end = None;
-        while index < stmts.len() && !is_scope_barrier(&stmts[index]) {
+        while index < stmts.len() && !is_scope_barrier(&stmts[index], has_global_declarations) {
             if let Some(bindings) = scopeable_bindings(&stmts[index]) {
                 if !short_lived[index] {
                     // 候选拒绝[PolicyBoundary]：当前 pass 只生成不超过 64-local 的连续
@@ -352,7 +380,25 @@ fn scope_ranges(
     ranges
 }
 
-fn is_scope_barrier(stmt: &AstStmt) -> bool {
+fn is_scope_barrier(stmt: &AstStmt, has_global_declarations: bool) -> bool {
+    let opens_global_scope = has_global_declarations
+        && (matches!(stmt, AstStmt::GlobalDecl(_))
+            || matches!(
+                stmt,
+                AstStmt::FunctionDecl(function)
+                    if matches!(
+                        &function.target,
+                        AstFunctionName::Plain(path)
+                            if path.fields.is_empty()
+                                && matches!(path.root, AstNameRef::Global(_))
+                    )
+            ));
+    if opens_global_scope {
+        // 候选拒绝[SemanticBarrier:Scope]：Lua 5.5 的 `global` / `global function`
+        // 声明从当前位置作用到原 block 后缀；随 local range 包进新 `do` 会让后缀
+        // global use 失去声明。没有 global 声明语法的目标仍可移动普通函数赋值糖。
+        return true;
+    }
     // 属性/debug/root 声明的具体拒绝理由由 scopeable_bindings 在同一候选点分类。
     direct_local_count(stmt) != 0 && scopeable_bindings(stmt).is_none()
 }
@@ -361,9 +407,11 @@ fn is_scope_barrier(stmt: &AstStmt) -> bool {
 mod tests {
     use super::*;
     use crate::ast::common::{
-        AstGenericFor, AstGoto, AstLabel, AstLabelId, AstLocalDecl, AstReturn,
+        AstAssign, AstFunctionDecl, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
+        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstLValue, AstLabel,
+        AstLabelId, AstLocalDecl, AstNamePath, AstNameRef, AstReturn,
     };
-    use crate::hir::LocalId;
+    use crate::hir::{HirProtoRef, LocalId};
 
     fn recovered_local(index: usize) -> AstStmt {
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -404,6 +452,39 @@ mod tests {
         }))
     }
 
+    fn global_decl(name: &str) -> AstStmt {
+        AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
+            bindings: vec![AstGlobalBinding {
+                target: AstGlobalBindingTarget::Name(AstGlobalName {
+                    text: name.to_owned(),
+                }),
+                attr: AstGlobalAttr::None,
+            }],
+            values: Vec::new(),
+        }))
+    }
+
+    fn plain_global_function(name: &str) -> AstStmt {
+        AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
+            target: AstFunctionName::Plain(AstNamePath {
+                root: AstNameRef::Global(AstGlobalName {
+                    text: name.to_owned(),
+                }),
+                fields: Vec::new(),
+            }),
+            func: AstFunctionExpr {
+                function: HirProtoRef(1),
+                params: Vec::new(),
+                is_vararg: false,
+                named_vararg: None,
+                body: AstBlock::default(),
+                captured_bindings: Default::default(),
+                captured_params: Default::default(),
+                capture_write_names: Default::default(),
+            },
+        }))
+    }
+
     #[test]
     fn scopes_preceding_locals_before_generic_for_binder_peak() {
         let mut block = AstBlock {
@@ -422,7 +503,12 @@ mod tests {
                 .collect(),
         };
 
-        assert!(scope_locals(&mut block, crate::SOURCE_LOCAL_LIMIT, None));
+        assert!(scope_locals(
+            &mut block,
+            crate::SOURCE_LOCAL_LIMIT,
+            None,
+            false,
+        ));
         assert!(matches!(block.stmts.first(), Some(AstStmt::DoBlock(_))));
     }
 
@@ -435,6 +521,7 @@ mod tests {
                 &last_binding_mentions(&internal),
                 &[true, false, false, false],
                 SCOPE_LOCAL_TARGET,
+                false,
             ),
             vec![(0, 4)]
         );
@@ -452,6 +539,7 @@ mod tests {
                 &last_binding_mentions(&outgoing),
                 &[true, false, false, false, false],
                 SCOPE_LOCAL_TARGET,
+                false,
             ),
             vec![(0, 3)]
         );
@@ -463,8 +551,43 @@ mod tests {
                 &last_binding_mentions(&incoming),
                 &[false, true, false, false],
                 SCOPE_LOCAL_TARGET,
+                false,
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn scope_range_does_not_shorten_a_global_declaration_scope() {
+        let stmts = vec![
+            recovered_local(0),
+            global_decl("exported"),
+            return_binding(0),
+            AstStmt::Assign(Box::new(AstAssign {
+                targets: vec![AstLValue::Name(AstNameRef::Global(AstGlobalName {
+                    text: "exported".to_owned(),
+                }))],
+                values: vec![AstExpr::Integer(1)],
+            })),
+        ];
+
+        assert!(
+            scope_ranges(
+                &stmts,
+                &last_binding_mentions(&stmts),
+                &[true, false, false, false],
+                SCOPE_LOCAL_TARGET,
+                true,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_global_function_syntax_opens_a_function_declaration_barrier() {
+        let function = plain_global_function("install");
+
+        assert!(is_scope_barrier(&function, true));
+        assert!(!is_scope_barrier(&function, false));
     }
 }

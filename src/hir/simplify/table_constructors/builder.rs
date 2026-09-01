@@ -264,9 +264,14 @@ impl ConstructorBuilder {
         if start_index == self.next_array_index {
             return true;
         }
-        if start_index == 0 || start_index > self.next_array_index {
-            // 候选拒绝[SemanticBarrier:TableShape]：SETLIST 起点跳过尚未生成的隐式数组槽，
-            // 不能用 constructor array 语法表示而不改变后续隐式下标。
+        if start_index == 0 {
+            // 候选拒绝[SemanticBarrier:TableShape]：raw SETLIST 起点 0 写键 0；把它
+            // 吸收到 constructor array 会改写成从键 1 开始。
+            return false;
+        }
+        if start_index > self.next_array_index {
+            // 当前调用方只在 overlap（start < next）时请求降级；保留这个边界检查，
+            // 但它不是一个可执行的 constructor rewrite 候选。
             return false;
         }
 
@@ -417,17 +422,40 @@ fn can_stage_pending_integer_record(
     record_value: &HirExpr,
     policy: RecordPromotionPolicy,
 ) -> bool {
+    let is_future_array_slot = match policy {
+        RecordPromotionPolicy::Normal => value > current_next_index,
+        RecordPromotionPolicy::PreserveSetListPrefix { start_index } => {
+            value >= i64::from(start_index)
+        }
+    };
+    if !is_future_array_slot {
+        return false;
+    }
+
     if !can_reorder_integer_record_value(record_value) {
         // 候选拒绝[SemanticBarrier:EvalOrder]：暂存 future integer record 会把 value 求值
         // 延后到较小整数键之后；反例见 regress_212_table_constructor_field_order 与
         // lua54_01_close#12。
         return false;
     }
+    true
+}
 
-    match policy {
-        RecordPromotionPolicy::Normal => value > current_next_index,
-        RecordPromotionPolicy::PreserveSetListPrefix { start_index } => {
-            value >= i64::from(start_index)
-        }
+#[cfg(test)]
+mod tests {
+    use super::ConstructorBuilder;
+    use crate::hir::common::{HirExpr, HirTableConstructor, HirTableField};
+
+    #[test]
+    fn zero_based_set_list_cannot_become_constructor_array_fields() {
+        let original = HirTableConstructor {
+            fields: vec![HirTableField::Array(HirExpr::Integer(7))],
+            trailing_multivalue: None,
+        };
+        let mut builder = ConstructorBuilder::from_constructor(original.clone());
+        let mut restored = Vec::new();
+
+        assert!(!builder.demote_array_suffix(0, &mut restored));
+        assert_eq!(builder.into_constructor(), original);
     }
 }

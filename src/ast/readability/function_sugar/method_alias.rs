@@ -9,17 +9,17 @@
 //!
 //! 普通 `obj.method(obj)` 不足以证明 method call：字段查询可能通过 `__index` 改写
 //! `obj`，而冒号调用只会求值一次 receiver。没有独立 receiver 快照的形状必须保留。
-//! alias 原本只求值一次，因此也不能搬入 while/repeat，或越过外层调用、左侧操作数、
-//! 复杂赋值目标等可观察前缀。
+//! field alias lookup 与事件型 receiver initializer 原本只求值一次，因此不能搬入
+//! while/repeat；所有 alias 也不能越过外层调用、左侧操作数、复杂赋值目标等可观察前缀。
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
 use super::super::binding_ref::name_matches_binding;
-use super::super::expr_analysis::expr_requires_ordered_snapshot;
+use super::super::expr_analysis::{expr_requires_ordered_snapshot, is_eventless_primitive_literal};
 use super::super::visit::{self, AstVisitor};
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFunctionName, AstGlobalDecl,
-    AstIf, AstLValue, AstLocalAttr, AstLocalOrigin, AstMethodCallExpr, AstNameRef, AstReturn,
-    AstStmt,
+    AstIf, AstLValue, AstLocalAttr, AstLocalBinding, AstLocalOrigin, AstMethodCallExpr, AstNameRef,
+    AstReturn, AstStmt,
 };
 
 pub(super) fn try_recover_method_alias_stmt(
@@ -70,12 +70,27 @@ fn try_recover_with_receiver_alias(
     let [receiver_alias, field_alias, sink, ..] = stmts else {
         return None;
     };
-    let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
-    let (field_binding, field_access) = single_field_alias_decl(field_alias)?;
+    let (receiver_local, receiver_expr) = single_local_alias_decl(receiver_alias)?;
+    let receiver_binding = receiver_local.id;
+    let (field_local, field_access) = single_field_alias_decl(field_alias)?;
+    let field_binding = field_local.id;
     let AstExpr::Var(receiver_name) = &field_access.base else {
         return None;
     };
     if !name_matches_binding(receiver_name, receiver_binding) {
+        return None;
+    }
+    let rewritten = recover_method_call_sink(
+        sink,
+        field_binding,
+        field_access.field.clone(),
+        receiver_expr.clone(),
+        mutable_snapshots,
+        |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, receiver_binding)),
+    )?;
+    if !method_alias_local_can_be_removed(receiver_local)
+        || !method_alias_local_can_be_removed(field_local)
+    {
         return None;
     }
     if binding_is_written_in_suffix(stmts, 1, receiver_binding)
@@ -87,24 +102,14 @@ fn try_recover_with_receiver_alias(
     if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2
         || use_index.count_uses_in_suffix(stmt_base + 2, field_binding) != 1
     {
-        // 候选拒绝[SemanticBarrier:EvalCount]：receiver 必须只供字段 lookup 与首参各一次，field alias 也只能作为唯一 callee；否则删除 local 会复制/丢失 use。
+        // 候选拒绝[SemanticBarrier:Scope]：receiver 必须只供字段 lookup 与首参各一次，field alias 也只能作为唯一 callee；额外 direct/captured use 会在删除声明后失去 local owner。
         return None;
     }
     if receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots) {
         return None;
     }
 
-    Some((
-        recover_method_call_sink(
-            sink,
-            field_binding,
-            field_access.field.clone(),
-            receiver_expr.clone(),
-            mutable_snapshots,
-            |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, receiver_binding)),
-        )?,
-        3,
-    ))
+    Some((rewritten, 3))
 }
 
 fn try_recover_receiver_alias_direct_method_call(
@@ -116,23 +121,15 @@ fn try_recover_receiver_alias_direct_method_call(
     let [receiver_alias, sink, ..] = stmts else {
         return None;
     };
-    let (receiver_binding, receiver_expr) = single_local_alias_decl(receiver_alias)?;
-    if binding_is_written_in_suffix(stmts, 1, receiver_binding) {
-        // 候选拒绝[SemanticBarrier:Scope]：删除 receiver local 会把 sink/后缀的 direct write 绑定到外层名称。
-        return None;
-    }
-    if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2 {
-        // 候选拒绝[SemanticBarrier:EvalCount]：direct 形状仍要求 receiver 恰好用于 lookup 和首参，额外 use 不能随 alias 删除。
-        return None;
-    }
-    if receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots) {
-        return None;
-    }
-    let rewritten = rewrite_single_expr_sink_stmt(sink, |value| {
+    let (receiver_local, receiver_expr) = single_local_alias_decl(receiver_alias)?;
+    let receiver_binding = receiver_local.id;
+    let receiver_is_repeatable =
+        direct_receiver_initializer_is_repeatable(receiver_expr, mutable_snapshots);
+    let rewritten = rewrite_single_expr_sink_stmt(sink, receiver_is_repeatable, |value| {
         rewrite_method_call_expr_in_order(
             value,
             mutable_snapshots,
-            expr_prefix_is_stable(receiver_expr, mutable_snapshots),
+            receiver_is_repeatable,
             |expr| {
                 recover_direct_method_call_with_receiver_alias_expr(
                     expr,
@@ -142,31 +139,66 @@ fn try_recover_receiver_alias_direct_method_call(
             },
         )
     })?;
+    if !method_alias_local_can_be_removed(receiver_local) {
+        return None;
+    }
+    if binding_is_written_in_suffix(stmts, 1, receiver_binding) {
+        // 候选拒绝[SemanticBarrier:Scope]：删除 receiver local 会把 sink/后缀的 direct write 绑定到外层名称。
+        return None;
+    }
+    if use_index.count_uses_in_suffix(stmt_base + 1, receiver_binding) != 2 {
+        // 候选拒绝[SemanticBarrier:Scope]：direct 形状仍要求 receiver 恰好用于 lookup 和首参，额外 direct/captured use 不能随 alias declaration 删除。
+        return None;
+    }
+    if receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots) {
+        return None;
+    }
     Some((rewritten, 2))
 }
 
-fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> {
+fn single_local_alias_decl(stmt: &AstStmt) -> Option<(&AstLocalBinding, &AstExpr)> {
     let AstStmt::LocalDecl(local_decl) = stmt else {
         return None;
     };
-    if local_decl.bindings.len() != 1
-        || local_decl.values.len() != 1
-        || local_decl.bindings[0].attr != AstLocalAttr::None
-        || local_decl.bindings[0].origin != AstLocalOrigin::Recovered
-    {
+    if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
         return None;
     }
-    Some((local_decl.bindings[0].id, &local_decl.values[0]))
+    Some((&local_decl.bindings[0], &local_decl.values[0]))
 }
 
 fn single_field_alias_decl(
     stmt: &AstStmt,
-) -> Option<(AstBindingRef, &crate::ast::common::AstFieldAccess)> {
+) -> Option<(&AstLocalBinding, &crate::ast::common::AstFieldAccess)> {
     let (binding, value) = single_local_alias_decl(stmt)?;
     let AstExpr::FieldAccess(access) = value else {
         return None;
     };
     Some((binding, access))
+}
+
+fn method_alias_local_can_be_removed(binding: &AstLocalBinding) -> bool {
+    match binding.attr {
+        AstLocalAttr::None => {}
+        AstLocalAttr::Close => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：删除 `<close>` receiver/field alias 会同时删除原 block 出口的关闭动作。
+            return false;
+        }
+        AstLocalAttr::Const => {
+            // 候选拒绝[PolicyBoundary]：`<const>` 的显式源码声明身份由原 local owner 保留。
+            return false;
+        }
+    }
+    match binding.origin {
+        AstLocalOrigin::Recovered => true,
+        AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
+            // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted alias 会改变调用期间 debug.getlocal 可见的名字与区间，反例见 regress_351。
+            false
+        }
+        AstLocalOrigin::PhysicalRoot => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：删除 PhysicalRoot alias 会让 receiver 在原 block 结束前提前离开 GC root，弱表/`__gc` 可观察，见 regress_353/regress_406。
+            false
+        }
+    }
 }
 
 fn binding_is_written_in_suffix(stmts: &[AstStmt], start: usize, binding: AstBindingRef) -> bool {
@@ -257,7 +289,7 @@ fn recover_method_call_sink(
     mutable_snapshots: &MutableSnapshotNames,
     receiver_matches: impl Fn(&AstExpr) -> bool,
 ) -> Option<AstStmt> {
-    rewrite_single_expr_sink_stmt(stmt, |value| {
+    rewrite_single_expr_sink_stmt(stmt, false, |value| {
         recover_method_call_expr(
             value,
             callee_binding,
@@ -329,6 +361,9 @@ fn rewrite_method_call_expr_in_order<F>(
 where
     F: Fn(&AstExpr) -> Option<AstExpr> + Copy,
 {
+    if !expr_contains_method_call_rewrite(expr, try_rewrite_here) {
+        return None;
+    }
     if let Some(rewritten) = try_rewrite_here(expr) {
         return Some(rewritten);
     }
@@ -345,13 +380,13 @@ where
             Some(rewritten)
         }
         AstExpr::Binary(binary) => {
-            if let Some(lhs) = rewrite_method_call_expr_in_order(
-                &binary.lhs,
-                mutable_snapshots,
-                can_cross_table_allocation,
-                try_rewrite_here,
-            ) {
-                binary.lhs = lhs;
+            if expr_contains_method_call_rewrite(&binary.lhs, try_rewrite_here) {
+                binary.lhs = rewrite_method_call_expr_in_order(
+                    &binary.lhs,
+                    mutable_snapshots,
+                    can_cross_table_allocation,
+                    try_rewrite_here,
+                )?;
                 return Some(rewritten);
             }
             if !expr_prefix_is_stable(&binary.lhs, mutable_snapshots) {
@@ -367,7 +402,10 @@ where
             Some(rewritten)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            // 候选拒绝[SemanticBarrier:ControlFlow]：只搜索必求值的 lhs；若搬入短路 rhs，原先无条件执行的 alias initializer 会变成条件执行。
+            if !expr_contains_method_call_rewrite(&logical.lhs, try_rewrite_here) {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：目标位于短路 rhs 时，原先无条件执行的 alias initializer 搬入后会变成条件执行。
+                return None;
+            }
             logical.lhs = rewrite_method_call_expr_in_order(
                 &logical.lhs,
                 mutable_snapshots,
@@ -377,13 +415,13 @@ where
             Some(rewritten)
         }
         AstExpr::Call(call) => {
-            if let Some(callee) = rewrite_method_call_expr_in_order(
-                &call.callee,
-                mutable_snapshots,
-                can_cross_table_allocation,
-                try_rewrite_here,
-            ) {
-                call.callee = callee;
+            if expr_contains_method_call_rewrite(&call.callee, try_rewrite_here) {
+                call.callee = rewrite_method_call_expr_in_order(
+                    &call.callee,
+                    mutable_snapshots,
+                    can_cross_table_allocation,
+                    try_rewrite_here,
+                )?;
                 return Some(rewritten);
             }
             if !expr_prefix_is_stable(&call.callee, mutable_snapshots) {
@@ -391,13 +429,13 @@ where
                 return None;
             }
             for arg in &mut call.args {
-                if let Some(value) = rewrite_method_call_expr_in_order(
-                    arg,
-                    mutable_snapshots,
-                    can_cross_table_allocation,
-                    try_rewrite_here,
-                ) {
-                    *arg = value;
+                if expr_contains_method_call_rewrite(arg, try_rewrite_here) {
+                    *arg = rewrite_method_call_expr_in_order(
+                        arg,
+                        mutable_snapshots,
+                        can_cross_table_allocation,
+                        try_rewrite_here,
+                    )?;
                     return Some(rewritten);
                 }
                 if !expr_prefix_is_stable(arg, mutable_snapshots) {
@@ -408,7 +446,10 @@ where
             None
         }
         AstExpr::MethodCall(call) => {
-            // 候选拒绝[SemanticBarrier:EvalOrder]：只搜索 receiver；冒号调用的 method lookup 位于 args 之前，把 alias initializer 搬进 args 会跨越 lookup。
+            if !expr_contains_method_call_rewrite(&call.receiver, try_rewrite_here) {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：目标位于冒号调用 args 时，alias initializer 会越过 receiver 与 method lookup。
+                return None;
+            }
             call.receiver = rewrite_method_call_expr_in_order(
                 &call.receiver,
                 mutable_snapshots,
@@ -427,13 +468,13 @@ where
             Some(rewritten)
         }
         AstExpr::IndexAccess(access) => {
-            if let Some(base) = rewrite_method_call_expr_in_order(
-                &access.base,
-                mutable_snapshots,
-                can_cross_table_allocation,
-                try_rewrite_here,
-            ) {
-                access.base = base;
+            if expr_contains_method_call_rewrite(&access.base, try_rewrite_here) {
+                access.base = rewrite_method_call_expr_in_order(
+                    &access.base,
+                    mutable_snapshots,
+                    can_cross_table_allocation,
+                    try_rewrite_here,
+                )?;
                 return Some(rewritten);
             }
             if !expr_prefix_is_stable(&access.base, mutable_snapshots) {
@@ -478,44 +519,47 @@ where
             for field in &mut table.fields {
                 match field {
                     crate::ast::common::AstTableField::Array(value) => {
-                        if let Some(next) = rewrite_method_call_expr_in_order(
-                            value,
-                            mutable_snapshots,
-                            can_cross_table_allocation,
-                            try_rewrite_here,
-                        ) {
-                            *value = next;
+                        if expr_contains_method_call_rewrite(value, try_rewrite_here) {
+                            *value = rewrite_method_call_expr_in_order(
+                                value,
+                                mutable_snapshots,
+                                can_cross_table_allocation,
+                                try_rewrite_here,
+                            )?;
                             return Some(rewritten);
                         }
                         if !expr_prefix_is_stable(value, mutable_snapshots) {
+                            // 候选拒绝[SemanticBarrier:EvalOrder]：目标 method call 位于后续字段时，先行 array value 的调用/lookup/可变快照不能被 alias initializer 跨越。
                             return None;
                         }
                     }
                     crate::ast::common::AstTableField::Record(record) => {
                         if let crate::ast::common::AstTableKey::Expr(key) = &mut record.key {
-                            if let Some(next) = rewrite_method_call_expr_in_order(
-                                key,
-                                mutable_snapshots,
-                                can_cross_table_allocation,
-                                try_rewrite_here,
-                            ) {
-                                *key = next;
+                            if expr_contains_method_call_rewrite(key, try_rewrite_here) {
+                                *key = rewrite_method_call_expr_in_order(
+                                    key,
+                                    mutable_snapshots,
+                                    can_cross_table_allocation,
+                                    try_rewrite_here,
+                                )?;
                                 return Some(rewritten);
                             }
                             if !expr_prefix_is_stable(key, mutable_snapshots) {
+                                // 候选拒绝[SemanticBarrier:EvalOrder]：后续目标不能把 alias initializer 搬过先行 record key 的调用/lookup/可变快照。
                                 return None;
                             }
                         }
-                        if let Some(next) = rewrite_method_call_expr_in_order(
-                            &record.value,
-                            mutable_snapshots,
-                            can_cross_table_allocation,
-                            try_rewrite_here,
-                        ) {
-                            record.value = next;
+                        if expr_contains_method_call_rewrite(&record.value, try_rewrite_here) {
+                            record.value = rewrite_method_call_expr_in_order(
+                                &record.value,
+                                mutable_snapshots,
+                                can_cross_table_allocation,
+                                try_rewrite_here,
+                            )?;
                             return Some(rewritten);
                         }
                         if !expr_prefix_is_stable(&record.value, mutable_snapshots) {
+                            // 候选拒绝[SemanticBarrier:EvalOrder]：后续字段中的目标不能跨越当前 record value 的可观察求值。
                             return None;
                         }
                     }
@@ -526,8 +570,92 @@ where
     }
 }
 
+fn expr_contains_method_call_rewrite<F>(expr: &AstExpr, try_rewrite_here: F) -> bool
+where
+    F: Fn(&AstExpr) -> Option<AstExpr> + Copy,
+{
+    if try_rewrite_here(expr).is_some() {
+        return true;
+    }
+    match expr {
+        AstExpr::Unary(unary) => expr_contains_method_call_rewrite(&unary.expr, try_rewrite_here),
+        AstExpr::Binary(binary) => {
+            expr_contains_method_call_rewrite(&binary.lhs, try_rewrite_here)
+                || expr_contains_method_call_rewrite(&binary.rhs, try_rewrite_here)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            expr_contains_method_call_rewrite(&logical.lhs, try_rewrite_here)
+                || expr_contains_method_call_rewrite(&logical.rhs, try_rewrite_here)
+        }
+        AstExpr::Call(call) => {
+            expr_contains_method_call_rewrite(&call.callee, try_rewrite_here)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_contains_method_call_rewrite(arg, try_rewrite_here))
+        }
+        AstExpr::MethodCall(call) => {
+            expr_contains_method_call_rewrite(&call.receiver, try_rewrite_here)
+                || call
+                    .args
+                    .iter()
+                    .any(|arg| expr_contains_method_call_rewrite(arg, try_rewrite_here))
+        }
+        AstExpr::FieldAccess(access) => {
+            expr_contains_method_call_rewrite(&access.base, try_rewrite_here)
+        }
+        AstExpr::IndexAccess(access) => {
+            expr_contains_method_call_rewrite(&access.base, try_rewrite_here)
+                || expr_contains_method_call_rewrite(&access.index, try_rewrite_here)
+        }
+        AstExpr::SingleValue(inner) => expr_contains_method_call_rewrite(inner, try_rewrite_here),
+        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
+            crate::ast::common::AstTableField::Array(value) => {
+                expr_contains_method_call_rewrite(value, try_rewrite_here)
+            }
+            crate::ast::common::AstTableField::Record(record) => {
+                let key_contains = match &record.key {
+                    crate::ast::common::AstTableKey::Name(_) => false,
+                    crate::ast::common::AstTableKey::Expr(key) => {
+                        expr_contains_method_call_rewrite(key, try_rewrite_here)
+                    }
+                };
+                key_contains || expr_contains_method_call_rewrite(&record.value, try_rewrite_here)
+            }
+        }),
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::String(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Vector(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Var(_)
+        | AstExpr::VarArg
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
+}
+
 fn expr_prefix_is_stable(expr: &AstExpr, mutable_snapshots: &MutableSnapshotNames) -> bool {
     !expr_requires_ordered_snapshot(expr, mutable_snapshots)
+}
+
+fn direct_receiver_initializer_is_repeatable(
+    expr: &AstExpr,
+    mutable_snapshots: &MutableSnapshotNames,
+) -> bool {
+    match expr {
+        AstExpr::Var(
+            name @ (AstNameRef::Param(_) | AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_)),
+        ) => !mutable_snapshots.contains(name),
+        AstExpr::SingleValue(inner) => {
+            direct_receiver_initializer_is_repeatable(inner, mutable_snapshots)
+        }
+        _ => is_eventless_primitive_literal(expr),
+    }
 }
 
 fn recover_direct_method_call_with_receiver_alias_expr(
@@ -566,27 +694,29 @@ fn recover_direct_method_call_with_receiver_alias_expr(
 
 fn rewrite_single_expr_sink_stmt(
     stmt: &AstStmt,
+    loop_rewrite_is_stable: bool,
     mut rewrite_expr: impl FnMut(&AstExpr) -> Option<AstExpr>,
 ) -> Option<AstStmt> {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
-            let [value] = local_decl.values.as_slice() else {
-                return None;
-            };
+            let value = local_decl.values.first()?;
             let mut rewritten = (**local_decl).clone();
             rewritten.values[0] = rewrite_expr(value)?;
+            // 候选接受[EvalOrderProof/ValueArityProof]：首 RHS 前没有求值前缀；存在后续
+            // RHS 时该位置前后都截成单值，作为唯一尾项时都保留原 open pack。
             Some(AstStmt::LocalDecl(Box::new(rewritten)))
         }
         AstStmt::GlobalDecl(global_decl) => {
-            let [value] = global_decl.values.as_slice() else {
-                return None;
-            };
+            let value = global_decl.values.first()?;
             let mut rewritten: AstGlobalDecl = (**global_decl).clone();
             rewritten.values[0] = rewrite_expr(value)?;
+            // 候选接受[EvalOrderProof/ValueArityProof]：global 首 RHS 没有先行事件；
+            // 多 RHS 的标量边界与唯一尾项的 open pack 均由原位置保持。
             Some(AstStmt::GlobalDecl(Box::new(rewritten)))
         }
         AstStmt::Assign(assign) => {
             let value = assign.values.first()?;
+            let rewritten_value = rewrite_expr(value)?;
             if assign
                 .targets
                 .iter()
@@ -596,7 +726,7 @@ fn rewrite_single_expr_sink_stmt(
                 return None;
             }
             let mut rewritten = (**assign).clone();
-            rewritten.values[0] = rewrite_expr(value)?;
+            rewritten.values[0] = rewritten_value;
             // 候选接受[EvalOrderProof/ValueArityProof]：纯 Name targets 没有地址求值，
             // 首 RHS 前无运行时前缀；存在后续 RHS 时该位置前后都截成单值。
             Some(AstStmt::Assign(Box::new(rewritten)))
@@ -609,11 +739,16 @@ fn rewrite_single_expr_sink_stmt(
             // return value 时该位置前后都截成单值，作为唯一项时则都保留 open tail。
             Some(AstStmt::Return(Box::new(rewritten)))
         }
-        AstStmt::If(if_stmt) => Some(AstStmt::If(Box::new(AstIf {
-            cond: rewrite_expr(&if_stmt.cond)?,
-            then_block: if_stmt.then_block.clone(),
-            else_block: if_stmt.else_block.clone(),
-        }))),
+        AstStmt::If(if_stmt) => {
+            let rewritten = AstStmt::If(Box::new(AstIf {
+                cond: rewrite_expr(&if_stmt.cond)?,
+                then_block: if_stmt.then_block.clone(),
+                else_block: if_stmt.else_block.clone(),
+            }));
+            // 候选接受[EvalCountProof/ValueArityProof]：if condition 是一次性标量 owner，
+            // 且 condition 前没有运行时事件。
+            Some(rewritten)
+        }
         AstStmt::CallStmt(call_stmt) => {
             let call_expr = match &call_stmt.call {
                 AstCallKind::Call(call) => AstExpr::Call(call.clone()),
@@ -645,9 +780,35 @@ fn rewrite_single_expr_sink_stmt(
             // 只执行一次的事件；有后续项时前后均截为单值，作为唯一项时均保持 open pack。
             Some(AstStmt::GenericFor(Box::new(rewritten)))
         }
-        AstStmt::While(_)
-        | AstStmt::Repeat(_)
-        | AstStmt::DoBlock(_)
+        AstStmt::While(while_stmt) => {
+            let rewritten_cond = rewrite_expr(&while_stmt.cond)?;
+            if !loop_rewrite_is_stable {
+                // 候选拒绝[SemanticBarrier:EvalCount]：三语句 field-alias 会把一次 method
+                // lookup 变成逐轮 lookup；两语句 direct 形状的事件型 receiver initializer
+                // 也会从一次变逐轮，regress_251 的 make_loop_receiver 可观察该次数变化。
+                return None;
+            }
+            let mut rewritten = (**while_stmt).clone();
+            rewritten.cond = rewritten_cond;
+            // 候选接受[EvalCountProof]：仅 direct 形状可到达这里；method lookup 原本就
+            // 每轮执行，receiver 是无事件且未标记 mutable 的稳定快照，后续 write/use
+            // 与 root gate 还会在提交前复核。
+            Some(AstStmt::While(Box::new(rewritten)))
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            let rewritten_cond = rewrite_expr(&repeat_stmt.cond)?;
+            if !loop_rewrite_is_stable {
+                // 候选拒绝[SemanticBarrier:EvalCount]：field alias lookup 或事件型 receiver
+                // initializer 原本在 repeat 前执行一次，搬入 until 后会逐轮执行。
+                return None;
+            }
+            let mut rewritten = (**repeat_stmt).clone();
+            rewritten.cond = rewritten_cond;
+            // 候选接受[EvalCountProof]：direct lookup 原本逐轮执行，稳定 receiver 的重复
+            // 读取不改变值；write/use/root gate 会在提交前排除循环体改写与 capture。
+            Some(AstStmt::Repeat(Box::new(rewritten)))
+        }
+        AstStmt::DoBlock(_)
         | AstStmt::FunctionDecl(_)
         | AstStmt::LocalFunctionDecl(_)
         | AstStmt::Break
@@ -655,5 +816,55 @@ fn rewrite_single_expr_sink_stmt(
         | AstStmt::Goto(_)
         | AstStmt::Label(_)
         | AstStmt::Error(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::common::{AstBlock, AstFieldAccess, AstLocalDecl, AstWhile};
+    use crate::hir::{LocalId, ParamId};
+
+    #[test]
+    fn direct_method_alias_accepts_stable_while_receiver() {
+        let receiver = AstBindingRef::Local(LocalId(0));
+        let source = AstNameRef::Param(ParamId(0));
+        let stmts = vec![
+            AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                bindings: vec![AstLocalBinding {
+                    id: receiver,
+                    attr: AstLocalAttr::None,
+                    origin: AstLocalOrigin::Recovered,
+                }],
+                values: vec![AstExpr::Var(source.clone())],
+            })),
+            AstStmt::While(Box::new(AstWhile {
+                cond: AstExpr::Call(Box::new(AstCallExpr {
+                    callee: AstExpr::FieldAccess(Box::new(AstFieldAccess {
+                        base: AstExpr::Var(receiver.to_name_ref()),
+                        field: "ready".to_owned(),
+                    })),
+                    args: vec![AstExpr::Var(receiver.to_name_ref())],
+                    method_name: None,
+                })),
+                body: AstBlock::default(),
+            })),
+        ];
+        let use_index = BindingUseIndex::for_stmts(&stmts);
+
+        let (AstStmt::While(rewritten), consumed) =
+            try_recover_method_alias_stmt(&stmts, &use_index, 0, &MutableSnapshotNames::new())
+                .expect("stable direct receiver can be read once per loop condition")
+        else {
+            panic!("method alias should preserve the while owner")
+        };
+        assert_eq!(consumed, 2);
+        assert!(matches!(
+            rewritten.cond,
+            AstExpr::MethodCall(call)
+                if call.receiver == AstExpr::Var(source)
+                    && call.method == "ready"
+                    && call.args.is_empty()
+        ));
     }
 }

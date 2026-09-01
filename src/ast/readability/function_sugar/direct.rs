@@ -27,13 +27,14 @@ fn try_lower_local_function_decl(local_decl: &AstLocalDecl) -> Option<AstStmt> {
         return None;
     }
     let binding = &local_decl.bindings[0];
-    if binding.attr != AstLocalAttr::None {
-        return None;
-    }
-    let name = binding.id;
     let AstExpr::FunctionExpr(func) = &local_decl.values[0] else {
         return None;
     };
+    if binding.attr != AstLocalAttr::None {
+        // 候选拒绝[TargetConstraint]：Lua 的 `local function` 语法没有 `<const>`/`<close>` 属性槽，不能丢弃原声明属性。
+        return None;
+    }
+    let name = binding.id;
     Some(AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
         name,
         origin: binding.origin,
@@ -45,17 +46,22 @@ fn try_lower_global_function_decl(
     global_decl: &AstGlobalDecl,
     target: AstTargetDialect,
 ) -> Option<AstStmt> {
-    if !target.caps.global_decl || global_decl.bindings.len() != 1 || global_decl.values.len() != 1
-    {
+    if global_decl.bindings.len() != 1 || global_decl.values.len() != 1 {
+        return None;
+    }
+    let AstExpr::FunctionExpr(func) = &global_decl.values[0] else {
+        return None;
+    };
+    if !target.caps.global_decl {
+        // 候选拒绝[TargetConstraint]：当前目标方言没有 `global function` 声明语法。
         return None;
     }
     if global_decl.bindings[0].attr != crate::ast::common::AstGlobalAttr::None {
+        // 候选拒绝[TargetConstraint]：`global function` 语法不能表达原 global 声明属性。
         return None;
     }
     let AstGlobalBindingTarget::Name(name) = &global_decl.bindings[0].target else {
-        return None;
-    };
-    let AstExpr::FunctionExpr(func) = &global_decl.values[0] else {
+        // 候选拒绝[TargetConstraint]：通配 global 没有可用于函数声明的名字。
         return None;
     };
     Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
@@ -103,15 +109,22 @@ pub(super) fn function_decl_target_from_lvalue(
             ))
         }
         AstLValue::FieldAccess(access) => {
-            // 候选拒绝[SemanticBarrier:ParameterBinding]：无定义 provenance 时改成 method 会删除显式首参；同名 receiver 的可达反例见 regress_333。
-            let AstNamePath { root, mut fields } = name_path_from_expr(&access.base)?;
+            // 无 method-definition provenance 时只能生成 plain field function；冒号形式会删除
+            // 显式首参并改变 parameter binding，反例见 regress_333。
+            let Some(AstNamePath { root, mut fields }) = name_path_from_expr(&access.base) else {
+                // 候选拒绝[TargetConstraint]：Lua function 声明的 field target 必须是静态点号 name path。
+                return None;
+            };
             fields.push(access.field.clone());
             Some((
                 AstFunctionName::Plain(AstNamePath { root, fields }),
                 func.clone(),
             ))
         }
-        AstLValue::IndexAccess(_) => None,
+        AstLValue::IndexAccess(_) => {
+            // 候选拒绝[TargetConstraint]：Lua function 声明不能用动态索引作为 target。
+            None
+        }
     }
 }
 

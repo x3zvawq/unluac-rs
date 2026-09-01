@@ -14,8 +14,8 @@
 //! - 嵌套循环自己的 `continue` 保留原 owner，不会阻止外层 `repeat` 的尾部整理
 
 use super::super::common::{
-    AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLocalOrigin, AstLogicalExpr,
-    AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
+    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLocalOrigin,
+    AstLogicalExpr, AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 use super::control_flow::block_contains_label_or_goto;
@@ -101,13 +101,6 @@ fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
     if len < 2 {
         return false;
     }
-    if repeat_stmt.body.stmts[..len - 2]
-        .iter()
-        .any(|stmt| stmt_contains_single_pass_forbidden_nodes(stmt, 0))
-    {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：prefix 中较早的 `continue` 原本直接进入旧 latch；折叠后会额外求值尾部 G/B（regress_294）。
-        return false;
-    }
     let [AstStmt::If(continue_if), AstStmt::If(break_if)] = &repeat_stmt.body.stmts[len - 2..]
     else {
         return false;
@@ -117,6 +110,13 @@ fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
         || !matches!(continue_if.then_block.stmts.as_slice(), [AstStmt::Continue])
         || !matches!(break_if.then_block.stmts.as_slice(), [AstStmt::Break])
     {
+        return false;
+    }
+    if repeat_stmt.body.stmts[..len - 2]
+        .iter()
+        .any(|stmt| stmt_contains_current_loop_continue(stmt, 0))
+    {
+        // 候选拒绝[SemanticBarrier:ControlFlow]：prefix 中较早的 `continue` 原本直接进入旧 latch；折叠后会额外求值尾部 G/B（regress_294）。
         return false;
     }
 
@@ -136,6 +136,60 @@ fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
         rhs: latch,
     }));
     true
+}
+
+fn stmt_contains_current_loop_continue(stmt: &AstStmt, loop_depth: usize) -> bool {
+    match stmt {
+        AstStmt::If(if_stmt) => {
+            if_stmt
+                .then_block
+                .stmts
+                .iter()
+                .any(|stmt| stmt_contains_current_loop_continue(stmt, loop_depth))
+                || if_stmt.else_block.as_ref().is_some_and(|else_block| {
+                    else_block
+                        .stmts
+                        .iter()
+                        .any(|stmt| stmt_contains_current_loop_continue(stmt, loop_depth))
+                })
+        }
+        AstStmt::DoBlock(block) => block
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_current_loop_continue(stmt, loop_depth)),
+        AstStmt::While(while_stmt) => while_stmt
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_current_loop_continue(stmt, loop_depth + 1)),
+        AstStmt::Repeat(repeat_stmt) => repeat_stmt
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_current_loop_continue(stmt, loop_depth + 1)),
+        AstStmt::NumericFor(numeric_for) => numeric_for
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_current_loop_continue(stmt, loop_depth + 1)),
+        AstStmt::GenericFor(generic_for) => generic_for
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| stmt_contains_current_loop_continue(stmt, loop_depth + 1)),
+        AstStmt::Continue => loop_depth == 0,
+        AstStmt::LocalDecl(_)
+        | AstStmt::GlobalDecl(_)
+        | AstStmt::Assign(_)
+        | AstStmt::CallStmt(_)
+        | AstStmt::Return(_)
+        | AstStmt::Break
+        | AstStmt::Goto(_)
+        | AstStmt::Label(_)
+        | AstStmt::FunctionDecl(_)
+        | AstStmt::LocalFunctionDecl(_)
+        | AstStmt::Error(_) => false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -222,9 +276,7 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
 
         if let AstStmt::DoBlock(do_block) = stmt {
             let do_tail_is_nonempty = stmt_flow.falls_through && tail_is_nonempty;
-            if do_tail_is_nonempty && block_requires_scope_barrier(do_block) {
-                // 候选拒绝[SemanticBarrier:Scope]：把后缀移入可继续执行的 do 会扩大 local 可见期；
-                // 候选拒绝[SemanticBarrier:Lifetime]：`<close>` 或 closure root 会推迟离开显式作用域（regress_378）。
+            if do_tail_is_nonempty && block_prevents_tail_extension(do_block) {
                 return false;
             }
             if !single_pass_block_is_foldable(do_block, do_tail_is_nonempty) {
@@ -257,9 +309,7 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
         }
 
         if then_flow.falls_through {
-            if tail_is_nonempty && block_requires_scope_barrier(&if_stmt.then_block) {
-                // 候选拒绝[SemanticBarrier:Scope]：把后缀塞进含 local/global 的 arm 会延长声明可见期；
-                // 候选拒绝[SemanticBarrier:Lifetime]：`<close>` 或 closure root 会延后退出（regress_378）。
+            if tail_is_nonempty && block_prevents_tail_extension(&if_stmt.then_block) {
                 return false;
             }
             if !single_pass_block_is_foldable(&if_stmt.then_block, tail_is_nonempty) {
@@ -271,9 +321,7 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
 
         if let Some(else_block) = &if_stmt.else_block {
             let else_tail_is_nonempty = else_flow.falls_through && tail_is_nonempty;
-            if else_tail_is_nonempty && block_requires_scope_barrier(else_block) {
-                // 候选拒绝[SemanticBarrier:Scope]：把后缀塞进 else 的 local/global 作用域会扩大声明可见性；
-                // 候选拒绝[SemanticBarrier:Lifetime]：`<close>` 或 closure root 会延后退出（regress_378）。
+            if else_tail_is_nonempty && block_prevents_tail_extension(else_block) {
                 return false;
             }
             if !single_pass_block_is_foldable(else_block, else_tail_is_nonempty) {
@@ -429,12 +477,6 @@ fn merge_exact_nested_if(if_stmt: &mut AstIf) -> bool {
     if if_stmt.else_block.is_some() || inner.else_block.is_some() {
         return false;
     }
-    if block_contains_label_or_goto(&inner.then_block) {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：label/goto 可从外部进入将被删除的
-        // 内层 block；合成 `A and B` 会删除该合法入口。
-        return false;
-    }
-
     let Some(AstStmt::If(mut inner)) = if_stmt.then_block.stmts.pop() else {
         unreachable!("validated nested if must remain the only then statement");
     };
@@ -504,13 +546,13 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
 /// 收回前层已经证明为常量的 `if`，但不越过诊断、跳转或词法作用域边界。
 ///
 /// `literal-fold` 只会把无元方法的原始字面量条件变成 `Boolean`；因此选中的 arm
-/// 不再有条件求值事件，未选中的 arm 也不会执行。不过，label/goto 可能从 arm 外部
-/// 直接进入一个看似不可达的 arm，诊断节点也不能被静默丢弃；`global` 是方言级
-/// 的词法声明，搬出原 arm 会改变其可见范围；debug/物理根、
-/// local-function 与 capture 则携带不可消除的 binding identity。任一边界存在时，外壳
-/// 继续保留。含普通 recovered local 的选中 arm 用 `do ... end` 保持原 if block 的词法
-/// 边界，包括 `<close>` 的退出点和 captured local 的 root lifetime。`break`/`continue`
-/// 只跨过非循环的 `if` 外壳，最近 loop owner 不变。
+/// 不再有条件求值事件，未选中的 arm 也不会执行。不过，未选 arm 的 permissive
+/// label/goto 与 Error 都是项目要求保留的诊断证据；`global` 是方言级
+/// 的词法声明，debug/物理根、local-function 与 capture 则携带项目要求保留的 identity。
+/// 这些证据只在未选 arm 会被删除时阻止改写；位于选中 arm 时节点本身继续保留，
+/// 需要词法范围的语句用 `do ... end` 保持原 if block 的边界，包括 `<close>` 的退出点和
+/// captured local 的 root lifetime。`break`/`continue` 只跨过非循环的 `if` 外壳，最近
+/// loop owner 不变。
 fn fold_constant_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
     let AstStmt::If(mut if_stmt) = stmt else {
         return Err(stmt);
@@ -520,7 +562,7 @@ fn fold_constant_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
         _ => return Err(AstStmt::If(if_stmt)),
     };
 
-    if constant_if_has_protected_nodes(&if_stmt) {
+    if constant_if_unselected_arm_is_protected(&if_stmt, selected_then) {
         return Err(AstStmt::If(if_stmt));
     }
 
@@ -536,22 +578,27 @@ fn fold_constant_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
     }
 }
 
-fn constant_if_has_protected_nodes(if_stmt: &AstIf) -> bool {
-    let else_block = if_stmt.else_block.as_ref();
-    // 候选拒绝[SemanticBarrier:ControlFlow]：label/goto 可从条件壳外进入 arm，删除 Boolean if 会删除合法入口或改变目标。
-    block_contains_label_or_goto(&if_stmt.then_block)
-        || else_block.is_some_and(block_contains_label_or_goto)
+fn constant_if_unselected_arm_is_protected(if_stmt: &AstIf, selected_then: bool) -> bool {
+    let unselected = if selected_then {
+        if_stmt.else_block.as_ref()
+    } else {
+        Some(&if_stmt.then_block)
+    };
+    let Some(unselected) = unselected else {
+        return false;
+    };
+
+    // 候选拒绝[PolicyBoundary]：未选 arm 的 label/goto 是 permissive 控制诊断证据；
+    // 即使常量条件令它不可执行，项目也不在展示层静默删除。
+    block_contains_label_or_goto(unselected)
         // 候选拒绝[PolicyBoundary]：删除常量 arm 外壳会连同 best-effort Error 诊断一起
         // 消失；项目选择保留失败证据，即使该 arm 按运行语义不可达。
-        || block_contains_diagnostic(&if_stmt.then_block)
-        || else_block.is_some_and(block_contains_diagnostic)
+        || block_contains_diagnostic(unselected)
         // 候选拒绝[PolicyBoundary]：方言 global 声明作为源码级编译期证据保留；选中 arm
         // 可用 do 保持范围、未选 arm 也可删除，因此这不是运行语义不等价证明。
-        || block_contains_global_decl(&if_stmt.then_block)
-        || else_block.is_some_and(block_contains_global_decl)
+        || block_contains_global_decl(unselected)
         // 候选拒绝[PolicyBoundary]：debug/physical/local-function/capture 身份即使位于未选 arm 也按项目的源码证据保留策略记账。
-        || block_contains_identity_boundary(&if_stmt.then_block)
-        || else_block.is_some_and(block_contains_identity_boundary)
+        || block_contains_identity_boundary(unselected)
 }
 
 struct DiagnosticVisitor(bool);
@@ -665,8 +712,7 @@ fn terminal_guard_return_candidate(block: &AstBlock) -> Option<(usize, bool)> {
     let AstStmt::If(if_stmt) = block.stmts.get(if_index)? else {
         return None;
     };
-    // 候选拒绝[LayerBoundary]：带 else 的终止分支由同 pass 的 flatten_terminating_if owner
-    // 消费，terminal-guard 只处理单臂函数尾。
+    // terminal-guard 的候选本就是单臂函数尾；带 else 的 if 不属于该形状。
     if if_stmt.else_block.is_some() {
         return None;
     }
@@ -679,14 +725,12 @@ fn terminal_guard_return_candidate(block: &AstBlock) -> Option<(usize, bool)> {
     if matches!(if_stmt.then_block.stmts.as_slice(), [stmt] if is_empty_return_stmt(stmt)) {
         return None;
     }
-    // 候选拒绝[SemanticBarrier:ControlFlow]：label/goto 可从外部进入将被提升的 arm，
-    // 删除 if block 会改变入口与目标词法范围。
-    if block_contains_label_or_goto(&if_stmt.then_block) {
-        return None;
-    }
     if matches!(if_stmt.cond, AstExpr::Boolean(_)) {
         assert!(
-            constant_if_has_protected_nodes(if_stmt),
+            constant_if_unselected_arm_is_protected(
+                if_stmt,
+                matches!(if_stmt.cond, AstExpr::Boolean(true)),
+            ),
             "unprotected Boolean if must be consumed by the constant-if owner"
         );
         return None;
@@ -736,6 +780,150 @@ fn block_requires_scope_barrier(block: &AstBlock) -> bool {
     block.stmts.iter().any(stmt_requires_scope_barrier)
 }
 
+fn block_prevents_tail_extension(block: &AstBlock) -> bool {
+    if block_captures_direct_local(block) {
+        // 候选拒绝[SemanticBarrier:Capture]：continuation 原本在 captured local 的词法块
+        // 之外；下沉会延长该 cell 的开放期及 closure root，regress_378 的弱表/GC
+        // 观察可以区分两个释放点。
+        return true;
+    }
+
+    block.stmts.iter().any(|stmt| match stmt {
+        AstStmt::LocalDecl(local_decl) => {
+            local_decl.bindings.iter().any(|binding| {
+                if binding.attr == AstLocalAttr::Close {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：把 continuation 收进该 arm 会把
+                    // `<close>` 的关闭点从原 arm 末尾推迟到 continuation 之后（regress_378）。
+                    true
+                } else if binding.origin.is_physical_root() {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：把 continuation 收进该 arm 会延长
+                    // PhysicalRoot 的强引用期，弱表或 `__gc` 可以观察到差异（regress_378）。
+                    true
+                } else if binding.origin.is_debug_hinted() {
+                    // 候选拒绝[SemanticBarrier:DebugScope]：continuation 原本位于 debug local
+                    // 的词法范围外；下沉后 debug API 会在 continuation 中观察到该 binding
+                    // （regress_351）。
+                    true
+                } else {
+                    false
+                }
+            }) || {
+                // 候选拒绝[SemanticBarrier:Lifetime]：普通 recovered local 若接住可能可回收的值，
+                // continuation 中的弱表/`collectgarbage` 能观察到 arm 末尾与下沉后末尾之间的
+                // root 差异；只有 primitive value local 才能越过该边界（regress_378）。
+                local_decl.bindings.iter().enumerate().any(|(index, _)| {
+                    local_binding_initial_value(&local_decl.values, index)
+                        .is_some_and(|value| !expr_is_gc_inert_local_value(value))
+                })
+            }
+        }
+        AstStmt::LocalFunctionDecl(local_function) => {
+            if local_function.origin.is_physical_root() {
+                // 候选拒绝[SemanticBarrier:Lifetime]：local function 的 PhysicalRoot 原本在
+                // arm 末尾释放，下沉 continuation 会延长闭包强引用期。
+                true
+            } else if local_function.origin.is_debug_hinted() {
+                // 候选拒绝[SemanticBarrier:DebugScope]：下沉 continuation 会扩大 debug
+                // local-function binding 的可观察词法范围。
+                true
+            } else {
+                // 候选拒绝[SemanticBarrier:Lifetime]：local-function binding 本身持有闭包；
+                // 把 continuation 收进 arm 会延长闭包及其 capture 的强引用期
+                // （regress_378 用 `collectgarbage` 观察 captured object 的释放点）。
+                true
+            }
+        }
+        AstStmt::GlobalDecl(_) => {
+            // 候选拒绝[SemanticBarrier:Scope]：Lua 5.5 中 `global x` 的词法效力原本
+            // 在 arm 末尾结束；把后缀 `x = value` 收进 arm 会把未声明访问变成已声明访问
+            // （cleanup::keeps_repeat_tail_global_declaration_scope 使用同一边界）。
+            true
+        }
+        _ => false,
+    })
+}
+
+fn block_captures_direct_local(block: &AstBlock) -> bool {
+    let direct_bindings = block
+        .stmts
+        .iter()
+        .flat_map(|stmt| match stmt {
+            AstStmt::LocalDecl(local_decl) => local_decl
+                .bindings
+                .iter()
+                .map(|binding| binding.id)
+                .collect::<Vec<_>>(),
+            AstStmt::LocalFunctionDecl(local_function) => vec![local_function.name],
+            _ => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if direct_bindings.is_empty() {
+        return false;
+    }
+
+    struct DirectCaptureVisitor<'a> {
+        direct_bindings: &'a [AstBindingRef],
+        found: bool,
+    }
+
+    impl AstVisitor for DirectCaptureVisitor<'_> {
+        fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
+            self.found |= self
+                .direct_bindings
+                .iter()
+                .any(|binding| function.captured_bindings.contains(binding));
+            true
+        }
+    }
+
+    let mut visitor = DirectCaptureVisitor {
+        direct_bindings: &direct_bindings,
+        found: false,
+    };
+    visit::visit_block(block, &mut visitor);
+    visitor.found
+}
+
+fn local_binding_initial_value(values: &[AstExpr], index: usize) -> Option<&AstExpr> {
+    values.get(index).or_else(|| {
+        let tail = values.last()?;
+        (index >= values.len()
+            && matches!(
+                tail,
+                AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
+            ))
+        .then_some(tail)
+    })
+}
+
+fn expr_is_gc_inert_local_value(expr: &AstExpr) -> bool {
+    match expr {
+        AstExpr::Nil
+        | AstExpr::Boolean(_)
+        | AstExpr::Integer(_)
+        | AstExpr::Number(_)
+        | AstExpr::Int64(_)
+        | AstExpr::UInt64(_)
+        | AstExpr::Complex { .. }
+        | AstExpr::Vector(_) => true,
+        AstExpr::SingleValue(inner) => expr_is_gc_inert_local_value(inner),
+        AstExpr::String(_)
+        | AstExpr::Var(_)
+        | AstExpr::FieldAccess(_)
+        | AstExpr::IndexAccess(_)
+        | AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::Call(_)
+        | AstExpr::MethodCall(_)
+        | AstExpr::VarArg
+        | AstExpr::TableConstructor(_)
+        | AstExpr::FunctionExpr(_)
+        | AstExpr::Error(_) => false,
+    }
+}
+
 fn is_empty_return_stmt(stmt: &AstStmt) -> bool {
     matches!(stmt, AstStmt::Return(ret) if ret.values.is_empty())
 }
@@ -765,13 +953,15 @@ fn negate_guard_condition(expr: AstExpr) -> AstExpr {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::ast::common::{
         AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstGlobalAttr, AstGlobalBinding,
-        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLocalAttr, AstLocalBinding,
-        AstLocalDecl, AstLocalOrigin, AstRepeat, AstWhile,
+        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstLabel, AstLabelId,
+        AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstRepeat, AstWhile,
     };
-    use crate::hir::LocalId;
+    use crate::hir::{HirProtoRef, LocalId};
 
     fn global_expr(name: &str) -> AstExpr {
         AstExpr::Var(crate::ast::common::AstNameRef::Global(AstGlobalName {
@@ -779,11 +969,37 @@ mod tests {
         }))
     }
 
+    fn call_expr(name: &str) -> AstExpr {
+        AstExpr::Call(Box::new(AstCallExpr {
+            callee: global_expr(name),
+            args: Vec::new(),
+            method_name: None,
+        }))
+    }
+
     fn call_stmt(name: &str) -> AstStmt {
+        let AstExpr::Call(call) = call_expr(name) else {
+            unreachable!("call_expr must produce a call");
+        };
+        AstStmt::CallStmt(Box::new(AstCallStmt {
+            call: AstCallKind::Call(call),
+        }))
+    }
+
+    fn capturing_call_stmt(name: &str, binding: AstBindingRef) -> AstStmt {
         AstStmt::CallStmt(Box::new(AstCallStmt {
             call: AstCallKind::Call(Box::new(AstCallExpr {
                 callee: global_expr(name),
-                args: Vec::new(),
+                args: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                    function: HirProtoRef(1),
+                    params: Vec::new(),
+                    is_vararg: false,
+                    named_vararg: None,
+                    body: AstBlock::default(),
+                    captured_bindings: BTreeSet::from([binding]),
+                    captured_params: BTreeSet::new(),
+                    capture_write_names: BTreeSet::new(),
+                }))],
                 method_name: None,
             })),
         }))
@@ -799,6 +1015,24 @@ mod tests {
         }))
     }
 
+    fn single_pass_fallthrough_arm(arm_stmts: Vec<AstStmt>) -> AstStmt {
+        AstStmt::Repeat(Box::new(AstRepeat {
+            body: AstBlock {
+                stmts: vec![
+                    AstStmt::If(Box::new(AstIf {
+                        cond: global_expr("skip"),
+                        then_block: AstBlock {
+                            stmts: vec![AstStmt::Break],
+                        },
+                        else_block: Some(AstBlock { stmts: arm_stmts }),
+                    })),
+                    call_stmt("tail"),
+                ],
+            },
+            cond: AstExpr::Boolean(true),
+        }))
+    }
+
     fn recovered_local(id: usize) -> AstStmt {
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![AstLocalBinding {
@@ -808,6 +1042,34 @@ mod tests {
             }],
             values: vec![AstExpr::Integer(1)],
         }))
+    }
+
+    fn physical_local(id: usize) -> AstStmt {
+        let mut stmt = recovered_local(id);
+        let AstStmt::LocalDecl(local_decl) = &mut stmt else {
+            unreachable!("recovered_local must produce a local declaration");
+        };
+        local_decl.bindings[0].origin = AstLocalOrigin::PhysicalRoot;
+        stmt
+    }
+
+    fn close_local(id: usize) -> AstStmt {
+        let mut stmt = recovered_local(id);
+        let AstStmt::LocalDecl(local_decl) = &mut stmt else {
+            unreachable!("recovered_local must produce a local declaration");
+        };
+        local_decl.bindings[0].attr = AstLocalAttr::Close;
+        local_decl.values[0] = AstExpr::Nil;
+        stmt
+    }
+
+    fn recovered_call_local(id: usize) -> AstStmt {
+        let mut stmt = recovered_local(id);
+        let AstStmt::LocalDecl(local_decl) = &mut stmt else {
+            unreachable!("recovered_local must produce a local declaration");
+        };
+        local_decl.values[0] = call_expr("make_value");
+        stmt
     }
 
     fn global_decl_stmt(name: &str) -> AstStmt {
@@ -877,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn constant_if_keeps_global_declaration_scope() {
+    fn constant_if_folds_selected_global_declaration_with_scope() {
         let stmt = AstStmt::If(Box::new(AstIf {
             cond: AstExpr::Boolean(true),
             then_block: AstBlock {
@@ -886,7 +1148,13 @@ mod tests {
             else_block: None,
         }));
 
-        assert!(fold_constant_if(stmt).is_err());
+        let Ok(selected_stmts) = fold_constant_if(stmt) else {
+            panic!("selected global declaration must not protect an absent arm");
+        };
+        let [AstStmt::DoBlock(selected)] = selected_stmts.as_slice() else {
+            panic!("selected global declaration must retain its lexical scope");
+        };
+        assert_eq!(selected.stmts, vec![global_decl_stmt("selected")]);
     }
 
     #[test]
@@ -925,7 +1193,35 @@ mod tests {
     }
 
     #[test]
-    fn protected_constant_if_does_not_reenter_terminating_flatten() {
+    fn nested_if_merge_keeps_internal_goto_scope() {
+        let label = AstLabelId(0);
+        let mut if_stmt = AstIf {
+            cond: global_expr("outer"),
+            then_block: AstBlock {
+                stmts: vec![AstStmt::If(Box::new(AstIf {
+                    cond: global_expr("inner"),
+                    then_block: AstBlock {
+                        stmts: vec![
+                            AstStmt::Label(Box::new(AstLabel { id: label })),
+                            AstStmt::Goto(Box::new(AstGoto { target: label })),
+                        ],
+                    },
+                    else_block: None,
+                }))],
+            },
+            else_block: None,
+        };
+
+        assert!(merge_exact_nested_if(&mut if_stmt));
+        assert!(matches!(if_stmt.cond, AstExpr::LogicalAnd(_)));
+        assert!(matches!(
+            if_stmt.then_block.stmts.as_slice(),
+            [AstStmt::Label(_), AstStmt::Goto(_)]
+        ));
+    }
+
+    #[test]
+    fn selected_diagnostic_survives_constant_if_folding() {
         let mut block = AstBlock {
             stmts: vec![AstStmt::If(Box::new(AstIf {
                 cond: AstExpr::Boolean(true),
@@ -938,8 +1234,8 @@ mod tests {
             }))],
         };
 
-        assert!(!BranchPrettyPass.rewrite_block(&mut block, BlockKind::Regular));
-        assert!(matches!(block.stmts.as_slice(), [AstStmt::If(_)]));
+        assert!(BranchPrettyPass.rewrite_block(&mut block, BlockKind::Regular));
+        assert!(matches!(block.stmts.as_slice(), [AstStmt::Error(_)]));
     }
 
     #[test]
@@ -964,6 +1260,33 @@ mod tests {
         assert!(matches!(
             body.stmts.as_slice(),
             [AstStmt::LocalDecl(_), AstStmt::Return(_)]
+        ));
+    }
+
+    #[test]
+    fn terminal_guard_keeps_internal_goto_scope() {
+        let label = AstLabelId(0);
+        let mut block = AstBlock {
+            stmts: vec![AstStmt::If(Box::new(AstIf {
+                cond: global_expr("guard"),
+                then_block: AstBlock {
+                    stmts: vec![
+                        AstStmt::Label(Box::new(AstLabel { id: label })),
+                        AstStmt::Goto(Box::new(AstGoto { target: label })),
+                        AstStmt::Return(Box::new(AstReturn { values: vec![] })),
+                    ],
+                },
+                else_block: None,
+            }))],
+        };
+
+        assert!(BranchPrettyPass.rewrite_block(&mut block, BlockKind::FunctionBody));
+        let [AstStmt::If(_), AstStmt::DoBlock(selected)] = block.stmts.as_slice() else {
+            panic!("lifted control must retain the original arm scope");
+        };
+        assert!(matches!(
+            selected.stmts.as_slice(),
+            [AstStmt::Label(_), AstStmt::Goto(_), AstStmt::Return(_)]
         ));
     }
 
@@ -1022,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_guard_does_not_reenter_protected_constant_if() {
+    fn selected_debug_identity_survives_constant_if_folding() {
         let mut debug_local = recovered_local(0);
         let AstStmt::LocalDecl(local_decl) = &mut debug_local else {
             unreachable!("recovered_local must produce a local declaration");
@@ -1041,8 +1364,41 @@ mod tests {
             }))],
         };
 
-        assert!(!BranchPrettyPass.rewrite_block(&mut block, BlockKind::FunctionBody));
-        assert!(matches!(block.stmts.as_slice(), [AstStmt::If(_)]));
+        assert!(BranchPrettyPass.rewrite_block(&mut block, BlockKind::FunctionBody));
+        let [AstStmt::DoBlock(selected)] = block.stmts.as_slice() else {
+            panic!("selected debug identity must retain its lexical scope");
+        };
+        assert!(matches!(
+            selected.stmts.as_slice(),
+            [AstStmt::LocalDecl(_), AstStmt::Return(_)]
+        ));
+    }
+
+    #[test]
+    fn repeat_tail_fold_keeps_prefix_diagnostic() {
+        let mut repeat_stmt = AstRepeat {
+            body: AstBlock {
+                stmts: vec![
+                    AstStmt::Error("diagnostic".to_owned()),
+                    AstStmt::If(Box::new(AstIf {
+                        cond: global_expr("skip"),
+                        then_block: AstBlock {
+                            stmts: vec![AstStmt::Continue],
+                        },
+                        else_block: None,
+                    })),
+                    break_guard("stop"),
+                ],
+            },
+            cond: global_expr("latch"),
+        };
+
+        assert!(fold_repeat_tail_continue_break(&mut repeat_stmt));
+        assert!(matches!(
+            repeat_stmt.body.stmts.as_slice(),
+            [AstStmt::Error(_)]
+        ));
+        assert!(matches!(repeat_stmt.cond, AstExpr::LogicalOr(_)));
     }
 
     #[test]
@@ -1149,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_fallthrough_do_break_when_tail_would_extend_local_scope() {
+    fn folds_fallthrough_do_break_across_inert_local_scope() {
         let mut stmt = AstStmt::Repeat(Box::new(AstRepeat {
             body: AstBlock {
                 stmts: vec![
@@ -1162,8 +1518,8 @@ mod tests {
             cond: AstExpr::Boolean(true),
         }));
 
-        assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));
-        assert!(matches!(stmt, AstStmt::Repeat(_)));
+        assert!(BranchPrettyPass.rewrite_stmt(&mut stmt));
+        assert!(matches!(stmt, AstStmt::DoBlock(_)));
     }
 
     #[test]
@@ -1191,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_single_pass_fence_when_tail_would_extend_local_scope() {
+    fn folds_single_pass_fence_across_inert_local_scope() {
         let local_decl = recovered_local(0);
         let mut stmt = AstStmt::Repeat(Box::new(AstRepeat {
             body: AstBlock {
@@ -1210,6 +1566,42 @@ mod tests {
             },
             cond: AstExpr::Boolean(true),
         }));
+
+        assert!(BranchPrettyPass.rewrite_stmt(&mut stmt));
+        assert!(matches!(stmt, AstStmt::DoBlock(_)));
+    }
+
+    #[test]
+    fn keeps_single_pass_fence_when_inert_local_is_captured() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let mut stmt = single_pass_fallthrough_arm(vec![
+            recovered_local(0),
+            capturing_call_stmt("sink", binding),
+        ]);
+
+        assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));
+        assert!(matches!(stmt, AstStmt::Repeat(_)));
+    }
+
+    #[test]
+    fn keeps_single_pass_fence_when_tail_would_extend_physical_root() {
+        let mut stmt = single_pass_fallthrough_arm(vec![physical_local(0)]);
+
+        assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));
+        assert!(matches!(stmt, AstStmt::Repeat(_)));
+    }
+
+    #[test]
+    fn keeps_single_pass_fence_when_tail_would_extend_recovered_call_root() {
+        let mut stmt = single_pass_fallthrough_arm(vec![recovered_call_local(0)]);
+
+        assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));
+        assert!(matches!(stmt, AstStmt::Repeat(_)));
+    }
+
+    #[test]
+    fn keeps_single_pass_fence_when_tail_would_delay_close() {
+        let mut stmt = single_pass_fallthrough_arm(vec![close_local(0)]);
 
         assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));
         assert!(matches!(stmt, AstStmt::Repeat(_)));

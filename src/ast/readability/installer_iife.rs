@@ -40,19 +40,45 @@ use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    walk::rewrite_module(module, &mut InstallerIifePass)
+    let next_synthetic_local = next_synthetic_local_index_in_block(&module.body);
+    walk::rewrite_module(
+        module,
+        &mut InstallerIifePass {
+            next_synthetic_locals: vec![next_synthetic_local],
+        },
+    )
 }
 
-struct InstallerIifePass;
+struct InstallerIifePass {
+    /// Synthetic ids are function-local, not block-local. Nested lexical blocks share the
+    /// current counter, while each child function receives its own namespace.
+    next_synthetic_locals: Vec<usize>,
+}
 
 impl AstRewritePass for InstallerIifePass {
+    fn enter_function(&mut self, function: &AstFunctionExpr) {
+        self.next_synthetic_locals
+            .push(next_synthetic_local_index_in_function(function));
+    }
+
+    fn leave_function(&mut self, _function: &AstFunctionExpr) {
+        assert!(
+            self.next_synthetic_locals.len() > 1,
+            "installer IIFE function namespace stack must keep the module frame"
+        );
+        self.next_synthetic_locals.pop();
+    }
+
     fn rewrite_block(&mut self, block: &mut AstBlock, _kind: BlockKind) -> bool {
-        let mut next_synthetic_local = next_synthetic_local_index_in_block(block);
+        let next_synthetic_local = self
+            .next_synthetic_locals
+            .last_mut()
+            .expect("installer IIFE rewrite must run inside a function namespace");
         let mut changed = false;
         let mut index = 0;
         while index < block.stmts.len() {
             let Some(rewritten) =
-                rewrite_installer_iife_stmt(&block.stmts[index], &mut next_synthetic_local)
+                rewrite_installer_iife_stmt(&block.stmts[index], next_synthetic_local)
             else {
                 index += 1;
                 continue;
@@ -143,6 +169,15 @@ fn next_synthetic_local_index_in_block(block: &AstBlock) -> usize {
     collector.next
 }
 
+fn next_synthetic_local_index_in_function(function: &AstFunctionExpr) -> usize {
+    let mut collector = SyntheticLocalCollector::default();
+    if let Some(binding) = function.named_vararg {
+        collector.collect_binding_ref(binding);
+    }
+    visit::visit_block(&function.body, &mut collector);
+    collector.next
+}
+
 #[derive(Default)]
 struct SyntheticLocalCollector {
     next: usize,
@@ -199,13 +234,15 @@ impl AstVisitor for SyntheticLocalCollector {
     }
 
     fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
-        if let Some(vararg) = function.named_vararg {
-            self.collect_binding_ref(vararg);
-        }
+        // Child bodies have a distinct function-local id namespace. Their capture metadata,
+        // however, names bindings from the current function and must reserve those ids here.
         for binding in &function.captured_bindings {
             self.collect_binding_ref(*binding);
         }
-        true
+        for name in &function.capture_write_names {
+            self.collect_name_ref(name);
+        }
+        false
     }
 }
 
@@ -367,5 +404,86 @@ fn expr_looks_like_exported_function_value(
         | AstExpr::VarArg
         | AstExpr::TableConstructor(_)
         | AstExpr::Error(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::common::{AstIf, AstTargetDialect};
+    use crate::decompile::DecompileDialect;
+    use crate::hir::HirProtoRef;
+
+    fn substantial_iife_call() -> AstStmt {
+        AstStmt::CallStmt(Box::new(AstCallStmt {
+            call: AstCallKind::Call(Box::new(AstCallExpr {
+                callee: AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
+                    function: HirProtoRef(1),
+                    params: Vec::new(),
+                    is_vararg: false,
+                    named_vararg: None,
+                    body: AstBlock {
+                        stmts: vec![
+                            AstStmt::Error("first".to_owned()),
+                            AstStmt::Error("second".to_owned()),
+                        ],
+                    },
+                    captured_bindings: BTreeSet::new(),
+                    captured_params: BTreeSet::new(),
+                    capture_write_names: BTreeSet::new(),
+                })),
+                args: Vec::new(),
+                method_name: None,
+            })),
+        }))
+    }
+
+    #[test]
+    fn nested_block_iife_uses_the_function_wide_synthetic_namespace() {
+        let outer = AstSyntheticLocalId(TempId(0));
+        let mut module = AstModule {
+            entry_function: HirProtoRef(0),
+            body: AstBlock {
+                stmts: vec![
+                    AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                        bindings: vec![AstLocalBinding {
+                            id: AstBindingRef::SyntheticLocal(outer),
+                            attr: AstLocalAttr::None,
+                            origin: AstLocalOrigin::Recovered,
+                        }],
+                        values: vec![AstExpr::Integer(1)],
+                    })),
+                    AstStmt::If(Box::new(AstIf {
+                        cond: AstExpr::Boolean(true),
+                        then_block: AstBlock {
+                            stmts: vec![substantial_iife_call()],
+                        },
+                        else_block: None,
+                    })),
+                ],
+            },
+        };
+
+        assert!(apply(
+            &mut module,
+            ReadabilityContext {
+                target: AstTargetDialect::new(DecompileDialect::Lua54),
+                options: super::super::ReadabilityOptions::default(),
+            },
+        ));
+
+        let AstStmt::If(if_stmt) = &module.body.stmts[1] else {
+            panic!("second statement should remain the containing if");
+        };
+        let [AstStmt::DoBlock(iife_scope)] = if_stmt.then_block.stmts.as_slice() else {
+            panic!("nested IIFE should become one do scope");
+        };
+        let Some(AstStmt::LocalDecl(installer)) = iife_scope.stmts.first() else {
+            panic!("IIFE scope should start with the installer local");
+        };
+        assert_eq!(
+            installer.bindings[0].id,
+            AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(1)))
+        );
     }
 }

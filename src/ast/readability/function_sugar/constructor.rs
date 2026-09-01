@@ -21,8 +21,8 @@ use super::super::expr_analysis::is_eventless_primitive_literal;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr,
-    AstFunctionName, AstLValue, AstLocalAttr, AstLocalDecl, AstReturn, AstStmt, AstTableField,
-    AstTableKey,
+    AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstReturn, AstStmt,
+    AstTableField, AstTableKey,
 };
 
 pub(super) fn try_inline_terminal_constructor_fields(
@@ -43,12 +43,19 @@ pub(super) fn try_inline_terminal_constructor_fields(
     let AstExpr::TableConstructor(table) = &mut rewritten.values[0] else {
         unreachable!("matched constructor value above")
     };
+    let mut consumed = 1usize;
+    let (field, func) = inlineable_local_table_function_stmt(stmts.get(consumed)?, binding)?;
     if !table_can_append_record_field(table) {
         return None;
     }
+    table
+        .fields
+        .push(AstTableField::Record(crate::ast::AstRecordField {
+            key: AstTableKey::Name(field),
+            value: AstExpr::FunctionExpr(Box::new(func)),
+        }));
+    consumed += 1;
 
-    let mut consumed = 1usize;
-    let mut inlined_any = false;
     while let Some(stmt) = stmts.get(consumed) {
         let Some((field, func)) = inlineable_local_table_function_stmt(stmt, binding) else {
             break;
@@ -60,10 +67,6 @@ pub(super) fn try_inline_terminal_constructor_fields(
                 value: AstExpr::FunctionExpr(Box::new(func)),
             }));
         consumed += 1;
-        inlined_any = true;
-    }
-    if !inlined_any {
-        return None;
     }
 
     Some((AstStmt::LocalDecl(Box::new(rewritten)), consumed))
@@ -74,26 +77,17 @@ pub(super) fn try_inline_terminal_constructor_call(
     use_index: &BindingUseIndex,
     stmt_base: usize,
 ) -> Option<(AstStmt, usize)> {
-    let (callee_binding, callee_expr) = single_local_alias_decl(stmts.first()?)?;
-    // This rule exists to remove constructor scaffolding, not to turn a readable named function
-    // back into a multiline result-position IIFE. Short callees still benefit from the compact
-    // terminal form.
-    if let AstExpr::FunctionExpr(function) = callee_expr
-        && function_expr_is_substantial(function)
-    {
-        // 候选拒绝[PolicyBoundary]：多语句/控制流 closure 内联到结果位置会制造难读 IIFE，语义上并非禁止。
-        return None;
-    }
+    let callee = single_local_alias_decl(stmts.first()?)?;
     let mut consumed = 1usize;
     let mut arg_locals = Vec::<ConstructorArg>::new();
 
     while let Some(stmt) = stmts.get(consumed) {
-        let Some((binding, value)) = single_local_alias_decl(stmt) else {
+        let Some(arg) = single_local_alias_decl(stmt) else {
             break;
         };
         arg_locals.push(ConstructorArg {
-            binding,
-            value: value.clone(),
+            binding: arg.binding,
+            value: arg.value,
             pass_to_sink: true,
         });
         consumed += 1;
@@ -115,36 +109,60 @@ pub(super) fn try_inline_terminal_constructor_call(
     }
 
     let sink = stmts.get(consumed)?;
+    let rewritten_sink = rewrite_terminal_constructor_call_sink(
+        sink,
+        callee.binding.id,
+        &callee.value,
+        &arg_locals,
+    )?;
+
+    // Removal-only gates intentionally run after the exact sink call has accepted the local
+    // sequence. A standalone `<close>`/debug-root local is not a constructor-handoff candidate.
+    if !constructor_local_can_be_removed(&callee.binding)
+        || arg_locals
+            .iter()
+            .any(|arg| !constructor_local_can_be_removed(&arg.binding))
+    {
+        return None;
+    }
+    // This rule exists to remove constructor scaffolding, not to turn a readable named function
+    // back into a multiline result-position IIFE. Short callees still benefit from the compact
+    // terminal form.
+    if let AstExpr::FunctionExpr(function) = &callee.value
+        && function_expr_is_substantial(function)
+    {
+        // 候选拒绝[PolicyBoundary]：多语句/控制流 closure 内联到结果位置会制造难读 IIFE，语义上并非禁止。
+        return None;
+    }
+
     if use_index.count_uses_in_range(
         stmt_base + consumed,
         stmt_base + consumed + 1,
-        callee_binding,
+        callee.binding.id,
     ) != 1
         || arg_locals.iter().any(|arg| {
             use_index.count_uses_in_range(
                 stmt_base + consumed,
                 stmt_base + consumed + 1,
-                arg.binding,
+                arg.binding.id,
             ) != usize::from(arg.pass_to_sink)
         })
     {
         // 候选拒绝[SemanticBarrier:Scope]：sink 内除目标 call 外再读 callee/arg 时，删除声明会留下未绑定 use；每个 active handoff 必须恰好出现一次，已嵌套消费的 arg 必须为零次。
         return None;
     }
-    let rewritten_sink =
-        rewrite_terminal_constructor_call_sink(sink, callee_binding, callee_expr, &arg_locals)?;
-    let removed_bindings = std::iter::once(callee_binding)
-        .chain(arg_locals.iter().map(|arg| arg.binding))
+    let removed_bindings = std::iter::once(callee.binding.id)
+        .chain(arg_locals.iter().map(|arg| arg.binding.id))
         .collect::<BTreeSet<_>>();
     if !binding_mentions_in_stmt(&rewritten_sink).is_disjoint(&removed_bindings) {
-        // 候选拒绝[SemanticBarrier:Capture]：折叠后 sink 若仍直接或经字段闭包引用任一被删 binding，消除声明会留下悬空引用；regress_362 是闭包捕获 arg 的具体反例。
+        // 候选拒绝[SemanticBarrier:Scope]：折叠后 sink 若仍直接或经字段闭包引用任一被删 binding，消除声明会留下未绑定引用；regress_362 是闭包捕获 arg 的具体反例。
         return None;
     }
     if !matches!(sink, AstStmt::Return(_))
         && !removed_constructor_locals_are_dead_after_sink(
             use_index,
             stmt_base + consumed + 1,
-            callee_binding,
+            callee.binding.id,
             &arg_locals,
         )
     {
@@ -156,39 +174,51 @@ pub(super) fn try_inline_terminal_constructor_call(
 
 #[derive(Clone)]
 struct ConstructorArg {
-    binding: AstBindingRef,
+    binding: AstLocalBinding,
     value: AstExpr,
     pass_to_sink: bool,
 }
 
-fn single_local_alias_decl(stmt: &AstStmt) -> Option<(AstBindingRef, &AstExpr)> {
+struct ConstructorLocal {
+    binding: AstLocalBinding,
+    value: AstExpr,
+}
+
+fn single_local_alias_decl(stmt: &AstStmt) -> Option<ConstructorLocal> {
     let AstStmt::LocalDecl(local_decl) = stmt else {
         return None;
     };
     if local_decl.bindings.len() != 1 || local_decl.values.len() != 1 {
         return None;
     }
-    match local_decl.bindings[0].attr {
+    Some(ConstructorLocal {
+        binding: local_decl.bindings[0].clone(),
+        value: local_decl.values[0].clone(),
+    })
+}
+
+fn constructor_local_can_be_removed(binding: &AstLocalBinding) -> bool {
+    match binding.attr {
         AstLocalAttr::None => {}
         AstLocalAttr::Close => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：删除 `<close>` alias 会同时删除其
-            // 离域 close 动作与资源 owner。
-            return None;
+            // 候选拒绝[SemanticBarrier:Lifetime]：`local x <close>=acquire(); return ctor(x)`
+            // 删除 alias 后不再在原 block 出口调用 x 的关闭动作。
+            return false;
         }
         AstLocalAttr::Const => {
             // 候选拒绝[PolicyBoundary]：`<const>` 的源码声明身份继续由声明 owner 保留。
-            return None;
+            return false;
         }
     }
-    if local_decl.bindings[0].origin.is_debug_hinted() {
-        // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 是 IR 已保留的源码 binding；删除 alias 会抹掉其名字与词法区间。
-        return None;
+    if binding.origin.is_debug_hinted() {
+        // 候选拒绝[SemanticBarrier:DebugScope]：删除 DebugHinted alias 会抹掉调用期间 debug.getlocal 可见的名字与区间，反例见 regress_351。
+        return false;
     }
-    if local_decl.bindings[0].origin.is_physical_root() {
-        // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 必须活到原 block 末。
-        return None;
+    if binding.origin.is_physical_root() {
+        // 候选拒绝[SemanticBarrier:Lifetime]：删除 PhysicalRoot 会让值在 sink 后、原 block 结束前提前离开 GC root，弱表/`__gc` 可观察，反例见 regress_353。
+        return false;
     }
-    Some((local_decl.bindings[0].id, &local_decl.values[0]))
+    true
 }
 
 fn inlineable_local_table_function_stmt(
@@ -206,7 +236,7 @@ fn inlineable_local_table_function_stmt(
             }
             // 同 assign 分支：闭包捕获了 constructor binding 时不能折入
             if function_decl.func.captured_bindings.contains(&binding) {
-                // 候选拒绝[SemanticBarrier:Capture]：`function obj.f() return obj end` 折进字面量并消除 `obj` 后，闭包捕获会悬空或改绑。
+                // 候选拒绝[SemanticBarrier:Capture]：`local obj={}; function obj.f() return obj end` 中 closure 原本捕获 local；折进 `local obj={f=function() return obj end}` 后该 local 尚未进入 initializer 作用域，引用会改绑外层名字。
                 return None;
             }
             Some((path.fields[0].clone(), function_decl.func.clone()))
@@ -236,9 +266,9 @@ fn inlineable_local_table_function_assign(
         return None;
     };
     // 如果闭包体捕获了 constructor binding 自身（如 `obj.inc = function() obj.count = ... end`），
-    // 折入 constructor 后 binding 可能因 return-handoff 被消除，导致闭包中引用悬空。
+    // 折入 constructor initializer 后该 local 尚未进入词法作用域，闭包引用会改绑。
     if function.captured_bindings.contains(&binding) {
-        // 候选拒绝[SemanticBarrier:Capture]：`obj.f=function() return obj end` 需要 constructor binding 作为 upvalue，不能在 return handoff 中删除。
+        // 候选拒绝[SemanticBarrier:Capture]：`local obj={}; obj.f=function() return obj end` 折叠后 closure 不再捕获同一个 local。
         return None;
     }
     Some((field.clone(), function.as_ref().clone()))
@@ -246,11 +276,11 @@ fn inlineable_local_table_function_assign(
 
 fn inline_arg_local_table_function(stmt: &AstStmt, arg_locals: &mut [ConstructorArg]) -> bool {
     for arg_local in arg_locals {
-        let Some((field, func)) = inlineable_local_table_function_stmt(stmt, arg_local.binding)
-        else {
+        let AstExpr::TableConstructor(table) = &mut arg_local.value else {
             continue;
         };
-        let AstExpr::TableConstructor(table) = &mut arg_local.value else {
+        let Some((field, func)) = inlineable_local_table_function_stmt(stmt, arg_local.binding.id)
+        else {
             continue;
         };
         if !table_can_append_record_field(table) {
@@ -273,31 +303,34 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     };
     let Some(inner_index) = arg_locals
         .iter()
-        .position(|arg| arg.binding == inner_binding)
+        .position(|arg| arg.binding.id == inner_binding)
     else {
         return false;
     };
     let Some(outer_index) = arg_locals
         .iter()
-        .position(|arg| arg.binding == outer_binding)
+        .position(|arg| arg.binding.id == outer_binding)
     else {
         return false;
     };
+    if !matches!(&arg_locals[inner_index].value, AstExpr::TableConstructor(_))
+        || !matches!(&arg_locals[outer_index].value, AstExpr::TableConstructor(_))
+    {
+        return false;
+    }
     if inner_index == outer_index || !arg_locals[inner_index].pass_to_sink {
-        // 候选拒绝[SemanticBarrier:Identity]：不能把 table 接到自身，且已被某次嵌套接线消费的 inner 不能再复制到第二个字段。
+        // 候选拒绝[SemanticBarrier:Identity]：`outer.self=outer` 原本保持自引用，克隆成嵌套字面量会产生另一个 table；同一 inner 接到两字段时再次克隆也会把共享身份拆成两个值。
         return false;
     }
     if outer_index + 1 != inner_index {
-        // 候选拒绝[SemanticBarrier:EvalOrder]：只有 `outer` 紧邻先于 `inner` 时，折入字段仍按 outer、inner 的原顺序构造；反向或跨 initializer 会重排事件。
+        // 只有声明顺序中紧邻的 `outer`、`inner` 接线属于本 pass 的 constructor
+        // handoff 形状；反向或跨 initializer 的普通接线留给原语句表达。
         return false;
     }
 
     let inner_value = arg_locals[inner_index].value.clone();
-    let AstExpr::TableConstructor(_) = inner_value else {
-        return false;
-    };
     let AstExpr::TableConstructor(table) = &mut arg_locals[outer_index].value else {
-        return false;
+        unreachable!("checked outer constructor above")
     };
     if !table_can_append_record_field(table) {
         return false;
@@ -430,8 +463,24 @@ fn rewrite_terminal_constructor_call_sink(
             // 候选接受[EvalOrderProof/ValueArityProof]：首 iterator 无前缀；单项时保留 open pack，多项时前后都截成单值。
             Some(AstStmt::GenericFor(Box::new(rewritten)))
         }
-        AstStmt::While(_) | AstStmt::Repeat(_) => {
-            // 候选拒绝[SemanticBarrier:EvalCount]：搬入循环条件会把一次 constructor/callee 初始化改成逐轮执行。
+        AstStmt::While(while_stmt) => {
+            rewrite_terminal_constructor_call_expr(
+                &while_stmt.cond,
+                callee_binding,
+                callee_expr,
+                arg_locals,
+            )?;
+            // 候选拒绝[SemanticBarrier:EvalCount]：`local f=make_f(); local a=make_a(); while f(a) do end` 中两个 initializer 原本各执行一次，搬入条件后会逐轮执行。
+            None
+        }
+        AstStmt::Repeat(repeat_stmt) => {
+            rewrite_terminal_constructor_call_expr(
+                &repeat_stmt.cond,
+                callee_binding,
+                callee_expr,
+                arg_locals,
+            )?;
+            // 候选拒绝[SemanticBarrier:EvalCount]：`local f=make_f(); local a=make_a(); repeat until f(a)` 中两个 initializer 原本各执行一次，搬入条件后会逐轮执行。
             None
         }
         _ => None,
@@ -455,7 +504,22 @@ fn rewrite_terminal_constructor_call_expr(
         .filter(|arg| arg.pass_to_sink)
         .collect::<Vec<_>>();
     if !name_matches_binding(name, callee_binding) {
-        // 候选拒绝[SemanticBarrier:Identity]：sink 必须调用被删除 alias 所指向的同一 callee。
+        return None;
+    }
+
+    // First recognize the complete handoff. Missing constructor locals are an ordinary
+    // non-candidate; only a concrete reversal between two participating locals is an
+    // observable ordering barrier.
+    let positions = active_args
+        .iter()
+        .map(|expected| {
+            call.args.iter().position(
+                |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, expected.binding.id)),
+            )
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：sink 以相反顺序承接两个 constructor local 时，内联会按实参顺序执行 initializer，反转原声明时的事件顺序。
         return None;
     }
 
@@ -464,7 +528,7 @@ fn rewrite_terminal_constructor_call_expr(
     let mut last_arg_is_inlined_constructor = false;
     for arg in &call.args {
         if let Some(expected) = expected_args.peek()
-            && matches!(arg, AstExpr::Var(name) if name_matches_binding(name, expected.binding))
+            && matches!(arg, AstExpr::Var(name) if name_matches_binding(name, expected.binding.id))
         {
             rewritten_args.push(expected.value.clone());
             expected_args.next();
@@ -480,11 +544,7 @@ fn rewrite_terminal_constructor_call_expr(
         rewritten_args.push(arg.clone());
         last_arg_is_inlined_constructor = false;
     }
-    if expected_args.next().is_some() {
-        // 候选拒绝[SemanticBarrier:Scope]：每个 active constructor local 都必须由 sink 承接一次，否则删除声明会丢失 handoff；
-        // 候选拒绝[SemanticBarrier:EvalOrder]：承接顺序还必须与 initializer 声明顺序一致。
-        return None;
-    }
+    debug_assert!(expected_args.next().is_none());
 
     let mut rewritten = call.as_ref().clone();
     rewritten.callee = callee_expr.clone();
@@ -517,7 +577,7 @@ fn removed_constructor_locals_are_dead_after_sink(
     // 候选拒绝[SemanticBarrier:Scope]：任一 constructor arg local 在 sink 后仍有 use，都不能从词法作用域删除。
     arg_locals
         .iter()
-        .all(|arg| use_index.count_uses_in_suffix(suffix_start, arg.binding) == 0)
+        .all(|arg| use_index.count_uses_in_suffix(suffix_start, arg.binding.id) == 0)
 }
 
 #[cfg(test)]

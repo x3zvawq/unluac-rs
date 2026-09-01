@@ -265,15 +265,17 @@ fn merge_adjacent_single_value_local_decls(
             lookahead += 1;
         }
 
-        // 只把多次使用的 binding 纳入合并组；单次使用的 binding 留给 inline_exprs
-        // 去内联。否则 `local a = x; local b = t.f; local c = T.K` 中 b/c 只用一次，
+        // 只把多次使用和零显式 use 但仍需保留的 binding 纳入合并组；单次使用的
+        // binding 留给 inline_exprs 去内联。否则 `local a = x; local b = t.f;
+        // local c = T.K` 中 b/c 只用一次，
         // 却因为 a 多次使用而被一起合并成 multi-local，导致 inline_exprs 无法识别。
         // 为了不破坏声明顺序，从连续序列尾部剥离单次使用的 binding。
         while bindings.len() >= 2
-            && use_index.count_uses_in_suffix(lookahead, bindings.last().unwrap().id) <= 1
+            && use_index.count_uses_in_suffix(lookahead, bindings.last().unwrap().id) == 1
         {
             // 候选拒绝[LayerBoundary]：尾部单次-use binding 留给 inline-exprs 消费；这是
-            // owner 分工而非合并会不等价的证明。
+            // 精确 owner 分工而非合并会不等价的证明。零 use 若仍存在，说明 cleanup 已按
+            // identity/lifetime 语义保留，本 pass 仍应把它纳入安全的相邻声明合并。
             bindings.pop();
             values.pop();
             lookahead -= 1;
@@ -294,8 +296,7 @@ fn merge_adjacent_single_value_local_decls(
             continue;
         }
 
-        // 候选拒绝[PolicyBoundary]：不足两个 multi-use binding 时不生成并行声明；该展示
-        // 密度门不说明顺序合并存在语义差异。
+        // 剥离交给 inline-exprs 的尾 binding 后只剩一个声明时，已经不存在并行声明候选。
         new_stmts.push(stmt);
         index += 1;
     }
@@ -307,12 +308,6 @@ fn merge_adjacent_single_value_local_decls(
 fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&AstExpr>) -> bool {
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&block.stmts, trailing_condition);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
-    if forward_gotos.has_backward_goto {
-        // backward goto 把当前 block 变成显式 CFG：hoisted temp 可能是回边上的 phi
-        // 槽。把声明沉进任一分支会创建不同的词法 local，破坏 label 后读取的值。
-        // 分析停用[SemanticBarrier:ControlFlow]：`::L::; use(t); ...; goto L` 中 hoisted `t` 可能是回边 phi，沉入单一路径会产生不同词法 local。
-        return false;
-    }
     let mut index = 0;
     while index < block.stmts.len() {
         let Some(pending_bindings) = hoisted_temp_bindings(&block.stmts[index]) else {
@@ -325,8 +320,31 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
         let mut sink_changed = false;
         let mut lookahead = index + 1;
         while lookahead < block.stmts.len() && !remaining.is_empty() {
-            if forward_gotos.has_forward_goto_past_index(lookahead) {
-                // 候选拒绝[SemanticBarrier:Scope]：`goto L; local t; ...; ::L:: use(t)` 若把声明沉到 label 前后，会让跳转进入 local 作用域或改变读取绑定。
+            let crosses_forward_goto = forward_gotos.has_forward_goto_past_index(lookahead);
+            let enters_backward_cycle = forward_gotos.move_enters_backward_cycle(index, lookahead);
+            if crosses_forward_goto || enters_backward_cycle {
+                if enters_backward_cycle {
+                    // 候选拒绝[SemanticBarrier:ControlFlow]：`local t; ::L::; t = v; ...; goto L`
+                    // 中原声明只建立一次 cell；把它沉到 L 与回跳之间会改成每轮新建 cell，
+                    // 逃逸 closure 可观察到不同 identity。只拒绝声明点在 label 前、sink
+                    // 位于该回边区间内的候选；不相交回边不影响本次移动。
+                } else {
+                    // 候选拒绝[SemanticBarrier:Scope]：`goto L; local t; ...; ::L:: use(t)` 若把声明沉到 label 前后，会让跳转进入 local 作用域或改变读取绑定。
+                }
+
+                // 不能越过已经读取 binding 的控制边界后再尝试 nested sink；否则后续
+                // 子块候选只看自己的 owner/suffix，会遗漏这次较早读取。
+                let mut remaining_index = 0;
+                while remaining_index < remaining.len() {
+                    if stmt_references_any_binding(
+                        &block.stmts[lookahead],
+                        std::slice::from_ref(&remaining[remaining_index]),
+                    ) {
+                        pinned.push(remaining.remove(remaining_index));
+                    } else {
+                        remaining_index += 1;
+                    }
+                }
                 lookahead += 1;
                 continue;
             }
@@ -801,8 +819,26 @@ fn sink_pending_bindings_into_block(
     let mut index = 0usize;
     while index < block.stmts.len() && consumed < pending.len() {
         let remaining = &pending[consumed..];
-        if forward_gotos.has_forward_goto_past_index(index) {
-            // 候选拒绝[SemanticBarrier:Scope]：已有 forward goto 跨过此点时新增 local 会制造非法的“跳入 local 作用域”。
+        let crosses_forward_goto = forward_gotos.has_forward_goto_past_index(index);
+        let enters_backward_cycle = forward_gotos.insertion_enters_backward_cycle(index);
+        if crosses_forward_goto || enters_backward_cycle {
+            if enters_backward_cycle {
+                // 候选拒绝[SemanticBarrier:ControlFlow]：pending 声明位于子 block 外；若在
+                // `::L:: ... goto L` 区间内新建 local，会把同一外层 cell 改成逐轮 cell。
+            } else {
+                // 候选拒绝[SemanticBarrier:Scope]：已有 forward goto 跨过此点时新增 local 会制造非法的“跳入 local 作用域”。
+            }
+            if stmt_references_binding_set(
+                &block.stmts[index],
+                &BindingRefSet::from_bindings(remaining),
+            ) {
+                // 当前首次读取点本身不能接收声明；继续扫描后再插入会让这次读取落到
+                // 声明之前，因此本层没有合法 sink。
+                return BlockSinkAttempt {
+                    consumed,
+                    dependencies: Vec::new(),
+                };
+            }
             index += 1;
             continue;
         }
@@ -899,8 +935,8 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
         .iter()
         .any(|binding| binding.attr != AstLocalAttr::None)
     {
-        // 候选拒绝[TargetConstraint]：`<const>`/`<close>` local 在目标 Lua 中不可在声明后
-        // 普通赋值；该异常 AST 不能用无属性 hoist 规则静默合法化。
+        // 候选忽略[NotApplicable]：`<const>`/`<close>` local 在目标 Lua 中不可在声明后
+        // 普通赋值；该异常 AST pair 不属于 initializer merge 候选。
         return None;
     }
     if local_decl
@@ -941,13 +977,28 @@ fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::Ast
     if !local_decl.values.is_empty() || local_decl.bindings.is_empty() {
         return None;
     }
-    if local_decl.bindings.iter().any(|binding| {
-        binding.attr != AstLocalAttr::None
-            || !is_temp_like_binding(binding.id)
-            || binding.origin != super::super::common::AstLocalOrigin::Recovered
-    }) {
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.attr != AstLocalAttr::None || !is_temp_like_binding(binding.id))
+    {
+        // 属性声明和非 temp binding 不属于 hoisted-temp 下沉候选。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.origin.is_debug_hinted())
+    {
         // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted temp 的原声明起点是已保留的
         // source identity，下沉会缩短 debug.getlocal 可见期。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| binding.origin.is_physical_root())
+    {
         // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 的空声明在 hoist 点清空旧 VM
         // root；下沉到赋值点会让旧对象跨过中间 GC/弱表观察继续存活。
         return None;
@@ -1122,7 +1173,7 @@ fn local_binding_matches_target(binding: AstBindingRef, target: &AstLValue) -> b
 
 struct ForwardGotoIndex {
     has_forward_goto_past_index: Vec<bool>,
-    has_backward_goto: bool,
+    backward_goto_ranges: Vec<(usize, usize)>,
 }
 
 impl ForwardGotoIndex {
@@ -1140,16 +1191,17 @@ impl ForwardGotoIndex {
             .enumerate()
             .filter_map(|(index, label)| label.map(|label| (label, index)))
             .collect::<BTreeMap<_, _>>();
-        let has_backward_goto = goto_targets_by_stmt
+        let backward_goto_ranges = goto_targets_by_stmt
             .iter()
             .enumerate()
-            .any(|(index, targets)| {
-                targets.iter().any(|target| {
-                    label_positions
-                        .get(target)
-                        .is_some_and(|label_index| *label_index < index)
+            .flat_map(|(goto_index, targets)| {
+                let label_positions = &label_positions;
+                targets.iter().filter_map(move |target| {
+                    let label_index = *label_positions.get(target)?;
+                    (label_index < goto_index).then_some((label_index, goto_index))
                 })
-            });
+            })
+            .collect();
 
         let mut future_labels: BTreeSet<AstLabelId> =
             labels_by_stmt.iter().skip(1).flatten().copied().collect();
@@ -1176,7 +1228,7 @@ impl ForwardGotoIndex {
 
         Self {
             has_forward_goto_past_index,
-            has_backward_goto,
+            backward_goto_ranges,
         }
     }
 
@@ -1185,6 +1237,20 @@ impl ForwardGotoIndex {
             .get(index)
             .copied()
             .unwrap_or(false)
+    }
+
+    fn move_enters_backward_cycle(&self, from_index: usize, to_index: usize) -> bool {
+        self.backward_goto_ranges
+            .iter()
+            .any(|&(label_index, goto_index)| {
+                from_index <= label_index && label_index < to_index && to_index <= goto_index
+            })
+    }
+
+    fn insertion_enters_backward_cycle(&self, index: usize) -> bool {
+        self.backward_goto_ranges
+            .iter()
+            .any(|&(label_index, goto_index)| label_index < index && index <= goto_index)
     }
 }
 
@@ -1215,7 +1281,9 @@ impl AstVisitor for GotoTargetCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::common::{AstAssign, AstLocalOrigin};
+    use crate::ast::common::{
+        AstAssign, AstGlobalName, AstGoto, AstIf, AstLabel, AstLocalOrigin, AstNameRef,
+    };
     use crate::hir::{LocalId, TempId};
 
     fn empty_local(id: usize, origin: AstLocalOrigin) -> AstStmt {
@@ -1247,6 +1315,42 @@ mod tests {
                 })),
             ],
         }
+    }
+
+    fn recovered_temp_decl(binding: AstBindingRef) -> AstStmt {
+        AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: vec![AstLocalBinding {
+                id: binding,
+                attr: AstLocalAttr::None,
+                origin: AstLocalOrigin::Recovered,
+            }],
+            values: Vec::new(),
+        }))
+    }
+
+    fn temp_write(binding: AstBindingRef) -> AstStmt {
+        AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![AstLValue::Name(binding.to_name_ref())],
+            values: vec![AstExpr::Integer(1)],
+        }))
+    }
+
+    fn label(id: usize) -> AstStmt {
+        AstStmt::Label(Box::new(AstLabel { id: AstLabelId(id) }))
+    }
+
+    fn conditional_goto(id: usize) -> AstStmt {
+        AstStmt::If(Box::new(AstIf {
+            cond: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                text: "again".to_owned(),
+            })),
+            then_block: AstBlock {
+                stmts: vec![AstStmt::Goto(Box::new(AstGoto {
+                    target: AstLabelId(id),
+                }))],
+            },
+            else_block: None,
+        }))
     }
 
     #[test]
@@ -1282,6 +1386,47 @@ mod tests {
     }
 
     #[test]
+    fn zero_use_physical_root_tail_remains_a_merge_candidate() {
+        let first = AstBindingRef::Local(LocalId(0));
+        let retained = AstBindingRef::Local(LocalId(1));
+        let input = AstBindingRef::Local(LocalId(2));
+        let mut block = AstBlock {
+            stmts: vec![
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: first,
+                        attr: AstLocalAttr::None,
+                        origin: AstLocalOrigin::Recovered,
+                    }],
+                    values: vec![AstExpr::Var(input.to_name_ref())],
+                })),
+                AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                    bindings: vec![AstLocalBinding {
+                        id: retained,
+                        attr: AstLocalAttr::None,
+                        origin: AstLocalOrigin::PhysicalRoot,
+                    }],
+                    values: vec![AstExpr::Var(input.to_name_ref())],
+                })),
+                AstStmt::Return(Box::new(crate::ast::common::AstReturn {
+                    values: vec![
+                        AstExpr::Var(first.to_name_ref()),
+                        AstExpr::Var(first.to_name_ref()),
+                    ],
+                })),
+            ],
+        };
+
+        assert!(merge_adjacent_single_value_local_decls(&mut block, None));
+        assert_eq!(block.stmts.len(), 2);
+        let AstStmt::LocalDecl(decl) = &block.stmts[0] else {
+            panic!("adjacent retained locals should merge");
+        };
+        assert_eq!(decl.bindings.len(), 2);
+        assert_eq!(decl.bindings[1].id, retained);
+    }
+
+    #[test]
     fn hoisted_temp_sink_preserves_debug_and_physical_root_origins() {
         for origin in [
             AstLocalOrigin::DebugHinted,
@@ -1301,5 +1446,110 @@ mod tests {
             panic!("recovered hoisted temp should sink into its assignment");
         };
         assert_eq!(decl.values, vec![AstExpr::Integer(1)]);
+    }
+
+    #[test]
+    fn unrelated_prior_backedge_does_not_disable_hoisted_temp_sink() {
+        let binding = AstBindingRef::Temp(TempId(0));
+        let mut block = AstBlock {
+            stmts: vec![
+                label(0),
+                conditional_goto(0),
+                recovered_temp_decl(binding),
+                temp_write(binding),
+            ],
+        };
+
+        assert!(sink_hoisted_temp_decls(&mut block, None));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::Label(_), AstStmt::If(_), AstStmt::LocalDecl(decl)]
+                if decl.values == vec![AstExpr::Integer(1)]
+        ));
+    }
+
+    #[test]
+    fn hoisted_temp_sink_does_not_enter_existing_backedge_cycle() {
+        let binding = AstBindingRef::Temp(TempId(0));
+        let original = AstBlock {
+            stmts: vec![
+                recovered_temp_decl(binding),
+                label(0),
+                temp_write(binding),
+                conditional_goto(0),
+            ],
+        };
+        let mut block = original.clone();
+
+        assert!(!sink_hoisted_temp_decls(&mut block, None));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn hoisted_temp_sink_within_same_backedge_cycle_keeps_cell_epoch() {
+        let binding = AstBindingRef::Temp(TempId(0));
+        let mut block = AstBlock {
+            stmts: vec![
+                label(0),
+                recovered_temp_decl(binding),
+                temp_write(binding),
+                conditional_goto(0),
+            ],
+        };
+
+        assert!(sink_hoisted_temp_decls(&mut block, None));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [AstStmt::Label(_), AstStmt::LocalDecl(decl), AstStmt::If(_)]
+                if decl.values == vec![AstExpr::Integer(1)]
+        ));
+    }
+
+    #[test]
+    fn nested_sink_does_not_create_per_iteration_cell() {
+        let binding = AstBindingRef::Temp(TempId(0));
+        let original = AstBlock {
+            stmts: vec![
+                recovered_temp_decl(binding),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![label(0), temp_write(binding), conditional_goto(0)],
+                })),
+            ],
+        };
+        let mut block = original.clone();
+
+        assert!(!sink_hoisted_temp_decls(&mut block, None));
+        assert_eq!(block, original);
+    }
+
+    #[test]
+    fn nested_sink_does_not_cross_control_barrier_read() {
+        let binding = AstBindingRef::Temp(TempId(0));
+        let original = AstBlock {
+            stmts: vec![
+                recovered_temp_decl(binding),
+                AstStmt::DoBlock(Box::new(AstBlock {
+                    stmts: vec![
+                        AstStmt::Goto(Box::new(AstGoto {
+                            target: AstLabelId(0),
+                        })),
+                        AstStmt::Assign(Box::new(AstAssign {
+                            targets: vec![AstLValue::Name(AstNameRef::Global(AstGlobalName {
+                                text: "seen".to_owned(),
+                            }))],
+                            values: vec![AstExpr::Var(binding.to_name_ref())],
+                        })),
+                        label(0),
+                        AstStmt::DoBlock(Box::new(AstBlock {
+                            stmts: vec![temp_write(binding)],
+                        })),
+                    ],
+                })),
+            ],
+        };
+        let mut block = original.clone();
+
+        assert!(!sink_hoisted_temp_decls(&mut block, None));
+        assert_eq!(block, original);
     }
 }

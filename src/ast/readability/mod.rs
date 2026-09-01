@@ -135,7 +135,9 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         // literal-fold can expose a constant condition after the initial branch pass;
         // rerun here so the control shell consumes that proven ExprShape fact.
         depends_on: &[ControlFlowShape, StatementAdjacency, ExprShape],
-        invalidates: &[ControlFlowShape, StatementAdjacency],
+        // branch-pretty 也会新建 `not`、`and`、`or` 条件；必须重置 ExprShape，
+        // 让 literal-fold 与表达式消费者在下一轮看到新形状。
+        invalidates: &[ControlFlowShape, StatementAdjacency, ExprShape],
     },
     PassDescriptor {
         name: "field-access-sugar",
@@ -172,7 +174,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         name: "function-sugar",
         phase: PassPhase::Deferred,
         depends_on: &[TempPresence, BindingStructure, ExprShape],
-        invalidates: &[StatementAdjacency, ExprShape],
+        invalidates: &[StatementAdjacency, ExprShape, BindingStructure],
     },
     PassDescriptor {
         name: "global-decl-pretty",
@@ -388,5 +390,25 @@ mod tests {
             path.root,
             AstNameRef::SyntheticLocal(AstSyntheticLocalId(temp))
         );
+    }
+
+    #[test]
+    fn function_sugar_reawakens_binding_structure_consumers() {
+        let descriptor = PASS_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.name == "function-sugar")
+            .expect("function-sugar descriptor must exist");
+
+        assert!(descriptor.invalidates.contains(&BindingStructure));
+    }
+
+    #[test]
+    fn branch_pretty_reawakens_expression_consumers() {
+        let descriptor = PASS_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.name == "branch-pretty")
+            .expect("branch-pretty descriptor must exist");
+
+        assert!(descriptor.invalidates.contains(&ExprShape));
     }
 }

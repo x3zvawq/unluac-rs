@@ -88,18 +88,26 @@ fn try_merge_seed_global_run(
     }
 
     if seeds.len() != globals.len() {
-        // 候选拒绝[SemanticBarrier:EvalCount]：seed/global 不是精确双射时，合并会删除未交接 seed 的 initializer，或丢掉没有来源的 global 写入；
-        // 候选拒绝[SemanticBarrier:Capture]：regress335 的 captured_seed 会因此失去闭包 owner。
+        return None;
+    }
+    if seeds
+        .iter()
+        .zip(&globals)
+        .any(|((seed, _), (global_source, _))| seed.id != *global_source)
+    {
+        return None;
+    }
+    if globals.len() > 1 {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：精确同序的 singleton handoff 原本按
+        // 声明顺序写 global；Lua 5.5 多目标 global 声明会按目标逆序写入，
+        // `_ENV.__newindex` 可观察该反转，见 regress_335/regress_409。
         return None;
     }
 
     let mut merged_bindings = Vec::with_capacity(globals.len());
     let mut merged_values = Vec::with_capacity(globals.len());
     for ((seed, value), (global_source, global_binding)) in seeds.iter().zip(&globals) {
-        if seed.id != *global_source {
-            // 候选拒绝[SemanticBarrier:EvalOrder]：seed 与 global handoff 次序不一致时，合成多声明会把 initializer/global 写入重排；regress335 通过 `_ENV.__newindex` 区分 `y,x` 与 `x,y`。
-            return None;
-        }
+        debug_assert_eq!(seed.id, *global_source);
         match seed.origin {
             AstLocalOrigin::Recovered => {}
             AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
@@ -112,7 +120,9 @@ fn try_merge_seed_global_run(
             }
         }
         if use_index.count_uses_in_suffix(start, seed.id) != 1 {
-            // 候选拒绝[SemanticBarrier:Capture]：唯一允许的 seed use 是对应 global handoff；initializer capture 或 run 后 use 都依赖被删 local，regress335 的闭包 seed 会变成未绑定引用。
+            // 候选拒绝[SemanticBarrier:Scope]：唯一允许的 seed use 是对应 global
+            // handoff；如 `global out=seed; return function() return seed end`，删除声明会
+            // 让后续 direct/captured use 失去 local owner。
             return None;
         }
         if stmts[index..]
@@ -126,12 +136,6 @@ fn try_merge_seed_global_run(
         }
         merged_bindings.push(global_binding.clone());
         merged_values.push(value.clone());
-    }
-
-    if merged_bindings.len() > 1 {
-        // 候选拒绝[SemanticBarrier:EvalOrder]：Lua 5.5 的多目标 global 声明按目标
-        // 逆序写入；合并顺序 singleton handoff 会反转 `_ENV.__newindex` 可观察顺序。
-        return None;
     }
 
     Some((

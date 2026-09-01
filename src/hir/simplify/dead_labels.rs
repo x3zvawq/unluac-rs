@@ -64,9 +64,9 @@ fn label_is_removable(
     if referenced.contains(&label.id) {
         return false;
     }
-    // 候选拒绝[SemanticBarrier:Lifetime]：raw TBC/Close 尚未被 close-scopes 消费时，
-    // 当前 epoch 的 active 与 inactive label 共同记录词法转换；提前删除会扩大
-    // `<close>` 生命周期（regress_328_dead_label_tbc_barrier）。
+    // 候选拒绝[LayerBoundary]：raw TBC/Close 尚未收敛时，这些 label 是 close-scopes
+    // owner 的 active-set/epoch 输入；该 owner 消费 cleanup 后会触发下一轮 Deferred
+    // dead-labels 再审计（regress_328_dead_label_tbc_barrier）。
     !pending_tbc_boundaries.contains(&label.id)
 }
 
