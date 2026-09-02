@@ -261,4 +261,22 @@ pub(super) const REGRESSION_CASES_401_500: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_456_generic_for_exit_result_home.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_457_luau_repeat_continue_scope_latch.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_O0_ONLY),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_458_luau_copy_root_call_move_overwrite.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_O0_ONLY),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_459_repeat_tail_safe_closure.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_460_non_tail_callable_root.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
 ];

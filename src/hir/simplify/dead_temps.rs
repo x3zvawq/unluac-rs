@@ -1143,6 +1143,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1212,6 +1213,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let mut block = block(vec![
@@ -1289,6 +1291,8 @@ mod tests {
                         method: false,
                         fastcall: None,
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     })),
                 ),
                 HirStmt::If(Box::new(HirIf {
@@ -1580,6 +1584,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
         ]);
         let stable_visible_bindings = StableVisibleBindings {
@@ -1641,6 +1646,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ]))),
         ]);

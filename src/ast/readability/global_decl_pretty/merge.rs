@@ -1,9 +1,9 @@
-//! 这个子模块负责把一串 seed local 运行合并成更自然的 global decl 形状。
+//! 这个子模块负责把 singleton seed local handoff 合并成更自然的 global decl 形状。
 //!
-//! 它依赖 binding-flow/binding-tree 已确认这些 local 只是过渡壳，不会越权去推断缺失的
-//! global 名称来源。接受候选必须是同序精确双射，且只删除无 provenance/lifetime 约束的
-//! Recovered seed。
-//! 例如：连续的 `local g = _ENV.g` seed 运行，会在这里尝试折成一条更紧凑的 global 声明。
+//! 它使用 typed binding identity 与 `BindingUseIndex`，并消费 HIR rewrite authority/origin；
+//! 不会越权推断缺失的 global 名称来源。接受候选必须是 singleton 精确 handoff，且只删除
+//! 无 provenance/lifetime 约束的 Recovered seed。
+//! 例如：`local seed = value; global g = seed` 会在这里尝试折成 `global g = value`。
 
 use super::super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
 use super::super::binding_ref::binding_from_name_ref;

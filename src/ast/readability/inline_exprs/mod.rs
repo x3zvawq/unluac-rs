@@ -1402,6 +1402,8 @@ mod tests {
                 })),
                 args: vec![arg],
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             })),
         }))
     }
@@ -1413,6 +1415,8 @@ mod tests {
             })),
             args: vec![arg],
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1421,6 +1425,7 @@ mod tests {
             targets: vec![AstLValue::Name(target.to_name_ref())],
             values: vec![value],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1513,6 +1518,7 @@ mod tests {
                     }))],
                     values: vec![AstExpr::Var(second.to_name_ref())],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 })),
                 return_values(vec![AstExpr::Integer(0)]),
             ],
@@ -1864,6 +1870,7 @@ mod tests {
                     targets: vec![AstLValue::Name(target.clone())],
                     values: vec![AstExpr::Var(snapshot.to_name_ref())],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 })),
                 assign_name(source, AstExpr::Nil),
             ],
@@ -1937,6 +1944,7 @@ mod tests {
                     targets: vec![AstLValue::Name(sink.to_name_ref())],
                     values: vec![AstExpr::Nil],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -2295,12 +2303,15 @@ mod tests {
                         callee: AstExpr::Var(binding.to_name_ref()),
                         args: Vec::new(),
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     })),
                 })),
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::Name(binding.to_name_ref())],
                     values: vec![global("replacement")],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -2340,6 +2351,8 @@ mod tests {
                         callee: AstExpr::Var(binding.to_name_ref()),
                         args: vec![AstExpr::Boolean(true)],
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     })),
                 })),
             ],
@@ -2387,6 +2400,8 @@ mod tests {
                         callee: AstExpr::Var(binding.to_name_ref()),
                         args: vec![AstExpr::Boolean(true)],
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     })),
                 })),
             ],
@@ -2582,6 +2597,8 @@ mod tests {
             })),
             args: Vec::new(),
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }));
         let logical = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
             lhs: AstExpr::Var(binding.to_name_ref()),

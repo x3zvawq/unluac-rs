@@ -180,6 +180,7 @@ impl<'a> AstLowerer<'a> {
                 PackLoweringContext::TargetCounted(assign.targets.len()),
             )?,
             initializer_merge_transaction: assign.initializer_merge_transaction,
+            method_rewrite_transaction: assign.method_rewrite_transaction,
         })
     }
 
@@ -395,28 +396,33 @@ impl<'a> AstLowerer<'a> {
 
         let callee = self.lower_expr(proto_index, &call.callee)?;
 
-        if call.method
-            && call.method_key.is_none()
-            && let AstExpr::FieldAccess(access) = callee
-        {
+        if call.method && call.method_key.is_none() {
             if args.is_empty() {
                 return Err(AstLowerError::InvalidMethodCallPattern {
                     proto: proto_index,
                     reason: "method call must keep the implicit receiver as its first argument",
                 });
             }
-            args.remove(0);
-            return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
-                receiver: access.base,
-                method: access.field,
-                args,
-            })));
+            if matches!(&callee, AstExpr::FieldAccess(access) if args.first() == Some(&access.base))
+            {
+                let AstExpr::FieldAccess(access) = callee else {
+                    unreachable!("method fallback candidate must remain a field access");
+                };
+                args.remove(0);
+                return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                    receiver: access.base,
+                    method: access.field,
+                    args,
+                })));
+            }
         }
 
         Ok(AstCallKind::Call(Box::new(AstCallExpr {
             callee,
             args,
             method_key: call.method_key.clone(),
+            callee_root_handoff: call.callee_root_handoff,
+            method_rewrite_transaction: call.method_rewrite_transaction,
         })))
     }
 

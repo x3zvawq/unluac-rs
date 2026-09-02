@@ -151,6 +151,8 @@ fn rewrite_installer_iife_stmt(stmt: &AstStmt, next_synthetic_local: usize) -> O
                 callee: AstExpr::Var(AstNameRef::SyntheticLocal(binding_id)),
                 args: call.args.clone(),
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             })),
         })),
     ];
@@ -457,6 +459,8 @@ mod tests {
                 })),
                 args: Vec::new(),
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             })),
         }))
     }

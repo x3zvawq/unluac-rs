@@ -176,12 +176,15 @@ mod tests {
     use super::{
         ColorMode, FailureOutputMode, MachineFailure, Options, PlainProgressDetail, ProgressMode,
         is_help_request, matches_case_filters, normalize_runner_failure, parse_args,
-        parse_machine_failure, sorted_failure_counts,
+        parse_machine_failure,
+        run::{progress_heartbeat_is_due, progress_heartbeat_wait},
+        sorted_failure_counts,
     };
     #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
     #[cfg(windows)]
     use std::os::windows::process::ExitStatusExt;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parse_args_should_accept_options() {
@@ -276,6 +279,24 @@ mod tests {
             500,
             500,
         ));
+    }
+
+    #[test]
+    fn persistent_progress_heartbeat_uses_the_last_visible_output_deadline() {
+        let last_persistent = Instant::now();
+        let before_deadline = last_persistent + Duration::from_secs(9);
+        let at_deadline = last_persistent + super::PROGRESS_HEARTBEAT_INTERVAL;
+
+        assert_eq!(
+            progress_heartbeat_wait(last_persistent, before_deadline),
+            Duration::from_secs(1)
+        );
+        assert!(!progress_heartbeat_is_due(last_persistent, before_deadline));
+        assert_eq!(
+            progress_heartbeat_wait(last_persistent, at_deadline),
+            Duration::ZERO
+        );
+        assert!(progress_heartbeat_is_due(last_persistent, at_deadline));
     }
 
     #[test]

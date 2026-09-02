@@ -18,11 +18,142 @@ use super::super::binding_flow::{
 };
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_stable_context_expr;
+use super::super::visit::{AstVisitor, visit_block};
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstGlobalDecl, AstIf,
-    AstLocalAttr, AstLocalBinding, AstLocalOrigin, AstMethodCallExpr, AstNameRef, AstReturn,
-    AstStmt,
+    AstLocalAttr, AstLocalBinding, AstLocalOrigin, AstMethodCallExpr, AstModule, AstNameRef,
+    AstReturn, AstStmt,
 };
+use crate::ast::readability::walk::{self, AstRewritePass};
+use crate::hir::HirMethodRewriteTransactionId;
+
+#[derive(Default)]
+struct MethodTransactionEndpointCount {
+    producers: usize,
+    calls: usize,
+}
+
+pub(super) struct MethodRewriteTransactionIndex {
+    function: crate::hir::HirProtoRef,
+    endpoints:
+        std::collections::BTreeMap<HirMethodRewriteTransactionId, MethodTransactionEndpointCount>,
+}
+
+impl MethodRewriteTransactionIndex {
+    pub(super) fn for_function_body(
+        function: crate::hir::HirProtoRef,
+        block: &crate::ast::common::AstBlock,
+    ) -> Self {
+        let mut index = Self {
+            function,
+            endpoints: std::collections::BTreeMap::new(),
+        };
+        visit_block(block, &mut index);
+        index
+    }
+
+    fn is_unique(
+        &self,
+        transaction: HirMethodRewriteTransactionId,
+        protocol: crate::hir::HirMethodSetupProtocolId,
+    ) -> bool {
+        transaction.matches_protocol(self.function, protocol)
+            && self
+                .endpoints
+                .get(&transaction)
+                .is_some_and(|count| count.producers == 1 && count.calls == 1)
+    }
+}
+
+impl AstVisitor for MethodRewriteTransactionIndex {
+    fn visit_function_expr(&mut self, _function: &crate::ast::common::AstFunctionExpr) -> bool {
+        // 事务身份按 HIR proto 签发；嵌套函数会在进入自身 proto 时另建索引，外层统计必须止步。
+        false
+    }
+
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        if let AstStmt::Assign(assign) = stmt
+            && let Some(transaction) = assign.method_rewrite_transaction
+        {
+            self.endpoints.entry(transaction).or_default().producers += 1;
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &AstExpr) {
+        if let AstExpr::Call(call) = expr
+            && let Some(transaction) = call.method_rewrite_transaction
+        {
+            self.endpoints.entry(transaction).or_default().calls += 1;
+        }
+    }
+
+    fn visit_call(&mut self, call: &AstCallKind) {
+        if let AstCallKind::Call(call) = call
+            && let Some(transaction) = call.method_rewrite_transaction
+        {
+            self.endpoints.entry(transaction).or_default().calls += 1;
+        }
+    }
+}
+
+/// 消费 HIR 已保留的 raw method key，把最终 AST 中已经同点求值的调用写成冒号语法。
+///
+/// 这里只改写 call 节点本身，不删除 receiver/callee producer。字段访问已经位于 call
+/// prefix 时，`receiver.field(receiver, args)` 与 `receiver:field(args)` 的求值点、次数和
+/// 顺序完全一致；raw key 则排除普通点调用的形状猜测。
+pub(super) fn recover_proven_direct_method_calls(module: &mut AstModule) -> bool {
+    walk::rewrite_module(module, &mut ProvenDirectMethodCallPass)
+}
+
+struct ProvenDirectMethodCallPass;
+
+impl AstRewritePass for ProvenDirectMethodCallPass {
+    fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
+        let AstStmt::CallStmt(call_stmt) = stmt else {
+            return false;
+        };
+        let AstCallKind::Call(call) = &call_stmt.call else {
+            return false;
+        };
+        let Some(method_call) = proven_direct_method_call(call) else {
+            return false;
+        };
+        call_stmt.call = AstCallKind::MethodCall(Box::new(method_call));
+        true
+    }
+
+    fn rewrite_expr(&mut self, expr: &mut AstExpr) -> bool {
+        let AstExpr::Call(call) = expr else {
+            return false;
+        };
+        let Some(method_call) = proven_direct_method_call(call) else {
+            return false;
+        };
+        *expr = AstExpr::MethodCall(Box::new(method_call));
+        true
+    }
+}
+
+fn proven_direct_method_call(call: &AstCallExpr) -> Option<AstMethodCallExpr> {
+    let method_key = call.method_key.as_ref()?.as_utf8()?;
+    let AstExpr::FieldAccess(access) = &call.callee else {
+        return None;
+    };
+    if access.field != method_key {
+        return None;
+    }
+    let [receiver, args @ ..] = call.args.as_slice() else {
+        return None;
+    };
+    if receiver != &access.base {
+        return None;
+    }
+    Some(AstMethodCallExpr {
+        receiver: access.base.clone(),
+        method: access.field.clone(),
+        args: args.to_vec(),
+    })
+}
 
 pub(super) fn try_recover_method_alias_stmt(
     stmts: &[AstStmt],
@@ -38,6 +169,60 @@ pub(super) fn try_recover_method_alias_stmt(
             mutable_snapshots,
         )
     })
+}
+
+pub(super) fn try_recover_certified_method_setup(
+    stmts: &[AstStmt],
+    transactions: &MethodRewriteTransactionIndex,
+) -> Option<(AstStmt, usize)> {
+    let [AstStmt::Assign(assign), AstStmt::CallStmt(call_stmt), ..] = stmts else {
+        return None;
+    };
+    let transaction = assign.method_rewrite_transaction?;
+    let AstCallKind::Call(call) = &call_stmt.call else {
+        return None;
+    };
+    let Some(crate::hir::HirCallRootHandoff::MethodCallee(protocol)) = call.callee_root_handoff
+    else {
+        return None;
+    };
+    if call.method_rewrite_transaction != Some(transaction)
+        || !transactions.is_unique(transaction, protocol)
+    {
+        return None;
+    }
+    let ([crate::ast::common::AstLValue::Name(target)], [AstExpr::FieldAccess(access)]) =
+        (assign.targets.as_slice(), assign.values.as_slice())
+    else {
+        return None;
+    };
+    let AstExpr::Var(callee) = &call.callee else {
+        return None;
+    };
+    let [receiver, args @ ..] = call.args.as_slice() else {
+        return None;
+    };
+    let method = call.method_key.as_ref()?.as_utf8()?;
+    if target != callee || receiver != &access.base || method != access.field {
+        return None;
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg, AstExpr::Var(name) if name == target))
+    {
+        return None;
+    }
+
+    Some((
+        AstStmt::CallStmt(Box::new(AstCallStmt {
+            call: AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                receiver: access.base.clone(),
+                method: access.field.clone(),
+                args: args.to_vec(),
+            })),
+        })),
+        2,
+    ))
 }
 
 pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
@@ -805,6 +990,8 @@ mod tests {
                     })),
                     args: vec![AstExpr::Var(receiver.to_name_ref())],
                     method_key: None,
+                    callee_root_handoff: None,
+                    method_rewrite_transaction: None,
                 })),
                 body: AstBlock::default(),
             })),

@@ -1378,8 +1378,11 @@ mod tests {
                 })),
                 args: Vec::new(),
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             }))],
             initializer_merge_transaction: assign_token,
+            method_rewrite_transaction: None,
         }));
         (declaration, assignment)
     }
@@ -1417,6 +1420,7 @@ mod tests {
                     targets: vec![AstLValue::Name(binding.to_name_ref())],
                     values: vec![AstExpr::Integer(1)],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         }
@@ -1441,6 +1445,7 @@ mod tests {
             targets: vec![AstLValue::Name(binding.to_name_ref())],
             values: vec![AstExpr::Integer(1)],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1575,8 +1580,11 @@ mod tests {
                 })),
                 args: Vec::new(),
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             }))],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
 
         assert!(try_merge_local_decl_with_assign(&declaration, &assignment).is_none());
@@ -1737,6 +1745,7 @@ mod tests {
                             }))],
                             values: vec![AstExpr::Var(binding.to_name_ref())],
                             initializer_merge_transaction: None,
+                            method_rewrite_transaction: None,
                         })),
                         label(0),
                         AstStmt::DoBlock(Box::new(AstBlock {

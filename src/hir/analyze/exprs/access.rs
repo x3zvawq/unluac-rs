@@ -74,6 +74,9 @@ pub(crate) fn lower_table_access_expr(
     HirExpr::TableAccess(Box::new(HirTableAccess {
         base: lower_access_base_expr(lowering, block, instr_ref, base),
         key: lower_access_key_expr(lowering, block, instr_ref, key),
+        method_setup_protocol: lowering
+            .promotion_facts
+            .method_setup_protocol_for_get(instr_ref),
     }))
 }
 
@@ -112,6 +115,8 @@ pub(crate) fn lower_raw_table_set_call(
         method: false,
         fastcall: None,
         method_key: None,
+        callee_root_handoff: None,
+        method_rewrite_transaction: None,
     }
 }
 
@@ -129,6 +134,7 @@ pub(crate) fn lower_table_access_target(
     HirLValue::TableAccess(Box::new(HirTableAccess {
         base: lower_access_base_expr(lowering, block, instr_ref, base),
         key: lower_access_key_expr(lowering, block, instr_ref, key),
+        method_setup_protocol: None,
     }))
 }
 
@@ -146,6 +152,9 @@ pub(crate) fn lower_table_access_expr_inline(
     HirExpr::TableAccess(Box::new(HirTableAccess {
         base: lower_access_base_expr_inline(lowering, block, instr_ref, base),
         key: lower_access_key_expr_inline(lowering, block, instr_ref, key),
+        method_setup_protocol: lowering
+            .promotion_facts
+            .method_setup_protocol_for_get(instr_ref),
     }))
 }
 
@@ -232,6 +241,9 @@ pub(crate) fn lower_table_access_expr_single_eval(
     HirExpr::TableAccess(Box::new(HirTableAccess {
         base: lower_access_base_expr_single_eval(lowering, block, instr_ref, base),
         key: lower_access_key_expr_single_eval(lowering, block, instr_ref, key),
+        method_setup_protocol: lowering
+            .promotion_facts
+            .method_setup_protocol_for_get(instr_ref),
     }))
 }
 
@@ -255,6 +267,8 @@ fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
         method: false,
         fastcall: None,
         method_key: None,
+        callee_root_handoff: None,
+        method_rewrite_transaction: None,
     }))
 }
 

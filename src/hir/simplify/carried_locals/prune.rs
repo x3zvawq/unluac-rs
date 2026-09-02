@@ -1254,6 +1254,7 @@ mod tests {
             values: HirValuePack::expanding(vec![HirExpr::LocalRef(binding)], tail.clone()),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         let facts = mirror_facts(mirror, binding);
 
@@ -1274,6 +1275,7 @@ mod tests {
                 values: HirValuePack::expanding(Vec::new(), tail),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         );
     }
@@ -1290,6 +1292,7 @@ mod tests {
             ),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         let before = stmt.clone();
         let facts = mirror_facts(mirror, binding);

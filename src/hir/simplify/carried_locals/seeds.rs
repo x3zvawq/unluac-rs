@@ -196,6 +196,7 @@ mod tests {
             ]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -224,6 +225,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::LocalRef(LocalId(0))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
 
         assert!(binding_handoff_seed(&stmt).is_none());
@@ -236,6 +238,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::LocalRef(LocalId(0))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
 
         assert!(binding_handoff_seed(&stmt).is_none());
@@ -256,6 +259,7 @@ mod tests {
             ]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
 
         let seed = binding_handoff_seed(&stmt)

@@ -15,16 +15,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBinaryOpKind, AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstFunctionName,
-    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstStmt,
-    AstTargetDialect, AstUnaryOpKind,
+    AstBinaryOpKind, AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstLValue,
+    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef,
+    AstRewriteAuthority, AstStmt, AstTargetDialect, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{BindingUseIndex, binding_mentions_in_expr, binding_mentions_in_stmt};
 use super::expr_analysis::is_discard_safe_expr_for_target;
 use super::global_decl_pretty::{VisibleGlobals, extending_global_scope_preserves_expr};
+use super::repeat_lifetime::{
+    binding_must_live_through_condition, hir_binding_may_end_before_condition,
+};
 use super::walk::{self, AstRewritePass, BlockKind, ScopedAstRewritePass};
 use crate::ast::traverse::traverse_expr_children;
+use crate::hir::HirRepeatConditionLifetimeFacts;
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let mut changed = walk::rewrite_module(
@@ -78,11 +82,11 @@ impl ScopedAstRewritePass for RepeatTailCleanupPass {
         &mut self,
         block: &mut AstBlock,
         condition: &AstExpr,
-        _lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
+        lifetime: &HirRepeatConditionLifetimeFacts,
         incoming: &Self::Scope,
     ) -> (bool, Self::Scope) {
         (
-            flatten_repeat_tail_do_blocks(block, condition, incoming),
+            flatten_repeat_tail_do_blocks(block, condition, lifetime, incoming),
             incoming.clone(),
         )
     }
@@ -153,7 +157,7 @@ fn cleanup_block(
     // 因而可安全去掉缩进壳（regress344 覆盖函数尾 `<close>` + return）。
     while trailing_condition.is_none()
         && let Some(AstStmt::DoBlock(nested)) = block.stmts.last()
-        && trailing_do_block_is_scope_neutral(nested, false)
+        && trailing_do_block_is_scope_neutral(nested, None)
     {
         let Some(AstStmt::DoBlock(nested)) = block.stmts.pop() else {
             unreachable!();
@@ -624,11 +628,12 @@ fn split_overwritten_call_result(
 fn flatten_repeat_tail_do_blocks(
     block: &mut AstBlock,
     condition: &AstExpr,
+    lifetime: &HirRepeatConditionLifetimeFacts,
     incoming_globals: &VisibleGlobals,
 ) -> bool {
     let mut changed = false;
     while let Some(AstStmt::DoBlock(nested)) = block.stmts.last() {
-        if !trailing_do_block_is_scope_neutral(nested, true) {
+        if !trailing_do_block_is_scope_neutral(nested, Some(lifetime)) {
             break;
         }
 
@@ -654,8 +659,11 @@ fn flatten_repeat_tail_do_blocks(
     changed
 }
 
-fn trailing_do_block_is_scope_neutral(block: &AstBlock, crosses_trailing_condition: bool) -> bool {
-    if !crosses_trailing_condition {
+fn trailing_do_block_is_scope_neutral(
+    block: &AstBlock,
+    repeat_lifetime: Option<&HirRepeatConditionLifetimeFacts>,
+) -> bool {
+    let Some(repeat_lifetime) = repeat_lifetime else {
         if block.stmts.iter().any(|stmt| {
             stmt_declares_debug_binding(stmt) || stmt_declares_hir_preserved_binding(stmt)
         }) {
@@ -668,85 +676,71 @@ fn trailing_do_block_is_scope_neutral(block: &AstBlock, crosses_trailing_conditi
         // 候选接受：尾 do 与普通父 block 在同一控制流出口结束；展开不会移动任何后继
         // 求值；DebugHinted 声明已由上面的语义 guard 排除。
         return true;
-    }
+    };
 
     let scoped_bindings = block
         .stmts
         .iter()
         .flat_map(|stmt| match stmt {
-            AstStmt::LocalDecl(local_decl) => local_decl
-                .bindings
-                .iter()
-                .map(|binding| binding.id)
-                .collect::<Vec<_>>(),
-            AstStmt::LocalFunctionDecl(function_decl) => vec![function_decl.name],
+            AstStmt::LocalDecl(local_decl) => local_decl.bindings.clone(),
+            AstStmt::LocalFunctionDecl(function_decl) => vec![AstLocalBinding {
+                id: function_decl.name,
+                attr: AstLocalAttr::None,
+                origin: function_decl.origin,
+                rewrite_authority: function_decl.rewrite_authority.clone(),
+            }],
             _ => Vec::new(),
         })
-        .collect::<BTreeSet<_>>();
+        .map(|binding| (binding.id, binding))
+        .collect::<BTreeMap<_, _>>();
 
     !block.stmts.iter().any(|stmt| match stmt {
         // global/global-function 的词法环境由 scoped repeat-tail owner 在 mutation 前通过
         // shared global-scope query 验证；这里仅负责正交的 lifetime/debug 边界。
         AstStmt::GlobalDecl(_) => false,
-        AstStmt::LocalDecl(local_decl) => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：`repeat do local x <close> = v end until cond()`
-            // 拍平会把 `__close` 推迟到 cond 后；regress246 由 cond 断言逐轮 close 已发生。
-            local_decl
-                .bindings
-                .iter()
-                .any(|binding| binding.attr == AstLocalAttr::Close)
-                // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot local 拍平后会在生成源码中
-                // 活过 condition；lua54_01_close#18 用 `__gc` 证明未读 root 的域末可观察。
-                || local_decl
-                    .bindings
-                    .iter()
-                    .any(|binding| binding.origin.is_physical_root())
-                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 的显式 repeat 内层词法域可由 debug API 观察。
-                || local_decl
-                    .bindings
-                    .iter()
-                    .any(|binding| binding.origin.is_debug_hinted())
-                || local_decl
-                    .bindings
-                    .iter()
-                    .any(|binding| !binding.rewrite_authority.may_shorten_lifetime())
-                // 候选拒绝[SemanticBarrier:Lifetime]：repeat 尾 closure 拍平会让 closure 及
-                // captured object 活过 condition；regress378 在 condition 中以 `__gc` 观察。
-                || local_decl
-                    .values
-                    .iter()
-                    .any(expr_contains_function)
+        AstStmt::LocalDecl(local_decl) => local_decl.bindings.iter().any(|binding| {
+            binding_must_live_through_condition(binding, repeat_lifetime)
+                || matches!(binding.rewrite_authority, AstRewriteAuthority::AstOwned)
+                    && (binding.origin.is_physical_root()
+                        || local_decl.values.iter().any(expr_contains_function))
+        }),
+        AstStmt::LocalFunctionDecl(function_decl) => {
+            let binding = scoped_bindings
+                .get(&function_decl.name)
+                .expect("direct local function must be indexed as a scoped binding");
+            binding_must_live_through_condition(binding, repeat_lifetime)
+                // AST-owned local function 没有 HIR endpoint certificate；其闭包 root 继续
+                // 由当前候选的源码层保守证明约束。
+                || matches!(binding.rewrite_authority, AstRewriteAuthority::AstOwned)
         }
-        // 候选拒绝[SemanticBarrier:Lifetime]：local function 与上述 closure 是同一 root
-        // 延长；regress378 证明运行时差异，direct AST unit 覆盖 assign 表示。
-        AstStmt::LocalFunctionDecl(_) => true,
         AstStmt::Assign(assign) => {
-            // 候选拒绝[SemanticBarrier:Lifetime]：`local f; f=function() end` 的函数值由
-            // 当前 do 内 local 持有；拍平会让该 root 活过 condition。Temp/SyntheticLocal
-            // 是 AST build 暂时提升到函数根部的声明，保留 do 后 statement-merge 才能把它
-            // 下沉回准确的词法 owner；regress378 覆盖该 bytecode 路径。真正的外层 source
-            // local 不扩大当前 do 的任何 binding 生命周期。
+            // HIR-origin scoped binding 已在直属声明处消费 endpoint certificate。这里只
+            // 保留 AST-owned binding 与未能确认来源的 hoisted carrier。
             assign.values.iter().any(expr_contains_function)
                 && assign.targets.iter().any(|target| {
                     matches!(
                         target,
                         AstLValue::Name(name)
-                            if AstBindingRef::from_name_ref(name)
-                                .is_some_and(|binding| nested_or_hoisted_binding(
+                            if AstBindingRef::from_name_ref(name).is_some_and(|binding| {
+                                closure_target_needs_scope_barrier(
                                     binding,
-                                    &scoped_bindings
-                                ))
+                                    &scoped_bindings,
+                                    repeat_lifetime,
+                                )
+                            })
                     )
                 })
         }
         AstStmt::FunctionDecl(function_decl) => {
             let path = match &function_decl.target {
-                AstFunctionName::Plain(path) | AstFunctionName::Method(path, _) => path,
+                crate::ast::common::AstFunctionName::Plain(path)
+                | crate::ast::common::AstFunctionName::Method(path, _) => path,
             };
             // 候选拒绝[SemanticBarrier:Lifetime]：`local holder={}; function holder.f() end`
             // 让当前 do 的 holder 持有函数 root；拍平会把 holder 延寿到 condition 之后。
-            AstBindingRef::from_name_ref(&path.root)
-                .is_some_and(|binding| nested_or_hoisted_binding(binding, &scoped_bindings))
+            AstBindingRef::from_name_ref(&path.root).is_some_and(|binding| {
+                closure_target_needs_scope_barrier(binding, &scoped_bindings, repeat_lifetime)
+            })
         }
         _ => {
             // 候选接受：其余语句不在 repeat 条件前引入 global、资源 local，或由当前
@@ -780,15 +774,21 @@ fn stmt_declares_hir_preserved_binding(stmt: &AstStmt) -> bool {
     }
 }
 
-fn nested_or_hoisted_binding(
+fn closure_target_needs_scope_barrier(
     binding: AstBindingRef,
-    scoped_bindings: &BTreeSet<AstBindingRef>,
+    scoped_bindings: &BTreeMap<AstBindingRef, AstLocalBinding>,
+    lifetime: &HirRepeatConditionLifetimeFacts,
 ) -> bool {
-    scoped_bindings.contains(&binding)
-        || matches!(
-            binding,
-            AstBindingRef::Temp(_) | AstBindingRef::SyntheticLocal(_)
-        )
+    if let Some(binding) = scoped_bindings.get(&binding) {
+        return matches!(binding.rewrite_authority, AstRewriteAuthority::AstOwned);
+    }
+    match binding {
+        AstBindingRef::Temp(_) => !hir_binding_may_end_before_condition(binding, lifetime),
+        // 缺少 declaration authority 时，SyntheticLocal 可能是 AST 自建身份，不能只凭
+        // 数字碰巧相同就借用 HIR temp certificate。
+        AstBindingRef::SyntheticLocal(_) => true,
+        AstBindingRef::Local(_) => false,
+    }
 }
 
 fn expr_contains_function(expr: &AstExpr) -> bool {
@@ -999,13 +999,14 @@ fn operation_rejection(expr: &AstExpr, target: AstTargetDialect) -> UnusedValueR
 mod tests {
     use super::*;
     use crate::ast::common::{
-        AstAssign, AstCallExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalAttr, AstGlobalBinding,
-        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLValue, AstLocalBinding,
-        AstLocalFunctionDecl, AstLogicalExpr, AstNamePath, AstNameRef, AstRepeat, AstReturn,
+        AstAssign, AstCallExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalAttr,
+        AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLValue,
+        AstLocalBinding, AstLocalFunctionDecl, AstLogicalExpr, AstNamePath, AstNameRef, AstRepeat,
+        AstReturn,
     };
     use crate::hir::{
-        HirExpr, HirPackTail, HirProtoRef, HirValuePack, LocalId, ParamId, TempId,
-        initializer_root_profile,
+        HirExpr, HirInlineDisposition, HirPackTail, HirProtoRef, HirRepeatBinding, HirValuePack,
+        LocalId, ParamId, TempId, initializer_root_profile,
     };
 
     fn recovered_binding() -> AstLocalBinding {
@@ -1024,6 +1025,8 @@ mod tests {
             })),
             args: vec![],
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1055,6 +1058,7 @@ mod tests {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9), call_value()],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
 
         let (call, rewritten) = split_overwritten_call_result(&declaration, &overwrite, target)
@@ -1067,6 +1071,7 @@ mod tests {
             targets: vec![],
             values: vec![AstExpr::Integer(9)],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         assert!(split_overwritten_call_result(&declaration, &missing_target, target).is_none());
         let extra_target = AstStmt::Assign(Box::new(AstAssign {
@@ -1078,6 +1083,7 @@ mod tests {
             ],
             values: vec![AstExpr::Integer(9), AstExpr::Integer(10)],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         assert!(split_overwritten_call_result(&declaration, &extra_target, target).is_none());
 
@@ -1118,6 +1124,7 @@ mod tests {
             targets: vec![AstLValue::Name(debug_binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9)],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         assert!(split_overwritten_call_result(&debug_decl, &debug_write, target).is_none());
 
@@ -1126,6 +1133,8 @@ mod tests {
             callee: AstExpr::Var(binding.id.to_name_ref()),
             args: vec![],
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }));
         let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],
@@ -1137,6 +1146,7 @@ mod tests {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9)],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         let (call, _) = split_overwritten_call_result(&declaration, &overwrite, target)
             .expect("the call stays before the local lexical scope in both shapes");
@@ -1155,6 +1165,7 @@ mod tests {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9), AstExpr::Var(binding.id.to_name_ref())],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         assert!(split_overwritten_call_result(&declaration, &later_rhs_read, target).is_none());
 
@@ -1170,6 +1181,7 @@ mod tests {
             targets: vec![AstLValue::Name(physical_binding.id.to_name_ref())],
             values: vec![AstExpr::Var(AstNameRef::Param(ParamId(0)))],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         let (_, rewritten) = split_overwritten_call_result(&physical_decl, &copy_overwrite, target)
             .expect("an eventless parameter copy cannot observe early root release");
@@ -1182,6 +1194,7 @@ mod tests {
             targets: vec![AstLValue::Name(physical_binding.id.to_name_ref())],
             values: vec![call_value()],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         assert!(
             split_overwritten_call_result(&physical_decl, &eventful_overwrite, target).is_none()
@@ -1210,6 +1223,7 @@ mod tests {
             ],
             values: vec![call_value()],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         assert!(
             split_overwritten_call_result(
@@ -1277,6 +1291,7 @@ mod tests {
                         targets: vec![AstLValue::Name(binding.id.to_name_ref())],
                         values: vec![function_value()],
                         initializer_merge_transaction: None,
+                        method_rewrite_transaction: None,
                     }))],
                 })),
                 AstStmt::Return(Box::new(AstReturn {
@@ -1326,6 +1341,7 @@ mod tests {
                             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
                             values: vec![AstExpr::Integer(1)],
                             initializer_merge_transaction: None,
+                            method_rewrite_transaction: None,
                         })),
                     ],
                 })),
@@ -1376,6 +1392,7 @@ mod tests {
                         targets: vec![AstLValue::Name(AstNameRef::Global(name.clone()))],
                         values: vec![AstExpr::Integer(1)],
                         initializer_merge_transaction: None,
+                        method_rewrite_transaction: None,
                     }))],
                 },
                 captured_bindings: BTreeSet::new(),
@@ -1401,6 +1418,7 @@ mod tests {
                 lhs: AstExpr::Var(AstNameRef::Global(missing.clone())),
                 rhs: nested_write(&stop),
             })),
+            &Default::default(),
             &VisibleGlobals::default(),
         ));
         assert!(matches!(
@@ -1422,6 +1440,7 @@ mod tests {
                 lhs: AstExpr::Var(AstNameRef::Global(missing)),
                 rhs: AstExpr::Var(AstNameRef::Global(stop)),
             })),
+            &Default::default(),
             &VisibleGlobals::default(),
         ));
 
@@ -1477,6 +1496,7 @@ mod tests {
         assert!(flatten_repeat_tail_do_blocks(
             &mut global_function_extension,
             &AstExpr::Var(AstNameRef::Global(function_name)),
+            &Default::default(),
             &VisibleGlobals::default(),
         ));
     }
@@ -1496,13 +1516,13 @@ mod tests {
         let returning_local = AstBlock {
             stmts: vec![declaration.clone(), return_stmt.clone()],
         };
-        assert!(!trailing_do_block_is_scope_neutral(&returning_local, false));
+        assert!(!trailing_do_block_is_scope_neutral(&returning_local, None));
         let falling_through_local = AstBlock {
             stmts: vec![declaration],
         };
         assert!(!trailing_do_block_is_scope_neutral(
             &falling_through_local,
-            false
+            None
         ));
 
         let function = match function_value() {
@@ -1520,20 +1540,21 @@ mod tests {
         };
         assert!(!trailing_do_block_is_scope_neutral(
             &returning_function,
-            false
+            None
         ));
         let falling_through_function = AstBlock {
             stmts: vec![local_function],
         };
         assert!(!trailing_do_block_is_scope_neutral(
             &falling_through_function,
-            false
+            None
         ));
     }
 
     #[test]
     fn keeps_repeat_tail_closure_roots_owned_by_nested_locals() {
         let condition = AstExpr::Boolean(true);
+        let lifetime = HirRepeatConditionLifetimeFacts::default();
         let binding = recovered_binding();
         let assigned_closure = AstBlock {
             stmts: vec![
@@ -1547,10 +1568,14 @@ mod tests {
                     targets: vec![AstLValue::Name(binding.id.to_name_ref())],
                     values: vec![function_value()],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
-        assert!(!trailing_do_block_is_scope_neutral(&assigned_closure, true));
+        assert!(!trailing_do_block_is_scope_neutral(
+            &assigned_closure,
+            Some(&lifetime)
+        ));
 
         let hoisted_temp = AstBindingRef::Temp(TempId(7));
         let hoisted_closure = AstBlock {
@@ -1558,9 +1583,13 @@ mod tests {
                 targets: vec![AstLValue::Name(hoisted_temp.to_name_ref())],
                 values: vec![AstExpr::SingleValue(Box::new(function_value()))],
                 initializer_merge_transaction: None,
+                method_rewrite_transaction: None,
             }))],
         };
-        assert!(!trailing_do_block_is_scope_neutral(&hoisted_closure, true));
+        assert!(!trailing_do_block_is_scope_neutral(
+            &hoisted_closure,
+            Some(&lifetime)
+        ));
         let mut repeat_body = AstBlock {
             stmts: vec![AstStmt::DoBlock(Box::new(hoisted_closure))],
         };
@@ -1597,7 +1626,7 @@ mod tests {
         };
         assert!(!trailing_do_block_is_scope_neutral(
             &rooted_function_decl,
-            true
+            Some(&lifetime)
         ));
 
         let outer_binding = AstBindingRef::Local(LocalId(99));
@@ -1606,8 +1635,52 @@ mod tests {
                 targets: vec![AstLValue::Name(outer_binding.to_name_ref())],
                 values: vec![function_value()],
                 initializer_merge_transaction: None,
+                method_rewrite_transaction: None,
             }))],
         };
-        assert!(trailing_do_block_is_scope_neutral(&outer_assignment, true));
+        assert!(trailing_do_block_is_scope_neutral(
+            &outer_assignment,
+            Some(&lifetime)
+        ));
+    }
+
+    #[test]
+    fn repeat_tail_hir_closure_requires_its_endpoint_certificate() {
+        let mut binding = recovered_binding();
+        binding.rewrite_authority = AstRewriteAuthority::Hir(HirInlineDisposition::Unknown);
+        let hir_closure = AstBlock {
+            stmts: vec![AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                bindings: vec![binding],
+                values: vec![function_value()],
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
+            }))],
+        };
+
+        assert!(!trailing_do_block_is_scope_neutral(
+            &hir_closure,
+            Some(&HirRepeatConditionLifetimeFacts::default())
+        ));
+
+        let certified = HirRepeatConditionLifetimeFacts {
+            may_end_before_condition: BTreeSet::from([HirRepeatBinding::Local(LocalId(0))]),
+        };
+        assert!(trailing_do_block_is_scope_neutral(
+            &hir_closure,
+            Some(&certified)
+        ));
+
+        let ast_owned_closure = AstBlock {
+            stmts: vec![AstStmt::LocalDecl(Box::new(AstLocalDecl {
+                bindings: vec![recovered_binding()],
+                values: vec![function_value()],
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
+            }))],
+        };
+        assert!(!trailing_do_block_is_scope_neutral(
+            &ast_owned_closure,
+            Some(&certified)
+        ));
     }
 }

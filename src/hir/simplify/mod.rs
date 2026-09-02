@@ -23,6 +23,8 @@ mod local_shapes;
 mod locals;
 mod logical_simplify;
 mod mention;
+mod method_protocol;
+mod method_rewrite_transactions;
 mod repeat_root_lifetimes;
 mod residuals;
 mod root_lifetimes;
@@ -354,6 +356,13 @@ pub(super) fn simplify_hir(
 
     timings.record("repeat-root-lifetimes", || {
         repeat_root_lifetimes::mark_repeat_trailing_condition_roots(module, promotion_facts, safety)
+    });
+    timings.record("method-rewrite-transactions", || {
+        for proto in &mut module.protos {
+            if let Some(facts) = promotion_facts.get(proto.id.index()) {
+                method_rewrite_transactions::finalize_method_rewrite_transactions(proto, facts);
+            }
+        }
     });
     let residuals = residuals::collect_hir_exit_residuals(module);
     if residuals.has_soft_residuals() && generate_mode != GenerateMode::Permissive {

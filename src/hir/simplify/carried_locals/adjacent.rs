@@ -97,6 +97,7 @@ pub(super) fn try_collapse_guarded_local_update(
         values,
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        method_rewrite_transaction: None,
     }));
 
     let mut rewrites = BTreeMap::new();
@@ -867,6 +868,7 @@ mod tests {
                             values: HirValuePack::fixed(vec![HirExpr::LocalRef(next)]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
                         }))],
                     },
                     else_block: Some(block(empty_return())),

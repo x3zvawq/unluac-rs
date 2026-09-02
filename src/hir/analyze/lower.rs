@@ -473,6 +473,12 @@ fn lower_proto_one(
         &bindings.fixed_temps,
         &bindings.phi_temps,
     );
+    super::method_setups::record_method_setup_protocols(
+        proto,
+        dataflow,
+        &bindings,
+        &mut promotion_facts,
+    );
     for &temp in &bindings.home_free_temps {
         promotion_facts.record_home_free_temp(temp);
     }

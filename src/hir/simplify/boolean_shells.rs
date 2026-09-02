@@ -321,6 +321,7 @@ fn collapse_live_boolean_materialization_shells_in_block(
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         changed = true;
         index += 1;
@@ -589,6 +590,7 @@ mod tests {
                         values: HirValuePack::fixed(vec![HirExpr::Boolean(false)]),
                         initializer_merge_transaction: None,
                         generic_for_initializer_producer: None,
+                        method_rewrite_transaction: None,
                     }))],
                 }),
             })),
@@ -1358,6 +1360,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![reference_closure(HirExpr::TempRef(candidate))]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             boolean_shell(HirLValue::Temp(candidate)),
             HirStmt::Return(Box::new(HirReturn {
@@ -1394,6 +1397,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![reference_closure(HirExpr::TempRef(candidate))]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             boolean_shell(HirLValue::Temp(candidate)),
         ];
@@ -1435,6 +1439,7 @@ mod tests {
                 ]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             boolean_shell(HirLValue::Temp(candidate)),
         ];
@@ -1719,6 +1724,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1728,6 +1734,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1802,6 +1809,8 @@ mod tests {
                 method: false,
                 fastcall: None,
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             },
         }))
     }
@@ -1813,6 +1822,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Boolean(value)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))],
         };
         HirStmt::If(Box::new(HirIf {

@@ -264,6 +264,7 @@ mod tests {
                         key: "sink".into(),
                     }),
                     key: HirExpr::TempRef(key),
+                    method_setup_protocol: None,
                 })),
             ],
             values: HirValuePack::fixed(vec![
@@ -272,6 +273,7 @@ mod tests {
             ]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
 
         assert_eq!(
@@ -296,6 +298,8 @@ mod tests {
                 method: false,
                 fastcall: None,
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             },
         }));
 
@@ -318,6 +322,8 @@ mod tests {
                         method: false,
                         fastcall: None,
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     },
                 }))],
             },

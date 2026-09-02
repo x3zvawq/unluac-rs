@@ -203,8 +203,12 @@ pub(super) const REGRESSION_CASES_001_100: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_39_method_hint_open_arg_call.lua",
-        PUC_LUA_51,
-    ),
+        &[LuaCaseDialect::Lua51, LuaCaseDialect::Lua54],
+    )
+    .with_options(LuaCaseOptions {
+        recompile_rounds: Some(3),
+        ..LuaCaseOptions::DEFAULT
+    }),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_40_branch_state_and_short_prefix_escape.lua",
         PUC_LUA_51,

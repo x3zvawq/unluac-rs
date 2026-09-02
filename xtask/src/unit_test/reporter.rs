@@ -136,9 +136,9 @@ impl Reporter {
         active: usize,
         case: &UnitCaseDescriptor,
         event: ProgressEventKind,
-    ) {
+    ) -> bool {
         if !self.progress_enabled {
-            return;
+            return false;
         }
         match &self.mode {
             ReporterMode::Interactive(progress) => {
@@ -146,16 +146,22 @@ impl Reporter {
                 progress.set_position(completed as u64);
                 progress.set_message(message);
                 if should_emit_progress_milestone(event, completed, total) {
-                    eprintln!(
-                        "{}",
-                        sparse_progress_message(self.palette, completed, total, active)
-                    );
+                    progress.println(sparse_progress_message(
+                        self.palette,
+                        completed,
+                        total,
+                        active,
+                    ));
+                    true
+                } else {
+                    false
                 }
             }
             ReporterMode::Plain => match self.plain_progress_detail {
                 PlainProgressDetail::Verbose => {
                     let message = progress_message(self.palette, completed, total, active, case);
                     eprintln!("{message}");
+                    true
                 }
                 PlainProgressDetail::Sparse => {
                     if should_emit_progress_milestone(event, completed, total) {
@@ -163,6 +169,9 @@ impl Reporter {
                             "{}",
                             sparse_progress_message(self.palette, completed, total, active)
                         );
+                        true
+                    } else {
+                        false
                     }
                 }
             },
@@ -173,10 +182,11 @@ impl Reporter {
         if !self.progress_enabled {
             return;
         }
-        eprintln!(
-            "{}",
-            heartbeat_progress_message(self.palette, completed, total, active)
-        );
+        let text = heartbeat_progress_message(self.palette, completed, total, active);
+        match &self.mode {
+            ReporterMode::Interactive(progress) => progress.println(text),
+            ReporterMode::Plain => eprintln!("{text}"),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

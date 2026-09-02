@@ -276,7 +276,7 @@ LuaCaseMatrixEntry::new(
     ..LuaCaseOptions::DEFAULT
 }),
     LuaCaseMatrixEntry::new(
-        "tests/regress-case/regress_352_multi_return_call_run_accept.lua",
+        "tests/regress-case/regress_352_multi_return_call_root.lua",
         PUC_LUA_ALL,
     )
     .with_options(LuaCaseOptions {

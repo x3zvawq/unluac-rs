@@ -64,29 +64,35 @@ where
     let mut worker_error = None;
     let mut total_protos = 0usize;
     let mut failed_protos = 0usize;
+    let mut last_persistent_progress = Instant::now();
 
     while completed < total && worker_error.is_none() {
-        match event_rx.recv_timeout(PROGRESS_HEARTBEAT_INTERVAL) {
+        let heartbeat_wait = progress_heartbeat_wait(last_persistent_progress, Instant::now());
+        match event_rx.recv_timeout(heartbeat_wait) {
             Ok(WorkerEvent::Started { case }) => {
                 active += 1;
-                reporter.update_progress(
+                if reporter.update_progress(
                     completed,
                     total,
                     active,
                     &case,
                     ProgressEventKind::Started,
-                );
+                ) {
+                    last_persistent_progress = Instant::now();
+                }
             }
             Ok(WorkerEvent::Finished { case, execution }) => {
                 active = active.saturating_sub(1);
                 completed += 1;
-                reporter.update_progress(
+                if reporter.update_progress(
                     completed,
                     total,
                     active,
                     &case,
                     ProgressEventKind::Finished,
-                );
+                ) {
+                    last_persistent_progress = Instant::now();
+                }
 
                 match execution.outcome {
                     UnitCaseOutcome::Passed => {
@@ -133,13 +139,18 @@ where
                     case.display_path()
                 ));
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                reporter.emit_heartbeat(completed, total, active);
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker_error =
                     Some("worker event channel closed before all cases finished".to_owned());
             }
+        }
+        if completed < total
+            && worker_error.is_none()
+            && progress_heartbeat_is_due(last_persistent_progress, Instant::now())
+        {
+            reporter.emit_heartbeat(completed, total, active);
+            last_persistent_progress = Instant::now();
         }
     }
 
@@ -177,6 +188,14 @@ where
     } else {
         bail!("unit runner failed with {failed} failing case(s)")
     }
+}
+
+pub(super) fn progress_heartbeat_wait(last_persistent: Instant, now: Instant) -> Duration {
+    PROGRESS_HEARTBEAT_INTERVAL.saturating_sub(now.saturating_duration_since(last_persistent))
+}
+
+pub(super) fn progress_heartbeat_is_due(last_persistent: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_persistent) >= PROGRESS_HEARTBEAT_INTERVAL
 }
 
 pub(crate) fn print_help() {

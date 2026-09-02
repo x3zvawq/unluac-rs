@@ -842,6 +842,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Nil]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 

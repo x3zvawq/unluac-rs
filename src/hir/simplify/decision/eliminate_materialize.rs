@@ -72,6 +72,8 @@ pub(super) fn extract_call_expr(
         method,
         fastcall,
         method_key,
+        callee_root_handoff,
+        method_rewrite_transaction,
     } = call;
     let (prefix, mut leading, args, changed) =
         extract_value_pack_with_leading(vec![callee], args, state, safety);
@@ -86,6 +88,8 @@ pub(super) fn extract_call_expr(
             method,
             fastcall,
             method_key,
+            callee_root_handoff,
+            method_rewrite_transaction,
         },
         changed,
     )
@@ -257,6 +261,7 @@ pub(super) fn extract_assign(
                     key: leading
                         .next()
                         .expect("table lvalue extraction should preserve its key"),
+                    method_setup_protocol: None,
                 }))
             })
         })
@@ -277,6 +282,7 @@ pub(super) fn extract_assign(
             generic_for_initializer_producer: (!changed)
                 .then_some(generic_for_initializer_producer)
                 .flatten(),
+            method_rewrite_transaction: None,
         },
         changed,
     )
@@ -536,6 +542,7 @@ fn prepare_pure_expr(
             (prefix, HirExpr::LocalRef(local))
         }
         HirExpr::TableAccess(access) => {
+            let method_setup_protocol = access.method_setup_protocol;
             let (prefix, exprs) =
                 prepare_ordered_exprs(vec![access.base, access.key], state, safety);
             let mut exprs = exprs.into_iter();
@@ -547,7 +554,11 @@ fn prepare_pure_expr(
                 .expect("table access extraction should preserve its key");
             (
                 prefix,
-                HirExpr::TableAccess(Box::new(HirTableAccess { base, key })),
+                HirExpr::TableAccess(Box::new(HirTableAccess {
+                    base,
+                    key,
+                    method_setup_protocol,
+                })),
             )
         }
         HirExpr::Unary(unary) => {
@@ -641,6 +652,7 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
         HirExpr::TableAccess(access) => Some(HirExpr::TableAccess(Box::new(HirTableAccess {
             base: collapse_expr_to_pure(access.base, safety)?,
             key: collapse_expr_to_pure(access.key, safety)?,
+            method_setup_protocol: access.method_setup_protocol,
         }))),
         HirExpr::Unary(unary) => Some(HirExpr::Unary(Box::new(HirUnaryExpr {
             op: unary.op,
@@ -726,6 +738,8 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         method: call.method,
         fastcall: call.fastcall,
         method_key: call.method_key,
+        callee_root_handoff: call.callee_root_handoff,
+        method_rewrite_transaction: call.method_rewrite_transaction,
     })
 }
 
@@ -979,5 +993,6 @@ fn assign_stmt(target: HirLValue, value: HirExpr) -> HirStmt {
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        method_rewrite_transaction: None,
     }))
 }

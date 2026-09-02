@@ -197,6 +197,7 @@ fn fold_nil_fallback_decision_locals_in_block(
                         values: HirValuePack::fixed(vec![rewrite.fallback]),
                         initializer_merge_transaction: None,
                         generic_for_initializer_producer: None,
+                        method_rewrite_transaction: None,
                     }))],
                 },
                 else_block: None,
@@ -1047,6 +1048,7 @@ fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt 
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        method_rewrite_transaction: None,
     }))
 }
 
@@ -1128,6 +1130,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 

@@ -540,10 +540,12 @@ impl TableConstructorPass<'_> {
                             targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                                 base: base.clone(),
                                 key: HirExpr::Integer(i64::from(key)),
+                                method_setup_protocol: None,
                             }))],
                             values: HirValuePack::fixed(vec![value.clone()]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
                         }))
                     })
                     .collect::<Vec<_>>();
@@ -2443,6 +2445,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -2503,15 +2507,18 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::TempRef(owner),
                         key: HirExpr::String("missing".into()),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -2552,10 +2559,12 @@ mod tests {
                 targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                     base: HirExpr::TempRef(owner),
                     key: HirExpr::String(key.into()),
+                    method_setup_protocol: None,
                 }))],
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let mut block = HirBlock {
@@ -2565,6 +2574,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(0), LocalId(1)],
@@ -2682,10 +2692,12 @@ mod tests {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::LocalRef(owner),
                         key: HirExpr::String("value".into()),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![call("make_value")]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -2722,6 +2734,7 @@ mod tests {
                     ))]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::TempRef(owner),
@@ -2733,6 +2746,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(30)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -2819,6 +2833,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(30)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -2994,10 +3009,12 @@ mod tests {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::LocalRef(owner),
                         key: call("make_key"),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![call("make_value")]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3049,10 +3066,12 @@ mod tests {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::LocalRef(owner),
                         key: HirExpr::LocalRef(producer),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3123,6 +3142,7 @@ mod tests {
                         HirLValue::TableAccess(Box::new(HirTableAccess {
                             base: HirExpr::LocalRef(owner),
                             key: HirExpr::String("value".into()),
+                            method_setup_protocol: None,
                         })),
                         HirLValue::Local(side),
                     ],
@@ -3132,6 +3152,7 @@ mod tests {
                     ),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3171,10 +3192,12 @@ mod tests {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::LocalRef(owner),
                         key: call("dynamic_key"),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(producer)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3255,10 +3278,12 @@ mod tests {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::LocalRef(nested),
                         key: call("make_key"),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![call("make_value")]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3509,6 +3534,7 @@ mod tests {
                             values: HirValuePack::fixed(vec![HirExpr::LocalRef(replacement)]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
                         }))],
                     },
                     else_block: None,
@@ -3547,6 +3573,7 @@ mod tests {
                             values: HirValuePack::fixed(vec![HirExpr::LocalRef(owner)]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
                         }))],
                     },
                     else_block: None,
@@ -3560,6 +3587,8 @@ mod tests {
                         method: false,
                         fastcall: None,
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     },
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
@@ -3617,6 +3646,7 @@ mod tests {
                 key: "registry".into(),
             }),
             key: HirExpr::String("target".into()),
+            method_setup_protocol: None,
         }));
         let mut block = HirBlock {
             stmts: vec![
@@ -3641,15 +3671,18 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: external_base,
                         key: HirExpr::String("value".into()),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(3)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: match call("tick") {
@@ -3710,6 +3743,8 @@ mod tests {
                         method: false,
                         fastcall: None,
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     },
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
@@ -3746,10 +3781,12 @@ mod tests {
                             key: "registry".into(),
                         }),
                         key: HirExpr::LocalRef(alias),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3788,11 +3825,15 @@ mod tests {
                             method: false,
                             fastcall: None,
                             method_key: None,
+                            callee_root_handoff: None,
+                            method_rewrite_transaction: None,
                         })),
+                        method_setup_protocol: None,
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),

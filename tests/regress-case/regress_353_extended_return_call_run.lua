@@ -1,6 +1,6 @@
--- regress_353_extended_return_call_run: a call run may restore a scalar producer to a non-final return slot
--- unluac: expect-not-contains [[local r4_0 =]]
--- unluac: expect-not-contains [[local r4_1 =]]
+-- regress_353_extended_return_call_run: a non-tail dynamic callee keeps the complete preparation run
+-- unluac: expect-contains [[local r4_0 =]]
+-- unluac: expect-contains [[local r4_1 =]]
 local function make_value(value)
     return value
 end

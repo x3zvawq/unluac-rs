@@ -174,19 +174,19 @@ fn note_repeat_condition_lifetimes(
     roots: &mut RepeatRoots,
     safety: HirExprSafety,
 ) {
-    let direct_bindings = direct_repeat_bindings(&repeat.body);
+    let scoped_bindings = repeat_scoped_bindings(&repeat.body);
     let repeat_key = std::ptr::from_ref(repeat).addr();
     roots
         .repeat_facts
         .entry(repeat_key)
         .or_insert_with(|| HirRepeatConditionLifetimeFacts {
-            may_end_before_condition: direct_bindings
+            may_end_before_condition: scoped_bindings
                 .iter()
                 .filter_map(|binding| repeat_binding(*binding))
                 .collect(),
         });
 
-    for binding in direct_repeat_bindings(&repeat.body) {
+    for binding in scoped_bindings {
         let eventful = !safety.is_discard_safe_without_residual(&repeat.cond);
         let observable = eventful
             && (state.roots.get(&binding).copied().unwrap_or(false)
@@ -287,7 +287,12 @@ fn install_repeat_condition_lifetime_facts(
     changed
 }
 
-fn direct_repeat_bindings(block: &HirBlock) -> BTreeSet<Binding> {
+/// 收集当前 repeat 正文内、词法作用域会在其 condition 之前或之后结束的 HIR binding。
+///
+/// 直属 binding 支持 AST collective 把 suffix 包进新 `do`；嵌套 block binding 支持
+/// cleanup 删除前层已经存在或 AST 早先生成的尾部 `do`。这里只收集稳定 HIR identity，
+/// 是否真的移动某个 block 仍由 AST 对具体候选证明。
+fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<Binding> {
     let mut bindings = BTreeSet::new();
     for stmt in &block.stmts {
         match stmt {
@@ -301,7 +306,38 @@ fn direct_repeat_bindings(block: &HirBlock) -> BTreeSet<Binding> {
                     .filter_map(binding_from_lvalue)
                     .filter(|binding| matches!(binding, Binding::Temp(_))),
             ),
-            _ => {}
+            HirStmt::If(if_stmt) => {
+                bindings.extend(repeat_scoped_bindings(&if_stmt.then_block));
+                if let Some(else_block) = &if_stmt.else_block {
+                    bindings.extend(repeat_scoped_bindings(else_block));
+                }
+            }
+            HirStmt::While(while_stmt) => {
+                bindings.extend(repeat_scoped_bindings(&while_stmt.body));
+            }
+            HirStmt::Repeat(repeat_stmt) => {
+                bindings.extend(repeat_scoped_bindings(&repeat_stmt.body));
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                bindings.insert(Binding::Local(for_stmt.binding));
+                bindings.extend(repeat_scoped_bindings(&for_stmt.body));
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                bindings.extend(for_stmt.bindings.iter().copied().map(Binding::Local));
+                bindings.extend(repeat_scoped_bindings(&for_stmt.body));
+            }
+            HirStmt::Block(block) => bindings.extend(repeat_scoped_bindings(block)),
+            HirStmt::GlobalDecl(_)
+            | HirStmt::TableSetList(_)
+            | HirStmt::ErrNil(_)
+            | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
+            | HirStmt::CallStmt(_)
+            | HirStmt::Return(_)
+            | HirStmt::Break
+            | HirStmt::Continue
+            | HirStmt::Goto(_)
+            | HirStmt::Label(_) => {}
         }
     }
     bindings
@@ -2197,7 +2233,7 @@ fn collect_effect_state(
 mod tests {
     use super::*;
     use crate::decompile::DecompileDialect;
-    use crate::hir::common::{HirGenericFor, HirGlobalRef};
+    use crate::hir::common::{HirAssign, HirGenericFor, HirGlobalRef, HirLocalDecl, HirRepeat};
 
     fn generic_for_block(iterator: HirExpr, binding: LocalId) -> HirBlock {
         HirBlock {
@@ -2320,5 +2356,55 @@ mod tests {
         );
         assert!(state.unknown_collectable.contains(&Binding::Local(binding)));
         assert_eq!(state.roots.get(&Binding::Local(binding)), Some(&true));
+    }
+
+    #[test]
+    fn repeat_endpoint_certificate_includes_nested_hir_bindings() {
+        let nested_local = LocalId(3);
+        let nested_temp = TempId(4);
+        let repeat = HirRepeat {
+            body: HirBlock {
+                stmts: vec![HirStmt::Block(Box::new(HirBlock {
+                    stmts: vec![
+                        HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                            bindings: vec![nested_local],
+                            values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                            initializer_merge_transaction: None,
+                        })),
+                        HirStmt::Assign(Box::new(HirAssign {
+                            targets: vec![HirLValue::Temp(nested_temp)],
+                            values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
+                        })),
+                    ],
+                }))],
+            },
+            cond: HirExpr::Boolean(true),
+            lifetime: HirRepeatConditionLifetimeFacts::default(),
+        };
+        let mut roots = RepeatRoots::default();
+
+        note_repeat_condition_lifetimes(
+            &repeat,
+            &RootState::default(),
+            None,
+            &mut roots,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
+
+        let facts = roots
+            .repeat_facts
+            .values()
+            .next()
+            .expect("reachable repeat endpoint certificate");
+        assert_eq!(
+            facts.may_end_before_condition,
+            BTreeSet::from([
+                HirRepeatBinding::Local(nested_local),
+                HirRepeatBinding::Temp(nested_temp),
+            ])
+        );
     }
 }

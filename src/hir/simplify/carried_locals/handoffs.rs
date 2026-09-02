@@ -627,6 +627,7 @@ mod tests {
             values: HirValuePack::fixed(values),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -636,6 +637,7 @@ mod tests {
             HirLValue::TableAccess(Box::new(HirTableAccess {
                 base: HirExpr::LocalRef(LocalId(1)),
                 key: HirExpr::Integer(1),
+                method_setup_protocol: None,
             })),
             HirExpr::Integer(0),
         );
@@ -649,6 +651,7 @@ mod tests {
             values: HirValuePack::fixed(pairs.into_iter().map(|(_, value)| value).collect()),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 

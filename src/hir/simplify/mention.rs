@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::hir::common::{
     HirBlock, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
 };
+use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::visit::{HirVisitor, visit_block, visit_expr, visit_proto, visit_stmts};
 
@@ -56,6 +57,23 @@ pub(super) fn stmts_value_captured_bindings(stmts: &[HirStmt]) -> ReferenceCaptu
     collector.bindings
 }
 
+/// 收集 TBC 原始寄存器在当前 proto 中可能保护的完整物理 home。
+///
+/// HIR value 可能已被改写成 Param/Local/Temp 或复合表达式；先收集所有可见 binding home，
+/// 再由原始 `reg_index` 收窄到对应 epoch。没有可匹配 binding 时退回该寄存器的全部 epoch，
+/// 避免后续 pass 从当前表达式形状猜测 Lua 5.4 close 生命周期。
+pub(super) fn stmts_tbc_protected_home_slots(
+    stmts: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    let mut collector = ToBeClosedHomeCollector {
+        facts,
+        homes: BTreeSet::new(),
+    };
+    visit_stmts(stmts, &mut collector);
+    collector.homes
+}
+
 pub(super) fn stmts_to_be_closed_temps(stmts: &[HirStmt]) -> BTreeSet<TempId> {
     let mut collector = ToBeClosedTempCollector::default();
     visit_stmts(stmts, &mut collector);
@@ -94,6 +112,39 @@ impl HirVisitor for ProtectedLocalCollector {
             }
             _ => {}
         }
+    }
+}
+
+struct ToBeClosedHomeCollector<'a> {
+    facts: &'a ProtoPromotionFacts,
+    homes: BTreeSet<HomeSlotKey>,
+}
+
+impl HirVisitor for ToBeClosedHomeCollector<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        let HirStmt::ToBeClosed(to_be_closed) = stmt else {
+            return;
+        };
+        let mut bindings = ReferenceCapturedBindings::default();
+        let mut collector = BindingRefCollector {
+            bindings: &mut bindings,
+        };
+        visit_expr(&to_be_closed.value, &mut collector);
+
+        let mut value_homes = BTreeSet::new();
+        for local in bindings.locals {
+            value_homes.extend(self.facts.complete_local_home_slots(local));
+        }
+        for param in bindings.params {
+            value_homes.extend(self.facts.complete_param_home_slots(param));
+        }
+        for temp in bindings.temps {
+            value_homes.extend(self.facts.complete_temp_home_slots(temp));
+        }
+        self.homes.extend(
+            self.facts
+                .complete_tbc_home_slots(to_be_closed.reg_index, value_homes),
+        );
     }
 }
 
@@ -184,6 +235,14 @@ pub(super) fn expr_mentions_temp(expr: &HirExpr, temp: TempId) -> bool {
 
 pub(super) fn stmt_writes_temp(stmt: &HirStmt, temp: TempId) -> bool {
     TempWriteCollector::writes_in_stmt(stmt, temp)
+}
+
+pub(super) fn stmt_writes_local(stmt: &HirStmt, local: LocalId) -> bool {
+    LocalWriteCollector::writes_in_stmt(stmt, local)
+}
+
+pub(super) fn stmts_write_local(stmts: &[HirStmt], local: LocalId) -> bool {
+    stmts.iter().any(|stmt| stmt_writes_local(stmt, local))
 }
 
 pub(super) fn collect_temp_use_counts(proto: &HirProto) -> BTreeMap<TempId, usize> {
@@ -371,5 +430,42 @@ impl TempWriteCollector {
 impl HirVisitor for TempWriteCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.written |= matches!(lvalue, HirLValue::Temp(temp) if *temp == self.temp);
+    }
+}
+
+struct LocalWriteCollector {
+    local: LocalId,
+    written: bool,
+}
+
+impl LocalWriteCollector {
+    fn writes_in_stmt(stmt: &HirStmt, local: LocalId) -> bool {
+        let mut collector = Self {
+            local,
+            written: false,
+        };
+        visit_stmts(std::slice::from_ref(stmt), &mut collector);
+        collector.written
+    }
+}
+
+impl HirVisitor for LocalWriteCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::LocalDecl(decl) => {
+                self.written |= decl.bindings.contains(&self.local);
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                self.written |= for_stmt.binding == self.local;
+            }
+            HirStmt::GenericFor(for_stmt) => {
+                self.written |= for_stmt.bindings.contains(&self.local);
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.written |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
     }
 }

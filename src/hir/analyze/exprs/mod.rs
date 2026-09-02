@@ -11,9 +11,9 @@ mod packs;
 mod regs;
 
 use crate::hir::common::{
-    HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCapture, HirCaptureMode, HirClosureExpr,
-    HirExpr, HirGlobalRef, HirLValue, HirPackTail, HirTableAccess, HirUnaryExpr, HirUnaryOpKind,
-    UpvalueId,
+    HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCallRootHandoff, HirCapture, HirCaptureMode,
+    HirClosureExpr, HirExpr, HirGlobalRef, HirLValue, HirPackTail, HirTableAccess, HirUnaryExpr,
+    HirUnaryOpKind, UpvalueId,
 };
 use crate::parser::RawLiteralConst;
 use crate::structure::BlockRef;
@@ -68,6 +68,8 @@ pub(super) fn lower_closure_expr(
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }));
     }
     if let Some(local) = lowering.shared_closure_local(closure.creation) {
@@ -240,6 +242,8 @@ fn pack_tail_for_open_def(
                     CallKind::Normal | CallKind::Method => None,
                 },
                 method_key,
+                callee_root_handoff: lower_call_root_handoff(lowering, open_def.instr, call.kind),
+                method_rewrite_transaction: None,
             }))))
         }
         LowInstr::VarArg(vararg) if matches!(vararg.results, ResultPack::Open(_)) => {
@@ -279,5 +283,19 @@ pub(super) fn lower_method_key(
     {
         Some(RawLiteralConst::String(value)) => Some(raw_lua_string(value)),
         _ => None,
+    }
+}
+
+pub(super) fn lower_call_root_handoff(
+    lowering: &ProtoLowering<'_>,
+    instr: InstrRef,
+    kind: CallKind,
+) -> Option<HirCallRootHandoff> {
+    match kind {
+        CallKind::Method => lowering
+            .promotion_facts
+            .method_setup_protocol_for_call(instr)
+            .map(HirCallRootHandoff::MethodCallee),
+        CallKind::Normal | CallKind::FastCall(_) => None,
     }
 }

@@ -989,6 +989,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Boolean(true)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             goto(header),
         ];

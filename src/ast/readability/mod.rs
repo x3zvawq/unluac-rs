@@ -21,6 +21,7 @@ mod installer_iife;
 mod literal_fold;
 mod local_scope_limit;
 mod materialize_temps;
+mod repeat_lifetime;
 mod statement_merge;
 mod stmt_plan;
 mod traverse;
@@ -364,6 +365,7 @@ mod tests {
                         capture_write_names: BTreeSet::new(),
                     }))],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 }))],
             },
         };

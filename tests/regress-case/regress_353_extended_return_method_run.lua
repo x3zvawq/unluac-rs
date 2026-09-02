@@ -1,6 +1,6 @@
--- regress_353_extended_return_method_run: a method producer stays scalar in a non-final return slot
--- unluac: expect-not-contains [[local r4_0 =]]
--- unluac: expect-not-contains [[local r4_1 =]]
+-- regress_353_extended_return_method_run: a non-tail dynamic callee keeps the complete preparation run
+-- unluac: expect-contains [[local r4_0 =]]
+-- unluac: expect-contains [[local r4_1 =]]
 local provider = {}
 
 function provider:get(value)

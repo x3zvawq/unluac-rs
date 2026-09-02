@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::LuaString;
 use crate::decompile::DecompileDialect;
 use crate::hir::{
-    HirInitializerMergeTransactionId, HirInitializerRootProfile, HirInlineDisposition, HirLabelId,
-    HirProtoRef, HirRepeatConditionLifetimeFacts, LocalId, ParamId, TempId, UpvalueId,
+    HirCallRootHandoff, HirInitializerMergeTransactionId, HirInitializerRootProfile,
+    HirInlineDisposition, HirLabelId, HirMethodRewriteTransactionId, HirProtoRef,
+    HirRepeatConditionLifetimeFacts, LocalId, ParamId, TempId, UpvalueId,
 };
 use strum_macros::{Display, IntoStaticStr};
 
@@ -104,6 +105,8 @@ pub struct AstAssign {
     pub values: Vec<AstExpr>,
     /// 从 HIR 原样传入的、仅供相邻 initializer merge 消费的一次性 token。
     pub initializer_merge_transaction: Option<HirInitializerMergeTransactionId>,
+    /// 从 HIR 原样传入的 method setup 原子改写事务。
+    pub(crate) method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
 }
 
 /// 赋值左值。
@@ -583,6 +586,10 @@ pub struct AstCallExpr {
     /// HIR 已确认的 SELF/NAMECALL 原始字段 key。`Call` 形状仍保留这份
     /// provenance，即使 key 不是目标方言的 identifier，只能渲染成索引调用。
     pub method_key: Option<LuaString>,
+    /// HIR 对这个调用 occurrence 发布的 callee 物理根交接证明。
+    pub(crate) callee_root_handoff: Option<HirCallRootHandoff>,
+    /// 与 method lookup assignment 配对的一次性 HIR 改写事务。
+    pub(crate) method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
 }
 
 /// 方法调用。

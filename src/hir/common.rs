@@ -275,6 +275,46 @@ pub struct HirInitializerMergeTransactionId {
     ordinal: usize,
 }
 
+/// HIR 已证明可原子收回 method callee setup 的单次事务身份。
+///
+/// token 只连接最终 HIR 中一条 method lookup assignment 与紧邻的 method call；它不把
+/// `method_key` 升格为通用删除许可，也不授权 AST 独立推断物理根生命周期。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct HirMethodRewriteTransactionId {
+    proto: HirProtoRef,
+    ordinal: usize,
+}
+
+/// low/SSA 已验证的单个 method setup/call 协议身份。
+///
+/// 该身份只用于把具体 call occurrence 接回 HIR 私有协议；它本身不是 producer 删除许可。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct HirMethodSetupProtocolId(usize);
+
+impl HirMethodSetupProtocolId {
+    pub(crate) const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl HirMethodRewriteTransactionId {
+    pub(crate) const fn new(proto: HirProtoRef, ordinal: usize) -> Self {
+        Self { proto, ordinal }
+    }
+
+    pub(crate) const fn matches_protocol(
+        self,
+        proto: HirProtoRef,
+        protocol: HirMethodSetupProtocolId,
+    ) -> bool {
+        self.proto.0 == proto.0 && self.ordinal == protocol.index()
+    }
+}
+
 impl HirInitializerMergeTransactionId {
     pub(crate) const fn new(proto: HirProtoRef, ordinal: usize) -> Self {
         Self { proto, ordinal }
@@ -432,6 +472,8 @@ pub struct HirGlobalRef {
 pub struct HirTableAccess {
     pub base: HirExpr,
     pub key: HirExpr,
+    /// 仅标记来自同一 low method setup 的 canonical GetTable producer。
+    pub(crate) method_setup_protocol: Option<HirMethodSetupProtocolId>,
 }
 
 /// 一元表达式。
@@ -540,6 +582,20 @@ pub struct HirCallExpr {
     /// 这一层显式保留字段的原始字节，是为了避免后面的 AST build 再去猜
     /// `obj[key](obj, ...)` 的协议身份；只有 AST 才决定 key 能否写成 `obj:method(...)`。
     pub method_key: Option<LuaString>,
+    /// HIR 对当前 call occurrence 发布的 callee 物理根交接证明。
+    ///
+    /// 该证明来自仍有效的底层 method-setup 协议；AST 可以据此把承载 method callee
+    /// 的机械 producer 收回到这个调用点，但不得从 `method_key` 或当前表达式形状重建它。
+    pub callee_root_handoff: Option<HirCallRootHandoff>,
+    /// 与 method lookup producer 配对的一次性 HIR 改写事务。
+    pub method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
+}
+
+/// 调用点接管底层物理根的方式。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum HirCallRootHandoff {
+    /// method setup 的 callee 槽由当前调用消费，强根终点正是这个 call occurrence。
+    MethodCallee(HirMethodSetupProtocolId),
 }
 
 impl HirCallExpr {
@@ -765,6 +821,8 @@ pub struct HirAssign {
     /// 只证明该 assignment occurrence 属于某个 generic-for initializer；删除、移动、
     /// 展开与 capture/lifetime 合法性仍由 consumer 重新验证。
     pub generic_for_initializer_producer: Option<HirGenericForInitializerProducerId>,
+    /// 与紧邻 method call 配对的一次性 HIR 改写事务。
+    pub method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
 }
 
 /// 表数组段批量写入。
@@ -843,8 +901,8 @@ pub struct HirRepeat {
     pub cond: HirExpr,
     /// 针对这个 repeat 条件边界、在最终 HIR 上证明的生命周期事实。
     ///
-    /// 这里只回答“哪些直属 binding 的 VM/HIR root 可以在执行条件前结束”；它不授权
-    /// 删除或移动 definition。AST 仍须针对自己的候选 suffix 证明词法作用域、属性和
+    /// 这里只回答“哪些正文词法 binding 的 VM/HIR root 可以在执行条件前结束”；它不
+    /// 授权删除或移动 definition。AST 仍须针对自己的具体候选证明词法作用域、属性和
     /// 控制流合法性。
     pub lifetime: HirRepeatConditionLifetimeFacts,
 }

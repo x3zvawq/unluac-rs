@@ -1,6 +1,7 @@
--- regress_39_method_hint_open_arg_call#1: SELF 后夹着多返回参数调用时不能丢 method hint
+-- regress_39_method_hint_open_arg_call#1: 同一 proto 重复 SELF 后夹着多返回参数调用时不能丢 method hint
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[:setPlayerName(]]
+-- unluac: expect-not-contains [[.setPlayerName]]
 
 local function pair()
     return "TEXTS_BASIC", "TEXT_SOCIAL_YOU"
@@ -21,4 +22,6 @@ local root = {
 
 local button = root:getChild("scoreBg2")
 button:setPlayerName(pair())
+local second_button = root:getChild("scoreBg2")
+second_button:setPlayerName(pair())
 print("regress_39_method_hint_open_arg_call#1", child.value)

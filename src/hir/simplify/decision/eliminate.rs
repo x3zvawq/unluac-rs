@@ -520,6 +520,7 @@ fn materialize_condition_into_flag(
         values: crate::hir::common::HirValuePack::fixed(vec![value.negate().negate()]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        method_rewrite_transaction: None,
     })));
     HirStmt::Block(Box::new(HirBlock { stmts: prefix }))
 }
@@ -646,6 +647,8 @@ mod tests {
                             method: false,
                             fastcall: None,
                             method_key: None,
+                            callee_root_handoff: None,
+                            method_rewrite_transaction: None,
                         },
                     },
                 ))],

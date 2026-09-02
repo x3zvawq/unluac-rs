@@ -1415,6 +1415,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         };
         let mut stmts = vec![
             HirStmt::If(Box::new(HirIf {
@@ -1467,6 +1469,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let external_entry = HirStmt::Block(Box::new(HirBlock {

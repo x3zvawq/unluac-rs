@@ -3,6 +3,8 @@
 //! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨后续观察点的
 //! table/global lookup result，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
 //! VM GC root。
+//! Promotion 另会发布普通 copy root 的单结果 call + 紧邻 MOVE 终点；本层只按 producer / endpoint
+//! temp 与 overwritten home 完整匹配，把它接入同一 local-owner handoff，不从 HIR 相邻文本猜 opcode。
 //! copy 共享值 identity，
 //! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
 //! 消费者只能把 producer 与同 home 的精确覆盖配对。
@@ -30,6 +32,13 @@ struct ActiveCallRoot {
     aliases: BTreeSet<TempId>,
     observed: bool,
     explicit_fence_only: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingCopyRootCallMove {
+    root_index: usize,
+    producer: TempId,
+    endpoint: TempId,
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -98,6 +107,22 @@ pub(super) struct CallRootLifetimeIndices {
 pub(super) struct CallRootOverwritePair {
     root_index: usize,
     home: HomeSlotKey,
+}
+
+/// HIR 已证明可由另一个 scope-end owner 接管的 method receiver 物理根事务。
+///
+/// statement 索引只在签发时的同一 block 坐标系内有效；消费者必须原子改写 producer、lookup
+/// 与 sink，不能把这份证明提升成 `TempId` 级通用删除许可。
+#[derive(Clone, Copy)]
+pub(super) struct MethodReceiverRootHandoff {
+    producer_index: usize,
+    lookup_index: usize,
+    sink_index: usize,
+    overwrite_index: usize,
+    target: TempId,
+    source: TempId,
+    target_home: HomeSlotKey,
+    source_home: HomeSlotKey,
 }
 
 #[derive(Default)]
@@ -196,6 +221,40 @@ impl CallRootOverwritePair {
     }
 }
 
+impl MethodReceiverRootHandoff {
+    pub(super) fn producer_index(self) -> usize {
+        self.producer_index
+    }
+
+    pub(super) fn lookup_index(self) -> usize {
+        self.lookup_index
+    }
+
+    pub(super) fn sink_index(self) -> usize {
+        self.sink_index
+    }
+
+    pub(super) fn overwrite_index(self) -> usize {
+        self.overwrite_index
+    }
+
+    pub(super) fn target(self) -> TempId {
+        self.target
+    }
+
+    pub(super) fn source(self) -> TempId {
+        self.source
+    }
+
+    pub(super) fn target_home(self) -> HomeSlotKey {
+        self.target_home
+    }
+
+    pub(super) fn source_home(self) -> HomeSlotKey {
+        self.source_home
+    }
+}
+
 impl CallRootLifetimeIndices {
     pub(super) fn is_root(&self, index: usize) -> bool {
         self.roots.contains(&index)
@@ -253,6 +312,81 @@ impl CallRootLifetimeIndices {
 
     fn pre_dispatch_releases(&self) -> &BTreeMap<usize, BTreeSet<TempId>> {
         &self.pre_dispatch_releases
+    }
+
+    /// 签发由 distinct pure scope-end owner 覆盖的 method receiver root handoff。
+    ///
+    /// 这里组合 allocation-root producer/overwrite pair、direct SSA copy、trusted homes 与
+    /// method-setup 双 use 协议，冻结 HIR/VM 生命周期事实。debug/capture/TBC/disposition 等
+    /// “是否允许删除当前 definition”条件仍由具体 rewrite owner 在提交前检查。
+    pub(super) fn method_receiver_handoffs(
+        &self,
+        stmts: &[HirStmt],
+        facts: &ProtoPromotionFacts,
+    ) -> Vec<MethodReceiverRootHandoff> {
+        let mut handoffs = Vec::new();
+        for producer_index in 0..stmts.len() {
+            let Some((target, HirExpr::TempRef(source))) =
+                scalar_temp_definition(&stmts[producer_index])
+            else {
+                continue;
+            };
+            if !self.is_root(producer_index) || !facts.is_pure_scope_end_copy_root_temp(*source) {
+                continue;
+            }
+
+            let (Some(target_home), Some(source_home)) = (
+                facts.trusted_temp_home_slot(target),
+                facts.trusted_temp_home_slot(*source),
+            ) else {
+                continue;
+            };
+            if target_home == source_home
+                || !self
+                    .root_homes(producer_index)
+                    .any(|home| home == target_home)
+            {
+                continue;
+            }
+
+            let overwrite_indices = self
+                .roots_by_overwrite
+                .iter()
+                .filter_map(|(index, pairs)| {
+                    pairs
+                        .iter()
+                        .any(|pair| pair.root_index == producer_index && pair.home == target_home)
+                        .then_some(*index)
+                })
+                .collect::<Vec<_>>();
+            let [overwrite_index] = overwrite_indices.as_slice() else {
+                continue;
+            };
+            let Some((lookup_index, sink_index)) =
+                method_receiver_protocol_sink(stmts, producer_index + 1, *overwrite_index, target)
+            else {
+                continue;
+            };
+
+            let writes =
+                StackWriteSummary::for_stmts(&stmts[(producer_index + 1)..=sink_index], facts);
+            if writes.has_unknown_home || writes.has_boundary || writes.homes.contains(&source_home)
+            {
+                continue;
+            }
+
+            handoffs.push(MethodReceiverRootHandoff {
+                producer_index,
+                lookup_index,
+                sink_index,
+                overwrite_index: *overwrite_index,
+                target,
+                source: *source,
+                target_home,
+                source_home,
+            });
+        }
+        handoffs
     }
 }
 
@@ -317,12 +451,66 @@ pub(super) fn collect_call_root_lifetimes(
     let mut active = BTreeMap::<HomeSlotKey, ActiveCallRoot>::new();
     let mut next_call_value_id = 0;
     let mut active_allocations = Vec::<ActiveAllocationRoot>::new();
+    let mut pending_copy_root_call_moves = BTreeMap::<HomeSlotKey, PendingCopyRootCallMove>::new();
     // Lua 编译器会用 literal nil 的纯 temp copy 清除同 home 的 allocation root；只沿这条
     // 无副作用链传播 nil 事实，其余写入必须先让旧事实失效。
     let mut known_nil_temps = BTreeSet::<TempId>::new();
     let mut lifetimes = CallRootLifetimeIndices::default();
 
     for (index, stmt) in stmts.iter().enumerate() {
+        let scalar_definition = scalar_temp_definition(stmt);
+        let matching_call_move_homes = scalar_definition
+            .filter(|(_, value)| matches!(value, HirExpr::Call(_)))
+            .and_then(|(temp, _)| {
+                facts
+                    .trusted_immediate_move_write_homes(temp)
+                    .map(|homes| (temp, homes))
+            })
+            .map(|(temp, homes)| {
+                homes
+                    .iter()
+                    .copied()
+                    .filter(|home| {
+                        pending_copy_root_call_moves
+                            .get(home)
+                            .is_some_and(|pending| pending.endpoint == temp)
+                    })
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        for home in &matching_call_move_homes {
+            let pending = pending_copy_root_call_moves
+                .remove(home)
+                .expect("matched copy-root call MOVE must retain its pending producer");
+            if overwrite_temp_is_eligible(pending.endpoint)
+                && !uses.has_live_read_after(pending.producer, index)
+            {
+                lifetimes.roots.insert(pending.root_index);
+                lifetimes
+                    .root_homes
+                    .entry(pending.root_index)
+                    .or_default()
+                    .insert(*home);
+                lifetimes.roots_by_overwrite.entry(index).or_default().push(
+                    CallRootOverwritePair {
+                        root_index: pending.root_index,
+                        home: *home,
+                    },
+                );
+            }
+        }
+        let mut current_writes = StackWriteSummary::for_stmt(stmt, facts);
+        current_writes
+            .homes
+            .retain(|home| !matching_call_move_homes.contains(home));
+        if current_writes.has_boundary || current_writes.has_unknown_home {
+            pending_copy_root_call_moves.clear();
+        } else {
+            for home in current_writes.homes {
+                pending_copy_root_call_moves.remove(&home);
+            }
+        }
+
         if let Some(result_homes) = generic_for_dispatch_result_homes(stmt, facts) {
             release_roots_before_generic_dispatch(
                 index,
@@ -389,7 +577,7 @@ pub(super) fn collect_call_root_lifetimes(
                 .iter()
                 .any(|alias| escaped_temps.contains(alias));
         }
-        let Some((temp, value)) = scalar_temp_definition(stmt) else {
+        let Some((temp, value)) = scalar_definition else {
             forget_written_known_nil_temps(stmt, &mut known_nil_temps);
             if let Some(targets) =
                 exact_multi_call_root_targets(stmt, facts, &mut producer_temp_is_eligible)
@@ -559,6 +747,28 @@ pub(super) fn collect_call_root_lifetimes(
 
         let producer_eligible = producer_temp_is_eligible(temp);
         let overwrite_eligible = overwrite_temp_is_eligible(temp);
+        let needs_copy_root_bridge = !matches!(
+            value,
+            HirExpr::Call(_)
+                | HirExpr::TempRef(_)
+                | HirExpr::GlobalRef(_)
+                | HirExpr::TableAccess(_)
+                | HirExpr::TableConstructor(_)
+                | HirExpr::Unresolved(_)
+        ) && !safety.result_is_gc_inert(value);
+        if producer_eligible
+            && needs_copy_root_bridge
+            && let Some(endpoint) = facts.copy_root_call_result_move_overwrite(temp)
+        {
+            pending_copy_root_call_moves.insert(
+                slot,
+                PendingCopyRootCallMove {
+                    root_index: index,
+                    producer: temp,
+                    endpoint,
+                },
+            );
+        }
         let mut allocation_state = AllocationRootState {
             active: &mut active_allocations,
             lifetimes: &mut lifetimes,
@@ -807,6 +1017,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })));
             }
         }
@@ -2127,6 +2338,60 @@ fn scalar_temp_definition(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
     assign.values.tail.is_none().then_some((*temp, value))
 }
 
+fn method_receiver_protocol_sink(
+    stmts: &[HirStmt],
+    begin: usize,
+    end: usize,
+    receiver: TempId,
+) -> Option<(usize, usize)> {
+    let mut matches = Vec::new();
+    for (lookup_index, lookup_stmt) in stmts.iter().enumerate().take(end).skip(begin) {
+        let Some((callee, HirExpr::TableAccess(access))) = scalar_temp_definition(lookup_stmt)
+        else {
+            continue;
+        };
+        let HirExpr::TempRef(base) = &access.base else {
+            continue;
+        };
+        if *base != receiver {
+            continue;
+        }
+
+        for (sink_index, sink_stmt) in stmts.iter().enumerate().take(end).skip(lookup_index + 1) {
+            let Some(call) = direct_call_in_stmt(sink_stmt) else {
+                continue;
+            };
+            if super::method_protocol::match_method_setup_pair(
+                access,
+                &HirExpr::TempRef(callee),
+                call,
+            )
+            .is_some()
+            {
+                matches.push((lookup_index, sink_index));
+            }
+        }
+    }
+    let [candidate] = matches.as_slice() else {
+        return None;
+    };
+    Some(*candidate)
+}
+
+fn direct_call_in_stmt(stmt: &HirStmt) -> Option<&HirCallExpr> {
+    let values = match stmt {
+        HirStmt::CallStmt(call_stmt) => return Some(&call_stmt.call),
+        HirStmt::LocalDecl(local_decl) => &local_decl.values,
+        HirStmt::Assign(assign) => &assign.values,
+        HirStmt::Return(ret) => &ret.values,
+        _ => return None,
+    };
+    let ([HirExpr::Call(call)], None) = (values.fixed.as_slice(), &values.tail) else {
+        return None;
+    };
+    Some(call)
+}
+
 struct AllocationRootState<'a> {
     active: &'a mut Vec<ActiveAllocationRoot>,
     lifetimes: &'a mut CallRootLifetimeIndices,
@@ -2395,7 +2660,7 @@ mod tests {
     use super::*;
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirGenericFor, HirGenericForDispatchResult, HirTableConstructor, UpvalueId,
+        HirCallStmt, HirGenericFor, HirGenericForDispatchResult, HirTableConstructor, UpvalueId,
     };
 
     fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
@@ -2404,6 +2669,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -2423,6 +2689,88 @@ mod tests {
                 success_binding: binding,
             }],
         }))
+    }
+
+    fn call(name: &str) -> HirExpr {
+        HirExpr::Call(Box::new(HirCallExpr {
+            callee: HirExpr::GlobalRef(crate::hir::common::HirGlobalRef { key: name.into() }),
+            args: HirValuePack::default(),
+            method: false,
+            fastcall: None,
+            method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
+        }))
+    }
+
+    fn call_stmt(name: &str) -> HirStmt {
+        let HirExpr::Call(call) = call(name) else {
+            unreachable!("test call helper must return a call expression")
+        };
+        HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }))
+    }
+
+    #[test]
+    fn certified_copy_root_call_move_reuses_the_overwritten_home_owner() {
+        let producer = TempId(0);
+        let endpoint = TempId(1);
+        let producer_home = HomeSlotKey::new(0, 0);
+        let endpoint_home = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(producer, producer_home);
+        facts.record_temp_home_slot_for_test(endpoint, endpoint_home);
+        facts.record_copy_root_call_result_move_for_test(producer, endpoint);
+        let stmts = vec![
+            assign(HirLValue::Temp(producer), HirExpr::UpvalueRef(UpvalueId(0))),
+            call_stmt("observe"),
+            assign(HirLValue::Temp(endpoint), call("replacement")),
+        ];
+
+        let lifetimes = collect_call_root_lifetimes(
+            &stmts,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Luau),
+            true,
+            |_| true,
+            |_| true,
+        );
+
+        assert!(lifetimes.is_root(0));
+        let pair = lifetimes
+            .unambiguous_overwrite_pair(2)
+            .expect("certified call MOVE must publish one overwrite pair");
+        assert_eq!(pair.root_index(), 0);
+        assert_eq!(pair.home(), producer_home);
+    }
+
+    #[test]
+    fn certified_copy_root_call_move_rejects_hir_write_before_endpoint() {
+        let producer = TempId(0);
+        let endpoint = TempId(1);
+        let intervening = TempId(2);
+        let producer_home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(producer, producer_home);
+        facts.record_temp_home_slot_for_test(endpoint, HomeSlotKey::new(1, 0));
+        facts.record_temp_home_slot_for_test(intervening, producer_home);
+        facts.record_copy_root_call_result_move_for_test(producer, endpoint);
+        let stmts = vec![
+            assign(HirLValue::Temp(producer), HirExpr::UpvalueRef(UpvalueId(0))),
+            assign(HirLValue::Temp(intervening), HirExpr::Nil),
+            assign(HirLValue::Temp(endpoint), call("replacement")),
+        ];
+
+        let lifetimes = collect_call_root_lifetimes(
+            &stmts,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Luau),
+            true,
+            |_| true,
+            |_| true,
+        );
+
+        assert!(!lifetimes.is_root(0));
+        assert!(lifetimes.unambiguous_overwrite_pair(2).is_none());
     }
 
     #[test]
@@ -2492,6 +2840,8 @@ mod tests {
                         method: false,
                         fastcall: None,
                         method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
                     })),
                 ),
                 generic_for(result_def, binding),

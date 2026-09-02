@@ -136,6 +136,7 @@ fn inline_constructor_value_inner(
             HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
                 base: inline_constructor_value_inner(context, &access.base)?,
                 key: inline_constructor_value_inner(context, &access.key)?,
+                method_setup_protocol: access.method_setup_protocol,
             }))
         }
         HirExpr::Call(call) => HirExpr::Call(Box::new(inline_constructor_call(context, call)?)),
@@ -287,6 +288,8 @@ pub(super) fn inline_constructor_call(
         method: call.method,
         fastcall: call.fastcall,
         method_key: call.method_key.clone(),
+        callee_root_handoff: call.callee_root_handoff,
+        method_rewrite_transaction: call.method_rewrite_transaction,
     })
 }
 

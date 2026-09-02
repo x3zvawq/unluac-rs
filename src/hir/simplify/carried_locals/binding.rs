@@ -233,6 +233,26 @@ pub(super) fn record_binding_merge(
     if source == target {
         return;
     }
+    let source_definition_write_homes = match source {
+        CarryBinding::Param(param) => {
+            promotion_facts.supplemental_param_definition_write_homes(param)
+        }
+        CarryBinding::Local(local) => {
+            promotion_facts.supplemental_local_definition_write_homes(local)
+        }
+        CarryBinding::Temp(temp) => promotion_facts.supplemental_temp_definition_write_homes(temp),
+    };
+    match target {
+        CarryBinding::Param(param) => {
+            promotion_facts.merge_param_definition_write_homes(param, source_definition_write_homes)
+        }
+        CarryBinding::Local(local) => {
+            promotion_facts.merge_local_definition_write_homes(local, source_definition_write_homes)
+        }
+        CarryBinding::Temp(temp) => {
+            promotion_facts.merge_temp_definition_write_homes(temp, source_definition_write_homes)
+        }
+    }
     let source_home = binding_home_slot(source, promotion_facts);
     let target_home = binding_home_slot(target, promotion_facts);
     if source_home.is_some() && source_home == target_home {

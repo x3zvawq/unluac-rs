@@ -647,6 +647,7 @@ mod tests {
                     }))],
                     values: vec![function_value()],
                     initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
                 })),
             ];
 

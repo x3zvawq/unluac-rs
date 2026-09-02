@@ -854,6 +854,7 @@ fn apply_fold(
         values,
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        method_rewrite_transaction: None,
     }));
     body.stmts.pop();
 
@@ -898,6 +899,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 

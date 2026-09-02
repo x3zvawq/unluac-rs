@@ -577,6 +577,7 @@ fn rewrite_boundary_assignment_reads(
         values: assign.values.clone(),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        method_rewrite_transaction: None,
     }));
     let rewritten = rewrite_stmts(std::slice::from_mut(&mut scratch), pass);
     let HirStmt::Assign(scratch) = scratch else {
@@ -615,6 +616,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -675,12 +677,14 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0)), HirExpr::Integer(7)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         };
         let preserved = HirAssign {
             targets: vec![HirLValue::Param(ParamId(0)), HirLValue::Local(LocalId(0))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::ParamRef(ParamId(0))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         };
         let overwritten = assignment_values(&overwritten);
         let preserved = assignment_values(&preserved);
@@ -726,6 +730,7 @@ mod tests {
                     }]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -764,6 +769,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(seed)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -814,12 +820,14 @@ mod tests {
             ]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         });
         let equal_literals = assignment_values(&HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(7)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         });
         let index = RegionResultIndex::new(&[]);
 
@@ -848,12 +856,14 @@ mod tests {
             ]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         });
         let distinct = assignment_values(&HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         });
         let index = RegionResultIndex::new(&[]);
 
@@ -882,6 +892,7 @@ mod tests {
             ]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         });
         let index = RegionResultIndex::new(&[]);
 

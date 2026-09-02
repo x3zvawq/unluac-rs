@@ -20,14 +20,15 @@
 //!   phi 或后续 local 物化不能冒充分配本身
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, LocalId, ParamId, TempId,
+    HirBlock, HirExpr, HirLValue, HirMethodSetupProtocolId, HirStmt, HirTableField, LocalId,
+    ParamId, TempId,
 };
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EffectTag, GraphFacts, InstrEffect,
-    LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, SideEffectSummary,
-    SsaValue, StructurePlan,
+    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EdgeRef, EffectTag, ForwardRouteKind,
+    GraphFacts, InstrEffect, LoopConditionPrefixPlacement, LoopVmProtocol, PhiId,
+    PhiIncomingDisposition, RegionId, RegionPlan, SideEffectSummary, SsaValue, StructurePlan,
 };
-use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg};
+use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// temp promotion 使用的词法槽位身份。
@@ -324,6 +325,7 @@ pub(super) struct ProtoPromotionFacts {
     direct_table_seed_temps: BTreeSet<TempId>,
     direct_table_seed_locals: BTreeSet<LocalId>,
     loop_carrier_temps: BTreeSet<TempId>,
+    implicit_root_scope_fences: BTreeMap<RegionId, ImplicitRootScopeFence>,
     scope_end_copy_root_temps: BTreeSet<TempId>,
     copy_root_overwrites: BTreeMap<TempId, Vec<CopyRootOverwrite>>,
     copy_root_endpoint_producers: BTreeMap<TempId, BTreeSet<TempId>>,
@@ -336,8 +338,37 @@ pub(super) struct ProtoPromotionFacts {
     possible_param_homes: BTreeMap<ParamId, Option<BTreeSet<HomeSlotKey>>>,
     possible_local_homes: BTreeMap<LocalId, Option<BTreeSet<HomeSlotKey>>>,
     possible_temp_homes: BTreeMap<TempId, Option<BTreeSet<HomeSlotKey>>>,
+    propagated_param_definition_write_homes: BTreeMap<ParamId, BTreeSet<HomeSlotKey>>,
+    propagated_local_definition_write_homes: BTreeMap<LocalId, BTreeSet<HomeSlotKey>>,
+    propagated_temp_definition_write_homes: BTreeMap<TempId, BTreeSet<HomeSlotKey>>,
     physical_home_universe: BTreeSet<HomeSlotKey>,
     compact_home_slots: bool,
+    method_setup_protocols: Vec<HirMethodSetupProtocol>,
+    method_setup_protocol_by_call: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
+    method_setup_protocol_by_get: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
+}
+
+/// raw VM active-top 与最终 Structure sequence 共同冻结的隐式 root 作用域。
+///
+/// `ended_roots` 是 collective 证明的一部分而不是 consumer 的匹配输入；它记录在
+/// ordinary call 观察期间已被 caller prefix 排除的全部原始 VM home。真正的 lowering
+/// 边界只由两个 direct child identity 决定。无法把所有 by-value holder 一并纳入时
+/// producer 不发布该 fence。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImplicitRootScopeFence {
+    pub(super) first_child: RegionId,
+    pub(super) end_before_child: RegionId,
+    pub(super) ended_roots: BTreeSet<TempId>,
+}
+
+/// low method setup 与 canonical callee definition 之间的 HIR 私有桥接事实。
+///
+/// 它只活到 HIR finalizer；AST 永远不会看到 `TempId` 或 physical home。
+#[derive(Debug, Clone)]
+pub(super) struct HirMethodSetupProtocol {
+    pub(super) callee_temp: TempId,
+    pub(super) prior_callee_root_temp: TempId,
+    pub(super) method_key: crate::LuaString,
 }
 
 impl ProtoPromotionFacts {
@@ -367,13 +398,15 @@ impl ProtoPromotionFacts {
             total_temps,
         );
         let copy_roots = collect_copy_root_facts(proto, cfg, dataflow, fixed_temps);
+        let implicit_root_scope_fences =
+            collect_implicit_root_scope_fences(proto, cfg, dataflow, plan, fixed_temps);
         let copy_root_endpoint_producers = copy_roots
             .overwrites
             .iter()
             .flat_map(|(producer, overwrites)| {
                 overwrites
                     .iter()
-                    .map(move |overwrite| (overwrite.temp, *producer))
+                    .map(move |overwrite| (overwrite.temp(), *producer))
             })
             .fold(
                 BTreeMap::<TempId, BTreeSet<TempId>>::new(),
@@ -402,6 +435,7 @@ impl ProtoPromotionFacts {
             direct_table_seed_temps: collect_direct_table_seed_temps(proto, dataflow, fixed_temps),
             direct_table_seed_locals: BTreeSet::new(),
             loop_carrier_temps: collect_loop_carrier_temps(plan, phi_temps),
+            implicit_root_scope_fences,
             scope_end_copy_root_temps: copy_roots.scope_end,
             copy_root_overwrites: copy_roots.overwrites,
             copy_root_endpoint_producers,
@@ -414,8 +448,14 @@ impl ProtoPromotionFacts {
             possible_param_homes: BTreeMap::new(),
             possible_local_homes: BTreeMap::new(),
             possible_temp_homes: BTreeMap::new(),
+            propagated_param_definition_write_homes: BTreeMap::new(),
+            propagated_local_definition_write_homes: BTreeMap::new(),
+            propagated_temp_definition_write_homes: BTreeMap::new(),
             physical_home_universe,
             compact_home_slots: false,
+            method_setup_protocols: Vec::new(),
+            method_setup_protocol_by_call: BTreeMap::new(),
+            method_setup_protocol_by_get: BTreeMap::new(),
         }
     }
 
@@ -477,6 +517,13 @@ impl ProtoPromotionFacts {
         self.loop_carrier_temps.contains(&temp)
     }
 
+    pub(super) fn implicit_root_scope_fence(
+        &self,
+        owner: RegionId,
+    ) -> Option<&ImplicitRootScopeFence> {
+        self.implicit_root_scope_fences.get(&owner)
+    }
+
     /// 该 temp 的潜在对象 home 在 producer 支配的 CFG 中沿每条路径精确走到 frame end
     /// 或已登记 overwrite，且至少一条路径在终点前经过 GC-root 观察事件。
     ///
@@ -497,14 +544,37 @@ impl ProtoPromotionFacts {
         if self.temp_home_was_invalidated(temp) {
             return None;
         }
+        let producer_home = self.trusted_temp_home_slot(temp)?;
         let overwrites = self.copy_root_overwrites.get(&temp)?;
         (!overwrites.is_empty()
             && overwrites.iter().all(|overwrite| {
-                !self.temp_home_was_invalidated(overwrite.temp)
-                    && self.trusted_temp_home_slot(temp)
-                        == self.trusted_temp_home_slot(overwrite.temp)
+                let endpoint = overwrite.temp();
+                !self.temp_home_was_invalidated(endpoint)
+                    && match overwrite {
+                        CopyRootOverwrite::Scalar { .. } => {
+                            self.trusted_temp_home_slot(endpoint) == Some(producer_home)
+                        }
+                        CopyRootOverwrite::CallResultMove { .. } => self
+                            .trusted_immediate_move_write_homes(endpoint)
+                            .is_some_and(|homes| homes.contains(&producer_home)),
+                    }
             }))
         .then_some(overwrites)
+    }
+
+    /// 返回以单结果 call 的紧邻透明 MOVE 精确结束的 copy-root transaction。
+    ///
+    /// 该 endpoint temp 自身属于 call result home，`trusted_immediate_move_write_homes`
+    /// 证明同一求值事件随后还写入 producer 的旧 home。只接受唯一 endpoint，避免把
+    /// CFG 分支上的多个动态终点压成一个线性 HIR handoff。
+    pub(super) fn copy_root_call_result_move_overwrite(&self, temp: TempId) -> Option<TempId> {
+        let [overwrite] = self.copy_root_overwrites(temp)? else {
+            return None;
+        };
+        match overwrite {
+            CopyRootOverwrite::CallResultMove { temp } => Some(*temp),
+            CopyRootOverwrite::Scalar { .. } => None,
+        }
     }
 
     /// Whether this temp is an exact scalar endpoint of a still-valid raw CFG physical-root
@@ -520,7 +590,7 @@ impl ProtoPromotionFacts {
                 producers.iter().any(|producer| {
                     self.copy_root_overwrites(*producer)
                         .is_some_and(|overwrites| {
-                            overwrites.iter().any(|overwrite| overwrite.temp == temp)
+                            overwrites.iter().any(|overwrite| overwrite.temp() == temp)
                         })
                 })
             })
@@ -534,7 +604,7 @@ impl ProtoPromotionFacts {
     ) {
         let overwrites: Vec<CopyRootOverwrite> = overwrites
             .into_iter()
-            .map(|(temp, value)| CopyRootOverwrite {
+            .map(|(temp, value)| CopyRootOverwrite::Scalar {
                 temp,
                 value: CopyRootScalarValue::from_hir_expr(&value)
                     .expect("test overwrite must be a direct GC-inert scalar"),
@@ -542,11 +612,35 @@ impl ProtoPromotionFacts {
             .collect();
         for overwrite in &overwrites {
             self.copy_root_endpoint_producers
-                .entry(overwrite.temp)
+                .entry(overwrite.temp())
                 .or_default()
                 .insert(producer);
         }
         self.copy_root_overwrites.insert(producer, overwrites);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_copy_root_call_result_move_for_test(
+        &mut self,
+        producer: TempId,
+        endpoint: TempId,
+    ) {
+        let home = self
+            .trusted_temp_home_slot(producer)
+            .expect("test copy-root producer must retain one trusted home");
+        if self.immediate_move_write_homes.len() <= endpoint.index() {
+            self.immediate_move_write_homes
+                .resize_with(endpoint.index() + 1, BTreeSet::new);
+        }
+        self.immediate_move_write_homes[endpoint.index()].insert(home);
+        self.copy_root_endpoint_producers
+            .entry(endpoint)
+            .or_default()
+            .insert(producer);
+        self.copy_root_overwrites.insert(
+            producer,
+            vec![CopyRootOverwrite::CallResultMove { temp: endpoint }],
+        );
     }
 
     /// 返回某个 temp 对应的原始寄存器槽位。
@@ -849,6 +943,113 @@ impl ProtoPromotionFacts {
         self.complete_possible_home_slots(self.trusted_immediate_move_write_homes(temp).cloned())
     }
 
+    /// 返回一次最终 temp 定义可能写入的全部物理 home。
+    ///
+    /// 除 temp 自身 home 外，还包含 low IR 中紧邻而被 HIR 隐藏的透明 MOVE，以及 carried
+    /// binding 合并时继承的定义写。consumer 必须在定义 lvalue 处查询，不能在读取 TempRef
+    /// 时把这些写副作用补回。
+    pub(super) fn complete_temp_definition_write_homes(
+        &self,
+        temp: TempId,
+    ) -> BTreeSet<HomeSlotKey> {
+        let mut homes = self.complete_temp_home_slots(temp);
+        homes.extend(self.supplemental_temp_definition_write_homes(temp));
+        homes
+    }
+
+    /// 返回一次最终 local 定义可能写入的全部物理 home。
+    pub(super) fn complete_local_definition_write_homes(
+        &self,
+        local: LocalId,
+    ) -> BTreeSet<HomeSlotKey> {
+        let mut homes = self.complete_local_home_slots(local);
+        homes.extend(self.supplemental_local_definition_write_homes(local));
+        homes
+    }
+
+    /// 返回一次最终 param 定义可能写入的全部物理 home。
+    pub(super) fn complete_param_definition_write_homes(
+        &self,
+        param: ParamId,
+    ) -> BTreeSet<HomeSlotKey> {
+        let mut homes = self.complete_param_home_slots(param);
+        homes.extend(self.supplemental_param_definition_write_homes(param));
+        homes
+    }
+
+    pub(super) fn supplemental_temp_definition_write_homes(
+        &self,
+        temp: TempId,
+    ) -> BTreeSet<HomeSlotKey> {
+        let mut homes = if self
+            .possible_temp_home_slots(temp)
+            .is_some_and(|homes| homes.is_empty())
+        {
+            BTreeSet::new()
+        } else {
+            self.trusted_immediate_move_write_homes(temp)
+                .cloned()
+                .unwrap_or_default()
+        };
+        if let Some(propagated) = self.propagated_temp_definition_write_homes.get(&temp) {
+            homes.extend(propagated.iter().copied());
+        }
+        homes
+    }
+
+    pub(super) fn supplemental_local_definition_write_homes(
+        &self,
+        local: LocalId,
+    ) -> BTreeSet<HomeSlotKey> {
+        self.propagated_local_definition_write_homes
+            .get(&local)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn supplemental_param_definition_write_homes(
+        &self,
+        param: ParamId,
+    ) -> BTreeSet<HomeSlotKey> {
+        self.propagated_param_definition_write_homes
+            .get(&param)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn merge_param_definition_write_homes(
+        &mut self,
+        param: ParamId,
+        homes: BTreeSet<HomeSlotKey>,
+    ) {
+        self.propagated_param_definition_write_homes
+            .entry(param)
+            .or_default()
+            .extend(homes);
+    }
+
+    pub(super) fn merge_local_definition_write_homes(
+        &mut self,
+        local: LocalId,
+        homes: BTreeSet<HomeSlotKey>,
+    ) {
+        self.propagated_local_definition_write_homes
+            .entry(local)
+            .or_default()
+            .extend(homes);
+    }
+
+    pub(super) fn merge_temp_definition_write_homes(
+        &mut self,
+        temp: TempId,
+        homes: BTreeSet<HomeSlotKey>,
+    ) {
+        self.propagated_temp_definition_write_homes
+            .entry(temp)
+            .or_default()
+            .extend(homes);
+    }
+
     /// 返回 TBC 原始寄存器在当前 proto 中可能对应的完整物理 home 集合。
     ///
     /// value binding 的 home 可缩小到精确 epoch；若 value 是 home-free 表达式或其 home
@@ -898,6 +1099,8 @@ impl ProtoPromotionFacts {
     }
 
     pub(super) fn record_temp_to_local_merge(&mut self, temp: TempId, local: LocalId) {
+        let definition_write_homes = self.supplemental_temp_definition_write_homes(temp);
+        self.merge_local_definition_write_homes(local, definition_write_homes);
         self.promoted_local_by_temp.insert(temp, local);
         let source_home = self.trusted_temp_home_slot(temp);
         let target_home = self.trusted_local_home_slot(local);
@@ -910,7 +1113,48 @@ impl ProtoPromotionFacts {
         self.promoted_local_by_temp.get(&temp).copied()
     }
 
+    pub(super) fn record_method_setup_protocol(
+        &mut self,
+        call: InstrRef,
+        get: InstrRef,
+        callee_temp: TempId,
+        prior_callee_root_temp: TempId,
+        method_key: crate::LuaString,
+    ) {
+        let id = HirMethodSetupProtocolId::new(self.method_setup_protocols.len());
+        self.method_setup_protocols.push(HirMethodSetupProtocol {
+            callee_temp,
+            prior_callee_root_temp,
+            method_key,
+        });
+        self.method_setup_protocol_by_call.insert(call, id);
+        self.method_setup_protocol_by_get.insert(get, id);
+    }
+
+    pub(super) fn method_setup_protocol_for_call(
+        &self,
+        call: InstrRef,
+    ) -> Option<HirMethodSetupProtocolId> {
+        self.method_setup_protocol_by_call.get(&call).copied()
+    }
+
+    pub(super) fn method_setup_protocol_for_get(
+        &self,
+        get: InstrRef,
+    ) -> Option<HirMethodSetupProtocolId> {
+        self.method_setup_protocol_by_get.get(&get).copied()
+    }
+
+    pub(super) fn method_setup_protocol(
+        &self,
+        id: HirMethodSetupProtocolId,
+    ) -> Option<&HirMethodSetupProtocol> {
+        self.method_setup_protocols.get(id.index())
+    }
+
     pub(super) fn record_local_to_param_merge(&mut self, local: LocalId, param: ParamId) {
+        let definition_write_homes = self.supplemental_local_definition_write_homes(local);
+        self.merge_param_definition_write_homes(param, definition_write_homes);
         let source_home = self.trusted_local_home_slot(local);
         let target_home = self.trusted_param_home_slot(param);
         if source_home.is_none() || source_home != target_home {
@@ -1437,6 +1681,357 @@ fn collect_loop_carrier_temps(plan: &StructurePlan, phi_temps: &[TempId]) -> BTr
     temps
 }
 
+/// Luau 等 VM 会通过 call base 收缩 active stack top；这个物理 scope end 不一定有
+/// `Close` 指令。这里只为已冻结的 repeat body sequence 发布一种很窄的 collective
+/// fence：repeat condition 已通过 continue route 前递到 body 的终端 dispatch child，
+/// 且 dispatch 后每条路径的首个 GC/user-code observer 都已排除整个高槽 root 集。
+fn collect_implicit_root_scope_fences(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    fixed_temps: &[TempId],
+) -> BTreeMap<RegionId, ImplicitRootScopeFence> {
+    let mut fences = BTreeMap::new();
+    for (loop_id, _) in plan.loops() {
+        let Some(loop_region) = plan.loop_region(loop_id) else {
+            continue;
+        };
+        if !matches!(plan.loop_protocol(loop_id), Some(LoopVmProtocol::Repeat(_))) {
+            continue;
+        }
+        let Some(RegionPlan::Loop { body, .. }) = plan.region(loop_region) else {
+            continue;
+        };
+        let Some(fence) = implicit_repeat_root_scope_fence(
+            proto,
+            cfg,
+            dataflow,
+            plan,
+            fixed_temps,
+            loop_region,
+            *body,
+        ) else {
+            continue;
+        };
+        fences.insert(*body, fence);
+    }
+    fences
+}
+
+fn implicit_repeat_root_scope_fence(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    fixed_temps: &[TempId],
+    loop_region: RegionId,
+    body: RegionId,
+) -> Option<ImplicitRootScopeFence> {
+    let RegionPlan::Sequence { children, .. } = plan.region(body)? else {
+        return None;
+    };
+    if children.len() < 2 {
+        return None;
+    }
+
+    // A forwarded repeat-condition arc is the frozen proof that this direct body child owns
+    // the source condition which an early `continue` must evaluate. All such arcs must agree.
+    let mut dispatch_positions = BTreeSet::new();
+    let mut repeat_condition_arc = None;
+    for edge_index in 0..cfg.edges.len() {
+        let edge_ref = EdgeRef(edge_index);
+        let edge = plan.edge_plan(edge_ref)?;
+        if edge.transfer != crate::structure::EdgeTransfer::Continue(loop_region) {
+            continue;
+        }
+        let route = edge
+            .forward_route
+            .and_then(|route| plan.forward_route(route))?;
+        let ForwardRouteKind::RepeatConditionArc(arc) = route.kind else {
+            return None;
+        };
+        if repeat_condition_arc.is_some_and(|expected| expected != arc) {
+            return None;
+        }
+        repeat_condition_arc = Some(arc);
+        let source_owner = plan.region_for_block(cfg.edges.get(edge_index)?.from)?;
+        let position = children
+            .iter()
+            .position(|child| plan.region_contains(*child, source_owner))?;
+        dispatch_positions.insert(position);
+    }
+    let dispatch_position = dispatch_positions.iter().copied().next()?;
+    if repeat_condition_arc.is_none() || dispatch_positions.len() != 1 || dispatch_position == 0 {
+        return None;
+    }
+
+    let dispatch_child = children[dispatch_position];
+    let RegionPlan::Branch {
+        plan: branch_id, ..
+    } = plan.region(dispatch_child)?
+    else {
+        return None;
+    };
+    let branch = plan.branch(*branch_id)?;
+    let condition = plan.condition(branch.condition)?;
+    let dispatch_blocks_vec = condition.blocks().collect::<Vec<_>>();
+    let [dispatch_header] = dispatch_blocks_vec.as_slice() else {
+        return None;
+    };
+    let prefix_children = &children[..dispatch_position];
+    let prefix_blocks = prefix_children
+        .iter()
+        .flat_map(|region| blocks_in_region(cfg, plan, *region))
+        .collect::<BTreeSet<_>>();
+    let dispatch_blocks = blocks_in_region(cfg, plan, dispatch_child);
+    if prefix_blocks.is_empty() || dispatch_blocks.is_empty() {
+        return None;
+    }
+
+    let mut entries = BTreeSet::new();
+    for edge in &cfg.edges {
+        let source_inside = dispatch_blocks.contains(&edge.from);
+        let target_inside = dispatch_blocks.contains(&edge.to);
+        if !source_inside && target_inside {
+            if !prefix_blocks.contains(&edge.from) {
+                return None;
+            }
+            entries.insert(edge.to);
+        }
+    }
+    if entries.len() != 1 || entries.first().copied() != Some(*dispatch_header) {
+        return None;
+    }
+    let dispatch_terminator = cfg.blocks.get(dispatch_header.index())?.instrs.last()?;
+    if low_instr_may_observe_gc_roots(&dataflow.effect_summaries, dispatch_terminator.index()) {
+        return None;
+    }
+    let observer_starts = cfg
+        .reachable_successors(*dispatch_header)
+        .into_iter()
+        .filter(|successor| dispatch_blocks.contains(successor))
+        .collect::<Vec<_>>();
+    if observer_starts.is_empty() {
+        return None;
+    }
+
+    let relevant_blocks = prefix_blocks
+        .union(&dispatch_blocks)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for block in &relevant_blocks {
+        if dataflow.block_open_live_in(*block) || dataflow.block_open_live_out(*block) {
+            return None;
+        }
+        let range = cfg.blocks.get(block.index())?.instrs;
+        for index in range.start.index()..range.end() {
+            let instr = proto.instrs.get(index)?;
+            let effect = dataflow.instr_effects.get(index)?;
+            if effect.open_use.is_some()
+                || effect.open_must_def.is_some()
+                || matches!(instr, LowInstr::Close(_) | LowInstr::Tbc(_))
+                || matches!(instr, LowInstr::Closure(closure) if closure.captures.iter().any(|capture| matches!(capture.source, CaptureSource::ByReference(_))))
+            {
+                return None;
+            }
+        }
+    }
+    for (edge_index, cfg_edge) in cfg.edges.iter().enumerate() {
+        if !relevant_blocks.contains(&cfg_edge.from) {
+            continue;
+        }
+        if matches!(
+            plan.edge_plan(EdgeRef(edge_index))?.transfer,
+            crate::structure::EdgeTransfer::Goto(..) | crate::structure::EdgeTransfer::LoopBack(_)
+        ) {
+            return None;
+        }
+    }
+
+    // Region-result phi 候选若仍可能持有 collectable，当前 fixed-def collective proof
+    // 没有覆盖其 source identity。Loop-carried/region-input phi 由外层 binding 拥有，
+    // 不会因这个内层 block 获得新声明。
+    for phi in plan.phis().filter(|phi| prefix_blocks.contains(&phi.block)) {
+        let outer_owned = phi.incomings.iter().any(|incoming| {
+            matches!(
+                incoming.disposition,
+                PhiIncomingDisposition::LoopCarried(_) | PhiIncomingDisposition::RegionInput(_)
+            )
+        });
+        if !outer_owned
+            && phi.incomings.iter().any(|incoming| {
+                dataflow
+                    .leaf_values(incoming.value)
+                    .into_iter()
+                    .any(|value| ssa_value_may_hold_gc_root(proto, dataflow, value))
+            })
+        {
+            return None;
+        }
+    }
+
+    let mut candidate_defs = BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    let mut homes = BTreeSet::new();
+    for def in &dataflow.defs {
+        if !prefix_blocks.contains(&def.block)
+            || fixed_temps.get(def.id.index()) != Some(&TempId(def.id.index()))
+            || !low_instr_def_may_hold_gc_root(proto.instrs.get(def.instr.index())?, def.reg)
+            || dataflow.def_has_use_outside(cfg, def.id, &prefix_blocks)
+            || dataflow.live_in_regs(*dispatch_header).contains(&def.reg)
+        {
+            continue;
+        }
+        candidate_defs.insert(def.id);
+        roots.insert(TempId(def.id.index()));
+        homes.insert(def.reg);
+    }
+    if roots.is_empty() {
+        return None;
+    }
+
+    // A by-value closure is an independent physical holder. Requiring a complete source+holder
+    // pair keeps this first implementation narrow and prevents publishing a one-binding fence
+    // for the regress_457 shape.
+    let mut collective_holder = false;
+    for def in candidate_defs.iter().copied() {
+        let instr = dataflow.def_instr(def);
+        let Some(LowInstr::Closure(closure)) = proto.instrs.get(instr.index()) else {
+            continue;
+        };
+        if closure.dst != dataflow.def_reg(def) {
+            continue;
+        }
+        if closure.captures.iter().any(|capture| {
+            let CaptureSource::ByValue(reg) = capture.source else {
+                return false;
+            };
+            matches!(dataflow.use_value(instr, reg), SsaValue::Def(source) if candidate_defs.contains(&source))
+        }) {
+            collective_holder = true;
+            break;
+        }
+    }
+    if !collective_holder
+        || !all_paths_remove_implicit_roots_from_first_observation(
+            proto,
+            cfg,
+            dataflow,
+            &dispatch_blocks,
+            &observer_starts,
+            &homes,
+        )
+    {
+        return None;
+    }
+
+    Some(ImplicitRootScopeFence {
+        first_child: prefix_children[0],
+        end_before_child: dispatch_child,
+        ended_roots: roots,
+    })
+}
+
+fn blocks_in_region(cfg: &Cfg, plan: &StructurePlan, region: RegionId) -> BTreeSet<BlockRef> {
+    cfg.reachable_blocks
+        .iter()
+        .copied()
+        .filter(|block| {
+            plan.region_for_block(*block)
+                .is_some_and(|owner| plan.region_contains(region, owner))
+        })
+        .collect()
+}
+
+fn ssa_value_may_hold_gc_root(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    value: SsaValue,
+) -> bool {
+    match value {
+        SsaValue::Entry(_) | SsaValue::Phi(_) => true,
+        SsaValue::Def(def) => proto
+            .instrs
+            .get(dataflow.def_instr(def).index())
+            .is_none_or(|instr| low_instr_def_may_hold_gc_root(instr, dataflow.def_reg(def))),
+    }
+}
+
+fn all_paths_remove_implicit_roots_from_first_observation(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    condition_blocks: &BTreeSet<BlockRef>,
+    entries: &[BlockRef],
+    homes: &BTreeSet<Reg>,
+) -> bool {
+    let mut pending = entries
+        .iter()
+        .copied()
+        .map(|entry| (entry, homes.clone()))
+        .collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    while let Some((block, mut active)) = pending.pop() {
+        if !seen.insert((block, active.clone())) {
+            return false;
+        }
+        let Some(range) = cfg.blocks.get(block.index()).map(|block| block.instrs) else {
+            return false;
+        };
+        let mut resolved = false;
+        for index in range.start.index()..range.end() {
+            let Some(instr) = proto.instrs.get(index) else {
+                return false;
+            };
+            let Some(effect) = dataflow.instr_effects.get(index) else {
+                return false;
+            };
+            if low_instr_may_observe_gc_roots(&dataflow.effect_summaries, index) {
+                if !ordinary_call_excludes_homes_from_caller_prefix(instr, &active) {
+                    return false;
+                }
+                resolved = true;
+                break;
+            }
+            active.retain(|home| !effect.must_define(*home));
+            if active.is_empty() {
+                resolved = true;
+                break;
+            }
+        }
+        if resolved {
+            continue;
+        }
+        let successors = cfg
+            .reachable_successors(block)
+            .into_iter()
+            .filter(|successor| condition_blocks.contains(successor))
+            .collect::<Vec<_>>();
+        if successors.is_empty() {
+            return false;
+        }
+        pending.extend(
+            successors
+                .into_iter()
+                .map(|successor| (successor, active.clone())),
+        );
+    }
+    true
+}
+
+/// 只证明这个 ordinary call 的观察期间，旧值所在槽位不属于 caller root prefix。
+/// 它不证明调用返回后的 home 死亡，也不授权其它 observer 协议复用该结论。
+fn ordinary_call_excludes_homes_from_caller_prefix(
+    instr: &LowInstr,
+    homes: &BTreeSet<Reg>,
+) -> bool {
+    let LowInstr::Call(call) = instr else {
+        return false;
+    };
+    homes.iter().all(|home| home.index() >= call.callee.index())
+}
+
 /// 从 low-IR 正证一个可能承载 GC root 的 canonical fixed def 在后续所有潜在用户代码 /
 /// GC 观察点都仍位于 VM active stack top 以下，并沿同一 basic block、线性 single-entry
 /// fast path，或 predecessor-closed 的严格前向 CFG DAG 活到每条路径的 Return/TailCall、
@@ -1492,18 +2087,28 @@ impl CopyRootScalarValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct CopyRootOverwrite {
-    temp: TempId,
-    value: CopyRootScalarValue,
+pub(super) enum CopyRootOverwrite {
+    Scalar {
+        temp: TempId,
+        value: CopyRootScalarValue,
+    },
+    /// 单结果 call 先写自己的 result home，下一条透明 MOVE 再覆盖旧 root home。
+    /// HIR 会折叠 MOVE，因此 endpoint 绑定 call result temp，而不是一个同 home scalar temp。
+    CallResultMove { temp: TempId },
 }
 
 impl CopyRootOverwrite {
     pub(super) const fn temp(self) -> TempId {
-        self.temp
+        match self {
+            Self::Scalar { temp, .. } | Self::CallResultMove { temp } => temp,
+        }
     }
 
     pub(super) fn matches_hir_expr(self, value: &HirExpr) -> bool {
-        self.value.matches_hir_expr(value)
+        match self {
+            Self::Scalar { value: scalar, .. } => scalar.matches_hir_expr(value),
+            Self::CallResultMove { .. } => false,
+        }
     }
 }
 
@@ -1526,7 +2131,7 @@ impl CopyRootEnd {
     fn overwrite(overwrite: CopyRootOverwrite) -> Self {
         Self {
             scope_end: false,
-            overwrites: BTreeMap::from([(overwrite.temp, overwrite)]),
+            overwrites: BTreeMap::from([(overwrite.temp(), overwrite)]),
             observed_any: true,
         }
     }
@@ -2049,8 +2654,52 @@ fn root_end_at_overwrite(
     if let Some(overwrite) = direct_scalar_overwrite(proto, dataflow, fixed_temps, index, home) {
         return Some(CopyRootEnd::overwrite(overwrite));
     }
+    if let Some(overwrite) =
+        immediate_call_result_move_overwrite(proto, dataflow, fixed_temps, index, home)
+    {
+        return Some(CopyRootEnd::overwrite(overwrite));
+    }
     overwrite_suffix_is_unobservable_until_scope_end(proto, cfg, dataflow, index)
         .then(CopyRootEnd::scope_end)
+}
+
+/// 识别 `CALL rX -> rX; MOVE old_home <- rX` 的单次 overwrite endpoint。
+///
+/// CALL 期间旧 home 是否仍位于 caller root prefix 已由 `copy_root_end` 在前一条指令
+/// 处理并证明；这里仅冻结结果宽度、相邻性与 SSA source identity。开放结果、多结果或
+/// 非相邻 forwarding 需要额外的 value-pack/事件证明，不能借这条证书。
+fn immediate_call_result_move_overwrite(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    fixed_temps: &[TempId],
+    index: usize,
+    home: Reg,
+) -> Option<CopyRootOverwrite> {
+    let LowInstr::Move(move_) = proto.instrs.get(index)? else {
+        return None;
+    };
+    if move_.dst != home {
+        return None;
+    }
+    let SsaValue::Def(source_def) = dataflow.use_value(InstrRef(index), move_.src) else {
+        return None;
+    };
+    let source = dataflow.defs.get(source_def.index())?;
+    if source.reg != move_.src || source.instr.index().checked_add(1) != Some(index) {
+        return None;
+    }
+    let LowInstr::Call(call) = proto.instrs.get(source.instr.index())? else {
+        return None;
+    };
+    if !matches!(
+        call.results,
+        ResultPack::Fixed(results) if results.start == move_.src && results.len == 1
+    ) {
+        return None;
+    }
+    let direct = TempId(source_def.index());
+    (fixed_temps.get(source_def.index()) == Some(&direct))
+        .then_some(CopyRootOverwrite::CallResultMove { temp: direct })
 }
 
 /// Marking the old value as a source local may keep it alive past a non-scalar raw overwrite.
@@ -2128,7 +2777,7 @@ fn direct_scalar_overwrite(
     let value = direct_scalar_overwrite_value(proto.instrs.get(index)?, home)?;
     let def = dataflow.instr_def_for_reg(InstrRef(index), home)?;
     let direct = TempId(def.index());
-    (fixed_temps.get(def.index()) == Some(&direct)).then_some(CopyRootOverwrite {
+    (fixed_temps.get(def.index()) == Some(&direct)).then_some(CopyRootOverwrite::Scalar {
         temp: direct,
         value,
     })
@@ -2416,6 +3065,32 @@ mod tests {
         assert_eq!(fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]), 7);
         assert!(Reg(6).index() < fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]));
         assert!(Reg(7).index() >= fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]));
+    }
+
+    #[test]
+    fn ordinary_call_excludes_only_the_complete_high_home_collective_from_caller_prefix() {
+        let call = LowInstr::Call(CallInstr {
+            callee: Reg(6),
+            args: ValuePack::Fixed(RegRange::new(Reg(7), 0)),
+            results: ResultPack::Ignore,
+            kind: CallKind::Normal,
+            method_name: None,
+        });
+
+        assert!(ordinary_call_excludes_homes_from_caller_prefix(
+            &call,
+            &BTreeSet::from([Reg(6), Reg(7)])
+        ));
+        assert!(!ordinary_call_excludes_homes_from_caller_prefix(
+            &call,
+            &BTreeSet::from([Reg(5), Reg(7)])
+        ));
+        assert!(!ordinary_call_excludes_homes_from_caller_prefix(
+            &LowInstr::Return(ReturnInstr {
+                values: ValuePack::Fixed(RegRange::new(Reg(0), 0)),
+            }),
+            &BTreeSet::from([Reg(6), Reg(7)])
+        ));
     }
 
     #[test]
@@ -2747,11 +3422,11 @@ mod tests {
         effects[4].fixed_must_defs.insert(Reg(1));
         let summaries = vec![SideEffectSummary::default(); instrs.len()];
         let overwrite = |index, _home| match index {
-            2 => Some(CopyRootEnd::overwrite(CopyRootOverwrite {
+            2 => Some(CopyRootEnd::overwrite(CopyRootOverwrite::Scalar {
                 temp: TempId(2),
                 value: CopyRootScalarValue::Boolean(false),
             })),
-            4 => Some(CopyRootEnd::overwrite(CopyRootOverwrite {
+            4 => Some(CopyRootEnd::overwrite(CopyRootOverwrite::Scalar {
                 temp: TempId(4),
                 value: CopyRootScalarValue::Integer(0),
             })),

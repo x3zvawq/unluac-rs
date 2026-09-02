@@ -1,7 +1,7 @@
--- regress_352_multi_return_call_run_accept: stable multi-return prefixes allow the complete callee run to collapse
+-- regress_352_multi_return_call_root: a non-tail dynamic callee keeps its producer locals rooted
 -- unluac: expect-contains [[return "stable",]]
--- unluac: expect-not-contains [[local r5_0 =]]
--- unluac: expect-not-contains [[local r5_1 =]]
+-- unluac: expect-contains [[local r5_0 =]]
+-- unluac: expect-contains [[local r5_1 =]]
 local function make_outer()
     return function(value)
         return value

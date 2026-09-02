@@ -1,8 +1,7 @@
 //! 这个子模块负责把“缺失 global 声明”收成最小 collective gate。
 //!
-//! 在 Lua 5.5 里，stripped chunk 常常只能证明“这里必须重新打开某种 global gate 才能
-//! 重新编译”，却未必能证明源码是逐名 `global a, b` 还是 collective `global *`。
-//! 这里的 owner 只处理这种 AST 级 canonical 选择：
+//! 在 Lua 5.5 里，已有 AST gate 会约束后缀中的 global 访问；当逐名声明与 collective
+//! gate 都能表达该约束时，这里的 owner 只处理 AST 级 canonical 选择，不声称恢复原源码形状：
 //! - 优先把终端语句尾巴收成最小 `do + global *` / `global<const> *`
 //! - 它不会去猜 block 外是否也存在同一批 global
 //! - 也不会跨越 label/goto 之类高风险控制流去硬包一层 `do`

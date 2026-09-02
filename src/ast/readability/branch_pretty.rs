@@ -945,6 +945,8 @@ mod tests {
             callee: global_expr(name),
             args: Vec::new(),
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -973,6 +975,8 @@ mod tests {
                     capture_write_names: BTreeSet::new(),
                 }))],
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             })),
         }))
     }
@@ -1595,6 +1599,7 @@ mod tests {
             targets: vec![AstLValue::Name(binding.to_name_ref())],
             values: vec![call_expr("make_value")],
             initializer_merge_transaction: None,
+            method_rewrite_transaction: None,
         }));
         let mut reassigned = single_pass_fallthrough_arm(vec![recovered_local(0), write]);
 

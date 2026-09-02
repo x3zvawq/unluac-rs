@@ -307,10 +307,18 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 continue;
             }
 
-            let mut trial_sink = rewritten_sink
-                .as_ref()
-                .unwrap_or(&old_stmts[run_end])
-                .clone();
+            let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end]);
+            if candidate.initializer_may_affect_collectable_lifetime()
+                && !call_alias_sink_preserves_root_lifetime(current_sink, candidate.binding())
+            {
+                // 候选拒绝[SemanticBarrier:Lifetime]：callee/receiver/argument 的源码位置
+                // 不能证明 producer local 在普通调用或 generic-for body 期间仍是强根。
+                // 只有单值 tail return、顶层 return value 或同一 call occurrence 的 HIR
+                // method-callee handoff 可以接管这一边界。
+                continue;
+            }
+
+            let mut trial_sink = current_sink.clone();
             if rewrite_stmt_use_sites_with_policy(
                 &mut trial_sink,
                 candidate,
@@ -444,22 +452,17 @@ pub(super) fn single_call_callee_alias(
             };
             candidate.binding().matches_name_ref(callee)
         }
-        AstStmt::GenericFor(generic_for) => {
-            let [AstExpr::Call(call)] = generic_for.iterator.as_slice() else {
-                // method iterator 由 receiver 单项规则判断；
-                // 多项 iterator 不是 terminal call-alias sink。
-                return false;
-            };
-            let AstExpr::Var(callee) = &call.callee else {
-                // 候选拒绝[PolicyBoundary]：caller 已证明唯一 loop-header use 并完成 trial
-                // rewrite；generic-for 的单项展示例外只收回直接 callee。
-                return false;
-            };
-            candidate.binding().matches_name_ref(callee)
+        AstStmt::GenericFor(_) => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：iterator call 不保证保存 callable producer；
+            // 原 local 还会跨 iterator setup 与 loop body 持根。缺少 HIR producer/sink
+            // 双端事务时，generic-for 不接受 call-result callee 单项折叠。
+            return false;
         }
         AstStmt::Return(ret) => {
-            let Some(AstExpr::Call(call)) = ret.values.last() else {
-                // terminal method-call 没有独立 direct callee binding。
+            let [AstExpr::Call(call)] = ret.values.as_slice() else {
+                // 候选拒绝[SemanticBarrier:Lifetime]：只有唯一 return call 会终结 caller
+                // frame；一旦有前置返回值，该 call 不再是 tail call，原 producer local
+                // 会在调用期间继续持根。
                 return false;
             };
             let AstExpr::Var(callee) = &call.callee else {
@@ -480,16 +483,15 @@ pub(super) fn single_call_callee_alias(
         return false;
     }
     if matches!(&stmts[sink_index], AstStmt::CallStmt(_))
-        && !call_stmt_hands_off_root(&stmts[sink_index], candidate.binding())
+        && !proven_method_call_consumes_callee(&stmts[sink_index], candidate.binding())
     {
-        // 候选拒绝[SemanticBarrier:Lifetime]：普通调用未证明 callee 槽接管 producer root，
-        // 删除 local 可能让函数值在参数求值前失去唯一强引用。
+        // 候选拒绝[SemanticBarrier:Lifetime]：普通 call callee 槽不证明 producer local
+        // 跨调用持根；只有同一 occurrence 的 HIR method-callee handoff 可以放行。
         return false;
     }
-    // callee 位在调用参数之前求值，并在调用帧或 generic-for loop header 中继续持有
-    // producer 结果；结合外层 suffix-use/write、run_preserves_eval_order 与 sink 的
-    // 直接 callee 形状检查，移除 local 只把同一次 call 放回 callee 槽，不复制 producer
-    // 或缩短 root 生命周期。
+    // 单值 return call 会在进入 callee 前终结 caller frame；普通 CallStmt 则只接受 HIR
+    // 已对同一 occurrence 签发的 method-callee root handoff。结合外层唯一 use/write 与
+    // eval-order 证明，移除 local 不复制 producer 或缩短已证明的 root 生命周期。
     true
 }
 
@@ -692,9 +694,6 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
-    let block_has_close = old_stmts.iter().any(|stmt| {
-        matches!(stmt, AstStmt::LocalDecl(local) if local.bindings.iter().any(|binding| binding.attr == AstLocalAttr::Close))
-    });
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
@@ -771,13 +770,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end]);
             if !matches!(current_sink, AstStmt::While(_) | AstStmt::Repeat(_))
                 && candidate.initializer_may_affect_collectable_lifetime()
-                && !mechanical_sink_preserves_root_lifetime(
-                    current_sink,
-                    candidate.binding(),
-                    run_end + 1 == old_stmts.len(),
-                    trailing_condition.is_none(),
-                    block_has_close,
-                )
+                && !mechanical_sink_preserves_root_lifetime(current_sink, candidate.binding())
             {
                 // 候选拒绝[SemanticBarrier:Lifetime]：把 recovered lookup/object/动态运算结果搬入非终态 sink 会在 sink 后提前释放唯一强 root（regress_355）。
                 // 候选拒绝[TargetConstraint]：只有目标已定义的 literal 运算可证明结果为标量；动态 operand 仍可能经元方法返回 collectable。
@@ -1011,19 +1004,15 @@ pub(super) fn stmt_can_absorb_mechanical_run(stmt: &AstStmt) -> bool {
     )
 }
 
-fn mechanical_sink_preserves_root_lifetime(
-    stmt: &AstStmt,
-    binding: AstBindingRef,
-    is_block_terminal: bool,
-    has_no_trailing_condition: bool,
-    block_has_close: bool,
-) -> bool {
+fn mechanical_sink_preserves_root_lifetime(stmt: &AstStmt, binding: AstBindingRef) -> bool {
     candidate::stmt_has_top_level_return_binding_use(stmt, binding)
         || proven_method_call_consumes_callee(stmt, binding)
-        || (!block_has_close
-            && is_block_terminal
-            && has_no_trailing_condition
-            && call_stmt_hands_off_root(stmt, binding))
+}
+
+fn call_alias_sink_preserves_root_lifetime(stmt: &AstStmt, binding: AstBindingRef) -> bool {
+    candidate::stmt_has_top_level_return_binding_use(stmt, binding)
+        || matches!(stmt, AstStmt::Return(ret) if matches!(ret.values.as_slice(), [AstExpr::Call(_) | AstExpr::MethodCall(_)]))
+        || proven_method_call_consumes_callee(stmt, binding)
 }
 
 fn proven_method_call_consumes_callee(stmt: &AstStmt, binding: AstBindingRef) -> bool {
@@ -1033,24 +1022,13 @@ fn proven_method_call_consumes_callee(stmt: &AstStmt, binding: AstBindingRef) ->
             if matches!(
                 &call_stmt.call,
                 AstCallKind::Call(call)
-                    if call.method_key.is_some()
+                    if matches!(
+                        call.callee_root_handoff,
+                        Some(crate::hir::HirCallRootHandoff::MethodCallee(_))
+                    )
                         && matches!(&call.callee, AstExpr::Var(name) if binding.matches_name_ref(name))
             )
     )
-}
-
-fn call_stmt_hands_off_root(stmt: &AstStmt, binding: AstBindingRef) -> bool {
-    let AstStmt::CallStmt(call_stmt) = stmt else {
-        return false;
-    };
-    let (prefix, args) = match &call_stmt.call {
-        AstCallKind::Call(call) => (&call.callee, call.args.as_slice()),
-        AstCallKind::MethodCall(call) => (&call.receiver, call.args.as_slice()),
-    };
-    matches!(prefix, AstExpr::Var(name) if binding.matches_name_ref(name))
-        || args
-            .iter()
-            .any(|arg| matches!(arg, AstExpr::Var(name) if binding.matches_name_ref(name)))
 }
 
 fn terminal_local_hands_off_root(stmt: &AstStmt, binding: AstBindingRef) -> bool {
@@ -1186,13 +1164,13 @@ mod tests {
 
     use crate::LuaString;
     use crate::ast::common::{
-        AstCallExpr, AstCallStmt, AstFunctionExpr, AstLocalBinding, AstLocalDecl, AstLocalOrigin,
-        AstReturn, AstTableConstructor, AstTableField,
+        AstCallExpr, AstCallStmt, AstFunctionExpr, AstGenericFor, AstLocalBinding, AstLocalDecl,
+        AstLocalOrigin, AstReturn, AstTableConstructor, AstTableField,
     };
     use crate::decompile::DecompileDialect;
     use crate::hir::{
-        HirBinaryExpr, HirBinaryOpKind, HirExpr, HirProtoRef, HirUnaryExpr, HirUnaryOpKind,
-        HirValuePack, LocalId, ParamId, initializer_root_profile,
+        HirBinaryExpr, HirBinaryOpKind, HirCallRootHandoff, HirExpr, HirProtoRef, HirUnaryExpr,
+        HirUnaryOpKind, HirValuePack, LocalId, ParamId, initializer_root_profile,
     };
 
     use super::*;
@@ -1217,6 +1195,8 @@ mod tests {
                 callee,
                 args: vec![arg],
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             })),
         }))
     }
@@ -1226,6 +1206,8 @@ mod tests {
             callee,
             args: Vec::new(),
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1240,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_call_run_accepts_table_arg_and_scalarizes_vararg() {
+    fn extended_call_run_keeps_unproven_table_and_vararg_roots() {
         let first = AstBindingRef::Local(LocalId(0));
         let second = AstBindingRef::Local(LocalId(1));
         let table = AstExpr::TableConstructor(Box::new(AstTableConstructor {
@@ -1248,7 +1230,7 @@ mod tests {
         }));
         let mut table_block = AstBlock {
             stmts: vec![
-                recovered_local(first, table.clone()),
+                recovered_local(first, table),
                 recovered_local(second, AstExpr::Var(AstNameRef::Param(ParamId(1)))),
                 direct_call(
                     AstExpr::Var(second.to_name_ref()),
@@ -1262,12 +1244,9 @@ mod tests {
             table_value,
             InlinePolicy::ExtendedCallChain
         ));
-        assert!(collapse_call_run(&mut table_block));
-        assert!(matches!(
-            table_block.stmts.as_slice(),
-            [AstStmt::CallStmt(call)]
-                if matches!(&call.call, AstCallKind::Call(call) if call.args == vec![table])
-        ));
+        let original = table_block.clone();
+        assert!(!collapse_call_run(&mut table_block));
+        assert_eq!(table_block, original);
 
         let mut vararg_block = AstBlock {
             stmts: vec![
@@ -1279,12 +1258,52 @@ mod tests {
                 ),
             ],
         };
-        assert!(collapse_call_run(&mut vararg_block));
+        let original = vararg_block.clone();
+        assert!(!collapse_call_run(&mut vararg_block));
+        assert_eq!(vararg_block, original);
+    }
+
+    #[test]
+    fn extended_call_run_accepts_hir_proven_scalar_arguments() {
+        let first = AstBindingRef::Local(LocalId(0));
+        let second = AstBindingRef::Local(LocalId(1));
+        let mut first_decl = recovered_local(first, AstExpr::Integer(1));
+        let mut second_decl = recovered_local(second, AstExpr::Integer(2));
+        for (decl, value) in [(&mut first_decl, 1), (&mut second_decl, 2)] {
+            let AstStmt::LocalDecl(local_decl) = decl else {
+                unreachable!("recovered_local must produce a local declaration");
+            };
+            local_decl.initializer_root_profile = Some(initializer_root_profile(
+                DecompileDialect::Lua54,
+                &HirValuePack::fixed(vec![HirExpr::Integer(value)]),
+                1,
+            ));
+        }
+        let mut block = AstBlock {
+            stmts: vec![
+                first_decl,
+                second_decl,
+                AstStmt::CallStmt(Box::new(AstCallStmt {
+                    call: AstCallKind::Call(Box::new(AstCallExpr {
+                        callee: AstExpr::Var(AstNameRef::Param(ParamId(0))),
+                        args: vec![
+                            AstExpr::Var(first.to_name_ref()),
+                            AstExpr::Var(second.to_name_ref()),
+                        ],
+                        method_key: None,
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
+                    })),
+                })),
+            ],
+        };
+
+        assert!(collapse_call_run(&mut block));
         assert!(matches!(
-            vararg_block.stmts.as_slice(),
+            block.stmts.as_slice(),
             [AstStmt::CallStmt(call)]
                 if matches!(&call.call, AstCallKind::Call(call)
-                    if call.args == vec![AstExpr::SingleValue(Box::new(AstExpr::VarArg))])
+                    if call.args == vec![AstExpr::Integer(1), AstExpr::Integer(2)])
         ));
     }
 
@@ -1331,6 +1350,51 @@ mod tests {
 
         assert!(!collapse_call_run(&mut block));
         assert_eq!(block, original);
+    }
+
+    #[test]
+    fn call_result_callee_requires_tail_return_or_hir_handoff() {
+        let callee = AstBindingRef::Local(LocalId(0));
+        let producer = call_expr(AstExpr::Var(AstNameRef::Param(ParamId(0))));
+
+        let mut call_stmt = AstBlock {
+            stmts: vec![
+                recovered_local(callee, producer.clone()),
+                direct_call(AstExpr::Var(callee.to_name_ref()), AstExpr::Nil),
+            ],
+        };
+        let original = call_stmt.clone();
+        assert!(!collapse_call_run(&mut call_stmt));
+        assert_eq!(call_stmt, original);
+
+        let mut prefixed_return = AstBlock {
+            stmts: vec![
+                recovered_local(callee, producer.clone()),
+                AstStmt::Return(Box::new(AstReturn {
+                    values: vec![
+                        AstExpr::Integer(42),
+                        call_expr(AstExpr::Var(callee.to_name_ref())),
+                    ],
+                })),
+            ],
+        };
+        let original = prefixed_return.clone();
+        assert!(!collapse_call_run(&mut prefixed_return));
+        assert_eq!(prefixed_return, original);
+
+        let mut generic_for = AstBlock {
+            stmts: vec![
+                recovered_local(callee, producer),
+                AstStmt::GenericFor(Box::new(AstGenericFor {
+                    bindings: vec![AstBindingRef::Local(LocalId(1))],
+                    iterator: vec![call_expr(AstExpr::Var(callee.to_name_ref()))],
+                    body: AstBlock::default(),
+                })),
+            ],
+        };
+        let original = generic_for.clone();
+        assert!(!collapse_call_run(&mut generic_for));
+        assert_eq!(generic_for, original);
     }
 
     #[test]
@@ -1418,5 +1482,31 @@ mod tests {
                 inline_candidate(&guarded).expect("single local is an inline candidate");
             assert!(candidate.initializer_may_affect_collectable_lifetime());
         }
+    }
+
+    #[test]
+    fn method_callee_root_gate_requires_hir_occurrence_proof() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let mut stmt = direct_call(
+            AstExpr::Var(binding.to_name_ref()),
+            AstExpr::Var(AstNameRef::Param(ParamId(0))),
+        );
+        if let AstStmt::CallStmt(call_stmt) = &mut stmt
+            && let AstCallKind::Call(call) = &mut call_stmt.call
+        {
+            call.method_key = Some(LuaString::from("run"));
+        } else {
+            unreachable!("direct_call must produce an ordinary call statement");
+        }
+        assert!(!proven_method_call_consumes_callee(&stmt, binding));
+
+        if let AstStmt::CallStmt(call_stmt) = &mut stmt
+            && let AstCallKind::Call(call) = &mut call_stmt.call
+        {
+            call.callee_root_handoff = Some(HirCallRootHandoff::MethodCallee(
+                crate::hir::HirMethodSetupProtocolId::new(0),
+            ));
+        }
+        assert!(proven_method_call_consumes_callee(&stmt, binding));
     }
 }

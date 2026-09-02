@@ -12,10 +12,10 @@
 
 use super::exprs::{
     expr_for_const, expr_for_reg_use, expr_for_value_operand, global_key_for_access,
-    lower_binary_op, lower_closure_capture, lower_closure_expr, lower_composite_factory_expr,
-    lower_method_key, lower_raw_table_get_expr, lower_raw_table_set_call, lower_table_access_expr,
-    lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
-    lower_upvalue_operand_target, lower_value_pack,
+    lower_binary_op, lower_call_root_handoff, lower_closure_capture, lower_closure_expr,
+    lower_composite_factory_expr, lower_method_key, lower_raw_table_get_expr,
+    lower_raw_table_set_call, lower_table_access_expr, lower_table_access_target, lower_unary_op,
+    lower_upvalue_operand_expr, lower_upvalue_operand_target, lower_value_pack,
 };
 use super::global_decls::{GlobalDeclProtocol, GlobalDeclValues};
 use super::helpers::{
@@ -195,6 +195,8 @@ pub(super) fn lower_regular_instr(
                 method: false,
                 fastcall: None,
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             };
             if type_guard.kind.normalizes_subject() {
                 fixed_assign(lowering, instr_ref, vec![HirExpr::Call(Box::new(call))])
@@ -358,6 +360,11 @@ pub(super) fn lower_terminal_instr(
                         CallKind::Normal | CallKind::Method => None,
                     },
                     method_key,
+                    // TailCall 不会返回当前 frame，普通 method transaction 因而没有 post-call
+                    // callee root 可接管。HIR 仍保留 raw method 事实；终结表达式能否写成冒号
+                    // 语法由 AST 证明。
+                    callee_root_handoff: None,
+                    method_rewrite_transaction: None,
                 }))),
             ))])
         }
@@ -413,6 +420,8 @@ fn generic_for_iterator_call(
         method: false,
         fastcall: None,
         method_key: None,
+        callee_root_handoff: None,
+        method_rewrite_transaction: None,
     }))
 }
 
@@ -455,6 +464,8 @@ fn lower_call_expr(
             CallKind::Normal | CallKind::Method => None,
         },
         method_key,
+        callee_root_handoff: lower_call_root_handoff(lowering, instr_ref, call.kind),
+        method_rewrite_transaction: None,
     }
 }
 
@@ -562,6 +573,7 @@ fn lower_shared_capture_barrier(
             HirExpr::TableAccess(Box::new(HirTableAccess {
                 base: HirExpr::LocalRef(barrier.box_local),
                 key: HirExpr::Integer((index + 1) as i64),
+                method_setup_protocol: None,
             }))
         })
         .collect::<Vec<_>>();

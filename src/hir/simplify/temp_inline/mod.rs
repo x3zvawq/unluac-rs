@@ -40,7 +40,9 @@
 //! method 协议的 callee base 与隐式首参虽是两个语法 use，却只求值一次 receiver；相邻
 //! 裸 binding 或命名字段链快照可在严格匹配这对 use 后原子收回，例如
 //! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；终结调用的连续物化 run
-//! 还可收回 owner 保持存活的裸 receiver，普通点调用仍按两次读取处理。
+//! 还可收回 owner 保持存活的裸 receiver。若独立 receiver owner 只是从另一个 pure scope-end
+//! root 复制而来，allocation-root pair 与稳定 source home 可共同证明 alternate-root handoff；
+//! 即使 receiver 的覆盖 RHS 可能触发 GC，也可删除该 copy。普通点调用仍按两次读取处理。
 //! 相邻 sink 若是无条件 `Block`，只递归穿过零前缀的第一条语句；第二条及更晚消费仍需
 //! block-prefix 的求值、写入、capture 与控制流摘要，不能把整个词法块视为透明。
 //! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
@@ -101,6 +103,7 @@ struct TempInlineWorkspace<'a> {
     readability: ReadabilityOptions,
     substantial_closure_bodies: &'a [bool],
     physical_root_temps: Vec<bool>,
+    new_physical_root_temps: BTreeSet<TempId>,
     inline_dispositions: HirInlineDispositions,
 }
 
@@ -182,6 +185,7 @@ impl<'a> TempInlineWorkspace<'a> {
             readability,
             substantial_closure_bodies,
             physical_root_temps,
+            new_physical_root_temps: BTreeSet::new(),
             inline_dispositions,
         }
     }
@@ -294,6 +298,11 @@ fn inline_temps_in_proto_with_scope(
         facts,
         &BTreeSet::new(),
     );
+    let physical_root_count = proto.physical_root_temps.len();
+    proto
+        .physical_root_temps
+        .extend(workspace.new_physical_root_temps.iter().copied());
+    changed |= proto.physical_root_temps.len() != physical_root_count;
     proto.inline_dispositions = workspace.inline_dispositions;
     changed
 }
@@ -395,6 +404,31 @@ fn inline_temps_in_block(
             facts,
             &captured_slots_before_stmt,
             &physical_root_lifetimes,
+        )
+    {
+        changed = true;
+        captured_slots_before_stmt =
+            captured_slots_before_stmts(block, facts, inherited_captured_slots);
+        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
+            &block.stmts,
+            facts,
+            workspace.safety,
+            &workspace.physical_root_temps,
+        );
+    }
+
+    if matches!(workspace.scope, TempInlineScope::All)
+        && inline_method_receiver_root_handoffs(
+            block,
+            &mut workspace.uses,
+            live_use_counts,
+            facts,
+            &captured_slots_before_stmt,
+            reference_captured,
+            &call_root_indices,
+            &mut workspace.physical_root_temps,
+            &mut workspace.new_physical_root_temps,
+            &workspace.inline_dispositions,
         )
     {
         changed = true;
@@ -881,6 +915,80 @@ fn inline_adjacent_call_root_expression_overwrites(
             .collect();
     }
     changed
+}
+
+/// 收回由另一个仍存活物理根覆盖的 `SELF` receiver copy。
+///
+/// `root_lifetimes` 已把 allocation owner、覆盖 endpoint、alternate scope-end root 与 method
+/// 协议冻结成 block-local handoff。这里只复核当前 definition 的 debug/capture/TBC/disposition
+/// 删除条件并提交替换；AST 之后只决定能否写成冒号语法，不再重建 VM 生命周期。
+#[allow(clippy::too_many_arguments)]
+fn inline_method_receiver_root_handoffs(
+    block: &mut HirBlock,
+    scratch: &mut TempUseScratch,
+    live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+    reference_captured: &ReferenceCapturedBindings,
+    call_roots: &CallRootLifetimeIndices,
+    physical_root_temps: &mut [bool],
+    new_physical_root_temps: &mut BTreeSet<TempId>,
+    inline_dispositions: &HirInlineDispositions,
+) -> bool {
+    let reference_captured_homes =
+        complete_reference_captured_home_slots(reference_captured, facts);
+    let mut identity_sensitive_temps = stmts_value_captured_bindings(&block.stmts).temps;
+    identity_sensitive_temps.extend(stmts_to_be_closed_temps(&block.stmts));
+    let mut plan = None;
+
+    for handoff in call_roots.method_receiver_handoffs(&block.stmts, facts) {
+        let target = handoff.target();
+        let source = handoff.source();
+        if total_use_count(target, live_use_counts) != 2
+            || scratch.has_debug_local_hint(target)
+            || inline_dispositions.temp(target).must_preserve()
+            || identity_sensitive_temps.contains(&target)
+            || identity_sensitive_temps.contains(&source)
+            || reference_captured.temps.contains(&target)
+            || reference_captured.temps.contains(&source)
+            || reference_captured_homes.contains(&handoff.target_home())
+            || reference_captured_homes.contains(&handoff.source_home())
+            || !materialization_run_candidate_is_safe(
+                target,
+                &HirExpr::TempRef(source),
+                handoff.producer_index(),
+                scratch,
+                facts,
+                captured_slots_before_stmt,
+            )
+        {
+            continue;
+        }
+        plan = Some(handoff);
+        break;
+    }
+
+    let Some(plan) = plan else {
+        return false;
+    };
+
+    debug_assert!(plan.sink_index() < plan.overwrite_index());
+    let target = plan.target();
+    let source = plan.source();
+    let replacement = HirExpr::TempRef(source);
+    replace_temp_in_stmt(&mut block.stmts[plan.lookup_index()], target, &replacement);
+    replace_temp_in_stmt(&mut block.stmts[plan.sink_index()], target, &replacement);
+    block.stmts.remove(plan.producer_index());
+    remove_live_use(live_use_counts, target);
+    remove_live_use(live_use_counts, target);
+    remove_live_use(live_use_counts, source);
+    collect_expr_temp_uses_summary(&replacement, scratch).add_to_totals(live_use_counts);
+    collect_expr_temp_uses_summary(&replacement, scratch).add_to_totals(live_use_counts);
+    *physical_root_temps
+        .get_mut(source.index())
+        .expect("physical root set should cover every referenced temp") = true;
+    new_physical_root_temps.insert(source);
+    true
 }
 
 fn call_root_overwrite_is_inlineable(expr: &HirExpr, root: TempId) -> bool {
@@ -3398,6 +3506,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Nil, HirExpr::Nil]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
                     values: HirValuePack::fixed(vec![
@@ -3420,6 +3529,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))));
         block
     }
@@ -3431,6 +3542,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::TempRef(source)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         HirBlock {
@@ -3442,6 +3554,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
                     values: HirValuePack::expanding(
@@ -3452,6 +3565,8 @@ mod tests {
                             method: false,
                             fastcall: None,
                             method_key: None,
+                            callee_root_handoff: None,
+                            method_rewrite_transaction: None,
                         }))),
                     ),
                 })),
@@ -3476,6 +3591,8 @@ mod tests {
                 method: false,
                 fastcall: None,
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             },
         }))
     }
@@ -3486,6 +3603,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -3493,6 +3611,7 @@ mod tests {
         HirExpr::TableAccess(Box::new(HirTableAccess {
             base,
             key: HirExpr::String(key.into()),
+            method_setup_protocol: None,
         }))
     }
 
@@ -3503,6 +3622,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -3741,6 +3862,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         let producer = |value| {
             HirStmt::Assign(Box::new(HirAssign {
@@ -3748,6 +3870,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
 
@@ -3789,6 +3912,7 @@ mod tests {
                             values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
                         })),
                     ),
                 ],
@@ -3818,6 +3942,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         let mut local = empty_proto(
             HirBlock {
@@ -3855,6 +3980,8 @@ mod tests {
                 method: false,
                 fastcall: None,
                 method_key: None,
+                callee_root_handoff: None,
+                method_rewrite_transaction: None,
             })),
             ReadabilityOptions::default(),
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
@@ -3867,6 +3994,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
         );
         assert!(inline_site_in_stmt(&rewritten_prefix, target).is_none());
@@ -3883,6 +4011,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(source)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 }))],
             },
             cond: HirExpr::TempRef(temp),
@@ -3929,12 +4058,14 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         let alias_write = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(other)],
             values: HirValuePack::fixed(vec![HirExpr::Integer(3)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         let empty_captures = ReferenceCapturedBindings::default();
         let empty_slots = BTreeSet::new();
@@ -4036,6 +4167,7 @@ mod tests {
             ))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))];
         assert!(!repeat_head_dependencies_are_stable(
             &value,
@@ -4082,6 +4214,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }));
         assert!(!repeat_head_dependencies_are_stable(
             &call,
@@ -4251,9 +4385,12 @@ mod tests {
                     method: false,
                     fastcall: None,
                     method_key: None,
+                    callee_root_handoff: None,
+                    method_rewrite_transaction: None,
                 }))]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
         );
         rooted.stmts.insert(1, call_stmt("collectgarbage"));
@@ -4337,6 +4474,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
@@ -4362,6 +4500,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::from([HomeSlotKey::new(0, 0)]),
@@ -4373,6 +4512,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::new(),
@@ -4384,6 +4524,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::new(),
@@ -4497,6 +4638,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let mut stable = HirBlock {
@@ -4538,6 +4680,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }));
         let mut dynamic = HirBlock {
             stmts: vec![candidate(dynamic_call), numeric_for()],
@@ -4572,12 +4716,14 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(2))]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(TempId(1))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::NumericFor(Box::new(crate::hir::common::HirNumericFor {
                     binding: LocalId(0),
@@ -4701,6 +4847,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let loop_sink = || {
@@ -4756,6 +4903,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         })));
         assert!(
             numeric_for_binding_header_alias_plan(&dynamic, 0..3, 2, &live_uses, &proof).is_none()
@@ -4773,6 +4922,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }));
         numeric_for.limit = HirExpr::TempRef(TempId(2));
         assert!(
@@ -4789,6 +4940,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let block = |middle_target| HirBlock {
@@ -4915,6 +5067,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let mut captured_rebind = empty_proto(

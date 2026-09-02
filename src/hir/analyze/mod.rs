@@ -11,6 +11,7 @@ mod global_decls;
 mod helpers;
 mod instrs;
 mod lower;
+pub(super) mod method_setups;
 mod shared_closures;
 mod short_circuit;
 mod structure;

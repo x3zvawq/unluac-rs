@@ -2,9 +2,9 @@
 //!
 //! 它依赖 `facts/insert/merge` 和共享 scoped walker，只负责在 block 作用域链上协调
 //! merge + 可见 global 集维护，不会在这里重写普通表达式 sugar。
-//! 例如：块前缀上一串 seed local + `global` run 会在这里先合并；Lua 5.5 的 missing
-//! global 声明只会在“当前作用域已经有显式 global 证据”时才从观测推断，并放回原 gate
-//! 的激活点；默认 `global *` 与 stripped bytecode 下的纯声明形式并不总是可区分。repeat
+//! 例如：singleton seed local + `global` handoff 会在这里先合并；Lua 5.5 的 missing
+//! global 声明只会在当前作用域已有 AST `GlobalDecl`/global-function gate 时，从词法观测
+//! 推导满足该 gate 的等价声明，并放回原激活点。前层未发布显式 gate 时不发明声明。repeat
 //! body 与 until condition 的 missing observation 分开结算，因为 suffix 内的新 `do` gate
 //! 不会扩展到条件。
 
@@ -84,8 +84,8 @@ impl GlobalDeclPrettyPass {
             &crate::hir::HirRepeatConditionLifetimeFacts,
         )>,
     ) -> (bool, VisibleGlobals) {
-        // AST build 只负责把字节码里显式存在的 `global ... = ...` 降回合法语法；
-        // 这里仅合并 seed run，并在“当前作用域已经有显式 global 证据”的情况下再补
+        // AST build 只消费 HIR 发布的 typed `HirGlobalDecl` 并验证目标语法；这里仅合并
+        // singleton seed handoff，并在当前作用域已有 AST 显式 global gate 时再补
         // missing global。Lua 5.5 默认 `global *`，完全没有显式证据时不能凭观测补声明；
         // repeat condition 与 body 共用事实；collective owner 会按 condition 实际引用的
         // body local 精确判断 suffix 能否包进 do，而不是停用整个 repeat 候选集。

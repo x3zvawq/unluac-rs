@@ -1787,6 +1787,7 @@ fn rewrite_plan_anchor_stmt(
                 values,
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })))
         }
         (PromotionAction::ReuseExistingLocal, PromotionInit::Empty) => None,
@@ -1963,6 +1964,7 @@ mod tests {
             values: HirValuePack::fixed(vec![value]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -1984,6 +1986,8 @@ mod tests {
             method: false,
             fastcall: None,
             method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
         }))
     }
 
@@ -2234,6 +2238,7 @@ mod tests {
                 ),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             HirStmt::CallStmt(Box::new(HirCallStmt {
                 call: match call("collectgarbage") {
@@ -2280,6 +2285,7 @@ mod tests {
             ),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         certify_batched_initializer_merge_transaction(
             HirProtoRef(0),
@@ -2306,6 +2312,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
 
         certify_batched_initializer_merge_transaction(

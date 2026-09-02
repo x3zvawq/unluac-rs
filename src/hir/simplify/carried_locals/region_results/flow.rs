@@ -905,6 +905,7 @@ fn apply_candidate(
             values,
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
         rewrite_stmts(
             &mut block.stmts[candidate.declaration..=candidate.last_mention],
@@ -1066,6 +1067,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             goto.clone(),
         ];
@@ -1081,12 +1083,14 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Local(LocalId(1))],
                 values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             goto,
         ];
@@ -1108,6 +1112,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let mut block = HirBlock {
@@ -1136,6 +1141,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -1193,12 +1199,14 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Local(state)],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -1251,6 +1259,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Goto(Box::new(HirGoto { target: label })),
                 HirStmt::Assign(Box::new(HirAssign {
@@ -1258,6 +1267,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Label(Box::new(HirLabel {
                     id: label,
@@ -1310,12 +1320,14 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Local(state)],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
                     bindings: vec![closure],
@@ -1374,12 +1386,14 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Local(state)],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(result)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
                     bindings: vec![closure],
@@ -1498,6 +1512,7 @@ mod tests {
                         values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
                         initializer_merge_transaction: None,
                         generic_for_initializer_producer: None,
+                        method_rewrite_transaction: None,
                     })),
                 ],
             },
@@ -1521,6 +1536,7 @@ mod tests {
                         values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                         initializer_merge_transaction: None,
                         generic_for_initializer_producer: None,
+                        method_rewrite_transaction: None,
                     }))],
                 },
             })),
@@ -1548,12 +1564,14 @@ mod tests {
                             values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
                         })),
                         HirStmt::Assign(Box::new(HirAssign {
                             targets: vec![HirLValue::Local(LocalId(1))],
                             values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
                             initializer_merge_transaction: None,
                             generic_for_initializer_producer: None,
+                            method_rewrite_transaction: None,
                         })),
                     ],
                 },
@@ -1578,6 +1596,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))],
         };
         let pending = verifier()
@@ -1593,12 +1612,14 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Local(LocalId(1))],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };
@@ -1618,6 +1639,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let return_old_state = || {
@@ -1690,6 +1712,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::LocalRef(LocalId(0))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         };
 
         let states = verifier
@@ -1708,6 +1731,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::LocalRef(LocalId(1))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         };
 
         assert!(
@@ -1725,6 +1749,7 @@ mod tests {
             values: HirValuePack::expanding(Vec::new(), HirPackTail::open(HirExpr::VarArg)),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         };
 
         let states = verifier
@@ -1743,6 +1768,7 @@ mod tests {
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::LocalRef(LocalId(0))]),
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            method_rewrite_transaction: None,
         }));
 
         assert!(writeback_targets(&[assign], result) == vec![CarryBinding::Local(LocalId(1))]);
@@ -1759,6 +1785,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Local(LocalId(1)), HirLValue::Local(LocalId(2))],
@@ -1772,6 +1799,7 @@ mod tests {
                 ]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
         ];
         let eligible = writeback_targets(&stmts, result);
@@ -1797,6 +1825,7 @@ mod tests {
                 ]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let stmts = vec![
@@ -1805,6 +1834,7 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             })),
             HirStmt::If(Box::new(HirIf {
                 cond: HirExpr::TempRef(TempId(0)),
@@ -1842,6 +1872,7 @@ mod tests {
                 ]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }))
         };
         let mut block = HirBlock {
@@ -1866,6 +1897,7 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
                 HirStmt::If(Box::new(HirIf {
                     cond: HirExpr::TempRef(TempId(0)),
@@ -1933,6 +1965,7 @@ mod tests {
                     ]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    method_rewrite_transaction: None,
                 })),
             ],
         };

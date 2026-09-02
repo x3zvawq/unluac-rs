@@ -409,7 +409,7 @@ pub(super) fn heartbeat_progress_message(
     format!(
         "[{completed}/{total}]\tactive: {active}\t{}",
         palette.yellow(format!(
-            "waiting for active cases; no worker event for {}s",
+            "still running; no persistent progress output for {}s",
             PROGRESS_HEARTBEAT_INTERVAL.as_secs()
         ))
     )

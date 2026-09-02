@@ -1,6 +1,7 @@
 //! 迭代遍历区域树并调度子区域 lowering；依赖共享 lowerer 索引，不负责具体分支/循环语法；例如用任务栈降低深层 Sequence。
 
 use super::*;
+use crate::hir::promotion::ImplicitRootScopeFence;
 
 impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
     pub(super) fn new(
@@ -159,8 +160,80 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     result_start,
                     child_count,
                     single_pass,
+                } => {
+                    let children = self.take_lowered_children(
+                        region,
+                        &mut results,
+                        result_start,
+                        child_count,
+                    )?;
+                    if let Some(fence) = self
+                        .lowering
+                        .promotion_facts
+                        .implicit_root_scope_fence(region)
+                    {
+                        let Some(RegionPlan::Sequence {
+                            children: planned_children,
+                            ..
+                        }) = self.lowering.structure.plan().region(region)
+                        else {
+                            return self.invalid_region(
+                                region,
+                                "implicit root scope fence owner is not a sequence",
+                            );
+                        };
+                        let fenced = match flatten_implicit_root_scope_fence(
+                            children,
+                            planned_children,
+                            fence,
+                        ) {
+                            Ok(stmts) => stmts,
+                            Err(detail) => return self.invalid_region(region, detail),
+                        };
+                        prefix.extend(fenced);
+                    } else {
+                        for child in children {
+                            prefix.extend(child.stmts);
+                        }
+                    }
+                    if single_pass {
+                        let Some((_, fence)) = self
+                            .lowering
+                            .structure
+                            .plan()
+                            .single_pass_for_region(region)
+                        else {
+                            return self.invalid_region(
+                                region,
+                                "single-pass sequence has no frozen fence payload",
+                            );
+                        };
+                        if fence.region != region {
+                            return self.invalid_region(
+                                region,
+                                "single-pass payload is bound to another region",
+                            );
+                        }
+                        let mut outer = Vec::new();
+                        self.emit_label(
+                            fence.entry,
+                            LabelPlacement::BeforeRegion(region),
+                            &mut outer,
+                        )?;
+                        outer.append(&mut outer_prefix);
+                        outer.push(HirStmt::Repeat(Box::new(HirRepeat {
+                            body: HirBlock { stmts: prefix },
+                            cond: HirExpr::Boolean(true),
+                            lifetime: Default::default(),
+                        })));
+                        prefix = outer;
+                    } else {
+                        outer_prefix.append(&mut prefix);
+                        prefix = outer_prefix;
+                    }
+                    results.push(HirBlock { stmts: prefix });
                 }
-                | LowerTask::FinishUnstructured {
+                LowerTask::FinishUnstructured {
                     region,
                     mut outer_prefix,
                     mut prefix,
@@ -312,5 +385,101 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             assignments.push((phi_id, self.ssa_expr(region, value)?));
         }
         self.copy_assignments(region, assignments)
+    }
+}
+
+fn flatten_implicit_root_scope_fence(
+    mut children: Vec<HirBlock>,
+    planned_children: &[RegionId],
+    fence: &ImplicitRootScopeFence,
+) -> Result<Vec<HirStmt>, &'static str> {
+    let Some(start) = planned_children
+        .iter()
+        .position(|child| *child == fence.first_child)
+    else {
+        return Err("implicit root scope fence start is not a direct child");
+    };
+    let Some(end) = planned_children
+        .iter()
+        .position(|child| *child == fence.end_before_child)
+    else {
+        return Err("implicit root scope fence end is not a direct child");
+    };
+    // ended_roots is retained as a consumer-side certificate sanity check. HIR promotion can
+    // merge identities, so this layer must not try to rematch the original TempIds to statements.
+    if start >= end || planned_children.len() != children.len() || fence.ended_roots.is_empty() {
+        return Err("implicit root scope fence has a stale child interval");
+    }
+
+    let trailing = children.split_off(end);
+    let scoped_children = children.split_off(start);
+    let mut flattened = children
+        .into_iter()
+        .flat_map(|child| child.stmts)
+        .collect::<Vec<_>>();
+    let mut scoped = scoped_children
+        .into_iter()
+        .flat_map(|child| child.stmts)
+        .collect::<Vec<_>>();
+    let mut trailing = trailing.into_iter();
+    let Some(mut end_child) = trailing.next() else {
+        return Err("implicit root scope fence end child is empty");
+    };
+    let Some(end_child_tail) = end_child.stmts.pop() else {
+        return Err("implicit root scope fence end child is empty");
+    };
+    if !matches!(end_child_tail, HirStmt::If(_)) {
+        return Err("implicit root scope fence end child has no terminal branch");
+    }
+    scoped.extend(end_child.stmts);
+
+    flattened.push(HirStmt::Block(Box::new(HirBlock { stmts: scoped })));
+    flattened.push(end_child_tail);
+    flattened.extend(trailing.flat_map(|child| child.stmts));
+    Ok(flattened)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::hir::common::HirIf;
+
+    #[test]
+    fn implicit_root_scope_fence_keeps_end_child_prefix_inside_and_terminal_if_outside() {
+        let terminal_if = HirStmt::If(Box::new(HirIf {
+            cond: HirExpr::Boolean(true),
+            then_block: HirBlock::default(),
+            else_block: None,
+        }));
+        let children = vec![
+            HirBlock {
+                stmts: vec![HirStmt::Break],
+            },
+            HirBlock {
+                stmts: vec![HirStmt::Continue, terminal_if],
+            },
+            HirBlock {
+                stmts: vec![HirStmt::Break],
+            },
+        ];
+        let planned_children = [RegionId(1), RegionId(2), RegionId(3)];
+        let fence = ImplicitRootScopeFence {
+            first_child: RegionId(1),
+            end_before_child: RegionId(2),
+            ended_roots: BTreeSet::from([TempId(0), TempId(1)]),
+        };
+
+        let flattened = flatten_implicit_root_scope_fence(children, &planned_children, &fence)
+            .expect("valid frozen fence must flatten");
+
+        assert_eq!(flattened.len(), 3);
+        let HirStmt::Block(scoped) = &flattened[0] else {
+            panic!("fenced prefix must remain a block");
+        };
+        assert_eq!(scoped.stmts, [HirStmt::Break, HirStmt::Continue]);
+        assert!(matches!(flattened[1], HirStmt::If(_)));
+        assert!(matches!(flattened[2], HirStmt::Break));
     }
 }

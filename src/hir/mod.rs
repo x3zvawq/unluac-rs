@@ -18,16 +18,17 @@ pub(crate) mod traverse;
 pub use crate::parser::{ProtoLineRange, ProtoSignature};
 pub(crate) use analyze::analyze_hir;
 pub use common::{
-    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture,
-    HirCaptureMode, HirClose, HirClosureExpr, HirControlFlowFeature, HirDecisionExpr,
-    HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExitRequirement, HirExpr,
-    HirGenericFor, HirGenericForDispatchResult, HirGlobalDecl, HirGlobalRef, HirGoto, HirIf,
-    HirInitializerMergeTransactionId, HirInlineDisposition, HirInlineDispositions,
+    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallRootHandoff,
+    HirCallStmt, HirCapture, HirCaptureMode, HirClose, HirClosureExpr, HirControlFlowFeature,
+    HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExitRequirement,
+    HirExpr, HirGenericFor, HirGenericForDispatchResult, HirGlobalDecl, HirGlobalRef, HirGoto,
+    HirIf, HirInitializerMergeTransactionId, HirInlineDisposition, HirInlineDispositions,
     HirInlineRetentionReason, HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirLogicalExpr,
-    HirModule, HirNumericFor, HirPackTail, HirProto, HirProtoRef, HirRecordField, HirRepeat,
-    HirRepeatBinding, HirRepeatConditionLifetimeFacts, HirReturn, HirStmt, HirTableAccess,
-    HirTableConstructor, HirTableField, HirTableSetList, HirToBeClosed, HirUnaryExpr,
-    HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile, LocalId, ParamId, TempId, UpvalueId,
+    HirMethodRewriteTransactionId, HirMethodSetupProtocolId, HirModule, HirNumericFor, HirPackTail,
+    HirProto, HirProtoRef, HirRecordField, HirRepeat, HirRepeatBinding,
+    HirRepeatConditionLifetimeFacts, HirReturn, HirStmt, HirTableAccess, HirTableConstructor,
+    HirTableField, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr,
+    HirValuePack, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_hir;
