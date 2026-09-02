@@ -21,8 +21,12 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
             replace_temp_in_value_pack(&mut global_decl.values, temp, replacement);
         }
         HirStmt::Assign(assign) => {
+            let mut targets_changed = 0;
             for target in &mut assign.targets {
-                replace_temp_in_lvalue(target, temp, replacement);
+                targets_changed += replace_temp_in_lvalue(target, temp, replacement);
+            }
+            if targets_changed != 0 {
+                assign.generic_for_initializer_producer = None;
             }
             replace_temp_in_value_pack(&mut assign.values, temp, replacement);
         }
@@ -64,7 +68,9 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
             replace_temp_in_block(&mut numeric_for.body, temp, replacement);
         }
         HirStmt::GenericFor(generic_for) => {
-            replace_temp_in_value_pack(&mut generic_for.iterator, temp, replacement);
+            if replace_temp_in_value_pack(&mut generic_for.iterator, temp, replacement) != 0 {
+                generic_for.initializer_transaction = None;
+            }
             replace_temp_in_block(&mut generic_for.body, temp, replacement);
         }
         HirStmt::Close(_)
@@ -93,6 +99,9 @@ pub(super) fn replace_temps_in_stmt(
                 .iter_mut()
                 .map(|target| replace_temps_in_lvalue(target, replacements))
                 .sum::<usize>();
+            if targets != 0 {
+                assign.generic_for_initializer_producer = None;
+            }
             targets + replace_temps_in_value_pack(&mut assign.values, replacements)
         }
         HirStmt::TableSetList(set_list) => {
@@ -129,8 +138,11 @@ pub(super) fn replace_temps_in_stmt(
                 + replace_temps_in_block(&mut numeric_for.body, replacements)
         }
         HirStmt::GenericFor(generic_for) => {
-            replace_temps_in_value_pack(&mut generic_for.iterator, replacements)
-                + replace_temps_in_block(&mut generic_for.body, replacements)
+            let iterator = replace_temps_in_value_pack(&mut generic_for.iterator, replacements);
+            if iterator != 0 {
+                generic_for.initializer_transaction = None;
+            }
+            iterator + replace_temps_in_block(&mut generic_for.body, replacements)
         }
         HirStmt::Block(block) => replace_temps_in_block(block, replacements),
         HirStmt::Close(_)
@@ -155,10 +167,12 @@ fn replace_temp_in_block(block: &mut HirBlock, temp: TempId, replacement: &HirEx
     }
 }
 
-fn replace_temp_in_lvalue(lvalue: &mut HirLValue, temp: TempId, replacement: &HirExpr) {
+fn replace_temp_in_lvalue(lvalue: &mut HirLValue, temp: TempId, replacement: &HirExpr) -> usize {
     if let HirLValue::TableAccess(access) = lvalue {
-        replace_temp_in_expr(&mut access.base, temp, replacement);
-        replace_temp_in_expr(&mut access.key, temp, replacement);
+        replace_temp_in_expr(&mut access.base, temp, replacement)
+            + replace_temp_in_expr(&mut access.key, temp, replacement)
+    } else {
+        0
     }
 }
 

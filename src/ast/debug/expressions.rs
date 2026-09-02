@@ -187,6 +187,7 @@ pub(super) fn format_name_ref(name: &AstNameRef, names: &FunctionRenderNames) ->
         AstNameRef::Temp(temp) => format!("t{}", temp.index()),
         AstNameRef::SyntheticLocal(local) => format!("l{}", display_synthetic_local(*local, names)),
         AstNameRef::Upvalue(upvalue) => format!("u{}", upvalue.index()),
+        AstNameRef::Environment => "_ENV".to_owned(),
         AstNameRef::Global(global) => global.text.clone(),
     }
 }

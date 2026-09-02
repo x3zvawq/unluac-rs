@@ -279,7 +279,7 @@ fn normalize_current_value_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::DecompileDialect;
+    use crate::decompile::DecompileDialect;
     use crate::hir::common::{HirAssign, HirLValue, HirValuePack};
 
     fn block(stmts: Vec<HirStmt>) -> HirBlock {
@@ -290,6 +290,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(temp)],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 

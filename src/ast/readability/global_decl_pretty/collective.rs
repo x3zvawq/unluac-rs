@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use crate::ast::common::{
     AstBlock, AstExpr, AstFunctionExpr, AstGlobalAttr, AstLValue, AstNameRef, AstStmt,
 };
+use crate::hir::HirRepeatConditionLifetimeFacts;
 
 use self::lifetime::{suffix_has_preserved_lifetime, suffix_shortens_referenced_binding};
 use super::super::visit::{self, AstVisitor};
@@ -29,6 +30,7 @@ pub(super) fn try_wrap_missing_collective_suffix(
     block: &mut AstBlock,
     missing: &MissingGlobals,
     trailing_expr: Option<&AstExpr>,
+    repeat_lifetime: Option<&HirRepeatConditionLifetimeFacts>,
 ) -> bool {
     let names = missing
         .none
@@ -56,9 +58,13 @@ pub(super) fn try_wrap_missing_collective_suffix(
         // 的 `value` 必须在 until 条件中可见；suffix 包进 `do + global *` 会提前结束其词法作用域；见 regress_424。
         return false;
     }
-    if trailing_expr.is_some() && suffix_has_preserved_lifetime(&block.stmts, start) {
+    if trailing_expr.is_some()
+        && repeat_lifetime
+            .is_none_or(|lifetime| suffix_has_preserved_lifetime(&block.stmts, start, lifetime))
+    {
         // 候选拒绝[SemanticBarrier:Lifetime]：repeat suffix 中的 `<close>`/source identity 必须跨过条件；
-        // eventful condition 还能用 weak table + collectgarbage 观察普通 local 的 collectable final value；见 regress_436。
+        // eventful condition 还能用 weak table + collectgarbage 观察普通 local 的 collectable final value；
+        // HIR-origin binding 只有在这个 repeat 的 condition 事实中逐项获证才可提前结束；见 regress_436。
         return false;
     }
     if has_incoming_goto(block, start) {

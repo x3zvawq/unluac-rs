@@ -16,10 +16,10 @@ pub(super) fn build_function_evidence(
     let param_debug_names = hir.param_debug_hints.clone();
 
     let mut local_debug_names = hir.local_debug_hints.clone();
-    // vararg 参数占用的 local slot 可能在 HIR 构建时未覆盖到；
-    // 这里用 param_debug_hints 对应位置做补全。
-    if hir.signature.has_vararg_param_reg
-        && let Some(slot) = local_debug_names.first_mut()
+    // 变参参数寄存器的 binding 身份由 HIR 冻结；debug evidence 只能按该身份补提示，
+    // 不能把 locals 的物理顺序当成参数身份。
+    if let Some(local) = hir.vararg_param_local
+        && let Some(slot) = local_debug_names.get_mut(local.index())
         && slot.is_none()
     {
         *slot = hir

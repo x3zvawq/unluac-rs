@@ -64,8 +64,8 @@ use super::temp_touch::{
     stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, HirValuePack,
-    LocalId, TempId,
+    HirAssign, HirBlock, HirExpr, HirInitializerMergeTransactionId, HirLValue, HirLocalDecl,
+    HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -100,6 +100,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     cell_sensitive_temps.extend(to_be_closed_temps.iter().copied());
     let result = {
         let mut ctx = PromotionCtx {
+            proto_id: proto.id,
             facts,
             safety,
             temp_debug_locals: &proto.temp_debug_locals,
@@ -135,6 +136,11 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     }
     for (temp, local) in promoted_bindings.iter().copied() {
         facts.record_entry_nil_phi_promotion(temp, local);
+    }
+    for (temp, local) in promoted_bindings.iter().copied() {
+        // temp-inline 的负向语义结论属于 binding，而不是 TempId 的展示形式。promotion
+        // 可能把多个 canonical temp 合并进同一个 local，因此按映射逐项取并集。
+        proto.inline_dispositions.promote_temp_to_local(temp, local);
     }
     for (temp, local) in direct_seed_promotions {
         facts.record_direct_table_seed_promotion(temp, local);
@@ -211,6 +217,14 @@ struct PromotionGroup {
     touching_stmt_indices: BTreeSet<usize>,
 }
 
+struct MultiHomeCallRootHandoff {
+    alias_index: usize,
+    temp: TempId,
+    home: HomeSlotKey,
+    local: LocalId,
+    values: HirValuePack,
+}
+
 fn trusted_home_slot_for_group(
     temps: &BTreeSet<TempId>,
     facts: &ProtoPromotionFacts,
@@ -246,6 +260,7 @@ fn capture_kind_allows_call_root_owner(
 }
 
 struct PromotionCtx<'a> {
+    proto_id: HirProtoRef,
     facts: &'a ProtoPromotionFacts,
     safety: HirExprSafety,
     temp_debug_locals: &'a [Option<String>],
@@ -462,6 +477,7 @@ fn promote_block_with_protection(
     for (index, mut stmt) in original_stmts.into_iter().enumerate() {
         temp_refs.enter_stmt(index);
         let mut replaced_stmt = false;
+        let mut batched_decl_output_index = None;
         if let Some(plans) = plan_by_decl.get(&index) {
             assert!(
                 plans
@@ -481,6 +497,7 @@ fn promote_block_with_protection(
                     }),
                     "batched physical roots may share their anchor only with empty handoffs"
                 );
+                batched_decl_output_index = Some(rewritten.len());
                 rewritten.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: plans
                         .iter()
@@ -488,6 +505,7 @@ fn promote_block_with_protection(
                         .map(|plan| plan.local)
                         .collect(),
                     values: HirValuePack::fixed(Vec::new()),
+                    initializer_merge_transaction: None,
                 })));
             } else {
                 for plan in plans {
@@ -539,6 +557,12 @@ fn promote_block_with_protection(
             &child_uses_outer_temp,
         );
         changed |= stmt_changed;
+        if let Some(decl_index) = batched_decl_output_index {
+            let HirStmt::LocalDecl(local_decl) = &mut rewritten[decl_index] else {
+                unreachable!("batched declaration output must remain a local declaration");
+            };
+            certify_batched_initializer_merge_transaction(ctx.proto_id, local_decl, &mut stmt);
+        }
         if is_redundant_binding_self_assign(&stmt) {
             changed = true;
             temp_refs.leave_stmt(index);
@@ -563,6 +587,39 @@ fn promote_block_with_protection(
         changed,
         trailing_mapping: mapping,
     }
+}
+
+fn certify_batched_initializer_merge_transaction(
+    proto_id: HirProtoRef,
+    local_decl: &mut HirLocalDecl,
+    stmt: &mut HirStmt,
+) {
+    let HirStmt::Assign(assign) = stmt else {
+        return;
+    };
+    if local_decl.bindings.len() < 2
+        || local_decl.bindings.len() != assign.targets.len()
+        || !local_decl
+            .bindings
+            .iter()
+            .zip(&assign.targets)
+            .all(|(binding, target)| matches!(target, HirLValue::Local(local) if local == binding))
+        || !assign.values.fixed.is_empty()
+        || !matches!(
+            assign.values.tail.as_ref(),
+            Some(tail)
+                if tail.exact_width() == Some(local_decl.bindings.len())
+                    && matches!(tail.as_expr(), HirExpr::Call(_))
+        )
+    {
+        return;
+    }
+
+    // batch declaration 的首个 local 是本 proto 中刚分配且不会复用的身份；只把它用作
+    // opaque transaction token 的唯一序号，不把 LocalId 本身暴露成 rewrite authority。
+    let token = HirInitializerMergeTransactionId::new(proto_id, local_decl.bindings[0].index());
+    local_decl.initializer_merge_transaction = Some(token);
+    assign.initializer_merge_transaction = Some(token);
 }
 
 fn collect_plans(
@@ -649,6 +706,45 @@ fn collect_plans(
         }
 
         activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+
+        if let Some(root_temp) = simple_temp_assign_target(stmt)
+            && let Some(handoffs) = multi_home_call_root_handoffs(
+                block,
+                decl_index,
+                root_temp,
+                facts,
+                &call_root_lifetimes,
+                &physical_root_locals_by_home,
+            )
+        {
+            // 一个 call 后的连续 MOVE 共同结束多个旧 root home。先完整匹配所有 pair、
+            // old owner 与 HIR copy，再一次登记 plans；不能只复用任意一个 home，或在
+            // 半数匹配后提交，否则会把同一个 VM overwrite transaction 拆开。
+            for handoff in handoffs {
+                let mut allocator = PlanAllocator {
+                    temp_debug_locals,
+                    temp_debug_scopes,
+                    plans: &mut plans,
+                    reserved_temps: &mut reserved_temps,
+                    reserved_alias_indices: &mut reserved_alias_indices,
+                    next_local_index: ctx.next_local_index,
+                    new_locals: ctx.new_locals,
+                    new_local_debug_hints: ctx.new_local_debug_hints,
+                    new_local_debug_scopes: ctx.new_local_debug_scopes,
+                    promoted_bindings: ctx.promoted_bindings,
+                    direct_seed_promotions: ctx.direct_seed_promotions,
+                    debug_scope_locals: ctx.debug_scope_locals,
+                };
+                allocator.reuse_existing_local(
+                    handoff.alias_index,
+                    handoff.local,
+                    Some(handoff.home),
+                    BTreeSet::from([handoff.temp]),
+                    BTreeSet::new(),
+                    PromotionInit::FromAssign(handoff.values),
+                );
+            }
+        }
 
         let has_grouped_targets = matches!(stmt, HirStmt::If(_))
             || matches!(stmt, HirStmt::Assign(assign) if assign.targets.len() > 1);
@@ -869,17 +965,22 @@ fn collect_plans(
         });
         let preceding_lookup_root = home_slot
             .and_then(|home| lookup_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
-            .map(|pair| pair.root_index());
+            .map(|pair| (pair.root_index(), pair.home()));
         let preceding_call_root = home_slot
             .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))
-            .map(|pair| pair.root_index())
-            .or_else(|| call_root_lifetimes.unambiguous_root_for_overwrite(decl_index));
-        let preceding_physical_root = preceding_call_root
-            .or(preceding_lookup_root)
-            .or_else(|| call_root_lifetimes.root_for_protected(decl_index));
-        let preceding_physical_root_local = preceding_physical_root.and_then(|root| {
-            home_slot.and_then(|home| physical_root_locals_by_home.get(&(root, home)).copied())
+            .or_else(|| call_root_lifetimes.unambiguous_overwrite_pair(decl_index))
+            .map(|pair| (pair.root_index(), pair.home()));
+        let preceding_physical_root = preceding_call_root.or(preceding_lookup_root).or_else(|| {
+            call_root_lifetimes
+                .root_for_protected(decl_index)
+                .zip(home_slot)
         });
+        let preceding_physical_root_local =
+            preceding_physical_root.and_then(|(root, root_home)| {
+                physical_root_locals_by_home
+                    .get(&(root, root_home))
+                    .copied()
+            });
         let force_physical_root_local = call_root_lifetimes.is_root(decl_index)
             || lookup_gc_root_lifetimes.is_root(decl_index)
             || preceding_physical_root_local.is_some();
@@ -1058,16 +1159,17 @@ fn collect_plans(
             }
             let preceding_lookup_root = home_slot
                 .and_then(|home| lookup_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
-                .map(|pair| pair.root_index());
+                .map(|pair| (pair.root_index(), pair.home()));
             let preceding_call_root = home_slot
                 .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))
-                .map(|pair| pair.root_index())
-                .or_else(|| call_root_lifetimes.unambiguous_root_for_overwrite(decl_index));
+                .or_else(|| call_root_lifetimes.unambiguous_overwrite_pair(decl_index))
+                .map(|pair| (pair.root_index(), pair.home()));
             let preceding_physical_root_local = preceding_call_root
                 .or(preceding_lookup_root)
-                .and_then(|root| {
-                    home_slot
-                        .and_then(|home| physical_root_locals_by_home.get(&(root, home)).copied())
+                .and_then(|(root, root_home)| {
+                    physical_root_locals_by_home
+                        .get(&(root, root_home))
+                        .copied()
                 });
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
@@ -1446,6 +1548,64 @@ fn temp_assign_targets_for_home(
     (!temps.is_empty()).then_some(temps)
 }
 
+fn multi_home_call_root_handoffs(
+    block: &HirBlock,
+    root_index: usize,
+    root_temp: TempId,
+    facts: &ProtoPromotionFacts,
+    call_roots: &CallRootLifetimeIndices,
+    physical_root_locals_by_home: &BTreeMap<(usize, HomeSlotKey), LocalId>,
+) -> Option<Vec<MultiHomeCallRootHandoff>> {
+    let pairs = call_roots.overwrite_pairs(root_index).collect::<Vec<_>>();
+    if pairs.len() <= 1 {
+        return None;
+    }
+
+    let mut pending = BTreeMap::new();
+    for pair in pairs {
+        let local = physical_root_locals_by_home
+            .get(&(pair.root_index(), pair.home()))
+            .copied()?;
+        if pending.insert(pair.home(), local).is_some() {
+            return None;
+        }
+    }
+
+    let immediate_move_homes = facts.trusted_immediate_move_write_homes(root_temp)?;
+    let mut seen_homes = BTreeSet::new();
+    let mut handoffs = Vec::with_capacity(pending.len());
+    for alias_index in root_index + 1..=root_index.checked_add(immediate_move_homes.len())? {
+        let HirStmt::Assign(assign) = block.stmts.get(alias_index)? else {
+            return None;
+        };
+        let ([HirLValue::Temp(temp)], [HirExpr::TempRef(source)], None) = (
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        ) else {
+            return None;
+        };
+        if *source != root_temp {
+            return None;
+        }
+        let home = facts.trusted_temp_home_slot(*temp)?;
+        if !immediate_move_homes.contains(&home) || !seen_homes.insert(home) {
+            return None;
+        }
+        if let Some(local) = pending.remove(&home) {
+            handoffs.push(MultiHomeCallRootHandoff {
+                alias_index,
+                temp: *temp,
+                home,
+                local,
+                values: assign.values.clone(),
+            });
+        }
+    }
+
+    pending.is_empty().then_some(handoffs)
+}
+
 fn scalar_temp_assign_targets_for_home(
     block: &HirBlock,
     facts: &ProtoPromotionFacts,
@@ -1619,11 +1779,14 @@ fn rewrite_plan_anchor_stmt(
         (PromotionAction::AllocateLocal, _) => Some(HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![plan.local],
             values,
+            initializer_merge_transaction: None,
         }))),
         (PromotionAction::ReuseExistingLocal, PromotionInit::FromAssign(_)) => {
             Some(HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Local(plan.local)],
                 values,
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })))
         }
         (PromotionAction::ReuseExistingLocal, PromotionInit::Empty) => None,
@@ -1652,6 +1815,9 @@ fn rewrite_stmt(
             let mut targets_changed = false;
             for target in &mut assign.targets {
                 targets_changed |= rewrite::lvalue(target, mapping.as_ref());
+            }
+            if targets_changed {
+                assign.generic_for_initializer_producer = None;
             }
             let values_changed = rewrite::value_pack(&mut assign.values, mapping.as_ref());
             targets_changed || values_changed
@@ -1739,6 +1905,9 @@ fn rewrite_stmt(
         }
         HirStmt::GenericFor(generic_for) => {
             let iterator_changed = rewrite::value_pack(&mut generic_for.iterator, mapping.as_ref());
+            if iterator_changed {
+                generic_for.initializer_transaction = None;
+            }
             let body_changed = promote_block(
                 ctx,
                 &mut generic_for.body,
@@ -1792,6 +1961,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(target)],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -1808,11 +1979,11 @@ mod tests {
 
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
-            callee: HirExpr::GlobalRef(HirGlobalRef { name: name.into() }),
+            callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }))
     }
 
@@ -1837,6 +2008,24 @@ mod tests {
             &value_captured,
             &BTreeSet::new(),
         ));
+
+        let mut dispositions = crate::hir::common::HirInlineDispositions::default();
+        assert!(dispositions.preserve_temp(
+            first,
+            crate::hir::common::HirInlineRetentionReason::CapturedValueEpoch,
+        ));
+        assert!(!dispositions.preserve_temp(
+            first,
+            crate::hir::common::HirInlineRetentionReason::CapturedValueEpoch,
+        ));
+        dispositions.promote_temp_to_local(first, LocalId(0));
+        dispositions.promote_temp_to_local(second, LocalId(0));
+        assert_eq!(
+            dispositions.local(LocalId(0)),
+            crate::hir::common::HirInlineDisposition::Preserve(BTreeSet::from([
+                crate::hir::common::HirInlineRetentionReason::CapturedValueEpoch,
+            ]))
+        );
     }
 
     #[test]
@@ -2043,6 +2232,8 @@ mod tests {
                     Vec::new(),
                     HirPackTail::exact(call("producer"), 2),
                 ),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             HirStmt::CallStmt(Box::new(HirCallStmt {
                 call: match call("collectgarbage") {
@@ -2071,5 +2262,62 @@ mod tests {
             &call_roots,
             &lookup_roots,
         ));
+    }
+
+    #[test]
+    fn batched_initializer_certificate_requires_the_complete_exact_multicall_pair() {
+        let bindings = vec![LocalId(0), LocalId(1)];
+        let mut declaration = HirLocalDecl {
+            bindings: bindings.clone(),
+            values: HirValuePack::fixed(Vec::new()),
+            initializer_merge_transaction: None,
+        };
+        let mut assignment = HirStmt::Assign(Box::new(HirAssign {
+            targets: bindings.iter().copied().map(HirLValue::Local).collect(),
+            values: HirValuePack::expanding(
+                Vec::new(),
+                HirPackTail::exact(call("producer"), bindings.len()),
+            ),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
+        }));
+        certify_batched_initializer_merge_transaction(
+            HirProtoRef(0),
+            &mut declaration,
+            &mut assignment,
+        );
+
+        let HirStmt::Assign(assignment) = assignment else {
+            unreachable!();
+        };
+        assert_eq!(
+            declaration.initializer_merge_transaction,
+            assignment.initializer_merge_transaction
+        );
+        assert!(declaration.initializer_merge_transaction.is_some());
+
+        let mut partial_declaration = HirLocalDecl {
+            bindings: vec![bindings[0]],
+            values: HirValuePack::fixed(Vec::new()),
+            initializer_merge_transaction: None,
+        };
+        let mut non_multicall_assignment = HirStmt::Assign(Box::new(HirAssign {
+            targets: bindings.iter().copied().map(HirLValue::Local).collect(),
+            values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
+        }));
+
+        certify_batched_initializer_merge_transaction(
+            HirProtoRef(0),
+            &mut partial_declaration,
+            &mut non_multicall_assignment,
+        );
+
+        let HirStmt::Assign(non_multicall_assignment) = non_multicall_assignment else {
+            unreachable!();
+        };
+        assert_eq!(partial_declaration.initializer_merge_transaction, None);
+        assert_eq!(non_multicall_assignment.initializer_merge_transaction, None);
     }
 }

@@ -471,13 +471,77 @@ pub(super) fn run_unsupported_island_contract(
         )));
     }
 
+    let mut hir_options = decompile_options(entry);
+    hir_options.target_stage = DecompileStage::Hir;
+    let hir_result = decompile(&chunk, hir_options).map_err(|error| {
+        structure_contract_failure(format!(
+            "unsupported island fixture failed before the frozen HIR exit diagnostic: {error}"
+        ))
+    })?;
+    let hir = hir_result
+        .state
+        .hir
+        .as_ref()
+        .ok_or_else(|| structure_contract_failure("HIR stage returned no HirModule"))?;
+    match lower_ast(
+        hir,
+        AstTargetDialect::new(DecompileDialect::Lua51),
+        GenerateMode::Strict,
+    ) {
+        Err(AstLowerError::UnsupportedFeature {
+            dialect: DecompileDialect::Lua51,
+            feature: "goto/label",
+            context: "HIR exit diagnostics",
+        }) => {}
+        Err(error) => {
+            return Err(structure_contract_failure(format!(
+                "direct HIR-to-AST lowering returned the wrong unsupported-island error: {error}"
+            )));
+        }
+        Ok(_) => {
+            return Err(structure_contract_failure(
+                "direct HIR-to-AST lowering accepted an unavailable goto island",
+            ));
+        }
+    }
+    lower_ast(
+        hir,
+        AstTargetDialect::new(DecompileDialect::Lua52),
+        GenerateMode::Strict,
+    )
+    .map_err(|error| {
+        structure_contract_failure(format!(
+            "direct HIR-to-AST lowering rejected the same required goto for a capable target: {error}"
+        ))
+    })?;
+    let direct_permissive = lower_ast(
+        hir,
+        AstTargetDialect::new(DecompileDialect::Lua51),
+        GenerateMode::Permissive,
+    )
+    .map_err(|error| {
+        structure_contract_failure(format!(
+            "direct permissive HIR-to-AST lowering rejected an unsupported island: {error}"
+        ))
+    })?;
+    let direct_diagnostic = match direct_permissive.body.stmts.first() {
+        Some(AstStmt::Error(diagnostic)) if diagnostic.starts_with("HIR exit diagnostics:") => {
+            diagnostic
+        }
+        _ => {
+            return Err(structure_contract_failure(
+                "direct permissive HIR-to-AST lowering did not preserve the HIR exit diagnostic",
+            ));
+        }
+    };
+
     let mut strict_options = decompile_options(entry);
     strict_options.generate.mode = GenerateMode::Strict;
     match decompile(&chunk, strict_options) {
         Err(DecompileError::Ast(AstLowerError::UnsupportedFeature {
             dialect: DecompileDialect::Lua51,
             feature: "goto/label",
-            context: "StructurePlan",
+            context: "HIR exit diagnostics",
         })) => {}
         Err(error) => {
             return Err(structure_contract_failure(format!(
@@ -506,7 +570,8 @@ pub(super) fn run_unsupported_island_contract(
         || !generated
             .source
             .contains("-- [unluac error] diagnostic pseudocode:")
-        || !generated.source.contains("StructurePlan requirements:")
+        || !generated.source.contains("HIR exit diagnostics:")
+        || !generated.source.contains(direct_diagnostic)
     {
         return Err(structure_contract_failure(format!(
             "permissive mode did not preserve the plan diagnostic contract: kind={:?}\n{}",

@@ -75,7 +75,7 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
         let mut lowerer = ProtoLowerer::new(frame.raw);
         let (mut instrs, lowering_map) = lowerer.lower()?;
         let children = instantiate_closure_children(&mut instrs, frame.children);
-        let result = finish_lowered_proto(frame.raw, children, instrs, lowering_map);
+        let result = finish_lowered_proto(frame.raw, Vec::new(), children, instrs, lowering_map);
         if let Some(parent) = stack.last_mut() {
             parent.children.push(Arc::new(result));
         } else {

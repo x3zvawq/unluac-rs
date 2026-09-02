@@ -66,7 +66,7 @@ where
     let mut failed_protos = 0usize;
 
     while completed < total && worker_error.is_none() {
-        match event_rx.recv() {
+        match event_rx.recv_timeout(PROGRESS_HEARTBEAT_INTERVAL) {
             Ok(WorkerEvent::Started { case }) => {
                 active += 1;
                 reporter.update_progress(
@@ -133,7 +133,10 @@ where
                     case.display_path()
                 ));
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                reporter.emit_heartbeat(completed, total, active);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 worker_error =
                     Some("worker event channel closed before all cases finished".to_owned());
             }

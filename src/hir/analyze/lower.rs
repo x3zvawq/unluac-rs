@@ -4,7 +4,8 @@
 //! 暴露主入口，这里集中放 proto 递归构造和共享 lowering 上下文。final edge 的 phi
 //! copy 由 plan 执行器消费；单条 low-IR 指令到 HIR 语句的映射由 `instrs.rs` 负责，
 //! captured Luau shared closure 的词法 factory 由 `shared_closures.rs` 先冻结，再由这里
-//! 预留并填充 synthetic proto；避免主流程重新猜 closure identity。
+//! 预留并填充 synthetic proto；Structure 已证明的控制流需求/unresolved requirement 也在这里
+//! 蒸馏为不含 CFG/SSA/VM 类型的 HIR 退出事实，目标语法是否合法仍由 AST 判断。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,19 +19,19 @@ use super::shared_closures::{
     build_shared_closure_plan,
 };
 use super::structure::build_structured_body;
-use crate::ast::AstTargetDialect;
-use crate::decompile::{DecompileContext, DecompileState};
+use crate::decompile::{DecompileContext, DecompileDialect, DecompileState};
 use crate::generate::GenerateMode;
 use crate::hir::HirLowerError;
 use crate::hir::common::{
-    HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirDebugScope, HirExpr, HirLValue,
-    HirLocalDecl, HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, ParamId, TempId,
-    UpvalueId,
+    HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirControlFlowFeature, HirDebugScope,
+    HirExitRequirement, HirExpr, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirStmt,
+    HirValuePack, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{
-    BlockRef, BlockTerminatorKind, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts,
-    LoopSourceBindings, LoopVmProtocol, OpenDefId, PhiId, SsaValue, StructurePlan,
+    BlockRef, BlockTerminatorKind, CanonicalMoveIndex, Cfg, CfgGraph, ControlFlowFeature,
+    DataflowFacts, GraphFacts, LoopSourceBindings, LoopVmProtocol, OpenDefId, PhiId,
+    PlanRequirement, SsaValue, StructurePlan,
 };
 use crate::structure::{ReadyStructureFacts, StructureFacts};
 use crate::transformer::{
@@ -42,6 +43,7 @@ pub(super) struct ProtoBindings {
     pub(super) params: Vec<ParamId>,
     pub(super) param_debug_hints: Vec<Option<String>>,
     pub(super) locals: Vec<LocalId>,
+    pub(super) vararg_param_local: Option<LocalId>,
     pub(super) local_debug_hints: Vec<Option<String>>,
     pub(super) local_debug_scopes: Vec<Option<usize>>,
     pub(super) upvalues: Vec<UpvalueId>,
@@ -165,11 +167,12 @@ impl ProtoBindings {
 }
 
 pub(super) struct ProtoLowering<'a> {
-    pub(super) target: AstTargetDialect,
+    pub(super) target: DecompileDialect,
     pub(super) proto: &'a LoweredProto,
     pub(super) cfg: &'a Cfg,
     pub(super) dataflow: &'a DataflowFacts,
     pub(super) structure: &'a ReadyStructureFacts,
+    pub(super) promotion_facts: &'a ProtoPromotionFacts,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
     pub(super) self_value_capture_locals: BTreeMap<InstrRef, LocalId>,
@@ -205,7 +208,7 @@ pub(super) struct LoweredProtoResult {
 }
 
 struct ProtoLowerFrame<'a> {
-    target: AstTargetDialect,
+    target: DecompileDialect,
     proto: &'a LoweredProto,
     cfg_graph: &'a CfgGraph,
     graph_facts: &'a GraphFacts,
@@ -239,7 +242,7 @@ pub(super) fn lower_proto(
     let dataflow = state.require_dataflow()?;
     let structure = state.require_structure_facts()?;
     Ok(lower_proto_node(
-        context.requested_target,
+        context.requested_target.version,
         ProtoNodeFacts {
             proto: &lowered.main,
             cfg_graph: cfg,
@@ -254,13 +257,13 @@ pub(super) fn lower_proto(
 }
 
 fn lower_proto_node(
-    target: AstTargetDialect,
+    target: DecompileDialect,
     node: ProtoNodeFacts<'_>,
     artifacts: &mut LowerArtifacts,
     recover_failures: bool,
 ) -> Result<LoweredProtoResult, HirLowerError> {
     fn make_frame<'a>(
-        target: AstTargetDialect,
+        target: DecompileDialect,
         node: ProtoNodeFacts<'a>,
         artifacts: &mut LowerArtifacts,
         source_proto_id: usize,
@@ -460,13 +463,41 @@ fn lower_proto_one(
             owned_open_producers[def.instr.index()] = true;
         }
     }
-    let global_decls = GlobalDeclProtocols::analyze(target, proto, cfg, dataflow);
+    let global_decls = GlobalDeclProtocols::analyze(proto, cfg, dataflow);
+    let mut promotion_facts = ProtoPromotionFacts::from_plan(
+        proto,
+        cfg,
+        dataflow,
+        structure.plan(),
+        &slot_epochs,
+        &bindings.fixed_temps,
+        &bindings.phi_temps,
+    );
+    for &temp in &bindings.home_free_temps {
+        promotion_facts.record_home_free_temp(temp);
+    }
+    // `entry_local_regs` 是 Entry(reg) 的可见 binding；它与 SSA entry leaf 一样属于
+    // `(reg, epoch 0)`。把这份已知身份带入 lowering/simplify，避免异槽 reference capture
+    // 被误判为可能观察任意 local 写入。后续异槽合并仍会通过 invalidation 使其失效。
+    for (&reg, &local) in &bindings.entry_local_regs {
+        promotion_facts.record_local_home_slot(local, HomeSlotKey::new(reg.index(), 0));
+    }
+    for &(local, home) in &bindings.captured_local_home_slots {
+        promotion_facts.record_local_home_slot(local, home);
+    }
+    record_loop_binding_local_homes(
+        structure.plan(),
+        &slot_epochs,
+        &bindings,
+        &mut promotion_facts,
+    );
     let lowering = ProtoLowering {
         target,
         proto,
         cfg,
         dataflow,
         structure,
+        promotion_facts: &promotion_facts,
         child_refs: &child_refs,
         bindings,
         self_value_capture_locals,
@@ -486,49 +517,31 @@ fn lower_proto_one(
         params: lowering.bindings.params.clone(),
         param_debug_hints: lowering.bindings.param_debug_hints.clone(),
         locals: lowering.bindings.locals.clone(),
+        vararg_param_local: lowering.bindings.vararg_param_local,
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
         local_debug_scopes: lowering.bindings.local_debug_scopes.clone(),
         debug_scopes: accepted_debug_scopes(proto, structure),
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
+        inline_dispositions: Default::default(),
         upvalues: lowering.bindings.upvalues.clone(),
+        environment_upvalues: proto
+            .environment_upvalues
+            .iter()
+            .map(|upvalue| lowering.bindings.upvalues[upvalue.index()])
+            .collect(),
         mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
         temps: lowering.bindings.temps.clone(),
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
         temp_debug_scopes: lowering.bindings.temp_debug_scopes.clone(),
+        exit_requirements: collect_exit_requirements(frame.source_proto_id, structure),
         body: build_proto_body(id, &lowering)?,
         children: lowering.hir_children(),
         failure: None,
         detached_children: Vec::new(),
     };
-    let mut promotion_facts = ProtoPromotionFacts::from_plan(
-        proto,
-        cfg,
-        dataflow,
-        structure.plan(),
-        &slot_epochs,
-        &lowering.bindings.fixed_temps,
-        &lowering.bindings.phi_temps,
-    );
-    for &temp in &lowering.bindings.home_free_temps {
-        promotion_facts.record_home_free_temp(temp);
-    }
-    // `entry_local_regs` 是 Entry(reg) 的可见 binding；它与 SSA entry leaf 一样属于
-    // `(reg, epoch 0)`。把这份已知身份带入 simplify，避免异槽 reference capture 被误判
-    // 为可能观察任意 local 写入。后续异槽合并仍会通过 promotion invalidation 使其失效。
-    for (&reg, &local) in &lowering.bindings.entry_local_regs {
-        promotion_facts.record_local_home_slot(local, HomeSlotKey::new(reg.index(), 0));
-    }
-    for &(local, home) in &lowering.bindings.captured_local_home_slots {
-        promotion_facts.record_local_home_slot(local, home);
-    }
-    record_loop_binding_local_homes(
-        structure.plan(),
-        &slot_epochs,
-        &lowering.bindings,
-        &mut promotion_facts,
-    );
+    drop(lowering);
     artifacts.promotion_facts[id.index()] = promotion_facts;
 
     Ok(LoweredProtoResult {
@@ -628,17 +641,17 @@ fn fill_failed_proto(
 ) -> LoweredProtoResult {
     let proto = frame.proto;
     let id = frame.id;
-    let named_vararg_locals = usize::from(proto.signature.has_vararg_param_reg);
+    let vararg_param_locals = usize::from(proto.signature.has_vararg_param_reg);
     let detached_children = frame
         .child_results
         .iter()
         .enumerate()
-        .map(|(index, child)| (LocalId(named_vararg_locals + index), child.id))
+        .map(|(index, child)| (LocalId(vararg_param_locals + index), child.id))
         .collect::<Vec<_>>();
-    let locals = (0..named_vararg_locals + detached_children.len())
+    let locals = (0..vararg_param_locals + detached_children.len())
         .map(LocalId)
         .collect::<Vec<_>>();
-    let mut local_debug_hints = vec![None; named_vararg_locals];
+    let mut local_debug_hints = vec![None; vararg_param_locals];
     local_debug_hints.extend(
         frame
             .child_results
@@ -662,13 +675,20 @@ fn fill_failed_proto(
             .collect(),
         param_debug_hints: vec![None; usize::from(proto.signature.num_params)],
         locals,
+        vararg_param_local: proto.signature.has_vararg_param_reg.then_some(LocalId(0)),
         local_debug_hints,
-        local_debug_scopes: vec![None; named_vararg_locals + detached_children.len()],
+        local_debug_scopes: vec![None; vararg_param_locals + detached_children.len()],
         debug_scopes: Vec::new(),
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
+        inline_dispositions: Default::default(),
         upvalues: (0..usize::from(proto.upvalues.common.count))
             .map(UpvalueId)
+            .collect(),
+        environment_upvalues: proto
+            .environment_upvalues
+            .iter()
+            .map(|upvalue| UpvalueId(upvalue.index()))
             .collect(),
         mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
         upvalue_debug_hints: (0..usize::from(proto.upvalues.common.count))
@@ -684,6 +704,9 @@ fn fill_failed_proto(
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
         temp_debug_scopes: Vec::new(),
+        exit_requirements: frame.structure.ready().map_or_else(Vec::new, |structure| {
+            collect_exit_requirements(frame.source_proto_id, structure)
+        }),
         body: HirBlock::default(),
         children: frame.child_results.iter().map(|child| child.id).collect(),
         failure: Some(failure),
@@ -713,6 +736,37 @@ fn accepted_debug_scopes(
     scopes
 }
 
+fn collect_exit_requirements(
+    source_proto: usize,
+    structure: &ReadyStructureFacts,
+) -> Vec<HirExitRequirement> {
+    let requirements = structure.plan().requirements();
+    let mut exit_requirements = requirements
+        .required_features()
+        .iter()
+        .copied()
+        .map(|feature| HirExitRequirement::RequiredControlFlow {
+            source_proto,
+            feature: match feature {
+                ControlFlowFeature::GotoLabel => HirControlFlowFeature::GotoLabel,
+                ControlFlowFeature::ContinueStatement => HirControlFlowFeature::ContinueStatement,
+            },
+        })
+        .collect::<Vec<_>>();
+    exit_requirements.extend(requirements.iter().filter_map(|(_, requirement)| {
+        let PlanRequirement::UnresolvedValue { phi_id, block, reg } = requirement else {
+            return None;
+        };
+        Some(HirExitRequirement::UnresolvedValue {
+            source_proto,
+            phi: phi_id.index(),
+            block: block.index(),
+            register: reg.index(),
+        })
+    }));
+    exit_requirements
+}
+
 fn low_instr_at_or_after_raw_pc(proto: &LoweredProto, pc: u32) -> Option<InstrRef> {
     proto
         .lowering_map
@@ -740,8 +794,9 @@ fn mutable_upvalues_for_proto(
     for instr in &proto.instrs {
         match instr {
             LowInstr::SetUpvalue(set) => {
-                let crate::transformer::UpvalueOperand::Upvalue(dst) = set.dst else {
-                    continue;
+                let dst = match set.dst {
+                    crate::transformer::UpvalueOperand::Env(dst)
+                    | crate::transformer::UpvalueOperand::Upvalue(dst) => dst,
                 };
                 if let Some(slot) = mutable.get_mut(dst.index()) {
                     *slot = true;
@@ -964,13 +1019,15 @@ fn fill_composite_factory_protos(
     artifacts: &mut LowerArtifacts,
 ) -> Result<(), HirLowerError> {
     for (composite, id) in plan.composites().iter().zip(ids) {
-        artifacts.protos[id.index()] = build_composite_factory_proto(
+        let (factory_proto, promotion_facts) = build_composite_factory_proto(
             *id,
             proto,
             child_refs,
             child_mutable_upvalues,
             composite,
         )?;
+        artifacts.protos[id.index()] = factory_proto;
+        artifacts.promotion_facts[id.index()] = promotion_facts;
     }
     Ok(())
 }
@@ -981,7 +1038,7 @@ fn build_composite_factory_proto(
     child_refs: &[HirProtoRef],
     child_mutable_upvalues: &[Vec<bool>],
     plan: &CompositeFactoryPlan,
-) -> Result<HirProto, HirLowerError> {
+) -> Result<(HirProto, ProtoPromotionFacts), HirLowerError> {
     let error = || HirLowerError::UnrepresentableRepeatedCapturedSharedClosure {
         shared_index: plan.root_shared.0,
         instr: plan.anchor.index(),
@@ -1050,6 +1107,7 @@ fn build_composite_factory_proto(
         body.stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![local],
             values: HirValuePack::fixed(vec![closure]),
+            initializer_merge_transaction: None,
         })));
     }
     if plan.root.index() >= plan.nodes.len() {
@@ -1059,8 +1117,13 @@ fn build_composite_factory_proto(
         .push(return_stmt(HirValuePack::fixed(vec![HirExpr::LocalRef(
             LocalId(plan.root.index()),
         )])));
+    let locals = (0..plan.nodes.len()).map(LocalId).collect::<Vec<_>>();
+    let mut promotion_facts = ProtoPromotionFacts::default();
+    for local in locals.iter().copied() {
+        promotion_facts.record_home_free_local(local);
+    }
 
-    Ok(HirProto {
+    let proto = HirProto {
         id,
         source: owner.source.as_ref().map(decode_raw_string),
         line_range: owner.line_range,
@@ -1073,23 +1136,38 @@ fn build_composite_factory_proto(
         },
         params: Vec::new(),
         param_debug_hints: Vec::new(),
-        locals: (0..plan.nodes.len()).map(LocalId).collect(),
+        locals,
+        vararg_param_local: None,
         local_debug_hints: vec![None; plan.nodes.len()],
         local_debug_scopes: vec![None; plan.nodes.len()],
         debug_scopes: Vec::new(),
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
+        inline_dispositions: Default::default(),
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
+        environment_upvalues: plan
+            .outer_captures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, source)| match source {
+                CaptureSource::Upvalue(upvalue) if proto.environment_upvalues.contains(upvalue) => {
+                    Some(UpvalueId(index))
+                }
+                _ => None,
+            })
+            .collect(),
         mutable_upvalues,
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],
         temps: Vec::new(),
         temp_debug_locals: Vec::new(),
         temp_debug_scopes: Vec::new(),
+        exit_requirements: Vec::new(),
         body,
         children,
         failure: None,
         detached_children: Vec::new(),
-    })
+    };
+    Ok((proto, promotion_facts))
 }
 
 fn build_open_pack_owners(
@@ -1233,7 +1311,10 @@ fn open_pack_bridge_is_import_setup(
         && producer_start.index() >= args_start.index()
         && first.kind == GetTableKind::Import
         && first.dst == call.callee
-        && matches!(first.base, AccessBase::Env)
+        && matches!(
+            first.base,
+            AccessBase::Env | AccessBase::EnvironmentUpvalue(_)
+        )
         && matches!(first.key, AccessKey::Const(_))
         && rest.iter().all(|instr| {
             matches!(
@@ -1362,6 +1443,7 @@ fn build_proto_body(
                 HirExpr::Nil;
                 lowering.bindings.debug_entry_local_decls.len()
             ]),
+            initializer_merge_transaction: None,
         }))]
     };
     prefix.extend(local_decl_stmts(
@@ -1378,6 +1460,7 @@ fn build_proto_body(
                         proto: lowering.child_refs[proto.index()],
                         captures: Vec::new(),
                     }))]),
+                    initializer_merge_transaction: None,
                 }))
             }),
     );

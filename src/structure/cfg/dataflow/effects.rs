@@ -240,7 +240,7 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
         LowInstr::GetTable(instr) => {
             tags.insert(EffectTag::ReadTable);
             match instr.base {
-                AccessBase::Env => {
+                AccessBase::Env | AccessBase::EnvironmentUpvalue(_) => {
                     tags.insert(EffectTag::ReadEnv);
                 }
                 AccessBase::Upvalue(_) => {
@@ -252,7 +252,7 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
         LowInstr::SetTable(instr) => {
             tags.insert(EffectTag::WriteTable);
             match instr.base {
-                AccessBase::Env => {
+                AccessBase::Env | AccessBase::EnvironmentUpvalue(_) => {
                     tags.insert(EffectTag::WriteEnv);
                 }
                 AccessBase::Upvalue(_) => {

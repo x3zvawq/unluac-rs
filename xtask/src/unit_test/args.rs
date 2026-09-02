@@ -119,14 +119,6 @@ pub(super) fn parse_env_or_default<T>(
     }
 }
 
-pub(super) fn progress_is_enabled(mode: ProgressMode) -> bool {
-    match mode {
-        ProgressMode::On => true,
-        ProgressMode::Off => false,
-        ProgressMode::Auto => stderr_supports_live_updates(),
-    }
-}
-
 pub(super) fn color_is_enabled(mode: ColorMode) -> bool {
     match mode {
         ColorMode::Always => true,

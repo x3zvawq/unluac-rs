@@ -34,10 +34,16 @@ fn try_lower_local_function_decl(local_decl: &AstLocalDecl) -> Option<AstStmt> {
         // 候选拒绝[TargetConstraint]：Lua 的 `local function` 语法没有 `<const>`/`<close>` 属性槽，不能丢弃原声明属性。
         return None;
     }
+    if !binding.rewrite_authority.may_move_scope_start() {
+        // 候选拒绝[LayerBoundary]：`local f = function` 与 `local function f` 的 binding
+        // 可见起点不同；HIR 已保留的身份不能由 AST 改写。
+        return None;
+    }
     let name = binding.id;
     Some(AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
         name,
         origin: binding.origin,
+        rewrite_authority: binding.rewrite_authority.clone(),
         func: func.as_ref().clone(),
     })))
 }
@@ -163,6 +169,7 @@ mod tests {
                 id: AstBindingRef::Local(LocalId(0)),
                 attr: AstLocalAttr::None,
                 origin,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: vec![AstExpr::FunctionExpr(Box::new(AstFunctionExpr {
                 function: HirProtoRef(0),
@@ -175,6 +182,8 @@ mod tests {
                 capture_names_by_upvalue: std::collections::BTreeMap::new(),
                 capture_write_names: BTreeSet::new(),
             }))],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }
     }
 

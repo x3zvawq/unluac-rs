@@ -1,100 +1,21 @@
-//! 这个文件承载 AST build 阶段“只负责合法语法化”的语法模式恢复。
+//! 这个文件承载 AST build 阶段需要相邻 HIR 节点才能完成的合法语法化。
 //!
-//! 这里的职责边界是：只把 HIR 里已经显式存在、并且能无歧义还原成某个 Lua 语法节点的
-//! 形状直接降回 AST。像 `global` 这种模式，在这里仅处理字节码里确实存在对应探测/
-//! 赋值序列的“显式声明”；缺失声明补全、声明合并、函数声明降糖都不属于这里，
-//! 而是留给后面的 Readability。
+//! 这里仅把 definition 与紧邻的 `ToBeClosed` 合成目标方言要求的 `<close>` 声明；它依赖
+//! HIR 已经给出的 binding 与 value-pack 身份，不重新识别 low-IR 协议，也不改变求值顺序。
+//! `global` 协议由 HIR 直接发布 typed `HirStmt::GlobalDecl`，本模块不会从普通声明、诊断和
+//! 赋值的相邻文本形状反猜。缺失声明补全、声明合并、函数声明降糖仍属于 Readability。
 //!
 //! 例子：
-//! - `LocalDecl(probe) + ErrNil + Assign(global)` 会在这里直接降成显式
-//!   `AstStmt::GlobalDecl`
-//! - 它不会根据一次普通 `x = ...` 写入去猜测“源码里也许应该先有 `global x`”
-//! - 它也不会把 `global f = function() end` 直接美化成 `function f() end`
+//! - `LocalDecl(binding) + ToBeClosed(binding)` 会落成 `local binding <close> = ...`
+//! - 普通 `Assign(global)` 不会在这里被猜成 `global` 声明
 
 use crate::hir::{HirExpr, HirLValue, HirStmt};
 
 use super::super::exprs::PackLoweringContext;
 use super::super::{AstLowerError, AstLowerer};
-use crate::ast::common::{
-    AstBindingRef, AstGlobalAttr, AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl,
-    AstGlobalName, AstLocalAttr, AstLocalDecl, AstStmt,
-};
+use crate::ast::common::{AstBindingRef, AstLocalAttr, AstLocalDecl, AstStmt};
 
 impl<'a> AstLowerer<'a> {
-    pub(in crate::ast::build) fn try_lower_global_decl(
-        &mut self,
-        proto_index: usize,
-        stmts: &[HirStmt],
-        index: usize,
-    ) -> Result<Option<(AstStmt, usize)>, AstLowerError> {
-        let Some(HirStmt::LocalDecl(probe)) = stmts.get(index) else {
-            return Ok(None);
-        };
-        let Some(HirStmt::ErrNil(err_nnil)) = stmts.get(index + 1) else {
-            return Ok(None);
-        };
-        let Some(HirStmt::Assign(assign)) = stmts.get(index + 2) else {
-            return Ok(None);
-        };
-
-        if !self.target.caps.global_decl {
-            return Err(AstLowerError::UnsupportedFeature {
-                dialect: self.target.version,
-                feature: "global",
-                context: "global declaration",
-            });
-        }
-
-        if probe.bindings.len() != 1
-            || !matches!((&probe.values.fixed[..], &probe.values.tail), ([_], None))
-            || assign.targets.len() != 1
-        {
-            return Ok(None);
-        }
-        let HirExpr::LocalRef(probe_local) = &err_nnil.value else {
-            return Ok(None);
-        };
-        if probe.bindings[0] != *probe_local {
-            return Ok(None);
-        }
-        if super::super::analysis::count_local_uses_in_stmts(&stmts[(index + 1)..], *probe_local)
-            != 1
-        {
-            return Ok(None);
-        }
-        let HirExpr::GlobalRef(probe_global) = &probe.values.fixed[0] else {
-            return Ok(None);
-        };
-        let HirLValue::Global(assign_global) = &assign.targets[0] else {
-            return Ok(None);
-        };
-        if probe_global.name != assign_global.name
-            || err_nnil
-                .name
-                .as_ref()
-                .is_some_and(|name| name != &assign_global.name)
-        {
-            return Ok(None);
-        }
-        let name = assign_global.name.clone();
-
-        let values = self.lower_value_pack(
-            proto_index,
-            &assign.values,
-            PackLoweringContext::TargetCounted(assign.targets.len()),
-        )?;
-        Ok(Some((
-            AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
-                bindings: vec![AstGlobalBinding {
-                    target: AstGlobalBindingTarget::Name(AstGlobalName { text: name }),
-                    attr: AstGlobalAttr::None,
-                }],
-                values,
-            })),
-            3,
-        )))
-    }
-
     pub(in crate::ast::build) fn try_lower_local_close_decl(
         &mut self,
         proto_index: usize,
@@ -128,6 +49,10 @@ impl<'a> AstLowerer<'a> {
                     &local_decl.values,
                     PackLoweringContext::TargetCounted(local_decl.bindings.len()),
                 )?,
+                // close syntax consumes a different two-statement protocol, so it cannot retain
+                // an initializer-merge endpoint even if malformed input happened to carry one.
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
             })),
             2,
         )))
@@ -183,14 +108,11 @@ impl<'a> AstLowerer<'a> {
                 bindings: bindings
                     .into_iter()
                     .map(|binding| {
-                        self.recovered_local_binding(
-                            AstBindingRef::Temp(binding),
-                            if binding == *temp {
-                                AstLocalAttr::Close
-                            } else {
-                                AstLocalAttr::None
-                            },
-                        )
+                        let mut binding = self.lower_temp_binding(proto_index, binding);
+                        if binding.id == AstBindingRef::Temp(*temp) {
+                            binding.attr = AstLocalAttr::Close;
+                        }
+                        binding
                     })
                     .collect(),
                 values: self.lower_value_pack(
@@ -198,6 +120,8 @@ impl<'a> AstLowerer<'a> {
                     &assign.values,
                     PackLoweringContext::TargetCounted(assign.targets.len()),
                 )?,
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
             })),
             2,
         )))

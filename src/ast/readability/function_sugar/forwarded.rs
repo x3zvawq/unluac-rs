@@ -60,6 +60,11 @@ pub(super) fn try_lower_forwarded_function_stmt(
         // 候选拒绝[SemanticBarrier:Lifetime]：转发后的函数对象不能替代原槽承担词法域末端前的强根生命周期，反例形状见 regress_400。
         return None;
     }
+    if !local_binding.rewrite_authority.may_remove_binding() {
+        // 候选拒绝[LayerBoundary]：HIR 已要求保留该 binding；函数转发 sugar 只能判断
+        // Lua 语法形状，不能推翻底层生命周期或 value-epoch 结论。
+        return None;
+    }
     // 只有“纯转发”的函数壳才适合被下一条语句吸收。
     // 递归 local function 这类 case 在 AST 函数体里往往已经只剩 `u0` 之类的 upvalue 引用，
     // 直接扫 body 看不到它对当前 binding 槽位的依赖；所以这里优先使用 AST build

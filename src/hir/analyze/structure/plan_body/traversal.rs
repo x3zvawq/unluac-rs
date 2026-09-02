@@ -201,6 +201,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         outer.push(HirStmt::Repeat(Box::new(HirRepeat {
                             body: HirBlock { stmts: prefix },
                             cond: HirExpr::Boolean(true),
+                            lifetime: Default::default(),
                         })));
                         prefix = outer;
                     } else {

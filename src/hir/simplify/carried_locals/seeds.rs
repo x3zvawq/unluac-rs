@@ -98,6 +98,7 @@ pub(super) fn rewrite_binding_handoff_seed(
         .iter()
         .map(|(_, value)| value.clone())
         .collect();
+    assign.generic_for_initializer_producer = None;
     true
 }
 
@@ -160,6 +161,7 @@ pub(super) fn rewrite_update_handoff_seed(stmt: &mut HirStmt, carried: CarryBind
         CarryBinding::Local(local) => HirLValue::Local(local),
         CarryBinding::Temp(temp) => HirLValue::Temp(temp),
     };
+    assign.generic_for_initializer_producer = None;
     true
 }
 
@@ -192,6 +194,8 @@ mod tests {
                 HirExpr::LocalRef(LocalId(0)),
                 HirExpr::LocalRef(LocalId(0)),
             ]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -218,6 +222,8 @@ mod tests {
         let stmt = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Temp(TempId(0))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::LocalRef(LocalId(0))]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
 
         assert!(binding_handoff_seed(&stmt).is_none());
@@ -228,6 +234,8 @@ mod tests {
         let stmt = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(TempId(0)), HirLValue::Temp(TempId(0))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::LocalRef(LocalId(0))]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
 
         assert!(binding_handoff_seed(&stmt).is_none());
@@ -246,6 +254,8 @@ mod tests {
                 HirExpr::Integer(2),
                 HirExpr::LocalRef(LocalId(0)),
             ]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
 
         let seed = binding_handoff_seed(&stmt)

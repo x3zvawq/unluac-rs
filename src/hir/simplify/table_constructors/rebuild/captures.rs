@@ -232,18 +232,15 @@ pub(super) fn decision_target_captures_orphaned_binding(
 }
 
 pub(super) fn table_key_captures_orphaned_binding(
-    key: &HirTableKey,
+    key: &HirExpr,
     binding_index: &BindingIndex,
     materialized_binding_counts: &[u32],
     removed_materializations: &[u32],
 ) -> bool {
-    match key {
-        HirTableKey::Name(_) => false,
-        HirTableKey::Expr(expr) => expr_captures_orphaned_binding(
-            expr,
-            binding_index,
-            materialized_binding_counts,
-            removed_materializations,
-        ),
-    }
+    expr_captures_orphaned_binding(
+        key,
+        binding_index,
+        materialized_binding_counts,
+        removed_materializations,
+    )
 }

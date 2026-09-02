@@ -19,17 +19,20 @@ pub use crate::parser::{ProtoLineRange, ProtoSignature};
 pub(crate) use analyze::analyze_hir;
 pub use common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirCapture,
-    HirCaptureMode, HirClose, HirClosureExpr, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef,
-    HirDecisionTarget, HirExpr, HirGenericFor, HirGlobalDecl, HirGlobalRef, HirGoto, HirIf,
-    HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirLogicalExpr, HirModule, HirNumericFor,
-    HirPackTail, HirProto, HirProtoRef, HirRecordField, HirRepeat, HirReturn, HirStmt,
-    HirTableAccess, HirTableConstructor, HirTableField, HirTableKey, HirTableSetList,
-    HirToBeClosed, HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile,
-    LocalId, ParamId, TempId, UpvalueId,
+    HirCaptureMode, HirClose, HirClosureExpr, HirControlFlowFeature, HirDecisionExpr,
+    HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExitRequirement, HirExpr,
+    HirGenericFor, HirGenericForDispatchResult, HirGlobalDecl, HirGlobalRef, HirGoto, HirIf,
+    HirInitializerMergeTransactionId, HirInlineDisposition, HirInlineDispositions,
+    HirInlineRetentionReason, HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirLogicalExpr,
+    HirModule, HirNumericFor, HirPackTail, HirProto, HirProtoRef, HirRecordField, HirRepeat,
+    HirRepeatBinding, HirRepeatConditionLifetimeFacts, HirReturn, HirStmt, HirTableAccess,
+    HirTableConstructor, HirTableField, HirTableSetList, HirToBeClosed, HirUnaryExpr,
+    HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_hir;
 pub use error::HirLowerError;
+pub(crate) use expr_safety::{HirInitializerRootProfile, initializer_root_profile};
 #[cfg(not(feature = "decompile-debug"))]
 mod debug {
     crate::debug::define_unavailable_stage_dump!(dump_hir);

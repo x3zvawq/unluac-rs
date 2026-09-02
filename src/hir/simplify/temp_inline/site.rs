@@ -61,9 +61,7 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         HirStmt::GenericFor(generic_for) => {
             find_site_in_exprs(&generic_for.iterator, temp, InlineSite::LoopHead)
         }
-        // 候选拒绝[PolicyBoundary]：项目选择保留 ErrNil 的显式诊断/probe identity，
-        // 供 AST build 恢复 global-decl 失败证据；temp-inline 不把 producer 埋进该协议（regress_244）。
-        HirStmt::ErrNil(_) => None,
+        HirStmt::ErrNil(err_nil) => find_site_in_expr(&err_nil.value, temp, InlineSite::Direct),
         // 候选拒绝[LayerBoundary]：close-scopes 需要相邻 definition + TBC binding 来物化
         // `<close>` 词法 owner；它消费协议后会 invalidates TempChain 并重跑 temp-inline，
         // 因而这里先保留独立 resource identity（regress_244）。
@@ -313,8 +311,8 @@ impl EvalOrderProbe<'_> {
             }
             HirStmt::GenericFor(generic_for) => self.exprs(&generic_for.iterator),
             HirStmt::Block(_) => transparent_block_head(stmt).is_some_and(|stmt| self.stmt(stmt)),
-            HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
+            HirStmt::ErrNil(err_nil) => self.expr(&err_nil.value),
+            HirStmt::ToBeClosed(_)
             | HirStmt::Close(_)
             | HirStmt::Break
             | HirStmt::Continue
@@ -393,12 +391,10 @@ impl EvalOrderProbe<'_> {
                             prefix_clear &= self.prefix_is_clear(value);
                         }
                         HirTableField::Record(field) => {
-                            if let HirTableKey::Expr(key) = &field.key {
-                                if expr_touches_temp(key, self.temp) {
-                                    return prefix_clear && self.expr(key);
-                                }
-                                prefix_clear &= self.prefix_is_clear(key);
+                            if expr_touches_temp(&field.key, self.temp) {
+                                return prefix_clear && self.expr(&field.key);
                             }
+                            prefix_clear &= self.prefix_is_clear(&field.key);
                             if expr_touches_temp(&field.value, self.temp) {
                                 return prefix_clear && self.expr(&field.value);
                             }
@@ -699,11 +695,8 @@ fn find_site_in_decision_target(
     }
 }
 
-fn find_site_in_table_key(key: &HirTableKey, temp: TempId, site: InlineSite) -> Option<InlineSite> {
-    match key {
-        HirTableKey::Name(_) => None,
-        HirTableKey::Expr(expr) => find_site_in_expr(expr, temp, site),
-    }
+fn find_site_in_table_key(key: &HirExpr, temp: TempId, site: InlineSite) -> Option<InlineSite> {
+    find_site_in_expr(key, temp, site)
 }
 
 fn expr_complexity(expr: &HirExpr) -> usize {
@@ -782,11 +775,8 @@ fn decision_target_complexity(target: &crate::hir::common::HirDecisionTarget) ->
     }
 }
 
-fn table_key_complexity(key: &HirTableKey) -> usize {
-    match key {
-        HirTableKey::Name(_) => 1,
-        HirTableKey::Expr(expr) => expr_complexity(expr),
-    }
+fn table_key_complexity(key: &HirExpr) -> usize {
+    expr_complexity(key)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1166,9 +1156,6 @@ fn decision_target_touches_temp(
     }
 }
 
-fn table_key_touches_temp(key: &HirTableKey, temp: TempId) -> bool {
-    match key {
-        HirTableKey::Name(_) => false,
-        HirTableKey::Expr(expr) => expr_touches_temp(expr, temp),
-    }
+fn table_key_touches_temp(key: &HirExpr, temp: TempId) -> bool {
+    expr_touches_temp(key, temp)
 }

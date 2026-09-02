@@ -12,14 +12,16 @@
 //! field alias lookup 与事件型 receiver initializer 原本只求值一次，因此不能搬入
 //! while/repeat；所有 alias 也不能越过外层调用、左侧操作数、复杂赋值目标等可观察前缀。
 
-use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
+use super::super::binding_flow::{
+    BindingUseIndex, MutableSnapshotNames, binding_is_directly_written_in_suffix,
+    name_is_directly_written_in_suffix,
+};
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_stable_context_expr;
-use super::super::visit::{self, AstVisitor};
 use crate::ast::common::{
-    AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstFunctionName, AstGlobalDecl,
-    AstIf, AstLValue, AstLocalAttr, AstLocalBinding, AstLocalOrigin, AstMethodCallExpr, AstNameRef,
-    AstReturn, AstStmt,
+    AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstGlobalDecl, AstIf,
+    AstLocalAttr, AstLocalBinding, AstLocalOrigin, AstMethodCallExpr, AstNameRef, AstReturn,
+    AstStmt,
 };
 
 pub(super) fn try_recover_method_alias_stmt(
@@ -97,8 +99,8 @@ fn try_recover_with_receiver_alias(
     {
         return None;
     }
-    if binding_is_written_in_suffix(stmts, 1, receiver_binding)
-        || binding_is_written_in_suffix(stmts, 2, field_binding)
+    if binding_is_directly_written_in_suffix(stmts, 1, receiver_binding)
+        || binding_is_directly_written_in_suffix(stmts, 2, field_binding)
     {
         // 候选拒绝[SemanticBarrier:Scope]：删除 alias declaration 会让后续 direct write 解析到外层 binding，不能只按读取次数判断。
         return None;
@@ -150,7 +152,7 @@ fn try_recover_receiver_alias_direct_method_call(
     if !method_alias_local_can_be_removed(receiver_local, source_preserves_receiver_root) {
         return None;
     }
-    if binding_is_written_in_suffix(stmts, 1, receiver_binding) {
+    if binding_is_directly_written_in_suffix(stmts, 1, receiver_binding) {
         // 候选拒绝[SemanticBarrier:Scope]：删除 receiver local 会把 sink/后缀的 direct write 绑定到外层名称。
         return None;
     }
@@ -188,6 +190,11 @@ fn method_alias_local_can_be_removed(
     binding: &AstLocalBinding,
     source_preserves_receiver_root: bool,
 ) -> bool {
+    if !binding.rewrite_authority.may_remove_binding() {
+        // 候选拒绝[LayerBoundary]：method sugar 会删除 receiver/field binding；HIR
+        // Preserve 不能被 AST 的 receiver 求值次数证明覆盖。
+        return false;
+    }
     match binding.attr {
         AstLocalAttr::None => {}
         AstLocalAttr::Close => {
@@ -215,23 +222,6 @@ fn method_alias_local_can_be_removed(
     }
 }
 
-fn binding_is_written_in_suffix(stmts: &[AstStmt], start: usize, binding: AstBindingRef) -> bool {
-    name_is_written_in_suffix(stmts, start, &binding.to_name_ref())
-}
-
-fn name_is_written_in_suffix(stmts: &[AstStmt], start: usize, name: &AstNameRef) -> bool {
-    stmts.get(start..).is_some_and(|suffix| {
-        suffix.iter().any(|stmt| {
-            let mut finder = NameWriteFinder {
-                name: name.clone(),
-                found: false,
-            };
-            visit::visit_stmt(stmt, &mut finder);
-            finder.found
-        })
-    })
-}
-
 fn receiver_alias_source_may_drop_root(
     stmts: &[AstStmt],
     receiver_expr: &AstExpr,
@@ -244,7 +234,7 @@ fn receiver_alias_source_may_drop_root(
         // 候选拒绝[SemanticBarrier:Lifetime]：global/upvalue 可在 sink 期间换值，删除 alias 会提前释放旧 receiver root。
         return true;
     }
-    if name_is_written_in_suffix(stmts, 1, source) {
+    if name_is_directly_written_in_suffix(stmts, 1, source) {
         // 候选拒绝[SemanticBarrier:Lifetime]：后缀写会丢失旧 root，反例见 regress_406。
         return true;
     }
@@ -253,46 +243,6 @@ fn receiver_alias_source_may_drop_root(
         return true;
     }
     false
-}
-
-struct NameWriteFinder {
-    name: AstNameRef,
-    found: bool,
-}
-
-impl AstVisitor for NameWriteFinder {
-    fn visit_function_expr(&mut self, _function: &crate::ast::common::AstFunctionExpr) -> bool {
-        // LocalId/SyntheticLocalId are function-local. Child bodies can only refer to the
-        // outer binding through capture provenance, not through a same-numbered direct write.
-        false
-    }
-
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
-        match stmt {
-            AstStmt::FunctionDecl(function_decl) => {
-                let AstFunctionName::Plain(path) = &function_decl.target else {
-                    return;
-                };
-                if path.fields.is_empty() && path.root == self.name {
-                    self.found = true;
-                }
-            }
-            AstStmt::LocalFunctionDecl(function_decl)
-                if function_decl.name.to_name_ref() == self.name =>
-            {
-                self.found = true;
-            }
-            _ => {}
-        }
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &AstLValue) {
-        if let AstLValue::Name(name) = lvalue
-            && name == &self.name
-        {
-            self.found = true;
-        }
-    }
 }
 
 fn recover_method_call_sink(
@@ -841,8 +791,11 @@ mod tests {
                     id: receiver,
                     attr: AstLocalAttr::None,
                     origin: AstLocalOrigin::Recovered,
+                    rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                 }],
                 values: vec![AstExpr::Var(source.clone())],
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
             })),
             AstStmt::While(Box::new(AstWhile {
                 cond: AstExpr::Call(Box::new(AstCallExpr {
@@ -851,7 +804,7 @@ mod tests {
                         field: "ready".to_owned(),
                     })),
                     args: vec![AstExpr::Var(receiver.to_name_ref())],
-                    method_name: None,
+                    method_key: None,
                 })),
                 body: AstBlock::default(),
             })),

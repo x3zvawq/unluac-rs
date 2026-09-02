@@ -215,7 +215,7 @@ fn format_upvalue(upvalue_ref: super::UpvalueRef) -> String {
 
 fn format_upvalue_operand(operand: super::UpvalueOperand) -> String {
     match operand {
-        super::UpvalueOperand::Env => "env".to_owned(),
+        super::UpvalueOperand::Env(upvalue) => format!("env({})", format_upvalue(upvalue)),
         super::UpvalueOperand::Upvalue(upvalue) => format_upvalue(upvalue),
     }
 }
@@ -238,6 +238,9 @@ fn format_access_base(base: AccessBase) -> String {
     match base {
         AccessBase::Reg(reg) => format_reg(reg),
         AccessBase::Env => "env".to_owned(),
+        AccessBase::EnvironmentUpvalue(upvalue) => {
+            format!("env({})", format_upvalue(upvalue))
+        }
         AccessBase::Upvalue(upvalue) => format_upvalue(upvalue),
     }
 }

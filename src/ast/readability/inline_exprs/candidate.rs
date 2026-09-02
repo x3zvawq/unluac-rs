@@ -177,6 +177,7 @@ fn expr_has_unconditional_boolean_binding_use(expr: &AstExpr, binding: AstBindin
 pub(super) struct InlineCandidate {
     binding: AstBindingRef,
     origin: AstLocalOrigin,
+    initializer_may_affect_collectable_lifetime: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +210,10 @@ impl InlineCandidate {
 
     pub(super) fn origin(self) -> AstLocalOrigin {
         self.origin
+    }
+
+    pub(super) fn initializer_may_affect_collectable_lifetime(self) -> bool {
+        self.initializer_may_affect_collectable_lifetime
     }
 
     pub(super) fn expr_rejection_with_policy(
@@ -315,6 +320,11 @@ fn inline_candidate_from_local_decl(
     if !local_attr_belongs_to_inline_pipeline(binding.attr) {
         return None;
     }
+    if binding.rewrite_authority.must_preserve() {
+        // 候选拒绝[LayerBoundary]：HIR 已证明删除这个 binding 会破坏底层生命周期或
+        // value epoch。AST 只消费该结论，不根据当前 Lua 语法形状重新打开候选。
+        return None;
+    }
     match binding.id {
         // 候选拒绝[LayerBoundary]：Normal inline-exprs 不把原生 TempId 当作源码 local；
         // Deferred materialize-temps 把残留 temp 建成 SyntheticLocal，并发出 TempPresence、
@@ -325,6 +335,10 @@ fn inline_candidate_from_local_decl(
             InlineCandidate {
                 binding: binding.id,
                 origin: binding.origin,
+                initializer_may_affect_collectable_lifetime: local_decl
+                    .initializer_root_profile
+                    .as_ref()
+                    .is_none_or(|profile| profile.may_affect_collectable_lifetime(0)),
             },
             value,
         )),

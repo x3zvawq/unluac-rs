@@ -10,6 +10,8 @@
 //!   稳定输出，而不是把裸 `t0` 留到最终代码
 //! - 命名 vararg、capture binding、函数名路径里残留的 temp 也会一起收成
 //!   synthetic local 身份
+//! - repeat 生命周期 certificate 保留 HIR 的 `TempId`，不随这里的语法名字改写；消费方只在
+//!   binding authority 仍来自 HIR 时把 `SyntheticLocal(temp)` 归一化回该身份
 
 use super::super::common::{
     AstBindingRef, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule, AstNameRef,

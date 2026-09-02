@@ -14,11 +14,12 @@ use crate::transformer::dialect::puc_lua::{
     access_base_for_upvalue as shared_access_base_for_upvalue, call_args_pack, call_result_pack,
     checked_const_ref, checked_proto_ref, checked_upvalue_ref, constant_binary_shape, emit_call,
     emit_generic_for_call, emit_generic_for_loop, emit_generic_for_prep, emit_numeric_for_init,
-    emit_numeric_for_loop, emit_return, emit_tail_call, finish_lowered_proto, generic_for_pair_abx,
-    helper_jump_asj, immediate_binary_shape, immediate_cond_operand, jump_target_back_bx,
-    jump_target_forward_bx, jump_target_sj, k_value_operand, lower_chunk_with_env,
-    numeric_for_regs, prepare_env_lowering, range_len_inclusive, reg_from_u8,
-    register_binary_shape, return_pack, upvalue_operand as shared_upvalue_operand,
+    emit_numeric_for_loop, emit_return, emit_tail_call, environment_upvalue_refs,
+    finish_lowered_proto, generic_for_pair_abx, helper_jump_asj, immediate_binary_shape,
+    immediate_cond_operand, jump_target_back_bx, jump_target_forward_bx, jump_target_sj,
+    k_value_operand, lower_chunk_with_env, numeric_for_regs, prepare_env_lowering,
+    range_len_inclusive, reg_from_u8, register_binary_shape, return_pack,
+    upvalue_operand as shared_upvalue_operand,
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
@@ -74,11 +75,18 @@ fn lower_proto(
         FamilyDialect::Lua55 => lower_lua55_proto,
     };
     let (env_upvalues, children) = prepare_env_lowering(raw, parent_env_upvalues, child_lowerer)?;
+    let environment_upvalues = environment_upvalue_refs(&env_upvalues);
     let mut lowerer = ProtoLowerer::new(raw, env_upvalues, dialect);
     let (mut instrs, lowering_map) = lowerer.lower()?;
     let children = instantiate_closure_children(&mut instrs, children);
 
-    Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
+    Ok(finish_lowered_proto(
+        raw,
+        environment_upvalues,
+        children,
+        instrs,
+        lowering_map,
+    ))
 }
 
 struct ProtoLowerer<'a> {

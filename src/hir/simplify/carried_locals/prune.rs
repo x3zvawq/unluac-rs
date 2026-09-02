@@ -56,7 +56,10 @@ pub(super) fn prune_empty_assign_stmts(block: &mut HirBlock) -> bool {
     block.stmts.len() != original_len
 }
 
-pub(super) fn prune_redundant_copy_stmts(block: &mut HirBlock) -> bool {
+pub(super) fn prune_redundant_copy_stmts(
+    block: &mut HirBlock,
+    preserved_bindings: &BTreeSet<CarryBinding>,
+) -> bool {
     let original = std::mem::take(&mut block.stmts);
     let mut rewritten = Vec::<HirStmt>::with_capacity(original.len());
     let mut changed = false;
@@ -65,16 +68,22 @@ pub(super) fn prune_redundant_copy_stmts(block: &mut HirBlock) -> bool {
         let copy = single_binding_copy(&stmt);
         let redundant_parallel = matches!(
             &stmt,
-            HirStmt::Assign(assign) if redundant_parallel_self_copy(assign)
+            HirStmt::Assign(assign)
+                if redundant_parallel_self_copy(assign)
+                    && !assign_targets_preserved_binding(assign, preserved_bindings)
         );
-        if copy.is_some_and(|(target, source)| target == source)
-            || redundant_parallel
+        if copy.is_some_and(|(target, source)| {
+            target == source && !preserved_bindings.contains(&target)
+        }) || redundant_parallel
             || rewritten
                 .last()
                 .and_then(single_binding_copy)
                 .zip(copy)
                 .is_some_and(|((first_target, first_source), (target, source))| {
-                    first_target != first_source && first_target == source && first_source == target
+                    first_target != first_source
+                        && first_target == source
+                        && first_source == target
+                        && !preserved_bindings.contains(&target)
                 })
         {
             changed = true;
@@ -90,6 +99,7 @@ pub(super) fn prune_redundant_copy_stmts(block: &mut HirBlock) -> bool {
 pub(super) fn prune_redundant_branch_state_copies(
     proto: &mut HirProto,
     safety: HirExprSafety,
+    preserved_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
     let debug_locals = proto
@@ -104,6 +114,7 @@ pub(super) fn prune_redundant_branch_state_copies(
         reference_captured_temps: &reference_captured.temps,
         debug_locals: &debug_locals,
         debug_temps: &proto.temp_debug_locals,
+        preserved_bindings,
         safety,
     };
     let (changed, _) = rewrite_branch_state_block(&mut proto.body, &facts, BTreeMap::new(), false);
@@ -113,6 +124,7 @@ pub(super) fn prune_redundant_branch_state_copies(
 pub(super) fn prune_dead_for_binding_temp_mirrors(
     proto: &mut HirProto,
     promotion_facts: &ProtoPromotionFacts,
+    preserved_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let live_reads = collect_temp_reads_in_proto(proto);
     let write_audit = collect_temp_write_audit_in_proto(proto, promotion_facts);
@@ -126,6 +138,7 @@ pub(super) fn prune_dead_for_binding_temp_mirrors(
         &live_reads,
         &write_audit,
         &debug_temps,
+        preserved_bindings,
         &BTreeSet::new(),
         promotion_facts,
     )
@@ -136,6 +149,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
     live_reads: &BTreeSet<TempId>,
     write_audit: &TempWriteAudit,
     debug_temps: &[bool],
+    preserved_bindings: &BTreeSet<CarryBinding>,
     active_for_bindings: &BTreeSet<LocalId>,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
@@ -153,6 +167,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                     live_reads,
                     write_audit,
                     debug_temps,
+                    preserved_bindings,
                     &child_for_bindings,
                     promotion_facts,
                 )
@@ -165,6 +180,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                     live_reads,
                     write_audit,
                     debug_temps,
+                    preserved_bindings,
                     &child_for_bindings,
                     promotion_facts,
                 )
@@ -175,6 +191,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                     live_reads,
                     write_audit,
                     debug_temps,
+                    preserved_bindings,
                     active_for_bindings,
                     promotion_facts,
                 ) | if_stmt.else_block.as_mut().is_some_and(|else_block| {
@@ -183,6 +200,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                         live_reads,
                         write_audit,
                         debug_temps,
+                        preserved_bindings,
                         active_for_bindings,
                         promotion_facts,
                     )
@@ -193,6 +211,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                 live_reads,
                 write_audit,
                 debug_temps,
+                preserved_bindings,
                 active_for_bindings,
                 promotion_facts,
             ),
@@ -201,6 +220,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                 live_reads,
                 write_audit,
                 debug_temps,
+                preserved_bindings,
                 active_for_bindings,
                 promotion_facts,
             ),
@@ -209,6 +229,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
                 live_reads,
                 write_audit,
                 debug_temps,
+                preserved_bindings,
                 active_for_bindings,
                 promotion_facts,
             ),
@@ -232,6 +253,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
             live_reads,
             write_audit,
             debug_temps,
+            preserved_bindings,
             active_for_bindings,
             promotion_facts,
         ) {
@@ -252,11 +274,20 @@ fn prune_dead_for_binding_temp_mirror_components(
     live_reads: &BTreeSet<TempId>,
     write_audit: &TempWriteAudit,
     debug_temps: &[bool],
+    preserved_bindings: &BTreeSet<CarryBinding>,
     active_for_bindings: &BTreeSet<LocalId>,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return false;
+    };
+    let facts = DeadForBindingMirrorFacts {
+        live_reads,
+        write_audit,
+        debug_temps,
+        preserved_bindings,
+        active_for_bindings,
+        promotion_facts,
     };
     let mut changed = false;
     let old_targets = std::mem::take(&mut assign.targets);
@@ -280,15 +311,7 @@ fn prune_dead_for_binding_temp_mirror_components(
         // 逐对移除是安全的：被删 RHS 只是纯 LocalRef，target temp 又已证明无读者，
         // 因此不会改变其余并行分量的求值、副作用或相互可见顺序。fixed pair 与
         // target 同时缩短后，后续 fixed/open-tail 的投影位置保持不变。
-        if dead_for_binding_temp_mirror_can_be_pruned(
-            &target,
-            &value,
-            live_reads,
-            write_audit,
-            debug_temps,
-            active_for_bindings,
-            promotion_facts,
-        ) {
+        if dead_for_binding_temp_mirror_can_be_pruned(&target, &value, &facts) {
             changed = true;
             removed_pairs.push((target, value));
             continue;
@@ -315,39 +338,62 @@ fn prune_dead_for_binding_temp_mirror_components(
 
     assign.targets = new_targets;
     assign.values.fixed = new_values;
+    if changed {
+        assign.generic_for_initializer_producer = None;
+    }
     changed
+}
+
+struct DeadForBindingMirrorFacts<'a> {
+    live_reads: &'a BTreeSet<TempId>,
+    write_audit: &'a TempWriteAudit,
+    debug_temps: &'a [bool],
+    preserved_bindings: &'a BTreeSet<CarryBinding>,
+    active_for_bindings: &'a BTreeSet<LocalId>,
+    promotion_facts: &'a ProtoPromotionFacts,
 }
 
 fn dead_for_binding_temp_mirror_can_be_pruned(
     target: &HirLValue,
     value: &HirExpr,
-    live_reads: &BTreeSet<TempId>,
-    write_audit: &TempWriteAudit,
-    debug_temps: &[bool],
-    active_for_bindings: &BTreeSet<LocalId>,
-    promotion_facts: &ProtoPromotionFacts,
+    facts: &DeadForBindingMirrorFacts<'_>,
 ) -> bool {
     let (HirLValue::Temp(temp), HirExpr::LocalRef(local)) = (target, value) else {
         return false;
     };
-    if !active_for_bindings.contains(local) || !promotion_facts.is_loop_carrier_temp(*temp) {
+    if !facts.active_for_bindings.contains(local)
+        || !facts.promotion_facts.is_loop_carrier_temp(*temp)
+    {
         return false;
     }
-    if live_reads.contains(temp) {
+    if facts.live_reads.contains(temp) {
         // 候选拒绝[SemanticBarrier:ValueFlow]：`t = binding; return t` 若删 mirror 会让后续读取失去该值定义。
         return false;
     }
-    if debug_temps.get(temp.index()).copied().unwrap_or(false) {
+    if facts
+        .preserved_bindings
+        .contains(&CarryBinding::Temp(*temp))
+    {
+        // 候选拒绝[LayerBoundary]：该 temp 写入已由上游 HIR 证明必须保留；即使它在
+        // 当前 for mirror 审计中无读取，也不能把另一事务的负向结论洗掉。
+        return false;
+    }
+    if facts
+        .debug_temps
+        .get(temp.index())
+        .copied()
+        .unwrap_or(false)
+    {
         // 候选拒绝[PolicyBoundary]：zero-read debug temp 仍是项目选择保留的源码 identity。
         return false;
     }
-    if write_audit.has_surviving_write(*temp) {
+    if facts.write_audit.has_surviving_write(*temp) {
         // 候选拒绝[SemanticBarrier:Lifetime]：regress_347 的 `t=A; for binding=B do t=binding; GC end`
         // 若任一写不是同一唯一可能 home 的 no-op，删 mirror 会让 A 多活并改变弱表/终结观察。
         return false;
     }
 
-    write_audit.all_writes_are_prunable_mirrors(*temp)
+    facts.write_audit.all_writes_are_prunable_mirrors(*temp)
 }
 
 #[derive(Default)]
@@ -533,6 +579,7 @@ struct BranchStateCopyFacts<'a> {
     reference_captured_temps: &'a BTreeSet<TempId>,
     debug_locals: &'a BTreeSet<LocalId>,
     debug_temps: &'a [Option<String>],
+    preserved_bindings: &'a BTreeSet<CarryBinding>,
     safety: HirExprSafety,
 }
 
@@ -664,6 +711,9 @@ impl BranchStateCopyFacts<'_> {
                 .debug_temps
                 .get(temp.index())
                 .is_none_or(Option::is_none)
+            && !self
+                .preserved_bindings
+                .contains(&CarryBinding::Local(local))
     }
 }
 
@@ -1036,6 +1086,17 @@ fn redundant_parallel_self_copy(assign: &HirAssign) -> bool {
         })
 }
 
+fn assign_targets_preserved_binding(
+    assign: &HirAssign,
+    preserved_bindings: &BTreeSet<CarryBinding>,
+) -> bool {
+    assign
+        .targets
+        .iter()
+        .filter_map(carry_binding_from_lvalue)
+        .any(|binding| preserved_bindings.contains(&binding))
+}
+
 pub(super) fn prune_redundant_self_assigns_in_stmts(
     stmts: &mut [HirStmt],
     prunable_bindings: BTreeSet<CarryBinding>,
@@ -1073,6 +1134,7 @@ fn prune_redundant_self_assign_stmt(
 
     assign.targets.clear();
     assign.values.fixed.clear();
+    assign.generic_for_initializer_producer = None;
     true
 }
 
@@ -1144,6 +1206,23 @@ mod tests {
             ),
             MirrorWriteDisposition::Prunable
         ));
+        let live_reads = BTreeSet::new();
+        let audit = prunable_audit(mirror);
+        let preserved_bindings = BTreeSet::from([CarryBinding::Temp(mirror)]);
+        let active_for_bindings = BTreeSet::from([binding]);
+        let mirror_facts = DeadForBindingMirrorFacts {
+            live_reads: &live_reads,
+            write_audit: &audit,
+            debug_temps: &[false],
+            preserved_bindings: &preserved_bindings,
+            active_for_bindings: &active_for_bindings,
+            promotion_facts: &facts,
+        };
+        assert!(!dead_for_binding_temp_mirror_can_be_pruned(
+            &HirLValue::Temp(mirror),
+            &HirExpr::LocalRef(binding),
+            &mirror_facts,
+        ));
     }
 
     #[test]
@@ -1173,6 +1252,8 @@ mod tests {
         let mut stmt = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(mirror), HirLValue::Temp(tail_target)],
             values: HirValuePack::expanding(vec![HirExpr::LocalRef(binding)], tail.clone()),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let facts = mirror_facts(mirror, binding);
 
@@ -1181,6 +1262,7 @@ mod tests {
             &BTreeSet::new(),
             &prunable_audit(mirror),
             &[false, false],
+            &BTreeSet::new(),
             &BTreeSet::from([binding]),
             &facts,
         ));
@@ -1190,6 +1272,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(tail_target)],
                 values: HirValuePack::expanding(Vec::new(), tail),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         );
     }
@@ -1204,6 +1288,8 @@ mod tests {
                 vec![HirExpr::LocalRef(binding)],
                 HirPackTail::open(HirExpr::VarArg),
             ),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let before = stmt.clone();
         let facts = mirror_facts(mirror, binding);
@@ -1213,6 +1299,7 @@ mod tests {
             &BTreeSet::new(),
             &prunable_audit(mirror),
             &[false],
+            &BTreeSet::new(),
             &BTreeSet::from([binding]),
             &facts,
         ));

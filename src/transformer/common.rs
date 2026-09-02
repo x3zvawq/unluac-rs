@@ -30,6 +30,11 @@ pub struct LoweredProto {
     pub frame: ProtoFrameInfo,
     pub constants: RawConstPool,
     pub upvalues: RawUpvalueInfo,
+    /// 当前 proto 中由 VM 绑定为词法环境的 upvalue，按 upvalue 索引升序保存。
+    ///
+    /// 这是 PUC Lua 5.2+ 的 cell 身份，不等同于 Lua 5.1/LuaJIT/Luau 全局指令使用的
+    /// 隐式环境 base；后层必须继续把它当作普通 upvalue identity 参与读写与 capture。
+    pub environment_upvalues: Vec<UpvalueRef>,
     pub debug_info: RawDebugInfo,
     /// 已按方言协议归一到寄存器与生命周期的局部变量调试事实。
     pub debug_locals: Vec<DebugLocalFact>,
@@ -421,14 +426,17 @@ pub enum ResultPack {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum AccessBase {
     Reg(Reg),
+    /// 没有源码级词法 upvalue 身份的隐式全局环境。
     Env,
+    /// PUC Lua 5.2+ 由真实 upvalue cell 承载的词法环境。
+    EnvironmentUpvalue(UpvalueRef),
     Upvalue(UpvalueRef),
 }
 
 /// 上值读写的语义目标。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum UpvalueOperand {
-    Env,
+    Env(UpvalueRef),
     Upvalue(UpvalueRef),
 }
 

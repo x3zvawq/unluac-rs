@@ -129,11 +129,15 @@ fn eliminate_stmt(
             )
         }
         HirStmt::LocalDecl(local_decl) => {
+            let initializer_merge_transaction = local_decl.initializer_merge_transaction;
             let (mut prefix, values, changed) =
                 extract_value_pack(local_decl.values, state, safety);
             prefix.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: local_decl.bindings,
                 values,
+                initializer_merge_transaction: (!changed)
+                    .then_some(initializer_merge_transaction)
+                    .flatten(),
             })));
             (prefix, changed)
         }
@@ -514,6 +518,8 @@ fn materialize_condition_into_flag(
     prefix.push(HirStmt::Assign(Box::new(crate::hir::common::HirAssign {
         targets: vec![HirLValue::Local(flag)],
         values: crate::hir::common::HirValuePack::fixed(vec![value.negate().negate()]),
+        initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     })));
     HirStmt::Block(Box::new(HirBlock { stmts: prefix }))
 }
@@ -639,12 +645,13 @@ mod tests {
                             args: crate::hir::common::HirValuePack::default(),
                             method: false,
                             fastcall: None,
-                            method_name: None,
+                            method_key: None,
                         },
                     },
                 ))],
             },
             cond: nonstable_decision(),
+            lifetime: Default::default(),
         }));
         let mut next_local_index = 0;
         let mut new_locals = Vec::new();
@@ -683,6 +690,7 @@ mod tests {
                 stmts: vec![HirStmt::Continue],
             },
             cond: nonstable_decision(),
+            lifetime: Default::default(),
         }));
         let mut next_local_index = 0;
         let mut new_locals = Vec::new();
@@ -725,6 +733,7 @@ mod tests {
                     HirStmt::LocalDecl(Box::new(HirLocalDecl {
                         bindings: vec![body_root],
                         values: HirValuePack::fixed(vec![global("body_root")]),
+                        initializer_merge_transaction: None,
                     })),
                     HirStmt::If(Box::new(HirIf {
                         cond: HirExpr::Boolean(true),
@@ -736,6 +745,7 @@ mod tests {
                 ],
             },
             cond: nonstable_decision(),
+            lifetime: Default::default(),
         }));
         let mut next_local_index = 1;
         let mut new_locals = Vec::new();
@@ -783,6 +793,7 @@ mod tests {
                             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                                 bindings: vec![resource],
                                 values: HirValuePack::fixed(vec![global("resource")]),
+                                initializer_merge_transaction: None,
                             })),
                             HirStmt::ToBeClosed(Box::new(HirToBeClosed {
                                 origin: InstrRef(0),
@@ -796,6 +807,7 @@ mod tests {
                 }))],
             },
             cond: nonstable_decision(),
+            lifetime: Default::default(),
         }));
         let mut next_local_index = 1;
         let mut new_locals = Vec::new();
@@ -830,10 +842,12 @@ mod tests {
                     HirStmt::LocalDecl(Box::new(HirLocalDecl {
                         bindings: vec![future],
                         values: HirValuePack::fixed(vec![global("future")]),
+                        initializer_merge_transaction: None,
                     })),
                 ],
             },
             cond: nonstable_decision_with_local(future),
+            lifetime: Default::default(),
         }));
         let mut next_local_index = 1;
         let mut new_locals = Vec::new();
@@ -883,8 +897,6 @@ mod tests {
     }
 
     fn global(name: &str) -> HirExpr {
-        HirExpr::GlobalRef(HirGlobalRef {
-            name: name.to_owned(),
-        })
+        HirExpr::GlobalRef(HirGlobalRef { key: name.into() })
     }
 }

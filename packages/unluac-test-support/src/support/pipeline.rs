@@ -694,8 +694,6 @@ fn run_global_decl_residual_contract(
     suite: UnitSuite,
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
-    use unluac::hir::HirStmt;
-
     let baseline = build_case_baseline(entry, suite.label()).map_err(|failure| {
         TestFailure::new(
             FailureKind::BaselineFailed,
@@ -717,12 +715,7 @@ fn run_global_decl_residual_contract(
     let root = module.protos.get(module.entry.index()).ok_or_else(|| {
         global_decl_residual_contract_failure(entry, "HIR entry references a missing proto")
     })?;
-    if root
-        .body
-        .stmts
-        .iter()
-        .any(|stmt| matches!(stmt, HirStmt::GlobalDecl(_)))
-    {
+    if hir_block_contains_global_decl(&root.body) {
         return Err(global_decl_residual_contract_failure(
             entry,
             "mixed RHS was partially claimed as a global declaration",
@@ -774,6 +767,38 @@ fn run_global_decl_residual_contract(
 
     Ok(TestSuccess {
         proto_count: count_output_tags(&baseline.source_output.stdout),
+    })
+}
+
+fn hir_block_contains_global_decl(block: &unluac::hir::HirBlock) -> bool {
+    use unluac::hir::HirStmt;
+
+    block.stmts.iter().any(|stmt| match stmt {
+        HirStmt::GlobalDecl(_) => true,
+        HirStmt::If(if_stmt) => {
+            hir_block_contains_global_decl(&if_stmt.then_block)
+                || if_stmt
+                    .else_block
+                    .as_ref()
+                    .is_some_and(hir_block_contains_global_decl)
+        }
+        HirStmt::While(while_stmt) => hir_block_contains_global_decl(&while_stmt.body),
+        HirStmt::Repeat(repeat_stmt) => hir_block_contains_global_decl(&repeat_stmt.body),
+        HirStmt::NumericFor(for_stmt) => hir_block_contains_global_decl(&for_stmt.body),
+        HirStmt::GenericFor(for_stmt) => hir_block_contains_global_decl(&for_stmt.body),
+        HirStmt::Block(block) => hir_block_contains_global_decl(block),
+        HirStmt::LocalDecl(_)
+        | HirStmt::Assign(_)
+        | HirStmt::TableSetList(_)
+        | HirStmt::ErrNil(_)
+        | HirStmt::ToBeClosed(_)
+        | HirStmt::Close(_)
+        | HirStmt::CallStmt(_)
+        | HirStmt::Return(_)
+        | HirStmt::Break
+        | HirStmt::Continue
+        | HirStmt::Goto(_)
+        | HirStmt::Label(_) => false,
     })
 }
 

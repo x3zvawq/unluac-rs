@@ -21,7 +21,7 @@ use super::super::common::{
 };
 use super::ReadabilityContext;
 use super::binding_flow::{BindingUseIndex, binding_mentions_in_expr, binding_mentions_in_stmt};
-use super::expr_analysis::{is_discard_safe_expr_for_target, result_cannot_root_collectable};
+use super::expr_analysis::is_discard_safe_expr_for_target;
 use super::global_decl_pretty::{VisibleGlobals, extending_global_scope_preserves_expr};
 use super::walk::{self, AstRewritePass, BlockKind, ScopedAstRewritePass};
 use crate::ast::traverse::traverse_expr_children;
@@ -78,6 +78,7 @@ impl ScopedAstRewritePass for RepeatTailCleanupPass {
         &mut self,
         block: &mut AstBlock,
         condition: &AstExpr,
+        _lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
         incoming: &Self::Scope,
     ) -> (bool, Self::Scope) {
         (
@@ -184,6 +185,9 @@ fn cleanup_block(
                     && local_decl.values.len() == 1
                     && local_decl.bindings[0].attr != AstLocalAttr::Close
                     && local_decl.bindings[0].origin == AstLocalOrigin::Recovered
+                    && local_decl.bindings[0]
+                        .rewrite_authority
+                        .may_remove_binding()
                     && !binding_flow.keeps_decl_alive(local_decl.bindings[0].id) =>
             {
                 if is_discard_safe_expr_for_target(&local_decl.values[0], target) {
@@ -247,6 +251,11 @@ fn cleanup_block(
         }
         let original_len = local_decl.bindings.len();
         local_decl.bindings.retain(|binding| {
+            if !binding.rewrite_authority.may_remove_binding() {
+                // 候选拒绝[LayerBoundary]：HIR 已冻结该 binding 的语义生命周期；即使
+                // AST 当前看不到普通 use，也不能删除空声明或其 nil 初始化。
+                return true;
+            }
             if binding.origin.is_physical_root() {
                 // 候选拒绝[SemanticBarrier:Lifetime]：空 PhysicalRoot declaration 会在 hoist
                 // 点用 nil 清空复用的 VM home；删除后旧对象会跨过后续 GC 继续存活
@@ -270,7 +279,10 @@ fn cleanup_block(
             }
             is_live
         });
-        changed |= local_decl.bindings.len() != original_len;
+        if local_decl.bindings.len() != original_len {
+            local_decl.initializer_root_profile = None;
+            changed = true;
+        }
     }
 
     let original_len = block.stmts.len();
@@ -321,7 +333,10 @@ fn inline_terminal_scoped_temp_return(block: &mut AstBlock) -> bool {
     if !binding.id.matches_name_ref(returned) {
         return false;
     }
-    if binding.attr != AstLocalAttr::None || binding.origin != AstLocalOrigin::Recovered {
+    if binding.attr != AstLocalAttr::None
+        || binding.origin != AstLocalOrigin::Recovered
+        || !binding.rewrite_authority.may_remove_binding()
+    {
         // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted carrier 的函数级可见期可由
         // debug.getlocal 观察；候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot carrier
         // 在外层 return 前仍承担精确对象 root，不能按普通 synthetic temp 消除。
@@ -407,6 +422,7 @@ fn trim_unused_initialized_local_suffix(
             .rposition(|binding| {
                 binding.attr == AstLocalAttr::Close
                     || binding.origin != AstLocalOrigin::Recovered
+                    || !binding.rewrite_authority.may_remove_binding()
                     || binding_flow.keeps_decl_alive(binding.id)
             })
             .map_or(1, |index| index + 1);
@@ -415,6 +431,9 @@ fn trim_unused_initialized_local_suffix(
             // 完整保留，因此既不改变求值，也不移动任何保留 binding 的返回值位置。
             // 全部尾槽都满足时仍留一个，交由既有单槽事务按 initializer 类型处理。
             local_decl.bindings.truncate(retained_len);
+            if let Some(profile) = &mut local_decl.initializer_root_profile {
+                profile.truncate(retained_len);
+            }
             changed = true;
         }
     }
@@ -538,10 +557,22 @@ fn split_overwritten_call_result(
     if local_decl
         .bindings
         .iter()
+        .any(|binding| !binding.rewrite_authority.may_move_scope_start())
+    {
+        // 候选拒绝[LayerBoundary]：把声明移动到 overwrite 点会改写 HIR 冻结的 binding
+        // 起点；AST 无权用当前局部语法重新证明这段生命周期可缩短。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
         .enumerate()
         .any(|(index, binding)| {
             binding.origin.is_physical_root()
-                && initializer_slot_may_root_collectable(&local_decl.values, index)
+                && local_decl
+                    .initializer_root_profile
+                    .as_ref()
+                    .is_none_or(|profile| profile.may_affect_collectable_lifetime(index))
         })
         && !assign
             .values
@@ -584,24 +615,10 @@ fn split_overwritten_call_result(
         AstLocalDecl {
             bindings: local_decl.bindings.clone(),
             values: assign.values.clone(),
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         },
     ))
-}
-
-fn initializer_slot_may_root_collectable(values: &[AstExpr], slot: usize) -> bool {
-    let Some((tail, prefix)) = values.split_last() else {
-        return false;
-    };
-    if let Some(value) = prefix.get(slot) {
-        return !result_cannot_root_collectable(value);
-    }
-    if slot == prefix.len() {
-        return !result_cannot_root_collectable(tail);
-    }
-    matches!(
-        tail,
-        AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
-    )
 }
 
 fn flatten_repeat_tail_do_blocks(
@@ -639,7 +656,9 @@ fn flatten_repeat_tail_do_blocks(
 
 fn trailing_do_block_is_scope_neutral(block: &AstBlock, crosses_trailing_condition: bool) -> bool {
     if !crosses_trailing_condition {
-        if block.stmts.iter().any(stmt_declares_debug_binding) {
+        if block.stmts.iter().any(|stmt| {
+            stmt_declares_debug_binding(stmt) || stmt_declares_hir_preserved_binding(stmt)
+        }) {
             // 候选拒绝[SemanticBarrier:DebugScope]：函数 Return hook 可以在 return event
             // 观察直属 local。拍平尾 do 会把原本在 Return 前结束的 debug local 延长到
             // 函数作用域；regress420 固定运行反例，direct unit 覆盖 LocalDecl 与
@@ -687,6 +706,10 @@ fn trailing_do_block_is_scope_neutral(block: &AstBlock, crosses_trailing_conditi
                     .bindings
                     .iter()
                     .any(|binding| binding.origin.is_debug_hinted())
+                || local_decl
+                    .bindings
+                    .iter()
+                    .any(|binding| !binding.rewrite_authority.may_shorten_lifetime())
                 // 候选拒绝[SemanticBarrier:Lifetime]：repeat 尾 closure 拍平会让 closure 及
                 // captured object 活过 condition；regress378 在 condition 中以 `__gc` 观察。
                 || local_decl
@@ -740,6 +763,19 @@ fn stmt_declares_debug_binding(stmt: &AstStmt) -> bool {
             .iter()
             .any(|binding| binding.origin.is_debug_hinted()),
         AstStmt::LocalFunctionDecl(function_decl) => function_decl.origin.is_debug_hinted(),
+        _ => false,
+    }
+}
+
+fn stmt_declares_hir_preserved_binding(stmt: &AstStmt) -> bool {
+    match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl
+            .bindings
+            .iter()
+            .any(|binding| binding.rewrite_authority.must_preserve()),
+        AstStmt::LocalFunctionDecl(function_decl) => {
+            function_decl.rewrite_authority.must_preserve()
+        }
         _ => false,
     }
 }
@@ -967,13 +1003,17 @@ mod tests {
         AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstLValue, AstLocalBinding,
         AstLocalFunctionDecl, AstLogicalExpr, AstNamePath, AstNameRef, AstRepeat, AstReturn,
     };
-    use crate::hir::{HirProtoRef, LocalId, ParamId, TempId};
+    use crate::hir::{
+        HirExpr, HirPackTail, HirProtoRef, HirValuePack, LocalId, ParamId, TempId,
+        initializer_root_profile,
+    };
 
     fn recovered_binding() -> AstLocalBinding {
         AstLocalBinding {
             id: AstBindingRef::Local(LocalId(0)),
             attr: AstLocalAttr::None,
             origin: AstLocalOrigin::Recovered,
+            rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
         }
     }
 
@@ -983,7 +1023,7 @@ mod tests {
                 text: "factory".to_owned(),
             })),
             args: vec![],
-            method_name: None,
+            method_key: None,
         }))
     }
 
@@ -1008,10 +1048,13 @@ mod tests {
         let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],
             values: vec![call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         let overwrite = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9), call_value()],
+            initializer_merge_transaction: None,
         }));
 
         let (call, rewritten) = split_overwritten_call_result(&declaration, &overwrite, target)
@@ -1023,6 +1066,7 @@ mod tests {
         let missing_target = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![],
             values: vec![AstExpr::Integer(9)],
+            initializer_merge_transaction: None,
         }));
         assert!(split_overwritten_call_result(&declaration, &missing_target, target).is_none());
         let extra_target = AstStmt::Assign(Box::new(AstAssign {
@@ -1033,12 +1077,15 @@ mod tests {
                 })),
             ],
             values: vec![AstExpr::Integer(9), AstExpr::Integer(10)],
+            initializer_merge_transaction: None,
         }));
         assert!(split_overwritten_call_result(&declaration, &extra_target, target).is_none());
 
         let multiple_initializers = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],
             values: vec![call_value(), call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         assert!(
             split_overwritten_call_result(&multiple_initializers, &overwrite, target).is_none()
@@ -1047,6 +1094,8 @@ mod tests {
         let one_call_with_primitive_sibling = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding],
             values: vec![AstExpr::Integer(0), call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         assert!(
             split_overwritten_call_result(&one_call_with_primitive_sibling, &overwrite, target)
@@ -1062,10 +1111,13 @@ mod tests {
         let debug_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![debug_binding.clone()],
             values: vec![call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         let debug_write = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(debug_binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9)],
+            initializer_merge_transaction: None,
         }));
         assert!(split_overwritten_call_result(&debug_decl, &debug_write, target).is_none());
 
@@ -1073,15 +1125,18 @@ mod tests {
         let self_call = AstExpr::Call(Box::new(AstCallExpr {
             callee: AstExpr::Var(binding.id.to_name_ref()),
             args: vec![],
-            method_name: None,
+            method_key: None,
         }));
         let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],
             values: vec![self_call],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         let overwrite = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9)],
+            initializer_merge_transaction: None,
         }));
         let (call, _) = split_overwritten_call_result(&declaration, &overwrite, target)
             .expect("the call stays before the local lexical scope in both shapes");
@@ -1093,10 +1148,13 @@ mod tests {
         let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],
             values: vec![call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         let later_rhs_read = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
             values: vec![AstExpr::Integer(9), AstExpr::Var(binding.id.to_name_ref())],
+            initializer_merge_transaction: None,
         }));
         assert!(split_overwritten_call_result(&declaration, &later_rhs_read, target).is_none());
 
@@ -1105,10 +1163,13 @@ mod tests {
         let physical_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![physical_binding.clone()],
             values: vec![call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         let copy_overwrite = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(physical_binding.id.to_name_ref())],
             values: vec![AstExpr::Var(AstNameRef::Param(ParamId(0)))],
+            initializer_merge_transaction: None,
         }));
         let (_, rewritten) = split_overwritten_call_result(&physical_decl, &copy_overwrite, target)
             .expect("an eventless parameter copy cannot observe early root release");
@@ -1120,6 +1181,7 @@ mod tests {
         let eventful_overwrite = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(physical_binding.id.to_name_ref())],
             values: vec![call_value()],
+            initializer_merge_transaction: None,
         }));
         assert!(
             split_overwritten_call_result(&physical_decl, &eventful_overwrite, target).is_none()
@@ -1129,10 +1191,17 @@ mod tests {
             id: AstBindingRef::Local(LocalId(1)),
             attr: AstLocalAttr::None,
             origin: AstLocalOrigin::Recovered,
+            rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
         };
         let primitive_physical_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![physical_binding.clone(), recovered_second.clone()],
             values: vec![AstExpr::Integer(0), call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: Some(initializer_root_profile(
+                target.version,
+                &HirValuePack::fixed(vec![HirExpr::Integer(0), HirExpr::LocalRef(LocalId(1))]),
+                2,
+            )),
         }));
         let eventful_full_overwrite = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![
@@ -1140,6 +1209,7 @@ mod tests {
                 AstLValue::Name(recovered_second.id.to_name_ref()),
             ],
             values: vec![call_value()],
+            initializer_merge_transaction: None,
         }));
         assert!(
             split_overwritten_call_result(
@@ -1155,6 +1225,12 @@ mod tests {
         let expanded_tail_physical_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![recovered_binding(), physical_second.clone()],
             values: vec![call_value()],
+            initializer_merge_transaction: None,
+            initializer_root_profile: Some(initializer_root_profile(
+                target.version,
+                &HirValuePack::expanding(Vec::new(), HirPackTail::open(HirExpr::VarArg)),
+                2,
+            )),
         }));
         assert!(
             split_overwritten_call_result(
@@ -1168,6 +1244,12 @@ mod tests {
         let scalar_tail_physical_decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![recovered_binding(), physical_second],
             values: vec![AstExpr::SingleValue(Box::new(call_value()))],
+            initializer_merge_transaction: None,
+            initializer_root_profile: Some(initializer_root_profile(
+                target.version,
+                &HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+                2,
+            )),
         }));
         assert!(
             split_overwritten_call_result(
@@ -1187,11 +1269,14 @@ mod tests {
                 AstStmt::LocalDecl(Box::new(AstLocalDecl {
                     bindings: vec![binding.clone()],
                     values: vec![],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::DoBlock(Box::new(AstBlock {
                     stmts: vec![AstStmt::Assign(Box::new(AstAssign {
                         targets: vec![AstLValue::Name(binding.id.to_name_ref())],
                         values: vec![function_value()],
+                        initializer_merge_transaction: None,
                     }))],
                 })),
                 AstStmt::Return(Box::new(AstReturn {
@@ -1217,12 +1302,15 @@ mod tests {
             id: AstBindingRef::Local(LocalId(1)),
             attr: AstLocalAttr::Close,
             origin: AstLocalOrigin::Recovered,
+            rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
         };
         let mut block = AstBlock {
             stmts: vec![
                 AstStmt::LocalDecl(Box::new(AstLocalDecl {
                     bindings: vec![binding.clone()],
                     values: vec![],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::DoBlock(Box::new(AstBlock {
                     stmts: vec![
@@ -1231,10 +1319,13 @@ mod tests {
                             values: vec![AstExpr::Var(AstNameRef::Global(AstGlobalName {
                                 text: "resource".to_owned(),
                             }))],
+                            initializer_merge_transaction: None,
+                            initializer_root_profile: None,
                         })),
                         AstStmt::Assign(Box::new(AstAssign {
                             targets: vec![AstLValue::Name(binding.id.to_name_ref())],
                             values: vec![AstExpr::Integer(1)],
+                            initializer_merge_transaction: None,
                         })),
                     ],
                 })),
@@ -1284,6 +1375,7 @@ mod tests {
                     stmts: vec![AstStmt::Assign(Box::new(AstAssign {
                         targets: vec![AstLValue::Name(AstNameRef::Global(name.clone()))],
                         values: vec![AstExpr::Integer(1)],
+                        initializer_merge_transaction: None,
                     }))],
                 },
                 captured_bindings: BTreeSet::new(),
@@ -1346,6 +1438,7 @@ mod tests {
                             }))],
                         },
                         cond: nested_write(&marker),
+                        lifetime: Default::default(),
                     })),
                 ],
             },
@@ -1395,6 +1488,8 @@ mod tests {
         let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![debug_binding.clone()],
             values: vec![AstExpr::Integer(1)],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }));
         let return_stmt = AstStmt::Return(Box::new(AstReturn { values: vec![] }));
 
@@ -1417,6 +1512,7 @@ mod tests {
         let local_function = AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
             name: debug_binding.id,
             origin: AstLocalOrigin::DebugHinted,
+            rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             func: function,
         }));
         let returning_function = AstBlock {
@@ -1444,10 +1540,13 @@ mod tests {
                 AstStmt::LocalDecl(Box::new(AstLocalDecl {
                     bindings: vec![binding.clone()],
                     values: vec![],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::Name(binding.id.to_name_ref())],
                     values: vec![function_value()],
+                    initializer_merge_transaction: None,
                 })),
             ],
         };
@@ -1458,6 +1557,7 @@ mod tests {
             stmts: vec![AstStmt::Assign(Box::new(AstAssign {
                 targets: vec![AstLValue::Name(hoisted_temp.to_name_ref())],
                 values: vec![AstExpr::SingleValue(Box::new(function_value()))],
+                initializer_merge_transaction: None,
             }))],
         };
         assert!(!trailing_do_block_is_scope_neutral(&hoisted_closure, true));
@@ -1480,6 +1580,8 @@ mod tests {
                 AstStmt::LocalDecl(Box::new(AstLocalDecl {
                     bindings: vec![binding.clone()],
                     values: vec![],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
                     target: AstFunctionName::Plain(AstNamePath {
@@ -1503,6 +1605,7 @@ mod tests {
             stmts: vec![AstStmt::Assign(Box::new(AstAssign {
                 targets: vec![AstLValue::Name(outer_binding.to_name_ref())],
                 values: vec![function_value()],
+                initializer_merge_transaction: None,
             }))],
         };
         assert!(trailing_do_block_is_scope_neutral(&outer_assignment, true));

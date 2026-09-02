@@ -120,6 +120,13 @@ pub(super) fn collapse_adjacent_self_call_updates(
             index += 1;
             continue;
         }
+        if !binding.rewrite_authority.may_remove_binding() {
+            // 候选拒绝[LayerBoundary]：self-call update run 会折叠 binding 的中间 value
+            // epoch；HIR 已保留的 binding 不由 AST 重审。
+            stmt_plan.push(PlannedStmt::Original(index));
+            index += 1;
+            continue;
+        }
         if use_index.count_uses_in_range(index, index + 1, binding.id) != 0 {
             // 候选拒绝[SemanticBarrier:Scope]：initializer 自引用时 `local x = x()` 的 `x` 解析到外层；折叠后续更新会改变该绑定。
             stmt_plan.push(PlannedStmt::Original(index));
@@ -763,7 +770,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             }
             let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end]);
             if !matches!(current_sink, AstStmt::While(_) | AstStmt::Repeat(_))
-                && !mechanical_value_cannot_root_collectable(value, target)
+                && candidate.initializer_may_affect_collectable_lifetime()
                 && !mechanical_sink_preserves_root_lifetime(
                     current_sink,
                     candidate.binding(),
@@ -934,7 +941,7 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
                 continue;
             }
             let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end - 1]);
-            if !super::super::expr_analysis::result_cannot_root_collectable(value)
+            if candidate.initializer_may_affect_collectable_lifetime()
                 && (!terminal_local_hands_off_root(current_sink, candidate.binding())
                     || write_index.has_write_after(run_end - 1, sink_candidate.binding()))
             {
@@ -1019,12 +1026,6 @@ fn mechanical_sink_preserves_root_lifetime(
             && call_stmt_hands_off_root(stmt, binding))
 }
 
-fn mechanical_value_cannot_root_collectable(value: &AstExpr, target: AstTargetDialect) -> bool {
-    super::super::expr_analysis::result_cannot_root_collectable(value)
-        || (matches!(value, AstExpr::Unary(_) | AstExpr::Binary(_))
-            && super::super::expr_analysis::is_discard_safe_expr_for_target(value, target))
-}
-
 fn proven_method_call_consumes_callee(stmt: &AstStmt, binding: AstBindingRef) -> bool {
     matches!(
         stmt,
@@ -1032,7 +1033,7 @@ fn proven_method_call_consumes_callee(stmt: &AstStmt, binding: AstBindingRef) ->
             if matches!(
                 &call_stmt.call,
                 AstCallKind::Call(call)
-                    if call.method_name.is_some()
+                    if call.method_key.is_some()
                         && matches!(&call.callee, AstExpr::Var(name) if binding.matches_name_ref(name))
             )
     )
@@ -1183,12 +1184,16 @@ pub(super) fn add_next_kept_stmt_uses(
 mod tests {
     use std::collections::BTreeSet;
 
+    use crate::LuaString;
     use crate::ast::common::{
-        AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallStmt, AstFunctionExpr, AstLocalBinding,
-        AstLocalDecl, AstLocalOrigin, AstReturn, AstTableConstructor, AstTableField,
+        AstCallExpr, AstCallStmt, AstFunctionExpr, AstLocalBinding, AstLocalDecl, AstLocalOrigin,
+        AstReturn, AstTableConstructor, AstTableField,
     };
     use crate::decompile::DecompileDialect;
-    use crate::hir::{HirProtoRef, LocalId, ParamId};
+    use crate::hir::{
+        HirBinaryExpr, HirBinaryOpKind, HirExpr, HirProtoRef, HirUnaryExpr, HirUnaryOpKind,
+        HirValuePack, LocalId, ParamId, initializer_root_profile,
+    };
 
     use super::*;
 
@@ -1198,8 +1203,11 @@ mod tests {
                 id: binding,
                 attr: AstLocalAttr::None,
                 origin: AstLocalOrigin::Recovered,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: vec![value],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }))
     }
 
@@ -1208,7 +1216,7 @@ mod tests {
             call: AstCallKind::Call(Box::new(AstCallExpr {
                 callee,
                 args: vec![arg],
-                method_name: None,
+                method_key: None,
             })),
         }))
     }
@@ -1217,7 +1225,7 @@ mod tests {
         AstExpr::Call(Box::new(AstCallExpr {
             callee,
             args: Vec::new(),
-            method_name: None,
+            method_key: None,
         }))
     }
 
@@ -1366,19 +1374,49 @@ mod tests {
     }
 
     #[test]
-    fn mechanical_scalar_result_uses_target_integer_semantics() {
-        let value = AstExpr::Binary(Box::new(AstBinaryExpr {
-            op: AstBinaryOpKind::Add,
-            lhs: AstExpr::Integer(1),
-            rhs: AstExpr::Integer(2),
-        }));
-        assert!(mechanical_value_cannot_root_collectable(
-            &value,
-            AstTargetDialect::new(DecompileDialect::Lua54)
+    fn mechanical_root_gate_uses_the_hir_initializer_profile() {
+        let binding = AstBindingRef::Local(LocalId(0));
+        let mut proven = recovered_local(binding, AstExpr::Integer(3));
+        let AstStmt::LocalDecl(local_decl) = &mut proven else {
+            unreachable!("recovered_local must produce a local declaration");
+        };
+        local_decl.initializer_root_profile = Some(initializer_root_profile(
+            DecompileDialect::Lua54,
+            &HirValuePack::fixed(vec![HirExpr::Integer(3)]),
+            1,
         ));
-        assert!(!mechanical_value_cannot_root_collectable(
-            &value,
-            AstTargetDialect::new(DecompileDialect::Auto)
-        ));
+        let (candidate, _) =
+            inline_candidate(&proven).expect("single local is an inline candidate");
+        assert!(!candidate.initializer_may_affect_collectable_lifetime());
+
+        let unknown = recovered_local(binding, AstExpr::Integer(3));
+        let (candidate, _) =
+            inline_candidate(&unknown).expect("single local is an inline candidate");
+        assert!(candidate.initializer_may_affect_collectable_lifetime());
+
+        for value in [
+            HirExpr::Binary(Box::new(HirBinaryExpr {
+                op: HirBinaryOpKind::Concat,
+                lhs: HirExpr::String(LuaString::from("left")),
+                rhs: HirExpr::String(LuaString::from("right")),
+            })),
+            HirExpr::Unary(Box::new(HirUnaryExpr {
+                op: HirUnaryOpKind::BitNot,
+                expr: HirExpr::Number(1.5),
+            })),
+        ] {
+            let mut guarded = recovered_local(binding, AstExpr::Integer(3));
+            let AstStmt::LocalDecl(local_decl) = &mut guarded else {
+                unreachable!("recovered_local must produce a local declaration");
+            };
+            local_decl.initializer_root_profile = Some(initializer_root_profile(
+                DecompileDialect::Lua54,
+                &HirValuePack::fixed(vec![value]),
+                1,
+            ));
+            let (candidate, _) =
+                inline_candidate(&guarded).expect("single local is an inline candidate");
+            assert!(candidate.initializer_may_affect_collectable_lifetime());
+        }
     }
 }

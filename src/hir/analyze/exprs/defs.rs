@@ -295,7 +295,7 @@ fn expr_for_fixed_call(
         return None;
     }
 
-    let method_name = lower_method_name(lowering, call.method_name);
+    let method_key = lower_method_key(lowering, call.method_name);
     let callee = expr_for_reg_use_single_eval_with_call_policy(
         lowering,
         block,
@@ -312,7 +312,7 @@ fn expr_for_fixed_call(
             CallKind::FastCall(args) => Some(args),
             CallKind::Normal | CallKind::Method => None,
         },
-        method_name,
+        method_key,
     })))
 }
 

@@ -285,13 +285,11 @@ mod tests {
 
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
-            callee: HirExpr::GlobalRef(HirGlobalRef {
-                name: name.to_owned(),
-            }),
+            callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }))
     }
 

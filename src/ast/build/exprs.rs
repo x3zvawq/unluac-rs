@@ -6,13 +6,15 @@
 //! 说明 HIR 物化尚未完成并直接报错。
 //! closure lowering 同时是 `capture_names_by_upvalue` 的唯一 producer：它按 HIR capture
 //! 顺序保留 child UpvalueId 到父级 Param/Local/Temp/Upvalue 名字的对应，供后续精确分析。
+//! 表构造器的 record key 同样只从 HIR 语义表达式降低：合法 UTF-8 identifier 在本层按
+//! 目标方言写成命名字段，其余键保持显式索引表达式，HIR 不承载这项源码语法选择。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::{
     HirAssign, HirBinaryOpKind, HirCallExpr, HirCaptureMode, HirClosureExpr, HirExpr, HirLValue,
-    HirLocalDecl, HirTableAccess, HirTableField, HirTableKey, HirUnaryOpKind, HirValuePack,
-    UpvalueId,
+    HirLocalDecl, HirTableAccess, HirTableField, HirUnaryOpKind, HirValuePack, UpvalueId,
+    initializer_root_profile,
 };
 
 use super::{AstLowerError, AstLowerer};
@@ -83,11 +85,12 @@ impl<'a> AstLowerer<'a> {
         let body = self.lower_proto_body(closure.proto.index())?;
         let named_vararg =
             if child.signature.has_vararg_param_reg && !child.signature.legacy_arg_slot {
-                let local = child.locals.first().copied().ok_or(
-                    AstLowerError::MissingNamedVarargBinding {
-                        proto: closure.proto.index(),
-                    },
-                )?;
+                let local =
+                    child
+                        .vararg_param_local
+                        .ok_or(AstLowerError::MissingNamedVarargBinding {
+                            proto: closure.proto.index(),
+                        })?;
                 (super::analysis::count_local_uses_in_block(&child.body, local) != 0)
                     .then_some(crate::ast::common::AstBindingRef::Local(local))
             } else {
@@ -98,7 +101,7 @@ impl<'a> AstLowerer<'a> {
         let mut capture_names_by_upvalue = BTreeMap::new();
         let mut capture_write_names = BTreeSet::new();
         for (capture_index, capture) in closure.captures.iter().enumerate() {
-            if let Some(name) = capture_name_from_hir_expr(&capture.value) {
+            if let Some(name) = self.capture_name_from_hir_expr(owner_proto, &capture.value)? {
                 capture_names_by_upvalue.insert(UpvalueId(capture_index), name);
             }
             match &capture.value {
@@ -113,7 +116,7 @@ impl<'a> AstLowerer<'a> {
             }
             if capture.mode == HirCaptureMode::ByReference
                 && child.mutable_upvalues.contains(&UpvalueId(capture_index))
-                && let Some(name) = capture_name_from_hir_expr(&capture.value)
+                && let Some(name) = self.capture_name_from_hir_expr(owner_proto, &capture.value)?
             {
                 capture_write_names.insert(name);
             }
@@ -136,7 +139,11 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         local_decl: &HirLocalDecl,
     ) -> Result<AstLocalDecl, AstLowerError> {
-        let _ = proto_index;
+        let initializer_root_profile = initializer_root_profile(
+            self.target.version,
+            &local_decl.values,
+            local_decl.bindings.len(),
+        );
         Ok(AstLocalDecl {
             bindings: local_decl
                 .bindings
@@ -151,6 +158,8 @@ impl<'a> AstLowerer<'a> {
                 &local_decl.values,
                 PackLoweringContext::TargetCounted(local_decl.bindings.len()),
             )?,
+            initializer_merge_transaction: local_decl.initializer_merge_transaction,
+            initializer_root_profile: Some(initializer_root_profile),
         })
     }
 
@@ -170,6 +179,7 @@ impl<'a> AstLowerer<'a> {
                 &assign.values,
                 PackLoweringContext::TargetCounted(assign.targets.len()),
             )?,
+            initializer_merge_transaction: assign.initializer_merge_transaction,
         })
     }
 
@@ -182,10 +192,12 @@ impl<'a> AstLowerer<'a> {
             HirLValue::Param(param) => AstLValue::Name(AstNameRef::Param(*param)),
             HirLValue::Temp(temp) => AstLValue::Name(AstNameRef::Temp(*temp)),
             HirLValue::Local(local) => AstLValue::Name(AstNameRef::Local(*local)),
-            HirLValue::Upvalue(upvalue) => AstLValue::Name(AstNameRef::Upvalue(*upvalue)),
-            HirLValue::Global(global) => AstLValue::Name(AstNameRef::Global(AstGlobalName {
-                text: global.name.clone(),
-            })),
+            HirLValue::Upvalue(upvalue) => {
+                AstLValue::Name(self.lower_upvalue_name(proto_index, *upvalue)?)
+            }
+            HirLValue::Global(global) => {
+                lower_global_lvalue(proto_index, &global.key, self.target.version)?
+            }
             HirLValue::TableAccess(access) => lower_access_expr(
                 proto_index,
                 access,
@@ -216,11 +228,13 @@ impl<'a> AstLowerer<'a> {
             HirExpr::Vector(vector) => AstExpr::Vector(*vector),
             HirExpr::ParamRef(param) => AstExpr::Var(AstNameRef::Param(*param)),
             HirExpr::LocalRef(local) => AstExpr::Var(AstNameRef::Local(*local)),
-            HirExpr::UpvalueRef(upvalue) => AstExpr::Var(AstNameRef::Upvalue(*upvalue)),
+            HirExpr::UpvalueRef(upvalue) => {
+                AstExpr::Var(self.lower_upvalue_name(proto_index, *upvalue)?)
+            }
             HirExpr::TempRef(temp) => AstExpr::Var(AstNameRef::Temp(*temp)),
-            HirExpr::GlobalRef(global) => AstExpr::Var(AstNameRef::Global(AstGlobalName {
-                text: global.name.clone(),
-            })),
+            HirExpr::GlobalRef(global) => {
+                lower_global_expr(proto_index, &global.key, self.target.version)?
+            }
             HirExpr::TableAccess(access) => lower_access_expr(
                 proto_index,
                 access,
@@ -273,11 +287,12 @@ impl<'a> AstLowerer<'a> {
                         }
                         HirTableField::Record(record) => {
                             Ok(AstTableField::Record(crate::ast::common::AstRecordField {
-                                key: match &record.key {
-                                    HirTableKey::Name(name) => AstTableKey::Name(name.clone()),
-                                    HirTableKey::Expr(expr) => {
-                                        AstTableKey::Expr(self.lower_expr(proto_index, expr)?)
-                                    }
+                                key: if let Some(name) =
+                                    field_name_from_key(&record.key, self.target.version)
+                                {
+                                    AstTableKey::Name(name)
+                                } else {
+                                    AstTableKey::Expr(self.lower_expr(proto_index, &record.key)?)
                                 },
                                 value: self.lower_expr(proto_index, &record.value)?,
                             }))
@@ -357,7 +372,9 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         call: &HirCallExpr,
     ) -> Result<AstCallKind, AstLowerError> {
-        let method_name = call.method_receiver().map(|(_, method_name)| method_name);
+        let method_name = call
+            .method_receiver()
+            .and_then(|(_, method_key)| identifier_from_lua_key(method_key, self.target.version));
         let mut args =
             self.lower_value_pack(proto_index, &call.args, PackLoweringContext::Ordinary)?;
 
@@ -371,7 +388,7 @@ impl<'a> AstLowerer<'a> {
             let receiver = args.remove(0);
             return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
                 receiver,
-                method: method_name.to_owned(),
+                method: method_name,
                 args,
             })));
         }
@@ -379,6 +396,7 @@ impl<'a> AstLowerer<'a> {
         let callee = self.lower_expr(proto_index, &call.callee)?;
 
         if call.method
+            && call.method_key.is_none()
             && let AstExpr::FieldAccess(access) = callee
         {
             if args.is_empty() {
@@ -398,8 +416,41 @@ impl<'a> AstLowerer<'a> {
         Ok(AstCallKind::Call(Box::new(AstCallExpr {
             callee,
             args,
-            method_name: call.method.then(|| call.method_name.clone()).flatten(),
+            method_key: call.method_key.clone(),
         })))
+    }
+
+    fn lower_upvalue_name(
+        &self,
+        proto_index: usize,
+        upvalue: UpvalueId,
+    ) -> Result<AstNameRef, AstLowerError> {
+        let proto = &self.module.protos[proto_index];
+        if !proto.environment_upvalues.contains(&upvalue) {
+            return Ok(AstNameRef::Upvalue(upvalue));
+        }
+        if !dialect_has_lexical_environment(self.target.version) {
+            return Err(AstLowerError::UnsupportedFeature {
+                dialect: self.target.version,
+                feature: "lexical environment",
+                context: "HIR environment upvalue",
+            });
+        }
+        Ok(AstNameRef::Environment)
+    }
+
+    fn capture_name_from_hir_expr(
+        &self,
+        owner_proto: usize,
+        expr: &HirExpr,
+    ) -> Result<Option<AstNameRef>, AstLowerError> {
+        Ok(match expr {
+            HirExpr::ParamRef(param) => Some(AstNameRef::Param(*param)),
+            HirExpr::LocalRef(local) => Some(AstNameRef::Local(*local)),
+            HirExpr::TempRef(temp) => Some(AstNameRef::Temp(*temp)),
+            HirExpr::UpvalueRef(upvalue) => Some(self.lower_upvalue_name(owner_proto, *upvalue)?),
+            _ => None,
+        })
     }
 }
 
@@ -443,16 +494,6 @@ fn capture_binding_from_hir_expr(expr: &HirExpr) -> Option<crate::ast::common::A
     match expr {
         HirExpr::LocalRef(local) => Some(crate::ast::common::AstBindingRef::Local(*local)),
         HirExpr::TempRef(temp) => Some(crate::ast::common::AstBindingRef::Temp(*temp)),
-        _ => None,
-    }
-}
-
-fn capture_name_from_hir_expr(expr: &HirExpr) -> Option<AstNameRef> {
-    match expr {
-        HirExpr::ParamRef(param) => Some(AstNameRef::Param(*param)),
-        HirExpr::LocalRef(local) => Some(AstNameRef::Local(*local)),
-        HirExpr::TempRef(temp) => Some(AstNameRef::Temp(*temp)),
-        HirExpr::UpvalueRef(upvalue) => Some(AstNameRef::Upvalue(*upvalue)),
         _ => None,
     }
 }
@@ -513,10 +554,73 @@ fn lower_binary_op(op: HirBinaryOpKind) -> AstBinaryOpKind {
 
 fn field_name_from_key(key: &HirExpr, dialect: DecompileDialect) -> Option<String> {
     match key {
-        HirExpr::String(name) => {
-            let name = name.as_utf8()?;
-            is_lua_identifier_name(name, dialect).then(|| name.to_owned())
-        }
+        HirExpr::String(key) => identifier_from_lua_key(key, dialect),
         _ => None,
+    }
+}
+
+fn identifier_from_lua_key(key: &crate::LuaString, dialect: DecompileDialect) -> Option<String> {
+    let name = key.as_utf8()?;
+    is_lua_identifier_name(name, dialect).then(|| name.to_owned())
+}
+
+fn lower_global_expr(
+    proto_index: usize,
+    key: &crate::LuaString,
+    dialect: DecompileDialect,
+) -> Result<AstExpr, AstLowerError> {
+    if let Some(text) = identifier_from_lua_key(key, dialect)
+        && !(dialect_has_lexical_environment(dialect) && text == "_ENV")
+    {
+        return Ok(AstExpr::Var(AstNameRef::Global(AstGlobalName { text })));
+    }
+    if dialect_has_lexical_environment(dialect) {
+        return Ok(AstExpr::IndexAccess(Box::new(environment_index(key))));
+    }
+    Err(invalid_global_name(proto_index, key, dialect))
+}
+
+fn lower_global_lvalue(
+    proto_index: usize,
+    key: &crate::LuaString,
+    dialect: DecompileDialect,
+) -> Result<AstLValue, AstLowerError> {
+    if let Some(text) = identifier_from_lua_key(key, dialect)
+        && !(dialect_has_lexical_environment(dialect) && text == "_ENV")
+    {
+        return Ok(AstLValue::Name(AstNameRef::Global(AstGlobalName { text })));
+    }
+    if dialect_has_lexical_environment(dialect) {
+        return Ok(AstLValue::IndexAccess(Box::new(environment_index(key))));
+    }
+    Err(invalid_global_name(proto_index, key, dialect))
+}
+
+fn environment_index(key: &crate::LuaString) -> AstIndexAccess {
+    AstIndexAccess {
+        base: AstExpr::Var(AstNameRef::Environment),
+        index: AstExpr::String(key.clone()),
+    }
+}
+
+const fn dialect_has_lexical_environment(dialect: DecompileDialect) -> bool {
+    matches!(
+        dialect,
+        DecompileDialect::Lua52
+            | DecompileDialect::Lua53
+            | DecompileDialect::Lua54
+            | DecompileDialect::Lua55
+    )
+}
+
+fn invalid_global_name(
+    proto_index: usize,
+    key: &crate::LuaString,
+    dialect: DecompileDialect,
+) -> AstLowerError {
+    AstLowerError::InvalidGlobalName {
+        proto: proto_index,
+        dialect,
+        key: key.debug_literal(),
     }
 }

@@ -4,7 +4,9 @@
 //! merge + 可见 global 集维护，不会在这里重写普通表达式 sugar。
 //! 例如：块前缀上一串 seed local + `global` run 会在这里先合并；Lua 5.5 的 missing
 //! global 声明只会在“当前作用域已经有显式 global 证据”时才从观测推断，并放回原 gate
-//! 的激活点；默认 `global *` 与 stripped bytecode 下的纯声明形式并不总是可区分。
+//! 的激活点；默认 `global *` 与 stripped bytecode 下的纯声明形式并不总是可区分。repeat
+//! body 与 until condition 的 missing observation 分开结算，因为 suffix 内的新 `do` gate
+//! 不会扩展到条件。
 
 use super::super::ReadabilityContext;
 use super::super::walk::{BlockKind, ScopedAstRewritePass, rewrite_module_scoped};
@@ -45,9 +47,10 @@ impl ScopedAstRewritePass for GlobalDeclPrettyPass {
         &mut self,
         block: &mut AstBlock,
         condition: &crate::ast::common::AstExpr,
+        lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
         outer_declared: &Self::Scope,
     ) -> (bool, Self::Scope) {
-        self.enter_scoped_block(block, outer_declared, Some(condition))
+        self.enter_scoped_block(block, outer_declared, Some((condition, lifetime)))
     }
 
     fn scope_for_stmt_children(
@@ -76,7 +79,10 @@ impl GlobalDeclPrettyPass {
         &mut self,
         block: &mut AstBlock,
         outer_declared: &VisibleGlobals,
-        trailing_expr: Option<&crate::ast::common::AstExpr>,
+        trailing: Option<(
+            &crate::ast::common::AstExpr,
+            &crate::hir::HirRepeatConditionLifetimeFacts,
+        )>,
     ) -> (bool, VisibleGlobals) {
         // AST build 只负责把字节码里显式存在的 `global ... = ...` 降回合法语法；
         // 这里仅合并 seed run，并在“当前作用域已经有显式 global 证据”的情况下再补
@@ -84,20 +90,28 @@ impl GlobalDeclPrettyPass {
         // repeat condition 与 body 共用事实；collective owner 会按 condition 实际引用的
         // body local 精确判断 suffix 能否包进 do，而不是停用整个 repeat 候选集。
         let mut changed = merge_seed_global_runs(block);
-        let facts = trailing_expr.map_or_else(
+        let facts = trailing.map_or_else(
             || BlockFacts::collect(block),
-            |condition| BlockFacts::collect_repeat(block, condition),
+            |(condition, _)| BlockFacts::collect_repeat(block, condition),
         );
         let mut missing = if facts.has_explicit_globals() || outer_declared.has_explicit_gate() {
             facts.infer_missing(outer_declared)
         } else {
             MissingGlobals::default()
         };
-        if !missing.is_empty()
+        let body_missing = facts.infer_body_missing(outer_declared);
+        if !body_missing.is_empty()
             && !facts.has_explicit_globals()
-            && try_wrap_missing_collective_suffix(block, &missing, trailing_expr)
+            && try_wrap_missing_collective_suffix(
+                block,
+                &body_missing,
+                trailing.map(|(condition, _)| condition),
+                trailing.map(|(_, lifetime)| lifetime),
+            )
         {
-            missing = MissingGlobals::default();
+            // 新 gate 位于 suffix 的 `do` 内，只覆盖 body 观测。until 条件仍在该 `do`
+            // 外，必须把它自己的 missing 保留下来交给逐名声明 owner。
+            missing = facts.infer_trailing_missing(outer_declared);
             changed = true;
         }
         if !missing.is_empty() {

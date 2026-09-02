@@ -18,10 +18,11 @@ mod refs;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstNameRef, AstStmt,
-    AstTableField, AstTableKey,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
+    AstNameRef, AstStmt, AstTableField, AstTableKey,
 };
 use super::binding_ref::binding_from_name_ref;
+use super::visit::{self, AstVisitor};
 
 pub(super) use refs::{
     BindingRefSet, block_references_binding_set, expr_references_any_binding,
@@ -44,6 +45,76 @@ pub(super) fn mutable_snapshot_names_in_block(block: &AstBlock) -> MutableSnapsh
     let mut collector = CaptureWriteCollector::default();
     super::visit::visit_block(block, &mut collector);
     collector.0
+}
+
+/// 判断当前函数的语句后缀是否直接写入该 binding。
+///
+/// 查询递归当前函数的结构化 block，但不进入 child function body；closure 的潜在
+/// capture write 不是创建 closure 时发生的直接写入，必须由候选单独消费 capture metadata。
+pub(super) fn binding_is_directly_written_in_suffix(
+    stmts: &[AstStmt],
+    start: usize,
+    binding: AstBindingRef,
+) -> bool {
+    name_is_directly_written_in_suffix(stmts, start, &binding.to_name_ref())
+}
+
+pub(super) fn name_is_directly_written_in_suffix(
+    stmts: &[AstStmt],
+    start: usize,
+    name: &AstNameRef,
+) -> bool {
+    stmts.get(start..).is_some_and(|suffix| {
+        suffix.iter().any(|stmt| {
+            let mut finder = NameWriteFinder {
+                name: name.clone(),
+                found: false,
+            };
+            visit::visit_stmt(stmt, &mut finder);
+            finder.found
+        })
+    })
+}
+
+struct NameWriteFinder {
+    name: AstNameRef,
+    found: bool,
+}
+
+impl AstVisitor for NameWriteFinder {
+    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
+        // Local and synthetic-local ids are function-local. A child function can only
+        // write the outer binding through explicit capture metadata, not through a
+        // same-numbered direct lvalue in its own body.
+        false
+    }
+
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        match stmt {
+            AstStmt::FunctionDecl(function_decl) => {
+                let AstFunctionName::Plain(path) = &function_decl.target else {
+                    return;
+                };
+                if path.fields.is_empty() && path.root == self.name {
+                    self.found = true;
+                }
+            }
+            AstStmt::LocalFunctionDecl(function_decl)
+                if function_decl.name.to_name_ref() == self.name =>
+            {
+                self.found = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &AstLValue) {
+        if let AstLValue::Name(name) = lvalue
+            && name == &self.name
+        {
+            self.found = true;
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]

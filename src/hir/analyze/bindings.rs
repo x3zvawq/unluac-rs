@@ -132,7 +132,7 @@ pub(super) fn build_bindings(
         })
         .collect::<Vec<_>>();
 
-    if proto.signature.has_vararg_param_reg {
+    let vararg_param_local = if proto.signature.has_vararg_param_reg {
         let reg = crate::transformer::Reg(usize::from(proto.signature.num_params));
         let local = LocalId(locals.len());
         locals.push(local);
@@ -140,7 +140,10 @@ pub(super) fn build_bindings(
         if entry_reg_is_observed(dataflow, structure.plan(), reg) {
             entry_local_regs.insert(reg, local);
         }
-    }
+        Some(local)
+    } else {
+        None
+    };
 
     let (debug_entry_local_decls, debug_scope_locals) = allocate_debug_entry_locals(
         proto,
@@ -445,6 +448,7 @@ pub(super) fn build_bindings(
         params,
         param_debug_hints,
         locals,
+        vararg_param_local,
         local_debug_hints,
         local_debug_scopes,
         upvalues,

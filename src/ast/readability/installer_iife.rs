@@ -33,7 +33,8 @@ use std::rc::Rc;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstCallStmt, AstExpr,
     AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding,
-    AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
+    AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstRewriteAuthority, AstStmt,
+    AstSyntheticLocalId,
 };
 use crate::hir::TempId;
 
@@ -139,14 +140,17 @@ fn rewrite_installer_iife_stmt(stmt: &AstStmt, next_synthetic_local: usize) -> O
                 id: AstBindingRef::SyntheticLocal(binding_id),
                 attr: AstLocalAttr::None,
                 origin: AstLocalOrigin::Recovered,
+                rewrite_authority: AstRewriteAuthority::AstOwned,
             }],
             values: vec![AstExpr::FunctionExpr(function.clone())],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         })),
         AstStmt::CallStmt(Box::new(AstCallStmt {
             call: AstCallKind::Call(Box::new(AstCallExpr {
                 callee: AstExpr::Var(AstNameRef::SyntheticLocal(binding_id)),
                 args: call.args.clone(),
-                method_name: None,
+                method_key: None,
             })),
         })),
     ];
@@ -399,6 +403,7 @@ fn expr_looks_like_exported_function_value(
         }
         AstExpr::Var(AstNameRef::Temp(_))
         | AstExpr::Var(AstNameRef::Upvalue(_))
+        | AstExpr::Var(AstNameRef::Environment)
         | AstExpr::Var(AstNameRef::Global(_))
         | AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -451,7 +456,7 @@ mod tests {
                     capture_write_names: BTreeSet::new(),
                 })),
                 args: Vec::new(),
-                method_name: None,
+                method_key: None,
             })),
         }))
     }
@@ -468,8 +473,11 @@ mod tests {
                             id: AstBindingRef::SyntheticLocal(outer),
                             attr: AstLocalAttr::None,
                             origin: AstLocalOrigin::Recovered,
+                            rewrite_authority: AstRewriteAuthority::AstOwned,
                         }],
                         values: vec![AstExpr::Integer(1)],
+                        initializer_merge_transaction: None,
+                        initializer_root_profile: None,
                     })),
                     AstStmt::If(Box::new(AstIf {
                         cond: AstExpr::Boolean(true),
@@ -517,9 +525,12 @@ mod tests {
                                 id: AstBindingRef::Local(LocalId(index)),
                                 attr: AstLocalAttr::None,
                                 origin: AstLocalOrigin::Recovered,
+                                rewrite_authority: AstRewriteAuthority::AstOwned,
                             })
                             .collect(),
                         values: Vec::new(),
+                        initializer_merge_transaction: None,
+                        initializer_root_profile: None,
                     })),
                     AstStmt::If(Box::new(AstIf {
                         cond: AstExpr::Boolean(true),

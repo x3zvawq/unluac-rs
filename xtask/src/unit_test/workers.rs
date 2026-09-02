@@ -88,6 +88,7 @@ pub(super) fn spawn_workers(
     let (task_tx, task_rx) = mpsc::channel::<ScheduledCase>();
     let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
     let task_rx = Arc::new(Mutex::new(task_rx));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::with_capacity(jobs);
 
     for _ in 0..jobs {
@@ -96,8 +97,12 @@ pub(super) fn spawn_workers(
         let output_mode = output_mode.clone();
         let task_rx = Arc::clone(&task_rx);
         let event_tx = event_tx.clone();
+        let cancelled = Arc::clone(&cancelled);
         handles.push(thread::spawn(move || {
             loop {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
                 let scheduled = {
                     let receiver = task_rx
                         .lock()
@@ -107,6 +112,9 @@ pub(super) fn spawn_workers(
                         Err(_) => break,
                     }
                 };
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
 
                 event_tx
                     .send(WorkerEvent::Started {
@@ -129,6 +137,7 @@ pub(super) fn spawn_workers(
                         })
                         .map_err(|_| anyhow::anyhow!("worker event channel closed"))?,
                     Err(error) => {
+                        cancelled.store(true, Ordering::Release);
                         let error = error.to_string();
                         let _ = event_tx.send(WorkerEvent::WorkerError {
                             case: scheduled.case,
@@ -185,6 +194,16 @@ pub(super) fn run_unit_case_with_timeout(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn `{}`", runner.display()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("unit case runner stdout pipe was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("unit case runner stderr pipe was not captured")?;
+    let stdout_reader = spawn_output_reader(stdout);
+    let stderr_reader = spawn_output_reader(stderr);
 
     let start = Instant::now();
     loop {
@@ -192,9 +211,7 @@ pub(super) fn run_unit_case_with_timeout(
             .try_wait()
             .with_context(|| format!("failed to poll `{}`", runner.display()))?
         {
-            let output = child
-                .wait_with_output()
-                .with_context(|| format!("failed to read `{}` output", runner.display()))?;
+            let output = collect_child_output(status, stdout_reader, stderr_reader)?;
             return match status.code() {
                 Some(0) => {
                     let proto_count = parse_machine_success(&output);
@@ -216,13 +233,23 @@ pub(super) fn run_unit_case_with_timeout(
                         failed_proto_tags: failure.failed_proto_tags,
                     })
                 }
-                _ => bail!(
-                    "unit case runner exited unexpectedly for {} {} {} with status {}",
-                    case.suite,
-                    case.dialect,
-                    case.display_path(),
-                    status
-                ),
+                _ => {
+                    let child_output = preferred_child_output(&output);
+                    let rendered_failure = if child_output.is_empty() {
+                        format!("unit case runner exited unexpectedly with status {status}")
+                    } else {
+                        format!(
+                            "unit case runner exited unexpectedly with status {status}\n{child_output}"
+                        )
+                    };
+                    Ok(UnitCaseExecution {
+                        outcome: UnitCaseOutcome::Failed,
+                        classification: Some("runner-crashed".to_owned()),
+                        rendered_failure: Some(rendered_failure),
+                        proto_count: 0,
+                        failed_proto_tags: Vec::new(),
+                    })
+                }
             };
         }
 
@@ -230,9 +257,10 @@ pub(super) fn run_unit_case_with_timeout(
             child
                 .kill()
                 .with_context(|| format!("failed to kill timed out `{}`", runner.display()))?;
-            let output = child.wait_with_output().with_context(|| {
-                format!("failed to read timed out `{}` output", runner.display())
-            })?;
+            let status = child
+                .wait()
+                .with_context(|| format!("failed to wait for timed out `{}`", runner.display()))?;
+            let output = collect_child_output(status, stdout_reader, stderr_reader)?;
             let rendered_failure = preferred_child_output(&output);
             return Ok(UnitCaseExecution {
                 outcome: UnitCaseOutcome::TimedOut,
@@ -245,6 +273,37 @@ pub(super) fn run_unit_case_with_timeout(
 
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+type OutputReader = thread::JoinHandle<io::Result<Vec<u8>>>;
+
+fn spawn_output_reader(mut reader: impl Read + Send + 'static) -> OutputReader {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn collect_child_output(
+    status: ExitStatus,
+    stdout_reader: OutputReader,
+    stderr_reader: OutputReader,
+) -> Result<Output> {
+    let stdout = join_output_reader(stdout_reader, "stdout")?;
+    let stderr = join_output_reader(stderr_reader, "stderr")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn join_output_reader(reader: OutputReader, stream: &str) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("unit case runner {stream} reader panicked"))?
+        .with_context(|| format!("failed to read unit case runner {stream}"))
 }
 
 /// 解析 machine 模式成功输出中的 `proto-count` 行。
@@ -341,13 +400,28 @@ pub(super) fn sparse_progress_message(
     )
 }
 
+pub(super) fn heartbeat_progress_message(
+    palette: Palette,
+    completed: usize,
+    total: usize,
+    active: usize,
+) -> String {
+    format!(
+        "[{completed}/{total}]\tactive: {active}\t{}",
+        palette.yellow(format!(
+            "waiting for active cases; no worker event for {}s",
+            PROGRESS_HEARTBEAT_INTERVAL.as_secs()
+        ))
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ProgressEventKind {
     Started,
     Finished,
 }
 
-pub(super) fn should_emit_sparse_plain_progress(
+pub(super) fn should_emit_progress_milestone(
     event: ProgressEventKind,
     completed: usize,
     total: usize,

@@ -61,6 +61,11 @@ pub(super) fn coalesce_param_aliases_in_proto(
         // 候选拒绝[PolicyBoundary]：带 source debug identity 的 alias local 保留独立声明，不把其名称与词法范围折入参数。
         return false;
     }
+    if proto.inline_dispositions.local(alias.local).must_preserve() {
+        // 候选拒绝[LayerBoundary]：temp-inline 已冻结该 alias 的 value epoch；把它折入
+        // 参数会在 AST 之前删除承载结论的 binding 身份。
+        return false;
+    }
     if proto.physical_root_locals.contains(&alias.local)
         && (rest.iter().any(|stmt| stmt_writes_param(stmt, alias.param))
             || stmts_reference_captured_bindings(rest)
@@ -982,6 +987,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Local(local)],
                 values: HirValuePack::fixed(vec![HirExpr::Boolean(true)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             goto(header),
         ];

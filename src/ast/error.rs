@@ -3,8 +3,6 @@
 use thiserror::Error;
 
 use crate::ast::{AstBindingRef, DecompileDialect};
-use crate::structure::{BlockRef, PhiId};
-use crate::transformer::Reg;
 
 /// HIR -> AST lowering 可能失败的原因。
 #[derive(Debug, Error)]
@@ -17,12 +15,12 @@ pub enum AstLowerError {
         feature: &'static str,
         context: &'static str,
     },
-    #[error("StructurePlan proto#{proto} retains unresolved {phi_id} at {block} register {reg}")]
-    UnresolvedStructureValue {
+    #[error("HIR exit proto#{proto} retains unresolved phi{phi} at #{block} register r{register}")]
+    UnresolvedHirValue {
         proto: usize,
-        phi_id: PhiId,
-        block: BlockRef,
-        reg: Reg,
+        phi: usize,
+        block: usize,
+        register: usize,
     },
     #[error("HIR proto#{proto} still contains residual {kind} during AST lowering")]
     ResidualHir { proto: usize, kind: &'static str },
@@ -38,6 +36,22 @@ pub enum AstLowerError {
     UnsupportedClose { proto: usize },
     #[error("HIR proto#{proto} contains err-nnil that cannot be matched to a global declaration")]
     InvalidGlobalDeclPattern { proto: usize },
+    #[error(
+        "HIR proto#{proto} global declaration name `{name}` is not a legal identifier for target dialect `{dialect}`"
+    )]
+    InvalidGlobalDeclName {
+        proto: usize,
+        dialect: DecompileDialect,
+        name: String,
+    },
+    #[error(
+        "HIR proto#{proto} global key {key} is not a legal identifier for target dialect `{dialect}`"
+    )]
+    InvalidGlobalName {
+        proto: usize,
+        dialect: DecompileDialect,
+        key: String,
+    },
     #[error("HIR proto#{proto} has invalid method call lowering shape: {reason}")]
     InvalidMethodCallPattern { proto: usize, reason: &'static str },
     #[error(

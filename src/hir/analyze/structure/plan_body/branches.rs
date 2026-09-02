@@ -81,7 +81,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             stmts,
             finalize_condition_decision_expr(
                 decision,
-                crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target.version),
+                crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target),
             ),
         ))
     }
@@ -135,7 +135,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             vec![self.lowering.bindings.lvalue_for_temp(target)],
             vec![finalize_value_decision_expr(
                 decision,
-                crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target.version),
+                crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target),
             )],
         ));
         stmts.extend(self.lower_edge_effects(region, selected.shared_exit_action)?);

@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use crate::hir::{
     HirBlock, HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirStmt,
-    HirTableField, HirTableKey, LocalId, TempId,
+    HirTableField, LocalId, TempId,
 };
 
 pub(super) fn max_hir_label_id(module: &HirModule) -> usize {
@@ -210,9 +210,7 @@ fn collect_referenced_temps_in_expr(expr: &HirExpr, temps: &mut ReferencedTempCo
                 match field {
                     HirTableField::Array(value) => collect_referenced_temps_in_expr(value, temps),
                     HirTableField::Record(record) => {
-                        if let HirTableKey::Expr(expr) = &record.key {
-                            collect_referenced_temps_in_expr(expr, temps);
-                        }
+                        collect_referenced_temps_in_expr(&record.key, temps);
                         collect_referenced_temps_in_expr(&record.value, temps);
                     }
                 }
@@ -324,13 +322,6 @@ fn stmt_has_continue(stmt: &HirStmt) -> bool {
         | HirStmt::GenericFor(_) => false,
         _ => false,
     }
-}
-
-pub(super) fn count_local_uses_in_stmts(stmts: &[HirStmt], local: LocalId) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| count_local_uses_in_stmt(stmt, local))
-        .sum()
 }
 
 fn count_local_uses_in_stmt(stmt: &HirStmt, local: LocalId) -> usize {
@@ -477,13 +468,10 @@ fn count_local_uses_in_expr(expr: &HirExpr, local: LocalId) -> usize {
                 .iter()
                 .map(|field| match field {
                     HirTableField::Array(expr) => count_local_uses_in_expr(expr, local),
-                    HirTableField::Record(record) => match &record.key {
-                        HirTableKey::Name(_) => count_local_uses_in_expr(&record.value, local),
-                        HirTableKey::Expr(expr) => {
-                            count_local_uses_in_expr(expr, local)
-                                + count_local_uses_in_expr(&record.value, local)
-                        }
-                    },
+                    HirTableField::Record(record) => {
+                        count_local_uses_in_expr(&record.key, local)
+                            + count_local_uses_in_expr(&record.value, local)
+                    }
                 })
                 .sum::<usize>()
                 + table

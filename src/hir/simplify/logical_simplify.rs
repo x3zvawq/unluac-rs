@@ -712,7 +712,7 @@ mod tests {
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }))
     }
 

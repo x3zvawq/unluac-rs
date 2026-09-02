@@ -17,8 +17,7 @@ use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirCaptureMode, HirClosureExpr,
     HirDecisionExpr, HirDecisionNode, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue,
     HirLocalDecl, HirLogicalExpr, HirNumericFor, HirPackTail, HirRecordField, HirStmt,
-    HirTableAccess, HirTableConstructor, HirTableField, HirTableKey, HirUnaryExpr, HirValuePack,
-    LocalId,
+    HirTableAccess, HirTableConstructor, HirTableField, HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::hir::expr_safety::{HirExprSafety, expr_requires_ordered_snapshot};
 
@@ -56,6 +55,9 @@ pub(super) fn extract_generic_for(
     let (prefix, iterator, iterator_changed) =
         extract_value_pack(generic_for.iterator, state, safety);
     generic_for.iterator = iterator;
+    if iterator_changed {
+        generic_for.initializer_transaction = None;
+    }
     (prefix, generic_for, iterator_changed)
 }
 
@@ -69,7 +71,7 @@ pub(super) fn extract_call_expr(
         args,
         method,
         fastcall,
-        method_name,
+        method_key,
     } = call;
     let (prefix, mut leading, args, changed) =
         extract_value_pack_with_leading(vec![callee], args, state, safety);
@@ -83,7 +85,7 @@ pub(super) fn extract_call_expr(
             args,
             method,
             fastcall,
-            method_name,
+            method_key,
         },
         changed,
     )
@@ -214,6 +216,7 @@ impl OrderedExprExtraction {
             self.prefix.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings,
                 values: HirValuePack::fixed(values),
+                initializer_merge_transaction: None,
             })));
         }
         self.prefix.append(&mut prefix);
@@ -225,6 +228,8 @@ pub(super) fn extract_assign(
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirAssign, bool) {
+    let initializer_merge_transaction = assign.initializer_merge_transaction;
+    let generic_for_initializer_producer = assign.generic_for_initializer_producer;
     let mut leading = Vec::new();
     let mut target_shapes = Vec::with_capacity(assign.targets.len());
     for target in assign.targets {
@@ -261,7 +266,20 @@ pub(super) fn extract_assign(
         "table lvalue extraction must consume every preserved base and key"
     );
 
-    (prefix, HirAssign { targets, values }, changed)
+    (
+        prefix,
+        HirAssign {
+            targets,
+            values,
+            initializer_merge_transaction: (!changed)
+                .then_some(initializer_merge_transaction)
+                .flatten(),
+            generic_for_initializer_producer: (!changed)
+                .then_some(generic_for_initializer_producer)
+                .flatten(),
+        },
+        changed,
+    )
 }
 
 pub(super) fn extract_value_expr(
@@ -662,12 +680,7 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
                         fields.push(HirTableField::Array(collapse_expr_to_pure(expr, safety)?));
                     }
                     HirTableField::Record(field) => {
-                        let key = match field.key {
-                            HirTableKey::Name(name) => HirTableKey::Name(name),
-                            HirTableKey::Expr(expr) => {
-                                HirTableKey::Expr(collapse_expr_to_pure(expr, safety)?)
-                            }
-                        };
+                        let key = collapse_expr_to_pure(field.key, safety)?;
                         fields.push(HirTableField::Record(HirRecordField {
                             key,
                             value: collapse_expr_to_pure(field.value, safety)?,
@@ -712,7 +725,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         args: HirValuePack { fixed, tail },
         method: call.method,
         fastcall: call.fastcall,
-        method_name: call.method_name,
+        method_key: call.method_key,
     })
 }
 
@@ -730,15 +743,8 @@ fn prepare_table_constructor(
                 exprs.push(expr);
             }
             HirTableField::Record(HirRecordField { key, value }) => {
-                match key {
-                    HirTableKey::Name(name) => {
-                        shapes.push(PreparedTableFieldShape::Named(name));
-                    }
-                    HirTableKey::Expr(expr) => {
-                        shapes.push(PreparedTableFieldShape::ExpressionKey);
-                        exprs.push(expr);
-                    }
-                }
+                shapes.push(PreparedTableFieldShape::Record);
+                exprs.push(key);
                 exprs.push(value);
             }
         }
@@ -773,18 +779,10 @@ fn prepare_table_constructor(
                     .next()
                     .expect("array field extraction should preserve its value"),
             ),
-            PreparedTableFieldShape::Named(name) => HirTableField::Record(HirRecordField {
-                key: HirTableKey::Name(name),
-                value: exprs
+            PreparedTableFieldShape::Record => HirTableField::Record(HirRecordField {
+                key: exprs
                     .next()
-                    .expect("record field extraction should preserve its value"),
-            }),
-            PreparedTableFieldShape::ExpressionKey => HirTableField::Record(HirRecordField {
-                key: HirTableKey::Expr(
-                    exprs
-                        .next()
-                        .expect("record field extraction should preserve its key"),
-                ),
+                    .expect("record field extraction should preserve its key"),
                 value: exprs
                     .next()
                     .expect("record field extraction should preserve its value"),
@@ -807,8 +805,7 @@ fn prepare_table_constructor(
 
 enum PreparedTableFieldShape {
     Array,
-    Named(String),
-    ExpressionKey,
+    Record,
 }
 
 fn prepare_closure(
@@ -876,9 +873,7 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety
                         changed |= eliminate_condition_expr(expr, safety);
                     }
                     HirTableField::Record(field) => {
-                        if let HirTableKey::Expr(expr) = &mut field.key {
-                            changed |= eliminate_condition_expr(expr, safety);
-                        }
+                        changed |= eliminate_condition_expr(&mut field.key, safety);
                         changed |= eliminate_condition_expr(&mut field.value, safety);
                     }
                 }
@@ -966,6 +961,7 @@ pub(super) fn empty_local_decl(local: LocalId) -> HirStmt {
     HirStmt::LocalDecl(Box::new(HirLocalDecl {
         bindings: vec![local],
         values: HirValuePack::fixed(Vec::new()),
+        initializer_merge_transaction: None,
     }))
 }
 
@@ -973,6 +969,7 @@ fn local_decl_with_value(local: LocalId, value: HirExpr) -> HirStmt {
     HirStmt::LocalDecl(Box::new(HirLocalDecl {
         bindings: vec![local],
         values: HirValuePack::fixed(vec![value]),
+        initializer_merge_transaction: None,
     }))
 }
 
@@ -980,5 +977,7 @@ fn assign_stmt(target: HirLValue, value: HirExpr) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
         targets: vec![target],
         values: HirValuePack::fixed(vec![value]),
+        initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }))
 }

@@ -1,8 +1,9 @@
 //! HIR -> AST build 阶段入口。
 //!
 //! 这里调度合法语法模式与逐节点机械 lowering，依赖 HIR 已经完成控制结构、binding 和
-//! value-pack 的语义恢复；不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实，
-//! 也不会把没有等价源码语义的残余 HIR 节点拆成表面合法的 AST。
+//! value-pack 的语义恢复；前层退出要求也只读取 `HirProto::exit_requirements`，不会旁路访问
+//! StructureFacts。这里不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实，也不会把
+//! 没有等价源码语义的残余 HIR 节点拆成表面合法的 AST。
 
 mod analysis;
 mod exprs;
@@ -13,10 +14,9 @@ use std::collections::BTreeSet;
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::generate::GenerateMode;
 use crate::hir::{
-    HirBlock, HirClosureExpr, HirGenericFor, HirGlobalDecl, HirModule, HirStmt, TempId,
+    HirBlock, HirClosureExpr, HirControlFlowFeature, HirExitRequirement, HirGenericFor,
+    HirGlobalDecl, HirModule, HirStmt, TempId,
 };
-use crate::structure::{BlockRef, ControlFlowFeature, PhiId, PlanRequirement, StructureFacts};
-use crate::transformer::Reg;
 
 use self::analysis::{
     block_has_continue, collect_close_temps, collect_referenced_temps_in_encounter_order,
@@ -27,7 +27,7 @@ use super::common::{
     AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
     AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstLabel, AstLabelId,
     AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNumericFor,
-    AstRepeat, AstReturn, AstStmt, AstTargetDialect, AstWhile,
+    AstRepeat, AstReturn, AstRewriteAuthority, AstStmt, AstTargetDialect, AstWhile,
 };
 use super::error::AstLowerError;
 
@@ -37,12 +37,25 @@ pub fn lower_ast(
     target: AstTargetDialect,
     mode: GenerateMode,
 ) -> Result<AstModule, AstLowerError> {
+    let exit_diagnostics = collect_exit_diagnostics(module, target);
+    if mode == GenerateMode::Strict
+        && let Some(diagnostic) = exit_diagnostics.first()
+    {
+        return Err(exit_diagnostic_error(*diagnostic, target.version));
+    }
     let lowering_target = match mode {
         GenerateMode::Strict => target,
         GenerateMode::Permissive => AstTargetDialect::diagnostic_for_lowering(target.version),
     };
     let mut lowerer = AstLowerer::new(module, lowering_target, mode);
-    lowerer.lower_module()
+    let mut ast = lowerer.lower_module()?;
+    if !exit_diagnostics.is_empty() {
+        ast.body.stmts.insert(
+            0,
+            AstStmt::Error(format_exit_diagnostics(&exit_diagnostics)),
+        );
+    }
+    Ok(ast)
 }
 
 /// 使用请求方言的真实语法能力执行 AST lowering。
@@ -51,124 +64,97 @@ pub(crate) fn lower_ast_for_generate(
     state: &mut DecompileState,
     context: &DecompileContext<'_>,
 ) -> Result<(), DecompileError> {
-    let plan_diagnostics = collect_plan_diagnostics(state.require_structure_facts()?);
-    if context.options.generate.mode == GenerateMode::Strict
-        && let Some(diagnostic) = plan_diagnostics.first()
-    {
-        return Err(diagnostic
-            .strict_error(context.requested_target.version)
-            .into());
-    }
     let hir = state.require_hir()?;
-    let mut ast = lower_ast(hir, context.requested_target, context.options.generate.mode)?;
-    if !plan_diagnostics.is_empty() {
-        ast.body.stmts.insert(
-            0,
-            AstStmt::Error(format_plan_diagnostics(&plan_diagnostics)),
-        );
-    }
+    let ast = lower_ast(hir, context.requested_target, context.options.generate.mode)?;
     state.ast = Some(ast);
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-enum PlanDiagnostic {
-    UnavailableFeature {
-        proto: usize,
-        feature: ControlFlowFeature,
-    },
-    UnresolvedValue {
-        proto: usize,
-        phi_id: PhiId,
-        block: BlockRef,
-        reg: Reg,
-    },
-}
-
-impl PlanDiagnostic {
-    fn strict_error(self, dialect: crate::ast::DecompileDialect) -> AstLowerError {
-        match self {
-            Self::UnavailableFeature { feature, .. } => AstLowerError::UnsupportedFeature {
+fn exit_diagnostic_error(
+    diagnostic: HirExitRequirement,
+    dialect: crate::ast::DecompileDialect,
+) -> AstLowerError {
+    match diagnostic {
+        HirExitRequirement::RequiredControlFlow { feature, .. } => {
+            AstLowerError::UnsupportedFeature {
                 dialect,
                 feature: control_flow_feature_name(feature),
-                context: "StructurePlan",
-            },
-            Self::UnresolvedValue {
-                proto,
-                phi_id,
-                block,
-                reg,
-            } => AstLowerError::UnresolvedStructureValue {
-                proto,
-                phi_id,
-                block,
-                reg,
-            },
+                context: "HIR exit diagnostics",
+            }
         }
+        HirExitRequirement::UnresolvedValue {
+            source_proto,
+            phi,
+            block,
+            register,
+        } => AstLowerError::UnresolvedHirValue {
+            proto: source_proto,
+            phi,
+            block,
+            register,
+        },
     }
 }
 
-fn collect_plan_diagnostics(root: &StructureFacts) -> Vec<PlanDiagnostic> {
-    let mut diagnostics = Vec::new();
-    let mut stack = vec![root];
-    let mut proto = 0usize;
-    while let Some(facts) = stack.pop() {
-        if let Some(ready) = facts.ready() {
-            diagnostics.extend(
-                ready
-                    .plan()
-                    .requirements()
-                    .unavailable_features()
-                    .iter()
-                    .copied()
-                    .map(|feature| PlanDiagnostic::UnavailableFeature { proto, feature }),
-            );
-            diagnostics.extend(ready.plan().requirements().iter().filter_map(
-                |(_, requirement)| match requirement {
-                    PlanRequirement::UnresolvedValue { phi_id, block, reg } => {
-                        Some(PlanDiagnostic::UnresolvedValue {
-                            proto,
-                            phi_id: *phi_id,
-                            block: *block,
-                            reg: *reg,
-                        })
-                    }
-                    PlanRequirement::Goto { .. }
-                    | PlanRequirement::Continue { .. }
-                    | PlanRequirement::MultiEntryIsland { .. } => None,
-                },
-            ));
-        }
-        proto += 1;
-        stack.extend(facts.children.iter().rev());
-    }
-    diagnostics
+fn collect_exit_diagnostics(
+    module: &HirModule,
+    target: AstTargetDialect,
+) -> Vec<HirExitRequirement> {
+    module
+        .protos
+        .iter()
+        .flat_map(|proto| proto.exit_requirements.iter().copied())
+        .filter(|requirement| match requirement {
+            HirExitRequirement::RequiredControlFlow { feature, .. } => {
+                !supports_control_flow_feature(target, *feature)
+            }
+            HirExitRequirement::UnresolvedValue { .. } => true,
+        })
+        .collect()
 }
 
-fn format_plan_diagnostics(diagnostics: &[PlanDiagnostic]) -> String {
+fn format_exit_diagnostics(diagnostics: &[HirExitRequirement]) -> String {
     let details = diagnostics
         .iter()
         .map(|diagnostic| match diagnostic {
-            PlanDiagnostic::UnavailableFeature { proto, feature } => format!(
-                "proto#{proto} requires unavailable {}",
+            HirExitRequirement::RequiredControlFlow {
+                source_proto,
+                feature,
+            } => format!(
+                "proto#{source_proto} requires unavailable {}",
                 control_flow_feature_name(*feature)
             ),
-            PlanDiagnostic::UnresolvedValue {
-                proto,
-                phi_id,
+            HirExitRequirement::UnresolvedValue {
+                source_proto,
+                phi,
                 block,
-                reg,
-            } => format!("proto#{proto} unresolved {phi_id} at {block} register {reg}"),
+                register,
+            } => {
+                format!("proto#{source_proto} unresolved phi{phi} at #{block} register r{register}")
+            }
         })
         .collect::<Vec<_>>()
         .join("; ");
-    format!("StructurePlan requirements: {details}")
+    format!("HIR exit diagnostics: {details}")
 }
 
-const fn control_flow_feature_name(feature: ControlFlowFeature) -> &'static str {
+const fn control_flow_feature_name(feature: HirControlFlowFeature) -> &'static str {
     match feature {
-        ControlFlowFeature::GotoLabel => "goto/label",
-        ControlFlowFeature::ContinueStatement => "continue",
+        HirControlFlowFeature::GotoLabel => "goto/label",
+        HirControlFlowFeature::ContinueStatement => "continue",
+    }
+}
+
+const fn supports_control_flow_feature(
+    target: AstTargetDialect,
+    feature: HirControlFlowFeature,
+) -> bool {
+    match feature {
+        HirControlFlowFeature::GotoLabel => target.caps.goto_label,
+        // AST can preserve `continue` either natively or with a loop-local goto/label pair.
+        HirControlFlowFeature::ContinueStatement => {
+            target.caps.continue_stmt || target.caps.goto_label
+        }
     }
 }
 
@@ -237,11 +223,10 @@ impl<'a> AstLowerer<'a> {
                     },
                 )?;
                 body.stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
-                    bindings: vec![self.recovered_local_binding(
-                        AstBindingRef::Local(*binding),
-                        AstLocalAttr::None,
-                    )],
+                    bindings: vec![self.detached_child_diagnostic_binding(*binding)],
                     values: vec![AstExpr::FunctionExpr(Box::new(function))],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })));
             }
         }
@@ -266,6 +251,8 @@ impl<'a> AstLowerer<'a> {
                 stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
                     bindings: temp_bindings,
                     values: Vec::new(),
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })));
             }
         }
@@ -298,12 +285,6 @@ impl<'a> AstLowerer<'a> {
         index: usize,
         continue_target: Option<AstLabelId>,
     ) -> Result<(Vec<AstStmt>, usize), AstLowerError> {
-        if let Some((stmt, consumed)) =
-            self.try_lower_global_decl(proto_index, &block.stmts, index)?
-        {
-            return Ok((vec![stmt], consumed));
-        }
-
         if let Some((stmt, consumed)) =
             self.try_lower_local_close_decl(proto_index, &block.stmts, index)?
         {
@@ -418,6 +399,7 @@ impl<'a> AstLowerer<'a> {
                     vec![AstStmt::Repeat(Box::new(AstRepeat {
                         body,
                         cond: self.lower_expr(proto_index, &repeat_stmt.cond)?,
+                        lifetime: repeat_stmt.lifetime.clone(),
                     }))],
                     1,
                 ))
@@ -524,9 +506,23 @@ impl<'a> AstLowerer<'a> {
                 context: "global declaration",
             });
         }
+        let names = global_decl
+            .names
+            .iter()
+            .map(|key| {
+                let name = key
+                    .as_utf8()
+                    .filter(|name| crate::ast::is_lua_identifier_name(name, self.target.version));
+                name.map(str::to_owned)
+                    .ok_or_else(|| AstLowerError::InvalidGlobalDeclName {
+                        proto: proto_index,
+                        dialect: self.target.version,
+                        name: key.debug_literal(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(AstGlobalDecl {
-            bindings: global_decl
-                .names
+            bindings: names
                 .iter()
                 .cloned()
                 .map(|text| AstGlobalBinding {
@@ -613,6 +609,7 @@ impl<'a> AstLowerer<'a> {
             id: AstBindingRef::Local(binding),
             attr,
             origin,
+            rewrite_authority: AstRewriteAuthority::Hir(proto.inline_dispositions.local(binding)),
         }
     }
 
@@ -636,18 +633,20 @@ impl<'a> AstLowerer<'a> {
             id: AstBindingRef::Temp(temp),
             attr: AstLocalAttr::None,
             origin,
+            rewrite_authority: AstRewriteAuthority::Hir(proto.inline_dispositions.temp(temp)),
         }
     }
 
-    fn recovered_local_binding(
-        &self,
-        binding: AstBindingRef,
-        attr: AstLocalAttr,
-    ) -> AstLocalBinding {
+    /// 为失败 proto 的 detached child 构造仅用于诊断伪源码的 synthetic binding。
+    ///
+    /// 成功降低的 HIR binding 必须走 `lower_local_binding` / `lower_temp_binding`，
+    /// 以免这里故意为空的 provenance 与 rewrite authority 覆盖前层结论。
+    fn detached_child_diagnostic_binding(&self, binding: crate::hir::LocalId) -> AstLocalBinding {
         AstLocalBinding {
-            id: binding,
-            attr,
+            id: AstBindingRef::Local(binding),
+            attr: AstLocalAttr::None,
             origin: AstLocalOrigin::Recovered,
+            rewrite_authority: AstRewriteAuthority::Hir(Default::default()),
         }
     }
 }

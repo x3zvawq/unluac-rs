@@ -379,12 +379,11 @@ fn conservative_binding_homes(
     binding: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
 ) -> BTreeSet<crate::hir::promotion::HomeSlotKey> {
-    let homes = match binding {
-        CarryBinding::Param(param) => promotion_facts.possible_param_home_slots(param),
-        CarryBinding::Local(local) => promotion_facts.possible_local_home_slots(local),
-        CarryBinding::Temp(temp) => promotion_facts.possible_temp_home_slots(temp),
-    };
-    homes.unwrap_or_else(|| promotion_facts.physical_home_universe().clone())
+    match binding {
+        CarryBinding::Param(param) => promotion_facts.complete_param_home_slots(param),
+        CarryBinding::Local(local) => promotion_facts.complete_local_home_slots(local),
+        CarryBinding::Temp(temp) => promotion_facts.complete_temp_home_slots(temp),
+    }
 }
 
 #[derive(Default)]
@@ -853,6 +852,8 @@ fn apply_fold(
     body.stmts[fold.seed_index] = HirStmt::Assign(Box::new(HirAssign {
         targets: vec![HirLValue::Local(fold.carried)],
         values,
+        initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }));
     body.stmts.pop();
 
@@ -887,6 +888,7 @@ mod tests {
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![local],
             values: HirValuePack::fixed(vec![HirExpr::Nil]),
+            initializer_merge_transaction: None,
         }))
     }
 
@@ -894,6 +896,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![target],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -937,6 +941,7 @@ mod tests {
                 ],
             },
             cond: HirExpr::TempRef(next),
+            lifetime: Default::default(),
         }))
     }
 
@@ -947,6 +952,7 @@ mod tests {
             physical_roots: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
+            preserved: BTreeSet::new(),
         }
     }
 
@@ -1022,6 +1028,7 @@ mod tests {
                         )],
                     },
                     cond: HirExpr::LocalRef(state),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1069,7 +1076,7 @@ mod tests {
         let state = LocalId(0);
         let next = TempId(0);
         let global = HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-            names: vec!["snapshot".to_owned()],
+            names: vec!["snapshot".into()],
             values: HirValuePack::fixed(vec![HirExpr::TempRef(next)]),
         }));
         let mut block = HirBlock {
@@ -1087,6 +1094,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1105,7 +1113,7 @@ mod tests {
                     add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
                 ),
                 HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                    names: vec!["snapshot".to_owned()],
+                    names: vec!["snapshot".into()],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(state)]),
                 })),
             ]
@@ -1128,13 +1136,14 @@ mod tests {
                                 add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
                             ),
                             HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                                names: vec!["snapshot".to_owned()],
+                                names: vec!["snapshot".into()],
                                 values: HirValuePack::fixed(vec![HirExpr::TempRef(next)]),
                             })),
                             assign(HirLValue::Local(state), HirExpr::TempRef(next)),
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1160,13 +1169,14 @@ mod tests {
                                 add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
                             ),
                             HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                                names: vec!["snapshot".to_owned()],
+                                names: vec!["snapshot".into()],
                                 values: HirValuePack::fixed(vec![decision(HirExpr::TempRef(next))]),
                             })),
                             assign(HirLValue::Local(state), HirExpr::TempRef(next)),
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1205,6 +1215,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1235,6 +1246,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1262,13 +1274,14 @@ mod tests {
                                 add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
                             ),
                             HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                                names: vec!["snapshot".to_owned()],
+                                names: vec!["snapshot".into()],
                                 values: HirValuePack::fixed(vec![HirExpr::TempRef(next)]),
                             })),
                             assign(HirLValue::Local(state), HirExpr::TempRef(next)),
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1286,7 +1299,7 @@ mod tests {
         let next = TempId(0);
         let target = HirLabelId(0);
         let skipped = HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-            names: vec!["skipped".to_owned()],
+            names: vec!["skipped".into()],
             values: HirValuePack::fixed(vec![HirExpr::TempRef(next)]),
         }));
         let mut block = HirBlock {
@@ -1306,6 +1319,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1325,7 +1339,7 @@ mod tests {
                 ),
                 goto(target),
                 HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                    names: vec!["skipped".to_owned()],
+                    names: vec!["skipped".into()],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(state)]),
                 })),
                 label(target),
@@ -1362,6 +1376,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1412,6 +1427,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1448,6 +1464,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1476,6 +1493,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
                 goto(target),
             ],
@@ -1512,6 +1530,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1545,6 +1564,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1575,6 +1595,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1625,13 +1646,14 @@ mod tests {
                                 add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
                             ),
                             HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                                names: vec!["snapshot".to_owned()],
+                                names: vec!["snapshot".into()],
                                 values: HirValuePack::fixed(vec![HirExpr::TempRef(next)]),
                             })),
                             assign(HirLValue::Local(state), HirExpr::TempRef(next)),
                         ],
                     },
                     cond: HirExpr::TempRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };
@@ -1647,6 +1669,7 @@ mod tests {
         let mut body = vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![next],
             values: HirValuePack::fixed(vec![add(HirExpr::LocalRef(state), HirExpr::Integer(1))]),
+            initializer_merge_transaction: None,
         }))];
         body.extend(prefix);
         body.push(assign(HirLValue::Local(state), HirExpr::LocalRef(next)));
@@ -1657,6 +1680,7 @@ mod tests {
                     HirStmt::Repeat(Box::new(HirRepeat {
                         body: HirBlock { stmts: body },
                         cond: HirExpr::LocalRef(next),
+                        lifetime: Default::default(),
                     })),
                 ],
             },
@@ -1708,7 +1732,7 @@ mod tests {
     fn local_update_crosses_global_declaration_without_moving_it() {
         let next = LocalId(1);
         let global = HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-            names: vec!["snapshot".to_owned()],
+            names: vec!["snapshot".into()],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(next)]),
         }));
         let (mut block, state, next) = local_update_with_prefix(vec![global, HirStmt::Break]);
@@ -1727,7 +1751,7 @@ mod tests {
                     add(HirExpr::LocalRef(state), HirExpr::Integer(1)),
                 ),
                 HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                    names: vec!["snapshot".to_owned()],
+                    names: vec!["snapshot".into()],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(state)]),
                 })),
                 HirStmt::Break,
@@ -1741,7 +1765,7 @@ mod tests {
         let target = HirLabelId(0);
         let next = LocalId(1);
         let skipped = HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-            names: vec!["skipped".to_owned()],
+            names: vec!["skipped".into()],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(next)]),
         }));
         let (mut block, state, next) =
@@ -1762,7 +1786,7 @@ mod tests {
                 ),
                 goto(target),
                 HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
-                    names: vec!["skipped".to_owned()],
+                    names: vec!["skipped".into()],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(state)]),
                 })),
                 label(target),
@@ -1790,6 +1814,7 @@ mod tests {
                                     HirExpr::LocalRef(state),
                                     HirExpr::Integer(1),
                                 )]),
+                                initializer_merge_transaction: None,
                             })),
                             goto(target),
                             HirStmt::Break,
@@ -1797,6 +1822,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::LocalRef(next),
+                    lifetime: Default::default(),
                 })),
             ],
         };

@@ -840,6 +840,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(temp)],
             values: HirValuePack::fixed(vec![HirExpr::Nil]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 

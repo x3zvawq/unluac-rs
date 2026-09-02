@@ -53,6 +53,12 @@ pub(super) trait HirRewritePass {
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
         self.rewrite_expr(expr)
     }
+
+    /// Generic-for 自身可以裁掉已由 transaction 宽度独立保存的 trailing nil；其它
+    /// iterator rewrite 默认会破坏 producer span correspondence。
+    fn preserves_generic_for_initializer_transaction_on_iterator_rewrite(&self) -> bool {
+        false
+    }
 }
 
 pub(super) fn rewrite_proto(proto: &mut HirProto, pass: &mut impl HirRewritePass) -> bool {
@@ -144,6 +150,18 @@ fn rewrite_block(block: &mut HirBlock, pass: &mut impl HirRewritePass) -> bool {
 }
 
 fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
+    let original_assign_targets = match stmt {
+        HirStmt::Assign(assign) if assign.generic_for_initializer_producer.is_some() => {
+            Some(assign.targets.clone())
+        }
+        _ => None,
+    };
+    let original_generic_for_iterator = match stmt {
+        HirStmt::GenericFor(generic_for) if generic_for.initializer_transaction.is_some() => {
+            Some(generic_for.iterator.clone())
+        }
+        _ => None,
+    };
     let mut nested_changed = false;
     traverse_hir_stmt_children!(
         stmt,
@@ -171,7 +189,22 @@ fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
     );
 
     let stmt_changed = pass.rewrite_stmt(stmt);
-    stmt_changed || nested_changed
+    let mut metadata_changed = false;
+    if let (Some(original_targets), HirStmt::Assign(assign)) = (original_assign_targets, &mut *stmt)
+        && assign.targets != original_targets
+    {
+        assign.generic_for_initializer_producer = None;
+        metadata_changed = true;
+    }
+    if let (Some(original_iterator), HirStmt::GenericFor(generic_for)) =
+        (original_generic_for_iterator, &mut *stmt)
+        && generic_for.iterator != original_iterator
+        && !pass.preserves_generic_for_initializer_transaction_on_iterator_rewrite()
+    {
+        generic_for.initializer_transaction = None;
+        metadata_changed = true;
+    }
+    stmt_changed || nested_changed || metadata_changed
 }
 
 fn rewrite_lvalue(lvalue: &mut HirLValue, pass: &mut impl HirRewritePass) -> bool {

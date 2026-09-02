@@ -83,6 +83,7 @@ pub(super) trait ScopedAstRewritePass {
         &mut self,
         block: &mut AstBlock,
         _condition: &AstExpr,
+        _lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
         outer_scope: &Self::Scope,
     ) -> (bool, Self::Scope) {
         self.enter_block(block, BlockKind::Regular, outer_scope)
@@ -202,8 +203,12 @@ fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
     pass: &mut P,
 ) -> bool {
     if let AstStmt::Repeat(repeat_stmt) = stmt {
-        let (block_changed, mut body_scope) =
-            pass.enter_repeat_body(&mut repeat_stmt.body, &repeat_stmt.cond, scope);
+        let (block_changed, mut body_scope) = pass.enter_repeat_body(
+            &mut repeat_stmt.body,
+            &repeat_stmt.cond,
+            &repeat_stmt.lifetime,
+            scope,
+        );
         let mut nested_changed = false;
         // repeat body 与 until 条件共享词法作用域；逐句推进后，条件必须看到
         // body 末尾已经生效的声明，而不能退回 repeat 外层 scope。

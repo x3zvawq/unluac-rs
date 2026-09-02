@@ -64,6 +64,9 @@ local function make_ephemeral_owner(state)
             return true
         end
     end
+    ephemeral.iterator = function()
+        return next_value
+    end
     return ephemeral
 end
 
@@ -89,6 +92,24 @@ end
 
 local loop_state = { collected = false }
 preserve_loop_receiver(make_ephemeral_owner(loop_state), loop_state)
+
+local mixed_loop_weak_values = setmetatable({}, { __mode = "v" })
+local function preserve_mixed_loop_receiver(source, values)
+    mixed_loop_weak_values.key = source
+    local receiver = source
+    for _ in receiver:iterator(), values, 0 do
+        source = nil
+        collectgarbage("collect")
+        collectgarbage("collect")
+        assert(
+            mixed_loop_weak_values.key ~= nil,
+            "mixed loop receiver left the weak table early"
+        )
+    end
+end
+
+local mixed_loop_state = { collected = false }
+preserve_mixed_loop_receiver(make_ephemeral_owner(mixed_loop_state), { true })
 
 local tail_method_weak_values = setmetatable({}, { __mode = "v" })
 local function preserve_tail_method_loop_receiver(source)

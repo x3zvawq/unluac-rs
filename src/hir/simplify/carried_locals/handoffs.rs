@@ -617,6 +617,7 @@ mod tests {
             physical_roots: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
+            preserved: BTreeSet::new(),
         }
     }
 
@@ -624,6 +625,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets,
             values: HirValuePack::fixed(values),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -644,6 +647,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: pairs.iter().map(|(target, _)| target.clone()).collect(),
             values: HirValuePack::fixed(pairs.into_iter().map(|(_, value)| value).collect()),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 

@@ -89,7 +89,7 @@ pub(super) fn choose_local_candidate(
     ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
-    if proto.signature.legacy_arg_slot && index == 0 {
+    if proto.signature.legacy_arg_slot && proto.vararg_param_local == Some(local) {
         return CandidateHint {
             text: "arg".to_owned(),
             source: NameSource::LegacyArg,

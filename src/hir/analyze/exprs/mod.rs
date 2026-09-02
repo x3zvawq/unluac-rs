@@ -10,7 +10,6 @@ mod defs;
 mod packs;
 mod regs;
 
-use crate::ast::is_lua_identifier_name;
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCapture, HirCaptureMode, HirClosureExpr,
     HirExpr, HirGlobalRef, HirLValue, HirPackTail, HirTableAccess, HirUnaryExpr, HirUnaryOpKind,
@@ -26,7 +25,7 @@ use crate::transformer::{
 };
 
 pub(super) use self::access::{
-    expr_for_const, expr_for_value_operand, global_name_for_access, lower_raw_table_get_expr,
+    expr_for_const, expr_for_value_operand, global_key_for_access, lower_raw_table_get_expr,
     lower_raw_table_set_call, lower_table_access_expr, lower_table_access_target,
     lower_upvalue_operand_expr, lower_upvalue_operand_target,
 };
@@ -52,7 +51,7 @@ use self::regs::{
     expr_for_reg_use_dup_safe, expr_for_reg_use_inline,
     expr_for_reg_use_single_eval_with_call_policy,
 };
-use super::helpers::{concat_expr, decode_raw_string, raw_lua_string, unresolved_expr};
+use super::helpers::{concat_expr, raw_lua_string, unresolved_expr};
 use super::lower::ProtoLowering;
 use super::shared_closures::CompositeFactoryRef;
 
@@ -68,7 +67,7 @@ pub(super) fn lower_closure_expr(
             args: Default::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }));
     }
     if let Some(local) = lowering.shared_closure_local(closure.creation) {
@@ -211,7 +210,7 @@ fn pack_tail_for_open_def(
     let instr = lowering.proto.instrs.get(open_def.instr.index())?;
     match instr {
         LowInstr::Call(call) if matches!(call.results, ResultPack::Open(_)) => {
-            let method_name = lower_method_name(lowering, call.method_name);
+            let method_key = lower_method_key(lowering, call.method_name);
             let callee = if single_eval {
                 expr_for_reg_use_single_eval_with_call_policy(
                     lowering,
@@ -240,7 +239,7 @@ fn pack_tail_for_open_def(
                     CallKind::FastCall(args) => Some(args),
                     CallKind::Normal | CallKind::Method => None,
                 },
-                method_name,
+                method_key,
             }))))
         }
         LowInstr::VarArg(vararg) if matches!(vararg.results, ResultPack::Open(_)) => {
@@ -266,10 +265,10 @@ fn reg_in_range(range: crate::transformer::RegRange, reg: Reg) -> bool {
     reg.index() >= range.start.index() && reg.index() < range.start.index() + range.len
 }
 
-pub(super) fn lower_method_name(
+pub(super) fn lower_method_key(
     lowering: &ProtoLowering<'_>,
     method_name: Option<MethodNameHint>,
-) -> Option<String> {
+) -> Option<crate::LuaString> {
     let const_ref = method_name?.const_ref;
     match lowering
         .proto
@@ -278,10 +277,7 @@ pub(super) fn lower_method_name(
         .literals
         .get(const_ref.index())
     {
-        Some(RawLiteralConst::String(value)) => {
-            let name = decode_raw_string(value);
-            is_lua_identifier_name(&name, lowering.target.version).then_some(name)
-        }
+        Some(RawLiteralConst::String(value)) => Some(raw_lua_string(value)),
         _ => None,
     }
 }

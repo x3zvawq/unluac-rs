@@ -1,4 +1,4 @@
-//! 渲染进度、失败详情、超时与最终汇总；依赖终端能力和 Options，不负责调度 case；例如在 TTY 使用进度条、非 TTY 输出稀疏里程碑。
+//! 渲染进度、失败详情、超时与最终汇总；依赖终端能力和 Options，不负责调度 case；例如在 TTY 重绘当前 case，同时输出持久里程碑与慢 case 心跳。
 
 use super::*;
 
@@ -69,6 +69,7 @@ pub(super) struct Reporter {
     mode: ReporterMode,
     palette: Palette,
     plain_progress_detail: PlainProgressDetail,
+    progress_enabled: bool,
 }
 
 impl Reporter {
@@ -76,7 +77,8 @@ impl Reporter {
         let palette = Palette {
             enabled: color_is_enabled(options.color),
         };
-        let mode = if progress_is_enabled(options.progress) {
+        let progress_enabled = !matches!(options.progress, ProgressMode::Off);
+        let mode = if progress_enabled && stderr_supports_live_updates() {
             let progress =
                 ProgressBar::with_draw_target(Some(total as u64), ProgressDrawTarget::stderr());
             progress.set_style(
@@ -91,6 +93,7 @@ impl Reporter {
             mode,
             palette,
             plain_progress_detail: options.plain_progress_detail,
+            progress_enabled,
         })
     }
 
@@ -134,11 +137,20 @@ impl Reporter {
         case: &UnitCaseDescriptor,
         event: ProgressEventKind,
     ) {
+        if !self.progress_enabled {
+            return;
+        }
         match &self.mode {
             ReporterMode::Interactive(progress) => {
                 let message = progress_message(self.palette, completed, total, active, case);
                 progress.set_position(completed as u64);
                 progress.set_message(message);
+                if should_emit_progress_milestone(event, completed, total) {
+                    eprintln!(
+                        "{}",
+                        sparse_progress_message(self.palette, completed, total, active)
+                    );
+                }
             }
             ReporterMode::Plain => match self.plain_progress_detail {
                 PlainProgressDetail::Verbose => {
@@ -146,7 +158,7 @@ impl Reporter {
                     eprintln!("{message}");
                 }
                 PlainProgressDetail::Sparse => {
-                    if should_emit_sparse_plain_progress(event, completed, total) {
+                    if should_emit_progress_milestone(event, completed, total) {
                         eprintln!(
                             "{}",
                             sparse_progress_message(self.palette, completed, total, active)
@@ -155,6 +167,16 @@ impl Reporter {
                 }
             },
         }
+    }
+
+    pub(super) fn emit_heartbeat(&self, completed: usize, total: usize, active: usize) {
+        if !self.progress_enabled {
+            return;
+        }
+        eprintln!(
+            "{}",
+            heartbeat_progress_message(self.palette, completed, total, active)
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -12,12 +12,15 @@
 //! - `repeat ...; if G then continue; if B then break until C` 会整理成
 //!   `repeat ... until not G and B or C`
 //! - 嵌套循环自己的 `continue` 保留原 owner，不会阻止外层 `repeat` 的尾部整理
+//!
+//! capture 边界只消费直接 closure 已保存的 metadata，不进入子函数的独立 LocalId 空间。
 
 use super::super::common::{
     AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLogicalExpr,
     AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
+use super::binding_flow::binding_is_directly_written_in_suffix;
 use super::control_flow::block_contains_label_or_goto;
 use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
@@ -627,11 +630,14 @@ impl AstVisitor for IdentityBoundaryVisitor {
         match stmt {
             AstStmt::LocalDecl(local_decl) => {
                 self.0 |= local_decl.bindings.iter().any(|binding| {
-                    binding.origin.is_debug_hinted() || !matches!(binding.attr, AstLocalAttr::None)
+                    binding.origin.is_debug_hinted()
+                        || !matches!(binding.attr, AstLocalAttr::None)
+                        || binding.rewrite_authority.must_preserve()
                 });
             }
             AstStmt::LocalFunctionDecl(local_function) => {
-                self.0 |= local_function.origin.is_debug_hinted();
+                self.0 |= local_function.origin.is_debug_hinted()
+                    || local_function.rewrite_authority.must_preserve();
             }
             _ => {}
         }
@@ -769,59 +775,78 @@ fn block_prevents_tail_extension(block: &AstBlock) -> bool {
         return true;
     }
 
-    block.stmts.iter().any(|stmt| match stmt {
-        AstStmt::LocalDecl(local_decl) => {
-            local_decl.bindings.iter().any(|binding| {
-                if binding.attr == AstLocalAttr::Close {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：把 continuation 收进该 arm 会把
-                    // `<close>` 的关闭点从原 arm 末尾推迟到 continuation 之后（regress_378）。
+    block
+        .stmts
+        .iter()
+        .enumerate()
+        .any(|(stmt_index, stmt)| match stmt {
+            AstStmt::LocalDecl(local_decl) => {
+                local_decl
+                    .bindings
+                    .iter()
+                    .enumerate()
+                    .any(|(binding_index, binding)| {
+                        if binding.attr == AstLocalAttr::Close {
+                            // 候选拒绝[SemanticBarrier:Lifetime]：把 continuation 收进该 arm 会把
+                            // `<close>` 的关闭点从原 arm 末尾推迟到 continuation 之后（regress_378）。
+                            true
+                        } else if binding.origin.is_physical_root() {
+                            // 候选拒绝[SemanticBarrier:Lifetime]：把 continuation 收进该 arm 会延长
+                            // PhysicalRoot 的强引用期，弱表或 `__gc` 可以观察到差异（regress_378）。
+                            true
+                        } else if binding.origin.is_debug_hinted() {
+                            // 候选拒绝[SemanticBarrier:DebugScope]：continuation 原本位于 debug local
+                            // 的词法范围外；下沉后 debug API 会在 continuation 中观察到该 binding
+                            // （regress_351）。
+                            true
+                        } else if !binding.rewrite_authority.may_shorten_lifetime() {
+                            // 候选拒绝[LayerBoundary]：HIR 已冻结该 binding 的结束边界；把
+                            // continuation 收进 arm 会延长它，AST 不再重建底层生命周期证明。
+                            true
+                        } else if local_decl.initializer_root_profile.as_ref().is_none_or(
+                            |profile| profile.may_affect_collectable_lifetime(binding_index),
+                        ) {
+                            // 候选拒绝[SemanticBarrier:Lifetime]：initializer 的原始 VM 结果类别
+                            // 只消费 HIR 发布的逐槽证明；缺失或越界事实必须 fail closed，AST
+                            // 不从最终表达式形状重建 value-pack 或 stack-root 语义。
+                            true
+                        } else {
+                            // 候选拒绝[ProofIncomplete]：HIR profile 只证明 declaration
+                            // initializer。若 binding 到原 block fallthrough 之间又被写入，scope-end
+                            // 值已不是该 initializer；AST 只证明候选区间没有写入，不分析 RHS
+                            // 类型。更精确的接受需要未来的 HIR endpoint certificate。
+                            binding_is_directly_written_in_suffix(
+                                &block.stmts,
+                                stmt_index + 1,
+                                binding.id,
+                            )
+                        }
+                    })
+            }
+            AstStmt::LocalFunctionDecl(local_function) => {
+                if local_function.origin.is_physical_root() {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：local function 的 PhysicalRoot 原本在
+                    // arm 末尾释放，下沉 continuation 会延长闭包强引用期。
                     true
-                } else if binding.origin.is_physical_root() {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：把 continuation 收进该 arm 会延长
-                    // PhysicalRoot 的强引用期，弱表或 `__gc` 可以观察到差异（regress_378）。
-                    true
-                } else if binding.origin.is_debug_hinted() {
-                    // 候选拒绝[SemanticBarrier:DebugScope]：continuation 原本位于 debug local
-                    // 的词法范围外；下沉后 debug API 会在 continuation 中观察到该 binding
-                    // （regress_351）。
+                } else if local_function.origin.is_debug_hinted() {
+                    // 候选拒绝[SemanticBarrier:DebugScope]：下沉 continuation 会扩大 debug
+                    // local-function binding 的可观察词法范围。
                     true
                 } else {
-                    false
+                    // 候选拒绝[SemanticBarrier:Lifetime]：local-function binding 本身持有闭包；
+                    // 把 continuation 收进 arm 会延长闭包及其 capture 的强引用期
+                    // （regress_378 用 `collectgarbage` 观察 captured object 的释放点）。
+                    true
                 }
-            }) || {
-                // 候选拒绝[SemanticBarrier:Lifetime]：普通 recovered local 若接住可能可回收的值，
-                // continuation 中的弱表/`collectgarbage` 能观察到 arm 末尾与下沉后末尾之间的
-                // root 差异；只有 primitive value local 才能越过该边界（regress_378）。
-                local_decl.bindings.iter().enumerate().any(|(index, _)| {
-                    local_binding_initial_value(&local_decl.values, index)
-                        .is_some_and(|value| !expr_is_gc_inert_local_value(value))
-                })
             }
-        }
-        AstStmt::LocalFunctionDecl(local_function) => {
-            if local_function.origin.is_physical_root() {
-                // 候选拒绝[SemanticBarrier:Lifetime]：local function 的 PhysicalRoot 原本在
-                // arm 末尾释放，下沉 continuation 会延长闭包强引用期。
-                true
-            } else if local_function.origin.is_debug_hinted() {
-                // 候选拒绝[SemanticBarrier:DebugScope]：下沉 continuation 会扩大 debug
-                // local-function binding 的可观察词法范围。
-                true
-            } else {
-                // 候选拒绝[SemanticBarrier:Lifetime]：local-function binding 本身持有闭包；
-                // 把 continuation 收进 arm 会延长闭包及其 capture 的强引用期
-                // （regress_378 用 `collectgarbage` 观察 captured object 的释放点）。
+            AstStmt::GlobalDecl(_) => {
+                // 候选拒绝[SemanticBarrier:Scope]：Lua 5.5 中 `global x` 的词法效力原本
+                // 在 arm 末尾结束；把后缀 `x = value` 收进 arm 会把未声明访问变成已声明访问
+                // （cleanup::keeps_repeat_tail_global_declaration_scope 使用同一边界）。
                 true
             }
-        }
-        AstStmt::GlobalDecl(_) => {
-            // 候选拒绝[SemanticBarrier:Scope]：Lua 5.5 中 `global x` 的词法效力原本
-            // 在 arm 末尾结束；把后缀 `x = value` 收进 arm 会把未声明访问变成已声明访问
-            // （cleanup::keeps_repeat_tail_global_declaration_scope 使用同一边界）。
-            true
-        }
-        _ => false,
-    })
+            _ => false,
+        })
 }
 
 fn block_captures_direct_local(block: &AstBlock) -> bool {
@@ -853,7 +878,10 @@ fn block_captures_direct_local(block: &AstBlock) -> bool {
                 .direct_bindings
                 .iter()
                 .any(|binding| function.captured_bindings.contains(binding));
-            true
+            // `captured_bindings` 已完整描述这个直接 closure 对当前 owner 的 capture；
+            // 不能再进入 child body 比较裸 LocalId，因为 child 使用独立的 local
+            // 命名空间，相同数字不表示同一 binding。
+            false
         }
     }
 
@@ -863,46 +891,6 @@ fn block_captures_direct_local(block: &AstBlock) -> bool {
     };
     visit::visit_block(block, &mut visitor);
     visitor.found
-}
-
-fn local_binding_initial_value(values: &[AstExpr], index: usize) -> Option<&AstExpr> {
-    values.get(index).or_else(|| {
-        let tail = values.last()?;
-        (index >= values.len()
-            && matches!(
-                tail,
-                AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
-            ))
-        .then_some(tail)
-    })
-}
-
-fn expr_is_gc_inert_local_value(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Vector(_) => true,
-        AstExpr::SingleValue(inner) => expr_is_gc_inert_local_value(inner),
-        AstExpr::String(_)
-        | AstExpr::Var(_)
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Unary(_)
-        | AstExpr::Binary(_)
-        | AstExpr::LogicalAnd(_)
-        | AstExpr::LogicalOr(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::VarArg
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_)
-        | AstExpr::Error(_) => false,
-    }
 }
 
 fn is_empty_return_stmt(stmt: &AstStmt) -> bool {
@@ -938,11 +926,13 @@ mod tests {
 
     use super::*;
     use crate::ast::common::{
-        AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstGlobalAttr, AstGlobalBinding,
-        AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstLabel, AstLabelId,
-        AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstRepeat, AstWhile,
+        AstAssign, AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstGlobalAttr,
+        AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstLValue,
+        AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin,
+        AstRepeat, AstWhile,
     };
-    use crate::hir::{HirProtoRef, LocalId};
+    use crate::decompile::DecompileDialect;
+    use crate::hir::{HirExpr, HirProtoRef, HirValuePack, LocalId, initializer_root_profile};
 
     fn global_expr(name: &str) -> AstExpr {
         AstExpr::Var(crate::ast::common::AstNameRef::Global(AstGlobalName {
@@ -954,7 +944,7 @@ mod tests {
         AstExpr::Call(Box::new(AstCallExpr {
             callee: global_expr(name),
             args: Vec::new(),
-            method_name: None,
+            method_key: None,
         }))
     }
 
@@ -982,7 +972,7 @@ mod tests {
                     capture_names_by_upvalue: std::collections::BTreeMap::new(),
                     capture_write_names: BTreeSet::new(),
                 }))],
-                method_name: None,
+                method_key: None,
             })),
         }))
     }
@@ -1012,6 +1002,7 @@ mod tests {
                 ],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }))
     }
 
@@ -1021,8 +1012,15 @@ mod tests {
                 id: AstBindingRef::Local(LocalId(id)),
                 attr: AstLocalAttr::None,
                 origin: AstLocalOrigin::Recovered,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: vec![AstExpr::Integer(1)],
+            initializer_merge_transaction: None,
+            initializer_root_profile: Some(initializer_root_profile(
+                DecompileDialect::Lua54,
+                &HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                1,
+            )),
         }))
     }
 
@@ -1051,6 +1049,11 @@ mod tests {
             unreachable!("recovered_local must produce a local declaration");
         };
         local_decl.values[0] = call_expr("make_value");
+        local_decl.initializer_root_profile = Some(initializer_root_profile(
+            DecompileDialect::Lua54,
+            &HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(id + 1))]),
+            1,
+        ));
         stmt
     }
 
@@ -1373,6 +1376,7 @@ mod tests {
                 ],
             },
             cond: global_expr("latch"),
+            lifetime: Default::default(),
         };
 
         assert!(fold_repeat_tail_continue_break(&mut repeat_stmt));
@@ -1390,6 +1394,7 @@ mod tests {
                 stmts: vec![break_guard("skip"), call_stmt("tail")],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }));
 
         assert!(BranchPrettyPass.rewrite_stmt(&mut stmt));
@@ -1428,6 +1433,7 @@ mod tests {
                 ],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }));
 
         assert!(BranchPrettyPass.rewrite_stmt(&mut stmt));
@@ -1463,6 +1469,7 @@ mod tests {
                 ],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }));
 
         assert!(BranchPrettyPass.rewrite_stmt(&mut stmt));
@@ -1498,6 +1505,7 @@ mod tests {
                 ],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }));
 
         assert!(BranchPrettyPass.rewrite_stmt(&mut stmt));
@@ -1522,6 +1530,7 @@ mod tests {
                 ],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }));
 
         assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));
@@ -1547,6 +1556,7 @@ mod tests {
                 ],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }));
 
         assert!(BranchPrettyPass.rewrite_stmt(&mut stmt));
@@ -1574,11 +1584,22 @@ mod tests {
     }
 
     #[test]
-    fn keeps_single_pass_fence_when_tail_would_extend_recovered_call_root() {
+    fn keeps_single_pass_fence_when_tail_would_extend_recovered_or_reassigned_root() {
         let mut stmt = single_pass_fallthrough_arm(vec![recovered_call_local(0)]);
 
         assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));
         assert!(matches!(stmt, AstStmt::Repeat(_)));
+
+        let binding = AstBindingRef::Local(LocalId(0));
+        let write = AstStmt::Assign(Box::new(AstAssign {
+            targets: vec![AstLValue::Name(binding.to_name_ref())],
+            values: vec![call_expr("make_value")],
+            initializer_merge_transaction: None,
+        }));
+        let mut reassigned = single_pass_fallthrough_arm(vec![recovered_local(0), write]);
+
+        assert!(!BranchPrettyPass.rewrite_stmt(&mut reassigned));
+        assert!(matches!(reassigned, AstStmt::Repeat(_)));
     }
 
     #[test]
@@ -1601,6 +1622,7 @@ mod tests {
                 }))],
             },
             cond: AstExpr::Boolean(true),
+            lifetime: Default::default(),
         }));
 
         assert!(!BranchPrettyPass.rewrite_stmt(&mut stmt));

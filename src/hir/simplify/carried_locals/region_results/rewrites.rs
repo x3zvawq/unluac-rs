@@ -427,6 +427,7 @@ pub(super) fn apply_loop_result_rewrites(
     rewrite_end: usize,
     rewrites: BTreeMap<CarryBinding, CarryBinding>,
     promotion_facts: &mut ProtoPromotionFacts,
+    has_fallthrough_exit: bool,
 ) {
     let prunable = rewrites.values().copied().collect::<BTreeSet<_>>();
     let boundary = (rewrite_end < block.stmts.len()).then_some(rewrite_end);
@@ -439,9 +440,8 @@ pub(super) fn apply_loop_result_rewrites(
             rewrite_break_exit_assignments(&mut while_stmt.body, &mut pass)
         }
         HirStmt::Repeat(repeat_stmt) => {
-            let falls_through = block_may_fall_through(&repeat_stmt.body);
             let mut rewritten = rewrite_break_exit_assignments(&mut repeat_stmt.body, &mut pass);
-            if falls_through {
+            if has_fallthrough_exit {
                 rewritten |= rewrite_terminal_assignments_mut(
                     repeat_stmt
                         .body
@@ -575,6 +575,8 @@ fn rewrite_boundary_assignment_reads(
             .map(|index| original_targets[*index].clone())
             .collect(),
         values: assign.values.clone(),
+        initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }));
     let rewritten = rewrite_stmts(std::slice::from_mut(&mut scratch), pass);
     let HirStmt::Assign(scratch) = scratch else {
@@ -595,6 +597,9 @@ fn rewrite_boundary_assignment_reads(
             }
         })
         .collect();
+    if rewritten {
+        assign.generic_for_initializer_producer = None;
+    }
     rewritten
 }
 
@@ -608,6 +613,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(LocalId(0))],
             values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -666,10 +673,14 @@ mod tests {
         let overwritten = HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Param(ParamId(0))],
             values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0)), HirExpr::Integer(7)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
         let preserved = HirAssign {
             targets: vec![HirLValue::Param(ParamId(0)), HirLValue::Local(LocalId(0))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::ParamRef(ParamId(0))]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
         let overwritten = assignment_values(&overwritten);
         let preserved = assignment_values(&preserved);
@@ -713,6 +724,8 @@ mod tests {
                         CarryBinding::Local(local) => HirExpr::LocalRef(local),
                         CarryBinding::Param(_) | CarryBinding::Temp(_) => unreachable!(),
                     }]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -720,10 +733,12 @@ mod tests {
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![LocalId(1)],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                initializer_merge_transaction: None,
             })),
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![LocalId(2)],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
+                initializer_merge_transaction: None,
             })),
         ];
         let index = RegionResultIndex::new(&stmts);
@@ -747,6 +762,8 @@ mod tests {
                 assignment_values(&HirAssign {
                     targets: vec![HirLValue::Local(LocalId(0))],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(seed)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })
             })
             .collect::<Vec<_>>();
@@ -754,10 +771,12 @@ mod tests {
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![LocalId(1)],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                initializer_merge_transaction: None,
             })),
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![LocalId(2)],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
+                initializer_merge_transaction: None,
             })),
             HirStmt::Block(Box::default()),
             HirStmt::Return(Box::new(crate::hir::common::HirReturn {
@@ -793,10 +812,14 @@ mod tests {
                 HirExpr::ParamRef(ParamId(0)),
                 HirExpr::ParamRef(ParamId(0)),
             ]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         });
         let equal_literals = assignment_values(&HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(7)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         });
         let index = RegionResultIndex::new(&[]);
 
@@ -823,10 +846,14 @@ mod tests {
                 HirExpr::ParamRef(ParamId(0)),
                 HirExpr::ParamRef(ParamId(0)),
             ]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         });
         let distinct = assignment_values(&HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         });
         let index = RegionResultIndex::new(&[]);
 
@@ -853,6 +880,8 @@ mod tests {
                 HirExpr::LocalRef(LocalId(1)),
                 HirExpr::ParamRef(ParamId(0)),
             ]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         });
         let index = RegionResultIndex::new(&[]);
 

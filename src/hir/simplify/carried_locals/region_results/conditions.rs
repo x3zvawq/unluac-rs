@@ -252,12 +252,52 @@ mod tests {
         let stmt = HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![local],
             values: HirValuePack::expanding(Vec::new(), HirPackTail::open(HirExpr::VarArg)),
+            initializer_merge_transaction: None,
         }));
 
         assert_eq!(
             condition_scratch_producer(&stmt),
             Some((local, &HirExpr::VarArg))
         );
+
+        let mut block = HirBlock {
+            stmts: vec![
+                stmt,
+                HirStmt::If(Box::new(crate::hir::common::HirIf {
+                    cond: HirExpr::LocalRef(local),
+                    then_block: HirBlock::default(),
+                    else_block: None,
+                })),
+            ],
+        };
+        let before = block.clone();
+        let mut identity = HandoffIdentityFacts {
+            debug: BTreeSet::new(),
+            for_bindings: BTreeSet::new(),
+            physical_roots: BTreeSet::new(),
+            reference_captured: BTreeSet::new(),
+            to_be_closed: BTreeSet::new(),
+            preserved: BTreeSet::from([CarryBinding::Local(local)]),
+        };
+        assert!(!inline_owned_branch_conditions(
+            &mut block,
+            &BTreeSet::from([local]),
+            &BTreeSet::new(),
+            &identity,
+        ));
+        assert_eq!(block, before);
+
+        identity.preserved.clear();
+        assert!(inline_owned_branch_conditions(
+            &mut block,
+            &BTreeSet::from([local]),
+            &BTreeSet::new(),
+            &identity,
+        ));
+        assert!(matches!(
+            block.stmts.as_slice(),
+            [HirStmt::If(if_stmt)] if if_stmt.cond == HirExpr::VarArg
+        ));
     }
 
     #[test]
@@ -268,6 +308,7 @@ mod tests {
                 vec![HirExpr::Boolean(true)],
                 HirPackTail::open(HirExpr::VarArg),
             ),
+            initializer_merge_transaction: None,
         }));
 
         assert!(condition_scratch_producer(&stmt).is_none());
@@ -278,10 +319,14 @@ mod tests {
         let padded = HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
         let truncated = HirAssign {
             targets: vec![HirLValue::Local(LocalId(0))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(8)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
 
         let padded = assignment_values(&padded);
@@ -309,6 +354,8 @@ mod tests {
         let assign = HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::expanding(Vec::new(), HirPackTail::open(HirExpr::VarArg)),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
 
         let values = assignment_values(&assign);
@@ -335,6 +382,8 @@ mod tests {
         let assign = HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(0))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(8)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
 
         let values = assignment_values(&assign);
@@ -357,6 +406,8 @@ mod tests {
                 HirExpr::LocalRef(LocalId(1)),
                 HirExpr::LocalRef(LocalId(0)),
             ]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
 
         assert!(result_assignment_values(&assign, &[result]).is_none());
@@ -369,6 +420,8 @@ mod tests {
         let assign = HirAssign {
             targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1)), HirExpr::Integer(7)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
 
         let values = result_assignment_values(&assign, &[result])
@@ -391,6 +444,8 @@ mod tests {
                 })),
             ],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1)), HirExpr::Integer(7)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         };
 
         assert!(result_assignment_values(&assign, &[result]).is_none());

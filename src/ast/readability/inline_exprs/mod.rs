@@ -24,7 +24,7 @@ mod use_sites;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::ReadabilityOptions;
+use crate::decompile::ReadabilityOptions;
 
 pub(super) use self::candidate::local_attr_belongs_to_inline_pipeline;
 use self::candidate::{
@@ -353,7 +353,7 @@ fn rewrite_current_block(
             InlinePolicy::Conservative
         };
         if matches!(policy, InlinePolicy::AliasInitializerChain)
-            && alias_initializer_shortens_root(&old_stmts, index + 1, value, &write_index)
+            && alias_initializer_shortens_root(&old_stmts, index + 1, candidate, &write_index)
         {
             // 候选拒绝[SemanticBarrier:Lifetime]：删除 source declaration 后，sink 的后续
             // 覆盖会提前释放原 source root。只有 `if sink == nil then sink = ... end`
@@ -558,10 +558,10 @@ fn rewrite_current_block(
 fn alias_initializer_shortens_root(
     stmts: &[AstStmt],
     sink_index: usize,
-    value: &AstExpr,
+    source: InlineCandidate,
     write_index: &BindingWriteIndex,
 ) -> bool {
-    if result_cannot_root_collectable(value) {
+    if !source.initializer_may_affect_collectable_lifetime() {
         return false;
     }
     let Some((sink, _)) = stmts.get(sink_index).and_then(inline_candidate) else {
@@ -767,7 +767,10 @@ fn collapse_stable_copy_aliases(
                         continue;
                     }
                 }
-                AstNameRef::Global(_) | AstNameRef::Upvalue(_) | AstNameRef::Temp(_) => {
+                AstNameRef::Environment
+                | AstNameRef::Global(_)
+                | AstNameRef::Upvalue(_)
+                | AstNameRef::Temp(_) => {
                     unreachable!("stable-copy expression filter only admits lexical names")
                 }
             }
@@ -940,7 +943,7 @@ fn stable_copy_trailing_root_handoff(
             // 截获而不保存值，不能充当强 root handoff。
             return None;
         }
-        AstNameRef::Upvalue(_) => {
+        AstNameRef::Upvalue(_) | AstNameRef::Environment => {
             // 候选拒绝[SemanticBarrier:Capture]：sibling closure 可在 handoff 后、latch 前
             // 覆盖同一 upvalue；当前函数内的 write index 无法把该外部写排除，target 因而
             // 不保证继续承载旧快照/root。
@@ -1324,7 +1327,10 @@ mod tests {
         AstNameRef, AstRepeat, AstReturn, AstTableConstructor, AstTableField, AstWhile,
     };
     use crate::decompile::DecompileDialect;
-    use crate::hir::{HirProtoRef, LocalId, ParamId, UpvalueId};
+    use crate::hir::{
+        HirBinaryExpr, HirBinaryOpKind, HirExpr, HirProtoRef, HirUnaryExpr, HirUnaryOpKind,
+        HirValuePack, LocalId, ParamId, UpvalueId, initializer_root_profile,
+    };
 
     use super::*;
 
@@ -1338,8 +1344,11 @@ mod tests {
                 id: binding,
                 attr: AstLocalAttr::None,
                 origin: AstLocalOrigin::Recovered,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: vec![value],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }))
     }
 
@@ -1349,9 +1358,24 @@ mod tests {
                 id: binding,
                 attr: AstLocalAttr::None,
                 origin: AstLocalOrigin::DebugHinted,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: vec![value],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }))
+    }
+
+    fn with_hir_initializer_profile(mut stmt: AstStmt, value: HirExpr) -> AstStmt {
+        let AstStmt::LocalDecl(local_decl) = &mut stmt else {
+            unreachable!("profile fixture requires a local declaration");
+        };
+        local_decl.initializer_root_profile = Some(initializer_root_profile(
+            DecompileDialect::Lua54,
+            &HirValuePack::fixed(vec![value]),
+            1,
+        ));
+        stmt
     }
 
     fn equals(lhs: AstExpr, rhs: AstExpr) -> AstExpr {
@@ -1377,7 +1401,7 @@ mod tests {
                     text: name.to_owned(),
                 })),
                 args: vec![arg],
-                method_name: None,
+                method_key: None,
             })),
         }))
     }
@@ -1388,7 +1412,7 @@ mod tests {
                 text: name.to_owned(),
             })),
             args: vec![arg],
-            method_name: None,
+            method_key: None,
         }))
     }
 
@@ -1396,6 +1420,7 @@ mod tests {
         AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(target.to_name_ref())],
             values: vec![value],
+            initializer_merge_transaction: None,
         }))
     }
 
@@ -1467,17 +1492,36 @@ mod tests {
         }));
         let mut block = AstBlock {
             stmts: vec![
-                recovered_local(first, scalar.clone()),
-                recovered_local(second, negated),
+                with_hir_initializer_profile(
+                    recovered_local(first, scalar.clone()),
+                    HirExpr::Binary(Box::new(HirBinaryExpr {
+                        op: HirBinaryOpKind::Add,
+                        lhs: HirExpr::Number(1.5),
+                        rhs: HirExpr::Number(2.5),
+                    })),
+                ),
+                with_hir_initializer_profile(
+                    recovered_local(second, negated),
+                    HirExpr::Unary(Box::new(HirUnaryExpr {
+                        op: HirUnaryOpKind::Not,
+                        expr: HirExpr::LocalRef(LocalId(0)),
+                    })),
+                ),
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::Name(AstNameRef::Global(AstGlobalName {
                         text: "sink".to_owned(),
                     }))],
                     values: vec![AstExpr::Var(second.to_name_ref())],
+                    initializer_merge_transaction: None,
                 })),
                 return_values(vec![AstExpr::Integer(0)]),
             ],
         };
+
+        for stmt in &block.stmts[..2] {
+            let (candidate, _) = inline_candidate(stmt).expect("run member must be a candidate");
+            assert!(!candidate.initializer_may_affect_collectable_lifetime());
+        }
 
         assert!(collapse_adjacent_mechanical_alias_runs(
             &mut block,
@@ -1819,6 +1863,7 @@ mod tests {
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::Name(target.clone())],
                     values: vec![AstExpr::Var(snapshot.to_name_ref())],
+                    initializer_merge_transaction: None,
                 })),
                 assign_name(source, AstExpr::Nil),
             ],
@@ -1891,6 +1936,7 @@ mod tests {
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::Name(sink.to_name_ref())],
                     values: vec![AstExpr::Nil],
+                    initializer_merge_transaction: None,
                 })),
             ],
         };
@@ -2178,6 +2224,7 @@ mod tests {
                         ],
                     },
                     cond: AstExpr::Var(snapshot.to_name_ref()),
+                    lifetime: Default::default(),
                 }))],
             },
         };
@@ -2237,19 +2284,23 @@ mod tests {
                         id: binding,
                         attr: AstLocalAttr::None,
                         origin: AstLocalOrigin::Recovered,
+                        rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: vec![global("factory")],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::CallStmt(Box::new(AstCallStmt {
                     call: AstCallKind::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(binding.to_name_ref()),
                         args: Vec::new(),
-                        method_name: None,
+                        method_key: None,
                     })),
                 })),
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::Name(binding.to_name_ref())],
                     values: vec![global("replacement")],
+                    initializer_merge_transaction: None,
                 })),
             ],
         };
@@ -2278,14 +2329,17 @@ mod tests {
                         id: binding,
                         attr: AstLocalAttr::None,
                         origin: AstLocalOrigin::Recovered,
+                        rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: vec![global],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::CallStmt(Box::new(AstCallStmt {
                     call: AstCallKind::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(binding.to_name_ref()),
                         args: vec![AstExpr::Boolean(true)],
-                        method_name: None,
+                        method_key: None,
                     })),
                 })),
             ],
@@ -2322,14 +2376,17 @@ mod tests {
                         id: binding,
                         attr: AstLocalAttr::None,
                         origin: AstLocalOrigin::PhysicalRoot,
+                        rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: vec![global],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::CallStmt(Box::new(AstCallStmt {
                     call: AstCallKind::Call(Box::new(AstCallExpr {
                         callee: AstExpr::Var(binding.to_name_ref()),
                         args: vec![AstExpr::Boolean(true)],
-                        method_name: None,
+                        method_key: None,
                     })),
                 })),
             ],
@@ -2524,7 +2581,7 @@ mod tests {
                 field: "fallback".to_owned(),
             })),
             args: Vec::new(),
-            method_name: None,
+            method_key: None,
         }));
         let logical = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
             lhs: AstExpr::Var(binding.to_name_ref()),
@@ -2567,8 +2624,11 @@ mod tests {
                             id: binding,
                             attr: AstLocalAttr::None,
                             origin,
+                            rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                         }],
                         values: vec![lookup],
+                        initializer_merge_transaction: None,
+                        initializer_root_profile: None,
                     })),
                     return_values(vec![logical]),
                 ],
@@ -2584,6 +2644,38 @@ mod tests {
             ));
             assert_eq!(block, expected);
         }
+
+        let binding = AstBindingRef::Local(LocalId(0));
+        let mut preserved = recovered_local(
+            binding,
+            indexed(
+                AstExpr::Var(AstNameRef::Local(LocalId(1))),
+                AstExpr::Var(AstNameRef::Param(ParamId(0))),
+            ),
+        );
+        let AstStmt::LocalDecl(local_decl) = &mut preserved else {
+            unreachable!("fixture must remain a local declaration")
+        };
+        local_decl.bindings[0].rewrite_authority = crate::ast::common::AstRewriteAuthority::Hir(
+            crate::hir::HirInlineDisposition::Preserve(BTreeSet::from([
+                crate::hir::HirInlineRetentionReason::CapturedValueEpoch,
+            ])),
+        );
+        let mut block = AstBlock {
+            stmts: vec![
+                preserved,
+                return_values(vec![AstExpr::Var(binding.to_name_ref())]),
+            ],
+        };
+        let expected = block.clone();
+        assert!(!rewrite_current_block(
+            &mut block,
+            lua54_target(),
+            ReadabilityOptions::default(),
+            &MutableSnapshotNames::new(),
+            None,
+        ));
+        assert_eq!(block, expected);
     }
 
     #[test]

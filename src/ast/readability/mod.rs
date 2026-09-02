@@ -28,31 +28,11 @@ mod visit;
 mod walk;
 
 use super::common::{AstModule, AstTargetDialect};
-use crate::decompile::{DecompileContext, DecompileError, DecompileState};
+use crate::decompile::{DecompileContext, DecompileError, DecompileState, ReadabilityOptions};
 use crate::scheduler::{
     InvalidationConvergence, InvalidationTag, PassDescriptor, PassPhase, run_invalidation_loop,
 };
 use crate::timing::TimingCollector;
-
-/// 可调的源码形状阈值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReadabilityOptions {
-    pub return_inline_max_complexity: usize,
-    pub index_inline_max_complexity: usize,
-    pub args_inline_max_complexity: usize,
-    pub access_base_inline_max_complexity: usize,
-}
-
-impl Default for ReadabilityOptions {
-    fn default() -> Self {
-        Self {
-            return_inline_max_complexity: 10,
-            index_inline_max_complexity: 10,
-            args_inline_max_complexity: 6,
-            access_base_inline_max_complexity: 5,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(super) struct ReadabilityContext {
@@ -134,10 +114,20 @@ const PASS_DESCRIPTORS: &[PassDescriptor<AstInvalidation>] = &[
         phase: PassPhase::Normal,
         // literal-fold can expose a constant condition after the initial branch pass;
         // rerun here so the control shell consumes that proven ExprShape fact.
-        depends_on: &[ControlFlowShape, StatementAdjacency, ExprShape],
+        depends_on: &[
+            ControlFlowShape,
+            StatementAdjacency,
+            ExprShape,
+            BindingStructure,
+        ],
         // branch-pretty 也会新建 `not`、`and`、`or` 条件；必须重置 ExprShape，
         // 让 literal-fold 与表达式消费者在下一轮看到新形状。
-        invalidates: &[ControlFlowShape, StatementAdjacency, ExprShape],
+        invalidates: &[
+            ControlFlowShape,
+            StatementAdjacency,
+            ExprShape,
+            BindingStructure,
+        ],
     },
     PassDescriptor {
         name: "field-access-sugar",
@@ -373,6 +363,7 @@ mod tests {
                         capture_names_by_upvalue: std::collections::BTreeMap::new(),
                         capture_write_names: BTreeSet::new(),
                     }))],
+                    initializer_merge_transaction: None,
                 }))],
             },
         };
@@ -419,12 +410,14 @@ mod tests {
     }
 
     #[test]
-    fn branch_pretty_reawakens_expression_consumers() {
+    fn branch_pretty_reawakens_expression_and_binding_consumers() {
         let descriptor = PASS_DESCRIPTORS
             .iter()
             .find(|descriptor| descriptor.name == "branch-pretty")
             .expect("branch-pretty descriptor must exist");
 
+        assert!(descriptor.depends_on.contains(&BindingStructure));
         assert!(descriptor.invalidates.contains(&ExprShape));
+        assert!(descriptor.invalidates.contains(&BindingStructure));
     }
 }

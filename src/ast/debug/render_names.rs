@@ -253,6 +253,7 @@ pub(super) fn collect_name_ref(
         AstNameRef::Param(_)
         | AstNameRef::Temp(_)
         | AstNameRef::Upvalue(_)
+        | AstNameRef::Environment
         | AstNameRef::Global(_) => {}
     }
 }

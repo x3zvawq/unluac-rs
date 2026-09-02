@@ -998,6 +998,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(local)],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -1030,17 +1032,21 @@ mod tests {
             params: Vec::new(),
             param_debug_hints: Vec::new(),
             locals: Vec::new(),
+            vararg_param_local: None,
             local_debug_hints: Vec::new(),
             local_debug_scopes: Vec::new(),
             debug_scopes: Vec::new(),
             physical_root_temps: BTreeSet::new(),
             physical_root_locals: BTreeSet::new(),
+            inline_dispositions: Default::default(),
             upvalues: Vec::new(),
+            environment_upvalues: BTreeSet::new(),
             mutable_upvalues: BTreeSet::new(),
             upvalue_debug_hints: Vec::new(),
             temps: Vec::new(),
             temp_debug_locals: Vec::new(),
             temp_debug_scopes: Vec::new(),
+            exit_requirements: Vec::new(),
             body: HirBlock::default(),
             children: Vec::new(),
             failure: None,

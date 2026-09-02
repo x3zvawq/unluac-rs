@@ -1,15 +1,15 @@
-//! 这个子模块负责 table-constructor pass 里的 binding 识别与字段键翻译。
+//! 这个子模块负责 table-constructor pass 里的 binding 识别与使用索引。
 //!
 //! 它依赖 HIR 已经分好的 lvalue/expr 形状，回答“这个读写是不是同一个构造器绑定”，
 //! 并用稳定 stmt id 索引 binding 的 use/mention 位置；不会扫描候选 region 或重建字段序列。
-//! 例如：`t.x = v` 会在这里把键翻成 `Name(\"x\")` 并识别 `t` 的绑定身份。
+//! 例如：`t[k] = v` 会在这里识别 `t` 的绑定身份，并把 `k` 作为普通语义表达式统计；
+//! 键最终能否写成 `name = value` 不属于 HIR binding facts。
 
 use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Unbounded};
 
-use crate::ast::{DecompileDialect, is_lua_identifier_name};
 use crate::hir::common::{
-    HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey,
+    HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -37,16 +37,6 @@ pub(super) fn binding_from_expr(expr: &HirExpr) -> Option<TableBinding> {
 
 pub(super) fn matches_binding_ref(expr: &HirExpr, binding: TableBinding) -> bool {
     binding_from_expr(expr) == Some(binding)
-}
-
-pub(super) fn table_key_from_expr(expr: &HirExpr, dialect: DecompileDialect) -> HirTableKey {
-    if let HirExpr::String(name) = expr
-        && let Some(name) = name.as_utf8()
-        && is_lua_identifier_name(name, dialect)
-    {
-        return HirTableKey::Name(name.to_owned());
-    }
-    HirTableKey::Expr(expr.clone())
 }
 
 pub(super) struct BindingFacts {
@@ -546,9 +536,6 @@ fn decision_target_uses_binding(target: &HirDecisionTarget, binding: TableBindin
     }
 }
 
-fn table_key_uses_binding(key: &HirTableKey, binding: TableBinding) -> bool {
-    match key {
-        HirTableKey::Name(_) => false,
-        HirTableKey::Expr(expr) => expr_uses_binding(expr, binding),
-    }
+fn table_key_uses_binding(key: &HirExpr, binding: TableBinding) -> bool {
+    expr_uses_binding(key, binding)
 }

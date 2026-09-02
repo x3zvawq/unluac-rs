@@ -53,6 +53,7 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         &mut self,
         block: &mut AstBlock,
         condition: &AstExpr,
+        _lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
         outer_locals: &Self::Scope,
     ) -> (bool, Self::Scope) {
         enter_block_with_trailing_condition(block, Some(condition), *outer_locals)
@@ -230,6 +231,7 @@ fn scopeable_bindings(stmt: &AstStmt) -> Option<ScopeableBindings<'_>> {
                 && decl.bindings.iter().all(|binding| {
                     binding.attr == AstLocalAttr::None
                         && binding.origin == AstLocalOrigin::Recovered
+                        && binding.rewrite_authority.may_shorten_lifetime()
                 }) =>
         {
             Some(ScopeableBindings {
@@ -237,7 +239,10 @@ fn scopeable_bindings(stmt: &AstStmt) -> Option<ScopeableBindings<'_>> {
                 local_function: None,
             })
         }
-        AstStmt::LocalFunctionDecl(decl) if decl.origin == AstLocalOrigin::Recovered => {
+        AstStmt::LocalFunctionDecl(decl)
+            if decl.origin == AstLocalOrigin::Recovered
+                && decl.rewrite_authority.may_shorten_lifetime() =>
+        {
             Some(ScopeableBindings {
                 locals: &[],
                 local_function: Some(decl.name),
@@ -386,8 +391,11 @@ mod tests {
                 id: AstBindingRef::Local(LocalId(index)),
                 attr: AstLocalAttr::None,
                 origin: AstLocalOrigin::Recovered,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: vec![AstExpr::Integer(index as i64)],
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }))
     }
 

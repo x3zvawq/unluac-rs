@@ -3,7 +3,7 @@
 //! HIR 已经进入“变量世界”，因此这里的核心职责是提供稳定的绑定身份、结构化
 //! 语句节点、保真的纯字面量以及少量受控 fallback 节点，供 AST/Readability/Naming 继续消费。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
@@ -28,6 +28,10 @@ pub struct HirProto {
     pub params: Vec<ParamId>,
     pub param_debug_hints: Vec<Option<String>>,
     pub locals: Vec<LocalId>,
+    /// 函数入口由 VM 变参参数寄存器承载的 local 身份。
+    ///
+    /// 该身份在 binding 分配时冻结；AST 是否把它写进形参列表仍由签名种类和真实使用决定。
+    pub vararg_param_local: Option<LocalId>,
     pub local_debug_hints: Vec<Option<String>>,
     /// `local_debug_hints` 对应的源码局部作用域身份；合成 local 为 `None`。
     pub local_debug_scopes: Vec<Option<usize>>,
@@ -43,7 +47,18 @@ pub struct HirProto {
     /// AST cleanup must not remove or shorten these declarations: the VM stack slot can keep a
     /// call result, escaped allocation, or closure-observable value alive after its last HIR use.
     pub physical_root_locals: BTreeSet<LocalId>,
+    /// HIR 对后续表达式重写拥有的结论，按当前 binding 身份保存。
+    ///
+    /// `temp-inline` 只在已经证明删除会破坏 VM/HIR 语义时写入 `Preserve`；没有记录
+    /// 仍是显式的 `Unknown`，不能被解释成 HIR 已经批准 AST 删除。locals promotion 会把
+    /// temp 结论并入对应 local，使 AST 不必重新构造 home/capture/value-epoch 证明。
+    pub inline_dispositions: HirInlineDispositions,
     pub upvalues: Vec<UpvalueId>,
+    /// 由 VM 证明为当前词法环境的 upvalue cell 身份。
+    ///
+    /// 集合成员仍使用普通 `UpvalueId`，使读写、capture、mutability 和 root/lifetime
+    /// consumer 共享同一身份；AST 只消费这项 role 事实决定是否写成 `_ENV`。
+    pub environment_upvalues: BTreeSet<UpvalueId>,
     /// Upvalues that this proto or one of its descendant closures may write.
     ///
     /// The set is transitive through by-reference captures. A by-value capture may mutate the
@@ -54,12 +69,131 @@ pub struct HirProto {
     pub temp_debug_locals: Vec<Option<String>>,
     /// `temp_debug_locals` 对应的源码局部作用域身份；编译器内部槽位为 `None`。
     pub temp_debug_scopes: Vec<Option<usize>>,
+    /// HIR 退出时仍需由 AST 满足或报告的事实。
+    ///
+    /// 这些事实已经脱离 Structure/SSA 的类型空间；AST 只消费这里冻结的索引和值语义，
+    /// 不得再读取 StructureFacts 重新解释 lowering 结果。
+    pub exit_requirements: Vec<HirExitRequirement>,
     pub body: HirBlock,
     pub children: Vec<HirProtoRef>,
     /// 当前 proto 无法继续降低时保留的分层诊断；成功 proto 为 `None`。
     pub failure: Option<ProtoFailure>,
     /// 失败父节点无法恢复原 closure 放置时，仍以诊断 local 展示的直接子 proto。
     pub detached_children: Vec<(LocalId, HirProtoRef)>,
+}
+
+/// HIR 对某个 binding 的表达式重写结论。
+///
+/// 当前迁移阶段只发布负向结论。`Unknown` 仍允许既有 AST 路径工作，但不代表正向证明；
+/// 后续会以具体 definition/transaction 为身份增加可消费的正向 certificate。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HirInlineDisposition {
+    #[default]
+    Unknown,
+    Preserve(BTreeSet<HirInlineRetentionReason>),
+}
+
+impl HirInlineDisposition {
+    pub const fn must_preserve(&self) -> bool {
+        matches!(self, Self::Preserve(_))
+    }
+
+    fn note_preservation(&mut self, reason: HirInlineRetentionReason) -> bool {
+        match self {
+            Self::Unknown => {
+                *self = Self::Preserve(BTreeSet::from([reason]));
+                true
+            }
+            Self::Preserve(reasons) => reasons.insert(reason),
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        let Self::Preserve(reasons) = other else {
+            return;
+        };
+        for reason in reasons {
+            let _ = self.note_preservation(*reason);
+        }
+    }
+}
+
+/// HIR 已证明必须保留 binding 的原因。
+///
+/// 原因是跨层 capability 的说明，不携带 Structure/SSA 的 home slot 或 def 类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HirInlineRetentionReason {
+    /// 删除快照会让引用捕获观察到另一个 value epoch。
+    CapturedValueEpoch,
+}
+
+/// 单个 proto 内跨 temp/local 身份提升保存的重写结论。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HirInlineDispositions {
+    temps: BTreeMap<TempId, HirInlineDisposition>,
+    locals: BTreeMap<LocalId, HirInlineDisposition>,
+}
+
+impl HirInlineDispositions {
+    pub fn temp(&self, temp: TempId) -> HirInlineDisposition {
+        self.temps.get(&temp).cloned().unwrap_or_default()
+    }
+
+    pub fn local(&self, local: LocalId) -> HirInlineDisposition {
+        self.locals.get(&local).cloned().unwrap_or_default()
+    }
+
+    pub fn preserve_temp(&mut self, temp: TempId, reason: HirInlineRetentionReason) -> bool {
+        self.temps
+            .entry(temp)
+            .or_default()
+            .note_preservation(reason)
+    }
+
+    pub fn preserve_local(&mut self, local: LocalId, reason: HirInlineRetentionReason) -> bool {
+        self.locals
+            .entry(local)
+            .or_default()
+            .note_preservation(reason)
+    }
+
+    /// 把 canonical temp 的全部负向结论并入提升后的 local。
+    ///
+    /// 同一 TempId 可覆盖多个 definition epoch，而多个 temp 也可合并成同一个 local；
+    /// AST 最终只看见 binding 身份，因此这里必须取并集，不能挑选某一次定义的结论。
+    pub fn promote_temp_to_local(&mut self, temp: TempId, local: LocalId) {
+        let Some(disposition) = self.temps.get(&temp).cloned() else {
+            return;
+        };
+        self.locals.entry(local).or_default().merge(&disposition);
+    }
+}
+
+/// HIR 边界保留的 typed requirement/residual。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirExitRequirement {
+    RequiredControlFlow {
+        /// 原始 proto 树的先序身份，用于与 Structure/bytecode dump 对齐。
+        source_proto: usize,
+        feature: HirControlFlowFeature,
+    },
+    UnresolvedValue {
+        /// 原始 proto 树的先序身份，用于与 Structure/bytecode dump 对齐。
+        source_proto: usize,
+        /// 原 Structure phi 的稳定数字身份，仅用于定位诊断。
+        phi: usize,
+        /// 原 CFG block 的稳定数字身份，仅用于定位诊断。
+        block: usize,
+        /// 原 VM register 的稳定数字身份，仅用于定位诊断。
+        register: usize,
+    },
+}
+
+/// HIR 语义树要求 AST 提供的控制流表达能力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HirControlFlowFeature {
+    GotoLabel,
+    ContinueStatement,
 }
 
 /// 已由 Structure 绑定到唯一 SSA 身份的源码 debug local 区间。
@@ -129,6 +263,75 @@ impl HirLabelId {
     pub const fn index(self) -> usize {
         self.0
     }
+}
+
+/// `locals` 已证明可由 AST 合回 initializer 的单次 storage transaction 身份。
+///
+/// token 只连接最终 HIR 中一条空 `LocalDecl` 与其紧邻的 multi-call `Assign`；它不代表
+/// binding 的通用定义身份，也不授权其它删除、内联或生命周期缩短。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct HirInitializerMergeTransactionId {
+    proto: HirProtoRef,
+    ordinal: usize,
+}
+
+impl HirInitializerMergeTransactionId {
+    pub(crate) const fn new(proto: HirProtoRef, ordinal: usize) -> Self {
+        Self { proto, ordinal }
+    }
+}
+
+/// 一次 generic-for initializer transaction 的不透明 HIR 身份。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct HirGenericForInitializerTransactionId {
+    proto: HirProtoRef,
+    ordinal: usize,
+}
+
+impl HirGenericForInitializerTransactionId {
+    pub(crate) const fn new(proto: HirProtoRef, ordinal: usize) -> Self {
+        Self { proto, ordinal }
+    }
+}
+
+/// initializer transaction 内一条 producer assignment occurrence 的不透明身份。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct HirGenericForInitializerProducerId {
+    transaction: HirGenericForInitializerTransactionId,
+    ordinal: usize,
+}
+
+impl HirGenericForInitializerProducerId {
+    pub(crate) const fn new(
+        transaction: HirGenericForInitializerTransactionId,
+        ordinal: usize,
+    ) -> Self {
+        Self {
+            transaction,
+            ordinal,
+        }
+    }
+
+    pub(crate) const fn transaction(self) -> HirGenericForInitializerTransactionId {
+        self.transaction
+    }
+}
+
+/// producer 在 generic-for semantic iterator pack 中贡献的连续区间。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct HirGenericForInitializerSpan {
+    pub producer: HirGenericForInitializerProducerId,
+    pub value_start: usize,
+    pub value_count: usize,
+}
+
+/// lowering 已证明的 initializer producer ownership；不授权任何源码改写。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirGenericForInitializerTransaction {
+    pub id: HirGenericForInitializerTransactionId,
+    /// 原始协议宽度独立于 simplify 后可能已裁掉的 trailing nil。
+    pub iterator_width: usize,
+    pub producers: Vec<HirGenericForInitializerSpan>,
 }
 
 /// 一段 HIR 语句块。
@@ -215,10 +418,13 @@ pub enum HirLValue {
     TableAccess(Box<HirTableAccess>),
 }
 
-/// 全局引用。
+/// 已由前层环境访问协议证明的全局引用。
+///
+/// key 保留 VM 常量的原始字节身份；能否写成目标方言的裸标识符由
+/// AST lowering 验证，不得反向影响 HIR 对环境访问的分类。
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub struct HirGlobalRef {
-    pub name: String,
+    pub key: LuaString,
 }
 
 /// 表访问。
@@ -329,27 +535,27 @@ pub struct HirCallExpr {
     pub method: bool,
     /// Luau FASTCALL 协议证明 fallback callee setup 位于参数物化之后，仅用于恢复源码求值顺序。
     pub fastcall: Option<FastCallArgs>,
-    /// 来自 `SELF` / `NAMECALL` 的 method 名事实。
+    /// 来自 `SELF` / `NAMECALL` 的 method raw key 事实。
     ///
-    /// 这一层显式保留字段名，是为了避免后面的 AST build 再去猜
-    /// `obj.method(obj, ...)` 是否可以收回 `obj:method(...)`。
-    pub method_name: Option<String>,
+    /// 这一层显式保留字段的原始字节，是为了避免后面的 AST build 再去猜
+    /// `obj[key](obj, ...)` 的协议身份；只有 AST 才决定 key 能否写成 `obj:method(...)`。
+    pub method_key: Option<LuaString>,
 }
 
 impl HirCallExpr {
     /// 返回由前层 method 协议证明的 receiver 与字段名。
-    pub(crate) fn method_receiver(&self) -> Option<(&HirExpr, &str)> {
+    pub(crate) fn method_receiver(&self) -> Option<(&HirExpr, &LuaString)> {
         if !self.method {
             return None;
         }
-        let method_name = self.method_name.as_deref()?;
+        let method_key = self.method_key.as_ref()?;
         let receiver = self.args.first()?;
         matches!(&self.callee,
             HirExpr::TableAccess(access)
                 if access.base == *receiver
                     && matches!(&access.key,
-                        HirExpr::String(key) if key.as_bytes() == method_name.as_bytes()))
-        .then_some((receiver, method_name))
+                        HirExpr::String(key) if key == method_key))
+        .then_some((receiver, method_key))
     }
 }
 
@@ -534,15 +740,18 @@ pub struct HirCallStmt {
 pub struct HirLocalDecl {
     pub bindings: Vec<LocalId>,
     pub values: HirValuePack,
+    /// 仅授权与同 token、紧邻且形状仍匹配的 assignment 合回 initializer。
+    pub initializer_merge_transaction: Option<HirInitializerMergeTransactionId>,
 }
 
 /// Lua 5.5 `global` 初始化声明。
 ///
 /// `ERRNNIL` 是编译器为该语法发出的显式协议；初始化先完整求值 RHS，再按 names 逆序
-/// probe/store。HIR 直接保留源码顺序，避免把 exact-tail 结果物化成会漂移的局部根。
+/// probe/store。HIR 直接保留源码顺序：单结果使用 fixed pack，多结果调用保留 exact tail，
+/// 避免把结果物化成会漂移的局部根。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirGlobalDecl {
-    pub names: Vec<String>,
+    pub names: Vec<LuaString>,
     pub values: HirValuePack,
 }
 
@@ -551,6 +760,11 @@ pub struct HirGlobalDecl {
 pub struct HirAssign {
     pub targets: Vec<HirLValue>,
     pub values: HirValuePack,
+    /// 仅授权与同 token、紧邻且形状仍匹配的 empty local declaration 合并。
+    pub initializer_merge_transaction: Option<HirInitializerMergeTransactionId>,
+    /// 只证明该 assignment occurrence 属于某个 generic-for initializer；删除、移动、
+    /// 展开与 capture/lifetime 合法性仍由 consumer 重新验证。
+    pub generic_for_initializer_producer: Option<HirGenericForInitializerProducerId>,
 }
 
 /// 表数组段批量写入。
@@ -627,6 +841,26 @@ pub struct HirWhile {
 pub struct HirRepeat {
     pub body: HirBlock,
     pub cond: HirExpr,
+    /// 针对这个 repeat 条件边界、在最终 HIR 上证明的生命周期事实。
+    ///
+    /// 这里只回答“哪些直属 binding 的 VM/HIR root 可以在执行条件前结束”；它不授权
+    /// 删除或移动 definition。AST 仍须针对自己的候选 suffix 证明词法作用域、属性和
+    /// 控制流合法性。
+    pub lifetime: HirRepeatConditionLifetimeFacts,
+}
+
+/// `repeat` 条件入口处可由 AST 消费的窄生命周期事实。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HirRepeatConditionLifetimeFacts {
+    /// 在这个 repeat 的 condition 边界前结束，不会丢失原 VM/HIR 物理 root 的 binding。
+    pub may_end_before_condition: BTreeSet<HirRepeatBinding>,
+}
+
+/// repeat 条件生命周期事实中的 HIR binding 身份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HirRepeatBinding {
+    Local(LocalId),
+    Temp(TempId),
 }
 
 /// 数值 for。
@@ -645,6 +879,30 @@ pub struct HirGenericFor {
     pub bindings: Vec<LocalId>,
     pub iterator: HirValuePack,
     pub body: HirBlock,
+    /// 原始 producer occurrence 与 semantic iterator span 的 owner-scoped 证书。
+    /// SSA def、寄存器与指令 identity 已在 lowering 中消费；该证书只证明 ownership，
+    /// 不授权 simplify 改写。
+    pub initializer_transaction: Option<HirGenericForInitializerTransaction>,
+    /// 该 owner 的一次性 ordinary initializer call operand 中，由 low CFG 与
+    /// Promotion 共同证明必须继续物化到原 scope endpoint 的 physical roots。
+    ///
+    /// 这里只保存最终 HIR `TempId`，不把 SSA def 链、寄存器或相邻语句形状泄漏给
+    /// simplify/AST；它与每轮隐式调用写 result home 的 `dispatch_results` 是独立事务。
+    pub initializer_roots: Vec<TempId>,
+    /// 每次隐式 iterator dispatch 都会写入的固定 VM result endpoint。
+    ///
+    /// `result_def` 是 Structure 已冻结的 `GenericForCall` fixed def 在 HIR 中的
+    /// canonical identity；它只标识静态物理写入点，不代表各轮共享同一个动态值。
+    /// 旧 result home 在调用 iterator 期间已经不属于 caller root prefix，而
+    /// `success_binding` 只在首结果允许进入 body 的边上获得源码 binding 身份。
+    pub dispatch_results: Vec<HirGenericForDispatchResult>,
+}
+
+/// Generic-for 隐式 dispatch 的一个固定 result endpoint。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HirGenericForDispatchResult {
+    pub result_def: TempId,
+    pub success_binding: LocalId,
 }
 
 /// goto 语句。
@@ -683,15 +941,9 @@ pub enum HirTableField {
 /// 表记录字段。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirRecordField {
-    pub key: HirTableKey,
+    /// 字段键的语义表达式；是否能写成 `name = value` 由目标 AST 方言决定。
+    pub key: HirExpr,
     pub value: HirExpr,
-}
-
-/// 表字段 key。
-#[derive(Debug, Clone, PartialEq)]
-pub enum HirTableKey {
-    Name(String),
-    Expr(HirExpr),
 }
 
 /// 闭包表达式。

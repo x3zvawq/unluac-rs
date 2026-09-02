@@ -15,6 +15,7 @@ mod dead_temps;
 mod debug_scopes;
 pub(super) mod decision;
 mod expr_facts;
+mod flow_events;
 mod generic_for_iterators;
 mod label_refs;
 mod lexical_cfg;
@@ -31,8 +32,8 @@ mod temp_touch;
 mod visit;
 pub(crate) mod walk;
 
-use crate::ast::ReadabilityOptions;
 use crate::debug::DebugFilters;
+use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::generate::GenerateMode;
 use crate::hir::common::HirModule;
 use crate::hir::expr_safety::HirExprSafety;
@@ -151,7 +152,13 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "temp-inline",
         phase: PassPhase::Normal,
-        depends_on: &[TempChain, DecisionShape, BooleanPattern, LogicalExpr],
+        depends_on: &[
+            TempChain,
+            DecisionShape,
+            BooleanPattern,
+            LogicalExpr,
+            ClosureCapture,
+        ],
         // Temp substitution can expose literal/logical shapes that were not present in the
         // pre-inline HIR expression.  Let logical-simplify consume those facts in the next
         // invalidation round instead of leaving a mechanical numeric shell behind.
@@ -262,7 +269,7 @@ pub(super) fn simplify_hir(
     timings: &TimingCollector,
     promotion_facts: &mut [ProtoPromotionFacts],
     generate_mode: GenerateMode,
-    dialect: crate::ast::DecompileDialect,
+    dialect: DecompileDialect,
     dump_config: &PassDumpConfig,
 ) -> Result<(), crate::decompile::DecompileError> {
     let mut empty_facts = ProtoPromotionFacts::default();
@@ -295,13 +302,13 @@ pub(super) fn simplify_hir(
                             proto, facts, safety,
                         ),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto, dialect),
-                        3 => table_constructors::stabilize_table_constructors_in_proto(
-                            proto, dialect, facts,
-                        ),
+                        3 => {
+                            table_constructors::stabilize_table_constructors_in_proto(proto, facts)
+                        }
                         4 => unreachable!("temp-inline needs child proto body facts"),
-                        5 => generic_for_iterators::fold_generic_for_iterators_in_proto(
-                            proto, facts, dialect,
-                        ),
+                        5 => {
+                            generic_for_iterators::fold_generic_for_iterators_in_proto(proto, facts)
+                        }
                         6 => branch_value_folding::fold_branch_values_in_proto(
                             proto,
                             readability,
@@ -348,7 +355,6 @@ pub(super) fn simplify_hir(
     timings.record("repeat-root-lifetimes", || {
         repeat_root_lifetimes::mark_repeat_trailing_condition_roots(module, promotion_facts, safety)
     });
-
     let residuals = residuals::collect_hir_exit_residuals(module);
     if residuals.has_soft_residuals() && generate_mode != GenerateMode::Permissive {
         residuals::emit_hir_warning(format!(
@@ -364,7 +370,7 @@ fn apply_temp_inline_pass(
     readability: ReadabilityOptions,
     promotion_facts: &[ProtoPromotionFacts],
     empty_facts: &ProtoPromotionFacts,
-    dialect: crate::ast::DecompileDialect,
+    dialect: DecompileDialect,
 ) -> bool {
     // HIR proto ids are allocated parent-first. Walk the flat arena backwards so every direct
     // child has already reached its current temp-inline shape before the parent decides whether

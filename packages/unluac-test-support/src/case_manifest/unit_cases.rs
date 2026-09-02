@@ -25,12 +25,7 @@ pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/unit-case/common_09_method_and_self.lua",
         ALL_DIALECTS,
     ),
-    LuaCaseMatrixEntry::new(
-        "tests/unit-case/common_10_tables.lua",
-        ALL_NON_LUAU_DIALECTS,
-    ),
-    LuaCaseMatrixEntry::new("tests/unit-case/common_10_tables.lua", LUAU_ONLY)
-        .with_expectation(LuaCaseExpectation::TableSetListResidual),
+    LuaCaseMatrixEntry::new("tests/unit-case/common_10_tables.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new("tests/unit-case/common_11_runtime.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new(
         "tests/unit-case/common_12_string_encoding.lua",

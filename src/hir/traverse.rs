@@ -153,11 +153,9 @@ macro_rules! traverse_hir_table_constructor_children {
                     $on_expr
                 }
                 crate::hir::HirTableField::Record(record) => {
-                    match $($borrow)+ record.key {
-                        crate::hir::HirTableKey::Name(_) => {}
-                        crate::hir::HirTableKey::Expr($expr) => {
-                            $on_expr
-                        }
+                    {
+                        let $expr = $($borrow)+ record.key;
+                        $on_expr
                     }
                     {
                         let $expr = $($borrow)+ record.value;

@@ -8,7 +8,7 @@
 //! local initializer 中的裸调用已经被赋值收窄为单值；移入最终调用参数时用
 //! `SingleValue` 保留该宽度，避免重新变成开放多返回值。
 
-use crate::ast::ReadabilityOptions;
+use crate::decompile::ReadabilityOptions;
 
 use super::super::super::common::{
     AstCallExpr, AstCallKind, AstExpr, AstGlobalDecl, AstLValue, AstMethodCallExpr, AstStmt,

@@ -60,6 +60,11 @@ pub(super) struct BlockFacts {
     explicit_collective_here: Option<AstGlobalAttr>,
     nested_written_here: BTreeSet<String>,
     observations: Vec<GlobalObservation>,
+    /// repeat body 求值结束后、同一词法域的 until 条件产生的观测。
+    ///
+    /// collective suffix 只给新建的 `do` 内部打开 gate，不能把这里的缺失访问一并
+    /// 当成已覆盖；保留独立序列让 caller 在包裹成功后仍插入条件所需的逐名声明。
+    trailing_observations: Vec<GlobalObservation>,
     first_explicit_index: Option<usize>,
 }
 
@@ -87,22 +92,49 @@ impl BlockFacts {
                 visit::visit_stmt(stmt, &mut collector);
             }
         }
+        let trailing_start = collector.observations.len();
         if let Some(expr) = trailing_expr {
             visit::visit_expr(expr, &mut collector);
         }
+        let trailing_observations = collector.observations.split_off(trailing_start);
 
         Self {
             explicit_here: collector.explicit_here,
             explicit_collective_here: collector.explicit_collective_here,
             nested_written_here: collector.nested_written_here,
             observations: collector.observations,
+            trailing_observations,
             first_explicit_index: block.stmts.iter().position(stmt_opens_global_gate),
         }
     }
 
     pub(super) fn infer_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
+        self.infer_missing_from(
+            outer_visible,
+            self.observations.iter().chain(&self.trailing_observations),
+        )
+    }
+
+    /// 只返回当前 block 直属语句里的缺失访问。
+    ///
+    /// repeat collective suffix 的新 gate 仅覆盖这一部分；until 条件的缺失访问必须继续
+    /// 留给外层逐名声明，不能因为名称恰好也在 body 出现就被集合差误删。
+    pub(super) fn infer_body_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
+        self.infer_missing_from(outer_visible, &self.observations)
+    }
+
+    /// 只返回 repeat until 条件里的缺失访问；普通 block 恒为空。
+    pub(super) fn infer_trailing_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
+        self.infer_missing_from(outer_visible, &self.trailing_observations)
+    }
+
+    fn infer_missing_from<'a>(
+        &self,
+        outer_visible: &VisibleGlobals,
+        observations: impl IntoIterator<Item = &'a GlobalObservation>,
+    ) -> MissingGlobals {
         let mut missing = MissingGlobals::default();
-        for observation in &self.observations {
+        for observation in observations {
             if !outer_visible.has_explicit_gate() && !observation.after_explicit_here {
                 continue;
             }

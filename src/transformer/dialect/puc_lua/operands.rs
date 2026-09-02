@@ -347,9 +347,20 @@ pub(crate) fn prepare_env_lowering(
     Ok((env_upvalues, children))
 }
 
-/// 共享 `LoweredProto` 组装壳，避免 5.2+ 每个版本重复复制元数据拼装代码。
+/// 把 `_ENV` 传播位图冻结为稳定、升序的 upvalue 身份列表。
+pub(crate) fn environment_upvalue_refs(env_upvalues: &[bool]) -> Vec<UpvalueRef> {
+    env_upvalues
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, is_env)| is_env.then_some(UpvalueRef(index)))
+        .collect()
+}
+
+/// 共享 `LoweredProto` 组装壳；调用方显式传入本方言拥有的环境 upvalue 身份。
 pub(crate) fn finish_lowered_proto(
     raw: &RawProto,
+    environment_upvalues: Vec<UpvalueRef>,
     children: Vec<Arc<LoweredProto>>,
     instrs: Vec<LowInstr>,
     lowering_map: LoweringMap,
@@ -362,6 +373,7 @@ pub(crate) fn finish_lowered_proto(
         frame: raw.common.frame,
         constants: raw.common.constants.clone(),
         upvalues: raw.common.upvalues.clone(),
+        environment_upvalues,
         debug_info: raw.common.debug_info.clone(),
         debug_locals: crate::transformer::common::normalize_debug_locals(raw),
         children,
@@ -410,7 +422,7 @@ pub(crate) fn access_base_for_upvalue(
     index: usize,
 ) -> Result<AccessBase, TransformError> {
     Ok(match upvalue_operand(raw, env_upvalues, raw_pc, index)? {
-        UpvalueOperand::Env => AccessBase::Env,
+        UpvalueOperand::Env(upvalue) => AccessBase::EnvironmentUpvalue(upvalue),
         UpvalueOperand::Upvalue(upvalue) => AccessBase::Upvalue(upvalue),
     })
 }
@@ -423,7 +435,7 @@ pub(crate) fn upvalue_operand(
 ) -> Result<UpvalueOperand, TransformError> {
     let upvalue = checked_upvalue_ref(raw, raw_pc, index)?;
     Ok(if env_upvalues.get(index).copied().unwrap_or(false) {
-        UpvalueOperand::Env
+        UpvalueOperand::Env(upvalue)
     } else {
         UpvalueOperand::Upvalue(upvalue)
     })

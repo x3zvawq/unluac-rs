@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirExpr, HirPackTail, HirTableConstructor, HirTableField, HirTableKey};
+use crate::hir::common::{HirExpr, HirPackTail, HirTableConstructor, HirTableField};
 
 use super::{RebuildScratch, RestoredArrayField, RestoredPendingIntegerField};
 
@@ -78,7 +78,7 @@ impl ConstructorBuilder {
                 BuilderField::Final(field) => fields.push(field),
                 BuilderField::PendingInt { key, value } => {
                     fields.push(HirTableField::Record(crate::hir::common::HirRecordField {
-                        key: HirTableKey::Expr(HirExpr::Integer(key)),
+                        key: HirExpr::Integer(key),
                         value,
                     }));
                 }
@@ -182,7 +182,7 @@ impl ConstructorBuilder {
         self.shadow_aliased_pending_integer_fields(&field.key);
         let current_next_index = i64::from(self.next_array_index);
         match field.key {
-            HirTableKey::Expr(HirExpr::Integer(value))
+            HirExpr::Integer(value)
                 if matches!(policy, RecordPromotionPolicy::Normal)
                     && value == current_next_index
                     && !self.has_numeric_key(value)
@@ -190,7 +190,7 @@ impl ConstructorBuilder {
             {
                 self.push_array_value(field.value);
             }
-            HirTableKey::Expr(HirExpr::Integer(value))
+            HirExpr::Integer(value)
                 if can_stage_pending_integer_record(
                     value,
                     current_next_index,
@@ -213,7 +213,7 @@ impl ConstructorBuilder {
                 } else {
                     self.fields.push(BuilderField::Final(HirTableField::Record(
                         crate::hir::common::HirRecordField {
-                            key: HirTableKey::Expr(HirExpr::Integer(value)),
+                            key: HirExpr::Integer(value),
                             value: field.value,
                         },
                     )));
@@ -287,7 +287,7 @@ impl ConstructorBuilder {
                 });
                 *field = BuilderField::Final(HirTableField::Record(
                     crate::hir::common::HirRecordField {
-                        key: HirTableKey::Expr(HirExpr::Integer(i64::from(array_index))),
+                        key: HirExpr::Integer(i64::from(array_index)),
                         value: value.clone(),
                     },
                 ));
@@ -298,7 +298,7 @@ impl ConstructorBuilder {
         true
     }
 
-    fn shadow_aliased_pending_integer_fields(&mut self, key: &HirTableKey) {
+    fn shadow_aliased_pending_integer_fields(&mut self, key: &HirExpr) {
         let shadowed_at = self.fields.len();
         match statically_known_numeric_key(key) {
             Some(Some(value)) => {
@@ -332,11 +332,10 @@ impl ConstructorBuilder {
     }
 }
 
-fn statically_known_numeric_key(key: &HirTableKey) -> Option<Option<i64>> {
+fn statically_known_numeric_key(key: &HirExpr) -> Option<Option<i64>> {
     match key {
-        HirTableKey::Name(_) => Some(None),
-        HirTableKey::Expr(HirExpr::Integer(value)) => Some(Some(*value)),
-        HirTableKey::Expr(HirExpr::Number(value)) => {
+        HirExpr::Integer(value) => Some(Some(*value)),
+        HirExpr::Number(value) => {
             if value.is_finite()
                 && value.fract() == 0.0
                 && value.abs() <= ((1_u64 << f64::MANTISSA_DIGITS) as f64)
@@ -346,40 +345,36 @@ fn statically_known_numeric_key(key: &HirTableKey) -> Option<Option<i64>> {
                 None
             }
         }
-        HirTableKey::Expr(
-            HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::String(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::Closure(_)
-            | HirExpr::TableConstructor(_),
-        ) => Some(None),
-        HirTableKey::Expr(
-            HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::ParamRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::GlobalRef(_)
-            | HirExpr::TempRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::TableAccess(_)
-            | HirExpr::Unary(_)
-            | HirExpr::Binary(_)
-            | HirExpr::LogicalAnd(_)
-            | HirExpr::LogicalOr(_)
-            | HirExpr::Decision(_)
-            | HirExpr::Call(_)
-            | HirExpr::VarArg
-            | HirExpr::Unresolved(_),
-        ) => None,
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::String(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::Closure(_)
+        | HirExpr::TableConstructor(_) => Some(None),
+        HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::ParamRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::Unary(_)
+        | HirExpr::Binary(_)
+        | HirExpr::LogicalAnd(_)
+        | HirExpr::LogicalOr(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Call(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => None,
     }
 }
 
-fn numeric_key_matches(key: &HirTableKey, expected: i64) -> bool {
+fn numeric_key_matches(key: &HirExpr, expected: i64) -> bool {
     match key {
-        HirTableKey::Expr(HirExpr::Integer(value)) => *value == expected,
-        HirTableKey::Expr(HirExpr::Number(value)) => {
+        HirExpr::Integer(value) => *value == expected,
+        HirExpr::Number(value) => {
             value.is_finite() && value.fract() == 0.0 && *value == expected as f64
         }
         _ => false,

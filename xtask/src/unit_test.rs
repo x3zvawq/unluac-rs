@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +29,7 @@ const OUTPUT_ENV: &str = "UNLUAC_TEST_OUTPUT";
 const PROGRESS_ENV: &str = "UNLUAC_TEST_PROGRESS";
 const COLOR_ENV: &str = "UNLUAC_TEST_COLOR";
 const RECOMPILE_ROUNDS_ENV: &str = "UNLUAC_TEST_RECOMPILE_ROUNDS";
+const PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FailureOutputMode {
@@ -250,23 +255,23 @@ mod tests {
     }
 
     #[test]
-    fn sparse_plain_progress_should_only_emit_on_milestones() {
-        assert!(!super::should_emit_sparse_plain_progress(
+    fn sparse_progress_should_only_emit_on_milestones() {
+        assert!(!super::should_emit_progress_milestone(
             super::ProgressEventKind::Started,
             100,
             500,
         ));
-        assert!(!super::should_emit_sparse_plain_progress(
+        assert!(!super::should_emit_progress_milestone(
             super::ProgressEventKind::Finished,
             99,
             500,
         ));
-        assert!(super::should_emit_sparse_plain_progress(
+        assert!(super::should_emit_progress_milestone(
             super::ProgressEventKind::Finished,
             100,
             500,
         ));
-        assert!(super::should_emit_sparse_plain_progress(
+        assert!(super::should_emit_progress_milestone(
             super::ProgressEventKind::Finished,
             500,
             500,

@@ -95,6 +95,8 @@ pub(super) fn try_collapse_guarded_local_update(
     block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
         targets: vec![binding_lvalue(state)],
         values,
+        initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }));
 
     let mut rewrites = BTreeMap::new();
@@ -855,6 +857,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![next],
                     values: HirValuePack::fixed(vec![HirExpr::Boolean(true)]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::If(Box::new(HirIf {
                     cond: HirExpr::LocalRef(next),
@@ -862,6 +865,8 @@ mod tests {
                         stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                             targets: vec![HirLValue::Temp(state)],
                             values: HirValuePack::fixed(vec![HirExpr::LocalRef(next)]),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
                         }))],
                     },
                     else_block: Some(block(empty_return())),
@@ -874,6 +879,7 @@ mod tests {
             physical_roots: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
+            preserved: BTreeSet::new(),
         };
         let mut promotion_facts = ProtoPromotionFacts::default();
 

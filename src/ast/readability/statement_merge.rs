@@ -91,10 +91,9 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
             new_stmts.push(stmt);
             continue;
         };
-        if bindings
-            .iter()
-            .any(|binding| binding.origin.is_debug_hinted())
-        {
+        if bindings.iter().any(|binding| {
+            binding.origin.is_debug_hinted() || !binding.rewrite_authority.may_move_scope_start()
+        }) {
             // 候选拒绝[SemanticBarrier:DebugScope]：`local debug_name; local t` 合并后，
             // 首个 binding 要到第二条声明之后才进入作用域；原第二行的 line hook 本可
             // 通过 debug.getlocal 观察它，合并会丢失这段已保留的源码可见期。
@@ -105,10 +104,10 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
         let mut merged_bindings = bindings.to_vec();
         let mut consumed = 0;
         for next_bindings in old_stmts.iter().map_while(empty_local_decl_bindings) {
-            if next_bindings
-                .iter()
-                .any(|binding| binding.origin.is_debug_hinted())
-            {
+            if next_bindings.iter().any(|binding| {
+                binding.origin.is_debug_hinted()
+                    || !binding.rewrite_authority.may_move_scope_start()
+            }) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：line hook 能在相邻声明间观察
                 // DebugHinted local 的边界，不能把后续声明提前到同一 local list。
                 break;
@@ -132,6 +131,8 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
             new_stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings: merged_bindings,
                 values: Vec::new(),
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
             })));
             old_stmts.drain(..consumed);
             changed = true;
@@ -201,7 +202,7 @@ fn merge_adjacent_single_value_local_decls(
             index += 1;
             continue;
         };
-        if binding.origin.is_debug_hinted() {
+        if binding.origin.is_debug_hinted() || !binding.rewrite_authority.may_move_scope_start() {
             // 候选拒绝[SemanticBarrier:DebugScope]：后续 RHS 求值期间 line hook/元方法可观察
             // 当前 DebugHinted local；并行声明会把它的作用域起点推迟到整组 RHS 之后。
             new_stmts.push(stmt);
@@ -229,7 +230,9 @@ fn merge_adjacent_single_value_local_decls(
             .get(lookahead - index - 1)
             .and_then(single_value_local_decl)
         {
-            if next_binding.origin.is_debug_hinted() {
+            if next_binding.origin.is_debug_hinted()
+                || !next_binding.rewrite_authority.may_move_scope_start()
+            {
                 // 候选拒绝[SemanticBarrier:DebugScope]：line hook 可在相邻声明间观察
                 // DebugHinted local；并行声明会让该名字提前可见。
                 break;
@@ -286,6 +289,8 @@ fn merge_adjacent_single_value_local_decls(
             new_stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings,
                 values,
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
             })));
             changed = true;
             old_stmts.drain(..(lookahead - index - 1));
@@ -444,6 +449,7 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
             unreachable!("hoisted temp decl scan must point at local decl");
         };
         local_decl.bindings = remaining;
+        local_decl.initializer_root_profile = None;
         return true;
     }
     false
@@ -895,6 +901,8 @@ fn sink_pending_bindings_into_block(
             let decl = AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings: remaining.to_vec(),
                 values: vec![],
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
             }));
             block.stmts.insert(index, decl);
             consumed += remaining.len();
@@ -957,11 +965,10 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     if local_decl
         .bindings
         .iter()
-        .any(|binding| binding.origin.is_physical_root())
+        .any(|binding| !binding.rewrite_authority.may_move_scope_start())
     {
-        // 候选拒绝[SemanticBarrier:Lifetime]：空 PhysicalRoot declaration 会先用 nil
-        // 清空复用的 VM home；合并成 initializer 会把清空推迟到 RHS 求值之后，
-        // RHS 内的 GC/弱表观察可以看到旧对象继续存活（regress_435）。
+        // 候选拒绝[LayerBoundary]：initializer merge 会把空声明起点移动到赋值处；
+        // HIR 已保留的 binding 不能由 AST 重新缩短。
         return None;
     }
     if local_decl.bindings.len() != assign.targets.len() || assign.values.is_empty() {
@@ -980,9 +987,32 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
         return None;
     }
 
+    let initializer_merge_transaction = match (
+        local_decl.initializer_merge_transaction,
+        assign.initializer_merge_transaction,
+    ) {
+        (Some(decl), Some(assign)) if decl == assign => Some(decl),
+        (None, None) => None,
+        _ => return None,
+    };
+    if initializer_merge_transaction.is_none()
+        && local_decl
+            .bindings
+            .iter()
+            .any(|binding| binding.origin.is_physical_root())
+    {
+        // 候选拒绝[SemanticBarrier:Lifetime]：空 PhysicalRoot declaration 会先用 nil
+        // 清空复用的 VM home；只有 HIR 为这一对最终节点发布的同 token transaction
+        // 才能证明这次 initializer merge 不会把旧 root 延长过 RHS 求值。
+        return None;
+    }
+
     Some(AstLocalDecl {
         bindings: local_decl.bindings.clone(),
         values: assign.values.clone(),
+        // certificate 是一次性 rewrite authority；合并完成后不属于新声明的持续事实。
+        initializer_merge_transaction: None,
+        initializer_root_profile: None,
     })
 }
 
@@ -1017,6 +1047,14 @@ fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::Ast
     {
         // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 的空声明在 hoist 点清空旧 VM
         // root；下沉到赋值点会让旧对象跨过中间 GC/弱表观察继续存活。
+        return None;
+    }
+    if local_decl
+        .bindings
+        .iter()
+        .any(|binding| !binding.rewrite_authority.may_move_scope_start())
+    {
+        // 候选拒绝[LayerBoundary]：hoisted binding 的声明起点由 HIR 冻结，不能下沉。
         return None;
     }
     Some(local_decl.bindings.clone())
@@ -1061,6 +1099,8 @@ fn try_sink_hoisted_decl_into_stmt(
         merged: AstLocalDecl {
             bindings: candidate.to_vec(),
             values: assign.values.clone(),
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         },
         dependencies: rhs_dependencies_outside_candidate(assign, dependency_universe, candidate),
     })
@@ -1125,6 +1165,8 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
             merged: AstLocalDecl {
                 bindings: candidate.to_vec(),
                 values: assign.values.clone(),
+                initializer_merge_transaction: None,
+                initializer_root_profile: None,
             },
             dependencies: rhs_dependencies_outside_candidate(
                 assign,
@@ -1298,9 +1340,49 @@ impl AstVisitor for GotoTargetCollector {
 mod tests {
     use super::*;
     use crate::ast::common::{
-        AstAssign, AstCallExpr, AstGlobalName, AstGoto, AstIf, AstLabel, AstLocalOrigin, AstNameRef,
+        AstAssign, AstCallExpr, AstGlobalName, AstGoto, AstIf, AstLabel, AstLocalOrigin,
+        AstNameRef, AstRewriteAuthority,
     };
-    use crate::hir::{LocalId, TempId};
+    use crate::hir::{
+        HirInitializerMergeTransactionId, HirInlineDisposition, HirInlineRetentionReason,
+        HirProtoRef, LocalId, TempId,
+    };
+
+    fn initializer_merge_pair(
+        decl_token: Option<HirInitializerMergeTransactionId>,
+        assign_token: Option<HirInitializerMergeTransactionId>,
+    ) -> (AstStmt, AstStmt) {
+        let bindings = [LocalId(0), LocalId(1)];
+        let declaration = AstStmt::LocalDecl(Box::new(AstLocalDecl {
+            bindings: bindings
+                .iter()
+                .map(|local| AstLocalBinding {
+                    id: AstBindingRef::Local(*local),
+                    attr: AstLocalAttr::None,
+                    origin: AstLocalOrigin::PhysicalRoot,
+                    rewrite_authority: AstRewriteAuthority::Hir(HirInlineDisposition::Unknown),
+                })
+                .collect(),
+            values: Vec::new(),
+            initializer_merge_transaction: decl_token,
+            initializer_root_profile: None,
+        }));
+        let assignment = AstStmt::Assign(Box::new(AstAssign {
+            targets: bindings
+                .iter()
+                .map(|local| AstLValue::Name(AstNameRef::Local(*local)))
+                .collect(),
+            values: vec![AstExpr::Call(Box::new(AstCallExpr {
+                callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
+                    text: "producer".to_owned(),
+                })),
+                args: Vec::new(),
+                method_key: None,
+            }))],
+            initializer_merge_transaction: assign_token,
+        }));
+        (declaration, assignment)
+    }
 
     fn empty_local(id: usize, origin: AstLocalOrigin) -> AstStmt {
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -1308,8 +1390,11 @@ mod tests {
                 id: AstBindingRef::Local(LocalId(id)),
                 attr: AstLocalAttr::None,
                 origin,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: Vec::new(),
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }))
     }
 
@@ -1322,12 +1407,16 @@ mod tests {
                         id: binding,
                         attr: AstLocalAttr::None,
                         origin,
+                        rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: Vec::new(),
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::Name(binding.to_name_ref())],
                     values: vec![AstExpr::Integer(1)],
+                    initializer_merge_transaction: None,
                 })),
             ],
         }
@@ -1339,8 +1428,11 @@ mod tests {
                 id: binding,
                 attr: AstLocalAttr::None,
                 origin: AstLocalOrigin::Recovered,
+                rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
             }],
             values: Vec::new(),
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
         }))
     }
 
@@ -1348,6 +1440,7 @@ mod tests {
         AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(binding.to_name_ref())],
             values: vec![AstExpr::Integer(1)],
+            initializer_merge_transaction: None,
         }))
     }
 
@@ -1413,16 +1506,22 @@ mod tests {
                         id: first,
                         attr: AstLocalAttr::None,
                         origin: AstLocalOrigin::Recovered,
+                        rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: vec![AstExpr::Var(input.to_name_ref())],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::LocalDecl(Box::new(AstLocalDecl {
                     bindings: vec![AstLocalBinding {
                         id: retained,
                         attr: AstLocalAttr::None,
                         origin: AstLocalOrigin::PhysicalRoot,
+                        rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: vec![AstExpr::Var(input.to_name_ref())],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::Return(Box::new(crate::ast::common::AstReturn {
                     values: vec![
@@ -1475,11 +1574,76 @@ mod tests {
                     text: "root_is_dead".to_owned(),
                 })),
                 args: Vec::new(),
-                method_name: None,
+                method_key: None,
             }))],
+            initializer_merge_transaction: None,
         }));
 
         assert!(try_merge_local_decl_with_assign(&declaration, &assignment).is_none());
+    }
+
+    #[test]
+    fn matching_initializer_merge_transaction_authorizes_physical_roots_once() {
+        let token = HirInitializerMergeTransactionId::new(HirProtoRef(0), 0);
+        let (declaration, assignment) = initializer_merge_pair(Some(token), Some(token));
+
+        let merged = try_merge_local_decl_with_assign(&declaration, &assignment)
+            .expect("matching HIR transaction should authorize this exact initializer merge");
+
+        assert_eq!(merged.bindings.len(), 2);
+        assert!(
+            merged
+                .bindings
+                .iter()
+                .all(|binding| binding.origin == AstLocalOrigin::PhysicalRoot)
+        );
+        assert_eq!(merged.values.len(), 1);
+        assert_eq!(merged.initializer_merge_transaction, None);
+    }
+
+    #[test]
+    fn initializer_merge_transaction_requires_both_matching_endpoints() {
+        let first = HirInitializerMergeTransactionId::new(HirProtoRef(0), 0);
+        let second = HirInitializerMergeTransactionId::new(HirProtoRef(0), 1);
+
+        for (decl_token, assign_token) in [
+            (Some(first), None),
+            (None, Some(first)),
+            (Some(first), Some(second)),
+        ] {
+            let (declaration, assignment) = initializer_merge_pair(decl_token, assign_token);
+            assert!(try_merge_local_decl_with_assign(&declaration, &assignment).is_none());
+        }
+    }
+
+    #[test]
+    fn initializer_merge_transaction_does_not_override_other_ast_barriers() {
+        let token = HirInitializerMergeTransactionId::new(HirProtoRef(0), 0);
+        let (declaration, assignment) = initializer_merge_pair(Some(token), Some(token));
+
+        let mut debug_stmt = declaration.clone();
+        let AstStmt::LocalDecl(debug_decl) = &mut debug_stmt else {
+            unreachable!();
+        };
+        debug_decl.bindings[0].origin = AstLocalOrigin::DebugHintedPhysicalRoot;
+        assert!(try_merge_local_decl_with_assign(&debug_stmt, &assignment).is_none());
+
+        let mut attributed_stmt = declaration.clone();
+        let AstStmt::LocalDecl(attributed) = &mut attributed_stmt else {
+            unreachable!();
+        };
+        attributed.bindings[0].attr = AstLocalAttr::Const;
+        assert!(try_merge_local_decl_with_assign(&attributed_stmt, &assignment).is_none());
+
+        let mut preserved_stmt = declaration;
+        let AstStmt::LocalDecl(preserved) = &mut preserved_stmt else {
+            unreachable!();
+        };
+        preserved.bindings[0].rewrite_authority =
+            AstRewriteAuthority::Hir(HirInlineDisposition::Preserve(BTreeSet::from([
+                HirInlineRetentionReason::CapturedValueEpoch,
+            ])));
+        assert!(try_merge_local_decl_with_assign(&preserved_stmt, &assignment).is_none());
     }
 
     #[test]
@@ -1572,6 +1736,7 @@ mod tests {
                                 text: "seen".to_owned(),
                             }))],
                             values: vec![AstExpr::Var(binding.to_name_ref())],
+                            initializer_merge_transaction: None,
                         })),
                         label(0),
                         AstStmt::DoBlock(Box::new(AstBlock {

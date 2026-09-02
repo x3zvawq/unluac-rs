@@ -210,6 +210,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             stmts.push(HirStmt::Repeat(Box::new(HirRepeat {
                 body: HirBlock { stmts: loop_body },
                 cond: HirExpr::Boolean(false),
+                lifetime: Default::default(),
             })));
         } else {
             stmts.push(HirStmt::While(Box::new(HirWhile {
@@ -368,6 +369,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             let mut stmts = vec![HirStmt::Repeat(Box::new(HirRepeat {
                 body: HirBlock { stmts: body_stmts },
                 cond: exit_cond,
+                lifetime: Default::default(),
             }))];
             if !final_stage.is_empty() {
                 stmts.push(assign_stmt(
@@ -405,6 +407,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 stmts: vec![HirStmt::Repeat(Box::new(HirRepeat {
                     body: HirBlock { stmts: body_stmts },
                     cond: HirExpr::Boolean(false),
+                    lifetime: Default::default(),
                 }))],
             });
         }
@@ -566,8 +569,24 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         if bindings.len() != protocol.bindings.len {
             return self.invalid_region(region, "generic for binding arity changed after planning");
         }
+        let Some(dispatch_results) =
+            lower_generic_for_dispatch_results(self.lowering, protocol, &bindings)
+        else {
+            return self.invalid_region(
+                region,
+                "generic for dispatch result definitions changed after planning",
+            );
+        };
         let mut stmts =
             self.lower_syntax_region_prefix(region, preheader_region, protocol.prep_instr)?;
+        let (initializer_transaction, initializer_roots) = lower_generic_for_initializer_facts(
+            self.lowering,
+            preheader,
+            protocol,
+            self.proto,
+            region.index(),
+            &mut stmts,
+        );
         stmts.extend(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
         if let Some((_, guard)) = &normal_tail {
             stmts.push(assign_stmt(
@@ -592,6 +611,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             bindings,
             iterator: lower_generic_for_iterator(self.lowering, preheader, protocol).into(),
             body: HirBlock { stmts: loop_stmts },
+            initializer_transaction,
+            initializer_roots,
+            dispatch_results,
         })));
         stmts.extend(self.lower_loop_value_phase(region, LoopValuePhase::AfterLoop)?);
         if let Some((tail, guard)) = normal_tail {
@@ -649,7 +671,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             prefix: self.lower_condition_prefix(owner, header)?,
             cond: finalize_condition_decision_expr(
                 decision,
-                crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target.version),
+                crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target),
             ),
         })
     }

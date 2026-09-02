@@ -45,7 +45,7 @@ use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_te
 use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
 use super::temp_touch::collect_temp_refs_by_stmt;
 use super::walk::{HirRewritePass, rewrite_proto};
-use crate::ast::{DecompileDialect, ReadabilityOptions};
+use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::hir::HirLabelId;
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirDecisionExpr, HirDecisionNode,
@@ -118,6 +118,7 @@ impl HirRewritePass for BranchValuePass<'_> {
 struct BranchValueLocalScopeFacts {
     debug_locals: BTreeSet<LocalId>,
     physical_root_locals: BTreeSet<LocalId>,
+    preserved_locals: BTreeSet<LocalId>,
 }
 
 impl BranchValueLocalScopeFacts {
@@ -131,6 +132,12 @@ impl BranchValueLocalScopeFacts {
                 .filter_map(|(local, hint)| hint.is_some().then_some(local))
                 .collect(),
             physical_root_locals: proto.physical_root_locals.clone(),
+            preserved_locals: proto
+                .locals
+                .iter()
+                .copied()
+                .filter(|local| proto.inline_dispositions.local(*local).must_preserve())
+                .collect(),
         }
     }
 
@@ -143,6 +150,11 @@ impl BranchValueLocalScopeFacts {
         if self.physical_root_locals.contains(&local) {
             // 候选拒绝[SemanticBarrier:Lifetime]：`local root; if collect() then root=v end`
             // 的空声明先用 nil 结束旧 slot root；并入 initializer 会让旧资源活过 collect。
+            return false;
+        }
+        if self.preserved_locals.contains(&local) {
+            // 候选拒绝[LayerBoundary]：把空声明/分支写折成 initializer 会改变该 binding
+            // 的 definition epoch；上游 HIR 的 Preserve 只能由理解其理由的事务消解。
             return false;
         }
         true
@@ -173,6 +185,7 @@ fn fold_nil_fallback_decision_locals_in_block(
         stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![rewrite.target],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(rewrite.source)]),
+            initializer_merge_transaction: None,
         }));
         stmts.insert(
             index + 1,
@@ -182,6 +195,8 @@ fn fold_nil_fallback_decision_locals_in_block(
                     stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Local(rewrite.target)],
                         values: HirValuePack::fixed(vec![rewrite.fallback]),
+                        initializer_merge_transaction: None,
+                        generic_for_initializer_producer: None,
                     }))],
                 },
                 else_block: None,
@@ -276,6 +291,7 @@ fn fold_branch_value_locals_in_block(
         rewritten.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![binding],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
         })));
         changed = true;
     }
@@ -304,11 +320,17 @@ fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> 
     }
 
     let mut exposed_temps = Vec::new();
+    let inline_dispositions = &proto.inline_dispositions;
     for stmt in &mut proto.body.stmts {
         let Some((target, replacement, guards)) = collapsible_branch_value_temp(stmt, safety)
         else {
             continue;
         };
+        if inline_dispositions.temp(target).must_preserve() {
+            // 候选拒绝[LayerBoundary]：Decision 会把多条 target definition 收成一条；
+            // 已证明必须保留的 value epoch 不能在这里被重新编码。
+            continue;
+        }
         let guards_are_mechanical = guards.iter().all(|guard| {
             // 候选拒绝[SemanticBarrier:ValueFlow]：guard 若还被其它根语句读取，删除其赋值会留下未定义/旧 epoch 的 temp 读取。
             stmt_touch_counts.get(guard) == Some(&1)
@@ -317,6 +339,7 @@ fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> 
                     .temp_debug_locals
                     .get(guard.index())
                     .is_none_or(Option::is_none)
+                && !inline_dispositions.temp(*guard).must_preserve()
         });
         if guards_are_mechanical {
             *stmt = replacement;
@@ -346,6 +369,7 @@ fn fold_nil_fallback_alias_locals_in_block(
         stmts[index] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![rewrite.target],
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(rewrite.source)]),
+            initializer_merge_transaction: None,
         }));
         stmts[index + 1] = HirStmt::If(Box::new(HirIf {
             cond: nil_check_for_local(rewrite.target),
@@ -1021,6 +1045,8 @@ fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt 
     HirStmt::Assign(Box::new(HirAssign {
         targets: vec![binding.into_lvalue()],
         values: HirValuePack::fixed(vec![value]),
+        initializer_merge_transaction: None,
+        generic_for_initializer_producer: None,
     }))
 }
 
@@ -1092,6 +1118,7 @@ mod tests {
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![local],
             values: HirValuePack::default(),
+            initializer_merge_transaction: None,
         }))
     }
 
@@ -1099,6 +1126,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(local)],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -1190,6 +1219,7 @@ mod tests {
         let stmt = HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![target],
             values: HirValuePack::fixed(vec![decision]),
+            initializer_merge_transaction: None,
         }));
 
         let rewrite = nil_fallback_decision_rewrite(
@@ -1210,7 +1240,7 @@ mod tests {
         let then_block = block(vec![assign(target, HirExpr::Boolean(false))]);
         let dynamic_if = HirStmt::If(Box::new(HirIf {
             cond: HirExpr::GlobalRef(crate::hir::HirGlobalRef {
-                name: "dynamic_guard".to_owned(),
+                key: "dynamic_guard".into(),
             }),
             then_block: then_block.clone(),
             else_block: None,
@@ -1255,9 +1285,13 @@ mod tests {
             debug_locals: BTreeSet::from([target]),
             ..BranchValueLocalScopeFacts::default()
         };
+        let preserved = BranchValueLocalScopeFacts {
+            preserved_locals: BTreeSet::from([target]),
+            ..BranchValueLocalScopeFacts::default()
+        };
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
 
-        for scope_facts in [&physical, &debug] {
+        for scope_facts in [&physical, &debug, &preserved] {
             assert!(
                 collapsible_branch_value_local(
                     &empty_local(target),

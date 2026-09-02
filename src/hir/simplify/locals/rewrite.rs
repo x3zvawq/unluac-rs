@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{
     HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableConstructor,
-    HirTableField, HirTableKey, HirValuePack, LocalId, TempId,
+    HirTableField, HirValuePack, LocalId, TempId,
 };
 
 use super::super::walk::{self, HirRewritePass};
@@ -112,10 +112,7 @@ fn table_constructor(table: &mut HirTableConstructor, mapping: &BTreeMap<TempId,
         let field_changed = match field {
             HirTableField::Array(expr) => self::expr(expr, mapping),
             HirTableField::Record(field) => {
-                let key_changed = match &mut field.key {
-                    HirTableKey::Name(_) => false,
-                    HirTableKey::Expr(expr) => self::expr(expr, mapping),
-                };
+                let key_changed = self::expr(&mut field.key, mapping);
                 let value_changed = self::expr(&mut field.value, mapping);
                 key_changed || value_changed
             }

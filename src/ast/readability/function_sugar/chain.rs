@@ -50,6 +50,11 @@ pub(super) fn try_chain_local_method_call_stmt(
             return None;
         }
     }
+    if !binding.rewrite_authority.may_remove_binding() {
+        // 候选拒绝[LayerBoundary]：链化会删除 call-result binding；HIR 已发布的负向
+        // 生命周期结论不能由 AST method 形状重审。
+        return None;
+    }
     if use_index.count_uses_in_suffix(stmt_base + 2, binding.id) != 0 {
         // 候选拒绝[SemanticBarrier:Lifetime]：链化会删除第二次调用后仍活跃的 receiver，反例见 regress_38。
         return None;

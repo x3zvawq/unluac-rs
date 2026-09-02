@@ -222,6 +222,11 @@ fn constructor_local_can_be_removed(binding: &AstLocalBinding) -> bool {
         // 候选拒绝[SemanticBarrier:Lifetime]：删除 PhysicalRoot 会让值在 sink 后、原 block 结束前提前离开 GC root，弱表/`__gc` 可观察，反例见 regress_353。
         return false;
     }
+    if !binding.rewrite_authority.may_remove_binding() {
+        // 候选拒绝[LayerBoundary]：constructor sugar 会删除独立 binding；HIR Preserve
+        // 只能原样转交，不能由 AST 的表构造语法重新证明。
+        return false;
+    }
     true
 }
 
@@ -627,10 +632,13 @@ mod tests {
                         id: binding,
                         attr,
                         origin: AstLocalOrigin::Recovered,
+                        rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
                         fields: Vec::new(),
                     }))],
+                    initializer_merge_transaction: None,
+                    initializer_root_profile: None,
                 })),
                 AstStmt::Assign(Box::new(AstAssign {
                     targets: vec![AstLValue::FieldAccess(Box::new(AstFieldAccess {
@@ -638,6 +646,7 @@ mod tests {
                         field: "read".to_owned(),
                     }))],
                     values: vec![function_value()],
+                    initializer_merge_transaction: None,
                 })),
             ];
 

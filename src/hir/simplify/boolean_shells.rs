@@ -74,15 +74,7 @@ impl BooleanShellFacts {
             .locals
             .iter()
             .copied()
-            .map(|local| {
-                (
-                    local,
-                    complete_possible_home_slots(
-                        promotion_facts.possible_local_home_slots(local),
-                        promotion_facts,
-                    ),
-                )
-            })
+            .map(|local| (local, promotion_facts.complete_local_home_slots(local)))
             .collect::<BTreeMap<_, _>>();
         Self {
             debug_temps: proto
@@ -102,15 +94,7 @@ impl BooleanShellFacts {
                 .temps
                 .iter()
                 .copied()
-                .map(|temp| {
-                    (
-                        temp,
-                        complete_possible_home_slots(
-                            promotion_facts.possible_temp_home_slots(temp),
-                            promotion_facts,
-                        ),
-                    )
-                })
+                .map(|temp| (temp, promotion_facts.complete_temp_home_slots(temp)))
                 .collect(),
             possible_local_homes,
         }
@@ -250,22 +234,6 @@ impl DeadShellOldValueFacts {
     }
 }
 
-pub(super) fn complete_possible_home_slots(
-    possible: Option<BTreeSet<HomeSlotKey>>,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    // Unknown is still a physical binding, so the slot/epoch universe is its complete may-alias
-    // set. An empty universe can only describe explicitly home-free HIR, which is represented by
-    // `Some(empty)` before this helper is called.
-    possible.unwrap_or_else(|| {
-        assert!(
-            !facts.physical_home_universe().is_empty(),
-            "unknown physical binding requires a non-empty physical-home universe"
-        );
-        facts.physical_home_universe().clone()
-    })
-}
-
 fn possible_home_relation(
     left: Option<HomeSlotKey>,
     left_possible: Option<&BTreeSet<HomeSlotKey>>,
@@ -340,6 +308,7 @@ fn collapse_live_boolean_materialization_shells_in_block(
             block.stmts[index - 1] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![*local],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
             }));
             block.stmts.remove(index);
             changed = true;
@@ -350,6 +319,8 @@ fn collapse_live_boolean_materialization_shells_in_block(
         block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![target],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         changed = true;
         index += 1;
@@ -616,6 +587,8 @@ mod tests {
                     stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Param(parameter)],
                         values: HirValuePack::fixed(vec![HirExpr::Boolean(false)]),
+                        initializer_merge_transaction: None,
+                        generic_for_initializer_producer: None,
                     }))],
                 }),
             })),
@@ -1383,6 +1356,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Param(closure)],
                 values: HirValuePack::fixed(vec![reference_closure(HirExpr::TempRef(candidate))]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             boolean_shell(HirLValue::Temp(candidate)),
             HirStmt::Return(Box::new(HirReturn {
@@ -1417,6 +1392,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Upvalue(upvalue)],
                 values: HirValuePack::fixed(vec![reference_closure(HirExpr::TempRef(candidate))]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             boolean_shell(HirLValue::Temp(candidate)),
         ];
@@ -1448,7 +1425,7 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![
                     HirLValue::Global(HirGlobalRef {
-                        name: "external".to_owned(),
+                        key: "external".into(),
                     }),
                     HirLValue::Local(closure),
                 ],
@@ -1456,6 +1433,8 @@ mod tests {
                     HirExpr::Nil,
                     reference_closure(HirExpr::TempRef(candidate)),
                 ]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             boolean_shell(HirLValue::Temp(candidate)),
         ];
@@ -1730,6 +1709,7 @@ mod tests {
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![local],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
         }))
     }
 
@@ -1737,6 +1717,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(temp)],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -1744,6 +1726,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(local)],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -1817,7 +1801,7 @@ mod tests {
                 args: HirValuePack::default(),
                 method: false,
                 fastcall: None,
-                method_name: None,
+                method_key: None,
             },
         }))
     }
@@ -1827,6 +1811,8 @@ mod tests {
             stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![target.clone()],
                 values: HirValuePack::fixed(vec![HirExpr::Boolean(value)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))],
         };
         HirStmt::If(Box::new(HirIf {
@@ -1854,17 +1840,21 @@ mod tests {
             params: Vec::new(),
             param_debug_hints: Vec::new(),
             locals: Vec::new(),
+            vararg_param_local: None,
             local_debug_hints: Vec::new(),
             local_debug_scopes: Vec::new(),
             debug_scopes: Vec::new(),
             physical_root_temps: BTreeSet::new(),
             physical_root_locals: BTreeSet::new(),
+            inline_dispositions: Default::default(),
             upvalues: Vec::new(),
+            environment_upvalues: BTreeSet::new(),
             mutable_upvalues: BTreeSet::new(),
             upvalue_debug_hints: Vec::new(),
             temps: Vec::new(),
             temp_debug_locals: Vec::new(),
             temp_debug_scopes: Vec::new(),
+            exit_requirements: Vec::new(),
             body: HirBlock::default(),
             children: Vec::new(),
             failure: None,

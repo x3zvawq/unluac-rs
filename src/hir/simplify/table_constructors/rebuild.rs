@@ -10,17 +10,15 @@ use std::collections::VecDeque;
 mod captures;
 use captures::*;
 
-use crate::ast::DecompileDialect;
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirStmt,
-    HirTableField, HirTableKey, HirTableSetList,
+    HirTableField, HirTableSetList,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::super::expr_facts::expr_is_boolean_valued;
 use super::bindings::{
     BindingIndex, BindingUseSummary, binding_from_expr, binding_from_lvalue, matches_binding_ref,
-    table_key_from_expr,
 };
 use super::builder::{ConstructorBuilder, RecordPromotionPolicy};
 use super::inline_value::{InlineContext, InlineRewriteState, inline_constructor_value};
@@ -34,7 +32,6 @@ pub(super) struct RegionRebuildContext<'a> {
     binding_index: &'a BindingIndex,
     remaining_uses: BindingUseSummary<'a>,
     materialized_binding_counts: &'a [u32],
-    dialect: DecompileDialect,
     scratch: &'a mut RebuildScratch,
 }
 
@@ -44,7 +41,6 @@ impl<'a> RegionRebuildContext<'a> {
         binding_index: &'a BindingIndex,
         remaining_uses: BindingUseSummary<'a>,
         materialized_binding_counts: &'a [u32],
-        dialect: DecompileDialect,
         scratch: &'a mut RebuildScratch,
     ) -> Self {
         Self {
@@ -52,7 +48,6 @@ impl<'a> RegionRebuildContext<'a> {
             binding_index,
             remaining_uses,
             materialized_binding_counts,
-            dialect,
             scratch,
         }
     }
@@ -457,14 +452,12 @@ fn collect_source_eval_events(
                         events,
                     ),
                     HirTableField::Record(field) => {
-                        if let HirTableKey::Expr(key) = &field.key {
-                            collect_source_eval_events(
-                                key,
-                                binding_index,
-                                producer_index_by_binding,
-                                events,
-                            );
-                        }
+                        collect_source_eval_events(
+                            &field.key,
+                            binding_index,
+                            producer_index_by_binding,
+                            events,
+                        );
                         collect_source_eval_events(
                             &field.value,
                             binding_index,
@@ -574,15 +567,13 @@ fn register_single_producer(
 }
 
 fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>) -> Option<()> {
-    let (key, value) = record_field_parts(context.block, stmt_index, context.dialect)?;
-    if let HirTableKey::Expr(key_expr) = &key {
-        collect_source_eval_events(
-            key_expr,
-            context.binding_index,
-            &context.scratch.producer_index_by_binding,
-            &mut context.scratch.source_eval_events,
-        );
-    }
+    let (key, value) = record_field_parts(context.block, stmt_index)?;
+    collect_source_eval_events(
+        &key,
+        context.binding_index,
+        &context.scratch.producer_index_by_binding,
+        &mut context.scratch.source_eval_events,
+    );
     collect_source_eval_events(
         value,
         context.binding_index,
@@ -592,26 +583,20 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
     let eval_event_start = context.scratch.prepared_eval_events.len();
     // 内联 record key 表达式：如果 key 是一个引用了 pending producer 的变量引用
     // （例如 `local k = "name"; t[k] = v`），把 producer 值折叠进 key 并消费绑定。
-    let key = match key {
-        HirTableKey::Expr(key_expr) => {
-            let inlined = {
-                let scratch = &mut context.scratch;
-                let mut inline_context = InlineContext::new(
-                    context.block,
-                    context.binding_index,
-                    &scratch.pending_producers,
-                    &scratch.producer_index_by_binding,
-                    InlineRewriteState {
-                        consumed_bindings: &mut scratch.consumed_bindings,
-                        eval_events: &mut scratch.prepared_eval_events,
-                    },
-                    context.remaining_uses,
-                );
-                inline_constructor_value(&mut inline_context, &key_expr)?
-            };
-            table_key_from_expr(&inlined, context.dialect)
-        }
-        name => name,
+    let key = {
+        let scratch = &mut context.scratch;
+        let mut inline_context = InlineContext::new(
+            context.block,
+            context.binding_index,
+            &scratch.pending_producers,
+            &scratch.producer_index_by_binding,
+            InlineRewriteState {
+                consumed_bindings: &mut scratch.consumed_bindings,
+                eval_events: &mut scratch.prepared_eval_events,
+            },
+            context.remaining_uses,
+        );
+        inline_constructor_value(&mut inline_context, &key)?
     };
     let recursive_closure_slot = binding_is_recursive_closure_slot(
         context.block,
@@ -661,11 +646,7 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
     Some(())
 }
 
-fn record_field_parts(
-    block: &HirBlock,
-    stmt_index: usize,
-    dialect: DecompileDialect,
-) -> Option<(HirTableKey, &HirExpr)> {
+fn record_field_parts(block: &HirBlock, stmt_index: usize) -> Option<(HirExpr, &HirExpr)> {
     let HirStmt::Assign(assign) = block.stmts.get(stmt_index)? else {
         return None;
     };
@@ -678,7 +659,7 @@ fn record_field_parts(
     let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
-    Some((table_key_from_expr(&access.key, dialect), value))
+    Some((access.key.clone(), value))
 }
 
 fn set_list_stmt(block: &HirBlock, stmt_index: usize) -> Option<&HirTableSetList> {
@@ -810,7 +791,6 @@ fn pending_producer_value<'a>(
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::ast::DecompileDialect;
     use crate::hir::common::{
         HirBlock, HirExpr, HirLocalDecl, HirStmt, HirTableConstructor, HirTableField,
         HirTableSetList, HirValuePack, LocalId,
@@ -833,6 +813,7 @@ mod tests {
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![binding],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
             }))
         };
         let block = HirBlock {
@@ -873,7 +854,6 @@ mod tests {
             &binding_index,
             occurrences.remaining_uses_after(3),
             &materialized_counts,
-            DecompileDialect::Lua54,
             &mut scratch,
         );
 

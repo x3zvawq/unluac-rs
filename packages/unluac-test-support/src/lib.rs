@@ -15,7 +15,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use unluac::ast::AstLowerError;
+use unluac::ast::{AstLowerError, AstStmt, AstTargetDialect, lower_ast};
 use unluac::decompile::{
     DecompileDialect, DecompileError, DecompileOptions, DecompileStage, decompile,
 };

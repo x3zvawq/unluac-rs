@@ -444,7 +444,9 @@ fn function_captures_path_root(
             .contains(&crate::ast::AstBindingRef::SyntheticLocal(*local)),
         // Upvalue identity is represented by the enclosing function rather than this local
         // capture summary. Keep declaration syntax when it is the path root.
-        crate::ast::AstNameRef::Upvalue(_) | crate::ast::AstNameRef::Temp(_) => true,
+        crate::ast::AstNameRef::Upvalue(_)
+        | crate::ast::AstNameRef::Environment
+        | crate::ast::AstNameRef::Temp(_) => true,
         crate::ast::AstNameRef::Global(_) => false,
     }
 }

@@ -128,9 +128,7 @@ fn note_named_vararg_binding(
     let Some(proto) = hir.protos.get(function.index()) else {
         return;
     };
-    if proto.signature.has_vararg_param_reg
-        && let Some(&local) = proto.locals.first()
-    {
+    if let Some(local) = proto.vararg_param_local {
         collector.note_binding(AstBindingRef::Local(local));
     }
 }

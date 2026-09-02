@@ -34,6 +34,7 @@ pub(super) fn merge_initialized_local_declarations(
     block.stmts[start] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
         bindings,
         values: HirValuePack::fixed(values),
+        initializer_merge_transaction: None,
     }));
     block.stmts.drain(start + 1..start + count);
     true

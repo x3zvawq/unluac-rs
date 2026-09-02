@@ -316,14 +316,8 @@ fn collect_decision_target_temp_uses(
     }
 }
 
-fn collect_table_key_temp_uses(
-    key: &crate::hir::common::HirTableKey,
-    scratch: &mut TempUseScratch,
-) {
-    match key {
-        crate::hir::common::HirTableKey::Name(_) => {}
-        crate::hir::common::HirTableKey::Expr(expr) => collect_expr_temp_uses(expr, scratch),
-    }
+fn collect_table_key_temp_uses(key: &crate::hir::common::HirExpr, scratch: &mut TempUseScratch) {
+    collect_expr_temp_uses(key, scratch);
 }
 
 pub(super) fn max_temp_index_in_block(block: &HirBlock) -> Option<usize> {
@@ -497,9 +491,6 @@ fn max_temp_index_in_decision_target(
     }
 }
 
-fn max_temp_index_in_table_key(key: &crate::hir::common::HirTableKey) -> Option<usize> {
-    match key {
-        crate::hir::common::HirTableKey::Name(_) => None,
-        crate::hir::common::HirTableKey::Expr(expr) => max_temp_index_in_expr(expr),
-    }
+fn max_temp_index_in_table_key(key: &crate::hir::common::HirExpr) -> Option<usize> {
+    max_temp_index_in_expr(key)
 }

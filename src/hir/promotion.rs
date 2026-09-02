@@ -20,7 +20,7 @@
 //!   phi 或后续 local 物化不能冒充分配本身
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, HirTableKey, LocalId, ParamId, TempId,
+    HirBlock, HirExpr, HirLValue, HirStmt, HirTableField, LocalId, ParamId, TempId,
 };
 use crate::structure::{
     BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EffectTag, GraphFacts, InstrEffect,
@@ -679,6 +679,37 @@ impl ProtoPromotionFacts {
         }
     }
 
+    /// 返回 param 在当前 HIR 改写后保守且完整的物理 home 集合。
+    ///
+    /// provenance 未知仍表示它来自某个物理 binding，因此必须扩大到当前 proto 的
+    /// 完整 home universe；只有显式 `Some(empty)` 才表示 HIR 合成且 home-free。
+    pub(super) fn complete_param_home_slots(&self, param: ParamId) -> BTreeSet<HomeSlotKey> {
+        self.complete_possible_home_slots(self.possible_param_home_slots(param))
+    }
+
+    /// 返回 local 在当前 HIR 改写后保守且完整的物理 home 集合。
+    pub(super) fn complete_local_home_slots(&self, local: LocalId) -> BTreeSet<HomeSlotKey> {
+        self.complete_possible_home_slots(self.possible_local_home_slots(local))
+    }
+
+    /// 返回 temp 在当前 HIR 改写后保守且完整的物理 home 集合。
+    pub(super) fn complete_temp_home_slots(&self, temp: TempId) -> BTreeSet<HomeSlotKey> {
+        self.complete_possible_home_slots(self.possible_temp_home_slots(temp))
+    }
+
+    fn complete_possible_home_slots(
+        &self,
+        possible: Option<BTreeSet<HomeSlotKey>>,
+    ) -> BTreeSet<HomeSlotKey> {
+        possible.unwrap_or_else(|| {
+            assert!(
+                !self.physical_home_universe.is_empty(),
+                "unknown physical binding requires a non-empty physical-home universe"
+            );
+            self.physical_home_universe.clone()
+        })
+    }
+
     /// 当前 proto 中任一物理 binding 可能占用的完整 `(slot, close epoch)` 全集。
     ///
     /// 某个 binding 的 provenance 若已退化为 Unknown，consumer 可以用该全集继续做
@@ -800,6 +831,52 @@ impl ProtoPromotionFacts {
         (!self.temp_home_was_invalidated(temp))
             .then(|| self.immediate_move_write_homes.get(temp.index()))
             .flatten()
+    }
+
+    /// 返回该 producer 紧邻透明 MOVE 链可能写入的完整物理 home 集合。
+    ///
+    /// home provenance 已失效时，consumer 仍须按任意物理 home 都可能被写入处理。
+    pub(super) fn complete_immediate_move_write_homes(
+        &self,
+        temp: TempId,
+    ) -> BTreeSet<HomeSlotKey> {
+        if self
+            .possible_temp_home_slots(temp)
+            .is_some_and(|homes| homes.is_empty())
+        {
+            return BTreeSet::new();
+        }
+        self.complete_possible_home_slots(self.trusted_immediate_move_write_homes(temp).cloned())
+    }
+
+    /// 返回 TBC 原始寄存器在当前 proto 中可能对应的完整物理 home 集合。
+    ///
+    /// value binding 的 home 可缩小到精确 epoch；若 value 是 home-free 表达式或其 home
+    /// 与协议寄存器不一致，TBC 仍由原始 `reg_index` 指定物理 cell，因此退回该寄存器的
+    /// 全部 close epoch。原始协议寄存器不在 universe 中属于内部事实错误。
+    pub(super) fn complete_tbc_home_slots(
+        &self,
+        reg_index: usize,
+        value_homes: BTreeSet<HomeSlotKey>,
+    ) -> BTreeSet<HomeSlotKey> {
+        let matching_value_homes = value_homes
+            .into_iter()
+            .filter(|home| home.slot() == reg_index)
+            .collect::<BTreeSet<_>>();
+        if !matching_value_homes.is_empty() {
+            return matching_value_homes;
+        }
+        let physical_homes = self
+            .physical_home_universe
+            .iter()
+            .copied()
+            .filter(|home| home.slot() == reg_index)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !physical_homes.is_empty(),
+            "to-be-closed register requires a physical home in the proto universe"
+        );
+        physical_homes
     }
 
     pub(super) fn param_home_was_invalidated(&self, param: ParamId) -> bool {
@@ -1016,9 +1093,7 @@ impl ProtoPromotionFacts {
                             self.collect_captured_home_slots_in_expr(value, slots);
                         }
                         HirTableField::Record(field) => {
-                            if let HirTableKey::Expr(key) = &field.key {
-                                self.collect_captured_home_slots_in_expr(key, slots);
-                            }
+                            self.collect_captured_home_slots_in_expr(&field.key, slots);
                             self.collect_captured_home_slots_in_expr(&field.value, slots);
                         }
                     }
@@ -1104,9 +1179,7 @@ impl ProtoPromotionFacts {
                             self.collect_temp_home_slots_in_expr(value, slots);
                         }
                         HirTableField::Record(field) => {
-                            if let HirTableKey::Expr(key) = &field.key {
-                                self.collect_temp_home_slots_in_expr(key, slots);
-                            }
+                            self.collect_temp_home_slots_in_expr(&field.key, slots);
                             self.collect_temp_home_slots_in_expr(&field.value, slots);
                         }
                     }

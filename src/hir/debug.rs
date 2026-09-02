@@ -15,8 +15,9 @@ use crate::debug::{
 };
 
 use super::common::{
-    HirBlock, HirDecisionExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirProto, HirStmt,
-    HirTableField, HirUnaryOpKind, HirValuePack,
+    HirBlock, HirControlFlowFeature, HirDecisionExpr, HirDecisionTarget, HirExitRequirement,
+    HirExpr, HirInlineDisposition, HirLValue, HirModule, HirProto, HirStmt, HirTableField,
+    HirUnaryOpKind, HirValuePack, UpvalueId,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -88,12 +89,14 @@ pub(crate) fn dump_hir_module(
 
         let _ = writeln!(
             output,
-            "proto#{} params={} locals={} upvalues={} temps={} children={}",
+            "proto#{} params={} locals={} upvalues={} env-upvalues={} temps={} exit-requirements={} children={}",
             proto.id.index(),
             proto.params.len(),
             proto.locals.len(),
             proto.upvalues.len(),
+            format_environment_upvalues(&proto.environment_upvalues),
             proto.temps.len(),
+            proto.exit_requirements.len(),
             format_proto_refs(&proto.children),
         );
 
@@ -103,18 +106,48 @@ pub(crate) fn dump_hir_module(
 
         let _ = writeln!(
             output,
-            "  source={} lines={}..{} vararg={}",
+            "  source={} lines={}..{} vararg={} vararg-local={}",
             proto.source.as_deref().unwrap_or("-"),
             proto.line_range.defined_start,
             proto.line_range.defined_end,
-            proto.signature.is_vararg
+            proto.signature.is_vararg,
+            proto
+                .vararg_param_local
+                .map_or_else(|| "-".to_owned(), |local| format!("l{}", local.index())),
         );
         write_debug_bindings(&mut output, proto);
+        write_exit_requirements(&mut output, proto);
         let _ = writeln!(output, "  body");
         write_block(&mut output, "    ", &proto.body);
     }
 
     colorize_debug_text(&output, color)
+}
+
+fn write_exit_requirements(output: &mut String, proto: &HirProto) {
+    for requirement in &proto.exit_requirements {
+        let detail = match requirement {
+            HirExitRequirement::RequiredControlFlow {
+                source_proto,
+                feature,
+            } => format!(
+                "source-proto#{source_proto} requires {}",
+                match feature {
+                    HirControlFlowFeature::GotoLabel => "goto/label",
+                    HirControlFlowFeature::ContinueStatement => "continue",
+                }
+            ),
+            HirExitRequirement::UnresolvedValue {
+                source_proto,
+                phi,
+                block,
+                register,
+            } => format!(
+                "source-proto#{source_proto} unresolved phi{phi} at #{block} register r{register}"
+            ),
+        };
+        let _ = writeln!(output, "  exit requirement {detail}");
+    }
 }
 
 fn write_debug_bindings(output: &mut String, proto: &HirProto) {
@@ -133,6 +166,20 @@ fn write_debug_bindings(output: &mut String, proto: &HirProto) {
         &proto.temp_debug_locals,
         Some(&proto.temp_debug_scopes),
     );
+    for local in &proto.locals {
+        if let HirInlineDisposition::Preserve(reasons) = proto.inline_dispositions.local(*local) {
+            let _ = writeln!(
+                output,
+                "    l{} rewrite=preserve:{reasons:?}",
+                local.index()
+            );
+        }
+    }
+    for temp in &proto.temps {
+        if let HirInlineDisposition::Preserve(reasons) = proto.inline_dispositions.temp(*temp) {
+            let _ = writeln!(output, "    t{} rewrite=preserve:{reasons:?}", temp.index());
+        }
+    }
 }
 
 fn write_debug_hint_slice(
@@ -177,7 +224,12 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                 let _ = writeln!(
                     output,
                     "{indent}global {} = {}",
-                    global_decl.names.join(", "),
+                    global_decl
+                        .names
+                        .iter()
+                        .map(crate::LuaString::debug_literal)
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     format_value_pack(&global_decl.values),
                 );
             }
@@ -257,9 +309,51 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                 write_block(output, &format!("{indent}  "), &numeric_for.body);
             }
             HirStmt::GenericFor(generic_for) => {
+                let protocol = if generic_for.initializer_transaction.is_some()
+                    || !generic_for.initializer_roots.is_empty()
+                    || !generic_for.dispatch_results.is_empty()
+                {
+                    let initializer = generic_for
+                        .initializer_transaction
+                        .as_ref()
+                        .map(|transaction| {
+                            let spans = transaction
+                                .producers
+                                .iter()
+                                .map(|span| format!("{}+{}", span.value_start, span.value_count))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!(
+                                "init-width:{} init-spans:{spans} ",
+                                transaction.iterator_width
+                            )
+                        })
+                        .unwrap_or_default();
+                    let roots = generic_for
+                        .initializer_roots
+                        .iter()
+                        .map(|temp| format!("t{}", temp.index()))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let results = generic_for
+                        .dispatch_results
+                        .iter()
+                        .map(|result| {
+                            format!(
+                                "t{}->l{}",
+                                result.result_def.index(),
+                                result.success_binding.index()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(" <{initializer}init-roots:{roots} dispatch-results:{results}>")
+                } else {
+                    String::new()
+                };
                 let _ = writeln!(
                     output,
-                    "{indent}generic-for {} in {}",
+                    "{indent}generic-for {} in {}{}",
                     generic_for
                         .bindings
                         .iter()
@@ -267,6 +361,7 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                         .collect::<Vec<_>>()
                         .join(", "),
                     format_value_pack(&generic_for.iterator),
+                    protocol,
                 );
                 write_block(output, &format!("{indent}  "), &generic_for.body);
             }
@@ -330,7 +425,7 @@ fn format_expr(expr: &HirExpr) -> String {
         HirExpr::LocalRef(local) => format!("l{}", local.index()),
         HirExpr::UpvalueRef(upvalue) => format!("u{}", upvalue.index()),
         HirExpr::TempRef(temp) => format!("t{}", temp.index()),
-        HirExpr::GlobalRef(global) => format!("global({})", global.name),
+        HirExpr::GlobalRef(global) => format!("global({})", global.key.debug_literal()),
         HirExpr::TableAccess(access) => {
             format!(
                 "{}[{}]",
@@ -444,7 +539,7 @@ fn format_lvalue(target: &HirLValue) -> String {
         HirLValue::Temp(temp) => format!("t{}", temp.index()),
         HirLValue::Local(local) => format!("l{}", local.index()),
         HirLValue::Upvalue(upvalue) => format!("u{}", upvalue.index()),
-        HirLValue::Global(global) => format!("global({})", global.name),
+        HirLValue::Global(global) => format!("global({})", global.key.debug_literal()),
         HirLValue::TableAccess(access) => {
             format!(
                 "{}[{}]",
@@ -509,6 +604,18 @@ fn format_proto_refs(protos: &[super::common::HirProtoRef]) -> String {
             .map(|proto| format!("proto#{}", proto.index()))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+fn format_environment_upvalues(upvalues: &std::collections::BTreeSet<UpvalueId>) -> String {
+    if upvalues.is_empty() {
+        "-".to_owned()
+    } else {
+        upvalues
+            .iter()
+            .map(|upvalue| format!("u{}", upvalue.index()))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -589,11 +696,15 @@ pub(crate) fn dump_proto_snapshot(proto: &super::common::HirProto) -> String {
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "proto#{} params={} locals={} upvalues={} temps={}",
+        "proto#{} params={} locals={} vararg-local={} upvalues={} env-upvalues={} temps={}",
         proto.id.index(),
         proto.params.len(),
         proto.locals.len(),
+        proto
+            .vararg_param_local
+            .map_or_else(|| "-".to_owned(), |local| format!("l{}", local.index())),
         proto.upvalues.len(),
+        format_environment_upvalues(&proto.environment_upvalues),
         proto.temps.len(),
     );
     let _ = writeln!(output, "  body");

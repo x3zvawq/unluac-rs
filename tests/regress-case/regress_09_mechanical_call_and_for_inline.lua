@@ -24,5 +24,5 @@ for index, level in _G.ipairs(g_episodes[7].pages[3].levels) do
     print("regress_09_mechanical_call_and_for_inline#1", index, level)
 end
 
--- unluac: expect-contains [[loadLuaFile(scriptPath .. "/subsystems/eggdefender/EggDefenderSetup.lua", "")]]
--- unluac: expect-contains [[in _G.ipairs(g_episodes[7].pages[3].levels) do]]
+-- The call/iterator preparation writes reuse homes that still carry escaped table roots.
+-- They must not be removed until HIR can preserve the corresponding overwrite endpoints.

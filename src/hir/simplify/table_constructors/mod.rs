@@ -16,6 +16,7 @@
 //! statement/block 骨架门跳过，不递归扫描无关表达式。
 //! fixed SETLIST 的 local 路径只改写 SETLIST 本身，fresh seed 的声明或重赋值保持原位；
 //! 该边界同时保留 initializer/overwrite 的求值时点与独立 GC root，不用复制表达式来换取展示折叠。
+//! record key 始终保留为 HIR 表达式；本 pass 不读取目标方言，也不提前选择命名字段语法。
 
 mod bindings;
 mod builder;
@@ -26,10 +27,9 @@ mod scan;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use crate::ast::DecompileDialect;
 use crate::hir::common::{
     HirAssign, HirExpr, HirLValue, HirProto, HirStmt, HirTableAccess, HirTableConstructor,
-    HirTableField, HirTableKey, HirValuePack, LocalId, TempId,
+    HirTableField, HirValuePack, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -45,7 +45,6 @@ use self::scan::{
     seed_delay_expr_is_unobservable, seed_overwrite_delay_is_unobservable,
     try_rebuild_constructor_region,
 };
-use super::boolean_shells::complete_possible_home_slots;
 use super::mention::{
     ReferenceCapturedBindings, stmts_reference_captured_bindings, stmts_value_captured_bindings,
 };
@@ -153,7 +152,6 @@ struct RebuildScratch {
 
 pub(super) fn stabilize_table_constructors_in_proto(
     proto: &mut HirProto,
-    dialect: DecompileDialect,
     promotion_facts: &ProtoPromotionFacts,
 ) -> bool {
     if !block_has_table_constructor_candidate(&proto.body) {
@@ -176,7 +174,6 @@ pub(super) fn stabilize_table_constructors_in_proto(
             &proto.local_debug_hints,
         ),
         promotion_facts,
-        dialect,
         temp_count,
         next_local_index: first_new_local,
         #[cfg(test)]
@@ -198,7 +195,6 @@ struct TableConstructorPass<'a> {
     reference_captured_home_slots: std::collections::BTreeSet<HomeSlotKey>,
     debug_identity_bindings: BindingSlots<bool>,
     promotion_facts: &'a ProtoPromotionFacts,
-    dialect: DecompileDialect,
     temp_count: usize,
     next_local_index: usize,
     #[cfg(test)]
@@ -256,7 +252,6 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     &materialized_binding_counts,
                     &self.debug_identity_bindings,
                     &stmt_ids,
-                    self.dialect,
                     &mut scratch,
                 );
                 candidate.filter(|(rebuilt_constructor, end_index, preserved_stmt_indices)| {
@@ -303,19 +298,20 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // folded region, a later clear/escape/call may observe that root; keep the
                     // producer declaration in that case.  When the table dies at the region
                     // boundary, dropping the temporary does not change its observable life.
+                    // 已通过 `open_local_constructor_region_is_safe` 的 LocalDecl owner 是
+                    // 更精确的整区间证明：producer 只为该 initializer 的最终 open tail
+                    // 服务，不能再让通用“后续仍提到 table”近似覆盖这项结论。
                     // 候选拒绝[SemanticBarrier:Lifetime]：反例见
                     // tests/unit-case/lua54_01_close.lua#lua54_01_close#13/#14/#16。
-                    let producer_root_is_observable = region_has_non_drop_safe_producer(
-                        block,
-                        index,
-                        *end_index,
-                        preserved_stmt_indices,
-                    ) && collect_range_binding_mentions(
-                        block,
-                        *end_index + 1,
-                        block.stmts.len(),
-                    )
-                    .contains(&binding);
+                    let producer_root_is_observable = !open_local_owner
+                        && region_has_non_drop_safe_producer(
+                            block,
+                            index,
+                            *end_index,
+                            preserved_stmt_indices,
+                        )
+                        && collect_range_binding_mentions(block, *end_index + 1, block.stmts.len())
+                            .contains(&binding);
                     // 候选拒绝[SemanticBarrier:Lifetime]：对象 producer 后再覆盖 table field
                     // 时，删除 producer 会提前释放最后一个强引用；反例同上。
                     let has_followup_object_write =
@@ -546,6 +542,8 @@ impl TableConstructorPass<'_> {
                                 key: HirExpr::Integer(i64::from(key)),
                             }))],
                             values: HirValuePack::fixed(vec![value.clone()]),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
                         }))
                     })
                     .collect::<Vec<_>>();
@@ -1205,23 +1203,20 @@ impl TableConstructorPass<'_> {
     ) -> bool {
         captured.locals.iter().any(|local| {
             *local == seed_local
-                || !complete_possible_home_slots(
-                    self.promotion_facts.possible_local_home_slots(*local),
-                    self.promotion_facts,
-                )
-                .is_disjoint(seed_homes)
+                || !self
+                    .promotion_facts
+                    .complete_local_home_slots(*local)
+                    .is_disjoint(seed_homes)
         }) || captured.temps.iter().any(|temp| {
-            !complete_possible_home_slots(
-                self.promotion_facts.possible_temp_home_slots(*temp),
-                self.promotion_facts,
-            )
-            .is_disjoint(seed_homes)
+            !self
+                .promotion_facts
+                .complete_temp_home_slots(*temp)
+                .is_disjoint(seed_homes)
         }) || captured.params.iter().any(|param| {
-            !complete_possible_home_slots(
-                self.promotion_facts.possible_param_home_slots(*param),
-                self.promotion_facts,
-            )
-            .is_disjoint(seed_homes)
+            !self
+                .promotion_facts
+                .complete_param_home_slots(*param)
+                .is_disjoint(seed_homes)
         })
     }
 
@@ -1235,10 +1230,7 @@ impl TableConstructorPass<'_> {
         let TableBinding::Local(local) = binding else {
             return false;
         };
-        let seed_homes = complete_possible_home_slots(
-            self.promotion_facts.possible_local_home_slots(local),
-            self.promotion_facts,
-        );
+        let seed_homes = self.promotion_facts.complete_local_home_slots(local);
         // 候选拒绝[SemanticBarrier:Capture]：ByReference closure 可持续观察 owner cell，
         // ByValue closure 则在 producer 原位置冻结该 cell；把 producer 移入 LocalDecl
         // initializer 会把两者都放到 owner store 之前。complete possible-home 相交时，
@@ -1959,13 +1951,8 @@ fn expr_open_tail_residuals(expr: &HirExpr) -> OpenTailResiduals {
             .fold(OpenTailResiduals::default(), |residuals, field| {
                 residuals.union(match field {
                     HirTableField::Array(value) => expr_open_tail_residuals(value),
-                    HirTableField::Record(record) => {
-                        let key = match &record.key {
-                            HirTableKey::Name(_) => OpenTailResiduals::default(),
-                            HirTableKey::Expr(key) => expr_open_tail_residuals(key),
-                        };
-                        key.union(expr_open_tail_residuals(&record.value))
-                    }
+                    HirTableField::Record(record) => expr_open_tail_residuals(&record.key)
+                        .union(expr_open_tail_residuals(&record.value)),
                 })
             })
             .union(
@@ -2102,11 +2089,8 @@ fn expr_is_fixed_set_list_value_safe(expr: &HirExpr) -> bool {
     }
 }
 
-fn record_key_is_data_only(key: &crate::hir::common::HirTableKey) -> bool {
-    match key {
-        crate::hir::common::HirTableKey::Name(_) => true,
-        crate::hir::common::HirTableKey::Expr(expr) => expr_is_data_only(expr),
-    }
+fn record_key_is_data_only(key: &HirExpr) -> bool {
+    expr_is_data_only(key)
 }
 
 /// 只沿 statement/block 骨架查找本 pass 可能改写的根形状，不进入表达式子树。
@@ -2175,10 +2159,8 @@ fn constructor_has_late_record_overwriting_array(constructor: &HirTableConstruct
             HirTableField::Array(_) => array_fields += 1,
             HirTableField::Record(record) => {
                 let matches_prior_array = match &record.key {
-                    HirTableKey::Expr(HirExpr::Integer(index)) => {
-                        (1..=array_fields).contains(index)
-                    }
-                    HirTableKey::Expr(HirExpr::Number(index)) => {
+                    HirExpr::Integer(index) => (1..=array_fields).contains(index),
+                    HirExpr::Number(index) => {
                         index.is_finite()
                             && index.fract() == 0.0
                             && *index >= 1.0
@@ -2229,7 +2211,7 @@ fn constructor_has_definite_nil_record_key(constructor: &HirTableConstructor) ->
         matches!(
             field,
             HirTableField::Record(record)
-                if matches!(&record.key, HirTableKey::Expr(HirExpr::Nil))
+                if matches!(&record.key, HirExpr::Nil)
         )
     })
 }
@@ -2253,36 +2235,60 @@ fn expressions_have_safe_nil_shape(values: &[HirExpr]) -> bool {
     true
 }
 
-/// 这里只沿 exact local producer 槽追踪 nil 性；producer 语句保持原位，因此不会继承 generic
-/// fold transaction 的表达式 clone 或 root lifetime 风险。
+/// 这里按语句顺序追踪 direct binding 当前 definition 的 nil 性；producer 语句保持原位，
+/// 因此不会继承 generic fold transaction 的表达式 clone 或 root lifetime 风险。
 fn local_set_list_values_have_safe_nil_shape(
     block: &crate::hir::common::HirBlock,
     seed_index: usize,
     set_list_index: usize,
     values: &[HirExpr],
 ) -> bool {
-    let mut definitions = BTreeMap::new();
+    let mut definitions = BTreeMap::<TableBinding, bool>::new();
     for stmt in &block.stmts[seed_index + 1..set_list_index] {
-        let HirStmt::LocalDecl(decl) = stmt else {
-            continue;
-        };
-        if decl.values.tail.is_some() || decl.bindings.len() != decl.values.fixed.len() {
-            continue;
-        }
-        for (local, value) in decl.bindings.iter().zip(&decl.values.fixed) {
-            if definitions
-                .insert(TableBinding::Local(*local), value)
-                .is_some()
-            {
-                return false;
+        match stmt {
+            HirStmt::LocalDecl(decl) => {
+                let value_facts = decl
+                    .values
+                    .fixed
+                    .iter()
+                    .map(|value| expr_is_definitely_non_nil_from_definitions(value, &definitions))
+                    .collect::<Vec<_>>();
+                for (index, local) in decl.bindings.iter().enumerate() {
+                    let definitely_non_nil = value_facts.get(index).copied().unwrap_or(false);
+                    definitions.insert(TableBinding::Local(*local), definitely_non_nil);
+                }
+            }
+            HirStmt::Assign(assign) => {
+                let value_facts = assign
+                    .values
+                    .fixed
+                    .iter()
+                    .map(|value| expr_is_definitely_non_nil_from_definitions(value, &definitions))
+                    .collect::<Vec<_>>();
+                let exact_width = assign.values.tail.is_none()
+                    && assign.targets.len() == assign.values.fixed.len();
+                for (index, target) in assign.targets.iter().enumerate() {
+                    let Some(binding) = binding_from_lvalue(target) else {
+                        continue;
+                    };
+                    let definitely_non_nil =
+                        exact_width && value_facts.get(index).copied().unwrap_or(false);
+                    definitions.insert(binding, definitely_non_nil);
+                }
+            }
+            _ => {
+                // 结构化语句可能按路径改写已知 binding；区间内没有 must-def 合流证明时，
+                // 不能沿用语句之前的 non-nil 事实。
+                for binding in stmt_written_bindings(stmt) {
+                    definitions.insert(binding, false);
+                }
             }
         }
     }
 
     let mut saw_uncertain = false;
     for value in values {
-        let mut resolving = BTreeSet::new();
-        if expr_is_definitely_non_nil_from_local_definitions(value, &definitions, &mut resolving) {
+        if expr_is_definitely_non_nil_from_definitions(value, &definitions) {
             if saw_uncertain {
                 return false;
             }
@@ -2295,10 +2301,9 @@ fn local_set_list_values_have_safe_nil_shape(
     true
 }
 
-fn expr_is_definitely_non_nil_from_local_definitions(
+fn expr_is_definitely_non_nil_from_definitions(
     expr: &HirExpr,
-    definitions: &BTreeMap<TableBinding, &HirExpr>,
-    resolving: &mut BTreeSet<TableBinding>,
+    definitions: &BTreeMap<TableBinding, bool>,
 ) -> bool {
     if expr_is_definitely_non_nil(expr) {
         return true;
@@ -2306,14 +2311,47 @@ fn expr_is_definitely_non_nil_from_local_definitions(
     let Some(binding) = binding_from_expr(expr) else {
         return false;
     };
-    if !resolving.insert(binding) {
-        return false;
+    definitions.get(&binding).copied().unwrap_or(false)
+}
+
+fn stmt_written_bindings(stmt: &HirStmt) -> BTreeSet<TableBinding> {
+    struct Probe {
+        bindings: BTreeSet<TableBinding>,
     }
-    let result = definitions.get(&binding).is_some_and(|definition| {
-        expr_is_definitely_non_nil_from_local_definitions(definition, definitions, resolving)
-    });
-    resolving.remove(&binding);
-    result
+
+    impl HirVisitor for Probe {
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            match stmt {
+                HirStmt::LocalDecl(decl) => self
+                    .bindings
+                    .extend(decl.bindings.iter().copied().map(TableBinding::Local)),
+                HirStmt::NumericFor(numeric_for) => {
+                    self.bindings
+                        .insert(TableBinding::Local(numeric_for.binding));
+                }
+                HirStmt::GenericFor(generic_for) => self.bindings.extend(
+                    generic_for
+                        .bindings
+                        .iter()
+                        .copied()
+                        .map(TableBinding::Local),
+                ),
+                _ => {}
+            }
+        }
+
+        fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+            if let Some(binding) = binding_from_lvalue(lvalue) {
+                self.bindings.insert(binding);
+            }
+        }
+    }
+
+    let mut probe = Probe {
+        bindings: BTreeSet::new(),
+    };
+    visit_stmts(std::slice::from_ref(stmt), &mut probe);
+    probe.bindings
 }
 
 fn array_fields_have_safe_nil_shape(fields: &[HirTableField]) -> bool {
@@ -2365,11 +2403,8 @@ fn table_field_contains_nil(field: &HirTableField) -> bool {
     }
 }
 
-fn record_key_contains_nil(key: &crate::hir::common::HirTableKey) -> bool {
-    match key {
-        crate::hir::common::HirTableKey::Expr(expr) => expr_contains_nil(expr),
-        crate::hir::common::HirTableKey::Name(_) => false,
-    }
+fn record_key_contains_nil(key: &HirExpr) -> bool {
+    expr_contains_nil(key)
 }
 
 fn expr_contains_nil(expr: &HirExpr) -> bool {
@@ -2403,11 +2438,11 @@ mod tests {
 
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
-            callee: HirExpr::GlobalRef(HirGlobalRef { name: name.into() }),
+            callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }))
     }
 
@@ -2415,6 +2450,7 @@ mod tests {
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![local],
             values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::new(constructor))]),
+            initializer_merge_transaction: None,
         }))
     }
 
@@ -2434,7 +2470,6 @@ mod tests {
             reference_captured_home_slots,
             debug_identity_bindings: BindingSlots::from_debug_hints(&[], local_debug_hints),
             promotion_facts,
-            dialect: DecompileDialect::Lua54,
             temp_count: 0,
             next_local_index: local_debug_hints.len(),
             direct_set_list_rebuilds: 0,
@@ -2447,7 +2482,7 @@ mod tests {
         let rebuilt = HirTableConstructor {
             fields: vec![
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Name("absent".into()),
+                    key: HirExpr::String("absent".into()),
                     value: HirExpr::Nil,
                 }),
                 HirTableField::Array(HirExpr::Nil),
@@ -2466,6 +2501,8 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(owner)],
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
@@ -2473,6 +2510,8 @@ mod tests {
                         key: HirExpr::String("missing".into()),
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
             ],
         };
@@ -2488,7 +2527,6 @@ mod tests {
             reference_captured_home_slots,
             debug_identity_bindings: BindingSlots::from_debug_hints(&[None], &[]),
             promotion_facts: &promotion_facts,
-            dialect: DecompileDialect::Lua54,
             temp_count: 1,
             next_local_index: 0,
             direct_set_list_rebuilds: 0,
@@ -2500,7 +2538,7 @@ mod tests {
         assert_eq!(
             constructor.fields,
             vec![HirTableField::Record(HirRecordField {
-                key: HirTableKey::Name("missing".into()),
+                key: HirExpr::String("missing".into()),
                 value: HirExpr::Nil,
             })]
         );
@@ -2516,6 +2554,8 @@ mod tests {
                     key: HirExpr::String(key.into()),
                 }))],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         let mut block = HirBlock {
@@ -2523,10 +2563,13 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(owner)],
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(0), LocalId(1)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                    initializer_merge_transaction: None,
                 })),
                 record("first", HirExpr::LocalRef(LocalId(0))),
                 record("second", HirExpr::LocalRef(LocalId(1))),
@@ -2544,7 +2587,6 @@ mod tests {
             reference_captured_home_slots,
             debug_identity_bindings: BindingSlots::from_debug_hints(&[None], &[None, None]),
             promotion_facts: &promotion_facts,
-            dialect: DecompileDialect::Lua54,
             temp_count: 1,
             next_local_index: 2,
             direct_set_list_rebuilds: 0,
@@ -2557,11 +2599,11 @@ mod tests {
             constructor.fields,
             vec![
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Name("first".into()),
+                    key: HirExpr::String("first".into()),
                     value: HirExpr::Integer(7),
                 }),
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Name("second".into()),
+                    key: HirExpr::String("second".into()),
                     value: HirExpr::Nil,
                 }),
             ]
@@ -2580,7 +2622,7 @@ mod tests {
         };
         let nil_key = HirTableConstructor {
             fields: vec![HirTableField::Record(HirRecordField {
-                key: HirTableKey::Expr(HirExpr::Nil),
+                key: HirExpr::Nil,
                 value: HirExpr::Integer(1),
             })],
             trailing_multivalue: None,
@@ -2596,7 +2638,7 @@ mod tests {
             fields: vec![
                 HirTableField::Array(HirExpr::LocalRef(LocalId(0))),
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Expr(HirExpr::Integer(1)),
+                    key: HirExpr::Integer(1),
                     value: HirExpr::Nil,
                 }),
             ],
@@ -2614,6 +2656,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![owner],
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -2641,6 +2684,8 @@ mod tests {
                         key: HirExpr::String("value".into()),
                     }))],
                     values: HirValuePack::fixed(vec![call("make_value")]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
             ],
         };
@@ -2653,9 +2698,9 @@ mod tests {
         assert!(matches!(
             constructor.fields.as_slice(),
             [HirTableField::Record(HirRecordField {
-                key: HirTableKey::Name(key),
+                key: HirExpr::String(key),
                 value: HirExpr::Call(_),
-            })] if key == "value"
+            })] if key.as_utf8() == Some("value")
         ));
     }
 
@@ -2669,12 +2714,14 @@ mod tests {
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::new(
                         HirTableConstructor {
                             fields: vec![HirTableField::Record(HirRecordField {
-                                key: HirTableKey::Expr(HirExpr::Integer(1)),
+                                key: HirExpr::Integer(1),
                                 value: HirExpr::Integer(10),
                             })],
                             trailing_multivalue: None,
                         },
                     ))]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::TempRef(owner),
@@ -2684,6 +2731,8 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(owner)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(30)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
             ],
         };
@@ -2702,7 +2751,6 @@ mod tests {
             reference_captured_home_slots,
             debug_identity_bindings: BindingSlots::from_debug_hints(&[None], &[]),
             promotion_facts: &promotion_facts,
-            dialect: DecompileDialect::Lua54,
             temp_count: 1,
             next_local_index: 0,
             direct_set_list_rebuilds: 0,
@@ -2723,7 +2771,7 @@ mod tests {
             constructor.fields.as_slice(),
             [
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Expr(HirExpr::Integer(1)),
+                    key: HirExpr::Integer(1),
                     value: HirExpr::Integer(10),
                 }),
                 HirTableField::Array(HirExpr::Nil),
@@ -2748,7 +2796,7 @@ mod tests {
                         fields: vec![
                             HirTableField::Array(HirExpr::Integer(10)),
                             HirTableField::Record(HirRecordField {
-                                key: HirTableKey::Name("self".into()),
+                                key: HirExpr::String("self".into()),
                                 value: HirExpr::LocalRef(owner),
                             }),
                         ],
@@ -2769,6 +2817,8 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Local(owner)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(30)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
             ],
         };
@@ -2795,11 +2845,11 @@ mod tests {
             [
                 HirTableField::Array(HirExpr::Integer(10)),
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Name(name),
+                    key: HirExpr::String(name),
                     value: HirExpr::LocalRef(local),
                 }),
                 HirTableField::Array(HirExpr::TableConstructor(_)),
-            ] if name == "self" && *local == owner
+            ] if name.as_utf8() == Some("self") && *local == owner
         ));
         assert!(
             constructor
@@ -2831,6 +2881,7 @@ mod tests {
                             trailing_multivalue: None,
                         },
                     ))]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -2893,6 +2944,7 @@ mod tests {
                                 }],
                             },
                         ))]),
+                        initializer_merge_transaction: None,
                     })),
                     HirStmt::TableSetList(Box::new(HirTableSetList {
                         base: HirExpr::LocalRef(owner),
@@ -2944,6 +2996,8 @@ mod tests {
                         key: call("make_key"),
                     }))],
                     values: HirValuePack::fixed(vec![call("make_value")]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -2969,7 +3023,7 @@ mod tests {
             constructor.fields.as_slice(),
             [
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Expr(HirExpr::Call(_)),
+                    key: HirExpr::Call(_),
                     value: HirExpr::Call(_),
                 }),
                 HirTableField::Array(HirExpr::TableConstructor(_)),
@@ -2989,6 +3043,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![producer],
                     values: HirValuePack::fixed(vec![HirExpr::String("key".into())]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
@@ -2996,6 +3051,8 @@ mod tests {
                         key: HirExpr::LocalRef(producer),
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3014,6 +3071,7 @@ mod tests {
                             value: HirExpr::LocalRef(producer),
                         }],
                     }))]),
+                    initializer_merge_transaction: None,
                 })),
             ],
         };
@@ -3036,11 +3094,11 @@ mod tests {
             constructor.fields.as_slice(),
             [
                 HirTableField::Record(HirRecordField {
-                    key: HirTableKey::Name(name),
+                    key: HirExpr::String(name),
                     value: HirExpr::Integer(7),
                 }),
                 HirTableField::Array(HirExpr::TableConstructor(_)),
-            ] if name == "key"
+            ] if name.as_utf8() == Some("key")
         ));
         assert!(constructor.trailing_multivalue.is_some());
         assert!(matches!(
@@ -3072,6 +3130,8 @@ mod tests {
                         vec![HirExpr::Integer(1)],
                         HirPackTail::open(call("parallel_tail")),
                     ),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3113,6 +3173,8 @@ mod tests {
                         key: call("dynamic_key"),
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(producer)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3157,6 +3219,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![prefix],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3194,6 +3257,8 @@ mod tests {
                         key: call("make_key"),
                     }))],
                     values: HirValuePack::fixed(vec![call("make_value")]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3225,7 +3290,7 @@ mod tests {
                     if matches!(constructor.fields.as_slice(), [
                         HirTableField::Array(HirExpr::Call(_)),
                         HirTableField::Record(HirRecordField {
-                            key: HirTableKey::Expr(HirExpr::Call(_)),
+                            key: HirExpr::Call(_),
                             value: HirExpr::Call(_),
                         }),
                     ]))
@@ -3242,6 +3307,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![producer],
                     values: HirValuePack::fixed(vec![call("inspect_owner")]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3275,6 +3341,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![inert_prefix],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3303,6 +3370,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![snapshot],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(merged_alias)]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3338,6 +3406,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![scratch],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3371,6 +3440,7 @@ mod tests {
                         stmts: vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
                             bindings: vec![scratch],
                             values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                            initializer_merge_transaction: None,
                         }))],
                     },
                     else_block: None,
@@ -3437,6 +3507,8 @@ mod tests {
                         stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                             targets: vec![HirLValue::Local(owner)],
                             values: HirValuePack::fixed(vec![HirExpr::LocalRef(replacement)]),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
                         }))],
                     },
                     else_block: None,
@@ -3465,6 +3537,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![alias],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::If(Box::new(HirIf {
                     cond: HirExpr::Boolean(true),
@@ -3472,6 +3545,8 @@ mod tests {
                         stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                             targets: vec![HirLValue::Local(alias)],
                             values: HirValuePack::fixed(vec![HirExpr::LocalRef(owner)]),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
                         }))],
                     },
                     else_block: None,
@@ -3479,12 +3554,12 @@ mod tests {
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: HirCallExpr {
                         callee: HirExpr::GlobalRef(HirGlobalRef {
-                            name: "install_metatable".into(),
+                            key: "install_metatable".into(),
                         }),
                         args: HirValuePack::fixed(vec![HirExpr::LocalRef(alias)]),
                         method: false,
                         fastcall: None,
-                        method_name: None,
+                        method_key: None,
                     },
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
@@ -3539,7 +3614,7 @@ mod tests {
         let resource = LocalId(3);
         let external_base = HirExpr::TableAccess(Box::new(HirTableAccess {
             base: HirExpr::GlobalRef(HirGlobalRef {
-                name: "registry".into(),
+                key: "registry".into(),
             }),
             key: HirExpr::String("target".into()),
         }));
@@ -3549,18 +3624,23 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![left],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![right],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![resource],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Local(left), HirLValue::Local(right)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
@@ -3568,6 +3648,8 @@ mod tests {
                         key: HirExpr::String("value".into()),
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(3)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: match call("tick") {
@@ -3617,16 +3699,17 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![alias],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(owner)]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: HirCallExpr {
                         callee: HirExpr::GlobalRef(HirGlobalRef {
-                            name: "install_metatable".into(),
+                            key: "install_metatable".into(),
                         }),
                         args: HirValuePack::fixed(vec![HirExpr::LocalRef(alias)]),
                         method: false,
                         fastcall: None,
-                        method_name: None,
+                        method_key: None,
                     },
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
@@ -3655,15 +3738,18 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![alias],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(owner)]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::GlobalRef(HirGlobalRef {
-                            name: "registry".into(),
+                            key: "registry".into(),
                         }),
                         key: HirExpr::LocalRef(alias),
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
@@ -3689,21 +3775,24 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![alias],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(owner)]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::LocalRef(owner),
                         key: HirExpr::Call(Box::new(HirCallExpr {
                             callee: HirExpr::GlobalRef(HirGlobalRef {
-                                name: "install_and_key".into(),
+                                key: "install_and_key".into(),
                             }),
                             args: HirValuePack::fixed(vec![HirExpr::LocalRef(alias)]),
                             method: false,
                             fastcall: None,
-                            method_name: None,
+                            method_key: None,
                         })),
                     }))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),

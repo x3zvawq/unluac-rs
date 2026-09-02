@@ -29,6 +29,7 @@ impl<'a> NameResolver<'a> {
         name: &AstNameRef,
     ) -> Result<String, GenerateError> {
         match name {
+            AstNameRef::Environment => Ok("_ENV".to_owned()),
             AstNameRef::Global(global) => Ok(global.text.clone()),
             AstNameRef::Temp(_) => Err(GenerateError::ResidualTempName {
                 function: function.index(),
@@ -56,7 +57,9 @@ impl<'a> NameResolver<'a> {
                         .upvalues
                         .get(id.index())
                         .map(|info| info.text.clone()),
-                    AstNameRef::Global(_) | AstNameRef::Temp(_) => unreachable!(),
+                    AstNameRef::Environment | AstNameRef::Global(_) | AstNameRef::Temp(_) => {
+                        unreachable!()
+                    }
                 };
                 text.ok_or_else(|| GenerateError::MissingName {
                     function: function.index(),

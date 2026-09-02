@@ -47,7 +47,13 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
     let (mut instrs, lowering_map) = lowerer.lower()?;
     let children = instantiate_closure_children(&mut instrs, children);
 
-    Ok(finish_lowered_proto(raw, children, instrs, lowering_map))
+    Ok(finish_lowered_proto(
+        raw,
+        Vec::new(),
+        children,
+        instrs,
+        lowering_map,
+    ))
 }
 
 struct ProtoLowerer<'a> {

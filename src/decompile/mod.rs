@@ -10,7 +10,6 @@ mod pipeline;
 mod stages;
 mod state;
 
-pub use crate::ast::ReadabilityOptions;
 pub use crate::ast::dump_ast;
 pub use crate::ast::{FunctionNameMap, NameInfo, NameMap, NameSource, NamingMode, NamingOptions};
 pub use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, ProtoDepth};
@@ -29,7 +28,9 @@ pub use contracts::{
     NamingResult, ReadabilityResult, StructureFacts,
 };
 pub use error::DecompileError;
-pub use options::{ControlFlowCaps, DebugOptions, DecompileDialect, DecompileOptions};
+pub use options::{
+    ControlFlowCaps, DebugOptions, DecompileDialect, DecompileOptions, ReadabilityOptions,
+};
 pub use pipeline::{DecompileResult, decompile};
 pub(crate) use state::DecompileContext;
 pub use state::{DecompileStage, DecompileState, StageDebugOutput};

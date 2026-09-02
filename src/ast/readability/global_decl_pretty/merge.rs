@@ -108,6 +108,11 @@ fn try_merge_seed_global_run(
     let mut merged_values = Vec::with_capacity(globals.len());
     for ((seed, value), (global_source, global_binding)) in seeds.iter().zip(&globals) {
         debug_assert_eq!(seed.id, *global_source);
+        if !seed.rewrite_authority.may_remove_binding() {
+            // 候选拒绝[LayerBoundary]：global decl sugar 会删除 seed local；HIR 已发布的
+            // binding 生命周期结论不能由 AST 的一对一 global 形状覆盖。
+            return None;
+        }
         match seed.origin {
             AstLocalOrigin::Recovered => {}
             AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {

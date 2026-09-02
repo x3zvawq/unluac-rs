@@ -2,8 +2,9 @@
 //!
 //! 它依赖 Transformer 已经给好的 operand 形状、Dataflow 的 use/def 事实和常量池，不会
 //! 越权去恢复短路结构或 merge 来源。
-//! 例如：`GETTABLE r0, r1, "x"` 会先在这里变成 `r1.x` 对应的访问表达式骨架；
-//! `_ENV["end"]` 这类非法裸标识符仍保留表访问，不会伪装成 global。
+//! 例如：`GETTABLE r0, r1, "x"` 会先在这里变成 `r1["x"]` 对应的访问
+//! 表达式骨架；已证明的 `_ENV[key]` 则无论 key 能否写成裸标识符，都保留为
+//! raw-byte `HirGlobalRef`，目标语法合法性留给 AST 验证。
 
 use std::collections::BTreeSet;
 
@@ -66,8 +67,8 @@ pub(crate) fn lower_table_access_expr(
     base: AccessBase,
     key: AccessKey,
 ) -> HirExpr {
-    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
-        return HirExpr::GlobalRef(HirGlobalRef { name });
+    if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
+        return HirExpr::GlobalRef(HirGlobalRef { key });
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
@@ -110,7 +111,7 @@ pub(crate) fn lower_raw_table_set_call(
         .into(),
         method: false,
         fastcall: None,
-        method_name: None,
+        method_key: None,
     }
 }
 
@@ -121,8 +122,8 @@ pub(crate) fn lower_table_access_target(
     base: AccessBase,
     key: AccessKey,
 ) -> HirLValue {
-    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
-        return HirLValue::Global(HirGlobalRef { name });
+    if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
+        return HirLValue::Global(HirGlobalRef { key });
     }
 
     HirLValue::TableAccess(Box::new(HirTableAccess {
@@ -138,8 +139,8 @@ pub(crate) fn lower_table_access_expr_inline(
     base: AccessBase,
     key: AccessKey,
 ) -> HirExpr {
-    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
-        return HirExpr::GlobalRef(HirGlobalRef { name });
+    if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
+        return HirExpr::GlobalRef(HirGlobalRef { key });
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
@@ -169,7 +170,10 @@ fn lower_access_base_expr(
 ) -> HirExpr {
     match base {
         AccessBase::Reg(reg) => expr_for_reg_use(lowering, block, instr_ref, reg),
-        AccessBase::Env => lower_upvalue_operand_expr(lowering, UpvalueOperand::Env),
+        AccessBase::Env => unresolved_expr("implicit environment has no source-level value"),
+        AccessBase::EnvironmentUpvalue(upvalue) => {
+            lower_upvalue_operand_expr(lowering, UpvalueOperand::Env(upvalue))
+        }
         AccessBase::Upvalue(upvalue) => {
             lower_upvalue_operand_expr(lowering, UpvalueOperand::Upvalue(upvalue))
         }
@@ -184,7 +188,10 @@ fn lower_access_base_expr_inline(
 ) -> HirExpr {
     match base {
         AccessBase::Reg(reg) => expr_for_reg_use_inline(lowering, block, instr_ref, reg),
-        AccessBase::Env => lower_upvalue_operand_expr(lowering, UpvalueOperand::Env),
+        AccessBase::Env => unresolved_expr("implicit environment has no source-level value"),
+        AccessBase::EnvironmentUpvalue(upvalue) => {
+            lower_upvalue_operand_expr(lowering, UpvalueOperand::Env(upvalue))
+        }
         AccessBase::Upvalue(upvalue) => {
             lower_upvalue_operand_expr(lowering, UpvalueOperand::Upvalue(upvalue))
         }
@@ -195,28 +202,20 @@ pub(in crate::hir::analyze) fn lower_upvalue_operand_expr(
     lowering: &ProtoLowering<'_>,
     operand: UpvalueOperand,
 ) -> HirExpr {
-    match operand {
-        UpvalueOperand::Env => HirExpr::GlobalRef(HirGlobalRef {
-            name: "_ENV".to_owned(),
-        }),
-        UpvalueOperand::Upvalue(upvalue) => {
-            HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
-        }
-    }
+    let upvalue = match operand {
+        UpvalueOperand::Env(upvalue) | UpvalueOperand::Upvalue(upvalue) => upvalue,
+    };
+    HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
 }
 
 pub(in crate::hir::analyze) fn lower_upvalue_operand_target(
     lowering: &ProtoLowering<'_>,
     operand: UpvalueOperand,
 ) -> HirLValue {
-    match operand {
-        UpvalueOperand::Env => HirLValue::Global(HirGlobalRef {
-            name: "_ENV".to_owned(),
-        }),
-        UpvalueOperand::Upvalue(upvalue) => {
-            HirLValue::Upvalue(lowering.bindings.upvalues[upvalue.index()])
-        }
-    }
+    let upvalue = match operand {
+        UpvalueOperand::Env(upvalue) | UpvalueOperand::Upvalue(upvalue) => upvalue,
+    };
+    HirLValue::Upvalue(lowering.bindings.upvalues[upvalue.index()])
 }
 
 pub(crate) fn lower_table_access_expr_single_eval(
@@ -226,8 +225,8 @@ pub(crate) fn lower_table_access_expr_single_eval(
     base: AccessBase,
     key: AccessKey,
 ) -> HirExpr {
-    if let Some(name) = global_name_for_access(lowering, block, instr_ref, base, key) {
-        return HirExpr::GlobalRef(HirGlobalRef { name });
+    if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
+        return HirExpr::GlobalRef(HirGlobalRef { key });
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
@@ -255,7 +254,7 @@ fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
         args: vec![base, key].into(),
         method: false,
         fastcall: None,
-        method_name: None,
+        method_key: None,
     }))
 }
 
@@ -279,9 +278,10 @@ fn lower_access_base_expr_single_eval(
             }
             expr
         }
-        AccessBase::Env => HirExpr::GlobalRef(HirGlobalRef {
-            name: "_ENV".to_owned(),
-        }),
+        AccessBase::Env => unresolved_expr("implicit environment has no source-level value"),
+        AccessBase::EnvironmentUpvalue(upvalue) => {
+            HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
+        }
         AccessBase::Upvalue(upvalue) => {
             HirExpr::UpvalueRef(lowering.bindings.upvalues[upvalue.index()])
         }
@@ -329,31 +329,36 @@ fn lower_access_key_expr_inline(
     }
 }
 
-pub(crate) fn global_name_for_access(
+pub(crate) fn global_key_for_access(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
     base: AccessBase,
     key: AccessKey,
-) -> Option<String> {
-    let name = global_name_from_key(lowering, block, instr_ref, key)?;
-    access_base_is_env(lowering, instr_ref, base, &name).then_some(name)
+) -> Option<crate::LuaString> {
+    let key = global_key_from_access_key(lowering, block, instr_ref, key)?;
+    access_base_is_env(lowering, instr_ref, base, &key).then_some(key)
 }
 
 fn access_base_is_env(
     lowering: &ProtoLowering<'_>,
     instr_ref: InstrRef,
     base: AccessBase,
-    name: &str,
+    key: &crate::LuaString,
 ) -> bool {
     match base {
-        AccessBase::Env => true,
-        AccessBase::Reg(reg) => reg_use_is_env(lowering, instr_ref, reg, name),
+        AccessBase::Env | AccessBase::EnvironmentUpvalue(_) => true,
+        AccessBase::Reg(reg) => reg_use_is_env(lowering, instr_ref, reg, key),
         AccessBase::Upvalue(_) => false,
     }
 }
 
-fn reg_use_is_env(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg, name: &str) -> bool {
+fn reg_use_is_env(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+    reg: Reg,
+    key: &crate::LuaString,
+) -> bool {
     let access_block = lowering.cfg.instr_to_block[instr_ref.index()];
     let mut value = lowering.dataflow.use_value(instr_ref, reg);
     let mut seen = BTreeSet::new();
@@ -364,11 +369,11 @@ fn reg_use_is_env(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg, n
         let def_instr = lowering.dataflow.def_instr(def);
         match &lowering.proto.instrs[def_instr.index()] {
             LowInstr::GetUpvalue(get_upvalue) => {
-                return matches!(get_upvalue.src, UpvalueOperand::Env)
+                return matches!(get_upvalue.src, UpvalueOperand::Env(_))
                     && def_instr.index() < instr_ref.index()
                     && (((def_instr.index() + 1)..instr_ref.index())
                         .all(|index| lowering.dataflow.effect_summaries[index].tags.is_empty())
-                        || access_is_global_decl(lowering, instr_ref, name));
+                        || access_is_global_decl(lowering, instr_ref, key));
             }
             LowInstr::Move(move_instr) => {
                 value = lowering.dataflow.use_value(def_instr, move_instr.src);
@@ -379,7 +384,11 @@ fn reg_use_is_env(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg, n
     false
 }
 
-fn access_is_global_decl(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, name: &str) -> bool {
+fn access_is_global_decl(
+    lowering: &ProtoLowering<'_>,
+    instr_ref: InstrRef,
+    key: &crate::LuaString,
+) -> bool {
     let Some(previous) = instr_ref.index().checked_sub(1) else {
         return false;
     };
@@ -399,7 +408,7 @@ fn access_is_global_decl(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, name
     }) else {
         return false;
     };
-    if decode_raw_string(raw_name) != name {
+    if crate::LuaString::from_raw(raw_name) != *key {
         return false;
     }
 
@@ -414,17 +423,17 @@ fn access_is_global_decl(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, name
         return false;
     };
     let probe_block = lowering.cfg.instr_to_block[probe_instr.index()];
-    global_name_for_access(lowering, probe_block, probe_instr, probe.base, probe.key)
-        .is_some_and(|probe_name| probe_name == name)
+    global_key_for_access(lowering, probe_block, probe_instr, probe.base, probe.key)
+        .is_some_and(|probe_key| probe_key == *key)
 }
 
-fn global_name_from_key(
+fn global_key_from_access_key(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     instr_ref: InstrRef,
     key: AccessKey,
-) -> Option<String> {
-    let name = match key {
+) -> Option<crate::LuaString> {
+    match key {
         AccessKey::Const(const_ref) => {
             let RawLiteralConst::String(value) = lowering
                 .proto
@@ -435,19 +444,15 @@ fn global_name_from_key(
             else {
                 return None;
             };
-            decode_raw_string(value)
+            Some(crate::LuaString::from_raw(value))
         }
         AccessKey::Reg(reg) => {
             let HirExpr::String(value) = expr_for_reg_use_inline(lowering, block, instr_ref, reg)
             else {
                 return None;
             };
-            value
-                .preferred_text()
-                .or_else(|| value.as_utf8())?
-                .to_owned()
+            Some(value)
         }
-        AccessKey::Integer(_) => return None,
-    };
-    is_lua_identifier_name(&name, lowering.target.version).then_some(name)
+        AccessKey::Integer(_) => None,
+    }
 }

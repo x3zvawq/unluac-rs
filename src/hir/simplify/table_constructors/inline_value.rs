@@ -7,8 +7,7 @@
 
 use crate::hir::common::{
     HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionTarget, HirExpr,
-    HirLogicalExpr, HirRecordField, HirTableConstructor, HirTableField, HirTableKey, HirUnaryExpr,
-    HirValuePack,
+    HirLogicalExpr, HirRecordField, HirTableConstructor, HirTableField, HirUnaryExpr, HirValuePack,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
@@ -187,12 +186,7 @@ fn inline_nested_constructor(
                 inline_constructor_value_inner(context, value)?,
             )),
             HirTableField::Record(field) => {
-                let key = match &field.key {
-                    HirTableKey::Name(name) => HirTableKey::Name(name.clone()),
-                    HirTableKey::Expr(key) => {
-                        HirTableKey::Expr(inline_constructor_value_inner(context, key)?)
-                    }
-                };
+                let key = inline_constructor_value_inner(context, &field.key)?;
                 let value = inline_constructor_value_inner(context, &field.value)?;
                 Some(HirTableField::Record(HirRecordField { key, value }))
             }
@@ -292,7 +286,7 @@ pub(super) fn inline_constructor_call(
         args,
         method: call.method,
         fastcall: call.fastcall,
-        method_name: call.method_name.clone(),
+        method_key: call.method_key.clone(),
     })
 }
 
@@ -371,15 +365,7 @@ fn expr_mentions_binding_where(
                 }
                 HirTableField::Record(field) => {
                     expr_mentions_binding_where(&field.value, binding_index, predicate)
-                        || matches!(
-                            &field.key,
-                            HirTableKey::Expr(key_expr)
-                                if expr_mentions_binding_where(
-                                    key_expr,
-                                    binding_index,
-                                    predicate,
-                                )
-                        )
+                        || expr_mentions_binding_where(&field.key, binding_index, predicate)
                 }
             }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
                 expr_mentions_binding_where(tail.as_expr(), binding_index, predicate)
@@ -485,6 +471,7 @@ mod tests {
             stmts: vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![local],
                 values: HirValuePack::fixed(vec![HirExpr::String("value".into())]),
+                initializer_merge_transaction: None,
             }))],
         };
         let mut binding_index = BindingIndex::new(0, 1);

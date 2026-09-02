@@ -18,9 +18,12 @@ use crate::hir::common::{
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
+use super::CarryBinding;
+
 pub(super) fn coalesce_repeat_terminal_snapshots(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
+    preserved_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let use_counts = collect_temp_use_counts(proto);
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
@@ -40,6 +43,7 @@ pub(super) fn coalesce_repeat_terminal_snapshots(
         closed_temps: &closed_temps,
         write_counts: &write_counts,
         debug_temps: &proto.temp_debug_locals,
+        preserved_bindings,
     };
     rewrite_block(
         &mut proto.body,
@@ -58,6 +62,7 @@ struct RepeatSnapshotFacts<'a> {
     closed_temps: &'a BTreeSet<TempId>,
     write_counts: &'a BTreeMap<TempId, usize>,
     debug_temps: &'a [Option<String>],
+    preserved_bindings: &'a BTreeSet<CarryBinding>,
 }
 
 fn rewrite_block(
@@ -142,6 +147,9 @@ fn try_rewrite_repeat(
             .debug_temps
             .get(return_temp.index())
             .is_some_and(Option::is_some)
+        || facts
+            .preserved_bindings
+            .contains(&CarryBinding::Temp(return_temp))
         || facts.use_counts.get(&return_temp).copied() != Some(2)
         || facts.write_counts.get(&return_temp).copied() != Some(1)
     {
@@ -181,6 +189,14 @@ fn try_rewrite_repeat(
     // 候选拒绝[PolicyBoundary]：for binding 的迭代 identity 由 loop owner 保留；候选拒绝
     // [SemanticBarrier:Lifetime]：TBC local 的 resource/close identity 不可并入普通 snapshot。
     if facts.captured_locals.contains(&local) || facts.protected_locals.contains(&local) {
+        return None;
+    }
+    if facts
+        .preserved_bindings
+        .contains(&CarryBinding::Local(local))
+    {
+        // 候选拒绝[LayerBoundary]：上游 HIR 已证明该 local definition 必须保留；
+        // repeat snapshot 不能通过把 temp producer 改写到 local 来改变其写入 epoch。
         return None;
     }
     let cleanup_preserves_raw_home = trusted_same_raw_home_merge(
@@ -298,6 +314,8 @@ mod tests {
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![target],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
@@ -308,6 +326,7 @@ mod tests {
             stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![local],
                 values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                initializer_merge_transaction: None,
             })));
         }
         stmts.push(assign(HirLValue::Temp(temp), HirExpr::Integer(7)));
@@ -319,6 +338,7 @@ mod tests {
         HirStmt::Repeat(Box::new(HirRepeat {
             body: repeat_snapshot_body(local, declare_local),
             cond: HirExpr::Boolean(true),
+            lifetime: Default::default(),
         }))
     }
 
@@ -333,6 +353,7 @@ mod tests {
         let write_counts = BTreeMap::from([(TempId(0), 1)]);
         let empty_locals = BTreeSet::new();
         let empty_temps = BTreeSet::new();
+        let preserved_bindings = BTreeSet::new();
         let facts = RepeatSnapshotFacts {
             use_counts: &use_counts,
             captured_locals: &empty_locals,
@@ -341,6 +362,7 @@ mod tests {
             closed_temps: &empty_temps,
             write_counts: &write_counts,
             debug_temps: &[],
+            preserved_bindings: &preserved_bindings,
         };
         test(&facts);
     }
@@ -377,6 +399,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![local],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                    initializer_merge_transaction: None,
                 })),
                 repeat_snapshot_stmt(local, false),
                 return_temp(TempId(0)),

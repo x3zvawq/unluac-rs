@@ -628,7 +628,8 @@ fn try_collapse_loop_results(
         // region-result 不把未知路径并入普通 state 映射。
         return false;
     }
-    if include_fallthrough && block_may_fall_through(body) {
+    let has_fallthrough_exit = include_fallthrough && block_may_fall_through(body);
+    if has_fallthrough_exit {
         let Some(HirStmt::Assign(assign)) = body.stmts.last() else {
             return false;
         };
@@ -745,7 +746,14 @@ fn try_collapse_loop_results(
     } else {
         // 非出口 result 写保留为独立旧 epoch；只改 tracked exit producer 与其 live-out reads，
         // 避免把中间值误写到 seed，且保留它在 seed overwrite/GC 之间的 root 生命周期。
-        apply_loop_result_rewrites(block, index, rewrite_end, rewrites, promotion_facts);
+        apply_loop_result_rewrites(
+            block,
+            index,
+            rewrite_end,
+            rewrites,
+            promotion_facts,
+            has_fallthrough_exit,
+        );
     }
     true
 }
@@ -825,6 +833,7 @@ mod tests {
             physical_roots: BTreeSet::new(),
             reference_captured: BTreeSet::new(),
             to_be_closed: BTreeSet::new(),
+            preserved: BTreeSet::new(),
         }
     }
 
@@ -857,6 +866,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(0)],
                     values: HirValuePack::default(),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::If(Box::new(HirIf {
                     cond: HirExpr::TempRef(TempId(0)),
@@ -864,6 +874,8 @@ mod tests {
                         stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                             targets: vec![HirLValue::Local(LocalId(0))],
                             values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
                         }))],
                     },
                     else_block: Some(HirBlock {
@@ -875,6 +887,8 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Param(ParamId(0))],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
             ],
         }
@@ -891,6 +905,8 @@ mod tests {
             stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Local(LocalId(1))],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))],
         };
         HirBlock {
@@ -898,10 +914,12 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(0)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(10)]),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1)],
                     values: HirValuePack::default(),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::If(Box::new(HirIf {
                     cond: HirExpr::TempRef(TempId(1)),
@@ -927,6 +945,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Local(LocalId(0)), HirLValue::Local(LocalId(1))],
                 values: HirValuePack::fixed(vec![first, second]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         HirBlock {
@@ -934,10 +954,12 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(0)],
                     values: HirValuePack::default(),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1)],
                     values: HirValuePack::default(),
+                    initializer_merge_transaction: None,
                 })),
                 HirStmt::If(Box::new(HirIf {
                     cond: HirExpr::TempRef(TempId(1)),
@@ -966,6 +988,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(0))],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         HirBlock {
@@ -998,6 +1022,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(0))],
                 values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         HirBlock {
@@ -1009,16 +1035,18 @@ mod tests {
                             HirStmt::Assign(Box::new(HirAssign {
                                 targets: vec![HirLValue::Param(ParamId(0))],
                                 values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                                initializer_merge_transaction: None,
+                                generic_for_initializer_producer: None,
                             })),
                             HirStmt::CallStmt(Box::new(HirCallStmt {
                                 call: HirCallExpr {
                                     callee: HirExpr::GlobalRef(HirGlobalRef {
-                                        name: "collectgarbage".to_owned(),
+                                        key: "collectgarbage".into(),
                                     }),
                                     args: HirValuePack::default(),
                                     method: false,
                                     fastcall: None,
-                                    method_name: None,
+                                    method_key: None,
                                 },
                             })),
                             result_copy(),
@@ -1026,6 +1054,7 @@ mod tests {
                         ],
                     },
                     cond: HirExpr::TempRef(TempId(1)),
+                    lifetime: Default::default(),
                 })),
                 HirStmt::Return(Box::new(HirReturn {
                     values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
@@ -1175,6 +1204,7 @@ mod tests {
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![LocalId(2)],
                 values: HirValuePack::fixed(vec![HirExpr::Nil]),
+                initializer_merge_transaction: None,
             })),
         );
         let HirStmt::If(if_stmt) = &mut block.stmts[2] else {
@@ -1333,6 +1363,7 @@ mod tests {
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![LocalId(2)],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(0)]),
+                initializer_merge_transaction: None,
             })),
         );
         let HirStmt::If(if_stmt) = &mut block.stmts[3] else {
@@ -1467,6 +1498,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(0))],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(99)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
         );
         let index = RegionResultIndex::new(&block.stmts);
@@ -1496,6 +1529,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Param(ParamId(1))],
                 values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
         );
         block.stmts.insert(
@@ -1503,6 +1538,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(0))],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
         );
         let index = RegionResultIndex::new(&block.stmts);
@@ -1538,6 +1575,8 @@ mod tests {
         block.stmts[1] = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Param(ParamId(1)), HirLValue::Temp(TempId(0))],
             values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0)), HirExpr::Integer(7)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let index = RegionResultIndex::new(&block.stmts);
         let mut facts = loop_result_facts();
@@ -1566,6 +1605,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Param(ParamId(1))],
                 values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
         );
         block.stmts.insert(
@@ -1576,6 +1617,8 @@ mod tests {
                     stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                         targets: vec![HirLValue::Temp(TempId(0))],
                         values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                        initializer_merge_transaction: None,
+                        generic_for_initializer_producer: None,
                     }))],
                 },
                 else_block: None,

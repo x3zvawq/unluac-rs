@@ -3,7 +3,6 @@
 //! 入口层集中补默认值，比把默认逻辑散在各阶段里更稳；后续阶段变多后，
 //! 仍然只需要维护这一处归一化逻辑。
 
-use crate::ast::ReadabilityOptions;
 use crate::ast::{NamingMode, NamingOptions};
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters};
 use crate::generate::GenerateOptions;
@@ -54,6 +53,26 @@ pub enum DecompileDialect {
 pub struct ControlFlowCaps {
     pub goto_label: bool,
     pub continue_stmt: bool,
+}
+
+/// HIR 与 AST readability 共同消费的源码形状阈值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadabilityOptions {
+    pub return_inline_max_complexity: usize,
+    pub index_inline_max_complexity: usize,
+    pub args_inline_max_complexity: usize,
+    pub access_base_inline_max_complexity: usize,
+}
+
+impl Default for ReadabilityOptions {
+    fn default() -> Self {
+        Self {
+            return_inline_max_complexity: 10,
+            index_inline_max_complexity: 10,
+            args_inline_max_complexity: 6,
+            access_base_inline_max_complexity: 5,
+        }
+    }
 }
 
 impl DecompileDialect {

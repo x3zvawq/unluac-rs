@@ -72,6 +72,7 @@ fn lower_proto(raw: &RawProto, fr2: bool) -> Result<LoweredProto, TransformError
         frame: raw.common.frame,
         constants: raw.common.constants.clone(),
         upvalues: raw.common.upvalues.clone(),
+        environment_upvalues: Vec::new(),
         debug_info: raw.common.debug_info.clone(),
         debug_locals: crate::transformer::common::normalize_debug_locals(raw),
         children,

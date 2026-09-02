@@ -25,7 +25,10 @@ use super::super::helpers::{assign_stmt, branch_stmt, goto_block};
 use super::super::instrs::{local_decl_stmts, lower_regular_instr, lower_terminal_instr};
 use super::super::lower::ProtoLowering;
 use super::super::short_circuit::{build_condition_decision_expr, build_value_decision_expr};
-use super::generic_for::lower_generic_for_iterator;
+use super::generic_for::{
+    lower_generic_for_dispatch_results, lower_generic_for_initializer_facts,
+    lower_generic_for_iterator,
+};
 
 mod blocks;
 mod branches;

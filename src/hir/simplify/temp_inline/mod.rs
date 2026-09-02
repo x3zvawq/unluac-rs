@@ -7,6 +7,9 @@
 //! “先求 callee、再求参数”而拆出的形状；融合时必须把 callee 和参数一起放回同一条
 //! call，不能只把 callee 延后到参数求值之后。run 中无读取且可安全丢弃的匿名 temp
 //! 不构成求值事件，但带 debug/capture 身份的赋值仍会阻断整包融合。
+//! 同一 transaction 还覆盖 `If` 条件中首个必达 call：只有连续 lookup/callee/arg run
+//! 的每个节点都唯一进入该 call 的 eager 求值子图时才整体收回；短路 RHS、额外 use、
+//! PhysicalRoot、capture/debug identity 或反向依赖均保留原形。
 //! 同一 block 的独立 run 沿进入本函数时的语句索引批量判定：sink 原位改写，删除区间
 //! 延迟到扫描结束后一次压缩，使 capture 与求值顺序快照始终处在同一坐标系。
 //! order-sensitive def 索引由 proto 级 scratch 复用，每个 block 只清理上次实际写过的槽，
@@ -52,10 +55,10 @@ mod usage;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{DecompileDialect, ReadabilityOptions};
+use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, HirTableField, HirTableKey,
-    TempId,
+    HirBlock, HirCallExpr, HirExpr, HirInlineDispositions, HirInlineRetentionReason, HirLValue,
+    HirProto, HirStmt, HirTableField, TempId,
 };
 use crate::hir::expr_safety::{
     HirExprSafety, expr_observes_eval_order, expr_requires_ordered_snapshot,
@@ -75,10 +78,13 @@ use self::usage::{
     inline_candidate, max_temp_index_in_block,
 };
 use super::label_refs::count_label_references;
-use super::mention::{ReferenceCapturedBindings, stmt_writes_temp};
+use super::mention::{
+    ReferenceCapturedBindings, stmt_writes_temp, stmts_reference_captured_bindings,
+    stmts_to_be_closed_temps, stmts_value_captured_bindings,
+};
 use super::root_lifetimes::{
     CallRootLifetimeIndices, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
-    scope_end_copy_roots_needing_materialization,
+    materialize_generic_for_dispatch_root_releases, scope_end_copy_roots_needing_materialization,
 };
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
 use super::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -95,6 +101,7 @@ struct TempInlineWorkspace<'a> {
     readability: ReadabilityOptions,
     substantial_closure_bodies: &'a [bool],
     physical_root_temps: Vec<bool>,
+    inline_dispositions: HirInlineDispositions,
 }
 
 enum TempInlineScope {
@@ -140,7 +147,7 @@ impl TempInlineScope {
             return true;
         };
         !call_stmt.call.method
-            && call_stmt.call.method_name.is_none()
+            && call_stmt.call.method_key.is_none()
             && matches!(callee_value, HirExpr::GlobalRef(_))
             && terminal_candidate.is_some_and(|temp| {
                 exposed.get(temp.index()).copied().unwrap_or(false)
@@ -157,6 +164,7 @@ impl<'a> TempInlineWorkspace<'a> {
         dialect: DecompileDialect,
         readability: ReadabilityOptions,
         substantial_closure_bodies: &'a [bool],
+        inline_dispositions: HirInlineDispositions,
     ) -> Self {
         let mut physical_root_temps = vec![false; temp_count];
         for temp in &proto.physical_root_temps {
@@ -174,6 +182,7 @@ impl<'a> TempInlineWorkspace<'a> {
             readability,
             substantial_closure_bodies,
             physical_root_temps,
+            inline_dispositions,
         }
     }
 }
@@ -233,6 +242,23 @@ fn inline_temps_in_proto_with_scope(
     dialect: DecompileDialect,
     substantial_closure_bodies: &[bool],
 ) -> bool {
+    let mut identity_sensitive_temps = stmts_reference_captured_bindings(&proto.body.stmts).temps;
+    identity_sensitive_temps.extend(stmts_value_captured_bindings(&proto.body.stmts).temps);
+    identity_sensitive_temps.extend(stmts_to_be_closed_temps(&proto.body.stmts));
+    let temp_debug_locals = &proto.temp_debug_locals;
+    let mut release_temp_is_eligible = |temp: TempId| {
+        !identity_sensitive_temps.contains(&temp)
+            && temp_debug_locals
+                .get(temp.index())
+                .is_none_or(Option::is_none)
+    };
+    let mut changed = matches!(&scope, TempInlineScope::All)
+        && materialize_generic_for_dispatch_root_releases(
+            &mut proto.body,
+            facts,
+            HirExprSafety::for_dialect(dialect),
+            &mut release_temp_is_eligible,
+        );
     let handoff_roots = collect_lookup_gc_root_lifetimes(
         &proto.body.stmts,
         facts,
@@ -245,8 +271,9 @@ fn inline_temps_in_proto_with_scope(
     proto
         .physical_root_temps
         .extend(scope_roots.into_iter().chain(handoff_roots));
-    let mut changed = proto.physical_root_temps.len() != original_root_count;
+    changed |= proto.physical_root_temps.len() != original_root_count;
     let temp_count = temp_count_for_proto(proto);
+    let inline_dispositions = std::mem::take(&mut proto.inline_dispositions);
     let mut workspace = TempInlineWorkspace::new(
         proto,
         temp_count,
@@ -254,6 +281,7 @@ fn inline_temps_in_proto_with_scope(
         dialect,
         readability,
         substantial_closure_bodies,
+        inline_dispositions,
     );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
@@ -266,6 +294,7 @@ fn inline_temps_in_proto_with_scope(
         facts,
         &BTreeSet::new(),
     );
+    proto.inline_dispositions = workspace.inline_dispositions;
     changed
 }
 
@@ -452,6 +481,21 @@ fn inline_temps_in_block(
         .enumerate()
         .rev()
     {
+        if let Some((temp, _)) = inline_candidate(&stmt)
+            && temp_rebinds_captured_slot(
+                temp,
+                facts,
+                captured_slots_before_stmt
+                    .get(index)
+                    .expect("forward scan should record every statement"),
+            )
+        {
+            // 该写入的物理 home 已按引用捕获；即使其它 guard 先拒绝候选，也必须把
+            // “不能删除这次 binding 写入”的结论交给后续身份提升与 AST。
+            changed |= workspace
+                .inline_dispositions
+                .preserve_temp(temp, HirInlineRetentionReason::CapturedValueEpoch);
+        }
         if let Some((temp, value)) = inline_candidate(&stmt)
             // 候选拒绝[SemanticBarrier:Lifetime]：被 physical-root lifetime 标记的 call/lookup 结果仍承担 VM root；提前删除会改变对象存活期（regress_356）。
             && !physical_root_lifetimes[index]
@@ -869,6 +913,212 @@ struct PureMaterializationContext<'a> {
     removed_stmts: &'a mut [bool],
 }
 
+#[derive(Clone, Copy)]
+enum EagerConditionCallCallee {
+    Temp(TempId),
+    Other,
+}
+
+fn first_eager_condition_call_callee(expr: &HirExpr) -> Option<EagerConditionCallCallee> {
+    match expr {
+        HirExpr::Call(call) => Some(match &call.callee {
+            HirExpr::TempRef(temp) => EagerConditionCallCallee::Temp(*temp),
+            _ => EagerConditionCallCallee::Other,
+        }),
+        HirExpr::Unary(unary) => first_eager_condition_call_callee(&unary.expr),
+        HirExpr::Binary(binary) => first_eager_condition_call_callee(&binary.lhs)
+            .or_else(|| first_eager_condition_call_callee(&binary.rhs)),
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            // The RHS is conditional. A producer evaluated before the If cannot move there.
+            first_eager_condition_call_callee(&logical.lhs)
+        }
+        HirExpr::TableAccess(access) => first_eager_condition_call_callee(&access.base)
+            .or_else(|| first_eager_condition_call_callee(&access.key)),
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::VarArg
+        | HirExpr::Decision(_)
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => None,
+    }
+}
+
+fn condition_materialization_value_is_supported(expr: &HirExpr) -> bool {
+    match expr {
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+        | HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::GlobalRef(_) => true,
+        HirExpr::TableAccess(access) => {
+            condition_materialization_value_is_supported(&access.base)
+                && condition_materialization_value_is_supported(&access.key)
+        }
+        HirExpr::Unary(unary) => condition_materialization_value_is_supported(&unary.expr),
+        HirExpr::Binary(binary) => {
+            condition_materialization_value_is_supported(&binary.lhs)
+                && condition_materialization_value_is_supported(&binary.rhs)
+        }
+        HirExpr::LogicalAnd(_)
+        | HirExpr::LogicalOr(_)
+        | HirExpr::Call(_)
+        | HirExpr::Decision(_)
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::VarArg
+        | HirExpr::Unresolved(_) => false,
+    }
+}
+
+struct EagerConditionMaterializationProof<'a> {
+    scratch: &'a mut TempUseScratch,
+    live_use_counts: &'a mut [usize],
+    facts: &'a ProtoPromotionFacts,
+    captured_slots_before_stmt: &'a CapturedSlotSnapshots,
+    order_sensitive_defs: &'a OrderSensitiveDefWorkspace,
+    reference_captured: &'a ReferenceCapturedBindings,
+    dialect: DecompileDialect,
+    safety: HirExprSafety,
+}
+
+fn inline_eager_condition_materialization_run(
+    block: &mut HirBlock,
+    run_start: usize,
+    run_end: usize,
+    physical_root_lifetimes: &[bool],
+    proof: &mut EagerConditionMaterializationProof<'_>,
+    removed_stmts: &mut [bool],
+) -> bool {
+    let Some(HirStmt::If(if_stmt)) = block.stmts.get(run_end) else {
+        return false;
+    };
+    let Some(EagerConditionCallCallee::Temp(callee_temp)) =
+        first_eager_condition_call_callee(&if_stmt.cond)
+    else {
+        return false;
+    };
+    if physical_root_lifetimes[run_start..run_end]
+        .iter()
+        .any(|preserve| *preserve)
+    {
+        // A real VM root cannot be consumed merely because the same value reaches a condition.
+        return false;
+    }
+
+    let mut positions = BTreeMap::new();
+    for index in run_start..run_end {
+        let Some((temp, value)) = inline_candidate(&block.stmts[index]) else {
+            return false;
+        };
+        if !condition_materialization_value_is_supported(value)
+            || positions.insert(temp, index).is_some()
+        {
+            return false;
+        }
+    }
+    if !positions.contains_key(&callee_temp) {
+        return false;
+    }
+
+    for (&temp, &position) in &positions {
+        let (_, value) = inline_candidate(&block.stmts[position])
+            .expect("condition materialization position must retain its scalar definition");
+        let mut dependencies_precede = true;
+        collect_expr_temp_uses_summary(value, proof.scratch).for_each(|dependency, _| {
+            if positions
+                .get(&dependency)
+                .is_some_and(|dependency_position| *dependency_position >= position)
+            {
+                dependencies_precede = false;
+            }
+        });
+        if !dependencies_precede || total_use_count(temp, proof.live_use_counts) != 1 {
+            return false;
+        }
+    }
+
+    let mut rewritten_sink = block.stmts[run_end].clone();
+    let mut removed_temps = Vec::with_capacity(run_end - run_start);
+    for index in (run_start..run_end).rev() {
+        let (temp, value) = inline_candidate(&block.stmts[index])
+            .expect("condition materialization run must retain scalar definitions");
+        if collect_stmt_temp_uses(&rewritten_sink, proof.scratch).count(temp) != 1 {
+            // Every producer must belong to the dependency closure of the eager call. This also
+            // rejects unrelated dead assignments instead of absorbing dead-temps responsibility.
+            return false;
+        }
+        let Some(site) = inline_site_in_stmt(&rewritten_sink, temp) else {
+            return false;
+        };
+        if matches!(
+            site,
+            InlineSite::ConditionalNested
+                | InlineSite::RepeatedNested
+                | InlineSite::LoopCondition
+                | InlineSite::LoopHead
+                | InlineSite::PrefixedBlock
+        ) || !materialization_run_candidate_is_safe(
+            temp,
+            value,
+            index,
+            proof.scratch,
+            proof.facts,
+            proof.captured_slots_before_stmt,
+        ) || !prefixed_block_candidate_is_safe(
+            site,
+            temp,
+            value,
+            proof.reference_captured,
+            proof.safety,
+        ) || arg_value_forwards_prior_order_sensitive_expr(
+            value,
+            run_start,
+            proof.order_sensitive_defs,
+        ) || inline_crosses_evaluation_boundary(
+            site,
+            value,
+            &rewritten_sink,
+            temp,
+            proof.reference_captured,
+            proof.dialect,
+            proof.safety,
+        ) {
+            return false;
+        }
+        replace_temp_in_stmt(&mut rewritten_sink, temp, value);
+        removed_temps.push(temp);
+    }
+
+    block.stmts[run_end] = rewritten_sink;
+    removed_stmts[run_start..run_end].fill(true);
+    for temp in removed_temps {
+        remove_live_use(proof.live_use_counts, temp);
+    }
+    true
+}
+
 fn inline_pure_materialization_run(
     block: &mut HirBlock,
     run_start: usize,
@@ -1027,6 +1277,29 @@ fn inline_materialization_runs(
         let mut run_end = run_start + 1;
         while run_end < block.stmts.len() && inline_candidate(&block.stmts[run_end]).is_some() {
             run_end += 1;
+        }
+        if matches!(scope, TempInlineScope::All)
+            && inline_eager_condition_materialization_run(
+                block,
+                run_start,
+                run_end,
+                physical_root_lifetimes,
+                &mut EagerConditionMaterializationProof {
+                    scratch: uses,
+                    live_use_counts,
+                    facts,
+                    captured_slots_before_stmt,
+                    order_sensitive_defs,
+                    reference_captured,
+                    dialect: *dialect,
+                    safety: *safety,
+                },
+                &mut removed_stmts,
+            )
+        {
+            changed = true;
+            index = run_end + 1;
+            continue;
         }
         if physical_root_lifetimes[run_start..run_end]
             .iter()
@@ -1479,7 +1752,7 @@ fn root_open_return_nil_pack_plan(
                 targets_are_safe = false;
                 break;
             }
-            let possible_homes = conservative_temp_home_slots(*target, facts);
+            let possible_homes = facts.complete_temp_home_slots(*target);
             // 候选拒绝[SemanticBarrier:Capture]：任一可能 target home 已被引用捕获时，
             // 删除 nil 写会让 closure 继续观察旧值。
             if possible_homes
@@ -1626,7 +1899,7 @@ fn inline_terminal_nil_return_pack(
         .get(assign_index)
         .expect("capture snapshots must cover the terminal nil-pack assignment");
     for target in &targets {
-        let possible_homes = conservative_temp_home_slots(*target, facts);
+        let possible_homes = facts.complete_temp_home_slots(*target);
         // 候选拒绝[SemanticBarrier:Capture]：closure 已引用捕获任一可能 target home 时，
         // 删除 nil 写会让其继续观察旧值。
         if possible_homes
@@ -1691,7 +1964,9 @@ fn root_nil_pack_gap_preserves_slots_with_context(
                 return true;
             }
             local_decl.bindings.iter().all(|local| {
-                conservative_local_home_slots(*local, facts).is_disjoint(protected_slots)
+                facts
+                    .complete_local_home_slots(*local)
+                    .is_disjoint(protected_slots)
             })
         }
         HirStmt::GlobalDecl(_)
@@ -1744,7 +2019,9 @@ fn root_nil_pack_gap_preserves_slots_with_context(
             facts,
         ),
         HirStmt::NumericFor(numeric_for) => {
-            conservative_local_home_slots(numeric_for.binding, facts).is_disjoint(protected_slots)
+            facts
+                .complete_local_home_slots(numeric_for.binding)
+                .is_disjoint(protected_slots)
                 && root_nil_pack_gap_block_preserves_slots(
                     &numeric_for.body,
                     protected_temps,
@@ -1756,7 +2033,9 @@ fn root_nil_pack_gap_preserves_slots_with_context(
         }
         HirStmt::GenericFor(generic_for) => {
             generic_for.bindings.iter().all(|binding| {
-                conservative_local_home_slots(*binding, facts).is_disjoint(protected_slots)
+                facts
+                    .complete_local_home_slots(*binding)
+                    .is_disjoint(protected_slots)
             }) && root_nil_pack_gap_block_preserves_slots(
                 &generic_for.body,
                 protected_temps,
@@ -1867,9 +2146,8 @@ struct DirectBindingReadHomeCollector<'a> {
 }
 
 impl DirectBindingReadHomeCollector<'_> {
-    fn note_homes(&mut self, homes: Option<BTreeSet<HomeSlotKey>>) {
-        self.homes
-            .extend(homes.unwrap_or_else(|| physical_home_universe_for_unknown(self.facts)));
+    fn note_homes(&mut self, homes: BTreeSet<HomeSlotKey>) {
+        self.homes.extend(homes);
     }
 }
 
@@ -1877,13 +2155,13 @@ impl HirVisitor for DirectBindingReadHomeCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
             HirExpr::ParamRef(param) => {
-                self.note_homes(self.facts.possible_param_home_slots(*param));
+                self.note_homes(self.facts.complete_param_home_slots(*param));
             }
             HirExpr::LocalRef(local) => {
-                self.note_homes(self.facts.possible_local_home_slots(*local));
+                self.note_homes(self.facts.complete_local_home_slots(*local));
             }
             HirExpr::TempRef(temp) => {
-                self.note_homes(self.facts.possible_temp_home_slots(*temp));
+                self.note_homes(self.facts.complete_temp_home_slots(*temp));
             }
             _ => {}
         }
@@ -1932,47 +2210,11 @@ fn direct_lvalue_possible_home_slots(
     facts: &ProtoPromotionFacts,
 ) -> BTreeSet<HomeSlotKey> {
     match target {
-        HirLValue::Param(param) => conservative_param_home_slots(*param, facts),
-        HirLValue::Temp(temp) => conservative_temp_home_slots(*temp, facts),
-        HirLValue::Local(local) => conservative_local_home_slots(*local, facts),
+        HirLValue::Param(param) => facts.complete_param_home_slots(*param),
+        HirLValue::Temp(temp) => facts.complete_temp_home_slots(*temp),
+        HirLValue::Local(local) => facts.complete_local_home_slots(*local),
         HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => BTreeSet::new(),
     }
-}
-
-fn conservative_param_home_slots(
-    param: crate::hir::common::ParamId,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    facts
-        .possible_param_home_slots(param)
-        .unwrap_or_else(|| physical_home_universe_for_unknown(facts))
-}
-
-fn conservative_local_home_slots(
-    local: crate::hir::common::LocalId,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    facts
-        .possible_local_home_slots(local)
-        .unwrap_or_else(|| physical_home_universe_for_unknown(facts))
-}
-
-fn conservative_temp_home_slots(
-    temp: TempId,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    facts
-        .possible_temp_home_slots(temp)
-        .unwrap_or_else(|| physical_home_universe_for_unknown(facts))
-}
-
-fn physical_home_universe_for_unknown(facts: &ProtoPromotionFacts) -> BTreeSet<HomeSlotKey> {
-    let universe = facts.physical_home_universe();
-    assert!(
-        !universe.is_empty(),
-        "unknown physical home requires a non-empty proto home universe"
-    );
-    universe.clone()
 }
 
 fn inline_numeric_for_stable_header_aliases(
@@ -2130,13 +2372,13 @@ fn complete_reference_captured_home_slots(
 ) -> BTreeSet<HomeSlotKey> {
     let mut homes = BTreeSet::new();
     for param in &captured.params {
-        homes.extend(conservative_param_home_slots(*param, facts));
+        homes.extend(facts.complete_param_home_slots(*param));
     }
     for local in &captured.locals {
-        homes.extend(conservative_local_home_slots(*local, facts));
+        homes.extend(facts.complete_local_home_slots(*local));
     }
     for temp in &captured.temps {
-        homes.extend(conservative_temp_home_slots(*temp, facts));
+        homes.extend(facts.complete_temp_home_slots(*temp));
     }
     homes
 }
@@ -2145,16 +2387,11 @@ fn complete_materialization_write_homes(
     temp: TempId,
     facts: &ProtoPromotionFacts,
 ) -> BTreeSet<HomeSlotKey> {
-    let mut homes = conservative_temp_home_slots(temp, facts);
+    let mut homes = facts.complete_temp_home_slots(temp);
     if homes.is_empty() {
         return homes;
     }
-    homes.extend(
-        facts
-            .trusted_immediate_move_write_homes(temp)
-            .cloned()
-            .unwrap_or_else(|| physical_home_universe_for_unknown(facts)),
-    );
+    homes.extend(facts.complete_immediate_move_write_homes(temp));
     homes
 }
 
@@ -2197,11 +2434,11 @@ fn numeric_for_binding_header_alias_plan(
         chain.push((current_index, temp));
         match value {
             HirExpr::ParamRef(param) => {
-                let homes = conservative_param_home_slots(*param, proof.facts);
+                let homes = proof.facts.complete_param_home_slots(*param);
                 break (value.clone(), homes, None, false, current_index);
             }
             HirExpr::LocalRef(local) => {
-                let homes = conservative_local_home_slots(*local, proof.facts);
+                let homes = proof.facts.complete_local_home_slots(*local);
                 break (value.clone(), homes, None, false, current_index);
             }
             HirExpr::TempRef(source) => {
@@ -2211,7 +2448,7 @@ fn numeric_for_binding_header_alias_plan(
                 }) {
                     current_index = source_index;
                 } else {
-                    let homes = conservative_temp_home_slots(*source, proof.facts);
+                    let homes = proof.facts.complete_temp_home_slots(*source);
                     break (value.clone(), homes, Some(*source), false, current_index);
                 }
             }
@@ -2333,17 +2570,22 @@ fn inline_open_return_fixed_alias_run(
             // 候选拒绝[PolicyBoundary]：DebugScope 标注的 alias 保留独立源码 binding 身份。
             return false;
         }
-        let target_homes = conservative_temp_home_slots(target, proof.facts);
-        let source_homes = conservative_temp_home_slots(*source, proof.facts);
-        if target_homes
+        let target_homes = proof.facts.complete_temp_home_slots(target);
+        let source_homes = proof.facts.complete_temp_home_slots(*source);
+        let touches_captured_home = target_homes
             .iter()
             .chain(&source_homes)
-            .any(|home| captured_slots.contains(home))
-            || !target_temps.insert(target)
-            || !target_slots.is_disjoint(&target_homes)
-        {
+            .any(|home| captured_slots.contains(home));
+        if touches_captured_home {
             // 候选拒绝[SemanticBarrier:Capture]：source/target 的任一可能 home 已捕获，
-            // 或多个 target 可能共享 HIR/物理槽时，移动读取会改变 closure/slot 生命周期。
+            // 当前 HIR 事务不能证明移动读取安全；这不是“任何后续源码改写都非法”的
+            // 绝对结论，因此不能把本次证明不足升级成跨层 Preserve。
+            return false;
+        }
+        if !target_temps.insert(target) || !target_slots.is_disjoint(&target_homes) {
+            // 候选拒绝[SemanticBarrier:Capture]：多个 target 可能共享 HIR/物理槽时，
+            // 移动读取会改变 closure/slot 生命周期。per-definition certificate 尚未覆盖
+            // 此关系，本阶段不把它错误聚合成整个 TempId 的 retention。
             return false;
         }
         source_temps.insert(*source);
@@ -2355,7 +2597,8 @@ fn inline_open_return_fixed_alias_run(
             || !source_slots.is_disjoint(proof.reference_captured_home_slots))
     {
         // 候选拒绝[SemanticBarrier:Capture]：删除 captured target 写或把 captured source
-        // 读取延到 open tail setup 之后，会改变 closure/return 观察的 value epoch（regress_310）。
+        // 读取延到 open tail setup 之后超出当前 HIR 证明；AST 仍可针对 Lua 源码的
+        // left-to-right return 求值规则证明另一种合法改写，所以这里只拒绝本事务。
         return false;
     }
     if !target_temps.is_disjoint(&source_temps) || !target_slots.is_disjoint(&source_slots) {
@@ -2373,7 +2616,7 @@ fn inline_open_return_fixed_alias_run(
             return false;
         }
         let protected_slots_are_empty = target_slots.is_empty() && source_slots.is_empty();
-        let possible_homes = conservative_temp_home_slots(target, proof.facts);
+        let possible_homes = proof.facts.complete_temp_home_slots(target);
         if !protected_slots_are_empty
             && (!possible_homes.is_disjoint(&target_slots)
                 || !possible_homes.is_disjoint(&source_slots))
@@ -2924,9 +3167,8 @@ struct DirectBindingWriteCollector<'a> {
 }
 
 impl DirectBindingWriteCollector<'_> {
-    fn note_homes(&mut self, homes: Option<BTreeSet<HomeSlotKey>>) {
-        self.homes
-            .extend(homes.unwrap_or_else(|| physical_home_universe_for_unknown(self.facts)));
+    fn note_homes(&mut self, homes: BTreeSet<HomeSlotKey>) {
+        self.homes.extend(homes);
     }
 }
 
@@ -2936,17 +3178,17 @@ impl HirVisitor for DirectBindingWriteCollector<'_> {
             HirStmt::LocalDecl(decl) => {
                 for local in &decl.bindings {
                     self.identities.locals.insert(*local);
-                    self.note_homes(self.facts.possible_local_home_slots(*local));
+                    self.note_homes(self.facts.complete_local_home_slots(*local));
                 }
             }
             HirStmt::NumericFor(for_stmt) => {
                 self.identities.locals.insert(for_stmt.binding);
-                self.note_homes(self.facts.possible_local_home_slots(for_stmt.binding));
+                self.note_homes(self.facts.complete_local_home_slots(for_stmt.binding));
             }
             HirStmt::GenericFor(for_stmt) => {
                 for local in &for_stmt.bindings {
                     self.identities.locals.insert(*local);
-                    self.note_homes(self.facts.possible_local_home_slots(*local));
+                    self.note_homes(self.facts.complete_local_home_slots(*local));
                 }
             }
             HirStmt::Close(close) => {
@@ -2960,11 +3202,11 @@ impl HirVisitor for DirectBindingWriteCollector<'_> {
         match lvalue {
             HirLValue::Param(param) => {
                 self.identities.params.insert(*param);
-                self.note_homes(self.facts.possible_param_home_slots(*param));
+                self.note_homes(self.facts.complete_param_home_slots(*param));
             }
             HirLValue::Local(local) => {
                 self.identities.locals.insert(*local);
-                self.note_homes(self.facts.possible_local_home_slots(*local));
+                self.note_homes(self.facts.complete_local_home_slots(*local));
             }
             HirLValue::Temp(temp) => {
                 self.identities.temps.insert(*temp);
@@ -3092,14 +3334,18 @@ fn temp_rebinds_captured_slot(
     facts: &ProtoPromotionFacts,
     captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
-    !conservative_temp_home_slots(temp, facts).is_disjoint(captured_slots)
+    !facts
+        .complete_temp_home_slots(temp)
+        .is_disjoint(captured_slots)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hir::common::{
-        HirAssign, HirGlobalDecl, HirGlobalRef, HirPackTail, HirReturn, HirValuePack, LocalId,
+        HirAssign, HirBinaryExpr, HirBinaryOpKind, HirCapture, HirCaptureMode, HirClosureExpr,
+        HirGlobalDecl, HirGlobalRef, HirIf, HirLogicalExpr, HirPackTail, HirReturn, HirTableAccess,
+        HirValuePack, LocalId,
     };
     use crate::parser::{ProtoLineRange, ProtoSignature};
 
@@ -3122,17 +3368,21 @@ mod tests {
             params: Vec::new(),
             param_debug_hints: Vec::new(),
             locals: Vec::new(),
+            vararg_param_local: None,
             local_debug_hints: Vec::new(),
             local_debug_scopes: Vec::new(),
             debug_scopes: Vec::new(),
             physical_root_temps: BTreeSet::new(),
             physical_root_locals: BTreeSet::new(),
+            inline_dispositions: Default::default(),
             upvalues: Vec::new(),
+            environment_upvalues: BTreeSet::new(),
             mutable_upvalues: BTreeSet::new(),
             upvalue_debug_hints: Vec::new(),
             temps,
             temp_debug_locals: vec![None; temp_count],
             temp_debug_scopes: vec![None; temp_count],
+            exit_requirements: Vec::new(),
             body,
             children: Vec::new(),
             failure: None,
@@ -3146,6 +3396,8 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(TempId(0)), HirLValue::Temp(TempId(1))],
                     values: HirValuePack::fixed(vec![HirExpr::Nil, HirExpr::Nil]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
                     values: HirValuePack::fixed(vec![
@@ -3163,13 +3415,11 @@ mod tests {
             unreachable!("terminal nil-pack fixture must end in return")
         };
         ret.values.tail = Some(HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
-            callee: HirExpr::GlobalRef(HirGlobalRef {
-                name: "tail".into(),
-            }),
+            callee: HirExpr::GlobalRef(HirGlobalRef { key: "tail".into() }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }))));
         block
     }
@@ -3179,6 +3429,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(target)],
                 values: HirValuePack::fixed(vec![HirExpr::TempRef(source)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         HirBlock {
@@ -3188,18 +3440,18 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(setup_target)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
                     values: HirValuePack::expanding(
                         vec![HirExpr::TempRef(TempId(0)), HirExpr::TempRef(TempId(1))],
                         HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
-                            callee: HirExpr::GlobalRef(HirGlobalRef {
-                                name: "tail".into(),
-                            }),
+                            callee: HirExpr::GlobalRef(HirGlobalRef { key: "tail".into() }),
                             args: HirValuePack::default(),
                             method: false,
                             fastcall: None,
-                            method_name: None,
+                            method_key: None,
                         }))),
                     ),
                 })),
@@ -3219,13 +3471,254 @@ mod tests {
     fn call_stmt(name: &str) -> HirStmt {
         HirStmt::CallStmt(Box::new(crate::hir::common::HirCallStmt {
             call: HirCallExpr {
-                callee: HirExpr::GlobalRef(HirGlobalRef { name: name.into() }),
+                callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
                 args: HirValuePack::default(),
                 method: false,
                 fastcall: None,
-                method_name: None,
+                method_key: None,
             },
         }))
+    }
+
+    fn scalar_temp_assign(target: TempId, value: HirExpr) -> HirStmt {
+        HirStmt::Assign(Box::new(HirAssign {
+            targets: vec![HirLValue::Temp(target)],
+            values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
+        }))
+    }
+
+    fn table_access(base: HirExpr, key: &str) -> HirExpr {
+        HirExpr::TableAccess(Box::new(HirTableAccess {
+            base,
+            key: HirExpr::String(key.into()),
+        }))
+    }
+
+    fn normal_call(callee: HirExpr, args: Vec<HirExpr>) -> HirExpr {
+        HirExpr::Call(Box::new(HirCallExpr {
+            callee,
+            args: HirValuePack::fixed(args),
+            method: false,
+            fastcall: None,
+            method_key: None,
+        }))
+    }
+
+    fn eager_condition_materialization_block() -> HirBlock {
+        let root = TempId(0);
+        let native = TempId(1);
+        let callee = TempId(2);
+        let argument = TempId(3);
+        HirBlock {
+            stmts: vec![
+                scalar_temp_assign(root, HirExpr::GlobalRef(HirGlobalRef { key: "_G".into() })),
+                scalar_temp_assign(native, table_access(HirExpr::TempRef(root), "native")),
+                scalar_temp_assign(
+                    callee,
+                    table_access(HirExpr::TempRef(native), "checkIfDatePassed"),
+                ),
+                scalar_temp_assign(
+                    argument,
+                    table_access(
+                        HirExpr::GlobalRef(HirGlobalRef { key: "page".into() }),
+                        "year",
+                    ),
+                ),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::Binary(Box::new(HirBinaryExpr {
+                        op: HirBinaryOpKind::Eq,
+                        lhs: normal_call(
+                            HirExpr::TempRef(callee),
+                            vec![HirExpr::TempRef(argument)],
+                        ),
+                        rhs: HirExpr::Integer(1),
+                    })),
+                    then_block: HirBlock::default(),
+                    else_block: None,
+                })),
+            ],
+        }
+    }
+
+    #[test]
+    fn eager_condition_transaction_consumes_the_complete_lookup_call_run() {
+        let mut block = eager_condition_materialization_block();
+        let temps = (0..4).map(TempId).collect::<Vec<_>>();
+        let proto = empty_proto(block.clone(), temps.clone());
+        let mut scratch = TempUseScratch::new(&proto, temps.len());
+        let mut facts = ProtoPromotionFacts::default();
+        for temp in temps {
+            facts.record_home_free_temp(temp);
+        }
+        let snapshots = empty_capture_snapshots(block.stmts.len());
+        let mut live_use_counts = vec![1; 4];
+        let mut order_sensitive_defs = OrderSensitiveDefWorkspace::new(4);
+        order_sensitive_defs.rebuild(&block.stmts);
+        let reference_captured = ReferenceCapturedBindings::default();
+        let mut removed = vec![false; block.stmts.len()];
+
+        assert!(inline_eager_condition_materialization_run(
+            &mut block,
+            0,
+            4,
+            &[false; 5],
+            &mut EagerConditionMaterializationProof {
+                scratch: &mut scratch,
+                live_use_counts: &mut live_use_counts,
+                facts: &facts,
+                captured_slots_before_stmt: &snapshots,
+                order_sensitive_defs: &order_sensitive_defs,
+                reference_captured: &reference_captured,
+                dialect: DecompileDialect::Lua54,
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            },
+            &mut removed,
+        ));
+        assert_eq!(removed, vec![true, true, true, true, false]);
+        assert_eq!(live_use_counts, vec![0; 4]);
+        for temp in 0..4 {
+            assert_eq!(
+                collect_stmt_temp_uses(&block.stmts[4], &mut scratch).count(TempId(temp)),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn eager_condition_transaction_rejects_short_circuit_and_physical_roots() {
+        let callee = TempId(0);
+        let short_circuit = HirBlock {
+            stmts: vec![
+                scalar_temp_assign(
+                    callee,
+                    HirExpr::GlobalRef(HirGlobalRef {
+                        key: "callee".into(),
+                    }),
+                ),
+                HirStmt::If(Box::new(HirIf {
+                    cond: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                        lhs: HirExpr::GlobalRef(HirGlobalRef { key: "gate".into() }),
+                        rhs: normal_call(HirExpr::TempRef(callee), Vec::new()),
+                    })),
+                    then_block: HirBlock::default(),
+                    else_block: None,
+                })),
+            ],
+        };
+        let proto = empty_proto(short_circuit.clone(), vec![callee]);
+        let mut scratch = TempUseScratch::new(&proto, 1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(callee);
+        let snapshots = empty_capture_snapshots(2);
+        let mut live_use_counts = vec![1];
+        let mut order_sensitive_defs = OrderSensitiveDefWorkspace::new(1);
+        order_sensitive_defs.rebuild(&short_circuit.stmts);
+        let reference_captured = ReferenceCapturedBindings::default();
+        let mut block = short_circuit.clone();
+        let mut removed = vec![false; 2];
+
+        assert!(!inline_eager_condition_materialization_run(
+            &mut block,
+            0,
+            1,
+            &[false; 2],
+            &mut EagerConditionMaterializationProof {
+                scratch: &mut scratch,
+                live_use_counts: &mut live_use_counts,
+                facts: &facts,
+                captured_slots_before_stmt: &snapshots,
+                order_sensitive_defs: &order_sensitive_defs,
+                reference_captured: &reference_captured,
+                dialect: DecompileDialect::Lua54,
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            },
+            &mut removed,
+        ));
+        assert_eq!(block, short_circuit);
+
+        let mut rooted = eager_condition_materialization_block();
+        let rooted_proto = empty_proto(rooted.clone(), (0..4).map(TempId).collect());
+        let mut rooted_scratch = TempUseScratch::new(&rooted_proto, 4);
+        let mut rooted_facts = ProtoPromotionFacts::default();
+        for temp in 0..4 {
+            rooted_facts.record_home_free_temp(TempId(temp));
+        }
+        let rooted_snapshots = empty_capture_snapshots(rooted.stmts.len());
+        let mut rooted_live_use_counts = vec![1; 4];
+        let mut rooted_order_sensitive_defs = OrderSensitiveDefWorkspace::new(4);
+        rooted_order_sensitive_defs.rebuild(&rooted.stmts);
+        let original_rooted = rooted.clone();
+        let mut rooted_removed = vec![false; rooted.stmts.len()];
+        assert!(!inline_eager_condition_materialization_run(
+            &mut rooted,
+            0,
+            4,
+            &[false, true, false, false, false],
+            &mut EagerConditionMaterializationProof {
+                scratch: &mut rooted_scratch,
+                live_use_counts: &mut rooted_live_use_counts,
+                facts: &rooted_facts,
+                captured_slots_before_stmt: &rooted_snapshots,
+                order_sensitive_defs: &rooted_order_sensitive_defs,
+                reference_captured: &reference_captured,
+                dialect: DecompileDialect::Lua54,
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            },
+            &mut rooted_removed,
+        ));
+        assert_eq!(rooted, original_rooted);
+
+        let first = TempId(0);
+        let later = TempId(1);
+        let forward_dependency = HirBlock {
+            stmts: vec![
+                scalar_temp_assign(first, HirExpr::TempRef(later)),
+                scalar_temp_assign(
+                    later,
+                    HirExpr::GlobalRef(HirGlobalRef {
+                        key: "callee".into(),
+                    }),
+                ),
+                HirStmt::If(Box::new(HirIf {
+                    cond: normal_call(HirExpr::TempRef(first), Vec::new()),
+                    then_block: HirBlock::default(),
+                    else_block: None,
+                })),
+            ],
+        };
+        let forward_proto = empty_proto(forward_dependency.clone(), vec![first, later]);
+        let mut forward_scratch = TempUseScratch::new(&forward_proto, 2);
+        let mut forward_facts = ProtoPromotionFacts::default();
+        forward_facts.record_home_free_temp(first);
+        forward_facts.record_home_free_temp(later);
+        let forward_snapshots = empty_capture_snapshots(forward_dependency.stmts.len());
+        let mut forward_live_use_counts = vec![1; 2];
+        let mut forward_order_sensitive_defs = OrderSensitiveDefWorkspace::new(2);
+        forward_order_sensitive_defs.rebuild(&forward_dependency.stmts);
+        let mut forward_block = forward_dependency.clone();
+        let mut forward_removed = vec![false; forward_block.stmts.len()];
+        assert!(!inline_eager_condition_materialization_run(
+            &mut forward_block,
+            0,
+            2,
+            &[false; 3],
+            &mut EagerConditionMaterializationProof {
+                scratch: &mut forward_scratch,
+                live_use_counts: &mut forward_live_use_counts,
+                facts: &forward_facts,
+                captured_slots_before_stmt: &forward_snapshots,
+                order_sensitive_defs: &forward_order_sensitive_defs,
+                reference_captured: &reference_captured,
+                dialect: DecompileDialect::Lua54,
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            },
+            &mut forward_removed,
+        ));
+        assert_eq!(forward_block, forward_dependency);
+        assert_eq!(forward_removed, vec![false; 3]);
+        assert_eq!(forward_live_use_counts, vec![1; 2]);
     }
 
     fn prefixed_block_sink(temp: TempId, prefix: HirStmt) -> HirStmt {
@@ -3246,11 +3739,15 @@ mod tests {
         let prefix = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(prefix_temp)],
             values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let producer = |value| {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(target)],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
 
@@ -3290,6 +3787,8 @@ mod tests {
                         HirStmt::Assign(Box::new(HirAssign {
                             targets: vec![HirLValue::Temp(prefix_temp)],
                             values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                            initializer_merge_transaction: None,
+                            generic_for_initializer_producer: None,
                         })),
                     ),
                 ],
@@ -3317,6 +3816,8 @@ mod tests {
         let source_write = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(source)],
             values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let mut local = empty_proto(
             HirBlock {
@@ -3349,11 +3850,11 @@ mod tests {
         assert!(matches!(site, InlineSite::PrefixedBlock));
         assert!(!site.allows(
             &HirExpr::Call(Box::new(HirCallExpr {
-                callee: HirExpr::GlobalRef(HirGlobalRef { name: "f".into() }),
+                callee: HirExpr::GlobalRef(HirGlobalRef { key: "f".into() }),
                 args: HirValuePack::default(),
                 method: false,
                 fastcall: None,
-                method_name: None,
+                method_key: None,
             })),
             ReadabilityOptions::default(),
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
@@ -3364,6 +3865,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(target)],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
         );
         assert!(inline_site_in_stmt(&rewritten_prefix, target).is_none());
@@ -3378,9 +3881,12 @@ mod tests {
                 stmts: vec![HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(temp)],
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(source)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 }))],
             },
             cond: HirExpr::TempRef(temp),
+            lifetime: Default::default(),
         };
         let proto = empty_proto(
             HirBlock {
@@ -3421,10 +3927,14 @@ mod tests {
         let direct_write = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(source)],
             values: HirValuePack::fixed(vec![HirExpr::Integer(2)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let alias_write = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Local(other)],
             values: HirValuePack::fixed(vec![HirExpr::Integer(3)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let empty_captures = ReferenceCapturedBindings::default();
         let empty_slots = BTreeSet::new();
@@ -3524,6 +4034,8 @@ mod tests {
                     captures: Vec::new(),
                 },
             ))]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))];
         assert!(!repeat_head_dependencies_are_stable(
             &value,
@@ -3564,12 +4076,12 @@ mod tests {
         let empty_slots = BTreeSet::new();
         let call = HirExpr::Call(Box::new(HirCallExpr {
             callee: HirExpr::GlobalRef(HirGlobalRef {
-                name: "produce".into(),
+                key: "produce".into(),
             }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }));
         assert!(!repeat_head_dependencies_are_stable(
             &call,
@@ -3733,13 +4245,15 @@ mod tests {
                 targets: vec![HirLValue::Temp(TempId(2))],
                 values: HirValuePack::fixed(vec![HirExpr::Call(Box::new(HirCallExpr {
                     callee: HirExpr::GlobalRef(HirGlobalRef {
-                        name: "resource".into(),
+                        key: "resource".into(),
                     }),
                     args: HirValuePack::default(),
                     method: false,
                     fastcall: None,
-                    method_name: None,
+                    method_key: None,
                 }))]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
         );
         rooted.stmts.insert(1, call_stmt("collectgarbage"));
@@ -3809,9 +4323,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unknown physical home requires a non-empty proto home universe")]
+    #[should_panic(
+        expected = "unknown physical binding requires a non-empty physical-home universe"
+    )]
     fn unknown_home_without_a_physical_universe_is_an_invalid_fact_set() {
-        let _ = conservative_temp_home_slots(TempId(0), &ProtoPromotionFacts::default());
+        let _ = ProtoPromotionFacts::default().complete_temp_home_slots(TempId(0));
     }
 
     #[test]
@@ -3819,6 +4335,8 @@ mod tests {
         let gap = HirStmt::Assign(Box::new(HirAssign {
             targets: vec![HirLValue::Temp(TempId(2))],
             values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }));
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
@@ -3842,6 +4360,8 @@ mod tests {
             &HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(9))],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::from([HomeSlotKey::new(0, 0)]),
@@ -3851,6 +4371,8 @@ mod tests {
             &HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(9))],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(8)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::new(),
@@ -3860,6 +4382,8 @@ mod tests {
             &HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(0))],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::new(),
@@ -3971,6 +4495,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(0))],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         let mut stable = HirBlock {
@@ -4006,12 +4532,12 @@ mod tests {
 
         let dynamic_call = HirExpr::Call(Box::new(HirCallExpr {
             callee: HirExpr::GlobalRef(HirGlobalRef {
-                name: "next_start".into(),
+                key: "next_start".into(),
             }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }));
         let mut dynamic = HirBlock {
             stmts: vec![candidate(dynamic_call), numeric_for()],
@@ -4044,10 +4570,14 @@ mod tests {
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(TempId(0))],
                     values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(2))]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Temp(TempId(1))],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(9)]),
+                    initializer_merge_transaction: None,
+                    generic_for_initializer_producer: None,
                 })),
                 HirStmt::NumericFor(Box::new(crate::hir::common::HirNumericFor {
                     binding: LocalId(0),
@@ -4169,6 +4699,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(target)],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         let loop_sink = || {
@@ -4218,12 +4750,12 @@ mod tests {
 
         let dynamic = block(HirExpr::Call(Box::new(HirCallExpr {
             callee: HirExpr::GlobalRef(HirGlobalRef {
-                name: "mutate_source".into(),
+                key: "mutate_source".into(),
             }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         })));
         assert!(
             numeric_for_binding_header_alias_plan(&dynamic, 0..3, 2, &live_uses, &proof).is_none()
@@ -4235,12 +4767,12 @@ mod tests {
         };
         numeric_for.start = HirExpr::Call(Box::new(HirCallExpr {
             callee: HirExpr::GlobalRef(HirGlobalRef {
-                name: "mutate_source".into(),
+                key: "mutate_source".into(),
             }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }));
         numeric_for.limit = HirExpr::TempRef(TempId(2));
         assert!(
@@ -4255,6 +4787,8 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(target)],
                 values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         let block = |middle_target| HirBlock {
@@ -4372,5 +4906,56 @@ mod tests {
             },
             &mut removed,
         ));
+
+        let captured_temp = TempId(0);
+        let closure_temp = TempId(1);
+        let assign = |target, value| {
+            HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![HirLValue::Temp(target)],
+                values: HirValuePack::fixed(vec![value]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
+            }))
+        };
+        let mut captured_rebind = empty_proto(
+            HirBlock {
+                stmts: vec![
+                    assign(
+                        closure_temp,
+                        HirExpr::Closure(Box::new(HirClosureExpr {
+                            proto: crate::hir::common::HirProtoRef(1),
+                            captures: vec![HirCapture {
+                                mode: HirCaptureMode::ByReference,
+                                value: HirExpr::TempRef(captured_temp),
+                            }],
+                        })),
+                    ),
+                    assign(captured_temp, HirExpr::Integer(7)),
+                    HirStmt::Return(Box::new(HirReturn {
+                        values: HirValuePack::fixed(vec![
+                            HirExpr::TempRef(captured_temp),
+                            HirExpr::TempRef(closure_temp),
+                        ]),
+                    })),
+                ],
+            },
+            vec![captured_temp, closure_temp],
+        );
+        let mut captured_rebind_facts = ProtoPromotionFacts::default();
+        captured_rebind_facts.record_temp_home_slot_for_test(captured_temp, HomeSlotKey::new(0, 0));
+        captured_rebind_facts.record_temp_home_slot_for_test(closure_temp, HomeSlotKey::new(1, 0));
+        inline_temps_in_proto_with_facts(
+            &mut captured_rebind,
+            ReadabilityOptions::default(),
+            &captured_rebind_facts,
+            DecompileDialect::Lua54,
+            &[],
+        );
+        assert_eq!(
+            captured_rebind.inline_dispositions.temp(captured_temp),
+            crate::hir::common::HirInlineDisposition::Preserve(BTreeSet::from([
+                HirInlineRetentionReason::CapturedValueEpoch,
+            ]))
+        );
     }
 }

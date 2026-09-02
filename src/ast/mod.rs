@@ -13,7 +13,7 @@ pub(crate) mod pretty;
 mod readability;
 pub(crate) mod traverse;
 
-pub use crate::decompile::DecompileDialect;
+pub use crate::decompile::{DecompileDialect, ReadabilityOptions};
 pub use build::lower_ast;
 pub use common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstBindingRef, AstBlock, AstCallExpr, AstCallKind,
@@ -22,9 +22,9 @@ pub use common::{
     AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIndexAccess,
     AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
     AstLocalFunctionDecl, AstLocalOrigin, AstLogicalExpr, AstMethodCallExpr, AstModule,
-    AstNamePath, AstNameRef, AstNumericFor, AstRecordField, AstRepeat, AstReturn, AstStmt,
-    AstSyntheticLocalId, AstTableConstructor, AstTableField, AstTableKey, AstTargetDialect,
-    AstUnaryExpr, AstUnaryOpKind, AstWhile,
+    AstNamePath, AstNameRef, AstNumericFor, AstRecordField, AstRepeat, AstReturn,
+    AstRewriteAuthority, AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTableField,
+    AstTableKey, AstTargetDialect, AstUnaryExpr, AstUnaryOpKind, AstWhile,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_ast;
@@ -41,7 +41,6 @@ pub use naming::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingError, NamingEvidence, NamingMode,
     NamingOptions, assign_name_map, assign_names_with_evidence, collect_naming_evidence,
 };
-pub use readability::ReadabilityOptions;
 
 pub(crate) fn analyze_ast_stage(
     state: &mut crate::decompile::DecompileState,

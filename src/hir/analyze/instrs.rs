@@ -7,17 +7,17 @@
 //! LuaJIT 没有精确 Lua 拼写的 `TypeGuard` 只保留带位置与效果说明的 residual；本模块不
 //! 猜测可覆盖的 helper 语义，严格模式仍由后续 residual 合同拒绝。
 //!
-//! 输入形状：`CALL r0 ...` + 指令 def 映射。
-//! 输出形状：`t0 = f(args)` 或 `f(args)` 这类 HIR 语句。
+//! 输入形状：`CALL r0 ...` + 指令 def 映射，或已由 global protocol owner 认领的指令区间。
+//! 输出形状：`t0 = f(args)`、`f(args)`，或 typed `HirStmt::GlobalDecl`。
 
 use super::exprs::{
-    expr_for_const, expr_for_reg_use, expr_for_value_operand, global_name_for_access,
+    expr_for_const, expr_for_reg_use, expr_for_value_operand, global_key_for_access,
     lower_binary_op, lower_closure_capture, lower_closure_expr, lower_composite_factory_expr,
-    lower_method_name, lower_raw_table_get_expr, lower_raw_table_set_call, lower_table_access_expr,
+    lower_method_key, lower_raw_table_get_expr, lower_raw_table_set_call, lower_table_access_expr,
     lower_table_access_target, lower_unary_op, lower_upvalue_operand_expr,
     lower_upvalue_operand_target, lower_value_pack,
 };
-use super::global_decls::GlobalDeclProtocol;
+use super::global_decls::{GlobalDeclProtocol, GlobalDeclValues};
 use super::helpers::{
     assign_stmt, binary_expr, concat_expr, decode_raw_string, return_stmt, unresolved_expr,
 };
@@ -194,7 +194,7 @@ pub(super) fn lower_regular_instr(
                 .into(),
                 method: false,
                 fastcall: None,
-                method_name: None,
+                method_key: None,
             };
             if type_guard.kind.normalizes_subject() {
                 fixed_assign(lowering, instr_ref, vec![HirExpr::Call(Box::new(call))])
@@ -253,6 +253,7 @@ pub(super) fn lower_regular_instr(
                             lowering, block, instr_ref, closure, factory,
                         )]
                         .into(),
+                        initializer_merge_transaction: None,
                     })));
                 }
                 None => stmts.extend(fixed_assign(
@@ -294,7 +295,7 @@ fn env_upvalue_is_consumed_by_global_accesses(
     instr_ref: InstrRef,
     get_upvalue: &crate::transformer::GetUpvalueInstr,
 ) -> bool {
-    if !matches!(get_upvalue.src, crate::transformer::UpvalueOperand::Env) {
+    if !matches!(get_upvalue.src, crate::transformer::UpvalueOperand::Env(_)) {
         return false;
     }
     let Some(def) = lowering
@@ -328,8 +329,7 @@ fn env_upvalue_is_consumed_by_global_accesses(
                     }
                     _ => return false,
                 };
-                global_name_for_access(lowering, use_block, site.instr, access.0, access.1)
-                    .is_some()
+                global_key_for_access(lowering, use_block, site.instr, access.0, access.1).is_some()
             })
         })
 }
@@ -345,7 +345,7 @@ pub(super) fn lower_terminal_instr(
             lowering, block, instr_ref, ret.values,
         ))]),
         LowInstr::TailCall(tail_call) => {
-            let method_name = lower_method_name(lowering, tail_call.method_name);
+            let method_key = lower_method_key(lowering, tail_call.method_name);
             let callee = expr_for_reg_use(lowering, block, instr_ref, tail_call.callee);
             Some(vec![return_stmt(HirValuePack::expanding(
                 Vec::new(),
@@ -357,7 +357,7 @@ pub(super) fn lower_terminal_instr(
                         CallKind::FastCall(args) => Some(args),
                         CallKind::Normal | CallKind::Method => None,
                     },
-                    method_name,
+                    method_key,
                 }))),
             ))])
         }
@@ -412,7 +412,7 @@ fn generic_for_iterator_call(
         args,
         method: false,
         fastcall: None,
-        method_name: None,
+        method_key: None,
     }))
 }
 
@@ -444,7 +444,7 @@ fn lower_call_expr(
     instr_ref: InstrRef,
     call: &crate::transformer::CallInstr,
 ) -> HirCallExpr {
-    let method_name = lower_method_name(lowering, call.method_name);
+    let method_key = lower_method_key(lowering, call.method_name);
     let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
     HirCallExpr {
         callee,
@@ -454,7 +454,7 @@ fn lower_call_expr(
             CallKind::FastCall(args) => Some(args),
             CallKind::Normal | CallKind::Method => None,
         },
-        method_name,
+        method_key,
     }
 }
 
@@ -464,24 +464,31 @@ pub(super) fn lower_global_decl_owner(
     instr_ref: InstrRef,
     protocol: &GlobalDeclProtocol,
 ) -> Option<HirStmt> {
-    let LowInstr::Call(call) = lowering.proto.instrs.get(instr_ref.index())? else {
-        return None;
+    let values = match &protocol.values {
+        GlobalDeclValues::FixedCall(results) => {
+            let LowInstr::Call(call) = lowering.proto.instrs.get(instr_ref.index())? else {
+                return None;
+            };
+            if call.results != ResultPack::Fixed(*results) {
+                return None;
+            }
+            let call = HirExpr::Call(Box::new(lower_call_expr(lowering, block, instr_ref, call)));
+            if results.len == 1 {
+                HirValuePack::fixed(vec![call])
+            } else {
+                HirValuePack::expanding(Vec::new(), HirPackTail::exact(call, results.len))
+            }
+        }
+        GlobalDeclValues::ValueUses(values) => HirValuePack::fixed(
+            values
+                .iter()
+                .map(|value| expr_for_reg_use(lowering, block, value.instr, value.reg))
+                .collect(),
+        ),
     };
-    let ResultPack::Fixed(results) = call.results else {
-        return None;
-    };
-    if results != protocol.results || results.len < 2 {
-        return None;
-    }
     Some(HirStmt::GlobalDecl(Box::new(HirGlobalDecl {
         names: protocol.names.clone(),
-        values: HirValuePack::expanding(
-            Vec::new(),
-            HirPackTail::exact(
-                HirExpr::Call(Box::new(lower_call_expr(lowering, block, instr_ref, call))),
-                results.len,
-            ),
-        ),
+        values,
     })))
 }
 
@@ -562,10 +569,12 @@ fn lower_shared_capture_barrier(
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![barrier.box_local],
             values: vec![table].into(),
+            initializer_merge_transaction: None,
         })),
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: locals,
             values: snapshots.into(),
+            initializer_merge_transaction: None,
         })),
     ]
 }
@@ -596,6 +605,7 @@ fn fixed_assign(
         vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: decl_locals,
             values,
+            initializer_merge_transaction: None,
         }))]
     } else {
         let mut stmts = local_decl_stmts(decl_locals);
@@ -625,6 +635,7 @@ pub(super) fn local_decl_stmts(locals: Vec<LocalId>) -> Vec<HirStmt> {
         vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: locals,
             values: HirValuePack::default(),
+            initializer_merge_transaction: None,
         }))]
     }
 }

@@ -12,7 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::LuaString;
 use crate::decompile::DecompileDialect;
-use crate::hir::{HirLabelId, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
+use crate::hir::{
+    HirInitializerMergeTransactionId, HirInitializerRootProfile, HirInlineDisposition, HirLabelId,
+    HirProtoRef, HirRepeatConditionLifetimeFacts, LocalId, ParamId, TempId, UpvalueId,
+};
 use strum_macros::{Display, IntoStaticStr};
 
 /// AST 内部物化出来的保守局部绑定。
@@ -99,6 +102,8 @@ pub enum AstExpr {
 pub struct AstAssign {
     pub targets: Vec<AstLValue>,
     pub values: Vec<AstExpr>,
+    /// 从 HIR 原样传入的、仅供相邻 initializer merge 消费的一次性 token。
+    pub initializer_merge_transaction: Option<HirInitializerMergeTransactionId>,
 }
 
 /// 赋值左值。
@@ -117,6 +122,8 @@ pub enum AstNameRef {
     Temp(TempId),
     SyntheticLocal(AstSyntheticLocalId),
     Upvalue(UpvalueId),
+    /// PUC Lua 5.2+ 的词法环境绑定；生成文本固定为 `_ENV`，但它不是普通 global。
+    Environment,
     Global(AstGlobalName),
 }
 
@@ -134,7 +141,10 @@ impl AstBindingRef {
             AstNameRef::Local(local) => Some(Self::Local(*local)),
             AstNameRef::Temp(temp) => Some(Self::Temp(*temp)),
             AstNameRef::SyntheticLocal(local) => Some(Self::SyntheticLocal(*local)),
-            AstNameRef::Param(_) | AstNameRef::Upvalue(_) | AstNameRef::Global(_) => None,
+            AstNameRef::Param(_)
+            | AstNameRef::Upvalue(_)
+            | AstNameRef::Environment
+            | AstNameRef::Global(_) => None,
         }
     }
 
@@ -203,6 +213,7 @@ pub struct AstFunctionDecl {
 pub struct AstLocalFunctionDecl {
     pub name: AstBindingRef,
     pub origin: AstLocalOrigin,
+    pub rewrite_authority: AstRewriteAuthority,
     pub func: AstFunctionExpr,
 }
 
@@ -418,6 +429,11 @@ impl AstDialectCaps {
 pub struct AstLocalDecl {
     pub bindings: Vec<AstLocalBinding>,
     pub values: Vec<AstExpr>,
+    /// 从 HIR 原样传入的、仅供相邻 initializer merge 消费的一次性 token。
+    pub initializer_merge_transaction: Option<HirInitializerMergeTransactionId>,
+    /// HIR value-pack 对每个 initializer 结果槽发布的 root 类别。AST 只消费该事实
+    /// 判断自己的 scope rewrite；任何改变 bindings/values 对应关系的改写必须清空它。
+    pub(crate) initializer_root_profile: Option<HirInitializerRootProfile>,
 }
 
 /// `global` 声明。
@@ -433,6 +449,37 @@ pub struct AstLocalBinding {
     pub id: AstBindingRef,
     pub attr: AstLocalAttr,
     pub origin: AstLocalOrigin,
+    /// 谁拥有删除、移动或缩短这个 binding 的语义判定。
+    ///
+    /// HIR 结论与 `origin` 正交：前者约束重写权限，后者只描述 debug/root 来源。
+    pub rewrite_authority: AstRewriteAuthority,
+}
+
+/// AST 对 binding 进行生命周期改写时必须服从的上游权限。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AstRewriteAuthority {
+    /// binding 由 AST readability 自己创建，语义判断也由 AST 拥有。
+    AstOwned,
+    /// binding 来自 HIR；当前携带负向结论或仍未迁移的显式 Unknown。
+    Hir(HirInlineDisposition),
+}
+
+impl AstRewriteAuthority {
+    pub const fn must_preserve(&self) -> bool {
+        matches!(self, Self::Hir(disposition) if disposition.must_preserve())
+    }
+
+    pub const fn may_remove_binding(&self) -> bool {
+        !self.must_preserve()
+    }
+
+    pub const fn may_move_scope_start(&self) -> bool {
+        !self.must_preserve()
+    }
+
+    pub const fn may_shorten_lifetime(&self) -> bool {
+        !self.must_preserve()
+    }
 }
 
 /// `global` binding。
@@ -533,9 +580,9 @@ pub struct AstLogicalExpr {
 pub struct AstCallExpr {
     pub callee: AstExpr,
     pub args: Vec<AstExpr>,
-    /// HIR 已确认的 SELF/NAMECALL 字段名。`Call` 形状仍保留这份 provenance，
-    /// 即使 receiver/callee 快照暂时不能安全渲染成 `obj:method(...)`。
-    pub method_name: Option<String>,
+    /// HIR 已确认的 SELF/NAMECALL 原始字段 key。`Call` 形状仍保留这份
+    /// provenance，即使 key 不是目标方言的 identifier，只能渲染成索引调用。
+    pub method_key: Option<LuaString>,
 }
 
 /// 方法调用。
@@ -606,6 +653,12 @@ pub struct AstWhile {
 pub struct AstRepeat {
     pub body: AstBlock,
     pub cond: AstExpr,
+    /// HIR 在这个 repeat 的条件边界证明的物理生命周期事实。
+    ///
+    /// 集合里的 binding 只获准在“当前 repeat body -> condition”这一条边界提前结束；
+    /// 它不是 binding 级通用 rewrite authority。AST 仍须针对实际 suffix 证明词法可见性、
+    /// `<close>`、debug identity、global gate 与 goto 合法性。
+    pub lifetime: HirRepeatConditionLifetimeFacts,
 }
 
 /// `numeric for` 语句。

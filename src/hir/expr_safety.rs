@@ -3,8 +3,54 @@
 //! HIR analyze 和 simplify 都会判断某个表达式是否能被挪动或折进别的表达式。
 //! 这个文件只放跨 pass 共用、和具体恢复策略无关的谓词，避免求值序规则散落后漂移。
 
-use super::common::{HirBinaryOpKind, HirCaptureMode, HirExpr, HirUnaryOpKind};
+use super::common::{HirBinaryOpKind, HirCaptureMode, HirExpr, HirUnaryOpKind, HirValuePack};
 use crate::decompile::DecompileDialect;
+
+/// 一个 HIR-origin local initializer 的逐槽 stack-root relevance 证明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HirInitializerRootProfile {
+    slots: Vec<HirStackRootRelevance>,
+}
+
+impl HirInitializerRootProfile {
+    /// 缺失或越界事实必须 fail closed。
+    pub(crate) fn may_affect_collectable_lifetime(&self, slot: usize) -> bool {
+        self.slots.get(slot) != Some(&HirStackRootRelevance::Irrelevant)
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.slots.truncate(len);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HirStackRootRelevance {
+    /// 延长承接该结果的 stack slot 不会延长任何可回收对象的生命周期。
+    Irrelevant,
+    MayAffectCollectableLifetime,
+}
+
+pub(crate) fn initializer_root_profile(
+    dialect: DecompileDialect,
+    values: &HirValuePack,
+    target_count: usize,
+) -> HirInitializerRootProfile {
+    let safety = HirExprSafety::for_dialect(dialect);
+    HirInitializerRootProfile {
+        slots: (0..target_count)
+            .map(|slot| match values.fixed.get(slot) {
+                Some(value) if safety.result_is_gc_inert(value) => {
+                    HirStackRootRelevance::Irrelevant
+                }
+                Some(_) => HirStackRootRelevance::MayAffectCollectableLifetime,
+                None if values.tail.is_some() => {
+                    HirStackRootRelevance::MayAffectCollectableLifetime
+                }
+                None => HirStackRootRelevance::Irrelevant,
+            })
+            .collect(),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MixedNumericMode {
@@ -365,6 +411,94 @@ pub(crate) fn luau_literal_addition_value(lhs: &HirExpr, rhs: &HirExpr) -> Optio
     Some(HirExpr::Number(number(lhs)? + number(rhs)?))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GcInertLiteralKind {
+    Nil,
+    Boolean,
+    Numeric,
+    String,
+}
+
+/// 只跟踪 primitive 字面量运算树在正常完成时的结果种类。
+///
+/// 这里不证明求值可删除，也不要求运算一定成功：除零、整数转换和目标数值域仍由
+/// `is_discard_safe` 或具体 rewrite 的事件证明负责。这里覆盖的普通数值运算不会走
+/// 元方法，因而一旦正常产出，结果仍是 number/integer，不会把 stack slot 变成对象
+/// root。bitwise 的 Number 整数转换失败后可能转入 primitive metatable，动态 concat
+/// 结果也没有 proto 常量锚点，因此两者都不在这条证明里传播。
+fn gc_inert_literal_kind(expr: &HirExpr) -> Option<GcInertLiteralKind> {
+    match expr {
+        HirExpr::Nil => Some(GcInertLiteralKind::Nil),
+        HirExpr::Boolean(_) => Some(GcInertLiteralKind::Boolean),
+        HirExpr::Integer(_) | HirExpr::Number(_) => Some(GcInertLiteralKind::Numeric),
+        HirExpr::String(_) => Some(GcInertLiteralKind::String),
+        HirExpr::Unary(unary) => {
+            let operand = gc_inert_literal_kind(&unary.expr)?;
+            match unary.op {
+                HirUnaryOpKind::Not => Some(GcInertLiteralKind::Boolean),
+                HirUnaryOpKind::Neg if operand == GcInertLiteralKind::Numeric => {
+                    Some(GcInertLiteralKind::Numeric)
+                }
+                HirUnaryOpKind::Length if operand == GcInertLiteralKind::String => {
+                    Some(GcInertLiteralKind::Numeric)
+                }
+                HirUnaryOpKind::Neg | HirUnaryOpKind::BitNot | HirUnaryOpKind::Length => None,
+            }
+        }
+        HirExpr::Binary(binary) => {
+            let lhs = gc_inert_literal_kind(&binary.lhs)?;
+            let rhs = gc_inert_literal_kind(&binary.rhs)?;
+            match binary.op {
+                HirBinaryOpKind::Add
+                | HirBinaryOpKind::Sub
+                | HirBinaryOpKind::Mul
+                | HirBinaryOpKind::Div
+                | HirBinaryOpKind::FloorDiv
+                | HirBinaryOpKind::Mod
+                | HirBinaryOpKind::Pow
+                    if lhs == GcInertLiteralKind::Numeric && rhs == GcInertLiteralKind::Numeric =>
+                {
+                    Some(GcInertLiteralKind::Numeric)
+                }
+                HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le => {
+                    Some(GcInertLiteralKind::Boolean)
+                }
+                HirBinaryOpKind::Add
+                | HirBinaryOpKind::Sub
+                | HirBinaryOpKind::Mul
+                | HirBinaryOpKind::Div
+                | HirBinaryOpKind::FloorDiv
+                | HirBinaryOpKind::Mod
+                | HirBinaryOpKind::Pow
+                | HirBinaryOpKind::BitAnd
+                | HirBinaryOpKind::BitOr
+                | HirBinaryOpKind::BitXor
+                | HirBinaryOpKind::Shl
+                | HirBinaryOpKind::Shr
+                | HirBinaryOpKind::Concat => None,
+            }
+        }
+        HirExpr::Int64(_)
+        | HirExpr::UInt64(_)
+        | HirExpr::Vector(_)
+        | HirExpr::Complex { .. }
+        | HirExpr::ParamRef(_)
+        | HirExpr::LocalRef(_)
+        | HirExpr::UpvalueRef(_)
+        | HirExpr::TempRef(_)
+        | HirExpr::GlobalRef(_)
+        | HirExpr::TableAccess(_)
+        | HirExpr::LogicalAnd(_)
+        | HirExpr::LogicalOr(_)
+        | HirExpr::Decision(_)
+        | HirExpr::Call(_)
+        | HirExpr::VarArg
+        | HirExpr::TableConstructor(_)
+        | HirExpr::Closure(_)
+        | HirExpr::Unresolved(_) => None,
+    }
+}
+
 impl HirExprSafety {
     /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
     pub(crate) fn is_discard_safe(self, expr: &HirExpr) -> bool {
@@ -457,9 +591,10 @@ impl HirExprSafety {
 
     /// 表达式的单值结果是否不会承载可观察的 GC 资源生命周期。
     ///
-    /// 这个谓词比“可丢弃求值”更窄：`not` 和原始比较的结果恒为 boolean，逻辑表达式
-    /// 则可能直接返回任一操作数。String 常量由 chunk 常量表持有，不会因为某个栈槽覆盖
-    /// 触发用户可观察的终结行为。LuaJIT 的 Int64/UInt64/Complex 虽由 GCcdata 表示，但
+    /// 这个谓词与“可丢弃求值”正交：`not` 和原始比较的结果恒为 boolean，primitive
+    /// 字面量运算树的正常结果仍是 number/integer，但运算的错误与事件仍由 `is_discard_safe`
+    /// 单独判断；逻辑表达式则可能直接返回任一操作数。String 常量由 chunk 常量表持有，
+    /// 不会因为某个栈槽覆盖触发用户可观察的终结行为。LuaJIT 的 Int64/UInt64/Complex 虽由 GCcdata 表示，但
     /// BC_KCDATA 指向 proto 的 KGC 常量且 proto 遍历会持续标记它；Luau vector 同样先由
     /// proto 常量表持有。无论 vector 的宿主表示是内嵌值还是 boxed GC 对象，这些常量的
     /// 存活期都不由某个栈槽是否继续引用决定。
@@ -475,8 +610,18 @@ impl HirExprSafety {
             | HirExpr::Vector(_)
             | HirExpr::Complex { .. } => true,
             HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => true,
-            HirExpr::Unary(_) | HirExpr::Binary(_) => self.is_discard_safe(expr),
-            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+            HirExpr::Unary(_) => gc_inert_literal_kind(expr).is_some(),
+            HirExpr::Binary(binary)
+                if matches!(
+                    binary.op,
+                    HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+                ) =>
+            {
+                true
+            }
+            HirExpr::Binary(_) => gc_inert_literal_kind(expr).is_some(),
+            HirExpr::LogicalAnd(logical) => self.result_is_gc_inert(&logical.rhs),
+            HirExpr::LogicalOr(logical) => {
                 self.result_is_gc_inert(&logical.lhs) && self.result_is_gc_inert(&logical.rhs)
             }
             HirExpr::ParamRef(_)

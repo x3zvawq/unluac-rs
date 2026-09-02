@@ -289,7 +289,8 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
             | AstNameRef::Local(_)
             | AstNameRef::SyntheticLocal(_)
             | AstNameRef::Temp(_)
-            | AstNameRef::Upvalue(_),
+            | AstNameRef::Upvalue(_)
+            | AstNameRef::Environment,
         ) => true,
         AstExpr::Unary(unary) => {
             matches!(unary.op, super::super::common::AstUnaryOpKind::Not)
@@ -347,7 +348,9 @@ pub(super) fn is_stable_context_expr(
             is_stable_context_expr(&logical.lhs, mutable_snapshots)
                 && is_stable_context_expr(&logical.rhs, mutable_snapshots)
         }
-        AstExpr::Var(AstNameRef::Upvalue(_) | AstNameRef::Global(_)) => false,
+        AstExpr::Var(AstNameRef::Upvalue(_) | AstNameRef::Environment | AstNameRef::Global(_)) => {
+            false
+        }
         _ => true,
     }
 }
@@ -378,7 +381,8 @@ pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
             | AstNameRef::Local(_)
             | AstNameRef::SyntheticLocal(_)
             | AstNameRef::Temp(_)
-            | AstNameRef::Upvalue(_),
+            | AstNameRef::Upvalue(_)
+            | AstNameRef::Environment,
         )
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
@@ -428,9 +432,11 @@ pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {
     }
 }
 
-/// 判断表达式结果是否不可能成为可回收对象的强引用。
+/// 候选 Lua 表达式的结果是否不需要旧对象 root handoff。
 ///
-/// 这里只描述结果值，不描述求值事件：`not value` 仍会读取 `value`，但结果一定是布尔值。
+/// 这个谓词只用于证明 AST stable-copy 改写自身：`not value` 仍会读取 `value`，但结果
+/// 一定是 boolean。原 bytecode initializer 的 stack-root 类别必须消费 HIR profile，
+/// 不能调用这里从 AST 形状反推。
 pub(super) fn result_cannot_root_collectable(expr: &AstExpr) -> bool {
     match expr {
         AstExpr::Nil
@@ -930,7 +936,8 @@ fn is_discard_safe_expr_with_facts(expr: &AstExpr, facts: DiscardSafetyFacts) ->
             | AstNameRef::Local(_)
             | AstNameRef::SyntheticLocal(_)
             | AstNameRef::Temp(_)
-            | AstNameRef::Upvalue(_),
+            | AstNameRef::Upvalue(_)
+            | AstNameRef::Environment,
         ) => true,
         AstExpr::VarArg => true,
         AstExpr::SingleValue(expr) => is_discard_safe_expr_with_facts(expr, facts),

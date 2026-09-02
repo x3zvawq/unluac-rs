@@ -209,4 +209,56 @@ pub(super) const REGRESSION_CASES_401_500: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_443_lua55_loop_carried_closure_effect.lua",
         &[LuaCaseDialect::Lua55],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_444_lua55_singleton_global_hir_owner.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_445_lua55_returned_fresh_closure_effect.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_446_nested_capture_local_namespace.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_447_lua55_environment_identity.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_448_call_root_immediate_move_overwrite.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_449_call_root_multi_home_overwrite.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_450_lua55_repeat_collective_certificate.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_451_lua55_repeat_condition_global_gate.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_452_allocation_home_owner.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_453_generic_for_dispatch_capture_root.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_454_generic_for_binding_repeat_root.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_455_allocation_call_escape.lua",
+        &[LuaCaseDialect::Lua54],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_456_generic_for_exit_result_home.lua",
+        ALL_DIALECTS,
+    ),
 ];

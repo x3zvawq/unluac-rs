@@ -16,6 +16,9 @@
 //! 唯一例外是 proven internal loop-carrier temp mirror：它先在 `prune.rs` 里被要求满足
 //! no-read、non-debug、loop-carrier owner、same-exact-home write audit 之后，才会在冻结
 //! identity 前删除；源码作者可见的 for binding 身份本身仍继续受这里的保护。
+//! `HirInlineDispositions::Preserve` 作为独立的 transaction protection 参与每个候选：
+//! 只要 rewrite map 或前置裁剪触及该 binding 就拒绝该事务，不把它混进 outer-scope
+//! 可见性，也不因 proto 中另一个无关 binding 被保护而停用整个 pass。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -74,11 +77,16 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
     promotion_facts: &mut ProtoPromotionFacts,
     expr_safety: HirExprSafety,
 ) -> bool {
-    let branch_copies_changed = prune_redundant_branch_state_copies(proto, expr_safety);
-    let snapshots_changed =
-        repeat_snapshots::coalesce_repeat_terminal_snapshots(proto, promotion_facts);
+    let preserved_bindings = collect_preserved_bindings(proto);
+    let branch_copies_changed =
+        prune_redundant_branch_state_copies(proto, expr_safety, &preserved_bindings);
+    let snapshots_changed = repeat_snapshots::coalesce_repeat_terminal_snapshots(
+        proto,
+        promotion_facts,
+        &preserved_bindings,
+    );
     let dead_for_binding_mirrors_changed =
-        prune_dead_for_binding_temp_mirrors(proto, promotion_facts);
+        prune_dead_for_binding_temp_mirrors(proto, promotion_facts, &preserved_bindings);
     // Both structural rewrites above can remove a materialization that would otherwise be
     // recorded as an active identity.  Freeze protection facts only after those rewrites so the
     // handoff owner never reasons over a stale binding set.
@@ -86,7 +94,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
         label_refs: count_label_references(&proto.body.stmts),
         expr_safety,
     };
-    let identity_facts = HandoffIdentityFacts::new(proto);
+    let identity_facts = HandoffIdentityFacts::new(proto, preserved_bindings);
     branch_copies_changed
         | snapshots_changed
         | dead_for_binding_mirrors_changed
@@ -184,7 +192,7 @@ fn collapse_handoffs_recursive(
         inherited_locals,
         expr_safety,
     );
-    changed |= prune_redundant_copy_stmts(block);
+    changed |= prune_redundant_copy_stmts(block, &identity_facts.preserved);
     changed
 }
 
@@ -312,10 +320,11 @@ struct HandoffIdentityFacts {
     physical_roots: BTreeSet<LocalId>,
     reference_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
+    preserved: BTreeSet<CarryBinding>,
 }
 
 impl HandoffIdentityFacts {
-    fn new(proto: &HirProto) -> Self {
+    fn new(proto: &HirProto, preserved: BTreeSet<CarryBinding>) -> Self {
         let debug = proto
             .locals
             .iter()
@@ -331,6 +340,7 @@ impl HandoffIdentityFacts {
             physical_roots: proto.physical_root_locals.clone(),
             reference_captured: collector.reference_captured,
             to_be_closed: collector.to_be_closed,
+            preserved,
         }
     }
 
@@ -338,6 +348,7 @@ impl HandoffIdentityFacts {
         self.debug.contains(&local)
             || self.for_bindings.contains(&local)
             || self.physical_roots.contains(&local)
+            || self.preserved.contains(&CarryBinding::Local(local))
     }
 
     fn binding_merge_preserves_identity(
@@ -361,7 +372,11 @@ impl HandoffIdentityFacts {
         // rewrite map 内。By-value capture 只是创建点快照，其值等价性由 transaction 的
         // reaching relation 验证。
         // 候选拒绝[SemanticBarrier:Lifetime]：TBC 任一端或 raw-home may-alias resource binding 时，合并会改变 close/root epoch。
-        !source.local().is_some_and(|local| self.contains(local))
+        // 候选拒绝[LayerBoundary]：HIR 已证明必须保留的 binding definition 不得被
+        // carried-local 的跨身份 merge 删除；不相关 Preserve 不影响当前事务。
+        !self.preserved.contains(&source)
+            && !self.preserved.contains(&target)
+            && !source.local().is_some_and(|local| self.contains(local))
             && !target.local().is_some_and(|local| self.contains(local))
             && (!endpoint_is_reference_captured || shares_exact_home)
             && !self.to_be_closed.contains(&source)
@@ -376,6 +391,24 @@ impl HandoffIdentityFacts {
                         && !bindings_may_share_raw_home_slot(target, *binding, promotion_facts)
                 })
     }
+}
+
+fn collect_preserved_bindings(proto: &HirProto) -> BTreeSet<CarryBinding> {
+    proto
+        .temps
+        .iter()
+        .copied()
+        .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve())
+        .map(CarryBinding::Temp)
+        .chain(
+            proto
+                .locals
+                .iter()
+                .copied()
+                .filter(|local| proto.inline_dispositions.local(*local).must_preserve())
+                .map(CarryBinding::Local),
+        )
+        .collect()
 }
 
 #[derive(Default)]

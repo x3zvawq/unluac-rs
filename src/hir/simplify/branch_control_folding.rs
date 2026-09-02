@@ -331,6 +331,7 @@ fn fold_constant_control(
                 stmts: vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![local],
                     values: HirValuePack::fixed(vec![condition]),
+                    initializer_merge_transaction: None,
                 }))],
             })));
         }
@@ -1396,7 +1397,7 @@ fn remove_nop_goto_labels(stmts: &mut Vec<HirStmt>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::DecompileDialect;
+    use crate::decompile::DecompileDialect;
     use crate::hir::common::{HirLabel, HirRepeat, HirReturn, ParamId};
 
     fn return_value(value: i64) -> HirStmt {
@@ -1413,7 +1414,7 @@ mod tests {
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         };
         let mut stmts = vec![
             HirStmt::If(Box::new(HirIf {
@@ -1464,6 +1465,8 @@ mod tests {
             HirStmt::Assign(Box::new(crate::hir::common::HirAssign {
                 targets: vec![HirLValue::Local(local)],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
             }))
         };
         let external_entry = HirStmt::Block(Box::new(HirBlock {
@@ -1530,6 +1533,7 @@ mod tests {
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![local],
                 values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
+                initializer_merge_transaction: None,
             })),
         ];
         let mut stmts = vec![
@@ -1621,6 +1625,7 @@ mod tests {
             HirStmt::LocalDecl(Box::new(HirLocalDecl {
                 bindings: vec![LocalId(0)],
                 values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::default())]),
+                initializer_merge_transaction: None,
             })),
             HirStmt::Label(Box::new(HirLabel {
                 id: target,
@@ -1714,6 +1719,7 @@ mod tests {
                 ],
             },
             cond: latch.clone(),
+            lifetime: Default::default(),
         }));
 
         assert!(fold_trailing_repeat_break_condition(

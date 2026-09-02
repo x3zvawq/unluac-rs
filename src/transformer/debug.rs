@@ -13,7 +13,9 @@ use crate::debug::{
 };
 use crate::decompile::DecompileDialect;
 
-use super::{DebugLocalKind, LoweredChunk, LoweredProto, RawInstrRef, format_low_instr};
+use super::{
+    DebugLocalKind, LoweredChunk, LoweredProto, RawInstrRef, UpvalueRef, format_low_instr,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct ProtoEntry<'a> {
@@ -142,13 +144,14 @@ fn write_proto_tree_view(
         let indent = "  ".repeat(entry.depth + 1);
         let _ = writeln!(
             output,
-            "{indent}proto#{} parent={} params={} upvalues={} stack={} instrs={} children={} lines={}..{} source={} debug-name={}",
+            "{indent}proto#{} parent={} params={} upvalues={} env-upvalues={} stack={} instrs={} children={} lines={}..{} source={} debug-name={}",
             entry.id,
             entry
                 .parent
                 .map_or_else(|| "-".to_owned(), |parent| format!("proto#{parent}")),
             entry.proto.signature.num_params,
             entry.proto.upvalues.common.count,
+            format_environment_upvalues(&entry.proto.environment_upvalues),
             entry.proto.frame.max_stack_size,
             entry.proto.instrs.len(),
             entry.proto.children.len(),
@@ -168,6 +171,18 @@ fn write_proto_tree_view(
                 entry.proto.debug_locals.len(),
             );
         }
+    }
+}
+
+fn format_environment_upvalues(upvalues: &[UpvalueRef]) -> String {
+    if upvalues.is_empty() {
+        "-".to_owned()
+    } else {
+        upvalues
+            .iter()
+            .map(|upvalue| format!("u{}", upvalue.index()))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 

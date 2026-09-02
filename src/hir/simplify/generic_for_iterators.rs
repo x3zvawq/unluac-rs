@@ -14,10 +14,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::decompile::DecompileDialect;
 use crate::hir::common::{
-    HirBlock, HirExpr, HirGenericFor, HirLValue, HirProto, HirStmt, HirValuePack, LocalId, ParamId,
-    TempId,
+    HirBlock, HirExpr, HirGenericFor, HirGenericForInitializerProducerId, HirLValue, HirProto,
+    HirStmt, HirValuePack, LocalId, ParamId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -31,7 +30,6 @@ use super::walk::{HirRewritePass, rewrite_proto};
 pub(super) fn fold_generic_for_iterators_in_proto(
     proto: &mut HirProto,
     facts: &ProtoPromotionFacts,
-    dialect: DecompileDialect,
 ) -> bool {
     let use_counts = collect_temp_use_counts(proto);
     let reference_capture_homes = iterator_reference_capture_homes(&proto.body, facts);
@@ -42,6 +40,12 @@ pub(super) fn fold_generic_for_iterators_in_proto(
         .iter()
         .map(Option::is_some)
         .collect();
+    let preserved_temps = proto
+        .temps
+        .iter()
+        .copied()
+        .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve())
+        .collect();
     rewrite_proto(
         proto,
         &mut GenericForIteratorPass {
@@ -50,8 +54,8 @@ pub(super) fn fold_generic_for_iterators_in_proto(
             tbc_protected_homes,
             physical_root_bindings,
             debug_temps,
+            preserved_temps,
             facts,
-            dialect,
         },
     )
 }
@@ -62,11 +66,15 @@ struct GenericForIteratorPass<'a> {
     tbc_protected_homes: BTreeSet<HomeSlotKey>,
     physical_root_bindings: BTreeSet<DirectBinding>,
     debug_temps: Vec<bool>,
+    preserved_temps: BTreeSet<TempId>,
     facts: &'a ProtoPromotionFacts,
-    dialect: DecompileDialect,
 }
 
 impl HirRewritePass for GenericForIteratorPass<'_> {
+    fn preserves_generic_for_initializer_transaction_on_iterator_rewrite(&self) -> bool {
+        true
+    }
+
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
         let HirStmt::GenericFor(generic_for) = stmt else {
             return false;
@@ -117,7 +125,7 @@ fn fold_adjacent_nil_iterators(
     context: &GenericForIteratorPass<'_>,
     new_stmts: &mut Vec<HirStmt>,
 ) -> bool {
-    let (iterator_start, value_count) = {
+    let (iterator_start, value_count, producer_id) = {
         let stmts = pending.make_contiguous();
         let (Some(HirStmt::Assign(assign)), Some(HirStmt::GenericFor(generic_for))) =
             (stmts.first(), stmts.get(1))
@@ -129,40 +137,43 @@ fn fold_adjacent_nil_iterators(
         if value_count == 0
             || assign.values.tail.is_some()
             || assign.values.fixed.len() != value_count
+            || !assign
+                .values
+                .fixed
+                .iter()
+                .all(|value| matches!(value, HirExpr::Nil))
         {
             return false;
         }
         let value_capture_homes = iterator_value_capture_homes(&stmts[1..], context.facts);
-        let Some(iterator_start) =
-            generic_for
-                .iterator
-                .fixed
-                .windows(value_count)
-                .position(|window| {
-                    window
-                        .iter()
-                        .zip(&assign.targets)
-                        .zip(&assign.values.fixed)
-                        .all(|((iterator, target), value)| {
-                            matches!(
-                                (iterator, target, value),
-                                (
-                                    HirExpr::TempRef(actual),
-                                    HirLValue::Temp(expected),
-                                    HirExpr::Nil
-                                ) if actual == expected
-                                    && iterator_target_can_be_deleted(
-                                        *expected,
-                                        &value_capture_homes,
-                                        context,
-                                    )
-                            )
-                        })
-                })
+        let Some(producer_id) = assign.generic_for_initializer_producer else {
+            return false;
+        };
+        let Some(span) = generic_for
+            .initializer_transaction
+            .as_ref()
+            .filter(|transaction| transaction.id == producer_id.transaction())
+            .and_then(|transaction| {
+                transaction
+                    .producers
+                    .iter()
+                    .find(|span| span.producer == producer_id)
+            })
         else {
             return false;
         };
-        (iterator_start, value_count)
+        if !producer_matches_iterator_span(assign, generic_for, span) {
+            return false;
+        }
+        if !assign.targets.iter().all(|target| {
+            let HirLValue::Temp(temp) = target else {
+                return false;
+            };
+            iterator_target_can_be_deleted(*temp, &value_capture_homes, context)
+        }) {
+            return false;
+        }
+        (span.value_start, value_count, producer_id)
     };
 
     let Some(HirStmt::Assign(_)) = pending.pop_front() else {
@@ -172,6 +183,7 @@ fn fold_adjacent_nil_iterators(
         unreachable!("validated adjacent generic-for owner");
     };
     generic_for.iterator.fixed[iterator_start..iterator_start + value_count].fill(HirExpr::Nil);
+    consume_initializer_producers(&mut generic_for, [producer_id]);
     trim_trailing_nil_iterators(&mut generic_for.iterator);
     new_stmts.push(HirStmt::GenericFor(generic_for));
     true
@@ -184,10 +196,19 @@ struct FoldPlan {
 }
 
 fn fold_plan(stmts: &[HirStmt], context: &GenericForIteratorPass<'_>) -> Option<FoldPlan> {
-    // VM 最多给 generic-for 保留 iterator/state/control/closing 四个 source slots。
+    let transaction = match stmts.first() {
+        Some(HirStmt::Assign(assign)) => assign.generic_for_initializer_producer?.transaction(),
+        _ => return None,
+    };
     let mut gap_fallback = None;
-    for assignment_count in 1..=4 {
-        if !matches!(stmts.get(assignment_count - 1), Some(HirStmt::Assign(_))) {
+    for assignment_count in 1..stmts.len() {
+        let Some(HirStmt::Assign(assign)) = stmts.get(assignment_count - 1) else {
+            return gap_fallback;
+        };
+        if assign
+            .generic_for_initializer_producer
+            .is_none_or(|producer| producer.transaction() != transaction)
+        {
             return gap_fallback;
         }
         let assignments = &stmts[..assignment_count];
@@ -348,13 +369,12 @@ struct BindingLocations {
 impl BindingLocations {
     fn insert(&mut self, binding: DirectBinding, facts: &ProtoPromotionFacts) {
         self.bindings.insert(binding);
-        let possible_homes = match binding {
-            DirectBinding::Param(param) => facts.possible_param_home_slots(param),
-            DirectBinding::Local(local) => facts.possible_local_home_slots(local),
-            DirectBinding::Temp(temp) => facts.possible_temp_home_slots(temp),
+        let homes = match binding {
+            DirectBinding::Param(param) => facts.complete_param_home_slots(param),
+            DirectBinding::Local(local) => facts.complete_local_home_slots(local),
+            DirectBinding::Temp(temp) => facts.complete_temp_home_slots(temp),
         };
-        self.physical_homes
-            .extend(complete_binding_home_slots(possible_homes, facts));
+        self.physical_homes.extend(homes);
     }
 
     fn extend(&mut self, other: Self) {
@@ -363,41 +383,19 @@ impl BindingLocations {
     }
 }
 
-fn complete_binding_home_slots(
-    possible_homes: Option<BTreeSet<HomeSlotKey>>,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    possible_homes.unwrap_or_else(|| {
-        assert!(
-            !facts.physical_home_universe().is_empty(),
-            "unknown physical iterator binding requires a non-empty home universe"
-        );
-        facts.physical_home_universe().clone()
-    })
-}
-
 fn captured_binding_homes(
     captured: &ReferenceCapturedBindings,
     facts: &ProtoPromotionFacts,
 ) -> BTreeSet<HomeSlotKey> {
     let mut homes = BTreeSet::new();
     for local in &captured.locals {
-        homes.extend(complete_binding_home_slots(
-            facts.possible_local_home_slots(*local),
-            facts,
-        ));
+        homes.extend(facts.complete_local_home_slots(*local));
     }
     for param in &captured.params {
-        homes.extend(complete_binding_home_slots(
-            facts.possible_param_home_slots(*param),
-            facts,
-        ));
+        homes.extend(facts.complete_param_home_slots(*param));
     }
     for temp in &captured.temps {
-        homes.extend(complete_binding_home_slots(
-            facts.possible_temp_home_slots(*temp),
-            facts,
-        ));
+        homes.extend(facts.complete_temp_home_slots(*temp));
     }
     homes
 }
@@ -690,12 +688,21 @@ fn assignments_match_iterator(
     value_capture_homes: &BTreeSet<HomeSlotKey>,
     context: &GenericForIteratorPass<'_>,
 ) -> bool {
-    let mut expected = generic_for.iterator.fixed.iter();
+    let Some(transaction) = &generic_for.initializer_transaction else {
+        return false;
+    };
     let mut protocol_prefix_width = 0;
-    for (index, stmt) in assignments.iter().enumerate() {
+    for (index, (stmt, producer)) in assignments.iter().zip(&transaction.producers).enumerate() {
         let HirStmt::Assign(assign) = stmt else {
             return false;
         };
+        if assign.generic_for_initializer_producer != Some(producer.producer)
+            || producer.producer.transaction() != transaction.id
+            || producer.value_start != protocol_prefix_width
+            || !producer_matches_iterator_span(assign, generic_for, producer)
+        {
+            return false;
+        }
         // 候选拒绝[SemanticBarrier:ValueArity]：target 之后的 fixed RHS 仍会求值但不占赋值槽；直接拼进 loop pack 会占据并移动后续 protocol 槽。
         if assign.values.fixed.len() > assign.targets.len() {
             return false;
@@ -711,12 +718,11 @@ fn assignments_match_iterator(
             .tail
             .as_ref()
             .and_then(|tail| tail.exact_width())
-            .is_some_and(|width| {
-                protocol_prefix_width + assign.values.fixed.len() + width
-                    < generic_for_protocol_width(context.dialect)
-            })
+            .is_some_and(|width| assign.values.fixed.len() + width != assign.targets.len())
         {
-            // 候选拒绝[SemanticBarrier:ValueArity]：exact tail 未覆盖完整 generic-for 协议；改成 open tail 会把被截掉的返回值带入 control/closing 槽。
+            // 候选拒绝[SemanticBarrier:ValueArity]：原 assignment 会把 exact tail 截到
+            // target arity；若证书已陈旧或 pack 宽度不符，改成 open tail 会重新暴露原本
+            // 被截掉的返回值，或丢失原本补 nil 的结果。
             return false;
         }
         // 候选拒绝[PolicyBoundary]：closure producer 保留命名 binding，避免把完整 child body 压成 loop head 内的多行 IIFE。
@@ -729,21 +735,19 @@ fn assignments_match_iterator(
             return false;
         }
         for target in &assign.targets {
-            let (HirLValue::Temp(actual), Some(HirExpr::TempRef(expected))) =
-                (target, expected.next())
-            else {
+            let HirLValue::Temp(output) = target else {
                 return false;
             };
-            if actual != expected {
-                return false;
-            }
-            if !iterator_target_can_be_deleted(*actual, value_capture_homes, context) {
+            if !iterator_target_can_be_deleted(*output, value_capture_homes, context) {
                 return false;
             }
         }
         protocol_prefix_width += assign.targets.len();
     }
-    let has_remaining_protocol_values = expected.next().is_some();
+    if assignments.len() > transaction.producers.len() {
+        return false;
+    }
+    let has_remaining_protocol_values = protocol_prefix_width < transaction.iterator_width;
     if assignments
         .iter()
         .any(|stmt| matches!(stmt, HirStmt::Assign(assign) if assign.values.tail.is_some()))
@@ -766,15 +770,28 @@ fn assignments_match_iterator(
     }
 }
 
-fn generic_for_protocol_width(dialect: DecompileDialect) -> usize {
-    match dialect {
-        DecompileDialect::Lua54 | DecompileDialect::Lua55 | DecompileDialect::Auto => 4,
-        DecompileDialect::Lua51
-        | DecompileDialect::Lua52
-        | DecompileDialect::Lua53
-        | DecompileDialect::Luajit
-        | DecompileDialect::Luau => 3,
+fn producer_matches_iterator_span(
+    assign: &crate::hir::common::HirAssign,
+    generic_for: &HirGenericFor,
+    span: &crate::hir::common::HirGenericForInitializerSpan,
+) -> bool {
+    if span.value_count != assign.targets.len() {
+        return false;
     }
+    let Some(iterator_values) = generic_for
+        .iterator
+        .fixed
+        .get(span.value_start..span.value_start + span.value_count)
+    else {
+        return false;
+    };
+    assign
+        .targets
+        .iter()
+        .zip(iterator_values)
+        .all(|(target, value)| {
+            matches!((target, value), (HirLValue::Temp(target), HirExpr::TempRef(value)) if target == value)
+        })
 }
 
 fn iterator_target_can_be_deleted(
@@ -795,10 +812,12 @@ fn iterator_target_can_be_deleted(
     {
         return false;
     }
-    let target_homes = complete_binding_home_slots(
-        context.facts.possible_temp_home_slots(target),
-        context.facts,
-    );
+    if context.preserved_temps.contains(&target) {
+        // 候选拒绝[LayerBoundary]：iterator fold 会删除 producer definition；HIR 已证明
+        // 必须保留的 target 只能由理解该 disposition 的后续事务处理。
+        return false;
+    }
+    let target_homes = context.facts.complete_temp_home_slots(target);
     if iterator_target_has_root_lifetime(target, &target_homes, context)
         || !target_homes.is_disjoint(&context.tbc_protected_homes)
     {
@@ -839,6 +858,7 @@ fn iterator_target_has_root_lifetime(
 fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut Vec<HirStmt>) {
     let mut iterator = HirValuePack::default();
     let mut consumed_protocol_values = 0;
+    let mut consumed_producers = Vec::with_capacity(plan.assignment_count);
     for _ in 0..plan.assignment_count {
         let HirStmt::Assign(assign) = pending
             .pop_front()
@@ -846,6 +866,11 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
         else {
             unreachable!("fold plan only counts assignments");
         };
+        consumed_producers.push(
+            assign
+                .generic_for_initializer_producer
+                .expect("validated generic-for producer token"),
+        );
         let target_count = assign.targets.len();
         consumed_protocol_values += target_count;
         let fixed_count = assign.values.fixed.len();
@@ -885,26 +910,85 @@ fn fold_front(pending: &mut VecDeque<HirStmt>, plan: FoldPlan, new_stmts: &mut V
     }
     trim_trailing_nil_iterators(&mut iterator);
     generic_for.iterator = iterator;
+    consume_initializer_producers(&mut generic_for, consumed_producers);
     new_stmts.push(HirStmt::GenericFor(generic_for));
+}
+
+fn consume_initializer_producers(
+    generic_for: &mut HirGenericFor,
+    consumed: impl IntoIterator<Item = HirGenericForInitializerProducerId>,
+) {
+    let consumed = consumed.into_iter().collect::<BTreeSet<_>>();
+    let Some(transaction) = &mut generic_for.initializer_transaction else {
+        return;
+    };
+    transaction
+        .producers
+        .retain(|span| !consumed.contains(&span.producer));
+    if transaction.producers.is_empty() {
+        generic_for.initializer_transaction = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hir::common::{HirAssign, HirCapture, HirCaptureMode, HirClosureExpr, HirProtoRef};
+    use crate::hir::common::{
+        HirAssign, HirCapture, HirCaptureMode, HirClosureExpr, HirGenericForInitializerSpan,
+        HirGenericForInitializerTransaction, HirGenericForInitializerTransactionId, HirProtoRef,
+    };
+
+    const TEST_TRANSACTION: HirGenericForInitializerTransactionId =
+        HirGenericForInitializerTransactionId::new(HirProtoRef(0), 0);
 
     fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
+        let generic_for_initializer_producer = match target {
+            HirLValue::Temp(temp) => Some(HirGenericForInitializerProducerId::new(
+                TEST_TRANSACTION,
+                temp.index(),
+            )),
+            _ => None,
+        };
         HirStmt::Assign(Box::new(HirAssign {
             targets: vec![target],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer,
         }))
     }
 
     fn generic_for(iterator: Vec<HirExpr>) -> HirStmt {
+        let producers: Vec<_> = iterator
+            .iter()
+            .enumerate()
+            .filter_map(|(value_start, value)| {
+                let HirExpr::TempRef(temp) = value else {
+                    return None;
+                };
+                Some(HirGenericForInitializerSpan {
+                    producer: HirGenericForInitializerProducerId::new(
+                        TEST_TRANSACTION,
+                        temp.index(),
+                    ),
+                    value_start,
+                    value_count: 1,
+                })
+            })
+            .collect();
+        let iterator_width = iterator.len();
+        let initializer_transaction =
+            (!producers.is_empty()).then_some(HirGenericForInitializerTransaction {
+                id: TEST_TRANSACTION,
+                iterator_width,
+                producers,
+            });
         HirStmt::GenericFor(Box::new(HirGenericFor {
             bindings: Vec::new(),
             iterator: HirValuePack::fixed(iterator),
             body: HirBlock::default(),
+            initializer_transaction,
+            initializer_roots: Vec::new(),
+            dispatch_results: Vec::new(),
         }))
     }
 
@@ -928,8 +1012,8 @@ mod tests {
             tbc_protected_homes: BTreeSet::new(),
             physical_root_bindings: BTreeSet::new(),
             debug_temps: Vec::new(),
+            preserved_temps: BTreeSet::new(),
             facts,
-            dialect: DecompileDialect::Lua54,
         }
     }
 
@@ -1187,6 +1271,10 @@ mod tests {
         let mut context = context(&facts, [iterator]);
         context.reference_capture_homes.insert(home);
 
+        assert!(fold_plan(&stmts, &context).is_none());
+        context.reference_capture_homes.clear();
+        assert!(fold_plan(&stmts, &context).is_some());
+        context.preserved_temps.insert(iterator);
         assert!(fold_plan(&stmts, &context).is_none());
     }
 

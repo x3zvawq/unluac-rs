@@ -10,7 +10,6 @@
 //! 旧值已证明为 nil 的简单 local assignment 也可保留，但从该点起只允许独立、无事件的
 //! constructor step 前移；赋值仍在原位完成 capture cell 更新和物理 root handoff。
 
-use crate::ast::DecompileDialect;
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack};
 use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 
@@ -108,8 +107,7 @@ pub(super) fn constructor_uses_binding(
     constructor.fields.iter().any(|field| match field {
         crate::hir::common::HirTableField::Array(value) => expr_uses_binding(value, binding),
         crate::hir::common::HirTableField::Record(record) => {
-            matches!(&record.key, crate::hir::common::HirTableKey::Expr(key) if expr_uses_binding(key, binding))
-                || expr_uses_binding(&record.value, binding)
+            expr_uses_binding(&record.key, binding) || expr_uses_binding(&record.value, binding)
         }
     }) || constructor
         .trailing_multivalue
@@ -128,7 +126,6 @@ pub(super) fn try_rebuild_constructor_region(
     materialized_binding_counts: &[u32],
     debug_identity_bindings: &BindingSlots<bool>,
     stmt_ids: &[usize],
-    dialect: DecompileDialect,
     scratch: &mut RebuildScratch,
 ) -> Option<(HirTableConstructor, usize, Vec<usize>)> {
     let mut steps = Vec::new();
@@ -210,7 +207,6 @@ pub(super) fn try_rebuild_constructor_region(
             binding_index,
             remaining_uses,
             materialized_binding_counts,
-            dialect,
             scratch,
         );
         if let Some(preserved_producer_sources) =
@@ -748,7 +744,6 @@ fn table_set_list_binding(stmt: &HirStmt) -> Option<TableBinding> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::ast::DecompileDialect;
     use crate::hir::common::{
         HirAssign, HirBlock, HirCallExpr, HirExpr, HirGlobalRef, HirLValue, HirLocalDecl,
         HirPackTail, HirReturn, HirStmt, HirTableAccess, HirTableConstructor, HirTableField,
@@ -765,6 +760,7 @@ mod tests {
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
             bindings: vec![binding],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
         }))
     }
 
@@ -779,16 +775,18 @@ mod tests {
                 key: HirExpr::String(key.into()),
             }))],
             values: HirValuePack::fixed(vec![value]),
+            initializer_merge_transaction: None,
+            generic_for_initializer_producer: None,
         }))
     }
 
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
-            callee: HirExpr::GlobalRef(HirGlobalRef { name: name.into() }),
+            callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
             fastcall: None,
-            method_name: None,
+            method_key: None,
         }))
     }
 
@@ -827,7 +825,6 @@ mod tests {
             &materialized_counts,
             &debug_identities,
             &stmt_ids,
-            DecompileDialect::Lua54,
             &mut scratch,
         )
     }
@@ -851,7 +848,7 @@ mod tests {
         assert_eq!(
             constructor.fields,
             vec![HirTableField::Record(crate::hir::common::HirRecordField {
-                key: crate::hir::common::HirTableKey::Name("field".into()),
+                key: HirExpr::String("field".into()),
                 value: HirExpr::Integer(7),
             })]
         );
@@ -865,6 +862,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1), LocalId(2)],
                     values: HirValuePack::fixed(vec![HirExpr::VarArg, HirExpr::Integer(7)]),
+                    initializer_merge_transaction: None,
                 })),
                 record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
             ],
@@ -921,6 +919,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1), LocalId(2)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                    initializer_merge_transaction: None,
                 })),
                 record_named(LocalId(0), "first", HirExpr::LocalRef(LocalId(1))),
                 record_named(LocalId(0), "second", HirExpr::LocalRef(LocalId(2))),
@@ -936,11 +935,11 @@ mod tests {
             constructor.fields,
             vec![
                 HirTableField::Record(crate::hir::common::HirRecordField {
-                    key: crate::hir::common::HirTableKey::Name("first".into()),
+                    key: HirExpr::String("first".into()),
                     value: HirExpr::Integer(7),
                 }),
                 HirTableField::Record(crate::hir::common::HirRecordField {
-                    key: crate::hir::common::HirTableKey::Name("second".into()),
+                    key: HirExpr::String("second".into()),
                     value: HirExpr::Nil,
                 }),
             ]
@@ -955,6 +954,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1), LocalId(2)],
                     values: HirValuePack::default(),
+                    initializer_merge_transaction: None,
                 })),
                 record_named(LocalId(0), "first", HirExpr::LocalRef(LocalId(1))),
                 record_named(LocalId(0), "second", HirExpr::LocalRef(LocalId(2))),
@@ -987,6 +987,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1), LocalId(2)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7)]),
+                    initializer_merge_transaction: None,
                 })),
                 record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
             ],
@@ -1008,6 +1009,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7), HirExpr::Integer(8)]),
+                    initializer_merge_transaction: None,
                 })),
                 record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
             ],
@@ -1037,6 +1039,7 @@ mod tests {
                         HirExpr::VarArg,
                         HirExpr::Integer(8),
                     ]),
+                    initializer_merge_transaction: None,
                 })),
                 record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
             ],
@@ -1061,6 +1064,7 @@ mod tests {
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![LocalId(1)],
                     values: HirValuePack::fixed(vec![HirExpr::Integer(7), call("mark")]),
+                    initializer_merge_transaction: None,
                 })),
                 record(LocalId(0), HirExpr::LocalRef(LocalId(1))),
             ],
@@ -1081,6 +1085,7 @@ mod tests {
                     HirStmt::LocalDecl(Box::new(HirLocalDecl {
                         bindings: vec![LocalId(1), LocalId(2)],
                         values: HirValuePack::expanding(Vec::new(), tail),
+                        initializer_merge_transaction: None,
                     })),
                     record_named(LocalId(0), "first", HirExpr::LocalRef(LocalId(1))),
                     record_named(LocalId(0), "second", HirExpr::LocalRef(LocalId(2))),

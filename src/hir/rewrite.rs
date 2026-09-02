@@ -3,8 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-    HirCallExpr, HirDecisionTarget, HirExpr, HirPackTail, HirTableField, HirTableKey, HirValuePack,
-    TempId,
+    HirCallExpr, HirDecisionTarget, HirExpr, HirPackTail, HirTableField, HirValuePack, TempId,
 };
 
 pub(crate) fn replace_temp_in_call(
@@ -96,10 +95,7 @@ pub(crate) fn replace_temp_in_expr(
                 .map(|field| match field {
                     HirTableField::Array(value) => replace_temp_in_expr(value, temp, replacement),
                     HirTableField::Record(field) => {
-                        let key = match &mut field.key {
-                            HirTableKey::Expr(key) => replace_temp_in_expr(key, temp, replacement),
-                            HirTableKey::Name(_) => 0,
-                        };
+                        let key = replace_temp_in_expr(&mut field.key, temp, replacement);
                         key + replace_temp_in_expr(&mut field.value, temp, replacement)
                     }
                 })
@@ -221,12 +217,7 @@ fn replace_expr_with_map(
                         replace_expr_with_map(value, replacements, active)
                     }
                     HirTableField::Record(field) => {
-                        let key = match &mut field.key {
-                            HirTableKey::Expr(key) => {
-                                replace_expr_with_map(key, replacements, active)
-                            }
-                            HirTableKey::Name(_) => 0,
-                        };
+                        let key = replace_expr_with_map(&mut field.key, replacements, active);
                         key + replace_expr_with_map(&mut field.value, replacements, active)
                     }
                 })
