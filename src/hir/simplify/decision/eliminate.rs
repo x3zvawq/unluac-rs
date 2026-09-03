@@ -642,6 +642,7 @@ mod tests {
                 stmts: vec![HirStmt::CallStmt(Box::new(
                     crate::hir::common::HirCallStmt {
                         call: crate::hir::common::HirCallExpr {
+                            argument_roots: Vec::new(),
                             callee: global("body"),
                             args: crate::hir::common::HirValuePack::default(),
                             method: false,

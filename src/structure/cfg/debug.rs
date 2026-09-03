@@ -299,7 +299,7 @@ pub(in crate::structure) fn dump_dataflow_facts(
             let block = entry.cfg.cfg.instr_to_block[instr_index];
             let _ = writeln!(
                 output,
-                "{indent}    @{instr_index:03} block=#{} {:<18} reads={} writes={} open-use={} open-def={} effects={}",
+                "{indent}    @{instr_index:03} block=#{} {:<18} reads={} writes={} open-use={} open-def={} effects={} roots={:?}",
                 block.index(),
                 format_low_instr_head(instr),
                 format_display_set(&effect.fixed_uses),
@@ -313,6 +313,7 @@ pub(in crate::structure) fn dump_dataflow_facts(
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
                 format_effect_tags(&summary.tags),
+                summary.root_observation,
             );
         }
 

@@ -14,7 +14,7 @@ use crate::hir::common::{
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::{BindingId, TableBinding};
-use crate::hir::simplify::visit::{HirVisitor, visit_block, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_block, visit_stmts};
 
 pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<TableBinding> {
     match lvalue {

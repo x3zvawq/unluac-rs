@@ -708,6 +708,7 @@ mod tests {
 
     fn call(index: usize) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: param(index),
             args: HirValuePack::default(),
             method: false,

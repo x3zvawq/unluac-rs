@@ -17,190 +17,36 @@ use super::super::common::{
     AstUnaryOpKind,
 };
 use crate::decompile::DecompileDialect;
+use crate::value_semantics::{LuaComparison, LuaLiteral, LuaValueSemantics};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MixedNumericMode {
-    Unknown,
-    ExactIntegerFloat,
-    LuaJitBinary64,
-    LuauBinary64,
-}
-
-/// 计算目标方言能够证明的原始字面量比较。
-///
-/// 混合 Integer/Number 仅在目标数值域可精确模拟时折叠；cdata/vector/complex 与非有限
-/// number 仍保留原表达式。调用方只能把 `Some` 当作可安全删除比较壳的事实。
+/// 把当前 AST 的原始字面量交给共享 Lua 值域；不从 HIR 借用改写许可。
 pub(super) fn primitive_literal_comparison_value(
     op: AstBinaryOpKind,
     lhs: &AstExpr,
     rhs: &AstExpr,
     target: AstTargetDialect,
 ) -> Option<bool> {
-    if op == AstBinaryOpKind::Eq {
-        let value = match (lhs, rhs) {
-            (AstExpr::Integer(lhs), AstExpr::Integer(rhs)) => Some(lhs == rhs),
-            (AstExpr::Number(lhs), AstExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
-                Some(lhs == rhs)
-            }
-            (AstExpr::Integer(integer), AstExpr::Number(number))
-            | (AstExpr::Number(number), AstExpr::Integer(integer)) => {
-                mixed_integer_number_equal(mixed_numeric_mode(target), *integer, *number)
-            }
-            (AstExpr::String(lhs), AstExpr::String(rhs)) => Some(lhs == rhs),
-            (AstExpr::Boolean(lhs), AstExpr::Boolean(rhs)) => Some(lhs == rhs),
-            (AstExpr::Nil, AstExpr::Nil) => Some(true),
-            _ => None,
-        };
-        if value.is_some() {
-            return value;
-        }
-        if matches!(
-            (lhs, rhs),
-            (AstExpr::Integer(_), AstExpr::Number(_))
-                | (AstExpr::Number(_), AstExpr::Integer(_))
-                | (AstExpr::Number(_), AstExpr::Number(_))
-        ) || matches!(lhs, AstExpr::Number(value) if !value.is_finite())
-            || matches!(rhs, AstExpr::Number(value) if !value.is_finite())
-        {
-            // 候选拒绝[TargetConstraint]：Integer/Number 的目标数值域或源码物化无法精确证明，不能按宿主表示直接判等。
-            return None;
-        }
-        if is_metamethod_inert_literal(lhs) && is_metamethod_inert_literal(rhs) {
-            return Some(false);
-        }
-        // 候选拒绝[TargetConstraint]：cdata、vector 与 complex 的 equality 及源码物化是方言专属语义，不能按普通 primitive 类型不匹配处理。
-        return None;
-    }
-
-    let ordering = match (lhs, rhs) {
-        (AstExpr::Integer(lhs), AstExpr::Integer(rhs)) => lhs.cmp(rhs),
-        (AstExpr::Number(lhs), AstExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
-            lhs.partial_cmp(rhs)?
-        }
-        (AstExpr::Integer(integer), AstExpr::Number(number)) => {
-            mixed_integer_number_ordering(mixed_numeric_mode(target), *integer, *number)?
-        }
-        (AstExpr::Number(number), AstExpr::Integer(integer)) => {
-            mixed_integer_number_ordering(mixed_numeric_mode(target), *integer, *number)?.reverse()
-        }
-        (AstExpr::String(lhs), AstExpr::String(rhs)) => {
-            // 候选拒绝[SemanticBarrier:Locale]：PUC Lua 的 `strcoll` 结果可被 `os.setlocale` 改写，regress_392 证明不能用宿主字节序替代。
-            if !target.version.literal_string_order_is_binary() {
-                return None;
-            }
-            lhs.cmp(rhs)
-        }
+    let op = match op {
+        AstBinaryOpKind::Eq => LuaComparison::Eq,
+        AstBinaryOpKind::Lt => LuaComparison::Lt,
+        AstBinaryOpKind::Le => LuaComparison::Le,
         _ => return None,
     };
-    match op {
-        AstBinaryOpKind::Lt => Some(ordering == std::cmp::Ordering::Less),
-        AstBinaryOpKind::Le => Some(ordering != std::cmp::Ordering::Greater),
+    LuaValueSemantics::for_dialect(target.version).compare(
+        op,
+        primitive_literal(lhs)?,
+        primitive_literal(rhs)?,
+    )
+}
+
+fn primitive_literal(expr: &AstExpr) -> Option<LuaLiteral<'_>> {
+    match expr {
+        AstExpr::Nil => Some(LuaLiteral::Nil),
+        AstExpr::Boolean(value) => Some(LuaLiteral::Boolean(*value)),
+        AstExpr::Integer(value) => Some(LuaLiteral::Integer(*value)),
+        AstExpr::Number(value) => Some(LuaLiteral::Number(*value)),
+        AstExpr::String(value) => Some(LuaLiteral::String(value)),
         _ => None,
-    }
-}
-
-fn mixed_numeric_mode(target: AstTargetDialect) -> MixedNumericMode {
-    match target.version {
-        DecompileDialect::Lua53 | DecompileDialect::Lua54 | DecompileDialect::Lua55 => {
-            MixedNumericMode::ExactIntegerFloat
-        }
-        DecompileDialect::Luajit => MixedNumericMode::LuaJitBinary64,
-        DecompileDialect::Luau => MixedNumericMode::LuauBinary64,
-        DecompileDialect::Auto | DecompileDialect::Lua51 | DecompileDialect::Lua52 => {
-            MixedNumericMode::Unknown
-        }
-    }
-}
-
-fn mixed_integer_number_equal(mode: MixedNumericMode, integer: i64, number: f64) -> Option<bool> {
-    if !number.is_finite() {
-        return None;
-    }
-    match mode {
-        MixedNumericMode::ExactIntegerFloat => {
-            const UPPER: f64 = 9_223_372_036_854_775_808.0;
-            Some(
-                number.fract() == 0.0
-                    && number >= i64::MIN as f64
-                    && number < UPPER
-                    && number as i64 == integer,
-            )
-        }
-        MixedNumericMode::LuaJitBinary64 | MixedNumericMode::LuauBinary64 => {
-            const MAX_EXACT: i64 = 9_007_199_254_740_992;
-            let max_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MAX)
-            } else {
-                MAX_EXACT
-            };
-            let min_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MIN)
-            } else {
-                -MAX_EXACT
-            };
-            (integer >= min_integer && integer <= max_integer).then_some(integer as f64 == number)
-        }
-        MixedNumericMode::Unknown => {
-            // 候选拒绝[TargetConstraint]：目标未声明 Integer/Number 的共同数值域，不能证明比较结果。
-            None
-        }
-    }
-}
-
-fn mixed_integer_number_ordering(
-    mode: MixedNumericMode,
-    integer: i64,
-    number: f64,
-) -> Option<std::cmp::Ordering> {
-    if !number.is_finite() {
-        return None;
-    }
-    match mode {
-        MixedNumericMode::LuaJitBinary64 | MixedNumericMode::LuauBinary64 => {
-            const MAX_EXACT: i64 = 9_007_199_254_740_992;
-            let max_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MAX)
-            } else {
-                MAX_EXACT
-            };
-            let min_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MIN)
-            } else {
-                -MAX_EXACT
-            };
-            (integer >= min_integer && integer <= max_integer)
-                .then(|| (integer as f64).partial_cmp(&number))
-                .flatten()
-        }
-        MixedNumericMode::ExactIntegerFloat => {
-            const UPPER: f64 = 9_223_372_036_854_775_808.0;
-            const LOWER: f64 = -9_223_372_036_854_775_808.0;
-            if number >= UPPER {
-                return Some(std::cmp::Ordering::Less);
-            }
-            if number < LOWER {
-                return Some(std::cmp::Ordering::Greater);
-            }
-            let ceil = number.ceil();
-            if ceil >= UPPER {
-                return Some(std::cmp::Ordering::Less);
-            }
-            let floor = number.floor();
-            if floor < LOWER {
-                return Some(std::cmp::Ordering::Greater);
-            }
-            if integer < ceil as i64 {
-                Some(std::cmp::Ordering::Less)
-            } else if integer > floor as i64 {
-                Some(std::cmp::Ordering::Greater)
-            } else {
-                Some(std::cmp::Ordering::Equal)
-            }
-        }
-        MixedNumericMode::Unknown => {
-            // 候选拒绝[TargetConstraint]：目标未声明 Integer/Number 的共同数值域，不能证明比较结果。
-            None
-        }
     }
 }
 

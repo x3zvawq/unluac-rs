@@ -372,15 +372,19 @@ fn abstract_value_partial_cmp(
         (AbstractValue::Number(a), AbstractValue::Number(b)) => {
             f64::from_bits(*a).partial_cmp(&f64::from_bits(*b))
         }
-        (AbstractValue::Integer(a), AbstractValue::Number(b)) => {
-            safety.mixed_integer_number_ordering(*a, f64::from_bits(*b))
-        }
+        (AbstractValue::Integer(a), AbstractValue::Number(b)) => safety
+            .values()
+            .mixed_integer_number_ordering(*a, f64::from_bits(*b)),
         (AbstractValue::Number(a), AbstractValue::Integer(b)) => safety
+            .values()
             .mixed_integer_number_ordering(*b, f64::from_bits(*a))
             .map(|o| o.reverse()),
         (AbstractValue::String(a), AbstractValue::String(b)) => {
             // 候选拒绝[SemanticBarrier:Locale]：PUC Lua 的字符串顺序依赖运行时 `LC_COLLATE`，抽象域不能用固定字节序验证候选（regress_392）。
-            safety.literal_string_order_is_binary().then(|| a.cmp(b))
+            safety
+                .values()
+                .literal_string_order_is_binary()
+                .then(|| a.cmp(b))
         }
         (AbstractValue::Int64(a), AbstractValue::Int64(b)) => Some(a.cmp(b)),
         (AbstractValue::UInt64(a), AbstractValue::UInt64(b)) => Some(a.cmp(b)),
@@ -405,9 +409,9 @@ fn abstract_value_eq(
             Some(f64::from_bits(*lhs) == f64::from_bits(*rhs))
         }
         (AbstractValue::Integer(integer), AbstractValue::Number(number))
-        | (AbstractValue::Number(number), AbstractValue::Integer(integer)) => {
-            safety.mixed_integer_number_equal(*integer, f64::from_bits(*number))
-        }
+        | (AbstractValue::Number(number), AbstractValue::Integer(integer)) => safety
+            .values()
+            .mixed_integer_number_equal(*integer, f64::from_bits(*number)),
         _ => Some(lhs == rhs),
     }
 }
@@ -609,9 +613,11 @@ pub(super) fn build_validation_domain(
 
     for literal in literals {
         match literal {
-            AbstractValue::Integer(integer) if safety.distinguishes_integer_number_values() => {
+            AbstractValue::Integer(integer)
+                if safety.values().distinguishes_integer_number_values() =>
+            {
                 let number = *integer as f64;
-                if safety.mixed_integer_number_equal(*integer, number) == Some(true) {
+                if safety.values().mixed_integer_number_equal(*integer, number) == Some(true) {
                     domain.insert(AbstractValue::Number(number.to_bits()));
                 }
                 if *integer == 0 {
@@ -625,7 +631,7 @@ pub(super) fn build_validation_domain(
                     domain.insert(AbstractValue::Number(0.0f64.to_bits()));
                     domain.insert(AbstractValue::Number((-0.0f64).to_bits()));
                 }
-                if safety.distinguishes_integer_number_values()
+                if safety.values().distinguishes_integer_number_values()
                     && let Some(integer) = exact_integer_representation(number, safety)
                 {
                     domain.insert(AbstractValue::Integer(integer));
@@ -650,7 +656,7 @@ fn exact_integer_representation(number: f64, safety: HirExprSafety) -> Option<i6
     }
     // 边界和整数性已在上面证明；最终 equality 复核同时排除 binary64 无法精确承载的整数。
     let integer = number as i64;
-    (safety.mixed_integer_number_equal(integer, number) == Some(true)).then_some(integer)
+    (safety.values().mixed_integer_number_equal(integer, number) == Some(true)).then_some(integer)
 }
 
 fn collect_literals_from_target(

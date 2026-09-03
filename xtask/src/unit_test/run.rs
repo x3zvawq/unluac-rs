@@ -16,8 +16,7 @@ where
     let options = parse_args(args)?;
     let root = workspace_root()?;
 
-    build_unit_case_runner(&root)?;
-    let runner = unit_case_runner_path(&root);
+    let runner = build_unit_case_runner(&root)?;
     let cases = list_unit_cases(&root, &runner)?;
     let cases = cases
         .into_iter()

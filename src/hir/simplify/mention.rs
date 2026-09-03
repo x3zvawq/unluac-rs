@@ -11,7 +11,7 @@ use crate::hir::common::{
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use super::visit::{HirVisitor, visit_block, visit_expr, visit_proto, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_block, visit_expr, visit_proto, visit_stmts};
 
 pub(super) fn stmts_mention_local(stmts: &[HirStmt], local: LocalId) -> bool {
     LocalMentionCollector::mentions_in_stmts(stmts, local)

@@ -167,7 +167,7 @@ impl FunctionVerifier {
                     {
                         return Err(AstLowerError::DuplicateGotoLabel {
                             function: self.function,
-                            label: label.id.index(),
+                            label: label.id,
                         });
                     }
                 }
@@ -250,12 +250,12 @@ impl FunctionVerifier {
                     .copied()
                     .ok_or(AstLowerError::MissingGotoLabel {
                         function: self.function,
-                        label: target.index(),
+                        label: target,
                     })?;
             if !block_intervals.contains(label.block, source.block) {
                 return Err(AstLowerError::InvisibleGotoLabel {
                     function: self.function,
-                    label: target.index(),
+                    label: target,
                 });
             }
             if !scope_intervals.contains(label.scope, source.scope) {
@@ -267,13 +267,13 @@ impl FunctionVerifier {
                 return Err(if binding.to_be_closed {
                     AstLowerError::GotoEntersToBeClosedScope {
                         function: self.function,
-                        label: target.index(),
+                        label: target,
                         binding: binding.id,
                     }
                 } else {
                     AstLowerError::GotoEntersLocalScope {
                         function: self.function,
-                        label: target.index(),
+                        label: target,
                         binding: binding.id,
                     }
                 });

@@ -21,8 +21,8 @@ use crate::hir::common::{
 };
 use crate::hir::expr_safety::{HirExprSafety, expr_requires_ordered_snapshot};
 
-use super::super::visit::{HirVisitor, visit_expr};
 use super::eliminate_state::EliminationState;
+use crate::hir::visit::{HirVisitor, visit_expr};
 
 pub(super) fn assign_target_supports_direct_materialization(target: &HirLValue) -> bool {
     matches!(
@@ -52,12 +52,12 @@ pub(super) fn extract_generic_for(
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, Box<HirGenericFor>, bool) {
-    let (prefix, iterator, iterator_changed) =
-        extract_value_pack(generic_for.iterator, state, safety);
-    generic_for.iterator = iterator;
-    if iterator_changed {
-        generic_for.initializer_transaction = None;
-    }
+    let (prefix, iterator_changed) = generic_for.rewrite_iterator(|iterator| {
+        let (prefix, rewritten, changed) =
+            extract_value_pack(std::mem::take(iterator), state, safety);
+        *iterator = rewritten;
+        (prefix, changed)
+    });
     (prefix, generic_for, iterator_changed)
 }
 
@@ -67,6 +67,7 @@ pub(super) fn extract_call_expr(
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirCallExpr, bool) {
     let HirCallExpr {
+        argument_roots,
         callee,
         args,
         method,
@@ -83,6 +84,7 @@ pub(super) fn extract_call_expr(
     (
         prefix,
         HirCallExpr {
+            argument_roots,
             callee,
             args,
             method,
@@ -733,6 +735,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         None => None,
     };
     Some(HirCallExpr {
+        argument_roots: Vec::new(),
         callee,
         args: HirValuePack { fixed, tail },
         method: call.method,

@@ -68,9 +68,9 @@ pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement
             replace_temp_in_block(&mut numeric_for.body, temp, replacement);
         }
         HirStmt::GenericFor(generic_for) => {
-            if replace_temp_in_value_pack(&mut generic_for.iterator, temp, replacement) != 0 {
-                generic_for.initializer_transaction = None;
-            }
+            generic_for.rewrite_iterator(|iterator| {
+                replace_temp_in_value_pack(iterator, temp, replacement)
+            });
             replace_temp_in_block(&mut generic_for.body, temp, replacement);
         }
         HirStmt::Close(_)
@@ -138,10 +138,8 @@ pub(super) fn replace_temps_in_stmt(
                 + replace_temps_in_block(&mut numeric_for.body, replacements)
         }
         HirStmt::GenericFor(generic_for) => {
-            let iterator = replace_temps_in_value_pack(&mut generic_for.iterator, replacements);
-            if iterator != 0 {
-                generic_for.initializer_transaction = None;
-            }
+            let iterator = generic_for
+                .rewrite_iterator(|iterator| replace_temps_in_value_pack(iterator, replacements));
             iterator + replace_temps_in_block(&mut generic_for.body, replacements)
         }
         HirStmt::Block(block) => replace_temps_in_block(block, replacements),

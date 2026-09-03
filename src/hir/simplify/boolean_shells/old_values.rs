@@ -1,25 +1,23 @@
-//! 证明 dead local boolean shell 入口的旧值不承载可观察的 GC 生命周期。
+//! 在同一 HIR 控制流快照上证明死布尔壳的旧值与读取者生命周期。
 //!
-//! 分析只消费当前 HIR 已有的结构化控制流与 trusted home。每个状态分别跟踪候选 local
-//! 与 raw home 的 `GC-inert / 可承载资源 / 证明不完整`；分支合流保留任一路径上的资源
-//! 可能，循环对回边求有限不动点。
-//! 分析阶段只记录完整语句路径，验证结束后才一次性应用删除，避免边改边算让 reaching
-//! value 漂移。同 block 单调 forward goto 可直接跳到唯一 label；共享 `LexicalCfg` 会把
-//! 后置嵌套 island 的自含回环留给嵌套 analyzer，只在当前层存在跨层或回边 goto 时才把
-//! 该 block 从资源保守状态重新证明，避免一个非结构化区域停用整个 proto，也避免在线性
-//! HIR 上猜 predecessor。
-//! dead write 的读取证明消费共享 `HirFlowGraph` 的全 proto topology：label id 统一解析跨
-//! block goto，函数出口与未知控制流显式分流，for initializer、dispatch 和每轮 binding write
-//! 各占独立节点；本 pass 只在其上附加 binding/home 的 gen-kill 并求后向 may-live 不动点。若
-//! proto 没有任何 dead-shell 形状，则不构建这份 owner-wide 图与不动点；home-free temp
-//! 虽然不会进入 local/raw-home 集合，仍然是需要分析的真实候选。
+//! 每个候选 binding/raw home 分别跟踪 `GC-inert / 可承载资源 / 证明不完整`。旧值分类、
+//! closure/TBC 观察者和后向 may-live 共用一份 `HirFlowGraph`：label/goto、回边与不可达
+//! 分支由图统一解释，本文件仅提供各自的有限单调域和 typed event 写入/观察语义。
+//! 例如 `x = nil; goto L; ...; ::L:: if c then x=true else x=false end`，旧值沿实际
+//! 到达 L 的路径合流；若任一回边带入对象，shell 必须保留释放旧根的写入职责。
+//! 所有不动点完成后才按当前语句路径签发删除计划，不在中间迭代批准删除或重建控制边。
+//!
+//! for initializer、dispatch 和每轮 binding write 各占独立节点；最终 dispatch 的 raw
+//! result 写入也更新 home 分类，不能被源码零轮出口或成功 binding 写入掩盖。参数入口
+//! home 集合直接来自 promotion，不按 ParamId 重建槽位。没有 shell 形状则不构建图。
+//! home-free temp 虽不进入 local/raw-home 集合，仍是需要读取证明的真实候选。
+//!
 //! 节点先 gen RHS、条件与左值地址读取，再 kill 精确 local/temp 或唯一 possible-home 写入。
-//! closure payload 另做前向 reaching：Temp/Local/Param holder 的确定覆写 kill 旧 instance，
-//! 分支与回边按 may payload 合流；只有当前 reaching closure 被调用、返回或写到外部位置时，
-//! 其 ByReference cell 才进入 observer。ByValue capture 仍在创建点读取 snapshot。TBC 同样
-//! 在标记点激活 raw home，并由 `Close`/函数出口读取后按 `from_reg` 结束。这样 capture/TBC
-//! 的持久观察不会退化成全 proto blanket guard。
-//! 值是否 GC-inert 由外层传入的目标方言安全上下文判定，避免 reaching class 与删除证明漂移。
+//! closure payload 前向 reaching 使用 Temp/Local/Param holder 的确定覆写 kill 旧 instance；
+//! 只有当前 reaching closure 被调用、返回或写到外部位置时，其 ByReference cell 才进入
+//! observer。ByValue capture 在创建点读取 snapshot。TBC 在标记点激活 home，并由 Close/
+//! 函数出口读取后结束。引用捕获和资源协议不会退化成全 proto blanket guard。
+//! 值是否 GC-inert 统一消费目标方言安全上下文；本文件不从底层 opcode 重新推断根协议。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,12 +33,10 @@ use super::{
     possible_home_relation,
 };
 use crate::hir::simplify::expr_facts::expr_truthiness;
-use crate::hir::simplify::label_refs::count_label_references;
 use crate::hir::simplify::lexical_cfg::{
-    HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings, LexicalCfg,
+    HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
 };
-use crate::hir::simplify::temp_touch::stmt_contains_nested_nonlocal_control;
-use crate::hir::simplify::visit::{self, HirVisitor};
+use crate::hir::visit::{self, HirVisitor};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PathComponent {
@@ -80,14 +76,20 @@ pub(super) struct ShellArmLiveOut {
     pub(super) else_arm: LiveBindingState,
 }
 
-#[derive(Clone, Debug, Default)]
-struct LiveAfterFacts {
-    shells: BTreeMap<StmtPath, ShellArmLiveOut>,
+#[derive(Clone, Debug)]
+struct ShellFlowSite<'a> {
+    stmt: &'a HirStmt,
+    node: usize,
+    live_after: ShellArmLiveOut,
+}
+
+#[derive(Default)]
+struct ShellFlowFacts<'a> {
+    shells: BTreeMap<StmtPath, ShellFlowSite<'a>>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct LiveCfgNode {
-    successors: BTreeSet<usize>,
     reads: LiveBindingState,
     writes: LiveBindingState,
     escaped_gen: ClosurePayloadSeed,
@@ -145,29 +147,14 @@ impl ActiveObserverState {
     }
 }
 
-impl LiveAfterFacts {
+impl<'a> ShellFlowFacts<'a> {
     fn collect(
-        proto: &HirProto,
+        proto: &'a HirProto,
+        graph: &HirFlowGraph<'a>,
         promotion_facts: &ProtoPromotionFacts,
         safety: HirExprSafety,
     ) -> Self {
-        let Ok(graph) = HirFlowGraph::for_proto(&proto.body, safety) else {
-            // label identity 不唯一时共享 topology 无法给出唯一事实；空结果会令所有候选
-            // 保守拒绝删除，而不是在 consumer 内另建一套猜测边。
-            return Self::default();
-        };
-        let mut nodes = graph
-            .nodes()
-            .iter()
-            .map(|node| LiveCfgNode {
-                successors: node
-                    .successors()
-                    .iter()
-                    .map(|successor| successor.index())
-                    .collect(),
-                ..LiveCfgNode::default()
-            })
-            .collect::<Vec<_>>();
+        let mut nodes = vec![LiveCfgNode::default(); graph.nodes().len()];
         let mut stmt_nodes = BTreeMap::new();
         for (id, flow_node) in graph.nodes().iter().enumerate() {
             match flow_node.kind() {
@@ -235,9 +222,17 @@ impl LiveAfterFacts {
             }
         }
 
-        let entry = graph.entry().index();
-        let active_observers = solve_active_observers(&nodes, entry);
+        let active_observers = graph.solve_forward(
+            ActiveObserverState::default(),
+            |current, incoming| {
+                let before = current.clone();
+                current.union_with(incoming);
+                *current != before
+            },
+            |id, _, state| *state = state.after(&nodes[id.index()]),
+        );
         for (id, active) in active_observers.into_iter().enumerate() {
+            let Some(active) = active else { continue };
             let is_function_exit =
                 matches!(graph.nodes()[id].kind(), HirFlowNodeKind::FunctionExit);
             if nodes[id].observes_captures || is_function_exit {
@@ -262,14 +257,26 @@ impl LiveAfterFacts {
                     .extend(active.tbc_homes.iter().copied());
             }
         }
-        let live_out = solve_live_out(&nodes);
+        let live_out = graph
+            .solve_backward(
+                LiveBindingState::default(),
+                |current, incoming| {
+                    let before = current.clone();
+                    current.union_with(incoming);
+                    *current != before
+                },
+                |id, _, state| {
+                    let node = &nodes[id.index()];
+                    *state = std::mem::take(state).without_writes(&node.writes);
+                    state.union_with(&node.reads);
+                },
+            )
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect::<Vec<_>>();
         let mut shells = BTreeMap::new();
         collect_shell_live_outs(&proto.body, &[], &stmt_nodes, &live_out, &mut shells);
         Self { shells }
-    }
-
-    fn shell(&self, path: &StmtPath) -> Option<&ShellArmLiveOut> {
-        self.shells.get(path)
     }
 }
 
@@ -1063,64 +1070,12 @@ fn record_binding_read(
     }
 }
 
-fn solve_active_observers(nodes: &[LiveCfgNode], entry: usize) -> Vec<ActiveObserverState> {
-    let mut predecessors = vec![BTreeSet::new(); nodes.len()];
-    for (source, node) in nodes.iter().enumerate() {
-        for successor in &node.successors {
-            predecessors[*successor].insert(source);
-        }
-    }
-    let mut active_in = vec![ActiveObserverState::default(); nodes.len()];
-    let mut active_out = vec![ActiveObserverState::default(); nodes.len()];
-    loop {
-        let mut changed = false;
-        for (id, node) in nodes.iter().enumerate() {
-            let mut next_in = ActiveObserverState::default();
-            for predecessor in &predecessors[id] {
-                next_in.union_with(&active_out[*predecessor]);
-            }
-            if id != entry && predecessors[id].is_empty() {
-                continue;
-            }
-            let next_out = next_in.after(node);
-            changed |= next_in != active_in[id] || next_out != active_out[id];
-            active_in[id] = next_in;
-            active_out[id] = next_out;
-        }
-        if !changed {
-            return active_in;
-        }
-    }
-}
-
-fn solve_live_out(nodes: &[LiveCfgNode]) -> Vec<LiveBindingState> {
-    let mut live_in = vec![LiveBindingState::default(); nodes.len()];
-    let mut live_out = vec![LiveBindingState::default(); nodes.len()];
-    loop {
-        let mut changed = false;
-        for (index, node) in nodes.iter().enumerate().rev() {
-            let mut next_out = LiveBindingState::default();
-            for successor in &node.successors {
-                next_out.union_with(&live_in[*successor]);
-            }
-            let mut next_in = next_out.clone().without_writes(&node.writes);
-            next_in.union_with(&node.reads);
-            changed |= next_out != live_out[index] || next_in != live_in[index];
-            live_out[index] = next_out;
-            live_in[index] = next_in;
-        }
-        if !changed {
-            return live_out;
-        }
-    }
-}
-
-fn collect_shell_live_outs(
-    block: &HirBlock,
+fn collect_shell_live_outs<'a>(
+    block: &'a HirBlock,
     prefix: &[PathComponent],
     stmt_nodes: &BTreeMap<*const HirStmt, usize>,
     live_out: &[LiveBindingState],
-    shells: &mut BTreeMap<StmtPath, ShellArmLiveOut>,
+    shells: &mut BTreeMap<StmtPath, ShellFlowSite<'a>>,
 ) {
     for (index, stmt) in block.stmts.iter().enumerate() {
         let mut path = prefix.to_vec();
@@ -1135,9 +1090,15 @@ fn collect_shell_live_outs(
                     let else_stmt = &else_block.stmts[0];
                     shells.insert(
                         path.clone(),
-                        ShellArmLiveOut {
-                            then_arm: live_out[stmt_nodes[&std::ptr::from_ref(then_stmt)]].clone(),
-                            else_arm: live_out[stmt_nodes[&std::ptr::from_ref(else_stmt)]].clone(),
+                        ShellFlowSite {
+                            stmt,
+                            node: stmt_nodes[&std::ptr::from_ref(stmt)],
+                            live_after: ShellArmLiveOut {
+                                then_arm: live_out[stmt_nodes[&std::ptr::from_ref(then_stmt)]]
+                                    .clone(),
+                                else_arm: live_out[stmt_nodes[&std::ptr::from_ref(else_stmt)]]
+                                    .clone(),
+                            },
                         },
                     );
                 }
@@ -1194,12 +1155,12 @@ fn collect_shell_live_outs(
     }
 }
 
-fn collect_body_shell_live_outs(
-    body: &HirBlock,
+fn collect_body_shell_live_outs<'a>(
+    body: &'a HirBlock,
     path: &StmtPath,
     stmt_nodes: &BTreeMap<*const HirStmt, usize>,
     live_out: &[LiveBindingState],
-    shells: &mut BTreeMap<StmtPath, ShellArmLiveOut>,
+    shells: &mut BTreeMap<StmtPath, ShellFlowSite<'a>>,
 ) {
     let mut prefix = path.clone();
     prefix.push(PathComponent::Body);
@@ -1209,7 +1170,6 @@ fn collect_body_shell_live_outs(
 #[derive(Default)]
 pub(super) struct DeadShellPlan {
     removable: BTreeSet<StmtPath>,
-    not_removable: BTreeSet<StmtPath>,
 }
 
 impl DeadShellPlan {
@@ -1230,27 +1190,51 @@ impl DeadShellPlan {
         if !candidates.has_shell {
             return Self::default();
         }
-        let live_after = LiveAfterFacts::collect(proto, promotion_facts, safety);
-        let owner_label_refs = count_label_references(&proto.body.stmts);
-
+        let Ok(graph) = HirFlowGraph::for_proto(&proto.body, safety) else {
+            // 分析停用[SemanticBarrier:ControlFlow]：同一个 label identity 若有多个 owner，
+            // 不能签发唯一的 reaching/observer 证明，也不能在 consumer 内猜测目标。
+            return Self::default();
+        };
+        let shell_facts = ShellFlowFacts::collect(proto, &graph, promotion_facts, safety);
         let parameter_homes = proto
             .params
             .iter()
-            .map(|param| HomeSlotKey::new(param.index(), 0))
+            .flat_map(|param| promotion_facts.complete_param_home_slots(*param))
             .collect::<BTreeSet<_>>();
         let initial_state = OldValueState::initial(&candidates, &parameter_homes);
-        let mut analyzer = OldValueAnalyzer {
-            facts,
+        let transfer = OldValueTransfer {
             promotion_facts,
             safety,
             candidate_locals: candidates.locals,
             candidate_homes: candidates.homes,
-            live_after,
-            owner_label_refs: &owner_label_refs,
-            plan: Self::default(),
         };
-        let _ = analyzer.analyze_block(&proto.body, &[], Some(initial_state));
-        analyzer.plan
+        let entries = graph.solve_forward(
+            initial_state,
+            |current, incoming| {
+                let merged = join_states(current.clone(), incoming.clone());
+                let changed = *current != merged;
+                *current = merged;
+                changed
+            },
+            |_, kind, state| *state = transfer.apply(kind, std::mem::take(state)),
+        );
+        let removable = shell_facts
+            .shells
+            .into_iter()
+            .filter_map(|(path, site)| {
+                let old_values = entries[site.node].as_ref()?.as_facts();
+                super::removable_dead_materialization_shell(
+                    site.stmt,
+                    facts,
+                    None,
+                    &old_values,
+                    &site.live_after,
+                    safety,
+                )
+                .then_some(path)
+            })
+            .collect();
+        Self { removable }
     }
 
     pub(super) fn apply(self, block: &mut HirBlock) -> bool {
@@ -1388,389 +1372,60 @@ impl OldValueState {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct InertFlow {
-    fallthrough: Option<OldValueState>,
-    breaks: Option<OldValueState>,
-    continues: Option<OldValueState>,
-}
-
-impl InertFlow {
-    fn fallthrough(state: Option<OldValueState>) -> Self {
-        Self {
-            fallthrough: state,
-            ..Self::default()
-        }
-    }
-}
-
-struct OldValueAnalyzer<'a> {
-    facts: &'a BooleanShellFacts,
+/// 在共享 CFG typed event 上更新当前候选 binding/home 的旧值分类。
+/// 控制边、循环收敛和不可达状态均由图管理；这里只解释实际写入。
+struct OldValueTransfer<'a> {
     promotion_facts: &'a ProtoPromotionFacts,
     safety: HirExprSafety,
     candidate_locals: BTreeSet<LocalId>,
     candidate_homes: BTreeSet<HomeSlotKey>,
-    live_after: LiveAfterFacts,
-    owner_label_refs: &'a BTreeMap<crate::hir::HirLabelId, usize>,
-    plan: DeadShellPlan,
 }
 
-impl OldValueAnalyzer<'_> {
-    fn analyze_block(
-        &mut self,
-        block: &HirBlock,
-        prefix: &[PathComponent],
-        mut state: Option<OldValueState>,
-    ) -> InertFlow {
-        let Ok(cfg) = LexicalCfg::analyze(&block.stmts, self.owner_label_refs, self.safety) else {
-            return self.analyze_unstructured_block(block, prefix);
-        };
-        let Some(label_indices) = cfg.linear_forward_labels() else {
-            return self.analyze_unstructured_block(block, prefix);
-        };
-        let mut breaks = None;
-        let mut continues = None;
-        let mut index = 0;
-        while let Some(stmt) = block.stmts.get(index) {
-            if state.is_none() {
-                break;
+impl OldValueTransfer<'_> {
+    fn apply(&self, kind: HirFlowNodeKind<'_>, mut state: OldValueState) -> OldValueState {
+        match kind {
+            HirFlowNodeKind::Stmt(HirStmt::LocalDecl(decl)) => self.apply_local_decl(decl, state),
+            HirFlowNodeKind::Stmt(HirStmt::Assign(assign)) => self.apply_assignment(assign, state),
+            HirFlowNodeKind::Stmt(HirStmt::GlobalDecl(_)) => {
+                // 该语法节点隐藏 call-result/probe 对 VM scratch 的写入；词法 local
+                // 仍独立，raw home 在协议尚未发布精确写事件时不能延续 GC-inert 正证明。
+                state.obscure_physical_homes()
             }
-            if let HirStmt::Goto(goto) = stmt {
-                index = *label_indices
-                    .get(&goto.target)
-                    .expect("validated forward goto must retain its local label");
-                continue;
+            HirFlowNodeKind::ForBinding(HirForBindings::Numeric(binding)) => {
+                self.write_local_binding(binding, OldValueClass::GcInert, state)
             }
-            let mut path = prefix.to_vec();
-            path.push(PathComponent::Stmt(index));
-            let flow = self.analyze_stmt(stmt, &path, state.expect("reachable state checked"));
-            state = flow.fallthrough;
-            breaks = join_optional_states(breaks, flow.breaks);
-            continues = join_optional_states(continues, flow.continues);
-            index += 1;
-        }
-        InertFlow {
-            fallthrough: state,
-            breaks,
-            continues,
-        }
-    }
-
-    fn analyze_unstructured_block(
-        &mut self,
-        block: &HirBlock,
-        prefix: &[PathComponent],
-    ) -> InertFlow {
-        let conservative = OldValueState {
-            local_classes: self
-                .candidate_locals
-                .iter()
-                .copied()
-                .map(|local| (local, OldValueClass::MayCarryResource))
-                .collect(),
-            home_classes: self
-                .candidate_homes
-                .iter()
-                .copied()
-                .map(|home| (home, OldValueClass::MayCarryResource))
-                .collect(),
-        };
-        let mut state = Some(conservative.clone());
-        for (index, stmt) in block.stmts.iter().enumerate() {
-            let mut path = prefix.to_vec();
-            path.push(PathComponent::Stmt(index));
-            if stmt_contains_nested_nonlocal_control(stmt) {
-                self.analyze_unstructured_children(stmt, &path);
-                // 分析停用[SemanticBarrier:ControlFlow]：label/goto 可绕过此前写入，回边还
-                // 会带入上一轮值；`::L:: shell(x); x = {}; goto L` 的第二轮旧值可承载资源。
-                state = Some(conservative.clone());
-                continue;
-            }
-            let Some(incoming) = state.take() else {
-                continue;
-            };
-            state = self.analyze_stmt(stmt, &path, incoming).fallthrough;
-        }
-        InertFlow {
-            fallthrough: Some(conservative.clone()),
-            breaks: Some(conservative.clone()),
-            continues: Some(conservative),
-        }
-    }
-
-    fn analyze_unstructured_children(&mut self, stmt: &HirStmt, path: &StmtPath) {
-        match stmt {
-            HirStmt::If(if_stmt) => {
-                let mut then_prefix = path.clone();
-                then_prefix.push(PathComponent::Then);
-                let _ = self.analyze_unstructured_block(&if_stmt.then_block, &then_prefix);
-                if let Some(else_block) = &if_stmt.else_block {
-                    let mut else_prefix = path.clone();
-                    else_prefix.push(PathComponent::Else);
-                    let _ = self.analyze_unstructured_block(else_block, &else_prefix);
-                }
-            }
-            HirStmt::While(while_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                let _ = self.analyze_unstructured_block(&while_stmt.body, &body_prefix);
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                let _ = self.analyze_unstructured_block(&repeat_stmt.body, &body_prefix);
-            }
-            HirStmt::NumericFor(for_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                let _ = self.analyze_unstructured_block(&for_stmt.body, &body_prefix);
-            }
-            HirStmt::GenericFor(for_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                let _ = self.analyze_unstructured_block(&for_stmt.body, &body_prefix);
-            }
-            HirStmt::Block(nested) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                let _ = self.analyze_unstructured_block(nested, &body_prefix);
-            }
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
-    }
-
-    fn analyze_stmt(&mut self, stmt: &HirStmt, path: &StmtPath, state: OldValueState) -> InertFlow {
-        match stmt {
-            HirStmt::LocalDecl(decl) => {
-                InertFlow::fallthrough(Some(self.apply_local_decl(decl, state)))
-            }
-            HirStmt::Assign(assign) => {
-                InertFlow::fallthrough(Some(self.apply_assignment(assign, state)))
-            }
-            HirStmt::If(if_stmt) => {
-                let old_values = state.as_facts();
-                let removable = self.live_after.shell(path).is_some_and(|live_after| {
-                    super::removable_dead_materialization_shell(
-                        stmt,
-                        self.facts,
-                        None,
-                        &old_values,
-                        live_after,
-                        self.safety,
-                    )
-                });
-                if matches!(
-                    stmt,
-                    HirStmt::If(if_stmt)
-                        if if_stmt.else_block.as_ref().is_some_and(|else_block| {
-                            super::single_fixed_assign_pattern(&if_stmt.then_block).is_some()
-                                && super::single_fixed_assign_pattern(else_block).is_some()
-                        })
-                ) {
-                    self.plan.observe(path, removable);
-                }
-
-                let mut then_prefix = path.clone();
-                then_prefix.push(PathComponent::Then);
-                let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
-                    InertFlow::default()
-                } else {
-                    self.analyze_block(&if_stmt.then_block, &then_prefix, Some(state.clone()))
-                };
-                let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
-                    InertFlow::default()
-                } else if let Some(else_block) = &if_stmt.else_block {
-                    let mut else_prefix = path.clone();
-                    else_prefix.push(PathComponent::Else);
-                    self.analyze_block(else_block, &else_prefix, Some(state))
-                } else {
-                    InertFlow::fallthrough(Some(state))
-                };
-                join_flows(then_flow, else_flow)
-            }
-            HirStmt::Block(block) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_block(block, &body_prefix, Some(state))
-            }
-            HirStmt::While(while_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_while(&while_stmt.body, &while_stmt.cond, &body_prefix, state)
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_repeat(&repeat_stmt.body, &repeat_stmt.cond, &body_prefix, state)
-            }
-            HirStmt::NumericFor(for_stmt) => {
-                let zero_exit = state.clone();
-                let body_state =
-                    self.write_local_binding(for_stmt.binding, OldValueClass::GcInert, state);
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_zero_or_more(
-                    &for_stmt.body,
-                    &body_prefix,
-                    zero_exit,
-                    body_state,
-                    &[(for_stmt.binding, OldValueClass::GcInert)],
-                )
-            }
-            HirStmt::GenericFor(for_stmt) => {
-                let zero_exit = state.clone();
-                let mut body_state = state;
-                let binding_values = for_stmt
-                    .bindings
-                    .iter()
-                    .copied()
-                    .map(|binding| (binding, OldValueClass::MayCarryResource))
-                    .collect::<Vec<_>>();
-                for (binding, value_class) in &binding_values {
-                    body_state = self.write_local_binding(*binding, *value_class, body_state);
-                }
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_zero_or_more(
-                    &for_stmt.body,
-                    &body_prefix,
-                    zero_exit,
-                    body_state,
-                    &binding_values,
-                )
-            }
-            HirStmt::Return(_) => InertFlow::default(),
-            HirStmt::Goto(_) => {
-                unreachable!("block analyzer must consume validated forward gotos")
-            }
-            HirStmt::Break => InertFlow {
-                breaks: Some(state),
-                ..InertFlow::default()
-            },
-            HirStmt::Continue => InertFlow {
-                continues: Some(state),
-                ..InertFlow::default()
-            },
-            HirStmt::GlobalDecl(_) => {
-                // The syntax node hides call-result/probe writes to raw VM slots, so home facts
-                // cannot cross it. Lexical locals remain distinct bindings; reference-captured
-                // locals are already rejected by the enclosing boolean-shell facts.
-                InertFlow::fallthrough(Some(state.obscure_physical_homes()))
-            }
-            HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Label(_) => InertFlow::fallthrough(Some(state)),
-        }
-    }
-
-    fn analyze_while(
-        &mut self,
-        body: &HirBlock,
-        condition: &HirExpr,
-        body_prefix: &[PathComponent],
-        incoming: OldValueState,
-    ) -> InertFlow {
-        let truthiness = expr_truthiness(condition, self.safety);
-        let mut entries = incoming.clone();
-        let mut break_exits = None;
-        loop {
-            let body_flow = if truthiness == Some(false) {
-                InertFlow::default()
-            } else {
-                self.analyze_block(body, body_prefix, Some(entries.clone()))
-            };
-            let back_edges = join_optional_states(body_flow.fallthrough, body_flow.continues);
-            let next_entries = join_optional_states(Some(incoming.clone()), back_edges)
-                .expect("loop entry always includes incoming state");
-            let next_break_exits = join_optional_states(break_exits.clone(), body_flow.breaks);
-            if next_entries == entries && next_break_exits == break_exits {
-                let normal_exits = (truthiness != Some(true)).then_some(entries);
-                return InertFlow::fallthrough(join_optional_states(normal_exits, break_exits));
-            }
-            entries = next_entries;
-            break_exits = next_break_exits;
-        }
-    }
-
-    fn analyze_repeat(
-        &mut self,
-        body: &HirBlock,
-        condition: &HirExpr,
-        body_prefix: &[PathComponent],
-        incoming: OldValueState,
-    ) -> InertFlow {
-        let truthiness = expr_truthiness(condition, self.safety);
-        let mut entries = incoming.clone();
-        let mut break_exits = None;
-        loop {
-            let body_flow = self.analyze_block(body, body_prefix, Some(entries.clone()));
-            let condition_states = join_optional_states(body_flow.fallthrough, body_flow.continues);
-            let back_edges = if truthiness == Some(true) {
-                None
-            } else {
-                condition_states.clone()
-            };
-            let next_entries = join_optional_states(Some(incoming.clone()), back_edges)
-                .expect("repeat entry always includes incoming state");
-            let next_break_exits = join_optional_states(break_exits.clone(), body_flow.breaks);
-            if next_entries == entries && next_break_exits == break_exits {
-                let normal_exits = if truthiness == Some(false) {
-                    None
-                } else {
-                    condition_states
-                };
-                return InertFlow::fallthrough(join_optional_states(normal_exits, break_exits));
-            }
-            entries = next_entries;
-            break_exits = next_break_exits;
-        }
-    }
-
-    fn analyze_zero_or_more(
-        &mut self,
-        body: &HirBlock,
-        body_prefix: &[PathComponent],
-        zero_exit: OldValueState,
-        initial_body_entry: OldValueState,
-        bindings: &[(LocalId, OldValueClass)],
-    ) -> InertFlow {
-        let mut entries = initial_body_entry.clone();
-        let mut break_exits = None;
-        loop {
-            let body_flow = self.analyze_block(body, body_prefix, Some(entries.clone()));
-            let iteration_exits = join_optional_states(body_flow.fallthrough, body_flow.continues);
-            let back_edges = iteration_exits.clone().map(|mut state| {
-                for (binding, value_class) in bindings {
-                    state = self.write_local_binding(*binding, *value_class, state);
+            HirFlowNodeKind::ForBinding(HirForBindings::Generic(flow)) => {
+                for binding in &flow.for_stmt().bindings {
+                    state =
+                        self.write_local_binding(*binding, OldValueClass::MayCarryResource, state);
                 }
                 state
-            });
-            let next_entries = join_optional_states(Some(initial_body_entry.clone()), back_edges)
-                .expect("for body entry always includes first iteration");
-            let next_break_exits = join_optional_states(break_exits.clone(), body_flow.breaks);
-            if next_entries == entries && next_break_exits == break_exits {
-                return InertFlow::fallthrough(join_optional_states(
-                    join_optional_states(Some(zero_exit), iteration_exits),
-                    break_exits,
-                ));
             }
-            entries = next_entries;
-            break_exits = next_break_exits;
+            HirFlowNodeKind::GenericForDispatch(flow) => {
+                // 最终一次返回 nil 也会执行 dispatch；result home 写入不能等价为仅在
+                // 进入 body 后执行的源码 binding 写入。消费 Structure 冻结的 def 身份。
+                for result in &flow.for_stmt().dispatch_results {
+                    state = self.write_target(
+                        &HirLValue::Temp(result.result_def),
+                        OldValueClass::MayCarryResource,
+                        state,
+                    );
+                }
+                state
+            }
+            HirFlowNodeKind::UnknownControl => {
+                state
+                    .local_classes
+                    .values_mut()
+                    .for_each(|class| *class = OldValueClass::MayCarryResource);
+                state.obscure_physical_homes()
+            }
+            HirFlowNodeKind::Stmt(_)
+            | HirFlowNodeKind::GenericForInit(_)
+            | HirFlowNodeKind::RepeatCondition(_)
+            | HirFlowNodeKind::NumericForDispatch
+            | HirFlowNodeKind::Exit
+            | HirFlowNodeKind::FunctionExit => state,
         }
     }
 
@@ -1894,17 +1549,6 @@ impl OldValueAnalyzer<'_> {
     }
 }
 
-impl DeadShellPlan {
-    fn observe(&mut self, path: &StmtPath, removable: bool) {
-        if removable && !self.not_removable.contains(path) {
-            self.removable.insert(path.clone());
-        } else if !removable {
-            self.removable.remove(path);
-            self.not_removable.insert(path.clone());
-        }
-    }
-}
-
 fn assigned_value_class(
     assign: &HirAssign,
     target_index: usize,
@@ -2006,25 +1650,6 @@ fn join_value_classes(left: OldValueClass, right: OldValueClass) -> OldValueClas
             OldValueClass::MayCarryResource
         }
         (OldValueClass::Unknown, _) | (_, OldValueClass::Unknown) => OldValueClass::Unknown,
-    }
-}
-
-fn join_optional_states(
-    left: Option<OldValueState>,
-    right: Option<OldValueState>,
-) -> Option<OldValueState> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(join_states(left, right)),
-        (Some(state), None) | (None, Some(state)) => Some(state),
-        (None, None) => None,
-    }
-}
-
-fn join_flows(left: InertFlow, right: InertFlow) -> InertFlow {
-    InertFlow {
-        fallthrough: join_optional_states(left.fallthrough, right.fallthrough),
-        breaks: join_optional_states(left.breaks, right.breaks),
-        continues: join_optional_states(left.continues, right.continues),
     }
 }
 

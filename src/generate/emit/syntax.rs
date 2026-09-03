@@ -74,7 +74,7 @@ pub(super) fn common_global_attr(bindings: &[AstGlobalBinding]) -> Option<AstGlo
 }
 
 pub(super) fn format_label_name(label: AstLabelId) -> String {
-    format!("L{}", label.index())
+    label.to_string()
 }
 
 pub(super) fn format_number(value: f64, preserve_integral_float: bool) -> String {

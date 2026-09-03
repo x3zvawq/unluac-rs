@@ -21,7 +21,7 @@ use super::super::label_refs::count_label_references;
 use super::super::lexical_cfg::LexicalCfg;
 use super::super::mention::ReferenceCapturedBindings;
 use super::super::temp_touch::stmt_contains_nested_nonlocal_control;
-use super::super::visit::{self, HirVisitor};
+use crate::hir::visit::{self, HirVisitor};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct NilPathState {

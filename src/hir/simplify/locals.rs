@@ -56,7 +56,7 @@ use super::mention::{
 };
 use super::root_lifetimes::{
     CallRootLifetimeIndices, LookupGcRootLifetimeIndices, collect_call_result_local_roots,
-    collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
+    collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes, stmt_has_argument_root_handoff,
 };
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
@@ -981,9 +981,31 @@ fn collect_plans(
                     .get(&(root, root_home))
                     .copied()
             });
-        let force_physical_root_local = call_root_lifetimes.is_root(decl_index)
+        let force_physical_root_local = group_has_physical_root
+            || call_root_lifetimes.is_root(decl_index)
             || lookup_gc_root_lifetimes.is_root(decl_index)
             || preceding_physical_root_local.is_some();
+        if sticky_local.is_none()
+            && debug_local.is_none()
+            && !force_physical_root_local
+            && group.len() == 1
+            && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+            && facts.is_direct_table_seed_temp(root_temp)
+            && facts.overwrites_entry_nil(root_temp)
+            && matches!(block.stmts.get(decl_index + 1), Some(HirStmt::TableSetList(batch))
+                if batch.base == HirExpr::TempRef(root_temp) && batch.values.tail.is_none())
+            && facts.temp_is_transferred_call_argument(root_temp)
+            && touching_stmt_indices
+                .iter()
+                .filter(|index| stmt_has_argument_root_handoff(&block.stmts[**index], root_temp))
+                .count()
+                == 1
+        {
+            // 候选拒绝[LayerBoundary]：table-constructors 的相邻 fixed-batch owner
+            // 已有入口 seed 与当前参数交接端点，先保留原 identity 供其消费。非相邻/
+            // open 区域不冒用该 owner 的能力；这里不重建字段或原始调用协议。
+            continue;
+        }
         let reusable_local = sticky_local
             .or(debug_local)
             .or(preceding_physical_root_local)
@@ -1905,10 +1927,8 @@ fn rewrite_stmt(
             start_changed || limit_changed || step_changed || body_changed
         }
         HirStmt::GenericFor(generic_for) => {
-            let iterator_changed = rewrite::value_pack(&mut generic_for.iterator, mapping.as_ref());
-            if iterator_changed {
-                generic_for.initializer_transaction = None;
-            }
+            let iterator_changed = generic_for
+                .rewrite_iterator(|iterator| rewrite::value_pack(iterator, mapping.as_ref()));
             let body_changed = promote_block(
                 ctx,
                 &mut generic_for.body,
@@ -1981,6 +2001,7 @@ mod tests {
 
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,

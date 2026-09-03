@@ -417,13 +417,13 @@ mod tests {
 
     fn goto(label: usize) -> AstStmt {
         AstStmt::Goto(Box::new(AstGoto {
-            target: AstLabelId(label),
+            target: AstLabelId::Synthetic(label),
         }))
     }
 
     fn label(label: usize) -> AstStmt {
         AstStmt::Label(Box::new(AstLabel {
-            id: AstLabelId(label),
+            id: AstLabelId::Synthetic(label),
         }))
     }
 

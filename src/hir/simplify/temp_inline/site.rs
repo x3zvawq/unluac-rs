@@ -10,8 +10,8 @@
 //! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
 
 use super::super::decision::assert_valid_decision;
-use super::super::visit::{HirVisitor, visit_stmts};
 use super::*;
+use crate::hir::visit::{HirVisitor, visit_stmts};
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
     if let HirStmt::Block(block) = stmt {

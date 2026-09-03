@@ -370,7 +370,7 @@ fn stmts_may_write_homes(
         watched,
         may_write: false,
     };
-    super::visit::visit_stmts(stmts, &mut collector);
+    crate::hir::visit::visit_stmts(stmts, &mut collector);
     collector.may_write
 }
 
@@ -386,7 +386,7 @@ impl WatchedHomeWriteCollector<'_> {
     }
 }
 
-impl super::visit::HirVisitor for WatchedHomeWriteCollector<'_> {
+impl crate::hir::visit::HirVisitor for WatchedHomeWriteCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::LocalDecl(decl) = stmt {
             for local in &decl.bindings {

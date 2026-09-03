@@ -19,7 +19,7 @@ pub use common::{
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
     InstrUseValues, NaturalLoop, NaturalLoopAncestors, NaturalLoopForest, NaturalLoopId, OpenDef,
     OpenDefId, OpenUseSources, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
-    ReachableSuccessorShape, SideEffectSummary, SsaRegMap, SsaValue, UseSite,
+    ReachableSuccessorShape, RootObservation, SideEffectSummary, SsaRegMap, SsaValue, UseSite,
 };
 pub(crate) use dataflow::analyze_dataflow;
 pub use dataflow::compute_dataflow_facts;

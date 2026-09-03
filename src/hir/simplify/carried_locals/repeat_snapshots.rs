@@ -11,12 +11,12 @@ use super::super::mention::{
     collect_temp_use_counts, collect_temp_write_counts, stmts_protected_locals,
     stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
 };
-use super::super::visit::{HirVisitor, visit_block};
 use super::super::walk::for_each_nested_block_mut;
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::visit::{HirVisitor, visit_block};
 
 use super::CarryBinding;
 

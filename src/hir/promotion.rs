@@ -16,17 +16,23 @@
 //! - carried-local 后续若把不同 home 的 binding 并入同一目标，会失效单一 home
 //!   的正向 provenance，但保留完整有限的可能 home 并集；未知来源则传播未知。原始
 //!   物理槽事实仍保留给 capture/TBC 等负向保护
+//! - root 观察期间的有效槽位只消费 Dataflow 的 `RootObservation`；这里负责路径闭合和
+//!   producer/endpoint 配对，不重建 CALL、TFORCALL、TBC 的 VM 栈协议
 //! - 由 `NewTable` canonical def 直接产生的 temp 单独保留 constructor origin；MOVE、
 //!   phi 或后续 local 物化不能冒充分配本身
+//! - ordinary CALL 参数交接沿 Dataflow SSA 固定前缀与 caller 边界发布到具体调用，
+//!   例如 `f({})` 的参数 home 不得在后层被重建成调用后继续持有的 caller root
+
+mod call_roots;
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirMethodSetupProtocolId, HirStmt, HirTableField, LocalId,
     ParamId, TempId,
 };
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EdgeRef, EffectTag, ForwardRouteKind,
-    GraphFacts, InstrEffect, LoopConditionPrefixPlacement, LoopVmProtocol, PhiId,
-    PhiIncomingDisposition, RegionId, RegionPlan, SideEffectSummary, SsaValue, StructurePlan,
+    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EdgeRef, ForwardRouteKind, GraphFacts,
+    InstrEffect, LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition,
+    RegionId, RegionPlan, RootObservation, SideEffectSummary, SsaValue, StructurePlan,
 };
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -343,6 +349,9 @@ pub(super) struct ProtoPromotionFacts {
     propagated_temp_definition_write_homes: BTreeMap<TempId, BTreeSet<HomeSlotKey>>,
     physical_home_universe: BTreeSet<HomeSlotKey>,
     compact_home_slots: bool,
+    argument_roots_by_call: BTreeMap<InstrRef, Vec<crate::hir::common::HirCallArgumentRoot>>,
+    argument_root_producers: BTreeSet<TempId>,
+    unobserved_call_result_ends: BTreeMap<TempId, TempId>,
     method_setup_protocols: Vec<HirMethodSetupProtocol>,
     method_setup_protocol_by_call: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
     method_setup_protocol_by_get: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
@@ -372,6 +381,32 @@ pub(super) struct HirMethodSetupProtocol {
 }
 
 impl ProtoPromotionFacts {
+    /// 查询原始参数 producer 候选；消费者仍须匹配当前唯一 definition 与具体 call 参数端点。
+    pub(super) fn temp_is_transferred_call_argument(&self, temp: TempId) -> bool {
+        self.trusted_temp_home_slot(temp).is_some() && self.argument_root_producers.contains(&temp)
+    }
+
+    /// 源 call result 在最后值读取后、首个观察前已有精确同 home 覆盖。
+    /// 这仅约束物理 root 后缀，当前 producer 单写/单读和移动到消费点的求值顺序仍由 HIR 证明。
+    pub(super) fn call_result_root_ends_after_value_use(&self, temp: TempId) -> bool {
+        let Some(home) = self.trusted_temp_home_slot(temp) else {
+            return false;
+        };
+        self.unobserved_call_result_ends
+            .get(&temp)
+            .is_some_and(|end| self.trusted_temp_home_slot(*end) == Some(home))
+    }
+
+    pub(super) fn call_argument_roots(
+        &self,
+        call: InstrRef,
+    ) -> Vec<crate::hir::common::HirCallArgumentRoot> {
+        self.argument_roots_by_call
+            .get(&call)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// 从 canonical def 与最终 value plan 提取当前 proto 的 temp -> home slot 对照表。
     pub(super) fn from_plan(
         proto: &LoweredProto,
@@ -416,11 +451,28 @@ impl ProtoPromotionFacts {
                 },
             );
 
+        let argument_roots_by_call =
+            call_roots::collect(proto, cfg, dataflow, slot_epochs, fixed_temps);
+        let argument_root_producers = argument_roots_by_call
+            .values()
+            .flatten()
+            .map(|root| root.producer)
+            .collect();
         Self {
+            argument_roots_by_call,
+            argument_root_producers,
+            unobserved_call_result_ends: call_roots::collect_unobserved_result_ends(
+                proto,
+                cfg,
+                dataflow,
+                slot_epochs,
+                fixed_temps,
+            ),
             temp_home_slots,
             immediate_move_write_homes,
             entry_nil_overwrite_temps: collect_entry_nil_overwrite_temps(
                 proto,
+                cfg,
                 dataflow,
                 fixed_temps,
             ),
@@ -1540,6 +1592,7 @@ fn collect_immediate_move_write_homes(
 
 fn collect_entry_nil_overwrite_temps(
     proto: &LoweredProto,
+    cfg: &Cfg,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
 ) -> BTreeSet<TempId> {
@@ -1565,7 +1618,9 @@ fn collect_entry_nil_overwrite_temps(
         .flatten()
         .filter_map(|def| {
             let direct = TempId(def.index());
-            (fixed_temps.get(def.index()) == Some(&direct)).then_some(direct)
+            (fixed_temps.get(def.index()) == Some(&direct)
+                && dataflow.def_overwrites_entry_value(def, cfg))
+            .then_some(direct)
         })
         .collect()
 }
@@ -1804,7 +1859,11 @@ fn implicit_repeat_root_scope_fence(
         return None;
     }
     let dispatch_terminator = cfg.blocks.get(dispatch_header.index())?.instrs.last()?;
-    if low_instr_may_observe_gc_roots(&dataflow.effect_summaries, dispatch_terminator.index()) {
+    if dataflow
+        .effect_summaries
+        .get(dispatch_terminator.index())
+        .is_some_and(SideEffectSummary::may_observe_gc_roots)
+    {
         return None;
     }
     let observer_starts = cfg
@@ -1915,7 +1974,6 @@ fn implicit_repeat_root_scope_fence(
     }
     if !collective_holder
         || !all_paths_remove_implicit_roots_from_first_observation(
-            proto,
             cfg,
             dataflow,
             &dispatch_blocks,
@@ -1959,7 +2017,6 @@ fn ssa_value_may_hold_gc_root(
 }
 
 fn all_paths_remove_implicit_roots_from_first_observation(
-    proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     condition_blocks: &BTreeSet<BlockRef>,
@@ -1981,14 +2038,18 @@ fn all_paths_remove_implicit_roots_from_first_observation(
         };
         let mut resolved = false;
         for index in range.start.index()..range.end() {
-            let Some(instr) = proto.instrs.get(index) else {
-                return false;
-            };
             let Some(effect) = dataflow.instr_effects.get(index) else {
                 return false;
             };
-            if low_instr_may_observe_gc_roots(&dataflow.effect_summaries, index) {
-                if !ordinary_call_excludes_homes_from_caller_prefix(instr, &active) {
+            if dataflow
+                .effect_summaries
+                .get(index)
+                .is_some_and(SideEffectSummary::may_observe_gc_roots)
+            {
+                if !dataflow.effect_summaries[index]
+                    .root_observation
+                    .excludes_homes_from_caller(&active)
+                {
                     return false;
                 }
                 resolved = true;
@@ -2018,18 +2079,6 @@ fn all_paths_remove_implicit_roots_from_first_observation(
         );
     }
     true
-}
-
-/// 只证明这个 ordinary call 的观察期间，旧值所在槽位不属于 caller root prefix。
-/// 它不证明调用返回后的 home 死亡，也不授权其它 observer 协议复用该结论。
-fn ordinary_call_excludes_homes_from_caller_prefix(
-    instr: &LowInstr,
-    homes: &BTreeSet<Reg>,
-) -> bool {
-    let LowInstr::Call(call) = instr else {
-        return false;
-    };
-    homes.iter().all(|home| home.index() >= call.callee.index())
 }
 
 /// 从 low-IR 正证一个可能承载 GC root 的 canonical fixed def 在后续所有潜在用户代码 /
@@ -2253,9 +2302,7 @@ fn copy_root_end(
         }
 
         match copy_root_instr_progress(
-            instr,
-            effect,
-            low_instr_may_observe_gc_roots(&dataflow.effect_summaries, index),
+            dataflow.effect_summaries.get(index)?.root_observation,
             home,
             &mut observed,
         )? {
@@ -2300,72 +2347,24 @@ enum CopyRootInstrProgress {
     ScopeEnd,
 }
 
+/// 只消费 Dataflow 已证明的观察点 root 边界；producer 与终点的路径闭合仍属于 HIR。
 fn copy_root_instr_progress(
-    instr: &LowInstr,
-    effect: &InstrEffect,
-    may_observe_gc_roots: bool,
+    observation: RootObservation,
     home: Reg,
     observed: &mut bool,
 ) -> Option<CopyRootInstrProgress> {
-    match instr {
-        LowInstr::Return(_) => observed.then_some(CopyRootInstrProgress::ScopeEnd),
-        LowInstr::Call(call) => {
-            // 只消费跨方言共同成立的 caller-prefix：callee base 以下的槽在被调
-            // 函数执行期间仍属于 caller frame。LuaJIT 的 FR1/FR2 frame link 会让
-            // args.start 与真实 TValue root 区间不同，不能用参数 range 推 active top。
-            if call.callee.index() <= home.index() {
-                // 候选拒绝[SemanticBarrier:Lifetime]：callee base 不高于 copy home
-                // 时，该槽不属于被调函数执行期间的 caller root 前缀。
+    match observation {
+        RootObservation::FrameExit => observed.then_some(CopyRootInstrProgress::ScopeEnd),
+        RootObservation::None | RootObservation::Close => Some(CopyRootInstrProgress::Continue),
+        RootObservation::Call { .. } | RootObservation::PrefixLowerBound { .. } => {
+            if !observation.keeps_home_rooted(home) {
+                // 候选拒绝[SemanticBarrier:Lifetime]：前层没有证明该 home 在观察期间存活。
+                // 前缀下界之外只代表未知，不能被 consumer 升级成释放 root 的许可。
                 return None;
             }
             *observed = true;
             Some(CopyRootInstrProgress::Continue)
         }
-        LowInstr::Close(_) => {
-            // CLOSE 结束 open-upvalue / TBC 事务，但不覆盖当前槽；前序观察点已经
-            // 证明 home 位于活动 caller prefix，保留同一物理 local 穿过 CLOSE
-            // 只复现 VM 原有 root。继续扫描到原始 Return 才冻结作用域终点。
-            Some(CopyRootInstrProgress::Continue)
-        }
-        LowInstr::Tbc(tbc) => {
-            let active_top = fixed_input_root_prefix_top([tbc.reg]);
-            if active_top <= home.index() {
-                // 候选拒绝[SemanticBarrier:Lifetime]：TBC 的异常/cleanup 路径只保证
-                // 标记槽以下仍属于活动 caller prefix；更高 copy home 已过期。
-                return None;
-            }
-            *observed = true;
-            Some(CopyRootInstrProgress::Continue)
-        }
-        LowInstr::GenericForCall(call) => {
-            // 迭代器调用执行期间只把 iterator/state/control 作为 caller roots；result
-            // targets 尚未产生，不能用通用 InstrEffect 的 must-def 抬高 active top。
-            let active_top = fixed_input_root_prefix_top([call.iterator, call.state, call.control]);
-            if active_top <= home.index() {
-                // 候选拒绝[SemanticBarrier:Lifetime]：copy 位于 TFORCALL 的三个活动
-                // 输入以上时，迭代器中的 GC 可观察其已经失活（同 regress_416 的
-                // block-end 高槽到期边界）。
-                return None;
-            }
-            *observed = true;
-            Some(CopyRootInstrProgress::Continue)
-        }
-        LowInstr::TailCall(_) => {
-            // tail callee 执行前 caller frame 已结束，不能把它当成新的 root 观察点；
-            // 但此前已被普通调用观察过的 transaction 可精确在此结束作用域。
-            observed.then_some(CopyRootInstrProgress::ScopeEnd)
-        }
-        _ if instr.is_control_terminator() => Some(CopyRootInstrProgress::Continue),
-        _ if may_observe_gc_roots => {
-            if !effect_keeps_copy_home_rooted(effect, home) {
-                // 候选拒绝[SemanticBarrier:Lifetime]：当前观察点不能正证 copy home
-                // 位于活动栈下界内；block-end 高槽到期反例会在这里被排除。
-                return None;
-            }
-            *observed = true;
-            Some(CopyRootInstrProgress::Continue)
-        }
-        _ => Some(CopyRootInstrProgress::Continue),
     }
 }
 
@@ -2572,9 +2571,7 @@ fn scan_copy_root_cfg_block(
             return Some(CopyRootCfgBlockEnd::End(end));
         }
         match copy_root_instr_progress(
-            instr,
-            effect,
-            low_instr_may_observe_gc_roots(inputs.effect_summaries, index),
+            inputs.effect_summaries.get(index)?.root_observation,
             inputs.home,
             &mut observed,
         )? {
@@ -2733,7 +2730,10 @@ fn overwrite_suffix_is_unobservable_until_scope_end(
                 break;
             }
             if matches!(instr, LowInstr::Close(_))
-                || low_instr_may_observe_gc_roots(&dataflow.effect_summaries, index)
+                || dataflow
+                    .effect_summaries
+                    .get(index)
+                    .is_some_and(SideEffectSummary::may_observe_gc_roots)
             {
                 return false;
             }
@@ -2801,47 +2801,6 @@ fn direct_scalar_overwrite_value(instr: &LowInstr, home: Reg) -> Option<CopyRoot
         // PhysicalRoot local，会把新 RHS 的生命周期延长到 raw home 失活点之后。
         _ => None,
     }
-}
-
-fn effect_active_top_lower_bound(effect: &crate::structure::InstrEffect) -> usize {
-    effect
-        .fixed_uses
-        .iter()
-        .chain(&effect.fixed_must_defs)
-        .map(|reg| reg.index().saturating_add(1))
-        .chain(effect.open_use.map(Reg::index))
-        .chain(effect.open_must_def.map(Reg::index))
-        .max()
-        .unwrap_or_default()
-}
-
-fn effect_keeps_copy_home_rooted(effect: &crate::structure::InstrEffect, home: Reg) -> bool {
-    effect_active_top_lower_bound(effect) > home.index()
-}
-
-fn fixed_input_root_prefix_top<const N: usize>(regs: [Reg; N]) -> usize {
-    regs.into_iter()
-        .map(|reg| reg.index().saturating_add(1))
-        .max()
-        .unwrap_or_default()
-}
-
-fn low_instr_may_observe_gc_roots(effect_summaries: &[SideEffectSummary], index: usize) -> bool {
-    const OBSERVATION_TAGS: &[EffectTag] = &[
-        EffectTag::Alloc,
-        EffectTag::ReadTable,
-        EffectTag::WriteTable,
-        EffectTag::ReadEnv,
-        EffectTag::WriteEnv,
-        EffectTag::Call,
-        EffectTag::Metamethod,
-    ];
-
-    effect_summaries.get(index).is_some_and(|summary| {
-        OBSERVATION_TAGS
-            .iter()
-            .any(|tag| summary.tags.contains(tag))
-    })
 }
 
 fn fill_phi_home_slots(
@@ -3061,36 +3020,21 @@ mod tests {
 
     #[test]
     fn dedicated_protocol_root_prefix_excludes_future_result_slots() {
-        assert_eq!(fixed_input_root_prefix_top([Reg(4)]), 5);
-        assert_eq!(fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]), 7);
-        assert!(Reg(6).index() < fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]));
-        assert!(Reg(7).index() >= fixed_input_root_prefix_top([Reg(4), Reg(5), Reg(6)]));
+        let observation = RootObservation::PrefixLowerBound { end: 7 };
+        assert!(observation.keeps_home_rooted(Reg(6)));
+        assert!(!observation.keeps_home_rooted(Reg(7)));
+        assert!(!observation.excludes_homes_from_caller(&BTreeSet::from([Reg(7)])));
     }
 
     #[test]
     fn ordinary_call_excludes_only_the_complete_high_home_collective_from_caller_prefix() {
-        let call = LowInstr::Call(CallInstr {
-            callee: Reg(6),
-            args: ValuePack::Fixed(RegRange::new(Reg(7), 0)),
-            results: ResultPack::Ignore,
-            kind: CallKind::Normal,
-            method_name: None,
-        });
-
-        assert!(ordinary_call_excludes_homes_from_caller_prefix(
-            &call,
-            &BTreeSet::from([Reg(6), Reg(7)])
-        ));
-        assert!(!ordinary_call_excludes_homes_from_caller_prefix(
-            &call,
-            &BTreeSet::from([Reg(5), Reg(7)])
-        ));
-        assert!(!ordinary_call_excludes_homes_from_caller_prefix(
-            &LowInstr::Return(ReturnInstr {
-                values: ValuePack::Fixed(RegRange::new(Reg(0), 0)),
-            }),
-            &BTreeSet::from([Reg(6), Reg(7)])
-        ));
+        let call = RootObservation::Call { caller_end: Reg(6) };
+        assert!(call.excludes_homes_from_caller(&BTreeSet::from([Reg(6), Reg(7)])));
+        assert!(!call.excludes_homes_from_caller(&BTreeSet::from([Reg(5), Reg(7)])));
+        assert!(
+            !RootObservation::FrameExit
+                .excludes_homes_from_caller(&BTreeSet::from([Reg(6), Reg(7)]))
+        );
     }
 
     #[test]
@@ -3308,7 +3252,10 @@ mod tests {
             }),
         ];
         let effects = vec![InstrEffect::default(); instrs.len()];
-        let summaries = vec![SideEffectSummary::default(); instrs.len()];
+        let mut summaries = vec![SideEffectSummary::default(); instrs.len()];
+        summaries[1].root_observation = RootObservation::Call { caller_end: Reg(2) };
+        summaries[3].root_observation = RootObservation::Call { caller_end: Reg(2) };
+        summaries[5].root_observation = RootObservation::FrameExit;
 
         assert_eq!(
             copy_root_cfg_scope_end(
@@ -3323,6 +3270,7 @@ mod tests {
             Some(())
         );
 
+        summaries[3].root_observation = RootObservation::None;
         instrs[3] = LowInstr::Move(MoveInstr {
             dst: Reg(3),
             src: Reg(4),
@@ -3420,7 +3368,8 @@ mod tests {
         let mut effects = vec![InstrEffect::default(); instrs.len()];
         effects[2].fixed_must_defs.insert(Reg(1));
         effects[4].fixed_must_defs.insert(Reg(1));
-        let summaries = vec![SideEffectSummary::default(); instrs.len()];
+        let mut summaries = vec![SideEffectSummary::default(); instrs.len()];
+        summaries[3].root_observation = RootObservation::Call { caller_end: Reg(2) };
         let overwrite = |index, _home| match index {
             2 => Some(CopyRootEnd::overwrite(CopyRootOverwrite::Scalar {
                 temp: TempId(2),
@@ -3546,12 +3495,10 @@ mod tests {
     #[test]
     fn copy_root_successor_observation_requires_active_top_above_home() {
         let home = Reg(1);
-        let mut expired = InstrEffect::default();
-        expired.fixed_uses.insert(Reg(0));
-        assert!(!effect_keeps_copy_home_rooted(&expired, home));
+        let expired = RootObservation::PrefixLowerBound { end: 1 };
+        assert!(!expired.keeps_home_rooted(home));
 
-        let mut rooted = InstrEffect::default();
-        rooted.fixed_uses.insert(Reg(2));
-        assert!(effect_keeps_copy_home_rooted(&rooted, home));
+        let rooted = RootObservation::PrefixLowerBound { end: 3 };
+        assert!(rooted.keeps_home_rooted(home));
     }
 }

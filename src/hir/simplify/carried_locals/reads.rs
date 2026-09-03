@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 
 use crate::hir::common::{HirExpr, HirLValue, HirStmt};
 
-use super::super::visit::{HirVisitor, visit_expr, visit_stmts};
 use super::binding::{CarryBinding, carry_binding_from_expr, carry_binding_from_lvalue};
+use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 pub(super) fn collect_binding_mentions_by_stmt(stmts: &[HirStmt]) -> Vec<BTreeSet<CarryBinding>> {
     stmts

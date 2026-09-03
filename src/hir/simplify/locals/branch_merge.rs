@@ -4,8 +4,9 @@
 //! temp 赋值，合流之后又继续读取这个 temp。这里会把这种 temp 报告给主 pass，让主 pass
 //! 在 if 前分配一个空 local，再由两条分支写回同一个 binding。
 //!
-//! 本文件消费共享 `HirFlowGraph` topology、当前 HIR 语义事件和 `TempTouchIndex`，不自行
-//! 解析 label/goto/loop，也不分配 local、不改写语句。分支摘要同时
+//! 本文件消费共享 `HirFlowGraph` topology/worklist、当前 HIR 语义事件和 `TempTouchIndex`，
+//! 只声明 must 状态的 transfer/intersection，不自行解析 label/goto/loop，也不分配 local、
+//! 不改写语句。分支摘要同时
 //! 维护“所有合流路径都已写入”和“首次写入前可能读取”，因此主 pass 只会在声明可以
 //! 支配所有读取时接受候选。global 声明只向全局名字提交写入，它的 RHS temp 读取仍纳入
 //! read-before-def；不会因为 AST-owned 声明身份而丢掉同 arm 后续的 temp must-def。常真
@@ -15,7 +16,7 @@
 //! 输入形状：`if c then t1 = a else t1 = b end; use(t1)`。
 //! 输出形状：候选 temp 集合 `{ t1 }`，后续由主 pass 物化成 `local l; if c then l = a else l = b end`。
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
 use super::super::temp_touch::{
@@ -176,75 +177,34 @@ impl<'a> RegionTempFlow<'a> {
     }
 
     fn fallthrough_temp_is_gc_inert(&self, temp: TempId) -> bool {
-        let mut incoming = vec![None::<bool>; self.graph.nodes().len()];
-        incoming[self.graph.entry().index()] = Some(false);
-        let mut pending = VecDeque::from([self.graph.entry()]);
-
-        while let Some(node_id) = pending.pop_front() {
-            let mut outgoing =
-                incoming[node_id.index()].expect("worklist only contains reachable CFG nodes");
-            if self.events[node_id.index()].writes.contains(&temp) {
-                outgoing = self.events[node_id.index()].gc_inert_writes.contains(&temp);
-            }
-            for &successor in self.graph.nodes()[node_id.index()].successors() {
-                let changed = match &mut incoming[successor.index()] {
-                    Some(current) => {
-                        let merged = *current && outgoing;
-                        if *current == merged {
-                            false
-                        } else {
-                            *current = merged;
-                            true
-                        }
-                    }
-                    slot @ None => {
-                        *slot = Some(outgoing);
-                        true
-                    }
-                };
-                if changed {
-                    pending.push_back(successor);
+        let incoming = self.graph.solve_forward(
+            false,
+            |current, outgoing| {
+                let merged = *current && *outgoing;
+                let changed = *current != merged;
+                *current = merged;
+                changed
+            },
+            |id, _, outgoing| {
+                if self.events[id.index()].writes.contains(&temp) {
+                    *outgoing = self.events[id.index()].gc_inert_writes.contains(&temp);
                 }
-            }
-        }
+            },
+        );
 
         incoming[self.graph.exit().index()] == Some(true)
     }
 
     fn summarize(&self) -> FallthroughSummary {
-        let mut incoming = vec![None::<BTreeSet<TempId>>; self.graph.nodes().len()];
-        incoming[self.graph.entry().index()] = Some(BTreeSet::new());
-        let mut pending = VecDeque::from([self.graph.entry()]);
-
-        while let Some(node_id) = pending.pop_front() {
-            let mut outgoing = incoming[node_id.index()]
-                .clone()
-                .expect("worklist only contains reachable CFG nodes");
-            outgoing.extend(self.events[node_id.index()].writes.iter().copied());
-            for &successor in self.graph.nodes()[node_id.index()].successors() {
-                let changed = match &mut incoming[successor.index()] {
-                    Some(current) => {
-                        let intersection = current
-                            .intersection(&outgoing)
-                            .copied()
-                            .collect::<BTreeSet<_>>();
-                        if *current == intersection {
-                            false
-                        } else {
-                            *current = intersection;
-                            true
-                        }
-                    }
-                    slot @ None => {
-                        *slot = Some(outgoing.clone());
-                        true
-                    }
-                };
-                if changed {
-                    pending.push_back(successor);
-                }
-            }
-        }
+        let incoming = self.graph.solve_forward(
+            BTreeSet::new(),
+            |current, outgoing| {
+                let before = current.len();
+                current.retain(|temp| outgoing.contains(temp));
+                current.len() != before
+            },
+            |id, _, outgoing| outgoing.extend(self.events[id.index()].writes.iter().copied()),
+        );
 
         let reads_before_assignment = self
             .events

@@ -17,6 +17,7 @@ pub(crate) mod scheduler;
 pub mod structure;
 mod timing;
 pub mod transformer;
+mod value_semantics;
 
 pub use lua_string::LuaString;
 

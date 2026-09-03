@@ -20,7 +20,6 @@ use crate::hir::{
 
 use self::analysis::{
     block_has_continue, collect_close_temps, collect_referenced_temps_in_encounter_order,
-    max_hir_label_id,
 };
 use self::exprs::PackLoweringContext;
 use super::common::{
@@ -171,7 +170,7 @@ impl<'a> AstLowerer<'a> {
             module,
             target,
             generate_mode,
-            next_synthetic_label: max_hir_label_id(module) + 1,
+            next_synthetic_label: 0,
         }
     }
 
@@ -578,7 +577,7 @@ impl<'a> AstLowerer<'a> {
         {
             None
         } else {
-            let label = AstLabelId(self.next_synthetic_label);
+            let label = AstLabelId::Synthetic(self.next_synthetic_label);
             self.next_synthetic_label += 1;
             Some(label)
         }

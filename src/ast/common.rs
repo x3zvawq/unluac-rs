@@ -698,19 +698,27 @@ pub struct AstLabel {
     pub id: AstLabelId,
 }
 
-/// AST label 身份。
+/// AST label 身份；前层 label 和本层语法化产生的 label 使用独立命名空间。
+///
+/// synthetic continue label 不需要扫描 HIR 最大编号，也不能与同号 HIR label 合并。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct AstLabelId(pub usize);
+pub enum AstLabelId {
+    Hir(HirLabelId),
+    Synthetic(usize),
+}
 
-impl AstLabelId {
-    pub const fn index(self) -> usize {
-        self.0
+impl std::fmt::Display for AstLabelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hir(id) => write!(f, "L{}", id.index()),
+            Self::Synthetic(id) => write!(f, "C{id}"),
+        }
     }
 }
 
 impl From<HirLabelId> for AstLabelId {
     fn from(value: HirLabelId) -> Self {
-        Self(value.index())
+        Self::Hir(value)
     }
 }
 

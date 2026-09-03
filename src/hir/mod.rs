@@ -14,6 +14,7 @@ mod promotion;
 mod rewrite;
 mod simplify;
 pub(crate) mod traverse;
+pub(crate) mod visit;
 
 pub use crate::parser::{ProtoLineRange, ProtoSignature};
 pub(crate) use analyze::analyze_hir;

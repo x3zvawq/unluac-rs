@@ -49,7 +49,7 @@ pub(super) fn bindings_are_mentioned_in_exprs<'a>(
 ) -> bool {
     let mut facts = BindingFacts::default();
     for expr in exprs {
-        super::super::super::visit::visit_expr(expr, &mut facts);
+        crate::hir::visit::visit_expr(expr, &mut facts);
     }
     bindings
         .iter()

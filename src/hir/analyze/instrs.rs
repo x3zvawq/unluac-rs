@@ -181,6 +181,7 @@ pub(super) fn lower_regular_instr(
                 "it can raise a LuaJIT-specific argument error without producing a Lua value"
             };
             let call = HirCallExpr {
+                argument_roots: Vec::new(),
                 callee: unresolved_expr(format!(
                     "LuaJIT builtin {} type guard at block {block}, instruction {instr_ref} has no exact Lua source spelling; {effect}",
                     type_guard.kind.label(),
@@ -352,6 +353,7 @@ pub(super) fn lower_terminal_instr(
             Some(vec![return_stmt(HirValuePack::expanding(
                 Vec::new(),
                 HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                    argument_roots: Vec::new(),
                     callee,
                     args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
                     method: matches!(tail_call.kind, CallKind::Method),
@@ -415,6 +417,7 @@ fn generic_for_iterator_call(
     .into();
 
     HirExpr::Call(Box::new(HirCallExpr {
+        argument_roots: Vec::new(),
         callee,
         args,
         method: false,
@@ -456,6 +459,7 @@ fn lower_call_expr(
     let method_key = lower_method_key(lowering, call.method_name);
     let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
     HirCallExpr {
+        argument_roots: lowering.promotion_facts.call_argument_roots(instr_ref),
         callee,
         args: lower_value_pack(lowering, block, instr_ref, call.args),
         method: matches!(call.kind, CallKind::Method),

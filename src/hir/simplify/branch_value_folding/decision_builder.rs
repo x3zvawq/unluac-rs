@@ -16,7 +16,7 @@ use crate::hir::common::{
     HirIf, HirLocalDecl, HirStmt, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::simplify::visit::{HirVisitor, visit_expr};
+use crate::hir::visit::{HirVisitor, visit_expr};
 
 #[derive(Default)]
 struct BindingRefs(BTreeSet<BranchValueBinding>);

@@ -13,8 +13,8 @@ pub use cfg::{
 };
 pub use dataflow::{
     DataflowFacts, Def, DefId, EffectTag, InstrEffect, InstrUseValues, OpenDef, OpenDefId,
-    OpenUseSources, PhiCandidate, PhiId, PhiIncoming, SideEffectSummary, SsaRegMap, SsaValue,
-    UseSite,
+    OpenUseSources, PhiCandidate, PhiId, PhiIncoming, RootObservation, SideEffectSummary,
+    SsaRegMap, SsaValue, UseSite,
 };
 pub use graph::{
     DominatorTree, GraphFacts, NaturalLoop, NaturalLoopAncestors, NaturalLoopForest, NaturalLoopId,

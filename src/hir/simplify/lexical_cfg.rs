@@ -4,19 +4,21 @@
 //! label 的 goto 则逐层上浮。`break` / `continue` 由最近的 loop owner 消费，恒真/恒假
 //! loop 的正常出口使用目标方言 truthiness 事实判定。`HirFlowGraph` 是当前 HIR 树
 //! 的 owner-wide topology 单一来源；它区分 for 的一次性求值节点与循环 dispatch，并为
-//! dataflow consumer 提供稳定 node id 和后继。block-local `LexicalCfg` 则保留线性
-//! rewrite 所需的 successor、外部出口和支配查询。
+//! dataflow consumer 提供稳定 node id 和后继。block-local `LexicalCfg` 从同一图的可达
+//! 出口投影线性 rewrite 所需的 successor、外部出口和支配查询，不另行解释控制结构。
+//! 例如 `do ... goto outer end; ...; ::outer::` 由子图的未解析出口连接直属 label，
+//! 子图内自含的回环则只通过真实可达的正常出口影响后续语句。
 //! 本模块不推断 temp reaching-def 或 root lifetime；这些仍由具体 pass 结合 promotion facts
 //! 判断。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::hir::common::{HirBlock, HirGenericFor, HirLabelId, HirRepeat, HirStmt, LocalId};
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::expr_facts::expr_truthiness;
 use super::label_refs::count_label_references;
-use super::visit::{HirVisitor, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_stmts};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum LexicalCfgFailure {
@@ -120,7 +122,7 @@ pub(super) struct HirFlowGraph<'a> {
     entry: HirFlowNodeId,
     exit: HirFlowNodeId,
     goto_edges: Vec<(HirFlowNodeId, OwnerLabelLocation)>,
-    unresolved_goto_sources: Vec<HirFlowNodeId>,
+    unresolved_gotos: Vec<(HirFlowNodeId, HirLabelId)>,
 }
 
 impl<'a> HirFlowGraph<'a> {
@@ -154,16 +156,107 @@ impl<'a> HirFlowGraph<'a> {
         HirFlowGraphBuilder::new(safety, HirFlowBoundary::Function).build(&block.stmts)
     }
 
-    pub(super) const fn entry(&self) -> HirFlowNodeId {
-        self.entry
-    }
-
     pub(super) const fn exit(&self) -> HirFlowNodeId {
         self.exit
     }
 
     pub(super) fn nodes(&self) -> &[HirFlowNode<'a>] {
         &self.nodes
+    }
+
+    /// 在同一 topology 快照上求前向抽象状态不动点。
+    ///
+    /// `None` 仅表示不可达，首次到达直接安装状态；之后由 consumer 的 `join` 区分
+    /// may-union 与 must-intersection。`transfer` 只解释当前 typed event，不重复建边。
+    /// consumer 必须使用有限单调域，并仅在 join 改变状态时返回 true；观察副产物也
+    /// 必须单调合并，因为回边可能使同一节点再次执行。返回值是每个节点的输入状态。
+    pub(super) fn solve_forward<S: Clone>(
+        &self,
+        initial: S,
+        mut join: impl FnMut(&mut S, &S) -> bool,
+        mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S),
+    ) -> Vec<Option<S>> {
+        let mut entries = vec![None; self.nodes.len()];
+        entries[self.entry.index()] = Some(initial);
+        let mut pending = VecDeque::from([self.entry]);
+        let mut queued = vec![false; self.nodes.len()];
+        queued[self.entry.index()] = true;
+        while let Some(id) = pending.pop_front() {
+            queued[id.index()] = false;
+            let mut output = entries[id.index()]
+                .as_ref()
+                .expect("queued HIR flow node must be reachable")
+                .clone();
+            transfer(id, self.nodes[id.index()].kind(), &mut output);
+            for &successor in self.nodes[id.index()].successors() {
+                let changed = match &mut entries[successor.index()] {
+                    Some(current) => join(current, &output),
+                    entry @ None => {
+                        *entry = Some(output.clone());
+                        true
+                    }
+                };
+                if changed && !queued[successor.index()] {
+                    queued[successor.index()] = true;
+                    pending.push_back(successor);
+                }
+            }
+        }
+        entries
+    }
+
+    /// 在入口可达子图上求后向抽象状态不动点，返回每个节点的输出状态。
+    ///
+    /// 所有可达节点从 lattice 的 bottom 开始执行，包含无法到达函数出口的循环；
+    /// 否则无限循环中的读取会被错误视为不可观察。
+    /// `transfer` 从输出状态计算输入状态，`join` 将它传播到前驱。
+    /// 图负责方向与调度；consumer 只提供有限单调域及当前 typed event 的 gen/kill。
+    pub(super) fn solve_backward<S: Clone>(
+        &self,
+        bottom: S,
+        mut join: impl FnMut(&mut S, &S) -> bool,
+        mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S),
+    ) -> Vec<Option<S>> {
+        let reachable = self.reachable();
+        let mut predecessors = vec![Vec::new(); self.nodes.len()];
+        for (source, node) in self.nodes.iter().enumerate() {
+            if reachable[source] {
+                for successor in node.successors() {
+                    predecessors[successor.index()].push(HirFlowNodeId(source));
+                }
+            }
+        }
+        let mut outputs = reachable
+            .iter()
+            .map(|&is_reachable| is_reachable.then(|| bottom.clone()))
+            .collect::<Vec<_>>();
+        let mut pending = reachable
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &is_reachable)| is_reachable.then_some(HirFlowNodeId(index)))
+            .collect::<VecDeque<_>>();
+        let mut queued = reachable;
+        while let Some(id) = pending.pop_front() {
+            queued[id.index()] = false;
+            let mut input = outputs[id.index()]
+                .as_ref()
+                .expect("queued HIR flow node must be reachable")
+                .clone();
+            transfer(id, self.nodes[id.index()].kind(), &mut input);
+            for &predecessor in &predecessors[id.index()] {
+                let changed = join(
+                    outputs[predecessor.index()]
+                        .as_mut()
+                        .expect("HIR flow predecessor must be reachable"),
+                    &input,
+                );
+                if changed && !queued[predecessor.index()] {
+                    queued[predecessor.index()] = true;
+                    pending.push_back(predecessor);
+                }
+            }
+        }
+        outputs
     }
 
     pub(super) fn reachable(&self) -> Vec<bool> {
@@ -183,9 +276,9 @@ impl<'a> HirFlowGraph<'a> {
 
     pub(super) fn has_reachable_unresolved_goto(&self) -> bool {
         let reachable = self.reachable();
-        self.unresolved_goto_sources
+        self.unresolved_gotos
             .iter()
-            .any(|source| reachable[source.index()])
+            .any(|(source, _)| reachable[source.index()])
     }
 
     fn node_reaches(&self, start: HirFlowNodeId, target: HirFlowNodeId) -> bool {
@@ -359,10 +452,10 @@ impl<'a> HirFlowGraphBuilder<'a> {
             .ok_or(LexicalCfgFailure::AmbiguousLabel)?;
 
         let mut goto_edges = Vec::with_capacity(self.pending_gotos.len());
-        let mut unresolved_goto_sources = Vec::new();
+        let mut unresolved_gotos = Vec::new();
         for (source, label) in std::mem::take(&mut self.pending_gotos) {
             let Some(location) = self.labels.get(&label).cloned() else {
-                unresolved_goto_sources.push(source);
+                unresolved_gotos.push((source, label));
                 if let Some(unknown) = self.unknown_control {
                     self.nodes[source.index()].successors.insert(unknown);
                 }
@@ -377,7 +470,7 @@ impl<'a> HirFlowGraphBuilder<'a> {
             entry,
             exit,
             goto_edges,
-            unresolved_goto_sources,
+            unresolved_gotos,
         })
     }
 
@@ -612,12 +705,16 @@ impl LexicalCfg {
         let mut successors = vec![BTreeSet::<usize>::new(); stmts.len()];
         let mut has_external_exit = false;
         for (index, stmt) in stmts.iter().enumerate() {
-            let summary = summarize_stmt_flow(stmt, safety);
-            if index + 1 < stmts.len() && summary.falls_through {
+            let graph = HirFlowGraph::for_stmts(std::slice::from_ref(stmt), safety)?;
+            let reachable = graph.reachable();
+            if index + 1 < stmts.len() && reachable[graph.exit().index()] {
                 successors[index].insert(index + 1);
             }
-            for target in summary.outgoing_gotos {
-                if let Some(&target_index) = direct_labels.get(&target) {
+            for (source, target) in &graph.unresolved_gotos {
+                if !reachable[source.index()] {
+                    continue;
+                }
+                if let Some(&target_index) = direct_labels.get(target) {
                     successors[index].insert(target_index);
                 } else {
                     has_external_exit = true;
@@ -626,7 +723,7 @@ impl LexicalCfg {
         }
         let reachable = reachable_indices(&successors, None);
         // 线性 consumer 只会显式跳过当前 block 的 direct forward goto；嵌套 block
-        // 内部自含的回环已经被 summarize_stmt_flow 消费成当前语句的 fallthrough，仍可
+        // 内部自含的回环已经投影成当前语句的正常出口，仍可
         // 安全交给递归 analyzer。若嵌套 goto 指向本层 label，当前非 Goto 语句会出现
         // 非顺序 successor，因而不能伪装成普通 fallthrough。
         let linear_forward_labels = (!has_external_exit
@@ -722,176 +819,6 @@ impl HirVisitor for OwnedLabelCollector {
         if let HirStmt::Label(label) = stmt {
             self.has_duplicate |= !self.labels.insert(label.id);
         }
-    }
-}
-
-#[derive(Default)]
-struct ControlFlowSummary {
-    falls_through: bool,
-    breaks_loop: bool,
-    continues_loop: bool,
-    outgoing_gotos: BTreeSet<HirLabelId>,
-}
-
-impl ControlFlowSummary {
-    fn fallthrough() -> Self {
-        Self {
-            falls_through: true,
-            breaks_loop: false,
-            continues_loop: false,
-            outgoing_gotos: BTreeSet::new(),
-        }
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.falls_through |= other.falls_through;
-        self.breaks_loop |= other.breaks_loop;
-        self.continues_loop |= other.continues_loop;
-        self.outgoing_gotos.extend(other.outgoing_gotos);
-    }
-}
-
-fn summarize_stmt_flow(stmt: &HirStmt, safety: HirExprSafety) -> ControlFlowSummary {
-    match stmt {
-        HirStmt::Goto(goto_stmt) => ControlFlowSummary {
-            falls_through: false,
-            breaks_loop: false,
-            continues_loop: false,
-            outgoing_gotos: BTreeSet::from([goto_stmt.target]),
-        },
-        HirStmt::Break => ControlFlowSummary {
-            breaks_loop: true,
-            ..ControlFlowSummary::default()
-        },
-        HirStmt::Continue => ControlFlowSummary {
-            continues_loop: true,
-            ..ControlFlowSummary::default()
-        },
-        HirStmt::Return(_) => ControlFlowSummary::default(),
-        HirStmt::If(if_stmt) => match expr_truthiness(&if_stmt.cond, safety) {
-            Some(true) => summarize_block_flow(&if_stmt.then_block, safety),
-            Some(false) => if_stmt
-                .else_block
-                .as_ref()
-                .map_or_else(ControlFlowSummary::fallthrough, |block| {
-                    summarize_block_flow(block, safety)
-                }),
-            None => {
-                let mut summary = summarize_block_flow(&if_stmt.then_block, safety);
-                if let Some(else_block) = &if_stmt.else_block {
-                    summary.merge(summarize_block_flow(else_block, safety));
-                } else {
-                    summary.falls_through = true;
-                }
-                summary
-            }
-        },
-        HirStmt::Block(block) => summarize_block_flow(block, safety),
-        HirStmt::While(while_stmt) => {
-            let truthiness = expr_truthiness(&while_stmt.cond, safety);
-            if truthiness == Some(false) {
-                return ControlFlowSummary::fallthrough();
-            }
-            let body = summarize_block_flow(&while_stmt.body, safety);
-            ControlFlowSummary {
-                falls_through: truthiness != Some(true) || body.breaks_loop,
-                breaks_loop: false,
-                continues_loop: false,
-                outgoing_gotos: body.outgoing_gotos,
-            }
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            let body = summarize_block_flow(&repeat_stmt.body, safety);
-            let reaches_condition = body.falls_through || body.continues_loop;
-            ControlFlowSummary {
-                falls_through: body.breaks_loop
-                    || (expr_truthiness(&repeat_stmt.cond, safety) != Some(false)
-                        && reaches_condition),
-                breaks_loop: false,
-                continues_loop: false,
-                outgoing_gotos: body.outgoing_gotos,
-            }
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            let body = summarize_block_flow(&numeric_for.body, safety);
-            ControlFlowSummary {
-                falls_through: true,
-                breaks_loop: false,
-                continues_loop: false,
-                outgoing_gotos: body.outgoing_gotos,
-            }
-        }
-        HirStmt::GenericFor(generic_for) => {
-            let body = summarize_block_flow(&generic_for.body, safety);
-            ControlFlowSummary {
-                falls_through: true,
-                breaks_loop: false,
-                continues_loop: false,
-                outgoing_gotos: body.outgoing_gotos,
-            }
-        }
-        HirStmt::Label(_)
-        | HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_) => ControlFlowSummary::fallthrough(),
-    }
-}
-
-fn summarize_block_flow(block: &HirBlock, safety: HirExprSafety) -> ControlFlowSummary {
-    let direct_labels = block
-        .stmts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, stmt)| match stmt {
-            HirStmt::Label(label) => Some((label.id, index)),
-            _ => None,
-        })
-        .collect::<BTreeMap<_, _>>();
-    let stmt_summaries = block
-        .stmts
-        .iter()
-        .map(|stmt| summarize_stmt_flow(stmt, safety))
-        .collect::<Vec<_>>();
-    let mut reachable = vec![false; block.stmts.len() + 1];
-    reachable[0] = true;
-    let mut pending = vec![0usize];
-    let mut outgoing_gotos = BTreeSet::new();
-    let mut breaks_loop = false;
-    let mut continues_loop = false;
-
-    while let Some(index) = pending.pop() {
-        if index == block.stmts.len() {
-            continue;
-        }
-        let summary = &stmt_summaries[index];
-        breaks_loop |= summary.breaks_loop;
-        continues_loop |= summary.continues_loop;
-        if summary.falls_through && !reachable[index + 1] {
-            reachable[index + 1] = true;
-            pending.push(index + 1);
-        }
-        for &target in &summary.outgoing_gotos {
-            if let Some(&target_index) = direct_labels.get(&target) {
-                if !reachable[target_index] {
-                    reachable[target_index] = true;
-                    pending.push(target_index);
-                }
-            } else {
-                outgoing_gotos.insert(target);
-            }
-        }
-    }
-
-    ControlFlowSummary {
-        falls_through: reachable[block.stmts.len()],
-        breaks_loop,
-        continues_loop,
-        outgoing_gotos,
     }
 }
 

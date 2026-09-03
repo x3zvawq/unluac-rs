@@ -10,7 +10,8 @@
 //!
 //! 它不会替具体 pass 决定"哪些节点该改、哪些事实可信"；这些语义仍然由各个 pass
 //! 自己负责。这个文件只统一递归顺序和进入子节点的边界，避免不同 pass 各自长出
-//! 一套不一致的 walker。
+//! 一套不一致的 walker。generic-for operand 改写只撤销对应 producer span，未变的区间
+//! 继续保留 lowering 证明；例如替换 callee 不会抹掉另一段 nil initializer 的身份。
 //!
 //! 例子：
 //! - `logical_simplify` 只需要实现 `ExprRewritePass`
@@ -55,7 +56,7 @@ pub(super) trait HirRewritePass {
     }
 
     /// Generic-for 自身可以裁掉已由 transaction 宽度独立保存的 trailing nil；其它
-    /// iterator rewrite 默认会破坏 producer span correspondence。
+    /// iterator rewrite 默认逐段校验并撤销变化区间，不抹掉其它 producer 的证明。
     fn preserves_generic_for_initializer_transaction_on_iterator_rewrite(&self) -> bool {
         false
     }
@@ -201,8 +202,7 @@ fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
         && generic_for.iterator != original_iterator
         && !pass.preserves_generic_for_initializer_transaction_on_iterator_rewrite()
     {
-        generic_for.initializer_transaction = None;
-        metadata_changed = true;
+        metadata_changed |= generic_for.retain_unchanged_initializer_spans(&original_iterator);
     }
     stmt_changed || nested_changed || metadata_changed
 }

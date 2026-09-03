@@ -2,7 +2,9 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-contains [[local r1_3 = "prefix"]]
+-- The shared literal must remain materialized before the irreducible region; its local ID is not stable.
+-- unluac: expect-contains [[ = "prefix"]]
+-- unluac: expect-order [[ = "prefix"]] [[goto ]]
 
 local function prefix_before_irreducible(entry, cycle)
     local prefix = "prefix"
@@ -24,6 +26,7 @@ local function prefix_before_irreducible(entry, cycle)
 end
 
 assert(prefix_before_irreducible(true, false) == 10)
+assert(prefix_before_irreducible(false, false) == 11)
 
 local total = 0
 for i = 1, 3 do

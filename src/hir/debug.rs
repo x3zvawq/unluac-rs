@@ -559,9 +559,10 @@ fn format_call_expr(call: &super::common::HirCallExpr) -> String {
         "normal"
     };
     format!(
-        "call({kind}) {}({})",
+        "call({kind}) {}({}) argument-roots={:?}",
         format_expr(&call.callee),
         format_value_pack(&call.args),
+        call.argument_roots,
     )
 }
 

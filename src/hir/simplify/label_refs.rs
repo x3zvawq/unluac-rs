@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{HirLabelId, HirStmt};
 
-use super::visit::HirVisitor;
+use crate::hir::visit::HirVisitor;
 
 pub(super) fn count_label_references(stmts: &[HirStmt]) -> BTreeMap<HirLabelId, usize> {
     let mut collector = LabelReferenceCount::default();
-    super::visit::visit_stmts(stmts, &mut collector);
+    crate::hir::visit::visit_stmts(stmts, &mut collector);
     collector.counts
 }
 

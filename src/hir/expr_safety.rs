@@ -2,9 +2,11 @@
 //!
 //! HIR analyze 和 simplify 都会判断某个表达式是否能被挪动或折进别的表达式。
 //! 这个文件只放跨 pass 共用、和具体恢复策略无关的谓词，避免求值序规则散落后漂移。
+//! 原始值比较使用共享 `LuaValueSemantics`；本文件只负责 HIR 求值事件和 root relevance。
 
 use super::common::{HirBinaryOpKind, HirCaptureMode, HirExpr, HirUnaryOpKind, HirValuePack};
 use crate::decompile::DecompileDialect;
+use crate::value_semantics::{LuaComparison, LuaLiteral, LuaValueSemantics};
 
 /// 一个 HIR-origin local initializer 的逐槽 stack-root relevance 证明。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,14 +54,6 @@ pub(crate) fn initializer_root_profile(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MixedNumericMode {
-    Unknown,
-    ExactIntegerFloat,
-    LuaJitBinary64,
-    LuauBinary64,
-}
-
 /// 一次 HIR simplify 调用共享的表达式安全能力。
 ///
 /// PUC Lua 与 Luau 的原始值不会和 table/userdata 通过 `__eq` 比较；LuaJIT cdata
@@ -68,8 +62,7 @@ enum MixedNumericMode {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HirExprSafety {
     dynamic_primitive_equality_is_stable: bool,
-    literal_string_order_is_binary: bool,
-    mixed_numeric_mode: MixedNumericMode,
+    values: LuaValueSemantics,
 }
 
 impl HirExprSafety {
@@ -84,17 +77,7 @@ impl HirExprSafety {
                     | DecompileDialect::Lua55
                     | DecompileDialect::Luau
             ),
-            literal_string_order_is_binary: dialect.literal_string_order_is_binary(),
-            mixed_numeric_mode: match dialect {
-                DecompileDialect::Lua53 | DecompileDialect::Lua54 | DecompileDialect::Lua55 => {
-                    MixedNumericMode::ExactIntegerFloat
-                }
-                DecompileDialect::Luajit => MixedNumericMode::LuaJitBinary64,
-                DecompileDialect::Luau => MixedNumericMode::LuauBinary64,
-                DecompileDialect::Auto | DecompileDialect::Lua51 | DecompileDialect::Lua52 => {
-                    MixedNumericMode::Unknown
-                }
-            },
+            values: LuaValueSemantics::for_dialect(dialect),
         }
     }
 
@@ -105,27 +88,18 @@ impl HirExprSafety {
         lhs: &HirExpr,
         rhs: &HirExpr,
     ) -> Option<bool> {
-        primitive_literal_comparison_value(op, lhs, rhs, self)
+        let op = match op {
+            HirBinaryOpKind::Eq => LuaComparison::Eq,
+            HirBinaryOpKind::Lt => LuaComparison::Lt,
+            HirBinaryOpKind::Le => LuaComparison::Le,
+            _ => return None,
+        };
+        self.values
+            .compare(op, primitive_literal(lhs)?, primitive_literal(rhs)?)
     }
 
-    pub(crate) fn mixed_integer_number_ordering(
-        self,
-        integer: i64,
-        number: f64,
-    ) -> Option<std::cmp::Ordering> {
-        mixed_integer_number_ordering(self.mixed_numeric_mode, integer, number)
-    }
-
-    pub(crate) fn mixed_integer_number_equal(self, integer: i64, number: f64) -> Option<bool> {
-        mixed_integer_number_equal(self.mixed_numeric_mode, integer, number)
-    }
-
-    pub(crate) const fn literal_string_order_is_binary(self) -> bool {
-        self.literal_string_order_is_binary
-    }
-
-    pub(crate) const fn distinguishes_integer_number_values(self) -> bool {
-        matches!(self.mixed_numeric_mode, MixedNumericMode::ExactIntegerFloat)
+    pub(crate) const fn values(self) -> LuaValueSemantics {
+        self.values
     }
 
     fn equality_is_stable(self, op: HirBinaryOpKind, lhs: &HirExpr, rhs: &HirExpr) -> bool {
@@ -163,179 +137,17 @@ impl HirExprSafety {
 }
 
 fn is_primitive_literal(expr: &HirExpr) -> bool {
-    matches!(
-        expr,
-        HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-    )
+    primitive_literal(expr).is_some()
 }
 
-/// 计算目标方言能够证明不会触发元方法的原始字面量比较。
-///
-/// 混合 Integer/Number 只在 `HirExprSafety` 已固定的数值域内使用精确算法；调用方只能
-/// 把 `Some` 当作可删除求值的常量事实，`None` 必须继续保留原表达式。
-/// dynamic/primitive equality 是否会触发元方法由 [`HirExprSafety`] 的方言能力判定；
-/// 这个 helper 只负责完全由字面量决定结果的比较。
-fn primitive_literal_comparison_value(
-    op: HirBinaryOpKind,
-    lhs: &HirExpr,
-    rhs: &HirExpr,
-    safety: HirExprSafety,
-) -> Option<bool> {
-    if op == HirBinaryOpKind::Eq {
-        let value = match (lhs, rhs) {
-            (HirExpr::Integer(lhs), HirExpr::Integer(rhs)) => Some(lhs == rhs),
-            (HirExpr::Number(lhs), HirExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
-                Some(lhs == rhs)
-            }
-            (HirExpr::String(lhs), HirExpr::String(rhs)) => Some(lhs == rhs),
-            (HirExpr::Boolean(lhs), HirExpr::Boolean(rhs)) => Some(lhs == rhs),
-            (HirExpr::Nil, HirExpr::Nil) => Some(true),
-            (HirExpr::Integer(integer), HirExpr::Number(number))
-            | (HirExpr::Number(number), HirExpr::Integer(integer)) => {
-                safety.mixed_integer_number_equal(*integer, *number)
-            }
-            _ => None,
-        };
-        if value.is_some() {
-            return value;
-        }
-        if matches!(
-            (lhs, rhs),
-            (HirExpr::Integer(_), HirExpr::Number(_))
-                | (HirExpr::Number(_), HirExpr::Integer(_))
-                | (HirExpr::Number(_), HirExpr::Number(_))
-        ) || matches!(lhs, HirExpr::Number(value) if !value.is_finite())
-            || matches!(rhs, HirExpr::Number(value) if !value.is_finite())
-        {
-            // 候选拒绝[TargetConstraint]：Integer/Number 的目标数值域或源码物化无法精确证明，不能按宿主表示直接判等。
-            return None;
-        }
-        if is_primitive_literal(lhs) && is_primitive_literal(rhs) {
-            return Some(false);
-        }
-        // 候选拒绝[TargetConstraint]：cdata、vector 与 complex 的 equality 及源码物化是方言专属语义，不能按普通 primitive 类型不匹配处理。
-        return None;
-    }
-    let ordering = match (lhs, rhs) {
-        (HirExpr::Integer(lhs), HirExpr::Integer(rhs)) => lhs.cmp(rhs),
-        (HirExpr::Number(lhs), HirExpr::Number(rhs)) if lhs.is_finite() && rhs.is_finite() => {
-            lhs.partial_cmp(rhs)?
-        }
-        (HirExpr::Integer(integer), HirExpr::Number(number)) => {
-            safety.mixed_integer_number_ordering(*integer, *number)?
-        }
-        (HirExpr::Number(number), HirExpr::Integer(integer)) => safety
-            .mixed_integer_number_ordering(*integer, *number)?
-            .reverse(),
-        (HirExpr::String(lhs), HirExpr::String(rhs)) => {
-            // 候选拒绝[SemanticBarrier:Locale]：PUC Lua 的 `strcoll` 结果可被 `os.setlocale` 改写，regress_392 证明不能用宿主字节序替代。
-            if !safety.literal_string_order_is_binary {
-                return None;
-            }
-            lhs.cmp(rhs)
-        }
-        _ => return None,
-    };
-    match op {
-        HirBinaryOpKind::Lt => Some(ordering == std::cmp::Ordering::Less),
-        HirBinaryOpKind::Le => Some(ordering != std::cmp::Ordering::Greater),
+fn primitive_literal(expr: &HirExpr) -> Option<LuaLiteral<'_>> {
+    match expr {
+        HirExpr::Nil => Some(LuaLiteral::Nil),
+        HirExpr::Boolean(value) => Some(LuaLiteral::Boolean(*value)),
+        HirExpr::Integer(value) => Some(LuaLiteral::Integer(*value)),
+        HirExpr::Number(value) => Some(LuaLiteral::Number(*value)),
+        HirExpr::String(value) => Some(LuaLiteral::String(value)),
         _ => None,
-    }
-}
-
-fn mixed_integer_number_equal(mode: MixedNumericMode, integer: i64, number: f64) -> Option<bool> {
-    if !number.is_finite() {
-        return None;
-    }
-    match mode {
-        MixedNumericMode::ExactIntegerFloat => {
-            const UPPER: f64 = 9_223_372_036_854_775_808.0;
-            Some(
-                number.fract() == 0.0
-                    && number >= i64::MIN as f64
-                    && number < UPPER
-                    && number as i64 == integer,
-            )
-        }
-        MixedNumericMode::LuaJitBinary64 | MixedNumericMode::LuauBinary64 => {
-            const MAX_EXACT: i64 = 9_007_199_254_740_992;
-            let max_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MAX)
-            } else {
-                MAX_EXACT
-            };
-            let min_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MIN)
-            } else {
-                -MAX_EXACT
-            };
-            (integer >= min_integer && integer <= max_integer).then_some(integer as f64 == number)
-        }
-        MixedNumericMode::Unknown => {
-            // 候选拒绝[TargetConstraint]：目标未声明 Integer/Number 的共同数值域，不能证明比较结果。
-            None
-        }
-    }
-}
-
-fn mixed_integer_number_ordering(
-    mode: MixedNumericMode,
-    integer: i64,
-    number: f64,
-) -> Option<std::cmp::Ordering> {
-    if !number.is_finite() {
-        return None;
-    }
-    match mode {
-        MixedNumericMode::LuaJitBinary64 | MixedNumericMode::LuauBinary64 => {
-            const MAX_EXACT: i64 = 9_007_199_254_740_992;
-            let max_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MAX)
-            } else {
-                MAX_EXACT
-            };
-            let min_integer = if mode == MixedNumericMode::LuaJitBinary64 {
-                i64::from(i32::MIN)
-            } else {
-                -MAX_EXACT
-            };
-            (integer >= min_integer && integer <= max_integer)
-                .then(|| (integer as f64).partial_cmp(&number))
-                .flatten()
-        }
-        MixedNumericMode::ExactIntegerFloat => {
-            const UPPER: f64 = 9_223_372_036_854_775_808.0;
-            const LOWER: f64 = -9_223_372_036_854_775_808.0;
-            if number >= UPPER {
-                return Some(std::cmp::Ordering::Less);
-            }
-            if number < LOWER {
-                return Some(std::cmp::Ordering::Greater);
-            }
-            let ceil = number.ceil();
-            if ceil >= UPPER {
-                return Some(std::cmp::Ordering::Less);
-            }
-            let floor = number.floor();
-            if floor < LOWER {
-                return Some(std::cmp::Ordering::Greater);
-            }
-            if integer < ceil as i64 {
-                Some(std::cmp::Ordering::Less)
-            } else if integer > floor as i64 {
-                Some(std::cmp::Ordering::Greater)
-            } else {
-                Some(std::cmp::Ordering::Equal)
-            }
-        }
-        MixedNumericMode::Unknown => {
-            // 候选拒绝[TargetConstraint]：目标未声明 Integer/Number 的共同数值域，不能证明比较结果。
-            None
-        }
     }
 }
 

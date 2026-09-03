@@ -182,7 +182,11 @@ LuaCaseMatrixEntry::new(
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_342_boolean_shell_gc_lifetime.lua",
-        PUC_LUA_54,
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_342_constructor_argument_call_order.lua",
+        PUC_LUA_GE_54,
     ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_342_boolean_shell_gc_inert_old_value.lua",

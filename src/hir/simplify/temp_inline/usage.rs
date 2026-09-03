@@ -67,6 +67,7 @@ impl TempUseSummary {
 }
 
 pub(super) struct TempUseScratch {
+    definition_counts: Vec<usize>,
     temp_debug_hints: Vec<bool>,
     counts: Vec<usize>,
     touched: Vec<TempId>,
@@ -78,11 +79,26 @@ impl TempUseScratch {
         for (index, hint) in proto.temp_debug_locals.iter().enumerate().take(temp_count) {
             temp_debug_hints[index] = hint.is_some();
         }
+        struct Definitions(Vec<usize>);
+        impl HirVisitor for Definitions {
+            fn visit_lvalue(&mut self, target: &HirLValue) {
+                if let HirLValue::Temp(temp) = target {
+                    self.0[temp.index()] += 1;
+                }
+            }
+        }
+        let mut definitions = Definitions(vec![0; temp_count]);
+        visit_stmts(&proto.body.stmts, &mut definitions);
         Self {
+            definition_counts: definitions.0,
             temp_debug_hints,
             counts: vec![0; temp_count],
             touched: Vec::new(),
         }
+    }
+
+    pub(super) fn has_unique_definition(&self, temp: TempId) -> bool {
+        self.definition_counts.get(temp.index()) == Some(&1)
     }
 
     pub(super) fn temp_count(&self) -> usize {

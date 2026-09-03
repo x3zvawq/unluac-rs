@@ -28,7 +28,6 @@ use crate::hir::promotion::ProtoPromotionFacts;
 use super::super::label_refs::count_label_references;
 use super::super::lexical_cfg::LexicalCfg;
 use super::super::mention::{stmts_captured_locals, stmts_mention_local};
-use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::{rewrite_expr, rewrite_stmts};
 use super::HandoffIdentityFacts;
 use super::binding::{
@@ -38,6 +37,7 @@ use super::binding::{
 };
 use super::prune::RedundantSelfAssignPrunePass;
 use super::reads::BindingReadCollector;
+use crate::hir::visit::{HirVisitor, visit_stmts};
 
 struct LoopUpdateFold {
     seed_index: usize,

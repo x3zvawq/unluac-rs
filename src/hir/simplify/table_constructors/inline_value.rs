@@ -283,6 +283,7 @@ pub(super) fn inline_constructor_call(
         (callee, args)
     };
     Some(HirCallExpr {
+        argument_roots: call.argument_roots.clone(),
         callee,
         args,
         method: call.method,

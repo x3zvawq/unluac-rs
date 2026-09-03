@@ -30,8 +30,8 @@ use super::logical_simplify::{
     normalize_condition_context, simplify_condition_truthiness_shape_with_safety,
 };
 use super::mention::{stmts_mention_local, stmts_protected_locals};
-use super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
+use crate::hir::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 
 pub(super) fn fold_branch_control_in_proto(
     proto: &mut HirProto,
@@ -528,7 +528,7 @@ struct ImmutablePrimitiveLocals {
 impl ImmutablePrimitiveLocals {
     fn new(proto: &HirProto) -> Self {
         let mut index = Self::default();
-        super::visit::visit_proto(proto, &mut index);
+        crate::hir::visit::visit_proto(proto, &mut index);
         let captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
         index.written.extend(captured.locals);
         index
@@ -1410,6 +1410,7 @@ mod tests {
     fn adjacent_conditional_goto_preserves_effectful_condition_once() {
         let target = HirLabelId(3);
         let call = HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::ParamRef(ParamId(0)),
             args: HirValuePack::default(),
             method: false,

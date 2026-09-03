@@ -1450,7 +1450,9 @@ mod tests {
     }
 
     fn label(id: usize) -> AstStmt {
-        AstStmt::Label(Box::new(AstLabel { id: AstLabelId(id) }))
+        AstStmt::Label(Box::new(AstLabel {
+            id: AstLabelId::Synthetic(id),
+        }))
     }
 
     fn conditional_goto(id: usize) -> AstStmt {
@@ -1460,7 +1462,7 @@ mod tests {
             })),
             then_block: AstBlock {
                 stmts: vec![AstStmt::Goto(Box::new(AstGoto {
-                    target: AstLabelId(id),
+                    target: AstLabelId::Synthetic(id),
                 }))],
             },
             else_block: None,
@@ -1737,7 +1739,7 @@ mod tests {
                 AstStmt::DoBlock(Box::new(AstBlock {
                     stmts: vec![
                         AstStmt::Goto(Box::new(AstGoto {
-                            target: AstLabelId(0),
+                            target: AstLabelId::Synthetic(0),
                         })),
                         AstStmt::Assign(Box::new(AstAssign {
                             targets: vec![AstLValue::Name(AstNameRef::Global(AstGlobalName {

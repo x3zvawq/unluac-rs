@@ -2,9 +2,13 @@
 //!
 //! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨后续观察点的
 //! table/global lookup result，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
-//! VM GC root。
+//! VM GC root。ordinary call 的参数槽由前层标记交接给 callee，只有当前唯一 producer 与
+//! call 参数端点仍匹配时才排除跨调用的 allocation-root 配对，不能把 callee 可覆盖的槽
+//! 物化为额外 caller local。例如 `f({})` 在 f 内丢弃参数后允许对象回收。
 //! Promotion 另会发布普通 copy root 的单结果 call + 紧邻 MOVE 终点；本层只按 producer / endpoint
 //! temp 与 overwritten home 完整匹配，把它接入同一 local-owner handoff，不从 HIR 相邻文本猜 opcode。
+//! allocation 的内部 aggregate 存储由共享 object_flow 证明是否真正逃逸，不能仅凭
+//! store 外形把不同 value epoch 合成一个 local。缺失正向证明时仍保留原配对。
 //! copy 共享值 identity，
 //! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
 //! 消费者只能把 producer 与同 home 的精确覆盖配对。
@@ -22,9 +26,24 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use super::flow_events::escaping_identity_temps_in_stmt_header;
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
-use super::visit::{HirVisitor, visit_expr, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
+
+/// 当前语句中必须只有一个仍匹配 producer 的参数交接端点；共享给内联和身份物化。
+pub(super) fn stmt_has_argument_root_handoff(stmt: &HirStmt, temp: TempId) -> bool {
+    struct Handoffs {
+        temp: TempId,
+        count: usize,
+    }
+    impl HirVisitor for Handoffs {
+        fn visit_call(&mut self, call: &HirCallExpr) {
+            self.count += usize::from(call.transfers_argument_root(self.temp));
+        }
+    }
+    let mut handoffs = Handoffs { temp, count: 0 };
+    visit_stmts(std::slice::from_ref(stmt), &mut handoffs);
+    handoffs.count == 1
+}
 
 struct ActiveCallRoot {
     value_id: CallValueId,
@@ -69,11 +88,12 @@ struct ActiveAllocationRoot {
     /// Each physical home has its own root transaction. The allocation value identity is
     /// shared, but a cross-home copy establishes a new producer for only the target home.
     home_owners: BTreeMap<HomeSlotKey, AllocationHomeOwner>,
-    escaped: bool,
+    allocation_site: usize,
 }
 
 #[derive(Clone, Copy)]
 struct AllocationHomeOwner {
+    producer: TempId,
     definition_index: usize,
     eligible: bool,
 }
@@ -101,6 +121,8 @@ pub(super) struct CallRootLifetimeIndices {
     roots_by_overwrite: BTreeMap<usize, Vec<CallRootOverwritePair>>,
     root_by_protected: BTreeMap<usize, usize>,
     pre_dispatch_releases: BTreeMap<usize, BTreeSet<TempId>>,
+    allocation_sites: BTreeMap<usize, usize>,
+    allocation_release_sites: BTreeMap<(usize, TempId), usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -447,6 +469,14 @@ pub(super) fn collect_call_root_lifetimes(
     mut producer_temp_is_eligible: impl FnMut(TempId) -> bool,
     mut overwrite_temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> CallRootLifetimeIndices {
+    let opaque_allocations = stmts
+        .iter()
+        .filter_map(scalar_temp_definition)
+        .filter_map(|(temp, value)| {
+            (matches!(value, HirExpr::TableConstructor(_)) && !producer_temp_is_eligible(temp))
+                .then_some(temp)
+        })
+        .collect::<BTreeSet<_>>();
     let uses = TempUseEvents::new(stmts);
     let mut active = BTreeMap::<HomeSlotKey, ActiveCallRoot>::new();
     let mut next_call_value_id = 0;
@@ -533,6 +563,12 @@ pub(super) fn collect_call_root_lifetimes(
         let reads = uses.reads_at(index);
         let read_observations = active
             .iter()
+            // Dataflow 已证明该 root 在最后值读取后、首个观察前被覆盖；单纯读取
+            // 不能再要求同 home local。显式 GC 和真实潜在观察仍由上方统一处理。
+            .filter(|(_, root)| {
+                !scalar_temp_definition(&stmts[root.root_index])
+                    .is_some_and(|(temp, _)| facts.call_result_root_ends_after_value_use(temp))
+            })
             .filter(|(_, root)| {
                 reads.is_some_and(|reads| root.aliases.iter().any(|temp| reads.contains(temp)))
             })
@@ -570,13 +606,6 @@ pub(super) fn collect_call_root_lifetimes(
             })
             .collect::<BTreeSet<_>>();
         observe_active_call_values(&mut active, Some(&read_observations));
-        let escaped_temps = escaping_identity_temps_in_stmt_header(stmt);
-        for root in &mut active_allocations {
-            root.escaped |= root
-                .aliases
-                .iter()
-                .any(|alias| escaped_temps.contains(alias));
-        }
         let Some((temp, value)) = scalar_definition else {
             forget_written_known_nil_temps(stmt, &mut known_nil_temps);
             if let Some(targets) =
@@ -893,6 +922,48 @@ pub(super) fn collect_call_root_lifetimes(
         }
     }
 
+    // 物理槽复用不代表对象已被外部观察。共享对象流证明原始 allocation 在
+    // 覆盖点仍未逃逸时，不把内部 aggregate 存储固化成同一 local 的释放事务。
+    let allocation_roots = std::mem::take(&mut lifetimes.allocation_sites);
+    let allocation_releases = std::mem::take(&mut lifetimes.allocation_release_sites);
+    if !allocation_roots.is_empty() || !allocation_releases.is_empty() {
+        let objects =
+            super::object_flow::AllocationEscapeFacts::analyze(stmts, safety, &opaque_allocations);
+        for ((index, temp), site) in allocation_releases {
+            if objects.proves_unescaped(site, &stmts[index])
+                && let Some(releases) = lifetimes.pre_dispatch_releases.get_mut(&index)
+            {
+                releases.remove(&temp);
+            }
+        }
+        lifetimes
+            .pre_dispatch_releases
+            .retain(|_, releases| !releases.is_empty());
+        for (index, pairs) in &mut lifetimes.roots_by_overwrite {
+            pairs.retain(|pair| {
+                allocation_roots
+                    .get(&pair.root_index)
+                    .is_none_or(|site| !objects.proves_unescaped(*site, &stmts[*index]))
+            });
+        }
+        lifetimes
+            .roots_by_overwrite
+            .retain(|_, pairs| !pairs.is_empty());
+        let retained = lifetimes
+            .roots_by_overwrite
+            .values()
+            .flatten()
+            .map(|pair| pair.root_index)
+            .collect::<BTreeSet<_>>();
+        for root in allocation_roots
+            .keys()
+            .filter(|root| !retained.contains(root))
+        {
+            lifetimes.roots.remove(root);
+            lifetimes.root_homes.remove(root);
+            lifetimes.root_by_protected.retain(|_, owner| owner != root);
+        }
+    }
     lifetimes
 }
 
@@ -957,9 +1028,11 @@ fn release_roots_before_generic_dispatch(
         for home in result_homes {
             if let Some(owner) = root.home_owners.remove(home)
                 && owner.eligible
-                && root.escaped
                 && let Some(temp) = root_release_temp(&root.aliases, *home, index, uses, facts)
             {
+                lifetimes
+                    .allocation_release_sites
+                    .insert((index, temp), root.allocation_site);
                 lifetimes
                     .pre_dispatch_releases
                     .entry(index)
@@ -2155,6 +2228,7 @@ impl HirVisitor for GcRootObservationCollector {
 }
 
 struct TempUseEvents {
+    argument_transfers: BTreeMap<TempId, Vec<usize>>,
     reads: BTreeMap<TempId, Vec<usize>>,
     reads_by_stmt: Vec<BTreeSet<TempId>>,
     writes: BTreeMap<TempId, Vec<usize>>,
@@ -2172,19 +2246,37 @@ impl TempUseEvents {
         }
 
         let mut writes = BTreeMap::<TempId, Vec<usize>>::new();
+        let mut argument_transfers = BTreeMap::<TempId, Vec<usize>>::new();
         for (index, stmt) in stmts.iter().enumerate() {
             let mut collector = TempWriteCollector::default();
             visit_stmts(std::slice::from_ref(stmt), &mut collector);
             for temp in collector.temps {
                 writes.entry(temp).or_default().push(index);
             }
+            for temp in collector.argument_transfers {
+                argument_transfers.entry(temp).or_default().push(index);
+            }
         }
         Self {
+            argument_transfers,
             reads,
             reads_by_stmt,
             writes,
             gc_fence_indices: collect_gc_fence_indices(stmts),
         }
+    }
+
+    /// 精确配对本快照内唯一的 producer 与 call 参数端点。多写或重复 call token 必须拒绝。
+    fn has_argument_transfer(&self, temp: TempId, producer: usize, overwrite: usize) -> bool {
+        self.writes
+            .get(&temp)
+            .is_some_and(|writes| writes.as_slice() == [producer])
+            && self.argument_transfers.get(&temp).is_some_and(|sites| {
+                let [site] = sites.as_slice() else {
+                    return false;
+                };
+                producer < *site && *site <= overwrite
+            })
     }
 
     fn has_live_read_after(&self, temp: TempId, index: usize) -> bool {
@@ -2306,13 +2398,21 @@ fn next_event_at_or_after(events: Option<&Vec<usize>>, index: usize) -> Option<u
 
 #[derive(Default)]
 struct TempWriteCollector {
-    temps: BTreeSet<TempId>,
+    temps: Vec<TempId>,
+    argument_transfers: Vec<TempId>,
 }
 
 impl HirVisitor for TempWriteCollector {
+    fn visit_call(&mut self, call: &HirCallExpr) {
+        for root in &call.argument_roots {
+            if call.transfers_argument_root(root.producer) {
+                self.argument_transfers.push(root.producer);
+            }
+        }
+    }
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         if let HirLValue::Temp(temp) = lvalue {
-            self.temps.insert(*temp);
+            self.temps.push(*temp);
         }
     }
 }
@@ -2429,6 +2529,7 @@ fn update_allocation_roots(
             // producer for a root that never left its physical slot.
             root.aliases.insert(temp);
             root.home_owners.entry(slot).or_insert(AllocationHomeOwner {
+                producer: temp,
                 definition_index: index,
                 eligible,
             });
@@ -2463,17 +2564,18 @@ fn update_allocation_roots(
 
     state.active.retain(|root| !root.home_owners.is_empty());
 
-    if matches!(value, HirExpr::TableConstructor(_)) {
+    if let HirExpr::TableConstructor(table) = value {
         state.active.push(ActiveAllocationRoot {
             aliases: BTreeSet::from([temp]),
             home_owners: BTreeMap::from([(
                 slot,
                 AllocationHomeOwner {
+                    producer: temp,
                     definition_index: index,
                     eligible,
                 },
             )]),
-            escaped: false,
+            allocation_site: std::ptr::from_ref(table.as_ref()).addr(),
         });
     }
 }
@@ -2520,7 +2622,9 @@ fn record_allocation_root_overwrite(
     evidence: AllocationOverwriteEvidence<'_>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
-    if root.escaped
+    if !evidence
+        .uses
+        .has_argument_transfer(owner.producer, owner.definition_index, index)
         && owner.eligible
         && eligible
         && !root
@@ -2530,6 +2634,9 @@ fn record_allocation_root_overwrite(
             .any(|alias| evidence.uses.has_live_read_after(*alias, index))
     {
         let root_index = owner.definition_index;
+        lifetimes
+            .allocation_sites
+            .insert(root_index, root.allocation_site);
         lifetimes.roots.insert(root_index);
         lifetimes
             .root_homes
@@ -2693,6 +2800,7 @@ mod tests {
 
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(crate::hir::common::HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
@@ -2833,6 +2941,7 @@ mod tests {
                 assign(
                     HirLValue::Temp(old),
                     HirExpr::Call(Box::new(HirCallExpr {
+                        argument_roots: Vec::new(),
                         callee: HirExpr::GlobalRef(crate::hir::common::HirGlobalRef {
                             key: "make_collectable".into(),
                         }),

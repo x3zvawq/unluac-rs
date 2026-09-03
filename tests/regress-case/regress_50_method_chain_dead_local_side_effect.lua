@@ -1,6 +1,7 @@
 -- regress_50_method_chain_dead_local_side_effect#1: method-chain sugar 不能吞掉前置 dead local 的可观察初始化
--- unluac: expect-not-contains [[local r3_0 = r0_2()]]
--- unluac: expect-contains [[r0_2()]]
+-- 物理根的声明/赋值外形不属于本例约束；用完整事件轨迹验证调用次数与顺序。
+-- unluac: expect-contains [[:step("first")]]
+-- unluac: expect-contains [[:step("second")]]
 
 local log = {}
 
@@ -23,4 +24,6 @@ local function run()
     return table.concat(log, ",")
 end
 
-print("regress_50_method_chain_dead_local_side_effect#1", run())
+local result = run()
+assert(result == "side,first,second")
+print("regress_50_method_chain_dead_local_side_effect#1", result)

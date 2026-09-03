@@ -1,4 +1,4 @@
-//! 构建 case runner、枚举 case、调度 worker、处理超时并解析机器输出；依赖子进程与 channel，不负责终端渲染；例如杀死超时 case 并归一化失败详情。
+//! 构建 case runner 并消费 Cargo 返回的 executable identity，枚举 case、调度 worker、处理超时并解析机器输出；依赖子进程与 channel，不负责终端渲染；例如杀死超时 case 并归一化失败详情。
 
 use super::*;
 
@@ -9,25 +9,48 @@ pub(super) fn workspace_root() -> Result<PathBuf> {
         .context("failed to resolve workspace root")
 }
 
-pub(super) fn build_unit_case_runner(root: &Path) -> Result<()> {
-    run_command(
-        "cargo",
-        [
+/// 构建产物路径由 Cargo 的 compiler-artifact 事实返回，不能在后层按 target/debug 重建。
+/// 自定义 target-dir、Cargo 配置或 host target 都由同一次构建解析。
+pub(super) fn build_unit_case_runner(root: &Path) -> Result<PathBuf> {
+    let output = Command::new("cargo")
+        .args([
             "build",
             "--quiet",
+            "--message-format=json-render-diagnostics",
             "-p",
             "unluac-test-support",
             "--bin",
             "unit_case_runner",
-        ],
-        root,
-    )
-}
-
-pub(super) fn unit_case_runner_path(root: &Path) -> PathBuf {
-    root.join("target")
-        .join("debug")
-        .join(format!("unit_case_runner{}", std::env::consts::EXE_SUFFIX))
+        ])
+        .current_dir(root)
+        .stderr(Stdio::inherit())
+        .output()
+        .context("failed to build unit case runner")?;
+    if !output.status.success() {
+        bail!(
+            "building unit case runner failed with status {}",
+            output.status
+        );
+    }
+    let mut executable = None;
+    for line in output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let message: serde_json::Value =
+            serde_json::from_slice(line).context("Cargo build message is not valid JSON")?;
+        if message["reason"] == "compiler-artifact"
+            && message["target"]["name"] == "unit_case_runner"
+            && let Some(path) = message["executable"].as_str()
+        {
+            if executable.is_some() {
+                bail!("Cargo reported multiple unit case runner executables");
+            }
+            executable = Some(PathBuf::from(path));
+        }
+    }
+    executable.context("Cargo did not report a unit case runner executable")
 }
 
 pub(super) fn list_unit_cases(root: &Path, runner: &Path) -> Result<Vec<UnitCaseDescriptor>> {
@@ -450,23 +473,5 @@ pub(super) fn normalize_runner_failure(
             .strip_prefix(&format!("case: {}\n", case.path))
             .unwrap_or(trimmed)
             .to_owned(),
-    }
-}
-
-pub(super) fn run_command<I, S>(program: &str, args: I, cwd: &Path) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let status = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .status()
-        .with_context(|| format!("failed to spawn `{program}` in {}", cwd.display()))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("`{program}` failed with status {status}")
     }
 }

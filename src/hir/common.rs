@@ -572,6 +572,8 @@ pub enum HirBinaryOpKind {
 /// 调用表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCallExpr {
+    /// 原始参数槽交给该 call 的事实；只供 HIR 消费，不向 AST 泄漏物理槽协议。
+    pub argument_roots: Vec<HirCallArgumentRoot>,
     pub callee: HirExpr,
     pub args: HirValuePack,
     pub method: bool,
@@ -591,6 +593,16 @@ pub struct HirCallExpr {
     pub method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
 }
 
+/// 一个 canonical definition 的原始 home 在该参数位置交给 callee。
+///
+/// producer 仍须在当前 HIR 中唯一，参数必须仍直接读取它；clone、合并或树化后不得
+/// 单凭绑定名沿用。交接只终止 caller 对该槽的独立持有，不证明对象已被回收。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HirCallArgumentRoot {
+    pub(crate) producer: TempId,
+    pub(crate) argument: usize,
+}
+
 /// 调用点接管底层物理根的方式。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HirCallRootHandoff {
@@ -599,6 +611,13 @@ pub enum HirCallRootHandoff {
 }
 
 impl HirCallExpr {
+    pub(crate) fn transfers_argument_root(&self, temp: TempId) -> bool {
+        self.argument_roots.iter().any(|root| {
+            root.producer == temp
+                && self.args.fixed.get(root.argument) == Some(&HirExpr::TempRef(temp))
+        })
+    }
+
     /// 返回由前层 method 协议证明的 receiver 与字段名。
     pub(crate) fn method_receiver(&self) -> Option<(&HirExpr, &LuaString)> {
         if !self.method {
@@ -954,6 +973,47 @@ pub struct HirGenericFor {
     /// 旧 result home 在调用 iterator 期间已经不属于 caller root prefix，而
     /// `success_binding` 只在首结果允许进入 body 的边上获得源码 binding 身份。
     pub dispatch_results: Vec<HirGenericForDispatchResult>,
+}
+
+impl HirGenericFor {
+    /// 改写 iterator 时只撤销实际变化区间的 producer 证书。
+    ///
+    /// 每个 span 独立拥有固定的语义槽；改变 callee 不应丢弃另一段未变 nil producer。
+    /// fixed 槽被删除、移动或改写时，该段须重新由 owner 证明，不能按新文本猜回协议。
+    pub(crate) fn retain_unchanged_initializer_spans(&mut self, before: &HirValuePack) -> bool {
+        let Some(transaction) = &mut self.initializer_transaction else {
+            return false;
+        };
+        let count = transaction.producers.len();
+        transaction.producers.retain(|span| {
+            let range = span.value_start..span.value_start + span.value_count;
+            before
+                .fixed
+                .get(range.clone())
+                .is_some_and(|values| self.iterator.fixed.get(range) == Some(values))
+        });
+        let changed = transaction.producers.len() != count;
+        if transaction.producers.is_empty() {
+            self.initializer_transaction = None;
+        }
+        changed
+    }
+
+    /// 在 iterator 的局部改写边界统一维护 producer 身份，避免各 pass 丢弃整份证明。
+    pub(crate) fn rewrite_iterator<R>(
+        &mut self,
+        rewrite: impl FnOnce(&mut HirValuePack) -> R,
+    ) -> R {
+        let before = self
+            .initializer_transaction
+            .as_ref()
+            .map(|_| self.iterator.clone());
+        let result = rewrite(&mut self.iterator);
+        if let Some(before) = before {
+            self.retain_unchanged_initializer_spans(&before);
+        }
+        result
+    }
 }
 
 /// Generic-for 隐式 dispatch 的一个固定 result endpoint。

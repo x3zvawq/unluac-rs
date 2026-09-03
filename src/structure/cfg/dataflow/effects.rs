@@ -1,7 +1,9 @@
 //! low-IR 指令的寄存器读写与副作用摘要。
 //!
 //! 这里把 Transformer 已冻结的单条指令语义投影成 canonical SSA 和后续移动安全性所需的
-//! 稠密事实；不识别控制结构，也不根据 opcode 外形猜隐式 owner。例如可能原槽转换的
+//! 稠密事实，并一次性冻结观察期间的 caller root 边界；例如 TFORCALL 只消费三个固定
+//! 输入，未产生的 result 槽不属于其存活前缀证明。下游不能从读写集合重新解释调用协议。
+//! 本层不识别控制结构，也不根据 opcode 外形猜隐式 owner。例如可能原槽转换的
 //! `TypeGuard` 同时读取并定义 subject，而纯类型检查只保留读取。
 
 use super::*;
@@ -221,7 +223,10 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
     effect
 }
 
-pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary {
+pub(super) fn compute_side_effect_summary(
+    instr: &LowInstr,
+    effect: &InstrEffect,
+) -> SideEffectSummary {
     let mut tags = BTreeSet::new();
 
     match instr {
@@ -288,7 +293,42 @@ pub(super) fn compute_side_effect_summary(instr: &LowInstr) -> SideEffectSummary
         _ => {}
     }
 
-    SideEffectSummary { tags }
+    let mut summary = SideEffectSummary {
+        tags,
+        root_observation: RootObservation::None,
+    };
+    summary.root_observation = match instr {
+        LowInstr::Return(_) | LowInstr::TailCall(_) => RootObservation::FrameExit,
+        // callee base 才是跨方言共同成立的 caller-frame 边界；LuaJIT FR1/FR2
+        // frame link 使 args.start 不能代替它，更不能用尚未写入的结果槽抬高边界。
+        LowInstr::Call(call) => RootObservation::Call {
+            caller_end: call.callee,
+        },
+        LowInstr::Close(_) => RootObservation::Close,
+        LowInstr::Tbc(tbc) => RootObservation::PrefixLowerBound {
+            end: tbc.reg.index() + 1,
+        },
+        LowInstr::GenericForCall(call) => RootObservation::PrefixLowerBound {
+            end: [call.iterator, call.state, call.control]
+                .into_iter()
+                .map(|reg| reg.index() + 1)
+                .max()
+                .expect("iterator has three fixed inputs"),
+        },
+        _ if summary.may_observe_gc_roots() => RootObservation::PrefixLowerBound {
+            end: effect
+                .fixed_uses
+                .iter()
+                .chain(&effect.fixed_must_defs)
+                .map(|reg| reg.index().saturating_add(1))
+                .chain(effect.open_use.map(Reg::index))
+                .chain(effect.open_must_def.map(Reg::index))
+                .max()
+                .unwrap_or_default(),
+        },
+        _ => RootObservation::None,
+    };
+    summary
 }
 
 fn insert_reg_range(target: &mut BTreeSet<Reg>, range: RegRange) {

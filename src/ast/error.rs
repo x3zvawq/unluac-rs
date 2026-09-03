@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::ast::{AstBindingRef, DecompileDialect};
+use crate::ast::{AstBindingRef, AstLabelId, DecompileDialect};
 
 /// HIR -> AST lowering 可能失败的原因。
 #[derive(Debug, Error)]
@@ -62,15 +62,15 @@ pub enum AstLowerError {
         binding: AstBindingRef,
     },
     #[error("AST function#{function} defines goto label#{label} more than once")]
-    DuplicateGotoLabel { function: usize, label: usize },
+    DuplicateGotoLabel { function: usize, label: AstLabelId },
     #[error("AST function#{function} goto references missing label#{label} in the same function")]
-    MissingGotoLabel { function: usize, label: usize },
+    MissingGotoLabel { function: usize, label: AstLabelId },
     #[error("AST function#{function} goto label#{label} is not visible from its lexical block")]
-    InvisibleGotoLabel { function: usize, label: usize },
+    InvisibleGotoLabel { function: usize, label: AstLabelId },
     #[error("AST function#{function} goto label#{label} enters local binding {binding:?} scope")]
     GotoEntersLocalScope {
         function: usize,
-        label: usize,
+        label: AstLabelId,
         binding: AstBindingRef,
     },
     #[error(
@@ -78,7 +78,7 @@ pub enum AstLowerError {
     )]
     GotoEntersToBeClosedScope {
         function: usize,
-        label: usize,
+        label: AstLabelId,
         binding: AstBindingRef,
     },
     #[error("AST function#{function} has an inconsistent goto scope tree")]

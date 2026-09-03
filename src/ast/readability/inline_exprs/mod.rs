@@ -1579,7 +1579,7 @@ mod tests {
         let source = AstBindingRef::Local(LocalId(0));
         let target = AstBindingRef::Local(LocalId(1));
         let snapshot = AstBindingRef::Local(LocalId(2));
-        let join = AstLabelId(0);
+        let join = AstLabelId::Synthetic(0);
         let mut block = AstBlock {
             stmts: vec![
                 debug_local(source, AstExpr::Integer(7)),
@@ -1613,7 +1613,7 @@ mod tests {
         let source = AstBindingRef::Local(LocalId(0));
         let target = AstBindingRef::Local(LocalId(1));
         let snapshot = AstBindingRef::Local(LocalId(2));
-        let join = AstLabelId(0);
+        let join = AstLabelId::Synthetic(0);
         let mut block = AstBlock {
             stmts: vec![
                 debug_local(source, AstExpr::Integer(7)),
@@ -1723,7 +1723,7 @@ mod tests {
         let source = AstBindingRef::Local(LocalId(0));
         let target = AstBindingRef::Local(LocalId(1));
         let snapshot = AstBindingRef::Local(LocalId(2));
-        let internal = AstLabelId(0);
+        let internal = AstLabelId::Synthetic(0);
         let mut block = AstBlock {
             stmts: vec![
                 debug_local(source, AstExpr::Integer(7)),

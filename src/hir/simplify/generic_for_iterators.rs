@@ -24,8 +24,8 @@ use super::mention::{
     ReferenceCapturedBindings, collect_temp_use_counts, stmts_reference_captured_bindings,
     stmts_value_captured_bindings,
 };
-use super::visit::{HirVisitor, visit_expr, visit_stmts};
 use super::walk::{HirRewritePass, rewrite_proto};
+use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 pub(super) fn fold_generic_for_iterators_in_proto(
     proto: &mut HirProto,

@@ -155,10 +155,10 @@ pub(super) fn write_block(
                 let _ = writeln!(output, "{indent}continue");
             }
             AstStmt::Goto(goto_stmt) => {
-                let _ = writeln!(output, "{indent}goto L{}", goto_stmt.target.index());
+                let _ = writeln!(output, "{indent}goto {}", goto_stmt.target);
             }
             AstStmt::Label(label) => {
-                let _ = writeln!(output, "{indent}::L{}::", label.id.index());
+                let _ = writeln!(output, "{indent}::{}::", label.id);
             }
             AstStmt::DoBlock(block) => {
                 let _ = writeln!(output, "{indent}do");

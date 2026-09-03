@@ -5,7 +5,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-contains [[for r1_3 = 1, 3 do]]
+-- Loop identity is allocated after HIR binding recovery; the contract is the numeric-for shape.
+-- unluac: expect-contains [[for ]]
+-- unluac: expect-contains [[ = 1, 3 do]]
 local function run(a, b)
     local x = 0
     if a and b then
@@ -25,3 +27,6 @@ local function run(a, b)
 end
 
 print("regress_98_short_circuit_shared_return_value#1", run(false, true))
+
+print("regress_98_short_circuit_shared_return_value#2", run(true, true))
+print("regress_98_short_circuit_shared_return_value#3", run(true, false))

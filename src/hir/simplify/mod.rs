@@ -15,7 +15,6 @@ mod dead_temps;
 mod debug_scopes;
 pub(super) mod decision;
 mod expr_facts;
-mod flow_events;
 mod generic_for_iterators;
 mod label_refs;
 mod lexical_cfg;
@@ -25,13 +24,13 @@ mod logical_simplify;
 mod mention;
 mod method_protocol;
 mod method_rewrite_transactions;
+mod object_flow;
 mod repeat_root_lifetimes;
 mod residuals;
 mod root_lifetimes;
 mod table_constructors;
 mod temp_inline;
 mod temp_touch;
-mod visit;
 pub(crate) mod walk;
 
 use crate::debug::DebugFilters;
@@ -149,7 +148,9 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "table-constructors",
         phase: PassPhase::Normal,
         depends_on: &[TablePattern, LocalBinding],
-        invalidates: &[TablePattern],
+        // Constructor commit 会删除 producer、替换 SETLIST 并改变 binding 的使用点；
+        // 这些事实必须让内联与 identity owner 重算，不能只通知表形状消费者。
+        invalidates: &[TablePattern, TempChain, LocalBinding],
     },
     PassDescriptor {
         name: "temp-inline",
@@ -262,6 +263,23 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         depends_on: &[LabelGoto],
         invalidates: &[LabelGoto, BlockStructure, TempChain],
     },
+    PassDescriptor {
+        name: "repeat-root-lifetimes",
+        phase: PassPhase::Deferred,
+        depends_on: &[
+            DecisionShape,
+            BooleanPattern,
+            LogicalExpr,
+            TablePattern,
+            TempChain,
+            LocalBinding,
+            BlockStructure,
+            LabelGoto,
+            ClosureCapture,
+        ],
+        // 新发现的无显式读取 root 仍需要 locals 在原 repeat body 安排词法 owner。
+        invalidates: &[TempChain, LocalBinding],
+    },
 ];
 
 /// 对已经构造完成的 HIR 做 fixed-point 收敛。
@@ -285,6 +303,13 @@ pub(super) fn simplify_hir(
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
+                if index == 15 {
+                    return repeat_root_lifetimes::mark_repeat_trailing_condition_roots(
+                        module,
+                        promotion_facts,
+                        safety,
+                    );
+                }
                 if index == 4 {
                     return apply_temp_inline_pass(
                         module,
@@ -354,9 +379,6 @@ pub(super) fn simplify_hir(
         });
     }
 
-    timings.record("repeat-root-lifetimes", || {
-        repeat_root_lifetimes::mark_repeat_trailing_condition_roots(module, promotion_facts, safety)
-    });
     timings.record("method-rewrite-transactions", || {
         for proto in &mut module.protos {
             if let Some(facts) = promotion_facts.get(proto.id.index()) {

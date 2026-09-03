@@ -1804,6 +1804,7 @@ mod tests {
     fn call_stmt(callee: HirExpr) -> HirStmt {
         HirStmt::CallStmt(Box::new(HirCallStmt {
             call: HirCallExpr {
+                argument_roots: Vec::new(),
                 callee,
                 args: HirValuePack::default(),
                 method: false,

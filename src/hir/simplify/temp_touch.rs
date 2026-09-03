@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, TempId};
 
-use super::visit::{HirVisitor, visit_expr, visit_proto, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_expr, visit_proto, visit_stmts};
 
 pub(super) fn stmts_touch_any_temp(stmts: &[HirStmt], temps: &BTreeSet<TempId>) -> bool {
     TempTouchCollector::touches_in_stmts(stmts, temps)

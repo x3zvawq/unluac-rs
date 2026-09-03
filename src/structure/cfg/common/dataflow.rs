@@ -2,7 +2,8 @@
 //!
 //! 这里承接 low-IR + CFG + GraphFacts 推导出的 canonical SSA / liveness / effect 事实。
 //! 下游应通过这里提供的查询接口读取定义、phi 和 reaching/use 信息，而不是直接依赖
-//! 这些事实在内存中的当前组织形状。
+//! 这些事实在内存中的当前组织形状。`RootObservation` 保留观察期间的物理栈合同，
+//! 与 SSA 读写和副作用标签分别表达值依赖、可见事件及 root 存活边界。
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -223,6 +224,67 @@ impl DataflowFacts {
             .expect("dataflow should have a def record for every def id")
     }
 
+    /// 所有可达前驱路径都尚未写入该物理槽，当前定义覆盖的仍是函数入口值。
+    /// PC 最早定义并不足够：回边若重新执行该定义，前一轮已经留下新的 value epoch。
+    pub fn def_overwrites_entry_value(&self, def: DefId, cfg: &Cfg) -> bool {
+        let block = self.def_block(def);
+        let home = self.def_reg(def);
+        let prefix = cfg.blocks[block.index()].instrs.start.index()..self.def_instr(def).index();
+        if prefix
+            .into_iter()
+            .any(|index| self.instr_effects[index].must_define(home))
+        {
+            return false;
+        }
+        let mut pending = cfg.reachable_predecessors(block);
+        let mut seen = BTreeSet::new();
+        while let Some(predecessor) = pending.pop() {
+            if !seen.insert(predecessor) {
+                continue;
+            }
+            let range = cfg.blocks[predecessor.index()].instrs;
+            if (range.start.index()..range.end())
+                .any(|index| self.instr_effects[index].must_define(home))
+            {
+                return false;
+            }
+            pending.extend(cfg.reachable_predecessors(predecessor));
+        }
+        true
+    }
+
+    /// 最后一次值读取后、首个潜在 GC/cleanup 观察前的必定覆盖。
+    ///
+    /// 只证明同一 basic block 内、没有 phi use 的 canonical value epoch；返回覆盖 def
+    /// 身份，不能把“未发现 root 保留事实”当作等价的释放证明。消费者还须验证当前唯一
+    /// producer/use、捕获与求值顺序。例如 CALL r; SETLIST(..., r); MOVE r,callee
+    /// 的结果不再跨后续调用独立保活，赋值给弱表且随后先 GC 的情况则没有此证明。
+    pub fn unobserved_root_overwrite_after_last_use(&self, def: DefId, cfg: &Cfg) -> Option<DefId> {
+        let block = self.def_block(def);
+        let producer = self.def_instr(def).index();
+        let home = self.def_reg(def);
+        if !self.def_phi_uses[def.index()].is_empty() {
+            return None;
+        }
+        let uses = &self.def_uses[def.index()];
+        if uses.iter().any(|use_| {
+            use_.instr.index() <= producer || cfg.instr_to_block[use_.instr.index()] != block
+        }) {
+            return None;
+        }
+        let last_use = uses.iter().map(|use_| use_.instr.index()).max()?;
+        for index in last_use + 1..cfg.blocks[block.index()].instrs.end() {
+            let summary = &self.effect_summaries[index];
+            if summary.may_observe_gc_roots() || summary.root_observation != RootObservation::None {
+                return None;
+            }
+            if self.instr_effects[index].must_define(home) {
+                return self.instr_def_for_reg(InstrRef(index), home);
+            }
+        }
+        None
+    }
+
     pub fn instr_def_for_reg(&self, instr: InstrRef, reg: Reg) -> Option<DefId> {
         self.instr_defs
             .get(instr.index())?
@@ -353,6 +415,60 @@ impl InstrEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SideEffectSummary {
     pub tags: BTreeSet<EffectTag>,
+    pub root_observation: RootObservation,
+}
+
+impl SideEffectSummary {
+    /// 可能调用用户代码或触发分配的事件；不把 frame exit 或 cleanup 的专用协议混进来。
+    pub fn may_observe_gc_roots(&self) -> bool {
+        self.tags.iter().any(|tag| {
+            matches!(
+                tag,
+                EffectTag::Alloc
+                    | EffectTag::ReadTable
+                    | EffectTag::WriteTable
+                    | EffectTag::ReadEnv
+                    | EffectTag::WriteEnv
+                    | EffectTag::Call
+                    | EffectTag::Metamethod
+            )
+        })
+    }
+}
+
+/// 原始指令观察期间的物理 root 合同。只在同一 low-IR snapshot 内以 InstrRef 定位。
+///
+/// PrefixLowerBound 之外是未知，不能推出死亡；Call 的边界只描述 caller frame，
+/// 被调用函数仍可通过自己的参数持有同一对象。这些事实不授权删除 producer 或延长词法 scope。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RootObservation {
+    #[default]
+    None,
+    FrameExit,
+    /// Close 结束 open-upvalue/TBC 协议而不覆盖槽；不凭空证明此前未被观察的高槽存活。
+    Close,
+    PrefixLowerBound {
+        end: usize,
+    },
+    Call {
+        caller_end: Reg,
+    },
+}
+
+impl RootObservation {
+    pub fn keeps_home_rooted(self, home: Reg) -> bool {
+        match self {
+            Self::PrefixLowerBound { end } => home.index() < end,
+            Self::Call { caller_end } => home.index() < caller_end.index(),
+            Self::None | Self::FrameExit | Self::Close => false,
+        }
+    }
+
+    /// 专用于普通调用的 collective 证明；不能把前缀下界当作排除上界。
+    pub fn excludes_homes_from_caller(self, homes: &BTreeSet<Reg>) -> bool {
+        matches!(self, Self::Call { caller_end }
+            if homes.iter().all(|home| home.index() >= caller_end.index()))
+    }
 }
 
 /// 当前阶段关心的副作用标签。

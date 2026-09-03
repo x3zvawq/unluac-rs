@@ -16,8 +16,8 @@ use crate::hir::common::{
 use crate::transformer::InstrRef;
 
 use super::label_refs::count_label_references;
-use super::visit::{HirVisitor, visit_proto, visit_stmts};
 use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_proto};
+use crate::hir::visit::{HirVisitor, visit_proto, visit_stmts};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopeInterval {
@@ -90,7 +90,7 @@ fn collect_pending_tbc_boundary_labels_in_block(
     block: &HirBlock,
     labels: &mut BTreeSet<HirLabelId>,
 ) {
-    super::visit::visit_block(block, &mut PendingTbcBoundaryCollector { labels });
+    crate::hir::visit::visit_block(block, &mut PendingTbcBoundaryCollector { labels });
 }
 
 struct PendingTbcBoundaryCollector<'a> {
@@ -375,7 +375,9 @@ fn find_scope_end(
     }
 
     if saw_close {
-        last_activity.or(label_scope_end).map(|end| ScopeEnd {
+        // 分支内 cleanup 与 active label 分别提供区间下界；二者同时存在时必须
+        // 覆盖较远边界，不能因先发现 cleanup 而丢弃前层已证明的 scope 延续。
+        last_activity.max(label_scope_end).map(|end| ScopeEnd {
             end,
             covering_close_indices,
         })

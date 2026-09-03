@@ -20,7 +20,7 @@ use self::open::analyze_open_values;
 use self::ssa::build_ssa;
 use super::common::{
     BlockRef, Cfg, CfgGraph, DataflowFacts, Def, DefId, EffectTag, GraphFacts, InstrEffect,
-    PhiCandidate, SideEffectSummary, SsaValue,
+    PhiCandidate, RootObservation, SideEffectSummary, SsaValue,
 };
 
 struct BlockLiveness {
@@ -138,7 +138,8 @@ fn compute_dataflow_proto(
     let effect_summaries = proto
         .instrs
         .iter()
-        .map(compute_side_effect_summary)
+        .zip(&instr_effects)
+        .map(|(instr, effect)| compute_side_effect_summary(instr, effect))
         .collect::<Vec<_>>();
     let reg_count = compute_reg_count(proto, &instr_effects)?;
 

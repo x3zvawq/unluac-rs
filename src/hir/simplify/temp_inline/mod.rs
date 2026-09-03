@@ -1,5 +1,7 @@
 //! 这个文件实现 HIR 的第一批 temp inlining。
 //!
+//! 原始参数槽交接证明只在当前唯一 producer/参数 occurrence 配对后消费；capture、
+//! 执行区域与求值顺序仍需正证，展示复杂度不能迫使该参数变成额外 caller root。
 //! 常规路径以 use-count、home/capture 与求值区域事实证明等价性，只折叠“单目标 temp
 //! 赋值，并且被紧邻下一条
 //! 简单语句使用一次”的情况。调用表达式另有一条更窄的连续融合规则，用来处理
@@ -87,9 +89,10 @@ use super::mention::{
 use super::root_lifetimes::{
     CallRootLifetimeIndices, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
     materialize_generic_for_dispatch_root_releases, scope_end_copy_roots_needing_materialization,
+    stmt_has_argument_root_handoff,
 };
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
-use super::visit::{HirVisitor, visit_expr, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -543,9 +546,10 @@ fn inline_temps_in_block(
             // temp would remove the only lexical/VM root before a later rawset or table clear;
             // keep that producer unless a separate lifetime proof exists.
             && !(matches!(value, HirExpr::Call(_))
-                && kept_rev
-                    .last()
-                    .is_some_and(|next_stmt| stmt_stores_temp_in_table(next_stmt, temp)))
+                && kept_rev.last().is_some_and(|next_stmt| {
+                    stmt_stores_temp_in_table(next_stmt, temp)
+                        && !call_result_can_enter_set_list(temp, next_stmt, &workspace.uses, facts)
+                }))
             // 候选拒绝[PolicyBoundary]：DebugScope 标注该 temp 是显式源码 binding，保留其独立声明身份。
             && !workspace.uses.has_debug_local_hint(temp)
             // 候选拒绝[SemanticBarrier:Capture]：若 closure 已按引用捕获该 home，删除写入会让 closure 观察旧值；见 regress_310。
@@ -608,7 +612,11 @@ fn inline_temps_in_block(
                 next_stmt,
                 workspace.substantial_closure_bodies,
             )
-            && site.allows(value, readability, workspace.safety)
+            && (site.allows(value, readability, workspace.safety)
+                || (site == InlineSite::CallArg
+                    && workspace.uses.has_unique_definition(temp)
+                    && facts.temp_is_transferred_call_argument(temp)
+                    && stmt_has_argument_root_handoff(next_stmt, temp)))
         {
             let next_stmt = kept_rev
                 .last_mut()
@@ -802,6 +810,26 @@ impl CapturedSlotSnapshots {
             .get(stmt_index)
             .and_then(|snapshot_index| self.snapshots.get(*snapshot_index))
     }
+}
+
+/// 物理 root 终点只证明源程序的后缀；目标还需要 constructor 的强引用载体。
+/// 任意已有表可能是弱表，删除显式释放再重编译会让隐藏调用结果槽存活更久（regress_396）。
+fn call_result_can_enter_set_list(
+    temp: TempId,
+    stmt: &HirStmt,
+    uses: &TempUseScratch,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let HirStmt::TableSetList(set_list) = stmt else {
+        return false;
+    };
+    let HirExpr::TempRef(seed) = set_list.base else {
+        return false;
+    };
+    uses.has_unique_definition(temp)
+        && facts.call_result_root_ends_after_value_use(temp)
+        && facts.is_direct_table_seed_temp(seed)
+        && facts.trusted_temp_home_slot(seed).is_some()
 }
 
 fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
@@ -1576,7 +1604,9 @@ fn inline_materialization_runs(
                 facts,
                 captured_slots_before_stmt,
             );
-            if matches!(value, HirExpr::Call(_)) && stmt_stores_temp_in_table(&rewritten_sink, temp)
+            if matches!(value, HirExpr::Call(_))
+                && stmt_stores_temp_in_table(&rewritten_sink, temp)
+                && !call_result_can_enter_set_list(temp, &rewritten_sink, uses, facts)
             {
                 // 候选拒绝[SemanticBarrier:Lifetime]：call result 写表前由 temp 保持存活，删除会改变 VM root 生命周期。
                 complete_run = false;
@@ -3524,6 +3554,7 @@ mod tests {
             unreachable!("terminal nil-pack fixture must end in return")
         };
         ret.values.tail = Some(HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef { key: "tail".into() }),
             args: HirValuePack::default(),
             method: false,
@@ -3560,6 +3591,7 @@ mod tests {
                     values: HirValuePack::expanding(
                         vec![HirExpr::TempRef(TempId(0)), HirExpr::TempRef(TempId(1))],
                         HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                            argument_roots: Vec::new(),
                             callee: HirExpr::GlobalRef(HirGlobalRef { key: "tail".into() }),
                             args: HirValuePack::default(),
                             method: false,
@@ -3586,6 +3618,7 @@ mod tests {
     fn call_stmt(name: &str) -> HirStmt {
         HirStmt::CallStmt(Box::new(crate::hir::common::HirCallStmt {
             call: HirCallExpr {
+                argument_roots: Vec::new(),
                 callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
                 args: HirValuePack::default(),
                 method: false,
@@ -3617,6 +3650,7 @@ mod tests {
 
     fn normal_call(callee: HirExpr, args: Vec<HirExpr>) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee,
             args: HirValuePack::fixed(args),
             method: false,
@@ -3975,6 +4009,7 @@ mod tests {
         assert!(matches!(site, InlineSite::PrefixedBlock));
         assert!(!site.allows(
             &HirExpr::Call(Box::new(HirCallExpr {
+                argument_roots: Vec::new(),
                 callee: HirExpr::GlobalRef(HirGlobalRef { key: "f".into() }),
                 args: HirValuePack::default(),
                 method: false,
@@ -4207,6 +4242,7 @@ mod tests {
         let empty_captures = ReferenceCapturedBindings::default();
         let empty_slots = BTreeSet::new();
         let call = HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "produce".into(),
             }),
@@ -4378,6 +4414,7 @@ mod tests {
             HirStmt::Assign(Box::new(HirAssign {
                 targets: vec![HirLValue::Temp(TempId(2))],
                 values: HirValuePack::fixed(vec![HirExpr::Call(Box::new(HirCallExpr {
+                    argument_roots: Vec::new(),
                     callee: HirExpr::GlobalRef(HirGlobalRef {
                         key: "resource".into(),
                     }),
@@ -4673,6 +4710,7 @@ mod tests {
         assert_eq!(removed, vec![true, false]);
 
         let dynamic_call = HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "next_start".into(),
             }),
@@ -4896,6 +4934,7 @@ mod tests {
         assert_eq!(plan.chain, vec![(2, TempId(2)), (0, TempId(0))]);
 
         let dynamic = block(HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "mutate_source".into(),
             }),
@@ -4915,6 +4954,7 @@ mod tests {
             unreachable!("fixture must end in numeric-for")
         };
         numeric_for.start = HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "mutate_source".into(),
             }),

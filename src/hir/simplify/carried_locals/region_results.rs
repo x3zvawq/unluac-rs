@@ -18,7 +18,6 @@ use crate::hir::common::{
 };
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::super::visit::{HirVisitor, visit_stmts};
 use super::super::walk::rewrite_stmts;
 use super::binding::{
     BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
@@ -27,6 +26,7 @@ use super::binding::{
 use super::prune::{RedundantSelfAssignPrunePass, prune_empty_assign_stmts};
 use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
 use super::{HandoffIdentityFacts, RegionControlFacts};
+use crate::hir::visit::{HirVisitor, visit_stmts};
 
 mod assignments;
 mod binding_facts;
@@ -1047,6 +1047,7 @@ mod tests {
                             })),
                             HirStmt::CallStmt(Box::new(HirCallStmt {
                                 call: HirCallExpr {
+                                    argument_roots: Vec::new(),
                                     callee: HirExpr::GlobalRef(HirGlobalRef {
                                         key: "collectgarbage".into(),
                                     }),

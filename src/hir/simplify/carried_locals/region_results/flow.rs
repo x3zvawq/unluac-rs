@@ -18,7 +18,6 @@ use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::super::expr_facts::expr_truthiness;
 use super::super::super::lexical_cfg::LexicalCfg;
-use super::super::super::visit::{HirVisitor, visit_expr, visit_stmts};
 use super::super::super::walk::rewrite_stmts;
 use super::super::binding::{
     BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
@@ -28,6 +27,7 @@ use super::super::prune::{RedundantSelfAssignPrunePass, prune_empty_assign_stmts
 use super::super::reads::{BindingReadCollector, collect_binding_mentions_by_stmt};
 use super::super::{HandoffIdentityFacts, RegionControlFacts};
 use super::binding_facts;
+use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 pub(in crate::hir::simplify::carried_locals) fn collapse_result_writeback_transactions(
     block: &mut HirBlock,

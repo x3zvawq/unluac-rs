@@ -65,7 +65,7 @@ use self::region_results::{
     collapse_written_back_if_results, try_collapse_region_result_handoff,
 };
 use super::mention::{stmts_captured_locals, stmts_reference_captured_bindings};
-use super::visit::{HirVisitor, visit_expr, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 struct HandoffSafety<'a> {
     promotion_facts: &'a mut ProtoPromotionFacts,

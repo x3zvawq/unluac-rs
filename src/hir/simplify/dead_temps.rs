@@ -37,8 +37,8 @@ use super::mention::{
 };
 use super::root_lifetimes::stmt_may_observe_gc_roots;
 use super::temp_touch::collect_temp_reads_in_proto;
-use super::visit::{self, HirVisitor};
 use super::walk::{HirRewritePass, rewrite_proto};
+use crate::hir::visit::{self, HirVisitor};
 
 pub(super) fn remove_dead_temp_materializations_in_proto(
     proto: &mut HirProto,
@@ -1286,6 +1286,7 @@ mod tests {
                 assign(
                     producer,
                     HirExpr::Call(Box::new(HirCallExpr {
+                        argument_roots: Vec::new(),
                         callee: HirExpr::ParamRef(ParamId(0)),
                         args: HirValuePack::default(),
                         method: false,

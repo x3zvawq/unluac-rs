@@ -26,8 +26,8 @@ use super::super::logical_simplify::{
     simplify_condition_truthiness_shape_with_safety, simplify_logical_shape_with_safety,
 };
 use super::super::mention::stmts_reference_captured_bindings;
-use super::super::visit::{HirVisitor, visit_proto};
 use super::DiscardBoundaryFacts;
+use crate::hir::visit::{HirVisitor, visit_proto};
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum StableBinding {

@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 use crate::hir::common::{HirLabel, HirLabelId, HirProto, HirStmt};
 
 use super::close_scopes::pending_tbc_boundary_labels_in_proto;
-use super::visit::{HirVisitor, visit_proto};
 use super::walk::{HirRewritePass, rewrite_proto};
+use crate::hir::visit::{HirVisitor, visit_proto};
 
 pub(super) fn remove_unused_labels_in_proto(proto: &mut HirProto) -> bool {
     let facts = collect_label_facts(proto);

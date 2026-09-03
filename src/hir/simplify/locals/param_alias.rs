@@ -33,8 +33,8 @@ use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::expr_facts::expr_truthiness;
 use super::super::mention::{expr_mentions_local, stmts_reference_captured_bindings};
-use super::super::visit::{self, HirVisitor};
 use super::super::walk::{self, HirRewritePass};
+use crate::hir::visit::{self, HirVisitor};
 
 pub(super) fn coalesce_param_aliases_in_proto(
     proto: &mut HirProto,

@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn nested_if_merge_keeps_internal_goto_scope() {
-        let label = AstLabelId(0);
+        let label = AstLabelId::Synthetic(0);
         let mut if_stmt = AstIf {
             cond: global_expr("outer"),
             then_block: AstBlock {
@@ -1254,7 +1254,7 @@ mod tests {
 
     #[test]
     fn terminal_guard_keeps_internal_goto_scope() {
-        let label = AstLabelId(0);
+        let label = AstLabelId::Synthetic(0);
         let mut block = AstBlock {
             stmts: vec![AstStmt::If(Box::new(AstIf {
                 cond: global_expr("guard"),

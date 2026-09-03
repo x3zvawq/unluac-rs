@@ -20,11 +20,11 @@ use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::mention::stmts_reference_captured_bindings;
 use super::super::temp_touch::collect_temp_reads_in_proto;
-use super::super::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 use super::super::walk::{HirRewritePass, rewrite_stmts};
 use super::binding::{
     CarryBinding, carry_binding_from_expr, carry_binding_from_lvalue, single_binding_copy,
 };
+use crate::hir::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
 
 pub(super) struct RedundantSelfAssignPrunePass {
     prunable_bindings: BTreeSet<CarryBinding>,

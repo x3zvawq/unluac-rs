@@ -1,15 +1,16 @@
-//! 这个文件提供 HIR simplify 共享的只读 visitor。
+//! 这个文件提供 HIR 及其消费者共享的只读 visitor。
 //!
-//! 很多 simplify pass 在真正改写前，只是想先遍历 HIR 收集一批事实，例如：
+//! HIR pass 和 AST lowering 在真正改写前，需要遍历当前 HIR 快照收集事实，例如：
 //! - 哪些 label 仍然被 `goto` 引用
 //! - 哪些 temp 在当前 proto 里有显式定义
 //! - 某段 stmt 切片里还会读到哪些 local/temp
 //!
-//! 过去这些分析各自复制了一整套 `block/stmt/lvalue/call/expr` 递归骨架。这里把只读
-//! 遍历收成共享设施，让 collector 更专注在"看到某个节点时记录什么"。
+//! `block/stmt/lvalue/call/expr` 子节点关系只由 HIR traverse 宏定义，collector 只声明
+//! "看到某个节点时记录什么"。例如 `x = f(t); return t` 可收集到一次 callee 和两次 temp
+//! 引用；不得在 AST 另写一套 HIR 遍历并重新解释 pack 或 closure 子节点。
 //!
 //! 它不会跨层补事实，也不会主动进入子 proto 的 body 重新扫描整棵模块树；这里的
-//! 作用域就是"当前正在 simplify 的这一个 proto"。例如 closure 只会访问 capture
+//! 作用域就是当前这一个 proto。例如 closure 只会访问 capture
 //! 表达式，因为那正是当前 proto 能直接消费的事实边界。
 
 use crate::hir::common::{
@@ -23,7 +24,7 @@ use crate::hir::traverse::{
     traverse_hir_table_constructor_children,
 };
 
-pub(super) trait HirVisitor {
+pub(crate) trait HirVisitor {
     fn visit_block(&mut self, _block: &HirBlock) {}
 
     fn visit_stmt(&mut self, _stmt: &HirStmt) {}
@@ -35,16 +36,16 @@ pub(super) trait HirVisitor {
     fn visit_call(&mut self, _call: &HirCallExpr) {}
 }
 
-pub(super) fn visit_proto(proto: &HirProto, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_proto(proto: &HirProto, visitor: &mut impl HirVisitor) {
     visit_block(&proto.body, visitor);
 }
 
-pub(super) fn visit_block(block: &HirBlock, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_block(block: &HirBlock, visitor: &mut impl HirVisitor) {
     visitor.visit_block(block);
     visit_stmts(&block.stmts, visitor);
 }
 
-pub(super) fn visit_stmts(stmts: &[HirStmt], visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_stmts(stmts: &[HirStmt], visitor: &mut impl HirVisitor) {
     for stmt in stmts {
         visit_stmt(stmt, visitor);
     }
@@ -75,21 +76,21 @@ fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
     );
 }
 
-pub(super) fn visit_call(call: &HirCallExpr, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_call(call: &HirCallExpr, visitor: &mut impl HirVisitor) {
     visitor.visit_call(call);
     traverse_hir_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
         visit_expr(expr, visitor);
     });
 }
 
-pub(super) fn visit_lvalue(lvalue: &HirLValue, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_lvalue(lvalue: &HirLValue, visitor: &mut impl HirVisitor) {
     visitor.visit_lvalue(lvalue);
     traverse_hir_lvalue_children!(lvalue, borrow = [&], expr(expr) => {
         visit_expr(expr, visitor);
     });
 }
 
-pub(super) fn visit_expr(expr: &HirExpr, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_expr(expr: &HirExpr, visitor: &mut impl HirVisitor) {
     visitor.visit_expr(expr);
     traverse_hir_expr_children!(
         expr,

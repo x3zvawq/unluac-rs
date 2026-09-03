@@ -49,7 +49,7 @@ use super::mention::{
     ReferenceCapturedBindings, stmts_reference_captured_bindings, stmts_value_captured_bindings,
 };
 use super::walk::{HirRewritePass, rewrite_proto};
-use crate::hir::simplify::visit::{HirVisitor, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_stmts};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 enum TableBinding {
@@ -337,6 +337,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             .unwrap_or_default();
                     let overwrite_timing_is_safe = open_local_owner
                         || source_local_owner
+                        || self.seed_overwrites_unobservable_entry_nil(binding)
                         || seed_overwrite_delay_is_unobservable(block, index, *end_index, binding);
                     open_capture_is_safe
                         && nil_shape_is_supported
@@ -663,6 +664,29 @@ impl TableConstructorPass<'_> {
             .then_some(seed_index)
     }
 
+    /// 入口 nil 槽没有旧 collectable root；且无人能通过 capture/debug 观察 seed store。
+    /// Dataflow 已排除回边旧值，不能凭“首个 PC 定义”推断这里可以延后覆盖。
+    fn seed_overwrites_unobservable_entry_nil(&self, binding: TableBinding) -> bool {
+        let TableBinding::Temp(temp) = binding else {
+            return false;
+        };
+        self.promotion_facts.overwrites_entry_nil(temp)
+            && !self
+                .debug_identity_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+            && !self
+                .reference_captured_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+            && self
+                .promotion_facts
+                .trusted_temp_home_slot(temp)
+                .is_some_and(|home| !self.reference_captured_home_slots.contains(&home))
+    }
+
     fn find_direct_set_list_seed(
         &self,
         block: &crate::hir::common::HirBlock,
@@ -703,6 +727,7 @@ impl TableConstructorPass<'_> {
             return None;
         }
         if matches!(binding, TableBinding::Temp(_))
+            && !self.seed_overwrites_unobservable_entry_nil(binding)
             && set_list
                 .values
                 .fixed
@@ -1193,7 +1218,7 @@ impl TableConstructorPass<'_> {
             seed_carriers,
             found: false,
         };
-        crate::hir::simplify::visit::visit_expr(expr, &mut probe);
+        crate::hir::visit::visit_expr(expr, &mut probe);
         probe.found
     }
 
@@ -1301,7 +1326,7 @@ impl TableConstructorPass<'_> {
             seed_carriers,
             found: false,
         };
-        crate::hir::simplify::visit::visit_stmts(std::slice::from_ref(stmt), &mut probe);
+        crate::hir::visit::visit_stmts(std::slice::from_ref(stmt), &mut probe);
         probe.found
     }
 
@@ -2421,7 +2446,7 @@ fn expr_contains_nil(expr: &HirExpr) -> bool {
     }
 
     let mut probe = NilProbe { found: false };
-    crate::hir::simplify::visit::visit_expr(expr, &mut probe);
+    crate::hir::visit::visit_expr(expr, &mut probe);
     probe.found
 }
 
@@ -2440,6 +2465,7 @@ mod tests {
 
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
+            argument_roots: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
@@ -3580,6 +3606,7 @@ mod tests {
                 })),
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: HirCallExpr {
+                        argument_roots: Vec::new(),
                         callee: HirExpr::GlobalRef(HirGlobalRef {
                             key: "install_metatable".into(),
                         }),
@@ -3736,6 +3763,7 @@ mod tests {
                 })),
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: HirCallExpr {
+                        argument_roots: Vec::new(),
                         callee: HirExpr::GlobalRef(HirGlobalRef {
                             key: "install_metatable".into(),
                         }),
@@ -3818,6 +3846,7 @@ mod tests {
                     targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                         base: HirExpr::LocalRef(owner),
                         key: HirExpr::Call(Box::new(HirCallExpr {
+                            argument_roots: Vec::new(),
                             callee: HirExpr::GlobalRef(HirGlobalRef {
                                 key: "install_and_key".into(),
                             }),

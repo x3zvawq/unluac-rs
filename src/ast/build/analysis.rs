@@ -1,66 +1,19 @@
-//! AST build：局部分析和小型统计 helper。
+//! AST build 所需的当前 HIR 语法事实查询。
 //!
-//! 这些 helper 只服务 HIR -> AST lowering 所需的合法语法化，不负责源码美化。
-//! 例如：
-//! - 统计 label 最大值，给 AST fallback 的 synthetic label 让位
-//! - 收集 block 里真正被引用到的 temp，供 AST build 决定哪些 temp 需要先 hoist 成保守 local
-//! - 在需要 hoist temp 时，按 block 里的首次出现顺序返回，避免后续 `statement_merge`
-//!   因为声明顺序和首次赋值顺序错位而下沉失败
-//!
-//! 它不会在这里猜源码级 sugar，也不会替 Readability 做后层整形。
+//! 遍历子节点和多返回 tail 的责任归 HIR visitor；这里仅收集剩余 temp 的首次出现顺序、
+//! `<close>` 声明配对和命名变参的真实引用，避免重新解释 HIR 树结构。
+//! 例如 `t = call(); use(t)` 只给 t 分配一次 hoist 声明；相邻 exact assignment/TBC
+//! 已能直接语法化为 `<close>` 声明时，整组 sibling temp 都不应再被提前声明。
+//! continue 查询只回答当前 loop 的语法化需求，嵌套 loop 使用自己的 label owner。
 
 use std::collections::BTreeSet;
 
-use crate::hir::{
-    HirBlock, HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirModule, HirStmt,
-    HirTableField, LocalId, TempId,
-};
-
-pub(super) fn max_hir_label_id(module: &HirModule) -> usize {
-    module
-        .protos
-        .iter()
-        .map(|proto| max_hir_label_id_in_block(&proto.body))
-        .max()
-        .unwrap_or(0)
-}
-
-fn max_hir_label_id_in_block(block: &HirBlock) -> usize {
-    block
-        .stmts
-        .iter()
-        .map(|stmt| match stmt {
-            HirStmt::If(if_stmt) => {
-                let then_max = max_hir_label_id_in_block(&if_stmt.then_block);
-                let else_max = if_stmt
-                    .else_block
-                    .as_ref()
-                    .map(max_hir_label_id_in_block)
-                    .unwrap_or(0);
-                then_max.max(else_max)
-            }
-            HirStmt::While(while_stmt) => max_hir_label_id_in_block(&while_stmt.body),
-            HirStmt::Repeat(repeat_stmt) => max_hir_label_id_in_block(&repeat_stmt.body),
-            HirStmt::NumericFor(numeric_for) => max_hir_label_id_in_block(&numeric_for.body),
-            HirStmt::GenericFor(generic_for) => max_hir_label_id_in_block(&generic_for.body),
-            HirStmt::Block(block) => max_hir_label_id_in_block(block),
-            HirStmt::Goto(goto_stmt) => goto_stmt.target.index(),
-            HirStmt::Label(label) => label.id.index(),
-            _ => 0,
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-pub(super) fn collect_close_temps(block: &HirBlock) -> BTreeSet<TempId> {
-    let mut temps = BTreeSet::new();
-    collect_close_temps_in_block(block, &mut temps);
-    temps
-}
+use crate::hir::visit::{self, HirVisitor};
+use crate::hir::{HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId};
 
 pub(super) fn collect_referenced_temps_in_encounter_order(block: &HirBlock) -> Vec<TempId> {
     let mut collector = ReferencedTempCollector::default();
-    collect_referenced_temps_in_block(block, &mut collector);
+    visit::visit_block(block, &mut collector);
     collector.ordered
 }
 
@@ -78,226 +31,84 @@ impl ReferencedTempCollector {
     }
 }
 
-fn collect_referenced_temps_in_block(block: &HirBlock, temps: &mut ReferencedTempCollector) {
-    for stmt in &block.stmts {
-        collect_referenced_temps_in_stmt(stmt, temps);
+impl HirVisitor for ReferencedTempCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::TempRef(temp) = expr {
+            self.note_temp(*temp);
+        }
+    }
+
+    fn visit_lvalue(&mut self, target: &HirLValue) {
+        if let HirLValue::Temp(temp) = target {
+            self.note_temp(*temp);
+        }
     }
 }
 
-fn collect_referenced_temps_in_stmt(stmt: &HirStmt, temps: &mut ReferencedTempCollector) {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            for value in &local_decl.values {
-                collect_referenced_temps_in_expr(value, temps);
+pub(super) fn collect_close_temps(block: &HirBlock) -> BTreeSet<TempId> {
+    let mut collector = CloseTempCollector::default();
+    visit::visit_block(block, &mut collector);
+    collector.temps
+}
+
+#[derive(Default)]
+struct CloseTempCollector {
+    temps: BTreeSet<TempId>,
+}
+
+impl HirVisitor for CloseTempCollector {
+    fn visit_block(&mut self, block: &HirBlock) {
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            let HirStmt::ToBeClosed(to_be_closed) = stmt else {
+                continue;
+            };
+            let HirExpr::TempRef(temp) = &to_be_closed.value else {
+                continue;
+            };
+            self.temps.insert(*temp);
+            // try_lower_temp_close_decl 将紧邻 exact assignment/TBC 合成一条声明。
+            // sibling temp 也必须从 hoist 排除，否则会先声明再被该语句重复遮蔽。
+            if let Some(HirStmt::Assign(assign)) = index
+                .checked_sub(1)
+                .and_then(|previous| block.stmts.get(previous))
+                && assign.values.exact_result_len() == Some(assign.targets.len())
+                && assign.targets.last() == Some(&HirLValue::Temp(*temp))
+                && assign
+                    .targets
+                    .iter()
+                    .all(|target| matches!(target, HirLValue::Temp(_)))
+            {
+                self.temps
+                    .extend(assign.targets.iter().filter_map(|target| match target {
+                        HirLValue::Temp(temp) => Some(*temp),
+                        _ => None,
+                    }));
             }
         }
-        HirStmt::GlobalDecl(global_decl) => {
-            for value in &global_decl.values {
-                collect_referenced_temps_in_expr(value, temps);
-            }
-        }
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                collect_referenced_temps_in_lvalue(target, temps);
-            }
-            for value in &assign.values {
-                collect_referenced_temps_in_expr(value, temps);
-            }
-        }
-        HirStmt::TableSetList(set_list) => {
-            collect_referenced_temps_in_expr(&set_list.base, temps);
-            for value in &set_list.values.fixed {
-                collect_referenced_temps_in_expr(value, temps);
-            }
-            if let Some(value) = &set_list.values.tail {
-                collect_referenced_temps_in_expr(value.as_expr(), temps);
-            }
-        }
-        HirStmt::ErrNil(err_nnil) => collect_referenced_temps_in_expr(&err_nnil.value, temps),
-        HirStmt::ToBeClosed(to_be_closed) => {
-            collect_referenced_temps_in_expr(&to_be_closed.value, temps);
-        }
-        HirStmt::Close(_) => {}
-        HirStmt::CallStmt(call_stmt) => collect_referenced_temps_in_call(&call_stmt.call, temps),
-        HirStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_referenced_temps_in_expr(value, temps);
-            }
-        }
-        HirStmt::If(if_stmt) => {
-            collect_referenced_temps_in_expr(&if_stmt.cond, temps);
-            collect_referenced_temps_in_block(&if_stmt.then_block, temps);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_referenced_temps_in_block(else_block, temps);
-            }
-        }
-        HirStmt::While(while_stmt) => {
-            collect_referenced_temps_in_expr(&while_stmt.cond, temps);
-            collect_referenced_temps_in_block(&while_stmt.body, temps);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            collect_referenced_temps_in_block(&repeat_stmt.body, temps);
-            collect_referenced_temps_in_expr(&repeat_stmt.cond, temps);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            collect_referenced_temps_in_expr(&numeric_for.start, temps);
-            collect_referenced_temps_in_expr(&numeric_for.limit, temps);
-            collect_referenced_temps_in_expr(&numeric_for.step, temps);
-            collect_referenced_temps_in_block(&numeric_for.body, temps);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for expr in &generic_for.iterator {
-                collect_referenced_temps_in_expr(expr, temps);
-            }
-            collect_referenced_temps_in_block(&generic_for.body, temps);
-        }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => {}
-        HirStmt::Block(block) => collect_referenced_temps_in_block(block, temps),
     }
 }
 
-fn collect_referenced_temps_in_lvalue(target: &HirLValue, temps: &mut ReferencedTempCollector) {
-    match target {
-        HirLValue::Temp(temp) => {
-            temps.note_temp(*temp);
-        }
-        HirLValue::TableAccess(access) => {
-            collect_referenced_temps_in_expr(&access.base, temps);
-            collect_referenced_temps_in_expr(&access.key, temps);
-        }
-        HirLValue::Param(_)
-        | HirLValue::Local(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_) => {}
-    }
+pub(super) fn local_is_referenced(block: &HirBlock, local: LocalId) -> bool {
+    let mut collector = LocalReferenceCollector {
+        local,
+        found: false,
+    };
+    visit::visit_block(block, &mut collector);
+    collector.found
 }
 
-fn collect_referenced_temps_in_call(call: &HirCallExpr, temps: &mut ReferencedTempCollector) {
-    collect_referenced_temps_in_expr(&call.callee, temps);
-    for arg in &call.args {
-        collect_referenced_temps_in_expr(arg, temps);
-    }
+struct LocalReferenceCollector {
+    local: LocalId,
+    found: bool,
 }
 
-fn collect_referenced_temps_in_expr(expr: &HirExpr, temps: &mut ReferencedTempCollector) {
-    match expr {
-        HirExpr::TempRef(temp) => {
-            temps.note_temp(*temp);
-        }
-        HirExpr::TableAccess(access) => {
-            collect_referenced_temps_in_expr(&access.base, temps);
-            collect_referenced_temps_in_expr(&access.key, temps);
-        }
-        HirExpr::Unary(unary) => collect_referenced_temps_in_expr(&unary.expr, temps),
-        HirExpr::Binary(binary) => {
-            collect_referenced_temps_in_expr(&binary.lhs, temps);
-            collect_referenced_temps_in_expr(&binary.rhs, temps);
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            collect_referenced_temps_in_expr(&logical.lhs, temps);
-            collect_referenced_temps_in_expr(&logical.rhs, temps);
-        }
-        HirExpr::Decision(decision) => {
-            for node in &decision.nodes {
-                collect_referenced_temps_in_expr(&node.test, temps);
-                collect_referenced_temps_in_target(&node.truthy, temps);
-                collect_referenced_temps_in_target(&node.falsy, temps);
-            }
-        }
-        HirExpr::Call(call) => collect_referenced_temps_in_call(call, temps),
-        HirExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    HirTableField::Array(value) => collect_referenced_temps_in_expr(value, temps),
-                    HirTableField::Record(record) => {
-                        collect_referenced_temps_in_expr(&record.key, temps);
-                        collect_referenced_temps_in_expr(&record.value, temps);
-                    }
-                }
-            }
-            if let Some(value) = &table.trailing_multivalue {
-                collect_referenced_temps_in_expr(value.as_expr(), temps);
-            }
-        }
-        HirExpr::Closure(closure) => {
-            for capture in &closure.captures {
-                collect_referenced_temps_in_expr(&capture.value, temps);
-            }
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => {}
+impl HirVisitor for LocalReferenceCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.found |= matches!(expr, HirExpr::LocalRef(local) if *local == self.local);
     }
-}
 
-fn collect_referenced_temps_in_target(
-    target: &HirDecisionTarget,
-    temps: &mut ReferencedTempCollector,
-) {
-    if let HirDecisionTarget::Expr(expr) = target {
-        collect_referenced_temps_in_expr(expr, temps);
-    }
-}
-
-fn collect_close_temps_in_block(block: &HirBlock, temps: &mut BTreeSet<TempId>) {
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        match stmt {
-            HirStmt::ToBeClosed(to_be_closed) => {
-                if let HirExpr::TempRef(temp) = &to_be_closed.value {
-                    temps.insert(*temp);
-                    // `try_lower_temp_close_decl` consumes the preceding exact assignment as
-                    // one local declaration. Keep every binding in that pair out of the root
-                    // hoist; hoisting a plain sibling first creates a duplicate shadowing local
-                    // before the `<close>` declaration.
-                    if let Some(HirStmt::Assign(assign)) = index
-                        .checked_sub(1)
-                        .and_then(|previous| block.stmts.get(previous))
-                    {
-                        let exact_pair = assign.values.exact_result_len()
-                            == Some(assign.targets.len())
-                            && assign.targets.last() == Some(&HirLValue::Temp(*temp))
-                            && assign
-                                .targets
-                                .iter()
-                                .all(|target| matches!(target, HirLValue::Temp(_)));
-                        if exact_pair {
-                            temps.extend(assign.targets.iter().filter_map(|target| match target {
-                                HirLValue::Temp(temp) => Some(*temp),
-                                _ => None,
-                            }));
-                        }
-                    }
-                }
-            }
-            HirStmt::If(if_stmt) => {
-                collect_close_temps_in_block(&if_stmt.then_block, temps);
-                if let Some(else_block) = &if_stmt.else_block {
-                    collect_close_temps_in_block(else_block, temps);
-                }
-            }
-            HirStmt::While(while_stmt) => collect_close_temps_in_block(&while_stmt.body, temps),
-            HirStmt::Repeat(repeat_stmt) => collect_close_temps_in_block(&repeat_stmt.body, temps),
-            HirStmt::NumericFor(numeric_for) => {
-                collect_close_temps_in_block(&numeric_for.body, temps)
-            }
-            HirStmt::GenericFor(generic_for) => {
-                collect_close_temps_in_block(&generic_for.body, temps)
-            }
-            HirStmt::Block(block) => collect_close_temps_in_block(block, temps),
-            _ => {}
-        }
+    fn visit_lvalue(&mut self, target: &HirLValue) {
+        self.found |= matches!(target, HirLValue::Local(local) if *local == self.local);
     }
 }
 
@@ -321,177 +132,5 @@ fn stmt_has_continue(stmt: &HirStmt) -> bool {
         | HirStmt::NumericFor(_)
         | HirStmt::GenericFor(_) => false,
         _ => false,
-    }
-}
-
-fn count_local_uses_in_stmt(stmt: &HirStmt, local: LocalId) -> usize {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .map(|value| count_local_uses_in_expr(value, local))
-            .sum(),
-        HirStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .map(|value| count_local_uses_in_expr(value, local))
-            .sum(),
-        HirStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .map(|target| count_local_uses_in_lvalue(target, local))
-                .sum::<usize>()
-                + assign
-                    .values
-                    .iter()
-                    .map(|value| count_local_uses_in_expr(value, local))
-                    .sum::<usize>()
-        }
-        HirStmt::TableSetList(set_list) => {
-            count_local_uses_in_expr(&set_list.base, local)
-                + set_list
-                    .values
-                    .fixed
-                    .iter()
-                    .map(|value| count_local_uses_in_expr(value, local))
-                    .sum::<usize>()
-                + set_list
-                    .values
-                    .tail
-                    .as_ref()
-                    .map(|value| count_local_uses_in_expr(value.as_expr(), local))
-                    .unwrap_or(0)
-        }
-        HirStmt::ErrNil(err_nnil) => count_local_uses_in_expr(&err_nnil.value, local),
-        HirStmt::ToBeClosed(to_be_closed) => count_local_uses_in_expr(&to_be_closed.value, local),
-        HirStmt::Close(_) => 0,
-        HirStmt::CallStmt(call_stmt) => count_local_uses_in_call(&call_stmt.call, local),
-        HirStmt::Return(ret) => ret
-            .values
-            .iter()
-            .map(|value| count_local_uses_in_expr(value, local))
-            .sum(),
-        HirStmt::If(if_stmt) => {
-            count_local_uses_in_expr(&if_stmt.cond, local)
-                + count_local_uses_in_block(&if_stmt.then_block, local)
-                + if_stmt
-                    .else_block
-                    .as_ref()
-                    .map(|else_block| count_local_uses_in_block(else_block, local))
-                    .unwrap_or(0)
-        }
-        HirStmt::While(while_stmt) => {
-            count_local_uses_in_expr(&while_stmt.cond, local)
-                + count_local_uses_in_block(&while_stmt.body, local)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            count_local_uses_in_block(&repeat_stmt.body, local)
-                + count_local_uses_in_expr(&repeat_stmt.cond, local)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            count_local_uses_in_expr(&numeric_for.start, local)
-                + count_local_uses_in_expr(&numeric_for.limit, local)
-                + count_local_uses_in_expr(&numeric_for.step, local)
-                + count_local_uses_in_block(&numeric_for.body, local)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            generic_for
-                .iterator
-                .iter()
-                .map(|expr| count_local_uses_in_expr(expr, local))
-                .sum::<usize>()
-                + count_local_uses_in_block(&generic_for.body, local)
-        }
-        HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_) => 0,
-        HirStmt::Block(block) => count_local_uses_in_block(block, local),
-    }
-}
-
-pub(super) fn count_local_uses_in_block(block: &HirBlock, local: LocalId) -> usize {
-    block
-        .stmts
-        .iter()
-        .map(|stmt| count_local_uses_in_stmt(stmt, local))
-        .sum()
-}
-
-fn count_local_uses_in_lvalue(target: &HirLValue, local: LocalId) -> usize {
-    match target {
-        HirLValue::TableAccess(access) => {
-            count_local_uses_in_expr(&access.base, local)
-                + count_local_uses_in_expr(&access.key, local)
-        }
-        HirLValue::Local(target_local) if *target_local == local => 1,
-        _ => 0,
-    }
-}
-
-pub(super) fn count_local_uses_in_call(call: &HirCallExpr, local: LocalId) -> usize {
-    count_local_uses_in_expr(&call.callee, local)
-        + call
-            .args
-            .iter()
-            .map(|arg| count_local_uses_in_expr(arg, local))
-            .sum::<usize>()
-}
-
-fn count_local_uses_in_expr(expr: &HirExpr, local: LocalId) -> usize {
-    match expr {
-        HirExpr::LocalRef(expr_local) if *expr_local == local => 1,
-        HirExpr::TableAccess(access) => {
-            count_local_uses_in_expr(&access.base, local)
-                + count_local_uses_in_expr(&access.key, local)
-        }
-        HirExpr::Unary(unary) => count_local_uses_in_expr(&unary.expr, local),
-        HirExpr::Binary(binary) => {
-            count_local_uses_in_expr(&binary.lhs, local)
-                + count_local_uses_in_expr(&binary.rhs, local)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            count_local_uses_in_expr(&logical.lhs, local)
-                + count_local_uses_in_expr(&logical.rhs, local)
-        }
-        HirExpr::Decision(decision) => decision
-            .nodes
-            .iter()
-            .map(|node| {
-                count_local_uses_in_expr(&node.test, local)
-                    + count_local_uses_in_target(&node.truthy, local)
-                    + count_local_uses_in_target(&node.falsy, local)
-            })
-            .sum(),
-        HirExpr::Call(call) => count_local_uses_in_call(call, local),
-        HirExpr::TableConstructor(table) => {
-            table
-                .fields
-                .iter()
-                .map(|field| match field {
-                    HirTableField::Array(expr) => count_local_uses_in_expr(expr, local),
-                    HirTableField::Record(record) => {
-                        count_local_uses_in_expr(&record.key, local)
-                            + count_local_uses_in_expr(&record.value, local)
-                    }
-                })
-                .sum::<usize>()
-                + table
-                    .trailing_multivalue
-                    .as_ref()
-                    .map(|tail| count_local_uses_in_expr(tail.as_expr(), local))
-                    .unwrap_or(0)
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .map(|capture| count_local_uses_in_expr(&capture.value, local))
-            .sum(),
-        _ => 0,
-    }
-}
-
-fn count_local_uses_in_target(target: &HirDecisionTarget, local: LocalId) -> usize {
-    match target {
-        HirDecisionTarget::Expr(expr) => count_local_uses_in_expr(expr, local),
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => 0,
     }
 }

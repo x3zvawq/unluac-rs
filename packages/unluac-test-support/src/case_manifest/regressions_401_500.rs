@@ -279,4 +279,21 @@ pub(super) const REGRESSION_CASES_401_500: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_460_non_tail_callable_root.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_461_aggregate_escape_identity.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_462_boolean_shell_flow_old_values.lua",
+        &[
+            LuaCaseDialect::Lua52,
+            LuaCaseDialect::Lua53,
+            LuaCaseDialect::Lua54,
+            LuaCaseDialect::Lua55,
+        ],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_463_generic_for_factory_root.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
 ];
