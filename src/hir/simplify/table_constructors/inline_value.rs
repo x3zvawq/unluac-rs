@@ -12,10 +12,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
-use super::{
-    BindingId, ConstructorEvalEvent, PendingProducer, PendingProducerSource,
-    ProducerSourcePreservation,
-};
+use super::{BindingId, ConstructorEvalEvent, PendingProducer, ProducerSourcePreservation};
 
 pub(super) struct InlineContext<'a> {
     block: &'a HirBlock,
@@ -103,7 +100,7 @@ fn inline_constructor_value_inner(
         if context.consumed_bindings[producer.binding_id] {
             return None;
         }
-        let producer_value = pending_producer_value(context.block, producer)?;
+        let producer_value = producer.source.value(context.block)?;
         context.consumed_bindings[producer.binding_id] = true;
         let producer_value = producer_value.clone();
         // producer 值继续递归展开；callee/access-base 的括号由 Generate 的
@@ -203,6 +200,7 @@ fn inline_nested_constructor(
         None => None,
     };
     Some(HirTableConstructor {
+        allocation: table.allocation.clone(),
         fields,
         trailing_multivalue,
     })
@@ -415,34 +413,6 @@ fn decision_target_mentions_binding_where(
     }
 }
 
-fn pending_producer_value<'a>(
-    block: &'a HirBlock,
-    producer: &PendingProducer,
-) -> Option<&'a HirExpr> {
-    match producer.source {
-        PendingProducerSource::Value {
-            stmt_index,
-            value_index,
-        } => producer_source_value(block, stmt_index, value_index),
-        PendingProducerSource::ImplicitNil { .. } => Some(&HirExpr::Nil),
-    }
-}
-
-fn producer_source_value(
-    block: &HirBlock,
-    stmt_index: usize,
-    value_index: usize,
-) -> Option<&HirExpr> {
-    let stmt = block.stmts.get(stmt_index)?;
-    match stmt {
-        crate::hir::common::HirStmt::LocalDecl(local_decl) => {
-            local_decl.values.fixed.get(value_index)
-        }
-        crate::hir::common::HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -529,6 +499,7 @@ mod tests {
             occurrence_index.remaining_uses_after(0),
         );
         let value = HirExpr::TableConstructor(Box::new(HirTableConstructor {
+            allocation: Default::default(),
             fields: vec![HirTableField::Array(HirExpr::LocalRef(LocalId(0)))],
             trailing_multivalue: None,
         }));
@@ -538,6 +509,7 @@ mod tests {
         assert_eq!(
             rewritten,
             Some(HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                allocation: Default::default(),
                 fields: vec![HirTableField::Array(HirExpr::String("value".into()))],
                 trailing_multivalue: None,
             })))

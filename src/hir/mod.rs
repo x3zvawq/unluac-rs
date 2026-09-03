@@ -13,7 +13,10 @@ mod expr_safety;
 mod promotion;
 mod rewrite;
 mod simplify;
+mod table_layout;
 pub(crate) mod traverse;
+mod value_facts;
+pub use crate::value_semantics::table::TableTemplateKey as HirTableTemplateKey;
 pub(crate) mod visit;
 
 pub use crate::parser::{ProtoLineRange, ProtoSignature};
@@ -27,9 +30,9 @@ pub use common::{
     HirInlineRetentionReason, HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirLogicalExpr,
     HirMethodRewriteTransactionId, HirMethodSetupProtocolId, HirModule, HirNumericFor, HirPackTail,
     HirProto, HirProtoRef, HirRecordField, HirRepeat, HirRepeatBinding,
-    HirRepeatConditionLifetimeFacts, HirReturn, HirStmt, HirTableAccess, HirTableConstructor,
-    HirTableField, HirTableSetList, HirToBeClosed, HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr,
-    HirValuePack, HirWhile, LocalId, ParamId, TempId, UpvalueId,
+    HirRepeatConditionLifetimeFacts, HirReturn, HirStmt, HirTableAccess, HirTableAllocation,
+    HirTableConstructor, HirTableField, HirTableSetList, HirToBeClosed, HirUnaryExpr,
+    HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile, LocalId, ParamId, TempId, UpvalueId,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_hir;

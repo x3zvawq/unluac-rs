@@ -1,3 +1,6 @@
+//! 驱动 Lua 源码矩阵的筛选、并发执行与进度汇总；实例身份由同次构建的 runner 签发，
+//! 本层只传递身份并展示描述，不重新拼装编译选项或语义验证合同。
+
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, IsTerminal, Read};
@@ -112,6 +115,7 @@ pub(crate) struct Options {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct UnitCaseDescriptor {
+    id: String,
     suite: String,
     dialect: String,
     path: String,
@@ -302,6 +306,7 @@ mod tests {
     #[test]
     fn normalize_runner_failure_should_strip_simple_case_prefix() {
         let case = super::UnitCaseDescriptor {
+            id: "0".to_owned(),
             suite: "unit".to_owned(),
             dialect: "lua5.4".to_owned(),
             path: "tests/example.lua".to_owned(),
@@ -359,6 +364,7 @@ mod tests {
     #[test]
     fn matches_case_filters_should_accept_any_substring_match() {
         let case = super::UnitCaseDescriptor {
+            id: "0".to_owned(),
             suite: "unit".to_owned(),
             dialect: "lua5.4".to_owned(),
             path: "tests/unit-case/common_04_generic_for.lua".to_owned(),

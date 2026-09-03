@@ -3,7 +3,8 @@
 -- the physical root may attach directly to the copied value instead of retaining an SSA alias.
 -- unluac: expect-not-contains [[local r1_0 = p1_0]]
 -- unluac: expect-contains [[local r2_0 = p2_0]]
--- unluac: expect-contains [[local r3_1 = r0_3]]
+-- unluac: expect-contains [[local r3_0 = r0_3]]
+-- unluac: expect-not-contains [[local r3_1 = r3_0]]
 
 local function stable(value, callback)
     local source = value

@@ -18,8 +18,8 @@ use crate::hir::promotion::ProtoPromotionFacts;
 use super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind};
 
 use super::object_flow::{
-    Binding, ProtoEffects, RootState, binding_from_lvalue, closure_captures_in_block,
-    collect_proto_effects, join_state, transfer_root_node,
+    Binding, ProtoEffects, RootAnalysisContext, RootState, binding_from_lvalue,
+    closure_captures_in_block, join_state, transfer_root_node,
 };
 
 /// Deferred 阶段补齐 repeat 条件仍可观察的物理 root。
@@ -29,8 +29,9 @@ use super::object_flow::{
 pub(super) fn mark_repeat_trailing_condition_roots(
     module: &mut HirModule,
     promotion_facts: &[ProtoPromotionFacts],
-    safety: HirExprSafety,
+    context: RootAnalysisContext<'_>,
 ) -> bool {
+    let RootAnalysisContext { safety, effects } = context;
     let relevant = module
         .protos
         .iter()
@@ -49,7 +50,6 @@ pub(super) fn mark_repeat_trailing_condition_roots(
     if !relevant.iter().any(|present| *present) {
         return false;
     }
-    let effects = collect_proto_effects(module, safety);
     let mut roots = Vec::with_capacity(module.protos.len());
     for (proto, relevant) in module.protos.iter().zip(relevant) {
         if !relevant {
@@ -57,7 +57,7 @@ pub(super) fn mark_repeat_trailing_condition_roots(
             continue;
         }
         let facts = promotion_facts.get(proto.id.index());
-        roots.push(collect_proto_repeat_roots(proto, facts, &effects, safety));
+        roots.push(collect_proto_repeat_roots(proto, facts, effects, safety));
     }
 
     let mut changed = false;

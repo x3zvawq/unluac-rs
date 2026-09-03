@@ -263,6 +263,7 @@ pub(crate) fn make_readable_module(
 
     let convergence = run_invalidation_loop(
         PASS_DESCRIPTORS,
+        &[],
         |index, name| {
             // 如果当前 pass 在 dump 列表中，先快照 before。关闭 debug feature 的构建
             // 不编译 AST renderer，因此这里会退化成 None。

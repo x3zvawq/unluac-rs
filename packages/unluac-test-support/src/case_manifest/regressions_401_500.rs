@@ -296,4 +296,52 @@ pub(super) const REGRESSION_CASES_401_500: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_463_generic_for_factory_root.lua",
         ALL_NON_LUAU_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_464_lookup_root_overwrite_chain.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_465_scope_end_copy_root_coverage.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_465_scope_end_copy_root_coverage.lua",
+        &[LuaCaseDialect::Lua54],
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_466_concat_operand_root_slots.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_467_shared_child_root_effects.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_468_shared_expression_value_facts.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_469_luajit_indexed_array_capacity.lua",
+        &[LuaCaseDialect::Luajit],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_470_constructor_call_root_handoff.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_471_luajit_runtime_table_constants.lua",
+        &[LuaCaseDialect::Luajit],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_472_luajit_template_runtime_fields.lua",
+        &[LuaCaseDialect::Luajit],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_473_luajit_template_hash_keys.lua",
+        &[LuaCaseDialect::Luajit],
+    ),
 ];

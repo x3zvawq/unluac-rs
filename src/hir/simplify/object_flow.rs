@@ -2,7 +2,8 @@
 //!
 //! 消费 HIR 控制流图及显式 capture，不重建 VM 寄存器。fresh table 的内部存储仅传播
 //! 持有关系，真正外部调用/存储才使可达对象逃逸；例如 a={}; b={}; a.x=b 不等于 sink(b)。
-//! repeat endpoint 与物理 root overwrite 共同消费此模型，分别决定自己的生命周期事务。
+//! repeat endpoint 与物理 root overwrite 共同消费此模型和模块入口提供的 child 效果快照，
+//! 分别决定生命周期事务；局部消费者不得用 capture 清单合成另一份调用效果。
 
 mod closure_effects;
 pub(super) use closure_effects::collect_proto_effects;
@@ -61,6 +62,13 @@ pub(super) struct ProtoEffects {
     pub(super) escapes: BTreeSet<UpvalueId>,
     returns: BTreeSet<EffectValue>,
     calls: BTreeSet<UpvalueId>,
+}
+
+/// 同一次模块 pass 的共享语义快照；子 proto 效果由模块入口计算，消费者不合成未知摘要。
+#[derive(Clone, Copy)]
+pub(super) struct RootAnalysisContext<'a> {
+    pub(super) safety: HirExprSafety,
+    pub(super) effects: &'a [ProtoEffects],
 }
 
 #[derive(Clone, Default)]
@@ -446,15 +454,11 @@ fn returned_holder_values(
     for &callee in callees {
         let (producer, returns) = match callee {
             ObjectId::Closure(proto) => {
-                let Some(effect) = effects.get(proto.index()) else {
-                    continue;
-                };
+                let effect = &effects[proto.index()];
                 (proto, &effect.returns)
             }
             ObjectId::ReturnedClosure { producer, closure } => {
-                let Some(effect) = effects.get(producer.index()) else {
-                    continue;
-                };
+                let effect = &effects[producer.index()];
                 for closure in returned_closures(&effect.returns, closure) {
                     returned.extend(closure.returns.iter().filter_map(|value| match value {
                         EffectValue::Upvalue(_) => None,
@@ -789,9 +793,7 @@ fn activate_object_ids(
                 let Some(closure_captures) = captures.get(&proto) else {
                     continue;
                 };
-                let Some(effect) = effects.get(proto.index()) else {
-                    continue;
-                };
+                let effect = &effects[proto.index()];
                 activate_projected_effect(
                     proto,
                     closure_captures,
@@ -809,9 +811,7 @@ fn activate_object_ids(
                 let Some(closure_captures) = captures.get(&producer) else {
                     continue;
                 };
-                let Some(effect) = effects.get(producer.index()) else {
-                    continue;
-                };
+                let effect = &effects[producer.index()];
                 for returned in returned_closures(&effect.returns, closure) {
                     activate_projected_effect(
                         producer,
@@ -986,9 +986,10 @@ pub(super) struct AllocationEscapeFacts {
 impl AllocationEscapeFacts {
     pub(super) fn analyze(
         stmts: &[HirStmt],
-        safety: HirExprSafety,
+        context: RootAnalysisContext<'_>,
         opaque: &BTreeSet<TempId>,
     ) -> Self {
+        let RootAnalysisContext { safety, effects } = context;
         let Ok(graph) = HirFlowGraph::for_stmts(stmts, safety) else {
             return Self::default();
         };
@@ -996,22 +997,6 @@ impl AllocationEscapeFacts {
             return Self::default();
         }
         let captures = closure_captures_in_stmts(stmts);
-        // simplify 的调用点没有 child-first 全模块效果摘要。所有 capture 都按可能写入、
-        // 逃逸、返回和调用处理；不能借“没有摘要”把 closure 当成无效果函数。
-        let mut effects = vec![
-            ProtoEffects::default();
-            captures.keys().map(|id| id.index() + 1).max().unwrap_or(0)
-        ];
-        for (proto, captures) in &captures {
-            let effect = &mut effects[proto.index()];
-            for index in 0..captures.len() {
-                let upvalue = UpvalueId(index);
-                effect.writes.insert(upvalue);
-                effect.escapes.insert(upvalue);
-                effect.calls.insert(upvalue);
-                effect.returns.insert(EffectValue::Upvalue(upvalue));
-            }
-        }
         struct ExternalBindings(BTreeSet<Binding>);
         impl crate::hir::visit::HirVisitor for ExternalBindings {
             fn visit_expr(&mut self, expr: &HirExpr) {
@@ -1027,14 +1012,14 @@ impl AllocationEscapeFacts {
             ..RootState::default()
         };
         let entries = graph.solve_forward(initial, join_state, |_, kind, state| {
-            transfer_overwrite_node(kind, state, &captures, &effects, safety, opaque);
+            transfer_overwrite_node(kind, state, &captures, effects, safety, opaque);
         });
         let mut result = Self::default();
         for (node, entry) in graph.nodes().iter().zip(entries) {
             let (HirFlowNodeKind::Stmt(stmt), Some(mut state)) = (node.kind(), entry) else {
                 continue;
             };
-            transfer_overwrite_node(node.kind(), &mut state, &captures, &effects, safety, opaque);
+            transfer_overwrite_node(node.kind(), &mut state, &captures, effects, safety, opaque);
             let escaped = reachable_holders(state.escaped.clone(), &state);
             result.unescaped.insert(
                 std::ptr::from_ref(stmt).addr(),

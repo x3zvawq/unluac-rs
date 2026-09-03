@@ -3,6 +3,8 @@
 //! HIR analyze 和 simplify 都会判断某个表达式是否能被挪动或折进别的表达式。
 //! 这个文件只放跨 pass 共用、和具体恢复策略无关的谓词，避免求值序规则散落后漂移。
 //! 原始值比较使用共享 `LuaValueSemantics`；本文件只负责 HIR 求值事件和 root relevance。
+//! 方言固定的表达式槽能力同样在入口发布：例如 PUC 5.1 CONCAT 保留最右 operand，
+//! 不代表中间 operand 或后续表达式仍拥有同一 root。
 
 use super::common::{HirBinaryOpKind, HirCaptureMode, HirExpr, HirUnaryOpKind, HirValuePack};
 use crate::decompile::DecompileDialect;
@@ -62,12 +64,14 @@ pub(crate) fn initializer_root_profile(
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HirExprSafety {
     dynamic_primitive_equality_is_stable: bool,
+    concat_preserves_rightmost_operand: bool,
     values: LuaValueSemantics,
 }
 
 impl HirExprSafety {
     pub(crate) const fn for_dialect(dialect: DecompileDialect) -> Self {
         Self {
+            concat_preserves_rightmost_operand: matches!(dialect, DecompileDialect::Lua51),
             dynamic_primitive_equality_is_stable: matches!(
                 dialect,
                 DecompileDialect::Lua51
@@ -79,6 +83,12 @@ impl HirExprSafety {
             ),
             values: LuaValueSemantics::for_dialect(dialect),
         }
+    }
+
+    /// PUC 5.1 的一次 CONCAT 保持 frame top，最右 operand 槽不被部分结果覆盖。
+    /// 中间 operand 槽仍会被覆盖；该能力不覆盖另一条 CONCAT 或后续表达式求值。
+    pub(crate) const fn concat_preserves_rightmost_operand(self) -> bool {
+        self.concat_preserves_rightmost_operand
     }
 
     /// 只计算结果由目标 VM 合同固定的原始字面量比较。
@@ -223,94 +233,6 @@ pub(crate) fn luau_literal_addition_value(lhs: &HirExpr, rhs: &HirExpr) -> Optio
     Some(HirExpr::Number(number(lhs)? + number(rhs)?))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GcInertLiteralKind {
-    Nil,
-    Boolean,
-    Numeric,
-    String,
-}
-
-/// 只跟踪 primitive 字面量运算树在正常完成时的结果种类。
-///
-/// 这里不证明求值可删除，也不要求运算一定成功：除零、整数转换和目标数值域仍由
-/// `is_discard_safe` 或具体 rewrite 的事件证明负责。这里覆盖的普通数值运算不会走
-/// 元方法，因而一旦正常产出，结果仍是 number/integer，不会把 stack slot 变成对象
-/// root。bitwise 的 Number 整数转换失败后可能转入 primitive metatable，动态 concat
-/// 结果也没有 proto 常量锚点，因此两者都不在这条证明里传播。
-fn gc_inert_literal_kind(expr: &HirExpr) -> Option<GcInertLiteralKind> {
-    match expr {
-        HirExpr::Nil => Some(GcInertLiteralKind::Nil),
-        HirExpr::Boolean(_) => Some(GcInertLiteralKind::Boolean),
-        HirExpr::Integer(_) | HirExpr::Number(_) => Some(GcInertLiteralKind::Numeric),
-        HirExpr::String(_) => Some(GcInertLiteralKind::String),
-        HirExpr::Unary(unary) => {
-            let operand = gc_inert_literal_kind(&unary.expr)?;
-            match unary.op {
-                HirUnaryOpKind::Not => Some(GcInertLiteralKind::Boolean),
-                HirUnaryOpKind::Neg if operand == GcInertLiteralKind::Numeric => {
-                    Some(GcInertLiteralKind::Numeric)
-                }
-                HirUnaryOpKind::Length if operand == GcInertLiteralKind::String => {
-                    Some(GcInertLiteralKind::Numeric)
-                }
-                HirUnaryOpKind::Neg | HirUnaryOpKind::BitNot | HirUnaryOpKind::Length => None,
-            }
-        }
-        HirExpr::Binary(binary) => {
-            let lhs = gc_inert_literal_kind(&binary.lhs)?;
-            let rhs = gc_inert_literal_kind(&binary.rhs)?;
-            match binary.op {
-                HirBinaryOpKind::Add
-                | HirBinaryOpKind::Sub
-                | HirBinaryOpKind::Mul
-                | HirBinaryOpKind::Div
-                | HirBinaryOpKind::FloorDiv
-                | HirBinaryOpKind::Mod
-                | HirBinaryOpKind::Pow
-                    if lhs == GcInertLiteralKind::Numeric && rhs == GcInertLiteralKind::Numeric =>
-                {
-                    Some(GcInertLiteralKind::Numeric)
-                }
-                HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le => {
-                    Some(GcInertLiteralKind::Boolean)
-                }
-                HirBinaryOpKind::Add
-                | HirBinaryOpKind::Sub
-                | HirBinaryOpKind::Mul
-                | HirBinaryOpKind::Div
-                | HirBinaryOpKind::FloorDiv
-                | HirBinaryOpKind::Mod
-                | HirBinaryOpKind::Pow
-                | HirBinaryOpKind::BitAnd
-                | HirBinaryOpKind::BitOr
-                | HirBinaryOpKind::BitXor
-                | HirBinaryOpKind::Shl
-                | HirBinaryOpKind::Shr
-                | HirBinaryOpKind::Concat => None,
-            }
-        }
-        HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::LogicalAnd(_)
-        | HirExpr::LogicalOr(_)
-        | HirExpr::Decision(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => None,
-    }
-}
-
 impl HirExprSafety {
     /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
     pub(crate) fn is_discard_safe(self, expr: &HirExpr) -> bool {
@@ -411,44 +333,7 @@ impl HirExprSafety {
     /// proto 常量表持有。无论 vector 的宿主表示是内嵌值还是 boxed GC 对象，这些常量的
     /// 存活期都不由某个栈槽是否继续引用决定。
     pub(crate) fn result_is_gc_inert(self, expr: &HirExpr) -> bool {
-        match expr {
-            HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. } => true,
-            HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => true,
-            HirExpr::Unary(_) => gc_inert_literal_kind(expr).is_some(),
-            HirExpr::Binary(binary)
-                if matches!(
-                    binary.op,
-                    HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
-                ) =>
-            {
-                true
-            }
-            HirExpr::Binary(_) => gc_inert_literal_kind(expr).is_some(),
-            HirExpr::LogicalAnd(logical) => self.result_is_gc_inert(&logical.rhs),
-            HirExpr::LogicalOr(logical) => {
-                self.result_is_gc_inert(&logical.lhs) && self.result_is_gc_inert(&logical.rhs)
-            }
-            HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::TempRef(_)
-            | HirExpr::GlobalRef(_)
-            | HirExpr::TableAccess(_)
-            | HirExpr::Decision(_)
-            | HirExpr::Call(_)
-            | HirExpr::VarArg
-            | HirExpr::TableConstructor(_)
-            | HirExpr::Closure(_)
-            | HirExpr::Unresolved(_) => false,
-        }
+        super::value_facts::value_facts(expr).is_gc_inert()
     }
 
     /// 表达式是否可以在同一个无副作用逻辑区域内合并重复求值。

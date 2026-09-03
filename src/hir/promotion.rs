@@ -20,6 +20,8 @@
 //!   producer/endpoint 配对，不重建 CALL、TFORCALL、TBC 的 VM 栈协议
 //! - 由 `NewTable` canonical def 直接产生的 temp 单独保留 constructor origin；MOVE、
 //!   phi 或后续 local 物化不能冒充分配本身
+//! - 覆盖前的非资源值按 canonical def 保存为入口 nil 或已定义 scalar；例如 LOADNIL
+//!   的 temp 被后续 HIR 内联删除，下一次 MOVE 仍能证明没有旧对象需要释放
 //! - ordinary CALL 参数交接沿 Dataflow SSA 固定前缀与 caller 边界发布到具体调用，
 //!   例如 `f({})` 的参数 home 不得在后层被重建成调用后继续持有的 caller root
 
@@ -30,7 +32,7 @@ use crate::hir::common::{
     ParamId, TempId,
 };
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, DefId, EdgeRef, ForwardRouteKind, GraphFacts,
+    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, EdgeRef, ForwardRouteKind, GraphFacts,
     InstrEffect, LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition,
     RegionId, RegionPlan, RootObservation, SideEffectSummary, SsaValue, StructurePlan,
 };
@@ -323,7 +325,7 @@ impl HomeSlotResolution {
 pub(super) struct ProtoPromotionFacts {
     temp_home_slots: Vec<HomeSlotResolution>,
     immediate_move_write_homes: Vec<BTreeSet<HomeSlotKey>>,
-    entry_nil_overwrite_temps: BTreeSet<TempId>,
+    inert_home_overwrites: BTreeMap<TempId, InertHomeOverwrite>,
     entry_nil_phi_temps: BTreeSet<TempId>,
     entry_nil_phi_locals: BTreeSet<LocalId>,
     entry_nil_pruned_locals: BTreeSet<LocalId>,
@@ -470,12 +472,7 @@ impl ProtoPromotionFacts {
             ),
             temp_home_slots,
             immediate_move_write_homes,
-            entry_nil_overwrite_temps: collect_entry_nil_overwrite_temps(
-                proto,
-                cfg,
-                dataflow,
-                fixed_temps,
-            ),
+            inert_home_overwrites: collect_inert_home_overwrites(proto, cfg, dataflow, fixed_temps),
             entry_nil_phi_temps: collect_entry_nil_phi_temps(proto, dataflow, plan, phi_temps),
             entry_nil_phi_locals: BTreeSet::new(),
             entry_nil_pruned_locals: BTreeSet::new(),
@@ -515,12 +512,15 @@ impl ProtoPromotionFacts {
         self.direct_table_seed_temps.contains(&temp)
     }
 
-    /// 该 temp 是非参数槽的首个 canonical fixed def；槽在函数入口因此必为 nil。
-    ///
-    /// 这不证明 def 只执行一次。消费方仍须把候选限制在 proto 根级单次执行区间，
-    /// 不能把同一静态 def 在循环下一轮面对的旧值误当成入口 nil。
+    /// 该 canonical fixed def 在所有可达前驱路径上覆盖非参数槽的入口 nil。
+    /// 回边携带的前一轮写入不能冒充入口值；当前 HIR 的重入与 home 合并仍由消费者检查。
     pub(super) fn overwrites_entry_nil(&self, temp: TempId) -> bool {
-        self.entry_nil_overwrite_temps.contains(&temp)
+        self.inert_home_overwrites.get(&temp) == Some(&InertHomeOverwrite::EntryNil)
+    }
+
+    /// 前层证明当前定义覆盖非资源旧值，后续 RHS 内联删除旧写时仍保留该事实。
+    pub(super) fn overwrites_gc_inert(&self, temp: TempId) -> bool {
+        !self.temp_home_was_invalidated(temp) && self.inert_home_overwrites.contains_key(&temp)
     }
 
     /// 该 local 来自仍含同槽 `Entry(nil)` incoming 的 direct region-result phi。
@@ -1590,39 +1590,50 @@ fn collect_immediate_move_write_homes(
     homes
 }
 
-fn collect_entry_nil_overwrite_temps(
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum InertHomeOverwrite {
+    EntryNil,
+    DefinedScalar,
+}
+
+fn collect_inert_home_overwrites(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
-) -> BTreeSet<TempId> {
+) -> BTreeMap<TempId, InertHomeOverwrite> {
     let param_count = usize::from(proto.signature.num_params);
     let vararg_param_reg = proto.signature.has_vararg_param_reg.then_some(param_count);
-    let mut first_defs = vec![None::<DefId>; usize::from(proto.frame.max_stack_size)];
-
+    let mut previous_defs = BTreeMap::new();
+    let mut overwrites = BTreeMap::new();
     for def in &dataflow.defs {
-        let slot = def.reg.index();
-        if slot < param_count || Some(slot) == vararg_param_reg {
+        let previous = previous_defs.insert((def.block, def.reg), def.id);
+        let direct = TempId(def.id.index());
+        if fixed_temps.get(def.id.index()) != Some(&direct) {
             continue;
         }
-        let Some(first) = first_defs.get_mut(slot) else {
-            continue;
-        };
-        if first.is_none_or(|current| dataflow.def_instr(current).index() > def.instr.index()) {
-            *first = Some(def.id);
+        if let Some(previous) = previous {
+            // 同一 basic block 内的上一条精确写已经覆盖所有入口路径；不依赖
+            // pruned SSA 是否仍为这个“只被覆盖而未读取”的旧值保留 use。
+            // open result 没有 fixed DefId，必须从同一 InstrEffect 检查它是否已覆盖该槽。
+            let previous_instr = dataflow.def_instr(previous).index();
+            let overwritten_by_open_result = dataflow.instr_effects
+                [previous_instr + 1..def.instr.index()]
+                .iter()
+                .any(|effect| effect.must_define(def.reg));
+            if !overwritten_by_open_result
+                && !ssa_value_may_hold_gc_root(proto, dataflow, SsaValue::Def(previous))
+            {
+                overwrites.insert(direct, InertHomeOverwrite::DefinedScalar);
+            }
+        } else if def.reg.index() >= param_count
+            && Some(def.reg.index()) != vararg_param_reg
+            && dataflow.def_overwrites_entry_value(def.id, cfg)
+        {
+            overwrites.insert(direct, InertHomeOverwrite::EntryNil);
         }
     }
-
-    first_defs
-        .into_iter()
-        .flatten()
-        .filter_map(|def| {
-            let direct = TempId(def.index());
-            (fixed_temps.get(def.index()) == Some(&direct)
-                && dataflow.def_overwrites_entry_value(def, cfg))
-            .then_some(direct)
-        })
-        .collect()
+    overwrites
 }
 
 fn collect_entry_nil_phi_temps(
@@ -3474,7 +3485,13 @@ mod tests {
             Some(CopyRootScalarValue::Number(-0.0))
         );
         assert_eq!(
-            direct_scalar_overwrite_value(&LowInstr::NewTable(NewTableInstr { dst: home }), home,),
+            direct_scalar_overwrite_value(
+                &LowInstr::NewTable(NewTableInstr {
+                    dst: home,
+                    allocation: Default::default()
+                }),
+                home,
+            ),
             None
         );
         assert_eq!(

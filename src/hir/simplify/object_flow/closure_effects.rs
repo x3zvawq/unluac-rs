@@ -8,7 +8,7 @@ use super::super::lexical_cfg::{
 };
 use super::{
     Binding, EffectClosure, EffectValue, ProtoEffects, adjusted_value, binding_from_expr,
-    closure_captures_in_block, extend_map_sets,
+    binding_from_lvalue, closure_captures_in_block, extend_map_sets,
 };
 use crate::hir::common::{
     HirCapture, HirCaptureMode, HirExpr, HirLValue, HirModule, HirProto, HirProtoRef, HirStmt,
@@ -41,14 +41,16 @@ pub(in crate::hir::simplify) fn collect_proto_effects(
             collect_one(child.index(), module, effects, visiting, ready, safety);
         }
 
+        // 无 upvalue 的叶函数没有可投影的 capture，也不可能返回带 capture 的 child；
+        // 其控制流规模不应增加调用方的 root 证明成本。
+        if proto.upvalues.is_empty() && proto.children.is_empty() {
+            ready[index] = true;
+            visiting[index] = false;
+            return;
+        }
+
         let captures = closure_captures_in_block(&proto.body);
-        let state = collect_effect_state(proto, &captures, effects, safety);
-        effects[index] = ProtoEffects {
-            writes: proto.mutable_upvalues.clone(),
-            escapes: state.escapes,
-            returns: state.returns,
-            calls: state.calls,
-        };
+        effects[index] = collect_effect_state(proto, &captures, effects, safety);
         visiting[index] = false;
         ready[index] = true;
     }
@@ -63,9 +65,11 @@ pub(in crate::hir::simplify) fn collect_proto_effects(
         .collect::<Vec<_>>();
     let mut visiting = vec![false; module.protos.len()];
     let mut ready = vec![false; module.protos.len()];
-    for index in 0..module.protos.len() {
+    // 只有 lexical child 的摘要会被 capture 投影消费；入口/独立根的完整 CFG
+    // 不是任何 closure 的 callee 事实，不应为大型无 child 函数反复求一份未使用摘要。
+    for child in module.protos.iter().flat_map(|proto| &proto.children) {
         collect_one(
-            index,
+            child.index(),
             module,
             &mut effects,
             &mut visiting,
@@ -116,6 +120,31 @@ impl EffectState {
             call_targets,
             ..Self::default()
         }
+    }
+
+    // 缺失 binding 与空集合都是 bottom；只保留有 capture 来源的值，避免所有临时值
+    // 都成为每个 CFG 节点必须复制的空状态。覆盖仍需移除旧来源，不能只忽略空写入。
+    fn write_binding(
+        &mut self,
+        binding: Binding,
+        origins: BTreeSet<UpvalueId>,
+        closures: BTreeSet<EffectClosure>,
+        call_targets: BTreeSet<UpvalueId>,
+    ) {
+        fn replace<V>(
+            map: &mut BTreeMap<Binding, BTreeSet<V>>,
+            binding: Binding,
+            values: BTreeSet<V>,
+        ) {
+            if values.is_empty() {
+                map.remove(&binding);
+            } else {
+                map.insert(binding, values);
+            }
+        }
+        replace(&mut self.origins, binding, origins);
+        replace(&mut self.closures, binding, closures);
+        replace(&mut self.call_targets, binding, call_targets);
     }
 
     fn join(&mut self, other: &Self) -> bool {
@@ -296,7 +325,7 @@ fn project_direct_closure(
     state: &EffectState,
     context: &EffectContext<'_>,
 ) -> Option<EffectClosure> {
-    let effect = context.effects.get(proto.index())?;
+    let effect = &context.effects[proto.index()];
     let captures = context.captures.get(&proto)?;
     Some(project_proto_effect(
         proto, effect, captures, state, context,
@@ -662,9 +691,7 @@ fn write_for_bindings_effect(bindings: HirForBindings<'_>, state: &mut EffectSta
     match bindings {
         HirForBindings::Numeric(local) => {
             let binding = Binding::Local(local);
-            state.origins.insert(binding, BTreeSet::new());
-            state.closures.insert(binding, BTreeSet::new());
-            state.call_targets.insert(binding, BTreeSet::new());
+            state.write_binding(binding, BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
         }
         HirForBindings::Generic(flow) => {
             let snapshot = state
@@ -674,15 +701,12 @@ fn write_for_bindings_effect(bindings: HirForBindings<'_>, state: &mut EffectSta
                 .unwrap_or_default();
             for &local in &flow.for_stmt().bindings {
                 let binding = Binding::Local(local);
-                state
-                    .origins
-                    .insert(binding, snapshot.result_origins.clone());
-                state
-                    .closures
-                    .insert(binding, snapshot.result_closures.clone());
-                state
-                    .call_targets
-                    .insert(binding, snapshot.result_call_targets.clone());
+                state.write_binding(
+                    binding,
+                    snapshot.result_origins.clone(),
+                    snapshot.result_closures.clone(),
+                    snapshot.result_call_targets.clone(),
+                );
             }
         }
     }
@@ -706,11 +730,7 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
                     .map_or_else(BTreeSet::new, |value| {
                         effect_expr_call_targets(value, &snapshot, context)
                     });
-                state.origins.insert(Binding::Local(local), origins);
-                state.closures.insert(Binding::Local(local), closures);
-                state
-                    .call_targets
-                    .insert(Binding::Local(local), call_targets);
+                state.write_binding(Binding::Local(local), origins, closures, call_targets);
             }
         }
         HirStmt::Assign(assign) => {
@@ -730,36 +750,22 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
                         effect_expr_call_targets(value, &snapshot, context)
                     });
                 match target {
-                    HirLValue::Param(param) => {
-                        state.origins.insert(Binding::Param(*param), origins);
-                        state.closures.insert(Binding::Param(*param), closures);
-                        state
-                            .call_targets
-                            .insert(Binding::Param(*param), call_targets);
-                    }
-                    HirLValue::Temp(temp) => {
-                        state.origins.insert(Binding::Temp(*temp), origins);
-                        state.closures.insert(Binding::Temp(*temp), closures);
-                        state
-                            .call_targets
-                            .insert(Binding::Temp(*temp), call_targets);
-                    }
-                    HirLValue::Local(local) => {
-                        state.origins.insert(Binding::Local(*local), origins);
-                        state.closures.insert(Binding::Local(*local), closures);
-                        state
-                            .call_targets
-                            .insert(Binding::Local(*local), call_targets);
+                    HirLValue::Param(_) | HirLValue::Temp(_) | HirLValue::Local(_) => {
+                        state.write_binding(
+                            binding_from_lvalue(target).expect("direct binding target"),
+                            origins,
+                            closures,
+                            call_targets,
+                        );
                     }
                     HirLValue::Upvalue(upvalue) => {
                         state.escapes.extend(origins);
-                        state
-                            .origins
-                            .insert(Binding::Upvalue(*upvalue), BTreeSet::from([*upvalue]));
-                        state.closures.insert(Binding::Upvalue(*upvalue), closures);
-                        state
-                            .call_targets
-                            .insert(Binding::Upvalue(*upvalue), call_targets);
+                        state.write_binding(
+                            Binding::Upvalue(*upvalue),
+                            BTreeSet::from([*upvalue]),
+                            closures,
+                            call_targets,
+                        );
                     }
                     HirLValue::Global(_) => state.escapes.extend(origins),
                     HirLValue::TableAccess(access) => {
@@ -838,14 +844,18 @@ fn collect_effect_state(
     captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
-) -> EffectState {
+) -> ProtoEffects {
     let context = EffectContext { captures, effects };
     // 复用 HIR 共享 topology：若通过重复扫描结构树求收敛，没有回边的后续赋值
     // 也会倒灌到先前调用。for initializer 与 loop dispatch 必须是不同节点，避免每次
     // 回边伪造对 initializer 的重复观测。
     let graph = HirFlowGraph::for_block(&proto.body, safety)
         .expect("HIR labels must be unique before effect finalization");
-    let mut summary = EffectState::default();
+    // 输出只需要可观察效果；中间 binding/loop 状态不能汇入函数摘要。
+    let mut summary = ProtoEffects {
+        writes: proto.mutable_upvalues.clone(),
+        ..ProtoEffects::default()
+    };
     graph.solve_forward(
         EffectState::new(proto),
         EffectState::join,
@@ -870,7 +880,9 @@ fn collect_effect_state(
                     note_effect_escapes(&repeat.cond, output, &context);
                 }
             }
-            summary.join(output);
+            summary.escapes.extend(&output.escapes);
+            summary.returns.extend(output.returns.iter().cloned());
+            summary.calls.extend(&output.calls);
         },
     );
     summary

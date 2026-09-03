@@ -1,5 +1,5 @@
--- unluac: expect-contains [[if r0_0 == nil then]]
--- unluac: expect-contains [[r0_0 = env]]
+-- unluac: expect-contains [[ == nil then]]
+-- unluac: expect-contains [[ = env]]
 -- unluac: expect-not-contains [[else]]
 -- unluac: expect-not-contains [[ or ]]
 
@@ -20,4 +20,6 @@ function b.two()
     return b.one
 end
 
+assert(b == env)
+assert(b.one() == b and b.two() == b.one)
 return b.two

@@ -323,7 +323,10 @@ impl<'a> AstLowerer<'a> {
                     let value = std::mem::replace(last, AstExpr::Nil);
                     *last = AstExpr::SingleValue(Box::new(value));
                 }
-                AstExpr::TableConstructor(Box::new(AstTableConstructor { fields }))
+                AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                    fields,
+                    allocation: table.allocation.clone(),
+                }))
             }
             HirExpr::Closure(closure) => {
                 AstExpr::FunctionExpr(Box::new(self.lower_function_expr(proto_index, closure)?))

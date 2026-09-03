@@ -249,7 +249,10 @@ impl<'a> ProtoLowerer<'a> {
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr { dst })),
+                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
+                            dst,
+                            allocation: Default::default(),
+                        })),
                     );
                     raw_index += 1;
                 }

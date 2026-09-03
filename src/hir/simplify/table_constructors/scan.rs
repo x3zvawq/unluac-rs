@@ -9,9 +9,14 @@
 //! 要么由 source preservation plan 整句保留，不能只删一部分 materialization。
 //! 旧值已证明为 nil 的简单 local assignment 也可保留，但从该点起只允许独立、无事件的
 //! constructor step 前移；赋值仍在原位完成 capture cell 更新和物理 root handoff。
+//! 调用结果 TempId 以 Promotion 的可信 home 进入 producer 计划；删除须由精确覆盖
+//! 终点或完整 constructor 的强字段持有/退出事务批准，单写身份自身不签发根释放许可。
+//! ConstructorRegion 只发布成功前缀的步骤，保留 producer binding/缺失槽投影、原字段
+//! 表达式与批次引用。rebuild 和 commit 消费同一角色划分，不从 stmt_index 反向匹配语法。
 
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack};
 use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::bindings::{
     BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue, expr_uses_binding,
@@ -20,8 +25,18 @@ use super::builder::ConstructorBuilder;
 use super::rebuild::producer_value_can_be_dropped;
 use super::rebuild::{RegionRebuildContext, try_extend_constructor_from_steps};
 use super::{
-    BindingId, BindingSlots, ProducerSourcePreservation, RebuildScratch, RegionStep, TableBinding,
+    BindingId, BindingSlots, PendingProducerSource, ProducerSourcePreservation, RebuildScratch,
+    RegionStep, TableBinding,
 };
+
+/// 仅含已经由 rebuild 验证事件序与完整消费的前缀；失败后缀不进入提交事实。
+/// 步骤借用当前不可变 HIR，安装 constructor 或删除语句前必须结束该借用。
+pub(super) struct ConstructorRegion<'a> {
+    pub(super) constructor: HirTableConstructor,
+    pub(super) end_index: usize,
+    pub(super) preserved_stmt_indices: Vec<usize>,
+    pub(super) steps: Vec<RegionStep<'a>>,
+}
 
 /// 按稳定 stmt id 记录每个 binding 最后可能扩展构造器的位置。
 ///
@@ -116,8 +131,8 @@ pub(super) fn constructor_uses_binding(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn try_rebuild_constructor_region(
-    block: &crate::hir::common::HirBlock,
+pub(super) fn try_rebuild_constructor_region<'a>(
+    block: &'a crate::hir::common::HirBlock,
     seed_index: usize,
     binding: TableBinding,
     constructor: HirTableConstructor,
@@ -125,10 +140,12 @@ pub(super) fn try_rebuild_constructor_region(
     binding_occurrences: &BindingOccurrenceIndex,
     materialized_binding_counts: &[u32],
     debug_identity_bindings: &BindingSlots<bool>,
+    promotion_facts: &ProtoPromotionFacts,
     stmt_ids: &[usize],
     scratch: &mut RebuildScratch,
-) -> Option<(HirTableConstructor, usize, Vec<usize>)> {
+) -> Option<ConstructorRegion<'a>> {
     let mut steps = Vec::new();
+    let mut committed_steps = Vec::new();
     let mut use_horizon: Option<usize> = None;
     let mut best_end = None;
     let mut preserved_stmt_indices = Vec::new();
@@ -170,11 +187,22 @@ pub(super) fn try_rebuild_constructor_region(
             // 与 call、lookup、allocation 或 metamethod-capable constructor work 交换顺序。
             break;
         }
-        let boundary_step = if keyed_write_step(stmt, binding) {
-            RegionStep::Record { stmt_index: index }
-        } else if let Some((producer_bindings, source_preservation)) =
-            producer_steps(stmt, index, binding, debug_identity_bindings, &mut steps)
+        let boundary_step = if let Some((owner, key, value)) = keyed_write_parts(stmt)
+            && owner == binding
         {
+            RegionStep::Record {
+                stmt_index: index,
+                key,
+                value,
+            }
+        } else if let Some((producer_bindings, source_preservation)) = producer_steps(
+            stmt,
+            index,
+            binding,
+            debug_identity_bindings,
+            promotion_facts,
+            &mut steps,
+        ) {
             for producer_binding in producer_bindings {
                 let binding_id = binding_index
                     .id_of(producer_binding)
@@ -187,8 +215,13 @@ pub(super) fn try_rebuild_constructor_region(
                 }
             }
             continue;
-        } else if table_set_list_step(stmt, binding) {
-            RegionStep::SetList { stmt_index: index }
+        } else if let HirStmt::TableSetList(batch) = stmt
+            && table_set_list_step(stmt, binding)
+        {
+            RegionStep::SetList {
+                stmt_index: index,
+                batch,
+            }
         } else {
             // 其它语句不属于 constructor region grammar，遇到时结束后缀候选。
             // 例如 `setmetatable(t, mt); t.x = 1` 若跨过前置 CallStmt，会把字段写入移到
@@ -228,7 +261,7 @@ pub(super) fn try_rebuild_constructor_region(
                 }
             }
             best_end = Some((index, preserved_stmt_indices.clone()));
-            steps.clear();
+            committed_steps.append(&mut steps);
             use_horizon = None;
         } else {
             // horizon 已覆盖未来对现有 producer 的引用；后缀无法改写已失败的 segment。
@@ -241,12 +274,11 @@ pub(super) fn try_rebuild_constructor_region(
     // 末尾那批未消费 producer 会让整段 region 失败，反而错过前面已经足够安全的
     // `{ ... }` 前缀。因此这里持续记住“最后一个成功前缀”，在真正遇到无关语句时
     // 回退到最近一次可证明安全的构造器边界。
-    best_end.map(|(end_index, preserved_stmt_indices)| {
-        (
-            committed_builder.into_constructor(),
-            end_index,
-            preserved_stmt_indices,
-        )
+    best_end.map(|(end_index, preserved_stmt_indices)| ConstructorRegion {
+        constructor: committed_builder.into_constructor(),
+        end_index,
+        preserved_stmt_indices,
+        steps: committed_steps,
     })
 }
 
@@ -459,11 +491,11 @@ fn stmt_uses_any_binding(stmt: &HirStmt, bindings: &[TableBinding]) -> bool {
     }
 }
 
-fn keyed_write_step(stmt: &HirStmt, binding: TableBinding) -> bool {
-    keyed_write_binding(stmt) == Some(binding)
+fn keyed_write_binding(stmt: &HirStmt) -> Option<TableBinding> {
+    keyed_write_parts(stmt).map(|(binding, _, _)| binding)
 }
 
-fn keyed_write_binding(stmt: &HirStmt) -> Option<TableBinding> {
+fn keyed_write_parts(stmt: &HirStmt) -> Option<(TableBinding, &HirExpr, &HirExpr)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -482,15 +514,16 @@ fn keyed_write_binding(stmt: &HirStmt) -> Option<TableBinding> {
         // `local t = { ... }`，initializer 内的 `t` 不再指向刚创建的 owner。
         return None;
     }
-    Some(binding)
+    Some((binding, &access.key, value))
 }
 
-fn producer_steps(
-    stmt: &HirStmt,
+fn producer_steps<'a>(
+    stmt: &'a HirStmt,
     stmt_index: usize,
     constructor_binding: TableBinding,
     debug_identity_bindings: &BindingSlots<bool>,
-    steps: &mut Vec<RegionStep>,
+    promotion_facts: &ProtoPromotionFacts,
+    steps: &mut Vec<RegionStep<'a>>,
 ) -> Option<(Vec<TableBinding>, ProducerSourcePreservation)> {
     match stmt {
         HirStmt::LocalDecl(local_decl) => {
@@ -515,6 +548,30 @@ fn producer_steps(
             )
             .map(|bindings| (bindings, source_preservation))
         }
+        HirStmt::Assign(assign) if matches!(assign.targets.as_slice(), [HirLValue::Temp(_)]) => {
+            let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
+                unreachable!("checked scalar temp producer")
+            };
+            if !matches!(assign.values.fixed.as_slice(), [HirExpr::Call(_)])
+                || promotion_facts.trusted_temp_home_slot(*temp).is_none()
+            {
+                return None;
+            }
+            // scanner 只保留原始值身份；commit 消费精确覆盖终点或终点强持有证明，
+            // 不能把可信 home 与单写 TempId 自身当成任意 assignment 的删除许可。
+            let bindings = vec![TableBinding::Temp(*temp)];
+            let preservation =
+                producer_source_preservation(&bindings, &assign.values, debug_identity_bindings);
+            producer_steps_from_bindings(
+                bindings,
+                &assign.values,
+                constructor_binding,
+                stmt_index,
+                preservation,
+                steps,
+            )
+            .map(|bindings| (bindings, preservation))
+        }
         // entry-nil、保留原写且只跨无事件字段的 assignment 已由 scanner 提前消费；
         // 其余 assignment 不是 producer declaration，并可能带独立 root/写后读语义。
         // `lua54_01_close#9` 的旧对象覆盖必须保留精确释放点；`x=1; t.v=x` 又要求字段维持
@@ -524,13 +581,13 @@ fn producer_steps(
     }
 }
 
-fn producer_steps_from_bindings(
+fn producer_steps_from_bindings<'a>(
     bindings: Vec<TableBinding>,
-    values: &HirValuePack,
+    values: &'a HirValuePack,
     constructor_binding: TableBinding,
     stmt_index: usize,
     source_preservation: ProducerSourcePreservation,
-    steps: &mut Vec<RegionStep>,
+    steps: &mut Vec<RegionStep<'a>>,
 ) -> Option<Vec<TableBinding>> {
     if bindings.is_empty() {
         return None;
@@ -576,11 +633,28 @@ fn producer_steps_from_bindings(
         debug_assert!(surplus.iter().all(seed_delay_expr_is_unobservable));
     }
 
-    steps.extend((0..bindings.len()).map(|slot_index| RegionStep::Producer {
-        stmt_index,
-        slot_index,
-        source_preservation,
-    }));
+    let scalar_call = bindings.len() == 1 && matches!(values.fixed.as_slice(), [HirExpr::Call(_)]);
+    let source_gc_inert = values.fixed.iter().all(producer_value_can_be_dropped);
+    steps.extend(
+        bindings
+            .iter()
+            .enumerate()
+            .map(|(slot_index, binding)| RegionStep::Producer {
+                binding: *binding,
+                source: if slot_index < values.fixed.len() {
+                    PendingProducerSource::Value {
+                        stmt_index,
+                        value_index: slot_index,
+                    }
+                } else {
+                    PendingProducerSource::ImplicitNil { stmt_index }
+                },
+                value: values.fixed.get(slot_index).unwrap_or(&HirExpr::Nil),
+                scalar_call,
+                source_gc_inert,
+                source_preservation,
+            }),
+    );
     Some(bindings)
 }
 
@@ -829,9 +903,17 @@ mod tests {
             &occurrences,
             &materialized_counts,
             &debug_identities,
+            &ProtoPromotionFacts::default(),
             &stmt_ids,
             &mut scratch,
         )
+        .map(|region| {
+            (
+                region.constructor,
+                region.end_index,
+                region.preserved_stmt_indices,
+            )
+        })
     }
 
     #[test]

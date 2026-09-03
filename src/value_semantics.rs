@@ -4,10 +4,13 @@
 //! 这些规则。消费者把当前 IR 字面量投影为 `LuaLiteral`，不复制 VM 比较算法，也不把
 //! HIR 的 binding/root 证明借给 AST。AST 新形成的字面量比较同样可以使用这个值域。
 //! 例如 Lua 5.3+ 的 `9007199254740993 == 9007199254740992.0` 必须判假，不能先把
-//! 整数舍入成宿主 f64。该模块只证明原始值结果，不授权移动求值或删除物理 root。
+//! 整数舍入成宿主 f64。`table` 子模块另行共享候选语法的模板初始化分类，不把正常
+//! 结果类型当成编译期常量。这些查询均不授权移动求值或删除物理 root。
 
 use crate::LuaString;
 use crate::decompile::DecompileDialect;
+
+pub(crate) mod table;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum LuaLiteral<'a> {

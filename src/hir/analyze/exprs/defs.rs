@@ -72,7 +72,7 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
             })
         }
         LowInstr::NewTable(new_table) if new_table.dst == def_reg => {
-            Some(HirExpr::TableConstructor(Box::default()))
+            Some(super::expr_for_new_table(lowering.proto, new_table))
         }
         LowInstr::Call(call) => expr_for_fixed_call(lowering, def_block, def_instr, call, def_reg),
         LowInstr::VarArg(vararg) => expr_for_fixed_vararg(vararg.results, def_reg),

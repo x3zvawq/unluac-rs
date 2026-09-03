@@ -47,10 +47,8 @@ pub(crate) fn compile_lua_case_to_suite_artifact(
     let source = repo_root().join(entry.path);
     let output = suite_artifact_path(
         suite_label,
-        dialect_label,
-        entry.variant,
+        entry,
         artifact_label,
-        entry.path,
         toolchain.chunk_extension,
     );
     let command_output =
@@ -64,15 +62,7 @@ pub(crate) fn write_generated_case_source(
     suite_label: &str,
     generated_source: &str,
 ) -> Result<PathBuf, String> {
-    let dialect_label = <&'static str>::from(entry.dialect);
-    let output = suite_artifact_path(
-        suite_label,
-        dialect_label,
-        entry.variant,
-        "generated-source",
-        entry.path,
-        "lua",
-    );
+    let output = suite_artifact_path(suite_label, entry, "generated-source", "lua");
     write_output_file(&output, generated_source.as_bytes())?;
     Ok(output)
 }
@@ -244,10 +234,8 @@ pub(crate) fn run_pipeline_case(
         })?;
         let carrier_path = suite_artifact_path(
             suite_label,
-            dialect_label,
-            entry.variant,
+            entry,
             "patched-self-value-carrier",
-            entry.path,
             toolchain.chunk_extension,
         );
         write_output_file(&carrier_path, &chunk).map_err(|detail| {

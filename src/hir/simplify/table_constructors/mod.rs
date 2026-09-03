@@ -17,11 +17,17 @@
 //! fixed SETLIST 的 local 路径只改写 SETLIST 本身，fresh seed 的声明或重赋值保持原位；
 //! 该边界同时保留 initializer/overwrite 的求值时点与独立 GC root，不用复制表达式来换取展示折叠。
 //! record key 始终保留为 HIR 表达式；本 pass 不读取目标方言，也不提前选择命名字段语法。
+//! 单次完整 raw 数组批次直接返回时，提交保留其 nil-hole 批次语义；无 cleanup/capture
+//! 观察者的函数出口同时终结 producer 根，不能将这一情形误判成逐字段写入后的长期持有。
+//! scanner 的 typed steps 保留到提交，producer 投影与字段/batch 角色不从语句重新推导。
+//! 提交消费每个构造器的分配事实；Indexed 字段中的常量通过受保护的字面量 local
+//! 保持运行时读取，避免 `{a,true,c}` 改用会裁掉尾部 nil 槽的模板初始化。
 
 mod bindings;
 mod builder;
 mod inline_value;
 mod rebuild;
+mod roots;
 mod scan;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +46,7 @@ use self::bindings::{
 };
 use self::builder::expr_is_definitely_non_nil;
 use self::rebuild::producer_value_can_be_dropped;
+use self::roots::RegionRootFacts;
 use self::scan::{
     ConstructorWriteIndex, constructor_seed, constructor_uses_binding, install_constructor_seed,
     seed_delay_expr_is_unobservable, seed_overwrite_delay_is_unobservable,
@@ -60,18 +67,33 @@ enum TableBinding {
 type BindingId = usize;
 
 #[derive(Debug, Clone, Copy)]
-enum RegionStep {
+enum RegionStep<'a> {
     Producer {
-        stmt_index: usize,
-        slot_index: usize,
+        binding: TableBinding,
+        source: PendingProducerSource,
+        value: &'a HirExpr,
+        scalar_call: bool,
+        source_gc_inert: bool,
         source_preservation: ProducerSourcePreservation,
     },
     Record {
         stmt_index: usize,
+        key: &'a HirExpr,
+        value: &'a HirExpr,
     },
     SetList {
         stmt_index: usize,
+        batch: &'a crate::hir::common::HirTableSetList,
     },
+}
+
+impl RegionStep<'_> {
+    fn stmt_index(&self) -> usize {
+        match self {
+            Self::Producer { source, .. } => source.stmt_index(),
+            Self::Record { stmt_index, .. } | Self::SetList { stmt_index, .. } => *stmt_index,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +113,7 @@ enum ProducerSourcePreservation {
     UnsupportedShape,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum PendingProducerSource {
     Value {
         stmt_index: usize,
@@ -101,6 +123,29 @@ enum PendingProducerSource {
         // Closed Lua assignments pad every target after the fixed RHS with nil.
         stmt_index: usize,
     },
+}
+
+impl PendingProducerSource {
+    fn stmt_index(self) -> usize {
+        match self {
+            Self::Value { stmt_index, .. } | Self::ImplicitNil { stmt_index } => stmt_index,
+        }
+    }
+
+    /// source 在 scanner 冻结，缺失槽的 nil 投影不再由各消费者重算。
+    fn value(self, block: &crate::hir::common::HirBlock) -> Option<&HirExpr> {
+        match self {
+            Self::Value {
+                stmt_index,
+                value_index,
+            } => match block.stmts.get(stmt_index)? {
+                HirStmt::LocalDecl(decl) => decl.values.fixed.get(value_index),
+                HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
+                _ => None,
+            },
+            Self::ImplicitNil { .. } => Some(&HirExpr::Nil),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -166,6 +211,7 @@ pub(super) fn stabilize_table_constructors_in_proto(
         reference_captured_home_slots,
     } = collect_binding_facts(&proto.body, promotion_facts, temp_count, first_new_local);
     let mut pass = TableConstructorPass {
+        has_cleanup: proto_has_cleanup(proto),
         materialized_bindings,
         reference_captured_bindings,
         reference_captured_home_slots,
@@ -186,10 +232,20 @@ pub(super) fn stabilize_table_constructors_in_proto(
     proto
         .locals
         .extend((first_new_local..pass.next_local_index).map(LocalId));
+    proto
+        .local_debug_scopes
+        .extend((first_new_local..pass.next_local_index).map(|_| None));
+    for index in first_new_local..pass.next_local_index {
+        proto.inline_dispositions.preserve_local(
+            LocalId(index),
+            crate::hir::HirInlineRetentionReason::TableInitialization,
+        );
+    }
     changed
 }
 
 struct TableConstructorPass<'a> {
+    has_cleanup: bool,
     materialized_bindings: BindingSlots<u32>,
     reference_captured_bindings: BindingSlots<bool>,
     reference_captured_home_slots: std::collections::BTreeSet<HomeSlotKey>,
@@ -209,6 +265,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
 
         let mut changed = false;
         let mut scratch = RebuildScratch::default();
+        let mut runtime_operand_prefixes = BTreeMap::new();
         // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
         // 每个 seed 只做当前位置之后的有序集合查找，不重建完整 suffix summary。
         let mut binding_index = BindingIndex::new(self.temp_count, self.next_local_index);
@@ -251,28 +308,45 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     &binding_occurrences,
                     &materialized_binding_counts,
                     &self.debug_identity_bindings,
+                    self.promotion_facts,
                     &stmt_ids,
                     &mut scratch,
                 );
-                candidate.filter(|(rebuilt_constructor, end_index, preserved_stmt_indices)| {
-                    let open_local_owner = rebuilt_constructor.trailing_multivalue.is_some()
-                        && self.open_local_constructor_region_is_safe(
-                            block,
-                            index,
-                            *end_index,
-                            binding,
-                            rebuilt_constructor,
-                            preserved_stmt_indices,
-                        );
+                candidate.filter(|region| {
+                    let scan::ConstructorRegion {
+                        constructor: rebuilt_constructor,
+                        end_index,
+                        preserved_stmt_indices,
+                        steps,
+                    } = region;
+                    let roots = RegionRootFacts::new(steps, preserved_stmt_indices);
+                    let returned_batch = self.returned_batch_is_safe(block, index, binding, region);
+                    let indexed_owner =
+                        self.returned_indexed_region_is_safe(block, index, binding, region, &roots);
+                    let open_owner = rebuilt_constructor.trailing_multivalue.is_some()
+                        && self
+                            .open_constructor_region_is_safe(block, index, binding, region, &roots);
+                    if !indexed_owner
+                        && roots.temp_producers.iter().any(|temp| {
+                            !open_owner
+                                || !self
+                                    .promotion_facts
+                                    .call_result_root_ends_after_value_use(*temp)
+                        })
+                    {
+                        // 原始调用结果只能由完整 open-owner 事务消费；不能先提交字段前缀，
+                        // 再让后缀重建已经删除的 physical root 身份。
+                        return false;
+                    }
                     let open_capture_is_safe = rebuilt_constructor.trailing_multivalue.is_none()
-                        || self.open_local_constructor_capture_region_is_safe(
+                        || self.open_constructor_capture_region_is_safe(
                             block, index, *end_index, binding,
                         );
                     // Value-position nil is governed by the completed table shape, not by whether
                     // a nil literal happened to occur in a producer. A final absent array slot and
                     // a nil-valued record field preserve the same key set as the original writes.
-                    let nil_shape_is_supported =
-                        constructor_nil_shape_is_supported(&seed_ctor, rebuilt_constructor);
+                    let nil_shape_is_supported = returned_batch
+                        || constructor_nil_shape_is_supported(&seed_ctor, rebuilt_constructor);
                     // Lua emits constructor array fields through a deferred SETLIST batch.  A
                     // later numeric record that aliases an earlier array field therefore cannot
                     // represent a later overwrite: `{ value, [1] = nil }` leaves `value` at key
@@ -286,8 +360,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 候选拒绝[SemanticBarrier:ValueArity]：`HirTableConstructor` 只有 open
                     // trailing pack，AST lowering 也拒绝 exact-width tail。若 `f()` 返回三个值，
                     // 原 SETLIST 的 exact width 2 只写两个槽，而 `{ f() }` 会写入三个槽。
-                    let unsupported_exact_width =
-                        region_has_exact_width_tail(block, index, *end_index);
+                    let unsupported_exact_width = roots.has_exact_width_tail;
                     // Check the completed constructor as well as the original seed.  A seed
                     // whose last array value may be nil is safe only while it remains the last
                     // slot; appending a later definite value must stay as an indexed write.
@@ -298,30 +371,26 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // folded region, a later clear/escape/call may observe that root; keep the
                     // producer declaration in that case.  When the table dies at the region
                     // boundary, dropping the temporary does not change its observable life.
-                    // 已通过 `open_local_constructor_region_is_safe` 的 LocalDecl owner 是
+                    // 已通过 `open_constructor_region_is_safe` 的 LocalDecl owner 是
                     // 更精确的整区间证明：producer 只为该 initializer 的最终 open tail
                     // 服务，不能再让通用“后续仍提到 table”近似覆盖这项结论。
                     // 候选拒绝[SemanticBarrier:Lifetime]：反例见
                     // tests/unit-case/lua54_01_close.lua#lua54_01_close#13/#14/#16。
-                    let producer_root_is_observable = !open_local_owner
-                        && region_has_non_drop_safe_producer(
-                            block,
-                            index,
-                            *end_index,
-                            preserved_stmt_indices,
-                        )
+                    let producer_root_is_observable = !indexed_owner
+                        && !open_owner
+                        && !returned_batch
+                        && roots.has_removed_object_producer
                         && collect_range_binding_mentions(block, *end_index + 1, block.stmts.len())
                             .contains(&binding);
                     // 候选拒绝[SemanticBarrier:Lifetime]：对象 producer 后再覆盖 table field
                     // 时，删除 producer 会提前释放最后一个强引用；反例同上。
-                    let has_followup_object_write =
-                        region_has_followup_table_write_after_object_producer(
-                            block,
-                            index,
-                            *end_index,
-                            binding,
-                            preserved_stmt_indices,
-                        );
+                    let has_followup_object_write = !indexed_owner
+                        && !(open_owner
+                            && rebuilt_constructor
+                                .allocation
+                                .indexed_array_capacity()
+                                .is_some())
+                        && roots.has_followup_object_write;
                     // A source LocalDecl has no visible owner before its initializer completes;
                     // with no debug identity, folding later fields into that initializer cannot
                     // expose a delayed store.  Temp seeds do overwrite an existing VM slot, so an
@@ -335,7 +404,8 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             .get(binding)
                             .copied()
                             .unwrap_or_default();
-                    let overwrite_timing_is_safe = open_local_owner
+                    let overwrite_timing_is_safe = indexed_owner
+                        || open_owner
                         || source_local_owner
                         || self.seed_overwrites_unobservable_entry_nil(binding)
                         || seed_overwrite_delay_is_unobservable(block, index, *end_index, binding);
@@ -350,18 +420,24 @@ impl HirRewritePass for TableConstructorPass<'_> {
             } else {
                 None
             };
-            let (constructor, end_index, preserved_stmt_indices, rebuilt_region) = match rebuilt {
-                Some((rebuilt_ctor, end_index, preserved_stmt_indices)) => {
-                    (rebuilt_ctor, end_index, preserved_stmt_indices, true)
-                }
-                None => (seed_ctor, index, Vec::new(), false),
-            };
-
-            if !rebuilt_region {
+            let Some(scan::ConstructorRegion {
+                mut constructor,
+                end_index,
+                preserved_stmt_indices,
+                ..
+            }) = rebuilt
+            else {
                 index += 1;
                 continue;
-            }
+            };
 
+            let runtime_operands = crate::hir::table_layout::materialize_runtime_table_operands(
+                &mut constructor,
+                &mut self.next_local_index,
+            );
+            if !runtime_operands.is_empty() {
+                runtime_operand_prefixes.insert(seed_stmt_id, runtime_operands);
+            }
             install_constructor_seed(&mut block.stmts[index], constructor);
             let drain_end = end_index;
             if drain_end > index {
@@ -379,85 +455,100 @@ impl HirRewritePass for TableConstructorPass<'_> {
             index += 1;
         }
 
+        if !runtime_operand_prefixes.is_empty() {
+            // 区域分析使用同一不可变坐标系；全部决定完成后才插入无事件的常量声明。
+            let stmts = std::mem::take(&mut block.stmts);
+            for (stmt, id) in stmts.into_iter().zip(stmt_ids) {
+                if let Some(prefix) = runtime_operand_prefixes.remove(&id) {
+                    block.stmts.extend(prefix);
+                }
+                block.stmts.push(stmt);
+            }
+        }
         changed |= self.materialize_safe_fixed_set_lists(block);
         changed
     }
 }
 
-fn region_has_non_drop_safe_producer(
-    block: &crate::hir::common::HirBlock,
-    start_index: usize,
-    end_index: usize,
-    preserved_stmt_indices: &[usize],
-) -> bool {
-    block.stmts[start_index + 1..=end_index]
-        .iter()
-        .enumerate()
-        .any(|(offset, stmt)| {
-            let stmt_index = start_index + 1 + offset;
-            preserved_stmt_indices.binary_search(&stmt_index).is_err()
-                && stmt_has_non_drop_safe_producer(stmt)
-        })
-}
-
-fn region_has_followup_table_write_after_object_producer(
-    block: &crate::hir::common::HirBlock,
-    start_index: usize,
-    end_index: usize,
-    binding: TableBinding,
-    preserved_stmt_indices: &[usize],
-) -> bool {
-    if end_index <= start_index {
-        return false;
-    }
-    let mut object_producer_seen = false;
-    let mut first_table_write_after_producer = false;
-    for (offset, stmt) in block.stmts[start_index + 1..=end_index].iter().enumerate() {
-        let stmt_index = start_index + 1 + offset;
-        if preserved_stmt_indices.binary_search(&stmt_index).is_err()
-            && stmt_has_non_drop_safe_producer(stmt)
-        {
-            object_producer_seen = true;
-        }
-        if stmt_writes_table_binding(stmt, binding) && object_producer_seen {
-            if first_table_write_after_producer {
-                return true;
-            }
-            first_table_write_after_producer = true;
-        }
-    }
-    false
-}
-
-fn stmt_has_non_drop_safe_producer(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalDecl(decl) => decl
-            .values
-            .fixed
-            .iter()
-            .any(|value| !producer_value_can_be_dropped(value)),
-        // Keyed writes are constructor fields, not independent producer materializations.
-        // Their object values remain rooted by the rebuilt table itself and must not make the
-        // enclosing region look as if a removable local producer were still alive.
-        _ => false,
-    }
-}
-
-fn stmt_writes_table_binding(stmt: &HirStmt, binding: TableBinding) -> bool {
-    match stmt {
-        HirStmt::Assign(assign) => assign.targets.iter().any(|target| {
-            matches!(
-                target,
-                HirLValue::TableAccess(access)
-                    if binding_from_expr(&access.base) == Some(binding)
-            )
-        }),
-        HirStmt::TableSetList(set_list) => binding_from_expr(&set_list.base) == Some(binding),
-        _ => false,
-    }
-}
-
 impl TableConstructorPass<'_> {
+    /// 一次 raw 数组批次直接离开无 cleanup 的函数时，槽根与结果构造器同时结束当前 frame。
+    /// scanner/rebuild 已证明 producer 消费和事件序；这里只证明提交所需的批次/出口身份，
+    /// 不把可能含 nil 的原始 SETLIST 误当作逐项 SETTABLE，也不跨过后续 root 观察点。
+    fn returned_batch_is_safe(
+        &self,
+        block: &crate::hir::common::HirBlock,
+        seed_index: usize,
+        binding: TableBinding,
+        region: &scan::ConstructorRegion<'_>,
+    ) -> bool {
+        let scan::ConstructorRegion {
+            constructor,
+            end_index,
+            preserved_stmt_indices: preserved,
+            steps,
+        } = region;
+        let end_index = *end_index;
+        if self.has_cleanup || !preserved.is_empty() {
+            return false;
+        }
+        let Some((_, seed)) = constructor_seed(&block.stmts[seed_index]) else {
+            return false;
+        };
+        let Some(RegionStep::SetList { batch, .. }) = steps.last() else {
+            return false;
+        };
+        let [HirStmt::Return(ret)] = &block.stmts[end_index + 1..] else {
+            return false;
+        };
+        if !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_))
+            || !seed.fields.is_empty()
+            || seed.trailing_multivalue.is_some()
+            || batch.start_index != 1
+            || batch.values.tail.is_some() != constructor.trailing_multivalue.is_some()
+            || binding_from_expr(&batch.base) != Some(binding)
+            || ret.values.tail.is_some()
+            || ret.values.fixed.len() != 1
+            || binding_from_expr(&ret.values.fixed[0]) != Some(binding)
+            || constructor.fields.len() != batch.values.fixed.len()
+            || !constructor
+                .fields
+                .iter()
+                .all(|field| matches!(field, HirTableField::Array(_)))
+            || self
+                .debug_identity_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+            || self
+                .reference_captured_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+        {
+            return false;
+        }
+        steps[..steps.len() - 1].iter().all(|step| {
+            let RegionStep::Producer {
+                binding: TableBinding::Local(local),
+                ..
+            } = step
+            else {
+                return false;
+            };
+            let binding = TableBinding::Local(*local);
+            !self
+                .debug_identity_bindings
+                .get(binding)
+                .copied()
+                .unwrap_or_default()
+                && !self
+                    .reference_captured_bindings
+                    .get(binding)
+                    .copied()
+                    .unwrap_or_default()
+        }) && self.open_constructor_capture_region_is_safe(block, seed_index, end_index, binding)
+    }
+
     /// Lower a fixed SETLIST to indexed writes only when an explicit fresh seed dominates it.
     /// Keeping the seed statement intact preserves its allocation point and avoids changing
     /// raw SETLIST writes on shared or metatable-bearing tables into ordinary assignments.
@@ -1225,20 +1316,21 @@ impl TableConstructorPass<'_> {
     fn captures_may_share_seed_home(
         &self,
         captured: &ReferenceCapturedBindings,
-        seed_local: LocalId,
+        seed_binding: TableBinding,
         seed_homes: &BTreeSet<HomeSlotKey>,
     ) -> bool {
         captured.locals.iter().any(|local| {
-            *local == seed_local
+            TableBinding::Local(*local) == seed_binding
                 || !self
                     .promotion_facts
                     .complete_local_home_slots(*local)
                     .is_disjoint(seed_homes)
         }) || captured.temps.iter().any(|temp| {
-            !self
-                .promotion_facts
-                .complete_temp_home_slots(*temp)
-                .is_disjoint(seed_homes)
+            TableBinding::Temp(*temp) == seed_binding
+                || !self
+                    .promotion_facts
+                    .complete_temp_home_slots(*temp)
+                    .is_disjoint(seed_homes)
         }) || captured.params.iter().any(|param| {
             !self
                 .promotion_facts
@@ -1247,17 +1339,17 @@ impl TableConstructorPass<'_> {
         })
     }
 
-    fn open_local_constructor_capture_region_is_safe(
+    fn open_constructor_capture_region_is_safe(
         &self,
         block: &crate::hir::common::HirBlock,
         seed_index: usize,
         end_index: usize,
         binding: TableBinding,
     ) -> bool {
-        let TableBinding::Local(local) = binding else {
-            return false;
+        let seed_homes = match binding {
+            TableBinding::Local(local) => self.promotion_facts.complete_local_home_slots(local),
+            TableBinding::Temp(temp) => self.promotion_facts.complete_temp_home_slots(temp),
         };
-        let seed_homes = self.promotion_facts.complete_local_home_slots(local);
         // 候选拒绝[SemanticBarrier:Capture]：ByReference closure 可持续观察 owner cell，
         // ByValue closure 则在 producer 原位置冻结该 cell；把 producer 移入 LocalDecl
         // initializer 会把两者都放到 owner store 之前。complete possible-home 相交时，
@@ -1266,11 +1358,11 @@ impl TableConstructorPass<'_> {
             let stmt_slice = std::slice::from_ref(stmt);
             !self.captures_may_share_seed_home(
                 &stmts_reference_captured_bindings(stmt_slice),
-                local,
+                binding,
                 &seed_homes,
             ) && !self.captures_may_share_seed_home(
                 &stmts_value_captured_bindings(stmt_slice),
-                local,
+                binding,
                 &seed_homes,
             )
         })
@@ -1631,30 +1723,51 @@ impl TableConstructorPass<'_> {
         true
     }
 
-    /// Prove the one open-tail region whose allocation owner is an actual LocalDecl at block
-    /// entry.  Scalar declarations may disappear into the constructor; named closure fields are
-    /// retained only when no later write can replace the same field.  Keeping this proof local to
-    /// HIR avoids treating an arbitrary raw/temp SETLIST as a normal table literal.
-    fn open_local_constructor_region_is_safe(
+    /// open constructor 保留原 allocation；LocalDecl 使用词法 owner，原始 Temp seed
+    /// 则必须覆盖入口 nil 并在无 cleanup 的出口交出整张表。原始 producer 的覆盖终点
+    /// 与独立字段持有共同证明根的转交，不能仅凭同 home 把值身份合并成一个 mutable local。
+    fn open_constructor_region_is_safe(
         &self,
         block: &crate::hir::common::HirBlock,
         seed_index: usize,
-        end_index: usize,
         binding: TableBinding,
-        constructor: &HirTableConstructor,
-        preserved_stmt_indices: &[usize],
+        region: &scan::ConstructorRegion<'_>,
+        roots: &RegionRootFacts,
     ) -> bool {
-        let TableBinding::Local(_) = binding else {
-            return false;
-        };
+        let scan::ConstructorRegion {
+            constructor,
+            end_index,
+            preserved_stmt_indices,
+            steps,
+        } = region;
+        let end_index = *end_index;
+        let consumes_temp_producer = !roots.temp_producers.is_empty();
+        if matches!(binding, TableBinding::Temp(_)) || consumes_temp_producer {
+            let [HirStmt::Return(ret)] = &block.stmts[end_index + 1..] else {
+                return false;
+            };
+            if self.has_cleanup
+                || matches!(binding, TableBinding::Temp(_))
+                    && !self.seed_overwrites_unobservable_entry_nil(binding)
+                || ret.values.tail.is_some()
+                || ret.values.fixed.len() != 1
+                || binding_from_expr(&ret.values.fixed[0]) != Some(binding)
+            {
+                return false;
+            }
+        }
         let Some((seed_binding, seed)) = constructor_seed(&block.stmts[seed_index]) else {
             return false;
         };
-        let Some(HirStmt::TableSetList(set_list)) = block.stmts.get(end_index) else {
+        let Some(RegionStep::SetList {
+            batch: set_list, ..
+        }) = steps.last()
+        else {
             return false;
         };
         if seed_binding != binding
-            || !matches!(block.stmts[seed_index], HirStmt::LocalDecl(_))
+            || !(matches!(block.stmts[seed_index], HirStmt::LocalDecl(_))
+                || matches!(binding, TableBinding::Temp(_)))
             || binding_from_expr(&set_list.base) != Some(binding)
             || set_list.values.tail.is_none()
             || constructor.trailing_multivalue.is_none()
@@ -1665,23 +1778,55 @@ impl TableConstructorPass<'_> {
         // transaction only appends later fields, so no expression-class whitelist is needed here.
         // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil seed/结果或越界 SETLIST 起点会
         // 改变键集合、覆盖关系或 `#table`；反例见 regress_237、lua54_01_close#10/#11/#15。
-        if seed.fields.iter().any(|field| match field {
-            HirTableField::Array(value) => !expr_is_definitely_non_nil(value),
-            HirTableField::Record(record) => !expr_is_definitely_non_nil(&record.value),
-        }) || set_list.start_index == 0
-            || set_list.start_index
-                > u32::try_from(
-                    seed.fields
-                        .iter()
-                        .filter(|field| matches!(field, HirTableField::Array(_)))
-                        .count()
-                        .saturating_add(1),
-                )
-                .unwrap_or(u32::MAX)
-            || constructor_has_nil_field(constructor)
-            || !array_fields_have_safe_nil_shape(&constructor.fields)
+        let indexed_layout = seed.allocation == constructor.allocation
+            && constructor.matches_indexed_array_capacity(
+                constructor
+                    .fields
+                    .iter()
+                    .filter(|field| matches!(field, HirTableField::Array(_)))
+                    .count(),
+            );
+        if consumes_temp_producer && !indexed_layout {
+            return false;
+        }
+        if (!indexed_layout
+            && seed.fields.iter().any(|field| match field {
+                HirTableField::Array(value) => !expr_is_definitely_non_nil(value),
+                HirTableField::Record(record) => !expr_is_definitely_non_nil(&record.value),
+            }))
+            || set_list.start_index == 0
+            || (!indexed_layout
+                && set_list.start_index
+                    > u32::try_from(
+                        seed.fields
+                            .iter()
+                            .filter(|field| matches!(field, HirTableField::Array(_)))
+                            .count()
+                            .saturating_add(1),
+                    )
+                    .unwrap_or(u32::MAX))
+            || (!indexed_layout
+                && (constructor_has_nil_field(constructor)
+                    || !array_fields_have_safe_nil_shape(&constructor.fields)))
         {
             return false;
+        }
+        if indexed_layout {
+            // indexed 前缀写与末尾 open batch 必须不重叠，才可把 producer 的独立根
+            // 交给同值字段持有；重复 key 或覆盖数组前缀仍保留原事务。
+            let mut keys = Vec::new();
+            for step in steps {
+                let RegionStep::Record { key, .. } = step else {
+                    continue;
+                };
+                if !matches!(key, HirExpr::Integer(key) if *key < i64::from(set_list.start_index))
+                    && !matches!(key, HirExpr::String(_))
+                    || keys.contains(key)
+                {
+                    return false;
+                }
+                keys.push(*key);
+            }
         }
         // 候选拒绝[SemanticBarrier:ValueArity]：已有 seed open tail 之后不能再接新 batch。
         if seed.trailing_multivalue.is_some() {
@@ -1727,106 +1872,57 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        // `try_rebuild_constructor_region` already compared the complete source/generated event
-        // sequences, including every fixed SETLIST value and the open tail. The exact LocalDecl is
-        // retained; earlier mentions cannot resolve to it, while later materializations remain
-        // outside the committed region. Home identity matters only for captures created inside the
-        // drained interval, so use the complete may-home set instead of requiring one exact home.
-        for (offset, stmt) in block.stmts[seed_index + 1..end_index].iter().enumerate() {
-            let stmt_index = seed_index + 1 + offset;
-            match stmt {
-                HirStmt::LocalDecl(decl) => {
-                    assert!(
-                        decl.values.tail.is_none(),
-                        "successful constructor region must contain only closed producer packs",
-                    );
-                    // 候选拒绝[SemanticBarrier:Scope]：区间内重新声明 owner binding 会切换
-                    // lexical owner，不能继续写回原 seed。
-                    if decl
-                        .bindings
-                        .iter()
-                        .any(|candidate| TableBinding::Local(*candidate) == binding)
-                    {
-                        return false;
+        // scanner 已冻结 owner 独立性、逐槽投影和角色；rebuild 已证明事件序与完整消费。
+        // 此处只补 open-owner 的 debug/capture 和前置固定批次约束，不重认原语句语法。
+        for step in steps.iter().filter(|step| step.stmt_index() < end_index) {
+            match step {
+                RegionStep::Producer {
+                    binding: producer,
+                    source,
+                    ..
+                } => match producer {
+                    TableBinding::Temp(temp) => {
+                        if !self
+                            .promotion_facts
+                            .call_result_root_ends_after_value_use(*temp)
+                        {
+                            return false;
+                        }
                     }
-                    if decl.bindings.iter().any(|candidate| {
-                        let candidate = TableBinding::Local(*candidate);
-                        self.debug_identity_bindings
-                            .get(candidate)
+                    TableBinding::Local(_) => {
+                        if self
+                            .debug_identity_bindings
+                            .get(*producer)
                             .copied()
                             .unwrap_or_default()
-                    }) {
-                        // 候选拒绝[PolicyBoundary]：删除 source-visible producer declaration，
-                        // 或把其消费写提前到声明行之前，会改变 debug hook 观察到的 local/table。
-                        return false;
+                        {
+                            return false;
+                        }
+                        assert!(
+                            !self
+                                .reference_captured_bindings
+                                .get(*producer)
+                                .copied()
+                                .unwrap_or_default()
+                                || preserved_stmt_indices
+                                    .binary_search(&source.stmt_index())
+                                    .is_ok(),
+                            "reference-captured producer source must be preserved by the rebuild plan",
+                        );
                     }
-                    let has_reference_capture = decl.bindings.iter().any(|candidate| {
-                        self.reference_captured_bindings
-                            .get(TableBinding::Local(*candidate))
-                            .copied()
-                            .unwrap_or_default()
-                    });
-                    assert!(
-                        !has_reference_capture
-                            || preserved_stmt_indices.binary_search(&stmt_index).is_ok(),
-                        "reference-captured producer source must be preserved by the rebuild plan",
-                    );
-                    // Eventful snapshots are admitted only after rebuild proves identical source
-                    // and generated event sequences. Removed object roots are checked by the
-                    // enclosing region lifetime transaction; preserved sources stay in place.
-                    // 候选拒绝[SemanticBarrier:Scope]：producer 读取 owner 后搬入 initializer
-                    // 会越过 owner 的词法生效点。
-                    if decl
-                        .values
-                        .fixed
-                        .iter()
-                        .any(|value| expr_uses_binding(value, binding))
+                },
+                RegionStep::SetList { batch, .. } => {
+                    if batch.values.tail.is_some()
+                        || batch
+                            .values
+                            .fixed
+                            .iter()
+                            .any(|value| !expr_is_fixed_set_list_value_safe(value))
                     {
                         return false;
                     }
                 }
-                HirStmt::Assign(assign) => {
-                    let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
-                        unreachable!(
-                            "successful open region must contain only scanner-approved record assignments"
-                        )
-                    };
-                    let [value] = assign.values.fixed.as_slice() else {
-                        unreachable!("successful record step must project exactly one fixed value")
-                    };
-                    assert!(
-                        assign.values.tail.is_none()
-                            && binding_from_expr(&access.base) == Some(binding),
-                        "successful record step must be a closed write to the region owner",
-                    );
-                    // 候选拒绝[SemanticBarrier:Scope]：key/value 中的 owner 自引用不能搬进
-                    // owner 的 LocalDecl initializer。
-                    if expr_uses_binding(&access.key, binding) || expr_uses_binding(value, binding)
-                    {
-                        return false;
-                    }
-                    // `prepare_record_step` collected key then value source events and the inline
-                    // transaction emitted the generated events in exactly that order. Dynamic
-                    // calls/lookups are therefore safe here. Independent object roots are owned by
-                    // the enclosing removed-producer lifetime checks, not by expression syntax.
-                }
-                HirStmt::TableSetList(prefix_set_list) => {
-                    // scanner/rebuild 已证明每个 SETLIST 的精确起点与 table shape；这里只补
-                    // open-owner 特有的词法 owner、value effect 和 open-pack 边界。前置 open
-                    // pack 不可能再接末尾 batch，而 owner 自引用不能搬进其 LocalDecl initializer。
-                    if binding_from_expr(&prefix_set_list.base) != Some(binding)
-                        || prefix_set_list.values.tail.is_some()
-                        || prefix_set_list.values.fixed.iter().any(|value| {
-                            expr_uses_binding(value, binding)
-                                || !expr_is_fixed_set_list_value_safe(value)
-                        })
-                    {
-                        return false;
-                    }
-                }
-                _ => unreachable!(
-                    "constructor region scanner only admits local declarations, assignments, and SETLIST"
-                ),
+                RegionStep::Record { .. } => {}
             }
         }
         true
@@ -2041,6 +2137,18 @@ fn debug_prefix_stmt_is_inert(stmt: &HirStmt) -> bool {
     }
 }
 
+fn proto_has_cleanup(proto: &HirProto) -> bool {
+    struct CleanupProbe(bool);
+    impl HirVisitor for CleanupProbe {
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            self.0 |= matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_));
+        }
+    }
+    let mut probe = CleanupProbe(false);
+    visit_stmts(&proto.body.stmts, &mut probe);
+    probe.0
+}
+
 fn stmt_contains_close(stmt: &HirStmt) -> bool {
     struct CloseProbe {
         found: bool,
@@ -2208,6 +2316,17 @@ fn constructor_nil_shape_is_supported(
     seed: &HirTableConstructor,
     rebuilt: &HirTableConstructor,
 ) -> bool {
+    if seed.allocation == rebuilt.allocation
+        && rebuilt.matches_indexed_array_capacity(
+            rebuilt
+                .fields
+                .iter()
+                .filter(|field| matches!(field, HirTableField::Array(_)))
+                .count(),
+        )
+    {
+        return !constructor_adds_definite_nil_record_key(seed, rebuilt);
+    }
     // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil 槽之后再出现确定数组值，
     // 或 open tail 覆盖不确定前缀，会改变键集合/`#table`；反例见
     // lua54_01_close#10/#11/#15 与 regress_237。
@@ -2401,26 +2520,6 @@ fn array_fields_contain_uncertain_value(fields: &[HirTableField]) -> bool {
     })
 }
 
-fn region_has_exact_width_tail(
-    block: &crate::hir::common::HirBlock,
-    seed_index: usize,
-    end_index: usize,
-) -> bool {
-    block.stmts[(seed_index + 1)..=end_index]
-        .iter()
-        .any(|stmt| {
-            matches!(
-                stmt,
-                HirStmt::TableSetList(set_list)
-                    if set_list
-                        .values
-                        .tail
-                        .as_ref()
-                        .is_some_and(|tail| tail.exact_width().is_some())
-            )
-        })
-}
-
 fn table_field_contains_nil(field: &HirTableField) -> bool {
     match field {
         HirTableField::Array(value) => expr_contains_nil(value),
@@ -2495,6 +2594,7 @@ mod tests {
             reference_captured_home_slots,
         } = collect_binding_facts(block, promotion_facts, 0, local_debug_hints.len());
         TableConstructorPass {
+            has_cleanup: false,
             materialized_bindings: materialized,
             reference_captured_bindings: reference_captured,
             reference_captured_home_slots,
@@ -2510,6 +2610,7 @@ mod tests {
     fn nil_values_are_supported_when_the_completed_array_shape_is_stable() {
         let seed = HirTableConstructor::default();
         let rebuilt = HirTableConstructor {
+            allocation: Default::default(),
             fields: vec![
                 HirTableField::Record(HirRecordField {
                     key: HirExpr::String("absent".into()),
@@ -2555,6 +2656,7 @@ mod tests {
             reference_captured_home_slots,
         } = collect_binding_facts(&block, &promotion_facts, 1, 0);
         let mut pass = TableConstructorPass {
+            has_cleanup: false,
             materialized_bindings: materialized,
             reference_captured_bindings: reference_captured,
             reference_captured_home_slots,
@@ -2618,6 +2720,7 @@ mod tests {
             reference_captured_home_slots,
         } = collect_binding_facts(&block, &promotion_facts, 1, 2);
         let mut pass = TableConstructorPass {
+            has_cleanup: false,
             materialized_bindings: materialized,
             reference_captured_bindings: reference_captured,
             reference_captured_home_slots,
@@ -2650,6 +2753,7 @@ mod tests {
     fn nil_shape_rejects_holes_and_new_definite_nil_keys() {
         let seed = HirTableConstructor::default();
         let array_hole = HirTableConstructor {
+            allocation: Default::default(),
             fields: vec![
                 HirTableField::Array(HirExpr::Nil),
                 HirTableField::Array(HirExpr::Integer(1)),
@@ -2657,6 +2761,7 @@ mod tests {
             trailing_multivalue: None,
         };
         let nil_key = HirTableConstructor {
+            allocation: Default::default(),
             fields: vec![HirTableField::Record(HirRecordField {
                 key: HirExpr::Nil,
                 value: HirExpr::Integer(1),
@@ -2671,6 +2776,7 @@ mod tests {
     #[test]
     fn late_numeric_record_cannot_overwrite_constructor_array_batch() {
         let constructor = HirTableConstructor {
+            allocation: Default::default(),
             fields: vec![
                 HirTableField::Array(HirExpr::LocalRef(LocalId(0))),
                 HirTableField::Record(HirRecordField {
@@ -2705,7 +2811,19 @@ mod tests {
             ],
         };
 
-        assert!(region_has_exact_width_tail(&block, 0, 1));
+        let HirStmt::TableSetList(batch) = &block.stmts[1] else {
+            unreachable!()
+        };
+        assert!(
+            RegionRootFacts::new(
+                &[RegionStep::SetList {
+                    stmt_index: 1,
+                    batch
+                }],
+                &[]
+            )
+            .has_exact_width_tail
+        );
     }
 
     #[test]
@@ -2751,6 +2869,7 @@ mod tests {
                     targets: vec![HirLValue::Temp(owner)],
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::new(
                         HirTableConstructor {
+                            allocation: Default::default(),
                             fields: vec![HirTableField::Record(HirRecordField {
                                 key: HirExpr::Integer(1),
                                 value: HirExpr::Integer(10),
@@ -2786,6 +2905,7 @@ mod tests {
             reference_captured_home_slots,
         } = collect_binding_facts(&block, &promotion_facts, 1, 0);
         let mut pass = TableConstructorPass {
+            has_cleanup: false,
             materialized_bindings: materialized,
             reference_captured_bindings: reference_captured,
             reference_captured_home_slots,
@@ -2833,6 +2953,7 @@ mod tests {
                 local_table(
                     owner,
                     HirTableConstructor {
+                        allocation: Default::default(),
                         fields: vec![
                             HirTableField::Array(HirExpr::Integer(10)),
                             HirTableField::Record(HirRecordField {
@@ -2848,6 +2969,7 @@ mod tests {
                     start_index: 2,
                     values: HirValuePack::expanding(
                         vec![HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                            allocation: Default::default(),
                             fields: vec![HirTableField::Array(call("fixed_value"))],
                             trailing_multivalue: None,
                         }))],
@@ -2910,6 +3032,7 @@ mod tests {
                 local_table(
                     owner,
                     HirTableConstructor {
+                        allocation: Default::default(),
                         fields: vec![HirTableField::Array(HirExpr::Integer(10))],
                         trailing_multivalue: None,
                     },
@@ -2918,6 +3041,7 @@ mod tests {
                     bindings: vec![producer],
                     values: HirValuePack::fixed(vec![HirExpr::TableConstructor(Box::new(
                         HirTableConstructor {
+                            allocation: Default::default(),
                             fields: vec![HirTableField::Array(HirExpr::Integer(20))],
                             trailing_multivalue: None,
                         },
@@ -2931,6 +3055,7 @@ mod tests {
                         vec![
                             HirExpr::LocalRef(producer),
                             HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                                allocation: Default::default(),
                                 fields: vec![HirTableField::Array(call("fixed_value"))],
                                 trailing_multivalue: None,
                             })),
@@ -3047,6 +3172,7 @@ mod tests {
                     start_index: 1,
                     values: HirValuePack::expanding(
                         vec![HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                            allocation: Default::default(),
                             fields: vec![HirTableField::Array(HirExpr::Integer(10))],
                             trailing_multivalue: None,
                         }))],
@@ -3210,6 +3336,7 @@ mod tests {
                 local_table(
                     producer,
                     HirTableConstructor {
+                        allocation: Default::default(),
                         fields: vec![HirTableField::Array(HirExpr::Integer(20))],
                         trailing_multivalue: None,
                     },
@@ -3240,13 +3367,6 @@ mod tests {
         promotion_facts.record_local_home_slot(producer, HomeSlotKey::new(1, 0));
         let mut pass = table_pass(&block, &promotion_facts, &[None, None]);
 
-        assert!(region_has_followup_table_write_after_object_producer(
-            &block,
-            0,
-            3,
-            TableBinding::Local(owner),
-            &[],
-        ));
         assert!(!pass.rewrite_block(&mut block));
         assert_eq!(block.stmts.len(), 4);
         assert!(matches!(block.stmts[3], HirStmt::TableSetList(_)));
@@ -3261,6 +3381,7 @@ mod tests {
                 local_table(
                     owner,
                     HirTableConstructor {
+                        allocation: Default::default(),
                         fields: Vec::new(),
                         trailing_multivalue: Some(HirPackTail::open(HirExpr::VarArg)),
                     },
@@ -3296,6 +3417,7 @@ mod tests {
                 local_table(
                     nested,
                     HirTableConstructor {
+                        allocation: Default::default(),
                         fields: vec![HirTableField::Array(call("make_nested_value"))],
                         trailing_multivalue: None,
                     },
@@ -3385,6 +3507,7 @@ mod tests {
                 local_table(
                     owner,
                     HirTableConstructor {
+                        allocation: Default::default(),
                         fields: vec![HirTableField::Array(call("make_initial_value"))],
                         trailing_multivalue: None,
                     },

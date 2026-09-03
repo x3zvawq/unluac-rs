@@ -9,8 +9,8 @@
 //! 合并视为 call 所在的单一站点；普通点调用仍分别扫描 callee 与参数。
 //! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
 
-use super::super::decision::assert_valid_decision;
 use super::*;
+use crate::hir::decision::assert_valid_decision;
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {

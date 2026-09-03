@@ -1,9 +1,8 @@
-//! 这个文件承载 HIR 的后处理收敛入口。
+//! HIR 后处理收敛入口：按变化标签调度 pass，并提供同一次执行的模块事实快照。
 //!
-//! 和 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze/mod.rs) 一样，外层文件只
-//! 负责声明 simplify 子模块并暴露主入口；真正的 pass 实现都放在目录内部。这样
-//! `src/hir` 下两条主线在结构上保持一致，后续维护时更不容易产生“哪边是入口、哪边
-//! 是细节实现”的混淆。
+//! 闭包效果由当前 HIR 的显式 child/capture 身份统一汇总，temp 内联、local 提升与
+//! repeat root 消费同一份摘要。例如只读 capture 的调用不应被消费者重新解释为写入。
+//! 此处负责摘要刷新和 pass 调度，不重新证明 VM 寄存器或源码改写合同。
 
 mod boolean_shells;
 mod branch_control_folding;
@@ -103,11 +102,23 @@ impl InvalidationTag for HirInvalidation {
 
 use HirInvalidation::*;
 
+// Capture 投影同时依赖 child 表达式、控制流与 binding，任一形状变化均需刷新消费者。
+const ROOT_EFFECT_INPUTS: &[HirInvalidation] = &[
+    DecisionShape,
+    BooleanPattern,
+    LogicalExpr,
+    TablePattern,
+    TempChain,
+    LocalBinding,
+    BlockStructure,
+    LabelGoto,
+    ClosureCapture,
+];
+
 // Pass 描述符：声明每个 pass 依赖和产出哪些 invalidation tag。
 //
-// Normal phase（对应原 core + exposure）在每轮 dirty-set 驱动下重复执行直到收敛。
-// Deferred phase（对应原 cleanup）在 Normal 全部收敛后执行一遍；如果产出新
-// invalidation 则触发 Normal 重新收敛。
+// Normal 按失效标签恢复表达式和身份；locals 合并前要求 constructor 的输入事实已刷新。
+// Normal 全部收敛后执行 Deferred，新增形状再回到 Normal 消费。
 const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     // ── Normal phase ──
     PassDescriptor {
@@ -147,7 +158,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "table-constructors",
         phase: PassPhase::Normal,
-        depends_on: &[TablePattern, LocalBinding],
+        depends_on: &[TablePattern, TempChain, LocalBinding],
         // Constructor commit 会删除 producer、替换 SETLIST 并改变 binding 的使用点；
         // 这些事实必须让内联与 identity owner 重算，不能只通知表形状消费者。
         invalidates: &[TablePattern, TempChain, LocalBinding],
@@ -155,13 +166,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "temp-inline",
         phase: PassPhase::Normal,
-        depends_on: &[
-            TempChain,
-            DecisionShape,
-            BooleanPattern,
-            LogicalExpr,
-            ClosureCapture,
-        ],
+        depends_on: ROOT_EFFECT_INPUTS,
         // Temp substitution can expose literal/logical shapes that were not present in the
         // pre-inline HIR expression.  Let logical-simplify consume those facts in the next
         // invalidation round instead of leaving a mechanical numeric shell behind.
@@ -176,7 +181,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "branch-values",
         phase: PassPhase::Normal,
-        depends_on: &[LabelGoto, TempChain, LocalBinding],
+        depends_on: ROOT_EFFECT_INPUTS,
         invalidates: &[
             LabelGoto,
             BlockStructure,
@@ -189,7 +194,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "locals",
         phase: PassPhase::Normal,
-        depends_on: &[TempChain, LocalBinding, BlockStructure],
+        depends_on: ROOT_EFFECT_INPUTS,
         invalidates: &[LocalBinding, TempChain],
     },
     PassDescriptor {
@@ -266,17 +271,7 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
     PassDescriptor {
         name: "repeat-root-lifetimes",
         phase: PassPhase::Deferred,
-        depends_on: &[
-            DecisionShape,
-            BooleanPattern,
-            LogicalExpr,
-            TablePattern,
-            TempChain,
-            LocalBinding,
-            BlockStructure,
-            LabelGoto,
-            ClosureCapture,
-        ],
+        depends_on: ROOT_EFFECT_INPUTS,
         // 新发现的无显式读取 root 仍需要 locals 在原 repeat body 安排词法 owner。
         invalidates: &[TempChain, LocalBinding],
     },
@@ -297,17 +292,26 @@ pub(super) fn simplify_hir(
 
     let convergence = run_invalidation_loop(
         PASS_DESCRIPTORS,
+        &[("locals", "table-constructors")],
         |index, name| {
             // 如果当前 pass 在 dump 列表中，先快照 before。关闭 debug feature 的构建
             // 不编译 HIR renderer，因此这里会退化成 None。
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
+                let effects = matches!(index, 4 | 6 | 7 | 15)
+                    .then(|| object_flow::collect_proto_effects(module, safety));
+                let roots = || object_flow::RootAnalysisContext {
+                    safety,
+                    effects: effects
+                        .as_deref()
+                        .expect("root pass requires module effects"),
+                };
                 if index == 15 {
                     return repeat_root_lifetimes::mark_repeat_trailing_condition_roots(
                         module,
                         promotion_facts,
-                        safety,
+                        roots(),
                     );
                 }
                 if index == 4 {
@@ -317,6 +321,7 @@ pub(super) fn simplify_hir(
                         promotion_facts,
                         &empty_facts,
                         dialect,
+                        roots(),
                     );
                 }
                 apply_proto_pass(module, |proto| {
@@ -341,9 +346,12 @@ pub(super) fn simplify_hir(
                             readability,
                             facts,
                             dialect,
+                            roots(),
                         ),
                         7 => locals::promote_temps_to_locals_in_proto_with_facts(
-                            proto, facts, safety,
+                            proto,
+                            facts,
+                            roots(),
                         ),
                         8 => branch_control_folding::fold_branch_control_in_proto(
                             proto, facts, safety,
@@ -402,6 +410,7 @@ fn apply_temp_inline_pass(
     promotion_facts: &[ProtoPromotionFacts],
     empty_facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
+    roots: object_flow::RootAnalysisContext<'_>,
 ) -> bool {
     // HIR proto ids are allocated parent-first. Walk the flat arena backwards so every direct
     // child has already reached its current temp-inline shape before the parent decides whether
@@ -419,6 +428,7 @@ fn apply_temp_inline_pass(
             facts,
             dialect,
             &substantial_closure_bodies,
+            roots,
         );
         if let Some(slot) = substantial_closure_bodies.get_mut(proto_id) {
             *slot = temp_inline::proto_body_prefers_named_callee(&proto.body);

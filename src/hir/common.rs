@@ -125,6 +125,8 @@ impl HirInlineDisposition {
 pub enum HirInlineRetentionReason {
     /// 删除快照会让引用捕获观察到另一个 value epoch。
     CapturedValueEpoch,
+    /// 常量替换会改变运行时建表与模板复制的分配方式。
+    TableInitialization,
 }
 
 /// 单个 proto 内跨 temp/local 身份提升保存的重写结论。
@@ -1042,6 +1044,97 @@ pub struct HirLabel {
 pub struct HirTableConstructor {
     pub fields: Vec<HirTableField>,
     pub trailing_multivalue: Option<HirPackTail>,
+    /// 前层发布的分配语义；模板默认值已进入 fields，但复制布局与普通预分配不同。
+    pub allocation: HirTableAllocation,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum HirTableAllocation {
+    #[default]
+    Batched,
+    Indexed {
+        array_capacity: u32,
+        hash_bits: u8,
+    },
+    Template {
+        /// 包含索引 0；零槽与仅有索引 0 的模板必须区分。
+        array_slots: u32,
+        /// 含 nil marker 的原始 hash 键集合；普通字段写入不能增添模板键。
+        hash_keys: std::sync::Arc<[crate::value_semantics::table::TableTemplateKey]>,
+    },
+}
+
+impl HirTableAllocation {
+    /// 原分配约束候选的模板初始化；已有模板也不能因新常量而扩大数组。
+    pub(crate) fn initialization_constraint(
+        &self,
+    ) -> Option<crate::value_semantics::table::TableInitializationConstraint<'_>> {
+        use crate::value_semantics::table::TableInitializationConstraint;
+        match self {
+            Self::Indexed {
+                array_capacity: 1..,
+                ..
+            } => Some(TableInitializationConstraint::Runtime),
+            Self::Template {
+                array_slots,
+                hash_keys,
+            } => Some(TableInitializationConstraint::Template {
+                array_slots: *array_slots,
+                hash_keys,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(in crate::hir) fn indexed_array_capacity(&self) -> Option<u32> {
+        match self {
+            Self::Batched => None,
+            Self::Indexed { array_capacity, .. } => Some(*array_capacity),
+            Self::Template { array_slots, .. } => Some(array_slots.saturating_sub(1)),
+        }
+    }
+}
+
+impl HirTableConstructor {
+    /// 完整字段数能否重现索引式构造器的数组预分配（含 VM 最小/饱和容量规则）。
+    /// 这里只检查容量；调用者另证字段均为顺序数组索引且求值/写入顺序不变。
+    pub(in crate::hir) fn matches_indexed_array_capacity(&self, count: usize) -> bool {
+        let Some(capacity) = self.allocation.indexed_array_capacity() else {
+            return false;
+        };
+        if matches!(self.allocation, HirTableAllocation::Template { .. }) {
+            return crate::hir::table_layout::candidate_template_array_capacity(self, count)
+                == Some(capacity);
+        }
+        let count = count + usize::from(self.trailing_multivalue.is_some());
+        let generated = if count == 0 {
+            0
+        } else if count >= 2046 {
+            2048
+        } else {
+            count.max(2) as u32
+        };
+        let records = self
+            .fields
+            .iter()
+            .filter(|field| {
+                matches!(field,
+            HirTableField::Record(record) if record.key != HirExpr::Integer(0))
+            })
+            .count();
+        let HirTableAllocation::Indexed { hash_bits, .. } = self.allocation else {
+            unreachable!()
+        };
+        capacity == generated && hash_bits == indexed_hash_bits(records)
+    }
+}
+
+pub(in crate::hir) fn indexed_hash_bits(entries: usize) -> u8 {
+    if entries == 0 {
+        0
+    } else {
+        (usize::BITS - (entries - 1).leading_zeros()).max(1) as u8
+    }
 }
 
 /// 表构造器字段。

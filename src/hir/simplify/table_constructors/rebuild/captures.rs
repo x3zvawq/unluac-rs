@@ -21,8 +21,7 @@ pub(super) fn binding_is_recursive_closure_slot(
     else {
         return false;
     };
-    let Some(HirExpr::Closure(closure)) = pending_producer_value(block, &producers[producer_index])
-    else {
+    let Some(HirExpr::Closure(closure)) = producers[producer_index].source.value(block) else {
         return false;
     };
     closure

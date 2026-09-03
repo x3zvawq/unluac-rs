@@ -2534,6 +2534,7 @@ mod tests {
         let table_binding = AstBindingRef::Local(LocalId(2));
         let table_sink = return_values(vec![AstExpr::TableConstructor(Box::new(
             AstTableConstructor {
+                allocation: Default::default(),
                 fields: vec![AstTableField::Array(AstExpr::Var(
                     table_binding.to_name_ref(),
                 ))],

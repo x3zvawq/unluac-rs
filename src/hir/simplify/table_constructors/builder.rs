@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::hir::common::{HirExpr, HirPackTail, HirTableConstructor, HirTableField};
+use crate::hir::common::{
+    HirExpr, HirPackTail, HirTableAllocation, HirTableConstructor, HirTableField,
+};
 
 use super::{RebuildScratch, RestoredArrayField, RestoredPendingIntegerField};
 
@@ -35,6 +37,7 @@ pub(super) enum RecordPromotionPolicy {
 
 #[derive(Debug, Clone)]
 pub(super) struct ConstructorBuilder {
+    allocation: HirTableAllocation,
     fields: Vec<BuilderField>,
     pub(super) trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
@@ -53,6 +56,7 @@ pub(super) struct BuilderCheckpoint {
 impl ConstructorBuilder {
     pub(super) fn from_constructor(constructor: HirTableConstructor) -> Self {
         let mut builder = Self {
+            allocation: constructor.allocation,
             fields: Vec::with_capacity(constructor.fields.len()),
             trailing_multivalue: constructor.trailing_multivalue,
             next_array_index: 1,
@@ -64,7 +68,14 @@ impl ConstructorBuilder {
                     builder.push_array_value(value);
                 }
                 HirTableField::Record(field) => {
-                    builder.push_record_field(field);
+                    if builder.trailing_multivalue.is_some() {
+                        // 已完成构造器的 array 数量决定 open tail 起点，不能重新晋升 record。
+                        builder
+                            .fields
+                            .push(BuilderField::Final(HirTableField::Record(field)));
+                    } else {
+                        builder.push_record_field(field);
+                    }
                 }
             }
         }
@@ -85,10 +96,13 @@ impl ConstructorBuilder {
                 BuilderField::MovedPendingInt => {}
             }
         }
-        HirTableConstructor {
+        let mut constructor = HirTableConstructor {
             fields,
             trailing_multivalue: self.trailing_multivalue,
-        }
+            allocation: self.allocation,
+        };
+        restore_indexed_array_fields(&mut constructor);
+        constructor
     }
 
     pub(super) fn checkpoint(&self, scratch: &RebuildScratch) -> BuilderCheckpoint {
@@ -164,6 +178,10 @@ impl ConstructorBuilder {
         self.next_array_index
     }
 
+    pub(super) fn has_indexed_array_layout(&self) -> bool {
+        self.allocation.indexed_array_capacity().is_some()
+    }
+
     pub(super) fn push_array_value(&mut self, value: HirExpr) {
         self.fields
             .push(BuilderField::Final(HirTableField::Array(value)));
@@ -183,10 +201,17 @@ impl ConstructorBuilder {
         let current_next_index = i64::from(self.next_array_index);
         match field.key {
             HirExpr::Integer(value)
-                if matches!(policy, RecordPromotionPolicy::Normal)
+                if (matches!(policy, RecordPromotionPolicy::Normal)
+                    || matches!(policy, RecordPromotionPolicy::PreserveSetListPrefix { start_index } if value < i64::from(start_index)))
                     && value == current_next_index
                     && !self.has_numeric_key(value)
-                    && expr_is_definitely_non_nil(&field.value) =>
+                    && match self.allocation {
+                        HirTableAllocation::Batched => expr_is_definitely_non_nil(&field.value),
+                        HirTableAllocation::Template { .. } => true,
+                        HirTableAllocation::Indexed { array_capacity, .. } => {
+                            value <= i64::from(array_capacity)
+                        }
+                    } =>
             {
                 self.push_array_value(field.value);
             }
@@ -332,6 +357,42 @@ impl ConstructorBuilder {
     }
 }
 
+/// 索引式构造器的预分配是前层事实；只有完整有序前缀能复现该容量时才恢复数组字段。
+/// 字段没有换序，故 indexed VM 的写入事件也不变；不把零散整数键猜成数组初始化。
+fn restore_indexed_array_fields(constructor: &mut HirTableConstructor) {
+    if constructor.trailing_multivalue.is_some() {
+        // open tail 的起点已由 rebuild 核对；容量相同不能证明扩大固定前缀合法。
+        // {"head", [2] = "old", many()} 中的 record 必须保留覆盖后的空返回路径。
+        return;
+    }
+    let mut array_fields = 0;
+    for field in &constructor.fields {
+        match field {
+            HirTableField::Array(_) => array_fields += 1,
+            HirTableField::Record(record)
+                if record.key == HirExpr::Integer((array_fields + 1) as i64) =>
+            {
+                array_fields += 1
+            }
+            _ => {}
+        }
+    }
+    if !constructor.matches_indexed_array_capacity(array_fields) {
+        return;
+    }
+    let mut array_index = 1;
+    for field in &mut constructor.fields {
+        match field {
+            HirTableField::Array(_) => array_index += 1,
+            HirTableField::Record(record) if record.key == HirExpr::Integer(array_index) => {
+                *field = HirTableField::Array(std::mem::replace(&mut record.value, HirExpr::Nil));
+                array_index += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn statically_known_numeric_key(key: &HirExpr) -> Option<Option<i64>> {
     match key {
         HirExpr::Integer(value) => Some(Some(*value)),
@@ -444,6 +505,7 @@ mod tests {
     #[test]
     fn zero_based_set_list_cannot_become_constructor_array_fields() {
         let original = HirTableConstructor {
+            allocation: Default::default(),
             fields: vec![HirTableField::Array(HirExpr::Integer(7))],
             trailing_multivalue: None,
         };

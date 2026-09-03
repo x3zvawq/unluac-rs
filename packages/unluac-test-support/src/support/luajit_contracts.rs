@@ -51,14 +51,7 @@ pub(super) fn assert_luajit_table_remove_contract(
     }
 
     let source = repo_root().join(entry.path);
-    let artifact = suite_artifact_path(
-        suite_label,
-        "luajit",
-        entry.variant,
-        "toolchain-fixture",
-        entry.path,
-        "luajit",
-    );
+    let artifact = suite_artifact_path(suite_label, entry, "toolchain-fixture", "luajit");
     let raw_dump = artifact.with_extension("raw.luajit");
     ensure_parent_dir(&raw_dump).map_err(|error| luajit_builtin_contract_failure(entry, error))?;
     let raw_dump_arg = raw_dump.to_string_lossy().into_owned();
@@ -273,14 +266,7 @@ pub(super) fn lower_luajit_method_fixture(
     argument: &str,
 ) -> Result<LoweredChunk, TestFailure> {
     let source = repo_root().join(entry.path);
-    let artifact = suite_artifact_path(
-        suite_label,
-        "luajit",
-        entry.variant,
-        artifact_label,
-        entry.path,
-        "luajit",
-    );
+    let artifact = suite_artifact_path(suite_label, entry, artifact_label, "luajit");
     let raw_dump = artifact.with_extension("raw.luajit");
     ensure_parent_dir(&raw_dump).map_err(|error| luajit_method_contract_failure(entry, error))?;
     let raw_dump_arg = raw_dump.to_string_lossy().into_owned();

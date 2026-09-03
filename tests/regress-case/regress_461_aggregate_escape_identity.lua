@@ -41,7 +41,7 @@ local function lookup_escape()
 end
 assert(lookup_escape() == 1)
 
--- child effect 未汇总时，调用已知 closure 也必须保留 capture 的可能逃逸与写入。
+-- 已知 closure 的 child effect 必须向调用方传递 capture 的逃逸与写入。
 local function capture_escape()
     local value = {}
     local holder = { value = value }

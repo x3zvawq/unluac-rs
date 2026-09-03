@@ -11,6 +11,7 @@ mod goto_scope;
 mod naming;
 pub(crate) mod pretty;
 mod readability;
+mod table_layout;
 pub(crate) mod traverse;
 
 pub use crate::decompile::{DecompileDialect, ReadabilityOptions};

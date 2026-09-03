@@ -205,10 +205,10 @@ pub(super) fn lower_regular_instr(
                 vec![HirStmt::CallStmt(Box::new(HirCallStmt { call }))]
             }
         }
-        LowInstr::NewTable(_new_table) => fixed_assign(
+        LowInstr::NewTable(new_table) => fixed_assign(
             lowering,
             instr_ref,
-            vec![HirExpr::TableConstructor(Box::default())],
+            vec![super::exprs::expr_for_new_table(lowering.proto, new_table)],
         ),
         LowInstr::SetList(set_list) => lower_set_list(lowering, block, instr_ref, set_list),
         LowInstr::Call(call) => lower_call(lowering, block, instr_ref, call),
@@ -567,6 +567,7 @@ fn lower_shared_capture_barrier(
         fields.push(HirTableField::Array(capture.value));
     }
     let table = HirExpr::TableConstructor(Box::new(HirTableConstructor {
+        allocation: Default::default(),
         fields,
         trailing_multivalue: None,
     }));

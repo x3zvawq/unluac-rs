@@ -691,9 +691,32 @@ impl TypeGuardKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct NewTableInstr {
     pub dst: Reg,
+    pub allocation: TableAllocation,
+}
+
+/// 分配与初始化是一条 VM 事件。模板里的 nil 槽和 hash key 是初始布局事实，
+/// 不能展开为有独立求值/观察语义的普通 SetTable 再让后层恢复。
+#[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
+pub enum TableAllocation {
+    #[default]
+    Empty,
+    /// 正整数数组槽数，不含 VM 的索引 0。
+    Indexed {
+        array_capacity: u32,
+        hash_bits: u8,
+    },
+    Template(TableTemplate),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct TableTemplate {
+    /// 包含索引 0；每个元素均引用本 proto 的常量池。
+    pub array: Vec<ConstRef>,
+    /// 包含 nil-valued 预置项，保留模板键集合。
+    pub hash: Vec<(ConstRef, ConstRef)>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

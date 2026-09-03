@@ -707,6 +707,7 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
                 None => None,
             };
             Some(HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                allocation: table.allocation,
                 fields,
                 trailing_multivalue,
             })))
@@ -814,6 +815,7 @@ fn prepare_table_constructor(
     (
         extracted.prefix,
         HirTableConstructor {
+            allocation: table.allocation,
             fields,
             trailing_multivalue,
         },

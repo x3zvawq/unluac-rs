@@ -635,6 +635,7 @@ mod tests {
                         rewrite_authority: crate::ast::common::AstRewriteAuthority::AstOwned,
                     }],
                     values: vec![AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                        allocation: Default::default(),
                         fields: Vec::new(),
                     }))],
                     initializer_merge_transaction: None,

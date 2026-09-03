@@ -15,11 +15,12 @@ mod eliminate_state;
 mod helpers;
 mod synthesize;
 
-use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
+use super::expr_facts::{expr_is_boolean_valued, expr_truthiness, expr_truthiness_assuming};
 use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirProto,
 };
+use crate::hir::decision::{assert_valid_decision, decision_has_shared_nodes};
 use crate::hir::expr_safety::HirExprSafety;
 use helpers::{logical_and, logical_or};
 
@@ -634,42 +635,6 @@ fn combine_value_expr(
     }
 }
 
-fn expr_truthiness_assuming(
-    expr: &HirExpr,
-    subject: &HirExpr,
-    subject_truthy: bool,
-    safety: HirExprSafety,
-) -> Option<bool> {
-    if expr == subject {
-        return Some(subject_truthy);
-    }
-    match expr {
-        HirExpr::Unary(unary) if unary.op == crate::hir::HirUnaryOpKind::Not => {
-            expr_truthiness_assuming(&unary.expr, subject, subject_truthy, safety)
-                .map(|value| !value)
-        }
-        HirExpr::LogicalOr(logical) => {
-            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy, safety);
-            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy, safety);
-            match (lhs, rhs) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (Some(false), rhs) => rhs,
-                _ => None,
-            }
-        }
-        HirExpr::LogicalAnd(logical) => {
-            let lhs = expr_truthiness_assuming(&logical.lhs, subject, subject_truthy, safety);
-            let rhs = expr_truthiness_assuming(&logical.rhs, subject, subject_truthy, safety);
-            match (lhs, rhs) {
-                (Some(false), _) | (_, Some(false)) => Some(false),
-                (Some(true), rhs) => rhs,
-                _ => None,
-            }
-        }
-        _ => expr_truthiness(expr, safety),
-    }
-}
-
 fn normalize_collapsed_target(
     subject: &HirExpr,
     target: CollapsedValueTarget,
@@ -897,93 +862,6 @@ fn is_true(expr: &HirExpr) -> bool {
 
 fn is_false(expr: &HirExpr) -> bool {
     matches!(expr, HirExpr::Boolean(false))
-}
-
-pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> bool {
-    assert_valid_decision(decision);
-
-    let mut incoming = vec![0usize; decision.nodes.len()];
-    incoming[decision.entry.index()] += 1;
-
-    for node in &decision.nodes {
-        for target in [&node.truthy, &node.falsy] {
-            if let HirDecisionTarget::Node(node_ref) = target
-                && let Some(count) = incoming.get_mut(node_ref.index())
-            {
-                *count += 1;
-            }
-        }
-    }
-
-    incoming.into_iter().any(|count| count > 1)
-}
-
-pub(in crate::hir) fn assert_valid_decision(decision: &HirDecisionExpr) {
-    assert!(!decision.nodes.is_empty(), "HIR Decision must not be empty");
-    assert!(
-        decision.entry.index() < decision.nodes.len(),
-        "HIR Decision entry must reference an existing node"
-    );
-
-    let mut incoming = vec![0usize; decision.nodes.len()];
-    for (index, node) in decision.nodes.iter().enumerate() {
-        assert_eq!(
-            node.id,
-            HirDecisionNodeRef(index),
-            "HIR Decision node id must match its arena index"
-        );
-        for target in [&node.truthy, &node.falsy] {
-            if let HirDecisionTarget::Node(node_ref) = target {
-                let Some(count) = incoming.get_mut(node_ref.index()) else {
-                    panic!("HIR Decision edge must reference an existing node");
-                };
-                *count += 1;
-            }
-        }
-    }
-
-    let mut reachable = vec![false; decision.nodes.len()];
-    let mut pending = vec![decision.entry];
-    while let Some(node_ref) = pending.pop() {
-        if std::mem::replace(&mut reachable[node_ref.index()], true) {
-            continue;
-        }
-        let node = &decision.nodes[node_ref.index()];
-        for target in [&node.truthy, &node.falsy] {
-            if let HirDecisionTarget::Node(next_ref) = target {
-                pending.push(*next_ref);
-            }
-        }
-    }
-    assert!(
-        reachable.into_iter().all(|reachable| reachable),
-        "HIR Decision must not contain unreachable nodes"
-    );
-
-    let mut ready = incoming
-        .iter()
-        .enumerate()
-        .filter_map(|(index, count)| (*count == 0).then_some(index))
-        .collect::<Vec<_>>();
-    let mut visited = 0usize;
-    while let Some(index) = ready.pop() {
-        visited += 1;
-        let node = &decision.nodes[index];
-        for target in [&node.truthy, &node.falsy] {
-            let HirDecisionTarget::Node(next_ref) = target else {
-                continue;
-            };
-            incoming[next_ref.index()] -= 1;
-            if incoming[next_ref.index()] == 0 {
-                ready.push(next_ref.index());
-            }
-        }
-    }
-    assert_eq!(
-        visited,
-        decision.nodes.len(),
-        "HIR Decision must be acyclic"
-    );
 }
 
 #[cfg(test)]

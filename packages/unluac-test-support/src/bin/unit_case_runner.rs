@@ -1,11 +1,12 @@
+//! 执行由矩阵签发的测试实例 ID；展示字段不再充当会丢失编译选项的匹配键。
+
 #![forbid(unsafe_code)]
 
 use std::env;
 use std::process;
 
 use unluac_test_support::{
-    LuaCaseVariant, UnitSuite, find_unit_case_spec, format_case_failure, run_unit_case,
-    unit_case_specs,
+    LuaCaseId, UnitSuite, find_unit_case_spec, format_case_failure, run_unit_case, unit_case_specs,
 };
 
 enum CommandLine {
@@ -13,9 +14,7 @@ enum CommandLine {
     Run {
         report: ReportFormat,
         suite: String,
-        dialect: String,
-        case_path: String,
-        variant: Option<String>,
+        id: LuaCaseId,
     },
 }
 
@@ -58,33 +57,25 @@ fn run() -> Result<ExitKind, String> {
         CommandLine::List => {
             for spec in unit_case_specs() {
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     spec.suite.label(),
+                    spec.entry.id.0,
                     <&'static str>::from(spec.entry.dialect),
                     spec.entry.path,
-                    spec.entry.variant.map_or("", LuaCaseVariant::label),
+                    spec.entry.variant_label(),
                 );
             }
             Ok(ExitKind::Success)
         }
-        CommandLine::Run {
-            report,
-            suite,
-            dialect,
-            case_path,
-            variant,
-        } => {
+        CommandLine::Run { report, suite, id } => {
             let suite = UnitSuite::parse(&suite)?;
-            let spec = find_unit_case_spec(suite, &dialect, &case_path, variant.as_deref())
-                .ok_or_else(|| {
-                    format!(
-                        "unknown unit case spec: suite={}, dialect={}, case={}, variant={}",
-                        suite.label(),
-                        dialect,
-                        case_path,
-                        variant.as_deref().unwrap_or("-")
-                    )
-                })?;
+            let spec = find_unit_case_spec(suite, id).ok_or_else(|| {
+                format!(
+                    "unknown unit case instance: suite={}, id={}",
+                    suite.label(),
+                    id.0
+                )
+            })?;
 
             match run_unit_case(spec) {
                 Ok(success) => {
@@ -132,9 +123,7 @@ where
 
     let mut report = ReportFormat::Human;
     let mut suite = None;
-    let mut dialect = None;
-    let mut case_path = None;
-    let mut variant = None;
+    let mut id = None;
     let mut cursor = 0;
 
     while cursor < args.len() {
@@ -154,29 +143,16 @@ where
                         .clone(),
                 );
             }
-            "--dialect" => {
+            "--id" => {
                 cursor += 1;
-                dialect = Some(
-                    args.get(cursor)
-                        .ok_or_else(|| "missing value for `--dialect`".to_owned())?
-                        .clone(),
-                );
-            }
-            "--case" => {
-                cursor += 1;
-                case_path = Some(
-                    args.get(cursor)
-                        .ok_or_else(|| "missing value for `--case`".to_owned())?
-                        .clone(),
-                );
-            }
-            "--variant" => {
-                cursor += 1;
-                variant = Some(
-                    args.get(cursor)
-                        .ok_or_else(|| "missing value for `--variant`".to_owned())?
-                        .clone(),
-                );
+                let value = args
+                    .get(cursor)
+                    .ok_or_else(|| "missing value for --id".to_owned())?;
+                id = Some(LuaCaseId(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid unit case id: {value}"))?,
+                ));
             }
             other => {
                 return Err(format!("unsupported unit_case_runner option: {other}"));
@@ -185,17 +161,8 @@ where
         cursor += 1;
     }
 
-    match (suite, dialect, case_path) {
-        (Some(suite), Some(dialect), Some(case_path)) => Ok(CommandLine::Run {
-            report,
-            suite,
-            dialect,
-            case_path,
-            variant,
-        }),
-        _ => Err(
-            "usage: unit_case_runner --list | unit_case_runner [--report <human|machine>] --suite <suite> --dialect <dialect> --case <path> [--variant <variant>]"
-                .to_owned(),
-        ),
+    match (suite, id) {
+        (Some(suite), Some(id)) => Ok(CommandLine::Run { report, suite, id }),
+        _ => Err("usage: unit_case_runner --list | unit_case_runner [--report <human|machine>] --suite <suite> --id <id>".to_owned()),
     }
 }

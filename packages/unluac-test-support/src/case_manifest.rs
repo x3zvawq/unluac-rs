@@ -1,8 +1,8 @@
 //! 这个模块集中声明仓库里的 Lua case 测试矩阵。
 //!
-//! 真正的事实源是“一个 case 属于哪类测试、支持哪些 dialect”。
-//! 目录负责区分 `unit` / `regression`，矩阵只负责展开具体 `(case, dialect)` 测试单元，
-//! 这样后续给 common case 显式挂多个 dialect 时，不需要回到“每行一个组合”的散乱写法。
+//! 目录区分 `unit` / `regression`；矩阵集中声明方言、编译选项和验证合同。
+//! 每个 suite 展开时签发实例 ID，让调度与产物路径直接保留完整条目身份；
+//! 例如同一 Lua 5.4 源码的 stripped/debug 两项分别执行，不由展示标签反向重建选项。
 
 use strum_macros::{Display, IntoStaticStr};
 use unluac::ast::NamingMode;
@@ -174,15 +174,37 @@ pub(crate) struct LuauVectorCaseOptions {
     pub(crate) components: u8,
 }
 
-/// 展开后的 `(case, dialect)` 测试单元。
+/// 同一 suite 的矩阵展开顺序签发的实例身份；选项相异的条目不能靠 path/dialect 重新匹配。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LuaCaseId(pub usize);
+
+/// 已展开并具有独立执行与产物身份的测试单元。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LuaCaseManifestEntry {
+    pub id: LuaCaseId,
     pub path: &'static str,
     pub dialect: LuaCaseDialect,
     pub variant: Option<LuaCaseVariant>,
     pub(crate) options: LuaCaseOptions,
     pub(crate) expectation: LuaCaseExpectation,
     pub(crate) structure_contracts: &'static [LuaCaseStructureContract],
+}
+
+impl LuaCaseManifestEntry {
+    /// 展示编译档位和 debug 策略；实例选择始终使用矩阵签发的 id。
+    pub fn variant_label(self) -> String {
+        let mut labels = Vec::new();
+        if let Some(variant) = self.variant {
+            labels.push(variant.label());
+        }
+        if self.options.retain_debug {
+            labels.push("retain-debug");
+        }
+        if self.options.ignore_debug {
+            labels.push("ignore-debug");
+        }
+        labels.join(",")
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -320,43 +342,49 @@ const NO_RECOMPILE_STRESS_OPTIONS: LuaCaseOptions = LuaCaseOptions {
 };
 
 pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
-    manifest_entries(UNIT_CASES)
+    manifest_entries(UNIT_CASES.iter())
 }
 
 pub(crate) fn regression_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
-    [
-        REGRESSION_CASES_001_100,
-        REGRESSION_CASES_101_200,
-        REGRESSION_CASES_201_318,
-        REGRESSION_CASES_319_400,
-        REGRESSION_CASES_401_500,
-    ]
-    .into_iter()
-    .flat_map(manifest_entries)
+    manifest_entries(
+        [
+            REGRESSION_CASES_001_100,
+            REGRESSION_CASES_101_200,
+            REGRESSION_CASES_201_318,
+            REGRESSION_CASES_319_400,
+            REGRESSION_CASES_401_500,
+        ]
+        .into_iter()
+        .flatten(),
+    )
 }
 
 fn manifest_entries(
-    cases: &'static [LuaCaseMatrixEntry],
+    cases: impl Iterator<Item = &'static LuaCaseMatrixEntry>,
 ) -> impl Iterator<Item = LuaCaseManifestEntry> {
-    cases.iter().flat_map(|entry| {
-        entry.dialects.iter().copied().flat_map(move |dialect| {
-            std::iter::once(None)
-                .filter(move |_| entry.variants.is_empty())
-                .chain(entry.variants.iter().copied().map(Some))
-                .map(move |variant| {
-                    let mut options = entry.options;
-                    if let Some(variant) = variant {
-                        variant.apply(&mut options);
-                    }
-                    LuaCaseManifestEntry {
-                        path: entry.path,
-                        dialect,
-                        variant,
-                        options,
-                        expectation: entry.expectation,
-                        structure_contracts: entry.structure_contracts,
-                    }
-                })
+    cases
+        .flat_map(|entry| {
+            entry.dialects.iter().copied().flat_map(move |dialect| {
+                std::iter::once(None)
+                    .filter(move |_| entry.variants.is_empty())
+                    .chain(entry.variants.iter().copied().map(Some))
+                    .map(move |variant| (entry, dialect, variant))
+            })
         })
-    })
+        .enumerate()
+        .map(|(id, (entry, dialect, variant))| {
+            let mut options = entry.options;
+            if let Some(variant) = variant {
+                variant.apply(&mut options);
+            }
+            LuaCaseManifestEntry {
+                id: LuaCaseId(id),
+                path: entry.path,
+                dialect,
+                variant,
+                options,
+                expectation: entry.expectation,
+                structure_contracts: entry.structure_contracts,
+            }
+        })
 }

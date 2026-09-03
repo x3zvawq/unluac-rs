@@ -15,6 +15,8 @@
 //! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
 //! 或 cleanup 边界时才允许穿过。消费者可以保留已配对的两次 materialization，也可以在
 //! 更窄的改写仍保持同一覆盖事务时，连同 owner 已证明的 physical home 一起消费该 pair。
+//! 同值 frame-end copy 的覆盖证明同时消费前层非资源旧值与两个完整 root transaction，
+//! 并复核当前 HIR 未改写 home；删除副本的 owner 必须物化原值根，不能只抹掉负向标记。
 //! 潜在求值事件与分支覆盖值的 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +28,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
+use super::object_flow::RootAnalysisContext;
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
@@ -464,11 +467,12 @@ impl LookupGcRootOverwritePair {
 pub(super) fn collect_call_root_lifetimes(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
+    context: RootAnalysisContext<'_>,
     observe_potential_events: bool,
     mut producer_temp_is_eligible: impl FnMut(TempId) -> bool,
     mut overwrite_temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> CallRootLifetimeIndices {
+    let safety = context.safety;
     let opaque_allocations = stmts
         .iter()
         .filter_map(scalar_temp_definition)
@@ -928,7 +932,7 @@ pub(super) fn collect_call_root_lifetimes(
     let allocation_releases = std::mem::take(&mut lifetimes.allocation_release_sites);
     if !allocation_roots.is_empty() || !allocation_releases.is_empty() {
         let objects =
-            super::object_flow::AllocationEscapeFacts::analyze(stmts, safety, &opaque_allocations);
+            super::object_flow::AllocationEscapeFacts::analyze(stmts, context, &opaque_allocations);
         for ((index, temp), site) in allocation_releases {
             if objects.proves_unescaped(site, &stmts[index])
                 && let Some(releases) = lifetimes.pre_dispatch_releases.get_mut(&index)
@@ -964,7 +968,88 @@ pub(super) fn collect_call_root_lifetimes(
             lifetimes.root_by_protected.retain(|_, owner| owner != root);
         }
     }
+    extend_allocation_owner_overwrites(
+        stmts,
+        facts,
+        safety,
+        &uses,
+        &allocation_roots,
+        &mut producer_temp_is_eligible,
+        &mut overwrite_temp_is_eligible,
+        &mut lifetimes,
+    );
     lifetimes
+}
+
+/// 复用 allocation owner 时，新写入值也必须在它自己的精确覆盖点释放。
+/// 例如 allocation -> global lookup -> table lookup，不能只保留第一条边，否则
+/// 第二次 lookup 被内联后，global lookup 的接收者会额外存活到源码 local 的作用域末尾。
+/// 只延续已经证明需要物化的 allocation 事务；call/copy 的独立根仍由各自 value owner 管理。
+#[allow(clippy::too_many_arguments)]
+fn extend_allocation_owner_overwrites(
+    stmts: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+    uses: &TempUseEvents,
+    allocation_roots: &BTreeMap<usize, usize>,
+    producer_is_eligible: &mut impl FnMut(TempId) -> bool,
+    overwrite_is_eligible: &mut impl FnMut(TempId) -> bool,
+    lifetimes: &mut CallRootLifetimeIndices,
+) {
+    let mut owners = BTreeMap::<HomeSlotKey, (usize, TempId)>::new();
+    for (index, stmt) in stmts.iter().enumerate() {
+        let definition = scalar_temp_definition(stmt);
+        let target = definition.and_then(|(temp, value)| {
+            facts
+                .trusted_temp_home_slot(temp)
+                .map(|home| (temp, value, home))
+        });
+        if let Some((temp, _, home)) = target
+            && let Some((root_index, producer)) = owners.get(&home).copied()
+            && overwrite_is_eligible(temp)
+            && !uses.has_live_read_after(producer, index)
+            && !uses.has_argument_transfer(producer, root_index, index)
+            && lifetimes.overwrite_pair_for_home(index, home).is_none()
+        {
+            lifetimes.roots.insert(root_index);
+            lifetimes
+                .root_homes
+                .entry(root_index)
+                .or_default()
+                .insert(home);
+            lifetimes.root_by_protected.insert(root_index, root_index);
+            lifetimes
+                .roots_by_overwrite
+                .entry(index)
+                .or_default()
+                .push(CallRootOverwritePair { root_index, home });
+        }
+        let continues_allocation_owner = target.is_some_and(|(_, _, home)| {
+            lifetimes.overwrite_pairs(index).any(|pair| {
+                pair.home() == home
+                    && (allocation_roots.contains_key(&pair.root_index())
+                        || owners
+                            .get(&home)
+                            .is_some_and(|(owner, _)| *owner == pair.root_index()))
+            })
+        });
+        let writes = StackWriteSummary::for_stmt(stmt, facts);
+        if writes.has_boundary || writes.has_unknown_home {
+            owners.clear();
+        } else {
+            owners.retain(|home, _| !writes.homes.contains(home));
+        }
+        if let Some((temp, value, home)) = target
+            && continues_allocation_owner
+            && producer_is_eligible(temp)
+            && !safety.result_is_gc_inert(value)
+            // copy 带有独立目标 home 和参数交接生命周期；把它沿用为 caller owner
+            // 会在 callee 已释放参数后继续保活。不能从值相同推断根的生命周期相同。
+            && !matches!(value, HirExpr::TempRef(_))
+        {
+            owners.insert(home, (index, temp));
+        }
+    }
 }
 
 fn generic_for_dispatch_result_homes(
@@ -1067,13 +1152,13 @@ fn root_release_temp(
 pub(super) fn materialize_generic_for_dispatch_root_releases(
     block: &mut HirBlock,
     facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
+    context: RootAnalysisContext<'_>,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
 ) -> bool {
     let lifetimes = collect_call_root_lifetimes(
         &block.stmts,
         facts,
-        safety,
+        context,
         true,
         &mut *temp_is_eligible,
         |_| true,
@@ -1097,7 +1182,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
         changed |= materialize_generic_for_dispatch_root_releases_in_stmt(
             &mut stmt,
             facts,
-            safety,
+            context,
             temp_is_eligible,
         );
         new_stmts.push(stmt);
@@ -1109,7 +1194,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
 fn materialize_generic_for_dispatch_root_releases_in_stmt(
     stmt: &mut HirStmt,
     facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
+    context: RootAnalysisContext<'_>,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
 ) -> bool {
     match stmt {
@@ -1117,14 +1202,14 @@ fn materialize_generic_for_dispatch_root_releases_in_stmt(
             let then_changed = materialize_generic_for_dispatch_root_releases(
                 &mut if_stmt.then_block,
                 facts,
-                safety,
+                context,
                 temp_is_eligible,
             );
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|block| {
                 materialize_generic_for_dispatch_root_releases(
                     block,
                     facts,
-                    safety,
+                    context,
                     temp_is_eligible,
                 )
             });
@@ -1133,29 +1218,29 @@ fn materialize_generic_for_dispatch_root_releases_in_stmt(
         HirStmt::While(while_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut while_stmt.body,
             facts,
-            safety,
+            context,
             temp_is_eligible,
         ),
         HirStmt::Repeat(repeat_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut repeat_stmt.body,
             facts,
-            safety,
+            context,
             temp_is_eligible,
         ),
         HirStmt::NumericFor(for_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut for_stmt.body,
             facts,
-            safety,
+            context,
             temp_is_eligible,
         ),
         HirStmt::GenericFor(for_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut for_stmt.body,
             facts,
-            safety,
+            context,
             temp_is_eligible,
         ),
         HirStmt::Block(block) => {
-            materialize_generic_for_dispatch_root_releases(block, facts, safety, temp_is_eligible)
+            materialize_generic_for_dispatch_root_releases(block, facts, context, temp_is_eligible)
         }
         HirStmt::LocalDecl(_)
         | HirStmt::GlobalDecl(_)
@@ -1679,6 +1764,12 @@ fn return_lookup_flow(
             return_lookup_flow(&unary.expr, definitions, value_by_temp, safety, resolving)?
                 .consume_result(safety.unary_operator_may_observe_gc_roots(unary.op)),
         ),
+        HirExpr::Binary(binary)
+            if binary.op == HirBinaryOpKind::Concat
+                && safety.concat_preserves_rightmost_operand() =>
+        {
+            return_concat_lookup_flow(expr, definitions, value_by_temp, safety, resolving)
+        }
         HirExpr::Binary(binary) => Some(
             return_lookup_flow(&binary.lhs, definitions, value_by_temp, safety, resolving)?
                 .then(return_lookup_flow(
@@ -1729,6 +1820,41 @@ fn return_lookup_flow(
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => None,
     }
+}
+
+/// 右结合 concat 源码会合成一条 PUC 5.1 CONCAT；求值依然从左到右，合并从右到左。
+/// 最右 operand 的原槽一直保留，中间 operand 的槽会被部分结果覆盖。只在本次 CONCAT
+/// 内延后最右根的释放；返回 caller flow 时所有 operand 都按已消费结果交出。
+fn return_concat_lookup_flow(
+    expr: &HirExpr,
+    definitions: &BTreeMap<TempId, &HirExpr>,
+    value_by_temp: &BTreeMap<TempId, LookupValueId>,
+    safety: HirExprSafety,
+    resolving: &mut BTreeSet<TempId>,
+) -> Option<ReturnLookupFlow> {
+    let mut operands = Vec::new();
+    let mut cursor = expr;
+    while let HirExpr::Binary(binary) = cursor
+        && binary.op == HirBinaryOpKind::Concat
+    {
+        operands.push(&binary.lhs);
+        cursor = &binary.rhs;
+    }
+    operands.push(cursor);
+    let mut flow = ReturnLookupFlow::default();
+    let mut operand_roots = Vec::new();
+    for operand in operands {
+        let next = return_lookup_flow(operand, definitions, value_by_temp, safety, resolving)?;
+        operand_roots.push(next.handed_roots.clone());
+        flow = flow.then(next);
+    }
+    for roots in operand_roots[..operand_roots.len() - 1].iter().rev() {
+        flow.needs_independent_root
+            .extend(flow.released_roots.iter().copied());
+        flow.has_observation = true;
+        flow.released_roots.extend(roots.iter().copied());
+    }
+    Some(flow.consume_result(false))
 }
 
 fn exact_multi_nil_temp_overwrites(
@@ -1975,6 +2101,73 @@ fn stmt_is_direct_if_control_read(stmt: &HirStmt, aliases: &BTreeSet<TempId>) ->
         }
         _ => false,
     }
+}
+
+/// 两个原始 home 都保活到 frame end，且当前 HIR 仍保留相同值的覆盖关系。
+/// 消费者删除 target copy 后必须把 source 作为 PhysicalRoot 物化，不能据此继续内联 source。
+pub(super) struct ScopeEndCopyRootHandoff {
+    pub(super) target: TempId,
+    pub(super) source: TempId,
+    pub(super) copy_index: usize,
+    pub(super) target_home: HomeSlotKey,
+    pub(super) source_home: HomeSlotKey,
+}
+
+pub(super) fn scope_end_copy_root_handoffs(
+    stmts: &[HirStmt],
+    facts: &ProtoPromotionFacts,
+) -> Vec<ScopeEndCopyRootHandoff> {
+    let Some((HirStmt::Return(_), prefix)) = stmts.split_last() else {
+        return Vec::new();
+    };
+    let mut handoffs = Vec::new();
+    for (copy_index, stmt) in prefix.iter().enumerate() {
+        let Some((target, HirExpr::TempRef(source))) = scalar_temp_definition(stmt) else {
+            continue;
+        };
+        // 前层非资源旧值证明删除 copy 不会丢失另一个旧对象的释放点；两个纯 scope-end
+        // transaction 则证明共享值不需要在不同的动态 endpoint 分别释放。
+        if !facts.overwrites_gc_inert(target)
+            || !facts.is_pure_scope_end_copy_root_temp(target)
+            || !facts.is_pure_scope_end_copy_root_temp(*source)
+        {
+            continue;
+        }
+        let (Some(target_home), Some(source_home)) = (
+            facts.trusted_temp_home_slot(target),
+            facts.trusted_temp_home_slot(*source),
+        ) else {
+            continue;
+        };
+        if target_home == source_home {
+            continue;
+        }
+        let Some(source_index) = prefix[..copy_index]
+            .iter()
+            .position(|stmt| scalar_temp_definition(stmt).is_some_and(|(temp, _)| temp == *source))
+        else {
+            continue;
+        };
+        let intervening = StackWriteSummary::for_stmts(&prefix[source_index + 1..], facts);
+        let suffix = StackWriteSummary::for_stmts(&prefix[copy_index + 1..], facts);
+        // 当前 HIR 必须继续满足原始 home 的无覆盖合同；opaque control/cleanup
+        // 边界不能用原始负向 root 标记推导出正向覆盖证明。
+        if intervening.has_boundary
+            || intervening.has_unknown_home
+            || intervening.homes.contains(&source_home)
+            || suffix.homes.contains(&target_home)
+        {
+            continue;
+        }
+        handoffs.push(ScopeEndCopyRootHandoff {
+            target,
+            source: *source,
+            copy_index,
+            target_home,
+            source_home,
+        });
+    }
+    handoffs
 }
 
 pub(super) fn scope_end_copy_roots_needing_materialization(
@@ -2837,7 +3030,10 @@ mod tests {
         let lifetimes = collect_call_root_lifetimes(
             &stmts,
             &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Luau),
+            RootAnalysisContext {
+                safety: HirExprSafety::for_dialect(DecompileDialect::Luau),
+                effects: &[],
+            },
             true,
             |_| true,
             |_| true,
@@ -2871,7 +3067,10 @@ mod tests {
         let lifetimes = collect_call_root_lifetimes(
             &stmts,
             &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Luau),
+            RootAnalysisContext {
+                safety: HirExprSafety::for_dialect(DecompileDialect::Luau),
+                effects: &[],
+            },
             true,
             |_| true,
             |_| true,
@@ -2904,7 +3103,10 @@ mod tests {
         assert!(materialize_generic_for_dispatch_root_releases(
             &mut block,
             &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            RootAnalysisContext {
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+                effects: &[]
+            },
             &mut |_| true,
         ));
         assert!(matches!(
@@ -2922,7 +3124,10 @@ mod tests {
         assert!(!materialize_generic_for_dispatch_root_releases(
             &mut block,
             &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            RootAnalysisContext {
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+                effects: &[]
+            },
             &mut |_| true,
         ));
     }
@@ -2960,7 +3165,10 @@ mod tests {
         assert!(materialize_generic_for_dispatch_root_releases(
             &mut block,
             &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            RootAnalysisContext {
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+                effects: &[]
+            },
             &mut |_| true,
         ));
         assert!(matches!(
@@ -2994,7 +3202,10 @@ mod tests {
         assert!(!materialize_generic_for_dispatch_root_releases(
             &mut block,
             &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            RootAnalysisContext {
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+                effects: &[]
+            },
             &mut |_| true,
         ));
         assert_eq!(block.stmts.len(), 3);
@@ -3023,7 +3234,10 @@ mod tests {
         assert!(!materialize_generic_for_dispatch_root_releases(
             &mut block,
             &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+            RootAnalysisContext {
+                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+                effects: &[]
+            },
             &mut |_| false,
         ));
         assert_eq!(block.stmts.len(), 3);

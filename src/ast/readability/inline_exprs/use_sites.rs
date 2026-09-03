@@ -7,6 +7,8 @@
 //! 非尾 return 复用候选集合并由 run 级事件前缀约束顺序，index 则保留跨调用的 key root。
 //! local initializer 中的裸调用已经被赋值收窄为单值；移入最终调用参数时用
 //! `SingleValue` 保留该宽度，避免重新变成开放多返回值。
+//! 表字段消费 HIR 原始分配事实，并由共享规则判断候选 Lua 语法是否引入模板；
+//! `local x=2; return {a,x+3,c}` 不能内联成常量运算后改变 Indexed 分配方式。
 
 use crate::decompile::ReadabilityOptions;
 
@@ -600,6 +602,9 @@ fn rewrite_expr_use_sites(
             policy,
         ),
         AstExpr::TableConstructor(table) => {
+            let original = (table.allocation.initialization_constraint().is_some()
+                && crate::value_semantics::table::table_constant_kind(replacement).is_some())
+            .then(|| table.clone());
             let mut changed = false;
             for field in &mut table.fields {
                 match field {
@@ -634,6 +639,15 @@ fn rewrite_expr_use_sites(
                         );
                     }
                 }
+            }
+            if let Some(original) = original
+                && changed
+                && crate::ast::table_layout::introduces_runtime_table_operand(&original, table)
+            {
+                // 候选拒绝[SemanticBarrier:TableShape]：regress_471/472/473 的常量内联不能改变原分配与模板键。
+                // 整个 table use-site 回滚，使外层事务保留同一 producer binding。
+                *table = original;
+                return false;
             }
             changed
         }

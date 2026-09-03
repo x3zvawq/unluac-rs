@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::label_refs::count_label_references;
 use super::local_shapes::empty_single_local_decl_binding;
 use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_temp};
+use super::object_flow::RootAnalysisContext;
 use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
 use super::temp_touch::collect_temp_refs_by_stmt;
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -64,6 +65,7 @@ pub(super) fn fold_branch_values_in_proto(
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
+    roots: RootAnalysisContext<'_>,
 ) -> bool {
     let safety = HirExprSafety::for_dialect(dialect);
     let exposed_temps = fold_root_branch_value_temps(proto, safety);
@@ -74,6 +76,7 @@ pub(super) fn fold_branch_values_in_proto(
         readability,
         facts,
         dialect,
+        roots,
     );
     let label_refs = count_label_references(&proto.body.stmts);
     let local_scope_facts = BranchValueLocalScopeFacts::collect(proto);
@@ -233,7 +236,7 @@ fn nil_fallback_decision_rewrite(
     if local_decl.values.tail.is_some() || !local_scope_facts.can_move_scope(*target) {
         return None;
     }
-    crate::hir::simplify::decision::assert_valid_decision(decision);
+    crate::hir::decision::assert_valid_decision(decision);
     let node = decision.nodes.get(decision.entry.index())?;
     let source = nil_check_local(&node.test)?;
     let source_target = match &node.falsy {

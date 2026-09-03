@@ -1,5 +1,6 @@
 -- regress_358_temp_inline_nested_regions: 必达 nested 可收回，条件区域与 table allocation 保留 producer
--- unluac: expect-contains [[lookup_result = 1 + source[key]]
+-- lookup 接收者的物理覆盖链由 regress_464 的 GC 观察验证，不要求跨 owner 内联。
+-- unluac: expect-contains [[lookup_result = 1 +]]
 -- unluac: expect-contains [[arithmetic_result = 1 + value()]]
 -- unluac: expect-contains [[f()[1]()]]
 -- unluac: expect-not-contains [[condition and f()]]

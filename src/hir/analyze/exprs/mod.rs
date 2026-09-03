@@ -9,6 +9,9 @@ mod branch;
 mod defs;
 mod packs;
 mod regs;
+mod tables;
+
+pub(super) use tables::expr_for_new_table;
 
 use crate::hir::common::{
     HirBinaryExpr, HirBinaryOpKind, HirCallExpr, HirCallRootHandoff, HirCapture, HirCaptureMode,

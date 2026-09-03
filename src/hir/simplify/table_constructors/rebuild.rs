@@ -1,6 +1,6 @@
 //! 这个子模块负责把扫描得到的 region steps 重建回表构造器。
 //!
-//! 它依赖 `scan` 产出的轻量 step 描述和 `inline_value` 的安全内联结果，只负责按顺序 flush
+//! 它依赖 `scan` 产出的带 producer 投影与字段/batch 引用的 step 和安全内联结果，按顺序 flush
 //! 片段，不会回头重新判定哪个 stmt 属于候选 region。
 //! 例如：一串 `record/setlist/producer` step 会在这里重新拼成 `HirTableConstructor`；
 //! producer、record key/value 的求值事件序列不一致时，整个推测事务回滚。
@@ -11,21 +11,18 @@ mod captures;
 use captures::*;
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirLValue, HirStmt,
-    HirTableField, HirTableSetList,
+    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirTableField, HirTableSetList,
 };
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
-use super::super::expr_facts::expr_is_boolean_valued;
-use super::bindings::{
-    BindingIndex, BindingUseSummary, binding_from_expr, binding_from_lvalue, matches_binding_ref,
-};
+use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr, matches_binding_ref};
 use super::builder::{ConstructorBuilder, RecordPromotionPolicy};
 use super::inline_value::{InlineContext, InlineRewriteState, inline_constructor_value};
 use super::{
     ConstructorEvalEvent, PendingProducer, PendingProducerSource, PreparedRecord,
     ProducerSourcePreservation, RebuildScratch, RegionStep, SegmentToken, TableBinding,
 };
+use crate::hir::value_facts::value_facts;
 
 pub(super) struct RegionRebuildContext<'a> {
     block: &'a HirBlock,
@@ -55,7 +52,7 @@ impl<'a> RegionRebuildContext<'a> {
 
 pub(super) fn try_extend_constructor_from_steps(
     builder: &mut ConstructorBuilder,
-    steps: &[RegionStep],
+    steps: &[RegionStep<'_>],
     context: &mut RegionRebuildContext<'_>,
 ) -> Option<Vec<usize>> {
     let checkpoint = builder.checkpoint(context.scratch);
@@ -63,11 +60,11 @@ pub(super) fn try_extend_constructor_from_steps(
     let mut preserved_producer_sources = Vec::new();
 
     for (index, step) in steps.iter().enumerate() {
-        if let RegionStep::SetList { stmt_index } = step {
+        if let RegionStep::SetList { batch, .. } = step {
             if flush_constructor_segment(
                 builder,
                 &steps[segment_start..index],
-                Some(*stmt_index),
+                Some(batch),
                 context,
                 &mut preserved_producer_sources,
             )
@@ -99,15 +96,13 @@ pub(super) fn try_extend_constructor_from_steps(
 
 fn flush_constructor_segment(
     builder: &mut ConstructorBuilder,
-    segment: &[RegionStep],
-    set_list_stmt_index: Option<usize>,
+    segment: &[RegionStep<'_>],
+    set_list: Option<&HirTableSetList>,
     context: &mut RegionRebuildContext<'_>,
     preserved_producer_sources: &mut Vec<usize>,
 ) -> Option<()> {
     prepare_scratch(context.scratch, context.binding_index.len());
-    if builder.trailing_multivalue.is_some()
-        && (!segment.is_empty() || set_list_stmt_index.is_some())
-    {
+    if builder.trailing_multivalue.is_some() && (!segment.is_empty() || set_list.is_some()) {
         // 候选拒绝[SemanticBarrier:ValueArity]：constructor 的 open tail 已决定后续数组槽；
         // 再吸收字段会改变多返回值覆盖范围，反例见 regress_52_table_trailing_multivalue_boundary。
         return None;
@@ -115,10 +110,9 @@ fn flush_constructor_segment(
 
     if segment.is_empty() {
         if builder.trailing_multivalue.is_some() {
-            return set_list_stmt_index.is_none().then_some(());
+            return set_list.is_none().then_some(());
         }
-        if let Some(stmt_index) = set_list_stmt_index {
-            let set_list = set_list_stmt(context.block, stmt_index)?;
+        if let Some(set_list) = set_list {
             if set_list.start_index < builder.next_array_index()
                 && !builder.demote_array_suffix(
                     set_list.start_index,
@@ -149,8 +143,8 @@ fn flush_constructor_segment(
         return Some(());
     }
 
-    let expected_set_list_start = if let Some(stmt_index) = set_list_stmt_index {
-        let start_index = set_list_stmt(context.block, stmt_index)?.start_index;
+    let expected_set_list_start = if let Some(set_list) = set_list {
+        let start_index = set_list.start_index;
         if start_index < builder.next_array_index()
             && !builder.demote_array_suffix(start_index, &mut context.scratch.restored_array_fields)
         {
@@ -158,7 +152,16 @@ fn flush_constructor_segment(
             // 起点 0；吸收到 constructor array 会把原键 0 改写成键 1。
             return None;
         }
-        builder.next_array_index()
+        // 索引式构造器先用 record 写入固定前缀，末尾才是 open SETLIST。
+        // 前层布局证书允许本段 record 填满前缀；在 tail 提交前仍必须精确核对起点。
+        if builder.has_indexed_array_layout()
+            && set_list.values.fixed.is_empty()
+            && set_list.values.tail.is_some()
+        {
+            start_index
+        } else {
+            builder.next_array_index()
+        }
     } else {
         builder.next_array_index()
     };
@@ -166,26 +169,27 @@ fn flush_constructor_segment(
     for step in segment {
         match step {
             RegionStep::Producer {
-                stmt_index,
-                slot_index,
+                binding,
+                source,
+                value,
                 source_preservation,
+                ..
             } => register_single_producer(
-                context.block,
                 context.binding_index,
-                *stmt_index,
-                *slot_index,
+                *binding,
+                *source,
+                value,
                 *source_preservation,
                 context.scratch,
-            )?,
-            RegionStep::Record { stmt_index } => prepare_record_step(*stmt_index, context)?,
+            ),
+            RegionStep::Record { key, value, .. } => prepare_record_step(key, value, context)?,
             RegionStep::SetList { .. } => {
                 unreachable!("set-list should terminate constructor segment")
             }
         }
     }
 
-    if let Some(stmt_index) = set_list_stmt_index {
-        let set_list = set_list_stmt(context.block, stmt_index)?;
+    if let Some(set_list) = set_list {
         if set_list.start_index != expected_set_list_start {
             // 候选拒绝[SemanticBarrier:TableShape]：producer/record 不能改变 raw SETLIST 的
             // 固定起点；否则隐式 array key 与原字节码不一致。
@@ -238,6 +242,11 @@ fn flush_constructor_segment(
         }
 
         if let Some(trailing) = &set_list.values.tail {
+            if set_list.values.fixed.is_empty()
+                && builder.next_array_index() != set_list.start_index
+            {
+                return None;
+            }
             builder.trailing_multivalue = Some(trailing.clone().try_map_call(|call| {
                 let expr = inline_set_list_value(context, &HirExpr::Call(Box::new(call)))?;
                 let HirExpr::Call(call) = expr else {
@@ -248,7 +257,7 @@ fn flush_constructor_segment(
         }
     }
 
-    if set_list_stmt_index.is_none() {
+    if set_list.is_none() {
         let tokens = context.scratch.tokens.clone();
         for token in &tokens {
             if let SegmentToken::Record {
@@ -273,13 +282,13 @@ fn flush_constructor_segment(
         }
     }
 
-    if !constructor_eval_order_is_preserved(set_list_stmt_index, context) {
+    if !constructor_eval_order_is_preserved(set_list, context) {
         // 候选拒绝[SemanticBarrier:EvalOrder]：source/generated 事件序列不同会重排 lookup、
         // call 或元方法；反例见 regress_212 与 regress_235。
         return None;
     }
 
-    if set_list_stmt_index.is_none() {
+    if set_list.is_none() {
         builder.drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
     }
 
@@ -337,15 +346,12 @@ fn append_prepared_record_events(scratch: &mut RebuildScratch, record_index: usi
 }
 
 fn constructor_eval_order_is_preserved(
-    set_list_stmt_index: Option<usize>,
+    set_list: Option<&HirTableSetList>,
     context: &RegionRebuildContext<'_>,
 ) -> bool {
     let scratch = &context.scratch;
     let mut expected = scratch.source_eval_events.clone();
-    if let Some(stmt_index) = set_list_stmt_index {
-        let Some(set_list) = set_list_stmt(context.block, stmt_index) else {
-            return false;
-        };
+    if let Some(set_list) = set_list {
         for value in &set_list.values.fixed {
             collect_source_eval_events(
                 value,
@@ -539,23 +545,27 @@ fn mark_binding_active(scratch: &mut RebuildScratch, binding_id: usize) {
 }
 
 fn register_single_producer(
-    block: &HirBlock,
     binding_index: &BindingIndex,
-    stmt_index: usize,
-    slot_index: usize,
+    binding: TableBinding,
+    source: PendingProducerSource,
+    value: &HirExpr,
     source_preservation: ProducerSourcePreservation,
     scratch: &mut RebuildScratch,
-) -> Option<()> {
-    let mut producer = single_producer(block, binding_index, stmt_index, slot_index)?;
-    producer.source_preservation = source_preservation;
+) {
+    let producer = PendingProducer {
+        binding,
+        binding_id: binding_index
+            .id_of(binding)
+            .expect("scanned producer is indexed"),
+        source,
+        source_preservation,
+    };
     let producer_index = scratch.pending_producers.len();
     mark_binding_active(scratch, producer.binding_id);
     scratch.producer_index_by_binding[producer.binding_id] = Some(producer_index);
     scratch.removed_materializations[producer.binding_id] += 1;
     scratch.pending_producers.push(producer);
-    if pending_producer_value(block, &scratch.pending_producers[producer_index])
-        .is_some_and(expr_requires_ordered_snapshot)
-    {
+    if expr_requires_ordered_snapshot(value) {
         scratch
             .source_eval_events
             .push(ConstructorEvalEvent::Producer(producer_index));
@@ -563,13 +573,15 @@ fn register_single_producer(
     scratch
         .tokens
         .push(SegmentToken::Producer { producer_index });
-    Some(())
 }
 
-fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>) -> Option<()> {
-    let (key, value) = record_field_parts(context.block, stmt_index)?;
+fn prepare_record_step(
+    key: &HirExpr,
+    value: &HirExpr,
+    context: &mut RegionRebuildContext<'_>,
+) -> Option<()> {
     collect_source_eval_events(
-        &key,
+        key,
         context.binding_index,
         &context.scratch.producer_index_by_binding,
         &mut context.scratch.source_eval_events,
@@ -596,7 +608,7 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
             },
             context.remaining_uses,
         );
-        inline_constructor_value(&mut inline_context, &key)?
+        inline_constructor_value(&mut inline_context, key)?
     };
     let recursive_closure_slot = binding_is_recursive_closure_slot(
         context.block,
@@ -646,75 +658,6 @@ fn prepare_record_step(stmt_index: usize, context: &mut RegionRebuildContext<'_>
     Some(())
 }
 
-fn record_field_parts(block: &HirBlock, stmt_index: usize) -> Option<(HirExpr, &HirExpr)> {
-    let HirStmt::Assign(assign) = block.stmts.get(stmt_index)? else {
-        return None;
-    };
-    let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
-        return None;
-    };
-    if assign.values.tail.is_some() {
-        return None;
-    }
-    let [value] = assign.values.fixed.as_slice() else {
-        return None;
-    };
-    Some((access.key.clone(), value))
-}
-
-fn set_list_stmt(block: &HirBlock, stmt_index: usize) -> Option<&HirTableSetList> {
-    let HirStmt::TableSetList(set_list) = block.stmts.get(stmt_index)? else {
-        return None;
-    };
-    Some(set_list)
-}
-
-fn single_producer(
-    block: &HirBlock,
-    binding_index: &BindingIndex,
-    stmt_index: usize,
-    slot_index: usize,
-) -> Option<PendingProducer> {
-    let stmt = block.stmts.get(stmt_index)?;
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            let binding = TableBinding::Local(*local_decl.bindings.get(slot_index)?);
-            let source = if local_decl.values.fixed.get(slot_index).is_some() {
-                PendingProducerSource::Value {
-                    stmt_index,
-                    value_index: slot_index,
-                }
-            } else {
-                PendingProducerSource::ImplicitNil { stmt_index }
-            };
-            Some(PendingProducer {
-                binding,
-                binding_id: binding_index.id_of(binding)?,
-                source,
-                source_preservation: ProducerSourcePreservation::UnsupportedShape,
-            })
-        }
-        HirStmt::Assign(assign) => {
-            let binding = binding_from_lvalue(assign.targets.get(slot_index)?)?;
-            let source = if assign.values.fixed.get(slot_index).is_some() {
-                PendingProducerSource::Value {
-                    stmt_index,
-                    value_index: slot_index,
-                }
-            } else {
-                PendingProducerSource::ImplicitNil { stmt_index }
-            };
-            Some(PendingProducer {
-                binding,
-                binding_id: binding_index.id_of(binding)?,
-                source,
-                source_preservation: ProducerSourcePreservation::UnsupportedShape,
-            })
-        }
-        _ => None,
-    }
-}
-
 fn preserve_producer_source(
     producer: &PendingProducer,
     preserved_stmt_indices: &mut Vec<usize>,
@@ -749,42 +692,10 @@ fn preserve_producer_source(
     Some(())
 }
 
-/// A producer declaration is removable only when its value cannot carry a source-visible
-/// object/root.  In addition to primitive literals, a value whose HIR type is proved boolean is
-/// scalar even when evaluating it can still observe user code (for example a comparison with a
-/// metamethod-capable operand).  The constructor-region evaluator separately preserves that
-/// expression's order; this predicate only answers whether the materialized result can be a
-/// surviving object root.
+/// producer 的结果根分类来自共享值域；区域 evaluator 独立保留求值事件及顺序。
+/// 例如比较结果是 boolean，不代表调用其元方法的求值本身可以删除。
 pub(super) fn producer_value_can_be_dropped(expr: &HirExpr) -> bool {
-    matches!(
-        expr,
-        HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-    ) || expr_is_boolean_valued(expr)
-}
-
-fn pending_producer_value<'a>(
-    block: &'a HirBlock,
-    producer: &PendingProducer,
-) -> Option<&'a HirExpr> {
-    match producer.source {
-        PendingProducerSource::Value {
-            stmt_index,
-            value_index,
-        } => match block.stmts.get(stmt_index)? {
-            HirStmt::LocalDecl(local_decl) => local_decl.values.fixed.get(value_index),
-            HirStmt::Assign(assign) => assign.values.fixed.get(value_index),
-            _ => None,
-        },
-        PendingProducerSource::ImplicitNil { .. } => Some(&HirExpr::Nil),
-    }
+    value_facts(expr).is_gc_inert()
 }
 
 #[cfg(test)]
@@ -801,7 +712,9 @@ mod tests {
         BindingIndex, BindingOccurrenceIndex, BindingSlots, collect_stmt_binding_summary,
     };
     use super::super::builder::ConstructorBuilder;
-    use super::super::{ProducerSourcePreservation, RebuildScratch, RegionStep};
+    use super::super::{
+        PendingProducerSource, ProducerSourcePreservation, RebuildScratch, RegionStep, TableBinding,
+    };
     use super::{RegionRebuildContext, try_extend_constructor_from_steps};
 
     #[test]
@@ -862,16 +775,34 @@ mod tests {
                 &mut builder,
                 &[
                     RegionStep::Producer {
-                        stmt_index: 1,
-                        slot_index: 0,
+                        binding: TableBinding::Local(first),
+                        source: PendingProducerSource::Value {
+                            stmt_index: 1,
+                            value_index: 0
+                        },
+                        value: &HirExpr::Integer(1),
+                        scalar_call: false,
+                        source_gc_inert: true,
                         source_preservation: ProducerSourcePreservation::Safe,
                     },
                     RegionStep::Producer {
-                        stmt_index: 2,
-                        slot_index: 0,
+                        binding: TableBinding::Local(second),
+                        source: PendingProducerSource::Value {
+                            stmt_index: 2,
+                            value_index: 0
+                        },
+                        value: &HirExpr::Integer(2),
+                        scalar_call: false,
+                        source_gc_inert: true,
                         source_preservation: ProducerSourcePreservation::Safe,
                     },
-                    RegionStep::SetList { stmt_index: 3 },
+                    RegionStep::SetList {
+                        stmt_index: 3,
+                        batch: match &block.stmts[3] {
+                            HirStmt::TableSetList(batch) => batch,
+                            _ => unreachable!(),
+                        }
+                    },
                 ],
                 &mut context,
             )

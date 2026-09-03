@@ -1,12 +1,11 @@
-//! Invalidation 驱动的 fixed-point pass 调度器。
+//! HIR/AST 共用的失效标签与事实消费顺序调度器。
 //!
-//! AST Readability 和 HIR Simplify 都存在"前面的 pass 暴露了新形状，后面某个 pass
-//! 需要重跑"的场景。此前靠手动在序列中重复放置同一 pass（如 statement-merge 出现两次）
-//! 来解决，每次新增 pass 都要手动推演和谁有顺序依赖，容易漏。
+//! pass 通过 depends_on/invalidates 声明形状依赖，调度器管理执行与收敛，不拥有
+//! 表达式改写或生命周期证明。consumer 还可要求更早的 owner 在消费前保持最新；
+//! 例如 temp-inline 暴露 constructor 后，locals 不能先合并其不同 SSA producer。
 //!
-//! 这个模块提供了一个泛型调度器 `InvalidationRunner`，让每个 pass 声明"我修改什么"
-//! (`invalidates`) 和"我关心什么"(`depends_on`)，调度器根据 dirty set 自动决定
-//! 哪些 pass 需要重跑、何时收敛。
+//! owner 在本轮输入失效时即时刷新，其它 pass 保持阶段及相对执行顺序；不需要重复
+//! 登记同一 pass，也不把身份消费推迟到所有不相关改写完成之后。
 //!
 //! ## 核心概念
 //!
@@ -59,6 +58,7 @@ pub enum InvalidationConvergence {
 ///
 /// 接受一组 pass 描述和对应的执行函数，按固定点策略执行。
 /// `run_pass(index, name)` 执行第 `index` 个 pass，返回是否产生了变化。
+/// `prerequisites` 指定 consumer 的唯一直接 owner；owner 可继续声明自己的依赖。
 ///
 /// 调度顺序：
 /// 1. 反复执行所有 `Normal` phase 的 pass，直到 dirty set 清空（Normal 收敛）。
@@ -66,6 +66,7 @@ pub enum InvalidationConvergence {
 /// 3. 如果 Deferred 产出了新的 dirty tag，回到步骤 1；否则整体收敛。
 pub fn run_invalidation_loop<T, F>(
     passes: &[PassDescriptor<T>],
+    prerequisites: &[(&str, &str)],
     mut run_pass: F,
     max_rounds: usize,
 ) -> InvalidationConvergence
@@ -73,6 +74,26 @@ where
     T: InvalidationTag,
     F: FnMut(usize, &str) -> bool,
 {
+    // 依赖只能指向同阶段更早的 owner，排除循环并保留既有阶段顺序。
+    let mut required = vec![None; passes.len()];
+    for &(consumer, owner) in prerequisites {
+        let consumer = passes
+            .iter()
+            .position(|pass| pass.name == consumer)
+            .expect("consumer pass exists");
+        let owner = passes
+            .iter()
+            .position(|pass| pass.name == owner)
+            .expect("owner pass exists");
+        assert!(
+            owner < consumer && passes[owner].phase == passes[consumer].phase,
+            "pass prerequisites must be earlier owners in the same phase"
+        );
+        assert!(
+            required[consumer].replace(owner).is_none(),
+            "consumer has one direct prerequisite owner"
+        );
+    }
     // 初始：所有 tag 都 dirty（第一轮每个 pass 都要跑）
     let mut dirty: BTreeSet<T> = T::all().iter().copied().collect();
     let mut rounds = 0;
@@ -81,6 +102,7 @@ where
         // ── Normal phase: 固定点收敛 ──
         if !run_phase_until_converged(
             passes,
+            &required,
             PassPhase::Normal,
             &mut dirty,
             &mut run_pass,
@@ -95,8 +117,13 @@ where
         // 还没跑过，必须给它们至少一次执行机会，因此在 Deferred round 前把所有 tag
         // 重新标记为 dirty。
         dirty = T::all().iter().copied().collect();
-        let deferred_changed =
-            run_single_round(passes, PassPhase::Deferred, &mut dirty, &mut run_pass);
+        let deferred_changed = run_single_round(
+            passes,
+            &required,
+            PassPhase::Deferred,
+            &mut dirty,
+            &mut run_pass,
+        );
         if !deferred_changed {
             return InvalidationConvergence::Converged;
         }
@@ -111,6 +138,7 @@ where
 /// 反复执行某个 phase 的所有 pass 直到 dirty set 中没有该 phase 关心的 tag。
 fn run_phase_until_converged<T, F>(
     passes: &[PassDescriptor<T>],
+    required: &[Option<usize>],
     phase: PassPhase,
     dirty: &mut BTreeSet<T>,
     run_pass: &mut F,
@@ -126,7 +154,7 @@ where
             return false;
         }
 
-        let round_changed = run_single_round(passes, phase, dirty, run_pass);
+        let round_changed = run_single_round(passes, required, phase, dirty, run_pass);
 
         if round_changed {
             *rounds += 1;
@@ -145,6 +173,7 @@ where
 /// - 遍历结束后，dirty set = newly_dirty（快照中的旧 tag 已被消费掉）。
 fn run_single_round<T, F>(
     passes: &[PassDescriptor<T>],
+    required: &[Option<usize>],
     phase: PassPhase,
     dirty: &mut BTreeSet<T>,
     run_pass: &mut F,
@@ -157,6 +186,7 @@ where
     let snapshot = dirty.clone();
     let mut newly_dirty: BTreeSet<T> = BTreeSet::new();
     let mut round_changed = false;
+    let mut current = vec![false; passes.len()];
 
     for (index, desc) in passes.iter().enumerate() {
         if desc.phase != phase {
@@ -172,17 +202,56 @@ where
             continue;
         }
 
-        let changed = run_pass(index, desc.name);
-        if changed {
-            round_changed = true;
-            for tag in desc.invalidates {
-                newly_dirty.insert(*tag);
-            }
-        }
+        round_changed |= run_current_pass(
+            passes,
+            required,
+            index,
+            &mut current,
+            &mut newly_dirty,
+            run_pass,
+        );
     }
 
     // 本轮结束：dirty set 只保留新产出的 tag
     *dirty = newly_dirty;
 
     round_changed
+}
+
+/// owner 执行后若又有输入变化，必须在身份消费前刷新；不提前重跑其它 pass。
+fn run_current_pass<T, F>(
+    passes: &[PassDescriptor<T>],
+    required: &[Option<usize>],
+    index: usize,
+    current: &mut [bool],
+    newly_dirty: &mut BTreeSet<T>,
+    run_pass: &mut F,
+) -> bool
+where
+    T: InvalidationTag,
+    F: FnMut(usize, &str) -> bool,
+{
+    if current[index] {
+        return false;
+    }
+    let mut changed = false;
+    if let Some(owner) = required[index] {
+        changed |= run_current_pass(passes, required, owner, current, newly_dirty, run_pass);
+    }
+    let desc = &passes[index];
+    if run_pass(index, desc.name) {
+        changed = true;
+        newly_dirty.extend(desc.invalidates);
+        for (other, pass) in passes.iter().enumerate() {
+            if pass
+                .depends_on
+                .iter()
+                .any(|tag| desc.invalidates.contains(tag))
+            {
+                current[other] = false;
+            }
+        }
+    }
+    current[index] = true;
+    changed
 }

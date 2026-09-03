@@ -97,7 +97,22 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
             format_reg(instr.subject),
             instr.kind.label()
         ),
-        LowInstr::NewTable(instr) => format!("new-table {}", format_reg(instr.dst)),
+        LowInstr::NewTable(instr) => match &instr.allocation {
+            super::TableAllocation::Indexed {
+                array_capacity,
+                hash_bits,
+            } => format!(
+                "new-table {} indexed-array-capacity={array_capacity} hash-bits={hash_bits}",
+                format_reg(instr.dst)
+            ),
+            super::TableAllocation::Empty => format!("new-table {}", format_reg(instr.dst)),
+            super::TableAllocation::Template(template) => format!(
+                "new-table {} template array={:?} hash={:?}",
+                format_reg(instr.dst),
+                template.array,
+                template.hash
+            ),
+        },
         LowInstr::SetList(instr) => format!(
             "set-list {} values={} start={}",
             format_reg(instr.base),

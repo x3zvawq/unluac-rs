@@ -32,7 +32,7 @@ use unluac::transformer::{
 
 #[allow(dead_code)]
 mod case_manifest;
-pub use case_manifest::{LuaCaseDialect, LuaCaseManifestEntry, LuaCaseVariant};
+pub use case_manifest::{LuaCaseDialect, LuaCaseId, LuaCaseManifestEntry, LuaCaseVariant};
 use case_manifest::{
     LuaCaseExpectation, LuaCaseLoopProtocol, LuaCaseOptions, LuaCaseStructureContract,
     regression_cases, unit_cases,
@@ -369,18 +369,10 @@ pub fn unit_case_specs() -> Vec<UnitCaseSpec> {
         .collect()
 }
 
-pub fn find_unit_case_spec(
-    suite: UnitSuite,
-    dialect_label: &str,
-    path: &str,
-    variant_label: Option<&str>,
-) -> Option<UnitCaseSpec> {
-    unit_case_specs().into_iter().find(|spec| {
-        spec.suite == suite
-            && <&'static str>::from(spec.entry.dialect) == dialect_label
-            && spec.entry.path == path
-            && spec.entry.variant.map(LuaCaseVariant::label) == variant_label
-    })
+pub fn find_unit_case_spec(suite: UnitSuite, id: LuaCaseId) -> Option<UnitCaseSpec> {
+    unit_case_specs()
+        .into_iter()
+        .find(|spec| spec.suite == suite && spec.entry.id == id)
 }
 
 pub fn run_unit_case(spec: UnitCaseSpec) -> Result<TestSuccess, TestFailure> {
@@ -399,6 +391,10 @@ enum ReadabilityAssertion {
         needle: String,
     },
     NotContains {
+        line: usize,
+        needle: String,
+    },
+    NotLine {
         line: usize,
         needle: String,
     },

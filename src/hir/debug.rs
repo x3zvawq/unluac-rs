@@ -469,7 +469,7 @@ fn format_expr(expr: &HirExpr) -> String {
                 .count();
             let record_count = table.fields.len().saturating_sub(array_count);
             format!(
-                "table(array={}, record={}, trailing={})",
+                "table(array={}, record={}, trailing={}, allocation={:?})",
                 array_count,
                 record_count,
                 table
@@ -477,6 +477,7 @@ fn format_expr(expr: &HirExpr) -> String {
                     .as_ref()
                     .map(|tail| format_expr(tail.as_expr()))
                     .unwrap_or_else(|| "-".to_owned()),
+                table.allocation,
             )
         }
         HirExpr::Closure(closure) => format!(

@@ -62,23 +62,18 @@ fn executable_name(name: &str) -> String {
 
 pub(super) fn suite_artifact_path(
     suite_label: &str,
-    dialect_label: &str,
-    variant: Option<LuaCaseVariant>,
+    entry: &LuaCaseManifestEntry,
     artifact_label: &str,
-    source_relative: &str,
     extension: &str,
 ) -> PathBuf {
-    let dialect_root = repo_root()
+    repo_root()
         .join("target")
         .join("unluac-tests")
         .join(suite_label)
-        .join(dialect_label);
-    variant
-        .map_or(dialect_root.clone(), |variant| {
-            dialect_root.join(variant.label())
-        })
+        .join(<&'static str>::from(entry.dialect))
+        .join(format!("case-{}", entry.id.0))
         .join(artifact_label)
-        .join(source_relative)
+        .join(entry.path)
         .with_extension(extension)
 }
 

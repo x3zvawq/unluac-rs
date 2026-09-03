@@ -13,7 +13,9 @@
 -- unluac: expect-not-contains [[local r10_0 = not p10_0]]
 -- unluac: expect-contains [[p11_1(p11_0)]]
 -- unluac: expect-not-contains [[local r11_0 = p11_0]]
--- unluac: expect-contains [[r13_0 = p13_0]]
+-- An unchanged parameter is itself the declaration-time truthiness snapshot.
+-- unluac: expect-contains [[until p13_0]]
+-- unluac: expect-not-contains [[r13_0 = p13_0]]
 -- unluac: expect-contains [[r14_0 = p14_0]]
 -- unluac: expect-contains [[r15_0 = p15_1]]
 

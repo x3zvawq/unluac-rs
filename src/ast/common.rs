@@ -617,6 +617,8 @@ pub enum AstCallKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstTableConstructor {
     pub fields: Vec<AstTableField>,
+    /// HIR 发布的初始化方式，约束后续常量替换；AST 不从字段猜原分配协议。
+    pub allocation: crate::hir::HirTableAllocation,
 }
 
 /// 表字段。

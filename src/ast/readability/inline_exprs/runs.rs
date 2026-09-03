@@ -1226,6 +1226,7 @@ mod tests {
         let first = AstBindingRef::Local(LocalId(0));
         let second = AstBindingRef::Local(LocalId(1));
         let table = AstExpr::TableConstructor(Box::new(AstTableConstructor {
+            allocation: Default::default(),
             fields: vec![AstTableField::Array(AstExpr::Integer(1))],
         }));
         let mut table_block = AstBlock {
@@ -1431,6 +1432,7 @@ mod tests {
         let container = recovered_local(
             second,
             AstExpr::TableConstructor(Box::new(AstTableConstructor {
+                allocation: Default::default(),
                 fields: vec![AstTableField::Array(AstExpr::Var(first.to_name_ref()))],
             })),
         );

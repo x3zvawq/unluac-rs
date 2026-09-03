@@ -50,17 +50,24 @@ pub(super) fn read_readability_assertions(
                     needle: needle.clone(),
                 });
             }
-            "expect-not-contains" => {
+            "expect-not-contains" | "expect-not-line" => {
                 let [needle] = args.as_slice() else {
                     return Err(readability_parse_failure(
                         source_relative,
                         line_no,
-                        "expect-not-contains requires exactly one [[...]] argument",
+                        format!("{directive} requires exactly one [[...]] argument"),
                     ));
                 };
-                assertions.push(ReadabilityAssertion::NotContains {
-                    line: line_no,
-                    needle: needle.clone(),
+                assertions.push(if directive == "expect-not-line" {
+                    ReadabilityAssertion::NotLine {
+                        line: line_no,
+                        needle: needle.clone(),
+                    }
+                } else {
+                    ReadabilityAssertion::NotContains {
+                        line: line_no,
+                        needle: needle.clone(),
+                    }
                 });
             }
             "expect-order" => {
@@ -173,6 +180,19 @@ pub(super) fn assert_readability(
                         stage_label,
                         *line,
                         format!("expected generated source not to contain {needle:?}"),
+                        generated_source,
+                    ));
+                }
+            }
+            ReadabilityAssertion::NotLine { line, needle } => {
+                if generated_source
+                    .lines()
+                    .any(|source_line| source_line.trim() == needle.trim())
+                {
+                    return Err(readability_assertion_failure(
+                        stage_label,
+                        *line,
+                        format!("expected generated source not to have a complete line {needle:?}"),
                         generated_source,
                     ));
                 }

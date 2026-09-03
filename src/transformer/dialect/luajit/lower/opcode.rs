@@ -1,4 +1,5 @@
 //! 将 LuaJIT opcode dispatch 降低为共享 LowInstr；依赖 ProtoLowerer 的常量/跳转辅助，不负责 chunk 递归与最终映射校验；例如把 ISLT、CALLM、TFORL 等指令写入 pending lowering。
+//! TNEW 的数组/hash 布局在这里解码；TDUP 发布完整常量模板，后层不再读取 raw D 或重建初始化写入。
 
 use super::*;
 
@@ -335,13 +336,22 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 LuaJitOpcode::TNew => {
-                    let (a, _) = expect_ad(raw_pc, opcode, operands)?;
+                    let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    // VM 将饱和值 0x7ff 解码成 0x801 个含零索引的数组槽。
+                    let array_slots = match u32::from(d) & 0x7ff {
+                        0x7ff => 0x801,
+                        slots => slots,
+                    };
                     self.invalidate_written_reg(reg_from_u8(a));
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
                             dst: reg_from_u8(a),
+                            allocation: crate::transformer::TableAllocation::Indexed {
+                                array_capacity: array_slots.saturating_sub(1),
+                                hash_bits: (d >> 11) as u8,
+                            },
                         })),
                     );
                     raw_index += 1;
@@ -354,38 +364,29 @@ impl<'a> ProtoLowerer<'a> {
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr { dst })),
+                        PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
+                            dst,
+                            allocation: crate::transformer::TableAllocation::Template(
+                                crate::transformer::TableTemplate {
+                                    array: table
+                                        .array
+                                        .iter()
+                                        .map(|value| ConstRef(value.literal_index))
+                                        .collect(),
+                                    hash: table
+                                        .hash
+                                        .iter()
+                                        .map(|entry| {
+                                            (
+                                                ConstRef(entry.key.literal_index),
+                                                ConstRef(entry.value.literal_index),
+                                            )
+                                        })
+                                        .collect(),
+                                },
+                            ),
+                        })),
                     );
-                    for (index, literal) in table.array.iter().enumerate() {
-                        if matches!(literal.value, RawLiteralConst::Nil) {
-                            continue;
-                        }
-                        self.emit(
-                            None,
-                            vec![raw_index],
-                            PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
-                                base: AccessBase::Reg(dst),
-                                key: AccessKey::Integer(index as i64),
-                                value: self.table_literal_value(literal),
-                                kind: SetTableKind::Normal,
-                            })),
-                        );
-                    }
-                    for record in &table.hash {
-                        if matches!(record.value.value, RawLiteralConst::Nil) {
-                            continue;
-                        }
-                        self.emit(
-                            None,
-                            vec![raw_index],
-                            PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
-                                base: AccessBase::Reg(dst),
-                                key: self.table_literal_key(&record.key),
-                                value: self.table_literal_value(&record.value),
-                                kind: SetTableKind::Normal,
-                            })),
-                        );
-                    }
                     raw_index += 1;
                 }
                 LuaJitOpcode::GGet => {

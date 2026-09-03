@@ -90,10 +90,8 @@ pub(crate) fn compile_generated_source_to_suite_artifact(
     let toolchain = lua_toolchain(dialect_label)?;
     let output = suite_artifact_path(
         suite_label,
-        dialect_label,
-        entry.variant,
+        entry,
         "generated-chunk",
-        entry.path,
         toolchain.chunk_extension,
     );
     let command_output = compile_lua_file_to_path(

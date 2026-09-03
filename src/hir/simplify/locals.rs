@@ -54,6 +54,7 @@ use super::mention::{
     stmt_writes_temp, stmts_reference_captured_bindings, stmts_to_be_closed_temps,
     stmts_value_captured_bindings,
 };
+use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
     CallRootLifetimeIndices, LookupGcRootLifetimeIndices, collect_call_result_local_roots,
     collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes, stmt_has_argument_root_handoff,
@@ -74,7 +75,7 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
-    safety: HirExprSafety,
+    roots: RootAnalysisContext<'_>,
 ) -> bool {
     let compact_home_slots = hir_block_local_pressure(&proto.body) > crate::SOURCE_LOCAL_LIMIT
         && facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
@@ -102,7 +103,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         let mut ctx = PromotionCtx {
             proto_id: proto.id,
             facts,
-            safety,
+            roots,
             temp_debug_locals: &proto.temp_debug_locals,
             temp_debug_scopes: &proto.temp_debug_scopes,
             next_local_index: &mut next_local_index,
@@ -152,8 +153,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     proto.local_debug_hints.extend(new_local_debug_hints);
     proto.local_debug_scopes.extend(new_local_debug_scopes);
     proto.physical_root_locals.extend(physical_root_locals);
-    let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, safety);
-    let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, safety);
+    let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, roots.safety);
+    let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, roots.safety);
     result.changed || entry_nil_changed || alias_changed
 }
 
@@ -217,7 +218,7 @@ struct PromotionGroup {
     touching_stmt_indices: BTreeSet<usize>,
 }
 
-struct MultiHomeCallRootHandoff {
+struct CallMoveRootHandoff {
     alias_index: usize,
     temp: TempId,
     home: HomeSlotKey,
@@ -262,7 +263,7 @@ fn capture_kind_allows_call_root_owner(
 struct PromotionCtx<'a> {
     proto_id: HirProtoRef,
     facts: &'a ProtoPromotionFacts,
-    safety: HirExprSafety,
+    roots: RootAnalysisContext<'a>,
     temp_debug_locals: &'a [Option<String>],
     temp_debug_scopes: &'a [Option<usize>],
     next_local_index: &'a mut usize,
@@ -437,7 +438,7 @@ fn promote_block_with_protection(
         .extend(collect_call_result_local_roots(
             &block.stmts,
             protection.trailing_root_condition,
-            ctx.safety,
+            ctx.roots.safety,
         ));
 
     // 每轮控制头等 block 外消费者先保护当前 block；递归进入子作用域时再叠加当前语句
@@ -636,7 +637,7 @@ fn collect_plans(
         .position(stmt_contains_nested_nonlocal_control);
     let linear_prefix_end = label_flow_boundary.unwrap_or(block.stmts.len());
     let lifetime_stmts = &block.stmts[..linear_prefix_end];
-    let label_cfg = LexicalCfg::analyze(&block.stmts, ctx.label_refs, ctx.safety).ok();
+    let label_cfg = LexicalCfg::analyze(&block.stmts, ctx.label_refs, ctx.roots.safety).ok();
     let has_label_flow =
         label_cfg.as_ref().is_some_and(LexicalCfg::has_label_flow) || label_flow_boundary.is_some();
 
@@ -649,7 +650,7 @@ fn collect_plans(
     let call_root_lifetimes = collect_call_root_lifetimes(
         lifetime_stmts,
         facts,
-        ctx.safety,
+        ctx.roots,
         true,
         |temp| {
             // 候选拒绝[SemanticBarrier:Resource]：TBC producer 若提前声明 owner，会改变 close 起点与被关闭的值。
@@ -677,7 +678,7 @@ fn collect_plans(
         },
     );
     let lookup_gc_root_lifetimes =
-        collect_lookup_gc_root_lifetimes(lifetime_stmts, facts, ctx.safety, |temp| {
+        collect_lookup_gc_root_lifetimes(lifetime_stmts, facts, ctx.roots.safety, |temp| {
             !ctx.identity_sensitive_temps.contains(&temp)
                 && !inherited.contains_key(&temp)
                 && !outer_uses_temp(temp)
@@ -692,7 +693,7 @@ fn collect_plans(
         facts,
         call_roots: &call_root_lifetimes,
         lookup_roots: &lookup_gc_root_lifetimes,
-        safety: ctx.safety,
+        safety: ctx.roots.safety,
     };
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
@@ -707,8 +708,9 @@ fn collect_plans(
 
         activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
 
+        let mut separate_call_move_homes = false;
         if let Some(root_temp) = simple_temp_assign_target(stmt)
-            && let Some(handoffs) = multi_home_call_root_handoffs(
+            && let Some(handoffs) = call_move_root_handoffs(
                 block,
                 decl_index,
                 root_temp,
@@ -717,10 +719,16 @@ fn collect_plans(
                 &physical_root_locals_by_home,
             )
         {
-            // 一个 call 后的连续 MOVE 共同结束多个旧 root home。先完整匹配所有 pair、
+            separate_call_move_homes = true;
+            // call 自己的结果槽与后续 MOVE 的目标槽各有生命周期；即使只覆盖一个
+            // 旧 home，结果槽仍有独立 root 时也必须保留两个 owner。先完整匹配所有 pair、
             // old owner 与 HIR copy，再一次登记 plans；不能只复用任意一个 home，或在
             // 半数匹配后提交，否则会把同一个 VM overwrite transaction 拆开。
             for handoff in handoffs {
+                if call_root_lifetimes.is_root(handoff.alias_index) {
+                    physical_root_locals_by_home
+                        .insert((handoff.alias_index, handoff.home), handoff.local);
+                }
                 let mut allocator = PlanAllocator {
                     temp_debug_locals,
                     temp_debug_scopes,
@@ -968,7 +976,11 @@ fn collect_plans(
             .map(|pair| (pair.root_index(), pair.home()));
         let preceding_call_root = home_slot
             .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))
-            .or_else(|| call_root_lifetimes.unambiguous_overwrite_pair(decl_index))
+            .or_else(|| {
+                (!separate_call_move_homes)
+                    .then(|| call_root_lifetimes.unambiguous_overwrite_pair(decl_index))
+                    .flatten()
+            })
             .map(|pair| (pair.root_index(), pair.home()));
         let preceding_physical_root = preceding_call_root.or(preceding_lookup_root).or_else(|| {
             call_root_lifetimes
@@ -992,8 +1004,12 @@ fn collect_plans(
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
             && facts.is_direct_table_seed_temp(root_temp)
             && facts.overwrites_entry_nil(root_temp)
-            && matches!(block.stmts.get(decl_index + 1), Some(HirStmt::TableSetList(batch))
+            && (matches!(block.stmts.get(decl_index + 1), Some(HirStmt::TableSetList(batch))
                 if batch.base == HirExpr::TempRef(root_temp) && batch.values.tail.is_none())
+                || touching_stmt_indices.len() == 1
+                    && matches!(stmt, HirStmt::Assign(assign)
+                        if assign.values.tail.is_none()
+                            && matches!(assign.values.fixed.as_slice(), [HirExpr::TableConstructor(_)])))
             && facts.temp_is_transferred_call_argument(root_temp)
             && touching_stmt_indices
                 .iter()
@@ -1001,9 +1017,10 @@ fn collect_plans(
                 .count()
                 == 1
         {
-            // 候选拒绝[LayerBoundary]：table-constructors 的相邻 fixed-batch owner
-            // 已有入口 seed 与当前参数交接端点，先保留原 identity 供其消费。非相邻/
-            // open 区域不冒用该 owner 的能力；这里不重建字段或原始调用协议。
+            // 候选拒绝[LayerBoundary]：入口 seed 与当前参数交接端点已配对；相邻
+            // fixed batch 由 constructor owner 消费，完整且单次使用的 constructor 则
+            // 交给 temp-inline。raw SETLIST 被消费后许可仍有效，不能新增跨调用的 local
+            // 根（regress_342）；这里不重建字段、原始参数协议或内联求值顺序。
             continue;
         }
         let reusable_local = sticky_local
@@ -1125,6 +1142,14 @@ fn collect_plans(
             // overwrite partner reuses it. Home-slot compaction may otherwise lend the same
             // source local to a simultaneously-live value before that overwrite occurs.
             slot_candidates.retain(|_, candidate| *candidate != selected_local);
+        } else if let Some(home) = home_slot
+            && let Some((_, root_home)) = preceding_call_root.or(preceding_lookup_root)
+            && root_home == home
+        {
+            // 精确覆盖已经结束旧 root，当前 owner 可以重新参与同槽复用。
+            // 跨 home 的 call/MOVE 交接只证明旧目标槽被覆盖，不能把它登记成
+            // call 自己的结果槽，否则下一次结果槽写会破坏仍活跃的 MOVE 目标。
+            slot_candidates.insert(home, selected_local);
         }
     }
 
@@ -1142,7 +1167,7 @@ fn collect_plans(
             &temp_touches,
             decl_index,
             &is_reserved,
-            ctx.safety,
+            ctx.roots.safety,
         );
         if (call_root_lifetimes
             .overwrite_pairs(decl_index)
@@ -1570,16 +1595,21 @@ fn temp_assign_targets_for_home(
     (!temps.is_empty()).then_some(temps)
 }
 
-fn multi_home_call_root_handoffs(
+fn call_move_root_handoffs(
     block: &HirBlock,
     root_index: usize,
     root_temp: TempId,
     facts: &ProtoPromotionFacts,
     call_roots: &CallRootLifetimeIndices,
     physical_root_locals_by_home: &BTreeMap<(usize, HomeSlotKey), LocalId>,
-) -> Option<Vec<MultiHomeCallRootHandoff>> {
+) -> Option<Vec<CallMoveRootHandoff>> {
     let pairs = call_roots.overwrite_pairs(root_index).collect::<Vec<_>>();
-    if pairs.len() <= 1 {
+    let own_home = facts.trusted_temp_home_slot(root_temp)?;
+    let keeps_distinct_result_home = pairs.iter().all(|pair| pair.home() != own_home)
+        && call_roots
+            .root_homes(root_index)
+            .any(|home| home == own_home);
+    if pairs.is_empty() || (pairs.len() == 1 && !keeps_distinct_result_home) {
         return None;
     }
 
@@ -1615,7 +1645,7 @@ fn multi_home_call_root_handoffs(
             return None;
         }
         if let Some(local) = pending.remove(&home) {
-            handoffs.push(MultiHomeCallRootHandoff {
+            handoffs.push(CallMoveRootHandoff {
                 alias_index,
                 temp: *temp,
                 home,
@@ -2270,8 +2300,17 @@ mod tests {
             assign(left_overwrite, HirExpr::Integer(0)),
         ];
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
-        let call_roots =
-            collect_call_root_lifetimes(&stmts, &facts, safety, true, |_| true, |_| true);
+        let call_roots = collect_call_root_lifetimes(
+            &stmts,
+            &facts,
+            RootAnalysisContext {
+                safety,
+                effects: &[],
+            },
+            true,
+            |_| true,
+            |_| true,
+        );
         let lookup_roots = LookupGcRootLifetimeIndices::default();
 
         assert!(root_lifetime_closes_in_prefix(

@@ -7,13 +7,13 @@
 //! - ISTYPE/ISNUM 保留内建 guard 与可能的原槽规范化，不猜普通 Lua helper；
 //! - method setup 由 split `MOV + TGETS/TGETV` 协议还原，并在这里冻结 receiver snapshot；
 //! - 写入和绕过 setup 的外部入边会使 method hint 失效，后层不再猜冒号调用；
-//! - TDUP 在这里展开成 `NewTable + SetTable*`，不把模板表细节泄漏到后层。
+//! - TNEW 发布完整分配布局；TDUP 的模板常量与 nil 占位由一条 NewTable 原子初始化。
 
 use std::sync::Arc;
 
 use crate::parser::{
     LuaJitKgcEntry, LuaJitNumberConstEntry, LuaJitOpcode, LuaJitOperands, LuaJitTableConst,
-    LuaJitTableLiteral, RawChunk, RawLiteralConst, RawProto,
+    RawChunk, RawLiteralConst, RawProto,
 };
 use crate::transformer::dialect::lowering::{
     JumpSourceEnvelope, PendingLowInstr, PendingLoweringState, PendingMethodHints,
@@ -572,17 +572,6 @@ impl<'a> ProtoLowerer<'a> {
         } else {
             ValuePack::Fixed(RegRange::new(start, usize::from(d.saturating_sub(1))))
         }
-    }
-
-    fn table_literal_key(&self, literal: &LuaJitTableLiteral) -> AccessKey {
-        match literal.value {
-            RawLiteralConst::Integer(value) => AccessKey::Integer(value),
-            _ => AccessKey::Const(ConstRef(literal.literal_index)),
-        }
-    }
-
-    fn table_literal_value(&self, literal: &LuaJitTableLiteral) -> ValueOperand {
-        ValueOperand::Const(ConstRef(literal.literal_index))
     }
 
     fn tsetm_start_index(&self, raw_pc: u32, knum_index: usize) -> Result<u32, TransformError> {
