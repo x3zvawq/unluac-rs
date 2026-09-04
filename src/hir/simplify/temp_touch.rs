@@ -203,55 +203,8 @@ fn collect_temp_reads_in_stmts(stmts: &[HirStmt]) -> BTreeSet<TempId> {
     collector.temps
 }
 
-pub(super) struct TempTouchIndex<'a> {
-    stmt_refs: &'a [BTreeSet<TempId>],
-    indices_by_temp: BTreeMap<TempId, Vec<usize>>,
-}
-
-impl<'a> TempTouchIndex<'a> {
-    pub(super) fn new(stmt_refs: &'a [BTreeSet<TempId>]) -> Self {
-        let mut indices_by_temp = BTreeMap::<TempId, Vec<usize>>::new();
-        for (index, refs) in stmt_refs.iter().enumerate() {
-            for temp in refs {
-                indices_by_temp.entry(*temp).or_default().push(index);
-            }
-        }
-
-        Self {
-            stmt_refs,
-            indices_by_temp,
-        }
-    }
-
-    pub(super) fn touches_before(&self, end: usize, temp: TempId) -> bool {
-        self.touches_in_range(0, end, temp)
-    }
-
-    pub(super) fn touches_after(&self, start: usize, temp: TempId) -> bool {
-        self.touches_in_range(start, self.stmt_refs.len(), temp)
-    }
-
-    pub(super) fn touches_in_range(&self, start: usize, end: usize, temp: TempId) -> bool {
-        let Some(indices) = self.indices_by_temp.get(&temp) else {
-            return false;
-        };
-        let offset = indices.partition_point(|index| *index < start);
-        indices.get(offset).is_some_and(|index| *index < end)
-    }
-
-    pub(super) fn extend_touch_indices_after(
-        &self,
-        start: usize,
-        temp: TempId,
-        indices: &mut BTreeSet<usize>,
-    ) {
-        let Some(touches) = self.indices_by_temp.get(&temp) else {
-            return;
-        };
-        let offset = touches.partition_point(|index| *index < start);
-        indices.extend(touches[offset..].iter().copied());
-    }
-}
+/// temp 的语句位置；读或提及的角色由输入集合定义。
+pub(super) type TempTouchIndex = crate::graph::PositionIndex<TempId>;
 
 /// 以每条语句的引用集合增量维护当前语句之外仍需保护的身份。
 ///

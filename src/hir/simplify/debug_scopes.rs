@@ -6,11 +6,11 @@
 //! 区间的终点直接落在当前 HIR block 的空终结 Return 上。此时声明到 Return 前之间没有
 //! 未表示的 low-IR 指令，Return 也不携带可能由物理 copy 间接依赖该 scope 的结果，因而
 //! 可以安全恢复尾部 `do ... end`；其它 PC/HIR value 布局不靠声明位置猜测。
+//! 接受的起点按当前语句位置递增；提交消费同一快照的段长，移动节点而不复制 HIR 子树。
 
 use crate::hir::common::{HirBlock, HirDebugScope, HirProto, HirStmt};
 
 use super::label_refs::label_references_by_stmt;
-use super::mention::stmts_mention_local;
 use super::walk::{HirRewritePass, rewrite_proto};
 
 pub(super) fn materialize_tail_debug_scopes_in_proto(proto: &mut HirProto) -> bool {
@@ -54,6 +54,7 @@ fn materialize_tail_scopes(
         )
         .unwrap_or(return_index);
 
+    // 已证明尾部仅为空 Return 或 Close(0) + 空 Return，不含任何 binding 引用。
     let label_refs = std::cell::OnceCell::new();
     let starts = block
         .stmts
@@ -74,10 +75,6 @@ fn materialize_tail_scopes(
             let range = ranges.next().flatten()?;
             (range.ends_before_return
                 && ranges.all(|candidate| candidate == Some(range))
-                && local_decl
-                    .bindings
-                    .iter()
-                    .all(|local| !stmts_mention_local(&block.stmts[body_end..], *local))
                 && !label_refs
                     .get_or_init(|| {
                         let mut refs = label_references_by_stmt(&block.stmts);
@@ -97,20 +94,26 @@ fn materialize_tail_scopes(
         return false;
     };
 
-    let mut rewritten = block.stmts[..first_start].to_vec();
+    let mut stmts = std::mem::take(&mut block.stmts).into_iter();
+    let mut rewritten: Vec<_> = stmts.by_ref().take(first_start).collect();
     rewritten.push(HirStmt::Block(Box::new(HirBlock {
-        stmts: nest_tail(&block.stmts, first_start, body_end, &starts[1..]),
+        stmts: nest_tail(&mut stmts, first_start, body_end, &starts[1..]),
     })));
-    rewritten.extend_from_slice(&block.stmts[body_end..]);
+    rewritten.extend(stmts);
     block.stmts = rewritten;
     true
 }
 
-fn nest_tail(stmts: &[HirStmt], start: usize, end: usize, nested_starts: &[usize]) -> Vec<HirStmt> {
+fn nest_tail(
+    stmts: &mut std::vec::IntoIter<HirStmt>,
+    start: usize,
+    end: usize,
+    nested_starts: &[usize],
+) -> Vec<HirStmt> {
     let Some((&next_start, rest)) = nested_starts.split_first() else {
-        return stmts[start..end].to_vec();
+        return stmts.by_ref().take(end - start).collect();
     };
-    let mut nested = stmts[start..next_start].to_vec();
+    let mut nested: Vec<_> = stmts.by_ref().take(next_start - start).collect();
     nested.push(HirStmt::Block(Box::new(HirBlock {
         stmts: nest_tail(stmts, next_start, end, rest),
     })));

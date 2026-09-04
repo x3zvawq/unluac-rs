@@ -316,8 +316,9 @@ fn scope_ranges(
                     // laminar 作用域，不为交错生命周期引入额外嵌套层。
                     break;
                 }
-                if scoped_locals + bindings.len() > scope_target && safe_end.is_some() {
+                if scoped_locals + bindings.len() > scope_target {
                     // 候选拒绝[PolicyBoundary]：单个生成作用域最多承载 64 个 local，控制缩进块密度并为外层活跃 binding 留余量。
+                    // 声明数只增不减；尚无合法终点时，继续扫描也只能形成超预算区间。
                     break;
                 }
                 scoped_locals += bindings.len();

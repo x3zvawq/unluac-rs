@@ -77,7 +77,7 @@ pub(super) fn candidate_temps(
         .filter(|temp| !is_reserved(*temp))
         .filter(|temp| !reads_before_assignment.contains(temp))
         .filter(|temp| {
-            if !temp_touches.touches_before(stmt_index, *temp)
+            if !temp_touches.has_before(temp, stmt_index)
                 || prefix_cfg
                     .as_ref()
                     .is_some_and(|cfg| cfg.fallthrough_temp_is_gc_inert(*temp))
@@ -92,7 +92,7 @@ pub(super) fn candidate_temps(
         })
         // 合流后没有任何后续 touch 的 branch temp 不形成跨语句
         // 源码 binding；dead-temps 会独立审计其中可删除的写，其余 effect/root 写仍保留原形。
-        .filter(|temp| temp_touches.touches_after(stmt_index + 1, *temp))
+        .filter(|temp| temp_touches.has_at_or_after(temp, stmt_index + 1))
         .collect()
 }
 
@@ -387,7 +387,7 @@ mod tests {
         candidate_temps(
             &owner_stmts,
             stmt,
-            &TempTouchIndex::new(&stmt_refs),
+            &TempTouchIndex::from_sets(&stmt_refs),
             0,
             &|_| false,
             HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Auto),
@@ -407,7 +407,7 @@ mod tests {
         candidate_temps(
             &stmts,
             &stmts[1],
-            &TempTouchIndex::new(&stmt_refs),
+            &TempTouchIndex::from_sets(&stmt_refs),
             1,
             &|_| false,
             HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Lua54),

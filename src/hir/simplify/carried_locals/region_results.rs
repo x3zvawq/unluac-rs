@@ -18,13 +18,18 @@ use crate::hir::common::{
 };
 use crate::hir::promotion::ProtoPromotionFacts;
 
+use super::super::local_shapes::{empty_single_local_decl_binding, initialized_single_local_decl};
 use super::super::walk::rewrite_stmts;
 use super::binding::{
     BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
     bindings_share_exact_home_slot, carry_binding_from_expr, carry_binding_from_lvalue,
 };
 use super::prune::{RedundantSelfAssignPrunePass, prune_empty_assign_stmts};
-use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
+use super::reads::{
+    binding_is_mentioned_in_stmts, bindings_are_mentioned_in_exprs,
+    bindings_are_mentioned_in_stmts, collect_binding_mentions_by_stmt,
+    collect_binding_mentions_in_expr,
+};
 use super::{HandoffIdentityFacts, RegionControlFacts};
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
@@ -46,24 +51,27 @@ use flow::{
 use parallel::*;
 use rewrites::*;
 
+// 当前块快照保留读写角色，私有性消费二者并集，loop live-out 消费首读/首写位置。
+// 例如 `r = r + 1` 在同一位置读写，不能当作不观察旧 result 的覆盖；成功改写后重建索引。
 pub(super) struct RegionResultIndex {
-    mentions: BTreeMap<CarryBinding, Vec<usize>>,
+    reads: crate::graph::PositionIndex<CarryBinding>,
+    writes: crate::graph::PositionIndex<CarryBinding>,
     local_declarations: BTreeMap<LocalId, usize>,
 }
 
 impl RegionResultIndex {
     pub(super) fn new(stmts: &[HirStmt]) -> RegionResultIndex {
-        let mut mentions = BTreeMap::<CarryBinding, Vec<usize>>::new();
-        for (index, bindings) in collect_binding_mentions_by_stmt(stmts)
-            .into_iter()
-            .enumerate()
-        {
-            for binding in bindings {
-                mentions.entry(binding).or_default().push(index);
-            }
-        }
+        let mut reads = crate::graph::PositionIndex::default();
+        let mut writes = crate::graph::PositionIndex::default();
         let mut local_declarations = BTreeMap::new();
         for (index, stmt) in stmts.iter().enumerate() {
+            let facts = binding_facts(std::slice::from_ref(stmt));
+            for binding in facts.reads {
+                reads.record(binding, index);
+            }
+            for binding in facts.writes.into_keys() {
+                writes.record(binding, index);
+            }
             if let HirStmt::LocalDecl(local_decl) = stmt {
                 for local in &local_decl.bindings {
                     local_declarations.entry(*local).or_insert(index);
@@ -71,7 +79,8 @@ impl RegionResultIndex {
             }
         }
         Self {
-            mentions,
+            reads,
+            writes,
             local_declarations,
         }
     }
@@ -88,8 +97,10 @@ impl RegionResultIndex {
     }
 
     fn is_private_after(&self, binding: CarryBinding, index: usize) -> bool {
-        self.mentions.get(&binding).is_none_or(|mentions| {
-            mentions.partition_point(|mention| *mention <= index) == mentions.len()
+        [&self.reads, &self.writes].into_iter().all(|positions| {
+            positions
+                .span(&binding)
+                .is_none_or(|(_, last)| last <= index)
         })
     }
 }
@@ -110,7 +121,11 @@ pub(super) fn collapse_inferred_if_result_chains(
     while cursor < block.stmts.len() {
         let declaration_start = cursor;
         let mut results = Vec::new();
-        while let Some(result) = block.stmts.get(cursor).and_then(empty_local) {
+        while let Some(result) = block
+            .stmts
+            .get(cursor)
+            .and_then(empty_single_local_decl_binding)
+        {
             results.push(CarryBinding::Local(result));
             cursor += 1;
         }
@@ -182,7 +197,7 @@ pub(super) fn collapse_inferred_if_result_chains(
                             block
                                 .stmts
                                 .get(*index)
-                                .and_then(initialized_local)
+                                .and_then(initialized_single_local_decl)
                                 .is_some_and(|(binding, _)| binding == *local)
                         })
                 }) {
@@ -290,7 +305,9 @@ pub(super) fn collapse_written_back_if_results(
     let mut folds = Vec::new();
     let mut index = 0;
     while index + 2 < block.stmts.len() {
-        let Some(result) = empty_local(&block.stmts[index]).map(CarryBinding::Local) else {
+        let Some(result) =
+            empty_single_local_decl_binding(&block.stmts[index]).map(CarryBinding::Local)
+        else {
             index += 1;
             continue;
         };
@@ -326,7 +343,7 @@ pub(super) fn collapse_written_back_if_results(
             continue;
         }
         if mention_counts.get(&result).copied() != Some(2)
-            || facts.reads.contains_key(&result)
+            || facts.reads.contains(&result)
             || facts.writes.get(&result).copied() != Some(exits.len())
             || (facts.writes.contains_key(&state) && !state_writes_preserve_result)
         {
@@ -446,13 +463,21 @@ fn try_collapse_seeded_if_results(
 ) -> bool {
     let mut cursor = index;
     let mut seeds = Vec::new();
-    while let Some((seed, _)) = block.stmts.get(cursor).and_then(initialized_local) {
+    while let Some((seed, _)) = block
+        .stmts
+        .get(cursor)
+        .and_then(initialized_single_local_decl)
+    {
         seeds.push(seed);
         cursor += 1;
     }
     let result_start = cursor;
     let mut results = Vec::new();
-    while let Some(result) = block.stmts.get(cursor).and_then(empty_local) {
+    while let Some(result) = block
+        .stmts
+        .get(cursor)
+        .and_then(empty_single_local_decl_binding)
+    {
         results.push(CarryBinding::Local(result));
         cursor += 1;
     }
@@ -525,7 +550,11 @@ fn try_collapse_inferred_if_results(
 ) -> bool {
     let mut cursor = index;
     let mut results = Vec::new();
-    while let Some(result) = block.stmts.get(cursor).and_then(empty_local) {
+    while let Some(result) = block
+        .stmts
+        .get(cursor)
+        .and_then(empty_single_local_decl_binding)
+    {
         results.push(CarryBinding::Local(result));
         cursor += 1;
     }
@@ -576,7 +605,7 @@ fn try_collapse_inferred_if_results(
             block
                 .stmts
                 .get(*declaration)
-                .and_then(empty_local)
+                .and_then(empty_single_local_decl_binding)
                 .is_some_and(|local| rewrites.contains_key(&CarryBinding::Local(local)))
         })
         .collect();
@@ -652,7 +681,7 @@ fn try_collapse_loop_results(
     let mut rewrite_ends = BTreeMap::new();
     let mut has_path_dependent_live_out = false;
     results.retain(
-        |result| match loop_result_rewrite_end(block, index, *result) {
+        |result| match loop_result_rewrite_end(block, index, *result, result_index) {
             LoopResultRewriteBoundary::Exact(rewrite_end) => {
                 rewrite_ends.insert(*result, rewrite_end);
                 true
@@ -677,7 +706,7 @@ fn try_collapse_loop_results(
     results.retain(|result| rewrite_ends.get(result) == Some(&rewrite_end));
 
     let loop_facts = binding_facts(std::slice::from_ref(stmt));
-    results.retain(|result| loop_facts.reads.get(result).copied().unwrap_or(0) == 0);
+    results.retain(|result| !loop_facts.reads.contains(result));
     if results.is_empty() {
         // 候选拒绝[SemanticBarrier:Lifetime]：loop 内读 result 会观察它在本次/上次迭代的独立 epoch，改名为 seed 会切换该读取。
         return false;
@@ -768,36 +797,21 @@ fn loop_result_rewrite_end(
     block: &HirBlock,
     loop_index: usize,
     result: CarryBinding,
+    result_index: &RegionResultIndex,
 ) -> LoopResultRewriteBoundary {
-    let mut saw_read = false;
-    for (index, stmt) in block.stmts.iter().enumerate().skip(loop_index + 1) {
-        let facts = binding_facts(std::slice::from_ref(stmt));
-        let reads = facts.reads.contains_key(&result);
-        if facts.writes.contains_key(&result) {
-            let direct_overwrite = matches!(stmt, HirStmt::Assign(assign)
-                if assign.targets.iter().any(|target| carry_binding_from_lvalue(target) == Some(result)));
-            if direct_overwrite {
-                return if saw_read || reads {
-                    LoopResultRewriteBoundary::Exact(index)
-                } else {
-                    LoopResultRewriteBoundary::NoLiveOut
-                };
-            }
-            let later_read = block.stmts[index + 1..].iter().any(|stmt| {
-                binding_facts(std::slice::from_ref(stmt))
-                    .reads
-                    .contains_key(&result)
-            });
-            return if saw_read || reads || later_read {
-                LoopResultRewriteBoundary::PathDependent
-            } else {
-                LoopResultRewriteBoundary::NoLiveOut
-            };
-        }
-        saw_read |= reads;
-    }
-    if saw_read {
-        LoopResultRewriteBoundary::Exact(block.stmts.len())
+    let start = loop_index + 1;
+    let Some(&read) = result_index.reads.positions_from(&result, start).first() else {
+        return LoopResultRewriteBoundary::NoLiveOut;
+    };
+    let Some(&write) = result_index.writes.positions_from(&result, start).first() else {
+        return LoopResultRewriteBoundary::Exact(block.stmts.len());
+    };
+    // Assign 没有嵌套语句，表达式遍历也不进入子 proto；其中被记录的 binding 写入
+    // 必为直接 target。同语句 RHS 先读旧值，因此 read == write 仍须保留 live-out。
+    if !matches!(block.stmts[write], HirStmt::Assign(_)) {
+        LoopResultRewriteBoundary::PathDependent
+    } else if read <= write {
+        LoopResultRewriteBoundary::Exact(write)
     } else {
         LoopResultRewriteBoundary::NoLiveOut
     }
@@ -1403,12 +1417,9 @@ mod tests {
             &block.stmts,
             CarryBinding::Local(LocalId(0)),
         ));
-        assert!(
-            block
-                .stmts
-                .iter()
-                .any(|stmt| { empty_local(stmt).is_some_and(|local| local == LocalId(1)) })
-        );
+        assert!(block.stmts.iter().any(|stmt| {
+            empty_single_local_decl_binding(stmt).is_some_and(|local| local == LocalId(1))
+        }));
         assert!(binding_is_mentioned_in_stmts(
             &block.stmts,
             CarryBinding::Local(LocalId(1)),

@@ -237,7 +237,7 @@ fn collapse_block_handoffs(
 
     loop {
         let action = {
-            let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+            let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
             let label_jumps = LabelJumpIndex::new(&block.stmts);
             captured_bindings = collect_captured_bindings(&block.stmts);
             let region_results = RegionResultIndex::new(&block.stmts);

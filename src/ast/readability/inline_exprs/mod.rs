@@ -120,11 +120,11 @@ fn adjacent_inline_rejection(
 }
 
 fn removable_inline_candidate<'a>(
-    stmts: &'a [AstStmt],
+    identified: Option<(InlineCandidate, &'a AstExpr)>,
     stmt_index: usize,
     write_index: &BindingWriteIndex,
 ) -> Option<(InlineCandidate, &'a AstExpr)> {
-    let (candidate, value) = inline_candidate(stmts.get(stmt_index)?)?;
+    let (candidate, value) = identified?;
     if write_index.has_write_after(stmt_index, candidate.binding()) {
         // 候选拒绝[SemanticBarrier:Scope]：删除仍有后续 direct write 的 local 声明，会把保留赋值渲染成外层/global 写入。
         return None;
@@ -201,7 +201,8 @@ fn rewrite_current_block(
             continue;
         };
 
-        let Some((candidate, value)) = removable_inline_candidate(&old_stmts, index, &write_index)
+        let Some((candidate, value)) =
+            removable_inline_candidate(run_facts.candidate_at(index), index, &write_index)
         else {
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
@@ -274,7 +275,7 @@ fn rewrite_current_block(
             // 无法再判断“整条链都只是脚手架”。让它留到 run-collapse 一次性处理，
             // 才能既收回 for-loop 里的机械局部，又保住 return 场景下的阶段 local。
             // 这只是同一个 inline-exprs transaction 内的 helper 交接：相邻单项 scanner
-            // 不拆开完整 run，尾部 collapse_adjacent_mechanical_alias_runs 会在本次调用中
+            // 不拆开完整 run，最后的机械 run 规划会在本次调用中
             // 重新判断整段是否值得且能够原子收回；它不是跨 layer 的候选拒绝。
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
@@ -440,20 +441,19 @@ fn rewrite_current_block(
         mutable_snapshots,
         trailing_condition.as_deref(),
     );
-    changed |= collapse_terminal_local_mechanical_runs(
-        block,
-        target,
-        options,
-        mutable_snapshots,
-        trailing_condition.as_deref(),
-    );
-    changed |= collapse_adjacent_mechanical_alias_runs(
-        block,
-        target,
-        options,
-        mutable_snapshots,
-        trailing_condition.as_deref(),
-    );
+    for kind in [
+        MechanicalRunKind::TerminalLocal,
+        MechanicalRunKind::FollowingStmt,
+    ] {
+        changed |= collapse_mechanical_runs(
+            block,
+            kind,
+            target,
+            options,
+            mutable_snapshots,
+            trailing_condition.as_deref(),
+        );
+    }
     changed
 }
 
@@ -536,9 +536,11 @@ fn collapse_stable_copy_aliases(
     let mut removed = vec![false; stmts.len()];
 
     for (candidate_index, is_removed) in removed.iter_mut().enumerate() {
-        let Some((candidate, value)) =
-            removable_inline_candidate(&stmts, candidate_index, &write_index)
-        else {
+        let Some((candidate, value)) = removable_inline_candidate(
+            inline_candidate(&stmts[candidate_index]),
+            candidate_index,
+            &write_index,
+        ) else {
             continue;
         };
         if [candidate_index + 1, candidate_index + 2]
@@ -1397,8 +1399,9 @@ mod tests {
             assert!(!candidate.initializer_may_affect_collectable_lifetime());
         }
 
-        assert!(collapse_adjacent_mechanical_alias_runs(
+        assert!(collapse_mechanical_runs(
             &mut block,
+            MechanicalRunKind::FollowingStmt,
             lua54_target(),
             ReadabilityOptions::default(),
             &MutableSnapshotNames::new(),

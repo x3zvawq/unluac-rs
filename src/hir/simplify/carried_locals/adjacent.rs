@@ -21,9 +21,7 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::expr_facts::expr_truthiness;
-use super::super::local_shapes::{
-    empty_single_local_decl_binding, initialized_single_local_decl_binding,
-};
+use super::super::local_shapes::{empty_single_local_decl_binding, initialized_single_local_decl};
 use super::super::mention::{expr_mentions_local, stmt_captures_local, stmts_mention_local};
 use super::super::walk::rewrite_stmts;
 use super::HandoffIdentityFacts;
@@ -43,7 +41,11 @@ pub(super) fn try_collapse_guarded_local_update(
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
 ) -> bool {
-    let Some((next, value)) = block.stmts.get(index).and_then(initialized_local) else {
+    let Some((next, value)) = block
+        .stmts
+        .get(index)
+        .and_then(initialized_single_local_decl)
+    else {
         return false;
     };
     let next_binding = CarryBinding::Local(next);
@@ -157,7 +159,7 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
     identity_facts: &HandoffIdentityFacts,
     safety: HirExprSafety,
 ) -> bool {
-    let Some(seed) = initialized_single_local_decl_binding(&block.stmts[index]) else {
+    let Some((seed, _)) = initialized_single_local_decl(&block.stmts[index]) else {
         return false;
     };
     let Some(carried) = block
@@ -753,23 +755,6 @@ fn lvalue_mentions_local(lvalue: &HirLValue, local: LocalId) -> bool {
 fn call_mentions_local(call: &HirCallExpr, local: LocalId) -> bool {
     expr_mentions_local(&call.callee, local)
         || call.args.iter().any(|arg| expr_mentions_local(arg, local))
-}
-
-fn initialized_local(stmt: &HirStmt) -> Option<(LocalId, &HirExpr)> {
-    let HirStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    let [value] = local_decl.values.fixed.as_slice() else {
-        return None;
-    };
-    local_decl
-        .values
-        .tail
-        .is_none()
-        .then_some((*binding, value))
 }
 
 fn exact_binding_copy(stmts: &[HirStmt], value: LocalId) -> Option<CarryBinding> {

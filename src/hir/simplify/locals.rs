@@ -647,7 +647,7 @@ fn collect_plans(
     let temp_debug_scopes = ctx.temp_debug_scopes;
     let stmt_temp_reads = collect_temp_reads_by_stmt(&block.stmts);
     let mut plans = Vec::new();
-    let temp_touches = TempTouchIndex::new(stmt_temp_refs);
+    let temp_touches = TempTouchIndex::from_sets(stmt_temp_refs);
     let lifetime_snapshot = RootLifetimeFacts::new(lifetime_stmts);
     let call_root_lifetimes = collect_call_root_lifetimes(
         &lifetime_snapshot,
@@ -846,7 +846,7 @@ fn collect_plans(
                 let group = BTreeSet::from([*temp]);
                 if slot_candidates.get(&home) != Some(&local)
                     || outer_uses_temp(*temp)
-                    || temp_touches.touches_before(decl_index, *temp)
+                    || temp_touches.has_before(temp, decl_index)
                     || has_label_flow
                 {
                     // debug scope 身份不代表当前 HIR 声明可见；也不能只改子块的写入，
@@ -943,7 +943,7 @@ fn collect_plans(
             // 已被祖先映射或当前 plan 认领的 temp 不再形成新候选。
             continue;
         }
-        if temp_touches.touches_before(decl_index, root_temp) {
+        if temp_touches.has_before(&root_temp, decl_index) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：backedge/goto 可让文本前方读取同一
             // TempId 的入口或上一轮值；在此定义点新建 local 会把该读取切到未初始化 binding。
             continue;
@@ -1329,13 +1329,13 @@ fn collect_promotion_group(
     root_temp: TempId,
     facts: &ProtoPromotionFacts,
     is_reserved: &dyn Fn(TempId) -> bool,
-    temp_touches: &TempTouchIndex<'_>,
+    temp_touches: &TempTouchIndex,
 ) -> PromotionGroup {
     let mut temps = BTreeSet::from([root_temp]);
     let mut removable_aliases = BTreeSet::new();
     let mut touching_stmt_indices = BTreeSet::new();
     let mut pending_indices = BTreeSet::new();
-    temp_touches.extend_touch_indices_after(decl_index + 1, root_temp, &mut pending_indices);
+    pending_indices.extend(temp_touches.positions_from(&root_temp, decl_index + 1));
 
     while let Some(future_index) = pending_indices.pop_first() {
         if removable_aliases.contains(&future_index) {
@@ -1364,16 +1364,12 @@ fn collect_promotion_group(
                 // `next = f(carried); carried = next` 是 loop 回边写回，不是可删除
                 // alias。若 alias 的旧值已在 root 定义语句中参与求值，合并二者会删掉
                 // 下一轮所需的写回，只留下每轮都读取入口 seed 的局部变量。
-                && !temp_touches.touches_in_range(decl_index, future_index, *alias_temp)
+                && temp_touches.last_in(alias_temp, decl_index..future_index).is_none()
         });
         if let Some(alias_temp) = alias {
             temps.insert(alias_temp);
             removable_aliases.insert(future_index);
-            temp_touches.extend_touch_indices_after(
-                future_index + 1,
-                alias_temp,
-                &mut pending_indices,
-            );
+            pending_indices.extend(temp_touches.positions_from(&alias_temp, future_index + 1));
         } else {
             touching_stmt_indices.insert(future_index);
         }

@@ -7,17 +7,36 @@
 //! `HirStmt::Block`，让后面的 AST lowering 自然落成 `do ... end`。一个 `close from rA`
 //! 会覆盖所有不小于 A 的 TBC 槽位，区间 owner 会消费词法范围内实际覆盖自己的 cleanup，
 //! 避免 fixed-point 每轮重复包块。
+//! 重建沿已证明的嵌套区间传递 cleanup owner 集合，一次过滤已有子树；例如外层 r2、
+//! 内层 r3 的作用域会共同消费内部的 Close(2)/Close(3)，无需包块后再逐层扫描。
+//! 这份集合只描述当前正在物化的词法 owner，不替代 Structure 的 label TBC active-set。
+//! 同一 block 的候选共享按需构建的位置事实；cleanup 只扫描语句，binding 活动还包括
+//! 声明、循环绑定和 capture 表达式。例如嵌套块内的 Close(r2) 发布在该块的外层语句位置。
+//! 直属 label 序列由边界保护、外部跳转与 active-set 连续性查询共用；活跃 origin
+//! 仍来自 Structure 发布的 label payload，不从 cleanup 的物理顺序反推。
+//! 直属 cleanup 单独发布覆盖阈值，范围查询不逐候选重扫无关语句或高槽 close；
+//! 它与嵌套 cleanup 的精确槽位摘要承担不同职责。
 
-use std::collections::BTreeSet;
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet},
+};
+
+use crate::graph::{LabelReferenceIndex, PositionIndex};
 
 use crate::hir::common::{
     HirBlock, HirDebugScope, HirExpr, HirLValue, HirLabelId, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::transformer::InstrRef;
 
-use super::label_refs::count_label_references;
+use super::label_refs::label_references_by_stmt;
 use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_proto};
-use crate::hir::visit::{HirVisitor, visit_proto, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_proto, visit_stmt_structure, visit_stmts};
+
+mod closes;
+mod labels;
+use closes::DirectCloseIndex;
+use labels::DirectLabelIndex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopeInterval {
@@ -33,29 +52,99 @@ struct ScopeEnd {
     covering_close_indices: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ScopeBinding {
     Local(LocalId),
     Temp(TempId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScopeStart {
+struct ScopeCandidate {
     start: usize,
     origin: InstrRef,
     reg_index: usize,
     binding: ScopeBinding,
+    epoch_end: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct ScopeActivity {
-    mentions_binding: bool,
-    closes_scope: bool,
+struct TbcEpoch {
+    origin: InstrRef,
+    tbc_index: usize,
+    end: usize,
 }
 
-impl ScopeActivity {
-    fn any(self) -> bool {
-        self.mentions_binding || self.closes_scope
+struct ScopeFacts<'a> {
+    stmts: &'a [HirStmt],
+    candidates: Vec<ScopeCandidate>,
+    labels: OnceCell<LabelReferenceIndex<HirLabelId>>,
+    direct_labels: OnceCell<DirectLabelIndex<'a>>,
+    direct_closes: OnceCell<DirectCloseIndex<'a>>,
+    closes: OnceCell<PositionIndex<usize>>,
+    bindings: OnceCell<PositionIndex<ScopeBinding>>,
+}
+
+impl<'a> ScopeFacts<'a> {
+    fn new(stmts: &'a [HirStmt]) -> Self {
+        Self {
+            stmts,
+            candidates: scope_candidates(stmts),
+            labels: OnceCell::new(),
+            direct_labels: OnceCell::new(),
+            direct_closes: OnceCell::new(),
+            closes: OnceCell::new(),
+            bindings: OnceCell::new(),
+        }
+    }
+
+    fn label_references(&self) -> &LabelReferenceIndex<HirLabelId> {
+        self.labels
+            .get_or_init(|| LabelReferenceIndex::new(&label_references_by_stmt(self.stmts)))
+    }
+
+    fn direct_labels(&self) -> &DirectLabelIndex<'a> {
+        self.direct_labels
+            .get_or_init(|| DirectLabelIndex::new(self.stmts))
+    }
+
+    fn direct_closes(&self) -> &DirectCloseIndex<'a> {
+        self.direct_closes
+            .get_or_init(|| DirectCloseIndex::new(self.stmts))
+    }
+
+    fn last_close(&self, scope: ScopeCandidate) -> Option<usize> {
+        self.closes
+            .get_or_init(|| {
+                let mut positions = PositionIndex::default();
+                for (index, stmt) in self.stmts.iter().enumerate() {
+                    visit_stmt_structure(stmt, &mut |stmt| {
+                        // Close(0) 的终结意义由当前 epoch 末尾或 Return 后继决定；
+                        // 子树位置摘要只发布非零槽位的精确 cleanup。
+                        if let HirStmt::Close(close) = stmt
+                            && close.from_reg != 0
+                        {
+                            positions.record(close.from_reg, index);
+                        }
+                    });
+                }
+                positions
+            })
+            .last_in(&scope.reg_index, scope.start + 2..scope.epoch_end)
+    }
+
+    fn last_binding_activity(&self, scope: ScopeCandidate) -> Option<usize> {
+        self.bindings
+            .get_or_init(|| {
+                let mut collector = BindingActivityCollector {
+                    positions: PositionIndex::default(),
+                    owner: 0,
+                };
+                for (index, stmt) in self.stmts.iter().enumerate() {
+                    collector.owner = index;
+                    visit_stmts(std::slice::from_ref(stmt), &mut collector);
+                }
+                collector.positions
+            })
+            .last_in(&scope.binding, scope.start + 2..scope.epoch_end)
     }
 }
 
@@ -107,33 +196,31 @@ fn collect_direct_pending_tbc_boundary_labels(
     stmts: &[HirStmt],
     labels: &mut BTreeSet<HirLabelId>,
 ) {
-    for index in 0..stmts.len() {
-        let Some(scope) = scope_start(stmts, index) else {
+    let facts = ScopeFacts::new(stmts);
+    let mut covered_end = 0;
+    for &scope in &facts.candidates {
+        // 候选起点升序，已覆盖的区间无需再次检查 cleanup 或枚举 label。
+        if scope.epoch_end <= covered_end {
             continue;
-        };
+        }
         let search_start = scope.start + 2;
-        let epoch_end = tbc_epoch_end(stmts, search_start, scope.origin, scope.reg_index);
-        let epoch_stmts = &stmts[..epoch_end];
-        let has_pending_close = epoch_stmts.iter().enumerate().skip(search_start).any(
-            |(stmt_index, stmt)| match stmt {
-                HirStmt::Close(close) if close.from_reg != 0 => close.from_reg <= scope.reg_index,
-                HirStmt::Close(close) => {
-                    close.from_reg == 0
-                        && terminal_close_zero_end(epoch_stmts, stmt_index).is_some()
-                }
-                _ => scope_activity_in_stmt(stmt, scope.binding, scope.reg_index).closes_scope,
-            },
-        );
-        if !has_pending_close {
+        let has_pending_close = facts
+            .direct_closes()
+            .scope_closes(search_start..scope.epoch_end, scope.reg_index)
+            .next()
+            .is_some();
+        if !has_pending_close && facts.last_close(scope).is_none() {
             continue;
         }
 
-        labels.extend(epoch_stmts.iter().skip(search_start).filter_map(|stmt| {
-            let HirStmt::Label(label) = stmt else {
-                return None;
-            };
-            Some(label.id)
-        }));
+        labels.extend(
+            facts
+                .direct_labels()
+                .in_range(search_start.max(covered_end)..scope.epoch_end)
+                .iter()
+                .map(|(_, label)| label.id),
+        );
+        covered_end = scope.epoch_end;
     }
 }
 
@@ -160,64 +247,50 @@ fn materialize_block(
     temp_debug_scopes: &[Option<usize>],
     debug_scopes: &[Option<HirDebugScope>],
 ) -> bool {
-    let Some(rewritten) = rewrite_stmt_slice(
+    let intervals = collect_scope_intervals(
         &block.stmts,
         local_debug_scopes,
         temp_debug_scopes,
         debug_scopes,
-    ) else {
-        return false;
-    };
-    block.stmts = rewritten;
+    );
+    if intervals.is_empty() {
+        return remove_terminal_close_zero(&mut block.stmts);
+    }
+
+    let owned_close_indices = intervals
+        .iter()
+        .flat_map(|interval| interval.covering_close_indices.iter().copied())
+        .collect();
+    let len = block.stmts.len();
+    // 区间已在原始序列上证明；提交只移动节点，递归消费仍按原始下标前进。
+    // 无需为父块再次复制已经处理完的子树。
+    block.stmts = rebuild_slice(
+        &mut std::mem::take(&mut block.stmts).into_iter(),
+        0,
+        len,
+        &intervals,
+        &mut 0,
+        &mut BTreeSet::new(),
+        &owned_close_indices,
+    );
+    remove_terminal_close_zero(&mut block.stmts);
     true
 }
 
-fn rewrite_stmt_slice(
-    stmts: &[HirStmt],
-    local_debug_scopes: &[Option<usize>],
-    temp_debug_scopes: &[Option<usize>],
-    debug_scopes: &[Option<HirDebugScope>],
-) -> Option<Vec<HirStmt>> {
-    let intervals =
-        collect_scope_intervals(stmts, local_debug_scopes, temp_debug_scopes, debug_scopes);
-    let mut changed = !intervals.is_empty();
-    let mut rewritten = if intervals.is_empty() {
-        stmts.to_vec()
-    } else {
-        let mut cursor = 0;
-        let owned_close_indices = intervals
-            .iter()
-            .flat_map(|interval| interval.covering_close_indices.iter().copied())
-            .collect();
-        rebuild_slice(
-            stmts,
-            0,
-            stmts.len(),
-            &intervals,
-            &mut cursor,
-            None,
-            &owned_close_indices,
-        )
-    };
-    changed |= remove_terminal_close_zero(&mut rewritten);
-    changed.then_some(rewritten)
-}
-
 fn remove_terminal_close_zero(stmts: &mut Vec<HirStmt>) -> bool {
-    let mut changed = false;
-    let mut index = 0;
-    while index < stmts.len() {
-        let is_close_zero = matches!(&stmts[index], HirStmt::Close(close) if close.from_reg == 0);
-        let is_terminal =
-            index + 1 == stmts.len() || matches!(stmts.get(index + 1), Some(HirStmt::Return(_)));
-        if is_close_zero && is_terminal {
-            stmts.remove(index);
-            changed = true;
-        } else {
-            index += 1;
+    let len = stmts.len();
+    let mut retained = 0;
+    for index in 0..len {
+        let remove = matches!(&stmts[index], HirStmt::Close(close) if close.from_reg == 0)
+            && terminal_close_zero_end(stmts, index).is_some();
+        if !remove {
+            stmts.swap(retained, index);
+            retained += 1;
         }
     }
-    changed
+    // 只移动到已读取的位置，判定仍看到原始后继；不在同轮回溯删除连续 Close(0)。
+    stmts.truncate(retained);
+    retained != len
 }
 
 fn collect_scope_intervals(
@@ -226,16 +299,15 @@ fn collect_scope_intervals(
     temp_debug_scopes: &[Option<usize>],
     debug_scopes: &[Option<HirDebugScope>],
 ) -> Vec<ScopeInterval> {
-    let mut intervals: Vec<_> = (0..stmts.len())
-        .filter_map(|index| {
-            let scope_start = scope_start(stmts, index)?;
+    let facts = ScopeFacts::new(stmts);
+    let intervals = facts
+        .candidates
+        .iter()
+        .copied()
+        .filter_map(|scope_start| {
             let scope_end = find_scope_end(
-                stmts,
-                scope_start.start,
-                scope_start.start + 2,
-                scope_start.binding,
-                scope_start.origin,
-                scope_start.reg_index,
+                &facts,
+                scope_start,
                 binding_debug_scope_ends_before_return(
                     scope_start.binding,
                     local_debug_scopes,
@@ -256,25 +328,51 @@ fn collect_scope_intervals(
         })
         .collect();
 
-    intervals.sort_by_key(|interval| (interval.start, interval.end));
-
     retain_well_nested_interval_components(intervals)
 }
 
-fn scope_start(stmts: &[HirStmt], index: usize) -> Option<ScopeStart> {
-    match (stmts.get(index), stmts.get(index + 1)) {
-        (Some(definition), Some(HirStmt::ToBeClosed(to_be_closed))) => {
-            binding_from_expr(&to_be_closed.value)
-                .filter(|binding| stmt_defines_tbc_binding(definition, *binding))
-                .map(|binding| ScopeStart {
-                    start: index,
-                    origin: to_be_closed.origin,
-                    reg_index: to_be_closed.reg_index,
-                    binding,
-                })
+/// epoch 是候选搜索的上界，不是最终词法终点。逆序继承同槽同 origin 的边界，
+/// 遇到不同 origin 才切断；未能配对声明的 TBC 仍参与这个判定。
+/// 候选按起点升序发布，保护区间的并集可以只向右扩展。
+fn scope_candidates(stmts: &[HirStmt]) -> Vec<ScopeCandidate> {
+    let mut next_epochs = BTreeMap::<usize, TbcEpoch>::new();
+    let mut candidates = Vec::new();
+    for (index, stmt) in stmts.iter().enumerate().rev() {
+        let HirStmt::ToBeClosed(tbc) = stmt else {
+            continue;
+        };
+        let epoch_end = next_epochs.get(&tbc.reg_index).map_or(stmts.len(), |next| {
+            if next.origin == tbc.origin {
+                next.end
+            } else {
+                next.tbc_index - 1
+            }
+        });
+        next_epochs.insert(
+            tbc.reg_index,
+            TbcEpoch {
+                origin: tbc.origin,
+                tbc_index: index,
+                end: epoch_end,
+            },
+        );
+        let Some(start) = index.checked_sub(1) else {
+            continue;
+        };
+        if let Some(binding) = binding_from_expr(&tbc.value)
+            .filter(|binding| stmt_defines_tbc_binding(&stmts[start], *binding))
+        {
+            candidates.push(ScopeCandidate {
+                start,
+                origin: tbc.origin,
+                reg_index: tbc.reg_index,
+                binding,
+                epoch_end,
+            });
         }
-        _ => None,
     }
+    candidates.reverse();
+    candidates
 }
 
 fn stmt_defines_tbc_binding(stmt: &HirStmt, binding: ScopeBinding) -> bool {
@@ -303,87 +401,74 @@ fn binding_from_expr(expr: &HirExpr) -> Option<ScopeBinding> {
 }
 
 fn find_scope_end(
-    stmts: &[HirStmt],
-    scope_start: usize,
-    start_index: usize,
-    binding: ScopeBinding,
-    origin: InstrRef,
-    reg_index: usize,
+    facts: &ScopeFacts<'_>,
+    scope: ScopeCandidate,
     debug_scope_ends_before_return: bool,
 ) -> Option<ScopeEnd> {
-    let epoch_end = tbc_epoch_end(stmts, start_index, origin, reg_index);
-    let epoch_stmts = &stmts[..epoch_end];
+    let ScopeCandidate {
+        start: scope_start,
+        binding: _,
+        origin,
+        reg_index,
+        epoch_end,
+    } = scope;
+    let start_index = scope_start + 2;
+    let epoch_stmts = &facts.stmts[..epoch_end];
 
-    match externally_entered_scope_end(epoch_stmts, scope_start, start_index, reg_index) {
+    match externally_entered_scope_end(facts, scope) {
         Ok(Some(scope_end)) => return Some(scope_end),
         Ok(None) => {}
         Err(()) => return None,
     }
 
-    let mut saw_close = false;
-    let mut last_activity = None;
     // 一个寄存器可能在 scope 内有多次 `close from rX`（如 goto 反复进入的
     // iteration early-exit），真正的词法 scope 结束应是能覆盖到当前寄存器的
     // 最“靠后”的一次 close 事件（可能是精确匹配，也可能是更外层 scope 的
     // 组合 close）。早期的 close 只是 scope 内部的 iteration 边界，把它们
     // 当成 scope 末端会把后续仍在同一 scope 内的表达式错误地挤出块外。
-    let mut last_scope_close = None;
+    let label_scope_end = facts
+        .direct_labels()
+        .active_scope_end(start_index..epoch_end, origin)
+        .ok()?;
+    let last_close = facts.last_close(scope);
+    let mut last_activity = last_close.map(|index| index + 1);
     let mut covering_close_indices = Vec::new();
-    let label_scope_end = active_label_scope_end(epoch_stmts, start_index, origin).ok()?;
-
-    for (index, stmt) in epoch_stmts.iter().enumerate().skip(start_index) {
-        if let HirStmt::Close(close) = stmt {
-            if close.from_reg == 0 {
-                if let Some(end) = terminal_close_zero_end(epoch_stmts, index) {
-                    last_scope_close = Some(index);
-                    covering_close_indices.push(index);
-                    let terminal_return_has_values = matches!(
-                        epoch_stmts.get(index + 1),
-                        Some(HirStmt::Return(return_stmt)) if !return_stmt.values.is_empty()
-                    );
-                    if !debug_scope_ends_before_return || terminal_return_has_values {
-                        last_activity = Some(end);
-                    }
-                    saw_close = true;
-                }
-            } else if close.from_reg <= reg_index {
-                last_scope_close = Some(index);
-                covering_close_indices.push(index);
-                saw_close = true;
+    for index in facts
+        .direct_closes()
+        .scope_closes(start_index..epoch_end, reg_index)
+    {
+        covering_close_indices.push(index);
+        if matches!(epoch_stmts[index], HirStmt::Close(ref close) if close.from_reg == 0) {
+            let terminal_return_has_values = matches!(
+                epoch_stmts.get(index + 1),
+                Some(HirStmt::Return(return_stmt)) if !return_stmt.values.is_empty()
+            );
+            if !debug_scope_ends_before_return || terminal_return_has_values {
+                last_activity = last_activity.max(terminal_close_zero_end(epoch_stmts, index));
             }
         }
-
-        let activity = scope_activity_in_stmt(stmt, binding, reg_index);
-        if activity.any() {
-            last_activity = Some(index + 1);
-        }
-        saw_close |= activity.closes_scope;
     }
-
-    if let Some(close_idx) = last_scope_close {
+    if last_close.is_none() && covering_close_indices.is_empty() {
+        return None;
+    }
+    last_activity = last_activity.max(facts.last_binding_activity(scope).map(|index| index + 1));
+    if let Some(&close_idx) = covering_close_indices.last() {
         // composite close 同时终结多个嵌套 TBC scope；所有 interval 会在重建前一次收集，
         // 因此最内层可以消费这条 VM cleanup，外层仍由自己的词法 block 结束来表达。
         let end = label_scope_end.map_or(close_idx + 1, |label_end| label_end.max(close_idx + 1));
         let end = last_activity.map_or(end, |la| la.max(end));
-        // 同一 TBC scope 内可能有多个 goto/分支 cleanup，只消费最终词法区间实际覆盖的
-        // close；区间之外的 cleanup 继续由对应 sibling/outer interval 接管。
-        covering_close_indices.retain(|index| *index < end);
         return Some(ScopeEnd {
             end,
             covering_close_indices,
         });
     }
 
-    if saw_close {
-        // 分支内 cleanup 与 active label 分别提供区间下界；二者同时存在时必须
-        // 覆盖较远边界，不能因先发现 cleanup 而丢弃前层已证明的 scope 延续。
-        last_activity.max(label_scope_end).map(|end| ScopeEnd {
-            end,
-            covering_close_indices,
-        })
-    } else {
-        None
-    }
+    // 分支内 cleanup 与 active label 分别提供区间下界；二者同时存在时必须
+    // 覆盖较远边界，不能因先发现 cleanup 而丢弃前层已证明的 scope 延续。
+    last_activity.max(label_scope_end).map(|end| ScopeEnd {
+        end,
+        covering_close_indices,
+    })
 }
 
 fn binding_debug_scope_ends_before_return(
@@ -403,23 +488,6 @@ fn binding_debug_scope_ends_before_return(
         .is_some_and(|scope| scope.ends_before_return)
 }
 
-fn tbc_epoch_end(
-    stmts: &[HirStmt],
-    start_index: usize,
-    origin: InstrRef,
-    reg_index: usize,
-) -> usize {
-    stmts
-        .iter()
-        .enumerate()
-        .skip(start_index)
-        .find_map(|(index, stmt)| {
-            matches!(stmt, HirStmt::ToBeClosed(next) if next.reg_index == reg_index && next.origin != origin)
-                .then_some(index.saturating_sub(1))
-        })
-        .unwrap_or(stmts.len())
-}
-
 fn terminal_close_zero_end(stmts: &[HirStmt], index: usize) -> Option<usize> {
     if index + 1 == stmts.len() {
         Some(stmts.len())
@@ -430,79 +498,45 @@ fn terminal_close_zero_end(stmts: &[HirStmt], index: usize) -> Option<usize> {
     }
 }
 
-/// label 的 TBC active-set 是 Structure 冻结的词法事实。物理 layout 中较早的 exit
-/// cleanup 只属于对应 goto path；只要后面的 label 仍携带同一 origin，整个连续片段
-/// 就必须留在该 `<close>` block 内，不能把那条 cleanup 当作线性 scope 末端。
-fn active_label_scope_end(
-    stmts: &[HirStmt],
-    start_index: usize,
-    origin: InstrRef,
-) -> Result<Option<usize>, ()> {
-    let mut inactive_before_active = false;
-    let mut first_inactive_after_active = None;
-    let mut last_active_end = None;
-    for (index, stmt) in stmts.iter().enumerate().skip(start_index) {
-        let HirStmt::Label(label) = stmt else {
-            continue;
-        };
-        if label.tbc_barriers.contains(&origin) {
-            if inactive_before_active || first_inactive_after_active.is_some() {
-                // 候选拒绝[SemanticBarrier:Scope]：`TBC; ::outside::; ::inside::` 允许
-                // scope 外 goto 命中 outside，`inside -> outside -> inside` 又要求同一
-                // origin 跨过 scope 外入口；两种 active-set 都不能用单一 Lua block 表达。
-                return Err(());
-            }
-            last_active_end = Some(index + 1);
-        } else if last_active_end.is_some() {
-            first_inactive_after_active.get_or_insert(index);
-        } else {
-            inactive_before_active = true;
-        }
-    }
-    // 没有 inactive label 时，active-set 只证明到最后一个 active label；显式 Close
-    // 和 binding activity 决定其后的真实词法终点，不能把无关尾语句扩进资源作用域。
-    Ok(first_inactive_after_active.or(last_active_end))
-}
-
 fn externally_entered_scope_end(
-    stmts: &[HirStmt],
-    scope_start: usize,
-    search_start: usize,
-    reg_index: usize,
+    facts: &ScopeFacts<'_>,
+    scope: ScopeCandidate,
 ) -> Result<Option<ScopeEnd>, ()> {
-    // 声明前已经存在的 goto 不能跳进 `<close>` local 的词法块；若目标 block
-    // 以匹配的 VM Close 开始，该 label 就是作用域硬边界。其他可消费 Close 只取
-    // 块内真实 goto 出口，避免同一物理寄存器后续复用时误删 sibling cleanup。
-    let external_targets = goto_targets(&stmts[..scope_start]);
-    let Some((label_index, external_target)) = stmts
+    let scope_start = scope.start;
+    let search_start = scope_start + 2;
+    let reg_index = scope.reg_index;
+    let label_references = facts.label_references();
+    let labels = facts.direct_labels();
+    // 声明前的 goto 不能跳进新建的 <close> 作用域；目标边界仍由真实 cleanup 布局决定。
+    let Some(&(label_index, external_target)) = labels
+        .in_range(search_start..scope.epoch_end)
         .iter()
-        .enumerate()
-        .skip(search_start)
-        .find_map(|(index, stmt)| match stmt {
-            HirStmt::Label(label) if external_targets.contains(&label.id) => {
-                Some((index, label.id))
-            }
-            _ => None,
-        })
+        .find(|(_, label)| label_references.has_goto_before(scope_start, label.id))
     else {
         return Ok(None);
     };
-    let scope_end = scope_boundary_for_external_label(stmts, search_start, label_index, reg_index)?;
+    let scope_end = scope_boundary_for_external_label(
+        facts,
+        search_start,
+        label_index,
+        reg_index,
+        scope.epoch_end,
+    )?;
     let end = scope_end.end;
 
-    let mut exit_targets = goto_targets(&stmts[scope_start..end]);
-    exit_targets.insert(external_target);
     let mut covering_close_indices = scope_end.covering_close_indices;
-    for index in stmts
-        .iter()
-        .enumerate()
-        .skip(end)
-        .filter_map(|(index, stmt)| match stmt {
-            HirStmt::Label(label) if exit_targets.contains(&label.id) => Some(index),
-            _ => None,
-        })
-    {
-        covering_close_indices.extend(covering_closes_after_label(stmts, index, reg_index)?);
+    for &(index, label) in labels.in_range(end..scope.epoch_end) {
+        // 其它 cleanup 只取块内真实 goto 出口，避免误删物理寄存器后续复用的 sibling。
+        if label.id == external_target.id
+            || label_references.has_goto_in(scope_start..end, label.id)
+        {
+            covering_close_indices.extend(covering_closes_after_label(
+                facts,
+                index,
+                reg_index,
+                scope.epoch_end,
+            )?);
+        }
     }
     covering_close_indices.sort_unstable();
     covering_close_indices.dedup();
@@ -513,12 +547,13 @@ fn externally_entered_scope_end(
 }
 
 fn scope_boundary_for_external_label(
-    stmts: &[HirStmt],
+    facts: &ScopeFacts<'_>,
     search_start: usize,
     label_index: usize,
     reg_index: usize,
+    epoch_end: usize,
 ) -> Result<ScopeEnd, ()> {
-    let closes_after = covering_closes_after_label(stmts, label_index, reg_index)?;
+    let closes_after = covering_closes_after_label(facts, label_index, reg_index, epoch_end)?;
     if !closes_after.is_empty() {
         return Ok(ScopeEnd {
             end: label_index,
@@ -526,122 +561,95 @@ fn scope_boundary_for_external_label(
         });
     }
 
-    // 外部 goto 的目标不能被包进新建的 `<close>` local 作用域；这里只接受能证明
-    // cleanup 位于目标 label 之前或紧邻其后的布局。
-    // PUC 5.4 也会把离开 `<close>` 块的 cleanup 放在目标 label 之前。label 本身
-    // 已在局部作用域之外，interval 必须截止到第一条 cleanup，并把这段 cleanup
-    // 作为词法块 owner 消费，不能把外部 goto 的目标一起包进 do block。
-    let last_close = (search_start..label_index).rev().find(|index| {
-        matches!(stmts[*index], HirStmt::Close(ref close) if close.from_reg != 0 && close.from_reg <= reg_index)
-    });
-    if let Some(last_close) = last_close {
-        return Ok(ScopeEnd {
-            end: last_close + 1,
-            covering_close_indices: (search_start..=last_close)
-                .filter(|index| {
-                    matches!(stmts[*index], HirStmt::Close(ref close) if close.from_reg != 0 && close.from_reg <= reg_index)
-                })
-                .collect(),
-        });
-    }
-
+    // 外部 goto 不能进入新建 local 的作用域；label 前的 cleanup 由词法 owner 消费，
+    // 终点截止在最后一条 cleanup 之后，不能把外部目标包进 do block。
+    let covering_close_indices: Vec<_> = facts
+        .direct_closes()
+        .nonzero_closes(search_start..label_index, reg_index)
+        .collect();
     Ok(ScopeEnd {
-        end: label_index,
-        covering_close_indices: Vec::new(),
+        end: covering_close_indices
+            .last()
+            .map_or(label_index, |index| index + 1),
+        covering_close_indices,
     })
 }
 
 fn covering_closes_after_label(
-    stmts: &[HirStmt],
+    facts: &ScopeFacts<'_>,
     label_index: usize,
     reg_index: usize,
+    epoch_end: usize,
 ) -> Result<Vec<usize>, ()> {
-    let segment: Vec<_> = stmts
-        .iter()
-        .enumerate()
-        .skip(label_index + 1)
-        .take_while(|(_, stmt)| !matches!(stmt, HirStmt::Label(_)))
-        .collect();
-    let prefix_len = segment
-        .iter()
-        .take_while(|(_, stmt)| {
-            matches!(stmt, HirStmt::Close(close) if close.from_reg != 0 && close.from_reg <= reg_index)
-        })
-        .count();
-    if segment[prefix_len..].iter().any(|(_, stmt)| {
-        matches!(stmt, HirStmt::Close(close) if close.from_reg != 0 && close.from_reg <= reg_index)
-    }) {
-        // 候选拒绝[SemanticBarrier:EvalOrder]：`goto L; ::L:: side(); Close r1`
-        // 不能改成 goto 离开 `<close>` block；后者会把可观察的 __close 提前到 side()
-        // 之前。regress334 的 side-effect/close 日志固定该顺序合同。
-        return Err(());
-    }
-    Ok(segment[..prefix_len]
-        .iter()
-        .map(|(index, _)| *index)
-        .collect())
-}
-
-fn goto_targets(stmts: &[HirStmt]) -> BTreeSet<HirLabelId> {
-    count_label_references(stmts).into_keys().collect()
-}
-
-fn well_nested_scope_intervals(intervals: &[ScopeInterval]) -> bool {
-    let mut stack = Vec::<&ScopeInterval>::new();
-
-    for interval in intervals {
-        while let Some(top) = stack.last() {
-            if interval.start >= top.end {
-                stack.pop();
-            } else {
-                break;
-            }
+    let start = label_index + 1;
+    let end = facts
+        .direct_labels()
+        .in_range(start..epoch_end)
+        .first()
+        .map_or(epoch_end, |(index, _)| *index);
+    let mut closes = Vec::new();
+    for index in facts.direct_closes().nonzero_closes(start..end, reg_index) {
+        if index != start + closes.len() {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：`goto L; ::L:: side(); Close r1`
+            // 不能改成 goto 离开 `<close>` block；后者会把可观察的 __close 提前到 side()
+            // 之前。regress334 的 side-effect/close 日志固定该顺序合同。
+            return Err(());
         }
-
-        if let Some(parent) = stack.last()
-            && interval.end > parent.end
-        {
-            return false;
-        }
-
-        stack.push(interval);
+        closes.push(index);
     }
-
-    true
+    Ok(closes)
 }
 
-fn retain_well_nested_interval_components(intervals: Vec<ScopeInterval>) -> Vec<ScopeInterval> {
-    let mut retained = Vec::with_capacity(intervals.len());
+fn retain_well_nested_interval_components(mut intervals: Vec<ScopeInterval>) -> Vec<ScopeInterval> {
+    let mut retained = 0;
     let mut component_start = 0;
-    while component_start < intervals.len() {
-        let mut component_end = component_start + 1;
-        let mut covered_end = intervals[component_start].end;
-        while component_end < intervals.len() && intervals[component_end].start < covered_end {
-            covered_end = covered_end.max(intervals[component_end].end);
-            component_end += 1;
+    let mut covered_end = 0;
+    let mut nested_ends = Vec::new();
+    let mut valid_component = true;
+    for index in 0..intervals.len() {
+        let start = intervals[index].start;
+        let end = intervals[index].end;
+        if start >= covered_end {
+            component_start = retained;
+            nested_ends.clear();
+            valid_component = true;
         }
-
-        let component = &intervals[component_start..component_end];
-        if well_nested_scope_intervals(component) {
-            retained.extend_from_slice(component);
-        } else {
+        // 被拒绝分量的后续区间仍可扩大连通范围，不能提前恢复接受。
+        covered_end = covered_end.max(end);
+        if !valid_component {
+            continue;
+        }
+        while nested_ends.last().is_some_and(|&end| end <= start) {
+            nested_ends.pop();
+        }
+        if nested_ends
+            .last()
+            .is_some_and(|&parent_end| end > parent_end)
+        {
             // 候选拒绝[SemanticBarrier:Resource]：`TBC a; TBC b; Close(a); use(b); Close(b)`
             // 的交叉资源区间无法表示成嵌套 Lua block；强行合并会把 a 延寿到 use(b) 之后，
             // 强行嵌套则会在 a 之前关闭 b。屏障只覆盖这个重叠连通分量；后续不相交
             // 的资源区间仍可独立物化。
+            retained = component_start;
+            valid_component = false;
+            continue;
         }
-        component_start = component_end;
+        nested_ends.push(end);
+        // 只移动到已读位置；交叉时回退前缀长度，整个分量共同接受或拒绝。
+        intervals.swap(retained, index);
+        retained += 1;
     }
-    retained
+    intervals.truncate(retained);
+    intervals
 }
 
 fn rebuild_slice(
-    stmts: &[HirStmt],
+    stmts: &mut std::vec::IntoIter<HirStmt>,
     start: usize,
     end: usize,
     intervals: &[ScopeInterval],
     cursor: &mut usize,
-    active_scope: Option<&ScopeInterval>,
+    cleanup_owners: &mut BTreeSet<usize>,
     owned_close_indices: &BTreeSet<usize>,
 ) -> Vec<HirStmt> {
     let mut rewritten = Vec::new();
@@ -656,35 +664,31 @@ fn rebuild_slice(
             let interval = &intervals[*cursor];
             if interval.start == index && interval.end <= end {
                 *cursor += 1;
+                let introduced_owner = cleanup_owners.insert(interval.reg_index);
                 let inner = rebuild_slice(
                     stmts,
                     interval.start,
                     interval.end,
                     intervals,
                     cursor,
-                    Some(interval),
+                    cleanup_owners,
                     owned_close_indices,
                 );
-                let mut block_stmt = HirStmt::Block(Box::new(HirBlock { stmts: inner }));
-                strip_matching_close_from_stmt(
-                    &mut block_stmt,
-                    active_scope.map(|scope| scope.reg_index),
-                );
-                rewritten.push(block_stmt);
+                if introduced_owner {
+                    cleanup_owners.remove(&interval.reg_index);
+                }
+                rewritten.push(HirStmt::Block(Box::new(HirBlock { stmts: inner })));
                 index = interval.end;
                 continue;
             }
         }
 
-        let mut cloned = stmts[index].clone();
+        let mut stmt = stmts
+            .next()
+            .expect("validated scope intervals partition the statement slice");
         let close_owned_by_scope = owned_close_indices.contains(&index);
-        if !close_owned_by_scope
-            && strip_matching_close_from_stmt(
-                &mut cloned,
-                active_scope.map(|scope| scope.reg_index),
-            )
-        {
-            rewritten.push(cloned);
+        if !close_owned_by_scope && strip_matching_close_from_stmt(&mut stmt, cleanup_owners) {
+            rewritten.push(stmt);
         }
         index += 1;
     }
@@ -692,84 +696,39 @@ fn rebuild_slice(
     rewritten
 }
 
-fn strip_matching_close_from_stmt(stmt: &mut HirStmt, active_scope_reg: Option<usize>) -> bool {
+fn strip_matching_close_from_stmt(stmt: &mut HirStmt, cleanup_owners: &BTreeSet<usize>) -> bool {
+    if cleanup_owners.is_empty() {
+        return true;
+    }
     if let HirStmt::Close(close) = stmt {
-        return close.from_reg == 0 || active_scope_reg != Some(close.from_reg);
+        return close.from_reg == 0 || !cleanup_owners.contains(&close.from_reg);
     }
 
     for_each_nested_block_mut(stmt, &mut |block| {
-        strip_matching_close_from_block(block, active_scope_reg);
+        block
+            .stmts
+            .retain_mut(|stmt| strip_matching_close_from_stmt(stmt, cleanup_owners));
     });
     true
 }
 
-fn strip_matching_close_from_block(block: &mut HirBlock, active_scope_reg: Option<usize>) {
-    block
-        .stmts
-        .retain_mut(|stmt| strip_matching_close_from_stmt(stmt, active_scope_reg));
+struct BindingActivityCollector {
+    positions: PositionIndex<ScopeBinding>,
+    owner: usize,
 }
 
-fn scope_activity_in_stmt(
-    stmt: &HirStmt,
-    binding: ScopeBinding,
-    reg_index: usize,
-) -> ScopeActivity {
-    let mut collector = ScopeActivityCollector {
-        binding,
-        reg_index,
-        activity: ScopeActivity::default(),
-    };
-    visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.activity
-}
-
-struct ScopeActivityCollector {
-    binding: ScopeBinding,
-    reg_index: usize,
-    activity: ScopeActivity,
-}
-
-impl ScopeActivityCollector {
-    fn binding_matches_local(&self, local: LocalId) -> bool {
-        self.binding == ScopeBinding::Local(local)
-    }
-
-    fn binding_matches_temp(&self, temp: TempId) -> bool {
-        self.binding == ScopeBinding::Temp(temp)
-    }
-}
-
-impl HirVisitor for ScopeActivityCollector {
+impl HirVisitor for BindingActivityCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
-        match stmt {
-            HirStmt::LocalDecl(local_decl) => {
-                self.activity.mentions_binding |= local_decl
-                    .bindings
-                    .iter()
-                    .copied()
-                    .any(|local| self.binding_matches_local(local));
-            }
-            HirStmt::Close(close) => {
-                // Close(0) 可能只是函数终结协议；它只有在当前 slice 的末尾或 Return
-                // 前才能由词法 scope 吸收，不能让深度不敏感的 activity visitor 决定。
-                self.activity.closes_scope |=
-                    close.from_reg != 0 && close.from_reg == self.reg_index;
-            }
-            HirStmt::NumericFor(numeric_for) => {
-                self.activity.mentions_binding |= self.binding_matches_local(numeric_for.binding);
-            }
-            HirStmt::GenericFor(generic_for) => {
-                self.activity.mentions_binding |= generic_for
-                    .bindings
-                    .iter()
-                    .copied()
-                    .any(|local| self.binding_matches_local(local));
-            }
+        let locals: &[LocalId] = match stmt {
+            HirStmt::LocalDecl(decl) => &decl.bindings,
+            HirStmt::NumericFor(for_stmt) => std::slice::from_ref(&for_stmt.binding),
+            HirStmt::GenericFor(for_stmt) => &for_stmt.bindings,
             HirStmt::Assign(_)
             | HirStmt::GlobalDecl(_)
             | HirStmt::TableSetList(_)
             | HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
+            | HirStmt::Close(_)
             | HirStmt::CallStmt(_)
             | HirStmt::Return(_)
             | HirStmt::If(_)
@@ -779,57 +738,30 @@ impl HirVisitor for ScopeActivityCollector {
             | HirStmt::Break
             | HirStmt::Continue
             | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
+            | HirStmt::Label(_) => &[],
+        };
+        for &local in locals {
+            self.positions
+                .record(ScopeBinding::Local(local), self.owner);
         }
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {
-        match expr {
-            HirExpr::LocalRef(local) => {
-                self.activity.mentions_binding |= self.binding_matches_local(*local);
-            }
-            HirExpr::TempRef(temp) => {
-                self.activity.mentions_binding |= self.binding_matches_temp(*temp);
-            }
-            HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::ParamRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::GlobalRef(_)
-            | HirExpr::VarArg
-            | HirExpr::Unresolved(_)
-            | HirExpr::TableAccess(_)
-            | HirExpr::Unary(_)
-            | HirExpr::Binary(_)
-            | HirExpr::LogicalAnd(_)
-            | HirExpr::LogicalOr(_)
-            | HirExpr::Decision(_)
-            | HirExpr::Call(_)
-            | HirExpr::TableConstructor(_)
-            | HirExpr::Closure(_) => {}
+        if let Some(binding) = binding_from_expr(expr) {
+            self.positions.record(binding, self.owner);
         }
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        match lvalue {
-            HirLValue::Temp(temp) => {
-                self.activity.mentions_binding |= self.binding_matches_temp(*temp);
-            }
-            HirLValue::Local(local) => {
-                self.activity.mentions_binding |= self.binding_matches_local(*local);
-            }
+        let binding = match lvalue {
+            HirLValue::Temp(temp) => ScopeBinding::Temp(*temp),
+            HirLValue::Local(local) => ScopeBinding::Local(*local),
             HirLValue::Param(_)
             | HirLValue::Upvalue(_)
             | HirLValue::Global(_)
-            | HirLValue::TableAccess(_) => {}
-        }
+            | HirLValue::TableAccess(_) => return,
+        };
+        self.positions.record(binding, self.owner);
     }
 }
 

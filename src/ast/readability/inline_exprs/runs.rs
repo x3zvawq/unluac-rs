@@ -1,4 +1,6 @@
 //! 折叠相邻调用、lookup 与机械 local run；依赖父模块的 candidate/use/eval-order 合同，不负责单次 alias inline；例如把 recovered callee/receiver 链收回调用或赋值 sink。
+//! 机械规划共用读取与事务检查，以消费点身份区分持续 local root 和普通语句；例如
+//! `local a=x; local b=a; local c=b; use(c)` 保留 c，而 return 消费点可收回整个准备段。
 
 use std::collections::BTreeMap;
 
@@ -263,9 +265,11 @@ pub(super) fn collapse_adjacent_call_alias_runs(
                 &removed,
                 &mut remaining_run_uses,
             );
-            let Some((candidate, value)) =
-                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
-            else {
+            let Some((candidate, value)) = removable_inline_candidate(
+                run_facts.candidate_at(candidate_index),
+                candidate_index,
+                &write_index,
+            ) else {
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, rewrite_policy)
@@ -339,8 +343,13 @@ pub(super) fn collapse_adjacent_call_alias_runs(
         // 单项只接受 method fact 已经冻结后的直接 receiver binding；若迭代器仍引用
         // 待物化 temp，则留到下一轮与整个调用准备包一起收回。
         let allows_single_receiver_alias = collapsed_count == 1
-            && (single_generic_for_method_receiver_alias(&old_stmts, index, run_end)
-                || single_call_callee_alias(&old_stmts, index, run_end));
+            && run_end == index + 1
+            && run_facts
+                .candidate_at(index)
+                .is_some_and(|(candidate, value)| {
+                    single_generic_for_method_receiver_alias(candidate, value, &old_stmts[run_end])
+                        || single_call_callee_alias(candidate, value, &old_stmts[run_end])
+                });
         if collapsed_count >= 2 || allows_single_receiver_alias {
             if eval_order::run_preserves_eval_order(
                 &old_stmts,
@@ -388,18 +397,15 @@ pub(super) fn stmt_is_generic_for_call_alias_sink(stmt: &AstStmt) -> bool {
     )
 }
 
-pub(super) fn single_generic_for_method_receiver_alias(
-    stmts: &[AstStmt],
-    run_start: usize,
-    sink_index: usize,
+fn single_generic_for_method_receiver_alias(
+    candidate: InlineCandidate,
+    value: &AstExpr,
+    sink: &AstStmt,
 ) -> bool {
-    let Some((candidate, AstExpr::Var(source))) = (sink_index == run_start + 1)
-        .then(|| inline_candidate(&stmts[run_start]))
-        .flatten()
-    else {
+    let AstExpr::Var(source) = value else {
         return false;
     };
-    let AstStmt::GenericFor(generic_for) = &stmts[sink_index] else {
+    let AstStmt::GenericFor(generic_for) = sink else {
         return false;
     };
     let [AstExpr::MethodCall(call)] = generic_for.iterator.as_slice() else {
@@ -421,18 +427,7 @@ pub(super) fn single_generic_for_method_receiver_alias(
             .any(|binding| matches!(binding, AstBindingRef::Temp(_)))
 }
 
-pub(super) fn single_call_callee_alias(
-    stmts: &[AstStmt],
-    run_start: usize,
-    sink_index: usize,
-) -> bool {
-    let Some((candidate, value)) = (sink_index == run_start + 1)
-        .then(|| inline_candidate(&stmts[run_start]))
-        .flatten()
-    else {
-        // 这不是紧邻 local + terminal call 的单项 run。
-        return false;
-    };
+fn single_call_callee_alias(candidate: InlineCandidate, value: &AstExpr, sink: &AstStmt) -> bool {
     if candidate.origin() != super::super::super::common::AstLocalOrigin::Recovered
         || !matches!(value, AstExpr::Call(_) | AstExpr::MethodCall(_))
     {
@@ -440,7 +435,7 @@ pub(super) fn single_call_callee_alias(
         // 证明；其它 origin 或非 call RHS 仍需普通多项 run 证明。
         return false;
     }
-    let callee_matches = match &stmts[sink_index] {
+    let callee_matches = match sink {
         AstStmt::CallStmt(call_stmt) => {
             let AstCallKind::Call(call) = &call_stmt.call else {
                 // 候选拒绝[SemanticBarrier:EvalOrder]：method call 的隐式 self/lookup 顺序不属于
@@ -483,8 +478,8 @@ pub(super) fn single_call_callee_alias(
         // 候选拒绝[SemanticBarrier:Scope]：callee 必须正是该 local binding，避免误吞其它变量。
         return false;
     }
-    if matches!(&stmts[sink_index], AstStmt::CallStmt(_))
-        && !proven_method_call_consumes_callee(&stmts[sink_index], candidate.binding())
+    if matches!(sink, AstStmt::CallStmt(_))
+        && !proven_method_call_consumes_callee(sink, candidate.binding())
     {
         // 候选拒绝[SemanticBarrier:Lifetime]：普通 call callee 槽不证明 producer local
         // 跨调用持根；只有同一 occurrence 的 HIR method-callee handoff 可以放行。
@@ -567,9 +562,11 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
                 &removed,
                 &mut remaining_run_uses,
             );
-            let Some((candidate, value)) =
-                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
-            else {
+            let Some((candidate, value)) = removable_inline_candidate(
+                run_facts.candidate_at(candidate_index),
+                candidate_index,
+                &write_index,
+            ) else {
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::ExtendedCallChain)
@@ -673,8 +670,16 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
     changed
 }
 
-pub(super) fn collapse_adjacent_mechanical_alias_runs(
+/// 机械准备段的消费点；两轮各自创建快照，terminal local 改写后才处理普通消费点。
+#[derive(Clone, Copy)]
+pub(super) enum MechanicalRunKind {
+    TerminalLocal,
+    FollowingStmt,
+}
+
+pub(super) fn collapse_mechanical_runs(
     block: &mut AstBlock,
+    kind: MechanicalRunKind,
     target: AstTargetDialect,
     options: ReadabilityOptions,
     mutable_snapshots: &MutableSnapshotNames,
@@ -691,34 +696,53 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
     while index < old_stmts.len() {
         let run_end = run_facts.end(index);
 
-        if run_end == index
-            || run_end >= old_stmts.len()
-            || !stmt_can_absorb_mechanical_run(&old_stmts[run_end])
-        {
+        let sink = match kind {
+            MechanicalRunKind::FollowingStmt
+                if run_end > index
+                    && run_end < old_stmts.len()
+                    && stmt_can_absorb_mechanical_run(&old_stmts[run_end]) =>
+            {
+                Some((run_end, None))
+            }
+            MechanicalRunKind::TerminalLocal
+                if run_end > index + 1 && run_end < old_stmts.len() =>
+            {
+                // 末尾 local 必须仍被后缀读取，才能作为持续存活的源码锚点。
+                // 零-use 的 lookup/dynamic initializer 仍有求值事件，不能借此删除。
+                run_facts
+                    .binding_at(run_end - 1)
+                    .filter(|binding| use_index.count_uses_in_suffix(run_end, *binding) != 0)
+                    .map(|binding| (run_end - 1, Some(binding)))
+            }
+            _ => None,
+        };
+        let Some((sink_index, terminal_binding)) = sink else {
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
-        }
+        };
 
         let mut rewritten_sink = None;
-        let mut removed = vec![false; run_end - index];
+        let mut removed = vec![false; sink_index - index];
         let mut collapsed_count = 0usize;
         let mut has_non_lookup_piece = false;
         let mut has_dependent_lookup_piece = false;
         let mut remaining_run_uses = BTreeMap::new();
 
-        for candidate_index in (index..run_end).rev() {
+        for candidate_index in (index..sink_index).rev() {
             add_next_kept_stmt_uses(
                 &use_index,
                 candidate_index,
-                run_end,
+                sink_index,
                 index,
                 &removed,
                 &mut remaining_run_uses,
             );
-            let Some((candidate, value)) =
-                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
-            else {
+            let Some((candidate, value)) = removable_inline_candidate(
+                run_facts.candidate_at(candidate_index),
+                candidate_index,
+                &write_index,
+            ) else {
                 continue;
             };
             if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
@@ -730,20 +754,17 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 // 候选拒绝[PolicyBoundary]：Error residual 是项目保留的 best-effort 失败证据。
                 continue;
             }
-            let run_uses = use_index.count_uses_in_range(
-                candidate_index + 1,
-                run_end + 1,
-                candidate.binding(),
-            );
-            if run_uses == 0 {
-                // 声明未被当前 run 或 sink 读取，不是该 transaction 的成员。
+            let suffix_uses =
+                use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
+            if suffix_uses == 0 {
+                // 声明在后缀没有读取，不是该 transaction 的成员。
                 continue;
             }
-            if run_uses > 1 {
-                // 候选拒绝[SemanticBarrier:EvalCount]：候选在 run+sink 中多次读取时，替换会复制 RHS。
+            if suffix_uses > 1 {
+                // 候选拒绝[SemanticBarrier:EvalCount]：候选在后缀多次读取时，不能删除声明或复制 RHS。
                 continue;
             }
-            if use_index.count_uses_in_suffix(run_end + 1, candidate.binding()) != 0 {
+            if use_index.count_uses_in_suffix(sink_index + 1, candidate.binding()) != 0 {
                 // 候选拒绝[SemanticBarrier:Scope]：binding 在 sink 后仍活跃，删除声明会使后缀读取失去 local 身份。
                 continue;
             }
@@ -754,15 +775,28 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 // 候选拒绝[SemanticBarrier:EvalOrder]：保留的中间语句仍读取候选快照，不能只在最终 sink 替换。
                 continue;
             }
-            let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end]);
-            if !matches!(current_sink, AstStmt::While(_) | AstStmt::Repeat(_))
-                && candidate.initializer_may_affect_collectable_lifetime()
-                && !mechanical_sink_preserves_root_lifetime(current_sink, candidate.binding())
-            {
-                // 候选拒绝[SemanticBarrier:Lifetime]：把 recovered lookup/object/动态运算结果搬入非终态 sink 会在 sink 后提前释放唯一强 root（regress_355）。
-                // 候选拒绝[TargetConstraint]：只有目标已定义的 literal 运算可证明结果为标量；动态 operand 仍可能经元方法返回 collectable。
-                // 候选拒绝[SemanticBarrier:EvalOrder]：fresh table/container 在字段前先分配，不能充当 producer 的透明 handoff；否则会交换 allocation/GC 事件。
-                continue;
+            let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[sink_index]);
+            if candidate.initializer_may_affect_collectable_lifetime() {
+                let preserves_root = match terminal_binding {
+                    Some(binding) => {
+                        terminal_local_hands_off_root(current_sink, candidate.binding())
+                            && !write_index.has_write_after(sink_index, binding)
+                    }
+                    None => {
+                        matches!(current_sink, AstStmt::While(_) | AstStmt::Repeat(_))
+                            || mechanical_sink_preserves_root_lifetime(
+                                current_sink,
+                                candidate.binding(),
+                            )
+                    }
+                };
+                if !preserves_root {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：terminal local 只接受无后续写入的
+                    // 顶层 copy 持续持有同一对象；普通消费点须证明强 root 未提前结束。
+                    // 候选拒绝[SemanticBarrier:EvalOrder]：table/container 的分配、weak 或
+                    // alias 清空不能当作 local root 的透明交棒；regress355 固定此边界。
+                    continue;
+                }
             }
             let mut trial_sink = current_sink.clone();
             if rewrite_stmt_use_sites_with_policy(
@@ -775,15 +809,18 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 rewritten_sink = Some(trial_sink);
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
-                has_non_lookup_piece |= !candidate::is_lookup_inline_expr(value);
-                has_dependent_lookup_piece = has_dependent_lookup_piece
-                    || (candidate::is_lookup_inline_expr(value)
-                        && run_facts.reads_other_candidate(value, index, candidate.binding()));
+                if terminal_binding.is_none() {
+                    has_non_lookup_piece |= !candidate::is_lookup_inline_expr(value);
+                    has_dependent_lookup_piece = has_dependent_lookup_piece
+                        || (candidate::is_lookup_inline_expr(value)
+                            && run_facts.reads_other_candidate(value, index, candidate.binding()));
+                }
             }
         }
 
         if let Some(rewritten_sink_ref) = rewritten_sink.as_ref() {
-            let display_worthy = has_non_lookup_piece
+            let display_worthy = terminal_binding.is_some()
+                || has_non_lookup_piece
                 || stmt_prefers_pure_lookup_run_collapse(rewritten_sink_ref)
                 || (has_dependent_lookup_piece
                     && stmt_prefers_dependent_lookup_run_collapse(rewritten_sink_ref));
@@ -791,7 +828,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 if eval_order::run_preserves_eval_order(
                     &old_stmts,
                     index,
-                    run_end,
+                    sink_index,
                     &removed,
                     target,
                     mutable_snapshots,
@@ -804,7 +841,7 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                         &removed,
                         rewritten_sink.expect("collapsed mechanical run must rewrite its sink"),
                     );
-                    index = run_end + 1;
+                    index = sink_index + 1;
                     continue;
                 }
                 // 候选拒绝[SemanticBarrier:EvalOrder]：已形成足量且值得展示的 mechanical
@@ -815,161 +852,24 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
             }
         }
 
-        stmt_plan.push(PlannedStmt::Original(index));
-        index += 1;
+        index = retain_failed_mechanical_run(&mut stmt_plan, index, run_end, collapsed_count);
     }
 
     block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed
 }
 
-pub(super) fn collapse_terminal_local_mechanical_runs(
-    block: &mut AstBlock,
-    target: AstTargetDialect,
-    options: ReadabilityOptions,
-    mutable_snapshots: &MutableSnapshotNames,
-    trailing_condition: Option<&AstExpr>,
-) -> bool {
-    let old_stmts = std::mem::take(&mut block.stmts);
-    let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
-    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
-    let run_facts = CandidateRunFacts::new(&old_stmts);
-    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
-    let mut changed = false;
-    let mut index = 0;
-
-    while index < old_stmts.len() {
-        let run_end = run_facts.end(index);
-
-        if run_end <= index + 1 || run_end >= old_stmts.len() {
-            stmt_plan.push(PlannedStmt::Original(index));
-            index += 1;
-            continue;
-        }
-
-        let Some((sink_candidate, _)) = inline_candidate(&old_stmts[run_end - 1]) else {
-            stmt_plan.push(PlannedStmt::Original(index));
-            index += 1;
-            continue;
-        };
-        // 这里只处理“run 末尾这个 local 自己还会跨语句活下去”的情况：
-        // 前面的 recovered local 只是为了把最终表达式拆成多个机械阶段，
-        // 但末尾这个 binding 仍然是后续语句要继续引用的源码锚点。
-        if use_index.count_uses_in_suffix(run_end, sink_candidate.binding()) == 0 {
-            // 末项没有后续读取，不是 terminal-local 源码锚点。
-            // cleanup 已先删除无事件值或把裸 call 降为 CallStmt；若声明仍存在，其 lookup/
-            // dynamic initializer 必须保留求值，不能假借 terminal-local run 删除。
-            stmt_plan.push(PlannedStmt::Original(index));
-            index += 1;
-            continue;
-        }
-
-        let mut rewritten_sink = None;
-        let mut removed = vec![false; run_end - index - 1];
-        let mut collapsed_count = 0usize;
-        let mut remaining_run_uses = BTreeMap::new();
-
-        for candidate_index in (index..(run_end - 1)).rev() {
-            add_next_kept_stmt_uses(
-                &use_index,
-                candidate_index,
-                run_end - 1,
-                index,
-                &removed,
-                &mut remaining_run_uses,
-            );
-            let Some((candidate, value)) =
-                removable_inline_candidate(&old_stmts, candidate_index, &write_index)
-            else {
-                continue;
-            };
-            if !candidate.allows_expr_with_policy(value, InlinePolicy::MechanicalRun) {
-                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted 不能删除（regress_351）；
-                // 候选拒绝[SemanticBarrier:Lifetime]：PhysicalRoot 不能脱离原 root（regress_353）；
-                // call/受限 table/标量 vararg 的调用消费点由 call-run owner 处理；直接 return 的 table/closure 由相邻 owner 处理。
-                // 候选拒绝[SemanticBarrier:ValueArity]：其它 call/vararg 尾位可能重新打开多值。
-                // 候选拒绝[SemanticBarrier:Capture]：nested closure 会改变分配/capture 时点。
-                // 候选拒绝[PolicyBoundary]：Error residual 是项目保留的 best-effort 失败证据。
-                continue;
-            }
-            let suffix_uses =
-                use_index.count_uses_in_suffix(candidate_index + 1, candidate.binding());
-            if suffix_uses == 0 {
-                // 候选拒绝[SemanticBarrier:EvalCount]：cleanup 已先处理可丢弃值与裸 call；
-                // 残留零-use lookup/dynamic initializer 没有 rewrite site，删除会少一次求值。
-                // 候选拒绝[SemanticBarrier:Metamethod]：动态读取/运算可能触发协议。
-                continue;
-            }
-            if suffix_uses > 1 {
-                // 候选拒绝[SemanticBarrier:EvalCount]：多次 use 会复制 producer。
-                continue;
-            }
-            if use_index.count_uses_in_suffix(run_end, candidate.binding()) != 0 {
-                // 候选拒绝[SemanticBarrier:Scope]：前置 binding 在 terminal local 之后仍活跃，不能随准备阶段一起删除。
-                continue;
-            }
-            if remaining_run_uses
-                .get(&candidate.binding())
-                .is_some_and(|count| *count != 0)
-            {
-                // 候选拒绝[SemanticBarrier:EvalOrder]：保留的 run 片段仍读取候选，不能只重写 terminal local。
-                continue;
-            }
-            let current_sink = rewritten_sink.as_ref().unwrap_or(&old_stmts[run_end - 1]);
-            if candidate.initializer_may_affect_collectable_lifetime()
-                && (!terminal_local_hands_off_root(current_sink, candidate.binding())
-                    || write_index.has_write_after(run_end - 1, sink_candidate.binding()))
-            {
-                // 候选拒绝[SemanticBarrier:Lifetime]：nested terminal initializer 可能在后续语句前释放 recovered lookup/object root（regress_355）；只有无后续写入的顶层 copy 仍直接持有同一对象。
-                // 候选拒绝[SemanticBarrier:Lifetime]：table/container 后续可被设为 weak 或经 alias 清空，不能等同于 local 的持续强 root。
-                continue;
-            }
-            let mut trial_sink = current_sink.clone();
-            if rewrite_stmt_use_sites_with_policy(
-                &mut trial_sink,
-                candidate,
-                value,
-                options,
-                InlinePolicy::MechanicalRun,
-            ) {
-                rewritten_sink = Some(trial_sink);
-                removed[candidate_index - index] = true;
-                collapsed_count += 1;
-            }
-        }
-
-        if collapsed_count >= 2 {
-            if eval_order::run_preserves_eval_order(
-                &old_stmts,
-                index,
-                run_end - 1,
-                &removed,
-                target,
-                mutable_snapshots,
-                &write_index,
-            ) {
-                changed = true;
-                plan_collapsed_run(
-                    &mut stmt_plan,
-                    index,
-                    &removed,
-                    rewritten_sink.expect("collapsed terminal-local run must rewrite its sink"),
-                );
-                index = run_end;
-                continue;
-            }
-            // 候选拒绝[SemanticBarrier:EvalOrder]：足量 terminal-local rewrite 的事件前缀
-            // 不一致时，会改变调用、lookup 或可变快照的次序。
-        } else if collapsed_count != 0 {
-            // 候选拒绝[PolicyBoundary]：少于两个机械阶段不做 terminal-local 展示折叠。
-        }
-
-        stmt_plan.push(PlannedStmt::Original(index));
-        index += 1;
-    }
-
-    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
-    changed
+fn retain_failed_mechanical_run(
+    plan: &mut Vec<PlannedStmt>,
+    start: usize,
+    end: usize,
+    collapsed_count: usize,
+) -> usize {
+    // 固定快照中，逆序准入只依赖当前候选与已处理后缀；缩短前缀不会增加可合并项数。
+    // 少于两项时整段后缀都达不到提交门槛，原样发布一次；其它失败仍逐起点重试。
+    let next = if collapsed_count < 2 { end } else { start + 1 };
+    plan.extend((start..next).map(PlannedStmt::Original));
+    next
 }
 
 pub(super) fn stmt_can_absorb_mechanical_run(stmt: &AstStmt) -> bool {

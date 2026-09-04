@@ -6,8 +6,9 @@
 //!
 //! 例子：
 //! - `local l0` → `Some(l0)`
+//! - `local l0 = f()` → `Some((l0, f()))`，绑定与固定单值 RHS 由同一次识别发布。
 
-use crate::hir::common::{HirStmt, LocalId};
+use crate::hir::common::{HirExpr, HirStmt, LocalId};
 
 pub(super) fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
     let HirStmt::LocalDecl(local_decl) = stmt else {
@@ -19,18 +20,18 @@ pub(super) fn empty_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId>
     local_decl.values.is_empty().then_some(*binding)
 }
 
-pub(super) fn initialized_single_local_decl_binding(stmt: &HirStmt) -> Option<LocalId> {
+pub(super) fn initialized_single_local_decl(stmt: &HirStmt) -> Option<(LocalId, &HirExpr)> {
     let HirStmt::LocalDecl(local_decl) = stmt else {
         return None;
     };
     let [binding] = local_decl.bindings.as_slice() else {
         return None;
     };
-    let [_value] = local_decl.values.fixed.as_slice() else {
+    let [value] = local_decl.values.fixed.as_slice() else {
         return None;
     };
     if local_decl.values.tail.is_some() {
         return None;
     }
-    Some(*binding)
+    Some((*binding, value))
 }

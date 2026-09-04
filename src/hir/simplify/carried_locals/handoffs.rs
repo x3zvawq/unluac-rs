@@ -47,7 +47,7 @@ pub(super) fn try_collapse_handoff_at(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    temp_touches: &TempTouchIndex<'_>,
+    temp_touches: &TempTouchIndex,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
     safety: &mut HandoffSafety<'_>,
@@ -96,7 +96,7 @@ fn try_collapse_pure_binding_handoffs(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    temp_touches: &TempTouchIndex<'_>,
+    temp_touches: &TempTouchIndex,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
     safety: &mut HandoffSafety<'_>,
@@ -124,7 +124,7 @@ fn try_collapse_pure_binding_handoffs(
     if seed.rewrites.iter().any(|rewrite| {
         outer_bindings.contains(&CarryBinding::Temp(rewrite.from))
             || outer_bindings.contains(&rewrite.to)
-            || temp_touches.touches_before(index, rewrite.from)
+            || temp_touches.has_before(&rewrite.from, index)
             || captured_bindings.contains(&rewrite.to)
             || !temp_handoff_preserves_storage(rewrite.from, rewrite.to, safety)
     }) {
@@ -140,7 +140,7 @@ fn try_collapse_pure_binding_handoffs(
         .rewrites
         .iter()
         .copied()
-        .filter(|rewrite| temp_touches.touches_after(index + 1, rewrite.from))
+        .filter(|rewrite| temp_touches.has_at_or_after(&rewrite.from, index + 1))
         .collect::<Vec<_>>();
     let suffix = &block.stmts[index + 1..];
     // suffix 未触碰的 rewrite 只是把 binding 当前值写回已证明相同的物理 cell；它没有
@@ -199,7 +199,7 @@ fn try_collapse_label_loop_update_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    temp_touches: &TempTouchIndex<'_>,
+    temp_touches: &TempTouchIndex,
     label_jumps: &LabelJumpIndex,
     safety: &mut HandoffSafety<'_>,
 ) -> bool {
@@ -208,7 +208,7 @@ fn try_collapse_label_loop_update_handoff(
     };
     // 候选拒绝[SemanticBarrier:Lifetime]：update temp 有 seed 前入口 use 或与 carried 不同 storage identity 时，改名会合并不同 epoch/root。
     if outer_bindings.contains(&CarryBinding::Temp(update_temp))
-        || temp_touches.touches_before(index, update_temp)
+        || temp_touches.has_before(&update_temp, index)
         || !temp_handoff_preserves_storage(update_temp, carried, safety)
     {
         return false;
@@ -278,7 +278,7 @@ fn try_collapse_single_binding_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    temp_touches: &TempTouchIndex<'_>,
+    temp_touches: &TempTouchIndex,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
     safety: &mut HandoffSafety<'_>,
@@ -291,7 +291,7 @@ fn try_collapse_single_binding_handoff(
     // 候选拒绝[SemanticBarrier:Lifetime]：outer/source 前 touch 证明 temp 是独立快照；合并会让跨块读取看到 binding 的后续 epoch。
     if outer_bindings.contains(&CarryBinding::Temp(temp))
         || outer_bindings.contains(&binding)
-        || temp_touches.touches_before(index, temp)
+        || temp_touches.has_before(&temp, index)
     {
         return false;
     }
@@ -308,7 +308,7 @@ fn try_collapse_single_binding_handoff(
         return false;
     }
 
-    if !temp_touches.touches_after(index + 1, temp) {
+    if !temp_touches.has_at_or_after(&temp, index + 1) {
         // exact-home 与 identity guards 已证明该赋值是同一 cell 的 self-copy；suffix 没有
         // temp use，删除 seed 不会消除值、root 或 close epoch 的消费者。
         block.stmts.remove(index);
@@ -344,7 +344,7 @@ fn try_collapse_binding_update_handoff(
     block: &mut HirBlock,
     index: usize,
     outer_bindings: &dyn BindingProtection,
-    temp_touches: &TempTouchIndex<'_>,
+    temp_touches: &TempTouchIndex,
     label_jumps: &LabelJumpIndex,
     captured_bindings: &BTreeSet<CarryBinding>,
     safety: &mut HandoffSafety<'_>,
@@ -377,7 +377,7 @@ fn try_collapse_binding_update_handoff(
         "parsed update handoff seed must remain rewritable while planning"
     );
 
-    if temp_touches.touches_after(index + 1, target_temp) {
+    if temp_touches.has_at_or_after(&target_temp, index + 1) {
         assert!(
             rewrite_stmts(
                 &mut block.stmts[index + 1..],
@@ -785,7 +785,7 @@ mod tests {
         };
         let stmt_temp_refs =
             super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -820,7 +820,7 @@ mod tests {
         };
         let stmt_temp_refs =
             super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -859,7 +859,7 @@ mod tests {
         };
         let stmt_temp_refs =
             super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -910,7 +910,7 @@ mod tests {
         };
         let stmt_temp_refs =
             super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -964,7 +964,7 @@ mod tests {
         };
         let stmt_temp_refs =
             super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::new(&stmt_temp_refs);
+        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();

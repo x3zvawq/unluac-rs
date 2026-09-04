@@ -19,6 +19,7 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use super::super::expr_facts::expr_truthiness;
 use super::super::label_refs::count_label_references;
 use super::super::lexical_cfg::LexicalCfg;
+use super::super::local_shapes::empty_single_local_decl_binding;
 use super::super::mention::ReferenceCapturedBindings;
 use super::super::temp_touch::stmt_contains_nested_nonlocal_control;
 use crate::hir::visit::{self, HirVisitor};
@@ -162,7 +163,7 @@ pub(super) fn prune_redundant_entry_nil_writes(
     let owner_label_refs = count_label_references(&proto.body.stmts);
     let mut changed = false;
     for index in 0..proto.body.stmts.len() - 1 {
-        let Some(local) = empty_local(&proto.body.stmts[index]) else {
+        let Some(local) = empty_single_local_decl_binding(&proto.body.stmts[index]) else {
             continue;
         };
         if !facts.is_entry_nil_phi_local(local) {
@@ -217,16 +218,6 @@ pub(super) fn prune_redundant_entry_nil_writes(
         changed = true;
     }
     changed
-}
-
-fn empty_local(stmt: &HirStmt) -> Option<LocalId> {
-    let HirStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [local] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    local_decl.values.is_empty().then_some(*local)
 }
 
 struct EntryNilAnalyzer<'a> {

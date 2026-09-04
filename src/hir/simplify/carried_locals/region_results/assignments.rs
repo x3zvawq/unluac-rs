@@ -2,33 +2,6 @@
 
 use super::*;
 
-pub(super) fn initialized_local(stmt: &HirStmt) -> Option<(LocalId, &HirExpr)> {
-    let HirStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    let [value] = local_decl.values.fixed.as_slice() else {
-        return None;
-    };
-    local_decl
-        .values
-        .tail
-        .is_none()
-        .then_some((*binding, value))
-}
-
-pub(super) fn empty_local(stmt: &HirStmt) -> Option<LocalId> {
-    let HirStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    local_decl.values.is_empty().then_some(*binding)
-}
-
 pub(super) fn if_fallthrough_assignments(
     if_stmt: &HirIf,
     results: &[CarryBinding],

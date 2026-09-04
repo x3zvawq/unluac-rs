@@ -27,6 +27,7 @@ use crate::hir::promotion::{HomeSlots, ProtoPromotionFacts};
 
 use super::super::label_refs::count_label_references;
 use super::super::lexical_cfg::LexicalCfg;
+use super::super::local_shapes::initialized_single_local_decl;
 use super::super::mention::{stmts_captured_locals, stmts_mention_local};
 use super::super::walk::{rewrite_expr, rewrite_stmts};
 use super::HandoffIdentityFacts;
@@ -679,7 +680,7 @@ fn find_fold(
         return None;
     }
     for (seed_index, seed) in prefix.iter().enumerate() {
-        let Some((seed_binding, value)) = initialized_local(seed) else {
+        let Some((seed_binding, value)) = initialized_single_local_decl(seed) else {
             continue;
         };
         if seed_binding != next
@@ -739,23 +740,6 @@ fn loop_body_mut(stmt: &mut HirStmt) -> Option<(&mut HirBlock, Option<&mut HirEx
         HirStmt::Repeat(repeat_stmt) => Some((&mut repeat_stmt.body, Some(&mut repeat_stmt.cond))),
         _ => None,
     }
-}
-
-fn initialized_local(stmt: &HirStmt) -> Option<(LocalId, &HirExpr)> {
-    let HirStmt::LocalDecl(local_decl) = stmt else {
-        return None;
-    };
-    let [binding] = local_decl.bindings.as_slice() else {
-        return None;
-    };
-    let [value] = local_decl.values.fixed.as_slice() else {
-        return None;
-    };
-    local_decl
-        .values
-        .tail
-        .is_none()
-        .then_some((*binding, value))
 }
 
 fn exact_local_writeback(stmt: &HirStmt) -> Option<(LocalId, LocalId)> {

@@ -8,9 +8,11 @@
 
 mod dominance;
 mod label_refs;
+mod positions;
 
 pub(crate) use dominance::{DominatorTree, dominator_tree};
 pub(crate) use label_refs::{LabelReferenceIndex, LabelReferences};
+pub(crate) use positions::PositionIndex;
 
 pub(crate) struct DfsTraversal<N> {
     pub(crate) preorder: Vec<N>,
