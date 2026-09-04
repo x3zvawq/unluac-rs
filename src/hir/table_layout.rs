@@ -82,7 +82,8 @@ impl RuntimeTableOperands<'_> {
                     condition(child) => { self.expr(child); }
                 );
             },
-            table_constructor(table) => { self.table(table); }
+            table_constructor(table) => { self.table(table); },
+            capture(capture) => { self.expr(&mut capture.value); }
         );
     }
 

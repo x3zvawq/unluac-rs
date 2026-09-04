@@ -365,7 +365,7 @@ mod tests {
         );
 
         assert!(state.escaped.contains(&escaped_table));
-        assert_eq!(state.roots.get(&Binding::Local(captured)), Some(&true));
+        assert!(state.roots.contains(&Binding::Local(captured)));
         assert_eq!(init.protocol(), dispatch.protocol());
     }
 
@@ -407,7 +407,7 @@ mod tests {
             Some(&BTreeSet::from([returned]))
         );
         assert!(state.unknown_collectable.contains(&Binding::Local(binding)));
-        assert_eq!(state.roots.get(&Binding::Local(binding)), Some(&true));
+        assert!(state.roots.contains(&Binding::Local(binding)));
     }
 
     #[test]

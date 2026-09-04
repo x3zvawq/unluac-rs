@@ -1,19 +1,19 @@
-//! HIR 退出残差统计。
+//! HIR 收敛后的退出事实。
 //!
-//! 统计一个 HirModule 中剩余未结构化的 Decision / Unresolved 节点数量，
-//! 用来在 simplify 主循环里判断是否还需要继续收敛。
+//! 消费共享 HIR visitor 统计仍存在的 Decision/Unresolved 与控制语法；不读取 Structure。
+//! 例如不可达 goto 已被 HIR 删除，原先从 Structure 带入的 goto 要求也应在这里退役，
+//! 不能迫使 AST 根据过期要求拒绝 Lua 5.1。失败 proto 与 unresolved 诊断仍保留原证据。
 
-use crate::hir::traverse::{
-    traverse_hir_call_children, traverse_hir_decision_children, traverse_hir_expr_children,
-    traverse_hir_lvalue_children, traverse_hir_stmt_children,
-    traverse_hir_table_constructor_children,
-};
-use crate::hir::{HirBlock, HirExpr, HirModule, HirStmt};
+use crate::hir::common::{HirControlFlowFeature, HirExitRequirement};
+use crate::hir::visit::{HirVisitor, visit_block};
+use crate::hir::{HirExpr, HirModule, HirStmt};
 
 #[derive(Default)]
 pub(super) struct HirExitResiduals {
     pub decisions: usize,
     pub unresolved: usize,
+    goto_label: bool,
+    continue_statement: bool,
 }
 
 impl HirExitResiduals {
@@ -22,87 +22,45 @@ impl HirExitResiduals {
     }
 }
 
-pub(super) fn collect_hir_exit_residuals(module: &HirModule) -> HirExitResiduals {
-    let mut residuals = HirExitResiduals::default();
-    for proto in &module.protos {
-        collect_block_residuals(&proto.body, &mut residuals);
-    }
-    residuals
-}
-
-fn collect_block_residuals(block: &HirBlock, residuals: &mut HirExitResiduals) {
-    for stmt in &block.stmts {
-        collect_stmt_residuals(stmt, residuals);
-    }
-}
-
-fn collect_stmt_residuals(stmt: &HirStmt, residuals: &mut HirExitResiduals) {
-    traverse_hir_stmt_children!(
-        stmt,
-        iter = iter,
-        opt = as_ref,
-        borrow = [&],
-        expr(e) => { collect_expr_residuals(e, residuals); },
-        lvalue(lv) => {
-            traverse_hir_lvalue_children!(
-                lv,
-                borrow = [&],
-                expr(e) => { collect_expr_residuals(e, residuals); }
-            );
-        },
-        block(b) => { collect_block_residuals(b, residuals); },
-        call(c) => {
-            traverse_hir_call_children!(
-                c,
-                iter = iter,
-                borrow = [&],
-                expr(e) => { collect_expr_residuals(e, residuals); }
-            );
-        },
-        condition(cond) => { collect_expr_residuals(cond, residuals); }
-    );
-}
-
-fn collect_expr_residuals(expr: &HirExpr, residuals: &mut HirExitResiduals) {
-    // Decision / Unresolved 需要在结构递归前统计。
-    match expr {
-        HirExpr::Decision(_) => residuals.decisions += 1,
-        HirExpr::Unresolved(_) => residuals.unresolved += 1,
-        _ => {}
-    }
-
-    traverse_hir_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(e) => { collect_expr_residuals(e, residuals); },
-        call(c) => {
-            traverse_hir_call_children!(
-                c,
-                iter = iter,
-                borrow = [&],
-                expr(e) => { collect_expr_residuals(e, residuals); }
-            );
-        },
-        decision(d) => {
-            traverse_hir_decision_children!(
-                d,
-                iter = iter,
-                borrow = [&],
-                expr(e) => { collect_expr_residuals(e, residuals); },
-                condition(cond) => { collect_expr_residuals(cond, residuals); }
-            );
-        },
-        table_constructor(t) => {
-            traverse_hir_table_constructor_children!(
-                t,
-                iter = iter,
-                opt = as_ref,
-                borrow = [&],
-                expr(e) => { collect_expr_residuals(e, residuals); }
-            );
+impl HirVisitor for HirExitResiduals {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::Goto(_) | HirStmt::Label(_) => self.goto_label = true,
+            HirStmt::Continue => self.continue_statement = true,
+            _ => {}
         }
-    );
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        match expr {
+            HirExpr::Decision(_) => self.decisions += 1,
+            HirExpr::Unresolved(_) => self.unresolved += 1,
+            _ => {}
+        }
+    }
+}
+
+pub(super) fn finalize_hir_exit_requirements(module: &mut HirModule) -> HirExitResiduals {
+    let mut total = HirExitResiduals::default();
+    for proto in &mut module.protos {
+        let mut residuals = HirExitResiduals::default();
+        visit_block(&proto.body, &mut residuals);
+        total.decisions += residuals.decisions;
+        total.unresolved += residuals.unresolved;
+        if proto.failure.is_some() {
+            continue;
+        }
+        proto
+            .exit_requirements
+            .retain(|requirement| match requirement {
+                HirExitRequirement::RequiredControlFlow { feature, .. } => match feature {
+                    HirControlFlowFeature::GotoLabel => residuals.goto_label,
+                    HirControlFlowFeature::ContinueStatement => residuals.continue_statement,
+                },
+                HirExitRequirement::UnresolvedValue { .. } => true,
+            });
+    }
+    total
 }
 
 pub(super) fn emit_hir_warning(message: String) {

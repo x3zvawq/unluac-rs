@@ -133,17 +133,17 @@ impl HirVisitor for ToBeClosedHomeCollector<'_> {
 
         let mut value_homes = BTreeSet::new();
         for local in bindings.locals {
-            value_homes.extend(self.facts.complete_local_home_slots(local));
+            value_homes.extend(self.facts.complete_local_home_slots(local).iter().copied());
         }
         for param in bindings.params {
-            value_homes.extend(self.facts.complete_param_home_slots(param));
+            value_homes.extend(self.facts.complete_param_home_slots(param).iter().copied());
         }
         for temp in bindings.temps {
-            value_homes.extend(self.facts.complete_temp_home_slots(temp));
+            value_homes.extend(self.facts.complete_temp_home_slots(temp).iter().copied());
         }
         self.homes.extend(
             self.facts
-                .complete_tbc_home_slots(to_be_closed.reg_index, value_homes),
+                .complete_tbc_home_slots(to_be_closed.reg_index, &value_homes),
         );
     }
 }

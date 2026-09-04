@@ -12,9 +12,11 @@
 //! 它不会跨层补事实，也不会主动进入子 proto 的 body 重新扫描整棵模块树；这里的
 //! 作用域就是当前这一个 proto。例如 closure 只会访问 capture
 //! 表达式，因为那正是当前 proto 能直接消费的事实边界。
+//! capture hook 持有 mode 与 value，默认递归 value；读取分析可以只进入 ByValue，
+//! 例如 `f(x, function() return x end)` 的直接 x 读取不会被 ByReference capture 抵消。
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,
+    HirBlock, HirCallExpr, HirCapture, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,
     HirTableConstructor,
 };
 
@@ -34,6 +36,14 @@ pub(crate) trait HirVisitor {
     fn visit_lvalue(&mut self, _lvalue: &HirLValue) {}
 
     fn visit_call(&mut self, _call: &HirCallExpr) {}
+
+    /// capture 是带模式的子树入口；重载者负责决定是否递归其 value。
+    fn visit_capture(&mut self, capture: &HirCapture)
+    where
+        Self: Sized,
+    {
+        visit_expr(&capture.value, self);
+    }
 }
 
 pub(crate) fn visit_proto(proto: &HirProto, visitor: &mut impl HirVisitor) {
@@ -76,6 +86,22 @@ fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
     );
 }
 
+/// 只访问本语句的求值部分；嵌套 block 由控制流图在各自的节点访问。
+pub(crate) fn visit_stmt_header(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
+    visitor.visit_stmt(stmt);
+    traverse_hir_stmt_children!(
+        stmt,
+        iter = iter,
+        opt = as_ref,
+        borrow = [&],
+        expr(expr) => { visit_expr(expr, visitor); },
+        lvalue(lvalue) => { visit_lvalue(lvalue, visitor); },
+        block(_block) => {},
+        call(call) => { visit_call(call, visitor); },
+        condition(cond) => { visit_expr(cond, visitor); }
+    );
+}
+
 pub(crate) fn visit_call(call: &HirCallExpr, visitor: &mut impl HirVisitor) {
     visitor.visit_call(call);
     traverse_hir_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
@@ -107,6 +133,9 @@ pub(crate) fn visit_expr(expr: &HirExpr, visitor: &mut impl HirVisitor) {
         },
         table_constructor(t) => {
             visit_table_constructor(t, visitor);
+        },
+        capture(capture) => {
+            visitor.visit_capture(capture);
         }
     );
 }

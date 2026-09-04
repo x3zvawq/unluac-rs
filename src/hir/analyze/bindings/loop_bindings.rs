@@ -1,4 +1,6 @@
-//! 合并嵌套 loop-carried temp 并分配 for/phi 状态绑定；依赖最终 loop value plan，不负责捕获槽位；例如复用祖先 carried 槽而保留可观察 capture。
+//! 分配 for/phi 状态绑定并保留其物理覆盖终点；依赖最终 loop value plan 与 Dataflow
+//! 覆盖关系，不负责捕获槽位。例如循环后的 `state = nil` 仍写回 carried 身份，
+//! 不会成为独立死 temp 而丢失原 VM 清根行为。
 
 use super::*;
 
@@ -6,6 +8,68 @@ use super::*;
 pub(super) struct LoopCarriedBinding {
     pub(super) owner: RegionId,
     pub(super) input: SsaValue,
+}
+
+/// 无值读取的 scalar 写入仍可能结束循环状态的强根。只接回已证明的 carried 身份，
+/// 不按槽号合并不同 value epoch，也不把新分配对象的根延长到旧 local 的作用域末尾。
+pub(super) fn preserve_loop_state_overwrites(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    epochs: &SlotEpochFacts,
+    barriers: (&[bool], &[bool], &[Option<DebugBindingHint>]),
+    temps: (&[TempId], &mut [TempId]),
+) {
+    let (captured_regs, numeric_phis, debug_hints) = barriers;
+    let (phi_temps, fixed_temps) = temps;
+    let mut carried_temps = BTreeSet::new();
+    let mut blocked_temps = BTreeSet::new();
+    for phi in plan.phis() {
+        let temp = phi_temps[phi.phi.index()];
+        if numeric_phis[phi.phi.index()] || debug_hints[phi.phi.index()].is_some() {
+            blocked_temps.insert(temp);
+        } else if loop_carried_binding(plan, phi).is_some() {
+            carried_temps.insert(temp);
+        }
+    }
+    let mut moves = crate::structure::CanonicalMoveIndex::new(proto, dataflow);
+    for def in &dataflow.defs {
+        if fixed_temps[def.id.index()] != TempId(def.id.index())
+            || reg_is_captured(captured_regs, def.reg)
+            || !dataflow.def_uses[def.id.index()].is_empty()
+            || !dataflow.def_phi_uses[def.id.index()].is_empty()
+            || debug_local_hint_for_reg_at_instr(proto, def.reg, def.instr).is_some()
+        {
+            continue;
+        }
+        let Ok(SsaValue::Def(value)) = moves.resolve(SsaValue::Def(def.id)) else {
+            continue;
+        };
+        if crate::hir::promotion::direct_scalar_overwrite_value(
+            &proto.instrs[dataflow.def_instr(value).index()],
+            dataflow.def_reg(value),
+        )
+        .is_none()
+        {
+            continue;
+        }
+        let Some(SsaValue::Phi(source)) = dataflow.def_overwritten_value(def.id) else {
+            continue;
+        };
+        let Some(phi) = plan.phi_plan(source) else {
+            continue;
+        };
+        let target = phi_temps[source.index()];
+        if phi.reg == def.reg
+            && carried_temps.contains(&target)
+            && !blocked_temps.contains(&target)
+            && epochs.epoch_at(def.reg, def.instr)
+                == epochs.epoch_at(phi.reg, cfg.blocks[phi.block.index()].instrs.start)
+        {
+            fixed_temps[def.id.index()] = target;
+        }
+    }
 }
 
 /// 嵌套 loop 只在最终 value plan 明确证明“沿用祖先 carried 槽位”时复用 HIR temp。

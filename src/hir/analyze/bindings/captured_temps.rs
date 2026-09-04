@@ -49,11 +49,6 @@ pub(super) fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> 
         .chain(captured_slots.region_local_decls.values().flatten())
         .copied()
         .collect::<BTreeSet<_>>();
-    let mut defs_by_instr = vec![Vec::<(DefId, Reg)>::new(); proto.instrs.len()];
-    for def in &dataflow.defs {
-        defs_by_instr[def.instr.index()].push((def.id, def.reg));
-    }
-
     let mut phis_by_instr = vec![Vec::<(crate::structure::PhiId, Reg)>::new(); proto.instrs.len()];
     for phi in plan
         .phis()
@@ -98,7 +93,8 @@ pub(super) fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> 
             }
         }
 
-        for (def_id, reg) in defs_by_instr[instr_index].iter().copied() {
+        for &def_id in &dataflow.instr_defs[instr_index] {
+            let reg = dataflow.def_reg(def_id);
             if let Some(target) = target_for_slot(reg, instr_index, epochs, captured_slots)
                 && let Some(temp) = fixed_temps.get(def_id.index()).copied()
             {

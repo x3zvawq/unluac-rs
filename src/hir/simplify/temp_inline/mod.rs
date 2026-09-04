@@ -61,6 +61,7 @@ mod rewrite;
 mod site;
 mod usage;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::decompile::{DecompileDialect, ReadabilityOptions};
@@ -71,7 +72,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::{
     HirExprSafety, expr_observes_eval_order, expr_requires_ordered_snapshot,
 };
-use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 
 use self::rewrite::{replace_temp_in_stmt, replace_temps_in_stmt};
 use self::site::{
@@ -92,9 +93,10 @@ use super::mention::{
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
-    CallRootLifetimeIndices, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
-    materialize_generic_for_dispatch_root_releases, scope_end_copy_root_handoffs,
-    scope_end_copy_roots_needing_materialization, stmt_has_argument_root_handoff,
+    CallRootLifetimeIndices, RootLifetimeFacts, collect_call_root_lifetimes,
+    collect_lookup_gc_root_lifetimes, materialize_generic_for_dispatch_root_releases,
+    scope_end_copy_root_handoffs, scope_end_copy_roots_needing_materialization,
+    stmt_has_argument_root_handoff,
 };
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -277,18 +279,9 @@ fn inline_temps_in_proto_with_scope(
             roots,
             &mut release_temp_is_eligible,
         );
-    let handoff_roots = collect_lookup_gc_root_lifetimes(
-        &proto.body.stmts,
-        facts,
-        HirExprSafety::for_dialect(dialect),
-        |_| true,
-    )
-    .into_handoff_roots();
     let scope_roots = scope_end_copy_roots_needing_materialization(&proto.body.stmts, facts);
     let original_root_count = proto.physical_root_temps.len();
-    proto
-        .physical_root_temps
-        .extend(scope_roots.into_iter().chain(handoff_roots));
+    proto.physical_root_temps.extend(scope_roots);
     changed |= proto.physical_root_temps.len() != original_root_count;
     let inline_dispositions = std::mem::take(&mut proto.inline_dispositions);
     let mut workspace = TempInlineWorkspace::new(
@@ -331,38 +324,54 @@ fn temp_count_for_proto(proto: &HirProto) -> usize {
     proto_temp_count.max(body_temp_count)
 }
 
-fn collect_temp_root_lifetimes(
-    stmts: &[HirStmt],
-    facts: &ProtoPromotionFacts,
-    roots: RootAnalysisContext<'_>,
-    protected_temps: &[bool],
-) -> (CallRootLifetimeIndices, Vec<bool>) {
-    // 分析停用[LayerBoundary]：普通潜在事件由后续 locals 以
-    // `collect_call_root_lifetimes(..., true, ...)` 配对并物化 owner；locals 的 TempChain
-    // invalidation 会让 temp-inline 针对已物化 owner 重跑。本轮只消费 lookup 的显式 GC/
-    // return 后缀证明与已完成 overwrite pair，避免把尚未配对的普通观察扩成全局 barrier。
-    let call_roots = collect_call_root_lifetimes(stmts, facts, roots, false, |_| true, |_| true);
-    let mut marked = call_roots.marked_stmts(stmts.len());
-    collect_lookup_gc_root_lifetimes(stmts, facts, roots.safety, |_| true).mark_stmts(&mut marked);
-    for (index, stmt) in stmts.iter().enumerate() {
-        if !marked[index]
-            && inline_candidate(stmt).is_some_and(|(temp, _)| {
-                facts.is_copy_root_endpoint(temp)
-                    || protected_temps.get(temp.index()).copied().unwrap_or(false)
-            })
-        {
-            // Raw CFG facts can pair a producer in the parent block with exact overwrites in
-            // multiple terminal children. The block-local collector above cannot represent that
-            // relation. Same-block pairs stay owned by the precise collector (including its
-            // effectful-RHS fusion); only an otherwise unrepresented endpoint is protected here.
-            // A scope-end copy root is protected here only when a direct if test controls a later
-            // observing arm, or when a generic-for producer consumes it before a loop-body
-            // observation. Direct return/protocol result slots already transfer the same value
-            // into VM-owned homes and remain eligible for their dedicated inline owners.
-            marked[index] = true;
+impl TempInlineWorkspace<'_> {
+    fn collect_temp_root_lifetimes(
+        &mut self,
+        stmts: &[HirStmt],
+        facts: &ProtoPromotionFacts,
+    ) -> (CallRootLifetimeIndices, Vec<bool>) {
+        // 分析停用[LayerBoundary]：普通潜在事件由后续 locals 以
+        // `collect_call_root_lifetimes(..., true, ...)` 配对并物化 owner；locals 的 TempChain
+        // invalidation 会让 temp-inline 针对已物化 owner 重跑。本轮只消费 lookup 的显式 GC/
+        // return 后缀证明与已完成 overwrite pair，避免把尚未配对的普通观察扩成全局 barrier。
+        let snapshot = RootLifetimeFacts::new(stmts);
+        let call_roots =
+            collect_call_root_lifetimes(&snapshot, facts, self.roots, false, |_| true, |_| true);
+        let mut marked = call_roots.marked_stmts(stmts.len());
+        let lookup_roots =
+            collect_lookup_gc_root_lifetimes(&snapshot, facts, self.roots.safety, |_| true);
+        lookup_roots.mark_stmts(&mut marked);
+        if self.block_depth == 1 {
+            // handoff 与覆盖配对来自同一改写前快照；先保护接收 home，再递归内联子块。
+            for temp in lookup_roots.into_handoff_roots() {
+                self.physical_root_temps[temp.index()] = true;
+                self.new_physical_root_temps.insert(temp);
+            }
         }
+        for (index, stmt) in stmts.iter().enumerate() {
+            if !marked[index]
+                && inline_candidate(stmt).is_some_and(|(temp, _)| {
+                    facts.is_copy_root_endpoint(temp)
+                        || self
+                            .physical_root_temps
+                            .get(temp.index())
+                            .copied()
+                            .unwrap_or(false)
+                })
+            {
+                // Raw CFG facts can pair a producer in the parent block with exact overwrites in
+                // multiple terminal children. The block-local collector above cannot represent that
+                // relation. Same-block pairs stay owned by the precise collector (including its
+                // effectful-RHS fusion); only an otherwise unrepresented endpoint is protected here.
+                // A scope-end copy root is protected here only when a direct if test controls a later
+                // observing arm, or when a generic-for producer consumes it before a loop-body
+                // observation. Direct return/protocol result slots already transfer the same value
+                // into VM-owned homes and remain eligible for their dedicated inline owners.
+                marked[index] = true;
+            }
+        }
+        (call_roots, marked)
     }
-    (call_roots, marked)
 }
 
 fn inline_temps_in_block(
@@ -377,12 +386,8 @@ fn inline_temps_in_block(
     let is_proto_root = workspace.block_depth == 0;
     workspace.block_depth += 1;
     let mut changed = false;
-    let (mut call_root_indices, mut physical_root_lifetimes) = collect_temp_root_lifetimes(
-        &block.stmts,
-        facts,
-        workspace.roots,
-        &workspace.physical_root_temps,
-    );
+    let (mut call_root_indices, mut physical_root_lifetimes) =
+        workspace.collect_temp_root_lifetimes(&block.stmts, facts);
     let mut captured_slots_before_stmt =
         CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
@@ -422,12 +427,8 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
-            &block.stmts,
-            facts,
-            workspace.roots,
-            &workspace.physical_root_temps,
-        );
+        (call_root_indices, physical_root_lifetimes) =
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
     }
 
     if matches!(workspace.scope, TempInlineScope::All)
@@ -447,12 +448,8 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
-            &block.stmts,
-            facts,
-            workspace.roots,
-            &workspace.physical_root_temps,
-        );
+        (call_root_indices, physical_root_lifetimes) =
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
     }
 
     if inline_terminal_nil_return_pack(
@@ -466,12 +463,8 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
-            &block.stmts,
-            facts,
-            workspace.roots,
-            &workspace.physical_root_temps,
-        );
+        (call_root_indices, physical_root_lifetimes) =
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
     }
 
     if inline_materialization_runs(
@@ -486,12 +479,8 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (call_root_indices, physical_root_lifetimes) = collect_temp_root_lifetimes(
-            &block.stmts,
-            facts,
-            workspace.roots,
-            &workspace.physical_root_temps,
-        );
+        (call_root_indices, physical_root_lifetimes) =
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
     }
 
     if matches!(workspace.scope, TempInlineScope::All)
@@ -507,12 +496,7 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (_, physical_root_lifetimes) = collect_temp_root_lifetimes(
-            &block.stmts,
-            facts,
-            workspace.roots,
-            &workspace.physical_root_temps,
-        );
+        (_, physical_root_lifetimes) = workspace.collect_temp_root_lifetimes(&block.stmts, facts);
     }
 
     // proto 级 live use count 会随成功内联同步减少；当前 block 只需保留下一条
@@ -601,6 +585,9 @@ fn inline_temps_in_block(
             // 下一条语句没有受支持的直接消费站点时，不形成相邻候选；proto 内更晚的
             // 唯一 use 属于非紧邻形状，具体站点边界由 `inline_site_in_stmt` 标记。
             && let Some(site) = inline_site_in_stmt(next_stmt, temp)
+            // 候选拒绝[SemanticBarrier:ValueFlow]：regress_387 的 repeat body 会重新定义
+            // 同一 carrier；把循环前的 nil 内联到 until 会抹掉这些 reaching writes。
+            && !(site.is_repeated_region() && stmt_writes_temp(next_stmt, temp))
             && prefixed_block_candidate_is_safe(
                 site,
                 temp,
@@ -681,12 +668,7 @@ fn inline_temps_in_block(
     // source binding；因此在同一坐标压缩完成后重算 root/capture 事实，并交回同一个
     // call-root owner 原子消费。
     if adjacent_changed && matches!(workspace.scope, TempInlineScope::All) {
-        let (call_roots, _) = collect_temp_root_lifetimes(
-            &block.stmts,
-            facts,
-            workspace.roots,
-            &workspace.physical_root_temps,
-        );
+        let (call_roots, _) = workspace.collect_temp_root_lifetimes(&block.stmts, facts);
         let captured_slots = captured_slots_before_stmts(block, facts, inherited_captured_slots);
         changed |= inline_adjacent_call_root_expression_overwrites(
             block,
@@ -1948,7 +1930,7 @@ fn root_open_return_nil_pack_plan(
             }
             all_physical_targets_have_exact_homes &=
                 possible_homes.is_empty() || facts.trusted_temp_home_slot(*target).is_some();
-            target_slots.extend(possible_homes);
+            target_slots.extend(possible_homes.iter().copied());
         }
         if has_non_entry_physical_target && !all_physical_targets_have_exact_homes {
             // 候选拒绝[SemanticBarrier:Lifetime]：merged physical target 可沿不同路径落入
@@ -2324,7 +2306,7 @@ struct DirectBindingReadHomeCollector<'a> {
 }
 
 impl DirectBindingReadHomeCollector<'_> {
-    fn note_homes(&mut self, homes: BTreeSet<HomeSlotKey>) {
+    fn note_homes(&mut self, homes: &BTreeSet<HomeSlotKey>) {
         self.homes.extend(homes);
     }
 }
@@ -2333,13 +2315,13 @@ impl HirVisitor for DirectBindingReadHomeCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
             HirExpr::ParamRef(param) => {
-                self.note_homes(self.facts.complete_param_home_slots(*param));
+                self.note_homes(&self.facts.complete_param_home_slots(*param));
             }
             HirExpr::LocalRef(local) => {
-                self.note_homes(self.facts.complete_local_home_slots(*local));
+                self.note_homes(&self.facts.complete_local_home_slots(*local));
             }
             HirExpr::TempRef(temp) => {
-                self.note_homes(self.facts.complete_temp_home_slots(*temp));
+                self.note_homes(&self.facts.complete_temp_home_slots(*temp));
             }
             _ => {}
         }
@@ -2383,15 +2365,17 @@ fn root_nil_pack_gap_preserves_slots(
     )
 }
 
-fn direct_lvalue_possible_home_slots(
+fn direct_lvalue_possible_home_slots<'a>(
     target: &HirLValue,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
+    facts: &'a ProtoPromotionFacts,
+) -> HomeSlots<'a> {
     match target {
         HirLValue::Param(param) => facts.complete_param_home_slots(*param),
         HirLValue::Temp(temp) => facts.complete_temp_home_slots(*temp),
         HirLValue::Local(local) => facts.complete_local_home_slots(*local),
-        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => BTreeSet::new(),
+        HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {
+            Cow::Owned(BTreeSet::new())
+        }
     }
 }
 
@@ -2550,13 +2534,13 @@ fn complete_reference_captured_home_slots(
 ) -> BTreeSet<HomeSlotKey> {
     let mut homes = BTreeSet::new();
     for param in &captured.params {
-        homes.extend(facts.complete_param_home_slots(*param));
+        homes.extend(facts.complete_param_home_slots(*param).iter().copied());
     }
     for local in &captured.locals {
-        homes.extend(facts.complete_local_home_slots(*local));
+        homes.extend(facts.complete_local_home_slots(*local).iter().copied());
     }
     for temp in &captured.temps {
-        homes.extend(facts.complete_temp_home_slots(*temp));
+        homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
     }
     homes
 }
@@ -2564,12 +2548,15 @@ fn complete_reference_captured_home_slots(
 fn complete_materialization_write_homes(
     temp: TempId,
     facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
+) -> HomeSlots<'_> {
     let mut homes = facts.complete_temp_home_slots(temp);
     if homes.is_empty() {
         return homes;
     }
-    homes.extend(facts.complete_immediate_move_write_homes(temp));
+    let moves = facts.complete_immediate_move_write_homes(temp);
+    if !moves.is_empty() {
+        homes.to_mut().extend(moves.iter().copied());
+    }
     homes
 }
 
@@ -2633,7 +2620,13 @@ fn numeric_for_binding_header_alias_plan(
             HirExpr::UpvalueRef(_) => {
                 // Upvalue 没有当前 proto 的 physical home；只要跨越区间无 lookup/call/元方法事件，
                 // 读取位置从 producer 延到 header 不会获得外部改写机会。
-                break (value.clone(), BTreeSet::new(), None, true, current_index);
+                break (
+                    value.clone(),
+                    Cow::Owned(BTreeSet::new()),
+                    None,
+                    true,
+                    current_index,
+                );
             }
             _ => {
                 // 候选拒绝[SemanticBarrier:EvalOrder]：lookup/call/元方法运算若作为 chain root，
@@ -2752,7 +2745,7 @@ fn inline_open_return_fixed_alias_run(
         let source_homes = proof.facts.complete_temp_home_slots(*source);
         let touches_captured_home = target_homes
             .iter()
-            .chain(&source_homes)
+            .chain(source_homes.iter())
             .any(|home| captured_slots.contains(home));
         if touches_captured_home {
             // 候选拒绝[SemanticBarrier:Capture]：source/target 的任一可能 home 已捕获，
@@ -2767,8 +2760,8 @@ fn inline_open_return_fixed_alias_run(
             return false;
         }
         source_temps.insert(*source);
-        target_slots.extend(target_homes);
-        source_slots.extend(source_homes);
+        target_slots.extend(target_homes.iter().copied());
+        source_slots.extend(source_homes.iter().copied());
     }
     if !(target_slots.is_empty() && source_slots.is_empty())
         && (!target_slots.is_disjoint(proof.reference_captured_home_slots)
@@ -3345,7 +3338,7 @@ struct DirectBindingWriteCollector<'a> {
 }
 
 impl DirectBindingWriteCollector<'_> {
-    fn note_homes(&mut self, homes: BTreeSet<HomeSlotKey>) {
+    fn note_homes(&mut self, homes: &BTreeSet<HomeSlotKey>) {
         self.homes.extend(homes);
     }
 }
@@ -3356,17 +3349,17 @@ impl HirVisitor for DirectBindingWriteCollector<'_> {
             HirStmt::LocalDecl(decl) => {
                 for local in &decl.bindings {
                     self.identities.locals.insert(*local);
-                    self.note_homes(self.facts.complete_local_home_slots(*local));
+                    self.note_homes(&self.facts.complete_local_home_slots(*local));
                 }
             }
             HirStmt::NumericFor(for_stmt) => {
                 self.identities.locals.insert(for_stmt.binding);
-                self.note_homes(self.facts.complete_local_home_slots(for_stmt.binding));
+                self.note_homes(&self.facts.complete_local_home_slots(for_stmt.binding));
             }
             HirStmt::GenericFor(for_stmt) => {
                 for local in &for_stmt.bindings {
                     self.identities.locals.insert(*local);
-                    self.note_homes(self.facts.complete_local_home_slots(*local));
+                    self.note_homes(&self.facts.complete_local_home_slots(*local));
                 }
             }
             HirStmt::Close(close) => {
@@ -3380,16 +3373,19 @@ impl HirVisitor for DirectBindingWriteCollector<'_> {
         match lvalue {
             HirLValue::Param(param) => {
                 self.identities.params.insert(*param);
-                self.note_homes(self.facts.complete_param_home_slots(*param));
+                self.note_homes(&self.facts.complete_param_home_slots(*param));
             }
             HirLValue::Local(local) => {
                 self.identities.locals.insert(*local);
-                self.note_homes(self.facts.complete_local_home_slots(*local));
+                self.note_homes(&self.facts.complete_local_home_slots(*local));
             }
             HirLValue::Temp(temp) => {
                 self.identities.temps.insert(*temp);
-                self.homes
-                    .extend(complete_materialization_write_homes(*temp, self.facts));
+                self.homes.extend(
+                    complete_materialization_write_homes(*temp, self.facts)
+                        .iter()
+                        .copied(),
+                );
             }
             HirLValue::Upvalue(upvalue) => {
                 self.identities.upvalues.insert(*upvalue);
@@ -4437,15 +4433,19 @@ mod tests {
         facts.record_home_free_temp(TempId(1));
         let snapshots = empty_capture_snapshots(2);
         let mut live_uses = vec![1, 1];
-        let (_, physical_roots) = collect_temp_root_lifetimes(
-            &block.stmts,
-            &facts,
+        let mut workspace = TempInlineWorkspace::new(
+            &proto,
+            TempInlineScope::All,
+            DecompileDialect::Lua54,
+            ReadabilityOptions::default(),
+            &[],
+            HirInlineDispositions::default(),
             RootAnalysisContext {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 effects: &[],
             },
-            &[],
         );
+        let (_, physical_roots) = workspace.collect_temp_root_lifetimes(&block.stmts, &facts);
 
         assert!(!physical_roots[0]);
         assert!(inline_root_open_return_nil_pack(
@@ -4491,15 +4491,20 @@ mod tests {
         let mut rooted_facts = facts;
         rooted_facts.record_temp_home_slot_for_test(TempId(2), HomeSlotKey::new(0, 0));
         let rooted_snapshots = empty_capture_snapshots(4);
-        let (_, rooted_physical_roots) = collect_temp_root_lifetimes(
-            &rooted.stmts,
-            &rooted_facts,
+        let mut rooted_workspace = TempInlineWorkspace::new(
+            &rooted_proto,
+            TempInlineScope::All,
+            DecompileDialect::Lua54,
+            ReadabilityOptions::default(),
+            &[],
+            HirInlineDispositions::default(),
             RootAnalysisContext {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 effects: &[],
             },
-            &[],
         );
+        let (_, rooted_physical_roots) =
+            rooted_workspace.collect_temp_root_lifetimes(&rooted.stmts, &rooted_facts);
 
         assert!(rooted_physical_roots[2]);
         assert!(

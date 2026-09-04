@@ -4,6 +4,8 @@
 //! 但仍属于通用图分析”的事实。StructureFacts/HIR 只应该调这些查询接口，不应再回头
 //! 自己揉 parent 数组、重新实现最近公共祖先或重复扫描图判断环。NaturalLoopForest
 //! 额外冻结 loop parent、innermost owner 和 direct block，供后层按 ancestor iterator 查询。
+//! SCC 同时保留拓扑身份与 condensation 前驱；例如 `entry -> a -> b -> a` 中 a/b
+//! 共用一个成环身份，捕获写后分析直接查询该身份，不再另建 block-to-SCC 映射。
 
 use std::collections::BTreeSet;
 
@@ -16,8 +18,7 @@ pub struct GraphFacts {
     pub dominator_tree: DominatorTree,
     pub post_dominator_tree: PostDominatorTree,
     pub dominance_frontier: Vec<BTreeSet<BlockRef>>,
-    pub(crate) strongly_connected_components: Vec<Vec<BlockRef>>,
-    pub(crate) cyclic_blocks: Vec<bool>,
+    pub(crate) scc: SccFacts,
     pub backedges: Vec<EdgeRef>,
     pub loop_headers: BTreeSet<BlockRef>,
     pub natural_loops: Vec<NaturalLoop>,
@@ -32,14 +33,24 @@ pub struct GraphFacts {
 
 impl GraphFacts {
     pub(crate) fn strongly_connected_components(&self) -> impl Iterator<Item = &[BlockRef]> {
-        self.strongly_connected_components.iter().map(Vec::as_slice)
+        self.scc.components.iter().map(Vec::as_slice)
+    }
+
+    pub(crate) fn scc_id(&self, block: BlockRef) -> Option<SccId> {
+        self.scc.block_scc.get(block.index()).copied().flatten()
+    }
+
+    pub(crate) fn scc_count(&self) -> usize {
+        self.scc.components.len()
+    }
+
+    pub(crate) fn scc_predecessors(&self, scc: SccId) -> &[SccId] {
+        &self.scc.predecessors[scc.index()]
     }
 
     pub fn block_is_cyclic(&self, block: BlockRef) -> bool {
-        self.cyclic_blocks
-            .get(block.index())
-            .copied()
-            .unwrap_or(false)
+        self.scc_id(block)
+            .is_some_and(|scc| self.scc.cyclic[scc.index()])
     }
 
     /// 返回某个 block 的 dominance frontier。
@@ -80,6 +91,27 @@ impl GraphFacts {
         self.post_dominator_tree
             .nearest_common_ancestor(left, right)
     }
+}
+
+/// 可达 CFG 的 SCC 身份，严格按 condensation 拓扑序编号。
+///
+/// 跨 SCC 边只能从较小编号到较大编号；消费者可据此裁剪查询范围，不能重建编号。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct SccId(pub(crate) usize);
+
+impl SccId {
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// Graph 分析一次冻结成员、身份、成环与 condensation 前驱；不缓存平方规模传递闭包。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SccFacts {
+    pub(crate) components: Vec<Vec<BlockRef>>,
+    pub(crate) block_scc: Vec<Option<SccId>>,
+    pub(crate) cyclic: Vec<bool>,
+    pub(crate) predecessors: Vec<Vec<SccId>>,
 }
 
 /// 支配树。

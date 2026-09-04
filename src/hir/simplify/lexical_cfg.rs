@@ -168,14 +168,26 @@ impl<'a> HirFlowGraph<'a> {
     ///
     /// `None` 仅表示不可达，首次到达直接安装状态；之后由 consumer 的 `join` 区分
     /// may-union 与 must-intersection。`transfer` 只解释当前 typed event，不重复建边。
-    /// consumer 必须使用有限单调域，并仅在 join 改变状态时返回 true；观察副产物也
-    /// 必须单调合并，因为回边可能使同一节点再次执行。返回值是每个节点的输入状态。
-    pub(super) fn solve_forward<S: Clone>(
+    /// consumer 必须使用有限单调域和单调 transfer，并仅在 join 改变状态时返回 true；观察副产物也
+    /// 必须单调合并，因为回边可能使同一节点再次执行。返回值只保存 consumer 从当前
+    /// 事件投影出的结果，不强迫它保存整份输入状态再重放 transfer。
+    /// 单前驱节点消费并移动状态，只有入口和合流点保存用于不动点比较的输入；每个
+    /// 入口可达环必经这类 checkpoint，因此线性链无需按语句复制不断增长的状态。
+    pub(super) fn solve_forward<S: Clone, R>(
         &self,
         initial: S,
         mut join: impl FnMut(&mut S, &S) -> bool,
-        mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S),
-    ) -> Vec<Option<S>> {
+        mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S) -> R,
+    ) -> Vec<Option<R>> {
+        let mut incoming_edges = vec![0usize; self.nodes.len()];
+        for node in &self.nodes {
+            for successor in node.successors() {
+                incoming_edges[successor.index()] += 1;
+            }
+        }
+        let mut results = std::iter::repeat_with(|| None)
+            .take(self.nodes.len())
+            .collect::<Vec<_>>();
         let mut entries = vec![None; self.nodes.len()];
         entries[self.entry.index()] = Some(initial);
         let mut pending = VecDeque::from([self.entry]);
@@ -183,40 +195,41 @@ impl<'a> HirFlowGraph<'a> {
         queued[self.entry.index()] = true;
         while let Some(id) = pending.pop_front() {
             queued[id.index()] = false;
-            let mut output = entries[id.index()]
-                .as_ref()
-                .expect("queued HIR flow node must be reachable")
-                .clone();
-            transfer(id, self.nodes[id.index()].kind(), &mut output);
-            for &successor in self.nodes[id.index()].successors() {
-                let changed = match &mut entries[successor.index()] {
-                    Some(current) => join(current, &output),
-                    entry @ None => {
-                        *entry = Some(output.clone());
-                        true
-                    }
-                };
-                if changed && !queued[successor.index()] {
-                    queued[successor.index()] = true;
-                    pending.push_back(successor);
-                }
+            let entry = &mut entries[id.index()];
+            let mut output = if id == self.entry || incoming_edges[id.index()] > 1 {
+                entry.clone()
+            } else {
+                entry.take()
             }
+            .expect("queued HIR flow node must be reachable");
+            results[id.index()] = Some(transfer(id, self.nodes[id.index()].kind(), &mut output));
+            propagate_flow_state(
+                output,
+                self.nodes[id.index()].successors().iter().copied(),
+                &mut entries,
+                &mut pending,
+                &mut queued,
+                &mut join,
+            );
         }
-        entries
+        results
     }
 
-    /// 在入口可达子图上求后向抽象状态不动点，返回每个节点的输出状态。
+    /// 在入口可达子图上求后向抽象状态不动点，由 consumer 投影所需结果。
     ///
     /// 所有可达节点从 lattice 的 bottom 开始执行，包含无法到达函数出口的循环；
     /// 否则无限循环中的读取会被错误视为不可观察。
     /// `transfer` 从输出状态计算输入状态，`join` 将它传播到前驱。
     /// 图负责方向与调度；consumer 只提供有限单调域及当前 typed event 的 gen/kill。
+    /// 入口、分支和合流点保留状态用于收敛比较，线性链直接转交状态。每个入口可达环
+    /// 必含入口或多前驱节点，因此无出口环也有 checkpoint。观察副产物必须单调合并，
+    /// 需要输出快照时在 transfer 改写状态前投影，不能在中间迭代批准删除。
     pub(super) fn solve_backward<S: Clone>(
         &self,
         bottom: S,
         mut join: impl FnMut(&mut S, &S) -> bool,
         mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S),
-    ) -> Vec<Option<S>> {
+    ) {
         let reachable = self.reachable();
         let mut predecessors = vec![Vec::new(); self.nodes.len()];
         for (source, node) in self.nodes.iter().enumerate() {
@@ -226,10 +239,7 @@ impl<'a> HirFlowGraph<'a> {
                 }
             }
         }
-        let mut outputs = reachable
-            .iter()
-            .map(|&is_reachable| is_reachable.then(|| bottom.clone()))
-            .collect::<Vec<_>>();
+        let mut outputs = vec![None; self.nodes.len()];
         let mut pending = reachable
             .iter()
             .enumerate()
@@ -238,25 +248,25 @@ impl<'a> HirFlowGraph<'a> {
         let mut queued = reachable;
         while let Some(id) = pending.pop_front() {
             queued[id.index()] = false;
-            let mut input = outputs[id.index()]
-                .as_ref()
-                .expect("queued HIR flow node must be reachable")
-                .clone();
+            let output = &mut outputs[id.index()];
+            let mut input = if id == self.entry
+                || self.nodes[id.index()].successors().len() > 1
+                || predecessors[id.index()].len() > 1
+            {
+                output.get_or_insert_with(|| bottom.clone()).clone()
+            } else {
+                output.take().unwrap_or_else(|| bottom.clone())
+            };
             transfer(id, self.nodes[id.index()].kind(), &mut input);
-            for &predecessor in &predecessors[id.index()] {
-                let changed = join(
-                    outputs[predecessor.index()]
-                        .as_mut()
-                        .expect("HIR flow predecessor must be reachable"),
-                    &input,
-                );
-                if changed && !queued[predecessor.index()] {
-                    queued[predecessor.index()] = true;
-                    pending.push_back(predecessor);
-                }
-            }
+            propagate_flow_state(
+                input,
+                predecessors[id.index()].iter().copied(),
+                &mut outputs,
+                &mut pending,
+                &mut queued,
+                &mut join,
+            );
         }
-        outputs
     }
 
     pub(super) fn reachable(&self) -> Vec<bool> {
@@ -281,25 +291,67 @@ impl<'a> HirFlowGraph<'a> {
             .any(|(source, _)| reachable[source.index()])
     }
 
-    fn node_reaches(&self, start: HirFlowNodeId, target: HirFlowNodeId) -> bool {
-        if start == target {
-            return true;
-        }
-        let mut visited = vec![false; self.nodes.len()];
-        visited[start.index()] = true;
-        let mut pending = vec![start];
-        while let Some(node) = pending.pop() {
-            for &successor in self.nodes[node.index()].successors() {
-                if successor == target {
-                    return true;
-                }
-                if !visited[successor.index()] {
-                    visited[successor.index()] = true;
-                    pending.push(successor);
-                }
+    fn reachable_components(&self) -> Vec<Option<usize>> {
+        let traversal = crate::graph::depth_first(
+            self.nodes.len(),
+            self.entry,
+            HirFlowNodeId::index,
+            |_| true,
+            |node| self.nodes[node.index()].successors().iter().copied(),
+        );
+        let mut predecessors = vec![Vec::new(); self.nodes.len()];
+        for &source in &traversal.postorder {
+            for successor in self.nodes[source.index()].successors() {
+                predecessors[successor.index()].push(source);
             }
         }
-        false
+        let components = crate::graph::strongly_connected_components(
+            self.nodes.len(),
+            &traversal.postorder,
+            HirFlowNodeId::index,
+            |node| predecessors[node.index()].iter().copied(),
+        );
+        let mut membership = vec![None; self.nodes.len()];
+        for (component, members) in components.iter().enumerate() {
+            for node in members {
+                membership[node.index()] = Some(component);
+            }
+        }
+        membership
+    }
+}
+
+/// 两个方向共用状态交接：已有输入只借用状态合流，空输入才需要所有权。
+/// 最后一条边可直接移动状态，避免在线性链或已建立的循环 checkpoint 上复制集合。
+fn propagate_flow_state<S: Clone>(
+    state: S,
+    edges: impl Iterator<Item = HirFlowNodeId>,
+    entries: &mut [Option<S>],
+    pending: &mut VecDeque<HirFlowNodeId>,
+    queued: &mut [bool],
+    join: &mut impl FnMut(&mut S, &S) -> bool,
+) {
+    let mut state = Some(state);
+    let mut edges = edges.peekable();
+    while let Some(target) = edges.next() {
+        let changed = match &mut entries[target.index()] {
+            Some(current) => join(
+                current,
+                state.as_ref().expect("remaining edges share state"),
+            ),
+            entry @ None => {
+                *entry = if edges.peek().is_none() {
+                    state.take()
+                } else {
+                    state.clone()
+                };
+                true
+            }
+        };
+        if changed && !queued[target.index()] {
+            queued[target.index()] = true;
+            pending.push_back(target);
+        }
     }
 }
 
@@ -353,10 +405,16 @@ impl OwnerReentryFacts {
         safety: HirExprSafety,
     ) -> Result<Self, LexicalCfgFailure> {
         let graph = HirFlowGraph::for_block(block, safety)?;
-        let reachable = graph.reachable();
         let mut facts = Self::default();
+        if graph.goto_edges.is_empty() {
+            return Ok(facts);
+        }
+        let components = graph.reachable_components();
         for (source, target) in &graph.goto_edges {
-            if reachable[source.index()] && graph.node_reaches(target.node, *source) {
+            // source -> target 已是实际 goto 边；同一可达 SCC 恰好证明 target 能回到 source。
+            if components[source.index()].is_some()
+                && components[source.index()] == components[target.node.index()]
+            {
                 facts.note_target(target);
             }
         }

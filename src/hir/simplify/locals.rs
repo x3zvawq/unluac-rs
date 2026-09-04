@@ -56,8 +56,9 @@ use super::mention::{
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
-    CallRootLifetimeIndices, LookupGcRootLifetimeIndices, collect_call_result_local_roots,
-    collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes, stmt_has_argument_root_handoff,
+    CallRootLifetimeIndices, LookupGcRootLifetimeIndices, RootLifetimeFacts,
+    collect_call_result_local_roots, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
+    stmt_has_argument_root_handoff,
 };
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
@@ -564,8 +565,8 @@ fn promote_block_with_protection(
             };
             certify_batched_initializer_merge_transaction(ctx.proto_id, local_decl, &mut stmt);
         }
-        if is_redundant_binding_self_assign(&stmt) {
-            changed = true;
+        changed |= prune_binding_self_assigns(&mut stmt);
+        if matches!(&stmt, HirStmt::Assign(assign) if assign.targets.is_empty()) {
             temp_refs.leave_stmt(index);
             continue;
         }
@@ -647,8 +648,9 @@ fn collect_plans(
     let stmt_temp_reads = collect_temp_reads_by_stmt(&block.stmts);
     let mut plans = Vec::new();
     let temp_touches = TempTouchIndex::new(stmt_temp_refs);
+    let lifetime_snapshot = RootLifetimeFacts::new(lifetime_stmts);
     let call_root_lifetimes = collect_call_root_lifetimes(
-        lifetime_stmts,
+        &lifetime_snapshot,
         facts,
         ctx.roots,
         true,
@@ -678,7 +680,7 @@ fn collect_plans(
         },
     );
     let lookup_gc_root_lifetimes =
-        collect_lookup_gc_root_lifetimes(lifetime_stmts, facts, ctx.roots.safety, |temp| {
+        collect_lookup_gc_root_lifetimes(&lifetime_snapshot, facts, ctx.roots.safety, |temp| {
             !ctx.identity_sensitive_temps.contains(&temp)
                 && !inherited.contains_key(&temp)
                 && !outer_uses_temp(temp)
@@ -787,21 +789,21 @@ fn collect_plans(
             .collect::<Vec<_>>();
         // 多 home overwrite 必须整条语句一起提交；任一 producer/target 无法对应时，不能只
         // 改写部分 target，留下一半仍写 temp、一半已写 local 的物理生命周期。
+        let mut allocator = PlanAllocator {
+            temp_debug_locals,
+            temp_debug_scopes,
+            plans: &mut plans,
+            reserved_temps: &mut reserved_temps,
+            reserved_alias_indices: &mut reserved_alias_indices,
+            next_local_index: ctx.next_local_index,
+            new_locals: ctx.new_locals,
+            new_local_debug_hints: ctx.new_local_debug_hints,
+            new_local_debug_scopes: ctx.new_local_debug_scopes,
+            promoted_bindings: ctx.promoted_bindings,
+            direct_seed_promotions: ctx.direct_seed_promotions,
+            debug_scope_locals: ctx.debug_scope_locals,
+        };
         for (temps, home, local) in physical_root_handoffs {
-            let mut allocator = PlanAllocator {
-                temp_debug_locals,
-                temp_debug_scopes,
-                plans: &mut plans,
-                reserved_temps: &mut reserved_temps,
-                reserved_alias_indices: &mut reserved_alias_indices,
-                next_local_index: ctx.next_local_index,
-                new_locals: ctx.new_locals,
-                new_local_debug_hints: ctx.new_local_debug_hints,
-                new_local_debug_scopes: ctx.new_local_debug_scopes,
-                promoted_bindings: ctx.promoted_bindings,
-                direct_seed_promotions: ctx.direct_seed_promotions,
-                debug_scope_locals: ctx.debug_scope_locals,
-            };
             // 原 scalar/parallel-nil/branch 语句继续留在原位；这里只把已证明 home 的
             // 全部 target 原子映射到既有 root local，不重新求值 RHS。
             allocator.reuse_existing_local(
@@ -819,6 +821,48 @@ fn collect_plans(
                 // the next one in the same local. Preserve that chained owner for its later pair.
                 physical_root_locals_by_home.insert((decl_index, home), local);
                 slot_candidates.retain(|_, candidate| *candidate != local);
+            }
+        }
+
+        if let HirStmt::Assign(assign) = stmt
+            && assign.targets.len() > 1
+        {
+            for target in &assign.targets {
+                let HirLValue::Temp(temp) = target else {
+                    continue;
+                };
+                if inherited.contains_key(temp) || allocator.reserved_temps.contains(temp) {
+                    continue;
+                }
+                let Some(home) = facts.trusted_temp_home_slot(*temp) else {
+                    continue;
+                };
+                let Some(scope) = temp_debug_scopes.get(temp.index()).copied().flatten() else {
+                    continue;
+                };
+                let Some(local) = allocator.debug_scope_locals.get(&(home, scope)).copied() else {
+                    continue;
+                };
+                let group = BTreeSet::from([*temp]);
+                if slot_candidates.get(&home) != Some(&local)
+                    || outer_uses_temp(*temp)
+                    || temp_touches.touches_before(decl_index, *temp)
+                    || has_label_flow
+                {
+                    // debug scope 身份不代表当前 HIR 声明可见；也不能只改子块的写入，
+                    // 留下外部/回边读取旧 temp。多目标尚无 label-flow promotion 证明。
+                    continue;
+                }
+                // 并行 carried seed 与单目标写入消费同一 debug scope 身份；保留 RHS
+                // 求值和赋值位置，不因机械批次制造另一个强根。
+                allocator.reuse_existing_local(
+                    decl_index,
+                    local,
+                    Some(home),
+                    group,
+                    BTreeSet::new(),
+                    PromotionInit::Empty,
+                );
             }
         }
 
@@ -1682,17 +1726,57 @@ fn scalar_temp_assign_targets_for_home(
         .collect()
 }
 
-fn is_redundant_binding_self_assign(stmt: &HirStmt) -> bool {
+fn prune_binding_self_assigns(stmt: &mut HirStmt) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return false;
     };
-    matches!(
-        (assign.targets.as_slice(), assign.values.fixed.as_slice(), &assign.values.tail),
-        ([HirLValue::Temp(target)], [HirExpr::TempRef(value)], None) if target == value
-    ) || matches!(
-        (assign.targets.as_slice(), assign.values.fixed.as_slice(), &assign.values.tail),
-        ([HirLValue::Local(target)], [HirExpr::LocalRef(value)], None) if target == value
-    )
+    if assign.values.tail.is_some()
+        || assign.targets.len() != assign.values.fixed.len()
+        || assign.initializer_merge_transaction.is_some()
+        || assign.generic_for_initializer_producer.is_some()
+        || assign.method_rewrite_transaction.is_some()
+    {
+        return false;
+    }
+    let mut temps = BTreeSet::new();
+    let mut locals = BTreeSet::new();
+    if !assign.targets.iter().all(|target| match target {
+        HirLValue::Temp(temp) => temps.insert(*temp),
+        HirLValue::Local(local) => locals.insert(*local),
+        _ => false,
+    }) || !assign.values.fixed.iter().all(|value| {
+        matches!(
+            value,
+            HirExpr::Nil
+                | HirExpr::Boolean(_)
+                | HirExpr::Integer(_)
+                | HirExpr::Number(_)
+                | HirExpr::TempRef(_)
+                | HirExpr::LocalRef(_)
+                | HirExpr::ParamRef(_)
+        )
+    }) {
+        return false;
+    }
+    // RHS 无调用/分配且目标不重复，去掉 x=x 不会恢复其它分量更新前的快照，
+    // 也不改变观察期间的根。只删除配对分量，余下赋值保持并行。
+    let keep = assign
+        .targets
+        .iter()
+        .zip(&assign.values.fixed)
+        .map(|(target, value)| {
+            !matches!((target, value), (HirLValue::Temp(a), HirExpr::TempRef(b)) if a == b)
+                && !matches!((target, value), (HirLValue::Local(a), HirExpr::LocalRef(b)) if a == b)
+        })
+        .collect::<Vec<_>>();
+    if keep.iter().all(|keep| *keep) {
+        return false;
+    }
+    let mut indices = keep.iter();
+    assign.targets.retain(|_| *indices.next().unwrap());
+    let mut indices = keep.iter();
+    assign.values.fixed.retain(|_| *indices.next().unwrap());
+    true
 }
 
 fn alias_temp_for_group(stmt: &HirStmt, group: &BTreeSet<TempId>) -> Option<TempId> {
@@ -2301,7 +2385,7 @@ mod tests {
         ];
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
         let call_roots = collect_call_root_lifetimes(
-            &stmts,
+            &RootLifetimeFacts::new(&stmts),
             &facts,
             RootAnalysisContext {
                 safety,

@@ -245,6 +245,41 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn timeout_termination_closes_descendant_output_pipe() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+
+        // cmd 等待 ping，ping 继承 stdout；只杀 cmd 时管道会再保持约 9 秒。
+        // 有限 ping 保证失败的测试也不会留下永久运行的探针。
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/C", "ping.exe -n 10 127.0.0.1"])
+            .creation_flags(0x0800_0000)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let mut line = Vec::new();
+        while !line.windows(9).any(|bytes| bytes == b"127.0.0.1") {
+            line.clear();
+            assert_ne!(reader.read_until(b'\n', &mut line).unwrap(), 0);
+        }
+        super::terminate_timed_out_runner(&mut child).unwrap();
+        assert!(!child.wait().unwrap().success());
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = reader.read_to_end(&mut Vec::new());
+            let _ = sender.send(result);
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("terminated descendants must release the output pipe")
+            .unwrap();
+    }
+
     #[test]
     fn parse_args_should_reject_zero_jobs() {
         let error = parse_args(["--jobs", "0"]).expect_err("zero jobs should be rejected");

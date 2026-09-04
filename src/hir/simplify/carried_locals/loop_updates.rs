@@ -23,7 +23,7 @@ use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLabelId, HirStmt, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::promotion::ProtoPromotionFacts;
+use crate::hir::promotion::{HomeSlots, ProtoPromotionFacts};
 
 use super::super::label_refs::count_label_references;
 use super::super::lexical_cfg::LexicalCfg;
@@ -378,7 +378,7 @@ fn repeat_gap_safety(
 fn conservative_binding_homes(
     binding: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
-) -> BTreeSet<crate::hir::promotion::HomeSlotKey> {
+) -> HomeSlots<'_> {
     match binding {
         CarryBinding::Param(param) => promotion_facts.complete_param_home_slots(param),
         CarryBinding::Local(local) => promotion_facts.complete_local_home_slots(local),

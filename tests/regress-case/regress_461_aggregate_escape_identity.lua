@@ -75,3 +75,36 @@ until check_alive()
 collectgarbage("collect")
 assert(weak[1] == nil)
 print("regress_461_aggregate_escape_identity#3")
+
+-- 回边和分支合流必须保持并行赋值前的两份对象身份，不能逐目标读取已更新的状态。
+local function swap_holders(flag)
+    local left = { marker = 11 }
+    local right = { marker = 22 }
+    local holder = {}
+    local round = 0
+    repeat
+        if flag then
+            left, right = right, left
+        else
+            left, right = left, right
+        end
+        holder.value = right
+        round = round + 1
+    until round == 3
+    assert(left.marker == (flag and 22 or 11))
+    local function deliver()
+        weak[1] = holder.value
+        holder.value = nil
+    end
+    deliver()
+    collectgarbage("collect")
+    assert(weak[1] == right)
+    assert(right.marker == (flag and 11 or 22))
+    right = nil
+    collectgarbage("collect")
+    collectgarbage("collect")
+    assert(weak[1] == nil)
+end
+swap_holders(true)
+swap_holders(false)
+print("regress_461_aggregate_escape_identity#4")

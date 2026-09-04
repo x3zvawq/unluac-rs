@@ -18,8 +18,10 @@
 //! 同值 frame-end copy 的覆盖证明同时消费前层非资源旧值与两个完整 root transaction，
 //! 并复核当前 HIR 未改写 home；删除副本的 owner 必须物化原值根，不能只抹掉负向标记。
 //! 潜在求值事件与分支覆盖值的 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
+//! 同一语句快照的读写、参数交接与 GC fence 索引由 RootLifetimeFacts 共享；借用期间
+//! 不允许改写语句，例如 locals 可用同一快照分别配对 call 与 lookup 的覆盖端点。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::hir::common::{
     HirAssign, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, HirUnaryOpKind,
@@ -335,10 +337,6 @@ impl CallRootLifetimeIndices {
         marked
     }
 
-    fn pre_dispatch_releases(&self) -> &BTreeMap<usize, BTreeSet<TempId>> {
-        &self.pre_dispatch_releases
-    }
-
     /// 签发由 distinct pure scope-end owner 覆盖的 method receiver root handoff。
     ///
     /// 这里组合 allocation-root producer/overwrite pair、direct SSA copy、trusted homes 与
@@ -465,13 +463,15 @@ impl LookupGcRootOverwritePair {
 }
 
 pub(super) fn collect_call_root_lifetimes(
-    stmts: &[HirStmt],
+    snapshot: &RootLifetimeFacts<'_>,
     facts: &ProtoPromotionFacts,
     context: RootAnalysisContext<'_>,
     observe_potential_events: bool,
     mut producer_temp_is_eligible: impl FnMut(TempId) -> bool,
     mut overwrite_temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> CallRootLifetimeIndices {
+    let stmts = snapshot.stmts;
+    let uses = &snapshot.uses;
     let safety = context.safety;
     let opaque_allocations = stmts
         .iter()
@@ -481,7 +481,6 @@ pub(super) fn collect_call_root_lifetimes(
                 .then_some(temp)
         })
         .collect::<BTreeSet<_>>();
-    let uses = TempUseEvents::new(stmts);
     let mut active = BTreeMap::<HomeSlotKey, ActiveCallRoot>::new();
     let mut next_call_value_id = 0;
     let mut active_allocations = Vec::<ActiveAllocationRoot>::new();
@@ -549,7 +548,7 @@ pub(super) fn collect_call_root_lifetimes(
             release_roots_before_generic_dispatch(
                 index,
                 &result_homes,
-                &uses,
+                uses,
                 facts,
                 &mut active,
                 &mut active_allocations,
@@ -626,7 +625,7 @@ pub(super) fn collect_call_root_lifetimes(
                             index,
                             target.home,
                             true,
-                            &uses,
+                            uses,
                             &mut lifetimes,
                         );
                     }
@@ -669,14 +668,14 @@ pub(super) fn collect_call_root_lifetimes(
                             index,
                             home,
                             eligible,
-                            &uses,
+                            uses,
                             &mut lifetimes,
                         );
                     }
                     let mut allocation_state = AllocationRootState {
                         active: &mut active_allocations,
                         lifetimes: &mut lifetimes,
-                        uses: &uses,
+                        uses,
                         facts,
                     };
                     for temp in temps {
@@ -734,14 +733,14 @@ pub(super) fn collect_call_root_lifetimes(
                         index,
                         home,
                         overwrite.eligible,
-                        &uses,
+                        uses,
                         &mut lifetimes,
                     );
                 }
                 terminate_allocation_home(
                     &mut active_allocations,
                     &mut lifetimes,
-                    &uses,
+                    uses,
                     facts,
                     index,
                     home,
@@ -805,7 +804,7 @@ pub(super) fn collect_call_root_lifetimes(
         let mut allocation_state = AllocationRootState {
             active: &mut active_allocations,
             lifetimes: &mut lifetimes,
-            uses: &uses,
+            uses,
             facts,
         };
         update_allocation_roots(
@@ -839,7 +838,7 @@ pub(super) fn collect_call_root_lifetimes(
                         index,
                         *write_home,
                         overwrite_eligible,
-                        &uses,
+                        uses,
                         &mut lifetimes,
                     );
                 }
@@ -860,14 +859,7 @@ pub(super) fn collect_call_root_lifetimes(
         }
 
         if let Some(root) = active.remove(&slot) {
-            record_call_root_overwrite(
-                root,
-                index,
-                slot,
-                overwrite_eligible,
-                &uses,
-                &mut lifetimes,
-            );
+            record_call_root_overwrite(root, index, slot, overwrite_eligible, uses, &mut lifetimes);
         }
 
         if let HirExpr::TempRef(source) = value {
@@ -972,7 +964,7 @@ pub(super) fn collect_call_root_lifetimes(
         stmts,
         facts,
         safety,
-        &uses,
+        uses,
         &allocation_roots,
         &mut producer_temp_is_eligible,
         &mut overwrite_temp_is_eligible,
@@ -1155,15 +1147,21 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
     context: RootAnalysisContext<'_>,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
 ) -> bool {
-    let lifetimes = collect_call_root_lifetimes(
-        &block.stmts,
-        facts,
-        context,
-        true,
-        &mut *temp_is_eligible,
-        |_| true,
-    );
-    let releases = lifetimes.pre_dispatch_releases().clone();
+    // 释放端点只可能是当前 block 的显式 dispatch；子块由下面的递归独立处理。
+    let releases = if block.stmts.iter().any(|stmt| {
+        matches!(stmt, HirStmt::GenericFor(for_stmt) if !for_stmt.dispatch_results.is_empty())
+    }) {
+        collect_call_root_lifetimes(
+            &RootLifetimeFacts::new(&block.stmts),
+            facts,
+            context,
+            true,
+            &mut *temp_is_eligible,
+            |_| true,
+        ).pre_dispatch_releases
+    } else {
+        BTreeMap::new()
+    };
     let mut changed = !releases.is_empty();
     let old_stmts = std::mem::take(&mut block.stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len() + releases.len());
@@ -1268,12 +1266,13 @@ fn materialize_generic_for_dispatch_root_releases_in_stmt(
 /// block 的词法 local 保活到 block end。block 外的 successor 不属于该 local 的可见区间，
 /// 因此无需猜测跨块 home 复用。
 pub(super) fn collect_lookup_gc_root_lifetimes(
-    stmts: &[HirStmt],
+    snapshot: &RootLifetimeFacts<'_>,
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
     mut temp_is_eligible: impl FnMut(TempId) -> bool,
 ) -> LookupGcRootLifetimeIndices {
-    let uses = TempUseEvents::new(stmts);
+    let stmts = snapshot.stmts;
+    let uses = &snapshot.uses;
     if uses.gc_fence_indices.is_empty()
         && !stmts.iter().any(|stmt| matches!(stmt, HirStmt::Return(_)))
     {
@@ -1342,7 +1341,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 &active,
                 &value_by_temp,
                 &reference_captured_temps,
-                &uses,
+                uses,
                 facts,
             ) {
                 // `source ~= nil` 的分支已经先把同一 identity 交给另一个 reference-captured
@@ -1374,7 +1373,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                             index,
                             overwrite.home,
                             overwrite.eligible,
-                            &uses,
+                            uses,
                             facts,
                             &mut lifetimes,
                         );
@@ -1418,7 +1417,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                     index,
                     home,
                     overwrite.eligible,
-                    &uses,
+                    uses,
                     facts,
                     &mut lifetimes,
                 );
@@ -1483,7 +1482,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
             for alias in &root.aliases {
                 value_by_temp.remove(alias);
             }
-            record_lookup_root_overwrite(root, index, home, eligible, &uses, facts, &mut lifetimes);
+            record_lookup_root_overwrite(root, index, home, eligible, uses, facts, &mut lifetimes);
         }
 
         if let Some(value_id) = incoming_value {
@@ -2420,67 +2419,91 @@ impl HirVisitor for GcRootObservationCollector {
     }
 }
 
+pub(super) struct RootLifetimeFacts<'a> {
+    stmts: &'a [HirStmt],
+    uses: TempUseEvents,
+}
+
+impl<'a> RootLifetimeFacts<'a> {
+    pub(super) fn new(stmts: &'a [HirStmt]) -> Self {
+        Self {
+            stmts,
+            uses: TempUseEvents::new(stmts),
+        }
+    }
+}
+
 struct TempUseEvents {
-    argument_transfers: BTreeMap<TempId, Vec<usize>>,
-    reads: BTreeMap<TempId, Vec<usize>>,
+    // 只按 identity 查询，不枚举 hash 顺序；事件顺序由语句扫描固定。
+    by_temp: HashMap<TempId, TempEvents>,
     reads_by_stmt: Vec<BTreeSet<TempId>>,
-    writes: BTreeMap<TempId, Vec<usize>>,
     gc_fence_indices: BTreeSet<usize>,
+}
+
+#[derive(Default)]
+struct TempEvents {
+    reads: Vec<usize>,
+    writes: Vec<usize>,
+    argument_transfers: Vec<usize>,
 }
 
 impl TempUseEvents {
     fn new(stmts: &[HirStmt]) -> Self {
         let reads_by_stmt = collect_temp_reads_by_stmt(stmts);
-        let mut reads = BTreeMap::<TempId, Vec<usize>>::new();
+        let mut by_temp = HashMap::<TempId, TempEvents>::new();
         for (index, temps) in reads_by_stmt.iter().enumerate() {
             for temp in temps {
-                reads.entry(*temp).or_default().push(index);
+                by_temp.entry(*temp).or_default().reads.push(index);
             }
         }
 
-        let mut writes = BTreeMap::<TempId, Vec<usize>>::new();
-        let mut argument_transfers = BTreeMap::<TempId, Vec<usize>>::new();
         for (index, stmt) in stmts.iter().enumerate() {
             let mut collector = TempWriteCollector::default();
             visit_stmts(std::slice::from_ref(stmt), &mut collector);
             for temp in collector.temps {
-                writes.entry(temp).or_default().push(index);
+                by_temp.entry(temp).or_default().writes.push(index);
             }
             for temp in collector.argument_transfers {
-                argument_transfers.entry(temp).or_default().push(index);
+                by_temp
+                    .entry(temp)
+                    .or_default()
+                    .argument_transfers
+                    .push(index);
             }
         }
         Self {
-            argument_transfers,
-            reads,
+            by_temp,
             reads_by_stmt,
-            writes,
             gc_fence_indices: collect_gc_fence_indices(stmts),
         }
     }
 
     /// 精确配对本快照内唯一的 producer 与 call 参数端点。多写或重复 call token 必须拒绝。
     fn has_argument_transfer(&self, temp: TempId, producer: usize, overwrite: usize) -> bool {
-        self.writes
-            .get(&temp)
-            .is_some_and(|writes| writes.as_slice() == [producer])
-            && self.argument_transfers.get(&temp).is_some_and(|sites| {
-                let [site] = sites.as_slice() else {
-                    return false;
-                };
-                producer < *site && *site <= overwrite
-            })
+        let Some(events) = self.by_temp.get(&temp) else {
+            return false;
+        };
+        let [site] = events.argument_transfers.as_slice() else {
+            return false;
+        };
+        events.writes.as_slice() == [producer] && producer < *site && *site <= overwrite
     }
 
     fn has_live_read_after(&self, temp: TempId, index: usize) -> bool {
-        let next_read = next_event_after(self.reads.get(&temp), index);
-        let next_write = next_event_after(self.writes.get(&temp), index);
+        let Some(events) = self.by_temp.get(&temp) else {
+            return false;
+        };
+        let next_read = next_event_after(Some(&events.reads), index);
+        let next_write = next_event_after(Some(&events.writes), index);
         next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
     }
 
     fn has_live_read_from(&self, temp: TempId, index: usize) -> bool {
-        let next_read = next_event_at_or_after(self.reads.get(&temp), index);
-        let next_write = next_event_at_or_after(self.writes.get(&temp), index);
+        let Some(events) = self.by_temp.get(&temp) else {
+            return false;
+        };
+        let next_read = next_event_at_or_after(Some(&events.reads), index);
+        let next_write = next_event_at_or_after(Some(&events.writes), index);
         next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
     }
 
@@ -3028,7 +3051,7 @@ mod tests {
         ];
 
         let lifetimes = collect_call_root_lifetimes(
-            &stmts,
+            &RootLifetimeFacts::new(&stmts),
             &facts,
             RootAnalysisContext {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Luau),
@@ -3065,7 +3088,7 @@ mod tests {
         ];
 
         let lifetimes = collect_call_root_lifetimes(
-            &stmts,
+            &RootLifetimeFacts::new(&stmts),
             &facts,
             RootAnalysisContext {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Luau),

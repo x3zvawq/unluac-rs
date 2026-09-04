@@ -3,6 +3,7 @@
 mod effects;
 mod liveness;
 mod open;
+mod overwrites;
 mod ssa;
 
 use std::collections::{BTreeSet, VecDeque};
@@ -198,6 +199,13 @@ fn compute_dataflow_proto(
         proto.instrs.len(),
         &incoming_slots,
     )?;
+    let def_overwritten_values = overwrites::analyze_overwritten_values(
+        cfg,
+        &instr_effects,
+        &defs,
+        &instr_defs,
+        &ssa.block_entry_values,
+    );
     Ok(DataflowFacts {
         instr_effects,
         effect_summaries,
@@ -209,6 +217,7 @@ fn compute_dataflow_proto(
         block_end_values: ssa.block_end_values,
         use_values: ssa.use_values,
         def_uses: ssa.def_uses,
+        def_overwritten_values,
         def_phi_uses: ssa.def_phi_uses,
         phi_uses: ssa.phi_uses,
         phi_phi_uses: ssa.phi_phi_uses,

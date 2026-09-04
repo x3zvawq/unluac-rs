@@ -14,6 +14,7 @@ use crate::structure::StructureError;
 
 pub use build::build_cfg_graph;
 pub(crate) use build::build_cfg_proto;
+pub(crate) use common::SccId;
 pub use common::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,

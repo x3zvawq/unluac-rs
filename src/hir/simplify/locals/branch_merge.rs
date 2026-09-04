@@ -186,9 +186,11 @@ impl<'a> RegionTempFlow<'a> {
                 changed
             },
             |id, _, outgoing| {
+                let incoming = *outgoing;
                 if self.events[id.index()].writes.contains(&temp) {
                     *outgoing = self.events[id.index()].gc_inert_writes.contains(&temp);
                 }
+                incoming
             },
         );
 
@@ -203,7 +205,11 @@ impl<'a> RegionTempFlow<'a> {
                 current.retain(|temp| outgoing.contains(temp));
                 current.len() != before
             },
-            |id, _, outgoing| outgoing.extend(self.events[id.index()].writes.iter().copied()),
+            |id, _, outgoing| {
+                let incoming = outgoing.clone();
+                outgoing.extend(self.events[id.index()].writes.iter().copied());
+                incoming
+            },
         );
 
         let reads_before_assignment = self

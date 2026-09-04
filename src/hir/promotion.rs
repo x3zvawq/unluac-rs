@@ -24,6 +24,8 @@
 //!   的 temp 被后续 HIR 内联删除，下一次 MOVE 仍能证明没有旧对象需要释放
 //! - ordinary CALL 参数交接沿 Dataflow SSA 固定前缀与 caller 边界发布到具体调用，
 //!   例如 `f({})` 的参数 home 不得在后层被重建成调用后继续持有的 caller root
+//! - possible/complete home query 借用已有集合；定义写需要补充新 home 时才复制。
+//!   跨 provenance 改写保存来源的 owner 显式取得 owned 快照，不让后层缓存整份映射。
 
 mod call_roots;
 
@@ -37,6 +39,7 @@ use crate::structure::{
     RegionId, RegionPlan, RootObservation, SideEffectSummary, SsaValue, StructurePlan,
 };
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// temp promotion 使用的词法槽位身份。
@@ -290,6 +293,9 @@ impl HomeSlotKey {
     }
 }
 
+/// 物理 home 集合视图：已有事实借用，新增写入的并集按需持有独立存储。
+pub(super) type HomeSlots<'a> = Cow<'a, BTreeSet<HomeSlotKey>>;
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 enum HomeSlotResolution {
     #[default]
@@ -312,9 +318,9 @@ impl HomeSlotResolution {
         homes.next().is_none().then_some(home)
     }
 
-    fn complete_homes(&self) -> Option<BTreeSet<HomeSlotKey>> {
+    fn complete_homes(&self) -> Option<&BTreeSet<HomeSlotKey>> {
         match self {
-            Self::Known(homes) => Some(homes.clone()),
+            Self::Known(homes) => Some(homes),
             Self::Pending | Self::Unknown => None,
         }
     }
@@ -472,7 +478,7 @@ impl ProtoPromotionFacts {
             ),
             temp_home_slots,
             immediate_move_write_homes,
-            inert_home_overwrites: collect_inert_home_overwrites(proto, cfg, dataflow, fixed_temps),
+            inert_home_overwrites: collect_inert_home_overwrites(proto, dataflow, fixed_temps),
             entry_nil_phi_temps: collect_entry_nil_phi_temps(proto, dataflow, plan, phi_temps),
             entry_nil_phi_locals: BTreeSet::new(),
             entry_nil_pruned_locals: BTreeSet::new(),
@@ -510,6 +516,26 @@ impl ProtoPromotionFacts {
 
     pub(super) fn is_direct_table_seed_temp(&self, temp: TempId) -> bool {
         self.direct_table_seed_temps.contains(&temp)
+    }
+
+    /// 多个静态 definition 合为一个 carrier 后，home 仍精确，但原 producer 的专属
+    /// 正向证书不再代表整个 binding。物理根负向事实由合并入口保护，不在此处删除。
+    pub(super) fn retire_coalesced_definition_facts(&mut self, temps: &BTreeSet<TempId>) {
+        self.inert_home_overwrites
+            .retain(|temp, _| !temps.contains(temp));
+        self.entry_nil_phi_temps
+            .retain(|temp| !temps.contains(temp));
+        self.direct_table_seed_temps
+            .retain(|temp| !temps.contains(temp));
+        self.repeat_condition_prefix_temps
+            .retain(|temp| !temps.contains(temp));
+        self.loop_carrier_temps.retain(|temp| !temps.contains(temp));
+        self.promoted_local_by_temp
+            .retain(|temp, _| !temps.contains(temp));
+        self.argument_root_producers
+            .retain(|temp| !temps.contains(temp));
+        self.unobserved_call_result_ends
+            .retain(|producer, end| !temps.contains(producer) && !temps.contains(end));
     }
 
     /// 该 canonical fixed def 在所有可达前驱路径上覆盖非参数槽的入口 nil。
@@ -791,37 +817,37 @@ impl ProtoPromotionFacts {
     ///
     /// `Some(empty)` 表示由 HIR 合成且明确 home-free；`None` 表示某次
     /// merge 的来源本身就缺 provenance，不得用 raw home 冒充完整集合。
-    pub(super) fn possible_param_home_slots(
-        &self,
-        param: ParamId,
-    ) -> Option<BTreeSet<HomeSlotKey>> {
+    /// 已存储集合借用当前 facts；需要跨改写保留来源时显式 `into_owned`。
+    pub(super) fn possible_param_home_slots(&self, param: ParamId) -> Option<HomeSlots<'_>> {
         match self.possible_param_homes.get(&param) {
-            Some(homes) => homes.clone(),
-            None => Some(BTreeSet::from([HomeSlotKey::new(param.index(), 0)])),
+            Some(homes) => homes.as_ref().map(Cow::Borrowed),
+            None => Some(Cow::Owned(BTreeSet::from([HomeSlotKey::new(
+                param.index(),
+                0,
+            )]))),
         }
     }
 
-    pub(super) fn possible_local_home_slots(
-        &self,
-        local: LocalId,
-    ) -> Option<BTreeSet<HomeSlotKey>> {
+    pub(super) fn possible_local_home_slots(&self, local: LocalId) -> Option<HomeSlots<'_>> {
         match self.possible_local_homes.get(&local) {
-            Some(homes) => homes.clone(),
-            None if self.local_has_no_physical_home(local) => Some(BTreeSet::new()),
+            Some(homes) => homes.as_ref().map(Cow::Borrowed),
+            None if self.local_has_no_physical_home(local) => Some(Cow::Owned(BTreeSet::new())),
             None => self
                 .local_home_slots
                 .get(local.index())
-                .and_then(HomeSlotResolution::complete_homes),
+                .and_then(HomeSlotResolution::complete_homes)
+                .map(Cow::Borrowed),
         }
     }
 
-    pub(super) fn possible_temp_home_slots(&self, temp: TempId) -> Option<BTreeSet<HomeSlotKey>> {
+    pub(super) fn possible_temp_home_slots(&self, temp: TempId) -> Option<HomeSlots<'_>> {
         match self.possible_temp_homes.get(&temp) {
-            Some(homes) => homes.clone(),
+            Some(homes) => homes.as_ref().map(Cow::Borrowed),
             None => self
                 .temp_home_slots
                 .get(temp.index())
-                .and_then(HomeSlotResolution::complete_homes),
+                .and_then(HomeSlotResolution::complete_homes)
+                .map(Cow::Borrowed),
         }
     }
 
@@ -829,30 +855,30 @@ impl ProtoPromotionFacts {
     ///
     /// provenance 未知仍表示它来自某个物理 binding，因此必须扩大到当前 proto 的
     /// 完整 home universe；只有显式 `Some(empty)` 才表示 HIR 合成且 home-free。
-    pub(super) fn complete_param_home_slots(&self, param: ParamId) -> BTreeSet<HomeSlotKey> {
+    pub(super) fn complete_param_home_slots(&self, param: ParamId) -> HomeSlots<'_> {
         self.complete_possible_home_slots(self.possible_param_home_slots(param))
     }
 
     /// 返回 local 在当前 HIR 改写后保守且完整的物理 home 集合。
-    pub(super) fn complete_local_home_slots(&self, local: LocalId) -> BTreeSet<HomeSlotKey> {
+    pub(super) fn complete_local_home_slots(&self, local: LocalId) -> HomeSlots<'_> {
         self.complete_possible_home_slots(self.possible_local_home_slots(local))
     }
 
     /// 返回 temp 在当前 HIR 改写后保守且完整的物理 home 集合。
-    pub(super) fn complete_temp_home_slots(&self, temp: TempId) -> BTreeSet<HomeSlotKey> {
+    pub(super) fn complete_temp_home_slots(&self, temp: TempId) -> HomeSlots<'_> {
         self.complete_possible_home_slots(self.possible_temp_home_slots(temp))
     }
 
-    fn complete_possible_home_slots(
-        &self,
-        possible: Option<BTreeSet<HomeSlotKey>>,
-    ) -> BTreeSet<HomeSlotKey> {
+    fn complete_possible_home_slots<'a>(
+        &'a self,
+        possible: Option<HomeSlots<'a>>,
+    ) -> HomeSlots<'a> {
         possible.unwrap_or_else(|| {
             assert!(
                 !self.physical_home_universe.is_empty(),
                 "unknown physical binding requires a non-empty physical-home universe"
             );
-            self.physical_home_universe.clone()
+            Cow::Borrowed(&self.physical_home_universe)
         })
     }
 
@@ -870,7 +896,10 @@ impl ProtoPromotionFacts {
         param: ParamId,
         source_homes: Option<BTreeSet<HomeSlotKey>>,
     ) {
-        let merged = merge_possible_home_slots(self.possible_param_home_slots(param), source_homes);
+        let merged = merge_possible_home_slots(
+            self.possible_param_home_slots(param).map(Cow::into_owned),
+            source_homes,
+        );
         self.possible_param_homes.insert(param, merged);
         self.invalidated_param_homes.insert(param);
     }
@@ -880,7 +909,10 @@ impl ProtoPromotionFacts {
         local: LocalId,
         source_homes: Option<BTreeSet<HomeSlotKey>>,
     ) {
-        let merged = merge_possible_home_slots(self.possible_local_home_slots(local), source_homes);
+        let merged = merge_possible_home_slots(
+            self.possible_local_home_slots(local).map(Cow::into_owned),
+            source_homes,
+        );
         if merged.as_ref().is_some_and(BTreeSet::is_empty) {
             self.home_free_locals.insert(local);
         } else {
@@ -897,7 +929,10 @@ impl ProtoPromotionFacts {
         temp: TempId,
         source_homes: Option<BTreeSet<HomeSlotKey>>,
     ) {
-        let merged = merge_possible_home_slots(self.possible_temp_home_slots(temp), source_homes);
+        let merged = merge_possible_home_slots(
+            self.possible_temp_home_slots(temp).map(Cow::into_owned),
+            source_homes,
+        );
         self.possible_temp_homes.insert(temp, merged);
         self.invalidated_temp_homes.insert(temp);
     }
@@ -982,17 +1017,17 @@ impl ProtoPromotionFacts {
     /// 返回该 producer 紧邻透明 MOVE 链可能写入的完整物理 home 集合。
     ///
     /// home provenance 已失效时，consumer 仍须按任意物理 home 都可能被写入处理。
-    pub(super) fn complete_immediate_move_write_homes(
-        &self,
-        temp: TempId,
-    ) -> BTreeSet<HomeSlotKey> {
+    pub(super) fn complete_immediate_move_write_homes(&self, temp: TempId) -> HomeSlots<'_> {
         if self
             .possible_temp_home_slots(temp)
             .is_some_and(|homes| homes.is_empty())
         {
-            return BTreeSet::new();
+            return Cow::Owned(BTreeSet::new());
         }
-        self.complete_possible_home_slots(self.trusted_immediate_move_write_homes(temp).cloned())
+        self.complete_possible_home_slots(
+            self.trusted_immediate_move_write_homes(temp)
+                .map(Cow::Borrowed),
+        )
     }
 
     /// 返回一次最终 temp 定义可能写入的全部物理 home。
@@ -1000,32 +1035,36 @@ impl ProtoPromotionFacts {
     /// 除 temp 自身 home 外，还包含 low IR 中紧邻而被 HIR 隐藏的透明 MOVE，以及 carried
     /// binding 合并时继承的定义写。consumer 必须在定义 lvalue 处查询，不能在读取 TempRef
     /// 时把这些写副作用补回。
-    pub(super) fn complete_temp_definition_write_homes(
-        &self,
-        temp: TempId,
-    ) -> BTreeSet<HomeSlotKey> {
-        let mut homes = self.complete_temp_home_slots(temp);
-        homes.extend(self.supplemental_temp_definition_write_homes(temp));
-        homes
+    pub(super) fn complete_temp_definition_write_homes(&self, temp: TempId) -> HomeSlots<'_> {
+        Self::with_supplemental_write_homes(
+            self.complete_temp_home_slots(temp),
+            self.supplemental_temp_definition_write_homes(temp),
+        )
     }
 
     /// 返回一次最终 local 定义可能写入的全部物理 home。
-    pub(super) fn complete_local_definition_write_homes(
-        &self,
-        local: LocalId,
-    ) -> BTreeSet<HomeSlotKey> {
-        let mut homes = self.complete_local_home_slots(local);
-        homes.extend(self.supplemental_local_definition_write_homes(local));
-        homes
+    pub(super) fn complete_local_definition_write_homes(&self, local: LocalId) -> HomeSlots<'_> {
+        Self::with_supplemental_write_homes(
+            self.complete_local_home_slots(local),
+            self.supplemental_local_definition_write_homes(local),
+        )
     }
 
     /// 返回一次最终 param 定义可能写入的全部物理 home。
-    pub(super) fn complete_param_definition_write_homes(
-        &self,
-        param: ParamId,
-    ) -> BTreeSet<HomeSlotKey> {
-        let mut homes = self.complete_param_home_slots(param);
-        homes.extend(self.supplemental_param_definition_write_homes(param));
+    pub(super) fn complete_param_definition_write_homes(&self, param: ParamId) -> HomeSlots<'_> {
+        Self::with_supplemental_write_homes(
+            self.complete_param_home_slots(param),
+            self.supplemental_param_definition_write_homes(param),
+        )
+    }
+
+    fn with_supplemental_write_homes(
+        mut homes: HomeSlots<'_>,
+        writes: BTreeSet<HomeSlotKey>,
+    ) -> HomeSlots<'_> {
+        if !writes.is_subset(&homes) {
+            homes.to_mut().extend(writes);
+        }
         homes
     }
 
@@ -1110,10 +1149,11 @@ impl ProtoPromotionFacts {
     pub(super) fn complete_tbc_home_slots(
         &self,
         reg_index: usize,
-        value_homes: BTreeSet<HomeSlotKey>,
+        value_homes: &BTreeSet<HomeSlotKey>,
     ) -> BTreeSet<HomeSlotKey> {
         let matching_value_homes = value_homes
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|home| home.slot() == reg_index)
             .collect::<BTreeSet<_>>();
         if !matching_value_homes.is_empty() {
@@ -1157,7 +1197,10 @@ impl ProtoPromotionFacts {
         let source_home = self.trusted_temp_home_slot(temp);
         let target_home = self.trusted_local_home_slot(local);
         if source_home.is_none() || source_home != target_home {
-            self.record_local_home_merge(local, self.possible_temp_home_slots(temp));
+            self.record_local_home_merge(
+                local,
+                self.possible_temp_home_slots(temp).map(Cow::into_owned),
+            );
         }
     }
 
@@ -1210,7 +1253,10 @@ impl ProtoPromotionFacts {
         let source_home = self.trusted_local_home_slot(local);
         let target_home = self.trusted_param_home_slot(param);
         if source_home.is_none() || source_home != target_home {
-            self.record_param_home_merge(param, self.possible_local_home_slots(local));
+            self.record_param_home_merge(
+                param,
+                self.possible_local_home_slots(local).map(Cow::into_owned),
+            );
         }
     }
 
@@ -1598,39 +1644,29 @@ enum InertHomeOverwrite {
 
 fn collect_inert_home_overwrites(
     proto: &LoweredProto,
-    cfg: &Cfg,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
 ) -> BTreeMap<TempId, InertHomeOverwrite> {
     let param_count = usize::from(proto.signature.num_params);
     let vararg_param_reg = proto.signature.has_vararg_param_reg.then_some(param_count);
-    let mut previous_defs = BTreeMap::new();
     let mut overwrites = BTreeMap::new();
     for def in &dataflow.defs {
-        let previous = previous_defs.insert((def.block, def.reg), def.id);
         let direct = TempId(def.id.index());
         if fixed_temps.get(def.id.index()) != Some(&direct) {
             continue;
         }
-        if let Some(previous) = previous {
-            // 同一 basic block 内的上一条精确写已经覆盖所有入口路径；不依赖
-            // pruned SSA 是否仍为这个“只被覆盖而未读取”的旧值保留 use。
-            // open result 没有 fixed DefId，必须从同一 InstrEffect 检查它是否已覆盖该槽。
-            let previous_instr = dataflow.def_instr(previous).index();
-            let overwritten_by_open_result = dataflow.instr_effects
-                [previous_instr + 1..def.instr.index()]
-                .iter()
-                .any(|effect| effect.must_define(def.reg));
-            if !overwritten_by_open_result
-                && !ssa_value_may_hold_gc_root(proto, dataflow, SsaValue::Def(previous))
+        match dataflow.def_overwritten_value(def.id) {
+            Some(SsaValue::Def(previous))
+                if !ssa_value_may_hold_gc_root(proto, dataflow, SsaValue::Def(previous)) =>
             {
                 overwrites.insert(direct, InertHomeOverwrite::DefinedScalar);
             }
-        } else if def.reg.index() >= param_count
-            && Some(def.reg.index()) != vararg_param_reg
-            && dataflow.def_overwrites_entry_value(def.id, cfg)
-        {
-            overwrites.insert(direct, InertHomeOverwrite::EntryNil);
+            Some(SsaValue::Entry(reg))
+                if reg.index() >= param_count && Some(reg.index()) != vararg_param_reg =>
+            {
+                overwrites.insert(direct, InertHomeOverwrite::EntryNil);
+            }
+            _ => {}
         }
     }
     overwrites
@@ -2794,7 +2830,10 @@ fn direct_scalar_overwrite(
     })
 }
 
-fn direct_scalar_overwrite_value(instr: &LowInstr, home: Reg) -> Option<CopyRootScalarValue> {
+pub(super) fn direct_scalar_overwrite_value(
+    instr: &LowInstr,
+    home: Reg,
+) -> Option<CopyRootScalarValue> {
     match instr {
         LowInstr::LoadNil(load_nil) if load_nil.dst.start == home && load_nil.dst.len == 1 => {
             Some(CopyRootScalarValue::Nil)
@@ -3002,7 +3041,7 @@ mod tests {
         assert_eq!(merged.exact_home(), None);
         assert_eq!(
             merged.complete_homes(),
-            Some(BTreeSet::from([first, second]))
+            Some(&BTreeSet::from([first, second]))
         );
         assert_eq!(
             merge_home_slot_resolutions(merged, HomeSlotResolution::Unknown),
@@ -3024,8 +3063,8 @@ mod tests {
 
         assert_eq!(facts.trusted_local_home_slot(target), None);
         assert_eq!(
-            facts.possible_local_home_slots(target),
-            Some(BTreeSet::from([target_home, source_home]))
+            facts.possible_local_home_slots(target).as_deref(),
+            Some(&BTreeSet::from([target_home, source_home]))
         );
     }
 

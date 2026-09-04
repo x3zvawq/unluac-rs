@@ -394,7 +394,7 @@ pub(super) fn simplify_hir(
             }
         }
     });
-    let residuals = residuals::collect_hir_exit_residuals(module);
+    let residuals = residuals::finalize_hir_exit_requirements(module);
     if residuals.has_soft_residuals() && generate_mode != GenerateMode::Permissive {
         residuals::emit_hir_warning(format!(
             "HIR exit still contains residual nodes: decision={}, unresolved={}.",

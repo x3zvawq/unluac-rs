@@ -251,6 +251,9 @@ pub(super) fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -
         },
         table_constructor(t) => {
             nested_changed |= rewrite_table_constructor(t, pass);
+        },
+        capture(capture) => {
+            nested_changed |= rewrite_expr(&mut capture.value, pass);
         }
     );
 

@@ -4,6 +4,8 @@
 //! 持有关系，真正外部调用/存储才使可达对象逃逸；例如 a={}; b={}; a.x=b 不等于 sink(b)。
 //! repeat endpoint 与物理 root overwrite 共同消费此模型和模块入口提供的 child 效果快照，
 //! 分别决定生命周期事务；局部消费者不得用 capture 清单合成另一份调用效果。
+//! binding 状态只存正向 root 与非空对象集合，缺项就是该域的空值；未知 collectable
+//! 单独记录，不能随空 holder 清除。例如 `object=nil` 清除持有者，但不撤销已经发生的逃逸。
 
 mod closure_effects;
 pub(super) use closure_effects::collect_proto_effects;
@@ -73,7 +75,7 @@ pub(super) struct RootAnalysisContext<'a> {
 
 #[derive(Clone, Default)]
 pub(super) struct RootState {
-    pub(super) roots: BTreeMap<Binding, bool>,
+    pub(super) roots: BTreeSet<Binding>,
     pub(super) holders: BTreeMap<Binding, BTreeSet<ObjectId>>,
     tables: BTreeMap<Binding, BTreeSet<ObjectId>>,
     pub(super) unknown_collectable: BTreeSet<Binding>,
@@ -85,7 +87,7 @@ pub(super) struct RootState {
 
 impl RootState {
     pub(super) fn binding_may_hold_observable_root(&self, binding: Binding) -> bool {
-        self.roots.get(&binding).copied().unwrap_or(false)
+        self.roots.contains(&binding)
             || self.holders.get(&binding).is_some_and(|holders| {
                 !reachable_holders(holders.clone(), self).is_disjoint(&self.escaped)
             })
@@ -100,60 +102,43 @@ pub(super) struct GenericForRootSnapshot {
 }
 
 pub(super) fn join_state(current: &mut RootState, incoming: &RootState) -> bool {
-    let before = (
-        current.roots.clone(),
-        current.holders.clone(),
-        current.tables.clone(),
-        current.unknown_collectable.clone(),
-        current.escaped.clone(),
-        current.contents.clone(),
-        current.allocations.clone(),
-        current.generic_for.clone(),
+    let mut changed = union_set(&mut current.roots, &incoming.roots);
+    changed |= extend_map_sets(&mut current.holders, &incoming.holders);
+    changed |= extend_map_sets(&mut current.tables, &incoming.tables);
+    changed |= union_set(
+        &mut current.unknown_collectable,
+        &incoming.unknown_collectable,
     );
-    for (&binding, &root) in &incoming.roots {
-        if root {
-            current.roots.insert(binding, true);
-        }
-    }
-    extend_map_sets(&mut current.holders, &incoming.holders);
-    extend_map_sets(&mut current.tables, &incoming.tables);
-    current
-        .unknown_collectable
-        .extend(&incoming.unknown_collectable);
-    current.escaped.extend(&incoming.escaped);
-    extend_map_sets(&mut current.contents, &incoming.contents);
-    current.allocations.extend(&incoming.allocations);
+    changed |= union_set(&mut current.escaped, &incoming.escaped);
+    changed |= extend_map_sets(&mut current.contents, &incoming.contents);
+    changed |= union_set(&mut current.allocations, &incoming.allocations);
+    let protocol_count = current.generic_for.len();
     for (&protocol, snapshot) in &incoming.generic_for {
         let current_snapshot = current.generic_for.entry(protocol).or_default();
-        current_snapshot.callees.extend(&snapshot.callees);
-        current_snapshot.arguments.extend(&snapshot.arguments);
-        current_snapshot.returns.extend(&snapshot.returns);
+        changed |= union_set(&mut current_snapshot.callees, &snapshot.callees);
+        changed |= union_set(&mut current_snapshot.arguments, &snapshot.arguments);
+        changed |= union_set(&mut current_snapshot.returns, &snapshot.returns);
     }
-    before
-        != (
-            current.roots.clone(),
-            current.holders.clone(),
-            current.tables.clone(),
-            current.unknown_collectable.clone(),
-            current.escaped.clone(),
-            current.contents.clone(),
-            current.allocations.clone(),
-            current.generic_for.clone(),
-        )
+    changed || protocol_count != current.generic_for.len()
+}
+
+fn union_set<T: Clone + Ord>(target: &mut BTreeSet<T>, source: &BTreeSet<T>) -> bool {
+    let before = target.len();
+    target.extend(source.iter().cloned());
+    before != target.len()
 }
 
 fn extend_map_sets<K: Copy + Ord, V: Clone + Ord>(
     target: &mut BTreeMap<K, BTreeSet<V>>,
     source: &BTreeMap<K, BTreeSet<V>>,
-) {
+) -> bool {
+    let before = target.len();
+    let mut changed = false;
     for (&key, values) in source {
-        target
-            .entry(key)
-            .or_default()
-            .extend(values.iter().cloned());
+        changed |= union_set(target.entry(key).or_default(), values);
     }
+    changed || before != target.len()
 }
-
 pub(super) fn snapshot_generic_for_root(
     flow: HirGenericForFlow<'_>,
     state: &mut RootState,
@@ -192,11 +177,7 @@ pub(super) fn dispatch_generic_for_root(
 pub(super) fn write_for_bindings_root(bindings: HirForBindings<'_>, state: &mut RootState) {
     match bindings {
         HirForBindings::Numeric(local) => {
-            let binding = Binding::Local(local);
-            state.holders.insert(binding, BTreeSet::new());
-            state.tables.insert(binding, BTreeSet::new());
-            state.unknown_collectable.remove(&binding);
-            state.roots.insert(binding, false);
+            BindingValue::default().install(Binding::Local(local), state);
         }
         HirForBindings::Generic(flow) => {
             let returned = state
@@ -205,11 +186,13 @@ pub(super) fn write_for_bindings_root(bindings: HirForBindings<'_>, state: &mut 
                 .map(|snapshot| snapshot.returns.clone())
                 .unwrap_or_default();
             for &local in &flow.for_stmt().bindings {
-                let binding = Binding::Local(local);
-                state.holders.insert(binding, returned.clone());
-                state.tables.insert(binding, BTreeSet::new());
-                state.unknown_collectable.insert(binding);
-                state.roots.insert(binding, true);
+                BindingValue {
+                    holders: returned.clone(),
+                    unknown: true,
+                    root: true,
+                    ..BindingValue::default()
+                }
+                .install(Binding::Local(local), state);
             }
         }
     }
@@ -232,22 +215,32 @@ pub(super) fn update_state_for_stmt(
             safety,
         ),
         HirStmt::Assign(assign) => {
-            let snapshot = state.clone();
-            for (index, target) in assign.targets.iter().enumerate() {
+            let values = assign
+                .targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    binding_from_lvalue(target).map(|binding| {
+                        (
+                            binding,
+                            BindingValue::resolve(
+                                adjusted_value(&assign.values, index),
+                                state,
+                                effects,
+                                safety,
+                            ),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (target, value)) in assign.targets.iter().zip(values).enumerate() {
                 if matches!(target, HirLValue::Global(_) | HirLValue::Upvalue(_))
                     && let Some(value) = adjusted_value(&assign.values, index)
                 {
                     escape_expr(value, state, captures, effects, safety);
                 }
-                if let Some(binding) = binding_from_lvalue(target) {
-                    assign_binding(
-                        binding,
-                        adjusted_value(&assign.values, index),
-                        &snapshot,
-                        state,
-                        effects,
-                        safety,
-                    );
+                if let Some((binding, value)) = value {
+                    value.install(binding, state);
                 } else if let HirLValue::TableAccess(access) = target {
                     store_table(
                         &access.base,
@@ -290,44 +283,67 @@ fn assign_bindings(
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
-    let bindings = bindings.collect::<Vec<_>>();
-    let snapshot = state.clone();
-    for (index, binding) in bindings.iter().copied().enumerate() {
-        assign_binding(
-            binding,
-            adjusted_value(values, index),
-            &snapshot,
-            state,
-            effects,
-            safety,
-        );
+    let values = bindings
+        .enumerate()
+        .map(|(index, binding)| {
+            (
+                binding,
+                BindingValue::resolve(adjusted_value(values, index), state, effects, safety),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (binding, value) in values {
+        value.install(binding, state);
     }
 }
 
-fn assign_binding(
-    binding: Binding,
-    value: Option<&HirExpr>,
-    snapshot: &RootState,
-    state: &mut RootState,
-    effects: &[ProtoEffects],
-    safety: HirExprSafety,
-) {
-    let holders = value.map_or_else(BTreeSet::new, |value| {
-        holder_values(value, snapshot, effects)
-    });
-    let tables = value.map_or_else(BTreeSet::new, |value| table_values(value, snapshot));
-    state.holders.insert(binding, holders);
-    state.tables.insert(binding, tables);
-    let unknown = adjusted_value_may_be_unknown(value, snapshot, safety);
-    if unknown {
-        state.unknown_collectable.insert(binding);
-    } else {
-        state.unknown_collectable.remove(&binding);
+/// 同一次并行赋值在写入前解析所有 RHS，只保留目标值事实，避免复制完整对象图。
+/// 例如 `a,b=b,a` 的两个值都来自旧状态；表存储与捕获效果仍按语句 owner 的顺序处理。
+#[derive(Default)]
+struct BindingValue {
+    holders: BTreeSet<ObjectId>,
+    tables: BTreeSet<ObjectId>,
+    unknown: bool,
+    root: bool,
+}
+
+impl BindingValue {
+    fn resolve(
+        value: Option<&HirExpr>,
+        state: &RootState,
+        effects: &[ProtoEffects],
+        safety: HirExprSafety,
+    ) -> Self {
+        Self {
+            holders: value.map_or_else(BTreeSet::new, |value| holder_values(value, state, effects)),
+            tables: value.map_or_else(BTreeSet::new, |value| table_values(value, state)),
+            unknown: adjusted_value_may_be_unknown(value, state, safety),
+            root: value.is_some_and(|value| expr_may_root(value, state, safety)),
+        }
     }
-    state.roots.insert(
-        binding,
-        value.is_some_and(|value| expr_may_root(value, snapshot, safety)),
-    );
+
+    fn install(self, binding: Binding, state: &mut RootState) {
+        for (map, objects) in [
+            (&mut state.holders, self.holders),
+            (&mut state.tables, self.tables),
+        ] {
+            if objects.is_empty() {
+                map.remove(&binding);
+            } else {
+                map.insert(binding, objects);
+            }
+        }
+        if self.unknown {
+            state.unknown_collectable.insert(binding);
+        } else {
+            state.unknown_collectable.remove(&binding);
+        }
+        if self.root {
+            state.roots.insert(binding);
+        } else {
+            state.roots.remove(&binding);
+        }
+    }
 }
 
 fn adjusted_value(values: &HirValuePack, index: usize) -> Option<&HirExpr> {
@@ -563,9 +579,11 @@ fn store_table(
         state.contents.entry(table).or_default().extend(&stored);
     }
     for binding in aliases {
-        state.holders.entry(binding).or_default().extend(&stored);
+        if !stored.is_empty() {
+            state.holders.entry(binding).or_default().extend(&stored);
+        }
         if may_root {
-            state.roots.insert(binding, true);
+            state.roots.insert(binding);
         }
     }
 }
@@ -752,7 +770,7 @@ fn escape_expr(
     state.escaped.extend(&holders);
     for binding in bindings_in_expr(expr) {
         if state.unknown_collectable.contains(&binding) {
-            state.roots.insert(binding, true);
+            state.roots.insert(binding);
         }
     }
     activate_object_ids(&holders, state, captures, effects, true, safety);
@@ -851,7 +869,7 @@ fn activate_projected_effect(
         if capture.mode == HirCaptureMode::ByReference
             && let Some(binding) = binding_from_expr(&capture.value)
         {
-            state.roots.insert(binding, true);
+            state.roots.insert(binding);
             state.unknown_collectable.insert(binding);
         }
     }
@@ -869,7 +887,7 @@ fn activate_projected_effect(
         pending.extend(captured_holders);
         for binding in bindings_in_expr(&capture.value) {
             if state.unknown_collectable.contains(&binding) {
-                state.roots.insert(binding, true);
+                state.roots.insert(binding);
             }
         }
     }
@@ -893,7 +911,7 @@ fn activate_projected_effect(
                 pending.extend(captured_holders);
                 for binding in bindings_in_expr(&capture.value) {
                     if state.unknown_collectable.contains(&binding) {
-                        state.roots.insert(binding, true);
+                        state.roots.insert(binding);
                     }
                 }
             }
@@ -1011,29 +1029,27 @@ impl AllocationEscapeFacts {
             unknown_collectable: external.0,
             ..RootState::default()
         };
-        let entries = graph.solve_forward(initial, join_state, |_, kind, state| {
+        let unescaped = graph.solve_forward(initial, join_state, |_, kind, state| {
             transfer_overwrite_node(kind, state, &captures, effects, safety, opaque);
-        });
-        let mut result = Self::default();
-        for (node, entry) in graph.nodes().iter().zip(entries) {
-            let (HirFlowNodeKind::Stmt(stmt), Some(mut state)) = (node.kind(), entry) else {
-                continue;
+            let HirFlowNodeKind::Stmt(stmt) = kind else {
+                return None;
             };
-            transfer_overwrite_node(node.kind(), &mut state, &captures, effects, safety, opaque);
-            let escaped = reachable_holders(state.escaped.clone(), &state);
-            result.unescaped.insert(
+            let escaped = reachable_holders(state.escaped.clone(), state);
+            Some((
                 std::ptr::from_ref(stmt).addr(),
                 state
                     .allocations
                     .iter()
                     .copied()
                     .filter(|object| {
-                        reachable_holders(BTreeSet::from([*object]), &state).is_disjoint(&escaped)
+                        reachable_holders(BTreeSet::from([*object]), state).is_disjoint(&escaped)
                     })
                     .collect(),
-            );
+            ))
+        });
+        Self {
+            unescaped: unescaped.into_iter().flatten().flatten().collect(),
         }
-        result
     }
 
     pub(super) fn proves_unescaped(&self, allocation_site: usize, stmt: &HirStmt) -> bool {

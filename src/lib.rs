@@ -9,6 +9,7 @@ pub mod ast;
 pub mod debug;
 pub mod decompile;
 pub mod generate;
+mod graph;
 pub mod hir;
 mod lua_string;
 pub mod parser;

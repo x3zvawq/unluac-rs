@@ -276,8 +276,7 @@ pub(super) fn run_unit_case_with_timeout(
         }
 
         if start.elapsed() >= timeout {
-            child
-                .kill()
+            terminate_timed_out_runner(&mut child)
                 .with_context(|| format!("failed to kill timed out `{}`", runner.display()))?;
             let status = child
                 .wait()
@@ -295,6 +294,32 @@ pub(super) fn run_unit_case_with_timeout(
 
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+pub(super) fn terminate_timed_out_runner(child: &mut std::process::Child) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // 必须在 runner 仍存活时按它的身份终止整棵树；先 kill 父进程会留下 Lua
+        // 及其继承的 pipe，随后 read_to_end/join 可能永远无法完成。
+        let output = Command::new("taskkill.exe")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .context("failed to spawn taskkill for timed out runner")?;
+        // runner 可以在上次 poll 与 taskkill 之间自然结束；此时无需再终止。
+        if !output.status.success() && child.try_wait()?.is_none() {
+            bail!(
+                "taskkill failed with status {}: {}",
+                output.status,
+                preferred_child_output(&output)
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    child.kill()?;
+    Ok(())
 }
 
 type OutputReader = thread::JoinHandle<io::Result<Vec<u8>>>;

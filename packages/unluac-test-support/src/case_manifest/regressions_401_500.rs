@@ -344,4 +344,28 @@ pub(super) const REGRESSION_CASES_401_500: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_473_luajit_template_hash_keys.lua",
         &[LuaCaseDialect::Luajit],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_474_loop_state_root_overwrites.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_474_loop_state_root_overwrites.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_475_capture_write_graph.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_476_irreducible_scope_pressure.lua",
+        LUA_GOTO_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_477_capture_creation_reads.lua",
+        ALL_DIALECTS,
+    ),
 ];

@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{HirExpr, HirLValue, HirStmt, LocalId, ParamId, TempId};
-use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 
 use super::super::walk::HirRewritePass;
 
@@ -43,7 +43,7 @@ pub(super) fn binding_home_slot(
 fn possible_binding_home_slots(
     binding: CarryBinding,
     promotion_facts: &ProtoPromotionFacts,
-) -> Option<BTreeSet<HomeSlotKey>> {
+) -> Option<HomeSlots<'_>> {
     match binding {
         CarryBinding::Param(param) => promotion_facts.possible_param_home_slots(param),
         CarryBinding::Local(local) => promotion_facts.possible_local_home_slots(local),
@@ -258,11 +258,8 @@ pub(super) fn record_binding_merge(
     if source_home.is_some() && source_home == target_home {
         return;
     }
-    let source_homes = match source {
-        CarryBinding::Param(param) => promotion_facts.possible_param_home_slots(param),
-        CarryBinding::Local(local) => promotion_facts.possible_local_home_slots(local),
-        CarryBinding::Temp(temp) => promotion_facts.possible_temp_home_slots(temp),
-    };
+    let source_homes =
+        possible_binding_home_slots(source, promotion_facts).map(|homes| homes.into_owned());
     match target {
         CarryBinding::Param(param) => promotion_facts.record_param_home_merge(param, source_homes),
         CarryBinding::Local(local) => promotion_facts.record_local_home_merge(local, source_homes),
@@ -324,8 +321,8 @@ mod tests {
 
         assert_eq!(facts.trusted_temp_home_slot(target), None);
         assert_eq!(
-            facts.possible_temp_home_slots(target),
-            Some(BTreeSet::from([source_home, target_home]))
+            facts.possible_temp_home_slots(target).as_deref(),
+            Some(&BTreeSet::from([source_home, target_home]))
         );
     }
 }

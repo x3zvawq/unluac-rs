@@ -278,6 +278,19 @@ pub(super) fn build_bindings(
         (&numeric_binding_phis.bindings, &phi_debug_hints),
         (&mut phi_temps, &mut fixed_temps),
     );
+    preserve_loop_state_overwrites(
+        proto,
+        cfg,
+        dataflow,
+        structure.plan(),
+        captured_slot_epochs,
+        (
+            &captured_regs,
+            &numeric_binding_phis.bindings,
+            &phi_debug_hints,
+        ),
+        (&phi_temps, &mut fixed_temps),
+    );
     // 只有下面实际分配 HIR staging 身份的 owner 才登记；复用 carried temp 的
     // repeat stage 保留其 canonical physical provenance。
     let mut home_free_temps = BTreeSet::new();

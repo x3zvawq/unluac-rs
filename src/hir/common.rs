@@ -72,7 +72,8 @@ pub struct HirProto {
     /// HIR 退出时仍需由 AST 满足或报告的事实。
     ///
     /// 这些事实已经脱离 Structure/SSA 的类型空间；AST 只消费这里冻结的索引和值语义，
-    /// 不得再读取 StructureFacts 重新解释 lowering 结果。
+    /// 不得再读取 StructureFacts 重新解释 lowering 结果。simplify 结束时按当前语义树
+    /// 退役已消失的控制语法要求；失败与 unresolved 诊断保留原始证据。
     pub exit_requirements: Vec<HirExitRequirement>,
     pub body: HirBlock,
     pub children: Vec<HirProtoRef>,

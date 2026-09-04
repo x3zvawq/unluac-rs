@@ -7,6 +7,8 @@ mod cfg;
 mod dataflow;
 mod graph;
 
+pub(crate) use graph::{SccFacts, SccId};
+
 pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, EdgeKind, EdgeRef, InstrRange,
     ReachableSuccessorShape,

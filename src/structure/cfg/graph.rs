@@ -9,14 +9,17 @@
 //! 例子：菱形 `entry -> then/else -> merge` 会产出 `idom(merge) = entry`，反向分析
 //! 同一张图则产出两臂的共同后支配点 `merge`。这里不会因为该形状“像 if”就创建
 //! branch 候选，也不会把不可达 block 接入任一支配树。
+//! SCC 的第二轮反图遍历按拓扑序签发身份，成员、成环与 condensation 前驱一并冻结，
+//! 后层无需根据 CFG 重建这些事实。
 
 use std::collections::{BTreeSet, VecDeque};
 
+use crate::graph::{self, DfsTraversal};
 use crate::structure::StructureError;
 
 use super::common::{
     BlockRef, Cfg, CfgGraph, DominatorTree, EdgeRef, GraphFacts, NaturalLoop, NaturalLoopForest,
-    PostDominatorTree,
+    PostDominatorTree, SccFacts, SccId,
 };
 
 struct DenseBlockSet {
@@ -61,12 +64,6 @@ impl FlowDirection {
     }
 }
 
-struct DfsTraversal {
-    preorder: Vec<BlockRef>,
-    parent: Vec<Option<BlockRef>>,
-    postorder: Vec<BlockRef>,
-}
-
 impl DenseBlockSet {
     fn new(block_count: usize) -> Self {
         Self {
@@ -102,8 +99,7 @@ struct GraphAnalysis {
     dominator_tree: DominatorTree,
     post_dominator_tree: PostDominatorTree,
     dominance_frontier: Vec<BTreeSet<BlockRef>>,
-    strongly_connected_components: Vec<Vec<BlockRef>>,
-    cyclic_blocks: Vec<bool>,
+    scc: SccFacts,
     backedges: Vec<EdgeRef>,
     loop_headers: BTreeSet<BlockRef>,
     natural_loops: Vec<NaturalLoop>,
@@ -118,9 +114,7 @@ impl GraphAnalysis {
         let forward =
             compute_dfs_traversal(cfg, cfg.entry_block, &reachable, FlowDirection::Forward);
         let dominator_tree = compute_dominator_tree(cfg, &forward)?;
-        let strongly_connected_components =
-            compute_strongly_connected_components(cfg, &forward.postorder, &reachable);
-        let cyclic_blocks = compute_cyclic_blocks(cfg, &strongly_connected_components);
+        let scc = compute_strongly_connected_components(cfg, &forward.postorder)?;
         let mut rpo = forward.postorder;
         rpo.reverse();
         let reverse_reachable = compute_reverse_reachable(cfg, &reachable);
@@ -143,8 +137,7 @@ impl GraphAnalysis {
             dominator_tree,
             post_dominator_tree,
             dominance_frontier,
-            strongly_connected_components,
-            cyclic_blocks,
+            scc,
             backedges,
             loop_headers,
             natural_loops,
@@ -158,8 +151,7 @@ impl GraphAnalysis {
             dominator_tree: self.dominator_tree,
             post_dominator_tree: self.post_dominator_tree,
             dominance_frontier: self.dominance_frontier,
-            strongly_connected_components: self.strongly_connected_components,
-            cyclic_blocks: self.cyclic_blocks,
+            scc: self.scc,
             backedges: self.backedges,
             loop_headers: self.loop_headers,
             natural_loops: self.natural_loops,
@@ -172,50 +164,63 @@ impl GraphAnalysis {
 fn compute_strongly_connected_components(
     cfg: &Cfg,
     postorder: &[BlockRef],
-    reachable: &DenseBlockSet,
-) -> Vec<Vec<BlockRef>> {
-    let mut visited = DenseBlockSet::new(cfg.blocks.len());
-    let mut components = Vec::new();
-    let mut pending = Vec::new();
-
-    for root in postorder.iter().rev().copied() {
-        if !visited.insert(root) {
+) -> Result<SccFacts, StructureError> {
+    let mut components = graph::strongly_connected_components(
+        cfg.blocks.len(),
+        postorder,
+        BlockRef::index,
+        |block| {
+            cfg.preds[block.index()]
+                .iter()
+                .map(|edge| cfg.edges[edge.index()].from)
+        },
+    );
+    for component in &mut components {
+        component.sort_unstable();
+    }
+    let mut block_scc = vec![None; cfg.blocks.len()];
+    let mut cyclic = Vec::with_capacity(components.len());
+    for (index, component) in components.iter().enumerate() {
+        cyclic.push(
+            component.len() > 1
+                || component.first().is_some_and(|block| {
+                    cfg.succs[block.index()]
+                        .iter()
+                        .any(|edge_ref| cfg.edges[edge_ref.index()].to == *block)
+                }),
+        );
+        for block in component {
+            block_scc[block.index()] = Some(SccId(index));
+        }
+    }
+    let mut predecessors = vec![Vec::new(); components.len()];
+    for edge in &cfg.edges {
+        let (Some(from), Some(to)) = (block_scc[edge.from.index()], block_scc[edge.to.index()])
+        else {
+            continue;
+        };
+        if from == to {
             continue;
         }
-        let mut component = Vec::new();
-        pending.push(root);
-        while let Some(block) = pending.pop() {
-            component.push(block);
-            for edge_ref in &cfg.preds[block.index()] {
-                let pred = cfg.edges[edge_ref.index()].from;
-                if reachable.contains(pred) && visited.insert(pred) {
-                    pending.push(pred);
-                }
-            }
+        // Kosaraju 的第二轮按第一轮逆完成序访问反图，先产出源 SCC；此不变量是
+        // 下游拓扑范围裁剪的前提，不能把任意 SCC 编号误作可达性证明。
+        if from > to {
+            return Err(StructureError::invalid(
+                "SCC condensation violates topological order",
+            ));
         }
-        component.sort_unstable();
-        components.push(component);
+        predecessors[to.index()].push(from);
     }
-
-    components
-}
-
-fn compute_cyclic_blocks(cfg: &Cfg, components: &[Vec<BlockRef>]) -> Vec<bool> {
-    let mut cyclic_blocks = vec![false; cfg.blocks.len()];
-    for component in components {
-        let cyclic = component.len() > 1
-            || component.first().is_some_and(|block| {
-                cfg.succs[block.index()]
-                    .iter()
-                    .any(|edge_ref| cfg.edges[edge_ref.index()].to == *block)
-            });
-        if cyclic {
-            for block in component {
-                cyclic_blocks[block.index()] = true;
-            }
-        }
+    for preds in &mut predecessors {
+        preds.sort_unstable();
+        preds.dedup();
     }
-    cyclic_blocks
+    Ok(SccFacts {
+        components,
+        block_scc,
+        cyclic,
+        predecessors,
+    })
 }
 
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
@@ -272,14 +277,14 @@ pub(crate) fn analyze_graph_facts(
 
 fn compute_dominator_tree(
     cfg: &Cfg,
-    traversal: &DfsTraversal,
+    traversal: &DfsTraversal<BlockRef>,
 ) -> Result<DominatorTree, StructureError> {
     compute_tree(cfg, traversal, FlowDirection::Forward)
 }
 
 fn compute_post_dominator_tree(
     cfg: &Cfg,
-    traversal: &DfsTraversal,
+    traversal: &DfsTraversal<BlockRef>,
 ) -> Result<PostDominatorTree, StructureError> {
     let tree = compute_tree(cfg, traversal, FlowDirection::Reverse)?;
 
@@ -440,7 +445,7 @@ fn compute_reverse_reachable(cfg: &Cfg, reachable: &DenseBlockSet) -> DenseBlock
 
 fn compute_tree(
     cfg: &Cfg,
-    traversal: &DfsTraversal,
+    traversal: &DfsTraversal<BlockRef>,
     direction: FlowDirection,
 ) -> Result<DominatorTree, StructureError> {
     let block_count = cfg.blocks.len();
@@ -674,41 +679,17 @@ fn compute_dfs_traversal(
     root: BlockRef,
     visible: &DenseBlockSet,
     direction: FlowDirection,
-) -> DfsTraversal {
-    let block_count = cfg.blocks.len();
-    let mut traversal = DfsTraversal {
-        preorder: Vec::with_capacity(block_count),
-        parent: vec![None; block_count],
-        postorder: Vec::with_capacity(block_count),
-    };
-    if !visible.contains(root) {
-        return traversal;
-    }
-
-    let mut visited = DenseBlockSet::new(block_count);
-    let mut stack = Vec::with_capacity(block_count);
-    visited.insert(root);
-    traversal.preorder.push(root);
-    stack.push((root, 0));
-
-    while !stack.is_empty() {
-        let top = stack.len() - 1;
-        let (block, edge_index) = stack[top];
-        let outgoing = direction.outgoing_edges(cfg, block);
-        if edge_index == outgoing.len() {
-            traversal.postorder.push(block);
-            stack.pop();
-            continue;
-        }
-
-        stack[top].1 += 1;
-        let successor = direction.edge_target(cfg, outgoing[edge_index]);
-        if visible.contains(successor) && visited.insert(successor) {
-            traversal.parent[successor.index()] = Some(block);
-            traversal.preorder.push(successor);
-            stack.push((successor, 0));
-        }
-    }
-
-    traversal
+) -> DfsTraversal<BlockRef> {
+    graph::depth_first(
+        cfg.blocks.len(),
+        root,
+        BlockRef::index,
+        |block| visible.contains(block),
+        |block| {
+            direction
+                .outgoing_edges(cfg, block)
+                .iter()
+                .map(move |&edge| direction.edge_target(cfg, edge))
+        },
+    )
 }

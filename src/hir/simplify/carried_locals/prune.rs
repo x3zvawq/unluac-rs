@@ -565,7 +565,7 @@ fn mirror_write_disposition(
     let Some(source_homes) = promotion_facts.possible_local_home_slots(*local) else {
         return MirrorWriteDisposition::Survives;
     };
-    if source_homes == BTreeSet::from([target_home]) {
+    if source_homes.len() == 1 && source_homes.contains(&target_home) {
         // LValue 的 raw home 不随 binding rewrite 改变；RHS 即使失去 trusted provenance，
         // 完整可能集合仍为同一单槽时，每条路径上的写都只是该物理 cell 自写回。
         MirrorWriteDisposition::Prunable

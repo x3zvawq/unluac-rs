@@ -109,6 +109,9 @@ fn collect_capture_evidence_in_expr(
                 borrow = [&],
                 expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; }
             );
+        },
+        capture(capture) => {
+            collect_capture_evidence_in_expr(function, &capture.value, hir, evidence)?;
         }
     );
     Ok(())

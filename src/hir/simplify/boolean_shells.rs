@@ -18,14 +18,16 @@
 
 mod old_values;
 
-use std::collections::{BTreeMap, BTreeSet};
+use old_values::OldValueFacts;
+
+use std::collections::BTreeSet;
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
     HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::local_shapes::empty_single_local_decl_binding;
@@ -45,7 +47,7 @@ pub(super) fn remove_boolean_materialization_shells_in_proto(
 }
 
 struct BooleanShellPass<'a> {
-    facts: &'a BooleanShellFacts,
+    facts: &'a BooleanShellFacts<'a>,
 }
 
 impl HirRewritePass for BooleanShellPass<'_> {
@@ -54,28 +56,21 @@ impl HirRewritePass for BooleanShellPass<'_> {
     }
 }
 
-struct BooleanShellFacts {
+struct BooleanShellFacts<'a> {
     debug_temps: BTreeSet<TempId>,
     debug_locals: BTreeSet<LocalId>,
     physical_root_locals: BTreeSet<LocalId>,
-    possible_temp_homes: BTreeMap<TempId, BTreeSet<HomeSlotKey>>,
-    possible_local_homes: BTreeMap<LocalId, BTreeSet<HomeSlotKey>>,
+    promotion_facts: &'a ProtoPromotionFacts,
 }
 
 struct DeadWriteProof<'a> {
     live_after: &'a old_values::LiveBindingState,
     adjacent_nil_local: Option<LocalId>,
-    old_values: &'a DeadShellOldValueFacts,
+    old_values: &'a OldValueFacts,
 }
 
-impl BooleanShellFacts {
-    fn collect(proto: &HirProto, promotion_facts: &ProtoPromotionFacts) -> Self {
-        let possible_local_homes = proto
-            .locals
-            .iter()
-            .copied()
-            .map(|local| (local, promotion_facts.complete_local_home_slots(local)))
-            .collect::<BTreeMap<_, _>>();
+impl<'a> BooleanShellFacts<'a> {
+    fn collect(proto: &HirProto, promotion_facts: &'a ProtoPromotionFacts) -> Self {
         Self {
             debug_temps: proto
                 .temps
@@ -90,13 +85,7 @@ impl BooleanShellFacts {
                 .filter_map(|(local, hint)| hint.as_ref().map(|_| *local))
                 .collect(),
             physical_root_locals: proto.physical_root_locals.clone(),
-            possible_temp_homes: proto
-                .temps
-                .iter()
-                .copied()
-                .map(|temp| (temp, promotion_facts.complete_temp_home_slots(temp)))
-                .collect(),
-            possible_local_homes,
+            promotion_facts,
         }
     }
 
@@ -116,11 +105,8 @@ impl BooleanShellFacts {
                     // 候选拒绝[SemanticBarrier:Lifetime]：把对象引用写入 raw home 会建立新的 VM root；删除死写可能让该对象在后续显式 GC 中提前终结。
                     return false;
                 }
-                let homes = self
-                    .possible_temp_homes
-                    .get(temp)
-                    .expect("every proto temp must have a complete possible-home set");
-                for home in homes {
+                let homes = self.promotion_facts.complete_temp_home_slots(*temp);
+                for home in homes.iter() {
                     if proof.live_after.homes.contains(home) {
                         // 候选拒绝[SemanticBarrier:ValueFlow]：shell 外仍通过同一 trusted home 的 param/local 读取布尔写；仅检查 target TempId 会漏掉该观察者。
                         return false;
@@ -155,11 +141,8 @@ impl BooleanShellFacts {
                 if self.physical_root_locals.contains(local) {
                     return false;
                 }
-                let homes = self
-                    .possible_local_homes
-                    .get(local)
-                    .expect("every proto local must have a complete possible-home set");
-                for home in homes {
+                let homes = self.promotion_facts.complete_local_home_slots(*local);
+                for home in homes.iter() {
                     if proof.live_after.homes.contains(home) {
                         // 候选拒绝[SemanticBarrier:ValueFlow]：candidate local 的 possible-home 与后续 param/local 读取相交时，raw cell 上的布尔写仍可见；只查 LocalId 会漏掉合流后的别名。
                         return false;
@@ -198,92 +181,11 @@ impl BooleanShellFacts {
     }
 }
 
-#[derive(Clone, Copy)]
-enum BindingRelation {
-    None,
-    Possible,
-    Definite,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OldValueClass {
     GcInert,
     MayCarryResource,
     Unknown,
-}
-
-#[derive(Default)]
-struct DeadShellOldValueFacts {
-    locals: BTreeMap<LocalId, OldValueClass>,
-    homes: BTreeMap<HomeSlotKey, OldValueClass>,
-}
-
-impl DeadShellOldValueFacts {
-    fn local(&self, local: LocalId) -> OldValueClass {
-        self.locals
-            .get(&local)
-            .copied()
-            .unwrap_or(OldValueClass::Unknown)
-    }
-
-    fn home(&self, home: HomeSlotKey) -> OldValueClass {
-        self.homes
-            .get(&home)
-            .copied()
-            .unwrap_or(OldValueClass::Unknown)
-    }
-}
-
-fn possible_home_relation(
-    left: Option<HomeSlotKey>,
-    left_possible: Option<&BTreeSet<HomeSlotKey>>,
-    right: Option<HomeSlotKey>,
-    right_possible: Option<&BTreeSet<HomeSlotKey>>,
-) -> BindingRelation {
-    let left_complete = left
-        .map(|home| BTreeSet::from([home]))
-        .or_else(|| left_possible.cloned());
-    let right_complete = right
-        .map(|home| BTreeSet::from([home]))
-        .or_else(|| right_possible.cloned());
-    if matches!(
-        (&left_complete, &right_complete),
-        (Some(left), Some(right)) if left.len() == 1 && left == right
-    ) {
-        return BindingRelation::Definite;
-    }
-    match (left, right) {
-        (Some(_), Some(_)) => return home_relation(left, right),
-        (Some(left), None) => {
-            return match right_possible {
-                Some(right) if !right.contains(&left) => BindingRelation::None,
-                Some(_) | None => BindingRelation::Possible,
-            };
-        }
-        (None, Some(right)) => {
-            return match left_possible {
-                Some(left) if !left.contains(&right) => BindingRelation::None,
-                Some(_) | None => BindingRelation::Possible,
-            };
-        }
-        (None, None) => {}
-    }
-    if left_possible.is_some_and(BTreeSet::is_empty)
-        || right_possible.is_some_and(BTreeSet::is_empty)
-        || matches!((left_possible, right_possible), (Some(left), Some(right)) if left.is_disjoint(right))
-    {
-        BindingRelation::None
-    } else {
-        BindingRelation::Possible
-    }
-}
-
-fn home_relation(left: Option<HomeSlotKey>, right: Option<HomeSlotKey>) -> BindingRelation {
-    match (left, right) {
-        (Some(left), Some(right)) if left == right => BindingRelation::Definite,
-        (Some(_), Some(_)) => BindingRelation::None,
-        (None, _) | (_, None) => BindingRelation::Possible,
-    }
 }
 
 fn collapse_live_boolean_materialization_shells_in_block(
@@ -386,7 +288,7 @@ fn removable_dead_materialization_shell(
     stmt: &HirStmt,
     facts: &BooleanShellFacts,
     adjacent_nil_local: Option<LocalId>,
-    old_values: &DeadShellOldValueFacts,
+    old_values: &OldValueFacts,
     live_after: &old_values::ShellArmLiveOut,
     safety: HirExprSafety,
 ) -> bool {
@@ -986,7 +888,11 @@ mod tests {
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![boolean_shell(HirLValue::Temp(target))];
 
-        let _ = BooleanShellFacts::collect(&proto, &ProtoPromotionFacts::default());
+        let _ = remove_boolean_materialization_shells_in_proto(
+            &mut proto,
+            &ProtoPromotionFacts::default(),
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@
 mod adjacent;
 mod binding;
 mod boundary;
+mod coalesce;
 mod handoffs;
 mod loop_updates;
 mod prune;
@@ -95,7 +96,10 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
         expr_safety,
     };
     let identity_facts = HandoffIdentityFacts::new(proto, preserved_bindings);
+    let coalesced =
+        coalesce::coalesce_disjoint_temps(proto, promotion_facts, &identity_facts, expr_safety);
     branch_copies_changed
+        | coalesced
         | snapshots_changed
         | dead_for_binding_mirrors_changed
         | collapse_handoffs_recursive(

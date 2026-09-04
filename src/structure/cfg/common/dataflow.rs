@@ -73,6 +73,7 @@ pub struct DataflowFacts {
     pub(crate) block_end_values: Vec<SsaRegMap>,
     pub use_values: Vec<InstrUseValues>,
     pub(crate) def_uses: Vec<Vec<UseSite>>,
+    pub(crate) def_overwritten_values: Vec<Option<SsaValue>>,
     pub(crate) def_phi_uses: Vec<Vec<PhiId>>,
     pub(crate) phi_uses: Vec<Vec<UseSite>>,
     pub(crate) phi_phi_uses: Vec<Vec<PhiId>>,
@@ -224,33 +225,13 @@ impl DataflowFacts {
             .expect("dataflow should have a def record for every def id")
     }
 
-    /// 所有可达前驱路径都尚未写入该物理槽，当前定义覆盖的仍是函数入口值。
-    /// PC 最早定义并不足够：回边若重新执行该定义，前一轮已经留下新的 value epoch。
-    pub fn def_overwrites_entry_value(&self, def: DefId, cfg: &Cfg) -> bool {
-        let block = self.def_block(def);
-        let home = self.def_reg(def);
-        let prefix = cfg.blocks[block.index()].instrs.start.index()..self.def_instr(def).index();
-        if prefix
-            .into_iter()
-            .any(|index| self.instr_effects[index].must_define(home))
-        {
-            return false;
-        }
-        let mut pending = cfg.reachable_predecessors(block);
-        let mut seen = BTreeSet::new();
-        while let Some(predecessor) = pending.pop() {
-            if !seen.insert(predecessor) {
-                continue;
-            }
-            let range = cfg.blocks[predecessor.index()].instrs;
-            if (range.start.index()..range.end())
-                .any(|index| self.instr_effects[index].must_define(home))
-            {
-                return false;
-            }
-            pending.extend(cfg.reachable_predecessors(predecessor));
-        }
-        true
+    /// 当前写入覆盖的 canonical 值；不同路径身份不一致时返回未知。
+    ///
+    /// pruned SSA 的无读取槽可能没有入口 phi，不能直接采用支配树栈顶。Dataflow
+    /// 用共享入口查询补齐稀疏快照间的覆盖关系；open result 覆盖表示未知。
+    /// 这条物理覆盖关系不是值读取，不增加 SSA use，也不决定 HIR 绑定是否允许共址。
+    pub fn def_overwritten_value(&self, def: DefId) -> Option<SsaValue> {
+        self.def_overwritten_values[def.index()]
     }
 
     /// 最后一次值读取后、首个潜在 GC/cleanup 观察前的必定覆盖。

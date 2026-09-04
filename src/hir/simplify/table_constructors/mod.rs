@@ -1013,7 +1013,7 @@ impl TableConstructorPass<'_> {
                     let values_may_carry_seed = decl.values.iter().any(|value| {
                         self.expr_may_carry_seed(
                             value,
-                            seed_homes.as_ref(),
+                            seed_homes.as_deref(),
                             &seed_aliases,
                             &seed_carriers,
                         )
@@ -1057,7 +1057,7 @@ impl TableConstructorPass<'_> {
                 HirStmt::ToBeClosed(tbc) => {
                     if self.expr_may_carry_seed(
                         &tbc.value,
-                        seed_homes.as_ref(),
+                        seed_homes.as_deref(),
                         &seed_aliases,
                         &seed_carriers,
                     ) {
@@ -1088,7 +1088,7 @@ impl TableConstructorPass<'_> {
                     let values_may_carry_seed = assign.values.iter().any(|value| {
                         self.expr_may_carry_seed(
                             value,
-                            seed_homes.as_ref(),
+                            seed_homes.as_deref(),
                             &seed_aliases,
                             &seed_carriers,
                         )
@@ -1108,7 +1108,7 @@ impl TableConstructorPass<'_> {
                             HirLValue::TableAccess(access) => {
                                 let key_may_carry_seed = self.expr_may_carry_seed(
                                     &access.key,
-                                    seed_homes.as_ref(),
+                                    seed_homes.as_deref(),
                                     &seed_aliases,
                                     &seed_carriers,
                                 );
@@ -1137,7 +1137,7 @@ impl TableConstructorPass<'_> {
                                 }
                                 if self.expr_may_carry_seed(
                                     &access.base,
-                                    seed_homes.as_ref(),
+                                    seed_homes.as_deref(),
                                     &seed_aliases,
                                     &seed_carriers,
                                 ) && !self.expr_is_seed_transport_safe(
@@ -1207,7 +1207,7 @@ impl TableConstructorPass<'_> {
                     let Some(structured_carriers) = self.structured_stmt_seed_carriers(
                         stmt,
                         binding,
-                        seed_homes.as_ref(),
+                        seed_homes.as_deref(),
                         &seed_aliases,
                         &seed_carriers,
                         &fresh_tables,
@@ -1230,7 +1230,7 @@ impl TableConstructorPass<'_> {
                 | HirStmt::CallStmt(_) => {
                     if self.stmt_may_carry_seed(
                         stmt,
-                        seed_homes.as_ref(),
+                        seed_homes.as_deref(),
                         &seed_aliases,
                         &seed_carriers,
                     ) {

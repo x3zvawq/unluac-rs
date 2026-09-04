@@ -1017,13 +1017,13 @@ fn reference_capture_possible_home_slots(
 ) -> BTreeSet<HomeSlotKey> {
     let mut homes = BTreeSet::new();
     for param in &captured.params {
-        homes.extend(facts.complete_param_home_slots(*param));
+        homes.extend(facts.complete_param_home_slots(*param).iter().copied());
     }
     for local in &captured.locals {
-        homes.extend(facts.complete_local_home_slots(*local));
+        homes.extend(facts.complete_local_home_slots(*local).iter().copied());
     }
     for temp in &captured.temps {
-        homes.extend(facts.complete_temp_home_slots(*temp));
+        homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
     }
     homes
 }

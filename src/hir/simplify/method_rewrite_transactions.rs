@@ -42,7 +42,7 @@ pub(super) fn finalize_method_rewrite_transactions(
     let mut barred_homes = captured_binding_homes(&reference_captured, facts);
     barred_homes.extend(captured_binding_homes(&value_captured, facts));
     for local in &protected {
-        barred_homes.extend(facts.complete_local_home_slots(*local));
+        barred_homes.extend(facts.complete_local_home_slots(*local).iter().copied());
     }
     barred_homes.extend(stmts_tbc_protected_home_slots(&proto.body.stmts, facts));
     let mut candidates = Vec::new();
@@ -272,7 +272,7 @@ fn alias_root_for_homes(
         if !visited.insert(current) {
             return None;
         }
-        if facts.complete_local_home_slots(current) == *root_homes {
+        if facts.complete_local_home_slots(current).as_ref() == root_homes {
             return Some(DirectAlias {
                 source: current,
                 stmt_index: direct.stmt_index,
@@ -349,13 +349,13 @@ fn captured_binding_homes(
 ) -> BTreeSet<HomeSlotKey> {
     let mut homes = BTreeSet::new();
     for local in &captured.locals {
-        homes.extend(facts.complete_local_home_slots(*local));
+        homes.extend(facts.complete_local_home_slots(*local).iter().copied());
     }
     for param in &captured.params {
-        homes.extend(facts.complete_param_home_slots(*param));
+        homes.extend(facts.complete_param_home_slots(*param).iter().copied());
     }
     for temp in &captured.temps {
-        homes.extend(facts.complete_temp_home_slots(*temp));
+        homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
     }
     homes
 }
@@ -381,7 +381,7 @@ struct WatchedHomeWriteCollector<'a> {
 }
 
 impl WatchedHomeWriteCollector<'_> {
-    fn note_homes(&mut self, homes: BTreeSet<HomeSlotKey>) {
+    fn note_homes(&mut self, homes: &BTreeSet<HomeSlotKey>) {
         self.may_write |= !homes.is_disjoint(self.watched);
     }
 }
@@ -390,7 +390,7 @@ impl crate::hir::visit::HirVisitor for WatchedHomeWriteCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::LocalDecl(decl) = stmt {
             for local in &decl.bindings {
-                self.note_homes(self.facts.complete_local_definition_write_homes(*local));
+                self.note_homes(&self.facts.complete_local_definition_write_homes(*local));
             }
         }
     }
@@ -398,13 +398,13 @@ impl crate::hir::visit::HirVisitor for WatchedHomeWriteCollector<'_> {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         match lvalue {
             HirLValue::Param(param) => {
-                self.note_homes(self.facts.complete_param_definition_write_homes(*param));
+                self.note_homes(&self.facts.complete_param_definition_write_homes(*param));
             }
             HirLValue::Local(local) => {
-                self.note_homes(self.facts.complete_local_definition_write_homes(*local));
+                self.note_homes(&self.facts.complete_local_definition_write_homes(*local));
             }
             HirLValue::Temp(temp) => {
-                self.note_homes(self.facts.complete_temp_definition_write_homes(*temp));
+                self.note_homes(&self.facts.complete_temp_definition_write_homes(*temp));
             }
             HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {}
         }

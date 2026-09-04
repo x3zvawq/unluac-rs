@@ -6,6 +6,7 @@
 //! 原先只在 `hir::simplify` 内部使用，现在提升到 `hir` 层面让 naming 等模块也能共享。
 //! 可变遍历不会把 value-pack tail 暴露成 `&mut HirExpr`：固定值仍按普通表达式遍历，
 //! tail 只能进入 Call 内部，因而任何 pass 都无法把其根节点改成非 Call/VarArg。
+//! closure 边保留完整 capture，不把 ByReference cell 与 ByValue snapshot 都降成普通读取。
 
 macro_rules! traverse_hir_value_pack_children {
     (
@@ -183,7 +184,8 @@ macro_rules! traverse_hir_expr_children {
         expr($expr:ident) => $on_expr:block,
         call($call:ident) => $on_call:block,
         decision($decision:ident) => $on_decision:block,
-        table_constructor($table:ident) => $on_table:block
+        table_constructor($table:ident) => $on_table:block,
+        capture($capture:ident) => $on_capture:block
     ) => {{
         match $expr_node {
             crate::hir::HirExpr::TableAccess(access) => {
@@ -231,9 +233,8 @@ macro_rules! traverse_hir_expr_children {
                 $on_table
             }
             crate::hir::HirExpr::Closure(closure) => {
-                for capture in closure.captures.$iter() {
-                    let $expr = $($borrow)+ capture.value;
-                    $on_expr
+                for $capture in closure.captures.$iter() {
+                    $on_capture
                 }
             }
             crate::hir::HirExpr::Nil

@@ -22,6 +22,7 @@ mod scope;
 mod short_circuit;
 
 pub(crate) use analyze::analyze_structure_stage;
+pub(crate) use cfg::SccId;
 pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
