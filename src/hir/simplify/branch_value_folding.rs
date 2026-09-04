@@ -236,15 +236,15 @@ fn nil_fallback_decision_rewrite(
     if local_decl.values.tail.is_some() || !local_scope_facts.can_move_scope(*target) {
         return None;
     }
-    crate::hir::decision::assert_valid_decision(decision);
-    let node = decision.nodes.get(decision.entry.index())?;
+    let topology = crate::hir::decision::analyze_decision(decision);
+    let node = &decision.nodes[decision.entry.index()];
     let source = nil_check_local(&node.test)?;
     let source_target = match &node.falsy {
         HirDecisionTarget::Expr(HirExpr::LocalRef(source_target)) => *source_target,
         _ => return None,
     };
     let fallback = crate::hir::simplify::decision::project_value_decision_target(
-        decision,
+        &topology,
         &node.truthy,
         HirExpr::Boolean(true),
         safety,

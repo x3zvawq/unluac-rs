@@ -20,37 +20,39 @@
 
 mod candidate;
 mod eval_order;
+mod run_facts;
 mod use_sites;
+use run_facts::CandidateRunFacts;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::decompile::ReadabilityOptions;
 
 pub(super) use self::candidate::local_attr_belongs_to_inline_pipeline;
 use self::candidate::{
     InlineCandidate, InlineExprRejection, InlinePolicy, inline_candidate, is_lookup_inline_expr,
-    stmt_is_adjacent_call_result_sink, stmt_is_alias_initializer_sink,
-    stmt_is_boolean_return_value_sink, stmt_is_direct_return_value_sink,
-    stmt_is_multi_return_value_sink, stmt_is_terminal_lookup_return_sink,
-    stmt_uses_binding_as_direct_call_callee,
+    stmt_is_alias_initializer_sink, stmt_is_boolean_return_value_sink,
+    stmt_is_direct_return_value_sink, stmt_is_multi_return_value_sink,
+    stmt_is_terminal_lookup_return_sink, stmt_uses_binding_as_direct_call_callee,
 };
 use self::use_sites::{
     rewrite_condition_use_sites_with_policy, rewrite_stmt_use_sites_with_policy,
 };
 use super::super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
-    AstLocalAttr, AstModule, AstNameRef, AstStmt, AstTargetDialect,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstLocalAttr,
+    AstModule, AstNameRef, AstStmt, AstTargetDialect,
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
-    BindingUseIndex, MutableSnapshotNames, binding_mentions_in_expr,
-    mutable_snapshot_names_in_block,
+    BindingUseIndex, BindingWriteIndex, MutableSnapshotNames, binding_mentions_in_expr,
+    expr_reads_binding, expr_uses_binding, mutable_snapshot_names_in_block, stmt_uses_binding,
+    stmt_writes_name,
 };
 use super::binding_ref::binding_from_name_ref;
 use super::binding_tree::{
-    expr_references_binding, stmt_has_access_base_binding_use,
-    stmt_has_direct_call_arg_binding_use, stmt_has_index_binding_use, stmt_has_nested_binding_use,
-    stmt_has_nested_binding_value_use, stmt_stores_binding_in_table,
+    stmt_has_access_base_binding_use, stmt_has_direct_call_arg_binding_use,
+    stmt_has_index_binding_use, stmt_has_nested_binding_use, stmt_has_nested_binding_value_use,
+    stmt_stores_binding_in_table,
 };
 use super::expr_analysis::{collect_stable_copy_snapshot_names, result_cannot_root_collectable};
 use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
@@ -117,83 +119,6 @@ fn adjacent_inline_rejection(
     }
 }
 
-#[derive(Default)]
-struct BindingWriteIndex {
-    write_bounds_by_binding: BTreeMap<AstBindingRef, (usize, usize)>,
-    write_bounds_by_name: BTreeMap<AstNameRef, (usize, usize)>,
-    direct_write_names_by_stmt: Vec<BTreeSet<AstNameRef>>,
-}
-
-impl BindingWriteIndex {
-    fn for_stmts(stmts: &[AstStmt]) -> Self {
-        let mut index = Self {
-            write_bounds_by_binding: BTreeMap::new(),
-            write_bounds_by_name: BTreeMap::new(),
-            direct_write_names_by_stmt: vec![BTreeSet::new(); stmts.len()],
-        };
-        for (stmt_index, stmt) in stmts.iter().enumerate() {
-            let mut collector = BindingWriteCollector {
-                stmt_index,
-                index: &mut index,
-            };
-            super::visit::visit_stmt(stmt, &mut collector);
-        }
-        index
-    }
-
-    fn record(&mut self, stmt_index: usize, binding: AstBindingRef) {
-        self.write_bounds_by_binding
-            .entry(binding)
-            .and_modify(|bounds| bounds.1 = stmt_index)
-            .or_insert((stmt_index, stmt_index));
-    }
-
-    fn record_name(&mut self, stmt_index: usize, name: &AstNameRef) {
-        self.direct_write_names_by_stmt[stmt_index].insert(name.clone());
-        self.write_bounds_by_name
-            .entry(name.clone())
-            .and_modify(|bounds| bounds.1 = stmt_index)
-            .or_insert((stmt_index, stmt_index));
-        if let Some(binding) = binding_from_name_ref(name) {
-            self.record(stmt_index, binding);
-        }
-    }
-
-    fn stmt_directly_writes_name(&self, stmt_index: usize, name: &AstNameRef) -> bool {
-        self.direct_write_names_by_stmt
-            .get(stmt_index)
-            .is_some_and(|names| names.contains(name))
-    }
-
-    fn has_write_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
-        self.write_bounds_by_binding
-            .get(&binding)
-            .is_some_and(|(_, last_write)| *last_write > stmt_index)
-    }
-
-    fn writes_only_at(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
-        self.write_bounds_by_binding.get(&binding) == Some(&(stmt_index, stmt_index))
-    }
-
-    fn name_has_write_after(&self, stmt_index: usize, name: &AstNameRef) -> bool {
-        self.write_bounds_by_name
-            .get(name)
-            .is_some_and(|(_, last_write)| *last_write > stmt_index)
-    }
-
-    fn name_has_write_in_range(&self, start: usize, end: usize, name: &AstNameRef) -> bool {
-        self.direct_write_names_by_stmt
-            .get(start..end)
-            .is_some_and(|names_by_stmt| names_by_stmt.iter().any(|names| names.contains(name)))
-    }
-
-    fn writes_start_after(&self, stmt_index: usize, binding: AstBindingRef) -> bool {
-        self.write_bounds_by_binding
-            .get(&binding)
-            .is_some_and(|(first_write, _)| *first_write > stmt_index)
-    }
-}
-
 fn removable_inline_candidate<'a>(
     stmts: &'a [AstStmt],
     stmt_index: usize,
@@ -205,36 +130,6 @@ fn removable_inline_candidate<'a>(
         return None;
     }
     Some((candidate, value))
-}
-
-struct BindingWriteCollector<'a> {
-    stmt_index: usize,
-    index: &'a mut BindingWriteIndex,
-}
-
-impl AstVisitor for BindingWriteCollector<'_> {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
-        let AstStmt::FunctionDecl(function) = stmt else {
-            return;
-        };
-        let AstFunctionName::Plain(path) = &function.target else {
-            return;
-        };
-        if path.fields.is_empty() {
-            self.index.record_name(self.stmt_index, &path.root);
-        }
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &AstLValue) {
-        let AstLValue::Name(name) = lvalue else {
-            return;
-        };
-        self.index.record_name(self.stmt_index, name);
-    }
-
-    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-        false
-    }
 }
 
 impl AstRewritePass for InlineExprsPass {
@@ -296,6 +191,7 @@ fn rewrite_current_block(
     let use_index =
         BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition.as_deref());
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut index = 0;
     while index < old_stmts.len() {
@@ -317,6 +213,7 @@ fn rewrite_current_block(
                 run_start,
                 index + 1,
                 &use_index,
+                &write_index,
                 mutable_snapshots,
             )
         }) {
@@ -364,7 +261,12 @@ fn rewrite_current_block(
         }
         if matches!(policy, InlinePolicy::AliasInitializerChain)
             && candidate::is_lookup_inline_expr(value)
-            && stmt_starts_lookup_mechanical_run(&old_stmts, index, candidate.binding())
+            && stmt_starts_lookup_mechanical_run(
+                &old_stmts,
+                index,
+                candidate.binding(),
+                run_facts.end(index),
+            )
         {
             // 这里故意不提前把 lookup 链压成“下一条 local 的初始化式”：
             // `local item = items[i]; local weight = item.weight; sum = sum + weight`
@@ -628,6 +530,9 @@ fn collapse_stable_copy_aliases(
     let use_index =
         BindingUseIndex::for_stmts_with_trailing_expr(&stmts, trailing_condition.as_deref());
     let write_index = BindingWriteIndex::for_stmts(&stmts);
+    // 本批只替换表达式，声明删除延迟到批末；label、终结语句和顶层下标均保持不变。
+    // 因此所有 handoff 候选可按需共用当前快照的支配事实。
+    let control_flow = std::cell::OnceCell::new();
     let mut removed = vec![false; stmts.len()];
 
     for (candidate_index, is_removed) in removed.iter_mut().enumerate() {
@@ -644,6 +549,7 @@ fn collapse_stable_copy_aliases(
                     candidate_index,
                     sink_index,
                     &use_index,
+                    &write_index,
                     mutable_snapshots,
                 )
             })
@@ -751,9 +657,9 @@ fn collapse_stable_copy_aliases(
                                 trailing_condition.as_deref(),
                                 &write_index,
                                 mutable_snapshots,
-                                candidate_index,
-                                use_stmt_indices[0],
+                                candidate_index..=use_stmt_indices[0],
                                 source_binding,
+                                &control_flow,
                             )
                         })
                         .flatten();
@@ -791,9 +697,7 @@ fn collapse_stable_copy_aliases(
                     &replacement,
                     options,
                     InlinePolicy::StableCopy,
-                ) || BindingUseIndex::for_stmts_with_trailing_expr(&[], Some(&rewritten))
-                    .count_uses_in_suffix(0, candidate.binding())
-                    != 0
+                ) || expr_uses_binding(&rewritten, candidate.binding())
                 {
                     return false;
                 }
@@ -820,11 +724,7 @@ fn collapse_stable_copy_aliases(
                 options,
                 InlinePolicy::StableCopy,
             );
-            if !rewritten
-                || BindingUseIndex::for_stmts(std::slice::from_ref(&rewritten_stmt))
-                    .count_uses_in_suffix(0, candidate.binding())
-                    != 0
-            {
+            if !rewritten || stmt_uses_binding(&rewritten_stmt, candidate.binding()) {
                 return false;
             }
             rewritten_stmts.push((*use_stmt_index, rewritten_stmt));
@@ -867,10 +767,11 @@ fn stable_copy_trailing_root_handoff(
     trailing_condition: Option<&AstExpr>,
     write_index: &BindingWriteIndex,
     mutable_snapshots: &MutableSnapshotNames,
-    candidate_index: usize,
-    use_stmt_index: usize,
+    interval: std::ops::RangeInclusive<usize>,
     source: AstBindingRef,
+    control_flow: &std::cell::OnceCell<Option<super::control_flow::RepeatBodyControlFlow>>,
 ) -> Option<StableCopyRootHandoff> {
+    let (candidate_index, use_stmt_index) = (*interval.start(), *interval.end());
     let candidate = inline_candidate(&stmts[candidate_index])
         .expect("planned stable-copy handoff must retain its candidate declaration")
         .0
@@ -963,14 +864,15 @@ fn stable_copy_trailing_root_handoff(
         return None;
     }
     if local_like_target {
-        let cfg = super::control_flow::RepeatBodyControlFlow::new(stmts)?;
+        let cfg = control_flow
+            .get_or_init(|| super::control_flow::RepeatBodyControlFlow::new(stmts))
+            .as_ref()?;
         if !cfg.dominates(candidate_index, use_stmt_index)
             || !cfg.dominates(use_stmt_index, cfg.exit())
-            || ((use_stmt_index + 1)..stmts.len())
-                .filter(|stmt_index| {
-                    write_index.stmt_directly_writes_name(*stmt_index, &source.to_name_ref())
-                })
-                .any(|write_stmt_index| !cfg.dominates(use_stmt_index, write_stmt_index))
+            || write_index
+                .name_write_indices_after(use_stmt_index, &source.to_name_ref())
+                .iter()
+                .any(|&write_stmt_index| !cfg.dominates(use_stmt_index, write_stmt_index))
         {
             // 候选拒绝[SemanticBarrier:ControlFlow]：goto 可绕过 alias 初始化或 handoff，
             // 使 source 覆盖/latch 路径重读新值或失去旧 root；block CFG 必须证明双重支配。
@@ -1000,7 +902,7 @@ fn stable_copy_trailing_root_handoff(
     };
     let condition_references_target = binding_from_name_ref(&target).map_or_else(
         || condition_references_param(condition, &target),
-        |target| expr_references_binding(condition, target),
+        |target| expr_reads_binding(condition, target),
     );
     if !condition_references_target {
         // 候选拒绝[SemanticBarrier:Lifetime]：cleanup 会继续删除 dead target；只有 latch
@@ -1018,6 +920,7 @@ fn stable_copy_trailing_root_handoff(
 enum StructuredHandoffState {
     Pending,
     HandedOff(AstNameRef),
+    Terminated,
 }
 
 fn structured_if_handoff_target(
@@ -1034,28 +937,13 @@ fn structured_if_handoff_target(
         // 整体支配；外部 goto 可进入内部 label 并绕过 owner 内的 handoff。
         return None;
     }
-    let mut outcomes = structured_handoff_block_outcomes(
-        &if_stmt.then_block,
-        candidate,
-        StructuredHandoffState::Pending,
-    )?;
-    if let Some(else_block) = &if_stmt.else_block {
-        outcomes.extend(structured_handoff_block_outcomes(
-            else_block,
-            candidate,
-            StructuredHandoffState::Pending,
-        )?);
+    let then_state = structured_handoff_block_outcome(&if_stmt.then_block, candidate)?;
+    let else_state = if let Some(else_block) = &if_stmt.else_block {
+        structured_handoff_block_outcome(else_block, candidate)?
     } else {
-        outcomes.push(StructuredHandoffState::Pending);
-    }
-    let mut targets = outcomes.into_iter().map(|state| match state {
-        StructuredHandoffState::Pending => None,
-        StructuredHandoffState::HandedOff(target) => Some(target),
-    });
-    let target = targets.next().flatten()?;
-    targets
-        .all(|other| other.as_ref() == Some(&target))
-        .then_some(target)
+        StructuredHandoffState::Pending
+    };
+    common_structured_handoff_target([then_state, else_state])
 }
 
 fn structured_do_handoff_target(block: &AstBlock, candidate: AstBindingRef) -> Option<AstNameRef> {
@@ -1064,15 +952,16 @@ fn structured_do_handoff_target(block: &AstBlock, candidate: AstBindingRef) -> O
         // 顶层 owner 的支配关系不能证明 owner 内的 handoff 已执行。
         return None;
     }
-    let outcomes =
-        structured_handoff_block_outcomes(block, candidate, StructuredHandoffState::Pending)?;
-    common_structured_handoff_target(outcomes)
+    common_structured_handoff_target([structured_handoff_block_outcome(block, candidate)?])
 }
 
-fn common_structured_handoff_target(outcomes: Vec<StructuredHandoffState>) -> Option<AstNameRef> {
-    let mut targets = outcomes.into_iter().map(|state| match state {
-        StructuredHandoffState::Pending => None,
-        StructuredHandoffState::HandedOff(target) => Some(target),
+fn common_structured_handoff_target(
+    outcomes: impl IntoIterator<Item = StructuredHandoffState>,
+) -> Option<AstNameRef> {
+    let mut targets = outcomes.into_iter().filter_map(|state| match state {
+        StructuredHandoffState::Terminated => None,
+        StructuredHandoffState::Pending => Some(None),
+        StructuredHandoffState::HandedOff(target) => Some(Some(target)),
     });
     let target = targets.next().flatten()?;
     targets
@@ -1080,82 +969,61 @@ fn common_structured_handoff_target(outcomes: Vec<StructuredHandoffState>) -> Op
         .then_some(target)
 }
 
-fn structured_handoff_block_outcomes(
+fn structured_handoff_block_outcome(
     block: &AstBlock,
     candidate: AstBindingRef,
-    initial: StructuredHandoffState,
-) -> Option<Vec<StructuredHandoffState>> {
-    let mut states = vec![initial];
+) -> Option<StructuredHandoffState> {
+    let mut state = StructuredHandoffState::Pending;
     for stmt in &block.stmts {
-        let mut next = Vec::new();
-        for state in states {
-            structured_handoff_stmt_outcomes(stmt, candidate, state, &mut next)?;
+        if let Some(target) = direct_handoff_target(stmt, candidate) {
+            if state != StructuredHandoffState::Pending {
+                return None;
+            }
+            state = StructuredHandoffState::HandedOff(target);
+            continue;
         }
-        states = dedup_handoff_states(next);
-        if states.is_empty() {
-            break;
-        }
-    }
-    Some(states)
-}
-
-fn structured_handoff_stmt_outcomes(
-    stmt: &AstStmt,
-    candidate: AstBindingRef,
-    state: StructuredHandoffState,
-    outcomes: &mut Vec<StructuredHandoffState>,
-) -> Option<()> {
-    if let Some(target) = direct_handoff_target(stmt, candidate) {
-        if state != StructuredHandoffState::Pending {
+        if stmt_uses_binding(stmt, candidate) {
             return None;
         }
-        outcomes.push(StructuredHandoffState::HandedOff(target));
-        return Some(());
-    }
-    if BindingUseIndex::for_stmts(std::slice::from_ref(stmt)).count_uses_in_suffix(0, candidate)
-        != 0
-    {
-        return None;
-    }
-    if let StructuredHandoffState::HandedOff(target) = &state
-        && BindingWriteIndex::for_stmts(std::slice::from_ref(stmt))
-            .stmt_directly_writes_name(0, target)
-    {
-        return None;
-    }
-    match stmt {
-        AstStmt::If(if_stmt) => {
-            outcomes.extend(structured_handoff_block_outcomes(
-                &if_stmt.then_block,
-                candidate,
-                state.clone(),
-            )?);
-            if let Some(else_block) = &if_stmt.else_block {
-                outcomes.extend(structured_handoff_block_outcomes(
-                    else_block, candidate, state,
-                )?);
-            } else {
-                outcomes.push(state);
-            }
+        if let StructuredHandoffState::HandedOff(target) = &state
+            && stmt_writes_name(stmt, target)
+        {
+            return None;
         }
-        AstStmt::DoBlock(block) => {
-            outcomes.extend(structured_handoff_block_outcomes(block, candidate, state)?);
+        // 整棵语句已排除 candidate 读取和 target 写入，嵌套路径不能产生不同的交接
+        // 状态，只能保留或终止当前状态；控制归约无需为每个子块重建读写索引。
+        if !handoff_stmt_may_continue(stmt, state != StructuredHandoffState::Pending)? {
+            return Some(StructuredHandoffState::Terminated);
         }
-        AstStmt::Return(_) | AstStmt::Break => {}
-        AstStmt::Continue if matches!(state, StructuredHandoffState::HandedOff(_)) => {}
-        AstStmt::Continue | AstStmt::Goto(_) => return None,
-        _ => outcomes.push(state),
     }
-    Some(())
+    Some(state)
 }
 
-fn dedup_handoff_states(states: Vec<StructuredHandoffState>) -> Vec<StructuredHandoffState> {
-    states.into_iter().fold(Vec::new(), |mut unique, state| {
-        if !unique.contains(&state) {
-            unique.push(state);
+fn handoff_block_may_continue(block: &AstBlock, handed_off: bool) -> Option<bool> {
+    for stmt in &block.stmts {
+        if !handoff_stmt_may_continue(stmt, handed_off)? {
+            return Some(false);
         }
-        unique
-    })
+    }
+    Some(true)
+}
+
+fn handoff_stmt_may_continue(stmt: &AstStmt, handed_off: bool) -> Option<bool> {
+    match stmt {
+        AstStmt::If(if_stmt) => {
+            let then_continues = handoff_block_may_continue(&if_stmt.then_block, handed_off)?;
+            let else_continues = match &if_stmt.else_block {
+                Some(block) => handoff_block_may_continue(block, handed_off)?,
+                None => true,
+            };
+            Some(then_continues || else_continues)
+        }
+        AstStmt::DoBlock(block) => handoff_block_may_continue(block, handed_off),
+        AstStmt::Return(_) | AstStmt::Break => Some(false),
+        AstStmt::Continue if handed_off => Some(false),
+        AstStmt::Continue | AstStmt::Goto(_) => None,
+        _ => Some(true),
+    }
 }
 
 fn direct_handoff_target(stmt: &AstStmt, candidate: AstBindingRef) -> Option<AstNameRef> {

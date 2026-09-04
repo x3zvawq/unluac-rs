@@ -12,10 +12,7 @@
 //! field alias lookup 与事件型 receiver initializer 原本只求值一次，因此不能搬入
 //! while/repeat；所有 alias 也不能越过外层调用、左侧操作数、复杂赋值目标等可观察前缀。
 
-use super::super::binding_flow::{
-    BindingUseIndex, MutableSnapshotNames, binding_is_directly_written_in_suffix,
-    name_is_directly_written_in_suffix,
-};
+use super::super::binding_flow::{BindingUseIndex, BindingWriteIndex, MutableSnapshotNames};
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_stable_context_expr;
 use super::super::visit::{AstVisitor, visit_block};
@@ -158,17 +155,20 @@ fn proven_direct_method_call(call: &AstCallExpr) -> Option<AstMethodCallExpr> {
 pub(super) fn try_recover_method_alias_stmt(
     stmts: &[AstStmt],
     use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
     stmt_base: usize,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<(AstStmt, usize)> {
-    try_recover_with_receiver_alias(stmts, use_index, stmt_base, mutable_snapshots).or_else(|| {
-        try_recover_receiver_alias_direct_method_call(
-            stmts,
-            use_index,
-            stmt_base,
-            mutable_snapshots,
-        )
-    })
+    try_recover_with_receiver_alias(stmts, use_index, write_index, stmt_base, mutable_snapshots)
+        .or_else(|| {
+            try_recover_receiver_alias_direct_method_call(
+                stmts,
+                use_index,
+                write_index,
+                stmt_base,
+                mutable_snapshots,
+            )
+        })
 }
 
 pub(super) fn try_recover_certified_method_setup(
@@ -230,6 +230,7 @@ pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
     index: usize,
     sink_index: usize,
     use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
     if stmts.get(sink_index).is_none() {
@@ -237,12 +238,17 @@ pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
     }
     let run = &stmts[index..];
     match sink_index.checked_sub(index) {
-        Some(1) => {
-            try_recover_receiver_alias_direct_method_call(run, use_index, index, mutable_snapshots)
-                .is_some()
-        }
+        Some(1) => try_recover_receiver_alias_direct_method_call(
+            run,
+            use_index,
+            write_index,
+            index,
+            mutable_snapshots,
+        )
+        .is_some(),
         Some(2) => {
-            try_recover_with_receiver_alias(run, use_index, index, mutable_snapshots).is_some()
+            try_recover_with_receiver_alias(run, use_index, write_index, index, mutable_snapshots)
+                .is_some()
         }
         _ => false,
     }
@@ -251,6 +257,7 @@ pub(in crate::ast::readability) fn run_belongs_to_method_alias_owner(
 fn try_recover_with_receiver_alias(
     stmts: &[AstStmt],
     use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
     stmt_base: usize,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<(AstStmt, usize)> {
@@ -275,8 +282,12 @@ fn try_recover_with_receiver_alias(
         mutable_snapshots,
         |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, receiver_binding)),
     )?;
-    let source_may_drop_receiver_root =
-        receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots);
+    let source_may_drop_receiver_root = receiver_alias_source_may_drop_root(
+        write_index,
+        stmt_base,
+        receiver_expr,
+        mutable_snapshots,
+    );
     let source_preserves_receiver_root =
         matches!(receiver_expr, AstExpr::Var(_)) && !source_may_drop_receiver_root;
     if !method_alias_local_can_be_removed(receiver_local, source_preserves_receiver_root)
@@ -284,8 +295,8 @@ fn try_recover_with_receiver_alias(
     {
         return None;
     }
-    if binding_is_directly_written_in_suffix(stmts, 1, receiver_binding)
-        || binding_is_directly_written_in_suffix(stmts, 2, field_binding)
+    if write_index.has_rebinding_after(stmt_base, receiver_binding)
+        || write_index.has_rebinding_after(stmt_base + 1, field_binding)
     {
         // 候选拒绝[SemanticBarrier:Scope]：删除 alias declaration 会让后续 direct write 解析到外层 binding，不能只按读取次数判断。
         return None;
@@ -306,6 +317,7 @@ fn try_recover_with_receiver_alias(
 fn try_recover_receiver_alias_direct_method_call(
     stmts: &[AstStmt],
     use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
     stmt_base: usize,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<(AstStmt, usize)> {
@@ -330,14 +342,18 @@ fn try_recover_receiver_alias_direct_method_call(
             },
         )
     })?;
-    let source_may_drop_receiver_root =
-        receiver_alias_source_may_drop_root(stmts, receiver_expr, mutable_snapshots);
+    let source_may_drop_receiver_root = receiver_alias_source_may_drop_root(
+        write_index,
+        stmt_base,
+        receiver_expr,
+        mutable_snapshots,
+    );
     let source_preserves_receiver_root =
         matches!(receiver_expr, AstExpr::Var(_)) && !source_may_drop_receiver_root;
     if !method_alias_local_can_be_removed(receiver_local, source_preserves_receiver_root) {
         return None;
     }
-    if binding_is_directly_written_in_suffix(stmts, 1, receiver_binding) {
+    if write_index.has_rebinding_after(stmt_base, receiver_binding) {
         // 候选拒绝[SemanticBarrier:Scope]：删除 receiver local 会把 sink/后缀的 direct write 绑定到外层名称。
         return None;
     }
@@ -408,7 +424,8 @@ fn method_alias_local_can_be_removed(
 }
 
 fn receiver_alias_source_may_drop_root(
-    stmts: &[AstStmt],
+    write_index: &BindingWriteIndex,
+    stmt_base: usize,
     receiver_expr: &AstExpr,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {
@@ -419,7 +436,7 @@ fn receiver_alias_source_may_drop_root(
         // 候选拒绝[SemanticBarrier:Lifetime]：global/upvalue 可在 sink 期间换值，删除 alias 会提前释放旧 receiver root。
         return true;
     }
-    if name_is_directly_written_in_suffix(stmts, 1, source) {
+    if write_index.name_has_rebinding_after(stmt_base, source) {
         // 候选拒绝[SemanticBarrier:Lifetime]：后缀写会丢失旧 root，反例见 regress_406。
         return true;
     }
@@ -998,10 +1015,14 @@ mod tests {
         ];
         let use_index = BindingUseIndex::for_stmts(&stmts);
 
-        let (AstStmt::While(rewritten), consumed) =
-            try_recover_method_alias_stmt(&stmts, &use_index, 0, &MutableSnapshotNames::new())
-                .expect("stable direct receiver can be read once per loop condition")
-        else {
+        let (AstStmt::While(rewritten), consumed) = try_recover_method_alias_stmt(
+            &stmts,
+            &use_index,
+            &BindingWriteIndex::for_stmts(&stmts),
+            0,
+            &MutableSnapshotNames::new(),
+        )
+        .expect("stable direct receiver can be read once per loop condition") else {
             panic!("method alias should preserve the while owner")
         };
         assert_eq!(consumed, 2);

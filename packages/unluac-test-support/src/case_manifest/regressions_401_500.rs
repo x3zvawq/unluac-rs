@@ -368,4 +368,8 @@ pub(super) const REGRESSION_CASES_401_500: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_477_capture_creation_reads.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_478_function_target_reads.lua",
+        ALL_DIALECTS,
+    ),
 ];

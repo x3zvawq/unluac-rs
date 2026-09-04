@@ -757,26 +757,24 @@ fn decision_payload_seed(
     safety: HirExprSafety,
 ) -> ClosurePayloadSeed {
     let mut seed = ClosurePayloadSeed::default();
-    let mut pending = BTreeSet::from([decision.entry]);
-    let mut visited = BTreeSet::new();
-    while let Some(node_ref) = pending.pop_first() {
-        if !visited.insert(node_ref) {
+    let topology = crate::hir::decision::analyze_decision(decision);
+    let mut reachable = vec![false; decision.nodes.len()];
+    reachable[decision.entry.index()] = true;
+    for node in topology.topological_nodes() {
+        if !reachable[node.id.index()] {
             continue;
         }
-        let Some(node) = decision.nodes.iter().find(|node| node.id == node_ref) else {
-            continue;
-        };
         let truthiness = expr_truthiness(&node.test, safety);
-        for (reachable, target) in [
+        for (edge_reachable, target) in [
             (truthiness != Some(false), &node.truthy),
             (truthiness != Some(true), &node.falsy),
         ] {
-            if !reachable {
+            if !edge_reachable {
                 continue;
             }
             match target {
                 crate::hir::HirDecisionTarget::Node(next) => {
-                    pending.insert(*next);
+                    reachable[next.index()] = true;
                 }
                 crate::hir::HirDecisionTarget::CurrentValue => {
                     seed.union_with(&payload_seed_from_expr(&node.test, promotion_facts, safety))

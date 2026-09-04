@@ -7,11 +7,9 @@
 //! 未表示的 low-IR 指令，Return 也不携带可能由物理 copy 间接依赖该 scope 的结果，因而
 //! 可以安全恢复尾部 `do ... end`；其它 PC/HIR value 布局不靠声明位置猜测。
 
-use std::collections::BTreeSet;
-
 use crate::hir::common::{HirBlock, HirDebugScope, HirProto, HirStmt};
 
-use super::label_refs::count_label_references;
+use super::label_refs::label_references_by_stmt;
 use super::mention::stmts_mention_local;
 use super::walk::{HirRewritePass, rewrite_proto};
 
@@ -56,7 +54,8 @@ fn materialize_tail_scopes(
         )
         .unwrap_or(return_index);
 
-    let mut starts = block
+    let label_refs = std::cell::OnceCell::new();
+    let starts = block
         .stmts
         .iter()
         .enumerate()
@@ -79,12 +78,21 @@ fn materialize_tail_scopes(
                     .bindings
                     .iter()
                     .all(|local| !stmts_mention_local(&block.stmts[body_end..], *local))
-                && !scope_has_external_entry(&block.stmts, index, body_end))
+                && !label_refs
+                    .get_or_init(|| {
+                        let mut refs = label_references_by_stmt(&block.stmts);
+                        // 此候选只检查直属 label；嵌套 label 仍由原来的子块拥有。
+                        for (stmt, refs) in block.stmts.iter().zip(&mut refs) {
+                            if !matches!(stmt, HirStmt::Label(_)) {
+                                refs.labels.clear();
+                            }
+                        }
+                        crate::graph::LabelReferenceIndex::new(&refs)
+                    })
+                    .has_incoming_outside(index..body_end, index..block.stmts.len()))
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    starts.sort_unstable();
-    starts.dedup();
     let Some(first_start) = starts.first().copied() else {
         return false;
     };
@@ -107,13 +115,4 @@ fn nest_tail(stmts: &[HirStmt], start: usize, end: usize, nested_starts: &[usize
         stmts: nest_tail(stmts, next_start, end, rest),
     })));
     nested
-}
-
-fn scope_has_external_entry(stmts: &[HirStmt], start: usize, end: usize) -> bool {
-    let external_targets = count_label_references(&stmts[..start])
-        .into_keys()
-        .collect::<BTreeSet<_>>();
-    stmts[start..end]
-        .iter()
-        .any(|stmt| matches!(stmt, HirStmt::Label(label) if external_targets.contains(&label.id)))
 }

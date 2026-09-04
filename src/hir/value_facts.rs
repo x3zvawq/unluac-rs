@@ -134,23 +134,9 @@ fn decision_value_facts(
     decision: &HirDecisionExpr,
     resolve: &impl Fn(&HirExpr) -> Option<HirValueFacts>,
 ) -> HirValueFacts {
-    super::decision::assert_valid_decision(decision);
+    let topology = super::decision::analyze_decision(decision);
     let mut facts = vec![None; decision.nodes.len()];
-    let mut pending = vec![(decision.entry, false)];
-    while let Some((id, expanded)) = pending.pop() {
-        if facts[id.index()].is_some() {
-            continue;
-        }
-        let node = &decision.nodes[id.index()];
-        if !expanded {
-            pending.push((id, true));
-            for target in [&node.truthy, &node.falsy] {
-                if let HirDecisionTarget::Node(child) = target {
-                    pending.push((*child, false));
-                }
-            }
-            continue;
-        }
+    for node in topology.topological_nodes().rev() {
         let test = value_facts_with(&node.test, resolve);
         let mut result = HirValueFacts(0);
         for (truthy, target) in [(true, &node.truthy), (false, &node.falsy)] {
@@ -166,7 +152,7 @@ fn decision_value_facts(
                 HirDecisionTarget::Expr(expr) => value_facts_with(expr, resolve),
             });
         }
-        facts[id.index()] = Some(result);
+        facts[node.id.index()] = Some(result);
     }
     facts[decision.entry.index()].expect("Decision entry has a result")
 }

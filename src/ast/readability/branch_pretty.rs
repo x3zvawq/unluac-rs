@@ -20,7 +20,7 @@ use super::super::common::{
     AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
-use super::binding_flow::binding_is_directly_written_in_suffix;
+use super::binding_flow::BindingWriteIndex;
 use super::control_flow::block_contains_label_or_goto;
 use super::visit::{self, AstVisitor};
 use super::walk::{self, AstRewritePass, BlockKind};
@@ -775,6 +775,7 @@ fn block_prevents_tail_extension(block: &AstBlock) -> bool {
         return true;
     }
 
+    let writes = std::cell::OnceCell::new();
     block
         .stmts
         .iter()
@@ -815,11 +816,9 @@ fn block_prevents_tail_extension(block: &AstBlock) -> bool {
                             // initializer。若 binding 到原 block fallthrough 之间又被写入，scope-end
                             // 值已不是该 initializer；AST 只证明候选区间没有写入，不分析 RHS
                             // 类型。更精确的接受需要未来的 HIR endpoint certificate。
-                            binding_is_directly_written_in_suffix(
-                                &block.stmts,
-                                stmt_index + 1,
-                                binding.id,
-                            )
+                            writes
+                                .get_or_init(|| BindingWriteIndex::for_stmts(&block.stmts))
+                                .has_rebinding_after(stmt_index, binding.id)
                         }
                     })
             }

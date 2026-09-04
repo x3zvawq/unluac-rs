@@ -410,7 +410,9 @@ fn materialize_decision_into_target(
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
 ) -> Vec<HirStmt> {
-    if let Some(expr) = super::collapse_value_decision_expr(&decision, safety) {
+    if let Some(expr) =
+        super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety)
+    {
         return materialize_expr_into_target(expr, target, state, safety);
     }
 
@@ -650,7 +652,9 @@ fn prepare_ordered_exprs(
 
 fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
     match expr {
-        HirExpr::Decision(decision) => super::collapse_value_decision_expr(&decision, safety),
+        HirExpr::Decision(decision) => {
+            super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety)
+        }
         HirExpr::TableAccess(access) => Some(HirExpr::TableAccess(Box::new(HirTableAccess {
             base: collapse_expr_to_pure(access.base, safety)?,
             key: collapse_expr_to_pure(access.key, safety)?,
@@ -874,7 +878,9 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety
             lhs_changed || rhs_changed
         }
         HirExpr::Decision(decision) => {
-            if let Some(replacement) = super::collapse_condition_decision_expr(decision, safety) {
+            if let Some(replacement) =
+                super::collapse_condition_decision_expr(&super::analyze_decision(decision), safety)
+            {
                 *expr = replacement;
                 true
             } else {

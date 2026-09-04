@@ -1,5 +1,7 @@
 //! 折叠相邻调用、lookup 与机械 local run；依赖父模块的 candidate/use/eval-order 合同，不负责单次 alias inline；例如把 recovered callee/receiver 链收回调用或赋值 sink。
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 fn extended_run_allows_recovered_expr(
@@ -211,15 +213,13 @@ pub(super) fn collapse_adjacent_call_alias_runs(
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
     while index < old_stmts.len() {
-        let mut run_end = index;
-        while run_end < old_stmts.len() && inline_candidate(&old_stmts[run_end]).is_some() {
-            run_end += 1;
-        }
+        let run_end = run_facts.end(index);
 
         if run_end == index
             || run_end >= old_stmts.len()
@@ -234,6 +234,7 @@ pub(super) fn collapse_adjacent_call_alias_runs(
             index,
             run_end,
             &use_index,
+            &write_index,
             mutable_snapshots,
         ) {
             // 候选拒绝[LayerBoundary]：Deferred function-sugar 的 method_alias owner 会把
@@ -526,12 +527,13 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
     while index < old_stmts.len() {
-        let Some(sink_index) = find_terminal_call_result_sink(&old_stmts, index) else {
+        let Some(sink_index) = run_facts.call_result_after(index) else {
             stmt_plan.push(PlannedStmt::Original(index));
             index += 1;
             continue;
@@ -541,6 +543,7 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
             index,
             sink_index,
             &use_index,
+            &write_index,
             mutable_snapshots,
         ) {
             // 候选拒绝[LayerBoundary]：Deferred function-sugar 的 method_alias owner 会原子
@@ -670,20 +673,6 @@ pub(super) fn collapse_terminal_call_result_alias_runs(
     changed
 }
 
-pub(super) fn find_terminal_call_result_sink(stmts: &[AstStmt], index: usize) -> Option<usize> {
-    inline_candidate(stmts.get(index)?)?;
-
-    let mut sink_index = index + 1;
-    while sink_index < stmts.len() && inline_candidate(&stmts[sink_index]).is_some() {
-        if stmt_is_adjacent_call_result_sink(&stmts[sink_index]) {
-            return Some(sink_index);
-        }
-        sink_index += 1;
-    }
-
-    None
-}
-
 pub(super) fn collapse_adjacent_mechanical_alias_runs(
     block: &mut AstBlock,
     target: AstTargetDialect,
@@ -694,15 +683,13 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
     while index < old_stmts.len() {
-        let mut run_end = index;
-        while run_end < old_stmts.len() && inline_candidate(&old_stmts[run_end]).is_some() {
-            run_end += 1;
-        }
+        let run_end = run_facts.end(index);
 
         if run_end == index
             || run_end >= old_stmts.len()
@@ -789,12 +776,9 @@ pub(super) fn collapse_adjacent_mechanical_alias_runs(
                 removed[candidate_index - index] = true;
                 collapsed_count += 1;
                 has_non_lookup_piece |= !candidate::is_lookup_inline_expr(value);
-                has_dependent_lookup_piece |= candidate::is_lookup_inline_expr(value)
-                    && expr_references_any_run_binding(
-                        value,
-                        &old_stmts[index..run_end],
-                        candidate.binding(),
-                    );
+                has_dependent_lookup_piece = has_dependent_lookup_piece
+                    || (candidate::is_lookup_inline_expr(value)
+                        && run_facts.reads_other_candidate(value, index, candidate.binding()));
             }
         }
 
@@ -849,15 +833,13 @@ pub(super) fn collapse_terminal_local_mechanical_runs(
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let run_facts = CandidateRunFacts::new(&old_stmts);
     let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
     let mut index = 0;
 
     while index < old_stmts.len() {
-        let mut run_end = index;
-        while run_end < old_stmts.len() && inline_candidate(&old_stmts[run_end]).is_some() {
-            run_end += 1;
-        }
+        let run_end = run_facts.end(index);
 
         if run_end <= index + 1 || run_end >= old_stmts.len() {
             stmt_plan.push(PlannedStmt::Original(index));
@@ -1080,12 +1062,8 @@ pub(super) fn stmt_starts_lookup_mechanical_run(
     stmts: &[AstStmt],
     index: usize,
     binding: AstBindingRef,
+    run_end: usize,
 ) -> bool {
-    let mut run_end = index;
-    while run_end < stmts.len() && inline_candidate(&stmts[run_end]).is_some() {
-        run_end += 1;
-    }
-
     run_end > index + 1
         && run_end < stmts.len()
         && stmt_can_absorb_mechanical_run(&stmts[run_end])
@@ -1094,21 +1072,8 @@ pub(super) fn stmt_starts_lookup_mechanical_run(
             .and_then(inline_candidate)
             .is_some_and(|(_, next_value)| {
                 candidate::is_lookup_inline_expr(next_value)
-                    && expr_references_binding(next_value, binding)
+                    && expr_reads_binding(next_value, binding)
             })
-}
-
-pub(super) fn expr_references_any_run_binding(
-    expr: &super::super::super::common::AstExpr,
-    run: &[AstStmt],
-    except: AstBindingRef,
-) -> bool {
-    run.iter().any(|stmt| {
-        inline_candidate(stmt).is_some_and(|(candidate, _)| {
-            let binding = candidate.binding();
-            binding != except && expr_references_binding(expr, binding)
-        })
-    })
 }
 
 pub(super) fn assign_targets_same_lookup_expr(

@@ -15,6 +15,7 @@ use crate::ast::common::{
     AstTableKey, AstTargetDialect, AstUnaryOpKind,
 };
 
+use super::super::binding_flow::expr_has_binding_read;
 use super::super::binding_ref::binding_from_name_ref;
 use super::super::expr_analysis::{
     expr_observes_eval_order, expr_requires_ordered_snapshot,
@@ -347,7 +348,9 @@ impl EvalPrefixCollector<'_> {
             AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
                 self.expr(&logical.lhs, mode);
                 if matches!(mode, WalkMode::Dependency)
-                    && contains_moved_binding(&logical.rhs, self.values)
+                    && expr_has_binding_read(&logical.rhs, |binding| {
+                        self.values.contains_key(&binding)
+                    })
                 {
                     // 候选拒绝[SemanticBarrier:ControlFlow]：把必达声明搬进 `and/or` 右臂会让 producer 受左值 truthiness 控制。
                     self.barrier();
@@ -360,10 +363,9 @@ impl EvalPrefixCollector<'_> {
             AstExpr::MethodCall(call) => {
                 self.expr(&call.receiver, mode);
                 if matches!(mode, WalkMode::Sink)
-                    || call
-                        .args
-                        .iter()
-                        .any(|arg| contains_moved_binding(arg, self.values))
+                    || call.args.iter().any(|arg| {
+                        expr_has_binding_read(arg, |binding| self.values.contains_key(&binding))
+                    })
                 {
                     self.barrier();
                 }
@@ -446,10 +448,4 @@ impl EvalPrefixCollector<'_> {
 enum WalkMode {
     Sink,
     Dependency,
-}
-
-fn contains_moved_binding(value: &AstExpr, values: &BTreeMap<AstBindingRef, &AstExpr>) -> bool {
-    values
-        .keys()
-        .any(|binding| super::super::binding_tree::expr_references_binding(value, *binding))
 }

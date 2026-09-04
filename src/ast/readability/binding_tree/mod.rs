@@ -1,73 +1,17 @@
 //! 当前函数体内 AST binding 树遍历的共享 helper。
 //!
-//! `binding_flow` 更偏向整段语句流上的 use-count / reachability 分析；这里则只处理
-//! 单棵 stmt/expr/lvalue 树上的递归查询，并且故意不继续钻进嵌套函数体，
-//! 避免把不同函数里碰巧同号的 binding 混成同一个局部变量。
+//! 这里只判断 binding 在调用参数、存储目标等源码上下文中的位置；通用名字访问
+//! 查询由 `binding_flow` 持有，并消费共享 visitor 的 Read/Write/Capture 角色。
+//! 例如 `t[x] = y` 的 x 是地址读取，不能当作被写入的 binding。
 
 use crate::ast::common::{
     AstBindingRef, AstCallKind, AstExpr, AstLValue, AstStmt, AstTableField, AstTableKey,
 };
 
+use super::binding_flow::expr_reads_binding;
 use super::binding_ref::name_matches_binding;
 
-pub(super) fn expr_references_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
-    match expr {
-        AstExpr::Var(name) => name_matches_binding(name, binding),
-        AstExpr::FieldAccess(access) => expr_references_binding(&access.base, binding),
-        AstExpr::IndexAccess(access) => {
-            expr_references_binding(&access.base, binding)
-                || expr_references_binding(&access.index, binding)
-        }
-        AstExpr::Unary(unary) => expr_references_binding(&unary.expr, binding),
-        AstExpr::Binary(binary) => {
-            expr_references_binding(&binary.lhs, binding)
-                || expr_references_binding(&binary.rhs, binding)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            expr_references_binding(&logical.lhs, binding)
-                || expr_references_binding(&logical.rhs, binding)
-        }
-        AstExpr::Call(call) => {
-            expr_references_binding(&call.callee, binding)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_references_binding(arg, binding))
-        }
-        AstExpr::MethodCall(call) => {
-            expr_references_binding(&call.receiver, binding)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_references_binding(arg, binding))
-        }
-        AstExpr::SingleValue(expr) => expr_references_binding(expr, binding),
-        AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
-            AstTableField::Array(value) => expr_references_binding(value, binding),
-            AstTableField::Record(record) => {
-                let key_references = match &record.key {
-                    AstTableKey::Name(_) => false,
-                    AstTableKey::Expr(key) => expr_references_binding(key, binding),
-                };
-                key_references || expr_references_binding(&record.value, binding)
-            }
-        }),
-        AstExpr::FunctionExpr(_)
-        | AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => false,
-    }
-}
-
-/// stmt 级别的 binding 使用查询统一入口。
+/// 只检查本语句的求值部分；子块和函数声明不属于当前 sink 的表达式位置。
 fn stmt_has_binding_use_by(
     stmt: &AstStmt,
     binding: AstBindingRef,
@@ -75,45 +19,19 @@ fn stmt_has_binding_use_by(
     check_call: impl Fn(&AstCallKind, AstBindingRef) -> bool,
     check_assign_target: impl Fn(&AstLValue, AstBindingRef) -> bool,
 ) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .any(|value| check_expr(value, binding)),
-        AstStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .any(|value| check_expr(value, binding)),
-        AstStmt::Assign(assign) => {
-            assign
-                .targets
-                .iter()
-                .any(|target| check_assign_target(target, binding))
-                || assign.values.iter().any(|value| check_expr(value, binding))
-        }
-        AstStmt::CallStmt(call_stmt) => check_call(&call_stmt.call, binding),
-        AstStmt::Return(ret) => ret.values.iter().any(|value| check_expr(value, binding)),
-        AstStmt::If(if_stmt) => check_expr(&if_stmt.cond, binding),
-        AstStmt::While(while_stmt) => check_expr(&while_stmt.cond, binding),
-        AstStmt::Repeat(repeat_stmt) => check_expr(&repeat_stmt.cond, binding),
-        AstStmt::NumericFor(numeric_for) => {
-            check_expr(&numeric_for.start, binding)
-                || check_expr(&numeric_for.limit, binding)
-                || check_expr(&numeric_for.step, binding)
-        }
-        AstStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter()
-            .any(|expr| check_expr(expr, binding)),
-        AstStmt::DoBlock(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => false,
-    }
+    crate::ast::traverse::traverse_stmt_children!(
+        stmt,
+        iter = iter,
+        opt = as_ref,
+        borrow = [&],
+        expr(expr) => { if check_expr(expr, binding) { return true; } },
+        lvalue(target) => { if check_assign_target(target, binding) { return true; } },
+        block(_block) => {},
+        function(_function) => {},
+        condition(expr) => { if check_expr(expr, binding) { return true; } },
+        call(call) => { if check_call(call, binding) { return true; } }
+    );
+    false
 }
 
 pub(super) fn stmt_has_nested_binding_use(stmt: &AstStmt, binding: AstBindingRef) -> bool {
@@ -177,10 +95,10 @@ pub(super) fn stmt_stores_binding_in_table(stmt: &AstStmt, binding: AstBindingRe
             .any(|value| expr_contains_table_binding(value, binding)),
         AstStmt::Assign(assign) => {
             let table_target = assign.targets.iter().any(|target| match target {
-                AstLValue::FieldAccess(access) => expr_references_binding(&access.base, binding),
+                AstLValue::FieldAccess(access) => expr_reads_binding(&access.base, binding),
                 AstLValue::IndexAccess(access) => {
-                    expr_references_binding(&access.base, binding)
-                        || expr_references_binding(&access.index, binding)
+                    expr_reads_binding(&access.base, binding)
+                        || expr_reads_binding(&access.index, binding)
                 }
                 AstLValue::Name(_) => false,
             });
@@ -191,7 +109,7 @@ pub(super) fn stmt_stores_binding_in_table(stmt: &AstStmt, binding: AstBindingRe
                         AstLValue::FieldAccess(_) | AstLValue::IndexAccess(_)
                     )
                 }) && assign.values.iter().any(|value| {
-                    expr_references_binding(value, binding)
+                    expr_reads_binding(value, binding)
                         || expr_contains_table_binding(value, binding)
                 }))
         }
@@ -202,13 +120,13 @@ pub(super) fn stmt_stores_binding_in_table(stmt: &AstStmt, binding: AstBindingRe
 fn expr_contains_table_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
     match expr {
         AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
-            AstTableField::Array(value) => expr_references_binding(value, binding),
+            AstTableField::Array(value) => expr_reads_binding(value, binding),
             AstTableField::Record(record) => {
                 let key_uses = match &record.key {
                     AstTableKey::Name(_) => false,
-                    AstTableKey::Expr(key) => expr_references_binding(key, binding),
+                    AstTableKey::Expr(key) => expr_reads_binding(key, binding),
                 };
-                key_uses || expr_references_binding(&record.value, binding)
+                key_uses || expr_reads_binding(&record.value, binding)
             }
         }),
         AstExpr::FieldAccess(access) => expr_contains_table_binding(&access.base, binding),

@@ -1,4 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+//! 当前 AST 语句快照的词法跳转与 repeat 支配事实。
+//!
+//! label/goto 和结构化语句决定本层实际边，共享图算法只负责支配计算，不读取前层 CFG。
+//! 例如 `if skip then goto tail end; handoff; ::tail::` 的 handoff 不支配尾端，不能
+//! 据此删除旧 root carrier。嵌套语句仍投影到顶层 owner，其内部交接路径由候选另行证明。
+//! 跳转集合与落空摘要通过共享 traverse 骨架一次后序归约；表达式和 child function
+//! 不参与当前函数的语句边，父块消费子块摘要，不再向下重扫 label/goto。
+
+use std::collections::BTreeMap;
+
+use crate::graph;
 
 use super::super::common::{AstBlock, AstFunctionExpr, AstLabelId, AstStmt};
 use super::visit::{self, AstVisitor};
@@ -27,33 +37,19 @@ pub(super) fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
     visitor.0
 }
 
-pub(super) struct BlockGotoIndex {
-    goto_targets_by_stmt: Vec<BTreeSet<AstLabelId>>,
-    labels_by_stmt: Vec<BTreeSet<AstLabelId>>,
-}
+pub(super) struct BlockGotoIndex(graph::LabelReferenceIndex<AstLabelId>);
 
 impl BlockGotoIndex {
     pub(super) fn new(stmts: &[AstStmt]) -> Self {
-        Self {
-            goto_targets_by_stmt: stmts.iter().map(collect_goto_targets).collect(),
-            labels_by_stmt: stmts.iter().map(collect_labels).collect(),
-        }
+        let refs = stmts
+            .iter()
+            .map(|stmt| collect_jumps(stmt).refs)
+            .collect::<Vec<_>>();
+        Self(graph::LabelReferenceIndex::new(&refs))
     }
 
     pub(super) fn has_external_entry(&self, start: usize, end: usize) -> bool {
-        let nested_labels = self.labels_by_stmt[start..end]
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if nested_labels.is_empty() {
-            return false;
-        }
-        self.goto_targets_by_stmt[..start]
-            .iter()
-            .chain(&self.goto_targets_by_stmt[end..])
-            .flatten()
-            .any(|target| nested_labels.contains(target))
+        self.0.has_incoming_outside(start..end, start..end)
     }
 }
 
@@ -63,16 +59,17 @@ impl BlockGotoIndex {
 /// 路径。调用方若把一个 structured statement 当作 handoff owner，仍需单独证明它的每条
 /// fallthrough/continue 路径已经完成 handoff。
 pub(super) struct RepeatBodyControlFlow {
-    successors: Vec<Vec<usize>>,
+    dominance: graph::DominatorTree<usize>,
     exit: usize,
 }
 
 impl RepeatBodyControlFlow {
     pub(super) fn new(stmts: &[AstStmt]) -> Option<Self> {
         let exit = stmts.len();
+        let jumps = stmts.iter().map(collect_jumps).collect::<Vec<_>>();
         let mut label_owners = BTreeMap::new();
-        for (stmt_index, labels) in stmts.iter().map(collect_labels).enumerate() {
-            for label in labels {
+        for (stmt_index, jump) in jumps.iter().enumerate() {
+            for &label in &jump.refs.labels {
                 if label_owners.insert(label, stmt_index).is_some() {
                     return None;
                 }
@@ -80,20 +77,40 @@ impl RepeatBodyControlFlow {
         }
 
         let mut successors = vec![Vec::new(); stmts.len() + 1];
-        for (stmt_index, stmt) in stmts.iter().enumerate() {
-            for target in collect_goto_targets(stmt) {
+        for (stmt_index, jump) in jumps.into_iter().enumerate() {
+            for target in jump.refs.goto_targets {
                 successors[stmt_index].push(*label_owners.get(&target)?);
             }
-            if stmt_contains_continue(stmt) {
+            if jump.has_continue {
                 successors[stmt_index].push(exit);
             }
-            if stmt_may_fall_through(stmt) {
+            if jump.may_fall_through {
                 successors[stmt_index].push(stmt_index + 1);
             }
             successors[stmt_index].sort_unstable();
             successors[stmt_index].dedup();
         }
-        Some(Self { successors, exit })
+        let mut predecessors = vec![Vec::new(); successors.len()];
+        for (node, targets) in successors.iter().enumerate() {
+            for &target in targets {
+                predecessors[target].push(node);
+            }
+        }
+        let traversal = graph::depth_first(
+            successors.len(),
+            0,
+            |node| node,
+            |_| exit != 0,
+            |node| successors[node].iter().copied(),
+        );
+        let dominance = graph::dominator_tree(
+            &traversal,
+            |node| node,
+            |node| node,
+            |node| predecessors[node].iter().copied(),
+        )
+        .expect("repeat CFG traversal must define a valid dominance tree");
+        Some(Self { dominance, exit })
     }
 
     pub(super) const fn exit(&self) -> usize {
@@ -103,116 +120,84 @@ impl RepeatBodyControlFlow {
     pub(super) fn dominates(&self, dominator: usize, node: usize) -> bool {
         dominator < self.exit
             && node <= self.exit
-            && self.reachable(node, None)
-            && !self.reachable(node, Some(dominator))
-    }
-
-    fn reachable(&self, target: usize, removed: Option<usize>) -> bool {
-        if self.exit == 0 || removed == Some(0) {
-            return false;
-        }
-        let mut seen = vec![false; self.successors.len()];
-        let mut pending = VecDeque::from([0]);
-        while let Some(node) = pending.pop_front() {
-            if Some(node) == removed || seen[node] {
-                continue;
-            }
-            if node == target {
-                return true;
-            }
-            seen[node] = true;
-            pending.extend(self.successors[node].iter().copied());
-        }
-        false
-    }
-}
-
-fn stmt_contains_continue(stmt: &AstStmt) -> bool {
-    struct ContinueVisitor(bool);
-
-    impl AstVisitor for ContinueVisitor {
-        fn visit_stmt(&mut self, stmt: &AstStmt) {
-            self.0 |= matches!(stmt, AstStmt::Continue);
-        }
-
-        fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-            false
-        }
-    }
-
-    let mut visitor = ContinueVisitor(false);
-    visit::visit_stmt(stmt, &mut visitor);
-    visitor.0
-}
-
-fn block_may_fall_through(block: &AstBlock) -> bool {
-    if block_contains_label_or_goto(block) {
-        // Without an owner-internal CFG, a goto may jump past an apparent terminator and
-        // resume at a later label. Keeping the enclosing statement's fallthrough edge is
-        // conservative for the top-level dominance proof.
-        return true;
-    }
-    block
-        .stmts
-        .iter()
-        .find(|stmt| !stmt_may_fall_through(stmt))
-        .is_none()
-}
-
-fn stmt_may_fall_through(stmt: &AstStmt) -> bool {
-    match stmt {
-        AstStmt::Return(_) | AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) => false,
-        AstStmt::If(if_stmt) => if_stmt.else_block.as_ref().is_none_or(|else_block| {
-            block_may_fall_through(&if_stmt.then_block) || block_may_fall_through(else_block)
-        }),
-        AstStmt::DoBlock(block) => block_may_fall_through(block),
-        AstStmt::LocalDecl(_)
-        | AstStmt::GlobalDecl(_)
-        | AstStmt::Assign(_)
-        | AstStmt::CallStmt(_)
-        | AstStmt::While(_)
-        | AstStmt::Repeat(_)
-        | AstStmt::NumericFor(_)
-        | AstStmt::GenericFor(_)
-        | AstStmt::Label(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_)
-        | AstStmt::Error(_) => true,
+            && self.dominance.dominates(dominator, node, |node| node)
     }
 }
 
 #[derive(Default)]
 struct GotoLabelCollector {
-    goto_targets: BTreeSet<AstLabelId>,
-    labels: BTreeSet<AstLabelId>,
+    refs: graph::LabelReferences<AstLabelId>,
+    has_continue: bool,
+    may_fall_through: bool,
 }
 
-impl AstVisitor for GotoLabelCollector {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
+struct StatementFlow {
+    has_jump: bool,
+    may_fall_through: bool,
+}
+
+impl GotoLabelCollector {
+    fn collect_stmt(&mut self, stmt: &AstStmt) -> StatementFlow {
         match stmt {
-            AstStmt::Goto(goto_stmt) => {
-                self.goto_targets.insert(goto_stmt.target);
+            AstStmt::Goto(goto) => {
+                self.refs.goto_targets.insert(goto.target);
             }
             AstStmt::Label(label) => {
-                self.labels.insert(label.id);
+                self.refs.labels.insert(label.id);
             }
+            AstStmt::Continue => self.has_continue = true,
             _ => {}
         }
+        let mut flow = StatementFlow {
+            has_jump: matches!(stmt, AstStmt::Label(_) | AstStmt::Goto(_)),
+            may_fall_through: match stmt {
+                AstStmt::Return(_) | AstStmt::Break | AstStmt::Continue | AstStmt::Goto(_) => false,
+                AstStmt::If(if_stmt) => if_stmt.else_block.is_none(),
+                _ => true,
+            },
+        };
+        crate::ast::traverse::traverse_stmt_children!(
+            stmt,
+            iter = iter,
+            opt = as_ref,
+            borrow = [&],
+            expr(_expr) => {},
+            lvalue(_lvalue) => {},
+            block(block) => {
+                let child = self.collect_block(block);
+                flow.has_jump |= child.has_jump;
+                match stmt {
+                    AstStmt::If(_) => flow.may_fall_through |= child.may_fall_through,
+                    AstStmt::DoBlock(_) => flow.may_fall_through = child.may_fall_through,
+                    _ => {}
+                }
+            },
+            function(_function) => {},
+            condition(_condition) => {},
+            call(_call) => {}
+        );
+        flow
     }
 
-    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-        false
+    fn collect_block(&mut self, block: &AstBlock) -> StatementFlow {
+        let mut flow = StatementFlow {
+            has_jump: false,
+            may_fall_through: true,
+        };
+        for stmt in &block.stmts {
+            let child = self.collect_stmt(stmt);
+            flow.has_jump |= child.has_jump;
+            flow.may_fall_through &= child.may_fall_through;
+        }
+        // 未构造 owner 内部 CFG：嵌套 goto 可能越过 terminator 后重新落入 label，
+        // 因而保留整个 block 的落空边。即使已遇到 terminator，也必须收集后续跳转。
+        flow.may_fall_through |= flow.has_jump;
+        flow
     }
 }
 
-fn collect_goto_targets(stmt: &AstStmt) -> BTreeSet<AstLabelId> {
+fn collect_jumps(stmt: &AstStmt) -> GotoLabelCollector {
     let mut collector = GotoLabelCollector::default();
-    visit::visit_stmt(stmt, &mut collector);
-    collector.goto_targets
-}
-
-fn collect_labels(stmt: &AstStmt) -> BTreeSet<AstLabelId> {
-    let mut collector = GotoLabelCollector::default();
-    visit::visit_stmt(stmt, &mut collector);
-    collector.labels
+    collector.may_fall_through = collector.collect_stmt(stmt).may_fall_through;
+    collector
 }

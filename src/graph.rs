@@ -1,9 +1,16 @@
-//! Structure 与 HIR 共用的非递归图遍历算法。
+//! Structure、HIR 与 AST 共用的非递归图算法和词法引用索引。
 //!
 //! 调用方提供当前快照的稠密身份、可见域及邻接关系；这里不解释控制语句或跨层复用
 //! 旧拓扑。Structure 保存支配分析所需的 DFS 顺序，HIR 在改写后重新分析其实际控制边。
 //! 例如 `entry -> a -> b -> a` 产生源 SCC `{entry}` 与循环 SCC `{a,b}`，不可达前驱
 //! 不会混入分量。分量按源到汇顺序签发，身份只在调用方提供的图快照内有效。
+//! label_refs 独立处理词法引用范围，不借执行图的可达性删除语法入边。
+
+mod dominance;
+mod label_refs;
+
+pub(crate) use dominance::{DominatorTree, dominator_tree};
+pub(crate) use label_refs::{LabelReferenceIndex, LabelReferences};
 
 pub(crate) struct DfsTraversal<N> {
     pub(crate) preorder: Vec<N>,

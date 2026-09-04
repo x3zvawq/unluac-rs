@@ -61,6 +61,26 @@ pub(crate) fn visit_stmts(stmts: &[HirStmt], visitor: &mut impl HirVisitor) {
     }
 }
 
+/// 只遍历语句及嵌套控制块；label 等词法事实不需要扫描求值表达式。
+pub(crate) fn visit_stmt_structure(stmt: &HirStmt, visitor: &mut impl FnMut(&HirStmt)) {
+    visitor(stmt);
+    traverse_hir_stmt_children!(
+        stmt,
+        iter = iter,
+        opt = as_ref,
+        borrow = [&],
+        expr(_expr) => {},
+        lvalue(_lvalue) => {},
+        block(block) => {
+            for child in &block.stmts {
+                visit_stmt_structure(child, visitor);
+            }
+        },
+        call(_call) => {},
+        condition(_cond) => {}
+    );
+}
+
 fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
     visitor.visit_stmt(stmt);
     traverse_hir_stmt_children!(

@@ -132,7 +132,7 @@ fn try_collapse_pure_binding_handoffs(
     }
     // 候选拒绝[SemanticBarrier:ControlFlow]：prior goto 可从 seed 之前直达 suffix 内任一
     // label；删除 seed 后该入口会使用未初始化的重写 binding。
-    if label_jumps.suffix_has_prior_goto(&block.stmts, index) {
+    if label_jumps.suffix_has_prior_goto(index) {
         return false;
     }
 
@@ -303,7 +303,7 @@ fn try_collapse_single_binding_handoff(
         // 候选拒绝[SemanticBarrier:Lifetime]：异槽或资源 identity 的 temp/binding 同值仍是两个可被 GC/close 观察的 root。
         return false;
     }
-    if label_jumps.suffix_has_prior_goto(&block.stmts, index) {
+    if label_jumps.suffix_has_prior_goto(index) {
         // 候选拒绝[SemanticBarrier:ControlFlow]：外部 goto 可绕过 seed 后进入 suffix，改名会把未定义 temp 路径变成已有 binding。
         return false;
     }
@@ -362,7 +362,7 @@ fn try_collapse_binding_update_handoff(
     {
         return false;
     }
-    if label_jumps.suffix_has_prior_goto(&block.stmts, index) {
+    if label_jumps.suffix_has_prior_goto(index) {
         // 候选拒绝[SemanticBarrier:ControlFlow]：prior goto 绕过 update seed 后进入 suffix，不能把未定义 temp 替换成 carried。
         return false;
     }

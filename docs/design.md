@@ -18,8 +18,13 @@ bytes ──→ Parser ──→ Transformer ──→ Structure ──→ HIR �
 | `src/decompile/options.rs` | 顶层选项 `DecompileOptions` 与 `DebugOptions`，统一默认值补齐 |
 | `src/debug.rs` | 跨层 debug 公共类型、聚焦工具与 `define_stage_dump!` 宏 |
 | `src/scheduler.rs` | HIR Simplify 与 AST Readability 共用的 invalidation-driven 调度器 |
-| `src/graph.rs` | Structure/HIR 共用的非递归 DFS 与 SCC 算法，图身份和快照仍由各层持有 |
+| `src/graph.rs` / `src/graph/` | 各层共用的 DFS、SCC、支配算法与词法 label 引用索引，身份和快照仍由各层持有 |
 | `src/recovery.rs` | Structure/HIR proto 级失败事实与最后完成产物合同 |
+
+`graph::LabelReferenceIndex` 消费各层提供的顶层语句 label/goto 集合，保留来源位置的首尾，
+按目标位置建立区间索引，以对数时间判断目标区间是否有来自允许范围之外的引用。
+这是词法引用事实，不按运行可达性裁剪；目标是否包含嵌套 label、允许哪些来源由消费者明确。
+语句位置或跳转改变后必须重建快照，不能跨层沿用旧位置或用它替代执行 CFG。
 
 ## 分层文档
 

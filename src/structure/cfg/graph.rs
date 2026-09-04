@@ -448,184 +448,23 @@ fn compute_tree(
     traversal: &DfsTraversal<BlockRef>,
     direction: FlowDirection,
 ) -> Result<DominatorTree, StructureError> {
-    let block_count = cfg.blocks.len();
-    let Some(root) = traversal.preorder.first().copied() else {
-        return empty_dominator_tree(block_count);
-    };
-
-    let mut semi = vec![usize::MAX; block_count];
-    let mut label = (0..block_count).map(BlockRef).collect::<Vec<_>>();
-    for (number, block) in traversal.preorder.iter().copied().enumerate() {
-        semi[block.index()] = number;
-    }
-
-    let mut ancestor = vec![None; block_count];
-    let mut idom = vec![None; block_count];
-    idom[root.index()] = Some(root);
-    let mut buckets = vec![Vec::new(); block_count];
-    let mut eval_path = Vec::with_capacity(block_count);
-
-    for block in traversal.preorder.iter().copied().skip(1).rev() {
-        for edge_ref in direction.incoming_edges(cfg, block) {
-            let predecessor = direction.incoming_source(cfg, *edge_ref);
-            if semi[predecessor.index()] == usize::MAX {
-                continue;
-            }
-
-            let representative = eval(
-                predecessor,
-                &mut ancestor,
-                &mut label,
-                &semi,
-                &mut eval_path,
-            )?;
-            semi[block.index()] = semi[block.index()].min(semi[representative.index()]);
-        }
-
-        let semi_dominator = traversal.preorder[semi[block.index()]];
-        buckets[semi_dominator.index()].push(block);
-
-        let Some(parent) = traversal.parent[block.index()] else {
-            return Err(StructureError::invalid(format!(
-                "non-root DFS block {block} has no traversal parent"
-            )));
-        };
-        ancestor[block.index()] = Some(parent);
-
-        while let Some(bucket_block) = buckets[parent.index()].pop() {
-            let representative = eval(
-                bucket_block,
-                &mut ancestor,
-                &mut label,
-                &semi,
-                &mut eval_path,
-            )?;
-            idom[bucket_block.index()] = Some(
-                if semi[representative.index()] < semi[bucket_block.index()] {
-                    representative
-                } else {
-                    parent
-                },
-            );
-        }
-    }
-
-    for block in traversal.preorder.iter().copied().skip(1) {
-        let semi_dominator = traversal.preorder[semi[block.index()]];
-        if idom[block.index()] != Some(semi_dominator) {
-            let Some(provisional) = idom[block.index()] else {
-                return Err(StructureError::invalid(format!(
-                    "reachable non-root block {block} has no provisional dominator"
-                )));
-            };
-            let Some(final_parent) = idom[provisional.index()] else {
-                return Err(StructureError::invalid(format!(
-                    "provisional dominator {provisional} for {block} is unresolved"
-                )));
-            };
-            idom[block.index()] = Some(final_parent);
-        }
-    }
-
-    let mut parent = vec![None; cfg.blocks.len()];
-    let mut children = vec![Vec::new(); cfg.blocks.len()];
-
-    for (index, maybe_idom) in idom.into_iter().enumerate() {
-        let block = BlockRef(index);
-        let Some(idom_block) = maybe_idom else {
-            continue;
-        };
-        if block == root {
-            continue;
-        }
-
-        parent[index] = Some(idom_block);
-        children[idom_block.index()].push(block);
-    }
-
-    let order = collect_tree_order(root, &children);
-    let (preorder_index, subtree_end) = tree_intervals(&parent, &order);
-    let (depth, ancestors) = tree_lca_index(&parent, &order)?;
-
+    let tree = graph::dominator_tree(traversal, BlockRef::index, BlockRef, |block| {
+        direction
+            .incoming_edges(cfg, block)
+            .iter()
+            .map(move |&edge| direction.incoming_source(cfg, edge))
+    })
+    .map_err(StructureError::invalid)?;
+    let (depth, ancestors) = tree_lca_index(&tree.parent, &tree.order)?;
     Ok(DominatorTree {
-        parent,
-        children,
-        order,
-        preorder_index,
-        subtree_end,
+        parent: tree.parent,
+        children: tree.children,
+        order: tree.order,
+        preorder_index: tree.preorder_index,
+        subtree_end: tree.subtree_end,
         depth,
         ancestors,
     })
-}
-
-fn empty_dominator_tree(block_count: usize) -> Result<DominatorTree, StructureError> {
-    let parent = vec![None; block_count];
-    let order = Vec::new();
-    let (preorder_index, subtree_end) = tree_intervals(&parent, &order);
-    let (depth, ancestors) = tree_lca_index(&parent, &order)?;
-    Ok(DominatorTree {
-        parent,
-        children: vec![Vec::new(); block_count],
-        order,
-        preorder_index,
-        subtree_end,
-        depth,
-        ancestors,
-    })
-}
-
-fn eval(
-    block: BlockRef,
-    ancestor: &mut [Option<BlockRef>],
-    label: &mut [BlockRef],
-    semi: &[usize],
-    path: &mut Vec<BlockRef>,
-) -> Result<BlockRef, StructureError> {
-    // 经典算法用递归 compress 更新祖先链。显式记录路径再逆序更新，既保持
-    // “先压缩父节点、再比较父 label”的顺序，也不把 CFG 深度转成线程栈深度。
-    path.clear();
-    let mut current = block;
-    while let Some(parent) = ancestor[current.index()] {
-        if ancestor[parent.index()].is_none() {
-            break;
-        }
-        path.push(current);
-        current = parent;
-    }
-
-    for current in path.iter().copied().rev() {
-        let Some(parent) = ancestor[current.index()] else {
-            return Err(StructureError::invalid(format!(
-                "compressed dominator path for {current} lost its parent"
-            )));
-        };
-        let parent_label = label[parent.index()];
-        if semi[parent_label.index()] < semi[label[current.index()].index()] {
-            label[current.index()] = parent_label;
-        }
-        ancestor[current.index()] = ancestor[parent.index()];
-    }
-
-    Ok(label[block.index()])
-}
-
-fn tree_intervals(
-    parent: &[Option<BlockRef>],
-    order: &[BlockRef],
-) -> (Vec<Option<usize>>, Vec<Option<usize>>) {
-    let mut preorder_index = vec![None; parent.len()];
-    let mut subtree_end = vec![None; parent.len()];
-    for (index, block) in order.iter().copied().enumerate() {
-        preorder_index[block.index()] = Some(index);
-        subtree_end[block.index()] = Some(index + 1);
-    }
-    for block in order.iter().copied().rev() {
-        let Some(parent) = parent[block.index()] else {
-            continue;
-        };
-        subtree_end[parent.index()] = subtree_end[parent.index()].max(subtree_end[block.index()]);
-    }
-    (preorder_index, subtree_end)
 }
 
 type TreeLcaIndex = (Vec<Option<usize>>, Vec<Vec<Option<BlockRef>>>);
@@ -661,17 +500,6 @@ fn tree_lca_index(
         );
     }
     Ok((depth, ancestors))
-}
-
-fn collect_tree_order(root: BlockRef, children: &[Vec<BlockRef>]) -> Vec<BlockRef> {
-    let mut order = Vec::with_capacity(children.len());
-    let mut stack = Vec::with_capacity(children.len());
-    stack.push(root);
-    while let Some(block) = stack.pop() {
-        order.push(block);
-        stack.extend(children[block.index()].iter().rev().copied());
-    }
-    order
 }
 
 fn compute_dfs_traversal(

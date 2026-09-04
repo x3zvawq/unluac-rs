@@ -5,7 +5,7 @@ local function run(obj)
     local receiver = obj
     receiver.m(receiver)
 
-    local function later()
+    local function later(flag, side, other, use)
         local receiver
         if flag then
             receiver = side()
@@ -19,4 +19,20 @@ local function run(obj)
     return later
 end
 
-return run
+local calls = 0
+local receiver = {
+    m = function(self)
+        calls = calls + 1
+        assert(self.tag == "receiver")
+    end,
+    tag = "receiver",
+}
+local later = run(receiver)
+local left, right = {}, {}
+local seen = {}
+local function record(value)
+    seen[#seen + 1] = value
+end
+assert(later(true, function() return left end, function() return right end, record) == left)
+assert(later(false, function() return left end, function() return right end, record) == right)
+assert(calls == 1 and seen[1] == left and seen[2] == right)

@@ -10,7 +10,7 @@
 //! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
 
 use super::*;
-use crate::hir::decision::assert_valid_decision;
+use crate::hir::decision::analyze_decision;
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
 pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<InlineSite> {
@@ -408,7 +408,7 @@ impl EvalOrderProbe<'_> {
                 })
             }
             HirExpr::Decision(decision) => {
-                assert_valid_decision(decision);
+                analyze_decision(decision);
                 let entry = &decision.nodes[decision.entry.index()];
                 expr_touches_temp(&entry.test, self.temp) && self.expr(&entry.test)
             }
@@ -650,7 +650,7 @@ fn find_site_in_decision(
     temp: TempId,
     outer_site: InlineSite,
 ) -> Option<InlineSite> {
-    assert_valid_decision(decision);
+    analyze_decision(decision);
     let entry_index = decision.entry.index();
     let entry = &decision.nodes[entry_index];
     let entry_site = match outer_site {

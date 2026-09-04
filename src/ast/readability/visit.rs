@@ -5,8 +5,18 @@
 //! `block/stmt/lvalue/call/expr` 递归骨架；这里把只读遍历收成共享设施，让分析代码
 //! 更专注在“看到某个节点时记录什么”，而不是重复维护递归。需要保持词法边界的分析
 //! 可以在 `visit_block` 返回 false，裁掉由 scoped walker 另行处理的子 block。
+//! 名字事件保留读、写、局部声明与 capture 的角色，consumer 不再各自解释函数 target。
+//! 例如 `function t.m() end` 读取 t，而 `function t() end` 写入 t；把赋值改成声明语法
+//! 不得丢掉前者的基址读取。函数边界的 capture 事件来自显式元数据，不遍历 child 重建。
+//! 名字回调可返回 Break 结束本次入口遍历；停止信号穿过子节点循环立即返回，已进入
+//! statement/function 的 leave hook 仍成对执行，未进入的 child 不产生回调。
 
-use crate::ast::common::{AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstStmt};
+use std::ops::ControlFlow;
+
+use crate::ast::common::{
+    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstNameRef,
+    AstStmt,
+};
 
 use super::traverse::BlockKind;
 use crate::ast::traverse::{
@@ -14,7 +24,20 @@ use crate::ast::traverse::{
     traverse_stmt_children,
 };
 
+#[derive(Clone, Copy)]
+pub(super) enum NameAccess {
+    Read,
+    Write,
+    LocalDeclaration,
+    LocalFunctionDeclaration,
+    Capture,
+}
+
 pub(super) trait AstVisitor {
+    fn visit_name(&mut self, _name: &AstNameRef, _access: NameAccess) -> ControlFlow<()> {
+        ControlFlow::Continue(())
+    }
+
     fn visit_block(&mut self, _block: &AstBlock, _kind: BlockKind) -> bool {
         true
     }
@@ -39,88 +62,137 @@ pub(super) trait AstVisitor {
 }
 
 pub(super) fn visit_block(block: &AstBlock, visitor: &mut impl AstVisitor) {
-    visit_block_with_kind(block, BlockKind::Regular, visitor);
+    let _ = visit_block_with_kind(block, BlockKind::Regular, visitor);
 }
 
 pub(super) fn visit_stmt(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
-    visit_stmt_impl(stmt, visitor);
-}
-
-fn visit_block_with_kind(block: &AstBlock, kind: BlockKind, visitor: &mut impl AstVisitor) {
-    if !visitor.visit_block(block, kind) {
-        return;
-    }
-    for stmt in &block.stmts {
-        visit_stmt_impl(stmt, visitor);
-    }
-}
-
-fn visit_stmt_impl(stmt: &AstStmt, visitor: &mut impl AstVisitor) {
-    visitor.visit_stmt(stmt);
-    traverse_stmt_children!(
-        stmt,
-        iter = iter,
-        opt = as_ref,
-        borrow = [&],
-        expr(expr) => {
-            visit_expr(expr, visitor);
-        },
-        lvalue(lvalue) => {
-            visit_lvalue(lvalue, visitor);
-        },
-        block(block) => {
-            visit_block_with_kind(block, BlockKind::Regular, visitor);
-        },
-        function(function) => {
-            visit_function_expr(function, BlockKind::FunctionBody, visitor);
-        },
-        condition(condition) => {
-            visit_condition_expr(condition, visitor);
-        },
-        call(call) => {
-            visit_call(call, visitor);
-        }
-    );
-    visitor.leave_stmt(stmt);
-}
-
-fn visit_call(call: &AstCallKind, visitor: &mut impl AstVisitor) {
-    visitor.visit_call(call);
-    traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
-        visit_expr(expr, visitor);
-    });
-}
-
-fn visit_lvalue(lvalue: &AstLValue, visitor: &mut impl AstVisitor) {
-    visitor.visit_lvalue(lvalue);
-    traverse_lvalue_children!(lvalue, borrow = [&], expr(expr) => {
-        visit_expr(expr, visitor);
-    });
+    let _ = visit_stmt_impl(stmt, visitor);
 }
 
 pub(super) fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
+    let _ = visit_expr_impl(expr, visitor);
+}
+
+fn visit_block_with_kind(
+    block: &AstBlock,
+    kind: BlockKind,
+    visitor: &mut impl AstVisitor,
+) -> ControlFlow<()> {
+    if visitor.visit_block(block, kind) {
+        for stmt in &block.stmts {
+            visit_stmt_impl(stmt, visitor)?;
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+fn visit_stmt_impl(stmt: &AstStmt, visitor: &mut impl AstVisitor) -> ControlFlow<()> {
+    visitor.visit_stmt(stmt);
+    // 短路只跳过后续节点，已进入 statement 的 leave hook 仍须执行。
+    let result = (|| {
+        match stmt {
+            AstStmt::LocalDecl(decl) => {
+                for binding in &decl.bindings {
+                    visitor.visit_name(&binding.id.to_name_ref(), NameAccess::LocalDeclaration)?;
+                }
+            }
+            AstStmt::NumericFor(stmt) => {
+                visitor.visit_name(&stmt.binding.to_name_ref(), NameAccess::LocalDeclaration)?;
+            }
+            AstStmt::GenericFor(stmt) => {
+                for binding in &stmt.bindings {
+                    visitor.visit_name(&binding.to_name_ref(), NameAccess::LocalDeclaration)?;
+                }
+            }
+            AstStmt::FunctionDecl(decl) => {
+                let (path, access) = match &decl.target {
+                    AstFunctionName::Plain(path) if path.fields.is_empty() => {
+                        (path, NameAccess::Write)
+                    }
+                    AstFunctionName::Plain(path) | AstFunctionName::Method(path, _) => {
+                        (path, NameAccess::Read)
+                    }
+                };
+                visitor.visit_name(&path.root, access)?;
+            }
+            AstStmt::LocalFunctionDecl(decl) => {
+                visitor.visit_name(
+                    &decl.name.to_name_ref(),
+                    NameAccess::LocalFunctionDeclaration,
+                )?;
+            }
+            _ => {}
+        }
+        traverse_stmt_children!(
+            stmt,
+            iter = iter,
+            opt = as_ref,
+            borrow = [&],
+            expr(expr) => { visit_expr_impl(expr, visitor)?; },
+            lvalue(lvalue) => { visit_lvalue(lvalue, visitor)?; },
+            block(block) => { visit_block_with_kind(block, BlockKind::Regular, visitor)?; },
+            function(function) => { visit_function_expr(function, BlockKind::FunctionBody, visitor)?; },
+            condition(condition) => { visit_condition_expr(condition, visitor)?; },
+            call(call) => { visit_call(call, visitor)?; }
+        );
+        ControlFlow::Continue(())
+    })();
+    visitor.leave_stmt(stmt);
+    result
+}
+
+fn visit_call(call: &AstCallKind, visitor: &mut impl AstVisitor) -> ControlFlow<()> {
+    visitor.visit_call(call);
+    traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
+        visit_expr_impl(expr, visitor)?;
+    });
+    ControlFlow::Continue(())
+}
+
+fn visit_lvalue(lvalue: &AstLValue, visitor: &mut impl AstVisitor) -> ControlFlow<()> {
+    visitor.visit_lvalue(lvalue);
+    if let AstLValue::Name(name) = lvalue {
+        visitor.visit_name(name, NameAccess::Write)?;
+    }
+    traverse_lvalue_children!(lvalue, borrow = [&], expr(expr) => {
+        visit_expr_impl(expr, visitor)?;
+    });
+    ControlFlow::Continue(())
+}
+
+fn visit_expr_impl(expr: &AstExpr, visitor: &mut impl AstVisitor) -> ControlFlow<()> {
     visitor.visit_expr(expr);
+    if let AstExpr::Var(name) = expr {
+        visitor.visit_name(name, NameAccess::Read)?;
+    }
     traverse_expr_children!(
         expr,
         iter = iter,
         borrow = [&],
-        expr(expr) => {
-            visit_expr(expr, visitor);
-        },
-        function(function) => {
-            visit_function_expr(function, BlockKind::FunctionBody, visitor);
-        }
+        expr(expr) => { visit_expr_impl(expr, visitor)?; },
+        function(function) => { visit_function_expr(function, BlockKind::FunctionBody, visitor)?; }
     );
+    ControlFlow::Continue(())
 }
 
-fn visit_condition_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
+fn visit_condition_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) -> ControlFlow<()> {
     visitor.visit_condition_expr(expr);
-    visit_expr(expr, visitor);
+    visit_expr_impl(expr, visitor)
 }
 
-fn visit_function_expr(function: &AstFunctionExpr, kind: BlockKind, visitor: &mut impl AstVisitor) {
-    if visitor.visit_function_expr(function) {
-        visit_block_with_kind(&function.body, kind, visitor);
+fn visit_function_expr(
+    function: &AstFunctionExpr,
+    kind: BlockKind,
+    visitor: &mut impl AstVisitor,
+) -> ControlFlow<()> {
+    for binding in &function.captured_bindings {
+        visitor.visit_name(&binding.to_name_ref(), NameAccess::Capture)?;
     }
+    let result = if visitor.visit_function_expr(function) {
+        visit_block_with_kind(&function.body, kind, visitor)
+    } else {
+        ControlFlow::Continue(())
+    };
     visitor.leave_function_expr(function);
+    result
 }

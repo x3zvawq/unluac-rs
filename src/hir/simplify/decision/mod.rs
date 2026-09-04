@@ -7,7 +7,7 @@
 //! 2. `then/else` 指向同一结果时的节点消除；
 //! 3. 根节点和内部节点裁剪后留下的不可达节点清理。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 
 mod eliminate;
 mod eliminate_materialize;
@@ -20,7 +20,7 @@ use super::walk::{ExprRewritePass, rewrite_proto_exprs};
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirProto,
 };
-use crate::hir::decision::{assert_valid_decision, decision_has_shared_nodes};
+use crate::hir::decision::{DecisionFacts, analyze_decision};
 use crate::hir::expr_safety::HirExprSafety;
 use helpers::{logical_and, logical_or};
 
@@ -65,7 +65,8 @@ impl ExprRewritePass for DecisionExprPass {
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut changed = false;
         if let HirExpr::Decision(decision) = expr
-            && let Some(replacement) = collapse_condition_decision_expr(decision, self.safety)
+            && let Some(replacement) =
+                collapse_condition_decision_expr(&analyze_decision(decision), self.safety)
         {
             *expr = replacement;
             changed = true;
@@ -106,46 +107,36 @@ fn reduce_decision_expr(
     decision: &HirDecisionExpr,
     safety: HirExprSafety,
 ) -> Option<ReducedDecision> {
-    assert_valid_decision(decision);
+    let topology = analyze_decision(decision);
 
     let mut nodes = decision.nodes.clone();
     let mut replacements = vec![None; nodes.len()];
     let mut changed = false;
 
-    for index in (0..nodes.len()).rev() {
-        let node_ref = HirDecisionNodeRef(index);
-        let mut node = nodes[index].clone();
-        let mut node_changed = false;
+    // arena 重编号只保留稠密身份，不保证拓扑顺序；共享 tail 必须先于所有父节点归约。
+    for original in topology.topological_nodes().rev() {
+        let node_ref = original.id;
+        let index = node_ref.index();
+        let node = &nodes[index];
 
-        // 候选拒绝[SemanticBarrier:EvalCount]：父子同为 `f()` 时跳过子 test 会把两次调用缩成一次。
-        if let HirDecisionTarget::Node(child_ref) = &node.truthy
-            && nodes
-                .get(child_ref.index())
-                .is_some_and(|child| child.test == node.test)
-            && safety.is_repeatable(&node.test)
-        {
-            node.truthy = resolve_child_branch(&nodes, &replacements, *child_ref, true);
-            node_changed = true;
-        } else {
-            let (truthy, resolved) = resolve_target_for_parent(&replacements, &node.truthy);
-            node.truthy = truthy;
-            node_changed |= resolved;
-        }
-
-        // 候选拒绝[SemanticBarrier:EvalCount]：父子同为 `f()` 时跳过子 test 会把两次调用缩成一次。
-        if let HirDecisionTarget::Node(child_ref) = &node.falsy
-            && nodes
-                .get(child_ref.index())
-                .is_some_and(|child| child.test == node.test)
-            && safety.is_repeatable(&node.test)
-        {
-            node.falsy = resolve_child_branch(&nodes, &replacements, *child_ref, false);
-            node_changed = true;
-        } else {
-            let (falsy, resolved) = resolve_target_for_parent(&replacements, &node.falsy);
-            node.falsy = falsy;
-            node_changed |= resolved;
-        }
+        let truthy = reduce_target(
+            &nodes,
+            &replacements,
+            &node.test,
+            &node.truthy,
+            true,
+            safety,
+        );
+        let falsy = reduce_target(
+            &nodes,
+            &replacements,
+            &node.test,
+            &node.falsy,
+            false,
+            safety,
+        );
+        let resolved_truthy = truthy.as_ref().unwrap_or(&node.truthy);
+        let resolved_falsy = falsy.as_ref().unwrap_or(&node.falsy);
 
         // 候选拒绝[SemanticBarrier:EvalCount]：即使 truthiness 已知，删除 `{ f() }` test 也会漏掉字段表达式中的一次 `f()`。
         if let Some(constant_truthy) = expr_truthiness(&node.test, safety)
@@ -153,11 +144,11 @@ fn reduce_decision_expr(
         {
             replacements[node_ref.index()] = Some(resolve_target_in_node_context(
                 &replacements,
-                &node,
+                &node.test,
                 if constant_truthy {
-                    &node.truthy
+                    resolved_truthy
                 } else {
-                    &node.falsy
+                    resolved_falsy
                 },
             ));
             changed = true;
@@ -165,21 +156,26 @@ fn reduce_decision_expr(
         }
 
         // 候选拒绝[SemanticBarrier:EvalCount]：两臂相同也不能删除 `f()` test，否则原来必达的一次调用消失。
-        if node.truthy == node.falsy && safety.is_discard_safe(&node.test) {
+        if resolved_truthy == resolved_falsy && safety.is_discard_safe(&node.test) {
             replacements[node_ref.index()] = Some(resolve_target_in_node_context(
                 &replacements,
-                &node,
-                &node.truthy,
+                &node.test,
+                resolved_truthy,
             ));
             changed = true;
             continue;
         }
 
-        changed |= node_changed;
-        nodes[index] = node;
+        changed |= truthy.is_some() || falsy.is_some();
+        if let Some(truthy) = truthy {
+            nodes[index].truthy = truthy;
+        }
+        if let Some(falsy) = falsy {
+            nodes[index].falsy = falsy;
+        }
     }
 
-    let root = if let Some(Some(replacement)) = replacements.get(decision.entry.index()) {
+    let root = if let Some(replacement) = &replacements[decision.entry.index()] {
         replacement.clone()
     } else {
         ResolvedDecisionTarget::Node(decision.entry)
@@ -190,7 +186,7 @@ fn reduce_decision_expr(
         ResolvedDecisionTarget::Node(entry) => {
             let (rebuilt, topology_changed) = rebuild_decision(entry, &nodes);
             changed |= topology_changed;
-            if let Some(expr) = collapse_value_decision_expr(&rebuilt, safety) {
+            if let Some(expr) = collapse_value_decision_expr(&analyze_decision(&rebuilt), safety) {
                 return Some(ReducedDecision::Expr(expr));
             }
             if changed {
@@ -202,49 +198,45 @@ fn reduce_decision_expr(
     }
 }
 
-fn resolve_target_for_parent(
+fn reduce_target(
+    nodes: &[HirDecisionNode],
     replacements: &[Option<ResolvedDecisionTarget>],
+    test: &HirExpr,
     target: &HirDecisionTarget,
-) -> (HirDecisionTarget, bool) {
-    match target {
-        HirDecisionTarget::Node(node_ref) => {
-            if let Some(Some(replacement)) = replacements.get(node_ref.index()) {
-                (replacement_as_target(replacement), true)
-            } else {
-                (HirDecisionTarget::Node(*node_ref), false)
-            }
-        }
-        HirDecisionTarget::CurrentValue => (HirDecisionTarget::CurrentValue, false),
-        HirDecisionTarget::Expr(expr) => (HirDecisionTarget::Expr(expr.clone()), false),
+    truthy: bool,
+    safety: HirExprSafety,
+) -> Option<HirDecisionTarget> {
+    let HirDecisionTarget::Node(child_ref) = target else {
+        return None;
+    };
+    let child = &nodes[child_ref.index()];
+    // 候选拒绝[SemanticBarrier:EvalCount]：父子同为 f() 时跳过子 test 会把两次调用缩成一次。
+    if child.test == *test && safety.is_repeatable(test) {
+        let branch = if truthy { &child.truthy } else { &child.falsy };
+        Some(replacement_as_target(&resolve_target_in_node_context(
+            replacements,
+            &child.test,
+            branch,
+        )))
+    } else {
+        replacements[child_ref.index()]
+            .as_ref()
+            .map(replacement_as_target)
     }
 }
 
 fn resolve_target_in_node_context(
     replacements: &[Option<ResolvedDecisionTarget>],
-    node: &HirDecisionNode,
+    test: &HirExpr,
     target: &HirDecisionTarget,
 ) -> ResolvedDecisionTarget {
     match target {
-        HirDecisionTarget::Node(node_ref) => replacements
-            .get(node_ref.index())
-            .and_then(|r| r.clone())
+        HirDecisionTarget::Node(node_ref) => replacements[node_ref.index()]
+            .clone()
             .unwrap_or(ResolvedDecisionTarget::Node(*node_ref)),
-        HirDecisionTarget::CurrentValue => ResolvedDecisionTarget::Expr(node.test.clone()),
+        HirDecisionTarget::CurrentValue => ResolvedDecisionTarget::Expr(test.clone()),
         HirDecisionTarget::Expr(expr) => ResolvedDecisionTarget::Expr(expr.clone()),
     }
-}
-
-fn resolve_child_branch(
-    nodes: &[HirDecisionNode],
-    replacements: &[Option<ResolvedDecisionTarget>],
-    child_ref: HirDecisionNodeRef,
-    truthy: bool,
-) -> HirDecisionTarget {
-    let Some(child) = nodes.get(child_ref.index()) else {
-        return HirDecisionTarget::Node(child_ref);
-    };
-    let branch = if truthy { &child.truthy } else { &child.falsy };
-    replacement_as_target(&resolve_target_in_node_context(replacements, child, branch))
 }
 
 pub(super) fn replacement_as_target(target: &ResolvedDecisionTarget) -> HirDecisionTarget {
@@ -254,25 +246,25 @@ pub(super) fn replacement_as_target(target: &ResolvedDecisionTarget) -> HirDecis
     }
 }
 
+/// 输入已验证稠密身份；归约只重定向到原图后继，投影不引入域外节点。
+/// 首次入队时签发新身份，同时去重并保留 BFS 顺序，不重新按旧 id 搜索或跳过非法边。
 fn rebuild_decision(
     entry: HirDecisionNodeRef,
     nodes: &[HirDecisionNode],
 ) -> (HirDecisionExpr, bool) {
-    let mut reachable = Vec::new();
-    let mut visited = BTreeSet::new();
-    let mut worklist = VecDeque::from([entry]);
-
-    while let Some(node_ref) = worklist.pop_front() {
-        if !visited.insert(node_ref) {
-            continue;
-        }
-        let Some(node) = nodes.get(node_ref.index()) else {
-            continue;
-        };
-        reachable.push(node_ref);
+    let mut remap = vec![None; nodes.len()];
+    let mut reachable = vec![entry];
+    remap[entry.index()] = Some(HirDecisionNodeRef(0));
+    let mut cursor = 0;
+    while cursor < reachable.len() {
+        let node = &nodes[reachable[cursor].index()];
+        cursor += 1;
         for target in [&node.truthy, &node.falsy] {
-            if let HirDecisionTarget::Node(next_ref) = target {
-                worklist.push_back(*next_ref);
+            if let HirDecisionTarget::Node(next_ref) = target
+                && remap[next_ref.index()].is_none()
+            {
+                remap[next_ref.index()] = Some(HirDecisionNodeRef(reachable.len()));
+                reachable.push(*next_ref);
             }
         }
     }
@@ -282,28 +274,23 @@ fn rebuild_decision(
             .iter()
             .enumerate()
             .any(|(index, old_ref)| old_ref.index() != index);
-    let remap = reachable
-        .iter()
-        .enumerate()
-        .map(|(index, node_ref)| (*node_ref, HirDecisionNodeRef(index)))
-        .collect::<BTreeMap<_, _>>();
-
     let rebuilt_nodes = reachable
         .into_iter()
-        .filter_map(|old_ref| {
-            let old = nodes.get(old_ref.index())?;
-            Some(HirDecisionNode {
-                id: remap[&old_ref],
+        .enumerate()
+        .map(|(index, old_ref)| {
+            let old = &nodes[old_ref.index()];
+            HirDecisionNode {
+                id: HirDecisionNodeRef(index),
                 test: old.test.clone(),
                 truthy: remap_target(&old.truthy, &remap),
                 falsy: remap_target(&old.falsy, &remap),
-            })
+            }
         })
         .collect::<Vec<_>>();
 
     (
         HirDecisionExpr {
-            entry: remap[&entry],
+            entry: HirDecisionNodeRef(0),
             nodes: rebuilt_nodes,
         },
         topology_changed,
@@ -315,19 +302,18 @@ fn rebuild_decision(
 /// `CurrentValue` 属于 edge 的父节点，调用方必须传入该已选路径上的精确值；Node edge
 /// 则只保留其可达子图并重编号，避免构造带不可达 root 的非法 Decision。
 pub(super) fn project_value_decision_target(
-    decision: &HirDecisionExpr,
+    topology: &DecisionFacts<'_>,
     target: &HirDecisionTarget,
     current_value: HirExpr,
     safety: HirExprSafety,
 ) -> HirExpr {
-    assert_valid_decision(decision);
+    let decision = topology.decision();
     match target {
         HirDecisionTarget::Expr(expr) => expr.clone(),
         HirDecisionTarget::CurrentValue => current_value,
         HirDecisionTarget::Node(entry) => {
             let (projected, _) = rebuild_decision(*entry, &decision.nodes);
-            assert_valid_decision(&projected);
-            collapse_value_decision_expr(&projected, safety)
+            collapse_value_decision_expr(&analyze_decision(&projected), safety)
                 .unwrap_or_else(|| HirExpr::Decision(Box::new(projected)))
         }
     }
@@ -335,22 +321,25 @@ pub(super) fn project_value_decision_target(
 
 fn remap_target(
     target: &HirDecisionTarget,
-    remap: &BTreeMap<HirDecisionNodeRef, HirDecisionNodeRef>,
+    remap: &[Option<HirDecisionNodeRef>],
 ) -> HirDecisionTarget {
     match target {
-        HirDecisionTarget::Node(node_ref) => HirDecisionTarget::Node(remap[node_ref]),
+        HirDecisionTarget::Node(node_ref) => HirDecisionTarget::Node(
+            remap[node_ref.index()]
+                .expect("reachable Decision edge must have a projected identity"),
+        ),
         HirDecisionTarget::CurrentValue => HirDecisionTarget::CurrentValue,
         HirDecisionTarget::Expr(expr) => HirDecisionTarget::Expr(expr.clone()),
     }
 }
 
 pub(in crate::hir) fn collapse_value_decision_expr(
-    decision: &HirDecisionExpr,
+    topology: &DecisionFacts<'_>,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
-    assert_valid_decision(decision);
+    let decision = topology.decision();
 
-    if decision_has_shared_nodes(decision) {
+    if topology.has_shared_nodes() {
         synthesize::synthesize_value_decision_expr(decision, safety).or_else(|| {
             let mut memo = BTreeMap::new();
             collapse_value_node(decision, decision.entry, &mut memo, safety)
@@ -654,10 +643,10 @@ fn normalize_collapsed_target(
 }
 
 pub(in crate::hir) fn collapse_condition_decision_expr(
-    decision: &HirDecisionExpr,
+    topology: &DecisionFacts<'_>,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
-    assert_valid_decision(decision);
+    let decision = topology.decision();
 
     let mut memo = BTreeMap::new();
     collapse_condition_node(decision, decision.entry, &mut memo, safety)
@@ -870,7 +859,7 @@ mod tests {
         HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
     };
 
-    use super::assert_valid_decision;
+    use super::analyze_decision;
 
     #[test]
     #[should_panic(expected = "HIR Decision must be acyclic")]
@@ -885,6 +874,6 @@ mod tests {
             }],
         };
 
-        assert_valid_decision(&decision);
+        analyze_decision(&decision);
     }
 }

@@ -5,36 +5,41 @@
 //! 那条共享入口固定下来，避免两边因为局部实现分叉而把同一棵决策图恢复成两种风格。
 //! DAG identity、可达性和无环性属于 HIR 节点合同；值域与改写者共用此校验，不能让
 //! 共享语义查询依赖某个 simplify pass 才能解释 Node/CurrentValue 的输入合法性。
+//! 校验同时发布借用当前节点的拓扑顺序和共享性；例如两臂汇入同一个 tail，值分析按
+//! 逆拓扑先算 tail 再合流两臂，payload 按正序传播可达边，不重新排序或按 id 搜索节点。
 
 use crate::hir::common::{HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget, HirExpr};
 use crate::hir::expr_safety::HirExprSafety;
 
-pub(in crate::hir) fn decision_has_shared_nodes(decision: &HirDecisionExpr) -> bool {
-    assert_valid_decision(decision);
-
-    let mut incoming = vec![0usize; decision.nodes.len()];
-    incoming[decision.entry.index()] += 1;
-
-    for node in &decision.nodes {
-        for target in [&node.truthy, &node.falsy] {
-            if let HirDecisionTarget::Node(node_ref) = target
-                && let Some(count) = incoming.get_mut(node_ref.index())
-            {
-                *count += 1;
-            }
-        }
-    }
-
-    incoming.into_iter().any(|count| count > 1)
+/// 当前不可变 Decision 快照的拓扑事实；借用期间不能改写节点或沿用旧身份。
+pub(in crate::hir) struct DecisionFacts<'a> {
+    decision: &'a HirDecisionExpr,
+    order: Vec<usize>,
+    has_shared_nodes: bool,
 }
 
-pub(in crate::hir) fn assert_valid_decision(decision: &HirDecisionExpr) {
+impl DecisionFacts<'_> {
+    pub(in crate::hir) fn decision(&self) -> &HirDecisionExpr {
+        self.decision
+    }
+
+    pub(in crate::hir) fn has_shared_nodes(&self) -> bool {
+        self.has_shared_nodes
+    }
+
+    pub(in crate::hir) fn topological_nodes(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &super::common::HirDecisionNode> {
+        self.order.iter().map(|&index| &self.decision.nodes[index])
+    }
+}
+
+pub(in crate::hir) fn analyze_decision(decision: &HirDecisionExpr) -> DecisionFacts<'_> {
     assert!(!decision.nodes.is_empty(), "HIR Decision must not be empty");
     assert!(
         decision.entry.index() < decision.nodes.len(),
         "HIR Decision entry must reference an existing node"
     );
-
     let mut incoming = vec![0usize; decision.nodes.len()];
     for (index, node) in decision.nodes.iter().enumerate() {
         assert_eq!(
@@ -51,59 +56,53 @@ pub(in crate::hir) fn assert_valid_decision(decision: &HirDecisionExpr) {
             }
         }
     }
-
-    let mut reachable = vec![false; decision.nodes.len()];
-    let mut pending = vec![decision.entry];
-    while let Some(node_ref) = pending.pop() {
-        if std::mem::replace(&mut reachable[node_ref.index()], true) {
-            continue;
-        }
-        let node = &decision.nodes[node_ref.index()];
-        for target in [&node.truthy, &node.falsy] {
-            if let HirDecisionTarget::Node(next_ref) = target {
-                pending.push(*next_ref);
-            }
-        }
-    }
-    assert!(
-        reachable.into_iter().all(|reachable| reachable),
-        "HIR Decision must not contain unreachable nodes"
-    );
-
+    let has_shared_nodes = incoming.iter().any(|&count| count > 1);
     let mut ready = incoming
         .iter()
         .enumerate()
-        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .filter_map(|(index, &count)| (count == 0).then_some(index))
         .collect::<Vec<_>>();
-    let mut visited = 0usize;
+    // 非空 DAG 的每个节点都可从某个零入度源到达；唯一源是 entry 时，全图入口可达。
+    // 与下面的无环证明组合即可，无需另起一次可达性遍历。
+    let unique_entry_source = ready.as_slice() == [decision.entry.index()];
+    let mut order = Vec::with_capacity(decision.nodes.len());
     while let Some(index) = ready.pop() {
-        visited += 1;
+        order.push(index);
         let node = &decision.nodes[index];
         for target in [&node.truthy, &node.falsy] {
-            let HirDecisionTarget::Node(next_ref) = target else {
-                continue;
-            };
-            incoming[next_ref.index()] -= 1;
-            if incoming[next_ref.index()] == 0 {
-                ready.push(next_ref.index());
+            if let HirDecisionTarget::Node(next_ref) = target {
+                incoming[next_ref.index()] -= 1;
+                if incoming[next_ref.index()] == 0 {
+                    ready.push(next_ref.index());
+                }
             }
         }
     }
     assert_eq!(
-        visited,
+        order.len(),
         decision.nodes.len(),
         "HIR Decision must be acyclic"
     );
+    assert!(
+        unique_entry_source,
+        "HIR Decision must not contain unreachable nodes"
+    );
+    DecisionFacts {
+        decision,
+        order,
+        has_shared_nodes,
+    }
 }
 
 pub(in crate::hir) fn finalize_condition_decision_expr(
     decision: HirDecisionExpr,
     safety: HirExprSafety,
 ) -> HirExpr {
-    if decision_has_shared_nodes(&decision) {
+    let topology = analyze_decision(&decision);
+    if topology.has_shared_nodes() {
         HirExpr::Decision(Box::new(decision))
     } else {
-        super::simplify::decision::collapse_condition_decision_expr(&decision, safety)
+        super::simplify::decision::collapse_condition_decision_expr(&topology, safety)
             .unwrap_or_else(|| HirExpr::Decision(Box::new(decision)))
     }
 }
@@ -112,6 +111,6 @@ pub(in crate::hir) fn finalize_value_decision_expr(
     decision: HirDecisionExpr,
     safety: HirExprSafety,
 ) -> HirExpr {
-    super::simplify::decision::collapse_value_decision_expr(&decision, safety)
+    super::simplify::decision::collapse_value_decision_expr(&analyze_decision(&decision), safety)
         .unwrap_or_else(|| HirExpr::Decision(Box::new(decision)))
 }
