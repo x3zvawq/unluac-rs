@@ -1,6 +1,109 @@
-//! loop payload 与 VM control edge 的最终冻结。输入 loop partition、edge plans 和 loop evidence，输出 LoopPlanData、传播 break 与 syntax edge roles；不负责发现循环候选。例如 numeric-for 的 body/exit/backedge 会被一次写入控制合同。
+//! loop payload 与 VM control edge 的最终冻结。输入 loop partition、edge plans、TBC flow 和 loop evidence，证明资源退出边界并输出 LoopPlanData、传播 break 与 syntax edge roles；不负责发现循环候选。例如 numeric-for 的 body/exit/backedge 会被一次写入控制合同；正常出口还需跨分叉保持本轮资源时，则不能签发 break owner。
 
 use super::*;
+
+/// 正常出口不能把资源边界后的事件吸入仍持有该资源的条件 arm。
+/// 例如 backward goto 的自然循环在 `assert(inner_closed and not outer_closed)`
+/// 前结束，但 outer 的真实 Close 在断言后；或 inner Close 与 outer Close 间还有
+/// observable。单 block exit-tail 只可消费终末清理，不能拥有这些交错的词法范围。
+pub(super) fn loop_exit_crosses_resource_boundary(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &crate::structure::LoopCandidate,
+    partition: &LoopPartitions,
+    scopes: &[crate::structure::ScopePlan],
+    flow: &crate::structure::scope::TbcFlowFacts,
+) -> Result<bool, StructureError> {
+    if partition.normal_tail.is_some() {
+        return Ok(false);
+    }
+    let Some(continuation) = partition.continuation else {
+        return Ok(false);
+    };
+    if partition.owned.contains(&continuation) {
+        return Ok(false);
+    }
+    let before = flow
+        .active_at_entry(continuation)
+        .ok_or_else(|| StructureError::invalid("loop normal exit has no TBC entry facts"))?;
+    let mut required = before
+        .iter()
+        .copied()
+        .filter(|origin| {
+            cfg.instr_to_block
+                .get(origin.index())
+                .is_some_and(|block| loop_body_owns_block(partition, *block))
+        })
+        .collect::<BTreeSet<_>>();
+    if required.is_empty() {
+        return Ok(false);
+    }
+    // Lua 5.4 的 goto pad 可只有 Jump，5.5 可把 Close 放在同一个 pad 内。
+    // 沿已有 cleanup connector 保留关闭状态，不能跳过 Close 后再重置生命周期。
+    let mut target = continuation;
+    let mut connectors = BTreeSet::new();
+    let mut closed_resource = false;
+    let crosses = 'tail: loop {
+        if partition.owned.contains(&target) || !connectors.insert(target) {
+            break false;
+        }
+        let after = flow
+            .active_after_block(target)
+            .ok_or_else(|| StructureError::invalid("loop normal exit has no TBC exit facts"))?;
+        if cfg.succs[target.index()].len() >= 2 && !required.is_disjoint(after) {
+            break true;
+        }
+        // ScopePlan 已按 block 发布全部 Close 位置；相邻位置间的空隙就是执行事件，
+        // 无须再扫描 opcode，也不按槽位重建每次 Close 的关闭集合。
+        let range = cfg.blocks[target.index()].instrs;
+        let mut event_start = range.start.index();
+        if let Ok(index) = scopes.binary_search_by_key(&target, |scope| scope.entry) {
+            for &close in &scopes[index].close_points {
+                if closed_resource && event_start < close.index() {
+                    break 'tail true;
+                }
+                if let Some(closed) = flow.close_origins(close) {
+                    closed_resource |= !required.is_disjoint(closed);
+                    required.retain(|origin| !closed.contains(origin));
+                }
+                if required.is_empty() {
+                    break 'tail false;
+                }
+                event_start = close.index() + 1;
+            }
+        }
+        let event_end = range.last().map_or(range.end(), |last| {
+            if proto.instrs[last.index()].is_control_terminator() {
+                last.index()
+            } else {
+                range.end()
+            }
+        });
+        if closed_resource && event_start < event_end {
+            break true;
+        }
+        let Some(next) = crate::structure::loops::transparent_loop_exit_target(proto, cfg, target)
+        else {
+            break false;
+        };
+        target = next;
+    };
+    if !crosses {
+        return Ok(false);
+    }
+    // 仅有交错资源边界时才冻结控制边；正常出口不依赖内部 terminal 细分。
+    let control = freeze_loop_control_edges(cfg, candidate, partition, None)?;
+    Ok(control
+        .exit
+        .into_iter()
+        .chain(control.preheader_exit)
+        .any(|edge| cfg.edges[edge.index()].to == continuation))
+}
+
+fn loop_body_owns_block(partition: &LoopPartitions, block: BlockRef) -> bool {
+    // for 的 preheader prefix 在循环前求值；其中的资源不属于本轮词法 body。
+    Some(block) != partition.preheader && partition.owned.contains(&block)
+}
 
 pub(super) struct LoopPayloadFreezeInput<'a> {
     pub(super) proto: &'a LoweredProto,
@@ -198,22 +301,22 @@ pub(super) fn detect_loop_exit_tail(
     let active = tbc_flow
         .active_at_entry(continuation)
         .ok_or_else(|| StructureError::invalid("loop exit tail block has no TBC entry facts"))?;
-    let mut required = BTreeMap::<usize, BTreeSet<InstrRef>>::new();
+    let mut required = BTreeSet::<InstrRef>::new();
     for origin in active {
         let Some(origin_block) = cfg.instr_to_block.get(origin.index()) else {
             return Err(StructureError::invalid(
                 "loop exit tail TBC origin has no CFG block",
             ));
         };
-        if !partition.owned.contains(origin_block) {
+        if !loop_body_owns_block(partition, *origin_block) {
             continue;
         }
-        let Some(LowInstr::Tbc(tbc)) = proto.instrs.get(origin.index()) else {
+        let Some(LowInstr::Tbc(_)) = proto.instrs.get(origin.index()) else {
             return Err(StructureError::invalid(
                 "loop exit tail active origin is not a TBC instruction",
             ));
         };
-        required.entry(tbc.reg.index()).or_default().insert(*origin);
+        required.insert(*origin);
     }
     if required.is_empty() {
         return Ok(None);
@@ -229,16 +332,18 @@ pub(super) fn detect_loop_exit_tail(
     for index in block_range.start.index()..block_range.end() {
         let instr_ref = InstrRef(index);
         match proto.instrs.get(index) {
-            Some(LowInstr::Tbc(tbc)) => {
-                cleanup.push(instr_ref);
-                required
-                    .entry(tbc.reg.index())
-                    .or_default()
-                    .insert(instr_ref);
+            Some(LowInstr::Tbc(_)) => {
+                // 注册仍是可抛错的执行事件，不属于 break 可吸收的清理后缀。
+                cleanup.clear();
+                has_observable_prefix = true;
+                required.insert(instr_ref);
             }
-            Some(LowInstr::Close(close)) => {
+            Some(LowInstr::Close(_)) => {
                 cleanup.push(instr_ref);
-                required.retain(|reg, _| *reg < close.from.index());
+                // 稀疏索引不记录仅关闭 open upvalue 的 Close；absence 即空 TBC kill。
+                if let Some(closed) = tbc_flow.close_origins(instr_ref) {
+                    required.retain(|origin| !closed.contains(origin));
+                }
                 if required.is_empty() {
                     tail_end = Some(index + 1);
                     break;
@@ -249,7 +354,12 @@ pub(super) fn detect_loop_exit_tail(
                 break;
             }
             Some(instr) if instr.is_control_terminator() => return Ok(None),
-            Some(_) => has_observable_prefix = true,
+            Some(_) => {
+                // 例如 Close(inner); observe(); Close(outer)：只消费末端 outer Close，
+                // inner Close 必须在 observe 前经原始位置或已冻结的入边事件执行。
+                cleanup.clear();
+                has_observable_prefix = true;
+            }
             None => {
                 return Err(StructureError::invalid(
                     "loop exit tail range exceeds the instruction arena",
@@ -261,9 +371,8 @@ pub(super) fn detect_loop_exit_tail(
         let Some(jump) = trailing_jump else {
             return Ok(None);
         };
-        if !cleanup.is_empty() {
-            return Ok(None);
-        }
+        // 先前的独立 Close 留在执行范围；唯一后继的连续 Close 才是终末后缀。
+        cleanup.clear();
         let [route_edge] = cfg.succs[continuation.index()].as_slice() else {
             return Ok(None);
         };
@@ -300,11 +409,13 @@ pub(super) fn detect_loop_exit_tail(
         let cleanup_range = cfg.blocks[cleanup_block.index()].instrs;
         for index in cleanup_range.start.index()..cleanup_range.end() {
             let instr_ref = InstrRef(index);
-            let Some(LowInstr::Close(close)) = proto.instrs.get(index) else {
+            let Some(LowInstr::Close(_)) = proto.instrs.get(index) else {
                 return Ok(None);
             };
             cleanup.push(instr_ref);
-            required.retain(|reg, _| *reg < close.from.index());
+            if let Some(closed) = tbc_flow.close_origins(instr_ref) {
+                required.retain(|origin| !closed.contains(origin));
+            }
             if required.is_empty() {
                 break;
             }

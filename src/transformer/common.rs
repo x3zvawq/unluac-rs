@@ -160,8 +160,49 @@ pub(crate) fn resolve_env_upvalues(
 pub struct LoweringMap {
     pub low_to_raw: Vec<Vec<RawInstrRef>>,
     pub raw_to_low: Vec<Vec<InstrRef>>,
-    pub pc_map: Vec<Vec<u32>>,
+    pc_map: Vec<Vec<u32>>,
+    pc_frontier: Vec<(u32, InstrRef)>,
     pub line_hints: Vec<Option<u32>>,
+}
+
+impl LoweringMap {
+    pub(super) fn new(
+        low_to_raw: Vec<Vec<RawInstrRef>>,
+        raw_to_low: Vec<Vec<InstrRef>>,
+        pc_map: Vec<Vec<u32>>,
+        line_hints: Vec<Option<u32>>,
+    ) -> Self {
+        // raw 来源可以多值、乱序或缺失；只有前缀最大 PC 首次提高的位置能成为查询答案。
+        // 例如 [2], [1,5], [], [3] 对 PC=4 的最早 low 仍是第二项，不能二分原 pc_map。
+        let mut pc_frontier = Vec::new();
+        for (index, pcs) in pc_map.iter().enumerate() {
+            if let Some(pc) = pcs.iter().copied().max()
+                && pc_frontier
+                    .last()
+                    .is_none_or(|&(previous, _)| previous < pc)
+            {
+                pc_frontier.push((pc, InstrRef(index)));
+            }
+        }
+        Self {
+            low_to_raw,
+            raw_to_low,
+            pc_map,
+            pc_frontier,
+            line_hints,
+        }
+    }
+
+    pub fn pc_map(&self) -> &[Vec<u32>] {
+        &self.pc_map
+    }
+
+    /// 返回原始来源中含有 PC >= boundary 的最早 low 指令；没有后继指令时返回 None。
+    /// 索引与映射由同一个 lowering 事务冻结，debug 消费者不重扫或假定 raw/low 单调对应。
+    pub fn low_instr_at_or_after_pc(&self, boundary: u32) -> Option<InstrRef> {
+        let position = self.pc_frontier.partition_point(|&(pc, _)| pc < boundary);
+        self.pc_frontier.get(position).map(|&(_, instr)| instr)
+    }
 }
 
 /// low-IR 指令的稳定索引。
@@ -800,8 +841,20 @@ fn instantiate_closure_child(
     instance
 }
 
+/// cleanup 的原始执行协议；不能根据零槽或与 Return 的邻接关系重新推断。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum CloseKind {
+    /// 独立 CLOSE / JMP-close 操作，后续求值必须发生在关闭之后。
+    Explicit,
+    /// 同一返回指令的 frame cleanup；返回结果已由 VM 返回协议承接。
+    Return(InstrRef),
+    /// 同一尾调用关闭旧 frame 的 upvalue；受支持 Lua 的此路径没有待关闭 TBC。
+    TailCall(InstrRef),
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct CloseInstr {
+    pub kind: CloseKind,
     pub from: Reg,
 }
 

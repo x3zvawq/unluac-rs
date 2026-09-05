@@ -2119,11 +2119,11 @@ fn exprs_open_tail_residuals<'a>(
 fn debug_prefix_stmt_is_inert(stmt: &HirStmt) -> bool {
     match stmt {
         HirStmt::LocalDecl(decl) => {
-            decl.values.tail.is_none() && decl.values.fixed.iter().all(expr_is_data_only)
+            decl.values.tail.is_none() && decl.values.fixed.iter().all(debug_prefix_expr_is_inert)
         }
         HirStmt::Assign(assign) => {
             assign.values.tail.is_none()
-                && assign.values.fixed.iter().all(expr_is_data_only)
+                && assign.values.fixed.iter().all(debug_prefix_expr_is_inert)
                 && assign.targets.iter().all(|target| {
                     matches!(
                         target,
@@ -2134,6 +2134,35 @@ fn debug_prefix_stmt_is_inert(stmt: &HirStmt) -> bool {
                 })
         }
         _ => false,
+    }
+}
+
+fn debug_prefix_expr_is_inert(expr: &HirExpr) -> bool {
+    match expr {
+        // 闭包及其 producer 保持原位：捕获已有 binding 不调用子函数，ByValue 的读取
+        // 也不后移。这里只证明无 debug 回调；捕获 seed 的持有/逃逸仍由 prefix scan 判定。
+        HirExpr::Closure(closure) => closure.captures.iter().all(|capture| {
+            matches!(
+                capture.value,
+                HirExpr::ParamRef(_)
+                    | HirExpr::LocalRef(_)
+                    | HirExpr::TempRef(_)
+                    | HirExpr::UpvalueRef(_)
+            )
+        }),
+        HirExpr::TableConstructor(constructor) => {
+            constructor.fields.iter().all(|field| match field {
+                HirTableField::Array(value) => debug_prefix_expr_is_inert(value),
+                HirTableField::Record(record) => {
+                    record_key_is_data_only(&record.key)
+                        && debug_prefix_expr_is_inert(&record.value)
+                }
+            }) && constructor
+                .trailing_multivalue
+                .as_ref()
+                .is_none_or(|tail| debug_prefix_expr_is_inert(tail.as_expr()))
+        }
+        _ => expr_is_data_only(expr),
     }
 }
 
@@ -3845,7 +3874,11 @@ mod tests {
                     reg_index: 3,
                     value: HirExpr::LocalRef(resource),
                 })),
-                HirStmt::Close(Box::new(HirClose { from_reg: 3 })),
+                HirStmt::Close(Box::new(HirClose {
+                    kind: crate::transformer::CloseKind::Explicit,
+                    from_reg: 3,
+                    origins: Vec::new(),
+                })),
                 HirStmt::TableSetList(Box::new(HirTableSetList {
                     base: HirExpr::LocalRef(owner),
                     start_index: 1,

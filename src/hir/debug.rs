@@ -266,12 +266,17 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
             HirStmt::ToBeClosed(to_be_closed) => {
                 let _ = writeln!(
                     output,
-                    "{indent}to-be-closed {}",
-                    format_expr(&to_be_closed.value)
+                    "{indent}to-be-closed {} origin={}",
+                    format_expr(&to_be_closed.value),
+                    to_be_closed.origin
                 );
             }
             HirStmt::Close(close) => {
-                let _ = writeln!(output, "{indent}close from r{}", close.from_reg);
+                let _ = writeln!(
+                    output,
+                    "{indent}close from r{} kind={:?} origins={:?}",
+                    close.from_reg, close.kind, close.origins
+                );
             }
             HirStmt::CallStmt(call_stmt) => {
                 let _ = writeln!(output, "{indent}call {}", format_call_expr(&call_stmt.call));
@@ -383,8 +388,9 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                     .join(", ");
                 let _ = writeln!(
                     output,
-                    "{indent}label L{} tbc=[{barriers}]",
-                    label.id.index()
+                    "{indent}label L{} tbc=[{barriers}] entry-cleanup={:?}",
+                    label.id.index(),
+                    label.entry_cleanup
                 );
             }
             HirStmt::Block(block) => {

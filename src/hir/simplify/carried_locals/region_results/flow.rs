@@ -3,8 +3,8 @@
 //! Structure/HIR 已经提供结构化分支与循环、binding 的 `(slot, close epoch)`、capture 和
 //! source debug 身份；这里在这些事实之上证明两个 HIR binding 只是同一物理状态的阶段性
 //! 名称，不重新推断 CFG owner，也不移动或复制 RHS。证明只接受同一精确 home-slot，并沿
-//! 每条结构化路径跟踪 `Unproduced/Pending/Synced`；Decision 的全部 test/target 读取按并集
-//! 保守验证。owner-wide label refs 与 lexical CFG 会精确跟踪候选内 goto；外部入口、
+//! 共享 HIR 图的可达路径跟踪 `Unproduced/Pending/Synced`；Decision 的全部 test/target 读取按并集
+//! 保守验证。入口验证与 topology 在同一区域的候选间共享，关系域消费 typed event 而不建边；外部入口、
 //! 未同步的外跳与 Unresolved 保留原形。cleanup 只有在 possible-home 与改写端点相交时
 //! 才由 proto 级身份门拒绝，不相交的 cleanup 原位保留。
 //!
@@ -16,8 +16,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::hir::common::{HirAssign, HirBlock, HirExpr, HirLValue, HirStmt, HirValuePack, LocalId};
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::super::super::expr_facts::expr_truthiness;
-use super::super::super::lexical_cfg::LexicalCfg;
+use super::super::super::lexical_cfg::{
+    FlowRefinement, HirFlowGraph, HirFlowNodeKind, validate_region_entry,
+};
 use super::super::super::walk::rewrite_stmts;
 use super::super::binding::{
     BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
@@ -94,8 +95,7 @@ fn find_candidate(
         else {
             continue;
         };
-        if writeback_region_has_barrier(&block.stmts[declaration + 1..=last_mention], control_facts)
-        {
+        if region_has_hard_barrier(&block.stmts[declaration + 1..=last_mention], control_facts) {
             // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据。
             // 候选拒绝[SemanticBarrier:ControlFlow]：owner-wide label refs 证明外部入口时，
             // producer 可被绕过或重执行；self-contained edge 交给 relation CFG。
@@ -199,6 +199,13 @@ fn completed_writeback_states(
     stmts: &[HirStmt],
     control_facts: &RegionControlFacts,
 ) -> Vec<CarryBinding> {
+    if eligible_states.is_empty() {
+        return Vec::new();
+    }
+    // 调用方已验证整区入口与 Unresolved；同一快照的候选只重算各自的关系域。
+    let Ok(graph) = HirFlowGraph::for_stmts(stmts, control_facts.expr_safety) else {
+        return Vec::new();
+    };
     eligible_states
         .iter()
         .copied()
@@ -206,14 +213,13 @@ fn completed_writeback_states(
             let verifier = FlowVerifier {
                 result,
                 state: *state,
-                control_facts,
                 validate_rewritten_reads: true,
             };
             let Some(states) = verifier.validate_initializer(initializer) else {
                 return false;
             };
             verifier
-                .validate_region(stmts, states)
+                .validate_region(&graph, states)
                 .is_some_and(|states| !states.contains(Relation::Pending))
         })
         .collect()
@@ -231,31 +237,32 @@ pub(super) fn region_rewrites_preserve_external_transfers(
     control_facts: &RegionControlFacts,
     scope: ExternalTransferScope,
 ) -> bool {
+    if rewrites.is_empty() {
+        return true;
+    }
+    if region_has_hard_barrier(stmts, control_facts) {
+        return false;
+    }
+    let Ok(graph) = HirFlowGraph::for_stmts(stmts, control_facts.expr_safety) else {
+        return false;
+    };
     rewrites.iter().all(|(result, state)| {
         let verifier = FlowVerifier {
             result: *result,
             state: *state,
-            control_facts,
             // Whole-region plans rename every read. Loop plans rename only tracked exit
             // producers and the live-out suffix, so unrelated body reads remain untouched.
             validate_rewritten_reads: matches!(scope, ExternalTransferScope::WholeRegion),
         };
-        let Ok(_) =
-            LexicalCfg::analyze(stmts, &control_facts.label_refs, control_facts.expr_safety)
-        else {
-            return false;
-        };
-        let Some(outcome) = verifier.validate_block(stmts, RelationSet::only(Relation::Unproduced))
+        let Some(outcome) =
+            verifier.validate_graph(&graph, RelationSet::only(Relation::Unproduced))
         else {
             return false;
         };
         let has_unsynced = |states: RelationSet| {
             states.contains(Relation::Unproduced) || states.contains(Relation::Pending)
         };
-        let unsynced_goto = outcome
-            .outgoing
-            .values()
-            .any(|states| has_unsynced(*states));
+        let unsynced_goto = has_unsynced(outcome.outgoing);
         let unsynced_loop_transfer = matches!(scope, ExternalTransferScope::WholeRegion)
             && (has_unsynced(outcome.breaks) || has_unsynced(outcome.continues));
         if unsynced_goto || unsynced_loop_transfer {
@@ -332,14 +339,13 @@ fn same_exact_home_slot(
 }
 
 #[derive(Clone, Copy)]
-struct FlowVerifier<'a> {
+struct FlowVerifier {
     result: CarryBinding,
     state: CarryBinding,
-    control_facts: &'a RegionControlFacts,
     validate_rewritten_reads: bool,
 }
 
-impl FlowVerifier<'_> {
+impl FlowVerifier {
     fn validate_initializer(&self, initializer: Option<&HirValuePack>) -> Option<RelationSet> {
         let Some(initializer) = initializer else {
             return Some(RelationSet::only(Relation::Unproduced));
@@ -356,20 +362,15 @@ impl FlowVerifier<'_> {
         })
     }
 
-    fn validate_region(&self, stmts: &[HirStmt], states: RelationSet) -> Option<RelationSet> {
-        LexicalCfg::analyze(
-            stmts,
-            &self.control_facts.label_refs,
-            self.control_facts.expr_safety,
-        )
-        .ok()?;
-        let outcome = self.validate_block(stmts, states)?;
+    fn validate_region(
+        &self,
+        graph: &HirFlowGraph<'_>,
+        states: RelationSet,
+    ) -> Option<RelationSet> {
+        let outcome = self.validate_graph(graph, states)?;
         if outcome.breaks.contains(Relation::Pending)
             || outcome.continues.contains(Relation::Pending)
-            || outcome
-                .outgoing
-                .values()
-                .any(|states| states.contains(Relation::Pending))
+            || outcome.outgoing.contains(Relation::Pending)
         {
             // 候选拒绝[SemanticBarrier:ControlFlow]：离开候选 owner 的 Pending path 未执行
             // writeback；把 result producer 提前改成 state write 会改变目标 owner 的读取。
@@ -378,128 +379,106 @@ impl FlowVerifier<'_> {
         Some(outcome.fallthrough)
     }
 
-    fn validate_block(&self, stmts: &[HirStmt], states: RelationSet) -> Option<FlowOutcome> {
-        if stmts.is_empty() {
-            return Some(FlowOutcome::fallthrough(states));
+    fn validate_graph(&self, graph: &HirFlowGraph<'_>, states: RelationSet) -> Option<FlowOutcome> {
+        // Err 是吸收态；terminal 节点没有后继，失败仍须单调记录，不能被 return/goto 吞掉。
+        let mut rejected = false;
+        let outputs = graph.solve_forward(
+            Ok(states),
+            |current, incoming| {
+                let next = match (*current, *incoming) {
+                    (Ok(current), Ok(incoming)) => Ok(current.union(incoming)),
+                    _ => Err(()),
+                };
+                let changed = *current != next;
+                *current = next;
+                changed
+            },
+            |_, kind, states| {
+                *states = states.and_then(|states| self.validate_event(kind, states).ok_or(()));
+                rejected |= states.is_err();
+                *states
+            },
+            |_expr, _truthy, _state| FlowRefinement::Unchanged,
+        );
+        if rejected {
+            return None;
         }
-        let direct_labels = stmts
-            .iter()
-            .enumerate()
-            .filter_map(|(index, stmt)| match stmt {
-                HirStmt::Label(label) => Some((label.id, index)),
-                _ => None,
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut inputs = vec![RelationSet::EMPTY; stmts.len()];
-        inputs[0] = states;
-        let mut pending = vec![0usize];
         let mut exits = FlowOutcome::default();
-        while let Some(index) = pending.pop() {
-            let mut output = self.validate_stmt_outcome(&stmts[index], inputs[index])?;
-            if index + 1 < stmts.len() {
-                if !output.fallthrough.is_empty() {
-                    let next = inputs[index + 1].union(output.fallthrough);
-                    if next != inputs[index + 1] {
-                        inputs[index + 1] = next;
-                        pending.push(index + 1);
-                    }
-                }
-            } else {
-                exits.fallthrough = exits.fallthrough.union(output.fallthrough);
-            }
-            for (target, target_states) in std::mem::take(&mut output.outgoing) {
-                if let Some(&target_index) = direct_labels.get(&target) {
-                    let next = inputs[target_index].union(target_states);
-                    if next != inputs[target_index] {
-                        inputs[target_index] = next;
-                        pending.push(target_index);
-                    }
-                } else {
-                    exits.add_outgoing(target, target_states);
-                }
-            }
-            exits.breaks = exits.breaks.union(output.breaks);
-            exits.continues = exits.continues.union(output.continues);
+        for (node, output) in graph.nodes().iter().zip(outputs) {
+            let Some(Ok(states)) = output else { continue };
+            let exit = match node.kind() {
+                HirFlowNodeKind::Exit => &mut exits.fallthrough,
+                HirFlowNodeKind::Stmt(stmt) if node.successors().is_empty() => match stmt {
+                    HirStmt::Break => &mut exits.breaks,
+                    HirStmt::Continue => &mut exits.continues,
+                    HirStmt::Goto(_) => &mut exits.outgoing,
+                    // return pack 已验证读取，identity 门负责 capture/resource；函数终止后
+                    // 不再要求旧 state 同步。内部 transfer 由共享图的最近 owner 消费。
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            *exit = exit.union(states);
         }
         Some(exits)
     }
 
-    fn validate_stmt_outcome(&self, stmt: &HirStmt, states: RelationSet) -> Option<FlowOutcome> {
-        match stmt {
-            HirStmt::Assign(assign) => self
-                .validate_assign(assign, states)
-                .map(FlowOutcome::fallthrough),
-            HirStmt::If(if_stmt) => {
-                self.validate_expr(&if_stmt.cond, states)?;
-                let then_outcome = self.validate_block(&if_stmt.then_block.stmts, states)?;
-                let else_outcome = if let Some(else_block) = &if_stmt.else_block {
-                    self.validate_block(&else_block.stmts, states)?
-                } else {
-                    FlowOutcome::fallthrough(states)
-                };
-                Some(then_outcome.union(else_outcome))
-            }
-            HirStmt::Block(block) => self.validate_block(&block.stmts, states),
-            HirStmt::Return(return_stmt) => {
-                self.validate_pack(&return_stmt.values, states)?;
-                // return pack 已验证所有可观察读取，且 identity 门排除了 capture/resource；
-                // 终止后未同步的旧 state 不再有 observer。
-                Some(FlowOutcome::default())
-            }
-            HirStmt::Break => Some(FlowOutcome {
-                breaks: states,
-                ..FlowOutcome::default()
-            }),
-            HirStmt::Continue => Some(FlowOutcome {
-                continues: states,
-                ..FlowOutcome::default()
-            }),
-            HirStmt::Goto(goto_stmt) => {
-                let mut outcome = FlowOutcome::default();
-                outcome.add_outgoing(goto_stmt.target, states);
-                Some(outcome)
-            }
-            HirStmt::While(_)
-            | HirStmt::Repeat(_)
-            | HirStmt::NumericFor(_)
-            | HirStmt::GenericFor(_) => self.validate_loop_outcome(stmt, states),
-            HirStmt::Label(_) => Some(FlowOutcome::fallthrough(states)),
-            HirStmt::ToBeClosed(to_be_closed) => {
-                // 候选形成前的 proto 身份门已经证明 result/state 与所有 TBC possible-home
-                // 不相交；这里只需保留并验证 TBC value 的读取 epoch。
-                self.validate_expr(&to_be_closed.value, states)?;
-                Some(FlowOutcome::fallthrough(states))
-            }
-            HirStmt::Close(_) => Some(FlowOutcome::fallthrough(states)),
-            HirStmt::LocalDecl(local_decl) => {
-                if local_decl
-                    .bindings
-                    .iter()
-                    .copied()
-                    .any(|local| [self.result, self.state].contains(&CarryBinding::Local(local)))
-                {
-                    // 候选拒绝[SemanticBarrier:Scope]：region 内重声明 result/state 会让批量 LocalId 改名跨越 lexical owner。
-                    return None;
+    fn validate_event(
+        &self,
+        kind: HirFlowNodeKind<'_>,
+        states: RelationSet,
+    ) -> Option<RelationSet> {
+        if states.is_empty() {
+            return Some(states);
+        }
+        match kind {
+            HirFlowNodeKind::Stmt(stmt) => match stmt {
+                HirStmt::Assign(assign) => return self.validate_assign(assign, states),
+                HirStmt::If(branch) => self.validate_expr(&branch.cond, states)?,
+                HirStmt::While(loop_stmt) => self.validate_expr(&loop_stmt.cond, states)?,
+                HirStmt::NumericFor(loop_stmt) => {
+                    self.validate_expr(&loop_stmt.start, states)?;
+                    self.validate_expr(&loop_stmt.limit, states)?;
+                    self.validate_expr(&loop_stmt.step, states)?;
                 }
-                self.validate_pack(&local_decl.values, states)?;
-                Some(FlowOutcome::fallthrough(states))
+                HirStmt::Return(stmt) => self.validate_pack(&stmt.values, states)?,
+                HirStmt::ToBeClosed(stmt) => self.validate_expr(&stmt.value, states)?,
+                HirStmt::LocalDecl(stmt) => {
+                    if stmt.bindings.iter().any(|&local| {
+                        [self.result, self.state].contains(&CarryBinding::Local(local))
+                    }) {
+                        // 候选拒绝[SemanticBarrier:Scope]：端点重声明不能跨 lexical owner 改名。
+                        return None;
+                    }
+                    self.validate_pack(&stmt.values, states)?;
+                }
+                HirStmt::GlobalDecl(stmt) => self.validate_pack(&stmt.values, states)?,
+                HirStmt::TableSetList(_) | HirStmt::ErrNil(_) | HirStmt::CallStmt(_) => {
+                    self.validate_leaf(stmt, states)?;
+                }
+                HirStmt::Break
+                | HirStmt::Continue
+                | HirStmt::Goto(_)
+                | HirStmt::Label(_)
+                | HirStmt::Close(_) => {}
+                HirStmt::Block(_) | HirStmt::Repeat(_) | HirStmt::GenericFor(_) => {
+                    unreachable!("structured owner must be lowered to HIR flow events")
+                }
+            },
+            HirFlowNodeKind::RepeatCondition(stmt) => self.validate_expr(&stmt.cond, states)?,
+            HirFlowNodeKind::GenericForInit(flow) => {
+                self.validate_pack(&flow.for_stmt().iterator, states)?;
             }
-            HirStmt::TableSetList(_) | HirStmt::ErrNil(_) | HirStmt::CallStmt(_) => {
-                self.validate_leaf(stmt, states)?;
-                Some(FlowOutcome::fallthrough(states))
-            }
-            HirStmt::GlobalDecl(global_decl) => {
-                self.validate_pack(&global_decl.values, states)?;
-                Some(FlowOutcome::fallthrough(states))
+            // identity 门排除了 for binding 与候选端点相交；这里不重证协议写入或资源身份。
+            HirFlowNodeKind::NumericForDispatch
+            | HirFlowNodeKind::GenericForDispatch(_)
+            | HirFlowNodeKind::ForBinding(_)
+            | HirFlowNodeKind::Exit => {}
+            HirFlowNodeKind::FunctionExit | HirFlowNodeKind::UnknownControl => {
+                unreachable!("writeback verification requires a region graph")
             }
         }
-    }
-
-    #[cfg(test)]
-    fn validate_stmt(&self, stmt: &HirStmt, states: RelationSet) -> Option<RelationSet> {
-        let outcome = self.validate_stmt_outcome(stmt, states)?;
-        (outcome.breaks.is_empty() && outcome.continues.is_empty() && outcome.outgoing.is_empty())
-            .then_some(outcome.fallthrough)
+        Some(states)
     }
 
     fn validate_assign(&self, assign: &HirAssign, states: RelationSet) -> Option<RelationSet> {
@@ -566,106 +545,6 @@ impl FlowVerifier<'_> {
         }
     }
 
-    fn validate_loop_outcome(&self, stmt: &HirStmt, states: RelationSet) -> Option<FlowOutcome> {
-        match stmt {
-            HirStmt::While(while_stmt) => {
-                self.validate_while(&while_stmt.body, &while_stmt.cond, states)
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                self.validate_repeat(&repeat_stmt.body, &repeat_stmt.cond, states)
-            }
-            HirStmt::NumericFor(numeric_for) => {
-                self.validate_expr(&numeric_for.start, states)?;
-                self.validate_expr(&numeric_for.limit, states)?;
-                self.validate_expr(&numeric_for.step, states)?;
-                self.validate_zero_or_more(&numeric_for.body, states)
-            }
-            HirStmt::GenericFor(generic_for) => {
-                self.validate_pack(&generic_for.iterator, states)?;
-                self.validate_zero_or_more(&generic_for.body, states)
-            }
-            _ => unreachable!("validate_loop only accepts loop statements"),
-        }
-    }
-
-    fn validate_zero_or_more(&self, body: &HirBlock, states: RelationSet) -> Option<FlowOutcome> {
-        let mut entries = states;
-        let mut exits = FlowOutcome::default();
-        for _ in 0..=3 {
-            exits.fallthrough = exits.fallthrough.union(entries);
-            let body_outcome = self.validate_block(&body.stmts, entries)?;
-            exits.fallthrough = exits.fallthrough.union(body_outcome.breaks);
-            exits.add_outgoing_all(body_outcome.outgoing);
-            let backedge = body_outcome.fallthrough.union(body_outcome.continues);
-            let next = entries.union(backedge);
-            if next == entries {
-                return Some(exits);
-            }
-            entries = next;
-        }
-        panic!("three-state monotone loop relation must converge within four rounds")
-    }
-
-    fn validate_while(
-        &self,
-        body: &HirBlock,
-        condition: &HirExpr,
-        states: RelationSet,
-    ) -> Option<FlowOutcome> {
-        let mut entries = states;
-        let mut exits = FlowOutcome::default();
-        let truthiness = expr_truthiness(condition, self.control_facts.expr_safety);
-        for _ in 0..=3 {
-            self.validate_expr(condition, entries)?;
-            if truthiness != Some(true) {
-                exits.fallthrough = exits.fallthrough.union(entries);
-            }
-            if truthiness == Some(false) {
-                return Some(exits);
-            }
-            let body_outcome = self.validate_block(&body.stmts, entries)?;
-            exits.fallthrough = exits.fallthrough.union(body_outcome.breaks);
-            exits.add_outgoing_all(body_outcome.outgoing);
-            let backedge = body_outcome.fallthrough.union(body_outcome.continues);
-            let next = entries.union(backedge);
-            if next == entries {
-                return Some(exits);
-            }
-            entries = next;
-        }
-        panic!("three-state monotone condition relation must converge within four rounds")
-    }
-
-    fn validate_repeat(
-        &self,
-        body: &HirBlock,
-        condition: &HirExpr,
-        states: RelationSet,
-    ) -> Option<FlowOutcome> {
-        let mut entries = states;
-        let mut exits = FlowOutcome::default();
-        let truthiness = expr_truthiness(condition, self.control_facts.expr_safety);
-        for _ in 0..=3 {
-            let body_outcome = self.validate_block(&body.stmts, entries)?;
-            let reaches_condition = body_outcome.fallthrough.union(body_outcome.continues);
-            self.validate_expr(condition, reaches_condition)?;
-            exits.fallthrough = exits.fallthrough.union(body_outcome.breaks);
-            if truthiness != Some(false) {
-                exits.fallthrough = exits.fallthrough.union(reaches_condition);
-            }
-            exits.add_outgoing_all(body_outcome.outgoing);
-            if truthiness == Some(true) {
-                return Some(exits);
-            }
-            let next = entries.union(reaches_condition);
-            if next == entries {
-                return Some(exits);
-            }
-            entries = next;
-        }
-        panic!("three-state monotone repeat relation must converge within four rounds")
-    }
-
     fn validate_leaf(&self, stmt: &HirStmt, states: RelationSet) -> Option<()> {
         if stmt_contains_unresolved_expr(stmt) {
             // 候选拒绝[PolicyBoundary]：Unresolved 的未知读取属于 permissive 失败证据。
@@ -684,7 +563,7 @@ impl FlowVerifier<'_> {
     }
 
     fn validate_expr(&self, expr: &HirExpr, states: RelationSet) -> Option<()> {
-        if expr_contains_unresolved(expr) {
+        if expr_has_hard_barrier(expr) {
             // 候选拒绝[PolicyBoundary]：Unresolved 的未知读取属于 permissive 失败证据。
             return None;
         }
@@ -769,40 +648,7 @@ struct FlowOutcome {
     fallthrough: RelationSet,
     breaks: RelationSet,
     continues: RelationSet,
-    outgoing: BTreeMap<crate::hir::common::HirLabelId, RelationSet>,
-}
-
-impl FlowOutcome {
-    fn fallthrough(states: RelationSet) -> Self {
-        Self {
-            fallthrough: states,
-            ..Self::default()
-        }
-    }
-
-    fn union(mut self, other: Self) -> Self {
-        self.fallthrough = self.fallthrough.union(other.fallthrough);
-        self.breaks = self.breaks.union(other.breaks);
-        self.continues = self.continues.union(other.continues);
-        self.add_outgoing_all(other.outgoing);
-        self
-    }
-
-    fn add_outgoing(&mut self, target: crate::hir::common::HirLabelId, states: RelationSet) {
-        self.outgoing
-            .entry(target)
-            .and_modify(|current| *current = current.union(states))
-            .or_insert(states);
-    }
-
-    fn add_outgoing_all(
-        &mut self,
-        outgoing: BTreeMap<crate::hir::common::HirLabelId, RelationSet>,
-    ) {
-        for (target, states) in outgoing {
-            self.add_outgoing(target, states);
-        }
-    }
+    outgoing: RelationSet,
 }
 
 impl Default for RelationSet {
@@ -817,12 +663,6 @@ fn binding_reads_in_expr(expr: &HirExpr) -> BTreeSet<CarryBinding> {
     reads.reads
 }
 
-fn expr_contains_unresolved(expr: &HirExpr) -> bool {
-    let mut collector = UnresolvedExprCollector::default();
-    visit_expr(expr, &mut collector);
-    collector.found
-}
-
 fn stmt_contains_unresolved_expr(stmt: &HirStmt) -> bool {
     let mut collector = UnresolvedExprCollector::default();
     visit_stmts(std::slice::from_ref(stmt), &mut collector);
@@ -834,57 +674,21 @@ struct UnresolvedExprCollector {
     found: bool,
 }
 
-fn writeback_region_has_barrier(stmts: &[HirStmt], control_facts: &RegionControlFacts) -> bool {
-    let mut collector = WritebackBarrierCollector::default();
-    visit_stmts(stmts, &mut collector);
-    collector.found
-        || LexicalCfg::analyze(stmts, &control_facts.label_refs, control_facts.expr_safety).is_err()
-}
-
-#[derive(Default)]
-struct WritebackBarrierCollector {
-    found: bool,
-}
-
-impl HirVisitor for WritebackBarrierCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= matches!(expr, HirExpr::Unresolved(_));
-    }
-}
-
 pub(super) fn region_has_hard_barrier(
     stmts: &[HirStmt],
     control_facts: &RegionControlFacts,
 ) -> bool {
-    let mut collector = RegionBarrierCollector::default();
+    let mut collector = UnresolvedExprCollector::default();
     visit_stmts(stmts, &mut collector);
-    if collector.found {
-        return true;
-    }
-    let Ok(_) = LexicalCfg::analyze(stmts, &control_facts.label_refs, control_facts.expr_safety)
-    else {
-        // 候选拒绝[SemanticBarrier:ControlFlow]：owner-wide label refs 证明候选区域有外部
-        // 入口或重复 label；改写 result 声明/producer 会被该入口绕过或重执行。
-        return true;
-    };
-    false
+    // 候选拒绝[SemanticBarrier:ControlFlow]：owner-wide label refs 证明候选区域有外部
+    // 入口或重复 label；改写 result 声明/producer 会被该入口绕过或重执行。
+    collector.found || validate_region_entry(stmts, &control_facts.label_refs).is_err()
 }
 
 pub(super) fn expr_has_hard_barrier(expr: &HirExpr) -> bool {
-    let mut collector = RegionBarrierCollector::default();
+    let mut collector = UnresolvedExprCollector::default();
     visit_expr(expr, &mut collector);
     collector.found
-}
-
-#[derive(Default)]
-struct RegionBarrierCollector {
-    found: bool,
-}
-
-impl HirVisitor for RegionBarrierCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= matches!(expr, HirExpr::Unresolved(_));
-    }
 }
 
 impl HirVisitor for UnresolvedExprCollector {
@@ -961,12 +765,25 @@ mod tests {
             ),
         });
 
-    fn verifier() -> FlowVerifier<'static> {
+    fn verifier() -> FlowVerifier {
         FlowVerifier {
             result: CarryBinding::Local(LocalId(0)),
             state: CarryBinding::Local(LocalId(1)),
-            control_facts: &EMPTY_CONTROL_FACTS,
             validate_rewritten_reads: true,
+        }
+    }
+
+    fn graph(stmts: &[HirStmt]) -> HirFlowGraph<'_> {
+        HirFlowGraph::for_stmts(stmts, EMPTY_CONTROL_FACTS.expr_safety).unwrap()
+    }
+
+    impl FlowVerifier {
+        fn validate_stmt(&self, stmt: &HirStmt, states: RelationSet) -> Option<RelationSet> {
+            let outcome = self.validate_graph(&graph(std::slice::from_ref(stmt)), states)?;
+            (outcome.breaks.is_empty()
+                && outcome.continues.is_empty()
+                && outcome.outgoing.is_empty())
+            .then_some(outcome.fallthrough)
         }
     }
 
@@ -1028,6 +845,7 @@ mod tests {
         let owner = vec![
             HirStmt::Goto(Box::new(HirGoto { target: label })),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: label,
                 tbc_barriers: Default::default(),
             })),
@@ -1045,6 +863,7 @@ mod tests {
         let owner = vec![
             goto.clone(),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: label,
                 tbc_barriers: Default::default(),
             })),
@@ -1191,6 +1010,7 @@ mod tests {
                 })),
                 HirStmt::Goto(Box::new(HirGoto { target: label })),
                 HirStmt::Label(Box::new(HirLabel {
+                    entry_cleanup: Vec::new(),
                     id: label,
                     tbc_barriers: Default::default(),
                 })),
@@ -1270,10 +1090,12 @@ mod tests {
                     method_rewrite_transaction: None,
                 })),
                 HirStmt::Label(Box::new(HirLabel {
+                    entry_cleanup: Vec::new(),
                     id: label,
                     tbc_barriers: Default::default(),
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(state)]),
                 })),
             ],
@@ -1483,6 +1305,7 @@ mod tests {
             cond: HirExpr::Boolean(true),
             body: HirBlock {
                 stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
                 }))],
             },
@@ -1541,13 +1364,14 @@ mod tests {
                 },
             })),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
             })),
         ];
 
         assert!(
             verifier()
-                .validate_region(&stmts, RelationSet::only(Relation::Unproduced))
+                .validate_region(&graph(&stmts), RelationSet::only(Relation::Unproduced))
                 .is_none()
         );
     }
@@ -1577,13 +1401,14 @@ mod tests {
                 },
             })),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
             })),
         ];
 
         assert!(
             verifier()
-                .validate_region(&stmts, RelationSet::only(Relation::Unproduced))
+                .validate_region(&graph(&stmts), RelationSet::only(Relation::Unproduced))
                 .is_some()
         );
     }
@@ -1599,8 +1424,18 @@ mod tests {
                 method_rewrite_transaction: None,
             }))],
         };
+        let pending_loop = HirStmt::NumericFor(Box::new(crate::hir::common::HirNumericFor {
+            binding: LocalId(2),
+            start: HirExpr::Integer(1),
+            limit: HirExpr::Integer(3),
+            step: HirExpr::Integer(1),
+            body: pending_body,
+        }));
         let pending = verifier()
-            .validate_zero_or_more(&pending_body, RelationSet::only(Relation::Unproduced))
+            .validate_graph(
+                &graph(&[pending_loop]),
+                RelationSet::only(Relation::Unproduced),
+            )
             .expect("loop body itself is valid");
         assert!(pending.fallthrough.contains(Relation::Unproduced));
         assert!(pending.fallthrough.contains(Relation::Pending));
@@ -1623,8 +1458,18 @@ mod tests {
                 })),
             ],
         };
+        let synced_loop = HirStmt::NumericFor(Box::new(crate::hir::common::HirNumericFor {
+            binding: LocalId(2),
+            start: HirExpr::Integer(1),
+            limit: HirExpr::Integer(3),
+            step: HirExpr::Integer(1),
+            body: synced_body,
+        }));
         let synced = verifier()
-            .validate_zero_or_more(&synced_body, RelationSet::only(Relation::Unproduced))
+            .validate_graph(
+                &graph(&[synced_loop]),
+                RelationSet::only(Relation::Unproduced),
+            )
             .expect("synchronized loop body is valid");
         assert!(synced.fallthrough.contains(Relation::Unproduced));
         assert!(synced.fallthrough.contains(Relation::Synced));
@@ -1644,6 +1489,7 @@ mod tests {
         };
         let return_old_state = || {
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
             }))
         };
@@ -1669,7 +1515,7 @@ mod tests {
 
         for stmts in [true_while, false_repeat] {
             let exits = verifier()
-                .validate_region(&stmts, RelationSet::only(Relation::Unproduced))
+                .validate_region(&graph(&stmts), RelationSet::only(Relation::Unproduced))
                 .expect("unreachable suffix cannot observe the pending relation");
             assert!(exits == RelationSet::EMPTY);
         }
@@ -1678,6 +1524,7 @@ mod tests {
     #[test]
     fn terminating_return_accepts_an_unobserved_pending_state() {
         let stmt = HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(0))]),
         }));
 

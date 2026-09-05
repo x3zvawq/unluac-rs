@@ -226,11 +226,14 @@ fn write_debug_bindings(output: &mut String, indent: &str, facts: &ReadyStructur
     for binding in &facts.debug_bindings.accepted {
         let _ = writeln!(
             output,
-            "{indent}    scope#{} source r{} pc={}..{} -> {}",
+            "{indent}    scope#{} source r{} pc={}..{} end={} -> {}",
             binding.scope,
             binding.reg.index(),
             binding.start_pc,
             binding.end_pc,
+            binding
+                .end_instr
+                .map_or_else(|| "-".to_owned(), |instr| instr.to_string()),
             binding.value,
         );
     }
@@ -893,12 +896,8 @@ fn format_cleanup_disposition(disposition: CleanupDisposition) -> String {
         CleanupDisposition::LoopTbcBoundary(id) => {
             format!("loop-tbc-boundary:r{}", id.index())
         }
-        CleanupDisposition::ExplicitTbcBoundary(id) => {
-            format!("explicit-tbc-boundary:t{}", id.index())
-        }
-        CleanupDisposition::ExplicitTbcExit(id) => {
-            format!("explicit-tbc-exit:t{}", id.index())
-        }
+        CleanupDisposition::ExplicitClose => "explicit-close".to_owned(),
+        CleanupDisposition::IncomingEdges => "incoming-edges".to_owned(),
         CleanupDisposition::LexicalScope(id) => format!("lexical-scope:s{}", id.index()),
     }
 }

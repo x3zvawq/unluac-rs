@@ -126,14 +126,19 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             "plan emits one loop syntax block more than once",
         )?;
         let mut stmts = Vec::new();
-        self.emit_label(block, LabelPlacement::BeforeBlock, &mut stmts)?;
-        stmts.extend(self.lower_unresolved_phis(owner, block)?);
         let terminator = self.block_terminator(owner, block)?.clone();
         let end = terminator
             .kind
             .instr()
             .map_or(terminator.instrs.end(), InstrRef::index);
-        for index in terminator.instrs.start.index()..end {
+        let start = self.lower_block_entry(
+            owner,
+            block,
+            terminator.instrs.start.index(),
+            end,
+            &mut stmts,
+        )?;
+        for index in start..end {
             let instr_ref = InstrRef(index);
             if skipped == Some(instr_ref) {
                 continue;

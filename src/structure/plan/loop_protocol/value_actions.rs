@@ -717,6 +717,10 @@ pub(super) fn edge_is_loop_exit(payload: &LoopPlanData, edge: EdgeRef) -> bool {
 pub(super) fn edge_emits_no_stmt(plan: &StructurePlan, edge: EdgeRef) -> bool {
     plan.edge_plan(edge).is_some_and(|edge_plan| {
         edge_plan.phi_copies.is_empty()
+            && edge_plan.cleanup.is_empty()
+            && edge_plan
+                .forward_route
+                .is_none_or(|route| plan.forward_route_action_edges(route).next().is_none())
             && edge_plan.actions_before_trailing_cleanup().is_none()
             && !matches!(
                 edge_plan.transfer,

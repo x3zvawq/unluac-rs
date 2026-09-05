@@ -4,9 +4,8 @@
 //! 重写"。如果每个 pass 都各自维护一套 `block/stmt/lvalue/call/expr` 骨架，后面一旦
 //! 新增 HIR 节点或调整遍历顺序，就得在多处同步返工。
 //!
-//! 这里把公共遍历样板收成两层接口：
-//! - `HirRewritePass` 负责通用 block/stmt/expr 级重写
-//! - `ExprRewritePass` 作为兼容层，继续服务"只关心表达式"的现有 pass
+//! `HirRewritePass` 统一提供 block/stmt/expr 等回调，pass 只实现自己负责的改写。
+//! block 入口允许直接借用 proto 的只读事实并独立修改 body，不为可变借用复制元数据。
 //!
 //! 它不会替具体 pass 决定"哪些节点该改、哪些事实可信"；这些语义仍然由各个 pass
 //! 自己负责。这个文件只统一递归顺序和进入子节点的边界，避免不同 pass 各自长出
@@ -14,7 +13,7 @@
 //! 继续保留 lowering 证明；例如替换 callee 不会抹掉另一段 nil initializer 的身份。
 //!
 //! 例子：
-//! - `logical_simplify` 只需要实现 `ExprRewritePass`
+//! - `logical_simplify` 实现表达式与条件回调，区分值语境与 truthiness 语境
 //! - `dead_labels` 这类要在整段 block 上做删改的 pass，则实现 `HirRewritePass`
 //! - `close_scopes / decision-eliminate` 这类自带 block rebuild 的 pass，则可以只复用
 //!   下面的 `for_each_nested_block_mut / rewrite_nested_blocks_in_stmt`
@@ -30,7 +29,7 @@ use crate::hir::traverse::{
     traverse_hir_table_constructor_children,
 };
 
-pub(super) trait HirRewritePass {
+pub(crate) trait HirRewritePass {
     fn rewrite_block(&mut self, _block: &mut HirBlock) -> bool {
         false
     }
@@ -57,12 +56,11 @@ pub(super) trait HirRewritePass {
 
     /// Generic-for 自身可以裁掉已由 transaction 宽度独立保存的 trailing nil；其它
     /// iterator rewrite 默认逐段校验并撤销变化区间，不抹掉其它 producer 的证明。
-    fn preserves_generic_for_initializer_transaction_on_iterator_rewrite(&self) -> bool {
-        false
-    }
+    /// 这是 pass 的固定能力；保留事务时不构建不会被消费的 iterator 快照。
+    const PRESERVES_GENERIC_FOR_INITIALIZER_TRANSACTION: bool = false;
 }
 
-pub(super) fn rewrite_proto(proto: &mut HirProto, pass: &mut impl HirRewritePass) -> bool {
+pub(crate) fn rewrite_proto(proto: &mut HirProto, pass: &mut impl HirRewritePass) -> bool {
     rewrite_block(&mut proto.body, pass)
 }
 
@@ -72,19 +70,6 @@ pub(super) fn rewrite_stmts(stmts: &mut [HirStmt], pass: &mut impl HirRewritePas
         changed |= rewrite_stmt(stmt, pass);
     }
     changed
-}
-
-pub(crate) trait ExprRewritePass {
-    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool;
-
-    fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
-        self.rewrite_expr(expr)
-    }
-}
-
-pub(crate) fn rewrite_proto_exprs(proto: &mut HirProto, pass: &mut impl ExprRewritePass) -> bool {
-    let mut adapter = ExprRewritePassAdapter { pass };
-    rewrite_proto(proto, &mut adapter)
 }
 
 pub(super) fn for_each_nested_block_mut(stmt: &mut HirStmt, visit: &mut impl FnMut(&mut HirBlock)) {
@@ -127,21 +112,7 @@ pub(super) fn rewrite_nested_blocks_in_stmt(
     changed
 }
 
-struct ExprRewritePassAdapter<'a, P> {
-    pass: &'a mut P,
-}
-
-impl<P: ExprRewritePass> HirRewritePass for ExprRewritePassAdapter<'_, P> {
-    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
-        self.pass.rewrite_expr(expr)
-    }
-
-    fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
-        self.pass.rewrite_condition_expr(expr)
-    }
-}
-
-fn rewrite_block(block: &mut HirBlock, pass: &mut impl HirRewritePass) -> bool {
+pub(super) fn rewrite_block(block: &mut HirBlock, pass: &mut impl HirRewritePass) -> bool {
     let mut nested_changed = false;
     for stmt in &mut block.stmts {
         nested_changed |= rewrite_stmt(stmt, pass);
@@ -150,7 +121,7 @@ fn rewrite_block(block: &mut HirBlock, pass: &mut impl HirRewritePass) -> bool {
     block_changed || nested_changed
 }
 
-fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
+fn rewrite_stmt<P: HirRewritePass>(stmt: &mut HirStmt, pass: &mut P) -> bool {
     let original_assign_targets = match stmt {
         HirStmt::Assign(assign) if assign.generic_for_initializer_producer.is_some() => {
             Some(assign.targets.clone())
@@ -158,7 +129,10 @@ fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
         _ => None,
     };
     let original_generic_for_iterator = match stmt {
-        HirStmt::GenericFor(generic_for) if generic_for.initializer_transaction.is_some() => {
+        HirStmt::GenericFor(generic_for)
+            if generic_for.initializer_transaction.is_some()
+                && !P::PRESERVES_GENERIC_FOR_INITIALIZER_TRANSACTION =>
+        {
             Some(generic_for.iterator.clone())
         }
         _ => None,
@@ -200,7 +174,6 @@ fn rewrite_stmt(stmt: &mut HirStmt, pass: &mut impl HirRewritePass) -> bool {
     if let (Some(original_iterator), HirStmt::GenericFor(generic_for)) =
         (original_generic_for_iterator, &mut *stmt)
         && generic_for.iterator != original_iterator
-        && !pass.preserves_generic_for_initializer_transaction_on_iterator_rewrite()
     {
         metadata_changed |= generic_for.retain_unchanged_initializer_spans(&original_iterator);
     }

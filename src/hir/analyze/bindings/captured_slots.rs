@@ -9,7 +9,7 @@ use crate::structure::SccId;
 pub(super) struct CapturedSlotTargets {
     pub(super) slot_targets: BTreeMap<CapturedSlotKey, CapturedSlotBinding>,
     pub(super) capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
-    pub(super) lexical_close_scope_starts: BTreeMap<usize, usize>,
+    pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
     pub(super) entry_local_decls: Vec<LocalId>,
     pub(super) region_local_decls: BTreeMap<RegionId, Vec<LocalId>>,
 }
@@ -208,7 +208,7 @@ pub(super) fn collect_captured_slot_targets(
         &mut write_queries,
         &mut captured_uses,
     );
-    let lexical_close_scope_starts = collect_lexical_close_scope_starts(
+    let lexical_scopes = collect_lexical_close_scopes(
         proto,
         cfg,
         dataflow,
@@ -314,20 +314,20 @@ pub(super) fn collect_captured_slot_targets(
     CapturedSlotTargets {
         slot_targets,
         capture_targets,
-        lexical_close_scope_starts,
+        lexical_scopes,
         entry_local_decls,
         region_local_decls,
     }
 }
 
-fn collect_lexical_close_scope_starts(
+fn collect_lexical_close_scopes(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     epochs: &SlotEpochFacts,
     captured_uses: &[CapturedSlotUse],
-) -> BTreeMap<usize, usize> {
+) -> Vec<std::ops::Range<usize>> {
     let mut starts_by_key = BTreeMap::<CapturedSlotKey, BTreeSet<usize>>::new();
     let local_keys = captured_uses
         .iter()
@@ -394,34 +394,11 @@ fn collect_lexical_close_scope_starts(
             )
             && !scope_window_open_def_escapes(dataflow, start, close_instr, close.from)
         {
-            candidates.push((start, close_instr));
-        }
-    }
-
-    // VM close ranges are nested or disjoint. If recovered capture starts would make two
-    // intervals cross, neither interval is precise enough to materialize at HIR level.
-    let mut retained = vec![true; candidates.len()];
-    for left in 0..candidates.len() {
-        for right in left + 1..candidates.len() {
-            let (left_start, left_close) = candidates[left];
-            let (right_start, right_close) = candidates[right];
-            let crosses =
-                (left_start < right_start && right_start < left_close && left_close < right_close)
-                    || (right_start < left_start
-                        && left_start < right_close
-                        && right_close < left_close);
-            if crosses {
-                retained[left] = false;
-                retained[right] = false;
-            }
+            candidates.push(start..close_instr + 1);
         }
     }
 
     candidates
-        .into_iter()
-        .zip(retained)
-        .filter_map(|((start, close), retained)| retained.then_some((close, start)))
-        .collect()
 }
 
 fn scope_window_local_def_escapes(
@@ -491,7 +468,7 @@ fn scope_window_open_def_escapes(
         })
 }
 
-fn lexical_scope_evaluation_start(
+pub(super) fn lexical_scope_evaluation_start(
     dataflow: &DataflowFacts,
     cfg: &Cfg,
     block: BlockRef,

@@ -426,10 +426,7 @@ pub(super) fn freeze_condition_value(
             continue;
         }
         let values = incoming_edges.map(|edge| {
-            let incoming = phi
-                .incoming
-                .iter()
-                .find(|incoming| incoming.edge == Some(edge))?;
+            let incoming = dataflow.phi_incoming_for_edge(phi.id, edge)?;
             let SsaValue::Def(def) = incoming.value else {
                 return None;
             };

@@ -56,6 +56,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             self.emitted_label_count += 1;
         }
         stmts.push(HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: payload.entry_cleanup.clone(),
             id: HirLabelId(label.index()),
             tbc_barriers: payload.tbc_barriers.clone(),
         })));

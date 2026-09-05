@@ -484,6 +484,7 @@ pub(super) fn validate_loop_plans(
                 });
             let cleanup_location_is_valid = if tail.cleanup_block == tail.block {
                 tail.cleanup_route.is_empty()
+                    && tail.cleanup.last().map(|instr| instr.index() + 1) == Some(tail.range.end())
                     && tail.cleanup.iter().all(|instr| {
                         instr.index() >= tail.range.start.index()
                             && instr.index() < tail.range.end()

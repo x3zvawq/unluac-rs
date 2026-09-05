@@ -1,33 +1,31 @@
 //! 稳定词法绑定的路径 truthiness 专门化。
 //!
-//! 本模块只服务 branch-control：它依赖已经结构化的 HIR block，并预先证明 Param/Local
-//! 在整个 proto 内没有写入、for binder 或 ByReference capture，随后沿真实 fallthrough
-//! 传播真假事实。事实只改写 `not/and/or` 条件骨架，不进入值表达式，也不把 truthy 原值
-//! 替换成布尔结果。proto 若仍有活跃 goto/label 流，则只分析与它隔离的结构化子树与
-//! 连续 clean fallthrough run；clean `If` arm 及其 tainted child 前缀可继承唯一入口的
-//! header truthiness。tainted block 内只从 entry 与已可达 label 传播事实；direct、嵌套与
-//! 后向 goto 都进入 label 的 must-fact 固定点，结构上不可达或与已知条件矛盾的边不参与
-//! 合流，出口事实也不会泄漏回污染父级。
+//! Param/Local 必须在整个 proto 内没有写入、for binder 或 ByReference capture；绑定稳定性
+//! 由本模块证明，控制流、条件边和不动点调度由共享 HIR CFG 持有。must-fact 合流只保留
+//! 所有可达入边共同成立的真假事实；矛盾条件边不进入合流，循环后续入边可削弱既有事实。
+//! 例如 `if flag then return end; if flag then body end` 的第二个条件可变为 false，
+//! goto、break 和 continue 通过同一 topology 获得相同证明，不重建独立的 label 传播算法。
 //!
-//! 例如 `if flag then break end; if flag then body end` 可删除第二个分支；若 flag 可能被
-//! 赋值、闭包回写则仍保守停用。被引用 label 与任意 goto 会污染所在结构化祖先，未引用
-//! label 不影响词法 fallthrough 证明。
+//! 收敛后只替换条件骨架，不进入值语境，不把 truthy 原值替换成布尔结果。候选表达式地址
+//! 仅关联同一次 HIR 快照的查询与原地改写，不解引用地址；子块完成改写后才截断不可达尾部，
+//! 不移动后续仍待查询的语句。源码身份、控制入口和诊断仍由 DiscardBoundaryFacts 决定保留。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirLabelId, HirLocalDecl, HirProto, HirStmt, HirUnaryOpKind,
-    LocalId, ParamId,
+    HirBlock, HirExpr, HirLValue, HirLocalDecl, HirStmt, HirUnaryOpKind, LocalId, ParamId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::super::expr_facts::expr_truthiness;
+use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 use super::super::logical_simplify::{
     simplify_condition_truthiness_shape_with_safety, simplify_logical_shape_with_safety,
 };
 use super::super::mention::stmts_reference_captured_bindings;
+use super::super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_block};
 use super::DiscardBoundaryFacts;
-use crate::hir::visit::{HirVisitor, visit_proto};
+use crate::hir::visit::{HirVisitor, visit_block};
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum StableBinding {
@@ -65,14 +63,11 @@ impl PathFacts {
         self.0.remove(&StableBinding::Local(local));
     }
 
-    fn intersection(mut paths: Vec<Self>) -> Self {
-        let Some(mut intersection) = paths.pop() else {
-            return Self::default();
-        };
-        intersection
-            .0
-            .retain(|binding, truthy| paths.iter().all(|path| path.get(*binding) == Some(*truthy)));
-        intersection
+    fn intersect(&mut self, incoming: &Self) -> bool {
+        let previous_len = self.0.len();
+        self.0
+            .retain(|binding, truthy| incoming.get(*binding) == Some(*truthy));
+        self.0.len() != previous_len
     }
 }
 
@@ -83,15 +78,15 @@ struct StableBindingIndex {
 }
 
 impl StableBindingIndex {
-    fn new(proto: &HirProto, safety: HirExprSafety) -> Self {
+    fn new(body: &HirBlock, safety: HirExprSafety) -> Self {
         let mut index = Self {
             candidates: BTreeSet::new(),
             unstable: BTreeSet::new(),
             safety,
         };
-        visit_proto(proto, &mut index);
+        visit_block(body, &mut index);
 
-        let captured = stmts_reference_captured_bindings(&proto.body.stmts);
+        let captured = stmts_reference_captured_bindings(&body.stmts);
         index
             .unstable
             .extend(captured.params.into_iter().map(StableBinding::Param));
@@ -160,693 +155,111 @@ impl HirVisitor for StableBindingIndex {
     }
 }
 
-struct Flow {
-    facts: PathFacts,
-    falls_through: bool,
-}
-
-#[derive(Clone, Copy)]
-struct TerminalIfExits {
-    then_target: Option<HirLabelId>,
-    else_target: Option<HirLabelId>,
-}
-
-fn fixed_point_label_facts(
-    block: &HirBlock,
-    entry_facts: PathFacts,
-    stable: &StableBindingIndex,
-) -> BTreeMap<HirLabelId, PathFacts> {
-    let mut label_facts = BTreeMap::new();
-    loop {
-        let mut incoming = BTreeMap::<HirLabelId, Vec<PathFacts>>::new();
-        let _ = analyze_tainted_block(
-            block,
-            AnalysisState::reachable(entry_facts.clone()),
-            &label_facts,
-            stable,
-            &mut incoming,
-        );
-        let next = incoming
-            .into_iter()
-            .filter_map(|(label, facts)| {
-                (!facts.is_empty()).then(|| (label, PathFacts::intersection(facts)))
-            })
-            .collect::<BTreeMap<_, _>>();
-        if next == label_facts {
-            return next;
-        }
-        label_facts = next;
-    }
-}
-
-#[derive(Clone)]
-enum AnalysisState {
-    Reachable(PathFacts),
-    Dead,
-}
-
-impl AnalysisState {
-    fn reachable(facts: PathFacts) -> Self {
-        Self::Reachable(facts)
-    }
-
-    fn facts(&self) -> Option<&PathFacts> {
-        match self {
-            Self::Reachable(facts) => Some(facts),
-            Self::Dead => None,
-        }
-    }
-
-    fn into_rewrite_facts(self) -> Option<PathFacts> {
-        match self {
-            Self::Reachable(facts) => Some(facts),
-            Self::Dead => None,
-        }
-    }
-}
-
-fn analyze_tainted_block(
-    block: &HirBlock,
-    mut state: AnalysisState,
-    label_facts: &BTreeMap<HirLabelId, PathFacts>,
-    stable: &StableBindingIndex,
-    incoming: &mut BTreeMap<HirLabelId, Vec<PathFacts>>,
-) -> AnalysisState {
-    let mut scoped_locals = Vec::new();
-    for stmt in &block.stmts {
-        if let HirStmt::Label(label) = stmt {
-            if let Some(fallthrough) = state.facts().cloned() {
-                incoming.entry(label.id).or_default().push(fallthrough);
-            }
-            let mut predecessors = incoming.get(&label.id).cloned().unwrap_or_default();
-            predecessors.extend(label_facts.get(&label.id).cloned());
-            state = if predecessors.is_empty() {
-                AnalysisState::Dead
-            } else {
-                AnalysisState::reachable(PathFacts::intersection(predecessors))
-            };
-            continue;
-        }
-        if let HirStmt::LocalDecl(local_decl) = stmt {
-            scoped_locals.extend(local_decl.bindings.iter().copied());
-        }
-        state = analyze_tainted_stmt(stmt, state, label_facts, stable, incoming);
-    }
-    if let AnalysisState::Reachable(facts) = &mut state {
-        for local in scoped_locals {
-            facts.remove_local(local);
-        }
-    }
-    state
-}
-
-fn analyze_tainted_stmt(
-    stmt: &HirStmt,
-    state: AnalysisState,
-    label_facts: &BTreeMap<HirLabelId, PathFacts>,
-    stable: &StableBindingIndex,
-    incoming: &mut BTreeMap<HirLabelId, Vec<PathFacts>>,
-) -> AnalysisState {
-    let AnalysisState::Reachable(mut facts) = state else {
-        return AnalysisState::Dead;
-    };
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            record_local_declaration(local_decl, &mut facts, stable);
-            AnalysisState::reachable(facts)
-        }
-        HirStmt::If(if_stmt) => {
-            let then_state = conditional_state(&facts, &if_stmt.cond, true, stable);
-            let else_state = conditional_state(&facts, &if_stmt.cond, false, stable);
-            let then_exit = analyze_tainted_block(
-                &if_stmt.then_block,
-                then_state,
-                label_facts,
-                stable,
-                incoming,
-            );
-            let else_exit = if let Some(else_block) = &if_stmt.else_block {
-                analyze_tainted_block(else_block, else_state, label_facts, stable, incoming)
-            } else {
-                else_state
-            };
-            merge_analysis_states([then_exit, else_exit])
-        }
-        HirStmt::Block(block) => analyze_tainted_block(
-            block,
-            AnalysisState::reachable(facts),
-            label_facts,
-            stable,
-            incoming,
-        ),
-        HirStmt::While(while_stmt) => {
-            let body_state = conditional_state(&facts, &while_stmt.cond, true, stable);
-            let _ =
-                analyze_tainted_block(&while_stmt.body, body_state, label_facts, stable, incoming);
-            AnalysisState::reachable(facts)
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            let _ = analyze_tainted_block(
-                &repeat_stmt.body,
-                AnalysisState::reachable(facts.clone()),
-                label_facts,
-                stable,
-                incoming,
-            );
-            AnalysisState::reachable(facts)
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            let _ = analyze_tainted_block(
-                &numeric_for.body,
-                AnalysisState::reachable(facts.clone()),
-                label_facts,
-                stable,
-                incoming,
-            );
-            AnalysisState::reachable(facts)
-        }
-        HirStmt::GenericFor(generic_for) => {
-            let _ = analyze_tainted_block(
-                &generic_for.body,
-                AnalysisState::reachable(facts.clone()),
-                label_facts,
-                stable,
-                incoming,
-            );
-            AnalysisState::reachable(facts)
-        }
-        HirStmt::Goto(goto) => {
-            incoming.entry(goto.target).or_default().push(facts);
-            AnalysisState::Dead
-        }
-        HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue => AnalysisState::Dead,
-        HirStmt::Assign(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Label(_) => AnalysisState::reachable(facts),
-    }
-}
-
-fn conditional_state(
-    facts: &PathFacts,
-    condition: &HirExpr,
-    truthy: bool,
-    stable: &StableBindingIndex,
-) -> AnalysisState {
-    if expr_truthiness(condition, stable.safety).is_some_and(|known| known != truthy) {
-        return AnalysisState::Dead;
-    }
-    facts_for_condition(facts, condition, truthy, stable)
-        .map_or(AnalysisState::Dead, AnalysisState::reachable)
-}
-
-fn merge_analysis_states(states: impl IntoIterator<Item = AnalysisState>) -> AnalysisState {
-    let facts = states
-        .into_iter()
-        .filter_map(|state| match state {
-            AnalysisState::Reachable(facts) => Some(facts),
-            AnalysisState::Dead => None,
-        })
-        .collect::<Vec<_>>();
-    if facts.is_empty() {
-        AnalysisState::Dead
-    } else {
-        AnalysisState::reachable(PathFacts::intersection(facts))
-    }
-}
-
 pub(super) fn specialize_stable_path_conditions(
-    proto: &mut HirProto,
+    body: &mut HirBlock,
     discard_facts: &DiscardBoundaryFacts,
     safety: HirExprSafety,
 ) -> bool {
-    let stable = StableBindingIndex::new(proto, safety);
-    let mut changed = false;
-    if discard_facts
-        .block_boundary(&proto.body)
-        .has_live_label_flow()
-    {
-        rewrite_clean_islands_in_tainted_block(
-            &mut proto.body,
-            PathFacts::default(),
-            &stable,
-            discard_facts,
-            &mut changed,
-        );
-    } else {
-        rewrite_block(
-            &mut proto.body,
-            PathFacts::default(),
-            &stable,
-            discard_facts,
-            &mut changed,
-        );
-    }
-    changed
-}
-
-fn rewrite_clean_islands_in_tainted_block(
-    block: &mut HirBlock,
-    entry_facts: PathFacts,
-    stable: &StableBindingIndex,
-    discard_facts: &DiscardBoundaryFacts,
-    changed: &mut bool,
-) {
-    let complete_label_facts = fixed_point_label_facts(block, entry_facts.clone(), stable);
-    let mut run_facts = Some(entry_facts);
-    for stmt in &mut block.stmts {
-        if !discard_facts.stmt_boundary(stmt).has_live_label_flow() {
-            let run_is_reachable = run_facts.is_some();
-            let flow = rewrite_stmt(
-                stmt,
-                run_facts.take().unwrap_or_default(),
-                stable,
-                discard_facts,
-                changed,
-            );
-            run_facts = (run_is_reachable && flow.falls_through).then_some(flow.facts);
-            continue;
-        }
-
-        if matches!(stmt, HirStmt::Goto(_)) {
-            run_facts = None;
-            continue;
-        }
-
-        if let Some(fallthrough_facts) =
-            rewrite_terminal_if_exits(stmt, run_facts.clone(), stable, discard_facts, changed)
-        {
-            run_facts = fallthrough_facts;
-            continue;
-        }
-
-        if let HirStmt::Label(label) = stmt {
-            run_facts = complete_label_facts.get(&label.id).cloned();
-            continue;
-        }
-
-        let mut ignored_incoming = BTreeMap::new();
-        let exit_facts = analyze_tainted_stmt(
-            stmt,
-            run_facts
-                .clone()
-                .map_or(AnalysisState::Dead, AnalysisState::reachable),
-            &complete_label_facts,
-            stable,
-            &mut ignored_incoming,
-        )
-        .into_rewrite_facts();
-        rewrite_clean_child_blocks(
-            stmt,
-            run_facts.clone().unwrap_or_default(),
-            stable,
-            discard_facts,
-            changed,
-        );
-        run_facts = exit_facts;
-    }
-}
-
-fn rewrite_terminal_if_exits(
-    stmt: &mut HirStmt,
-    entry_facts: Option<PathFacts>,
-    stable: &StableBindingIndex,
-    discard_facts: &DiscardBoundaryFacts,
-    changed: &mut bool,
-) -> Option<Option<PathFacts>> {
-    let exits = terminal_if_exits(stmt, discard_facts)?;
-    let HirStmt::If(if_stmt) = stmt else {
-        unreachable!("terminal if exits must belong to an if")
+    let stable = StableBindingIndex::new(body, safety);
+    let Ok(graph) = HirFlowGraph::for_proto(body, safety) else {
+        // 候选拒绝[ProofIncomplete]：歧义 label 不能建立唯一控制流，不在消费者重猜入口。
+        return false;
     };
-    let reachable = entry_facts.is_some();
-    let entry_facts = entry_facts.unwrap_or_default();
-    if reachable {
-        *changed |= specialize_condition(&mut if_stmt.cond, &entry_facts, stable);
-    }
-    let then_facts = reachable
-        .then(|| facts_for_condition(&entry_facts, &if_stmt.cond, true, stable))
-        .flatten();
-    let else_facts = reachable
-        .then(|| facts_for_condition(&entry_facts, &if_stmt.cond, false, stable))
-        .flatten();
-
-    let then_fallthrough = rewrite_terminal_if_arm(
-        &mut if_stmt.then_block,
-        exits.then_target,
-        then_facts,
-        stable,
-        discard_facts,
-        changed,
+    let candidates = graph.solve_forward(
+        PathFacts::default(),
+        PathFacts::intersect,
+        |id, kind, facts| {
+            if let HirFlowNodeKind::Stmt(HirStmt::LocalDecl(decl)) = kind {
+                record_local_declaration(decl, facts, &stable);
+            }
+            let condition = graph.nodes()[id.index()].condition()?;
+            let mut replacement = condition.clone();
+            specialize_condition(&mut replacement, facts, &stable)
+                .then_some((std::ptr::from_ref(condition), replacement))
+        },
+        |condition, truthy, facts| match facts_for_condition(facts, condition, truthy, &stable) {
+            None => FlowRefinement::Unreachable,
+            Some(refined) if refined == *facts => FlowRefinement::Unchanged,
+            Some(refined) => FlowRefinement::Refined(refined),
+        },
     );
-    let else_fallthrough = if let Some(else_block) = &mut if_stmt.else_block {
-        rewrite_terminal_if_arm(
-            else_block,
-            exits.else_target,
-            else_facts,
-            stable,
+    let mut replacements = BTreeMap::new();
+    let mut live_stmts = BTreeSet::new();
+    for (node, candidate) in graph.nodes().iter().zip(candidates) {
+        if candidate.is_some()
+            && let Some(stmt) = node.owner_stmt()
+        {
+            live_stmts.insert(std::ptr::from_ref(stmt));
+        }
+        if let Some(Some((condition, replacement))) = candidate {
+            replacements.insert(condition, replacement);
+        }
+    }
+    rewrite_block(
+        body,
+        &mut PathConditionRewrite {
+            replacements,
+            live_stmts,
             discard_facts,
-            changed,
-        )
-    } else {
-        debug_assert!(exits.else_target.is_none());
-        else_facts
-    };
-    let fallthroughs = [then_fallthrough, else_fallthrough]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    Some((!fallthroughs.is_empty()).then(|| PathFacts::intersection(fallthroughs)))
+        },
+    )
 }
 
-fn rewrite_terminal_if_arm(
-    block: &mut HirBlock,
-    target: Option<HirLabelId>,
-    facts: Option<PathFacts>,
-    stable: &StableBindingIndex,
-    discard_facts: &DiscardBoundaryFacts,
-    changed: &mut bool,
-) -> Option<PathFacts> {
-    let reachable = facts.is_some();
-    let flow = if target.is_some() {
-        rewrite_terminal_goto_prefix(
-            block,
-            facts.unwrap_or_default(),
-            stable,
-            discard_facts,
-            changed,
-        )
-    } else {
-        rewrite_block(
-            block,
-            facts.unwrap_or_default(),
-            stable,
-            discard_facts,
-            changed,
-        )
-    };
-    if target.is_some() {
-        None
-    } else {
-        (reachable && flow.falls_through).then_some(flow.facts)
+struct PathConditionRewrite<'a, 'b> {
+    replacements: BTreeMap<*const HirExpr, HirExpr>,
+    live_stmts: BTreeSet<*const HirStmt>,
+    discard_facts: &'a DiscardBoundaryFacts<'b>,
+}
+
+impl HirRewritePass for PathConditionRewrite<'_, '_> {
+    const PRESERVES_GENERIC_FOR_INITIALIZER_TRANSACTION: bool = true;
+
+    fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
+        // Block 没有独立求值事件；repeat 的条件也可能被 body 的 return 绕过。
+        // 后序只合并子树已经求出的可达性，不重新解释控制结构或传播抽象状态。
+        let mut live_child = false;
+        for_each_nested_block_mut(stmt, &mut |block| {
+            live_child |= block
+                .stmts
+                .iter()
+                .any(|stmt| self.live_stmts.contains(&std::ptr::from_ref(stmt)));
+        });
+        if live_child {
+            self.live_stmts.insert(std::ptr::from_ref(stmt));
+        }
+        false
     }
-}
 
-fn terminal_if_exits(
-    stmt: &HirStmt,
-    discard_facts: &DiscardBoundaryFacts,
-) -> Option<TerminalIfExits> {
-    let HirStmt::If(if_stmt) = stmt else {
-        return None;
-    };
-    let then_target = terminal_or_clean_arm(&if_stmt.then_block, discard_facts)?;
-    let else_target = if let Some(else_block) = &if_stmt.else_block {
-        terminal_or_clean_arm(else_block, discard_facts)?
-    } else {
-        None
-    };
-    (then_target.is_some() || else_target.is_some()).then_some(TerminalIfExits {
-        then_target,
-        else_target,
-    })
-}
-
-fn terminal_or_clean_arm(
-    block: &HirBlock,
-    discard_facts: &DiscardBoundaryFacts,
-) -> Option<Option<HirLabelId>> {
-    if !discard_facts.block_boundary(block).has_live_label_flow() {
-        Some(None)
-    } else {
-        terminal_clean_goto(block, discard_facts).map(Some)
-    }
-}
-
-fn terminal_clean_goto(
-    block: &HirBlock,
-    discard_facts: &DiscardBoundaryFacts,
-) -> Option<HirLabelId> {
-    let (HirStmt::Goto(goto), prefix) = block.stmts.split_last()? else {
-        return None;
-    };
-    (!discard_facts.stmts_boundary(prefix).has_live_label_flow()).then_some(goto.target)
-}
-
-fn rewrite_terminal_goto_prefix(
-    block: &mut HirBlock,
-    facts: PathFacts,
-    stable: &StableBindingIndex,
-    discard_facts: &DiscardBoundaryFacts,
-    changed: &mut bool,
-) -> Flow {
-    let goto = block
-        .stmts
-        .pop()
-        .expect("terminal guarded goto block must end in goto");
-    debug_assert!(matches!(goto, HirStmt::Goto(_)));
-    let flow = rewrite_block(block, facts, stable, discard_facts, changed);
-    block.stmts.push(goto);
-    flow
-}
-
-fn rewrite_clean_child_blocks(
-    stmt: &mut HirStmt,
-    entry_facts: PathFacts,
-    stable: &StableBindingIndex,
-    discard_facts: &DiscardBoundaryFacts,
-    changed: &mut bool,
-) {
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            *changed |= specialize_condition(&mut if_stmt.cond, &entry_facts, stable);
+    fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        let retained_len = block
+            .stmts
+            .iter()
+            .rposition(|stmt| self.live_stmts.contains(&std::ptr::from_ref(stmt)))
+            .map_or(0, |index| index + 1);
+        if retained_len == block.stmts.len() {
+            return false;
         }
-        HirStmt::While(while_stmt) => {
-            *changed |= specialize_condition(&mut while_stmt.cond, &entry_facts, stable);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            *changed |= specialize_condition(&mut repeat_stmt.cond, &entry_facts, stable);
-        }
-        _ => {}
-    }
-    let mut rewrite_child = |block: &mut HirBlock, facts: PathFacts| {
-        if discard_facts.block_boundary(block).has_live_label_flow() {
-            rewrite_clean_islands_in_tainted_block(block, facts, stable, discard_facts, changed);
-        } else {
-            let _ = rewrite_block(block, facts, stable, discard_facts, changed);
-        }
-    };
-
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            let then_facts = facts_for_condition(&entry_facts, &if_stmt.cond, true, stable)
-                .unwrap_or_else(|| entry_facts.clone());
-            let else_facts = facts_for_condition(&entry_facts, &if_stmt.cond, false, stable)
-                .unwrap_or_else(|| entry_facts.clone());
-            rewrite_child(&mut if_stmt.then_block, then_facts);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                rewrite_child(else_block, else_facts);
-            }
-        }
-        HirStmt::While(while_stmt) => {
-            let body_facts = facts_for_condition(&entry_facts, &while_stmt.cond, true, stable)
-                .unwrap_or_else(|| entry_facts.clone());
-            rewrite_child(&mut while_stmt.body, body_facts);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            rewrite_child(&mut repeat_stmt.body, entry_facts);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            rewrite_child(&mut numeric_for.body, entry_facts);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            rewrite_child(&mut generic_for.body, entry_facts);
-        }
-        HirStmt::Block(block) => rewrite_child(block, entry_facts),
-        HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_) => {}
-    }
-}
-
-fn rewrite_block(
-    block: &mut HirBlock,
-    mut facts: PathFacts,
-    stable: &StableBindingIndex,
-    discard_facts: &DiscardBoundaryFacts,
-    changed: &mut bool,
-) -> Flow {
-    let mut scoped_locals = Vec::new();
-    let mut falls_through = true;
-    let mut retained_len = block.stmts.len();
-
-    for (index, stmt) in block.stmts.iter_mut().enumerate() {
-        if let HirStmt::LocalDecl(local_decl) = stmt {
-            scoped_locals.extend(local_decl.bindings.iter().copied());
-        }
-        let flow = rewrite_stmt(stmt, facts, stable, discard_facts, changed);
-        facts = flow.facts;
-        falls_through = flow.falls_through;
-        if !falls_through {
-            retained_len = index + 1;
-            break;
-        }
-    }
-    if retained_len != block.stmts.len() {
-        let boundary = discard_facts.stmts_boundary(&block.stmts[retained_len..]);
+        let boundary = self
+            .discard_facts
+            .stmts_boundary(&block.stmts[retained_len..]);
         if boundary.has_control_entry() {
-            // 候选拒绝[SemanticBarrier:ControlFlow]：全局 label 引用数大于尾部内部引用数，如前缀 `goto L` 指向被截尾的 `::L::`；删除尾部会丢失确定入边。
-        } else if boundary.has_identity() {
-            // 候选拒绝[PolicyBoundary]：尾部 debug/PhysicalRoot/TBC 身份按源码证据策略保留（regress339 retain-debug）。
-        } else if boundary.has_diagnostic() {
-            // 候选拒绝[PolicyBoundary]：项目保留不可达尾部中的 ErrNil/Unresolved
-            // permissive 诊断，路径专门化不吞掉失败证据（regress339 Lua 5.5 ERRNNIL）。
-        } else {
-            block.stmts.truncate(retained_len);
-            *changed = true;
+            // 候选拒绝[SemanticBarrier:ControlFlow]：词法引用仍指向尾部，不能留下失配的 goto。
+            return false;
         }
+        if boundary.has_identity() || boundary.has_diagnostic() {
+            // 候选拒绝[PolicyBoundary]：保留不可达 debug/PhysicalRoot/TBC 身份及 permissive 诊断。
+            return false;
+        }
+        block.stmts.truncate(retained_len);
+        true
     }
 
-    for local in scoped_locals {
-        facts.remove_local(local);
-    }
-    Flow {
-        facts,
-        falls_through,
-    }
-}
-
-fn rewrite_stmt(
-    stmt: &mut HirStmt,
-    mut facts: PathFacts,
-    stable: &StableBindingIndex,
-    discard_facts: &DiscardBoundaryFacts,
-    changed: &mut bool,
-) -> Flow {
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => {
-            record_local_declaration(local_decl, &mut facts, stable);
-        }
-        HirStmt::If(if_stmt) => {
-            *changed |= specialize_condition(&mut if_stmt.cond, &facts, stable);
-            let condition_truthiness = expr_truthiness(&if_stmt.cond, stable.safety);
-            let then_facts = facts_for_condition(&facts, &if_stmt.cond, true, stable);
-            let else_facts = facts_for_condition(&facts, &if_stmt.cond, false, stable);
-            let then_reachable = condition_truthiness != Some(false) && then_facts.is_some();
-            let else_reachable = condition_truthiness != Some(true) && else_facts.is_some();
-
-            let then_flow = rewrite_block(
-                &mut if_stmt.then_block,
-                then_facts.unwrap_or_else(|| facts.clone()),
-                stable,
-                discard_facts,
-                changed,
-            );
-            let else_flow = if_stmt.else_block.as_mut().map(|else_block| {
-                rewrite_block(
-                    else_block,
-                    else_facts.clone().unwrap_or_else(|| facts.clone()),
-                    stable,
-                    discard_facts,
-                    changed,
-                )
-            });
-            let then_falls_through = then_reachable && then_flow.falls_through;
-            let else_falls_through =
-                else_reachable && else_flow.as_ref().is_none_or(|flow| flow.falls_through);
-
-            let mut exits = Vec::new();
-            if then_falls_through {
-                exits.push(then_flow.facts);
-            }
-            if else_reachable {
-                if let Some(else_flow) = else_flow {
-                    if else_flow.falls_through {
-                        exits.push(else_flow.facts);
-                    }
-                } else if let Some(else_facts) = else_facts {
-                    exits.push(else_facts);
-                }
-            }
-            return Flow {
-                facts: PathFacts::intersection(exits),
-                falls_through: then_falls_through || else_falls_through,
-            };
-        }
-        HirStmt::While(while_stmt) => {
-            *changed |= specialize_condition(&mut while_stmt.cond, &facts, stable);
-            let body_facts = facts_for_condition(&facts, &while_stmt.cond, true, stable)
-                .unwrap_or_else(|| facts.clone());
-            rewrite_block(
-                &mut while_stmt.body,
-                body_facts,
-                stable,
-                discard_facts,
-                changed,
-            );
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            rewrite_block(
-                &mut repeat_stmt.body,
-                facts.clone(),
-                stable,
-                discard_facts,
-                changed,
-            );
-            *changed |= specialize_condition(&mut repeat_stmt.cond, &facts, stable);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            rewrite_block(
-                &mut numeric_for.body,
-                facts.clone(),
-                stable,
-                discard_facts,
-                changed,
-            );
-        }
-        HirStmt::GenericFor(generic_for) => {
-            rewrite_block(
-                &mut generic_for.body,
-                facts.clone(),
-                stable,
-                discard_facts,
-                changed,
-            );
-        }
-        HirStmt::Block(block) => {
-            return rewrite_block(block, facts, stable, discard_facts, changed);
-        }
-        HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) => {
-            return Flow {
-                facts,
-                falls_through: false,
-            };
-        }
-        HirStmt::Assign(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Label(_) => {}
-    }
-
-    Flow {
-        facts,
-        falls_through: true,
+    fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
+        let Some(replacement) = self.replacements.remove(&std::ptr::from_ref(expr)) else {
+            return false;
+        };
+        *expr = replacement;
+        true
     }
 }
 
@@ -954,29 +367,25 @@ fn extend_condition_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::super::DiscardBoundaryFacts;
     use super::*;
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{
-        HirGoto, HirIf, HirLabel, HirReturn, HirValuePack, HirWhile, ParamId,
+        HirGoto, HirIf, HirLabel, HirLabelId, HirRepeat, HirReturn, HirValuePack, HirWhile, ParamId,
     };
     use crate::hir::expr_safety::HirExprSafety;
-    use crate::hir::simplify::label_refs::count_label_references;
-
-    fn stable_params(params: impl IntoIterator<Item = ParamId>) -> StableBindingIndex {
-        StableBindingIndex {
-            candidates: params.into_iter().map(StableBinding::Param).collect(),
-            unstable: BTreeSet::new(),
-            safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
-        }
-    }
-
-    fn discard_facts(block: &HirBlock) -> DiscardBoundaryFacts {
-        DiscardBoundaryFacts {
-            protected_locals: BTreeSet::new(),
-            protected_temps: BTreeSet::new(),
-            label_refs: count_label_references(&block.stmts),
-        }
+    fn specialize(block: &mut HirBlock) -> bool {
+        static EMPTY_ROOTS: BTreeSet<LocalId> = BTreeSet::new();
+        let discard = DiscardBoundaryFacts {
+            local_debug_hints: &[],
+            temp_debug_hints: &[],
+            physical_root_locals: &EMPTY_ROOTS,
+            label_refs: crate::hir::simplify::label_refs::count_label_references(&block.stmts),
+        };
+        specialize_stable_path_conditions(
+            block,
+            &discard,
+            HirExprSafety::for_dialect(DecompileDialect::Lua54),
+        )
     }
 
     fn goto(target: HirLabelId) -> HirStmt {
@@ -985,6 +394,7 @@ mod tests {
 
     fn label(id: HirLabelId) -> HirStmt {
         HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id,
             tbc_barriers: Vec::new(),
         }))
@@ -1004,6 +414,7 @@ mod tests {
 
     fn return_stmt() -> HirStmt {
         HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::default(),
         }))
     }
@@ -1051,17 +462,7 @@ mod tests {
                 if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
             ],
         };
-        let stable = stable_params([flag]);
-        let discard_facts = discard_facts(&block);
-        let mut changed = false;
-
-        rewrite_clean_islands_in_tainted_block(
-            &mut block,
-            PathFacts::default(),
-            &stable,
-            &discard_facts,
-            &mut changed,
-        );
+        let changed = specialize(&mut block);
 
         assert!(changed);
         assert_eq!(condition_at(&block, 2), &HirExpr::Boolean(true));
@@ -1088,17 +489,7 @@ mod tests {
                 if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
             ],
         };
-        let stable = stable_params([flag, gate]);
-        let discard_facts = discard_facts(&block);
-        let mut changed = false;
-
-        rewrite_clean_islands_in_tainted_block(
-            &mut block,
-            PathFacts::default(),
-            &stable,
-            &discard_facts,
-            &mut changed,
-        );
+        let changed = specialize(&mut block);
 
         assert!(changed);
         assert_eq!(condition_at(&block, 3), &HirExpr::Boolean(true));
@@ -1124,17 +515,7 @@ mod tests {
                 if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
             ],
         };
-        let stable = stable_params([flag]);
-        let discard_facts = discard_facts(&block);
-        let mut changed = false;
-
-        rewrite_clean_islands_in_tainted_block(
-            &mut block,
-            PathFacts::default(),
-            &stable,
-            &discard_facts,
-            &mut changed,
-        );
+        let changed = specialize(&mut block);
 
         assert!(changed);
         assert_eq!(condition_at(&block, 6), &HirExpr::Boolean(true));
@@ -1159,17 +540,7 @@ mod tests {
                 if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
             ],
         };
-        let stable = stable_params([flag]);
-        let discard_facts = discard_facts(&block);
-        let mut changed = false;
-
-        rewrite_clean_islands_in_tainted_block(
-            &mut block,
-            PathFacts::default(),
-            &stable,
-            &discard_facts,
-            &mut changed,
-        );
+        let changed = specialize(&mut block);
 
         assert!(changed);
         assert_eq!(condition_at(&block, 3), &HirExpr::Boolean(true));
@@ -1192,17 +563,7 @@ mod tests {
                 ),
             ],
         };
-        let stable = stable_params([flag]);
-        let discard_facts = discard_facts(&block);
-        let mut changed = false;
-
-        rewrite_clean_islands_in_tainted_block(
-            &mut block,
-            PathFacts::default(),
-            &stable,
-            &discard_facts,
-            &mut changed,
-        );
+        let changed = specialize(&mut block);
 
         assert!(changed);
         assert_eq!(condition_at(&block, 3), &HirExpr::Boolean(true));
@@ -1227,18 +588,49 @@ mod tests {
                 if_stmt(HirExpr::ParamRef(cycle), vec![goto(left)], None),
             ],
         };
-        let stable = stable_params([flag, jump_right, cycle]);
-        let discard_facts = discard_facts(&block);
-        let mut changed = false;
-
-        rewrite_clean_islands_in_tainted_block(
-            &mut block,
-            PathFacts::default(),
-            &stable,
-            &discard_facts,
-            &mut changed,
-        );
+        specialize(&mut block);
 
         assert_eq!(condition_at(&block, 6), &HirExpr::ParamRef(flag));
+    }
+
+    #[test]
+    fn loop_exit_facts_include_real_break_and_continue_routes() {
+        let flag = ParamId(0);
+        let gate = ParamId(1);
+        for repeat in [false, true] {
+            for has_break in [false, true] {
+                let mut loop_body = Vec::new();
+                if has_break {
+                    loop_body.push(if_stmt(HirExpr::ParamRef(gate), vec![HirStmt::Break], None));
+                }
+                loop_body.push(HirStmt::Continue);
+                let body = HirBlock { stmts: loop_body };
+                let loop_stmt = if repeat {
+                    HirStmt::Repeat(Box::new(HirRepeat {
+                        body,
+                        cond: HirExpr::ParamRef(flag),
+                        lifetime: Default::default(),
+                    }))
+                } else {
+                    HirStmt::While(Box::new(HirWhile {
+                        body,
+                        cond: HirExpr::ParamRef(flag),
+                    }))
+                };
+                let mut block = HirBlock {
+                    stmts: vec![
+                        loop_stmt,
+                        if_stmt(HirExpr::ParamRef(flag), Vec::new(), None),
+                    ],
+                };
+                specialize(&mut block);
+                let expected = if has_break {
+                    HirExpr::ParamRef(flag)
+                } else {
+                    HirExpr::Boolean(repeat)
+                };
+                assert_eq!(condition_at(&block, 1), &expected);
+            }
+        }
     }
 }

@@ -10,6 +10,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::hir::simplify::stmt_plan::{PathComponent, StmtPath, remove_planned_stmts};
+
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
 };
@@ -20,7 +22,6 @@ use super::super::expr_facts::expr_truthiness;
 use super::super::label_refs::count_label_references;
 use super::super::lexical_cfg::LexicalCfg;
 use super::super::local_shapes::empty_single_local_decl_binding;
-use super::super::mention::ReferenceCapturedBindings;
 use super::super::temp_touch::stmt_contains_nested_nonlocal_control;
 use crate::hir::visit::{self, HirVisitor};
 
@@ -123,16 +124,6 @@ enum PruneError {
     BindingInvariant,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum PathComponent {
-    Stmt(usize),
-    Then,
-    Else,
-    Body,
-}
-
-type StmtPath = Vec<PathComponent>;
-
 #[derive(Default)]
 struct PrunePlan {
     redundant: BTreeSet<StmtPath>,
@@ -159,7 +150,7 @@ pub(super) fn prune_redundant_entry_nil_writes(
         return false;
     }
 
-    let debug_identity = debug_identity_bindings(proto);
+    let debug_homes = debug_identity_homes(proto, facts);
     let owner_label_refs = count_label_references(&proto.body.stmts);
     let mut changed = false;
     for index in 0..proto.body.stmts.len() - 1 {
@@ -174,11 +165,14 @@ pub(super) fn prune_redundant_entry_nil_writes(
         let candidate_home = facts
             .trusted_local_home_slot(local)
             .expect("entry-nil phi local must retain its trusted home");
-        if bindings_share_home(&debug_identity, candidate_home, facts) {
+        if debug_homes
+            .as_ref()
+            .is_none_or(|homes| homes.contains(&candidate_home))
+        {
             // 候选拒绝[PolicyBoundary]：候选自身或已证明同 home 的 binding 带 source debug identity 时保留显式 nil 边写，维护源码/调试形状。
             continue;
         }
-        let HirStmt::If(if_stmt) = &proto.body.stmts[index + 1] else {
+        let HirStmt::If(if_stmt) = &mut proto.body.stmts[index + 1] else {
             continue;
         };
 
@@ -211,9 +205,7 @@ pub(super) fn prune_redundant_entry_nil_writes(
             continue;
         }
 
-        let mut rewritten = (**if_stmt).clone();
-        apply_if_plan(&mut rewritten, &analyzer.plan.redundant);
-        proto.body.stmts[index + 1] = HirStmt::If(Box::new(rewritten));
+        apply_if_plan(if_stmt, &analyzer.plan.redundant);
         facts.mark_entry_nil_writes_pruned(local);
         changed = true;
     }
@@ -837,146 +829,54 @@ fn expr_may_reference_home(
 }
 
 fn apply_if_plan(if_stmt: &mut HirIf, redundant: &BTreeSet<StmtPath>) {
-    apply_block_plan(&mut if_stmt.then_block, &[PathComponent::Then], redundant);
+    remove_planned_stmts(
+        &mut if_stmt.then_block,
+        &mut vec![PathComponent::Then],
+        redundant,
+    );
     if let Some(else_block) = &mut if_stmt.else_block {
-        apply_block_plan(else_block, &[PathComponent::Else], redundant);
+        remove_planned_stmts(else_block, &mut vec![PathComponent::Else], redundant);
     }
 }
 
-fn apply_block_plan(
-    block: &mut HirBlock,
-    prefix: &[PathComponent],
-    redundant: &BTreeSet<StmtPath>,
-) {
-    let mut remove = Vec::new();
-    for (index, stmt) in block.stmts.iter_mut().enumerate() {
-        let mut path = prefix.to_vec();
-        path.push(PathComponent::Stmt(index));
-        match stmt {
-            HirStmt::If(if_stmt) => {
-                let mut then_prefix = path.clone();
-                then_prefix.push(PathComponent::Then);
-                apply_block_plan(&mut if_stmt.then_block, &then_prefix, redundant);
-                if let Some(else_block) = &mut if_stmt.else_block {
-                    let mut else_prefix = path.clone();
-                    else_prefix.push(PathComponent::Else);
-                    apply_block_plan(else_block, &else_prefix, redundant);
-                }
-            }
-            HirStmt::While(while_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut while_stmt.body, &body_prefix, redundant);
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut repeat_stmt.body, &body_prefix, redundant);
-            }
-            HirStmt::NumericFor(numeric_for) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut numeric_for.body, &body_prefix, redundant);
-            }
-            HirStmt::GenericFor(generic_for) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut generic_for.body, &body_prefix, redundant);
-            }
-            HirStmt::Block(nested) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(nested, &body_prefix, redundant);
-            }
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
-        if redundant.contains(&path) {
-            remove.push(index);
-        }
-    }
-    for index in remove.into_iter().rev() {
-        block.stmts.remove(index);
-    }
-}
-
-fn debug_identity_bindings(proto: &HirProto) -> ReferenceCapturedBindings {
-    let mut bindings = ReferenceCapturedBindings::default();
-    bindings.locals.extend(
-        proto
-            .locals
-            .iter()
-            .copied()
-            .zip(&proto.local_debug_hints)
-            .filter_map(|(local, hint)| hint.is_some().then_some(local)),
-    );
-    bindings.locals.extend(
-        proto
-            .locals
-            .iter()
-            .copied()
-            .zip(&proto.local_debug_scopes)
-            .filter_map(|(local, scope)| scope.is_some().then_some(local)),
-    );
-    bindings.params.extend(
-        proto
-            .params
-            .iter()
-            .copied()
-            .zip(&proto.param_debug_hints)
-            .filter_map(|(param, hint)| hint.is_some().then_some(param)),
-    );
-    bindings.temps.extend(
-        proto
-            .temps
-            .iter()
-            .copied()
-            .zip(&proto.temp_debug_locals)
-            .filter_map(|(temp, hint)| hint.is_some().then_some(temp)),
-    );
-    bindings.temps.extend(
-        proto
-            .temps
-            .iter()
-            .copied()
-            .zip(&proto.temp_debug_scopes)
-            .filter_map(|(temp, scope)| scope.is_some().then_some(temp)),
-    );
-    bindings
-}
-
-fn bindings_share_home(
-    bindings: &ReferenceCapturedBindings,
-    candidate: HomeSlotKey,
+fn debug_identity_homes(
+    proto: &HirProto,
     facts: &ProtoPromotionFacts,
-) -> bool {
-    bindings.locals.iter().any(|binding| {
-        facts
-            .possible_local_home_slots(*binding)
-            .as_ref()
-            .is_none_or(|homes| homes.contains(&candidate))
-    }) || bindings.params.iter().any(|binding| {
-        facts
-            .possible_param_home_slots(*binding)
-            .as_ref()
-            .is_none_or(|homes| homes.contains(&candidate))
-    }) || bindings.temps.iter().any(|binding| {
-        facts
-            .possible_temp_home_slots(*binding)
-            .as_ref()
-            .is_none_or(|homes| homes.contains(&candidate))
-    })
+) -> Option<BTreeSet<HomeSlotKey>> {
+    let locals = proto
+        .locals
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            matches!(proto.local_debug_hints.get(*index), Some(Some(_)))
+                || matches!(proto.local_debug_scopes.get(*index), Some(Some(_)))
+        })
+        .map(|(_, local)| facts.possible_local_home_slots(*local));
+    let params = proto
+        .params
+        .iter()
+        .zip(&proto.param_debug_hints)
+        .filter_map(|(param, hint)| {
+            hint.as_ref()
+                .map(|_| facts.possible_param_home_slots(*param))
+        });
+    let temps = proto
+        .temps
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            matches!(proto.temp_debug_locals.get(*index), Some(Some(_)))
+                || matches!(proto.temp_debug_scopes.get(*index), Some(Some(_)))
+        })
+        .map(|(_, temp)| facts.possible_temp_home_slots(*temp));
+    // home 映射在本 pass 内不变；未知来源保护任意 home，明确 home-free 则不贡献条目。
+    locals
+        .chain(params)
+        .chain(temps)
+        .try_fold(BTreeSet::new(), |mut homes, possible| {
+            homes.extend(possible?.iter().copied());
+            Some(homes)
+        })
 }
 
 #[cfg(test)]
@@ -997,6 +897,7 @@ mod tests {
 
     fn label(id: HirLabelId) -> HirStmt {
         HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id,
             tbc_barriers: Vec::new(),
         }))
@@ -1078,11 +979,16 @@ mod tests {
         let mut facts = ProtoPromotionFacts::default();
         facts.record_local_home_slot(debug_local, first);
         facts.record_local_home_merge(debug_local, Some(BTreeSet::from([candidate])));
-        let mut debug = ReferenceCapturedBindings::default();
-        debug.locals.insert(debug_local);
+        let mut proto = empty_proto();
+        proto.locals = vec![debug_local];
+        proto.local_debug_hints = vec![Some("debug".into())];
 
         assert_eq!(facts.trusted_local_home_slot(debug_local), None);
-        assert!(bindings_share_home(&debug, candidate, &facts));
+        assert!(
+            debug_identity_homes(&proto, &facts)
+                .unwrap()
+                .contains(&candidate)
+        );
     }
 
     #[test]
@@ -1097,9 +1003,14 @@ mod tests {
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![Some(2)];
 
-        let identities = debug_identity_bindings(&proto);
-        assert!(identities.locals.contains(&local));
-        assert!(identities.temps.contains(&temp));
+        let local_home = HomeSlotKey::new(0, 0);
+        let temp_home = HomeSlotKey::new(1, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_local_home_slot(local, local_home);
+        facts.record_temp_home_slot_for_test(temp, temp_home);
+        let homes = debug_identity_homes(&proto, &facts).unwrap();
+        assert!(homes.contains(&local_home));
+        assert!(homes.contains(&temp_home));
     }
 
     #[test]

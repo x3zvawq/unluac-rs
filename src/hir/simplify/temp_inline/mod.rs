@@ -3575,6 +3575,7 @@ mod tests {
                     method_rewrite_transaction: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![
                         HirExpr::TempRef(TempId(0)),
                         HirExpr::TempRef(TempId(1)),
@@ -3624,6 +3625,7 @@ mod tests {
                     method_rewrite_transaction: None,
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::expanding(
                         vec![HirExpr::TempRef(TempId(0)), HirExpr::TempRef(TempId(1))],
                         HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
@@ -3917,6 +3919,7 @@ mod tests {
             stmts: vec![
                 prefix,
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
                 })),
             ],
@@ -4266,7 +4269,9 @@ mod tests {
         ));
 
         let close = [HirStmt::Close(Box::new(crate::hir::common::HirClose {
+            kind: crate::transformer::CloseKind::Explicit,
             from_reg: 1,
+            origins: Vec::new(),
         }))];
         assert!(!repeat_head_dependencies_are_stable(
             &value,
@@ -4660,6 +4665,7 @@ mod tests {
             cond: HirExpr::Boolean(true),
             then_block: HirBlock {
                 stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::Integer(1)]),
                 }))],
             },
@@ -4674,6 +4680,7 @@ mod tests {
 
         let label_id = crate::hir::common::HirLabelId(0);
         let label = HirStmt::Label(Box::new(crate::hir::common::HirLabel {
+            entry_cleanup: Vec::new(),
             id: label_id,
             tbc_barriers: Vec::new(),
         }));
@@ -4708,13 +4715,21 @@ mod tests {
             &facts,
         ));
         assert!(root_nil_pack_gap_preserves_slots(
-            &HirStmt::Close(Box::new(crate::hir::common::HirClose { from_reg: 1 })),
+            &HirStmt::Close(Box::new(crate::hir::common::HirClose {
+                kind: crate::transformer::CloseKind::Explicit,
+                from_reg: 1,
+                origins: Vec::new()
+            })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::from([HomeSlotKey::new(0, 0)]),
             &facts,
         ));
         assert!(!root_nil_pack_gap_preserves_slots(
-            &HirStmt::Close(Box::new(crate::hir::common::HirClose { from_reg: 0 })),
+            &HirStmt::Close(Box::new(crate::hir::common::HirClose {
+                kind: crate::transformer::CloseKind::Explicit,
+                from_reg: 0,
+                origins: Vec::new()
+            })),
             &BTreeSet::from([TempId(0)]),
             &BTreeSet::from([HomeSlotKey::new(0, 0)]),
             &facts,
@@ -5188,6 +5203,7 @@ mod tests {
                     ),
                     assign(captured_temp, HirExpr::Integer(7)),
                     HirStmt::Return(Box::new(HirReturn {
+                        source_instr: None,
                         values: HirValuePack::fixed(vec![
                             HirExpr::TempRef(captured_temp),
                             HirExpr::TempRef(closure_temp),
@@ -5213,7 +5229,7 @@ mod tests {
         );
         assert_eq!(
             captured_rebind.inline_dispositions.temp(captured_temp),
-            crate::hir::common::HirInlineDisposition::Preserve(BTreeSet::from([
+            &crate::hir::common::HirInlineDisposition::Preserve(BTreeSet::from([
                 HirInlineRetentionReason::CapturedValueEpoch,
             ]))
         );

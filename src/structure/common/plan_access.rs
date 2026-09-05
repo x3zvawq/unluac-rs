@@ -39,7 +39,7 @@ pub struct StructurePlan {
     pub(in crate::structure) value_decision_region_by_plan: Vec<RegionId>,
     pub(in crate::structure) value_decision_by_phi: Vec<Option<ValueDecisionPlanId>>,
     pub(in crate::structure) scopes: Vec<ScopePlan>,
-    pub(in crate::structure) tbc_scopes: Vec<TbcScopePlan>,
+    pub(in crate::structure) tbc_flow: crate::structure::scope::TbcFlowFacts,
     pub(in crate::structure) phis: Vec<super::super::plan::PhiPlan>,
     pub(in crate::structure) phis_by_block: Vec<Vec<PhiId>>,
     pub(in crate::structure) phis_by_region: Vec<Vec<PhiId>>,
@@ -47,6 +47,13 @@ pub struct StructurePlan {
 }
 
 impl StructurePlan {
+    pub(crate) fn cleanup_tbc_origins(
+        &self,
+        instr: crate::transformer::InstrRef,
+    ) -> Option<&BTreeSet<crate::transformer::InstrRef>> {
+        self.tbc_flow.close_origins(instr)
+    }
+
     pub const fn root(&self) -> RegionId {
         self.root
     }
@@ -306,10 +313,6 @@ impl StructurePlan {
 
     pub(crate) fn scope(&self, id: ScopePlanId) -> Option<&ScopePlan> {
         self.scopes.get(id.index())
-    }
-
-    pub fn tbc_scope(&self, id: TbcScopePlanId) -> Option<&TbcScopePlan> {
-        self.tbc_scopes.get(id.index())
     }
 
     pub fn branches(&self) -> impl ExactSizeIterator<Item = (BranchPlanId, &BranchPlanData)> {

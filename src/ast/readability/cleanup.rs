@@ -783,10 +783,9 @@ fn closure_target_needs_scope_barrier(
         return matches!(binding.rewrite_authority, AstRewriteAuthority::AstOwned);
     }
     match binding {
-        AstBindingRef::Temp(_) => !hir_binding_may_end_before_condition(binding, lifetime),
-        // 缺少 declaration authority 时，SyntheticLocal 可能是 AST 自建身份，不能只凭
-        // 数字碰巧相同就借用 HIR temp certificate。
-        AstBindingRef::SyntheticLocal(_) => true,
+        AstBindingRef::Temp(_) | AstBindingRef::SyntheticLocal(_) => {
+            !hir_binding_may_end_before_condition(binding, lifetime)
+        }
         AstBindingRef::Local(_) => false,
     }
 }
@@ -1446,6 +1445,7 @@ mod tests {
 
         let marker = global_name("marker");
         let mut wildcard_extension = AstModule {
+            next_synthetic_local: 0,
             entry_function: HirProtoRef(0),
             body: AstBlock {
                 stmts: vec![

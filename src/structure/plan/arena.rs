@@ -810,7 +810,8 @@ pub(super) fn build(
     {
         loop_partitions = build_loop_partitions(proto, cfg, graph_facts, caps, &input)?;
     }
-    let mut arena = build_regions(cfg, graph_facts, &input, &loop_partitions)?;
+    let tbc_flow = crate::structure::scope::analyze_tbc_flow(proto, cfg);
+    let mut arena = build_regions(proto, cfg, graph_facts, &input, &loop_partitions, &tbc_flow)?;
     prune_non_iteration_branch_tail_continues(
         proto,
         cfg,
@@ -857,20 +858,18 @@ pub(super) fn build(
             let forward_route = semantics
                 .forward_routes
                 .binding_for_transfer(edge_ref, transfer);
-            let action_placement =
-                freeze_edge_action_placement(proto, cfg, &arena, &input, edge_ref, transfer);
             EdgePlan {
                 edge: edge_ref,
                 owner,
                 transfer,
-                action_placement,
+                action_placement: EdgeActionPlacement::BeforeTransfer,
                 forward_route,
                 phi_copies: Vec::new(),
+                cleanup: Vec::new(),
                 iteration: Vec::new(),
             }
         })
         .collect::<Vec<_>>();
-    let tbc_flow = crate::structure::scope::analyze_tbc_flow(proto, cfg);
     let (labels, label_by_block) = freeze_labels(cfg, &arena, &mut edge_plans, &tbc_flow)?;
 
     let requirements = build_requirements(cfg, caps, &arena, &edge_plans)?;
@@ -905,6 +904,7 @@ pub(super) fn build(
         index_value_decisions(dataflow.phi_candidates.len(), &selected.value_decisions)?;
     let region_count = arena.regions.len();
     Ok(StructurePlan {
+        tbc_flow,
         root,
         regions: arena.regions,
         region_by_block: arena.region_by_block,
@@ -938,7 +938,6 @@ pub(super) fn build(
         value_decision_region_by_plan: selected.value_decision_regions,
         value_decision_by_phi,
         scopes: input.scopes,
-        tbc_scopes: Vec::new(),
         phis: Vec::new(),
         phis_by_block: vec![Vec::new(); cfg.blocks.len()],
         phis_by_region: vec![Vec::new(); region_count],

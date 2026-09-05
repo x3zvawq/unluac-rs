@@ -276,6 +276,17 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         owner: RegionId,
         edge: EdgeRef,
     ) -> Result<Vec<HirStmt>, HirLowerError> {
+        let mut stmts = self.lower_edge_source_effects(owner, edge)?;
+        stmts.extend(self.lower_edge_entry_effects(owner, edge)?);
+        Ok(stmts)
+    }
+
+    /// source 的 carried 值可由 BeforeTrailingCleanup 合同提前发射；目标清理不可随之提前。
+    pub(super) fn lower_edge_source_effects(
+        &self,
+        owner: RegionId,
+        edge: EdgeRef,
+    ) -> Result<Vec<HirStmt>, HirLowerError> {
         let edge_plan = self.lowering.structure.plan().edge_plan(edge).ok_or(
             HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
@@ -293,13 +304,28 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         } else {
             edge_plan.phi_copies.as_slice()
         };
-        let mut stmts = self.lower_edge_copy_set(
+        self.lower_edge_copy_set(
             owner,
             edge,
             direct_copies,
             &edge_plan.iteration,
             edge_plan.transfer,
-        )?;
+        )
+    }
+
+    /// 物理边的目标入口事件先于后续 route；每条 route 边继续保持 copies -> cleanup。
+    pub(super) fn lower_edge_entry_effects(
+        &self,
+        owner: RegionId,
+        edge: EdgeRef,
+    ) -> Result<Vec<HirStmt>, HirLowerError> {
+        let plan = self.lowering.structure.plan();
+        let edge_plan = self.planned_edge(owner, edge)?;
+        let mut stmts = if plan.edge_action_is_forwarded_only(edge) {
+            Vec::new()
+        } else {
+            self.lower_edge_cleanups(owner, &edge_plan.cleanup)?
+        };
         if let Some(route) = edge_plan.forward_route {
             for action_edge in self
                 .lowering
@@ -324,9 +350,36 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     &[],
                     edge_plan.transfer,
                 )?);
+                stmts.extend(self.lower_edge_cleanups(owner, &action_plan.cleanup)?);
             }
         }
         Ok(stmts)
+    }
+
+    fn lower_edge_cleanups(
+        &self,
+        owner: RegionId,
+        actions: &[crate::structure::EdgeCleanupAction],
+    ) -> Result<Vec<HirStmt>, HirLowerError> {
+        actions
+            .iter()
+            .map(|action| {
+                let Some(LowInstr::Close(close)) =
+                    self.lowering.proto.instrs.get(action.instr.index())
+                else {
+                    return Err(HirLowerError::InvalidPlanRegion {
+                        proto: self.proto.index(),
+                        region: owner.index(),
+                        detail: "edge cleanup references a non-Close instruction",
+                    });
+                };
+                Ok(HirStmt::Close(Box::new(crate::hir::HirClose {
+                    from_reg: close.from.index(),
+                    kind: close.kind,
+                    origins: action.origins.clone(),
+                })))
+            })
+            .collect()
     }
 
     pub(super) fn lower_edge_copy_set(

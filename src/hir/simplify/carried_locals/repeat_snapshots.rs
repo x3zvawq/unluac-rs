@@ -345,6 +345,7 @@ mod tests {
 
     fn return_temp(temp: TempId) -> HirStmt {
         HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
         }))
     }
@@ -449,7 +450,11 @@ mod tests {
         assert!(!trusted_same_raw_home_merge(false, Some(home), None));
 
         let cleanup = HirBlock {
-            stmts: vec![HirStmt::Close(Box::new(HirClose { from_reg: 2 }))],
+            stmts: vec![HirStmt::Close(Box::new(HirClose {
+                kind: crate::transformer::CloseKind::Explicit,
+                from_reg: 2,
+                origins: Vec::new(),
+            }))],
         };
         assert!(stmt_contains_loop_exit(&cleanup, false));
         assert!(!stmt_contains_loop_exit(&cleanup, true));

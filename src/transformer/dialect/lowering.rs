@@ -154,12 +154,7 @@ impl PendingLoweringState {
 
         Ok((
             instrs,
-            LoweringMap {
-                low_to_raw,
-                raw_to_low: self.raw_to_low.clone(),
-                pc_map,
-                line_hints,
-            },
+            LoweringMap::new(low_to_raw, self.raw_to_low.clone(), pc_map, line_hints),
         ))
     }
 

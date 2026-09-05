@@ -33,7 +33,7 @@ pub(super) fn debug_local_hint_for_reg_at_instr(
 ) -> Option<DebugBindingHint> {
     let pc = proto
         .lowering_map
-        .pc_map
+        .pc_map()
         .get(instr.index())?
         .first()
         .copied()?;
@@ -76,7 +76,7 @@ pub(super) fn debug_local_name_for_reg_in_blocks(
             let instr = cfg.blocks[block.index()].instrs.start;
             let pc = proto
                 .lowering_map
-                .pc_map
+                .pc_map()
                 .get(instr.index())?
                 .first()
                 .copied()?;

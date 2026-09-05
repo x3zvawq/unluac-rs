@@ -268,7 +268,16 @@ pub(super) fn lower_regular_instr(
             stmts
         }
         LowInstr::Close(close) => vec![HirStmt::Close(Box::new(HirClose {
+            kind: close.kind,
             from_reg: close.from.index(),
+            origins: lowering
+                .structure
+                .plan()
+                .cleanup_tbc_origins(instr_ref)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
         }))],
         LowInstr::Tbc(tbc) => vec![HirStmt::ToBeClosed(Box::new(HirToBeClosed {
             origin: instr_ref,
@@ -344,31 +353,41 @@ pub(super) fn lower_terminal_instr(
     instr: &LowInstr,
 ) -> Option<Vec<HirStmt>> {
     match instr {
-        LowInstr::Return(ret) => Some(vec![return_stmt(lower_value_pack(
-            lowering, block, instr_ref, ret.values,
-        ))]),
+        LowInstr::Return(ret) => Some(vec![return_stmt(
+            lower_value_pack(lowering, block, instr_ref, ret.values),
+            lowering
+                .pending_frame_returns
+                .contains(&instr_ref)
+                .then_some(instr_ref),
+        )]),
         LowInstr::TailCall(tail_call) => {
             let method_key = lower_method_key(lowering, tail_call.method_name);
             let callee = expr_for_reg_use(lowering, block, instr_ref, tail_call.callee);
-            Some(vec![return_stmt(HirValuePack::expanding(
-                Vec::new(),
-                HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
-                    argument_roots: Vec::new(),
-                    callee,
-                    args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                    method: matches!(tail_call.kind, CallKind::Method),
-                    fastcall: match tail_call.kind {
-                        CallKind::FastCall(args) => Some(args),
-                        CallKind::Normal | CallKind::Method => None,
-                    },
-                    method_key,
-                    // TailCall 不会返回当前 frame，普通 method transaction 因而没有 post-call
-                    // callee root 可接管。HIR 仍保留 raw method 事实；终结表达式能否写成冒号
-                    // 语法由 AST 证明。
-                    callee_root_handoff: None,
-                    method_rewrite_transaction: None,
-                }))),
-            ))])
+            Some(vec![return_stmt(
+                HirValuePack::expanding(
+                    Vec::new(),
+                    HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                        argument_roots: Vec::new(),
+                        callee,
+                        args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
+                        method: matches!(tail_call.kind, CallKind::Method),
+                        fastcall: match tail_call.kind {
+                            CallKind::FastCall(args) => Some(args),
+                            CallKind::Normal | CallKind::Method => None,
+                        },
+                        method_key,
+                        // TailCall 不会返回当前 frame，普通 method transaction 因而没有 post-call
+                        // callee root 可接管。HIR 仍保留 raw method 事实；终结表达式能否写成冒号
+                        // 语法由 AST 证明。
+                        callee_root_handoff: None,
+                        method_rewrite_transaction: None,
+                    }))),
+                ),
+                lowering
+                    .pending_frame_returns
+                    .contains(&instr_ref)
+                    .then_some(instr_ref),
+            )])
         }
         _ => None,
     }

@@ -6,6 +6,10 @@
 //! 位置和引用计数，再按不交叉区间从右向左改写，避免多个 guard 共用 label 时反复全块
 //! 扫描和重建。
 //! 条件能否删除或合并重复求值统一消费入口按目标方言构造的表达式安全上下文。
+//! 身份元数据在 body 改写期间只读借用；label/resource 分析仍按每轮改写前的 body 冻结。
+//! 新建 local 的 debug 空槽与 home-free 事实在 body 改写结束后一起发布。
+//! forward 区域的后写位置和 join 后 mention 各收集一次，声明检查消费同一区域快照，
+//! 不再逐个 binding 重扫后缀；嵌套写入归属其直接外层语句的位置。
 //!
 //! 例如 `if false then body end` 会被删除，`if true then body end` 会保留原 branch block
 //! 的词法作用域后去掉条件壳；已知真值或两臂相同但有求值事件的条件会先物化在独立
@@ -17,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLValue, HirLabelId,
-    HirLocalDecl, HirLogicalExpr, HirProto, HirStmt, HirUnaryOpKind, HirValuePack, LocalId, TempId,
+    HirLocalDecl, HirLogicalExpr, HirProto, HirStmt, HirUnaryOpKind, HirValuePack, LocalId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -25,13 +29,13 @@ use crate::hir::promotion::ProtoPromotionFacts;
 use super::carried_locals::{CarryBinding, single_binding_copy};
 use super::expr_facts::expr_truthiness;
 use super::label_refs::count_label_references;
-use super::lexical_cfg::{LexicalCfg, LexicalCfgFailure};
+use super::lexical_cfg::{LexicalCfgFailure, validate_region_entry};
 use super::logical_simplify::{
     normalize_condition_context, simplify_condition_truthiness_shape_with_safety,
 };
-use super::mention::{stmts_mention_local, stmts_protected_locals};
-use super::walk::{HirRewritePass, rewrite_proto};
-use crate::hir::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
+use super::mention::{stmts_mentioned_locals, stmts_protected_locals};
+use super::walk::{HirRewritePass, rewrite_block};
+use crate::hir::visit::{HirVisitor, visit_block, visit_expr, visit_stmt_structure, visit_stmts};
 
 pub(super) fn fold_branch_control_in_proto(
     proto: &mut HirProto,
@@ -40,11 +44,24 @@ pub(super) fn fold_branch_control_in_proto(
 ) -> bool {
     let mut changed = false;
     loop {
-        let primitive_locals = ImmutablePrimitiveLocals::new(proto);
-        let discard_facts = DiscardBoundaryFacts::new(proto);
-        let forward_move_facts = ForwardBranchMoveFacts::new(proto);
-        let path_changed =
-            path_conditions::specialize_stable_path_conditions(proto, &discard_facts, safety);
+        let primitive_locals = ImmutablePrimitiveLocals::new(&proto.body);
+        let discard_facts = DiscardBoundaryFacts {
+            local_debug_hints: &proto.local_debug_hints,
+            temp_debug_hints: &proto.temp_debug_locals,
+            physical_root_locals: &proto.physical_root_locals,
+            label_refs: count_label_references(&proto.body.stmts),
+        };
+        let forward_move_facts = ForwardBranchMoveFacts {
+            local_debug_hints: &proto.local_debug_hints,
+            local_debug_scopes: &proto.local_debug_scopes,
+            physical_root_locals: &proto.physical_root_locals,
+            resource_locals: stmts_protected_locals(&proto.body.stmts),
+        };
+        let path_changed = path_conditions::specialize_stable_path_conditions(
+            &mut proto.body,
+            &discard_facts,
+            safety,
+        );
         let first_new_local = proto.locals.len();
         let mut pass = BranchControlPass {
             discard_facts: &discard_facts,
@@ -53,7 +70,7 @@ pub(super) fn fold_branch_control_in_proto(
             next_local_index: first_new_local,
             safety,
         };
-        let rewrite_changed = rewrite_proto(proto, &mut pass);
+        let rewrite_changed = rewrite_block(&mut proto.body, &mut pass);
         for index in first_new_local..pass.next_local_index {
             let local = LocalId(index);
             proto.locals.push(local);
@@ -71,8 +88,8 @@ pub(super) fn fold_branch_control_in_proto(
 }
 
 struct BranchControlPass<'a> {
-    discard_facts: &'a DiscardBoundaryFacts,
-    forward_move_facts: &'a ForwardBranchMoveFacts,
+    discard_facts: &'a DiscardBoundaryFacts<'a>,
+    forward_move_facts: &'a ForwardBranchMoveFacts<'a>,
     primitive_locals: &'a ImmutablePrimitiveLocals,
     next_local_index: usize,
     safety: HirExprSafety,
@@ -286,6 +303,15 @@ fn fold_constant_control(
             rewritten.push(stmt);
             continue;
         };
+        // 空 else 不拥有声明、事件或入口；统一其形状，使后续 repeat/guard 消费同一合同。
+        if if_stmt
+            .else_block
+            .as_ref()
+            .is_some_and(|block| block.stmts.is_empty())
+        {
+            if_stmt.else_block = None;
+            changed = true;
+        }
         let arms_are_equal = if_stmt
             .else_block
             .as_ref()
@@ -354,48 +380,17 @@ fn fold_constant_control(
 /// branch-control 只在丢弃不可达代码时消费的 proto 身份与诊断边界。
 ///
 /// `locals` 已经把可保留的源码 local 稳定成 `LocalId`；尚未物化的
-/// debug temp 仍以 `temp_debug_locals` 标记。这里冻结两类身份，不重建 debug scope。
-pub(super) struct DiscardBoundaryFacts {
-    protected_locals: BTreeSet<LocalId>,
-    protected_temps: BTreeSet<TempId>,
+/// debug temp 仍以 `temp_debug_locals` 标记。身份映射直接借用；label 计数属于本轮 body 快照。
+pub(super) struct DiscardBoundaryFacts<'a> {
+    local_debug_hints: &'a [Option<String>],
+    temp_debug_hints: &'a [Option<String>],
+    physical_root_locals: &'a BTreeSet<LocalId>,
     label_refs: BTreeMap<HirLabelId, usize>,
 }
 
-impl DiscardBoundaryFacts {
-    fn new(proto: &HirProto) -> Self {
-        let mut protected_locals = proto.physical_root_locals.clone();
-        protected_locals.extend(
-            proto
-                .locals
-                .iter()
-                .copied()
-                .zip(&proto.local_debug_hints)
-                .filter_map(|(local, hint)| hint.is_some().then_some(local)),
-        );
-        let protected_temps = proto
-            .temps
-            .iter()
-            .copied()
-            .zip(&proto.temp_debug_locals)
-            .filter_map(|(temp, hint)| hint.is_some().then_some(temp))
-            .collect();
-        let label_refs = count_label_references(&proto.body.stmts);
-        Self {
-            protected_locals,
-            protected_temps,
-            label_refs,
-        }
-    }
-
+impl DiscardBoundaryFacts<'_> {
     pub(super) fn block_boundary(&self, block: &HirBlock) -> DiscardBoundary {
-        let mut visitor = DiscardBoundaryVisitor {
-            facts: self,
-            boundary: DiscardBoundary::default(),
-            labels: BTreeSet::new(),
-            internal_label_refs: BTreeMap::new(),
-        };
-        visit_block(block, &mut visitor);
-        visitor.finish()
+        self.stmts_boundary(&block.stmts)
     }
 
     pub(super) fn stmts_boundary(&self, stmts: &[HirStmt]) -> DiscardBoundary {
@@ -408,10 +403,6 @@ impl DiscardBoundaryFacts {
         visit_stmts(stmts, &mut visitor);
         visitor.finish()
     }
-
-    pub(super) fn stmt_boundary(&self, stmt: &HirStmt) -> DiscardBoundary {
-        self.stmts_boundary(std::slice::from_ref(stmt))
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -419,7 +410,6 @@ pub(super) struct DiscardBoundary {
     identity: bool,
     diagnostic: bool,
     control_entry: bool,
-    live_label_flow: bool,
 }
 
 impl DiscardBoundary {
@@ -434,14 +424,10 @@ impl DiscardBoundary {
     pub(super) fn has_control_entry(self) -> bool {
         self.control_entry
     }
-
-    pub(super) fn has_live_label_flow(self) -> bool {
-        self.live_label_flow
-    }
 }
 
 struct DiscardBoundaryVisitor<'a> {
-    facts: &'a DiscardBoundaryFacts,
+    facts: &'a DiscardBoundaryFacts<'a>,
     boundary: DiscardBoundary,
     labels: BTreeSet<HirLabelId>,
     internal_label_refs: BTreeMap<HirLabelId, usize>,
@@ -471,23 +457,20 @@ impl HirVisitor for DiscardBoundaryVisitor<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(local_decl) => {
-                self.boundary.identity |= local_decl
-                    .bindings
-                    .iter()
-                    .any(|local| self.facts.protected_locals.contains(local));
+                self.boundary.identity |= local_decl.bindings.iter().any(|local| {
+                    self.facts.physical_root_locals.contains(local)
+                        || matches!(
+                            self.facts.local_debug_hints.get(local.index()),
+                            Some(Some(_))
+                        )
+                });
             }
             HirStmt::ErrNil(_) => self.boundary.diagnostic = true,
             HirStmt::ToBeClosed(_) | HirStmt::Close(_) => self.boundary.identity = true,
             HirStmt::Goto(goto) => {
-                self.boundary.live_label_flow = true;
                 *self.internal_label_refs.entry(goto.target).or_default() += 1;
             }
             HirStmt::Label(label) => {
-                self.boundary.live_label_flow |= self
-                    .facts
-                    .label_refs
-                    .get(&label.id)
-                    .is_some_and(|references| *references > 0);
                 self.labels.insert(label.id);
             }
             _ => {}
@@ -499,8 +482,7 @@ impl HirVisitor for DiscardBoundaryVisitor<'_> {
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.boundary.identity |=
-            matches!(lvalue, HirLValue::Temp(temp) if self.facts.protected_temps.contains(temp));
+        self.boundary.identity |= matches!(lvalue, HirLValue::Temp(temp) if matches!(self.facts.temp_debug_hints.get(temp.index()), Some(Some(_))));
     }
 }
 
@@ -526,10 +508,10 @@ struct ImmutablePrimitiveLocals {
 }
 
 impl ImmutablePrimitiveLocals {
-    fn new(proto: &HirProto) -> Self {
+    fn new(body: &HirBlock) -> Self {
         let mut index = Self::default();
-        crate::hir::visit::visit_proto(proto, &mut index);
-        let captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
+        visit_block(body, &mut index);
+        let captured = super::mention::stmts_reference_captured_bindings(&body.stmts);
         index.written.extend(captured.locals);
         index
             .candidates
@@ -933,38 +915,11 @@ struct FoldCandidate {
     invert_cond: bool,
 }
 
-#[derive(Default)]
-struct ForwardBranchMoveFacts {
-    debug_locals: BTreeSet<LocalId>,
-    physical_root_locals: BTreeSet<LocalId>,
+struct ForwardBranchMoveFacts<'a> {
+    local_debug_hints: &'a [Option<String>],
+    local_debug_scopes: &'a [Option<usize>],
+    physical_root_locals: &'a BTreeSet<LocalId>,
     resource_locals: BTreeSet<LocalId>,
-}
-
-impl ForwardBranchMoveFacts {
-    fn new(proto: &HirProto) -> Self {
-        let mut debug_locals = BTreeSet::new();
-        debug_locals.extend(
-            proto
-                .locals
-                .iter()
-                .copied()
-                .zip(&proto.local_debug_hints)
-                .filter_map(|(local, hint)| hint.is_some().then_some(local)),
-        );
-        debug_locals.extend(
-            proto
-                .locals
-                .iter()
-                .copied()
-                .zip(&proto.local_debug_scopes)
-                .filter_map(|(local, scope)| scope.is_some().then_some(local)),
-        );
-        Self {
-            debug_locals,
-            physical_root_locals: proto.physical_root_locals.clone(),
-            resource_locals: stmts_protected_locals(&proto.body.stmts),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1230,7 +1185,7 @@ fn can_move_into_branch(
     safety: HirExprSafety,
     primitive_locals: &ImmutablePrimitiveLocals,
 ) -> Result<(), BranchMoveFailure> {
-    match LexicalCfg::analyze(stmts, owner_label_refs, safety) {
+    match validate_region_entry(stmts, owner_label_refs) {
         Ok(_) => {}
         Err(LexicalCfgFailure::AmbiguousLabel) => {
             return Err(BranchMoveFailure::AmbiguousControl);
@@ -1240,12 +1195,27 @@ fn can_move_into_branch(
         }
     }
 
+    // raw cleanup 的边界仍位于指令之间；先由资源 pass 物化 owner，再移动整个词法块。
+    let mut pending_cleanup = false;
+    for stmt in stmts {
+        visit_stmt_structure(stmt, &mut |stmt| {
+            pending_cleanup |= matches!(stmt, HirStmt::Close(_))
+        });
+    }
+    if pending_cleanup {
+        return Err(BranchMoveFailure::ResourceScope);
+    }
+
+    let mut suffix_mentions = None;
+    let mut root_writes = None;
     for (decl_index, stmt) in stmts.iter().enumerate() {
         let HirStmt::LocalDecl(decl) = stmt else {
             continue;
         };
         for (binding_index, &local) in decl.bindings.iter().enumerate() {
-            if facts.debug_locals.contains(&local) {
+            if matches!(facts.local_debug_hints.get(local.index()), Some(Some(_)))
+                || matches!(facts.local_debug_scopes.get(local.index()), Some(Some(_)))
+            {
                 return Err(BranchMoveFailure::DebugScope);
             }
             if facts.physical_root_locals.contains(&local) {
@@ -1254,17 +1224,27 @@ fn can_move_into_branch(
             if facts.resource_locals.contains(&local) {
                 return Err(BranchMoveFailure::ResourceScope);
             }
-            if stmts_mention_local(suffix, local) {
+            if suffix_mentions
+                .get_or_insert_with(|| stmts_mentioned_locals(suffix))
+                .contains(&local)
+            {
                 return Err(BranchMoveFailure::LiveAfterJoin);
             }
             let initial_is_gc_inert =
                 pack_slot_is_gc_inert(&decl.values, binding_index, safety, primitive_locals);
-            let later_writes =
-                summarize_later_writes(&stmts[(decl_index + 1)..], local, safety, primitive_locals);
-            if !initial_is_gc_inert && !later_writes.any {
+            let writes = root_writes
+                .get_or_insert_with(|| local_root_write_positions(stmts, safety, primitive_locals))
+                .get(&local);
+            let written_later = writes.is_some_and(|writes| writes.last_write > decl_index);
+            let collectable_later = writes.is_some_and(|writes| {
+                writes
+                    .last_collectable
+                    .is_some_and(|index| index > decl_index)
+            });
+            if !initial_is_gc_inert && !written_later {
                 return Err(BranchMoveFailure::CollectableRoot);
             }
-            if (!initial_is_gc_inert && later_writes.any) || !later_writes.all_gc_inert {
+            if (!initial_is_gc_inert && written_later) || collectable_later {
                 return Err(BranchMoveFailure::UnsupportedRootFlow);
             }
         }
@@ -1287,69 +1267,53 @@ fn pack_slot_is_gc_inert(
     )
 }
 
-fn summarize_later_writes(
+fn local_root_write_positions(
     stmts: &[HirStmt],
-    local: LocalId,
     safety: HirExprSafety,
     primitive_locals: &ImmutablePrimitiveLocals,
-) -> LocalRootWriteSummary {
-    let mut visitor = LocalRootWriteVisitor {
-        local,
-        safety,
-        primitive_locals,
-        summary: LocalRootWriteSummary {
-            any: false,
-            all_gc_inert: true,
-        },
-    };
-    visit_stmts(stmts, &mut visitor);
-    visitor.summary
-}
-
-#[derive(Clone, Copy)]
-struct LocalRootWriteSummary {
-    any: bool,
-    all_gc_inert: bool,
-}
-
-struct LocalRootWriteVisitor<'a> {
-    local: LocalId,
-    safety: HirExprSafety,
-    primitive_locals: &'a ImmutablePrimitiveLocals,
-    summary: LocalRootWriteSummary,
-}
-
-impl HirVisitor for LocalRootWriteVisitor<'_> {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        match stmt {
+) -> BTreeMap<LocalId, LocalRootWritePositions> {
+    let mut writes = BTreeMap::<LocalId, LocalRootWritePositions>::new();
+    for (stmt_index, stmt) in stmts.iter().enumerate() {
+        let mut record = |local, gc_inert: bool| {
+            let positions = writes.entry(local).or_default();
+            positions.last_write = stmt_index;
+            if !gc_inert {
+                positions.last_collectable = Some(stmt_index);
+            }
+        };
+        visit_stmt_structure(stmt, &mut |stmt| match stmt {
             HirStmt::Assign(assign) => {
                 for (index, target) in assign.targets.iter().enumerate() {
-                    if matches!(target, HirLValue::Local(local) if *local == self.local) {
-                        self.summary.any = true;
-                        self.summary.all_gc_inert &= pack_slot_is_gc_inert(
-                            &assign.values,
-                            index,
-                            self.safety,
-                            self.primitive_locals,
+                    if let HirLValue::Local(local) = target {
+                        record(
+                            *local,
+                            pack_slot_is_gc_inert(&assign.values, index, safety, primitive_locals),
                         );
                     }
                 }
             }
-            HirStmt::LocalDecl(decl) if decl.bindings.contains(&self.local) => {
-                self.summary.any = true;
-                self.summary.all_gc_inert = false;
+            HirStmt::LocalDecl(decl) => {
+                for local in &decl.bindings {
+                    record(*local, false);
+                }
             }
-            HirStmt::NumericFor(for_stmt) if for_stmt.binding == self.local => {
-                self.summary.any = true;
-                self.summary.all_gc_inert = false;
-            }
-            HirStmt::GenericFor(for_stmt) if for_stmt.bindings.contains(&self.local) => {
-                self.summary.any = true;
-                self.summary.all_gc_inert = false;
+            HirStmt::NumericFor(for_stmt) => record(for_stmt.binding, false),
+            HirStmt::GenericFor(for_stmt) => {
+                for local in &for_stmt.bindings {
+                    record(*local, false);
+                }
             }
             _ => {}
-        }
+        });
     }
+    writes
+}
+
+/// 直接语句位置也代表其整个嵌套子树；查询严格排除声明所在语句。
+#[derive(Default)]
+struct LocalRootWritePositions {
+    last_write: usize,
+    last_collectable: Option<usize>,
 }
 
 fn index_top_level_labels(stmts: &[HirStmt]) -> BTreeMap<HirLabelId, usize> {
@@ -1396,12 +1360,23 @@ fn remove_nop_goto_labels(stmts: &mut Vec<HirStmt>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn empty_move_facts() -> ForwardBranchMoveFacts<'static> {
+        static EMPTY_ROOTS: BTreeSet<LocalId> = BTreeSet::new();
+        ForwardBranchMoveFacts {
+            local_debug_hints: &[],
+            local_debug_scopes: &[],
+            physical_root_locals: &EMPTY_ROOTS,
+            resource_locals: BTreeSet::new(),
+        }
+    }
+
     use super::*;
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{HirLabel, HirRepeat, HirReturn, ParamId};
 
     fn return_value(value: i64) -> HirStmt {
         HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::fixed(vec![HirExpr::Integer(value)]),
         }))
     }
@@ -1430,6 +1405,7 @@ mod tests {
                 else_block: None,
             })),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: target,
                 tbc_barriers: Vec::new(),
             })),
@@ -1453,6 +1429,7 @@ mod tests {
                 else_block: None,
             })),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: target,
                 tbc_barriers: Vec::new(),
             })),
@@ -1479,6 +1456,7 @@ mod tests {
             }))],
         }));
         let label = HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id: target,
             tbc_barriers: Vec::new(),
         }));
@@ -1502,7 +1480,7 @@ mod tests {
         assert!(fold_forward_gotos(
             &mut stmts,
             FoldKind::TerminalElse,
-            &ForwardBranchMoveFacts::default(),
+            &empty_move_facts(),
             &label_refs,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
             &ImmutablePrimitiveLocals::default(),
@@ -1531,6 +1509,7 @@ mod tests {
         let moved = vec![
             HirStmt::Goto(Box::new(crate::hir::common::HirGoto { target: internal })),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: internal,
                 tbc_barriers: Vec::new(),
             })),
@@ -1554,6 +1533,7 @@ mod tests {
             moved[1].clone(),
             moved[2].clone(),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: target,
                 tbc_barriers: Vec::new(),
             })),
@@ -1563,7 +1543,7 @@ mod tests {
         assert!(fold_forward_gotos(
             &mut stmts,
             FoldKind::Guard,
-            &ForwardBranchMoveFacts::default(),
+            &empty_move_facts(),
             &label_refs,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
             &ImmutablePrimitiveLocals::default(),
@@ -1591,10 +1571,12 @@ mod tests {
                 else_block: None,
             })),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: internal,
                 tbc_barriers: Vec::new(),
             })),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: target,
                 tbc_barriers: Vec::new(),
             })),
@@ -1605,7 +1587,7 @@ mod tests {
         assert!(!fold_forward_gotos(
             &mut stmts,
             FoldKind::Guard,
-            &ForwardBranchMoveFacts::default(),
+            &empty_move_facts(),
             &label_refs,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
             &ImmutablePrimitiveLocals::default(),
@@ -1632,6 +1614,7 @@ mod tests {
                 initializer_merge_transaction: None,
             })),
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: target,
                 tbc_barriers: Vec::new(),
             })),
@@ -1642,7 +1625,7 @@ mod tests {
         assert!(!fold_forward_gotos(
             &mut stmts,
             FoldKind::Guard,
-            &ForwardBranchMoveFacts::default(),
+            &empty_move_facts(),
             &label_refs,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
             &ImmutablePrimitiveLocals::default(),
@@ -1663,8 +1646,9 @@ mod tests {
             }),
         }))];
         let discard_facts = DiscardBoundaryFacts {
-            protected_locals: BTreeSet::new(),
-            protected_temps: BTreeSet::new(),
+            local_debug_hints: &[],
+            temp_debug_hints: &[],
+            physical_root_locals: &BTreeSet::new(),
             label_refs: BTreeMap::new(),
         };
         let mut next_local_index = 7;
@@ -1691,6 +1675,7 @@ mod tests {
     #[test]
     fn repeat_tail_fold_absorbs_every_safe_stage_and_keeps_prefix_label_in_place() {
         let label = HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id: HirLabelId(3),
             tbc_barriers: Vec::new(),
         }));

@@ -6,6 +6,9 @@
 //! `local target = temp; if cond then target = temp end` 变成只保留初值声明。
 //! 分支规则在每个 arm 独立维护已证明的 `(local -> temp)` 状态，并让循环入口状态收敛到
 //! 首轮入口与所有自然/continue 回边的交集；它不会跨未知 goto 或 reference capture 猜测。
+//! debug 身份直接查询 proto 的 canonical 映射；删除已证明的重复写不更新状态，语句列表
+//! 按原顺序传播事实并只压缩一次，避免每个重复写都搬移整个尾部。相邻复制裁剪也保留
+//! 上一条存活语句的已分类关系；删除项不改变邻接事实，非复制语句则清空它。
 //! 多目标赋值默认仍不拆分；唯一例外是这里证明过的 dead loop-carrier mirror 分量：
 //! 被删 RHS 只能是纯 `LocalRef`，且目标 temp 的每一次写都必须属于同一 active-for、
 //! same-sole-possible-home 删除事务，因此不会留下旧值写而改变并行求值、副作用或 GC root 行为。
@@ -60,14 +63,13 @@ pub(super) fn prune_redundant_copy_stmts(
     block: &mut HirBlock,
     preserved_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
-    let original = std::mem::take(&mut block.stmts);
-    let mut rewritten = Vec::<HirStmt>::with_capacity(original.len());
+    let mut previous_copy = None;
     let mut changed = false;
 
-    for stmt in original {
-        let copy = single_binding_copy(&stmt);
+    block.stmts.retain(|stmt| {
+        let copy = single_binding_copy(stmt);
         let redundant_parallel = matches!(
-            &stmt,
+            stmt,
             HirStmt::Assign(assign)
                 if redundant_parallel_self_copy(assign)
                     && !assign_targets_preserved_binding(assign, preserved_bindings)
@@ -75,24 +77,22 @@ pub(super) fn prune_redundant_copy_stmts(
         if copy.is_some_and(|(target, source)| {
             target == source && !preserved_bindings.contains(&target)
         }) || redundant_parallel
-            || rewritten
-                .last()
-                .and_then(single_binding_copy)
-                .zip(copy)
-                .is_some_and(|((first_target, first_source), (target, source))| {
+            || previous_copy.zip(copy).is_some_and(
+                |((first_target, first_source), (target, source))| {
                     first_target != first_source
                         && first_target == source
                         && first_source == target
                         && !preserved_bindings.contains(&target)
-                })
+                },
+            )
         {
             changed = true;
+            false
         } else {
-            rewritten.push(stmt);
+            previous_copy = copy;
+            true
         }
-    }
-
-    block.stmts = rewritten;
+    });
     changed
 }
 
@@ -102,17 +102,10 @@ pub(super) fn prune_redundant_branch_state_copies(
     preserved_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
-    let debug_locals = proto
-        .locals
-        .iter()
-        .copied()
-        .zip(&proto.local_debug_hints)
-        .filter_map(|(local, hint)| hint.is_some().then_some(local))
-        .collect();
     let facts = BranchStateCopyFacts {
         reference_captured_locals: &reference_captured.locals,
         reference_captured_temps: &reference_captured.temps,
-        debug_locals: &debug_locals,
+        debug_locals: &proto.local_debug_hints,
         debug_temps: &proto.temp_debug_locals,
         preserved_bindings,
         safety,
@@ -577,7 +570,7 @@ fn mirror_write_disposition(
 struct BranchStateCopyFacts<'a> {
     reference_captured_locals: &'a BTreeSet<LocalId>,
     reference_captured_temps: &'a BTreeSet<TempId>,
-    debug_locals: &'a BTreeSet<LocalId>,
+    debug_locals: &'a [Option<String>],
     debug_temps: &'a [Option<String>],
     preserved_bindings: &'a BTreeSet<CarryBinding>,
     safety: HirExprSafety,
@@ -590,9 +583,8 @@ fn rewrite_branch_state_block(
     allow_prune: bool,
 ) -> (bool, BTreeMap<LocalId, TempId>) {
     let mut changed = false;
-    let mut index = 0;
-    while index < block.stmts.len() {
-        match &mut block.stmts[index] {
+    block.stmts.retain_mut(|stmt| {
+        match stmt {
             HirStmt::If(if_stmt) => {
                 invalidate_capture_writes_from_expr(&mut known, &if_stmt.cond, facts);
                 let incoming = known.clone();
@@ -685,9 +677,8 @@ fn rewrite_branch_state_block(
                         known.get(&local) == Some(&temp) && facts.can_remove(local, temp)
                     })
                 {
-                    block.stmts.remove(index);
                     changed = true;
-                    continue;
+                    return false;
                 }
                 update_known_state(stmt, &mut known, facts);
                 if matches!(
@@ -698,15 +689,17 @@ fn rewrite_branch_state_block(
                 }
             }
         }
-        index += 1;
-    }
+        true
+    });
     (changed, known)
 }
 
 impl BranchStateCopyFacts<'_> {
     fn can_remove(&self, local: LocalId, temp: TempId) -> bool {
         // 候选拒绝[PolicyBoundary]：retain-debug 模式保留源码 local/temp 的显式写入位置与值 epoch，不把它压成支配声明（regress_336 retain-debug）。
-        !self.debug_locals.contains(&local)
+        self.debug_locals
+            .get(local.index())
+            .is_none_or(Option::is_none)
             && self
                 .debug_temps
                 .get(temp.index())

@@ -21,8 +21,14 @@ pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: impl Into<HirValuePac
     }))
 }
 
-pub(super) fn return_stmt(values: HirValuePack) -> HirStmt {
-    HirStmt::Return(Box::new(HirReturn { values }))
+pub(super) fn return_stmt(
+    values: HirValuePack,
+    source_instr: Option<crate::transformer::InstrRef>,
+) -> HirStmt {
+    HirStmt::Return(Box::new(HirReturn {
+        source_instr,
+        values,
+    }))
 }
 
 pub(super) fn goto_stmt(target: HirLabelId) -> HirStmt {

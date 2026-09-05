@@ -4,7 +4,8 @@
 //! 调用方获得对应 capture 效果，不靠函数文本或参数位置猜测。对象存活由父模块消费摘要。
 
 use super::super::lexical_cfg::{
-    HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings, HirGenericForFlow,
+    FlowRefinement, HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
+    HirGenericForFlow,
 };
 use super::{
     Binding, EffectClosure, EffectValue, ProtoEffects, adjusted_value, binding_from_expr,
@@ -884,6 +885,7 @@ fn collect_effect_state(
             summary.returns.extend(output.returns.iter().cloned());
             summary.calls.extend(&output.calls);
         },
+        |_expr, _truthy, _state| FlowRefinement::Unchanged,
     );
     summary
 }

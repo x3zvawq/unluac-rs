@@ -82,7 +82,7 @@ struct PlanLoweringIndex {
     normal_tail_guard_by_edge: Vec<Option<(RegionId, TempId)>>,
     consumed_loop_copy_targets: Vec<Vec<PhiId>>,
     repeat_staged_result_by_phi: Vec<Option<(RegionId, TempId)>>,
-    canonical_move_source: Vec<Option<SsaValue>>,
+    edge_action_use_count: Vec<usize>,
     absorbed_region_result_moves: Vec<bool>,
     shared_ssa_temps: Vec<bool>,
 }

@@ -5,7 +5,9 @@
 //! escape 与物理 home 已由 `repeat_root_lifetimes` 证明，AST consumer 不再从表达式
 //! 形状重新推断。
 
-use crate::ast::common::{AstBindingRef, AstLocalAttr, AstLocalBinding, AstRewriteAuthority};
+use crate::ast::common::{
+    AstBindingRef, AstLocalAttr, AstLocalBinding, AstRewriteAuthority, AstSyntheticLocalId,
+};
 use crate::hir::{HirRepeatBinding, HirRepeatConditionLifetimeFacts};
 
 pub(super) fn binding_must_live_through_condition(
@@ -33,14 +35,14 @@ pub(super) fn hir_binding_may_end_before_condition(
         .is_some_and(|binding| lifetime.may_end_before_condition.contains(&binding))
 }
 
-/// 把 AST materialize 后的名字归一化回 HIR 发布 certificate 时的稳定 binding 身份。
-///
-/// `SyntheticLocal(temp)` 只有在 caller 已证明它来自 HIR 时才能使用；AST 自建的同号
-/// synthetic local 不能冒充 HIR temp。
+/// 物化保持原 HIR 身份；AST 自建 local 不属于 HIR certificate 的命名空间。
 fn hir_repeat_binding(binding: AstBindingRef) -> Option<HirRepeatBinding> {
     match binding {
         AstBindingRef::Local(local) => Some(HirRepeatBinding::Local(local)),
         AstBindingRef::Temp(temp) => Some(HirRepeatBinding::Temp(temp)),
-        AstBindingRef::SyntheticLocal(local) => Some(HirRepeatBinding::Temp(local.0)),
+        AstBindingRef::SyntheticLocal(AstSyntheticLocalId::HirTemp(temp)) => {
+            Some(HirRepeatBinding::Temp(temp))
+        }
+        AstBindingRef::SyntheticLocal(AstSyntheticLocalId::Ast(_)) => None,
     }
 }

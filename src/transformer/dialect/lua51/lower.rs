@@ -613,6 +613,7 @@ impl<'a> ProtoLowerer<'a> {
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                            kind: crate::transformer::CloseKind::Explicit,
                             from: reg_from_u8(a),
                         })),
                     );

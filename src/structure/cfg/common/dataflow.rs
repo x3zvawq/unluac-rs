@@ -68,12 +68,14 @@ pub struct DataflowFacts {
     pub defs: Vec<Def>,
     pub open_defs: Vec<OpenDef>,
     pub instr_defs: Vec<Vec<DefId>>,
+    pub(crate) fixed_defs_by_reg: Vec<Vec<DefId>>,
     pub block_entry_values: Vec<SsaRegMap>,
     pub block_exit_values: Vec<SsaRegMap>,
     pub(crate) block_end_values: Vec<SsaRegMap>,
     pub use_values: Vec<InstrUseValues>,
     pub(crate) def_uses: Vec<Vec<UseSite>>,
     pub(crate) def_overwritten_values: Vec<Option<SsaValue>>,
+    pub(crate) canonical_move_values: Vec<Option<SsaValue>>,
     pub(crate) def_phi_uses: Vec<Vec<PhiId>>,
     pub(crate) phi_uses: Vec<Vec<UseSite>>,
     pub(crate) phi_phi_uses: Vec<Vec<PhiId>>,
@@ -84,12 +86,40 @@ pub struct DataflowFacts {
     pub open_live_in: Vec<bool>,
     pub open_live_out: Vec<bool>,
     pub phi_candidates: Vec<PhiCandidate>,
+    pub(crate) incoming_slots_by_edge: Vec<Option<usize>>,
     pub(crate) phi_block_ranges: Vec<Range<usize>>,
     pub(crate) phi_use_blocks: Vec<Option<BlockRef>>,
     pub children: Vec<DataflowFacts>,
 }
 
 impl DataflowFacts {
+    /// 返回 exclusive low 区间内最后一次 fixed Def，包括不可达块中的定义。
+    ///
+    /// 索引在 Dataflow 产出时按指令顺序冻结；例如 debug local 入口不读取该槽，也能
+    /// 查询初始化前缀。这里只回答线性区间内的 fixed 写入，不推断跨块 reaching value、
+    /// open 覆盖或 Move 值根；调用方仍负责限定所属 block 与解释缺失定义。
+    pub(crate) fn last_fixed_def_in_range(&self, reg: Reg, range: Range<usize>) -> Option<DefId> {
+        let definitions = self.fixed_defs_by_reg.get(reg.index())?;
+        let end = definitions.partition_point(|&def| self.def_instr(def).index() < range.end);
+        let &def = definitions.get(end.checked_sub(1)?)?;
+        (self.def_instr(def).index() >= range.start).then_some(def)
+    }
+
+    /// 最终 SSA 快照中的透明 Move 值根；Phi/Entry 保持原身份。
+    ///
+    /// None 表示该链没有可证明的源（例如不可达 Move 没有 use-value）。这里只证明
+    /// 值恒等，不证明寄存器、close epoch 或物理根的生命周期，也不授权延后读取。
+    pub(crate) fn canonical_move_value(&self, value: SsaValue) -> Option<SsaValue> {
+        match value {
+            SsaValue::Def(def) => self
+                .canonical_move_values
+                .get(def.index())
+                .copied()
+                .flatten(),
+            _ => Some(value),
+        }
+    }
+
     pub fn block_entry_value(&self, block: BlockRef, reg: Reg) -> SsaValue {
         self.block_entry_values
             .get(block.index())
@@ -171,6 +201,22 @@ impl DataflowFacts {
 
     pub fn phi_candidate(&self, phi_id: PhiId) -> Option<&PhiCandidate> {
         self.phi_candidates.get(phi_id.index())
+    }
+
+    /// 按真实 CFG edge 读取同一 SSA snapshot 的 incoming；不包含合成 Entry 输入。
+    ///
+    /// SSA/open rename 共用的 slot 排列在 phi 压缩后不变。不同目标块的 edge 可以
+    /// 占据同一 slot，因此仍须核对 edge 身份，不能把另一个 phi 的该槽误作结果。
+    pub fn phi_incoming_for_edge(&self, phi: PhiId, edge: EdgeRef) -> Option<&PhiIncoming> {
+        let slot = self
+            .incoming_slots_by_edge
+            .get(edge.index())
+            .copied()
+            .flatten()?;
+        self.phi_candidate(phi)?
+            .incoming
+            .get(slot)
+            .filter(|incoming| incoming.edge == Some(edge))
     }
 
     pub fn phi_candidates_in_block(&self, block: BlockRef) -> &[PhiCandidate] {

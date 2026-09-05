@@ -20,8 +20,8 @@ use super::plan::{
     ConditionPlan, ConditionPlanId, EdgePlan, EdgeRegionRelation, ForwardRouteId, ForwardRouteKind,
     ForwardRoutePlan, LabelPlan, LabelPlanId, LoopExitTailPlan, LoopPlanData, LoopPlanId,
     LoopValueActions, LoopVmProtocol, PlanRequirements, RegionBoundarySummary, RegionId,
-    RegionNavigation, RegionPlan, ScopePlanId, SinglePassPlan, SinglePassPlanId, TbcScopePlan,
-    TbcScopePlanId, ValueDecisionPlan, ValueDecisionPlanId,
+    RegionNavigation, RegionPlan, ScopePlanId, SinglePassPlan, SinglePassPlanId, ValueDecisionPlan,
+    ValueDecisionPlanId,
 };
 
 /// 一个 proto 的 Structure 结果，以及保持原顺序的子 proto 结果。
@@ -56,6 +56,8 @@ pub struct DebugBindingFact {
     pub reg: Reg,
     pub start_pc: u32,
     pub end_pc: u32,
+    /// 原 debug 结束 PC 对应的 exclusive low 边界；None 表示已越过所有 low 指令。
+    pub end_instr: Option<InstrRef>,
     pub value: SsaValue,
 }
 
@@ -458,12 +460,6 @@ pub struct LoopValueArm {
 impl LoopValueArm {
     pub fn is_empty(&self) -> bool {
         self.incomings.is_empty()
-    }
-
-    pub fn contains_pred(&self, pred: BlockRef) -> bool {
-        self.incomings
-            .iter()
-            .any(|incoming| incoming.pred == Some(pred))
     }
 
     pub fn values(&self) -> impl Iterator<Item = SsaValue> + '_ {

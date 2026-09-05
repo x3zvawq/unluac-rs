@@ -2093,6 +2093,7 @@ mod tests {
         let source = AstBindingRef::Local(LocalId(0));
         let snapshot = AstBindingRef::Local(LocalId(1));
         let mut module = AstModule {
+            next_synthetic_local: 0,
             entry_function: HirProtoRef(0),
             body: AstBlock {
                 stmts: vec![AstStmt::Repeat(Box::new(AstRepeat {

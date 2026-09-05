@@ -3,8 +3,8 @@
 //! 这里坚持只按控制流切块，不夹带结构恢复语义，是为了让后续 GraphFacts /
 //! Dataflow 都能在同一份"最原始但稳定"的图上复用分析结果。
 //!
-//! `CfgBuilder` 把构图过程中反复传递的 `edges/preds/succs/instr_to_block`
-//! 收敛到一个可变上下文里，消除了原先十几个 helper 各带 6 个参数的模式。
+//! leader 与物理边共享 low-IR 控制出口投影，`CfgBuilder` 统一维护边及前驱/后继。
+//! 例如真假分支指向同一指令时仍生成两条不同极性的边，不能按目标去重。
 
 use std::collections::BTreeSet;
 
@@ -142,82 +142,18 @@ fn build_cfg(instrs: &[LowInstr]) -> Result<Cfg, StructureError> {
             continue;
         };
 
-        match &instrs[last_instr.index()] {
-            LowInstr::Jump(instr) => {
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.target,
-                    EdgeKind::Jump,
-                )?;
-            }
-            LowInstr::Branch(instr) => {
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.then_target,
-                    EdgeKind::BranchTrue,
-                )?;
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.else_target,
-                    EdgeKind::BranchFalse,
-                )?;
-            }
-            LowInstr::NumericForInit(instr) => {
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.body_target,
-                    EdgeKind::LoopBody,
-                )?;
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.exit_target,
-                    EdgeKind::LoopExit,
-                )?;
-            }
-            LowInstr::NumericForLoop(instr) => {
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.body_target,
-                    EdgeKind::LoopBody,
-                )?;
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.exit_target,
-                    EdgeKind::LoopExit,
-                )?;
-            }
-            LowInstr::GenericForLoop(instr) => {
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.body_target,
-                    EdgeKind::LoopBody,
-                )?;
-                builder.add_target_edge(
-                    &instr_to_block,
-                    block_ref,
-                    instr.exit_target,
-                    EdgeKind::LoopExit,
-                )?;
-            }
-            LowInstr::Return(_) => {
-                builder.add_edge(block_ref, exit_block, EdgeKind::Return);
-            }
-            LowInstr::TailCall(_) => {
-                builder.add_edge(block_ref, exit_block, EdgeKind::TailCall);
-            }
-            _ => {
-                if let Some(next_block) = block_order.get(index + 1).copied() {
-                    builder.add_edge(block_ref, next_block, EdgeKind::Fallthrough);
+        let has_control_edges =
+            visit_control_edges(&instrs[last_instr.index()], |target, kind| {
+                match target {
+                    Some(target) => {
+                        builder.add_target_edge(&instr_to_block, block_ref, target, kind)?
+                    }
+                    None => builder.add_edge(block_ref, exit_block, kind),
                 }
-            }
+                Ok::<_, StructureError>(())
+            })?;
+        if !has_control_edges && let Some(next_block) = block_order.get(index + 1).copied() {
+            builder.add_edge(block_ref, next_block, EdgeKind::Fallthrough);
         }
     }
 
@@ -277,7 +213,10 @@ fn collect_leaders(instrs: &[LowInstr]) -> Result<BTreeSet<usize>, StructureErro
     let mut leaders = BTreeSet::from([0]);
 
     for (index, instr) in instrs.iter().enumerate() {
-        collect_jump_targets(instr, |target| {
+        visit_control_edges(instr, |target, _| {
+            let Some(target) = target else {
+                return Ok(());
+            };
             if target.index() >= instrs.len() {
                 return Err(StructureError::invalid(format!(
                     "low-IR control instruction @{index} targets missing instruction {target}"
@@ -295,32 +234,35 @@ fn collect_leaders(instrs: &[LowInstr]) -> Result<BTreeSet<usize>, StructureErro
     Ok(leaders)
 }
 
-/// 把指令的跳转目标通过回调交给调用方，避免为至多 2 个元素分配 `Vec`。
-fn collect_jump_targets<E>(
+/// 统一投影 low-IR 的控制出口；None 表示函数出口，返回 false 才使用普通 fallthrough。
+/// leader 切分与物理边构造共享目标及极性，回调逐边执行，保留同目标双分支的身份和顺序。
+fn visit_control_edges<E>(
     instr: &LowInstr,
-    mut f: impl FnMut(InstrRef) -> Result<(), E>,
-) -> Result<(), E> {
+    mut emit: impl FnMut(Option<InstrRef>, EdgeKind) -> Result<(), E>,
+) -> Result<bool, E> {
     match instr {
-        LowInstr::Jump(instr) => f(instr.target)?,
+        LowInstr::Jump(instr) => emit(Some(instr.target), EdgeKind::Jump)?,
         LowInstr::Branch(instr) => {
-            f(instr.then_target)?;
-            f(instr.else_target)?;
+            emit(Some(instr.then_target), EdgeKind::BranchTrue)?;
+            emit(Some(instr.else_target), EdgeKind::BranchFalse)?;
         }
         LowInstr::NumericForInit(instr) => {
-            f(instr.body_target)?;
-            f(instr.exit_target)?;
+            emit(Some(instr.body_target), EdgeKind::LoopBody)?;
+            emit(Some(instr.exit_target), EdgeKind::LoopExit)?;
         }
         LowInstr::NumericForLoop(instr) => {
-            f(instr.body_target)?;
-            f(instr.exit_target)?;
+            emit(Some(instr.body_target), EdgeKind::LoopBody)?;
+            emit(Some(instr.exit_target), EdgeKind::LoopExit)?;
         }
         LowInstr::GenericForLoop(instr) => {
-            f(instr.body_target)?;
-            f(instr.exit_target)?;
+            emit(Some(instr.body_target), EdgeKind::LoopBody)?;
+            emit(Some(instr.exit_target), EdgeKind::LoopExit)?;
         }
-        _ => {}
+        LowInstr::Return(_) => emit(None, EdgeKind::Return)?,
+        LowInstr::TailCall(_) => emit(None, EdgeKind::TailCall)?,
+        _ => return Ok(false),
     }
-    Ok(())
+    Ok(true)
 }
 
 fn compute_reachable_blocks(

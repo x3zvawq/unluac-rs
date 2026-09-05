@@ -37,6 +37,57 @@ pub(super) fn single_entry(cfg: &Cfg, blocks: &BTreeSet<BlockRef>, entry: BlockR
         })
 }
 
+/// arm 根的自支配不能证明词法单入口：另一个 arm 仍可能跳到这个根。
+/// 一次索引所有非支配入边；候选只核对两个实际 arm 入口，不重扫整个候选子图。
+pub(super) struct BranchEntryFacts {
+    external_predecessors: Vec<Vec<BlockRef>>,
+}
+
+impl BranchEntryFacts {
+    pub(super) fn new(cfg: &Cfg, graph_facts: &GraphFacts) -> Self {
+        let mut external_predecessors = vec![Vec::new(); cfg.blocks.len()];
+        for edge in &cfg.edges {
+            if cfg.reachable_blocks.contains(&edge.from)
+                && !graph_facts.dominates(edge.to, edge.from)
+            {
+                external_predecessors[edge.to.index()].push(edge.from);
+            }
+        }
+        Self {
+            external_predecessors,
+        }
+    }
+
+    pub(super) fn admits(
+        &self,
+        branch: &super::super::BranchPlanInput,
+        input: &FinalPlanInput,
+        contains: impl Fn(BlockRef) -> bool,
+    ) -> bool {
+        let Some((then_entry, else_entry)) = branch_arm_entries(branch, input) else {
+            return false;
+        };
+        let condition = branch
+            .condition
+            .and_then(|id| input.conditions.get(id.index()));
+        let is_condition = |block| {
+            block == branch.branch.header
+                || condition.is_some_and(|condition| condition.candidate.blocks.contains(&block))
+        };
+        std::iter::once(then_entry).chain(else_entry).all(|entry| {
+            // loop exit、外部 continuation 等 condition 端点不属于这个候选，
+            // 不创建 arm 词法作用域；只检查前层实际选入的 arm 根。
+            !contains(entry)
+                || Some(entry) == branch.branch.merge
+                || is_condition(entry)
+                || self.external_predecessors[entry.index()]
+                    .iter()
+                    .copied()
+                    .all(is_condition)
+        })
+    }
+}
+
 pub(super) fn value_decision_is_closed(
     cfg: &Cfg,
     blocks: &BTreeSet<BlockRef>,

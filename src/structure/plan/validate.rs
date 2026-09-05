@@ -4,7 +4,7 @@ use super::{
     BlockEmissionPlan, BlockTerminatorKind, BranchArm, CleanupDisposition, ConditionArcPolarity,
     ConditionPlan, ConditionPlanId, ConditionTarget, ControlFlowFeature, EdgeActionPlacement,
     EdgeTransfer, ForwardRouteKind, LabelPlacement, LoopPlanId, PhiIncomingDisposition,
-    PlanRequirement, RegionId, RegionNavigation, RegionPlan, ScopePlanId, StructureError,
+    PlanRequirement, RegionId, RegionNavigation, RegionPlan, StructureError,
     UnstructuredLayoutItem, ValueDecisionArcPlan, ValueDecisionPlan, ValueDecisionPlanId,
     ValueDecisionTarget,
 };
@@ -100,11 +100,20 @@ pub(super) fn validate_final(
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
     validate(proto, cfg, plan)?;
-    crate::structure::scope::validate_label_tbc_barriers(proto, cfg, plan)?;
+    crate::structure::scope::validate_label_tbc_barriers(cfg, plan)?;
     validate_condition_predicates(proto, plan)?;
     validate_condition_prefix_placements(proto, cfg, plan)?;
     validate_cleanup(proto, cfg, plan)?;
     validate_phis(cfg, dataflow, plan)?;
+    let placements = super::expected_edge_action_placements(proto, cfg, dataflow, plan);
+    for (edge, expected) in plan.edge_plans.iter().zip(placements) {
+        if edge.action_placement != expected {
+            return Err(StructureError::invalid(format!(
+                "edge {} has a stale source-cleanup action placement",
+                edge.edge
+            )));
+        }
+    }
     validate_block_emissions(cfg, plan)?;
     super::loop_protocol::validate(proto, cfg, graph_facts, dataflow, plan)?;
     validate_condition_values(proto, cfg, dataflow, plan)?;

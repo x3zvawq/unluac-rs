@@ -17,6 +17,18 @@ pub(super) fn stmts_mention_local(stmts: &[HirStmt], local: LocalId) -> bool {
     LocalMentionCollector::mentions_in_stmts(stmts, local)
 }
 
+/// 批量查询同一后缀时一次收集读取和直接左值；声明字段本身不属于 mention。
+pub(super) fn stmts_mentioned_locals(stmts: &[HirStmt]) -> BTreeSet<LocalId> {
+    let mut locals = BTreeSet::new();
+    visit_stmts(
+        stmts,
+        &mut LocalMentionSetCollector {
+            locals: &mut locals,
+        },
+    );
+    locals
+}
+
 pub(super) fn block_mentions_local(block: &HirBlock, local: LocalId) -> bool {
     LocalMentionCollector::mentions_in_block(block, local)
 }
@@ -105,7 +117,7 @@ impl HirVisitor for ProtectedLocalCollector {
                 self.locals.extend(for_stmt.bindings.iter().copied());
             }
             HirStmt::ToBeClosed(to_be_closed) => {
-                let mut refs = LocalRefSetCollector {
+                let mut refs = LocalMentionSetCollector {
                     locals: &mut self.locals,
                 };
                 visit_expr(&to_be_closed.value, &mut refs);
@@ -365,7 +377,7 @@ impl HirVisitor for CapturedLocalSetCollector {
             return;
         };
         for capture in &closure.captures {
-            let mut collector = LocalRefSetCollector {
+            let mut collector = LocalMentionSetCollector {
                 locals: &mut self.locals,
             };
             visit_expr(&capture.value, &mut collector);
@@ -373,13 +385,19 @@ impl HirVisitor for CapturedLocalSetCollector {
     }
 }
 
-struct LocalRefSetCollector<'a> {
+struct LocalMentionSetCollector<'a> {
     locals: &'a mut BTreeSet<LocalId>,
 }
 
-impl HirVisitor for LocalRefSetCollector<'_> {
+impl HirVisitor for LocalMentionSetCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::LocalRef(local) = expr {
+            self.locals.insert(*local);
+        }
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        if let HirLValue::Local(local) = lvalue {
             self.locals.insert(*local);
         }
     }

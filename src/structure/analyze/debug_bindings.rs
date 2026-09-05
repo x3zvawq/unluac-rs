@@ -19,7 +19,7 @@ pub(super) fn analyze_debug_bindings(
         .enumerate()
         .filter(|(_, local)| local.is_source())
     {
-        let Some(instr) = low_instr_at_or_after_pc(proto, local.start_pc) else {
+        let Some(instr) = proto.lowering_map.low_instr_at_or_after_pc(local.start_pc) else {
             continue;
         };
         let value =
@@ -36,6 +36,7 @@ pub(super) fn analyze_debug_bindings(
                 reg: local.reg,
                 start_pc: local.start_pc,
                 end_pc: local.end_pc,
+                end_instr: proto.lowering_map.low_instr_at_or_after_pc(local.end_pc),
                 value,
             });
         } else {
@@ -43,16 +44,6 @@ pub(super) fn analyze_debug_bindings(
         }
     }
     facts
-}
-
-pub(super) fn low_instr_at_or_after_pc(proto: &LoweredProto, pc: u32) -> Option<InstrRef> {
-    proto
-        .lowering_map
-        .pc_map
-        .iter()
-        .enumerate()
-        .find(|(_, raw_pcs)| raw_pcs.iter().any(|raw_pc| *raw_pc >= pc))
-        .map(|(index, _)| InstrRef(index))
 }
 
 pub(super) fn ssa_value_at_debug_scope_entry(
@@ -64,19 +55,19 @@ pub(super) fn ssa_value_at_debug_scope_entry(
     start_pc: u32,
 ) -> super::super::SsaValue {
     let block = cfg.instr_to_block[instr.index()];
-    let mut value = dataflow.block_entry_value(block, reg);
     let start = cfg.blocks[block.index()].instrs.start.index();
-    for index in start..instr.index() {
-        if let Some(def) = dataflow.instr_def_for_reg(InstrRef(index), reg) {
-            value = super::super::SsaValue::Def(def);
-        }
-    }
+    let mut value = dataflow
+        .last_fixed_def_in_range(reg, start..instr.index())
+        .map_or_else(
+            || dataflow.block_entry_value(block, reg),
+            super::super::SsaValue::Def,
+        );
     // Luau 等格式可把 local.start_pc 直接指向初始化指令；这时作用域入口看到的是
     // 该指令完成后的值。PUC Lua 常把 start_pc 放在初始化之后，或像 SETLIST 一样
     // 指向不重定义 binding 的最后一步，两种情况都继续使用上面的 reaching value。
     if proto
         .lowering_map
-        .pc_map
+        .pc_map()
         .get(instr.index())
         .is_some_and(|pcs| pcs.contains(&start_pc))
         && let Some(def) = dataflow.instr_def_for_reg(instr, reg)

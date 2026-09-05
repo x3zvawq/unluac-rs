@@ -36,6 +36,7 @@ mod captured_slots;
 mod captured_temps;
 mod debug_entries;
 mod debug_names;
+mod lexical_windows;
 mod loop_bindings;
 
 use captured_slots::*;
@@ -484,7 +485,14 @@ pub(super) fn build_bindings(
         debug_entry_local_decls,
         capture_region_local_decls: captured_slots.region_local_decls,
         closure_capture_targets: captured_slots.capture_targets,
-        lexical_close_scope_starts: captured_slots.lexical_close_scope_starts,
+        lexical_scopes: lexical_windows::collect_lexical_scopes(
+            proto,
+            cfg,
+            dataflow,
+            structure,
+            captured_slot_epochs,
+            captured_slots.lexical_scopes,
+        ),
         reference_captured_regs,
         entry_local_regs,
         numeric_for_locals,

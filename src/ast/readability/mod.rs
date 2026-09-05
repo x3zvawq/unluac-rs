@@ -350,6 +350,7 @@ mod tests {
     fn deferred_pipeline_materializes_temp_before_function_sugar() {
         let temp = TempId(7);
         let module = AstModule {
+            next_synthetic_local: 0,
             entry_function: HirProtoRef(0),
             body: AstBlock {
                 stmts: vec![AstStmt::Assign(Box::new(AstAssign {
@@ -388,7 +389,7 @@ mod tests {
         };
         assert_eq!(
             path.root,
-            AstNameRef::SyntheticLocal(AstSyntheticLocalId(temp))
+            AstNameRef::SyntheticLocal(AstSyntheticLocalId::HirTemp(temp))
         );
     }
 

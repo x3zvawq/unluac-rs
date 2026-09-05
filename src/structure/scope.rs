@@ -10,8 +10,15 @@
 //!   这些 cleanup 点属于词法边界，而不是把 `Close` 当普通语句往后拖
 //! - 每条 `Close/Tbc` 最终取得唯一 `CleanupDisposition`；for 词法边界只有在覆盖的
 //!   显式 TBC 全部属于唯一 loop owner 时才交给该循环，HIR 不再重跑活跃性分析
+//! - 显式 Close 的连续 block 前缀可下放到入边，每条边按 may-out 冻结独立事件；
+//!   相同 origin 的其它 Close 仍保留自己的执行位置，不能充当这一事件的替身
+//! - branch admission 按真实 container preorder 区间查询 Close；共享透明链只在当前
+//!   候选内解析，例如 Close -> jump -> 候选外 -> effect 不把外部 effect 吸进 arm
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    ops::Range,
+};
 
 use crate::structure::{BlockRef, Cfg, GraphFacts, StructurePlan};
 use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg};
@@ -19,23 +26,239 @@ use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg};
 use super::common::ScopePlan;
 use super::plan::{
     CleanupDisposition, LabelPlacement, LoopPlanData, RegionId, RegionPlan, ScopePlanId,
-    StructureError, TbcScopePlan, TbcScopePlanId,
+    StructureError,
 };
 
 /// 显式 TBC 声明沿 CFG 传播后的 VM 作用域事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TbcFlowFacts {
+    // must 用于 label 可见性；may 用于每个真实 cleanup occurrence 的关闭集合。
     active_in: Vec<BTreeSet<InstrRef>>,
     active_out: Vec<BTreeSet<InstrRef>>,
+    may_out: Vec<BTreeSet<InstrRef>>,
     close_origins: BTreeMap<InstrRef, BTreeSet<InstrRef>>,
 }
 
 impl TbcFlowFacts {
+    pub(super) fn close_origins(&self, instr: InstrRef) -> Option<&BTreeSet<InstrRef>> {
+        self.close_origins.get(&instr)
+    }
+
     pub(super) fn active_at_entry(&self, block: BlockRef) -> Option<&BTreeSet<InstrRef>> {
         self.active_in.get(block.index())
     }
 
     pub(super) fn active_after_block(&self, block: BlockRef) -> Option<&BTreeSet<InstrRef>> {
         self.active_out.get(block.index())
+    }
+
+    /// 纯清理 pad 已关闭所有 may-active 资源，且每条显式 Close 都关闭调用方所属的 origin。
+    /// 调用方另证无 loop owner 和隐式入边；不能用 must-out 为空替代逐路径已清空。
+    pub(super) fn fully_closed_local_pad(
+        &self,
+        proto: &LoweredProto,
+        cfg: &Cfg,
+        block: BlockRef,
+        owns_origin: impl Fn(InstrRef) -> bool,
+    ) -> bool {
+        if !self.may_out[block.index()].is_empty() || !block_is_cleanup_pad(proto, cfg, block) {
+            return false;
+        }
+        let range = cfg.blocks[block.index()].instrs;
+        let mut has_close = false;
+        for index in range.start.index()..range.end() {
+            let LowInstr::Close(close) = &proto.instrs[index] else {
+                continue;
+            };
+            has_close = true;
+            if close.kind != crate::transformer::CloseKind::Explicit
+                || self.close_origins(InstrRef(index)).is_none_or(|origins| {
+                    origins.is_empty() || !origins.iter().copied().all(&owns_origin)
+                })
+            {
+                return false;
+            }
+        }
+        has_close
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CleanupContinuation {
+    Effect,
+    End,
+    Next(BlockRef),
+}
+
+struct CleanupBlock {
+    last_effect: Option<usize>,
+    tail: CleanupContinuation,
+}
+
+#[derive(Clone, Copy)]
+struct BranchClose<'a> {
+    instr: InstrRef,
+    position: usize,
+    origins: &'a BTreeSet<InstrRef>,
+}
+
+#[derive(Clone, Copy)]
+enum CleanupVisit {
+    Unknown,
+    Active,
+    Done(bool),
+}
+
+/// Close 身份/origins 来自 TBC flow，范围来自实际 container；不以 header 支配子树
+/// 替代成员关系。完整 block 的透明链结果只在一次候选查询内共享。
+pub(super) struct BranchCleanupFacts<'a> {
+    cfg: &'a Cfg,
+    positions: &'a [Option<usize>],
+    closes: Vec<BranchClose<'a>>,
+    blocks: Vec<CleanupBlock>,
+    visits: Vec<CleanupVisit>,
+    touched: Vec<BlockRef>,
+}
+
+impl<'a> BranchCleanupFacts<'a> {
+    pub(super) fn new(
+        proto: &LoweredProto,
+        cfg: &'a Cfg,
+        graph_facts: &'a GraphFacts,
+        flow: &'a TbcFlowFacts,
+    ) -> Self {
+        let positions = &graph_facts.dominator_tree.preorder_index;
+        let mut closes = flow
+            .close_origins
+            .iter()
+            .filter_map(|(&instr, origins)| {
+                Some(BranchClose {
+                    instr,
+                    position: positions[cfg.instr_to_block[instr.index()].index()]?,
+                    origins,
+                })
+            })
+            .collect::<Vec<_>>();
+        closes.sort_unstable_by_key(|close| (close.position, close.instr));
+        let block_count = if closes.is_empty() {
+            0
+        } else {
+            cfg.blocks.len()
+        };
+        let blocks = cfg
+            .blocks
+            .iter()
+            .take(block_count)
+            .enumerate()
+            .map(|(index, block)| {
+                let last_effect =
+                    (block.instrs.start.index()..block.instrs.end())
+                        .rev()
+                        .find(|&index| {
+                            !matches!(proto.instrs[index], LowInstr::Close(_) | LowInstr::Jump(_))
+                        });
+                let tail = match cfg.succs[index].as_slice() {
+                    [] => CleanupContinuation::End,
+                    [edge] => CleanupContinuation::Next(cfg.edges[edge.index()].to),
+                    _ => CleanupContinuation::Effect,
+                };
+                CleanupBlock { last_effect, tail }
+            })
+            .collect();
+        Self {
+            cfg,
+            positions,
+            closes,
+            blocks,
+            visits: vec![CleanupVisit::Unknown; block_count],
+            touched: Vec::new(),
+        }
+    }
+
+    pub(super) fn crosses_cleanup(&mut self, header: BlockRef, ranges: &[Range<usize>]) -> bool {
+        let cfg = self.cfg;
+        let positions = self.positions;
+        let contains = |block: BlockRef| {
+            positions[block.index()].is_some_and(|position| {
+                let index = ranges.partition_point(|range| range.end <= position);
+                ranges
+                    .get(index)
+                    .is_some_and(|range| range.contains(&position))
+            })
+        };
+        let crosses = 'candidate: {
+            for range in ranges {
+                let start = self
+                    .closes
+                    .partition_point(|close| close.position < range.start);
+                let end = self
+                    .closes
+                    .partition_point(|close| close.position < range.end);
+                for index in start..end {
+                    let close = self.closes[index];
+                    let block = cfg.instr_to_block[close.instr.index()];
+                    // header prefix 在 If 外原位发射，只有其它 Close 才可能将关闭后的
+                    // continuation 隐藏进 arm；origins 仍按真实候选成员关系判断。
+                    if block == header
+                        || !close.origins.iter().any(|origin| {
+                            let owner = cfg.instr_to_block[origin.index()];
+                            owner == header || !contains(owner)
+                        })
+                    {
+                        continue;
+                    }
+                    let facts = &self.blocks[block.index()];
+                    if facts
+                        .last_effect
+                        .is_some_and(|effect| effect > close.instr.index())
+                        || self.crosses_continuation(facts.tail, &contains)
+                    {
+                        break 'candidate true;
+                    }
+                }
+            }
+            false
+        };
+        for block in self.touched.drain(..) {
+            self.visits[block.index()] = CleanupVisit::Unknown;
+        }
+        crosses
+    }
+
+    fn crosses_continuation(
+        &mut self,
+        mut step: CleanupContinuation,
+        contains: &impl Fn(BlockRef) -> bool,
+    ) -> bool {
+        let start = self.touched.len();
+        let crosses = loop {
+            let block = match step {
+                CleanupContinuation::Effect => break true,
+                CleanupContinuation::End => break false,
+                CleanupContinuation::Next(block) => block,
+            };
+            if block == self.cfg.exit_block || !contains(block) {
+                break false;
+            }
+            match self.visits[block.index()] {
+                CleanupVisit::Done(result) => break result,
+                CleanupVisit::Active => break true,
+                CleanupVisit::Unknown => {}
+            }
+            self.visits[block.index()] = CleanupVisit::Active;
+            self.touched.push(block);
+            let facts = &self.blocks[block.index()];
+            step = if facts.last_effect.is_some() {
+                CleanupContinuation::Effect
+            } else {
+                facts.tail
+            };
+        };
+        // 这里只记完整 block 入口的结果，不能把 Close 的中途 suffix 结果写回。
+        for block in &self.touched[start..] {
+            self.visits[block.index()] = CleanupVisit::Done(crosses);
+        }
+        crosses
     }
 }
 
@@ -73,286 +296,199 @@ pub(super) fn analyze_scopes(
     scopes
 }
 
-pub(super) fn analyze_cleanup_dispositions(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    plan: &StructurePlan,
-) -> Result<(Vec<Option<CleanupDisposition>>, Vec<TbcScopePlan>), StructureError> {
-    let tbc_flow = analyze_tbc_flow(proto, cfg);
-    let explicit_tbc_close_origins = &tbc_flow.close_origins;
-    let mut lexical_owners = vec![None; proto.instrs.len()];
-    for (index, scope) in plan.scopes.iter().enumerate() {
-        for close in &scope.close_points {
-            let Some(&close_block) = cfg.instr_to_block.get(close.index()) else {
-                return Err(StructureError::invalid(format!(
-                    "scope cleanup {close} has no CFG block"
-                )));
-            };
-            if scope.entry == close_block {
-                let Some(slot) = lexical_owners.get_mut(close.index()) else {
-                    return Err(StructureError::invalid(format!(
-                        "scope cleanup {close} is outside the instruction arena"
-                    )));
-                };
-                if slot.replace(ScopePlanId(index)).is_some() {
-                    return Err(StructureError::invalid(format!(
-                        "cleanup {close} has multiple lexical scope owners"
-                    )));
-                }
-            }
-        }
-    }
-
-    let layout_rank = block_layout_ranks(plan, cfg)?;
-    let mut scope_groups = BTreeMap::<Vec<InstrRef>, Vec<InstrRef>>::new();
-    for (&close, origins) in explicit_tbc_close_origins {
-        if explicit_tbc_loop_owner(proto, cfg, plan, close, origins).is_none() {
-            scope_groups
-                .entry(origins.iter().copied().collect())
-                .or_default()
-                .push(close);
-        }
-    }
-    let mut tbc_scopes = Vec::with_capacity(scope_groups.len());
-    let mut tbc_scope_by_close = vec![None; proto.instrs.len()];
-    for (origins, mut closes) in scope_groups {
-        closes.sort_by_key(|close| {
-            let block = cfg.instr_to_block[close.index()];
-            (layout_rank[block.index()], close.index())
-        });
-        let boundary = closes[0];
-        let id = TbcScopePlanId(tbc_scopes.len());
-        for close in &closes {
-            tbc_scope_by_close[close.index()] = Some((id, *close == boundary));
-        }
-        tbc_scopes.push(TbcScopePlan {
-            origins,
-            boundary,
-            exits: closes
-                .into_iter()
-                .filter(|close| *close != boundary)
-                .collect(),
-        });
-    }
-
-    let mut dispositions = vec![None; proto.instrs.len()];
-    for block in cfg.block_order.iter().copied() {
-        let range = cfg.blocks[block.index()].instrs;
-        for instr_index in range.start.index()..range.end() {
-            let instr_ref = InstrRef(instr_index);
-            let reachable = cfg.reachable_blocks.contains(&block);
-            dispositions[instr_index] = match &proto.instrs[instr_index] {
-                LowInstr::Close(_) | LowInstr::Tbc(_) if !reachable => {
-                    Some(CleanupDisposition::Unreachable)
-                }
-                LowInstr::Tbc(_) => Some(CleanupDisposition::ExplicitTbc),
-                LowInstr::Close(_) if explicit_tbc_close_origins.contains_key(&instr_ref) => {
-                    let origins = explicit_tbc_close_origins.get(&instr_ref).ok_or_else(|| {
-                        StructureError::invalid(format!(
-                            "cleanup {instr_ref} lost its explicit TBC origins"
-                        ))
-                    })?;
-                    Some(
-                        if let Some(region) =
-                            explicit_tbc_loop_owner(proto, cfg, plan, instr_ref, origins)
-                        {
-                            CleanupDisposition::LoopTbcBoundary(region)
-                        } else {
-                            let (scope, boundary) =
-                                tbc_scope_by_close[instr_index].ok_or_else(|| {
-                                    StructureError::invalid(format!(
-                                        "cleanup {instr_ref} has no explicit TBC scope owner"
-                                    ))
-                                })?;
-                            if boundary {
-                                CleanupDisposition::ExplicitTbcBoundary(scope)
-                            } else {
-                                CleanupDisposition::ExplicitTbcExit(scope)
-                            }
-                        },
-                    )
-                }
-                LowInstr::Close(_) => {
-                    let owner = lexical_owners
-                        .get(instr_index)
-                        .copied()
-                        .flatten()
-                        .ok_or_else(|| {
-                            StructureError::invalid(format!(
-                                "reachable cleanup {instr_ref} has no lexical scope owner"
-                            ))
-                        })?;
-                    Some(CleanupDisposition::LexicalScope(owner))
-                }
-                _ => None,
-            };
-        }
-    }
-    validate_cleanup_dispositions(
-        proto,
-        cfg,
-        plan,
-        explicit_tbc_close_origins,
-        &dispositions,
-        &tbc_scopes,
-    )?;
-    Ok((dispositions, tbc_scopes))
-}
-
-/// 把 label 相对入口 cleanup 的位置冻结进最终计划。
-///
-/// TBC join 的 must-active 集合可能为空，但某条入边仍携带活跃声明，并由目标 block
-/// 开头的 `Close` 归一化。label 若放在该 Close 前面，HIR 词法化后会错误地落进
-/// `<close>` local 的作用域；因此只允许它越过连续、已有唯一 owner 的 boundary。
-pub(super) fn finalize_label_placements(
+pub(super) fn finalize_cleanup_dispositions(
     proto: &LoweredProto,
     cfg: &Cfg,
     plan: &mut StructurePlan,
 ) -> Result<(), StructureError> {
-    let flow = analyze_tbc_flow(proto, cfg);
-    let mut finalized = Vec::with_capacity(plan.labels.len());
-    for label in &plan.labels {
-        let range = cfg
-            .blocks
-            .get(label.block.index())
-            .ok_or_else(|| StructureError::invalid("label block is outside the CFG arena"))?
-            .instrs;
-        let mut barriers = flow
-            .active_at_entry(label.block)
-            .ok_or_else(|| StructureError::invalid("label block has no TBC entry facts"))?
-            .clone();
-        let mut placement = label.placement;
-        if placement == LabelPlacement::BeforeBlock {
-            for instr_index in range.start.index()..range.end() {
-                let instr_ref = InstrRef(instr_index);
-                let Some(CleanupDisposition::ExplicitTbcBoundary(scope_id)) =
-                    plan.cleanup_disposition(instr_ref)
-                else {
-                    break;
-                };
-                if !matches!(proto.instrs.get(instr_index), Some(LowInstr::Close(_))) {
-                    return Err(StructureError::invalid(format!(
-                        "label cleanup boundary {instr_ref} is not a Close instruction"
-                    )));
-                }
-                let scope = plan.tbc_scope(scope_id).ok_or_else(|| {
-                    StructureError::invalid(format!(
-                        "label cleanup boundary {instr_ref} references missing TBC scope"
-                    ))
-                })?;
-                for origin in &scope.origins {
-                    barriers.remove(origin);
-                }
-                placement = LabelPlacement::AfterCleanup(instr_ref);
+    let mut lexical_owners = vec![None; proto.instrs.len()];
+    for (index, scope) in plan.scopes.iter().enumerate() {
+        for &close in &scope.close_points {
+            if cfg.instr_to_block[close.index()] == scope.entry
+                && lexical_owners[close.index()]
+                    .replace(ScopePlanId(index))
+                    .is_some()
+            {
+                return Err(StructureError::invalid(
+                    "cleanup has multiple lexical scope owners",
+                ));
             }
         }
-        finalized.push((barriers.into_iter().collect::<Vec<_>>(), placement));
     }
-    for (label, (barriers, placement)) in plan.labels.iter_mut().zip(finalized) {
+    let mut dispositions = vec![None; proto.instrs.len()];
+    for &block in &cfg.block_order {
+        let range = cfg.blocks[block.index()].instrs;
+        for index in range.start.index()..range.end() {
+            let instr = InstrRef(index);
+            dispositions[index] = match &proto.instrs[index] {
+                LowInstr::Close(_) | LowInstr::Tbc(_) if !cfg.reachable_blocks.contains(&block) => {
+                    Some(CleanupDisposition::Unreachable)
+                }
+                LowInstr::Tbc(_) => Some(CleanupDisposition::ExplicitTbc),
+                LowInstr::Close(_) if plan.tbc_flow.close_origins.contains_key(&instr) => {
+                    let origins = &plan.tbc_flow.close_origins[&instr];
+                    Some(
+                        explicit_tbc_loop_owner(proto, cfg, plan, instr, origins).map_or(
+                            CleanupDisposition::ExplicitClose,
+                            CleanupDisposition::LoopTbcBoundary,
+                        ),
+                    )
+                }
+                LowInstr::Close(_) => Some(CleanupDisposition::LexicalScope(
+                    lexical_owners[index].ok_or_else(|| {
+                        StructureError::invalid(format!(
+                            "reachable cleanup {instr} has no lexical scope owner"
+                        ))
+                    })?,
+                )),
+                _ => None,
+            };
+        }
+    }
+    // 每条 Close 保留独立事件；只有目标的连续显式入口可以移动到所有真实入边。
+    // 函数入口没有可代表首次调用的 CFG 入边，loop cleanup 则保留既有 owner。
+    let mut syntax_edges = vec![false; cfg.edges.len()];
+    for (_, loop_) in plan.loops() {
+        if matches!(
+            loop_.kind,
+            crate::structure::LoopKindHint::NumericForLike
+                | crate::structure::LoopKindHint::GenericForLike
+        ) {
+            let control = &loop_.control_edges;
+            for edge in control
+                .preheader_body
+                .iter()
+                .chain(&control.preheader_exit)
+                .chain(&control.body)
+                .chain(&control.exit)
+                .chain(&control.backedges)
+            {
+                syntax_edges[edge.index()] = true;
+            }
+        }
+    }
+    for &block in &cfg.block_order {
+        if block == cfg.entry_block || !cfg.reachable_blocks.contains(&block) {
+            continue;
+        }
+        let range = cfg.blocks[block.index()].instrs;
+        let prefix = (range.start.index()..range.end())
+            .take_while(|&index| {
+                matches!(&proto.instrs[index], LowInstr::Close(close)
+                if close.kind == crate::transformer::CloseKind::Explicit)
+                    && dispositions[index] == Some(CleanupDisposition::ExplicitClose)
+                    && plan
+                        .loop_exit_tail_for_cleanup_instr(InstrRef(index))
+                        .is_none()
+            })
+            .collect::<Vec<_>>();
+        if prefix.is_empty() {
+            continue;
+        }
+        let incoming = cfg.preds[block.index()]
+            .iter()
+            .copied()
+            .filter(|edge| cfg.reachable_blocks.contains(&cfg.edges[edge.index()].from))
+            .collect::<Vec<_>>();
+        if incoming.is_empty() {
+            return Err(StructureError::invalid(
+                "reachable cleanup block has no incoming edge",
+            ));
+        }
+        // for 的隐式分派边由源码语法及 VM value phases 消费，没有逐边 cleanup 发射点。
+        // 必须让整个前缀保留原位；只移动 break 入边会让自然/提前退出重复或漏执行。
+        if incoming.iter().any(|edge| syntax_edges[edge.index()]) {
+            continue;
+        }
+        for edge in incoming {
+            let mut active = plan.tbc_flow.may_out[cfg.edges[edge.index()].from.index()].clone();
+            for &index in &prefix {
+                let instr = InstrRef(index);
+                let actual = &plan.tbc_flow.close_origins[&instr];
+                let origins = active.intersection(actual).copied().collect::<Vec<_>>();
+                active.retain(|origin| !actual.contains(origin));
+                if !origins.is_empty() {
+                    plan.edge_plans[edge.index()]
+                        .cleanup
+                        .push(super::plan::EdgeCleanupAction { instr, origins });
+                }
+            }
+        }
+        for index in prefix {
+            dispositions[index] = Some(CleanupDisposition::IncomingEdges);
+        }
+    }
+    plan.cleanup_dispositions = dispositions;
+    Ok(())
+}
+
+/// 入口事件已在入边执行，label 消费原始 Close 锚点及其 origin，不能从 must 集合反推。
+pub(super) fn finalize_label_placements(
+    cfg: &Cfg,
+    plan: &mut StructurePlan,
+) -> Result<(), StructureError> {
+    let mut finalized = Vec::with_capacity(plan.labels.len());
+    for label in &plan.labels {
+        let (last, entry_cleanup) = label_entry_cleanup(cfg, plan, label.block)?;
+        let barriers = plan
+            .tbc_flow
+            .active_at_entry(label.block)
+            .ok_or_else(|| StructureError::invalid("label block has no TBC entry facts"))?
+            .difference(&entry_cleanup)
+            .copied()
+            .collect::<Vec<_>>();
+        let placement = match (label.placement, last) {
+            (LabelPlacement::BeforeBlock, Some(last)) => LabelPlacement::AfterCleanup(last),
+            (placement, _) => placement,
+        };
+        finalized.push((
+            barriers,
+            placement,
+            entry_cleanup.into_iter().collect::<Vec<_>>(),
+        ));
+    }
+    for (label, (barriers, placement, entry_cleanup)) in plan.labels.iter_mut().zip(finalized) {
+        label.entry_cleanup = entry_cleanup;
         label.tbc_barriers = barriers;
         label.placement = placement;
     }
     Ok(())
 }
 
-fn block_layout_ranks(plan: &StructurePlan, cfg: &Cfg) -> Result<Vec<usize>, StructureError> {
-    enum Work {
-        Region(RegionId),
-        Block(BlockRef),
-    }
-
-    let mut ranks = vec![usize::MAX; cfg.blocks.len()];
-    let mut next = 0usize;
-    let mut stack = vec![Work::Region(plan.root())];
-    while let Some(work) = stack.pop() {
-        let block = match work {
-            Work::Block(block) => Some(block),
-            Work::Region(region) => {
-                let node = plan.region(region).ok_or_else(|| {
-                    StructureError::invalid("TBC layout references a missing region")
-                })?;
-                match node {
-                    RegionPlan::Block { block, .. } => Some(*block),
-                    RegionPlan::Sequence { children, .. } => {
-                        stack.extend(children.iter().rev().copied().map(Work::Region));
-                        None
-                    }
-                    RegionPlan::Branch {
-                        condition,
-                        then_arm,
-                        else_arm,
-                        ..
-                    } => {
-                        if let Some(else_arm) = else_arm {
-                            stack.push(Work::Region(*else_arm));
-                        }
-                        stack.push(Work::Region(*then_arm));
-                        stack.push(Work::Region(*condition));
-                        None
-                    }
-                    RegionPlan::ValueDecision { plan: decision, .. } => {
-                        let decision = plan.value_decision(*decision).ok_or_else(|| {
-                            StructureError::invalid(
-                                "TBC layout references a missing value decision",
-                            )
-                        })?;
-                        stack.extend(decision.blocks.iter().rev().copied().map(Work::Block));
-                        None
-                    }
-                    RegionPlan::Loop {
-                        preheader,
-                        control,
-                        body,
-                        normal_tail,
-                        ..
-                    } => {
-                        if let Some(normal_tail) = normal_tail {
-                            stack.push(Work::Region(*normal_tail));
-                        }
-                        stack.push(Work::Region(*body));
-                        stack.push(Work::Region(*control));
-                        if let Some(preheader) = preheader {
-                            stack.push(Work::Region(*preheader));
-                        }
-                        None
-                    }
-                    RegionPlan::Unstructured { layout, .. } => {
-                        for item in layout.iter().rev() {
-                            stack.push(match item {
-                                super::plan::UnstructuredLayoutItem::Block(block) => {
-                                    Work::Block(*block)
-                                }
-                                super::plan::UnstructuredLayoutItem::Region(region) => {
-                                    Work::Region(*region)
-                                }
-                            });
-                        }
-                        None
-                    }
-                }
-            }
-        };
-        if let Some(block) = block {
-            let slot = ranks.get_mut(block.index()).ok_or_else(|| {
-                StructureError::invalid("TBC layout block is outside the CFG arena")
-            })?;
-            if *slot == usize::MAX {
-                *slot = next;
-                next += 1;
-            }
+fn label_entry_cleanup(
+    cfg: &Cfg,
+    plan: &StructurePlan,
+    block: BlockRef,
+) -> Result<(Option<InstrRef>, BTreeSet<InstrRef>), StructureError> {
+    let range = cfg
+        .blocks
+        .get(block.index())
+        .ok_or_else(|| StructureError::invalid("label block is outside the CFG arena"))?
+        .instrs;
+    let mut last = None;
+    let mut origins = BTreeSet::new();
+    for index in range.start.index()..range.end() {
+        let instr = InstrRef(index);
+        if plan.cleanup_disposition(instr) != Some(CleanupDisposition::IncomingEdges) {
+            break;
         }
+        origins.extend(
+            plan.tbc_flow
+                .close_origins(instr)
+                .ok_or_else(|| StructureError::invalid("entry cleanup has no TBC origins"))?,
+        );
+        last = Some(instr);
     }
-    Ok(ranks)
+    Ok((last, origins))
 }
 
-fn validate_cleanup_dispositions(
+pub(super) fn validate_cleanup_dispositions(
     proto: &LoweredProto,
     cfg: &Cfg,
     plan: &StructurePlan,
-    explicit_tbc_close_origins: &BTreeMap<InstrRef, BTreeSet<InstrRef>>,
-    dispositions: &[Option<CleanupDisposition>],
-    tbc_scopes: &[TbcScopePlan],
 ) -> Result<(), StructureError> {
+    let explicit_tbc_close_origins = &plan.tbc_flow.close_origins;
+    let dispositions = &plan.cleanup_dispositions;
     if dispositions.len() != proto.instrs.len() {
         return Err(StructureError::invalid(format!(
             "cleanup arena has {} slots for {} instructions",
@@ -400,34 +536,17 @@ fn validate_cleanup_dispositions(
             }
             (
                 LowInstr::Close(_),
-                Some(
-                    CleanupDisposition::ExplicitTbcBoundary(scope_id)
-                    | CleanupDisposition::ExplicitTbcExit(scope_id),
-                ),
+                Some(CleanupDisposition::ExplicitClose | CleanupDisposition::IncomingEdges),
             ) => {
-                let Some(scope) = tbc_scopes.get(scope_id.index()) else {
-                    return Err(StructureError::invalid(format!(
-                        "cleanup @{instr_index} references a missing TBC scope"
-                    )));
-                };
-                let instr_ref = InstrRef(instr_index);
-                let role_matches = match disposition {
-                    Some(CleanupDisposition::ExplicitTbcBoundary(_)) => scope.boundary == instr_ref,
-                    Some(CleanupDisposition::ExplicitTbcExit(_)) => {
-                        scope.exits.contains(&instr_ref)
-                    }
-                    _ => false,
-                };
+                let instr = InstrRef(instr_index);
+                let origins = explicit_tbc_close_origins.get(&instr);
                 if !cfg.reachable_blocks.contains(&block)
-                    || explicit_tbc_close_origins
-                        .get(&instr_ref)
-                        .is_none_or(|origins| {
-                            !origins.iter().copied().eq(scope.origins.iter().copied())
-                        })
-                    || !role_matches
+                    || origins.is_none_or(|origins| {
+                        explicit_tbc_loop_owner(proto, cfg, plan, instr, origins).is_some()
+                    })
                 {
                     return Err(StructureError::invalid(format!(
-                        "cleanup @{instr_index} has a stale explicit TBC scope owner"
+                        "cleanup @{instr_index} has stale TBC origins"
                     )));
                 }
             }
@@ -458,6 +577,65 @@ fn validate_cleanup_dispositions(
             }
         }
     }
+    validate_entry_cleanups(proto, cfg, plan)
+}
+
+fn validate_entry_cleanups(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    plan: &StructurePlan,
+) -> Result<(), StructureError> {
+    let mut prefixes = vec![Vec::new(); cfg.blocks.len()];
+    for &block in &cfg.block_order {
+        let range = cfg.blocks[block.index()].instrs;
+        let mut prefix = true;
+        for index in range.start.index()..range.end() {
+            let instr = InstrRef(index);
+            if plan.cleanup_disposition(instr) != Some(CleanupDisposition::IncomingEdges) {
+                prefix = false;
+                continue;
+            }
+            if !prefix
+                || block == cfg.entry_block
+                || !matches!(&proto.instrs[index], LowInstr::Close(close)
+                    if close.kind == crate::transformer::CloseKind::Explicit)
+                || plan.loop_exit_tail_for_cleanup_instr(instr).is_some()
+                || cfg.preds[block.index()]
+                    .iter()
+                    .all(|edge| !cfg.reachable_blocks.contains(&cfg.edges[edge.index()].from))
+            {
+                return Err(StructureError::invalid(format!(
+                    "cleanup {instr} has no complete explicit-entry ownership"
+                )));
+            }
+            prefixes[block.index()].push(instr);
+        }
+    }
+    for (index, edge) in cfg.edges.iter().enumerate() {
+        let mut actions = plan.edge_plans[index].cleanup.iter();
+        if cfg.reachable_blocks.contains(&edge.from) {
+            let mut active = plan.tbc_flow.may_out[edge.from.index()].clone();
+            for &instr in &prefixes[edge.to.index()] {
+                let actual = &plan.tbc_flow.close_origins[&instr];
+                let origins = active.intersection(actual).copied().collect::<Vec<_>>();
+                active.retain(|origin| !actual.contains(origin));
+                if !origins.is_empty()
+                    && actions
+                        .next()
+                        .is_none_or(|action| action.instr != instr || action.origins != origins)
+                {
+                    return Err(StructureError::invalid(format!(
+                        "edge #{index} does not execute its exact entry cleanup {instr}"
+                    )));
+                }
+            }
+        }
+        if actions.next().is_some() {
+            return Err(StructureError::invalid(format!(
+                "edge #{index} has an unowned or duplicate entry cleanup"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -470,6 +648,7 @@ pub(super) fn analyze_tbc_flow(proto: &LoweredProto, cfg: &Cfg) -> TbcFlowFacts 
         return TbcFlowFacts {
             active_in: vec![BTreeSet::new(); cfg.blocks.len()],
             active_out: vec![BTreeSet::new(); cfg.blocks.len()],
+            may_out: vec![BTreeSet::new(); cfg.blocks.len()],
             close_origins: BTreeMap::new(),
         };
     }
@@ -535,6 +714,10 @@ pub(super) fn analyze_tbc_flow(proto: &LoweredProto, cfg: &Cfg) -> TbcFlowFacts 
     TbcFlowFacts {
         active_in,
         active_out,
+        may_out: active_by_reg_out
+            .into_iter()
+            .map(|by_reg| by_reg.into_values().flatten().collect())
+            .collect(),
         close_origins: close_points,
     }
 }
@@ -623,51 +806,30 @@ fn analyze_definite_tbc_flow(
 }
 
 pub(super) fn validate_label_tbc_barriers(
-    proto: &LoweredProto,
     cfg: &Cfg,
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
-    let flow = analyze_tbc_flow(proto, cfg);
+    let flow = &plan.tbc_flow;
     for (id, label) in plan.labels() {
-        let mut expected = flow.active_at_entry(label.block).cloned().ok_or_else(|| {
-            StructureError::invalid(format!(
-                "label #{} target {} has no TBC entry facts",
-                id.index(),
-                label.block
-            ))
-        })?;
-        if let LabelPlacement::AfterCleanup(last) = label.placement {
-            let range = cfg
-                .blocks
-                .get(label.block.index())
-                .ok_or_else(|| StructureError::invalid("label block is outside the CFG arena"))?
-                .instrs;
-            if last.index() < range.start.index() || last.index() >= range.end() {
-                return Err(StructureError::invalid(format!(
-                    "label #{} cleanup placement is outside its target block",
-                    id.index()
-                )));
-            }
-            for instr_index in range.start.index()..=last.index() {
-                let instr_ref = InstrRef(instr_index);
-                let Some(CleanupDisposition::ExplicitTbcBoundary(scope_id)) =
-                    plan.cleanup_disposition(instr_ref)
-                else {
-                    return Err(StructureError::invalid(format!(
-                        "label #{} crosses a non-boundary instruction",
-                        id.index()
-                    )));
-                };
-                let scope = plan.tbc_scope(scope_id).ok_or_else(|| {
-                    StructureError::invalid(format!(
-                        "label #{} references a missing TBC boundary owner",
-                        id.index()
-                    ))
-                })?;
-                for origin in &scope.origins {
-                    expected.remove(origin);
-                }
-            }
+        let (last, entry_cleanup) = label_entry_cleanup(cfg, plan, label.block)?;
+        let expected = flow
+            .active_at_entry(label.block)
+            .ok_or_else(|| StructureError::invalid("label block has no TBC entry facts"))?
+            .difference(&entry_cleanup)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if matches!(label.placement, LabelPlacement::AfterCleanup(actual) if Some(actual) != last)
+            || matches!(label.placement, LabelPlacement::BeforeBlock) && last.is_some()
+            || !label
+                .entry_cleanup
+                .iter()
+                .copied()
+                .eq(entry_cleanup.iter().copied())
+        {
+            return Err(StructureError::invalid(format!(
+                "label #{} has stale entry cleanup",
+                id.index()
+            )));
         }
         if !label
             .tbc_barriers
@@ -768,6 +930,7 @@ fn explicit_tbc_loop_owner(
                         preheader: *preheader,
                         control: *control,
                         body: *body,
+                        covered_origins: covered_tbc_instrs,
                     },
                     close_block,
                     close_instr,
@@ -829,6 +992,7 @@ struct LoopTbcOwnershipContext<'a> {
     preheader: Option<RegionId>,
     control: RegionId,
     body: RegionId,
+    covered_origins: &'a BTreeSet<InstrRef>,
 }
 
 fn loop_tbc_boundary_location_is_owned(
@@ -845,6 +1009,7 @@ fn loop_tbc_boundary_location_is_owned(
         preheader: _,
         control,
         body,
+        covered_origins: _,
     } = *context;
     if !loop_tbc_boundary_entries_are_owned(context, close_block) {
         return false;
@@ -890,6 +1055,7 @@ fn loop_tbc_boundary_entries_are_owned(
         preheader,
         control,
         body,
+        covered_origins,
     } = *context;
     let mut pending = vec![close_block];
     let mut visited = BTreeSet::new();
@@ -901,6 +1067,10 @@ fn loop_tbc_boundary_entries_are_owned(
             let predecessor = cfg.edges[edge_ref.index()].from;
             if !cfg.reachable_blocks.contains(&predecessor)
                 || loop_iteration_scope_contains(plan, candidate, control, body, predecessor)
+                // VM-for 的正常 dispatch 出口已执行 body cleanup；它可以与仍携带资源的
+                // break 汇合。只消费这条边确实不再携带的 origins，不能将 control 冒充 body。
+                || (block_is_in_region(plan, control, predecessor)
+                    && covered_origins.is_disjoint(&plan.tbc_flow.may_out[predecessor.index()]))
                 || (candidate.preheader_block == Some(predecessor)
                     && preheader
                         .is_some_and(|region| block_is_in_region(plan, region, predecessor))

@@ -1496,10 +1496,12 @@ mod tests {
             else_block: None,
         }));
         let return_stmt = HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::default(),
         }));
         let goto_stmt = HirStmt::Goto(Box::new(HirGoto { target }));
         let label = HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id: target,
             tbc_barriers: Vec::new(),
         }));
@@ -1531,6 +1533,7 @@ mod tests {
         let nested_target = HirLabelId(1);
         let external_backward = block(vec![
             HirStmt::Block(Box::new(block(vec![HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: nested_target,
                 tbc_barriers: Vec::new(),
             }))]))),
@@ -1556,6 +1559,7 @@ mod tests {
         let body = block(vec![
             assign(TempId(0), HirExpr::LocalRef(local)),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::default(),
             })),
             assign(TempId(1), HirExpr::LocalRef(local)),
@@ -1575,9 +1579,14 @@ mod tests {
         facts.record_temp_home_slot_for_test(temp, home);
         let mut body = block(vec![
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::default(),
             })),
-            HirStmt::Close(Box::new(HirClose { from_reg: 0 })),
+            HirStmt::Close(Box::new(HirClose {
+                kind: crate::transformer::CloseKind::Explicit,
+                from_reg: 0,
+                origins: Vec::new(),
+            })),
             HirStmt::Block(Box::default()),
             assign(temp, HirExpr::ParamRef(ParamId(0))),
             HirStmt::Assign(Box::new(HirAssign {
@@ -1637,10 +1646,15 @@ mod tests {
             })),
             HirStmt::Block(Box::new(block(vec![
                 HirStmt::Label(Box::new(HirLabel {
+                    entry_cleanup: Vec::new(),
                     id: target,
                     tbc_barriers: Vec::new(),
                 })),
-                HirStmt::Close(Box::new(HirClose { from_reg: 0 })),
+                HirStmt::Close(Box::new(HirClose {
+                    kind: crate::transformer::CloseKind::Explicit,
+                    from_reg: 0,
+                    origins: Vec::new(),
+                })),
                 assign(temp, HirExpr::ParamRef(ParamId(0))),
                 HirStmt::Assign(Box::new(HirAssign {
                     targets: vec![HirLValue::Param(ParamId(0))],

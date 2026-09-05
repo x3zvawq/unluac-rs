@@ -71,9 +71,7 @@ struct GenericForIteratorPass<'a> {
 }
 
 impl HirRewritePass for GenericForIteratorPass<'_> {
-    fn preserves_generic_for_initializer_transaction_on_iterator_rewrite(&self) -> bool {
-        true
-    }
+    const PRESERVES_GENERIC_FOR_INITIALIZER_TRANSACTION: bool = true;
 
     fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
         let HirStmt::GenericFor(generic_for) = stmt else {

@@ -46,22 +46,21 @@ pub use common::{
 pub use debug::dump_structure;
 pub(crate) use diagnostic::{dump_dataflow_proto, dump_structure_proto};
 pub use error::StructureError;
-pub(crate) use phi_facts::CanonicalMoveIndex;
 pub use plan::{
     BlockEmissionPlan, BlockTerminatorKind, BlockTerminatorPlan, BranchArm, BranchPlanData,
     BranchPlanId, BranchValuePlan, CleanupDisposition, ConditionArcPlan, ConditionArcPolarity,
     ConditionArcRef, ConditionNodeId, ConditionNodePlan, ConditionPlan, ConditionPlanId,
-    ConditionTarget, ConditionValuePlan, ControlFlowFeature, EdgeCopyOrigin, EdgePlan,
-    EdgeTransfer, ForwardRouteId, ForwardRouteKind, ForwardRoutePlan, GenericForProtocol,
+    ConditionTarget, ConditionValuePlan, ControlFlowFeature, EdgeCleanupAction, EdgeCopyOrigin,
+    EdgePlan, EdgeTransfer, ForwardRouteId, ForwardRouteKind, ForwardRoutePlan, GenericForProtocol,
     LabelPlacement, LabelPlan, LabelPlanId, LoopConditionPrefixPlacement, LoopConditionProtocol,
     LoopControlEdges, LoopIterationDisposition, LoopNormalTailPlan, LoopPlanData, LoopPlanId,
     LoopRepeatForm, LoopRepeatProtocol, LoopRepeatStagedResult, LoopRepeatValuePlan,
     LoopValueActionBatch, LoopValueActions, LoopValuePhase, LoopValueSource, LoopValueWrite,
     LoopVmProtocol, NumericForProtocol, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan,
     PlanRequirement, PlanRequirementId, PlanRequirements, RegionId, RegionPlan, ScopePlanId,
-    SinglePassPlan, SinglePassPlanId, TbcScopePlan, TbcScopePlanId, UnstructuredLayoutItem,
-    ValueDecisionArcPlan, ValueDecisionLeafId, ValueDecisionLeafPlan, ValueDecisionNodeId,
-    ValueDecisionNodePlan, ValueDecisionPlan, ValueDecisionPlanId, ValueDecisionTarget,
+    SinglePassPlan, SinglePassPlanId, UnstructuredLayoutItem, ValueDecisionArcPlan,
+    ValueDecisionLeafId, ValueDecisionLeafPlan, ValueDecisionNodeId, ValueDecisionNodePlan,
+    ValueDecisionPlan, ValueDecisionPlanId, ValueDecisionTarget,
 };
 #[cfg(not(feature = "decompile-debug"))]
 mod debug {

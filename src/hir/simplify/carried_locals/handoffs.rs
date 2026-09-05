@@ -814,6 +814,7 @@ mod tests {
                     vec![HirExpr::ParamRef(ParamId(0))],
                 ),
                 HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::ParamRef(ParamId(0))]),
                 })),
             ],
@@ -897,11 +898,13 @@ mod tests {
                     cond: HirExpr::Boolean(true),
                     then_block: HirBlock {
                         stmts: vec![HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                            source_instr: None,
                             values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
                         }))],
                     },
                     else_block: Some(HirBlock {
                         stmts: vec![HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                            source_instr: None,
                             values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
                         }))],
                     }),
@@ -954,10 +957,12 @@ mod tests {
                     vec![HirExpr::Integer(0)],
                 ),
                 HirStmt::Label(Box::new(HirLabel {
+                    entry_cleanup: Vec::new(),
                     id: label,
                     tbc_barriers: Vec::new(),
                 })),
                 HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
                 })),
             ],

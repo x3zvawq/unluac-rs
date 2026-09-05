@@ -178,7 +178,12 @@ pub(super) fn choose_synthetic_local_candidate(
     options: NamingOptions,
 ) -> CandidateHint {
     let index = local.index();
-    if let Some(name) = evidence.temp_debug_names.get(index).and_then(as_valid_name) {
+    if let AstSyntheticLocalId::HirTemp(temp) = local
+        && let Some(name) = evidence
+            .temp_debug_names
+            .get(temp.index())
+            .and_then(as_valid_name)
+    {
         return CandidateHint {
             text: name,
             source: NameSource::Debug,
@@ -346,7 +351,7 @@ fn resolve_captured_temp_name(
             })?;
     parent_names
         .synthetic_locals
-        .get(&AstSyntheticLocalId(temp))
+        .get(&AstSyntheticLocalId::HirTemp(temp))
         .map(|name| name.text.clone())
         .ok_or(NamingError::MissingCapturedBinding {
             function: function.index(),

@@ -76,8 +76,9 @@ pub(super) fn validate_edges(
                         ))
                     })?
                     .instrs;
-                if !matches!(edge_plan.transfer, EdgeTransfer::LoopBack(_))
+                if edge.kind != EdgeKind::Jump
                     || edge_plan.forward_route.is_some()
+                    || plan.edge_action_is_forwarded_only(edge_plan.edge)
                     || cfg.succs.get(edge.from.index()).map(Vec::as_slice)
                         != Some(&[edge_plan.edge])
                     || cleanup.is_empty()
@@ -431,6 +432,7 @@ pub(super) fn validate_condition_internal_route(
             ))
         })?;
         if !edge_plan.phi_copies.is_empty()
+            || !edge_plan.cleanup.is_empty()
             || edge_plan.actions_before_trailing_cleanup().is_some()
             || !matches!(
                 edge_plan.transfer,

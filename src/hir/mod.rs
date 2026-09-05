@@ -31,8 +31,9 @@ pub use common::{
     HirMethodRewriteTransactionId, HirMethodSetupProtocolId, HirModule, HirNumericFor, HirPackTail,
     HirProto, HirProtoRef, HirRecordField, HirRepeat, HirRepeatBinding,
     HirRepeatConditionLifetimeFacts, HirReturn, HirStmt, HirTableAccess, HirTableAllocation,
-    HirTableConstructor, HirTableField, HirTableSetList, HirToBeClosed, HirUnaryExpr,
-    HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile, LocalId, ParamId, TempId, UpvalueId,
+    HirTableConstructor, HirTableField, HirTableSetList, HirTbcDeclaration, HirToBeClosed,
+    HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile, LocalId, ParamId,
+    TempId, UpvalueId,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_hir;

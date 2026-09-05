@@ -36,7 +36,8 @@
 //! 含引用 capture 的 temp 组若不能证明同槽，则保持 temp，避免丢失 capture cell 身份。
 //! promotion plan 会在候选形成时冻结初始化值；apply 只消费已验证的 plan，不再重新匹配
 //! anchor 语句。`while` 条件里的 temp 则作为跨迭代消费者保护到 body，避免把回边写回
-//! 误删成一次性的 move alias。
+//! 误删成一次性的 move alias。子作用域还继承父块的前缀引用；goto 回边可再次读取
+//! 这些状态，不能因为读点在文本前方就让内层 alias promotion 吞掉跨块写回。
 //!
 mod branch_merge;
 mod entry_nil;
@@ -443,7 +444,7 @@ fn promote_block_with_protection(
         ));
 
     // 每轮控制头等 block 外消费者先保护当前 block；递归进入子作用域时再叠加当前语句
-    // 之后的引用。tracker 用引用计数维护后缀集合，避免按 index 克隆完整集合。
+    // 之外的引用。tracker 维护前缀集合和后缀计数，避免按 index 克隆完整集合。
     let stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
     let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
 
@@ -545,10 +546,12 @@ fn promote_block_with_protection(
             continue;
         }
 
-        // 子作用域的 outer temps = 当前块后续语句的 temp 引用 ∪ 来自祖先作用域的保护集
+        // 候选拒绝[SemanticBarrier:Scope]：前缀读取可经 goto 回边重访；regress_485 中
+        // 子块若把 `next=1; state=next` 合并成新 local，会让外层始终读取入口 state。
         let child_uses_outer_temp = |temp| {
             block_uses_outer_temp(temp)
                 || protection.descendant_temps.contains(&temp)
+                || temp_refs.prefix_contains(temp)
                 || temp_refs.suffix_contains(temp)
         };
         let stmt_changed = rewrite_stmt(
@@ -638,9 +641,14 @@ fn collect_plans(
         .position(stmt_contains_nested_nonlocal_control);
     let linear_prefix_end = label_flow_boundary.unwrap_or(block.stmts.len());
     let lifetime_stmts = &block.stmts[..linear_prefix_end];
-    let label_cfg = LexicalCfg::analyze(&block.stmts, ctx.label_refs, ctx.roots.safety).ok();
-    let has_label_flow =
-        label_cfg.as_ref().is_some_and(LexicalCfg::has_label_flow) || label_flow_boundary.is_some();
+    let has_label_flow = label_flow_boundary.is_some();
+    let suffix_dominance = if has_label_flow {
+        LexicalCfg::analyze(&block.stmts, ctx.label_refs, ctx.roots.safety)
+            .ok()
+            .map(|cfg| cfg.suffix_dominance())
+    } else {
+        None
+    };
 
     let facts = ctx.facts;
     let temp_debug_locals = ctx.temp_debug_locals;
@@ -691,7 +699,7 @@ fn collect_plans(
     let label_flow_proof = LabelFlowGroupProof {
         block,
         linear_prefix_end,
-        cfg: label_cfg.as_ref(),
+        suffix_dominance: suffix_dominance.as_deref(),
         facts,
         call_roots: &call_root_lifetimes,
         lookup_roots: &lookup_gc_root_lifetimes,
@@ -1422,7 +1430,7 @@ enum LabelFlowGroupFailure {
 struct LabelFlowGroupProof<'a> {
     block: &'a HirBlock,
     linear_prefix_end: usize,
-    cfg: Option<&'a LexicalCfg>,
+    suffix_dominance: Option<&'a [bool]>,
     facts: &'a ProtoPromotionFacts,
     call_roots: &'a CallRootLifetimeIndices,
     lookup_roots: &'a LookupGcRootLifetimeIndices,
@@ -1436,10 +1444,10 @@ impl LabelFlowGroupProof<'_> {
         root_temp: TempId,
         group: &PromotionGroup,
     ) -> Result<(), LabelFlowGroupFailure> {
-        let Some(cfg) = self.cfg else {
+        let Some(suffix_dominance) = self.suffix_dominance else {
             return Err(LabelFlowGroupFailure::ControlFlow);
         };
-        if !cfg.statement_dominates_suffix(decl_index) {
+        if !suffix_dominance[decl_index] {
             return Err(LabelFlowGroupFailure::ControlFlow);
         }
         let Some(value) = single_temp_assign_value(&self.block.stmts[decl_index], root_temp) else {
@@ -2104,6 +2112,7 @@ mod tests {
 
     fn label(id: HirLabelId) -> HirStmt {
         HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id,
             tbc_barriers: Vec::new(),
         }))
@@ -2157,7 +2166,7 @@ mod tests {
         dispositions.promote_temp_to_local(second, LocalId(0));
         assert_eq!(
             dispositions.local(LocalId(0)),
-            crate::hir::common::HirInlineDisposition::Preserve(BTreeSet::from([
+            &crate::hir::common::HirInlineDisposition::Preserve(BTreeSet::from([
                 crate::hir::common::HirInlineRetentionReason::CapturedValueEpoch,
             ]))
         );
@@ -2264,13 +2273,14 @@ mod tests {
         };
         let owner_refs = count_label_references(&inert.stmts);
         let inert_cfg = LexicalCfg::analyze(&inert.stmts, &owner_refs, safety).unwrap();
+        let inert_suffix_dominance = inert_cfg.suffix_dominance();
         let call_roots = CallRootLifetimeIndices::default();
         let lookup_roots = LookupGcRootLifetimeIndices::default();
         let facts = ProtoPromotionFacts::default();
         let proof = LabelFlowGroupProof {
             block: &inert,
             linear_prefix_end: 2,
-            cfg: Some(&inert_cfg),
+            suffix_dominance: Some(&inert_suffix_dominance),
             facts: &facts,
             call_roots: &call_roots,
             lookup_roots: &lookup_roots,
@@ -2302,13 +2312,14 @@ mod tests {
         };
         let bypassed_refs = count_label_references(&bypassed.stmts);
         let bypassed_cfg = LexicalCfg::analyze(&bypassed.stmts, &bypassed_refs, safety).unwrap();
+        let bypassed_suffix_dominance = bypassed_cfg.suffix_dominance();
         let call_roots = CallRootLifetimeIndices::default();
         let lookup_roots = LookupGcRootLifetimeIndices::default();
         let facts = ProtoPromotionFacts::default();
         let bypassed_proof = LabelFlowGroupProof {
             block: &bypassed,
             linear_prefix_end: 0,
-            cfg: Some(&bypassed_cfg),
+            suffix_dominance: Some(&bypassed_suffix_dominance),
             facts: &facts,
             call_roots: &call_roots,
             lookup_roots: &lookup_roots,
@@ -2334,10 +2345,11 @@ mod tests {
         };
         let unclosed_refs = count_label_references(&unclosed.stmts);
         let unclosed_cfg = LexicalCfg::analyze(&unclosed.stmts, &unclosed_refs, safety).unwrap();
+        let unclosed_suffix_dominance = unclosed_cfg.suffix_dominance();
         let unclosed_proof = LabelFlowGroupProof {
             block: &unclosed,
             linear_prefix_end: 1,
-            cfg: Some(&unclosed_cfg),
+            suffix_dominance: Some(&unclosed_suffix_dominance),
             facts: &facts,
             call_roots: &call_roots,
             lookup_roots: &lookup_roots,

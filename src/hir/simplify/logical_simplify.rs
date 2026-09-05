@@ -17,7 +17,7 @@
 //! - 它不会把一般 `if/branch` 结构强行改写成逻辑表达式，那仍然属于更前面的结构恢复职责
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
-use super::walk::{ExprRewritePass, rewrite_proto_exprs};
+use super::walk::{HirRewritePass, rewrite_proto};
 use crate::decompile::DecompileDialect;
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLogicalExpr, HirProto, HirUnaryOpKind};
 use crate::hir::expr_safety::{HirExprSafety, luau_literal_addition_value};
@@ -27,7 +27,7 @@ pub(super) fn simplify_logical_exprs_in_proto(
     proto: &mut HirProto,
     dialect: DecompileDialect,
 ) -> bool {
-    rewrite_proto_exprs(proto, &mut LogicalExprPass::for_dialect(dialect))
+    rewrite_proto(proto, &mut LogicalExprPass::for_dialect(dialect))
 }
 
 struct LogicalExprPass {
@@ -44,7 +44,7 @@ impl LogicalExprPass {
     }
 }
 
-impl ExprRewritePass for LogicalExprPass {
+impl HirRewritePass for LogicalExprPass {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut changed = false;
 
@@ -693,7 +693,7 @@ fn absorb_stable_or_guard(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -
 
 #[cfg(test)]
 mod tests {
-    use super::super::walk::ExprRewritePass;
+    use super::super::walk::HirRewritePass;
     use super::{LogicalExprPass, simplify_condition_truthiness_shape, simplify_logical_shape};
     use crate::decompile::DecompileDialect;
     use crate::hir::common::{

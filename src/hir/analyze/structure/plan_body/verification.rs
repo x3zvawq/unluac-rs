@@ -215,13 +215,14 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         self.lowering,
                         definition.block,
                     );
-                let canonical = self
-                    .index
-                    .canonical_move_source
-                    .get(def.index())
-                    .copied()
-                    .flatten()
-                    .unwrap_or(value);
+                let canonical = if self.index.edge_action_use_count[def.index()] == 0 {
+                    value
+                } else {
+                    self.lowering
+                        .dataflow
+                        .canonical_move_value(value)
+                        .expect("actual edge action Move source is validated")
+                };
                 // Capture targets include the slot close epoch. Also require the normal temp
                 // resolver to select that cell, so a debug binding cannot override this proof.
                 let shares_capture_target = self

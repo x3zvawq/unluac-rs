@@ -33,7 +33,6 @@ pub(super) fn preserve_loop_state_overwrites(
             carried_temps.insert(temp);
         }
     }
-    let mut moves = crate::structure::CanonicalMoveIndex::new(proto, dataflow);
     for def in &dataflow.defs {
         if fixed_temps[def.id.index()] != TempId(def.id.index())
             || reg_is_captured(captured_regs, def.reg)
@@ -43,7 +42,8 @@ pub(super) fn preserve_loop_state_overwrites(
         {
             continue;
         }
-        let Ok(SsaValue::Def(value)) = moves.resolve(SsaValue::Def(def.id)) else {
+        let Some(SsaValue::Def(value)) = dataflow.canonical_move_value(SsaValue::Def(def.id))
+        else {
             continue;
         };
         if crate::hir::promotion::direct_scalar_overwrite_value(

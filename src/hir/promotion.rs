@@ -34,9 +34,9 @@ use crate::hir::common::{
     ParamId, TempId,
 };
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, DataflowFacts, EdgeRef, ForwardRouteKind, GraphFacts,
-    InstrEffect, LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition,
-    RegionId, RegionPlan, RootObservation, SideEffectSummary, SsaValue, StructurePlan,
+    BlockRef, Cfg, DataflowFacts, EdgeRef, ForwardRouteKind, GraphFacts, InstrEffect,
+    LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, RegionId,
+    RegionPlan, RootObservation, SideEffectSummary, SsaValue, StructurePlan,
 };
 use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
 use std::borrow::Cow;
@@ -1585,7 +1585,6 @@ fn collect_immediate_move_write_homes(
     total_temps: usize,
 ) -> Vec<BTreeSet<HomeSlotKey>> {
     let mut homes = vec![BTreeSet::new(); total_temps];
-    let mut canonical_moves = CanonicalMoveIndex::new(proto, dataflow);
     let mut last_instr_by_root = std::collections::BTreeMap::<SsaValue, (usize, BlockRef)>::new();
 
     for (instr_index, def_ids) in dataflow.instr_defs.iter().enumerate() {
@@ -1594,7 +1593,7 @@ fn collect_immediate_move_write_homes(
                 continue;
             };
             let value = SsaValue::Def(*def_id);
-            let Ok(root) = canonical_moves.resolve(value) else {
+            let Some(root) = dataflow.canonical_move_value(value) else {
                 continue;
             };
 

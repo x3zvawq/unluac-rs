@@ -236,7 +236,7 @@ fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &Focu
         }
 
         for (index, instr) in entry.proto.instrs.iter().enumerate() {
-            let pcs = &entry.proto.lowering_map.pc_map[index];
+            let pcs = &entry.proto.lowering_map.pc_map()[index];
             let raws = &entry.proto.lowering_map.low_to_raw[index];
             let line = entry.proto.lowering_map.line_hints[index]
                 .map_or_else(|| "-".to_owned(), |line| line.to_string());

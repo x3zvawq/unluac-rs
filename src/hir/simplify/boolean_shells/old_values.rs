@@ -24,6 +24,8 @@
 //! 函数出口读取后结束。引用捕获和资源协议不会退化成全 proto blanket guard。
 //! 值是否 GC-inert 统一消费目标方言安全上下文；本文件不从底层 opcode 重新推断根协议。
 
+use crate::hir::simplify::stmt_plan::{PathComponent, StmtPath, remove_planned_stmts};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,19 +39,9 @@ use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 use super::{BooleanShellFacts, OldValueClass};
 use crate::hir::simplify::expr_facts::expr_truthiness;
 use crate::hir::simplify::lexical_cfg::{
-    HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
+    FlowRefinement, HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
 };
 use crate::hir::visit::{self, HirVisitor, visit_stmt_header};
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum PathComponent {
-    Stmt(usize),
-    Then,
-    Else,
-    Body,
-}
-
-type StmtPath = Vec<PathComponent>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct LiveBindingState {
@@ -280,6 +272,7 @@ impl<'a> ShellFlowFacts<'a> {
                 }
                 active.apply(node);
             },
+            |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
         // 观察者 reaching 已收敛；后向 gen/kill 按 binding/home 分量独立，不会从域外
         // 状态生成候选读取。写入仍消费原有精确 kill，不能用 possible-home 当作确定覆写。
@@ -1078,9 +1071,9 @@ impl DeadShellPlan {
     pub(super) fn collect(
         proto: &HirProto,
         facts: &BooleanShellFacts,
-        promotion_facts: &ProtoPromotionFacts,
         safety: HirExprSafety,
     ) -> Self {
+        let promotion_facts = facts.promotion_facts;
         let mut candidates = CandidateValues {
             has_shell: false,
             temps: BTreeSet::new(),
@@ -1121,20 +1114,25 @@ impl DeadShellPlan {
             .values()
             .map(|site| (site.node, site))
             .collect::<BTreeMap<_, _>>();
-        let entries = graph.solve_forward(initial_state, join_states, |id, kind, state| {
-            let removable = sites_by_node.get(&id.index()).is_some_and(|site| {
-                super::removable_dead_materialization_shell(
-                    site.stmt,
-                    facts,
-                    None,
-                    state,
-                    &site.live_after,
-                    safety,
-                )
-            });
-            *state = transfer.apply(kind, std::mem::take(state));
-            removable
-        });
+        let entries = graph.solve_forward(
+            initial_state,
+            join_states,
+            |id, kind, state| {
+                let removable = sites_by_node.get(&id.index()).is_some_and(|site| {
+                    super::removable_dead_materialization_shell(
+                        site.stmt,
+                        facts,
+                        None,
+                        state,
+                        &site.live_after,
+                        safety,
+                    )
+                });
+                *state = transfer.apply(kind, std::mem::take(state));
+                removable
+            },
+            |_expr, _truthy, _state| FlowRefinement::Unchanged,
+        );
         let removable = shell_facts
             .shells
             .into_iter()
@@ -1147,7 +1145,7 @@ impl DeadShellPlan {
         if self.removable.is_empty() {
             return false;
         }
-        apply_block_plan(block, &[], &self.removable);
+        remove_planned_stmts(block, &mut Vec::new(), &self.removable);
         true
     }
 }
@@ -1573,67 +1571,6 @@ fn join_value_classes(left: OldValueClass, right: OldValueClass) -> OldValueClas
         }
         (OldValueClass::Unknown, _) | (_, OldValueClass::Unknown) => OldValueClass::Unknown,
     }
-}
-
-fn apply_block_plan(block: &mut HirBlock, prefix: &[PathComponent], plan: &BTreeSet<StmtPath>) {
-    // plan 使用改写前坐标；计数包含被删除的项，retain_mut 只压缩一次存活语句。
-    let mut index = 0;
-    block.stmts.retain_mut(|stmt| {
-        let mut path = prefix.to_vec();
-        path.push(PathComponent::Stmt(index));
-        index += 1;
-        match stmt {
-            HirStmt::If(if_stmt) => {
-                let mut then_prefix = path.clone();
-                then_prefix.push(PathComponent::Then);
-                apply_block_plan(&mut if_stmt.then_block, &then_prefix, plan);
-                if let Some(else_block) = &mut if_stmt.else_block {
-                    let mut else_prefix = path.clone();
-                    else_prefix.push(PathComponent::Else);
-                    apply_block_plan(else_block, &else_prefix, plan);
-                }
-            }
-            HirStmt::While(while_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut while_stmt.body, &body_prefix, plan);
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut repeat_stmt.body, &body_prefix, plan);
-            }
-            HirStmt::NumericFor(for_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut for_stmt.body, &body_prefix, plan);
-            }
-            HirStmt::GenericFor(for_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(&mut for_stmt.body, &body_prefix, plan);
-            }
-            HirStmt::Block(nested) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                apply_block_plan(nested, &body_prefix, plan);
-            }
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
-        !plan.contains(&path)
-    });
 }
 
 #[cfg(test)]

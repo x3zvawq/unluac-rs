@@ -145,7 +145,12 @@ pub(crate) fn emit_tail_call(
         lowering.emit(
             Some(raw_index),
             vec![raw_index],
-            PendingLowInstr::Ready(LowInstr::Close(CloseInstr { from: Reg(0) })),
+            PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                kind: crate::transformer::CloseKind::TailCall(crate::transformer::InstrRef(
+                    lowering.next_low_index(),
+                )),
+                from: Reg(0),
+            })),
         );
         lowering.emit(
             None,
@@ -181,7 +186,12 @@ pub(crate) fn emit_return(
         lowering.emit(
             Some(raw_index),
             vec![raw_index],
-            PendingLowInstr::Ready(LowInstr::Close(CloseInstr { from: Reg(0) })),
+            PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                kind: crate::transformer::CloseKind::Return(crate::transformer::InstrRef(
+                    lowering.next_low_index(),
+                )),
+                from: Reg(0),
+            })),
         );
         lowering.emit(
             None,

@@ -9,6 +9,8 @@
 //! 它依赖前层 HIR/StructureFacts 已经给出合法的 branch、label/goto 和 binding 边界；
 //! 这里只做 HIR 内部的语义收敛，不重新解释 CFG，也不会跨过仍有其它入边的 label。
 //! 对需要复制默认值的形状，只允许复制无副作用的常量或引用，避免为了可读性改变求值语义。
+//! 作用域 guard 借用 proto 的 debug、物理根和 rewrite authority；三个元数据源在 body
+//! 改写期间保持不变，不需要另外冻结同义身份集合。
 //! nil fallback 不会被恢复成 `A or b`，因为 `or` 会把 `false` 也视为 fallback 条件。
 //!
 //! 对 Temp/Local binding，除了平铺的两臂形状以外，结构恢复阶段经常因为短路条件被翻译成多层嵌套 `if`
@@ -45,13 +47,13 @@ use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_te
 use super::object_flow::RootAnalysisContext;
 use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
 use super::temp_touch::collect_temp_refs_by_stmt;
-use super::walk::{HirRewritePass, rewrite_proto};
+use super::walk::{HirRewritePass, rewrite_block};
 use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::hir::HirLabelId;
 use crate::hir::common::{
     HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirDecisionExpr, HirDecisionNode,
-    HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto,
-    HirStmt, HirUnaryOpKind, HirValuePack, LocalId, TempId,
+    HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirIf, HirInlineDispositions, HirLValue,
+    HirLocalDecl, HirProto, HirStmt, HirUnaryOpKind, HirValuePack, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -79,9 +81,13 @@ pub(super) fn fold_branch_values_in_proto(
         roots,
     );
     let label_refs = count_label_references(&proto.body.stmts);
-    let local_scope_facts = BranchValueLocalScopeFacts::collect(proto);
-    let other_changed = rewrite_proto(
-        proto,
+    let local_scope_facts = BranchValueLocalScopeFacts::new(
+        &proto.local_debug_hints,
+        &proto.physical_root_locals,
+        &proto.inline_dispositions,
+    );
+    let other_changed = rewrite_block(
+        &mut proto.body,
         &mut BranchValuePass {
             label_refs: &label_refs,
             local_scope_facts: &local_scope_facts,
@@ -93,7 +99,7 @@ pub(super) fn fold_branch_values_in_proto(
 
 struct BranchValuePass<'a> {
     label_refs: &'a BTreeMap<HirLabelId, usize>,
-    local_scope_facts: &'a BranchValueLocalScopeFacts,
+    local_scope_facts: &'a BranchValueLocalScopeFacts<'a>,
     safety: HirExprSafety,
 }
 
@@ -117,35 +123,27 @@ impl HirRewritePass for BranchValuePass<'_> {
     }
 }
 
-#[derive(Default)]
-struct BranchValueLocalScopeFacts {
-    debug_locals: BTreeSet<LocalId>,
-    physical_root_locals: BTreeSet<LocalId>,
-    preserved_locals: BTreeSet<LocalId>,
+struct BranchValueLocalScopeFacts<'a> {
+    debug_locals: &'a [Option<String>],
+    physical_root_locals: &'a BTreeSet<LocalId>,
+    inline_dispositions: &'a HirInlineDispositions,
 }
 
-impl BranchValueLocalScopeFacts {
-    fn collect(proto: &HirProto) -> Self {
+impl<'a> BranchValueLocalScopeFacts<'a> {
+    fn new(
+        debug_locals: &'a [Option<String>],
+        physical_root_locals: &'a BTreeSet<LocalId>,
+        inline_dispositions: &'a HirInlineDispositions,
+    ) -> Self {
         Self {
-            debug_locals: proto
-                .locals
-                .iter()
-                .copied()
-                .zip(&proto.local_debug_hints)
-                .filter_map(|(local, hint)| hint.is_some().then_some(local))
-                .collect(),
-            physical_root_locals: proto.physical_root_locals.clone(),
-            preserved_locals: proto
-                .locals
-                .iter()
-                .copied()
-                .filter(|local| proto.inline_dispositions.local(*local).must_preserve())
-                .collect(),
+            debug_locals,
+            physical_root_locals,
+            inline_dispositions,
         }
     }
 
     fn can_move_scope(&self, local: LocalId) -> bool {
-        if self.debug_locals.contains(&local) {
+        if matches!(self.debug_locals.get(local.index()), Some(Some(_))) {
             // 候选拒绝[PolicyBoundary]：retain-debug local 的声明边界是源码身份；把空声明
             // 并入 initializer，或删除 guard local，会改变 debug.getlocal 可见区间。
             return false;
@@ -155,7 +153,7 @@ impl BranchValueLocalScopeFacts {
             // 的空声明先用 nil 结束旧 slot root；并入 initializer 会让旧资源活过 collect。
             return false;
         }
-        if self.preserved_locals.contains(&local) {
+        if self.inline_dispositions.local(local).must_preserve() {
             // 候选拒绝[LayerBoundary]：把空声明/分支写折成 initializer 会改变该 binding
             // 的 definition epoch；上游 HIR 的 Preserve 只能由理解其理由的事务消解。
             return false;
@@ -1163,6 +1161,8 @@ mod tests {
 
     #[test]
     fn nil_fallback_alias_preserves_target_epoch_through_prefix() {
+        let empty_roots = BTreeSet::new();
+        let dispositions = HirInlineDispositions::default();
         let target = LocalId(0);
         let source = LocalId(1);
         for negated in [false, true] {
@@ -1175,7 +1175,7 @@ mod tests {
             let rewrite = nil_fallback_alias_rewrite(
                 &empty_local(target),
                 &if_stmt,
-                &BranchValueLocalScopeFacts::default(),
+                &BranchValueLocalScopeFacts::new(&[], &empty_roots, &dispositions),
             )
             .expect("distinct source and target share the same nil fallback epoch");
 
@@ -1187,6 +1187,8 @@ mod tests {
 
     #[test]
     fn nil_fallback_alias_rejects_same_source_and_target_binding() {
+        let empty_roots = BTreeSet::new();
+        let dispositions = HirInlineDispositions::default();
         let target = LocalId(0);
         let fallback = block(vec![assign(target, HirExpr::LocalRef(target))]);
         let if_stmt = nil_fallback_if(target, target, fallback, false);
@@ -1195,7 +1197,7 @@ mod tests {
             nil_fallback_alias_rewrite(
                 &empty_local(target),
                 &if_stmt,
-                &BranchValueLocalScopeFacts::default(),
+                &BranchValueLocalScopeFacts::new(&[], &empty_roots, &dispositions),
             )
             .is_none()
         );
@@ -1203,6 +1205,8 @@ mod tests {
 
     #[test]
     fn multi_node_nil_fallback_projects_the_complete_truthy_subgraph() {
+        let empty_roots = BTreeSet::new();
+        let dispositions = HirInlineDispositions::default();
         let target = LocalId(0);
         let source = LocalId(1);
         let decision = HirExpr::Decision(Box::new(HirDecisionExpr {
@@ -1230,7 +1234,7 @@ mod tests {
 
         let rewrite = nil_fallback_decision_rewrite(
             &stmt,
-            &BranchValueLocalScopeFacts::default(),
+            &BranchValueLocalScopeFacts::new(&[], &empty_roots, &dispositions),
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         )
         .expect("the truthy subtree is a complete fallback value decision");
@@ -1242,6 +1246,8 @@ mod tests {
 
     #[test]
     fn missing_else_uses_nil_only_when_the_value_is_expressible() {
+        let empty_roots = BTreeSet::new();
+        let dispositions = HirInlineDispositions::default();
         let target = LocalId(0);
         let then_block = block(vec![assign(target, HirExpr::Boolean(false))]);
         let dynamic_if = HirStmt::If(Box::new(HirIf {
@@ -1256,7 +1262,7 @@ mod tests {
             then_block,
             else_block: None,
         }));
-        let scope_facts = BranchValueLocalScopeFacts::default();
+        let scope_facts = BranchValueLocalScopeFacts::new(&[], &empty_roots, &dispositions);
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
 
         let dynamic =
@@ -1277,24 +1283,24 @@ mod tests {
 
     #[test]
     fn protected_output_local_keeps_its_empty_declaration_boundary() {
+        let empty_roots = BTreeSet::new();
+        let dispositions = HirInlineDispositions::default();
         let target = LocalId(0);
         let if_stmt = HirStmt::If(Box::new(HirIf {
             cond: HirExpr::Boolean(true),
             then_block: block(vec![assign(target, HirExpr::Integer(7))]),
             else_block: None,
         }));
-        let physical = BranchValueLocalScopeFacts {
-            physical_root_locals: BTreeSet::from([target]),
-            ..BranchValueLocalScopeFacts::default()
-        };
-        let debug = BranchValueLocalScopeFacts {
-            debug_locals: BTreeSet::from([target]),
-            ..BranchValueLocalScopeFacts::default()
-        };
-        let preserved = BranchValueLocalScopeFacts {
-            preserved_locals: BTreeSet::from([target]),
-            ..BranchValueLocalScopeFacts::default()
-        };
+        let physical_roots = BTreeSet::from([target]);
+        let debug_names = [Some("target".into())];
+        let mut preserved_dispositions = HirInlineDispositions::default();
+        preserved_dispositions.preserve_local(
+            target,
+            crate::hir::HirInlineRetentionReason::CapturedValueEpoch,
+        );
+        let physical = BranchValueLocalScopeFacts::new(&[], &physical_roots, &dispositions);
+        let debug = BranchValueLocalScopeFacts::new(&debug_names, &empty_roots, &dispositions);
+        let preserved = BranchValueLocalScopeFacts::new(&[], &empty_roots, &preserved_dispositions);
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
 
         for scope_facts in [&physical, &debug, &preserved] {

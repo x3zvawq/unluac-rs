@@ -1,4 +1,4 @@
-//! loop condition route 与构建前 edge 规范化。输入 selected condition、RegionArena 和 CFG，输出对齐后的 condition route、branch-tail continue 与 edge action placement；不负责最终 transfer 分类。例如 repeat 经纯 jump pad 回 header 时会把完整 route 冻结进 condition arc。
+//! loop condition route 与构建前 edge 规范化。输入 selected condition、RegionArena 和 CFG，输出对齐后的 condition route 与 branch-tail continue；不负责最终 transfer 分类或值动作时序。例如 repeat 经纯 jump pad 回 header 时会把完整 route 冻结进 condition arc。
 
 use super::*;
 
@@ -363,72 +363,4 @@ pub(super) fn repeat_condition_route_kind(
             polarity,
         },
     )))
-}
-
-pub(super) fn freeze_edge_action_placement(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    arena: &RegionArena,
-    input: &FinalPlanInput,
-    edge_ref: EdgeRef,
-    transfer: EdgeTransfer,
-) -> EdgeActionPlacement {
-    let EdgeTransfer::LoopBack(loop_region) = transfer else {
-        return EdgeActionPlacement::BeforeTransfer;
-    };
-    let Some(edge) = cfg.edges.get(edge_ref.index()) else {
-        return EdgeActionPlacement::BeforeTransfer;
-    };
-    if edge.kind != EdgeKind::Jump
-        || cfg.succs.get(edge.from.index()).map(Vec::as_slice) != Some(&[edge_ref])
-    {
-        return EdgeActionPlacement::BeforeTransfer;
-    }
-    let Some(RegionPlan::Loop { plan: loop_id, .. }) = arena.regions.get(loop_region.index())
-    else {
-        return EdgeActionPlacement::BeforeTransfer;
-    };
-    let has_carried_action = input.loops.get(loop_id.index()).is_some_and(|loop_| {
-        loop_
-            .carried_values
-            .iter()
-            .any(|value| value.inside_arm.contains_pred(edge.from))
-    });
-    if !has_carried_action {
-        return EdgeActionPlacement::BeforeTransfer;
-    }
-
-    let Some(block_range) = cfg.blocks.get(edge.from.index()).map(|block| block.instrs) else {
-        return EdgeActionPlacement::BeforeTransfer;
-    };
-    let Some(terminator) = block_range.last() else {
-        return EdgeActionPlacement::BeforeTransfer;
-    };
-    if !matches!(
-        proto.instrs.get(terminator.index()),
-        Some(LowInstr::Jump(_))
-    ) {
-        return EdgeActionPlacement::BeforeTransfer;
-    }
-
-    let cleanup_end = terminator.index();
-    let mut cleanup_start = cleanup_end;
-    while cleanup_start > block_range.start.index()
-        && matches!(
-            proto.instrs.get(cleanup_start - 1),
-            Some(LowInstr::Close(_) | LowInstr::Tbc(_))
-        )
-    {
-        cleanup_start -= 1;
-    }
-    if cleanup_start == cleanup_end || cleanup_start == block_range.start.index() {
-        return EdgeActionPlacement::BeforeTransfer;
-    }
-
-    EdgeActionPlacement::BeforeTrailingCleanup {
-        cleanup: crate::structure::InstrRange::new(
-            InstrRef(cleanup_start),
-            cleanup_end - cleanup_start,
-        ),
-    }
 }

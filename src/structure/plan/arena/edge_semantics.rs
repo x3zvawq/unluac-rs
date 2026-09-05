@@ -407,7 +407,23 @@ impl EdgeSemantics {
                             }
                         }
                     }
+                    let ContainerSlots::Loop { body, .. } = arena.slots[index] else {
+                        return Err(StructureError::invalid(
+                            "loop container has no body region slot",
+                        ));
+                    };
                     for block in &partition.body {
+                        let source = arena.region_by_block[block.index()].ok_or_else(|| {
+                            StructureError::invalid("loop body block has no containment owner")
+                        })?;
+                        // 到达 latch 不代表已经走完源码 body：island [A, B] 中 A 的
+                        // 条件边可能跳过 B 的 break，必须保留显式跳转到条件前缀。
+                        if !arena
+                            .navigation
+                            .region_can_complete_from(body, source, *block)
+                        {
+                            continue;
+                        }
                         for edge in &cfg.succs[block.index()] {
                             if partition.control.contains(&cfg.edges[edge.index()].to) {
                                 semantics.internal_transitions[edge.index()] = Some(region);

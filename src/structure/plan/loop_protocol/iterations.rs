@@ -66,7 +66,6 @@ pub(super) fn build_iteration_edge_dispositions(
     plan: &StructurePlan,
     analysis: &LoopValueAnalysis,
 ) -> Result<Vec<Vec<LoopIterationDisposition>>, StructureError> {
-    let mut canonical_moves = crate::structure::phi_facts::CanonicalMoveIndex::new(proto, dataflow);
     let mut by_edge = vec![Vec::new(); cfg.edges.len()];
     for (index, payload) in plan.loops.iter().enumerate() {
         let loop_id = super::super::LoopPlanId(index);
@@ -124,8 +123,11 @@ pub(super) fn build_iteration_edge_dispositions(
                         StructureError::invalid("loop iteration action targets a missing phi")
                     })?
                     .reg;
-                let incoming =
-                    canonical_moves.resolve(dataflow.block_exit_value(value_block, reg))?;
+                let incoming = dataflow
+                    .canonical_move_value(dataflow.block_exit_value(value_block, reg))
+                    .ok_or_else(|| {
+                        StructureError::invalid("loop iteration Move has no canonical SSA source")
+                    })?;
                 if !value_is_available_at_edge_action(
                     cfg,
                     graph_facts,

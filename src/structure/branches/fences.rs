@@ -263,10 +263,8 @@ pub(super) fn closed_if_else_owns_value_result(
     // Dataflow 的 block range 是稠密索引；每个 exit 只检查自身 canonical/live phi，
     // 并要求当前两臂的物理边给同一个非平凡 phi 提供不同值。
     let direct_result = dataflow.phi_candidates_in_block(exit).iter().any(|phi| {
-        let Some(tail_value) = phi
-            .incoming
-            .iter()
-            .find(|incoming| incoming.edge == Some(tail_edge))
+        let Some(tail_value) = dataflow
+            .phi_incoming_for_edge(phi.id, tail_edge)
             .map(|incoming| incoming.value)
         else {
             return false;

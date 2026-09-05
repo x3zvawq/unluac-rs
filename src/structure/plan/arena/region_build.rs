@@ -1,12 +1,16 @@
 //! Region arena 的构建与物化。输入规范化 container/loop partitions，输出 containment tree、direct block owner 与导航索引；不负责冻结 edge transfer。例如 structured child 会先物化，再嵌入最小 residual island。
+//! branch 的整体单入口与各 arm 的词法入口分别证明；`if c then A else ... goto A end`
+//! 中 A 不能因自支配而成为 then 子作用域，必须由 residual 控制保留共享入口。
 
 use super::*;
 
 pub(super) fn build_regions(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     input: &FinalPlanInput,
     partitions: &[LoopPartitions],
+    flow: &crate::structure::scope::TbcFlowFacts,
 ) -> Result<RegionArena, StructureError> {
     let mut pending = Vec::new();
     let mut residuals = Vec::new();
@@ -100,7 +104,8 @@ pub(super) fn build_regions(
         )?);
     }
 
-    for (index, _) in input.loops.iter().enumerate() {
+    let mut admitted_loops = vec![false; input.loops.len()];
+    for (index, loop_) in input.loops.iter().enumerate() {
         let id = super::super::LoopPlanId(index);
         let blocks = partitions
             .get(index)
@@ -121,7 +126,16 @@ pub(super) fn build_regions(
         let entry = partition
             .preheader
             .unwrap_or(input.loops[id.index()].candidate.header);
-        if !single_entry(cfg, &blocks, entry) {
+        if !single_entry(cfg, &blocks, entry)
+            || loop_exit_crosses_resource_boundary(
+                proto,
+                cfg,
+                &loop_.candidate,
+                partition,
+                &input.scopes,
+                flow,
+            )?
+        {
             push_residual_seed(&mut residuals, entry, blocks);
             continue;
         }
@@ -130,6 +144,7 @@ pub(super) fn build_regions(
             blocks,
             graph_facts,
         )?);
+        admitted_loops[index] = true;
     }
 
     let mut value_decision_blocks = BTreeSet::new();
@@ -164,10 +179,15 @@ pub(super) fn build_regions(
 
     let loop_control_blocks = partitions
         .iter()
+        .zip(&admitted_loops)
+        .filter_map(|(partition, admitted)| admitted.then_some(partition))
         .flat_map(|partition| partition.control.iter().copied())
         .collect::<BTreeSet<_>>();
     let mut claimed_condition_headers = BTreeSet::new();
     for (index, loop_) in input.loops.iter().enumerate() {
+        if !admitted_loops[index] {
+            continue;
+        }
         if let Some(condition) = loop_
             .condition
             .and_then(|id| input.conditions.get(id.index()))
@@ -200,7 +220,10 @@ pub(super) fn build_regions(
         }
     }
     let mut loop_owned_by_block = vec![false; cfg.blocks.len()];
-    for partition in partitions {
+    for (partition, admitted) in partitions.iter().zip(&admitted_loops) {
+        if !admitted {
+            continue;
+        }
         for block in partition.owned.iter().copied().chain(
             partition
                 .normal_tail
@@ -210,6 +233,9 @@ pub(super) fn build_regions(
             loop_owned_by_block[block.index()] = true;
         }
     }
+    let branch_entries = BranchEntryFacts::new(cfg, graph_facts);
+    let mut cleanup =
+        crate::structure::scope::BranchCleanupFacts::new(proto, cfg, graph_facts, flow);
     for (index, branch) in input.branches.iter().enumerate() {
         if loop_control_blocks.contains(&branch.branch.header)
             || claimed_condition_headers.contains(&branch.branch.header)
@@ -227,11 +253,30 @@ pub(super) fn build_regions(
                 false
             };
             if !intersects_island {
-                pending.push(PendingContainer::intervals(
-                    ContainerKind::Branch(id),
-                    ranges,
-                    graph_facts,
-                )?);
+                let candidate =
+                    PendingContainer::intervals(ContainerKind::Branch(id), ranges, graph_facts)?;
+                if !branch_entries.admits(branch, input, |block| {
+                    graph_facts.dominator_tree.preorder_index[block.index()].is_some_and(
+                        |position| {
+                            let index = candidate
+                                .ranges
+                                .partition_point(|range| range.end <= position);
+                            candidate
+                                .ranges
+                                .get(index)
+                                .is_some_and(|range| range.contains(&position))
+                        },
+                    )
+                }) || cleanup.crosses_cleanup(branch.branch.header, &candidate.ranges)
+                {
+                    push_residual_seed(
+                        &mut residuals,
+                        branch.branch.header,
+                        candidate.materialize_blocks(graph_facts)?,
+                    );
+                    continue;
+                }
+                pending.push(candidate);
                 continue;
             }
         }
@@ -298,6 +343,10 @@ pub(super) fn build_regions(
         if blocks.is_empty() {
             continue;
         }
+        if !branch_entries.admits(branch, input, |block| blocks.contains(&block)) {
+            push_residual_seed(&mut residuals, branch.branch.header, blocks);
+            continue;
+        }
         if unstructured_blocks.iter().any(|island| {
             island.is_subset(&blocks)
                 && branch_part_for_blocks(branch, input, graph_facts, island).is_none()
@@ -310,11 +359,12 @@ pub(super) fn build_regions(
             push_residual_seed(&mut residuals, branch.branch.header, blocks);
             continue;
         }
-        pending.push(PendingContainer::exact(
-            ContainerKind::Branch(id),
-            blocks,
-            graph_facts,
-        )?);
+        let candidate = PendingContainer::exact(ContainerKind::Branch(id), blocks, graph_facts)?;
+        if cleanup.crosses_cleanup(branch.branch.header, &candidate.ranges) {
+            push_residual_seed(&mut residuals, branch.branch.header, candidate.blocks);
+            continue;
+        }
+        pending.push(candidate);
     }
 
     if !unstructured_blocks.is_empty() {
@@ -408,7 +458,16 @@ pub(super) fn build_regions(
     flatten_nested_unstructured_specs(&mut specs, &mut owner_by_block, &mut dispositions)?;
     validate_aggregate_seed_dispositions(cfg, input, &residuals, &specs, &dispositions)?;
 
-    materialize_regions(cfg, graph_facts, input, partitions, specs, owner_by_block)
+    materialize_regions(
+        proto,
+        cfg,
+        graph_facts,
+        input,
+        partitions,
+        flow,
+        specs,
+        owner_by_block,
+    )
 }
 
 pub(super) fn push_residual_seed(
@@ -423,11 +482,14 @@ pub(super) fn push_residual_seed(
     });
 }
 
-pub(super) fn materialize_regions(
+#[allow(clippy::too_many_arguments)]
+fn materialize_regions(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     input: &FinalPlanInput,
     partitions: &[LoopPartitions],
+    flow: &crate::structure::scope::TbcFlowFacts,
     specs: Vec<ContainerSpec>,
     owner_by_block: Vec<Option<usize>>,
 ) -> Result<RegionArena, StructureError> {
@@ -665,8 +727,17 @@ pub(super) fn materialize_regions(
             region.ok_or_else(|| StructureError::invalid(format!("region #{index} was not filled")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let navigation = RegionNavigation::build(cfg, root, &regions, &region_by_block)?;
+    let navigation = RegionNavigation::build_topology(cfg, root, &regions, &region_by_block)?;
     order_sequence_children_by_flow(cfg, graph_facts, &mut regions, &navigation)?;
+    order_island_cleanup_exits(
+        proto,
+        cfg,
+        flow,
+        &mut regions,
+        &region_by_block,
+        &navigation,
+    );
+    let navigation = navigation.finish_layout(&regions)?;
     let mut ports = navigation.collect_island_ports(cfg, &regions)?;
     for (index, region) in regions.iter_mut().enumerate() {
         let RegionPlan::Unstructured { entries, exits, .. } = region else {
@@ -711,6 +782,80 @@ pub(super) fn materialize_regions(
         specs,
         slots,
     })
+}
+
+/// 只延后已完全关闭本 island 资源的出口 pad，普通 item 保留物理顺序。
+/// `entry; Close(inner, outer); goto exit; active_continuation` 的 pad 可置于末端；
+/// 普通出口的可观察动作不能一起搬动，否则会夹入另一条仍 active 的路径。
+fn order_island_cleanup_exits(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    flow: &crate::structure::scope::TbcFlowFacts,
+    regions: &mut [RegionPlan],
+    region_by_block: &[Option<RegionId>],
+    navigation: &RegionNavigation,
+) {
+    if !regions
+        .iter()
+        .any(|region| matches!(region, RegionPlan::Unstructured { layout, .. } if layout.len() > 1))
+    {
+        return;
+    }
+    let mut loop_owned = vec![false; regions.len()];
+    for &region in &navigation.preorder {
+        loop_owned[region.index()] = matches!(regions[region.index()], RegionPlan::Loop { .. })
+            || navigation.parent[region.index()].is_some_and(|parent| loop_owned[parent.index()]);
+    }
+    for (index, region) in regions.iter_mut().enumerate() {
+        let RegionPlan::Unstructured { entry, layout, .. } = region else {
+            continue;
+        };
+        if loop_owned[index] || layout.len() < 2 {
+            continue;
+        }
+        let island = RegionId(index);
+        let mut exits = Vec::new();
+        layout.retain(|item| {
+            let UnstructuredLayoutItem::Block(block) = *item else {
+                return true;
+            };
+            if block == *entry || block == cfg.entry_block {
+                return true;
+            }
+            let [outgoing] = cfg.succs[block.index()].as_slice() else {
+                return true;
+            };
+            let target = cfg.edges[outgoing.index()].to;
+            if region_by_block[target.index()]
+                .is_some_and(|owner| navigation.contains(island, owner))
+            {
+                return true;
+            }
+            // 声明与入边来源都直属此无 loop 祖先的 island：Close 不可能属于 loop
+            // boundary/exit-tail，入边也不可能是 VM-for 的隐式语法边。每条 Close
+            // 都有本地 origin，因此整个显式前缀会由唯一 cleanup owner 移到入边。
+            let mut has_incoming = false;
+            let local_incoming = cfg.preds[block.index()].iter().all(|edge| {
+                let source = cfg.edges[edge.index()].from;
+                if !cfg.reachable_blocks.contains(&source) {
+                    return true;
+                }
+                has_incoming = true;
+                region_by_block[source.index()] == Some(island)
+            });
+            if !local_incoming
+                || !has_incoming
+                || !flow.fully_closed_local_pad(proto, cfg, block, |origin| {
+                    region_by_block[cfg.instr_to_block[origin.index()].index()] == Some(island)
+                })
+            {
+                return true;
+            }
+            exits.push(*item);
+            false
+        });
+        layout.extend(exits);
+    }
 }
 
 /// 物理指令顺序不是结构化 sequence 的执行顺序：编译器可以把 loop tail 放到 header

@@ -1,6 +1,113 @@
-//! 冻结最终 StructurePlan、loop 合同与 block emission，并调用严格校验；依赖 arena/validator/loop protocol，不负责候选分析；例如在 phi ownership 完成后生成稠密块发射计划。
+//! 冻结最终 StructurePlan、source cleanup 动作位置、loop 合同与 block emission。
+//! 依赖 canonical SSA 和最终 edge batch，不负责候选分析；例如同槽写入后的 Close/Jump
+//! 即使归为 Goto，也在 Close 前保存 phi 表示，不从候选 loop 身份重建动作时序。
 
 use super::*;
+
+use crate::structure::EdgeKind;
+use crate::transformer::{CaptureSource, CloseKind, InstrRef, LowInstr, Reg};
+
+/// canonical phi 与 iteration 动作就绪后，一次冻结 source 动作相对原始 Close 的位置。
+pub(super) fn finalize_edge_action_placements(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &mut StructurePlan,
+) {
+    let placements = expected_edge_action_placements(proto, cfg, dataflow, plan);
+    for (edge, placement) in plan.edge_plans.iter_mut().zip(placements) {
+        edge.action_placement = placement;
+    }
+}
+
+pub(super) fn expected_edge_action_placements(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+) -> Vec<EdgeActionPlacement> {
+    let captured = proto
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            LowInstr::Closure(closure) => Some(&closure.captures),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|capture| match capture.source {
+            CaptureSource::ByReference(reg) => Some(reg),
+            CaptureSource::ByValue(_) | CaptureSource::Upvalue(_) => None,
+        })
+        .collect::<BTreeSet<Reg>>();
+    plan.edge_plans
+        .iter()
+        .map(|edge| {
+            let before_transfer = EdgeActionPlacement::BeforeTransfer;
+            if edge.phi_copies.is_empty()
+                || !edge.iteration.is_empty()
+                || edge.forward_route.is_some()
+                || plan.edge_action_is_forwarded_only(edge.edge)
+                || !matches!(
+                    edge.transfer,
+                    EdgeTransfer::Goto(..) | EdgeTransfer::LoopBack(_)
+                )
+            {
+                return before_transfer;
+            }
+            let source = cfg.edges[edge.edge.index()];
+            if source.kind != EdgeKind::Jump
+                || cfg.succs[source.from.index()].as_slice() != [edge.edge]
+            {
+                return before_transfer;
+            }
+            let range = cfg.blocks[source.from.index()].instrs;
+            let Some(terminator) = range.last() else {
+                return before_transfer;
+            };
+            if !matches!(proto.instrs[terminator.index()], LowInstr::Jump(_)) {
+                return before_transfer;
+            }
+            let end = terminator.index();
+            let mut start = end;
+            let mut close_from = usize::MAX;
+            while start > range.start.index() {
+                let LowInstr::Close(close) = &proto.instrs[start - 1] else {
+                    break;
+                };
+                if close.kind != CloseKind::Explicit {
+                    break;
+                }
+                close_from = close_from.min(close.from.index());
+                start -= 1;
+            }
+            if start == end || start == range.start.index() {
+                return before_transfer;
+            }
+            // 原 VM 已在同一物理槽完成写入；提前的只是该值的 phi 表示。不能穿过
+            // 此槽的 Close epoch，也不能提前读取 closer 可改写的 reference capture。
+            // 保留 Move 的实际写入槽身份，不用透明值等价替代物理 home 等价。
+            if !edge.phi_copies.iter().all(|copy| {
+                let SsaValue::Def(def) = copy.value else {
+                    return false;
+                };
+                dataflow.defs.get(def.index()).is_some_and(|definition| {
+                    definition.block == source.from
+                        && definition.instr.index() < start
+                        && definition.reg.index() < close_from
+                        && !captured.contains(&definition.reg)
+                        && dataflow
+                            .phi_candidate(copy.phi_id)
+                            .is_some_and(|phi| phi.reg == definition.reg)
+                })
+            }) {
+                return before_transfer;
+            }
+            EdgeActionPlacement::BeforeTrailingCleanup {
+                cleanup: InstrRange::new(InstrRef(start), end - start),
+            }
+        })
+        .collect()
+}
 
 pub(crate) fn build_final_structure_plan(
     proto: &LoweredProto,

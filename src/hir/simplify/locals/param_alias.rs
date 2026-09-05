@@ -934,6 +934,7 @@ mod tests {
 
     fn label(id: HirLabelId) -> HirStmt {
         HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id,
             tbc_barriers: Vec::new(),
         }))
@@ -941,6 +942,7 @@ mod tests {
 
     fn return_expr(expr: HirExpr) -> HirStmt {
         HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::fixed(vec![expr]),
         }))
     }

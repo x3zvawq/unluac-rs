@@ -29,9 +29,8 @@ use crate::hir::common::{
 };
 use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{
-    BlockRef, BlockTerminatorKind, CanonicalMoveIndex, Cfg, CfgGraph, ControlFlowFeature,
-    DataflowFacts, GraphFacts, LoopSourceBindings, LoopVmProtocol, OpenDefId, PhiId,
-    PlanRequirement, SsaValue, StructurePlan,
+    BlockRef, BlockTerminatorKind, Cfg, CfgGraph, ControlFlowFeature, DataflowFacts, GraphFacts,
+    LoopSourceBindings, LoopVmProtocol, OpenDefId, PhiId, PlanRequirement, SsaValue, StructurePlan,
 };
 use crate::structure::{ReadyStructureFacts, StructureFacts};
 use crate::transformer::{
@@ -66,7 +65,7 @@ pub(super) struct ProtoBindings {
     pub(super) debug_entry_local_decls: Vec<LocalId>,
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
-    pub(super) lexical_close_scope_starts: BTreeMap<usize, usize>,
+    pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
     pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
@@ -181,6 +180,32 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) open_pack_owners: Vec<Option<InstrRef>>,
     pub(super) owned_open_producers: Vec<bool>,
     pub(super) global_decls: GlobalDeclProtocols,
+    pub(super) pending_frame_returns: BTreeSet<InstrRef>,
+}
+
+fn pending_frame_returns(proto: &LoweredProto, plan: &StructurePlan) -> BTreeSet<InstrRef> {
+    proto
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| {
+            let LowInstr::Close(close) = instr else {
+                return None;
+            };
+            let source = match close.kind {
+                crate::transformer::CloseKind::Return(source)
+                | crate::transformer::CloseKind::TailCall(source) => source,
+                crate::transformer::CloseKind::Explicit => return None,
+            };
+            let instr = InstrRef(index);
+            // 只有最终计划仍在原位置发射的 frame cleanup 需要 HIR 配对。词法 scope、
+            // loop boundary/tail 已消费它们；IncomingEdges 只搬运 Explicit 协议。
+            (plan.cleanup_disposition(instr)
+                == Some(crate::structure::CleanupDisposition::ExplicitClose)
+                && plan.loop_exit_tail_for_cleanup_instr(instr).is_none())
+            .then_some(source)
+        })
+        .collect()
 }
 
 pub(super) struct CapturedSharedClosureLowering {
@@ -512,6 +537,7 @@ fn lower_proto_one(
         open_pack_owners,
         owned_open_producers,
         global_decls,
+        pending_frame_returns: pending_frame_returns(proto, structure.plan()),
     };
     let mutable_upvalues = mutable_upvalues_for_proto(proto, &child_mutable_upvalues);
 
@@ -735,7 +761,8 @@ fn accepted_debug_scopes(
         scopes[fact.scope] = Some(HirDebugScope {
             start_pc: fact.start_pc,
             end_pc: fact.end_pc,
-            ends_before_return: low_instr_at_or_after_raw_pc(proto, fact.end_pc)
+            ends_before_return: fact
+                .end_instr
                 .is_some_and(|instr| debug_scope_end_precedes_return(proto, instr)),
         });
     }
@@ -771,16 +798,6 @@ fn collect_exit_requirements(
         })
     }));
     exit_requirements
-}
-
-fn low_instr_at_or_after_raw_pc(proto: &LoweredProto, pc: u32) -> Option<InstrRef> {
-    proto
-        .lowering_map
-        .pc_map
-        .iter()
-        .enumerate()
-        .find(|(_, raw_pcs)| raw_pcs.iter().any(|raw_pc| *raw_pc >= pc))
-        .map(|(index, _)| InstrRef(index))
 }
 
 fn debug_scope_end_precedes_return(proto: &LoweredProto, instr: InstrRef) -> bool {
@@ -890,7 +907,6 @@ impl CapturedSharedClosureLowering {
     ) -> Self {
         let mut factory_locals = Vec::with_capacity(plan.composites().len());
         let mut capture_barriers = Vec::with_capacity(plan.composites().len());
-        let mut canonical_moves = CanonicalMoveIndex::new(proto, dataflow);
         for composite in plan.composites() {
             let instr = composite.anchor;
             let index = instr.index();
@@ -911,13 +927,7 @@ impl CapturedSharedClosureLowering {
             let mut snapshots = vec![None; sources.len()];
             for (source, snapshot) in sources.iter().copied().zip(&mut snapshots) {
                 if !matches!(source, CaptureSource::ByValue(reg) if reg != owner_dst)
-                    || !capture_needs_non_reflexive_barrier(
-                        proto,
-                        dataflow,
-                        instr,
-                        source,
-                        &mut canonical_moves,
-                    )
+                    || !capture_needs_non_reflexive_barrier(proto, dataflow, instr, source)
                 {
                     continue;
                 }
@@ -972,12 +982,12 @@ fn capture_needs_non_reflexive_barrier(
     dataflow: &DataflowFacts,
     instr: InstrRef,
     source: CaptureSource,
-    canonical_moves: &mut CanonicalMoveIndex<'_>,
 ) -> bool {
     let CaptureSource::ByValue(reg) = source else {
         return false;
     };
-    let Ok(SsaValue::Def(def)) = canonical_moves.resolve(dataflow.use_value(instr, reg)) else {
+    let Some(SsaValue::Def(def)) = dataflow.canonical_move_value(dataflow.use_value(instr, reg))
+    else {
         return false;
     };
     let def_instr = dataflow.def_instr(def);
@@ -1119,10 +1129,10 @@ fn build_composite_factory_proto(
     if plan.root.index() >= plan.nodes.len() {
         return Err(error());
     }
-    body.stmts
-        .push(return_stmt(HirValuePack::fixed(vec![HirExpr::LocalRef(
-            LocalId(plan.root.index()),
-        )])));
+    body.stmts.push(return_stmt(
+        HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(plan.root.index()))]),
+        None,
+    ));
     let locals = (0..plan.nodes.len()).map(LocalId).collect::<Vec<_>>();
     let mut promotion_facts = ProtoPromotionFacts::default();
     for local in locals.iter().copied() {

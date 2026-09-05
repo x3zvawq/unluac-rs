@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
+use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
 use super::super::temp_touch::{
     TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_in_expr,
 };
@@ -192,6 +192,7 @@ impl<'a> RegionTempFlow<'a> {
                 }
                 incoming
             },
+            |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
 
         incoming[self.graph.exit().index()] == Some(true)
@@ -210,6 +211,7 @@ impl<'a> RegionTempFlow<'a> {
                 outgoing.extend(self.events[id.index()].writes.iter().copied());
                 incoming
             },
+            |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
 
         let reads_before_assignment = self
@@ -368,6 +370,7 @@ mod tests {
 
     fn label(id: HirLabelId) -> HirStmt {
         HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id,
             tbc_barriers: Vec::new(),
         }))
@@ -400,6 +403,7 @@ mod tests {
             prefix,
             candidate,
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
             })),
         ];
@@ -571,6 +575,7 @@ mod tests {
         let temp = TempId(0);
         let stmt = branch(
             vec![HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::default(),
             }))],
             vec![assign_temp(temp)],

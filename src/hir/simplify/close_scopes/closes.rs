@@ -1,21 +1,63 @@
 //! 当前 HIR 块直属 cleanup 的位置与覆盖阈值，供资源边界消费者共享。
 //!
-//! 非零 Close(r) 覆盖不小于 r 的槽位；区间树保存最小阈值，跳过不覆盖候选的子区间。
-//! 嵌套 cleanup 属于不同词法 owner，不进入这里。Close(0) 只有紧邻 Return 或处于
-//! 当前 epoch 末尾才提供终结事实；外部 goto 的 cleanup 查询始终排除它。
-//! 例如 `Close(0); side(); TBC` 中的零槽 close 对完整块不终结，但 epoch 若恰好
-//! 截止在该 close 之后，它仍是合法终点。索引保留前一种事实，查询补充 epoch 边界。
+//! 独立 Close(r) 覆盖不小于 r 的槽位；区间摘要支持最后覆盖点与连续 cleanup 前缀查询。
+//! 嵌套 cleanup 属于不同词法 owner，不进入这里。独立 Close(0) 同样是覆盖阈值 0；
+//! frame cleanup 只有与原始 Return/TailCall 身份配对才提供终结事实，不能按槽位猜测。
+//! 候选只保存范围选择条件，通过分量检查后才一次发布所有权并集，不逐候选复制位置。
+//! 例如多个嵌套 TBC 共用一串 Close(2) 时，每个候选仅保存一个条件，重建只消费一份位置集。
 
-use std::ops::Range;
+use std::{
+    collections::{BTreeSet, BinaryHeap},
+    ops::Range,
+};
 
 use crate::hir::common::HirStmt;
 
-use super::terminal_close_zero_end;
+use super::frame_cleanup_end;
+
+/// 只在当前未改写 block 快照内有效；范围可以包含词法作用域外的 goto cleanup。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CloseSelection {
+    range: Range<usize>,
+    reg: usize,
+    terminal: bool,
+}
+
+impl CloseSelection {
+    pub(super) fn scope(range: Range<usize>, reg: usize) -> Self {
+        Self {
+            range,
+            reg,
+            terminal: true,
+        }
+    }
+
+    pub(super) fn explicit(range: Range<usize>, reg: usize) -> Self {
+        Self {
+            range,
+            reg,
+            terminal: false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct CloseSummary {
-    nonzero: Option<usize>,
+    explicit: Option<usize>,
     terminal: bool,
+    explicit_count: usize,
+    maximum: usize,
+}
+
+impl CloseSummary {
+    fn union(self, other: Self) -> Self {
+        Self {
+            explicit: self.explicit.into_iter().chain(other.explicit).min(),
+            terminal: self.terminal || other.terminal,
+            explicit_count: self.explicit_count + other.explicit_count,
+            maximum: self.maximum.max(other.maximum),
+        }
+    }
 }
 
 pub(super) struct DirectCloseIndex<'a> {
@@ -31,12 +73,17 @@ impl<'a> DirectCloseIndex<'a> {
         let mut leaves = Vec::new();
         for (index, stmt) in stmts.iter().enumerate() {
             if let HirStmt::Close(close) = stmt {
-                let nonzero = (close.from_reg != 0).then_some(close.from_reg);
-                let terminal =
-                    close.from_reg == 0 && terminal_close_zero_end(stmts, index).is_some();
-                if nonzero.is_some() || terminal {
+                let explicit = (close.kind == crate::transformer::CloseKind::Explicit)
+                    .then_some(close.from_reg);
+                let terminal = frame_cleanup_end(stmts, index).is_some();
+                if explicit.is_some() || terminal {
                     positions.push(index);
-                    leaves.push(CloseSummary { nonzero, terminal });
+                    leaves.push(CloseSummary {
+                        explicit,
+                        terminal,
+                        explicit_count: usize::from(explicit.is_some()),
+                        maximum: close.from_reg,
+                    });
                 }
             }
         }
@@ -44,12 +91,7 @@ impl<'a> DirectCloseIndex<'a> {
         let mut tree = vec![CloseSummary::default(); 2 * base];
         tree[base..base + leaves.len()].copy_from_slice(&leaves);
         for node in (1..base).rev() {
-            let left = tree[2 * node];
-            let right = tree[2 * node + 1];
-            tree[node] = CloseSummary {
-                nonzero: left.nonzero.into_iter().chain(right.nonzero).min(),
-                terminal: left.terminal || right.terminal,
-            };
+            tree[node] = tree[2 * node].union(tree[2 * node + 1]);
         }
         Self {
             stmts,
@@ -59,57 +101,113 @@ impl<'a> DirectCloseIndex<'a> {
         }
     }
 
-    pub(super) fn nonzero_closes(
-        &self,
-        range: Range<usize>,
-        reg: usize,
-    ) -> impl Iterator<Item = usize> + '_ {
-        self.covering(range, reg, false)
-    }
-
-    pub(super) fn scope_closes(
-        &self,
-        range: Range<usize>,
-        reg: usize,
-    ) -> impl Iterator<Item = usize> + '_ {
-        let terminal = range.end.checked_sub(1).filter(|&index| {
-            index >= range.start
-                && matches!(self.stmts[index], HirStmt::Close(ref close) if close.from_reg == 0)
-        });
-        // 末尾零槽 close 单独发布一次，包括未被完整块索引收录的 epoch 终点。
-        self.covering(range.start..terminal.unwrap_or(range.end), reg, true)
-            .chain(terminal)
-    }
-
-    fn covering(
-        &self,
-        range: Range<usize>,
-        reg: usize,
-        terminal: bool,
-    ) -> impl Iterator<Item = usize> + '_ {
+    fn positions_in(&self, range: Range<usize>) -> Range<usize> {
         let start = self.positions.partition_point(|&index| index < range.start);
         let end = start + self.positions[start..].partition_point(|&index| index < range.end);
-        let mut next = Some((1, 0..self.base));
-        let mut pending = Vec::new();
-        std::iter::from_fn(move || {
-            while let Some((node, span)) = next.take().or_else(|| pending.pop()) {
-                let summary = self.tree[node];
-                if start >= end
-                    || span.end <= start
-                    || span.start >= end
-                    || !(summary.nonzero.is_some_and(|minimum| minimum <= reg)
-                        || (terminal && summary.terminal))
-                {
-                    continue;
-                }
-                if span.end - span.start == 1 {
-                    return Some(self.positions[span.start]);
-                }
-                let middle = (span.start + span.end) / 2;
-                pending.push((2 * node + 1, middle..span.end));
-                next = Some((2 * node, span.start..middle));
+        start..end
+    }
+
+    pub(super) fn last(&self, selection: &CloseSelection) -> Option<usize> {
+        self.last_in_node(
+            1,
+            0..self.base,
+            &self.positions_in(selection.range.clone()),
+            selection,
+        )
+    }
+
+    fn last_in_node(
+        &self,
+        node: usize,
+        span: Range<usize>,
+        range: &Range<usize>,
+        selection: &CloseSelection,
+    ) -> Option<usize> {
+        let summary = self.tree[node];
+        if range.is_empty()
+            || span.end <= range.start
+            || span.start >= range.end
+            || !(summary
+                .explicit
+                .is_some_and(|minimum| minimum <= selection.reg)
+                || (selection.terminal && summary.terminal))
+        {
+            return None;
+        }
+        if span.end - span.start == 1 {
+            return Some(self.positions[span.start]);
+        }
+        let middle = (span.start + span.end) / 2;
+        self.last_in_node(2 * node + 1, middle..span.end, range, selection)
+            .or_else(|| self.last_in_node(2 * node, span.start..middle, range, selection))
+    }
+
+    /// 成功的外部 label cleanup 必须是语句连续前缀；间隙或较高槽 close 都不能跳过。
+    pub(super) fn contiguous_explicit(
+        &self,
+        range: Range<usize>,
+        reg: usize,
+    ) -> Result<Option<CloseSelection>, ()> {
+        let mut selection = CloseSelection::explicit(range, reg);
+        let Some(last) = self.last(&selection) else {
+            return Ok(None);
+        };
+        selection.range.end = last + 1;
+        let bounds = self.positions_in(selection.range.clone());
+        let (mut left, mut right) = (self.base + bounds.start, self.base + bounds.end);
+        let mut summary = CloseSummary::default();
+        while left < right {
+            if left % 2 == 1 {
+                summary = summary.union(self.tree[left]);
+                left += 1;
             }
-            None
-        })
+            if right % 2 == 1 {
+                right -= 1;
+                summary = summary.union(self.tree[right]);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        if summary.explicit_count != selection.range.len() || summary.maximum > reg {
+            return Err(());
+        }
+        Ok(Some(selection))
+    }
+
+    /// 只发布已接受候选的并集；最大活跃槽位足以判断独立 close 是否被任一 owner 覆盖。
+    pub(super) fn owned_closes<'s>(
+        &self,
+        selections: impl Iterator<Item = &'s CloseSelection>,
+    ) -> BTreeSet<usize> {
+        let mut selections = selections.collect::<Vec<_>>();
+        selections.sort_unstable_by_key(|selection| selection.range.start);
+        let mut owned = BTreeSet::new();
+        let mut pending = selections.into_iter().peekable();
+        let mut active = BinaryHeap::<(usize, usize)>::new();
+        let mut terminal_end = 0;
+        for &index in &self.positions {
+            while let Some(selection) = pending.next_if(|selection| selection.range.start <= index)
+            {
+                active.push((selection.reg, selection.range.end));
+                if selection.terminal {
+                    terminal_end = terminal_end.max(selection.range.end);
+                }
+            }
+            while active.peek().is_some_and(|&(_, end)| end <= index) {
+                active.pop();
+            }
+            let HirStmt::Close(close) = &self.stmts[index] else {
+                unreachable!("direct close positions only contain cleanup statements")
+            };
+            let covered = if close.kind == crate::transformer::CloseKind::Explicit {
+                active.peek().is_some_and(|&(reg, _)| close.from_reg <= reg)
+            } else {
+                index < terminal_end
+            };
+            if covered {
+                owned.insert(index);
+            }
+        }
+        owned
     }
 }

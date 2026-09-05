@@ -10,7 +10,7 @@
 
 use crate::hir::HirLowerError;
 use crate::hir::common::{HirExpr, HirProtoRef};
-use crate::hir::simplify::walk::{ExprRewritePass, rewrite_proto_exprs};
+use crate::hir::simplify::walk::{HirRewritePass, rewrite_proto};
 
 use super::lower::{LowerArtifacts, LoweredProtoResult};
 
@@ -57,7 +57,7 @@ struct ProtoRefRewrite {
     removed_reference: Option<HirProtoRef>,
 }
 
-impl ExprRewritePass for ProtoRefRewrite {
+impl HirRewritePass for ProtoRefRewrite {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let HirExpr::Closure(closure) = expr else {
             return false;
@@ -87,7 +87,7 @@ fn remap_artifact_proto_refs(
             remap,
             removed_reference: None,
         };
-        rewrite_proto_exprs(proto, &mut rewrite);
+        rewrite_proto(proto, &mut rewrite);
         if let Some(removed) = rewrite.removed_reference {
             return Err(removed_composite_reference_error(removed));
         }

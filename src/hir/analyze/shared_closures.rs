@@ -15,8 +15,8 @@ use std::sync::Arc;
 use crate::hir::HirLowerError;
 use crate::parser::Origin;
 use crate::structure::{
-    BlockRef, CanonicalMoveIndex, Cfg, CfgGraph, DataflowFacts, GraphFacts, RegionId, RegionPlan,
-    SsaValue, StructurePlan,
+    BlockRef, Cfg, CfgGraph, DataflowFacts, GraphFacts, RegionId, RegionPlan, SsaValue,
+    StructurePlan,
 };
 use crate::transformer::{
     CaptureSource, ClosureCreation, InstrRef, LowInstr, LoweredProto, ProtoRef, Reg,
@@ -127,7 +127,6 @@ pub(super) fn build_shared_closure_plan(
     }
 
     let owner_templates = collect_owner_templates(proto, cfg_graph, dataflow);
-    let mut canonical_moves = CanonicalMoveIndex::new(proto, dataflow);
     let mut owners_by_root = BTreeMap::<_, Vec<_>>::new();
     for (index, owner) in owner_templates.iter().enumerate() {
         let root = owner.template.nodes[owner.template.root.index()].origin;
@@ -166,17 +165,7 @@ pub(super) fn build_shared_closure_plan(
                             structure.region_contains(owner_scope, lexical_scope.first)
                                 && structure.region_contains(owner_scope, lexical_scope.last)
                         }))
-                .then(|| {
-                    match_component(
-                        proto,
-                        dataflow,
-                        &groups,
-                        owner,
-                        group,
-                        &mut shape_cache,
-                        &mut canonical_moves,
-                    )
-                })
+                .then(|| match_component(proto, dataflow, &groups, owner, group, &mut shape_cache))
                 .flatten()
             else {
                 continue;

@@ -895,6 +895,7 @@ mod tests {
                     },
                     else_block: Some(HirBlock {
                         stmts: vec![HirStmt::Return(Box::new(HirReturn {
+                            source_instr: None,
                             values: HirValuePack::fixed(vec![terminating_value]),
                         }))],
                     }),
@@ -944,6 +945,7 @@ mod tests {
                     else_block: Some(branch(2)),
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(1))]),
                 })),
             ],
@@ -992,6 +994,7 @@ mod tests {
                     }),
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![
                         HirExpr::LocalRef(LocalId(0)),
                         HirExpr::LocalRef(LocalId(1)),
@@ -1024,6 +1027,7 @@ mod tests {
                     },
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
                 })),
             ],
@@ -1081,6 +1085,7 @@ mod tests {
                     lifetime: Default::default(),
                 })),
                 HirStmt::Return(Box::new(HirReturn {
+                    source_instr: None,
                     values: HirValuePack::fixed(vec![HirExpr::TempRef(TempId(0))]),
                 })),
             ],
@@ -1170,6 +1175,7 @@ mod tests {
         if_stmt.then_block.stmts.insert(
             1,
             HirStmt::Label(Box::new(HirLabel {
+                entry_cleanup: Vec::new(),
                 id: label,
                 tbc_barriers: Default::default(),
             })),
@@ -1204,6 +1210,7 @@ mod tests {
             .stmts
             .insert(0, HirStmt::Goto(Box::new(HirGoto { target: label })));
         block.stmts.push(HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id: label,
             tbc_barriers: Default::default(),
         })));
@@ -1242,10 +1249,14 @@ mod tests {
                 value: HirExpr::LocalRef(LocalId(2)),
             })),
         );
-        if_stmt
-            .then_block
-            .stmts
-            .insert(1, HirStmt::Close(Box::new(HirClose { from_reg: 9 })));
+        if_stmt.then_block.stmts.insert(
+            1,
+            HirStmt::Close(Box::new(HirClose {
+                kind: crate::transformer::CloseKind::Explicit,
+                from_reg: 9,
+                origins: Vec::new(),
+            })),
+        );
         let mut facts = same_home_facts();
         facts.record_local_home_slot(LocalId(2), HomeSlotKey::new(9, 0));
         let mut identity = empty_identity_facts();

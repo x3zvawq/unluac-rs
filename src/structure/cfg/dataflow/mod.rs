@@ -2,6 +2,7 @@
 
 mod effects;
 mod liveness;
+mod moves;
 mod open;
 mod overwrites;
 mod ssa;
@@ -187,6 +188,12 @@ fn compute_dataflow_proto(
         }
     }
 
+    // 按 low 指令而非 CFG 遍历顺序索引；debug/capture 边界查询也需要不可达 fixed Def。
+    let mut fixed_defs_by_reg = vec![Vec::new(); reg_count];
+    for &def in instr_defs.iter().flatten() {
+        fixed_defs_by_reg[defs[def.index()].reg.index()].push(def);
+    }
+
     let ssa = build_ssa(
         cfg,
         graph_facts,
@@ -206,18 +213,21 @@ fn compute_dataflow_proto(
         &instr_defs,
         &ssa.block_entry_values,
     );
+    let canonical_move_values = moves::freeze_move_values(proto, &defs, &ssa.use_values);
     Ok(DataflowFacts {
         instr_effects,
         effect_summaries,
         defs,
         open_defs: open.defs,
         instr_defs,
+        fixed_defs_by_reg,
         block_entry_values: ssa.block_entry_values,
         block_exit_values: ssa.block_exit_values,
         block_end_values: ssa.block_end_values,
         use_values: ssa.use_values,
         def_uses: ssa.def_uses,
         def_overwritten_values,
+        canonical_move_values,
         def_phi_uses: ssa.def_phi_uses,
         phi_uses: ssa.phi_uses,
         phi_phi_uses: ssa.phi_phi_uses,
@@ -228,6 +238,7 @@ fn compute_dataflow_proto(
         open_live_in: open.live_in,
         open_live_out: open.live_out,
         phi_candidates: ssa.phis,
+        incoming_slots_by_edge: incoming_slots,
         phi_block_ranges: ssa.phi_block_ranges,
         phi_use_blocks: ssa.phi_use_blocks,
         children: Vec::new(),

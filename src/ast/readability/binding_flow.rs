@@ -8,7 +8,7 @@
 //! - repeat body 之后的 until 条件会不会继续读取正文 local？
 //!
 //! 这里故意把“当前函数体”作为边界，不继续钻进嵌套函数体。
-//! 原因是 AST 的 `LocalId` / `SyntheticLocalId` 都是按函数局部编号的，跨闭包继续统计
+//! 原因是 HIR-origin LocalId 与已物化 HirTemp 仍按函数局部编号，跨闭包继续统计
 //! 很容易把不同函数里碰巧同号的 binding 错算成同一个变量。
 //! 但 `FunctionExpr.captured_bindings` 是闭包创建时对当前词法 binding 的显式引用，
 //! 必须按当前语句的一次使用统计，否则后续 pass 可能误删仍被闭包持有的局部。

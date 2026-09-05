@@ -358,12 +358,10 @@ fn analyze_structure_proto_one(
     )?;
     let mut plan =
         plan::build_final_structure_plan(proto, cfg, graph_facts, dataflow, caps, input)?;
-    let (cleanup_dispositions, tbc_scopes) =
-        scope::analyze_cleanup_dispositions(proto, cfg, &plan)?;
-    plan.cleanup_dispositions = cleanup_dispositions;
-    plan.tbc_scopes = tbc_scopes;
-    scope::finalize_label_placements(proto, cfg, &mut plan)?;
+    scope::finalize_cleanup_dispositions(proto, cfg, &mut plan)?;
+    scope::finalize_label_placements(cfg, &mut plan)?;
     phi_facts::finalize_phi_ownership(cfg, graph_facts, dataflow, &mut plan)?;
+    // 最终值动作先于 source cleanup placement，placement 再先于消费它的 loop protocol。
     plan::finalize_loop_contracts(proto, cfg, graph_facts, dataflow, &mut plan)?;
     plan::finalize_block_emissions(cfg, &mut plan)?;
     plan::validate_final_structure_plan(proto, cfg, graph_facts, dataflow, &plan)?;

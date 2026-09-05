@@ -786,6 +786,7 @@ mod tests {
             })),
             HirStmt::Block(Box::default()),
             HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![
                     HirExpr::LocalRef(LocalId(1)),
                     HirExpr::LocalRef(LocalId(2)),

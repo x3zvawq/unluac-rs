@@ -334,15 +334,13 @@ fn access_base_is_env(
 ) -> bool {
     match base {
         AccessBase::Env | AccessBase::EnvironmentUpvalue(_) => true,
-        AccessBase::Reg(reg) => {
-            resolve_reg_def(proto, dataflow, instr, reg).is_some_and(|def_instr| {
-                matches!(
-                    proto.instrs.get(def_instr.index()),
-                    Some(LowInstr::GetUpvalue(get))
-                        if matches!(get.src, crate::transformer::UpvalueOperand::Env(_))
-                )
-            })
-        }
+        AccessBase::Reg(reg) => resolve_reg_def(dataflow, instr, reg).is_some_and(|def_instr| {
+            matches!(
+                proto.instrs.get(def_instr.index()),
+                Some(LowInstr::GetUpvalue(get))
+                    if matches!(get.src, crate::transformer::UpvalueOperand::Env(_))
+            )
+        }),
         AccessBase::Upvalue(_) => false,
     }
 }
@@ -356,7 +354,7 @@ fn raw_key_for_access(
     let constant = match key {
         AccessKey::Const(constant) => constant,
         AccessKey::Reg(reg) => {
-            let def_instr = resolve_reg_def(proto, dataflow, instr, reg)?;
+            let def_instr = resolve_reg_def(dataflow, instr, reg)?;
             let LowInstr::LoadConst(load) = proto.instrs.get(def_instr.index())? else {
                 return None;
             };
@@ -367,28 +365,12 @@ fn raw_key_for_access(
     const_string(proto, constant)
 }
 
-fn resolve_reg_def(
-    proto: &LoweredProto,
-    dataflow: &DataflowFacts,
-    use_instr: InstrRef,
-    mut reg: Reg,
-) -> Option<InstrRef> {
-    let mut value = dataflow.use_value(use_instr, reg);
-    let mut seen = std::collections::BTreeSet::new();
-    loop {
-        let SsaValue::Def(def) = value else {
-            return None;
-        };
-        if !seen.insert(def) {
-            return None;
-        }
-        let def_instr = dataflow.def_instr(def);
-        let Some(LowInstr::Move(moved)) = proto.instrs.get(def_instr.index()) else {
-            return Some(def_instr);
-        };
-        reg = moved.src;
-        value = dataflow.use_value(def_instr, reg);
-    }
+fn resolve_reg_def(dataflow: &DataflowFacts, use_instr: InstrRef, reg: Reg) -> Option<InstrRef> {
+    let SsaValue::Def(def) = dataflow.canonical_move_value(dataflow.use_value(use_instr, reg))?
+    else {
+        return None;
+    };
+    Some(dataflow.def_instr(def))
 }
 
 fn const_string(

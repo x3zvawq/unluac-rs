@@ -377,10 +377,8 @@ pub(super) fn freeze_value_decision_arc(
             .last()
             .ok_or_else(|| StructureError::invalid("value decision route is empty"))?;
         let physical_pred = cfg.edges[terminal_edge.index()].from;
-        let incoming = phi
-            .incoming
-            .iter()
-            .find(|incoming| incoming.edge == Some(terminal_edge))
+        let incoming = dataflow
+            .phi_incoming_for_edge(phi.id, terminal_edge)
             .ok_or_else(|| {
                 StructureError::invalid(
                     "value decision terminal edge has no physical result incoming",

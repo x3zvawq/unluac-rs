@@ -15,7 +15,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind};
+use super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 
 use super::object_flow::{
     Binding, ProtoEffects, RootAnalysisContext, RootState, binding_from_lvalue,
@@ -97,12 +97,17 @@ fn collect_proto_repeat_roots(
         .unknown_collectable
         .extend(proto.upvalues.iter().copied().map(Binding::Upvalue));
     let mut roots = RepeatRoots::default();
-    graph.solve_forward(initial, join_state, |_, kind, output| {
-        if let HirFlowNodeKind::RepeatCondition(repeat) = kind {
-            note_repeat_condition_lifetimes(repeat, output, facts, &mut roots, safety);
-        }
-        transfer_root_node(kind, output, &captures, effects, safety);
-    });
+    graph.solve_forward(
+        initial,
+        join_state,
+        |_, kind, output| {
+            if let HirFlowNodeKind::RepeatCondition(repeat) = kind {
+                note_repeat_condition_lifetimes(repeat, output, facts, &mut roots, safety);
+            }
+            transfer_root_node(kind, output, &captures, effects, safety);
+        },
+        |_expr, _truthy, _state| FlowRefinement::Unchanged,
+    );
     roots
 }
 

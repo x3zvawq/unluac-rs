@@ -181,6 +181,7 @@ impl<'a> AstLowerer<'a> {
     fn lower_module(&mut self) -> Result<AstModule, AstLowerError> {
         let body = self.lower_proto_body(self.module.entry.index())?;
         let module = AstModule {
+            next_synthetic_local: 0,
             entry_function: self.module.entry,
             body,
         };
@@ -285,13 +286,7 @@ impl<'a> AstLowerer<'a> {
         continue_target: Option<AstLabelId>,
     ) -> Result<(Vec<AstStmt>, usize), AstLowerError> {
         if let Some((stmt, consumed)) =
-            self.try_lower_local_close_decl(proto_index, &block.stmts, index)?
-        {
-            return Ok((vec![stmt], consumed));
-        }
-
-        if let Some((stmt, consumed)) =
-            self.try_lower_temp_close_decl(proto_index, &block.stmts, index)?
+            self.try_lower_close_decl(proto_index, &block.stmts, index)?
         {
             return Ok((vec![stmt], consumed));
         }
@@ -608,7 +603,9 @@ impl<'a> AstLowerer<'a> {
             id: AstBindingRef::Local(binding),
             attr,
             origin,
-            rewrite_authority: AstRewriteAuthority::Hir(proto.inline_dispositions.local(binding)),
+            rewrite_authority: AstRewriteAuthority::Hir(
+                proto.inline_dispositions.local(binding).clone(),
+            ),
         }
     }
 
@@ -632,7 +629,9 @@ impl<'a> AstLowerer<'a> {
             id: AstBindingRef::Temp(temp),
             attr: AstLocalAttr::None,
             origin,
-            rewrite_authority: AstRewriteAuthority::Hir(proto.inline_dispositions.temp(temp)),
+            rewrite_authority: AstRewriteAuthority::Hir(
+                proto.inline_dispositions.temp(temp).clone(),
+            ),
         }
     }
 

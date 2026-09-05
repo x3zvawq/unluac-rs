@@ -16,7 +16,7 @@ mod helpers;
 mod synthesize;
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness, expr_truthiness_assuming};
-use super::walk::{ExprRewritePass, rewrite_proto_exprs};
+use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr, HirProto,
 };
@@ -29,7 +29,7 @@ pub(super) fn simplify_decision_exprs_in_proto(
     proto: &mut HirProto,
     safety: HirExprSafety,
 ) -> bool {
-    rewrite_proto_exprs(proto, &mut DecisionExprPass { safety })
+    rewrite_proto(proto, &mut DecisionExprPass { safety })
 }
 
 /// 把前面保留在 HIR 内部的 `Decision` 彻底消掉。
@@ -44,7 +44,7 @@ struct DecisionExprPass {
     safety: HirExprSafety,
 }
 
-impl ExprRewritePass for DecisionExprPass {
+impl HirRewritePass for DecisionExprPass {
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut decision_replacement = None;
         let mut changed = false;

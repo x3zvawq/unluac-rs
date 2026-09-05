@@ -324,7 +324,7 @@ pub(in crate::structure) fn build_forwarded_action_heads(
         next_action[edge.index()] = if plan
             .edge_plans
             .get(edge.index())
-            .is_some_and(|edge| !edge.phi_copies.is_empty())
+            .is_some_and(|edge| !edge.phi_copies.is_empty() || !edge.cleanup.is_empty())
         {
             Some(edge)
         } else {

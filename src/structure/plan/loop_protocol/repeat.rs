@@ -37,6 +37,7 @@ pub(super) fn freeze_repeat_value_plan(
         .edge_plan(backedge)
         .ok_or_else(|| StructureError::invalid("repeat backedge has no final edge plan"))?;
     if matches!(backedge_plan.transfer, EdgeTransfer::LoopBack(target) if target == owner)
+        && backedge_plan.cleanup.is_empty()
         && backedge_plan.actions_before_trailing_cleanup().is_none()
         && backedge_plan.forward_route.is_none()
         && plan.loop_exit_tail_for_edge(backedge).is_none()
@@ -58,6 +59,7 @@ pub(super) fn freeze_repeat_value_plan(
         }
     }
     if !matches!(edge_plan.transfer, EdgeTransfer::Break(target) if target == owner)
+        || !edge_plan.cleanup.is_empty()
         || edge_plan.actions_before_trailing_cleanup().is_some()
         || edge_plan.forward_route.is_some()
         || plan.loop_exit_tail_for_edge(exit).is_some()
@@ -321,6 +323,7 @@ pub(super) fn repeat_backedge_copies_are_movable(
         .edge_plan(backedge)
         .ok_or_else(|| StructureError::invalid("repeat backedge has no final edge plan"))?;
     Ok(!value_plan.backedge_copies.is_empty()
+        && edge_plan.cleanup.is_empty()
         && matches!(edge_plan.transfer, EdgeTransfer::LoopBack(target) if target == owner)
         && edge_plan.phi_copies == value_plan.backedge_copies
         && edge_plan.actions_before_trailing_cleanup().is_none()
@@ -343,6 +346,11 @@ pub(super) fn repeat_exit_is_plain_break(
         (matches!(edge_plan.transfer, EdgeTransfer::Break(target) if target == owner)
             || edge_plan.transfer == EdgeTransfer::BranchArm(super::super::BranchArm::LoopExit))
             && plan.loop_exit_tail_for_edge(exit).is_none()
+            && edge_plan.cleanup.is_empty()
+            && edge_plan.forward_route.is_none_or(|route| {
+                plan.forward_route_action_edges(route)
+                    .all(|edge| plan.edge_plans[edge.index()].cleanup.is_empty())
+            })
             && locally_owned_repeat_exit_copies(value_plan)
                 .next()
                 .is_none(),
@@ -368,6 +376,7 @@ pub(super) fn repeat_exit_is_staged_break(
         .map(|copy| copy.phi_id)
         .collect::<BTreeSet<_>>();
     Ok(!exit_targets.is_empty()
+        && edge_plan.cleanup.is_empty()
         && staged_targets == exit_targets
         && matches!(edge_plan.transfer, EdgeTransfer::Break(target) if target == owner)
         && edge_plan.actions_before_trailing_cleanup().is_none()

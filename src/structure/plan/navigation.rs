@@ -1,3 +1,12 @@
+//! 最终 region containment、CFG 端点关系与源码布局完成位置的共享索引。
+//!
+//! parent/Euler 事实来自最终 arena；完成路径只穿过 Sequence/island 的末项与
+//! structured owner 的语法子区，不能用任意 descendant 代替正常完成。比如
+//! `Branch { then: island [A, B] }; C` 中 A -> C 必须保留显式跳转，只有 B 能
+//! 从 island 落底后结束 branch。这里不替代 loop 的 break/continue/条件出口分类。
+//! 构建时先冻结不依赖 sibling 顺序的拓扑供 layout 排序，排序完成后才冻结完成路径；
+//! RegionArena 只发布 finish_layout 返回的最终索引。
+
 use crate::structure::{BlockRef, Cfg, EdgeRef, StructurePlan};
 
 use super::{RegionId, RegionPlan, StructureError, UnstructuredLayoutItem};
@@ -28,14 +37,11 @@ pub(super) struct IslandBoundaryPorts {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum IslandCompletion {
+enum DirectCompletion {
     #[default]
     None,
-    ExactBlock {
-        owner: RegionId,
-        block: BlockRef,
-    },
-    StructuredRegion(RegionId),
+    ExactBlock(BlockRef),
+    ValueDecision,
 }
 
 /// 最终 region arena 的共享导航索引。
@@ -54,11 +60,12 @@ pub struct RegionNavigation {
     edge_relations: Vec<EdgeRegionRelation>,
     boundaries: Vec<RegionBoundarySummary>,
     has_unstructured_ancestor: Vec<bool>,
-    island_completion: Vec<IslandCompletion>,
+    completion_root: Vec<RegionId>,
+    direct_completion: Vec<DirectCompletion>,
 }
 
 impl RegionNavigation {
-    pub(super) fn build(
+    pub(super) fn build_topology(
         cfg: &Cfg,
         root: RegionId,
         regions: &[RegionPlan],
@@ -151,11 +158,17 @@ impl RegionNavigation {
             edge_relations: vec![EdgeRegionRelation::default(); cfg.edges.len()],
             boundaries: vec![RegionBoundarySummary::default(); regions.len()],
             has_unstructured_ancestor: vec![false; regions.len()],
-            island_completion: vec![IslandCompletion::None; regions.len()],
+            completion_root: (0..regions.len()).map(RegionId).collect(),
+            direct_completion: vec![DirectCompletion::None; regions.len()],
         };
         navigation.freeze_region_facts(regions)?;
         navigation.freeze_edges_and_boundaries(cfg, region_by_block, &children)?;
         Ok(navigation)
+    }
+
+    pub(super) fn finish_layout(mut self, regions: &[RegionPlan]) -> Result<Self, StructureError> {
+        self.freeze_completion_paths(regions)?;
+        Ok(self)
     }
 
     fn freeze_region_facts(&mut self, regions: &[RegionPlan]) -> Result<(), StructureError> {
@@ -174,29 +187,108 @@ impl RegionNavigation {
             }
             self.has_unstructured_ancestor[region.index()] = inherited || current;
         }
-        for region in &self.postorder {
-            self.island_completion[region.index()] = match regions.get(region.index()) {
-                Some(RegionPlan::Unstructured { layout, .. }) => match layout.last() {
-                    Some(UnstructuredLayoutItem::Block(block)) => IslandCompletion::ExactBlock {
-                        owner: *region,
-                        block: *block,
-                    },
-                    Some(UnstructuredLayoutItem::Region(child)) => {
-                        *self.island_completion.get(child.index()).ok_or_else(|| {
-                            StructureError::invalid(
-                                "island layout completion references a missing region",
-                            )
-                        })?
-                    }
-                    None => IslandCompletion::None,
-                },
-                Some(_) => IslandCompletion::StructuredRegion(*region),
-                None => {
+        Ok(())
+    }
+
+    fn freeze_completion_paths(&mut self, regions: &[RegionPlan]) -> Result<(), StructureError> {
+        let mut completes_parent = vec![false; regions.len()];
+        let mut empty = vec![false; regions.len()];
+        for &region in &self.postorder {
+            let mut connect = |child: RegionId| -> Result<(), StructureError> {
+                if self.parent.get(child.index()).copied().flatten() != Some(region) {
                     return Err(StructureError::invalid(
-                        "region completion references a missing region",
+                        "region completion references a child with a different owner",
                     ));
                 }
+                completes_parent[child.index()] = true;
+                Ok(())
             };
+            match &regions[region.index()] {
+                RegionPlan::Block { block, .. } => {
+                    self.direct_completion[region.index()] = DirectCompletion::ExactBlock(*block);
+                }
+                RegionPlan::ValueDecision { .. } => {
+                    // 整个 DAG 由 value-decision payload 吸收；其 leaf 出口不按块排序。
+                    self.direct_completion[region.index()] = DirectCompletion::ValueDecision;
+                }
+                RegionPlan::Sequence { parent, children } => {
+                    let syntax_control = parent
+                        .and_then(|parent| regions.get(parent.index()))
+                        .is_some_and(|parent| match parent {
+                            RegionPlan::Branch { condition, .. } => *condition == region,
+                            RegionPlan::Loop { control, .. } => *control == region,
+                            _ => false,
+                        });
+                    empty[region.index()] = true;
+                    for &child in children.iter().rev() {
+                        connect(child)?;
+                        if !empty[child.index()] {
+                            empty[region.index()] = false;
+                            // 条件 DAG/VM loop control 由 syntax payload 发射，不是源码
+                            // 顺序语句；短路 terminal arc 可以从任一 control block 退出。
+                            if !syntax_control {
+                                break;
+                            }
+                        }
+                    }
+                }
+                RegionPlan::Unstructured { layout, .. } => {
+                    empty[region.index()] = true;
+                    for item in layout.iter().rev() {
+                        match *item {
+                            UnstructuredLayoutItem::Block(block) => {
+                                self.direct_completion[region.index()] =
+                                    DirectCompletion::ExactBlock(block);
+                                empty[region.index()] = false;
+                                break;
+                            }
+                            UnstructuredLayoutItem::Region(child) => {
+                                connect(child)?;
+                                if !empty[child.index()] {
+                                    empty[region.index()] = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                RegionPlan::Branch {
+                    condition,
+                    then_arm,
+                    else_arm,
+                    ..
+                } => {
+                    // 各 arm 互斥，其内部 Sequence 仍必须真正落底。condition 的出口
+                    // 角色由冻结的 condition arcs 决定，不能把另一个 arm 当作后继尾部。
+                    connect(*condition)?;
+                    connect(*then_arm)?;
+                    if let Some(else_arm) = else_arm {
+                        connect(*else_arm)?;
+                    }
+                }
+                RegionPlan::Loop {
+                    preheader,
+                    control,
+                    body,
+                    normal_tail,
+                    ..
+                } => {
+                    // 这里只传递各语法子区的布局完成位置；提前 break、continue 与 VM
+                    // control 出口仍由 EdgeSemantics/LoopControlEdges 决定，不能从顺序猜测。
+                    for child in preheader.iter().chain([control, body]).chain(normal_tail) {
+                        connect(*child)?;
+                    }
+                }
+            }
+        }
+        // 允许完成的 parent 边构成 containment 子森林；同一分量内的祖先查询即为
+        // 完成路径，避免每条 CFG edge 沿深层 Sequence/branch/island 重复爬祖先。
+        for &region in &self.preorder {
+            if completes_parent[region.index()]
+                && let Some(parent) = self.parent[region.index()]
+            {
+                self.completion_root[region.index()] = self.completion_root[parent.index()];
+            }
         }
         Ok(())
     }
@@ -374,7 +466,8 @@ impl RegionNavigation {
     }
 
     pub(super) fn validate(&self, cfg: &Cfg, plan: &StructurePlan) -> Result<(), StructureError> {
-        let expected = Self::build(cfg, plan.root, &plan.regions, &plan.region_by_block)?;
+        let expected = Self::build_topology(cfg, plan.root, &plan.regions, &plan.region_by_block)?
+            .finish_layout(&plan.regions)?;
         if *self != expected {
             return Err(StructureError::invalid(
                 "region navigation or edge relation index is stale",
@@ -513,17 +606,17 @@ impl RegionNavigation {
 
     pub(super) fn region_can_complete_from(
         &self,
-        island: RegionId,
+        region: RegionId,
         source_owner: RegionId,
         source_block: BlockRef,
     ) -> bool {
-        match self.island_completion.get(island.index()).copied() {
-            Some(IslandCompletion::ExactBlock { owner, block }) => {
-                source_owner == owner && source_block == block
+        self.contains(region, source_owner)
+            && self.completion_root[region.index()] == self.completion_root[source_owner.index()]
+            && match self.direct_completion[source_owner.index()] {
+                DirectCompletion::ExactBlock(block) => source_block == block,
+                DirectCompletion::ValueDecision => true,
+                DirectCompletion::None => false,
             }
-            Some(IslandCompletion::StructuredRegion(region)) => self.contains(region, source_owner),
-            Some(IslandCompletion::None) | None => false,
-        }
     }
 }
 

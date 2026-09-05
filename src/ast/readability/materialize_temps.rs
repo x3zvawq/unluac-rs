@@ -10,8 +10,8 @@
 //!   稳定输出，而不是把裸 `t0` 留到最终代码
 //! - 命名 vararg、capture binding、函数名路径里残留的 temp 也会一起收成
 //!   synthetic local 身份
-//! - repeat 生命周期 certificate 保留 HIR 的 `TempId`，不随这里的语法名字改写；消费方只在
-//!   binding authority 仍来自 HIR 时把 `SyntheticLocal(temp)` 归一化回该身份
+//! - 物化只改变可读性状态，`HirTemp(temp)` 显式保留 HIR 身份；repeat/capture 消费方
+//!   直接查询该来源，不能把 AST 自建的同号 local 当作原 temp
 
 use super::super::common::{
     AstBindingRef, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule, AstNameRef,
@@ -111,7 +111,7 @@ fn rewrite_binding_ref(binding: &mut AstBindingRef) -> bool {
     let AstBindingRef::Temp(temp) = *binding else {
         return false;
     };
-    *binding = AstBindingRef::SyntheticLocal(AstSyntheticLocalId(temp));
+    *binding = AstBindingRef::SyntheticLocal(AstSyntheticLocalId::HirTemp(temp));
     true
 }
 
@@ -127,7 +127,7 @@ fn rewrite_name_ref(name: &mut AstNameRef) -> bool {
         return false;
     };
     let temp = *temp;
-    *name = AstNameRef::SyntheticLocal(AstSyntheticLocalId(temp));
+    *name = AstNameRef::SyntheticLocal(AstSyntheticLocalId::HirTemp(temp));
     true
 }
 
@@ -146,7 +146,7 @@ fn rewrite_function_metadata(function: &mut AstFunctionExpr) -> bool {
             .into_iter()
             .map(|binding| match binding {
                 AstBindingRef::Temp(temp) => {
-                    AstBindingRef::SyntheticLocal(AstSyntheticLocalId(temp))
+                    AstBindingRef::SyntheticLocal(AstSyntheticLocalId::HirTemp(temp))
                 }
                 binding => binding,
             })

@@ -11,7 +11,8 @@ mod closure_effects;
 pub(super) use closure_effects::collect_proto_effects;
 
 use super::lexical_cfg::{
-    HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings, HirGenericForFlow,
+    FlowRefinement, HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
+    HirGenericForFlow,
 };
 use crate::hir::common::{
     HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProtoRef, HirStmt, HirTableField,
@@ -66,7 +67,7 @@ pub(super) struct ProtoEffects {
     calls: BTreeSet<UpvalueId>,
 }
 
-/// 同一次模块 pass 的共享语义快照；子 proto 效果由模块入口计算，消费者不合成未知摘要。
+/// 当前模块形状的共享语义快照；子 proto 效果由模块入口计算，任一 pass 改写后失效。
 #[derive(Clone, Copy)]
 pub(super) struct RootAnalysisContext<'a> {
     pub(super) safety: HirExprSafety,
@@ -1029,24 +1030,30 @@ impl AllocationEscapeFacts {
             unknown_collectable: external.0,
             ..RootState::default()
         };
-        let unescaped = graph.solve_forward(initial, join_state, |_, kind, state| {
-            transfer_overwrite_node(kind, state, &captures, effects, safety, opaque);
-            let HirFlowNodeKind::Stmt(stmt) = kind else {
-                return None;
-            };
-            let escaped = reachable_holders(state.escaped.clone(), state);
-            Some((
-                std::ptr::from_ref(stmt).addr(),
-                state
-                    .allocations
-                    .iter()
-                    .copied()
-                    .filter(|object| {
-                        reachable_holders(BTreeSet::from([*object]), state).is_disjoint(&escaped)
-                    })
-                    .collect(),
-            ))
-        });
+        let unescaped = graph.solve_forward(
+            initial,
+            join_state,
+            |_, kind, state| {
+                transfer_overwrite_node(kind, state, &captures, effects, safety, opaque);
+                let HirFlowNodeKind::Stmt(stmt) = kind else {
+                    return None;
+                };
+                let escaped = reachable_holders(state.escaped.clone(), state);
+                Some((
+                    std::ptr::from_ref(stmt).addr(),
+                    state
+                        .allocations
+                        .iter()
+                        .copied()
+                        .filter(|object| {
+                            reachable_holders(BTreeSet::from([*object]), state)
+                                .is_disjoint(&escaped)
+                        })
+                        .collect(),
+                ))
+            },
+            |_expr, _truthy, _state| FlowRefinement::Unchanged,
+        );
         Self {
             unescaped: unescaped.into_iter().flatten().flatten().collect(),
         }

@@ -27,6 +27,7 @@ pub struct HirProto {
     pub signature: ProtoSignature,
     pub params: Vec<ParamId>,
     pub param_debug_hints: Vec<Option<String>>,
+    /// proto 内连续分配的 LocalId；local debug 映射按 ID 下标访问。
     pub locals: Vec<LocalId>,
     /// 函数入口由 VM 变参参数寄存器承载的 local 身份。
     ///
@@ -65,6 +66,7 @@ pub struct HirProto {
     /// child's private snapshot, but does not make the parent binding mutable.
     pub mutable_upvalues: BTreeSet<UpvalueId>,
     pub upvalue_debug_hints: Vec<Option<String>>,
+    /// proto 内连续分配的 TempId；temp debug 映射按 ID 下标访问。
     pub temps: Vec<TempId>,
     pub temp_debug_locals: Vec<Option<String>>,
     /// `temp_debug_locals` 对应的源码局部作用域身份；编译器内部槽位为 `None`。
@@ -131,6 +133,8 @@ pub enum HirInlineRetentionReason {
 }
 
 /// 单个 proto 内跨 temp/local 身份提升保存的重写结论。
+///
+/// 查询借用当前结论；跨层发布独立快照时显式复制，promotion 直接合并来源原因。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HirInlineDispositions {
     temps: BTreeMap<TempId, HirInlineDisposition>,
@@ -138,12 +142,16 @@ pub struct HirInlineDispositions {
 }
 
 impl HirInlineDispositions {
-    pub fn temp(&self, temp: TempId) -> HirInlineDisposition {
-        self.temps.get(&temp).cloned().unwrap_or_default()
+    pub fn temp(&self, temp: TempId) -> &HirInlineDisposition {
+        self.temps
+            .get(&temp)
+            .unwrap_or(&HirInlineDisposition::Unknown)
     }
 
-    pub fn local(&self, local: LocalId) -> HirInlineDisposition {
-        self.locals.get(&local).cloned().unwrap_or_default()
+    pub fn local(&self, local: LocalId) -> &HirInlineDisposition {
+        self.locals
+            .get(&local)
+            .unwrap_or(&HirInlineDisposition::Unknown)
     }
 
     pub fn preserve_temp(&mut self, temp: TempId, reason: HirInlineRetentionReason) -> bool {
@@ -165,10 +173,10 @@ impl HirInlineDispositions {
     /// 同一 TempId 可覆盖多个 definition epoch，而多个 temp 也可合并成同一个 local；
     /// AST 最终只看见 binding 身份，因此这里必须取并集，不能挑选某一次定义的结论。
     pub fn promote_temp_to_local(&mut self, temp: TempId, local: LocalId) {
-        let Some(disposition) = self.temps.get(&temp).cloned() else {
+        let Some(disposition) = self.temps.get(&temp) else {
             return;
         };
-        self.locals.entry(local).or_default().merge(&disposition);
+        self.locals.entry(local).or_default().merge(disposition);
     }
 }
 
@@ -875,29 +883,73 @@ pub struct HirToBeClosed {
     /// 原始 `TBC` 指令 identity；与 label 的冻结 active-set 精确配对，避免寄存器复用
     /// 让 close-scope materialization 把 goto target 放到错误的词法块。
     pub origin: InstrRef,
-    /// 对应 Lua VM 里的寄存器槽位。
-    ///
-    /// 这里额外保留 `tbc rX` 的原始槽位，不是为了把后面的 AST 再次绑定回寄存器，
-    /// 而是为了让 HIR 还能在结构层之后重建“这条 `<close>` 词法块究竟在什么位置结束”。
-    /// 对于像 Lua 5.4 `goto` 反复进入同一块、以及多条退出路径都触发 cleanup 的 case，
-    /// 单靠 `value: HirExpr` 已经不足以把多个 `close from rX` 重新配对回同一条声明。
+    /// 原始槽位只参与 HIR 候选 epoch 与覆盖阈值查询；资源配对以 origin 为准。
     pub reg_index: usize,
     pub value: HirExpr,
 }
 
-/// 显式表示一次 Lua VM `Close` cleanup 边界。
-///
-/// 这里保留“从哪个寄存器槽位开始关闭”活动值这个语义事实。后续 AST 可以基于它和
-/// `ToBeClosed` 的组合，再决定是否能恢复成 `<close>` 变量的词法块边界。
+/// 当前 HIR 快照中与 TBC 精确配对的声明；借用原 value pack，不重新证明 SSA 或槽位身份。
+#[derive(Debug, Clone, Copy)]
+pub enum HirTbcDeclaration<'a> {
+    Local {
+        local: LocalId,
+        declaration: &'a HirLocalDecl,
+    },
+    Temps {
+        close_temp: TempId,
+        assignment: &'a HirAssign,
+    },
+}
+
+impl HirToBeClosed {
+    /// 查询紧邻前句是否完整定义当前 TBC 绑定。调用方负责提供同块的前句；这里不推断 scope 终点。
+    /// 例如 `t0, t1 = exact_call(); TBC t1` 包含整组 temp 声明，不能只声明最后一个资源。
+    pub fn declaration<'a>(&self, previous: &'a HirStmt) -> Option<HirTbcDeclaration<'a>> {
+        match (previous, &self.value) {
+            (HirStmt::LocalDecl(declaration), HirExpr::LocalRef(local))
+                if declaration.bindings.as_slice() == [*local] =>
+            {
+                Some(HirTbcDeclaration::Local {
+                    local: *local,
+                    declaration,
+                })
+            }
+            (HirStmt::Assign(assignment), HirExpr::TempRef(temp))
+                if assignment.values.exact_result_len() == Some(assignment.targets.len())
+                    && assignment.targets.last() == Some(&HirLValue::Temp(*temp))
+                    && assignment
+                        .targets
+                        .iter()
+                        .all(|target| matches!(target, HirLValue::Temp(_))) =>
+            {
+                Some(HirTbcDeclaration::Temps {
+                    close_temp: *temp,
+                    assignment,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// HIR 中待词法化的实际清理事件；Structure 发布身份和执行位置，HIR 消费后才进入 AST。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirClose {
+    /// 原始 cleanup 协议由 Transformer 生产，HIR 不再按槽位猜测 frame 返回边界。
+    pub kind: crate::transformer::CloseKind,
     pub from_reg: usize,
+    /// Structure 证明的、尚待词法 owner 消费的显式 TBC origin。作用域提交时逐项退休；
+    /// 全部退休后删除事件。初始空集合只关闭普通 upvalue。
+    pub origins: Vec<InstrRef>,
 }
 
 /// 返回语句。
 ///
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirReturn {
+    /// 尚待 HIR 消费的 frame cleanup 事务身份；严格配对的 cleanup 被消费时一起退休。
+    /// 普通返回和前层已完成 cleanup 的返回没有此标记，不以诊断来源阻止语义合并。
+    pub source_instr: Option<InstrRef>,
     pub values: HirValuePack,
 }
 
@@ -1035,6 +1087,8 @@ pub struct HirGoto {
 /// label 语句。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirLabel {
+    /// 跳转到该 label 时跨过的真实 cleanup origins；不等同于 must-active barrier 的补集。
+    pub entry_cleanup: Vec<InstrRef>,
     pub id: HirLabelId,
     /// Structure 在目标 block 冻结的活跃 TBC 声明。
     pub tbc_barriers: Vec<InstrRef>,

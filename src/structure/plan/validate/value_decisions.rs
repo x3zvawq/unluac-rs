@@ -568,9 +568,13 @@ impl ValueDecisionRouteContext<'_> {
                     )
                 })?;
             let terminal_action_matches = if is_last && logical_leaf.is_some() {
-                edge_plan.phi_copies == shared_action.phi_copies && edge_plan.iteration.is_empty()
+                edge_plan.phi_copies == shared_action.phi_copies
+                    && edge_plan.cleanup == shared_action.cleanup
+                    && edge_plan.iteration.is_empty()
             } else {
-                edge_plan.phi_copies.is_empty() && edge_plan.iteration.is_empty()
+                edge_plan.phi_copies.is_empty()
+                    && edge_plan.cleanup.is_empty()
+                    && edge_plan.iteration.is_empty()
             };
             if edge_plan.owner != self.region
                 || edge_plan.transfer != EdgeTransfer::Fallthrough

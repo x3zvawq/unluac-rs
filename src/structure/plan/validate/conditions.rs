@@ -137,10 +137,7 @@ pub(super) fn validate_condition_values(
                 };
                 let arc = node.arc(polarity);
                 let edge = arc.route.last().copied()?;
-                let incoming = phi
-                    .incoming
-                    .iter()
-                    .find(|incoming| incoming.edge == Some(edge))?;
+                let incoming = dataflow.phi_incoming_for_edge(phi.id, edge)?;
                 let crate::structure::SsaValue::Def(def) = incoming.value else {
                     return None;
                 };

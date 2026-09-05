@@ -6,6 +6,8 @@
 //! `if/else` 结构误删掉。删除死写前还要证明目标没有外部读取、capture、debug identity
 //! 或物理根职责；把相邻空声明吸收到初始化器时，则必须保留条件求值期间的词法作用域。
 //! 条件是否可删除、arm 结果是否承载 GC root 统一消费入口按目标方言构造的表达式安全上下文。
+//! debug 映射按 canonical binding 下标查询；两个改写阶段共享借用的 proto 元数据，
+//! 不重建 debug 身份集合，promotion 与物理根事实也由同一只读视图提供。
 //!
 //! 它不会越权去重新判断 branch/loop 是否应该结构化，也不会替前层补决策。
 //! 这里唯一关心的是：当前 `if` 是否已经退化成“无副作用的布尔值搬运壳”。table
@@ -24,7 +26,7 @@ use std::collections::BTreeSet;
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
-    HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId, TempId,
+    HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -32,18 +34,23 @@ use crate::hir::promotion::ProtoPromotionFacts;
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::local_shapes::empty_single_local_decl_binding;
 use super::mention::expr_mentions_local;
-use super::walk::{HirRewritePass, rewrite_proto};
+use super::walk::{HirRewritePass, rewrite_block};
 
 pub(super) fn remove_boolean_materialization_shells_in_proto(
     proto: &mut HirProto,
     promotion_facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> bool {
-    let facts = BooleanShellFacts::collect(proto, promotion_facts);
-    let old_value_plan = old_values::DeadShellPlan::collect(proto, &facts, promotion_facts, safety);
+    let facts = BooleanShellFacts {
+        temp_debug_hints: &proto.temp_debug_locals,
+        local_debug_hints: &proto.local_debug_hints,
+        physical_root_locals: &proto.physical_root_locals,
+        promotion_facts,
+    };
+    let old_value_plan = old_values::DeadShellPlan::collect(proto, &facts, safety);
     let old_value_changed = old_value_plan.apply(&mut proto.body);
     let mut pass = BooleanShellPass { facts: &facts };
-    old_value_changed | rewrite_proto(proto, &mut pass)
+    old_value_changed | rewrite_block(&mut proto.body, &mut pass)
 }
 
 struct BooleanShellPass<'a> {
@@ -57,9 +64,9 @@ impl HirRewritePass for BooleanShellPass<'_> {
 }
 
 struct BooleanShellFacts<'a> {
-    debug_temps: BTreeSet<TempId>,
-    debug_locals: BTreeSet<LocalId>,
-    physical_root_locals: BTreeSet<LocalId>,
+    temp_debug_hints: &'a [Option<String>],
+    local_debug_hints: &'a [Option<String>],
+    physical_root_locals: &'a BTreeSet<LocalId>,
     promotion_facts: &'a ProtoPromotionFacts,
 }
 
@@ -69,26 +76,7 @@ struct DeadWriteProof<'a> {
     old_values: &'a OldValueFacts,
 }
 
-impl<'a> BooleanShellFacts<'a> {
-    fn collect(proto: &HirProto, promotion_facts: &'a ProtoPromotionFacts) -> Self {
-        Self {
-            debug_temps: proto
-                .temps
-                .iter()
-                .zip(&proto.temp_debug_locals)
-                .filter_map(|(temp, hint)| hint.as_ref().map(|_| *temp))
-                .collect(),
-            debug_locals: proto
-                .locals
-                .iter()
-                .zip(&proto.local_debug_hints)
-                .filter_map(|(local, hint)| hint.as_ref().map(|_| *local))
-                .collect(),
-            physical_root_locals: proto.physical_root_locals.clone(),
-            promotion_facts,
-        }
-    }
-
+impl BooleanShellFacts<'_> {
     fn target_write_is_unobservable(
         &self,
         target: &HirLValue,
@@ -98,7 +86,7 @@ impl<'a> BooleanShellFacts<'a> {
         match target {
             HirLValue::Temp(temp) => {
                 // 候选拒绝[SemanticBarrier:DebugScope]：debug temp 是 IR 已保留的源码 binding；删除其分支写入会抹掉该 source identity。
-                if self.debug_temps.contains(temp) {
+                if matches!(self.temp_debug_hints.get(temp.index()), Some(Some(_))) {
                     return false;
                 }
                 if !written_value_is_gc_inert {
@@ -134,7 +122,7 @@ impl<'a> BooleanShellFacts<'a> {
                     return false;
                 }
                 // 候选拒绝[SemanticBarrier:DebugScope]：retain-debug local 是 IR 已保留的源码 binding；删除显式分支写入会抹掉该 source identity。
-                if self.debug_locals.contains(local) {
+                if matches!(self.local_debug_hints.get(local.index()), Some(Some(_))) {
                     return false;
                 }
                 // 候选拒绝[SemanticBarrier:Lifetime]：物理根 local 的写入决定可观察的 GC 存活区间，不能按普通死值删除。
@@ -192,42 +180,42 @@ fn collapse_live_boolean_materialization_shells_in_block(
     block: &mut HirBlock,
     facts: &BooleanShellFacts,
 ) -> bool {
-    let mut index = 0;
+    let mut retained = 0;
     let mut changed = false;
-    while index < block.stmts.len() {
-        let Some((target, value)) =
-            collapsible_live_boolean_materialization_shell(&block.stmts[index])
-        else {
-            index += 1;
-            continue;
-        };
-
-        if index > 0
-            && let HirLValue::Local(local) = &target
-            && empty_single_local_decl_binding(&block.stmts[index - 1]) == Some(*local)
-            && declaration_can_absorb_boolean_shell(*local, &value, facts)
+    for index in 0..block.stmts.len() {
+        if let Some((target, value)) =
+            collapse_live_boolean_materialization_shell(&mut block.stmts[index])
         {
-            block.stmts[index - 1] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
-                bindings: vec![*local],
+            changed = true;
+            if retained > 0
+                && let HirLValue::Local(local) = &target
+                && empty_single_local_decl_binding(&block.stmts[retained - 1]) == Some(*local)
+                && declaration_can_absorb_boolean_shell(*local, &value, facts)
+            {
+                block.stmts[retained - 1] = HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                    bindings: vec![*local],
+                    values: HirValuePack::fixed(vec![value]),
+                    initializer_merge_transaction: None,
+                }));
+                // 输出仍是声明，不会成为新的分支候选；不必回退或逐次搬移整个尾部。
+                continue;
+            }
+
+            block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
+                targets: vec![target],
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
+                method_rewrite_transaction: None,
             }));
-            block.stmts.remove(index);
-            changed = true;
-            index = index.saturating_sub(1);
-            continue;
         }
-
-        block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
-            targets: vec![target],
-            values: HirValuePack::fixed(vec![value]),
-            initializer_merge_transaction: None,
-            generic_for_initializer_producer: None,
-            method_rewrite_transaction: None,
-        }));
-        changed = true;
-        index += 1;
+        // 只与已读位置交换，未处理的后缀及上一条保留语句的邻接关系不变。
+        if retained != index {
+            block.stmts.swap(retained, index);
+        }
+        retained += 1;
     }
+    block.stmts.truncate(retained);
 
     changed
 }
@@ -238,14 +226,14 @@ fn declaration_can_absorb_boolean_shell(
     facts: &BooleanShellFacts,
 ) -> bool {
     // 候选拒绝[SemanticBarrier:Scope]：regress_342 retain-debug 证明条件中的调用能观察到原声明；合并会把 debug 作用域起点后移。
-    if facts.debug_locals.contains(&local) {
+    if matches!(facts.local_debug_hints.get(local.index()), Some(Some(_))) {
         return false;
     }
     // 候选拒绝[SemanticBarrier:Scope]：regress_342 stripped 证明初始化器中的同名引用会改绑到外层 local，而不是读取已经声明的当前 local。
     !expr_mentions_local(value, local)
 }
 
-fn collapsible_live_boolean_materialization_shell(stmt: &HirStmt) -> Option<(HirLValue, HirExpr)> {
+fn collapse_live_boolean_materialization_shell(stmt: &mut HirStmt) -> Option<(HirLValue, HirExpr)> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
     };
@@ -255,33 +243,32 @@ fn collapsible_live_boolean_materialization_shell(stmt: &HirStmt) -> Option<(Hir
 
     let (then_target, then_value) = single_fixed_assign_pattern(&if_stmt.then_block)?;
     let (else_target, else_value) = single_fixed_assign_pattern(else_block)?;
-    let target = canonical_shared_target(then_target, else_target)?;
+    if then_target != else_target {
+        // 候选拒绝[SemanticBarrier:ValueFlow]：same-home 不代表可见 binding 等价；统一 local/param 写入会改变分支结果。
+        return None;
+    }
     // 候选拒绝[SemanticBarrier:EvalOrder]：regress_249 中 table 左值会把地址求值移出已选分支，条件改写的 holder 因而指向不同 table。
-    if !target_address_can_follow_condition_eval(&target) {
+    if !target_address_can_follow_condition_eval(then_target) {
         return None;
     }
 
-    match (then_value, else_value) {
-        (HirExpr::Boolean(true), HirExpr::Boolean(false)) => {
-            Some((target, booleanized_truthiness_expr(if_stmt.cond.clone())))
-        }
-        (HirExpr::Boolean(false), HirExpr::Boolean(true)) => Some((
-            target,
-            HirExpr::Unary(Box::new(HirUnaryExpr {
-                op: HirUnaryOpKind::Not,
-                expr: if_stmt.cond.clone(),
-            })),
-        )),
-        _ => None,
-    }
-}
-
-fn canonical_shared_target(then_target: &HirLValue, else_target: &HirLValue) -> Option<HirLValue> {
-    if then_target == else_target {
-        return Some(then_target.clone());
-    }
-    // 候选拒绝[SemanticBarrier:ValueFlow]：same-home 不代表可见 binding 等价；`then local=true else param=false; return local,param` 若统一写 param 会改变 true 臂结果。
-    None
+    let positive = match (then_value, else_value) {
+        (HirExpr::Boolean(true), HirExpr::Boolean(false)) => true,
+        (HirExpr::Boolean(false), HirExpr::Boolean(true)) => false,
+        _ => return None,
+    };
+    let target = then_target.clone();
+    // 所有分支转换 guard 已通过；声明吸收即使被拒绝，也会提交为独立赋值。
+    let cond = std::mem::replace(&mut if_stmt.cond, HirExpr::Nil);
+    let value = if positive {
+        booleanized_truthiness_expr(cond)
+    } else {
+        HirExpr::Unary(Box::new(HirUnaryExpr {
+            op: HirUnaryOpKind::Not,
+            expr: cond,
+        }))
+    };
+    Some((target, value))
 }
 
 fn removable_dead_materialization_shell(
@@ -548,6 +535,7 @@ mod tests {
             local_decl(candidate, HirExpr::Nil),
             boolean_shell(HirLValue::Local(candidate)),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::default(),
             })),
             HirStmt::If(Box::new(HirIf {
@@ -941,6 +929,7 @@ mod tests {
             ),
             boolean_shell(HirLValue::Temp(candidate)),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![HirExpr::LocalRef(closure)]),
             })),
         ];
@@ -983,6 +972,7 @@ mod tests {
             ),
             assign_temp(candidate, HirExpr::Nil),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![HirExpr::LocalRef(closure)]),
             })),
         ];
@@ -1025,6 +1015,7 @@ mod tests {
             ),
             boolean_shell(HirLValue::Temp(candidate)),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::default(),
             })),
         ];
@@ -1128,6 +1119,7 @@ mod tests {
             local_decl(closure, reference_closure(HirExpr::TempRef(candidate))),
             boolean_shell(HirLValue::Temp(candidate)),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::default(),
             })),
         ];
@@ -1270,6 +1262,7 @@ mod tests {
             })),
             boolean_shell(HirLValue::Temp(candidate)),
             HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
                 values: HirValuePack::fixed(vec![HirExpr::ParamRef(closure)]),
             })),
         ];
@@ -1380,7 +1373,9 @@ mod tests {
                 value: HirExpr::TempRef(candidate),
             })),
             HirStmt::Close(Box::new(HirClose {
+                kind: crate::transformer::CloseKind::Explicit,
                 from_reg: home.slot(),
+                origins: Vec::new(),
             })),
         ];
         let mut facts = ProtoPromotionFacts::default();
@@ -1500,11 +1495,15 @@ mod tests {
         ];
         let mut promotion_facts = ProtoPromotionFacts::default();
         promotion_facts.record_home_free_local(candidate);
-        let shell_facts = BooleanShellFacts::collect(&proto, &promotion_facts);
+        let shell_facts = BooleanShellFacts {
+            temp_debug_hints: &proto.temp_debug_locals,
+            local_debug_hints: &proto.local_debug_hints,
+            physical_root_locals: &proto.physical_root_locals,
+            promotion_facts: &promotion_facts,
+        };
         let plan = super::old_values::DeadShellPlan::collect(
             &proto,
             &shell_facts,
-            &promotion_facts,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         );
 
@@ -1541,11 +1540,15 @@ mod tests {
         let mut promotion_facts = ProtoPromotionFacts::default();
         promotion_facts.record_home_free_local(candidate);
         promotion_facts.record_home_free_local(flag);
-        let shell_facts = BooleanShellFacts::collect(&proto, &promotion_facts);
+        let shell_facts = BooleanShellFacts {
+            temp_debug_hints: &proto.temp_debug_locals,
+            local_debug_hints: &proto.local_debug_hints,
+            physical_root_locals: &proto.physical_root_locals,
+            promotion_facts: &promotion_facts,
+        };
         let plan = super::old_values::DeadShellPlan::collect(
             &proto,
             &shell_facts,
-            &promotion_facts,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         );
 
@@ -1577,11 +1580,15 @@ mod tests {
         ];
         let mut promotion_facts = ProtoPromotionFacts::default();
         promotion_facts.record_home_free_local(candidate);
-        let shell_facts = BooleanShellFacts::collect(&proto, &promotion_facts);
+        let shell_facts = BooleanShellFacts {
+            temp_debug_hints: &proto.temp_debug_locals,
+            local_debug_hints: &proto.local_debug_hints,
+            physical_root_locals: &proto.physical_root_locals,
+            promotion_facts: &promotion_facts,
+        };
         let plan = super::old_values::DeadShellPlan::collect(
             &proto,
             &shell_facts,
-            &promotion_facts,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         );
 
@@ -1604,11 +1611,15 @@ mod tests {
         ];
         let mut promotion_facts = ProtoPromotionFacts::default();
         promotion_facts.record_local_home_slot(candidate, HomeSlotKey::new(0, 0));
-        let shell_facts = BooleanShellFacts::collect(&proto, &promotion_facts);
+        let shell_facts = BooleanShellFacts {
+            temp_debug_hints: &proto.temp_debug_locals,
+            local_debug_hints: &proto.local_debug_hints,
+            physical_root_locals: &proto.physical_root_locals,
+            promotion_facts: &promotion_facts,
+        };
         let plan = super::old_values::DeadShellPlan::collect(
             &proto,
             &shell_facts,
-            &promotion_facts,
             HirExprSafety::for_dialect(DecompileDialect::Lua54),
         );
 
@@ -1692,6 +1703,7 @@ mod tests {
 
     fn label(id: HirLabelId) -> HirStmt {
         HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id,
             tbc_barriers: Vec::new(),
         }))

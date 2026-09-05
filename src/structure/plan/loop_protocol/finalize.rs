@@ -1,4 +1,6 @@
-//! 编排循环协议与值动作的冻结并校验最终 arena；依赖各专题构造器，不负责识别循环候选；例如逐个 loop 写入 protocol/value_actions。
+//! 按值动作、iteration、source cleanup placement、loop protocol 的依赖顺序冻结并校验
+//! 最终 arena；依赖各专题构造器，不负责识别循环候选。例如 repeat 的 native 判据只消费
+//! 已冻结的 source 动作位置，不会在 protocol 发布后再改变它的输入。
 
 use super::*;
 
@@ -10,8 +12,7 @@ pub(in crate::structure::plan) fn finalize(
     plan: &mut StructurePlan,
 ) -> Result<(), StructureError> {
     let analysis = LoopValueAnalysis::build(proto, cfg, graph_facts, dataflow, plan)?;
-    let body_completion = freeze_vm_for_body_completion(cfg, plan)?;
-    let frozen = plan
+    let actions = plan
         .loops
         .iter()
         .enumerate()
@@ -21,7 +22,24 @@ pub(in crate::structure::plan) fn finalize(
                 .get(index)
                 .copied()
                 .ok_or_else(|| StructureError::invalid("loop region reverse index is stale"))?;
-            let protocol = freeze_protocol(&LoopProtocolContext {
+            freeze_value_actions(proto, cfg, dataflow, plan, &analysis, region, payload)
+        })
+        .collect::<Result<Vec<_>, StructureError>>()?;
+    for (payload, actions) in plan.loops.iter_mut().zip(actions) {
+        payload.value_actions = Some(actions);
+    }
+    freeze_iteration_edge_dispositions(proto, cfg, graph_facts, dataflow, plan, &analysis)?;
+    // repeat 的 native/staged 判据消费 placement；必须在真实 edge batch 确定之后、
+    // protocol 冻结之前签发一次，不能先冻结 protocol 再改变它的动作时序输入。
+    super::super::finalize_edge_action_placements(proto, cfg, dataflow, plan);
+    let body_completion = freeze_vm_for_body_completion(cfg, plan)?;
+    let protocols = plan
+        .loops
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let region = plan.loop_region_by_plan[index];
+            freeze_protocol(&LoopProtocolContext {
                 proto,
                 cfg,
                 dataflow,
@@ -30,17 +48,12 @@ pub(in crate::structure::plan) fn finalize(
                 region,
                 payload,
                 body_completes_normally: body_completion[index],
-            })?;
-            let value_actions =
-                freeze_value_actions(proto, cfg, dataflow, plan, &analysis, region, payload)?;
-            Ok((protocol, value_actions))
+            })
         })
-        .collect::<Result<Vec<_>, StructureError>>()?;
-    for (payload, (protocol, actions)) in plan.loops.iter_mut().zip(frozen) {
+        .collect::<Result<Vec<_>, _>>()?;
+    for (payload, protocol) in plan.loops.iter_mut().zip(protocols) {
         payload.protocol = Some(protocol);
-        payload.value_actions = Some(actions);
     }
-    freeze_iteration_edge_dispositions(proto, cfg, graph_facts, dataflow, plan, &analysis)?;
     Ok(())
 }
 

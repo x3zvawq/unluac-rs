@@ -19,13 +19,23 @@ use crate::hir::{
 };
 use strum_macros::{Display, IntoStaticStr};
 
-/// AST 内部物化出来的保守局部绑定。
+/// 已物化的局部绑定身份；来源与可读性阶段分开，不借编号推断 HIR provenance。
+/// 例如 HirTemp(0) 和 Ast(0) 可以共存，后者不能查询前者的 capture、debug 或生命周期事实。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
-pub struct AstSyntheticLocalId(pub TempId);
+pub enum AstSyntheticLocalId {
+    /// 原 HIR temp，仍属于对应函数的 TempId 域。
+    HirTemp(TempId),
+    /// AST 模块分配的独立身份，不对应任何 HIR temp。
+    Ast(usize),
+}
 
 impl AstSyntheticLocalId {
+    /// 仅供名字候选与诊断显示；不同来源的同号身份并不相等。
     pub const fn index(self) -> usize {
-        self.0.index()
+        match self {
+            Self::HirTemp(temp) => temp.index(),
+            Self::Ast(index) => index,
+        }
     }
 }
 
@@ -34,6 +44,8 @@ impl AstSyntheticLocalId {
 pub struct AstModule {
     pub entry_function: HirProtoRef,
     pub body: AstBlock,
+    /// 随完整 AST 快照保存分配进度；跨 block、child 和 readability 轮次不复用身份。
+    pub(crate) next_synthetic_local: usize,
 }
 
 /// AST 语句块。

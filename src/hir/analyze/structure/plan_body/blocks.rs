@@ -64,52 +64,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         } else {
             prefix_end
         };
-        let placement = self
-            .lowering
-            .structure
-            .plan()
-            .label_for_block(block)
-            .map(|label| {
-                self.lowering
-                    .structure
-                    .plan()
-                    .label(label)
-                    .map(|label| label.placement)
-                    .ok_or(HirLowerError::InvalidPlanRegion {
-                        proto: self.proto.index(),
-                        region: owner.index(),
-                        detail: "block label has no frozen payload",
-                    })
-            })
-            .transpose()?;
-        let regular_start = match placement {
-            Some(LabelPlacement::AfterCleanup(last)) => {
-                if last.index() < prefix_start || last.index() >= regular_end {
-                    return self.invalid_region(
-                        owner,
-                        "label cleanup placement is outside the regular block prefix",
-                    );
-                }
-                stmts.extend(self.lower_regular_range(
-                    owner,
-                    block,
-                    prefix_start,
-                    last.index() + 1,
-                )?);
-                self.emit_label(block, LabelPlacement::AfterCleanup(last), &mut stmts)?;
-                stmts.extend(self.lower_unresolved_phis(owner, block)?);
-                last.index() + 1
-            }
-            Some(LabelPlacement::BeforeRegion(_)) => {
-                stmts.extend(self.lower_unresolved_phis(owner, block)?);
-                prefix_start
-            }
-            Some(LabelPlacement::BeforeBlock) | None => {
-                self.emit_label(block, LabelPlacement::BeforeBlock, &mut stmts)?;
-                stmts.extend(self.lower_unresolved_phis(owner, block)?);
-                prefix_start
-            }
-        };
+        let regular_start =
+            self.lower_block_entry(owner, block, prefix_start, regular_end, &mut stmts)?;
         stmts.extend(self.lower_regular_range(owner, block, regular_start, regular_end)?);
 
         if let Some(cleanup) = trailing_cleanup {
@@ -117,13 +73,14 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 return self.invalid_region(owner, "cleanup placement has no source jump");
             };
             let edge_plan = self.planned_edge(owner, edge)?;
-            stmts.extend(self.lower_edge_effects(owner, edge)?);
+            stmts.extend(self.lower_edge_source_effects(owner, edge)?);
             stmts.extend(self.lower_regular_range(
                 owner,
                 block,
                 cleanup.start.index(),
                 cleanup.end(),
             )?);
+            stmts.extend(self.lower_edge_entry_effects(owner, edge)?);
             stmts.extend(self.lower_edge_after_effects(owner, edge, edge_plan)?);
             return Ok(HirBlock { stmts });
         }
@@ -221,6 +178,56 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         Ok(stmts)
     }
 
+    /// 普通块和 loop syntax prefix 共用入口协议：AfterCleanup 先消费计划中的前缀，
+    /// 再发射一次 label/phi；BeforeRegion 的 label 仍由 region owner 发射。
+    pub(super) fn lower_block_entry(
+        &mut self,
+        owner: RegionId,
+        block: BlockRef,
+        start: usize,
+        end: usize,
+        stmts: &mut Vec<HirStmt>,
+    ) -> Result<usize, HirLowerError> {
+        let placement = self
+            .lowering
+            .structure
+            .plan()
+            .label_for_block(block)
+            .map(|label| {
+                self.lowering
+                    .structure
+                    .plan()
+                    .label(label)
+                    .map(|label| label.placement)
+                    .ok_or(HirLowerError::InvalidPlanRegion {
+                        proto: self.proto.index(),
+                        region: owner.index(),
+                        detail: "block label has no frozen payload",
+                    })
+            })
+            .transpose()?;
+        let remaining_start = match placement {
+            Some(LabelPlacement::AfterCleanup(last)) => {
+                if last.index() < start || last.index() >= end {
+                    return self.invalid_region(
+                        owner,
+                        "label cleanup placement is outside the regular block prefix",
+                    );
+                }
+                stmts.extend(self.lower_regular_range(owner, block, start, last.index() + 1)?);
+                self.emit_label(block, LabelPlacement::AfterCleanup(last), stmts)?;
+                last.index() + 1
+            }
+            Some(LabelPlacement::BeforeRegion(_)) => start,
+            Some(LabelPlacement::BeforeBlock) | None => {
+                self.emit_label(block, LabelPlacement::BeforeBlock, stmts)?;
+                start
+            }
+        };
+        stmts.extend(self.lower_unresolved_phis(owner, block)?);
+        Ok(remaining_start)
+    }
+
     fn lower_regular_range(
         &self,
         owner: RegionId,
@@ -228,26 +235,42 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         start: usize,
         end: usize,
     ) -> Result<Vec<HirStmt>, HirLowerError> {
+        let intervals = &self.lowering.bindings.lexical_scopes;
+        let candidates = &intervals[intervals.partition_point(|scope| scope.start < start)
+            ..intervals.partition_point(|scope| scope.start < end)];
+        let protocols = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            (start..end)
+                .filter_map(|index| {
+                    self.lowering
+                        .global_decls
+                        .owner(InstrRef(index))
+                        .map(|protocol| (index, protocol.end))
+                })
+                .collect::<Vec<_>>()
+        };
+        let splits_protocol = |boundary| {
+            let before = protocols.partition_point(|&(owner, _)| owner < boundary);
+            before > 0 && protocols[before - 1].1 > boundary
+        };
         let mut starts = BTreeMap::<usize, Vec<usize>>::new();
-        for (&close, &scope_start) in &self.lowering.bindings.lexical_close_scope_starts {
-            if scope_start >= start
-                && close < end
-                && self.lowering.cfg.instr_to_block.get(scope_start) == Some(&block)
-                && self.lowering.cfg.instr_to_block.get(close) == Some(&block)
+        for scope in candidates {
+            if scope.end <= end
+                && self.lowering.cfg.instr_to_block.get(scope.start) == Some(&block)
+                && self.lowering.cfg.instr_to_block.get(scope.end - 1) == Some(&block)
+                && !splits_protocol(scope.start)
+                && !splits_protocol(scope.end)
             {
-                starts.entry(scope_start).or_default().push(close);
+                starts.entry(scope.start).or_default().push(scope.end);
             }
         }
-        for closes in starts.values_mut() {
-            closes.sort_unstable_by(|left, right| right.cmp(left));
-        }
-
         let mut root = Vec::new();
         let mut scopes = Vec::<(usize, Vec<HirStmt>)>::new();
         let mut instr_index = start;
         while instr_index < end {
-            if let Some(closes) = starts.get(&instr_index) {
-                scopes.extend(closes.iter().map(|&close| (close, Vec::new())));
+            if let Some(ends) = starts.get(&instr_index) {
+                scopes.extend(ends.iter().map(|&end| (end, Vec::new())));
             }
             let mut consumed_end = instr_index + 1;
             let lowered = if let Some(protocol) = self
@@ -260,7 +283,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                             .range((instr_index + 1)..protocol.end)
                             .next()
                             .is_none()
-                        && scopes.iter().all(|(close, _)| *close + 1 >= protocol.end)
+                        && scopes.last().is_none_or(|(end, _)| *end >= protocol.end)
                 }) {
                 let stmt = super::super::super::instrs::lower_global_decl_owner(
                     self.lowering,
@@ -284,13 +307,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 root.extend(lowered);
             }
             instr_index = consumed_end;
-            while scopes
-                .last()
-                .is_some_and(|(close, _)| *close + 1 == instr_index)
-            {
-                let (_, stmts) = scopes
-                    .pop()
-                    .expect("lexical close scope stack is non-empty");
+            while scopes.last().is_some_and(|(end, _)| *end == instr_index) {
+                let (_, stmts) = scopes.pop().expect("lexical scope stack is non-empty");
                 let block = HirStmt::Block(Box::new(HirBlock { stmts }));
                 if let Some((_, parent)) = scopes.last_mut() {
                     parent.push(block);
@@ -365,8 +383,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 // 不一定还是 loop region 的 child。最终 disposition 已在 Structure
                 // 校验过 owner 与边界位置；HIR 只消费该结论，不能再按 lowering 栈重判。
                 CleanupDisposition::LoopTbcBoundary(_) => return Ok(Vec::new()),
-                CleanupDisposition::ExplicitTbcExit(_) => return Ok(Vec::new()),
-                CleanupDisposition::ExplicitTbc | CleanupDisposition::ExplicitTbcBoundary(_) => {}
+                CleanupDisposition::IncomingEdges => return Ok(Vec::new()),
+                CleanupDisposition::ExplicitTbc | CleanupDisposition::ExplicitClose => {}
             }
         }
         lower_regular_instr(self.lowering, block, instr_ref, instr).ok_or(

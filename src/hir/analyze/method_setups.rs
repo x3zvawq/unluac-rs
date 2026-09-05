@@ -3,11 +3,12 @@
 //! `CallKind::Method` 只说明调用来自方言 method 协议；这里进一步把 callee 的唯一
 //! `GetTableKind::Method` reaching-def、receiver 首参和 raw key 配成一个完整协议。最终
 //! HIR 是否仍可删除 producer，由 simplify 在所有形状与生命周期改写收敛后另行证明。
+//! callee 槽的旧值消费 Dataflow 的覆盖身份；这里只收紧同块协议边界，不重扫定义与 open 写。
 
 use super::lower::ProtoBindings;
 use crate::hir::promotion::ProtoPromotionFacts;
 use crate::parser::RawLiteralConst;
-use crate::structure::{CanonicalMoveIndex, DataflowFacts, SsaValue};
+use crate::structure::{DataflowFacts, SsaValue};
 use crate::transformer::{AccessBase, AccessKey, CallKind, LowInstr, LoweredProto, ValuePack};
 
 pub(super) fn record_method_setup_protocols(
@@ -16,7 +17,6 @@ pub(super) fn record_method_setup_protocols(
     bindings: &ProtoBindings,
     facts: &mut ProtoPromotionFacts,
 ) {
-    let mut canonical_moves = CanonicalMoveIndex::new(proto, dataflow);
     proto
         .instrs
         .iter()
@@ -65,27 +65,17 @@ pub(super) fn record_method_setup_protocols(
             let [callee_temp] = bindings.instr_fixed_defs.get(get_ref.index())?.as_slice() else {
                 return None;
             };
-            let get_block = dataflow.def_block(callee_def);
-            let prior_callee_def = dataflow
-                .defs
-                .iter()
-                .filter(|def| {
-                    def.block == get_block
-                        && def.reg == get.dst
-                        && def.instr.index() < get_ref.index()
-                })
-                .max_by_key(|def| def.instr.index())?;
-            if dataflow
-                .instr_effects
-                .get(prior_callee_def.instr.index().checked_add(1)?..get_ref.index())?
-                .iter()
-                .any(|effect| effect.must_define(get.dst))
+            let SsaValue::Def(prior_callee_def) = dataflow.def_overwritten_value(callee_def)?
+            else {
+                return None;
+            };
+            if dataflow.def_block(prior_callee_def) != dataflow.def_block(callee_def)
+                || dataflow.def_instr(prior_callee_def).index() >= get_ref.index()
             {
                 return None;
             }
-            let SsaValue::Def(prior_callee_root) = canonical_moves
-                .resolve(SsaValue::Def(prior_callee_def.id))
-                .ok()?
+            let SsaValue::Def(prior_callee_root) =
+                dataflow.canonical_move_value(SsaValue::Def(prior_callee_def))?
             else {
                 return None;
             };

@@ -185,6 +185,7 @@ pub(super) fn freeze_labels(
         let id = LabelPlanId(labels.len());
         label_by_block[block.index()] = Some(id);
         labels.push(LabelPlan {
+            entry_cleanup: Vec::new(),
             block,
             tbc_barriers: tbc_flow
                 .active_at_entry(block)

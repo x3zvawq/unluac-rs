@@ -325,6 +325,7 @@ impl<'a> ProtoLowerer<'a> {
                             Some(raw_index),
                             vec![raw_index],
                             PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                kind: crate::transformer::CloseKind::Explicit,
                                 from: close_from,
                             })),
                         );
@@ -367,6 +368,7 @@ impl<'a> ProtoLowerer<'a> {
                             None,
                             vec![raw_index, helper.helper_index],
                             PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                kind: crate::transformer::CloseKind::Explicit,
                                 from: close_from,
                             })),
                         );
@@ -404,6 +406,7 @@ impl<'a> ProtoLowerer<'a> {
                             None,
                             vec![raw_index, helper.helper_index],
                             PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                kind: crate::transformer::CloseKind::Explicit,
                                 from: close_from,
                             })),
                         );
@@ -442,6 +445,7 @@ impl<'a> ProtoLowerer<'a> {
                                 None,
                                 vec![raw_index, helper.helper_index],
                                 PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                    kind: crate::transformer::CloseKind::Explicit,
                                     from: close_from,
                                 })),
                             );
@@ -478,6 +482,7 @@ impl<'a> ProtoLowerer<'a> {
                                 None,
                                 vec![raw_index, helper.helper_index],
                                 PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
+                                    kind: crate::transformer::CloseKind::Explicit,
                                     from: close_from,
                                 })),
                             );

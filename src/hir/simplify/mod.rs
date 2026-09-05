@@ -1,7 +1,8 @@
 //! HIR 后处理收敛入口：按变化标签调度 pass，并提供同一次执行的模块事实快照。
 //!
 //! 闭包效果由当前 HIR 的显式 child/capture 身份统一汇总，temp 内联、local 提升与
-//! repeat root 消费同一份摘要。例如只读 capture 的调用不应被消费者重新解释为写入。
+//! repeat root 消费同一份摘要，任一 pass 改写 HIR 后失效。例如只读 capture 的调用
+//! 不应被消费者重新解释为写入，未改写的连续 pass 也不必重复分析 child。
 //! 此处负责摘要刷新和 pass 调度，不重新证明 VM 寄存器或源码改写合同。
 
 mod boolean_shells;
@@ -27,6 +28,7 @@ mod object_flow;
 mod repeat_root_lifetimes;
 mod residuals;
 mod root_lifetimes;
+mod stmt_plan;
 mod table_constructors;
 mod temp_inline;
 mod temp_touch;
@@ -289,6 +291,7 @@ pub(super) fn simplify_hir(
 ) -> Result<(), crate::decompile::DecompileError> {
     let mut empty_facts = ProtoPromotionFacts::default();
     let safety = HirExprSafety::for_dialect(dialect);
+    let mut effect_snapshot = None;
 
     let convergence = run_invalidation_loop(
         PASS_DESCRIPTORS,
@@ -299,13 +302,18 @@ pub(super) fn simplify_hir(
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
-                let effects = matches!(index, 4 | 6 | 7 | 15)
-                    .then(|| object_flow::collect_proto_effects(module, safety));
+                let effects = matches!(index, 4 | 6 | 7 | 15).then(|| {
+                    effect_snapshot
+                        .get_or_insert_with(|| {
+                            timings.record("closure-effects", || {
+                                object_flow::collect_proto_effects(module, safety)
+                            })
+                        })
+                        .as_slice()
+                });
                 let roots = || object_flow::RootAnalysisContext {
                     safety,
-                    effects: effects
-                        .as_deref()
-                        .expect("root pass requires module effects"),
+                    effects: effects.expect("root pass requires module effects"),
                 };
                 if index == 15 {
                     return repeat_root_lifetimes::mark_repeat_trailing_condition_roots(
@@ -358,7 +366,7 @@ pub(super) fn simplify_hir(
                         ),
                         9 => decision::eliminate_remaining_decisions_in_proto(proto, facts, safety),
                         10 => debug_scopes::materialize_tail_debug_scopes_in_proto(proto),
-                        11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto),
+                        11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto, safety),
                         12 => carried_locals::collapse_carried_local_handoffs_in_proto(
                             proto, facts, safety,
                         ),
@@ -370,6 +378,10 @@ pub(super) fn simplify_hir(
                     }
                 })
             });
+
+            if changed {
+                effect_snapshot = None;
+            }
 
             // pass 产生变化时输出 before/after diff
             if let Some(before) = before_snapshots.filter(|_| changed) {

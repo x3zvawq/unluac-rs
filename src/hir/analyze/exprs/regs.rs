@@ -137,8 +137,8 @@ fn is_loadnil_def(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -
 ///
 /// Lua upvalue 引用的是变量槽而非快照，所以 closure 捕获时应指向该寄存器
 /// 在此 block 内的最终定义。这个函数查找从 `instr_ref` 之后到 block 末尾
-/// 的最后一个 must_def，确保互递归和 LOADNIL+CLOSURE 前向声明模式都能
-/// 正确解析到最终绑定。
+/// 的最后一个 fixed Def，直接消费 Dataflow 区间索引，保留互递归和
+/// LOADNIL+CLOSURE 前向声明的最终绑定。
 fn forward_def_in_block(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
@@ -146,15 +146,11 @@ fn forward_def_in_block(
     reg: Reg,
 ) -> Option<HirExpr> {
     let block_range = lowering.cfg.blocks[block.index()].instrs;
-    let mut last_def_temp = None;
-    for idx in (instr_ref.index() + 1)..block_range.end() {
-        for def in &lowering.dataflow.instr_defs[idx] {
-            if lowering.dataflow.def_reg(*def) == reg {
-                last_def_temp = Some(lowering.bindings.fixed_temps[def.index()]);
-            }
-        }
-    }
-    last_def_temp.map(|temp| lowering.bindings.expr_for_temp(temp))
+    let def = lowering
+        .dataflow
+        .last_fixed_def_in_range(reg, (instr_ref.index() + 1)..block_range.end())?;
+    let temp = lowering.bindings.fixed_temps[def.index()];
+    Some(lowering.bindings.expr_for_temp(temp))
 }
 
 /// 某些 `goto + label` 形状需要读取“离开 block 时这个寄存器的稳定值”。

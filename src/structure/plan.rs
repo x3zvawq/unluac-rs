@@ -17,7 +17,7 @@ mod terminator;
 mod validate;
 mod value;
 
-pub use cleanup::CleanupDisposition;
+pub use cleanup::{CleanupDisposition, EdgeCleanupAction};
 pub use loop_protocol::{
     EdgeCopyOrigin, GenericForProtocol, LoopConditionProtocol, LoopIterationDisposition,
     LoopRepeatForm, LoopRepeatProtocol, LoopRepeatStagedResult, LoopRepeatValuePlan,
@@ -47,6 +47,7 @@ pub(crate) use finalize::{
     build_final_structure_plan, finalize_block_emissions, finalize_loop_contracts,
     validate_final_structure_plan,
 };
+use finalize::{expected_edge_action_placements, finalize_edge_action_placements};
 /// 已完成冲突消解并移入最终计划的 branch identity。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchPlanId(pub usize);
@@ -125,23 +126,6 @@ impl ScopePlanId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TbcScopePlanId(pub usize);
-
-impl TbcScopePlanId {
-    pub const fn index(self) -> usize {
-        self.0
-    }
-}
-
-/// 一个显式 `<close>` 声明集合的冻结词法边界及其它 CFG 出口。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TbcScopePlan {
-    pub origins: Vec<crate::transformer::InstrRef>,
-    pub boundary: crate::transformer::InstrRef,
-    pub exits: Vec<crate::transformer::InstrRef>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RegionId(pub usize);
 
@@ -217,6 +201,8 @@ pub enum RegionPlan {
 /// 已冻结 label 及其目标处必须已激活的 VM `<close>` 声明。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelPlan {
+    /// AfterCleanup 放置让 goto 跨过的真实 TBC 关闭事件。
+    pub entry_cleanup: Vec<crate::transformer::InstrRef>,
     pub block: BlockRef,
     pub tbc_barriers: Vec<crate::transformer::InstrRef>,
     pub placement: LabelPlacement,
@@ -318,8 +304,9 @@ pub struct LoopExitTailPlan {
     pub range: InstrRange,
     pub continuation: BlockRef,
     pub early_exits: Vec<EdgeRef>,
-    /// 被源码 `break` 的作用域退出吸收的 cleanup。某些 PUC 版本把它放在 tail block
-    /// 的唯一后继前缀，因此 block/route 也必须由 Structure 一并冻结。
+    /// 被源码 `break` 的作用域退出吸收的连续 Close 后缀；range 内较早的独立 Close
+    /// 和 TBC 注册仍是执行事件。某些 PUC 版本把后缀放在 tail block 的唯一后继前缀，
+    /// 因此 block/route 也必须由 Structure 一并冻结。
     pub cleanup_block: BlockRef,
     pub cleanup_route: Vec<EdgeRef>,
     pub cleanup: Vec<crate::transformer::InstrRef>,
@@ -777,9 +764,9 @@ pub struct ForwardRoutePlan {
 
 /// edge 上的 value 动作相对 source 尾部指令的冻结执行位置。
 ///
-/// 默认位置是在 source 指令全部执行后、控制转移前。若 loop latch 的尾部 cleanup 会
-/// 结束产生 carried value 的局部作用域，Structure 必须冻结精确 cleanup 范围，让 value
-/// 动作先于该范围执行；HIR 不得再从指令邻接推断这个顺序。
+/// source 值动作默认在 source 指令全部执行后、控制转移前。canonical copy 证明源块已在
+/// 同一未捕获槽完成写入，且尾部显式 Close 不结束该槽 epoch 时，最终动作阶段冻结精确
+/// cleanup 范围，让 phi 写入先于该范围执行；目标入口 cleanup 保持在它之后。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EdgeActionPlacement {
     #[default]
@@ -799,6 +786,8 @@ pub struct EdgePlan {
     /// 该 edge 被折叠成提前控制转移时共享的冻结物理 route。
     pub forward_route: Option<ForwardRouteId>,
     pub phi_copies: Vec<PhiEdgeCopy>,
+    /// 本物理边的值动作完成后、进入目标前执行；forward route 按边顺序穿插发射。
+    pub cleanup: Vec<EdgeCleanupAction>,
     /// 提前 continue/goto 绕过源码 loop tail 时，该 edge 对 for 迭代结果槽的唯一处置。
     pub iteration: Vec<LoopIterationDisposition>,
 }

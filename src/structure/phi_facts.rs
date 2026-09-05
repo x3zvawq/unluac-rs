@@ -20,9 +20,9 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::structure::{
-    BlockRef, Cfg, DataflowFacts, DefId, EdgeRef, GraphFacts, PhiCandidate, PhiId, SsaValue,
+    BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts, PhiCandidate, PhiId, SsaValue,
 };
-use crate::transformer::{LowInstr, LoweredProto, Reg};
+use crate::transformer::Reg;
 
 use super::common::{
     BranchValueMergeArm, BranchValueMergeValue, LoopKindHint, LoopValueArm, LoopValueIncoming,
@@ -50,80 +50,6 @@ pub(super) use install::incoming_requires_edge_copy;
 use install::*;
 use loop_incomings::*;
 use ownership::*;
-
-/// 只解析最终 action 实际引用的透明 Move 链；dead/unreachable def 不进入计划合同。
-pub(crate) struct CanonicalMoveIndex<'a> {
-    proto: &'a LoweredProto,
-    dataflow: &'a DataflowFacts,
-    resolved: Vec<Option<SsaValue>>,
-    state: Vec<u8>,
-    path: Vec<DefId>,
-}
-
-impl<'a> CanonicalMoveIndex<'a> {
-    pub(crate) fn new(proto: &'a LoweredProto, dataflow: &'a DataflowFacts) -> Self {
-        Self {
-            proto,
-            dataflow,
-            resolved: vec![None; dataflow.defs.len()],
-            state: vec![0; dataflow.defs.len()],
-            path: Vec::new(),
-        }
-    }
-
-    pub(crate) fn resolve(&mut self, mut value: SsaValue) -> Result<SsaValue, StructureError> {
-        self.path.clear();
-        let root = loop {
-            let SsaValue::Def(def) = value else {
-                break value;
-            };
-            let definition = self.dataflow.defs.get(def.index()).ok_or_else(|| {
-                StructureError::invalid(format!("edge action references missing {def}"))
-            })?;
-            if definition.id != def {
-                return Err(StructureError::invalid(
-                    "edge action references a non-dense SSA def",
-                ));
-            }
-            if let Some(root) = self.resolved[def.index()] {
-                break root;
-            }
-            if self.state[def.index()] == 1 {
-                return Err(StructureError::invalid(
-                    "transparent Move identities form an SSA cycle",
-                ));
-            }
-            self.state[def.index()] = 1;
-            self.path.push(def);
-            value = match self.proto.instrs.get(definition.instr.index()) {
-                Some(LowInstr::Move(move_)) if move_.dst == definition.reg => self
-                    .dataflow
-                    .use_values
-                    .get(definition.instr.index())
-                    .and_then(|uses| uses.fixed.get(move_.src))
-                    .ok_or_else(|| {
-                        StructureError::invalid(format!(
-                            "edge action {def} Move has no canonical SSA source"
-                        ))
-                    })?,
-                Some(_) => SsaValue::Def(def),
-                None => {
-                    return Err(StructureError::invalid(format!(
-                        "edge action {def} references an instruction outside the proto"
-                    )));
-                }
-            };
-            if value == SsaValue::Def(def) {
-                break value;
-            }
-        };
-        for def in self.path.drain(..).rev() {
-            self.resolved[def.index()] = Some(root);
-            self.state[def.index()] = 2;
-        }
-        Ok(root)
-    }
-}
 
 pub(super) struct ShortCircuitPhiFacts {
     pub(super) entry_value: SsaValue,

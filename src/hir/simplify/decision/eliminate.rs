@@ -197,7 +197,10 @@ fn eliminate_stmt(
         }
         HirStmt::Return(ret) => {
             let (mut prefix, values, changed) = extract_value_pack(ret.values, state, safety);
-            prefix.push(HirStmt::Return(Box::new(HirReturn { values })));
+            prefix.push(HirStmt::Return(Box::new(HirReturn {
+                source_instr: ret.source_instr,
+                values,
+            })));
             (prefix, changed)
         }
         HirStmt::If(mut if_stmt) => {

@@ -871,6 +871,7 @@ mod tests {
 
     fn returned(value: HirExpr) -> HirStmt {
         HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::fixed(vec![value]),
         }))
     }

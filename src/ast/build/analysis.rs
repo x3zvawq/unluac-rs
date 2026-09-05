@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use crate::hir::visit::{self, HirVisitor};
-use crate::hir::{HirBlock, HirExpr, HirLValue, HirStmt, LocalId, TempId};
+use crate::hir::{HirBlock, HirExpr, HirLValue, HirStmt, HirTbcDeclaration, LocalId, TempId};
 
 pub(super) fn collect_referenced_temps_in_encounter_order(block: &HirBlock) -> Vec<TempId> {
     let mut collector = ReferencedTempCollector::default();
@@ -66,20 +66,15 @@ impl HirVisitor for CloseTempCollector {
                 continue;
             };
             self.temps.insert(*temp);
-            // try_lower_temp_close_decl 将紧邻 exact assignment/TBC 合成一条声明。
+            // TBC 声明 query 证明紧邻的整组 exact assignment 都将合成一条声明。
             // sibling temp 也必须从 hoist 排除，否则会先声明再被该语句重复遮蔽。
-            if let Some(HirStmt::Assign(assign)) = index
+            if let Some(HirTbcDeclaration::Temps { assignment, .. }) = index
                 .checked_sub(1)
                 .and_then(|previous| block.stmts.get(previous))
-                && assign.values.exact_result_len() == Some(assign.targets.len())
-                && assign.targets.last() == Some(&HirLValue::Temp(*temp))
-                && assign
-                    .targets
-                    .iter()
-                    .all(|target| matches!(target, HirLValue::Temp(_)))
+                .and_then(|previous| to_be_closed.declaration(previous))
             {
                 self.temps
-                    .extend(assign.targets.iter().filter_map(|target| match target {
+                    .extend(assignment.targets.iter().filter_map(|target| match target {
                         HirLValue::Temp(temp) => Some(*temp),
                         _ => None,
                     }));

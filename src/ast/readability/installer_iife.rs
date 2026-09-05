@@ -18,17 +18,15 @@
 //! 与 capture 身份都不重建。单条简单语句的短 IIFE 保留原样。两类结果都交给后面的
 //! `function_sugar` 再决定是否继续变成 `local function l0(...) ... end`。
 //!
-//! 它依赖 AST build 已经把直接调用的 callee 落成合法 `FunctionExpr`，也依赖
-//! `materialize-temps` 先把 AST 自己残留的 temp 物化掉，这样这里新增的名字只需要走
-//! synthetic-local 命名空间，不会越权复用前层 temp。
+//! AST build 已把 callee 落成合法 `FunctionExpr`。新增 binding 从模块分配器取得
+//! `Ast` 身份，与 `materialize-temps` 保留的 `HirTemp` 分域；分配进度随模块快照保存，
+//! 不因进入子函数或新一轮改写重置，也不扫描前层编号来避让。
 //!
 //! 它不负责：
 //! - 判断多值转发与物化约束，它们由 HIR value-pack owner 负责；
 //! - 把这个局部函数进一步降成方法声明或 `local function`，那属于 `function_sugar`。
 
-use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstCallStmt, AstExpr,
@@ -36,35 +34,30 @@ use crate::ast::common::{
     AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef, AstRewriteAuthority, AstStmt,
     AstSyntheticLocalId,
 };
-use crate::hir::TempId;
 
 use super::ReadabilityContext;
 use super::local_scope_limit::{
     direct_local_count, function_entry_local_count, stmt_child_local_count,
 };
-use super::visit::{self, AstVisitor};
 use super::walk::{self, ScopedAstRewritePass};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    let next_synthetic_local = next_synthetic_local_index_in_block(&module.body);
-    walk::rewrite_module_scoped(
-        module,
-        &InstallerIifeScope {
-            active_locals: 0,
-            next_synthetic_local: Rc::new(Cell::new(next_synthetic_local)),
-        },
-        &mut InstallerIifePass,
-    )
+    let mut pass = InstallerIifePass {
+        next_synthetic_local: module.next_synthetic_local,
+    };
+    let changed =
+        walk::rewrite_module_scoped(module, &InstallerIifeScope { active_locals: 0 }, &mut pass);
+    module.next_synthetic_local = pass.next_synthetic_local;
+    changed
 }
 
-struct InstallerIifePass;
+struct InstallerIifePass {
+    next_synthetic_local: usize,
+}
 
 #[derive(Clone)]
 struct InstallerIifeScope {
     active_locals: usize,
-    /// Synthetic ids are function-local, not block-local. Nested lexical blocks share this
-    /// counter, while each child function receives its own namespace.
-    next_synthetic_local: Rc<Cell<usize>>,
 }
 
 impl ScopedAstRewritePass for InstallerIifePass {
@@ -77,9 +70,6 @@ impl ScopedAstRewritePass for InstallerIifePass {
     ) -> Self::Scope {
         InstallerIifeScope {
             active_locals: function_entry_local_count(function),
-            next_synthetic_local: Rc::new(Cell::new(next_synthetic_local_index_in_function(
-                function,
-            ))),
         }
     }
 
@@ -88,19 +78,17 @@ impl ScopedAstRewritePass for InstallerIifePass {
             active_locals: scope
                 .active_locals
                 .saturating_add(stmt_child_local_count(stmt)),
-            next_synthetic_local: Rc::clone(&scope.next_synthetic_local),
         }
     }
 
     fn scope_after_stmt(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
         InstallerIifeScope {
             active_locals: scope.active_locals.saturating_add(direct_local_count(stmt)),
-            next_synthetic_local: Rc::clone(&scope.next_synthetic_local),
         }
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt, scope: &Self::Scope) -> bool {
-        let next_synthetic_local = scope.next_synthetic_local.get();
+        let next_synthetic_local = self.next_synthetic_local;
         let Some(rewritten) = rewrite_installer_iife_stmt(stmt, next_synthetic_local) else {
             return false;
         };
@@ -108,9 +96,7 @@ impl ScopedAstRewritePass for InstallerIifePass {
             // 候选拒绝[TargetConstraint]：命名 IIFE 会在调用点新增一个 active local；现有词法 owner 已耗尽项目源码 local 预算时，后置缩域无法保证释放外层或长生命周期槽。
             return false;
         }
-        scope
-            .next_synthetic_local
-            .set(next_synthetic_local.saturating_add(1));
+        self.next_synthetic_local += 1;
         *stmt = rewritten;
         true
     }
@@ -132,7 +118,7 @@ fn rewrite_installer_iife_stmt(stmt: &AstStmt, next_synthetic_local: usize) -> O
         return None;
     }
 
-    let binding_id = AstSyntheticLocalId(TempId(next_synthetic_local));
+    let binding_id = AstSyntheticLocalId::Ast(next_synthetic_local);
 
     let rewritten = vec![
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
@@ -183,110 +169,6 @@ fn substantive_function_body_stmts(function: &AstFunctionExpr) -> &[AstStmt] {
     match body_stmts.last() {
         Some(AstStmt::Return(ret)) if ret.values.is_empty() => &body_stmts[..body_stmts.len() - 1],
         _ => body_stmts,
-    }
-}
-
-fn next_synthetic_local_index_in_block(block: &AstBlock) -> usize {
-    let mut collector = SyntheticLocalCollector::default();
-    visit::visit_block(block, &mut collector);
-    collector.next
-}
-
-fn next_synthetic_local_index_in_function(function: &AstFunctionExpr) -> usize {
-    let mut collector = SyntheticLocalCollector::default();
-    if let Some(binding) = function.named_vararg {
-        collector.collect_binding_ref(binding);
-    }
-    visit::visit_block(&function.body, &mut collector);
-    collector.next
-}
-
-#[derive(Default)]
-struct SyntheticLocalCollector {
-    next: usize,
-}
-
-impl AstVisitor for SyntheticLocalCollector {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
-        match stmt {
-            AstStmt::LocalDecl(local_decl) => {
-                for binding in &local_decl.bindings {
-                    self.collect_binding_ref(binding.id);
-                }
-            }
-            AstStmt::NumericFor(numeric_for) => {
-                self.collect_binding_ref(numeric_for.binding);
-            }
-            AstStmt::GenericFor(generic_for) => {
-                for binding in &generic_for.bindings {
-                    self.collect_binding_ref(*binding);
-                }
-            }
-            AstStmt::FunctionDecl(function_decl) => {
-                self.collect_function_name(&function_decl.target);
-            }
-            AstStmt::LocalFunctionDecl(function_decl) => {
-                self.collect_binding_ref(function_decl.name);
-            }
-            AstStmt::GlobalDecl(_)
-            | AstStmt::Assign(_)
-            | AstStmt::CallStmt(_)
-            | AstStmt::Return(_)
-            | AstStmt::If(_)
-            | AstStmt::While(_)
-            | AstStmt::Repeat(_)
-            | AstStmt::DoBlock(_)
-            | AstStmt::Break
-            | AstStmt::Continue
-            | AstStmt::Goto(_)
-            | AstStmt::Label(_)
-            | AstStmt::Error(_) => {}
-        }
-    }
-
-    fn visit_lvalue(&mut self, target: &AstLValue) {
-        if let AstLValue::Name(name) = target {
-            self.collect_name_ref(name);
-        }
-    }
-
-    fn visit_expr(&mut self, expr: &AstExpr) {
-        if let AstExpr::Var(name) = expr {
-            self.collect_name_ref(name);
-        }
-    }
-
-    fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
-        // Child bodies have a distinct function-local id namespace. Their capture metadata,
-        // however, names bindings from the current function and must reserve those ids here.
-        for binding in &function.captured_bindings {
-            self.collect_binding_ref(*binding);
-        }
-        for name in &function.capture_write_names {
-            self.collect_name_ref(name);
-        }
-        false
-    }
-}
-
-impl SyntheticLocalCollector {
-    fn collect_function_name(&mut self, target: &AstFunctionName) {
-        match target {
-            AstFunctionName::Plain(path) => self.collect_name_ref(&path.root),
-            AstFunctionName::Method(path, _) => self.collect_name_ref(&path.root),
-        }
-    }
-
-    fn collect_name_ref(&mut self, name: &AstNameRef) {
-        if let AstNameRef::SyntheticLocal(id) = name {
-            self.next = self.next.max(id.index() + 1);
-        }
-    }
-
-    fn collect_binding_ref(&mut self, binding: AstBindingRef) {
-        if let AstBindingRef::SyntheticLocal(id) = binding {
-            self.next = self.next.max(id.index() + 1);
-        }
     }
 }
 
@@ -436,7 +318,7 @@ mod tests {
     use super::*;
     use crate::ast::common::{AstIf, AstTargetDialect};
     use crate::decompile::DecompileDialect;
-    use crate::hir::{HirProtoRef, LocalId};
+    use crate::hir::{HirInlineDisposition, HirProtoRef, LocalId, TempId};
 
     fn substantial_iife_call() -> AstStmt {
         AstStmt::CallStmt(Box::new(AstCallStmt {
@@ -466,9 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn nested_block_iife_uses_the_function_wide_synthetic_namespace() {
-        let outer = AstSyntheticLocalId(TempId(0));
+    fn nested_iife_separates_hir_identity_and_preserves_allocation() {
+        let outer = AstSyntheticLocalId::HirTemp(TempId(0));
         let mut module = AstModule {
+            next_synthetic_local: 0,
             entry_function: HirProtoRef(0),
             body: AstBlock {
                 stmts: vec![
@@ -477,7 +360,9 @@ mod tests {
                             id: AstBindingRef::SyntheticLocal(outer),
                             attr: AstLocalAttr::None,
                             origin: AstLocalOrigin::Recovered,
-                            rewrite_authority: AstRewriteAuthority::AstOwned,
+                            rewrite_authority: AstRewriteAuthority::Hir(
+                                HirInlineDisposition::Unknown,
+                            ),
                         }],
                         values: vec![AstExpr::Integer(1)],
                         initializer_merge_transaction: None,
@@ -513,13 +398,31 @@ mod tests {
         };
         assert_eq!(
             installer.bindings[0].id,
-            AstBindingRef::SyntheticLocal(AstSyntheticLocalId(TempId(1)))
+            AstBindingRef::SyntheticLocal(AstSyntheticLocalId::Ast(0))
+        );
+        let context = ReadabilityContext {
+            target: AstTargetDialect::new(DecompileDialect::Lua54),
+            options: super::super::ReadabilityOptions::default(),
+        };
+        assert!(!apply(&mut module, context));
+        module.body.stmts.push(substantial_iife_call());
+        assert!(apply(&mut module, context));
+        let Some(AstStmt::DoBlock(scope)) = module.body.stmts.last() else {
+            panic!("second installer should receive its own scope");
+        };
+        let AstStmt::LocalDecl(installer) = &scope.stmts[0] else {
+            panic!("second scope should declare its installer");
+        };
+        assert_eq!(
+            installer.bindings[0].id,
+            AstBindingRef::SyntheticLocal(AstSyntheticLocalId::Ast(1))
         );
     }
 
     #[test]
     fn nested_iife_keeps_call_shape_when_active_locals_exhaust_budget() {
         let mut module = AstModule {
+            next_synthetic_local: 0,
             entry_function: HirProtoRef(0),
             body: AstBlock {
                 stmts: vec![

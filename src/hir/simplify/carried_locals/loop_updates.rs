@@ -913,6 +913,7 @@ mod tests {
 
     fn label(id: HirLabelId) -> HirStmt {
         HirStmt::Label(Box::new(HirLabel {
+            entry_cleanup: Vec::new(),
             id,
             tbc_barriers: Vec::new(),
         }))
@@ -1565,7 +1566,11 @@ mod tests {
     fn repeat_tail_update_uses_exact_home_under_compaction_and_cleanup() {
         let state = LocalId(0);
         let next = TempId(0);
-        let cleanup = HirStmt::Close(Box::new(HirClose { from_reg: 5 }));
+        let cleanup = HirStmt::Close(Box::new(HirClose {
+            kind: crate::transformer::CloseKind::Explicit,
+            from_reg: 5,
+            origins: Vec::new(),
+        }));
         let mut block = HirBlock {
             stmts: vec![
                 local_decl(state),
@@ -1821,7 +1826,11 @@ mod tests {
 
     #[test]
     fn local_update_uses_exact_home_under_compaction_and_cleanup() {
-        let cleanup = HirStmt::Close(Box::new(HirClose { from_reg: 5 }));
+        let cleanup = HirStmt::Close(Box::new(HirClose {
+            kind: crate::transformer::CloseKind::Explicit,
+            from_reg: 5,
+            origins: Vec::new(),
+        }));
         let (mut block, state, next) =
             local_update_with_prefix(vec![cleanup.clone(), HirStmt::Break]);
         let mut promotion_facts = exact_local_home_facts(state, next);

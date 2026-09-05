@@ -178,6 +178,26 @@ pub(super) fn classify_loop_exit_bounded_one_arm_branch(
     else_entry: BlockRef,
 ) -> Option<BranchCandidate> {
     let strict_merge = graph_facts.nearest_common_postdom(then_entry, else_entry)?;
+    // 带 break 的无限循环中，tail 可能必须先回到 header、下一轮进入另一臂才能
+    // 最终退出函数。此时另一臂虽严格后支配 tail，却不是本轮 continuation。
+    // 例如 `repeat if a then repeat step() until b; if c then break end end;
+    // while not b do step() end until false`：共享 while tail 应留在 if 外。
+    // 两臂都属于当前 natural loop 时，优先使用真实 frontier 汇入的单臂证明；
+    // 直接进入 header 的 continue 仍交给下面既有的控制出口分类。
+    if [then_entry, else_entry]
+        .into_iter()
+        .any(|entry| graph_facts.post_dominates(header, entry))
+        && branch_index.endpoint_loops(header).any(|owner| {
+            owner.header == header
+                && [then_entry, else_entry]
+                    .into_iter()
+                    .all(|entry| entry != header && owner.blocks.contains(&entry))
+        })
+        && let Some(candidate) =
+            classify_loop_bounded_one_arm_branch(branch_index, header, then_entry, else_entry)
+    {
+        return Some(candidate);
+    }
     // 局部 break 会把严格后支配点推到外层 loop exit；但若一臂进入单跳回边 pad，
     // 它表达的是下一轮 continue，不能把 loop-header frontier 当成普通 continuation。
     let enters_continue_pad = branch_index.endpoint_loops(header).any(|candidate| {
@@ -365,23 +385,11 @@ pub(super) fn classify_loop_bounded_one_arm_branch(
     let then_reaches_else = branch_index.joins_at(then_entry, else_entry);
     let else_reaches_then = branch_index.joins_at(else_entry, then_entry);
 
-    match (then_reaches_else, else_reaches_then) {
-        (true, false) => Some(BranchCandidate {
-            header,
-            then_entry,
-            else_entry: None,
-            merge: Some(else_entry),
-            kind: BranchKind::IfThen,
-            invert_hint: false,
-        }),
-        (false, true) => Some(BranchCandidate {
-            header,
-            then_entry: else_entry,
-            else_entry: None,
-            merge: Some(then_entry),
-            kind: BranchKind::IfThen,
-            invert_hint: true,
-        }),
-        _ => None,
-    }
+    one_arm_candidate(
+        header,
+        then_entry,
+        else_entry,
+        then_reaches_else,
+        else_reaches_then,
+    )
 }

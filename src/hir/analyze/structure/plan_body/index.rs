@@ -246,18 +246,14 @@ impl PlanLoweringIndex {
                 ));
             }
         }
-        let mut canonical_move_source = vec![None; lowering.dataflow.defs.len()];
         let mut edge_action_use_count = vec![0_usize; lowering.dataflow.defs.len()];
-        let mut canonical_moves =
-            crate::structure::CanonicalMoveIndex::new(lowering.proto, lowering.dataflow);
         for edge_index in 0..lowering.cfg.edges.len() {
             let edge = plan
                 .edge_plan(EdgeRef(edge_index))
                 .ok_or_else(|| invalid(root, "final plan has no action entry for one CFG edge"))?;
             for copy in &edge.phi_copies {
-                cache_canonical_move_source(
-                    &mut canonical_moves,
-                    &mut canonical_move_source,
+                record_edge_action_use(
+                    lowering.dataflow,
                     &mut edge_action_use_count,
                     copy.value,
                     root,
@@ -265,18 +261,16 @@ impl PlanLoweringIndex {
                 )?;
             }
             for disposition in &edge.iteration {
-                cache_canonical_move_source(
-                    &mut canonical_moves,
-                    &mut canonical_move_source,
+                record_edge_action_use(
+                    lowering.dataflow,
                     &mut edge_action_use_count,
                     disposition.incoming,
                     root,
                     invalid,
                 )?;
                 if let LoopValueSource::Ssa(value) = disposition.source {
-                    cache_canonical_move_source(
-                        &mut canonical_moves,
-                        &mut canonical_move_source,
+                    record_edge_action_use(
+                        lowering.dataflow,
                         &mut edge_action_use_count,
                         value,
                         root,
@@ -285,12 +279,8 @@ impl PlanLoweringIndex {
                 }
             }
         }
-        let absorbed_region_result_moves = build_absorbed_region_result_moves(
-            proto,
-            lowering,
-            &canonical_move_source,
-            &edge_action_use_count,
-        )?;
+        let absorbed_region_result_moves =
+            build_absorbed_region_result_moves(proto, lowering, &edge_action_use_count)?;
         let mut seen_ssa_temps = vec![false; lowering.bindings.temps.len()];
         let mut shared_ssa_temps = vec![false; lowering.bindings.temps.len()];
         for temp in lowering
@@ -315,16 +305,15 @@ impl PlanLoweringIndex {
             normal_tail_guard_by_edge,
             consumed_loop_copy_targets,
             repeat_staged_result_by_phi,
-            canonical_move_source,
+            edge_action_use_count,
             absorbed_region_result_moves,
             shared_ssa_temps,
         })
     }
 }
 
-pub(super) fn cache_canonical_move_source(
-    canonical_moves: &mut crate::structure::CanonicalMoveIndex<'_>,
-    cache: &mut [Option<SsaValue>],
+pub(super) fn record_edge_action_use(
+    dataflow: &crate::structure::DataflowFacts,
     action_use_count: &mut [usize],
     value: SsaValue,
     owner: RegionId,
@@ -333,26 +322,21 @@ pub(super) fn cache_canonical_move_source(
     let SsaValue::Def(def) = value else {
         return Ok(());
     };
-    let slot = cache
-        .get_mut(def.index())
-        .ok_or_else(|| invalid(owner, "edge action references a missing SSA def"))?;
     let uses = action_use_count
         .get_mut(def.index())
         .ok_or_else(|| invalid(owner, "edge action use index misses one SSA def"))?;
     *uses = uses
         .checked_add(1)
         .ok_or_else(|| invalid(owner, "edge action use count overflowed"))?;
-    let canonical = canonical_moves
-        .resolve(value)
-        .map_err(|_| invalid(owner, "edge action Move chain has no canonical SSA source"))?;
-    *slot = Some(canonical);
+    dataflow
+        .canonical_move_value(value)
+        .ok_or_else(|| invalid(owner, "edge action Move chain has no canonical SSA source"))?;
     Ok(())
 }
 
 pub(super) fn build_absorbed_region_result_moves(
     proto: HirProtoRef,
     lowering: &ProtoLowering<'_>,
-    canonical_move_source: &[Option<SsaValue>],
     edge_action_use_count: &[usize],
 ) -> Result<Vec<bool>, HirLowerError> {
     // 只有 final plan 已把末尾 Move 的唯一结果写入冻结为同边 copy 时，物理 temp 才是
@@ -401,9 +385,17 @@ pub(super) fn build_absorbed_region_result_moves(
             return Err(invalid(root, "Move definition block contradicts the CFG"));
         }
 
-        let Some(canonical) = canonical_move_source.get(def_index).copied().flatten() else {
+        let action_uses = edge_action_use_count
+            .get(def_index)
+            .copied()
+            .ok_or_else(|| invalid(root, "edge action use index misses one Move definition"))?;
+        if action_uses != 1 {
             continue;
-        };
+        }
+        let canonical = lowering
+            .dataflow
+            .canonical_move_value(SsaValue::Def(definition.id))
+            .expect("actual edge action Move source is validated");
         if canonical == SsaValue::Def(definition.id) {
             continue;
         }
@@ -416,13 +408,6 @@ pub(super) fn build_absorbed_region_result_moves(
         if canonical != immediate_source {
             // 多跳链的 immediate source 可能是为并行赋值保存的旧值；把 edge read
             // 穿透到 mutable canonical home 会越过中间覆写。单跳才可无条件延后读取。
-            continue;
-        }
-        let action_uses = edge_action_use_count
-            .get(def_index)
-            .copied()
-            .ok_or_else(|| invalid(root, "edge action use index misses one Move definition"))?;
-        if action_uses != 1 {
             continue;
         }
         let ordinary_uses = lowering

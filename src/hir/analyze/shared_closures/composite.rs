@@ -12,13 +12,10 @@ pub(super) fn capture_identity(
     source: CaptureSource,
     instr: InstrRef,
     dataflow: &DataflowFacts,
-    canonical_moves: &mut CanonicalMoveIndex<'_>,
 ) -> Option<CaptureIdentity> {
     match source {
         CaptureSource::ByValue(reg) => Some(CaptureIdentity::Value(
-            canonical_moves
-                .resolve(dataflow.use_value(instr, reg))
-                .ok()?,
+            dataflow.canonical_move_value(dataflow.use_value(instr, reg))?,
         )),
         CaptureSource::Upvalue(upvalue) => Some(CaptureIdentity::Upvalue(upvalue)),
         CaptureSource::ByReference(_) => None,

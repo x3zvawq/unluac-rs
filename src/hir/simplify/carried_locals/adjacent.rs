@@ -791,6 +791,7 @@ mod tests {
 
     fn empty_return() -> HirStmt {
         HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
             values: HirValuePack::default(),
         }))
     }

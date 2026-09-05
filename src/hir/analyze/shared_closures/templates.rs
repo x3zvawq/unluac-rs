@@ -26,7 +26,6 @@ pub(super) fn extract_template(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
 ) -> Option<ClosureTemplate> {
-    let mut canonical_moves = CanonicalMoveIndex::new(proto, dataflow);
     let mut returned_root = None;
     for (index, instr) in proto.instrs.iter().enumerate() {
         let instr_ref = InstrRef(index);
@@ -43,7 +42,7 @@ pub(super) fn extract_template(
             return None;
         }
         let value = dataflow.use_value(instr_ref, values.start);
-        let root = resolve_returned_closure(proto, dataflow, value, &mut canonical_moves)?;
+        let root = resolve_returned_closure(proto, dataflow, value)?;
         match returned_root {
             None => returned_root = Some(root),
             Some(existing) if existing == root => {}
@@ -59,7 +58,6 @@ pub(super) fn extract_template(
         node_by_instr: BTreeMap::new(),
         visiting: BTreeSet::new(),
         outer_upvalues: BTreeSet::new(),
-        canonical_moves: &mut canonical_moves,
     };
     let root = builder.build_node(returned_root)?;
 
@@ -74,9 +72,8 @@ pub(super) fn resolve_returned_closure(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     value: SsaValue,
-    canonical_moves: &mut CanonicalMoveIndex<'_>,
 ) -> Option<InstrRef> {
-    let SsaValue::Def(def) = canonical_moves.resolve(value).ok()? else {
+    let SsaValue::Def(def) = dataflow.canonical_move_value(value)? else {
         return None;
     };
     let instr_ref = dataflow.def_instr(def);
@@ -84,17 +81,16 @@ pub(super) fn resolve_returned_closure(
         .then_some(instr_ref)
 }
 
-pub(super) struct TemplateBuilder<'a, 'moves> {
+pub(super) struct TemplateBuilder<'a> {
     proto: &'a LoweredProto,
     dataflow: &'a DataflowFacts,
     nodes: Vec<TemplateNode>,
     node_by_instr: BTreeMap<InstrRef, CompositeNodeRef>,
     visiting: BTreeSet<InstrRef>,
     outer_upvalues: BTreeSet<UpvalueRef>,
-    canonical_moves: &'moves mut CanonicalMoveIndex<'a>,
 }
 
-impl TemplateBuilder<'_, '_> {
+impl TemplateBuilder<'_> {
     pub(super) fn build_node(&mut self, instr_ref: InstrRef) -> Option<CompositeNodeRef> {
         if let Some(node) = self.node_by_instr.get(&instr_ref) {
             return Some(*node);
@@ -177,8 +173,8 @@ impl TemplateBuilder<'_, '_> {
         }
     }
 
-    pub(super) fn resolve_capture_value(&mut self, value: SsaValue) -> Option<InstrRef> {
-        let SsaValue::Def(def) = self.canonical_moves.resolve(value).ok()? else {
+    pub(super) fn resolve_capture_value(&self, value: SsaValue) -> Option<InstrRef> {
+        let SsaValue::Def(def) = self.dataflow.canonical_move_value(value)? else {
             return None;
         };
         let instr_ref = self.dataflow.def_instr(def);
@@ -219,14 +215,12 @@ pub(super) fn match_component(
     owner: &OwnerTemplate,
     root_group: &ReusableGroup,
     shape_cache: &mut BTreeMap<(TemplateClassRef, SharedClosureRef), Option<Arc<MatchedShape>>>,
-    canonical_moves: &mut CanonicalMoveIndex<'_>,
 ) -> Option<MatchedComponent> {
     let owner_closure = closure_at(proto, owner.instr)?;
     let shape = shape_cache
         .entry((owner.class, root_group.shared))
         .or_insert_with(|| {
-            match_component_shape(proto, dataflow, groups, owner, root_group, canonical_moves)
-                .map(Arc::new)
+            match_component_shape(proto, dataflow, groups, owner, root_group).map(Arc::new)
         })
         .clone()?;
 
@@ -243,7 +237,7 @@ pub(super) fn match_component(
     }
     for (upvalue, expected) in &shape.outer_identities {
         let source = owner_closure.captures.get(upvalue.index())?.source;
-        if capture_identity(source, owner.instr, dataflow, canonical_moves) != Some(*expected) {
+        if capture_identity(source, owner.instr, dataflow) != Some(*expected) {
             return None;
         }
     }
@@ -263,7 +257,6 @@ fn match_component_shape(
     groups: &BTreeMap<SharedClosureRef, ReusableGroup>,
     owner: &OwnerTemplate,
     root_group: &ReusableGroup,
-    canonical_moves: &mut CanonicalMoveIndex<'_>,
 ) -> Option<MatchedShape> {
     if !root_group.consistent_proto
         || proto.children.get(root_group.proto.index())?.origin
@@ -294,7 +287,6 @@ fn match_component_shape(
             &mut instance_nodes,
             &mut instance_generations,
             root_index + 1,
-            canonical_moves,
         )?;
     }
 
@@ -386,7 +378,6 @@ impl ComponentMatcher<'_> {
         instance_nodes: &mut [InstrRef],
         instance_generations: &mut [usize],
         generation: usize,
-        canonical_moves: &mut CanonicalMoveIndex<'_>,
     ) -> Option<()> {
         enum MatchFrame {
             Enter {
@@ -469,12 +460,8 @@ impl ComponentMatcher<'_> {
                         .get(next_capture)?;
                     match template_capture {
                         TemplateCapture::Outer(upvalue) => {
-                            let identity = capture_identity(
-                                capture.source,
-                                instr_ref,
-                                self.dataflow,
-                                canonical_moves,
-                            )?;
+                            let identity =
+                                capture_identity(capture.source, instr_ref, self.dataflow)?;
                             match self.outer_identities.entry(upvalue) {
                                 std::collections::btree_map::Entry::Vacant(entry) => {
                                     entry.insert(identity);
