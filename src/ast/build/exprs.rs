@@ -4,6 +4,7 @@
 //! 形状猜多值语义。固定 pack 尾调用只在普通列表或目标槽位会暴露额外返回值时降成
 //! `SingleValue`，open tail 则保持展开；非 target-counted 上下文若仍收到 exact tail，
 //! 说明 HIR 物化尚未完成并直接报错。
+//! 本地范围清零保留 HIR 的成组生命周期证明，在此落成无需整组 RHS 暂存槽的标量写入。
 //! closure lowering 同时是 `capture_names_by_upvalue` 的唯一 producer：它按 HIR capture
 //! 顺序保留 child UpvalueId 到父级 Param/Local/Temp/Upvalue 名字的对应，供后续精确分析。
 //! 表构造器的 record key 同样只从 HIR 语义表达式降低：合法 UTF-8 identifier 在本层按
@@ -22,8 +23,8 @@ use crate::ast::DecompileDialect;
 use crate::ast::common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
     AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue, AstLocalDecl, AstLogicalExpr,
-    AstMethodCallExpr, AstNameRef, AstTableConstructor, AstTableField, AstTableKey, AstUnaryExpr,
-    AstUnaryOpKind, is_lua_identifier_name,
+    AstMethodCallExpr, AstNameRef, AstStmt, AstTableConstructor, AstTableField, AstTableKey,
+    AstUnaryExpr, AstUnaryOpKind, is_lua_identifier_name,
 };
 
 impl<'a> AstLowerer<'a> {
@@ -82,7 +83,7 @@ impl<'a> AstLowerer<'a> {
                 child: closure.proto.index(),
             },
         )?;
-        let body = self.lower_proto_body(closure.proto.index())?;
+        let body = self.proto_bodies.take(closure.proto.index())?;
         let named_vararg =
             if child.signature.has_vararg_param_reg && !child.signature.legacy_arg_slot {
                 let local =
@@ -167,8 +168,8 @@ impl<'a> AstLowerer<'a> {
         &mut self,
         proto_index: usize,
         assign: &HirAssign,
-    ) -> Result<AstAssign, AstLowerError> {
-        Ok(AstAssign {
+    ) -> Result<Vec<AstStmt>, AstLowerError> {
+        let assign = AstAssign {
             targets: assign
                 .targets
                 .iter()
@@ -181,7 +182,41 @@ impl<'a> AstLowerer<'a> {
             )?,
             initializer_merge_transaction: assign.initializer_merge_transaction,
             method_rewrite_transaction: assign.method_rewrite_transaction,
-        })
+        };
+        if assign.targets.len() > 1
+            && assign.targets.len() == assign.values.len()
+            && assign
+                .values
+                .iter()
+                .all(|value| matches!(value, AstExpr::Nil))
+            && assign.targets.iter().all(|target| {
+                matches!(
+                    target,
+                    AstLValue::Name(
+                        AstNameRef::Param(_) | AstNameRef::Local(_) | AstNameRef::Temp(_)
+                    )
+                )
+            })
+            && assign.initializer_merge_transaction.is_none()
+            && assign.method_rewrite_transaction.is_none()
+        {
+            // HIR 保留范围清零的共同覆盖端点；源码多值赋值却为整组 RHS 预留临时寄存器，
+            // 128 个活跃 local 再接 128 个 nil 就不可重编译。标量本地清零直接写原槽，
+            // 没有 RHS 读取、地址求值或 GC 观察点，不改变 binding/capture 的身份与释放点。
+            return Ok(assign
+                .targets
+                .into_iter()
+                .map(|target| {
+                    AstStmt::Assign(Box::new(AstAssign {
+                        targets: vec![target],
+                        values: vec![AstExpr::Nil],
+                        initializer_merge_transaction: None,
+                        method_rewrite_transaction: None,
+                    }))
+                })
+                .collect());
+        }
+        Ok(vec![AstStmt::Assign(Box::new(assign))])
     }
 
     pub(super) fn lower_lvalue(

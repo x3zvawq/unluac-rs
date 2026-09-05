@@ -7,26 +7,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::HirProto;
+use crate::hir::{HirProto, HirProtoRef};
 
 use super::NamingError;
-use super::ast_facts::FunctionAstNamingFacts;
+use super::ast_facts::{AstNamingFacts, FunctionAstNamingFacts};
 use super::common::{
     CandidateHint, FunctionHints, FunctionNameMap, FunctionNamingEvidence, ModuleNameAllocator,
     NameInfo, NameSource, NamingMode, NamingOptions,
 };
-use super::lexical::FunctionLexicalContext;
 use super::strategy::{
     choose_local_candidate, choose_param_candidate, choose_synthetic_local_candidate,
-    choose_upvalue_candidate, resolve_outer_visible_names,
+    choose_upvalue_candidate,
 };
 use super::support::{alphabetical_name, is_lua_keyword, lua_keywords};
+use super::visibility::VisibleNames;
 
 impl ModuleNameAllocator {
-    pub(super) fn reserve_function_shape_name(
+    fn reserve_function_shape_name(
         &mut self,
         candidate: CandidateHint,
-        used_in_function: &BTreeSet<String>,
+        names: &FunctionNameAllocator<'_>,
         mode: NamingMode,
     ) -> CandidateHint {
         if mode == NamingMode::DebugLike || candidate.source != NameSource::FunctionShape {
@@ -49,7 +49,7 @@ impl ModuleNameAllocator {
                 format!("{base}{next_suffix}")
             };
             if !self.function_shape_names.contains(&text)
-                && !used_in_function.contains(&text)
+                && !names.is_used(&text)
                 && !is_lua_keyword(&text)
             {
                 self.function_shape_names.insert(text.clone());
@@ -70,23 +70,46 @@ pub(super) struct FunctionAssignContext<'a> {
     pub evidence: &'a FunctionNamingEvidence,
     pub hints: &'a FunctionHints,
     pub ast_facts: &'a FunctionAstNamingFacts,
+    pub module_ast_facts: &'a AstNamingFacts,
     pub options: NamingOptions,
-    pub lexical: &'a FunctionLexicalContext,
+    pub visible_names: &'a VisibleNames,
+    pub definition_position: usize,
     pub assigned_functions: &'a [FunctionNameMap],
     pub module_names: &'a mut ModuleNameAllocator,
 }
 
-struct FunctionNameAllocator {
+struct FunctionNameAllocator<'a> {
+    ast_facts: &'a AstNamingFacts,
+    function: HirProtoRef,
+    visible_names: &'a VisibleNames,
+    definition_position: usize,
     used: BTreeSet<String>,
     next_suffix_by_base: BTreeMap<String, usize>,
 }
 
-impl FunctionNameAllocator {
-    fn new(used: BTreeSet<String>) -> Self {
+impl<'a> FunctionNameAllocator<'a> {
+    fn new(
+        ast_facts: &'a AstNamingFacts,
+        function: HirProtoRef,
+        visible_names: &'a VisibleNames,
+        definition_position: usize,
+    ) -> Self {
         Self {
-            used,
+            ast_facts,
+            function,
+            visible_names,
+            definition_position,
+            used: lua_keywords(),
             next_suffix_by_base: BTreeMap::new(),
         }
+    }
+
+    fn is_used(&self, name: &str) -> bool {
+        self.used.contains(name) || self.ast_facts.reserves_global_name(self.function, name)
+    }
+
+    fn is_outer_visible(&self, name: &str) -> bool {
+        self.visible_names.contains(name, self.definition_position)
     }
 
     fn allocate(&mut self, candidate: CandidateHint) -> NameInfo {
@@ -98,7 +121,7 @@ impl FunctionNameAllocator {
                 renamed: false,
             };
         }
-        if candidate.source == NameSource::Discard && !self.used.contains(&candidate.text) {
+        if candidate.source == NameSource::Discard && !self.is_used(&candidate.text) {
             return NameInfo {
                 text: candidate.text,
                 source: candidate.source,
@@ -107,7 +130,7 @@ impl FunctionNameAllocator {
         }
 
         let base = candidate.text;
-        if !self.used.contains(&base) && !is_lua_keyword(&base) {
+        if !self.is_used(&base) && !is_lua_keyword(&base) {
             self.used.insert(base.clone());
             return NameInfo {
                 text: base,
@@ -116,11 +139,12 @@ impl FunctionNameAllocator {
             };
         }
 
-        let suffix = self.next_suffix_by_base.entry(base.clone()).or_insert(2);
+        let mut suffix = self.next_suffix_by_base.get(&base).copied().unwrap_or(2);
         loop {
             let renamed = format!("{base}{suffix}");
-            *suffix = suffix.saturating_add(1);
-            if !self.used.contains(&renamed) && !is_lua_keyword(&renamed) {
+            suffix = suffix.saturating_add(1);
+            if !self.is_used(&renamed) && !is_lua_keyword(&renamed) {
+                self.next_suffix_by_base.insert(base, suffix);
                 self.used.insert(renamed.clone());
                 return NameInfo {
                     text: renamed,
@@ -141,15 +165,19 @@ pub(super) fn assign_names_for_function(
         evidence,
         hints,
         ast_facts,
+        module_ast_facts,
         options,
-        lexical,
+        visible_names,
+        definition_position,
         assigned_functions,
         module_names,
     } = context;
-    let mut reserved_names = lua_keywords();
-    reserved_names.extend(ast_facts.reserved_global_names.iter().cloned());
-    let mut names = FunctionNameAllocator::new(reserved_names);
-    let outer_visible_names = resolve_outer_visible_names(proto.id, lexical, assigned_functions)?;
+    let mut names = FunctionNameAllocator::new(
+        module_ast_facts,
+        proto.id,
+        visible_names,
+        definition_position,
+    );
     let upvalue_candidates = proto
         .upvalues
         .iter()
@@ -177,13 +205,12 @@ pub(super) fn assign_names_for_function(
             allocate_param_name(
                 module_names.reserve_function_shape_name(
                     choose_param_candidate(proto, *param, index, evidence, hints, options),
-                    &names.used,
+                    &names,
                     options.mode,
                 ),
                 index,
                 options,
                 &mut names,
-                &outer_visible_names,
             )
         })
         .collect::<Vec<_>>();
@@ -195,7 +222,7 @@ pub(super) fn assign_names_for_function(
         .map(|(index, local)| {
             names.allocate(module_names.reserve_function_shape_name(
                 choose_local_candidate(proto, *local, index, evidence, hints, ast_facts, options),
-                &names.used,
+                &names,
                 options.mode,
             ))
         })
@@ -203,8 +230,7 @@ pub(super) fn assign_names_for_function(
 
     let mut upvalues = Vec::with_capacity(proto.upvalues.len());
     for candidate in upvalue_candidates {
-        let candidate =
-            module_names.reserve_function_shape_name(candidate, &names.used, options.mode);
+        let candidate = module_names.reserve_function_shape_name(candidate, &names, options.mode);
         if candidate.source == NameSource::CaptureProvenance {
             upvalues.push(NameInfo {
                 text: candidate.text,
@@ -233,7 +259,7 @@ pub(super) fn assign_names_for_function(
                     ast_facts,
                     options,
                 ),
-                &names.used,
+                &names,
                 options.mode,
             ));
             (local, info)
@@ -252,32 +278,27 @@ fn allocate_param_name(
     candidate: CandidateHint,
     index: usize,
     options: NamingOptions,
-    names: &mut FunctionNameAllocator,
-    outer_visible_names: &BTreeSet<String>,
+    names: &mut FunctionNameAllocator<'_>,
 ) -> NameInfo {
     if options.mode == NamingMode::DebugLike || candidate.source != NameSource::Simple {
         return names.allocate(candidate);
     }
-    if !outer_visible_names.contains(&candidate.text) {
+    if !names.is_outer_visible(&candidate.text) {
         return names.allocate(candidate);
     }
 
-    let replacement = next_available_simple_param_name(index, &names.used, outer_visible_names);
+    let replacement = next_available_simple_param_name(index, names);
     names.allocate(CandidateHint {
         text: replacement,
         source: candidate.source,
     })
 }
 
-fn next_available_simple_param_name(
-    mut index: usize,
-    used: &BTreeSet<String>,
-    outer_visible_names: &BTreeSet<String>,
-) -> String {
+fn next_available_simple_param_name(mut index: usize, names: &FunctionNameAllocator<'_>) -> String {
     loop {
         let candidate = alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1));
-        if !used.contains(&candidate)
-            && !outer_visible_names.contains(&candidate)
+        if !names.is_used(&candidate)
+            && !names.is_outer_visible(&candidate)
             && !is_lua_keyword(&candidate)
         {
             return candidate;

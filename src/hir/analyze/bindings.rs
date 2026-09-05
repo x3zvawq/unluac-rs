@@ -146,7 +146,7 @@ pub(super) fn build_bindings(
         None
     };
 
-    let (debug_entry_local_decls, debug_scope_locals) = allocate_debug_entry_locals(
+    let (debug_entry_local_decls, debug_scope_targets) = allocate_debug_entry_bindings(
         proto,
         structure,
         &mut entry_local_regs,
@@ -398,16 +398,21 @@ pub(super) fn build_bindings(
         .enumerate()
         .filter_map(|(index, scope)| {
             let scope = (*scope)?;
-            let local = debug_scope_locals.get(&scope).copied()?;
-            Some((TempId(index), BoundSlotTarget::Local(local)))
+            let target = debug_scope_targets.get(&scope).copied()?;
+            Some((TempId(index), target))
         })
         .collect::<BTreeMap<_, _>>();
     let mut local_debug_scopes = vec![None; locals.len()];
-    for (&scope, &local) in &debug_scope_locals {
-        local_debug_scopes[local.index()] = Some(scope);
+    for (&scope, &target) in &debug_scope_targets {
+        if let BoundSlotTarget::Local(local) = target {
+            local_debug_scopes[local.index()] = Some(scope);
+        }
     }
     let mut conflicted_local_debug_scopes = BTreeSet::new();
-    for (&temp, &BoundSlotTarget::Local(local)) in &debug_temp_targets {
+    for (&temp, &target) in &debug_temp_targets {
+        let BoundSlotTarget::Local(local) = target else {
+            continue;
+        };
         let Some(scope) = temp_debug_scopes[temp.index()] else {
             continue;
         };
@@ -449,10 +454,7 @@ pub(super) fn build_bindings(
     let captured_local_home_slots = captured_slots
         .slot_targets
         .iter()
-        .map(|(key, binding)| {
-            let BoundSlotTarget::Local(local) = binding.target;
-            (local, HomeSlotKey::new(key.slot, key.epoch))
-        })
+        .map(|(key, binding)| (binding.target, HomeSlotKey::new(key.slot, key.epoch)))
         .collect();
 
     // 这一层默认只消费 reachable 子图，所以 label/temp 也贴着 shared CFG/Dataflow 的约定。

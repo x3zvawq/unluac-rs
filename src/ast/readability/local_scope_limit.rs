@@ -24,7 +24,7 @@ use walk::{BlockKind, ScopedAstRewritePass};
 const SCOPE_LOCAL_TARGET: usize = 64;
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
-    walk::rewrite_module_scoped(module, &0, &mut LocalScopeLimitPass)
+    walk::rewrite_module_scoped(module, 0, &mut LocalScopeLimitPass)
 }
 
 struct LocalScopeLimitPass;
@@ -32,20 +32,16 @@ struct LocalScopeLimitPass;
 impl ScopedAstRewritePass for LocalScopeLimitPass {
     type Scope = usize;
 
-    fn enter_function(
-        &mut self,
-        function: &mut AstFunctionExpr,
-        _outer_scope: &Self::Scope,
-    ) -> Self::Scope {
-        function_entry_local_count(function)
+    fn enter_function(&mut self, function: &mut AstFunctionExpr, scope: &mut Self::Scope) {
+        *scope = function_entry_local_count(function);
     }
 
     fn enter_block(
         &mut self,
         block: &mut AstBlock,
         _kind: BlockKind,
-        outer_locals: &Self::Scope,
-    ) -> (bool, Self::Scope) {
+        outer_locals: &mut Self::Scope,
+    ) -> bool {
         enter_block_with_trailing_condition(block, None, *outer_locals)
     }
 
@@ -54,24 +50,20 @@ impl ScopedAstRewritePass for LocalScopeLimitPass {
         block: &mut AstBlock,
         condition: &AstExpr,
         _lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
-        outer_locals: &Self::Scope,
-    ) -> (bool, Self::Scope) {
+        outer_locals: &mut Self::Scope,
+    ) -> bool {
         enter_block_with_trailing_condition(block, Some(condition), *outer_locals)
     }
 
-    fn scope_for_stmt_children(
-        &mut self,
-        stmt: &AstStmt,
-        outer_locals: &Self::Scope,
-    ) -> Self::Scope {
+    fn enter_stmt_children(&mut self, stmt: &AstStmt, outer_locals: &mut Self::Scope) {
         // for 控制变量只在 loop body 内可见；控制表达式里即使出现嵌套函数，
         // enter_function 也会重置预算，因此统一给 statement children 加上它们是精确的。
-        outer_locals.saturating_add(stmt_child_local_count(stmt))
+        *outer_locals = outer_locals.saturating_add(stmt_child_local_count(stmt));
     }
 
-    fn scope_after_stmt(&mut self, stmt: &AstStmt, outer_locals: &Self::Scope) -> Self::Scope {
+    fn after_stmt(&mut self, stmt: &AstStmt, outer_locals: &mut Self::Scope) {
         // Lua local 从声明语句结束后才进入当前 block 的后续词法作用域。
-        outer_locals.saturating_add(direct_local_count(stmt))
+        *outer_locals = outer_locals.saturating_add(direct_local_count(stmt));
     }
 }
 
@@ -79,15 +71,13 @@ fn enter_block_with_trailing_condition(
     block: &mut AstBlock,
     trailing_condition: Option<&AstExpr>,
     outer_locals: usize,
-) -> (bool, usize) {
-    let changed = scope_locals(
+) -> bool {
+    // 当前 block 的声明由 after_stmt 按源码位置激活，不能在入口一次性加入预算。
+    scope_locals(
         block,
         crate::SOURCE_LOCAL_LIMIT.saturating_sub(outer_locals),
         trailing_condition,
-    );
-    // 当前 block 的声明不能在入口一次性加入：它们只应通过 scope_after_stmt
-    // 按源码位置影响后续 sibling 及其子 block。
-    (changed, outer_locals)
+    )
 }
 
 fn scope_locals(

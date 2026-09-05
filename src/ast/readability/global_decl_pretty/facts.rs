@@ -15,12 +15,33 @@ use crate::ast::common::{
 };
 
 use super::super::visit::{self, AstVisitor};
-use super::super::walk::BlockKind;
+use super::super::walk::{BlockKind, RewriteScope};
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(in crate::ast::readability) struct VisibleGlobals {
     names: BTreeMap<String, AstGlobalAttr>,
     collective: Option<AstGlobalAttr>,
+    undo_names: Vec<(String, Option<AstGlobalAttr>)>,
+}
+
+impl RewriteScope for VisibleGlobals {
+    type Checkpoint = (usize, Option<AstGlobalAttr>);
+
+    fn checkpoint(&self) -> Self::Checkpoint {
+        (self.undo_names.len(), self.collective)
+    }
+
+    fn restore(&mut self, (len, collective): Self::Checkpoint) {
+        while self.undo_names.len() > len {
+            let (name, previous) = self.undo_names.pop().unwrap();
+            if let Some(attr) = previous {
+                self.names.insert(name, attr);
+            } else {
+                self.names.remove(&name);
+            }
+        }
+        self.collective = collective;
+    }
 }
 
 impl VisibleGlobals {
@@ -36,22 +57,37 @@ impl VisibleGlobals {
         self.collective
     }
 
-    pub(in crate::ast::readability) fn after_stmt(&self, stmt: &AstStmt) -> Self {
-        let mut visible = self.clone();
+    pub(in crate::ast::readability) fn apply_stmt(&mut self, stmt: &AstStmt) {
         match stmt {
-            AstStmt::GlobalDecl(decl) => GlobalFactsCollector::note_global_decl_bindings(
-                &decl.bindings,
-                &mut visible.names,
-                &mut visible.collective,
-            ),
+            AstStmt::GlobalDecl(decl) => {
+                for binding in &decl.bindings {
+                    if let AstGlobalBindingTarget::Name(name) = &binding.target {
+                        self.undo_names
+                            .push((name.text.clone(), self.names.get(&name.text).copied()));
+                    }
+                }
+                GlobalFactsCollector::note_global_decl_bindings(
+                    &decl.bindings,
+                    &mut self.names,
+                    &mut self.collective,
+                );
+            }
             AstStmt::FunctionDecl(function) => {
                 if let Some(name) = global_declared_name(function) {
-                    visible.names.insert(name.to_owned(), AstGlobalAttr::None);
+                    let name = name.to_owned();
+                    let previous = self.names.insert(name.clone(), AstGlobalAttr::None);
+                    self.undo_names.push((name, previous));
                 }
             }
             _ => {}
         }
-        visible
+    }
+
+    pub(in crate::ast::readability) fn enter_stmt_children(&mut self, stmt: &AstStmt) {
+        // global function 的自名对函数体可见；GlobalDecl initializer 仍使用声明前环境。
+        if matches!(stmt, AstStmt::FunctionDecl(_)) {
+            self.apply_stmt(stmt);
+        }
     }
 }
 
@@ -453,223 +489,103 @@ fn global_access_is_allowed(
         .is_some_and(|attr| global_attr_allows(attr, kind, false))
 }
 
-/// 判断把一段直属语句的 global 声明延伸到后继表达式后，是否保持每个 global 访问的
-/// 许可结果不变。
-///
-/// `extending_stmts` 本身仍在原位置、原环境求值，因此这里只用其直属声明推进扩域后的
-/// 环境，不重新验证其访问。表达式中的每个读写分别比较扩域前后；无关 missing global
-/// 即使两边都暂时非法也不会掩盖另一个访问由合法变非法。嵌套函数继续使用同一套顺序
-/// 词法解释器，所以函数内声明、global function 递归名和 repeat body outgoing 环境均
-/// 按实际作用域继承。
+/// 比较扩域前后每个 global 访问的许可，不能用整个表达式是否有效代替逐访问结果。
+/// 两次遍历使用同一表达式和共享 visitor 顺序，只回退期间新增的词法声明，不复制祖先环境。
 pub(in crate::ast::readability) fn extending_global_scope_preserves_expr(
-    incoming: &VisibleGlobals,
+    incoming: &mut VisibleGlobals,
     extending_stmts: &[AstStmt],
     expr: &AstExpr,
 ) -> bool {
-    let extended = extending_stmts
-        .iter()
-        .fold(incoming.clone(), |globals, stmt| globals.after_stmt(stmt));
-    expr_global_accesses_satisfy(expr, incoming, Some(&extended))
+    let mut permissions = Vec::new();
+    visit_global_permissions(expr, incoming, |allowed| permissions.push(allowed));
+    let checkpoint = incoming.checkpoint();
+    for stmt in extending_stmts {
+        incoming.apply_stmt(stmt);
+    }
+    let mut permissions = permissions.into_iter();
+    let mut equal = true;
+    visit_global_permissions(expr, incoming, |allowed| {
+        equal &= permissions.next() == Some(allowed);
+    });
+    incoming.restore(checkpoint);
+    equal && permissions.next().is_none()
 }
 
-fn expr_global_accesses_satisfy(
+fn visit_global_permissions(
     expr: &AstExpr,
-    globals: &VisibleGlobals,
-    comparison: Option<&VisibleGlobals>,
-) -> bool {
-    let mut validator = ExprGlobalAccessValidator {
+    globals: &mut VisibleGlobals,
+    record: impl FnMut(bool),
+) {
+    let mut visitor = GlobalPermissionVisitor {
         globals,
-        comparison,
-        valid: true,
+        record,
+        repeat_scopes: Vec::new(),
+        repeat_body_pending: false,
     };
-    visit::visit_expr(expr, &mut validator);
-    validator.valid
+    visit::visit_expr(expr, &mut visitor);
 }
 
-struct ExprGlobalAccessValidator<'a> {
-    globals: &'a VisibleGlobals,
-    comparison: Option<&'a VisibleGlobals>,
-    valid: bool,
+struct GlobalPermissionVisitor<'a, F> {
+    globals: &'a mut VisibleGlobals,
+    record: F,
+    repeat_scopes: Vec<<VisibleGlobals as RewriteScope>::Checkpoint>,
+    repeat_body_pending: bool,
 }
 
-impl AstVisitor for ExprGlobalAccessValidator<'_> {
-    fn visit_block(&mut self, _block: &AstBlock, _kind: BlockKind) -> bool {
+impl<F: FnMut(bool)> GlobalPermissionVisitor<'_, F> {
+    fn access(&mut self, name: &str, kind: GlobalObservationKind) {
+        (self.record)(global_access_is_allowed(self.globals, name, kind));
+    }
+}
+
+impl<F: FnMut(bool)> AstVisitor for GlobalPermissionVisitor<'_, F> {
+    fn visit_block(&mut self, block: &AstBlock, _kind: BlockKind) -> bool {
+        // 共享遍历保证 Repeat 的第一个 child 是 body。其声明须保留到 until 结束，
+        // 普通 block（包括条件里的闭包）则在自身出口回退。
+        let repeat_body = std::mem::take(&mut self.repeat_body_pending);
+        let checkpoint = self.globals.checkpoint();
+        for stmt in &block.stmts {
+            visit::visit_stmt(stmt, self);
+        }
+        if !repeat_body {
+            self.globals.restore(checkpoint);
+        }
         false
+    }
+
+    fn visit_stmt(&mut self, stmt: &AstStmt) {
+        self.globals.enter_stmt_children(stmt);
+        match stmt {
+            AstStmt::Repeat(_) => {
+                self.repeat_scopes.push(self.globals.checkpoint());
+                self.repeat_body_pending = true;
+            }
+            AstStmt::FunctionDecl(decl) => {
+                if let Some(name) = global_function_root_read(decl) {
+                    self.access(name, GlobalObservationKind::Read);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn leave_stmt(&mut self, stmt: &AstStmt) {
+        match stmt {
+            AstStmt::Repeat(_) => self.globals.restore(self.repeat_scopes.pop().unwrap()),
+            AstStmt::GlobalDecl(_) => self.globals.apply_stmt(stmt),
+            _ => {}
+        }
     }
 
     fn visit_expr(&mut self, expr: &AstExpr) {
         if let AstExpr::Var(AstNameRef::Global(name)) = expr {
-            self.valid &= global_access_satisfies(
-                self.globals,
-                self.comparison,
-                &name.text,
-                GlobalObservationKind::Read,
-            );
+            self.access(&name.text, GlobalObservationKind::Read);
         }
     }
 
     fn visit_lvalue(&mut self, lvalue: &AstLValue) {
         if let AstLValue::Name(AstNameRef::Global(name)) = lvalue {
-            self.valid &= global_access_satisfies(
-                self.globals,
-                self.comparison,
-                &name.text,
-                GlobalObservationKind::Write,
-            );
+            self.access(&name.text, GlobalObservationKind::Write);
         }
     }
-
-    fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
-        self.valid &= check_block_global_accesses(&function.body, self.globals, self.comparison).0;
-        false
-    }
-}
-
-fn global_access_satisfies(
-    globals: &VisibleGlobals,
-    comparison: Option<&VisibleGlobals>,
-    name: &str,
-    kind: GlobalObservationKind,
-) -> bool {
-    let allowed = global_access_is_allowed(globals, name, kind);
-    comparison.is_none_or(|other| allowed == global_access_is_allowed(other, name, kind))
-}
-
-fn check_block_global_accesses(
-    block: &AstBlock,
-    incoming: &VisibleGlobals,
-    comparison: Option<&VisibleGlobals>,
-) -> (bool, VisibleGlobals, Option<VisibleGlobals>) {
-    check_stmts_global_accesses(&block.stmts, incoming, comparison)
-}
-
-fn check_stmts_global_accesses(
-    stmts: &[AstStmt],
-    incoming: &VisibleGlobals,
-    comparison: Option<&VisibleGlobals>,
-) -> (bool, VisibleGlobals, Option<VisibleGlobals>) {
-    let mut globals = incoming.clone();
-    let mut comparison = comparison.cloned();
-    for stmt in stmts {
-        if !check_stmt_global_accesses(stmt, &mut globals, &mut comparison) {
-            return (false, globals, comparison);
-        }
-    }
-    (true, globals, comparison)
-}
-
-fn check_stmt_global_accesses(
-    stmt: &AstStmt,
-    globals: &mut VisibleGlobals,
-    comparison: &mut Option<VisibleGlobals>,
-) -> bool {
-    match stmt {
-        AstStmt::GlobalDecl(decl) => {
-            // 声明 initializer 位于新 binding 生效前；其中的闭包也不能提前看到新名字。
-            if !decl
-                .values
-                .iter()
-                .all(|value| expr_global_accesses_satisfy(value, globals, comparison.as_ref()))
-            {
-                return false;
-            }
-            GlobalFactsCollector::note_global_decl_bindings(
-                &decl.bindings,
-                &mut globals.names,
-                &mut globals.collective,
-            );
-            if let Some(comparison) = comparison {
-                GlobalFactsCollector::note_global_decl_bindings(
-                    &decl.bindings,
-                    &mut comparison.names,
-                    &mut comparison.collective,
-                );
-            }
-            true
-        }
-        AstStmt::FunctionDecl(decl) => {
-            if let Some(name) = global_declared_name(decl) {
-                // `global function f()` 形式的名字对函数体递归引用可见，也在语句后
-                // 留在当前域；它等价于一个可写逐名声明，而不是普通 field store。
-                globals.names.insert(name.to_owned(), AstGlobalAttr::None);
-                if let Some(comparison) = comparison {
-                    comparison
-                        .names
-                        .insert(name.to_owned(), AstGlobalAttr::None);
-                }
-            } else if let Some(name) = global_function_root_read(decl)
-                && !global_access_satisfies(
-                    globals,
-                    comparison.as_ref(),
-                    name,
-                    GlobalObservationKind::Read,
-                )
-            {
-                return false;
-            }
-            check_block_global_accesses(&decl.func.body, globals, comparison.as_ref()).0
-        }
-        AstStmt::LocalFunctionDecl(decl) => {
-            check_block_global_accesses(&decl.func.body, globals, comparison.as_ref()).0
-        }
-        AstStmt::If(if_stmt) => {
-            expr_global_accesses_satisfy(&if_stmt.cond, globals, comparison.as_ref())
-                && check_block_global_accesses(&if_stmt.then_block, globals, comparison.as_ref()).0
-                && if_stmt.else_block.as_ref().is_none_or(|block| {
-                    check_block_global_accesses(block, globals, comparison.as_ref()).0
-                })
-        }
-        AstStmt::While(while_stmt) => {
-            expr_global_accesses_satisfy(&while_stmt.cond, globals, comparison.as_ref())
-                && check_block_global_accesses(&while_stmt.body, globals, comparison.as_ref()).0
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            let (valid, body_globals, body_comparison) =
-                check_block_global_accesses(&repeat_stmt.body, globals, comparison.as_ref());
-            valid
-                && expr_global_accesses_satisfy(
-                    &repeat_stmt.cond,
-                    &body_globals,
-                    body_comparison.as_ref(),
-                )
-        }
-        AstStmt::NumericFor(for_stmt) => {
-            expr_global_accesses_satisfy(&for_stmt.start, globals, comparison.as_ref())
-                && expr_global_accesses_satisfy(&for_stmt.limit, globals, comparison.as_ref())
-                && expr_global_accesses_satisfy(&for_stmt.step, globals, comparison.as_ref())
-                && check_block_global_accesses(&for_stmt.body, globals, comparison.as_ref()).0
-        }
-        AstStmt::GenericFor(for_stmt) => {
-            for_stmt
-                .iterator
-                .iter()
-                .all(|value| expr_global_accesses_satisfy(value, globals, comparison.as_ref()))
-                && check_block_global_accesses(&for_stmt.body, globals, comparison.as_ref()).0
-        }
-        AstStmt::DoBlock(block) => {
-            check_block_global_accesses(block, globals, comparison.as_ref()).0
-        }
-        AstStmt::LocalDecl(_) | AstStmt::Assign(_) | AstStmt::CallStmt(_) | AstStmt::Return(_) => {
-            check_leaf_stmt_global_accesses(stmt, globals, comparison.as_ref())
-        }
-        AstStmt::Break
-        | AstStmt::Continue
-        | AstStmt::Goto(_)
-        | AstStmt::Label(_)
-        | AstStmt::Error(_) => true,
-    }
-}
-
-fn check_leaf_stmt_global_accesses(
-    stmt: &AstStmt,
-    globals: &VisibleGlobals,
-    comparison: Option<&VisibleGlobals>,
-) -> bool {
-    let mut validator = ExprGlobalAccessValidator {
-        globals,
-        comparison,
-        valid: true,
-    };
-    visit::visit_stmt(stmt, &mut validator);
-    validator.valid
 }

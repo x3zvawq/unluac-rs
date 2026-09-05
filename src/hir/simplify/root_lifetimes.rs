@@ -30,6 +30,12 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
+mod call_values;
+mod lookup_values;
+
+use call_values::CallValues;
+use lookup_values::LookupValues;
+
 use super::object_flow::RootAnalysisContext;
 use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -53,8 +59,9 @@ pub(super) fn stmt_has_argument_root_handoff(stmt: &HirStmt, temp: TempId) -> bo
 struct ActiveCallRoot {
     value_id: CallValueId,
     root_index: usize,
-    aliases: BTreeSet<TempId>,
     observed: bool,
+    preserved: bool,
+    continuations: Vec<usize>,
     explicit_fence_only: bool,
 }
 
@@ -170,65 +177,86 @@ pub(super) fn collect_call_result_local_roots(
     trailing_condition: Option<&HirExpr>,
     safety: HirExprSafety,
 ) -> BTreeSet<LocalId> {
-    let uses = LocalUseEvents::new(stmts, trailing_condition);
     let explicit_fences = collect_gc_fence_indices(stmts);
-    let mut active = BTreeSet::<LocalId>::new();
-    let mut roots = BTreeSet::<LocalId>::new();
-
-    for (index, stmt) in stmts.iter().enumerate() {
-        if explicit_fences.contains(&index) {
-            // 显式 GC 是强观察点；沿用既有合同，不依赖后续源码读取来证明 root。
-            roots.extend(active.iter().copied());
-        } else if stmt_may_observe_gc_roots(stmt, safety) {
-            roots.extend(
-                active
-                    .iter()
-                    .copied()
-                    .filter(|local| !uses.has_live_read_from(*local, index)),
+    let mut observations = stmts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stmt)| stmt_may_observe_gc_roots(stmt, safety).then_some(index))
+        .collect::<BTreeSet<_>>();
+    let mut states = BTreeMap::<LocalId, LocalRootSuffix>::new();
+    if let Some(condition) = trailing_condition {
+        if expr_may_observe_gc_roots(condition, safety) {
+            observations.insert(stmts.len());
+        }
+        let mut uses = LocalUseCollector::default();
+        visit_expr(condition, &mut uses);
+        for local in uses.reads {
+            states.insert(
+                local,
+                LocalRootSuffix {
+                    next_event: stmts.len(),
+                    has_live_read: true,
+                    observed: false,
+                },
             );
         }
-
+    }
+    let mut roots = BTreeSet::new();
+    for (index, stmt) in stmts.iter().enumerate().rev() {
+        let mut uses = LocalUseCollector::default();
+        visit_stmts(std::slice::from_ref(stmt), &mut uses);
+        let mut direct_writes = BTreeSet::new();
+        let mut call_result = None;
         match stmt {
             HirStmt::Assign(assign) => {
-                for target in &assign.targets {
-                    if let HirLValue::Local(local) = target {
-                        active.remove(local);
-                    }
-                }
+                direct_writes.extend(assign.targets.iter().filter_map(|target| match target {
+                    HirLValue::Local(local) => Some(*local),
+                    _ => None,
+                }));
                 if let ([HirLValue::Local(local)], [HirExpr::Call(_)], None) = (
                     assign.targets.as_slice(),
                     assign.values.fixed.as_slice(),
                     &assign.values.tail,
                 ) {
-                    active.insert(*local);
+                    call_result = Some(*local);
                 }
             }
             HirStmt::LocalDecl(decl) => {
-                for local in &decl.bindings {
-                    active.remove(local);
-                }
+                direct_writes.extend(decl.bindings.iter().copied());
                 if let ([local], [HirExpr::Call(_)], None) = (
                     decl.bindings.as_slice(),
                     decl.values.fixed.as_slice(),
                     &decl.values.tail,
                 ) {
-                    active.insert(*local);
+                    call_result = Some(*local);
                 }
             }
             _ => {}
         }
+        // 相邻读写事件之间的 future-read 状态不变，只查询该窗口是否存在观察点。
+        // 同一语句中的读先于覆盖；nested write 改变 future-read，但不终止直属 call owner。
+        for &local in uses.reads.union(&uses.writes) {
+            let state = states.entry(local).or_insert(LocalRootSuffix {
+                next_event: stmts.len() + 1,
+                has_live_read: false,
+                observed: false,
+            });
+            let gap = index + 1..state.next_event;
+            state.observed |= explicit_fences.range(gap.clone()).next().is_some()
+                || (!state.has_live_read && observations.range(gap).next().is_some());
+            if direct_writes.contains(&local) {
+                if call_result == Some(local) && state.observed {
+                    roots.insert(local);
+                }
+                // 当前覆盖语句的求值仍可观察旧值，所以先消费新值的后缀，再处理当前观察。
+                state.observed = false;
+            }
+            state.has_live_read = uses.reads.contains(&local);
+            state.observed |= explicit_fences.contains(&index)
+                || (!state.has_live_read && observations.contains(&index));
+            state.next_event = index;
+        }
     }
-
-    if trailing_condition.is_some_and(|condition| expr_may_observe_gc_roots(condition, safety)) {
-        let condition_index = stmts.len();
-        roots.extend(
-            active
-                .iter()
-                .copied()
-                .filter(|local| !uses.has_live_read_from(*local, condition_index)),
-        );
-    }
-
     roots
 }
 
@@ -283,6 +311,19 @@ impl MethodReceiverRootHandoff {
 }
 
 impl CallRootLifetimeIndices {
+    fn preserve_call_root(&mut self, root: &ActiveCallRoot, home: HomeSlotKey) {
+        self.roots.insert(root.root_index);
+        self.root_by_protected.extend(
+            root.continuations
+                .iter()
+                .map(|index| (*index, root.root_index)),
+        );
+        self.root_homes
+            .entry(root.root_index)
+            .or_default()
+            .insert(home);
+    }
+
     pub(super) fn is_root(&self, index: usize) -> bool {
         self.roots.contains(&index)
     }
@@ -331,7 +372,12 @@ impl CallRootLifetimeIndices {
 
     pub(super) fn marked_stmts(&self, stmt_count: usize) -> Vec<bool> {
         let mut marked = vec![false; stmt_count];
-        for index in self.roots.iter().chain(self.roots_by_overwrite.keys()) {
+        for index in self
+            .roots
+            .iter()
+            .chain(self.roots_by_overwrite.keys())
+            .chain(self.root_by_protected.keys())
+        {
             marked[*index] = true;
         }
         marked
@@ -481,8 +527,7 @@ pub(super) fn collect_call_root_lifetimes(
                 .then_some(temp)
         })
         .collect::<BTreeSet<_>>();
-    let mut active = BTreeMap::<HomeSlotKey, ActiveCallRoot>::new();
-    let mut next_call_value_id = 0;
+    let mut active = CallValues::new(uses);
     let mut active_allocations = Vec::<ActiveAllocationRoot>::new();
     let mut pending_copy_root_call_moves = BTreeMap::<HomeSlotKey, PendingCopyRootCallMove>::new();
     // Lua 编译器会用 literal nil 的纯 temp copy 清除同 home 的 allocation root；只沿这条
@@ -491,6 +536,7 @@ pub(super) fn collect_call_root_lifetimes(
     let mut lifetimes = CallRootLifetimeIndices::default();
 
     for (index, stmt) in stmts.iter().enumerate() {
+        active.advance(index);
         let scalar_definition = scalar_temp_definition(stmt);
         let matching_call_move_homes = scalar_definition
             .filter(|(_, value)| matches!(value, HirExpr::Call(_)))
@@ -555,33 +601,25 @@ pub(super) fn collect_call_root_lifetimes(
                 &mut lifetimes,
             );
         }
+        let potential_observation = stmt_may_observe_gc_roots(stmt, safety);
         if uses.is_gc_fence(index) {
             preserve_active_call_roots(&mut active, &mut lifetimes);
-        } else if observe_potential_events && stmt_may_observe_gc_roots(stmt, safety) {
+        } else if observe_potential_events && potential_observation {
             // A potential user-code/GC event matters only if a later same-home overwrite proves
             // the end of this transaction. Unlike an explicit collection fence, this does not
             // by itself justify materializing every still-active call result.
             observe_active_call_values(&mut active, None);
         }
         let reads = uses.reads_at(index);
-        let read_observations = active
-            .iter()
-            // Dataflow 已证明该 root 在最后值读取后、首个观察前被覆盖；单纯读取
-            // 不能再要求同 home local。显式 GC 和真实潜在观察仍由上方统一处理。
-            .filter(|(_, root)| {
-                !scalar_temp_definition(&stmts[root.root_index])
-                    .is_some_and(|(temp, _)| facts.call_result_root_ends_after_value_use(temp))
-            })
-            .filter(|(_, root)| {
-                reads.is_some_and(|reads| root.aliases.iter().any(|temp| reads.contains(temp)))
-            })
-            .filter_map(|(home, root)| {
-                // A read still needs the same-local overwrite pairing, but a loop predicate or
-                // a direct `if temp`/`if not temp` test only consumes the value as control flow.
-                // Treating those forwarding reads as observations materializes ordinary loop
-                // snapshots as locals. Compound one-shot tests (for example `temp == 1`) stay
-                // observed so the call/result boundary remains readable. An explicit collection
-                // fence after any copy still upgrades the root below.
+        let read_values = reads
+            .into_iter()
+            .flatten()
+            .filter_map(|temp| active.value_for_temp(*temp))
+            .collect::<BTreeSet<_>>();
+        let read_observations = read_values
+            .into_iter()
+            .filter(|value| {
+                let aliases = active.aliases(*value);
                 let is_loop_control = matches!(
                     stmt,
                     HirStmt::While(_)
@@ -589,23 +627,28 @@ pub(super) fn collect_call_root_lifetimes(
                         | HirStmt::NumericFor(_)
                         | HirStmt::GenericFor(_)
                 );
-                let current_read_is_gc_inert_grouped_overwrite =
-                    !stmt_may_observe_gc_roots(stmt, safety) && {
-                        let mut every_temp_is_eligible = |_| true;
-                        definite_grouped_home_overwrite(
-                            stmt,
-                            *home,
-                            facts,
-                            &mut every_temp_is_eligible,
-                        )
-                        .is_some()
-                    };
-                ((!is_loop_control
-                    && !stmt_is_direct_if_control_read(stmt, &root.aliases)
-                    && !stmt_is_transparent_temp_copy(stmt, &root.aliases)
-                    && !current_read_is_gc_inert_grouped_overwrite)
-                    || uses.has_gc_fence_after(index))
-                .then_some(root.value_id)
+                let has_later_fence = uses.has_gc_fence_after(index);
+                // 控制头和纯 copy 本身只转发值；后续显式 GC 仍需要精确物理根配对。
+                if !has_later_fence
+                    && (is_loop_control
+                        || stmt_is_direct_if_control_read(stmt, aliases)
+                        || stmt_is_transparent_temp_copy(stmt, aliases))
+                {
+                    return false;
+                }
+                active.homes(*value).any(|home| {
+                    let root = active.get(home).unwrap();
+                    // 前层已证明最后值读取后、首个观察前覆盖时，读取不升级根事务。
+                    if scalar_temp_definition(&stmts[root.root_index])
+                        .is_some_and(|(temp, _)| facts.call_result_root_ends_after_value_use(temp))
+                    {
+                        return false;
+                    }
+                    has_later_fence
+                        || potential_observation
+                        || definite_grouped_home_overwrite(stmt, *home, facts, &mut |_| true)
+                            .is_none()
+                })
             })
             .collect::<BTreeSet<_>>();
         observe_active_call_values(&mut active, Some(&read_observations));
@@ -626,26 +669,26 @@ pub(super) fn collect_call_root_lifetimes(
                             target.home,
                             true,
                             uses,
+                            &active,
                             &mut lifetimes,
                         );
                     }
                 }
-                for root in active.values_mut() {
-                    for target in &targets {
-                        root.aliases.remove(&target.temp);
-                    }
+                for target in &targets {
+                    active.forget_temp(target.temp);
                 }
                 remove_allocation_homes(&mut active_allocations, &target_homes, facts);
                 for target in targets {
-                    let value_id = CallValueId(next_call_value_id);
-                    next_call_value_id += 1;
+                    let value_id = active.new_value();
+                    active.bind(target.temp, target.home, value_id);
                     active.insert(
                         target.home,
                         ActiveCallRoot {
                             value_id,
                             root_index: index,
-                            aliases: BTreeSet::from([target.temp]),
                             observed: false,
+                            preserved: false,
+                            continuations: Vec::new(),
                             explicit_fence_only: false,
                         },
                     );
@@ -669,6 +712,7 @@ pub(super) fn collect_call_root_lifetimes(
                             home,
                             eligible,
                             uses,
+                            &active,
                             &mut lifetimes,
                         );
                     }
@@ -702,7 +746,9 @@ pub(super) fn collect_call_root_lifetimes(
                 )
                 .collect::<BTreeSet<_>>();
             let grouped_assignment_is_complete =
-                grouped_assignment_targets_are_active(stmt, facts, &active_homes);
+                grouped_assignment_targets_are_active(stmt, facts, |home| {
+                    active_homes.contains(home)
+                });
             for home in active_homes {
                 if !grouped_assignment_is_complete {
                     break;
@@ -717,13 +763,15 @@ pub(super) fn collect_call_root_lifetimes(
                 };
                 proven_homes.insert(home);
                 let active_root_is_read = active.get(&home).is_some_and(|root| {
-                    reads
-                        .is_some_and(|reads| root.aliases.iter().any(|alias| reads.contains(alias)))
+                    reads.is_some_and(|reads| {
+                        active
+                            .aliases(root.value_id)
+                            .iter()
+                            .any(|alias| reads.contains(alias))
+                    })
                 });
                 for temp in &overwrite.temps {
-                    for root in active.values_mut() {
-                        root.aliases.remove(temp);
-                    }
+                    active.forget_temp(*temp);
                 }
                 if let Some(root) = active.remove(&home)
                     && !active_root_is_read
@@ -734,6 +782,7 @@ pub(super) fn collect_call_root_lifetimes(
                         home,
                         overwrite.eligible,
                         uses,
+                        &active,
                         &mut lifetimes,
                     );
                 }
@@ -753,13 +802,9 @@ pub(super) fn collect_call_root_lifetimes(
                 active.clear();
                 active_allocations.clear();
             } else {
-                active.retain(|slot, _| !writes.homes.contains(slot));
-                for root in active.values_mut() {
-                    root.aliases.retain(|temp| {
-                        facts
-                            .trusted_temp_home_slot(*temp)
-                            .is_none_or(|slot| !writes.homes.contains(&slot))
-                    });
+                for home in &writes.homes {
+                    active.remove(home);
+                    active.forget_home_aliases(*home);
                 }
                 remove_allocation_homes(&mut active_allocations, &writes.homes, facts);
             }
@@ -818,10 +863,8 @@ pub(super) fn collect_call_root_lifetimes(
         let same_value_in_target_home = matches!(value, HirExpr::TempRef(source)
             if active
                 .get(&slot)
-                .is_some_and(|root| root.aliases.contains(source)));
-        for root in active.values_mut() {
-            root.aliases.remove(&temp);
-        }
+                .is_some_and(|root| active.aliases(root.value_id).contains(source)));
+        active.forget_temp(temp);
 
         if matches!(value, HirExpr::Call(_))
             && let Some(write_homes) = facts.trusted_immediate_move_write_homes(temp)
@@ -839,6 +882,7 @@ pub(super) fn collect_call_root_lifetimes(
                         *write_home,
                         overwrite_eligible,
                         uses,
+                        &active,
                         &mut lifetimes,
                     );
                 }
@@ -850,35 +894,33 @@ pub(super) fn collect_call_root_lifetimes(
         // Record the new SSA name as another alias so a later logical read can prove that the
         // physical home was not the value's only surviving root.
         if same_value_in_target_home {
-            active
-                .get_mut(&slot)
+            let value_id = active
+                .get(&slot)
                 .expect("same-home active call root must exist")
-                .aliases
-                .insert(temp);
+                .value_id;
+            active.bind(temp, slot, value_id);
+            let root = active.continue_home(slot, index);
+            if root.preserved {
+                lifetimes.root_by_protected.insert(index, root.root_index);
+            }
             continue;
         }
 
         if let Some(root) = active.remove(&slot) {
-            record_call_root_overwrite(root, index, slot, overwrite_eligible, uses, &mut lifetimes);
+            record_call_root_overwrite(
+                root,
+                index,
+                slot,
+                overwrite_eligible,
+                uses,
+                &active,
+                &mut lifetimes,
+            );
         }
 
         if let HirExpr::TempRef(source) = value {
-            let copied_value_id = active
-                .values()
-                .find(|root| root.aliases.contains(source))
-                .map(|root| root.value_id);
-            if let Some(value_id) = copied_value_id {
-                let copied_root_aliases = active
-                    .values()
-                    .filter(|root| root.value_id == value_id)
-                    .flat_map(|root| root.aliases.iter().copied())
-                    .chain(std::iter::once(temp))
-                    .collect::<BTreeSet<_>>();
-                for root in active.values_mut() {
-                    if root.value_id == value_id {
-                        root.aliases.insert(temp);
-                    }
-                }
+            if let Some(value_id) = active.value_for_temp(*source) {
+                active.bind(temp, slot, value_id);
                 if !producer_eligible {
                     continue;
                 }
@@ -890,8 +932,9 @@ pub(super) fn collect_call_root_lifetimes(
                     ActiveCallRoot {
                         value_id,
                         root_index: index,
-                        aliases: copied_root_aliases,
                         observed: false,
+                        preserved: false,
+                        continuations: Vec::new(),
                         // Transparent compiler forwarding can normally be reconstructed inside
                         // its consuming expression. Only an explicit collection fence proves
                         // that the otherwise unread target home needs a standalone source owner.
@@ -903,15 +946,16 @@ pub(super) fn collect_call_root_lifetimes(
         }
 
         if producer_eligible && matches!(value, HirExpr::Call(_)) {
-            let value_id = CallValueId(next_call_value_id);
-            next_call_value_id += 1;
+            let value_id = active.new_value();
+            active.bind(temp, slot, value_id);
             active.insert(
                 slot,
                 ActiveCallRoot {
                     value_id,
                     root_index: index,
-                    aliases: BTreeSet::from([temp]),
                     observed: false,
+                    preserved: false,
+                    continuations: Vec::new(),
                     explicit_fence_only: false,
                 },
             );
@@ -1085,13 +1129,19 @@ fn release_roots_before_generic_dispatch(
     result_homes: &BTreeSet<HomeSlotKey>,
     uses: &TempUseEvents,
     facts: &ProtoPromotionFacts,
-    active_calls: &mut BTreeMap<HomeSlotKey, ActiveCallRoot>,
+    active_calls: &mut CallValues<'_>,
     active_allocations: &mut Vec<ActiveAllocationRoot>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
     for home in result_homes {
         if let Some(root) = active_calls.remove(home)
-            && let Some(temp) = root_release_temp(&root.aliases, *home, index, uses, facts)
+            && let Some(temp) = root_release_temp(
+                active_calls.aliases(root.value_id),
+                *home,
+                index,
+                uses,
+                facts,
+            )
         {
             lifetimes
                 .pre_dispatch_releases
@@ -1284,29 +1334,33 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
         .collect::<BTreeMap<_, _>>();
     let reference_captured_temps = super::mention::stmts_reference_captured_bindings(stmts).temps;
     let mut active = BTreeMap::<HomeSlotKey, ActiveLookupGcHome>::new();
-    let mut value_by_temp = BTreeMap::<TempId, LookupValueId>::new();
+    let mut values = LookupValues::new(uses, stmts, safety);
     let mut global_lookup_values = BTreeSet::<LookupValueId>::new();
-    let mut next_value_id = 0;
     let mut lifetimes = LookupGcRootLifetimeIndices::default();
 
     for (index, stmt) in stmts.iter().enumerate() {
-        let live_read_values = value_by_temp
-            .iter()
-            .filter(|(temp, _)| uses.has_live_read_from(**temp, index))
-            .map(|(_, value)| *value)
-            .collect::<BTreeSet<_>>();
-        if uses.is_gc_fence(index) {
-            for root in active.values_mut() {
-                if (!root.global_lookup || root.pure_scope_end_copy_root)
-                    && !live_read_values.contains(&root.value_id)
-                {
-                    root.crossed_observation = true;
-                }
-            }
-        } else if stmt_may_observe_gc_roots(stmt, safety) {
-            for root in active.values_mut() {
-                if root.pure_scope_end_copy_root && !live_read_values.contains(&root.value_id) {
-                    root.crossed_observation = true;
+        values.advance(index);
+        // 参数 home 在 dispatch 时交给 callee；不能再把它物化为跨调用存活的 caller local。
+        // 同值的其它 home 仍独立保活，只有当前快照中的唯一 producer/端点证明可以结束事务。
+        for temp in &uses.argument_transfers_by_stmt[index] {
+            let Some(home) = facts.trusted_temp_home_slot(*temp) else {
+                continue;
+            };
+            let Some(root) = active.get(&home) else {
+                continue;
+            };
+            let [producer] = uses.by_temp[temp].writes.as_slice() else {
+                continue;
+            };
+            if root.aliases.contains(temp)
+                && *producer >= root.root_index
+                && uses.has_argument_transfer(*temp, *producer, index)
+            {
+                let root = active
+                    .remove(&home)
+                    .expect("matched argument home must remain active");
+                for alias in root.aliases {
+                    values.remove(&alias, index);
                 }
             }
         }
@@ -1316,30 +1370,30 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 observe_lookup_return_post_use_roots(
                     &return_stmt.values,
                     &definitions,
-                    &value_by_temp,
+                    &values.by_temp,
                     &mut active,
                     safety,
                 );
-                preserve_lookup_roots_to_scope_end(&active, &mut lifetimes);
+                preserve_lookup_roots_to_scope_end(&active, &values, index + 1, &mut lifetimes);
                 active.clear();
-                value_by_temp.clear();
+                values.clear();
                 continue;
             }
             if let HirStmt::ErrNil(err_nil) = stmt
                 && let HirExpr::TempRef(temp) = &err_nil.value
-                && let Some(value_id) = value_by_temp.remove(temp)
+                && let Some(value_id) = values.remove(temp, index)
             {
                 // ERRNNIL 的正常后继已经证明该 lookup 结果为 nil；它不再可能承担 GC root。
                 // 只终止同一 value identity，不能把同时活跃的其它 home 一并清空。
                 active.retain(|_, root| root.value_id != value_id);
-                value_by_temp.retain(|_, value| *value != value_id);
+                values.retain(index, |_, value| *value != value_id);
                 continue;
             }
             if let Some((value_id, handoff_root)) = nil_guarded_global_lookup_handoff(
                 index,
                 stmt,
                 &active,
-                &value_by_temp,
+                &values.by_temp,
                 &reference_captured_temps,
                 uses,
                 facts,
@@ -1349,7 +1403,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 // home 因而不再是后续观察点所需的独立 root。这个证明必须留在 HIR：AST
                 // 只会看到两个 local，无法恢复分支对应的 VM home 事务（regress_36）。
                 active.retain(|_, root| root.value_id != value_id);
-                value_by_temp.retain(|_, value| *value != value_id);
+                values.retain(index, |_, value| *value != value_id);
                 lifetimes.handoff_roots.insert(handoff_root);
             }
             if let Some(overwrites) =
@@ -1357,8 +1411,8 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
             {
                 for overwrite in &overwrites {
                     for temp in &overwrite.temps {
-                        value_by_temp.remove(temp);
-                        for root in active.values_mut() {
+                        values.remove(temp, index);
+                        if let Some(root) = active.get_mut(&overwrite.home) {
                             root.aliases.remove(temp);
                         }
                     }
@@ -1366,7 +1420,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 for overwrite in overwrites {
                     if let Some(root) = active.remove(&overwrite.home) {
                         for alias in &root.aliases {
-                            value_by_temp.remove(alias);
+                            values.remove(alias, index);
                         }
                         record_lookup_root_overwrite(
                             root,
@@ -1374,7 +1428,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                             overwrite.home,
                             overwrite.eligible,
                             uses,
-                            facts,
+                            &values,
                             &mut lifetimes,
                         );
                     }
@@ -1382,11 +1436,18 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 continue;
             }
             let mut proven_homes = BTreeSet::new();
-            let active_homes = active.keys().copied().collect::<Vec<_>>();
-            let active_home_set = active_homes.iter().copied().collect::<BTreeSet<_>>();
+            let mut writes = StackWriteSummary::for_stmt(stmt, facts);
             let grouped_assignment_is_complete =
-                grouped_assignment_targets_are_active(stmt, facts, &active_home_set);
-            for home in active_homes {
+                grouped_assignment_targets_are_active(stmt, facts, |home| {
+                    active.contains_key(home)
+                });
+            let written_active_homes = writes
+                .homes
+                .iter()
+                .copied()
+                .filter(|home| active.contains_key(home))
+                .collect::<Vec<_>>();
+            for home in written_active_homes {
                 if !grouped_assignment_is_complete {
                     break;
                 }
@@ -1397,8 +1458,8 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 };
                 proven_homes.insert(home);
                 for temp in &overwrite.temps {
-                    value_by_temp.remove(temp);
-                    for root in active.values_mut() {
+                    values.remove(temp, index);
+                    if let Some(root) = active.get_mut(&home) {
                         root.aliases.remove(temp);
                     }
                 }
@@ -1406,7 +1467,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                     continue;
                 };
                 for alias in &root.aliases {
-                    value_by_temp.remove(alias);
+                    values.remove(alias, index);
                 }
                 // Grouped assignment evaluates every RHS and branch/block prefix while the old
                 // physical home is still owned by this local. Each proven path then commits a
@@ -1418,44 +1479,39 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                     home,
                     overwrite.eligible,
                     uses,
-                    facts,
+                    &values,
                     &mut lifetimes,
                 );
             }
-            let mut writes = StackWriteSummary::for_stmt(stmt, facts);
             writes.homes.retain(|home| !proven_homes.contains(home));
             if writes.has_boundary || writes.has_unknown_home {
                 active.clear();
-                value_by_temp.clear();
+                values.clear();
             } else {
-                active.retain(|home, _| !writes.homes.contains(home));
-                value_by_temp.retain(|temp, _| {
-                    facts
-                        .trusted_temp_home_slot(*temp)
-                        .is_none_or(|home| !writes.homes.contains(&home))
-                });
+                for home in writes.homes {
+                    if let Some(root) = active.remove(&home) {
+                        for alias in root.aliases {
+                            values.remove(&alias, index);
+                        }
+                    }
+                }
             }
             continue;
         };
         let Some(home) = facts.trusted_temp_home_slot(temp) else {
             active.clear();
-            value_by_temp.clear();
+            values.clear();
             continue;
         };
         let eligible = temp_is_eligible(temp);
         let incoming_value = match value {
-            HirExpr::TableAccess(_) => {
-                let value_id = LookupValueId(next_value_id);
-                next_value_id += 1;
-                Some(value_id)
-            }
+            HirExpr::TableAccess(_) => Some(values.new_value(index)),
             HirExpr::GlobalRef(_) if facts.is_pure_scope_end_copy_root_temp(temp) => {
-                let value_id = LookupValueId(next_value_id);
-                next_value_id += 1;
+                let value_id = values.new_value(index);
                 global_lookup_values.insert(value_id);
                 Some(value_id)
             }
-            HirExpr::TempRef(source) => value_by_temp.get(source).copied(),
+            HirExpr::TempRef(source) => values.by_temp.get(source).copied(),
             _ => None,
         };
         let continues_same_home = incoming_value.is_some_and(|value_id| {
@@ -1463,10 +1519,11 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 .get(&home)
                 .is_some_and(|root| root.value_id == value_id)
         });
-        for root in active.values_mut() {
+        // alias 只在其 trusted home 中建立，覆盖也只影响该 home 的旧事务。
+        if let Some(root) = active.get_mut(&home) {
             root.aliases.remove(&temp);
         }
-        value_by_temp.remove(&temp);
+        values.remove(&temp, index);
 
         if continues_same_home {
             let root = active
@@ -1474,19 +1531,27 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 .expect("same-home active lookup root must exist");
             root.aliases.insert(temp);
             root.eligible &= eligible;
-            value_by_temp.insert(temp, root.value_id);
+            values.insert(temp, root.value_id, index);
             continue;
         }
 
         if let Some(root) = active.remove(&home) {
             for alias in &root.aliases {
-                value_by_temp.remove(alias);
+                values.remove(alias, index);
             }
-            record_lookup_root_overwrite(root, index, home, eligible, uses, facts, &mut lifetimes);
+            record_lookup_root_overwrite(
+                root,
+                index,
+                home,
+                eligible,
+                uses,
+                &values,
+                &mut lifetimes,
+            );
         }
 
         if let Some(value_id) = incoming_value {
-            value_by_temp.insert(temp, value_id);
+            values.insert(temp, value_id, index);
             active.insert(
                 home,
                 ActiveLookupGcHome {
@@ -1507,7 +1572,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
         }
     }
 
-    preserve_lookup_roots_to_scope_end(&active, &mut lifetimes);
+    preserve_lookup_roots_to_scope_end(&active, &values, stmts.len(), &mut lifetimes);
     lifetimes
 }
 
@@ -1595,17 +1660,21 @@ fn record_lookup_root_overwrite(
     home: HomeSlotKey,
     overwrite_is_eligible: bool,
     uses: &TempUseEvents,
-    facts: &ProtoPromotionFacts,
+    values: &LookupValues<'_>,
     lifetimes: &mut LookupGcRootLifetimeIndices,
 ) {
     if !root.global_lookup
-        && root.crossed_observation
+        // 已跨语句观察的 lookup 即使仍有活读，物化后也必须在后续 GC 前精确释放。
+        // overwrite 自身的求值不属于此前区间；相邻 lookup/copy 可由同一表达式临时槽接管。
+        && (root.crossed_observation
+            || values.observed(&root, index + 1)
+            || (uses.has_gc_fence_after(index)
+                && values.crossed_observer_before(root.root_index, index)))
         && root.eligible
         && overwrite_is_eligible
         && !root
             .aliases
             .iter()
-            .filter(|alias| facts.trusted_temp_home_slot(**alias) == Some(home))
             .any(|alias| uses.has_live_read_after(*alias, index))
     {
         lifetimes.roots.insert(root.root_index);
@@ -1622,6 +1691,8 @@ fn record_lookup_root_overwrite(
 
 fn preserve_lookup_roots_to_scope_end(
     active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
+    values: &LookupValues<'_>,
+    end: usize,
     lifetimes: &mut LookupGcRootLifetimeIndices,
 ) {
     // collector 按 HirBlock 独立运行，locals pass 也把 producer 提升为同一 block 内的词法
@@ -1633,7 +1704,7 @@ fn preserve_lookup_roots_to_scope_end(
             .values()
             .filter(|root| {
                 root.eligible
-                    && root.crossed_observation
+                    && (root.crossed_observation || values.observed(root, end))
                     && (!root.global_lookup || root.pure_scope_end_copy_root)
             })
             .map(|root| root.root_index),
@@ -1994,7 +2065,7 @@ fn definite_grouped_home_overwrite(
 fn grouped_assignment_targets_are_active(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
-    active_homes: &BTreeSet<HomeSlotKey>,
+    home_is_active: impl FnMut(&HomeSlotKey) -> bool,
 ) -> bool {
     let HirStmt::Assign(assign) = stmt else {
         return true;
@@ -2015,8 +2086,7 @@ fn grouped_assignment_targets_are_active(
     else {
         return false;
     };
-    target_homes.len() == assign.targets.len()
-        && target_homes.iter().all(|home| active_homes.contains(home))
+    target_homes.len() == assign.targets.len() && target_homes.iter().all(home_is_active)
 }
 
 fn definite_block_home_overwrite(
@@ -2090,16 +2160,14 @@ fn stmt_is_direct_if_control_read(stmt: &HirStmt, aliases: &BTreeSet<TempId>) ->
     let HirStmt::If(if_stmt) = stmt else {
         return false;
     };
-    if !stmt_consumes_temps_only_in_control_head(stmt, aliases) {
-        return false;
-    }
-    match &if_stmt.cond {
+    let reads_alias = match &if_stmt.cond {
         HirExpr::TempRef(temp) => aliases.contains(temp),
         HirExpr::Unary(unary) => {
             matches!(&unary.expr, HirExpr::TempRef(temp) if aliases.contains(temp))
         }
         _ => false,
-    }
+    };
+    reads_alias && stmt_consumes_temps_only_in_control_head(stmt, aliases)
 }
 
 /// 两个原始 home 都保活到 frame end，且当前 HIR 仍保留相同值的覆盖关系。
@@ -2222,21 +2290,19 @@ fn record_call_root_overwrite(
     home: HomeSlotKey,
     eligible: bool,
     uses: &TempUseEvents,
+    active: &CallValues<'_>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
+    // 普通表达式 forwarding 可由仍活读的同值副本接管；显式 GC 物化则必须同时保留
+    // 原 home 的结束位置，不能因另一个 home 继续读该值而留下永不释放的源码 local。
     if eligible
         && root.observed
-        && !root
-            .aliases
-            .iter()
-            .any(|alias| uses.has_live_read_after(*alias, index))
+        && !active.has_live_read_after(root.value_id, home)
+        && (root.preserved
+            || uses.has_gc_fence_after(index)
+            || !active.value_has_live_read_after(root.value_id))
     {
-        lifetimes.roots.insert(root.root_index);
-        lifetimes
-            .root_homes
-            .entry(root.root_index)
-            .or_default()
-            .insert(home);
+        lifetimes.preserve_call_root(&root, home);
         lifetimes
             .roots_by_overwrite
             .entry(index)
@@ -2249,64 +2315,29 @@ fn record_call_root_overwrite(
 }
 
 fn preserve_active_call_roots(
-    active: &mut BTreeMap<HomeSlotKey, ActiveCallRoot>,
+    active: &mut CallValues<'_>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
-    let representatives = active_call_value_representatives(active, None, true);
-    for home in representatives.into_values() {
-        let root = active
-            .get_mut(&home)
-            .expect("active call representative must retain its home");
-        // One live home is enough to retain a shared result at this observation point. If that
-        // home is overwritten, a later observation can select another still-active transaction.
-        root.observed = true;
-        lifetimes.roots.insert(root.root_index);
-        lifetimes
-            .root_homes
-            .entry(root.root_index)
-            .or_default()
-            .insert(home);
+    for home in active.pending(true) {
+        active.observe(home, true);
+        let root = active.get(&home).unwrap();
+        lifetimes.preserve_call_root(root, home);
     }
 }
 
-fn observe_active_call_values(
-    active: &mut BTreeMap<HomeSlotKey, ActiveCallRoot>,
-    values: Option<&BTreeSet<CallValueId>>,
-) {
-    let representatives = active_call_value_representatives(active, values, false);
-    for home in representatives.into_values() {
-        active
-            .get_mut(&home)
-            .expect("active call representative must retain its home")
-            .observed = true;
+fn observe_active_call_values(active: &mut CallValues<'_>, values: Option<&BTreeSet<CallValueId>>) {
+    let homes = values.map_or_else(
+        || active.pending(false),
+        |values| {
+            values
+                .iter()
+                .filter_map(|value| active.representative(*value, false))
+                .collect()
+        },
+    );
+    for home in homes {
+        active.observe(home, false);
     }
-}
-
-fn active_call_value_representatives(
-    active: &BTreeMap<HomeSlotKey, ActiveCallRoot>,
-    values: Option<&BTreeSet<CallValueId>>,
-    include_explicit_fence_only: bool,
-) -> BTreeMap<CallValueId, HomeSlotKey> {
-    let mut representatives = BTreeMap::<CallValueId, HomeSlotKey>::new();
-    for (home, root) in active {
-        if (!include_explicit_fence_only && root.explicit_fence_only)
-            || values.is_some_and(|values| !values.contains(&root.value_id))
-        {
-            continue;
-        }
-        representatives
-            .entry(root.value_id)
-            .and_modify(|representative_home| {
-                let representative = active
-                    .get(representative_home)
-                    .expect("selected call representative must remain active");
-                if root.observed && !representative.observed {
-                    *representative_home = *home;
-                }
-            })
-            .or_insert(*home);
-    }
-    representatives
 }
 
 pub(super) fn stmt_may_observe_gc_roots(stmt: &HirStmt, safety: HirExprSafety) -> bool {
@@ -2327,40 +2358,11 @@ fn expr_may_observe_gc_roots(expr: &HirExpr, safety: HirExprSafety) -> bool {
     collector.found
 }
 
-struct LocalUseEvents {
-    reads: BTreeMap<LocalId, Vec<usize>>,
-    writes: BTreeMap<LocalId, Vec<usize>>,
-}
-
-impl LocalUseEvents {
-    fn new(stmts: &[HirStmt], trailing_condition: Option<&HirExpr>) -> Self {
-        let mut reads = BTreeMap::<LocalId, Vec<usize>>::new();
-        let mut writes = BTreeMap::<LocalId, Vec<usize>>::new();
-        for (index, stmt) in stmts.iter().enumerate() {
-            let mut collector = LocalUseCollector::default();
-            visit_stmts(std::slice::from_ref(stmt), &mut collector);
-            for local in collector.reads {
-                reads.entry(local).or_default().push(index);
-            }
-            for local in collector.writes {
-                writes.entry(local).or_default().push(index);
-            }
-        }
-        if let Some(condition) = trailing_condition {
-            let mut collector = LocalUseCollector::default();
-            visit_expr(condition, &mut collector);
-            for local in collector.reads {
-                reads.entry(local).or_default().push(stmts.len());
-            }
-        }
-        Self { reads, writes }
-    }
-
-    fn has_live_read_from(&self, local: LocalId, index: usize) -> bool {
-        let next_read = next_event_at_or_after(self.reads.get(&local), index);
-        let next_write = next_event_at_or_after(self.writes.get(&local), index);
-        next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
-    }
+/// 逆序扫描中该 local 到下一次直属覆盖的观察事实；只在自身读写事件上更新。
+struct LocalRootSuffix {
+    next_event: usize,
+    has_live_read: bool,
+    observed: bool,
 }
 
 #[derive(Default)]
@@ -2406,7 +2408,7 @@ impl HirVisitor for GcRootObservationCollector {
         // The shared discard-safety boundary already classifies dynamic environment/table
         // access, metamethod-capable operators, calls, and allocating expressions as eventful;
         // residual diagnostics stay conservative instead of being treated as executable no-ops.
-        self.found |= !self.safety.is_discard_safe_without_residual(expr);
+        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
@@ -2434,6 +2436,7 @@ impl<'a> RootLifetimeFacts<'a> {
 }
 
 struct TempUseEvents {
+    argument_transfers_by_stmt: Vec<Vec<TempId>>,
     // 只按 identity 查询，不枚举 hash 顺序；事件顺序由语句扫描固定。
     by_temp: HashMap<TempId, TempEvents>,
     reads_by_stmt: Vec<BTreeSet<TempId>>,
@@ -2457,21 +2460,24 @@ impl TempUseEvents {
             }
         }
 
+        let mut argument_transfers_by_stmt = Vec::with_capacity(stmts.len());
         for (index, stmt) in stmts.iter().enumerate() {
             let mut collector = TempWriteCollector::default();
             visit_stmts(std::slice::from_ref(stmt), &mut collector);
             for temp in collector.temps {
                 by_temp.entry(temp).or_default().writes.push(index);
             }
-            for temp in collector.argument_transfers {
+            for temp in &collector.argument_transfers {
                 by_temp
-                    .entry(temp)
+                    .entry(*temp)
                     .or_default()
                     .argument_transfers
                     .push(index);
             }
+            argument_transfers_by_stmt.push(collector.argument_transfers);
         }
         Self {
+            argument_transfers_by_stmt,
             by_temp,
             reads_by_stmt,
             gc_fence_indices: collect_gc_fence_indices(stmts),
@@ -2490,12 +2496,22 @@ impl TempUseEvents {
     }
 
     fn has_live_read_after(&self, temp: TempId, index: usize) -> bool {
-        let Some(events) = self.by_temp.get(&temp) else {
-            return false;
-        };
-        let next_read = next_event_after(Some(&events.reads), index);
-        let next_write = next_event_after(Some(&events.writes), index);
-        next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
+        self.has_live_read_from(temp, index + 1)
+    }
+
+    fn live_read_changes(&self) -> Vec<(usize, TempId, bool)> {
+        let mut changes = Vec::new();
+        for (temp, events) in &self.by_temp {
+            for index in events.reads.iter().chain(&events.writes).copied() {
+                let live = self.has_live_read_after(*temp, index);
+                if live != self.has_live_read_from(*temp, index) {
+                    changes.push((index + 1, *temp, live));
+                }
+            }
+        }
+        changes.sort_unstable();
+        changes.dedup();
+        changes
     }
 
     fn has_live_read_from(&self, temp: TempId, index: usize) -> bool {
@@ -2596,13 +2612,6 @@ impl HirVisitor for GcFenceCollector<'_> {
         ) || matches!(&call.callee, HirExpr::TempRef(temp) if self.temp_aliases.contains(temp))
             || matches!(&call.callee, HirExpr::LocalRef(local) if self.local_aliases.contains(local));
     }
-}
-
-fn next_event_after(events: Option<&Vec<usize>>, index: usize) -> Option<usize> {
-    let events = events?;
-    events
-        .get(events.partition_point(|event| *event <= index))
-        .copied()
 }
 
 fn next_event_at_or_after(events: Option<&Vec<usize>>, index: usize) -> Option<usize> {

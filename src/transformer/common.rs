@@ -6,6 +6,9 @@
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
+use super::debug_locals::DebugLocals;
+pub(crate) use super::debug_locals::normalize_debug_locals;
+
 use crate::parser::{
     ChunkHeader, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawConstPool,
     RawDebugInfo, RawProto, RawString, RawUpvalueInfo,
@@ -37,7 +40,7 @@ pub struct LoweredProto {
     pub environment_upvalues: Vec<UpvalueRef>,
     pub debug_info: RawDebugInfo,
     /// 已按方言协议归一到寄存器与生命周期的局部变量调试事实。
-    pub debug_locals: Vec<DebugLocalFact>,
+    pub debug_locals: DebugLocals,
     /// Lowered child templates are immutable.  `Arc` keeps closure instances cheap:
     /// creating a second closure from one child copies only the current proto
     /// payload and shares its descendants instead of recursively cloning a subtree.
@@ -72,54 +75,6 @@ impl DebugLocalFact {
     pub const fn is_active_at(&self, pc: u32) -> bool {
         self.start_pc <= pc && pc < self.end_pc
     }
-}
-
-/// 把 PUC Lua/LuaJIT 的活动局部顺序和 Luau 的显式寄存器表收敛成统一事实。
-///
-/// 非 Luau 格式中，第 N 个活动局部对应寄存器 N；同一 start PC 的局部继续按
-/// 调试表顺序保持 VM 槽位顺序。无法得到寄存器的损坏/冲突项只作为无效 hint 丢弃，
-/// 不参与字节码语义恢复。
-pub(crate) fn normalize_debug_locals(raw: &RawProto) -> Vec<DebugLocalFact> {
-    let locals = &raw.common.debug_info.common.local_vars;
-    let explicit_regs = raw
-        .common
-        .debug_info
-        .extra
-        .luau()
-        .map(|extra| extra.local_regs.as_slice())
-        .filter(|regs| regs.len() == locals.len());
-
-    locals
-        .iter()
-        .enumerate()
-        .filter_map(|(index, local)| {
-            let reg = explicit_regs
-                .and_then(|regs| regs.get(index).copied().map(usize::from))
-                .or_else(|| {
-                    locals
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, candidate)| {
-                            candidate.start_pc <= local.start_pc
-                                && local.start_pc < candidate.end_pc
-                        })
-                        .position(|(candidate_index, _)| candidate_index == index)
-                })?;
-            let kind = if local.name.bytes.starts_with(b"(for ") && local.name.bytes.ends_with(b")")
-            {
-                DebugLocalKind::CompilerInternal
-            } else {
-                DebugLocalKind::Source
-            };
-            Some(DebugLocalFact {
-                name: local.name.clone(),
-                reg: Reg(reg),
-                start_pc: local.start_pc,
-                end_pc: local.end_pc,
-                kind,
-            })
-        })
-        .collect()
 }
 
 /// 基于 proto upvalue 描述符和父链传播结果，恢复当前 proto 哪些 upvalue 表示根环境。

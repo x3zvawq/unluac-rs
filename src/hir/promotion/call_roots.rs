@@ -45,7 +45,9 @@ pub(super) fn collect(
                 continue;
             }
             let argument = reg.index() - args_start.index();
-            if reg.index() <= caller_end.index() || epochs.tracks_reference_capture(reg) {
+            if reg.index() <= caller_end.index()
+                || epochs.reference_capture_may_be_open(reg, call_ref)
+            {
                 continue;
             }
             let SsaValue::Def(def) = value else {

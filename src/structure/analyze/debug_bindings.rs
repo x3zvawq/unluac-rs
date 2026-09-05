@@ -54,6 +54,10 @@ pub(super) fn ssa_value_at_debug_scope_entry(
     reg: crate::transformer::Reg,
     start_pc: u32,
 ) -> super::super::SsaValue {
+    // 参数在首条指令执行前已建立；PC 0 的重绑定不是参数 scope 的初始化。
+    if start_pc == 0 && reg.index() < usize::from(proto.signature.num_params) {
+        return super::super::SsaValue::Entry(reg);
+    }
     let block = cfg.instr_to_block[instr.index()];
     let start = cfg.blocks[block.index()].instrs.start.index();
     let mut value = dataflow

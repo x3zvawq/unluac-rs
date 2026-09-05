@@ -28,6 +28,7 @@
 //!   跨 provenance 改写保存来源的 owner 显式取得 owned 快照，不让后层缓存整份映射。
 
 mod call_roots;
+mod slot_captures;
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirLValue, HirMethodSetupProtocolId, HirStmt, HirTableField, LocalId,
@@ -64,6 +65,7 @@ pub(super) struct SlotEpochFacts {
 
 struct SlotEpochFlow {
     at_instr: Vec<usize>,
+    reference_capture_before: Vec<bool>,
     spans_entry: bool,
 }
 
@@ -150,6 +152,13 @@ impl SlotEpochFacts {
             .copied()
             .unwrap_or(false)
     }
+
+    pub(super) fn reference_capture_may_be_open(&self, reg: Reg, instr: InstrRef) -> bool {
+        self.epochs_by_reg
+            .get(reg.index())
+            .and_then(Option::as_ref)
+            .is_some_and(|flow| flow.reference_capture_before[instr.index()])
+    }
 }
 
 fn analyze_slot_epoch(
@@ -229,6 +238,7 @@ fn analyze_slot_epoch(
 
     SlotEpochFlow {
         at_instr,
+        reference_capture_before: slot_captures::before_instructions(proto, cfg, reg),
         spans_entry: defs_span_entry && captures_span_entry,
     }
 }
@@ -3010,6 +3020,7 @@ mod tests {
                 None,
                 Some(SlotEpochFlow {
                     at_instr: vec![0, 1, 1, 2],
+                    reference_capture_before: vec![false; 4],
                     spans_entry: true,
                 }),
             ],

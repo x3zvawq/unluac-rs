@@ -45,8 +45,7 @@ pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> boo
     let mut pass = InstallerIifePass {
         next_synthetic_local: module.next_synthetic_local,
     };
-    let changed =
-        walk::rewrite_module_scoped(module, &InstallerIifeScope { active_locals: 0 }, &mut pass);
+    let changed = walk::rewrite_module_scoped(module, 0, &mut pass);
     module.next_synthetic_local = pass.next_synthetic_local;
     changed
 }
@@ -55,36 +54,19 @@ struct InstallerIifePass {
     next_synthetic_local: usize,
 }
 
-#[derive(Clone)]
-struct InstallerIifeScope {
-    active_locals: usize,
-}
-
 impl ScopedAstRewritePass for InstallerIifePass {
-    type Scope = InstallerIifeScope;
+    type Scope = usize;
 
-    fn enter_function(
-        &mut self,
-        function: &mut AstFunctionExpr,
-        _outer_scope: &Self::Scope,
-    ) -> Self::Scope {
-        InstallerIifeScope {
-            active_locals: function_entry_local_count(function),
-        }
+    fn enter_function(&mut self, function: &mut AstFunctionExpr, scope: &mut Self::Scope) {
+        *scope = function_entry_local_count(function);
     }
 
-    fn scope_for_stmt_children(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
-        InstallerIifeScope {
-            active_locals: scope
-                .active_locals
-                .saturating_add(stmt_child_local_count(stmt)),
-        }
+    fn enter_stmt_children(&mut self, stmt: &AstStmt, scope: &mut Self::Scope) {
+        *scope = scope.saturating_add(stmt_child_local_count(stmt));
     }
 
-    fn scope_after_stmt(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
-        InstallerIifeScope {
-            active_locals: scope.active_locals.saturating_add(direct_local_count(stmt)),
-        }
+    fn after_stmt(&mut self, stmt: &AstStmt, scope: &mut Self::Scope) {
+        *scope = scope.saturating_add(direct_local_count(stmt));
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt, scope: &Self::Scope) -> bool {
@@ -92,7 +74,7 @@ impl ScopedAstRewritePass for InstallerIifePass {
         let Some(rewritten) = rewrite_installer_iife_stmt(stmt, next_synthetic_local) else {
             return false;
         };
-        if scope.active_locals >= crate::SOURCE_LOCAL_LIMIT {
+        if *scope >= crate::SOURCE_LOCAL_LIMIT {
             // 候选拒绝[TargetConstraint]：命名 IIFE 会在调用点新增一个 active local；现有词法 owner 已耗尽项目源码 local 预算时，后置缩域无法保证释放外层或长生命周期槽。
             return false;
         }

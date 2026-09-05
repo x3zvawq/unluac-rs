@@ -3,8 +3,6 @@
 //! 这里还不做最终冲突消解，只回答“这个槽位现在最像什么名字”。
 //! 真正的唯一化和祖先作用域避让由 allocation 阶段完成。
 
-use std::collections::BTreeSet;
-
 use crate::ast::AstSyntheticLocalId;
 use crate::hir::{HirProto, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
 
@@ -14,25 +12,8 @@ use super::common::{
     CandidateHint, CapturedBinding, FunctionHints, FunctionNameMap, FunctionNamingEvidence,
     NameSource, NamingMode, NamingOptions,
 };
-use super::lexical::{FunctionLexicalContext, VisibleBinding};
+use super::lexical::VisibleBinding;
 use super::support::{alphabetical_name, as_valid_name};
-
-/// 计算函数定义点外层当前可见绑定对应的最终名字。
-pub(super) fn resolve_outer_visible_names(
-    function: HirProtoRef,
-    lexical: &FunctionLexicalContext,
-    assigned_functions: &[FunctionNameMap],
-) -> Result<BTreeSet<String>, NamingError> {
-    let mut names = BTreeSet::new();
-    for &binding in &lexical.outer_visible_bindings {
-        names.insert(resolve_visible_binding_name(
-            function,
-            binding,
-            assigned_functions,
-        )?);
-    }
-    Ok(names)
-}
 
 /// 选择参数候选名。
 pub(super) fn choose_param_candidate(
@@ -219,7 +200,7 @@ fn debug_like_binding_index(
     ast_facts.debug_like_binding_order.get(&binding).copied()
 }
 
-fn resolve_visible_binding_name(
+pub(super) fn resolve_visible_binding_name(
     function: HirProtoRef,
     binding: VisibleBinding,
     assigned_functions: &[FunctionNameMap],

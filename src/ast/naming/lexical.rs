@@ -1,8 +1,11 @@
-//! 这个文件负责从 AST 重建 Naming 需要的词法可见域信息。
+//! 从最终 AST 声明顺序发布 Naming 的 closure 定义点与 binding 可见区间。
 //!
-//! Naming 不能假定前层已经单独导出 scope facts，所以这里显式记录：
-//! “某个函数在定义点到底能看到哪些外层绑定”。这样后续参数命名就能避开
-//! 祖先作用域里当前可见的自动生成名字，而不是退化成全局禁名或拍脑袋加后缀。
+//! Readability 会改变声明形状，因此区间以最终 AST 词法作用域为准，不复用 HIR 块树。
+//! 每个 binding 仅由声明函数发布一次，子函数持有自己的 preorder 定义点，不复制祖先
+//! binding。例如 `local x; f = function() end; local y; g = function() end` 中，x 的
+//! 区间覆盖 f/g，y 只覆盖 g；区间随后与声明函数的最终名字关联，供参数避让查询。
+
+use std::ops::Range;
 
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
@@ -15,10 +18,11 @@ use crate::hir::{HirModule, HirProtoRef, LocalId, ParamId, UpvalueId};
 
 use super::NamingError;
 
-/// 按函数记录其定义点能看到的外层绑定。
+/// 按函数记录最终 AST 定义点与本函数声明的可见区间。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LexicalContexts {
     pub(crate) functions: Vec<FunctionLexicalContext>,
+    next_definition_position: usize,
 }
 
 impl LexicalContexts {
@@ -30,10 +34,11 @@ impl LexicalContexts {
 /// 单个函数的词法上下文。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FunctionLexicalContext {
-    pub(crate) outer_visible_bindings: Vec<VisibleBinding>,
+    pub(crate) definition_position: usize,
+    pub(crate) visible_bindings: Vec<(VisibleBinding, Range<usize>)>,
 }
 
-/// 在函数定义点可见的外层绑定。
+/// 声明函数持有的 binding 身份；可见区间只覆盖后续子孙 closure 定义点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub(crate) enum VisibleBinding {
     Param {
@@ -61,8 +66,9 @@ pub(crate) fn collect_lexical_contexts(
 ) -> Result<LexicalContexts, NamingError> {
     let mut contexts = LexicalContexts {
         functions: vec![FunctionLexicalContext::default(); hir.protos.len()],
+        next_definition_position: 0,
     };
-    collect_function_context(module.entry_function, &module.body, hir, &mut contexts, &[])?;
+    collect_function_context(module.entry_function, &module.body, hir, &mut contexts)?;
     Ok(contexts)
 }
 
@@ -71,34 +77,44 @@ fn collect_function_context(
     body: &AstBlock,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
 ) -> Result<(), NamingError> {
     let Some(proto) = hir.protos.get(function.index()) else {
         return Err(NamingError::MissingFunction {
             function: function.index(),
         });
     };
-    contexts.functions[function.index()].outer_visible_bindings = outer_visible_bindings.to_vec();
+    contexts.functions[function.index()] = FunctionLexicalContext {
+        definition_position: contexts.next_definition_position,
+        visible_bindings: Vec::new(),
+    };
+    contexts.next_definition_position += 1;
 
     let mut scopes = vec![Vec::new()];
     for &param in &proto.params {
-        declare_binding(&mut scopes, VisibleBinding::Param { function, param });
+        declare_binding(
+            &mut scopes,
+            VisibleBinding::Param { function, param },
+            contexts.next_definition_position,
+        );
     }
     if let Some(local) = proto.vararg_param_local {
-        declare_binding(&mut scopes, VisibleBinding::Local { function, local });
+        declare_binding(
+            &mut scopes,
+            VisibleBinding::Local { function, local },
+            contexts.next_definition_position,
+        );
     }
     for &upvalue in &proto.upvalues {
-        declare_binding(&mut scopes, VisibleBinding::Upvalue { function, upvalue });
+        declare_binding(
+            &mut scopes,
+            VisibleBinding::Upvalue { function, upvalue },
+            contexts.next_definition_position,
+        );
     }
 
-    collect_block_context(
-        function,
-        body,
-        hir,
-        contexts,
-        outer_visible_bindings,
-        &mut scopes,
-    )
+    let result = collect_block_context(function, body, hir, contexts, &mut scopes);
+    close_scope(function, contexts, &mut scopes);
+    result
 }
 
 fn collect_block_context(
@@ -106,18 +122,10 @@ fn collect_block_context(
     block: &AstBlock,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &mut Vec<Vec<VisibleBinding>>,
+    scopes: &mut PendingScopes,
 ) -> Result<(), NamingError> {
     for stmt in &block.stmts {
-        collect_stmt_context(
-            function,
-            stmt,
-            hir,
-            contexts,
-            outer_visible_bindings,
-            scopes,
-        )?;
+        collect_stmt_context(function, stmt, hir, contexts, scopes)?;
     }
     Ok(())
 }
@@ -127,196 +135,106 @@ fn collect_stmt_context(
     stmt: &AstStmt,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &mut Vec<Vec<VisibleBinding>>,
+    scopes: &mut PendingScopes,
 ) -> Result<(), NamingError> {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
-            collect_local_decl_context(
-                function,
-                local_decl,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
+            collect_local_decl_context(function, local_decl, hir, contexts, scopes)?;
         }
         AstStmt::GlobalDecl(global_decl) => {
             for value in &global_decl.values {
-                collect_expr_context(value, hir, contexts, outer_visible_bindings, scopes)?;
+                collect_expr_context(value, hir, contexts)?;
             }
         }
         AstStmt::Assign(assign) => {
             for target in &assign.targets {
-                collect_lvalue_context(target, hir, contexts, outer_visible_bindings, scopes)?;
+                collect_lvalue_context(target, hir, contexts)?;
             }
             for value in &assign.values {
-                collect_expr_context(value, hir, contexts, outer_visible_bindings, scopes)?;
+                collect_expr_context(value, hir, contexts)?;
             }
         }
         AstStmt::CallStmt(call_stmt) => {
-            collect_call_context(
-                &call_stmt.call,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
+            collect_call_context(&call_stmt.call, hir, contexts)?;
         }
         AstStmt::Return(ret) => {
             for value in &ret.values {
-                collect_expr_context(value, hir, contexts, outer_visible_bindings, scopes)?;
+                collect_expr_context(value, hir, contexts)?;
             }
         }
         AstStmt::If(if_stmt) => {
-            collect_expr_context(&if_stmt.cond, hir, contexts, outer_visible_bindings, scopes)?;
-            with_nested_scope(scopes, |scopes| {
-                collect_block_context(
-                    function,
-                    &if_stmt.then_block,
-                    hir,
-                    contexts,
-                    outer_visible_bindings,
-                    scopes,
-                )
+            collect_expr_context(&if_stmt.cond, hir, contexts)?;
+            with_nested_scope(function, contexts, scopes, |contexts, scopes| {
+                collect_block_context(function, &if_stmt.then_block, hir, contexts, scopes)
             })?;
             if let Some(else_block) = &if_stmt.else_block {
-                with_nested_scope(scopes, |scopes| {
-                    collect_block_context(
-                        function,
-                        else_block,
-                        hir,
-                        contexts,
-                        outer_visible_bindings,
-                        scopes,
-                    )
+                with_nested_scope(function, contexts, scopes, |contexts, scopes| {
+                    collect_block_context(function, else_block, hir, contexts, scopes)
                 })?;
             }
         }
         AstStmt::While(while_stmt) => {
-            collect_expr_context(
-                &while_stmt.cond,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
-            with_nested_scope(scopes, |scopes| {
-                collect_block_context(
-                    function,
-                    &while_stmt.body,
-                    hir,
-                    contexts,
-                    outer_visible_bindings,
-                    scopes,
-                )
+            collect_expr_context(&while_stmt.cond, hir, contexts)?;
+            with_nested_scope(function, contexts, scopes, |contexts, scopes| {
+                collect_block_context(function, &while_stmt.body, hir, contexts, scopes)
             })?;
         }
         AstStmt::Repeat(repeat_stmt) => {
             // `repeat ... until cond` 的条件仍处在同一个词法块里。
             // 这里不能像 while 一样先跑 body 再弹 scope，否则会丢掉 body 中局部对 cond 的可见性。
-            with_nested_scope(scopes, |scopes| {
-                collect_block_context(
-                    function,
-                    &repeat_stmt.body,
-                    hir,
-                    contexts,
-                    outer_visible_bindings,
-                    scopes,
-                )?;
-                collect_expr_context(
-                    &repeat_stmt.cond,
-                    hir,
-                    contexts,
-                    outer_visible_bindings,
-                    scopes,
-                )
+            with_nested_scope(function, contexts, scopes, |contexts, scopes| {
+                collect_block_context(function, &repeat_stmt.body, hir, contexts, scopes)?;
+                collect_expr_context(&repeat_stmt.cond, hir, contexts)
             })?;
         }
         AstStmt::NumericFor(numeric_for) => {
-            collect_expr_context(
-                &numeric_for.start,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
-            collect_expr_context(
-                &numeric_for.limit,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
-            collect_expr_context(
-                &numeric_for.step,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
-            with_nested_scope(scopes, |scopes| {
-                declare_ast_binding(function, numeric_for.binding, scopes);
-                collect_block_context(
+            collect_expr_context(&numeric_for.start, hir, contexts)?;
+            collect_expr_context(&numeric_for.limit, hir, contexts)?;
+            collect_expr_context(&numeric_for.step, hir, contexts)?;
+            with_nested_scope(function, contexts, scopes, |contexts, scopes| {
+                declare_ast_binding(
                     function,
-                    &numeric_for.body,
-                    hir,
-                    contexts,
-                    outer_visible_bindings,
+                    numeric_for.binding,
                     scopes,
-                )
+                    contexts.next_definition_position,
+                );
+                collect_block_context(function, &numeric_for.body, hir, contexts, scopes)
             })?;
         }
         AstStmt::GenericFor(generic_for) => {
             for expr in &generic_for.iterator {
-                collect_expr_context(expr, hir, contexts, outer_visible_bindings, scopes)?;
+                collect_expr_context(expr, hir, contexts)?;
             }
-            with_nested_scope(scopes, |scopes| {
+            with_nested_scope(function, contexts, scopes, |contexts, scopes| {
                 for &binding in &generic_for.bindings {
-                    declare_ast_binding(function, binding, scopes);
+                    declare_ast_binding(
+                        function,
+                        binding,
+                        scopes,
+                        contexts.next_definition_position,
+                    );
                 }
-                collect_block_context(
-                    function,
-                    &generic_for.body,
-                    hir,
-                    contexts,
-                    outer_visible_bindings,
-                    scopes,
-                )
+                collect_block_context(function, &generic_for.body, hir, contexts, scopes)
             })?;
         }
         AstStmt::DoBlock(block) => {
-            with_nested_scope(scopes, |scopes| {
-                collect_block_context(
-                    function,
-                    block,
-                    hir,
-                    contexts,
-                    outer_visible_bindings,
-                    scopes,
-                )
+            with_nested_scope(function, contexts, scopes, |contexts, scopes| {
+                collect_block_context(function, block, hir, contexts, scopes)
             })?;
         }
         AstStmt::FunctionDecl(function_decl) => {
-            collect_nested_function_context(
-                &function_decl.func,
-                hir,
-                contexts,
-                outer_visible_bindings,
-                scopes,
-            )?;
+            collect_nested_function_context(&function_decl.func, hir, contexts)?;
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             // `local function f() ... end` 里的 `f` 在函数体内也是可见的，
             // 所以要先把它放进当前作用域，再收集子函数的词法上下文。
-            declare_ast_binding(function, local_function_decl.name, scopes);
-            collect_nested_function_context(
-                &local_function_decl.func,
-                hir,
-                contexts,
-                outer_visible_bindings,
+            declare_ast_binding(
+                function,
+                local_function_decl.name,
                 scopes,
-            )?;
+                contexts.next_definition_position,
+            );
+            collect_nested_function_context(&local_function_decl.func, hir, contexts)?;
         }
         AstStmt::Break
         | AstStmt::Continue
@@ -332,14 +250,18 @@ fn collect_local_decl_context(
     local_decl: &AstLocalDecl,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &mut Vec<Vec<VisibleBinding>>,
+    scopes: &mut PendingScopes,
 ) -> Result<(), NamingError> {
     for value in &local_decl.values {
-        collect_expr_context(value, hir, contexts, outer_visible_bindings, scopes)?;
+        collect_expr_context(value, hir, contexts)?;
     }
     for binding in &local_decl.bindings {
-        declare_ast_binding(function, binding.id, scopes);
+        declare_ast_binding(
+            function,
+            binding.id,
+            scopes,
+            contexts.next_definition_position,
+        );
     }
     Ok(())
 }
@@ -348,28 +270,17 @@ fn collect_nested_function_context(
     function_expr: &AstFunctionExpr,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &[Vec<VisibleBinding>],
 ) -> Result<(), NamingError> {
-    let child_outer_visible = visible_snapshot(outer_visible_bindings, scopes);
-    collect_function_context(
-        function_expr.function,
-        &function_expr.body,
-        hir,
-        contexts,
-        &child_outer_visible,
-    )
+    collect_function_context(function_expr.function, &function_expr.body, hir, contexts)
 }
 
 fn collect_call_context(
     call: &AstCallKind,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &mut Vec<Vec<VisibleBinding>>,
 ) -> Result<(), NamingError> {
     traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
-        collect_expr_context(expr, hir, contexts, outer_visible_bindings, scopes)?;
+        collect_expr_context(expr, hir, contexts)?;
     });
     Ok(())
 }
@@ -378,11 +289,9 @@ fn collect_lvalue_context(
     target: &AstLValue,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &mut Vec<Vec<VisibleBinding>>,
 ) -> Result<(), NamingError> {
     traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
-        collect_expr_context(expr, hir, contexts, outer_visible_bindings, scopes)?;
+        collect_expr_context(expr, hir, contexts)?;
     });
     Ok(())
 }
@@ -391,18 +300,16 @@ fn collect_expr_context(
     expr: &AstExpr,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &mut Vec<Vec<VisibleBinding>>,
 ) -> Result<(), NamingError> {
     traverse_expr_children!(
         expr,
         iter = iter,
         borrow = [&],
         expr(child) => {
-            collect_expr_context(child, hir, contexts, outer_visible_bindings, scopes)?;
+            collect_expr_context(child, hir, contexts)?;
         },
         function(func) => {
-            collect_nested_function_context(func, hir, contexts, outer_visible_bindings, scopes)?;
+            collect_nested_function_context(func, hir, contexts)?;
         }
     );
     Ok(())
@@ -411,14 +318,19 @@ fn collect_expr_context(
 fn declare_ast_binding(
     function: HirProtoRef,
     binding: AstBindingRef,
-    scopes: &mut [Vec<VisibleBinding>],
+    scopes: &mut [Vec<(VisibleBinding, usize)>],
+    start: usize,
 ) {
     match binding {
         AstBindingRef::Local(local) => {
-            declare_binding(scopes, VisibleBinding::Local { function, local });
+            declare_binding(scopes, VisibleBinding::Local { function, local }, start);
         }
         AstBindingRef::SyntheticLocal(local) => {
-            declare_binding(scopes, VisibleBinding::SyntheticLocal { function, local });
+            declare_binding(
+                scopes,
+                VisibleBinding::SyntheticLocal { function, local },
+                start,
+            );
         }
         AstBindingRef::Temp(_) => unreachable!(
             "readability output must not leak raw temp bindings into naming lexical analysis"
@@ -426,34 +338,45 @@ fn declare_ast_binding(
     }
 }
 
-fn declare_binding(scopes: &mut [Vec<VisibleBinding>], binding: VisibleBinding) {
+/// 每个活动 scope 只保留自己尚未闭合的声明，离域时一次性发布区间。
+type PendingScopes = Vec<Vec<(VisibleBinding, usize)>>;
+
+fn declare_binding(
+    scopes: &mut [Vec<(VisibleBinding, usize)>],
+    binding: VisibleBinding,
+    start: usize,
+) {
     scopes
         .last_mut()
         .expect("lexical context must always keep at least one scope")
-        .push(binding);
+        .push((binding, start));
 }
 
-fn visible_snapshot(
-    outer_visible_bindings: &[VisibleBinding],
-    scopes: &[Vec<VisibleBinding>],
-) -> Vec<VisibleBinding> {
-    let mut visible = Vec::with_capacity(
-        outer_visible_bindings.len() + scopes.iter().map(Vec::len).sum::<usize>(),
-    );
-    visible.extend_from_slice(outer_visible_bindings);
-    for scope in scopes {
-        visible.extend_from_slice(scope);
-    }
-    visible
+fn close_scope(function: HirProtoRef, contexts: &mut LexicalContexts, scopes: &mut PendingScopes) {
+    let end = contexts.next_definition_position;
+    let scope = scopes
+        .pop()
+        .expect("lexical scope must exist before closing");
+    contexts.functions[function.index()]
+        .visible_bindings
+        .extend(
+            scope
+                .into_iter()
+                .map(|(binding, start)| (binding, start..end)),
+        );
 }
 
-fn with_nested_scope<T, F>(scopes: &mut Vec<Vec<VisibleBinding>>, f: F) -> Result<T, NamingError>
+fn with_nested_scope<T, F>(
+    function: HirProtoRef,
+    contexts: &mut LexicalContexts,
+    scopes: &mut PendingScopes,
+    f: F,
+) -> Result<T, NamingError>
 where
-    F: FnOnce(&mut Vec<Vec<VisibleBinding>>) -> Result<T, NamingError>,
+    F: FnOnce(&mut LexicalContexts, &mut PendingScopes) -> Result<T, NamingError>,
 {
     scopes.push(Vec::new());
-    let result = f(scopes);
-    let popped = scopes.pop();
-    debug_assert!(popped.is_some(), "nested lexical scope should exist");
+    let result = f(contexts, scopes);
+    close_scope(function, contexts, scopes);
     result
 }

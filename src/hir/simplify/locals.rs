@@ -1106,7 +1106,10 @@ fn collect_plans(
             // locals 不把未被读取的 SSA 版本固化成源码 local。
             continue;
         }
-        if sticky_local.is_none() && !force_physical_root_local {
+        if sticky_local.is_none()
+            && !force_physical_root_local
+            && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+        {
             let first_touch_index = touching_stmt_indices.first().copied();
             // 只在控制头里单次消费的 temp，更像机械性的结构参数而不是源码级 local。
             // 只有一次后续消费的全局别名或字符串常量，必须结合消费站点判定：

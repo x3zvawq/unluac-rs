@@ -26,7 +26,7 @@ use super::global_decl_pretty::{VisibleGlobals, extending_global_scope_preserves
 use super::repeat_lifetime::{
     binding_must_live_through_condition, hir_binding_may_end_before_condition,
 };
-use super::walk::{self, AstRewritePass, BlockKind, ScopedAstRewritePass};
+use super::walk::{self, AstRewritePass, BlockKind, RewriteScope, ScopedAstRewritePass};
 use crate::ast::traverse::traverse_expr_children;
 use crate::hir::HirRepeatConditionLifetimeFacts;
 
@@ -39,7 +39,7 @@ pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool
     );
     changed |= walk::rewrite_module_scoped(
         module,
-        &VisibleGlobals::default(),
+        VisibleGlobals::default(),
         &mut RepeatTailCleanupPass,
     );
     changed
@@ -69,40 +69,22 @@ struct RepeatTailCleanupPass;
 impl ScopedAstRewritePass for RepeatTailCleanupPass {
     type Scope = VisibleGlobals;
 
-    fn enter_block(
-        &mut self,
-        _block: &mut AstBlock,
-        _kind: BlockKind,
-        incoming: &Self::Scope,
-    ) -> (bool, Self::Scope) {
-        (false, incoming.clone())
-    }
-
     fn enter_repeat_body(
         &mut self,
         block: &mut AstBlock,
         condition: &AstExpr,
         lifetime: &HirRepeatConditionLifetimeFacts,
-        incoming: &Self::Scope,
-    ) -> (bool, Self::Scope) {
-        (
-            flatten_repeat_tail_do_blocks(block, condition, lifetime, incoming),
-            incoming.clone(),
-        )
+        incoming: &mut Self::Scope,
+    ) -> bool {
+        flatten_repeat_tail_do_blocks(block, condition, lifetime, incoming)
     }
 
-    fn scope_for_stmt_children(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
-        // `global function f()` 的名字在函数体内即可见；普通 global declaration 的
-        // initializer 则必须继续使用声明前环境。与 global-decl-pretty 共用同一规则。
-        if matches!(stmt, AstStmt::FunctionDecl(_)) {
-            scope.after_stmt(stmt)
-        } else {
-            scope.clone()
-        }
+    fn enter_stmt_children(&mut self, stmt: &AstStmt, scope: &mut Self::Scope) {
+        scope.enter_stmt_children(stmt);
     }
 
-    fn scope_after_stmt(&mut self, stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
-        scope.after_stmt(stmt)
+    fn after_stmt(&mut self, stmt: &AstStmt, scope: &mut Self::Scope) {
+        scope.apply_stmt(stmt);
     }
 }
 
@@ -629,7 +611,7 @@ fn flatten_repeat_tail_do_blocks(
     block: &mut AstBlock,
     condition: &AstExpr,
     lifetime: &HirRepeatConditionLifetimeFacts,
-    incoming_globals: &VisibleGlobals,
+    incoming_globals: &mut VisibleGlobals,
 ) -> bool {
     let mut changed = false;
     while let Some(AstStmt::DoBlock(nested)) = block.stmts.last() {
@@ -637,12 +619,14 @@ fn flatten_repeat_tail_do_blocks(
             break;
         }
 
-        let globals_before_tail = block.stmts[..block.stmts.len() - 1]
-            .iter()
-            .fold(incoming_globals.clone(), |globals, stmt| {
-                globals.after_stmt(stmt)
-            });
-        if !extending_global_scope_preserves_expr(&globals_before_tail, &nested.stmts, condition) {
+        let checkpoint = incoming_globals.checkpoint();
+        for stmt in &block.stmts[..block.stmts.len() - 1] {
+            incoming_globals.apply_stmt(stmt);
+        }
+        let preserves_permissions =
+            extending_global_scope_preserves_expr(incoming_globals, &nested.stmts, condition);
+        incoming_globals.restore(checkpoint);
+        if !preserves_permissions {
             // 候选拒绝[SemanticBarrier:Scope]：展开会把尾 do 的直属 global/global-function
             // 声明延伸到 repeat condition。先从 repeat body incoming 环境只推进未移动的
             // 直属 prefix，再由共享词法解释器逐访问比较 condition 在扩域前后的许可；
@@ -1418,7 +1402,7 @@ mod tests {
                 rhs: nested_write(&stop),
             })),
             &Default::default(),
-            &VisibleGlobals::default(),
+            &mut VisibleGlobals::default(),
         ));
         assert!(matches!(
             named_const_extension.stmts.last(),
@@ -1440,7 +1424,7 @@ mod tests {
                 rhs: AstExpr::Var(AstNameRef::Global(stop)),
             })),
             &Default::default(),
-            &VisibleGlobals::default(),
+            &mut VisibleGlobals::default(),
         ));
 
         let marker = global_name("marker");
@@ -1464,7 +1448,7 @@ mod tests {
         };
         assert!(!walk::rewrite_module_scoped(
             &mut wildcard_extension,
-            &VisibleGlobals::default(),
+            VisibleGlobals::default(),
             &mut RepeatTailCleanupPass,
         ));
         let AstStmt::Repeat(repeat_stmt) = &wildcard_extension.body.stmts[1] else {
@@ -1497,7 +1481,7 @@ mod tests {
             &mut global_function_extension,
             &AstExpr::Var(AstNameRef::Global(function_name)),
             &Default::default(),
-            &VisibleGlobals::default(),
+            &mut VisibleGlobals::default(),
         ));
     }
 

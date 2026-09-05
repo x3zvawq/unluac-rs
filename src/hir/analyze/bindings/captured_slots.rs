@@ -8,7 +8,7 @@ use crate::structure::SccId;
 
 pub(super) struct CapturedSlotTargets {
     pub(super) slot_targets: BTreeMap<CapturedSlotKey, CapturedSlotBinding>,
-    pub(super) capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+    pub(super) capture_targets: BTreeMap<(usize, usize), LocalId>,
     pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
     pub(super) entry_local_decls: Vec<LocalId>,
     pub(super) region_local_decls: BTreeMap<RegionId, Vec<LocalId>>,
@@ -16,7 +16,7 @@ pub(super) struct CapturedSlotTargets {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CapturedSlotBinding {
-    pub(super) target: BoundSlotTarget,
+    pub(super) target: LocalId,
     pub(super) start_instr: usize,
 }
 
@@ -264,7 +264,7 @@ pub(super) fn collect_captured_slot_targets(
                 captured.reg,
                 InstrRef(captured.instr_index),
             ));
-            let target = BoundSlotTarget::Local(local);
+            let target = local;
             slot_targets.insert(
                 captured.key,
                 CapturedSlotBinding {
@@ -275,8 +275,7 @@ pub(super) fn collect_captured_slot_targets(
             target
         };
         if captured.entry_local_safe {
-            let BoundSlotTarget::Local(local) = target;
-            entry_local_regs.entry(captured.reg).or_insert(local);
+            entry_local_regs.entry(captured.reg).or_insert(target);
         }
     }
 
@@ -298,18 +297,17 @@ pub(super) fn collect_captured_slot_targets(
     let entry_local_decls = entry_decl_keys
         .iter()
         .filter_map(|key| slot_targets.get(key))
-        .map(|binding| {
-            let BoundSlotTarget::Local(local) = binding.target;
-            local
-        })
+        .map(|binding| binding.target)
         .collect();
     let mut region_local_decls = BTreeMap::<RegionId, Vec<LocalId>>::new();
     for (key, region) in region_decl_keys {
         let Some(binding) = slot_targets.get(&key) else {
             continue;
         };
-        let BoundSlotTarget::Local(local) = binding.target;
-        region_local_decls.entry(region).or_default().push(local);
+        region_local_decls
+            .entry(region)
+            .or_default()
+            .push(binding.target);
     }
     CapturedSlotTargets {
         slot_targets,

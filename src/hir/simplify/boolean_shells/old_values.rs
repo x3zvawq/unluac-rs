@@ -873,7 +873,7 @@ impl HirVisitor for UserCodeObserver {
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= !self.safety.is_discard_safe_without_residual(expr);
+        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
     }
 }
 

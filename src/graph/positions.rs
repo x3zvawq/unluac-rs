@@ -5,6 +5,7 @@
 //! 不能证明 [1,4) 内有事件；搜索上界早于起点时也不存在活动。
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     ops::Range,
 };
@@ -63,7 +64,10 @@ impl<K: Ord> PositionIndex<K> {
         &positions[positions.partition_point(|&position| position < start)..]
     }
 
-    pub(crate) fn last_in(&self, key: &K, range: Range<usize>) -> Option<usize> {
+    pub(crate) fn last_in<Q: Ord + ?Sized>(&self, key: &Q, range: Range<usize>) -> Option<usize>
+    where
+        K: Borrow<Q>,
+    {
         let positions = self.0.get(key)?;
         let end = positions.partition_point(|&position| position < range.end);
         positions[..end]

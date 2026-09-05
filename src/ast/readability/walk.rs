@@ -4,7 +4,8 @@
 //! 保守重写”。如果每个 pass 都各自维护一套 `block/stmt/lvalue/call/expr` 骨架，
 //! 新 AST 节点一加，或者遍历边界一改，就要在一堆文件里同步返工。这里把纯遍历
 //! 样板收成共享设施，让 pass 更专注在“当前节点要不要改写”。repeat body 通过专用
-//! hook 暴露同作用域的 until 条件，避免块级分析漏掉正文之后的读取。
+//! hook 暴露同作用域的 until 条件，避免块级分析漏掉正文之后的读取。带状态遍历只保存
+//! 当前层的回退位置；例如子域新增 global 名字后退出，不复制祖先映射，也不污染 sibling。
 
 use crate::ast::common::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
@@ -54,29 +55,36 @@ pub(super) trait AstRewritePass {
     }
 }
 
-/// 某些 readability pass 需要沿 block 树向下携带一份显式状态，
-/// 例如“当前作用域已经可见哪些 global 名称”。
-///
-/// 这类 pass 以前只能各自复制整套递归 walker；这里把“进入 block 时产出子作用域状态”
-/// 也收成共享设施，让 pass 只关心如何更新状态，不再重复维护遍历骨架。
-pub(super) trait ScopedAstRewritePass {
-    type Scope: Clone;
+/// 词法状态由自身保存回退位置；子域只撤销新增变化，不复制祖先事实。
+pub(super) trait RewriteScope {
+    type Checkpoint;
+    fn checkpoint(&self) -> Self::Checkpoint;
+    fn restore(&mut self, checkpoint: Self::Checkpoint);
+}
 
-    fn enter_function(
-        &mut self,
-        _function: &mut AstFunctionExpr,
-        outer_scope: &Self::Scope,
-    ) -> Self::Scope {
-        outer_scope.clone()
+impl RewriteScope for usize {
+    type Checkpoint = usize;
+    fn checkpoint(&self) -> usize {
+        *self
     }
+    fn restore(&mut self, checkpoint: usize) {
+        *self = checkpoint;
+    }
+}
+
+/// 共享带状态的遍历顺序；entry 更新当前域，子域退出由 walker 恢复，后继消费最终语句。
+pub(super) trait ScopedAstRewritePass {
+    type Scope: RewriteScope;
+
+    fn enter_function(&mut self, _function: &mut AstFunctionExpr, _scope: &mut Self::Scope) {}
 
     fn enter_block(
         &mut self,
         _block: &mut AstBlock,
         _kind: BlockKind,
-        outer_scope: &Self::Scope,
-    ) -> (bool, Self::Scope) {
-        (false, outer_scope.clone())
+        _scope: &mut Self::Scope,
+    ) -> bool {
+        false
     }
 
     fn enter_repeat_body(
@@ -84,18 +92,13 @@ pub(super) trait ScopedAstRewritePass {
         block: &mut AstBlock,
         _condition: &AstExpr,
         _lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
-        outer_scope: &Self::Scope,
-    ) -> (bool, Self::Scope) {
-        self.enter_block(block, BlockKind::Regular, outer_scope)
+        scope: &mut Self::Scope,
+    ) -> bool {
+        self.enter_block(block, BlockKind::Regular, scope)
     }
 
-    fn scope_for_stmt_children(&mut self, _stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
-        scope.clone()
-    }
-
-    fn scope_after_stmt(&mut self, _stmt: &AstStmt, scope: &Self::Scope) -> Self::Scope {
-        scope.clone()
-    }
+    fn enter_stmt_children(&mut self, _stmt: &AstStmt, _scope: &mut Self::Scope) {}
+    fn after_stmt(&mut self, _stmt: &AstStmt, _scope: &mut Self::Scope) {}
 
     fn rewrite_stmt(&mut self, _stmt: &mut AstStmt, _scope: &Self::Scope) -> bool {
         false
@@ -133,26 +136,25 @@ fn rewrite_block_with_kind(
 
 pub(super) fn rewrite_module_scoped<P: ScopedAstRewritePass>(
     module: &mut AstModule,
-    scope: &P::Scope,
+    mut scope: P::Scope,
     pass: &mut P,
 ) -> bool {
-    rewrite_block_with_kind_scoped(&mut module.body, BlockKind::ModuleBody, scope, pass)
+    rewrite_block_with_kind_scoped(&mut module.body, BlockKind::ModuleBody, &mut scope, pass)
 }
 
 fn rewrite_block_with_kind_scoped<P: ScopedAstRewritePass>(
     block: &mut AstBlock,
     kind: BlockKind,
-    outer_scope: &P::Scope,
+    scope: &mut P::Scope,
     pass: &mut P,
 ) -> bool {
-    let (block_changed, mut scope) = pass.enter_block(block, kind, outer_scope);
-    let mut nested_changed = false;
+    let checkpoint = scope.checkpoint();
+    let mut changed = pass.enter_block(block, kind, scope);
     for stmt in &mut block.stmts {
-        let child_scope = pass.scope_for_stmt_children(stmt, &scope);
-        nested_changed |= rewrite_stmt_scoped(stmt, &child_scope, pass);
-        scope = pass.scope_after_stmt(stmt, &scope);
+        changed |= rewrite_stmt_scoped(stmt, scope, pass);
     }
-    block_changed || nested_changed
+    scope.restore(checkpoint);
+    changed
 }
 
 pub(super) fn rewrite_stmt(stmt: &mut AstStmt, pass: &mut impl AstRewritePass) -> bool {
@@ -199,11 +201,26 @@ pub(super) fn rewrite_stmt(stmt: &mut AstStmt, pass: &mut impl AstRewritePass) -
 
 fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
     stmt: &mut AstStmt,
-    scope: &P::Scope,
+    scope: &mut P::Scope,
+    pass: &mut P,
+) -> bool {
+    let checkpoint = scope.checkpoint();
+    pass.enter_stmt_children(stmt, scope);
+    let changed = rewrite_stmt_children_scoped(stmt, scope, pass);
+    scope.restore(checkpoint);
+    // children 的临时许可覆盖 rewrite_stmt；后继状态消费最终语句，不能把新子域声明泄露出去。
+    pass.after_stmt(stmt, scope);
+    changed
+}
+
+fn rewrite_stmt_children_scoped<P: ScopedAstRewritePass>(
+    stmt: &mut AstStmt,
+    scope: &mut P::Scope,
     pass: &mut P,
 ) -> bool {
     if let AstStmt::Repeat(repeat_stmt) = stmt {
-        let (block_changed, mut body_scope) = pass.enter_repeat_body(
+        let checkpoint = scope.checkpoint();
+        let block_changed = pass.enter_repeat_body(
             &mut repeat_stmt.body,
             &repeat_stmt.cond,
             &repeat_stmt.lifetime,
@@ -213,11 +230,10 @@ fn rewrite_stmt_scoped<P: ScopedAstRewritePass>(
         // repeat body 与 until 条件共享词法作用域；逐句推进后，条件必须看到
         // body 末尾已经生效的声明，而不能退回 repeat 外层 scope。
         for stmt in &mut repeat_stmt.body.stmts {
-            let child_scope = pass.scope_for_stmt_children(stmt, &body_scope);
-            nested_changed |= rewrite_stmt_scoped(stmt, &child_scope, pass);
-            body_scope = pass.scope_after_stmt(stmt, &body_scope);
+            nested_changed |= rewrite_stmt_scoped(stmt, scope, pass);
         }
-        nested_changed |= rewrite_condition_expr_scoped(&mut repeat_stmt.cond, &body_scope, pass);
+        nested_changed |= rewrite_condition_expr_scoped(&mut repeat_stmt.cond, scope, pass);
+        scope.restore(checkpoint);
         return pass.rewrite_stmt(stmt, scope) || block_changed || nested_changed;
     }
 
@@ -271,7 +287,7 @@ pub(super) fn rewrite_expr(expr: &mut AstExpr, pass: &mut impl AstRewritePass) -
 
 fn rewrite_expr_scoped<P: ScopedAstRewritePass>(
     expr: &mut AstExpr,
-    scope: &P::Scope,
+    scope: &mut P::Scope,
     pass: &mut P,
 ) -> bool {
     let mut nested_changed = false;
@@ -303,7 +319,7 @@ pub(super) fn rewrite_lvalue(lvalue: &mut AstLValue, pass: &mut impl AstRewriteP
 
 fn rewrite_lvalue_scoped<P: ScopedAstRewritePass>(
     lvalue: &mut AstLValue,
-    scope: &P::Scope,
+    scope: &mut P::Scope,
     pass: &mut P,
 ) -> bool {
     let mut nested_changed = false;
@@ -323,7 +339,7 @@ fn rewrite_condition_expr(expr: &mut AstExpr, pass: &mut impl AstRewritePass) ->
 
 fn rewrite_condition_expr_scoped<P: ScopedAstRewritePass>(
     expr: &mut AstExpr,
-    scope: &P::Scope,
+    scope: &mut P::Scope,
     pass: &mut P,
 ) -> bool {
     let nested_changed = rewrite_expr_scoped(expr, scope, pass);
@@ -341,7 +357,7 @@ fn rewrite_call(call: &mut AstCallKind, pass: &mut impl AstRewritePass) -> bool 
 
 fn rewrite_call_scoped<P: ScopedAstRewritePass>(
     call: &mut AstCallKind,
-    scope: &P::Scope,
+    scope: &mut P::Scope,
     pass: &mut P,
 ) -> bool {
     let mut nested_changed = false;
@@ -365,9 +381,12 @@ fn rewrite_function_expr(
 fn rewrite_function_expr_scoped<P: ScopedAstRewritePass>(
     function: &mut AstFunctionExpr,
     kind: BlockKind,
-    scope: &P::Scope,
+    scope: &mut P::Scope,
     pass: &mut P,
 ) -> bool {
-    let function_scope = pass.enter_function(function, scope);
-    rewrite_block_with_kind_scoped(&mut function.body, kind, &function_scope, pass)
+    let checkpoint = scope.checkpoint();
+    pass.enter_function(function, scope);
+    let changed = rewrite_block_with_kind_scoped(&mut function.body, kind, scope, pass);
+    scope.restore(checkpoint);
+    changed
 }

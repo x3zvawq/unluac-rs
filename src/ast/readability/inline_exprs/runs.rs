@@ -147,7 +147,7 @@ pub(super) fn collapse_adjacent_self_call_updates(
         let mut run_end = index + 1;
         while use_index.count_uses_in_range(run_end, run_end + 1, binding.id) == 1
             && let Some(next) = old_stmts.get(run_end)
-            && let Some(rewritten) = self_call_update_value(next, binding.id, &value)
+            && let Some(rewritten) = self_call_update_value(next, binding.id, &mut value)
         {
             value = rewritten;
             run_end += 1;
@@ -171,10 +171,11 @@ pub(super) fn collapse_adjacent_self_call_updates(
     changed
 }
 
+// replacement 在独立 plan 内构造；匹配成功才移入增长中的 receiver，拒绝时原值不变。
 fn self_call_update_value(
     stmt: &AstStmt,
     binding: AstBindingRef,
-    receiver: &AstExpr,
+    receiver: &mut AstExpr,
 ) -> Option<AstExpr> {
     let AstStmt::Assign(assign) = stmt else {
         return None;
@@ -192,13 +193,13 @@ fn self_call_update_value(
         AstExpr::Call(call) if matches!(&call.callee, AstExpr::Var(name) if binding.matches_name_ref(name)) =>
         {
             let mut call = (**call).clone();
-            call.callee = receiver.clone();
+            call.callee = std::mem::replace(receiver, AstExpr::Nil);
             Some(AstExpr::Call(Box::new(call)))
         }
         AstExpr::MethodCall(call) if matches!(&call.receiver, AstExpr::Var(name) if binding.matches_name_ref(name)) =>
         {
             let mut call = (**call).clone();
-            call.receiver = receiver.clone();
+            call.receiver = std::mem::replace(receiver, AstExpr::Nil);
             Some(AstExpr::MethodCall(Box::new(call)))
         }
         _ => None,

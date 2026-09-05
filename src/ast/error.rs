@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::ast::{AstBindingRef, AstLabelId, DecompileDialect};
 
 /// HIR -> AST lowering 可能失败的原因。
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum AstLowerError {
     #[error(
         "target dialect `{dialect}` does not support feature `{feature}` required by {context}"

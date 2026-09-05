@@ -3,8 +3,13 @@
 //! Naming 发生在 Readability 之后，所以像“哪些 binding 还真实留在 AST 里”
 //! “哪些 synthetic local 最终其实只是丢弃位”这类信息，不能再靠 HIR/Raw 的原始槽位推断。
 //! 这里直接基于最终 AST 建一份轻量事实表，让命名阶段能按成品结构做决定。
+//! 全局名字按函数后序位置发布，函数只持有其最终 AST 子树区间，不沿 HIR children
+//! 复制后代集合。例如兄弟函数分别引用 x/y，父函数避让两者，各子函数只避让自己的名字。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
@@ -14,42 +19,41 @@ use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName,
     AstGlobalBindingTarget, AstLValue, AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
 };
+use crate::graph::PositionIndex;
 use crate::hir::{HirModule, HirProtoRef};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub(super) struct AstNamingFacts {
     pub(super) functions: Vec<FunctionAstNamingFacts>,
+    global_names: PositionIndex<String>,
+    next_function_position: usize,
+}
+
+impl AstNamingFacts {
+    pub(super) fn reserves_global_name(&self, function: HirProtoRef, name: &str) -> bool {
+        self.global_names
+            .last_in(
+                name,
+                self.functions[function.index()].global_name_range.clone(),
+            )
+            .is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct FunctionAstNamingFacts {
     pub(super) debug_like_binding_order: BTreeMap<AstBindingRef, usize>,
     pub(super) unused_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
-    pub(super) reserved_global_names: BTreeSet<String>,
+    global_name_range: Range<usize>,
 }
 
 pub(super) fn collect_ast_naming_facts(module: &AstModule, hir: &HirModule) -> AstNamingFacts {
     let mut facts = AstNamingFacts {
         functions: vec![FunctionAstNamingFacts::default(); hir.protos.len()],
+        ..AstNamingFacts::default()
     };
     collect_function_facts(module.entry_function, &module.body, hir, &mut facts);
-    propagate_subtree_global_names(module.entry_function, hir, &mut facts);
     facts
-}
-
-fn propagate_subtree_global_names(
-    function: HirProtoRef,
-    hir: &HirModule,
-    facts: &mut AstNamingFacts,
-) -> BTreeSet<String> {
-    let mut names = facts.functions[function.index()]
-        .reserved_global_names
-        .clone();
-    for child in &hir.protos[function.index()].children {
-        names.extend(propagate_subtree_global_names(*child, hir, facts));
-    }
-    facts.functions[function.index()].reserved_global_names = names.clone();
-    names
 }
 
 #[derive(Debug, Default)]
@@ -87,7 +91,14 @@ impl FunctionAstCollector {
         }
     }
 
-    fn finish(self) -> FunctionAstNamingFacts {
+    fn finish(
+        self,
+        global_name_range: Range<usize>,
+        global_names: &mut PositionIndex<String>,
+    ) -> FunctionAstNamingFacts {
+        for name in self.global_names {
+            global_names.record(name, global_name_range.end - 1);
+        }
         let debug_like_binding_order = self
             .binding_order
             .into_iter()
@@ -103,7 +114,7 @@ impl FunctionAstCollector {
         FunctionAstNamingFacts {
             debug_like_binding_order,
             unused_synthetic_locals,
-            reserved_global_names: self.global_names,
+            global_name_range,
         }
     }
 }
@@ -114,10 +125,13 @@ fn collect_function_facts(
     hir: &HirModule,
     facts: &mut AstNamingFacts,
 ) {
+    let start = facts.next_function_position;
     let mut collector = FunctionAstCollector::default();
     note_named_vararg_binding(function, hir, &mut collector);
     collect_block_facts(body, &mut collector, hir, facts);
-    facts.functions[function.index()] = collector.finish();
+    facts.next_function_position += 1;
+    facts.functions[function.index()] =
+        collector.finish(start..facts.next_function_position, &mut facts.global_names);
 }
 
 fn note_named_vararg_binding(

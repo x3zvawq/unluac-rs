@@ -8,6 +8,7 @@
 mod analysis;
 mod exprs;
 mod patterns;
+mod proto_bodies;
 
 use std::collections::BTreeSet;
 
@@ -162,6 +163,7 @@ struct AstLowerer<'a> {
     target: AstTargetDialect,
     generate_mode: GenerateMode,
     next_synthetic_label: usize,
+    proto_bodies: proto_bodies::ProtoBodies,
 }
 
 impl<'a> AstLowerer<'a> {
@@ -171,6 +173,7 @@ impl<'a> AstLowerer<'a> {
             target,
             generate_mode,
             next_synthetic_label: 0,
+            proto_bodies: proto_bodies::ProtoBodies::default(),
         }
     }
 
@@ -179,7 +182,20 @@ impl<'a> AstLowerer<'a> {
     }
 
     fn lower_module(&mut self) -> Result<AstModule, AstLowerError> {
-        let body = self.lower_proto_body(self.module.entry.index())?;
+        let entry = self.module.entry.index();
+        if entry >= self.module.protos.len() {
+            return Err(AstLowerError::MissingChildProto {
+                proto: entry,
+                child: entry,
+            });
+        }
+        let (bodies, order) = proto_bodies::ProtoBodies::prepare(self.module);
+        self.proto_bodies = bodies;
+        for proto in order {
+            let body = self.lower_proto_body(proto);
+            self.proto_bodies.insert(proto, body);
+        }
+        let body = self.proto_bodies.take(entry)?;
         let module = AstModule {
             next_synthetic_local: 0,
             entry_function: self.module.entry,
@@ -304,12 +320,7 @@ impl<'a> AstLowerer<'a> {
                 ))],
                 1,
             )),
-            HirStmt::Assign(assign) => Ok((
-                vec![AstStmt::Assign(Box::new(
-                    self.lower_assign(proto_index, assign)?,
-                ))],
-                1,
-            )),
+            HirStmt::Assign(assign) => Ok((self.lower_assign(proto_index, assign)?, 1)),
             HirStmt::TableSetList(_) => Err(AstLowerError::ResidualHir {
                 proto: proto_index,
                 kind: "table-set-list",

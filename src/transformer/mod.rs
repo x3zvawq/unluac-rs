@@ -6,6 +6,7 @@
 mod common;
 #[cfg(feature = "decompile-debug")]
 mod debug;
+mod debug_locals;
 mod dialect;
 mod error;
 mod format;
@@ -32,6 +33,7 @@ pub use common::{
     VarArgInstr,
 };
 pub use debug::dump_lir;
+pub use debug_locals::DebugLocals;
 pub use error::TransformError;
 pub use format::format_low_instr;
 

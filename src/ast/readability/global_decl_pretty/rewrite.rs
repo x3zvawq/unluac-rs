@@ -26,7 +26,7 @@ pub(in crate::ast::readability) fn apply(
     }
 
     let mut pass = GlobalDeclPrettyPass;
-    rewrite_module_scoped(module, &VisibleGlobals::default(), &mut pass)
+    rewrite_module_scoped(module, VisibleGlobals::default(), &mut pass)
 }
 
 struct GlobalDeclPrettyPass;
@@ -38,8 +38,8 @@ impl ScopedAstRewritePass for GlobalDeclPrettyPass {
         &mut self,
         block: &mut AstBlock,
         _kind: BlockKind,
-        outer_declared: &Self::Scope,
-    ) -> (bool, Self::Scope) {
+        outer_declared: &mut Self::Scope,
+    ) -> bool {
         self.enter_scoped_block(block, outer_declared, None)
     }
 
@@ -48,29 +48,17 @@ impl ScopedAstRewritePass for GlobalDeclPrettyPass {
         block: &mut AstBlock,
         condition: &crate::ast::common::AstExpr,
         lifetime: &crate::hir::HirRepeatConditionLifetimeFacts,
-        outer_declared: &Self::Scope,
-    ) -> (bool, Self::Scope) {
+        outer_declared: &mut Self::Scope,
+    ) -> bool {
         self.enter_scoped_block(block, outer_declared, Some((condition, lifetime)))
     }
 
-    fn scope_for_stmt_children(
-        &mut self,
-        stmt: &crate::ast::common::AstStmt,
-        scope: &Self::Scope,
-    ) -> Self::Scope {
-        if matches!(stmt, crate::ast::common::AstStmt::FunctionDecl(_)) {
-            scope.after_stmt(stmt)
-        } else {
-            scope.clone()
-        }
+    fn enter_stmt_children(&mut self, stmt: &crate::ast::common::AstStmt, scope: &mut Self::Scope) {
+        scope.enter_stmt_children(stmt);
     }
 
-    fn scope_after_stmt(
-        &mut self,
-        stmt: &crate::ast::common::AstStmt,
-        scope: &Self::Scope,
-    ) -> Self::Scope {
-        scope.after_stmt(stmt)
+    fn after_stmt(&mut self, stmt: &crate::ast::common::AstStmt, scope: &mut Self::Scope) {
+        scope.apply_stmt(stmt);
     }
 }
 
@@ -83,7 +71,7 @@ impl GlobalDeclPrettyPass {
             &crate::ast::common::AstExpr,
             &crate::hir::HirRepeatConditionLifetimeFacts,
         )>,
-    ) -> (bool, VisibleGlobals) {
+    ) -> bool {
         // AST build 只消费 HIR 发布的 typed `HirGlobalDecl` 并验证目标语法；这里仅合并
         // singleton seed handoff，并在当前作用域已有 AST 显式 global gate 时再补
         // missing global。Lua 5.5 默认 `global *`，完全没有显式证据时不能凭观测补声明；
@@ -120,6 +108,6 @@ impl GlobalDeclPrettyPass {
             changed = true;
         }
 
-        (changed, outer_declared.clone())
+        changed
     }
 }

@@ -7,7 +7,7 @@ pub(super) fn target_for_slot(
     instr_index: usize,
     epochs: &SlotEpochFacts,
     captured_slots: &CapturedSlotTargets,
-) -> Option<BoundSlotTarget> {
+) -> Option<LocalId> {
     captured_slots
         .slot_targets
         .get(&CapturedSlotKey::new(
@@ -101,9 +101,7 @@ pub(super) fn debug_local_hint_for_reg_at_pc(
 ) -> Option<DebugBindingHint> {
     proto
         .debug_locals
-        .iter()
-        .enumerate()
-        .find(|(_, local)| local.is_source() && local.reg == reg && local.is_active_at(pc))
+        .source_at(reg, pc)
         .map(|(scope, local)| DebugBindingHint {
             scope,
             name: decode_raw_string(&local.name),

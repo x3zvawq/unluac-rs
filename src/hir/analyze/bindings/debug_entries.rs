@@ -1,4 +1,4 @@
-//! 为函数入口 debug local 分配绑定并提取 closure 名称；依赖 debug scope 与 lowering，不负责循环/捕获合并；例如把 Entry(reg) 映射到稳定 LocalId。
+//! 为入口 debug scope 分配参数或 local 绑定并提取 closure 名称；依赖 Structure 的入口 SSA 身份，不负责循环/捕获合并。例如参数 scope 的后续 nil 写仍写回 ParamId。
 
 use super::*;
 
@@ -6,27 +6,32 @@ use super::*;
 ///
 /// 若继续把 `Entry(reg)` 只当作一个普通 nil 值，loop-carried phi 会在循环前才被
 /// `locals` 提升，进而把源码声明错误地移动到前置调用之后。这里直接建立 scope 对应的
-/// `LocalId`，后续同 scope 的 def/phi temp 都写回这个绑定。
-pub(super) fn allocate_debug_entry_locals(
+/// `LocalId`，后续同 scope 的 def/phi temp 都写回这个绑定。参数 scope 则直接使用入口
+/// `ParamId`，重绑定不另建会延长旧参数 root 生命周期的 local。
+pub(super) fn allocate_debug_entry_bindings(
     proto: &LoweredProto,
     structure: &ReadyStructureFacts,
     entry_local_regs: &mut BTreeMap<Reg, LocalId>,
     locals: &mut Vec<LocalId>,
     local_debug_hints: &mut Vec<Option<String>>,
-) -> (Vec<LocalId>, BTreeMap<usize, LocalId>) {
+) -> (Vec<LocalId>, BTreeMap<usize, BoundSlotTarget>) {
     let param_count = usize::from(proto.signature.num_params);
     let vararg_reg = proto
         .signature
         .has_vararg_param_reg
         .then_some(Reg(param_count));
     let mut declarations = Vec::new();
-    let mut scope_locals = BTreeMap::new();
+    let mut scope_targets = BTreeMap::new();
 
     for fact in &structure.debug_bindings().accepted {
         let SsaValue::Entry(reg) = fact.value else {
             continue;
         };
-        if fact.start_pc != 0 || reg.index() < param_count || Some(reg) == vararg_reg {
+        if fact.start_pc != 0 || Some(reg) == vararg_reg {
+            continue;
+        }
+        if reg.index() < param_count {
+            scope_targets.insert(fact.scope, BoundSlotTarget::Param(ParamId(reg.index())));
             continue;
         }
         let Some(debug_local) = proto.debug_locals.get(fact.scope) else {
@@ -42,10 +47,10 @@ pub(super) fn allocate_debug_entry_locals(
             declarations.push(local);
             local
         };
-        scope_locals.insert(fact.scope, local);
+        scope_targets.insert(fact.scope, BoundSlotTarget::Local(local));
     }
 
-    (declarations, scope_locals)
+    (declarations, scope_targets)
 }
 
 pub(super) fn closure_debug_name(proto: &LoweredProto, instr: Option<&LowInstr>) -> Option<String> {

@@ -22,6 +22,7 @@ use super::evidence::collect_naming_evidence;
 use super::hints::collect_function_hints;
 use super::lexical::collect_lexical_contexts;
 use super::validate::validate_readability_ast;
+use super::visibility::VisibleNames;
 
 /// Naming 阶段入口：从 HIR/Readability 槽位收集证据并写回 NameMap。
 pub(crate) fn assign_names(
@@ -65,21 +66,26 @@ pub fn assign_names_with_evidence(
     let mut hints = vec![FunctionHints::default(); hir.protos.len()];
     collect_function_hints(module, hir, &mut hints)?;
 
+    let mut visible_names = VisibleNames::default();
     let mut module_names = ModuleNameAllocator::default();
     let mut functions = Vec::with_capacity(hir.protos.len());
     for proto in &hir.protos {
+        let lexical = lexical_contexts
+            .function(proto.id)
+            .expect("lexical contexts should cover every HIR proto");
         functions.push(assign_names_for_function(FunctionAssignContext {
             proto,
             evidence: &evidence.functions[proto.id.index()],
             hints: &hints[proto.id.index()],
             ast_facts: &ast_facts.functions[proto.id.index()],
+            module_ast_facts: &ast_facts,
             options,
-            lexical: lexical_contexts
-                .function(proto.id)
-                .expect("lexical contexts should cover every HIR proto"),
+            visible_names: &visible_names,
+            definition_position: lexical.definition_position,
             assigned_functions: &functions,
             module_names: &mut module_names,
         })?);
+        visible_names.publish(proto.id, lexical, &functions)?;
     }
 
     Ok(NameMap {

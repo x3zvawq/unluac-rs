@@ -236,6 +236,40 @@ pub(crate) fn luau_literal_addition_value(lhs: &HirExpr, rhs: &HirExpr) -> Optio
 impl HirExprSafety {
     /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
     pub(crate) fn is_discard_safe(self, expr: &HirExpr) -> bool {
+        self.discard_safe(expr, true)
+    }
+
+    /// 表达式既可删除求值，也不承载必须交给 residual owner 的未解析诊断。
+    pub(crate) fn is_discard_safe_without_residual(self, expr: &HirExpr) -> bool {
+        self.discard_safe(expr, false)
+    }
+
+    /// 只检查当前节点；共享 visitor 负责子节点，不能把此结果当作整棵表达式的许可。
+    pub(crate) fn node_is_discard_safe_without_residual(self, expr: &HirExpr) -> bool {
+        !matches!(expr, HirExpr::Unresolved(_)) && self.node_is_discard_safe(expr)
+    }
+
+    fn discard_safe(self, expr: &HirExpr, allow_residual: bool) -> bool {
+        if !self.node_is_discard_safe(expr)
+            || (!allow_residual && matches!(expr, HirExpr::Unresolved(_)))
+        {
+            return false;
+        }
+        match expr {
+            HirExpr::Unary(unary) => self.discard_safe(&unary.expr, allow_residual),
+            HirExpr::Binary(binary) => {
+                self.discard_safe(&binary.lhs, allow_residual)
+                    && self.discard_safe(&binary.rhs, allow_residual)
+            }
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                self.discard_safe(&logical.lhs, allow_residual)
+                    && self.discard_safe(&logical.rhs, allow_residual)
+            }
+            _ => true,
+        }
+    }
+
+    fn node_is_discard_safe(self, expr: &HirExpr) -> bool {
         match expr {
             HirExpr::Nil
             | HirExpr::Boolean(_)
@@ -251,69 +285,15 @@ impl HirExprSafety {
             | HirExpr::UpvalueRef(_)
             | HirExpr::TempRef(_)
             | HirExpr::VarArg
-            | HirExpr::Unresolved(_) => true,
-            HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-                self.is_discard_safe(&unary.expr)
-            }
-            HirExpr::Binary(binary)
-                if primitive_literal_comparison_is_eventless(
-                    binary.op,
-                    &binary.lhs,
-                    &binary.rhs,
-                ) =>
-            {
-                true
-            }
-            HirExpr::Binary(binary)
-                if self.equality_is_stable(binary.op, &binary.lhs, &binary.rhs) =>
-            {
-                self.is_discard_safe(&binary.lhs) && self.is_discard_safe(&binary.rhs)
-            }
-            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-                self.is_discard_safe(&logical.lhs) && self.is_discard_safe(&logical.rhs)
+            | HirExpr::Unresolved(_)
+            | HirExpr::LogicalAnd(_)
+            | HirExpr::LogicalOr(_) => true,
+            HirExpr::Unary(unary) => unary.op == HirUnaryOpKind::Not,
+            HirExpr::Binary(binary) => {
+                primitive_literal_comparison_is_eventless(binary.op, &binary.lhs, &binary.rhs)
+                    || self.equality_is_stable(binary.op, &binary.lhs, &binary.rhs)
             }
             // 全局读取可触发环境表 __index；其余节点可能调用元方法、分配新身份或执行用户代码。
-            HirExpr::GlobalRef(_)
-            | HirExpr::TableAccess(_)
-            | HirExpr::Unary(_)
-            | HirExpr::Binary(_)
-            | HirExpr::Decision(_)
-            | HirExpr::Call(_)
-            | HirExpr::TableConstructor(_)
-            | HirExpr::Closure(_) => false,
-        }
-    }
-
-    /// 表达式既可删除求值，也不承载必须交给 residual owner 的未解析诊断。
-    pub(crate) fn is_discard_safe_without_residual(self, expr: &HirExpr) -> bool {
-        if !self.is_discard_safe(expr) {
-            return false;
-        }
-        match expr {
-            HirExpr::Unresolved(_) => false,
-            HirExpr::Unary(unary) => self.is_discard_safe_without_residual(&unary.expr),
-            HirExpr::Binary(binary) => {
-                self.is_discard_safe_without_residual(&binary.lhs)
-                    && self.is_discard_safe_without_residual(&binary.rhs)
-            }
-            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-                self.is_discard_safe_without_residual(&logical.lhs)
-                    && self.is_discard_safe_without_residual(&logical.rhs)
-            }
-            HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::TempRef(_)
-            | HirExpr::VarArg => true,
             HirExpr::GlobalRef(_)
             | HirExpr::TableAccess(_)
             | HirExpr::Decision(_)

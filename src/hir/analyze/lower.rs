@@ -64,7 +64,7 @@ pub(super) struct ProtoBindings {
     pub(super) capture_entry_local_decls: Vec<LocalId>,
     pub(super) debug_entry_local_decls: Vec<LocalId>,
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
-    pub(super) closure_capture_targets: BTreeMap<(usize, usize), BoundSlotTarget>,
+    pub(super) closure_capture_targets: BTreeMap<(usize, usize), LocalId>,
     pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
     pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
@@ -77,18 +77,21 @@ pub(super) struct ProtoBindings {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum BoundSlotTarget {
     Local(LocalId),
+    Param(ParamId),
 }
 
 impl BoundSlotTarget {
     pub(super) fn expr(self) -> HirExpr {
         match self {
             Self::Local(local) => HirExpr::LocalRef(local),
+            Self::Param(param) => HirExpr::ParamRef(param),
         }
     }
 
     pub(super) fn lvalue(self) -> HirLValue {
         match self {
             Self::Local(local) => HirLValue::Local(local),
+            Self::Param(param) => HirLValue::Param(param),
         }
     }
 }
@@ -155,6 +158,7 @@ impl ProtoBindings {
         self.closure_capture_targets
             .get(&(instr_ref.index(), reg.index()))
             .copied()
+            .map(BoundSlotTarget::Local)
     }
 
     pub(super) fn reg_is_reference_captured(&self, reg: Reg) -> bool {

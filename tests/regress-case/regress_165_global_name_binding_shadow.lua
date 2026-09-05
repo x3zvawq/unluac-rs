@@ -22,3 +22,12 @@ function methods:call()
     _ENV.self("regress_165_global_name_binding_shadow#3", self.marker)
 end
 methods:call()
+
+-- sibling 的全局引用不能污染本函数的命名区间；此处 print 只引用参数。
+-- unluac: expect-contains [[(print)]]
+;(function(print)
+    local function nested()
+        return print + 1
+    end
+    assert(nested() == 10)
+end)(9)

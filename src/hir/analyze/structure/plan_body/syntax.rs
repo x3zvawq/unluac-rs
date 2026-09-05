@@ -207,15 +207,15 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     region: owner.index(),
                     detail: "loop action binding lost its selected local",
                 })?,
-            LoopValueSource::Carried(phi) => {
-                HirExpr::TempRef(*self.lowering.bindings.phi_temps.get(phi.index()).ok_or(
+            LoopValueSource::Carried(phi) => self.lowering.bindings.expr_for_temp(
+                *self.lowering.bindings.phi_temps.get(phi.index()).ok_or(
                     HirLowerError::InvalidPlanRegion {
                         proto: self.proto.index(),
                         region: owner.index(),
                         detail: "loop action carried source has no temp binding",
                     },
-                )?)
-            }
+                )?,
+            ),
         })
     }
 

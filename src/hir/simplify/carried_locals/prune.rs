@@ -1045,7 +1045,7 @@ impl HirVisitor for UserCodeEffectCollector {
         // Allocation, dynamic access, calls and metamethod-capable expressions can run GC or
         // user code that mutates a captured binding. Reuse the shared dialect-aware boundary so
         // branch-state facts cannot survive an event omitted by a second ad-hoc classifier.
-        self.found |= !self.safety.is_discard_safe_without_residual(expr);
+        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
