@@ -476,6 +476,11 @@ fn closure_observer_effects_in_stmt(
 ) -> ClosureObserverEffects {
     let mut effects = ClosureObserverEffects::default();
     match stmt {
+        HirStmt::LocalRootRelease(local) => {
+            effects
+                .holder_writes
+                .push((ClosureHolder::Local(*local), HolderWrite::Clear));
+        }
         HirStmt::LocalDecl(decl) => {
             for (index, local) in decl.bindings.iter().copied().enumerate() {
                 let write =
@@ -883,6 +888,9 @@ fn writes_in_stmt_header(
 ) -> LiveBindingState {
     let mut writes = LiveBindingState::default();
     match stmt {
+        HirStmt::LocalRootRelease(local) => {
+            writes.locals.insert(*local);
+        }
         HirStmt::LocalDecl(decl) => {
             for local in &decl.bindings {
                 record_local_write(&mut writes, *local, promotion_facts);
@@ -990,6 +998,7 @@ fn collect_shell_sites<'a>(
         let mut path = prefix.to_vec();
         path.push(PathComponent::Stmt(index));
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => {
                 if let Some(else_block) = &if_stmt.else_block
                     && super::single_fixed_assign_pattern(&if_stmt.then_block).is_some()
@@ -1335,6 +1344,12 @@ impl<'a> OldValueTransfer<'a> {
         match kind {
             HirFlowNodeKind::Stmt(HirStmt::LocalDecl(decl)) => self.apply_local_decl(decl, state),
             HirFlowNodeKind::Stmt(HirStmt::Assign(assign)) => self.apply_assignment(assign, state),
+            HirFlowNodeKind::Stmt(HirStmt::LocalRootRelease(local)) => {
+                if let Some(class) = state.local_classes.get_mut(local) {
+                    *class = OldValueClass::GcInert;
+                }
+                state
+            }
             HirFlowNodeKind::Stmt(HirStmt::GlobalDecl(_)) => {
                 // 该语法节点隐藏 call-result/probe 对 VM scratch 的写入；词法 local
                 // 仍独立，raw home 在协议尚未发布精确写事件时不能延续 GC-inert 正证明。

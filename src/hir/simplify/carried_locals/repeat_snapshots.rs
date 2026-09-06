@@ -268,6 +268,7 @@ fn stmt_contains_unsafe_control(
     cleanup_preserves_raw_home: bool,
 ) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::Break | HirStmt::Continue if loop_depth == 0 => true,
         HirStmt::Return(_) | HirStmt::Goto(_) | HirStmt::Label(_) | HirStmt::GlobalDecl(_) => true,
         HirStmt::Close(_) | HirStmt::ToBeClosed(_) => !cleanup_preserves_raw_home,

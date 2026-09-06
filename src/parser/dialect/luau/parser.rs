@@ -717,8 +717,8 @@ impl LuauParserState {
             let reg = reader.read_u8()?;
             locals.push(RawLocalVar {
                 name,
-                start_pc: raw_pc_from_word_pc(start_word, raw_by_word_pc)?,
-                end_pc: raw_pc_from_word_pc(end_word, raw_by_word_pc)?,
+                start_pc: checked_debug_word_pc(start_word, raw_by_word_pc)?,
+                end_pc: checked_debug_word_pc(end_word, raw_by_word_pc)?,
             });
             regs.push(reg);
         }
@@ -967,10 +967,12 @@ fn count_reachable_proto_uses(
     Ok(occurrences)
 }
 
-fn raw_pc_from_word_pc(word_pc: u32, raw_by_word: &[Option<u32>]) -> Result<u32, ParseError> {
+// RawInstr::pc 与后续 lowering map 都保留 word PC；AUX 只影响存储下标，不改变 debug 坐标。
+fn checked_debug_word_pc(word_pc: u32, raw_by_word: &[Option<u32>]) -> Result<u32, ParseError> {
     raw_by_word
         .get(word_pc as usize)
         .and_then(|value| *value)
+        .map(|_| word_pc)
         .ok_or(ParseError::UnsupportedValue {
             field: "luau debug pc",
             value: u64::from(word_pc),

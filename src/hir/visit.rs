@@ -14,10 +14,12 @@
 //! 表达式，因为那正是当前 proto 能直接消费的事实边界。
 //! capture hook 持有 mode 与 value，默认递归 value；读取分析可以只进入 ByValue，
 //! 例如 `f(x, function() return x end)` 的直接 x 读取不会被 ByReference capture 抵消。
+//! local root release 默认作为逻辑 local 写暴露；分析 VM home 的 collector 必须单独
+//! 消费该事件，不得从旧 local 的来源槽位推导一次物理覆盖。
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,
-    HirTableConstructor,
+    HirTableConstructor, LocalId,
 };
 
 use crate::hir::traverse::{
@@ -34,6 +36,11 @@ pub(crate) trait HirVisitor {
     fn visit_expr(&mut self, _expr: &HirExpr) {}
 
     fn visit_lvalue(&mut self, _lvalue: &HirLValue) {}
+
+    /// 释放源码 local 的额外根，保持逻辑写入与 VM home 覆盖的区别。
+    fn visit_local_root_release(&mut self, local: LocalId) {
+        self.visit_lvalue(&HirLValue::Local(local));
+    }
 
     fn visit_call(&mut self, _call: &HirCallExpr) {}
 
@@ -71,6 +78,7 @@ pub(crate) fn visit_stmt_structure(stmt: &HirStmt, visitor: &mut impl FnMut(&Hir
         borrow = [&],
         expr(_expr) => {},
         lvalue(_lvalue) => {},
+        release(_local) => {},
         block(block) => {
             for child in &block.stmts {
                 visit_stmt_structure(child, visitor);
@@ -94,6 +102,7 @@ fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
         lvalue(lvalue) => {
             visit_lvalue(lvalue, visitor);
         },
+        release(local) => { visitor.visit_local_root_release(*local); },
         block(block) => {
             visit_block(block, visitor);
         },
@@ -116,6 +125,7 @@ pub(crate) fn visit_stmt_header(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
         borrow = [&],
         expr(expr) => { visit_expr(expr, visitor); },
         lvalue(lvalue) => { visit_lvalue(lvalue, visitor); },
+        release(local) => { visitor.visit_local_root_release(*local); },
         block(_block) => {},
         call(call) => { visit_call(call, visitor); },
         condition(cond) => { visit_expr(cond, visitor); }

@@ -74,6 +74,7 @@ pub(super) fn rewrite_stmts(stmts: &mut [HirStmt], pass: &mut impl HirRewritePas
 
 pub(super) fn for_each_nested_block_mut(stmt: &mut HirStmt, visit: &mut impl FnMut(&mut HirBlock)) {
     match stmt {
+        HirStmt::LocalRootRelease(_) => {}
         HirStmt::If(if_stmt) => {
             visit(&mut if_stmt.then_block);
             if let Some(else_block) = &mut if_stmt.else_block {
@@ -151,6 +152,14 @@ fn rewrite_stmt<P: HirRewritePass>(stmt: &mut HirStmt, pass: &mut P) -> bool {
         },
         lvalue(lvalue) => {
             nested_changed |= rewrite_lvalue(lvalue, pass);
+        },
+        release(local) => {
+            let mut target = HirLValue::Local(*local);
+            nested_changed |= pass.rewrite_lvalue(&mut target);
+            let HirLValue::Local(rewritten) = target else {
+                panic!("a protected local root release must retain local binding identity");
+            };
+            *local = rewritten;
         },
         block(block) => {
             nested_changed |= rewrite_block(block, pass);

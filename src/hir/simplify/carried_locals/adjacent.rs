@@ -136,6 +136,7 @@ fn stmt_is_return_shell(stmt: &HirStmt) -> bool {
         HirStmt::LocalDecl(_)
         | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
+        | HirStmt::LocalRootRelease(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)
         | HirStmt::ToBeClosed(_)
@@ -324,6 +325,11 @@ fn analyze_dominance_stmt(
     safety: HirExprSafety,
 ) -> Result<DominanceFlow, DominanceError> {
     match stmt {
+        HirStmt::LocalRootRelease(local) => Ok(DominanceFlow::fallthrough(if *local == carried {
+            states.after_write()
+        } else {
+            states
+        })),
         HirStmt::LocalDecl(local_decl) => {
             ensure_pack_is_initialized(&local_decl.values, states, carried)?;
             Ok(DominanceFlow::fallthrough(states))
@@ -564,6 +570,7 @@ fn ensure_expr_is_initialized(
 
 fn stmt_has_unstructured_control(stmt: &HirStmt) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::Goto(_) | HirStmt::Label(_) => true,
         HirStmt::If(if_stmt) => {
             if_stmt
@@ -631,6 +638,7 @@ fn rewrite_carried_local_in_stmts(
 
 fn stmt_allows_seed_to_absorb_carried(stmt: &HirStmt, seed: LocalId, carried: LocalId) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(local) => *local != seed,
         HirStmt::LocalDecl(local_decl) => {
             local_decl
                 .bindings

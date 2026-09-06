@@ -306,6 +306,7 @@ fn expr_for_fixed_call(
 
     Some(HirExpr::Call(Box::new(HirCallExpr {
         argument_roots: lowering.promotion_facts.call_argument_roots(instr_ref),
+        frame_root_ends: lowering.promotion_facts.call_frame_root_ends(instr_ref),
         callee,
         args: lower_value_pack_single_eval(lowering, block, instr_ref, call.args),
         method: matches!(call.kind, CallKind::Method),

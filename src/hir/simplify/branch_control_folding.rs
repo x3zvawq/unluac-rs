@@ -752,6 +752,7 @@ fn collect_repeat_prefix_ownership(
     ownership: &mut RepeatPrefixOwnership,
 ) {
     match stmt {
+        HirStmt::LocalRootRelease(_) => {}
         HirStmt::If(if_stmt) => {
             collect_repeat_prefix_ownership_stmts(
                 &if_stmt.then_block.stmts,
@@ -1386,6 +1387,7 @@ mod tests {
         let target = HirLabelId(3);
         let call = HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::ParamRef(ParamId(0)),
             args: HirValuePack::default(),
             method: false,

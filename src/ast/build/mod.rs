@@ -4,6 +4,7 @@
 //! value-pack 的语义恢复；前层退出要求也只读取 `HirProto::exit_requirements`，不会旁路访问
 //! StructureFacts。这里不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实，也不会把
 //! 没有等价源码语义的残余 HIR 节点拆成表面合法的 AST。
+//! LocalRootRelease 已由 HIR 证明只结束旧源码根，在此生成 local 清零，不回推 VM 覆写。
 
 mod analysis;
 mod exprs;
@@ -24,10 +25,11 @@ use self::analysis::{
 };
 use self::exprs::PackLoweringContext;
 use super::common::{
-    AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
-    AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstLabel, AstLabelId,
-    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNumericFor,
-    AstRepeat, AstReturn, AstRewriteAuthority, AstStmt, AstTargetDialect, AstWhile,
+    AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGlobalAttr,
+    AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf,
+    AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin,
+    AstModule, AstNameRef, AstNumericFor, AstRepeat, AstReturn, AstRewriteAuthority, AstStmt,
+    AstTargetDialect, AstWhile,
 };
 use super::error::AstLowerError;
 
@@ -321,6 +323,15 @@ impl<'a> AstLowerer<'a> {
                 1,
             )),
             HirStmt::Assign(assign) => Ok((self.lower_assign(proto_index, assign)?, 1)),
+            HirStmt::LocalRootRelease(local) => Ok((
+                vec![AstStmt::Assign(Box::new(AstAssign {
+                    targets: vec![AstLValue::Name(AstNameRef::Local(*local))],
+                    values: vec![AstExpr::Nil],
+                    initializer_merge_transaction: None,
+                    method_rewrite_transaction: None,
+                }))],
+                1,
+            )),
             HirStmt::TableSetList(_) => Err(AstLowerError::ResidualHir {
                 proto: proto_index,
                 kind: "table-set-list",

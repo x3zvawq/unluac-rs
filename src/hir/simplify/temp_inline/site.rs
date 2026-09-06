@@ -18,6 +18,7 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         return find_site_in_sequential_block(block, temp);
     }
     match stmt {
+        HirStmt::LocalRootRelease(_) => None,
         HirStmt::LocalDecl(local_decl) => {
             find_site_in_exprs(&local_decl.values, temp, InlineSite::Direct)
         }
@@ -292,6 +293,7 @@ struct EvalOrderProbe<'a> {
 impl EvalOrderProbe<'_> {
     fn stmt(&self, stmt: &HirStmt) -> bool {
         match stmt {
+            HirStmt::LocalRootRelease(_) => false,
             HirStmt::LocalDecl(local_decl) => self.exprs(&local_decl.values),
             HirStmt::GlobalDecl(global_decl) => self.exprs(&global_decl.values),
             HirStmt::Assign(assign) => {

@@ -199,6 +199,9 @@ pub(super) fn collect_stmt_binding_summary(
 
 pub(super) fn intern_stmt_bindings(stmt: &HirStmt, binding_index: &mut BindingIndex) {
     match stmt {
+        HirStmt::LocalRootRelease(local) => {
+            binding_index.intern(TableBinding::Local(*local));
+        }
         HirStmt::LocalDecl(local_decl) => {
             for binding in &local_decl.bindings {
                 binding_index.intern(TableBinding::Local(*binding));
@@ -361,6 +364,9 @@ struct BindingFactCollector<'a> {
 impl HirVisitor for BindingFactCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
+            HirStmt::LocalRootRelease(local) => {
+                increment_materialized_count(&mut self.materialized, TableBinding::Local(*local))
+            }
             HirStmt::LocalDecl(local_decl) => {
                 for binding in &local_decl.bindings {
                     increment_materialized_count(

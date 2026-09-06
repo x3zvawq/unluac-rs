@@ -208,6 +208,9 @@ pub(super) fn update_state_for_stmt(
 ) {
     observe_stmt(stmt, state, captures, effects, safety);
     match stmt {
+        HirStmt::LocalRootRelease(local) => {
+            BindingValue::default().install(Binding::Local(*local), state);
+        }
         HirStmt::LocalDecl(decl) => assign_bindings(
             decl.bindings.iter().copied().map(Binding::Local),
             &decl.values,
@@ -597,6 +600,7 @@ fn observe_stmt(
     safety: HirExprSafety,
 ) {
     match stmt {
+        HirStmt::LocalRootRelease(_) => {}
         HirStmt::LocalDecl(decl) => observe_pack(&decl.values, state, captures, effects, safety),
         HirStmt::GlobalDecl(decl) => observe_pack(&decl.values, state, captures, effects, safety),
         HirStmt::Assign(assign) => {

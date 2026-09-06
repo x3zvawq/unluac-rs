@@ -393,6 +393,8 @@ struct PhysicalBindingWriteCollector {
 }
 
 impl HirVisitor for PhysicalBindingWriteCollector {
+    fn visit_local_root_release(&mut self, _local: LocalId) {}
+
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(local_decl) => self
@@ -502,6 +504,7 @@ fn stmt_has_candidate_loop_transfer(stmt: &HirStmt) -> bool {
 
 fn stmt_has_nonlocal_transfer(stmt: &HirStmt, inside_nested_loop: bool) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::Return(_) => true,
         HirStmt::Break | HirStmt::Continue => !inside_nested_loop,
         HirStmt::If(if_stmt) => {
@@ -757,6 +760,7 @@ fn exact_local_writeback(stmt: &HirStmt) -> Option<(LocalId, LocalId)> {
 
 fn stmt_has_candidate_loop_continue(stmt: &HirStmt) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::Continue => true,
         HirStmt::If(if_stmt) => {
             if_stmt

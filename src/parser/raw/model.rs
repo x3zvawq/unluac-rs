@@ -354,6 +354,7 @@ pub struct RawDebugInfoCommon {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawLocalVar {
     pub name: RawString,
+    /// 与 RawInstr::pc 相同的原始坐标；Luau 为包含 AUX 的 word PC，不是指令 Vec 下标。
     pub start_pc: u32,
     pub end_pc: u32,
 }

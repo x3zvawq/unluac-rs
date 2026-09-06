@@ -63,6 +63,7 @@ fn collect_terminal_assignments<'a>(
     assignments: &mut Vec<&'a HirAssign>,
 ) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::Assign(assign) => {
             assignments.push(assign);
             true
@@ -134,6 +135,13 @@ pub(super) fn result_writes_are_standalone_seed_copies(
     }
 
     impl HirVisitor for CopyWriteCollector {
+        fn visit_local_root_release(&mut self, local: LocalId) {
+            if CarryBinding::Local(local) == self.result {
+                self.writes += 1;
+                self.valid = false;
+            }
+        }
+
         fn visit_stmt(&mut self, stmt: &HirStmt) {
             let HirStmt::Assign(assign) = stmt else {
                 return;
@@ -487,6 +495,7 @@ fn rewrite_break_exit_assignments(
             continue;
         }
         match &mut block.stmts[index] {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => {
                 rewritten |= rewrite_break_exit_assignments(&mut if_stmt.then_block, pass);
                 if let Some(else_block) = &mut if_stmt.else_block {

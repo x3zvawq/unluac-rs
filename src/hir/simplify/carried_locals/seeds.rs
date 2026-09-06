@@ -166,20 +166,8 @@ pub(super) fn rewrite_update_handoff_seed(stmt: &mut HirStmt, carried: CarryBind
 }
 
 pub(super) fn single_binding_handoff_seed(stmt: &HirStmt) -> Option<(TempId, CarryBinding)> {
-    let HirStmt::Assign(assign) = stmt else {
-        return None;
-    };
-    let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [value] = assign.values.fixed.as_slice() else {
-        return None;
-    };
-    if assign.values.tail.is_some() {
-        return None;
-    }
-    let binding = carry_binding_from_expr(value)?;
-    Some((*temp, binding))
+    let (temp, value) = stmt.scalar_temp_assignment()?;
+    Some((temp, carry_binding_from_expr(value)?))
 }
 
 #[cfg(test)]

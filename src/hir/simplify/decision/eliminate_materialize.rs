@@ -68,6 +68,7 @@ pub(super) fn extract_call_expr(
 ) -> (Vec<HirStmt>, HirCallExpr, bool) {
     let HirCallExpr {
         argument_roots,
+        frame_root_ends,
         callee,
         args,
         method,
@@ -85,6 +86,7 @@ pub(super) fn extract_call_expr(
         prefix,
         HirCallExpr {
             argument_roots,
+            frame_root_ends,
             callee,
             args,
             method,
@@ -741,6 +743,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
     };
     Some(HirCallExpr {
         argument_roots: Vec::new(),
+        frame_root_ends: call.frame_root_ends,
         callee,
         args: HirValuePack { fixed, tail },
         method: call.method,

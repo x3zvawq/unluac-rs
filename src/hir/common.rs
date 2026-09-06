@@ -397,6 +397,10 @@ pub enum HirStmt {
     LocalDecl(Box<HirLocalDecl>),
     GlobalDecl(Box<HirGlobalDecl>),
     Assign(Box<HirAssign>),
+    /// 在已证明的交接或 dispatch 终点清除源码 local 的额外 GC 根。
+    /// 只写该 LocalId，不覆盖其 provenance 中的 VM home；例如 `local new=old`
+    /// 后释放 old，不能让物理槽分析误认为 new 也已被清零。
+    LocalRootRelease(LocalId),
     TableSetList(Box<HirTableSetList>),
     ErrNil(Box<HirErrNil>),
     ToBeClosed(Box<HirToBeClosed>),
@@ -413,6 +417,23 @@ pub enum HirStmt {
     Goto(Box<HirGoto>),
     Label(Box<HirLabel>),
     Block(Box<HirBlock>),
+}
+
+impl HirStmt {
+    /// 借用单 temp、单固定 RHS、无尾包的赋值；不证明该定义可内联、删除或移动。
+    pub(crate) fn scalar_temp_assignment(&self) -> Option<(TempId, &HirExpr)> {
+        let Self::Assign(assign) = self else {
+            return None;
+        };
+        let ([HirLValue::Temp(temp)], [value], None) = (
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        ) else {
+            return None;
+        };
+        Some((*temp, value))
+    }
 }
 
 /// HIR 表达式。
@@ -585,6 +606,9 @@ pub enum HirBinaryOpKind {
 pub struct HirCallExpr {
     /// 原始参数槽交给该 call 的事实；只供 HIR 消费，不向 AST 泄漏物理槽协议。
     pub argument_roots: Vec<HirCallArgumentRoot>,
+    /// 原始 caller home 在该精确 dispatch 处结束的 call result 身份。
+    /// 此前可能已有观察；消费者须核对当前值流与 callee/参数求值顺序，不能提前释放。
+    pub(crate) frame_root_ends: Vec<TempId>,
     pub callee: HirExpr,
     pub args: HirValuePack,
     pub method: bool,

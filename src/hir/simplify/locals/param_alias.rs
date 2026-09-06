@@ -275,6 +275,7 @@ fn forward_label_indices(stmts: &[HirStmt]) -> Option<BTreeMap<crate::hir::HirLa
 fn forward_control_is_self_contained(stmts: &[HirStmt]) -> bool {
     forward_label_indices(stmts).is_some()
         && stmts.iter().all(|stmt| match stmt {
+            HirStmt::LocalRootRelease(_) => true,
             HirStmt::If(if_stmt) => {
                 forward_control_is_self_contained(&if_stmt.then_block.stmts)
                     && if_stmt
@@ -362,6 +363,7 @@ impl UnstructuredAliasFacts {
 impl HirVisitor for UnstructuredAliasFacts {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::LocalDecl(local_decl) => {
                 self.binding_reused |= local_decl.bindings.contains(&self.local);
             }
@@ -457,6 +459,9 @@ fn validate_alias_stmt(
     safety: HirExprSafety,
 ) -> Result<AliasFlow, AliasFlowError> {
     match stmt {
+        HirStmt::LocalRootRelease(_) => Ok(AliasFlow::fallthrough(evaluate_leaf_stmt(
+            stmt, local, param, states,
+        )?)),
         HirStmt::If(if_stmt) => {
             let states = evaluate_expr(&if_stmt.cond, local, param, states)?;
             let then_flow = if expr_truthiness(&if_stmt.cond, safety) == Some(false) {

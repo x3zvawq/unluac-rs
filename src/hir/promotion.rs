@@ -370,6 +370,7 @@ pub(super) struct ProtoPromotionFacts {
     argument_roots_by_call: BTreeMap<InstrRef, Vec<crate::hir::common::HirCallArgumentRoot>>,
     argument_root_producers: BTreeSet<TempId>,
     unobserved_call_result_ends: BTreeMap<TempId, TempId>,
+    frame_result_ends_by_call: BTreeMap<InstrRef, Vec<TempId>>,
     method_setup_protocols: Vec<HirMethodSetupProtocol>,
     method_setup_protocol_by_call: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
     method_setup_protocol_by_get: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
@@ -413,6 +414,17 @@ impl ProtoPromotionFacts {
         self.unobserved_call_result_ends
             .get(&temp)
             .is_some_and(|end| self.trusted_temp_home_slot(*end) == Some(home))
+    }
+
+    /// 精确 dispatch 排除的原始 caller root；当前值流和求值前缀仍由 HIR 消费者核对。
+    pub(super) fn call_frame_root_ends(&self, call: InstrRef) -> Vec<TempId> {
+        self.frame_result_ends_by_call
+            .get(&call)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|temp| self.trusted_temp_home_slot(*temp).is_some())
+            .collect()
     }
 
     pub(super) fn call_argument_roots(
@@ -479,6 +491,13 @@ impl ProtoPromotionFacts {
         Self {
             argument_roots_by_call,
             argument_root_producers,
+            frame_result_ends_by_call: call_roots::collect_frame_result_ends(
+                proto,
+                cfg,
+                dataflow,
+                slot_epochs,
+                fixed_temps,
+            ),
             unobserved_call_result_ends: call_roots::collect_unobserved_result_ends(
                 proto,
                 cfg,
@@ -546,6 +565,10 @@ impl ProtoPromotionFacts {
             .retain(|temp| !temps.contains(temp));
         self.unobserved_call_result_ends
             .retain(|producer, end| !temps.contains(producer) && !temps.contains(end));
+        self.frame_result_ends_by_call.retain(|_, roots| {
+            roots.retain(|temp| !temps.contains(temp));
+            !roots.is_empty()
+        });
     }
 
     /// 该 canonical fixed def 在所有可达前驱路径上覆盖非参数槽的入口 nil。
@@ -1277,6 +1300,7 @@ impl ProtoPromotionFacts {
         slots: &mut BTreeSet<HomeSlotKey>,
     ) {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::LocalDecl(local_decl) => {
                 for value in &local_decl.values {
                     self.collect_captured_home_slots_in_expr(value, slots);
@@ -1364,6 +1388,7 @@ impl ProtoPromotionFacts {
         slots: &mut BTreeSet<HomeSlotKey>,
     ) {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => self.collect_captured_home_slots_in_expr(&if_stmt.cond, slots),
             HirStmt::While(while_stmt) => {
                 self.collect_captured_home_slots_in_expr(&while_stmt.cond, slots);

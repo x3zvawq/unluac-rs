@@ -1066,6 +1066,7 @@ mod tests {
                             HirStmt::CallStmt(Box::new(HirCallStmt {
                                 call: HirCallExpr {
                                     argument_roots: Vec::new(),
+                                    frame_root_ends: Vec::new(),
                                     callee: HirExpr::GlobalRef(HirGlobalRef {
                                         key: "collectgarbage".into(),
                                     }),

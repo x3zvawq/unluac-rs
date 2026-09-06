@@ -17,6 +17,7 @@ use super::super::common::{
     AstUnaryOpKind,
 };
 use crate::decompile::DecompileDialect;
+use crate::value_semantics::results::LuaValueFacts;
 use crate::value_semantics::{LuaComparison, LuaLiteral, LuaValueSemantics};
 
 /// 把当前 AST 的原始字面量交给共享 Lua 值域；不从 HIR 借用改写许可。
@@ -52,18 +53,51 @@ fn primitive_literal(expr: &AstExpr) -> Option<LuaLiteral<'_>> {
 
 /// 表达式是否保证只产生布尔值。
 pub(super) fn expr_is_boolean_valued(expr: &AstExpr) -> bool {
+    value_facts(expr).is_boolean()
+}
+
+/// AST 只投影当前候选源码；正常结果规则与 HIR 共用，不沿用改写前的值快照。
+fn value_facts(expr: &AstExpr) -> LuaValueFacts {
     match expr {
-        AstExpr::Boolean(_) => true,
-        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => true,
-        AstExpr::Binary(binary) => matches!(
-            binary.op,
-            AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le
-        ),
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            expr_is_boolean_valued(&logical.lhs) && expr_is_boolean_valued(&logical.rhs)
+        AstExpr::Nil => LuaValueFacts::NIL,
+        AstExpr::Boolean(value) => LuaValueFacts::boolean(*value),
+        AstExpr::Integer(_) | AstExpr::Number(_) => LuaValueFacts::NUMERIC,
+        AstExpr::String(_) => LuaValueFacts::STRING,
+        // typed 常量节点保留原 proto 的锚点；结果惰性不授权复制 cdata 身份或构造求值。
+        AstExpr::Int64(_) | AstExpr::UInt64(_) | AstExpr::Vector(_) | AstExpr::Complex { .. } => {
+            LuaValueFacts::ANCHORED
         }
-        AstExpr::SingleValue(inner) => expr_is_boolean_valued(inner),
-        _ => false,
+        AstExpr::FunctionExpr(_) | AstExpr::TableConstructor(_) => LuaValueFacts::RESOURCE,
+        AstExpr::Unary(unary) => {
+            let operand = value_facts(&unary.expr);
+            match unary.op {
+                AstUnaryOpKind::Not => operand.logical_not(),
+                AstUnaryOpKind::Neg => operand.negated(),
+                AstUnaryOpKind::Length => operand.string_length(),
+                _ => LuaValueFacts::UNKNOWN,
+            }
+        }
+        AstExpr::Binary(binary) => match binary.op {
+            AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le => {
+                LuaValueFacts::BOOLEAN
+            }
+            AstBinaryOpKind::Add
+            | AstBinaryOpKind::Sub
+            | AstBinaryOpKind::Mul
+            | AstBinaryOpKind::Div
+            | AstBinaryOpKind::FloorDiv
+            | AstBinaryOpKind::Mod
+            | AstBinaryOpKind::Pow => {
+                value_facts(&binary.lhs).arithmetic(|| value_facts(&binary.rhs))
+            }
+            _ => LuaValueFacts::UNKNOWN,
+        },
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => value_facts(&logical.lhs)
+            .logical(matches!(expr, AstExpr::LogicalAnd(_)), || {
+                value_facts(&logical.rhs)
+            }),
+        AstExpr::SingleValue(inner) => value_facts(inner),
+        _ => LuaValueFacts::UNKNOWN,
     }
 }
 
@@ -284,79 +318,12 @@ pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {
 /// 一定是 boolean。原 bytecode initializer 的 stack-root 类别必须消费 HIR profile，
 /// 不能调用这里从 AST 形状反推。
 pub(super) fn result_cannot_root_collectable(expr: &AstExpr) -> bool {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_) => true,
-        AstExpr::Unary(unary) => matches!(unary.op, AstUnaryOpKind::Not),
-        AstExpr::Binary(binary) => matches!(
-            binary.op,
-            AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le
-        ),
-        AstExpr::LogicalAnd(logical) => result_cannot_root_collectable(&logical.rhs),
-        AstExpr::LogicalOr(logical) => {
-            result_cannot_root_collectable(&logical.lhs)
-                && result_cannot_root_collectable(&logical.rhs)
-        }
-        AstExpr::SingleValue(value) => result_cannot_root_collectable(value),
-        AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::VarArg
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_)
-        | AstExpr::Error(_) => false,
-    }
+    value_facts(expr).is_gc_inert()
 }
 
-/// 返回无需求值即可由 Lua 值种类证明的 truthiness。
+/// 由正常结果种类证明 truthiness；删除求值仍须单独检查事件。
 pub(super) fn constant_truthiness(expr: &AstExpr) -> Option<bool> {
-    match expr {
-        AstExpr::Nil => Some(false),
-        AstExpr::Boolean(value) => Some(*value),
-        AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::TableConstructor(_)
-        | AstExpr::FunctionExpr(_) => Some(true),
-        AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
-            constant_truthiness(&unary.expr).map(|value| !value)
-        }
-        AstExpr::LogicalAnd(logical) => match constant_truthiness(&logical.lhs) {
-            Some(false) => Some(false),
-            Some(true) => constant_truthiness(&logical.rhs),
-            None if constant_truthiness(&logical.rhs) == Some(false) => Some(false),
-            None => None,
-        },
-        AstExpr::LogicalOr(logical) => match constant_truthiness(&logical.lhs) {
-            Some(true) => Some(true),
-            Some(false) => constant_truthiness(&logical.rhs),
-            None if constant_truthiness(&logical.rhs) == Some(true) => Some(true),
-            None => None,
-        },
-        AstExpr::SingleValue(expr) => constant_truthiness(expr),
-        AstExpr::Unary(_)
-        | AstExpr::Binary(_)
-        | AstExpr::Var(_)
-        | AstExpr::FieldAccess(_)
-        | AstExpr::IndexAccess(_)
-        | AstExpr::Call(_)
-        | AstExpr::MethodCall(_)
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => None,
-    }
+    value_facts(expr).truthiness()
 }
 
 pub(super) fn is_access_base_inline_expr(expr: &AstExpr) -> bool {

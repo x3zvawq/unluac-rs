@@ -1,9 +1,9 @@
 -- regress_40_branch_state_and_short_prefix_escape#1: branch state 初值要物化，必达字段操作数可收回
 -- unluac: expect-not-contains [[unluac error]]
--- generic-for 下一轮调用不保留 result 槽；r1_3 明确保留本轮对象的物理根。
--- unluac: expect-contains [[local r1_4 = r1_1]]
--- unluac: expect-contains [[r1_3 = r1_7]]
--- unluac: expect-contains [[r1_4, r1_5 = r1_7, r1_7.w * r1_7.h]]
+-- RHS 求值期间由 loop binding 保活 mode；写回后由外层 target 跨下一轮调用保活。
+-- 同路径的匿名副本不再承担独有 root，无需要求它继续物化。
+-- unluac: expect-contains [[local r1_3 = r1_1]]
+-- unluac: expect-contains [[r1_3, r1_4 = r1_6, r1_6.w * r1_6.h]]
 
 local function choose_mode(fullscreen, width, height, handler)
     local selected, current, modes = handler:getCurrentMode()

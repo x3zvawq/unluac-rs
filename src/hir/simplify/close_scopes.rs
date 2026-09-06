@@ -766,6 +766,7 @@ struct BindingActivityCollector {
 impl HirVisitor for BindingActivityCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         let locals: &[LocalId] = match stmt {
+            HirStmt::LocalRootRelease(_) => &[],
             HirStmt::LocalDecl(decl) => &decl.bindings,
             HirStmt::NumericFor(for_stmt) => std::slice::from_ref(&for_stmt.binding),
             HirStmt::GenericFor(for_stmt) => &for_stmt.bindings,

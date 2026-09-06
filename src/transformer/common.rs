@@ -62,6 +62,7 @@ pub enum DebugLocalKind {
 pub struct DebugLocalFact {
     pub name: RawString,
     pub reg: Reg,
+    /// 作用域首条原始指令执行前的位置；该指令的重绑定不属于 local 初始化。
     pub start_pc: u32,
     pub end_pc: u32,
     pub kind: DebugLocalKind,

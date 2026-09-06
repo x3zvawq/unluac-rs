@@ -106,6 +106,7 @@ pub(crate) fn lower_raw_table_set_call(
     // 同 raw read，不把 VM primitive 伪装成会触发 `__newindex` 的普通赋值。
     HirCallExpr {
         argument_roots: Vec::new(),
+        frame_root_ends: Vec::new(),
         callee: unresolved_expr("LuaJIT raw table write has no exact Lua source form"),
         args: vec![
             lower_access_base_expr(lowering, block, instr_ref, base),
@@ -264,6 +265,7 @@ pub(crate) fn lower_raw_table_get_expr_single_eval(
 fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
     HirExpr::Call(Box::new(HirCallExpr {
         argument_roots: Vec::new(),
+        frame_root_ends: Vec::new(),
         callee: unresolved_expr("LuaJIT raw table read has no exact Lua source form"),
         args: vec![base, key].into(),
         method: false,

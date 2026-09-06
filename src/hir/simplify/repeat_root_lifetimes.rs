@@ -181,6 +181,7 @@ fn install_repeat_condition_lifetime_facts(
     let mut changed = false;
     for stmt in &mut block.stmts {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => {
                 changed |= install_repeat_condition_lifetime_facts(&mut if_stmt.then_block, facts);
                 if let Some(else_block) = &mut if_stmt.else_block {
@@ -235,6 +236,7 @@ fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<Binding> {
     let mut bindings = BTreeSet::new();
     for stmt in &block.stmts {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::LocalDecl(decl) => {
                 bindings.extend(decl.bindings.iter().copied().map(Binding::Local))
             }

@@ -715,6 +715,12 @@ fn write_for_bindings_effect(bindings: HirForBindings<'_>, state: &mut EffectSta
 
 fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &EffectContext<'_>) {
     match stmt {
+        HirStmt::LocalRootRelease(local) => state.write_binding(
+            Binding::Local(*local),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        ),
         HirStmt::LocalDecl(decl) => {
             let snapshot = state.clone();
             note_effect_pack_escapes(&decl.values, state, context);

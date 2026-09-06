@@ -208,6 +208,9 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
 
     for stmt in &block.stmts {
         match stmt {
+            HirStmt::LocalRootRelease(local) => {
+                let _ = writeln!(output, "{indent}release-local-root l{}", local.index());
+            }
             HirStmt::LocalDecl(local_decl) => {
                 let _ = writeln!(
                     output,

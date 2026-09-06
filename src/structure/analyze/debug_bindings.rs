@@ -60,23 +60,12 @@ pub(super) fn ssa_value_at_debug_scope_entry(
     }
     let block = cfg.instr_to_block[instr.index()];
     let start = cfg.blocks[block.index()].instrs.start.index();
-    let mut value = dataflow
+    // 归一化 start_pc 指向作用域首条指令执行前；该指令可能立即重绑定 local。
+    // 例如 `local a,b=f(); a,b=nil,nil`，b 的入口仍是 call result，不能改取后续 nil Def。
+    dataflow
         .last_fixed_def_in_range(reg, start..instr.index())
         .map_or_else(
             || dataflow.block_entry_value(block, reg),
             super::super::SsaValue::Def,
-        );
-    // Luau 等格式可把 local.start_pc 直接指向初始化指令；这时作用域入口看到的是
-    // 该指令完成后的值。PUC Lua 常把 start_pc 放在初始化之后，或像 SETLIST 一样
-    // 指向不重定义 binding 的最后一步，两种情况都继续使用上面的 reaching value。
-    if proto
-        .lowering_map
-        .pc_map()
-        .get(instr.index())
-        .is_some_and(|pcs| pcs.contains(&start_pc))
-        && let Some(def) = dataflow.instr_def_for_reg(instr, reg)
-    {
-        value = super::super::SsaValue::Def(def);
-    }
-    value
+        )
 }

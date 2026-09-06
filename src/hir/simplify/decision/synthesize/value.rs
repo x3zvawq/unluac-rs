@@ -286,6 +286,7 @@ mod tests {
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,

@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 pub(super) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &HirExpr) {
     match stmt {
+        HirStmt::LocalRootRelease(_) => {}
         HirStmt::LocalDecl(local_decl) => {
             replace_temp_in_value_pack(&mut local_decl.values, temp, replacement);
         }
@@ -87,6 +88,7 @@ pub(super) fn replace_temps_in_stmt(
     replacements: &BTreeMap<TempId, HirExpr>,
 ) -> usize {
     match stmt {
+        HirStmt::LocalRootRelease(_) => 0,
         HirStmt::LocalDecl(local_decl) => {
             replace_temps_in_value_pack(&mut local_decl.values, replacements)
         }

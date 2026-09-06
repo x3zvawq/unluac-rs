@@ -4,6 +4,7 @@
 //! 例如 `a = f(); b = a; c = b` 只保存一次三个别名；覆盖 a 只结束 a 的事务，
 //! b、c 仍可选出另一个根。观察优先选择已观察的最低 home，否则选择最低可用 home。
 //! 潜在事件排除仅由显式 GC 证明的 copy home；显式 fence 另记是否已物化当前代表。
+//! 不符合根保护资格的 home 仍传播确值身份，但不参与观察代表选择或签发释放事务。
 
 use super::{ActiveCallRoot, BTreeMap, BTreeSet, CallValueId, HomeSlotKey, TempId, TempUseEvents};
 
@@ -21,6 +22,7 @@ pub(super) struct CallValues<'a> {
 
 #[derive(Default)]
 struct CallValue {
+    active_homes: usize,
     aliases: BTreeSet<TempId>,
     live_aliases_by_home: BTreeMap<HomeSlotKey, usize>,
     // false 排在前面，对应已经观察过的 home；第二关键字保持原最低 home 规则。
@@ -86,7 +88,7 @@ impl<'a> CallValues<'a> {
         self.by_temp
             .get(&temp)
             .map(|(value, _)| *value)
-            .filter(|value| !self.values[value.0].representatives.is_empty())
+            .filter(|value| self.values[value.0].active_homes != 0)
     }
 
     pub(super) fn aliases(&self, value: CallValueId) -> &BTreeSet<TempId> {
@@ -143,10 +145,6 @@ impl<'a> CallValues<'a> {
         self.roots.get(home)
     }
 
-    pub(super) fn keys(&self) -> impl Iterator<Item = &HomeSlotKey> {
-        self.roots.keys()
-    }
-
     pub(super) fn homes(&self, value: CallValueId) -> impl Iterator<Item = &HomeSlotKey> {
         self.values[value.0]
             .representatives
@@ -161,8 +159,11 @@ impl<'a> CallValues<'a> {
         );
         let value = root.value_id;
         let state = &mut self.values[value.0];
-        state.representatives.insert((!root.observed, home));
-        if !root.explicit_fence_only {
+        state.active_homes += 1;
+        if root.eligible {
+            state.representatives.insert((!root.observed, home));
+        }
+        if root.eligible && !root.explicit_fence_only {
             state
                 .ordinary_representatives
                 .insert((!root.observed, home));
@@ -171,18 +172,10 @@ impl<'a> CallValues<'a> {
         self.refresh_pending(value);
     }
 
-    pub(super) fn continue_home(&mut self, home: HomeSlotKey, index: usize) -> &ActiveCallRoot {
-        let root = self
-            .roots
-            .get_mut(&home)
-            .expect("continued call home must remain active");
-        root.continuations.push(index);
-        root
-    }
-
     pub(super) fn remove(&mut self, home: &HomeSlotKey) -> Option<ActiveCallRoot> {
         let root = self.roots.remove(home)?;
         let state = &mut self.values[root.value_id.0];
+        state.active_homes -= 1;
         state.representatives.remove(&(!root.observed, *home));
         state
             .ordinary_representatives

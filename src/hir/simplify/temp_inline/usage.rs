@@ -1,27 +1,10 @@
-//! 这个子模块负责 temp-inline pass 的候选识别和使用计数摘要。
+//! 这个子模块负责 temp-inline pass 的定义与使用计数摘要。
 //!
-//! 它依赖 HIR 当前 stmt 序列，只回答“这一句是不是 `temp = expr` 候选”以及语句树对 temp
-//! 的使用次数，不会在这里改写任何节点。
-//! 例如：`t0 = a.b` 若整棵 proto 只消费一次 `t0`，这里会把它标成可继续审查的候选。
+//! 它依赖 HIR 当前 stmt 序列，只记录 temp 的定义数量、debug 身份与语句树中的读取次数，
+//! 不会在这里改写任何节点。例如 `t0 = a.b` 的读取计数为一时，inline owner 可继续审查
+//! 该定义的求值顺序与生命周期，不能仅凭计数删除它。
 
 use super::*;
-
-pub(super) fn inline_candidate(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
-    let HirStmt::Assign(assign) = stmt else {
-        return None;
-    };
-    let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [value] = assign.values.fixed.as_slice() else {
-        return None;
-    };
-    if assign.values.tail.is_some() {
-        return None;
-    }
-
-    Some((*temp, value))
-}
 
 pub(super) enum TempUseSummary {
     Empty,
@@ -161,6 +144,7 @@ pub(super) fn collect_expr_temp_uses_summary(
 
 fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
     match stmt {
+        HirStmt::LocalRootRelease(_) => {}
         HirStmt::LocalDecl(local_decl) => {
             for value in &local_decl.values {
                 collect_expr_temp_uses(value, scratch);
@@ -342,6 +326,7 @@ pub(super) fn max_temp_index_in_block(block: &HirBlock) -> Option<usize> {
 
 fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
     match stmt {
+        HirStmt::LocalRootRelease(_) => None,
         HirStmt::LocalDecl(local_decl) => local_decl
             .values
             .iter()

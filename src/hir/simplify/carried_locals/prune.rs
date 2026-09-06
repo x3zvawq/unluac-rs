@@ -152,6 +152,7 @@ fn prune_dead_for_binding_temp_mirrors_in_block(
 
     for mut stmt in old_stmts {
         let nested_changed = match &mut stmt {
+            HirStmt::LocalRootRelease(_) => false,
             HirStmt::NumericFor(numeric_for) => {
                 let mut child_for_bindings = active_for_bindings.clone();
                 child_for_bindings.insert(numeric_for.binding);
@@ -439,6 +440,7 @@ fn collect_temp_write_audit_in_block(
 ) {
     for stmt in &block.stmts {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::Assign(assign) => {
                 note_assign_writes(assign, promotion_facts, active_for_bindings, audit)
             }

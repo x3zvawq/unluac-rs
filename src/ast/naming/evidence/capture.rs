@@ -55,6 +55,7 @@ fn collect_capture_evidence_in_stmt(
                 expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; }
             );
         },
+        release(_local) => {},
         block(b) => { collect_capture_evidence_in_block(function, b, hir, evidence)?; },
         call(c) => {
             traverse_hir_call_children!(

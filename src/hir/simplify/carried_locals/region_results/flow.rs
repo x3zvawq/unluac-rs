@@ -433,6 +433,16 @@ impl FlowVerifier {
         }
         match kind {
             HirFlowNodeKind::Stmt(stmt) => match stmt {
+                HirStmt::LocalRootRelease(local) => {
+                    // nil 只更新逻辑端点，不同步具有相同 VM home 的另一个 binding。
+                    return Some(if CarryBinding::Local(*local) == self.result {
+                        RelationSet::only(Relation::Pending)
+                    } else if CarryBinding::Local(*local) == self.state {
+                        RelationSet::only(Relation::Unproduced)
+                    } else {
+                        states
+                    });
+                }
                 HirStmt::Assign(assign) => return self.validate_assign(assign, states),
                 HirStmt::If(branch) => self.validate_expr(&branch.cond, states)?,
                 HirStmt::While(loop_stmt) => self.validate_expr(&loop_stmt.cond, states)?,

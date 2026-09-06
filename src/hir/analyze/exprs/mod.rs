@@ -67,6 +67,7 @@ pub(super) fn lower_closure_expr(
     if let Some(factory) = lowering.shared_closure_replacement(instr_ref) {
         return HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::LocalRef(lowering.shared_factory_local(factory)),
             args: Default::default(),
             method: false,
@@ -230,6 +231,9 @@ fn pack_tail_for_open_def(
             };
             Some(HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
                 argument_roots: lowering.promotion_facts.call_argument_roots(open_def.instr),
+                frame_root_ends: lowering
+                    .promotion_facts
+                    .call_frame_root_ends(open_def.instr),
                 callee,
                 args: if single_eval {
                     lower_value_pack_single_eval(

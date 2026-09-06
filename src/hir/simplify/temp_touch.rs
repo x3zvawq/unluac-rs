@@ -42,6 +42,7 @@ pub(super) fn stmt_consumes_temps_only_in_control_head(
     temps: &BTreeSet<TempId>,
 ) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::If(if_stmt) => {
             expr_touches_any_temp(&if_stmt.cond, temps)
                 && !stmts_touch_any_temp(&if_stmt.then_block.stmts, temps)
@@ -90,6 +91,7 @@ pub(super) fn stmt_consumes_temps_only_in_control_head(
 
 pub(super) fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::If(if_stmt) => {
             block_contains_nonlocal_control(&if_stmt.then_block)
                 || if_stmt

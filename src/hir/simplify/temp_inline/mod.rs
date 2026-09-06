@@ -84,7 +84,7 @@ use self::site::{
 };
 use self::usage::{
     TempUseScratch, TempUseSummary, collect_expr_temp_uses_summary, collect_stmt_temp_uses,
-    inline_candidate, max_temp_index_in_block,
+    max_temp_index_in_block,
 };
 use super::label_refs::count_label_references;
 use super::mention::{
@@ -338,6 +338,21 @@ impl TempInlineWorkspace<'_> {
         let call_roots =
             collect_call_root_lifetimes(&snapshot, facts, self.roots, false, |_| true, |_| true);
         let mut marked = call_roots.marked_stmts(stmts.len());
+        let mut dispatch_operands = BTreeSet::new();
+        for (index, stmt) in stmts.iter().enumerate() {
+            // locals 会原子物化普通多返回组；其任一结果的确切覆盖都必须留在原 home，
+            // 即使该槽自身没有触发保活。否则 nil forwarding 会让物化后的 sibling 无终点
+            // （regress_509）。generic initializer 仍由专属 owner 消费整包。
+            marked[index] |= call_roots.owner_overwrites(index).any(|owner| {
+                matches!(&stmts[owner.root_index()], HirStmt::Assign(assign)
+                    if assign.targets.len() > 1 && assign.generic_for_initializer_producer.is_none())
+            });
+            if call_roots.call_dispatch_releases(index).next().is_some() {
+                collect_stmt_temp_uses(stmt, &mut self.uses).for_each(|temp, _| {
+                    dispatch_operands.insert(temp);
+                });
+            }
+        }
         let lookup_roots =
             collect_lookup_gc_root_lifetimes(&snapshot, facts, self.roots.safety, |_| true);
         lookup_roots.mark_stmts(&mut marked);
@@ -350,8 +365,11 @@ impl TempInlineWorkspace<'_> {
         }
         for (index, stmt) in stmts.iter().enumerate() {
             if !marked[index]
-                && inline_candidate(stmt).is_some_and(|(temp, _)| {
-                    facts.is_copy_root_endpoint(temp)
+                && stmt.scalar_temp_assignment().is_some_and(|(temp, _)| {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：regress_509 的 lookup 必须先于
+                    // dispatch root release；locals 安装释放位置前不能收回操作数求值点。
+                    dispatch_operands.contains(&temp)
+                        || facts.is_copy_root_endpoint(temp)
                         || self
                             .physical_root_temps
                             .get(temp.index())
@@ -513,18 +531,20 @@ fn inline_temps_in_block(
         .rev()
     {
         let preserves_table_initialization =
-            inline_candidate(&stmt).is_some_and(|(temp, value)| {
+            stmt.scalar_temp_assignment().is_some_and(|(temp, value)| {
                 kept_rev.last().is_some_and(|sink| {
                     crate::hir::table_layout::inline_changes_table_initialization(sink, temp, value)
                 })
             });
         if preserves_table_initialization {
-            let (temp, _) = inline_candidate(&stmt).expect("checked table operand producer");
+            let (temp, _) = stmt
+                .scalar_temp_assignment()
+                .expect("checked table operand producer");
             changed |= workspace
                 .inline_dispositions
                 .preserve_temp(temp, HirInlineRetentionReason::TableInitialization);
         }
-        if let Some((temp, _)) = inline_candidate(&stmt)
+        if let Some((temp, _)) = stmt.scalar_temp_assignment()
             && temp_rebinds_captured_slot(
                 temp,
                 facts,
@@ -539,7 +559,7 @@ fn inline_temps_in_block(
                 .inline_dispositions
                 .preserve_temp(temp, HirInlineRetentionReason::CapturedValueEpoch);
         }
-        if let Some((temp, value)) = inline_candidate(&stmt)
+        if let Some((temp, value)) = stmt.scalar_temp_assignment()
             // 候选拒绝[SemanticBarrier:TableShape]：regress_471 的常量字段会触发模板裁尾，改变 #table。
             && !preserves_table_initialization
             // 候选拒绝[SemanticBarrier:Lifetime]：被 physical-root lifetime 标记的 call/lookup 结果仍承担 VM root；提前删除会改变对象存活期（regress_356）。
@@ -650,13 +670,12 @@ fn inline_temps_in_block(
         }
 
         // FASTCALL fallback callee 在参数后物化，收回 callee 后仍可按协议折叠相邻末参数；普通调用保留原顺序屏障。
-        callee_materialized_at =
-            kept_rev
-                .last()
-                .and_then(inline_candidate)
-                .and_then(|(next_temp, _)| {
-                    fastcall_callee_materialization_precedes_temp(&stmt, next_temp).then_some(index)
-                });
+        callee_materialized_at = kept_rev
+            .last()
+            .and_then(HirStmt::scalar_temp_assignment)
+            .and_then(|(next_temp, _)| {
+                fastcall_callee_materialization_precedes_temp(&stmt, next_temp).then_some(index)
+            });
         kept_rev.push(stmt);
     }
 
@@ -901,10 +920,12 @@ fn inline_adjacent_call_root_expression_overwrites(
         else {
             continue;
         };
-        let Some((root, HirExpr::Call(call))) = inline_candidate(&block.stmts[root_index]) else {
+        let Some((root, HirExpr::Call(call))) = block.stmts[root_index].scalar_temp_assignment()
+        else {
             continue;
         };
-        let Some((target, overwrite)) = inline_candidate(&block.stmts[overwrite_index]) else {
+        let Some((target, overwrite)) = block.stmts[overwrite_index].scalar_temp_assignment()
+        else {
             continue;
         };
         if root == target {
@@ -1187,7 +1208,7 @@ fn inline_eager_condition_materialization_run(
 
     let mut positions = BTreeMap::new();
     for index in run_start..run_end {
-        let Some((temp, value)) = inline_candidate(&block.stmts[index]) else {
+        let Some((temp, value)) = block.stmts[index].scalar_temp_assignment() else {
             return false;
         };
         if !condition_materialization_value_is_supported(value)
@@ -1201,7 +1222,8 @@ fn inline_eager_condition_materialization_run(
     }
 
     for (&temp, &position) in &positions {
-        let (_, value) = inline_candidate(&block.stmts[position])
+        let (_, value) = block.stmts[position]
+            .scalar_temp_assignment()
             .expect("condition materialization position must retain its scalar definition");
         let mut dependencies_precede = true;
         collect_expr_temp_uses_summary(value, proof.scratch).for_each(|dependency, _| {
@@ -1220,7 +1242,8 @@ fn inline_eager_condition_materialization_run(
     let mut rewritten_sink = block.stmts[run_end].clone();
     let mut removed_temps = Vec::with_capacity(run_end - run_start);
     for index in (run_start..run_end).rev() {
-        let (temp, value) = inline_candidate(&block.stmts[index])
+        let (temp, value) = block.stmts[index]
+            .scalar_temp_assignment()
             .expect("condition materialization run must retain scalar definitions");
         if collect_stmt_temp_uses(&rewritten_sink, proof.scratch).count(temp) != 1 {
             // Every producer must belong to the dependency closure of the eager call. This also
@@ -1292,7 +1315,7 @@ fn inline_pure_materialization_run(
     let mut replacements = BTreeMap::new();
     let mut positions = BTreeMap::new();
     for index in run_start..run_end {
-        let Some((temp, value)) = inline_candidate(&block.stmts[index]) else {
+        let Some((temp, value)) = block.stmts[index].scalar_temp_assignment() else {
             return false;
         };
         // 候选拒绝[SemanticBarrier:Lifetime]：alias 链节点有额外 use 时不能随 run 整段删除。
@@ -1427,13 +1450,14 @@ fn inline_materialization_runs(
     let mut index = 0;
 
     while index < block.stmts.len() {
-        if inline_candidate(&block.stmts[index]).is_none() {
+        if block.stmts[index].scalar_temp_assignment().is_none() {
             index += 1;
             continue;
         }
         let run_start = index;
         let mut run_end = run_start + 1;
-        while run_end < block.stmts.len() && inline_candidate(&block.stmts[run_end]).is_some() {
+        while run_end < block.stmts.len() && block.stmts[run_end].scalar_temp_assignment().is_some()
+        {
             run_end += 1;
         }
         if matches!(scope, TempInlineScope::All)
@@ -1514,20 +1538,21 @@ fn inline_materialization_runs(
         // 同一 canonical temp 可能由 loop-state coalescing 产生多个 def；直接调用读取的
         // 是 run 内最后一次写入，较早 producer 不属于本次融合事务。
         let Some(callee_index) = (run_start..run_end).rfind(|candidate_index| {
-            inline_candidate(&block.stmts[*candidate_index])
+            block.stmts[*candidate_index]
+                .scalar_temp_assignment()
                 .is_some_and(|(candidate, _)| candidate == callee_temp)
         }) else {
             index = run_end + 1;
             continue;
         };
-        let Some((_, callee_value)) = inline_candidate(&block.stmts[callee_index]) else {
+        let Some((_, callee_value)) = block.stmts[callee_index].scalar_temp_assignment() else {
             index = run_end + 1;
             continue;
         };
         let callee_value = callee_value.clone();
         let terminal_candidate = block.stmts[..run_end]
             .last()
-            .and_then(inline_candidate)
+            .and_then(HirStmt::scalar_temp_assignment)
             .map(|(temp, _)| temp);
         if !scope.allows_call(
             call_stmt,
@@ -1595,7 +1620,7 @@ fn inline_materialization_runs(
         let mut method_receiver_pair_seen = false;
         let mut complete_run = true;
         for candidate_index in ((callee_index + 1)..run_end).rev() {
-            let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
+            let Some((temp, value)) = block.stmts[candidate_index].scalar_temp_assignment() else {
                 complete_run = false;
                 break;
             };
@@ -1782,7 +1807,7 @@ fn materialization_run_preserves_forwarded_temp_owner(
         if offset == candidate_offset {
             return true;
         }
-        let Some((target, _)) = inline_candidate(stmt) else {
+        let Some((target, _)) = stmt.scalar_temp_assignment() else {
             return false;
         };
         facts
@@ -2106,6 +2131,7 @@ fn root_nil_pack_gap_preserves_slots_with_context(
         }
     }
     match stmt {
+        HirStmt::LocalRootRelease(_) => true,
         HirStmt::Assign(assign) => {
             // 候选拒绝[SemanticBarrier:EvalOrder]：`t=nil; t=x; return t` 若跨过同槽写，会错误恢复成 `return nil`。
             assign.targets.iter().all(|target| {
@@ -2394,7 +2420,8 @@ fn inline_numeric_for_stable_header_aliases(
     let mut rewritten_sink = block.stmts[run_end].clone();
     let mut last_def_indices = vec![None; proof.scratch.temp_count()];
     for candidate_index in run_start..run_end {
-        let (temp, _) = inline_candidate(&block.stmts[candidate_index])
+        let (temp, _) = block.stmts[candidate_index]
+            .scalar_temp_assignment()
             .expect("numeric-for materialization run must contain only scalar temp definitions");
         last_def_indices[temp.index()] = Some(candidate_index);
     }
@@ -2403,7 +2430,7 @@ fn inline_numeric_for_stable_header_aliases(
         if removed_stmts[candidate_index] {
             continue;
         }
-        let Some((temp, value)) = inline_candidate(&block.stmts[candidate_index]) else {
+        let Some((temp, value)) = block.stmts[candidate_index].scalar_temp_assignment() else {
             continue;
         };
         if last_def_indices[temp.index()] != Some(candidate_index) {
@@ -2499,7 +2526,8 @@ fn materialization_run_preserves_value_reads(
         return true;
     }
     block.stmts[later_run].iter().all(|stmt| {
-        let (target, _) = inline_candidate(stmt)
+        let (target, _) = stmt
+            .scalar_temp_assignment()
             .expect("numeric-for materialization run must contain only scalar temp definitions");
         if expr_touches_temp(value, target) {
             return false;
@@ -2567,7 +2595,7 @@ fn numeric_for_binding_header_alias_plan(
     live_use_counts: &[usize],
     proof: &NumericForHeaderProof<'_>,
 ) -> Option<NumericForBindingHeaderAliasPlan> {
-    let (sink_temp, _) = inline_candidate(&block.stmts[sink_temp_index])?;
+    let (sink_temp, _) = block.stmts[sink_temp_index].scalar_temp_assignment()?;
     let sink_captured_slots = proof
         .captured_slots_before_stmt
         .get(run.end)
@@ -2575,7 +2603,7 @@ fn numeric_for_binding_header_alias_plan(
     let mut chain = Vec::new();
     let mut current_index = sink_temp_index;
     let (replacement, source_homes, source_temp, source_requires_event_free_gap, source_index) = loop {
-        let (temp, value) = inline_candidate(&block.stmts[current_index])?;
+        let (temp, value) = block.stmts[current_index].scalar_temp_assignment()?;
         if total_use_count(temp, live_use_counts) != 1 || expr_touches_temp(value, temp) {
             // 候选拒绝[SemanticBarrier:Lifetime]：链节点有额外 use 或自写时，删除整条快照链会丢失仍可观察的值或状态更新。
             return None;
@@ -2608,7 +2636,8 @@ fn numeric_for_binding_header_alias_plan(
             }
             HirExpr::TempRef(source) => {
                 if let Some(source_index) = (run.start..current_index).rfind(|index| {
-                    inline_candidate(&block.stmts[*index])
+                    block.stmts[*index]
+                        .scalar_temp_assignment()
                         .is_some_and(|(candidate, _)| candidate == *source)
                 }) {
                     current_index = source_index;
@@ -2650,7 +2679,8 @@ fn numeric_for_binding_header_alias_plan(
         if chain_indices.contains(&stmt_index) {
             continue;
         }
-        let (target, value) = inline_candidate(&block.stmts[stmt_index])
+        let (target, value) = block.stmts[stmt_index]
+            .scalar_temp_assignment()
             .expect("numeric-for materialization run must contain only scalar temp definitions");
         if source_temp == Some(target) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：链外状态准备按同一 HIR identity
@@ -2730,7 +2760,7 @@ fn inline_open_return_fixed_alias_run(
         .iter()
         .zip(&ret.values.fixed)
     {
-        let Some((target, HirExpr::TempRef(source))) = inline_candidate(stmt) else {
+        let Some((target, HirExpr::TempRef(source))) = stmt.scalar_temp_assignment() else {
             return false;
         };
         if !matches!(fixed, HirExpr::TempRef(temp) if *temp == target)
@@ -2778,7 +2808,7 @@ fn inline_open_return_fixed_alias_run(
     }
 
     for stmt in &block.stmts[(run_start + alias_count)..run_end] {
-        let Some((target, _)) = inline_candidate(stmt) else {
+        let Some((target, _)) = stmt.scalar_temp_assignment() else {
             return false;
         };
         if target_temps.contains(&target) || source_temps.contains(&target) {
@@ -2806,7 +2836,7 @@ fn inline_open_return_fixed_alias_run(
         .zip(&mut ret.values.fixed)
         .enumerate()
     {
-        let Some((target, HirExpr::TempRef(source))) = inline_candidate(stmt) else {
+        let Some((target, HirExpr::TempRef(source))) = stmt.scalar_temp_assignment() else {
             unreachable!("validated fixed-prefix alias must remain scalar")
         };
         *fixed = HirExpr::TempRef(*source);
@@ -2845,7 +2875,7 @@ impl OrderSensitiveDefWorkspace {
             self.defs[temp.index()] = None;
         }
         for (index, stmt) in stmts.iter().enumerate() {
-            let Some((temp, value)) = inline_candidate(stmt) else {
+            let Some((temp, value)) = stmt.scalar_temp_assignment() else {
                 continue;
             };
             if !expr_observes_eval_order(value) {
@@ -2933,6 +2963,7 @@ fn inline_temps_in_nested_blocks(
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::If(if_stmt) => {
             let mut changed = inline_temps_in_block(
                 &mut if_stmt.then_block,
@@ -3057,7 +3088,12 @@ fn inline_repeat_head_scalar_temp(
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
-    let Some((temp, _)) = repeat_stmt.body.stmts.first().and_then(inline_candidate) else {
+    let Some((temp, _)) = repeat_stmt
+        .body
+        .stmts
+        .first()
+        .and_then(HirStmt::scalar_temp_assignment)
+    else {
         return false;
     };
     // 这里的 producer 已由 structure fact 证明是 continue 重定位出的 latch prefix；
@@ -3087,7 +3123,12 @@ fn inline_repeat_head_scalar_temp_with_proven_prefix(
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
-    let Some((temp, value)) = repeat_stmt.body.stmts.first().and_then(inline_candidate) else {
+    let Some((temp, value)) = repeat_stmt
+        .body
+        .stmts
+        .first()
+        .and_then(HirStmt::scalar_temp_assignment)
+    else {
         return false;
     };
     // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
@@ -3344,6 +3385,10 @@ impl DirectBindingWriteCollector<'_> {
 }
 
 impl HirVisitor for DirectBindingWriteCollector<'_> {
+    fn visit_local_root_release(&mut self, local: crate::hir::common::LocalId) {
+        self.identities.locals.insert(local);
+    }
+
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(decl) => {
@@ -3445,7 +3490,7 @@ fn inline_repeat_tail_temp(
     let Some(tail_index) = repeat_stmt.body.stmts.len().checked_sub(1) else {
         return false;
     };
-    let Some((temp, value)) = inline_candidate(&repeat_stmt.body.stmts[tail_index]) else {
+    let Some((temp, value)) = repeat_stmt.body.stmts[tail_index].scalar_temp_assignment() else {
         return false;
     };
     // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
@@ -3592,6 +3637,7 @@ mod tests {
         };
         ret.values.tail = Some(HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef { key: "tail".into() }),
             args: HirValuePack::default(),
             method: false,
@@ -3630,6 +3676,7 @@ mod tests {
                         vec![HirExpr::TempRef(TempId(0)), HirExpr::TempRef(TempId(1))],
                         HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
                             argument_roots: Vec::new(),
+                            frame_root_ends: Vec::new(),
                             callee: HirExpr::GlobalRef(HirGlobalRef { key: "tail".into() }),
                             args: HirValuePack::default(),
                             method: false,
@@ -3657,6 +3704,7 @@ mod tests {
         HirStmt::CallStmt(Box::new(crate::hir::common::HirCallStmt {
             call: HirCallExpr {
                 argument_roots: Vec::new(),
+                frame_root_ends: Vec::new(),
                 callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
                 args: HirValuePack::default(),
                 method: false,
@@ -3689,6 +3737,7 @@ mod tests {
     fn normal_call(callee: HirExpr, args: Vec<HirExpr>) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee,
             args: HirValuePack::fixed(args),
             method: false,
@@ -4061,6 +4110,7 @@ mod tests {
         assert!(!site.allows(
             &HirExpr::Call(Box::new(HirCallExpr {
                 argument_roots: Vec::new(),
+                frame_root_ends: Vec::new(),
                 callee: HirExpr::GlobalRef(HirGlobalRef { key: "f".into() }),
                 args: HirValuePack::default(),
                 method: false,
@@ -4296,6 +4346,7 @@ mod tests {
         let empty_slots = BTreeSet::new();
         let call = HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "produce".into(),
             }),
@@ -4475,6 +4526,7 @@ mod tests {
                 targets: vec![HirLValue::Temp(TempId(2))],
                 values: HirValuePack::fixed(vec![HirExpr::Call(Box::new(HirCallExpr {
                     argument_roots: Vec::new(),
+                    frame_root_ends: Vec::new(),
                     callee: HirExpr::GlobalRef(HirGlobalRef {
                         key: "resource".into(),
                     }),
@@ -4789,6 +4841,7 @@ mod tests {
 
         let dynamic_call = HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "next_start".into(),
             }),
@@ -5013,6 +5066,7 @@ mod tests {
 
         let dynamic = block(HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "mutate_source".into(),
             }),
@@ -5033,6 +5087,7 @@ mod tests {
         };
         numeric_for.start = HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef {
                 key: "mutate_source".into(),
             }),

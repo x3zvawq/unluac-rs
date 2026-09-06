@@ -490,6 +490,7 @@ fn stmt_writes_binding_only_via_direct_writeback(
     target_temp: TempId,
 ) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(local) => binding != CarryBinding::Local(*local),
         HirStmt::Assign(assign) => {
             if assign.values.tail.is_some() || assign.targets.len() != assign.values.fixed.len() {
                 return !assign

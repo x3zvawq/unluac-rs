@@ -30,6 +30,7 @@ pub(super) fn remove_planned_stmts(
         path.push(PathComponent::Stmt(index));
         index += 1;
         let body = match stmt {
+            HirStmt::LocalRootRelease(_) => None,
             HirStmt::If(if_stmt) => {
                 path.push(PathComponent::Then);
                 remove_planned_stmts(&mut if_stmt.then_block, path, plan);

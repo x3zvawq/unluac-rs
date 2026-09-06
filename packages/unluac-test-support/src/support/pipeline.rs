@@ -776,6 +776,7 @@ fn hir_block_contains_global_decl(block: &unluac::hir::HirBlock) -> bool {
         HirStmt::GenericFor(for_stmt) => hir_block_contains_global_decl(&for_stmt.body),
         HirStmt::Block(block) => hir_block_contains_global_decl(block),
         HirStmt::LocalDecl(_)
+        | HirStmt::LocalRootRelease(_)
         | HirStmt::Assign(_)
         | HirStmt::TableSetList(_)
         | HirStmt::ErrNil(_)

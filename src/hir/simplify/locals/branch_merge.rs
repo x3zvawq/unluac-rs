@@ -108,17 +108,10 @@ pub(super) fn definite_if_arm_temp_writes(stmt: &HirStmt) -> Option<[TempId; 2]>
 }
 
 fn single_scalar_temp_write(block: &HirBlock) -> Option<TempId> {
-    let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+    let [stmt] = block.stmts.as_slice() else {
         return None;
     };
-    let ([HirLValue::Temp(temp)], [_], None) = (
-        assign.targets.as_slice(),
-        assign.values.fixed.as_slice(),
-        &assign.values.tail,
-    ) else {
-        return None;
-    };
-    Some(*temp)
+    stmt.scalar_temp_assignment().map(|(temp, _)| temp)
 }
 
 fn summarize_block_fallthrough_assignments(

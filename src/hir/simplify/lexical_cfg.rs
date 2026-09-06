@@ -686,6 +686,9 @@ impl<'a> HirFlowGraphBuilder<'a> {
         loop_targets: HirLoopTargets,
     ) -> Option<HirFlowNodeId> {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {
+                Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), [next]))
+            }
             HirStmt::Label(label) => {
                 let node = self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), [next]);
                 let location = OwnerLabelLocation {

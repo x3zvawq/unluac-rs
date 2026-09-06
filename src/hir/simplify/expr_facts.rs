@@ -6,7 +6,8 @@
 
 use crate::hir::common::HirExpr;
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::value_facts::{HirValueFacts, value_facts, value_facts_with};
+use crate::hir::value_facts::{value_facts, value_facts_with};
+use crate::value_semantics::results::LuaValueFacts;
 
 pub(in crate::hir) fn expr_truthiness(expr: &HirExpr, safety: HirExprSafety) -> Option<bool> {
     value_facts_with(expr, &|value| comparison_facts(value, safety)).truthiness()
@@ -20,7 +21,7 @@ pub(super) fn expr_truthiness_assuming(
 ) -> Option<bool> {
     value_facts_with(expr, &|value| {
         if value == subject {
-            Some(HirValueFacts::assuming_truthiness(subject_truthy))
+            Some(LuaValueFacts::assuming_truthiness(subject_truthy))
         } else {
             comparison_facts(value, safety)
         }
@@ -28,13 +29,13 @@ pub(super) fn expr_truthiness_assuming(
     .truthiness()
 }
 
-fn comparison_facts(expr: &HirExpr, safety: HirExprSafety) -> Option<HirValueFacts> {
+fn comparison_facts(expr: &HirExpr, safety: HirExprSafety) -> Option<LuaValueFacts> {
     let HirExpr::Binary(binary) = expr else {
         return None;
     };
     safety
         .primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
-        .map(HirValueFacts::boolean)
+        .map(LuaValueFacts::boolean)
 }
 
 pub(super) fn expr_is_boolean_valued(expr: &HirExpr) -> bool {

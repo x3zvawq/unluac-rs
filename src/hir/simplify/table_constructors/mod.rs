@@ -1002,6 +1002,12 @@ impl TableConstructorPass<'_> {
                 return false;
             }
             match stmt {
+                HirStmt::LocalRootRelease(local) => {
+                    let released = TableBinding::Local(*local);
+                    seed_aliases.remove(&released);
+                    seed_carriers.remove(&released);
+                    fresh_tables.remove(&released);
+                }
                 HirStmt::LocalDecl(decl) => {
                     if decl.bindings.contains(&seed_local) && stmt_index != seed_index {
                         // A second declaration of the seed binding would create a new lexical
@@ -2118,6 +2124,7 @@ fn exprs_open_tail_residuals<'a>(
 
 fn debug_prefix_stmt_is_inert(stmt: &HirStmt) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => true,
         HirStmt::LocalDecl(decl) => {
             decl.values.tail.is_none() && decl.values.fixed.iter().all(debug_prefix_expr_is_inert)
         }
@@ -2268,6 +2275,7 @@ fn stmt_has_table_constructor_candidate(stmt: &HirStmt) -> bool {
     }
 
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::If(if_stmt) => {
             block_has_table_constructor_candidate(&if_stmt.then_block)
                 || if_stmt
@@ -2594,6 +2602,7 @@ mod tests {
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
@@ -3759,6 +3768,7 @@ mod tests {
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: HirCallExpr {
                         argument_roots: Vec::new(),
+                        frame_root_ends: Vec::new(),
                         callee: HirExpr::GlobalRef(HirGlobalRef {
                             key: "install_metatable".into(),
                         }),
@@ -3920,6 +3930,7 @@ mod tests {
                 HirStmt::CallStmt(Box::new(HirCallStmt {
                     call: HirCallExpr {
                         argument_roots: Vec::new(),
+                        frame_root_ends: Vec::new(),
                         callee: HirExpr::GlobalRef(HirGlobalRef {
                             key: "install_metatable".into(),
                         }),
@@ -4003,6 +4014,7 @@ mod tests {
                         base: HirExpr::LocalRef(owner),
                         key: HirExpr::Call(Box::new(HirCallExpr {
                             argument_roots: Vec::new(),
+                            frame_root_ends: Vec::new(),
                             callee: HirExpr::GlobalRef(HirGlobalRef {
                                 key: "install_and_key".into(),
                             }),

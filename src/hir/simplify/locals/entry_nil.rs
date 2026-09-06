@@ -319,6 +319,7 @@ impl EntryNilAnalyzer<'_> {
             self.analyze_unstructured_block(block, &prefix).map(|_| ())
         };
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => {
                 analyze(&if_stmt.then_block, PathComponent::Then)?;
                 if let Some(else_block) = &if_stmt.else_block {
@@ -354,6 +355,11 @@ impl EntryNilAnalyzer<'_> {
         states: NilStates,
     ) -> Result<NilFlow, PruneError> {
         match stmt {
+            HirStmt::LocalRootRelease(local) => Ok(NilFlow::fallthrough(if *local == self.local {
+                states.set_known_nil(true)
+            } else {
+                states
+            })),
             HirStmt::Assign(assign) => {
                 let states = self.evaluate_stmt_exprs(stmt, states)?;
                 if is_direct_nil_write(assign, self.local) {

@@ -223,6 +223,7 @@ fn remove_dead_entry_nil_writes_from_acyclic_prefixes(
             break;
         }
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => {
                 changed |= remove_dead_entry_nil_writes_from_acyclic_prefixes(
                     &mut if_stmt.then_block,
@@ -415,7 +416,7 @@ fn collect_copy_root_assignment_sites(
                     | HirLValue::Global(_) => {}
                 }
             }
-            if let Some((temp, value)) = single_temp_assignment(stmt) {
+            if let Some((temp, value)) = stmt.scalar_temp_assignment() {
                 let site = sites.entry(temp).or_default();
                 site.value = Some(value.clone());
                 if !live_reads.contains(&temp) {
@@ -484,6 +485,7 @@ fn straight_line_suffix_is_gc_inert_to_return(suffix: &[HirStmt], safety: HirExp
 
 fn for_each_copy_root_child_block(stmt: &HirStmt, visit: &mut impl FnMut(&HirBlock, u8)) {
     match stmt {
+        HirStmt::LocalRootRelease(_) => {}
         HirStmt::If(if_stmt) => {
             visit(&if_stmt.then_block, 0);
             if let Some(else_block) = &if_stmt.else_block {
@@ -599,7 +601,7 @@ fn preserve_adjacent_dead_physical_overwrites(
         else {
             continue;
         };
-        let Some((previous, previous_value)) = single_temp_assignment(&block.stmts[index - 1])
+        let Some((previous, previous_value)) = block.stmts[index - 1].scalar_temp_assignment()
         else {
             continue;
         };
@@ -640,19 +642,6 @@ fn preserve_adjacent_dead_physical_overwrites(
         changed = true;
     }
     changed
-}
-
-fn single_temp_assignment(stmt: &HirStmt) -> Option<(TempId, &HirExpr)> {
-    let HirStmt::Assign(assign) = stmt else {
-        return None;
-    };
-    let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [value] = assign.values.fixed.as_slice() else {
-        return None;
-    };
-    assign.values.tail.is_none().then_some((*temp, value))
 }
 
 fn remove_dead_entry_nil_writes_from_root_prefix(
@@ -732,7 +721,7 @@ fn adjacent_same_value_visible_handoff(
     let [first, HirStmt::Assign(second)] = pair else {
         return None;
     };
-    let (temp, first_value) = single_temp_assignment(first)?;
+    let (temp, first_value) = first.scalar_temp_assignment()?;
     let [second_value] = second.values.fixed.as_slice() else {
         return None;
     };
@@ -758,6 +747,7 @@ fn adjacent_same_value_visible_handoff(
 
 fn root_prefix_scan_can_cross(stmt: &HirStmt) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => true,
         HirStmt::LocalDecl(_)
         | HirStmt::GlobalDecl(_)
         | HirStmt::Assign(_)
@@ -1058,6 +1048,10 @@ struct VisibleHomeWriteCollector<'a> {
 }
 
 impl HirVisitor for VisibleHomeWriteCollector<'_> {
+    fn visit_local_root_release(&mut self, local: LocalId) {
+        self.written |= matches!(self.binding, VisibleBinding::Local(binding) if binding == local);
+    }
+
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.written |= match lvalue {
             HirLValue::Param(param) => {
@@ -1287,6 +1281,7 @@ mod tests {
                     producer,
                     HirExpr::Call(Box::new(HirCallExpr {
                         argument_roots: Vec::new(),
+                        frame_root_ends: Vec::new(),
                         callee: HirExpr::ParamRef(ParamId(0)),
                         args: HirValuePack::default(),
                         method: false,

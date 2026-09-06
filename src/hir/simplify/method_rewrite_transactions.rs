@@ -387,6 +387,8 @@ impl WatchedHomeWriteCollector<'_> {
 }
 
 impl crate::hir::visit::HirVisitor for WatchedHomeWriteCollector<'_> {
+    fn visit_local_root_release(&mut self, _local: crate::hir::common::LocalId) {}
+
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::LocalDecl(decl) = stmt {
             for local in &decl.bindings {

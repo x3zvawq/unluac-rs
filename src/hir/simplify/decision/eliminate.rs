@@ -83,6 +83,7 @@ fn eliminate_stmt(
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, bool) {
     match stmt {
+        HirStmt::LocalRootRelease(_) => (vec![stmt], false),
         HirStmt::LocalDecl(local_decl)
             if local_decl.bindings.len() == 1
                 && local_decl.values.tail.is_none()
@@ -346,6 +347,7 @@ fn repeat_continue_precedes_condition_local(block: &HirBlock, condition: &HirExp
 
 fn stmt_has_current_owner_continue(stmt: &HirStmt) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::Continue => true,
         HirStmt::If(if_stmt) => {
             if_stmt
@@ -386,6 +388,7 @@ fn repeat_continue_crosses_live_nested_scope(
     let mut local_root_is_live = false;
     for stmt in &block.stmts {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::Continue if inherited_live_scope || (!repeat_body && local_root_is_live) => {
                 return true;
             }
@@ -439,6 +442,7 @@ fn materialize_repeat_continues(
 ) {
     for stmt in &mut block.stmts {
         match stmt {
+            HirStmt::LocalRootRelease(_) => {}
             HirStmt::Continue => {
                 let condition_scope =
                     materialize_condition_into_flag(condition.clone(), flag, state, safety);
@@ -646,6 +650,7 @@ mod tests {
                     crate::hir::common::HirCallStmt {
                         call: crate::hir::common::HirCallExpr {
                             argument_roots: Vec::new(),
+                            frame_root_ends: Vec::new(),
                             callee: global("body"),
                             args: crate::hir::common::HirValuePack::default(),
                             method: false,

@@ -7,6 +7,7 @@
 //! 可变遍历不会把 value-pack tail 暴露成 `&mut HirExpr`：固定值仍按普通表达式遍历，
 //! tail 只能进入 Call 内部，因而任何 pass 都无法把其根节点改成非 Call/VarArg。
 //! closure 边保留完整 capture，不把 ByReference cell 与 ByValue snapshot 都降成普通读取。
+//! source-only root release 单独暴露 LocalId；可变遍历可更新身份，不能降成 VM home 写。
 
 macro_rules! traverse_hir_value_pack_children {
     (
@@ -266,6 +267,7 @@ macro_rules! traverse_hir_stmt_children {
         expr($expr:ident) => $on_expr:block,
         $(tail_call($tail_call:ident) => $on_tail_call:block,)?
         lvalue($lvalue:ident) => $on_lvalue:block,
+        release($release:ident) => $on_release:block,
         block($block:ident) => $on_block:block,
         call($call:ident) => $on_call:block,
         condition($cond:ident) => $on_cond:block
@@ -298,6 +300,7 @@ macro_rules! traverse_hir_stmt_children {
                     $(, call($tail_call) => $on_tail_call)?
                 );
             }
+            crate::hir::HirStmt::LocalRootRelease($release) => $on_release,
             crate::hir::HirStmt::TableSetList(set_list) => {
                 {
                     let $expr = $($borrow)+ set_list.base;

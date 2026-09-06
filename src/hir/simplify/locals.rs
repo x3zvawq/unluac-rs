@@ -57,8 +57,8 @@ use super::mention::{
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
-    CallRootLifetimeIndices, LookupGcRootLifetimeIndices, RootLifetimeFacts,
-    collect_call_result_local_roots, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
+    CallRootLifetimeIndices, RootLifetimeFacts, collect_call_result_local_roots,
+    collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes, exact_multi_call_home_targets,
     stmt_has_argument_root_handoff,
 };
 use super::temp_touch::{
@@ -186,12 +186,20 @@ struct PromotionPlan {
     init: PromotionInit,
     action: PromotionAction,
     batch_empty_decl: bool,
+    /// 在已证明的声明交接后或调用 dispatch 前结束旧源码根，保持原求值边界。
+    root_release: Option<(usize, RootRelease)>,
 }
 
 #[derive(Debug, Clone)]
 enum PromotionInit {
     FromAssign(HirValuePack),
     Empty,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RootRelease {
+    Before(LocalId),
+    After(LocalId),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -334,6 +342,7 @@ impl PlanAllocator<'_> {
             init,
             action: PromotionAction::AllocateLocal,
             batch_empty_decl: false,
+            root_release: None,
         });
     }
 
@@ -343,34 +352,16 @@ impl PlanAllocator<'_> {
         home_slot: HomeSlotKey,
         temp: TempId,
     ) -> LocalId {
-        let local = LocalId(*self.next_local_index);
-        *self.next_local_index += 1;
-        self.new_locals.push(local);
-        self.new_local_debug_hints.push(
-            self.temp_debug_locals
-                .get(temp.index())
-                .cloned()
-                .unwrap_or_default(),
-        );
-        self.new_local_debug_scopes.push(
-            self.temp_debug_scopes
-                .get(temp.index())
-                .copied()
-                .unwrap_or_default(),
-        );
-        self.reserved_temps.insert(temp);
-        self.promoted_bindings.push((temp, local));
-        self.plans.push(PromotionPlan {
+        self.allocate_local(
             decl_index,
-            local,
-            home_slot: Some(home_slot),
-            temps: BTreeSet::from([temp]),
-            removable_aliases: BTreeSet::new(),
-            init: PromotionInit::Empty,
-            action: PromotionAction::AllocateLocal,
-            batch_empty_decl: true,
-        });
-        local
+            Some(home_slot),
+            BTreeSet::from([temp]),
+            BTreeSet::new(),
+            PromotionInit::Empty,
+        );
+        let plan = self.plans.last_mut().unwrap();
+        plan.batch_empty_decl = true;
+        plan.local
     }
 
     fn reuse_existing_local(
@@ -396,6 +387,7 @@ impl PlanAllocator<'_> {
             init,
             action: PromotionAction::ReuseExistingLocal,
             batch_empty_decl: false,
+            root_release: None,
         });
     }
 }
@@ -465,6 +457,19 @@ fn promote_block_with_protection(
             grouped
         },
     );
+    let mut root_releases = BTreeMap::<usize, Vec<RootRelease>>::new();
+    for (index, local) in plans.iter().filter_map(|plan| plan.root_release) {
+        root_releases.entry(index).or_default().push(local);
+    }
+    let append_root_releases = |index, before: bool, stmts: &mut Vec<HirStmt>| {
+        if let Some(releases) = root_releases.get(&index) {
+            stmts.extend(releases.iter().filter_map(|release| match *release {
+                RootRelease::Before(local) if before => Some(HirStmt::LocalRootRelease(local)),
+                RootRelease::After(local) if !before => Some(HirStmt::LocalRootRelease(local)),
+                _ => None,
+            }));
+        }
+    };
     let removable = plans
         .iter()
         .flat_map(|plan| plan.removable_aliases.iter().copied())
@@ -472,13 +477,14 @@ fn promote_block_with_protection(
 
     let mut changed = !plans.is_empty();
     let mut mapping = Rc::clone(inherited);
-    let mut slot_candidates = inherited_sticky_slots.clone();
+    let mut current_slot_locals = inherited_sticky_slots.clone();
     let mut active_sticky_slots = inherited_sticky_slots.clone();
     let original_stmts = std::mem::take(&mut block.stmts);
     let mut rewritten = Vec::with_capacity(original_stmts.len());
 
     for (index, mut stmt) in original_stmts.into_iter().enumerate() {
         temp_refs.enter_stmt(index);
+        append_root_releases(index, true, &mut rewritten);
         let mut replaced_stmt = false;
         let mut batched_decl_output_index = None;
         if let Some(plans) = plan_by_decl.get(&index) {
@@ -525,7 +531,7 @@ fn promote_block_with_protection(
                 if let Some(slot) = plan.home_slot
                     && matches!(plan.action, PromotionAction::AllocateLocal)
                 {
-                    slot_candidates.insert(slot, plan.local);
+                    current_slot_locals.insert(slot, plan.local);
                 }
                 replaced_stmt |= plan_replaces_original_stmt(plan);
             }
@@ -533,10 +539,11 @@ fn promote_block_with_protection(
         activate_captured_slots_in_stmt(
             &stmt,
             ctx.facts,
-            &slot_candidates,
+            &current_slot_locals,
             &mut active_sticky_slots,
         );
         if replaced_stmt {
+            append_root_releases(index, false, &mut rewritten);
             temp_refs.leave_stmt(index);
             continue;
         }
@@ -574,6 +581,7 @@ fn promote_block_with_protection(
             continue;
         }
         rewritten.push(stmt);
+        append_root_releases(index, false, &mut rewritten);
         temp_refs.leave_stmt(index);
     }
 
@@ -591,6 +599,17 @@ fn promote_block_with_protection(
     PromotionResult {
         changed,
         trailing_mapping: mapping,
+    }
+}
+
+/// 新资源的声明与 TBC activation 是同一入口事务；释放旧根必须在完整入口之后。
+fn root_handoff_end(block: &HirBlock, declaration: usize) -> usize {
+    if let Some(HirStmt::ToBeClosed(tbc)) = block.stmts.get(declaration + 1)
+        && tbc.declaration(&block.stmts[declaration]).is_some()
+    {
+        declaration + 1
+    } else {
+        declaration
     }
 }
 
@@ -701,32 +720,91 @@ fn collect_plans(
         linear_prefix_end,
         suffix_dominance: suffix_dominance.as_deref(),
         facts,
-        call_roots: &call_root_lifetimes,
-        lookup_roots: &lookup_gc_root_lifetimes,
+        closed_root_homes: suffix_dominance.as_ref().map_or_else(BTreeSet::new, |_| {
+            call_root_lifetimes
+                .closed_roots_before(linear_prefix_end)
+                .chain(lookup_gc_root_lifetimes.closed_roots_before(linear_prefix_end))
+                .map(|owner| (owner.root_index(), owner.home()))
+                .collect()
+        }),
         safety: ctx.roots.safety,
     };
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
-    let mut slot_candidates = inherited_sticky_slots.clone();
+    // 当前词法身份独立于 compaction 资格：受保护的 debug local 仍须接收后续同 scope 清零。
+    let mut current_slot_locals = inherited_sticky_slots.clone();
     let mut sticky_slots = inherited_sticky_slots.clone();
-    let mut physical_root_locals_by_home = BTreeMap::<(usize, HomeSlotKey), LocalId>::new();
+    let mut unavailable_for_compaction = BTreeSet::new();
+    let mut materialized_owner_locals = BTreeMap::<(usize, HomeSlotKey), LocalId>::new();
     for (decl_index, stmt) in block.stmts.iter().enumerate() {
         if reserved_alias_indices.contains(&decl_index) {
-            activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+            activate_captured_slots_in_stmt(stmt, facts, &current_slot_locals, &mut sticky_slots);
             continue;
         }
 
-        activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+        activate_captured_slots_in_stmt(stmt, facts, &current_slot_locals, &mut sticky_slots);
+
+        for owner in call_root_lifetimes.call_dispatch_releases(decl_index) {
+            let Some(local) = materialized_owner_locals
+                .get(&(owner.root_index(), owner.home()))
+                .copied()
+            else {
+                continue;
+            };
+            plans.push(PromotionPlan {
+                decl_index,
+                local,
+                home_slot: None,
+                temps: BTreeSet::new(),
+                removable_aliases: BTreeSet::new(),
+                init: PromotionInit::Empty,
+                action: PromotionAction::ReuseExistingLocal,
+                batch_empty_decl: false,
+                root_release: Some((decl_index, RootRelease::Before(local))),
+            });
+            ctx.physical_root_locals.insert(local);
+            current_slot_locals.remove(&owner.home());
+        }
+
+        if let HirStmt::LocalDecl(decl) = stmt
+            && let [local] = decl.bindings.as_slice()
+            && let Some(owner) = call_root_lifetimes.continuation_owner(decl_index)
+            && let Some(old_local) = materialized_owner_locals
+                .get(&(owner.root_index(), owner.home()))
+                .copied()
+            && old_local != *local
+        {
+            // 捕获 owner 已在前层建立声明；消费其同值交接事实，保留原 declaration 与 capture cell。
+            plans.push(PromotionPlan {
+                decl_index,
+                local: *local,
+                home_slot: Some(owner.home()),
+                temps: BTreeSet::new(),
+                removable_aliases: BTreeSet::new(),
+                init: PromotionInit::Empty,
+                action: PromotionAction::ReuseExistingLocal,
+                batch_empty_decl: false,
+                root_release: Some((
+                    root_handoff_end(block, decl_index),
+                    RootRelease::After(old_local),
+                )),
+            });
+            ctx.physical_root_locals.extend([old_local, *local]);
+            materialized_owner_locals.insert((owner.root_index(), owner.home()), *local);
+            current_slot_locals.insert(owner.home(), *local);
+            unavailable_for_compaction.insert(*local);
+            continue;
+        }
 
         let mut separate_call_move_homes = false;
-        if let Some(root_temp) = simple_temp_assign_target(stmt)
+        if let Some((root_temp, _)) = stmt.scalar_temp_assignment()
             && let Some(handoffs) = call_move_root_handoffs(
                 block,
                 decl_index,
                 root_temp,
                 facts,
                 &call_root_lifetimes,
-                &physical_root_locals_by_home,
+                &materialized_owner_locals,
             )
         {
             separate_call_move_homes = true;
@@ -736,8 +814,9 @@ fn collect_plans(
             // 半数匹配后提交，否则会把同一个 VM overwrite transaction 拆开。
             for handoff in handoffs {
                 if call_root_lifetimes.is_root(handoff.alias_index) {
-                    physical_root_locals_by_home
+                    materialized_owner_locals
                         .insert((handoff.alias_index, handoff.home), handoff.local);
+                    ctx.physical_root_locals.insert(handoff.local);
                 }
                 let mut allocator = PlanAllocator {
                     temp_debug_locals,
@@ -767,8 +846,13 @@ fn collect_plans(
         let has_grouped_targets = matches!(stmt, HirStmt::If(_))
             || matches!(stmt, HirStmt::Assign(assign) if assign.targets.len() > 1);
         let physical_root_pairs = call_root_lifetimes
-            .overwrite_pairs(decl_index)
-            .filter(|_| has_grouped_targets)
+            .owner_overwrites(decl_index)
+            .filter(|pair| {
+                has_grouped_targets
+                    && (call_root_lifetimes.owner_is_preserved(*pair)
+                        || materialized_owner_locals
+                            .contains_key(&(pair.root_index(), pair.home())))
+            })
             .map(|pair| (pair.root_index(), pair.home()))
             .chain(
                 lookup_gc_root_lifetimes
@@ -779,7 +863,7 @@ fn collect_plans(
         let physical_root_handoffs = physical_root_pairs
             .iter()
             .map(|(root_index, home)| {
-                let local = physical_root_locals_by_home
+                let local = materialized_owner_locals
                     .get(&(*root_index, *home))
                     .copied()
                     .unwrap_or_else(|| {
@@ -812,6 +896,7 @@ fn collect_plans(
             debug_scope_locals: ctx.debug_scope_locals,
         };
         for (temps, home, local) in physical_root_handoffs {
+            ctx.physical_root_locals.insert(local);
             // 原 scalar/parallel-nil/branch 语句继续留在原位；这里只把已证明 home 的
             // 全部 target 原子映射到既有 root local，不重新求值 RHS。
             allocator.reuse_existing_local(
@@ -822,13 +907,14 @@ fn collect_plans(
                 BTreeSet::new(),
                 PromotionInit::Empty,
             );
+            materialized_owner_locals.insert((decl_index, home), local);
             if call_root_lifetimes.is_root(decl_index)
                 || lookup_gc_root_lifetimes.is_root(decl_index)
             {
                 // A scalar overwrite can terminate one physical-root transaction and produce
                 // the next one in the same local. Preserve that chained owner for its later pair.
-                physical_root_locals_by_home.insert((decl_index, home), local);
-                slot_candidates.retain(|_, candidate| *candidate != local);
+                ctx.physical_root_locals.insert(local);
+                unavailable_for_compaction.insert(local);
             }
         }
 
@@ -852,7 +938,7 @@ fn collect_plans(
                     continue;
                 };
                 let group = BTreeSet::from([*temp]);
-                if slot_candidates.get(&home) != Some(&local)
+                if current_slot_locals.get(&home) != Some(&local)
                     || outer_uses_temp(*temp)
                     || temp_touches.has_before(temp, decl_index)
                     || has_label_flow
@@ -871,38 +957,27 @@ fn collect_plans(
                     BTreeSet::new(),
                     PromotionInit::Empty,
                 );
+                materialized_owner_locals.insert((decl_index, home), local);
             }
         }
 
         let call_root_homes = call_root_lifetimes
             .root_homes(decl_index)
             .collect::<BTreeSet<_>>();
-        if !call_root_homes.is_empty()
-            && let HirStmt::Assign(assign) = stmt
-            && assign.targets.len() > 1
+        if let Some(targets) = exact_multi_call_home_targets(stmt, facts)
+            && (!call_root_homes.is_empty()
+                || !matches!(stmt, HirStmt::Assign(assign) if assign.generic_for_initializer_producer.is_some()))
+            && (!has_label_flow || !call_root_homes.is_empty())
+            && targets.iter().all(|(temp, _)| {
+                !ctx.to_be_closed_temps.contains(temp)
+                    && !outer_uses_temp(*temp)
+                    && !temp_touches.has_before(temp, decl_index)
+                    && !stmt_temp_reads[decl_index].contains(temp)
+            })
         {
-            let targets = assign
-                .targets
-                .iter()
-                .map(|target| {
-                    let HirLValue::Temp(temp) = target else {
-                        panic!("multi-call root producer must retain only temp targets");
-                    };
-                    let home = facts
-                        .trusted_temp_home_slot(*temp)
-                        .expect("multi-call root producer target must retain its trusted home");
-                    (*temp, home)
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                targets
-                    .iter()
-                    .map(|(_, home)| *home)
-                    .collect::<BTreeSet<_>>()
-                    .len(),
-                targets.len(),
-                "multi-call root producer homes must stay distinct"
-            );
+            // 完整返回组共用一次求值；只物化其中一个目标会丢失其余目标的后续 home 端点。
+            // TBC 仍由资源声明 owner 消费整组协议；普通分组不越过尚未证明的 label/backedge。
+
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
                 temp_debug_scopes,
@@ -918,33 +993,30 @@ fn collect_plans(
                 debug_scope_locals: ctx.debug_scope_locals,
             };
             for (temp, home) in targets {
-                let existing_local = inherited.get(&temp).copied().or_else(|| {
-                    physical_root_locals_by_home
-                        .get(&(decl_index, home))
-                        .copied()
-                });
+                let existing_local = inherited
+                    .get(&temp)
+                    .copied()
+                    .or_else(|| materialized_owner_locals.get(&(decl_index, home)).copied());
                 let local = if let Some(local) = existing_local {
                     local
-                } else if allocator.reserved_temps.contains(&temp) {
-                    allocator
-                        .plans
-                        .iter()
-                        .rev()
-                        .find(|plan| plan.decl_index == decl_index && plan.temps.contains(&temp))
-                        .map(|plan| plan.local)
-                        .expect("reserved multi-call target must retain its promotion owner")
                 } else {
+                    assert!(
+                        !allocator.reserved_temps.contains(&temp),
+                        "reserved multi-call target must retain its promotion owner"
+                    );
                     allocator.allocate_batched_empty_local(decl_index, home, temp)
                 };
+                materialized_owner_locals.insert((decl_index, home), local);
+                current_slot_locals.insert(home, local);
                 if call_root_homes.contains(&home) {
-                    physical_root_locals_by_home.insert((decl_index, home), local);
-                    slot_candidates.retain(|_, candidate| *candidate != local);
+                    ctx.physical_root_locals.insert(local);
+                    unavailable_for_compaction.insert(local);
                 }
             }
             continue;
         }
 
-        let Some(root_temp) = simple_temp_assign_target(stmt) else {
+        let Some((root_temp, _)) = stmt.scalar_temp_assignment() else {
             continue;
         };
         if inherited.contains_key(&root_temp) || reserved_temps.contains(&root_temp) {
@@ -1027,28 +1099,49 @@ fn collect_plans(
             .and_then(|home| lookup_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
             .map(|pair| (pair.root_index(), pair.home()));
         let preceding_call_root = home_slot
-            .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))
+            .and_then(|home| {
+                call_root_lifetimes
+                    .owner_overwrites(decl_index)
+                    .find(|owner| {
+                        owner.home() == home
+                            && (call_root_lifetimes.owner_is_preserved(*owner)
+                                || materialized_owner_locals
+                                    .contains_key(&(owner.root_index(), home)))
+                    })
+            })
             .or_else(|| {
                 (!separate_call_move_homes)
                     .then(|| call_root_lifetimes.unambiguous_overwrite_pair(decl_index))
                     .flatten()
             })
             .map(|pair| (pair.root_index(), pair.home()));
-        let preceding_physical_root = preceding_call_root.or(preceding_lookup_root).or_else(|| {
-            call_root_lifetimes
-                .root_for_protected(decl_index)
-                .zip(home_slot)
+        let continuation_owner = call_root_lifetimes.continuation_owner(decl_index);
+        let continuation_local = continuation_owner.and_then(|owner| {
+            materialized_owner_locals
+                .get(&(owner.root_index(), owner.home()))
+                .copied()
         });
-        let preceding_physical_root_local =
-            preceding_physical_root.and_then(|(root, root_home)| {
-                physical_root_locals_by_home
-                    .get(&(root, root_home))
-                    .copied()
-            });
+        // 新 debug scope 与 TBC owner 保留独立声明入口；同值交接不从匿名 root 的保活资格反推身份。
+        let release_local = continuation_local.filter(|_| {
+            sticky_local.is_none()
+                && debug_local.is_none()
+                && (debug_scope_for_temp_group(temp_debug_scopes, &group).is_some()
+                    || group
+                        .iter()
+                        .any(|temp| ctx.to_be_closed_temps.contains(temp)))
+        });
+        let preceding_physical_root = preceding_call_root.or(preceding_lookup_root).or_else(|| {
+            continuation_owner
+                .filter(|owner| call_root_lifetimes.owner_is_preserved(*owner))
+                .map(|owner| (owner.root_index(), owner.home()))
+        });
+        let preceding_physical_root_local = preceding_physical_root
+            .and_then(|owner| materialized_owner_locals.get(&owner).copied());
         let force_physical_root_local = group_has_physical_root
             || call_root_lifetimes.is_root(decl_index)
             || lookup_gc_root_lifetimes.is_root(decl_index)
-            || preceding_physical_root_local.is_some();
+            || preceding_physical_root_local.is_some()
+            || release_local.is_some();
         if sticky_local.is_none()
             && debug_local.is_none()
             && !force_physical_root_local
@@ -1075,14 +1168,19 @@ fn collect_plans(
             // 根（regress_342）；这里不重建字段、原始参数协议或内联求值顺序。
             continue;
         }
-        let reusable_local = sticky_local
-            .or(debug_local)
-            .or(preceding_physical_root_local)
-            .or_else(|| {
-                ctx.compact_home_slots
-                    .then(|| home_slot.and_then(|slot| slot_candidates.get(&slot).copied()))
-                    .flatten()
-            });
+        let reusable_local = if release_local.is_some() {
+            None
+        } else {
+            sticky_local
+                .or(debug_local)
+                .or(preceding_physical_root_local)
+                .or_else(|| {
+                    ctx.compact_home_slots
+                        .then(|| home_slot.and_then(|slot| current_slot_locals.get(&slot).copied()))
+                        .flatten()
+                        .filter(|local| !unavailable_for_compaction.contains(local))
+                })
+        };
 
         if sticky_local.is_none()
             && !force_physical_root_local
@@ -1175,28 +1273,47 @@ fn collect_plans(
                 .expect("allocated promotion plan must exist")
                 .local;
             if let Some(slot) = home_slot {
-                slot_candidates.insert(slot, local);
+                current_slot_locals.insert(slot, local);
             }
             if ctx.facts.is_direct_table_seed_temp(root_temp) {
                 allocator.direct_seed_promotions.push((root_temp, local));
             }
             local
         };
+        if let Some(old_local) = release_local {
+            allocator.plans.last_mut().unwrap().root_release = Some((
+                root_handoff_end(block, decl_index),
+                RootRelease::After(old_local),
+            ));
+            let owner = continuation_owner.unwrap();
+            // 替换当前 owner 后，旧 local 仍须保留其精确 nil 端点，不能从保护集合中消失。
+            ctx.physical_root_locals.insert(old_local);
+            ctx.physical_root_locals.insert(selected_local);
+            materialized_owner_locals.insert((owner.root_index(), owner.home()), selected_local);
+        }
         let collected_root =
             call_root_lifetimes.is_root(decl_index) || lookup_gc_root_lifetimes.is_root(decl_index);
-        if (collected_root || group_has_physical_root)
-            && let Some(home) = home_slot
-        {
+        if let Some(home) = home_slot {
             // Root ownership is keyed by both producer epoch and physical home. A value may be
             // copied through several homes; indexing only by its producer would let a later
             // endpoint reuse an unrelated local and collapse callee/argument identities.
-            physical_root_locals_by_home.insert((decl_index, home), selected_local);
+            materialized_owner_locals.insert((decl_index, home), selected_local);
         }
-        if collected_root || (group_has_physical_root && home_slot.is_some()) {
+        if collected_root
+            || (group_has_physical_root && home_slot.is_some())
+            || preceding_physical_root_local.is_some()
+        {
+            ctx.physical_root_locals.insert(selected_local);
+        }
+        if collected_root
+            || (group_has_physical_root && home_slot.is_some())
+            || (continuation_owner.is_some() && preceding_physical_root_local.is_some())
+            || release_local.is_some()
+        {
             // This local must stay dedicated to the root result until its proven physical
             // overwrite partner reuses it. Home-slot compaction may otherwise lend the same
             // source local to a simultaneously-live value before that overwrite occurs.
-            slot_candidates.retain(|_, candidate| *candidate != selected_local);
+            unavailable_for_compaction.insert(selected_local);
         } else if let Some(home) = home_slot
             && let Some((_, root_home)) = preceding_call_root.or(preceding_lookup_root)
             && root_home == home
@@ -1204,14 +1321,10 @@ fn collect_plans(
             // 精确覆盖已经结束旧 root，当前 owner 可以重新参与同槽复用。
             // 跨 home 的 call/MOVE 交接只证明旧目标槽被覆盖，不能把它登记成
             // call 自己的结果槽，否则下一次结果槽写会破坏仍活跃的 MOVE 目标。
-            slot_candidates.insert(home, selected_local);
+            unavailable_for_compaction.remove(&selected_local);
+            current_slot_locals.insert(home, selected_local);
         }
     }
-
-    // The AST cleanup pass cannot infer physical-slot lifetime from ordinary binding mentions.
-    // Carry the proven root identity across the HIR -> AST boundary explicitly.
-    ctx.physical_root_locals
-        .extend(physical_root_locals_by_home.values().copied());
 
     let mut sticky_slots = inherited_sticky_slots.clone();
     for (decl_index, stmt) in block.stmts[..linear_prefix_end].iter().enumerate() {
@@ -1269,9 +1382,7 @@ fn collect_plans(
             let preceding_physical_root_local = preceding_call_root
                 .or(preceding_lookup_root)
                 .and_then(|(root, root_home)| {
-                    physical_root_locals_by_home
-                        .get(&(root, root_home))
-                        .copied()
+                    materialized_owner_locals.get(&(root, root_home)).copied()
                 });
             let mut allocator = PlanAllocator {
                 temp_debug_locals,
@@ -1300,8 +1411,9 @@ fn collect_plans(
                         })
                         .or_else(|| {
                             ctx.compact_home_slots
-                                .then(|| slot_candidates.get(&slot).copied())
+                                .then(|| current_slot_locals.get(&slot).copied())
                                 .flatten()
+                                .filter(|local| !unavailable_for_compaction.contains(local))
                         })
                 })
             }) {
@@ -1324,11 +1436,11 @@ fn collect_plans(
                 if let Some(slot) = home_slot
                     && let Some(local) = allocator.plans.last().map(|plan| plan.local)
                 {
-                    slot_candidates.insert(slot, local);
+                    current_slot_locals.insert(slot, local);
                 }
             }
         }
-        activate_captured_slots_in_stmt(stmt, facts, &slot_candidates, &mut sticky_slots);
+        activate_captured_slots_in_stmt(stmt, facts, &current_slot_locals, &mut sticky_slots);
     }
 
     plans
@@ -1435,8 +1547,7 @@ struct LabelFlowGroupProof<'a> {
     linear_prefix_end: usize,
     suffix_dominance: Option<&'a [bool]>,
     facts: &'a ProtoPromotionFacts,
-    call_roots: &'a CallRootLifetimeIndices,
-    lookup_roots: &'a LookupGcRootLifetimeIndices,
+    closed_root_homes: BTreeSet<(usize, HomeSlotKey)>,
     safety: HirExprSafety,
 }
 
@@ -1461,13 +1572,7 @@ impl LabelFlowGroupProof<'_> {
             let Some(home) = exact_home else {
                 return Err(LabelFlowGroupFailure::Lifetime);
             };
-            if !root_lifetime_closes_in_prefix(
-                decl_index,
-                home,
-                self.linear_prefix_end,
-                self.call_roots,
-                self.lookup_roots,
-            ) {
+            if !self.closed_root_homes.contains(&(decl_index, home)) {
                 return Err(LabelFlowGroupFailure::Lifetime);
             }
         }
@@ -1484,15 +1589,7 @@ impl LabelFlowGroupProof<'_> {
             let Some(home) = exact_home else {
                 return Err(LabelFlowGroupFailure::Lifetime);
             };
-            if index >= self.linear_prefix_end
-                || !root_lifetime_closes_in_prefix(
-                    index,
-                    home,
-                    self.linear_prefix_end,
-                    self.call_roots,
-                    self.lookup_roots,
-                )
-            {
+            if index >= self.linear_prefix_end || !self.closed_root_homes.contains(&(index, home)) {
                 return Err(LabelFlowGroupFailure::Lifetime);
             }
         }
@@ -1506,6 +1603,7 @@ fn group_writes_are_gc_inert(
     safety: HirExprSafety,
 ) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => true,
         HirStmt::Assign(assign) => {
             let writes_group = assign
                 .targets
@@ -1570,52 +1668,19 @@ fn group_writes_are_gc_inert(
     }
 }
 
-fn root_lifetime_closes_in_prefix(
-    root_index: usize,
-    home: HomeSlotKey,
-    linear_prefix_end: usize,
-    call_roots: &CallRootLifetimeIndices,
-    lookup_roots: &LookupGcRootLifetimeIndices,
-) -> bool {
-    (root_index + 1..linear_prefix_end).any(|overwrite_index| {
-        call_roots
-            .overwrite_pairs(overwrite_index)
-            .any(|pair| pair.root_index() == root_index && pair.home() == home)
-            || lookup_roots
-                .overwrite_pairs(overwrite_index)
-                .any(|pair| pair.root_index() == root_index && pair.home() == home)
-    })
-}
-
 fn activate_captured_slots_in_stmt(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
-    slot_candidates: &BTreeMap<HomeSlotKey, LocalId>,
+    current_slot_locals: &BTreeMap<HomeSlotKey, LocalId>,
     sticky_slots: &mut BTreeMap<HomeSlotKey, LocalId>,
 ) {
     let mut captured_slots = BTreeSet::new();
     facts.collect_captured_home_slots_in_stmt(stmt, &mut captured_slots);
     for slot in captured_slots {
-        if let Some(local) = slot_candidates.get(&slot).copied() {
+        if let Some(local) = current_slot_locals.get(&slot).copied() {
             sticky_slots.insert(slot, local);
         }
     }
-}
-
-fn simple_temp_assign_target(stmt: &HirStmt) -> Option<TempId> {
-    let HirStmt::Assign(assign) = stmt else {
-        return None;
-    };
-    let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
-        return None;
-    };
-    let [_value] = assign.values.fixed.as_slice() else {
-        return None;
-    };
-    if assign.values.tail.is_some() {
-        return None;
-    }
-    Some(*temp)
 }
 
 fn temp_assign_targets_for_home(
@@ -1652,7 +1717,7 @@ fn call_move_root_handoffs(
     root_temp: TempId,
     facts: &ProtoPromotionFacts,
     call_roots: &CallRootLifetimeIndices,
-    physical_root_locals_by_home: &BTreeMap<(usize, HomeSlotKey), LocalId>,
+    materialized_owner_locals: &BTreeMap<(usize, HomeSlotKey), LocalId>,
 ) -> Option<Vec<CallMoveRootHandoff>> {
     let pairs = call_roots.overwrite_pairs(root_index).collect::<Vec<_>>();
     let own_home = facts.trusted_temp_home_slot(root_temp)?;
@@ -1666,7 +1731,7 @@ fn call_move_root_handoffs(
 
     let mut pending = BTreeMap::new();
     for pair in pairs {
-        let local = physical_root_locals_by_home
+        let local = materialized_owner_locals
             .get(&(pair.root_index(), pair.home()))
             .copied()?;
         if pending.insert(pair.home(), local).is_some() {
@@ -1949,6 +2014,7 @@ fn rewrite_stmt(
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> bool {
     match stmt {
+        HirStmt::LocalRootRelease(_) => false,
         HirStmt::LocalDecl(local_decl) => {
             rewrite::value_pack(&mut local_decl.values, mapping.as_ref())
         }
@@ -2124,6 +2190,7 @@ mod tests {
     fn call(name: &str) -> HirExpr {
         HirExpr::Call(Box::new(HirCallExpr {
             argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
             callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
             args: HirValuePack::default(),
             method: false,
@@ -2277,16 +2344,13 @@ mod tests {
         let owner_refs = count_label_references(&inert.stmts);
         let inert_cfg = LexicalCfg::analyze(&inert.stmts, &owner_refs, safety).unwrap();
         let inert_suffix_dominance = inert_cfg.suffix_dominance();
-        let call_roots = CallRootLifetimeIndices::default();
-        let lookup_roots = LookupGcRootLifetimeIndices::default();
         let facts = ProtoPromotionFacts::default();
         let proof = LabelFlowGroupProof {
             block: &inert,
             linear_prefix_end: 2,
             suffix_dominance: Some(&inert_suffix_dominance),
             facts: &facts,
-            call_roots: &call_roots,
-            lookup_roots: &lookup_roots,
+            closed_root_homes: BTreeSet::new(),
             safety,
         };
 
@@ -2316,16 +2380,13 @@ mod tests {
         let bypassed_refs = count_label_references(&bypassed.stmts);
         let bypassed_cfg = LexicalCfg::analyze(&bypassed.stmts, &bypassed_refs, safety).unwrap();
         let bypassed_suffix_dominance = bypassed_cfg.suffix_dominance();
-        let call_roots = CallRootLifetimeIndices::default();
-        let lookup_roots = LookupGcRootLifetimeIndices::default();
         let facts = ProtoPromotionFacts::default();
         let bypassed_proof = LabelFlowGroupProof {
             block: &bypassed,
             linear_prefix_end: 0,
             suffix_dominance: Some(&bypassed_suffix_dominance),
             facts: &facts,
-            call_roots: &call_roots,
-            lookup_roots: &lookup_roots,
+            closed_root_homes: BTreeSet::new(),
             safety,
         };
         assert_eq!(
@@ -2354,8 +2415,7 @@ mod tests {
             linear_prefix_end: 1,
             suffix_dominance: Some(&unclosed_suffix_dominance),
             facts: &facts,
-            call_roots: &call_roots,
-            lookup_roots: &lookup_roots,
+            closed_root_homes: BTreeSet::new(),
             safety,
         };
         assert_eq!(
@@ -2406,22 +2466,12 @@ mod tests {
             |_| true,
             |_| true,
         );
-        let lookup_roots = LookupGcRootLifetimeIndices::default();
-
-        assert!(root_lifetime_closes_in_prefix(
-            0,
-            left_home,
-            stmts.len(),
-            &call_roots,
-            &lookup_roots,
-        ));
-        assert!(!root_lifetime_closes_in_prefix(
-            0,
-            right_home,
-            stmts.len(),
-            &call_roots,
-            &lookup_roots,
-        ));
+        let closed_roots = call_roots
+            .closed_roots_before(stmts.len())
+            .map(|owner| (owner.root_index(), owner.home()))
+            .collect::<BTreeSet<_>>();
+        assert!(closed_roots.contains(&(0, left_home)));
+        assert!(!closed_roots.contains(&(0, right_home)));
     }
 
     #[test]
