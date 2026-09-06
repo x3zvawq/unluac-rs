@@ -319,7 +319,7 @@ impl<'a> Emitter<'a> {
             .iter()
             .chain(std::iter::once(&constructor.constructor))
         {
-            if !crate::ast::is_lua_identifier_name(name, DecompileDialect::Luau) {
+            if !DecompileDialect::Luau.is_identifier_name(name) {
                 return Err(GenerateError::InvalidLuauVectorConstructor { name: name.clone() });
             }
         }

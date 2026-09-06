@@ -204,7 +204,10 @@ fn exact_initializer_producer(
                 != SsaValue::Def(def)
             || lowering.bindings.fixed_temps.get(def.index()) != Some(&temp)
             || lowering.bindings.expr_for_fixed_def(preheader, reg, temp) != HirExpr::TempRef(temp)
-            || lowering.bindings.lvalue_for_fixed_def(preheader, reg, temp) != HirLValue::Temp(temp)
+            || lowering
+                .bindings
+                .lvalue_for_reg_result(preheader, reg, temp)
+                != HirLValue::Temp(temp)
         {
             return None;
         }

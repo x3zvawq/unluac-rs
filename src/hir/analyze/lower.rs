@@ -121,15 +121,25 @@ impl ProtoBindings {
             .map_or(HirLValue::Temp(temp), BoundSlotTarget::lvalue)
     }
 
+    /// 当前 block 的寄存器值优先投影到 local owner；旧值快照仍显式使用 temp 查询。
+    pub(super) fn expr_for_reg_value(
+        &self,
+        block: BlockRef,
+        reg: Reg,
+        fallback: impl FnOnce() -> HirExpr,
+    ) -> HirExpr {
+        self.local_for_reg_in_block(block, reg)
+            .map_or_else(fallback, HirExpr::LocalRef)
+    }
+
     /// 固定定义优先投影到当前 block 的 local owner，否则回退到 temp target。
     /// 同一个 VM 结果的读写必须使用这对投影，避免 closure 的 self capture 与接收
     /// closure 的 binding 分裂成两个身份。
     pub(super) fn expr_for_fixed_def(&self, block: BlockRef, reg: Reg, temp: TempId) -> HirExpr {
-        self.local_for_reg_in_block(block, reg)
-            .map_or_else(|| self.expr_for_temp(temp), HirExpr::LocalRef)
+        self.expr_for_reg_value(block, reg, || self.expr_for_temp(temp))
     }
 
-    pub(super) fn lvalue_for_fixed_def(
+    pub(super) fn lvalue_for_reg_result(
         &self,
         block: BlockRef,
         reg: Reg,
@@ -1389,6 +1399,15 @@ fn open_producer_start(proto: &LoweredProto, producer: InstrRef) -> Option<Reg> 
 }
 
 impl ProtoLowering<'_> {
+    /// 消费 canonical SSA 身份的寄存器归属，不按 temp 编号或物理 home 反推。
+    pub(super) fn ssa_reg(&self, value: SsaValue) -> Option<Reg> {
+        match value {
+            SsaValue::Entry(reg) => Some(reg),
+            SsaValue::Def(def) => self.dataflow.defs.get(def.index()).map(|def| def.reg),
+            SsaValue::Phi(phi) => self.structure.plan().phi_plan(phi).map(|phi| phi.reg),
+        }
+    }
+
     pub(super) fn shared_closure_local(&self, creation: ClosureCreation) -> Option<LocalId> {
         let ClosureCreation::Reusable(identity) = creation else {
             return None;

@@ -3562,7 +3562,10 @@ mod tests {
             direct_scalar_overwrite_value(
                 &LowInstr::NewTable(NewTableInstr {
                     dst: home,
-                    allocation: Default::default()
+                    allocation: crate::transformer::TableAllocation::PucBatched(
+                        crate::value_semantics::table::allocation::TablePreallocation::exact(0, 0)
+                            .unwrap()
+                    )
                 }),
                 home,
             ),

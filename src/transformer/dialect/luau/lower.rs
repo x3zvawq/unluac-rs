@@ -497,43 +497,37 @@ impl<'a> ProtoLowerer<'a> {
         self.emit(None, vec![raw_index], PendingLowInstr::Ready(instr));
     }
 
-    fn emit_dup_table_template(
-        &mut self,
+    fn table_template(
+        &self,
         raw_pc: u32,
-        raw_index: usize,
-        dst: Reg,
         const_index: usize,
-    ) -> Result<(), TransformError> {
-        match self.const_entry(raw_pc, const_index)?.clone() {
-            LuauConstEntry::Table { .. } => Ok(()),
-            LuauConstEntry::TableWithConstants { entries } => {
-                for entry in entries {
-                    let Some(value_const) = entry.value_const else {
-                        continue;
-                    };
-                    self.emit(
-                        None,
-                        vec![raw_index],
-                        PendingLowInstr::Ready(LowInstr::SetTable(SetTableInstr {
-                            base: AccessBase::Reg(dst),
-                            key: AccessKey::Const(
-                                self.literal_const_ref(raw_pc, entry.key_const as usize)?,
-                            ),
-                            value: ValueOperand::Const(
-                                self.literal_const_ref(raw_pc, value_const as usize)?,
-                            ),
-                            kind: SetTableKind::Normal,
-                        })),
-                    );
-                }
-                Ok(())
+    ) -> Result<crate::transformer::TableAllocation, TransformError> {
+        let entry = |key, value: Option<u32>| {
+            Ok((
+                self.literal_const_ref(raw_pc, key as usize)?,
+                value
+                    .map(|value| self.literal_const_ref(raw_pc, value as usize))
+                    .transpose()?,
+            ))
+        };
+        let entries = match self.const_entry(raw_pc, const_index)? {
+            LuauConstEntry::Table { key_consts } => key_consts
+                .iter()
+                .map(|key| entry(*key, None))
+                .collect::<Result<_, TransformError>>()?,
+            LuauConstEntry::TableWithConstants { entries } => entries
+                .iter()
+                .map(|item| entry(item.key_const, item.value_const))
+                .collect::<Result<_, TransformError>>()?,
+            _ => {
+                return Err(TransformError::InvalidConstRef {
+                    raw_pc,
+                    const_index,
+                    const_count: self.const_entries().len(),
+                });
             }
-            _ => Err(TransformError::InvalidConstRef {
-                raw_pc,
-                const_index,
-                const_count: self.const_entries().len(),
-            }),
-        }
+        };
+        Ok(crate::transformer::TableAllocation::LuauTemplate(entries))
     }
 }
 

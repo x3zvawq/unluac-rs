@@ -105,6 +105,73 @@ impl DecompileDialect {
     }
 }
 
+impl DecompileDialect {
+    /// HIR 候选字段与 AST/Generate 共用的目标裸标识符规则。
+    pub(crate) fn is_identifier_name(self, name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return false;
+        }
+        if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+            return false;
+        }
+        !self.is_keyword(name)
+    }
+
+    /// 判断 `name` 是否是该方言版本下禁止作为标识符的硬关键字。
+    ///
+    /// PUC Lua 5.2+ 的 `goto` 是硬关键字；LuaJIT `goto`、Luau `continue` 和
+    /// Lua 5.5 `global` 只在对应语句上下文中有特殊含义，仍可作为普通名字。
+    pub fn is_keyword(self, name: &str) -> bool {
+        if is_base_lua_keyword(name) {
+            return true;
+        }
+        match name {
+            "goto" => matches!(self, Self::Lua52 | Self::Lua53 | Self::Lua54 | Self::Lua55),
+            _ => false,
+        }
+    }
+
+    /// 判断 `name` 是否在 **任意** 受支持方言中可能是关键字或上下文语法词。
+    ///
+    /// Naming 在目标方言未知时使用此保守全集，避免主动分配容易与语句语法冲突的名字；
+    /// 目标明确的已有 global / field 名仍由 `is_keyword` 按标识符位置精确判断。
+    pub fn is_keyword_in_any_dialect(name: &str) -> bool {
+        is_base_lua_keyword(name) || matches!(name, "goto" | "continue" | "global")
+    }
+}
+
+/// 所有方言共有的 21 个基础关键字（Lua 5.1 关键字集）。
+fn is_base_lua_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "and"
+            | "break"
+            | "do"
+            | "else"
+            | "elseif"
+            | "end"
+            | "false"
+            | "for"
+            | "function"
+            | "if"
+            | "in"
+            | "local"
+            | "nil"
+            | "not"
+            | "or"
+            | "repeat"
+            | "return"
+            | "then"
+            | "true"
+            | "until"
+            | "while"
+    )
+}
+
 /// 一次主反编译调用的顶层选项。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecompileOptions {

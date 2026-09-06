@@ -180,7 +180,7 @@ pub(super) struct StmtBindingSummary {
 }
 
 impl StmtBindingSummary {
-    fn uses(&self) -> impl Iterator<Item = BindingId> + '_ {
+    pub(super) fn uses(&self) -> impl Iterator<Item = BindingId> + '_ {
         self.uses.iter().copied()
     }
 

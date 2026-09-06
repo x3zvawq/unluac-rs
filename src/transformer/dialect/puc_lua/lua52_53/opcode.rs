@@ -2,6 +2,9 @@
 
 use super::*;
 
+use crate::transformer::TableAllocation;
+use crate::value_semantics::table::allocation::TablePreallocation;
+
 impl<'a> ProtoLowerer<'a> {
     pub(super) fn lower(&mut self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
         let mut raw_index = 0_usize;
@@ -206,7 +209,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 FamilyOpcode::NewTable => {
-                    let (a, _, _) = expect_abc(raw_pc, opcode, operands)?;
+                    let (a, b, c) = expect_abc(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.pending_methods.invalidate_reg(dst);
                     self.emit(
@@ -214,7 +217,14 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
                             dst,
-                            allocation: Default::default(),
+                            allocation: TableAllocation::PucBatched(
+                                TablePreallocation::floating_byte(u32::from(b), u32::from(c))
+                                    .ok_or(TransformError::UnexpectedOperands {
+                                        raw_pc,
+                                        opcode: "NEWTABLE",
+                                        expected: "table preallocation fits u32",
+                                    })?,
+                            ),
                         })),
                     );
                     raw_index += 1;

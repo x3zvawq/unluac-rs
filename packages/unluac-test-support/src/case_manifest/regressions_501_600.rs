@@ -119,4 +119,36 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_511_luajit_result_identity.lua",
         &[LuaCaseDialect::Luajit],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_512_table_result_nil_shape.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_513_luau_table_template.lua",
+        &[LuaCaseDialect::Luau],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_514_luau_table_preallocation.lua",
+        &[LuaCaseDialect::Luau],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_515_loop_binding_decision.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_516_luau_record_key_syntax.lua",
+        &[LuaCaseDialect::Luau],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_517_decl_sink_write_scope.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_518_pending_integer_key_shadow.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_519_constructor_nil_prefix.lua",
+        ALL_DIALECTS,
+    ),
 ];

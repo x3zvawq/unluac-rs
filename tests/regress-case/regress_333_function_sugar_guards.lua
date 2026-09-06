@@ -2,9 +2,8 @@
 -- unluac: expect-contains [[plain = function(value)]]
 -- unluac: expect-contains [[method = function]]
 -- unluac: expect-contains [[after = function]]
--- unluac: expect-not-contains [[prefix_owner.plain = function]]
 -- unluac: expect-not-contains [[function prefix_owner:method()]]
--- unluac: expect-not-contains [[.after = function]]
+-- Original preallocation may require plain fields to remain separate assignments.
 
 self = "global-self"
 

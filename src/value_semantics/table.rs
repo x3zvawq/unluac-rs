@@ -1,4 +1,4 @@
-//! HIR/AST 共用的索引式表模板初始化规则。
+//! HIR/AST 共用的表分配容量与索引式模板初始化规则。
 //!
 //! 两层只投影自己的表达式语法，不互相构建表达式树。这里区分编译期常量与运行时
 //! 值；正常结果为 number 不代表编译器能把它放入模板。该规则不授权移动求值或根。
@@ -7,6 +7,8 @@
 //! `TableInitializationConstraint` 统一 Indexed 的模板禁入与已有 Template 的数组边界、hash 键身份；消费者
 //! 只投影字段与下标。精确容量查询与运行时操作数查询共用常量规则，不重建原始布局。
 //! Template 使用包含索引 0 的精确槽数，避免误把原零索引项当作新模板键。
+
+pub(crate) mod allocation;
 
 #[derive(Clone, Copy)]
 pub(crate) enum TableConstant {
@@ -39,7 +41,7 @@ pub(crate) trait TableExpression: Sized {
     fn table_key(&self) -> Option<TableTemplateKey>;
 }
 
-/// 原模板中的稳定 key 身份。数字使用 LuaJIT 的 binary64 身份，字符串保留原始字节。
+/// 原模板中的稳定 key 身份。LuaJIT/Luau 数字使用 binary64 身份，字符串保留原始字节。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableTemplateKey {
     Boolean(bool),

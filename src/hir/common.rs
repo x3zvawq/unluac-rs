@@ -1129,8 +1129,16 @@ pub struct HirTableConstructor {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum HirTableAllocation {
+    /// HIR 自行生成的 capture 数组盒，没有原始 VM 表分配。
     #[default]
-    Batched,
+    Synthetic,
+    /// Luau NEWTABLE 的精确预分配，与模板复制保持区别。
+    Luau(crate::value_semantics::table::allocation::TablePreallocation),
+    /// DUPTABLE 的原始有序键身份，不能由吸收后续写入的字段重新推算。
+    LuauTemplate {
+        hash_keys: std::sync::Arc<[crate::value_semantics::table::TableTemplateKey]>,
+    },
+    PucBatched(crate::value_semantics::table::allocation::TablePreallocation),
     Indexed {
         array_capacity: u32,
         hash_bits: u8,
@@ -1144,6 +1152,33 @@ pub enum HirTableAllocation {
 }
 
 impl HirTableAllocation {
+    /// Luau 的纯 hash NEWTABLE 必须保留 bracket 字段；裸名字可能启用数组或模板预分配。
+    /// 例如 `{["a"]=x,[1]=y}` 与 `{a=x,[1]=y}` 的容量不同，键值相同不足以证明等价。
+    pub(crate) fn permits_named_record_keys(&self) -> bool {
+        !matches!(self, Self::Luau(allocation) if allocation.array_capacity == 0)
+    }
+
+    /// 完成后的候选字段数是否复现批次预分配；None 表示该分配使用其它协议。
+    /// 增量扫描的未完成前缀不能用此查询代替完整构造区域证明。
+    pub(crate) fn batched_capacity_matches(&self, arrays: usize, records: usize) -> Option<bool> {
+        match self {
+            Self::PucBatched(allocation) => Some(allocation.matches(arrays, records)),
+            _ => None,
+        }
+    }
+
+    /// 原模板对新增 record 键的许可；不代替容量、求值顺序和根生命周期证明。
+    /// Luau 模板扩大后，即使最终键值相同，也可能改变后续 pairs 顺序。
+    pub(crate) fn permits_record_key(
+        &self,
+        key: Option<crate::value_semantics::table::TableTemplateKey>,
+    ) -> bool {
+        match self {
+            Self::LuauTemplate { hash_keys } => key.is_some_and(|key| hash_keys.contains(&key)),
+            _ => true,
+        }
+    }
+
     /// 原分配约束候选的模板初始化；已有模板也不能因新常量而扩大数组。
     pub(crate) fn initialization_constraint(
         &self,
@@ -1167,7 +1202,9 @@ impl HirTableAllocation {
 
     pub(in crate::hir) fn indexed_array_capacity(&self) -> Option<u32> {
         match self {
-            Self::Batched => None,
+            Self::Synthetic | Self::Luau(_) | Self::LuauTemplate { .. } | Self::PucBatched(_) => {
+                None
+            }
             Self::Indexed { array_capacity, .. } => Some(*array_capacity),
             Self::Template { array_slots, .. } => Some(array_slots.saturating_sub(1)),
         }
@@ -1175,6 +1212,13 @@ impl HirTableAllocation {
 }
 
 impl HirTableConstructor {
+    /// 比较候选与原 NEWTABLE 的完整预分配；PUC 不因此获得 indexed 写入协议的许可。
+    pub(in crate::hir) fn matches_allocation_capacity(&self, array_fields: usize) -> bool {
+        self.allocation
+            .batched_capacity_matches(array_fields, self.fields.len() - array_fields)
+            .unwrap_or_else(|| self.matches_indexed_array_capacity(array_fields))
+    }
+
     /// 完整字段数能否重现索引式构造器的数组预分配（含 VM 最小/饱和容量规则）。
     /// 这里只检查容量；调用者另证字段均为顺序数组索引且求值/写入顺序不变。
     pub(in crate::hir) fn matches_indexed_array_capacity(&self, count: usize) -> bool {

@@ -1,7 +1,6 @@
--- regress_430_constructor_eventless_assignment_prefix: an eventless captured-local write stays
--- in place while an independent constructor field crosses it; a dependent field cannot cross.
--- unluac: expect-contains [[local r1_2 = { answer = 7 }]]
--- unluac: expect-not-contains [[r1_2.answer = 7]]
+-- regress_430_constructor_eventless_assignment_prefix: an eventless captured-local write does
+-- not justify changing empty-table preallocation; a dependent field cannot cross the write.
+-- unluac: expect-order [[local r1_2 = {}]] [[r1_2.answer = 7]]
 -- unluac: expect-order [[local r3_2 = {}]] [[r3_0 = "new"]]
 -- unluac: expect-order [[r3_0 = "new"]] [[r3_2.answer = r3_0]]
 

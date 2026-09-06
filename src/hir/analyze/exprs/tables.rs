@@ -1,10 +1,11 @@
 //! 统一 NewTable 的语句与单次表达式入口，保留分配方式和模板初始值。
 //!
-//! Transformer 已区分空分配、索引预分配与模板复制；这里仅把常量身份映射为 HIR
+//! Transformer 已区分各 VM 的预分配与模板复制；这里仅把常量身份映射为 HIR
 //! 字段，不再读取 raw opcode。模板中的 nil 数组槽与 hash 项也属于初始化事实，
 //! 例如 TDUP {nil, nil, true} 不能变成空表后的一条 [3] 写入。
 //! 同次降低同时发布原 hash 键身份；后续构造区域融合后，不能从 fields 猜哪些键属于模板。
 //! 模板数组槽数包含索引 0，不能把只有零索引的模板和没有数组的模板合并为同一个容量。
+//! Luau 的动态模板项以数值 0 预置；这里保留初值和原键，后续真实写入由构造区域消费。
 
 use crate::hir::common::{
     HirExpr, HirRecordField, HirTableAllocation, HirTableConstructor, HirTableField,
@@ -20,7 +21,25 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
 ) -> HirExpr {
     let mut table = HirTableConstructor::default();
     table.allocation = match &instruction.allocation {
-        TableAllocation::Empty => HirTableAllocation::Batched,
+        TableAllocation::Luau(allocation) => HirTableAllocation::Luau(*allocation),
+        TableAllocation::LuauTemplate(entries) => {
+            let mut hash_keys = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                let key = expr_for_const(proto, *key);
+                hash_keys.push(
+                    key.table_key()
+                        .expect("template key is a primitive constant"),
+                );
+                table.fields.push(HirTableField::Record(HirRecordField {
+                    key,
+                    value: value.map_or(HirExpr::Integer(0), |value| expr_for_const(proto, value)),
+                }));
+            }
+            HirTableAllocation::LuauTemplate {
+                hash_keys: hash_keys.into(),
+            }
+        }
+        TableAllocation::PucBatched(allocation) => HirTableAllocation::PucBatched(*allocation),
         TableAllocation::Indexed {
             array_capacity,
             hash_bits,

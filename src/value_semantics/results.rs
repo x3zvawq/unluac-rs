@@ -40,6 +40,10 @@ impl LuaValueFacts {
         !self.is_empty() && self.0 & !Self::BOOLEAN.0 == 0
     }
 
+    pub(crate) fn is_non_nil(self) -> bool {
+        !self.is_empty() && self.0 & Self::NIL.0 == 0
+    }
+
     pub(crate) fn is_gc_inert(self) -> bool {
         !self.is_empty() && self.0 & Self::RESOURCE.0 == 0
     }

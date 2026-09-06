@@ -18,6 +18,7 @@
 //! - 如果某个 hoisted temp 在声明点与候选下沉点之间已经被读取过，也不能把它下沉
 //!   成后置 `local`，否则 fallback/goto 回边会读到未初始化的局部变量
 //! - repeat body 的 until 条件是正文之后的读取，引用到的声明不能沉入更窄的嵌套块
+//! - 后缀即使只有赋值也需要原声明支配；把声明沉入前面的 if 会让后缀写入全局环境
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -27,9 +28,9 @@ use super::super::common::{
 };
 use super::ReadabilityContext;
 use super::binding_flow::{
-    BindingRefSet, BindingUseIndex, binding_mentions_in_block, binding_mentions_in_expr,
-    block_references_binding_set, expr_references_any_binding, expr_references_binding_set,
-    stmt_references_any_binding, stmt_references_binding_set,
+    BindingRefSet, BindingUseIndex, BindingWriteIndex, binding_mentions_in_block,
+    binding_mentions_in_expr, block_references_binding_set, expr_references_any_binding,
+    expr_references_binding_set, stmt_references_any_binding, stmt_references_binding_set,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr, is_discard_safe_expr};
 use super::visit::{self, AstVisitor};
@@ -318,6 +319,7 @@ fn binding_is_owned_by_inline_exprs(
 
 fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&AstExpr>) -> bool {
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&block.stmts, trailing_condition);
+    let write_index = BindingWriteIndex::for_stmts(&block.stmts);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     let mut index = 0;
     while index < block.stmts.len() {
@@ -379,7 +381,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
                 &remaining,
                 &block.stmts[lookahead],
                 &use_index,
-                lookahead + 1,
+                &write_index,
+                lookahead,
             ) {
                 block.stmts[lookahead] = attempt.rewritten;
                 remaining.drain(attempt.start..(attempt.start + attempt.consumed));
@@ -574,18 +577,29 @@ impl NestedSinkOwners {
     }
 }
 
+fn binding_has_access_after(
+    use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
+    stmt_index: usize,
+    binding: AstBindingRef,
+) -> bool {
+    // 候选拒绝[SemanticBarrier:Scope]：后缀读写都必须由声明支配，不能只证明值不再被读。
+    use_index.count_uses_in_suffix(stmt_index + 1, binding) != 0
+        || write_index.has_write_after(stmt_index, binding)
+}
+
 fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
     use_index: &BindingUseIndex,
-    suffix_start: usize,
+    write_index: &BindingWriteIndex,
+    stmt_index: usize,
 ) -> Option<NestedSinkAttempt> {
     let owners = NestedSinkOwners::new(stmt)?;
 
     let mut start = 0usize;
     while start < pending.len() {
-        if use_index.count_uses_in_suffix(suffix_start, pending[start].id) != 0 {
-            // 候选拒绝[SemanticBarrier:Scope]：binding 在候选嵌套语句之后仍被读取，沉入该子 block 会使后缀读取越出词法作用域。
+        if binding_has_access_after(use_index, write_index, stmt_index, pending[start].id) {
             start += 1;
             continue;
         }
@@ -594,7 +608,7 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
         let mut run_end = start;
         let mut mentioned_owners = Vec::new();
         while run_end < pending.len()
-            && use_index.count_uses_in_suffix(suffix_start, pending[run_end].id) == 0
+            && !binding_has_access_after(use_index, write_index, stmt_index, pending[run_end].id)
         {
             if let Some(owner) = owners.owner(pending[run_end].id) {
                 mentioned_owners.push((run_end, owner));
@@ -641,7 +655,8 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
                 pending,
                 stmt,
                 use_index,
-                suffix_start,
+                write_index,
+                stmt_index,
             ) {
                 return Some(NestedSinkAttempt {
                     rewritten,
@@ -663,7 +678,8 @@ fn try_sink_hoisted_decl_into_nested_stmt(
     dependency_universe: &[super::super::common::AstLocalBinding],
     stmt: &AstStmt,
     use_index: &BindingUseIndex,
-    suffix_start: usize,
+    write_index: &BindingWriteIndex,
+    stmt_index: usize,
 ) -> Option<(AstStmt, BlockSinkAttempt)> {
     if !stmt_can_accept_nested_hoisted_sink(stmt) {
         return None;
@@ -671,10 +687,12 @@ fn try_sink_hoisted_decl_into_nested_stmt(
 
     let sinkable_len = pending
         .iter()
-        .take_while(|binding| use_index.count_uses_in_suffix(suffix_start, binding.id) == 0)
+        .take_while(|binding| {
+            !binding_has_access_after(use_index, write_index, stmt_index, binding.id)
+        })
         .count();
     if sinkable_len == 0 {
-        // 候选拒绝[SemanticBarrier:Scope]：所有 pending binding 都在 nested stmt 后仍有 use，沉入子 block 会让后缀读取越出作用域。
+        // 候选拒绝[SemanticBarrier:Scope]：后缀仍有读写，声明沉入子 block 会缩短所需作用域。
         return None;
     }
     let sinkable = &pending[..sinkable_len];
@@ -826,6 +844,7 @@ fn sink_pending_bindings_into_block(
     dependency_universe: &[super::super::common::AstLocalBinding],
 ) -> BlockSinkAttempt {
     let use_index = BindingUseIndex::for_stmts(&block.stmts);
+    let write_index = BindingWriteIndex::for_stmts(&block.stmts);
     let forward_gotos = ForwardGotoIndex::new(&block.stmts);
     let mut consumed = 0usize;
     let mut index = 0usize;
@@ -881,7 +900,8 @@ fn sink_pending_bindings_into_block(
             dependency_universe,
             &block.stmts[index],
             &use_index,
-            index + 1,
+            &write_index,
+            index,
         ) {
             block.stmts[index] = rewritten;
             consumed += nested_attempt.consumed;

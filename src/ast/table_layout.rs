@@ -13,6 +13,15 @@ use crate::value_semantics::table::{
     runtime_table_operand,
 };
 
+/// 新增字段与 HIR lowering 共用原分配对命名语法的许可，不能在 sugar 中改回裸键。
+pub(crate) fn record_key(allocation: &crate::hir::HirTableAllocation, name: String) -> AstTableKey {
+    if allocation.permits_named_record_keys() {
+        AstTableKey::Name(name)
+    } else {
+        AstTableKey::Expr(AstExpr::String(name.into()))
+    }
+}
+
 fn field_ref<'a>(field: &'a AstTableField, next_array: &mut u32) -> TableFieldRef<'a, AstExpr> {
     match field {
         AstTableField::Array(value) => {
@@ -30,6 +39,32 @@ fn field_ref<'a>(field: &'a AstTableField, next_array: &mut u32) -> TableFieldRe
             },
         },
     }
+}
+
+/// 字段扩展事务完成后统一投影候选大小，不在每次追加时重复扫描整个构造器。
+pub(crate) fn matches_preallocation(table: &AstTableConstructor) -> bool {
+    if let crate::hir::HirTableAllocation::Luau(allocation) = table.allocation {
+        let mut next_array = 0;
+        return allocation.matches_luau(
+            table
+                .fields
+                .iter()
+                .map(|field| field_ref(field, &mut next_array)),
+            matches!(
+                table.fields.last(),
+                Some(AstTableField::Array(AstExpr::VarArg))
+            ),
+        );
+    }
+    let arrays = table
+        .fields
+        .iter()
+        .filter(|field| matches!(field, AstTableField::Array(_)))
+        .count();
+    table
+        .allocation
+        .batched_capacity_matches(arrays, table.fields.len() - arrays)
+        .unwrap_or(true)
 }
 
 pub(crate) fn introduces_runtime_table_operand(

@@ -90,6 +90,10 @@ pub(super) fn try_extend_constructor_from_steps(
         return None;
     }
 
+    if !builder.fits_preallocated_field_count() {
+        builder.rollback(checkpoint, context.scratch);
+        return None;
+    }
     builder.commit(&checkpoint, context.scratch);
     Some(preserved_producer_sources)
 }

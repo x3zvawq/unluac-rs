@@ -105,7 +105,23 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
                 "new-table {} indexed-array-capacity={array_capacity} hash-bits={hash_bits}",
                 format_reg(instr.dst)
             ),
-            super::TableAllocation::Empty => format!("new-table {}", format_reg(instr.dst)),
+            super::TableAllocation::Luau(allocation) => format!(
+                "new-table {} luau-array-capacity={} hash-capacity={}",
+                format_reg(instr.dst),
+                allocation.array_capacity,
+                allocation.hash_capacity
+            ),
+            super::TableAllocation::LuauTemplate(entries) => format!(
+                "new-table {} luau-template entries={entries:?}",
+                format_reg(instr.dst)
+            ),
+            super::TableAllocation::PucBatched(allocation) => format!(
+                "new-table {} puc-array-capacity={} hash-capacity={} array-sizing={:?}",
+                format_reg(instr.dst),
+                allocation.array_capacity,
+                allocation.hash_capacity,
+                allocation.array_sizing
+            ),
             super::TableAllocation::Template(template) => format!(
                 "new-table {} template array={:?} hash={:?}",
                 format_reg(instr.dst),

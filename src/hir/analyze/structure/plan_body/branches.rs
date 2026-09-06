@@ -132,7 +132,11 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 detail: "value decision result phi has no HIR binding",
             })?;
         stmts.push(assign_stmt(
-            vec![self.lowering.bindings.lvalue_for_temp(target)],
+            vec![self.lowering.bindings.lvalue_for_reg_result(
+                selected.merge,
+                self.ssa_reg(region, crate::structure::SsaValue::Phi(selected.result_phi))?,
+                target,
+            )],
             vec![finalize_value_decision_expr(
                 decision,
                 crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target),

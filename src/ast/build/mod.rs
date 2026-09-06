@@ -528,7 +528,7 @@ impl<'a> AstLowerer<'a> {
             .map(|key| {
                 let name = key
                     .as_utf8()
-                    .filter(|name| crate::ast::is_lua_identifier_name(name, self.target.version));
+                    .filter(|name| self.target.version.is_identifier_name(name));
                 name.map(str::to_owned)
                     .ok_or_else(|| AstLowerError::InvalidGlobalDeclName {
                         proto: proto_index,

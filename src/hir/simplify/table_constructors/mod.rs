@@ -44,7 +44,6 @@ use self::bindings::{
     binding_from_expr, binding_from_lvalue, collect_binding_facts, collect_stmt_binding_summary,
     expr_uses_binding,
 };
-use self::builder::expr_is_definitely_non_nil;
 use self::rebuild::producer_value_can_be_dropped;
 use self::roots::RegionRootFacts;
 use self::scan::{
@@ -56,6 +55,7 @@ use super::mention::{
     ReferenceCapturedBindings, stmts_reference_captured_bindings, stmts_value_captured_bindings,
 };
 use super::walk::{HirRewritePass, rewrite_proto};
+use crate::hir::value_facts::value_facts;
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -306,6 +306,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     seed_ctor.clone(),
                     &binding_index,
                     &binding_occurrences,
+                    &stmt_bindings,
                     &materialized_binding_counts,
                     &self.debug_identity_bindings,
                     self.promotion_facts,
@@ -1797,8 +1798,8 @@ impl TableConstructorPass<'_> {
         }
         if (!indexed_layout
             && seed.fields.iter().any(|field| match field {
-                HirTableField::Array(value) => !expr_is_definitely_non_nil(value),
-                HirTableField::Record(record) => !expr_is_definitely_non_nil(&record.value),
+                HirTableField::Array(value) => !value_facts(value).is_non_nil(),
+                HirTableField::Record(record) => !value_facts(&record.value).is_non_nil(),
             }))
             || set_list.start_index == 0
             || (!indexed_layout
@@ -2353,8 +2354,12 @@ fn constructor_nil_shape_is_supported(
     seed: &HirTableConstructor,
     rebuilt: &HirTableConstructor,
 ) -> bool {
+    if !crate::hir::table_layout::matches_luau_allocation(rebuilt) {
+        // 候选拒绝[SemanticBarrier:TableShape]：扩大 Luau hash 预分配改变 pairs 顺序。
+        return false;
+    }
     if seed.allocation == rebuilt.allocation
-        && rebuilt.matches_indexed_array_capacity(
+        && rebuilt.matches_allocation_capacity(
             rebuilt
                 .fields
                 .iter()
@@ -2363,6 +2368,15 @@ fn constructor_nil_shape_is_supported(
         )
     {
         return !constructor_adds_definite_nil_record_key(seed, rebuilt);
+    }
+    if matches!(
+        seed.allocation,
+        crate::hir::common::HirTableAllocation::Indexed { .. }
+            | crate::hir::common::HirTableAllocation::PucBatched(_)
+    ) {
+        // 候选拒绝[SemanticBarrier:TableShape]：record 语法也会预分配 hash；原空表
+        // 吸收运行时写入后改变扩容和 #table，不能退回只检查数组 nil 的规则（regress_512）。
+        return false;
     }
     // 候选拒绝[SemanticBarrier:TableShape]：不确定 nil 槽之后再出现确定数组值，
     // 或 open tail 覆盖不确定前缀，会改变键集合/`#table`；反例见
@@ -2405,7 +2419,7 @@ fn constructor_has_definite_nil_record_key(constructor: &HirTableConstructor) ->
 fn expressions_have_safe_nil_shape(values: &[HirExpr]) -> bool {
     let mut saw_uncertain = false;
     for value in values {
-        if expr_is_definitely_non_nil(value) {
+        if value_facts(value).is_non_nil() {
             if saw_uncertain {
                 return false;
             }
@@ -2488,7 +2502,7 @@ fn expr_is_definitely_non_nil_from_definitions(
     expr: &HirExpr,
     definitions: &BTreeMap<TableBinding, bool>,
 ) -> bool {
-    if expr_is_definitely_non_nil(expr) {
+    if value_facts(expr).is_non_nil() {
         return true;
     }
     let Some(binding) = binding_from_expr(expr) else {
@@ -2552,7 +2566,7 @@ fn array_fields_contain_uncertain_value(fields: &[HirTableField]) -> bool {
     fields.iter().any(|field| {
         matches!(
             field,
-            HirTableField::Array(value) if !expr_is_definitely_non_nil(value)
+            HirTableField::Array(value) if !value_facts(value).is_non_nil()
         )
     })
 }

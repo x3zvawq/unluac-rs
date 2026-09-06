@@ -696,10 +696,13 @@ pub struct NewTableInstr {
 
 /// 分配与初始化是一条 VM 事件。模板里的 nil 槽和 hash key 是初始布局事实，
 /// 不能展开为有独立求值/观察语义的普通 SetTable 再让后层恢复。
-#[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum TableAllocation {
-    #[default]
-    Empty,
+    PucBatched(crate::value_semantics::table::allocation::TablePreallocation),
+    Luau(crate::value_semantics::table::allocation::TablePreallocation),
+    /// Luau DUPTABLE 按原顺序预置键；None 是 VM 的数值 0 占位，不是 nil。
+    /// 模板复制是一条分配事件，不能拆成后续普通字段写入。
+    LuauTemplate(Vec<(ConstRef, Option<ConstRef>)>),
     /// 正整数数组槽数，不含 VM 的索引 0。
     Indexed {
         array_capacity: u32,

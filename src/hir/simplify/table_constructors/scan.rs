@@ -9,17 +9,24 @@
 //! 要么由 source preservation plan 整句保留，不能只删一部分 materialization。
 //! 旧值已证明为 nil 的简单 local assignment 也可保留，但从该点起只允许独立、无事件的
 //! constructor step 前移；赋值仍在原位完成 capture cell 更新和物理 root handoff。
+//! 同一 seed 的声明前缀按需归约一次，逐槽 nil 事实只在当前不可变语句快照内有效。
+//! 后缀读屏障直接消费上游逐语句 binding 摘要，不按每个保留变量重新遍历表达式。
 //! 调用结果 TempId 以 Promotion 的可信 home 进入 producer 计划；删除须由精确覆盖
 //! 终点或完整 constructor 的强字段持有/退出事务批准，单写身份自身不签发根释放许可。
 //! ConstructorRegion 只发布成功前缀的步骤，保留 producer binding/缺失槽投影、原字段
 //! 表达式与批次引用。rebuild 和 commit 消费同一角色划分，不从 stmt_index 反向匹配语法。
 
-use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack};
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack, LocalId};
 use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 use crate::hir::promotion::ProtoPromotionFacts;
+use crate::value_semantics::table::TableExpression;
 
 use super::bindings::{
-    BindingIndex, BindingOccurrenceIndex, binding_from_expr, binding_from_lvalue, expr_uses_binding,
+    BindingIndex, BindingOccurrenceIndex, StmtBindingSummary, binding_from_expr,
+    binding_from_lvalue, expr_uses_binding,
 };
 use super::builder::ConstructorBuilder;
 use super::rebuild::producer_value_can_be_dropped;
@@ -138,19 +145,27 @@ pub(super) fn try_rebuild_constructor_region<'a>(
     constructor: HirTableConstructor,
     binding_index: &BindingIndex,
     binding_occurrences: &BindingOccurrenceIndex,
+    stmt_bindings: &[StmtBindingSummary],
     materialized_binding_counts: &[u32],
     debug_identity_bindings: &BindingSlots<bool>,
     promotion_facts: &ProtoPromotionFacts,
     stmt_ids: &[usize],
     scratch: &mut RebuildScratch,
 ) -> Option<ConstructorRegion<'a>> {
+    let allocation = constructor.allocation.clone();
     let mut steps = Vec::new();
     let mut committed_steps = Vec::new();
     let mut use_horizon: Option<usize> = None;
     let mut best_end = None;
     let mut preserved_stmt_indices = Vec::new();
-    let mut preserved_scope_bindings = Vec::new();
-    let mut preserved_assignment_bindings = Vec::new();
+    let mut preserved_bindings = BTreeSet::new();
+    let mut has_preserved_assignment = false;
+    let preserved_binding_id = |binding| {
+        binding_index
+            .id_of(binding)
+            .expect("preserved binding belongs to the current snapshot")
+    };
+    let seed_local_values = OnceCell::new();
     let mut committed_builder = ConstructorBuilder::from_constructor(constructor);
     let scan_stmts = &block.stmts[(seed_index + 1)..];
     for (offset, stmt) in scan_stmts.iter().enumerate() {
@@ -158,31 +173,35 @@ pub(super) fn try_rebuild_constructor_region<'a>(
         let remaining_uses = binding_occurrences.remaining_uses_after(stmt_ids[index]);
         if let Some(bindings) = preserved_nil_local_bindings(stmt, debug_identity_bindings) {
             preserved_stmt_indices.push(index);
-            preserved_scope_bindings.extend(bindings);
+            preserved_bindings.extend(bindings.into_iter().map(preserved_binding_id));
             continue;
         }
-        if let Some(bindings) = preserved_eventless_assignment_bindings(
-            block,
-            seed_index,
-            index,
+        if let Some(preserved_binding) = preserved_eventless_assignment_binding(
+            stmt,
             binding,
             binding_index,
             materialized_binding_counts,
             debug_identity_bindings,
+            |local| {
+                seed_local_values
+                    .get_or_init(|| local_nil_values_before_seed(&block.stmts[..seed_index]))
+                    .get(&local)
+                    .copied()
+                    .unwrap_or(false)
+            },
         ) {
             preserved_stmt_indices.push(index);
-            preserved_assignment_bindings.extend(bindings);
+            preserved_bindings.insert(preserved_binding_id(preserved_binding));
+            has_preserved_assignment = true;
             continue;
         }
-        if stmt_uses_any_binding(stmt, &preserved_scope_bindings)
-            || stmt_uses_any_binding(stmt, &preserved_assignment_bindings)
-        {
+        if stmt_uses_any_binding(stmt, &stmt_bindings[index], &preserved_bindings) {
             // 候选拒绝[SemanticBarrier:Scope]：保留的 nil local 必须仍先于它的每次读取；
             // assignment target 也必须保持“写后读”。把 `local x=nil; t.v=x` 的字段移进
             // seed 会让 x 在 initializer 中不可见；`x=1; t.v=x` 则会读到旧值。
             break;
         }
-        if !preserved_assignment_bindings.is_empty() && !constructor_step_is_unobservable(stmt) {
+        if has_preserved_assignment && !constructor_step_is_unobservable(stmt) {
             // 候选拒绝[SemanticBarrier:EvalOrder]：保留 assignment 的 cell/root handoff 不能
             // 与 call、lookup、allocation 或 metamethod-capable constructor work 交换顺序。
             break;
@@ -190,6 +209,11 @@ pub(super) fn try_rebuild_constructor_region<'a>(
         let boundary_step = if let Some((owner, key, value)) = keyed_write_parts(stmt)
             && owner == binding
         {
+            if !allocation.permits_record_key(key.table_key()) {
+                // 候选拒绝[SemanticBarrier:TableShape]：新键不能提前进入原 DUPTABLE；
+                // 模板扩大会改变运行时插入/扩容与 pairs 顺序（regress_513）。
+                break;
+            }
             RegionStep::Record {
                 stmt_index: index,
                 key,
@@ -207,9 +231,18 @@ pub(super) fn try_rebuild_constructor_region<'a>(
                 let binding_id = binding_index
                     .id_of(producer_binding)
                     .expect("producer binding should be indexed");
-                if source_preservation != ProducerSourcePreservation::Safe
-                    && let Some(last_use) = binding_occurrences.last_use(binding_id)
-                {
+                let Some(last_use) = binding_occurrences.last_use(binding_id) else {
+                    continue;
+                };
+                // 同一原始批次还要消费这个 producer 时，不能先把它冻结为区间外声明。
+                // 否则 record 前缀先提交、SETLIST 再读取时会被 scope guard 拒绝，且前缀
+                // 自身无法复现原数组预分配。稳定 stmt id 单调递增，直接复用现有 use 索引。
+                let consumed_by_batch = last_use > stmt_ids[index]
+                    && stmt_ids
+                        .binary_search(&last_use)
+                        .ok()
+                        .is_some_and(|last| table_set_list_step(&block.stmts[last], binding));
+                if source_preservation != ProducerSourcePreservation::Safe || consumed_by_batch {
                     use_horizon =
                         Some(use_horizon.map_or(last_use, |horizon| horizon.max(last_use)));
                 }
@@ -255,9 +288,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
                 };
                 for local in &local_decl.bindings {
                     let binding = TableBinding::Local(*local);
-                    if !preserved_scope_bindings.contains(&binding) {
-                        preserved_scope_bindings.push(binding);
-                    }
+                    preserved_bindings.insert(preserved_binding_id(binding));
                 }
             }
             best_end = Some((index, preserved_stmt_indices.clone()));
@@ -322,63 +353,55 @@ fn preserved_nil_local_bindings(
     Some(bindings)
 }
 
-fn preserved_eventless_assignment_bindings(
-    block: &crate::hir::common::HirBlock,
-    seed_index: usize,
-    stmt_index: usize,
+fn preserved_eventless_assignment_binding(
+    stmt: &HirStmt,
     constructor_binding: TableBinding,
     binding_index: &BindingIndex,
     materialized_binding_counts: &[u32],
     debug_identity_bindings: &BindingSlots<bool>,
-) -> Option<Vec<TableBinding>> {
-    let HirStmt::Assign(assign) = block.stmts.get(stmt_index)? else {
+    local_is_nil: impl FnOnce(LocalId) -> bool,
+) -> Option<TableBinding> {
+    let HirStmt::Assign(assign) = stmt else {
         return None;
     };
-    let bindings = simple_assignment_bindings_if_eventless(assign, constructor_binding)?;
-    let [TableBinding::Local(local)] = bindings.as_slice() else {
+    let binding = simple_assignment_binding_if_eventless(assign, constructor_binding)?;
+    let TableBinding::Local(local) = binding else {
         return None;
     };
-    let binding_id = binding_index.id_of(TableBinding::Local(*local))?;
-    if materialized_binding_counts.get(binding_id).copied() != Some(2)
-        || !local_is_nil_before_seed(block, seed_index, *local)
-    {
+    let binding_id = binding_index.id_of(binding)?;
+    if materialized_binding_counts.get(binding_id).copied() != Some(2) || !local_is_nil(local) {
         // 候选拒绝[SemanticBarrier:Lifetime]：field 进入 seed 会把 table 内部 allocation/GC
         // 移到 assignment 前；只有旧值已证明为 nil 时，才不会跨过 root release 点。
         return None;
     }
-    if bindings.iter().any(|binding| {
-        debug_identity_bindings
-            .get(*binding)
-            .copied()
-            .unwrap_or_default()
-    }) {
+    if debug_identity_bindings
+        .get(binding)
+        .copied()
+        .unwrap_or_default()
+    {
         // 候选拒绝[SemanticBarrier:DebugScope]：字段提前到 source-visible assignment 之前，
         // 会改变 hook 在赋值行观察到的 fresh table 内容。
         return None;
     }
-    Some(bindings)
+    Some(binding)
 }
 
-fn local_is_nil_before_seed(
-    block: &crate::hir::common::HirBlock,
-    seed_index: usize,
-    local: crate::hir::common::LocalId,
-) -> bool {
-    for stmt in block.stmts[..seed_index].iter().rev() {
+/// 当前候选的声明前缀只归约一次；最近声明覆盖旧事实，用户代码屏障阻断更早来源。
+fn local_nil_values_before_seed(stmts: &[HirStmt]) -> BTreeMap<LocalId, bool> {
+    let mut values = BTreeMap::new();
+    for stmt in stmts.iter().rev() {
         let HirStmt::LocalDecl(local_decl) = stmt else {
-            return false;
+            break;
         };
-        if let Some(slot_index) = local_decl
-            .bindings
-            .iter()
-            .position(|binding| *binding == local)
-        {
-            return local_decl.values.tail.is_none()
-                && local_decl
-                    .values
-                    .fixed
-                    .get(slot_index)
-                    .is_none_or(|value| matches!(value, HirExpr::Nil));
+        for (slot_index, &binding) in local_decl.bindings.iter().enumerate() {
+            values.entry(binding).or_insert_with(|| {
+                local_decl.values.tail.is_none()
+                    && local_decl
+                        .values
+                        .fixed
+                        .get(slot_index)
+                        .is_none_or(|value| matches!(value, HirExpr::Nil))
+            });
         }
         if local_decl.values.tail.is_some()
             || local_decl
@@ -387,10 +410,10 @@ fn local_is_nil_before_seed(
                 .iter()
                 .any(|value| !local_prefix_expr_cannot_invoke_user_code(value))
         {
-            return false;
+            break;
         }
     }
-    false
+    values
 }
 
 fn local_prefix_expr_cannot_invoke_user_code(expr: &HirExpr) -> bool {
@@ -405,29 +428,27 @@ fn local_prefix_expr_cannot_invoke_user_code(expr: &HirExpr) -> bool {
         )
 }
 
-fn simple_assignment_bindings_if_eventless(
+fn simple_assignment_binding_if_eventless(
     assign: &crate::hir::common::HirAssign,
     constructor_binding: TableBinding,
-) -> Option<Vec<TableBinding>> {
-    if assign.targets.len() != 1
-        || assign.values.tail.is_some()
-        || assign.targets.len() != assign.values.fixed.len()
+) -> Option<TableBinding> {
+    let [target] = assign.targets.as_slice() else {
+        return None;
+    };
+    let [value] = assign.values.fixed.as_slice() else {
+        return None;
+    };
+    if assign.values.tail.is_some() {
+        return None;
+    }
+    let binding = binding_from_lvalue(target)?;
+    if binding == constructor_binding
+        || !seed_delay_expr_is_unobservable(value)
+        || expr_uses_binding(value, constructor_binding)
     {
         return None;
     }
-    let bindings = assign
-        .targets
-        .iter()
-        .map(binding_from_lvalue)
-        .collect::<Option<Vec<_>>>()?;
-    if bindings.contains(&constructor_binding)
-        || assign.values.fixed.iter().any(|value| {
-            !seed_delay_expr_is_unobservable(value) || expr_uses_binding(value, constructor_binding)
-        })
-    {
-        return None;
-    }
-    Some(bindings)
+    Some(binding)
 }
 
 fn constructor_step_is_unobservable(stmt: &HirStmt) -> bool {
@@ -463,32 +484,17 @@ fn constructor_step_is_unobservable(stmt: &HirStmt) -> bool {
     }
 }
 
-fn stmt_uses_any_binding(stmt: &HirStmt, bindings: &[TableBinding]) -> bool {
-    let expr_uses_any = |expr: &HirExpr| {
-        bindings
-            .iter()
-            .copied()
-            .any(|binding| expr_uses_binding(expr, binding))
-    };
-    match stmt {
-        HirStmt::LocalDecl(local_decl) => local_decl.values.iter().any(expr_uses_any),
-        HirStmt::Assign(assign) => {
-            assign.targets.iter().any(|target| match target {
-                HirLValue::TableAccess(access) => {
-                    expr_uses_any(&access.base) || expr_uses_any(&access.key)
-                }
-                HirLValue::Param(_)
-                | HirLValue::Temp(_)
-                | HirLValue::Local(_)
-                | HirLValue::Upvalue(_)
-                | HirLValue::Global(_) => false,
-            }) || assign.values.iter().any(expr_uses_any)
-        }
-        HirStmt::TableSetList(set_list) => {
-            expr_uses_any(&set_list.base) || set_list.values.iter().any(expr_uses_any)
-        }
-        _ => false,
-    }
+fn stmt_uses_any_binding(
+    stmt: &HirStmt,
+    summary: &StmtBindingSummary,
+    bindings: &BTreeSet<BindingId>,
+) -> bool {
+    !bindings.is_empty()
+        && matches!(
+            stmt,
+            HirStmt::LocalDecl(_) | HirStmt::Assign(_) | HirStmt::TableSetList(_)
+        )
+        && summary.uses().any(|binding| bindings.contains(&binding))
 }
 
 fn keyed_write_binding(stmt: &HirStmt) -> Option<TableBinding> {
@@ -751,7 +757,7 @@ pub(super) fn seed_overwrite_delay_is_unobservable(
                             .iter()
                             .all(seed_delay_expr_is_unobservable)
                 } else {
-                    simple_assignment_bindings_if_eventless(assign, binding).is_some()
+                    simple_assignment_binding_if_eventless(assign, binding).is_some()
                 }
             }
             HirStmt::TableSetList(set_list) => {
@@ -903,6 +909,7 @@ mod tests {
             HirTableConstructor::default(),
             &binding_index,
             &occurrences,
+            &summaries,
             &materialized_counts,
             &debug_identities,
             &ProtoPromotionFacts::default(),

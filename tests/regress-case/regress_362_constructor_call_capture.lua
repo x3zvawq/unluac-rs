@@ -1,5 +1,5 @@
 -- regress_362_constructor_call_capture: constructor-call folding must retain locals captured by an inlined field closure
--- unluac: expect-contains [[return (function(]]
+-- A constructor call may stay explicit when folding its installed field changes allocation.
 local function build()
     local callee = function(table_value, value)
         return table_value.get()

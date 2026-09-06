@@ -48,7 +48,8 @@ pub(super) use self::packs::lower_value_pack;
 use self::packs::lower_value_pack_single_eval;
 pub(super) use self::regs::block_is_absorbed_decision;
 pub(super) use self::regs::{
-    expr_for_reg_at_block_exit, expr_for_reg_use, expr_for_ssa_value, lower_closure_capture,
+    expr_for_reg_at_block_exit, expr_for_reg_use, expr_for_ssa_value, expr_for_ssa_value_in_block,
+    lower_closure_capture,
 };
 use self::regs::{
     expr_for_reg_use_dup_safe, expr_for_reg_use_inline,

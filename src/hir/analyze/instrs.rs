@@ -691,7 +691,7 @@ fn lower_fixed_targets(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> Vec
             // 随后 dead-temp 清理会静默删除真实赋值。
             lowering
                 .bindings
-                .lvalue_for_fixed_def(block, lowering.dataflow.def_reg(*def), *temp)
+                .lvalue_for_reg_result(block, lowering.dataflow.def_reg(*def), *temp)
         })
         .collect()
 }

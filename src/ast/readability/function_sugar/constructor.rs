@@ -24,7 +24,7 @@ use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
     AstAssign, AstBindingRef, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr,
     AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstReturn, AstStmt,
-    AstTableField, AstTableKey,
+    AstTableField,
 };
 
 pub(super) fn try_inline_terminal_constructor_fields(
@@ -47,13 +47,13 @@ pub(super) fn try_inline_terminal_constructor_fields(
     };
     let mut consumed = 1usize;
     let (field, func) = inlineable_local_table_function_stmt(stmts.get(consumed)?, binding)?;
-    if !table_can_append_record_field(table) {
+    if !table_can_append_record_field(table, &field) {
         return None;
     }
     table
         .fields
         .push(AstTableField::Record(crate::ast::AstRecordField {
-            key: AstTableKey::Name(field),
+            key: crate::ast::table_layout::record_key(&table.allocation, field),
             value: AstExpr::FunctionExpr(Box::new(func)),
         }));
     consumed += 1;
@@ -62,15 +62,21 @@ pub(super) fn try_inline_terminal_constructor_fields(
         let Some((field, func)) = inlineable_local_table_function_stmt(stmt, binding) else {
             break;
         };
+        if !table_can_append_record_field(table, &field) {
+            break;
+        }
         table
             .fields
             .push(AstTableField::Record(crate::ast::AstRecordField {
-                key: AstTableKey::Name(field),
+                key: crate::ast::table_layout::record_key(&table.allocation, field),
                 value: AstExpr::FunctionExpr(Box::new(func)),
             }));
         consumed += 1;
     }
 
+    if !crate::ast::table_layout::matches_preallocation(table) {
+        return None;
+    }
     Some((AstStmt::LocalDecl(Box::new(rewritten)), consumed))
 }
 
@@ -92,6 +98,7 @@ pub(super) fn try_inline_terminal_constructor_call(
             binding: arg.binding,
             value: arg.value,
             pass_to_sink: true,
+            fields_extended: false,
         });
         consumed += 1;
     }
@@ -111,6 +118,14 @@ pub(super) fn try_inline_terminal_constructor_call(
         break;
     }
 
+    // 原分配容量约束完整字段批次；局部候选尚未安装，失败时整次回滚。
+    if arg_locals.iter().any(|arg| {
+        arg.fields_extended
+            && matches!(&arg.value, AstExpr::TableConstructor(table)
+                if !crate::ast::table_layout::matches_preallocation(table))
+    }) {
+        return None;
+    }
     let sink = stmts.get(consumed)?;
     let rewritten_sink = rewrite_terminal_constructor_call_sink(
         sink,
@@ -181,6 +196,7 @@ struct ConstructorArg {
     binding: AstLocalBinding,
     value: AstExpr,
     pass_to_sink: bool,
+    fields_extended: bool,
 }
 
 struct ConstructorLocal {
@@ -292,15 +308,16 @@ fn inline_arg_local_table_function(stmt: &AstStmt, arg_locals: &mut [Constructor
         else {
             continue;
         };
-        if !table_can_append_record_field(table) {
+        if !table_can_append_record_field(table, &field) {
             return false;
         }
         table
             .fields
             .push(AstTableField::Record(crate::ast::common::AstRecordField {
-                key: AstTableKey::Name(field),
+                key: crate::ast::table_layout::record_key(&table.allocation, field),
                 value: AstExpr::FunctionExpr(Box::new(func)),
             }));
+        arg_local.fields_extended = true;
         return true;
     }
     false
@@ -341,7 +358,7 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     let AstExpr::TableConstructor(table) = &mut arg_locals[outer_index].value else {
         unreachable!("checked outer constructor above")
     };
-    if !table_can_append_record_field(table) {
+    if !table_can_append_record_field(table, &field) {
         return false;
     }
 
@@ -351,14 +368,23 @@ fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorAr
     table
         .fields
         .push(AstTableField::Record(crate::ast::AstRecordField {
-            key: AstTableKey::Name(field),
+            key: crate::ast::table_layout::record_key(&table.allocation, field),
             value: inner_value,
         }));
     arg_locals[inner_index].pass_to_sink = false;
+    arg_locals[outer_index].fields_extended = true;
     true
 }
 
-fn table_can_append_record_field(table: &crate::ast::common::AstTableConstructor) -> bool {
+fn table_can_append_record_field(
+    table: &crate::ast::common::AstTableConstructor,
+    field: &str,
+) -> bool {
+    if !table.allocation.permits_record_key(Some(
+        crate::value_semantics::table::TableTemplateKey::String(field.into()),
+    )) {
+        return false;
+    }
     // 候选拒绝[SemanticBarrier:ValueArity]：追加字段会让原末尾 open call/vararg 不再展开，具体反例见 regress_401。
     !matches!(
         table.fields.last(),

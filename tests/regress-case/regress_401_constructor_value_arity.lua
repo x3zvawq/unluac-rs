@@ -1,8 +1,9 @@
 -- regress_401_constructor_value_arity: a scalar call initializer stays scalar as the final argument
--- unluac: expect-not-contains [[.call_marker = function]]
--- unluac: expect-not-contains [[.if_marker = function]]
--- unluac: expect-not-contains [[.numeric_marker = function]]
--- unluac: expect-not-contains [[.iterator_marker = function]]
+-- Adding these fields to the empty constructor would change its hash preallocation.
+-- unluac: expect-contains [[.call_marker = function]]
+-- unluac: expect-contains [[.if_marker = function]]
+-- unluac: expect-contains [[.numeric_marker = function]]
+-- unluac: expect-contains [[.iterator_marker = function]]
 
 local function pair()
     return 7, 99

@@ -21,6 +21,39 @@ use crate::value_semantics::table::{
     TableFieldRef, TableRuntimeOperand, runtime_table_operand, table_constant_kind,
 };
 
+/// 原 Luau 容量由 lowering 发布；这里只投影最终裸字段名和 pack tail 的语法位置。
+pub(in crate::hir) fn matches_luau_allocation(table: &super::common::HirTableConstructor) -> bool {
+    let super::common::HirTableAllocation::Luau(allocation) = table.allocation else {
+        return true;
+    };
+    let mut next_array = 0;
+    let fields = table.fields.iter().map(|field| {
+        if table.allocation.permits_named_record_keys()
+            && let HirTableField::Record(record) = field
+            && let HirExpr::String(key) = &record.key
+            && let Some(name) = key.as_utf8()
+            && crate::decompile::DecompileDialect::Luau.is_identifier_name(name)
+        {
+            return TableFieldRef::Named(name);
+        }
+        field_ref(field, &mut next_array)
+    });
+    let tail = table
+        .trailing_multivalue
+        .as_ref()
+        .map(|tail| TableFieldRef::Array {
+            index: 0,
+            value: tail.as_expr(),
+        });
+    allocation.matches_luau(
+        fields.chain(tail),
+        table
+            .trailing_multivalue
+            .as_ref()
+            .is_some_and(|tail| matches!(tail.as_expr(), HirExpr::VarArg)),
+    )
+}
+
 /// builder 只投影本次拟晋升的连续整数 record，容量规则由共享模板语义计算。
 pub(in crate::hir) fn candidate_template_array_capacity(
     table: &super::common::HirTableConstructor,

@@ -24,7 +24,7 @@ use crate::ast::common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstCallExpr, AstCallKind, AstExpr, AstFieldAccess,
     AstFunctionExpr, AstGlobalName, AstIndexAccess, AstLValue, AstLocalDecl, AstLogicalExpr,
     AstMethodCallExpr, AstNameRef, AstStmt, AstTableConstructor, AstTableField, AstTableKey,
-    AstUnaryExpr, AstUnaryOpKind, is_lua_identifier_name,
+    AstUnaryExpr, AstUnaryOpKind,
 };
 
 impl<'a> AstLowerer<'a> {
@@ -323,8 +323,9 @@ impl<'a> AstLowerer<'a> {
                         }
                         HirTableField::Record(record) => {
                             Ok(AstTableField::Record(crate::ast::common::AstRecordField {
-                                key: if let Some(name) =
-                                    field_name_from_key(&record.key, self.target.version)
+                                key: if table.allocation.permits_named_record_keys()
+                                    && let Some(name) =
+                                        field_name_from_key(&record.key, self.target.version)
                                 {
                                     AstTableKey::Name(name)
                                 } else {
@@ -605,7 +606,7 @@ fn field_name_from_key(key: &HirExpr, dialect: DecompileDialect) -> Option<Strin
 
 fn identifier_from_lua_key(key: &crate::LuaString, dialect: DecompileDialect) -> Option<String> {
     let name = key.as_utf8()?;
-    is_lua_identifier_name(name, dialect).then(|| name.to_owned())
+    dialect.is_identifier_name(name).then(|| name.to_owned())
 }
 
 fn lower_global_expr(

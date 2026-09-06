@@ -286,30 +286,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
     }
 
     pub(super) fn ssa_reg(&self, owner: RegionId, value: SsaValue) -> Result<Reg, HirLowerError> {
-        match value {
-            SsaValue::Entry(reg) => Ok(reg),
-            SsaValue::Def(def) => self
-                .lowering
-                .dataflow
-                .defs
-                .get(def.index())
-                .map(|def| def.reg)
-                .ok_or(HirLowerError::InvalidPlanRegion {
-                    proto: self.proto.index(),
-                    region: owner.index(),
-                    detail: "SSA value references a missing def",
-                }),
-            SsaValue::Phi(phi) => self
-                .lowering
-                .structure
-                .plan()
-                .phi_plan(phi)
-                .map(|phi| phi.reg)
-                .ok_or(HirLowerError::InvalidPlanRegion {
-                    proto: self.proto.index(),
-                    region: owner.index(),
-                    detail: "SSA value references a missing final phi plan",
-                }),
-        }
+        self.lowering
+            .ssa_reg(value)
+            .ok_or(HirLowerError::InvalidPlanRegion {
+                proto: self.proto.index(),
+                region: owner.index(),
+                detail: "SSA value references a missing def or final phi plan",
+            })
     }
 }

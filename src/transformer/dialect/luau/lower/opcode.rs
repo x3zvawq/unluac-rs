@@ -306,7 +306,7 @@ impl<'a> ProtoLowerer<'a> {
                     raw_index += 1;
                 }
                 LuauOpcode::NewTable => {
-                    let (a, _) = expect_ab(raw_pc, opcode, operands)?;
+                    let (a, b) = expect_ab(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
                     self.emit(
@@ -314,7 +314,13 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
                             dst,
-                            allocation: Default::default(),
+                            allocation: crate::transformer::TableAllocation::Luau(
+                                crate::value_semantics::table::allocation::TablePreallocation::exact(
+                                    required_aux(raw_pc, opcode, extra)?, b,
+                                ).ok_or(TransformError::UnexpectedOperands {
+                                    raw_pc, opcode: "NEWTABLE", expected: "table preallocation fits u32",
+                                })?,
+                            ),
                         })),
                     );
                     raw_index += 1;
@@ -328,10 +334,9 @@ impl<'a> ProtoLowerer<'a> {
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::NewTable(NewTableInstr {
                             dst,
-                            allocation: Default::default(),
+                            allocation: self.table_template(raw_pc, d as usize)?,
                         })),
                     );
-                    self.emit_dup_table_template(raw_pc, raw_index, dst, d as usize)?;
                     raw_index += 1;
                 }
                 LuauOpcode::NameCall => {

@@ -13,10 +13,23 @@ pub(crate) fn expr_for_reg_use(
     instr_ref: InstrRef,
     reg: Reg,
 ) -> HirExpr {
-    if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
-        return HirExpr::LocalRef(local);
-    }
-    expr_for_ssa_value(lowering, lowering.dataflow.use_value(instr_ref, reg))
+    lowering.bindings.expr_for_reg_value(block, reg, || {
+        expr_for_ssa_value(lowering, lowering.dataflow.use_value(instr_ref, reg))
+    })
+}
+
+/// 冻结叶值保留 SSA 来源，但在读取位置消费已有循环 binding；不能引用未发射的 dispatch temp。
+pub(in crate::hir::analyze) fn expr_for_ssa_value_in_block(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    value: SsaValue,
+) -> Option<HirExpr> {
+    let reg = lowering.ssa_reg(value)?;
+    Some(
+        lowering
+            .bindings
+            .expr_for_reg_value(block, reg, || expr_for_ssa_value(lowering, value)),
+    )
 }
 
 pub(crate) fn lower_closure_capture(

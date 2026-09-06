@@ -1,7 +1,8 @@
 -- regress_423_constructor_extra_arg_order: only extra args before a pending constructor handoff need an eventless proof
--- unluac: expect-contains [[}, __reg423_suffix_values())]]
+-- Allocation may keep the table argument explicit; suffix expansion and prefix ordering remain mandatory.
+-- unluac: expect-contains [[, __reg423_suffix_values())]]
 -- unluac: expect-order [["prefix-table"]] [[__reg423_mark("prefix-extra", 11)]]
--- unluac: expect-not-contains [[.read = function]]
+-- unluac: expect-contains [[.read = function]]
 
 local events = {}
 

@@ -93,7 +93,9 @@ fn lower_value_target(
                 // 依赖链展开；普通 def lowering 可能返回引用那些不会再被发射的中间 temp。
                 Some(def) => expr_for_fixed_def_single_eval(lowering, def)
                     .or_else(|| expr_for_fixed_def(lowering, def))?,
-                None => expr_for_ssa_value(lowering, leaf.value),
+                None => super::super::exprs::expr_for_ssa_value_in_block(
+                    lowering, leaf.block, leaf.value,
+                )?,
             };
             Some(HirDecisionTarget::Expr(expr))
         }
@@ -109,11 +111,15 @@ fn expr_for_emitted_header_leaf(
     header: BlockRef,
     def: crate::structure::DefId,
 ) -> HirExpr {
-    let fallback = || expr_for_ssa_value(lowering, crate::structure::SsaValue::Def(def));
+    let reg = lowering.dataflow.def_reg(def);
+    let fallback = || {
+        lowering.bindings.expr_for_reg_value(header, reg, || {
+            expr_for_ssa_value(lowering, crate::structure::SsaValue::Def(def))
+        })
+    };
     let Some(temp) = lowering.bindings.fixed_temps.get(def.index()).copied() else {
         return fallback();
     };
-    let reg = lowering.dataflow.def_reg(def);
 
     // Header prefix 仍按原位置发射。这里只把没有源码/捕获身份的稳定字面量交给
     // decision leaf；随后 dead-temp 才能在确认无剩余引用后删除那条机械赋值。

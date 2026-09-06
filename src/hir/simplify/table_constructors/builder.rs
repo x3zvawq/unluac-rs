@@ -15,6 +15,8 @@ use crate::hir::common::{
 };
 
 use super::{RebuildScratch, RestoredArrayField, RestoredPendingIntegerField};
+use crate::hir::value_facts::value_facts;
+use crate::value_semantics::table::TableExpression;
 
 #[derive(Debug, Clone)]
 enum BuilderField {
@@ -42,15 +44,22 @@ pub(super) struct ConstructorBuilder {
     pub(super) trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
     pending_integer_fields: BTreeMap<i64, PendingIntegerField>,
+    // 未知键一次遮蔽所有更早的 pending；位置随事务回滚，避免逐键重复标记。
+    last_unknown_key_field: Option<usize>,
+    // 首次字段位置使搬移/降级不改变键身份，回滚只需移除检查点之后首次出现的键。
+    numeric_key_first_fields: BTreeMap<i64, usize>,
+    moved_fields: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct BuilderCheckpoint {
     fields_len: usize,
+    last_unknown_key_field: Option<usize>,
     trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
     restored_pending_integer_fields_len: usize,
     restored_array_fields_len: usize,
+    moved_fields: usize,
 }
 
 impl ConstructorBuilder {
@@ -61,6 +70,9 @@ impl ConstructorBuilder {
             trailing_multivalue: constructor.trailing_multivalue,
             next_array_index: 1,
             pending_integer_fields: BTreeMap::new(),
+            last_unknown_key_field: None,
+            numeric_key_first_fields: BTreeMap::new(),
+            moved_fields: 0,
         };
         for field in constructor.fields {
             match field {
@@ -70,6 +82,12 @@ impl ConstructorBuilder {
                 HirTableField::Record(field) => {
                     if builder.trailing_multivalue.is_some() {
                         // 已完成构造器的 array 数量决定 open tail 起点，不能重新晋升 record。
+                        if let Some(key) = field.key.table_integer_key() {
+                            builder
+                                .numeric_key_first_fields
+                                .entry(key)
+                                .or_insert(builder.fields.len());
+                        }
                         builder
                             .fields
                             .push(BuilderField::Final(HirTableField::Record(field)));
@@ -108,17 +126,23 @@ impl ConstructorBuilder {
     pub(super) fn checkpoint(&self, scratch: &RebuildScratch) -> BuilderCheckpoint {
         BuilderCheckpoint {
             fields_len: self.fields.len(),
+            last_unknown_key_field: self.last_unknown_key_field,
             trailing_multivalue: self.trailing_multivalue.clone(),
             next_array_index: self.next_array_index,
             restored_pending_integer_fields_len: scratch.restored_pending_integer_fields.len(),
             restored_array_fields_len: scratch.restored_array_fields.len(),
+            moved_fields: self.moved_fields,
         }
     }
 
     pub(super) fn rollback(&mut self, checkpoint: BuilderCheckpoint, scratch: &mut RebuildScratch) {
         self.fields.truncate(checkpoint.fields_len);
+        self.last_unknown_key_field = checkpoint.last_unknown_key_field;
+        self.numeric_key_first_fields
+            .retain(|_, first_field| *first_field < checkpoint.fields_len);
         self.trailing_multivalue = checkpoint.trailing_multivalue;
         self.next_array_index = checkpoint.next_array_index;
+        self.moved_fields = checkpoint.moved_fields;
         for restored in scratch.restored_array_fields[checkpoint.restored_array_fields_len..]
             .iter()
             .rev()
@@ -178,11 +202,29 @@ impl ConstructorBuilder {
         self.next_array_index
     }
 
+    /// 已完成的字段段超过原分配上界时，保留 scanner 的上一个完整事务。
+    /// 重复字段也计入这个保守预算；精确语法布局仍在完整构造器提交处统一核对。
+    pub(super) fn fits_preallocated_field_count(&self) -> bool {
+        let HirTableAllocation::Luau(allocation) = self.allocation else {
+            return true;
+        };
+        let fields = self.fields.len() - self.moved_fields;
+        let tail_slot = self
+            .trailing_multivalue
+            .as_ref()
+            .is_some_and(|tail| !matches!(tail.as_expr(), HirExpr::VarArg));
+        fields as u64 + u64::from(tail_slot)
+            <= u64::from(allocation.array_capacity) + u64::from(allocation.hash_capacity)
+    }
+
     pub(super) fn has_indexed_array_layout(&self) -> bool {
         self.allocation.indexed_array_capacity().is_some()
     }
 
     pub(super) fn push_array_value(&mut self, value: HirExpr) {
+        self.numeric_key_first_fields
+            .entry(i64::from(self.next_array_index))
+            .or_insert(self.fields.len());
         self.fields
             .push(BuilderField::Final(HirTableField::Array(value)));
         self.next_array_index += 1;
@@ -199,14 +241,24 @@ impl ConstructorBuilder {
     ) {
         self.shadow_aliased_pending_integer_fields(&field.key);
         let current_next_index = i64::from(self.next_array_index);
-        match field.key {
-            HirExpr::Integer(value)
+        let numeric_key = field.key.table_integer_key();
+        let field_index = self.fields.len();
+        match numeric_key {
+            Some(value)
                 if (matches!(policy, RecordPromotionPolicy::Normal)
                     || matches!(policy, RecordPromotionPolicy::PreserveSetListPrefix { start_index } if value < i64::from(start_index)))
                     && value == current_next_index
-                    && !self.has_numeric_key(value)
+                    && !self.numeric_key_first_fields.contains_key(&value)
                     && match self.allocation {
-                        HirTableAllocation::Batched => expr_is_definitely_non_nil(&field.value),
+                        HirTableAllocation::Synthetic | HirTableAllocation::LuauTemplate { .. } => {
+                            value_facts(&field.value).is_non_nil()
+                        }
+                        HirTableAllocation::Luau(allocation) => {
+                            value <= i64::from(allocation.array_capacity)
+                                && value_facts(&field.value).is_non_nil()
+                        }
+                        // PUC 的数组字段由原 SETLIST 发布；数字 record 仍计入 hash 预分配。
+                        HirTableAllocation::PucBatched(_) => false,
                         HirTableAllocation::Template { .. } => true,
                         HirTableAllocation::Indexed { array_capacity, .. } => {
                             value <= i64::from(array_capacity)
@@ -215,13 +267,14 @@ impl ConstructorBuilder {
             {
                 self.push_array_value(field.value);
             }
-            HirExpr::Integer(value)
-                if can_stage_pending_integer_record(
-                    value,
-                    current_next_index,
-                    &field.value,
-                    policy,
-                ) =>
+            Some(value)
+                if !matches!(self.allocation, HirTableAllocation::PucBatched(_))
+                    && can_stage_pending_integer_record(
+                        value,
+                        current_next_index,
+                        &field.value,
+                        policy,
+                    ) =>
             {
                 if let std::collections::btree_map::Entry::Vacant(entry) =
                     self.pending_integer_fields.entry(value)
@@ -244,12 +297,17 @@ impl ConstructorBuilder {
                     )));
                 }
             }
-            key => self.fields.push(BuilderField::Final(HirTableField::Record(
+            _ => self.fields.push(BuilderField::Final(HirTableField::Record(
                 crate::hir::common::HirRecordField {
-                    key,
+                    key: field.key,
                     value: field.value,
                 },
             ))),
+        }
+        if let Some(key) = numeric_key {
+            self.numeric_key_first_fields
+                .entry(key)
+                .or_insert(field_index);
         }
     }
 
@@ -261,12 +319,17 @@ impl ConstructorBuilder {
             .pending_integer_fields
             .remove(&i64::from(self.next_array_index))
         {
-            if pending.shadowed_at.is_some() {
+            if pending.shadowed_at.is_some()
+                || self
+                    .last_unknown_key_field
+                    .is_some_and(|field_index| field_index > pending.field_index)
+            {
                 continue;
             }
             let field_index = pending.field_index;
             let old_field =
                 std::mem::replace(&mut self.fields[field_index], BuilderField::MovedPendingInt);
+            self.moved_fields += 1;
             let BuilderField::PendingInt { key, value } = old_field else {
                 unreachable!("pending integer field index should always point at a pending field");
             };
@@ -333,27 +396,9 @@ impl ConstructorBuilder {
             }
             Some(None) => {}
             None => {
-                for pending in self.pending_integer_fields.values_mut() {
-                    pending.shadowed_at.get_or_insert(shadowed_at);
-                }
+                self.last_unknown_key_field = Some(shadowed_at);
             }
         }
-    }
-
-    fn has_numeric_key(&self, key: i64) -> bool {
-        let mut array_index = 1_i64;
-        self.fields.iter().any(|field| match field {
-            BuilderField::Final(HirTableField::Array(_)) => {
-                let matches = array_index == key;
-                array_index += 1;
-                matches
-            }
-            BuilderField::Final(HirTableField::Record(record)) => {
-                numeric_key_matches(&record.key, key)
-            }
-            BuilderField::PendingInt { key: existing, .. } => *existing == key,
-            BuilderField::MovedPendingInt => false,
-        })
     }
 }
 
@@ -395,17 +440,7 @@ fn restore_indexed_array_fields(constructor: &mut HirTableConstructor) {
 
 fn statically_known_numeric_key(key: &HirExpr) -> Option<Option<i64>> {
     match key {
-        HirExpr::Integer(value) => Some(Some(*value)),
-        HirExpr::Number(value) => {
-            if value.is_finite()
-                && value.fract() == 0.0
-                && value.abs() <= ((1_u64 << f64::MANTISSA_DIGITS) as f64)
-            {
-                Some(Some(*value as i64))
-            } else {
-                None
-            }
-        }
+        HirExpr::Integer(_) | HirExpr::Number(_) => key.table_integer_key().map(Some),
         HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::String(_)
@@ -432,16 +467,6 @@ fn statically_known_numeric_key(key: &HirExpr) -> Option<Option<i64>> {
     }
 }
 
-fn numeric_key_matches(key: &HirExpr, expected: i64) -> bool {
-    match key {
-        HirExpr::Integer(value) => *value == expected,
-        HirExpr::Number(value) => {
-            value.is_finite() && value.fract() == 0.0 && *value == expected as f64
-        }
-        _ => false,
-    }
-}
-
 fn can_reorder_integer_record_value(expr: &HirExpr) -> bool {
     matches!(
         expr,
@@ -453,22 +478,6 @@ fn can_reorder_integer_record_value(expr: &HirExpr) -> bool {
             | HirExpr::UInt64(_)
             | HirExpr::Vector(_)
             | HirExpr::Complex { .. }
-    )
-}
-
-pub(super) fn expr_is_definitely_non_nil(expr: &HirExpr) -> bool {
-    matches!(
-        expr,
-        HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::Closure(_)
-            | HirExpr::TableConstructor(_)
     )
 }
 
