@@ -144,7 +144,7 @@ pub(super) fn snapshot_generic_for_root(
     state: &mut RootState,
     effects: &[ProtoEffects],
 ) {
-    let Some(callee) = adjusted_value(&flow.for_stmt().iterator, 0) else {
+    let Some(callee) = flow.for_stmt().iterator.result_source(0) else {
         return;
     };
     let callees = holder_values(callee, state, effects);
@@ -227,7 +227,7 @@ pub(super) fn update_state_for_stmt(
                         (
                             binding,
                             BindingValue::resolve(
-                                adjusted_value(&assign.values, index),
+                                assign.values.result_source(index),
                                 state,
                                 effects,
                                 safety,
@@ -238,7 +238,7 @@ pub(super) fn update_state_for_stmt(
                 .collect::<Vec<_>>();
             for (index, (target, value)) in assign.targets.iter().zip(values).enumerate() {
                 if matches!(target, HirLValue::Global(_) | HirLValue::Upvalue(_))
-                    && let Some(value) = adjusted_value(&assign.values, index)
+                    && let Some(value) = assign.values.result_source(index)
                 {
                     escape_expr(value, state, captures, effects, safety);
                 }
@@ -248,7 +248,7 @@ pub(super) fn update_state_for_stmt(
                     store_table(
                         &access.base,
                         Some(&access.key),
-                        adjusted_value(&assign.values, index),
+                        assign.values.result_source(index),
                         state,
                         captures,
                         effects,
@@ -291,7 +291,7 @@ fn assign_bindings(
         .map(|(index, binding)| {
             (
                 binding,
-                BindingValue::resolve(adjusted_value(values, index), state, effects, safety),
+                BindingValue::resolve(values.result_source(index), state, effects, safety),
             )
         })
         .collect::<Vec<_>>();
@@ -347,17 +347,6 @@ impl BindingValue {
             state.roots.remove(&binding);
         }
     }
-}
-
-fn adjusted_value(values: &HirValuePack, index: usize) -> Option<&HirExpr> {
-    if let Some(value) = values.fixed.get(index) {
-        return Some(value);
-    }
-    let tail = values.tail.as_ref()?;
-    let tail_index = index - values.fixed.len();
-    tail.exact_width()
-        .is_none_or(|width| tail_index < width)
-        .then(|| tail.as_expr())
 }
 
 fn adjusted_value_may_be_unknown(

@@ -8,7 +8,6 @@
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
-use super::super::binding_ref::binding_from_name_ref;
 use crate::ast::common::{
     AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalBinding, AstNameRef, AstStmt,
 };
@@ -22,7 +21,7 @@ pub(in crate::ast::readability) struct BindingRefSet {
 impl BindingRefSet {
     fn finder(&self) -> NameFinder<impl FnMut(&AstNameRef, NameAccess) -> bool + '_> {
         NameFinder::new(|name, _| {
-            binding_from_name_ref(name).is_some_and(|binding| self.ids.contains(&binding))
+            AstBindingRef::from_name_ref(name).is_some_and(|binding| self.ids.contains(&binding))
         })
     }
 
@@ -31,13 +30,6 @@ impl BindingRefSet {
             ids: bindings.iter().map(|binding| binding.id).collect(),
         }
     }
-}
-
-pub(in crate::ast::readability) fn stmt_references_any_binding(
-    stmt: &AstStmt,
-    bindings: &[AstLocalBinding],
-) -> bool {
-    stmt_references_binding_set(stmt, &BindingRefSet::from_bindings(bindings))
 }
 
 pub(in crate::ast::readability) fn stmt_references_binding_set(
@@ -80,7 +72,8 @@ pub(in crate::ast::readability) fn expr_has_binding_read(
     mut accepts: impl FnMut(AstBindingRef) -> bool,
 ) -> bool {
     NameFinder::new(|name, access| {
-        matches!(access, NameAccess::Read) && binding_from_name_ref(name).is_some_and(&mut accepts)
+        matches!(access, NameAccess::Read)
+            && AstBindingRef::from_name_ref(name).is_some_and(&mut accepts)
     })
     .in_expr(expr)
 }

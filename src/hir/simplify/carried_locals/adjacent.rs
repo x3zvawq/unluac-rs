@@ -21,6 +21,7 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::expr_facts::expr_truthiness;
+use super::super::label_refs::stmt_has_label_or_goto;
 use super::super::local_shapes::{empty_single_local_decl_binding, initialized_single_local_decl};
 use super::super::mention::{expr_mentions_local, stmt_captures_local, stmts_mention_local};
 use super::super::walk::rewrite_stmts;
@@ -284,7 +285,7 @@ fn carried_write_dominance(
     carried: LocalId,
     safety: HirExprSafety,
 ) -> CarriedWriteDominance {
-    if stmts.iter().any(stmt_has_unstructured_control) {
+    if stmts.iter().any(stmt_has_label_or_goto) {
         return CarriedWriteDominance::UnstructuredControl;
     }
     match analyze_dominance_stmts(stmts, WriteStates::UNWRITTEN, carried, safety) {
@@ -565,55 +566,6 @@ fn ensure_expr_is_initialized(
         Err(DominanceError::ReadBeforeWrite)
     } else {
         Ok(())
-    }
-}
-
-fn stmt_has_unstructured_control(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => false,
-        HirStmt::Goto(_) | HirStmt::Label(_) => true,
-        HirStmt::If(if_stmt) => {
-            if_stmt
-                .then_block
-                .stmts
-                .iter()
-                .any(stmt_has_unstructured_control)
-                || if_stmt.else_block.as_ref().is_some_and(|else_block| {
-                    else_block.stmts.iter().any(stmt_has_unstructured_control)
-                })
-        }
-        HirStmt::While(while_stmt) => while_stmt
-            .body
-            .stmts
-            .iter()
-            .any(stmt_has_unstructured_control),
-        HirStmt::Repeat(repeat_stmt) => repeat_stmt
-            .body
-            .stmts
-            .iter()
-            .any(stmt_has_unstructured_control),
-        HirStmt::NumericFor(numeric_for) => numeric_for
-            .body
-            .stmts
-            .iter()
-            .any(stmt_has_unstructured_control),
-        HirStmt::GenericFor(generic_for) => generic_for
-            .body
-            .stmts
-            .iter()
-            .any(stmt_has_unstructured_control),
-        HirStmt::Block(block) => block.stmts.iter().any(stmt_has_unstructured_control),
-        HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue => false,
     }
 }
 

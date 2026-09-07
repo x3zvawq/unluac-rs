@@ -9,7 +9,6 @@ use crate::ast::common::{
 };
 
 use super::binding_flow::expr_reads_binding;
-use super::binding_ref::name_matches_binding;
 
 /// 只检查本语句的求值部分；子块和函数声明不属于当前 sink 的表达式位置。
 fn stmt_has_binding_use_by(
@@ -207,7 +206,7 @@ fn call_has_direct_call_arg_binding_use(call: &AstCallKind, binding: AstBindingR
 
 fn args_have_direct_call_arg_binding_use(args: &[AstExpr], binding: AstBindingRef) -> bool {
     args.iter()
-        .any(|arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, binding)))
+        .any(|arg| matches!(arg, AstExpr::Var(name) if binding.matches_name_ref(name)))
 }
 
 fn call_has_contextual_binding_use(
@@ -376,7 +375,7 @@ fn expr_has_contextual_binding_use(
     context: BindingUseContext,
 ) -> bool {
     match expr {
-        AstExpr::Var(name) if name_matches_binding(name, binding) => context.matches_var(),
+        AstExpr::Var(name) if binding.matches_name_ref(name) => context.matches_var(),
         AstExpr::FieldAccess(access) => {
             expr_has_contextual_binding_use(&access.base, binding, context.field_base())
         }

@@ -49,7 +49,7 @@ use std::{
     rc::Rc,
 };
 
-use super::label_refs::count_label_references;
+use super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::lexical_cfg::LexicalCfg;
 use super::mention::{
     stmt_writes_temp, stmts_reference_captured_bindings, stmts_to_be_closed_temps,
@@ -64,7 +64,6 @@ use super::root_lifetimes::{
 use super::temp_touch::{
     TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
     collect_temp_refs_in_expr, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
-    stmt_contains_nested_nonlocal_control,
 };
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirInitializerMergeTransactionId, HirLValue, HirLocalDecl,
@@ -643,10 +642,7 @@ fn collect_plans(
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> Vec<PromotionPlan> {
-    let label_flow_boundary = block
-        .stmts
-        .iter()
-        .position(stmt_contains_nested_nonlocal_control);
+    let label_flow_boundary = block.stmts.iter().position(stmt_has_label_or_goto);
     let linear_prefix_end = label_flow_boundary.unwrap_or(block.stmts.len());
     let lifetime_stmts = &block.stmts[..linear_prefix_end];
     let has_label_flow = label_flow_boundary.is_some();

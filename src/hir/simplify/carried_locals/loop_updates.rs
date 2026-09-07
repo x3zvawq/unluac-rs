@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirLValue, HirLabelId, HirStmt, LocalId, TempId,
 };
-use crate::hir::expr_safety::HirExprSafety;
+use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::promotion::{HomeSlots, ProtoPromotionFacts};
 
 use super::super::label_refs::count_label_references;
@@ -429,41 +429,11 @@ impl HirVisitor for PhysicalBindingWriteCollector {
 }
 
 fn between_may_observe_gc_roots(stmts: &[HirStmt], safety: HirExprSafety) -> bool {
-    let mut collector = GapRootObservationCollector {
-        found: false,
-        safety,
-    };
+    let mut collector = HirEvalEffects::new(safety, |stmt| {
+        matches!(stmt, HirStmt::ErrNil(_) | HirStmt::ToBeClosed(_))
+    });
     visit_stmts(stmts, &mut collector);
-    collector.found
-}
-
-struct GapRootObservationCollector {
-    found: bool,
-    safety: HirExprSafety,
-}
-
-impl HirVisitor for GapRootObservationCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(
-            stmt,
-            HirStmt::GlobalDecl(_)
-                | HirStmt::ErrNil(_)
-                | HirStmt::ToBeClosed(_)
-                | HirStmt::Close(_)
-        );
-    }
-
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
-    }
-
-    fn visit_call(&mut self, _call: &crate::hir::common::HirCallExpr) {
-        self.found = true;
-    }
+    collector.found()
 }
 
 #[derive(Default)]

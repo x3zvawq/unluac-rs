@@ -6,7 +6,6 @@
 //! 例如：`local f = function() ... end; t.f = f` 会在这里尝试合成 `function t.f() ... end`。
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
-use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_stable_context_expr;
 use super::direct::function_decl_target_from_lvalue;
 use crate::ast::common::{
@@ -94,7 +93,7 @@ fn inline_function_into_stmt(
             let AstExpr::Var(name) = &global_decl.values[0] else {
                 return None;
             };
-            if !name_matches_binding(name, binding) {
+            if !binding.matches_name_ref(name) {
                 return None;
             }
             if global_decl.bindings[0].attr == crate::ast::common::AstGlobalAttr::None
@@ -120,7 +119,7 @@ fn inline_function_into_stmt(
             let AstExpr::Var(name) = &assign.values[0] else {
                 return None;
             };
-            if !name_matches_binding(name, binding) {
+            if !binding.matches_name_ref(name) {
                 return None;
             }
             if !lvalue_prefix_can_move_before_closure(&assign.targets[0], mutable_snapshots) {

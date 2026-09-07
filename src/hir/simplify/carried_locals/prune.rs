@@ -16,9 +16,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
+    HirAssign, HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
 };
-use crate::hir::expr_safety::HirExprSafety;
+use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::super::mention::stmts_reference_captured_bindings;
@@ -27,7 +27,7 @@ use super::super::walk::{HirRewritePass, rewrite_stmts};
 use super::binding::{
     CarryBinding, carry_binding_from_expr, carry_binding_from_lvalue, single_binding_copy,
 };
-use crate::hir::visit::{HirVisitor, visit_block, visit_expr, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_block, visit_stmt_structure, visit_stmts};
 
 pub(super) struct RedundantSelfAssignPrunePass {
     prunable_bindings: BTreeSet<CarryBinding>,
@@ -620,7 +620,9 @@ fn rewrite_branch_state_block(
                     &while_stmt.body,
                     &known,
                     facts,
-                    expr_may_execute_user_code(&while_stmt.cond, facts.safety),
+                    !facts
+                        .safety
+                        .is_discard_safe_without_residual(&while_stmt.cond),
                 );
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut while_stmt.body, facts, loop_entry, true);
@@ -634,7 +636,9 @@ fn rewrite_branch_state_block(
                     &repeat_stmt.body,
                     &known,
                     facts,
-                    expr_may_execute_user_code(&repeat_stmt.cond, facts.safety),
+                    !facts
+                        .safety
+                        .is_discard_safe_without_residual(&repeat_stmt.cond),
                 );
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut repeat_stmt.body, facts, loop_entry, true);
@@ -914,9 +918,9 @@ fn invalidate_capture_writes_from_stmt(
     stmt: &HirStmt,
     facts: &BranchStateCopyFacts<'_>,
 ) {
-    let mut effects = UserCodeEffectCollector::new(facts.safety);
+    let mut effects = HirEvalEffects::new(facts.safety, |_| false);
     visit_stmts(std::slice::from_ref(stmt), &mut effects);
-    if effects.found {
+    if effects.found() {
         invalidate_reference_captured_state(known, facts);
     }
 }
@@ -926,9 +930,9 @@ fn invalidate_capture_writes_from_block(
     block: &HirBlock,
     facts: &BranchStateCopyFacts<'_>,
 ) {
-    let mut effects = UserCodeEffectCollector::new(facts.safety);
+    let mut effects = HirEvalEffects::new(facts.safety, |_| false);
     visit_block(block, &mut effects);
-    if effects.found {
+    if effects.found() {
         invalidate_reference_captured_state(known, facts);
     }
 }
@@ -938,15 +942,9 @@ fn invalidate_capture_writes_from_expr(
     expr: &HirExpr,
     facts: &BranchStateCopyFacts<'_>,
 ) {
-    if expr_may_execute_user_code(expr, facts.safety) {
+    if !facts.safety.is_discard_safe_without_residual(expr) {
         invalidate_reference_captured_state(known, facts);
     }
-}
-
-fn expr_may_execute_user_code(expr: &HirExpr, safety: HirExprSafety) -> bool {
-    let mut effects = UserCodeEffectCollector::new(safety);
-    visit_expr(expr, &mut effects);
-    effects.found
 }
 
 fn invalidate_reference_captured_state(
@@ -983,22 +981,15 @@ fn intersect_known_states(
 }
 
 fn declared_locals(block: &HirBlock) -> BTreeSet<LocalId> {
-    let mut declarations = LocalDeclCollector::default();
-    visit_stmts(&block.stmts, &mut declarations);
-    declarations.locals
-}
-
-#[derive(Default)]
-struct LocalDeclCollector {
-    locals: BTreeSet<LocalId>,
-}
-
-impl HirVisitor for LocalDeclCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        if let HirStmt::LocalDecl(decl) = stmt {
-            self.locals.extend(decl.bindings.iter().copied());
-        }
+    let mut locals = BTreeSet::new();
+    for stmt in &block.stmts {
+        visit_stmt_structure(stmt, &mut |stmt| {
+            if let HirStmt::LocalDecl(decl) = stmt {
+                locals.extend(decl.bindings.iter().copied());
+            }
+        });
     }
+    locals
 }
 
 #[derive(Default)]
@@ -1021,41 +1012,6 @@ impl HirVisitor for BindingWriteCollector {
             | HirLValue::Global(_)
             | HirLValue::TableAccess(_) => {}
         }
-    }
-}
-
-struct UserCodeEffectCollector {
-    found: bool,
-    safety: HirExprSafety,
-}
-
-impl UserCodeEffectCollector {
-    fn new(safety: HirExprSafety) -> Self {
-        Self {
-            found: false,
-            safety,
-        }
-    }
-}
-
-impl HirVisitor for UserCodeEffectCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(stmt, HirStmt::GlobalDecl(_) | HirStmt::Close(_));
-    }
-
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        // Allocation, dynamic access, calls and metamethod-capable expressions can run GC or
-        // user code that mutates a captured binding. Reuse the shared dialect-aware boundary so
-        // branch-state facts cannot survive an event omitted by a second ad-hoc classifier.
-        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
-    }
-
-    fn visit_call(&mut self, _call: &HirCallExpr) {
-        self.found = true;
     }
 }
 

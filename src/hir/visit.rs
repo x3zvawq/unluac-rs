@@ -90,12 +90,29 @@ pub(crate) fn for_each_nested_block<'hir>(
 
 /// 只遍历语句及嵌套控制块；label 等词法事实不需要扫描求值表达式。
 pub(crate) fn visit_stmt_structure(stmt: &HirStmt, visitor: &mut impl FnMut(&HirStmt)) {
-    visitor(stmt);
-    for_each_nested_block(stmt, &mut |block| {
-        for child in &block.stmts {
-            visit_stmt_structure(child, visitor);
-        }
+    any_stmt_structure(stmt, &mut |stmt| {
+        visitor(stmt);
+        false
     });
+}
+
+/// 在当前 proto 的语句骨架中先序短路查询，不进入表达式或 child proto。
+pub(crate) fn any_stmt_structure(
+    stmt: &HirStmt,
+    predicate: &mut impl FnMut(&HirStmt) -> bool,
+) -> bool {
+    if predicate(stmt) {
+        return true;
+    }
+    let mut found = false;
+    for_each_nested_block(stmt, &mut |block| {
+        found = found
+            || block
+                .stmts
+                .iter()
+                .any(|stmt| any_stmt_structure(stmt, predicate));
+    });
+    found
 }
 
 fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {

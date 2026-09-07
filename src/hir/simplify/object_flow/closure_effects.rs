@@ -13,8 +13,8 @@ use super::super::lexical_cfg::{
     HirGenericForFlow,
 };
 use super::{
-    EffectClosure, EffectValue, ProtoEffects, adjusted_value, binding_from_lvalue,
-    closure_captures_in_block, extend_map_sets, union_set,
+    EffectClosure, EffectValue, ProtoEffects, binding_from_lvalue, closure_captures_in_block,
+    extend_map_sets, union_set,
 };
 use crate::hir::common::{
     HirCapture, HirCaptureMode, HirExpr, HirLValue, HirModule, HirProto, HirProtoRef, HirStmt,
@@ -644,7 +644,7 @@ fn snapshot_generic_for_effect(
     state: &mut EffectState,
     context: &EffectContext<'_>,
 ) {
-    let Some(callee) = adjusted_value(&flow.for_stmt().iterator, 0) else {
+    let Some(callee) = flow.for_stmt().iterator.result_source(0) else {
         return;
     };
     let callees = effect_expr_closures(callee, state, context);
@@ -749,7 +749,7 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
         HirStmt::LocalDecl(decl) => {
             let values = (0..decl.bindings.len())
                 .map(|index| {
-                    assignment_value_effects(adjusted_value(&decl.values, index), state, context)
+                    assignment_value_effects(decl.values.result_source(index), state, context)
                 })
                 .collect::<Vec<_>>();
             note_effect_pack_escapes(&decl.values, state, context);
@@ -769,7 +769,7 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
                 .enumerate()
                 .map(|(index, target)| {
                     let mut value = assignment_value_effects(
-                        adjusted_value(&assign.values, index),
+                        assign.values.result_source(index),
                         state,
                         context,
                     );

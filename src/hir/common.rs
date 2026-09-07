@@ -722,6 +722,21 @@ impl HirValuePack {
         )
     }
 
+    /// 调整到接收位置后的结果来源；超过已知结果宽度时返回 None，表示补 nil。
+    ///
+    /// 多个尾结果共享同一个 producer，例如 `a,b=f()` 的两个位置都指向 f()；
+    /// 这不表示重复求值，也不证明两个结果具有相同的值或生命周期。
+    pub fn result_source(&self, index: usize) -> Option<&HirExpr> {
+        if let Some(value) = self.fixed.get(index) {
+            return Some(value);
+        }
+        let tail = self.tail.as_ref()?;
+        let tail_index = index - self.fixed.len();
+        tail.exact_width()
+            .is_none_or(|width| tail_index < width)
+            .then(|| tail.as_expr())
+    }
+
     pub fn first(&self) -> Option<&HirExpr> {
         self.fixed
             .first()

@@ -48,7 +48,6 @@ use super::binding_flow::{
     expr_reads_binding, expr_uses_binding, mutable_snapshot_names_in_block, stmt_uses_binding,
     stmt_writes_name,
 };
-use super::binding_ref::binding_from_name_ref;
 use super::binding_tree::{
     stmt_has_access_base_binding_use, stmt_has_direct_call_arg_binding_use,
     stmt_has_index_binding_use, stmt_has_nested_binding_use, stmt_has_nested_binding_value_use,
@@ -647,7 +646,7 @@ fn collapse_stable_copy_aliases(
                     }
                 }
                 AstNameRef::Local(_) | AstNameRef::SyntheticLocal(_) => {
-                    let source_binding = binding_from_name_ref(source_name)
+                    let source_binding = AstBindingRef::from_name_ref(source_name)
                         .expect("local-like name must have an AST binding identity");
                     // A bound local/synthetic name can only appear while its lexical declaration
                     // is active, so the AST binding identity itself supplies the dominance proof.
@@ -862,7 +861,7 @@ fn stable_copy_trailing_root_handoff(
         // 候选拒绝[SemanticBarrier:Capture]：target 被 closure 捕获时，接管前后的 binding 写入可被观察。
         return None;
     }
-    let local_like_target = binding_from_name_ref(&target).is_some();
+    let local_like_target = AstBindingRef::from_name_ref(&target).is_some();
     if structured && !local_like_target {
         return None;
     }
@@ -903,7 +902,7 @@ fn stable_copy_trailing_root_handoff(
         // 可删除 dead carrier assignment；原 alias 本会让旧对象活到词法 block 末尾。
         return None;
     };
-    let condition_references_target = binding_from_name_ref(&target).map_or_else(
+    let condition_references_target = AstBindingRef::from_name_ref(&target).map_or_else(
         || condition_references_param(condition, &target),
         |target| expr_reads_binding(condition, target),
     );

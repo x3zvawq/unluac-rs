@@ -4,7 +4,6 @@
 //! - 一段语句中是否存在对某个/某些 temp 的引用？
 //! - 某个 temp 在当前位置之后只出现于哪些语句？
 //! - 某条语句是否只在控制头部（条件表达式）处消费了 temp，body 内不再引用？
-//! - 某条语句的子树中是否包含 goto/label/continue 等非局部控制流？
 //! - 递归进入子作用域时，外层前缀/后缀还保护着哪些 temp？
 //!
 //! 这些查询都是只读的，不会修改 HIR 结构。按 temp 建立的 occurrence index 让候选扩张
@@ -13,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirBlock, HirExpr, HirLValue, HirProto, HirStmt, TempId};
+use crate::hir::common::{HirExpr, HirLValue, HirProto, HirStmt, TempId};
 
 use crate::hir::visit::{HirVisitor, visit_expr, visit_proto, visit_stmts};
 
@@ -92,43 +91,6 @@ pub(super) fn stmt_consumes_temps_only_in_control_head(
     }
 }
 
-pub(super) fn stmt_contains_nested_nonlocal_control(stmt: &HirStmt) -> bool {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => false,
-        HirStmt::If(if_stmt) => {
-            block_contains_nonlocal_control(&if_stmt.then_block)
-                || if_stmt
-                    .else_block
-                    .as_ref()
-                    .is_some_and(block_contains_nonlocal_control)
-        }
-        HirStmt::While(while_stmt) => block_contains_nonlocal_control(&while_stmt.body),
-        HirStmt::Repeat(repeat_stmt) => block_contains_nonlocal_control(&repeat_stmt.body),
-        HirStmt::NumericFor(numeric_for) => block_contains_nonlocal_control(&numeric_for.body),
-        HirStmt::GenericFor(generic_for) => block_contains_nonlocal_control(&generic_for.body),
-        HirStmt::Block(block) => block_contains_nonlocal_control(block),
-        HirStmt::Goto(_) | HirStmt::Label(_) => true,
-        HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue => false,
-    }
-}
-
-fn block_contains_nonlocal_control(block: &HirBlock) -> bool {
-    block
-        .stmts
-        .iter()
-        .any(stmt_contains_nested_nonlocal_control)
-}
-
 struct TempTouchCollector<'a> {
     temps: &'a BTreeSet<TempId>,
     touched: bool,
@@ -193,7 +155,7 @@ pub(super) fn collect_temp_reads_in_proto(proto: &HirProto) -> BTreeSet<TempId> 
     collector.temps
 }
 
-fn collect_temp_reads_in_stmts(stmts: &[HirStmt]) -> BTreeSet<TempId> {
+pub(super) fn collect_temp_reads_in_stmts(stmts: &[HirStmt]) -> BTreeSet<TempId> {
     let mut collector = TempReadCollector::default();
     visit_stmts(stmts, &mut collector);
     collector.temps

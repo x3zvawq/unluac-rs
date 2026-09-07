@@ -16,7 +16,6 @@ use crate::ast::common::{
 };
 
 use super::super::binding_flow::expr_has_binding_read;
-use super::super::binding_ref::binding_from_name_ref;
 use super::super::expr_analysis::{
     expr_observes_eval_order, expr_requires_ordered_snapshot,
     is_eventless_primitive_expr_for_target,
@@ -141,7 +140,7 @@ fn loop_header_rhs_is_invariant(
 
     match value {
         AstExpr::Var(name) => {
-            if let Some(binding) = binding_from_name_ref(name)
+            if let Some(binding) = AstBindingRef::from_name_ref(name)
                 && let Some(candidate_value) = removed_values.get(&binding)
             {
                 assert!(
@@ -327,7 +326,7 @@ impl EvalPrefixCollector<'_> {
             return;
         }
         if let AstExpr::Var(name) = value
-            && let Some(binding) = binding_from_name_ref(name)
+            && let Some(binding) = AstBindingRef::from_name_ref(name)
             && self.values.contains_key(&binding)
         {
             self.candidate(binding);

@@ -16,7 +16,6 @@ use super::super::super::common::{
     AstCallExpr, AstCallKind, AstExpr, AstGlobalDecl, AstLValue, AstMethodCallExpr, AstStmt,
     AstTableField, AstTableKey,
 };
-use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::{
     direct_return_concat_cost, direct_return_logical_cost, expr_complexity,
     is_access_base_inline_expr, is_call_arg_constructor_inline_expr, is_context_safe_expr,
@@ -487,7 +486,7 @@ fn try_rewrite_raw_global_call_arg(
     let AstExpr::Var(name) = arg else {
         return false;
     };
-    if !name_matches_binding(name, candidate.binding()) {
+    if !candidate.binding().matches_name_ref(name) {
         return false;
     }
     *arg = replacement.clone();
@@ -697,8 +696,7 @@ impl InlineSite {
         options: ReadabilityOptions,
         policy: InlinePolicy,
     ) -> bool {
-        if !matches!(use_expr, AstExpr::Var(name) if name_matches_binding(name, candidate.binding()))
-        {
+        if !matches!(use_expr, AstExpr::Var(name) if candidate.binding().matches_name_ref(name)) {
             return false;
         }
 

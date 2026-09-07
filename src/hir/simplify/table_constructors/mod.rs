@@ -56,7 +56,7 @@ use super::mention::{
 };
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::value_facts::value_facts;
-use crate::hir::visit::{HirVisitor, visit_stmts};
+use crate::hir::visit::{HirVisitor, any_stmt_structure, visit_stmts};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 enum TableBinding {
@@ -2163,31 +2163,15 @@ fn debug_prefix_expr_is_inert(expr: &HirExpr) -> bool {
 }
 
 fn proto_has_cleanup(proto: &HirProto) -> bool {
-    struct CleanupProbe(bool);
-    impl HirVisitor for CleanupProbe {
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
-            self.0 |= matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_));
-        }
-    }
-    let mut probe = CleanupProbe(false);
-    visit_stmts(&proto.body.stmts, &mut probe);
-    probe.0
+    proto.body.stmts.iter().any(|stmt| {
+        any_stmt_structure(stmt, &mut |stmt| {
+            matches!(stmt, HirStmt::ToBeClosed(_) | HirStmt::Close(_))
+        })
+    })
 }
 
 fn stmt_contains_close(stmt: &HirStmt) -> bool {
-    struct CloseProbe {
-        found: bool,
-    }
-
-    impl HirVisitor for CloseProbe {
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
-            self.found |= matches!(stmt, HirStmt::Close(_));
-        }
-    }
-
-    let mut probe = CloseProbe { found: false };
-    visit_stmts(std::slice::from_ref(stmt), &mut probe);
-    probe.found
+    any_stmt_structure(stmt, &mut |stmt| matches!(stmt, HirStmt::Close(_)))
 }
 
 /// Splitting raw SETLIST into indexed writes interleaves each write with evaluation of the next

@@ -1,4 +1,4 @@
-//! HIR simplify pass 共享的 label 引用计数与顶层 owner 投影。
+//! HIR simplify pass 共享的 label/goto 存在性查询、引用计数与顶层 owner 投影。
 //!
 //! 嵌套控制块的 label/goto 保留其顶层语句位置，跨语句查询消费共享词法引用索引；
 //! 例如 if 内的 goto 属于整个 if 的 owner，不按运行可达性裁剪源码作用域入边。
@@ -7,7 +7,13 @@ use std::collections::BTreeMap;
 
 use crate::hir::common::{HirLabelId, HirStmt};
 
-use crate::hir::visit::visit_stmt_structure;
+use crate::hir::visit::{any_stmt_structure, visit_stmt_structure};
+
+pub(super) fn stmt_has_label_or_goto(stmt: &HirStmt) -> bool {
+    any_stmt_structure(stmt, &mut |stmt| {
+        matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_))
+    })
+}
 
 pub(super) fn label_references_by_stmt(
     stmts: &[HirStmt],

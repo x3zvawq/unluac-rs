@@ -16,6 +16,7 @@ use crate::hir::common::{
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
+use crate::hir::visit::any_stmt_structure;
 
 use super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 
@@ -38,15 +39,9 @@ pub(super) fn mark_repeat_trailing_condition_roots(
         .protos
         .iter()
         .map(|proto| {
-            struct Repeats(bool);
-            impl crate::hir::visit::HirVisitor for Repeats {
-                fn visit_stmt(&mut self, stmt: &HirStmt) {
-                    self.0 |= matches!(stmt, HirStmt::Repeat(_));
-                }
-            }
-            let mut repeats = Repeats(false);
-            crate::hir::visit::visit_proto(proto, &mut repeats);
-            repeats.0
+            proto.body.stmts.iter().any(|stmt| {
+                any_stmt_structure(stmt, &mut |stmt| matches!(stmt, HirStmt::Repeat(_)))
+            })
         })
         .collect::<Vec<_>>();
     if !relevant.iter().any(|present| *present) {
@@ -132,8 +127,9 @@ fn note_repeat_condition_lifetimes(
                 .collect(),
         });
 
+    let eventful =
+        !scoped_bindings.is_empty() && !safety.is_discard_safe_without_residual(&repeat.cond);
     for binding in scoped_bindings {
-        let eventful = !safety.is_discard_safe_without_residual(&repeat.cond);
         let observable = eventful && state.binding_may_hold_observable_root(binding);
         let has_physical_home = match binding {
             HirBinding::Local(local) => {

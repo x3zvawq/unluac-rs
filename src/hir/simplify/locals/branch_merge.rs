@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 
 use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
 use super::super::temp_touch::{
-    TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_in_expr,
+    TempTouchIndex, collect_temp_reads_in_stmts, collect_temp_refs_in_expr,
 };
 use crate::hir::common::{HirBlock, HirLValue, HirStmt, TempId};
 use crate::hir::expr_safety::HirExprSafety;
@@ -70,7 +70,7 @@ pub(super) fn candidate_temps(
         .copied()
         .chain(condition_reads)
         .collect::<BTreeSet<_>>();
-    let prefix_cfg = RegionTempFlow::for_stmts(&owner_stmts[..stmt_index], safety).ok();
+    let mut prefix_cfg = None;
 
     common_temps
         .into_iter()
@@ -79,6 +79,9 @@ pub(super) fn candidate_temps(
         .filter(|temp| {
             if !temp_touches.has_before(temp, stmt_index)
                 || prefix_cfg
+                    .get_or_insert_with(|| {
+                        RegionTempFlow::for_stmts(&owner_stmts[..stmt_index], safety).ok()
+                    })
                     .as_ref()
                     .is_some_and(|cfg| cfg.fallthrough_temp_is_gc_inert(*temp))
             {
@@ -192,7 +195,8 @@ impl<'a> RegionTempFlow<'a> {
     }
 
     fn summarize(&self) -> FallthroughSummary {
-        let incoming = self.graph.solve_forward(
+        let mut summary = FallthroughSummary::default();
+        self.graph.solve_forward(
             BTreeSet::new(),
             |current, outgoing| {
                 let before = current.len();
@@ -200,28 +204,22 @@ impl<'a> RegionTempFlow<'a> {
                 current.len() != before
             },
             |id, _, outgoing| {
-                let incoming = outgoing.clone();
-                outgoing.extend(self.events[id.index()].writes.iter().copied());
-                incoming
+                let event = &self.events[id.index()];
+                // must-def 在首次到达后只会交集缩小，未定义读取只会增长；直接汇总
+                // 单调观察结果，避免为每个节点保留整份已赋值集合。
+                summary
+                    .reads_before_assignment
+                    .extend(event.reads.difference(outgoing).copied());
+                if id == self.graph.exit() {
+                    summary.falls_through = true;
+                    summary.assigned_temps.clone_from(outgoing);
+                }
+                outgoing.extend(event.writes.iter().copied());
             },
             |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
 
-        let reads_before_assignment = self
-            .events
-            .iter()
-            .enumerate()
-            .filter_map(|(node_id, node)| incoming[node_id].as_ref().map(|defs| (node, defs)))
-            .flat_map(|(node, defs)| node.reads.difference(defs).copied())
-            .collect();
-        let assigned_temps = incoming[self.graph.exit().index()]
-            .clone()
-            .unwrap_or_default();
-        FallthroughSummary {
-            falls_through: incoming[self.graph.exit().index()].is_some(),
-            assigned_temps,
-            reads_before_assignment,
-        }
+        summary
     }
 }
 
@@ -250,7 +248,7 @@ fn temp_flow_event(kind: HirFlowNodeKind<'_>, safety: HirExprSafety) -> TempFlow
                 .iter()
                 .flat_map(collect_temp_refs_in_expr)
                 .collect(),
-            _ => stmt_reads(stmt),
+            _ => collect_temp_reads_in_stmts(std::slice::from_ref(stmt)),
         },
         HirFlowNodeKind::GenericForInit(flow) => flow
             .for_stmt()
@@ -307,26 +305,16 @@ fn assignment_final_temp_value_is_gc_inert(
     )
 }
 
-fn stmt_reads(stmt: &HirStmt) -> BTreeSet<TempId> {
-    collect_temp_reads_by_stmt(std::slice::from_ref(stmt))
-        .into_iter()
-        .next()
-        .unwrap_or_default()
-}
-
 fn intersect_fallthrough_assignment_sets<'a>(
     summaries: impl IntoIterator<Item = &'a FallthroughSummary>,
 ) -> Option<BTreeSet<TempId>> {
     let mut fallthrough_sets = summaries
         .into_iter()
         .filter(|summary| summary.falls_through)
-        .map(|summary| summary.assigned_temps.clone());
-    let mut intersection = fallthrough_sets.next()?;
+        .map(|summary| &summary.assigned_temps);
+    let mut intersection = fallthrough_sets.next()?.clone();
     for set in fallthrough_sets {
-        intersection = intersection
-            .intersection(&set)
-            .copied()
-            .collect::<BTreeSet<_>>();
+        intersection.retain(|temp| set.contains(temp));
     }
     Some(intersection)
 }

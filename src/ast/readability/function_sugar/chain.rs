@@ -7,7 +7,6 @@
 //! 无用声明由前置 cleanup/fixed-point 删除；这里不跨越其它语句寻找链段。
 
 use super::super::binding_flow::BindingUseIndex;
-use super::super::binding_ref::name_matches_binding;
 use crate::ast::common::{
     AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalBinding, AstLocalOrigin,
     AstMethodCallExpr, AstStmt,
@@ -95,7 +94,7 @@ fn chain_local_method_call_stmt(
         // 第二段 receiver 不是首句声明的直接 binding use。
         return None;
     };
-    if !name_matches_binding(name, binding)
+    if !binding.matches_name_ref(name)
         || use_index.count_uses_in_range(second_index, second_index + 1, binding) != 1
     {
         // 候选拒绝[SemanticBarrier:EvalCount]：第二句必须恰好把同一快照用作唯一 receiver；额外 use 不能随链化消失。

@@ -19,6 +19,9 @@
 //!   成后置 `local`，否则 fallback/goto 回边会读到未初始化的局部变量
 //! - repeat body 的 until 条件是正文之后的读取，引用到的声明不能沉入更窄的嵌套块
 //! - 后缀即使只有赋值也需要原声明支配；把声明沉入前面的 if 会让后缀写入全局环境
+//!
+//! 嵌套下沉先检查作用域，再原地提交；每次修改必消费非空 binding，因此失败不改树，
+//! 成功只返回已消费数量和必须留在外层的依赖，无需复制候选控制语句。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -29,8 +32,8 @@ use super::super::common::{
 use super::ReadabilityContext;
 use super::binding_flow::{
     BindingRefSet, BindingUseIndex, BindingWriteIndex, binding_mentions_in_block,
-    binding_mentions_in_expr, block_references_binding_set, expr_references_any_binding,
-    expr_references_binding_set, stmt_references_any_binding, stmt_references_binding_set,
+    binding_mentions_in_expr, binding_mentions_in_stmt, block_references_binding_set,
+    expr_references_any_binding, expr_references_binding_set, stmt_references_binding_set,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr, is_discard_safe_expr};
 use super::walk::{self, AstRewritePass};
@@ -348,17 +351,8 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
 
                 // 不能越过已经读取 binding 的控制边界后再尝试 nested sink；否则后续
                 // 子块候选只看自己的 owner/suffix，会遗漏这次较早读取。
-                let mut remaining_index = 0;
-                while remaining_index < remaining.len() {
-                    if stmt_references_any_binding(
-                        &block.stmts[lookahead],
-                        std::slice::from_ref(&remaining[remaining_index]),
-                    ) {
-                        pinned.push(remaining.remove(remaining_index));
-                    } else {
-                        remaining_index += 1;
-                    }
-                }
+                let mentions = binding_mentions_in_stmt(&block.stmts[lookahead]);
+                pinned.extend(remaining.extract_if(.., |binding| mentions.contains(&binding.id)));
                 lookahead += 1;
                 continue;
             }
@@ -378,14 +372,17 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
                 lookahead += 1;
                 continue;
             }
-            if let Some(attempt) = try_sink_hoisted_decl_into_nested_stmt_anywhere(
-                &remaining,
-                &block.stmts[lookahead],
-                &use_index,
-                &write_index,
-                lookahead,
-            ) {
-                block.stmts[lookahead] = attempt.rewritten;
+            let nested_owners = NestedSinkOwners::new(&block.stmts[lookahead]);
+            if let Some(attempt) = nested_owners.as_ref().and_then(|owners| {
+                try_sink_hoisted_decl_into_nested_stmt_anywhere(
+                    &remaining,
+                    &mut block.stmts[lookahead],
+                    &use_index,
+                    &write_index,
+                    lookahead,
+                    owners,
+                )
+            }) {
                 remaining.drain(attempt.start..(attempt.start + attempt.consumed));
                 pin_sink_dependencies(&mut remaining, &mut pinned, &attempt.dependencies);
                 sink_changed = true;
@@ -411,24 +408,14 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
                 lookahead += 1;
                 continue;
             }
-            let remaining_refs = BindingRefSet::from_bindings(&remaining);
-            if stmt_references_binding_set(&block.stmts[lookahead], &remaining_refs) {
-                // 钉住被引用但无法下沉的 binding：它们的声明必须留在提升位置，
-                // 但其他 binding 仍然可能被下沉到后续语句里。
-                // 候选拒绝[SemanticBarrier:Scope]：当前语句已经读取却无法成为声明 sink 的 binding 必须继续由 hoisted 声明支配。
-                let mut i = 0;
-                while i < remaining.len() {
-                    if stmt_references_any_binding(
-                        &block.stmts[lookahead],
-                        std::slice::from_ref(&remaining[i]),
-                    ) {
-                        pinned.push(remaining.remove(i));
-                    } else {
-                        i += 1;
-                    }
-                }
-                lookahead += 1;
-                continue;
+            // 候选拒绝[SemanticBarrier:Scope]：被引用但无法下沉的 binding 必须留在
+            // hoist 点。失败不改树，故嵌套 owner 的键仍是当前语句的完整 mention 集合。
+            if let Some(owners) = &nested_owners {
+                pinned
+                    .extend(remaining.extract_if(.., |binding| owners.0.contains_key(&binding.id)));
+            } else {
+                let mentions = binding_mentions_in_stmt(&block.stmts[lookahead]);
+                pinned.extend(remaining.extract_if(.., |binding| mentions.contains(&binding.id)));
             }
             lookahead += 1;
         }
@@ -460,7 +447,6 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
 }
 
 struct NestedSinkAttempt {
-    rewritten: AstStmt,
     start: usize,
     consumed: usize,
     dependencies: Vec<AstBindingRef>,
@@ -591,13 +577,12 @@ fn binding_has_access_after(
 
 fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
-    stmt: &AstStmt,
+    stmt: &mut AstStmt,
     use_index: &BindingUseIndex,
     write_index: &BindingWriteIndex,
     stmt_index: usize,
+    owners: &NestedSinkOwners,
 ) -> Option<NestedSinkAttempt> {
-    let owners = NestedSinkOwners::new(stmt)?;
-
     let mut start = 0usize;
     while start < pending.len() {
         if binding_has_access_after(use_index, write_index, stmt_index, pending[start].id) {
@@ -651,7 +636,7 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
             // owner 分组只能缩窄 candidate 的落点，不能缩窄 initializer 的依赖全集：
             // `if cond then a=b else use(b)` 会让 a 属于 Then、b 属于 Blocked，传入的
             // candidate slice 只有 a，但 b 仍必须固定在原 hoist 点。
-            if let Some((rewritten, attempt)) = try_sink_hoisted_decl_into_nested_stmt(
+            if let Some(attempt) = try_sink_hoisted_decl_into_nested_stmt(
                 &pending[slice_start..slice_end],
                 pending,
                 stmt,
@@ -660,7 +645,6 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
                 stmt_index,
             ) {
                 return Some(NestedSinkAttempt {
-                    rewritten,
                     start: slice_start,
                     consumed: attempt.consumed,
                     dependencies: attempt.dependencies,
@@ -677,11 +661,11 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
 fn try_sink_hoisted_decl_into_nested_stmt(
     pending: &[super::super::common::AstLocalBinding],
     dependency_universe: &[super::super::common::AstLocalBinding],
-    stmt: &AstStmt,
+    stmt: &mut AstStmt,
     use_index: &BindingUseIndex,
     write_index: &BindingWriteIndex,
     stmt_index: usize,
-) -> Option<(AstStmt, BlockSinkAttempt)> {
+) -> Option<BlockSinkAttempt> {
     if !stmt_can_accept_nested_hoisted_sink(stmt) {
         return None;
     }
@@ -699,7 +683,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
     let sinkable = &pending[..sinkable_len];
     let sinkable_refs = BindingRefSet::from_bindings(sinkable);
 
-    match stmt {
+    let target_block = match stmt {
         AstStmt::If(if_stmt) => {
             if expr_references_binding_set(&if_stmt.cond, &sinkable_refs) {
                 // 候选拒绝[SemanticBarrier:Scope]：条件先于 arm 执行；把条件读取的 binding 声明沉进 arm 会令该读取失去原绑定。
@@ -718,50 +702,28 @@ fn try_sink_hoisted_decl_into_nested_stmt(
                 return None;
             }
 
-            let mut rewritten = stmt.clone();
-            let target_block = match &mut rewritten {
-                AstStmt::If(if_stmt) if then_refs => &mut if_stmt.then_block,
-                AstStmt::If(if_stmt) => if_stmt
+            if then_refs {
+                &mut if_stmt.then_block
+            } else {
+                if_stmt
                     .else_block
                     .as_mut()
-                    .expect("else refs imply else block"),
-                _ => unreachable!("rewritten stmt must remain if"),
-            };
-            let attempt =
-                sink_pending_bindings_into_block(target_block, sinkable, dependency_universe);
-            (attempt.consumed > 0).then_some((rewritten, attempt))
+                    .expect("else refs imply else block")
+            }
         }
         AstStmt::While(while_stmt) => {
             if expr_references_binding_set(&while_stmt.cond, &sinkable_refs) {
                 // 候选拒绝[SemanticBarrier:Scope]：`while t do ... end` 的条件在 body 外且逐轮先求值，声明不能沉入 body。
                 return None;
             }
-            let mut rewritten = stmt.clone();
-            let AstStmt::While(while_stmt) = &mut rewritten else {
-                unreachable!("rewritten stmt must remain while");
-            };
-            let attempt = sink_pending_bindings_into_block(
-                &mut while_stmt.body,
-                sinkable,
-                dependency_universe,
-            );
-            (attempt.consumed > 0).then_some((rewritten, attempt))
+            &mut while_stmt.body
         }
         AstStmt::Repeat(repeat_stmt) => {
             if expr_references_binding_set(&repeat_stmt.cond, &sinkable_refs) {
                 // 候选拒绝[SemanticBarrier:Scope]：`until t` 与 body 共享外层词法域；把 `t` 声明沉入更窄子块会让条件不可见。
                 return None;
             }
-            let mut rewritten = stmt.clone();
-            let AstStmt::Repeat(repeat_stmt) = &mut rewritten else {
-                unreachable!("rewritten stmt must remain repeat");
-            };
-            let attempt = sink_pending_bindings_into_block(
-                &mut repeat_stmt.body,
-                sinkable,
-                dependency_universe,
-            );
-            (attempt.consumed > 0).then_some((rewritten, attempt))
+            &mut repeat_stmt.body
         }
         AstStmt::NumericFor(numeric_for) => {
             if expr_references_binding_set(&numeric_for.start, &sinkable_refs)
@@ -771,16 +733,7 @@ fn try_sink_hoisted_decl_into_nested_stmt(
                 // 候选拒绝[SemanticBarrier:Scope]：numeric-for header 在循环 binding/body 作用域建立前求值，声明不能沉入 body。
                 return None;
             }
-            let mut rewritten = stmt.clone();
-            let AstStmt::NumericFor(numeric_for) = &mut rewritten else {
-                unreachable!("rewritten stmt must remain numeric-for");
-            };
-            let attempt = sink_pending_bindings_into_block(
-                &mut numeric_for.body,
-                sinkable,
-                dependency_universe,
-            );
-            (attempt.consumed > 0).then_some((rewritten, attempt))
+            &mut numeric_for.body
         }
         AstStmt::GenericFor(generic_for) => {
             if generic_for
@@ -791,25 +744,9 @@ fn try_sink_hoisted_decl_into_nested_stmt(
                 // 候选拒绝[SemanticBarrier:Scope]：generic-for iterator 在 body 外求值，沉入 body 会改变 header 的绑定解析。
                 return None;
             }
-            let mut rewritten = stmt.clone();
-            let AstStmt::GenericFor(generic_for) = &mut rewritten else {
-                unreachable!("rewritten stmt must remain generic-for");
-            };
-            let attempt = sink_pending_bindings_into_block(
-                &mut generic_for.body,
-                sinkable,
-                dependency_universe,
-            );
-            (attempt.consumed > 0).then_some((rewritten, attempt))
+            &mut generic_for.body
         }
-        AstStmt::DoBlock(inner) => {
-            let mut rewritten = AstBlock {
-                stmts: inner.stmts.clone(),
-            };
-            let attempt =
-                sink_pending_bindings_into_block(&mut rewritten, sinkable, dependency_universe);
-            (attempt.consumed > 0).then_some((AstStmt::DoBlock(Box::new(rewritten)), attempt))
-        }
+        AstStmt::DoBlock(inner) => inner,
         AstStmt::FunctionDecl(_)
         | AstStmt::LocalFunctionDecl(_)
         | AstStmt::LocalDecl(_)
@@ -821,8 +758,10 @@ fn try_sink_hoisted_decl_into_nested_stmt(
         | AstStmt::Continue
         | AstStmt::Goto(_)
         | AstStmt::Label(_)
-        | AstStmt::Error(_) => None,
-    }
+        | AstStmt::Error(_) => return None,
+    };
+    let attempt = sink_pending_bindings_into_block(target_block, sinkable, dependency_universe);
+    (attempt.consumed > 0).then_some(attempt)
 }
 
 fn stmt_can_accept_nested_hoisted_sink(stmt: &AstStmt) -> bool {
@@ -839,6 +778,7 @@ fn stmt_can_accept_nested_hoisted_sink(stmt: &AstStmt) -> bool {
     )
 }
 
+/// 每个写入分支都消费非空 binding；零消费意味着原块未变，调用方可继续尝试其它候选。
 fn sink_pending_bindings_into_block(
     block: &mut AstBlock,
     pending: &[super::super::common::AstLocalBinding],
@@ -896,15 +836,14 @@ fn sink_pending_bindings_into_block(
             index += 1;
             continue;
         }
-        if let Some((rewritten, nested_attempt)) = try_sink_hoisted_decl_into_nested_stmt(
+        if let Some(nested_attempt) = try_sink_hoisted_decl_into_nested_stmt(
             remaining,
             dependency_universe,
-            &block.stmts[index],
+            &mut block.stmts[index],
             &use_index,
             &write_index,
             index,
         ) {
-            block.stmts[index] = rewritten;
             consumed += nested_attempt.consumed;
             if !nested_attempt.dependencies.is_empty() {
                 return BlockSinkAttempt {
@@ -1221,14 +1160,7 @@ fn pin_sink_dependencies(
     pinned: &mut Vec<super::super::common::AstLocalBinding>,
     dependencies: &[AstBindingRef],
 ) {
-    let mut index = 0;
-    while index < remaining.len() {
-        if dependencies.contains(&remaining[index].id) {
-            pinned.push(remaining.remove(index));
-        } else {
-            index += 1;
-        }
-    }
+    pinned.extend(remaining.extract_if(.., |binding| dependencies.contains(&binding.id)));
 }
 
 fn stmt_references_any_binding_in_assign(

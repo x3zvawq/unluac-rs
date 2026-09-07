@@ -18,7 +18,6 @@
 use std::collections::BTreeSet;
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames, binding_mentions_in_stmt};
-use super::super::binding_ref::{binding_from_name_ref, name_matches_binding};
 use super::super::expr_analysis::is_stable_context_expr;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
@@ -256,7 +255,7 @@ fn inlineable_local_table_function_stmt(
             let AstFunctionName::Plain(path) = &function_decl.target else {
                 return None;
             };
-            if path.fields.len() != 1 || !name_matches_binding(&path.root, binding) {
+            if path.fields.len() != 1 || !binding.matches_name_ref(&path.root) {
                 return None;
             }
             // 同 assign 分支：闭包捕获了 constructor binding 时不能折入
@@ -284,7 +283,7 @@ fn inlineable_local_table_function_assign(
     let AstExpr::Var(name) = base else {
         return None;
     };
-    if !name_matches_binding(name, binding) {
+    if !binding.matches_name_ref(name) {
         return None;
     }
     let AstExpr::FunctionExpr(function) = &assign.values[0] else {
@@ -413,9 +412,9 @@ fn inlineable_nested_table_assign(
         return None;
     };
     Some((
-        binding_from_name_ref(outer_name)?,
+        AstBindingRef::from_name_ref(outer_name)?,
         access.field.clone(),
-        binding_from_name_ref(inner_name)?,
+        AstBindingRef::from_name_ref(inner_name)?,
     ))
 }
 
@@ -548,7 +547,7 @@ fn rewrite_terminal_constructor_call_expr(
         .iter()
         .filter(|arg| arg.pass_to_sink)
         .collect::<Vec<_>>();
-    if !name_matches_binding(name, callee_binding) {
+    if !callee_binding.matches_name_ref(name) {
         return None;
     }
 
@@ -559,7 +558,7 @@ fn rewrite_terminal_constructor_call_expr(
         .iter()
         .map(|expected| {
             call.args.iter().position(
-                |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, expected.binding.id)),
+                |arg| matches!(arg, AstExpr::Var(name) if expected.binding.id.matches_name_ref(name)),
             )
         })
         .collect::<Option<Vec<_>>>()?;
@@ -573,7 +572,7 @@ fn rewrite_terminal_constructor_call_expr(
     let mut last_arg_is_inlined_constructor = false;
     for arg in &call.args {
         if let Some(expected) = expected_args.peek()
-            && matches!(arg, AstExpr::Var(name) if name_matches_binding(name, expected.binding.id))
+            && matches!(arg, AstExpr::Var(name) if expected.binding.id.matches_name_ref(name))
         {
             rewritten_args.push(expected.value.clone());
             expected_args.next();

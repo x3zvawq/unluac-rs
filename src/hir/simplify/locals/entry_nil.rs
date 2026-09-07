@@ -25,10 +25,9 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::super::expr_facts::expr_truthiness;
-use super::super::label_refs::count_label_references;
+use super::super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::super::lexical_cfg::LexicalCfg;
 use super::super::local_shapes::empty_single_local_decl_binding;
-use super::super::temp_touch::stmt_contains_nested_nonlocal_control;
 use crate::hir::visit::{self, HirVisitor};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -298,7 +297,7 @@ impl EntryNilAnalyzer<'_> {
         let conservative = NilStates::unknown();
         let mut states = conservative.clone();
         for (index, stmt) in block.stmts.iter().enumerate() {
-            if stmt_contains_nested_nonlocal_control(stmt) {
+            if stmt_has_label_or_goto(stmt) {
                 with_path_component(prefix, PathComponent::Stmt(index), |path| {
                     self.analyze_unstructured_children(stmt, path)
                 })?;

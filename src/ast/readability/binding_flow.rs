@@ -24,13 +24,12 @@ use std::ops::ControlFlow;
 use super::super::common::{
     AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstNameRef, AstStmt,
 };
-use super::binding_ref::binding_from_name_ref;
 use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 pub(super) use refs::{
     BindingRefSet, block_references_binding_set, expr_has_binding_read, expr_reads_binding,
     expr_references_any_binding, expr_references_binding_set, expr_uses_binding,
-    stmt_references_any_binding, stmt_references_binding_set, stmt_uses_binding, stmt_writes_name,
+    stmt_references_binding_set, stmt_uses_binding, stmt_writes_name,
 };
 
 pub(super) type MutableSnapshotNames = BTreeSet<AstNameRef>;
@@ -230,7 +229,7 @@ struct BindingCollector<F>(F);
 
 impl<F: FnMut(AstBindingRef, NameAccess)> AstVisitor for BindingCollector<F> {
     fn visit_name(&mut self, name: &AstNameRef, access: NameAccess) -> ControlFlow<()> {
-        if let Some(binding) = binding_from_name_ref(name) {
+        if let Some(binding) = AstBindingRef::from_name_ref(name) {
             self.0(binding, access);
         }
         ControlFlow::Continue(())

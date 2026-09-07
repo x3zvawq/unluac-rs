@@ -36,7 +36,7 @@ use crate::hir::common::{
     HirAssign, HirBinding, HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto,
     HirStmt, LocalId, ParamId, TempId,
 };
-use crate::hir::expr_safety::HirExprSafety;
+use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 
 use super::{BooleanShellFacts, OldValueClass};
@@ -364,7 +364,7 @@ fn populate_expr_live_event(
     node.escaped_gen = observer_effects.escaped_gen;
     node.escape_holders = observer_effects.escape_holders;
     node.holder_writes = observer_effects.holder_writes;
-    node.observes_captures = expr_may_invoke_user_code(expr, safety);
+    node.observes_captures = !safety.is_discard_safe_without_residual(expr);
 }
 
 fn reads_in_stmt_header(stmt: &HirStmt, promotion_facts: &ProtoPromotionFacts) -> LiveBindingState {
@@ -831,44 +831,9 @@ fn tbc_homes_started_by_stmt(
 }
 
 fn stmt_header_may_invoke_user_code(stmt: &HirStmt, safety: HirExprSafety) -> bool {
-    let mut collector = UserCodeObserver {
-        safety,
-        found: false,
-    };
+    let mut collector = HirEvalEffects::new(safety, |_| false);
     visit_stmt_header(stmt, &mut collector);
-    collector.found
-}
-
-fn expr_may_invoke_user_code(expr: &HirExpr, safety: HirExprSafety) -> bool {
-    let mut collector = UserCodeObserver {
-        safety,
-        found: false,
-    };
-    visit::visit_expr(expr, &mut collector);
-    collector.found
-}
-
-struct UserCodeObserver {
-    safety: HirExprSafety,
-    found: bool,
-}
-
-impl HirVisitor for UserCodeObserver {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(stmt, HirStmt::GlobalDecl(_) | HirStmt::Close(_));
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
-    }
-
-    fn visit_call(&mut self, _call: &crate::hir::HirCallExpr) {
-        self.found = true;
-    }
-
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
-    }
+    collector.found()
 }
 
 fn writes_in_stmt_header(

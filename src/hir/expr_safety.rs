@@ -1,4 +1,4 @@
-//! HIR 表达式求值安全性的共享判断。
+//! HIR 求值事件与表达式安全性的共享判断。
 //!
 //! HIR analyze 和 simplify 都会判断某个表达式是否能被挪动或折进别的表达式。
 //! 这个文件只放跨 pass 共用、和具体恢复策略无关的谓词，避免求值序规则散落后漂移。
@@ -6,9 +6,56 @@
 //! 方言固定的表达式槽能力同样在入口发布：例如 PUC 5.1 CONCAT 保留最右 operand，
 //! 不代表中间 operand 或后续表达式仍拥有同一 root。
 
-use super::common::{HirBinaryOpKind, HirCaptureMode, HirExpr, HirUnaryOpKind, HirValuePack};
+use super::common::{
+    HirBinaryOpKind, HirCallExpr, HirCaptureMode, HirExpr, HirLValue, HirStmt, HirUnaryOpKind,
+    HirValuePack,
+};
+use super::visit::HirVisitor;
 use crate::decompile::DecompileDialect;
 use crate::value_semantics::{LuaComparison, LuaLiteral, LuaValueSemantics};
+
+/// 共享表达式、写目标和调用的观察边界；遍历范围与额外语句事件由消费者决定。
+///
+/// 例如 generic-for header 的求值与隐式 dispatch 是不同事件，CFG 消费者不能把
+/// 整个循环的观察能力提前到初始化；循环间隙分析则可保留自己的 cleanup 屏障。
+pub(crate) struct HirEvalEffects<F> {
+    safety: HirExprSafety,
+    extra_stmt_effect: F,
+    found: bool,
+}
+
+impl<F: FnMut(&HirStmt) -> bool> HirEvalEffects<F> {
+    pub(crate) fn new(safety: HirExprSafety, extra_stmt_effect: F) -> Self {
+        Self {
+            safety,
+            extra_stmt_effect,
+            found: false,
+        }
+    }
+
+    pub(crate) fn found(self) -> bool {
+        self.found
+    }
+}
+
+impl<F: FnMut(&HirStmt) -> bool> HirVisitor for HirEvalEffects<F> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.found |= matches!(stmt, HirStmt::GlobalDecl(_) | HirStmt::Close(_))
+            || (self.extra_stmt_effect)(stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
+    }
+
+    fn visit_call(&mut self, _call: &HirCallExpr) {
+        self.found = true;
+    }
+}
 
 /// 一个 HIR-origin local initializer 的逐槽 stack-root relevance 证明。
 #[derive(Debug, Clone, PartialEq, Eq)]

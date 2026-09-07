@@ -69,7 +69,7 @@ use crate::hir::common::{
     HirProto, HirStmt, HirTableField, TempId,
 };
 use crate::hir::expr_safety::{
-    HirExprSafety, expr_observes_eval_order, expr_requires_ordered_snapshot,
+    HirEvalEffects, HirExprSafety, expr_observes_eval_order, expr_requires_ordered_snapshot,
 };
 use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 
@@ -83,7 +83,7 @@ use self::site::{
 use self::usage::{
     TempUseScratch, TempUseSummary, collect_expr_temp_uses_summary, collect_stmt_temp_uses,
 };
-use super::label_refs::count_label_references;
+use super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::mention::{
     ReferenceCapturedBindings, expr_mentions_temp, stmt_writes_temp,
     stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
@@ -95,7 +95,6 @@ use super::root_lifetimes::{
     scope_end_copy_root_handoffs, scope_end_copy_roots_needing_materialization,
     stmt_has_argument_root_handoff,
 };
-use super::temp_touch::stmt_contains_nested_nonlocal_control;
 use crate::hir::rewrite::{replace_temp_in_expr, replace_temp_in_stmt, replace_temps_in_stmt};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
@@ -3141,7 +3140,7 @@ fn inline_repeat_head_scalar_temp_with_proven_prefix(
     for stmt in &repeat_stmt.body.stmts[1..] {
         if collect_stmt_temp_uses(stmt, scratch).count(temp) != 0
             || stmt_writes_temp(stmt, temp)
-            || stmt_contains_nested_nonlocal_control(stmt)
+            || stmt_has_label_or_goto(stmt)
         {
             // 候选拒绝[SemanticBarrier:ControlFlow]：中间 use/write 或 break/return/goto 会让 producer 与 condition 不再位于每轮同一路径；见 regress_263#2。
             return false;
@@ -3429,41 +3428,11 @@ impl HirVisitor for DirectBindingWriteCollector<'_> {
 }
 
 fn stmts_observe_eval_order(stmts: &[HirStmt], safety: HirExprSafety) -> bool {
-    struct ObservableEvalCollector {
-        found: bool,
-        safety: HirExprSafety,
-    }
-
-    impl HirVisitor for ObservableEvalCollector {
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
-            self.found |= matches!(
-                stmt,
-                HirStmt::GlobalDecl(_)
-                    | HirStmt::TableSetList(_)
-                    | HirStmt::Close(_)
-                    | HirStmt::ErrNil(_)
-            );
-        }
-
-        fn visit_expr(&mut self, expr: &HirExpr) {
-            self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
-        }
-
-        fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-            self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
-        }
-
-        fn visit_call(&mut self, _call: &HirCallExpr) {
-            self.found = true;
-        }
-    }
-
-    let mut collector = ObservableEvalCollector {
-        found: false,
-        safety,
-    };
+    let mut collector = HirEvalEffects::new(safety, |stmt| {
+        matches!(stmt, HirStmt::TableSetList(_) | HirStmt::ErrNil(_))
+    });
     visit_stmts(stmts, &mut collector);
-    collector.found
+    collector.found()
 }
 
 fn inline_repeat_tail_temp(
@@ -3513,7 +3482,7 @@ fn inline_repeat_tail_temp(
     for stmt in &repeat_stmt.body.stmts[..tail_index] {
         if collect_stmt_temp_uses(stmt, scratch).count(temp) != 0
             || stmt_writes_temp(stmt, temp)
-            || stmt_contains_nested_nonlocal_control(stmt)
+            || stmt_has_label_or_goto(stmt)
         {
             // 候选拒绝[SemanticBarrier:ControlFlow]：中间 use/write 或非局部控制转移破坏同轮路径证明；见 regress_263#2。
             return false;

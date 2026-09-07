@@ -6,7 +6,6 @@
 //! 例如：`local seed = value; global g = seed` 会在这里尝试折成 `global g = value`。
 
 use super::super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
-use super::super::binding_ref::binding_from_name_ref;
 use crate::ast::common::{
     AstBindingRef, AstBlock, AstExpr, AstGlobalBinding, AstGlobalDecl, AstLocalAttr,
     AstLocalBinding, AstLocalOrigin, AstStmt,
@@ -70,7 +69,7 @@ fn try_merge_seed_global_run(
         let AstExpr::Var(name) = &global_decl.values[0] else {
             break;
         };
-        let Some(binding) = binding_from_name_ref(name) else {
+        let Some(binding) = AstBindingRef::from_name_ref(name) else {
             break;
         };
         let current_attr = global_decl.bindings[0].attr;

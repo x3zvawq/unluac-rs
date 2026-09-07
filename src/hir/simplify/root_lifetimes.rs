@@ -29,7 +29,7 @@ use crate::hir::common::{
     HirAssign, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, HirUnaryOpKind,
     HirValuePack, LocalId, ParamId, TempId,
 };
-use crate::hir::expr_safety::HirExprSafety;
+use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 mod allocation_homes;
@@ -175,7 +175,7 @@ pub(super) fn collect_call_result_local_roots(
         .collect::<BTreeSet<_>>();
     let mut states = BTreeMap::<LocalId, LocalRootSuffix>::new();
     if let Some(condition) = trailing_condition {
-        if expr_may_observe_gc_roots(condition, safety) {
+        if !safety.is_discard_safe_without_residual(condition) {
             observations.insert(stmts.len());
         }
         let mut uses = LocalUseCollector::default();
@@ -646,13 +646,13 @@ pub(super) fn collect_call_root_lifetimes(
             let call = &call_stmt.call;
             // 只在当前 callee/参数求值不含观察事件时，才可在 statement 前释放。
             // 原始 dispatch 事实不允许把释放前移到已内联的 lookup、分配或嵌套调用之前。
-            if !expr_may_observe_gc_roots(&call.callee, safety)
+            if safety.is_discard_safe_without_residual(&call.callee)
                 && call.args.tail.is_none()
                 && call
                     .args
                     .fixed
                     .iter()
-                    .all(|arg| !expr_may_observe_gc_roots(arg, safety))
+                    .all(|arg| safety.is_discard_safe_without_residual(arg))
             {
                 for producer in &call.frame_root_ends {
                     let Some(home) = facts.trusted_temp_home_slot(*producer) else {
@@ -2278,21 +2278,9 @@ fn observe_active_call_values(active: &mut CallValues<'_>, values: Option<&BTree
 }
 
 pub(super) fn stmt_may_observe_gc_roots(stmt: &HirStmt, safety: HirExprSafety) -> bool {
-    let mut collector = GcRootObservationCollector {
-        found: false,
-        safety,
-    };
+    let mut collector = HirEvalEffects::new(safety, |stmt| matches!(stmt, HirStmt::GenericFor(_)));
     visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.found
-}
-
-fn expr_may_observe_gc_roots(expr: &HirExpr, safety: HirExprSafety) -> bool {
-    let mut collector = GcRootObservationCollector {
-        found: false,
-        safety,
-    };
-    visit_expr(expr, &mut collector);
-    collector.found
+    collector.found()
 }
 
 /// 逆序扫描中该 local 到下一次直属覆盖的观察事实；只在自身读写事件上更新。
@@ -2325,36 +2313,6 @@ impl HirVisitor for LocalUseCollector {
         if let HirLValue::Local(local) = lvalue {
             self.writes.insert(*local);
         }
-    }
-}
-
-struct GcRootObservationCollector {
-    found: bool,
-    safety: HirExprSafety,
-}
-
-impl HirVisitor for GcRootObservationCollector {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.found |= matches!(
-            stmt,
-            HirStmt::GlobalDecl(_) | HirStmt::Close(_) | HirStmt::GenericFor(_)
-        );
-    }
-
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        // The shared discard-safety boundary already classifies dynamic environment/table
-        // access, metamethod-capable operators, calls, and allocating expressions as eventful;
-        // residual diagnostics stay conservative instead of being treated as executable no-ops.
-        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.found |= matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
-    }
-
-    fn visit_call(&mut self, _call: &HirCallExpr) {
-        // CallStmt exposes a HirCallExpr directly instead of wrapping it in HirExpr::Call.
-        self.found = true;
     }
 }
 

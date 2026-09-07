@@ -13,7 +13,6 @@
 //! while/repeat；所有 alias 也不能越过外层调用、左侧操作数、复杂赋值目标等可观察前缀。
 
 use super::super::binding_flow::{BindingUseIndex, BindingWriteIndex, MutableSnapshotNames};
-use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_stable_context_expr;
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstGlobalDecl, AstIf,
@@ -271,7 +270,7 @@ fn try_recover_with_receiver_alias(
     let AstExpr::Var(receiver_name) = &field_access.base else {
         return None;
     };
-    if !name_matches_binding(receiver_name, receiver_binding) {
+    if !receiver_binding.matches_name_ref(receiver_name) {
         return None;
     }
     let rewritten = recover_method_call_sink(
@@ -280,7 +279,7 @@ fn try_recover_with_receiver_alias(
         field_access.field.clone(),
         receiver_expr.clone(),
         mutable_snapshots,
-        |arg| matches!(arg, AstExpr::Var(name) if name_matches_binding(name, receiver_binding)),
+        |arg| matches!(arg, AstExpr::Var(name) if receiver_binding.matches_name_ref(name)),
     )?;
     let source_may_drop_receiver_root = receiver_alias_source_may_drop_root(
         write_index,
@@ -502,7 +501,7 @@ fn recover_method_call(
     let AstExpr::Var(callee_name) = &call.callee else {
         return None;
     };
-    if !name_matches_binding(callee_name, callee_binding) {
+    if !callee_binding.matches_name_ref(callee_name) {
         return None;
     }
     let [receiver_arg, args @ ..] = call.args.as_slice() else {
@@ -830,7 +829,7 @@ fn recover_direct_method_call_with_receiver_alias_expr(
     let AstExpr::Var(receiver_base_name) = &access.base else {
         return None;
     };
-    if !name_matches_binding(receiver_base_name, receiver_binding) {
+    if !receiver_binding.matches_name_ref(receiver_base_name) {
         return None;
     }
     let [receiver_arg, args @ ..] = call.args.as_slice() else {
@@ -839,7 +838,7 @@ fn recover_direct_method_call_with_receiver_alias_expr(
     let AstExpr::Var(receiver_arg_name) = receiver_arg else {
         return None;
     };
-    if !name_matches_binding(receiver_arg_name, receiver_binding) {
+    if !receiver_binding.matches_name_ref(receiver_arg_name) {
         return None;
     }
 
