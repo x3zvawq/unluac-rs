@@ -70,14 +70,13 @@ pub(super) fn validate(
     plan.navigation.validate(cfg, plan)?;
     let intervals = &plan.navigation;
     let edge_regions = &plan.navigation;
-    let block_stats = RegionBlockStats::new(plan, intervals)?;
     validate_block_terminators(proto, cfg, plan)?;
     validate_block_coverage(cfg, plan)?;
     validate_region_entries(cfg, plan, intervals)?;
     validate_single_pass_plans(cfg, plan, intervals)?;
     let condition_edges = validate_condition_plans(proto, cfg, plan)?;
-    validate_branch_plans(cfg, plan, intervals, &block_stats, &condition_edges)?;
-    let loop_edges = validate_loop_plans(proto, cfg, plan, intervals, &block_stats)?;
+    validate_branch_plans(cfg, plan, intervals, &condition_edges)?;
+    let loop_edges = validate_loop_plans(proto, cfg, plan, intervals)?;
     validate_labels(cfg, plan)?;
     validate_edges(
         cfg,

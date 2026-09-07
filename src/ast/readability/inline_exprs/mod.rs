@@ -56,8 +56,9 @@ use super::binding_tree::{
 };
 use super::expr_analysis::{collect_stable_copy_snapshot_names, result_cannot_root_collectable};
 use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
-use super::visit::AstVisitor;
-use super::walk::{self, AstRewritePass, BlockKind};
+use super::walk::{self, AstRewritePass};
+use crate::ast::traverse::BlockKind;
+use crate::ast::visit::AstVisitor;
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let root_mutable_snapshots = mutable_snapshot_names_in_block(&module.body);
@@ -1150,7 +1151,7 @@ fn condition_references_param(condition: &AstExpr, target: &AstNameRef) -> bool 
         target,
         found: false,
     };
-    super::visit::visit_expr(condition, &mut use_visitor);
+    crate::ast::visit::visit_expr(condition, &mut use_visitor);
     use_visitor.found
 }
 

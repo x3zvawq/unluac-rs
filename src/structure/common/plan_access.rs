@@ -77,6 +77,11 @@ impl StructurePlan {
         self.navigation.contains(outer, inner)
     }
 
+    /// region 及其后代拥有的可达块，不承诺 CFG 或源码顺序。
+    pub(crate) fn region_blocks(&self, region: RegionId) -> &[BlockRef] {
+        self.navigation.blocks(region)
+    }
+
     pub fn edge_region_relation(&self, edge: EdgeRef) -> Option<EdgeRegionRelation> {
         self.navigation.edge_relation(edge)
     }

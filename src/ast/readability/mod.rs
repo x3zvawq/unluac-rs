@@ -24,8 +24,6 @@ mod materialize_temps;
 mod repeat_lifetime;
 mod statement_merge;
 mod stmt_plan;
-mod traverse;
-mod visit;
 mod walk;
 
 use super::common::{AstModule, AstTargetDialect};

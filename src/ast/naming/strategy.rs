@@ -64,12 +64,12 @@ pub(super) fn choose_param_candidate(
 pub(super) fn choose_local_candidate(
     proto: &HirProto,
     local: LocalId,
-    index: usize,
     evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
     ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
+    let index = local.index();
     if proto.signature.legacy_arg_slot && proto.vararg_param_local == Some(local) {
         return CandidateHint {
             text: "arg".to_owned(),
@@ -177,7 +177,7 @@ pub(super) fn choose_synthetic_local_candidate(
             proto.id,
             "r",
             debug_like_binding_index(ast_facts, crate::ast::AstBindingRef::SyntheticLocal(local))
-                .unwrap_or(visible_count + proto.locals.len() + synthetic_order),
+                .unwrap_or(visible_count + proto.local_count + synthetic_order),
             "value".to_owned(),
         );
     }
@@ -247,17 +247,19 @@ fn resolve_captured_name(
     capture: CapturedBinding,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<CandidateHint, NamingError> {
-    let text = match capture {
-        CapturedBinding::Param { parent, param } => {
+    use crate::hir::HirBinding;
+    let parent = capture.parent;
+    let text = match capture.binding {
+        HirBinding::Param(param) => {
             resolve_captured_param_name(function, parent, param, assigned_functions)?
         }
-        CapturedBinding::Local { parent, local } => {
+        HirBinding::Local(local) => {
             resolve_captured_local_name(function, parent, local, assigned_functions)?
         }
-        CapturedBinding::Temp { parent, temp } => {
+        HirBinding::Temp(temp) => {
             resolve_captured_temp_name(function, parent, temp, assigned_functions)?
         }
-        CapturedBinding::Upvalue { parent, upvalue } => {
+        HirBinding::Upvalue(upvalue) => {
             resolve_captured_upvalue_name(function, parent, upvalue, assigned_functions)?
         }
     };

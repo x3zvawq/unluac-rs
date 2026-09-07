@@ -4,6 +4,14 @@
 //! 递归枚举子节点"。这里把 child dispatch 收成参数化宏，每个使用方只需提供
 //! 自己的回调即可，不用重复维护 AST 形状的 match 骨架。
 
+/// AST 遍历与改写的词法 block 边界。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BlockKind {
+    ModuleBody,
+    FunctionBody,
+    Regular,
+}
+
 macro_rules! traverse_call_children {
     (
         $call:expr,

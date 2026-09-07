@@ -17,7 +17,7 @@ use crate::debug::{
 use super::common::{
     HirBlock, HirControlFlowFeature, HirDecisionExpr, HirDecisionTarget, HirExitRequirement,
     HirExpr, HirInlineDisposition, HirLValue, HirModule, HirProto, HirStmt, HirTableField,
-    HirUnaryOpKind, HirValuePack, UpvalueId,
+    HirUnaryOpKind, HirValuePack, LocalId, TempId, UpvalueId,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -92,10 +92,10 @@ pub(crate) fn dump_hir_module(
             "proto#{} params={} locals={} upvalues={} env-upvalues={} temps={} exit-requirements={} children={}",
             proto.id.index(),
             proto.params.len(),
-            proto.locals.len(),
+            proto.local_count,
             proto.upvalues.len(),
             format_environment_upvalues(&proto.environment_upvalues),
-            proto.temps.len(),
+            proto.temp_count,
             proto.exit_requirements.len(),
             format_proto_refs(&proto.children),
         );
@@ -166,8 +166,8 @@ fn write_debug_bindings(output: &mut String, proto: &HirProto) {
         &proto.temp_debug_locals,
         Some(&proto.temp_debug_scopes),
     );
-    for local in &proto.locals {
-        if let HirInlineDisposition::Preserve(reasons) = proto.inline_dispositions.local(*local) {
+    for local in (0..proto.local_count).map(LocalId) {
+        if let HirInlineDisposition::Preserve(reasons) = proto.inline_dispositions.local(local) {
             let _ = writeln!(
                 output,
                 "    l{} rewrite=preserve:{reasons:?}",
@@ -175,8 +175,8 @@ fn write_debug_bindings(output: &mut String, proto: &HirProto) {
             );
         }
     }
-    for temp in &proto.temps {
-        if let HirInlineDisposition::Preserve(reasons) = proto.inline_dispositions.temp(*temp) {
+    for temp in (0..proto.temp_count).map(TempId) {
+        if let HirInlineDisposition::Preserve(reasons) = proto.inline_dispositions.temp(temp) {
             let _ = writeln!(output, "    t{} rewrite=preserve:{reasons:?}", temp.index());
         }
     }
@@ -500,7 +500,7 @@ fn format_expr(expr: &HirExpr) -> String {
                         crate::hir::common::HirCaptureMode::ByValue => "value",
                         crate::hir::common::HirCaptureMode::ByReference => "ref",
                     };
-                    format!("{mode}({})", format_expr(&capture.value))
+                    format!("{mode}({})", format_expr(&capture.binding.expr()))
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -710,13 +710,13 @@ pub(crate) fn dump_proto_snapshot(proto: &super::common::HirProto) -> String {
         "proto#{} params={} locals={} vararg-local={} upvalues={} env-upvalues={} temps={}",
         proto.id.index(),
         proto.params.len(),
-        proto.locals.len(),
+        proto.local_count,
         proto
             .vararg_param_local
             .map_or_else(|| "-".to_owned(), |local| format!("l{}", local.index())),
         proto.upvalues.len(),
         format_environment_upvalues(&proto.environment_upvalues),
-        proto.temps.len(),
+        proto.temp_count,
     );
     let _ = writeln!(output, "  body");
     write_block(&mut output, "    ", &proto.body);

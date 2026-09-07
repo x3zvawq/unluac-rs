@@ -19,7 +19,8 @@ use super::super::common::{
 use super::binding_flow::{binding_mentions_in_expr, binding_mentions_in_stmt};
 use super::control_flow::BlockGotoIndex;
 use super::{ReadabilityContext, walk};
-use walk::{BlockKind, ScopedAstRewritePass};
+use crate::ast::traverse::BlockKind;
+use walk::ScopedAstRewritePass;
 
 const SCOPE_LOCAL_TARGET: usize = 64;
 

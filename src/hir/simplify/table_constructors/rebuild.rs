@@ -10,9 +10,7 @@ use std::collections::VecDeque;
 mod captures;
 use captures::*;
 
-use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCapture, HirDecisionTarget, HirExpr, HirTableField, HirTableSetList,
-};
+use crate::hir::common::{HirBlock, HirCapture, HirExpr, HirTableField, HirTableSetList};
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr, matches_binding_ref};

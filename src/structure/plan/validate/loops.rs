@@ -96,7 +96,6 @@ pub(super) fn validate_loop_plans(
     cfg: &Cfg,
     plan: &StructurePlan,
     intervals: &RegionNavigation,
-    block_stats: &RegionBlockStats,
 ) -> Result<LoopEdgeIndex, StructureError> {
     if plan.loop_region_by_plan.len() != plan.loops.len() {
         return Err(StructureError::invalid("loop region index length mismatch"));
@@ -249,7 +248,6 @@ pub(super) fn validate_loop_plans(
             !region_matches_exact_blocks(
                 plan,
                 intervals,
-                block_stats,
                 partition,
                 expected_preheader_len,
                 payload.preheader_block,
@@ -262,14 +260,14 @@ pub(super) fn validate_loop_plans(
             )));
         }
         let preheader_count = preheader
-            .map(|partition| block_stats.subtree_count(partition))
+            .map(|partition| plan.region_blocks(partition).len())
             .unwrap_or(0);
-        let control_count = block_stats.subtree_count(*control);
+        let control_count = plan.region_blocks(*control).len();
         let normal_tail_count = normal_tail
-            .map(|partition| block_stats.subtree_count(partition))
+            .map(|partition| plan.region_blocks(partition).len())
             .unwrap_or(0);
-        let owned_count = block_stats.subtree_count(region_id);
-        let body_count = block_stats.subtree_count(*body);
+        let owned_count = plan.region_blocks(region_id).len();
+        let body_count = plan.region_blocks(*body).len();
         let expected_body_count = owned_count
             .saturating_sub(control_count)
             .saturating_sub(preheader_count)
@@ -642,7 +640,6 @@ pub(super) fn validate_loop_plans(
             if !region_matches_exact_blocks(
                 plan,
                 intervals,
-                block_stats,
                 *control,
                 expected_condition_blocks.len(),
                 expected_condition_blocks.iter().copied(),

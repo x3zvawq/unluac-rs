@@ -112,7 +112,7 @@ impl GenerateCommentMetadata {
                     source: proto.source.clone(),
                     line_range: proto.line_range,
                     signature: proto.signature,
-                    local_count: proto.locals.len(),
+                    local_count: proto.local_count,
                     upvalue_count: proto.upvalues.len(),
                 })
                 .collect(),

@@ -14,8 +14,9 @@ use crate::ast::common::{
     AstGlobalBindingTarget, AstLValue, AstNameRef, AstStmt,
 };
 
-use super::super::visit::{self, AstVisitor};
-use super::super::walk::{BlockKind, RewriteScope};
+use super::super::walk::RewriteScope;
+use crate::ast::traverse::BlockKind;
+use crate::ast::visit::{self, AstVisitor};
 
 #[derive(Default)]
 pub(in crate::ast::readability) struct VisibleGlobals {

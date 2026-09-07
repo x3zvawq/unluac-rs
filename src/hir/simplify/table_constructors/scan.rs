@@ -417,15 +417,7 @@ fn local_nil_values_before_seed(stmts: &[HirStmt]) -> BTreeMap<LocalId, bool> {
 }
 
 fn local_prefix_expr_cannot_invoke_user_code(expr: &HirExpr) -> bool {
-    seed_delay_expr_is_unobservable(expr)
-        || matches!(
-            expr,
-            HirExpr::Closure(closure)
-                if closure
-                    .captures
-                    .iter()
-                    .all(|capture| seed_delay_expr_is_unobservable(&capture.value))
-        )
+    seed_delay_expr_is_unobservable(expr) || matches!(expr, HirExpr::Closure(_))
 }
 
 fn simple_assignment_binding_if_eventless(

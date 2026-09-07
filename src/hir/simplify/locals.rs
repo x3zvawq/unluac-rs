@@ -85,10 +85,6 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     if compact_home_slots {
         facts.enable_home_slot_compaction();
     }
-    let mut next_local_index = proto.locals.len();
-    let mut new_locals = Vec::new();
-    let mut new_local_debug_hints = Vec::new();
-    let mut new_local_debug_scopes = Vec::new();
     let mut physical_root_locals = BTreeSet::new();
     let mut promoted_bindings = Vec::new();
     let mut direct_seed_promotions = Vec::new();
@@ -108,10 +104,9 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             roots,
             temp_debug_locals: &proto.temp_debug_locals,
             temp_debug_scopes: &proto.temp_debug_scopes,
-            next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
-            new_local_debug_scopes: &mut new_local_debug_scopes,
+            next_local_index: &mut proto.local_count,
+            local_debug_hints: &mut proto.local_debug_hints,
+            local_debug_scopes: &mut proto.local_debug_scopes,
             physical_root_locals: &mut physical_root_locals,
             physical_root_temps: &proto.physical_root_temps,
             promoted_bindings: &mut promoted_bindings,
@@ -151,9 +146,6 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     for (temp, local) in promoted_bindings {
         facts.record_temp_to_local_merge(temp, local);
     }
-    proto.locals.extend(new_locals);
-    proto.local_debug_hints.extend(new_local_debug_hints);
-    proto.local_debug_scopes.extend(new_local_debug_scopes);
     proto.physical_root_locals.extend(physical_root_locals);
     let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, roots.safety);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, roots.safety);
@@ -277,9 +269,8 @@ struct PromotionCtx<'a> {
     temp_debug_locals: &'a [Option<String>],
     temp_debug_scopes: &'a [Option<usize>],
     next_local_index: &'a mut usize,
-    new_locals: &'a mut Vec<LocalId>,
-    new_local_debug_hints: &'a mut Vec<Option<String>>,
-    new_local_debug_scopes: &'a mut Vec<Option<usize>>,
+    local_debug_hints: &'a mut Vec<Option<String>>,
+    local_debug_scopes: &'a mut Vec<Option<usize>>,
     physical_root_locals: &'a mut BTreeSet<LocalId>,
     physical_root_temps: &'a BTreeSet<TempId>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
@@ -299,9 +290,8 @@ struct PlanAllocator<'a> {
     reserved_temps: &'a mut BTreeSet<TempId>,
     reserved_alias_indices: &'a mut BTreeSet<usize>,
     next_local_index: &'a mut usize,
-    new_locals: &'a mut Vec<LocalId>,
-    new_local_debug_hints: &'a mut Vec<Option<String>>,
-    new_local_debug_scopes: &'a mut Vec<Option<usize>>,
+    local_debug_hints: &'a mut Vec<Option<String>>,
+    local_debug_scopes: &'a mut Vec<Option<usize>>,
     promoted_bindings: &'a mut Vec<(TempId, LocalId)>,
     direct_seed_promotions: &'a mut Vec<(TempId, LocalId)>,
     debug_scope_locals: &'a mut BTreeMap<(HomeSlotKey, usize), LocalId>,
@@ -318,10 +308,9 @@ impl PlanAllocator<'_> {
     ) {
         let local = LocalId(*self.next_local_index);
         *self.next_local_index += 1;
-        self.new_locals.push(local);
-        self.new_local_debug_hints
+        self.local_debug_hints
             .push(debug_hint_for_temp_group(self.temp_debug_locals, &temps));
-        self.new_local_debug_scopes
+        self.local_debug_scopes
             .push(debug_scope_for_temp_group(self.temp_debug_scopes, &temps));
         if let Some(home_slot) = home_slot
             && let Some(scope) = debug_scope_for_temp_group(self.temp_debug_scopes, &temps)
@@ -825,9 +814,8 @@ fn collect_plans(
                     reserved_temps: &mut reserved_temps,
                     reserved_alias_indices: &mut reserved_alias_indices,
                     next_local_index: ctx.next_local_index,
-                    new_locals: ctx.new_locals,
-                    new_local_debug_hints: ctx.new_local_debug_hints,
-                    new_local_debug_scopes: ctx.new_local_debug_scopes,
+                    local_debug_hints: ctx.local_debug_hints,
+                    local_debug_scopes: ctx.local_debug_scopes,
                     promoted_bindings: ctx.promoted_bindings,
                     direct_seed_promotions: ctx.direct_seed_promotions,
                     debug_scope_locals: ctx.debug_scope_locals,
@@ -888,9 +876,8 @@ fn collect_plans(
             reserved_temps: &mut reserved_temps,
             reserved_alias_indices: &mut reserved_alias_indices,
             next_local_index: ctx.next_local_index,
-            new_locals: ctx.new_locals,
-            new_local_debug_hints: ctx.new_local_debug_hints,
-            new_local_debug_scopes: ctx.new_local_debug_scopes,
+            local_debug_hints: ctx.local_debug_hints,
+            local_debug_scopes: ctx.local_debug_scopes,
             promoted_bindings: ctx.promoted_bindings,
             direct_seed_promotions: ctx.direct_seed_promotions,
             debug_scope_locals: ctx.debug_scope_locals,
@@ -985,9 +972,8 @@ fn collect_plans(
                 reserved_temps: &mut reserved_temps,
                 reserved_alias_indices: &mut reserved_alias_indices,
                 next_local_index: ctx.next_local_index,
-                new_locals: ctx.new_locals,
-                new_local_debug_hints: ctx.new_local_debug_hints,
-                new_local_debug_scopes: ctx.new_local_debug_scopes,
+                local_debug_hints: ctx.local_debug_hints,
+                local_debug_scopes: ctx.local_debug_scopes,
                 promoted_bindings: ctx.promoted_bindings,
                 direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,
@@ -1238,9 +1224,8 @@ fn collect_plans(
             reserved_temps: &mut reserved_temps,
             reserved_alias_indices: &mut reserved_alias_indices,
             next_local_index: ctx.next_local_index,
-            new_locals: ctx.new_locals,
-            new_local_debug_hints: ctx.new_local_debug_hints,
-            new_local_debug_scopes: ctx.new_local_debug_scopes,
+            local_debug_hints: ctx.local_debug_hints,
+            local_debug_scopes: ctx.local_debug_scopes,
             promoted_bindings: ctx.promoted_bindings,
             direct_seed_promotions: ctx.direct_seed_promotions,
             debug_scope_locals: ctx.debug_scope_locals,
@@ -1391,9 +1376,8 @@ fn collect_plans(
                 reserved_temps: &mut reserved_temps,
                 reserved_alias_indices: &mut reserved_alias_indices,
                 next_local_index: ctx.next_local_index,
-                new_locals: ctx.new_locals,
-                new_local_debug_hints: ctx.new_local_debug_hints,
-                new_local_debug_scopes: ctx.new_local_debug_scopes,
+                local_debug_hints: ctx.local_debug_hints,
+                local_debug_scopes: ctx.local_debug_scopes,
                 promoted_bindings: ctx.promoted_bindings,
                 direct_seed_promotions: ctx.direct_seed_promotions,
                 debug_scope_locals: ctx.debug_scope_locals,

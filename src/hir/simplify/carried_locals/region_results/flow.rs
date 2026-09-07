@@ -836,7 +836,10 @@ mod tests {
     fn capture_closure(mode: HirCaptureMode, value: HirExpr) -> HirExpr {
         HirExpr::Closure(Box::new(HirClosureExpr {
             proto: crate::hir::common::HirProtoRef(1),
-            captures: vec![HirCapture { mode, value }],
+            captures: vec![HirCapture {
+                mode,
+                binding: crate::hir::HirBinding::from_expr(&value).unwrap(),
+            }],
         }))
     }
 

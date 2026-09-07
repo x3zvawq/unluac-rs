@@ -1,4 +1,4 @@
-//! 校验结构化分支的条件与 arm 边界；依赖条件边索引和区域统计，不负责条件归约；例如确认 then/else 精确覆盖各自区域。
+//! 校验结构化分支的条件与 arm 边界；依赖条件边索引和共享区域导航，不负责条件归约；例如确认 then/else 精确覆盖各自区域。
 
 use super::*;
 
@@ -14,7 +14,6 @@ pub(super) fn validate_branch_plans(
     cfg: &Cfg,
     plan: &StructurePlan,
     intervals: &RegionNavigation,
-    block_stats: &RegionBlockStats,
     condition_edges: &ConditionEdgeIndex,
 ) -> Result<(), StructureError> {
     let mut seen = vec![false; plan.branches.len()];
@@ -63,7 +62,6 @@ pub(super) fn validate_branch_plans(
         if !region_matches_exact_blocks(
             plan,
             intervals,
-            block_stats,
             *condition,
             expected_condition_blocks.len(),
             expected_condition_blocks.iter().copied(),

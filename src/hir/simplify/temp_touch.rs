@@ -22,7 +22,10 @@ pub(super) fn stmts_touch_any_temp(stmts: &[HirStmt], temps: &BTreeSet<TempId>) 
 }
 
 pub(super) fn expr_touches_any_temp(expr: &HirExpr, temps: &BTreeSet<TempId>) -> bool {
-    TempTouchCollector::touches_in_expr(expr, temps)
+    crate::hir::visit::any_expr(
+        expr,
+        &mut |expr| matches!(expr, HirExpr::TempRef(temp) if temps.contains(temp)),
+    )
 }
 
 pub(super) fn collect_temp_refs_in_expr(expr: &HirExpr) -> BTreeSet<TempId> {
@@ -140,15 +143,6 @@ impl<'a> TempTouchCollector<'a> {
         visit_stmts(stmts, &mut collector);
         collector.touched
     }
-
-    fn touches_in_expr(expr: &HirExpr, temps: &'a BTreeSet<TempId>) -> bool {
-        let mut collector = Self {
-            temps,
-            touched: false,
-        };
-        visit_expr(expr, &mut collector);
-        collector.touched
-    }
 }
 
 impl HirVisitor for TempTouchCollector<'_> {
@@ -210,18 +204,15 @@ pub(super) type TempTouchIndex = crate::graph::PositionIndex<TempId>;
 
 /// 以每条语句的引用集合增量维护当前语句之外仍需保护的身份。
 ///
-/// locals 使用 `TempId` 特化；carried-locals 复用同一 tracker 维护 local/temp 统一
-/// binding，避免为两类身份复制前缀/后缀计数逻辑。
-pub(super) type TempRefScopeTracker<'a> = RefScopeTracker<'a, TempId>;
-
-pub(super) struct RefScopeTracker<'a, T> {
-    stmt_refs: &'a [BTreeSet<T>],
-    suffix_ref_counts: BTreeMap<T, usize>,
-    prefix_refs: BTreeSet<T>,
+/// locals 在本次声明规划期间冻结语句引用，按进入/离开当前语句维护外部 temp 保护。
+pub(super) struct TempRefScopeTracker<'a> {
+    stmt_refs: &'a [BTreeSet<TempId>],
+    suffix_ref_counts: BTreeMap<TempId, usize>,
+    prefix_refs: BTreeSet<TempId>,
 }
 
-impl<'a, T: Copy + Ord> RefScopeTracker<'a, T> {
-    pub(super) fn new(stmt_refs: &'a [BTreeSet<T>]) -> Self {
+impl<'a> TempRefScopeTracker<'a> {
+    pub(super) fn new(stmt_refs: &'a [BTreeSet<TempId>]) -> Self {
         let mut suffix_ref_counts = BTreeMap::new();
         for refs in stmt_refs {
             for temp in refs {
@@ -234,10 +225,6 @@ impl<'a, T: Copy + Ord> RefScopeTracker<'a, T> {
             suffix_ref_counts,
             prefix_refs: BTreeSet::new(),
         }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.stmt_refs.len()
     }
 
     pub(super) fn enter_stmt(&mut self, index: usize) {
@@ -258,11 +245,11 @@ impl<'a, T: Copy + Ord> RefScopeTracker<'a, T> {
             .extend(self.stmt_refs[index].iter().copied());
     }
 
-    pub(super) fn suffix_contains(&self, reference: T) -> bool {
+    pub(super) fn suffix_contains(&self, reference: TempId) -> bool {
         self.suffix_ref_counts.contains_key(&reference)
     }
 
-    pub(super) fn prefix_contains(&self, reference: T) -> bool {
+    pub(super) fn prefix_contains(&self, reference: TempId) -> bool {
         self.prefix_refs.contains(&reference)
     }
 }

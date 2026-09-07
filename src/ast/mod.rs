@@ -13,6 +13,7 @@ pub(crate) mod pretty;
 mod readability;
 mod table_layout;
 pub(crate) mod traverse;
+mod visit;
 
 pub use crate::decompile::{DecompileDialect, ReadabilityOptions};
 pub use build::lower_ast;

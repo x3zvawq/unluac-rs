@@ -26,7 +26,8 @@ use super::global_decl_pretty::{VisibleGlobals, extending_global_scope_preserves
 use super::repeat_lifetime::{
     binding_must_live_through_condition, hir_binding_may_end_before_condition,
 };
-use super::walk::{self, AstRewritePass, BlockKind, RewriteScope, ScopedAstRewritePass};
+use super::walk::{self, AstRewritePass, RewriteScope, ScopedAstRewritePass};
+use crate::ast::traverse::BlockKind;
 use crate::ast::traverse::traverse_expr_children;
 use crate::hir::HirRepeatConditionLifetimeFacts;
 

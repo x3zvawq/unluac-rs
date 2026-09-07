@@ -7,7 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
+    HirBinding, HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt,
+    LocalId, ParamId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
@@ -34,7 +35,10 @@ pub(super) fn block_mentions_local(block: &HirBlock, local: LocalId) -> bool {
 }
 
 pub(super) fn expr_mentions_local(expr: &HirExpr, local: LocalId) -> bool {
-    LocalMentionCollector::mentions_in_expr(expr, local)
+    crate::hir::visit::any_expr(
+        expr,
+        &mut |expr| matches!(expr, HirExpr::LocalRef(id) if *id == local),
+    )
 }
 
 pub(super) fn stmt_captures_local(stmt: &HirStmt, local: LocalId) -> bool {
@@ -54,8 +58,40 @@ pub(super) struct ReferenceCapturedBindings {
     pub(super) temps: BTreeSet<TempId>,
 }
 
+impl ReferenceCapturedBindings {
+    fn insert(&mut self, binding: HirBinding) {
+        match binding {
+            HirBinding::Local(local) => {
+                self.locals.insert(local);
+            }
+            HirBinding::Param(param) => {
+                self.params.insert(param);
+            }
+            HirBinding::Temp(temp) => {
+                self.temps.insert(temp);
+            }
+            HirBinding::Upvalue(_) => {}
+        }
+    }
+}
+
+struct BindingRefCollector<'a> {
+    bindings: &'a mut ReferenceCapturedBindings,
+}
+
+impl HirVisitor for BindingRefCollector<'_> {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let Some(binding) = HirBinding::from_expr(expr) {
+            self.bindings.insert(binding);
+        }
+    }
+}
+
 pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
-    let mut collector = ReferenceCaptureCollector::default();
+    let mut collector = CaptureCollector {
+        mode: HirCaptureMode::ByReference,
+        bindings: Default::default(),
+    };
     visit_stmts(stmts, &mut collector);
     collector.bindings
 }
@@ -64,7 +100,10 @@ pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceC
 /// capture is a snapshot: a later write to the same physical slot must not be merged back into
 /// the captured binding merely because the snapshot has no ordinary expression use.
 pub(super) fn stmts_value_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
-    let mut collector = ValueCaptureCollector::default();
+    let mut collector = CaptureCollector {
+        mode: HirCaptureMode::ByValue,
+        bindings: Default::default(),
+    };
     visit_stmts(stmts, &mut collector);
     collector.bindings
 }
@@ -176,73 +215,25 @@ impl HirVisitor for ToBeClosedTempCollector {
     }
 }
 
-#[derive(Default)]
-struct ReferenceCaptureCollector {
+struct CaptureCollector {
+    mode: HirCaptureMode,
     bindings: ReferenceCapturedBindings,
 }
 
-impl HirVisitor for ReferenceCaptureCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        let HirExpr::Closure(closure) = expr else {
+impl HirVisitor for CaptureCollector {
+    fn visit_capture(&mut self, capture: &HirCapture) {
+        if capture.mode != self.mode {
             return;
-        };
-        for capture in &closure.captures {
-            if capture.mode != HirCaptureMode::ByReference {
-                continue;
-            }
-            let mut collector = BindingRefCollector {
-                bindings: &mut self.bindings,
-            };
-            visit_expr(&capture.value, &mut collector);
         }
-    }
-}
-
-#[derive(Default)]
-struct ValueCaptureCollector {
-    bindings: ReferenceCapturedBindings,
-}
-
-impl HirVisitor for ValueCaptureCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        let HirExpr::Closure(closure) = expr else {
-            return;
-        };
-        for capture in &closure.captures {
-            if capture.mode != HirCaptureMode::ByValue {
-                continue;
-            }
-            let mut collector = BindingRefCollector {
-                bindings: &mut self.bindings,
-            };
-            visit_expr(&capture.value, &mut collector);
-        }
-    }
-}
-
-struct BindingRefCollector<'a> {
-    bindings: &'a mut ReferenceCapturedBindings,
-}
-
-impl HirVisitor for BindingRefCollector<'_> {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        match expr {
-            HirExpr::LocalRef(local) => {
-                self.bindings.locals.insert(*local);
-            }
-            HirExpr::ParamRef(param) => {
-                self.bindings.params.insert(*param);
-            }
-            HirExpr::TempRef(temp) => {
-                self.bindings.temps.insert(*temp);
-            }
-            _ => {}
-        }
+        self.bindings.insert(capture.binding);
     }
 }
 
 pub(super) fn expr_mentions_temp(expr: &HirExpr, temp: TempId) -> bool {
-    TempMentionCollector::mentions_in_expr(expr, temp)
+    crate::hir::visit::any_expr(
+        expr,
+        &mut |expr| matches!(expr, HirExpr::TempRef(id) if *id == temp),
+    )
 }
 
 pub(super) fn stmt_writes_temp(stmt: &HirStmt, temp: TempId) -> bool {
@@ -318,15 +309,6 @@ impl LocalMentionCollector {
         visit_block(block, &mut collector);
         collector.mentioned
     }
-
-    fn mentions_in_expr(expr: &HirExpr, local: LocalId) -> bool {
-        let mut collector = Self {
-            local,
-            mentioned: false,
-        };
-        visit_expr(expr, &mut collector);
-        collector.mentioned
-    }
 }
 
 impl HirVisitor for LocalMentionCollector {
@@ -356,13 +338,8 @@ impl LocalCaptureCollector {
 }
 
 impl HirVisitor for LocalCaptureCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        if let HirExpr::Closure(closure) = expr {
-            self.captured |= closure
-                .captures
-                .iter()
-                .any(|capture| expr_mentions_local(&capture.value, self.local));
-        }
+    fn visit_capture(&mut self, capture: &HirCapture) {
+        self.captured |= capture.binding == HirBinding::Local(self.local);
     }
 }
 
@@ -372,15 +349,9 @@ struct CapturedLocalSetCollector {
 }
 
 impl HirVisitor for CapturedLocalSetCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        let HirExpr::Closure(closure) = expr else {
-            return;
-        };
-        for capture in &closure.captures {
-            let mut collector = LocalMentionSetCollector {
-                locals: &mut self.locals,
-            };
-            visit_expr(&capture.value, &mut collector);
+    fn visit_capture(&mut self, capture: &HirCapture) {
+        if let HirBinding::Local(local) = capture.binding {
+            self.locals.insert(local);
         }
     }
 }
@@ -400,32 +371,6 @@ impl HirVisitor for LocalMentionSetCollector<'_> {
         if let HirLValue::Local(local) = lvalue {
             self.locals.insert(*local);
         }
-    }
-}
-
-struct TempMentionCollector {
-    temp: TempId,
-    mentioned: bool,
-}
-
-impl TempMentionCollector {
-    fn mentions_in_expr(expr: &HirExpr, temp: TempId) -> bool {
-        let mut collector = Self {
-            temp,
-            mentioned: false,
-        };
-        visit_expr(expr, &mut collector);
-        collector.mentioned
-    }
-}
-
-impl HirVisitor for TempMentionCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.mentioned |= matches!(expr, HirExpr::TempRef(temp) if *temp == self.temp);
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.mentioned |= matches!(lvalue, HirLValue::Temp(temp) if *temp == self.temp);
     }
 }
 

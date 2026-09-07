@@ -1,10 +1,11 @@
-//! 这个文件提供 AST readability 共享的只读 visitor。
+//! 这个文件提供 AST 各消费者共享的只读 visitor。
 //!
-//! 很多 readability pass 只是想“遍历 AST 收集一批事实”，例如统计 method 名、
+//! readability、方言特性和调试编号收集器经常只是想“遍历 AST 收集一批事实”，例如统计 method 名、
 //! 扫描 temp、寻找 synthetic local。过去这些分析各自复制了一整套
 //! `block/stmt/lvalue/call/expr` 递归骨架；这里把只读遍历收成共享设施，让分析代码
 //! 更专注在“看到某个节点时记录什么”，而不是重复维护递归。需要保持词法边界的分析
 //! 可以在 `visit_block` 返回 false，裁掉由 scoped walker 另行处理的子 block。
+//! 本层只枚举当前 AST 与显式 capture 元数据，不提供 HIR/VM 语义或改写许可。
 //! 名字事件保留读、写、局部声明与 capture 的角色，consumer 不再各自解释函数 target。
 //! 例如 `function t.m() end` 读取 t，而 `function t() end` 写入 t；把赋值改成声明语法
 //! 不得丢掉前者的基址读取。函数边界的 capture 事件来自显式元数据，不遍历 child 重建。
@@ -18,9 +19,8 @@ use crate::ast::common::{
     AstStmt,
 };
 
-use super::traverse::BlockKind;
 use crate::ast::traverse::{
-    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
+    BlockKind, traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,
 };
 

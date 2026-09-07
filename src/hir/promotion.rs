@@ -30,10 +30,7 @@
 mod call_roots;
 mod slot_captures;
 
-use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirMethodSetupProtocolId, HirStmt, HirTableField, LocalId,
-    ParamId, TempId,
-};
+use crate::hir::common::{HirExpr, HirMethodSetupProtocolId, HirStmt, LocalId, ParamId, TempId};
 use crate::structure::{
     BlockRef, Cfg, DataflowFacts, EdgeRef, ForwardRouteKind, GraphFacts, InstrEffect,
     LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, RegionId,
@@ -1293,308 +1290,49 @@ impl ProtoPromotionFacts {
         }
     }
 
-    /// 把当前语句里所有 closure capture 观察到的 home slot 收集进集合。
+    /// 收集当前语句及嵌套 block 中按引用捕获的 temp home；不进入子 proto。
     pub(super) fn collect_captured_home_slots_in_stmt(
         &self,
         stmt: &HirStmt,
         slots: &mut BTreeSet<HomeSlotKey>,
     ) {
-        match stmt {
-            HirStmt::LocalRootRelease(_) => {}
-            HirStmt::LocalDecl(local_decl) => {
-                for value in &local_decl.values {
-                    self.collect_captured_home_slots_in_expr(value, slots);
-                }
-            }
-            HirStmt::GlobalDecl(global_decl) => {
-                for value in &global_decl.values {
-                    self.collect_captured_home_slots_in_expr(value, slots);
-                }
-            }
-            HirStmt::Assign(assign) => {
-                for target in &assign.targets {
-                    if let HirLValue::TableAccess(access) = target {
-                        self.collect_captured_home_slots_in_expr(&access.base, slots);
-                        self.collect_captured_home_slots_in_expr(&access.key, slots);
-                    }
-                }
-                for value in &assign.values {
-                    self.collect_captured_home_slots_in_expr(value, slots);
-                }
-            }
-            HirStmt::TableSetList(set_list) => {
-                self.collect_captured_home_slots_in_expr(&set_list.base, slots);
-                for value in &set_list.values {
-                    self.collect_captured_home_slots_in_expr(value, slots);
-                }
-            }
-            HirStmt::ErrNil(err_nil) => {
-                self.collect_captured_home_slots_in_expr(&err_nil.value, slots);
-            }
-            HirStmt::ToBeClosed(to_be_closed) => {
-                self.collect_captured_home_slots_in_expr(&to_be_closed.value, slots);
-            }
-            HirStmt::CallStmt(call_stmt) => {
-                self.collect_captured_home_slots_in_expr(&call_stmt.call.callee, slots);
-                for arg in &call_stmt.call.args {
-                    self.collect_captured_home_slots_in_expr(arg, slots);
-                }
-            }
-            HirStmt::Return(ret) => {
-                for value in &ret.values {
-                    self.collect_captured_home_slots_in_expr(value, slots);
-                }
-            }
-            HirStmt::If(if_stmt) => {
-                self.collect_captured_home_slots_in_expr(&if_stmt.cond, slots);
-                self.collect_captured_home_slots_in_block(&if_stmt.then_block, slots);
-                if let Some(else_block) = &if_stmt.else_block {
-                    self.collect_captured_home_slots_in_block(else_block, slots);
-                }
-            }
-            HirStmt::While(while_stmt) => {
-                self.collect_captured_home_slots_in_expr(&while_stmt.cond, slots);
-                self.collect_captured_home_slots_in_block(&while_stmt.body, slots);
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                self.collect_captured_home_slots_in_block(&repeat_stmt.body, slots);
-                self.collect_captured_home_slots_in_expr(&repeat_stmt.cond, slots);
-            }
-            HirStmt::NumericFor(numeric_for) => {
-                self.collect_captured_home_slots_in_expr(&numeric_for.start, slots);
-                self.collect_captured_home_slots_in_expr(&numeric_for.limit, slots);
-                self.collect_captured_home_slots_in_expr(&numeric_for.step, slots);
-                self.collect_captured_home_slots_in_block(&numeric_for.body, slots);
-            }
-            HirStmt::GenericFor(generic_for) => {
-                for iterator in &generic_for.iterator {
-                    self.collect_captured_home_slots_in_expr(iterator, slots);
-                }
-                self.collect_captured_home_slots_in_block(&generic_for.body, slots);
-            }
-            HirStmt::Block(block) => self.collect_captured_home_slots_in_block(block, slots),
-            HirStmt::Break
-            | HirStmt::Close(_)
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
+        crate::hir::visit::visit_stmts(
+            std::slice::from_ref(stmt),
+            &mut CapturedHomeSlotCollector { facts: self, slots },
+        );
     }
 
-    /// 只收集在进入嵌套 block 之前就会执行到的 capture。
+    /// 只收集进入嵌套 block 前执行的 capture；repeat 尾条件不属于入口前缀。
     pub(super) fn collect_prefix_captured_home_slots_in_stmt(
         &self,
         stmt: &HirStmt,
         slots: &mut BTreeSet<HomeSlotKey>,
     ) {
-        match stmt {
-            HirStmt::LocalRootRelease(_) => {}
-            HirStmt::If(if_stmt) => self.collect_captured_home_slots_in_expr(&if_stmt.cond, slots),
-            HirStmt::While(while_stmt) => {
-                self.collect_captured_home_slots_in_expr(&while_stmt.cond, slots);
-            }
-            HirStmt::NumericFor(numeric_for) => {
-                self.collect_captured_home_slots_in_expr(&numeric_for.start, slots);
-                self.collect_captured_home_slots_in_expr(&numeric_for.limit, slots);
-                self.collect_captured_home_slots_in_expr(&numeric_for.step, slots);
-            }
-            HirStmt::GenericFor(generic_for) => {
-                for iterator in &generic_for.iterator {
-                    self.collect_captured_home_slots_in_expr(iterator, slots);
-                }
-            }
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Repeat(_)
-            | HirStmt::Block(_)
-            | HirStmt::Break
-            | HirStmt::Close(_)
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
+        if matches!(
+            stmt,
+            HirStmt::If(_) | HirStmt::While(_) | HirStmt::NumericFor(_) | HirStmt::GenericFor(_)
+        ) {
+            crate::hir::visit::visit_stmt_header(
+                stmt,
+                &mut CapturedHomeSlotCollector { facts: self, slots },
+            );
         }
     }
+}
 
-    fn collect_captured_home_slots_in_block(
-        &self,
-        block: &HirBlock,
-        slots: &mut BTreeSet<HomeSlotKey>,
-    ) {
-        for stmt in &block.stmts {
-            self.collect_captured_home_slots_in_stmt(stmt, slots);
-        }
-    }
+struct CapturedHomeSlotCollector<'a> {
+    facts: &'a ProtoPromotionFacts,
+    slots: &'a mut BTreeSet<HomeSlotKey>,
+}
 
-    fn collect_captured_home_slots_in_expr(
-        &self,
-        expr: &HirExpr,
-        slots: &mut BTreeSet<HomeSlotKey>,
-    ) {
-        match expr {
-            HirExpr::TableAccess(access) => {
-                self.collect_captured_home_slots_in_expr(&access.base, slots);
-                self.collect_captured_home_slots_in_expr(&access.key, slots);
-            }
-            HirExpr::Unary(unary) => self.collect_captured_home_slots_in_expr(&unary.expr, slots),
-            HirExpr::Binary(binary) => {
-                self.collect_captured_home_slots_in_expr(&binary.lhs, slots);
-                self.collect_captured_home_slots_in_expr(&binary.rhs, slots);
-            }
-            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-                self.collect_captured_home_slots_in_expr(&logical.lhs, slots);
-                self.collect_captured_home_slots_in_expr(&logical.rhs, slots);
-            }
-            HirExpr::Decision(decision) => {
-                for node in &decision.nodes {
-                    self.collect_captured_home_slots_in_expr(&node.test, slots);
-                    self.collect_captured_home_slots_in_decision_target(&node.truthy, slots);
-                    self.collect_captured_home_slots_in_decision_target(&node.falsy, slots);
-                }
-            }
-            HirExpr::Call(call) => {
-                self.collect_captured_home_slots_in_expr(&call.callee, slots);
-                for arg in &call.args {
-                    self.collect_captured_home_slots_in_expr(arg, slots);
-                }
-            }
-            HirExpr::TableConstructor(table) => {
-                for field in &table.fields {
-                    match field {
-                        HirTableField::Array(value) => {
-                            self.collect_captured_home_slots_in_expr(value, slots);
-                        }
-                        HirTableField::Record(field) => {
-                            self.collect_captured_home_slots_in_expr(&field.key, slots);
-                            self.collect_captured_home_slots_in_expr(&field.value, slots);
-                        }
-                    }
-                }
-                if let Some(trailing) = &table.trailing_multivalue {
-                    self.collect_captured_home_slots_in_expr(trailing.as_expr(), slots);
-                }
-            }
-            HirExpr::Closure(closure) => {
-                for capture in &closure.captures {
-                    if capture.mode == crate::hir::common::HirCaptureMode::ByReference {
-                        self.collect_temp_home_slots_in_expr(&capture.value, slots);
-                    }
-                    self.collect_captured_home_slots_in_expr(&capture.value, slots);
-                }
-            }
-            HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::TempRef(_)
-            | HirExpr::GlobalRef(_)
-            | HirExpr::VarArg
-            | HirExpr::Unresolved(_) => {}
-        }
-    }
-
-    fn collect_captured_home_slots_in_decision_target(
-        &self,
-        target: &crate::hir::common::HirDecisionTarget,
-        slots: &mut BTreeSet<HomeSlotKey>,
-    ) {
-        if let crate::hir::common::HirDecisionTarget::Expr(expr) = target {
-            self.collect_captured_home_slots_in_expr(expr, slots);
-        }
-    }
-
-    fn collect_temp_home_slots_in_expr(&self, expr: &HirExpr, slots: &mut BTreeSet<HomeSlotKey>) {
-        match expr {
-            HirExpr::TempRef(temp) => {
-                if let Some(slot) = self.home_slot(*temp) {
-                    slots.insert(slot);
-                }
-            }
-            HirExpr::TableAccess(access) => {
-                self.collect_temp_home_slots_in_expr(&access.base, slots);
-                self.collect_temp_home_slots_in_expr(&access.key, slots);
-            }
-            HirExpr::Unary(unary) => self.collect_temp_home_slots_in_expr(&unary.expr, slots),
-            HirExpr::Binary(binary) => {
-                self.collect_temp_home_slots_in_expr(&binary.lhs, slots);
-                self.collect_temp_home_slots_in_expr(&binary.rhs, slots);
-            }
-            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-                self.collect_temp_home_slots_in_expr(&logical.lhs, slots);
-                self.collect_temp_home_slots_in_expr(&logical.rhs, slots);
-            }
-            HirExpr::Decision(decision) => {
-                for node in &decision.nodes {
-                    self.collect_temp_home_slots_in_expr(&node.test, slots);
-                    self.collect_temp_home_slots_in_decision_target(&node.truthy, slots);
-                    self.collect_temp_home_slots_in_decision_target(&node.falsy, slots);
-                }
-            }
-            HirExpr::Call(call) => {
-                self.collect_temp_home_slots_in_expr(&call.callee, slots);
-                for arg in &call.args {
-                    self.collect_temp_home_slots_in_expr(arg, slots);
-                }
-            }
-            HirExpr::TableConstructor(table) => {
-                for field in &table.fields {
-                    match field {
-                        HirTableField::Array(value) => {
-                            self.collect_temp_home_slots_in_expr(value, slots);
-                        }
-                        HirTableField::Record(field) => {
-                            self.collect_temp_home_slots_in_expr(&field.key, slots);
-                            self.collect_temp_home_slots_in_expr(&field.value, slots);
-                        }
-                    }
-                }
-                if let Some(trailing) = &table.trailing_multivalue {
-                    self.collect_temp_home_slots_in_expr(trailing.as_expr(), slots);
-                }
-            }
-            HirExpr::Closure(closure) => {
-                for capture in &closure.captures {
-                    self.collect_temp_home_slots_in_expr(&capture.value, slots);
-                }
-            }
-            HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::GlobalRef(_)
-            | HirExpr::VarArg
-            | HirExpr::Unresolved(_) => {}
-        }
-    }
-
-    fn collect_temp_home_slots_in_decision_target(
-        &self,
-        target: &crate::hir::common::HirDecisionTarget,
-        slots: &mut BTreeSet<HomeSlotKey>,
-    ) {
-        if let crate::hir::common::HirDecisionTarget::Expr(expr) = target {
-            self.collect_temp_home_slots_in_expr(expr, slots);
+impl crate::hir::visit::HirVisitor for CapturedHomeSlotCollector<'_> {
+    fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
+        // 按值捕获不激活原槽的 sticky 身份；这里只维护尚未物化的 temp home。
+        if capture.mode == crate::hir::HirCaptureMode::ByReference
+            && let crate::hir::HirBinding::Temp(temp) = capture.binding
+            && let Some(slot) = self.facts.home_slot(temp)
+        {
+            self.slots.insert(slot);
         }
     }
 }
@@ -1829,7 +1567,7 @@ fn collect_implicit_root_scope_fences(
     fixed_temps: &[TempId],
 ) -> BTreeMap<RegionId, ImplicitRootScopeFence> {
     let mut fences = BTreeMap::new();
-    for (loop_id, _) in plan.loops() {
+    for (loop_id, loop_) in plan.loops() {
         let Some(loop_region) = plan.loop_region(loop_id) else {
             continue;
         };
@@ -1845,7 +1583,7 @@ fn collect_implicit_root_scope_fences(
             dataflow,
             plan,
             fixed_temps,
-            loop_region,
+            &loop_.control_edges.continues,
             *body,
         ) else {
             continue;
@@ -1861,7 +1599,7 @@ fn implicit_repeat_root_scope_fence(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     fixed_temps: &[TempId],
-    loop_region: RegionId,
+    continue_edges: &[EdgeRef],
     body: RegionId,
 ) -> Option<ImplicitRootScopeFence> {
     let RegionPlan::Sequence { children, .. } = plan.region(body)? else {
@@ -1875,12 +1613,8 @@ fn implicit_repeat_root_scope_fence(
     // the source condition which an early `continue` must evaluate. All such arcs must agree.
     let mut dispatch_positions = BTreeSet::new();
     let mut repeat_condition_arc = None;
-    for edge_index in 0..cfg.edges.len() {
-        let edge_ref = EdgeRef(edge_index);
+    for &edge_ref in continue_edges {
         let edge = plan.edge_plan(edge_ref)?;
-        if edge.transfer != crate::structure::EdgeTransfer::Continue(loop_region) {
-            continue;
-        }
         let route = edge
             .forward_route
             .and_then(|route| plan.forward_route(route))?;
@@ -1891,7 +1625,7 @@ fn implicit_repeat_root_scope_fence(
             return None;
         }
         repeat_condition_arc = Some(arc);
-        let source_owner = plan.region_for_block(cfg.edges.get(edge_index)?.from)?;
+        let source_owner = plan.region_for_block(cfg.edges.get(edge_ref.index())?.from)?;
         let position = children
             .iter()
             .position(|child| plan.region_contains(*child, source_owner))?;
@@ -1918,18 +1652,24 @@ fn implicit_repeat_root_scope_fence(
     let prefix_children = &children[..dispatch_position];
     let prefix_blocks = prefix_children
         .iter()
-        .flat_map(|region| blocks_in_region(cfg, plan, *region))
+        .flat_map(|region| plan.region_blocks(*region).iter().copied())
         .collect::<BTreeSet<_>>();
-    let dispatch_blocks = blocks_in_region(cfg, plan, dispatch_child);
+    let dispatch_blocks = plan
+        .region_blocks(dispatch_child)
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     if prefix_blocks.is_empty() || dispatch_blocks.is_empty() {
         return None;
     }
 
     let mut entries = BTreeSet::new();
-    for edge in &cfg.edges {
-        let source_inside = dispatch_blocks.contains(&edge.from);
-        let target_inside = dispatch_blocks.contains(&edge.to);
-        if !source_inside && target_inside {
+    for edge_ref in dispatch_blocks
+        .iter()
+        .flat_map(|block| &cfg.preds[block.index()])
+    {
+        let edge = &cfg.edges[edge_ref.index()];
+        if !dispatch_blocks.contains(&edge.from) {
             if !prefix_blocks.contains(&edge.from) {
                 return None;
             }
@@ -1977,12 +1717,12 @@ fn implicit_repeat_root_scope_fence(
             }
         }
     }
-    for (edge_index, cfg_edge) in cfg.edges.iter().enumerate() {
-        if !relevant_blocks.contains(&cfg_edge.from) {
-            continue;
-        }
+    for &edge_ref in relevant_blocks
+        .iter()
+        .flat_map(|block| &cfg.succs[block.index()])
+    {
         if matches!(
-            plan.edge_plan(EdgeRef(edge_index))?.transfer,
+            plan.edge_plan(edge_ref)?.transfer,
             crate::structure::EdgeTransfer::Goto(..) | crate::structure::EdgeTransfer::LoopBack(_)
         ) {
             return None;
@@ -1992,7 +1732,11 @@ fn implicit_repeat_root_scope_fence(
     // Region-result phi 候选若仍可能持有 collectable，当前 fixed-def collective proof
     // 没有覆盖其 source identity。Loop-carried/region-input phi 由外层 binding 拥有，
     // 不会因这个内层 block 获得新声明。
-    for phi in plan.phis().filter(|phi| prefix_blocks.contains(&phi.block)) {
+    for &phi_id in prefix_blocks
+        .iter()
+        .flat_map(|block| plan.phis_in_block(*block))
+    {
+        let phi = plan.phi_plan(phi_id)?;
         let outer_owned = phi.incomings.iter().any(|incoming| {
             matches!(
                 incoming.disposition,
@@ -2014,9 +1758,15 @@ fn implicit_repeat_root_scope_fence(
     let mut candidate_defs = BTreeSet::new();
     let mut roots = BTreeSet::new();
     let mut homes = BTreeSet::new();
-    for def in &dataflow.defs {
-        if !prefix_blocks.contains(&def.block)
-            || fixed_temps.get(def.id.index()) != Some(&TempId(def.id.index()))
+    let prefix_defs = prefix_blocks.iter().flat_map(|block| {
+        let range = cfg.blocks[block.index()].instrs;
+        dataflow.instr_defs[range.start.index()..range.end()]
+            .iter()
+            .flatten()
+    });
+    for def_id in prefix_defs {
+        let def = &dataflow.defs[def_id.index()];
+        if fixed_temps.get(def.id.index()) != Some(&TempId(def.id.index()))
             || !low_instr_def_may_hold_gc_root(proto.instrs.get(def.instr.index())?, def.reg)
             || dataflow.def_has_use_outside(cfg, def.id, &prefix_blocks)
             || dataflow.live_in_regs(*dispatch_header).contains(&def.reg)
@@ -2070,17 +1820,6 @@ fn implicit_repeat_root_scope_fence(
         end_before_child: dispatch_child,
         ended_roots: roots,
     })
-}
-
-fn blocks_in_region(cfg: &Cfg, plan: &StructurePlan, region: RegionId) -> BTreeSet<BlockRef> {
-    cfg.reachable_blocks
-        .iter()
-        .copied()
-        .filter(|block| {
-            plan.region_for_block(*block)
-                .is_some_and(|owner| plan.region_contains(region, owner))
-        })
-        .collect()
 }
 
 fn ssa_value_may_hold_gc_root(
@@ -2371,52 +2110,50 @@ fn copy_root_end(
             }
             current_block = instr_block;
         }
-        let instr = proto.instrs.get(index)?;
-        let effect = dataflow.instr_effects.get(index)?;
-
-        // 当前值若被覆盖，同一 root transaction 要么在精确 direct GC-inert 写处终止，
-        // 要么该 overwrite 到 caller scope end 之间没有任何 GC/用户观察点。
-        if effect.must_define(home) {
+        let range = cfg.blocks.get(current_block.index())?.instrs;
+        let last = range.last()?;
+        let control = proto
+            .instrs
+            .get(last.index())?
+            .is_control_terminator()
+            .then_some(last.index());
+        let overwrite = dataflow.first_must_write_in_range(home, index..range.end());
+        let stop = overwrite
+            .map_or(range.end(), |instr| instr.index())
+            .min(control.unwrap_or(range.end()));
+        if let Some(prefix) = dataflow.minimum_rooted_prefix(index..stop) {
+            if home.index() >= prefix {
+                // 候选拒绝[SemanticBarrier:Lifetime]：观察前缀外的槽不能继续保活（regress_416）。
+                return None;
+            }
+            observed = true;
+        }
+        if overwrite == Some(InstrRef(stop)) {
+            // 覆写指令自身的观察不属于此前 root transaction。
             return observed
-                .then(|| root_end_at_overwrite(proto, cfg, dataflow, fixed_temps, index, home))
+                .then(|| root_end_at_overwrite(proto, cfg, dataflow, fixed_temps, stop, home))
                 .flatten();
         }
-
-        match copy_root_instr_progress(
-            dataflow.effect_summaries.get(index)?.root_observation,
-            home,
-            &mut observed,
-        )? {
-            CopyRootInstrProgress::Continue => {}
-            CopyRootInstrProgress::ScopeEnd => return Some(CopyRootEnd::scope_end()),
-        }
-
-        match instr {
-            LowInstr::Jump(_) => {
-                return copy_root_cfg_end(
-                    proto,
-                    cfg,
-                    dataflow,
-                    fixed_temps,
-                    current_block,
-                    observed,
-                    home,
-                );
+        if control == Some(stop) {
+            match copy_root_instr_progress(
+                dataflow.effect_summaries.get(stop)?.root_observation,
+                home,
+                &mut observed,
+            )? {
+                CopyRootInstrProgress::Continue => {}
+                CopyRootInstrProgress::ScopeEnd => return Some(CopyRootEnd::scope_end()),
             }
-            _ if instr.is_control_terminator() => {
-                return copy_root_cfg_end(
-                    proto,
-                    cfg,
-                    dataflow,
-                    fixed_temps,
-                    current_block,
-                    observed,
-                    home,
-                );
-            }
-            _ => {}
+            return copy_root_cfg_end(
+                proto,
+                cfg,
+                dataflow,
+                fixed_temps,
+                current_block,
+                observed,
+                home,
+            );
         }
-        index += 1;
+        index = range.end();
     }
 
     None

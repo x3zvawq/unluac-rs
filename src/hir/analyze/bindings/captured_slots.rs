@@ -89,7 +89,7 @@ pub(super) struct CapturedSlotInputs<'a> {
 pub(super) fn collect_captured_slot_targets(
     inputs: CapturedSlotInputs<'_>,
     entry_local_regs: &mut BTreeMap<Reg, LocalId>,
-    locals: &mut Vec<LocalId>,
+    local_count: &mut usize,
     local_debug_hints: &mut Vec<Option<String>>,
 ) -> CapturedSlotTargets {
     let CapturedSlotInputs {
@@ -257,8 +257,8 @@ pub(super) fn collect_captured_slot_targets(
             binding.start_instr = binding.start_instr.min(captured.start_instr);
             binding.target
         } else {
-            let local = LocalId(locals.len());
-            locals.push(local);
+            let local = LocalId(*local_count);
+            *local_count += 1;
             local_debug_hints.push(debug_local_name_for_reg_at_instr(
                 proto,
                 captured.reg,

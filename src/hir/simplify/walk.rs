@@ -42,6 +42,11 @@ pub(crate) trait HirRewritePass {
         false
     }
 
+    /// 捕获只允许身份改写；表达式 pass 不会进入或替换父级 cell。
+    fn rewrite_capture(&mut self, _capture: &mut crate::hir::HirCapture) -> bool {
+        false
+    }
+
     fn rewrite_lvalue(&mut self, _lvalue: &mut HirLValue) -> bool {
         false
     }
@@ -73,33 +78,19 @@ pub(super) fn rewrite_stmts(stmts: &mut [HirStmt], pass: &mut impl HirRewritePas
 }
 
 pub(super) fn for_each_nested_block_mut(stmt: &mut HirStmt, visit: &mut impl FnMut(&mut HirBlock)) {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => {}
-        HirStmt::If(if_stmt) => {
-            visit(&mut if_stmt.then_block);
-            if let Some(else_block) = &mut if_stmt.else_block {
-                visit(else_block);
-            }
-        }
-        HirStmt::While(while_stmt) => visit(&mut while_stmt.body),
-        HirStmt::Repeat(repeat_stmt) => visit(&mut repeat_stmt.body),
-        HirStmt::NumericFor(numeric_for) => visit(&mut numeric_for.body),
-        HirStmt::GenericFor(generic_for) => visit(&mut generic_for.body),
-        HirStmt::Block(block) => visit(block),
-        HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::Close(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Return(_)
-        | HirStmt::Break
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
-    }
+    traverse_hir_stmt_children!(
+        stmt,
+        iter = iter_mut,
+        opt = as_mut,
+        borrow = [&mut],
+        expr(_expr) => {},
+        tail_call(_call) => {},
+        lvalue(_lvalue) => {},
+        release(_local) => {},
+        block(block) => { visit(block); },
+        call(_call) => {},
+        condition(_cond) => {}
+    );
 }
 
 pub(super) fn rewrite_nested_blocks_in_stmt(
@@ -189,7 +180,7 @@ fn rewrite_stmt<P: HirRewritePass>(stmt: &mut HirStmt, pass: &mut P) -> bool {
     stmt_changed || nested_changed || metadata_changed
 }
 
-fn rewrite_lvalue(lvalue: &mut HirLValue, pass: &mut impl HirRewritePass) -> bool {
+pub(super) fn rewrite_lvalue(lvalue: &mut HirLValue, pass: &mut impl HirRewritePass) -> bool {
     let mut nested_changed = false;
     traverse_hir_lvalue_children!(lvalue, borrow = [&mut], expr(expr) => {
         nested_changed |= rewrite_expr(expr, pass);
@@ -235,7 +226,7 @@ pub(super) fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -
             nested_changed |= rewrite_table_constructor(t, pass);
         },
         capture(capture) => {
-            nested_changed |= rewrite_expr(&mut capture.value, pass);
+            nested_changed |= pass.rewrite_capture(capture);
         }
     );
 

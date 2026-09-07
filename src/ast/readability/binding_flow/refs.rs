@@ -9,10 +9,10 @@ use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 use super::super::binding_ref::binding_from_name_ref;
-use super::super::visit::{self, AstVisitor, NameAccess};
 use crate::ast::common::{
     AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalBinding, AstNameRef, AstStmt,
 };
+use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 #[derive(Debug, Default)]
 pub(in crate::ast::readability) struct BindingRefSet {

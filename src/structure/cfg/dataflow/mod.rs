@@ -214,6 +214,7 @@ fn compute_dataflow_proto(
         &ssa.block_entry_values,
     );
     let canonical_move_values = moves::freeze_move_values(proto, &defs, &ssa.use_values);
+    let root_intervals = super::common::RootIntervalIndex::new(&instr_effects, &effect_summaries);
     Ok(DataflowFacts {
         instr_effects,
         effect_summaries,
@@ -221,6 +222,7 @@ fn compute_dataflow_proto(
         open_defs: open.defs,
         instr_defs,
         fixed_defs_by_reg,
+        root_intervals,
         block_entry_values: ssa.block_entry_values,
         block_exit_values: ssa.block_exit_values,
         block_end_values: ssa.block_end_values,

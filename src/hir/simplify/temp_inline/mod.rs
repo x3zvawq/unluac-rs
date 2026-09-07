@@ -57,7 +57,6 @@
 //! Indexed 构造器直接消费 HIR 分配事实；若内联引入模板初始化，则发布操作数保留
 //! 身份，例如 `t=true; return {a,t,c}` 保持运行时 t，不将 TNEW 的容量改成 TDUP 裁尾。
 
-mod rewrite;
 mod site;
 mod usage;
 
@@ -74,22 +73,20 @@ use crate::hir::expr_safety::{
 };
 use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 
-use self::rewrite::{replace_temp_in_stmt, replace_temps_in_stmt};
 use self::site::{
-    InlineSite, expr_touches_temp, fastcall_callee_materialization_precedes_temp,
-    inline_site_in_repeat_condition, inline_site_in_stmt, is_bare_method_receiver_snapshot_in_stmt,
-    is_method_receiver_snapshot, is_stable_inline_value,
-    puc_upvalue_table_key_with_deferred_base_read, temp_precedes_observable_eval_in_expr,
-    temp_precedes_observable_eval_in_stmt, transparent_block_head,
+    InlineSite, fastcall_callee_materialization_precedes_temp, inline_site_in_repeat_condition,
+    inline_site_in_stmt, is_bare_method_receiver_snapshot_in_stmt, is_method_receiver_snapshot,
+    is_stable_inline_value, puc_upvalue_table_key_with_deferred_base_read,
+    temp_precedes_observable_eval_in_expr, temp_precedes_observable_eval_in_stmt,
+    transparent_block_head,
 };
 use self::usage::{
     TempUseScratch, TempUseSummary, collect_expr_temp_uses_summary, collect_stmt_temp_uses,
-    max_temp_index_in_block,
 };
 use super::label_refs::count_label_references;
 use super::mention::{
-    ReferenceCapturedBindings, stmt_writes_temp, stmts_reference_captured_bindings,
-    stmts_to_be_closed_temps, stmts_value_captured_bindings,
+    ReferenceCapturedBindings, expr_mentions_temp, stmt_writes_temp,
+    stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
@@ -99,6 +96,7 @@ use super::root_lifetimes::{
     stmt_has_argument_root_handoff,
 };
 use super::temp_touch::stmt_contains_nested_nonlocal_control;
+use crate::hir::rewrite::{replace_temp_in_expr, replace_temp_in_stmt, replace_temps_in_stmt};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
@@ -179,7 +177,7 @@ impl<'a> TempInlineWorkspace<'a> {
         inline_dispositions: HirInlineDispositions,
         roots: RootAnalysisContext<'a>,
     ) -> Self {
-        let temp_count = temp_count_for_proto(proto);
+        let temp_count = proto.temp_count;
         let mut physical_root_temps = vec![false; temp_count];
         for temp in &proto.physical_root_temps {
             if let Some(protected) = physical_root_temps.get_mut(temp.index()) {
@@ -187,7 +185,7 @@ impl<'a> TempInlineWorkspace<'a> {
             }
         }
         Self {
-            uses: TempUseScratch::new(proto, temp_count),
+            uses: TempUseScratch::new(proto),
             order_sensitive_defs: OrderSensitiveDefWorkspace::new(temp_count),
             block_depth: 0,
             scope,
@@ -311,17 +309,6 @@ fn inline_temps_in_proto_with_scope(
     changed |= proto.physical_root_temps.len() != physical_root_count;
     proto.inline_dispositions = workspace.inline_dispositions;
     changed
-}
-
-fn temp_count_for_proto(proto: &HirProto) -> usize {
-    let proto_temp_count = proto
-        .temps
-        .iter()
-        .map(|temp| temp.index())
-        .max()
-        .map_or(0, |max_index| max_index + 1);
-    let body_temp_count = max_temp_index_in_block(&proto.body).map_or(0, |max_index| max_index + 1);
-    proto_temp_count.max(body_temp_count)
 }
 
 impl TempInlineWorkspace<'_> {
@@ -594,7 +581,7 @@ fn inline_temps_in_block(
             // 后续再也没有地方记录“状态已经更新过”。
             // 因此这里只允许折叠真正的 forwarding temp，不折叠自引用状态槽位。
             // 候选拒绝[SemanticBarrier:Lifetime]：`t=t+1; return t` 若删 producer，状态槽不再完成本次更新。
-            && !expr_touches_temp(value, temp)
+            && !expr_mentions_temp(value, temp)
             && let Some(next_stmt) = kept_rev.last()
             && let use_count = total_use_count(temp, live_use_counts)
             // 候选拒绝[SemanticBarrier:Lifetime]：两个以上消费不能随 producer 一并替换；零消费属于 dead-temps owner。
@@ -867,12 +854,12 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
                 matches!(
                     target,
                     HirLValue::TableAccess(access)
-                        if expr_touches_temp(&access.base, temp)
-                            || expr_touches_temp(&access.key, temp)
+                        if expr_mentions_temp(&access.base, temp)
+                            || expr_mentions_temp(&access.key, temp)
                 )
             });
             let table_constructor_value = assign.values.iter().any(|value| {
-                matches!(value, HirExpr::TableConstructor(_)) && expr_touches_temp(value, temp)
+                matches!(value, HirExpr::TableConstructor(_)) && expr_mentions_temp(value, temp)
             });
             table_lvalue
                 || table_constructor_value
@@ -883,21 +870,22 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
                     && assign
                         .values
                         .iter()
-                        .any(|value| expr_touches_temp(value, temp)))
+                        .any(|value| expr_mentions_temp(value, temp)))
         }
         HirStmt::GlobalDecl(global_decl) => global_decl.values.fixed.iter().any(|value| {
             matches!(value, HirExpr::TempRef(value_temp) if *value_temp == temp)
-                || (matches!(value, HirExpr::TableConstructor(_)) && expr_touches_temp(value, temp))
+                || (matches!(value, HirExpr::TableConstructor(_))
+                    && expr_mentions_temp(value, temp))
         }),
         HirStmt::TableSetList(set_list) => {
-            expr_touches_temp(&set_list.base, temp)
+            expr_mentions_temp(&set_list.base, temp)
                 || set_list
                     .values
                     .iter()
-                    .any(|value| expr_touches_temp(value, temp))
+                    .any(|value| expr_mentions_temp(value, temp))
         }
         HirStmt::LocalDecl(local_decl) => local_decl.values.iter().any(|value| {
-            matches!(value, HirExpr::TableConstructor(_)) && expr_touches_temp(value, temp)
+            matches!(value, HirExpr::TableConstructor(_)) && expr_mentions_temp(value, temp)
         }),
         _ => false,
     }
@@ -2529,7 +2517,7 @@ fn materialization_run_preserves_value_reads(
         let (target, _) = stmt
             .scalar_temp_assignment()
             .expect("numeric-for materialization run must contain only scalar temp definitions");
-        if expr_touches_temp(value, target) {
+        if expr_mentions_temp(value, target) {
             return false;
         }
         let target_write_homes = complete_materialization_write_homes(target, facts);
@@ -2604,7 +2592,7 @@ fn numeric_for_binding_header_alias_plan(
     let mut current_index = sink_temp_index;
     let (replacement, source_homes, source_temp, source_requires_event_free_gap, source_index) = loop {
         let (temp, value) = block.stmts[current_index].scalar_temp_assignment()?;
-        if total_use_count(temp, live_use_counts) != 1 || expr_touches_temp(value, temp) {
+        if total_use_count(temp, live_use_counts) != 1 || expr_mentions_temp(value, temp) {
             // 候选拒绝[SemanticBarrier:Lifetime]：链节点有额外 use 或自写时，删除整条快照链会丢失仍可观察的值或状态更新。
             return None;
         }
@@ -2926,7 +2914,7 @@ fn materialization_run_candidate_is_safe(
                 .expect("captured slot scan should cover every statement"),
         )
         // 候选拒绝[SemanticBarrier:Lifetime]：`t=t+1; sink(t)` 的 producer 是状态更新而非 forwarding temp；见 regress_263#2。
-        && !expr_touches_temp(value, temp)
+        && !expr_mentions_temp(value, temp)
 }
 
 fn total_use_count(temp: TempId, total_use_totals: &[usize]) -> usize {
@@ -3181,7 +3169,7 @@ fn inline_repeat_head_scalar_temp_with_proven_prefix(
 
     let value = value.clone();
     assert_eq!(
-        rewrite::replace_temp_in_expr(&mut repeat_stmt.cond, temp, &value),
+        replace_temp_in_expr(&mut repeat_stmt.cond, temp, &value),
         1,
         "validated repeat-head candidate must have exactly one rewrite site"
     );
@@ -3496,7 +3484,7 @@ fn inline_repeat_tail_temp(
     // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
     // 候选拒绝[SemanticBarrier:Lifetime]：self-reference 或额外 use 需要保留状态写入/temp 值。
     if scratch.has_debug_local_hint(temp)
-        || expr_touches_temp(value, temp)
+        || expr_mentions_temp(value, temp)
         || total_use_count(temp, live_use_counts) != 1
         || collect_expr_temp_uses_summary(&repeat_stmt.cond, scratch).count(temp) != 1
     {
@@ -3539,7 +3527,7 @@ fn inline_repeat_tail_temp(
 
     let value = value.clone();
     assert_eq!(
-        rewrite::replace_temp_in_expr(&mut repeat_stmt.cond, temp, &value),
+        replace_temp_in_expr(&mut repeat_stmt.cond, temp, &value),
         1,
         "validated repeat-tail candidate must have exactly one rewrite site"
     );
@@ -3569,7 +3557,7 @@ mod tests {
     use crate::parser::{ProtoLineRange, ProtoSignature};
 
     fn empty_proto(body: HirBlock, temps: Vec<TempId>) -> HirProto {
-        let temp_count = temps.len();
+        let temp_count = temps.iter().map(|temp| temp.index() + 1).max().unwrap_or(0);
         HirProto {
             id: crate::hir::common::HirProtoRef(0),
             source: None,
@@ -3586,7 +3574,7 @@ mod tests {
             },
             params: Vec::new(),
             param_debug_hints: Vec::new(),
-            locals: Vec::new(),
+            local_count: 0,
             vararg_param_local: None,
             local_debug_hints: Vec::new(),
             local_debug_scopes: Vec::new(),
@@ -3598,7 +3586,7 @@ mod tests {
             environment_upvalues: BTreeSet::new(),
             mutable_upvalues: BTreeSet::new(),
             upvalue_debug_hints: Vec::new(),
-            temps,
+            temp_count,
             temp_debug_locals: vec![None; temp_count],
             temp_debug_scopes: vec![None; temp_count],
             exit_requirements: Vec::new(),
@@ -3789,7 +3777,7 @@ mod tests {
         let mut block = eager_condition_materialization_block();
         let temps = (0..4).map(TempId).collect::<Vec<_>>();
         let proto = empty_proto(block.clone(), temps.clone());
-        let mut scratch = TempUseScratch::new(&proto, temps.len());
+        let mut scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         for temp in temps {
             facts.record_home_free_temp(temp);
@@ -3850,7 +3838,7 @@ mod tests {
             ],
         };
         let proto = empty_proto(short_circuit.clone(), vec![callee]);
-        let mut scratch = TempUseScratch::new(&proto, 1);
+        let mut scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_home_free_temp(callee);
         let snapshots = empty_capture_snapshots(2);
@@ -3882,7 +3870,7 @@ mod tests {
 
         let mut rooted = eager_condition_materialization_block();
         let rooted_proto = empty_proto(rooted.clone(), (0..4).map(TempId).collect());
-        let mut rooted_scratch = TempUseScratch::new(&rooted_proto, 4);
+        let mut rooted_scratch = TempUseScratch::new(&rooted_proto);
         let mut rooted_facts = ProtoPromotionFacts::default();
         for temp in 0..4 {
             rooted_facts.record_home_free_temp(TempId(temp));
@@ -3931,7 +3919,7 @@ mod tests {
             ],
         };
         let forward_proto = empty_proto(forward_dependency.clone(), vec![first, later]);
-        let mut forward_scratch = TempUseScratch::new(&forward_proto, 2);
+        let mut forward_scratch = TempUseScratch::new(&forward_proto);
         let mut forward_facts = ProtoPromotionFacts::default();
         forward_facts.record_home_free_temp(first);
         forward_facts.record_home_free_temp(later);
@@ -4083,7 +4071,7 @@ mod tests {
             },
             vec![target],
         );
-        local.locals.push(source);
+        local.local_count = source.index() + 1;
         local.local_debug_hints.push(None);
         local.local_debug_scopes.push(None);
         let original = local.body.clone();
@@ -4159,7 +4147,7 @@ mod tests {
             },
             vec![temp],
         );
-        let mut scratch = TempUseScratch::new(&proto, 1);
+        let mut scratch = TempUseScratch::new(&proto);
         let mut live_uses = vec![1];
         let mut facts = ProtoPromotionFacts::default();
         facts.record_home_free_temp(temp);
@@ -4375,7 +4363,7 @@ mod tests {
     fn terminal_nil_pack_accepts_explicitly_home_free_temps() {
         let mut block = terminal_nil_pack_block();
         let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
-        let scratch = TempUseScratch::new(&proto, 2);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_home_free_temp(TempId(0));
         facts.record_home_free_temp(TempId(1));
@@ -4402,7 +4390,7 @@ mod tests {
     fn terminal_nil_pack_accepts_complete_invalidated_home_unions() {
         let mut block = terminal_nil_pack_block();
         let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
-        let scratch = TempUseScratch::new(&proto, 2);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
         facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(1, 0));
@@ -4425,7 +4413,7 @@ mod tests {
     fn root_open_nil_pack_accepts_non_entry_exact_home_transaction() {
         let block = root_open_nil_pack_block();
         let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
-        let scratch = TempUseScratch::new(&proto, 2);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
         facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(1, 0));
@@ -4483,7 +4471,7 @@ mod tests {
     fn root_open_nil_pack_mixed_homefree_target_uses_physical_root_fact() {
         let mut block = root_open_nil_pack_block();
         let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
-        let scratch = TempUseScratch::new(&proto, 2);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
         facts.record_home_free_temp(TempId(1));
@@ -4544,7 +4532,7 @@ mod tests {
         );
         rooted.stmts.insert(1, call_stmt("collectgarbage"));
         let rooted_proto = empty_proto(rooted.clone(), vec![TempId(0), TempId(1), TempId(2)]);
-        let rooted_scratch = TempUseScratch::new(&rooted_proto, 3);
+        let rooted_scratch = TempUseScratch::new(&rooted_proto);
         let mut rooted_facts = facts;
         rooted_facts.record_temp_home_slot_for_test(TempId(2), HomeSlotKey::new(0, 0));
         let rooted_snapshots = empty_capture_snapshots(4);
@@ -4581,7 +4569,7 @@ mod tests {
     fn terminal_nil_pack_uses_home_universe_for_unknown_targets() {
         let mut block = terminal_nil_pack_block();
         let proto = empty_proto(block.clone(), vec![TempId(0), TempId(1)]);
-        let scratch = TempUseScratch::new(&proto, 2);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_temp_home_slot_for_test(TempId(0), HomeSlotKey::new(0, 0));
         facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(1, 0));
@@ -4812,7 +4800,7 @@ mod tests {
             stmts: vec![candidate(HirExpr::VarArg), numeric_for()],
         };
         let proto = empty_proto(stable.clone(), vec![TempId(0)]);
-        let scratch = TempUseScratch::new(&proto, 1);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_home_free_temp(TempId(0));
         let snapshots = empty_capture_snapshots(2);
@@ -4856,7 +4844,7 @@ mod tests {
             stmts: vec![candidate(dynamic_call), numeric_for()],
         };
         let proto = empty_proto(dynamic.clone(), vec![TempId(0)]);
-        let scratch = TempUseScratch::new(&proto, 1);
+        let scratch = TempUseScratch::new(&proto);
         let mut live_uses = vec![1];
         let mut removed = vec![false; 2];
         assert!(!inline_numeric_for_stable_header_aliases(
@@ -4907,7 +4895,7 @@ mod tests {
 
         let mut disjoint = block();
         let proto = empty_proto(disjoint.clone(), vec![TempId(0), TempId(1), TempId(2)]);
-        let scratch = TempUseScratch::new(&proto, 3);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_home_free_temp(TempId(0));
         facts.record_home_free_temp(TempId(1));
@@ -4932,7 +4920,7 @@ mod tests {
 
         let mut overlapping = block();
         let proto = empty_proto(overlapping.clone(), vec![TempId(0), TempId(1), TempId(2)]);
-        let scratch = TempUseScratch::new(&proto, 3);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         facts.record_home_free_temp(TempId(0));
         facts.record_temp_home_slot_for_test(TempId(1), HomeSlotKey::new(2, 0));
@@ -4967,7 +4955,7 @@ mod tests {
         let mut live_uses = vec![1; 5];
         let mut removed = vec![false; 4];
         let proto = empty_proto(block.clone(), (0..5).map(TempId).collect());
-        let scratch = TempUseScratch::new(&proto, 5);
+        let scratch = TempUseScratch::new(&proto);
 
         assert!(inline_open_return_fixed_alias_run(
             &mut block,
@@ -4992,7 +4980,7 @@ mod tests {
         let mut live_uses = vec![1; 5];
         let mut removed = vec![false; 4];
         let proto = empty_proto(clobbered.clone(), (0..5).map(TempId).collect());
-        let scratch = TempUseScratch::new(&proto, 5);
+        let scratch = TempUseScratch::new(&proto);
         assert!(!inline_open_return_fixed_alias_run(
             &mut clobbered,
             0..3,
@@ -5038,7 +5026,7 @@ mod tests {
         };
         let stable = block(HirExpr::Integer(7));
         let proto = empty_proto(stable.clone(), vec![TempId(0), TempId(1), TempId(2)]);
-        let scratch = TempUseScratch::new(&proto, 3);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         for temp in [TempId(0), TempId(1), TempId(2)] {
             facts.record_home_free_temp(temp);
@@ -5135,7 +5123,7 @@ mod tests {
             stable.clone(),
             vec![TempId(0), TempId(1), TempId(2), TempId(3)],
         );
-        let scratch = TempUseScratch::new(&proto, 4);
+        let scratch = TempUseScratch::new(&proto);
         let mut facts = ProtoPromotionFacts::default();
         for temp in [TempId(0), TempId(1), TempId(2)] {
             facts.record_home_free_temp(temp);
@@ -5181,7 +5169,7 @@ mod tests {
         let mut accepted = open_return_alias_block(TempId(4));
         let facts = build_facts();
         let proto = empty_proto(accepted.clone(), (0..5).map(TempId).collect());
-        let scratch = TempUseScratch::new(&proto, 5);
+        let scratch = TempUseScratch::new(&proto);
         let mut live_uses = vec![1; 5];
         let mut removed = vec![false; 4];
         assert!(inline_open_return_fixed_alias_run(
@@ -5252,7 +5240,7 @@ mod tests {
                             proto: crate::hir::common::HirProtoRef(1),
                             captures: vec![HirCapture {
                                 mode: HirCaptureMode::ByReference,
-                                value: HirExpr::TempRef(captured_temp),
+                                binding: crate::hir::HirBinding::Temp(captured_temp),
                             }],
                         })),
                     ),

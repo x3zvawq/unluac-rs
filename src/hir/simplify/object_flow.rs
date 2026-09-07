@@ -15,19 +15,11 @@ use super::lexical_cfg::{
     HirGenericForFlow,
 };
 use crate::hir::common::{
-    HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProtoRef, HirStmt, HirTableField,
-    HirValuePack, LocalId, ParamId, TempId, UpvalueId,
+    HirBinding, HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProtoRef, HirStmt,
+    HirTableField, HirValuePack, TempId, UpvalueId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) enum Binding {
-    Param(ParamId),
-    Local(LocalId),
-    Temp(TempId),
-    Upvalue(UpvalueId),
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectId {
@@ -76,10 +68,10 @@ pub(super) struct RootAnalysisContext<'a> {
 
 #[derive(Clone, Default)]
 pub(super) struct RootState {
-    pub(super) roots: BTreeSet<Binding>,
-    pub(super) holders: BTreeMap<Binding, BTreeSet<ObjectId>>,
-    tables: BTreeMap<Binding, BTreeSet<ObjectId>>,
-    pub(super) unknown_collectable: BTreeSet<Binding>,
+    pub(super) roots: BTreeSet<HirBinding>,
+    pub(super) holders: BTreeMap<HirBinding, BTreeSet<ObjectId>>,
+    tables: BTreeMap<HirBinding, BTreeSet<ObjectId>>,
+    pub(super) unknown_collectable: BTreeSet<HirBinding>,
     pub(super) escaped: BTreeSet<ObjectId>,
     contents: BTreeMap<ObjectId, BTreeSet<ObjectId>>,
     allocations: BTreeSet<ObjectId>,
@@ -87,11 +79,18 @@ pub(super) struct RootState {
 }
 
 impl RootState {
-    pub(super) fn binding_may_hold_observable_root(&self, binding: Binding) -> bool {
+    pub(super) fn binding_may_hold_observable_root(&self, binding: HirBinding) -> bool {
         self.roots.contains(&binding)
-            || self.holders.get(&binding).is_some_and(|holders| {
-                !reachable_holders(holders.clone(), self).is_disjoint(&self.escaped)
-            })
+            || !self
+                .binding_holder_values(binding)
+                .is_disjoint(&self.escaped)
+    }
+
+    fn binding_holder_values(&self, binding: HirBinding) -> BTreeSet<ObjectId> {
+        reachable_holders(
+            self.holders.get(&binding).cloned().unwrap_or_default(),
+            self,
+        )
     }
 }
 
@@ -178,7 +177,7 @@ pub(super) fn dispatch_generic_for_root(
 pub(super) fn write_for_bindings_root(bindings: HirForBindings<'_>, state: &mut RootState) {
     match bindings {
         HirForBindings::Numeric(local) => {
-            BindingValue::default().install(Binding::Local(local), state);
+            BindingValue::default().install(HirBinding::Local(local), state);
         }
         HirForBindings::Generic(flow) => {
             let returned = state
@@ -193,7 +192,7 @@ pub(super) fn write_for_bindings_root(bindings: HirForBindings<'_>, state: &mut 
                     root: true,
                     ..BindingValue::default()
                 }
-                .install(Binding::Local(local), state);
+                .install(HirBinding::Local(local), state);
             }
         }
     }
@@ -209,10 +208,10 @@ pub(super) fn update_state_for_stmt(
     observe_stmt(stmt, state, captures, effects, safety);
     match stmt {
         HirStmt::LocalRootRelease(local) => {
-            BindingValue::default().install(Binding::Local(*local), state);
+            BindingValue::default().install(HirBinding::Local(*local), state);
         }
         HirStmt::LocalDecl(decl) => assign_bindings(
-            decl.bindings.iter().copied().map(Binding::Local),
+            decl.bindings.iter().copied().map(HirBinding::Local),
             &decl.values,
             state,
             effects,
@@ -281,7 +280,7 @@ pub(super) fn update_state_for_stmt(
 }
 
 fn assign_bindings(
-    bindings: impl Iterator<Item = Binding>,
+    bindings: impl Iterator<Item = HirBinding>,
     values: &HirValuePack,
     state: &mut RootState,
     effects: &[ProtoEffects],
@@ -326,7 +325,7 @@ impl BindingValue {
         }
     }
 
-    fn install(self, binding: Binding, state: &mut RootState) {
+    fn install(self, binding: HirBinding, state: &mut RootState) {
         for (map, objects) in [
             (&mut state.holders, self.holders),
             (&mut state.tables, self.tables),
@@ -371,10 +370,12 @@ fn adjusted_value_may_be_unknown(
 
 fn expr_may_be_unknown(expr: &HirExpr, state: &RootState, safety: HirExprSafety) -> bool {
     match expr {
-        HirExpr::ParamRef(id) => state.unknown_collectable.contains(&Binding::Param(*id)),
-        HirExpr::LocalRef(id) => state.unknown_collectable.contains(&Binding::Local(*id)),
-        HirExpr::TempRef(id) => state.unknown_collectable.contains(&Binding::Temp(*id)),
-        HirExpr::UpvalueRef(id) => state.unknown_collectable.contains(&Binding::Upvalue(*id)),
+        HirExpr::ParamRef(id) => state.unknown_collectable.contains(&HirBinding::Param(*id)),
+        HirExpr::LocalRef(id) => state.unknown_collectable.contains(&HirBinding::Local(*id)),
+        HirExpr::TempRef(id) => state.unknown_collectable.contains(&HirBinding::Temp(*id)),
+        HirExpr::UpvalueRef(id) => state
+            .unknown_collectable
+            .contains(&HirBinding::Upvalue(*id)),
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             expr_may_be_unknown(&logical.lhs, state, safety)
                 || expr_may_be_unknown(&logical.rhs, state, safety)
@@ -385,7 +386,7 @@ fn expr_may_be_unknown(expr: &HirExpr, state: &RootState, safety: HirExprSafety)
 }
 
 fn expr_may_root(expr: &HirExpr, state: &RootState, safety: HirExprSafety) -> bool {
-    if let Some(binding) = binding_from_expr(expr) {
+    if let Some(binding) = HirBinding::from_expr(expr) {
         return state.binding_may_hold_observable_root(binding);
     }
     match expr {
@@ -432,7 +433,7 @@ fn direct_holder_values(
     state: &RootState,
     effects: &[ProtoEffects],
 ) -> BTreeSet<ObjectId> {
-    if let Some(binding) = binding_from_expr(expr) {
+    if let Some(binding) = HirBinding::from_expr(expr) {
         return state.holders.get(&binding).cloned().unwrap_or_default();
     }
     match expr {
@@ -526,7 +527,7 @@ fn returned_closures(values: &BTreeSet<EffectValue>, target: HirProtoRef) -> Vec
 }
 
 fn table_values(expr: &HirExpr, state: &RootState) -> BTreeSet<ObjectId> {
-    if let Some(binding) = binding_from_expr(expr) {
+    if let Some(binding) = HirBinding::from_expr(expr) {
         return state.tables.get(&binding).cloned().unwrap_or_default();
     }
     match expr {
@@ -825,7 +826,6 @@ fn activate_object_ids(
                     &effect.returns,
                     &effect.calls,
                     state,
-                    effects,
                     include_returns,
                     &mut pending,
                 );
@@ -844,7 +844,6 @@ fn activate_object_ids(
                         &returned.returns,
                         &returned.calls,
                         state,
-                        effects,
                         include_returns,
                         &mut pending,
                     );
@@ -863,7 +862,6 @@ fn activate_projected_effect(
     returns: &BTreeSet<EffectValue>,
     calls: &BTreeSet<UpvalueId>,
     state: &mut RootState,
-    effects: &[ProtoEffects],
     include_returns: bool,
     pending: &mut VecDeque<ObjectId>,
 ) {
@@ -871,11 +869,9 @@ fn activate_projected_effect(
         let Some(capture) = closure_captures.get(upvalue.index()) else {
             continue;
         };
-        if capture.mode == HirCaptureMode::ByReference
-            && let Some(binding) = binding_from_expr(&capture.value)
-        {
-            state.roots.insert(binding);
-            state.unknown_collectable.insert(binding);
+        if capture.mode == HirCaptureMode::ByReference {
+            state.roots.insert(capture.binding);
+            state.unknown_collectable.insert(capture.binding);
         }
     }
     for upvalue in escapes.iter().chain(
@@ -887,13 +883,11 @@ fn activate_projected_effect(
         let Some(capture) = closure_captures.get(upvalue.index()) else {
             continue;
         };
-        let captured_holders = holder_values(&capture.value, state, effects);
+        let captured_holders = state.binding_holder_values(capture.binding);
         state.escaped.extend(&captured_holders);
         pending.extend(captured_holders);
-        for binding in bindings_in_expr(&capture.value) {
-            if state.unknown_collectable.contains(&binding) {
-                state.roots.insert(binding);
-            }
+        if state.unknown_collectable.contains(&capture.binding) {
+            state.roots.insert(capture.binding);
         }
     }
     if include_returns {
@@ -911,13 +905,11 @@ fn activate_projected_effect(
                 let Some(capture) = closure_captures.get(upvalue.index()) else {
                     continue;
                 };
-                let captured_holders = holder_values(&capture.value, state, effects);
+                let captured_holders = state.binding_holder_values(capture.binding);
                 state.escaped.extend(&captured_holders);
                 pending.extend(captured_holders);
-                for binding in bindings_in_expr(&capture.value) {
-                    if state.unknown_collectable.contains(&binding) {
-                        state.roots.insert(binding);
-                    }
+                if state.unknown_collectable.contains(&capture.binding) {
+                    state.roots.insert(capture.binding);
                 }
             }
         }
@@ -926,7 +918,7 @@ fn activate_projected_effect(
         let Some(capture) = closure_captures.get(upvalue.index()) else {
             continue;
         };
-        pending.extend(holder_values(&capture.value, state, effects));
+        pending.extend(state.binding_holder_values(capture.binding));
     }
 }
 
@@ -937,11 +929,11 @@ fn returned_upvalues(values: &BTreeSet<EffectValue>) -> impl Iterator<Item = &Up
     })
 }
 
-fn bindings_in_expr(expr: &HirExpr) -> BTreeSet<Binding> {
-    struct Bindings(BTreeSet<Binding>);
+fn bindings_in_expr(expr: &HirExpr) -> BTreeSet<HirBinding> {
+    struct Bindings(BTreeSet<HirBinding>);
     impl crate::hir::visit::HirVisitor for Bindings {
         fn visit_expr(&mut self, expr: &HirExpr) {
-            if let Some(binding) = binding_from_expr(expr) {
+            if let Some(binding) = HirBinding::from_expr(expr) {
                 self.0.insert(binding);
             }
         }
@@ -951,22 +943,12 @@ fn bindings_in_expr(expr: &HirExpr) -> BTreeSet<Binding> {
     bindings.0
 }
 
-fn binding_from_expr(expr: &HirExpr) -> Option<Binding> {
-    match expr {
-        HirExpr::ParamRef(param) => Some(Binding::Param(*param)),
-        HirExpr::LocalRef(local) => Some(Binding::Local(*local)),
-        HirExpr::TempRef(temp) => Some(Binding::Temp(*temp)),
-        HirExpr::UpvalueRef(upvalue) => Some(Binding::Upvalue(*upvalue)),
-        _ => None,
-    }
-}
-
-pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<Binding> {
+pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<HirBinding> {
     match lvalue {
-        HirLValue::Param(param) => Some(Binding::Param(*param)),
-        HirLValue::Local(local) => Some(Binding::Local(*local)),
-        HirLValue::Temp(temp) => Some(Binding::Temp(*temp)),
-        HirLValue::Upvalue(upvalue) => Some(Binding::Upvalue(*upvalue)),
+        HirLValue::Param(param) => Some(HirBinding::Param(*param)),
+        HirLValue::Local(local) => Some(HirBinding::Local(*local)),
+        HirLValue::Temp(temp) => Some(HirBinding::Temp(*temp)),
+        HirLValue::Upvalue(upvalue) => Some(HirBinding::Upvalue(*upvalue)),
         HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
     }
 }
@@ -1020,10 +1002,10 @@ impl AllocationEscapeFacts {
             return Self::default();
         }
         let captures = closure_captures_in_stmts(stmts);
-        struct ExternalBindings(BTreeSet<Binding>);
+        struct ExternalBindings(BTreeSet<HirBinding>);
         impl crate::hir::visit::HirVisitor for ExternalBindings {
             fn visit_expr(&mut self, expr: &HirExpr) {
-                if let Some(binding) = binding_from_expr(expr) {
+                if let Some(binding) = HirBinding::from_expr(expr) {
                     self.0.insert(binding);
                 }
             }

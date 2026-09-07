@@ -6,6 +6,7 @@
 //! 例如 `x = nil; goto L; ...; ::L:: if c then x=true else x=false end`，旧值沿实际
 //! 到达 L 的路径合流；若任一回边带入对象，shell 必须保留释放旧根的写入职责。
 //! 所有不动点完成后才按当前语句路径签发删除计划，不在中间迭代批准删除或重建控制边。
+//! 候选定位复用一条词法路径栈，仅为实际 shell 保存独立路径，不逐层复制无关语句的前缀。
 //! 候选 local 按完整 possible-home 集合建立反向索引，写入只更新可能命中的候选；
 //! 未知 provenance 仍覆盖 home universe，home-free local 仍接收直接 binding 写入。
 //! 数据流节点只投影 observer reads 与 shell 删除判定，不保存供后续重放的整份输入状态。
@@ -24,14 +25,16 @@
 //! 函数出口读取后结束。引用捕获和资源协议不会退化成全 proto blanket guard。
 //! 值是否 GC-inert 统一消费目标方言安全上下文；本文件不从底层 opcode 重新推断根协议。
 
-use crate::hir::simplify::stmt_plan::{PathComponent, StmtPath, remove_planned_stmts};
+use crate::hir::simplify::stmt_plan::{
+    PathComponent, StmtPath, remove_planned_stmts, with_path_component,
+};
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt,
-    LocalId, ParamId, TempId,
+    HirAssign, HirBinding, HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto,
+    HirStmt, LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
@@ -234,8 +237,14 @@ impl<'a> ShellFlowFacts<'a> {
                     );
                 }
                 HirFlowNodeKind::UnknownControl => {
-                    nodes[id].reads.temps.extend(proto.temps.iter().copied());
-                    nodes[id].reads.locals.extend(proto.locals.iter().copied());
+                    nodes[id]
+                        .reads
+                        .temps
+                        .extend((0..proto.temp_count).map(TempId));
+                    nodes[id]
+                        .reads
+                        .locals
+                        .extend((0..proto.local_count).map(LocalId));
                     nodes[id]
                         .reads
                         .homes
@@ -280,7 +289,7 @@ impl<'a> ShellFlowFacts<'a> {
             node.reads.retain_domain(live_domain);
         }
         let mut shells = BTreeMap::new();
-        collect_shell_sites(&proto.body, &[], &stmt_nodes, &mut shells);
+        collect_shell_sites(&proto.body, &mut Vec::new(), &stmt_nodes, &mut shells);
         let mut arm_outputs = shells
             .values_mut()
             .flat_map(|site| {
@@ -615,11 +624,15 @@ fn holder_from_lvalue(target: &HirLValue) -> Option<ClosureHolder> {
 }
 
 fn holder_from_expr(expr: &HirExpr) -> Option<ClosureHolder> {
-    match expr {
-        HirExpr::TempRef(temp) => Some(ClosureHolder::Temp(*temp)),
-        HirExpr::LocalRef(local) => Some(ClosureHolder::Local(*local)),
-        HirExpr::ParamRef(param) => Some(ClosureHolder::Param(*param)),
-        _ => None,
+    HirBinding::from_expr(expr).and_then(holder_from_binding)
+}
+
+fn holder_from_binding(binding: HirBinding) -> Option<ClosureHolder> {
+    match binding {
+        HirBinding::Temp(temp) => Some(ClosureHolder::Temp(temp)),
+        HirBinding::Local(local) => Some(ClosureHolder::Local(local)),
+        HirBinding::Param(param) => Some(ClosureHolder::Param(param)),
+        HirBinding::Upvalue(_) => None,
     }
 }
 
@@ -637,22 +650,17 @@ fn payload_seed_from_expr(
         }
         HirExpr::Closure(closure) => {
             for capture in &closure.captures {
+                let holder = holder_from_binding(capture.binding);
                 match capture.mode {
                     HirCaptureMode::ByReference => {
-                        let mut bindings = CapturedBindingCollector {
-                            state: &mut seed.direct.bindings,
+                        record_captured_binding(
+                            capture.binding,
+                            &mut seed.direct.bindings,
                             promotion_facts,
-                        };
-                        visit::visit_expr(&capture.value, &mut bindings);
-                        if let Some(holder) = holder_from_expr(&capture.value) {
-                            seed.direct.captured_holder_cells.insert(holder);
-                        }
+                        );
+                        seed.direct.captured_holder_cells.extend(holder);
                     }
-                    HirCaptureMode::ByValue => seed.union_with(&payload_seed_from_expr(
-                        &capture.value,
-                        promotion_facts,
-                        safety,
-                    )),
+                    HirCaptureMode::ByValue => seed.sources.extend(holder),
                 }
             }
         }
@@ -786,43 +794,24 @@ fn decision_payload_seed(
     seed
 }
 
-struct CapturedBindingCollector<'a> {
-    state: &'a mut LiveBindingState,
-    promotion_facts: &'a ProtoPromotionFacts,
-}
-
-impl HirVisitor for CapturedBindingCollector<'_> {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        match expr {
-            HirExpr::TempRef(temp) => {
-                self.state.temps.insert(*temp);
-                self.state.homes.extend(
-                    self.promotion_facts
-                        .complete_temp_home_slots(*temp)
-                        .iter()
-                        .copied(),
-                );
-            }
-            HirExpr::LocalRef(local) => {
-                self.state.locals.insert(*local);
-                self.state.homes.extend(
-                    self.promotion_facts
-                        .complete_local_home_slots(*local)
-                        .iter()
-                        .copied(),
-                );
-            }
-            HirExpr::ParamRef(param) => {
-                self.state.homes.extend(
-                    self.promotion_facts
-                        .complete_param_home_slots(*param)
-                        .iter()
-                        .copied(),
-                );
-            }
-            _ => {}
+fn record_captured_binding(
+    binding: HirBinding,
+    state: &mut LiveBindingState,
+    promotion_facts: &ProtoPromotionFacts,
+) {
+    let homes = match binding {
+        HirBinding::Temp(temp) => {
+            state.temps.insert(temp);
+            promotion_facts.complete_temp_home_slots(temp)
         }
-    }
+        HirBinding::Local(local) => {
+            state.locals.insert(local);
+            promotion_facts.complete_local_home_slots(local)
+        }
+        HirBinding::Param(param) => promotion_facts.complete_param_home_slots(param),
+        HirBinding::Upvalue(_) => return,
+    };
+    state.homes.extend(homes.iter().copied());
 }
 
 fn tbc_homes_started_by_stmt(
@@ -983,21 +972,19 @@ impl HirVisitor for LiveReadCollector<'_> {
 
     fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
         if capture.mode == HirCaptureMode::ByValue {
-            visit::visit_expr(&capture.value, self);
+            visit::visit_expr(&capture.binding.expr(), self);
         }
     }
 }
 
 fn collect_shell_sites<'a>(
     block: &'a HirBlock,
-    prefix: &[PathComponent],
+    path: &mut StmtPath,
     stmt_nodes: &BTreeMap<*const HirStmt, usize>,
     shells: &mut BTreeMap<StmtPath, ShellFlowSite<'a>>,
 ) {
     for (index, stmt) in block.stmts.iter().enumerate() {
-        let mut path = prefix.to_vec();
-        path.push(PathComponent::Stmt(index));
-        match stmt {
+        with_path_component(path, PathComponent::Stmt(index), |path| match stmt {
             HirStmt::LocalRootRelease(_) => {}
             HirStmt::If(if_stmt) => {
                 if let Some(else_block) = &if_stmt.else_block
@@ -1019,29 +1006,29 @@ fn collect_shell_sites<'a>(
                         },
                     );
                 }
-                let mut then_prefix = path.clone();
-                then_prefix.push(PathComponent::Then);
-                collect_shell_sites(&if_stmt.then_block, &then_prefix, stmt_nodes, shells);
+                with_path_component(path, PathComponent::Then, |path| {
+                    collect_shell_sites(&if_stmt.then_block, path, stmt_nodes, shells);
+                });
                 if let Some(else_block) = &if_stmt.else_block {
-                    let mut else_prefix = path.clone();
-                    else_prefix.push(PathComponent::Else);
-                    collect_shell_sites(else_block, &else_prefix, stmt_nodes, shells);
+                    with_path_component(path, PathComponent::Else, |path| {
+                        collect_shell_sites(else_block, path, stmt_nodes, shells);
+                    });
                 }
             }
             HirStmt::While(while_stmt) => {
-                collect_body_shell_sites(&while_stmt.body, &path, stmt_nodes, shells);
+                collect_body_shell_sites(&while_stmt.body, path, stmt_nodes, shells);
             }
             HirStmt::Repeat(repeat_stmt) => {
-                collect_body_shell_sites(&repeat_stmt.body, &path, stmt_nodes, shells);
+                collect_body_shell_sites(&repeat_stmt.body, path, stmt_nodes, shells);
             }
             HirStmt::NumericFor(for_stmt) => {
-                collect_body_shell_sites(&for_stmt.body, &path, stmt_nodes, shells);
+                collect_body_shell_sites(&for_stmt.body, path, stmt_nodes, shells);
             }
             HirStmt::GenericFor(for_stmt) => {
-                collect_body_shell_sites(&for_stmt.body, &path, stmt_nodes, shells);
+                collect_body_shell_sites(&for_stmt.body, path, stmt_nodes, shells);
             }
             HirStmt::Block(nested) => {
-                collect_body_shell_sites(nested, &path, stmt_nodes, shells);
+                collect_body_shell_sites(nested, path, stmt_nodes, shells);
             }
             HirStmt::LocalDecl(_)
             | HirStmt::GlobalDecl(_)
@@ -1056,19 +1043,19 @@ fn collect_shell_sites<'a>(
             | HirStmt::Continue
             | HirStmt::Goto(_)
             | HirStmt::Label(_) => {}
-        }
+        });
     }
 }
 
 fn collect_body_shell_sites<'a>(
     body: &'a HirBlock,
-    path: &StmtPath,
+    path: &mut StmtPath,
     stmt_nodes: &BTreeMap<*const HirStmt, usize>,
     shells: &mut BTreeMap<StmtPath, ShellFlowSite<'a>>,
 ) {
-    let mut prefix = path.clone();
-    prefix.push(PathComponent::Body);
-    collect_shell_sites(body, &prefix, stmt_nodes, shells);
+    with_path_component(path, PathComponent::Body, |path| {
+        collect_shell_sites(body, path, stmt_nodes, shells);
+    });
 }
 
 #[derive(Default)]

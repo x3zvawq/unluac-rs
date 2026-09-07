@@ -41,13 +41,13 @@ use crate::transformer::{
 pub(super) struct ProtoBindings {
     pub(super) params: Vec<ParamId>,
     pub(super) param_debug_hints: Vec<Option<String>>,
-    pub(super) locals: Vec<LocalId>,
+    pub(super) local_count: usize,
     pub(super) vararg_param_local: Option<LocalId>,
     pub(super) local_debug_hints: Vec<Option<String>>,
     pub(super) local_debug_scopes: Vec<Option<usize>>,
     pub(super) upvalues: Vec<UpvalueId>,
     pub(super) upvalue_debug_hints: Vec<Option<String>>,
-    pub(super) temps: Vec<TempId>,
+    pub(super) temp_count: usize,
     pub(super) temp_debug_locals: Vec<Option<String>>,
     pub(super) temp_debug_scopes: Vec<Option<usize>>,
     pub(super) fixed_temps: Vec<TempId>,
@@ -562,7 +562,7 @@ fn lower_proto_one(
         signature: proto.signature,
         params: lowering.bindings.params.clone(),
         param_debug_hints: lowering.bindings.param_debug_hints.clone(),
-        locals: lowering.bindings.locals.clone(),
+        local_count: lowering.bindings.local_count,
         vararg_param_local: lowering.bindings.vararg_param_local,
         local_debug_hints: lowering.bindings.local_debug_hints.clone(),
         local_debug_scopes: lowering.bindings.local_debug_scopes.clone(),
@@ -578,7 +578,7 @@ fn lower_proto_one(
             .collect(),
         mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
         upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
-        temps: lowering.bindings.temps.clone(),
+        temp_count: lowering.bindings.temp_count,
         temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
         temp_debug_scopes: lowering.bindings.temp_debug_scopes.clone(),
         exit_requirements: collect_exit_requirements(frame.source_proto_id, structure),
@@ -670,8 +670,8 @@ fn build_self_value_capture_locals(
                     matches!(capture.source, CaptureSource::ByValue(reg) if reg == closure.dst)
                 })
                 .then(|| {
-                    let local = LocalId(bindings.locals.len());
-                    bindings.locals.push(local);
+                    let local = LocalId(bindings.local_count);
+                    bindings.local_count += 1;
                     bindings.local_debug_hints.push(None);
                     bindings.local_debug_scopes.push(None);
                     (InstrRef(index), local)
@@ -694,9 +694,7 @@ fn fill_failed_proto(
         .enumerate()
         .map(|(index, child)| (LocalId(vararg_param_locals + index), child.id))
         .collect::<Vec<_>>();
-    let locals = (0..vararg_param_locals + detached_children.len())
-        .map(LocalId)
-        .collect::<Vec<_>>();
+    let local_count = vararg_param_locals + detached_children.len();
     let mut local_debug_hints = vec![None; vararg_param_locals];
     local_debug_hints.extend(
         frame
@@ -720,7 +718,7 @@ fn fill_failed_proto(
             .map(ParamId)
             .collect(),
         param_debug_hints: vec![None; usize::from(proto.signature.num_params)],
-        locals,
+        local_count,
         vararg_param_local: proto.signature.has_vararg_param_reg.then_some(LocalId(0)),
         local_debug_hints,
         local_debug_scopes: vec![None; vararg_param_locals + detached_children.len()],
@@ -747,7 +745,7 @@ fn fill_failed_proto(
                     .and_then(|name| name.as_ref().map(decode_raw_string))
             })
             .collect(),
-        temps: Vec::new(),
+        temp_count: 0,
         temp_debug_locals: Vec::new(),
         temp_debug_scopes: Vec::new(),
         exit_requirements: frame.structure.ready().map_or_else(Vec::new, |structure| {
@@ -902,8 +900,8 @@ fn build_shared_closure_locals(
         .into_iter()
         .filter(|(_, (count, _))| *count > 1)
         .map(|(identity, (_, proto))| {
-            let local = LocalId(bindings.locals.len());
-            bindings.locals.push(local);
+            let local = LocalId(bindings.local_count);
+            bindings.local_count += 1;
             bindings.local_debug_hints.push(None);
             bindings.local_debug_scopes.push(None);
             (identity, (local, proto))
@@ -924,8 +922,8 @@ impl CapturedSharedClosureLowering {
         for composite in plan.composites() {
             let instr = composite.anchor;
             let index = instr.index();
-            let local = LocalId(bindings.locals.len());
-            bindings.locals.push(local);
+            let local = LocalId(bindings.local_count);
+            bindings.local_count += 1;
             bindings.local_debug_hints.push(None);
             bindings.local_debug_scopes.push(None);
             factory_locals.push(local);
@@ -945,15 +943,15 @@ impl CapturedSharedClosureLowering {
                 {
                     continue;
                 }
-                let local = LocalId(bindings.locals.len());
-                bindings.locals.push(local);
+                let local = LocalId(bindings.local_count);
+                bindings.local_count += 1;
                 bindings.local_debug_hints.push(None);
                 bindings.local_debug_scopes.push(None);
                 *snapshot = Some(local);
             }
             let barrier = snapshots.iter().any(Option::is_some).then(|| {
-                let box_local = LocalId(bindings.locals.len());
-                bindings.locals.push(box_local);
+                let box_local = LocalId(bindings.local_count);
+                bindings.local_count += 1;
                 bindings.local_debug_hints.push(None);
                 bindings.local_debug_scopes.push(None);
                 SharedCaptureBarrier {
@@ -1098,7 +1096,7 @@ fn build_composite_factory_proto(
             .iter()
             .enumerate()
             .map(|(capture_index, capture)| {
-                let (mode, value) = match *capture {
+                let (mode, binding) = match *capture {
                     CompositeCapture::Outer(outer) => {
                         if outer >= plan.outer_captures.len() {
                             return None;
@@ -1113,7 +1111,7 @@ fn build_composite_factory_proto(
                         }
                         (
                             HirCaptureMode::ByReference,
-                            HirExpr::UpvalueRef(UpvalueId(outer)),
+                            crate::hir::HirBinding::Upvalue(UpvalueId(outer)),
                         )
                     }
                     CompositeCapture::Dependency(dependency) => {
@@ -1122,11 +1120,11 @@ fn build_composite_factory_proto(
                         }
                         (
                             HirCaptureMode::ByValue,
-                            HirExpr::LocalRef(LocalId(dependency.index())),
+                            crate::hir::HirBinding::Local(LocalId(dependency.index())),
                         )
                     }
                 };
-                Some(HirCapture { mode, value })
+                Some(HirCapture { mode, binding })
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(error)?;
@@ -1147,9 +1145,9 @@ fn build_composite_factory_proto(
         HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(plan.root.index()))]),
         None,
     ));
-    let locals = (0..plan.nodes.len()).map(LocalId).collect::<Vec<_>>();
+    let local_count = plan.nodes.len();
     let mut promotion_facts = ProtoPromotionFacts::default();
-    for local in locals.iter().copied() {
+    for local in (0..local_count).map(LocalId) {
         promotion_facts.record_home_free_local(local);
     }
 
@@ -1166,7 +1164,7 @@ fn build_composite_factory_proto(
         },
         params: Vec::new(),
         param_debug_hints: Vec::new(),
-        locals,
+        local_count,
         vararg_param_local: None,
         local_debug_hints: vec![None; plan.nodes.len()],
         local_debug_scopes: vec![None; plan.nodes.len()],
@@ -1188,7 +1186,7 @@ fn build_composite_factory_proto(
             .collect(),
         mutable_upvalues,
         upvalue_debug_hints: vec![None; plan.outer_captures.len()],
-        temps: Vec::new(),
+        temp_count: 0,
         temp_debug_locals: Vec::new(),
         temp_debug_scopes: Vec::new(),
         exit_requirements: Vec::new(),

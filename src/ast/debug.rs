@@ -35,7 +35,6 @@ use crate::debug::{
     format_breadcrumb,
 };
 use crate::decompile::{DebugOptions, DecompileState};
-use crate::hir::LocalId;
 
 use super::common::{
     AstBindingRef, AstBlock, AstCallExpr, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName,

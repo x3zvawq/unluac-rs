@@ -6,8 +6,10 @@
 mod cfg;
 mod dataflow;
 mod graph;
+mod root_intervals;
 
 pub(crate) use graph::{SccFacts, SccId};
+pub(crate) use root_intervals::RootIntervalIndex;
 
 pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, EdgeKind, EdgeRef, InstrRange,

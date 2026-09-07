@@ -6,6 +6,8 @@
 //! 同时发布 proto-wide physical-root 集合和 repeat-specific may_end_before_condition，
 //! AST 只消费这些事实并证明自身候选的词法/控制合法性。
 
+use crate::hir::HirBinding;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
@@ -18,8 +20,8 @@ use crate::hir::promotion::ProtoPromotionFacts;
 use super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 
 use super::object_flow::{
-    Binding, ProtoEffects, RootAnalysisContext, RootState, binding_from_lvalue,
-    closure_captures_in_block, join_state, transfer_root_node,
+    ProtoEffects, RootAnalysisContext, RootState, binding_from_lvalue, closure_captures_in_block,
+    join_state, transfer_root_node,
 };
 
 /// Deferred 阶段补齐 repeat 条件仍可观察的物理 root。
@@ -92,10 +94,10 @@ fn collect_proto_repeat_roots(
     let mut initial = RootState::default();
     initial
         .unknown_collectable
-        .extend(proto.params.iter().copied().map(Binding::Param));
+        .extend(proto.params.iter().copied().map(HirBinding::Param));
     initial
         .unknown_collectable
-        .extend(proto.upvalues.iter().copied().map(Binding::Upvalue));
+        .extend(proto.upvalues.iter().copied().map(HirBinding::Upvalue));
     let mut roots = RepeatRoots::default();
     graph.solve_forward(
         initial,
@@ -134,15 +136,15 @@ fn note_repeat_condition_lifetimes(
         let eventful = !safety.is_discard_safe_without_residual(&repeat.cond);
         let observable = eventful && state.binding_may_hold_observable_root(binding);
         let has_physical_home = match binding {
-            Binding::Local(local) => {
+            HirBinding::Local(local) => {
                 !facts.is_some_and(|facts| facts.local_has_no_physical_home(local))
             }
-            Binding::Temp(temp) => !facts.is_some_and(|facts| {
+            HirBinding::Temp(temp) => !facts.is_some_and(|facts| {
                 facts
                     .possible_temp_home_slots(temp)
                     .is_some_and(|homes| homes.is_empty())
             }),
-            Binding::Param(_) | Binding::Upvalue(_) => false,
+            HirBinding::Param(_) | HirBinding::Upvalue(_) => false,
         };
         if observable && has_physical_home {
             if let Some(binding) = repeat_binding(binding) {
@@ -154,23 +156,23 @@ fn note_repeat_condition_lifetimes(
                     .remove(&binding);
             }
             match binding {
-                Binding::Local(local) => {
+                HirBinding::Local(local) => {
                     roots.locals.insert(local);
                 }
-                Binding::Temp(temp) => {
+                HirBinding::Temp(temp) => {
                     roots.temps.insert(temp);
                 }
-                Binding::Param(_) | Binding::Upvalue(_) => {}
+                HirBinding::Param(_) | HirBinding::Upvalue(_) => {}
             }
         }
     }
 }
 
-fn repeat_binding(binding: Binding) -> Option<HirRepeatBinding> {
+fn repeat_binding(binding: HirBinding) -> Option<HirRepeatBinding> {
     match binding {
-        Binding::Local(local) => Some(HirRepeatBinding::Local(local)),
-        Binding::Temp(temp) => Some(HirRepeatBinding::Temp(temp)),
-        Binding::Param(_) | Binding::Upvalue(_) => None,
+        HirBinding::Local(local) => Some(HirRepeatBinding::Local(local)),
+        HirBinding::Temp(temp) => Some(HirRepeatBinding::Temp(temp)),
+        HirBinding::Param(_) | HirBinding::Upvalue(_) => None,
     }
 }
 
@@ -232,20 +234,20 @@ fn install_repeat_condition_lifetime_facts(
 /// 直属 binding 支持 AST collective 把 suffix 包进新 `do`；嵌套 block binding 支持
 /// cleanup 删除前层已经存在或 AST 早先生成的尾部 `do`。这里只收集稳定 HIR identity，
 /// 是否真的移动某个 block 仍由 AST 对具体候选证明。
-fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<Binding> {
+fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<HirBinding> {
     let mut bindings = BTreeSet::new();
     for stmt in &block.stmts {
         match stmt {
             HirStmt::LocalRootRelease(_) => {}
             HirStmt::LocalDecl(decl) => {
-                bindings.extend(decl.bindings.iter().copied().map(Binding::Local))
+                bindings.extend(decl.bindings.iter().copied().map(HirBinding::Local))
             }
             HirStmt::Assign(assign) => bindings.extend(
                 assign
                     .targets
                     .iter()
                     .filter_map(binding_from_lvalue)
-                    .filter(|binding| matches!(binding, Binding::Temp(_))),
+                    .filter(|binding| matches!(binding, HirBinding::Temp(_))),
             ),
             HirStmt::If(if_stmt) => {
                 bindings.extend(repeat_scoped_bindings(&if_stmt.then_block));
@@ -260,11 +262,11 @@ fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<Binding> {
                 bindings.extend(repeat_scoped_bindings(&repeat_stmt.body));
             }
             HirStmt::NumericFor(for_stmt) => {
-                bindings.insert(Binding::Local(for_stmt.binding));
+                bindings.insert(HirBinding::Local(for_stmt.binding));
                 bindings.extend(repeat_scoped_bindings(&for_stmt.body));
             }
             HirStmt::GenericFor(for_stmt) => {
-                bindings.extend(for_stmt.bindings.iter().copied().map(Binding::Local));
+                bindings.extend(for_stmt.bindings.iter().copied().map(HirBinding::Local));
                 bindings.extend(repeat_scoped_bindings(&for_stmt.body));
             }
             HirStmt::Block(block) => bindings.extend(repeat_scoped_bindings(block)),
@@ -341,26 +343,28 @@ mod tests {
         let escaped_table = ObjectId::Table(7);
         let mut state = RootState::default();
         state.holders.insert(
-            Binding::Local(iterator),
+            HirBinding::Local(iterator),
             BTreeSet::from([ObjectId::Closure(child)]),
         );
         state
             .holders
-            .insert(Binding::Local(captured), BTreeSet::from([escaped_table]));
-        state.unknown_collectable.insert(Binding::Local(captured));
+            .insert(HirBinding::Local(captured), BTreeSet::from([escaped_table]));
+        state
+            .unknown_collectable
+            .insert(HirBinding::Local(captured));
         let mut effects = vec![ProtoEffects::default(); 3];
         effects[child.index()].escapes.insert(UpvalueId(0));
         snapshot_generic_for_root(init, &mut state, &effects);
 
         state.holders.insert(
-            Binding::Local(iterator),
+            HirBinding::Local(iterator),
             BTreeSet::from([ObjectId::Closure(later_child)]),
         );
         let captures = BTreeMap::from([(
             child,
             vec![HirCapture {
                 mode: HirCaptureMode::ByReference,
-                value: HirExpr::LocalRef(captured),
+                binding: crate::hir::HirBinding::Local(captured),
             }],
         )]);
         dispatch_generic_for_root(
@@ -372,7 +376,7 @@ mod tests {
         );
 
         assert!(state.escaped.contains(&escaped_table));
-        assert!(state.roots.contains(&Binding::Local(captured)));
+        assert!(state.roots.contains(&HirBinding::Local(captured)));
         assert_eq!(init.protocol(), dispatch.protocol());
     }
 
@@ -400,7 +404,7 @@ mod tests {
         };
         let mut state = RootState::default();
         state.holders.insert(
-            Binding::Local(binding),
+            HirBinding::Local(binding),
             BTreeSet::from([ObjectId::Table(9)]),
         );
         let mut snapshot = GenericForRootSnapshot::default();
@@ -410,11 +414,15 @@ mod tests {
         write_for_bindings_root(HirForBindings::Generic(flow), &mut state);
 
         assert_eq!(
-            state.holders.get(&Binding::Local(binding)),
+            state.holders.get(&HirBinding::Local(binding)),
             Some(&BTreeSet::from([returned]))
         );
-        assert!(state.unknown_collectable.contains(&Binding::Local(binding)));
-        assert!(state.roots.contains(&Binding::Local(binding)));
+        assert!(
+            state
+                .unknown_collectable
+                .contains(&HirBinding::Local(binding))
+        );
+        assert!(state.roots.contains(&HirBinding::Local(binding)));
     }
 
     #[test]

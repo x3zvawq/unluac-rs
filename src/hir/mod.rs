@@ -22,14 +22,14 @@ pub(crate) mod visit;
 pub use crate::parser::{ProtoLineRange, ProtoSignature};
 pub(crate) use analyze::analyze_hir;
 pub use common::{
-    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBlock, HirCallExpr, HirCallRootHandoff,
-    HirCallStmt, HirCapture, HirCaptureMode, HirClose, HirClosureExpr, HirControlFlowFeature,
-    HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExitRequirement,
-    HirExpr, HirGenericFor, HirGenericForDispatchResult, HirGlobalDecl, HirGlobalRef, HirGoto,
-    HirIf, HirInitializerMergeTransactionId, HirInlineDisposition, HirInlineDispositions,
-    HirInlineRetentionReason, HirLValue, HirLabel, HirLabelId, HirLocalDecl, HirLogicalExpr,
-    HirMethodRewriteTransactionId, HirMethodSetupProtocolId, HirModule, HirNumericFor, HirPackTail,
-    HirProto, HirProtoRef, HirRecordField, HirRepeat, HirRepeatBinding,
+    HirAssign, HirBinaryExpr, HirBinaryOpKind, HirBinding, HirBlock, HirCallExpr,
+    HirCallRootHandoff, HirCallStmt, HirCapture, HirCaptureMode, HirClose, HirClosureExpr,
+    HirControlFlowFeature, HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget,
+    HirExitRequirement, HirExpr, HirGenericFor, HirGenericForDispatchResult, HirGlobalDecl,
+    HirGlobalRef, HirGoto, HirIf, HirInitializerMergeTransactionId, HirInlineDisposition,
+    HirInlineDispositions, HirInlineRetentionReason, HirLValue, HirLabel, HirLabelId, HirLocalDecl,
+    HirLogicalExpr, HirMethodRewriteTransactionId, HirMethodSetupProtocolId, HirModule,
+    HirNumericFor, HirPackTail, HirProto, HirProtoRef, HirRecordField, HirRepeat, HirRepeatBinding,
     HirRepeatConditionLifetimeFacts, HirReturn, HirStmt, HirTableAccess, HirTableAllocation,
     HirTableConstructor, HirTableField, HirTableSetList, HirTbcDeclaration, HirToBeClosed,
     HirUnaryExpr, HirUnaryOpKind, HirUnresolvedExpr, HirValuePack, HirWhile, LocalId, ParamId,

@@ -32,40 +32,25 @@ pub(crate) fn eliminate_remaining_decisions_in_proto(
     promotion_facts: &mut ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> bool {
-    let mut next_local_index = proto.locals.len();
-    let mut new_locals = Vec::new();
-    let mut new_local_debug_hints = Vec::new();
-    let changed = eliminate_block(
-        &mut proto.body,
-        &mut next_local_index,
-        &mut new_locals,
-        &mut new_local_debug_hints,
-        safety,
-    );
-    for local in new_locals.iter().copied() {
+    let first_new_local = proto.local_count;
+    let changed = eliminate_block(&mut proto.body, &mut proto.local_count, safety);
+    for local in (first_new_local..proto.local_count).map(LocalId) {
         promotion_facts.record_home_free_local(local);
     }
-    proto.locals.extend(new_locals);
-    proto.local_debug_hints.extend(new_local_debug_hints);
-    proto.local_debug_scopes.resize(proto.locals.len(), None);
+    proto.local_debug_hints.resize(proto.local_count, None);
+    proto.local_debug_scopes.resize(proto.local_count, None);
     changed
 }
 
 fn eliminate_block(
     block: &mut HirBlock,
     next_local_index: &mut usize,
-    new_locals: &mut Vec<LocalId>,
-    new_local_debug_hints: &mut Vec<Option<String>>,
     safety: HirExprSafety,
 ) -> bool {
     let mut changed = false;
     let mut rewritten = Vec::with_capacity(block.stmts.len());
     let original = mem::take(&mut block.stmts);
-    let mut state = EliminationState {
-        next_local_index,
-        new_locals,
-        new_local_debug_hints,
-    };
+    let mut state = EliminationState { next_local_index };
 
     for stmt in original {
         let (mut lowered, stmt_changed) = eliminate_stmt(stmt, &mut state, safety);
@@ -491,13 +476,7 @@ fn eliminate_nested_blocks_in_stmt(
     safety: HirExprSafety,
 ) -> bool {
     rewrite_nested_blocks_in_stmt(stmt, &mut |block| {
-        eliminate_block(
-            block,
-            state.next_local_index,
-            state.new_locals,
-            state.new_local_debug_hints,
-            safety,
-        )
+        eliminate_block(block, state.next_local_index, safety)
     })
 }
 
@@ -561,12 +540,8 @@ mod tests {
             else_block: None,
         }));
         let mut next_local_index = 0;
-        let mut new_locals = Vec::new();
-        let mut new_local_debug_hints = Vec::new();
         let mut state = EliminationState {
             next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
         };
 
         let (lowered, changed) = eliminate_stmt(
@@ -593,8 +568,7 @@ mod tests {
         assert!(flag.values.fixed.is_empty() && flag.values.tail.is_none());
         assert!(matches!(condition_scope.stmts[1], HirStmt::If(_)));
         assert!(matches!(consumer.cond, HirExpr::LocalRef(local) if local == *flag_local));
-        assert_eq!(new_locals, vec![LocalId(0), LocalId(1)]);
-        assert_eq!(new_local_debug_hints, vec![None, None]);
+        assert_eq!(next_local_index, 2);
     }
 
     #[test]
@@ -615,12 +589,8 @@ mod tests {
             },
         }));
         let mut next_local_index = 0;
-        let mut new_locals = Vec::new();
-        let mut new_local_debug_hints = Vec::new();
         let mut state = EliminationState {
             next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
         };
 
         let (lowered, changed) = eliminate_stmt(
@@ -666,12 +636,8 @@ mod tests {
             lifetime: Default::default(),
         }));
         let mut next_local_index = 0;
-        let mut new_locals = Vec::new();
-        let mut new_local_debug_hints = Vec::new();
         let mut state = EliminationState {
             next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
         };
 
         let (lowered, changed) = eliminate_stmt(
@@ -705,12 +671,8 @@ mod tests {
             lifetime: Default::default(),
         }));
         let mut next_local_index = 0;
-        let mut new_locals = Vec::new();
-        let mut new_local_debug_hints = Vec::new();
         let mut state = EliminationState {
             next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
         };
 
         let (lowered, changed) = eliminate_stmt(
@@ -733,7 +695,7 @@ mod tests {
         assert!(matches!(continue_route.stmts[0], HirStmt::Block(_)));
         assert!(matches!(continue_route.stmts[1], HirStmt::Continue));
         assert!(matches!(repeat.cond, HirExpr::LocalRef(local) if local == *flag));
-        assert!(!new_locals.is_empty());
+        assert!(next_local_index > 0);
     }
 
     #[test]
@@ -760,12 +722,8 @@ mod tests {
             lifetime: Default::default(),
         }));
         let mut next_local_index = 1;
-        let mut new_locals = Vec::new();
-        let mut new_local_debug_hints = Vec::new();
         let mut state = EliminationState {
             next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
         };
 
         let (lowered, changed) = eliminate_stmt(
@@ -822,12 +780,8 @@ mod tests {
             lifetime: Default::default(),
         }));
         let mut next_local_index = 1;
-        let mut new_locals = Vec::new();
-        let mut new_local_debug_hints = Vec::new();
         let mut state = EliminationState {
             next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
         };
 
         let (lowered, changed) = eliminate_stmt(
@@ -841,7 +795,7 @@ mod tests {
             panic!("live TBC path must keep the condition at the real repeat latch");
         };
         assert!(matches!(repeat.cond, HirExpr::Decision(_)));
-        assert!(new_locals.is_empty());
+        assert_eq!(next_local_index, 1);
     }
 
     #[test]
@@ -862,12 +816,8 @@ mod tests {
             lifetime: Default::default(),
         }));
         let mut next_local_index = 1;
-        let mut new_locals = Vec::new();
-        let mut new_local_debug_hints = Vec::new();
         let mut state = EliminationState {
             next_local_index: &mut next_local_index,
-            new_locals: &mut new_locals,
-            new_local_debug_hints: &mut new_local_debug_hints,
         };
 
         let (lowered, changed) = eliminate_stmt(
@@ -881,7 +831,7 @@ mod tests {
             panic!("future condition local must keep the condition at the real repeat latch");
         };
         assert!(matches!(repeat.cond, HirExpr::Decision(_)));
-        assert!(new_locals.is_empty());
+        assert_eq!(next_local_index, 1);
     }
 
     fn nonstable_decision() -> HirExpr {

@@ -111,9 +111,7 @@ fn collect_capture_evidence_in_expr(
                 expr(e) => { collect_capture_evidence_in_expr(function, e, hir, evidence)?; }
             );
         },
-        capture(capture) => {
-            collect_capture_evidence_in_expr(function, &capture.value, hir, evidence)?;
-        }
+        capture(_capture) => {}
     );
     Ok(())
 }
@@ -144,7 +142,10 @@ fn record_closure_capture_evidence(
         captures: closure
             .captures
             .iter()
-            .map(|capture| captured_binding_from_expr(parent, &capture.value))
+            .map(|capture| CapturedBinding {
+                parent,
+                binding: capture.binding,
+            })
             .collect(),
     };
 
@@ -157,47 +158,5 @@ fn record_closure_capture_evidence(
         Some(_) => Err(NamingError::ConflictingCaptureEvidence {
             child: closure.proto.index(),
         }),
-    }
-}
-
-fn captured_binding_from_expr(parent: HirProtoRef, expr: &HirExpr) -> Option<CapturedBinding> {
-    match expr {
-        HirExpr::ParamRef(param) => Some(CapturedBinding::Param {
-            parent,
-            param: *param,
-        }),
-        HirExpr::LocalRef(local) => Some(CapturedBinding::Local {
-            parent,
-            local: *local,
-        }),
-        HirExpr::TempRef(temp) => Some(CapturedBinding::Temp {
-            parent,
-            temp: *temp,
-        }),
-        HirExpr::UpvalueRef(upvalue) => Some(CapturedBinding::Upvalue {
-            parent,
-            upvalue: *upvalue,
-        }),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::TableAccess(_)
-        | HirExpr::Unary(_)
-        | HirExpr::Binary(_)
-        | HirExpr::LogicalAnd(_)
-        | HirExpr::LogicalOr(_)
-        | HirExpr::Decision(_)
-        | HirExpr::Call(_)
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => None,
     }
 }

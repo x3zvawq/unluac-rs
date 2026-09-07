@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::AstSyntheticLocalId;
-use crate::hir::{HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
+use crate::hir::{HirProtoRef, LocalId, ParamId};
 use strum_macros::{Display, EnumString, IntoStaticStr};
 
 /// Naming 模式。
@@ -105,30 +105,16 @@ pub(super) struct FunctionNamingEvidence {
 
 /// upvalue 捕获自父函数哪个绑定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CapturedBinding {
-    Param {
-        parent: HirProtoRef,
-        param: ParamId,
-    },
-    Local {
-        parent: HirProtoRef,
-        local: LocalId,
-    },
-    Temp {
-        parent: HirProtoRef,
-        temp: TempId,
-    },
-    Upvalue {
-        parent: HirProtoRef,
-        upvalue: UpvalueId,
-    },
+pub(super) struct CapturedBinding {
+    pub(super) parent: HirProtoRef,
+    pub(super) binding: crate::hir::HirBinding,
 }
 
 /// 单次 closure 观察得到的 capture 证据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ClosureCaptureEvidence {
     pub(super) parent: HirProtoRef,
-    pub(super) captures: Vec<Option<CapturedBinding>>,
+    pub(super) captures: Vec<CapturedBinding>,
 }
 
 /// 从 AST 结构收集到的 naming hint。

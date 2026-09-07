@@ -31,7 +31,7 @@ pub(super) fn build_function_evidence(
 
     let upvalue_debug_names = hir.upvalue_debug_hints.clone();
     let upvalue_capture_sources = capture_evidence
-        .map(|evidence| evidence.captures.clone())
+        .map(|evidence| evidence.captures.iter().copied().map(Some).collect())
         .unwrap_or_else(|| vec![None; hir.upvalues.len()]);
 
     FunctionNamingEvidence {

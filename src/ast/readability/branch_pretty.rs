@@ -22,8 +22,9 @@ use super::super::common::{
 use super::ReadabilityContext;
 use super::binding_flow::BindingWriteIndex;
 use super::control_flow::block_contains_label_or_goto;
-use super::visit::{self, AstVisitor};
-use super::walk::{self, AstRewritePass, BlockKind};
+use super::walk::{self, AstRewritePass};
+use crate::ast::traverse::BlockKind;
+use crate::ast::visit::{self, AstVisitor};
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let _ = context.target;

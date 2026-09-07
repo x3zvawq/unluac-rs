@@ -10,7 +10,8 @@
 
 use super::super::common::{AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;
-use super::walk::{self, AstRewritePass, BlockKind};
+use super::walk::{self, AstRewritePass};
+use crate::ast::traverse::BlockKind;
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
     walk::rewrite_module(module, &mut GotoSyntaxSafetyPass)

@@ -90,16 +90,14 @@ pub(super) fn lower_plain_closure_expr(
     instr_ref: InstrRef,
     closure: &ClosureInstr,
 ) -> HirExpr {
-    HirExpr::Closure(Box::new(HirClosureExpr {
-        proto: lowering.child_refs[closure.proto.index()],
-        captures: closure
-            .captures
-            .iter()
-            .map(|capture| {
-                lower_closure_capture(lowering, block, instr_ref, closure.dst, capture.source)
-            })
-            .collect(),
-    }))
+    let captures = closure
+        .captures
+        .iter()
+        .map(|capture| {
+            lower_closure_capture(lowering, block, instr_ref, closure.dst, capture.source)
+        })
+        .collect::<Result<Vec<_>, _>>();
+    capture_closure_expr(lowering.child_refs[closure.proto.index()], captures)
 }
 
 pub(super) fn lower_composite_factory_expr(
@@ -110,9 +108,9 @@ pub(super) fn lower_composite_factory_expr(
     factory: CompositeFactoryRef,
 ) -> HirExpr {
     let plan = lowering.captured_shared_closures.composite_plan(factory);
-    HirExpr::Closure(Box::new(HirClosureExpr {
-        proto: lowering.captured_shared_closures.composite_proto(factory),
-        captures: lower_factory_captures(
+    capture_closure_expr(
+        lowering.captured_shared_closures.composite_proto(factory),
+        lower_factory_captures(
             lowering,
             block,
             instr_ref,
@@ -120,7 +118,17 @@ pub(super) fn lower_composite_factory_expr(
             factory,
             plan.outer_captures.iter().copied(),
         ),
-    }))
+    )
+}
+
+fn capture_closure_expr(
+    proto: crate::hir::HirProtoRef,
+    captures: Result<Vec<HirCapture>, crate::hir::HirUnresolvedExpr>,
+) -> HirExpr {
+    match captures {
+        Ok(captures) => HirExpr::Closure(Box::new(HirClosureExpr { proto, captures })),
+        Err(error) => HirExpr::Unresolved(Box::new(error)),
+    }
 }
 
 fn lower_factory_captures(
@@ -130,7 +138,7 @@ fn lower_factory_captures(
     dst: Reg,
     factory: CompositeFactoryRef,
     sources: impl IntoIterator<Item = CaptureSource>,
-) -> Vec<HirCapture> {
+) -> Result<Vec<HirCapture>, crate::hir::HirUnresolvedExpr> {
     let barrier = lowering.captured_shared_closures.capture_barrier(factory);
     sources
         .into_iter()
@@ -140,9 +148,11 @@ fn lower_factory_captures(
                 .and_then(|barrier| barrier.snapshots.get(index).copied().flatten())
                 .map_or_else(
                     || lower_closure_capture(lowering, block, instr_ref, dst, source),
-                    |snapshot| HirCapture {
-                        mode: HirCaptureMode::ByValue,
-                        value: HirExpr::LocalRef(snapshot),
+                    |snapshot| {
+                        Ok(HirCapture {
+                            mode: HirCaptureMode::ByValue,
+                            binding: crate::hir::HirBinding::Local(snapshot),
+                        })
                     },
                 )
         })

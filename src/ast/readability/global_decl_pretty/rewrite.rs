@@ -9,12 +9,13 @@
 //! 不会扩展到条件。
 
 use super::super::ReadabilityContext;
-use super::super::walk::{BlockKind, ScopedAstRewritePass, rewrite_module_scoped};
+use super::super::walk::{ScopedAstRewritePass, rewrite_module_scoped};
 use super::collective::try_wrap_missing_collective_suffix;
 use super::facts::{BlockFacts, MissingGlobals, VisibleGlobals};
 use super::insert::insert_missing_global_decls;
 use super::merge::merge_seed_global_runs;
 use crate::ast::common::{AstBlock, AstModule};
+use crate::ast::traverse::BlockKind;
 
 pub(in crate::ast::readability) fn apply(
     module: &mut AstModule,

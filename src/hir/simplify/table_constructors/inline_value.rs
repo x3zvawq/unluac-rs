@@ -12,7 +12,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::expr_requires_ordered_snapshot;
 
 use super::bindings::{BindingIndex, BindingUseSummary, binding_from_expr};
-use super::{BindingId, ConstructorEvalEvent, PendingProducer, ProducerSourcePreservation};
+use super::{ConstructorEvalEvent, PendingProducer, ProducerSourcePreservation};
 
 pub(super) struct InlineContext<'a> {
     block: &'a HirBlock,
@@ -321,97 +321,15 @@ pub(super) fn expr_mentions_any_pending_binding(
     binding_index: &BindingIndex,
     producer_index_by_binding: &[Option<usize>],
 ) -> bool {
-    expr_mentions_binding_where(expr, binding_index, |binding_id| {
-        producer_index_by_binding
-            .get(binding_id)
-            .is_some_and(Option::is_some)
-    })
-}
-
-fn expr_mentions_binding_where(
-    expr: &HirExpr,
-    binding_index: &BindingIndex,
-    predicate: impl Fn(BindingId) -> bool + Copy,
-) -> bool {
-    if binding_from_expr(expr)
-        .and_then(|binding| binding_index.id_of(binding))
-        .is_some_and(predicate)
-    {
-        return true;
-    }
-
-    match expr {
-        HirExpr::TableAccess(access) => {
-            expr_mentions_binding_where(&access.base, binding_index, predicate)
-                || expr_mentions_binding_where(&access.key, binding_index, predicate)
-        }
-        HirExpr::Unary(unary) => expr_mentions_binding_where(&unary.expr, binding_index, predicate),
-        HirExpr::Binary(binary) => {
-            expr_mentions_binding_where(&binary.lhs, binding_index, predicate)
-                || expr_mentions_binding_where(&binary.rhs, binding_index, predicate)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_mentions_binding_where(&logical.lhs, binding_index, predicate)
-                || expr_mentions_binding_where(&logical.rhs, binding_index, predicate)
-        }
-        HirExpr::Call(call) => {
-            expr_mentions_binding_where(&call.callee, binding_index, predicate)
-                || call
-                    .args
-                    .iter()
-                    .any(|arg| expr_mentions_binding_where(arg, binding_index, predicate))
-        }
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(value) => {
-                    expr_mentions_binding_where(value, binding_index, predicate)
-                }
-                HirTableField::Record(field) => {
-                    expr_mentions_binding_where(&field.value, binding_index, predicate)
-                        || expr_mentions_binding_where(&field.key, binding_index, predicate)
-                }
-            }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
-                expr_mentions_binding_where(tail.as_expr(), binding_index, predicate)
+    crate::hir::visit::any_expr(expr, &mut |expr| {
+        binding_from_expr(expr)
+            .and_then(|binding| binding_index.id_of(binding))
+            .is_some_and(|binding_id| {
+                producer_index_by_binding
+                    .get(binding_id)
+                    .is_some_and(Option::is_some)
             })
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_mentions_binding_where(&node.test, binding_index, predicate)
-                || decision_target_mentions_binding_where(&node.truthy, binding_index, predicate)
-                || decision_target_mentions_binding_where(&node.falsy, binding_index, predicate)
-        }),
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_mentions_binding_where(&capture.value, binding_index, predicate)),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-        HirExpr::TempRef(_) | HirExpr::LocalRef(_) => false,
-    }
-}
-
-fn decision_target_mentions_binding_where(
-    target: &HirDecisionTarget,
-    binding_index: &BindingIndex,
-    predicate: impl Fn(BindingId) -> bool + Copy,
-) -> bool {
-    match target {
-        HirDecisionTarget::Expr(expr) => {
-            expr_mentions_binding_where(expr, binding_index, predicate)
-        }
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -540,7 +458,7 @@ mod tests {
             proto: HirProtoRef(1),
             captures: vec![HirCapture {
                 mode: HirCaptureMode::ByReference,
-                value: HirExpr::LocalRef(LocalId(0)),
+                binding: crate::hir::HirBinding::Local(LocalId(0)),
             }],
         }));
 

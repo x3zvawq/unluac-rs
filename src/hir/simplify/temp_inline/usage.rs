@@ -1,6 +1,8 @@
 //! 这个子模块负责 temp-inline pass 的定义与使用计数摘要。
 //!
 //! 它依赖 HIR 当前 stmt 序列，只记录 temp 的定义数量、debug 身份与语句树中的读取次数，
+//! 子节点顺序由共享 HIR visitor 提供；读取摘要保留 temp 首次出现顺序，索引容量直接
+//! 消费 bindings 发布的编号域。capture 两种模式都计入父级绑定引用，不进入子 proto。
 //! 不会在这里改写任何节点。例如 `t0 = a.b` 的读取计数为一时，inline owner 可继续审查
 //! 该定义的求值顺序与生命周期，不能仅凭计数删除它。
 
@@ -57,7 +59,8 @@ pub(super) struct TempUseScratch {
 }
 
 impl TempUseScratch {
-    pub(super) fn new(proto: &HirProto, temp_count: usize) -> Self {
+    pub(super) fn new(proto: &HirProto) -> Self {
+        let temp_count = proto.temp_count;
         let mut temp_debug_hints = vec![false; temp_count];
         for (index, hint) in proto.temp_debug_locals.iter().enumerate().take(temp_count) {
             temp_debug_hints[index] = hint.is_some();
@@ -126,11 +129,19 @@ impl TempUseScratch {
     }
 }
 
+impl HirVisitor for TempUseScratch {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::TempRef(temp) = expr {
+            self.note_temp(*temp);
+        }
+    }
+}
+
 pub(super) fn collect_stmt_temp_uses(
     stmt: &HirStmt,
     scratch: &mut TempUseScratch,
 ) -> TempUseSummary {
-    collect_stmt_temp_uses_into(stmt, scratch);
+    visit_stmts(std::slice::from_ref(stmt), scratch);
     scratch.finish_summary()
 }
 
@@ -138,360 +149,6 @@ pub(super) fn collect_expr_temp_uses_summary(
     expr: &HirExpr,
     scratch: &mut TempUseScratch,
 ) -> TempUseSummary {
-    collect_expr_temp_uses(expr, scratch);
+    visit_expr(expr, scratch);
     scratch.finish_summary()
-}
-
-fn collect_stmt_temp_uses_into(stmt: &HirStmt, scratch: &mut TempUseScratch) {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => {}
-        HirStmt::LocalDecl(local_decl) => {
-            for value in &local_decl.values {
-                collect_expr_temp_uses(value, scratch);
-            }
-        }
-        HirStmt::GlobalDecl(global_decl) => {
-            for value in &global_decl.values {
-                collect_expr_temp_uses(value, scratch);
-            }
-        }
-        HirStmt::Assign(assign) => {
-            for target in &assign.targets {
-                collect_lvalue_temp_uses(target, scratch);
-            }
-            for value in &assign.values {
-                collect_expr_temp_uses(value, scratch);
-            }
-        }
-        HirStmt::TableSetList(set_list) => {
-            collect_expr_temp_uses(&set_list.base, scratch);
-            for value in &set_list.values {
-                collect_expr_temp_uses(value, scratch);
-            }
-        }
-        HirStmt::ErrNil(err_nil) => {
-            collect_expr_temp_uses(&err_nil.value, scratch);
-        }
-        HirStmt::ToBeClosed(to_be_closed) => {
-            collect_expr_temp_uses(&to_be_closed.value, scratch);
-        }
-        HirStmt::CallStmt(call_stmt) => collect_call_temp_uses(&call_stmt.call, scratch),
-        HirStmt::Return(ret) => {
-            for value in &ret.values {
-                collect_expr_temp_uses(value, scratch);
-            }
-        }
-        HirStmt::If(if_stmt) => {
-            collect_expr_temp_uses(&if_stmt.cond, scratch);
-            collect_block_temp_uses(&if_stmt.then_block, scratch);
-            if let Some(else_block) = &if_stmt.else_block {
-                collect_block_temp_uses(else_block, scratch);
-            }
-        }
-        HirStmt::While(while_stmt) => {
-            collect_expr_temp_uses(&while_stmt.cond, scratch);
-            collect_block_temp_uses(&while_stmt.body, scratch);
-        }
-        HirStmt::Repeat(repeat_stmt) => {
-            collect_block_temp_uses(&repeat_stmt.body, scratch);
-            collect_expr_temp_uses(&repeat_stmt.cond, scratch);
-        }
-        HirStmt::NumericFor(numeric_for) => {
-            collect_expr_temp_uses(&numeric_for.start, scratch);
-            collect_expr_temp_uses(&numeric_for.limit, scratch);
-            collect_expr_temp_uses(&numeric_for.step, scratch);
-            collect_block_temp_uses(&numeric_for.body, scratch);
-        }
-        HirStmt::GenericFor(generic_for) => {
-            for expr in &generic_for.iterator {
-                collect_expr_temp_uses(expr, scratch);
-            }
-            collect_block_temp_uses(&generic_for.body, scratch);
-        }
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => {}
-        HirStmt::Block(block) => collect_block_temp_uses(block, scratch),
-    }
-}
-
-fn collect_block_temp_uses(block: &HirBlock, scratch: &mut TempUseScratch) {
-    for stmt in &block.stmts {
-        collect_stmt_temp_uses_into(stmt, scratch);
-    }
-}
-
-fn collect_call_temp_uses(call: &HirCallExpr, scratch: &mut TempUseScratch) {
-    collect_expr_temp_uses(&call.callee, scratch);
-    for arg in &call.args {
-        collect_expr_temp_uses(arg, scratch);
-    }
-}
-
-fn collect_lvalue_temp_uses(lvalue: &HirLValue, scratch: &mut TempUseScratch) {
-    match lvalue {
-        HirLValue::Param(_)
-        | HirLValue::Temp(_)
-        | HirLValue::Local(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_) => {}
-        HirLValue::TableAccess(access) => {
-            collect_expr_temp_uses(&access.base, scratch);
-            collect_expr_temp_uses(&access.key, scratch);
-        }
-    }
-}
-
-fn collect_expr_temp_uses(expr: &HirExpr, scratch: &mut TempUseScratch) {
-    match expr {
-        HirExpr::TempRef(temp) => scratch.note_temp(*temp),
-        HirExpr::TableAccess(access) => {
-            collect_expr_temp_uses(&access.base, scratch);
-            collect_expr_temp_uses(&access.key, scratch);
-        }
-        HirExpr::Unary(unary) => collect_expr_temp_uses(&unary.expr, scratch),
-        HirExpr::Binary(binary) => {
-            collect_expr_temp_uses(&binary.lhs, scratch);
-            collect_expr_temp_uses(&binary.rhs, scratch);
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            collect_expr_temp_uses(&logical.lhs, scratch);
-            collect_expr_temp_uses(&logical.rhs, scratch);
-        }
-        HirExpr::Decision(decision) => {
-            for node in &decision.nodes {
-                collect_expr_temp_uses(&node.test, scratch);
-                collect_decision_target_temp_uses(&node.truthy, scratch);
-                collect_decision_target_temp_uses(&node.falsy, scratch);
-            }
-        }
-        HirExpr::Call(call) => collect_call_temp_uses(call, scratch),
-        HirExpr::TableConstructor(table) => {
-            for field in &table.fields {
-                match field {
-                    HirTableField::Array(expr) => collect_expr_temp_uses(expr, scratch),
-                    HirTableField::Record(field) => {
-                        collect_table_key_temp_uses(&field.key, scratch);
-                        collect_expr_temp_uses(&field.value, scratch);
-                    }
-                }
-            }
-            if let Some(tail) = &table.trailing_multivalue {
-                collect_expr_temp_uses(tail.as_expr(), scratch);
-            }
-        }
-        HirExpr::Closure(closure) => {
-            for capture in &closure.captures {
-                collect_expr_temp_uses(&capture.value, scratch);
-            }
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => {}
-    }
-}
-
-fn collect_decision_target_temp_uses(
-    target: &crate::hir::common::HirDecisionTarget,
-    scratch: &mut TempUseScratch,
-) {
-    match target {
-        crate::hir::common::HirDecisionTarget::Expr(expr) => collect_expr_temp_uses(expr, scratch),
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => {}
-    }
-}
-
-fn collect_table_key_temp_uses(key: &crate::hir::common::HirExpr, scratch: &mut TempUseScratch) {
-    collect_expr_temp_uses(key, scratch);
-}
-
-pub(super) fn max_temp_index_in_block(block: &HirBlock) -> Option<usize> {
-    block.stmts.iter().filter_map(max_temp_index_in_stmt).max()
-}
-
-fn max_temp_index_in_stmt(stmt: &HirStmt) -> Option<usize> {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => None,
-        HirStmt::LocalDecl(local_decl) => local_decl
-            .values
-            .iter()
-            .filter_map(max_temp_index_in_expr)
-            .max(),
-        HirStmt::GlobalDecl(global_decl) => global_decl
-            .values
-            .iter()
-            .filter_map(max_temp_index_in_expr)
-            .max(),
-        HirStmt::Assign(assign) => assign
-            .targets
-            .iter()
-            .filter_map(max_temp_index_in_lvalue)
-            .chain(assign.values.iter().filter_map(max_temp_index_in_expr))
-            .max(),
-        HirStmt::TableSetList(set_list) => std::iter::once(max_temp_index_in_expr(&set_list.base))
-            .chain(set_list.values.iter().map(max_temp_index_in_expr))
-            .flatten()
-            .max(),
-        HirStmt::ErrNil(err_nil) => max_temp_index_in_expr(&err_nil.value),
-        HirStmt::ToBeClosed(to_be_closed) => max_temp_index_in_expr(&to_be_closed.value),
-        HirStmt::CallStmt(call_stmt) => max_temp_index_in_call(&call_stmt.call),
-        HirStmt::Return(ret) => ret.values.iter().filter_map(max_temp_index_in_expr).max(),
-        HirStmt::If(if_stmt) => std::iter::once(max_temp_index_in_expr(&if_stmt.cond))
-            .chain(std::iter::once(max_temp_index_in_block(
-                &if_stmt.then_block,
-            )))
-            .chain(if_stmt.else_block.iter().map(max_temp_index_in_block))
-            .flatten()
-            .max(),
-        HirStmt::While(while_stmt) => std::iter::once(max_temp_index_in_expr(&while_stmt.cond))
-            .chain(std::iter::once(max_temp_index_in_block(&while_stmt.body)))
-            .flatten()
-            .max(),
-        HirStmt::Repeat(repeat_stmt) => std::iter::once(max_temp_index_in_block(&repeat_stmt.body))
-            .chain(std::iter::once(max_temp_index_in_expr(&repeat_stmt.cond)))
-            .flatten()
-            .max(),
-        HirStmt::NumericFor(numeric_for) => {
-            std::iter::once(max_temp_index_in_expr(&numeric_for.start))
-                .chain(std::iter::once(max_temp_index_in_expr(&numeric_for.limit)))
-                .chain(std::iter::once(max_temp_index_in_expr(&numeric_for.step)))
-                .chain(std::iter::once(max_temp_index_in_block(&numeric_for.body)))
-                .flatten()
-                .max()
-        }
-        HirStmt::GenericFor(generic_for) => generic_for
-            .iterator
-            .iter()
-            .filter_map(max_temp_index_in_expr)
-            .chain(std::iter::once(max_temp_index_in_block(&generic_for.body)).flatten())
-            .max(),
-        HirStmt::Break
-        | HirStmt::Close(_)
-        | HirStmt::Continue
-        | HirStmt::Goto(_)
-        | HirStmt::Label(_) => None,
-        HirStmt::Block(block) => max_temp_index_in_block(block),
-    }
-}
-
-fn max_temp_index_in_call(call: &HirCallExpr) -> Option<usize> {
-    std::iter::once(max_temp_index_in_expr(&call.callee))
-        .chain(call.args.iter().map(max_temp_index_in_expr))
-        .flatten()
-        .max()
-}
-
-fn max_temp_index_in_lvalue(lvalue: &HirLValue) -> Option<usize> {
-    match lvalue {
-        HirLValue::Temp(temp) => Some(temp.index()),
-        HirLValue::TableAccess(access) => std::iter::once(max_temp_index_in_expr(&access.base))
-            .chain(std::iter::once(max_temp_index_in_expr(&access.key)))
-            .flatten()
-            .max(),
-        HirLValue::Param(_)
-        | HirLValue::Local(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_) => None,
-    }
-}
-
-fn max_temp_index_in_expr(expr: &HirExpr) -> Option<usize> {
-    match expr {
-        HirExpr::TempRef(temp) => Some(temp.index()),
-        HirExpr::TableAccess(access) => std::iter::once(max_temp_index_in_expr(&access.base))
-            .chain(std::iter::once(max_temp_index_in_expr(&access.key)))
-            .flatten()
-            .max(),
-        HirExpr::Unary(unary) => max_temp_index_in_expr(&unary.expr),
-        HirExpr::Binary(binary) => std::iter::once(max_temp_index_in_expr(&binary.lhs))
-            .chain(std::iter::once(max_temp_index_in_expr(&binary.rhs)))
-            .flatten()
-            .max(),
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            std::iter::once(max_temp_index_in_expr(&logical.lhs))
-                .chain(std::iter::once(max_temp_index_in_expr(&logical.rhs)))
-                .flatten()
-                .max()
-        }
-        HirExpr::Decision(decision) => decision
-            .nodes
-            .iter()
-            .flat_map(|node| {
-                [
-                    max_temp_index_in_expr(&node.test),
-                    max_temp_index_in_decision_target(&node.truthy),
-                    max_temp_index_in_decision_target(&node.falsy),
-                ]
-            })
-            .flatten()
-            .max(),
-        HirExpr::Call(call) => max_temp_index_in_call(call),
-        HirExpr::TableConstructor(table) => table
-            .fields
-            .iter()
-            .flat_map(|field| match field {
-                HirTableField::Array(expr) => [max_temp_index_in_expr(expr), None],
-                HirTableField::Record(field) => [
-                    max_temp_index_in_table_key(&field.key),
-                    max_temp_index_in_expr(&field.value),
-                ],
-            })
-            .chain(
-                table
-                    .trailing_multivalue
-                    .iter()
-                    .map(|tail| max_temp_index_in_expr(tail.as_expr())),
-            )
-            .flatten()
-            .max(),
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .filter_map(|capture| max_temp_index_in_expr(&capture.value))
-            .max(),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => None,
-    }
-}
-
-fn max_temp_index_in_decision_target(
-    target: &crate::hir::common::HirDecisionTarget,
-) -> Option<usize> {
-    match target {
-        crate::hir::common::HirDecisionTarget::Expr(expr) => max_temp_index_in_expr(expr),
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => None,
-    }
-}
-
-fn max_temp_index_in_table_key(key: &crate::hir::common::HirExpr) -> Option<usize> {
-    max_temp_index_in_expr(key)
 }

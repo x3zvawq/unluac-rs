@@ -442,11 +442,8 @@ pub(crate) fn expr_observes_eval_order(expr: &HirExpr) -> bool {
             true
         }
         HirExpr::Decision(_) | HirExpr::TableConstructor(_) => true,
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_observes_eval_order(&capture.value)),
-        HirExpr::Nil
+        HirExpr::Closure(_)
+        | HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
@@ -472,7 +469,6 @@ pub(crate) fn expr_requires_ordered_snapshot(expr: &HirExpr) -> bool {
     expr_observes_eval_order(expr)
         || matches!(expr, HirExpr::Closure(closure) if closure.captures.iter().any(|capture| {
             capture.mode == HirCaptureMode::ByValue
-                && expr_requires_ordered_snapshot(&capture.value)
         }))
         || matches!(
             expr,

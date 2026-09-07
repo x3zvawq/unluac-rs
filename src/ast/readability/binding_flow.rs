@@ -25,7 +25,7 @@ use super::super::common::{
     AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstNameRef, AstStmt,
 };
 use super::binding_ref::binding_from_name_ref;
-use super::visit::{self, AstVisitor, NameAccess};
+use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 pub(super) use refs::{
     BindingRefSet, block_references_binding_set, expr_has_binding_read, expr_reads_binding,
@@ -39,7 +39,7 @@ pub(super) fn mutable_snapshot_names_in_block(block: &AstBlock) -> MutableSnapsh
     #[derive(Default)]
     struct CaptureWriteCollector(MutableSnapshotNames);
 
-    impl super::visit::AstVisitor for CaptureWriteCollector {
+    impl crate::ast::visit::AstVisitor for CaptureWriteCollector {
         fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
             self.0.extend(function.capture_write_names.iter().cloned());
             false
@@ -47,7 +47,7 @@ pub(super) fn mutable_snapshot_names_in_block(block: &AstBlock) -> MutableSnapsh
     }
 
     let mut collector = CaptureWriteCollector::default();
-    super::visit::visit_block(block, &mut collector);
+    crate::ast::visit::visit_block(block, &mut collector);
     collector.0
 }
 

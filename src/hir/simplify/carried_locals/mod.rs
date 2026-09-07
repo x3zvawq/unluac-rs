@@ -19,6 +19,10 @@
 //! `HirInlineDispositions::Preserve` 作为独立的 transaction protection 参与每个候选：
 //! 只要 rewrite map 或前置裁剪触及该 binding 就拒绝该事务，不把它混进 outer-scope
 //! 可见性，也不因 proto 中另一个无关 binding 被保护而停用整个 pass。
+//! 词法可用 Local 用共享集合和本层新增日志维护；兄弟子块返回时恢复入口状态，后序
+//! owner 执行前再撤销本块声明，避免把后置声明误认为入口已存在的写回目标。
+//! 前序保护借用入口树的一次 mention 索引；子块只改自身，父 owner 在所有子块返回后
+//! 才执行，因此未处理兄弟的入口快照仍有效。后序仅在子块改变时重新索引当前块。
 //!
 //! 例子：
 //! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
@@ -40,17 +44,18 @@ mod seeds;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirBlock, HirLabelId, HirProto, HirStmt, LocalId};
+use crate::hir::common::{HirBlock, HirLabelId, HirProto, HirStmt, LocalId, TempId};
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::label_refs::count_label_references;
-use super::temp_touch::{RefScopeTracker, TempTouchIndex, collect_temp_refs_by_stmt};
+use super::temp_touch::{TempTouchIndex, collect_temp_refs_by_stmt};
 use super::walk::for_each_nested_block_mut;
 
 use self::adjacent::{try_collapse_adjacent_local_seed_handoff, try_collapse_guarded_local_update};
 use self::binding::{
-    BindingProtection, binding_home_slot, bindings_may_share_raw_home_slot, carry_binding_from_expr,
+    BindingProtection, binding_home_slot, bindings_may_share_raw_home_slot,
+    carry_binding_from_capture, carry_binding_from_expr,
 };
 pub(super) use self::binding::{CarryBinding, single_binding_copy};
 use self::boundary::LabelJumpIndex;
@@ -60,13 +65,13 @@ use self::prune::{
     prune_dead_for_binding_temp_mirrors, prune_redundant_branch_state_copies,
     prune_redundant_copy_stmts,
 };
-use self::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
+use self::reads::{BindingMentionIndex, BlockMentions, collect_binding_mentions_in_expr};
 use self::region_results::{
     RegionResultIndex, collapse_inferred_if_result_chains, collapse_result_writeback_transactions,
     collapse_written_back_if_results, try_collapse_region_result_handoff,
 };
 use super::mention::{stmts_captured_locals, stmts_reference_captured_bindings};
-use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_stmts};
 
 struct HandoffSafety<'a> {
     promotion_facts: &'a mut ProtoPromotionFacts,
@@ -98,6 +103,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
     let identity_facts = HandoffIdentityFacts::new(proto, preserved_bindings);
     let coalesced =
         coalesce::coalesce_disjoint_temps(proto, promotion_facts, &identity_facts, expr_safety);
+    let mentions = BindingMentionIndex::new(&proto.body.stmts);
     branch_copies_changed
         | coalesced
         | snapshots_changed
@@ -108,33 +114,33 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
             promotion_facts,
             &identity_facts,
             &control_facts,
-            &BTreeSet::new(),
-            expr_safety,
+            &mut BTreeSet::new(),
+            &mut mentions.blocks(),
         )
 }
 
 /// 自定义后序遍历：先递归处理子块（同时把外层 binding 引用集传下去），再在当前块做
 /// handoff 折叠。外层仍提及的 source 或 target 不能在当前块内被当成私有快照消除。
-fn collapse_handoffs_recursive(
+fn collapse_handoffs_recursive<'a>(
     block: &mut HirBlock,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
     control_facts: &RegionControlFacts,
-    inherited_locals: &BTreeSet<LocalId>,
-    expr_safety: HirExprSafety,
+    inherited_locals: &mut BTreeSet<LocalId>,
+    snapshots: &mut impl Iterator<Item = BlockMentions<'a>>,
 ) -> bool {
+    let mentions = snapshots
+        .next()
+        .expect("each original block has a mention snapshot");
     let mut changed = false;
-    let mut visible_locals = inherited_locals.clone();
+    let mut introduced_locals = Vec::new();
 
     // 跟踪每个嵌套语句“进入该子块时需要保护的 binding 集”。
     // 对于 index 处的语句，保护集 = 继承的 outer_bindings ∪ 本块中其他语句的 mentions。
     // 注意不能用 `all - self` 来近似：如果某个 binding 同时出现在当前语句和其他语句中，
     // 差集会把它减掉，导致跨作用域的引用失去保护。这里用前缀+后缀并集来精确计算。
-    let stmt_binding_refs = collect_binding_mentions_by_stmt(&block.stmts);
-    let mut binding_refs = RefScopeTracker::new(&stmt_binding_refs);
-    for index in 0..binding_refs.len() {
-        binding_refs.enter_stmt(index);
+    for index in 0..block.stmts.len() {
         let repeat_cond_refs = match &block.stmts[index] {
             HirStmt::Repeat(repeat_stmt) => {
                 Some(collect_binding_mentions_in_expr(&repeat_stmt.cond))
@@ -143,19 +149,17 @@ fn collapse_handoffs_recursive(
         };
         let child_outer = ScopedBindingProtection {
             inherited: outer_bindings,
-            refs: &binding_refs,
+            refs: mentions,
+            stmt_index: index,
             extra: repeat_cond_refs.as_ref(),
         };
-        let mut child_locals = visible_locals.clone();
-        match &block.stmts[index] {
-            HirStmt::NumericFor(numeric_for) => {
-                child_locals.insert(numeric_for.binding);
-            }
-            HirStmt::GenericFor(generic_for) => {
-                child_locals.extend(generic_for.bindings.iter().copied());
-            }
-            _ => {}
-        }
+        let local_checkpoint = introduced_locals.len();
+        let for_bindings = match &block.stmts[index] {
+            HirStmt::NumericFor(numeric_for) => std::slice::from_ref(&numeric_for.binding),
+            HirStmt::GenericFor(generic_for) => generic_for.bindings.as_slice(),
+            _ => &[],
+        };
+        extend_visible_locals(inherited_locals, &mut introduced_locals, for_bindings);
 
         for_each_nested_block_mut(&mut block.stmts[index], &mut |nested_block| {
             changed |= collapse_handoffs_recursive(
@@ -164,28 +168,36 @@ fn collapse_handoffs_recursive(
                 promotion_facts,
                 identity_facts,
                 control_facts,
-                &child_locals,
-                expr_safety,
+                inherited_locals,
+                snapshots,
             );
         });
 
-        if let HirStmt::LocalDecl(local_decl) = &block.stmts[index] {
-            visible_locals.extend(local_decl.bindings.iter().copied());
+        for local in introduced_locals.drain(local_checkpoint..) {
+            inherited_locals.remove(&local);
         }
-
-        binding_refs.leave_stmt(index);
+        if let HirStmt::LocalDecl(local_decl) = &block.stmts[index] {
+            extend_visible_locals(
+                inherited_locals,
+                &mut introduced_locals,
+                &local_decl.bindings,
+            );
+        }
     }
 
-    // 后序：子块可能把 binding 引用改写到当前层，因此 owner 不能继续使用递归前的索引。
-    let refreshed_stmt_binding_refs = collect_binding_mentions_by_stmt(&block.stmts);
+    // 后序 owner 判断的是进入本块之前的可用性，不能把本块后置声明当成入口 local。
+    for local in introduced_locals {
+        inherited_locals.remove(&local);
+    }
+    // 初始快照保留给祖先和未处理的兄弟；子块改变后由实际消费者按需重建。
     changed |= collapse_dead_loop_update_handoffs(
         block,
-        &refreshed_stmt_binding_refs,
+        (!changed).then_some(mentions),
         outer_bindings,
         promotion_facts,
         identity_facts,
         inherited_locals,
-        expr_safety,
+        control_facts.expr_safety,
     );
     changed |= collapse_block_handoffs(
         block,
@@ -194,10 +206,23 @@ fn collapse_handoffs_recursive(
         identity_facts,
         control_facts,
         inherited_locals,
-        expr_safety,
+        control_facts.expr_safety,
     );
     changed |= prune_redundant_copy_stmts(block, &identity_facts.preserved);
     changed
+}
+
+fn extend_visible_locals(
+    visible: &mut BTreeSet<LocalId>,
+    introduced: &mut Vec<LocalId>,
+    bindings: &[LocalId],
+) {
+    for &local in bindings {
+        // 同一身份可能已经由祖先声明；退出子块时只能撤销本层首次引入的身份。
+        if visible.insert(local) {
+            introduced.push(local);
+        }
+    }
 }
 
 fn collapse_block_handoffs(
@@ -329,10 +354,8 @@ struct HandoffIdentityFacts {
 
 impl HandoffIdentityFacts {
     fn new(proto: &HirProto, preserved: BTreeSet<CarryBinding>) -> Self {
-        let debug = proto
-            .locals
-            .iter()
-            .copied()
+        let debug = (0..proto.local_count)
+            .map(LocalId)
             .zip(&proto.local_debug_hints)
             .filter_map(|(local, hint)| hint.is_some().then_some(local))
             .collect();
@@ -398,17 +421,13 @@ impl HandoffIdentityFacts {
 }
 
 fn collect_preserved_bindings(proto: &HirProto) -> BTreeSet<CarryBinding> {
-    proto
-        .temps
-        .iter()
-        .copied()
+    (0..proto.temp_count)
+        .map(TempId)
         .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve())
         .map(CarryBinding::Temp)
         .chain(
-            proto
-                .locals
-                .iter()
-                .copied()
+            (0..proto.local_count)
+                .map(LocalId)
                 .filter(|local| proto.inline_dispositions.local(*local).must_preserve())
                 .map(CarryBinding::Local),
         )
@@ -441,46 +460,26 @@ impl HirVisitor for HandoffIdentityCollector {
         }
     }
 
-    fn visit_expr(&mut self, expr: &crate::hir::common::HirExpr) {
-        let crate::hir::common::HirExpr::Closure(closure) = expr else {
-            return;
-        };
-        for capture in &closure.captures {
-            if capture.mode == crate::hir::common::HirCaptureMode::ByReference {
-                visit_expr(
-                    &capture.value,
-                    &mut CapturedValueBindingCollector {
-                        bindings: &mut self.reference_captured,
-                    },
-                );
-            }
+    fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
+        if capture.mode == crate::hir::HirCaptureMode::ByReference
+            && let Some(binding) = carry_binding_from_capture(capture.binding)
+        {
+            self.reference_captured.insert(binding);
         }
     }
 }
 
-struct CapturedValueBindingCollector<'a> {
-    bindings: &'a mut BTreeSet<CarryBinding>,
-}
-
-impl HirVisitor for CapturedValueBindingCollector<'_> {
-    fn visit_expr(&mut self, expr: &crate::hir::common::HirExpr) {
-        if let Some(binding) = carry_binding_from_expr(expr) {
-            self.bindings.insert(binding);
-        }
-    }
-}
-
-struct ScopedBindingProtection<'scope, 'refs> {
+struct ScopedBindingProtection<'scope> {
     inherited: &'scope dyn BindingProtection,
-    refs: &'scope RefScopeTracker<'refs, CarryBinding>,
+    refs: BlockMentions<'scope>,
+    stmt_index: usize,
     extra: Option<&'scope BTreeSet<CarryBinding>>,
 }
 
-impl BindingProtection for ScopedBindingProtection<'_, '_> {
+impl BindingProtection for ScopedBindingProtection<'_> {
     fn contains(&self, binding: &CarryBinding) -> bool {
         self.inherited.contains(binding)
-            || self.refs.prefix_contains(*binding)
-            || self.refs.suffix_contains(*binding)
+            || self.refs.outside_stmt(self.stmt_index, *binding)
             || self.extra.is_some_and(|extra| extra.contains(binding))
     }
 }

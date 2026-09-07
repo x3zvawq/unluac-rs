@@ -20,6 +20,18 @@ pub(super) enum PathComponent {
 
 pub(super) type StmtPath = Vec<PathComponent>;
 
+/// 临时导航复用同一条路径；先恢复父路径，再交还包括 `Err` 在内的分析结果。
+pub(super) fn with_path_component<R>(
+    path: &mut StmtPath,
+    component: PathComponent,
+    visit: impl FnOnce(&mut StmtPath) -> R,
+) -> R {
+    path.push(component);
+    let result = visit(path);
+    path.pop();
+    result
+}
+
 pub(super) fn remove_planned_stmts(
     block: &mut HirBlock,
     path: &mut StmtPath,

@@ -394,16 +394,12 @@ impl HirVisitor for UnstructuredAliasFacts {
         }
     }
 
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        let HirExpr::Closure(closure) = expr else {
-            return;
-        };
-        for capture in &closure.captures {
-            if capture.mode != HirCaptureMode::ByReference {
-                continue;
-            }
-            self.reference_captures_local |= expr_mentions_local(&capture.value, self.local);
-            self.reference_captures_param |= expr_mentions_param(&capture.value, self.param);
+    fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
+        if capture.mode == HirCaptureMode::ByReference {
+            self.reference_captures_local |=
+                capture.binding == crate::hir::HirBinding::Local(self.local);
+            self.reference_captures_param |=
+                capture.binding == crate::hir::HirBinding::Param(self.param);
         }
     }
 
@@ -820,18 +816,19 @@ impl HirVisitor for AliasEvaluationFacts {
             | HirExpr::Unary(_)
             | HirExpr::Binary(_)
             | HirExpr::Call(_) => self.has_opaque_callback = true,
-            HirExpr::Closure(closure) => {
-                for capture in &closure.captures {
-                    if capture.mode != HirCaptureMode::ByReference {
-                        continue;
-                    }
-                    self.reference_captures_local |=
-                        expr_mentions_local(&capture.value, self.local);
-                    self.reference_captures_param |=
-                        expr_mentions_param(&capture.value, self.param);
-                }
-            }
             _ => {}
+        }
+    }
+
+    fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
+        let local = capture.binding == crate::hir::HirBinding::Local(self.local);
+        let param = capture.binding == crate::hir::HirBinding::Param(self.param);
+        // 两种捕获模式都读取创建点的父绑定；只有引用捕获会暴露后续写入。
+        self.reads_local |= local;
+        self.reads_param |= param;
+        if capture.mode == HirCaptureMode::ByReference {
+            self.reference_captures_local |= local;
+            self.reference_captures_param |= param;
         }
     }
 
@@ -885,29 +882,20 @@ impl HirVisitor for LocalWriteCollector {
     }
 }
 
-fn expr_mentions_param(expr: &HirExpr, param: ParamId) -> bool {
-    let mut collector = ParamReadCollector { param, read: false };
-    visit::visit_expr(expr, &mut collector);
-    collector.read
-}
-
-struct ParamReadCollector {
-    param: ParamId,
-    read: bool,
-}
-
-impl HirVisitor for ParamReadCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.read |= matches!(expr, HirExpr::ParamRef(param) if *param == self.param);
-    }
-}
-
 struct LocalToParamRewrite {
     local: LocalId,
     param: ParamId,
 }
 
 impl HirRewritePass for LocalToParamRewrite {
+    fn rewrite_capture(&mut self, capture: &mut crate::hir::HirCapture) -> bool {
+        if capture.binding == crate::hir::HirBinding::Local(self.local) {
+            capture.binding = crate::hir::HirBinding::Param(self.param);
+            return true;
+        }
+        false
+    }
+
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         if matches!(expr, HirExpr::LocalRef(local) if *local == self.local) {
             *expr = HirExpr::ParamRef(self.param);

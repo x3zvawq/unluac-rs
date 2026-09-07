@@ -69,6 +69,7 @@ pub struct DataflowFacts {
     pub open_defs: Vec<OpenDef>,
     pub instr_defs: Vec<Vec<DefId>>,
     pub(crate) fixed_defs_by_reg: Vec<Vec<DefId>>,
+    pub(crate) root_intervals: super::RootIntervalIndex,
     pub block_entry_values: Vec<SsaRegMap>,
     pub block_exit_values: Vec<SsaRegMap>,
     pub(crate) block_end_values: Vec<SsaRegMap>,
@@ -93,6 +94,31 @@ pub struct DataflowFacts {
 }
 
 impl DataflowFacts {
+    /// 同一 low 指令区间中的首次必定覆写，包含 fixed def 与开放结果后缀。
+    pub(crate) fn first_must_write_in_range(
+        &self,
+        reg: Reg,
+        range: Range<usize>,
+    ) -> Option<InstrRef> {
+        let fixed = self.fixed_defs_by_reg.get(reg.index()).and_then(|defs| {
+            let position = defs.partition_point(|def| self.def_instr(*def).index() < range.start);
+            defs.get(position)
+                .map(|def| self.def_instr(*def))
+                .filter(|instr| instr.index() < range.end)
+        });
+        let end = fixed.map_or(range.end, |instr| instr.index());
+        self.root_intervals
+            .first_open_write(range.start..end, reg.index())
+            .map(InstrRef)
+            .or(fixed)
+    }
+
+    /// 区间内全部普通观察共同证明的最小保活前缀；None 表示没有普通观察。
+    /// FrameExit 与 Close 的协议边界仍由调用方按原控制流处理。
+    pub(crate) fn minimum_rooted_prefix(&self, range: Range<usize>) -> Option<usize> {
+        self.root_intervals.minimum_rooted_prefix(range)
+    }
+
     /// 返回 exclusive low 区间内最后一次 fixed Def，包括不可达块中的定义。
     ///
     /// 索引在 Dataflow 产出时按指令顺序冻结；例如 debug local 入口不读取该槽，也能

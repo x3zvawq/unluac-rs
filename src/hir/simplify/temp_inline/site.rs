@@ -36,7 +36,7 @@ pub(super) fn inline_site_in_stmt(stmt: &HirStmt, temp: TempId) -> Option<Inline
         // its NewTable origin/home slot; inlining the producer here loses both facts and used to
         // require materializing an unrelated block-local owner afterward.  Values remain normal
         // direct sites.
-        HirStmt::TableSetList(set_list) => (!expr_touches_temp(&set_list.base, temp))
+        HirStmt::TableSetList(set_list) => (!expr_mentions_temp(&set_list.base, temp))
             .then(|| find_site_in_exprs(&set_list.values, temp, InlineSite::Direct))
             .flatten(),
         HirStmt::CallStmt(call_stmt) => {
@@ -221,7 +221,7 @@ pub(super) fn fastcall_callee_materialization_precedes_temp(stmt: &HirStmt, temp
         }
         _ => return false,
     };
-    call.fastcall.is_some() && call.args.iter().any(|arg| expr_touches_temp(arg, temp))
+    call.fastcall.is_some() && call.args.iter().any(|arg| expr_mentions_temp(arg, temp))
 }
 
 pub(super) fn temp_precedes_observable_eval_in_stmt(
@@ -325,7 +325,7 @@ impl EvalOrderProbe<'_> {
 
     fn exprs<'a>(&self, exprs: impl IntoIterator<Item = &'a HirExpr>) -> bool {
         for expr in exprs {
-            if expr_touches_temp(expr, self.temp) {
+            if expr_mentions_temp(expr, self.temp) {
                 return self.expr(expr);
             }
             if !self.prefix_is_clear(expr) {
@@ -340,7 +340,7 @@ impl EvalOrderProbe<'_> {
         for lvalue in lvalues {
             if let HirLValue::TableAccess(access) = lvalue {
                 for expr in [&access.base, &access.key] {
-                    if expr_touches_temp(expr, self.temp) {
+                    if expr_mentions_temp(expr, self.temp) {
                         return (Some(prefix_clear && self.expr(expr)), prefix_clear);
                     }
                     prefix_clear &= self.prefix_is_clear(expr);
@@ -352,16 +352,16 @@ impl EvalOrderProbe<'_> {
 
     fn call(&self, call: &HirCallExpr) -> bool {
         if let Some(fastcall) = call.fastcall {
-            if expr_touches_temp(&call.callee, self.temp) {
+            if expr_mentions_temp(&call.callee, self.temp) {
                 return self.expr(&call.callee);
             }
             for (index, arg) in call.args.fixed.iter().enumerate() {
-                if expr_touches_temp(arg, self.temp) {
+                if expr_mentions_temp(arg, self.temp) {
                     return fastcall.fixed_is_direct(index) && self.expr(arg);
                 }
             }
             if let Some(tail) = &call.args.tail
-                && expr_touches_temp(tail.as_expr(), self.temp)
+                && expr_mentions_temp(tail.as_expr(), self.temp)
             {
                 return fastcall.tail_is_direct() && self.expr(tail.as_expr());
             }
@@ -377,7 +377,7 @@ impl EvalOrderProbe<'_> {
             HirExpr::Unary(unary) => self.expr(&unary.expr),
             HirExpr::Binary(binary) => self.exprs([&binary.lhs, &binary.rhs]),
             HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-                expr_touches_temp(&logical.lhs, self.temp) && self.expr(&logical.lhs)
+                expr_mentions_temp(&logical.lhs, self.temp) && self.expr(&logical.lhs)
             }
             HirExpr::Call(call) => self.call(call),
             HirExpr::TableConstructor(table) => {
@@ -387,17 +387,17 @@ impl EvalOrderProbe<'_> {
                 for field in &table.fields {
                     match field {
                         HirTableField::Array(value) => {
-                            if expr_touches_temp(value, self.temp) {
+                            if expr_mentions_temp(value, self.temp) {
                                 return prefix_clear && self.expr(value);
                             }
                             prefix_clear &= self.prefix_is_clear(value);
                         }
                         HirTableField::Record(field) => {
-                            if expr_touches_temp(&field.key, self.temp) {
+                            if expr_mentions_temp(&field.key, self.temp) {
                                 return prefix_clear && self.expr(&field.key);
                             }
                             prefix_clear &= self.prefix_is_clear(&field.key);
-                            if expr_touches_temp(&field.value, self.temp) {
+                            if expr_mentions_temp(&field.value, self.temp) {
                                 return prefix_clear && self.expr(&field.value);
                             }
                             prefix_clear &= self.prefix_is_clear(&field.value);
@@ -406,13 +406,13 @@ impl EvalOrderProbe<'_> {
                 }
                 table.trailing_multivalue.as_ref().is_some_and(|tail| {
                     let trailing = tail.as_expr();
-                    prefix_clear && expr_touches_temp(trailing, self.temp) && self.expr(trailing)
+                    prefix_clear && expr_mentions_temp(trailing, self.temp) && self.expr(trailing)
                 })
             }
             HirExpr::Decision(decision) => {
                 analyze_decision(decision);
                 let entry = &decision.nodes[decision.entry.index()];
-                expr_touches_temp(&entry.test, self.temp) && self.expr(&entry.test)
+                expr_mentions_temp(&entry.test, self.temp) && self.expr(&entry.test)
             }
             HirExpr::Closure(_)
             | HirExpr::Nil
@@ -445,7 +445,7 @@ impl EvalOrderProbe<'_> {
             HirExpr::UpvalueRef(_) => true,
             HirExpr::Closure(closure) => closure.captures.iter().any(|capture| {
                 capture.mode == crate::hir::common::HirCaptureMode::ByValue
-                    && self.expr_is_mutable_binding_snapshot(&capture.value)
+                    && self.expr_is_mutable_binding_snapshot(&capture.binding.expr())
             }),
             _ => false,
         }
@@ -753,13 +753,7 @@ fn expr_complexity(expr: &HirExpr) -> usize {
                     .as_ref()
                     .map_or(0, |tail| expr_complexity(tail.as_expr()))
         }
-        HirExpr::Closure(closure) => {
-            1 + closure
-                .captures
-                .iter()
-                .map(|capture| expr_complexity(&capture.value))
-                .sum::<usize>()
-        }
+        HirExpr::Closure(closure) => 1 + closure.captures.len(),
     }
 }
 
@@ -1089,75 +1083,4 @@ fn is_named_field_chain_expr(expr: &HirExpr) -> bool {
     };
     matches!(&access.key, HirExpr::String(_))
         && (is_atomic_nested_inline_expr(&access.base) || is_named_field_chain_expr(&access.base))
-}
-
-pub(super) fn expr_touches_temp(expr: &HirExpr, temp: TempId) -> bool {
-    match expr {
-        HirExpr::TempRef(other) => *other == temp,
-        HirExpr::TableAccess(access) => {
-            expr_touches_temp(&access.base, temp) || expr_touches_temp(&access.key, temp)
-        }
-        HirExpr::Unary(unary) => expr_touches_temp(&unary.expr, temp),
-        HirExpr::Binary(binary) => {
-            expr_touches_temp(&binary.lhs, temp) || expr_touches_temp(&binary.rhs, temp)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_touches_temp(&logical.lhs, temp) || expr_touches_temp(&logical.rhs, temp)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_touches_temp(&node.test, temp)
-                || decision_target_touches_temp(&node.truthy, temp)
-                || decision_target_touches_temp(&node.falsy, temp)
-        }),
-        HirExpr::Call(call) => {
-            expr_touches_temp(&call.callee, temp)
-                || call.args.iter().any(|arg| expr_touches_temp(arg, temp))
-        }
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(expr) => expr_touches_temp(expr, temp),
-                HirTableField::Record(field) => {
-                    table_key_touches_temp(&field.key, temp)
-                        || expr_touches_temp(&field.value, temp)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(|tail| expr_touches_temp(tail.as_expr(), temp))
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_touches_temp(&capture.value, temp)),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    }
-}
-
-fn decision_target_touches_temp(
-    target: &crate::hir::common::HirDecisionTarget,
-    temp: TempId,
-) -> bool {
-    match target {
-        crate::hir::common::HirDecisionTarget::Expr(expr) => expr_touches_temp(expr, temp),
-        crate::hir::common::HirDecisionTarget::Node(_)
-        | crate::hir::common::HirDecisionTarget::CurrentValue => false,
-    }
-}
-
-fn table_key_touches_temp(key: &HirExpr, temp: TempId) -> bool {
-    expr_touches_temp(key, temp)
 }

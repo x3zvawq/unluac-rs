@@ -150,6 +150,25 @@ pub(in crate::hir::simplify) fn single_binding_copy(
     ))
 }
 
+pub(super) fn carry_binding_from_capture(binding: crate::hir::HirBinding) -> Option<CarryBinding> {
+    use crate::hir::HirBinding;
+    match binding {
+        HirBinding::Param(id) => Some(CarryBinding::Param(id)),
+        HirBinding::Local(id) => Some(CarryBinding::Local(id)),
+        HirBinding::Temp(id) => Some(CarryBinding::Temp(id)),
+        HirBinding::Upvalue(_) => None,
+    }
+}
+
+fn carry_capture_binding(binding: CarryBinding) -> crate::hir::HirBinding {
+    use crate::hir::HirBinding;
+    match binding {
+        CarryBinding::Param(id) => HirBinding::Param(id),
+        CarryBinding::Local(id) => HirBinding::Local(id),
+        CarryBinding::Temp(id) => HirBinding::Temp(id),
+    }
+}
+
 fn carry_binding_expr(binding: CarryBinding) -> HirExpr {
     match binding {
         CarryBinding::Param(param) => HirExpr::ParamRef(param),
@@ -186,6 +205,17 @@ impl BindingClassRewritePass<'_> {
 }
 
 impl HirRewritePass for BindingClassRewritePass<'_> {
+    fn rewrite_capture(&mut self, capture: &mut crate::hir::HirCapture) -> bool {
+        let Some(binding) = carry_binding_from_capture(capture.binding) else {
+            return false;
+        };
+        let Some(rewrite) = self.rewrite_binding(binding) else {
+            return false;
+        };
+        capture.binding = carry_capture_binding(rewrite);
+        true
+    }
+
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let Some(binding) = carry_binding_from_expr(expr) else {
             return false;
@@ -268,6 +298,17 @@ pub(super) fn record_binding_merge(
 }
 
 impl HirRewritePass for TempToBindingPass<'_> {
+    fn rewrite_capture(&mut self, capture: &mut crate::hir::HirCapture) -> bool {
+        let crate::hir::HirBinding::Temp(temp) = capture.binding else {
+            return false;
+        };
+        let Some(binding) = self.binding_for_temp(temp) else {
+            return false;
+        };
+        capture.binding = carry_capture_binding(binding);
+        true
+    }
+
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let HirExpr::TempRef(temp) = expr else {
             return false;

@@ -392,7 +392,7 @@ mod tests {
     fn unrelated_residual_does_not_disable_old_value_proof() {
         let candidate = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -424,10 +424,10 @@ mod tests {
         let resource = TempId(0);
         let home = HomeSlotKey::new(0, 0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
-        proto.temps = vec![resource];
+        proto.temp_count = resource.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -463,7 +463,7 @@ mod tests {
         let mut proto = empty_test_proto();
         proto.params = vec![parameter];
         proto.param_debug_hints = vec![None];
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -500,7 +500,7 @@ mod tests {
     fn dead_shell_ignores_a_read_that_only_precedes_the_write() {
         let candidate = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -528,7 +528,7 @@ mod tests {
     fn return_does_not_make_a_lexical_suffix_read_live() {
         let candidate = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -561,7 +561,7 @@ mod tests {
     fn later_exact_write_kills_the_shell_before_a_read() {
         let candidate = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -592,7 +592,7 @@ mod tests {
         let candidate = LocalId(0);
         let flag = LocalId(1);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate, flag];
+        proto.local_count = candidate.index().max(flag.index()) + 1;
         proto.local_debug_hints = vec![None, None];
         proto.local_debug_scopes = vec![None, None];
         proto.body.stmts = vec![
@@ -631,7 +631,7 @@ mod tests {
         let candidate = LocalId(0);
         let reentry = HirLabelId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -667,7 +667,7 @@ mod tests {
     fn unresolved_goto_uses_the_unknown_observer_sink() {
         let candidate = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -692,7 +692,7 @@ mod tests {
         let candidate = LocalId(0);
         let unrelated = LocalId(1);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate, unrelated];
+        proto.local_count = candidate.index().max(unrelated.index()) + 1;
         proto.local_debug_hints = vec![None, None];
         proto.local_debug_scopes = vec![None, None];
         proto.body.stmts = vec![
@@ -721,7 +721,7 @@ mod tests {
         let unrelated = LocalId(1);
         let candidate_home = HomeSlotKey::new(2, 0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate, unrelated];
+        proto.local_count = candidate.index().max(unrelated.index()) + 1;
         proto.local_debug_hints = vec![None, None];
         proto.local_debug_scopes = vec![None, None];
         proto.body.stmts = vec![
@@ -751,10 +751,10 @@ mod tests {
         let target = TempId(0);
         let target_home = HomeSlotKey::new(0, 0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![observer];
+        proto.local_count = observer.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
-        proto.temps = vec![target];
+        proto.temp_count = target.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -845,7 +845,7 @@ mod tests {
         let universe_witness = TempId(1);
         let home = HomeSlotKey::new(0, 0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![target, universe_witness];
+        proto.temp_count = target.index().max(universe_witness.index()) + 1;
         proto.temp_debug_locals = vec![None, None];
         proto.temp_debug_scopes = vec![None, None];
         proto.body.stmts = vec![
@@ -871,7 +871,7 @@ mod tests {
     fn unknown_temp_without_a_physical_home_universe_is_an_invalid_fact_set() {
         let target = TempId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![target];
+        proto.temp_count = target.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![boolean_shell(HirLValue::Temp(target))];
@@ -909,10 +909,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -923,7 +923,7 @@ mod tests {
                     proto: HirProtoRef(1),
                     captures: vec![HirCapture {
                         mode: HirCaptureMode::ByReference,
-                        value: HirExpr::TempRef(candidate),
+                        binding: crate::hir::HirBinding::Temp(candidate),
                     }],
                 })),
             ),
@@ -951,10 +951,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -966,7 +966,7 @@ mod tests {
                     proto: HirProtoRef(1),
                     captures: vec![HirCapture {
                         mode: HirCaptureMode::ByReference,
-                        value: HirExpr::TempRef(candidate),
+                        binding: crate::hir::HirBinding::Temp(candidate),
                     }],
                 })),
             ),
@@ -995,10 +995,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1009,7 +1009,7 @@ mod tests {
                     proto: HirProtoRef(1),
                     captures: vec![HirCapture {
                         mode: HirCaptureMode::ByReference,
-                        value: HirExpr::TempRef(candidate),
+                        binding: crate::hir::HirBinding::Temp(candidate),
                     }],
                 })),
             ),
@@ -1037,10 +1037,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1052,7 +1052,7 @@ mod tests {
                     proto: HirProtoRef(1),
                     captures: vec![HirCapture {
                         mode: HirCaptureMode::ByValue,
-                        value: HirExpr::TempRef(candidate),
+                        binding: crate::hir::HirBinding::Temp(candidate),
                     }],
                 })),
             ),
@@ -1075,10 +1075,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1107,10 +1107,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1142,10 +1142,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1174,10 +1174,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1205,10 +1205,10 @@ mod tests {
         let closure = LocalId(0);
         let flag = LocalId(1);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure, flag];
+        proto.local_count = closure.index().max(flag.index()) + 1;
         proto.local_debug_hints = vec![None, None];
         proto.local_debug_scopes = vec![None, None];
         proto.body.stmts = vec![
@@ -1248,7 +1248,7 @@ mod tests {
         let mut proto = empty_test_proto();
         proto.params = vec![closure];
         proto.param_debug_hints = vec![None];
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1286,7 +1286,7 @@ mod tests {
         let mut proto = empty_test_proto();
         proto.upvalues = vec![upvalue];
         proto.upvalue_debug_hints = vec![None];
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1317,10 +1317,10 @@ mod tests {
         let candidate = TempId(0);
         let closure = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
-        proto.locals = vec![closure];
+        proto.local_count = closure.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1360,7 +1360,7 @@ mod tests {
         let candidate = TempId(0);
         let home = HomeSlotKey::new(0, 0);
         let mut proto = empty_test_proto();
-        proto.temps = vec![candidate];
+        proto.temp_count = candidate.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1396,7 +1396,7 @@ mod tests {
         let observer = LocalId(1);
         let home = HomeSlotKey::new(0, 0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate, observer];
+        proto.local_count = candidate.index().max(observer.index()) + 1;
         proto.local_debug_hints = vec![None, None];
         proto.local_debug_scopes = vec![None, None];
         proto.body.stmts = vec![
@@ -1480,7 +1480,7 @@ mod tests {
         let candidate = LocalId(0);
         let join = HirLabelId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1518,7 +1518,7 @@ mod tests {
         let flag = LocalId(1);
         let join = HirLabelId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate, flag];
+        proto.local_count = candidate.index().max(flag.index()) + 1;
         proto.local_debug_hints = vec![None, None];
         proto.local_debug_scopes = vec![None, None];
         proto.body.stmts = vec![
@@ -1565,7 +1565,7 @@ mod tests {
         let candidate = LocalId(0);
         let head = HirLabelId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1601,7 +1601,7 @@ mod tests {
     fn old_value_plan_keeps_a_physical_root_local_write() {
         let candidate = LocalId(0);
         let mut proto = empty_test_proto();
-        proto.locals = vec![candidate];
+        proto.local_count = candidate.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
         proto.physical_root_locals.insert(candidate);
@@ -1657,10 +1657,10 @@ mod tests {
 
     fn raw_home_shell_with_external_local_read(observer: LocalId, target: TempId) -> HirProto {
         let mut proto = empty_test_proto();
-        proto.locals = vec![observer];
+        proto.local_count = observer.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![None];
-        proto.temps = vec![target];
+        proto.temp_count = target.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![None];
         proto.body.stmts = vec![
@@ -1686,7 +1686,11 @@ mod tests {
         second_value: HirExpr,
     ) -> HirProto {
         let mut proto = empty_test_proto();
-        proto.temps = vec![target, first_seed, second_seed];
+        proto.temp_count = target
+            .index()
+            .max(first_seed.index())
+            .max(second_seed.index())
+            + 1;
         proto.temp_debug_locals = vec![None, None, None];
         proto.temp_debug_scopes = vec![None, None, None];
         proto.body.stmts = vec![
@@ -1714,7 +1718,7 @@ mod tests {
             proto: HirProtoRef(1),
             captures: vec![HirCapture {
                 mode: HirCaptureMode::ByReference,
-                value,
+                binding: crate::hir::HirBinding::from_expr(&value).unwrap(),
             }],
         }))
     }
@@ -1769,7 +1773,7 @@ mod tests {
             },
             params: Vec::new(),
             param_debug_hints: Vec::new(),
-            locals: Vec::new(),
+            local_count: 0,
             vararg_param_local: None,
             local_debug_hints: Vec::new(),
             local_debug_scopes: Vec::new(),
@@ -1781,7 +1785,7 @@ mod tests {
             environment_upvalues: BTreeSet::new(),
             mutable_upvalues: BTreeSet::new(),
             upvalue_debug_hints: Vec::new(),
-            temps: Vec::new(),
+            temp_count: 0,
             temp_debug_locals: Vec::new(),
             temp_debug_scopes: Vec::new(),
             exit_requirements: Vec::new(),

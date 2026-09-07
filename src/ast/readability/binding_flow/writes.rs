@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use crate::ast::common::{AstBindingRef, AstFunctionExpr, AstNameRef, AstStmt};
-use crate::ast::readability::visit::{self, AstVisitor, NameAccess};
+use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 #[derive(Default)]
 struct NameWrites {

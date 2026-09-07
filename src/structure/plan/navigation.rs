@@ -6,6 +6,8 @@
 //! 从 island 落底后结束 branch。这里不替代 loop 的 break/continue/条件出口分类。
 //! 构建时先冻结不依赖 sibling 顺序的拓扑供 layout 排序，排序完成后才冻结完成路径；
 //! RegionArena 只发布 finish_layout 返回的最终索引。
+//! reachable block 按最终 owner 的 Euler 位置只存一份，子树查询借用连续区间；
+//! 例如 island 直接拥有的块与其 structured child 的块共同属于 island，不能只枚举 Block 节点。
 
 use crate::structure::{BlockRef, Cfg, EdgeRef, StructurePlan};
 
@@ -57,6 +59,8 @@ pub struct RegionNavigation {
     pub(super) postorder: Vec<RegionId>,
     pub(super) preorder_index: Vec<usize>,
     pub(super) subtree_end: Vec<usize>,
+    reachable_blocks_by_owner: Vec<BlockRef>,
+    owned_block_offsets: Vec<usize>,
     edge_relations: Vec<EdgeRegionRelation>,
     boundaries: Vec<RegionBoundarySummary>,
     has_unstructured_ancestor: Vec<bool>,
@@ -155,6 +159,8 @@ impl RegionNavigation {
             postorder,
             preorder_index,
             subtree_end,
+            reachable_blocks_by_owner: Vec::new(),
+            owned_block_offsets: Vec::new(),
             edge_relations: vec![EdgeRegionRelation::default(); cfg.edges.len()],
             boundaries: vec![RegionBoundarySummary::default(); regions.len()],
             has_unstructured_ancestor: vec![false; regions.len()],
@@ -163,7 +169,50 @@ impl RegionNavigation {
         };
         navigation.freeze_region_facts(regions)?;
         navigation.freeze_edges_and_boundaries(cfg, region_by_block, &children)?;
+        navigation.freeze_owned_blocks(cfg, region_by_block)?;
         Ok(navigation)
+    }
+
+    fn freeze_owned_blocks(
+        &mut self,
+        cfg: &Cfg,
+        region_by_block: &[Option<RegionId>],
+    ) -> Result<(), StructureError> {
+        self.owned_block_offsets = vec![0; self.preorder.len() + 1];
+        for block in &cfg.reachable_blocks {
+            let Some(owner) = region_by_block.get(block.index()).copied().flatten() else {
+                continue;
+            };
+            let position = self.preorder_index.get(owner.index()).ok_or_else(|| {
+                StructureError::invalid("reachable block references a missing region")
+            })?;
+            self.owned_block_offsets[position + 1] += 1;
+        }
+        for position in 1..self.owned_block_offsets.len() {
+            self.owned_block_offsets[position] += self.owned_block_offsets[position - 1];
+        }
+        let mut next = self.owned_block_offsets[..self.preorder.len()].to_vec();
+        self.reachable_blocks_by_owner =
+            vec![BlockRef::default(); self.owned_block_offsets[self.preorder.len()]];
+        for block in &cfg.reachable_blocks {
+            let Some(owner) = region_by_block.get(block.index()).copied().flatten() else {
+                continue;
+            };
+            let position = self.preorder_index[owner.index()];
+            self.reachable_blocks_by_owner[next[position]] = *block;
+            next[position] += 1;
+        }
+        Ok(())
+    }
+
+    /// 按 containment 查询可达块；返回顺序不代表 CFG 或源码执行顺序。
+    pub(crate) fn blocks(&self, region: RegionId) -> &[BlockRef] {
+        let Some(&start) = self.preorder_index.get(region.index()) else {
+            return &[];
+        };
+        let end = self.subtree_end[region.index()];
+        &self.reachable_blocks_by_owner
+            [self.owned_block_offsets[start]..self.owned_block_offsets[end]]
     }
 
     pub(super) fn finish_layout(mut self, regions: &[RegionPlan]) -> Result<Self, StructureError> {

@@ -281,8 +281,8 @@ impl PlanLoweringIndex {
         }
         let absorbed_region_result_moves =
             build_absorbed_region_result_moves(proto, lowering, &edge_action_use_count)?;
-        let mut seen_ssa_temps = vec![false; lowering.bindings.temps.len()];
-        let mut shared_ssa_temps = vec![false; lowering.bindings.temps.len()];
+        let mut seen_ssa_temps = vec![false; lowering.bindings.temp_count];
+        let mut shared_ssa_temps = vec![false; lowering.bindings.temp_count];
         for temp in lowering
             .bindings
             .fixed_temps

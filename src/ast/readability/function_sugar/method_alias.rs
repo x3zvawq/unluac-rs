@@ -15,13 +15,13 @@
 use super::super::binding_flow::{BindingUseIndex, BindingWriteIndex, MutableSnapshotNames};
 use super::super::binding_ref::name_matches_binding;
 use super::super::expr_analysis::is_stable_context_expr;
-use super::super::visit::{AstVisitor, visit_block};
 use crate::ast::common::{
     AstBindingRef, AstCallExpr, AstCallKind, AstCallStmt, AstExpr, AstGlobalDecl, AstIf,
     AstLocalAttr, AstLocalBinding, AstLocalOrigin, AstMethodCallExpr, AstModule, AstNameRef,
     AstReturn, AstStmt,
 };
 use crate::ast::readability::walk::{self, AstRewritePass};
+use crate::ast::visit::{AstVisitor, visit_block};
 use crate::hir::HirMethodRewriteTransactionId;
 
 #[derive(Default)]

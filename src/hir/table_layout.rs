@@ -116,7 +116,7 @@ impl RuntimeTableOperands<'_> {
                 );
             },
             table_constructor(table) => { self.table(table); },
-            capture(capture) => { self.expr(&mut capture.value); }
+            capture(_capture) => {}
         );
     }
 

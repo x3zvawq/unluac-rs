@@ -37,7 +37,7 @@ use super::binding::{
     record_binding_merge,
 };
 use super::prune::RedundantSelfAssignPrunePass;
-use super::reads::BindingReadCollector;
+use super::reads::{BindingMentionIndex, BindingReadCollector, BlockMentions};
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
 struct LoopUpdateFold {
@@ -48,8 +48,8 @@ struct LoopUpdateFold {
     writeback: HirStmt,
 }
 
-struct LoopUpdateBlockFacts {
-    last_local_mentions: BTreeMap<LocalId, usize>,
+struct LoopUpdateBlockFacts<'a> {
+    mentions: BlockMentions<'a>,
     label_refs: BTreeMap<HirLabelId, usize>,
     expr_safety: HirExprSafety,
 }
@@ -64,13 +64,25 @@ struct RepeatUpdateSafety<'a> {
 
 pub(super) fn collapse_dead_loop_update_handoffs(
     block: &mut HirBlock,
-    stmt_mentions: &[BTreeSet<CarryBinding>],
+    stmt_mentions: Option<BlockMentions<'_>>,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &mut ProtoPromotionFacts,
     identity_facts: &HandoffIdentityFacts,
     inherited_locals: &BTreeSet<LocalId>,
     expr_safety: HirExprSafety,
 ) -> bool {
+    // 只有 while/repeat owner 消费这些全块事实；其它语句的子块已由后序遍历处理。
+    if !block.stmts.iter().any(|stmt| loop_body(stmt).is_some()) {
+        return false;
+    }
+    let refreshed;
+    let stmt_mentions = match stmt_mentions {
+        Some(mentions) => mentions,
+        None => {
+            refreshed = BindingMentionIndex::new(&block.stmts);
+            refreshed.root()
+        }
+    };
     let captured_locals = stmts_captured_locals(&block.stmts);
     if collapse_repeat_tail_temp_updates(
         block,
@@ -88,7 +100,7 @@ pub(super) fn collapse_dead_loop_update_handoffs(
     }
 
     let block_facts = LoopUpdateBlockFacts {
-        last_local_mentions: last_local_mentions(stmt_mentions),
+        mentions: stmt_mentions,
         label_refs: count_label_references(&block.stmts),
         expr_safety,
     };
@@ -114,17 +126,11 @@ pub(super) fn collapse_dead_loop_update_handoffs(
 
 fn collapse_repeat_tail_temp_updates(
     block: &mut HirBlock,
-    stmt_mentions: &[BTreeSet<CarryBinding>],
+    stmt_mentions: BlockMentions<'_>,
     promotion_facts: &mut ProtoPromotionFacts,
     safety: &RepeatUpdateSafety<'_>,
 ) -> bool {
     let owner_label_refs = count_label_references(&block.stmts);
-    let mut first_mentions = BTreeMap::new();
-    for (index, mentions) in stmt_mentions.iter().enumerate() {
-        for binding in mentions {
-            first_mentions.entry(*binding).or_insert(index);
-        }
-    }
     let writes = collect_top_level_write_facts(&block.stmts);
 
     let mut rewrites = BTreeMap::new();
@@ -191,7 +197,7 @@ fn collapse_repeat_tail_temp_updates(
                 continue;
             }
         }
-        if first_mentions.get(&next_binding).copied() != Some(index)
+        if !stmt_mentions.first_is(index, next_binding)
             || writes.counts.get(&next_binding).copied() != Some(1)
             || writes.last_stmt.get(&state_binding).copied() != Some(index)
         {
@@ -631,22 +637,10 @@ impl HirVisitor for UnresolvedCollector {
     }
 }
 
-fn last_local_mentions(stmt_mentions: &[BTreeSet<CarryBinding>]) -> BTreeMap<LocalId, usize> {
-    let mut last_mentions = BTreeMap::new();
-    for (index, mentions) in stmt_mentions.iter().enumerate() {
-        for binding in mentions {
-            if let CarryBinding::Local(local) = binding {
-                last_mentions.insert(*local, index);
-            }
-        }
-    }
-    last_mentions
-}
-
 fn find_fold(
     stmt: &HirStmt,
     stmt_index: usize,
-    block_facts: &LoopUpdateBlockFacts,
+    block_facts: &LoopUpdateBlockFacts<'_>,
     captured_locals: &BTreeSet<LocalId>,
     outer_bindings: &dyn BindingProtection,
     promotion_facts: &ProtoPromotionFacts,
@@ -656,8 +650,12 @@ fn find_fold(
     let (writeback, prefix) = body.stmts.split_last()?;
     let (carried, next) = exact_local_writeback(writeback)?;
     if carried == next
-        || block_facts.last_local_mentions.get(&carried).copied() != Some(stmt_index)
-        || block_facts.last_local_mentions.get(&next).copied() != Some(stmt_index)
+        || !block_facts
+            .mentions
+            .last_is(stmt_index, CarryBinding::Local(carried))
+        || !block_facts
+            .mentions
+            .last_is(stmt_index, CarryBinding::Local(next))
         || captured_locals.contains(&carried)
         || captured_locals.contains(&next)
         || outer_bindings.contains(&CarryBinding::Local(carried))
@@ -963,10 +961,10 @@ mod tests {
     }
 
     fn run_fold(block: &mut HirBlock, promotion_facts: &mut ProtoPromotionFacts) -> bool {
-        let stmt_mentions = super::super::reads::collect_binding_mentions_by_stmt(&block.stmts);
+        let stmt_mentions = super::super::reads::BindingMentionIndex::new(&block.stmts);
         collapse_dead_loop_update_handoffs(
             block,
-            &stmt_mentions,
+            Some(stmt_mentions.root()),
             &BTreeSet::<CarryBinding>::new(),
             promotion_facts,
             &empty_identity_facts(),
@@ -991,7 +989,7 @@ mod tests {
                 ),
             ],
         };
-        let stmt_mentions = super::super::reads::collect_binding_mentions_by_stmt(&block.stmts);
+        let stmt_mentions = super::super::reads::BindingMentionIndex::new(&block.stmts);
         let outer_bindings = BTreeSet::<CarryBinding>::new();
         let inherited_locals = BTreeSet::new();
         let identity_facts = empty_identity_facts();
@@ -999,7 +997,7 @@ mod tests {
 
         let changed = collapse_dead_loop_update_handoffs(
             &mut block,
-            &stmt_mentions,
+            Some(stmt_mentions.root()),
             &outer_bindings,
             &mut promotion_facts,
             &identity_facts,
@@ -1043,7 +1041,7 @@ mod tests {
             ],
         };
         let before = block.clone();
-        let stmt_mentions = super::super::reads::collect_binding_mentions_by_stmt(&block.stmts);
+        let stmt_mentions = super::super::reads::BindingMentionIndex::new(&block.stmts);
         let outer_bindings = BTreeSet::<CarryBinding>::new();
         let inherited_locals = BTreeSet::new();
         let identity_facts = empty_identity_facts();
@@ -1051,7 +1049,7 @@ mod tests {
 
         let changed = collapse_dead_loop_update_handoffs(
             &mut block,
-            &stmt_mentions,
+            Some(stmt_mentions.root()),
             &outer_bindings,
             &mut promotion_facts,
             &identity_facts,

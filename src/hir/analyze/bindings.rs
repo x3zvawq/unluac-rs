@@ -101,7 +101,7 @@ pub(super) fn build_bindings(
         .map(Reg)
         .map(|reg| captured_slot_epochs.tracks_reference_capture(reg))
         .collect::<Vec<_>>();
-    let mut locals = Vec::new();
+    let mut local_count = 0;
     let mut local_debug_hints = Vec::new();
     let mut entry_local_regs = BTreeMap::new();
     let mut numeric_for_locals = BTreeMap::new();
@@ -135,8 +135,8 @@ pub(super) fn build_bindings(
 
     let vararg_param_local = if proto.signature.has_vararg_param_reg {
         let reg = crate::transformer::Reg(usize::from(proto.signature.num_params));
-        let local = LocalId(locals.len());
-        locals.push(local);
+        let local = LocalId(local_count);
+        local_count += 1;
         local_debug_hints.push(debug_local_name_for_reg_at_pc(proto, reg, 0));
         if entry_reg_is_observed(dataflow, structure.plan(), reg) {
             entry_local_regs.insert(reg, local);
@@ -150,7 +150,7 @@ pub(super) fn build_bindings(
         proto,
         structure,
         &mut entry_local_regs,
-        &mut locals,
+        &mut local_count,
         &mut local_debug_hints,
     );
 
@@ -167,7 +167,7 @@ pub(super) fn build_bindings(
             loop_body_blocks: &loop_body_blocks,
         },
         &mut entry_local_regs,
-        &mut locals,
+        &mut local_count,
         &mut local_debug_hints,
     );
 
@@ -180,8 +180,8 @@ pub(super) fn build_bindings(
         };
         match loop_plan.source_bindings {
             Some(LoopSourceBindings::Numeric(reg)) => {
-                let local = LocalId(locals.len());
-                locals.push(local);
+                let local = LocalId(local_count);
+                local_count += 1;
                 local_debug_hints.push(
                     debug_local_name_for_reg_in_blocks(proto, cfg, body_blocks, reg).or_else(
                         || {
@@ -206,8 +206,8 @@ pub(super) fn build_bindings(
             Some(LoopSourceBindings::Generic(bindings)) => {
                 let mut locals_for_loop = Vec::with_capacity(bindings.len);
                 for offset in 0..bindings.len {
-                    let local = LocalId(locals.len());
-                    locals.push(local);
+                    let local = LocalId(local_count);
+                    local_count += 1;
                     let reg = crate::transformer::Reg(bindings.start.index() + offset);
                     local_debug_hints.push(
                         debug_local_name_for_reg_in_blocks(proto, cfg, body_blocks, reg).or_else(
@@ -351,7 +351,6 @@ pub(super) fn build_bindings(
         })
         .collect::<Vec<_>>();
 
-    let temps = (0..next_temp_index).map(TempId).collect::<Vec<_>>();
     let mut temp_debug_locals = vec![None; next_temp_index];
     let mut temp_debug_scopes = vec![None; next_temp_index];
 
@@ -402,7 +401,7 @@ pub(super) fn build_bindings(
             Some((TempId(index), target))
         })
         .collect::<BTreeMap<_, _>>();
-    let mut local_debug_scopes = vec![None; locals.len()];
+    let mut local_debug_scopes = vec![None; local_count];
     for (&scope, &target) in &debug_scope_targets {
         if let BoundSlotTarget::Local(local) = target {
             local_debug_scopes[local.index()] = Some(scope);
@@ -463,13 +462,13 @@ pub(super) fn build_bindings(
     ProtoBindings {
         params,
         param_debug_hints,
-        locals,
+        local_count,
         vararg_param_local,
         local_debug_hints,
         local_debug_scopes,
         upvalues,
         upvalue_debug_hints,
-        temps,
+        temp_count: next_temp_index,
         temp_debug_locals,
         temp_debug_scopes,
         fixed_temps,

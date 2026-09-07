@@ -14,15 +14,15 @@
 use std::mem;
 
 use crate::hir::common::{
-    HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirCaptureMode, HirClosureExpr,
-    HirDecisionExpr, HirDecisionNode, HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue,
-    HirLocalDecl, HirLogicalExpr, HirNumericFor, HirPackTail, HirRecordField, HirStmt,
-    HirTableAccess, HirTableConstructor, HirTableField, HirUnaryExpr, HirValuePack, LocalId,
+    HirAssign, HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionNode,
+    HirDecisionTarget, HirExpr, HirGenericFor, HirIf, HirLValue, HirLocalDecl, HirLogicalExpr,
+    HirNumericFor, HirPackTail, HirRecordField, HirStmt, HirTableAccess, HirTableConstructor,
+    HirTableField, HirUnaryExpr, HirValuePack, LocalId,
 };
 use crate::hir::expr_safety::{HirExprSafety, expr_requires_ordered_snapshot};
 
 use super::eliminate_state::EliminationState;
-use crate::hir::visit::{HirVisitor, visit_expr};
+use crate::hir::visit::any_expr;
 
 pub(super) fn assign_target_supports_direct_materialization(target: &HirLValue) -> bool {
     matches!(
@@ -631,10 +631,6 @@ fn prepare_pure_expr(
             let (prefix, table) = prepare_table_constructor(*table, state, safety);
             (prefix, HirExpr::TableConstructor(Box::new(table)))
         }
-        HirExpr::Closure(closure) => {
-            let (prefix, closure) = prepare_closure(*closure, state, safety);
-            (prefix, HirExpr::Closure(Box::new(closure)))
-        }
         expr => (Vec::new(), expr),
     }
 }
@@ -717,13 +713,6 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
                 fields,
                 trailing_multivalue,
             })))
-        }
-        HirExpr::Closure(closure) => {
-            let mut closure = *closure;
-            for capture in &mut closure.captures {
-                capture.value = collapse_expr_to_pure(capture.value.clone(), safety)?;
-            }
-            Some(HirExpr::Closure(Box::new(closure)))
         }
         expr => Some(expr),
     }
@@ -834,34 +823,6 @@ enum PreparedTableFieldShape {
     Record,
 }
 
-fn prepare_closure(
-    mut closure: HirClosureExpr,
-    state: &mut EliminationState<'_>,
-    safety: HirExprSafety,
-) -> (Vec<HirStmt>, HirClosureExpr) {
-    let mut extracted = OrderedExprExtraction::with_capacity(closure.captures.len());
-    for capture in &mut closure.captures {
-        let value = mem::replace(&mut capture.value, HirExpr::Nil);
-        let by_value = capture.mode == HirCaptureMode::ByValue;
-        let (prefix, value) = if by_value {
-            prepare_pure_expr(value, state, safety)
-        } else {
-            assert!(
-                !expr_contains_eliminable_decision(&value),
-                "by-reference capture must not retain an eliminable decision"
-            );
-            (Vec::new(), value)
-        };
-        let stable = !prefix.is_empty() && matches!(value, HirExpr::LocalRef(_));
-        let changed = !prefix.is_empty();
-        extracted.push(prefix, value, changed, stable, by_value, state);
-    }
-    for (capture, value) in closure.captures.iter_mut().zip(extracted.exprs) {
-        capture.value = value;
-    }
-    (extracted.prefix, closure)
-}
-
 pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety) -> bool {
     let mut changed = match expr {
         HirExpr::TableAccess(access) => {
@@ -915,14 +876,8 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety
             }
             changed
         }
-        HirExpr::Closure(closure) => {
-            let mut changed = false;
-            for capture in &mut closure.captures {
-                changed |= eliminate_condition_expr(&mut capture.value, safety);
-            }
-            changed
-        }
-        HirExpr::Nil
+        HirExpr::Closure(_)
+        | HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
@@ -970,19 +925,7 @@ fn eliminate_condition_call(call: &mut HirCallExpr, safety: HirExprSafety) -> bo
 }
 
 pub(super) fn expr_contains_eliminable_decision(expr: &HirExpr) -> bool {
-    let mut collector = EliminableDecisionCollector { found: false };
-    visit_expr(expr, &mut collector);
-    collector.found
-}
-
-struct EliminableDecisionCollector {
-    found: bool,
-}
-
-impl HirVisitor for EliminableDecisionCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= matches!(expr, HirExpr::Decision(_));
-    }
+    any_expr(expr, &mut |expr| matches!(expr, HirExpr::Decision(_)))
 }
 
 pub(super) fn empty_local_decl(local: LocalId) -> HirStmt {

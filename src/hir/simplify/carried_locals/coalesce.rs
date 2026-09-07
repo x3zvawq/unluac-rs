@@ -48,7 +48,7 @@ pub(super) fn coalesce_disjoint_temps(
     {
         blocked.extend(facts.complete_local_home_slots(local).iter().copied());
     }
-    for &temp in &proto.temps {
+    for temp in (0..proto.temp_count).map(TempId) {
         if proto.physical_root_temps.contains(&temp)
             || facts.is_scope_end_copy_root_temp(temp)
             || facts.is_copy_root_endpoint(temp)

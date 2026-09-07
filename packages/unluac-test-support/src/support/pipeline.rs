@@ -844,19 +844,14 @@ fn run_proto_failure_recovery_contract(
             ),
         ));
     }
-    let first_recovery_local = root
-        .locals
-        .iter()
-        .map(|local| local.index())
-        .max()
-        .map_or(0, |index| index + 1);
+    let first_recovery_local = root.local_count;
     root.detached_children = children
         .iter()
         .enumerate()
         .map(|(index, child)| (LocalId(first_recovery_local + index), *child))
         .collect();
+    root.local_count += root.detached_children.len();
     for (local, _) in &root.detached_children {
-        root.locals.push(*local);
         root.local_debug_hints
             .push(Some(format!("unluac_proto_{}", local.index())));
     }

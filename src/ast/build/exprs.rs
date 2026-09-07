@@ -102,25 +102,25 @@ impl<'a> AstLowerer<'a> {
         let mut capture_names_by_upvalue = BTreeMap::new();
         let mut capture_write_names = BTreeSet::new();
         for (capture_index, capture) in closure.captures.iter().enumerate() {
-            if let Some(name) = self.capture_name_from_hir_expr(owner_proto, &capture.value)? {
-                capture_names_by_upvalue.insert(UpvalueId(capture_index), name);
-            }
-            match &capture.value {
-                HirExpr::ParamRef(param) => {
-                    captured_params.insert(*param);
+            let name = self.lower_capture_name(owner_proto, capture.binding)?;
+            match capture.binding {
+                crate::hir::HirBinding::Param(param) => {
+                    captured_params.insert(param);
                 }
-                value => {
-                    if let Some(binding) = capture_binding_from_hir_expr(value) {
-                        captured_bindings.insert(binding);
-                    }
+                crate::hir::HirBinding::Local(local) => {
+                    captured_bindings.insert(crate::ast::common::AstBindingRef::Local(local));
                 }
+                crate::hir::HirBinding::Temp(temp) => {
+                    captured_bindings.insert(crate::ast::common::AstBindingRef::Temp(temp));
+                }
+                crate::hir::HirBinding::Upvalue(_) => {}
             }
             if capture.mode == HirCaptureMode::ByReference
                 && child.mutable_upvalues.contains(&UpvalueId(capture_index))
-                && let Some(name) = self.capture_name_from_hir_expr(owner_proto, &capture.value)?
             {
-                capture_write_names.insert(name);
+                capture_write_names.insert(name.clone());
             }
+            capture_names_by_upvalue.insert(UpvalueId(capture_index), name);
         }
         Ok(AstFunctionExpr {
             function: closure.proto,
@@ -484,17 +484,17 @@ impl<'a> AstLowerer<'a> {
         Ok(AstNameRef::Environment)
     }
 
-    fn capture_name_from_hir_expr(
+    fn lower_capture_name(
         &self,
         owner_proto: usize,
-        expr: &HirExpr,
-    ) -> Result<Option<AstNameRef>, AstLowerError> {
-        Ok(match expr {
-            HirExpr::ParamRef(param) => Some(AstNameRef::Param(*param)),
-            HirExpr::LocalRef(local) => Some(AstNameRef::Local(*local)),
-            HirExpr::TempRef(temp) => Some(AstNameRef::Temp(*temp)),
-            HirExpr::UpvalueRef(upvalue) => Some(self.lower_upvalue_name(owner_proto, *upvalue)?),
-            _ => None,
+        binding: crate::hir::HirBinding,
+    ) -> Result<AstNameRef, AstLowerError> {
+        use crate::hir::HirBinding;
+        Ok(match binding {
+            HirBinding::Param(param) => AstNameRef::Param(param),
+            HirBinding::Local(local) => AstNameRef::Local(local),
+            HirBinding::Temp(temp) => AstNameRef::Temp(temp),
+            HirBinding::Upvalue(upvalue) => self.lower_upvalue_name(owner_proto, upvalue)?,
         })
     }
 }
@@ -533,14 +533,6 @@ fn build_balanced_logical_expr(
 pub(super) enum PackLoweringContext {
     Ordinary,
     TargetCounted(usize),
-}
-
-fn capture_binding_from_hir_expr(expr: &HirExpr) -> Option<crate::ast::common::AstBindingRef> {
-    match expr {
-        HirExpr::LocalRef(local) => Some(crate::ast::common::AstBindingRef::Local(*local)),
-        HirExpr::TempRef(temp) => Some(crate::ast::common::AstBindingRef::Temp(*temp)),
-        _ => None,
-    }
 }
 
 fn lower_access_expr<T, FField, FIndex>(

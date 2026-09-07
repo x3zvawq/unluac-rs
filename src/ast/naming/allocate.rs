@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::{HirProto, HirProtoRef};
+use crate::hir::{HirProto, HirProtoRef, LocalId};
 
 use super::NamingError;
 use super::ast_facts::{AstNamingFacts, FunctionAstNamingFacts};
@@ -215,13 +215,11 @@ pub(super) fn assign_names_for_function(
         })
         .collect::<Vec<_>>();
 
-    let locals = proto
-        .locals
-        .iter()
-        .enumerate()
-        .map(|(index, local)| {
+    let locals = (0..proto.local_count)
+        .map(LocalId)
+        .map(|local| {
             names.allocate(module_names.reserve_function_shape_name(
-                choose_local_candidate(proto, *local, index, evidence, hints, ast_facts, options),
+                choose_local_candidate(proto, local, evidence, hints, ast_facts, options),
                 &names,
                 options.mode,
             ))

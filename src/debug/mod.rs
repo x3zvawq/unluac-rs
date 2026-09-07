@@ -10,11 +10,12 @@
 
 #[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
 mod colorize;
+#[cfg(feature = "decompile-debug")]
 mod focus;
 
 #[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
 pub(crate) use colorize::colorize_debug_text;
-pub use focus::ProtoDepth;
+#[cfg(feature = "decompile-debug")]
 pub(crate) use focus::{
     FocusPlan, FocusRequest, ProtoNode, ProtoSummaryRow, build_proto_nodes, compute_focus_plan,
     format_breadcrumb, format_proto_summary_row,
@@ -117,11 +118,35 @@ impl DebugColorMode {
     }
 }
 
+/// proto 向下展开的层数语义。
+///
+/// `Fixed(N)` 表示相对焦点 proto 向下展开 N 层；`All` 表示不设上限（等价于旧的全量行为）。
+/// 默认值 `Fixed(0)` 意味着只展开焦点本身，子 proto 以占位行出现。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProtoDepth {
+    Fixed(usize),
+    All,
+}
+
+impl Default for ProtoDepth {
+    fn default() -> Self {
+        Self::Fixed(0)
+    }
+}
+
+impl fmt::Display for ProtoDepth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fixed(n) => write!(f, "{n}"),
+            Self::All => f.write_str("all"),
+        }
+    }
+}
+
 /// 统一过滤器。proto 决定「聚焦哪一个 proto」，proto_depth 决定「从聚焦点向下展开多少层」。
 ///
-/// 历史上这个结构只有 proto 一项，且 `proto=None` 表示全量。现在我们引入 proto_depth
-/// 之后仍然保留「库层默认=全量」的语义（`Default` = `ProtoDepth::All`），让库内
-/// 单测/诊断打印不会因默认值改变而突然变少；CLI 层自行把默认改成 `Fixed(0)`。
+/// 默认只展开焦点 proto；`unfiltered()` 显式选择整棵树。选项类型在关闭 debug 特性时
+/// 仍然可用，聚焦计算及渲染只在启用 `decompile-debug` 时编译。
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct DebugFilters {
     pub proto: Option<usize>,
@@ -130,6 +155,7 @@ pub struct DebugFilters {
 
 impl DebugFilters {
     /// 把 `DebugFilters` 投射成 `FocusRequest`，方便传给 `compute_focus_plan`。
+    #[cfg(feature = "decompile-debug")]
     pub(crate) fn as_focus_request(&self) -> FocusRequest {
         FocusRequest {
             proto: self.proto,
@@ -137,10 +163,7 @@ impl DebugFilters {
         }
     }
 
-    /// 旧的「全量、不过滤」语义。库内诊断用途（如单测失败时 dump 全部 HIR）使用这个。
-    ///
-    /// `Default` 实现走的是「默认只看入口 proto」的新语义，所以当你真的想要
-    /// 旧的全量行为时请显式走这个构造器。
+    /// 展开整棵 proto 树，例如测试失败时查看完整 HIR。
     pub fn unfiltered() -> Self {
         Self {
             proto: None,

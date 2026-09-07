@@ -12,7 +12,7 @@ pub(super) fn allocate_debug_entry_bindings(
     proto: &LoweredProto,
     structure: &ReadyStructureFacts,
     entry_local_regs: &mut BTreeMap<Reg, LocalId>,
-    locals: &mut Vec<LocalId>,
+    local_count: &mut usize,
     local_debug_hints: &mut Vec<Option<String>>,
 ) -> (Vec<LocalId>, BTreeMap<usize, BoundSlotTarget>) {
     let param_count = usize::from(proto.signature.num_params);
@@ -40,8 +40,8 @@ pub(super) fn allocate_debug_entry_bindings(
         let local = if let Some(local) = entry_local_regs.get(&reg).copied() {
             local
         } else {
-            let local = LocalId(locals.len());
-            locals.push(local);
+            let local = LocalId(*local_count);
+            *local_count += 1;
             local_debug_hints.push(Some(decode_raw_string(&debug_local.name)));
             entry_local_regs.insert(reg, local);
             declarations.push(local);

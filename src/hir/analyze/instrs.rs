@@ -587,7 +587,10 @@ fn lower_shared_capture_barrier(
         let capture =
             lower_closure_capture(lowering, block, instr_ref, closure.dst, sources[index]);
         locals.push(*local);
-        fields.push(HirTableField::Array(capture.value));
+        fields.push(HirTableField::Array(match capture {
+            Ok(capture) => capture.binding.expr(),
+            Err(error) => HirExpr::Unresolved(Box::new(error)),
+        }));
     }
     let table = HirExpr::TableConstructor(Box::new(HirTableConstructor {
         allocation: Default::default(),

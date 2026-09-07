@@ -2,18 +2,24 @@
 //!
 //! 候选必须来自 promotion 保留的 direct canonical phi provenance。分析以可信的
 //! `(slot, close epoch)` 为身份，分别传播普通落空、`break` 与 `continue` 状态；循环对
-//! 回边求有限不动点。分析阶段只记录路径，验证成功后才在原 HIR 上一次性提交删除。
+//! 回边求有限不动点。临时导航共用路径栈，只有保留的计划键拥有路径；验证成功后才
+//! 在原 HIR 上一次性提交删除。
 //! reference capture 本身不会让 `nil = nil` 变得可观察，但 capture 逃逸后的调用或
 //! `__close` 可能回写该 cell，因此会把值状态降为 unknown。当前 block 的单调前向
 //! goto 由共享 `LexicalCfg` 精确消费；后置嵌套 island 的自含回环只停用它自身，不会
 //! 抹掉此前已证明的入口 nil 事实。
+//! capture 直接按父级绑定查询可能 home；例如已知 home-free 的 Local 不暴露入口槽，
+//! 未知 home 仍保守视为可能别名，不从临时表达式树重新识别捕获身份。
 
 use std::collections::BTreeSet;
 
-use crate::hir::simplify::stmt_plan::{PathComponent, StmtPath, remove_planned_stmts};
+use crate::hir::simplify::stmt_plan::{
+    PathComponent, StmtPath, remove_planned_stmts, with_path_component,
+};
 
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
+    TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -224,15 +230,20 @@ struct EntryNilAnalyzer<'a> {
 impl EntryNilAnalyzer<'_> {
     fn analyze_if(&mut self, if_stmt: &HirIf, incoming: NilStates) -> Result<NilFlow, PruneError> {
         let states = self.evaluate_expr(&if_stmt.cond, incoming)?;
+        let path = &mut Vec::new();
         let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
             NilFlow::default()
         } else {
-            self.analyze_block(&if_stmt.then_block, &[PathComponent::Then], states.clone())?
+            with_path_component(path, PathComponent::Then, |path| {
+                self.analyze_block(&if_stmt.then_block, path, states.clone())
+            })?
         };
         let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
             NilFlow::default()
         } else if let Some(else_block) = &if_stmt.else_block {
-            self.analyze_block(else_block, &[PathComponent::Else], states)?
+            with_path_component(path, PathComponent::Else, |path| {
+                self.analyze_block(else_block, path, states)
+            })?
         } else {
             NilFlow::fallthrough(states)
         };
@@ -242,7 +253,7 @@ impl EntryNilAnalyzer<'_> {
     fn analyze_block(
         &mut self,
         block: &HirBlock,
-        prefix: &[PathComponent],
+        prefix: &mut StmtPath,
         mut states: NilStates,
     ) -> Result<NilFlow, PruneError> {
         let Ok(cfg) = LexicalCfg::analyze(&block.stmts, self.owner_label_refs, self.safety) else {
@@ -264,9 +275,9 @@ impl EntryNilAnalyzer<'_> {
                     .expect("validated forward goto must retain its local label");
                 continue;
             }
-            let mut path = prefix.to_vec();
-            path.push(PathComponent::Stmt(index));
-            let flow = self.analyze_stmt(stmt, &path, states)?;
+            let flow = with_path_component(prefix, PathComponent::Stmt(index), |path| {
+                self.analyze_stmt(stmt, path, states)
+            })?;
             states = flow.fallthrough;
             breaks = breaks.union(flow.breaks);
             continues = continues.union(flow.continues);
@@ -282,15 +293,15 @@ impl EntryNilAnalyzer<'_> {
     fn analyze_unstructured_block(
         &mut self,
         block: &HirBlock,
-        prefix: &[PathComponent],
+        prefix: &mut StmtPath,
     ) -> Result<NilFlow, PruneError> {
         let conservative = NilStates::unknown();
         let mut states = conservative.clone();
         for (index, stmt) in block.stmts.iter().enumerate() {
-            let mut path = prefix.to_vec();
-            path.push(PathComponent::Stmt(index));
             if stmt_contains_nested_nonlocal_control(stmt) {
-                self.analyze_unstructured_children(stmt, &path)?;
+                with_path_component(prefix, PathComponent::Stmt(index), |path| {
+                    self.analyze_unstructured_children(stmt, path)
+                })?;
                 // 分析停用[SemanticBarrier:ControlFlow]：label/goto 可绕过此前 nil 写，回边
                 // 还会带入上一轮值；`::L:: x=nil; x={}; goto L` 的第二轮旧值并非 nil。
                 states = conservative.clone();
@@ -299,7 +310,10 @@ impl EntryNilAnalyzer<'_> {
             if states.is_empty() {
                 continue;
             }
-            states = self.analyze_stmt(stmt, &path, states)?.fallthrough;
+            states = with_path_component(prefix, PathComponent::Stmt(index), |path| {
+                self.analyze_stmt(stmt, path, states)
+            })?
+            .fallthrough;
         }
         Ok(NilFlow {
             fallthrough: conservative.clone(),
@@ -311,12 +325,12 @@ impl EntryNilAnalyzer<'_> {
     fn analyze_unstructured_children(
         &mut self,
         stmt: &HirStmt,
-        path: &StmtPath,
+        path: &mut StmtPath,
     ) -> Result<(), PruneError> {
         let mut analyze = |block: &HirBlock, component| {
-            let mut prefix = path.clone();
-            prefix.push(component);
-            self.analyze_unstructured_block(block, &prefix).map(|_| ())
+            with_path_component(path, component, |path| {
+                self.analyze_unstructured_block(block, path).map(|_| ())
+            })
         };
         match stmt {
             HirStmt::LocalRootRelease(_) => {}
@@ -351,7 +365,7 @@ impl EntryNilAnalyzer<'_> {
     fn analyze_stmt(
         &mut self,
         stmt: &HirStmt,
-        path: &StmtPath,
+        path: &mut StmtPath,
         states: NilStates,
     ) -> Result<NilFlow, PruneError> {
         match stmt {
@@ -378,38 +392,34 @@ impl EntryNilAnalyzer<'_> {
             }
             HirStmt::If(if_stmt) => {
                 let states = self.evaluate_expr(&if_stmt.cond, states)?;
-                let mut then_prefix = path.clone();
-                then_prefix.push(PathComponent::Then);
                 let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
                     NilFlow::default()
                 } else {
-                    self.analyze_block(&if_stmt.then_block, &then_prefix, states.clone())?
+                    with_path_component(path, PathComponent::Then, |path| {
+                        self.analyze_block(&if_stmt.then_block, path, states.clone())
+                    })?
                 };
                 let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
                     NilFlow::default()
                 } else if let Some(else_block) = &if_stmt.else_block {
-                    let mut else_prefix = path.clone();
-                    else_prefix.push(PathComponent::Else);
-                    self.analyze_block(else_block, &else_prefix, states)?
+                    with_path_component(path, PathComponent::Else, |path| {
+                        self.analyze_block(else_block, path, states)
+                    })?
                 } else {
                     NilFlow::fallthrough(states)
                 };
                 Ok(union_flows(then_flow, else_flow))
             }
-            HirStmt::Block(block) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_block(block, &body_prefix, states)
-            }
-            HirStmt::While(while_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_while(&while_stmt.body, &while_stmt.cond, &body_prefix, states)
-            }
+            HirStmt::Block(block) => with_path_component(path, PathComponent::Body, |path| {
+                self.analyze_block(block, path, states)
+            }),
+            HirStmt::While(while_stmt) => with_path_component(path, PathComponent::Body, |path| {
+                self.analyze_while(&while_stmt.body, &while_stmt.cond, path, states)
+            }),
             HirStmt::Repeat(repeat_stmt) => {
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_repeat(&repeat_stmt.body, &repeat_stmt.cond, &body_prefix, states)
+                with_path_component(path, PathComponent::Body, |path| {
+                    self.analyze_repeat(&repeat_stmt.body, &repeat_stmt.cond, path, states)
+                })
             }
             HirStmt::NumericFor(numeric_for) => {
                 if numeric_for.binding == self.local {
@@ -420,16 +430,16 @@ impl EntryNilAnalyzer<'_> {
                     states,
                 )?;
                 let body_states = self.write_local_binding(numeric_for.binding, states.clone());
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_zero_or_more(
-                    &numeric_for.body,
-                    &body_prefix,
-                    states,
-                    body_states,
-                    &[numeric_for.binding],
-                    false,
-                )
+                with_path_component(path, PathComponent::Body, |path| {
+                    self.analyze_zero_or_more(
+                        &numeric_for.body,
+                        path,
+                        states,
+                        body_states,
+                        &[numeric_for.binding],
+                        false,
+                    )
+                })
             }
             HirStmt::GenericFor(generic_for) => {
                 if generic_for.bindings.contains(&self.local) {
@@ -443,16 +453,16 @@ impl EntryNilAnalyzer<'_> {
                 for binding in &generic_for.bindings {
                     body_states = self.write_local_binding(*binding, body_states);
                 }
-                let mut body_prefix = path.clone();
-                body_prefix.push(PathComponent::Body);
-                self.analyze_zero_or_more(
-                    &generic_for.body,
-                    &body_prefix,
-                    zero_exit,
-                    body_states,
-                    &generic_for.bindings,
-                    true,
-                )
+                with_path_component(path, PathComponent::Body, |path| {
+                    self.analyze_zero_or_more(
+                        &generic_for.body,
+                        path,
+                        zero_exit,
+                        body_states,
+                        &generic_for.bindings,
+                        true,
+                    )
+                })
             }
             HirStmt::Return(_) => {
                 self.evaluate_stmt_exprs(stmt, states)?;
@@ -485,7 +495,7 @@ impl EntryNilAnalyzer<'_> {
         &mut self,
         body: &HirBlock,
         condition: &HirExpr,
-        body_prefix: &[PathComponent],
+        body_prefix: &mut StmtPath,
         incoming: NilStates,
     ) -> Result<NilFlow, PruneError> {
         let truthiness = expr_truthiness(condition, self.safety);
@@ -520,7 +530,7 @@ impl EntryNilAnalyzer<'_> {
         &mut self,
         body: &HirBlock,
         condition: &HirExpr,
-        body_prefix: &[PathComponent],
+        body_prefix: &mut StmtPath,
         incoming: NilStates,
     ) -> Result<NilFlow, PruneError> {
         let truthiness = expr_truthiness(condition, self.safety);
@@ -553,7 +563,7 @@ impl EntryNilAnalyzer<'_> {
     fn analyze_zero_or_more(
         &mut self,
         body: &HirBlock,
-        body_prefix: &[PathComponent],
+        body_prefix: &mut StmtPath,
         zero_exit: NilStates,
         initial_body_entry: NilStates,
         bindings: &[LocalId],
@@ -781,13 +791,17 @@ impl HirVisitor for ExprEffects<'_> {
             | HirExpr::Call(_) => self.has_call = true,
             HirExpr::Decision(_) => self.decision = true,
             HirExpr::Unresolved(_) => self.unresolved = true,
-            HirExpr::Closure(closure) => {
-                self.captures_reference |= closure.captures.iter().any(|capture| {
-                    capture.mode == crate::hir::common::HirCaptureMode::ByReference
-                        && expr_may_reference_home(&capture.value, self.candidate_home, self.facts)
-                });
-            }
             _ => {}
+        }
+    }
+
+    fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
+        if !self.captures_reference && capture.mode == crate::hir::HirCaptureMode::ByReference {
+            self.captures_reference = capture_binding_may_reference_home(
+                capture.binding,
+                self.candidate_home,
+                self.facts,
+            );
         }
     }
 
@@ -800,38 +814,21 @@ impl HirVisitor for ExprEffects<'_> {
     }
 }
 
-fn expr_may_reference_home(
-    expr: &HirExpr,
+fn capture_binding_may_reference_home(
+    binding: crate::hir::HirBinding,
     candidate_home: HomeSlotKey,
     facts: &ProtoPromotionFacts,
 ) -> bool {
-    struct Collector<'a> {
-        candidate_home: HomeSlotKey,
-        facts: &'a ProtoPromotionFacts,
-        may_reference: bool,
-    }
-
-    impl HirVisitor for Collector<'_> {
-        fn visit_expr(&mut self, expr: &HirExpr) {
-            let homes = match expr {
-                HirExpr::LocalRef(local) => self.facts.possible_local_home_slots(*local),
-                HirExpr::ParamRef(param) => self.facts.possible_param_home_slots(*param),
-                HirExpr::TempRef(temp) => self.facts.possible_temp_home_slots(*temp),
-                _ => return,
-            };
-            self.may_reference |= homes
-                .as_ref()
-                .is_none_or(|homes| homes.contains(&self.candidate_home));
-        }
-    }
-
-    let mut collector = Collector {
-        candidate_home,
-        facts,
-        may_reference: false,
+    use crate::hir::HirBinding;
+    let homes = match binding {
+        HirBinding::Local(local) => facts.possible_local_home_slots(local),
+        HirBinding::Param(param) => facts.possible_param_home_slots(param),
+        HirBinding::Temp(temp) => facts.possible_temp_home_slots(temp),
+        HirBinding::Upvalue(_) => return false,
     };
-    visit::visit_expr(expr, &mut collector);
-    collector.may_reference
+    homes
+        .as_ref()
+        .is_none_or(|homes| homes.contains(&candidate_home))
 }
 
 fn apply_if_plan(if_stmt: &mut HirIf, redundant: &BTreeSet<StmtPath>) {
@@ -849,15 +846,13 @@ fn debug_identity_homes(
     proto: &HirProto,
     facts: &ProtoPromotionFacts,
 ) -> Option<BTreeSet<HomeSlotKey>> {
-    let locals = proto
-        .locals
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            matches!(proto.local_debug_hints.get(*index), Some(Some(_)))
-                || matches!(proto.local_debug_scopes.get(*index), Some(Some(_)))
+    let locals = (0..proto.local_count)
+        .map(LocalId)
+        .filter(|local| {
+            matches!(proto.local_debug_hints.get(local.index()), Some(Some(_)))
+                || matches!(proto.local_debug_scopes.get(local.index()), Some(Some(_)))
         })
-        .map(|(_, local)| facts.possible_local_home_slots(*local));
+        .map(|local| facts.possible_local_home_slots(local));
     let params = proto
         .params
         .iter()
@@ -866,15 +861,13 @@ fn debug_identity_homes(
             hint.as_ref()
                 .map(|_| facts.possible_param_home_slots(*param))
         });
-    let temps = proto
-        .temps
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| {
-            matches!(proto.temp_debug_locals.get(*index), Some(Some(_)))
-                || matches!(proto.temp_debug_scopes.get(*index), Some(Some(_)))
+    let temps = (0..proto.temp_count)
+        .map(TempId)
+        .filter(|temp| {
+            matches!(proto.temp_debug_locals.get(temp.index()), Some(Some(_)))
+                || matches!(proto.temp_debug_scopes.get(temp.index()), Some(Some(_)))
         })
-        .map(|(_, temp)| facts.possible_temp_home_slots(*temp));
+        .map(|temp| facts.possible_temp_home_slots(temp));
     // home 映射在本 pass 内不变；未知来源保护任意 home，明确 home-free 则不贡献条目。
     locals
         .chain(params)
@@ -930,7 +923,7 @@ mod tests {
             },
             params: Vec::new(),
             param_debug_hints: Vec::new(),
-            locals: Vec::new(),
+            local_count: 0,
             vararg_param_local: None,
             local_debug_hints: Vec::new(),
             local_debug_scopes: Vec::new(),
@@ -942,7 +935,7 @@ mod tests {
             environment_upvalues: BTreeSet::new(),
             mutable_upvalues: BTreeSet::new(),
             upvalue_debug_hints: Vec::new(),
-            temps: Vec::new(),
+            temp_count: 0,
             temp_debug_locals: Vec::new(),
             temp_debug_scopes: Vec::new(),
             exit_requirements: Vec::new(),
@@ -986,8 +979,8 @@ mod tests {
         facts.record_local_home_slot(debug_local, first);
         facts.record_local_home_merge(debug_local, Some(BTreeSet::from([candidate])));
         let mut proto = empty_proto();
-        proto.locals = vec![debug_local];
-        proto.local_debug_hints = vec![Some("debug".into())];
+        proto.local_count = debug_local.index() + 1;
+        proto.local_debug_hints = vec![None, Some("debug".into())];
 
         assert_eq!(facts.trusted_local_home_slot(debug_local), None);
         assert!(
@@ -1002,10 +995,10 @@ mod tests {
         let local = LocalId(0);
         let temp = crate::hir::TempId(0);
         let mut proto = empty_proto();
-        proto.locals = vec![local];
+        proto.local_count = local.index() + 1;
         proto.local_debug_hints = vec![None];
         proto.local_debug_scopes = vec![Some(1)];
-        proto.temps = vec![temp];
+        proto.temp_count = temp.index() + 1;
         proto.temp_debug_locals = vec![None];
         proto.temp_debug_scopes = vec![Some(2)];
 
@@ -1025,8 +1018,8 @@ mod tests {
         let mut facts = ProtoPromotionFacts::default();
         facts.record_home_free_local(local);
 
-        assert!(!expr_may_reference_home(
-            &HirExpr::LocalRef(local),
+        assert!(!capture_binding_may_reference_home(
+            crate::hir::HirBinding::Local(local),
             HomeSlotKey::new(0, 0),
             &facts,
         ));

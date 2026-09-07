@@ -14,6 +14,7 @@
 //! 判断。
 //! `validate_region_entry` 独立验证区域 label 唯一性和外部入口；只需要检查词法入口的
 //! consumer 直接消费它，完整 CFG 也复用该结果，不为验证边界而构造后继与可达性。
+//! 构图与重入查询的临时词法导航复用路径栈，仅已登记 label 和重入边界拥有路径副本。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -453,10 +454,17 @@ impl LexicalBlockPath {
         Self::default()
     }
 
-    pub(super) fn child(&self, stmt_index: usize, kind: LexicalBlockKind) -> Self {
-        let mut path = self.clone();
-        path.0.push(LexicalBlockStep { stmt_index, kind });
-        path
+    /// 临时导航共享路径栈，先恢复父路径再返回，包括未形成子图的 None/Err。
+    pub(super) fn with_child<R>(
+        &mut self,
+        stmt_index: usize,
+        kind: LexicalBlockKind,
+        visit: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.0.push(LexicalBlockStep { stmt_index, kind });
+        let result = visit(self);
+        self.0.pop();
+        result
     }
 }
 
@@ -585,7 +593,7 @@ impl<'a> HirFlowGraphBuilder<'a> {
         let entry = self
             .build_block(
                 stmts,
-                &LexicalBlockPath::root(),
+                &mut LexicalBlockPath::root(),
                 exit,
                 HirLoopTargets {
                     break_target: None,
@@ -666,7 +674,7 @@ impl<'a> HirFlowGraphBuilder<'a> {
     fn build_block(
         &mut self,
         stmts: &'a [HirStmt],
-        path: &LexicalBlockPath,
+        path: &mut LexicalBlockPath,
         next: HirFlowNodeId,
         loop_targets: HirLoopTargets,
     ) -> Option<HirFlowNodeId> {
@@ -680,7 +688,7 @@ impl<'a> HirFlowGraphBuilder<'a> {
     fn build_stmt(
         &mut self,
         stmt: &'a HirStmt,
-        path: &LexicalBlockPath,
+        path: &mut LexicalBlockPath,
         stmt_index: usize,
         next: HirFlowNodeId,
         loop_targets: HirLoopTargets,
@@ -717,26 +725,17 @@ impl<'a> HirFlowGraphBuilder<'a> {
             HirStmt::Return(_) => {
                 Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), self.function_exit))
             }
-            HirStmt::Block(block) => self.build_block(
-                &block.stmts,
-                &path.child(stmt_index, LexicalBlockKind::Body),
-                next,
-                loop_targets,
-            ),
+            HirStmt::Block(block) => path.with_child(stmt_index, LexicalBlockKind::Body, |path| {
+                self.build_block(&block.stmts, path, next, loop_targets)
+            }),
             HirStmt::If(if_stmt) => {
-                let then_entry = self.build_block(
-                    &if_stmt.then_block.stmts,
-                    &path.child(stmt_index, LexicalBlockKind::Then),
-                    next,
-                    loop_targets,
-                )?;
+                let then_entry = path.with_child(stmt_index, LexicalBlockKind::Then, |path| {
+                    self.build_block(&if_stmt.then_block.stmts, path, next, loop_targets)
+                })?;
                 let else_entry = if let Some(block) = &if_stmt.else_block {
-                    self.build_block(
-                        &block.stmts,
-                        &path.child(stmt_index, LexicalBlockKind::Else),
-                        next,
-                        loop_targets,
-                    )?
+                    path.with_child(stmt_index, LexicalBlockKind::Else, |path| {
+                        self.build_block(&block.stmts, path, next, loop_targets)
+                    })?
                 } else {
                     next
                 };
@@ -746,15 +745,17 @@ impl<'a> HirFlowGraphBuilder<'a> {
             }
             HirStmt::While(while_stmt) => {
                 let condition = self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), []);
-                let body = self.build_block(
-                    &while_stmt.body.stmts,
-                    &path.child(stmt_index, LexicalBlockKind::Body),
-                    condition,
-                    HirLoopTargets {
-                        break_target: Some(next),
-                        continue_target: Some(condition),
-                    },
-                )?;
+                let body = path.with_child(stmt_index, LexicalBlockKind::Body, |path| {
+                    self.build_block(
+                        &while_stmt.body.stmts,
+                        path,
+                        condition,
+                        HirLoopTargets {
+                            break_target: Some(next),
+                            continue_target: Some(condition),
+                        },
+                    )
+                })?;
                 self.set_condition_successors(condition, body, next);
                 Some(condition)
             }
@@ -764,15 +765,17 @@ impl<'a> HirFlowGraphBuilder<'a> {
                     HirFlowNodeKind::RepeatCondition(repeat_stmt),
                     [],
                 );
-                let body = self.build_block(
-                    &repeat_stmt.body.stmts,
-                    &path.child(stmt_index, LexicalBlockKind::Body),
-                    condition,
-                    HirLoopTargets {
-                        break_target: Some(next),
-                        continue_target: Some(condition),
-                    },
-                )?;
+                let body = path.with_child(stmt_index, LexicalBlockKind::Body, |path| {
+                    self.build_block(
+                        &repeat_stmt.body.stmts,
+                        path,
+                        condition,
+                        HirLoopTargets {
+                            break_target: Some(next),
+                            continue_target: Some(condition),
+                        },
+                    )
+                })?;
                 self.set_condition_successors(condition, next, body);
                 Some(body)
             }
@@ -783,15 +786,17 @@ impl<'a> HirFlowGraphBuilder<'a> {
                     HirFlowNodeKind::ForBinding(HirForBindings::Numeric(for_stmt.binding)),
                     [],
                 );
-                let body = self.build_block(
-                    &for_stmt.body.stmts,
-                    &path.child(stmt_index, LexicalBlockKind::Body),
-                    dispatch,
-                    HirLoopTargets {
-                        break_target: Some(next),
-                        continue_target: Some(dispatch),
-                    },
-                )?;
+                let body = path.with_child(stmt_index, LexicalBlockKind::Body, |path| {
+                    self.build_block(
+                        &for_stmt.body.stmts,
+                        path,
+                        dispatch,
+                        HirLoopTargets {
+                            break_target: Some(next),
+                            continue_target: Some(dispatch),
+                        },
+                    )
+                })?;
                 self.nodes[binding.index()].successors.insert(body, None);
                 self.nodes[dispatch.index()]
                     .successors
@@ -812,15 +817,17 @@ impl<'a> HirFlowGraphBuilder<'a> {
                     HirFlowNodeKind::ForBinding(HirForBindings::Generic(flow)),
                     [],
                 );
-                let body = self.build_block(
-                    &for_stmt.body.stmts,
-                    &path.child(stmt_index, LexicalBlockKind::Body),
-                    dispatch,
-                    HirLoopTargets {
-                        break_target: Some(next),
-                        continue_target: Some(dispatch),
-                    },
-                )?;
+                let body = path.with_child(stmt_index, LexicalBlockKind::Body, |path| {
+                    self.build_block(
+                        &for_stmt.body.stmts,
+                        path,
+                        dispatch,
+                        HirLoopTargets {
+                            break_target: Some(next),
+                            continue_target: Some(dispatch),
+                        },
+                    )
+                })?;
                 self.nodes[binding.index()].successors.insert(body, None);
                 self.nodes[dispatch.index()]
                     .successors

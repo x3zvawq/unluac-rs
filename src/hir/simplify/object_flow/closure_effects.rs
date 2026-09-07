@@ -1,15 +1,20 @@
 //! 词法 child-first 闭包效果摘要：把 child upvalue 的写入、逃逸、返回与调用投影到父级。
 //!
+//! capture 直接查询当前 binding 状态；嵌套返回 closure 的效果仍逐层投影到父域。
 //! 消费显式 capture 对应和共享 HIR CFG；例如 factory 返回读取 u0 的 closure，
 //! 调用方获得对应 capture 效果，不靠函数文本或参数位置猜测。对象存活由父模块消费摘要。
+//! 并行赋值只暂存本次 RHS 与索引目标的投影，统一读取写入前状态；例如 a,b=b,a
+//! 交换来源后再提交，不复制无关 binding 或已经累积的效果。合流直接记录集合增长。
+
+use crate::hir::HirBinding;
 
 use super::super::lexical_cfg::{
     FlowRefinement, HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
     HirGenericForFlow,
 };
 use super::{
-    Binding, EffectClosure, EffectValue, ProtoEffects, adjusted_value, binding_from_expr,
-    binding_from_lvalue, closure_captures_in_block, extend_map_sets,
+    EffectClosure, EffectValue, ProtoEffects, adjusted_value, binding_from_lvalue,
+    closure_captures_in_block, extend_map_sets, union_set,
 };
 use crate::hir::common::{
     HirCapture, HirCaptureMode, HirExpr, HirLValue, HirModule, HirProto, HirProtoRef, HirStmt,
@@ -83,9 +88,9 @@ pub(in crate::hir::simplify) fn collect_proto_effects(
 
 #[derive(Clone, Default, Eq, PartialEq)]
 struct EffectState {
-    origins: BTreeMap<Binding, BTreeSet<UpvalueId>>,
-    closures: BTreeMap<Binding, BTreeSet<EffectClosure>>,
-    call_targets: BTreeMap<Binding, BTreeSet<UpvalueId>>,
+    origins: BTreeMap<HirBinding, BTreeSet<UpvalueId>>,
+    closures: BTreeMap<HirBinding, BTreeSet<EffectClosure>>,
+    call_targets: BTreeMap<HirBinding, BTreeSet<UpvalueId>>,
     escapes: BTreeSet<UpvalueId>,
     returns: BTreeSet<EffectValue>,
     calls: BTreeSet<UpvalueId>,
@@ -108,13 +113,13 @@ impl EffectState {
             .upvalues
             .iter()
             .copied()
-            .map(|upvalue| (Binding::Upvalue(upvalue), BTreeSet::from([upvalue])))
+            .map(|upvalue| (HirBinding::Upvalue(upvalue), BTreeSet::from([upvalue])))
             .collect();
         let call_targets = proto
             .upvalues
             .iter()
             .copied()
-            .map(|upvalue| (Binding::Upvalue(upvalue), BTreeSet::from([upvalue])))
+            .map(|upvalue| (HirBinding::Upvalue(upvalue), BTreeSet::from([upvalue])))
             .collect();
         Self {
             origins,
@@ -127,14 +132,14 @@ impl EffectState {
     // 都成为每个 CFG 节点必须复制的空状态。覆盖仍需移除旧来源，不能只忽略空写入。
     fn write_binding(
         &mut self,
-        binding: Binding,
+        binding: HirBinding,
         origins: BTreeSet<UpvalueId>,
         closures: BTreeSet<EffectClosure>,
         call_targets: BTreeSet<UpvalueId>,
     ) {
         fn replace<V>(
-            map: &mut BTreeMap<Binding, BTreeSet<V>>,
-            binding: Binding,
+            map: &mut BTreeMap<HirBinding, BTreeSet<V>>,
+            binding: HirBinding,
             values: BTreeSet<V>,
         ) {
             if values.is_empty() {
@@ -149,27 +154,26 @@ impl EffectState {
     }
 
     fn join(&mut self, other: &Self) -> bool {
-        let before = self.clone();
-        extend_map_sets(&mut self.origins, &other.origins);
-        extend_map_sets(&mut self.closures, &other.closures);
-        extend_map_sets(&mut self.call_targets, &other.call_targets);
-        self.escapes.extend(&other.escapes);
-        self.returns.extend(other.returns.iter().cloned());
-        self.calls.extend(&other.calls);
+        let mut changed = extend_map_sets(&mut self.origins, &other.origins);
+        changed |= extend_map_sets(&mut self.closures, &other.closures);
+        changed |= extend_map_sets(&mut self.call_targets, &other.call_targets);
+        changed |= union_set(&mut self.escapes, &other.escapes);
+        changed |= union_set(&mut self.returns, &other.returns);
+        changed |= union_set(&mut self.calls, &other.calls);
+        let protocol_count = self.generic_for.len();
         for (&protocol, snapshot) in &other.generic_for {
             let current = self.generic_for.entry(protocol).or_default();
-            current.callees.extend(snapshot.callees.iter().cloned());
-            current.call_targets.extend(&snapshot.call_targets);
-            current.argument_origins.extend(&snapshot.argument_origins);
-            current.result_origins.extend(&snapshot.result_origins);
-            current
-                .result_closures
-                .extend(snapshot.result_closures.iter().cloned());
-            current
-                .result_call_targets
-                .extend(&snapshot.result_call_targets);
+            changed |= union_set(&mut current.callees, &snapshot.callees);
+            changed |= union_set(&mut current.call_targets, &snapshot.call_targets);
+            changed |= union_set(&mut current.argument_origins, &snapshot.argument_origins);
+            changed |= union_set(&mut current.result_origins, &snapshot.result_origins);
+            changed |= union_set(&mut current.result_closures, &snapshot.result_closures);
+            changed |= union_set(
+                &mut current.result_call_targets,
+                &snapshot.result_call_targets,
+            );
         }
-        *self != before
+        changed || protocol_count != self.generic_for.len()
     }
 }
 
@@ -183,7 +187,7 @@ fn effect_expr_origins(
     state: &EffectState,
     context: &EffectContext<'_>,
 ) -> BTreeSet<UpvalueId> {
-    if let Some(binding) = binding_from_expr(expr) {
+    if let Some(binding) = HirBinding::from_expr(expr) {
         return state.origins.get(&binding).cloned().unwrap_or_default();
     }
     let mut origins = BTreeSet::new();
@@ -215,13 +219,6 @@ fn effect_expr_origins(
             }
         }
         HirExpr::Call(call) => {
-            effect_note_expr_escapes(
-                expr,
-                state,
-                context,
-                &mut BTreeSet::new(),
-                &mut BTreeSet::new(),
-            );
             origins.extend(effect_expr_origins(&call.callee, state, context));
             for closure in effect_expr_closures(&call.callee, state, context) {
                 for value in &closure.returns {
@@ -247,7 +244,7 @@ fn effect_expr_origins(
         }
         HirExpr::Closure(closure) => {
             for capture in &closure.captures {
-                origins.extend(effect_expr_origins(&capture.value, state, context));
+                origins.extend(state.origins.get(&capture.binding).into_iter().flatten());
             }
         }
         HirExpr::Nil
@@ -282,7 +279,7 @@ fn effect_expr_closures(
     state: &EffectState,
     context: &EffectContext<'_>,
 ) -> BTreeSet<EffectClosure> {
-    if let Some(binding) = binding_from_expr(expr) {
+    if let Some(binding) = HirBinding::from_expr(expr) {
         return state.closures.get(&binding).cloned().unwrap_or_default();
     }
     match expr {
@@ -328,9 +325,7 @@ fn project_direct_closure(
 ) -> Option<EffectClosure> {
     let effect = &context.effects[proto.index()];
     let captures = context.captures.get(&proto)?;
-    Some(project_proto_effect(
-        proto, effect, captures, state, context,
-    ))
+    Some(project_proto_effect(proto, effect, captures, state))
 }
 
 fn project_proto_effect(
@@ -338,17 +333,17 @@ fn project_proto_effect(
     effect: &ProtoEffects,
     captures: &[HirCapture],
     state: &EffectState,
-    context: &EffectContext<'_>,
 ) -> EffectClosure {
     let captured = captures
         .iter()
-        .flat_map(|capture| effect_expr_origins(&capture.value, state, context))
+        .filter_map(|capture| state.origins.get(&capture.binding))
+        .flatten()
+        .copied()
         .collect();
-    let writes = project_written_upvalues(&effect.writes, captures, state, context);
-    let escapes = project_origin_upvalues(&effect.escapes, captures, state, context);
-    let returns = project_return_values(&effect.returns, captures, state, context);
-    let (mut call_escapes, calls) =
-        project_called_upvalues(&effect.calls, captures, state, context);
+    let writes = project_written_upvalues(&effect.writes, captures, state);
+    let escapes = project_origin_upvalues(&effect.escapes, captures, state);
+    let returns = project_return_values(&effect.returns, captures, state);
+    let (mut call_escapes, calls) = project_called_upvalues(&effect.calls, captures, state);
     call_escapes.extend(escapes);
     EffectClosure {
         proto,
@@ -364,14 +359,12 @@ fn project_nested_closure(
     closure: &EffectClosure,
     captures: &[HirCapture],
     state: &EffectState,
-    context: &EffectContext<'_>,
 ) -> EffectClosure {
-    let captured = project_origin_upvalues(&closure.captures, captures, state, context);
-    let writes = project_written_upvalues(&closure.writes, captures, state, context);
-    let escapes = project_origin_upvalues(&closure.escapes, captures, state, context);
-    let returns = project_return_values(&closure.returns, captures, state, context);
-    let (mut call_escapes, calls) =
-        project_called_upvalues(&closure.calls, captures, state, context);
+    let captured = project_origin_upvalues(&closure.captures, captures, state);
+    let writes = project_written_upvalues(&closure.writes, captures, state);
+    let escapes = project_origin_upvalues(&closure.escapes, captures, state);
+    let returns = project_return_values(&closure.returns, captures, state);
+    let (mut call_escapes, calls) = project_called_upvalues(&closure.calls, captures, state);
     call_escapes.extend(escapes);
     EffectClosure {
         proto: closure.proto,
@@ -387,12 +380,13 @@ fn project_origin_upvalues(
     upvalues: &BTreeSet<UpvalueId>,
     captures: &[HirCapture],
     state: &EffectState,
-    context: &EffectContext<'_>,
 ) -> BTreeSet<UpvalueId> {
     upvalues
         .iter()
         .filter_map(|upvalue| captures.get(upvalue.index()))
-        .flat_map(|capture| effect_expr_origins(&capture.value, state, context))
+        .filter_map(|capture| state.origins.get(&capture.binding))
+        .flatten()
+        .copied()
         .collect()
 }
 
@@ -400,13 +394,14 @@ fn project_written_upvalues(
     upvalues: &BTreeSet<UpvalueId>,
     captures: &[HirCapture],
     state: &EffectState,
-    context: &EffectContext<'_>,
 ) -> BTreeSet<UpvalueId> {
     upvalues
         .iter()
         .filter_map(|upvalue| captures.get(upvalue.index()))
         .filter(|capture| capture.mode == HirCaptureMode::ByReference)
-        .flat_map(|capture| effect_expr_origins(&capture.value, state, context))
+        .filter_map(|capture| state.origins.get(&capture.binding))
+        .flatten()
+        .copied()
         .collect()
 }
 
@@ -414,7 +409,6 @@ fn project_return_values(
     values: &BTreeSet<EffectValue>,
     captures: &[HirCapture],
     state: &EffectState,
-    context: &EffectContext<'_>,
 ) -> BTreeSet<EffectValue> {
     let mut projected = BTreeSet::new();
     for value in values {
@@ -424,19 +418,27 @@ fn project_return_values(
                     continue;
                 };
                 projected.extend(
-                    effect_expr_origins(&capture.value, state, context)
+                    state
+                        .origins
+                        .get(&capture.binding)
                         .into_iter()
+                        .flatten()
+                        .copied()
                         .map(EffectValue::Upvalue),
                 );
                 projected.extend(
-                    effect_expr_closures(&capture.value, state, context)
+                    state
+                        .closures
+                        .get(&capture.binding)
                         .into_iter()
+                        .flatten()
+                        .cloned()
                         .map(|closure| EffectValue::Closure(Box::new(closure))),
                 );
             }
             EffectValue::Closure(closure) => {
                 projected.insert(EffectValue::Closure(Box::new(project_nested_closure(
-                    closure, captures, state, context,
+                    closure, captures, state,
                 ))));
             }
         }
@@ -448,7 +450,6 @@ fn project_called_upvalues(
     upvalues: &BTreeSet<UpvalueId>,
     captures: &[HirCapture],
     state: &EffectState,
-    context: &EffectContext<'_>,
 ) -> (BTreeSet<UpvalueId>, BTreeSet<UpvalueId>) {
     let mut escapes = BTreeSet::new();
     let mut calls = BTreeSet::new();
@@ -456,10 +457,16 @@ fn project_called_upvalues(
         let Some(capture) = captures.get(upvalue.index()) else {
             continue;
         };
-        calls.extend(effect_expr_call_targets(&capture.value, state, context));
-        for closure in effect_expr_closures(&capture.value, state, context) {
-            escapes.extend(closure.escapes);
-            calls.extend(closure.calls);
+        calls.extend(
+            state
+                .call_targets
+                .get(&capture.binding)
+                .into_iter()
+                .flatten(),
+        );
+        for closure in state.closures.get(&capture.binding).into_iter().flatten() {
+            escapes.extend(&closure.escapes);
+            calls.extend(&closure.calls);
         }
     }
     (escapes, calls)
@@ -470,7 +477,7 @@ fn effect_expr_call_targets(
     state: &EffectState,
     context: &EffectContext<'_>,
 ) -> BTreeSet<UpvalueId> {
-    if let Some(binding) = binding_from_expr(expr) {
+    if let Some(binding) = HirBinding::from_expr(expr) {
         return state
             .call_targets
             .get(&binding)
@@ -569,11 +576,6 @@ fn effect_note_expr_escapes(
                 effect_note_expr_escapes(tail.as_expr(), state, context, escapes, calls);
             }
         }
-        HirExpr::Closure(closure) => {
-            for capture in &closure.captures {
-                effect_note_expr_escapes(&capture.value, state, context, escapes, calls);
-            }
-        }
         HirExpr::Decision(decision) => {
             for node in &decision.nodes {
                 effect_note_expr_escapes(&node.test, state, context, escapes, calls);
@@ -599,6 +601,7 @@ fn effect_note_expr_escapes(
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
+        | HirExpr::Closure(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => {}
     }
@@ -678,7 +681,7 @@ fn snapshot_generic_for_effect(
 }
 
 fn dispatch_generic_for_effect(flow: HirGenericForFlow<'_>, state: &mut EffectState) {
-    let Some(snapshot) = state.generic_for.get(&flow.protocol()).cloned() else {
+    let Some(snapshot) = state.generic_for.get(&flow.protocol()) else {
         return;
     };
     state.calls.extend(&snapshot.call_targets);
@@ -691,7 +694,7 @@ fn dispatch_generic_for_effect(flow: HirGenericForFlow<'_>, state: &mut EffectSt
 fn write_for_bindings_effect(bindings: HirForBindings<'_>, state: &mut EffectState) {
     match bindings {
         HirForBindings::Numeric(local) => {
-            let binding = Binding::Local(local);
+            let binding = HirBinding::Local(local);
             state.write_binding(binding, BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
         }
         HirForBindings::Generic(flow) => {
@@ -701,7 +704,7 @@ fn write_for_bindings_effect(bindings: HirForBindings<'_>, state: &mut EffectSta
                 .cloned()
                 .unwrap_or_default();
             for &local in &flow.for_stmt().bindings {
-                let binding = Binding::Local(local);
+                let binding = HirBinding::Local(local);
                 state.write_binding(
                     binding,
                     snapshot.result_origins.clone(),
@@ -713,49 +716,81 @@ fn write_for_bindings_effect(bindings: HirForBindings<'_>, state: &mut EffectSta
     }
 }
 
+#[derive(Default)]
+struct EffectAssignmentValue {
+    origins: BTreeSet<UpvalueId>,
+    closures: BTreeSet<EffectClosure>,
+    call_targets: BTreeSet<UpvalueId>,
+}
+
+fn assignment_value_effects(
+    value: Option<&HirExpr>,
+    state: &EffectState,
+    context: &EffectContext<'_>,
+) -> EffectAssignmentValue {
+    let Some(value) = value else {
+        return EffectAssignmentValue::default();
+    };
+    EffectAssignmentValue {
+        origins: effect_expr_origins(value, state, context),
+        closures: effect_expr_closures(value, state, context),
+        call_targets: effect_expr_call_targets(value, state, context),
+    }
+}
+
 fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &EffectContext<'_>) {
     match stmt {
         HirStmt::LocalRootRelease(local) => state.write_binding(
-            Binding::Local(*local),
+            HirBinding::Local(*local),
             BTreeSet::new(),
             BTreeSet::new(),
             BTreeSet::new(),
         ),
         HirStmt::LocalDecl(decl) => {
-            let snapshot = state.clone();
+            let values = (0..decl.bindings.len())
+                .map(|index| {
+                    assignment_value_effects(adjusted_value(&decl.values, index), state, context)
+                })
+                .collect::<Vec<_>>();
             note_effect_pack_escapes(&decl.values, state, context);
-            for (index, local) in decl.bindings.iter().copied().enumerate() {
-                let origins = adjusted_value(&decl.values, index)
-                    .map_or_else(BTreeSet::new, |value| {
-                        effect_expr_origins(value, &snapshot, context)
-                    });
-                let closures = adjusted_value(&decl.values, index)
-                    .map_or_else(BTreeSet::new, |value| {
-                        effect_expr_closures(value, &snapshot, context)
-                    });
-                let call_targets = adjusted_value(&decl.values, index)
-                    .map_or_else(BTreeSet::new, |value| {
-                        effect_expr_call_targets(value, &snapshot, context)
-                    });
-                state.write_binding(Binding::Local(local), origins, closures, call_targets);
+            for (&local, value) in decl.bindings.iter().zip(values) {
+                state.write_binding(
+                    HirBinding::Local(local),
+                    value.origins,
+                    value.closures,
+                    value.call_targets,
+                );
             }
         }
         HirStmt::Assign(assign) => {
-            let snapshot = state.clone();
+            let values = assign
+                .targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    let mut value = assignment_value_effects(
+                        adjusted_value(&assign.values, index),
+                        state,
+                        context,
+                    );
+                    if let HirLValue::TableAccess(access) = target {
+                        value
+                            .origins
+                            .extend(effect_expr_origins(&access.base, state, context));
+                        value
+                            .origins
+                            .extend(effect_expr_origins(&access.key, state, context));
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
             note_effect_pack_escapes(&assign.values, state, context);
-            for (index, target) in assign.targets.iter().enumerate() {
-                let origins = adjusted_value(&assign.values, index)
-                    .map_or_else(BTreeSet::new, |value| {
-                        effect_expr_origins(value, &snapshot, context)
-                    });
-                let closures = adjusted_value(&assign.values, index)
-                    .map_or_else(BTreeSet::new, |value| {
-                        effect_expr_closures(value, &snapshot, context)
-                    });
-                let call_targets = adjusted_value(&assign.values, index)
-                    .map_or_else(BTreeSet::new, |value| {
-                        effect_expr_call_targets(value, &snapshot, context)
-                    });
+            for (target, value) in assign.targets.iter().zip(values) {
+                let EffectAssignmentValue {
+                    origins,
+                    closures,
+                    call_targets,
+                } = value;
                 match target {
                     HirLValue::Param(_) | HirLValue::Temp(_) | HirLValue::Local(_) => {
                         state.write_binding(
@@ -768,21 +803,14 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
                     HirLValue::Upvalue(upvalue) => {
                         state.escapes.extend(origins);
                         state.write_binding(
-                            Binding::Upvalue(*upvalue),
+                            HirBinding::Upvalue(*upvalue),
                             BTreeSet::from([*upvalue]),
                             closures,
                             call_targets,
                         );
                     }
-                    HirLValue::Global(_) => state.escapes.extend(origins),
-                    HirLValue::TableAccess(access) => {
-                        state.escapes.extend(origins);
-                        state
-                            .escapes
-                            .extend(effect_expr_origins(&access.base, &snapshot, context));
-                        state
-                            .escapes
-                            .extend(effect_expr_origins(&access.key, &snapshot, context));
+                    HirLValue::Global(_) | HirLValue::TableAccess(_) => {
+                        state.escapes.extend(origins)
                     }
                 }
             }

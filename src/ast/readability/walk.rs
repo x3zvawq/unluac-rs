@@ -11,7 +11,7 @@ use crate::ast::common::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
 };
 
-pub(super) use super::traverse::BlockKind;
+use crate::ast::traverse::BlockKind;
 use crate::ast::traverse::{
     traverse_call_children, traverse_expr_children, traverse_lvalue_children,
     traverse_stmt_children,

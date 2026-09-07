@@ -19,9 +19,9 @@ use crate::ast::common::{
 use crate::hir::HirRepeatConditionLifetimeFacts;
 
 use self::lifetime::{suffix_has_preserved_lifetime, suffix_shortens_referenced_binding};
-use super::super::visit::{self, AstVisitor};
 use super::facts::MissingGlobals;
 use super::insert::build_wildcard_global_decl;
+use crate::ast::visit::{self, AstVisitor};
 
 mod lifetime;
 

@@ -27,8 +27,10 @@ pub struct HirProto {
     pub signature: ProtoSignature,
     pub params: Vec<ParamId>,
     pub param_debug_hints: Vec<Option<String>>,
-    /// proto 内连续分配的 LocalId；local debug 映射按 ID 下标访问。
-    pub locals: Vec<LocalId>,
+    /// 已分配的 LocalId 编号域为 `0..local_count`；debug 映射按 ID 下标访问。
+    ///
+    /// lowering 与 simplify 只追加身份，删除源码声明或合并绑定不缩减编号域。
+    pub local_count: usize,
     /// 函数入口由 VM 变参参数寄存器承载的 local 身份。
     ///
     /// 该身份在 binding 分配时冻结；AST 是否把它写进形参列表仍由签名种类和真实使用决定。
@@ -66,8 +68,10 @@ pub struct HirProto {
     /// child's private snapshot, but does not make the parent binding mutable.
     pub mutable_upvalues: BTreeSet<UpvalueId>,
     pub upvalue_debug_hints: Vec<Option<String>>,
-    /// proto 内连续分配的 TempId；temp debug 映射按 ID 下标访问。
-    pub temps: Vec<TempId>,
+    /// bindings 分配的 TempId 编号域为 `0..temp_count`，debug 映射按 ID 下标访问。
+    ///
+    /// simplify 可退役或复用身份，但不缩减编号域；这不是当前活跃 temp 的数量。
+    pub temp_count: usize,
     pub temp_debug_locals: Vec<Option<String>>,
     /// `temp_debug_locals` 对应的源码局部作用域身份；编译器内部槽位为 `None`。
     pub temp_debug_scopes: Vec<Option<usize>>,
@@ -1296,11 +1300,47 @@ pub enum HirCaptureMode {
     ByReference,
 }
 
-/// 闭包 capture。
-#[derive(Debug, Clone, PartialEq)]
+/// 当前 proto 的词法绑定身份，供捕获、对象流与后层命名共享。
+///
+/// 闭包捕获引用创建点的父 proto，不能承载待求值的复合表达式。
+/// lowering 消费寄存器与 upvalue 的绑定事实后确定身份，后续 pass 只能做已证明的
+/// 身份改写。例如 `local x; return function() return x end` 捕获的是父级 Local，
+/// 即使 x 的初始值为 nil，也不能把这个 cell 换成 Nil 表达式。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum HirBinding {
+    Param(ParamId),
+    Local(LocalId),
+    Temp(TempId),
+    Upvalue(UpvalueId),
+}
+
+impl HirBinding {
+    /// 为读取、对象流及 visitor 投影一次父级引用，不展开绑定定义或子 proto。
+    pub const fn expr(self) -> HirExpr {
+        match self {
+            Self::Param(id) => HirExpr::ParamRef(id),
+            Self::Local(id) => HirExpr::LocalRef(id),
+            Self::Temp(id) => HirExpr::TempRef(id),
+            Self::Upvalue(id) => HirExpr::UpvalueRef(id),
+        }
+    }
+
+    pub(crate) fn from_expr(expr: &HirExpr) -> Option<Self> {
+        match *expr {
+            HirExpr::ParamRef(id) => Some(Self::Param(id)),
+            HirExpr::LocalRef(id) => Some(Self::Local(id)),
+            HirExpr::TempRef(id) => Some(Self::Temp(id)),
+            HirExpr::UpvalueRef(id) => Some(Self::Upvalue(id)),
+            _ => None,
+        }
+    }
+}
+
+/// 父级绑定与捕获方式独立保存；ByValue 读取快照，ByReference 保留可写 cell。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct HirCapture {
     pub mode: HirCaptureMode,
-    pub value: HirExpr,
+    pub binding: HirBinding,
 }
 
 /// 未解析表达式。

@@ -1,6 +1,13 @@
-//! 校验构造器 producer 移除后 closure capture 仍有物化绑定；依赖 BindingIndex 与 producer 表，不负责字段/求值顺序重建；例如识别递归 closure 槽和嵌套表达式中的 orphan capture。
+//! 校验构造器 producer 移除后，closure 的直接 capture 仍有物化绑定。
+//!
+//! 字段表达式的子节点只由共享 HIR 查询遍历；capture 边消费 BindingIndex 与本事务的
+//! materialization 计数，不把它改成一般表达式提及，也不展开绑定定义或子 proto。
+//! 例如字段 closure 捕获的 Local 若只由被删除 producer 声明，则拒绝该构造器事务；
+//! 参数及 upvalue 的存活不由本事务签发。这里不重建字段顺序或 capture 来源。
 
+use super::super::bindings::binding_from_capture;
 use super::*;
+use crate::hir::visit::any_expr;
 
 pub(super) fn binding_is_recursive_closure_slot(
     block: &HirBlock,
@@ -27,11 +34,7 @@ pub(super) fn binding_is_recursive_closure_slot(
     closure
         .captures
         .iter()
-        .any(|capture| match (binding, &capture.value) {
-            (TableBinding::Local(local), HirExpr::LocalRef(captured)) => *captured == local,
-            (TableBinding::Temp(temp), HirExpr::TempRef(captured)) => *captured == temp,
-            _ => false,
-        })
+        .any(|capture| binding_from_capture(capture.binding) == Some(binding))
 }
 
 pub(super) fn expr_captures_orphaned_binding(
@@ -40,140 +43,28 @@ pub(super) fn expr_captures_orphaned_binding(
     materialized_binding_counts: &[u32],
     removed_materializations: &[u32],
 ) -> bool {
-    match expr {
-        HirExpr::Unary(unary) => expr_captures_orphaned_binding(
-            &unary.expr,
-            binding_index,
-            materialized_binding_counts,
-            removed_materializations,
-        ),
-        HirExpr::Binary(binary) => {
-            expr_captures_orphaned_binding(
-                &binary.lhs,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            ) || expr_captures_orphaned_binding(
-                &binary.rhs,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            )
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_captures_orphaned_binding(
-                &logical.lhs,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            ) || expr_captures_orphaned_binding(
-                &logical.rhs,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            )
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_captures_orphaned_binding(
-                &node.test,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            ) || decision_target_captures_orphaned_binding(
-                &node.truthy,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            ) || decision_target_captures_orphaned_binding(
-                &node.falsy,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            )
-        }),
-        HirExpr::Call(call) => call_captures_orphaned_binding(
-            call,
-            binding_index,
-            materialized_binding_counts,
-            removed_materializations,
-        ),
-        HirExpr::TableAccess(access) => {
-            expr_captures_orphaned_binding(
-                &access.base,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            ) || expr_captures_orphaned_binding(
-                &access.key,
-                binding_index,
-                materialized_binding_counts,
-                removed_materializations,
-            )
-        }
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(value) => expr_captures_orphaned_binding(
-                    value,
-                    binding_index,
-                    materialized_binding_counts,
-                    removed_materializations,
-                ),
-                HirTableField::Record(field) => {
-                    table_key_captures_orphaned_binding(
-                        &field.key,
-                        binding_index,
-                        materialized_binding_counts,
-                        removed_materializations,
-                    ) || expr_captures_orphaned_binding(
-                        &field.value,
-                        binding_index,
-                        materialized_binding_counts,
-                        removed_materializations,
-                    )
-                }
-            }) || table.trailing_multivalue.as_ref().is_some_and(|tail| {
-                expr_captures_orphaned_binding(
-                    tail.as_expr(),
-                    binding_index,
-                    materialized_binding_counts,
-                    removed_materializations,
-                )
-            })
-        }
-        HirExpr::Closure(closure) => closure.captures.iter().any(|capture| {
+    any_expr(expr, &mut |expr| {
+        let HirExpr::Closure(closure) = expr else {
+            return false;
+        };
+        closure.captures.iter().any(|capture| {
             capture_is_orphaned(
                 capture,
                 binding_index,
                 materialized_binding_counts,
                 removed_materializations,
             )
-        }),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-    }
+        })
+    })
 }
 
-pub(super) fn capture_is_orphaned(
+fn capture_is_orphaned(
     capture: &HirCapture,
     binding_index: &BindingIndex,
     materialized_binding_counts: &[u32],
     removed_materializations: &[u32],
 ) -> bool {
-    let Some(binding) = binding_from_expr(&capture.value) else {
+    let Some(binding) = binding_from_capture(capture.binding) else {
         return false;
     };
     let Some(binding_id) = binding_index.id_of(binding) else {
@@ -190,56 +81,4 @@ pub(super) fn capture_is_orphaned(
                 .unwrap_or_default(),
         );
     surviving == 0
-}
-
-pub(super) fn call_captures_orphaned_binding(
-    call: &HirCallExpr,
-    binding_index: &BindingIndex,
-    materialized_binding_counts: &[u32],
-    removed_materializations: &[u32],
-) -> bool {
-    expr_captures_orphaned_binding(
-        &call.callee,
-        binding_index,
-        materialized_binding_counts,
-        removed_materializations,
-    ) || call.args.iter().any(|arg| {
-        expr_captures_orphaned_binding(
-            arg,
-            binding_index,
-            materialized_binding_counts,
-            removed_materializations,
-        )
-    })
-}
-
-pub(super) fn decision_target_captures_orphaned_binding(
-    target: &HirDecisionTarget,
-    binding_index: &BindingIndex,
-    materialized_binding_counts: &[u32],
-    removed_materializations: &[u32],
-) -> bool {
-    match target {
-        HirDecisionTarget::Expr(expr) => expr_captures_orphaned_binding(
-            expr,
-            binding_index,
-            materialized_binding_counts,
-            removed_materializations,
-        ),
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
-    }
-}
-
-pub(super) fn table_key_captures_orphaned_binding(
-    key: &HirExpr,
-    binding_index: &BindingIndex,
-    materialized_binding_counts: &[u32],
-    removed_materializations: &[u32],
-) -> bool {
-    expr_captures_orphaned_binding(
-        key,
-        binding_index,
-        materialized_binding_counts,
-        removed_materializations,
-    )
 }

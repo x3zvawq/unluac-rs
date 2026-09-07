@@ -151,4 +151,8 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_519_constructor_nil_prefix.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_520_capture_closed_nil_slot.lua",
+        ALL_DIALECTS,
+    ),
 ];

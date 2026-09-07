@@ -62,7 +62,7 @@ pub(super) fn fold_branch_control_in_proto(
             &discard_facts,
             safety,
         );
-        let first_new_local = proto.locals.len();
+        let first_new_local = proto.local_count;
         let mut pass = BranchControlPass {
             discard_facts: &discard_facts,
             forward_move_facts: &forward_move_facts,
@@ -71,13 +71,14 @@ pub(super) fn fold_branch_control_in_proto(
             safety,
         };
         let rewrite_changed = rewrite_block(&mut proto.body, &mut pass);
-        for index in first_new_local..pass.next_local_index {
+        let next_local_index = pass.next_local_index;
+        for index in first_new_local..next_local_index {
             let local = LocalId(index);
-            proto.locals.push(local);
             proto.local_debug_hints.push(None);
             proto.local_debug_scopes.push(None);
             promotion_facts.record_home_free_local(local);
         }
+        proto.local_count = next_local_index;
         changed |= path_changed | rewrite_changed;
         // 删除不可达写可能让下一项 local 立刻满足稳定性证明。这里收完本 pass 自己的
         // 单调链，避免合法的长链逐项消耗全局 scheduler 的固定轮次预算。

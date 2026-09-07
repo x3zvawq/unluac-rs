@@ -40,10 +40,8 @@ pub(super) fn fold_generic_for_iterators_in_proto(
         .iter()
         .map(Option::is_some)
         .collect();
-    let preserved_temps = proto
-        .temps
-        .iter()
-        .copied()
+    let preserved_temps = (0..proto.temp_count)
+        .map(TempId)
         .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve())
         .collect();
     rewrite_proto(
@@ -996,7 +994,7 @@ mod tests {
             proto: HirProtoRef(1),
             captures: vec![HirCapture {
                 mode: HirCaptureMode::ByValue,
-                value,
+                binding: crate::hir::HirBinding::from_expr(&value).unwrap(),
             }],
         }))
     }

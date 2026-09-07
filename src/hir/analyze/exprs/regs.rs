@@ -38,7 +38,7 @@ pub(crate) fn lower_closure_capture(
     instr_ref: InstrRef,
     dst: Reg,
     source: crate::transformer::CaptureSource,
-) -> HirCapture {
+) -> Result<HirCapture, HirUnresolvedExpr> {
     let (mode, value) = match source {
         crate::transformer::CaptureSource::ByValue(reg) if reg == dst => (
             HirCaptureMode::ByValue,
@@ -59,43 +59,32 @@ pub(crate) fn lower_closure_capture(
         ),
         crate::transformer::CaptureSource::ByReference(reg) => {
             if let Some(target) = lowering.bindings.closure_capture_target(instr_ref, reg) {
-                return HirCapture {
-                    mode: HirCaptureMode::ByReference,
-                    value: target.expr(),
-                };
+                return capture_from_expr(instr_ref, HirCaptureMode::ByReference, target.expr());
             }
-            // 先尝试正常的 SSA use-def 解析
-            let expr = expr_for_reg_use(lowering, block, instr_ref, reg);
-            // 互递归前向声明模式：Lua upvalue 是引用变量槽而非快照，closure 实际执行
-            // 时看到的是寄存器的最终值。需要 forward_def 的场景有两种：
-            //  1. 入口空值：寄存器在捕获点没有到达定义（entry-reg），说明没有显式
-            //     初始化；普通读取会把它解释成 nil，但 closure 捕获的是槽位，需要继续
-            //     向后找同一 block 里的最终定义（如 `local a, b; a = function() b()... end`）。
-            //  2. LOADNIL 前缀：三路互递归 `local a, b, c` 编译时先 LOADNIL r2..r4
-            //     再依次 CLOSURE，此时 SSA 能看到 LOADNIL 的定义（TempRef），但该
-            //     定义只是占位 nil。真正的值是后续 CLOSURE 写入的同一寄存器。
-            let entry_empty = reg_use_is_entry_empty(lowering, instr_ref, reg);
-            let should_forward = match &expr {
-                _ if entry_empty => true,
-                HirExpr::TempRef(_) => is_loadnil_def(lowering, instr_ref, reg),
-                _ => false,
-            };
-            if should_forward
-                && let Some(forward_expr) = forward_def_in_block(lowering, block, instr_ref, reg)
-            {
-                return HirCapture {
-                    mode: HirCaptureMode::ByReference,
-                    value: forward_expr,
-                };
-            }
-            (HirCaptureMode::ByReference, expr)
+            // 同 epoch 的后续写、前向声明由 captured_slots 签发 cell 身份。
+            // 其余 capture 保留原 reaching 值；不能按寄存器前向扫描并越过 Close。
+            (
+                HirCaptureMode::ByReference,
+                expr_for_reg_use(lowering, block, instr_ref, reg),
+            )
         }
         crate::transformer::CaptureSource::Upvalue(upvalue) => (
             HirCaptureMode::ByReference,
             HirExpr::UpvalueRef(UpvalueId(upvalue.index())),
         ),
     };
-    HirCapture { mode, value }
+    capture_from_expr(instr_ref, mode, value)
+}
+
+fn capture_from_expr(
+    instr: InstrRef,
+    mode: HirCaptureMode,
+    value: HirExpr,
+) -> Result<HirCapture, HirUnresolvedExpr> {
+    let binding = crate::hir::HirBinding::from_expr(&value).ok_or_else(|| HirUnresolvedExpr {
+        summary: format!("closure at {instr} has no parent binding for capture {value:?}"),
+    })?;
+    Ok(HirCapture { mode, binding })
 }
 
 fn closure_result_expr(
@@ -116,54 +105,6 @@ fn closure_result_expr(
                 summary: format!("closure at {instr_ref} has no fixed result"),
             }))
         })
-}
-
-fn reg_use_is_entry_empty(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> bool {
-    lowering
-        .dataflow
-        .use_values_at(instr_ref)
-        .get(reg)
-        .is_none_or(|value| matches!(value, SsaValue::Entry(_)))
-        && reg.index() >= lowering.bindings.params.len()
-        && !lowering.bindings.entry_local_regs.contains_key(&reg)
-}
-
-/// 检查某条指令读取的寄存器的 SSA 到达定义是否来自 LOADNIL 指令。
-///
-/// 用于在 closure capture 解析中区分"有意义的非 nil 定义"和"仅仅是 LOADNIL 占位"。
-/// 后者在 `local a, b, c` + 三路互递归编译结果中出现：
-/// LOADNIL r2..r4 之后紧跟 CLOSURE r2/r3/r4，capture 的 SSA 到达定义
-/// 虽然存在（不是 Unresolved）但只是 LOADNIL 的占位 nil。
-fn is_loadnil_def(lowering: &ProtoLowering<'_>, instr_ref: InstrRef, reg: Reg) -> bool {
-    let value = lowering.dataflow.use_value(instr_ref, reg);
-    let SsaValue::Def(def) = value else {
-        return false;
-    };
-    let def_instr = lowering.dataflow.def_instr(def);
-    matches!(
-        &lowering.proto.instrs[def_instr.index()],
-        crate::transformer::LowInstr::LoadNil(_)
-    )
-}
-
-/// 在当前 block 中查找 `instr_ref` 之后最后一个写入 `reg` 的定义。
-///
-/// Lua upvalue 引用的是变量槽而非快照，所以 closure 捕获时应指向该寄存器
-/// 在此 block 内的最终定义。这个函数查找从 `instr_ref` 之后到 block 末尾
-/// 的最后一个 fixed Def，直接消费 Dataflow 区间索引，保留互递归和
-/// LOADNIL+CLOSURE 前向声明的最终绑定。
-fn forward_def_in_block(
-    lowering: &ProtoLowering<'_>,
-    block: BlockRef,
-    instr_ref: InstrRef,
-    reg: Reg,
-) -> Option<HirExpr> {
-    let block_range = lowering.cfg.blocks[block.index()].instrs;
-    let def = lowering
-        .dataflow
-        .last_fixed_def_in_range(reg, (instr_ref.index() + 1)..block_range.end())?;
-    let temp = lowering.bindings.fixed_temps[def.index()];
-    Some(lowering.bindings.expr_for_temp(temp))
 }
 
 /// 某些 `goto + label` 形状需要读取“离开 block 时这个寄存器的稳定值”。

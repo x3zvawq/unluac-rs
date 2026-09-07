@@ -6,22 +6,18 @@
 //!
 //! 例子：
 //! - 输入形状：`x = Decision(...)`
-//! - 输出形状：分配一个新的 local 暂存短路值，并把该 local 追加到 proto locals。
+//! - 输出形状：递增 proto 的 Local 编号域，返回新身份暂存短路值；元数据由入口补齐。
 
 use crate::hir::common::LocalId;
 
 pub(super) struct EliminationState<'a> {
     pub(super) next_local_index: &'a mut usize,
-    pub(super) new_locals: &'a mut Vec<LocalId>,
-    pub(super) new_local_debug_hints: &'a mut Vec<Option<String>>,
 }
 
 impl EliminationState<'_> {
     pub(super) fn alloc_local(&mut self) -> LocalId {
         let local = LocalId(*self.next_local_index);
         *self.next_local_index += 1;
-        self.new_locals.push(local);
-        self.new_local_debug_hints.push(None);
         local
     }
 }

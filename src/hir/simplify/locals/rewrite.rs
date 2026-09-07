@@ -11,8 +11,7 @@
 use std::collections::BTreeMap;
 
 use crate::hir::common::{
-    HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableConstructor,
-    HirTableField, HirValuePack, LocalId, TempId,
+    HirBinding, HirCallExpr, HirCapture, HirExpr, HirLValue, HirStmt, HirValuePack, LocalId, TempId,
 };
 
 use super::super::walk::{self, HirRewritePass};
@@ -37,117 +36,51 @@ pub(super) fn value_pack(pack: &mut HirValuePack, mapping: &BTreeMap<TempId, Loc
 }
 
 pub(super) fn expr(node: &mut HirExpr, mapping: &BTreeMap<TempId, LocalId>) -> bool {
-    match node {
-        HirExpr::TempRef(temp) => {
-            if let Some(local) = mapping.get(temp) {
-                *node = HirExpr::LocalRef(*local);
-                true
-            } else {
-                false
-            }
+    walk::rewrite_expr(node, &mut TempLocalRewrite { mapping })
+}
+
+pub(super) fn lvalue(node: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>) -> bool {
+    walk::rewrite_lvalue(node, &mut TempLocalRewrite { mapping })
+}
+
+struct TempLocalRewrite<'a> {
+    mapping: &'a BTreeMap<TempId, LocalId>,
+}
+
+impl HirRewritePass for TempLocalRewrite<'_> {
+    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+        if let HirExpr::TempRef(temp) = expr
+            && let Some(local) = self.mapping.get(temp)
+        {
+            *expr = HirExpr::LocalRef(*local);
+            return true;
         }
-        HirExpr::TableAccess(access) => {
-            let base_changed = expr(&mut access.base, mapping);
-            let key_changed = expr(&mut access.key, mapping);
-            base_changed || key_changed
+        false
+    }
+
+    fn rewrite_lvalue(&mut self, lvalue: &mut HirLValue) -> bool {
+        if let HirLValue::Temp(temp) = lvalue
+            && let Some(local) = self.mapping.get(temp)
+        {
+            *lvalue = HirLValue::Local(*local);
+            return true;
         }
-        HirExpr::Unary(unary) => expr(&mut unary.expr, mapping),
-        HirExpr::Binary(binary) => {
-            let lhs_changed = expr(&mut binary.lhs, mapping);
-            let rhs_changed = expr(&mut binary.rhs, mapping);
-            lhs_changed || rhs_changed
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            let lhs_changed = expr(&mut logical.lhs, mapping);
-            let rhs_changed = expr(&mut logical.rhs, mapping);
-            lhs_changed || rhs_changed
-        }
-        HirExpr::Decision(decision) => {
-            let mut changed = false;
-            for node in &mut decision.nodes {
-                let test_changed = expr(&mut node.test, mapping);
-                let truthy_changed = decision_target(&mut node.truthy, mapping);
-                let falsy_changed = decision_target(&mut node.falsy, mapping);
-                changed |= test_changed || truthy_changed || falsy_changed;
-            }
-            changed
-        }
-        HirExpr::Call(call) => call_expr(call, mapping),
-        HirExpr::TableConstructor(table) => table_constructor(table, mapping),
-        HirExpr::Closure(closure) => {
-            let mut changed = false;
-            for capture in &mut closure.captures {
-                changed |= expr(&mut capture.value, mapping);
-            }
-            changed
-        }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
+        false
+    }
+
+    fn rewrite_capture(&mut self, capture: &mut HirCapture) -> bool {
+        rewrite_capture(capture, self.mapping)
     }
 }
 
-fn decision_target(target: &mut HirDecisionTarget, mapping: &BTreeMap<TempId, LocalId>) -> bool {
-    match target {
-        HirDecisionTarget::Expr(expr) => self::expr(expr, mapping),
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
+fn rewrite_capture(capture: &mut HirCapture, mapping: &BTreeMap<TempId, LocalId>) -> bool {
+    if let HirBinding::Temp(temp) = capture.binding
+        && let Some(local) = mapping.get(&temp)
+    {
+        capture.binding = HirBinding::Local(*local);
+        return true;
     }
-}
-
-fn table_constructor(table: &mut HirTableConstructor, mapping: &BTreeMap<TempId, LocalId>) -> bool {
-    let mut fields_changed = false;
-    for field in &mut table.fields {
-        let field_changed = match field {
-            HirTableField::Array(expr) => self::expr(expr, mapping),
-            HirTableField::Record(field) => {
-                let key_changed = self::expr(&mut field.key, mapping);
-                let value_changed = self::expr(&mut field.value, mapping);
-                key_changed || value_changed
-            }
-        };
-        fields_changed |= field_changed;
-    }
-    let trailing_changed = table
-        .trailing_multivalue
-        .as_mut()
-        .and_then(crate::hir::HirPackTail::call_mut)
-        .is_some_and(|call| call_expr(call, mapping));
-
-    fields_changed || trailing_changed
-}
-
-pub(super) fn lvalue(lvalue: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>) -> bool {
-    match lvalue {
-        HirLValue::Temp(temp) => {
-            if let Some(local) = mapping.get(temp) {
-                *lvalue = HirLValue::Local(*local);
-                true
-            } else {
-                false
-            }
-        }
-        HirLValue::TableAccess(access) => {
-            let base_changed = expr(&mut access.base, mapping);
-            let key_changed = expr(&mut access.key, mapping);
-            base_changed || key_changed
-        }
-        HirLValue::Param(_)
-        | HirLValue::Local(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_) => false,
-    }
+    false
 }
 
 /// 对语句中 closure capture 里残留的 TempRef 做定向重写。
@@ -168,14 +101,7 @@ struct ForwardCaptureRefPass<'a> {
 }
 
 impl HirRewritePass for ForwardCaptureRefPass<'_> {
-    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
-        let HirExpr::Closure(closure) = expr else {
-            return false;
-        };
-        let mut changed = false;
-        for capture in &mut closure.captures {
-            changed |= self::expr(&mut capture.value, self.mapping);
-        }
-        changed
+    fn rewrite_capture(&mut self, capture: &mut HirCapture) -> bool {
+        rewrite_capture(capture, self.mapping)
     }
 }

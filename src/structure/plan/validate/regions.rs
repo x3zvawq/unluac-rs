@@ -99,37 +99,6 @@ pub(super) fn validate_containment(plan: &StructurePlan) -> Result<(), Structure
     Ok(())
 }
 
-pub(super) struct RegionBlockStats {
-    subtree_counts: Vec<usize>,
-}
-
-impl RegionBlockStats {
-    pub(super) fn new(
-        plan: &StructurePlan,
-        intervals: &RegionNavigation,
-    ) -> Result<Self, StructureError> {
-        let mut subtree_counts = vec![0usize; plan.regions.len()];
-        for owner in plan.region_by_block.iter().copied().flatten() {
-            *subtree_counts.get_mut(owner.index()).ok_or_else(|| {
-                StructureError::invalid(format!(
-                    "block owner references missing region {:?} while building validation stats",
-                    owner
-                ))
-            })? += 1;
-        }
-        for region in &intervals.postorder {
-            if let Some(parent) = intervals.parent[region.index()] {
-                subtree_counts[parent.index()] += subtree_counts[region.index()];
-            }
-        }
-        Ok(Self { subtree_counts })
-    }
-
-    pub(super) fn subtree_count(&self, region: RegionId) -> usize {
-        self.subtree_counts[region.index()]
-    }
-}
-
 pub(super) fn region_contains_block(
     plan: &StructurePlan,
     intervals: &RegionNavigation,
@@ -143,7 +112,6 @@ pub(super) fn region_contains_block(
 pub(super) fn region_matches_exact_blocks<I>(
     plan: &StructurePlan,
     intervals: &RegionNavigation,
-    stats: &RegionBlockStats,
     region: RegionId,
     expected_len: usize,
     expected_blocks: I,
@@ -151,7 +119,7 @@ pub(super) fn region_matches_exact_blocks<I>(
 where
     I: IntoIterator<Item = BlockRef>,
 {
-    stats.subtree_count(region) == expected_len
+    plan.region_blocks(region).len() == expected_len
         && expected_blocks
             .into_iter()
             .all(|block| region_contains_block(plan, intervals, region, block))

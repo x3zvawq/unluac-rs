@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::graph;
 
 use super::super::common::{AstBlock, AstFunctionExpr, AstLabelId, AstStmt};
-use super::visit::{self, AstVisitor};
+use crate::ast::visit::{self, AstVisitor};
 
 struct LabelOrGotoVisitor(bool);
 

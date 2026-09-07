@@ -22,23 +22,9 @@
 //!     -> FocusPlan{ focus=Some(0), visible={0,1,2}, elided_at=[] }
 
 use std::collections::BTreeSet;
-use std::fmt::{self, Write as _};
+use std::fmt::Write as _;
 
-/// proto 向下展开的层数语义。
-///
-/// `Fixed(N)` 表示相对焦点 proto 向下展开 N 层；`All` 表示不设上限（等价于旧的全量行为）。
-/// 默认值 `Fixed(0)` 意味着只展开焦点本身，子 proto 以占位行出现。
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ProtoDepth {
-    Fixed(usize),
-    All,
-}
-
-impl Default for ProtoDepth {
-    fn default() -> Self {
-        Self::Fixed(0)
-    }
-}
+use super::ProtoDepth;
 
 impl ProtoDepth {
     /// 判断给定的相对深度是否仍在展开范围内。
@@ -48,15 +34,6 @@ impl ProtoDepth {
         match self {
             Self::Fixed(limit) => relative <= limit,
             Self::All => true,
-        }
-    }
-}
-
-impl fmt::Display for ProtoDepth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Fixed(n) => write!(f, "{n}"),
-            Self::All => f.write_str("all"),
         }
     }
 }

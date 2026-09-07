@@ -203,8 +203,8 @@ pub(super) fn stabilize_table_constructors_in_proto(
         return false;
     }
 
-    let temp_count = proto.temps.len();
-    let first_new_local = proto.locals.len();
+    let temp_count = proto.temp_count;
+    let first_new_local = proto.local_count;
     let BindingFacts {
         materialized: materialized_bindings,
         reference_captured: reference_captured_bindings,
@@ -229,9 +229,7 @@ pub(super) fn stabilize_table_constructors_in_proto(
     proto
         .local_debug_hints
         .extend((first_new_local..pass.next_local_index).map(|_| None));
-    proto
-        .locals
-        .extend((first_new_local..pass.next_local_index).map(LocalId));
+    proto.local_count = pass.next_local_index;
     proto
         .local_debug_scopes
         .extend((first_new_local..pass.next_local_index).map(|_| None));
@@ -2092,10 +2090,8 @@ fn expr_open_tail_residuals(expr: &HirExpr) -> OpenTailResiduals {
                     .map(|tail| expr_open_tail_residuals(tail.as_expr()))
                     .unwrap_or_default(),
             ),
-        HirExpr::Closure(closure) => {
-            exprs_open_tail_residuals(closure.captures.iter().map(|capture| &capture.value))
-        }
-        HirExpr::Nil
+        HirExpr::Closure(_)
+        | HirExpr::Nil
         | HirExpr::Boolean(_)
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
@@ -2149,15 +2145,7 @@ fn debug_prefix_expr_is_inert(expr: &HirExpr) -> bool {
     match expr {
         // 闭包及其 producer 保持原位：捕获已有 binding 不调用子函数，ByValue 的读取
         // 也不后移。这里只证明无 debug 回调；捕获 seed 的持有/逃逸仍由 prefix scan 判定。
-        HirExpr::Closure(closure) => closure.captures.iter().all(|capture| {
-            matches!(
-                capture.value,
-                HirExpr::ParamRef(_)
-                    | HirExpr::LocalRef(_)
-                    | HirExpr::TempRef(_)
-                    | HirExpr::UpvalueRef(_)
-            )
-        }),
+        HirExpr::Closure(_) => true,
         HirExpr::TableConstructor(constructor) => {
             constructor.fields.iter().all(|field| match field {
                 HirTableField::Array(value) => debug_prefix_expr_is_inert(value),
@@ -2243,10 +2231,14 @@ fn expr_is_fixed_set_list_value_safe(expr: &HirExpr) -> bool {
         return true;
     }
     match expr {
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .all(|capture| expr_is_data_only(&capture.value)),
+        HirExpr::Closure(closure) => closure.captures.iter().all(|capture| {
+            matches!(
+                capture.binding,
+                crate::hir::HirBinding::Param(_)
+                    | crate::hir::HirBinding::Local(_)
+                    | crate::hir::HirBinding::Temp(_)
+            )
+        }),
         HirExpr::TableConstructor(constructor) => {
             constructor.trailing_multivalue.is_none()
                 && constructor.fields.iter().all(|field| match field {
@@ -2575,29 +2567,13 @@ fn table_field_contains_nil(field: &HirTableField) -> bool {
     match field {
         HirTableField::Array(value) => expr_contains_nil(value),
         HirTableField::Record(record) => {
-            record_key_contains_nil(&record.key) || expr_contains_nil(&record.value)
+            expr_contains_nil(&record.key) || expr_contains_nil(&record.value)
         }
     }
-}
-
-fn record_key_contains_nil(key: &HirExpr) -> bool {
-    expr_contains_nil(key)
 }
 
 fn expr_contains_nil(expr: &HirExpr) -> bool {
-    struct NilProbe {
-        found: bool,
-    }
-
-    impl HirVisitor for NilProbe {
-        fn visit_expr(&mut self, expr: &HirExpr) {
-            self.found |= matches!(expr, HirExpr::Nil);
-        }
-    }
-
-    let mut probe = NilProbe { found: false };
-    crate::hir::visit::visit_expr(expr, &mut probe);
-    probe.found
+    crate::hir::visit::any_expr(expr, &mut |expr| matches!(expr, HirExpr::Nil))
 }
 
 #[cfg(test)]
@@ -3158,7 +3134,7 @@ mod tests {
                                 proto: HirProtoRef(1),
                                 captures: vec![HirCapture {
                                     mode: capture_mode,
-                                    value: HirExpr::LocalRef(captured_alias),
+                                    binding: crate::hir::HirBinding::Local(captured_alias),
                                 }],
                             },
                         ))]),
@@ -3291,7 +3267,7 @@ mod tests {
                         proto: HirProtoRef(1),
                         captures: vec![HirCapture {
                             mode: HirCaptureMode::ByReference,
-                            value: HirExpr::LocalRef(producer),
+                            binding: crate::hir::HirBinding::Local(producer),
                         }],
                     }))]),
                     initializer_merge_transaction: None,

@@ -33,8 +33,9 @@ use super::binding_flow::{
     expr_references_binding_set, stmt_references_any_binding, stmt_references_binding_set,
 };
 use super::expr_analysis::{expr_complexity, is_copy_like_expr, is_discard_safe_expr};
-use super::visit::{self, AstVisitor};
-use super::walk::{self, AstRewritePass, BlockKind};
+use super::walk::{self, AstRewritePass};
+use crate::ast::traverse::BlockKind;
+use crate::ast::visit::{self, AstVisitor};
 
 const ADJACENT_LOCAL_VALUE_COMPLEXITY_LIMIT: usize = 4;
 

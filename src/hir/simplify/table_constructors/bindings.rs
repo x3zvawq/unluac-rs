@@ -4,13 +4,12 @@
 //! 并用稳定 stmt id 索引 binding 的 use/mention 位置；不会扫描候选 region 或重建字段序列。
 //! 例如：`t[k] = v` 会在这里识别 `t` 的绑定身份，并把 `k` 作为普通语义表达式统计；
 //! 键最终能否写成 `name = value` 不属于 HIR binding facts。
+//! capture 从类型化父级身份投影到构造器的 Temp/Local 域，两种捕获模式均保留物化依赖。
 
 use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Unbounded};
 
-use crate::hir::common::{
-    HirCallExpr, HirDecisionTarget, HirExpr, HirLValue, HirStmt, HirTableField,
-};
+use crate::hir::common::{HirBinding, HirCapture, HirExpr, HirLValue, HirStmt};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::{BindingId, TableBinding};
@@ -32,6 +31,14 @@ pub(super) fn binding_from_expr(expr: &HirExpr) -> Option<TableBinding> {
         HirExpr::TempRef(temp) => Some(TableBinding::Temp(*temp)),
         HirExpr::LocalRef(local) => Some(TableBinding::Local(*local)),
         _ => None,
+    }
+}
+
+pub(super) fn binding_from_capture(binding: HirBinding) -> Option<TableBinding> {
+    match binding {
+        HirBinding::Temp(temp) => Some(TableBinding::Temp(temp)),
+        HirBinding::Local(local) => Some(TableBinding::Local(local)),
+        HirBinding::Param(_) | HirBinding::Upvalue(_) => None,
     }
 }
 
@@ -412,15 +419,9 @@ impl HirVisitor for BindingFactCollector<'_> {
         }
     }
 
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        let HirExpr::Closure(closure) = expr else {
-            return;
-        };
-        for binding in closure
-            .captures
-            .iter()
-            .filter_map(|capture| binding_from_expr(&capture.value))
-        {
+    fn visit_capture(&mut self, capture: &HirCapture) {
+        // 两种 capture 都依赖父级物化身份；ByValue 也不能随 producer 删除而变成孤儿。
+        if let Some(binding) = binding_from_capture(capture.binding) {
             *self.reference_captured.get_mut_or_default(binding) = true;
             if let Some(slot) = binding_home_slot(binding, self.promotion_facts) {
                 self.reference_captured_home_slots.insert(slot);
@@ -430,59 +431,7 @@ impl HirVisitor for BindingFactCollector<'_> {
 }
 
 pub(super) fn expr_uses_binding(expr: &HirExpr, binding: TableBinding) -> bool {
-    if matches_binding_ref(expr, binding) {
-        return true;
-    }
-
-    match expr {
-        HirExpr::TableAccess(access) => {
-            expr_uses_binding(&access.base, binding) || expr_uses_binding(&access.key, binding)
-        }
-        HirExpr::Unary(unary) => expr_uses_binding(&unary.expr, binding),
-        HirExpr::Binary(binary) => {
-            expr_uses_binding(&binary.lhs, binding) || expr_uses_binding(&binary.rhs, binding)
-        }
-        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_uses_binding(&logical.lhs, binding) || expr_uses_binding(&logical.rhs, binding)
-        }
-        HirExpr::Decision(decision) => decision.nodes.iter().any(|node| {
-            expr_uses_binding(&node.test, binding)
-                || decision_target_uses_binding(&node.truthy, binding)
-                || decision_target_uses_binding(&node.falsy, binding)
-        }),
-        HirExpr::Call(call) => call_expr_uses_binding(call, binding),
-        HirExpr::TableConstructor(table) => {
-            table.fields.iter().any(|field| match field {
-                HirTableField::Array(expr) => expr_uses_binding(expr, binding),
-                HirTableField::Record(field) => {
-                    table_key_uses_binding(&field.key, binding)
-                        || expr_uses_binding(&field.value, binding)
-                }
-            }) || table
-                .trailing_multivalue
-                .as_ref()
-                .is_some_and(|tail| expr_uses_binding(tail.as_expr(), binding))
-        }
-        HirExpr::Closure(closure) => closure
-            .captures
-            .iter()
-            .any(|capture| expr_uses_binding(&capture.value, binding)),
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::VarArg
-        | HirExpr::Unresolved(_) => false,
-        HirExpr::TempRef(_) | HirExpr::LocalRef(_) => false,
-    }
+    crate::hir::visit::any_expr(expr, &mut |expr| matches_binding_ref(expr, binding))
 }
 
 struct BindingUseCollector<'a> {
@@ -528,20 +477,4 @@ fn increment_materialized_count(counts: &mut BindingSlots<u32>, binding: TableBi
     *count = count
         .checked_add(1)
         .expect("table-constructor materialization count must fit u32");
-}
-
-fn call_expr_uses_binding(call: &HirCallExpr, binding: TableBinding) -> bool {
-    expr_uses_binding(&call.callee, binding)
-        || call.args.iter().any(|arg| expr_uses_binding(arg, binding))
-}
-
-fn decision_target_uses_binding(target: &HirDecisionTarget, binding: TableBinding) -> bool {
-    match target {
-        HirDecisionTarget::Expr(expr) => expr_uses_binding(expr, binding),
-        HirDecisionTarget::Node(_) | HirDecisionTarget::CurrentValue => false,
-    }
-}
-
-fn table_key_uses_binding(key: &HirExpr, binding: TableBinding) -> bool {
-    expr_uses_binding(key, binding)
 }
