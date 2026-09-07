@@ -451,21 +451,15 @@ pub(super) fn exclusive_break_forwarding_route(
         {
             return None;
         }
-        let range = cfg.blocks.get(block.index())?.instrs;
         let [edge] = cfg.succs.get(block.index())?.as_slice() else {
             return None;
         };
         if cfg.edges.get(edge.index())?.kind != EdgeKind::Jump {
             return None;
         }
-        let end = range.last().map_or(range.end(), |last| {
-            if proto.instrs[last.index()].is_control_terminator() {
-                range.end() - 1
-            } else {
-                range.end()
-            }
-        });
-        if !(range.start.index()..end).all(|index| matches!(proto.instrs[index], LowInstr::Move(_)))
+        if !cfg
+            .non_control_instr_range(&proto.instrs, block)
+            .all(|index| matches!(proto.instrs[index], LowInstr::Move(_)))
         {
             return None;
         }
@@ -474,22 +468,6 @@ pub(super) fn exclusive_break_forwarding_route(
         block = cfg.edges[edge.index()].to;
     }
     (!route.is_empty()).then_some(route)
-}
-
-pub(super) fn block_has_non_control_prefix(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    block: BlockRef,
-) -> bool {
-    let range = cfg.blocks[block.index()].instrs;
-    let end = range.last().map_or(range.end(), |last| {
-        if proto.instrs[last.index()].is_control_terminator() {
-            range.end() - 1
-        } else {
-            range.end()
-        }
-    });
-    range.start.index() < end
 }
 
 pub(super) fn merged_natural_loop_domain(

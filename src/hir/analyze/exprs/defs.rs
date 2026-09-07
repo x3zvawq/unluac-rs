@@ -109,7 +109,7 @@ pub(crate) fn expr_for_fixed_def_single_eval(
 
     match instr {
         LowInstr::Move(move_instr) if move_instr.dst == def_reg => {
-            if !absorbed && lowering.bindings.reg_is_reference_captured(move_instr.src) {
+            if !absorbed && lowering.dataflow.reg_is_reference_captured(move_instr.src) {
                 return None;
             }
             let expr = expr_for_reg_use_single_eval_with_call_policy(
@@ -151,7 +151,7 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             });
         }
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
-            if !absorbed && lowering.bindings.reg_is_reference_captured(unary.src) {
+            if !absorbed && lowering.dataflow.reg_is_reference_captured(unary.src) {
                 return None;
             }
             return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
@@ -172,7 +172,7 @@ pub(crate) fn expr_for_fixed_def_single_eval(
                         | ValueOperand::Nil
                         | ValueOperand::Boolean(_) => None,
                     })
-                    .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
+                    .any(|reg| lowering.dataflow.reg_is_reference_captured(reg))
             {
                 return None;
             }
@@ -190,7 +190,7 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             if !absorbed
                 && (0..concat.src.len)
                     .map(|offset| Reg(concat.src.start.index() + offset))
-                    .any(|reg| lowering.bindings.reg_is_reference_captured(reg))
+                    .any(|reg| lowering.dataflow.reg_is_reference_captured(reg))
             {
                 return None;
             }
@@ -220,10 +220,7 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
     let def_reg = lowering.dataflow.def_reg(def_id);
     let def_block = lowering.dataflow.def_block(def_id);
     let instr = lowering.proto.instrs.get(def_instr.index())?;
-    if !lowering.dataflow.effect_summaries[def_instr.index()]
-        .tags
-        .is_empty()
-    {
+    if lowering.dataflow.effect_summaries[def_instr.index()].has_effect_tags() {
         return None;
     }
 

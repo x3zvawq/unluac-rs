@@ -3,12 +3,10 @@
 use std::fmt::Write as _;
 
 use crate::debug::{
-    DebugColorMode, DebugDetail, DebugFilters, colorize_debug_text, format_breadcrumb,
+    DebugColorMode, DebugDetail, DebugFilters, collect_proto_tree, colorize_debug_text,
+    format_breadcrumb, plan_proto_focus,
 };
-use crate::parser::debug::{
-    collect_parser_proto_entries, format_literal, format_optional_source, plan_parser_focus,
-    write_elided_summary,
-};
+use crate::parser::debug::{format_literal, format_optional_source, write_elided_summary};
 use crate::parser::raw::{RawChunk, RawInstr};
 
 use super::raw::{
@@ -24,8 +22,10 @@ pub(crate) fn dump_chunk(
     color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
-    let protos = collect_parser_proto_entries(&chunk.main);
-    let plan = plan_parser_focus(&protos, filters);
+    let protos = collect_proto_tree(&chunk.main, |proto| {
+        proto.common.children.iter().map(|child| child.as_ref())
+    });
+    let plan = plan_proto_focus(&protos, filters);
 
     let layout = chunk
         .header
@@ -87,7 +87,7 @@ pub(crate) fn dump_chunk(
 
         let indent = "  ".repeat(entry.depth);
         let id = entry.id;
-        let proto = entry.proto;
+        let proto = entry.value;
         let LuaJitProtoExtra {
             flags,
             first_line,

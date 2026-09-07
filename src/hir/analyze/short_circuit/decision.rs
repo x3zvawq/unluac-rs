@@ -131,7 +131,7 @@ fn expr_for_emitted_header_leaf(
             .bindings
             .captured_temp_decl_locals
             .contains_key(&temp)
-        || lowering.bindings.reg_is_reference_captured(reg)
+        || lowering.dataflow.reg_is_reference_captured(reg)
         || lowering
             .bindings
             .local_for_reg_in_block(header, reg)

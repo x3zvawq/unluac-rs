@@ -4,7 +4,7 @@
 use super::*;
 
 impl<'a> ProtoLowerer<'a> {
-    pub(super) fn lower(&mut self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
+    pub(super) fn lower(mut self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
         let mut raw_index = 0_usize;
 
         while raw_index < self.raw.common.instructions.len() {

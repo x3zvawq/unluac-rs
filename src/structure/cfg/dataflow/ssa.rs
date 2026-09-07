@@ -4,6 +4,7 @@
 //! `Entry/Def/Phi` 身份、稀疏 block 快照、指令 use 和双向 use graph。它不识别
 //! branch/loop/short-circuit，也不决定 HIR lvalue；这些语义归属由 Structure/HIR 消费
 //! SSA 事实后完成。
+//! phi 放置与 rename 共享正式 Def 表及寄存器/指令索引，不另建 Reg 分组或复制身份配对。
 //!
 //! 输入形状：两条分支分别写 r2，随后 merge 读取 r2。
 //! 输出形状：merge 上一个 pruned phi，读取点直接引用 `SsaValue::Phi`，两条 incoming
@@ -32,25 +33,26 @@ pub(super) fn build_ssa(
     cfg: &Cfg,
     graph: &GraphFacts,
     defs: &[Def],
-    def_lookup: &[Vec<(Reg, DefId)>],
-    fixed_use_regs: &[Vec<Reg>],
+    instr_defs: &[Vec<DefId>],
+    fixed_defs_by_reg: &[Vec<DefId>],
+    fixed_uses: &FixedUseFacts<'_>,
     live_in: &[BTreeSet<Reg>],
     live_out: &[BTreeSet<Reg>],
     reg_count: usize,
-    instr_count: usize,
     incoming_slots: &[Option<usize>],
 ) -> Result<SsaAnalysis, StructureError> {
-    let mut phis = place_phis(cfg, graph, defs, live_in);
+    let mut phis = place_phis(cfg, graph, defs, fixed_defs_by_reg, live_in);
     let phi_block_ranges = super::index_phi_candidate_ranges(cfg, &phis);
     let mut block_entry_values = vec![SsaRegMap::default(); cfg.blocks.len()];
     let mut block_exit_values = vec![SsaRegMap::default(); cfg.blocks.len()];
     let mut block_end_values = vec![SsaRegMap::default(); cfg.blocks.len()];
-    let mut use_values = vec![InstrUseValues::default(); instr_count];
+    let mut use_values = vec![InstrUseValues::default(); instr_defs.len()];
     rename(
         cfg,
         graph,
-        def_lookup,
-        fixed_use_regs,
+        defs,
+        instr_defs,
+        fixed_uses,
         live_in,
         live_out,
         reg_count,
@@ -134,42 +136,41 @@ fn place_phis(
     cfg: &Cfg,
     graph: &GraphFacts,
     defs: &[Def],
+    fixed_defs_by_reg: &[Vec<DefId>],
     live_in: &[BTreeSet<Reg>],
 ) -> Vec<PhiCandidate> {
-    let mut def_blocks = std::collections::BTreeMap::<Reg, BTreeSet<BlockRef>>::new();
-    for def in defs {
-        def_blocks.entry(def.reg).or_default().insert(def.block);
-    }
     let mut placements = BTreeSet::new();
-    for (reg, blocks) in def_blocks {
-        let mut placed = BTreeSet::new();
-        let mut pending = blocks.iter().copied().collect::<VecDeque<_>>();
-        while let Some(block) = pending.pop_front() {
-            for frontier in graph.dominance_frontier_blocks(block) {
-                if !live_in[frontier.index()].contains(&reg) || !placed.insert(frontier) {
-                    continue;
-                }
-                placements.insert((frontier, reg));
-                if !blocks.contains(&frontier) {
-                    pending.push_back(frontier);
-                }
-            }
+    let entry_loop = graph
+        .natural_loop_forest()
+        .loop_for_header(cfg.entry_block)
+        .map(|id| &graph.natural_loops[id.index()]);
+    for (index, definitions) in fixed_defs_by_reg.iter().enumerate() {
+        if definitions.is_empty() {
+            continue;
         }
+        let reg = Reg(index);
+        let blocks = definitions
+            .iter()
+            .map(|def| defs[def.index()].block)
+            .collect::<BTreeSet<_>>();
+        let mut placed = BTreeSet::new();
+        graph.extend_dominance_frontier(&blocks, &mut placed, |block| {
+            live_in[block.index()].contains(&reg)
+        });
 
         // 入口块同时是 loop header 时，CFG 没有一条显式“函数入口边”，普通
         // dominance frontier 不会替 Entry(reg) 放 phi；把虚拟入口定义纳入后，
         // 回边写入才能与参数/初始栈槽正确合流。
-        for natural_loop in &graph.natural_loops {
-            if natural_loop.header == cfg.entry_block
-                && live_in[cfg.entry_block.index()].contains(&reg)
-                && natural_loop
-                    .blocks
-                    .iter()
-                    .any(|block| blocks.contains(block))
-            {
-                placements.insert((cfg.entry_block, reg));
-            }
+        if let Some(natural_loop) = entry_loop
+            && live_in[cfg.entry_block.index()].contains(&reg)
+            && natural_loop
+                .blocks
+                .iter()
+                .any(|block| blocks.contains(block))
+        {
+            placed.insert(cfg.entry_block);
         }
+        placements.extend(placed.into_iter().map(|block| (block, reg)));
     }
 
     placements
@@ -215,8 +216,9 @@ enum RenameEvent {
 fn rename(
     cfg: &Cfg,
     graph: &GraphFacts,
-    def_lookup: &[Vec<(Reg, DefId)>],
-    fixed_use_regs: &[Vec<Reg>],
+    defs: &[Def],
+    instr_defs: &[Vec<DefId>],
+    fixed_uses: &FixedUseFacts<'_>,
     live_in: &[BTreeSet<Reg>],
     live_out: &[BTreeSet<Reg>],
     reg_count: usize,
@@ -267,12 +269,14 @@ fn rename(
 
                 if let Some(indices) = super::instr_indices(cfg, block) {
                     for instr_index in indices {
-                        let mut entries = Vec::with_capacity(fixed_use_regs[instr_index].len());
-                        for &reg in &fixed_use_regs[instr_index] {
+                        let regs = fixed_uses.ssa_regs(InstrRef(instr_index));
+                        let mut entries = Vec::with_capacity(regs.size_hint().0);
+                        for reg in regs {
                             entries.push((reg, current(&stacks, reg)?));
                         }
                         use_values[instr_index].fixed = SsaRegMap::from_sorted_entries(entries)?;
-                        for &(reg, def) in &def_lookup[instr_index] {
+                        for &def in &instr_defs[instr_index] {
+                            let reg = defs[def.index()].reg;
                             let Some(stack) = stacks.get_mut(reg.index()) else {
                                 return Err(StructureError::invalid(format!(
                                     "definition {def:?} register r{} exceeds the SSA stack arena",

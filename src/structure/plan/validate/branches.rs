@@ -13,7 +13,6 @@ pub(super) fn forwarded_actions_are_empty(
 pub(super) fn validate_branch_plans(
     cfg: &Cfg,
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
     condition_edges: &ConditionEdgeIndex,
 ) -> Result<(), StructureError> {
     let mut seen = vec![false; plan.branches.len()];
@@ -58,14 +57,7 @@ pub(super) fn validate_branch_plans(
                 branch_id.index()
             )));
         }
-        let expected_condition_blocks = condition_plan.blocks().collect::<Vec<_>>();
-        if !region_matches_exact_blocks(
-            plan,
-            intervals,
-            *condition,
-            expected_condition_blocks.len(),
-            expected_condition_blocks.iter().copied(),
-        ) {
+        if !region_matches_exact_blocks(plan, *condition, condition_plan.blocks()) {
             return Err(StructureError::invalid(format!(
                 "branch payload #{} condition region has stale coverage",
                 branch_id.index()
@@ -122,7 +114,7 @@ pub(super) fn validate_branch_plans(
                     branch_id.index()
                 )));
             }
-            if !region_contains_block(plan, intervals, *condition, cfg_edge.from) {
+            if !region_contains_block(plan, *condition, cfg_edge.from) {
                 return Err(StructureError::invalid(format!(
                     "branch payload #{} edge {edge} starts outside its condition region",
                     branch_id.index()

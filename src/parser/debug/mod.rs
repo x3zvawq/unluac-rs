@@ -1,15 +1,15 @@
 //! 这个文件承载 parser 层对外暴露的调试入口。
 //!
 //! 具体某个 dialect 的 dump 逻辑放在各自目录里，这里只负责从主 pipeline state
-//! 读取 parser 产物并根据解析结果做分派；跨 dialect 的 traversal/focus/基础格式化
-//! 放在 `common`，避免每个 dialect debug 文件复制同一套展示语义。
+//! 读取 parser 产物并根据解析结果做分派；前序身份与 focus 消费共享 debug 层，
+//! Raw 模型的基础格式化放在 `common`，避免每个 dialect 复制同一套展示语义。
 
 mod common;
 
 pub(crate) use common::{
-    ParserProtoEntry, build_parser_summary_row, collect_parser_proto_entries, format_endianness,
-    format_literal, format_optional_line, format_optional_raw_word, format_optional_source,
-    format_optional_u32, format_origin, format_raw_string, plan_parser_focus, write_elided_summary,
+    format_endianness, format_literal, format_optional_line, format_optional_raw_word,
+    format_optional_source, format_optional_u32, format_origin, format_raw_string,
+    write_constants_view, write_elided_summary,
 };
 
 use crate::debug::{DebugColorMode, DebugDetail, DebugFilters, define_stage_dump};

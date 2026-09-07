@@ -37,23 +37,62 @@ pub(super) struct OpenPhi {
     pub(super) incoming: Vec<OpenIncoming>,
 }
 
-pub(super) struct OpenAnalysis {
+struct FixedUseBounds {
+    ssa_end: usize,
+    liveness_end: usize,
+}
+
+/// 固定读取直接借用 InstrEffect；这里只保存 open 来源证明的 must/may 前缀端点。
+pub(super) struct FixedUseFacts<'a> {
+    effects: &'a [InstrEffect],
+    bounds: Vec<FixedUseBounds>,
+}
+
+impl FixedUseFacts<'_> {
+    pub(super) fn ssa_regs(&self, instr: InstrRef) -> impl Iterator<Item = Reg> + '_ {
+        self.uses_with_prefix(instr, self.bounds[instr.index()].ssa_end)
+    }
+
+    pub(super) fn liveness_regs(&self, instr: InstrRef) -> impl Iterator<Item = Reg> + '_ {
+        self.uses_with_prefix(instr, self.bounds[instr.index()].liveness_end)
+    }
+
+    fn uses_with_prefix(&self, instr: InstrRef, end: usize) -> impl Iterator<Item = Reg> + '_ {
+        let effect = &self.effects[instr.index()];
+        let fixed = effect.fixed_uses();
+        let start = effect.open_use.map_or(0, Reg::index);
+        // 固定集合已升序唯一；范围覆盖的成员只从范围输出，避免重新展开、排序和去重。
+        let (before, after): (&[Reg], &[Reg]) = if start == end {
+            (fixed, &[])
+        } else {
+            let lo = fixed.partition_point(|reg| reg.index() < start);
+            let hi = fixed.partition_point(|reg| reg.index() < end);
+            (&fixed[..lo], &fixed[hi..])
+        };
+        before
+            .iter()
+            .copied()
+            .chain((start..end).map(Reg))
+            .chain(after.iter().copied())
+    }
+}
+
+pub(super) struct OpenAnalysis<'a> {
     pub(super) defs: Vec<OpenDef>,
     pub(super) use_sources: Vec<OpenUseSources>,
-    pub(super) fixed_ssa_use_regs: Vec<Vec<Reg>>,
-    pub(super) fixed_liveness_use_regs: Vec<Vec<Reg>>,
+    pub(super) fixed_uses: FixedUseFacts<'a>,
     pub(super) live_in: Vec<bool>,
     pub(super) live_out: Vec<bool>,
 }
 
-pub(super) fn analyze_open_values(
+pub(super) fn analyze_open_values<'a>(
     cfg: &Cfg,
     graph: &GraphFacts,
-    effects: &[super::super::common::InstrEffect],
+    effects: &'a [InstrEffect],
     reg_count: usize,
     entry_open_start: Option<Reg>,
     incoming_slots: &[Option<usize>],
-) -> Result<OpenAnalysis, StructureError> {
+) -> Result<OpenAnalysis<'a>, StructureError> {
     let (live_in, live_out) = solve_open_liveness(cfg, graph, effects);
     let mut defs = Vec::new();
     let mut instr_defs = vec![None; effects.len()];
@@ -117,39 +156,28 @@ pub(super) fn analyze_open_values(
     )?;
 
     let phi_sources = index_open_phi_sources(&phis)?;
-    let mut use_sources = vec![OpenUseSources::default(); effects.len()];
-    let mut fixed_ssa_use_regs = Vec::with_capacity(effects.len());
-    let mut fixed_liveness_use_regs = Vec::with_capacity(effects.len());
+    let mut use_sources = Vec::with_capacity(effects.len());
+    let mut bounds = Vec::with_capacity(effects.len());
     for (instr_index, effect) in effects.iter().enumerate() {
         let sources = open_sources_for_value(uses[instr_index], &phi_sources)?;
-        use_sources[instr_index] = sources.clone();
 
-        let mut ssa_regs = effect.fixed_uses.iter().copied().collect::<Vec<_>>();
-        let mut liveness_regs = ssa_regs.clone();
-        if let Some(start_reg) = effect.open_use {
-            let (must_end, may_end) =
-                fixed_prefix_ends(&sources, &defs, entry_open_start, start_reg, reg_count)?;
-            ssa_regs.extend((start_reg.index()..must_end).map(Reg));
-            liveness_regs.extend((start_reg.index()..may_end).map(Reg));
-        }
-        for regs in [&mut ssa_regs, &mut liveness_regs] {
-            regs.sort_unstable_by_key(|reg| reg.index());
-            regs.dedup();
-            if regs.iter().any(|reg| reg.index() >= reg_count) {
-                return Err(StructureError::invalid(format!(
-                    "open-value instruction @{instr_index} references a register outside the arena"
-                )));
-            }
-        }
-        fixed_ssa_use_regs.push(ssa_regs);
-        fixed_liveness_use_regs.push(liveness_regs);
+        // compute_reg_count 已覆盖全部固定读取；新增前缀由 fixed_prefix_ends 限定在 arena 内。
+        let (ssa_end, liveness_end) = if let Some(start_reg) = effect.open_use {
+            fixed_prefix_ends(&sources, &defs, entry_open_start, start_reg, reg_count)?
+        } else {
+            (0, 0)
+        };
+        bounds.push(FixedUseBounds {
+            ssa_end,
+            liveness_end,
+        });
+        use_sources.push(sources);
     }
 
     Ok(OpenAnalysis {
         defs,
         use_sources,
-        fixed_ssa_use_regs,
-        fixed_liveness_use_regs,
+        fixed_uses: FixedUseFacts { effects, bounds },
         live_in,
         live_out,
     })
@@ -166,13 +194,11 @@ fn solve_open_liveness(
         let Some(indices) = super::instr_indices(cfg, block) else {
             continue;
         };
-        let mut defined = false;
         for index in indices {
-            if effects[index].open_use.is_some() && !defined {
+            if effects[index].open_use.is_some() && !block_def[block.index()] {
                 block_use[block.index()] = true;
             }
             if effects[index].open_must_def.is_some() {
-                defined = true;
                 block_def[block.index()] = true;
             }
         }
@@ -215,17 +241,7 @@ fn place_open_phis(
     live_in: &[bool],
 ) -> BTreeSet<BlockRef> {
     let mut placed = BTreeSet::new();
-    let mut pending = def_blocks.iter().copied().collect::<VecDeque<_>>();
-    while let Some(block) = pending.pop_front() {
-        for frontier in graph.dominance_frontier_blocks(block) {
-            if !live_in[frontier.index()] || !placed.insert(frontier) {
-                continue;
-            }
-            if !def_blocks.contains(&frontier) {
-                pending.push_back(frontier);
-            }
-        }
-    }
+    graph.extend_dominance_frontier(def_blocks, &mut placed, |block| live_in[block.index()]);
     for natural_loop in &graph.natural_loops {
         if natural_loop.header == cfg.entry_block
             && live_in[cfg.entry_block.index()]
@@ -379,8 +395,12 @@ fn fixed_prefix_ends(
             "open use starts at r{start}, outside the register arena"
         )));
     }
-    let mut source_starts =
-        Vec::with_capacity(sources.defs().len() + usize::from(sources.has_entry()));
+    let mut source_bounds: Option<(usize, usize)> = None;
+    let mut include_start = |start| {
+        let (minimum, maximum) = source_bounds.get_or_insert((start, start));
+        *minimum = (*minimum).min(start);
+        *maximum = (*maximum).max(start);
+    };
     for def in sources.defs() {
         let Some(definition) = defs.get(def.index()) else {
             return Err(StructureError::invalid(format!(
@@ -395,7 +415,7 @@ fn fixed_prefix_ends(
                 def.index()
             )));
         }
-        source_starts.push(source_start);
+        include_start(source_start);
     }
     if sources.has_entry() {
         let Some(entry_start) = entry_open_start else {
@@ -407,15 +427,10 @@ fn fixed_prefix_ends(
                 "entry open value starts at r{entry_start}, outside the register arena"
             )));
         }
-        source_starts.push(entry_start);
+        include_start(entry_start);
     }
-    let Some(min_start) = source_starts.iter().copied().min() else {
+    let Some((min_start, max_start)) = source_bounds else {
         return Ok((start, start));
-    };
-    let Some(max_start) = source_starts.iter().copied().max() else {
-        return Err(StructureError::invalid(
-            "open-source range unexpectedly became empty",
-        ));
     };
     Ok((
         min_start.clamp(start, reg_count),

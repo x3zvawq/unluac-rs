@@ -6,7 +6,6 @@ use super::*;
 pub(super) fn validate_single_pass_plans(
     cfg: &Cfg,
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
 ) -> Result<(), StructureError> {
     if plan.single_pass_by_region.len() != plan.regions.len() {
         return Err(StructureError::invalid(
@@ -37,8 +36,8 @@ pub(super) fn validate_single_pass_plans(
         let tail = plan.region_for_block(fence.tail).ok_or_else(|| {
             StructureError::invalid(format!("single-pass payload #{index} tail is unowned"))
         })?;
-        if !intervals.contains(fence.region, entry)
-            || !intervals.contains(fence.region, tail)
+        if !plan.region_contains(fence.region, entry)
+            || !plan.region_contains(fence.region, tail)
             || fence.escape_edges.is_empty()
         {
             return Err(StructureError::invalid(format!(
@@ -81,14 +80,8 @@ pub(super) fn validate_single_pass_plans(
             })?;
             if edge.from == fence.tail
                 || edge.to != fence.continuation
-                || !intervals.contains(fence.region, source)
-                || !single_pass_escape_plan_matches(
-                    plan,
-                    intervals,
-                    fence.region,
-                    source,
-                    *edge_ref,
-                )
+                || !plan.region_contains(fence.region, source)
+                || !single_pass_escape_plan_matches(plan, fence.region, source, *edge_ref)
             {
                 return Err(StructureError::invalid(format!(
                     "single-pass payload #{index} escape edge {edge_ref} is stale: region={:?} entry={} tail={} continuation={} edge={} -> {} plan={:?}",
@@ -111,8 +104,8 @@ pub(super) fn validate_single_pass_plans(
         }
     }
     let mut fence_depth = vec![0usize; plan.regions.len()];
-    for region in &intervals.preorder {
-        let parent_depth = intervals.parent[region.index()]
+    for region in &plan.navigation.preorder {
+        let parent_depth = plan.navigation.parent[region.index()]
             .map(|parent| fence_depth[parent.index()])
             .unwrap_or(0);
         fence_depth[region.index()] =
@@ -127,7 +120,7 @@ pub(super) fn validate_single_pass_plans(
                 "single-pass control target is outside the region arena",
             ));
         };
-        Ok(intervals.contains(target, source) && source_depth > target_depth)
+        Ok(plan.region_contains(target, source) && source_depth > target_depth)
     };
     for edge_plan in &plan.edge_plans {
         let target = match edge_plan.transfer {
@@ -168,7 +161,6 @@ pub(super) fn validate_single_pass_plans(
 /// 后紧跟祖先 `break`，所以 edge 仍归 for，transfer 则指向包含它的 fence。
 pub(super) fn single_pass_escape_plan_matches(
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
     fence: RegionId,
     source: RegionId,
     edge: EdgeRef,
@@ -182,7 +174,9 @@ pub(super) fn single_pass_escape_plan_matches(
     if edge_plan.owner == fence {
         return true;
     }
-    if !intervals.contains(fence, edge_plan.owner) || !intervals.contains(edge_plan.owner, source) {
+    if !plan.region_contains(fence, edge_plan.owner)
+        || !plan.region_contains(edge_plan.owner, source)
+    {
         return false;
     }
     let Some(RegionPlan::Loop { plan: loop_id, .. }) = plan.region(edge_plan.owner) else {

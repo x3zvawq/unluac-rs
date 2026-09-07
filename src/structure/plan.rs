@@ -382,11 +382,22 @@ impl ConditionArcPolarity {
 pub struct ConditionArcPlan {
     pub source: ConditionNodeId,
     pub polarity: ConditionArcPolarity,
-    pub route: Vec<EdgeRef>,
-    /// 此语义 arc 上唯一需要 HIR 执行的 edge；forward route 可从这里覆盖物理后缀。
-    pub transfer: EdgeRef,
+    route: Vec<EdgeRef>,
+    /// 唯一可执行 edge 在冻结路径中的位置；forward route 可从这里覆盖物理后缀。
+    transfer_position: usize,
     pub connector_blocks: Vec<BlockRef>,
     pub target: ConditionTarget,
+}
+
+impl ConditionArcPlan {
+    pub fn route(&self) -> &[EdgeRef] {
+        &self.route
+    }
+
+    /// 位置由冻结时的完整 edge-plan 扫描选定；后层不按边身份反查路径。
+    pub fn transfer(&self) -> EdgeRef {
+        self.route[self.transfer_position]
+    }
 }
 
 /// condition DAG 的稠密节点。

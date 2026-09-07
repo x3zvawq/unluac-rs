@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts, PostDominatorTree};
-use crate::transformer::{LowInstr, LoweredProto};
+use crate::transformer::LoweredProto;
 
 use super::super::common::{
     BranchCandidate, BranchKind, IrreducibleRegion, LoopCandidate, ShortCircuitCandidate,

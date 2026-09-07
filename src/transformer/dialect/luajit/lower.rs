@@ -17,13 +17,13 @@ use crate::parser::{
 };
 use crate::transformer::dialect::lowering::{
     JumpSourceEnvelope, PendingLowInstr, PendingLoweringState, PendingMethodHints,
-    TargetPlaceholder, instr_pc, resolve_pending_instr_with,
+    TargetPlaceholder, raw_pc_at,
 };
 use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     Capture, CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef,
-    GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
+    GenericForCallInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr, LoweredChunk, LoweredProto,
     LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack, ReturnInstr,
     SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TailCallInstr, TransformError,
@@ -60,7 +60,7 @@ fn lower_proto(raw: &RawProto, fr2: bool) -> Result<LoweredProto, TransformError
         .iter()
         .map(|child| lower_proto(child, fr2).map(Arc::new))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut lowerer = ProtoLowerer::new(raw, fr2);
+    let lowerer = ProtoLowerer::new(raw, fr2);
     let (mut instrs, lowering_map) = lowerer.lower()?;
     let children = instantiate_closure_children(&mut instrs, children);
 
@@ -103,14 +103,13 @@ impl<'a> ProtoLowerer<'a> {
         }
     }
 
-    fn finish(&self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
+    fn finish(self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
+        let raw = self.raw;
         self.lowering.finish(
-            self.raw,
-            |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
-            instr_pc,
+            raw,
+            |raw_index| raw_index,
             |raw_index| {
-                self.raw
-                    .common
+                raw.common
                     .debug_info
                     .common
                     .line_info
@@ -118,24 +117,6 @@ impl<'a> ProtoLowerer<'a> {
                     .copied()
             },
         )
-    }
-
-    fn resolve_pending_instr(
-        &self,
-        owner_raw: usize,
-        pending: &PendingLowInstr,
-    ) -> Result<LowInstr, TransformError> {
-        let owner_pc = raw_pc_at(self.raw, owner_raw);
-        resolve_pending_instr_with(pending, |target| self.resolve_target(owner_pc, target))
-    }
-
-    fn resolve_target(
-        &self,
-        owner_pc: u32,
-        target: TargetPlaceholder,
-    ) -> Result<InstrRef, TransformError> {
-        self.lowering
-            .resolve_target(owner_pc, target, |raw_index| raw_index)
     }
 
     fn emit(
@@ -613,10 +594,6 @@ struct IterLoopHelper {
     helper_index: usize,
     body_target: usize,
     exit_target: usize,
-}
-
-fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {
-    raw.common.instructions[index].pc()
 }
 
 fn opcode_at(raw: &RawProto, index: usize) -> LuaJitOpcode {

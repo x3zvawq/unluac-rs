@@ -3,27 +3,19 @@
 //! CFG/GraphFacts/Dataflow 都是跨 dialect 共享的底层事实，所以观察视图也放在这里；
 //! 对外只暴露统一的 Structure dump，由 `src/structure/debug.rs` 负责把这些片段拼起来。
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::debug::{
-    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes,
-    colorize_debug_text, compute_focus_plan, format_breadcrumb, format_display_set,
-    format_proto_summary_row,
+    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, ProtoTreeEntry,
+    build_proto_nodes, collect_proto_tree, colorize_debug_text, compute_focus_plan,
+    format_breadcrumb, format_display_set, format_proto_summary_row, plan_proto_focus,
 };
 use crate::transformer::{LowInstr, LoweredChunk, LoweredProto};
 
 use super::common::{
-    BlockRef, CfgGraph, DataflowFacts, EffectTag, GraphFacts, OpenUseSources, SsaRegMap, SsaValue,
+    BlockRef, CfgGraph, DataflowFacts, EffectTag, GraphFacts, OpenUseSources, SideEffectSummary,
+    SsaRegMap, SsaValue,
 };
-
-#[derive(Debug, Clone, Copy)]
-struct ProtoEntry<'a, T> {
-    id: usize,
-    parent: Option<usize>,
-    depth: usize,
-    facts: &'a T,
-}
 
 #[derive(Debug, Clone, Copy)]
 struct DataflowProtoEntry<'a> {
@@ -43,8 +35,8 @@ pub(in crate::structure) fn dump_cfg_graph(
     color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
-    let entries = collect_proto_entries(graph);
-    let plan = plan_focus(&entries, filters);
+    let entries = collect_proto_tree(graph, |node| node.children.iter());
+    let plan = plan_proto_focus(&entries, filters);
 
     let _ = writeln!(output, "===== Dump CFG =====");
     let _ = writeln!(output, "cfg detail={} protos={}", detail, entries.len());
@@ -70,7 +62,7 @@ pub(in crate::structure) fn dump_cfg_graph(
             continue;
         }
 
-        let cfg = &entry.facts.cfg;
+        let cfg = &entry.value.cfg;
         let indent = "  ".repeat(entry.depth);
         let _ = writeln!(
             output,
@@ -132,8 +124,8 @@ pub(in crate::structure) fn dump_graph_facts_tree(
     color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
-    let entries = collect_proto_entries(graph_facts);
-    let plan = plan_focus(&entries, filters);
+    let entries = collect_proto_tree(graph_facts, |node| node.children.iter());
+    let plan = plan_proto_focus(&entries, filters);
 
     let _ = writeln!(output, "===== Dump GraphFacts =====");
     let _ = writeln!(
@@ -164,7 +156,7 @@ pub(in crate::structure) fn dump_graph_facts_tree(
             continue;
         }
 
-        let facts = entry.facts;
+        let facts = entry.value;
         let indent = "  ".repeat(entry.depth);
         let _ = writeln!(
             output,
@@ -302,8 +294,8 @@ pub(in crate::structure) fn dump_dataflow_facts(
                 "{indent}    @{instr_index:03} block=#{} {:<18} reads={} writes={} open-use={} open-def={} effects={} roots={:?}",
                 block.index(),
                 format_low_instr_head(instr),
-                format_display_set(&effect.fixed_uses),
-                format_display_set(&effect.fixed_must_defs),
+                format_display_set(effect.fixed_uses()),
+                format_display_set(effect.fixed_must_defs()),
                 effect
                     .open_use
                     .map(|r| r.to_string())
@@ -312,7 +304,7 @@ pub(in crate::structure) fn dump_dataflow_facts(
                     .open_must_def
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
-                format_effect_tags(&summary.tags),
+                format_effect_tags(summary),
                 summary.root_observation,
             );
         }
@@ -380,30 +372,6 @@ pub(in crate::structure) fn dump_dataflow_facts(
     colorize_debug_text(&output, color)
 }
 
-fn collect_proto_entries<'a, T>(root: &'a T) -> Vec<ProtoEntry<'a, T>>
-where
-    T: ProtoChildren<T>,
-{
-    let mut entries = Vec::new();
-    let mut pending: Vec<(&'a T, Option<usize>, usize)> = vec![(root, None, 0usize)];
-    while let Some((node, parent, depth)) = pending.pop() {
-        let id = entries.len();
-        entries.push(ProtoEntry {
-            id,
-            parent,
-            depth,
-            facts: node,
-        });
-        pending.extend(
-            node.children()
-                .iter()
-                .rev()
-                .map(|child| (child, Some(id), depth + 1)),
-        );
-    }
-    entries
-}
-
 fn collect_dataflow_entries<'a>(
     proto: &'a LoweredProto,
     cfg: &'a CfgGraph,
@@ -453,12 +421,6 @@ fn collect_dataflow_entries<'a>(
     entries
 }
 
-fn plan_focus<T>(entries: &[ProtoEntry<'_, T>], filters: &DebugFilters) -> FocusPlan {
-    let parents: Vec<Option<usize>> = entries.iter().map(|e| e.parent).collect();
-    let nodes = build_proto_nodes(&parents);
-    compute_focus_plan(&nodes, &filters.as_focus_request())
-}
-
 fn plan_focus_dataflow(entries: &[DataflowProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
     let parents: Vec<Option<usize>> = entries.iter().map(|e| e.parent).collect();
     let nodes = build_proto_nodes(&parents);
@@ -475,28 +437,25 @@ fn write_focus_header(output: &mut String, filters: &DebugFilters, plan: &FocusP
     }
 }
 
-fn build_cfg_summary_row<T>(entry: &ProtoEntry<'_, T>) -> ProtoSummaryRow
-where
-    T: ProtoChildren<T>,
-{
+fn build_cfg_summary_row(entry: &ProtoTreeEntry<&CfgGraph>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
         name: None,
         first: None,
         lines: None,
         instrs: None,
-        children: Some(entry.facts.children().len()),
+        children: Some(entry.value.children.len()),
     }
 }
 
-fn build_graph_facts_summary_row(entry: &ProtoEntry<'_, GraphFacts>) -> ProtoSummaryRow {
+fn build_graph_facts_summary_row(entry: &ProtoTreeEntry<&GraphFacts>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
         name: None,
         first: None,
         lines: None,
         instrs: None,
-        children: Some(entry.facts.children.len()),
+        children: Some(entry.value.children.len()),
     }
 }
 
@@ -508,22 +467,6 @@ fn build_dataflow_summary_row(entry: &DataflowProtoEntry<'_>) -> ProtoSummaryRow
         lines: None,
         instrs: Some(entry.proto.instrs.len()),
         children: Some(entry.proto.children.len()),
-    }
-}
-
-trait ProtoChildren<T> {
-    fn children(&self) -> &[T];
-}
-
-impl ProtoChildren<CfgGraph> for CfgGraph {
-    fn children(&self) -> &[CfgGraph] {
-        &self.children
-    }
-}
-
-impl ProtoChildren<GraphFacts> for GraphFacts {
-    fn children(&self) -> &[GraphFacts] {
-        &self.children
     }
 }
 
@@ -577,14 +520,28 @@ fn format_open_sources(sources: &OpenUseSources) -> String {
     }
 }
 
-fn format_effect_tags(tags: &BTreeSet<EffectTag>) -> String {
-    if tags.is_empty() {
+fn format_effect_tags(summary: &SideEffectSummary) -> String {
+    if !summary.has_effect_tags() {
         "[-]".to_string()
     } else {
+        let tags = [
+            (EffectTag::Alloc, "alloc"),
+            (EffectTag::ReadTable, "read-table"),
+            (EffectTag::WriteTable, "write-table"),
+            (EffectTag::ReadEnv, "read-env"),
+            (EffectTag::WriteEnv, "write-env"),
+            (EffectTag::ReadUpvalue, "read-upvalue"),
+            (EffectTag::WriteUpvalue, "write-upvalue"),
+            (EffectTag::Call, "call"),
+            (EffectTag::Metamethod, "metamethod"),
+            (EffectTag::MayThrow, "may-throw"),
+            (EffectTag::Close, "close"),
+            (EffectTag::RegisterClose, "register-close"),
+        ];
         format!(
             "[{}]",
-            tags.iter()
-                .map(|tag| format_effect_tag(*tag))
+            tags.into_iter()
+                .filter_map(|(tag, label)| summary.has_effect_tag(tag).then_some(label))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -638,23 +595,6 @@ fn format_low_instr_head(instr: &LowInstr) -> &'static str {
         LowInstr::GenericForLoop(_instr) => "generic-for-loop",
         LowInstr::Jump(_instr) => "jump",
         LowInstr::Branch(_instr) => "branch",
-    }
-}
-
-fn format_effect_tag(tag: EffectTag) -> &'static str {
-    match tag {
-        EffectTag::Alloc => "alloc",
-        EffectTag::ReadTable => "read-table",
-        EffectTag::WriteTable => "write-table",
-        EffectTag::ReadEnv => "read-env",
-        EffectTag::WriteEnv => "write-env",
-        EffectTag::ReadUpvalue => "read-upvalue",
-        EffectTag::WriteUpvalue => "write-upvalue",
-        EffectTag::Call => "call",
-        EffectTag::Metamethod => "metamethod",
-        EffectTag::MayThrow => "may-throw",
-        EffectTag::Close => "close",
-        EffectTag::RegisterClose => "register-close",
     }
 }
 

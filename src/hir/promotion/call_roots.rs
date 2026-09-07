@@ -80,7 +80,6 @@ pub(super) fn collect_unobserved_result_ends(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
-    epochs: &SlotEpochFacts,
     fixed_temps: &[TempId],
 ) -> BTreeMap<TempId, TempId> {
     dataflow
@@ -89,7 +88,7 @@ pub(super) fn collect_unobserved_result_ends(
         .filter_map(|def| {
             let producer = TempId(def.id.index());
             if fixed_temps[def.id.index()] != producer
-                || epochs.tracks_reference_capture(def.reg)
+                || dataflow.reg_is_reference_captured(def.reg)
                 || !matches!(proto.instrs[def.instr.index()], LowInstr::Call(_))
             {
                 return None;
@@ -129,7 +128,7 @@ pub(super) fn collect_frame_result_ends(
                         .into_iter()
                         .filter_map(|(reg, (temp, last_use))| {
                             (last_use < index
-                                && !effect.fixed_uses.contains(&reg)
+                                && !effect.uses_fixed(reg)
                                 && effect.open_use.is_none_or(|start| reg < start))
                             .then_some(temp)
                         })
@@ -158,7 +157,7 @@ pub(super) fn collect_frame_result_ends(
                 }
                 _ => {}
             }
-            for reg in &effect.fixed_must_defs {
+            for reg in effect.fixed_must_defs() {
                 active.remove(reg);
             }
             if let Some(start) = effect.open_must_def {

@@ -81,7 +81,7 @@ pub(super) fn condition_transfer_target(
         .iter()
         .flat_map(|node| node.arcs.iter())
         .find(|arc| {
-            arc.transfer == transfer
+            arc.transfer() == transfer
                 && matches!(
                     arc.target,
                     super::super::ConditionTarget::Truthy | super::super::ConditionTarget::Falsy

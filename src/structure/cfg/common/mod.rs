@@ -8,6 +8,7 @@ mod dataflow;
 mod graph;
 mod root_intervals;
 
+pub(crate) use dataflow::RegCaptures;
 pub(crate) use graph::{SccFacts, SccId};
 pub(crate) use root_intervals::RootIntervalIndex;
 

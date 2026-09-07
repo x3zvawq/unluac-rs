@@ -66,7 +66,6 @@ pub(super) struct ProtoBindings {
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), LocalId>,
     pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
-    pub(super) reference_captured_regs: Vec<bool>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
     pub(super) numeric_binding_phi_locals: Vec<Option<LocalId>>,
@@ -169,13 +168,6 @@ impl ProtoBindings {
             .get(&(instr_ref.index(), reg.index()))
             .copied()
             .map(BoundSlotTarget::Local)
-    }
-
-    pub(super) fn reg_is_reference_captured(&self, reg: Reg) -> bool {
-        self.reference_captured_regs
-            .get(reg.index())
-            .copied()
-            .unwrap_or(false)
     }
 }
 
@@ -455,7 +447,7 @@ fn lower_proto_one(
         .captured_shared_plan
         .take()
         .ok_or_else(|| HirLowerError::invalid("missing HIR proto lowering plan"))??;
-    let composite_protos = frame.composite_protos.clone();
+    let composite_protos = &frame.composite_protos;
     let child_results = &frame.child_results;
     let cfg = &cfg_graph.cfg;
     let child_refs = child_results
@@ -471,7 +463,7 @@ fn lower_proto_one(
         &child_refs,
         &child_mutable_upvalues,
         &captured_shared_plan,
-        &composite_protos,
+        composite_protos,
         artifacts,
     )?;
 
@@ -555,39 +547,43 @@ fn lower_proto_one(
     };
     let mutable_upvalues = mutable_upvalues_for_proto(proto, &child_mutable_upvalues);
 
+    let environment_upvalues = proto
+        .environment_upvalues
+        .iter()
+        .map(|upvalue| lowering.bindings.upvalues[upvalue.index()])
+        .collect();
+    let body = build_proto_body(id, &lowering)?;
+    let children = lowering.hir_children();
+    let bindings = lowering.bindings;
+
     artifacts.protos[id.index()] = HirProto {
         id,
         source: proto.source.as_ref().map(decode_raw_string),
         line_range: proto.line_range,
         signature: proto.signature,
-        params: lowering.bindings.params.clone(),
-        param_debug_hints: lowering.bindings.param_debug_hints.clone(),
-        local_count: lowering.bindings.local_count,
-        vararg_param_local: lowering.bindings.vararg_param_local,
-        local_debug_hints: lowering.bindings.local_debug_hints.clone(),
-        local_debug_scopes: lowering.bindings.local_debug_scopes.clone(),
+        params: bindings.params,
+        param_debug_hints: bindings.param_debug_hints,
+        local_count: bindings.local_count,
+        vararg_param_local: bindings.vararg_param_local,
+        local_debug_hints: bindings.local_debug_hints,
+        local_debug_scopes: bindings.local_debug_scopes,
         debug_scopes: accepted_debug_scopes(proto, structure),
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         inline_dispositions: Default::default(),
-        upvalues: lowering.bindings.upvalues.clone(),
-        environment_upvalues: proto
-            .environment_upvalues
-            .iter()
-            .map(|upvalue| lowering.bindings.upvalues[upvalue.index()])
-            .collect(),
+        upvalues: bindings.upvalues,
+        environment_upvalues,
         mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
-        upvalue_debug_hints: lowering.bindings.upvalue_debug_hints.clone(),
-        temp_count: lowering.bindings.temp_count,
-        temp_debug_locals: lowering.bindings.temp_debug_locals.clone(),
-        temp_debug_scopes: lowering.bindings.temp_debug_scopes.clone(),
+        upvalue_debug_hints: bindings.upvalue_debug_hints,
+        temp_count: bindings.temp_count,
+        temp_debug_locals: bindings.temp_debug_locals,
+        temp_debug_scopes: bindings.temp_debug_scopes,
         exit_requirements: collect_exit_requirements(frame.source_proto_id, structure),
-        body: build_proto_body(id, &lowering)?,
-        children: lowering.hir_children(),
+        body,
+        children,
         failure: None,
         detached_children: Vec::new(),
     };
-    drop(lowering);
     artifacts.promotion_facts[id.index()] = promotion_facts;
 
     Ok(LoweredProtoResult {

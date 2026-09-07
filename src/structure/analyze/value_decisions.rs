@@ -471,7 +471,7 @@ pub(super) fn value_decision_control_dag_is_closed(
             let pure_dead = dataflow
                 .effect_summaries
                 .get(index)
-                .is_some_and(|summary| summary.tags.is_empty())
+                .is_some_and(|summary| !summary.has_effect_tags())
                 && dataflow.instr_defs.get(index).is_some();
             if !pure_dead {
                 scratch.result_required_instrs.push(instr_ref);

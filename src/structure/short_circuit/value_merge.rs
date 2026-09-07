@@ -31,8 +31,7 @@ use super::super::common::{
 use super::super::phi_facts::short_circuit_phi_facts;
 use super::shared::{
     LinearFollowCtx, LinearFollowTarget, block_has_ignore_call, block_is_passthrough,
-    block_writes_reg, is_reducible_candidate, short_circuit_nodes_are_acyclic,
-    truthy_falsy_targets,
+    is_reducible_candidate, short_circuit_nodes_are_acyclic, truthy_falsy_targets,
 };
 
 pub(super) fn analyze_value_merge_candidates(
@@ -350,7 +349,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         .follow(
             target,
             |block| block != self.phi.block && self.postdom_tree.dominates(self.phi.block, block),
-            |block, _| {
+            |block| {
                 terminal = self.value_leaf_carrier(block);
                 terminal.is_some()
             },
@@ -372,7 +371,11 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
     /// carrier 必须是唯一后继、无普通写入的透明块；最终 incoming 还要确实包含
     /// 当前叶值，不能仅凭 CFG 可达性把中途已被覆盖的 def 算进候选。
     fn value_leaf_carrier(&self, leaf: BlockRef) -> Option<(BTreeSet<BlockRef>, BlockRef)> {
-        if !block_writes_reg(self.proto, self.dataflow, self.cfg, leaf, self.phi.reg)
+        let range = self.cfg.blocks[leaf.index()].instrs;
+        if self
+            .dataflow
+            .last_fixed_def_in_range(self.phi.reg, range.start.index()..range.end())
+            .is_none()
             || block_has_ignore_call(self.proto, self.cfg, leaf)
         {
             return None;

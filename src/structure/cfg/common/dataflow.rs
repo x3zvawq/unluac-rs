@@ -4,6 +4,7 @@
 //! 下游应通过这里提供的查询接口读取定义、phi 和 reaching/use 信息，而不是直接依赖
 //! 这些事实在内存中的当前组织形状。`RootObservation` 保留观察期间的物理栈合同，
 //! 与 SSA 读写和副作用标签分别表达值依赖、可见事件及 root 存活边界。
+//! 寄存器捕获模式保留整个 proto 的按值/引用事实，包括不可达 closure；它不表示某点的开放 cell。
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -60,6 +61,13 @@ impl SsaRegMap {
     }
 }
 
+/// 同一物理寄存器可在不同 closure 中同时按值和按引用捕获，两种模式分别保留。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RegCaptures {
+    pub(crate) by_value: bool,
+    pub(crate) by_reference: bool,
+}
+
 /// 一个 proto 的数据流事实，以及它的子 proto 事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataflowFacts {
@@ -67,8 +75,10 @@ pub struct DataflowFacts {
     pub effect_summaries: Vec<SideEffectSummary>,
     pub defs: Vec<Def>,
     pub open_defs: Vec<OpenDef>,
+    /// 同条指令的 fixed Def 按 Reg 严格递增，保留 effect 的有序写入域。
     pub instr_defs: Vec<Vec<DefId>>,
     pub(crate) fixed_defs_by_reg: Vec<Vec<DefId>>,
+    pub(crate) reg_captures: Vec<RegCaptures>,
     pub(crate) root_intervals: super::RootIntervalIndex,
     pub block_entry_values: Vec<SsaRegMap>,
     pub block_exit_values: Vec<SsaRegMap>,
@@ -94,6 +104,45 @@ pub struct DataflowFacts {
 }
 
 impl DataflowFacts {
+    /// 按块内指令顺序借用已冻结的 fixed Def 身份；不含 open result，也不裁剪不可达块。
+    pub(crate) fn fixed_defs_in_block(
+        &self,
+        cfg: &Cfg,
+        block: BlockRef,
+    ) -> impl Iterator<Item = DefId> + '_ {
+        let range = cfg.blocks[block.index()].instrs;
+        self.instr_defs[range.start.index()..range.end()]
+            .iter()
+            .flatten()
+            .copied()
+    }
+
+    pub(crate) fn reg_is_captured(&self, reg: Reg) -> bool {
+        self.reg_captures
+            .get(reg.index())
+            .is_some_and(|capture| capture.by_value || capture.by_reference)
+    }
+
+    pub(crate) fn reg_is_reference_captured(&self, reg: Reg) -> bool {
+        self.reg_captures
+            .get(reg.index())
+            .is_some_and(|capture| capture.by_reference)
+    }
+
+    pub(crate) fn reference_captured_regs(&self) -> impl Iterator<Item = Reg> + '_ {
+        self.reg_captures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, capture)| capture.by_reference.then_some(Reg(index)))
+    }
+
+    /// 返回按 low 指令顺序排列的全部固定定义，包含不可达块，不推断 reaching value。
+    pub(crate) fn fixed_defs_for_reg(&self, reg: Reg) -> &[DefId] {
+        self.fixed_defs_by_reg
+            .get(reg.index())
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// 同一 low 指令区间中的首次必定覆写，包含 fixed def 与开放结果后缀。
     pub(crate) fn first_must_write_in_range(
         &self,
@@ -326,24 +375,24 @@ impl DataflowFacts {
             return None;
         }
         let last_use = uses.iter().map(|use_| use_.instr.index()).max()?;
-        for index in last_use + 1..cfg.blocks[block.index()].instrs.end() {
-            let summary = &self.effect_summaries[index];
-            if summary.may_observe_gc_roots() || summary.root_observation != RootObservation::None {
-                return None;
-            }
-            if self.instr_effects[index].must_define(home) {
-                return self.instr_def_for_reg(InstrRef(index), home);
-            }
+        let start = last_use + 1;
+        let overwrite =
+            self.first_must_write_in_range(home, start..cfg.blocks[block.index()].instrs.end())?;
+        // 覆写本条指令也可能先观察旧 root；无观察的 open 覆写仍须具有精确 fixed Def。
+        if self
+            .root_intervals
+            .has_observation(start..overwrite.index() + 1)
+        {
+            return None;
         }
-        None
+        self.instr_def_for_reg(overwrite, home)
     }
 
     pub fn instr_def_for_reg(&self, instr: InstrRef, reg: Reg) -> Option<DefId> {
-        self.instr_defs
-            .get(instr.index())?
-            .iter()
-            .copied()
-            .find(|def_id| self.def_reg(*def_id) == reg)
+        let defs = self.instr_defs.get(instr.index())?;
+        defs.binary_search_by_key(&reg, |&def| self.def_reg(def))
+            .ok()
+            .map(|index| defs[index])
     }
 
     pub fn phi_used_only_in_block(&self, phi_id: PhiId, block: BlockRef) -> bool {
@@ -402,6 +451,17 @@ impl DataflowFacts {
         false
     }
 
+    /// 块内固定定义经 phi 传播后的真实读取是否越界；不把 phi 所在块视作逃逸。
+    pub(crate) fn block_defs_have_use_outside(
+        &self,
+        cfg: &Cfg,
+        block: BlockRef,
+        allowed_blocks: &BTreeSet<BlockRef>,
+    ) -> bool {
+        self.fixed_defs_in_block(cfg, block)
+            .any(|def| self.def_has_use_outside(cfg, def, allowed_blocks))
+    }
+
     /// 判断一个底层定义经任意 phi 传播后，是否在允许区域之外被真实指令读取。
     pub fn def_has_use_outside(
         &self,
@@ -446,18 +506,64 @@ impl DataflowFacts {
 }
 
 /// 一条 low-IR 指令在数据流层的固定/开放读写摘要。
+/// 构造时统一排序去重，随后只借用固定读写域；消费者的可变工作集由其自己持有。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstrEffect {
-    pub fixed_uses: BTreeSet<Reg>,
-    pub fixed_must_defs: BTreeSet<Reg>,
+    fixed_uses: Box<[Reg]>,
+    fixed_must_defs: Box<[Reg]>,
     pub open_use: Option<Reg>,
     pub open_must_def: Option<Reg>,
 }
 
 impl InstrEffect {
+    pub(crate) fn new(
+        mut fixed_uses: Vec<Reg>,
+        mut fixed_must_defs: Vec<Reg>,
+        open_use: Option<Reg>,
+        open_must_def: Option<Reg>,
+    ) -> Self {
+        fixed_uses.sort_unstable();
+        fixed_uses.dedup();
+        fixed_must_defs.sort_unstable();
+        fixed_must_defs.dedup();
+        Self {
+            fixed_uses: fixed_uses.into_boxed_slice(),
+            fixed_must_defs: fixed_must_defs.into_boxed_slice(),
+            open_use,
+            open_must_def,
+        }
+    }
+
+    /// 完整固定读取域，按 Reg 严格递增；不包含 open use 的动态后缀。
+    pub fn fixed_uses(&self) -> &[Reg] {
+        &self.fixed_uses
+    }
+
+    /// 完整固定必定写入域，按 Reg 严格递增。
+    pub fn fixed_must_defs(&self) -> &[Reg] {
+        &self.fixed_must_defs
+    }
+
+    pub fn uses_fixed(&self, reg: Reg) -> bool {
+        self.fixed_uses.binary_search(&reg).is_ok()
+    }
+
+    pub fn fixed_uses_from(&self, from: Reg) -> &[Reg] {
+        &self.fixed_uses[self.fixed_uses.partition_point(|reg| *reg < from)..]
+    }
+
+    pub fn fixed_defs_intersect_uses(&self, other: &Self) -> bool {
+        let (small, large) = if self.fixed_must_defs.len() <= other.fixed_uses.len() {
+            (&self.fixed_must_defs, &other.fixed_uses)
+        } else {
+            (&other.fixed_uses, &self.fixed_must_defs)
+        };
+        small.iter().any(|reg| large.binary_search(reg).is_ok())
+    }
+
     /// 指令是否必定覆盖该固定寄存器；open result 从起始槽一直覆盖到栈顶。
     pub fn must_define(&self, reg: Reg) -> bool {
-        self.fixed_must_defs.contains(&reg)
+        self.fixed_must_defs.binary_search(&reg).is_ok()
             || self
                 .open_must_def
                 .is_some_and(|start| reg.index() >= start.index())
@@ -467,25 +573,34 @@ impl InstrEffect {
 /// 一条指令的副作用摘要。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SideEffectSummary {
-    pub tags: BTreeSet<EffectTag>,
+    tags: u16,
     pub root_observation: RootObservation,
 }
 
 impl SideEffectSummary {
+    pub fn has_effect_tags(&self) -> bool {
+        self.tags != 0
+    }
+
+    pub fn has_effect_tag(&self, tag: EffectTag) -> bool {
+        self.tags & tag as u16 != 0
+    }
+
+    pub(crate) fn add_tag(&mut self, tag: EffectTag) {
+        self.tags |= tag as u16;
+    }
+
     /// 可能调用用户代码或触发分配的事件；不把 frame exit 或 cleanup 的专用协议混进来。
     pub fn may_observe_gc_roots(&self) -> bool {
-        self.tags.iter().any(|tag| {
-            matches!(
-                tag,
-                EffectTag::Alloc
-                    | EffectTag::ReadTable
-                    | EffectTag::WriteTable
-                    | EffectTag::ReadEnv
-                    | EffectTag::WriteEnv
-                    | EffectTag::Call
-                    | EffectTag::Metamethod
-            )
-        })
+        self.tags
+            & (EffectTag::Alloc as u16
+                | EffectTag::ReadTable as u16
+                | EffectTag::WriteTable as u16
+                | EffectTag::ReadEnv as u16
+                | EffectTag::WriteEnv as u16
+                | EffectTag::Call as u16
+                | EffectTag::Metamethod as u16)
+            != 0
     }
 }
 
@@ -526,19 +641,20 @@ impl RootObservation {
 
 /// 当前阶段关心的副作用标签。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(u16)]
 pub enum EffectTag {
-    Alloc,
-    ReadTable,
-    WriteTable,
-    ReadEnv,
-    WriteEnv,
-    ReadUpvalue,
-    WriteUpvalue,
-    Call,
-    Metamethod,
-    MayThrow,
-    Close,
-    RegisterClose,
+    Alloc = 1 << 0,
+    ReadTable = 1 << 1,
+    WriteTable = 1 << 2,
+    ReadEnv = 1 << 3,
+    WriteEnv = 1 << 4,
+    ReadUpvalue = 1 << 5,
+    WriteUpvalue = 1 << 6,
+    Call = 1 << 7,
+    Metamethod = 1 << 8,
+    MayThrow = 1 << 9,
+    Close = 1 << 10,
+    RegisterClose = 1 << 11,
 }
 
 /// 一个固定寄存器定义的唯一身份。

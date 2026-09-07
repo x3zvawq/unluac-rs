@@ -160,7 +160,7 @@ pub(crate) fn expr_for_reg_use_dup_safe(
     instr_ref: InstrRef,
     reg: Reg,
 ) -> Option<HirExpr> {
-    (!lowering.bindings.reg_is_reference_captured(reg))
+    (!lowering.dataflow.reg_is_reference_captured(reg))
         .then(|| expr_for_reg_use_inline(lowering, block, instr_ref, reg))
 }
 
@@ -185,7 +185,7 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
     // 被整体吸收的 decision 可以省掉内部机械 temp，但不能省掉按引用 capture 的
     // 词法 local：任意 child call 都可能经 upvalue 改写它，旧 SSA def 不是调用后的值。
     if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg)
-        && (!absorbed || lowering.bindings.reg_is_reference_captured(reg))
+        && (!absorbed || lowering.dataflow.reg_is_reference_captured(reg))
     {
         return HirExpr::LocalRef(local);
     }
@@ -320,7 +320,7 @@ fn def_has_later_use_after_pure_wrapper(
     let range = lowering.cfg.blocks[def_block.index()].instrs;
     for instr_index in (wrapper_instr.index() + 1)..range.end() {
         let effect = &lowering.dataflow.instr_effects[instr_index];
-        if effect.fixed_uses.contains(&def_reg)
+        if effect.uses_fixed(def_reg)
             && !matches!(lowering.proto.instrs[instr_index], LowInstr::Branch(_))
         {
             return true;
@@ -341,11 +341,9 @@ fn def_has_intervening_barrier(
     if def_instr.index() >= consumer_instr.index() {
         return false;
     }
-    let defined_regs = &lowering.dataflow.instr_effects[def_instr.index()].fixed_must_defs;
+    let producer = &lowering.dataflow.instr_effects[def_instr.index()];
     ((def_instr.index() + 1)..consumer_instr.index()).any(|instr_index| {
-        !defined_regs.is_disjoint(&lowering.dataflow.instr_effects[instr_index].fixed_uses)
-            || !lowering.dataflow.effect_summaries[instr_index]
-                .tags
-                .is_empty()
+        producer.fixed_defs_intersect_uses(&lowering.dataflow.instr_effects[instr_index])
+            || lowering.dataflow.effect_summaries[instr_index].has_effect_tags()
     })
 }

@@ -225,7 +225,10 @@ pub(super) fn closed_single_entry_linear_interiors(
         .collect::<Vec<_>>();
     interiors
         .iter()
-        .all(|block| cfg.reachable_predecessors(*block).len() == 1)
+        .all(|block| {
+            cfg.unique_reachable_predecessor_matching(*block, |_| true)
+                .is_some()
+        })
         .then_some(interiors)
 }
 

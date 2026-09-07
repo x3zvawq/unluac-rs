@@ -17,7 +17,6 @@ pub(super) fn collect_lexical_scopes(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     structure: &ReadyStructureFacts,
-    epochs: &SlotEpochFacts,
     mut scopes: Vec<Range<usize>>,
 ) -> Vec<Range<usize>> {
     let debug_defs = structure
@@ -34,9 +33,7 @@ pub(super) fn collect_lexical_scopes(
             .debug_bindings()
             .accepted
             .iter()
-            .filter_map(|fact| {
-                debug_closure_window(proto, cfg, dataflow, epochs, &debug_defs, fact)
-            }),
+            .filter_map(|fact| debug_closure_window(proto, cfg, dataflow, &debug_defs, fact)),
     );
     retain_non_crossing(scopes)
 }
@@ -45,7 +42,6 @@ fn debug_closure_window(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
-    epochs: &SlotEpochFacts,
     debug_defs: &BTreeSet<DefId>,
     fact: &DebugBindingFact,
 ) -> Option<Range<usize>> {
@@ -90,7 +86,7 @@ fn debug_closure_window(
             || matches!(instr, LowInstr::Close(_) | LowInstr::Tbc(_))
             || effect.open_use.is_some()
             || effect.open_must_def.is_some()
-            || effect.fixed_uses.iter().any(|&reg| {
+            || effect.fixed_uses().iter().any(|&reg| {
                 reg.index() >= fact.reg.index()
                     && !matches!(dataflow.use_value(InstrRef(index), reg),
                         SsaValue::Def(def) if values.contains_key(&def))
@@ -125,7 +121,7 @@ fn debug_closure_window(
             // 候选拒绝[ProofIncomplete]：外层写、额外 debug binding、捕获 cell 或逃逸 def/phi 需独立 owner 证明，当前单 binding 窗口未覆盖。
             if reg.index() < fact.reg.index()
                 || (reg == fact.reg && def != binding)
-                || epochs.tracks_reference_capture(reg)
+                || dataflow.reg_is_reference_captured(reg)
                 || (def != binding && debug_defs.contains(&def))
                 || dataflow.def_uses[def.index()]
                     .iter()

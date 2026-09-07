@@ -17,7 +17,7 @@ pub(super) fn synthesize_direct_condition_arcs(
         .nodes
         .iter()
         .map(|node| -> Result<Option<_>, StructureError> {
-            let Some((truthy_edge, falsy_edge)) = semantic_branch_edges(proto, cfg, node.header)
+            let Some((truthy_edge, falsy_edge)) = cfg.predicate_edges(&proto.instrs, node.header)
             else {
                 return Ok(None);
             };
@@ -168,21 +168,6 @@ pub(super) fn synthesize_direct_condition_arc(
     }))
 }
 
-pub(super) fn semantic_branch_edges(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    header: super::super::BlockRef,
-) -> Option<(super::super::EdgeRef, super::super::EdgeRef)> {
-    let (then_edge, else_edge) = cfg.branch_edges(header)?;
-    match cfg.terminator(&proto.instrs, header) {
-        Some(crate::transformer::LowInstr::Branch(branch)) if branch.cond.negated => {
-            Some((else_edge, then_edge))
-        }
-        Some(crate::transformer::LowInstr::Branch(_)) => Some((then_edge, else_edge)),
-        _ => None,
-    }
-}
-
 pub(super) fn safe_condition_candidate(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
@@ -195,7 +180,7 @@ pub(super) fn safe_condition_candidate(
         .enumerate()
         .skip(1)
         .find_map(|(index, node)| {
-            (block_has_escaping_defs(cfg, dataflow, candidate, node.header)
+            (dataflow.block_defs_have_use_outside(cfg, node.header, &candidate.blocks)
                 || block_has_unabsorbed_effects(cfg, dataflow, node.header, workspace))
             .then_some(index)
         });
@@ -304,23 +289,8 @@ pub(super) fn block_has_unabsorbed_effects(
 
     (range.start.index()..predicate.index()).any(|index| {
         dataflow.effect_summaries.get(index).is_none_or(|summary| {
-            !summary.tags.is_empty() && !workspace.needs_instr(InstrRef(index))
+            summary.has_effect_tags() && !workspace.needs_instr(InstrRef(index))
         })
-    })
-}
-
-pub(super) fn block_has_escaping_defs(
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    condition: &ShortCircuitCandidate,
-    block: super::super::BlockRef,
-) -> bool {
-    let range = cfg.blocks[block.index()].instrs;
-    (range.start.index()..range.end()).any(|instr| {
-        dataflow.instr_defs[instr]
-            .iter()
-            .copied()
-            .any(|def| dataflow.def_has_use_outside(cfg, def, &condition.blocks))
     })
 }
 

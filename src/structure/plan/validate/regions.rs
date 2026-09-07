@@ -54,7 +54,7 @@ pub(super) fn validate_containment(plan: &StructurePlan) -> Result<(), Structure
                 })
                 .collect(),
         };
-        for child in owned {
+        for &child in &owned {
             let Some(child_plan) = plan.regions.get(child.index()) else {
                 return Err(StructureError::invalid(format!(
                     "region {owner:?} references missing child {child:?}"
@@ -66,8 +66,8 @@ pub(super) fn validate_containment(plan: &StructurePlan) -> Result<(), Structure
                 )));
             }
             references[child.index()] += 1;
-            children[index].push(child);
         }
+        children[index] = owned;
     }
     for (index, count) in references.into_iter().enumerate() {
         let expected = usize::from(index != plan.root.index());
@@ -101,28 +101,25 @@ pub(super) fn validate_containment(plan: &StructurePlan) -> Result<(), Structure
 
 pub(super) fn region_contains_block(
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
     region: RegionId,
     block: BlockRef,
 ) -> bool {
     plan.region_for_block(block)
-        .is_some_and(|owner| intervals.contains(region, owner))
+        .is_some_and(|owner| plan.region_contains(region, owner))
 }
 
 pub(super) fn region_matches_exact_blocks<I>(
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
     region: RegionId,
-    expected_len: usize,
     expected_blocks: I,
 ) -> bool
 where
     I: IntoIterator<Item = BlockRef>,
+    I::IntoIter: ExactSizeIterator,
 {
-    plan.region_blocks(region).len() == expected_len
-        && expected_blocks
-            .into_iter()
-            .all(|block| region_contains_block(plan, intervals, region, block))
+    let mut expected_blocks = expected_blocks.into_iter();
+    plan.region_blocks(region).len() == expected_blocks.len()
+        && expected_blocks.all(|block| region_contains_block(plan, region, block))
 }
 
 pub(super) fn validate_block_coverage(
@@ -132,24 +129,7 @@ pub(super) fn validate_block_coverage(
     let mut claims = vec![None; cfg.blocks.len()];
     for (index, region) in plan.regions.iter().enumerate() {
         let owner = RegionId(index);
-        let blocks = match region {
-            RegionPlan::Block { block, .. } => vec![*block],
-            RegionPlan::Unstructured { layout, .. } => layout
-                .iter()
-                .filter_map(|item| match item {
-                    UnstructuredLayoutItem::Block(block) => Some(*block),
-                    UnstructuredLayoutItem::Region(_) => None,
-                })
-                .collect(),
-            RegionPlan::ValueDecision { plan: decision, .. } => plan
-                .value_decision(*decision)
-                .map(|decision| decision.blocks().collect())
-                .unwrap_or_default(),
-            RegionPlan::Sequence { .. } | RegionPlan::Branch { .. } | RegionPlan::Loop { .. } => {
-                Vec::new()
-            }
-        };
-        for block in blocks {
+        let mut claim = |block: BlockRef| {
             let Some(slot) = claims.get_mut(block.index()) else {
                 return Err(StructureError::invalid(format!(
                     "region {owner:?} claims missing block {block}"
@@ -160,6 +140,23 @@ pub(super) fn validate_block_coverage(
                     "block {block} is claimed by multiple regions"
                 )));
             }
+            Ok(())
+        };
+        match region {
+            RegionPlan::Block { block, .. } => claim(*block)?,
+            RegionPlan::Unstructured { layout, .. } => layout
+                .iter()
+                .filter_map(|item| match item {
+                    UnstructuredLayoutItem::Block(block) => Some(*block),
+                    UnstructuredLayoutItem::Region(_) => None,
+                })
+                .try_for_each(&mut claim)?,
+            RegionPlan::ValueDecision { plan: decision, .. } => plan
+                .value_decision(*decision)
+                .into_iter()
+                .flat_map(|decision| decision.blocks())
+                .try_for_each(&mut claim)?,
+            RegionPlan::Sequence { .. } | RegionPlan::Branch { .. } | RegionPlan::Loop { .. } => {}
         }
     }
     for block in &cfg.block_order {
@@ -181,12 +178,11 @@ pub(super) fn validate_block_coverage(
 pub(super) fn validate_region_entries(
     cfg: &Cfg,
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
 ) -> Result<(), StructureError> {
-    let expected_island_ports = intervals.collect_island_ports(cfg, &plan.regions)?;
+    let expected_island_ports = plan.navigation.collect_island_ports(cfg, &plan.regions)?;
     for (index, region) in plan.regions.iter().enumerate() {
         let region_id = RegionId(index);
-        let boundary = intervals.boundary(region_id).ok_or_else(|| {
+        let boundary = plan.region_boundary(region_id).ok_or_else(|| {
             StructureError::invalid(format!("region #{index} has no boundary summary"))
         })?;
         match region {
@@ -200,7 +196,7 @@ pub(super) fn validate_region_entries(
                         cfg.reachable_blocks.contains(&source)
                             && plan
                                 .region_for_block(source)
-                                .is_some_and(|owner| !intervals.contains(region_id, owner))
+                                .is_some_and(|owner| !plan.region_contains(region_id, owner))
                     })
                     .count();
                 if boundary.entry_count != through_entry {
@@ -215,7 +211,7 @@ pub(super) fn validate_region_entries(
                 exits,
                 ..
             } => {
-                if !region_contains_block(plan, intervals, region_id, *entry) {
+                if !region_contains_block(plan, region_id, *entry) {
                     return Err(StructureError::invalid(format!(
                         "unstructured region #{index} entry block is outside its containment"
                     )));

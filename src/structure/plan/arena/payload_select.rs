@@ -344,13 +344,7 @@ pub(super) fn freeze_condition(
             frozen_blocks.push(node.block);
         }
         for arc in &node.arcs {
-            let transfer_position = arc
-                .route
-                .iter()
-                .position(|edge| *edge == arc.transfer)
-                .ok_or_else(|| {
-                    StructureError::invalid("condition transfer is outside its physical route")
-                })?;
+            let transfer_position = arc.transfer_position;
             // transfer 之后的 connector 已由 forward route 物理覆盖，不属于会被
             // condition 表达式吸收的控制分区。
             for block in arc.connector_blocks.iter().copied().take(transfer_position) {

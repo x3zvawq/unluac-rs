@@ -97,10 +97,6 @@ pub(super) fn build_bindings(
                 .and_then(|name| name.as_ref().map(decode_raw_string))
         })
         .collect::<Vec<_>>();
-    let reference_captured_regs = (0..usize::from(proto.frame.max_stack_size))
-        .map(Reg)
-        .map(|reg| captured_slot_epochs.tracks_reference_capture(reg))
-        .collect::<Vec<_>>();
     let mut local_count = 0;
     let mut local_debug_hints = Vec::new();
     let mut entry_local_regs = BTreeMap::new();
@@ -256,9 +252,8 @@ pub(super) fn build_bindings(
         phi_temps.push(TempId(next_temp_index));
         next_temp_index += 1;
     }
-    let captured_regs = captured_regs(proto);
     let nested_carried_parents =
-        coalesce_nested_loop_carried_temps(structure.plan(), &captured_regs, &mut phi_temps);
+        coalesce_nested_loop_carried_temps(structure.plan(), dataflow, &mut phi_temps);
     let nested_carried_child_owners = nested_carried_parents
         .iter()
         .enumerate()
@@ -274,7 +269,6 @@ pub(super) fn build_bindings(
         cfg,
         dataflow,
         structure.plan(),
-        &captured_regs,
         &nested_carried_parents,
         (&numeric_binding_phis.bindings, &phi_debug_hints),
         (&mut phi_temps, &mut fixed_temps),
@@ -285,11 +279,7 @@ pub(super) fn build_bindings(
         dataflow,
         structure.plan(),
         captured_slot_epochs,
-        (
-            &captured_regs,
-            &numeric_binding_phis.bindings,
-            &phi_debug_hints,
-        ),
+        (&numeric_binding_phis.bindings, &phi_debug_hints),
         (&phi_temps, &mut fixed_temps),
     );
     // 只有下面实际分配 HIR staging 身份的 owner 才登记；复用 carried temp 的
@@ -335,7 +325,7 @@ pub(super) fn build_bindings(
                     structure.plan(),
                     loop_id,
                     result.target,
-                    &captured_regs,
+                    dataflow,
                     &nested_carried_child_owners,
                     &phi_temps,
                 ) {
@@ -491,10 +481,8 @@ pub(super) fn build_bindings(
             cfg,
             dataflow,
             structure,
-            captured_slot_epochs,
             captured_slots.lexical_scopes,
         ),
-        reference_captured_regs,
         entry_local_regs,
         numeric_for_locals,
         numeric_binding_phi_locals,

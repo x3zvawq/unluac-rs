@@ -1,75 +1,28 @@
 //! 这个文件承载 parser debug 输出里的跨 dialect 公共工具。
 //!
-//! dialect debug 需要展示的方言字段各不相同，但 proto traversal、focus/elide 规则、
-//! RawString/literal/origin 这类基础格式化是一致的；集中在这里可以避免每个 dialect
-//! debug 文件复制同一套展示细节。
+//! dialect debug 需要展示的方言字段各不相同，但 RawString/literal/origin 的基础格式化
+//! 是一致的；这里消费共享 debug 层的前序身份与 focus，不重新遍历 proto 树。
+//! 例如同一子 proto 在树视图和常量视图中共享前序 id 与折叠状态；方言只选择视图布局，
+//! 不重新声明身份记录或遍历规则。独立常量视图读取公共 literal 池，不解释方言私有常量。
 
 use std::fmt::Write as _;
 
-use crate::debug::{
-    DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes, compute_focus_plan,
-    format_proto_summary_row,
-};
+use crate::debug::{FocusPlan, ProtoSummaryRow, ProtoTreeEntry, format_proto_summary_row};
 use crate::parser::{DecodedText, Endianness, Origin, RawLiteralConst, RawProto, RawString, Span};
-
-/// 各 dialect parser dump 复用的 `(id, parent, depth, proto)` 快照。
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ParserProtoEntry<'a> {
-    pub id: usize,
-    pub parent: Option<usize>,
-    pub depth: usize,
-    pub proto: &'a RawProto,
-}
-
-/// 收集 proto tree 的前序遍历视图，供 focus plan 和 elided 行共用。
-pub(crate) fn collect_parser_proto_entries(root: &RawProto) -> Vec<ParserProtoEntry<'_>> {
-    let mut entries = Vec::new();
-    // proto 遍历不占用 Rust 调用栈。Luau 平表可以合法地包含数千层词法嵌套，
-    // parser debug 不能把解码阶段已经移除的深度风险重新引入。
-    let mut pending = vec![(root, None, 0usize)];
-    while let Some((proto, parent, depth)) = pending.pop() {
-        let id = entries.len();
-        entries.push(ParserProtoEntry {
-            id,
-            parent,
-            depth,
-            proto,
-        });
-        pending.extend(
-            proto
-                .common
-                .children
-                .iter()
-                .rev()
-                .map(|child| (child.as_ref(), Some(id), depth + 1)),
-        );
-    }
-    entries
-}
-
-/// 根据 parser proto traversal 生成统一 focus plan。
-pub(crate) fn plan_parser_focus(
-    entries: &[ParserProtoEntry<'_>],
-    filters: &DebugFilters,
-) -> FocusPlan {
-    let parents: Vec<Option<usize>> = entries.iter().map(|entry| entry.parent).collect();
-    let nodes = build_proto_nodes(&parents);
-    compute_focus_plan(&nodes, &filters.as_focus_request())
-}
 
 /// 把 `RawProto` 压成 elided 行。parser 阶段拿不到函数名，只能呈现
 /// `lines / instrs / children` 三项，这些都从 `RawProto::common` 里直接取得。
-pub(crate) fn build_parser_summary_row(entry: &ParserProtoEntry<'_>) -> ProtoSummaryRow {
+fn build_parser_summary_row(entry: &ProtoTreeEntry<&RawProto>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
         name: None,
         first: None,
         lines: Some((
-            entry.proto.common.line_range.defined_start,
-            entry.proto.common.line_range.defined_end,
+            entry.value.common.line_range.defined_start,
+            entry.value.common.line_range.defined_end,
         )),
-        instrs: Some(entry.proto.common.instructions.len()),
-        children: Some(entry.proto.common.children.len()),
+        instrs: Some(entry.value.common.instructions.len()),
+        children: Some(entry.value.common.children.len()),
     }
 }
 
@@ -77,13 +30,45 @@ pub(crate) fn build_parser_summary_row(entry: &ParserProtoEntry<'_>) -> ProtoSum
 pub(crate) fn write_elided_summary(
     output: &mut String,
     indent: &str,
-    entry: &ParserProtoEntry<'_>,
+    entry: &ProtoTreeEntry<&RawProto>,
 ) {
     let _ = writeln!(
         output,
         "{indent}{}",
         format_proto_summary_row(&build_parser_summary_row(entry)),
     );
+}
+
+pub(crate) fn write_constants_view(
+    output: &mut String,
+    protos: &[ProtoTreeEntry<&RawProto>],
+    plan: &FocusPlan,
+) {
+    let _ = writeln!(output, "constants");
+    if plan.focus.is_none() {
+        let _ = writeln!(output, "  <no proto matched filters>");
+        return;
+    }
+
+    for entry in protos {
+        if plan.is_elided(entry.id) {
+            write_elided_summary(output, "  ", entry);
+            continue;
+        }
+        if !plan.is_visible(entry.id) {
+            continue;
+        }
+
+        let _ = writeln!(output, "  proto#{}", entry.id);
+        let literals = &entry.value.common.constants.common.literals;
+        if literals.is_empty() {
+            let _ = writeln!(output, "    <empty>");
+        } else {
+            for (index, literal) in literals.iter().enumerate() {
+                let _ = writeln!(output, "    k{index:<3} {}", format_literal(literal));
+            }
+        }
+    }
 }
 
 pub(crate) fn format_optional_source(source: Option<&RawString>) -> String {

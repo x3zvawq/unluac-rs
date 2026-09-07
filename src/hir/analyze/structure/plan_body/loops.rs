@@ -59,17 +59,13 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 return self.invalid_region(region, "normal-tail payload and region slot disagree");
             }
         };
-        let protocol = self
-            .lowering
-            .structure
-            .plan()
-            .loop_protocol(plan)
-            .cloned()
-            .ok_or(HirLowerError::InvalidPlanRegion {
+        let protocol = self.lowering.structure.plan().loop_protocol(plan).ok_or(
+            HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
                 region: region.index(),
                 detail: "loop payload has no finalized VM protocol",
-            })?;
+            },
+        )?;
         let mut lowered = match protocol {
             LoopVmProtocol::While(protocol) => self.lower_while_loop(
                 region,
@@ -77,7 +73,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 body,
                 normal_tail,
                 propagated_break,
-                protocol,
+                *protocol,
             ),
             LoopVmProtocol::Repeat(protocol) if normal_tail.is_none() => {
                 self.lower_repeat_loop(region, plan, control, body, protocol)
@@ -91,7 +87,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     normal_tail,
                 },
                 body,
-                protocol,
+                *protocol,
             ),
             LoopVmProtocol::GenericFor(protocol) => self.lower_generic_for(
                 region,
@@ -102,7 +98,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     normal_tail,
                 },
                 body,
-                protocol,
+                *protocol,
             ),
             LoopVmProtocol::WhileTrue if normal_tail.is_none() => {
                 if preheader.is_some() {
@@ -135,9 +131,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let body_edge = protocol.body_edge;
         let exit_edge = protocol.exit_edge;
         let cond = if protocol.body_on_truthy {
-            condition.cond.clone()
+            condition.cond
         } else {
-            condition.cond.clone().negate()
+            condition.cond.negate()
         };
         let exit_transfer = self.planned_edge(region, exit_edge)?.transfer;
         let cross_loop_transfer = match exit_transfer {
@@ -241,34 +237,29 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         plan: crate::structure::LoopPlanId,
         control: RegionId,
         mut body: HirBlock,
-        protocol: LoopRepeatProtocol,
+        protocol: &LoopRepeatProtocol,
     ) -> Result<HirBlock, HirLowerError> {
-        let condition =
+        let mut condition =
             self.lower_loop_condition(region, control, Some(protocol.condition.condition))?;
         let backedge = protocol.condition.body_edge;
         let exit = protocol.condition.exit_edge;
         let exit_cond = if protocol.condition.body_on_truthy {
-            condition.cond.clone().negate()
+            condition.cond.negate()
         } else {
-            condition.cond.clone()
+            condition.cond
         };
-        let exit_plan = self
-            .lowering
-            .structure
-            .plan()
-            .edge_plan(exit)
-            .cloned()
-            .ok_or(HirLowerError::InvalidPlanRegion {
+        let exit_plan = self.lowering.structure.plan().edge_plan(exit).ok_or(
+            HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
                 region: region.index(),
                 detail: "repeat exit has no final edge plan",
-            })?;
+            },
+        )?;
         let staged_temps = self
             .lowering
             .bindings
             .repeat_staged_temps
             .get(plan.index())
-            .cloned()
             .ok_or(HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
                 region: region.index(),
@@ -284,7 +275,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             .value_plan
             .staged_results
             .iter()
-            .zip(&staged_temps)
+            .zip(staged_temps)
             .filter(|(result, temp)| !self.repeat_stage_is_direct(result.target, **temp))
             .map(|(result, temp)| Ok((*temp, self.ssa_expr(region, result.normal_value)?)))
             .collect::<Result<Vec<_>, HirLowerError>>()?;
@@ -292,7 +283,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             .value_plan
             .staged_results
             .iter()
-            .zip(&staged_temps)
+            .zip(staged_temps)
             .filter(|(result, temp)| !self.repeat_stage_is_direct(result.target, **temp))
             .map(|(result, temp)| {
                 let target = self
@@ -315,23 +306,18 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
 
         let mut body_stmts = Vec::new();
         if protocol.prefix_placement == crate::structure::LoopConditionPrefixPlacement::BeforeBody {
-            body_stmts.extend(condition.prefix.clone());
+            body_stmts.append(&mut condition.prefix);
         }
         body_stmts.append(&mut body.stmts);
         if protocol.prefix_placement == crate::structure::LoopConditionPrefixPlacement::AfterBody {
             body_stmts.extend(condition.prefix);
         }
         if !normal_stage.is_empty() {
-            body_stmts.push(assign_stmt(
-                normal_stage
-                    .iter()
-                    .map(|(temp, _)| HirLValue::Temp(*temp))
-                    .collect::<Vec<_>>(),
-                normal_stage
-                    .iter()
-                    .map(|(_, value)| value.clone())
-                    .collect::<Vec<_>>(),
-            ));
+            let (targets, values): (Vec<_>, Vec<_>) = normal_stage
+                .into_iter()
+                .map(|(temp, value)| (HirLValue::Temp(temp), value))
+                .unzip();
+            body_stmts.push(assign_stmt(targets, values));
         }
         let backedge_stmts = if protocol.value_plan.backedge_copies.is_empty() {
             self.lower_edge(region, backedge)?.stmts
@@ -372,16 +358,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 lifetime: Default::default(),
             }))];
             if !final_stage.is_empty() {
-                stmts.push(assign_stmt(
-                    final_stage
-                        .iter()
-                        .map(|(target, _)| target.clone())
-                        .collect::<Vec<_>>(),
-                    final_stage
-                        .iter()
-                        .map(|(_, value)| value.clone())
-                        .collect::<Vec<_>>(),
-                ));
+                let (targets, values): (Vec<_>, Vec<_>) = final_stage.into_iter().unzip();
+                stmts.push(assign_stmt(targets, values));
             }
             if protocol.exit_after_loop {
                 stmts.extend(self.lower_edge(region, exit)?.stmts);

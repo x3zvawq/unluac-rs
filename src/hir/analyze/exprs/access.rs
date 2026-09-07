@@ -389,9 +389,9 @@ fn reg_use_is_env(
             LowInstr::GetUpvalue(get_upvalue) => {
                 return matches!(get_upvalue.src, UpvalueOperand::Env(_))
                     && def_instr.index() < instr_ref.index()
-                    && (((def_instr.index() + 1)..instr_ref.index())
-                        .all(|index| lowering.dataflow.effect_summaries[index].tags.is_empty())
-                        || access_is_global_decl(lowering, instr_ref, key));
+                    && (((def_instr.index() + 1)..instr_ref.index()).all(|index| {
+                        !lowering.dataflow.effect_summaries[index].has_effect_tags()
+                    }) || access_is_global_decl(lowering, instr_ref, key));
             }
             LowInstr::Move(move_instr) => {
                 value = lowering.dataflow.use_value(def_instr, move_instr.src);

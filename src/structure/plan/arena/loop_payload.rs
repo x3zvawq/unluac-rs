@@ -72,13 +72,7 @@ pub(super) fn loop_exit_crosses_resource_boundary(
                 event_start = close.index() + 1;
             }
         }
-        let event_end = range.last().map_or(range.end(), |last| {
-            if proto.instrs[last.index()].is_control_terminator() {
-                last.index()
-            } else {
-                range.end()
-            }
-        });
+        let event_end = cfg.non_control_instr_range(&proto.instrs, target).end;
         if closed_resource && event_start < event_end {
             break true;
         }

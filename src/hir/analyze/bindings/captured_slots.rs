@@ -483,11 +483,7 @@ pub(super) fn lexical_scope_evaluation_start(
         if effect.open_use.is_some() || effect.open_must_def.is_some() {
             return None;
         }
-        for &reg in effect
-            .fixed_uses
-            .iter()
-            .filter(|reg| reg.index() >= from.index())
-        {
+        for &reg in effect.fixed_uses_from(from) {
             let SsaValue::Def(def) = dataflow.use_value(InstrRef(instr_index), reg) else {
                 return None;
             };
@@ -505,7 +501,7 @@ pub(super) fn lexical_scope_evaluation_start(
     for instr_index in earliest..=slot_start {
         let effect = dataflow.instr_effects.get(instr_index)?;
         if effect
-            .fixed_must_defs
+            .fixed_must_defs()
             .iter()
             .any(|reg| reg.index() < from.index())
             || effect.open_use.is_some()
@@ -514,9 +510,9 @@ pub(super) fn lexical_scope_evaluation_start(
             return None;
         }
         let touches_scope_window = effect
-            .fixed_uses
+            .fixed_uses()
             .iter()
-            .chain(effect.fixed_must_defs.iter())
+            .chain(effect.fixed_must_defs().iter())
             .any(|reg| reg.index() >= from.index());
         if !included.contains(&instr_index) && !touches_scope_window {
             return None;

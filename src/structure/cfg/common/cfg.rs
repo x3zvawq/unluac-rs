@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
+use std::ops::Range;
 
 use crate::transformer::{InstrRef, LowInstr};
 
@@ -151,6 +152,25 @@ pub enum EdgeKind {
 }
 
 impl Cfg {
+    /// 当前 low 快照中去掉块末控制指令的区间，空块保持为空。
+    ///
+    /// 例如 Close; Jump 仍包含 Close；范围本身不证明前缀可移动或可省略。
+    pub(crate) fn non_control_instr_range(
+        &self,
+        instrs: &[LowInstr],
+        block: BlockRef,
+    ) -> Range<usize> {
+        let range = self.blocks[block.index()].instrs;
+        let end = range.last().map_or(range.end(), |last| {
+            if instrs[last.index()].is_control_terminator() {
+                last.index()
+            } else {
+                range.end()
+            }
+        });
+        range.start.index()..end
+    }
+
     /// block 末尾指令通常决定了边形态，所以这里提供统一入口避免各层重复取尾。
     pub fn terminator<'a>(&self, instrs: &'a [LowInstr], block: BlockRef) -> Option<&'a LowInstr> {
         self.blocks
@@ -176,6 +196,22 @@ impl Cfg {
             .find(|edge_ref| matches!(self.edges[edge_ref.index()].kind, EdgeKind::BranchFalse))?;
 
         Some((*then_edge, *else_edge))
+    }
+
+    /// 正谓词的真假边；区别于已应用 cond.negated 的物理 BranchTrue/BranchFalse。
+    ///
+    /// 例如 not p 的 BranchFalse 对应 p 为真，短路候选与最终弧计划共享此映射。
+    pub fn predicate_edges(
+        &self,
+        instrs: &[LowInstr],
+        block: BlockRef,
+    ) -> Option<(EdgeRef, EdgeRef)> {
+        let (then_edge, else_edge) = self.branch_edges(block)?;
+        match self.terminator(instrs, block) {
+            Some(LowInstr::Branch(branch)) if branch.cond.negated => Some((else_edge, then_edge)),
+            Some(LowInstr::Branch(_)) => Some((then_edge, else_edge)),
+            _ => None,
+        }
     }
 
     /// 返回去重后的 reachable successors。

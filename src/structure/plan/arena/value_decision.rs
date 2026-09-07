@@ -294,21 +294,10 @@ pub(super) fn freeze_value_decision_arc(
         }
     };
 
-    let (branch_true, branch_false) = cfg
-        .branch_edges(node.header)
+    let (truthy, falsy) = cfg
+        .predicate_edges(&proto.instrs, node.header)
         .ok_or_else(|| StructureError::invalid("value decision node is not a CFG branch"))?;
-    let physical_truthy = if predicate.cond.negated {
-        branch_false
-    } else {
-        branch_true
-    };
-    let first = if semantic_truthy {
-        physical_truthy
-    } else if physical_truthy == branch_true {
-        branch_false
-    } else {
-        branch_true
-    };
+    let first = if semantic_truthy { truthy } else { falsy };
     let polarity = match cfg.edges[first.index()].kind {
         EdgeKind::BranchTrue => super::super::ConditionArcPolarity::BranchTrue,
         EdgeKind::BranchFalse => super::super::ConditionArcPolarity::BranchFalse,
@@ -494,7 +483,8 @@ pub(super) fn freeze_condition_arc(
         arc.edges.last().copied().ok_or_else(|| {
             StructureError::invalid("condition route is missing its terminal edge")
         })?;
-    let transfer = condition_arc_transfer_edge(&arc.edges, edge_plans)?;
+    let transfer_position = condition_arc_transfer_position(&arc.edges, edge_plans)?;
+    let transfer = arc.edges[transfer_position];
     let edge_target = cfg.edges[last.index()].to;
     let target = match &arc.target {
         crate::structure::common::ShortCircuitTarget::Node(node) => {
@@ -541,25 +531,25 @@ pub(super) fn freeze_condition_arc(
         source: super::super::ConditionNodeId(arc.source.index()),
         polarity,
         route: arc.edges.clone(),
-        transfer,
+        transfer_position,
         connector_blocks,
         target,
     })
 }
 
-pub(super) fn condition_arc_transfer_edge(
+fn condition_arc_transfer_position(
     route: &[EdgeRef],
     edge_plans: Option<&[EdgePlan]>,
-) -> Result<EdgeRef, StructureError> {
+) -> Result<usize, StructureError> {
     let last = route
-        .last()
-        .copied()
+        .len()
+        .checked_sub(1)
         .ok_or_else(|| StructureError::invalid("condition route is empty"))?;
     let Some(edge_plans) = edge_plans else {
         return Ok(last);
     };
     let mut transfer = None;
-    for edge in route {
+    for (position, edge) in route.iter().enumerate() {
         let edge_plan = edge_plans.get(edge.index()).ok_or_else(|| {
             StructureError::invalid("condition route references a missing final edge plan")
         })?;
@@ -572,7 +562,7 @@ pub(super) fn condition_arc_transfer_edge(
                         super::super::BranchArm::Truthy | super::super::BranchArm::Falsy
                     )
             );
-        if !inert && transfer.replace(*edge).is_some() {
+        if !inert && transfer.replace(position).is_some() {
             return Err(StructureError::invalid(
                 "condition route contains multiple executable edge transfers",
             ));

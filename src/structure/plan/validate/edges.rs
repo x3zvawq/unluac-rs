@@ -45,8 +45,6 @@ pub(super) fn mark_block(index: &mut [bool], block: BlockRef) {
 pub(super) fn validate_edges(
     cfg: &Cfg,
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
-    edge_regions: &RegionNavigation,
     condition_edges: &ConditionEdgeIndex,
     loop_edges: &LoopEdgeIndex,
 ) -> Result<(), StructureError> {
@@ -56,7 +54,7 @@ pub(super) fn validate_edges(
     let layout_edges =
         super::super::arena::layout_edge_facts(cfg, &plan.regions, &plan.navigation)?;
     let validation_index = EdgeValidationIndex::new(cfg, plan);
-    validate_forward_routes(cfg, plan, intervals, condition_edges, &validation_index)?;
+    validate_forward_routes(cfg, plan, &validation_index)?;
     for (index, edge_plan) in plan.edge_plans.iter().enumerate() {
         if edge_plan.edge.index() != index || edge_plan.owner.index() >= plan.regions.len() {
             return Err(StructureError::invalid(format!(
@@ -114,22 +112,21 @@ pub(super) fn validate_edges(
             let target = plan.region_for_block(edge.to).ok_or_else(|| {
                 StructureError::invalid(format!("edge #{index} target has no region"))
             })?;
-            edge_regions
-                .edge_relation(edge_plan.edge)
+            plan.edge_region_relation(edge_plan.edge)
                 .and_then(|relation| relation.lca)
                 .ok_or_else(|| {
                     StructureError::invalid(format!(
                         "edge #{index} has no containment owner while validating fallthrough"
                     ))
                 })?;
-            if let Some(source_child) = edge_regions
-                .edge_relation(edge_plan.edge)
+            if let Some(source_child) = plan
+                .edge_region_relation(edge_plan.edge)
                 .and_then(|relation| relation.source_child)
                 && matches!(
                     plan.region(source_child),
                     Some(RegionPlan::Unstructured { .. })
                 )
-                && !intervals.contains(source_child, target)
+                && !plan.region_contains(source_child, target)
                 && !plan
                     .navigation
                     .region_can_complete_from(source_child, source, edge.from)
@@ -200,16 +197,10 @@ pub(super) fn validate_edges(
                 let source = plan.region_for_block(edge.from).ok_or_else(|| {
                     StructureError::invalid(format!("edge #{index} source has no region"))
                 })?;
-                if !intervals.contains(region, source)
+                if !plan.region_contains(region, source)
                     || edge.to != fence.continuation
                     || fence.escape_edges.binary_search(&edge_plan.edge).is_err()
-                    || !single_pass_escape_plan_matches(
-                        plan,
-                        intervals,
-                        region,
-                        source,
-                        edge_plan.edge,
-                    )
+                    || !single_pass_escape_plan_matches(plan, region, source, edge_plan.edge)
                 {
                     return Err(StructureError::invalid(format!(
                         "edge #{index} does not match single-pass region #{}",
@@ -236,7 +227,7 @@ pub(super) fn validate_edges(
                 let source = plan.region_for_block(edge.from).ok_or_else(|| {
                     StructureError::invalid(format!("edge #{index} source has no region"))
                 })?;
-                if !intervals.contains(region, source) {
+                if !plan.region_contains(region, source) {
                     return Err(StructureError::invalid(format!(
                         "edge #{index} {} -> {} {:?} loop region #{} does not contain source owner #{} ({:?})",
                         edge.from,
@@ -248,7 +239,7 @@ pub(super) fn validate_edges(
                     )));
                 }
                 if matches!(edge_plan.transfer, EdgeTransfer::Break(_))
-                    && !intervals.contains(*body, source)
+                    && !plan.region_contains(*body, source)
                     && !loop_edges.has_exit(*loop_id, edge_plan.edge)
                 {
                     return Err(StructureError::invalid(format!(
@@ -267,15 +258,7 @@ pub(super) fn validate_edges(
                     }
                     EdgeTransfer::Break(_) => {
                         loop_.continuation == Some(edge.to) && edge_plan.forward_route.is_none()
-                            || validate_break_forwarding_route(
-                                cfg,
-                                plan,
-                                intervals,
-                                edge_plan,
-                                region,
-                                loop_.continuation,
-                                &validation_index,
-                            )?
+                            || validate_break_forwarding_route(cfg, plan, edge_plan, region)?
                     }
                     _ => false,
                 };
@@ -285,7 +268,7 @@ pub(super) fn validate_edges(
                 // ownership 因而仍属于内层 syntax region，transfer target 才是祖先。
                 let nested_syntax_exit = matches!(edge_plan.transfer, EdgeTransfer::Break(_))
                     && edge_plan.owner != region
-                    && intervals.contains(region, edge_plan.owner)
+                    && plan.region_contains(region, edge_plan.owner)
                     && matches!(
                         plan.region(edge_plan.owner),
                         Some(RegionPlan::Loop {
@@ -405,15 +388,7 @@ pub(super) fn validate_condition_internal_route(
     node_index: usize,
     arc: &super::super::ConditionArcPlan,
 ) -> Result<(), StructureError> {
-    let transfer_position = arc
-        .route
-        .iter()
-        .position(|edge| *edge == arc.transfer)
-        .ok_or_else(|| {
-            StructureError::invalid(format!(
-                "condition payload #{condition_index} node {node_index} transfer is outside its route"
-            ))
-        })?;
+    let transfer_position = arc.transfer_position;
     let internal_len = match arc.target {
         ConditionTarget::Node(_) => {
             if transfer_position + 1 != arc.route.len() {
@@ -458,7 +433,7 @@ pub(super) fn validate_condition_internal_route(
     if matches!(arc.target, ConditionTarget::Truthy | ConditionTarget::Falsy)
         && transfer_position + 1 < arc.route.len()
     {
-        let edge_plan = plan.edge_plan(arc.transfer).ok_or_else(|| {
+        let edge_plan = plan.edge_plan(arc.transfer()).ok_or_else(|| {
             StructureError::invalid(format!(
                 "condition payload #{condition_index} transfer edge has no final plan"
             ))
@@ -485,8 +460,6 @@ pub(super) fn validate_condition_internal_route(
 pub(super) fn validate_forward_routes(
     cfg: &Cfg,
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
-    _condition_edges: &ConditionEdgeIndex,
     index: &EdgeValidationIndex,
 ) -> Result<(), StructureError> {
     let edge_count = cfg.edges.len();
@@ -650,7 +623,7 @@ pub(super) fn validate_forward_routes(
         if route.kind == ForwardRouteKind::ExclusiveBreak
             && entry.is_none_or(|entry| {
                 plan.region_for_block(cfg.edges[entry.index()].from)
-                    .is_none_or(|source| !intervals.contains(route.loop_region, source))
+                    .is_none_or(|source| !plan.region_contains(route.loop_region, source))
             })
         {
             return Err(StructureError::invalid(format!(
@@ -743,8 +716,8 @@ pub(super) fn validate_forward_routes(
                         if is_last
                             && ancestor != owner
                             && edge_plan.owner == ancestor
-                            && intervals.contains(ancestor, owner)
-                            && intervals.contains(ancestor, source_owner)
+                            && plan.region_contains(ancestor, owner)
+                            && plan.region_contains(ancestor, source_owner)
                             && matches!(
                                 plan.region(ancestor),
                                 Some(RegionPlan::Loop { plan: loop_id, .. })
@@ -787,11 +760,11 @@ pub(super) fn validate_forward_routes(
                             && edge_plan.owner == nested
                             && edge_plan.forward_route.is_none()
                             && edge_plan.iteration.is_empty()
-                            && intervals.contains(owner, nested)
-                            && intervals.contains(nested, source_owner)
+                            && plan.region_contains(owner, nested)
+                            && plan.region_contains(nested, source_owner)
                             && plan.region_for_block(cfg_edge.to).is_some_and(|target_owner| {
-                                !intervals.contains(nested, target_owner)
-                                    && intervals.contains(*body, target_owner)
+                                !plan.region_contains(nested, target_owner)
+                                    && plan.region_contains(*body, target_owner)
                             })
                             && matches!(
                                 plan.region(nested),
@@ -801,7 +774,7 @@ pub(super) fn validate_forward_routes(
                             )
                 );
                 if index.continue_barriers[cfg_edge.from.index()]
-                    || !intervals.contains(*body, source_owner)
+                    || !plan.region_contains(*body, source_owner)
                     || plan.navigation.has_unstructured_ancestor(source_owner)
                     || cfg.succs[cfg_edge.from.index()].as_slice() != [edge]
                     || cfg_edge.kind != EdgeKind::Jump
@@ -844,7 +817,7 @@ pub(super) fn validate_forward_routes(
                 if index.continue_barriers[cfg_edge.from.index()]
                     || plan.navigation.has_unstructured_ancestor(source_owner)
                     || if condition_edge {
-                        !intervals.contains(*control, source_owner)
+                        !plan.region_contains(*control, source_owner)
                             || if is_last {
                                 !terminal_transfer
                             } else {
@@ -857,7 +830,7 @@ pub(super) fn validate_forward_routes(
                                 )
                             }
                     } else {
-                        !intervals.contains(*body, source_owner)
+                        !plan.region_contains(*body, source_owner)
                             || cfg.succs[cfg_edge.from.index()].as_slice() != [edge]
                             || cfg_edge.kind != EdgeKind::Jump
                             || cfg.blocks[cfg_edge.from.index()].instrs.len != 1
@@ -901,11 +874,8 @@ pub(super) fn validate_continue_forwarding_route(
 pub(super) fn validate_break_forwarding_route(
     cfg: &Cfg,
     plan: &StructurePlan,
-    _intervals: &RegionNavigation,
     entry: &super::super::EdgePlan,
     loop_region: RegionId,
-    _continuation: Option<crate::structure::BlockRef>,
-    _validation_index: &EdgeValidationIndex,
 ) -> Result<bool, StructureError> {
     let Some(route_id) = entry.forward_route else {
         return Ok(false);

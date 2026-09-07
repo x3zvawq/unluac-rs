@@ -31,12 +31,12 @@ pub(crate) fn dump_dataflow_proto(
         let uses = facts
             .instr_effects
             .get(index)
-            .map(|effect| format_display_set(&effect.fixed_uses))
+            .map(|effect| format_display_set(effect.fixed_uses()))
             .unwrap_or_else(|| "[-]".to_owned());
         let defs = facts
             .instr_effects
             .get(index)
-            .map(|effect| format_display_set(&effect.fixed_must_defs))
+            .map(|effect| format_display_set(effect.fixed_must_defs()))
             .unwrap_or_else(|| "[-]".to_owned());
         let _ = writeln!(
             output,

@@ -21,7 +21,7 @@ pub(super) fn build_closed_branch_control_dag(
         if header != root && claimed.get(header.index()).copied().unwrap_or(true) {
             return None;
         }
-        let (truthy_edge, falsy_edge) = truthy_falsy_edges(proto, cfg, header)?;
+        let (truthy_edge, falsy_edge) = cfg.predicate_edges(&proto.instrs, header)?;
         for (truthy, edge) in [(true, truthy_edge), (false, falsy_edge)] {
             let arc = follow_closed_branch_arc(
                 proto,
@@ -70,7 +70,7 @@ pub(super) fn finalize_closed_control_dag(
             .iter()
             .copied()
             .filter(|header| *header != root)
-            .any(|header| block_defs_escape(cfg, dataflow, header, &blocks))
+            .any(|header| dataflow.block_defs_have_use_outside(cfg, header, &blocks))
         || !connector_defs_stay_inside(cfg, dataflow, &raw_arcs, &blocks)
         || !is_reducible_candidate(cfg, root, &blocks)
     {
@@ -274,7 +274,7 @@ pub(super) fn build_raw_condition_index(
         let Some(owner) = owner_by_block[header.index()] else {
             continue;
         };
-        let Some((truthy_edge, falsy_edge)) = truthy_falsy_edges(proto, cfg, header) else {
+        let Some((truthy_edge, falsy_edge)) = cfg.predicate_edges(&proto.instrs, header) else {
             owner_conflicts[owner] = true;
             continue;
         };
@@ -464,7 +464,7 @@ pub(super) fn build_closed_control_dag(
         .copied()
         .filter(|header| *header != root.header)
     {
-        if block_defs_escape(cfg, dataflow, header, &raw_blocks) {
+        if dataflow.block_defs_have_use_outside(cfg, header, &raw_blocks) {
             workspace.blocked.insert(header, blocked_epoch);
         }
     }
@@ -586,19 +586,6 @@ pub(super) fn build_closed_control_dag(
     })
 }
 
-pub(super) fn truthy_falsy_edges(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    header: BlockRef,
-) -> Option<(EdgeRef, EdgeRef)> {
-    let (then_edge, else_edge) = cfg.branch_edges(header)?;
-    match cfg.terminator(&proto.instrs, header) {
-        Some(LowInstr::Branch(branch)) if branch.cond.negated => Some((else_edge, then_edge)),
-        Some(LowInstr::Branch(_)) => Some((then_edge, else_edge)),
-        _ => None,
-    }
-}
-
 pub(super) fn connector_block_is_safe(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -622,22 +609,7 @@ pub(super) fn connector_block_is_safe(
         dataflow
             .effect_summaries
             .get(index)
-            .is_some_and(|summary| summary.tags.is_empty())
-    })
-}
-
-pub(super) fn block_defs_escape(
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    block: BlockRef,
-    allowed_blocks: &BTreeSet<BlockRef>,
-) -> bool {
-    let range = cfg.blocks[block.index()].instrs;
-    (range.start.index()..range.end()).any(|instr| {
-        dataflow.instr_defs[instr]
-            .iter()
-            .copied()
-            .any(|def| dataflow.def_has_use_outside(cfg, def, allowed_blocks))
+            .is_some_and(|summary| !summary.has_effect_tags())
     })
 }
 
@@ -649,7 +621,7 @@ pub(super) fn connector_defs_stay_inside(
 ) -> bool {
     arcs.iter()
         .flat_map(|arc| arc.connector_blocks.iter().copied())
-        .all(|block| !block_defs_escape(cfg, dataflow, block, allowed_blocks))
+        .all(|block| !dataflow.block_defs_have_use_outside(cfg, block, allowed_blocks))
 }
 
 pub(super) fn reachable_predecessor_count(cfg: &Cfg, block: BlockRef) -> usize {

@@ -359,6 +359,9 @@ impl<'a> HirFlowGraph<'a> {
     }
 
     pub(super) fn has_reachable_unresolved_goto(&self) -> bool {
+        if self.unresolved_gotos.is_empty() {
+            return false;
+        }
         let reachable = self.reachable();
         self.unresolved_gotos
             .iter()

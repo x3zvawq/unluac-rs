@@ -17,8 +17,9 @@ mod focus;
 pub(crate) use colorize::colorize_debug_text;
 #[cfg(feature = "decompile-debug")]
 pub(crate) use focus::{
-    FocusPlan, FocusRequest, ProtoNode, ProtoSummaryRow, build_proto_nodes, compute_focus_plan,
-    format_breadcrumb, format_proto_summary_row,
+    FocusPlan, FocusRequest, ProtoNode, ProtoSummaryRow, ProtoTreeEntry, build_proto_nodes,
+    collect_proto_tree, compute_focus_plan, format_breadcrumb, format_proto_summary_row,
+    plan_proto_focus,
 };
 
 /// 生成一对 `#[cfg(feature)]` / `#[cfg(not)]` 的阶段 dump 入口。

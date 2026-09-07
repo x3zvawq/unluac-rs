@@ -7,23 +7,15 @@
 use std::fmt::Write as _;
 
 use crate::debug::{
-    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes,
-    colorize_debug_text, compute_focus_plan, define_stage_dump, format_breadcrumb,
-    format_proto_summary_row,
+    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, ProtoTreeEntry,
+    collect_proto_tree, colorize_debug_text, define_stage_dump, format_breadcrumb,
+    format_proto_summary_row, plan_proto_focus,
 };
 use crate::decompile::DecompileDialect;
 
 use super::{
     DebugLocalKind, LoweredChunk, LoweredProto, RawInstrRef, UpvalueRef, format_low_instr,
 };
-
-#[derive(Debug, Clone, Copy)]
-struct ProtoEntry<'a> {
-    id: usize,
-    parent: Option<usize>,
-    depth: usize,
-    proto: &'a LoweredProto,
-}
 
 define_stage_dump! {
     /// Transformer 阶段的调试导出。
@@ -44,8 +36,10 @@ fn dump_lir_chunk(
     color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
-    let protos = collect_proto_entries(&chunk.main);
-    let plan = plan_focus(&protos, filters);
+    let protos = collect_proto_tree(&chunk.main, |proto| {
+        proto.children.iter().map(|child| child.as_ref())
+    });
+    let plan = plan_proto_focus(&protos, filters);
 
     let _ = writeln!(output, "===== Dump LIR =====");
     let _ = writeln!(
@@ -71,53 +65,23 @@ fn dump_lir_chunk(
     colorize_debug_text(&output, color)
 }
 
-fn collect_proto_entries(root: &LoweredProto) -> Vec<ProtoEntry<'_>> {
-    let mut entries = Vec::new();
-    // Debug dump 与 lowering 消费同一棵深 Luau 树；使用显式 DFS 栈，开启 dump
-    // 也不会把合法 proto 深度变成进程栈溢出。
-    let mut pending = vec![(root, None, 0usize)];
-    while let Some((proto, parent, depth)) = pending.pop() {
-        let id = entries.len();
-        entries.push(ProtoEntry {
-            id,
-            parent,
-            depth,
-            proto,
-        });
-        pending.extend(
-            proto
-                .children
-                .iter()
-                .rev()
-                .map(|child| (child.as_ref(), Some(id), depth + 1)),
-        );
-    }
-    entries
-}
-
-fn plan_focus(protos: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
-    let parents: Vec<Option<usize>> = protos.iter().map(|e| e.parent).collect();
-    let nodes = build_proto_nodes(&parents);
-    compute_focus_plan(&nodes, &filters.as_focus_request())
-}
-
-fn build_summary_row(entry: &ProtoEntry<'_>) -> ProtoSummaryRow {
+fn build_summary_row(entry: &ProtoTreeEntry<&LoweredProto>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
         name: None,
         first: None,
         lines: Some((
-            entry.proto.line_range.defined_start,
-            entry.proto.line_range.defined_end,
+            entry.value.line_range.defined_start,
+            entry.value.line_range.defined_end,
         )),
-        instrs: Some(entry.proto.instrs.len()),
-        children: Some(entry.proto.children.len()),
+        instrs: Some(entry.value.instrs.len()),
+        children: Some(entry.value.children.len()),
     }
 }
 
 fn write_proto_tree_view(
     output: &mut String,
-    protos: &[ProtoEntry<'_>],
+    protos: &[ProtoTreeEntry<&LoweredProto>],
     plan: &FocusPlan,
     detail: DebugDetail,
 ) {
@@ -149,26 +113,26 @@ fn write_proto_tree_view(
             entry
                 .parent
                 .map_or_else(|| "-".to_owned(), |parent| format!("proto#{parent}")),
-            entry.proto.signature.num_params,
-            entry.proto.upvalues.common.count,
-            format_environment_upvalues(&entry.proto.environment_upvalues),
-            entry.proto.frame.max_stack_size,
-            entry.proto.instrs.len(),
-            entry.proto.children.len(),
-            entry.proto.line_range.defined_start,
-            entry.proto.line_range.defined_end,
-            format_optional_source(entry.proto),
-            format_optional_raw_string(entry.proto.debug_name.as_ref()),
+            entry.value.signature.num_params,
+            entry.value.upvalues.common.count,
+            format_environment_upvalues(&entry.value.environment_upvalues),
+            entry.value.frame.max_stack_size,
+            entry.value.instrs.len(),
+            entry.value.children.len(),
+            entry.value.line_range.defined_start,
+            entry.value.line_range.defined_end,
+            format_optional_source(entry.value),
+            format_optional_raw_string(entry.value.debug_name.as_ref()),
         );
 
         if matches!(detail, DebugDetail::Verbose) {
             let _ = writeln!(
                 output,
                 "{indent}  raw_instrs={} consts={} low_instrs={} debug_locals={}",
-                entry.proto.lowering_map.raw_to_low.len(),
-                entry.proto.constants.common.literals.len(),
-                entry.proto.instrs.len(),
-                entry.proto.debug_locals.len(),
+                entry.value.lowering_map.raw_to_low.len(),
+                entry.value.constants.common.literals.len(),
+                entry.value.instrs.len(),
+                entry.value.debug_locals.len(),
             );
         }
     }
@@ -186,7 +150,11 @@ fn format_environment_upvalues(upvalues: &[UpvalueRef]) -> String {
     }
 }
 
-fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &FocusPlan) {
+fn write_lir_listing(
+    output: &mut String,
+    protos: &[ProtoTreeEntry<&LoweredProto>],
+    plan: &FocusPlan,
+) {
     let _ = writeln!(output, "low-ir listing");
     if plan.focus.is_none() {
         let _ = writeln!(output, "  <no proto matched filters>");
@@ -208,10 +176,10 @@ fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &Focu
 
         let _ = writeln!(output, "  proto#{}", entry.id);
         let _ = writeln!(output, "    debug locals");
-        if entry.proto.debug_locals.is_empty() {
+        if entry.value.debug_locals.is_empty() {
             let _ = writeln!(output, "      <none>");
         } else {
-            for (scope, local) in entry.proto.debug_locals.iter().enumerate() {
+            for (scope, local) in entry.value.debug_locals.iter().enumerate() {
                 let kind = match local.kind {
                     DebugLocalKind::Source => "source",
                     DebugLocalKind::CompilerInternal => "compiler-internal",
@@ -230,15 +198,15 @@ fn write_lir_listing(output: &mut String, protos: &[ProtoEntry<'_>], plan: &Focu
             }
         }
         let _ = writeln!(output, "    instructions");
-        if entry.proto.instrs.is_empty() {
+        if entry.value.instrs.is_empty() {
             let _ = writeln!(output, "      <empty>");
             continue;
         }
 
-        for (index, instr) in entry.proto.instrs.iter().enumerate() {
-            let pcs = &entry.proto.lowering_map.pc_map()[index];
-            let raws = &entry.proto.lowering_map.low_to_raw[index];
-            let line = entry.proto.lowering_map.line_hints[index]
+        for (index, instr) in entry.value.instrs.iter().enumerate() {
+            let pcs = &entry.value.lowering_map.pc_map()[index];
+            let raws = &entry.value.lowering_map.low_to_raw[index];
+            let line = entry.value.lowering_map.line_hints[index]
                 .map_or_else(|| "-".to_owned(), |line| line.to_string());
 
             let _ = writeln!(

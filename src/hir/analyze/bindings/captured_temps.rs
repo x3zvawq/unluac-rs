@@ -33,7 +33,8 @@ pub(super) fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> 
         numeric_binding_phis,
     } = input;
     let param_count = usize::from(proto.signature.num_params);
-    let has_captured_params = (0..param_count).any(|reg| epochs.tracks_reference_capture(Reg(reg)));
+    let has_captured_params =
+        (0..param_count).any(|reg| dataflow.reg_is_reference_captured(Reg(reg)));
     if captured_slots.slot_targets.is_empty() && !has_captured_params {
         return CapturedTempFacts {
             targets: BTreeMap::new(),
@@ -46,7 +47,7 @@ pub(super) fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> 
     // 入口参数已拥有词法 cell；引用捕获不能把同一 epoch 的后续写拆成新 local。
     let param_target = |reg: Reg, instr_index: usize| {
         (reg.index() < param_count
-            && epochs.tracks_reference_capture(reg)
+            && dataflow.reg_is_reference_captured(reg)
             && epochs.epoch_at(reg, InstrRef(instr_index)) == 0)
             .then_some(BoundSlotTarget::Param(ParamId(reg.index())))
     };

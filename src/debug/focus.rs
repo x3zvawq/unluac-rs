@@ -10,7 +10,9 @@
 //!   该打 elided 行」上出 bug，所以集中到这个文件，让每层传一颗 proto 树就行。
 //!
 //! 这个文件不承担业务事实的查询：各层自己决定在 elided 行里填哪些字段，
-//! 这里只提供容器 `ProtoSummaryRow` 和稳定格式 `format_proto_summary_row`。
+//! 这里统一树形产物的前序调试身份、focus 计划及 summary 格式，不转换业务 proto id。
+//! `collect_proto_tree` 仅借用原对象，children 回调保留各层的树结构；例如根的第二个子树
+//! 会在第一个子树遍历完成后编号。HIR/AST 的扁平 id 映射仍由各层投影到 focus 节点。
 //!
 //! 输入形状 -> 输出形状例子：
 //!   protos=[(id=0, parent=-), (id=1, parent=0), (id=2, parent=1)]
@@ -24,7 +26,48 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use super::ProtoDepth;
+use super::{DebugFilters, ProtoDepth};
+
+/// 调试树一次前序快照的身份；value 借用所属层的对象，不代替业务 proto id。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProtoTreeEntry<T> {
+    pub(crate) id: usize,
+    pub(crate) parent: Option<usize>,
+    pub(crate) depth: usize,
+    pub(crate) value: T,
+}
+
+/// children 按源码顺序提供；显式栈保证深 Luau proto 不消耗递归调用栈。
+pub(crate) fn collect_proto_tree<T: Copy, I: DoubleEndedIterator<Item = T>>(
+    root: T,
+    children: impl Fn(T) -> I,
+) -> Vec<ProtoTreeEntry<T>> {
+    let mut entries = Vec::new();
+    let mut pending = vec![(root, None, 0usize)];
+    while let Some((value, parent, depth)) = pending.pop() {
+        let id = entries.len();
+        entries.push(ProtoTreeEntry {
+            id,
+            parent,
+            depth,
+            value,
+        });
+        pending.extend(
+            children(value)
+                .rev()
+                .map(|child| (child, Some(id), depth + 1)),
+        );
+    }
+    entries
+}
+
+pub(crate) fn plan_proto_focus<T>(
+    entries: &[ProtoTreeEntry<T>],
+    filters: &DebugFilters,
+) -> FocusPlan {
+    let parents = entries.iter().map(|entry| entry.parent).collect::<Vec<_>>();
+    compute_focus_plan(&build_proto_nodes(&parents), &filters.as_focus_request())
+}
 
 impl ProtoDepth {
     /// 判断给定的相对深度是否仍在展开范围内。
@@ -41,7 +84,7 @@ impl ProtoDepth {
 /// proto 树节点的轻量描述，供 `compute_focus_plan` 消费。
 ///
 /// 每个 `ProtoNode` 在 `nodes` 切片里的下标就是它的稳定 id（DFS 序），
-/// 各层在调用本 helper 前要自己先把树线性化成这个形态。
+/// 树形产物消费共享前序快照；扁平产物由所属层投影到这个形态。
 #[derive(Debug, Clone)]
 pub(crate) struct ProtoNode {
     pub(crate) parent: Option<usize>,

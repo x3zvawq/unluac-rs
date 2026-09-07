@@ -12,7 +12,7 @@ use crate::parser::{
 };
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
-    instr_pc, instr_word_len, resolve_pending_instr_with,
+    instr_pc, instr_word_len, raw_pc_at,
 };
 use crate::transformer::dialect::puc_lua::{
     call_args_pack, call_result_pack, finish_lowered_proto, range_len_inclusive, reg_from_u8,
@@ -23,9 +23,9 @@ use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     CallKind, Capture, CaptureSource, CloseInstr, ClosureCreation, ClosureInstr, ConcatInstr,
     CondOperand, ConstRef, FastCallArgs, GenericForCallInstr, GetTableInstr, GetTableKind,
-    GetUpvalueInstr, InstrRef, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr,
-    LowInstr, LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg,
-    RegRange, ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
+    GetUpvalueInstr, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
+    LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
+    ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
     SharedClosureRef, TransformError, UnaryOpInstr, UnaryOpKind, UpvalueRef, ValueOperand,
     ValuePack, VarArgInstr, instantiate_closure_children,
 };
@@ -72,7 +72,7 @@ fn lower_proto(raw: &RawProto) -> Result<LoweredProto, TransformError> {
         }
 
         let frame = stack.pop().expect("Luau proto frame is non-empty");
-        let mut lowerer = ProtoLowerer::new(frame.raw);
+        let lowerer = ProtoLowerer::new(frame.raw);
         let (mut instrs, lowering_map) = lowerer.lower()?;
         let children = instantiate_closure_children(&mut instrs, frame.children);
         let result = finish_lowered_proto(frame.raw, Vec::new(), children, instrs, lowering_map);
@@ -150,14 +150,13 @@ impl<'a> ProtoLowerer<'a> {
         }
     }
 
-    fn finish(&self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
+    fn finish(self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
+        let raw = self.raw;
         self.lowering.finish(
-            self.raw,
-            |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
-            instr_pc,
+            raw,
+            |raw_index| raw_pc_at(raw, raw_index) as usize,
             |raw_index| {
-                self.raw
-                    .common
+                raw.common
                     .debug_info
                     .common
                     .line_info
@@ -165,25 +164,6 @@ impl<'a> ProtoLowerer<'a> {
                     .copied()
             },
         )
-    }
-
-    fn resolve_pending_instr(
-        &self,
-        owner_raw: usize,
-        pending: &PendingLowInstr,
-    ) -> Result<LowInstr, TransformError> {
-        let owner_pc = raw_pc_at(self.raw, owner_raw);
-        resolve_pending_instr_with(pending, |target| self.resolve_target(owner_pc, target))
-    }
-
-    fn resolve_target(
-        &self,
-        owner_pc: u32,
-        target: TargetPlaceholder,
-    ) -> Result<InstrRef, TransformError> {
-        self.lowering.resolve_target(owner_pc, target, |raw_index| {
-            raw_pc_at(self.raw, raw_index) as usize
-        })
     }
 
     fn emit(
@@ -529,10 +509,6 @@ impl<'a> ProtoLowerer<'a> {
         };
         Ok(crate::transformer::TableAllocation::LuauTemplate(entries))
     }
-}
-
-fn raw_pc_at(raw: &RawProto, index: usize) -> u32 {
-    raw.common.instructions[index].pc()
 }
 
 fn required_aux(

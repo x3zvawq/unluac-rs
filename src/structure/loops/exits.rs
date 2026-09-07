@@ -302,7 +302,11 @@ pub(super) fn block_is_while_header_like(
     let Some(branch_effect) = dataflow.instr_effects.get(terminator_index) else {
         return false;
     };
-    let mut needed_regs = branch_effect.fixed_uses.clone();
+    let mut needed_regs = branch_effect
+        .fixed_uses()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
 
     (range.start.index()..terminator_index)
         .rev()
@@ -321,16 +325,16 @@ pub(super) fn block_is_while_header_like(
                 return dataflow
                     .effect_summaries
                     .get(instr_index)
-                    .is_some_and(|summary| summary.tags.is_empty());
+                    .is_some_and(|summary| !summary.has_effect_tags());
             }
 
-            for reg in &effect.fixed_must_defs {
+            for reg in effect.fixed_must_defs() {
                 needed_regs.remove(reg);
             }
             if let Some(open_def) = effect.open_must_def {
                 needed_regs.retain(|reg| reg.index() < open_def.index());
             }
-            needed_regs.extend(effect.fixed_uses.iter().copied());
+            needed_regs.extend(effect.fixed_uses().iter().copied());
             if let Some(open_use) = effect.open_use {
                 needed_regs.insert(open_use);
             }

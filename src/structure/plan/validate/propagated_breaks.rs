@@ -5,7 +5,6 @@ use super::*;
 pub(super) fn validate_propagated_breaks(
     cfg: &Cfg,
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
     nearest_loop: &[Option<RegionId>],
 ) -> Result<(), StructureError> {
     let mut target_by_region = vec![None; plan.regions.len()];
@@ -25,7 +24,7 @@ pub(super) fn validate_propagated_breaks(
                 "propagated break targets a non-loop region",
             ));
         };
-        if target == source || !intervals.contains(target, source) {
+        if target == source || !plan.region_contains(target, source) {
             return Err(StructureError::invalid(
                 "propagated break target does not contain its source loop",
             ));
@@ -62,9 +61,9 @@ pub(super) fn validate_propagated_breaks(
     // 离开更外层的传播 loop；若离开了，transfer 对最近 owner 的证明可沿相同 target
     // 链向祖先复用。这样无需为每个 loop 重扫整张 CFG。
     let mut nearest_propagated = vec![None; plan.regions.len()];
-    for region in intervals.preorder.iter().copied() {
-        let inherited =
-            intervals.parent[region.index()].and_then(|parent| nearest_propagated[parent.index()]);
+    for region in plan.navigation.preorder.iter().copied() {
+        let inherited = plan.navigation.parent[region.index()]
+            .and_then(|parent| nearest_propagated[parent.index()]);
         nearest_propagated[region.index()] = if target_by_region[region.index()].is_some() {
             Some(region)
         } else {
@@ -74,11 +73,11 @@ pub(super) fn validate_propagated_breaks(
 
     // 跨过多个源码 loop 的 break 需要每个中间 loop 在完成后继续传播；否则一个
     // Lua `break` 只能退出最内层。该链只沿 loop-parent 检查一次。
-    for source in intervals.preorder.iter().copied() {
+    for source in plan.navigation.preorder.iter().copied() {
         let Some(target) = target_by_region[source.index()] else {
             continue;
         };
-        let parent_loop = intervals.parent[source.index()]
+        let parent_loop = plan.navigation.parent[source.index()]
             .and_then(|parent| nearest_loop[parent.index()])
             .ok_or_else(|| {
                 StructureError::invalid("propagated break source has no containing loop")
@@ -106,7 +105,7 @@ pub(super) fn validate_propagated_breaks(
         };
         if plan
             .region_for_block(edge.to)
-            .is_some_and(|target_owner| intervals.contains(source_loop, target_owner))
+            .is_some_and(|target_owner| plan.region_contains(source_loop, target_owner))
         {
             continue;
         }
@@ -126,7 +125,7 @@ pub(super) fn validate_propagated_breaks(
 
     // 内层完成会执行计划中的下一层 break；逆 preorder 把该完成事实沿同 target
     // 的连续传播链汇总，仍然只访问每个 region 一次。
-    for source in intervals.preorder.iter().copied().rev() {
+    for source in plan.navigation.preorder.iter().copied().rev() {
         let Some(target) = target_by_region[source.index()] else {
             continue;
         };
@@ -136,7 +135,7 @@ pub(super) fn validate_propagated_breaks(
             ));
         }
         let parent_loop =
-            intervals.parent[source.index()].and_then(|parent| nearest_loop[parent.index()]);
+            plan.navigation.parent[source.index()].and_then(|parent| nearest_loop[parent.index()]);
         if let Some(parent) = parent_loop
             && target_by_region[parent.index()] == Some(target)
         {

@@ -57,7 +57,6 @@ pub(super) struct HomeSlotKey {
 /// PC 给所有后缀指令累加边界，否则 break/continue cleanup 会污染 sibling 路径。
 pub(super) struct SlotEpochFacts {
     epochs_by_reg: Vec<Option<SlotEpochFlow>>,
-    reference_captured_regs: Vec<bool>,
 }
 
 struct SlotEpochFlow {
@@ -73,20 +72,7 @@ impl SlotEpochFacts {
         graph: &GraphFacts,
         dataflow: &DataflowFacts,
     ) -> Self {
-        let reference_captured_regs = proto
-            .instrs
-            .iter()
-            .filter_map(|instr| match instr {
-                LowInstr::Closure(closure) => Some(&closure.captures),
-                _ => None,
-            })
-            .flatten()
-            .filter_map(|capture| match capture.source {
-                CaptureSource::ByReference(reg) => Some(reg),
-                CaptureSource::ByValue(_) | CaptureSource::Upvalue(_) => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let mut tracked_regs = reference_captured_regs.clone();
+        let mut tracked_regs = dataflow.reference_captured_regs().collect::<BTreeSet<_>>();
         tracked_regs.extend(proto.instrs.iter().filter_map(|instr| match instr {
             LowInstr::Tbc(tbc) => Some(tbc.reg),
             _ => None,
@@ -101,14 +87,7 @@ impl SlotEpochFacts {
         for reg in tracked_regs {
             epochs_by_reg[reg.index()] = Some(analyze_slot_epoch(proto, cfg, graph, dataflow, reg));
         }
-        let mut reference_captured_by_reg = vec![false; reg_count];
-        for reg in reference_captured_regs {
-            reference_captured_by_reg[reg.index()] = true;
-        }
-        Self {
-            epochs_by_reg,
-            reference_captured_regs: reference_captured_by_reg,
-        }
+        Self { epochs_by_reg }
     }
 
     fn all_home_slots(&self, max_stack_size: usize) -> BTreeSet<HomeSlotKey> {
@@ -141,13 +120,6 @@ impl SlotEpochFacts {
             .get(reg.index())
             .and_then(Option::as_ref)
             .is_none_or(|flow| flow.spans_entry)
-    }
-
-    pub(super) fn tracks_reference_capture(&self, reg: Reg) -> bool {
-        self.reference_captured_regs
-            .get(reg.index())
-            .copied()
-            .unwrap_or(false)
     }
 
     pub(super) fn reference_capture_may_be_open(&self, reg: Reg, instr: InstrRef) -> bool {
@@ -218,10 +190,9 @@ fn analyze_slot_epoch(
     }
 
     let defs_span_entry = dataflow
-        .defs
+        .fixed_defs_for_reg(reg)
         .iter()
-        .filter(|def| def.reg == reg)
-        .all(|def| at_instr[def.instr.index()] == 0);
+        .all(|&def| at_instr[dataflow.def_instr(def).index()] == 0);
     let captures_span_entry = proto.instrs.iter().enumerate().all(|(instr_index, instr)| {
         let LowInstr::Closure(closure) = instr else {
             return true;
@@ -263,15 +234,7 @@ fn place_epoch_merges(
             })
         })
         .collect::<BTreeSet<_>>();
-    let mut pending = close_blocks.iter().copied().collect::<VecDeque<_>>();
-    pending.extend(placed.iter().copied());
-    while let Some(block) = pending.pop_front() {
-        for frontier in graph.dominance_frontier_blocks(block) {
-            if placed.insert(frontier) && !close_blocks.contains(&frontier) {
-                pending.push_back(frontier);
-            }
-        }
-    }
+    graph.extend_dominance_frontier(close_blocks, &mut placed, |_| true);
 
     if graph.natural_loops.iter().any(|natural_loop| {
         natural_loop.header == cfg.entry_block
@@ -499,7 +462,6 @@ impl ProtoPromotionFacts {
                 proto,
                 cfg,
                 dataflow,
-                slot_epochs,
                 fixed_temps,
             ),
             temp_home_slots,
@@ -1523,9 +1485,8 @@ fn collect_direct_table_seed_temps(
             let LowInstr::NewTable(new_table) = instr else {
                 return None;
             };
-            dataflow.instr_defs[instr_index]
-                .iter()
-                .find(|def| dataflow.defs[def.index()].reg == new_table.dst)
+            dataflow
+                .instr_def_for_reg(InstrRef(instr_index), new_table.dst)
                 .and_then(|def| {
                     let canonical = fixed_temps.get(def.index()).copied()?;
                     // loop-state coalescing 可把多个 fixed def 映射到同一个 phi temp；
@@ -1758,12 +1719,9 @@ fn implicit_repeat_root_scope_fence(
     let mut candidate_defs = BTreeSet::new();
     let mut roots = BTreeSet::new();
     let mut homes = BTreeSet::new();
-    let prefix_defs = prefix_blocks.iter().flat_map(|block| {
-        let range = cfg.blocks[block.index()].instrs;
-        dataflow.instr_defs[range.start.index()..range.end()]
-            .iter()
-            .flatten()
-    });
+    let prefix_defs = prefix_blocks
+        .iter()
+        .flat_map(|&block| dataflow.fixed_defs_in_block(cfg, block));
     for def_id in prefix_defs {
         let def = &dataflow.defs[def_id.index()];
         if fixed_temps.get(def.id.index()) != Some(&TempId(def.id.index()))
@@ -2786,7 +2744,6 @@ mod tests {
                     spans_entry: true,
                 }),
             ],
-            reference_captured_regs: vec![false, true],
         };
 
         assert_eq!(
@@ -3188,8 +3145,8 @@ mod tests {
             }),
         ];
         let mut effects = vec![InstrEffect::default(); instrs.len()];
-        effects[2].fixed_must_defs.insert(Reg(1));
-        effects[4].fixed_must_defs.insert(Reg(1));
+        effects[2] = InstrEffect::new(Vec::new(), vec![Reg(1)], None, None);
+        effects[4] = InstrEffect::new(Vec::new(), vec![Reg(1)], None, None);
         let mut summaries = vec![SideEffectSummary::default(); instrs.len()];
         summaries[3].root_observation = RootObservation::Call { caller_end: Reg(2) };
         let overwrite = |index, _home| match index {

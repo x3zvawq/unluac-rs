@@ -15,7 +15,9 @@ use crate::structure::{
 use crate::transformer::{BranchSubject, InstrRef, LowInstr, LoweredProto};
 
 use super::super::common::{BranchRegionDomain, BranchRegionSpan};
-use super::super::helpers::{control_prefix_is_movable, shared_pure_terminal_kind};
+use super::super::helpers::{
+    block_has_non_control_prefix, control_prefix_is_movable, shared_pure_terminal_kind,
+};
 use super::super::loops::branch_conditions_share_subject;
 
 mod branch_payload;

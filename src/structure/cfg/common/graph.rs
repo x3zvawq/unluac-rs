@@ -6,8 +6,9 @@
 //! 额外冻结 loop parent、innermost owner 和 direct block，供后层按 ancestor iterator 查询。
 //! SCC 同时保留拓扑身份与 condensation 前驱；例如 `entry -> a -> b -> a` 中 a/b
 //! 共用一个成环身份，捕获写后分析直接查询该身份，不再另建 block-to-SCC 映射。
+//! 迭代支配边界统一扩展已有定义与合流种子；值活性、Close 出口及虚拟入口仍由消费者决定。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use super::cfg::{BlockRef, EdgeRef};
 
@@ -72,6 +73,31 @@ impl GraphFacts {
         self.dominance_frontier
             .get(block.index())
             .is_none_or(BTreeSet::is_empty)
+    }
+
+    /// 扩展定义与已有合流点的迭代支配边界，活性条件只裁剪新发现的合流点。
+    ///
+    /// 已有合流点也作为传播种子，例如 Close 的真实循环出口还可能在下游再次汇合。
+    /// 虚拟函数入口没有真实 CFG 边，不能在这里猜测其定义或把它提前加入传播。
+    pub(crate) fn extend_dominance_frontier(
+        &self,
+        definitions: &BTreeSet<BlockRef>,
+        merges: &mut BTreeSet<BlockRef>,
+        is_live: impl Fn(BlockRef) -> bool,
+    ) {
+        let mut pending = definitions
+            .iter()
+            .chain(merges.iter())
+            .copied()
+            .collect::<VecDeque<_>>();
+        while let Some(block) = pending.pop_front() {
+            for frontier in self.dominance_frontier_blocks(block) {
+                if is_live(frontier) && merges.insert(frontier) && !definitions.contains(&frontier)
+                {
+                    pending.push_back(frontier);
+                }
+            }
+        }
     }
 
     /// 返回 natural-loop 的共享 containment 查询索引。

@@ -1,8 +1,9 @@
-//! 索引同一 low 快照内的开放覆写和物理根观察阈值，避免每个 producer 重扫指令后缀。
+//! 索引同一 low 快照内的开放覆写、物理根观察阈值与观察位置，避免逐 producer 重扫后缀。
 //!
 //! 事实只来自 InstrEffect 与 RootObservation；不解码 opcode，也不证明控制流闭合或根释放。
 //! 例如区间内两次观察分别保留前 5、3 个槽，则共同保活前缀为 3；从槽 4 开始的开放
-//! 写入会覆盖 home 4，但不覆盖 home 3。调用方必须先找覆写，再查询覆写之前的观察。
+//! 写入会覆盖 home 4，但不覆盖 home 3。查询任意观察时还包括无前缀的 GC/cleanup，
+//! 不能以“没有普通保活前缀”推断无观察；调用方按合同决定是否包含覆写指令自身。
 
 use std::ops::Range;
 
@@ -33,16 +34,22 @@ impl Thresholds {
 pub(crate) struct RootIntervalIndex {
     leaf_base: usize,
     nodes: Vec<Thresholds>,
+    observations: Vec<usize>,
 }
 
 impl RootIntervalIndex {
     pub(crate) fn new(effects: &[InstrEffect], summaries: &[SideEffectSummary]) -> Self {
         let leaf_base = effects.len().next_power_of_two();
         let mut nodes = vec![Thresholds::EMPTY; leaf_base * 2];
+        let mut observations = Vec::new();
         for (index, effect) in effects.iter().enumerate() {
+            let summary = &summaries[index];
+            if summary.may_observe_gc_roots() || summary.root_observation != RootObservation::None {
+                observations.push(index);
+            }
             nodes[leaf_base + index] = Thresholds {
                 open_write: effect.open_must_def.map_or(usize::MAX, |reg| reg.index()),
-                rooted_prefix: match summaries[index].root_observation {
+                rooted_prefix: match summary.root_observation {
                     RootObservation::Call { caller_end } => caller_end.index(),
                     RootObservation::PrefixLowerBound { end } => end,
                     RootObservation::None | RootObservation::Close | RootObservation::FrameExit => {
@@ -54,7 +61,21 @@ impl RootIntervalIndex {
         for index in (1..leaf_base).rev() {
             nodes[index] = nodes[index * 2].merge(nodes[index * 2 + 1]);
         }
-        Self { leaf_base, nodes }
+        Self {
+            leaf_base,
+            nodes,
+            observations,
+        }
+    }
+
+    /// 包含 GC 与清理事件，不要求观察提供普通 caller-frame 保活前缀。
+    pub(crate) fn has_observation(&self, range: Range<usize>) -> bool {
+        let first = self
+            .observations
+            .partition_point(|&index| index < range.start);
+        self.observations
+            .get(first)
+            .is_some_and(|&index| index < range.end)
     }
 
     pub(crate) fn minimum_rooted_prefix(&self, range: Range<usize>) -> Option<usize> {

@@ -646,7 +646,7 @@ pub(super) fn simple_condition_input(
     cfg: &Cfg,
     header: super::super::BlockRef,
 ) -> Option<ConditionPlanInput> {
-    let (truthy_edge, falsy_edge) = semantic_branch_edges(proto, cfg, header)?;
+    let (truthy_edge, falsy_edge) = cfg.predicate_edges(&proto.instrs, header)?;
     let truthy = cfg.edges.get(truthy_edge.index())?.to;
     let falsy = cfg.edges.get(falsy_edge.index())?.to;
     let candidate = ShortCircuitCandidate {

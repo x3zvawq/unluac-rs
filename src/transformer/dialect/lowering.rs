@@ -2,7 +2,8 @@
 //!
 //! 这些类型只描述“raw 指令如何收集成 low-IR、如何回填 target、如何维护 method
 //! hint / raw pc 索引”这类与具体 opcode 语义无关的稳定事实，不应该继续挂在某个
-//! family 名下。
+//! family 名下。收尾消费 pending 指令与来源映射，一次完成目标回填和公共投影；
+//! 方言只提供诊断目标坐标与行号索引规则。
 
 use crate::parser::{RawInstr, RawProto};
 use crate::transformer::{
@@ -96,83 +97,53 @@ impl PendingLoweringState {
         self.emitted.len() + 1
     }
 
-    pub(crate) fn finish<ResolvePending, RawPcAt, LineHintAtRaw>(
-        &self,
+    pub(crate) fn finish<RawIndexToTargetRaw, LineHintAtRaw>(
+        self,
         raw: &RawProto,
-        mut resolve_pending: ResolvePending,
-        raw_pc_at: RawPcAt,
+        raw_index_to_target_raw: RawIndexToTargetRaw,
         line_hint_at_raw: LineHintAtRaw,
     ) -> Result<(Vec<LowInstr>, LoweringMap), TransformError>
     where
-        ResolvePending: FnMut(usize, &PendingLowInstr) -> Result<LowInstr, TransformError>,
-        RawPcAt: Fn(&RawInstr) -> u32,
+        RawIndexToTargetRaw: Fn(usize) -> usize,
         LineHintAtRaw: Fn(usize) -> Option<u32>,
     {
-        let instrs = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                let owner_raw = emitted.raw_indices.first().copied().unwrap_or(0);
-                resolve_pending(owner_raw, &emitted.instr)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let low_to_raw = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
+        let count = self.emitted.len();
+        let mut instrs = Vec::with_capacity(count);
+        let mut low_to_raw = Vec::with_capacity(count);
+        let mut pc_map = Vec::with_capacity(count);
+        let mut line_hints = Vec::with_capacity(count);
+        for EmittedInstr { raw_indices, instr } in self.emitted {
+            // 合并指令仍由首个原始来源承担诊断位置，与可选的跳转 owner 无关。
+            let owner_raw = *raw_indices
+                .first()
+                .expect("emitted instruction has a raw origin");
+            let owner_pc = raw.common.instructions[owner_raw].pc();
+            instrs.push(resolve_pending_instr_with(instr, |target| {
+                resolve_target_placeholder(
+                    owner_pc,
+                    target,
+                    &self.raw_target_low,
+                    &raw_index_to_target_raw,
+                )
+            })?);
+            pc_map.push(
+                raw_indices
                     .iter()
-                    .copied()
-                    .map(RawInstrRef)
-                    .collect()
-            })
-            .collect::<Vec<Vec<RawInstrRef>>>();
-        let pc_map = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
+                    .map(|&index| raw.common.instructions[index].pc())
+                    .collect(),
+            );
+            line_hints.push(
+                raw_indices
                     .iter()
-                    .copied()
-                    .map(|index| raw_pc_at(&raw.common.instructions[index]))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let line_hints = self
-            .emitted
-            .iter()
-            .map(|emitted| {
-                emitted
-                    .raw_indices
-                    .iter()
-                    .find_map(|raw_index| line_hint_at_raw(*raw_index))
-            })
-            .collect::<Vec<_>>();
+                    .find_map(|&index| line_hint_at_raw(index)),
+            );
+            low_to_raw.push(raw_indices.into_iter().map(RawInstrRef).collect());
+        }
 
         Ok((
             instrs,
-            LoweringMap::new(low_to_raw, self.raw_to_low.clone(), pc_map, line_hints),
+            LoweringMap::new(low_to_raw, self.raw_to_low, pc_map, line_hints),
         ))
-    }
-
-    pub(crate) fn resolve_target<F>(
-        &self,
-        owner_pc: u32,
-        target: TargetPlaceholder,
-        raw_index_to_target_raw: F,
-    ) -> Result<InstrRef, TransformError>
-    where
-        F: FnOnce(usize) -> usize,
-    {
-        resolve_target_placeholder(
-            owner_pc,
-            target,
-            &self.raw_target_low,
-            raw_index_to_target_raw,
-        )
     }
 
     pub(crate) fn emit(
@@ -389,26 +360,26 @@ impl WordCodeIndex {
     }
 }
 
-pub(crate) fn resolve_pending_instr_with<F>(
-    pending: &PendingLowInstr,
+fn resolve_pending_instr_with<F>(
+    pending: PendingLowInstr,
     mut resolve_target: F,
 ) -> Result<LowInstr, TransformError>
 where
     F: FnMut(TargetPlaceholder) -> Result<InstrRef, TransformError>,
 {
     match pending {
-        PendingLowInstr::Ready(instr) => Ok(instr.clone()),
+        PendingLowInstr::Ready(instr) => Ok(instr),
         PendingLowInstr::Jump { target } => Ok(LowInstr::Jump(JumpInstr {
-            target: resolve_target(*target)?,
+            target: resolve_target(target)?,
         })),
         PendingLowInstr::Branch {
             cond,
             then_target,
             else_target,
         } => Ok(LowInstr::Branch(BranchInstr {
-            cond: *cond,
-            then_target: resolve_target(*then_target)?,
-            else_target: resolve_target(*else_target)?,
+            cond,
+            then_target: resolve_target(then_target)?,
+            else_target: resolve_target(else_target)?,
         })),
         PendingLowInstr::NumericForInit {
             index,
@@ -418,12 +389,12 @@ where
             body_target,
             exit_target,
         } => Ok(LowInstr::NumericForInit(NumericForInitInstr {
-            index: *index,
-            limit: *limit,
-            step: *step,
-            binding: *binding,
-            body_target: resolve_target(*body_target)?,
-            exit_target: resolve_target(*exit_target)?,
+            index,
+            limit,
+            step,
+            binding,
+            body_target: resolve_target(body_target)?,
+            exit_target: resolve_target(exit_target)?,
         })),
         PendingLowInstr::NumericForLoop {
             index,
@@ -433,12 +404,12 @@ where
             body_target,
             exit_target,
         } => Ok(LowInstr::NumericForLoop(NumericForLoopInstr {
-            index: *index,
-            limit: *limit,
-            step: *step,
-            binding: *binding,
-            body_target: resolve_target(*body_target)?,
-            exit_target: resolve_target(*exit_target)?,
+            index,
+            limit,
+            step,
+            binding,
+            body_target: resolve_target(body_target)?,
+            exit_target: resolve_target(exit_target)?,
         })),
         PendingLowInstr::GenericForLoop {
             control_target,
@@ -446,15 +417,15 @@ where
             body_target,
             exit_target,
         } => Ok(LowInstr::GenericForLoop(GenericForLoopInstr {
-            control_target: *control_target,
-            bindings: *bindings,
-            body_target: resolve_target(*body_target)?,
-            exit_target: resolve_target(*exit_target)?,
+            control_target,
+            bindings,
+            body_target: resolve_target(body_target)?,
+            exit_target: resolve_target(exit_target)?,
         })),
     }
 }
 
-pub(crate) fn resolve_target_placeholder<F>(
+fn resolve_target_placeholder<F>(
     owner_pc: u32,
     target: TargetPlaceholder,
     raw_target_low: &[Option<usize>],

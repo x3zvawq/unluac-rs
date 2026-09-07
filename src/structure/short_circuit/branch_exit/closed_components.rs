@@ -168,7 +168,7 @@ pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
         .copied()
         .filter(|block| eligible[block.index()])
     {
-        let Some((truthy, falsy)) = truthy_falsy_edges(proto, cfg, block) else {
+        let Some((truthy, falsy)) = cfg.predicate_edges(&proto.instrs, block) else {
             continue;
         };
         let make_arc = |truthy: bool, edge: EdgeRef| {

@@ -542,9 +542,10 @@ fn store_table(
     safety: HirExprSafety,
 ) {
     let tables = table_values(base, state);
-    let base_has_unknown = bindings_in_expr(base)
-        .iter()
-        .any(|binding| state.unknown_collectable.contains(binding));
+    let base_has_unknown = crate::hir::visit::any_expr(base, &mut |expr| {
+        HirBinding::from_expr(expr)
+            .is_some_and(|binding| state.unknown_collectable.contains(&binding))
+    });
     let is_known_plain =
         !tables.is_empty() && tables.is_disjoint(&state.escaped) && !base_has_unknown;
     if !is_known_plain {
@@ -763,11 +764,17 @@ fn escape_expr(
 ) {
     let holders = holder_values(expr, state, effects);
     state.escaped.extend(&holders);
-    for binding in bindings_in_expr(expr) {
-        if state.unknown_collectable.contains(&binding) {
-            state.roots.insert(binding);
+    struct EscapeBindings<'a>(&'a mut RootState);
+    impl crate::hir::visit::HirVisitor for EscapeBindings<'_> {
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            if let Some(binding) = HirBinding::from_expr(expr)
+                && self.0.unknown_collectable.contains(&binding)
+            {
+                self.0.roots.insert(binding);
+            }
         }
     }
+    crate::hir::visit::visit_expr(expr, &mut EscapeBindings(state));
     activate_object_ids(&holders, state, captures, effects, true, safety);
     if let HirExpr::Call(call) = expr {
         activate_closures(&call.callee, state, captures, effects, true, safety);
@@ -916,20 +923,6 @@ fn returned_upvalues(values: &BTreeSet<EffectValue>) -> impl Iterator<Item = &Up
         EffectValue::Upvalue(upvalue) => Some(upvalue),
         EffectValue::Closure(_) => None,
     })
-}
-
-fn bindings_in_expr(expr: &HirExpr) -> BTreeSet<HirBinding> {
-    struct Bindings(BTreeSet<HirBinding>);
-    impl crate::hir::visit::HirVisitor for Bindings {
-        fn visit_expr(&mut self, expr: &HirExpr) {
-            if let Some(binding) = HirBinding::from_expr(expr) {
-                self.0.insert(binding);
-            }
-        }
-    }
-    let mut bindings = Bindings(BTreeSet::new());
-    crate::hir::visit::visit_expr(expr, &mut bindings);
-    bindings.0
 }
 
 pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<HirBinding> {

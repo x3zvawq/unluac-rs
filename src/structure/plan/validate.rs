@@ -4,9 +4,8 @@ use super::{
     BlockEmissionPlan, BlockTerminatorKind, BranchArm, CleanupDisposition, ConditionArcPolarity,
     ConditionPlan, ConditionPlanId, ConditionTarget, ControlFlowFeature, EdgeActionPlacement,
     EdgeTransfer, ForwardRouteKind, LabelPlacement, LoopPlanId, PhiIncomingDisposition,
-    PlanRequirement, RegionId, RegionNavigation, RegionPlan, StructureError,
-    UnstructuredLayoutItem, ValueDecisionArcPlan, ValueDecisionPlan, ValueDecisionPlanId,
-    ValueDecisionTarget,
+    PlanRequirement, RegionId, RegionPlan, StructureError, UnstructuredLayoutItem,
+    ValueDecisionArcPlan, ValueDecisionPlan, ValueDecisionPlanId, ValueDecisionTarget,
 };
 use crate::structure::helpers::shared_pure_terminal_kind;
 use crate::structure::{
@@ -68,25 +67,16 @@ pub(super) fn validate(
 
     validate_containment(plan)?;
     plan.navigation.validate(cfg, plan)?;
-    let intervals = &plan.navigation;
-    let edge_regions = &plan.navigation;
     validate_block_terminators(proto, cfg, plan)?;
     validate_block_coverage(cfg, plan)?;
-    validate_region_entries(cfg, plan, intervals)?;
-    validate_single_pass_plans(cfg, plan, intervals)?;
+    validate_region_entries(cfg, plan)?;
+    validate_single_pass_plans(cfg, plan)?;
     let condition_edges = validate_condition_plans(proto, cfg, plan)?;
-    validate_branch_plans(cfg, plan, intervals, &condition_edges)?;
-    let loop_edges = validate_loop_plans(proto, cfg, plan, intervals)?;
+    validate_branch_plans(cfg, plan, &condition_edges)?;
+    let loop_edges = validate_loop_plans(proto, cfg, plan)?;
     validate_labels(cfg, plan)?;
-    validate_edges(
-        cfg,
-        plan,
-        intervals,
-        edge_regions,
-        &condition_edges,
-        &loop_edges,
-    )?;
-    validate_requirements(cfg, plan, intervals)?;
+    validate_edges(cfg, plan, &condition_edges, &loop_edges)?;
+    validate_requirements(cfg, plan)?;
     validate_value_decision_plans(cfg, plan)?;
     Ok(())
 }

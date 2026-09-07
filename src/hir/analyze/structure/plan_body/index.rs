@@ -562,8 +562,8 @@ pub(super) fn build_absorbed_region_result_moves(
                 .bindings
                 .captured_temp_decl_locals
                 .contains_key(&fixed_temp)
-            || lowering.bindings.reg_is_reference_captured(move_.dst)
-            || lowering.bindings.reg_is_reference_captured(move_.src)
+            || lowering.dataflow.reg_is_reference_captured(move_.dst)
+            || lowering.dataflow.reg_is_reference_captured(move_.src)
             || lowering
                 .bindings
                 .local_for_reg_in_block(definition.block, move_.dst)

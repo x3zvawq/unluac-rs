@@ -7,9 +7,9 @@
 use std::fmt::Write as _;
 
 use crate::debug::{
-    DebugColorMode, DebugDetail, DebugFilters, FocusPlan, ProtoSummaryRow, build_proto_nodes,
-    colorize_debug_text, compute_focus_plan, define_stage_dump, format_breadcrumb,
-    format_display_set, format_proto_summary_row,
+    DebugColorMode, DebugDetail, DebugFilters, ProtoSummaryRow, ProtoTreeEntry, collect_proto_tree,
+    colorize_debug_text, define_stage_dump, format_breadcrumb, format_display_set,
+    format_proto_summary_row, plan_proto_focus,
 };
 use crate::decompile::{DebugOptions, DecompileState};
 
@@ -19,14 +19,6 @@ use super::{
     PhiIncomingDisposition, PlanRequirement, ReadyStructureFacts, RegionId, RegionPlan,
     StructureFacts, UnstructuredLayoutItem,
 };
-
-#[derive(Debug, Clone, Copy)]
-struct ProtoEntry<'a> {
-    id: usize,
-    parent: Option<usize>,
-    depth: usize,
-    facts: &'a StructureFacts,
-}
 
 define_stage_dump! {
     /// Structure 阶段的调试导出。
@@ -99,8 +91,8 @@ fn dump_structure_facts(
     color: DebugColorMode,
 ) -> String {
     let mut output = String::new();
-    let entries = collect_proto_entries(structure);
-    let focus = plan_focus(&entries, filters);
+    let entries = collect_proto_tree(structure, |facts| facts.children.iter());
+    let focus = plan_proto_focus(&entries, filters);
 
     let _ = writeln!(output, "===== Dump Structure =====");
     let _ = writeln!(
@@ -138,8 +130,8 @@ fn dump_structure_facts(
         }
 
         let indent = "  ".repeat(entry.depth);
-        let Some(facts) = entry.facts.ready() else {
-            let Some(failure) = entry.facts.failure() else {
+        let Some(facts) = entry.value.ready() else {
+            let Some(failure) = entry.value.failure() else {
                 let _ = writeln!(output, "{indent}proto#{} <invalid outcome>", entry.id);
                 continue;
             };
@@ -408,7 +400,7 @@ fn write_conditions(output: &mut String, indent: &str, plan: &super::StructurePl
                     output,
                     "{indent}        {:?} route={} connectors={} target={target}",
                     arc.polarity,
-                    format_display_set(&arc.route),
+                    format_display_set(arc.route()),
                     format_display_set(&arc.connector_blocks),
                 );
             }
@@ -909,42 +901,14 @@ fn format_control_feature(feature: ControlFlowFeature) -> &'static str {
     }
 }
 
-fn collect_proto_entries(root: &StructureFacts) -> Vec<ProtoEntry<'_>> {
-    let mut entries = Vec::new();
-    let mut pending = vec![(root, None, 0usize)];
-    while let Some((facts, parent, depth)) = pending.pop() {
-        let id = entries.len();
-        entries.push(ProtoEntry {
-            id,
-            parent,
-            depth,
-            facts,
-        });
-        pending.extend(
-            facts
-                .children
-                .iter()
-                .rev()
-                .map(|child| (child, Some(id), depth + 1)),
-        );
-    }
-    entries
-}
-
-fn plan_focus(entries: &[ProtoEntry<'_>], filters: &DebugFilters) -> FocusPlan {
-    let parents = entries.iter().map(|entry| entry.parent).collect::<Vec<_>>();
-    let nodes = build_proto_nodes(&parents);
-    compute_focus_plan(&nodes, &filters.as_focus_request())
-}
-
-fn build_summary_row(entry: &ProtoEntry<'_>) -> ProtoSummaryRow {
+fn build_summary_row(entry: &ProtoTreeEntry<&StructureFacts>) -> ProtoSummaryRow {
     ProtoSummaryRow {
         id: entry.id,
         name: None,
         first: None,
         lines: None,
         instrs: None,
-        children: Some(entry.facts.children.len()),
+        children: Some(entry.value.children.len()),
     }
 }
 

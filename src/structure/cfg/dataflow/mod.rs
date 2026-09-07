@@ -18,11 +18,11 @@ use crate::transformer::{
 
 use self::effects::{compute_instr_effect, compute_reg_count, compute_side_effect_summary};
 use self::liveness::solve_liveness;
-use self::open::analyze_open_values;
+use self::open::{FixedUseFacts, analyze_open_values};
 use self::ssa::build_ssa;
 use super::common::{
     BlockRef, Cfg, CfgGraph, DataflowFacts, Def, DefId, EffectTag, GraphFacts, InstrEffect,
-    PhiCandidate, RootObservation, SideEffectSummary, SsaValue,
+    PhiCandidate, RegCaptures, RootObservation, SideEffectSummary, SsaValue,
 };
 
 struct BlockLiveness {
@@ -144,6 +144,20 @@ fn compute_dataflow_proto(
         .map(|(instr, effect)| compute_side_effect_summary(instr, effect))
         .collect::<Vec<_>>();
     let reg_count = compute_reg_count(proto, &instr_effects)?;
+    let mut reg_captures = vec![RegCaptures::default(); reg_count];
+    for instr in &proto.instrs {
+        if let LowInstr::Closure(closure) = instr {
+            for capture in &closure.captures {
+                match capture.source {
+                    CaptureSource::ByValue(reg) => reg_captures[reg.index()].by_value = true,
+                    CaptureSource::ByReference(reg) => {
+                        reg_captures[reg.index()].by_reference = true;
+                    }
+                    CaptureSource::Upvalue(_) => {}
+                }
+            }
+        }
+    }
 
     let entry_open_start = proto
         .signature
@@ -162,19 +176,18 @@ fn compute_dataflow_proto(
         cfg,
         graph_facts,
         &instr_effects,
-        &open.fixed_liveness_use_regs,
+        &open.fixed_uses,
         reg_count,
     )?;
 
     let mut defs = Vec::new();
     let mut instr_defs = vec![Vec::new(); proto.instrs.len()];
-    let mut def_lookup = vec![Vec::new(); proto.instrs.len()];
     for block in cfg.block_order.iter().copied() {
         let Some(indices) = instr_indices(cfg, block) else {
             continue;
         };
         for instr_index in indices {
-            for &reg in &instr_effects[instr_index].fixed_must_defs {
+            for &reg in instr_effects[instr_index].fixed_must_defs() {
                 let id = DefId(defs.len());
                 defs.push(Def {
                     id,
@@ -183,7 +196,6 @@ fn compute_dataflow_proto(
                     block,
                 });
                 instr_defs[instr_index].push(id);
-                def_lookup[instr_index].push((reg, id));
             }
         }
     }
@@ -198,14 +210,21 @@ fn compute_dataflow_proto(
         cfg,
         graph_facts,
         &defs,
-        &def_lookup,
-        &open.fixed_ssa_use_regs,
+        &instr_defs,
+        &fixed_defs_by_reg,
+        &open.fixed_uses,
         &liveness.live_in,
         &liveness.live_out,
         reg_count,
-        proto.instrs.len(),
         &incoming_slots,
     )?;
+    let open::OpenAnalysis {
+        defs: open_defs,
+        use_sources: open_use_sources,
+        live_in: open_live_in,
+        live_out: open_live_out,
+        ..
+    } = open;
     let def_overwritten_values = overwrites::analyze_overwritten_values(
         cfg,
         &instr_effects,
@@ -219,9 +238,10 @@ fn compute_dataflow_proto(
         instr_effects,
         effect_summaries,
         defs,
-        open_defs: open.defs,
+        open_defs,
         instr_defs,
         fixed_defs_by_reg,
+        reg_captures,
         root_intervals,
         block_entry_values: ssa.block_entry_values,
         block_exit_values: ssa.block_exit_values,
@@ -234,11 +254,11 @@ fn compute_dataflow_proto(
         phi_uses: ssa.phi_uses,
         phi_phi_uses: ssa.phi_phi_uses,
         phi_truly_dead: ssa.phi_truly_dead,
-        open_use_sources: open.use_sources,
+        open_use_sources,
         live_in: liveness.live_in,
         live_out: liveness.live_out,
-        open_live_in: open.live_in,
-        open_live_out: open.live_out,
+        open_live_in,
+        open_live_out,
         phi_candidates: ssa.phis,
         incoming_slots_by_edge: incoming_slots,
         phi_block_ranges: ssa.phi_block_ranges,

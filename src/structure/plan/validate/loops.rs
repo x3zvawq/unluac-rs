@@ -95,7 +95,6 @@ pub(super) fn validate_loop_plans(
     proto: &LoweredProto,
     cfg: &Cfg,
     plan: &StructurePlan,
-    intervals: &RegionNavigation,
 ) -> Result<LoopEdgeIndex, StructureError> {
     if plan.loop_region_by_plan.len() != plan.loops.len() {
         return Err(StructureError::invalid("loop region index length mismatch"));
@@ -129,9 +128,9 @@ pub(super) fn validate_loop_plans(
     // freeze 阶段保存的候选边。只有最内层当前 loop 的真实 Break 才会写 guard；
     // forwarding route 取最终 target，pad outgoing 自身不拥有动作。
     let mut nearest_loop = vec![None; plan.regions.len()];
-    for region in intervals.preorder.iter().copied() {
+    for region in plan.navigation.preorder.iter().copied() {
         let inherited =
-            intervals.parent[region.index()].and_then(|parent| nearest_loop[parent.index()]);
+            plan.navigation.parent[region.index()].and_then(|parent| nearest_loop[parent.index()]);
         nearest_loop[region.index()] =
             if matches!(plan.region(region), Some(RegionPlan::Loop { .. })) {
                 Some(region)
@@ -243,16 +242,9 @@ pub(super) fn validate_loop_plans(
                 "loop region #{index} reuses a partition region"
             )));
         }
-        let expected_preheader_len = usize::from(payload.preheader_block.is_some());
         if preheader.is_some_and(|partition| {
-            !region_matches_exact_blocks(
-                plan,
-                intervals,
-                partition,
-                expected_preheader_len,
-                payload.preheader_block,
-            )
-        }) || (preheader.is_none() && expected_preheader_len != 0)
+            !region_matches_exact_blocks(plan, partition, payload.preheader_block)
+        }) || (preheader.is_none() && payload.preheader_block.is_some())
         {
             return Err(StructureError::invalid(format!(
                 "loop payload #{} preheader partition is stale",
@@ -288,7 +280,7 @@ pub(super) fn validate_loop_plans(
                         | crate::structure::LoopKindHint::GenericForLike
                 ) || payload.continuation != Some(tail.continuation)
                     || normal_tail_count == 0
-                    || !region_contains_block(plan, intervals, *tail_region, tail.entry)
+                    || !region_contains_block(plan, *tail_region, tail.entry)
                 {
                     return Err(StructureError::invalid(format!(
                         "loop payload #{} has an invalid normal-tail partition",
@@ -301,13 +293,13 @@ pub(super) fn validate_loop_plans(
                         loop_id.index()
                     ))
                 })?;
-                if !intervals.contains(*tail_region, entry_owner) {
+                if !plan.region_contains(*tail_region, entry_owner) {
                     return Err(StructureError::invalid(format!(
                         "loop payload #{} normal-tail entry is outside its partition",
                         loop_id.index()
                     )));
                 }
-                let boundary = intervals.boundary(*tail_region).ok_or_else(|| {
+                let boundary = plan.region_boundary(*tail_region).ok_or_else(|| {
                     StructureError::invalid("normal-tail region has no boundary summary")
                 })?;
                 if tail.normal_exits.is_empty()
@@ -347,7 +339,7 @@ pub(super) fn validate_loop_plans(
                     };
                     if !syntax_exit_kind
                         || cfg_edge.to != tail.entry
-                        || region_contains_block(plan, intervals, *tail_region, cfg_edge.from)
+                        || region_contains_block(plan, *tail_region, cfg_edge.from)
                         || !loop_edges.has_exit(*loop_id, *edge)
                         || !syntax_exit_transfer
                     {
@@ -377,7 +369,7 @@ pub(super) fn validate_loop_plans(
                     })?;
                     if edge_plan.edge != *edge
                         || cfg_edge.to != tail.continuation
-                        || !region_contains_block(plan, intervals, *tail_region, cfg_edge.from)
+                        || !region_contains_block(plan, *tail_region, cfg_edge.from)
                     {
                         return Err(StructureError::invalid(format!(
                             "loop payload #{} normal-tail completion is stale",
@@ -463,13 +455,12 @@ pub(super) fn validate_loop_plans(
             let expected_early = break_edges_by_region[region_id.index()]
                 .iter()
                 .copied()
-                .filter(|edge| *edge != tail.normal_exit)
-                .collect::<Vec<_>>();
-            let reachable_predecessors = cfg.preds[tail.block.index()]
+                .filter(|edge| *edge != tail.normal_exit);
+            let has_only_normal_predecessor = cfg.preds[tail.block.index()]
                 .iter()
                 .copied()
                 .filter(|edge| cfg.reachable_blocks.contains(&cfg.edges[edge.index()].from))
-                .collect::<Vec<_>>();
+                .eq([tail.normal_exit]);
             let cleanup_block_range = cfg
                 .blocks
                 .get(tail.cleanup_block.index())
@@ -496,12 +487,11 @@ pub(super) fn validate_loop_plans(
                 };
                 let route_cfg = cfg.edges.get(route.index());
                 let route_plan = plan.edge_plan(*route);
-                let mut cleanup_predecessors = cfg.preds[tail.cleanup_block.index()]
+                let cleanup_has_only_route = cfg.preds[tail.cleanup_block.index()]
                     .iter()
                     .copied()
                     .filter(|edge| cfg.reachable_blocks.contains(&cfg.edges[edge.index()].from))
-                    .collect::<Vec<_>>();
-                cleanup_predecessors.sort_by_key(|edge| edge.index());
+                    .eq([*route]);
                 cfg.succs[tail.block.index()].as_slice() == [*route]
                     && route_cfg.is_some_and(|edge| {
                         edge.from == tail.block && edge.to == tail.cleanup_block
@@ -509,7 +499,7 @@ pub(super) fn validate_loop_plans(
                     && route_plan.is_some_and(|edge| {
                         edge.transfer == EdgeTransfer::Fallthrough && edge.forward_route.is_none()
                     })
-                    && cleanup_predecessors.as_slice() == [*route]
+                    && cleanup_has_only_route
                     && cleanup_block_range
                         .is_some_and(|range| tail.cleanup.first() == Some(&range.start))
                     && block_range.last().map(|last| last.index()) == Some(tail.range.end())
@@ -525,8 +515,8 @@ pub(super) fn validate_loop_plans(
                 || tail.range.start != block_range.start
                 || tail.range.is_empty()
                 || tail.range.end() >= block_range.end()
-                || reachable_predecessors.as_slice() != [tail.normal_exit]
-                || tail.early_exits != expected_early
+                || !has_only_normal_predecessor
+                || !tail.early_exits.iter().copied().eq(expected_early)
                 || tail.early_exits.iter().any(|edge| {
                     cfg.edges
                         .get(edge.index())
@@ -546,7 +536,7 @@ pub(super) fn validate_loop_plans(
             let tail_owner = plan
                 .region_for_block(tail.block)
                 .ok_or_else(|| StructureError::invalid("loop exit tail block is unowned"))?;
-            if intervals.contains(region_id, tail_owner) {
+            if plan.region_contains(region_id, tail_owner) {
                 return Err(StructureError::invalid(format!(
                     "loop payload #{} instruction exit tail is still contained by the loop",
                     loop_id.index()
@@ -559,12 +549,12 @@ pub(super) fn validate_loop_plans(
                 loop_id.index()
             ))
         })?;
-        let header_partition = if intervals.contains(*control, header_owner) {
+        let header_partition = if plan.region_contains(*control, header_owner) {
             *control
         } else {
             *body
         };
-        if !intervals.contains(header_partition, header_owner) {
+        if !plan.region_contains(header_partition, header_owner) {
             return Err(StructureError::invalid(format!(
                 "loop payload #{} header is outside its frozen partition",
                 loop_id.index()
@@ -582,7 +572,7 @@ pub(super) fn validate_loop_plans(
                     loop_id.index()
                 ))
             })?;
-            if !intervals.contains(*control, latch_owner) {
+            if !plan.region_contains(*control, latch_owner) {
                 return Err(StructureError::invalid(format!(
                     "loop payload #{} VM latch is outside control",
                     loop_id.index()
@@ -599,7 +589,7 @@ pub(super) fn validate_loop_plans(
             )));
         }
         let expected_entry_partition = preheader.unwrap_or(header_partition);
-        if !intervals.contains(expected_entry_partition, entry_owner) {
+        if !plan.region_contains(expected_entry_partition, entry_owner) {
             return Err(StructureError::invalid(format!(
                 "loop region #{index} entry is outside its entry partition"
             )));
@@ -629,21 +619,14 @@ pub(super) fn validate_loop_plans(
                         loop_id.index()
                     ))
                 })?;
-                if !intervals.contains(*control, owner) {
+                if !plan.region_contains(*control, owner) {
                     return Err(StructureError::invalid(format!(
                         "loop payload #{} condition block {block} is outside control",
                         loop_id.index()
                     )));
                 }
             }
-            let expected_condition_blocks = condition.blocks().collect::<Vec<_>>();
-            if !region_matches_exact_blocks(
-                plan,
-                intervals,
-                *control,
-                expected_condition_blocks.len(),
-                expected_condition_blocks.iter().copied(),
-            ) {
+            if !region_matches_exact_blocks(plan, *control, condition.blocks()) {
                 return Err(StructureError::invalid(format!(
                     "loop payload #{} condition region has stale coverage",
                     loop_id.index()
@@ -717,8 +700,8 @@ pub(super) fn validate_loop_plans(
                 .ok_or_else(|| {
                     StructureError::invalid("normalized loop exit continuation is outside the CFG")
                 })?;
-            let alias_in_control = intervals.contains(*control, alias_owner);
-            let continuation_in_loop = intervals.contains(region_id, continuation_owner);
+            let alias_in_control = plan.region_contains(*control, alias_owner);
+            let continuation_in_loop = plan.region_contains(region_id, continuation_owner);
             let has_exit_edge = payload.control_edges.exit.iter().any(|edge| {
                 cfg.edges
                     .get(edge.index())
@@ -817,7 +800,7 @@ pub(super) fn validate_loop_plans(
             } else {
                 *control
             };
-            if !intervals.contains(source_partition, source) {
+            if !plan.region_contains(source_partition, source) {
                 return Err(StructureError::invalid(format!(
                     "loop payload #{} {:?} header {} {role} edge {edge} source {} owner {:?} ({:?}) is outside partition {:?}",
                     loop_id.index(),
@@ -831,7 +814,7 @@ pub(super) fn validate_loop_plans(
             }
             let target_inside = plan
                 .region_for_block(cfg_edge.to)
-                .is_some_and(|target| intervals.contains(region_id, target));
+                .is_some_and(|target| plan.region_contains(region_id, target));
             let immediate_break_body = role == "control body"
                 && payload.kind == crate::structure::LoopKindHint::GenericForLike
                 && matches!(
@@ -854,7 +837,7 @@ pub(super) fn validate_loop_plans(
             }
         }
     }
-    validate_propagated_breaks(cfg, plan, intervals, &nearest_loop)?;
+    validate_propagated_breaks(cfg, plan, &nearest_loop)?;
     if seen.into_iter().any(|seen| !seen) {
         return Err(StructureError::invalid(
             "selected loop payload has no owning region",

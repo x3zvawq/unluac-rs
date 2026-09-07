@@ -18,10 +18,10 @@ pub(super) fn preserve_loop_state_overwrites(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     epochs: &SlotEpochFacts,
-    barriers: (&[bool], &[bool], &[Option<DebugBindingHint>]),
+    barriers: (&[bool], &[Option<DebugBindingHint>]),
     temps: (&[TempId], &mut [TempId]),
 ) {
-    let (captured_regs, numeric_phis, debug_hints) = barriers;
+    let (numeric_phis, debug_hints) = barriers;
     let (phi_temps, fixed_temps) = temps;
     let mut carried_temps = BTreeSet::new();
     let mut blocked_temps = BTreeSet::new();
@@ -35,7 +35,7 @@ pub(super) fn preserve_loop_state_overwrites(
     }
     for def in &dataflow.defs {
         if fixed_temps[def.id.index()] != TempId(def.id.index())
-            || reg_is_captured(captured_regs, def.reg)
+            || dataflow.reg_is_captured(def.reg)
             || !dataflow.def_uses[def.id.index()].is_empty()
             || !dataflow.def_phi_uses[def.id.index()].is_empty()
             || debug_local_hint_for_reg_at_instr(proto, def.reg, def.instr).is_some()
@@ -79,7 +79,7 @@ pub(super) fn preserve_loop_state_overwrites(
 /// 提前写回变得可观察，因此保守保留独立 temp。
 pub(super) fn coalesce_nested_loop_carried_temps(
     plan: &StructurePlan,
-    captured_regs: &[bool],
+    dataflow: &DataflowFacts,
     phi_temps: &mut [TempId],
 ) -> Vec<Option<PhiId>> {
     let carried = plan
@@ -89,7 +89,7 @@ pub(super) fn coalesce_nested_loop_carried_temps(
     let mut parents = vec![None; carried.len()];
 
     for phi in plan.phis() {
-        if reg_is_captured(captured_regs, phi.reg) {
+        if dataflow.reg_is_captured(phi.reg) {
             continue;
         }
         let Some(binding) = carried.get(phi.phi.index()).copied().flatten() else {
@@ -147,33 +147,6 @@ pub(super) fn coalesce_nested_loop_carried_temps(
     parents
 }
 
-pub(super) fn captured_regs(proto: &LoweredProto) -> Vec<bool> {
-    let mut captured = vec![false; usize::from(proto.frame.max_stack_size)];
-    for reg in proto
-        .instrs
-        .iter()
-        .filter_map(|instr| match instr {
-            LowInstr::Closure(closure) => Some(&closure.captures),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|capture| match capture.source {
-            CaptureSource::ByValue(reg) | CaptureSource::ByReference(reg) => Some(reg),
-            CaptureSource::Upvalue(_) => None,
-        })
-    {
-        if reg.index() >= captured.len() {
-            captured.resize(reg.index() + 1, false);
-        }
-        captured[reg.index()] = true;
-    }
-    captured
-}
-
-pub(super) fn reg_is_captured(captured: &[bool], reg: Reg) -> bool {
-    captured.get(reg.index()).copied().unwrap_or(false)
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct BindingCandidate<T> {
     target: Option<T>,
@@ -212,7 +185,6 @@ pub(super) fn coalesce_loop_state_temps(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
-    captured_regs: &[bool],
     nested_carried_parents: &[Option<PhiId>],
     binding_barriers: (&[bool], &[Option<DebugBindingHint>]),
     binding_temps: (&mut [TempId], &mut [TempId]),
@@ -287,7 +259,7 @@ pub(super) fn coalesce_loop_state_temps(
     let mut phi_candidates = vec![BindingCandidate::default(); phi_temps.len()];
 
     for phi in plan.phis() {
-        if reg_is_captured(captured_regs, phi.reg) || numeric_binding_phis[phi.phi.index()] {
+        if dataflow.reg_is_captured(phi.reg) || numeric_binding_phis[phi.phi.index()] {
             continue;
         }
         let Some(carried) = loop_carried_binding(plan, phi) else {
@@ -539,13 +511,13 @@ pub(super) fn repeat_stage_carried_temp(
     plan: &StructurePlan,
     loop_id: LoopPlanId,
     target: PhiId,
-    captured_regs: &[bool],
+    dataflow: &DataflowFacts,
     nested_carried_child_owners: &BTreeSet<(PhiId, RegionId)>,
     phi_temps: &[TempId],
 ) -> Option<TempId> {
     let owner = plan.loop_region(loop_id)?;
     let result = plan.phi_plan(target)?;
-    if reg_is_captured(captured_regs, result.reg) {
+    if dataflow.reg_is_captured(result.reg) {
         return None;
     }
     let carried = loop_carried_binding(plan, result)?;

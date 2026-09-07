@@ -41,49 +41,21 @@ pub(super) fn block_has_non_control_prefix(
     cfg: &Cfg,
     block: BlockRef,
 ) -> bool {
-    let range = cfg.blocks[block.index()].instrs;
-    let Some(last_instr) = range
-        .last()
-        .and_then(|instr_ref| proto.instrs.get(instr_ref.index()))
-    else {
-        return false;
-    };
-    let body_end = if matches!(
-        last_instr,
-        LowInstr::Jump(_)
-            | LowInstr::Branch(_)
-            | LowInstr::Return(_)
-            | LowInstr::TailCall(_)
-            | LowInstr::NumericForInit(_)
-            | LowInstr::NumericForLoop(_)
-            | LowInstr::GenericForLoop(_)
-    ) {
-        range.end().saturating_sub(1)
-    } else {
-        range.end()
-    };
-    range.start.index() < body_end
+    !cfg.non_control_instr_range(&proto.instrs, block).is_empty()
 }
 
 pub(super) fn control_prefix_is_movable(proto: &LoweredProto, cfg: &Cfg, block: BlockRef) -> bool {
-    let range = cfg.blocks[block.index()].instrs;
-    let body_end = range.last().map_or(range.end(), |last| {
-        if proto.instrs[last.index()].is_control_terminator() {
-            range.end() - 1
-        } else {
-            range.end()
-        }
-    });
-    (range.start.index()..body_end).all(|index| {
-        matches!(
-            proto.instrs[index],
-            LowInstr::LoadNil(_)
-                | LowInstr::LoadBool(_)
-                | LowInstr::LoadConst(_)
-                | LowInstr::LoadInteger(_)
-                | LowInstr::LoadNumber(_)
-        )
-    })
+    cfg.non_control_instr_range(&proto.instrs, block)
+        .all(|index| {
+            matches!(
+                proto.instrs[index],
+                LowInstr::LoadNil(_)
+                    | LowInstr::LoadBool(_)
+                    | LowInstr::LoadConst(_)
+                    | LowInstr::LoadInteger(_)
+                    | LowInstr::LoadNumber(_)
+            )
+        })
 }
 
 /// `actual` 可以是直达 `expected` 所在 block 的单跳 pad；只穿透实际目标这一侧。

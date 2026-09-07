@@ -3,6 +3,7 @@
 //! 但节点和内部 route 仍必须各自唯一。
 
 use super::*;
+use crate::structure::helpers::control_prefix_is_movable;
 
 pub(super) fn validate_condition_predicates(
     proto: &LoweredProto,
@@ -206,24 +207,7 @@ pub(super) fn validate_condition_prefix_placements(
         if condition_entry == payload.header {
             continue;
         }
-        let range = cfg.blocks[condition_entry.index()].instrs;
-        let end = range.last().map_or(range.end(), |last| {
-            if proto.instrs[last.index()].is_control_terminator() {
-                range.end() - 1
-            } else {
-                range.end()
-            }
-        });
-        if !(range.start.index()..end).all(|instr| {
-            matches!(
-                proto.instrs[instr],
-                LowInstr::LoadNil(_)
-                    | LowInstr::LoadBool(_)
-                    | LowInstr::LoadConst(_)
-                    | LowInstr::LoadInteger(_)
-                    | LowInstr::LoadNumber(_)
-            )
-        }) {
+        if !control_prefix_is_movable(proto, cfg, condition_entry) {
             return Err(StructureError::invalid(format!(
                 "loop payload #{index} moves an effectful condition prefix before the body"
             )));
@@ -499,20 +483,12 @@ pub(super) fn validate_condition_plans(
                         "condition payload #{index} node {node_index} route connector blocks are stale"
                     )));
                 }
-                if !arc.route.contains(&arc.transfer) {
+                let transfer_position = arc.transfer_position;
+                if transfer_position >= arc.route.len() {
                     return Err(StructureError::invalid(format!(
                         "condition payload #{index} node {node_index} transfer is outside its route"
                     )));
                 }
-                let transfer_position = arc
-                    .route
-                    .iter()
-                    .position(|edge| *edge == arc.transfer)
-                    .ok_or_else(|| {
-                        StructureError::invalid(format!(
-                            "condition payload #{index} node {node_index} transfer is outside its route"
-                        ))
-                    })?;
                 for block in arc.connector_blocks.iter().take(transfer_position) {
                     let Some(seen_epoch) = seen_block_epoch.get_mut(block.index()) else {
                         return Err(StructureError::invalid(format!(
@@ -533,7 +509,7 @@ pub(super) fn validate_condition_plans(
                                         .is_some_and(|edges| edges.len() == 1)
                             });
                         if shared_terminal_connector[block.index()]
-                            != Some((epoch, arc.transfer, arc.target))
+                            != Some((epoch, arc.transfer(), arc.target))
                             || !pure_shared_jump
                         {
                             return Err(StructureError::invalid(format!(
@@ -544,7 +520,7 @@ pub(super) fn validate_condition_plans(
                     }
                     shared_terminal_connector[block.index()] =
                         matches!(arc.target, ConditionTarget::Truthy | ConditionTarget::Falsy)
-                            .then_some((epoch, arc.transfer, arc.target));
+                            .then_some((epoch, arc.transfer(), arc.target));
                     blocks.push(*block);
                 }
                 validate_condition_internal_route(cfg, plan, index, node_index, arc)?;
@@ -568,9 +544,9 @@ pub(super) fn validate_condition_plans(
                         indegree[target.index()] += 1;
                     }
                     ConditionTarget::Truthy => {
-                        terminal_edges[0].push(arc.transfer);
+                        terminal_edges[0].push(arc.transfer());
                         edge_index.record_terminal(
-                            arc.transfer,
+                            arc.transfer(),
                             ConditionEdgeBinding {
                                 condition: ConditionPlanId(index),
                                 node: node.block,
@@ -580,9 +556,9 @@ pub(super) fn validate_condition_plans(
                         )?;
                     }
                     ConditionTarget::Falsy => {
-                        terminal_edges[1].push(arc.transfer);
+                        terminal_edges[1].push(arc.transfer());
                         edge_index.record_terminal(
-                            arc.transfer,
+                            arc.transfer(),
                             ConditionEdgeBinding {
                                 condition: ConditionPlanId(index),
                                 node: node.block,

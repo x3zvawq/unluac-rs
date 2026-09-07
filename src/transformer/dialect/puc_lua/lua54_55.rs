@@ -6,7 +6,7 @@
 use crate::parser::{RawChunk, RawInstr, RawProto};
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
-    instr_pc, instr_word_len, next_raw_pc, raw_pc_at, resolve_pending_instr_with,
+    instr_pc, instr_word_len, next_raw_pc, raw_pc_at,
 };
 use crate::transformer::dialect::puc_lua::{
     GenericForPairAbxSpec, GenericForPairInfo as GenericForPair, HelperJumpAsjSpec,
@@ -25,7 +25,7 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, Capture,
     CaptureSource, CloseInstr, ClosureInstr, ConcatInstr, CondOperand, ConstRef, ErrNilInstr,
-    GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, LoadBoolInstr,
+    GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, LoadBoolInstr,
     LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr, LoweredChunk,
     LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange, ResultPack,
     SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr, TbcInstr, TransformError,
@@ -76,7 +76,7 @@ fn lower_proto(
     };
     let (env_upvalues, children) = prepare_env_lowering(raw, parent_env_upvalues, child_lowerer)?;
     let environment_upvalues = environment_upvalue_refs(&env_upvalues);
-    let mut lowerer = ProtoLowerer::new(raw, env_upvalues, dialect);
+    let lowerer = ProtoLowerer::new(raw, env_upvalues, dialect);
     let (mut instrs, lowering_map) = lowerer.lower()?;
     let children = instantiate_closure_children(&mut instrs, children);
 
@@ -114,35 +114,20 @@ impl<'a> ProtoLowerer<'a> {
         }
     }
 
-    fn finish(&self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
+    fn finish(self) -> Result<(Vec<LowInstr>, LoweringMap), TransformError> {
+        let raw = self.raw;
         self.lowering.finish(
-            self.raw,
-            |owner_raw, pending| self.resolve_pending_instr(owner_raw, pending),
-            instr_pc,
+            raw,
+            |raw_index| raw_pc_at(raw, raw_index) as usize,
             |raw_index| {
-                let pc = raw_pc_at(self.raw, raw_index) as usize;
-                self.raw.common.debug_info.common.line_info.get(pc).copied()
+                raw.common
+                    .debug_info
+                    .common
+                    .line_info
+                    .get(raw_pc_at(raw, raw_index) as usize)
+                    .copied()
             },
         )
-    }
-
-    fn resolve_pending_instr(
-        &self,
-        owner_raw: usize,
-        pending: &PendingLowInstr,
-    ) -> Result<LowInstr, TransformError> {
-        let owner_pc = raw_pc_at(self.raw, owner_raw);
-        resolve_pending_instr_with(pending, |target| self.resolve_target(owner_pc, target))
-    }
-
-    fn resolve_target(
-        &self,
-        owner_pc: u32,
-        target: TargetPlaceholder,
-    ) -> Result<InstrRef, TransformError> {
-        self.lowering.resolve_target(owner_pc, target, |raw_index| {
-            raw_pc_at(self.raw, raw_index) as usize
-        })
     }
 
     fn emit(

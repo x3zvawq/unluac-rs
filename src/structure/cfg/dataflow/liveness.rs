@@ -28,7 +28,7 @@ pub(super) fn solve_liveness(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     instr_effects: &[InstrEffect],
-    fixed_use_regs: &[Vec<Reg>],
+    fixed_uses: &FixedUseFacts<'_>,
     reg_count: usize,
 ) -> Result<BlockLiveness, StructureError> {
     let mut block_uses = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
@@ -39,18 +39,18 @@ pub(super) fn solve_liveness(
             continue;
         };
 
-        let mut seen_defs = DenseRegSet::new(reg_count);
+        let defs = &mut block_defs[block.index()];
+        let uses = &mut block_uses[block.index()];
 
         for instr_index in instr_indices {
-            for &reg in &fixed_use_regs[instr_index] {
-                if !seen_defs.contains(reg)? {
-                    block_uses[block.index()].insert(reg)?;
+            for reg in fixed_uses.liveness_regs(InstrRef(instr_index)) {
+                if !defs.contains(reg)? {
+                    uses.insert(reg)?;
                 }
             }
 
-            for reg in &instr_effects[instr_index].fixed_must_defs {
-                seen_defs.insert(*reg)?;
-                block_defs[block.index()].insert(*reg)?;
+            for reg in instr_effects[instr_index].fixed_must_defs() {
+                defs.insert(*reg)?;
             }
         }
     }
@@ -69,9 +69,12 @@ pub(super) fn solve_liveness(
         queued[block.index()] = true;
     }
 
+    // 全部集合共享固定寄存器域；提交后回收旧结果缓冲区，回边重访不重复分配。
+    let mut new_live_out = DenseRegSet::new(reg_count);
+    let mut new_live_in = DenseRegSet::new(reg_count);
     while let Some(block) = worklist.pop_front() {
         queued[block.index()] = false;
-        let mut new_live_out = DenseRegSet::new(reg_count);
+        new_live_out.bits.fill(false);
 
         for edge_ref in &cfg.succs[block.index()] {
             let succ = cfg.edges[edge_ref.index()].to;
@@ -81,12 +84,14 @@ pub(super) fn solve_liveness(
             new_live_out.extend_from(&live_in[succ.index()]);
         }
 
-        let mut new_live_in = block_uses[block.index()].clone();
+        new_live_in
+            .bits
+            .copy_from_slice(&block_uses[block.index()].bits);
         new_live_in.extend_without(&new_live_out, &block_defs[block.index()]);
         let entry_changed = live_in[block.index()] != new_live_in;
 
-        live_out[block.index()] = new_live_out;
-        live_in[block.index()] = new_live_in;
+        std::mem::swap(&mut live_out[block.index()], &mut new_live_out);
+        std::mem::swap(&mut live_in[block.index()], &mut new_live_in);
         if entry_changed {
             enqueue_predecessors(cfg, block, &mut worklist, &mut queued);
         }

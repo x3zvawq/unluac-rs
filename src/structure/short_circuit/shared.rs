@@ -3,7 +3,7 @@
 //! 比如线性跟随、真值边翻译、无环检查都同时服务 branch-exit 和 value-merge 两类
 //! 候选；把它们集中起来可以避免两个 pass 各自养一套近似状态机。
 //!
-//! 它依赖 CFG / GraphFacts / Dataflow 已提供的图查询和写寄存器事实，只表达短路提取
+//! 它依赖 CFG / GraphFacts 已提供的图查询与 low 指令分类，只表达短路提取
 //! 两边都共享的“小规则”，不会越权判断最终源码语法。
 //!
 //! 例子：
@@ -13,8 +13,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::structure::{BlockRef, Cfg, DataflowFacts, DominatorTree};
-use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg, ResultPack};
+use crate::structure::{BlockRef, Cfg, DominatorTree};
+use crate::transformer::{LowInstr, LoweredProto, ResultPack};
 
 use super::super::common::{
     BranchCandidate, ShortCircuitCandidate, ShortCircuitNode, ShortCircuitNodeRef,
@@ -85,7 +85,7 @@ impl<'a> LinearFollowCtx<'a> {
         &self,
         start: BlockRef,
         mut extra_valid: impl FnMut(BlockRef) -> bool,
-        mut is_terminal: impl FnMut(BlockRef, &[BlockRef]) -> bool,
+        mut is_terminal: impl FnMut(BlockRef) -> bool,
     ) -> Option<LinearFollowResult> {
         let mut current = start;
         let mut visited = BTreeSet::new();
@@ -107,16 +107,16 @@ impl<'a> LinearFollowCtx<'a> {
                 });
             }
 
-            let succs = self.cfg.reachable_successors(current);
-            if is_terminal(current, succs.as_slice()) {
+            let successor = self.cfg.unique_reachable_successor(current);
+            if is_terminal(current) {
                 return Some(LinearFollowResult {
                     target: LinearFollowTarget::Terminal(current),
                     traversed: visited,
                 });
             }
 
-            match succs.as_slice() {
-                [succ] if block_is_passthrough(self.proto, self.cfg, current) => current = *succ,
+            match successor {
+                Some(succ) if block_is_passthrough(self.proto, self.cfg, current) => current = succ,
                 _ => return None,
             }
         }
@@ -138,38 +138,8 @@ pub(super) fn truthy_falsy_targets(
     cfg: &Cfg,
     header: BlockRef,
 ) -> Option<(BlockRef, BlockRef)> {
-    let (then_edge_ref, else_edge_ref) = cfg.branch_edges(header)?;
-    let then_target = cfg.edges[then_edge_ref.index()].to;
-    let else_target = cfg.edges[else_edge_ref.index()].to;
-
-    match cfg.terminator(&proto.instrs, header) {
-        Some(LowInstr::Branch(instr)) if instr.cond.negated => Some((else_target, then_target)),
-        Some(LowInstr::Branch(_)) => Some((then_target, else_target)),
-        _ => None,
-    }
-}
-
-pub(super) fn block_writes_reg(
-    proto: &LoweredProto,
-    dataflow: &DataflowFacts,
-    cfg: &Cfg,
-    block: BlockRef,
-    reg: Reg,
-) -> bool {
-    let range = cfg.blocks[block.index()].instrs;
-    let end = range
-        .last()
-        .and_then(|last| {
-            matches!(proto.instrs.get(last.index()), Some(LowInstr::Jump(_)))
-                .then_some(range.end().saturating_sub(1))
-        })
-        .unwrap_or_else(|| range.end());
-
-    (range.start.index()..end).any(|instr_index| {
-        dataflow
-            .instr_def_for_reg(InstrRef(instr_index), reg)
-            .is_some()
-    })
+    let (truthy, falsy) = cfg.predicate_edges(&proto.instrs, header)?;
+    Some((cfg.edges[truthy.index()].to, cfg.edges[falsy.index()].to))
 }
 
 pub(super) fn short_circuit_nodes_are_acyclic(

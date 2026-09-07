@@ -2,11 +2,7 @@
 
 use super::*;
 
-pub(super) fn validate_requirements(
-    cfg: &Cfg,
-    plan: &StructurePlan,
-    _intervals: &RegionNavigation,
-) -> Result<(), StructureError> {
+pub(super) fn validate_requirements(cfg: &Cfg, plan: &StructurePlan) -> Result<(), StructureError> {
     if plan.requirements.by_edge.len() != cfg.edges.len()
         || plan.requirements.unresolved_by_block.len() != cfg.blocks.len()
     {

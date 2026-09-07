@@ -5,7 +5,7 @@
 use super::*;
 
 use crate::structure::EdgeKind;
-use crate::transformer::{CaptureSource, CloseKind, InstrRef, LowInstr, Reg};
+use crate::transformer::{CloseKind, InstrRef, LowInstr};
 
 /// canonical phi 与 iteration 动作就绪后，一次冻结 source 动作相对原始 Close 的位置。
 pub(super) fn finalize_edge_action_placements(
@@ -26,19 +26,6 @@ pub(super) fn expected_edge_action_placements(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
 ) -> Vec<EdgeActionPlacement> {
-    let captured = proto
-        .instrs
-        .iter()
-        .filter_map(|instr| match instr {
-            LowInstr::Closure(closure) => Some(&closure.captures),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|capture| match capture.source {
-            CaptureSource::ByReference(reg) => Some(reg),
-            CaptureSource::ByValue(_) | CaptureSource::Upvalue(_) => None,
-        })
-        .collect::<BTreeSet<Reg>>();
     plan.edge_plans
         .iter()
         .map(|edge| {
@@ -94,7 +81,7 @@ pub(super) fn expected_edge_action_placements(
                     definition.block == source.from
                         && definition.instr.index() < start
                         && definition.reg.index() < close_from
-                        && !captured.contains(&definition.reg)
+                        && !dataflow.reg_is_reference_captured(definition.reg)
                         && dataflow
                             .phi_candidate(copy.phi_id)
                             .is_some_and(|phi| phi.reg == definition.reg)
