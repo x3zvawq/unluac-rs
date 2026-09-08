@@ -23,9 +23,9 @@ use unluac::transformer::{LoweredProto, RawInstrRef, format_low_instr};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WasmRichResult {
+pub struct WasmRichResult<'a> {
     /// 反编译生成的源码或诊断伪源码
-    pub source: String,
+    pub source: &'a str,
     /// `source` 或 `diagnostic-pseudocode`
     pub kind: &'static str,
     /// proto 元数据（DFS 序展平）
@@ -105,12 +105,12 @@ pub struct WasmCfgEdge {
 // ── 投影逻辑 ────────────────────────────────────────────
 
 /// 从 `DecompileResult` 提取前端所需的结构化数据。
-pub fn project_rich_result(result: &DecompileResult) -> WasmRichResult {
+pub fn project_rich_result(result: &DecompileResult) -> WasmRichResult<'_> {
     let (source, kind) = result
         .state
         .generated
         .as_ref()
-        .map(|g| (g.source.clone(), <&'static str>::from(g.kind)))
+        .map(|g| (g.source.as_str(), <&'static str>::from(g.kind)))
         .unwrap_or_default();
 
     let mut protos = Vec::new();
@@ -118,13 +118,13 @@ pub fn project_rich_result(result: &DecompileResult) -> WasmRichResult {
 
     // 从 raw_chunk 提取 proto 元数据（DFS 序）
     if let Some(raw_chunk) = &result.state.raw_chunk {
-        collect_proto_meta(&raw_chunk.main, &mut protos, &mut 0);
+        collect_proto_meta(&raw_chunk.main, &mut protos);
     }
 
     // 从 lowered + cfg + raw_chunk 提取 CFG 数据
     if let (Some(lowered), Some(cfg_graph)) = (&result.state.lowered, &result.state.cfg) {
         let raw_main = result.state.raw_chunk.as_ref().map(|c| &c.main);
-        collect_cfgs(&lowered.main, raw_main, cfg_graph, &mut cfgs, &mut 0);
+        collect_cfgs(&lowered.main, raw_main, cfg_graph, &mut cfgs);
     }
 
     WasmRichResult {
@@ -135,16 +135,12 @@ pub fn project_rich_result(result: &DecompileResult) -> WasmRichResult {
     }
 }
 
-/// DFS 收集 proto 元数据，`counter` 跟踪全局 ID 分配。
-fn collect_proto_meta(proto: &RawProto, out: &mut Vec<WasmProtoMeta>, counter: &mut usize) {
-    // Child metadata is emitted in pre-order, but the explicit stack keeps a
-    // deep Luau chain out of the WASM host call stack.
+/// DFS 收集 proto 元数据，已发布行数就是当前先序 ID。
+fn collect_proto_meta(proto: &RawProto, out: &mut Vec<WasmProtoMeta>) {
+    // 显式栈避免深 Luau proto 链耗尽 WASM 调用栈；子 ID 在实际出栈时回填父行。
     let mut pending: Vec<(&RawProto, Option<usize>)> = vec![(proto, None)];
     while let Some((proto, parent)) = pending.pop() {
-        let my_id = *counter;
-        *counter += 1;
-        let child_start_id = *counter;
-        let num_children = proto.common.children.len();
+        let my_id = out.len();
 
         if let Some(parent) = parent {
             out[parent].children.push(my_id);
@@ -169,23 +165,13 @@ fn collect_proto_meta(proto: &RawProto, out: &mut Vec<WasmProtoMeta>, counter: &
                 .enumerate()
                 .map(|(i, lit)| project_constant(i, lit))
                 .collect(),
-            children: Vec::with_capacity(num_children),
+            children: Vec::with_capacity(proto.common.children.len()),
         });
 
-        // Reverse-push preserves lexical child order in the pre-order output;
-        // IDs are assigned when a frame is popped, matching the old recursion.
+        // 逆序压栈保持源码子节点顺序，此时子节点尚未发布。
         for child in proto.common.children.iter().rev() {
             pending.push((child.as_ref(), Some(my_id)));
         }
-
-        debug_assert_eq!(
-            out[my_id].children.first().copied(),
-            if num_children > 0 {
-                Some(child_start_id)
-            } else {
-                None
-            }
-        );
     }
 }
 
@@ -198,7 +184,6 @@ fn collect_cfgs(
     raw_proto: Option<&RawProto>,
     cfg_graph: &CfgGraph,
     out: &mut Vec<WasmProtoCfg>,
-    counter: &mut usize,
 ) {
     struct Frame<'a> {
         lowered: &'a LoweredProto,
@@ -212,8 +197,7 @@ fn collect_cfgs(
         cfg_graph,
     }];
     while let Some(frame) = pending.pop() {
-        let proto_id = *counter;
-        *counter += 1;
+        let proto_id = out.len();
 
         let raw_instrs = frame.raw.map(|p| &p.common.instructions);
         let cfg = &frame.cfg_graph.cfg;
@@ -275,7 +259,7 @@ fn collect_cfgs(
             block_order: cfg.block_order.iter().map(|b| b.index()).collect(),
         });
 
-        // Reverse-push preserves the lexical child order of the old recursion.
+        // 与元数据投影保持相同的源码先序。
         let child_count = frame
             .lowered
             .children

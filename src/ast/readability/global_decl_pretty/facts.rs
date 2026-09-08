@@ -10,13 +10,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{
-    AstBlock, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalAttr,
-    AstGlobalBindingTarget, AstLValue, AstNameRef, AstStmt,
+    AstBlock, AstExpr, AstFunctionDecl, AstFunctionExpr, AstGlobalAttr, AstGlobalBindingTarget,
+    AstLValue, AstNameRef, AstStmt,
 };
 
 use super::super::walk::RewriteScope;
 use crate::ast::traverse::BlockKind;
-use crate::ast::visit::{self, AstVisitor};
+use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 #[derive(Default)]
 pub(in crate::ast::readability) struct VisibleGlobals {
@@ -439,26 +439,15 @@ impl AstVisitor for GlobalFactsCollector {
 }
 
 fn global_declared_name(function_decl: &AstFunctionDecl) -> Option<&str> {
-    let AstFunctionName::Plain(path) = &function_decl.target else {
-        return None;
-    };
-    if !path.fields.is_empty() {
-        return None;
-    }
-    match &path.root {
-        AstNameRef::Global(global) => Some(global.text.as_str()),
+    match visit::function_target_name(&function_decl.target) {
+        (AstNameRef::Global(global), NameAccess::Write) => Some(global.text.as_str()),
         _ => None,
     }
 }
 
 fn global_function_root_read(function_decl: &AstFunctionDecl) -> Option<&str> {
-    let path = match &function_decl.target {
-        AstFunctionName::Plain(path) if !path.fields.is_empty() => path,
-        AstFunctionName::Method(path, _) => path,
-        AstFunctionName::Plain(_) => return None,
-    };
-    match &path.root {
-        AstNameRef::Global(global) => Some(global.text.as_str()),
+    match visit::function_target_name(&function_decl.target) {
+        (AstNameRef::Global(global), NameAccess::Read) => Some(global.text.as_str()),
         _ => None,
     }
 }

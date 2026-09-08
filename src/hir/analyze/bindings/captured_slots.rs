@@ -80,7 +80,7 @@ pub(super) struct CapturedSlotInputs<'a> {
     pub(super) dataflow: &'a DataflowFacts,
     pub(super) structure: &'a ReadyStructureFacts,
     pub(super) epochs: &'a SlotEpochFacts,
-    pub(super) child_mutable_upvalues: &'a [Vec<bool>],
+    pub(super) child_mutable_upvalues: &'a [&'a [bool]],
     pub(super) numeric_binding_phis: &'a [bool],
     /// 与 loop binding pass 共享的紧凑 body block 列表；每个 loop 只在 bindings 总入口展开一次。
     pub(super) loop_body_blocks: &'a [Option<Vec<BlockRef>>],

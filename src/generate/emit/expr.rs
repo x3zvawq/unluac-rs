@@ -1,7 +1,8 @@
 //! 这个子模块负责把 AST 表达式序列化成目标 Lua 源码片段。
 //!
 //! 它依赖 AST 已经保真的表达式形状、precedence helper 和 naming 结果，只负责发射语法，
-//! 不会在这里再猜补缺失的 sugar。
+//! 不会在这里再猜补缺失的 sugar。一元/二元运算使用显式任务栈发射为同一 Doc 序列，
+//! 保留每个节点的括号边界，避免把 AST 深运算链继续传给 Doc 渲染与析构。
 //! 例如：`AstExpr::SingleValue(call)` 会在这里带括号输出成单值调用表达式；Luau vector
 //! 只消费显式宿主构造器配置，不从 bytecode 猜 API 名。
 
@@ -20,7 +21,7 @@ use super::super::common::TableStyle;
 use super::super::error::GenerateError;
 use super::syntax::{
     binary_meta, format_complex_literal, format_integer, format_number, format_string_literal,
-    format_unsigned_integer, format_vector_component, maybe_parenthesize,
+    format_unsigned_integer, format_vector_component, maybe_parenthesize, needs_parentheses,
 };
 use super::{
     Assoc, Emitter, ExprSide, PREC_AND, PREC_COMPARE, PREC_LITERAL, PREC_OR, PREC_PREFIX,
@@ -169,55 +170,8 @@ impl<'a> Emitter<'a> {
                 PREC_PREFIX,
                 Assoc::Left,
             ),
-            AstExpr::Unary(unary) => {
-                if let Some(preferred) = preferred_negated_relational_render(unary) {
-                    let prec = PREC_COMPARE;
-                    let lhs = self.emit_expr(preferred.lhs, function, prec, ExprSide::Left)?;
-                    let rhs = self.emit_expr(preferred.rhs, function, prec, ExprSide::Right)?;
-                    (
-                        Doc::concat([
-                            lhs,
-                            Doc::text(" "),
-                            Doc::text(preferred.op_text),
-                            Doc::text(" "),
-                            rhs,
-                        ]),
-                        prec,
-                        Assoc::Non,
-                    )
-                } else if unary.op == AstUnaryOpKind::Neg
-                    && matches!(&unary.expr, AstExpr::Number(value) if *value == 0.0 && !value.is_sign_negative())
-                {
-                    (Doc::text("-0.0"), PREC_UNARY, Assoc::Right)
-                } else {
-                    let prec = PREC_UNARY;
-                    let inner = self.emit_expr(&unary.expr, function, prec, ExprSide::Right)?;
-                    let op = match unary.op {
-                        AstUnaryOpKind::Not => "not ",
-                        // `--` 在 Lua 中是行注释；负数常量和内层取负都要插入空格。
-                        AstUnaryOpKind::Neg if neg_operand_starts_with_minus(&unary.expr) => "- ",
-                        AstUnaryOpKind::Neg => "-",
-                        AstUnaryOpKind::BitNot => "~",
-                        AstUnaryOpKind::Length => "#",
-                    };
-                    (Doc::concat([Doc::text(op), inner]), prec, Assoc::Right)
-                }
-            }
-            AstExpr::Binary(binary) => {
-                let (prec, assoc, op) = binary_meta(binary.op);
-                let (lhs_expr, op_text, rhs_expr) =
-                    if let Some(preferred) = preferred_relational_render(binary) {
-                        (preferred.lhs, preferred.op_text, preferred.rhs)
-                    } else {
-                        (&binary.lhs, op, &binary.rhs)
-                    };
-                let lhs = self.emit_expr(lhs_expr, function, prec, ExprSide::Left)?;
-                let rhs = self.emit_expr(rhs_expr, function, prec, ExprSide::Right)?;
-                (
-                    Doc::concat([lhs, Doc::text(" "), Doc::text(op_text), Doc::text(" "), rhs]),
-                    prec,
-                    assoc,
-                )
+            AstExpr::Unary(_) | AstExpr::Binary(_) => {
+                return self.emit_operator_expr(expr, function, parent_prec, side);
             }
             AstExpr::LogicalAnd(logical) => {
                 let doc = self.emit_logical_chain(logical, function, LogicalOperator::And)?;
@@ -262,6 +216,92 @@ impl<'a> Emitter<'a> {
             ),
         };
         Ok(maybe_parenthesize(doc, prec, parent_prec, side, assoc))
+    }
+
+    /// 只展平 Doc 拼接，不改变运算树；括号仍逐节点消费原 precedence/side/assoc。
+    /// 一条深算术链在这里和后续 renderer 中都不需要与链长成比例的调用栈。
+    fn emit_operator_expr(
+        &self,
+        expr: &AstExpr,
+        function: HirProtoRef,
+        parent_prec: u8,
+        side: ExprSide,
+    ) -> Result<Doc, GenerateError> {
+        enum Step<'ast> {
+            Expr(&'ast AstExpr, u8, ExprSide),
+            Text(&'static str),
+        }
+
+        let mut pending = vec![Step::Expr(expr, parent_prec, side)];
+        let mut parts = Vec::new();
+        while let Some(step) = pending.pop() {
+            let (expr, parent_prec, side) = match step {
+                Step::Expr(expr, parent_prec, side) => (expr, parent_prec, side),
+                Step::Text(text) => {
+                    parts.push(Doc::text(text));
+                    continue;
+                }
+            };
+            let ((prec, assoc, op), lhs, rhs) = match expr {
+                AstExpr::Binary(binary) => {
+                    let (prec, assoc, op) = binary_meta(binary.op);
+                    if let Some(preferred) = preferred_relational_render(binary) {
+                        (
+                            (prec, assoc, preferred.op_text),
+                            Some(preferred.lhs),
+                            Some(preferred.rhs),
+                        )
+                    } else {
+                        ((prec, assoc, op), Some(&binary.lhs), Some(&binary.rhs))
+                    }
+                }
+                AstExpr::Unary(unary) => {
+                    if let Some(preferred) = preferred_negated_relational_render(unary) {
+                        (
+                            (PREC_COMPARE, Assoc::Non, preferred.op_text),
+                            Some(preferred.lhs),
+                            Some(preferred.rhs),
+                        )
+                    } else if unary.op == AstUnaryOpKind::Neg
+                        && matches!(&unary.expr, AstExpr::Number(value) if *value == 0.0 && !value.is_sign_negative())
+                    {
+                        ((PREC_UNARY, Assoc::Right, "-0.0"), None, None)
+                    } else {
+                        let op = match unary.op {
+                            AstUnaryOpKind::Not => "not ",
+                            // 两个连续负号会被 Lua lexer 当作行注释。
+                            AstUnaryOpKind::Neg if neg_operand_starts_with_minus(&unary.expr) => {
+                                "- "
+                            }
+                            AstUnaryOpKind::Neg => "-",
+                            AstUnaryOpKind::BitNot => "~",
+                            AstUnaryOpKind::Length => "#",
+                        };
+                        ((PREC_UNARY, Assoc::Right, op), None, Some(&unary.expr))
+                    }
+                }
+                _ => {
+                    parts.push(self.emit_expr(expr, function, parent_prec, side)?);
+                    continue;
+                }
+            };
+            if needs_parentheses(prec, parent_prec, side, assoc) {
+                parts.push(Doc::text("("));
+                pending.push(Step::Text(")"));
+            }
+            if let Some(rhs) = rhs {
+                pending.push(Step::Expr(rhs, prec, ExprSide::Right));
+            }
+            if let Some(lhs) = lhs {
+                pending.push(Step::Text(" "));
+                pending.push(Step::Text(op));
+                pending.push(Step::Text(" "));
+                pending.push(Step::Expr(lhs, prec, ExprSide::Left));
+            } else {
+                parts.push(Doc::text(op));
+            }
+        }
+        Ok(Doc::concat(parts))
     }
 
     fn emit_logical_chain(

@@ -129,6 +129,10 @@ The result includes:
 - `protos`: array of `UnluacProtoMeta` with function metadata (name, line range, params, upvalues, constants, instructions, children)
 - `cfgs`: array of `UnluacProtoCfg` with control flow graph data (blocks with Low-IR and raw bytecode instructions, edges with type labels)
 
+`protos` contains the complete lexical proto tree in preorder: the root has ID 0,
+and every ID equals its array index. `children` preserves source child order.
+`cfgs` is parallel to `protos`, so `cfgs[id]` belongs to `protos[id]`.
+
 Supported top-level options:
 
 - `dialect`

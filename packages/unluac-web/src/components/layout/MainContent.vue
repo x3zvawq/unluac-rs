@@ -109,7 +109,7 @@ const {
 const activeProtoForConstants = computed(() => {
   if (!richResult.value || richResult.value.protos.length === 0) return null
   if (selectedProtoId.value !== null) {
-    return richResult.value.protos.find((p) => p.id === selectedProtoId.value) ?? null
+    return richResult.value.protos[selectedProtoId.value] ?? null
   }
   return richResult.value.protos[0]
 })
@@ -137,7 +137,7 @@ const richResult = computed(() => selectedFile.value?.richResult ?? null)
 /** 选中 proto 对应的 CFG */
 const selectedCfg = computed(() => {
   if (selectedProtoId.value === null || !richResult.value) return null
-  return richResult.value.cfgs.find((c) => c.protoId === selectedProtoId.value) ?? null
+  return richResult.value.cfgs[selectedProtoId.value] ?? null
 })
 
 const hasAnalysisData = computed(
@@ -181,7 +181,7 @@ function onSelectProto(protoId: number) {
 
 /** 从 ProtoGraph 双击节点→跳转到源码行范围高亮 */
 function onJumpToSource(protoId: number) {
-  const proto = richResult.value?.protos.find((p) => p.id === protoId)
+  const proto = richResult.value?.protos[protoId]
   if (proto && proto.lineStart > 0) {
     highlightLineRange.value = { from: proto.lineStart, to: proto.lineEnd }
   }
@@ -299,7 +299,7 @@ watch(
             <template v-if="selectedCfg">
               —
               {{
-                richResult?.protos.find((p) => p.id === selectedProtoId)?.name
+                richResult?.protos[selectedProtoId!]?.name
                   ?? `Proto #${selectedProtoId}`
               }}
             </template>

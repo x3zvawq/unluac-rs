@@ -182,7 +182,7 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) bindings: ProtoBindings,
     pub(super) self_value_capture_locals: BTreeMap<InstrRef, LocalId>,
     pub(super) shared_closure_locals: BTreeMap<SharedClosureRef, (LocalId, ProtoRef)>,
-    pub(super) captured_shared_closures: CapturedSharedClosureLowering,
+    pub(super) captured_shared_closures: CapturedSharedClosureLowering<'a>,
     pub(super) open_pack_owners: Vec<Option<InstrRef>>,
     pub(super) owned_open_producers: Vec<bool>,
     pub(super) global_decls: GlobalDeclProtocols,
@@ -214,11 +214,12 @@ fn pending_frame_returns(proto: &LoweredProto, plan: &StructurePlan) -> BTreeSet
         .collect()
 }
 
-pub(super) struct CapturedSharedClosureLowering {
+pub(super) struct CapturedSharedClosureLowering<'a> {
     plan: SharedClosurePlan,
     factory_locals: Vec<LocalId>,
     capture_barriers: Vec<Option<SharedCaptureBarrier>>,
-    composite_protos: Vec<HirProtoRef>,
+    // frame 保留列表供失败回滚；lowering 只借用已预留的身份。
+    composite_protos: &'a [HirProtoRef],
 }
 
 pub(super) struct SharedCaptureBarrier {
@@ -456,7 +457,7 @@ fn lower_proto_one(
         .collect::<Vec<_>>();
     let child_mutable_upvalues = child_results
         .iter()
-        .map(|child| child.mutable_upvalues.clone())
+        .map(|child| child.mutable_upvalues.as_slice())
         .collect::<Vec<_>>();
     fill_composite_factory_protos(
         proto,
@@ -482,7 +483,7 @@ fn lower_proto_one(
         build_shared_closure_locals(proto, &captured_shared_plan, &mut bindings);
     let captured_shared_closures = CapturedSharedClosureLowering::new(
         captured_shared_plan,
-        composite_protos.clone(),
+        composite_protos,
         proto,
         dataflow,
         &mut bindings,
@@ -528,7 +529,7 @@ fn lower_proto_one(
         &bindings,
         &mut promotion_facts,
     );
-    let lowering = ProtoLowering {
+    let mut lowering = ProtoLowering {
         target,
         proto,
         cfg,
@@ -552,7 +553,7 @@ fn lower_proto_one(
         .iter()
         .map(|upvalue| lowering.bindings.upvalues[upvalue.index()])
         .collect();
-    let body = build_proto_body(id, &lowering)?;
+    let body = build_proto_body(id, &mut lowering)?;
     let children = lowering.hir_children();
     let bindings = lowering.bindings;
 
@@ -701,7 +702,7 @@ fn fill_failed_proto(
     let child_mutable_upvalues = frame
         .child_results
         .iter()
-        .map(|child| child.mutable_upvalues.clone())
+        .map(|child| child.mutable_upvalues.as_slice())
         .collect::<Vec<_>>();
     let mutable_upvalues = mutable_upvalues_for_proto(proto, &child_mutable_upvalues);
 
@@ -819,7 +820,7 @@ fn debug_scope_end_precedes_return(proto: &LoweredProto, instr: InstrRef) -> boo
 
 fn mutable_upvalues_for_proto(
     proto: &LoweredProto,
-    child_mutable_upvalues: &[Vec<bool>],
+    child_mutable_upvalues: &[&[bool]],
 ) -> Vec<bool> {
     let mut mutable = vec![false; usize::from(proto.upvalues.common.count)];
     for instr in &proto.instrs {
@@ -905,10 +906,10 @@ fn build_shared_closure_locals(
         .collect()
 }
 
-impl CapturedSharedClosureLowering {
+impl<'a> CapturedSharedClosureLowering<'a> {
     fn new(
         plan: SharedClosurePlan,
-        composite_protos: Vec<HirProtoRef>,
+        composite_protos: &'a [HirProtoRef],
         proto: &LoweredProto,
         dataflow: &DataflowFacts,
         bindings: &mut ProtoBindings,
@@ -1037,7 +1038,7 @@ fn reserve_composite_factory_protos(
 fn fill_composite_factory_protos(
     proto: &LoweredProto,
     child_refs: &[HirProtoRef],
-    child_mutable_upvalues: &[Vec<bool>],
+    child_mutable_upvalues: &[&[bool]],
     plan: &SharedClosurePlan,
     ids: &[HirProtoRef],
     artifacts: &mut LowerArtifacts,
@@ -1060,7 +1061,7 @@ fn build_composite_factory_proto(
     id: HirProtoRef,
     proto: &LoweredProto,
     child_refs: &[HirProtoRef],
-    child_mutable_upvalues: &[Vec<bool>],
+    child_mutable_upvalues: &[&[bool]],
     plan: &CompositeFactoryPlan,
 ) -> Result<(HirProto, ProtoPromotionFacts), HirLowerError> {
     let error = || HirLowerError::UnrepresentableRepeatedCapturedSharedClosure {
@@ -1464,24 +1465,22 @@ impl ProtoLowering<'_> {
 
 fn build_proto_body(
     proto: HirProtoRef,
-    lowering: &ProtoLowering<'_>,
+    lowering: &mut ProtoLowering<'_>,
 ) -> Result<HirBlock, HirLowerError> {
     let mut body = build_structured_body(proto, lowering)?;
-    let mut prefix = if lowering.bindings.debug_entry_local_decls.is_empty() {
+    let debug_entry_bindings = std::mem::take(&mut lowering.bindings.debug_entry_local_decls);
+    let mut prefix = if debug_entry_bindings.is_empty() {
         Vec::new()
     } else {
         vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
-            bindings: lowering.bindings.debug_entry_local_decls.clone(),
-            values: HirValuePack::fixed(vec![
-                HirExpr::Nil;
-                lowering.bindings.debug_entry_local_decls.len()
-            ]),
+            values: HirValuePack::fixed(vec![HirExpr::Nil; debug_entry_bindings.len()]),
+            bindings: debug_entry_bindings,
             initializer_merge_transaction: None,
         }))]
     };
-    prefix.extend(local_decl_stmts(
-        lowering.bindings.capture_entry_local_decls.clone(),
-    ));
+    prefix.extend(local_decl_stmts(std::mem::take(
+        &mut lowering.bindings.capture_entry_local_decls,
+    )));
     prefix.extend(
         lowering
             .shared_closure_locals

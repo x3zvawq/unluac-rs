@@ -6,7 +6,7 @@
  * 每个 proto 渲染为节点（显示 id、名称、行号、参数签名），
  * 父子关系渲染为有向边。
  *
- * 布局算法：简单的层次树布局（BFS 按深度分层），
+ * 布局算法：消费后端先序身份，按深度分层，
  * 不依赖 dagre，因为 proto 关系是严格的树结构。
  *
  * 性能优化：
@@ -73,7 +73,7 @@ interface TreeLayoutResult {
 }
 
 /**
- * 层次树布局：BFS 分层，同层节点等间距水平排列。
+ * 层次树布局：同层节点等间距水平排列。
  * 同时记录每个节点的深度，用于颜色编码。
  */
 function computeTreeLayout(protos: ProtoMeta[]): TreeLayoutResult {
@@ -81,37 +81,14 @@ function computeTreeLayout(protos: ProtoMeta[]): TreeLayoutResult {
   const depths = new Map<number, number>()
   if (protos.length === 0) return { positions, depths }
 
-  // 找出所有被引用为 children 的 id
-  const childSet = new Set(protos.flatMap((p) => p.children))
-  // 根节点：不是任何 proto 的 child
-  const roots = protos.filter((p) => !childSet.has(p.id))
-  if (roots.length === 0 && protos.length > 0) {
-    // fallback: 使用第一个 proto 作为根
-    roots.push(protos[0])
-  }
-
-  const protoMap = new Map(protos.map((p) => [p.id, p]))
-
-  // BFS 分层
+  // rich.protos 是完整先序树：根为 0，父节点先于孩子；同层顺序与 BFS 一致。
   const layers: number[][] = []
-  const visited = new Set<number>()
-  let queue = roots.map((r) => r.id)
-  for (const id of queue) visited.add(id)
-
-  while (queue.length > 0) {
-    layers.push(queue)
-    const next: number[] = []
-    for (const id of queue) {
-      const proto = protoMap.get(id)
-      if (!proto) continue
-      for (const childId of proto.children) {
-        if (!visited.has(childId)) {
-          visited.add(childId)
-          next.push(childId)
-        }
-      }
-    }
-    queue = next
+  depths.set(0, 0)
+  for (const proto of protos) {
+    const depth = depths.get(proto.id)!
+    layers[depth] ??= []
+    layers[depth].push(proto.id)
+    for (const childId of proto.children) depths.set(childId, depth + 1)
   }
 
   // 计算位置和深度
@@ -124,7 +101,6 @@ function computeTreeLayout(protos: ProtoMeta[]): TreeLayoutResult {
         x: startX + i * (NODE_WIDTH + H_GAP),
         y: layer * (NODE_HEIGHT + V_GAP),
       })
-      depths.set(ids[i], layer)
     }
   }
 

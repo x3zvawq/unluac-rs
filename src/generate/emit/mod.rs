@@ -150,19 +150,19 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_block(&self, block: &AstBlock, function: HirProtoRef) -> Result<Doc, GenerateError> {
-        let docs = block
+        let mut docs = block
             .stmts
             .iter()
-            .map(|stmt| self.emit_stmt(stmt, function))
-            .collect::<Result<Vec<_>, _>>()?;
-        let Some((first, rest)) = docs.split_first() else {
+            .map(|stmt| self.emit_stmt(stmt, function));
+        let Some(first) = docs.next().transpose()? else {
             return Ok(Doc::concat([]));
         };
 
-        let mut parts = vec![first.clone()];
-        for (index, doc) in rest.iter().enumerate() {
+        let mut parts = vec![first];
+        for (index, doc) in docs.enumerate() {
+            let doc = doc?;
             parts.push(self.emit_stmt_separator(&block.stmts[index], &block.stmts[index + 1]));
-            parts.push(doc.clone());
+            parts.push(doc);
         }
         Ok(Doc::concat(parts))
     }

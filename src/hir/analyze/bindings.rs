@@ -70,7 +70,7 @@ pub(super) fn build_bindings(
     dataflow: &DataflowFacts,
     structure: &ReadyStructureFacts,
     captured_slot_epochs: &SlotEpochFacts,
-    child_mutable_upvalues: &[Vec<bool>],
+    child_mutable_upvalues: &[&[bool]],
 ) -> ProtoBindings {
     let debug_names_by_ssa = debug_names_by_ssa(proto, structure);
     let params = (0..usize::from(proto.signature.num_params))

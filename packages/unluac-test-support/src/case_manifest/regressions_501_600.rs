@@ -155,4 +155,12 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_520_capture_closed_nil_slot.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_521_deep_arithmetic_chain.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_522_lua55_function_target_global_gate.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
 ];

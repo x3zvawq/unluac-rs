@@ -10,31 +10,17 @@ use std::collections::BTreeMap;
 
 use crate::graph;
 
-use super::super::common::{AstBlock, AstFunctionExpr, AstLabelId, AstStmt};
-use crate::ast::visit::{self, AstVisitor};
-
-struct LabelOrGotoVisitor(bool);
-
-impl AstVisitor for LabelOrGotoVisitor {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
-        self.0 |= matches!(stmt, AstStmt::Label(_) | AstStmt::Goto(_));
-    }
-
-    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-        false
-    }
-}
+use super::super::common::{AstBlock, AstLabelId, AstStmt};
+use crate::ast::visit::any_stmt_structure;
 
 pub(super) fn block_contains_label_or_goto(block: &AstBlock) -> bool {
-    let mut visitor = LabelOrGotoVisitor(false);
-    visit::visit_block(block, &mut visitor);
-    visitor.0
+    block.stmts.iter().any(stmt_contains_label_or_goto)
 }
 
 pub(super) fn stmt_contains_label_or_goto(stmt: &AstStmt) -> bool {
-    let mut visitor = LabelOrGotoVisitor(false);
-    visit::visit_stmt(stmt, &mut visitor);
-    visitor.0
+    any_stmt_structure(stmt, &mut |stmt| {
+        matches!(stmt, AstStmt::Label(_) | AstStmt::Goto(_))
+    })
 }
 
 pub(super) struct BlockGotoIndex(graph::LabelReferenceIndex<AstLabelId>);

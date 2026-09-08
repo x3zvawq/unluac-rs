@@ -11,6 +11,8 @@
 //! 不得丢掉前者的基址读取。函数边界的 capture 事件来自显式元数据，不遍历 child 重建。
 //! 名字回调可返回 Break 结束本次入口遍历；停止信号穿过子节点循环立即返回，已进入
 //! statement/function 的 leave hook 仍成对执行，未进入的 child 不产生回调。
+//! 只需跳转事实时使用 any_stmt_structure，跳过求值与 child function；例如外层声明
+//! 能否移动只取决于本函数的 goto，闭包体中的同号 label 不属于这个查询域。
 
 use std::ops::ControlFlow;
 
@@ -31,6 +33,16 @@ pub(super) enum NameAccess {
     LocalDeclaration,
     LocalFunctionDeclaration,
     Capture,
+}
+
+/// 裸目标写入 binding，字段/方法目标先读取路径根；global gate 与名字事件共用此判定。
+pub(super) fn function_target_name(target: &AstFunctionName) -> (&AstNameRef, NameAccess) {
+    match target {
+        AstFunctionName::Plain(path) if path.fields.is_empty() => (&path.root, NameAccess::Write),
+        AstFunctionName::Plain(path) | AstFunctionName::Method(path, _) => {
+            (&path.root, NameAccess::Read)
+        }
+    }
 }
 
 pub(super) trait AstVisitor {
@@ -73,6 +85,30 @@ pub(super) fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
     let _ = visit_expr_impl(expr, visitor);
 }
 
+/// 当前函数语句骨架的先序查询；表达式、函数体和 capture 不含本域的 label/goto。
+pub(super) fn any_stmt_structure(
+    stmt: &AstStmt,
+    predicate: &mut impl FnMut(&AstStmt) -> bool,
+) -> bool {
+    if predicate(stmt) {
+        return true;
+    }
+    traverse_stmt_children!(
+        stmt, iter = iter, opt = as_ref, borrow = [&],
+        expr(_expr) => {},
+        lvalue(_lvalue) => {},
+        block(block) => {
+            if block.stmts.iter().any(|stmt| any_stmt_structure(stmt, predicate)) {
+                return true;
+            }
+        },
+        function(_function) => {},
+        condition(_condition) => {},
+        call(_call) => {}
+    );
+    false
+}
+
 fn visit_block_with_kind(
     block: &AstBlock,
     kind: BlockKind,
@@ -105,15 +141,8 @@ fn visit_stmt_impl(stmt: &AstStmt, visitor: &mut impl AstVisitor) -> ControlFlow
                 }
             }
             AstStmt::FunctionDecl(decl) => {
-                let (path, access) = match &decl.target {
-                    AstFunctionName::Plain(path) if path.fields.is_empty() => {
-                        (path, NameAccess::Write)
-                    }
-                    AstFunctionName::Plain(path) | AstFunctionName::Method(path, _) => {
-                        (path, NameAccess::Read)
-                    }
-                };
-                visitor.visit_name(&path.root, access)?;
+                let (name, access) = function_target_name(&decl.target);
+                visitor.visit_name(name, access)?;
             }
             AstStmt::LocalFunctionDecl(decl) => {
                 visitor.visit_name(

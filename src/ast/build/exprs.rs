@@ -9,6 +9,8 @@
 //! 顺序保留 child UpvalueId 到父级 Param/Local/Temp/Upvalue 名字的对应，供后续精确分析。
 //! 表构造器的 record key 同样只从 HIR 语义表达式降低：合法 UTF-8 identifier 在本层按
 //! 目标方言写成命名字段，其余键保持显式索引表达式，HIR 不承载这项源码语法选择。
+//! 一元/二元运算通过显式后序栈保留 HIR 原树；例如长加法链不能为减少调用栈而重结合，
+//! 否则会改变浮点结果或元方法执行顺序。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -278,15 +280,9 @@ impl<'a> AstLowerer<'a> {
                 |field| AstExpr::FieldAccess(Box::new(field)),
                 |index| AstExpr::IndexAccess(Box::new(index)),
             )?,
-            HirExpr::Unary(unary) => AstExpr::Unary(Box::new(AstUnaryExpr {
-                op: lower_unary_op(unary.op),
-                expr: self.lower_expr(proto_index, &unary.expr)?,
-            })),
-            HirExpr::Binary(binary) => AstExpr::Binary(Box::new(AstBinaryExpr {
-                op: lower_binary_op(binary.op),
-                lhs: self.lower_expr(proto_index, &binary.lhs)?,
-                rhs: self.lower_expr(proto_index, &binary.rhs)?,
-            })),
+            HirExpr::Unary(_) | HirExpr::Binary(_) => {
+                self.lower_operator_expr(proto_index, expr)?
+            }
             HirExpr::LogicalAnd(_) => {
                 self.lower_logical_chain(proto_index, expr, LogicalKind::And)?
             }
@@ -377,6 +373,48 @@ impl<'a> AstLowerer<'a> {
                 AstExpr::Error(format!("unresolved HIR expression: {}", unresolved.summary))
             }
         })
+    }
+
+    /// 运算节点按原来的左到右顺序降低，叶子仍使用相同 lowering 和错误路径。
+    fn lower_operator_expr(
+        &mut self,
+        proto_index: usize,
+        expr: &HirExpr,
+    ) -> Result<AstExpr, AstLowerError> {
+        enum Step<'hir> {
+            Expr(&'hir HirExpr),
+            Unary(AstUnaryOpKind),
+            Binary(AstBinaryOpKind),
+        }
+
+        let mut pending = vec![Step::Expr(expr)];
+        let mut values = Vec::new();
+        while let Some(step) = pending.pop() {
+            match step {
+                Step::Expr(HirExpr::Unary(unary)) => {
+                    pending.push(Step::Unary(lower_unary_op(unary.op)));
+                    pending.push(Step::Expr(&unary.expr));
+                }
+                Step::Expr(HirExpr::Binary(binary)) => {
+                    pending.push(Step::Binary(lower_binary_op(binary.op)));
+                    pending.push(Step::Expr(&binary.rhs));
+                    pending.push(Step::Expr(&binary.lhs));
+                }
+                Step::Expr(leaf) => values.push(self.lower_expr(proto_index, leaf)?),
+                Step::Unary(op) => {
+                    let expr = values
+                        .pop()
+                        .expect("unary operand is lowered before its node");
+                    values.push(AstExpr::Unary(Box::new(AstUnaryExpr { op, expr })));
+                }
+                Step::Binary(op) => {
+                    let rhs = values.pop().expect("binary rhs is lowered before its node");
+                    let lhs = values.pop().expect("binary lhs is lowered before its node");
+                    values.push(AstExpr::Binary(Box::new(AstBinaryExpr { op, lhs, rhs })));
+                }
+            }
+        }
+        Ok(values.pop().expect("operator tree has one lowered root"))
     }
 
     /// 同类逻辑运算保持 operand 次序时可安全重结合；先迭代展平再平衡，避免长链把

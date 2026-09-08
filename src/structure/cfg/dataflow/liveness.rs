@@ -9,7 +9,7 @@
 
 use super::*;
 
-fn enqueue_predecessors(
+pub(super) fn enqueue_predecessors(
     cfg: &Cfg,
     block: BlockRef,
     worklist: &mut VecDeque<BlockRef>,

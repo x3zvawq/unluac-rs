@@ -324,15 +324,23 @@ impl EvalOrderProbe<'_> {
     }
 
     fn exprs<'a>(&self, exprs: impl IntoIterator<Item = &'a HirExpr>) -> bool {
+        self.find_in_exprs(exprs) == Some(true)
+    }
+
+    fn find_in_exprs<'a>(&self, exprs: impl IntoIterator<Item = &'a HirExpr>) -> Option<bool> {
+        let mut prefix_clear = true;
         for expr in exprs {
-            if expr_mentions_temp(expr, self.temp) {
-                return self.expr(expr);
+            let found = if prefix_clear {
+                self.find_in_expr(expr)
+            } else {
+                expr_mentions_temp(expr, self.temp).then_some(false)
+            };
+            if found.is_some() {
+                return found;
             }
-            if !self.prefix_is_clear(expr) {
-                return false;
-            }
+            prefix_clear &= self.prefix_is_clear(expr);
         }
-        false
+        None
     }
 
     fn lvalues(&self, lvalues: &[HirLValue]) -> (Option<bool>, bool) {
@@ -340,8 +348,8 @@ impl EvalOrderProbe<'_> {
         for lvalue in lvalues {
             if let HirLValue::TableAccess(access) = lvalue {
                 for expr in [&access.base, &access.key] {
-                    if expr_mentions_temp(expr, self.temp) {
-                        return (Some(prefix_clear && self.expr(expr)), prefix_clear);
+                    if let Some(found) = self.find_in_expr(expr) {
+                        return (Some(prefix_clear && found), prefix_clear);
                     }
                     prefix_clear &= self.prefix_is_clear(expr);
                 }
@@ -351,71 +359,63 @@ impl EvalOrderProbe<'_> {
     }
 
     fn call(&self, call: &HirCallExpr) -> bool {
+        self.find_in_call(call) == Some(true)
+    }
+
+    fn find_in_call(&self, call: &HirCallExpr) -> Option<bool> {
         if let Some(fastcall) = call.fastcall {
-            if expr_mentions_temp(&call.callee, self.temp) {
-                return self.expr(&call.callee);
+            if let Some(found) = self.find_in_expr(&call.callee) {
+                return Some(found);
             }
             for (index, arg) in call.args.fixed.iter().enumerate() {
-                if expr_mentions_temp(arg, self.temp) {
-                    return fastcall.fixed_is_direct(index) && self.expr(arg);
+                let found = if fastcall.fixed_is_direct(index) {
+                    self.find_in_expr(arg)
+                } else {
+                    expr_mentions_temp(arg, self.temp).then_some(false)
+                };
+                if found.is_some() {
+                    return found;
                 }
             }
-            if let Some(tail) = &call.args.tail
-                && expr_mentions_temp(tail.as_expr(), self.temp)
-            {
-                return fastcall.tail_is_direct() && self.expr(tail.as_expr());
-            }
-            return false;
+            return call.args.tail.as_ref().and_then(|tail| {
+                if fastcall.tail_is_direct() {
+                    self.find_in_expr(tail.as_expr())
+                } else {
+                    expr_mentions_temp(tail.as_expr(), self.temp).then_some(false)
+                }
+            });
         }
-        self.exprs(std::iter::once(&call.callee).chain(&call.args))
+        self.find_in_exprs(std::iter::once(&call.callee).chain(&call.args))
     }
 
     fn expr(&self, expr: &HirExpr) -> bool {
+        self.find_in_expr(expr) == Some(true)
+    }
+
+    /// 同一次下降返回“没有引用”或“首次引用是否越过屏障”。若先 contains 再下降，
+    /// 长算术链的每层都会重扫其左子树，使一轮逆向内联累计成三次方成本。
+    fn find_in_expr(&self, expr: &HirExpr) -> Option<bool> {
         match expr {
-            HirExpr::TempRef(other) => *other == self.temp,
-            HirExpr::TableAccess(access) => self.exprs([&access.base, &access.key]),
-            HirExpr::Unary(unary) => self.expr(&unary.expr),
-            HirExpr::Binary(binary) => self.exprs([&binary.lhs, &binary.rhs]),
-            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-                expr_mentions_temp(&logical.lhs, self.temp) && self.expr(&logical.lhs)
-            }
-            HirExpr::Call(call) => self.call(call),
-            HirExpr::TableConstructor(table) => {
-                // table 在首字段前已经分配，可能触发 GC/finalizer；原本位于 constructor
-                // 之前的有序 producer 不能移入任何字段，包括第一个字段。
-                let mut prefix_clear = false;
-                for field in &table.fields {
-                    match field {
-                        HirTableField::Array(value) => {
-                            if expr_mentions_temp(value, self.temp) {
-                                return prefix_clear && self.expr(value);
-                            }
-                            prefix_clear &= self.prefix_is_clear(value);
-                        }
-                        HirTableField::Record(field) => {
-                            if expr_mentions_temp(&field.key, self.temp) {
-                                return prefix_clear && self.expr(&field.key);
-                            }
-                            prefix_clear &= self.prefix_is_clear(&field.key);
-                            if expr_mentions_temp(&field.value, self.temp) {
-                                return prefix_clear && self.expr(&field.value);
-                            }
-                            prefix_clear &= self.prefix_is_clear(&field.value);
-                        }
-                    }
-                }
-                table.trailing_multivalue.as_ref().is_some_and(|tail| {
-                    let trailing = tail.as_expr();
-                    prefix_clear && expr_mentions_temp(trailing, self.temp) && self.expr(trailing)
-                })
+            HirExpr::TempRef(other) => (*other == self.temp).then_some(true),
+            HirExpr::TableAccess(access) => self.find_in_exprs([&access.base, &access.key]),
+            HirExpr::Unary(unary) => self.find_in_expr(&unary.expr),
+            HirExpr::Binary(binary) => self.find_in_exprs([&binary.lhs, &binary.rhs]),
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => self
+                .find_in_expr(&logical.lhs)
+                .or_else(|| expr_mentions_temp(&logical.rhs, self.temp).then_some(false)),
+            HirExpr::Call(call) => self.find_in_call(call),
+            // constructor 的分配先于所有字段；closure capture 也不是可移动的消费站点。
+            // 仍区分缺少引用与受阻引用，FASTCALL 需要跳过不含该 temp 的参数。
+            HirExpr::TableConstructor(_) | HirExpr::Closure(_) => {
+                expr_mentions_temp(expr, self.temp).then_some(false)
             }
             HirExpr::Decision(decision) => {
                 analyze_decision(decision);
                 let entry = &decision.nodes[decision.entry.index()];
-                expr_mentions_temp(&entry.test, self.temp) && self.expr(&entry.test)
+                self.find_in_expr(&entry.test)
+                    .or_else(|| expr_mentions_temp(expr, self.temp).then_some(false))
             }
-            HirExpr::Closure(_)
-            | HirExpr::Nil
+            HirExpr::Nil
             | HirExpr::Boolean(_)
             | HirExpr::Integer(_)
             | HirExpr::Number(_)
@@ -429,7 +429,7 @@ impl EvalOrderProbe<'_> {
             | HirExpr::UpvalueRef(_)
             | HirExpr::GlobalRef(_)
             | HirExpr::VarArg
-            | HirExpr::Unresolved(_) => false,
+            | HirExpr::Unresolved(_) => None,
         }
     }
 

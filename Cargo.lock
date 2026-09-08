@@ -458,6 +458,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "unluac",
+ "unluac-test-support",
  "wasm-bindgen",
 ]
 

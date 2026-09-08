@@ -540,6 +540,33 @@ mod tests {
     }
 
     #[test]
+    fn rich_result_preserves_proto_tree_and_cfg_identity() {
+        let bytes = unluac_test_support::compile_lua_case(
+            "lua5.4",
+            "tests/unit-case/common_09_method_and_self.lua",
+        );
+        let result = super::run_decompile(&bytes, default_wasm_decompile_options())
+            .expect("the supported Lua input should decompile");
+        let rich = super::rich::project_rich_result(&result);
+
+        assert_eq!(rich.kind, "source");
+        assert_eq!(rich.source, result.state.generated.as_ref().unwrap().source);
+        assert_eq!(rich.protos.len(), 15);
+        assert_eq!(rich.protos[0].children, [1, 4, 9, 12]);
+        assert_eq!(rich.protos[1].children, [2, 3]);
+        assert_eq!(rich.protos[4].children, [5, 6, 7, 8]);
+        assert_eq!(rich.protos[9].children, [10, 11]);
+        assert_eq!(rich.protos[12].children, [13]);
+        assert_eq!(rich.protos[13].children, [14]);
+        assert!(rich.protos[14].children.is_empty());
+        assert_eq!(rich.cfgs.len(), rich.protos.len());
+        for (id, (proto, cfg)) in rich.protos.iter().zip(&rich.cfgs).enumerate() {
+            assert_eq!(proto.id, id);
+            assert_eq!(cfg.proto_id, id);
+        }
+    }
+
+    #[test]
     fn supported_value_lists_match_public_labels() {
         assert_eq!(parse_mode_labels(), vec!["strict", "permissive"]);
         assert_eq!(

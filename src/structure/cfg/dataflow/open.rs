@@ -222,13 +222,7 @@ fn solve_open_liveness(
         live_in[block.index()] = new_in;
         live_out[block.index()] = new_out;
         if changed {
-            for edge in &cfg.preds[block.index()] {
-                let pred = cfg.edges[edge.index()].from;
-                if cfg.reachable_blocks.contains(&pred) && !queued[pred.index()] {
-                    queued[pred.index()] = true;
-                    worklist.push_back(pred);
-                }
-            }
+            super::liveness::enqueue_predecessors(cfg, block, &mut worklist, &mut queued);
         }
     }
     (live_in, live_out)

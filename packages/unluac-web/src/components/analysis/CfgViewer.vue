@@ -132,11 +132,16 @@ function computeDagreLayout(cfg: ProtoCfg): Map<number, { x: number; y: number }
   return positions
 }
 
+// 聚焦只过滤完整布局；切换 CFG 或指令模式时才需重新运行 dagre。
+const layoutPositions = computed(() =>
+  props.cfg ? computeDagreLayout(props.cfg) : new Map<number, { x: number; y: number }>(),
+)
+
 const graphData = computed(() => {
   const cfg = props.cfg
   if (!cfg) return { nodes: [], edges: [] }
 
-  const positions = computeDagreLayout(cfg)
+  const positions = layoutPositions.value
 
   // 聚焦模式：只显示 N 跳邻居
   const visibleIds =

@@ -137,7 +137,9 @@ export type EdgeKind =
 export interface RichDecompileResult {
   source: string
   kind: 'source' | 'diagnostic-pseudocode'
+  /** 完整 proto 树的先序数组，ID 等于索引，根为 0。 */
   protos: ProtoMeta[]
+  /** 与 protos 平行，protoId 等于索引。 */
   cfgs: ProtoCfg[]
 }
 

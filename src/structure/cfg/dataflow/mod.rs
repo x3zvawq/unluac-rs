@@ -298,28 +298,3 @@ fn incoming_slots_by_edge(cfg: &Cfg) -> Vec<Option<usize>> {
     }
     slots
 }
-
-fn canonical_value(
-    mut value: SsaValue,
-    replacements: &[SsaValue],
-) -> Result<SsaValue, StructureError> {
-    let mut remaining = replacements.len() + 1;
-    while let SsaValue::Phi(phi) = value {
-        let Some(next) = replacements.get(phi.index()).copied() else {
-            return Err(StructureError::invalid(format!(
-                "SSA canonicalization references missing {phi}"
-            )));
-        };
-        if next == value {
-            break;
-        }
-        if remaining == 0 {
-            return Err(StructureError::invalid(
-                "SSA replacement graph contains a cycle",
-            ));
-        }
-        value = next;
-        remaining -= 1;
-    }
-    Ok(value)
-}

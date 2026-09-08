@@ -11,17 +11,15 @@
 //! - `local ok = ...; local left = math.max(...); return left`
 //!   会被收成 `local ok = ...; do global<const> *; local left = ...; return left end`
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, ops::ControlFlow};
 
-use crate::ast::common::{
-    AstBlock, AstExpr, AstFunctionExpr, AstGlobalAttr, AstLValue, AstNameRef, AstStmt,
-};
+use crate::ast::common::{AstBlock, AstExpr, AstFunctionExpr, AstGlobalAttr, AstNameRef, AstStmt};
 use crate::hir::HirRepeatConditionLifetimeFacts;
 
 use self::lifetime::{suffix_has_preserved_lifetime, suffix_shortens_referenced_binding};
 use super::facts::MissingGlobals;
 use super::insert::build_wildcard_global_decl;
-use crate::ast::visit::{self, AstVisitor};
+use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 mod lifetime;
 
@@ -112,31 +110,11 @@ fn has_incoming_goto(block: &AstBlock, start: usize) -> bool {
         return false;
     }
 
-    let mut visitor = IncomingGotoVisitor {
-        suffix_labels: &suffix_labels,
-        found: false,
-    };
-    for stmt in &block.stmts[..start] {
-        visit::visit_stmt(stmt, &mut visitor);
-    }
-    visitor.found
-}
-
-struct IncomingGotoVisitor<'a> {
-    suffix_labels: &'a BTreeSet<crate::ast::common::AstLabelId>,
-    found: bool,
-}
-
-impl AstVisitor for IncomingGotoVisitor<'_> {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
-        if let AstStmt::Goto(goto_) = stmt {
-            self.found |= self.suffix_labels.contains(&goto_.target);
-        }
-    }
-
-    fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-        false
-    }
+    block.stmts[..start].iter().any(|stmt| {
+        visit::any_stmt_structure(stmt, &mut |stmt| {
+            matches!(stmt, AstStmt::Goto(goto_) if suffix_labels.contains(&goto_.target))
+        })
+    })
 }
 
 fn stmt_mentions_any_missing_global(stmt: &AstStmt, names: &BTreeSet<String>) -> bool {
@@ -154,20 +132,15 @@ struct MissingGlobalStmtVisitor<'a> {
 }
 
 impl AstVisitor for MissingGlobalStmtVisitor<'_> {
-    fn visit_expr(&mut self, expr: &AstExpr) {
-        if let AstExpr::Var(AstNameRef::Global(global)) = expr
+    fn visit_name(&mut self, name: &AstNameRef, _access: NameAccess) -> ControlFlow<()> {
+        // 函数 target 的根引用同样由 visitor 发布；例如 box.f 的 box 在写字段前读取。
+        if let AstNameRef::Global(global) = name
             && self.names.contains(&global.text)
         {
             self.found = true;
+            return ControlFlow::Break(());
         }
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &AstLValue) {
-        if let AstLValue::Name(AstNameRef::Global(global)) = lvalue
-            && self.names.contains(&global.text)
-        {
-            self.found = true;
-        }
+        ControlFlow::Continue(())
     }
 
     fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {

@@ -98,14 +98,14 @@ export interface UnluacRichResult {
   source: string;
   /** 可重编译源码或带 Error 标记的诊断伪源码 */
   kind: "source" | "diagnostic-pseudocode";
-  /** proto 元数据（DFS 序展平） */
+  /** 完整 proto 树的先序数组，ID 等于索引，根为 0 */
   protos: UnluacProtoMeta[];
   /** 每个 proto 的 CFG（与 protos 平行数组） */
   cfgs: UnluacProtoCfg[];
 }
 
 export interface UnluacProtoMeta {
-  /** DFS 遍历序号（0 = 主 proto） */
+  /** 先序数组索引（0 = 主 proto） */
   id: number;
   /** 源文件名（debug info） */
   name: string | null;

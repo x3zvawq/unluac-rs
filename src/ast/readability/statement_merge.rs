@@ -38,7 +38,7 @@ use super::binding_flow::{
 use super::expr_analysis::{expr_complexity, is_copy_like_expr, is_discard_safe_expr};
 use super::walk::{self, AstRewritePass};
 use crate::ast::traverse::BlockKind;
-use crate::ast::visit::{self, AstVisitor};
+use crate::ast::visit::any_stmt_structure;
 
 const ADJACENT_LOCAL_VALUE_COMPLEXITY_LIMIT: usize = 4;
 
@@ -1266,27 +1266,14 @@ impl ForwardGotoIndex {
 }
 
 fn collect_goto_targets(stmt: &AstStmt) -> BTreeSet<AstLabelId> {
-    let mut visitor = GotoTargetCollector {
-        targets: BTreeSet::new(),
-    };
-    visit::visit_stmt(stmt, &mut visitor);
-    visitor.targets
-}
-
-struct GotoTargetCollector {
-    targets: BTreeSet<AstLabelId>,
-}
-
-impl AstVisitor for GotoTargetCollector {
-    fn visit_stmt(&mut self, stmt: &AstStmt) {
+    let mut targets = BTreeSet::new();
+    any_stmt_structure(stmt, &mut |stmt| {
         if let AstStmt::Goto(goto_stmt) = stmt {
-            self.targets.insert(goto_stmt.target);
+            targets.insert(goto_stmt.target);
         }
-    }
-
-    fn visit_function_expr(&mut self, _function: &super::super::common::AstFunctionExpr) -> bool {
         false
-    }
+    });
+    targets
 }
 
 #[cfg(test)]

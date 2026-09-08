@@ -5,6 +5,7 @@
 //! branch/loop/short-circuit，也不决定 HIR lvalue；这些语义归属由 Structure/HIR 消费
 //! SSA 事实后完成。
 //! phi 放置与 rename 共享正式 Def 表及寄存器/指令索引，不另建 Reg 分组或复制身份配对。
+//! trivial phi 收敛后冻结直接值根；compact/remap 只查询该结果，不再次追踪替换图。
 //!
 //! 输入形状：两条分支分别写 r2，随后 merge 读取 r2。
 //! 输出形状：merge 上一个 pruned phi，读取点直接引用 `SsaValue::Phi`，两条 incoming
@@ -354,7 +355,21 @@ fn snapshot(stacks: &[Vec<SsaValue>], live: &BTreeSet<Reg>) -> Result<SsaRegMap,
     SsaRegMap::from_sorted_entries(entries)
 }
 
-fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Result<Vec<SsaValue>, StructureError> {
+/// 只在替换收敛且全部路径压缩后发布；每项直接指向 Entry、Def 或保留的 Phi。
+struct CanonicalPhiValues(Vec<SsaValue>);
+
+impl CanonicalPhiValues {
+    fn value(&self, value: SsaValue) -> Result<SsaValue, StructureError> {
+        match value {
+            SsaValue::Phi(phi) => self.0.get(phi.index()).copied().ok_or_else(|| {
+                StructureError::invalid(format!("SSA canonicalization references missing {phi}"))
+            }),
+            other => Ok(other),
+        }
+    }
+}
+
+fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Result<CanonicalPhiValues, StructureError> {
     let mut replacements = phis
         .iter()
         .map(|phi| SsaValue::Phi(phi.id))
@@ -369,6 +384,7 @@ fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Result<Vec<SsaValue>, Stru
             }
         }
     }
+    let mut path = Vec::new();
     let mut pending = phis.iter().map(|phi| phi.id).collect::<VecDeque<_>>();
     let mut queued = vec![true; phis.len()];
     while let Some(phi_id) = pending.pop_front() {
@@ -378,7 +394,7 @@ fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Result<Vec<SsaValue>, Stru
         let mut unique = None;
         let mut conflict = false;
         for incoming in &phi.incoming {
-            let value = canonical_value_compress(incoming.value, &mut replacements)?;
+            let value = canonical_value_compress(incoming.value, &mut replacements, &mut path)?;
             if value == own {
                 continue;
             }
@@ -407,17 +423,17 @@ fn trivial_phi_replacements(phis: &[PhiCandidate]) -> Result<Vec<SsaValue>, Stru
     }
     for index in 0..replacements.len() {
         replacements[index] =
-            canonical_value_compress(SsaValue::Phi(PhiId(index)), &mut replacements)?;
+            canonical_value_compress(SsaValue::Phi(PhiId(index)), &mut replacements, &mut path)?;
     }
-    Ok(replacements)
+    Ok(CanonicalPhiValues(replacements))
 }
 
 fn canonical_value_compress(
     value: SsaValue,
     replacements: &mut [SsaValue],
+    path: &mut Vec<PhiId>,
 ) -> Result<SsaValue, StructureError> {
     let mut value = value;
-    let mut path = Vec::new();
     while let SsaValue::Phi(phi) = value {
         let Some(next) = replacements.get(phi.index()).copied() else {
             return Err(StructureError::invalid(format!(
@@ -430,7 +446,7 @@ fn canonical_value_compress(
         path.push(phi);
         value = next;
     }
-    for phi in path {
+    for phi in path.drain(..) {
         replacements[phi.index()] = value;
     }
     Ok(value)
@@ -438,12 +454,12 @@ fn canonical_value_compress(
 
 fn compact_phis(
     phis: Vec<PhiCandidate>,
-    replacements: &[SsaValue],
+    replacements: &CanonicalPhiValues,
 ) -> Result<(Vec<PhiCandidate>, Vec<Option<PhiId>>), StructureError> {
     let mut remap = vec![None; phis.len()];
     let mut kept = Vec::new();
     for mut phi in phis {
-        if super::canonical_value(SsaValue::Phi(phi.id), replacements)? != SsaValue::Phi(phi.id) {
+        if replacements.value(SsaValue::Phi(phi.id))? != SsaValue::Phi(phi.id) {
             continue;
         }
         let id = PhiId(kept.len());
@@ -456,10 +472,10 @@ fn compact_phis(
 
 fn remap_value(
     value: SsaValue,
-    replacements: &[SsaValue],
+    replacements: &CanonicalPhiValues,
     remap: &[Option<PhiId>],
 ) -> Result<SsaValue, StructureError> {
-    match super::canonical_value(value, replacements)? {
+    match replacements.value(value)? {
         SsaValue::Phi(old) => {
             let Some(remapped) = remap.get(old.index()).copied().flatten() else {
                 return Err(StructureError::invalid(format!(

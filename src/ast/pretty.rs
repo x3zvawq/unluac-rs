@@ -20,6 +20,9 @@ pub(crate) struct PreferredRelationalRender<'a> {
 pub(crate) fn preferred_relational_render(
     binary: &AstBinaryExpr,
 ) -> Option<PreferredRelationalRender<'_>> {
+    if !matches!(binary.op, AstBinaryOpKind::Lt | AstBinaryOpKind::Le) {
+        return None;
+    }
     let flipped = should_flip_relational_operands(&binary.lhs, &binary.rhs);
     match (binary.op, flipped) {
         (AstBinaryOpKind::Lt, false) => Some(PreferredRelationalRender {

@@ -22,7 +22,20 @@ pub(super) fn maybe_parenthesize(
     side: ExprSide,
     assoc: Assoc,
 ) -> Doc {
-    let needs_parens = if expr_prec < parent_prec {
+    if needs_parentheses(expr_prec, parent_prec, side, assoc) {
+        Doc::concat([Doc::text("("), doc, Doc::text(")")])
+    } else {
+        doc
+    }
+}
+
+pub(super) const fn needs_parentheses(
+    expr_prec: u8,
+    parent_prec: u8,
+    side: ExprSide,
+    assoc: Assoc,
+) -> bool {
+    if expr_prec < parent_prec {
         true
     } else if expr_prec > parent_prec {
         false
@@ -33,11 +46,6 @@ pub(super) fn maybe_parenthesize(
             Assoc::Non => !matches!(side, ExprSide::Standalone),
             Assoc::Full => false,
         }
-    };
-    if needs_parens {
-        Doc::concat([Doc::text("("), doc, Doc::text(")")])
-    } else {
-        doc
     }
 }
 
