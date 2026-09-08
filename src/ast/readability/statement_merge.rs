@@ -22,6 +22,8 @@
 //!
 //! 嵌套下沉先检查作用域，再原地提交；每次修改必消费非空 binding，因此失败不改树，
 //! 成功只返回已消费数量和必须留在外层的依赖，无需复制候选控制语句。
+//! initializer 合并也在完整证明后移动原 RHS；失败不改 declaration 或 assignment，
+//! 成功才清除已消费的 transaction/profile，避免复制任意深度的表达式树。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -64,14 +66,14 @@ fn rewrite_current_block(block: &mut AstBlock, trailing_condition: Option<&AstEx
 
     let mut old_stmts = VecDeque::from(std::mem::take(&mut block.stmts));
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
-    while let Some(stmt) = old_stmts.pop_front() {
-        let Some(next_stmt) = old_stmts.front() else {
+    while let Some(mut stmt) = old_stmts.pop_front() {
+        let Some(next_stmt) = old_stmts.front_mut() else {
             new_stmts.push(stmt);
             continue;
         };
 
-        if let Some(merged) = try_merge_local_decl_with_assign(&stmt, next_stmt) {
-            new_stmts.push(AstStmt::LocalDecl(Box::new(merged)));
+        if try_merge_local_decl_with_assign(&mut stmt, next_stmt) {
+            new_stmts.push(stmt);
             old_stmts.pop_front();
             changed = true;
             continue;
@@ -359,13 +361,12 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
             if let Some(attempt) = try_sink_hoisted_decl_into_stmt(
                 &remaining,
                 &remaining,
-                &block.stmts[lookahead],
+                &mut block.stmts[lookahead],
                 &use_index,
                 index + 1,
                 lookahead,
             ) {
-                let consumed = attempt.merged.bindings.len();
-                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(attempt.merged));
+                let consumed = attempt.consumed;
                 remaining.drain(..consumed);
                 pin_sink_dependencies(&mut remaining, &mut pinned, &attempt.dependencies);
                 sink_changed = true;
@@ -394,14 +395,13 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
             if let Some(attempt) = try_sink_hoisted_decl_into_stmt_anywhere(
                 &remaining,
                 &remaining,
-                &block.stmts[lookahead],
+                &mut block.stmts[lookahead],
                 &use_index,
                 index + 1,
                 lookahead,
                 lookahead + 1,
             ) {
-                let consumed = attempt.merged.bindings.len();
-                block.stmts[lookahead] = AstStmt::LocalDecl(Box::new(attempt.merged));
+                let consumed = attempt.consumed;
                 remaining.drain(attempt.start..attempt.start + consumed);
                 pin_sink_dependencies(&mut remaining, &mut pinned, &attempt.dependencies);
                 sink_changed = true;
@@ -446,7 +446,7 @@ fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&Ast
     false
 }
 
-struct NestedSinkAttempt {
+struct SinkAttempt {
     start: usize,
     consumed: usize,
     dependencies: Vec<AstBindingRef>,
@@ -454,12 +454,6 @@ struct NestedSinkAttempt {
 
 struct BlockSinkAttempt {
     consumed: usize,
-    dependencies: Vec<AstBindingRef>,
-}
-
-struct DirectSinkAttempt {
-    start: usize,
-    merged: AstLocalDecl,
     dependencies: Vec<AstBindingRef>,
 }
 
@@ -582,7 +576,7 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
     write_index: &BindingWriteIndex,
     stmt_index: usize,
     owners: &NestedSinkOwners,
-) -> Option<NestedSinkAttempt> {
+) -> Option<SinkAttempt> {
     let mut start = 0usize;
     while start < pending.len() {
         if binding_has_access_after(use_index, write_index, stmt_index, pending[start].id) {
@@ -644,7 +638,7 @@ fn try_sink_hoisted_decl_into_nested_stmt_anywhere(
                 write_index,
                 stmt_index,
             ) {
-                return Some(NestedSinkAttempt {
+                return Some(SinkAttempt {
                     start: slice_start,
                     consumed: attempt.consumed,
                     dependencies: attempt.dependencies,
@@ -817,14 +811,12 @@ fn sink_pending_bindings_into_block(
         if let Some(attempt) = try_sink_hoisted_decl_into_stmt(
             remaining,
             dependency_universe,
-            &block.stmts[index],
+            &mut block.stmts[index],
             &use_index,
             0,
             index,
         ) {
-            let merged_len = attempt.merged.bindings.len();
-            block.stmts[index] = AstStmt::LocalDecl(Box::new(attempt.merged));
-            consumed += merged_len;
+            consumed += attempt.consumed;
             if !attempt.dependencies.is_empty() {
                 // 依赖仍须由最外层 hoisted 声明支配 RHS；立即上送，避免本次子块扫描
                 // 把它继续沉到 initializer 之后。
@@ -894,15 +886,15 @@ fn single_value_local_decl(
     Some((binding, value))
 }
 
-fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option<AstLocalDecl> {
+fn try_merge_local_decl_with_assign(current: &mut AstStmt, next: &mut AstStmt) -> bool {
     let AstStmt::LocalDecl(local_decl) = current else {
-        return None;
+        return false;
     };
     let AstStmt::Assign(assign) = next else {
-        return None;
+        return false;
     };
     if !local_decl.values.is_empty() || local_decl.bindings.is_empty() {
-        return None;
+        return false;
     }
     if local_decl
         .bindings
@@ -911,7 +903,7 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     {
         // `<const>`/`<close>` local 在目标 Lua 中不可在声明后
         // 普通赋值；该异常 AST pair 不属于 initializer merge 候选。
-        return None;
+        return false;
     }
     if local_decl
         .bindings
@@ -920,7 +912,7 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     {
         // 候选拒绝[SemanticBarrier:DebugScope]：regress_342 中条件调用通过 `debug.getlocal`
         // 观察空声明；合并到 initializer 会把 debug local 的作用域起点后移到调用之后。
-        return None;
+        return false;
     }
     if local_decl
         .bindings
@@ -929,10 +921,10 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     {
         // 候选拒绝[LayerBoundary]：initializer merge 会把空声明起点移动到赋值处；
         // HIR 已保留的 binding 不能由 AST 重新缩短。
-        return None;
+        return false;
     }
     if local_decl.bindings.len() != assign.targets.len() || assign.values.is_empty() {
-        return None;
+        return false;
     }
     if !local_decl
         .bindings
@@ -940,11 +932,11 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
         .zip(assign.targets.iter())
         .all(|(binding, target)| local_binding_matches_target(binding.id, target))
     {
-        return None;
+        return false;
     }
     if stmt_references_any_binding_in_assign(assign, &local_decl.bindings) {
         // 候选拒绝[SemanticBarrier:Scope]：`local x; x = function() return x end` 合成 initializer 后 closure 捕获点的词法绑定会改变。
-        return None;
+        return false;
     }
 
     let initializer_merge_transaction = match (
@@ -953,7 +945,7 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
     ) {
         (Some(decl), Some(assign)) if decl == assign => Some(decl),
         (None, None) => None,
-        _ => return None,
+        _ => return false,
     };
     if initializer_merge_transaction.is_none()
         && local_decl
@@ -964,16 +956,14 @@ fn try_merge_local_decl_with_assign(current: &AstStmt, next: &AstStmt) -> Option
         // 候选拒绝[SemanticBarrier:Lifetime]：空 PhysicalRoot declaration 会先用 nil
         // 清空复用的 VM home；只有 HIR 为这一对最终节点发布的同 token transaction
         // 才能证明这次 initializer merge 不会把旧 root 延长过 RHS 求值。
-        return None;
+        return false;
     }
 
-    Some(AstLocalDecl {
-        bindings: local_decl.bindings.clone(),
-        values: assign.values.clone(),
-        // certificate 是一次性 rewrite authority；合并完成后不属于新声明的持续事实。
-        initializer_merge_transaction: None,
-        initializer_root_profile: None,
-    })
+    local_decl.values = std::mem::take(&mut assign.values);
+    // certificate 是一次性 rewrite authority；合并完成后不属于新声明的持续事实。
+    local_decl.initializer_merge_transaction = None;
+    local_decl.initializer_root_profile = None;
+    true
 }
 
 fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::AstLocalBinding>> {
@@ -1023,11 +1013,11 @@ fn hoisted_temp_bindings(stmt: &AstStmt) -> Option<Vec<super::super::common::Ast
 fn try_sink_hoisted_decl_into_stmt(
     pending: &[super::super::common::AstLocalBinding],
     dependency_universe: &[super::super::common::AstLocalBinding],
-    stmt: &AstStmt,
+    stmt: &mut AstStmt,
     use_index: &BindingUseIndex,
     prior_start: usize,
     target_index: usize,
-) -> Option<DirectSinkAttempt> {
+) -> Option<SinkAttempt> {
     let AstStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -1054,15 +1044,19 @@ fn try_sink_hoisted_decl_into_stmt(
         // 候选拒绝[SemanticBarrier:Scope]：赋值 RHS 读取候选 binding 时，改成 local initializer 会把读取解析到新声明之前的外层绑定。
         return None;
     }
-    Some(DirectSinkAttempt {
+    let dependencies =
+        rhs_dependencies_outside_candidate(use_index, target_index, dependency_universe);
+    let merged = AstLocalDecl {
+        bindings: candidate.to_vec(),
+        values: std::mem::take(&mut assign.values),
+        initializer_merge_transaction: None,
+        initializer_root_profile: None,
+    };
+    *stmt = AstStmt::LocalDecl(Box::new(merged));
+    Some(SinkAttempt {
         start: 0,
-        merged: AstLocalDecl {
-            bindings: candidate.to_vec(),
-            values: assign.values.clone(),
-            initializer_merge_transaction: None,
-            initializer_root_profile: None,
-        },
-        dependencies: rhs_dependencies_outside_candidate(assign, dependency_universe, candidate),
+        consumed: candidate.len(),
+        dependencies,
     })
 }
 
@@ -1075,16 +1069,16 @@ fn is_temp_like_binding(binding: AstBindingRef) -> bool {
 
 /// 与 [`try_sink_hoisted_decl_into_stmt`] 类似，但在 `pending` 中任意位置搜索
 /// 匹配的 binding，而非仅要求它们位于头部。成功时 attempt 同时携带匹配起点、
-/// 合并声明和必须留在原 hoist 点的 RHS 依赖。
+/// 消费数量和必须留在原 hoist 点的 RHS 依赖；声明直接安装到原语句。
 fn try_sink_hoisted_decl_into_stmt_anywhere(
     pending: &[super::super::common::AstLocalBinding],
     dependency_universe: &[super::super::common::AstLocalBinding],
-    stmt: &AstStmt,
+    stmt: &mut AstStmt,
     use_index: &BindingUseIndex,
     prior_start: usize,
     target_index: usize,
     suffix_start: usize,
-) -> Option<DirectSinkAttempt> {
+) -> Option<SinkAttempt> {
     let AstStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -1120,36 +1114,35 @@ fn try_sink_hoisted_decl_into_stmt_anywhere(
             // 候选拒绝[SemanticBarrier:Scope]：候选在赋值后仍活跃，沉入当前位置会缩窄其作用域并破坏后缀读取。
             continue;
         }
-        return Some(DirectSinkAttempt {
+        let dependencies =
+            rhs_dependencies_outside_candidate(use_index, target_index, dependency_universe);
+        let merged = AstLocalDecl {
+            bindings: candidate.to_vec(),
+            values: std::mem::take(&mut assign.values),
+            initializer_merge_transaction: None,
+            initializer_root_profile: None,
+        };
+        *stmt = AstStmt::LocalDecl(Box::new(merged));
+        return Some(SinkAttempt {
             start,
-            merged: AstLocalDecl {
-                bindings: candidate.to_vec(),
-                values: assign.values.clone(),
-                initializer_merge_transaction: None,
-                initializer_root_profile: None,
-            },
-            dependencies: rhs_dependencies_outside_candidate(
-                assign,
-                dependency_universe,
-                candidate,
-            ),
+            consumed: candidate.len(),
+            dependencies,
         });
     }
     None
 }
 
 fn rhs_dependencies_outside_candidate(
-    assign: &super::super::common::AstAssign,
+    use_index: &BindingUseIndex,
+    target_index: usize,
     dependency_universe: &[super::super::common::AstLocalBinding],
-    candidate: &[super::super::common::AstLocalBinding],
 ) -> Vec<AstBindingRef> {
-    // candidate 自引用由调用方拒绝；其余 RHS 引用随成功 attempt 返回，并在下一次
-    // sink 前固定到原 hoist 点，因而 initializer 的词法解析保持不变。
+    // 目标已证明全是普通名字，故该行 Read/Capture 精确等于 RHS 引用；candidate
+    // 自引用也已拒绝。当前 Assign 尚未改写，直接消费原索引，不逐 binding 重走 RHS。
     dependency_universe
         .iter()
-        .filter(|binding| !candidate.iter().any(|item| item.id == binding.id))
         .filter(|binding| {
-            stmt_references_any_binding_in_assign(assign, std::slice::from_ref(binding))
+            use_index.count_uses_in_range(target_index, target_index + 1, binding.id) != 0
         })
         .map(|binding| binding.id)
         .collect()
@@ -1513,8 +1506,8 @@ mod tests {
     #[test]
     fn empty_physical_root_decl_does_not_merge_with_eventful_assignment() {
         let binding = AstBindingRef::Local(LocalId(0));
-        let declaration = empty_local(0, AstLocalOrigin::PhysicalRoot);
-        let assignment = AstStmt::Assign(Box::new(AstAssign {
+        let mut declaration = empty_local(0, AstLocalOrigin::PhysicalRoot);
+        let mut assignment = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![AstLValue::Name(binding.to_name_ref())],
             values: vec![AstExpr::Call(Box::new(AstCallExpr {
                 callee: AstExpr::Var(AstNameRef::Global(AstGlobalName {
@@ -1529,16 +1522,24 @@ mod tests {
             method_rewrite_transaction: None,
         }));
 
-        assert!(try_merge_local_decl_with_assign(&declaration, &assignment).is_none());
+        assert!(!try_merge_local_decl_with_assign(
+            &mut declaration,
+            &mut assignment
+        ));
     }
 
     #[test]
     fn matching_initializer_merge_transaction_authorizes_physical_roots_once() {
         let token = HirInitializerMergeTransactionId::new(HirProtoRef(0), 0);
-        let (declaration, assignment) = initializer_merge_pair(Some(token), Some(token));
+        let (mut declaration, mut assignment) = initializer_merge_pair(Some(token), Some(token));
 
-        let merged = try_merge_local_decl_with_assign(&declaration, &assignment)
-            .expect("matching HIR transaction should authorize this exact initializer merge");
+        assert!(try_merge_local_decl_with_assign(
+            &mut declaration,
+            &mut assignment
+        ));
+        let AstStmt::LocalDecl(merged) = declaration else {
+            panic!("matching HIR transaction should preserve the declaration node");
+        };
 
         assert_eq!(merged.bindings.len(), 2);
         assert!(
@@ -1561,29 +1562,43 @@ mod tests {
             (None, Some(first)),
             (Some(first), Some(second)),
         ] {
-            let (declaration, assignment) = initializer_merge_pair(decl_token, assign_token);
-            assert!(try_merge_local_decl_with_assign(&declaration, &assignment).is_none());
+            let (mut declaration, mut assignment) =
+                initializer_merge_pair(decl_token, assign_token);
+            let original_declaration = declaration.clone();
+            let original_assignment = assignment.clone();
+            assert!(!try_merge_local_decl_with_assign(
+                &mut declaration,
+                &mut assignment
+            ));
+            assert_eq!(declaration, original_declaration);
+            assert_eq!(assignment, original_assignment);
         }
     }
 
     #[test]
     fn initializer_merge_transaction_does_not_override_other_ast_barriers() {
         let token = HirInitializerMergeTransactionId::new(HirProtoRef(0), 0);
-        let (declaration, assignment) = initializer_merge_pair(Some(token), Some(token));
+        let (declaration, mut assignment) = initializer_merge_pair(Some(token), Some(token));
 
         let mut debug_stmt = declaration.clone();
         let AstStmt::LocalDecl(debug_decl) = &mut debug_stmt else {
             unreachable!();
         };
         debug_decl.bindings[0].origin = AstLocalOrigin::DebugHintedPhysicalRoot;
-        assert!(try_merge_local_decl_with_assign(&debug_stmt, &assignment).is_none());
+        assert!(!try_merge_local_decl_with_assign(
+            &mut debug_stmt,
+            &mut assignment
+        ));
 
         let mut attributed_stmt = declaration.clone();
         let AstStmt::LocalDecl(attributed) = &mut attributed_stmt else {
             unreachable!();
         };
         attributed.bindings[0].attr = AstLocalAttr::Const;
-        assert!(try_merge_local_decl_with_assign(&attributed_stmt, &assignment).is_none());
+        assert!(!try_merge_local_decl_with_assign(
+            &mut attributed_stmt,
+            &mut assignment
+        ));
 
         let mut preserved_stmt = declaration;
         let AstStmt::LocalDecl(preserved) = &mut preserved_stmt else {
@@ -1593,7 +1608,10 @@ mod tests {
             AstRewriteAuthority::Hir(HirInlineDisposition::Preserve(BTreeSet::from([
                 HirInlineRetentionReason::CapturedValueEpoch,
             ])));
-        assert!(try_merge_local_decl_with_assign(&preserved_stmt, &assignment).is_none());
+        assert!(!try_merge_local_decl_with_assign(
+            &mut preserved_stmt,
+            &mut assignment
+        ));
     }
 
     #[test]

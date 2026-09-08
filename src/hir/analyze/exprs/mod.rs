@@ -294,13 +294,7 @@ pub(super) fn lower_method_key(
     method_name: Option<MethodNameHint>,
 ) -> Option<crate::LuaString> {
     let const_ref = method_name?.const_ref;
-    match lowering
-        .proto
-        .constants
-        .common
-        .literals
-        .get(const_ref.index())
-    {
+    match lowering.proto.constants.get(const_ref.index()) {
         Some(RawLiteralConst::String(value)) => Some(raw_lua_string(value)),
         _ => None,
     }

@@ -80,7 +80,7 @@ pub(in crate::structure::plan) fn validate(
         ));
     }
 
-    let absorbed_owner = analysis.absorbed_owner_by_edge.clone();
+    let absorbed_owner = &analysis.absorbed_owner_by_edge;
     let mut origins_by_edge = vec![Vec::<PhiId>::new(); cfg.edges.len()];
     let mut partial_elided_by_edge = vec![Vec::<PhiId>::new(); cfg.edges.len()];
     for (index, payload) in plan.loops.iter().enumerate() {
@@ -153,14 +153,14 @@ pub(in crate::structure::plan) fn validate(
                             loop_id.index()
                         )));
                     }
-                    record_origin(cfg, &absorbed_owner, &mut origins_by_edge, loop_id, *origin)?;
+                    record_origin(cfg, absorbed_owner, &mut origins_by_edge, loop_id, *origin)?;
                 }
             }
         }
         for origin in &actions.elided {
             match absorbed_owner.get(origin.edge.index()).copied().flatten() {
                 Some(owner) if owner == loop_id => {
-                    record_origin(cfg, &absorbed_owner, &mut origins_by_edge, loop_id, *origin)?;
+                    record_origin(cfg, absorbed_owner, &mut origins_by_edge, loop_id, *origin)?;
                 }
                 None if cfg.edges.get(origin.edge.index()).is_some()
                     && payload
@@ -186,7 +186,7 @@ pub(in crate::structure::plan) fn validate(
 
     let mut seen_phi = vec![0usize; dataflow.phi_candidates.len()];
     let mut epoch = 0usize;
-    for (edge_index, owner) in absorbed_owner.into_iter().enumerate() {
+    for (edge_index, owner) in absorbed_owner.iter().copied().enumerate() {
         let Some(loop_id) = owner else {
             if !origins_by_edge[edge_index].is_empty() {
                 return Err(StructureError::invalid(

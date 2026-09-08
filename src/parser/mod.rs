@@ -116,7 +116,7 @@ pub fn parse_chunk_with_dialect(
     if options.ignore_debug {
         // parser 仍需先完整消费并校验变长 debug section；只有成功解析后才统一清除，
         // 这样 ignore 模式不会成为绕过格式校验或错位读取后续 proto 的入口。
-        chunk.discard_debug_metadata();
+        chunk = chunk.discard_debug_metadata();
     }
     Ok(chunk)
 }

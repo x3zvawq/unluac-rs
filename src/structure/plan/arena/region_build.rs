@@ -911,13 +911,12 @@ pub(super) fn order_sequence_children_by_flow(
         if children.len() < 2 {
             continue;
         }
-        let original = children.clone();
-        let mut ready = original
+        let mut ready = children
             .iter()
             .copied()
             .filter(|child| indegree[child.index()] == 0)
             .collect::<VecDeque<_>>();
-        let mut ordered = Vec::with_capacity(original.len());
+        let mut ordered = Vec::with_capacity(children.len());
         while let Some(child) = ready.pop_front() {
             ordered.push(child);
             for successor in &successors[child.index()] {
@@ -932,7 +931,7 @@ pub(super) fn order_sequence_children_by_flow(
                 }
             }
         }
-        if ordered.len() == original.len() {
+        if ordered.len() == children.len() {
             *children = ordered;
         }
     }

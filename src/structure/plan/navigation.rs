@@ -618,6 +618,12 @@ impl RegionNavigation {
         &self.postorder
     }
 
+    pub(crate) fn postorder_rank(&self, region: RegionId) -> Option<usize> {
+        let end = *self.subtree_end.get(region.index())?;
+        // 子树退出时，已进入的节点中仅自身和 depth 个祖先尚未退出。
+        Some(end - self.depth[region.index()] - 1)
+    }
+
     pub(super) fn has_unstructured_ancestor(&self, region: RegionId) -> bool {
         self.has_unstructured_ancestor
             .get(region.index())

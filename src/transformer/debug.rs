@@ -114,7 +114,7 @@ fn write_proto_tree_view(
                 .parent
                 .map_or_else(|| "-".to_owned(), |parent| format!("proto#{parent}")),
             entry.value.signature.num_params,
-            entry.value.upvalues.common.count,
+            entry.value.upvalue_count,
             format_environment_upvalues(&entry.value.environment_upvalues),
             entry.value.frame.max_stack_size,
             entry.value.instrs.len(),
@@ -130,7 +130,7 @@ fn write_proto_tree_view(
                 output,
                 "{indent}  raw_instrs={} consts={} low_instrs={} debug_locals={}",
                 entry.value.lowering_map.raw_to_low.len(),
-                entry.value.constants.common.literals.len(),
+                entry.value.constants.len(),
                 entry.value.instrs.len(),
                 entry.value.debug_locals.len(),
             );

@@ -30,24 +30,13 @@ impl RawChunk {
     ///
     /// 该操作只允许在 dialect parser 已完整解析并校验 chunk 后执行；指令、常量、
     /// upvalue 描述符和字节来源区间等运行时语义事实保持不变。
-    pub(crate) fn discard_debug_metadata(&mut self) {
+    pub(crate) fn discard_debug_metadata(mut self) -> Self {
         if let DialectHeaderExtra::LuaJit(extra) = &mut self.header.extra {
             extra.chunk_name = None;
         }
-        discard_proto_debug_metadata(&mut self.main);
+        self.main = Arc::unwrap_or_clone(strip_proto_graph(Arc::new(self.main)));
+        self
     }
-}
-
-fn discard_proto_debug_metadata(root: &mut RawProto) {
-    // Metadata stripping is part of the normal parse path (`strip=true`). A
-    // `make_mut` walk would clone every shared edge, undoing the flat-DAG
-    // contract. Rebuild the graph iteratively instead: each source address is
-    // transformed once, then all incoming edges reuse the resulting `Arc`.
-    let transformed = strip_proto_graph(Arc::new(root.clone()));
-    // The root value is kept by the public `RawChunk` field, so a shallow clone
-    // is sufficient and does not depend on the temporary Arc being unique.
-    // Descendant payloads remain shared through their Arc edges.
-    *root = (*transformed).clone();
 }
 
 struct StripFrame {
@@ -57,6 +46,9 @@ struct StripFrame {
 }
 
 fn strip_proto_graph(root: Arc<RawProto>) -> Arc<RawProto> {
+    // ignore_debug 在完整解析后按源地址只转换一次，共享边复用结果 Arc。
+    // 父 frame 始终保留旧 children，使 memo 的地址键在全部子节点查询期间有效；
+    // 因而非根仍需复制一次，独占根则可在最后完成时移动载荷。
     let mut memo: HashMap<*const RawProto, Arc<RawProto>> = HashMap::new();
     let mut frames = vec![StripFrame {
         children: Vec::with_capacity(root.common.children.len()),
@@ -85,7 +77,7 @@ fn strip_proto_graph(root: Arc<RawProto>) -> Arc<RawProto> {
 
         let frame = frames.pop().expect("root frame exists");
         let key = Arc::as_ptr(&frame.source);
-        let mut proto = (*frame.source).clone();
+        let mut proto = Arc::unwrap_or_clone(frame.source);
         proto.common.source = None;
         proto.common.line_range = ProtoLineRange {
             defined_start: 0,
@@ -395,4 +387,33 @@ pub struct RawString {
 pub struct DecodedText {
     pub encoding: StringEncoding,
     pub value: Arc<str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{ParseOptions, parse_chunk_with_dialect};
+
+    #[test]
+    fn discard_debug_moves_owned_root_payloads() {
+        let bytes = unluac_test_support::compile_lua_case_with_debug(
+            "lua5.4",
+            "tests/regress-case/regress_307_ignore_debug_policy.lua",
+        );
+        let chunk =
+            parse_chunk_with_dialect(DecompileDialect::Lua54, &bytes, ParseOptions::default())
+                .unwrap();
+        assert!(!chunk.main.common.instructions.is_empty());
+        assert!(!chunk.main.common.constants.common.literals.is_empty());
+        let instructions = chunk.main.common.instructions.as_ptr();
+        let constants = chunk.main.common.constants.common.literals.as_ptr();
+        let chunk = chunk.discard_debug_metadata();
+        assert_eq!(chunk.main.common.instructions.as_ptr(), instructions);
+        assert_eq!(
+            chunk.main.common.constants.common.literals.as_ptr(),
+            constants
+        );
+        assert!(chunk.main.common.source.is_none());
+        assert!(chunk.main.common.debug_info.common.local_vars.is_empty());
+    }
 }

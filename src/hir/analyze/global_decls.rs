@@ -12,7 +12,7 @@
 //! 输出形状：一个 owner 覆盖完整区间的 typed `HirStmt::GlobalDecl` 协议。
 
 use crate::parser::RawLiteralConst;
-use crate::structure::{Cfg, DataflowFacts, DefId, SsaValue};
+use crate::structure::{Cfg, DataflowFacts, DefId, InstrRange, SsaValue};
 use crate::transformer::{
     AccessBase, AccessKey, GetTableKind, InstrRef, LowInstr, LoweredProto, Reg, RegRange,
     ResultPack, SetTableKind, ValueOperand,
@@ -20,7 +20,8 @@ use crate::transformer::{
 
 #[derive(Debug)]
 pub(super) struct GlobalDeclProtocols {
-    owners: Vec<Option<GlobalDeclProtocol>>,
+    protocols: Vec<GlobalDeclProtocol>,
+    protocol_by_instr: Vec<Option<usize>>,
 }
 
 #[derive(Debug)]
@@ -51,18 +52,25 @@ struct GlobalDeclItem {
 
 impl GlobalDeclProtocols {
     pub(super) fn analyze(proto: &LoweredProto, cfg: &Cfg, dataflow: &DataflowFacts) -> Self {
-        let mut owners = (0..proto.instrs.len()).map(|_| None).collect::<Vec<_>>();
+        let mut protocols = Vec::new();
+        let mut protocol_by_instr = Vec::new();
         for block in &cfg.blocks {
+            let mut suffix_ends = None;
             let mut index = block.instrs.start.index();
             let block_end = block.instrs.end();
             while index < block_end {
-                match recognize_call_protocol(proto, dataflow, InstrRef(index), block_end) {
-                    CallProtocolMatch::Claimed(protocol) => {
-                        let owner = protocol.owner;
-                        index = protocol.end;
-                        owners[owner.index()] = Some(protocol);
+                let protocol = match recognize_call_protocol(
+                    proto,
+                    dataflow,
+                    InstrRef(index),
+                    block.instrs,
+                    &mut suffix_ends,
+                ) {
+                    CallProtocolMatch::Claimed(protocol) => protocol,
+                    CallProtocolMatch::Blocked { resume_at } => {
+                        index = resume_at;
+                        continue;
                     }
-                    CallProtocolMatch::Blocked { resume_at } => index = resume_at,
                     CallProtocolMatch::None => {
                         let Some(protocol) = recognize_value_run_protocol(
                             proto,
@@ -73,18 +81,39 @@ impl GlobalDeclProtocols {
                             index += 1;
                             continue;
                         };
-                        let owner = protocol.owner;
-                        index = protocol.end;
-                        owners[owner.index()] = Some(protocol);
+                        protocol
                     }
+                };
+                // 每次 claim 后越过完整协议；不重叠的覆盖索引同时服务 owner 与词法边界查询。
+                if protocol_by_instr.len() < protocol.end {
+                    protocol_by_instr.resize(protocol.end, None);
                 }
+                protocol_by_instr[protocol.owner.index()..protocol.end].fill(Some(protocols.len()));
+                index = protocol.end;
+                protocols.push(protocol);
             }
         }
-        Self { owners }
+        Self {
+            protocols,
+            protocol_by_instr,
+        }
     }
 
     pub(super) fn owner(&self, instr: InstrRef) -> Option<&GlobalDeclProtocol> {
-        self.owners.get(instr.index())?.as_ref()
+        self.at(instr.index())
+            .filter(|protocol| protocol.owner == instr)
+    }
+
+    fn at(&self, instr: usize) -> Option<&GlobalDeclProtocol> {
+        let index = self.protocol_by_instr.get(instr).copied().flatten()?;
+        Some(&self.protocols[index])
+    }
+
+    /// 只检查当前 lowering 区间内开始的协议；owner 与 end 本身都允许作为词法边界。
+    pub(super) fn splits_protocol(&self, range_start: usize, boundary: usize) -> bool {
+        self.at(boundary).is_some_and(|protocol| {
+            protocol.owner.index() >= range_start && protocol.owner.index() < boundary
+        })
     }
 }
 
@@ -98,8 +127,10 @@ fn recognize_call_protocol(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     call_ref: InstrRef,
-    block_end: usize,
+    block: InstrRange,
+    suffix_ends: &mut Option<Vec<Option<usize>>>,
 ) -> CallProtocolMatch {
+    let block_end = block.end();
     let Some(LowInstr::Call(call)) = proto.instrs.get(call_ref.index()) else {
         return CallProtocolMatch::None;
     };
@@ -169,8 +200,10 @@ fn recognize_call_protocol(
     // pair consuming a pre-owner SSA value may still belong to this declaration; splitting it
     // would re-evaluate its environment after the call, which can rebind `_ENV`
     // (regress_410_lua55_wide_mixed_global_rhs).
+    let suffix_ends =
+        suffix_ends.get_or_insert_with(|| pre_owner_item_ends(proto, dataflow, block));
     if let Some(resume_at) =
-        nonadjacent_pre_owner_value_run_end(proto, dataflow, call_ref, end, block_end)
+        suffix_ends[call_ref.index() - block.start.index()].filter(|&item_end| item_end >= end + 3)
     {
         return CallProtocolMatch::Blocked { resume_at };
     }
@@ -184,22 +217,34 @@ fn recognize_call_protocol(
     })
 }
 
-fn nonadjacent_pre_owner_value_run_end(
+/// 按候选 owner 的物理位置冻结可阻断 item 的最远末端。直接 Def 只从下一条指令起
+/// 生效；Entry/Phi 从块入口生效，不能沿 Move 追到更早的值根。前缀最大值保留旧后缀
+/// 查询的最后一个 item，避免每个 call 重新识别剩余块内的全部三指令协议。
+fn pre_owner_item_ends(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
-    owner: InstrRef,
-    direct_run_end: usize,
-    block_end: usize,
-) -> Option<usize> {
-    ((direct_run_end + 2)..block_end)
-        .filter_map(|set_index| {
-            let get_index = set_index.checked_sub(2)?;
-            let item = recognize_item(proto, dataflow, InstrRef(get_index))?;
-            (item.set_ref.index() == set_index
-                && set_uses_value_from_before_owner(proto, dataflow, InstrRef(set_index), owner))
-            .then_some(set_index + 1)
-        })
-        .max()
+    block: InstrRange,
+) -> Vec<Option<usize>> {
+    let start = block.start.index();
+    let mut ends = vec![None; block.len];
+    for set_index in (start + 2)..block.end() {
+        let Some(item) = recognize_item(proto, dataflow, InstrRef(set_index - 2)) else {
+            continue;
+        };
+        let active_from = match dataflow.use_value(item.set_ref, item.value_reg) {
+            SsaValue::Def(def) => (dataflow.def_instr(def).index() + 1).max(start),
+            SsaValue::Entry(_) | SsaValue::Phi(_) => start,
+        };
+        if let Some(end) = ends.get_mut(active_from - start) {
+            *end = (*end).max(Some(set_index + 1));
+        }
+    }
+    let mut latest = None;
+    for end in &mut ends {
+        latest = latest.max(*end);
+        *end = latest;
+    }
+    ends
 }
 
 fn recognize_value_run_protocol(
@@ -222,14 +267,18 @@ fn recognize_value_run_protocol(
     }
 
     items.reverse();
-    let names = items.iter().map(|item| item.name.clone()).collect();
-    let values = items
+    let (names, values) = items
         .into_iter()
-        .map(|item| GlobalDeclValueUse {
-            instr: item.set_ref,
-            reg: item.value_reg,
+        .map(|item| {
+            (
+                item.name,
+                GlobalDeclValueUse {
+                    instr: item.set_ref,
+                    reg: item.value_reg,
+                },
+            )
         })
-        .collect();
+        .unzip();
     Some(GlobalDeclProtocol {
         owner,
         end: cursor,
@@ -251,24 +300,6 @@ fn contiguous_item_run_end(
         cursor += 3;
     }
     cursor
-}
-
-fn set_uses_value_from_before_owner(
-    proto: &LoweredProto,
-    dataflow: &DataflowFacts,
-    set_ref: InstrRef,
-    owner: InstrRef,
-) -> bool {
-    let Some(LowInstr::SetTable(set)) = proto.instrs.get(set_ref.index()) else {
-        return false;
-    };
-    let ValueOperand::Reg(value_reg) = set.value else {
-        return true;
-    };
-    match dataflow.use_value(set_ref, value_reg) {
-        SsaValue::Def(def) => dataflow.def_instr(def).index() < owner.index(),
-        SsaValue::Entry(_) | SsaValue::Phi(_) => true,
-    }
 }
 
 fn recognize_item(
@@ -377,8 +408,7 @@ fn const_string(
     proto: &LoweredProto,
     constant: crate::transformer::ConstRef,
 ) -> Option<crate::LuaString> {
-    let RawLiteralConst::String(value) = proto.constants.common.literals.get(constant.index())?
-    else {
+    let RawLiteralConst::String(value) = proto.constants.get(constant.index())? else {
         return None;
     };
     Some(crate::LuaString::from_raw(value))
@@ -398,4 +428,52 @@ fn def_has_only_direct_use(
             dataflow.def_uses.get(def.index()).map(Vec::as_slice),
             Some([site]) if site.instr == instr && site.reg == reg
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_boundaries_do_not_claim_interiors_or_cross_range_start() {
+        let facts = GlobalDeclProtocols {
+            protocols: [(2, 5), (5, 8)]
+                .into_iter()
+                .map(|(start, end)| GlobalDeclProtocol {
+                    owner: InstrRef(start),
+                    end,
+                    names: Vec::new(),
+                    values: GlobalDeclValues::ValueUses(Vec::new()),
+                })
+                .collect(),
+            protocol_by_instr: vec![
+                None,
+                None,
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(1),
+            ],
+        };
+        for instr in 0..=9 {
+            assert_eq!(
+                facts.owner(InstrRef(instr)).is_some(),
+                matches!(instr, 2 | 5)
+            );
+            assert_eq!(
+                facts.splits_protocol(0, instr),
+                matches!(instr, 3 | 4 | 6 | 7)
+            );
+            // 当前区间从第一个协议内部开始时，该协议与旧 owner 范围查询一样不参与。
+            assert_eq!(facts.splits_protocol(3, instr), matches!(instr, 6 | 7));
+        }
+        let empty = GlobalDeclProtocols {
+            protocols: Vec::new(),
+            protocol_by_instr: Vec::new(),
+        };
+        assert!(empty.owner(InstrRef(0)).is_none());
+        assert!(!empty.splits_protocol(0, 0));
+    }
 }

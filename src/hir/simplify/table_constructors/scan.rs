@@ -291,7 +291,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
                     preserved_bindings.insert(preserved_binding_id(binding));
                 }
             }
-            best_end = Some((index, preserved_stmt_indices.clone()));
+            best_end = Some((index, preserved_stmt_indices.len()));
             committed_steps.append(&mut steps);
             use_horizon = None;
         } else {
@@ -305,11 +305,15 @@ pub(super) fn try_rebuild_constructor_region<'a>(
     // 末尾那批未消费 producer 会让整段 region 失败，反而错过前面已经足够安全的
     // `{ ... }` 前缀。因此这里持续记住“最后一个成功前缀”，在真正遇到无关语句时
     // 回退到最近一次可证明安全的构造器边界。
-    best_end.map(|(end_index, preserved_stmt_indices)| ConstructorRegion {
-        constructor: committed_builder.into_constructor(),
-        end_index,
-        preserved_stmt_indices,
-        steps: committed_steps,
+    best_end.map(|(end_index, preserved_len)| {
+        // 成功后只会追加新的保留语句；补回旧 producer 时会同时更新成功前缀。
+        preserved_stmt_indices.truncate(preserved_len);
+        ConstructorRegion {
+            constructor: committed_builder.into_constructor(),
+            end_index,
+            preserved_stmt_indices,
+            steps: committed_steps,
+        }
     })
 }
 

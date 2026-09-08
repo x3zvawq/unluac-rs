@@ -23,7 +23,7 @@ pub(super) fn allocate_debug_entry_bindings(
     let mut declarations = Vec::new();
     let mut scope_targets = BTreeMap::new();
 
-    for fact in &structure.debug_bindings().accepted {
+    for fact in structure.debug_bindings().accepted() {
         let SsaValue::Entry(reg) = fact.value else {
             continue;
         };

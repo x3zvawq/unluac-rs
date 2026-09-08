@@ -179,11 +179,11 @@ impl<'a> Emitter<'a> {
         let mut comments = Vec::with_capacity(4);
         if let Some(file_name) = self
             .metadata
-            .and_then(|metadata| metadata.chunk.file_name.as_deref())
+            .and_then(|metadata| metadata.chunk.file_name.as_ref())
         {
             comments.push(Doc::text(format!(
                 "-- file: {}",
-                sanitize_comment_text(file_name)
+                sanitize_comment_text(&file_name.display_text())
             )));
         }
         comments.extend([
@@ -217,9 +217,9 @@ impl<'a> Emitter<'a> {
         if metadata.signature.has_vararg_param_reg {
             proto_meta.push_str(" vararg_reg=true");
         }
-        if let Some(source) = metadata.source.as_deref() {
+        if let Some(source) = metadata.source.as_ref() {
             proto_meta.push_str(" source=");
-            proto_meta.push_str(&sanitize_comment_text(source));
+            proto_meta.push_str(&sanitize_comment_text(&source.display_text()));
         }
 
         let mut comments = Vec::with_capacity(2);

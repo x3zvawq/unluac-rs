@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use super::*;
-use crate::structure::{DebugBindingFact, RootObservation};
+use crate::structure::{DebugBindingFact, DebugBindingFacts, RootObservation};
 use crate::transformer::ResultPack;
 
 pub(super) fn collect_lexical_scopes(
@@ -19,21 +19,12 @@ pub(super) fn collect_lexical_scopes(
     structure: &ReadyStructureFacts,
     mut scopes: Vec<Range<usize>>,
 ) -> Vec<Range<usize>> {
-    let debug_defs = structure
-        .debug_bindings()
-        .accepted
-        .iter()
-        .filter_map(|fact| match fact.value {
-            SsaValue::Def(def) => Some(def),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let debug_bindings = structure.debug_bindings();
     scopes.extend(
-        structure
-            .debug_bindings()
-            .accepted
+        debug_bindings
+            .accepted()
             .iter()
-            .filter_map(|fact| debug_closure_window(proto, cfg, dataflow, &debug_defs, fact)),
+            .filter_map(|fact| debug_closure_window(proto, cfg, dataflow, debug_bindings, fact)),
     );
     retain_non_crossing(scopes)
 }
@@ -42,7 +33,7 @@ fn debug_closure_window(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
-    debug_defs: &BTreeSet<DefId>,
+    debug_bindings: &DebugBindingFacts,
     fact: &DebugBindingFact,
 ) -> Option<Range<usize>> {
     if !proto.debug_locals.get(fact.scope)?.is_source() {
@@ -122,7 +113,7 @@ fn debug_closure_window(
             if reg.index() < fact.reg.index()
                 || (reg == fact.reg && def != binding)
                 || dataflow.reg_is_reference_captured(reg)
-                || (def != binding && debug_defs.contains(&def))
+                || (def != binding && debug_bindings.for_value(SsaValue::Def(def)).is_some())
                 || dataflow.def_uses[def.index()]
                     .iter()
                     .any(|site| !window.contains(&site.instr.index()))

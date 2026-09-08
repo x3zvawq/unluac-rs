@@ -84,9 +84,7 @@ pub(super) fn record_method_setup_protocols(
             {
                 return None;
             }
-            let RawLiteralConst::String(raw_key) =
-                proto.constants.common.literals.get(method_key.index())?
-            else {
+            let RawLiteralConst::String(raw_key) = proto.constants.get(method_key.index())? else {
                 return None;
             };
             Some((

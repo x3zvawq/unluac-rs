@@ -31,7 +31,7 @@ pub(super) struct BuiltComposite {
 pub(super) fn build_composite(
     proto: &LoweredProto,
     owner: &OwnerTemplate,
-    component: &MatchedComponent,
+    component: &MatchedShape,
 ) -> Option<BuiltComposite> {
     let owner_closure = closure_at(proto, owner.instr)?;
     let mut outer_indices = BTreeMap::new();

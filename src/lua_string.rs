@@ -5,6 +5,7 @@
 //! 视图。字节与已解码文本使用 `Arc` 共享，RawString -> HIR -> AST 的机械 Clone
 //! 不应随 pipeline 阶段重复深拷贝字面量。
 
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -68,6 +69,13 @@ impl LuaString {
         self.text.as_deref()
     }
 
+    /// 元数据展示优先采用已解码文本，缺少视图时按 UTF-8 替换无效字节。
+    /// 这不是源码字面量的转义策略；有效视图直接借用共享载荷。
+    pub fn display_text(&self) -> Cow<'_, str> {
+        self.decoded_text()
+            .map_or_else(|| String::from_utf8_lossy(self.as_bytes()), Cow::Borrowed)
+    }
+
     pub fn preferred_text(&self) -> Option<&str> {
         match self.encoding {
             // auto 检测到 windows-1252 时常只是给任意单字节高位数据一个展示视图；
@@ -128,5 +136,24 @@ impl From<String> for LuaString {
             text: Some(value.into()),
             encoding: Some(StringEncoding::Utf8),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_display_preserves_decoding_and_lossy_fallback() {
+        let decoded = LuaString {
+            bytes: vec![0x80].into(),
+            text: Some("€".into()),
+            encoding: Some(StringEncoding::EncodingRs(encoding_rs::WINDOWS_1252)),
+        };
+        assert_eq!(decoded.display_text(), "€");
+        assert!(matches!(decoded.display_text(), Cow::Borrowed(_)));
+        assert_eq!(LuaString::from_bytes(vec![b'a', 0xff]).display_text(), "a�");
+        let undecoded = LuaString::from_bytes(b"source".to_vec());
+        assert!(matches!(undecoded.display_text(), Cow::Borrowed("source")));
     }
 }

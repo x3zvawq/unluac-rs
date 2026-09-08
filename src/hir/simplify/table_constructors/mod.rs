@@ -440,15 +440,22 @@ impl HirRewritePass for TableConstructorPass<'_> {
             install_constructor_seed(&mut block.stmts[index], constructor);
             let drain_end = end_index;
             if drain_end > index {
-                for i in (index + 1..=drain_end).rev() {
-                    if preserved_stmt_indices.binary_search(&i).is_ok() {
-                        continue;
+                // 三表按同一原始坐标稳定压缩；只在整段处理后搬移尾部，避免每个字段
+                // 删除都移动其后的全部语句。稳定 stmt_id 仍用于撤销旧 occurrence。
+                let mut write = index + 1;
+                for read in index + 1..=drain_end {
+                    if preserved_stmt_indices.binary_search(&read).is_ok() {
+                        block.stmts.swap(write, read);
+                        stmt_bindings.swap(write, read);
+                        stmt_ids.swap(write, read);
+                        write += 1;
+                    } else {
+                        binding_occurrences.remove_stmt(stmt_ids[read], &stmt_bindings[read]);
                     }
-                    binding_occurrences.remove_stmt(stmt_ids[i], &stmt_bindings[i]);
-                    block.stmts.remove(i);
-                    stmt_bindings.remove(i);
-                    stmt_ids.remove(i);
                 }
+                drop(block.stmts.drain(write..drain_end + 1));
+                drop(stmt_bindings.drain(write..drain_end + 1));
+                drop(stmt_ids.drain(write..drain_end + 1));
             }
             changed = true;
             index += 1;

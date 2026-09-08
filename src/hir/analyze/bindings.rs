@@ -10,8 +10,8 @@
 //!   一组 header locals，而不是再从 `GenericForLoop` terminator 回扫一次
 //! - 同一 `(slot, close epoch)` 的引用捕获会共用一次反向写后分析，不会按
 //!   `closure 数 × def 数` 重复扫描；这里只决定绑定身份，不改写 closure 语义
-//! - loop body 的 block 列表在 bindings 入口按 `LoopPlanId` 只展开一次，loop local 与
-//!   captured-slot owner 判定共享紧凑快照，不重复 DFS region tree。
+//! - loop local 与 captured-slot owner 判定直接借用 Structure 的 region 块切片；
+//!   例如嵌套循环的 body 覆盖由已校验的 containment 给出，不再展开 region tree。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +22,7 @@ use crate::structure::{
 };
 use crate::structure::{
     CleanupDisposition, LoopPlanId, LoopSourceBindings, LoopVmProtocol, ReadyStructureFacts,
-    RegionId, RegionPlan, StructurePlan, UnstructuredLayoutItem,
+    RegionId, RegionPlan, StructurePlan,
 };
 use crate::transformer::{
     AccessBase, CaptureSource, GetTableKind, InstrRef, LowInstr, LoweredProto, Reg,
@@ -51,10 +51,10 @@ struct CapturedSlotKey {
     epoch: usize,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct DebugBindingHint {
+#[derive(Debug, Clone, Copy)]
+struct DebugBindingHint<'a> {
     scope: usize,
-    name: String,
+    name: &'a crate::parser::RawString,
 }
 
 impl CapturedSlotKey {
@@ -72,27 +72,23 @@ pub(super) fn build_bindings(
     captured_slot_epochs: &SlotEpochFacts,
     child_mutable_upvalues: &[&[bool]],
 ) -> ProtoBindings {
-    let debug_names_by_ssa = debug_names_by_ssa(proto, structure);
     let params = (0..usize::from(proto.signature.num_params))
         .map(ParamId)
         .collect::<Vec<_>>();
     let param_debug_hints = (0..params.len())
         .map(|reg| {
-            debug_names_by_ssa
-                .get(&SsaValue::Entry(Reg(reg)))
-                .map(|hint| hint.name.clone())
+            debug_local_hint_for_ssa(proto, structure, SsaValue::Entry(Reg(reg)))
+                .map(|hint| decode_raw_string(hint.name))
                 .or_else(|| debug_local_name_for_reg_at_pc(proto, Reg(reg), 0))
         })
         .collect::<Vec<_>>();
-    let upvalues = (0..usize::from(proto.upvalues.common.count))
+    let upvalues = (0..usize::from(proto.upvalue_count))
         .map(UpvalueId)
         .collect::<Vec<_>>();
     let upvalue_debug_hints = (0..upvalues.len())
         .map(|index| {
             proto
-                .debug_info
-                .common
-                .upvalue_names
+                .upvalue_debug_names
                 .get(index)
                 .and_then(|name| name.as_ref().map(decode_raw_string))
         })
@@ -103,17 +99,6 @@ pub(super) fn build_bindings(
     let mut numeric_for_locals = BTreeMap::new();
     let mut generic_for_locals = BTreeMap::new();
     let mut block_local_regs = BTreeMap::new();
-    // loop body 的 region tree 展开同时服务 loop binding 与 captured-slot owner 判定。
-    // 先按稠密 LoopPlanId 只展开一次，并压成 block 列表，避免保留每个 loop 的 BTreeSet
-    // 节点开销；嵌套 ancestor incidence 仍由后续 owner map 合同单独约束。
-    let loop_body_blocks = structure
-        .plan()
-        .loops()
-        .map(|(loop_id, _)| {
-            loop_body_region(structure.plan(), loop_id)
-                .map(|body| region_blocks(structure.plan(), body))
-        })
-        .collect::<Vec<_>>();
     let numeric_binding_phis = numeric_for_binding_phis(structure.plan());
     let phi_debug_hints = structure
         .plan()
@@ -122,9 +107,7 @@ pub(super) fn build_bindings(
             if !phi_participates_in_normal_binding(phi) {
                 return None;
             }
-            debug_names_by_ssa
-                .get(&SsaValue::Phi(phi.phi))
-                .cloned()
+            debug_local_hint_for_ssa(proto, structure, SsaValue::Phi(phi.phi))
                 .or_else(|| debug_local_hint_for_reg_at_block_entry(proto, cfg, phi.block, phi.reg))
         })
         .collect::<Vec<_>>();
@@ -160,7 +143,6 @@ pub(super) fn build_bindings(
             epochs: captured_slot_epochs,
             child_mutable_upvalues,
             numeric_binding_phis: &numeric_binding_phis.bindings,
-            loop_body_blocks: &loop_body_blocks,
         },
         &mut entry_local_regs,
         &mut local_count,
@@ -168,9 +150,8 @@ pub(super) fn build_bindings(
     );
 
     for (loop_id, loop_plan) in structure.plan().loops() {
-        let Some(body_blocks) = loop_body_blocks
-            .get(loop_id.index())
-            .and_then(Option::as_ref)
+        let Some(body_blocks) = loop_body_region(structure.plan(), loop_id)
+            .map(|body| structure.plan().region_blocks(body))
         else {
             continue;
         };
@@ -359,14 +340,12 @@ pub(super) fn build_bindings(
             {
                 None
             }
-            _ => debug_names_by_ssa
-                .get(&SsaValue::Def(def.id))
-                .cloned()
+            _ => debug_local_hint_for_ssa(proto, structure, SsaValue::Def(def.id))
                 .or_else(|| debug_local_hint_for_reg_at_instr(proto, def.reg, def.instr)),
         };
         temp_debug_locals[temp.index()] = hint
             .as_ref()
-            .map(|hint| hint.name.clone())
+            .map(|hint| decode_raw_string(hint.name))
             .or_else(|| closure_debug_name(proto, instr));
         temp_debug_scopes[temp.index()] = hint.map(|hint| hint.scope);
     }
@@ -376,8 +355,9 @@ pub(super) fn build_bindings(
             continue;
         };
         if phi_participates_in_normal_binding(phi) {
-            let hint = phi_debug_hints[phi.phi.index()].clone();
-            temp_debug_locals[temp.index()] = hint.as_ref().map(|hint| hint.name.clone());
+            let hint = phi_debug_hints[phi.phi.index()];
+            temp_debug_locals[temp.index()] =
+                hint.as_ref().map(|hint| decode_raw_string(hint.name));
             temp_debug_scopes[temp.index()] = hint.map(|hint| hint.scope);
         }
     }

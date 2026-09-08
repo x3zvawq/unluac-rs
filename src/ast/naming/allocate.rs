@@ -12,7 +12,7 @@ use crate::hir::{HirProto, HirProtoRef, LocalId};
 use super::NamingError;
 use super::ast_facts::{AstNamingFacts, FunctionAstNamingFacts};
 use super::common::{
-    CandidateHint, FunctionHints, FunctionNameMap, FunctionNamingEvidence, ModuleNameAllocator,
+    CandidateHint, ClosureCaptureEvidence, FunctionHints, FunctionNameMap, ModuleNameAllocator,
     NameInfo, NameSource, NamingMode, NamingOptions,
 };
 use super::strategy::{
@@ -67,7 +67,7 @@ impl ModuleNameAllocator {
 
 pub(super) struct FunctionAssignContext<'a> {
     pub proto: &'a HirProto,
-    pub evidence: &'a FunctionNamingEvidence,
+    pub capture_evidence: Option<&'a ClosureCaptureEvidence>,
     pub hints: &'a FunctionHints,
     pub ast_facts: &'a FunctionAstNamingFacts,
     pub module_ast_facts: &'a AstNamingFacts,
@@ -162,7 +162,7 @@ pub(super) fn assign_names_for_function(
 ) -> Result<FunctionNameMap, NamingError> {
     let FunctionAssignContext {
         proto,
-        evidence,
+        capture_evidence,
         hints,
         ast_facts,
         module_ast_facts,
@@ -183,7 +183,7 @@ pub(super) fn assign_names_for_function(
         .iter()
         .enumerate()
         .map(|(index, _upvalue)| {
-            choose_upvalue_candidate(proto, index, evidence, options, assigned_functions)
+            choose_upvalue_candidate(proto, index, capture_evidence, options, assigned_functions)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -204,7 +204,7 @@ pub(super) fn assign_names_for_function(
         .map(|(index, param)| {
             allocate_param_name(
                 module_names.reserve_function_shape_name(
-                    choose_param_candidate(proto, *param, index, evidence, hints, options),
+                    choose_param_candidate(proto, *param, index, hints, options),
                     &names,
                     options.mode,
                 ),
@@ -219,7 +219,7 @@ pub(super) fn assign_names_for_function(
         .map(LocalId)
         .map(|local| {
             names.allocate(module_names.reserve_function_shape_name(
-                choose_local_candidate(proto, local, evidence, hints, ast_facts, options),
+                choose_local_candidate(proto, local, hints, ast_facts, options),
                 &names,
                 options.mode,
             ))
@@ -252,7 +252,6 @@ pub(super) fn assign_names_for_function(
                     proto,
                     local,
                     synthetic_order,
-                    evidence,
                     hints,
                     ast_facts,
                     options,

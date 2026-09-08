@@ -1,4 +1,6 @@
 //! 提取 closure capture 模板并匹配 owner/replacement 组件；依赖 canonical Move 与 child 依赖，不负责最终 dominance/scope 校验；例如递归构建共享 factory 节点。
+//! 组件沿用缓存 shape 的共享身份与 occurrence 集；每个 owner 仍单独校验外层 capture，
+//! 通过后直接消费同一份只读证明，不再复制一套候选组件。
 
 use super::*;
 
@@ -42,7 +44,7 @@ pub(super) fn extract_template(
             return None;
         }
         let value = dataflow.use_value(instr_ref, values.start);
-        let root = resolve_returned_closure(proto, dataflow, value)?;
+        let root = resolve_closure_value(proto, dataflow, value)?;
         match returned_root {
             None => returned_root = Some(root),
             Some(existing) if existing == root => {}
@@ -68,7 +70,7 @@ pub(super) fn extract_template(
     })
 }
 
-pub(super) fn resolve_returned_closure(
+pub(super) fn resolve_closure_value(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     value: SsaValue,
@@ -148,7 +150,7 @@ impl TemplateBuilder<'_> {
                 CaptureSource::ByValue(reg) if reg == closure_dst => return None,
                 CaptureSource::ByValue(reg) => {
                     let value = self.dataflow.use_value(current_instr, reg);
-                    let dependency = self.resolve_capture_value(value)?;
+                    let dependency = resolve_closure_value(self.proto, self.dataflow, value)?;
                     if let Some(node) = self.node_by_instr.get(&dependency) {
                         frame.captures.push(TemplateCapture::Dependency(*node));
                         continue;
@@ -172,24 +174,6 @@ impl TemplateBuilder<'_> {
             }
         }
     }
-
-    pub(super) fn resolve_capture_value(&self, value: SsaValue) -> Option<InstrRef> {
-        let SsaValue::Def(def) = self.dataflow.canonical_move_value(value)? else {
-            return None;
-        };
-        let instr_ref = self.dataflow.def_instr(def);
-        matches!(self.proto.instrs.get(instr_ref.index()), Some(LowInstr::Closure(closure)) if closure.dst == self.dataflow.def_reg(def))
-            .then_some(instr_ref)
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct MatchedComponent {
-    pub(super) root_shared: SharedClosureRef,
-    pub(super) node_groups: Vec<SharedClosureRef>,
-    pub(super) node_protos: Vec<ProtoRef>,
-    pub(super) root_occurrences: BTreeSet<InstrRef>,
-    pub(super) dependency_occurrences: BTreeSet<InstrRef>,
 }
 
 /// owner-independent component proof cached by `(TemplateClassRef, SharedClosureRef)`.
@@ -199,8 +183,9 @@ pub(super) struct MatchedComponent {
 /// these facts; it never re-walks a validated `(template node, physical instruction)` pair.
 /// The occurrence sets are also the alias/liveness contract used to consume the matched shared
 /// groups.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct MatchedShape {
+    pub(super) root_shared: SharedClosureRef,
     pub(super) node_groups: Vec<SharedClosureRef>,
     pub(super) node_protos: Vec<ProtoRef>,
     pub(super) root_occurrences: BTreeSet<InstrRef>,
@@ -215,7 +200,7 @@ pub(super) fn match_component(
     owner: &OwnerTemplate,
     root_group: &ReusableGroup,
     shape_cache: &mut BTreeMap<(TemplateClassRef, SharedClosureRef), Option<Arc<MatchedShape>>>,
-) -> Option<MatchedComponent> {
+) -> Option<Arc<MatchedShape>> {
     let owner_closure = closure_at(proto, owner.instr)?;
     let shape = shape_cache
         .entry((owner.class, root_group.shared))
@@ -242,13 +227,7 @@ pub(super) fn match_component(
         }
     }
 
-    Some(MatchedComponent {
-        root_shared: root_group.shared,
-        node_groups: shape.node_groups.clone(),
-        node_protos: shape.node_protos.clone(),
-        root_occurrences: shape.root_occurrences.clone(),
-        dependency_occurrences: shape.dependency_occurrences.clone(),
-    })
+    Some(shape)
 }
 
 fn match_component_shape(
@@ -337,15 +316,11 @@ fn match_component_shape(
         }
     }
 
-    let root_occurrences = matcher.node_occurrences[owner.template.root.index()].clone();
-    let dependency_occurrences = matcher
-        .node_occurrences
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != owner.template.root.index())
-        .flat_map(|(_, occurrences)| occurrences.iter().copied())
-        .collect();
+    let root_occurrences =
+        std::mem::take(&mut matcher.node_occurrences[owner.template.root.index()]);
+    let dependency_occurrences = matcher.node_occurrences.into_iter().flatten().collect();
     Some(MatchedShape {
+        root_shared: root_group.shared,
         root_occurrences,
         dependency_occurrences,
         node_groups,

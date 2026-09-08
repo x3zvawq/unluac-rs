@@ -94,6 +94,10 @@ impl StructurePlan {
         self.navigation.postorder()
     }
 
+    pub(crate) fn region_postorder_rank(&self, region: RegionId) -> Option<usize> {
+        self.navigation.postorder_rank(region)
+    }
+
     pub fn block_terminator(&self, block: BlockRef) -> Option<&BlockTerminatorPlan> {
         self.block_terminators.get(block.index())
     }

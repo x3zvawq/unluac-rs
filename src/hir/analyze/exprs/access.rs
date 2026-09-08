@@ -6,8 +6,6 @@
 //! 表达式骨架；已证明的 `_ENV[key]` 则无论 key 能否写成裸标识符，都保留为
 //! raw-byte `HirGlobalRef`，目标语法合法性留给 AST 验证。
 
-use std::collections::BTreeSet;
-
 use super::*;
 
 pub(crate) fn expr_for_value_operand(
@@ -43,7 +41,7 @@ pub(crate) fn expr_for_value_operand_single_eval_pure_operand(
 }
 
 pub(crate) fn expr_for_const(proto: &LoweredProto, const_ref: ConstRef) -> HirExpr {
-    match proto.constants.common.literals.get(const_ref.index()) {
+    match proto.constants.get(const_ref.index()) {
         Some(RawLiteralConst::Nil) => HirExpr::Nil,
         Some(RawLiteralConst::Boolean(value)) => HirExpr::Boolean(*value),
         Some(RawLiteralConst::Integer(value)) => HirExpr::Integer(*value),
@@ -377,29 +375,26 @@ fn reg_use_is_env(
     reg: Reg,
     key: &crate::LuaString,
 ) -> bool {
-    let access_block = lowering.cfg.instr_to_block[instr_ref.index()];
-    let mut value = lowering.dataflow.use_value(instr_ref, reg);
-    let mut seen = BTreeSet::new();
-    while let SsaValue::Def(def) = value {
-        if !seen.insert(def) || lowering.dataflow.def_block(def) != access_block {
-            return false;
-        }
-        let def_instr = lowering.dataflow.def_instr(def);
-        match &lowering.proto.instrs[def_instr.index()] {
-            LowInstr::GetUpvalue(get_upvalue) => {
-                return matches!(get_upvalue.src, UpvalueOperand::Env(_))
-                    && def_instr.index() < instr_ref.index()
-                    && (((def_instr.index() + 1)..instr_ref.index()).all(|index| {
-                        !lowering.dataflow.effect_summaries[index].has_effect_tags()
-                    }) || access_is_global_decl(lowering, instr_ref, key));
-            }
-            LowInstr::Move(move_instr) => {
-                value = lowering.dataflow.use_value(def_instr, move_instr.src);
-            }
-            _ => return false,
-        }
+    let Some(SsaValue::Def(def)) = lowering
+        .dataflow
+        .canonical_move_value(lowering.dataflow.use_value(instr_ref, reg))
+    else {
+        return false;
+    };
+    // SSA 定义支配其 use；根与最终访问同块时，中间 Move 块同时支配和被支配于
+    // 此块，因此也必同块。只消费共享值根，跨事件延后读取的证明仍独立保留。
+    if lowering.dataflow.def_block(def) != lowering.cfg.instr_to_block[instr_ref.index()] {
+        return false;
     }
-    false
+    let def_instr = lowering.dataflow.def_instr(def);
+    let LowInstr::GetUpvalue(get_upvalue) = &lowering.proto.instrs[def_instr.index()] else {
+        return false;
+    };
+    matches!(get_upvalue.src, UpvalueOperand::Env(_))
+        && def_instr.index() < instr_ref.index()
+        && (((def_instr.index() + 1)..instr_ref.index())
+            .all(|index| !lowering.dataflow.effect_summaries[index].has_effect_tags())
+            || access_is_global_decl(lowering, instr_ref, key))
 }
 
 fn access_is_global_decl(
@@ -416,14 +411,10 @@ fn access_is_global_decl(
     ) else {
         return false;
     };
-    let Some(RawLiteralConst::String(raw_name)) = err_nil.name.and_then(|const_ref| {
-        lowering
-            .proto
-            .constants
-            .common
-            .literals
-            .get(const_ref.index())
-    }) else {
+    let Some(RawLiteralConst::String(raw_name)) = err_nil
+        .name
+        .and_then(|const_ref| lowering.proto.constants.get(const_ref.index()))
+    else {
         return false;
     };
     if crate::LuaString::from_raw(raw_name) != *key {
@@ -453,12 +444,7 @@ fn global_key_from_access_key(
 ) -> Option<crate::LuaString> {
     match key {
         AccessKey::Const(const_ref) => {
-            let RawLiteralConst::String(value) = lowering
-                .proto
-                .constants
-                .common
-                .literals
-                .get(const_ref.index())?
+            let RawLiteralConst::String(value) = lowering.proto.constants.get(const_ref.index())?
             else {
                 return None;
             };

@@ -22,7 +22,8 @@ pub struct HirModule {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirProto {
     pub id: HirProtoRef,
-    pub source: Option<String>,
+    /// 共享原始源码名及解码视图；按字节身份比较，只在 dump/注释输出时取得文本。
+    pub source: Option<LuaString>,
     pub line_range: ProtoLineRange,
     pub signature: ProtoSignature,
     pub params: Vec<ParamId>,

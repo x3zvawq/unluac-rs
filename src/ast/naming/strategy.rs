@@ -4,13 +4,13 @@
 //! 真正的唯一化和祖先作用域避让由 allocation 阶段完成。
 
 use crate::ast::AstSyntheticLocalId;
-use crate::hir::{HirProto, HirProtoRef, LocalId, ParamId, TempId, UpvalueId};
+use crate::hir::{HirBinding, HirProto, HirProtoRef, LocalId, ParamId};
 
 use super::NamingError;
 use super::ast_facts::FunctionAstNamingFacts;
 use super::common::{
-    CandidateHint, CapturedBinding, FunctionHints, FunctionNameMap, FunctionNamingEvidence,
-    NameSource, NamingMode, NamingOptions,
+    CandidateHint, ClosureCaptureEvidence, FunctionHints, FunctionNameMap, NameSource, NamingMode,
+    NamingOptions,
 };
 use super::lexical::VisibleBinding;
 use super::support::{alphabetical_name, as_valid_name};
@@ -20,7 +20,6 @@ pub(super) fn choose_param_candidate(
     proto: &HirProto,
     param: ParamId,
     index: usize,
-    evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
     options: NamingOptions,
 ) -> CandidateHint {
@@ -29,11 +28,7 @@ pub(super) fn choose_param_candidate(
     {
         return hint.clone();
     }
-    if let Some(name) = evidence
-        .param_debug_names
-        .get(index)
-        .and_then(as_valid_name)
-    {
+    if let Some(name) = proto.param_debug_hints.get(index).and_then(as_valid_name) {
         return CandidateHint {
             text: name,
             source: NameSource::Debug,
@@ -64,7 +59,6 @@ pub(super) fn choose_param_candidate(
 pub(super) fn choose_local_candidate(
     proto: &HirProto,
     local: LocalId,
-    evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
     ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
@@ -76,11 +70,15 @@ pub(super) fn choose_local_candidate(
             source: NameSource::LegacyArg,
         };
     }
-    if let Some(name) = evidence
-        .local_debug_names
-        .get(index)
-        .and_then(as_valid_name)
-    {
+    // 仅为 HIR 指定的变参 local 补空提示，不覆盖已有名字或越界槽。
+    let debug_hint = proto.local_debug_hints.get(index).and_then(|hint| {
+        if hint.is_none() && proto.vararg_param_local == Some(local) {
+            proto.param_debug_hints.get(proto.params.len())
+        } else {
+            Some(hint)
+        }
+    });
+    if let Some(name) = debug_hint.and_then(as_valid_name) {
         return CandidateHint {
             text: name,
             source: NameSource::Debug,
@@ -107,24 +105,18 @@ pub(super) fn choose_local_candidate(
 pub(super) fn choose_upvalue_candidate(
     proto: &HirProto,
     index: usize,
-    evidence: &FunctionNamingEvidence,
+    capture_evidence: Option<&ClosureCaptureEvidence>,
     options: NamingOptions,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<CandidateHint, NamingError> {
-    if let Some(capture) = evidence
-        .upvalue_capture_sources
-        .get(index)
-        .and_then(|capture| *capture)
+    if let Some(evidence) = capture_evidence
+        && let Some(&binding) = evidence.captures.get(index)
     {
         // upvalue 不是一个“重新发明名字”的槽位：只要我们知道它捕获自哪个父绑定，
         // 就应该沿用那个绑定在父作用域里已经稳定下来的名字。
-        return resolve_captured_name(proto.id, capture, assigned_functions);
+        return resolve_captured_name(proto.id, evidence.parent, binding, assigned_functions);
     }
-    if let Some(name) = evidence
-        .upvalue_debug_names
-        .get(index)
-        .and_then(as_valid_name)
-    {
+    if let Some(name) = proto.upvalue_debug_hints.get(index).and_then(as_valid_name) {
         return Ok(CandidateHint {
             text: name,
             source: NameSource::Debug,
@@ -153,15 +145,14 @@ pub(super) fn choose_synthetic_local_candidate(
     proto: &HirProto,
     local: AstSyntheticLocalId,
     synthetic_order: usize,
-    evidence: &FunctionNamingEvidence,
     hints: &FunctionHints,
     ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
     let index = local.index();
     if let AstSyntheticLocalId::HirTemp(temp) = local
-        && let Some(name) = evidence
-            .temp_debug_names
+        && let Some(name) = proto
+            .temp_debug_locals
             .get(temp.index())
             .and_then(as_valid_name)
     {
@@ -205,168 +196,64 @@ pub(super) fn resolve_visible_binding_name(
     binding: VisibleBinding,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<String, NamingError> {
-    match binding {
-        VisibleBinding::Param {
-            function: parent,
-            param,
-        } => resolve_captured_param_name(function, parent, param, assigned_functions),
-        VisibleBinding::Local {
-            function: parent,
-            local,
-        } => resolve_captured_local_name(function, parent, local, assigned_functions),
-        VisibleBinding::SyntheticLocal {
-            function: parent,
-            local,
-        } => {
-            let parent_names = assigned_functions.get(parent.index()).ok_or(
-                NamingError::MissingCaptureParent {
-                    function: function.index(),
-                    parent: parent.index(),
-                },
-            )?;
-            parent_names
-                .synthetic_locals
-                .get(&local)
-                .map(|name| name.text.clone())
-                .ok_or(NamingError::MissingCapturedBinding {
-                    function: function.index(),
-                    parent: parent.index(),
-                    kind: "synthetic-local",
-                    index: local.index(),
-                })
+    let (parent, kind, index) = match binding {
+        VisibleBinding::Param { function, param } => (function, "param", param.index()),
+        VisibleBinding::Local { function, local } => (function, "local", local.index()),
+        VisibleBinding::SyntheticLocal { function, local } => {
+            (function, "synthetic-local", local.index())
         }
-        VisibleBinding::Upvalue {
-            function: parent,
-            upvalue,
-        } => resolve_captured_upvalue_name(function, parent, upvalue, assigned_functions),
-    }
+        VisibleBinding::Upvalue { function, upvalue } => (function, "upvalue", upvalue.index()),
+    };
+    let parent_names =
+        assigned_functions
+            .get(parent.index())
+            .ok_or(NamingError::MissingCaptureParent {
+                function: function.index(),
+                parent: parent.index(),
+            })?;
+    let name = match binding {
+        VisibleBinding::Param { param, .. } => parent_names.params.get(param.index()),
+        VisibleBinding::Local { local, .. } => parent_names.locals.get(local.index()),
+        VisibleBinding::SyntheticLocal { local, .. } => parent_names.synthetic_locals.get(&local),
+        VisibleBinding::Upvalue { upvalue, .. } => parent_names.upvalues.get(upvalue.index()),
+    };
+    name.map(|name| name.text.clone())
+        .ok_or(NamingError::MissingCapturedBinding {
+            function: function.index(),
+            parent: parent.index(),
+            kind,
+            index,
+        })
 }
 
 fn resolve_captured_name(
     function: HirProtoRef,
-    capture: CapturedBinding,
+    parent: HirProtoRef,
+    binding: HirBinding,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<CandidateHint, NamingError> {
-    use crate::hir::HirBinding;
-    let parent = capture.parent;
-    let text = match capture.binding {
-        HirBinding::Param(param) => {
-            resolve_captured_param_name(function, parent, param, assigned_functions)?
-        }
-        HirBinding::Local(local) => {
-            resolve_captured_local_name(function, parent, local, assigned_functions)?
-        }
-        HirBinding::Temp(temp) => {
-            resolve_captured_temp_name(function, parent, temp, assigned_functions)?
-        }
-        HirBinding::Upvalue(upvalue) => {
-            resolve_captured_upvalue_name(function, parent, upvalue, assigned_functions)?
-        }
+    let binding = match binding {
+        HirBinding::Param(param) => VisibleBinding::Param {
+            function: parent,
+            param,
+        },
+        HirBinding::Local(local) => VisibleBinding::Local {
+            function: parent,
+            local,
+        },
+        HirBinding::Temp(temp) => VisibleBinding::SyntheticLocal {
+            function: parent,
+            local: AstSyntheticLocalId::HirTemp(temp),
+        },
+        HirBinding::Upvalue(upvalue) => VisibleBinding::Upvalue {
+            function: parent,
+            upvalue,
+        },
     };
     Ok(CandidateHint {
-        text,
+        text: resolve_visible_binding_name(function, binding, assigned_functions)?,
         source: NameSource::CaptureProvenance,
     })
-}
-
-fn resolve_captured_param_name(
-    function: HirProtoRef,
-    parent: HirProtoRef,
-    param: ParamId,
-    assigned_functions: &[FunctionNameMap],
-) -> Result<String, NamingError> {
-    let parent_names =
-        assigned_functions
-            .get(parent.index())
-            .ok_or(NamingError::MissingCaptureParent {
-                function: function.index(),
-                parent: parent.index(),
-            })?;
-    parent_names
-        .params
-        .get(param.index())
-        .map(|name| name.text.clone())
-        .ok_or(NamingError::MissingCapturedBinding {
-            function: function.index(),
-            parent: parent.index(),
-            kind: "param",
-            index: param.index(),
-        })
-}
-
-fn resolve_captured_local_name(
-    function: HirProtoRef,
-    parent: HirProtoRef,
-    local: LocalId,
-    assigned_functions: &[FunctionNameMap],
-) -> Result<String, NamingError> {
-    let parent_names =
-        assigned_functions
-            .get(parent.index())
-            .ok_or(NamingError::MissingCaptureParent {
-                function: function.index(),
-                parent: parent.index(),
-            })?;
-    parent_names
-        .locals
-        .get(local.index())
-        .map(|name| name.text.clone())
-        .ok_or(NamingError::MissingCapturedBinding {
-            function: function.index(),
-            parent: parent.index(),
-            kind: "local",
-            index: local.index(),
-        })
-}
-
-fn resolve_captured_temp_name(
-    function: HirProtoRef,
-    parent: HirProtoRef,
-    temp: TempId,
-    assigned_functions: &[FunctionNameMap],
-) -> Result<String, NamingError> {
-    let parent_names =
-        assigned_functions
-            .get(parent.index())
-            .ok_or(NamingError::MissingCaptureParent {
-                function: function.index(),
-                parent: parent.index(),
-            })?;
-    parent_names
-        .synthetic_locals
-        .get(&AstSyntheticLocalId::HirTemp(temp))
-        .map(|name| name.text.clone())
-        .ok_or(NamingError::MissingCapturedBinding {
-            function: function.index(),
-            parent: parent.index(),
-            kind: "synthetic-local",
-            index: temp.index(),
-        })
-}
-
-fn resolve_captured_upvalue_name(
-    function: HirProtoRef,
-    parent: HirProtoRef,
-    upvalue: UpvalueId,
-    assigned_functions: &[FunctionNameMap],
-) -> Result<String, NamingError> {
-    let parent_names =
-        assigned_functions
-            .get(parent.index())
-            .ok_or(NamingError::MissingCaptureParent {
-                function: function.index(),
-                parent: parent.index(),
-            })?;
-    parent_names
-        .upvalues
-        .get(upvalue.index())
-        .map(|name| name.text.clone())
-        .ok_or(NamingError::MissingCapturedBinding {
-            function: function.index(),
-            parent: parent.index(),
-            kind: "upvalue",
-            index: upvalue.index(),
-        })
 }
 
 fn mode_fallback_candidate(

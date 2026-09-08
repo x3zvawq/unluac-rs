@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::super::promotion::{HomeSlotKey, ProtoPromotionFacts, SlotEpochFacts};
 use super::bindings::build_bindings;
 use super::global_decls::GlobalDeclProtocols;
-use super::helpers::{decode_raw_string, empty_proto, return_stmt};
+use super::helpers::{decode_raw_string, empty_proto, raw_lua_string, return_stmt};
 use super::instrs::local_decl_stmts;
 use super::shared_closures::{
     CompositeCapture, CompositeFactoryPlan, CompositeFactoryRef, SharedClosurePlan,
@@ -559,7 +559,7 @@ fn lower_proto_one(
 
     artifacts.protos[id.index()] = HirProto {
         id,
-        source: proto.source.as_ref().map(decode_raw_string),
+        source: proto.source.as_ref().map(raw_lua_string),
         line_range: proto.line_range,
         signature: proto.signature,
         params: bindings.params,
@@ -708,7 +708,7 @@ fn fill_failed_proto(
 
     artifacts.protos[id.index()] = HirProto {
         id,
-        source: proto.source.as_ref().map(decode_raw_string),
+        source: proto.source.as_ref().map(raw_lua_string),
         line_range: proto.line_range,
         signature: proto.signature,
         params: (0..usize::from(proto.signature.num_params))
@@ -723,7 +723,7 @@ fn fill_failed_proto(
         physical_root_temps: BTreeSet::new(),
         physical_root_locals: BTreeSet::new(),
         inline_dispositions: Default::default(),
-        upvalues: (0..usize::from(proto.upvalues.common.count))
+        upvalues: (0..usize::from(proto.upvalue_count))
             .map(UpvalueId)
             .collect(),
         environment_upvalues: proto
@@ -732,12 +732,10 @@ fn fill_failed_proto(
             .map(|upvalue| UpvalueId(upvalue.index()))
             .collect(),
         mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
-        upvalue_debug_hints: (0..usize::from(proto.upvalues.common.count))
+        upvalue_debug_hints: (0..usize::from(proto.upvalue_count))
             .map(|index| {
                 proto
-                    .debug_info
-                    .common
-                    .upvalue_names
+                    .upvalue_debug_names
                     .get(index)
                     .and_then(|name| name.as_ref().map(decode_raw_string))
             })
@@ -766,7 +764,7 @@ fn accepted_debug_scopes(
     structure: &ReadyStructureFacts,
 ) -> Vec<Option<HirDebugScope>> {
     let mut scopes = vec![None; proto.debug_locals.len()];
-    for fact in &structure.debug_bindings().accepted {
+    for fact in structure.debug_bindings().accepted() {
         scopes[fact.scope] = Some(HirDebugScope {
             start_pc: fact.start_pc,
             end_pc: fact.end_pc,
@@ -822,7 +820,7 @@ fn mutable_upvalues_for_proto(
     proto: &LoweredProto,
     child_mutable_upvalues: &[&[bool]],
 ) -> Vec<bool> {
-    let mut mutable = vec![false; usize::from(proto.upvalues.common.count)];
+    let mut mutable = vec![false; usize::from(proto.upvalue_count)];
     for instr in &proto.instrs {
         match instr {
             LowInstr::SetUpvalue(set) => {
@@ -1002,19 +1000,17 @@ fn capture_needs_non_reflexive_barrier(
     let def_instr = dataflow.def_instr(def);
     match proto.instrs.get(def_instr.index()) {
         Some(LowInstr::LoadNumber(load)) => load.value.is_nan(),
-        Some(LowInstr::LoadConst(load)) => {
-            match proto.constants.common.literals.get(load.value.index()) {
-                Some(crate::parser::RawLiteralConst::Number(value)) => value.is_nan(),
-                Some(crate::parser::RawLiteralConst::Vector(value)) => value
-                    .components
-                    .iter()
-                    .any(|bits| f32::from_bits(*bits).is_nan()),
-                Some(crate::parser::RawLiteralConst::Complex { real, imag }) => {
-                    real.is_nan() || imag.is_nan()
-                }
-                _ => false,
+        Some(LowInstr::LoadConst(load)) => match proto.constants.get(load.value.index()) {
+            Some(crate::parser::RawLiteralConst::Number(value)) => value.is_nan(),
+            Some(crate::parser::RawLiteralConst::Vector(value)) => value
+                .components
+                .iter()
+                .any(|bits| f32::from_bits(*bits).is_nan()),
+            Some(crate::parser::RawLiteralConst::Complex { real, imag }) => {
+                real.is_nan() || imag.is_nan()
             }
-        }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -1079,7 +1075,7 @@ fn build_composite_factory_proto(
 
     for (index, node) in plan.nodes.iter().enumerate() {
         let child = proto.children.get(node.proto.index()).ok_or_else(error)?;
-        if usize::from(child.upvalues.common.count) != node.captures.len() {
+        if usize::from(child.upvalue_count) != node.captures.len() {
             return Err(error());
         }
         let child_ref = *child_refs.get(node.proto.index()).ok_or_else(error)?;
@@ -1150,7 +1146,7 @@ fn build_composite_factory_proto(
 
     let proto = HirProto {
         id,
-        source: owner.source.as_ref().map(decode_raw_string),
+        source: owner.source.as_ref().map(raw_lua_string),
         line_range: owner.line_range,
         signature: crate::parser::ProtoSignature {
             num_params: 0,

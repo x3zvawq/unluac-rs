@@ -522,30 +522,28 @@ impl<'a> AstLowerer<'a> {
                 context: "global declaration",
             });
         }
-        let names = global_decl
+        let bindings = global_decl
             .names
             .iter()
             .map(|key| {
                 let name = key
                     .as_utf8()
                     .filter(|name| self.target.version.is_identifier_name(name));
-                name.map(str::to_owned)
-                    .ok_or_else(|| AstLowerError::InvalidGlobalDeclName {
-                        proto: proto_index,
-                        dialect: self.target.version,
-                        name: key.debug_literal(),
-                    })
+                name.map(|text| AstGlobalBinding {
+                    target: AstGlobalBindingTarget::Name(AstGlobalName {
+                        text: text.to_owned(),
+                    }),
+                    attr: AstGlobalAttr::None,
+                })
+                .ok_or_else(|| AstLowerError::InvalidGlobalDeclName {
+                    proto: proto_index,
+                    dialect: self.target.version,
+                    name: key.debug_literal(),
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(AstGlobalDecl {
-            bindings: names
-                .iter()
-                .cloned()
-                .map(|text| AstGlobalBinding {
-                    target: AstGlobalBindingTarget::Name(AstGlobalName { text }),
-                    attr: AstGlobalAttr::None,
-                })
-                .collect(),
+            bindings,
             values: self.lower_value_pack(
                 proto_index,
                 &global_decl.values,

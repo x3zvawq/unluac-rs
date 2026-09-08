@@ -159,13 +159,7 @@ pub(super) fn lower_regular_instr(
             vec![HirStmt::ErrNil(Box::new(crate::hir::common::HirErrNil {
                 value: expr_for_reg_use(lowering, block, instr_ref, err_nnil.subject),
                 name: err_nnil.name.and_then(|const_ref| {
-                    match lowering
-                        .proto
-                        .constants
-                        .common
-                        .literals
-                        .get(const_ref.index())
-                    {
+                    match lowering.proto.constants.get(const_ref.index()) {
                         Some(crate::parser::RawLiteralConst::String(value)) => {
                             Some(decode_raw_string(value))
                         }

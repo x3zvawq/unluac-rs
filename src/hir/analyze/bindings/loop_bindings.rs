@@ -18,7 +18,7 @@ pub(super) fn preserve_loop_state_overwrites(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     epochs: &SlotEpochFacts,
-    barriers: (&[bool], &[Option<DebugBindingHint>]),
+    barriers: (&[bool], &[Option<DebugBindingHint<'_>>]),
     temps: (&[TempId], &mut [TempId]),
 ) {
     let (numeric_phis, debug_hints) = barriers;
@@ -186,7 +186,7 @@ pub(super) fn coalesce_loop_state_temps(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     nested_carried_parents: &[Option<PhiId>],
-    binding_barriers: (&[bool], &[Option<DebugBindingHint>]),
+    binding_barriers: (&[bool], &[Option<DebugBindingHint<'_>>]),
     binding_temps: (&mut [TempId], &mut [TempId]),
 ) {
     let (numeric_binding_phis, phi_debug_hints) = binding_barriers;
@@ -583,24 +583,21 @@ pub(super) struct NumericBindingPhiFacts {
 /// capture 所有权需要识别全部 exact header phi；只有 Structure 已冻结为 elided target 的
 /// phi 才能把读取直接绑定到循环语法 local。寄存器相同不足以建立任一别名。
 pub(super) fn numeric_for_binding_phis(plan: &StructurePlan) -> NumericBindingPhiFacts {
-    let mut phi_by_block_reg = BTreeMap::<(BlockRef, Reg), Option<PhiId>>::new();
-    for phi in plan.phis() {
-        phi_by_block_reg
-            .entry((phi.block, phi.reg))
-            .and_modify(|candidate| *candidate = None)
-            .or_insert(Some(phi.phi));
-    }
-
     let mut bindings = vec![false; plan.phis().len()];
     let mut source_direct = vec![false; plan.phis().len()];
     for (phi, direct) in plan.loops().filter_map(|(_, loop_plan)| {
         let LoopSourceBindings::Numeric(binding) = loop_plan.source_bindings? else {
             return None;
         };
-        let phi = phi_by_block_reg
-            .get(&(loop_plan.header, binding))
-            .copied()
-            .flatten()?;
+        let mut candidates = plan
+            .phis_in_block(loop_plan.header)
+            .iter()
+            .filter_map(|&phi| plan.phi_plan(phi))
+            .filter(|phi| phi.reg == binding);
+        let phi = candidates.next()?.phi;
+        if candidates.next().is_some() {
+            return None;
+        }
         let direct = loop_plan
             .value_actions
             .as_ref()
@@ -614,73 +611,6 @@ pub(super) fn numeric_for_binding_phis(plan: &StructurePlan) -> NumericBindingPh
         bindings,
         source_direct,
     }
-}
-
-pub(super) fn region_blocks(plan: &StructurePlan, region: RegionId) -> Vec<BlockRef> {
-    fn collect(plan: &StructurePlan, region: RegionId, blocks: &mut Vec<BlockRef>) {
-        let Some(node) = plan.region(region) else {
-            return;
-        };
-        match node {
-            RegionPlan::Block { block, .. } => {
-                blocks.push(*block);
-            }
-            RegionPlan::Sequence { children, .. } => {
-                for child in children {
-                    collect(plan, *child, blocks);
-                }
-            }
-            RegionPlan::Branch {
-                condition,
-                then_arm,
-                else_arm,
-                ..
-            } => {
-                collect(plan, *condition, blocks);
-                collect(plan, *then_arm, blocks);
-                if let Some(else_arm) = else_arm {
-                    collect(plan, *else_arm, blocks);
-                }
-            }
-            RegionPlan::ValueDecision { plan: decision, .. } => {
-                if let Some(decision) = plan.value_decision(*decision) {
-                    blocks.extend(decision.blocks());
-                }
-            }
-            RegionPlan::Loop {
-                preheader,
-                control,
-                body,
-                normal_tail,
-                ..
-            } => {
-                if let Some(preheader) = preheader {
-                    collect(plan, *preheader, blocks);
-                }
-                collect(plan, *control, blocks);
-                collect(plan, *body, blocks);
-                if let Some(normal_tail) = normal_tail {
-                    collect(plan, *normal_tail, blocks);
-                }
-            }
-            RegionPlan::Unstructured { layout, .. } => {
-                for item in layout {
-                    match item {
-                        UnstructuredLayoutItem::Block(block) => {
-                            blocks.push(*block);
-                        }
-                        UnstructuredLayoutItem::Region(child) => collect(plan, *child, blocks),
-                    }
-                }
-            }
-        }
-    }
-
-    let mut blocks = Vec::new();
-    collect(plan, region, &mut blocks);
-    blocks.sort_unstable();
-    blocks.dedup();
-    blocks
 }
 
 pub(super) fn phi_incoming_is_normal(disposition: PhiIncomingDisposition) -> bool {

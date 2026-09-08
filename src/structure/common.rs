@@ -71,8 +71,22 @@ pub struct DebugBindingConflict {
 /// 一个 proto 已冻结的 debug binding 映射及被拒绝的冲突证据。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DebugBindingFacts {
-    pub accepted: Vec<DebugBindingFact>,
+    // 生产者按唯一 SsaValue 排序，后层只借用，不能破坏二分查询的不变量。
+    pub(super) accepted: Vec<DebugBindingFact>,
     pub conflicts: Vec<DebugBindingConflict>,
+}
+
+impl DebugBindingFacts {
+    pub fn accepted(&self) -> &[DebugBindingFact] {
+        &self.accepted
+    }
+
+    pub fn for_value(&self, value: SsaValue) -> Option<&DebugBindingFact> {
+        self.accepted
+            .binary_search_by_key(&value, |fact| fact.value)
+            .ok()
+            .map(|index| &self.accepted[index])
+    }
 }
 
 impl StructureFacts {

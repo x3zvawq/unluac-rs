@@ -238,29 +238,14 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let intervals = &self.lowering.bindings.lexical_scopes;
         let candidates = &intervals[intervals.partition_point(|scope| scope.start < start)
             ..intervals.partition_point(|scope| scope.start < end)];
-        let protocols = if candidates.is_empty() {
-            Vec::new()
-        } else {
-            (start..end)
-                .filter_map(|index| {
-                    self.lowering
-                        .global_decls
-                        .owner(InstrRef(index))
-                        .map(|protocol| (index, protocol.end))
-                })
-                .collect::<Vec<_>>()
-        };
-        let splits_protocol = |boundary| {
-            let before = protocols.partition_point(|&(owner, _)| owner < boundary);
-            before > 0 && protocols[before - 1].1 > boundary
-        };
+        let protocols = &self.lowering.global_decls;
         let mut starts = BTreeMap::<usize, Vec<usize>>::new();
         for scope in candidates {
             if scope.end <= end
                 && self.lowering.cfg.instr_to_block.get(scope.start) == Some(&block)
                 && self.lowering.cfg.instr_to_block.get(scope.end - 1) == Some(&block)
-                && !splits_protocol(scope.start)
-                && !splits_protocol(scope.end)
+                && !protocols.splits_protocol(start, scope.start)
+                && !protocols.splits_protocol(start, scope.end)
             {
                 starts.entry(scope.start).or_default().push(scope.end);
             }

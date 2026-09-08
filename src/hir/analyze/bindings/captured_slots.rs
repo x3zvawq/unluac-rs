@@ -1,5 +1,5 @@
 //! 收集闭包捕获槽目标、声明区域与 capture 后写入；依赖 CFG、slot epoch 和 region tree，
-//! 不负责 temp 映射；loop body block 列表由 bindings 入口共享，避免重复展开；例如把同一槽
+//! 不负责 temp 映射；loop body 块直接借用 Structure 的 containment 索引；例如把同一槽
 //! 的不同时代分成独立 local。capture 后写入按 slot/epoch 批量消费 GraphFacts 的 SCC
 //! 拓扑与前驱；例如无环块内先写后捕获不需要写回，回边上的同一次静态写则可能再次执行。
 
@@ -82,8 +82,6 @@ pub(super) struct CapturedSlotInputs<'a> {
     pub(super) epochs: &'a SlotEpochFacts,
     pub(super) child_mutable_upvalues: &'a [&'a [bool]],
     pub(super) numeric_binding_phis: &'a [bool],
-    /// 与 loop binding pass 共享的紧凑 body block 列表；每个 loop 只在 bindings 总入口展开一次。
-    pub(super) loop_body_blocks: &'a [Option<Vec<BlockRef>>],
 }
 
 pub(super) fn collect_captured_slot_targets(
@@ -101,16 +99,14 @@ pub(super) fn collect_captured_slot_targets(
         epochs,
         child_mutable_upvalues,
         numeric_binding_phis,
-        loop_body_blocks,
     } = inputs;
     let mut slot_targets = BTreeMap::<CapturedSlotKey, CapturedSlotBinding>::new();
     let mut capture_targets = BTreeMap::new();
     let mut captured_uses = Vec::new();
     let mut loop_owned_slots = BTreeSet::new();
     for (loop_id, loop_plan) in structure.plan().loops() {
-        let Some(body_blocks) = loop_body_blocks
-            .get(loop_id.index())
-            .and_then(Option::as_ref)
+        let Some(body_blocks) = loop_body_region(structure.plan(), loop_id)
+            .map(|body| structure.plan().region_blocks(body))
         else {
             continue;
         };

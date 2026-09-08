@@ -379,6 +379,15 @@ pub(super) const REGRESSION_CASES_201_318: &[LuaCaseMatrixEntry] = &[
     )
     .with_options(LUAU_OPTIMIZED_OPTIONS),
     LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_288_luau_shared_proto_dag.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ignore_debug: true,
+        ..LUAU_OPTIMIZED_OPTIONS
+    }),
+    LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_289_luau_closure_creation_identity.lua",
         LUAU_ONLY,
     )

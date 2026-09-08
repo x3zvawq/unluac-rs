@@ -1,7 +1,7 @@
 //! 这个文件负责串起 Naming 主流程。
 //!
 //! Naming 现在已经拆成多个关注点模块：
-//! - evidence：从 parser/HIR 收集辅助证据
+//! - evidence：从 HIR 收集捕获来源
 //! - lexical：从 AST 重建定义点可见域
 //! - validate：保证 Readability 已经收敛到 Naming 可消费的边界
 //! - hints：从 AST 结构收集稳定 hint
@@ -38,8 +38,7 @@ pub(crate) fn assign_names(
 /// 对外的 Naming 显式事实入口。
 ///
 /// 这个 convenience wrapper 内部先收集 evidence 再做分配。
-/// 分配核心已经下沉到 `assign_names_with_evidence()`：后者只消费预先构建好的
-/// Naming 证据，不再直接碰 parser 原始结构。
+/// 分配核心消费捕获证据与 HIR 已提取的调试提示，不接触 parser 原始结构。
 pub fn assign_name_map(
     module: &AstModule,
     hir: &HirModule,
@@ -51,8 +50,8 @@ pub fn assign_name_map(
 
 /// Naming 核心入口。
 ///
-/// 这里仍然保留 `HIR`，因为 lexical context、AST facts、readability 验证和 hints
-/// 这些结构事实当前都是真实依赖 HIR 的；这比把它们偷偷塞回 evidence 里更诚实。
+/// `evidence` 必须对应当前 HIR 的捕获身份；debug 提示直接消费传入的 HIR。
+/// lexical context、AST facts、readability 验证和 hints 同样依赖该 HIR。
 pub fn assign_names_with_evidence(
     module: &AstModule,
     hir: &HirModule,
@@ -75,7 +74,7 @@ pub fn assign_names_with_evidence(
             .expect("lexical contexts should cover every HIR proto");
         functions.push(assign_names_for_function(FunctionAssignContext {
             proto,
-            evidence: &evidence.functions[proto.id.index()],
+            capture_evidence: evidence.functions[proto.id.index()].as_ref(),
             hints: &hints[proto.id.index()],
             ast_facts: &ast_facts.functions[proto.id.index()],
             module_ast_facts: &ast_facts,

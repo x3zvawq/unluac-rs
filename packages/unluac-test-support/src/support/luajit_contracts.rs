@@ -1,6 +1,8 @@
-//! 校验 LuaJIT 内建与方法调用协议及特殊 island 合同；依赖 lowered proto，不负责通用反编译断言；例如识别大参数方法调用是否绕过错误 lowering。
+//! 校验 LuaJIT 内建与方法调用协议及特殊 island 合同；原始编码边界读取 RawProto，运行协议读取 LoweredProto。
+//! 例如大键方法样例先证明原 KGC 池跨过 8bit 边界，再检查归一化调用签名，不把字面量池长度当成 KGC 数量。
 
 use super::*;
+use unluac::parser::{RawChunk, RawProto};
 
 pub(super) fn assert_ignore_debug_keeps_parser_validation(
     entry: &LuaCaseManifestEntry,
@@ -222,7 +224,7 @@ pub(super) fn assert_luajit_method_protocol_contract(
         ));
     }
 
-    let lowered = lower_luajit_method_fixture(
+    let (raw, lowered) = lower_luajit_method_fixture(
         entry,
         suite_label,
         "large-method-fixture",
@@ -233,7 +235,14 @@ pub(super) fn assert_luajit_method_protocol_contract(
         .main
         .children
         .iter()
-        .map(|proto| large_method_signature(proto))
+        .enumerate()
+        .map(|(index, proto)| {
+            raw.main
+                .common
+                .children
+                .get(index)
+                .and_then(|raw_proto| large_method_signature(raw_proto, proto))
+        })
         .collect::<Vec<_>>();
     if signatures.len() != 2
         || !signatures.contains(&Some(LargeMethodSignature::Method))
@@ -244,7 +253,7 @@ pub(super) fn assert_luajit_method_protocol_contract(
             format!("large-key method/dot LIR signatures mismatch: {signatures:?}"),
         ));
     }
-    let bypassed = lower_luajit_method_fixture(
+    let (_, bypassed) = lower_luajit_method_fixture(
         entry,
         suite_label,
         "bypassed-method-fixture",
@@ -264,7 +273,7 @@ pub(super) fn lower_luajit_method_fixture(
     suite_label: &str,
     artifact_label: &str,
     argument: &str,
-) -> Result<LoweredChunk, TestFailure> {
+) -> Result<(RawChunk, LoweredChunk), TestFailure> {
     let source = repo_root().join(entry.path);
     let artifact = suite_artifact_path(suite_label, entry, artifact_label, "luajit");
     let raw_dump = artifact.with_extension("raw.luajit");
@@ -293,13 +302,16 @@ pub(super) fn lower_luajit_method_fixture(
     })?;
     let mut options = decompile_options(entry);
     options.target_stage = DecompileStage::Transformer;
-    decompile(&dump, options)
+    let state = decompile(&dump, options)
         .map_err(|error| luajit_method_contract_failure(entry, error.to_string()))?
-        .state
-        .lowered
-        .ok_or_else(|| {
-            luajit_method_contract_failure(entry, "method fixture produced no lowered chunk")
-        })
+        .state;
+    let raw = state.raw_chunk.ok_or_else(|| {
+        luajit_method_contract_failure(entry, "method fixture produced no raw chunk")
+    })?;
+    let lowered = state.lowered.ok_or_else(|| {
+        luajit_method_contract_failure(entry, "method fixture produced no lowered chunk")
+    })?;
+    Ok((raw, lowered))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -308,8 +320,11 @@ pub(super) enum LargeMethodSignature {
     Dot,
 }
 
-pub(super) fn large_method_signature(proto: &LoweredProto) -> Option<LargeMethodSignature> {
-    let DialectConstPoolExtra::LuaJit(constants) = &proto.constants.extra else {
+pub(super) fn large_method_signature(
+    raw: &RawProto,
+    proto: &LoweredProto,
+) -> Option<LargeMethodSignature> {
+    let DialectConstPoolExtra::LuaJit(constants) = &raw.common.constants.extra else {
         return None;
     };
     if constants.kgc_entries.len() <= u8::MAX as usize {

@@ -49,27 +49,18 @@ pub(super) enum LexicalScopeStep {
 pub(super) struct LexicalScopeIndex<'a> {
     structure: &'a StructurePlan,
     states: Vec<LexicalScopeState>,
-    ranks: Vec<usize>,
 }
 
 impl<'a> LexicalScopeIndex<'a> {
     pub(super) fn new(structure: &'a StructurePlan) -> Self {
-        let mut ranks = vec![usize::MAX; structure.regions().len()];
-        for (rank, region) in structure.region_postorder().iter().copied().enumerate() {
-            ranks[region.index()] = rank;
-        }
         Self {
             structure,
-            states: vec![LexicalScopeState::Unknown; ranks.len()],
-            ranks,
+            states: vec![LexicalScopeState::Unknown; structure.regions().len()],
         }
     }
 
     pub(super) fn rank(&self, region: RegionId) -> Option<usize> {
-        self.ranks
-            .get(region.index())
-            .copied()
-            .filter(|rank| *rank != usize::MAX)
+        self.structure.region_postorder_rank(region)
     }
 
     pub(super) fn instr_scope(&mut self, instr: InstrRef, cfg: &Cfg) -> Option<RegionId> {

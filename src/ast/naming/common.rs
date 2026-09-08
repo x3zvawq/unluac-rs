@@ -87,34 +87,17 @@ impl NameMap {
     }
 }
 
-/// 所有函数的辅助证据。
+/// 当前 HIR 模块的捕获来源快照；调试提示直接从同一 HIR 查询。
 #[derive(Debug, Clone, Default)]
 pub struct NamingEvidence {
-    pub(super) functions: Vec<FunctionNamingEvidence>,
-}
-
-/// 单个函数的命名证据。
-#[derive(Debug, Clone, Default)]
-pub(super) struct FunctionNamingEvidence {
-    pub(super) param_debug_names: Vec<Option<String>>,
-    pub(super) local_debug_names: Vec<Option<String>>,
-    pub(super) upvalue_debug_names: Vec<Option<String>>,
-    pub(super) upvalue_capture_sources: Vec<Option<CapturedBinding>>,
-    pub(super) temp_debug_names: Vec<Option<String>>,
-}
-
-/// upvalue 捕获自父函数哪个绑定。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CapturedBinding {
-    pub(super) parent: HirProtoRef,
-    pub(super) binding: crate::hir::HirBinding,
+    pub(super) functions: Vec<Option<ClosureCaptureEvidence>>,
 }
 
 /// 单次 closure 观察得到的 capture 证据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ClosureCaptureEvidence {
     pub(super) parent: HirProtoRef,
-    pub(super) captures: Vec<CapturedBinding>,
+    pub(super) captures: Vec<crate::hir::HirBinding>,
 }
 
 /// 从 AST 结构收集到的 naming hint。

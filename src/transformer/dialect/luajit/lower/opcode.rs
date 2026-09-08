@@ -360,7 +360,7 @@ impl<'a> ProtoLowerer<'a> {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
                     let dst = reg_from_u8(a);
                     self.invalidate_written_reg(dst);
-                    let table = self.table_const(raw_pc, usize::from(d))?.clone();
+                    let table = self.table_const(raw_pc, usize::from(d))?;
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],

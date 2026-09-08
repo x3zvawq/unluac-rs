@@ -10,8 +10,8 @@ use super::debug_locals::DebugLocals;
 pub(crate) use super::debug_locals::normalize_debug_locals;
 
 use crate::parser::{
-    ChunkHeader, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawConstPool,
-    RawDebugInfo, RawProto, RawString, RawUpvalueInfo,
+    ChunkHeader, Origin, ProtoFrameInfo, ProtoLineRange, ProtoSignature, RawLiteralConst, RawProto,
+    RawString,
 };
 
 /// transformer 层的根对象，保留 chunk 级元数据和主 proto。
@@ -31,19 +31,20 @@ pub struct LoweredProto {
     pub line_range: ProtoLineRange,
     pub signature: ProtoSignature,
     pub frame: ProtoFrameInfo,
-    pub constants: RawConstPool,
-    pub upvalues: RawUpvalueInfo,
+    /// ConstRef 的完整字面量域，保留原顺序；方言池条目已经降低为指令和模板事实。
+    pub constants: Vec<RawLiteralConst>,
+    /// 本 proto 的 upvalue 身份域；描述符已经投影为 Closure 的显式 Capture。
+    pub upvalue_count: u8,
     /// 当前 proto 中由 VM 绑定为词法环境的 upvalue，按 upvalue 索引升序保存。
     ///
     /// 这是 PUC Lua 5.2+ 的 cell 身份，不等同于 Lua 5.1/LuaJIT/Luau 全局指令使用的
     /// 隐式环境 base；后层必须继续把它当作普通 upvalue identity 参与读写与 capture。
     pub environment_upvalues: Vec<UpvalueRef>,
-    pub debug_info: RawDebugInfo,
+    /// 按 UpvalueRef 索引的原始名字；行号和 local 事实分别属于 LoweringMap 与 DebugLocals。
+    pub upvalue_debug_names: Vec<Option<RawString>>,
     /// 已按方言协议归一到寄存器与生命周期的局部变量调试事实。
     pub debug_locals: DebugLocals,
-    /// Lowered child templates are immutable.  `Arc` keeps closure instances cheap:
-    /// creating a second closure from one child copies only the current proto
-    /// payload and shares its descendants instead of recursively cloning a subtree.
+    /// 不可变 child 模板通过 Arc 共享；新的闭包实例只追加指针，不复制 proto 或子树。
     pub children: Vec<Arc<LoweredProto>>,
     pub instrs: Vec<LowInstr>,
     pub lowering_map: LoweringMap,

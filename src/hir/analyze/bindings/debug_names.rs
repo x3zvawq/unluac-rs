@@ -1,4 +1,6 @@
-//! 查询指令、块入口和区域内寄存器的 debug local 名称；依赖 debug scope 与 SSA 名称索引，不负责分配 LocalId；例如为唯一活跃 scope 提供命名 hint。
+//! 查询指令、块入口和区域内寄存器的 debug local 名称；借用 debug scope 并查询 Structure 的 SSA 身份，不负责分配 LocalId；例如为唯一活跃 scope 提供命名 hint。
+
+//! 名称仅在最终写入 HIR 提示时解码；屏障与存在性查询不构造 String。
 
 use super::*;
 
@@ -23,14 +25,14 @@ pub(super) fn debug_local_name_for_reg_at_instr(
     reg: Reg,
     instr: InstrRef,
 ) -> Option<String> {
-    debug_local_hint_for_reg_at_instr(proto, reg, instr).map(|hint| hint.name)
+    debug_local_hint_for_reg_at_instr(proto, reg, instr).map(|hint| decode_raw_string(hint.name))
 }
 
 pub(super) fn debug_local_hint_for_reg_at_instr(
     proto: &LoweredProto,
     reg: Reg,
     instr: InstrRef,
-) -> Option<DebugBindingHint> {
+) -> Option<DebugBindingHint<'_>> {
     let pc = proto
         .lowering_map
         .pc_map()
@@ -46,15 +48,16 @@ pub(super) fn debug_local_name_for_reg_at_block_entry(
     block: crate::structure::BlockRef,
     reg: Reg,
 ) -> Option<String> {
-    debug_local_hint_for_reg_at_block_entry(proto, cfg, block, reg).map(|hint| hint.name)
+    debug_local_hint_for_reg_at_block_entry(proto, cfg, block, reg)
+        .map(|hint| decode_raw_string(hint.name))
 }
 
-pub(super) fn debug_local_hint_for_reg_at_block_entry(
-    proto: &LoweredProto,
+pub(super) fn debug_local_hint_for_reg_at_block_entry<'a>(
+    proto: &'a LoweredProto,
     cfg: &Cfg,
     block: crate::structure::BlockRef,
     reg: Reg,
-) -> Option<DebugBindingHint> {
+) -> Option<DebugBindingHint<'a>> {
     let instrs = cfg.blocks[block.index()].instrs;
     if instrs.is_empty() {
         return None;
@@ -91,40 +94,32 @@ pub(super) fn debug_local_name_for_reg_at_pc(
     reg: Reg,
     pc: u32,
 ) -> Option<String> {
-    debug_local_hint_for_reg_at_pc(proto, reg, pc).map(|hint| hint.name)
+    debug_local_hint_for_reg_at_pc(proto, reg, pc).map(|hint| decode_raw_string(hint.name))
 }
 
 pub(super) fn debug_local_hint_for_reg_at_pc(
     proto: &LoweredProto,
     reg: Reg,
     pc: u32,
-) -> Option<DebugBindingHint> {
+) -> Option<DebugBindingHint<'_>> {
     proto
         .debug_locals
         .source_at(reg, pc)
         .map(|(scope, local)| DebugBindingHint {
             scope,
-            name: decode_raw_string(&local.name),
+            name: &local.name,
         })
 }
 
-pub(super) fn debug_names_by_ssa(
-    proto: &LoweredProto,
+pub(super) fn debug_local_hint_for_ssa<'a>(
+    proto: &'a LoweredProto,
     structure: &ReadyStructureFacts,
-) -> BTreeMap<SsaValue, DebugBindingHint> {
-    structure
-        .debug_bindings()
-        .accepted
-        .iter()
-        .filter_map(|fact| {
-            let local = proto.debug_locals.get(fact.scope)?;
-            local.is_source().then_some((
-                fact.value,
-                DebugBindingHint {
-                    scope: fact.scope,
-                    name: decode_raw_string(&local.name),
-                },
-            ))
-        })
-        .collect()
+    value: SsaValue,
+) -> Option<DebugBindingHint<'a>> {
+    let fact = structure.debug_bindings().for_value(value)?;
+    let local = proto.debug_locals.get(fact.scope)?;
+    local.is_source().then_some(DebugBindingHint {
+        scope: fact.scope,
+        name: &local.name,
+    })
 }

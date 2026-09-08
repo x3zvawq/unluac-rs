@@ -3,6 +3,7 @@
 //! 这些类型需要同时被 decompile 入口、renderer 和调试输出复用，所以单独抽到这里，
 //! 避免把“生成选项”“宿主构造器配置”“注释元信息”和“最终产物”散落在 emit/render 两边。
 
+use crate::LuaString;
 use crate::ast::DecompileDialect;
 use crate::hir::{HirModule, HirProtoRef, ProtoLineRange, ProtoSignature};
 use strum_macros::{Display, EnumString, IntoStaticStr};
@@ -127,7 +128,7 @@ impl GenerateCommentMetadata {
 /// chunk 级注释要展示的元信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateChunkCommentMetadata {
-    pub file_name: Option<String>,
+    pub file_name: Option<LuaString>,
     pub encoding: String,
 }
 
@@ -135,7 +136,7 @@ pub struct GenerateChunkCommentMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateFunctionCommentMetadata {
     pub function: HirProtoRef,
-    pub source: Option<String>,
+    pub source: Option<LuaString>,
     pub line_range: ProtoLineRange,
     pub signature: ProtoSignature,
     pub local_count: usize,
@@ -181,4 +182,56 @@ pub enum TableStyle {
     #[default]
     Balanced,
     Expanded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompile::{DecompileOptions, DecompileStage, decompile};
+
+    #[test]
+    fn source_storage_is_shared_through_hir_and_comment_metadata() {
+        let bytes = unluac_test_support::compile_lua_case_with_debug(
+            "lua5.4",
+            "tests/unit-case/common_09_method_and_self.lua",
+        );
+        let result = decompile(
+            &bytes,
+            DecompileOptions {
+                target_stage: DecompileStage::Hir,
+                ..DecompileOptions::default()
+            },
+        )
+        .unwrap();
+        let raw_source = result
+            .state
+            .raw_chunk
+            .as_ref()
+            .unwrap()
+            .main
+            .common
+            .source
+            .as_ref()
+            .unwrap();
+        let raw_text = raw_source.text.as_ref().unwrap().value.as_ref();
+        let hir = result.state.hir.as_ref().unwrap();
+        assert!(hir.protos.len() > 1);
+        let metadata = GenerateCommentMetadata::from_hir(hir, "auto");
+        let sources = hir
+            .protos
+            .iter()
+            .map(|proto| proto.source.as_ref().unwrap())
+            .chain(
+                metadata
+                    .functions
+                    .iter()
+                    .map(|proto| proto.source.as_ref().unwrap()),
+            )
+            .chain(metadata.chunk.file_name.as_ref());
+        for source in sources {
+            assert!(std::ptr::eq(source.as_bytes(), raw_source.bytes.as_ref()));
+            assert!(std::ptr::eq(source.decoded_text().unwrap(), raw_text));
+            assert_eq!(source.display_text(), raw_text);
+        }
+    }
 }

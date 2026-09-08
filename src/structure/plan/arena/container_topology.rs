@@ -225,7 +225,7 @@ pub(super) fn flatten_nested_unstructured_specs(
         }
     };
 
-    let old_islands = dispositions.islands.clone();
+    let old_islands = &dispositions.islands;
     for disposition in &mut dispositions.residuals {
         let old = match *disposition {
             AggregateSeedDisposition::Residual(index) => index,

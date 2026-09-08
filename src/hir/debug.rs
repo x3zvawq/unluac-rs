@@ -107,7 +107,11 @@ pub(crate) fn dump_hir_module(
         let _ = writeln!(
             output,
             "  source={} lines={}..{} vararg={} vararg-local={}",
-            proto.source.as_deref().unwrap_or("-"),
+            proto
+                .source
+                .as_ref()
+                .map(|source| source.display_text())
+                .unwrap_or_else(|| "-".into()),
             proto.line_range.defined_start,
             proto.line_range.defined_end,
             proto.signature.is_vararg,

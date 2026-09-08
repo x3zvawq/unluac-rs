@@ -9,7 +9,7 @@ use crate::hir::visit::{HirVisitor, visit_proto};
 use crate::hir::{HirCapture, HirClosureExpr, HirExpr, HirModule, HirProtoRef};
 
 use super::super::NamingError;
-use super::super::common::{CapturedBinding, ClosureCaptureEvidence};
+use super::super::common::ClosureCaptureEvidence;
 
 pub(super) fn build_capture_evidence(
     hir: &HirModule,
@@ -75,10 +75,7 @@ fn record_closure_capture_evidence(
         captures: closure
             .captures
             .iter()
-            .map(|capture| CapturedBinding {
-                parent,
-                binding: capture.binding,
-            })
+            .map(|capture| capture.binding)
             .collect(),
     };
 

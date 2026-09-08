@@ -1,4 +1,6 @@
-//! 把 fixed/phi temp 投影到捕获槽绑定并生成 local 空声明；依赖捕获槽目标与 slot epoch，不负责 debug 命名。例如参数先 capture 后赋值仍写回 ParamId，非参数槽使用已分配的 LocalId。
+//! 把 fixed/phi temp 投影到捕获槽绑定并生成 local 空声明；依赖捕获槽目标与 slot epoch，
+//! 直接消费 CFG 指令归属和 Structure 块内 phi 索引，不负责 debug 命名。
+//! 例如参数先 capture 后赋值仍写回 ParamId，非参数槽使用已分配的 LocalId。
 
 use super::*;
 
@@ -59,18 +61,6 @@ pub(super) fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> 
         .chain(captured_slots.region_local_decls.values().flatten())
         .copied()
         .collect::<BTreeSet<_>>();
-    let mut phis_by_instr = vec![Vec::<(crate::structure::PhiId, Reg)>::new(); proto.instrs.len()];
-    for phi in plan
-        .phis()
-        .filter(|phi| phi_participates_in_normal_binding(phi))
-    {
-        let instrs = cfg.blocks[phi.block.index()].instrs;
-        if instrs.is_empty() {
-            continue;
-        }
-        phis_by_instr[instrs.start.index()].push((phi.phi, phi.reg));
-    }
-
     for (instr_index, instr) in proto.instrs.iter().enumerate() {
         if let LowInstr::Closure(closure) = instr {
             for capture in &closure.captures {
@@ -86,7 +76,18 @@ pub(super) fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> 
             }
         }
 
-        for (phi_id, reg) in phis_by_instr[instr_index].iter().copied() {
+        let block = cfg.instr_to_block[instr_index];
+        let phis = if cfg.blocks[block.index()].instrs.start == InstrRef(instr_index) {
+            plan.phis_in_block(block)
+        } else {
+            &[]
+        };
+        for phi in phis
+            .iter()
+            .filter_map(|&phi| plan.phi_plan(phi))
+            .filter(|phi| phi_participates_in_normal_binding(phi))
+        {
+            let (phi_id, reg) = (phi.phi, phi.reg);
             if numeric_binding_phis
                 .get(phi_id.index())
                 .copied()
