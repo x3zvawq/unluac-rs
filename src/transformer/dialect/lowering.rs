@@ -285,42 +285,24 @@ struct PendingMethodHint {
 #[derive(Debug, Clone)]
 pub(crate) struct WordCodeIndex {
     raw_pc_to_index: Vec<Option<usize>>,
-    raw_word_count: usize,
 }
 
 impl WordCodeIndex {
-    pub(crate) fn from_raw<RawPcAt, WordLen>(
-        raw: &RawProto,
-        raw_pc_at: RawPcAt,
-        word_len: WordLen,
-    ) -> Self
-    where
-        RawPcAt: Fn(&RawInstr) -> u32,
-        WordLen: Fn(&RawInstr) -> u8,
-    {
-        let mut raw_word_count = 0_usize;
-
-        let raw_pcs = raw
+    pub(crate) fn from_raw(raw: &RawProto) -> Self {
+        let raw_word_count = raw
             .common
             .instructions
             .iter()
-            .enumerate()
-            .map(|(index, instr)| {
-                let pc = raw_pc_at(instr);
-                raw_word_count = raw_word_count.max((pc + u32::from(word_len(instr))) as usize);
-                (pc, index)
-            })
-            .collect::<Vec<_>>();
+            .map(|instr| (instr_pc(instr) + u32::from(instr_word_len(instr))) as usize)
+            .max()
+            .unwrap_or(0);
 
         let mut raw_pc_to_index = vec![None; raw_word_count];
-        for (pc, index) in raw_pcs {
-            raw_pc_to_index[pc as usize] = Some(index);
+        for (index, instr) in raw.common.instructions.iter().enumerate() {
+            raw_pc_to_index[instr_pc(instr) as usize] = Some(index);
         }
 
-        Self {
-            raw_pc_to_index,
-            raw_word_count,
-        }
+        Self { raw_pc_to_index }
     }
 
     pub(crate) fn raw_index_at_pc(&self, target_pc: u32) -> Option<usize> {
@@ -335,12 +317,19 @@ impl WordCodeIndex {
         raw_pc: u32,
         target_pc: u32,
     ) -> Result<usize, TransformError> {
-        ensure_targetable_pc(
-            raw_pc,
-            target_pc,
-            self.raw_word_count,
-            &self.raw_pc_to_index,
-        )
+        if target_pc as usize >= self.raw_pc_to_index.len() {
+            return Err(TransformError::InvalidJumpTarget {
+                raw_pc,
+                target_raw: target_pc as usize,
+                instr_count: self.raw_pc_to_index.len(),
+            });
+        }
+
+        self.raw_index_at_pc(target_pc)
+            .ok_or(TransformError::UntargetableRawInstruction {
+                raw_pc,
+                target_raw: target_pc as usize,
+            })
     }
 
     pub(crate) fn ensure_valid_jump_pc(
@@ -348,11 +337,11 @@ impl WordCodeIndex {
         raw_pc: u32,
         target_pc: i64,
     ) -> Result<usize, TransformError> {
-        if target_pc < 0 || target_pc >= self.raw_word_count as i64 {
+        if target_pc < 0 || target_pc >= self.raw_pc_to_index.len() as i64 {
             return Err(TransformError::InvalidJumpTarget {
                 raw_pc,
                 target_raw: target_pc.max(0) as usize,
-                instr_count: self.raw_word_count,
+                instr_count: self.raw_pc_to_index.len(),
             });
         }
 
@@ -471,30 +460,6 @@ pub(crate) fn emit_pending_instr(
     emitted.push(EmittedInstr { raw_indices, instr });
     low_index
 }
-pub(crate) fn ensure_targetable_pc(
-    raw_pc: u32,
-    target_pc: u32,
-    raw_word_count: usize,
-    raw_pc_to_index: &[Option<usize>],
-) -> Result<usize, TransformError> {
-    if target_pc as usize >= raw_word_count {
-        return Err(TransformError::InvalidJumpTarget {
-            raw_pc,
-            target_raw: target_pc as usize,
-            instr_count: raw_word_count,
-        });
-    }
-
-    raw_pc_to_index
-        .get(target_pc as usize)
-        .copied()
-        .flatten()
-        .ok_or(TransformError::UntargetableRawInstruction {
-            raw_pc,
-            target_raw: target_pc as usize,
-        })
-}
-
 fn set_pending_method_hint(
     pending_methods: &mut [Option<PendingMethodHint>],
     callee: Reg,

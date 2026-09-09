@@ -3,14 +3,14 @@
 use super::*;
 
 pub(super) fn unique_branch_regions(
-    regions: &[BranchRegionFact],
-) -> Result<BTreeMap<super::super::BlockRef, &BranchRegionFact>, StructureError> {
+    regions: Vec<BranchRegionFact>,
+) -> Result<BTreeMap<super::super::BlockRef, BranchRegionFact>, StructureError> {
     let mut by_header = BTreeMap::new();
     for region in regions {
-        if by_header.insert(region.header, region).is_some() {
+        let header = region.header;
+        if by_header.insert(header, region).is_some() {
             return Err(StructureError::invalid(format!(
-                "branch {} has multiple region facts",
-                region.header
+                "branch {header} has multiple region facts"
             )));
         }
     }
@@ -18,9 +18,9 @@ pub(super) fn unique_branch_regions(
 }
 
 pub(super) fn unique_branch_value_merges(
-    candidates: &[BranchValueMergeCandidate],
+    candidates: Vec<BranchValueMergeCandidate>,
 ) -> Result<
-    BTreeMap<(super::super::BlockRef, super::super::BlockRef), &BranchValueMergeCandidate>,
+    BTreeMap<(super::super::BlockRef, super::super::BlockRef), BranchValueMergeCandidate>,
     StructureError,
 > {
     let mut by_region = BTreeMap::new();
@@ -29,7 +29,7 @@ pub(super) fn unique_branch_value_merges(
         if by_region.insert(key, candidate).is_some() {
             return Err(StructureError::invalid(format!(
                 "branch {} -> {} has multiple value plans",
-                candidate.header, candidate.merge
+                key.0, key.1
             )));
         }
     }

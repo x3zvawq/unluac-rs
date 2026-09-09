@@ -266,7 +266,6 @@ pub(super) struct LoopPlanInput {
     pub(super) candidate: LoopCandidate,
     pub(super) condition: Option<ConditionPlanId>,
     pub(super) continuation: Option<BlockRef>,
-    pub(super) carried_values: Vec<LoopValueMerge>,
     /// 最终复合 condition 与 loop owner 共同证明的显式 continue transfer。
     pub(super) semantic_continue_edges: BTreeSet<EdgeRef>,
 }
@@ -338,9 +337,9 @@ pub struct LoopPlanData {
     pub(crate) exit_tail: Option<LoopExitTailPlan>,
     /// 当前 loop 的所有可完成出口都会继续 break 同一个祖先 loop。
     pub(crate) propagated_break: Option<RegionId>,
+    /// 唯一的 header 合流事实，供 phi ownership、循环协议和 HIR 捕获绑定共同查询。
     pub(crate) header_values: Vec<LoopValueMerge>,
     pub(crate) exit_values: Vec<LoopExitValueMergeCandidate>,
-    pub(crate) carried_values: Vec<LoopValueMerge>,
     /// phi/cleanup 冻结完成后写入的唯一 VM lowering 合同。
     pub(crate) protocol: Option<LoopVmProtocol>,
     pub(crate) value_actions: Option<LoopValueActions>,

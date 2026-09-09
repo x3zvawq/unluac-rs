@@ -186,7 +186,7 @@ impl<'a> ProtoLowerer<'a> {
 
     fn kgc_literal_const_ref(&self, raw_pc: u32, index: usize) -> Result<ConstRef, TransformError> {
         match self.kgc_entry(raw_pc, index)? {
-            LuaJitKgcEntry::Literal { literal_index, .. } => self.const_ref(raw_pc, *literal_index),
+            LuaJitKgcEntry::Literal { literal_index } => self.const_ref(raw_pc, *literal_index),
             _ => Err(TransformError::InvalidConstRef {
                 raw_pc,
                 const_index: index,

@@ -537,12 +537,16 @@ pub(super) fn build_absorbed_region_result_moves(
             .get(def_index)
             .copied()
             .ok_or_else(|| invalid(owner, "RegionResult Move has no fixed-temp binding"))?;
-        let instr_temps = lowering
-            .bindings
-            .instr_fixed_defs
+        let instr_defs = lowering
+            .dataflow
+            .instr_defs
             .get(definition.instr.index())
             .ok_or_else(|| invalid(owner, "RegionResult Move has no instruction-temp binding"))?;
-        if instr_temps.as_slice() != [fixed_temp] {
+        if !instr_defs
+            .iter()
+            .map(|def| lowering.bindings.fixed_temps[def.index()])
+            .eq([fixed_temp])
+        {
             return Err(invalid(
                 owner,
                 "RegionResult Move instruction binding contradicts its fixed temp",

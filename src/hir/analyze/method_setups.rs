@@ -62,7 +62,7 @@ pub(super) fn record_method_setup_protocols(
             {
                 return None;
             }
-            let [callee_temp] = bindings.instr_fixed_defs.get(get_ref.index())?.as_slice() else {
+            let [result_def] = dataflow.instr_defs.get(get_ref.index())?.as_slice() else {
                 return None;
             };
             let SsaValue::Def(prior_callee_def) = dataflow.def_overwritten_value(callee_def)?
@@ -90,7 +90,7 @@ pub(super) fn record_method_setup_protocols(
             Some((
                 call_ref,
                 get_ref,
-                *callee_temp,
+                bindings.fixed_temps[result_def.index()],
                 prior_callee_root_temp,
                 crate::LuaString::from_raw(raw_key),
             ))

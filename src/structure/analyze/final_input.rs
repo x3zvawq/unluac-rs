@@ -1,19 +1,20 @@
 //! 汇总冻结最终 StructurePlan 所需的候选与边界；依赖各专题选择结果，不负责构建区域 arena；例如为 branch、loop 和 condition 建立稳定输入。
+//! 候选在最后一次选择查询后移交载荷；branch 提取保证 header 唯一，因此对应边界和值合流事实各消费一次。
 
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn final_plan_input(
-    branches: &[BranchCandidate],
-    branch_regions: &[BranchRegionFact],
-    branch_value_merges: &[BranchValueMergeCandidate],
-    loops: &[LoopCandidate],
+    branches: Vec<BranchCandidate>,
+    branch_regions: Vec<BranchRegionFact>,
+    branch_value_merges: Vec<BranchValueMergeCandidate>,
+    loops: Vec<LoopCandidate>,
     condition_candidates: &[ShortCircuitCandidate],
     value_candidates: &[ShortCircuitCandidate],
     closed_control_dags: &[ClosedControlDagEvidence],
-    residual_transfers: &[ResidualTransferEvidence],
-    regions: &[RegionFact],
-    scopes: &[ScopePlan],
+    residual_transfers: Vec<ResidualTransferEvidence>,
+    regions: Vec<RegionFact>,
+    scopes: Vec<ScopePlan>,
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
@@ -21,51 +22,47 @@ pub(super) fn final_plan_input(
     exit_block: super::super::BlockRef,
     caps: ControlFlowCaps,
 ) -> Result<FinalPlanInput, StructureError> {
-    let branch_regions = unique_branch_regions(branch_regions)?;
-    let branch_value_merges = unique_branch_value_merges(branch_value_merges)?;
+    let mut branch_regions = unique_branch_regions(branch_regions)?;
+    let mut branch_value_merges = unique_branch_value_merges(branch_value_merges)?;
     let (conditions, condition_by_header) = selected_conditions(ConditionSelectionInput {
         proto,
         cfg,
         dataflow,
-        loops,
+        loops: &loops,
         caps,
-        branches,
+        branches: &branches,
         candidates: condition_candidates,
         closed_control_dags,
-        residual_transfers,
+        residual_transfers: &residual_transfers,
     })?;
     let value_decisions = selected_value_decisions(
         proto,
         cfg,
         dataflow,
-        loops,
-        residual_transfers,
+        &loops,
+        &residual_transfers,
         value_candidates,
     );
 
     let branches = branches
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|mut branch| {
             let condition = condition_by_header.get(&branch.header).copied();
             let condition_ref = condition.and_then(|id| conditions.get(id.index()));
-            let frozen_region = branch_regions
-                .get(&branch.header)
-                .map(|region| (*region).clone());
+            let frozen_region = branch_regions.remove(&branch.header);
             let boundary_changed = frozen_region
                 .as_ref()
                 .is_none_or(|region| region.single_pass_fence.is_none())
                 && normalize_branch_condition_boundary(
                     cfg,
                     graph_facts,
-                    loops,
+                    &loops,
                     &mut branch,
                     condition_ref,
                 );
             let value_merge = branch
                 .merge
-                .and_then(|merge| branch_value_merges.get(&(branch.header, merge)))
-                .map(|candidate| (*candidate).clone());
+                .and_then(|merge| branch_value_merges.remove(&(branch.header, merge)));
             let region = frozen_region
                 .filter(|region| !boundary_changed || Some(region.merge) == branch.merge)
                 .or_else(|| {
@@ -82,8 +79,7 @@ pub(super) fn final_plan_input(
         })
         .collect();
     let loops = loops
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|loop_| {
             let condition = required_loop_condition_header(cfg, &loop_)
                 .and_then(|header| condition_by_header.get(&header).copied());
@@ -96,7 +92,6 @@ pub(super) fn final_plan_input(
                 exit_block,
             );
             LoopPlanInput {
-                carried_values: loop_.header_value_merges.clone(),
                 condition,
                 continuation,
                 candidate: loop_,
@@ -105,8 +100,7 @@ pub(super) fn final_plan_input(
         })
         .collect();
     let unstructured = regions
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|fact| UnstructuredPlanData { fact, layout: None })
         .collect();
 
@@ -115,9 +109,9 @@ pub(super) fn final_plan_input(
         loops,
         conditions,
         value_decisions,
-        scopes: scopes.to_vec(),
+        scopes,
         unstructured,
-        residual_transfers: residual_transfers.to_vec(),
+        residual_transfers,
     })
 }
 

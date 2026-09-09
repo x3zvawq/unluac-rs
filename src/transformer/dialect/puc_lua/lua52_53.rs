@@ -4,7 +4,7 @@
 use crate::parser::{RawChunk, RawInstr, RawProto};
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
-    instr_pc, instr_word_len, next_raw_pc, raw_pc_at,
+    instr_pc, next_raw_pc, raw_pc_at,
 };
 use crate::transformer::dialect::puc_lua::{
     GenericForPairAsbxSpec, GenericForPairInfo as GenericForPair, HelperJumpAsbxSpec,
@@ -96,7 +96,7 @@ impl<'a> ProtoLowerer<'a> {
     fn new(raw: &'a RawProto, env_upvalues: Vec<bool>, dialect: FamilyDialect) -> Self {
         let raw_instr_count = raw.common.instructions.len();
         let method_slots = usize::from(raw.common.frame.max_stack_size).saturating_add(2);
-        let word_code_index = WordCodeIndex::from_raw(raw, instr_pc, instr_word_len);
+        let word_code_index = WordCodeIndex::from_raw(raw);
 
         Self {
             raw,

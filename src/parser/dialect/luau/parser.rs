@@ -547,7 +547,9 @@ impl LuauParserState {
         }
 
         Ok(RawConstPool {
-            common: RawConstPoolCommon { literals },
+            common: RawConstPoolCommon {
+                literals: literals.into(),
+            },
             extra: DialectConstPoolExtra::Luau(LuauConstPoolExtra { entries }),
         })
     }

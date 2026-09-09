@@ -12,7 +12,7 @@ use crate::value_semantics::table::allocation::TablePreallocation;
 use crate::parser::{Lua51Opcode, Lua51Operands, RawChunk, RawProto};
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
-    instr_pc, instr_word_len, next_raw_pc, raw_pc_at,
+    next_raw_pc, raw_pc_at,
 };
 use crate::transformer::dialect::puc_lua::{
     checked_const_ref, checked_proto_ref, checked_upvalue_ref, finish_lowered_proto,
@@ -71,7 +71,7 @@ impl<'a> ProtoLowerer<'a> {
         let raw_instr_count = raw.common.instructions.len();
         let method_slots = usize::from(raw.common.frame.max_stack_size).saturating_add(2);
 
-        let word_code_index = WordCodeIndex::from_raw(raw, instr_pc, instr_word_len);
+        let word_code_index = WordCodeIndex::from_raw(raw);
         Self {
             raw,
             lowering: PendingLoweringState::new(raw_instr_count),

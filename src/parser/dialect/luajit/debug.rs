@@ -7,12 +7,11 @@ use crate::debug::{
     format_breadcrumb, plan_proto_focus,
 };
 use crate::parser::debug::{format_literal, format_optional_source, write_elided_summary};
-use crate::parser::raw::{RawChunk, RawInstr};
+use crate::parser::raw::{RawChunk, RawInstr, RawLiteralConst};
 
 use super::raw::{
     LuaJitConstPoolExtra, LuaJitDebugExtra, LuaJitHeaderExtra, LuaJitKgcEntry,
-    LuaJitNumberConstEntry, LuaJitOperands, LuaJitProtoExtra, LuaJitTableConst, LuaJitTableLiteral,
-    LuaJitTableRecord,
+    LuaJitNumberConstEntry, LuaJitOperands, LuaJitProtoExtra, LuaJitTableConst, LuaJitTableRecord,
 };
 
 pub(crate) fn dump_chunk(
@@ -160,7 +159,7 @@ pub(crate) fn dump_chunk(
                 let _ = writeln!(
                     output,
                     "{indent}    kgc{index:03} {}",
-                    format_kgc_entry(entry)
+                    format_kgc_entry(entry, &proto.common.constants.common.literals)
                 );
             }
             for (index, entry) in knum_entries.iter().enumerate() {
@@ -214,14 +213,14 @@ fn format_operands(operands: &LuaJitOperands) -> String {
     }
 }
 
-fn format_kgc_entry(entry: &LuaJitKgcEntry) -> String {
+fn format_kgc_entry(entry: &LuaJitKgcEntry, literals: &[RawLiteralConst]) -> String {
     match entry {
         LuaJitKgcEntry::Child { child_proto_index } => format!("child proto={child_proto_index}"),
-        LuaJitKgcEntry::Table(table) => format!("table {}", format_table(table)),
-        LuaJitKgcEntry::Literal {
-            value,
-            literal_index,
-        } => format!("literal l{literal_index:03} {}", format_literal(value)),
+        LuaJitKgcEntry::Table(table) => format!("table {}", format_table(table, literals)),
+        LuaJitKgcEntry::Literal { literal_index } => format!(
+            "literal l{literal_index:03} {}",
+            format_literal(&literals[*literal_index])
+        ),
     }
 }
 
@@ -238,34 +237,30 @@ fn format_knum_entry(entry: &LuaJitNumberConstEntry) -> String {
     }
 }
 
-fn format_table(table: &LuaJitTableConst) -> String {
+fn format_table(table: &LuaJitTableConst, literals: &[RawLiteralConst]) -> String {
     let array = table
         .array
         .iter()
-        .map(format_table_literal)
+        .map(|&index| format_table_literal(index, literals))
         .collect::<Vec<_>>()
         .join(", ");
     let hash = table
         .hash
         .iter()
-        .map(format_record)
+        .map(|record| format_record(record, literals))
         .collect::<Vec<_>>()
         .join(", ");
     format!("array=[{array}] hash=[{hash}]")
 }
 
-fn format_record(record: &LuaJitTableRecord) -> String {
+fn format_record(record: &LuaJitTableRecord, literals: &[RawLiteralConst]) -> String {
     format!(
         "{} => {}",
-        format_table_literal(&record.key),
-        format_table_literal(&record.value)
+        format_table_literal(record.key, literals),
+        format_table_literal(record.value, literals)
     )
 }
 
-fn format_table_literal(literal: &LuaJitTableLiteral) -> String {
-    format!(
-        "l{:03} {}",
-        literal.literal_index,
-        format_literal(&literal.value)
-    )
+fn format_table_literal(index: usize, literals: &[RawLiteralConst]) -> String {
+    format!("l{index:03} {}", format_literal(&literals[index]))
 }

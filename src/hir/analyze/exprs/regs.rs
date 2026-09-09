@@ -94,11 +94,12 @@ fn closure_result_expr(
 ) -> HirExpr {
     lowering.dataflow.instr_defs[instr_ref.index()]
         .first()
-        .zip(lowering.bindings.instr_fixed_defs[instr_ref.index()].first())
-        .map(|(def, temp)| {
-            lowering
-                .bindings
-                .expr_for_fixed_def(block, lowering.dataflow.def_reg(*def), *temp)
+        .map(|def| {
+            lowering.bindings.expr_for_fixed_def(
+                block,
+                lowering.dataflow.def_reg(*def),
+                lowering.bindings.fixed_temps[def.index()],
+            )
         })
         .unwrap_or_else(|| {
             HirExpr::Unresolved(Box::new(HirUnresolvedExpr {

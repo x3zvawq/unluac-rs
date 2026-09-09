@@ -31,8 +31,8 @@ pub struct LoweredProto {
     pub line_range: ProtoLineRange,
     pub signature: ProtoSignature,
     pub frame: ProtoFrameInfo,
-    /// ConstRef 的完整字面量域，保留原顺序；方言池条目已经降低为指令和模板事实。
-    pub constants: Vec<RawLiteralConst>,
+    /// 与 Parser 共享的冻结字面量域，ConstRef 顺序不变；方言池条目已经降低为指令和模板事实。
+    pub constants: Arc<[RawLiteralConst]>,
     /// 本 proto 的 upvalue 身份域；描述符已经投影为 Closure 的显式 Capture。
     pub upvalue_count: u8,
     /// 当前 proto 中由 VM 绑定为词法环境的 upvalue，按 upvalue 索引升序保存。

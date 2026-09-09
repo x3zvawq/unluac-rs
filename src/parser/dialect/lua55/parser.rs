@@ -337,7 +337,9 @@ impl Lua55ParserState {
         )?;
 
         Ok(RawConstPool {
-            common: RawConstPoolCommon { literals },
+            common: RawConstPoolCommon {
+                literals: literals.into(),
+            },
             extra: DialectConstPoolExtra::Lua55,
         })
     }

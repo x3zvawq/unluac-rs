@@ -25,8 +25,8 @@ use crate::parser::strings::build_raw_string;
 
 use super::raw::{
     LuaJitConstPoolExtra, LuaJitDebugExtra, LuaJitHeaderExtra, LuaJitInstrExtra, LuaJitKgcEntry,
-    LuaJitNumberConstEntry, LuaJitOpcode, LuaJitProtoExtra, LuaJitTableConst, LuaJitTableLiteral,
-    LuaJitTableRecord, LuaJitUpvalueExtra,
+    LuaJitNumberConstEntry, LuaJitOpcode, LuaJitProtoExtra, LuaJitTableConst, LuaJitTableRecord,
+    LuaJitUpvalueExtra,
 };
 
 const LUAJIT_HEAD1: u8 = 0x1b;
@@ -445,12 +445,8 @@ impl LuaJitParser {
                 let bytes = reader.read_exact(string_len)?;
                 let raw = self.decode_raw_string(start + base_offset, string_len, bytes)?;
                 let literal_index = literals.len();
-                let value = RawLiteralConst::String(raw.clone());
-                literals.push(value.clone());
-                kgc_entries.push(LuaJitKgcEntry::Literal {
-                    value,
-                    literal_index,
-                });
+                literals.push(RawLiteralConst::String(raw));
+                kgc_entries.push(LuaJitKgcEntry::Literal { literal_index });
                 continue;
             }
 
@@ -472,33 +468,21 @@ impl LuaJitParser {
                 BCDUMP_KGC_I64 => {
                     let value = self.read_i64_from_uleb(reader)?;
                     let literal_index = literals.len();
-                    let literal = RawLiteralConst::Int64(value);
-                    literals.push(literal.clone());
-                    kgc_entries.push(LuaJitKgcEntry::Literal {
-                        value: literal,
-                        literal_index,
-                    });
+                    literals.push(RawLiteralConst::Int64(value));
+                    kgc_entries.push(LuaJitKgcEntry::Literal { literal_index });
                 }
                 BCDUMP_KGC_U64 => {
                     let value = self.read_u64_from_uleb(reader)?;
                     let literal_index = literals.len();
-                    let literal = RawLiteralConst::UInt64(value);
-                    literals.push(literal.clone());
-                    kgc_entries.push(LuaJitKgcEntry::Literal {
-                        value: literal,
-                        literal_index,
-                    });
+                    literals.push(RawLiteralConst::UInt64(value));
+                    kgc_entries.push(LuaJitKgcEntry::Literal { literal_index });
                 }
                 BCDUMP_KGC_COMPLEX => {
                     let real = self.read_f64_from_uleb(reader)?;
                     let imag = self.read_f64_from_uleb(reader)?;
                     let literal_index = literals.len();
-                    let literal = RawLiteralConst::Complex { real, imag };
-                    literals.push(literal.clone());
-                    kgc_entries.push(LuaJitKgcEntry::Literal {
-                        value: literal,
-                        literal_index,
-                    });
+                    literals.push(RawLiteralConst::Complex { real, imag });
+                    kgc_entries.push(LuaJitKgcEntry::Literal { literal_index });
                 }
                 value => {
                     return Err(ParseError::UnsupportedValue {
@@ -541,7 +525,9 @@ impl LuaJitParser {
 
         Ok(ParsedConstPool {
             const_pool: RawConstPool {
-                common: RawConstPoolCommon { literals },
+                common: RawConstPoolCommon {
+                    literals: literals.into(),
+                },
                 extra: DialectConstPoolExtra::LuaJit(LuaJitConstPoolExtra {
                     kgc_entries,
                     knum_entries,
@@ -571,7 +557,7 @@ impl LuaJitParser {
 
         for _ in 0..hash_len {
             let key = self.parse_table_literal(reader, base_offset, literals)?;
-            if matches!(key.value, RawLiteralConst::Nil) {
+            if matches!(literals[key], RawLiteralConst::Nil) {
                 return Err(ParseError::UnsupportedValue {
                     field: "luajit table key",
                     value: 0,
@@ -589,7 +575,7 @@ impl LuaJitParser {
         reader: &mut BinaryReader<'_>,
         base_offset: usize,
         literals: &mut Vec<RawLiteralConst>,
-    ) -> Result<LuaJitTableLiteral, ParseError> {
+    ) -> Result<usize, ParseError> {
         let tag = reader.read_uleb128_u32("luajit table literal tag")?;
         let value = if tag >= BCDUMP_KTAB_STR {
             let string_len = (tag - BCDUMP_KTAB_STR) as usize;
@@ -617,11 +603,8 @@ impl LuaJitParser {
         };
 
         let literal_index = literals.len();
-        literals.push(value.clone());
-        Ok(LuaJitTableLiteral {
-            value,
-            literal_index,
-        })
+        literals.push(value);
+        Ok(literal_index)
     }
 
     fn parse_debug_info(

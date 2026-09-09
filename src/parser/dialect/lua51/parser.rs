@@ -243,7 +243,9 @@ impl Lua51Parser {
         })?;
 
         Ok(RawConstPool {
-            common: RawConstPoolCommon { literals },
+            common: RawConstPoolCommon {
+                literals: literals.into(),
+            },
             extra: DialectConstPoolExtra::Lua51,
         })
     }

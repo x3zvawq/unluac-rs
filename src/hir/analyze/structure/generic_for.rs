@@ -179,8 +179,7 @@ fn exact_initializer_producer(
     instr: InstrRef,
 ) -> Option<ExactInitializerProducer> {
     let defs = lowering.dataflow.instr_defs.get(instr.index())?;
-    let outputs = lowering.bindings.instr_fixed_defs.get(instr.index())?;
-    if defs.is_empty() || defs.len() != outputs.len() {
+    if defs.is_empty() {
         return None;
     }
     let protocol_start = protocol.iterator.start.index();
@@ -196,13 +195,13 @@ fn exact_initializer_producer(
     {
         return None;
     }
-    for (offset, (&def, &temp)) in defs.iter().zip(outputs).enumerate() {
+    for (offset, &def) in defs.iter().enumerate() {
+        let temp = lowering.bindings.fixed_temps[def.index()];
         let reg = Reg(first_reg + offset);
         if lowering.dataflow.def_reg(def) != reg
             || lowering.dataflow.instr_def_for_reg(instr, reg) != Some(def)
             || generic_for_initializer_value(lowering, preheader, protocol, reg)
                 != SsaValue::Def(def)
-            || lowering.bindings.fixed_temps.get(def.index()) != Some(&temp)
             || lowering.bindings.expr_for_fixed_def(preheader, reg, temp) != HirExpr::TempRef(temp)
             || lowering
                 .bindings
@@ -215,7 +214,10 @@ fn exact_initializer_producer(
     Some(ExactInitializerProducer {
         instr,
         protocol_start: first_reg - protocol_start,
-        outputs: outputs.clone(),
+        outputs: defs
+            .iter()
+            .map(|def| lowering.bindings.fixed_temps[def.index()])
+            .collect(),
     })
 }
 

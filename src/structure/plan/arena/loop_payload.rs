@@ -205,7 +205,6 @@ pub(super) fn freeze_loop_payload(
         propagated_break,
         header_values: candidate.header_value_merges.clone(),
         exit_values: candidate.exit_value_merges.clone(),
-        carried_values: evidence.carried_values.clone(),
         protocol: None,
         value_actions: None,
     })

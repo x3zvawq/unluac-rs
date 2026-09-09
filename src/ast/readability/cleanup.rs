@@ -428,31 +428,21 @@ fn trim_unused_initialized_local_suffix(
 }
 
 fn split_overwritten_call_result_locals(block: &mut AstBlock, target: AstTargetDialect) -> bool {
-    let old_stmts = std::mem::take(&mut block.stmts);
-    let mut rewritten = Vec::with_capacity(old_stmts.len());
+    let mut stmts = std::mem::take(&mut block.stmts).into_iter().peekable();
+    let mut rewritten = Vec::with_capacity(stmts.len());
     let mut changed = false;
-    let mut index = 0;
 
-    while index < old_stmts.len() {
-        if let Some((call, declaration)) = old_stmts
-            .get(index)
-            .zip(old_stmts.get(index + 1))
-            .and_then(|(declaration, overwrite)| {
-                split_overwritten_call_result(declaration, overwrite, target)
-            })
+    while let Some(mut stmt) = stmts.next() {
+        if let Some((call, declaration)) = stmts
+            .peek_mut()
+            .and_then(|overwrite| split_overwritten_call_result(&mut stmt, overwrite, target))
         {
             rewritten.push(AstStmt::CallStmt(Box::new(AstCallStmt { call })));
             rewritten.push(AstStmt::LocalDecl(Box::new(declaration)));
-            index += 2;
+            stmts.next();
             changed = true;
         } else {
-            rewritten.push(
-                old_stmts
-                    .get(index)
-                    .cloned()
-                    .expect("cleanup scan index must stay in bounds"),
-            );
-            index += 1;
+            rewritten.push(stmt);
         }
     }
 
@@ -461,8 +451,8 @@ fn split_overwritten_call_result_locals(block: &mut AstBlock, target: AstTargetD
 }
 
 fn split_overwritten_call_result(
-    declaration: &AstStmt,
-    overwrite: &AstStmt,
+    declaration: &mut AstStmt,
+    overwrite: &mut AstStmt,
     target: AstTargetDialect,
 ) -> Option<(AstCallKind, AstLocalDecl)> {
     let AstStmt::LocalDecl(local_decl) = declaration else {
@@ -481,25 +471,31 @@ fn split_overwritten_call_result(
         // 空 value declaration 不产生 call-result 候选。
         return None;
     }
-    let mut call = None;
-    for value in &local_decl.values {
-        match into_call_kind(value.clone()) {
-            Ok(candidate) if call.is_none() => call = Some(candidate),
-            Ok(_) => {
+    let mut call_index = None;
+    for (index, value) in local_decl.values.iter().enumerate() {
+        let mut unwrapped = value;
+        while let AstExpr::SingleValue(inner) = unwrapped {
+            unwrapped = inner;
+        }
+        match unwrapped {
+            AstExpr::Call(_) | AstExpr::MethodCall(_) if call_index.is_none() => {
+                call_index = Some(index);
+            }
+            AstExpr::Call(_) | AstExpr::MethodCall(_) => {
                 // 候选拒绝[SemanticBarrier:Lifetime]：第一个 call 的结果原本作为 pending
                 // RHS root 活过第二个 call；拆成两个 statement 会允许 GC 提前回收
                 // （regress388）。
                 return None;
             }
-            Err(_) if is_discard_safe_expr_for_target(value, target) => {}
-            Err(_) => {
+            _ if is_discard_safe_expr_for_target(value, target) => {}
+            _ => {
                 // 候选拒绝[SemanticBarrier:EvalCount]：非 call sibling 的 lookup、分配、
                 // 元方法或错误事件不能随 overwritten value 一起删除。
                 return None;
             }
         }
     }
-    let call = call?;
+    let call_index = call_index?;
     if assign.targets.len() != local_decl.bindings.len() {
         // 当前事务只消费按声明顺序完整覆盖全部 binding 的 overwrite；
         // 缺少 target 必须保留未覆盖 call result，额外 target 则包含外部写入。
@@ -597,11 +593,13 @@ fn split_overwritten_call_result(
     // 求值期间仍不可见，完整 RHS 的 nil fill、尾值截断和最终 binding 映射保持不变。
     // PhysicalRoot 额外要求 RHS 全部通过 target-aware 的无事件、无分配 discard proof；
     // 它们仍在原 overwrite 位置求值，所以旧 root 在这段纯求值期间提前结束不可观察。
+    let call = std::mem::replace(&mut local_decl.values[call_index], AstExpr::Nil);
+    let call = into_call_kind(call).expect("validated initializer must remain a call");
     Some((
         call,
         AstLocalDecl {
-            bindings: local_decl.bindings.clone(),
-            values: assign.values.clone(),
+            bindings: std::mem::take(&mut local_decl.bindings),
+            values: std::mem::take(&mut assign.values),
             initializer_merge_transaction: None,
             initializer_root_profile: None,
         },
@@ -1028,6 +1026,14 @@ mod tests {
         }))
     }
 
+    fn split_fixture_pair(
+        declaration: &AstStmt,
+        overwrite: &AstStmt,
+        target: AstTargetDialect,
+    ) -> Option<(AstCallKind, AstLocalDecl)> {
+        split_overwritten_call_result(&mut declaration.clone(), &mut overwrite.clone(), target)
+    }
+
     #[test]
     fn splits_recovered_call_result_before_direct_overwrite() {
         let target = AstTargetDialect::new(crate::decompile::DecompileDialect::Lua54);
@@ -1045,7 +1051,7 @@ mod tests {
             method_rewrite_transaction: None,
         }));
 
-        let (call, rewritten) = split_overwritten_call_result(&declaration, &overwrite, target)
+        let (call, rewritten) = split_fixture_pair(&declaration, &overwrite, target)
             .expect("a recovered call result with a direct overwrite is safe to split");
         assert!(matches!(call, AstCallKind::Call(_)));
         assert_eq!(rewritten.bindings, vec![binding.clone()]);
@@ -1057,7 +1063,7 @@ mod tests {
             initializer_merge_transaction: None,
             method_rewrite_transaction: None,
         }));
-        assert!(split_overwritten_call_result(&declaration, &missing_target, target).is_none());
+        assert!(split_fixture_pair(&declaration, &missing_target, target).is_none());
         let extra_target = AstStmt::Assign(Box::new(AstAssign {
             targets: vec![
                 AstLValue::Name(binding.id.to_name_ref()),
@@ -1069,7 +1075,7 @@ mod tests {
             initializer_merge_transaction: None,
             method_rewrite_transaction: None,
         }));
-        assert!(split_overwritten_call_result(&declaration, &extra_target, target).is_none());
+        assert!(split_fixture_pair(&declaration, &extra_target, target).is_none());
 
         let multiple_initializers = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding.clone()],
@@ -1077,9 +1083,7 @@ mod tests {
             initializer_merge_transaction: None,
             initializer_root_profile: None,
         }));
-        assert!(
-            split_overwritten_call_result(&multiple_initializers, &overwrite, target).is_none()
-        );
+        assert!(split_fixture_pair(&multiple_initializers, &overwrite, target).is_none());
 
         let one_call_with_primitive_sibling = AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![binding],
@@ -1087,10 +1091,7 @@ mod tests {
             initializer_merge_transaction: None,
             initializer_root_profile: None,
         }));
-        assert!(
-            split_overwritten_call_result(&one_call_with_primitive_sibling, &overwrite, target)
-                .is_some()
-        );
+        assert!(split_fixture_pair(&one_call_with_primitive_sibling, &overwrite, target).is_some());
     }
 
     #[test]
@@ -1110,7 +1111,7 @@ mod tests {
             initializer_merge_transaction: None,
             method_rewrite_transaction: None,
         }));
-        assert!(split_overwritten_call_result(&debug_decl, &debug_write, target).is_none());
+        assert!(split_fixture_pair(&debug_decl, &debug_write, target).is_none());
 
         let binding = recovered_binding();
         let self_call = AstExpr::Call(Box::new(AstCallExpr {
@@ -1132,7 +1133,7 @@ mod tests {
             initializer_merge_transaction: None,
             method_rewrite_transaction: None,
         }));
-        let (call, _) = split_overwritten_call_result(&declaration, &overwrite, target)
+        let (call, _) = split_fixture_pair(&declaration, &overwrite, target)
             .expect("the call stays before the local lexical scope in both shapes");
         let AstCallKind::Call(call) = call else {
             panic!("same-id initializer should preserve the direct call");
@@ -1151,7 +1152,14 @@ mod tests {
             initializer_merge_transaction: None,
             method_rewrite_transaction: None,
         }));
-        assert!(split_overwritten_call_result(&declaration, &later_rhs_read, target).is_none());
+        let mut rejected_decl = declaration.clone();
+        let mut rejected_write = later_rhs_read.clone();
+        assert!(
+            split_overwritten_call_result(&mut rejected_decl, &mut rejected_write, target)
+                .is_none()
+        );
+        assert_eq!(rejected_decl, declaration);
+        assert_eq!(rejected_write, later_rhs_read);
 
         let mut physical_binding = recovered_binding();
         physical_binding.origin = AstLocalOrigin::PhysicalRoot;
@@ -1167,7 +1175,7 @@ mod tests {
             initializer_merge_transaction: None,
             method_rewrite_transaction: None,
         }));
-        let (_, rewritten) = split_overwritten_call_result(&physical_decl, &copy_overwrite, target)
+        let (_, rewritten) = split_fixture_pair(&physical_decl, &copy_overwrite, target)
             .expect("an eventless parameter copy cannot observe early root release");
         assert_eq!(
             rewritten.values,
@@ -1180,9 +1188,7 @@ mod tests {
             initializer_merge_transaction: None,
             method_rewrite_transaction: None,
         }));
-        assert!(
-            split_overwritten_call_result(&physical_decl, &eventful_overwrite, target).is_none()
-        );
+        assert!(split_fixture_pair(&physical_decl, &eventful_overwrite, target).is_none());
 
         let recovered_second = AstLocalBinding {
             id: AstBindingRef::Local(LocalId(1)),
@@ -1210,12 +1216,8 @@ mod tests {
             method_rewrite_transaction: None,
         }));
         assert!(
-            split_overwritten_call_result(
-                &primitive_physical_decl,
-                &eventful_full_overwrite,
-                target,
-            )
-            .is_some()
+            split_fixture_pair(&primitive_physical_decl, &eventful_full_overwrite, target)
+                .is_some()
         );
 
         let mut physical_second = recovered_second;
@@ -1231,10 +1233,10 @@ mod tests {
             )),
         }));
         assert!(
-            split_overwritten_call_result(
+            split_fixture_pair(
                 &expanded_tail_physical_decl,
                 &eventful_full_overwrite,
-                target,
+                target
             )
             .is_none()
         );
@@ -1250,12 +1252,8 @@ mod tests {
             )),
         }));
         assert!(
-            split_overwritten_call_result(
-                &scalar_tail_physical_decl,
-                &eventful_full_overwrite,
-                target,
-            )
-            .is_some()
+            split_fixture_pair(&scalar_tail_physical_decl, &eventful_full_overwrite, target)
+                .is_some()
         );
     }
 

@@ -49,10 +49,7 @@ pub(super) fn lower_regular_instr(
         LowInstr::LoadNil(_instr) => fixed_assign(
             lowering,
             instr_ref,
-            lowering.bindings.instr_fixed_defs[instr_ref.index()]
-                .iter()
-                .map(|_temp| HirExpr::Nil)
-                .collect::<Vec<_>>(),
+            vec![HirExpr::Nil; lowering.dataflow.instr_defs[instr_ref.index()].len()],
         ),
         LowInstr::LoadBool(load_bool) => {
             fixed_assign(lowering, instr_ref, vec![HirExpr::Boolean(load_bool.value)])
@@ -622,14 +619,13 @@ fn fixed_assign(
     values: impl Into<HirValuePack>,
 ) -> Vec<HirStmt> {
     let values = values.into();
-    let temps = &lowering.bindings.instr_fixed_defs[instr_ref.index()];
-    let decl_locals = temps
+    let decl_locals = lowering.dataflow.instr_defs[instr_ref.index()]
         .iter()
-        .filter_map(|temp| {
+        .filter_map(|def| {
             lowering
                 .bindings
                 .captured_temp_decl_locals
-                .get(temp)
+                .get(&lowering.bindings.fixed_temps[def.index()])
                 .copied()
         })
         .collect::<Vec<_>>();
@@ -681,14 +677,15 @@ fn lower_fixed_targets(lowering: &ProtoLowering<'_>, instr_ref: InstrRef) -> Vec
     let block = lowering.cfg.instr_to_block[instr_ref.index()];
     lowering.dataflow.instr_defs[instr_ref.index()]
         .iter()
-        .zip(&lowering.bindings.instr_fixed_defs[instr_ref.index()])
-        .map(|(def, temp)| {
+        .map(|def| {
             // for 的可见 binding 是当前 body 内该寄存器的词法 owner；显式写入也必须
             // 回到同一个 local。只在读取侧映射会把 `i = value` 留成无人读取的 temp，
             // 随后 dead-temp 清理会静默删除真实赋值。
-            lowering
-                .bindings
-                .lvalue_for_reg_result(block, lowering.dataflow.def_reg(*def), *temp)
+            lowering.bindings.lvalue_for_reg_result(
+                block,
+                lowering.dataflow.def_reg(*def),
+                lowering.bindings.fixed_temps[def.index()],
+            )
         })
         .collect()
 }

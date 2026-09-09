@@ -2,11 +2,14 @@
 //!
 //! Generate 不直接在 visitor 里拼字符串，是为了把“语义输出”和“换行布局”拆开。
 //! 这个 Doc 足够小，只覆盖当前项目实际需要的布局原语。
+//! 固定关键字和标点借用静态文本，动态格式化结果移交所有权，避免逐 token 分配。
+
+use std::borrow::Cow;
 
 /// Generate 内部使用的轻量文档树。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Doc {
-    Text(String),
+    Text(Cow<'static, str>),
     Line,
     SoftLine,
     Concat(Vec<Doc>),
@@ -18,7 +21,7 @@ pub enum Doc {
 impl Doc {
     pub fn text<T>(text: T) -> Self
     where
-        T: Into<String>,
+        T: Into<Cow<'static, str>>,
     {
         Self::Text(text.into())
     }

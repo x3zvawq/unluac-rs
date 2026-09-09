@@ -368,20 +368,11 @@ impl<'a> ProtoLowerer<'a> {
                             dst,
                             allocation: crate::transformer::TableAllocation::Template(
                                 crate::transformer::TableTemplate {
-                                    array: table
-                                        .array
-                                        .iter()
-                                        .map(|value| ConstRef(value.literal_index))
-                                        .collect(),
+                                    array: table.array.iter().copied().map(ConstRef).collect(),
                                     hash: table
                                         .hash
                                         .iter()
-                                        .map(|entry| {
-                                            (
-                                                ConstRef(entry.key.literal_index),
-                                                ConstRef(entry.value.literal_index),
-                                            )
-                                        })
+                                        .map(|entry| (ConstRef(entry.key), ConstRef(entry.value)))
                                         .collect(),
                                 },
                             ),

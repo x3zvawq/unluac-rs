@@ -471,6 +471,7 @@ impl ProtoPromotionFacts {
             entry_nil_phi_locals: BTreeSet::new(),
             entry_nil_pruned_locals: BTreeSet::new(),
             repeat_condition_prefix_temps: collect_repeat_condition_prefix_temps(
+                cfg,
                 dataflow,
                 plan,
                 fixed_temps,
@@ -1437,6 +1438,7 @@ fn collect_entry_nil_phi_temps(
 }
 
 fn collect_repeat_condition_prefix_temps(
+    cfg: &Cfg,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     fixed_temps: &[TempId],
@@ -1461,13 +1463,12 @@ fn collect_repeat_condition_prefix_temps(
         })
         .collect::<BTreeSet<_>>();
 
-    dataflow
-        .defs
-        .iter()
-        .filter(|def| condition_headers.contains(&def.block))
+    condition_headers
+        .into_iter()
+        .flat_map(|header| dataflow.fixed_defs_in_block(cfg, header))
         .filter_map(|def| {
-            let direct = TempId(def.id.index());
-            (fixed_temps.get(def.id.index()) == Some(&direct)).then_some(direct)
+            let direct = TempId(def.index());
+            (fixed_temps.get(def.index()) == Some(&direct)).then_some(direct)
         })
         .collect()
 }

@@ -199,7 +199,7 @@ pub(super) fn claim_selected_region_values(
                         condition,
                     )?;
                 }
-                for value in &loop_plan.carried_values {
+                for value in &loop_plan.header_values {
                     claim_loop_header_value(
                         dataflow,
                         owner_index,

@@ -339,16 +339,16 @@ fn analyze_structure_proto_one(
     );
     let scope_candidates = scope::analyze_scopes(proto, cfg, graph_facts);
     let input = final_plan_input(
-        &branch_candidates,
-        &branch_region_facts,
-        &branch_value_merge_candidates,
-        &loop_candidates,
+        branch_candidates,
+        branch_region_facts,
+        branch_value_merge_candidates,
+        loop_candidates,
         &short_circuit_candidates_for_loops,
         &short_circuit_candidates,
         &closed_control_dags,
-        &residual_transfers,
-        &region_facts,
-        &scope_candidates,
+        residual_transfers,
+        region_facts,
+        scope_candidates,
         proto,
         cfg,
         dataflow,

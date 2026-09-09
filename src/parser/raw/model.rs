@@ -4,7 +4,8 @@
 //! origin 和保留位模式的宿主字面量；具体 opcode、operand 和 dialect extra 只通过 wrapper 字段挂接进来，
 //! 避免公共模型被某个版本的协议细节撑大。
 //! `RawString` 的原始字节和解码文本都是不可变共享 payload，raw tree 和后续层的
-//! Clone 只复制所有权，不复制字符串内容；Luau 的平铺 proto 还通过 `Arc` 保留共享
+//! Clone 只复制所有权，不复制字符串内容；公共字面量池也在解析后冻结为共享切片。
+//! Luau 的平铺 proto 还通过 `Arc` 保留共享
 //! 子图，避免把同一个 lexical proto 展开成指数级树。
 
 use std::{collections::HashMap, sync::Arc};
@@ -272,7 +273,8 @@ pub struct RawConstPoolCommon {
     ///
     /// 像 Luau 这种拥有 import/table/closure 常量的 dialect，会把完整常量表放进
     /// `extra`；vector 属于后层需要直接消费的运行时字面量，因此归一到这里。
-    pub literals: Vec<RawLiteralConst>,
+    /// 解析完成后索引与载荷同时冻结，后层和 raw clone 共享同一个池。
+    pub literals: Arc<[RawLiteralConst]>,
 }
 
 /// 被原始指令引用的字面量常量。
@@ -393,6 +395,14 @@ pub struct DecodedText {
 mod tests {
     use super::*;
     use crate::parser::{ParseOptions, parse_chunk_with_dialect};
+
+    #[test]
+    fn shared_literal_pool_keeps_nan_content_equality() {
+        let pool = RawConstPoolCommon {
+            literals: vec![RawLiteralConst::Number(f64::NAN)].into(),
+        };
+        assert_ne!(pool, pool.clone());
+    }
 
     #[test]
     fn discard_debug_moves_owned_root_payloads() {

@@ -409,15 +409,6 @@ pub(super) fn build_bindings(
         numeric_binding_phis: &numeric_binding_phis.bindings,
     });
 
-    let instr_fixed_defs = dataflow
-        .instr_defs
-        .iter()
-        .map(|defs| {
-            defs.iter()
-                .map(|def| fixed_temps[def.index()])
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
     // CapturedSlotKey 与 HomeSlotKey 使用同一 `(reg, close epoch)` 坐标；保留全部 pair，
     // 若未来一个 local 吸收多个 key，promotion facts 会把它合流成 Conflict。
     let captured_local_home_slots = captured_slots
@@ -446,7 +437,6 @@ pub(super) fn build_bindings(
         home_free_temps,
         loop_guard_temps,
         repeat_staged_temps,
-        instr_fixed_defs,
         debug_temp_targets,
         captured_temp_targets: captured_temp_facts.targets,
         captured_temp_decl_locals: captured_temp_facts.decl_temps,

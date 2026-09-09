@@ -55,7 +55,6 @@ pub(super) struct ProtoBindings {
     pub(super) home_free_temps: BTreeSet<TempId>,
     pub(super) loop_guard_temps: Vec<Option<TempId>>,
     pub(super) repeat_staged_temps: Vec<Vec<TempId>>,
-    pub(super) instr_fixed_defs: Vec<Vec<TempId>>,
     pub(super) debug_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,

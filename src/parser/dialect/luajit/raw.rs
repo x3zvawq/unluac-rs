@@ -1,7 +1,7 @@
-//! 这个文件定义 LuaJIT 专属的 raw 类型。
+//! 这个文件定义 LuaJIT 专属的 raw 类型；表模板和 KGC 字面量记录公共池索引，载荷由池统一持有。
 
+use crate::parser::RawString;
 use crate::parser::dialect::opcodes::define_opcode_kind_table;
-use crate::parser::{RawLiteralConst, RawString};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LuaJitOperandKind {
@@ -154,14 +154,9 @@ pub struct LuaJitProtoExtra {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LuaJitKgcEntry {
-    Child {
-        child_proto_index: usize,
-    },
+    Child { child_proto_index: usize },
     Table(LuaJitTableConst),
-    Literal {
-        value: RawLiteralConst,
-        literal_index: usize,
-    },
+    Literal { literal_index: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,18 +190,12 @@ pub struct LuaJitInstrExtra {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LuaJitTableConst {
-    pub array: Vec<LuaJitTableLiteral>,
+    pub array: Vec<usize>,
     pub hash: Vec<LuaJitTableRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LuaJitTableRecord {
-    pub key: LuaJitTableLiteral,
-    pub value: LuaJitTableLiteral,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct LuaJitTableLiteral {
-    pub value: RawLiteralConst,
-    pub literal_index: usize,
+    pub key: usize,
+    pub value: usize,
 }

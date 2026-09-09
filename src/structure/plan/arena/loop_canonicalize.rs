@@ -148,7 +148,6 @@ pub(super) fn canonicalize_loops(
                         selected.candidate.exit_value_merges.push(exit_merge);
                     }
                 }
-                extend_value_merges(&mut selected.carried_values, candidate.carried_values);
                 if selected.condition.is_none() {
                     selected.condition = candidate.condition;
                 }

@@ -12,7 +12,7 @@ use crate::parser::{
 };
 use crate::transformer::dialect::lowering::{
     PendingLowInstr, PendingLoweringState, PendingMethodHints, TargetPlaceholder, WordCodeIndex,
-    instr_pc, instr_word_len, raw_pc_at,
+    instr_word_len, raw_pc_at,
 };
 use crate::transformer::dialect::puc_lua::{
     call_args_pack, call_result_pack, finish_lowered_proto, range_len_inclusive, reg_from_u8,
@@ -146,7 +146,7 @@ impl<'a> ProtoLowerer<'a> {
             lowering: PendingLoweringState::new(raw_instr_count),
             pending_methods: PendingMethodHints::new(method_slots),
             pending_fastcall_calls: vec![None; raw_instr_count],
-            word_code_index: WordCodeIndex::from_raw(raw, instr_pc, instr_word_len),
+            word_code_index: WordCodeIndex::from_raw(raw),
         }
     }
 
