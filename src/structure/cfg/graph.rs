@@ -85,13 +85,6 @@ impl DenseBlockSet {
     fn contains(&self, block: BlockRef) -> bool {
         self.present[block.index()]
     }
-
-    fn insert(&mut self, block: BlockRef) -> bool {
-        let slot = &mut self.present[block.index()];
-        let inserted = !*slot;
-        *slot = true;
-        inserted
-    }
 }
 
 struct GraphAnalysis {
@@ -101,7 +94,6 @@ struct GraphAnalysis {
     dominance_frontier: Vec<BTreeSet<BlockRef>>,
     scc: SccFacts,
     backedges: Vec<EdgeRef>,
-    loop_headers: BTreeSet<BlockRef>,
     natural_loops: Vec<NaturalLoop>,
     natural_loop_forest: NaturalLoopForest,
 }
@@ -111,23 +103,26 @@ impl GraphAnalysis {
         super::validate_cfg(cfg)?;
         let reachable =
             DenseBlockSet::from_blocks(cfg.blocks.len(), cfg.reachable_blocks.iter().copied());
-        let forward =
-            compute_dfs_traversal(cfg, cfg.entry_block, &reachable, FlowDirection::Forward);
+        let forward = compute_dfs_traversal(
+            cfg,
+            cfg.entry_block,
+            |block| reachable.contains(block),
+            FlowDirection::Forward,
+        );
         let dominator_tree = compute_dominator_tree(cfg, &forward)?;
         let scc = compute_strongly_connected_components(cfg, &forward.postorder)?;
         let mut rpo = forward.postorder;
         rpo.reverse();
-        let reverse_reachable = compute_reverse_reachable(cfg, &reachable);
         let reverse = compute_dfs_traversal(
             cfg,
             cfg.exit_block,
-            &reverse_reachable,
+            // 无正常退出路径时仍保留 exit 根；其余节点必须属于入口可达域。
+            |block| block == cfg.exit_block || reachable.contains(block),
             FlowDirection::Reverse,
         );
         let post_dominator_tree = compute_post_dominator_tree(cfg, &reverse)?;
         let dominance_frontier = compute_dominance_frontier(cfg, &dominator_tree, &reachable);
         let backedges = compute_backedges(cfg, &dominator_tree, &reachable);
-        let loop_headers = compute_loop_headers(cfg, &backedges);
         let natural_loops = compute_natural_loops(cfg, &backedges, &reachable);
         let natural_loop_forest =
             NaturalLoopForest::build(&natural_loops, &dominator_tree, cfg.blocks.len());
@@ -139,7 +134,6 @@ impl GraphAnalysis {
             dominance_frontier,
             scc,
             backedges,
-            loop_headers,
             natural_loops,
             natural_loop_forest,
         })
@@ -153,7 +147,6 @@ impl GraphAnalysis {
             dominance_frontier: self.dominance_frontier,
             scc: self.scc,
             backedges: self.backedges,
-            loop_headers: self.loop_headers,
             natural_loops: self.natural_loops,
             natural_loop_forest: self.natural_loop_forest,
             children,
@@ -349,19 +342,14 @@ fn compute_backedges(
         .collect()
 }
 
-fn compute_loop_headers(cfg: &Cfg, backedges: &[EdgeRef]) -> BTreeSet<BlockRef> {
-    backedges
-        .iter()
-        .copied()
-        .map(|edge_ref| cfg.edges[edge_ref.index()].to)
-        .collect()
-}
-
 fn compute_natural_loops(
     cfg: &Cfg,
     backedges: &[EdgeRef],
     reachable: &DenseBlockSet,
 ) -> Vec<NaturalLoop> {
+    if backedges.is_empty() {
+        return Vec::new();
+    }
     let mut backedges_by_header = vec![Vec::new(); cfg.blocks.len()];
     for backedge in backedges.iter().copied() {
         let header = cfg.edges[backedge.index()].to;
@@ -423,26 +411,6 @@ fn compute_natural_loops(
     natural_loops
 }
 
-fn compute_reverse_reachable(cfg: &Cfg, reachable: &DenseBlockSet) -> DenseBlockSet {
-    let mut reverse_reachable = DenseBlockSet::new(cfg.blocks.len());
-    let mut worklist = VecDeque::from([cfg.exit_block]);
-
-    while let Some(block) = worklist.pop_front() {
-        if !reverse_reachable.insert(block) {
-            continue;
-        }
-
-        for edge_ref in &cfg.preds[block.index()] {
-            let pred = cfg.edges[edge_ref.index()].from;
-            if reachable.contains(pred) && !reverse_reachable.contains(pred) {
-                worklist.push_back(pred);
-            }
-        }
-    }
-
-    reverse_reachable
-}
-
 fn compute_tree(
     cfg: &Cfg,
     traversal: &DfsTraversal<BlockRef>,
@@ -455,7 +423,7 @@ fn compute_tree(
             .map(move |&edge| direction.incoming_source(cfg, edge))
     })
     .map_err(StructureError::invalid)?;
-    let (depth, ancestors) = tree_lca_index(&tree.parent, &tree.order)?;
+    let (depth, ancestors) = tree_lca_index(&tree.parent, &tree.order);
     Ok(DominatorTree {
         parent: tree.parent,
         children: tree.children,
@@ -469,10 +437,7 @@ fn compute_tree(
 
 type TreeLcaIndex = (Vec<Option<usize>>, Vec<Vec<Option<BlockRef>>>);
 
-fn tree_lca_index(
-    parent: &[Option<BlockRef>],
-    order: &[BlockRef],
-) -> Result<TreeLcaIndex, StructureError> {
+fn tree_lca_index(parent: &[Option<BlockRef>], order: &[BlockRef]) -> TreeLcaIndex {
     let mut depth = vec![None; parent.len()];
     for block in order.iter().copied() {
         depth[block.index()] = Some(
@@ -483,15 +448,8 @@ fn tree_lca_index(
     }
 
     let mut ancestors = Vec::new();
-    if !parent.is_empty() {
-        ancestors.push(parent.to_vec());
-    }
-    while (1usize << ancestors.len()) < parent.len() {
-        let Some(previous) = ancestors.last() else {
-            return Err(StructureError::invalid(
-                "non-empty dominator tree has no first ancestor level",
-            ));
-        };
+    while (1usize << (ancestors.len() + 1)) < parent.len() {
+        let previous = ancestors.last().map_or(parent, Vec::as_slice);
         ancestors.push(
             previous
                 .iter()
@@ -499,25 +457,19 @@ fn tree_lca_index(
                 .collect(),
         );
     }
-    Ok((depth, ancestors))
+    (depth, ancestors)
 }
 
 fn compute_dfs_traversal(
     cfg: &Cfg,
     root: BlockRef,
-    visible: &DenseBlockSet,
+    visible: impl Fn(BlockRef) -> bool,
     direction: FlowDirection,
 ) -> DfsTraversal<BlockRef> {
-    graph::depth_first(
-        cfg.blocks.len(),
-        root,
-        BlockRef::index,
-        |block| visible.contains(block),
-        |block| {
-            direction
-                .outgoing_edges(cfg, block)
-                .iter()
-                .map(move |&edge| direction.edge_target(cfg, edge))
-        },
-    )
+    graph::depth_first(cfg.blocks.len(), root, BlockRef::index, visible, |block| {
+        direction
+            .outgoing_edges(cfg, block)
+            .iter()
+            .map(move |&edge| direction.edge_target(cfg, edge))
+    })
 }

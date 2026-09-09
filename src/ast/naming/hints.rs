@@ -109,7 +109,7 @@ fn collect_stmt_hints(
             collect_expr_hints(function, &repeat_stmt.cond, hints, hir)?;
         }
         AstStmt::NumericFor(numeric_for) => {
-            let candidate = numeric_loop_name(loop_ctx.numeric_depth);
+            let candidate = numeric_loop_name(loop_ctx.numeric_depth).to_owned();
             register_binding_hint(
                 function,
                 numeric_for.binding,
@@ -141,7 +141,13 @@ fn collect_stmt_hints(
                     1 => "v",
                     _ => "extra",
                 };
-                register_binding_hint(function, binding, candidate, NameSource::LoopRole, hints);
+                register_binding_hint(
+                    function,
+                    binding,
+                    candidate.to_owned(),
+                    NameSource::LoopRole,
+                    hints,
+                );
             }
             collect_block_hints(function, &generic_for.body, hints, loop_ctx, hir)?;
         }
@@ -164,7 +170,7 @@ fn collect_stmt_hints(
             register_binding_hint(
                 function,
                 local_function_decl.name,
-                "fn",
+                "fn".to_owned(),
                 NameSource::FunctionShape,
                 hints,
             );
@@ -254,7 +260,7 @@ fn register_binding_expr_hint(
     let Some((candidate, source)) = candidate_from_expr(expr) else {
         return;
     };
-    register_binding_hint(function, binding, &candidate, source, hints);
+    register_binding_hint(function, binding, candidate, source, hints);
 }
 
 fn record_binding_presence(
@@ -267,19 +273,32 @@ fn record_binding_presence(
     }
 }
 
+// 候选由表达式规范化或固定角色名产生，注册只消费其所有权，不再清洗同一文本。
 fn register_binding_hint(
     function: HirProtoRef,
     binding: AstBindingRef,
-    candidate: &str,
+    candidate: String,
     source: NameSource,
     hints: &mut [FunctionHints],
 ) {
     match binding {
         AstBindingRef::Local(local) => {
-            register_local_hint(function, local, candidate, source, hints)
+            insert_hint(
+                &mut hints[function.index()].local_hints,
+                local,
+                candidate,
+                source,
+            );
         }
         AstBindingRef::SyntheticLocal(local) => {
-            register_synthetic_local_hint(function, local, candidate, source, hints)
+            let function_hints = &mut hints[function.index()];
+            function_hints.synthetic_locals.insert(local);
+            insert_hint(
+                &mut function_hints.synthetic_local_hints,
+                local,
+                candidate,
+                source,
+            );
         }
         AstBindingRef::Temp(_) => {
             unreachable!("readability output must not leak raw temp bindings into naming")
@@ -299,40 +318,6 @@ fn register_param_hint(
     };
     let function_hints = &mut hints[function.index()];
     insert_hint(&mut function_hints.param_hints, param, candidate, source);
-}
-
-fn register_local_hint(
-    function: HirProtoRef,
-    local: crate::hir::LocalId,
-    candidate: &str,
-    source: NameSource,
-    hints: &mut [FunctionHints],
-) {
-    let Some(candidate) = normalize_identifier(candidate) else {
-        return;
-    };
-    let function_hints = &mut hints[function.index()];
-    insert_hint(&mut function_hints.local_hints, local, candidate, source);
-}
-
-fn register_synthetic_local_hint(
-    function: HirProtoRef,
-    local: AstSyntheticLocalId,
-    candidate: &str,
-    source: NameSource,
-    hints: &mut [FunctionHints],
-) {
-    let Some(candidate) = normalize_identifier(candidate) else {
-        return;
-    };
-    let function_hints = &mut hints[function.index()];
-    function_hints.synthetic_locals.insert(local);
-    insert_hint(
-        &mut function_hints.synthetic_local_hints,
-        local,
-        candidate,
-        source,
-    );
 }
 
 fn record_synthetic_local(
@@ -387,7 +372,7 @@ fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
             Some((normalize_identifier(&access.field)?, NameSource::FieldName))
         }
         AstExpr::IndexAccess(access) => Some((
-            normalize_identifier(&candidate_from_index_base(&access.base)?)?,
+            candidate_from_index_base(&access.base)?,
             NameSource::FieldName,
         )),
         AstExpr::TableConstructor(_) => Some(("tbl".to_owned(), NameSource::TableShape)),

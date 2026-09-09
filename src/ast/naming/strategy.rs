@@ -195,7 +195,7 @@ pub(super) fn resolve_visible_binding_name(
     function: HirProtoRef,
     binding: VisibleBinding,
     assigned_functions: &[FunctionNameMap],
-) -> Result<String, NamingError> {
+) -> Result<&str, NamingError> {
     let (parent, kind, index) = match binding {
         VisibleBinding::Param { function, param } => (function, "param", param.index()),
         VisibleBinding::Local { function, local } => (function, "local", local.index()),
@@ -217,7 +217,7 @@ pub(super) fn resolve_visible_binding_name(
         VisibleBinding::SyntheticLocal { local, .. } => parent_names.synthetic_locals.get(&local),
         VisibleBinding::Upvalue { upvalue, .. } => parent_names.upvalues.get(upvalue.index()),
     };
-    name.map(|name| name.text.clone())
+    name.map(|name| name.text.as_str())
         .ok_or(NamingError::MissingCapturedBinding {
             function: function.index(),
             parent: parent.index(),
@@ -251,7 +251,7 @@ fn resolve_captured_name(
         },
     };
     Ok(CandidateHint {
-        text: resolve_visible_binding_name(function, binding, assigned_functions)?,
+        text: resolve_visible_binding_name(function, binding, assigned_functions)?.to_owned(),
         source: NameSource::CaptureProvenance,
     })
 }

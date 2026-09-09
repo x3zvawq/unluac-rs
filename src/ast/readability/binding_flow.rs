@@ -192,6 +192,20 @@ impl BindingUseIndex {
     }
 }
 
+/// 当前函数内每个 binding 最后出现的顶层语句位置，包含声明、读写与显式捕获。
+pub(super) fn last_binding_mentions(stmts: &[AstStmt]) -> BTreeMap<AstBindingRef, usize> {
+    let mut last_mentions = BTreeMap::new();
+    for (index, stmt) in stmts.iter().enumerate() {
+        visit::visit_stmt(
+            stmt,
+            &mut BindingCollector(|binding, _| {
+                last_mentions.insert(binding, index);
+            }),
+        );
+    }
+    last_mentions
+}
+
 pub(super) fn binding_mentions_in_stmt(stmt: &AstStmt) -> BTreeSet<AstBindingRef> {
     let mut mentions = BTreeSet::new();
     visit::visit_stmt(

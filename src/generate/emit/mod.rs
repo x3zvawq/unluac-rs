@@ -181,10 +181,9 @@ impl<'a> Emitter<'a> {
             .metadata
             .and_then(|metadata| metadata.chunk.file_name.as_ref())
         {
-            comments.push(Doc::text(format!(
-                "-- file: {}",
-                sanitize_comment_text(&file_name.display_text())
-            )));
+            let mut comment = String::from("-- file: ");
+            push_comment_text(&mut comment, &file_name.display_text());
+            comments.push(Doc::text(comment));
         }
         comments.extend([
             Doc::text(format!(
@@ -219,7 +218,7 @@ impl<'a> Emitter<'a> {
         }
         if let Some(source) = metadata.source.as_ref() {
             proto_meta.push_str(" source=");
-            proto_meta.push_str(&sanitize_comment_text(&source.display_text()));
+            push_comment_text(&mut proto_meta, &source.display_text());
         }
 
         let mut comments = Vec::with_capacity(2);
@@ -244,10 +243,20 @@ impl<'a> Emitter<'a> {
     }
 }
 
-fn sanitize_comment_text(text: &str) -> String {
-    text.replace("\r\n", "\\n")
-        .replace(['\n', '\r'], "\\n")
-        .replace('\t', "\\t")
+fn push_comment_text(output: &mut String, text: &str) {
+    output.reserve(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                output.push_str("\\n");
+            }
+            '\n' => output.push_str("\\n"),
+            '\t' => output.push_str("\\t"),
+            _ => output.push(ch),
+        }
+    }
 }
 
 fn is_function_stmt(stmt: &crate::ast::AstStmt) -> bool {

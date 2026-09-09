@@ -10,8 +10,9 @@ impl EdgeSemantics {
         arena: &RegionArena,
         input: &FinalPlanInput,
         partitions: &[LoopPartitions],
+        forwarding: &ForwardingBoundaries,
     ) -> Result<Self, StructureError> {
-        let layout_edges = layout_edge_facts(cfg, &arena.regions, &arena.navigation)?;
+        let layout_edges = layout_edge_facts(cfg, &arena.regions, &arena.navigation);
         let loops = LoopQueryIndex::build(cfg, arena, input, partitions, &layout_edges)?;
         let mut planned_breaks = vec![None; cfg.edges.len()];
         for (spec_index, spec) in arena.specs.iter().enumerate() {
@@ -58,35 +59,9 @@ impl EdgeSemantics {
             preheader_edges: vec![false; cfg.edges.len()],
             for_syntax_edges: vec![false; cfg.edges.len()],
             normal_tail_edges: vec![false; cfg.edges.len()],
-            natural_edges: layout_edges.iter().map(|fact| fact.natural).collect(),
-            crosses_island_layout: layout_edges
-                .iter()
-                .map(|fact| fact.crosses_island_layout)
-                .collect(),
+            layout_edges,
             value_decision_edges: vec![None; cfg.edges.len()],
         };
-        let forwarding_barriers = input
-            .scopes
-            .iter()
-            .flat_map(|scope| {
-                scope
-                    .exit
-                    .into_iter()
-                    .chain(std::iter::once(scope.entry))
-                    .chain(
-                        scope
-                            .close_points
-                            .iter()
-                            .filter_map(|close| cfg.instr_to_block.get(close.index()).copied()),
-                    )
-            })
-            .collect::<BTreeSet<_>>();
-        let label_targets = input
-            .residual_transfers
-            .iter()
-            .filter_map(|residual| cfg.edges.get(residual.edge.index()))
-            .map(|edge| edge.to)
-            .collect::<BTreeSet<_>>();
         for (index, spec) in arena.specs.iter().enumerate() {
             let region = arena.slots[index].region();
             match spec.kind {
@@ -217,8 +192,8 @@ impl EdgeSemantics {
                                 arena,
                                 partition,
                                 target,
-                                &forwarding_barriers,
-                                &label_targets,
+                                &forwarding.barriers,
+                                &forwarding.label_targets,
                             )
                         })
                         .transpose()?;
@@ -236,7 +211,7 @@ impl EdgeSemantics {
                             partition,
                             loop_.header,
                             target,
-                            &forwarding_barriers,
+                            &forwarding.barriers,
                         ) {
                         Some(route)
                     } else {
@@ -254,8 +229,8 @@ impl EdgeSemantics {
                                         partition,
                                         loop_,
                                         target,
-                                        &forwarding_barriers,
-                                        &label_targets,
+                                        &forwarding.barriers,
+                                        &forwarding.label_targets,
                                     )
                                 })
                                 .map(|route| {
@@ -308,7 +283,7 @@ impl EdgeSemantics {
                         let natural_repeat_tail = loop_.kind_hint
                             == crate::structure::LoopKindHint::RepeatLike
                             && direct
-                            && semantics.natural_edges[edge.index()];
+                            && semantics.layout_edges[edge.index()].natural;
                         if !natural_repeat_tail
                             && reaches_target
                             && explicit_continue
@@ -563,7 +538,7 @@ impl EdgeSemantics {
         }
         if self.breaks[edge_ref.index()].is_none()
             && self.break_region(edge_ref).is_none()
-            && !self.natural_edges[edge_ref.index()]
+            && !self.layout_edges[edge_ref.index()].natural
             && let Some(kind) = shared_pure_terminal_kind(cfg, edge.to)
         {
             return (
@@ -583,7 +558,7 @@ impl EdgeSemantics {
             && let Some(region) = self.continues[edge_ref.index()]
             && !self.is_nested_loop_exit_to_ancestor(edge_ref, edge.from, region)
             && !self.exits_nested_loop_before_continue(edge_ref, edge.from, region)
-            && (!self.natural_edges[edge_ref.index()]
+            && (!self.layout_edges[edge_ref.index()].natural
                 || self.loops.control_by_block[edge.to.index()] == Some(region))
         {
             // 显式 continue 可以同时是物理 backedge；语义 transfer 必须先于
@@ -660,9 +635,9 @@ impl EdgeSemantics {
                 return (region, EdgeTransfer::Break(target));
             }
             if arm == super::super::BranchArm::LoopExit
-                && !self.natural_edges[edge_ref.index()]
+                && !self.layout_edges[edge_ref.index()].natural
                 && self.breaks[edge_ref.index()].is_none()
-                && (self.crosses_island_layout[edge_ref.index()]
+                && (self.layout_edges[edge_ref.index()].crosses_island_layout
                     || self
                         .loops
                         .innermost_spec(edge.from)
@@ -736,7 +711,7 @@ impl EdgeSemantics {
             && self.early_continues[edge_ref.index()]
             && !self.is_nested_loop_exit_to_ancestor(edge_ref, edge.from, region)
             && !self.exits_nested_loop_before_continue(edge_ref, edge.from, region)
-            && (!self.natural_edges[edge_ref.index()]
+            && (!self.layout_edges[edge_ref.index()].natural
                 || self.loops.control_by_block[edge.to.index()] == Some(region))
         {
             if caps.continue_stmt {
@@ -778,7 +753,7 @@ impl EdgeSemantics {
         if let Some(reason) = self.forced_gotos[edge_ref.index()] {
             let natural_tail_to_latch =
                 structured_branch_arm && self.continue_target_region(edge_ref).is_some();
-            let natural_empty_arm = self.natural_edges[edge_ref.index()]
+            let natural_empty_arm = self.layout_edges[edge_ref.index()].natural
                 && self.syntax_arms[edge_ref.index()].is_some();
             let selected_loop_arm = matches!(
                 self.syntax_arms[edge_ref.index()],
@@ -800,7 +775,9 @@ impl EdgeSemantics {
                 );
             }
         }
-        if self.crosses_island_layout[edge_ref.index()] && !self.natural_edges[edge_ref.index()] {
+        if self.layout_edges[edge_ref.index()].crosses_island_layout
+            && !self.layout_edges[edge_ref.index()].natural
+        {
             return (
                 default_owner,
                 EdgeTransfer::Goto(
@@ -863,7 +840,7 @@ impl EdgeSemantics {
             edge.kind,
             EdgeKind::BranchTrue | EdgeKind::BranchFalse | EdgeKind::LoopBody | EdgeKind::LoopExit
         ) {
-            if self.natural_edges[edge_ref.index()] {
+            if self.layout_edges[edge_ref.index()].natural {
                 return (default_owner, EdgeTransfer::Fallthrough);
             }
             return (
@@ -874,7 +851,7 @@ impl EdgeSemantics {
                 ),
             );
         }
-        if self.natural_edges[edge_ref.index()] {
+        if self.layout_edges[edge_ref.index()].natural {
             (default_owner, EdgeTransfer::Fallthrough)
         } else {
             (
@@ -909,8 +886,8 @@ impl EdgeSemantics {
             .copied()
             .flatten()
             == Some(target)
-            && self.crosses_island_layout[edge_ref.index()]
-            && !self.natural_edges[edge_ref.index()]
+            && self.layout_edges[edge_ref.index()].crosses_island_layout
+            && !self.layout_edges[edge_ref.index()].natural
     }
 
     fn continue_target_region(&self, edge: EdgeRef) -> Option<RegionId> {

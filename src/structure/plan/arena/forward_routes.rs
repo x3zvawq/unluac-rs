@@ -372,6 +372,18 @@ impl ForwardRouteBuilder {
                 *slot = true;
             }
         }
+        // 没有安装路径时不构建反向森林，但发布表仍覆盖完整 CFG edge 域。
+        if self.routes.is_empty() {
+            return Ok(ForwardRouteArena {
+                routes: self.routes,
+                preorder: vec![usize::MAX; self.next.len()],
+                subtree_end: vec![usize::MAX; self.next.len()],
+                depth: vec![usize::MAX; self.next.len()],
+                next: self.next,
+                owner_by_edge: self.owner_by_edge,
+                kind_by_edge: self.kind_by_edge,
+            });
+        }
         let mut remap = vec![None; self.routes.len()];
         let mut routes = Vec::new();
         for (index, route) in self.routes.iter().copied().enumerate() {
@@ -387,14 +399,10 @@ impl ForwardRouteBuilder {
             }
         }
 
-        let mut retained = vec![0usize; self.next.len()];
+        let mut retained = vec![false; self.next.len()];
         for (index, route) in self.routes.iter().enumerate() {
             if used[index] {
-                retained[route.first.index()] = retained[route.first.index()]
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        StructureError::invalid("forward route retain count overflow")
-                    })?;
+                retained[route.first.index()] = true;
             }
         }
         let mut full_children = vec![Vec::<usize>::new(); self.next.len()];
@@ -411,15 +419,18 @@ impl ForwardRouteBuilder {
         }
         let mut full_order = Vec::new();
         let mut full_seen = vec![false; self.next.len()];
-        let mut full_stack = full_roots;
-        while let Some(index) = full_stack.pop() {
-            if std::mem::replace(&mut full_seen[index], true) {
-                return Err(StructureError::invalid(
-                    "forward route graph contains a cycle or duplicate parent",
-                ));
+        let mut full_stack = Vec::new();
+        for root in full_roots.iter().rev().copied() {
+            full_stack.push(root);
+            while let Some(index) = full_stack.pop() {
+                if std::mem::replace(&mut full_seen[index], true) {
+                    return Err(StructureError::invalid(
+                        "forward route graph contains a cycle or duplicate parent",
+                    ));
+                }
+                full_order.push(index);
+                full_stack.extend(full_children[index].iter().copied());
             }
-            full_order.push(index);
-            full_stack.extend(full_children[index].iter().copied());
         }
         if self
             .next_assigned
@@ -432,19 +443,15 @@ impl ForwardRouteBuilder {
             ));
         }
         for index in full_order.into_iter().rev() {
-            if retained[index] == 0 {
+            if !retained[index] {
                 continue;
             }
             if let Some(next) = self.next[index] {
-                retained[next.index()] = retained[next.index()]
-                    .checked_add(retained[index])
-                    .ok_or_else(|| {
-                        StructureError::invalid("forward route retain count overflow")
-                    })?;
+                retained[next.index()] = true;
             }
         }
         for (index, retained) in retained.iter().copied().enumerate() {
-            if retained == 0 {
+            if !retained {
                 self.next[index] = None;
                 self.next_assigned[index] = false;
                 self.owner_by_edge[index] = None;
@@ -452,28 +459,18 @@ impl ForwardRouteBuilder {
             }
         }
 
-        let mut children = vec![Vec::<EdgeRef>::new(); self.next.len()];
-        let mut roots = Vec::new();
-        for (index, assigned) in self.next_assigned.iter().copied().enumerate() {
-            if !assigned {
-                continue;
-            }
-            let edge = EdgeRef(index);
-            if let Some(next) = self.next[index] {
-                let slot = children.get_mut(next.index()).ok_or_else(|| {
-                    StructureError::invalid(format!("{edge} has a missing forward successor"))
-                })?;
-                slot.push(edge);
-            } else {
-                roots.push(edge);
-            }
-        }
+        // retained 沿 next 传播，保留集合对后继闭合；不会产生新根。
+        // 过滤原反向森林即可得到保留森林，且保持根与兄弟的 edge 顺序。
         let mut preorder = vec![usize::MAX; self.next.len()];
         let mut subtree_end = vec![usize::MAX; self.next.len()];
         let mut depth = vec![usize::MAX; self.next.len()];
         let mut clock = 0usize;
         let mut stack = Vec::new();
-        for root in roots {
+        for root in full_roots
+            .into_iter()
+            .filter(|&root| self.next_assigned[root])
+        {
+            let root = EdgeRef(root);
             depth[root.index()] = 0;
             stack.push((root, false));
             while let Some((edge, exiting)) = stack.pop() {
@@ -491,7 +488,13 @@ impl ForwardRouteBuilder {
                     .checked_add(1)
                     .ok_or_else(|| StructureError::invalid("forward route rank overflow"))?;
                 stack.push((edge, true));
-                for child in children[edge.index()].iter().rev().copied() {
+                for child in full_children[edge.index()]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|&child| self.next_assigned[child])
+                    .map(EdgeRef)
+                {
                     depth[child.index()] = depth[edge.index()]
                         .checked_add(1)
                         .ok_or_else(|| StructureError::invalid("forward route depth overflow"))?;

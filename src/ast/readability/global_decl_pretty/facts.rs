@@ -145,32 +145,31 @@ impl BlockFacts {
         }
     }
 
-    pub(super) fn infer_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
-        self.infer_missing_from(
-            outer_visible,
-            self.observations.iter().chain(&self.trailing_observations),
-        )
-    }
-
     /// 只返回当前 block 直属语句里的缺失访问。
     ///
     /// repeat collective suffix 的新 gate 仅覆盖这一部分；until 条件的缺失访问必须继续
     /// 留给外层逐名声明，不能因为名称恰好也在 body 出现就被集合差误删。
     pub(super) fn infer_body_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
-        self.infer_missing_from(outer_visible, &self.observations)
+        let mut missing = MissingGlobals::default();
+        self.extend_missing_from(outer_visible, &self.observations, &mut missing);
+        missing
     }
 
-    /// 只返回 repeat until 条件里的缺失访问；普通 block 恒为空。
-    pub(super) fn infer_trailing_missing(&self, outer_visible: &VisibleGlobals) -> MissingGlobals {
-        self.infer_missing_from(outer_visible, &self.trailing_observations)
+    /// 按原观测顺序追加 until 的缺失访问，保留对 body 中 const 候选的可写提升。
+    pub(super) fn extend_trailing_missing(
+        &self,
+        outer_visible: &VisibleGlobals,
+        missing: &mut MissingGlobals,
+    ) {
+        self.extend_missing_from(outer_visible, &self.trailing_observations, missing);
     }
 
-    fn infer_missing_from<'a>(
+    fn extend_missing_from<'a>(
         &self,
         outer_visible: &VisibleGlobals,
         observations: impl IntoIterator<Item = &'a GlobalObservation>,
-    ) -> MissingGlobals {
-        let mut missing = MissingGlobals::default();
+        missing: &mut MissingGlobals,
+    ) {
         for observation in observations {
             if !outer_visible.has_explicit_gate() && !observation.after_explicit_here {
                 continue;
@@ -209,7 +208,10 @@ impl BlockFacts {
                 missing.note_const(&observation.name);
             }
         }
+        // 可写状态只增不减；在发布前稳定过滤，避免每次升级都移动整个 const 列表。
         missing
+            .const_
+            .retain(|name| !missing.seen_none.contains(name));
     }
 
     pub(super) fn has_explicit_globals(&self) -> bool {
@@ -231,7 +233,7 @@ pub(super) struct MissingGlobals {
     pub(super) const_: Vec<String>,
     seen_none: BTreeSet<String>,
     seen_const: BTreeSet<String>,
-    force_named: BTreeSet<String>,
+    force_named: bool,
 }
 
 impl MissingGlobals {
@@ -240,18 +242,14 @@ impl MissingGlobals {
     }
 
     pub(super) fn requires_named_decl(&self) -> bool {
-        !self.force_named.is_empty()
+        self.force_named
     }
 
     fn note_none(&mut self, name: &str, force_named: bool) {
         if self.seen_none.insert(name.to_owned()) {
             self.none.push(name.to_owned());
         }
-        if force_named {
-            self.force_named.insert(name.to_owned());
-        }
-        self.seen_const.remove(name);
-        self.const_.retain(|candidate| candidate != name);
+        self.force_named |= force_named;
     }
 
     fn note_const(&mut self, name: &str) {

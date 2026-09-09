@@ -602,11 +602,46 @@ struct LoopPartitions {
     normal_tail: Option<NormalTailPartition>,
 }
 
-struct LoopPartitionContext {
-    forwarding_barriers: BTreeSet<BlockRef>,
+/// final build 内共享的转发边界，来自固定的 scope 与 residual transfer 身份。
+/// 分支规范化只改 branch 候选，不改变这些集合；循环重分区与 edge 分类借用同一份事实。
+struct ForwardingBoundaries {
+    barriers: BTreeSet<BlockRef>,
     label_targets: BTreeSet<BlockRef>,
-    branch_merge_by_header: Vec<Option<BlockRef>>,
-    reachable_by_block: Vec<bool>,
+}
+
+impl ForwardingBoundaries {
+    fn new(cfg: &Cfg, input: &FinalPlanInput) -> Self {
+        Self {
+            barriers: input
+                .scopes
+                .iter()
+                .flat_map(|scope| {
+                    scope
+                        .exit
+                        .into_iter()
+                        .chain(std::iter::once(scope.entry))
+                        .chain(
+                            scope
+                                .close_points
+                                .iter()
+                                .filter_map(|close| cfg.instr_to_block.get(close.index()).copied()),
+                        )
+                })
+                .collect(),
+            label_targets: input
+                .residual_transfers
+                .iter()
+                .filter_map(|residual| cfg.edges.get(residual.edge.index()))
+                .map(|edge| edge.to)
+                .collect(),
+        }
+    }
+}
+
+struct LoopPartitionContext<'a> {
+    forwarding: &'a ForwardingBoundaries,
+    // 规范化只改 branch 载荷，header/位置及 island、residual 身份保持稳定。
+    branch_by_header: Vec<Option<usize>>,
     unstructured_by_block: Vec<bool>,
     residual_incidents_by_block: Vec<Vec<EdgeRef>>,
 }
@@ -807,10 +842,19 @@ pub(super) fn build(
     align_loop_condition_references(cfg, &mut input)?;
     normalize_repeat_condition_routes(proto, cfg, &mut input)?;
     legalize_conditional_continues(proto, cfg, graph_facts, caps, &mut input)?;
-    let mut loop_partitions = build_loop_partitions(proto, cfg, graph_facts, caps, &input)?;
-    if normalize_effectful_unknown_loop_conditions(cfg, graph_facts, &mut input, &loop_partitions)?
-    {
-        loop_partitions = build_loop_partitions(proto, cfg, graph_facts, caps, &input)?;
+    let forwarding = ForwardingBoundaries::new(cfg, &input);
+    let partition_context = LoopPartitionContext::new(cfg, &input, &forwarding)?;
+    let mut loop_partitions =
+        build_loop_partitions(proto, cfg, graph_facts, caps, &input, &partition_context)?;
+    if normalize_effectful_unknown_loop_conditions(
+        cfg,
+        graph_facts,
+        &mut input,
+        &loop_partitions,
+        &partition_context.branch_by_header,
+    )? {
+        loop_partitions =
+            build_loop_partitions(proto, cfg, graph_facts, caps, &input, &partition_context)?;
     }
     let tbc_flow = crate::structure::scope::analyze_tbc_flow(proto, cfg);
     let mut arena = build_regions(proto, cfg, graph_facts, &input, &loop_partitions, &tbc_flow)?;
@@ -842,7 +886,15 @@ pub(super) fn build(
         }
     }
 
-    let mut semantics = EdgeSemantics::new(proto, cfg, dataflow, &arena, &input, &loop_partitions)?;
+    let mut semantics = EdgeSemantics::new(
+        proto,
+        cfg,
+        dataflow,
+        &arena,
+        &input,
+        &loop_partitions,
+        &forwarding,
+    )?;
     let mut edge_plans = cfg
         .edges
         .iter()
@@ -962,7 +1014,6 @@ struct EdgeSemantics {
     preheader_edges: Vec<bool>,
     for_syntax_edges: Vec<bool>,
     normal_tail_edges: Vec<bool>,
-    natural_edges: Vec<bool>,
-    crosses_island_layout: Vec<bool>,
+    layout_edges: Vec<LayoutEdgeFact>,
     value_decision_edges: Vec<Option<RegionId>>,
 }

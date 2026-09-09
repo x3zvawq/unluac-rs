@@ -5,7 +5,6 @@ use super::*;
 pub(super) struct LoopQueryIndex {
     pub(super) innermost_by_block: Vec<Option<RegionId>>,
     pub(super) control_by_block: Vec<Option<RegionId>>,
-    pub(super) loop_parent: Vec<Option<RegionId>>,
     pub(super) spec_by_region: Vec<Option<usize>>,
     pub(super) continuation: Vec<Option<BlockRef>>,
     pub(super) normal_tail_entry: Vec<Option<BlockRef>>,
@@ -79,16 +78,8 @@ impl LoopQueryIndex {
                 control_marker[region.index()].or(inherited_control);
         }
 
-        let mut blocks_by_owner = vec![Vec::new(); region_count];
         let mut innermost_by_block = vec![None; cfg.blocks.len()];
         let mut control_by_block = vec![None; cfg.blocks.len()];
-        for (index, owner) in arena.region_by_block.iter().copied().enumerate() {
-            let Some(owner) = owner else { continue };
-            let block = BlockRef(index);
-            blocks_by_owner[owner.index()].push(block);
-            innermost_by_block[index] = nearest_by_region[owner.index()];
-            control_by_block[index] = control_by_region[owner.index()];
-        }
 
         #[derive(Clone, Copy)]
         struct ActiveLoopTargets {
@@ -130,7 +121,9 @@ impl LoopQueryIndex {
                     continue_target,
                 });
             }
-            for block in &blocks_by_owner[region.index()] {
+            for block in arena.navigation.direct_blocks(region) {
+                innermost_by_block[block.index()] = nearest_by_region[region.index()];
+                control_by_block[block.index()] = control_by_region[region.index()];
                 for edge in &cfg.succs[block.index()] {
                     let target = cfg.edges[edge.index()].to;
                     break_owner_by_edge[edge.index()] = active_break[target.index()];
@@ -216,7 +209,6 @@ impl LoopQueryIndex {
         Ok(Self {
             innermost_by_block,
             control_by_block,
-            loop_parent,
             spec_by_region,
             continuation,
             normal_tail_entry,
@@ -237,8 +229,9 @@ impl LoopQueryIndex {
 
     pub(super) fn innermost_spec(&self, block: BlockRef) -> Option<(usize, RegionId)> {
         let region = self.innermost(block)?;
-        self.loop_parent.get(region.index())?;
-        self.spec_by_region[region.index()].map(|spec| (spec, region))
+        self.spec_by_region
+            .get(region.index())?
+            .map(|spec| (spec, region))
     }
 
     pub(super) fn propagates_break(&self, source: BlockRef, target: RegionId) -> bool {

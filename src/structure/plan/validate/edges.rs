@@ -51,8 +51,7 @@ pub(super) fn validate_edges(
     if plan.edge_plans.len() != cfg.edges.len() {
         return Err(StructureError::invalid("edge plan length mismatch"));
     }
-    let layout_edges =
-        super::super::arena::layout_edge_facts(cfg, &plan.regions, &plan.navigation)?;
+    let layout_edges = super::super::arena::layout_edge_facts(cfg, &plan.regions, &plan.navigation);
     let validation_index = EdgeValidationIndex::new(cfg, plan);
     validate_forward_routes(cfg, plan, &validation_index)?;
     for (index, edge_plan) in plan.edge_plans.iter().enumerate() {

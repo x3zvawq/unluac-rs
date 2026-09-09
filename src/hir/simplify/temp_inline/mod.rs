@@ -291,12 +291,13 @@ fn inline_temps_in_proto_with_scope(
         roots,
     );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
-    let reference_captured = super::mention::stmts_reference_captured_bindings(&proto.body.stmts);
+    let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
+    let captures = TempInlineCaptureFacts::new(&reference_captured, facts);
     changed |= inline_temps_in_block(
         &mut proto.body,
         &mut workspace,
         &mut live_use_counts,
-        &reference_captured,
+        &captures,
         readability,
         facts,
         &BTreeSet::new(),
@@ -382,11 +383,12 @@ fn inline_temps_in_block(
     block: &mut HirBlock,
     workspace: &mut TempInlineWorkspace<'_>,
     live_use_counts: &mut [usize],
-    reference_captured: &ReferenceCapturedBindings,
+    captures: &TempInlineCaptureFacts<'_>,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
+    let reference_captured = captures.bindings;
     let is_proto_root = workspace.block_depth == 0;
     workspace.block_depth += 1;
     let mut changed = false;
@@ -408,7 +410,7 @@ fn inline_temps_in_block(
                 &mut block.stmts[index],
                 workspace,
                 live_use_counts,
-                reference_captured,
+                captures,
                 readability,
                 facts,
                 &nested_captured_slots,
@@ -442,7 +444,7 @@ fn inline_temps_in_block(
             live_use_counts,
             facts,
             &captured_slots_before_stmt,
-            reference_captured,
+            captures,
             &call_root_indices,
             &mut workspace.physical_root_temps,
             &mut workspace.new_physical_root_temps,
@@ -477,7 +479,7 @@ fn inline_temps_in_block(
         live_use_counts,
         facts,
         &captured_slots_before_stmt,
-        reference_captured,
+        captures,
         &physical_root_lifetimes,
     ) {
         changed = true;
@@ -979,13 +981,14 @@ fn inline_covered_root_copies(
     live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
-    reference_captured: &ReferenceCapturedBindings,
+    captures: &TempInlineCaptureFacts<'_>,
     call_roots: &CallRootLifetimeIndices,
     physical_root_temps: &mut [bool],
     new_physical_root_temps: &mut BTreeSet<TempId>,
     inline_dispositions: &HirInlineDispositions,
 ) -> bool {
-    let captured_homes = complete_reference_captured_home_slots(reference_captured, facts);
+    let reference_captured = captures.bindings;
+    let captured_homes = &captures.homes;
     let mut identity_sensitive = stmts_value_captured_bindings(&block.stmts).temps;
     identity_sensitive.extend(stmts_to_be_closed_temps(&block.stmts));
     let dead_copies = scope_end_copy_root_handoffs(&block.stmts, facts)
@@ -1415,9 +1418,10 @@ fn inline_materialization_runs(
     live_use_counts: &mut [usize],
     facts: &ProtoPromotionFacts,
     captured_slots_before_stmt: &CapturedSlotSnapshots,
-    reference_captured: &ReferenceCapturedBindings,
+    captures: &TempInlineCaptureFacts<'_>,
     physical_root_lifetimes: &[bool],
 ) -> bool {
+    let reference_captured = captures.bindings;
     // child block 已全部处理完才会到这里，因此同一个 proto 级 workspace 不会覆盖
     // 仍在活跃递归 frame 中的 parent 索引。
     let TempInlineWorkspace {
@@ -1430,8 +1434,7 @@ fn inline_materialization_runs(
         ..
     } = workspace;
     order_sensitive_defs.rebuild(&block.stmts);
-    let reference_captured_home_slots =
-        complete_reference_captured_home_slots(reference_captured, facts);
+    let reference_captured_home_slots = &captures.homes;
     let mut removed_stmts = vec![false; block.stmts.len()];
     let mut changed = false;
     let mut index = 0;
@@ -1487,7 +1490,7 @@ fn inline_materialization_runs(
                     scratch: uses,
                     facts,
                     captured_slots_before_stmt,
-                    reference_captured_home_slots: &reference_captured_home_slots,
+                    reference_captured_home_slots,
                 },
                 &mut removed_stmts,
             )
@@ -1506,7 +1509,7 @@ fn inline_materialization_runs(
                 safety: *safety,
                 reference_captured,
                 captured_slots_before_stmt,
-                reference_captured_home_slots: &reference_captured_home_slots,
+                reference_captured_home_slots,
             },
             &mut removed_stmts,
         ) {
@@ -2543,21 +2546,28 @@ struct NumericForHeaderProof<'a> {
     reference_captured_home_slots: &'a BTreeSet<HomeSlotKey>,
 }
 
-fn complete_reference_captured_home_slots(
-    captured: &ReferenceCapturedBindings,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let mut homes = BTreeSet::new();
-    for param in &captured.params {
-        homes.extend(facts.complete_param_home_slots(*param).iter().copied());
+/// 本轮 temp-inline 的引用捕获身份及其完整 home 投影。
+/// 身份在进入递归改写前冻结，promotion 在整轮只读；块和 repeat 候选共享同一份
+/// may-alias 全集，例如不同 local 同属一个 captured slot 时仍必须阻止延后读取。
+struct TempInlineCaptureFacts<'a> {
+    bindings: &'a ReferenceCapturedBindings,
+    homes: BTreeSet<HomeSlotKey>,
+}
+
+impl<'a> TempInlineCaptureFacts<'a> {
+    fn new(bindings: &'a ReferenceCapturedBindings, facts: &ProtoPromotionFacts) -> Self {
+        let mut homes = BTreeSet::new();
+        for param in &bindings.params {
+            homes.extend(facts.complete_param_home_slots(*param).iter().copied());
+        }
+        for local in &bindings.locals {
+            homes.extend(facts.complete_local_home_slots(*local).iter().copied());
+        }
+        for temp in &bindings.temps {
+            homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
+        }
+        Self { bindings, homes }
     }
-    for local in &captured.locals {
-        homes.extend(facts.complete_local_home_slots(*local).iter().copied());
-    }
-    for temp in &captured.temps {
-        homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
-    }
-    homes
 }
 
 fn complete_materialization_write_homes(
@@ -2944,7 +2954,7 @@ fn inline_temps_in_nested_blocks(
     stmt: &mut HirStmt,
     workspace: &mut TempInlineWorkspace<'_>,
     live_use_counts: &mut [usize],
-    reference_captured: &ReferenceCapturedBindings,
+    captures: &TempInlineCaptureFacts<'_>,
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
@@ -2956,7 +2966,7 @@ fn inline_temps_in_nested_blocks(
                 &mut if_stmt.then_block,
                 workspace,
                 live_use_counts,
-                reference_captured,
+                captures,
                 readability,
                 facts,
                 inherited_captured_slots,
@@ -2966,7 +2976,7 @@ fn inline_temps_in_nested_blocks(
                     else_block,
                     workspace,
                     live_use_counts,
-                    reference_captured,
+                    captures,
                     readability,
                     facts,
                     inherited_captured_slots,
@@ -2978,7 +2988,7 @@ fn inline_temps_in_nested_blocks(
             &mut while_stmt.body,
             workspace,
             live_use_counts,
-            reference_captured,
+            captures,
             readability,
             facts,
             inherited_captured_slots,
@@ -2992,7 +3002,7 @@ fn inline_temps_in_nested_blocks(
                 &mut repeat_stmt.body,
                 workspace,
                 live_use_counts,
-                reference_captured,
+                captures,
                 readability,
                 facts,
                 inherited_captured_slots,
@@ -3001,7 +3011,7 @@ fn inline_temps_in_nested_blocks(
                 repeat_stmt,
                 &mut workspace.uses,
                 live_use_counts,
-                reference_captured,
+                captures,
                 policy,
                 facts,
                 inherited_captured_slots,
@@ -3010,7 +3020,7 @@ fn inline_temps_in_nested_blocks(
                 repeat_stmt,
                 &mut workspace.uses,
                 live_use_counts,
-                reference_captured,
+                captures.bindings,
                 policy,
                 facts,
                 inherited_captured_slots,
@@ -3021,7 +3031,7 @@ fn inline_temps_in_nested_blocks(
             &mut numeric_for.body,
             workspace,
             live_use_counts,
-            reference_captured,
+            captures,
             readability,
             facts,
             inherited_captured_slots,
@@ -3030,7 +3040,7 @@ fn inline_temps_in_nested_blocks(
             &mut generic_for.body,
             workspace,
             live_use_counts,
-            reference_captured,
+            captures,
             readability,
             facts,
             inherited_captured_slots,
@@ -3039,7 +3049,7 @@ fn inline_temps_in_nested_blocks(
             block,
             workspace,
             live_use_counts,
-            reference_captured,
+            captures,
             readability,
             facts,
             inherited_captured_slots,
@@ -3070,7 +3080,7 @@ fn inline_repeat_head_scalar_temp(
     repeat_stmt: &mut crate::hir::common::HirRepeat,
     scratch: &mut TempUseScratch,
     live_use_counts: &mut [usize],
-    reference_captured: &ReferenceCapturedBindings,
+    captures: &TempInlineCaptureFacts<'_>,
     policy: RepeatInlinePolicy,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
@@ -3094,7 +3104,7 @@ fn inline_repeat_head_scalar_temp(
         repeat_stmt,
         scratch,
         live_use_counts,
-        reference_captured,
+        captures,
         policy,
         facts,
         inherited_captured_slots,
@@ -3105,7 +3115,7 @@ fn inline_repeat_head_scalar_temp_with_proven_prefix(
     repeat_stmt: &mut crate::hir::common::HirRepeat,
     scratch: &mut TempUseScratch,
     live_use_counts: &mut [usize],
-    reference_captured: &ReferenceCapturedBindings,
+    captures: &TempInlineCaptureFacts<'_>,
     policy: RepeatInlinePolicy,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
@@ -3157,7 +3167,7 @@ fn inline_repeat_head_scalar_temp_with_proven_prefix(
         &repeat_stmt.body.stmts[1..],
         &repeat_stmt.cond,
         &RepeatHeadDependencyProof {
-            reference_captured,
+            captures,
             safety: policy.safety,
             facts,
             captured_slots: &captured_slots,
@@ -3190,7 +3200,7 @@ fn is_repeat_header_rootless_scalar(expr: &HirExpr) -> bool {
 }
 
 struct RepeatHeadDependencyProof<'a> {
-    reference_captured: &'a ReferenceCapturedBindings,
+    captures: &'a TempInlineCaptureFacts<'a>,
     safety: HirExprSafety,
     facts: &'a ProtoPromotionFacts,
     captured_slots: &'a BTreeSet<HomeSlotKey>,
@@ -3239,19 +3249,13 @@ fn repeat_head_dependencies_are_stable(
                 condition,
                 temp,
                 true,
-                proof.reference_captured,
+                proof.captures.bindings,
             );
         if crosses_observable_eval {
             let source_is_identity_captured = read_identities
-                .overlaps_reference_captured(proof.reference_captured)
+                .overlaps_reference_captured(proof.captures.bindings)
                 || !read_identities.upvalues.is_empty();
-            let source_is_home_captured = if read_homes.is_empty() {
-                false
-            } else {
-                let reference_captured_homes =
-                    complete_reference_captured_home_slots(proof.reference_captured, proof.facts);
-                !read_homes.is_disjoint(&reference_captured_homes)
-            };
+            let source_is_home_captured = !read_homes.is_disjoint(&proof.captures.homes);
             if source_is_identity_captured || source_is_home_captured {
                 // 候选拒绝[SemanticBarrier:ValueFlow]：body 或 until 前缀的 call/lookup/元方法
                 // 可在延后读取前改写 captured identity/home；producer 冻结的旧值会丢失。
@@ -3261,21 +3265,17 @@ fn repeat_head_dependencies_are_stable(
     }
 
     let target_write_homes = complete_materialization_write_homes(temp, proof.facts);
-    if proof.reference_captured.temps.contains(&temp)
+    if proof.captures.bindings.temps.contains(&temp)
         || !target_write_homes.is_disjoint(proof.captured_slots)
     {
         // 候选拒绝[SemanticBarrier:Capture]：删除写入 captured temp identity/home 的 prefix
         // producer 会让 closure 观察上一轮 cell value。
         return false;
     }
-    if !target_write_homes.is_empty() {
-        let reference_captured_homes =
-            complete_reference_captured_home_slots(proof.reference_captured, proof.facts);
-        if !target_write_homes.is_disjoint(&reference_captured_homes) {
-            // 候选拒绝[SemanticBarrier:Capture]：prefix target 的 primary/hidden write 命中
-            // captured home 时，删除 producer 会改变 closure 观察值。
-            return false;
-        }
+    if !target_write_homes.is_disjoint(&proof.captures.homes) {
+        // 候选拒绝[SemanticBarrier:Capture]：prefix target 的 primary/hidden write 命中
+        // captured home 时，删除 producer 会改变 closure 观察值。
+        return false;
     }
     true
 }
@@ -4126,7 +4126,7 @@ mod tests {
             &mut repeat,
             &mut scratch,
             &mut live_uses,
-            &ReferenceCapturedBindings::default(),
+            &TempInlineCaptureFacts::new(&ReferenceCapturedBindings::default(), &facts),
             RepeatInlinePolicy {
                 readability: ReadabilityOptions::default(),
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
@@ -4168,7 +4168,7 @@ mod tests {
         facts.record_local_home_slot(source, HomeSlotKey::new(0, 0));
         facts.record_local_home_slot(other, HomeSlotKey::new(1, 0));
         let proof = RepeatHeadDependencyProof {
-            reference_captured: &empty_captures,
+            captures: &TempInlineCaptureFacts::new(&empty_captures, &facts),
             safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
             facts: &facts,
             captured_slots: &empty_slots,
@@ -4198,7 +4198,7 @@ mod tests {
             std::slice::from_ref(&alias_write),
             &condition,
             &RepeatHeadDependencyProof {
-                reference_captured: &empty_captures,
+                captures: &TempInlineCaptureFacts::new(&empty_captures, &alias_facts),
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 facts: &alias_facts,
                 captured_slots: &empty_slots,
@@ -4228,7 +4228,7 @@ mod tests {
             &body,
             &condition,
             &RepeatHeadDependencyProof {
-                reference_captured: &empty_captures,
+                captures: &TempInlineCaptureFacts::new(&empty_captures, &facts),
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 facts: &facts,
                 captured_slots: &empty_slots,
@@ -4243,7 +4243,7 @@ mod tests {
             &body,
             &condition,
             &RepeatHeadDependencyProof {
-                reference_captured: &captured,
+                captures: &TempInlineCaptureFacts::new(&captured, &facts),
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 facts: &facts,
                 captured_slots: &empty_slots,
@@ -4268,7 +4268,7 @@ mod tests {
             &closure_allocation,
             &condition,
             &RepeatHeadDependencyProof {
-                reference_captured: &captured,
+                captures: &TempInlineCaptureFacts::new(&captured, &facts),
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 facts: &facts,
                 captured_slots: &empty_slots,
@@ -4286,7 +4286,7 @@ mod tests {
             &close,
             &condition,
             &RepeatHeadDependencyProof {
-                reference_captured: &captured,
+                captures: &TempInlineCaptureFacts::new(&captured, &facts),
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 facts: &facts,
                 captured_slots: &empty_slots,
@@ -4320,7 +4320,7 @@ mod tests {
             &[],
             &HirExpr::TempRef(temp),
             &RepeatHeadDependencyProof {
-                reference_captured: &empty_captures,
+                captures: &TempInlineCaptureFacts::new(&empty_captures, &facts),
                 safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
                 facts: &facts,
                 captured_slots: &empty_slots,

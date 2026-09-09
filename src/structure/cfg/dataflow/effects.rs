@@ -17,11 +17,7 @@ pub(super) fn compute_reg_count(
     let mut max_reg = proto.frame.max_stack_size as usize;
 
     for effect in instr_effects {
-        for reg in effect
-            .fixed_uses()
-            .iter()
-            .chain(effect.fixed_must_defs().iter())
-        {
+        if let Some(reg) = effect.max_fixed_reg() {
             let Some(end) = reg.index().checked_add(1) else {
                 return Err(StructureError::invalid("register index overflows usize"));
             };
@@ -306,10 +302,9 @@ pub(super) fn compute_side_effect_summary(
         },
         _ if summary.may_observe_gc_roots() => RootObservation::PrefixLowerBound {
             end: effect
-                .fixed_uses()
-                .iter()
-                .chain(effect.fixed_must_defs())
+                .max_fixed_reg()
                 .map(|reg| reg.index().saturating_add(1))
+                .into_iter()
                 .chain(effect.open_use.map(Reg::index))
                 .chain(effect.open_must_def.map(Reg::index))
                 .max()

@@ -1,152 +1,129 @@
 //! 这个子模块负责把 singleton seed local handoff 合并成更自然的 global decl 形状。
 //!
-//! 它使用 typed binding identity 与 `BindingUseIndex`，并消费 HIR rewrite authority/origin；
-//! 不会越权推断缺失的 global 名称来源。接受候选必须是 singleton 精确 handoff，且只删除
-//! 无 provenance/lifetime 约束的 Recovered seed。
-//! 例如：`local seed = value; global g = seed` 会在这里尝试折成 `global g = value`。
+//! 它消费当前 AST 快照的使用次数和最后 mention 位置，并保留 HIR rewrite authority/origin。
+//! 候选只接受相邻的一对 seed/global；后续同属性 handoff 仍是原多目标 run 的拒绝边界。
+//! 例如 `local seed = value; global g = seed` 可折成 `global g = value`，原语句在判断
+//! 完成后统一移交，失败候选不复制整个后缀或嵌套子树。
 
-use super::super::binding_flow::{BindingUseIndex, binding_mentions_in_stmt};
+use std::collections::BTreeMap;
+
+use super::super::binding_flow::{BindingUseIndex, last_binding_mentions};
+use super::super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
 use crate::ast::common::{
     AstBindingRef, AstBlock, AstExpr, AstGlobalBinding, AstGlobalDecl, AstLocalAttr,
-    AstLocalBinding, AstLocalOrigin, AstStmt,
+    AstLocalOrigin, AstStmt,
 };
 
 pub(super) fn merge_seed_global_runs(block: &mut AstBlock) -> bool {
+    if !block
+        .stmts
+        .windows(2)
+        .any(|pair| matches!(pair, [AstStmt::LocalDecl(_), AstStmt::GlobalDecl(_)]))
+    {
+        return false;
+    }
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts(&old_stmts);
-    let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let last_mentions = last_binding_mentions(&old_stmts);
+    let mut stmt_plan = Vec::with_capacity(old_stmts.len());
     let mut index = 0usize;
     let mut changed = false;
 
     while index < old_stmts.len() {
-        if let Some((stmt, consumed)) = try_merge_seed_global_run(&old_stmts, &use_index, index) {
-            new_stmts.push(stmt);
+        if let Some((stmt, consumed)) =
+            try_merge_seed_global_run(&old_stmts, &use_index, &last_mentions, index)
+        {
+            stmt_plan.push(PlannedStmt::Rewritten(stmt));
             index += consumed;
             changed = true;
             continue;
         }
-        new_stmts.push(old_stmts[index].clone());
+        stmt_plan.push(PlannedStmt::Original(index));
         index += 1;
     }
 
-    block.stmts = new_stmts;
+    block.stmts = materialize_stmt_plan(old_stmts, stmt_plan);
     changed
 }
 
 fn try_merge_seed_global_run(
     stmts: &[AstStmt],
     use_index: &BindingUseIndex,
+    last_mentions: &BTreeMap<AstBindingRef, usize>,
     start: usize,
 ) -> Option<(AstStmt, usize)> {
-    let mut seeds = Vec::<(AstLocalBinding, AstExpr)>::new();
-    let mut index = start;
-    while let Some(stmt) = stmts.get(index) {
-        let AstStmt::LocalDecl(local_decl) = stmt else {
-            break;
-        };
-        if local_decl.bindings.len() != 1
-            || local_decl.values.len() != 1
-            || local_decl.bindings[0].attr != AstLocalAttr::None
-        {
-            break;
-        }
-        seeds.push((local_decl.bindings[0].clone(), local_decl.values[0].clone()));
-        index += 1;
-    }
-    if seeds.is_empty() {
+    let [AstStmt::LocalDecl(local_decl), next, ..] = stmts.get(start..)? else {
+        return None;
+    };
+    let ([seed], [value]) = (local_decl.bindings.as_slice(), local_decl.values.as_slice()) else {
+        return None;
+    };
+    if seed.attr != AstLocalAttr::None {
         return None;
     }
-
-    let mut globals = Vec::<(AstBindingRef, AstGlobalBinding)>::new();
-    let mut attr = None;
-    while let Some(stmt) = stmts.get(index) {
-        let AstStmt::GlobalDecl(global_decl) = stmt else {
-            break;
-        };
-        if global_decl.bindings.len() != 1 || global_decl.values.len() != 1 {
-            break;
-        }
-        let AstExpr::Var(name) = &global_decl.values[0] else {
-            break;
-        };
-        let Some(binding) = AstBindingRef::from_name_ref(name) else {
-            break;
-        };
-        let current_attr = global_decl.bindings[0].attr;
-        if attr.is_none() {
-            attr = Some(current_attr);
-        }
-        if attr != Some(current_attr) {
-            break;
-        }
-        globals.push((binding, global_decl.bindings[0].clone()));
-        index += 1;
-    }
-    if globals.is_empty() {
+    let (global_source, global_binding) = singleton_global_handoff(next)?;
+    if seed.id != global_source {
         return None;
     }
-
-    if seeds.len() != globals.len() {
-        return None;
-    }
-    if seeds
-        .iter()
-        .zip(&globals)
-        .any(|((seed, _), (global_source, _))| seed.id != *global_source)
+    if stmts
+        .get(start + 2)
+        .and_then(singleton_global_handoff)
+        .is_some_and(|(_, following)| following.attr == global_binding.attr)
     {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：原扫描会继续认领同属性 handoff，不能
+        // 把被拒绝的多目标 run 拆成首个 pair；全局写入顺序见 regress_335/regress_409。
         return None;
     }
-    if globals.len() > 1 {
-        // 候选拒绝[SemanticBarrier:EvalOrder]：精确同序的 singleton handoff 原本按
-        // 声明顺序写 global；Lua 5.5 多目标 global 声明会按目标逆序写入，
-        // `_ENV.__newindex` 可观察该反转，见 regress_335/regress_409。
+    if !seed.rewrite_authority.may_remove_binding() {
+        // 候选拒绝[LayerBoundary]：global decl sugar 会删除 seed local；HIR 已发布的
+        // binding 生命周期结论不能由 AST 的一对一 global 形状覆盖。
         return None;
     }
-
-    let mut merged_bindings = Vec::with_capacity(globals.len());
-    let mut merged_values = Vec::with_capacity(globals.len());
-    for ((seed, value), (global_source, global_binding)) in seeds.iter().zip(&globals) {
-        debug_assert_eq!(seed.id, *global_source);
-        if !seed.rewrite_authority.may_remove_binding() {
-            // 候选拒绝[LayerBoundary]：global decl sugar 会删除 seed local；HIR 已发布的
-            // binding 生命周期结论不能由 AST 的一对一 global 形状覆盖。
+    match seed.origin {
+        AstLocalOrigin::Recovered => {}
+        AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
+            // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted seed 是显式源码 local 身份；regress335 通过 debug.getlocal 观察该名字，声明合并不得抹掉它。
             return None;
         }
-        match seed.origin {
-            AstLocalOrigin::Recovered => {}
-            AstLocalOrigin::DebugHinted | AstLocalOrigin::DebugHintedPhysicalRoot => {
-                // 候选拒绝[SemanticBarrier:DebugScope]：DebugHinted seed 是显式源码 local 身份；regress335 通过 debug.getlocal 观察该名字，声明合并不得抹掉它。
-                return None;
-            }
-            AstLocalOrigin::PhysicalRoot => {
-                // 候选拒绝[SemanticBarrier:Lifetime]：global 随后被覆盖时，PhysicalRoot seed 仍须把旧值保活到原 block 末端；regress335 用弱表/GC 观察提前消失。
-                return None;
-            }
-        }
-        if use_index.count_uses_in_suffix(start, seed.id) != 1 {
-            // 候选拒绝[SemanticBarrier:Scope]：唯一允许的 seed use 是对应 global
-            // handoff；如 `global out=seed; return function() return seed end`，删除声明会
-            // 让后续 direct/captured use 失去 local owner。
+        AstLocalOrigin::PhysicalRoot => {
+            // 候选拒绝[SemanticBarrier:Lifetime]：global 随后被覆盖时，PhysicalRoot seed 仍须把旧值保活到原 block 末端；regress335 用弱表/GC 观察提前消失。
             return None;
         }
-        if stmts[index..]
-            .iter()
-            .any(|stmt| binding_mentions_in_stmt(stmt).contains(&seed.id))
-        {
-            // 候选拒绝[SemanticBarrier:Scope]：global handoff 后的 direct write 或
-            // `function seed.field()` 仍依赖该 local owner；删除声明会把它改成未声明/global
-            // binding。regress335 的 function-name seed 可直接观察生成源码失去 owner。
-            return None;
-        }
-        merged_bindings.push(global_binding.clone());
-        merged_values.push(value.clone());
+    }
+    if use_index.count_uses_in_suffix(start, seed.id) != 1 {
+        // 候选拒绝[SemanticBarrier:Scope]：唯一允许的 seed use 是对应 global
+        // handoff；如 `global out=seed; return function() return seed end`，删除声明会
+        // 让后续 direct/captured use 失去 local owner。
+        return None;
+    }
+    if last_mentions
+        .get(&seed.id)
+        .is_some_and(|&last| last >= start + 2)
+    {
+        // 候选拒绝[SemanticBarrier:Scope]：global handoff 后的 direct write 或
+        // `function seed.field()` 仍依赖该 local owner；删除声明会把它改成未声明/global
+        // binding。regress335 的 function-name seed 可直接观察生成源码失去 owner。
+        return None;
     }
 
     Some((
         AstStmt::GlobalDecl(Box::new(AstGlobalDecl {
-            bindings: merged_bindings,
-            values: merged_values,
+            bindings: vec![global_binding.clone()],
+            values: vec![value.clone()],
         })),
-        index - start,
+        2,
     ))
+}
+
+fn singleton_global_handoff(stmt: &AstStmt) -> Option<(AstBindingRef, &AstGlobalBinding)> {
+    let AstStmt::GlobalDecl(global_decl) = stmt else {
+        return None;
+    };
+    let ([binding], [AstExpr::Var(name)]) = (
+        global_decl.bindings.as_slice(),
+        global_decl.values.as_slice(),
+    ) else {
+        return None;
+    };
+    Some((AstBindingRef::from_name_ref(name)?, binding))
 }

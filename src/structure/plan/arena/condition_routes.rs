@@ -49,12 +49,6 @@ pub(super) fn index_branch_tail_edges(
         previous: Option<RegionId>,
     }
 
-    let mut blocks_by_owner = vec![Vec::new(); arena.regions.len()];
-    for (index, owner) in arena.region_by_block.iter().copied().enumerate() {
-        if let Some(owner) = owner {
-            blocks_by_owner[owner.index()].push(BlockRef(index));
-        }
-    }
     let mut active_by_continuation = vec![None; cfg.blocks.len()];
     let mut active = Vec::<ActiveBranch>::new();
     let mut tail_edges = vec![false; cfg.edges.len()];
@@ -82,7 +76,7 @@ pub(super) fn index_branch_tail_edges(
                 previous,
             });
         }
-        for block in &blocks_by_owner[region.index()] {
+        for block in arena.navigation.direct_blocks(region) {
             for edge in &cfg.succs[block.index()] {
                 let target = cfg.edges[edge.index()].to;
                 if active_by_continuation[target.index()].is_some() {

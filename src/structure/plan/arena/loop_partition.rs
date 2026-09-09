@@ -64,79 +64,58 @@ pub(super) fn index_loop_exit_tails(
     })
 }
 
+impl<'a> LoopPartitionContext<'a> {
+    pub(super) fn new(
+        cfg: &Cfg,
+        input: &FinalPlanInput,
+        forwarding: &'a ForwardingBoundaries,
+    ) -> Result<Self, StructureError> {
+        let mut branch_by_header = vec![None; cfg.blocks.len()];
+        for (index, branch) in input.branches.iter().enumerate() {
+            branch_by_header[branch.branch.header.index()] = Some(index);
+        }
+        let mut unstructured_by_block = vec![false; cfg.blocks.len()];
+        for island in &input.unstructured {
+            let blocks = island
+                .layout
+                .as_ref()
+                .map_or(&island.fact.blocks, |layout| &layout.blocks);
+            for &block in blocks {
+                let slot = unstructured_by_block
+                    .get_mut(block.index())
+                    .ok_or_else(|| {
+                        StructureError::invalid("unstructured block is outside the CFG block arena")
+                    })?;
+                *slot = true;
+            }
+        }
+        let mut residual_incidents_by_block = vec![Vec::new(); cfg.blocks.len()];
+        for residual in &input.residual_transfers {
+            let edge = cfg.edges.get(residual.edge.index()).ok_or_else(|| {
+                StructureError::invalid("residual transfer is outside the CFG edge arena")
+            })?;
+            residual_incidents_by_block[edge.from.index()].push(residual.edge);
+            if edge.to != edge.from {
+                residual_incidents_by_block[edge.to.index()].push(residual.edge);
+            }
+        }
+        Ok(Self {
+            forwarding,
+            branch_by_header,
+            unstructured_by_block,
+            residual_incidents_by_block,
+        })
+    }
+}
+
 pub(super) fn build_loop_partitions(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     caps: ControlFlowCaps,
     input: &FinalPlanInput,
+    context: &LoopPartitionContext<'_>,
 ) -> Result<Vec<LoopPartitions>, StructureError> {
-    let forwarding_barriers = input
-        .scopes
-        .iter()
-        .flat_map(|scope| {
-            scope
-                .exit
-                .into_iter()
-                .chain(std::iter::once(scope.entry))
-                .chain(
-                    scope
-                        .close_points
-                        .iter()
-                        .filter_map(|close| cfg.instr_to_block.get(close.index()).copied()),
-                )
-        })
-        .collect();
-    let label_targets = input
-        .residual_transfers
-        .iter()
-        .filter_map(|residual| cfg.edges.get(residual.edge.index()))
-        .map(|edge| edge.to)
-        .collect();
-    let mut branch_merge_by_header = vec![None; cfg.blocks.len()];
-    for branch in &input.branches {
-        branch_merge_by_header[branch.branch.header.index()] = branch.branch.merge;
-    }
-    let mut reachable_by_block = vec![false; cfg.blocks.len()];
-    for &block in &cfg.reachable_blocks {
-        let slot = reachable_by_block.get_mut(block.index()).ok_or_else(|| {
-            StructureError::invalid("reachable block is outside the CFG block arena")
-        })?;
-        *slot = true;
-    }
-    let mut unstructured_by_block = vec![false; cfg.blocks.len()];
-    for island in &input.unstructured {
-        let blocks = island
-            .layout
-            .as_ref()
-            .map_or(&island.fact.blocks, |layout| &layout.blocks);
-        for &block in blocks {
-            let slot = unstructured_by_block
-                .get_mut(block.index())
-                .ok_or_else(|| {
-                    StructureError::invalid("unstructured block is outside the CFG block arena")
-                })?;
-            *slot = true;
-        }
-    }
-    let mut residual_incidents_by_block = vec![Vec::new(); cfg.blocks.len()];
-    for residual in &input.residual_transfers {
-        let edge = cfg.edges.get(residual.edge.index()).ok_or_else(|| {
-            StructureError::invalid("residual transfer is outside the CFG edge arena")
-        })?;
-        residual_incidents_by_block[edge.from.index()].push(residual.edge);
-        if edge.to != edge.from {
-            residual_incidents_by_block[edge.to.index()].push(residual.edge);
-        }
-    }
-    let context = LoopPartitionContext {
-        forwarding_barriers,
-        label_targets,
-        branch_merge_by_header,
-        reachable_by_block,
-        unstructured_by_block,
-        residual_incidents_by_block,
-    };
     let inputs = LoopPartitionInputs {
         proto,
         cfg,
@@ -144,6 +123,9 @@ pub(super) fn build_loop_partitions(
         caps,
         input,
     };
+    if input.loops.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut workspaces = LoopPartitionWorkspaces {
         exit_pad: LoopExitPadWorkspace::new(cfg.blocks.len()),
         while_arm: WhileLexicalArmWorkspace::new(cfg.blocks.len(), cfg.edges.len()),
@@ -152,7 +134,7 @@ pub(super) fn build_loop_partitions(
     for (index, loop_) in input.loops.iter().enumerate() {
         partitions.push(build_loop_partition(
             &inputs,
-            &context,
+            context,
             &mut workspaces,
             index,
             loop_,
@@ -163,7 +145,7 @@ pub(super) fn build_loop_partitions(
 
 pub(super) fn build_loop_partition(
     inputs: &LoopPartitionInputs<'_>,
-    context: &LoopPartitionContext,
+    context: &LoopPartitionContext<'_>,
     workspaces: &mut LoopPartitionWorkspaces,
     index: usize,
     loop_: &super::super::LoopPlanInput,
@@ -468,7 +450,9 @@ pub(super) fn build_loop_partition(
         .collect::<BTreeSet<_>>();
     let is_own_branch_continuation = |edge: EdgeRef| {
         let edge = cfg.edges[edge.index()];
-        context.branch_merge_by_header[edge.from.index()] == Some(edge.to)
+        context.branch_by_header[edge.from.index()]
+            .and_then(|index| input.branches[index].branch.merge)
+            == Some(edge.to)
     };
     let mut continues = candidate.continue_edges.clone();
     continues.extend(loop_.semantic_continue_edges.iter().copied());
@@ -502,8 +486,8 @@ pub(super) fn build_loop_partition(
             cfg,
             &body,
             target,
-            &context.forwarding_barriers,
-            &context.label_targets,
+            &context.forwarding.barriers,
+            &context.forwarding.label_targets,
         )?;
         for block in &body {
             for edge in &cfg.succs[block.index()] {
@@ -586,8 +570,8 @@ pub(super) fn build_loop_partition(
                         cfg,
                         *edge,
                         target,
-                        &context.forwarding_barriers,
-                        &context.label_targets,
+                        &context.forwarding.barriers,
+                        &context.forwarding.label_targets,
                     )
                 {
                     break_routes.insert(*edge, route);

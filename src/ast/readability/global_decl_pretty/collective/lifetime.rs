@@ -13,7 +13,7 @@ use super::super::super::repeat_lifetime::binding_must_live_through_condition;
 
 pub(super) fn suffix_shortens_referenced_binding(stmts: &[AstStmt], expr: &AstExpr) -> bool {
     let expr_bindings = binding_mentions_in_expr(expr);
-    direct_suffix_bindings(stmts).any(|binding| expr_bindings.contains(&binding.id))
+    any_direct_suffix_binding(stmts, |binding| expr_bindings.contains(&binding.id))
 }
 
 pub(super) fn suffix_has_preserved_lifetime(
@@ -21,19 +21,23 @@ pub(super) fn suffix_has_preserved_lifetime(
     start: usize,
     lifetime: &HirRepeatConditionLifetimeFacts,
 ) -> bool {
-    direct_suffix_bindings(&stmts[start..])
-        .any(|binding| binding_must_live_through_condition(&binding, lifetime))
+    any_direct_suffix_binding(&stmts[start..], |binding| {
+        binding_must_live_through_condition(binding, lifetime)
+    })
 }
 
-fn direct_suffix_bindings(stmts: &[AstStmt]) -> impl Iterator<Item = AstLocalBinding> + '_ {
-    stmts.iter().flat_map(|stmt| match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl.bindings.clone(),
-        AstStmt::LocalFunctionDecl(function_decl) => vec![AstLocalBinding {
+fn any_direct_suffix_binding(
+    stmts: &[AstStmt],
+    mut predicate: impl FnMut(&AstLocalBinding) -> bool,
+) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        AstStmt::LocalDecl(local_decl) => local_decl.bindings.iter().any(&mut predicate),
+        AstStmt::LocalFunctionDecl(function_decl) => predicate(&AstLocalBinding {
             id: function_decl.name,
             attr: AstLocalAttr::None,
             origin: function_decl.origin,
             rewrite_authority: function_decl.rewrite_authority.clone(),
-        }],
+        }),
         AstStmt::Assign(_)
         | AstStmt::CallStmt(_)
         | AstStmt::Return(_)
@@ -49,6 +53,6 @@ fn direct_suffix_bindings(stmts: &[AstStmt]) -> impl Iterator<Item = AstLocalBin
         | AstStmt::Continue
         | AstStmt::Goto(_)
         | AstStmt::Label(_)
-        | AstStmt::Error(_) => Vec::new(),
+        | AstStmt::Error(_) => false,
     })
 }

@@ -4,7 +4,8 @@
 //! “哪些 synthetic local 最终其实只是丢弃位”这类信息，不能再靠 HIR/Raw 的原始槽位推断。
 //! 这里直接基于最终 AST 建一份轻量事实表，让命名阶段能按成品结构做决定。
 //! 全局名字按函数后序位置发布，函数只持有其最终 AST 子树区间，不沿 HIR children
-//! 复制后代集合。例如兄弟函数分别引用 x/y，父函数避让两者，各子函数只避让自己的名字。
+//! 复制后代集合。名字载荷借用该只读 AST，仅在本次命名内存活。例如兄弟函数分别
+//! 引用 x/y，父函数避让两者，各子函数只避让自己的名字。
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,13 +24,13 @@ use crate::graph::PositionIndex;
 use crate::hir::{HirModule, HirProtoRef};
 
 #[derive(Default)]
-pub(super) struct AstNamingFacts {
+pub(super) struct AstNamingFacts<'ast> {
     pub(super) functions: Vec<FunctionAstNamingFacts>,
-    global_names: PositionIndex<String>,
+    global_names: PositionIndex<&'ast str>,
     next_function_position: usize,
 }
 
-impl AstNamingFacts {
+impl AstNamingFacts<'_> {
     pub(super) fn reserves_global_name(&self, function: HirProtoRef, name: &str) -> bool {
         self.global_names
             .last_in(
@@ -47,7 +48,10 @@ pub(super) struct FunctionAstNamingFacts {
     global_name_range: Range<usize>,
 }
 
-pub(super) fn collect_ast_naming_facts(module: &AstModule, hir: &HirModule) -> AstNamingFacts {
+pub(super) fn collect_ast_naming_facts<'ast>(
+    module: &'ast AstModule,
+    hir: &HirModule,
+) -> AstNamingFacts<'ast> {
     let mut facts = AstNamingFacts {
         functions: vec![FunctionAstNamingFacts::default(); hir.protos.len()],
         ..AstNamingFacts::default()
@@ -57,25 +61,23 @@ pub(super) fn collect_ast_naming_facts(module: &AstModule, hir: &HirModule) -> A
 }
 
 #[derive(Debug, Default)]
-struct FunctionAstCollector {
-    binding_order: Vec<AstBindingRef>,
-    seen_bindings: BTreeSet<AstBindingRef>,
+struct FunctionAstCollector<'ast> {
+    binding_order: BTreeMap<AstBindingRef, usize>,
     declared_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
     mentioned_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
-    global_names: BTreeSet<String>,
+    global_names: BTreeSet<&'ast str>,
 }
 
-impl FunctionAstCollector {
+impl<'ast> FunctionAstCollector<'ast> {
     fn note_binding(&mut self, binding: AstBindingRef) {
-        if self.seen_bindings.insert(binding) {
-            self.binding_order.push(binding);
-        }
+        let next = self.binding_order.len();
+        self.binding_order.entry(binding).or_insert(next);
         if let AstBindingRef::SyntheticLocal(local) = binding {
             self.declared_synthetic_locals.insert(local);
         }
     }
 
-    fn note_name_ref(&mut self, name: &AstNameRef) {
+    fn note_name_ref(&mut self, name: &'ast AstNameRef) {
         match AstBindingRef::from_name_ref(name) {
             Some(AstBindingRef::Local(local)) => self.note_binding(AstBindingRef::Local(local)),
             Some(AstBindingRef::SyntheticLocal(local)) => {
@@ -85,7 +87,7 @@ impl FunctionAstCollector {
             Some(AstBindingRef::Temp(_)) => {}
             None => {
                 if let AstNameRef::Global(global) = name {
-                    self.global_names.insert(global.text.clone());
+                    self.global_names.insert(global.text.as_str());
                 }
             }
         }
@@ -94,17 +96,11 @@ impl FunctionAstCollector {
     fn finish(
         self,
         global_name_range: Range<usize>,
-        global_names: &mut PositionIndex<String>,
+        global_names: &mut PositionIndex<&'ast str>,
     ) -> FunctionAstNamingFacts {
         for name in self.global_names {
             global_names.record(name, global_name_range.end - 1);
         }
-        let debug_like_binding_order = self
-            .binding_order
-            .into_iter()
-            .enumerate()
-            .map(|(index, binding)| (binding, index))
-            .collect();
         let unused_synthetic_locals = self
             .declared_synthetic_locals
             .difference(&self.mentioned_synthetic_locals)
@@ -112,18 +108,18 @@ impl FunctionAstCollector {
             .collect();
 
         FunctionAstNamingFacts {
-            debug_like_binding_order,
+            debug_like_binding_order: self.binding_order,
             unused_synthetic_locals,
             global_name_range,
         }
     }
 }
 
-fn collect_function_facts(
+fn collect_function_facts<'ast>(
     function: HirProtoRef,
-    body: &AstBlock,
+    body: &'ast AstBlock,
     hir: &HirModule,
-    facts: &mut AstNamingFacts,
+    facts: &mut AstNamingFacts<'ast>,
 ) {
     let start = facts.next_function_position;
     let mut collector = FunctionAstCollector::default();
@@ -137,7 +133,7 @@ fn collect_function_facts(
 fn note_named_vararg_binding(
     function: HirProtoRef,
     hir: &HirModule,
-    collector: &mut FunctionAstCollector,
+    collector: &mut FunctionAstCollector<'_>,
 ) {
     let Some(proto) = hir.protos.get(function.index()) else {
         return;
@@ -147,22 +143,22 @@ fn note_named_vararg_binding(
     }
 }
 
-fn collect_block_facts(
-    block: &AstBlock,
-    collector: &mut FunctionAstCollector,
+fn collect_block_facts<'ast>(
+    block: &'ast AstBlock,
+    collector: &mut FunctionAstCollector<'ast>,
     hir: &HirModule,
-    facts: &mut AstNamingFacts,
+    facts: &mut AstNamingFacts<'ast>,
 ) {
     for stmt in &block.stmts {
         collect_stmt_facts(stmt, collector, hir, facts);
     }
 }
 
-fn collect_stmt_facts(
-    stmt: &AstStmt,
-    collector: &mut FunctionAstCollector,
+fn collect_stmt_facts<'ast>(
+    stmt: &'ast AstStmt,
+    collector: &mut FunctionAstCollector<'ast>,
     hir: &HirModule,
-    facts: &mut AstNamingFacts,
+    facts: &mut AstNamingFacts<'ast>,
 ) {
     // 先处理各变体的自定义 binding 收集
     match stmt {
@@ -174,7 +170,7 @@ fn collect_stmt_facts(
         AstStmt::GlobalDecl(global_decl) => {
             for binding in &global_decl.bindings {
                 if let AstGlobalBindingTarget::Name(name) = &binding.target {
-                    collector.global_names.insert(name.text.clone());
+                    collector.global_names.insert(name.text.as_str());
                 }
             }
         }
@@ -221,15 +217,18 @@ fn collect_stmt_facts(
     );
 }
 
-fn collect_nested_function_facts(
-    function_expr: &AstFunctionExpr,
+fn collect_nested_function_facts<'ast>(
+    function_expr: &'ast AstFunctionExpr,
     hir: &HirModule,
-    facts: &mut AstNamingFacts,
+    facts: &mut AstNamingFacts<'ast>,
 ) {
     collect_function_facts(function_expr.function, &function_expr.body, hir, facts);
 }
 
-fn collect_function_name_facts(target: &AstFunctionName, collector: &mut FunctionAstCollector) {
+fn collect_function_name_facts<'ast>(
+    target: &'ast AstFunctionName,
+    collector: &mut FunctionAstCollector<'ast>,
+) {
     let path = match target {
         AstFunctionName::Plain(path) => path,
         AstFunctionName::Method(path, _) => path,
@@ -237,22 +236,22 @@ fn collect_function_name_facts(target: &AstFunctionName, collector: &mut Functio
     collector.note_name_ref(&path.root);
 }
 
-fn collect_call_facts(
-    call: &AstCallKind,
-    collector: &mut FunctionAstCollector,
+fn collect_call_facts<'ast>(
+    call: &'ast AstCallKind,
+    collector: &mut FunctionAstCollector<'ast>,
     hir: &HirModule,
-    facts: &mut AstNamingFacts,
+    facts: &mut AstNamingFacts<'ast>,
 ) {
     traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
         collect_expr_facts(expr, collector, hir, facts);
     });
 }
 
-fn collect_lvalue_facts(
-    target: &AstLValue,
-    collector: &mut FunctionAstCollector,
+fn collect_lvalue_facts<'ast>(
+    target: &'ast AstLValue,
+    collector: &mut FunctionAstCollector<'ast>,
     hir: &HirModule,
-    facts: &mut AstNamingFacts,
+    facts: &mut AstNamingFacts<'ast>,
 ) {
     if let AstLValue::Name(name) = target {
         collector.note_name_ref(name);
@@ -262,11 +261,11 @@ fn collect_lvalue_facts(
     });
 }
 
-fn collect_expr_facts(
-    expr: &AstExpr,
-    collector: &mut FunctionAstCollector,
+fn collect_expr_facts<'ast>(
+    expr: &'ast AstExpr,
+    collector: &mut FunctionAstCollector<'ast>,
     hir: &HirModule,
-    facts: &mut AstNamingFacts,
+    facts: &mut AstNamingFacts<'ast>,
 ) {
     if let AstExpr::Var(name) = expr {
         collector.note_name_ref(name);

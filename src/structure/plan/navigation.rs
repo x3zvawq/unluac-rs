@@ -215,6 +215,15 @@ impl RegionNavigation {
             [self.owned_block_offsets[start]..self.owned_block_offsets[end]]
     }
 
+    /// 只借出当前 owner 的可达块，排除子 region，供 preorder 中的活动控制目标查询。
+    pub(super) fn direct_blocks(&self, region: RegionId) -> &[BlockRef] {
+        let Some(&position) = self.preorder_index.get(region.index()) else {
+            return &[];
+        };
+        &self.reachable_blocks_by_owner
+            [self.owned_block_offsets[position]..self.owned_block_offsets[position + 1]]
+    }
+
     pub(super) fn finish_layout(mut self, regions: &[RegionPlan]) -> Result<Self, StructureError> {
         self.freeze_completion_paths(regions)?;
         Ok(self)

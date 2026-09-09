@@ -43,8 +43,12 @@ impl VisibleNames {
             .is_some_and(|(_, &end)| position < end)
     }
 
-    fn insert(&mut self, name: String, mut range: Range<usize>) {
-        let ranges = self.ranges.entry(name).or_default();
+    fn insert(&mut self, name: &str, mut range: Range<usize>) {
+        let ranges = if let Some(ranges) = self.ranges.get_mut(name) {
+            ranges
+        } else {
+            self.ranges.entry(name.to_owned()).or_default()
+        };
         if let Some((&start, &end)) = ranges.range(..=range.start).next_back()
             && end >= range.start
         {

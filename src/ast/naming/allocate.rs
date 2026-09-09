@@ -19,7 +19,7 @@ use super::strategy::{
     choose_local_candidate, choose_param_candidate, choose_synthetic_local_candidate,
     choose_upvalue_candidate,
 };
-use super::support::{alphabetical_name, is_lua_keyword, lua_keywords};
+use super::support::{alphabetical_name, is_lua_keyword};
 use super::visibility::VisibleNames;
 
 impl ModuleNameAllocator {
@@ -48,10 +48,7 @@ impl ModuleNameAllocator {
             } else {
                 format!("{base}{next_suffix}")
             };
-            if !self.function_shape_names.contains(&text)
-                && !names.is_used(&text)
-                && !is_lua_keyword(&text)
-            {
+            if !self.function_shape_names.contains(&text) && !names.is_used(&text) {
                 self.function_shape_names.insert(text.clone());
                 self.next_function_shape_suffix
                     .insert(base, next_suffix.saturating_add(1));
@@ -70,7 +67,7 @@ pub(super) struct FunctionAssignContext<'a> {
     pub capture_evidence: Option<&'a ClosureCaptureEvidence>,
     pub hints: &'a FunctionHints,
     pub ast_facts: &'a FunctionAstNamingFacts,
-    pub module_ast_facts: &'a AstNamingFacts,
+    pub module_ast_facts: &'a AstNamingFacts<'a>,
     pub options: NamingOptions,
     pub visible_names: &'a VisibleNames,
     pub definition_position: usize,
@@ -79,7 +76,7 @@ pub(super) struct FunctionAssignContext<'a> {
 }
 
 struct FunctionNameAllocator<'a> {
-    ast_facts: &'a AstNamingFacts,
+    ast_facts: &'a AstNamingFacts<'a>,
     function: HirProtoRef,
     visible_names: &'a VisibleNames,
     definition_position: usize,
@@ -89,7 +86,7 @@ struct FunctionNameAllocator<'a> {
 
 impl<'a> FunctionNameAllocator<'a> {
     fn new(
-        ast_facts: &'a AstNamingFacts,
+        ast_facts: &'a AstNamingFacts<'a>,
         function: HirProtoRef,
         visible_names: &'a VisibleNames,
         definition_position: usize,
@@ -99,13 +96,15 @@ impl<'a> FunctionNameAllocator<'a> {
             function,
             visible_names,
             definition_position,
-            used: lua_keywords(),
+            used: BTreeSet::new(),
             next_suffix_by_base: BTreeMap::new(),
         }
     }
 
     fn is_used(&self, name: &str) -> bool {
-        self.used.contains(name) || self.ast_facts.reserves_global_name(self.function, name)
+        is_lua_keyword(name)
+            || self.used.contains(name)
+            || self.ast_facts.reserves_global_name(self.function, name)
     }
 
     fn is_outer_visible(&self, name: &str) -> bool {
@@ -130,7 +129,7 @@ impl<'a> FunctionNameAllocator<'a> {
         }
 
         let base = candidate.text;
-        if !self.is_used(&base) && !is_lua_keyword(&base) {
+        if !self.is_used(&base) {
             self.used.insert(base.clone());
             return NameInfo {
                 text: base,
@@ -143,7 +142,7 @@ impl<'a> FunctionNameAllocator<'a> {
         loop {
             let renamed = format!("{base}{suffix}");
             suffix = suffix.saturating_add(1);
-            if !self.is_used(&renamed) && !is_lua_keyword(&renamed) {
+            if !self.is_used(&renamed) {
                 self.next_suffix_by_base.insert(base, suffix);
                 self.used.insert(renamed.clone());
                 return NameInfo {
@@ -294,10 +293,7 @@ fn allocate_param_name(
 fn next_available_simple_param_name(mut index: usize, names: &FunctionNameAllocator<'_>) -> String {
     loop {
         let candidate = alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1));
-        if !names.is_used(&candidate)
-            && !names.is_outer_visible(&candidate)
-            && !is_lua_keyword(&candidate)
-        {
+        if !names.is_used(&candidate) && !names.is_outer_visible(&candidate) {
             return candidate;
         }
         index = index.saturating_add(1);

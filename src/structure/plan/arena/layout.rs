@@ -12,7 +12,7 @@ pub(in crate::structure::plan) fn layout_edge_facts(
     cfg: &Cfg,
     regions: &[RegionPlan],
     navigation: &RegionNavigation,
-) -> Result<Vec<LayoutEdgeFact>, StructureError> {
+) -> Vec<LayoutEdgeFact> {
     let mut sequence_positions = vec![None; regions.len()];
     let mut island_block_positions = vec![None; cfg.blocks.len()];
     let mut island_region_positions = vec![None; regions.len()];
@@ -44,8 +44,7 @@ pub(in crate::structure::plan) fn layout_edge_facts(
         }
     }
 
-    Ok(cfg
-        .edges
+    cfg.edges
         .iter()
         .enumerate()
         .map(|(edge_index, edge)| {
@@ -133,7 +132,7 @@ pub(in crate::structure::plan) fn layout_edge_facts(
                 | RegionPlan::Loop { .. } => LayoutEdgeFact::default(),
             }
         })
-        .collect())
+        .collect()
 }
 
 pub(super) fn freeze_labels(

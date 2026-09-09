@@ -7,6 +7,7 @@ pub(super) fn normalize_effectful_unknown_loop_conditions(
     graph_facts: &GraphFacts,
     input: &mut FinalPlanInput,
     partitions: &[LoopPartitions],
+    branch_by_header: &[Option<usize>],
 ) -> Result<bool, StructureError> {
     let mut while_true_guards = Vec::new();
     let mut loop_header_guards = Vec::new();
@@ -18,22 +19,13 @@ pub(super) fn normalize_effectful_unknown_loop_conditions(
         if loop_.candidate.kind_hint == crate::structure::LoopKindHint::WhileTrueLike
             && partition.control.is_empty()
             && let Some(continuation) = partition.continuation
-            && let Some((branch, condition)) =
-                input
-                    .branches
-                    .iter()
-                    .enumerate()
-                    .find_map(|(index, branch)| {
-                        (branch.branch.header == loop_.candidate.header)
-                            .then_some(branch.condition)
-                            .flatten()
-                            .and_then(|condition| {
-                                input
-                                    .conditions
-                                    .get(condition.index())
-                                    .map(|condition| (index, condition))
-                            })
-                    })
+            && let Some(branch) = branch_by_header
+                .get(loop_.candidate.header.index())
+                .copied()
+                .flatten()
+            && let Some(condition) = input.branches[branch]
+                .condition
+                .and_then(|condition| input.conditions.get(condition.index()))
             && let ShortCircuitExit::BranchExit { truthy, falsy } = condition.candidate.exit
         {
             let body = match (truthy == continuation, falsy == continuation) {
@@ -73,10 +65,11 @@ pub(super) fn normalize_effectful_unknown_loop_conditions(
                 truthy
             };
             if partition.body.contains(&remainder)
-                && let Some(branch) = input.branches.iter().position(|branch| {
-                    branch.branch.header == condition.candidate.header
-                        && branch.condition == Some(condition_id)
-                })
+                && let Some(branch) = branch_by_header
+                    .get(condition.candidate.header.index())
+                    .copied()
+                    .flatten()
+                && input.branches[branch].condition == Some(condition_id)
             {
                 loop_header_guards.push((branch, remainder));
             }
@@ -86,10 +79,12 @@ pub(super) fn normalize_effectful_unknown_loop_conditions(
             continue;
         }
 
-        let Some(prefix_branch) = input.branches.iter().position(|branch| {
-            branch.branch.header == condition.candidate.header
-                && branch.condition == Some(condition_id)
-        }) else {
+        let Some(prefix_branch) = branch_by_header
+            .get(condition.candidate.header.index())
+            .copied()
+            .flatten()
+            .filter(|&branch| input.branches[branch].condition == Some(condition_id))
+        else {
             continue;
         };
         let branch = &input.branches[prefix_branch].branch;

@@ -83,26 +83,25 @@ impl GlobalDeclPrettyPass {
             || BlockFacts::collect(block),
             |(condition, _)| BlockFacts::collect_repeat(block, condition),
         );
-        let mut missing = if facts.has_explicit_globals() || outer_declared.has_explicit_gate() {
-            facts.infer_missing(outer_declared)
-        } else {
-            MissingGlobals::default()
-        };
         let body_missing = facts.infer_body_missing(outer_declared);
-        if !body_missing.is_empty()
+        let mut missing = if !body_missing.is_empty()
             && !facts.has_explicit_globals()
             && try_wrap_missing_collective_suffix(
                 block,
                 &body_missing,
                 trailing.map(|(condition, _)| condition),
                 trailing.map(|(_, lifetime)| lifetime),
-            )
-        {
+            ) {
             // 新 gate 位于 suffix 的 `do` 内，只覆盖 body 观测。until 条件仍在该 `do`
             // 外，必须把它自己的 missing 保留下来交给逐名声明 owner。
-            missing = facts.infer_trailing_missing(outer_declared);
             changed = true;
-        }
+            MissingGlobals::default()
+        } else if facts.has_explicit_globals() || outer_declared.has_explicit_gate() {
+            body_missing
+        } else {
+            return changed;
+        };
+        facts.extend_trailing_missing(outer_declared, &mut missing);
         if !missing.is_empty() {
             let insert_at = facts.missing_insert_at(outer_declared);
             insert_missing_global_decls(block, &missing, insert_at);

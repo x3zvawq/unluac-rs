@@ -612,19 +612,15 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             return self.invalid_region(owner, "loop payload is missing its frozen condition plan");
         };
 
-        let condition = self
-            .lowering
-            .structure
-            .plan()
-            .condition(selected)
-            .cloned()
-            .ok_or(HirLowerError::MissingPlanPayload {
+        let condition = self.lowering.structure.plan().condition(selected).ok_or(
+            HirLowerError::MissingPlanPayload {
                 proto: self.proto.index(),
                 kind: "condition",
                 id: selected.index(),
-            })?;
-        self.verify_condition_plan(owner, &condition)?;
-        let decision = build_condition_decision_expr(self.lowering, &condition).ok_or(
+            },
+        )?;
+        self.verify_condition_plan(owner, condition)?;
+        let decision = build_condition_decision_expr(self.lowering, condition).ok_or(
             HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
                 region: owner.index(),

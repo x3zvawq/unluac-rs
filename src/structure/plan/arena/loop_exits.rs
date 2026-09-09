@@ -50,7 +50,7 @@ pub(super) struct WhileLexicalArmDomain<'a> {
 pub(super) fn verified_while_lexical_arms(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-    context: &LoopPartitionContext,
+    context: &LoopPartitionContext<'_>,
     domain: WhileLexicalArmDomain<'_>,
     workspace: &mut WhileLexicalArmWorkspace,
 ) -> Result<BTreeSet<BlockRef>, StructureError> {
@@ -144,7 +144,7 @@ pub(super) fn verified_while_lexical_arms(
 pub(super) fn closed_while_lexical_arm(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
-    context: &LoopPartitionContext,
+    context: &LoopPartitionContext<'_>,
     workspace: &mut WhileLexicalArmWorkspace,
     source: BlockRef,
     entry_edge: EdgeRef,
@@ -167,15 +167,9 @@ pub(super) fn closed_while_lexical_arm(
             continue;
         }
         if workspace.contains(block, WHILE_ARM_OWNED)?
-            || !context
-                .reachable_by_block
-                .get(block.index())
-                .copied()
-                .ok_or_else(|| {
-                    StructureError::invalid("while lexical arm block is outside the CFG arena")
-                })?
             // 单入口闭合 arm 的 entry 必须支配其全部 block。这个 interval 检查使
             // 多入口共享尾在首个汇合点即失败，避免每个入口重复遍历同一长尾。
+            // 正向支配树只覆盖可达域，无需另外展开 CFG 可达位图。
             || !graph_facts.dominates(entry, block)
             || context
                 .unstructured_by_block
@@ -219,15 +213,7 @@ pub(super) fn closed_while_lexical_arm(
                     "while lexical arm predecessor edge is outside the CFG arena",
                 )
             })?;
-            if !context
-                .reachable_by_block
-                .get(edge.from.index())
-                .copied()
-                .ok_or_else(|| {
-                    StructureError::invalid(
-                        "while lexical arm predecessor is outside the CFG arena",
-                    )
-                })?
+            if !graph_facts.dominates(cfg.entry_block, edge.from)
                 || workspace.is_visited(edge.from)?
             {
                 continue;

@@ -164,7 +164,12 @@ pub(in crate::structure) fn dump_graph_facts_tree(
             entry.id,
             format_display_set(&facts.rpo),
             format_edge_refs(&facts.backedges),
-            format_display_set(&facts.loop_headers),
+            format_display_set(
+                facts
+                    .natural_loops
+                    .iter()
+                    .map(|natural_loop| natural_loop.header)
+            ),
         );
 
         if matches!(detail, DebugDetail::Summary) {

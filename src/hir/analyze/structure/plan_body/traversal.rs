@@ -32,16 +32,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         while let Some(task) = tasks.pop() {
             match task {
                 LowerTask::Region(region) => {
-                    let node = self
-                        .lowering
-                        .structure
-                        .plan()
-                        .region(region)
-                        .cloned()
-                        .ok_or(HirLowerError::MissingPlanRegion {
+                    let node = self.lowering.structure.plan().region(region).ok_or(
+                        HirLowerError::MissingPlanRegion {
                             proto: self.proto.index(),
                             region: region.index(),
-                        })?;
+                        },
+                    )?;
                     let mut prefix = Vec::new();
                     self.emit_region_label(region, &mut prefix)?;
                     let mut region_local_decls = local_decl_stmts(
@@ -67,7 +63,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     prefix.extend(self.lower_region_inputs(region)?);
                     match node {
                         RegionPlan::Block { block, .. } => {
-                            prefix.extend(self.lower_block(region, block)?.stmts);
+                            prefix.extend(self.lower_block(region, *block)?.stmts);
                             results.push(HirBlock { stmts: prefix });
                         }
                         RegionPlan::Sequence { children, .. } => {
@@ -80,7 +76,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                                 child_count: children.len(),
                                 single_pass,
                             });
-                            tasks.extend(children.into_iter().rev().map(LowerTask::Region));
+                            tasks.extend(children.iter().rev().copied().map(LowerTask::Region));
                         }
                         RegionPlan::Branch {
                             plan,
@@ -93,18 +89,18 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                             tasks.push(LowerTask::FinishBranch {
                                 region,
                                 prefix,
-                                plan,
-                                condition,
+                                plan: *plan,
+                                condition: *condition,
                                 has_else: else_arm.is_some(),
                                 result_start,
                             });
                             if let Some(else_arm) = else_arm {
-                                tasks.push(LowerTask::Region(else_arm));
+                                tasks.push(LowerTask::Region(*else_arm));
                             }
-                            tasks.push(LowerTask::Region(then_arm));
+                            tasks.push(LowerTask::Region(*then_arm));
                         }
                         RegionPlan::ValueDecision { plan, .. } => {
-                            prefix.extend(self.lower_value_decision(region, plan)?.stmts);
+                            prefix.extend(self.lower_value_decision(region, *plan)?.stmts);
                             results.push(HirBlock { stmts: prefix });
                         }
                         RegionPlan::Loop {
@@ -119,16 +115,16 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                             tasks.push(LowerTask::FinishLoop {
                                 region,
                                 prefix,
-                                plan,
-                                preheader,
-                                control,
-                                normal_tail,
+                                plan: *plan,
+                                preheader: *preheader,
+                                control: *control,
+                                normal_tail: *normal_tail,
                                 result_start,
                             });
                             if let Some(normal_tail) = normal_tail {
-                                tasks.push(LowerTask::Region(normal_tail));
+                                tasks.push(LowerTask::Region(*normal_tail));
                             }
-                            tasks.push(LowerTask::Region(body));
+                            tasks.push(LowerTask::Region(*body));
                         }
                         RegionPlan::Unstructured { layout, .. } => {
                             let result_start = results.len();
@@ -140,12 +136,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                                 item_count: layout.len(),
                                 single_pass: false,
                             });
-                            tasks.extend(layout.into_iter().rev().map(|item| match item {
+                            tasks.extend(layout.iter().rev().map(|item| match item {
                                 UnstructuredLayoutItem::Block(block) => LowerTask::Block {
                                     owner: region,
-                                    block,
+                                    block: *block,
                                 },
-                                UnstructuredLayoutItem::Region(child) => LowerTask::Region(child),
+                                UnstructuredLayoutItem::Region(child) => LowerTask::Region(*child),
                             }));
                         }
                     }

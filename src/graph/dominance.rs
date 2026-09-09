@@ -46,13 +46,19 @@ pub(crate) fn dominator_tree<N: Copy + Eq + std::fmt::Display, I: IntoIterator<I
     let Some(root) = traversal.preorder.first().copied() else {
         return Ok(tree);
     };
+    if traversal.preorder.len() == 1 {
+        tree.order.push(root);
+        tree.preorder_index[index(root)] = Some(0);
+        tree.subtree_end[index(root)] = Some(1);
+        return Ok(tree);
+    }
     let mut semi = vec![usize::MAX; node_count];
     let mut label = (0..node_count).map(&node_at).collect::<Vec<_>>();
     for (number, node) in traversal.preorder.iter().copied().enumerate() {
         semi[index(node)] = number;
     }
     let mut ancestor = vec![None; node_count];
-    let mut idom = vec![None; node_count];
+    let idom = &mut tree.parent;
     idom[index(root)] = Some(root);
     let mut buckets = vec![Vec::new(); node_count];
     let mut eval_path = Vec::with_capacity(node_count);
@@ -104,13 +110,11 @@ pub(crate) fn dominator_tree<N: Copy + Eq + std::fmt::Display, I: IntoIterator<I
             })?);
         }
     }
-    for (node_index, maybe_idom) in idom.into_iter().enumerate() {
-        let node = node_at(node_index);
-        if node != root
-            && let Some(parent) = maybe_idom
-        {
-            tree.parent[node_index] = Some(parent);
-            tree.children[index(parent)].push(node);
+    // root 自指只服务于构建期修正；发布的支配树根节点没有父节点。
+    idom[index(root)] = None;
+    for (node_index, maybe_idom) in idom.iter().copied().enumerate() {
+        if let Some(parent) = maybe_idom {
+            tree.children[index(parent)].push(node_at(node_index));
         }
     }
     let mut pending = vec![root];

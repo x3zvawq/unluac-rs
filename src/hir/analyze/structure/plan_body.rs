@@ -2,6 +2,7 @@
 //!
 //! 这里不按 header 搜候选、不做试降回滚，也不把 emitted 集合作为结构决策依据。
 //! region、edge 与 value identity 已在 Structure 冻结；本模块只执行计划并校验引用一致性。
+//! lowering 直接借用冻结 payload，只有输出 HIR、任务栈与发射校验状态由本层独占。
 
 use std::collections::BTreeMap;
 

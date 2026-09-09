@@ -544,6 +544,14 @@ impl InstrEffect {
         &self.fixed_must_defs
     }
 
+    /// 固定读写域已排序；容量和观察边界只需比较两个端点。
+    pub(crate) fn max_fixed_reg(&self) -> Option<Reg> {
+        self.fixed_uses
+            .last()
+            .max(self.fixed_must_defs.last())
+            .copied()
+    }
+
     pub fn uses_fixed(&self, reg: Reg) -> bool {
         self.fixed_uses.binary_search(&reg).is_ok()
     }

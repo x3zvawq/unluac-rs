@@ -20,7 +20,11 @@ pub(super) fn extend_branch_value_arm(
     // header 之后重新流回入口，就已经构成 backedge。顺序 branch 的 preserved arm
     // 因而无需反复展开随前序分支增长的整条 Phi 链。
     let needs_dominated_update_check = carries_entry
-        && (incoming.value != entry_value || graph_facts.loop_headers.contains(&header));
+        && (incoming.value != entry_value
+            || graph_facts
+                .natural_loop_forest()
+                .loop_for_header(header)
+                .is_some());
     let is_dominated_update = needs_dominated_update_check
         && dataflow.leaf_defs(incoming.value).iter().any(|def| {
             let block = dataflow.def_block(*def);

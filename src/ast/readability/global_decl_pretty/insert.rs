@@ -29,12 +29,12 @@ pub(super) fn insert_missing_global_decls(
         return;
     }
 
-    let old_stmts = std::mem::take(&mut block.stmts);
+    let mut old_stmts = std::mem::take(&mut block.stmts).into_iter();
     let insert_at = insert_at.min(old_stmts.len());
     let mut new_stmts = Vec::with_capacity(old_stmts.len() + inserted.len());
-    new_stmts.extend(old_stmts.iter().take(insert_at).cloned());
+    new_stmts.extend(old_stmts.by_ref().take(insert_at));
     new_stmts.extend(inserted);
-    new_stmts.extend(old_stmts.into_iter().skip(insert_at));
+    new_stmts.extend(old_stmts);
     block.stmts = new_stmts;
 }
 

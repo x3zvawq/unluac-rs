@@ -163,4 +163,8 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_522_lua55_function_target_global_gate.lua",
         &[LuaCaseDialect::Lua55],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_523_lua55_global_missing_promotion.lua",
+        &[LuaCaseDialect::Lua55],
+    ),
 ];

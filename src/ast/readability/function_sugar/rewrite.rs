@@ -65,79 +65,51 @@ fn rewrite_block(
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
 
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
+    let mut old_stmts = old_stmts.into_iter();
     let mut index = 0;
-    while index < old_stmts.len() {
-        if let Some((stmt, consumed)) =
-            try_recover_certified_method_setup(&old_stmts[index..], method_transactions)
-        {
-            new_stmts.push(stmt);
-            changed = true;
-            index += consumed;
-            continue;
-        }
+    while let Some(first) = old_stmts.as_slice().first() {
+        let remaining = old_stmts.as_slice();
+        let rewritten = try_recover_certified_method_setup(remaining, method_transactions)
+            .or_else(|| try_inline_terminal_constructor_fields(remaining))
+            .or_else(|| {
+                try_inline_terminal_constructor_call(
+                    remaining,
+                    &use_index,
+                    index,
+                    mutable_snapshots,
+                )
+            })
+            .or_else(|| {
+                try_recover_method_alias_stmt(
+                    remaining,
+                    &use_index,
+                    &write_index,
+                    index,
+                    mutable_snapshots,
+                )
+            })
+            .or_else(|| try_chain_local_method_call_stmt(remaining, &use_index, index))
+            .or_else(|| {
+                try_lower_forwarded_function_stmt(
+                    remaining,
+                    &use_index,
+                    index,
+                    target,
+                    mutable_snapshots,
+                )
+            })
+            .or_else(|| lower_direct_function_stmt(first, target).map(|stmt| (stmt, 1)));
 
-        if let Some((stmt, consumed)) = try_inline_terminal_constructor_fields(&old_stmts[index..])
-        {
+        if let Some((stmt, consumed)) = rewritten {
             new_stmts.push(stmt);
             changed = true;
+            old_stmts.by_ref().take(consumed).for_each(drop);
             index += consumed;
-            continue;
-        }
-
-        if let Some((stmt, consumed)) = try_inline_terminal_constructor_call(
-            &old_stmts[index..],
-            &use_index,
-            index,
-            mutable_snapshots,
-        ) {
-            new_stmts.push(stmt);
-            changed = true;
-            index += consumed;
-            continue;
-        }
-
-        if let Some((stmt, consumed)) = try_recover_method_alias_stmt(
-            &old_stmts[index..],
-            &use_index,
-            &write_index,
-            index,
-            mutable_snapshots,
-        ) {
-            new_stmts.push(stmt);
-            changed = true;
-            index += consumed;
-            continue;
-        }
-
-        if let Some((stmt, consumed)) =
-            try_chain_local_method_call_stmt(&old_stmts[index..], &use_index, index)
-        {
-            new_stmts.push(stmt);
-            changed = true;
-            index += consumed;
-            continue;
-        }
-
-        if let Some((stmt, consumed)) = try_lower_forwarded_function_stmt(
-            &old_stmts[index..],
-            &use_index,
-            index,
-            target,
-            mutable_snapshots,
-        ) {
-            new_stmts.push(stmt);
-            changed = true;
-            index += consumed;
-            continue;
-        }
-
-        if let Some(stmt) = lower_direct_function_stmt(&old_stmts[index], target) {
-            new_stmts.push(stmt);
-            changed = true;
         } else {
-            new_stmts.push(old_stmts[index].clone());
+            // 索引保留原始坐标，未命中的语句直接移交；父块不再复制已改写的子树。
+            new_stmts.push(old_stmts.next().expect("remaining statement checked above"));
+            index += 1;
         }
-        index += 1;
     }
 
     block.stmts = new_stmts;

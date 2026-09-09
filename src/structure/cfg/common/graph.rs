@@ -21,7 +21,6 @@ pub struct GraphFacts {
     pub dominance_frontier: Vec<BTreeSet<BlockRef>>,
     pub(crate) scc: SccFacts,
     pub backedges: Vec<EdgeRef>,
-    pub loop_headers: BTreeSet<BlockRef>,
     pub natural_loops: Vec<NaturalLoop>,
     /// natural-loop evidence 的唯一 containment 索引。
     ///
@@ -149,6 +148,7 @@ pub struct DominatorTree {
     pub(crate) preorder_index: Vec<Option<usize>>,
     pub(crate) subtree_end: Vec<Option<usize>>,
     pub(crate) depth: Vec<Option<usize>>,
+    /// 第 k 行是 2^(k+1) 步祖先；单步祖先直接使用 parent。
     pub(crate) ancestors: Vec<Vec<Option<BlockRef>>>,
 }
 
@@ -171,6 +171,7 @@ pub struct PostDominatorTree {
     pub(crate) preorder_index: Vec<Option<usize>>,
     pub(crate) subtree_end: Vec<Option<usize>>,
     pub(crate) depth: Vec<Option<usize>>,
+    /// 第 k 行是 2^(k+1) 步祖先；单步祖先直接使用 parent。
     pub(crate) ancestors: Vec<Vec<Option<BlockRef>>>,
 }
 
@@ -202,6 +203,7 @@ pub struct NaturalLoop {
 /// 建立 parent/children。每个 reachable block 只保存一个 innermost owner；因此
 /// `direct_blocks` 的总长度最多为 block 数，而不是 `block × loop-depth`。遇到不可规约
 /// 的交叠 domain 时，owner 会标记为不确定并保守返回 `None`，绝不猜一个祖先关系。
+/// 歧义标记只在构建期阻止 owner 恢复；发布时 `None` 已承载该结果。无 loop 时不保存 CFG 容量。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NaturalLoopForest {
     loop_by_header: Vec<Option<NaturalLoopId>>,
@@ -211,7 +213,6 @@ pub struct NaturalLoopForest {
     innermost_by_block: Vec<Option<NaturalLoopId>>,
     preorder_index: Vec<Option<usize>>,
     subtree_end: Vec<Option<usize>>,
-    ambiguous_blocks: Vec<bool>,
 }
 
 /// Natural-loop 在 `GraphFacts::natural_loops` 中的稠密 ID。
@@ -231,18 +232,14 @@ impl NaturalLoopForest {
         dominator_tree: &DominatorTree,
         block_count: usize,
     ) -> Self {
+        if loops.is_empty() {
+            return Self::default();
+        }
         let loop_count = loops.len();
         let mut loop_by_header = vec![None; block_count];
         for (index, natural_loop) in loops.iter().enumerate() {
-            let Some(slot) = loop_by_header.get_mut(natural_loop.header.index()) else {
-                continue;
-            };
-            // GraphFacts 已在 CFG 校验后生成；重复 header 理论上不可能，因为
-            // compute_natural_loops 会先按 header 合并回边。冲突时保留第一份并让
-            // 后续 domain containment 证明自然失败，而不是覆盖已有身份。
-            if slot.is_none() {
-                *slot = Some(NaturalLoopId(index));
-            }
+            // 唯一生产者已校验 CFG，并按 header 合并全部回边，身份无需再次去重。
+            loop_by_header[natural_loop.header.index()] = Some(NaturalLoopId(index));
         }
 
         let mut parent = vec![None; loop_count];
@@ -257,10 +254,7 @@ impl NaturalLoopForest {
                     let candidate_index = candidate.index();
                     let candidate_loop = &loops[candidate_index];
                     if candidate_loop.blocks.len() > natural_loop.blocks.len()
-                        && natural_loop
-                            .blocks
-                            .iter()
-                            .all(|member| candidate_loop.blocks.contains(member))
+                        && natural_loop.blocks.is_subset(&candidate_loop.blocks)
                     {
                         parent[index] = Some(candidate);
                         break;
@@ -276,10 +270,6 @@ impl NaturalLoopForest {
                 children[ancestor.index()].push(NaturalLoopId(index));
             }
         }
-        for child_list in &mut children {
-            child_list.sort_unstable();
-        }
-
         // 先冻结 loop containment 的 Euler 区间。后面的 block owner 判定只需要一次
         // 区间查询；如果沿 parent 链逐个回溯，深层嵌套会把同一份 evidence 放大为
         // `block × loop-depth` 的重复工作。
@@ -308,9 +298,9 @@ impl NaturalLoopForest {
             }
         }
 
-        // A block can belong to several natural domains only when the domains are nested in
-        // the reducible case. Compare the domains explicitly so an overlapping irreducible
-        // pair never receives an invented innermost owner.
+        // 每条 parent 边已证明严格集合包含，且该关系可传递；owner 选择直接消费
+        // 冻结的祖先区间，不按 block 重复比较整个 domain。仅有集合包含而没有
+        // 已证明的 forest 祖先关系时，仍按交叠处理，不签发 innermost owner。
         let mut innermost_by_block = vec![None; block_count];
         let mut ambiguous_blocks = vec![false; block_count];
         for (index, natural_loop) in loops.iter().enumerate() {
@@ -326,26 +316,14 @@ impl NaturalLoopForest {
                     *current_slot = Some(current_id);
                     continue;
                 };
-                if previous_id == current_id {
-                    continue;
-                }
-                let previous = &loops[previous_id.index()];
-                // `parent` points from an inner loop to its outer loop.  Keep the
-                // smaller domain as the innermost owner, regardless of the order in
-                // which headers were discovered.  A strict subset without the same
-                // forest relation is an overlap (or malformed evidence), so it must
-                // stay ambiguous instead of inventing an owner.
-                if natural_loop.blocks.len() < previous.blocks.len()
-                    && natural_loop.blocks.is_subset(&previous.blocks)
-                    && strict_loop_ancestor(&preorder_index, &subtree_end, previous_id, current_id)
-                {
+                if strict_loop_ancestor(&preorder_index, &subtree_end, previous_id, current_id) {
                     *current_slot = Some(current_id);
-                } else if previous.blocks.len() < natural_loop.blocks.len()
-                    && previous.blocks.is_subset(&natural_loop.blocks)
-                    && strict_loop_ancestor(&preorder_index, &subtree_end, current_id, previous_id)
-                {
-                    // The existing owner is the strict inner loop.
-                } else {
+                } else if !strict_loop_ancestor(
+                    &preorder_index,
+                    &subtree_end,
+                    current_id,
+                    previous_id,
+                ) {
                     *current_slot = None;
                     ambiguous_blocks[block.index()] = true;
                 }
@@ -367,7 +345,6 @@ impl NaturalLoopForest {
             innermost_by_block,
             preorder_index,
             subtree_end,
-            ambiguous_blocks,
         }
     }
 
@@ -408,14 +385,6 @@ impl NaturalLoopForest {
 
     /// 查询某个 block 的唯一 innermost loop；交叠/不可规约 domain 返回 `None`。
     pub fn innermost_loop(&self, block: BlockRef) -> Option<NaturalLoopId> {
-        if self
-            .ambiguous_blocks
-            .get(block.index())
-            .copied()
-            .unwrap_or(true)
-        {
-            return None;
-        }
         self.innermost_by_block
             .get(block.index())
             .copied()
@@ -522,14 +491,19 @@ fn nearest_common_tree_ancestor(
         std::mem::swap(&mut left, &mut right);
         std::mem::swap(&mut left_depth, &mut right_depth);
     }
-    left = lift_tree_node(ancestors, left, left_depth - right_depth)?;
+    left = lift_tree_node(parent, ancestors, left, left_depth - right_depth)?;
 
     if left == right {
         return Some(left);
     }
-    for level in (0..ancestors.len()).rev() {
-        let left_ancestor = ancestors[level][left.index()];
-        let right_ancestor = ancestors[level][right.index()];
+    for level in ancestors
+        .iter()
+        .rev()
+        .map(Vec::as_slice)
+        .chain(std::iter::once(parent))
+    {
+        let left_ancestor = level[left.index()];
+        let right_ancestor = level[right.index()];
         if left_ancestor != right_ancestor
             && let (Some(next_left), Some(next_right)) = (left_ancestor, right_ancestor)
         {
@@ -542,21 +516,18 @@ fn nearest_common_tree_ancestor(
 }
 
 fn lift_tree_node(
+    parent: &[Option<BlockRef>],
     ancestors: &[Vec<Option<BlockRef>>],
     mut block: BlockRef,
     mut distance: usize,
 ) -> Option<BlockRef> {
-    let mut level = 0;
+    let mut levels = std::iter::once(parent).chain(ancestors.iter().map(Vec::as_slice));
     while distance != 0 {
+        let level = levels.next()?;
         if distance & 1 != 0 {
-            block = ancestors
-                .get(level)?
-                .get(block.index())
-                .copied()
-                .flatten()?;
+            block = level.get(block.index()).copied().flatten()?;
         }
         distance >>= 1;
-        level += 1;
     }
     Some(block)
 }

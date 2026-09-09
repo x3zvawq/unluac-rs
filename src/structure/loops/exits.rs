@@ -294,10 +294,6 @@ pub(super) fn block_is_while_header_like(
         return true;
     }
 
-    let carried_regs = header_value_merges
-        .iter()
-        .map(|value| value.reg)
-        .collect::<BTreeSet<_>>();
     let terminator_index = range.end() - 1;
     let Some(branch_effect) = dataflow.instr_effects.get(terminator_index) else {
         return false;
@@ -315,7 +311,9 @@ pub(super) fn block_is_while_header_like(
             let Some(effect) = dataflow.instr_effects.get(instr_index) else {
                 return false;
             };
-            if carried_regs.iter().any(|reg| effect.must_define(*reg))
+            if header_value_merges
+                .iter()
+                .any(|value| effect.must_define(value.reg))
                 || !instr_is_while_header_prefix(instr)
             {
                 return false;

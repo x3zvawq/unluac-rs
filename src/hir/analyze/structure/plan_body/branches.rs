@@ -11,7 +11,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         mut then_arm: HirBlock,
         else_arm: Option<HirBlock>,
     ) -> Result<HirBlock, HirLowerError> {
-        let payload = self.lowering.structure.plan().branch(plan).cloned().ok_or(
+        let payload = self.lowering.structure.plan().branch(plan).ok_or(
             HirLowerError::MissingPlanPayload {
                 proto: self.proto.index(),
                 kind: "branch",
@@ -46,14 +46,13 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             .structure
             .plan()
             .condition(condition_plan)
-            .cloned()
             .ok_or(HirLowerError::MissingPlanPayload {
                 proto: self.proto.index(),
                 kind: "condition",
                 id: condition_plan.index(),
             })?;
-        self.verify_condition_plan(owner, &selected)?;
-        let decision = build_condition_decision_expr(self.lowering, &selected).ok_or(
+        self.verify_condition_plan(owner, selected)?;
+        let decision = build_condition_decision_expr(self.lowering, selected).ok_or(
             HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
                 region: owner.index(),
@@ -68,7 +67,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         })?;
         let stmts = self.lower_condition_prefix(owner, header)?;
         #[cfg(debug_assertions)]
-        for block in selected.blocks {
+        for block in selected.blocks() {
             if block != header {
                 self.mark_block_emitted(
                     owner,
@@ -91,18 +90,14 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         region: RegionId,
         plan: crate::structure::ValueDecisionPlanId,
     ) -> Result<HirBlock, HirLowerError> {
-        let selected = self
-            .lowering
-            .structure
-            .plan()
-            .value_decision(plan)
-            .cloned()
-            .ok_or(HirLowerError::MissingPlanPayload {
+        let selected = self.lowering.structure.plan().value_decision(plan).ok_or(
+            HirLowerError::MissingPlanPayload {
                 proto: self.proto.index(),
                 kind: "value-decision",
                 id: plan.index(),
-            })?;
-        self.verify_value_decision_plan(region, &selected)?;
+            },
+        )?;
+        self.verify_value_decision_plan(region, selected)?;
         if self.lowering.structure.plan().value_decision_region(plan) != Some(region) {
             return self
                 .invalid_region(region, "value decision payload is bound to another region");
@@ -112,7 +107,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             region: region.index(),
             detail: "value decision has no entry node",
         })?;
-        let decision = build_value_decision_expr(self.lowering, &selected).ok_or(
+        let decision = build_value_decision_expr(self.lowering, selected).ok_or(
             HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
                 region: region.index(),

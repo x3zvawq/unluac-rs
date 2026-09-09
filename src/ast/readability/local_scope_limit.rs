@@ -16,7 +16,7 @@ use super::super::common::{
     AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstLocalAttr, AstLocalBinding,
     AstLocalOrigin, AstModule, AstStmt,
 };
-use super::binding_flow::{binding_mentions_in_expr, binding_mentions_in_stmt};
+use super::binding_flow::{binding_mentions_in_expr, last_binding_mentions};
 use super::control_flow::BlockGotoIndex;
 use super::{ReadabilityContext, walk};
 use crate::ast::traverse::BlockKind;
@@ -247,16 +247,6 @@ fn scopeable_bindings(stmt: &AstStmt) -> Option<ScopeableBindings<'_>> {
         }
         _ => None,
     }
-}
-
-fn last_binding_mentions(stmts: &[AstStmt]) -> BTreeMap<AstBindingRef, usize> {
-    let mut last_mentions = BTreeMap::new();
-    for (index, stmt) in stmts.iter().enumerate() {
-        for binding in binding_mentions_in_stmt(stmt) {
-            last_mentions.insert(binding, index);
-        }
-    }
-    last_mentions
 }
 
 fn scopeable_local_prefix(stmts: &[AstStmt]) -> Vec<usize> {

@@ -33,7 +33,7 @@ pub(super) fn try_wrap_missing_collective_suffix(
         .none
         .iter()
         .chain(&missing.const_)
-        .cloned()
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     if names.is_empty() {
         return false;
@@ -117,7 +117,7 @@ fn has_incoming_goto(block: &AstBlock, start: usize) -> bool {
     })
 }
 
-fn stmt_mentions_any_missing_global(stmt: &AstStmt, names: &BTreeSet<String>) -> bool {
+fn stmt_mentions_any_missing_global(stmt: &AstStmt, names: &BTreeSet<&str>) -> bool {
     let mut visitor = MissingGlobalStmtVisitor {
         names,
         found: false,
@@ -126,16 +126,16 @@ fn stmt_mentions_any_missing_global(stmt: &AstStmt, names: &BTreeSet<String>) ->
     visitor.found
 }
 
-struct MissingGlobalStmtVisitor<'a> {
-    names: &'a BTreeSet<String>,
+struct MissingGlobalStmtVisitor<'a, 'names> {
+    names: &'a BTreeSet<&'names str>,
     found: bool,
 }
 
-impl AstVisitor for MissingGlobalStmtVisitor<'_> {
+impl AstVisitor for MissingGlobalStmtVisitor<'_, '_> {
     fn visit_name(&mut self, name: &AstNameRef, _access: NameAccess) -> ControlFlow<()> {
         // 函数 target 的根引用同样由 visitor 发布；例如 box.f 的 box 在写字段前读取。
         if let AstNameRef::Global(global) = name
-            && self.names.contains(&global.text)
+            && self.names.contains(global.text.as_str())
         {
             self.found = true;
             return ControlFlow::Break(());

@@ -16,7 +16,10 @@
 //! consumer 直接消费它，完整 CFG 也复用该结果，不为验证边界而构造后继与可达性。
 //! 构图与重入查询的临时词法导航复用路径栈，仅已登记 label 和重入边界拥有路径副本。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+};
 
 use crate::hir::common::{
     HirBlock, HirExpr, HirGenericFor, HirLabelId, HirRepeat, HirStmt, LocalId,
@@ -174,6 +177,8 @@ pub(super) enum FlowRefinement<S> {
 /// lattice，避免 root、liveness 和 reaching-def 因为共享 topology 而被耦合在一起。
 pub(super) struct HirFlowGraph<'a> {
     nodes: Vec<HirFlowNode<'a>>,
+    // 只在前向求解时冻结最终入边的 0/1/多条分类；可达性/SCC 查询不分配此表。
+    incoming_multiplicity: OnceCell<Box<[u8]>>,
     entry: HirFlowNodeId,
     exit: HirFlowNodeId,
     goto_edges: Vec<(HirFlowNodeId, OwnerLabelLocation)>,
@@ -237,12 +242,16 @@ impl<'a> HirFlowGraph<'a> {
         mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S) -> R,
         mut refine: impl FnMut(&'a HirExpr, bool, &S) -> FlowRefinement<S>,
     ) -> Vec<Option<R>> {
-        let mut incoming_edges = vec![0usize; self.nodes.len()];
-        for node in &self.nodes {
-            for successor in node.successors().keys() {
-                incoming_edges[successor.index()] += 1;
+        let incoming_edges = self.incoming_multiplicity.get_or_init(|| {
+            let mut incoming = vec![0u8; self.nodes.len()];
+            for node in &self.nodes {
+                for successor in node.successors().keys() {
+                    let count = &mut incoming[successor.index()];
+                    *count = (*count + 1).min(2);
+                }
             }
-        }
+            incoming.into_boxed_slice()
+        });
         let mut results = std::iter::repeat_with(|| None)
             .take(self.nodes.len())
             .collect::<Vec<_>>();
@@ -623,6 +632,7 @@ impl<'a> HirFlowGraphBuilder<'a> {
 
         Ok(HirFlowGraph {
             nodes: self.nodes,
+            incoming_multiplicity: OnceCell::new(),
             entry,
             exit,
             goto_edges,
@@ -1007,13 +1017,15 @@ mod tests {
             condition.successors(),
             &BTreeMap::from([(graph.exit(), None)])
         );
-        let outputs = graph.solve_forward(
-            7,
-            |_, _| panic!("a linear path has no joins"),
-            |_, _, state| *state,
-            |_, _, _| panic!("coincident exits impose no condition"),
-        );
-        assert_eq!(outputs[graph.exit().index()], Some(7));
+        for initial in [7, 19] {
+            let outputs = graph.solve_forward(
+                initial,
+                |_, _| panic!("a linear path has no joins"),
+                |_, _, state| *state,
+                |_, _, _| panic!("coincident exits impose no condition"),
+            );
+            assert_eq!(outputs[graph.exit().index()], Some(initial));
+        }
     }
 
     #[test]
