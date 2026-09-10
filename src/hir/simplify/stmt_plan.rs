@@ -1,6 +1,6 @@
-//! HIR 快照内的语句路径与已证明删除计划共用的提交器。
+//! HIR 快照内的语句路径与已证明改写计划共用的提交器。
 //!
-//! entry-nil 与死布尔壳各自证明哪些写入可删；这里统一解释 `Stmt/Then/Else/Body`
+//! entry-nil 与死布尔壳证明删除，repeat root 发布端点证书；这里统一解释 `Stmt/Then/Else/Body`
 //! 坐标，只执行已经完成的计划，不重新分析控制流、binding 或生命周期。路径必须来自
 //! 同一根节点的改写前快照，不能跨 rewrite 当作持久身份；删除计数始终包含原来的槽位。
 //! 例如 `[Stmt(2), Then, Stmt(1)]` 删除原第 3 条 if 的 then 第 2 条语句，前面的
@@ -20,22 +20,20 @@ pub(super) enum PathComponent {
 
 pub(super) type StmtPath = Vec<PathComponent>;
 
-/// 临时导航复用同一条路径；先恢复父路径，再交还包括 `Err` 在内的分析结果。
-pub(super) fn with_path_component<R>(
-    path: &mut StmtPath,
-    component: PathComponent,
-    visit: impl FnOnce(&mut StmtPath) -> R,
-) -> R {
-    path.push(component);
-    let result = visit(path);
-    path.pop();
-    result
-}
-
 pub(super) fn remove_planned_stmts(
     block: &mut HirBlock,
     path: &mut StmtPath,
     plan: &BTreeSet<StmtPath>,
+) {
+    retain_stmts_with_paths(block, path, &mut |_, path| !plan.contains(path));
+}
+
+/// 后序提交同一快照的语句改写；回调返回 false 才删除当前语句。
+/// 回调不能移动、插入或删除其它待提交语句，否则它们的原始坐标将失效。
+pub(super) fn retain_stmts_with_paths(
+    block: &mut HirBlock,
+    path: &mut StmtPath,
+    retain: &mut impl FnMut(&mut HirStmt, &StmtPath) -> bool,
 ) {
     let mut index = 0;
     block.stmts.retain_mut(|stmt| {
@@ -45,11 +43,11 @@ pub(super) fn remove_planned_stmts(
             HirStmt::LocalRootRelease(_) => None,
             HirStmt::If(if_stmt) => {
                 path.push(PathComponent::Then);
-                remove_planned_stmts(&mut if_stmt.then_block, path, plan);
+                retain_stmts_with_paths(&mut if_stmt.then_block, path, retain);
                 path.pop();
                 if let Some(else_block) = &mut if_stmt.else_block {
                     path.push(PathComponent::Else);
-                    remove_planned_stmts(else_block, path, plan);
+                    retain_stmts_with_paths(else_block, path, retain);
                     path.pop();
                 }
                 None
@@ -75,11 +73,11 @@ pub(super) fn remove_planned_stmts(
         };
         if let Some(body) = body {
             path.push(PathComponent::Body);
-            remove_planned_stmts(body, path, plan);
+            retain_stmts_with_paths(body, path, retain);
             path.pop();
         }
-        let retain = !plan.contains(path);
+        let keep = retain(stmt, path);
         path.pop();
-        retain
+        keep
     });
 }

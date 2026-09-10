@@ -110,7 +110,7 @@ pub(crate) fn build_final_structure_plan(
     Ok(plan)
 }
 
-/// value/cleanup ownership 安装完成后的全量 plan 校验入口。
+/// value/cleanup ownership 安装完成后的发布校验；区域拓扑已在 arena 完成时验证并冻结。
 pub(crate) fn validate_final_structure_plan(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -118,8 +118,17 @@ pub(crate) fn validate_final_structure_plan(
     dataflow: &super::super::DataflowFacts,
     debug_bindings: &crate::structure::DebugBindingFacts,
     plan: &StructurePlan,
+    loop_analysis: &loop_protocol::LoopValueAnalysis,
 ) -> Result<(), StructureError> {
-    validate::validate_final(proto, cfg, graph_facts, dataflow, debug_bindings, plan)
+    validate::validate_final(
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        debug_bindings,
+        plan,
+        loop_analysis,
+    )
 }
 
 pub(crate) fn finalize_loop_contracts(
@@ -128,7 +137,7 @@ pub(crate) fn finalize_loop_contracts(
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     plan: &mut StructurePlan,
-) -> Result<(), StructureError> {
+) -> Result<loop_protocol::LoopValueAnalysis, StructureError> {
     loop_protocol::finalize(proto, cfg, graph_facts, dataflow, plan)
 }
 

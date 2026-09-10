@@ -3,8 +3,8 @@
 //!
 //! 这里只消费已经存在的 `If/Goto/Label`，不重新解释 CFG，也不接管同一 lvalue 选值；
 //! branch-value 形状仍由 `branch_value_folding` 先处理。每轮先为当前 block 建一次 label
-//! 位置和引用计数，再按不交叉区间从右向左改写，避免多个 guard 共用 label 时反复全块
-//! 扫描和重建。
+//! 位置和引用计数，再选取不交叉区间一次移动原语句，避免多个 guard 共用 label 时反复全块
+//! 扫描、深复制和搬移后缀。
 //! 条件能否删除或合并重复求值统一消费入口按目标方言构造的表达式安全上下文。
 //! 身份元数据在 body 改写期间只读借用；label/resource 分析仍按每轮改写前的 body 冻结。
 //! 新建 local 的 debug 空槽与 home-free 事实在 body 改写结束后一起发布。
@@ -19,6 +19,8 @@ mod path_conditions;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::graph::PositionIndex;
+
 use crate::hir::common::{
     HirBinaryOpKind, HirBlock, HirCallExpr, HirCallStmt, HirExpr, HirIf, HirLValue, HirLabelId,
     HirLocalDecl, HirLogicalExpr, HirProto, HirStmt, HirUnaryOpKind, HirValuePack, LocalId,
@@ -31,7 +33,8 @@ use super::expr_facts::expr_truthiness;
 use super::label_refs::count_label_references;
 use super::lexical_cfg::{LexicalCfgFailure, validate_region_entry};
 use super::logical_simplify::{
-    normalize_condition_context, simplify_condition_truthiness_shape_with_safety,
+    condition_needs_normalization, condition_not_costs, normalize_condition_context,
+    simplify_condition_truthiness_shape_with_safety,
 };
 use super::mention::{stmts_mentioned_locals, stmts_protected_locals};
 use super::walk::{HirRewritePass, rewrite_block};
@@ -865,8 +868,10 @@ fn fold_leading_while_break_guard(stmt: &mut HirStmt) -> bool {
     {
         return false;
     }
-    while_stmt.cond = normalize_condition_context(&guard.cond, true).expr;
-    while_stmt.body.stmts.remove(0);
+    let HirStmt::If(guard) = while_stmt.body.stmts.remove(0) else {
+        unreachable!("validated loop guard remains the first statement");
+    };
+    while_stmt.cond = normalize_condition_context(guard.cond, true);
     true
 }
 
@@ -874,26 +879,24 @@ fn naturalize_if_polarity(stmt: &mut HirStmt) -> bool {
     let HirStmt::If(if_stmt) = stmt else {
         return false;
     };
-    let Some(else_block) = if_stmt.else_block.as_ref() else {
+    let Some(else_block) = if_stmt.else_block.as_mut() else {
         return false;
     };
     if if_stmt.then_block.stmts.is_empty() || else_block.stmts.is_empty() {
         return false;
     }
 
-    let current = normalize_condition_context(&if_stmt.cond, false);
-    let negated = normalize_condition_context(&if_stmt.cond, true);
-    if negated.not_cost < current.not_cost {
-        let Some(else_block) = if_stmt.else_block.as_mut() else {
-            return false;
-        };
-        if_stmt.cond = negated.expr;
+    let [positive, negative] = condition_not_costs(&if_stmt.cond);
+    if negative < positive {
+        if_stmt.cond =
+            normalize_condition_context(std::mem::replace(&mut if_stmt.cond, HirExpr::Nil), true);
         std::mem::swap(&mut if_stmt.then_block, else_block);
         return true;
     }
 
-    if current.changed {
-        if_stmt.cond = current.expr;
+    if condition_needs_normalization(&if_stmt.cond) {
+        if_stmt.cond =
+            normalize_condition_context(std::mem::replace(&mut if_stmt.cond, HirExpr::Nil), false);
         return true;
     }
     false
@@ -936,6 +939,19 @@ enum BranchMoveFailure {
     UnsupportedRootFlow,
 }
 
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+enum MoveBoundary {
+    Label,
+    Close,
+}
+
+struct BranchMoveRegion<'a> {
+    stmts: &'a [HirStmt],
+    suffix: &'a [HirStmt],
+    has_label: bool,
+    has_cleanup: bool,
+}
+
 fn fold_forward_gotos(
     stmts: &mut Vec<HirStmt>,
     kind: FoldKind,
@@ -945,6 +961,8 @@ fn fold_forward_gotos(
     primitive_locals: &ImmutablePrimitiveLocals,
 ) -> bool {
     let label_indices = index_top_level_labels(stmts);
+    let mut boundaries = PositionIndex::default();
+    let mut indexed_end = 0;
     let mut groups = BTreeMap::<usize, FoldGroup>::new();
 
     for (if_index, stmt) in stmts.iter().enumerate() {
@@ -967,11 +985,31 @@ fn fold_forward_gotos(
             // 仍有其它入口，它会继续保留为真实目标，否则 deferred dead-labels 清扫它。
             continue;
         }
-        let body = &stmts[(if_index + 1)..label_index];
-        let suffix = &stmts[(label_index + 1)..];
+        let range = (if_index + 1)..label_index;
+        // 候选起点递增，终点可回退；只补充此前查询并集之外的子树，跳过永不再查的空隙。
+        for (index, stmt) in stmts
+            .iter()
+            .enumerate()
+            .take(range.end)
+            .skip(indexed_end.max(range.start))
+        {
+            visit_stmt_structure(stmt, &mut |stmt| match stmt {
+                HirStmt::Label(_) => boundaries.record(MoveBoundary::Label, index),
+                HirStmt::Close(_) => boundaries.record(MoveBoundary::Close, index),
+                _ => {}
+            });
+        }
+        indexed_end = indexed_end.max(range.end);
+        let region = BranchMoveRegion {
+            stmts: &stmts[range.clone()],
+            suffix: &stmts[(label_index + 1)..],
+            has_label: boundaries
+                .last_in(&MoveBoundary::Label, range.clone())
+                .is_some(),
+            has_cleanup: boundaries.last_in(&MoveBoundary::Close, range).is_some(),
+        };
         let Err(failure) = can_move_into_branch(
-            body,
-            suffix,
+            region,
             move_facts,
             owner_label_refs,
             safety,
@@ -1038,14 +1076,27 @@ fn fold_forward_gotos(
         next_start = start;
         selected.push(group);
     }
-    for group in selected {
+    let mut original = std::mem::take(stmts).into_iter();
+    let mut rewritten = Vec::with_capacity(original.len());
+    let mut position = 0;
+    // 选择顺序仍从右到左；提交按原坐标顺序消费互不重叠的区域，不重复移动已处理后缀。
+    for group in selected.into_iter().rev() {
+        let first = group.candidates[0].if_index;
+        rewritten.extend(original.by_ref().take(first - position));
+        let region = original
+            .by_ref()
+            .take(group.label_index - first + 1)
+            .collect();
+        position = group.label_index + 1;
         let keep_label = owner_label_refs
             .get(&group.label)
             .copied()
             .unwrap_or_default()
             > group.candidates.len();
-        rewrite_fold_group(stmts, group, kind, keep_label);
+        rewritten.extend(rewrite_fold_group(region, group, kind, keep_label));
     }
+    rewritten.extend(original);
+    *stmts = rewritten;
     true
 }
 
@@ -1088,20 +1139,19 @@ fn fold_adjacent_conditional_gotos(stmts: &mut [HirStmt]) -> bool {
 }
 
 fn rewrite_fold_group(
-    stmts: &mut Vec<HirStmt>,
+    mut stmts: Vec<HirStmt>,
     group: FoldGroup,
     kind: FoldKind,
     keep_label: bool,
-) {
+) -> Vec<HirStmt> {
     let first = group.candidates[0].if_index;
-    let mut next = group.label_index;
+    let label = stmts.pop().expect("fold region ends at its label");
     let mut nested = Vec::new();
 
     for candidate in group.candidates.into_iter().rev() {
-        let if_index = candidate.if_index;
-        let mut body = stmts[(if_index + 1)..next].to_vec();
+        let mut body = stmts.split_off(candidate.if_index - first + 1);
         body.append(&mut nested);
-        let HirStmt::If(if_stmt) = stmts[if_index].clone() else {
+        let Some(HirStmt::If(if_stmt)) = stmts.pop() else {
             unreachable!("branch-control fold index must point to an if")
         };
         nested = vec![HirStmt::If(Box::new(rewrite_if(
@@ -1110,13 +1160,12 @@ fn rewrite_fold_group(
             kind,
             candidate.invert_cond,
         )))];
-        next = if_index;
     }
 
     if keep_label {
-        nested.push(stmts[group.label_index].clone());
+        nested.push(label);
     }
-    stmts.splice(first..=group.label_index, nested);
+    nested
 }
 
 fn rewrite_if(mut if_stmt: HirIf, body: Vec<HirStmt>, kind: FoldKind, invert_cond: bool) -> HirIf {
@@ -1180,31 +1229,33 @@ fn fold_target(stmt: &HirStmt, kind: FoldKind) -> Option<(HirLabelId, bool)> {
 }
 
 fn can_move_into_branch(
-    stmts: &[HirStmt],
-    suffix: &[HirStmt],
+    region: BranchMoveRegion<'_>,
     facts: &ForwardBranchMoveFacts,
     owner_label_refs: &BTreeMap<HirLabelId, usize>,
     safety: HirExprSafety,
     primitive_locals: &ImmutablePrimitiveLocals,
 ) -> Result<(), BranchMoveFailure> {
-    match validate_region_entry(stmts, owner_label_refs) {
-        Ok(_) => {}
-        Err(LexicalCfgFailure::AmbiguousLabel) => {
-            return Err(BranchMoveFailure::AmbiguousControl);
-        }
-        Err(LexicalCfgFailure::ExternalEntry) => {
-            return Err(BranchMoveFailure::ExternalControlEntry);
+    let BranchMoveRegion {
+        stmts,
+        suffix,
+        has_label,
+        has_cleanup,
+    } = region;
+    // 没有内部 label 就没有待验证的控制入口；含 label 时仍核对重复定义及完整引用计数。
+    if has_label {
+        match validate_region_entry(stmts, owner_label_refs) {
+            Ok(_) => {}
+            Err(LexicalCfgFailure::AmbiguousLabel) => {
+                return Err(BranchMoveFailure::AmbiguousControl);
+            }
+            Err(LexicalCfgFailure::ExternalEntry) => {
+                return Err(BranchMoveFailure::ExternalControlEntry);
+            }
         }
     }
 
     // raw cleanup 的边界仍位于指令之间；先由资源 pass 物化 owner，再移动整个词法块。
-    let mut pending_cleanup = false;
-    for stmt in stmts {
-        visit_stmt_structure(stmt, &mut |stmt| {
-            pending_cleanup |= matches!(stmt, HirStmt::Close(_))
-        });
-    }
-    if pending_cleanup {
+    if has_cleanup {
         return Err(BranchMoveFailure::ResourceScope);
     }
 

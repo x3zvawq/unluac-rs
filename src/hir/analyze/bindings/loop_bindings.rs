@@ -1,14 +1,9 @@
 //! 分配 for/phi 状态绑定并保留其物理覆盖终点；依赖最终 loop value plan 与 Dataflow
 //! 覆盖关系，不负责捕获槽位。例如循环后的 `state = nil` 仍写回 carried 身份，
 //! 不会成为独立死 temp 而丢失原 VM 清根行为。
+//! 循环 owner 与唯一入口值直接消费 PhiPlan 的已证明输入，不在 binding 分配中重建处置。
 
 use super::*;
-
-#[derive(Clone, Copy)]
-pub(super) struct LoopCarriedBinding {
-    pub(super) owner: RegionId,
-    pub(super) input: SsaValue,
-}
 
 /// 无值读取的 scalar 写入仍可能结束循环状态的强根。只接回已证明的 carried 身份，
 /// 不按槽号合并不同 value epoch，也不把新分配对象的根延长到旧 local 的作用域末尾。
@@ -29,7 +24,7 @@ pub(super) fn preserve_loop_state_overwrites(
         let temp = phi_temps[phi.phi.index()];
         if numeric_phis[phi.phi.index()] || debug_hints[phi.phi.index()].is_some() {
             blocked_temps.insert(temp);
-        } else if loop_carried_binding(plan, phi).is_some() {
+        } else if phi.loop_carried().is_some() {
             carried_temps.insert(temp);
         }
     }
@@ -82,17 +77,13 @@ pub(super) fn coalesce_nested_loop_carried_temps(
     dataflow: &DataflowFacts,
     phi_temps: &mut [TempId],
 ) -> Vec<Option<PhiId>> {
-    let carried = plan
-        .phis()
-        .map(|phi| loop_carried_binding(plan, phi))
-        .collect::<Vec<_>>();
-    let mut parents = vec![None; carried.len()];
+    let mut parents = vec![None; plan.phis().len()];
 
     for phi in plan.phis() {
         if dataflow.reg_is_captured(phi.reg) {
             continue;
         }
-        let Some(binding) = carried.get(phi.phi.index()).copied().flatten() else {
+        let Some(binding) = phi.loop_carried() else {
             continue;
         };
         let SsaValue::Phi(source) = binding.input else {
@@ -101,7 +92,7 @@ pub(super) fn coalesce_nested_loop_carried_temps(
         let Some(source_plan) = plan.phi_plan(source) else {
             continue;
         };
-        let Some(source_binding) = carried.get(source.index()).copied().flatten() else {
+        let Some(source_binding) = source_plan.loop_carried() else {
             continue;
         };
         if source_plan.reg == phi.reg
@@ -262,7 +253,7 @@ pub(super) fn coalesce_loop_state_temps(
         if dataflow.reg_is_captured(phi.reg) || numeric_binding_phis[phi.phi.index()] {
             continue;
         }
-        let Some(carried) = loop_carried_binding(plan, phi) else {
+        let Some(carried) = phi.loop_carried() else {
             continue;
         };
         let Some(RegionPlan::Loop {
@@ -520,7 +511,7 @@ pub(super) fn repeat_stage_carried_temp(
     if dataflow.reg_is_captured(result.reg) {
         return None;
     }
-    let carried = loop_carried_binding(plan, result)?;
+    let carried = result.loop_carried()?;
     if carried.owner == owner
         || !plan.region_contains(carried.owner, owner)
         || !nested_carried_child_owners.contains(&(target, owner))
@@ -528,43 +519,6 @@ pub(super) fn repeat_stage_carried_temp(
         return None;
     }
     phi_temps.get(target.index()).copied()
-}
-
-pub(super) fn loop_carried_binding(
-    plan: &StructurePlan,
-    phi: &PhiPlan,
-) -> Option<LoopCarriedBinding> {
-    let mut owner = None;
-    let mut input = None;
-    let mut has_carried = false;
-    for incoming in &phi.incomings {
-        let region = match incoming.disposition {
-            PhiIncomingDisposition::RegionInput(region) => {
-                if input.replace(incoming.value).is_some() {
-                    return None;
-                }
-                region
-            }
-            PhiIncomingDisposition::LoopCarried(region) => {
-                has_carried = true;
-                region
-            }
-            PhiIncomingDisposition::Dead => continue,
-            PhiIncomingDisposition::RegionResult(_)
-            | PhiIncomingDisposition::EdgeCopy
-            | PhiIncomingDisposition::DiagnosticUnresolved => return None,
-        };
-        if owner.replace(region).is_some_and(|owner| owner != region) {
-            return None;
-        }
-    }
-    let owner = owner?;
-    (has_carried && matches!(plan.region(owner), Some(RegionPlan::Loop { .. }))).then_some(
-        LoopCarriedBinding {
-            owner,
-            input: input?,
-        },
-    )
 }
 
 pub(super) fn loop_body_region(plan: &StructurePlan, loop_id: LoopPlanId) -> Option<RegionId> {

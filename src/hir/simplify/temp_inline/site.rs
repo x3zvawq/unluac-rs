@@ -494,7 +494,7 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
                 if let Some(found) = if site.preserves_execution_region() {
                     find_site_in_expr(arg, temp, site.nested())
                 } else if fastcall.fixed_is_direct(index) {
-                    find_site_in_fastcall_arg(arg, temp, arg_site)
+                    find_site_in_expr_with_fastcall_context(arg, temp, arg_site)
                 } else {
                     find_site_in_expr(arg, temp, arg_site)
                 } {
@@ -505,7 +505,11 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
                 if site.preserves_execution_region() {
                     find_site_in_expr(tail.as_expr(), temp, site.nested())
                 } else if fastcall.tail_is_direct() {
-                    find_site_in_fastcall_arg(tail.as_expr(), temp, InlineSite::FastCallArg)
+                    find_site_in_expr_with_fastcall_context(
+                        tail.as_expr(),
+                        temp,
+                        InlineSite::FastCallArg,
+                    )
                 } else {
                     find_site_in_expr(tail.as_expr(), temp, InlineSite::CallArg)
                 }
@@ -521,12 +525,17 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
     })
 }
 
-fn find_site_in_fastcall_arg(
+/// 代换后的依赖保留其原消费上下文；FASTCALL direct 参数的纯壳层不能降为普通 nested。
+pub(super) fn inline_dependency_site(
     expr: &HirExpr,
     temp: TempId,
-    direct_site: InlineSite,
+    site: InlineSite,
 ) -> Option<InlineSite> {
-    find_site_in_expr_with_fastcall_context(expr, temp, direct_site)
+    if site == InlineSite::FastCallArg {
+        find_site_in_expr_with_fastcall_context(expr, temp, site)
+    } else {
+        find_site_in_expr(expr, temp, site)
+    }
 }
 
 fn find_site_in_expr_with_fastcall_context(

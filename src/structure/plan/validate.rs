@@ -1,3 +1,7 @@
+//! 按事实冻结时点校验 StructurePlan，避免发布时重建已经验证的区域拓扑。
+//! arena 完成后校验 root、containment 与导航；后续只安装动作、ownership 等载荷。
+//! 例如 phi copy 安装后仍须检查 edge payload，但不改变其所在区域及祖先关系。
+
 use std::collections::BTreeSet;
 
 use super::{
@@ -67,6 +71,14 @@ pub(super) fn validate(
 
     validate_containment(plan)?;
     plan.navigation.validate(cfg, plan)?;
+    validate_payloads(proto, cfg, plan)
+}
+
+fn validate_payloads(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    plan: &StructurePlan,
+) -> Result<(), StructureError> {
     validate_block_terminators(proto, cfg, plan)?;
     validate_block_coverage(cfg, plan)?;
     validate_region_entries(cfg, plan)?;
@@ -88,8 +100,9 @@ pub(super) fn validate_final(
     dataflow: &DataflowFacts,
     debug_bindings: &crate::structure::DebugBindingFacts,
     plan: &StructurePlan,
+    loop_analysis: &super::loop_protocol::LoopValueAnalysis,
 ) -> Result<(), StructureError> {
-    validate(proto, cfg, plan)?;
+    validate_payloads(proto, cfg, plan)?;
     crate::structure::scope::validate_label_tbc_barriers(cfg, plan)?;
     validate_condition_predicates(proto, plan)?;
     validate_condition_prefix_placements(proto, cfg, plan)?;
@@ -105,7 +118,7 @@ pub(super) fn validate_final(
         }
     }
     validate_block_emissions(cfg, plan)?;
-    super::loop_protocol::validate(proto, cfg, graph_facts, dataflow, plan)?;
+    super::loop_protocol::validate(proto, cfg, graph_facts, dataflow, plan, loop_analysis)?;
     validate_condition_values(proto, cfg, dataflow, plan)?;
     validate_value_decision_values(proto, cfg, dataflow, plan)?;
     Ok(())

@@ -6,12 +6,13 @@
 //! 本模块不重建 CFG、寄存器覆盖或 loop cleanup 协议，也不直接删除 Close。
 //! 求值事件按顶层位置累计总数，origin 只索引可接受事件；相同 owner 的多个 typed event
 //! 分别计数。候选以区间计数相等证明 must 覆盖，不逐候选重扫整张事件表。
+//! 事件的根层位置在共享图构建时投影到节点索引；不另走语句树建立地址到位置的关联。
 
 use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 use super::{ScopeCandidate, paired_return_cleanup};
 use crate::hir::common::{HirBlock, HirStmt};
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::visit::{HirVisitor, visit_stmt_structure, visit_stmts};
+use crate::hir::visit::{HirVisitor, visit_stmts};
 use crate::transformer::InstrRef;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,25 +33,22 @@ pub(super) fn scope_ends(
         .collect::<BTreeSet<_>>();
     let paired_returns = paired_return_cleanups(stmts);
     let mut unpaired_origins = BTreeSet::<InstrRef>::new();
-    let mut positions = BTreeMap::new();
+    let mut positions = Vec::new();
     let mut goto_cleanup = BTreeMap::new();
-    for (index, stmt) in stmts.iter().enumerate() {
-        visit_stmt_structure(stmt, &mut |stmt| {
-            let address = std::ptr::from_ref(stmt).addr();
-            positions.insert(address, index);
-            if let HirStmt::Close(close) = stmt
-                && matches!(close.kind, crate::transformer::CloseKind::Return(_))
-                && !paired_returns.contains(&address)
-            {
-                unpaired_origins.extend(&close.origins);
-            }
-            if let HirStmt::Label(label) = stmt {
-                goto_cleanup.insert(label.id, label.entry_cleanup.clone());
-            }
-        });
-    }
-    let graph =
-        HirFlowGraph::for_stmts(stmts, safety).expect("HIR resource scope has unique labels");
+    let graph = HirFlowGraph::for_stmts_with_locations(stmts, safety, |id, event, block, index| {
+        positions.resize(id.index() + 1, 0);
+        positions[id.index()] = block.root_stmt_index(index);
+        if let HirFlowNodeKind::Stmt(stmt @ HirStmt::Close(close)) = event
+            && matches!(close.kind, crate::transformer::CloseKind::Return(_))
+            && !paired_returns.contains(&std::ptr::from_ref(stmt).addr())
+        {
+            unpaired_origins.extend(&close.origins);
+        }
+        if let HirFlowNodeKind::Stmt(HirStmt::Label(label)) = event {
+            goto_cleanup.insert(label.id, label.entry_cleanup.clone());
+        }
+    })
+    .expect("HIR resource scope has unique labels");
     let mut last_live = BTreeMap::<InstrRef, usize>::new();
     let states = graph.solve_forward(
         Active::default(),
@@ -64,7 +62,7 @@ pub(super) fn scope_ends(
         |id, event, active| {
             let stmt = graph.nodes()[id.index()].owner_stmt();
             let observation = stmt.map(|stmt| {
-                let position = positions[&std::ptr::from_ref(stmt).addr()];
+                let position = positions[id.index()];
                 let accepted = if matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_)) {
                     None
                 } else {

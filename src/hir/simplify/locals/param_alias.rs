@@ -13,17 +13,16 @@
 //! return l0
 //! ```
 //!
-//! 这里不重新推断前层 phi，也不处理任意 local 对；它只沿可闭合的结构化/严格前向控制
-//! 证明参数与 alias 从入口相同值开始不会被分别观察。分析逐路径记录最后写入的一侧以及
-//! 已经逃逸的 reference capture；`return/break/continue` 不参与错误的普通合流，循环则对
-//! 回边状态求有限不动点。其余 label/goto 仅在整个公共区域对两侧只读、无 capture/resource
-//! 时放行；此时任意路径都不能让两个 binding 从入口等值状态分叉。
+//! 这里不重新推断前层 phi，也不处理任意 local 对；它消费共享 HIR 控制流图，证明参数
+//! 与 alias 从入口相同值开始不会被分别观察。节点事实只收集一次，逐路径状态记录最后
+//! 写入的一侧与已经逃逸的 reference capture。return/break/continue、label/goto 及循环
+//! 分派的后继由共享图提供，有限位集合由其 worklist 收敛；本层只解释求值与 binding。
 //! alias 后续写入会提前覆盖参数，因此还要求两者属于同一可信物理 home；仅有显式读写
 //! 等价不足以排除弱表、`__gc` 或异常 cleanup 对旧参数存活期的观察。
 //! 实际发生的 `Local -> Param` 引用改写还会把失效的 home provenance 传播到参数，避免
 //! deferred carried-local 的下一轮把换壳后的参数重新当作可信物理槽。
-
-use std::collections::{BTreeMap, BTreeSet};
+//! 同一语句的读取、capture、回调和 lvalue 写入共用一次事实收集；状态转换仍先处理
+//! 读取与回调，再应用最终覆盖，不把 visitor 的左值先序误当成运行时 store 顺序。
 
 use crate::hir::common::{
     HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
@@ -31,7 +30,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::super::expr_facts::expr_truthiness;
+use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 use super::super::mention::{expr_mentions_local, stmts_reference_captured_bindings};
 use super::super::walk::{self, HirRewritePass};
 use crate::hir::visit::{self, HirVisitor};
@@ -78,9 +77,7 @@ pub(super) fn coalesce_param_aliases_in_proto(
         // regress_406 覆盖 generic-for body 覆盖参数、弱表观察 alias 提前消失的反例。
         return false;
     }
-    if let Err(error) =
-        validate_alias_flow(rest, alias.local, alias.param, AliasStates::entry(), safety)
-    {
+    if let Err(error) = validate_alias_flow(rest, alias.local, alias.param, safety) {
         match error {
             AliasFlowError::ValueFlow => {
                 // 候选拒绝[SemanticBarrier:ValueFlow]：同一路径写一侧后读取另一侧会区分两个 binding；如 `l=1; return p` 或 `p=2; return l`，合并后返回新值而非旧值。
@@ -92,7 +89,7 @@ pub(super) fn coalesce_param_aliases_in_proto(
                 // 候选拒绝[SemanticBarrier:Resource]：`local l=p; <TBC l>; l=q` 若改为参数，会更换 close owner，并可能关闭错误值或改变关闭时点。
             }
             AliasFlowError::UnstructuredControl => {
-                // 候选拒绝[SemanticBarrier:ControlFlow]：残留回边若写 alias/param，下一轮可从分叉值开始；如 `::L:: use(p); l=1; goto L`，改写后第二轮会观察 1。
+                // 候选拒绝[ProofIncomplete]：共享 CFG 无法唯一解析 label 或仍有可达的区域外 goto，缺少完整后继，不能证明两侧 binding 在所有路径等价。
             }
             AliasFlowError::BindingInvariant => {
                 panic!("alias local must not be redeclared or reused as a for binding")
@@ -201,41 +198,49 @@ struct AliasState {
     param_reference_exposed: bool,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct AliasStates(BTreeSet<AliasState>);
+// 三种分叉状态与两个 capture 标志只形成 12 个状态；位序沿用 AliasState 的 Ord，
+// 让分支合流和循环不动点无需分配集合，同时保持两阶段检查的遍历顺序。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AliasStates(u16);
 
 impl AliasStates {
     fn entry() -> Self {
-        Self(BTreeSet::from([AliasState {
-            divergence: Divergence::Equal,
-            local_reference_exposed: false,
-            param_reference_exposed: false,
-        }]))
+        Self(1)
     }
 
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0 == 0
     }
 
-    fn union(mut self, other: Self) -> Self {
-        self.0.extend(other.0);
-        self
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
-}
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct AliasFlow {
-    fallthrough: AliasStates,
-    breaks: AliasStates,
-    continues: AliasStates,
-}
+    fn insert(&mut self, state: AliasState) {
+        let rank = state.divergence as u32 * 4
+            + u32::from(state.local_reference_exposed) * 2
+            + u32::from(state.param_reference_exposed);
+        self.0 |= 1 << rank;
+    }
 
-impl AliasFlow {
-    fn fallthrough(states: AliasStates) -> Self {
-        Self {
-            fallthrough: states,
-            ..Self::default()
-        }
+    fn iter(mut self) -> impl Iterator<Item = AliasState> {
+        std::iter::from_fn(move || {
+            if self.is_empty() {
+                return None;
+            }
+            let rank = self.0.trailing_zeros();
+            self.0 &= self.0 - 1;
+            Some(AliasState {
+                divergence: match rank / 4 {
+                    0 => Divergence::Equal,
+                    1 => Divergence::LocalWritten,
+                    2 => Divergence::ParamWritten,
+                    _ => unreachable!("alias state bit must belong to the twelve-state domain"),
+                },
+                local_reference_exposed: rank & 2 != 0,
+                param_reference_exposed: rank & 1 != 0,
+            })
+        })
     }
 }
 
@@ -248,488 +253,151 @@ enum AliasFlowError {
     BindingInvariant,
 }
 
-fn forward_label_indices(stmts: &[HirStmt]) -> Option<BTreeMap<crate::hir::HirLabelId, usize>> {
-    let mut labels = BTreeMap::new();
-    for (index, stmt) in stmts.iter().enumerate() {
-        let HirStmt::Label(label) = stmt else {
-            continue;
-        };
-        if labels.insert(label.id, index).is_some() {
-            return None;
-        }
-    }
-    for (index, stmt) in stmts.iter().enumerate() {
-        let HirStmt::Goto(goto) = stmt else {
-            continue;
-        };
-        if labels
-            .get(&goto.target)
-            .is_none_or(|target| *target <= index)
-        {
-            return None;
-        }
-    }
-    Some(labels)
-}
-
-fn forward_control_is_self_contained(stmts: &[HirStmt]) -> bool {
-    forward_label_indices(stmts).is_some()
-        && stmts.iter().all(|stmt| match stmt {
-            HirStmt::LocalRootRelease(_) => true,
-            HirStmt::If(if_stmt) => {
-                forward_control_is_self_contained(&if_stmt.then_block.stmts)
-                    && if_stmt
-                        .else_block
-                        .as_ref()
-                        .is_none_or(|block| forward_control_is_self_contained(&block.stmts))
-            }
-            HirStmt::While(while_stmt) => forward_control_is_self_contained(&while_stmt.body.stmts),
-            HirStmt::Repeat(repeat_stmt) => {
-                forward_control_is_self_contained(&repeat_stmt.body.stmts)
-            }
-            HirStmt::NumericFor(for_stmt) => {
-                forward_control_is_self_contained(&for_stmt.body.stmts)
-            }
-            HirStmt::GenericFor(for_stmt) => {
-                forward_control_is_self_contained(&for_stmt.body.stmts)
-            }
-            HirStmt::Block(block) => forward_control_is_self_contained(&block.stmts),
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => true,
-        })
-}
-
-fn validate_read_only_unstructured_alias_region(
-    stmts: &[HirStmt],
-    local: LocalId,
-    param: ParamId,
-    states: AliasStates,
-) -> Result<AliasFlow, AliasFlowError> {
-    let mut facts = UnstructuredAliasFacts::new(local, param);
-    visit::visit_stmts(stmts, &mut facts);
-    if facts.binding_reused {
-        return Err(AliasFlowError::BindingInvariant);
-    }
-    if facts.local_is_to_be_closed {
-        return Err(AliasFlowError::Resource);
-    }
-    if facts.writes_local
-        || facts.writes_param
-        || facts.reference_captures_local
-        || facts.reference_captures_param
-    {
-        return Err(AliasFlowError::UnstructuredControl);
-    }
-    Ok(AliasFlow::fallthrough(states))
-}
-
-struct UnstructuredAliasFacts {
-    local: LocalId,
-    param: ParamId,
-    writes_local: bool,
-    writes_param: bool,
-    reference_captures_local: bool,
-    reference_captures_param: bool,
-    local_is_to_be_closed: bool,
-    binding_reused: bool,
-}
-
-impl UnstructuredAliasFacts {
-    fn new(local: LocalId, param: ParamId) -> Self {
-        Self {
-            local,
-            param,
-            writes_local: false,
-            writes_param: false,
-            reference_captures_local: false,
-            reference_captures_param: false,
-            local_is_to_be_closed: false,
-            binding_reused: false,
-        }
-    }
-}
-
-impl HirVisitor for UnstructuredAliasFacts {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        match stmt {
-            HirStmt::LocalRootRelease(_) => {}
-            HirStmt::LocalDecl(local_decl) => {
-                self.binding_reused |= local_decl.bindings.contains(&self.local);
-            }
-            HirStmt::NumericFor(for_stmt) => {
-                self.binding_reused |= for_stmt.binding == self.local;
-            }
-            HirStmt::GenericFor(for_stmt) => {
-                self.binding_reused |= for_stmt.bindings.contains(&self.local);
-            }
-            HirStmt::ToBeClosed(to_be_closed) => {
-                self.local_is_to_be_closed |= expr_mentions_local(&to_be_closed.value, self.local);
-            }
-            HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::If(_)
-            | HirStmt::While(_)
-            | HirStmt::Repeat(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_)
-            | HirStmt::Block(_) => {}
-        }
-    }
-
-    fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
-        if capture.mode == HirCaptureMode::ByReference {
-            self.reference_captures_local |=
-                capture.binding == crate::hir::HirBinding::Local(self.local);
-            self.reference_captures_param |=
-                capture.binding == crate::hir::HirBinding::Param(self.param);
-        }
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.writes_local |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
-        self.writes_param |= matches!(lvalue, HirLValue::Param(param) if *param == self.param);
-    }
-}
-
 fn validate_alias_flow(
     stmts: &[HirStmt],
     local: LocalId,
     param: ParamId,
-    mut states: AliasStates,
     safety: HirExprSafety,
-) -> Result<AliasFlow, AliasFlowError> {
-    if !forward_control_is_self_contained(stmts) {
-        return validate_read_only_unstructured_alias_region(stmts, local, param, states);
+) -> Result<(), AliasFlowError> {
+    let graph =
+        HirFlowGraph::for_stmts(stmts, safety).map_err(|_| AliasFlowError::UnstructuredControl)?;
+    if graph.has_reachable_unresolved_goto() {
+        return Err(AliasFlowError::UnstructuredControl);
     }
-    let label_indices = forward_label_indices(stmts)
-        .expect("self-contained forward control must retain local labels");
-    let mut breaks = AliasStates::default();
-    let mut continues = AliasStates::default();
-    let mut index = 0;
-    while let Some(stmt) = stmts.get(index) {
-        if states.is_empty() {
-            break;
-        }
-        if let HirStmt::Goto(goto) = stmt {
-            index = *label_indices
-                .get(&goto.target)
-                .expect("validated forward goto must retain its local label");
-            continue;
-        }
-        let flow = validate_alias_stmt(stmt, local, param, states, safety)?;
-        states = flow.fallthrough;
-        breaks = breaks.union(flow.breaks);
-        continues = continues.union(flow.continues);
-        index += 1;
-    }
-    Ok(AliasFlow {
-        fallthrough: states,
-        breaks,
-        continues,
-    })
+    // 事实来自同一个不可变 HIR 快照，循环重入只转换有限状态，不再扫描表达式和子块。
+    let transfers: Vec<_> = graph
+        .nodes()
+        .iter()
+        .map(|node| AliasTransfer::collect(node.kind(), local, param))
+        .collect();
+    let mut error = None;
+    graph.solve_forward(
+        AliasStates::entry(),
+        |current, incoming| {
+            let joined = current.union(*incoming);
+            let changed = joined != *current;
+            *current = joined;
+            changed
+        },
+        |id, _, states| {
+            if states.is_empty() {
+                return;
+            }
+            match transfers[id.index()].apply(*states) {
+                Ok(next) => *states = next,
+                Err(failure) => {
+                    // 拒绝是单调观察结果；无出口循环中的失败同样阻止提交。
+                    error.get_or_insert(failure);
+                    *states = AliasStates::default();
+                }
+            }
+        },
+        |_, _, _| FlowRefinement::Unchanged,
+    );
+    error.map_or(Ok(()), Err)
 }
 
-fn validate_alias_stmt(
-    stmt: &HirStmt,
-    local: LocalId,
-    param: ParamId,
-    states: AliasStates,
-    safety: HirExprSafety,
-) -> Result<AliasFlow, AliasFlowError> {
-    match stmt {
-        HirStmt::LocalRootRelease(_) => Ok(AliasFlow::fallthrough(evaluate_leaf_stmt(
-            stmt, local, param, states,
-        )?)),
-        HirStmt::If(if_stmt) => {
-            let states = evaluate_expr(&if_stmt.cond, local, param, states)?;
-            let then_flow = if expr_truthiness(&if_stmt.cond, safety) == Some(false) {
-                AliasFlow::fallthrough(AliasStates::default())
-            } else {
-                validate_alias_flow(
-                    &if_stmt.then_block.stmts,
-                    local,
-                    param,
-                    states.clone(),
-                    safety,
-                )?
-            };
-            let else_flow = if expr_truthiness(&if_stmt.cond, safety) == Some(true) {
-                AliasFlow::fallthrough(AliasStates::default())
-            } else if let Some(else_block) = &if_stmt.else_block {
-                validate_alias_flow(&else_block.stmts, local, param, states, safety)?
-            } else {
-                AliasFlow::fallthrough(states)
-            };
-            Ok(union_alias_flows(then_flow, else_flow))
-        }
-        HirStmt::While(while_stmt) => validate_while_alias(
-            &while_stmt.body,
-            &while_stmt.cond,
-            local,
-            param,
-            states,
-            safety,
-        ),
-        HirStmt::Repeat(repeat_stmt) => validate_repeat_alias(
-            &repeat_stmt.body,
-            &repeat_stmt.cond,
-            local,
-            param,
-            states,
-            safety,
-        ),
-        HirStmt::NumericFor(numeric_for) => {
-            if numeric_for.binding == local {
-                return Err(AliasFlowError::BindingInvariant);
+enum AliasTransfer {
+    Identity,
+    Evaluate(AliasEvaluationFacts),
+    Ordered(Box<[AliasEvaluationFacts]>),
+    Reject(AliasFlowError),
+}
+
+impl AliasTransfer {
+    fn collect(event: HirFlowNodeKind<'_>, local: LocalId, param: ParamId) -> Self {
+        match event {
+            HirFlowNodeKind::Stmt(HirStmt::If(stmt)) => Self::expr(&stmt.cond, local, param),
+            HirFlowNodeKind::Stmt(HirStmt::While(stmt)) => Self::expr(&stmt.cond, local, param),
+            HirFlowNodeKind::RepeatCondition(stmt) => Self::expr(&stmt.cond, local, param),
+            HirFlowNodeKind::Stmt(HirStmt::NumericFor(stmt)) => {
+                if stmt.binding == local {
+                    return Self::Reject(AliasFlowError::BindingInvariant);
+                }
+                Self::exprs([&stmt.start, &stmt.limit, &stmt.step], local, param)
             }
-            let mut evaluated = states;
-            for expr in [&numeric_for.start, &numeric_for.limit, &numeric_for.step] {
-                evaluated = evaluate_expr(expr, local, param, evaluated)?;
+            HirFlowNodeKind::GenericForInit(flow) => {
+                let stmt = flow.for_stmt();
+                if stmt.bindings.contains(&local) {
+                    return Self::Reject(AliasFlowError::BindingInvariant);
+                }
+                Self::exprs(&stmt.iterator, local, param)
             }
-            validate_zero_or_more_alias(
-                &numeric_for.body,
-                local,
-                param,
-                evaluated.clone(),
-                evaluated,
-                false,
-                safety,
+            HirFlowNodeKind::GenericForDispatch(_) => {
+                // 包括零轮和最后一次失败分派；iterator 可经已逃逸的引用观察或改写 cell。
+                let mut facts = AliasEvaluationFacts::new(local, param);
+                facts.has_opaque_callback = true;
+                Self::Evaluate(facts)
+            }
+            HirFlowNodeKind::Stmt(HirStmt::ToBeClosed(stmt))
+                if expr_mentions_local(&stmt.value, local) =>
+            {
+                Self::Reject(AliasFlowError::Resource)
+            }
+            HirFlowNodeKind::Stmt(HirStmt::LocalDecl(stmt)) if stmt.bindings.contains(&local) => {
+                Self::Reject(AliasFlowError::BindingInvariant)
+            }
+            HirFlowNodeKind::Stmt(
+                HirStmt::Break | HirStmt::Continue | HirStmt::Goto(_) | HirStmt::Label(_),
             )
-        }
-        HirStmt::GenericFor(generic_for) => {
-            if generic_for.bindings.contains(&local) {
-                return Err(AliasFlowError::BindingInvariant);
+            | HirFlowNodeKind::Exit
+            | HirFlowNodeKind::FunctionExit
+            | HirFlowNodeKind::NumericForDispatch
+            | HirFlowNodeKind::ForBinding(_) => Self::Identity,
+            HirFlowNodeKind::UnknownControl => Self::Reject(AliasFlowError::UnstructuredControl),
+            HirFlowNodeKind::Stmt(
+                HirStmt::Block(_) | HirStmt::Repeat(_) | HirStmt::GenericFor(_),
+            ) => {
+                unreachable!("shared flow graph must split structured owners into typed events")
             }
-            let mut evaluated = states;
-            for expr in &generic_for.iterator {
-                evaluated = evaluate_expr(expr, local, param, evaluated)?;
+            HirFlowNodeKind::Stmt(stmt) => {
+                let mut facts = AliasEvaluationFacts::new(local, param);
+                visit::visit_stmts(std::slice::from_ref(stmt), &mut facts);
+                facts.has_opaque_callback |= matches!(stmt, HirStmt::Close(_));
+                Self::Evaluate(facts)
             }
-            // Generic-for invokes the iterator once even on the zero-iteration path and once
-            // after every completed body iteration. The iterator may observe or mutate either
-            // side through a reference capture that escaped while constructing the iterator.
-            let zero_exit = evaluate_opaque_callback(local, param, evaluated)?;
-            validate_zero_or_more_alias(
-                &generic_for.body,
-                local,
-                param,
-                zero_exit.clone(),
-                zero_exit,
-                true,
-                safety,
-            )
         }
-        HirStmt::Block(block) => validate_alias_flow(&block.stmts, local, param, states, safety),
-        HirStmt::ToBeClosed(to_be_closed) if expr_mentions_local(&to_be_closed.value, local) => {
-            Err(AliasFlowError::Resource)
-        }
-        HirStmt::Goto(_) => unreachable!("block analyzer must consume validated forward gotos"),
-        HirStmt::Label(_) => Ok(AliasFlow::fallthrough(states)),
-        HirStmt::LocalDecl(local_decl) if local_decl.bindings.contains(&local) => {
-            Err(AliasFlowError::BindingInvariant)
-        }
-        HirStmt::Return(_) => {
-            evaluate_leaf_stmt(stmt, local, param, states)?;
-            Ok(AliasFlow::default())
-        }
-        HirStmt::Break => Ok(AliasFlow {
-            breaks: states,
-            ..AliasFlow::default()
-        }),
-        HirStmt::Continue => Ok(AliasFlow {
-            continues: states,
-            ..AliasFlow::default()
-        }),
-        HirStmt::LocalDecl(_)
-        | HirStmt::GlobalDecl(_)
-        | HirStmt::Assign(_)
-        | HirStmt::TableSetList(_)
-        | HirStmt::ErrNil(_)
-        | HirStmt::ToBeClosed(_)
-        | HirStmt::CallStmt(_)
-        | HirStmt::Close(_) => Ok(AliasFlow::fallthrough(evaluate_leaf_stmt(
-            stmt, local, param, states,
-        )?)),
     }
-}
 
-fn validate_while_alias(
-    body: &HirBlock,
-    condition: &HirExpr,
-    local: LocalId,
-    param: ParamId,
-    incoming: AliasStates,
-    safety: HirExprSafety,
-) -> Result<AliasFlow, AliasFlowError> {
-    let truthiness = expr_truthiness(condition, safety);
-    let mut entries = incoming.clone();
-    let mut break_exits = AliasStates::default();
-    loop {
-        let condition_states = evaluate_expr(condition, local, param, entries.clone())?;
-        let body_flow = if truthiness == Some(false) {
-            AliasFlow::default()
-        } else {
-            validate_alias_flow(&body.stmts, local, param, condition_states.clone(), safety)?
-        };
-        let next_entries = incoming
-            .clone()
-            .union(body_flow.fallthrough)
-            .union(body_flow.continues);
-        let next_break_exits = break_exits.clone().union(body_flow.breaks);
-        if next_entries == entries && next_break_exits == break_exits {
-            let normal_exits = if truthiness == Some(true) {
-                AliasStates::default()
-            } else {
-                condition_states
-            };
-            return Ok(AliasFlow::fallthrough(normal_exits.union(break_exits)));
+    fn expr(expr: &HirExpr, local: LocalId, param: ParamId) -> Self {
+        Self::Evaluate(AliasEvaluationFacts::for_expr(expr, local, param))
+    }
+
+    fn exprs<'a>(
+        exprs: impl IntoIterator<Item = &'a HirExpr>,
+        local: LocalId,
+        param: ParamId,
+    ) -> Self {
+        // 每个 header 表达式按原顺序发布 capture/callback，不能先合并整组再转换状态。
+        Self::Ordered(
+            exprs
+                .into_iter()
+                .map(|expr| AliasEvaluationFacts::for_expr(expr, local, param))
+                .collect(),
+        )
+    }
+
+    fn apply(&self, states: AliasStates) -> Result<AliasStates, AliasFlowError> {
+        match self {
+            Self::Identity => Ok(states),
+            Self::Evaluate(facts) => apply_evaluation_facts(facts, states),
+            Self::Ordered(facts) => facts.iter().try_fold(states, |states, facts| {
+                apply_evaluation_facts(facts, states)
+            }),
+            Self::Reject(error) => Err(*error),
         }
-        entries = next_entries;
-        break_exits = next_break_exits;
     }
-}
-
-fn validate_repeat_alias(
-    body: &HirBlock,
-    condition: &HirExpr,
-    local: LocalId,
-    param: ParamId,
-    incoming: AliasStates,
-    safety: HirExprSafety,
-) -> Result<AliasFlow, AliasFlowError> {
-    let truthiness = expr_truthiness(condition, safety);
-    let mut entries = incoming.clone();
-    let mut break_exits = AliasStates::default();
-    loop {
-        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone(), safety)?;
-        let condition_states = evaluate_expr(
-            condition,
-            local,
-            param,
-            body_flow.fallthrough.union(body_flow.continues),
-        )?;
-        let back_edges = if truthiness == Some(true) {
-            AliasStates::default()
-        } else {
-            condition_states.clone()
-        };
-        let next_entries = incoming.clone().union(back_edges);
-        let next_break_exits = break_exits.clone().union(body_flow.breaks);
-        if next_entries == entries && next_break_exits == break_exits {
-            let normal_exits = if truthiness == Some(false) {
-                AliasStates::default()
-            } else {
-                condition_states
-            };
-            return Ok(AliasFlow::fallthrough(normal_exits.union(break_exits)));
-        }
-        entries = next_entries;
-        break_exits = next_break_exits;
-    }
-}
-
-fn validate_zero_or_more_alias(
-    body: &HirBlock,
-    local: LocalId,
-    param: ParamId,
-    zero_exit: AliasStates,
-    initial_body_entry: AliasStates,
-    opaque_each_iteration: bool,
-    safety: HirExprSafety,
-) -> Result<AliasFlow, AliasFlowError> {
-    let mut entries = initial_body_entry.clone();
-    let mut break_exits = AliasStates::default();
-    loop {
-        let body_flow = validate_alias_flow(&body.stmts, local, param, entries.clone(), safety)?;
-        let iteration_exits = body_flow.fallthrough.union(body_flow.continues);
-        let callback_exits = if opaque_each_iteration {
-            evaluate_opaque_callback(local, param, iteration_exits)?
-        } else {
-            iteration_exits
-        };
-        let next_entries = initial_body_entry.clone().union(callback_exits.clone());
-        let next_break_exits = break_exits.clone().union(body_flow.breaks);
-        if next_entries == entries && next_break_exits == break_exits {
-            return Ok(AliasFlow::fallthrough(
-                zero_exit.union(callback_exits).union(break_exits),
-            ));
-        }
-        entries = next_entries;
-        break_exits = next_break_exits;
-    }
-}
-
-fn union_alias_flows(left: AliasFlow, right: AliasFlow) -> AliasFlow {
-    AliasFlow {
-        fallthrough: left.fallthrough.union(right.fallthrough),
-        breaks: left.breaks.union(right.breaks),
-        continues: left.continues.union(right.continues),
-    }
-}
-
-fn evaluate_expr(
-    expr: &HirExpr,
-    local: LocalId,
-    param: ParamId,
-    states: AliasStates,
-) -> Result<AliasStates, AliasFlowError> {
-    let mut facts = AliasEvaluationFacts::new(local, param);
-    visit::visit_expr(expr, &mut facts);
-    apply_evaluation_facts(facts, false, false, states)
-}
-
-fn evaluate_opaque_callback(
-    local: LocalId,
-    param: ParamId,
-    states: AliasStates,
-) -> Result<AliasStates, AliasFlowError> {
-    let mut facts = AliasEvaluationFacts::new(local, param);
-    facts.has_opaque_callback = true;
-    apply_evaluation_facts(facts, false, false, states)
-}
-
-fn evaluate_leaf_stmt(
-    stmt: &HirStmt,
-    local: LocalId,
-    param: ParamId,
-    states: AliasStates,
-) -> Result<AliasStates, AliasFlowError> {
-    let mut facts = AliasEvaluationFacts::new(local, param);
-    visit::visit_stmts(std::slice::from_ref(stmt), &mut facts);
-    facts.has_opaque_callback |= matches!(stmt, HirStmt::Close(_));
-    let writes_local = stmt_writes_local(stmt, local);
-    let writes_param = stmt_writes_param(stmt, param);
-    apply_evaluation_facts(facts, writes_local, writes_param, states)
 }
 
 fn apply_evaluation_facts(
-    facts: AliasEvaluationFacts,
-    writes_local: bool,
-    writes_param: bool,
+    facts: &AliasEvaluationFacts,
     states: AliasStates,
 ) -> Result<AliasStates, AliasFlowError> {
-    if writes_local && writes_param {
+    if facts.writes_local && facts.writes_param {
         return Err(AliasFlowError::ValueFlow);
     }
-    let mut after_callbacks = BTreeSet::new();
-    for mut state in states.0 {
+    let mut after_callbacks = AliasStates::default();
+    for mut state in states.iter() {
         if (state.divergence == Divergence::LocalWritten && facts.reads_param)
             || (state.divergence == Divergence::ParamWritten && facts.reads_local)
         {
@@ -760,14 +428,14 @@ fn apply_evaluation_facts(
         }
     }
 
-    let mut next = BTreeSet::new();
-    for mut state in after_callbacks {
-        if writes_local {
+    let mut next = AliasStates::default();
+    for mut state in after_callbacks.iter() {
+        if facts.writes_local {
             if state.param_reference_exposed {
                 return Err(AliasFlowError::Capture);
             }
             state.divergence = Divergence::LocalWritten;
-        } else if writes_param {
+        } else if facts.writes_param {
             if state.local_reference_exposed {
                 return Err(AliasFlowError::Capture);
             }
@@ -775,12 +443,14 @@ fn apply_evaluation_facts(
         }
         next.insert(state);
     }
-    Ok(AliasStates(next))
+    Ok(next)
 }
 
 struct AliasEvaluationFacts {
     local: LocalId,
     param: ParamId,
+    writes_local: bool,
+    writes_param: bool,
     reads_local: bool,
     reads_param: bool,
     reference_captures_local: bool,
@@ -789,10 +459,18 @@ struct AliasEvaluationFacts {
 }
 
 impl AliasEvaluationFacts {
+    fn for_expr(expr: &HirExpr, local: LocalId, param: ParamId) -> Self {
+        let mut facts = Self::new(local, param);
+        visit::visit_expr(expr, &mut facts);
+        facts
+    }
+
     fn new(local: LocalId, param: ParamId) -> Self {
         Self {
             local,
             param,
+            writes_local: false,
+            writes_param: false,
             reads_local: false,
             reads_param: false,
             reference_captures_local: false,
@@ -833,6 +511,8 @@ impl HirVisitor for AliasEvaluationFacts {
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.writes_local |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
+        self.writes_param |= matches!(lvalue, HirLValue::Param(param) if *param == self.param);
         self.has_opaque_callback |=
             matches!(lvalue, HirLValue::Global(_) | HirLValue::TableAccess(_));
     }
@@ -840,20 +520,6 @@ impl HirVisitor for AliasEvaluationFacts {
     fn visit_call(&mut self, _call: &crate::hir::common::HirCallExpr) {
         self.has_opaque_callback = true;
     }
-}
-
-fn stmt_writes_local(stmt: &HirStmt, local: LocalId) -> bool {
-    let mut collector = LocalWriteCollector {
-        local,
-        written: false,
-    };
-    visit::visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.written
-}
-
-struct LocalWriteCollector {
-    local: LocalId,
-    written: bool,
 }
 
 fn stmt_writes_param(stmt: &HirStmt, param: ParamId) -> bool {
@@ -873,12 +539,6 @@ struct ParamWriteCollector {
 impl HirVisitor for ParamWriteCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.written |= matches!(lvalue, HirLValue::Param(param) if *param == self.param);
-    }
-}
-
-impl HirVisitor for LocalWriteCollector {
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.written |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
     }
 }
 

@@ -152,6 +152,15 @@ pub enum EdgeKind {
 }
 
 impl Cfg {
+    /// 原始指令前缀中的最后可达指令；布局顺序来自 CFG 构建时单调分配的 BlockRef。
+    /// debug 末端可能覆盖 goto 后的不可达 CLOSE，消费者不应把它当作运行终点。
+    pub(crate) fn last_reachable_instr_before(&self, end: usize) -> Option<InstrRef> {
+        let block = self.instr_to_block.get(end.checked_sub(1)?)?;
+        let reachable = self.reachable_blocks.range(..=block).next_back()?;
+        let end = end.min(self.blocks[reachable.index()].instrs.end());
+        end.checked_sub(1).map(InstrRef)
+    }
+
     /// 当前 low 快照中去掉块末控制指令的区间，空块保持为空。
     ///
     /// 例如 Close; Jump 仍包含 Close；范围本身不证明前缀可移动或可省略。

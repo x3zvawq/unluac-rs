@@ -7,6 +7,7 @@
 //! 它依赖 branch 骨架、Dataflow phi 和共享短路跟随规则，只负责产出值合流候选与
 //! merge 前的来源事实；它不会越权决定最终是 `a and b or c`、`if + assign` 还是
 //! generic phi 物化。
+//! 递归 phi 身份由 canonical Dataflow 图事实提供，此处不重新计算分量。
 //!
 //! 例子：
 //! - `local x = a and b or c` 会产出一个 `merge=#... result_reg=x` 的 value-merge 候选
@@ -42,7 +43,6 @@ pub(super) fn analyze_value_merge_candidates(
     branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
 ) -> Vec<ShortCircuitCandidate> {
     let dom_tree = &graph_facts.dominator_tree;
-    let recursive_phis = recursive_phi_flags(dataflow);
     let build_ctx = ValueMergeBuildCtx {
         proto,
         cfg,
@@ -50,7 +50,6 @@ pub(super) fn analyze_value_merge_candidates(
         branch_by_header,
         dom_tree,
         postdom_tree: &graph_facts.post_dominator_tree,
-        recursive_phis: &recursive_phis,
     };
     let mut candidates = Vec::new();
     let mut node_refs = DenseNodeRefs::new(cfg.blocks.len());
@@ -93,7 +92,6 @@ struct ValueMergeBuildCtx<'a> {
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     dom_tree: &'a DominatorTree,
     postdom_tree: &'a PostDominatorTree,
-    recursive_phis: &'a [bool],
 }
 
 struct DenseNodeRefs {
@@ -162,7 +160,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         if phi.incoming.iter().any(|incoming| incoming.pred.is_none()) {
             return None;
         }
-        if ctx.recursive_phis[phi.id.index()]
+        if ctx.dataflow.phi_graph.is_recursive(phi.id)
             && !phi
                 .incoming
                 .iter()
@@ -460,63 +458,4 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
 enum ResolvedValueTarget {
     Final(ShortCircuitTarget),
     Header(BlockRef),
-}
-
-/// Phi incoming 依赖若能回到自身，该 phi 就不是可安全展开的 value-merge 叶。
-/// 一次 SCC 标记替代为每个候选重复遍历整条历史 phi 链。
-fn recursive_phi_flags(dataflow: &DataflowFacts) -> Vec<bool> {
-    let phi_count = dataflow.phi_candidates.len();
-    let mut visited = vec![false; phi_count];
-    let mut postorder = Vec::with_capacity(phi_count);
-
-    for root in dataflow.phi_candidates.iter().map(|phi| phi.id) {
-        let mut pending = vec![(root, false)];
-        while let Some((phi_id, expanded)) = pending.pop() {
-            if expanded {
-                postorder.push(phi_id);
-                continue;
-            }
-            if std::mem::replace(&mut visited[phi_id.index()], true) {
-                continue;
-            }
-            pending.push((phi_id, true));
-            let phi = &dataflow.phi_candidates[phi_id.index()];
-            pending.extend(
-                phi.incoming
-                    .iter()
-                    .filter_map(|incoming| match incoming.value {
-                        SsaValue::Phi(dependency) => Some((dependency, false)),
-                        SsaValue::Entry(_) | SsaValue::Def(_) => None,
-                    }),
-            );
-        }
-    }
-
-    visited.fill(false);
-    let mut recursive = vec![false; phi_count];
-    for root in postorder.into_iter().rev() {
-        if visited[root.index()] {
-            continue;
-        }
-        let mut component = Vec::new();
-        let mut pending = vec![root];
-        while let Some(phi_id) = pending.pop() {
-            if std::mem::replace(&mut visited[phi_id.index()], true) {
-                continue;
-            }
-            component.push(phi_id);
-            pending.extend(dataflow.phi_consumer_ids(phi_id).iter().copied());
-        }
-        let is_recursive = component.len() > 1
-            || dataflow.phi_candidates[root.index()]
-                .incoming
-                .iter()
-                .any(|incoming| incoming.value == SsaValue::Phi(root));
-        if is_recursive {
-            for phi_id in component {
-                recursive[phi_id.index()] = true;
-            }
-        }
-    }
-    recursive
 }

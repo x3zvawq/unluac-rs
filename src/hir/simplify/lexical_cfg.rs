@@ -15,6 +15,8 @@
 //! `validate_region_entry` 独立验证区域 label 唯一性和外部入口；只需要检查词法入口的
 //! consumer 直接消费它，完整 CFG 也复用该结果，不为验证边界而构造后继与可达性。
 //! 构图与重入查询的临时词法导航复用路径栈，仅已登记 label 和重入边界拥有路径副本。
+//! 需要删除计划的 consumer 可在节点创建时按需投影原语句位置；例如 if 内的 nil 写
+//! 直接关联图节点与 Stmt/Then/Stmt 路径，不再用节点地址反查语句，也不为全图复制路径。
 
 use std::{
     cell::OnceCell,
@@ -27,6 +29,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::expr_facts::expr_truthiness;
+use super::stmt_plan::{PathComponent, StmtPath};
 use crate::hir::visit::visit_stmt_structure;
 
 mod statement_tree;
@@ -68,7 +71,6 @@ pub(super) fn validate_region_entry(
 pub(super) struct LexicalCfg {
     successors: Vec<BTreeSet<usize>>,
     has_external_exit: bool,
-    linear_forward_labels: Option<BTreeMap<HirLabelId, usize>>,
 }
 
 /// 仅在一次 HIR topology 快照中有效的节点身份。
@@ -204,7 +206,20 @@ impl<'a> HirFlowGraph<'a> {
         stmts: &'a [HirStmt],
         safety: HirExprSafety,
     ) -> Result<Self, LexicalCfgFailure> {
-        HirFlowGraphBuilder::new(safety, HirFlowBoundary::Region).build(stmts)
+        Self::for_stmts_with_locations(stmts, safety, |_, _, _, _| {})
+    }
+
+    /// 构图时借用当前位置，供 consumer 只保存所需事件的删除或改写坐标。
+    ///
+    /// 每个有语句 owner 的 typed event 恰好回调一次，包括 repeat 条件及 for 的各个
+    /// 分派事件；合成出口不回调。回调顺序是构图顺序，不是执行或源码顺序，位置相对于
+    /// 输入 stmts 的根。若构图失败，调用方必须丢弃本次回调产物。
+    pub(super) fn for_stmts_with_locations(
+        stmts: &'a [HirStmt],
+        safety: HirExprSafety,
+        observer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &LexicalBlockPath, usize),
+    ) -> Result<Self, LexicalCfgFailure> {
+        HirFlowGraphBuilder::new(safety, HirFlowBoundary::Region, observer).build(stmts)
     }
 
     /// 为完整函数 owner 构造 topology。
@@ -216,7 +231,16 @@ impl<'a> HirFlowGraph<'a> {
         block: &'a HirBlock,
         safety: HirExprSafety,
     ) -> Result<Self, LexicalCfgFailure> {
-        HirFlowGraphBuilder::new(safety, HirFlowBoundary::Function).build(&block.stmts)
+        Self::for_proto_with_locations(block, safety, |_, _, _, _| {})
+    }
+
+    /// 发布函数图的节点位置，同时保留 FunctionExit 与 unknown-control 边界。
+    pub(super) fn for_proto_with_locations(
+        block: &'a HirBlock,
+        safety: HirExprSafety,
+        observer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &LexicalBlockPath, usize),
+    ) -> Result<Self, LexicalCfgFailure> {
+        HirFlowGraphBuilder::new(safety, HirFlowBoundary::Function, observer).build(&block.stmts)
     }
 
     pub(super) const fn exit(&self) -> HirFlowNodeId {
@@ -241,6 +265,23 @@ impl<'a> HirFlowGraph<'a> {
     pub(super) fn solve_forward<S: Clone, R>(
         &self,
         initial: S,
+        join: impl FnMut(&mut S, &S) -> bool,
+        transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S) -> R,
+        refine: impl FnMut(&'a HirExpr, bool, &S) -> FlowRefinement<S>,
+    ) -> Vec<Option<R>> {
+        self.solve_forward_with_entries(initial, std::iter::empty(), join, transfer, refine)
+    }
+
+    /// 与 solve_forward 共用求解过程，额外入口由 consumer 提供本图节点及其输入事实。
+    ///
+    /// 例如区域内 label 仍有区域外 goto 时，可从该 label 注入 unknown，而不抹去其它
+    /// 路径的已知状态。重复入口先按 join 合流且只入队一次；额外入口即使只有一个图内
+    /// 前驱也保留输入 checkpoint，保证注入事实在回边重访时不丢失。空入口列表不分配
+    /// 额外的节点表；与普通入口一样，seed 身份必须属于当前图快照。
+    pub(super) fn solve_forward_with_entries<S: Clone, R>(
+        &self,
+        initial: S,
+        additional_entries: impl IntoIterator<Item = (HirFlowNodeId, S)>,
         mut join: impl FnMut(&mut S, &S) -> bool,
         mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S) -> R,
         mut refine: impl FnMut(&'a HirExpr, bool, &S) -> FlowRefinement<S>,
@@ -263,10 +304,27 @@ impl<'a> HirFlowGraph<'a> {
         let mut pending = VecDeque::from([self.entry]);
         let mut queued = vec![false; self.nodes.len()];
         queued[self.entry.index()] = true;
+        let mut additional_checkpoints = BTreeSet::new();
+        for (id, state) in additional_entries {
+            additional_checkpoints.insert(id);
+            match &mut entries[id.index()] {
+                Some(entry) => {
+                    join(entry, &state);
+                }
+                entry @ None => *entry = Some(state),
+            }
+            if !queued[id.index()] {
+                pending.push_back(id);
+                queued[id.index()] = true;
+            }
+        }
         while let Some(id) = pending.pop_front() {
             queued[id.index()] = false;
             let entry = &mut entries[id.index()];
-            let mut output = if id == self.entry || incoming_edges[id.index()] > 1 {
+            let mut output = if id == self.entry
+                || incoming_edges[id.index()] > 1
+                || additional_checkpoints.contains(&id)
+            {
                 entry.clone()
             } else {
                 entry.take()
@@ -469,6 +527,26 @@ impl LexicalBlockPath {
         Self::default()
     }
 
+    /// 当前事件归属的根层语句；嵌套事件仍投影到最外层 owner，不复制完整路径。
+    pub(super) fn root_stmt_index(&self, stmt_index: usize) -> usize {
+        self.0.first().map_or(stmt_index, |step| step.stmt_index)
+    }
+
+    /// 仅在 consumer 确认需要保存计划时复制路径；末尾索引属于当前 block。
+    pub(super) fn to_stmt_path(&self, stmt_index: usize) -> StmtPath {
+        let mut path = Vec::with_capacity(self.0.len() * 2 + 1);
+        for step in &self.0 {
+            path.push(PathComponent::Stmt(step.stmt_index));
+            path.push(match step.kind {
+                LexicalBlockKind::Then => PathComponent::Then,
+                LexicalBlockKind::Else => PathComponent::Else,
+                LexicalBlockKind::Body => PathComponent::Body,
+            });
+        }
+        path.push(PathComponent::Stmt(stmt_index));
+        path
+    }
+
     /// 临时导航共享路径栈，先恢复父路径再返回，包括未形成子图的 None/Err。
     pub(super) fn with_child<R>(
         &mut self,
@@ -569,7 +647,7 @@ enum HirFlowBoundary {
     Function,
 }
 
-struct HirFlowGraphBuilder<'a> {
+struct HirFlowGraphBuilder<'a, F> {
     nodes: Vec<HirFlowNode<'a>>,
     labels: BTreeMap<HirLabelId, OwnerLabelLocation>,
     pending_gotos: Vec<(HirFlowNodeId, HirLabelId)>,
@@ -578,10 +656,14 @@ struct HirFlowGraphBuilder<'a> {
     function_exit: Option<HirFlowNodeId>,
     unknown_control: Option<HirFlowNodeId>,
     next_protocol: usize,
+    observer: F,
 }
 
-impl<'a> HirFlowGraphBuilder<'a> {
-    fn new(safety: HirExprSafety, boundary: HirFlowBoundary) -> Self {
+impl<'a, F> HirFlowGraphBuilder<'a, F>
+where
+    F: FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &LexicalBlockPath, usize),
+{
+    fn new(safety: HirExprSafety, boundary: HirFlowBoundary, observer: F) -> Self {
         Self {
             nodes: Vec::new(),
             labels: BTreeMap::new(),
@@ -591,6 +673,7 @@ impl<'a> HirFlowGraphBuilder<'a> {
             function_exit: None,
             unknown_control: None,
             next_protocol: 0,
+            observer,
         }
     }
 
@@ -661,6 +744,17 @@ impl<'a> HirFlowGraphBuilder<'a> {
         id
     }
 
+    fn new_owned_node(
+        &mut self,
+        (stmt, path, stmt_index): (&'a HirStmt, &LexicalBlockPath, usize),
+        kind: HirFlowNodeKind<'a>,
+        successors: impl IntoIterator<Item = HirFlowNodeId>,
+    ) -> HirFlowNodeId {
+        let id = self.new_node(Some(stmt), kind, successors);
+        (self.observer)(id, kind, path, stmt_index);
+        id
+    }
+
     fn set_condition_successors(
         &mut self,
         condition: HirFlowNodeId,
@@ -710,11 +804,17 @@ impl<'a> HirFlowGraphBuilder<'a> {
         loop_targets: HirLoopTargets,
     ) -> Option<HirFlowNodeId> {
         match stmt {
-            HirStmt::LocalRootRelease(_) => {
-                Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), [next]))
-            }
+            HirStmt::LocalRootRelease(_) => Some(self.new_owned_node(
+                (stmt, path, stmt_index),
+                HirFlowNodeKind::Stmt(stmt),
+                [next],
+            )),
             HirStmt::Label(label) => {
-                let node = self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), [next]);
+                let node = self.new_owned_node(
+                    (stmt, path, stmt_index),
+                    HirFlowNodeKind::Stmt(stmt),
+                    [next],
+                );
                 let location = OwnerLabelLocation {
                     node,
                     block: path.clone(),
@@ -726,21 +826,32 @@ impl<'a> HirFlowGraphBuilder<'a> {
                 Some(node)
             }
             HirStmt::Goto(goto) => {
-                let node = self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), []);
+                let node =
+                    self.new_owned_node((stmt, path, stmt_index), HirFlowNodeKind::Stmt(stmt), []);
                 self.pending_gotos.push((node, goto.target));
                 Some(node)
             }
             HirStmt::Break => {
                 let target = loop_targets.break_target.or(self.unknown_control);
-                Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), target))
+                Some(self.new_owned_node(
+                    (stmt, path, stmt_index),
+                    HirFlowNodeKind::Stmt(stmt),
+                    target,
+                ))
             }
             HirStmt::Continue => {
                 let target = loop_targets.continue_target.or(self.unknown_control);
-                Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), target))
+                Some(self.new_owned_node(
+                    (stmt, path, stmt_index),
+                    HirFlowNodeKind::Stmt(stmt),
+                    target,
+                ))
             }
-            HirStmt::Return(_) => {
-                Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), self.function_exit))
-            }
+            HirStmt::Return(_) => Some(self.new_owned_node(
+                (stmt, path, stmt_index),
+                HirFlowNodeKind::Stmt(stmt),
+                self.function_exit,
+            )),
             HirStmt::Block(block) => path.with_child(stmt_index, LexicalBlockKind::Body, |path| {
                 self.build_block(&block.stmts, path, next, loop_targets)
             }),
@@ -755,12 +866,14 @@ impl<'a> HirFlowGraphBuilder<'a> {
                 } else {
                     next
                 };
-                let condition = self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), []);
+                let condition =
+                    self.new_owned_node((stmt, path, stmt_index), HirFlowNodeKind::Stmt(stmt), []);
                 self.set_condition_successors(condition, then_entry, else_entry);
                 Some(condition)
             }
             HirStmt::While(while_stmt) => {
-                let condition = self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), []);
+                let condition =
+                    self.new_owned_node((stmt, path, stmt_index), HirFlowNodeKind::Stmt(stmt), []);
                 let body = path.with_child(stmt_index, LexicalBlockKind::Body, |path| {
                     self.build_block(
                         &while_stmt.body.stmts,
@@ -776,8 +889,8 @@ impl<'a> HirFlowGraphBuilder<'a> {
                 Some(condition)
             }
             HirStmt::Repeat(repeat_stmt) => {
-                let condition = self.new_node(
-                    Some(stmt),
+                let condition = self.new_owned_node(
+                    (stmt, path, stmt_index),
                     HirFlowNodeKind::RepeatCondition(repeat_stmt),
                     [],
                 );
@@ -796,9 +909,13 @@ impl<'a> HirFlowGraphBuilder<'a> {
                 Some(body)
             }
             HirStmt::NumericFor(for_stmt) => {
-                let dispatch = self.new_node(Some(stmt), HirFlowNodeKind::NumericForDispatch, []);
-                let binding = self.new_node(
-                    Some(stmt),
+                let dispatch = self.new_owned_node(
+                    (stmt, path, stmt_index),
+                    HirFlowNodeKind::NumericForDispatch,
+                    [],
+                );
+                let binding = self.new_owned_node(
+                    (stmt, path, stmt_index),
                     HirFlowNodeKind::ForBinding(HirForBindings::Numeric(for_stmt.binding)),
                     [],
                 );
@@ -817,7 +934,11 @@ impl<'a> HirFlowGraphBuilder<'a> {
                 self.nodes[dispatch.index()]
                     .successors
                     .extend([(binding, None), (next, None)]);
-                Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), [dispatch]))
+                Some(self.new_owned_node(
+                    (stmt, path, stmt_index),
+                    HirFlowNodeKind::Stmt(stmt),
+                    [dispatch],
+                ))
             }
             HirStmt::GenericFor(for_stmt) => {
                 let flow = HirGenericForFlow {
@@ -826,10 +947,13 @@ impl<'a> HirFlowGraphBuilder<'a> {
                     for_stmt,
                 };
                 self.next_protocol += 1;
-                let dispatch =
-                    self.new_node(Some(stmt), HirFlowNodeKind::GenericForDispatch(flow), []);
-                let binding = self.new_node(
-                    Some(stmt),
+                let dispatch = self.new_owned_node(
+                    (stmt, path, stmt_index),
+                    HirFlowNodeKind::GenericForDispatch(flow),
+                    [],
+                );
+                let binding = self.new_owned_node(
+                    (stmt, path, stmt_index),
                     HirFlowNodeKind::ForBinding(HirForBindings::Generic(flow)),
                     [],
                 );
@@ -848,8 +972,8 @@ impl<'a> HirFlowGraphBuilder<'a> {
                 self.nodes[dispatch.index()]
                     .successors
                     .extend([(binding, None), (next, None)]);
-                Some(self.new_node(
-                    Some(stmt),
+                Some(self.new_owned_node(
+                    (stmt, path, stmt_index),
                     HirFlowNodeKind::GenericForInit(flow),
                     [dispatch],
                 ))
@@ -861,9 +985,11 @@ impl<'a> HirFlowGraphBuilder<'a> {
             | HirStmt::ErrNil(_)
             | HirStmt::ToBeClosed(_)
             | HirStmt::Close(_)
-            | HirStmt::CallStmt(_) => {
-                Some(self.new_node(Some(stmt), HirFlowNodeKind::Stmt(stmt), [next]))
-            }
+            | HirStmt::CallStmt(_) => Some(self.new_owned_node(
+                (stmt, path, stmt_index),
+                HirFlowNodeKind::Stmt(stmt),
+                [next],
+            )),
         }
     }
 }
@@ -903,33 +1029,9 @@ impl LexicalCfg {
                 }
             }
         }
-        // 线性 consumer 只会显式跳过当前 block 的 direct forward goto；嵌套 block
-        // 内部自含的回环已经投影成当前语句的正常出口，仍可
-        // 安全交给递归 analyzer。若嵌套 goto 指向本层 label，当前非 Goto 语句会出现
-        // 非顺序 successor，因而不能伪装成普通 fallthrough。
-        let linear_forward_labels = (!has_external_exit
-            && stmts.iter().enumerate().all(|(index, stmt)| {
-                let stmt_successors = &successors[index];
-                match stmt {
-                    HirStmt::Goto(_) => {
-                        stmt_successors.len() == 1
-                            && stmt_successors
-                                .first()
-                                .is_some_and(|target| *target > index)
-                    }
-                    _ => {
-                        stmt_successors.is_empty()
-                            || (stmt_successors.len() == 1
-                                && stmt_successors.contains(&(index + 1)))
-                    }
-                }
-            }))
-        .then_some(direct_labels);
-
         Ok(Self {
             successors,
             has_external_exit,
-            linear_forward_labels,
         })
     }
 
@@ -939,15 +1041,6 @@ impl LexicalCfg {
 
     pub(super) fn has_external_exit(&self) -> bool {
         self.has_external_exit
-    }
-
-    /// 返回可由单调词法 walker 精确消费的 direct label 索引。
-    ///
-    /// 成功意味着当前 block 没有外部 goto 出口，direct goto 只严格向前，且所有非
-    /// Goto 语句在本层只会正常落到下一句。嵌套结构内部可以包含自洽回环；它们由嵌套
-    /// analyzer 自己处理，不会再让整个外层 block 丢失入口事实。
-    pub(super) fn linear_forward_labels(&self) -> Option<&BTreeMap<HirLabelId, usize>> {
-        self.linear_forward_labels.as_ref()
     }
 
     /// 按直接语句位置发布“该声明支配所有可达后缀语句”；不可达声明为 false。

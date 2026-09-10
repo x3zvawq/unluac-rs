@@ -4,6 +4,8 @@
 //! Promotion。不能把命名 copy 的 nil 声明提到函数入口；也不能在声明处复制隐藏根，
 //! 否则 scope 内 debug.setlocal(copy,nil) 后仍会多保活旧值。这里在已证明的 scope 末端
 //! 才读取当前 copy：`do local copy=owner; inspect(); holder=copy end`，后层无需重建边界。
+//! 原 debug 末端可能含 goto 或不可达尾部；可发射末端消费共享 emission 投影，
+//! 再在实际窗口上校验闭合、覆盖与 cleanup，不让原始 PC 代替运行生命周期。
 
 use super::*;
 use crate::hir::HirLowerError;
@@ -37,12 +39,17 @@ pub(in crate::hir::analyze) fn bind_copy_root_holders(
     holders.into_values().collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "身份交接借用同一 lowering 的发射与生命周期事实"
+)]
 pub(in crate::hir::analyze) fn bind_copy_root_scopes(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     graph: &GraphFacts,
     structure: &ReadyStructureFacts,
+    emission: &HirEmissionFacts<'_>,
     bindings: &mut ProtoBindings,
     facts: &mut ProtoPromotionFacts,
 ) -> Result<(), HirLowerError> {
@@ -50,7 +57,6 @@ pub(in crate::hir::analyze) fn bind_copy_root_scopes(
         return Ok(());
     }
     let debug = structure.debug_bindings();
-    let emission = HirEmissionFacts::new(structure.plan());
     let mut scopes = bindings.lexical_scopes.clone();
     let mut handoffs = Vec::new();
     let mut local_homes = Vec::new();
@@ -74,10 +80,15 @@ pub(in crate::hir::analyze) fn bind_copy_root_scopes(
         if fact.value != SsaValue::Def(def.id) {
             continue;
         }
-        let end = fact
+        let raw_end = fact
             .end_instr
             .ok_or_else(|| HirLowerError::invalid("copy root source scope has no low endpoint"))?
             .index();
+        let end = emission
+            .source_scope_prefix_end(cfg, raw_end)
+            .ok_or_else(|| {
+                HirLowerError::invalid("copy root source scope has no emitted prefix endpoint")
+            })?;
         let start = def.instr.index();
         if start >= end {
             return Err(HirLowerError::invalid(

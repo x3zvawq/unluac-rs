@@ -61,6 +61,7 @@ pub(super) fn install_phi_plans(
             phi: phi.id,
             block: phi.block,
             reg: phi.reg,
+            loop_carried_input: crate::structure::plan::loop_carried_input(plan, &incomings),
             incomings,
         });
     }

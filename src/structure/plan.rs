@@ -26,7 +26,8 @@ pub use loop_protocol::{
 };
 pub use navigation::{EdgeRegionRelation, RegionBoundarySummary, RegionNavigation};
 pub use terminator::{BlockTerminatorKind, BlockTerminatorPlan};
-pub use value::{PhiIncomingDisposition, PhiIncomingPlan, PhiPlan};
+pub(in crate::structure) use value::loop_carried_input;
+pub use value::{LoopCarriedPhi, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan};
 
 use std::collections::BTreeSet;
 

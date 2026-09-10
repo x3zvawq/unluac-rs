@@ -1,4 +1,6 @@
-//! 汇总 loop phi、使用范围和 VM for 控制值分析；依赖 SSA/区域导航，不负责冻结语法协议；例如判断 carried phi 是否在 control 外被观察。
+//! 汇总 loop phi、使用范围和 VM for 控制值分析，依赖 canonical SSA 与区域导航。
+//! 直接借用 Dataflow 的分量/使用边与拓扑顺序；本层只传播区域使用范围，
+//! 不负责冻结语法协议。例如 consumer 在 control 外被观察时，其上游 carried phi 也被标记。
 
 use super::*;
 
@@ -11,115 +13,10 @@ impl LoopValueAnalysis {
         plan: &StructurePlan,
     ) -> Result<Self, StructureError> {
         let phi_count = dataflow.phi_candidates.len();
-        if dataflow.phi_phi_uses.len() != phi_count || dataflow.phi_uses.len() != phi_count {
-            return Err(StructureError::invalid(
-                "loop value analysis received a sparse phi-use index",
-            ));
-        }
-
-        let mut reverse_uses = vec![Vec::<usize>::new(); phi_count];
-        for (source, consumers) in dataflow.phi_phi_uses.iter().enumerate() {
-            for consumer in consumers {
-                let Some(sources) = reverse_uses.get_mut(consumer.index()) else {
-                    return Err(StructureError::invalid(
-                        "loop value analysis found a missing phi consumer",
-                    ));
-                };
-                sources.push(source);
-            }
-        }
-
-        let mut visited = vec![false; phi_count];
-        let mut finish_order = Vec::with_capacity(phi_count);
-        for start in 0..phi_count {
-            if visited[start] {
-                continue;
-            }
-            let mut pending = vec![(start, false)];
-            while let Some((phi, leaving)) = pending.pop() {
-                if leaving {
-                    finish_order.push(phi);
-                    continue;
-                }
-                if std::mem::replace(&mut visited[phi], true) {
-                    continue;
-                }
-                pending.push((phi, true));
-                for consumer in dataflow.phi_phi_uses[phi].iter().rev() {
-                    if consumer.index() >= phi_count {
-                        return Err(StructureError::invalid(
-                            "loop value analysis found a missing phi consumer",
-                        ));
-                    }
-                    if !visited[consumer.index()] {
-                        pending.push((consumer.index(), false));
-                    }
-                }
-            }
-        }
-
-        let mut component_by_phi = vec![usize::MAX; phi_count];
-        let mut components = Vec::<Vec<usize>>::new();
-        for start in finish_order.into_iter().rev() {
-            if component_by_phi[start] != usize::MAX {
-                continue;
-            }
-            let component = components.len();
-            let mut members = Vec::new();
-            let mut pending = vec![start];
-            component_by_phi[start] = component;
-            while let Some(phi) = pending.pop() {
-                members.push(phi);
-                for source in &reverse_uses[phi] {
-                    if component_by_phi[*source] == usize::MAX {
-                        component_by_phi[*source] = component;
-                        pending.push(*source);
-                    }
-                }
-            }
-            components.push(members);
-        }
-
-        let mut component_edges = vec![Vec::<usize>::new(); components.len()];
-        let mut indegree = vec![0usize; components.len()];
-        for (source, consumers) in dataflow.phi_phi_uses.iter().enumerate() {
-            let source_component = component_by_phi[source];
-            for consumer in consumers {
-                let consumer_component = component_by_phi[consumer.index()];
-                if source_component == consumer_component {
-                    continue;
-                }
-                component_edges[source_component].push(consumer_component);
-                indegree[consumer_component] =
-                    indegree[consumer_component].checked_add(1).ok_or_else(|| {
-                        StructureError::invalid("loop value analysis indegree overflowed")
-                    })?;
-            }
-        }
-        let mut ready = indegree
-            .iter()
-            .enumerate()
-            .filter_map(|(component, degree)| (*degree == 0).then_some(component))
-            .collect::<VecDeque<_>>();
-        let mut topo = Vec::with_capacity(components.len());
-        while let Some(component) = ready.pop_front() {
-            topo.push(component);
-            for consumer in &component_edges[component] {
-                indegree[*consumer] -= 1;
-                if indegree[*consumer] == 0 {
-                    ready.push_back(*consumer);
-                }
-            }
-        }
-        if topo.len() != components.len() {
-            return Err(StructureError::invalid(
-                "loop value analysis failed to condense the phi graph",
-            ));
-        }
-
+        let components = dataflow.phi_graph.components();
         let mut component_extents = vec![PhiUseExtent::default(); components.len()];
         for (phi, uses) in dataflow.phi_uses.iter().enumerate() {
-            let extent = &mut component_extents[component_by_phi[phi]];
+            let extent = &mut component_extents[dataflow.phi_graph.component_index(PhiId(phi))];
             for site in uses {
                 let owner = cfg
                     .instr_to_block
@@ -135,26 +32,32 @@ impl LoopValueAnalysis {
                 }
             }
         }
-        for component in topo.iter().rev().copied() {
-            for consumer in &component_edges[component] {
-                let consumer_extent = component_extents[*consumer];
-                component_extents[component].merge(consumer_extent);
+        // Dataflow 按源到汇签发分量；从汇反向传播，直接消费 canonical use 边，
+        // 不另建 condensation 邻接表或再排序同一 DAG。重复边只重复幂等的范围合并。
+        for (component, members) in components.iter().enumerate().rev() {
+            for phi in members {
+                for consumer in &dataflow.phi_phi_uses[phi.index()] {
+                    let consumer_component = dataflow.phi_graph.component_index(*consumer);
+                    if component != consumer_component {
+                        let consumer_extent = component_extents[consumer_component];
+                        component_extents[component].merge(consumer_extent);
+                    }
+                }
             }
         }
-        let use_extents = component_by_phi
-            .iter()
-            .map(|component| component_extents[*component])
+        let use_extents = (0..phi_count)
+            .map(|phi| component_extents[dataflow.phi_graph.component_index(PhiId(phi))])
             .collect();
 
         let mut vm_for_control = vec![false; phi_count];
-        for component in topo {
-            let [phi] = components[component].as_slice() else {
+        for members in components {
+            let [phi] = members.as_slice() else {
                 continue;
             };
-            let Some(candidate) = dataflow.phi_candidates.get(*phi) else {
+            let Some(candidate) = dataflow.phi_candidates.get(phi.index()) else {
                 continue;
             };
-            if candidate.id.index() != *phi
+            if candidate.id != *phi
                 || candidate.incoming.is_empty()
                 || candidate
                     .incoming
@@ -163,16 +66,15 @@ impl LoopValueAnalysis {
             {
                 continue;
             }
-            vm_for_control[*phi] = candidate
-                .incoming
-                .iter()
-                .all(|incoming| match incoming.value {
-                    SsaValue::Entry(_) => false,
-                    SsaValue::Def(def) => def_is_vm_for_control(proto, dataflow, def),
-                    SsaValue::Phi(source) => {
-                        vm_for_control.get(source.index()).copied().unwrap_or(false)
-                    }
-                });
+            vm_for_control[phi.index()] = candidate.incoming.iter().all(|incoming| match incoming
+                .value
+            {
+                SsaValue::Entry(_) => false,
+                SsaValue::Def(def) => def_is_vm_for_control(proto, dataflow, def),
+                SsaValue::Phi(source) => {
+                    vm_for_control.get(source.index()).copied().unwrap_or(false)
+                }
+            });
         }
 
         let mut absorbed_owner_by_edge = vec![None; cfg.edges.len()];

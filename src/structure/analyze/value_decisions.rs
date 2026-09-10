@@ -10,8 +10,6 @@ pub(super) fn selected_value_decisions(
     residual_transfers: &[ResidualTransferEvidence],
     candidates: &[ShortCircuitCandidate],
 ) -> Vec<ValueDecisionPlanInput> {
-    let safety = ValueDecisionSafetyIndex::new(cfg, dataflow, loops, residual_transfers);
-    let mut scratch = ValueDecisionCandidateScratch::new(proto, cfg, dataflow);
     let mut group_by_dag = HashMap::<ValueDecisionDagKey<'_>, usize>::new();
     let mut groups = Vec::<Vec<(usize, &ShortCircuitCandidate)>>::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -36,6 +34,11 @@ pub(super) fn selected_value_decisions(
         groups[group].push((index, candidate));
     }
 
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let safety = ValueDecisionSafetyIndex::new(cfg, dataflow, loops, residual_transfers);
+    let mut scratch = ValueDecisionCandidateScratch::new(proto, cfg, dataflow);
     let mut selected = vec![None::<(usize, &ShortCircuitCandidate)>; dataflow.phi_candidates.len()];
     for mut group in groups {
         // 同一控制 DAG 最终只能有一个 containment owner。按最终 payload 的 PhiId
@@ -161,7 +164,6 @@ pub(super) struct ValueDecisionSafetyIndex {
     forbidden_blocks: Vec<bool>,
     forbidden_edges: Vec<bool>,
     live_phi_edges: Vec<Vec<super::super::PhiId>>,
-    phi_sources: Vec<Vec<super::super::PhiId>>,
     loop_input_blocks: Vec<bool>,
 }
 
@@ -222,24 +224,10 @@ impl ValueDecisionSafetyIndex {
             }
         }
 
-        let mut phi_sources = vec![Vec::new(); dataflow.phi_candidates.len()];
-        for (source_index, consumers) in dataflow.phi_phi_uses.iter().enumerate() {
-            if source_index >= dataflow.phi_candidates.len() {
-                break;
-            }
-            let source = super::super::PhiId(source_index);
-            for consumer in consumers {
-                if let Some(sources) = phi_sources.get_mut(consumer.index()) {
-                    sources.push(source);
-                }
-            }
-        }
-
         Self {
             forbidden_blocks,
             forbidden_edges,
             live_phi_edges,
-            phi_sources,
             loop_input_blocks,
         }
     }
@@ -261,13 +249,11 @@ pub(super) struct ValueDecisionCandidateScratch {
     boundary_phi_epochs: Vec<usize>,
     internal_phi_epochs: Vec<usize>,
     reachable_phi_epochs: Vec<usize>,
-    escaping_phi_epochs: Vec<usize>,
     relevant_defs: Vec<super::super::DefId>,
     boundary_live_phis: Vec<super::super::PhiId>,
     result_required_instrs: Vec<InstrRef>,
     pending_values: Vec<super::super::SsaValue>,
     pending_phis: Vec<super::super::PhiId>,
-    escaping_phis: Vec<super::super::PhiId>,
 }
 
 impl ValueDecisionCandidateScratch {
@@ -287,13 +273,11 @@ impl ValueDecisionCandidateScratch {
             boundary_phi_epochs: vec![0; dataflow.phi_candidates.len()],
             internal_phi_epochs: vec![0; dataflow.phi_candidates.len()],
             reachable_phi_epochs: vec![0; dataflow.phi_candidates.len()],
-            escaping_phi_epochs: vec![0; dataflow.phi_candidates.len()],
             relevant_defs: Vec::new(),
             boundary_live_phis: Vec::new(),
             result_required_instrs: Vec::new(),
             pending_values: Vec::new(),
             pending_phis: Vec::new(),
-            escaping_phis: Vec::new(),
         }
     }
 
@@ -323,14 +307,12 @@ impl ValueDecisionCandidateScratch {
             self.result_dependency_phi_epochs.fill(0);
             self.internal_phi_epochs.fill(0);
             self.reachable_phi_epochs.fill(0);
-            self.escaping_phi_epochs.fill(0);
             self.result_epoch = 1;
         } else {
             self.result_epoch += 1;
         }
         self.pending_values.clear();
         self.pending_phis.clear();
-        self.escaping_phis.clear();
     }
 
     fn contains_block(&self, block: super::super::BlockRef) -> bool {
@@ -511,7 +493,7 @@ pub(super) fn value_decision_result_is_closed(
             return false;
         }
     }
-    !value_decision_defs_escape(cfg, dataflow, safety, scratch, result_phi)
+    !value_decision_defs_escape(cfg, dataflow, scratch, result_phi)
 }
 
 pub(super) fn value_decision_boundary_phi_is_unchanged(
@@ -623,7 +605,6 @@ pub(super) fn value_decision_phi_is_internal(
 pub(super) fn value_decision_defs_escape(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
-    safety: &ValueDecisionSafetyIndex,
     scratch: &mut ValueDecisionCandidateScratch,
     result_phi: super::super::PhiId,
 ) -> bool {
@@ -663,11 +644,9 @@ pub(super) fn value_decision_defs_escape(
                 .get(site.instr.index())
                 .is_none_or(|block| !scratch.contains_block(*block))
         }) {
-            let Some(escaping) = scratch.escaping_phi_epochs.get_mut(phi.index()) else {
-                return true;
-            };
-            *escaping = scratch.result_epoch;
-            scratch.escaping_phis.push(phi);
+            // 正向可达域只从 relevant defs 出发并切断 result 端口；越界 use
+            // 已证明至少一个定义逃逸，无需反向标记来源后再次查询这些起点。
+            return true;
         }
 
         let Some(consumers) = dataflow.phi_phi_uses.get(phi.index()) else {
@@ -676,41 +655,7 @@ pub(super) fn value_decision_defs_escape(
         scratch.pending_phis.extend(consumers.iter().copied());
     }
 
-    // 从真实越界 use 反向标记所有可到达它的 phi。result phi 是 ValueDecision 的
-    // 显式结果端口，传播到它即终止，不能把端口外的正常使用误判为内部 def 泄漏。
-    while let Some(phi) = scratch.escaping_phis.pop() {
-        let Some(sources) = safety.phi_sources.get(phi.index()) else {
-            return true;
-        };
-        for source in sources {
-            if *source == result_phi
-                || scratch.reachable_phi_epochs.get(source.index()).copied()
-                    != Some(scratch.result_epoch)
-            {
-                continue;
-            }
-            let Some(escaping) = scratch.escaping_phi_epochs.get_mut(source.index()) else {
-                return true;
-            };
-            if *escaping != scratch.result_epoch {
-                *escaping = scratch.result_epoch;
-                scratch.escaping_phis.push(*source);
-            }
-        }
-    }
-
-    scratch.relevant_defs.iter().any(|def| {
-        dataflow
-            .def_phi_uses
-            .get(def.index())
-            .into_iter()
-            .flatten()
-            .any(|phi| {
-                *phi != result_phi
-                    && scratch.escaping_phi_epochs.get(phi.index()).copied()
-                        == Some(scratch.result_epoch)
-            })
-    })
+    false
 }
 
 pub(super) fn mark_value_decision_common_dependencies(
@@ -730,6 +675,7 @@ pub(super) fn mark_value_decision_common_dependencies(
         scratch.group_epoch,
         &mut scratch.pending_values,
         root,
+        |_| false,
     )
 }
 
@@ -750,6 +696,25 @@ pub(super) fn mark_value_decision_result_dependencies(
         scratch.result_epoch,
         &mut scratch.pending_values,
         root,
+        // common 已成功覆盖同一控制域；required 指令预先排除了 common 闭包，
+        // 不必把这些指令再标入当前 result，也不能消费失败 group 的部分标记。
+        |value| match value {
+            super::super::SsaValue::Def(def) => {
+                scratch
+                    .common_dependency_def_epochs
+                    .get(def.index())
+                    .copied()
+                    == Some(scratch.group_epoch)
+            }
+            super::super::SsaValue::Phi(phi) => {
+                scratch
+                    .common_dependency_phi_epochs
+                    .get(phi.index())
+                    .copied()
+                    == Some(scratch.group_epoch)
+            }
+            super::super::SsaValue::Entry(_) => false,
+        },
     )
 }
 
@@ -765,10 +730,14 @@ pub(super) fn mark_value_decision_dependencies(
     dependency_epoch: usize,
     pending_values: &mut Vec<super::super::SsaValue>,
     root: super::super::SsaValue,
+    already_proven: impl Fn(super::super::SsaValue) -> bool,
 ) -> bool {
     pending_values.clear();
     pending_values.push(root);
     while let Some(value) = pending_values.pop() {
+        if already_proven(value) {
+            continue;
+        }
         match value {
             super::super::SsaValue::Entry(_) => {}
             super::super::SsaValue::Def(def) => {

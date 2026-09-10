@@ -363,9 +363,18 @@ fn analyze_structure_proto_one(
     scope::finalize_label_placements(cfg, &mut plan)?;
     phi_facts::finalize_phi_ownership(cfg, graph_facts, dataflow, &mut plan)?;
     // 最终值动作先于 source cleanup placement，placement 再先于消费它的 loop protocol。
-    plan::finalize_loop_contracts(proto, cfg, graph_facts, dataflow, &mut plan)?;
+    let loop_analysis =
+        plan::finalize_loop_contracts(proto, cfg, graph_facts, dataflow, &mut plan)?;
     plan::finalize_block_emissions(cfg, &mut plan)?;
-    plan::validate_final_structure_plan(proto, cfg, graph_facts, dataflow, &debug_bindings, &plan)?;
+    plan::validate_final_structure_plan(
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        &debug_bindings,
+        &plan,
+        &loop_analysis,
+    )?;
 
     Ok(ReadyStructureFacts {
         plan,

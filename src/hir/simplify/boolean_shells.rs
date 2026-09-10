@@ -25,8 +25,8 @@ use old_values::OldValueFacts;
 use std::collections::BTreeSet;
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto, HirStmt,
-    HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId,
+    HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto,
+    HirStmt, HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -237,12 +237,7 @@ fn collapse_live_boolean_materialization_shell(stmt: &mut HirStmt) -> Option<(Hi
     let HirStmt::If(if_stmt) = stmt else {
         return None;
     };
-    let Some(else_block) = &if_stmt.else_block else {
-        return None;
-    };
-
-    let (then_target, then_value) = single_fixed_assign_pattern(&if_stmt.then_block)?;
-    let (else_target, else_value) = single_fixed_assign_pattern(else_block)?;
+    let [(then_target, then_value), (else_target, else_value)] = fixed_assign_arms(if_stmt)?;
     if then_target != else_target {
         // 候选拒绝[SemanticBarrier:ValueFlow]：same-home 不代表可见 binding 等价；统一 local/param 写入会改变分支结果。
         return None;
@@ -282,13 +277,8 @@ fn removable_dead_materialization_shell(
     let HirStmt::If(if_stmt) = stmt else {
         return false;
     };
-    let Some(else_block) = &if_stmt.else_block else {
-        return false;
-    };
-    let Some((then_target, then_value)) = single_fixed_assign_pattern(&if_stmt.then_block) else {
-        return false;
-    };
-    let Some((else_target, else_value)) = single_fixed_assign_pattern(else_block) else {
+    let Some([(then_target, then_value), (else_target, else_value)]) = fixed_assign_arms(if_stmt)
+    else {
         return false;
     };
     let truthiness = expr_truthiness(&if_stmt.cond, safety);
@@ -327,6 +317,13 @@ fn removable_dead_materialization_shell(
     // 候选拒绝[PolicyBoundary]：任一 arm 的 Unresolved 都是 permissive 输出保留的失败证据。
     (truthiness == Some(false) || safety.is_discard_safe_without_residual(then_value))
         && (truthiness == Some(true) || safety.is_discard_safe_without_residual(else_value))
+}
+
+fn fixed_assign_arms(if_stmt: &HirIf) -> Option<[(&HirLValue, &HirExpr); 2]> {
+    Some([
+        single_fixed_assign_pattern(&if_stmt.then_block)?,
+        single_fixed_assign_pattern(if_stmt.else_block.as_ref()?)?,
+    ])
 }
 
 fn single_fixed_assign_pattern(block: &HirBlock) -> Option<(&HirLValue, &HirExpr)> {

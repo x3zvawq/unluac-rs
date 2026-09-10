@@ -39,6 +39,10 @@ impl<F: FnMut(&HirStmt) -> bool> HirEvalEffects<F> {
 }
 
 impl<F: FnMut(&HirStmt) -> bool> HirVisitor for HirEvalEffects<F> {
+    fn is_complete(&self) -> bool {
+        self.found
+    }
+
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         self.found |= matches!(stmt, HirStmt::GlobalDecl(_) | HirStmt::Close(_))
             || (self.extra_stmt_effect)(stmt);

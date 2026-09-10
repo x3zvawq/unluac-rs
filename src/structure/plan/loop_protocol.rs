@@ -4,7 +4,7 @@
 //! numeric/generic-for 的 phi copy 应在什么阶段执行一次性写死。HIR 只能消费这些
 //! 稳定协议，不能再扫整张 CFG 回推 loop 形状或值写回时序。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::structure::{
     BlockRef, BlockTerminatorKind, Cfg, DataflowFacts, EdgeRef, GotoReason, GraphFacts,
@@ -212,10 +212,11 @@ impl PhiUseExtent {
 
 /// loop value 分类只依赖冻结 SSA/containment，因此为整个 proto 一次性建立稠密摘要。
 ///
-/// phi graph 先收缩 SCC，再沿 condensation DAG 传播 instruction-use 的 region
+/// 消费 Dataflow 冻结的 phi 分量，沿其拓扑顺序传播 instruction-use 的 region
 /// preorder 范围。一个 control region 的 subtree 也是连续 preorder 区间，所以
 /// `phi_observed_outside` 无需再为每个 copy 递归遍历整张 use graph。
-struct LoopValueAnalysis {
+/// 结果由协议生成和发布校验共用；两者之间只安装动作与协议，不改变这些分析输入。
+pub(crate) struct LoopValueAnalysis {
     vm_for_control: Vec<bool>,
     use_extents: Vec<PhiUseExtent>,
     absorbed_owner_by_edge: Vec<Option<super::LoopPlanId>>,

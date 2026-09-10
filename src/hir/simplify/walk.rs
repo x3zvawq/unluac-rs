@@ -14,6 +14,7 @@
 //!
 //! 例子：
 //! - `logical_simplify` 实现表达式与条件回调，区分值语境与 truthiness 语境
+//!   并在进入子节点前压平整条 NOT 链，避免先递归进入内联制造的深链或反复复制操作数
 //! - `dead_labels` 这类要在整段 block 上做删改的 pass，则实现 `HirRewritePass`
 //! - `close_scopes / decision-eliminate` 这类自带 block rebuild 的 pass，则可以只复用
 //!   下面的 `for_each_nested_block_mut / rewrite_nested_blocks_in_stmt`
@@ -39,6 +40,11 @@ pub(crate) trait HirRewritePass {
     }
 
     fn rewrite_expr(&mut self, _expr: &mut HirExpr) -> bool {
+        false
+    }
+
+    /// 先归一会影响遍历深度的表达式外壳，再沿改写后的子节点执行普通后序回调。
+    fn rewrite_expr_before_children(&mut self, _expr: &mut HirExpr) -> bool {
         false
     }
 
@@ -208,6 +214,7 @@ fn rewrite_call_expr(call: &mut HirCallExpr, pass: &mut impl HirRewritePass) -> 
 }
 
 pub(super) fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
+    let prefix_changed = pass.rewrite_expr_before_children(expr);
     let mut nested_changed = false;
     traverse_hir_expr_children!(
         expr,
@@ -231,7 +238,7 @@ pub(super) fn rewrite_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -
     );
 
     let expr_changed = pass.rewrite_expr(expr);
-    expr_changed || nested_changed
+    expr_changed || nested_changed || prefix_changed
 }
 
 fn rewrite_decision_expr(decision: &mut HirDecisionExpr, pass: &mut impl HirRewritePass) -> bool {

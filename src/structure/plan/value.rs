@@ -1,5 +1,12 @@
-use super::RegionId;
-use crate::structure::{BlockRef, EdgeRef, PhiId, SsaValue};
+//! 冻结 canonical phi 的逐输入处置，并发布由最终处置证明的循环状态身份。
+//!
+//! 唯一 RegionInput 与至少一个同 owner 的 LoopCarried 才形成 carried phi；例如
+//! `x = 0; while test() do x = step(x) end` 的入口值和循环 owner 在此确定。
+//! HIR 可以决定如何分配 binding，但不能重新遍历 incoming 选择结构 owner。
+//! 证明只保存输入槽位，查询从同一 canonical incoming 读取 owner/value，不复制身份。
+
+use super::{RegionId, RegionPlan};
+use crate::structure::{BlockRef, EdgeRef, PhiId, SsaValue, StructurePlan};
 use crate::transformer::Reg;
 
 /// 一个 canonical phi incoming 在最终结构计划中的唯一语义归属。
@@ -48,9 +55,21 @@ pub struct PhiPlan {
     pub block: BlockRef,
     pub reg: Reg,
     pub incomings: Vec<PhiIncomingPlan>,
+    pub(in crate::structure) loop_carried_input: Option<usize>,
 }
 
 impl PhiPlan {
+    pub fn loop_carried(&self) -> Option<LoopCarriedPhi> {
+        let input = &self.incomings[self.loop_carried_input?];
+        let PhiIncomingDisposition::RegionInput(owner) = input.disposition else {
+            unreachable!("certified loop input remains a RegionInput");
+        };
+        Some(LoopCarriedPhi {
+            owner,
+            input: input.value,
+        })
+    }
+
     pub fn has_unresolved(&self) -> bool {
         self.incomings.iter().any(|incoming| {
             matches!(
@@ -59,4 +78,43 @@ impl PhiPlan {
             )
         })
     }
+}
+
+/// 最终 incoming 共同证明的循环 owner 与唯一入口值，不包含 HIR binding 分配决定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopCarriedPhi {
+    pub owner: RegionId,
+    pub input: SsaValue,
+}
+
+pub(in crate::structure) fn loop_carried_input(
+    plan: &StructurePlan,
+    incomings: &[PhiIncomingPlan],
+) -> Option<usize> {
+    let mut owner = None;
+    let mut input = None;
+    let mut has_carried = false;
+    for (index, incoming) in incomings.iter().enumerate() {
+        let region = match incoming.disposition {
+            PhiIncomingDisposition::RegionInput(region) => {
+                if input.replace(index).is_some() {
+                    return None;
+                }
+                region
+            }
+            PhiIncomingDisposition::LoopCarried(region) => {
+                has_carried = true;
+                region
+            }
+            PhiIncomingDisposition::Dead => continue,
+            PhiIncomingDisposition::RegionResult(_)
+            | PhiIncomingDisposition::EdgeCopy
+            | PhiIncomingDisposition::DiagnosticUnresolved => return None,
+        };
+        if owner.replace(region).is_some_and(|owner| owner != region) {
+            return None;
+        }
+    }
+    let owner = owner?;
+    (has_carried && matches!(plan.region(owner), Some(RegionPlan::Loop { .. }))).then_some(input?)
 }

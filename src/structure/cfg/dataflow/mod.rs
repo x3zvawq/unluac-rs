@@ -262,6 +262,7 @@ fn compute_dataflow_proto(
         def_phi_uses: ssa.def_phi_uses,
         phi_uses: ssa.phi_uses,
         phi_phi_uses: ssa.phi_phi_uses,
+        phi_graph: ssa.phi_graph,
         phi_truly_dead: ssa.phi_truly_dead,
         open_use_sources,
         live_in: liveness.live_in,

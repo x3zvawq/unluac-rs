@@ -6,7 +6,8 @@
 //! 例如 `x = nil; goto L; ...; ::L:: if c then x=true else x=false end`，旧值沿实际
 //! 到达 L 的路径合流；若任一回边带入对象，shell 必须保留释放旧根的写入职责。
 //! 所有不动点完成后才按当前语句路径签发删除计划，不在中间迭代批准删除或重建控制边。
-//! 候选定位复用一条词法路径栈，仅为实际 shell 保存独立路径，不逐层复制无关语句的前缀。
+//! 构图时只为实际 shell 发布节点 ID 与词法路径；两臂的单赋值节点消费条件后继，
+//! 不再用语句地址关联身份或另走全树重建候选位置。常量裁掉的臂不参与后向活跃性。
 //! 候选 local 按完整 possible-home 集合建立反向索引，写入只更新可能命中的候选；
 //! 未知 provenance 仍覆盖 home universe，home-free local 仍接收直接 binding 写入。
 //! 数据流节点只投影 observer reads 与 shell 删除判定，不保存供后续重放的整份输入状态。
@@ -25,9 +26,7 @@
 //! 函数出口读取后结束。引用捕获和资源协议不会退化成全 proto blanket guard。
 //! 值是否 GC-inert 统一消费目标方言安全上下文；本文件不从底层 opcode 重新推断根协议。
 
-use crate::hir::simplify::stmt_plan::{
-    PathComponent, StmtPath, remove_planned_stmts, with_path_component,
-};
+use crate::hir::simplify::stmt_plan::{StmtPath, remove_planned_stmts};
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,7 +41,7 @@ use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 use super::{BooleanShellFacts, OldValueClass};
 use crate::hir::simplify::expr_facts::expr_truthiness;
 use crate::hir::simplify::lexical_cfg::{
-    FlowRefinement, HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
+    FlowRefinement, HirFlowGraph, HirFlowNodeId, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
 };
 use crate::hir::visit::{self, HirVisitor, visit_stmt_header};
 
@@ -85,8 +84,7 @@ pub(super) struct ShellArmLiveOut {
 #[derive(Clone, Debug)]
 struct ShellFlowSite<'a> {
     stmt: &'a HirStmt,
-    node: usize,
-    arm_nodes: [usize; 2],
+    node: HirFlowNodeId,
     live_after: ShellArmLiveOut,
 }
 
@@ -181,17 +179,15 @@ impl<'a> ShellFlowFacts<'a> {
         promotion_facts: &ProtoPromotionFacts,
         safety: HirExprSafety,
         live_domain: &LiveBindingState,
+        mut shells: BTreeMap<StmtPath, ShellFlowSite<'a>>,
     ) -> Self {
         let mut nodes = vec![LiveCfgNode::default(); graph.nodes().len()];
-        let mut stmt_nodes = BTreeMap::new();
         for (id, flow_node) in graph.nodes().iter().enumerate() {
             match flow_node.kind() {
                 HirFlowNodeKind::Stmt(stmt) => {
-                    stmt_nodes.insert(std::ptr::from_ref(stmt), id);
                     populate_stmt_live_event(&mut nodes[id], stmt, promotion_facts, safety);
                 }
                 HirFlowNodeKind::GenericForInit(flow) => {
-                    stmt_nodes.insert(std::ptr::from_ref(flow.stmt()), id);
                     populate_stmt_live_event(&mut nodes[id], flow.stmt(), promotion_facts, safety);
                     for (slot, value) in flow.for_stmt().iterator.iter().enumerate() {
                         nodes[id].holder_writes.push((
@@ -288,22 +284,30 @@ impl<'a> ShellFlowFacts<'a> {
         for node in &mut nodes {
             node.reads.retain_domain(live_domain);
         }
-        let mut shells = BTreeMap::new();
-        collect_shell_sites(&proto.body, &mut Vec::new(), &stmt_nodes, &mut shells);
         let mut arm_outputs = shells
             .values_mut()
             .flat_map(|site| {
+                let mut arms = [None; 2];
+                // 两臂各恰好一条 Assign，条件后继就是该臂节点；常量裁掉的臂保持空 live-out。
+                for (&node, &polarity) in graph.nodes()[site.node.index()].successors() {
+                    let index = usize::from(
+                        !polarity.expect("single-assignment arms must retain condition polarity"),
+                    );
+                    arms[index] = Some(node);
+                }
                 [
-                    (site.arm_nodes[0], &mut site.live_after.then_arm),
-                    (site.arm_nodes[1], &mut site.live_after.else_arm),
+                    arms[0].map(|node| (node, &mut site.live_after.then_arm)),
+                    arms[1].map(|node| (node, &mut site.live_after.else_arm)),
                 ]
+                .into_iter()
+                .flatten()
             })
             .collect::<BTreeMap<_, _>>();
         graph.solve_backward(
             LiveBindingState::default(),
             LiveBindingState::union_with,
             |id, _, state| {
-                if let Some(output) = arm_outputs.get_mut(&id.index()) {
+                if let Some(output) = arm_outputs.get_mut(&id) {
                     output.clone_from(state);
                 }
                 let node = &nodes[id.index()];
@@ -942,87 +946,6 @@ impl HirVisitor for LiveReadCollector<'_> {
     }
 }
 
-fn collect_shell_sites<'a>(
-    block: &'a HirBlock,
-    path: &mut StmtPath,
-    stmt_nodes: &BTreeMap<*const HirStmt, usize>,
-    shells: &mut BTreeMap<StmtPath, ShellFlowSite<'a>>,
-) {
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        with_path_component(path, PathComponent::Stmt(index), |path| match stmt {
-            HirStmt::LocalRootRelease(_) => {}
-            HirStmt::If(if_stmt) => {
-                if let Some(else_block) = &if_stmt.else_block
-                    && super::single_fixed_assign_pattern(&if_stmt.then_block).is_some()
-                    && super::single_fixed_assign_pattern(else_block).is_some()
-                {
-                    let then_stmt = &if_stmt.then_block.stmts[0];
-                    let else_stmt = &else_block.stmts[0];
-                    shells.insert(
-                        path.clone(),
-                        ShellFlowSite {
-                            stmt,
-                            node: stmt_nodes[&std::ptr::from_ref(stmt)],
-                            arm_nodes: [
-                                stmt_nodes[&std::ptr::from_ref(then_stmt)],
-                                stmt_nodes[&std::ptr::from_ref(else_stmt)],
-                            ],
-                            live_after: ShellArmLiveOut::default(),
-                        },
-                    );
-                }
-                with_path_component(path, PathComponent::Then, |path| {
-                    collect_shell_sites(&if_stmt.then_block, path, stmt_nodes, shells);
-                });
-                if let Some(else_block) = &if_stmt.else_block {
-                    with_path_component(path, PathComponent::Else, |path| {
-                        collect_shell_sites(else_block, path, stmt_nodes, shells);
-                    });
-                }
-            }
-            HirStmt::While(while_stmt) => {
-                collect_body_shell_sites(&while_stmt.body, path, stmt_nodes, shells);
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                collect_body_shell_sites(&repeat_stmt.body, path, stmt_nodes, shells);
-            }
-            HirStmt::NumericFor(for_stmt) => {
-                collect_body_shell_sites(&for_stmt.body, path, stmt_nodes, shells);
-            }
-            HirStmt::GenericFor(for_stmt) => {
-                collect_body_shell_sites(&for_stmt.body, path, stmt_nodes, shells);
-            }
-            HirStmt::Block(nested) => {
-                collect_body_shell_sites(nested, path, stmt_nodes, shells);
-            }
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        });
-    }
-}
-
-fn collect_body_shell_sites<'a>(
-    body: &'a HirBlock,
-    path: &mut StmtPath,
-    stmt_nodes: &BTreeMap<*const HirStmt, usize>,
-    shells: &mut BTreeMap<StmtPath, ShellFlowSite<'a>>,
-) {
-    with_path_component(path, PathComponent::Body, |path| {
-        collect_shell_sites(body, path, stmt_nodes, shells);
-    });
-}
-
 #[derive(Default)]
 pub(super) struct DeadShellPlan {
     removable: BTreeSet<StmtPath>,
@@ -1047,7 +970,25 @@ impl DeadShellPlan {
         if !candidates.has_shell {
             return Self::default();
         }
-        let Ok(graph) = HirFlowGraph::for_proto(&proto.body, safety) else {
+        let mut shells = BTreeMap::new();
+        let Ok(graph) = HirFlowGraph::for_proto_with_locations(
+            &proto.body,
+            safety,
+            |node, kind, block, index| {
+                if let HirFlowNodeKind::Stmt(stmt @ HirStmt::If(if_stmt)) = kind
+                    && super::fixed_assign_arms(if_stmt).is_some()
+                {
+                    shells.insert(
+                        block.to_stmt_path(index),
+                        ShellFlowSite {
+                            stmt,
+                            node,
+                            live_after: ShellArmLiveOut::default(),
+                        },
+                    );
+                }
+            },
+        ) else {
             // 分析停用[SemanticBarrier:ControlFlow]：同一个 label identity 若有多个 owner，
             // 不能签发唯一的 reaching/observer 证明，也不能在 consumer 内猜测目标。
             return Self::default();
@@ -1058,6 +999,7 @@ impl DeadShellPlan {
             promotion_facts,
             safety,
             &candidates.live_domain(),
+            shells,
         );
         let mut parameter_homes = BTreeSet::new();
         for param in &proto.params {
@@ -1079,7 +1021,7 @@ impl DeadShellPlan {
             initial_state,
             join_states,
             |id, kind, state| {
-                let removable = sites_by_node.get(&id.index()).is_some_and(|site| {
+                let removable = sites_by_node.get(&id).is_some_and(|site| {
                     super::removable_dead_materialization_shell(
                         site.stmt,
                         facts,
@@ -1097,7 +1039,7 @@ impl DeadShellPlan {
         let removable = shell_facts
             .shells
             .into_iter()
-            .filter_map(|(path, site)| entries[site.node].unwrap_or(false).then_some(path))
+            .filter_map(|(path, site)| entries[site.node.index()].unwrap_or(false).then_some(path))
             .collect();
         Self { removable }
     }
@@ -1144,13 +1086,7 @@ impl HirVisitor for CandidateValues<'_> {
         let HirStmt::If(if_stmt) = stmt else {
             return;
         };
-        let Some(else_block) = &if_stmt.else_block else {
-            return;
-        };
-        let Some((then_target, _)) = super::single_fixed_assign_pattern(&if_stmt.then_block) else {
-            return;
-        };
-        let Some((else_target, _)) = super::single_fixed_assign_pattern(else_block) else {
+        let Some([(then_target, _), (else_target, _)]) = super::fixed_assign_arms(if_stmt) else {
             return;
         };
         self.has_shell = true;

@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{LocalId, ParamId, TempId, UpvalueId};
+use crate::hir::emission::HirEmissionFacts;
 use crate::structure::{
     BlockRef, BlockTerminatorKind, BranchArm, Cfg, DataflowFacts, DefId, EdgeRef, EdgeTransfer,
     GraphFacts, PhiId, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan, SsaValue,
@@ -65,12 +66,17 @@ impl CapturedSlotKey {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "绑定分配显式借用各层事实及共享发射投影"
+)]
 pub(super) fn build_bindings(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph: &GraphFacts,
     dataflow: &DataflowFacts,
     structure: &ReadyStructureFacts,
+    emission: &HirEmissionFacts<'_>,
     captured_slot_epochs: &SlotEpochFacts,
     child_mutable_upvalues: &[&[bool]],
 ) -> ProtoBindings {
@@ -243,7 +249,10 @@ pub(super) fn build_bindings(
         .filter_map(|(child, parent)| {
             Some((
                 (*parent)?,
-                loop_carried_binding(structure.plan(), structure.plan().phi_plan(PhiId(child))?)?
+                structure
+                    .plan()
+                    .phi_plan(PhiId(child))?
+                    .loop_carried()?
                     .owner,
             ))
         })
@@ -454,6 +463,7 @@ pub(super) fn build_bindings(
             dataflow,
             graph,
             structure,
+            emission,
             captured_slots.lexical_scopes,
         ),
         entry_local_regs,

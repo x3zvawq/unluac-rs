@@ -93,6 +93,7 @@ pub struct DataflowFacts {
     pub(crate) def_phi_uses: Vec<Vec<PhiId>>,
     pub(crate) phi_uses: Vec<Vec<UseSite>>,
     pub(crate) phi_phi_uses: Vec<Vec<PhiId>>,
+    pub(crate) phi_graph: super::PhiGraphFacts,
     pub(crate) phi_truly_dead: Vec<bool>,
     pub open_use_sources: Vec<OpenUseSources>,
     pub live_in: Vec<BTreeSet<Reg>>,

@@ -16,6 +16,12 @@
 //! 延迟到扫描结束后一次压缩，使 capture 与求值顺序快照始终处在同一坐标系。
 //! order-sensitive def 索引由 proto 级 scratch 复用，每个 block 只清理上次实际写过的槽，
 //! 避免结构块数量与全局 temp 数相乘的稠密初始化成本。
+//! 相邻提交点统一消费连续纯依赖链：例如 `t0=not p; t1=not t0; box.x=t1`
+//! 在原站点、根、捕获及左值求值前缀允许时，一次展开为 `box.x=not not p`，
+//! callee、参数和 return 也复用该入口。每个原 producer 仅有一个读取叶，其余为常量；
+//! 依赖沿既有站点 query 传播，保留 FASTCALL direct 参数上下文与 callee 物化位置，
+//! 不反复重扫增长中的 sink。多读取分支仍需展开后的前缀证明，保留逐站点处理；
+//! 逻辑归一仍由 logical-simplify 负责。
 //! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
 //! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
 //! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
@@ -74,11 +80,11 @@ use crate::hir::expr_safety::{
 use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 
 use self::site::{
-    InlineSite, fastcall_callee_materialization_precedes_temp, inline_site_in_repeat_condition,
-    inline_site_in_stmt, is_bare_method_receiver_snapshot_in_stmt, is_method_receiver_snapshot,
-    is_stable_inline_value, puc_upvalue_table_key_with_deferred_base_read,
-    temp_precedes_observable_eval_in_expr, temp_precedes_observable_eval_in_stmt,
-    transparent_block_head,
+    InlineSite, fastcall_callee_materialization_precedes_temp, inline_dependency_site,
+    inline_site_in_repeat_condition, inline_site_in_stmt, is_bare_method_receiver_snapshot_in_stmt,
+    is_method_receiver_snapshot, is_stable_inline_value,
+    puc_upvalue_table_key_with_deferred_base_read, temp_precedes_observable_eval_in_expr,
+    temp_precedes_observable_eval_in_stmt, transparent_block_head,
 };
 use self::usage::{
     TempUseScratch, TempUseSummary, collect_expr_temp_uses_summary, collect_stmt_temp_uses,
@@ -534,11 +540,12 @@ fn inline_temps_in_block(
     let mut callee_materialized_at = None;
     let mut adjacent_changed = false;
 
-    for (index, stmt) in std::mem::take(&mut block.stmts)
+    let mut earlier = std::mem::take(&mut block.stmts)
         .into_iter()
         .enumerate()
         .rev()
-    {
+        .peekable();
+    while let Some((index, stmt)) = earlier.next() {
         let preserves_table_initialization =
             stmt.scalar_temp_assignment().is_some_and(|(temp, value)| {
                 kept_rev.last().is_some_and(|sink| {
@@ -661,17 +668,38 @@ fn inline_temps_in_block(
             let next_stmt = kept_rev
                 .last_mut()
                 .expect("next stmt metadata must track the last kept stmt");
-            replace_temp_in_stmt(next_stmt, temp, value);
-            if site.is_call_callee() {
-                callee_materialized_at = Some(index);
-            }
-            remove_live_use(live_use_counts, temp);
-            if use_count == 2 {
-                // method receiver 会把 replacement 同时写入 callee base 与隐式首参；
-                // 删除原赋值只抵消其中一份，因此需把新增的语法 use 记回本轮计数。
-                collect_expr_temp_uses_summary(value, &mut workspace.uses)
-                    .add_to_totals(live_use_counts);
+            let batched = use_count == 1
+                && matches!(workspace.scope, TempInlineScope::All)
+                && inline_pure_dependency_chain(
+                    next_stmt,
+                    (index, &stmt, site),
+                    &mut earlier,
+                    &mut PureInlineContext {
+                        scratch: &mut workspace.uses,
+                        live_use_counts,
+                        facts,
+                        captured_slots_before_stmt: &captured_slots_before_stmt,
+                        readability,
+                        safety: workspace.roots.safety,
+                    },
+                    &physical_root_lifetimes,
+                    &workspace.physical_root_temps,
+                    reference_captured,
+                    &mut callee_materialized_at,
+                );
+            if !batched {
+                replace_temp_in_stmt(next_stmt, temp, value);
+                if site.is_call_callee() {
+                    callee_materialized_at = Some(index);
+                }
                 remove_live_use(live_use_counts, temp);
+                if use_count == 2 {
+                    // method receiver 会把 replacement 同时写入 callee base 与隐式首参；
+                    // 删除原赋值只抵消其中一份，因此需把新增的语法 use 记回本轮计数。
+                    collect_expr_temp_uses_summary(value, &mut workspace.uses)
+                        .add_to_totals(live_use_counts);
+                    remove_live_use(live_use_counts, temp);
+                }
             }
             changed = true;
             adjacent_changed = true;
@@ -1157,22 +1185,166 @@ fn call_root_overwrite_is_inlineable(expr: &HirExpr, root: TempId) -> bool {
     }
 }
 
-/// Inline a contiguous pure alias chain through one substitution-DAG rewrite.
-///
-/// This path deliberately accepts only repeatable expressions.  Such a chain has no
-/// lookup, call, allocation, or mutable snapshot whose evaluation point could move;
-/// every candidate has one total use and the dependency edges point forward in the
-/// statement run.  The stricter contract is useful here because it lets the rewrite
-/// operate on the final sink directly instead of recreating every intermediate sink.
-struct PureMaterializationContext<'a> {
+/// 调用 materialization 与相邻依赖链共享纯 producer 验证和一次 DAG 提交。
+/// 依赖方向、连续性和消费站点由各自入口证明；repeatable 排除调用、查找和分配，
+/// 但不表示来源 binding 不可变。capture 与求值前缀证明仍负责快照读取时点。
+struct PureInlineContext<'a> {
     scratch: &'a mut TempUseScratch,
     live_use_counts: &'a mut [usize],
     facts: &'a ProtoPromotionFacts,
     captured_slots_before_stmt: &'a CapturedSlotSnapshots,
-    order_sensitive_defs: &'a OrderSensitiveDefWorkspace,
     readability: ReadabilityOptions,
     safety: HirExprSafety,
-    removed_stmts: &'a mut [bool],
+}
+
+impl PureInlineContext<'_> {
+    fn candidate_is_safe(&self, temp: TempId, value: &HirExpr, index: usize) -> bool {
+        // 候选拒绝[SemanticBarrier:Lifetime]：额外 use 仍需原 producer 的值。
+        // 候选拒绝[SemanticBarrier:EvalOrder]：批量路径只合并 repeatable 值。
+        // 候选拒绝[PolicyBoundary]：原 producer 继续服从固定 nested 复杂度上限。
+        // capture、debug 与自更新身份由同一 materialization guard 判定。
+        total_use_count(temp, self.live_use_counts) == 1
+            && self.safety.is_repeatable(value)
+            && InlineSite::Nested.allows(value, self.readability, self.safety)
+            && materialization_run_candidate_is_safe(
+                temp,
+                value,
+                index,
+                self.scratch,
+                self.facts,
+                self.captured_slots_before_stmt,
+            )
+    }
+
+    fn commit(&mut self, sink: &mut HirStmt, replacements: &BTreeMap<TempId, HirExpr>) {
+        assert_ne!(
+            replace_temps_in_stmt(sink, replacements),
+            0,
+            "proven pure materialization must reach its sink"
+        );
+        let mut remaining = false;
+        collect_stmt_temp_uses(sink, self.scratch).for_each(|temp, _| {
+            remaining |= replacements.contains_key(&temp);
+        });
+        assert!(
+            !remaining,
+            "acyclic materialization substitution must consume every run temp"
+        );
+        for &temp in replacements.keys() {
+            remove_live_use(self.live_use_counts, temp);
+        }
+    }
+}
+
+/// 一个读取叶与常量组成的纯表达式没有需再次物化的 sibling 快照；返回继续追溯的 Temp。
+/// 多读取分支需要展开后的前缀事实，仍交给原逐站点路径，不能用 repeatable 猜测。
+fn single_pure_dependency(value: &HirExpr) -> Option<Option<TempId>> {
+    let mut binding = None;
+    let multiple = crate::hir::visit::any_expr(value, &mut |expr| {
+        let Some(current) = HirBinding::from_expr(expr) else {
+            return false;
+        };
+        binding.replace(current).is_some()
+    });
+    (!multiple).then_some(match binding {
+        Some(HirBinding::Temp(temp)) => Some(temp),
+        _ => None,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "候选、原坐标根快照和可变 callee 顺序分别由相邻 owner 持有"
+)]
+fn inline_pure_dependency_chain(
+    sink: &mut HirStmt,
+    first: (usize, &HirStmt, InlineSite),
+    earlier: &mut std::iter::Peekable<impl Iterator<Item = (usize, HirStmt)>>,
+    context: &mut PureInlineContext<'_>,
+    physical_root_lifetimes: &[bool],
+    physical_root_temps: &[bool],
+    reference_captured: &ReferenceCapturedBindings,
+    callee_materialized_at: &mut Option<usize>,
+) -> bool {
+    let (first_index, first_stmt, mut site) = first;
+    let (mut expected, _) = first_stmt
+        .scalar_temp_assignment()
+        .expect("adjacent scalar producer");
+    if !temp_precedes_observable_eval_in_stmt(sink, expected, true, reference_captured) {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：来源快照不能越过 sink 的事件或先前可变读取。
+        return false;
+    }
+    let mut first = Some((first_index, first_stmt));
+    let mut replacements = BTreeMap::new();
+    let mut callee = *callee_materialized_at;
+    loop {
+        let from_iterator = first.is_none();
+        let Some((index, stmt)) =
+            first.or_else(|| earlier.peek().map(|(index, stmt)| (*index, stmt)))
+        else {
+            break;
+        };
+        let Some((temp, value)) = stmt.scalar_temp_assignment() else {
+            break;
+        };
+        if temp != expected
+            || replacements.contains_key(&temp)
+            || physical_root_lifetimes[index]
+            || physical_root_temps
+                .get(temp.index())
+                .copied()
+                .unwrap_or(false)
+            || matches!(
+                site,
+                InlineSite::ConditionalNested
+                    | InlineSite::RepeatedNested
+                    | InlineSite::LoopCondition
+                    | InlineSite::LoopHead
+                    | InlineSite::PrefixedBlock
+            )
+            || !context.candidate_is_safe(temp, value, index)
+            || !site.allows(value, context.readability, context.safety)
+            || call_arg_inline_crosses_materialized_callee(site, value, index, callee)
+        {
+            // 候选拒绝[LayerBoundary]：连续批处理在原根、身份、执行区域或求值顺序边界停止。
+            break;
+        }
+        let Some(dependency) = single_pure_dependency(value) else {
+            // 候选拒绝[ProofIncomplete]：多读取分支需要展开后的 sibling 前缀，仍由逐站点路径证明。
+            break;
+        };
+        if dependency.is_some_and(|temp| replacements.contains_key(&temp)) {
+            // 候选拒绝[SemanticBarrier:ValueFlow]：向后依赖已选 producer 会形成不同 epoch 或环。
+            break;
+        }
+        let next = dependency.and_then(|dependency| {
+            temp_precedes_observable_eval_in_expr(value, dependency, true, reference_captured)
+                .then(|| {
+                    inline_dependency_site(value, dependency, site).map(|site| (dependency, site))
+                })
+                .flatten()
+        });
+        replacements.insert(temp, value.clone());
+        if site.is_call_callee() {
+            callee = Some(index);
+        }
+        if from_iterator {
+            earlier.next();
+        } else {
+            first = None;
+        }
+        let Some((dependency, next_site)) = next else {
+            break;
+        };
+        expected = dependency;
+        site = next_site;
+    }
+    if replacements.len() < 2 {
+        return false;
+    }
+    context.commit(sink, &replacements);
+    *callee_materialized_at = callee;
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -1389,7 +1561,8 @@ fn inline_pure_materialization_run(
     run_end: usize,
     callee_index: usize,
     callee_temp: TempId,
-    context: &mut PureMaterializationContext<'_>,
+    context: &mut PureInlineContext<'_>,
+    order_sensitive_defs: &OrderSensitiveDefWorkspace,
 ) -> bool {
     if callee_index != run_start || run_end <= run_start {
         return false;
@@ -1401,27 +1574,8 @@ fn inline_pure_materialization_run(
         let Some((temp, value)) = block.stmts[index].scalar_temp_assignment() else {
             return false;
         };
-        // 候选拒绝[SemanticBarrier:Lifetime]：alias 链节点有额外 use 时不能随 run 整段删除。
-        // 候选拒绝[SemanticBarrier:EvalOrder]：非 repeatable 值或转发更早 observable def 会被延后/重复求值。
-        // 候选拒绝[PolicyBoundary]：nested sink 继续服从固定复杂度展示阈值。
-        // 候选拒绝[SemanticBarrier:Capture]：capture/self-rebind 改写会改变闭包或状态所见值。
-        // 候选拒绝[PolicyBoundary]：DebugScope 标注的 temp 保留独立源码 binding 身份。
-        if total_use_count(temp, context.live_use_counts) != 1
-            || !context.safety.is_repeatable(value)
-            || !InlineSite::Nested.allows(value, context.readability, context.safety)
-            || !materialization_run_candidate_is_safe(
-                temp,
-                value,
-                index,
-                context.scratch,
-                context.facts,
-                context.captured_slots_before_stmt,
-            )
-            || arg_value_forwards_prior_order_sensitive_expr(
-                value,
-                run_start,
-                context.order_sensitive_defs,
-            )
+        if !context.candidate_is_safe(temp, value, index)
+            || arg_value_forwards_prior_order_sensitive_expr(value, run_start, order_sensitive_defs)
         {
             return false;
         }
@@ -1476,32 +1630,11 @@ fn inline_pure_materialization_run(
         }
     }
 
-    let mut rewritten_sink = block.stmts[run_end].clone();
-    assert_ne!(
-        replace_temps_in_stmt(&mut rewritten_sink, &replacements),
-        0,
-        "pure materialization DAG must replace its direct call callee"
-    );
-    let mut remaining = false;
-    collect_stmt_temp_uses(&rewritten_sink, context.scratch).for_each(|temp, _| {
-        remaining |= positions.contains_key(&temp);
-    });
-    assert!(
-        !remaining,
-        "acyclic materialization substitution must consume every run temp"
-    );
-
-    // The source call already establishes that `callee_temp` is the direct call
-    // target, and `callee_index == run_start` makes it a member of this complete map.
     assert!(
         replacements.contains_key(&callee_temp),
         "pure materialization map must contain its validated callee"
     );
-    block.stmts[run_end] = rewritten_sink;
-    context.removed_stmts[run_start..run_end].fill(true);
-    for temp in positions.keys().copied() {
-        remove_live_use(context.live_use_counts, temp);
-    }
+    context.commit(&mut block.stmts[run_end], &replacements);
     true
 }
 
@@ -1668,15 +1801,13 @@ fn inline_materialization_runs(
         // this keeps generated source readable without imposing an arbitrary run-size
         // cutoff.  Runs containing observable expressions continue through the precise
         // per-site proof below.
-        let mut pure_context = PureMaterializationContext {
+        let mut pure_context = PureInlineContext {
             scratch: uses,
             live_use_counts,
             facts,
             captured_slots_before_stmt,
-            order_sensitive_defs,
             readability: *readability,
             safety: *safety,
-            removed_stmts: &mut removed_stmts,
         };
         if inline_pure_materialization_run(
             block,
@@ -1685,7 +1816,9 @@ fn inline_materialization_runs(
             callee_index,
             callee_temp,
             &mut pure_context,
+            order_sensitive_defs,
         ) {
+            removed_stmts[run_start..run_end].fill(true);
             changed = true;
             index = run_end + 1;
             continue;

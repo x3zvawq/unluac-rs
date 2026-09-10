@@ -373,9 +373,8 @@ impl ProtoPromotionFacts {
         dataflow: &DataflowFacts,
         fixed_temps: &[TempId],
         debug_scopes: &[Option<usize>],
-        plan: &StructurePlan,
+        emission: &crate::hir::emission::HirEmissionFacts<'_>,
     ) {
-        let emission = crate::hir::emission::HirEmissionFacts::new(plan);
         let emitted = |instr: InstrRef| {
             !emission.for_instr(instr)
                 && emission

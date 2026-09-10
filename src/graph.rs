@@ -59,6 +59,7 @@ pub(crate) fn depth_first<N: Copy, I: IntoIterator<Item = N>>(
 }
 
 /// 消费同一图的 DFS 后序与反向边；后序同时限定入口可达域。
+/// 分量按源到汇签发，跨分量边的 source 编号严格小于 target，可直接用于正反向传播。
 pub(crate) fn strongly_connected_components<N: Copy, I: IntoIterator<Item = N>>(
     node_count: usize,
     postorder: &[N],

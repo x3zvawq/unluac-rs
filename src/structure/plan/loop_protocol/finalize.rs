@@ -10,7 +10,7 @@ pub(in crate::structure::plan) fn finalize(
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     plan: &mut StructurePlan,
-) -> Result<(), StructureError> {
+) -> Result<LoopValueAnalysis, StructureError> {
     let analysis = LoopValueAnalysis::build(proto, cfg, graph_facts, dataflow, plan)?;
     let actions = plan
         .loops
@@ -54,7 +54,7 @@ pub(in crate::structure::plan) fn finalize(
     for (payload, protocol) in plan.loops.iter_mut().zip(protocols) {
         payload.protocol = Some(protocol);
     }
-    Ok(())
+    Ok(analysis)
 }
 
 /// 证明最终 loop protocol/value-action arena 与被语法吸收的 CFG edge 完全一致。
@@ -67,8 +67,8 @@ pub(in crate::structure::plan) fn validate(
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
+    analysis: &LoopValueAnalysis,
 ) -> Result<(), StructureError> {
-    let analysis = LoopValueAnalysis::build(proto, cfg, graph_facts, dataflow, plan)?;
     let body_completion = freeze_vm_for_body_completion(cfg, plan)?;
     if plan
         .loops
@@ -96,7 +96,7 @@ pub(in crate::structure::plan) fn validate(
             cfg,
             dataflow,
             plan,
-            analysis: &analysis,
+            analysis,
             region,
             payload,
             body_completes_normally: body_completion[index],
@@ -109,7 +109,7 @@ pub(in crate::structure::plan) fn validate(
         }
         if let LoopVmProtocol::Repeat(repeat) = protocol {
             validate_repeat_outer_loop_owned_exit_copies(
-                proto, cfg, dataflow, plan, &analysis, region, repeat,
+                proto, cfg, dataflow, plan, analysis, region, repeat,
             )?;
         }
 
@@ -117,7 +117,7 @@ pub(in crate::structure::plan) fn validate(
             .loop_value_actions(loop_id)
             .ok_or_else(|| StructureError::invalid("loop value-action arena is sparse"))?;
         let expected_actions =
-            freeze_value_actions(proto, cfg, dataflow, plan, &analysis, region, payload)?;
+            freeze_value_actions(proto, cfg, dataflow, plan, analysis, region, payload)?;
         if *actions != expected_actions {
             return Err(StructureError::invalid(format!(
                 "loop value actions #{} changed after freezing",
@@ -289,6 +289,6 @@ pub(in crate::structure::plan) fn validate(
             )));
         }
     }
-    validate_iteration_edge_dispositions(proto, cfg, graph_facts, dataflow, plan, &analysis)?;
+    validate_iteration_edge_dispositions(proto, cfg, graph_facts, dataflow, plan, analysis)?;
     Ok(())
 }

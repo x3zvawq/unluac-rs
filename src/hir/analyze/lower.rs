@@ -27,6 +27,7 @@ use crate::hir::common::{
     HirExitRequirement, HirExpr, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirStmt,
     HirValuePack, LocalId, ParamId, TempId, UpvalueId,
 };
+use crate::hir::emission::HirEmissionFacts;
 use crate::recovery::{ProtoArtifactStage, ProtoFailure};
 use crate::structure::{
     BlockRef, BlockTerminatorKind, Cfg, CfgGraph, ControlFlowFeature, DataflowFacts, GraphFacts,
@@ -468,12 +469,14 @@ fn lower_proto_one(
     )?;
 
     let slot_epochs = SlotEpochFacts::analyze(proto, cfg, graph_facts, dataflow);
+    let emission = HirEmissionFacts::new(structure.plan());
     let mut bindings = build_bindings(
         proto,
         cfg,
         graph_facts,
         dataflow,
         structure,
+        &emission,
         &slot_epochs,
         &child_mutable_upvalues,
     );
@@ -511,7 +514,7 @@ fn lower_proto_one(
         dataflow,
         &bindings.fixed_temps,
         &bindings.temp_debug_scopes,
-        structure.plan(),
+        &emission,
     );
     super::bindings::bind_copy_root_scopes(
         proto,
@@ -519,9 +522,11 @@ fn lower_proto_one(
         dataflow,
         graph_facts,
         structure,
+        &emission,
         &mut bindings,
         &mut promotion_facts,
     )?;
+    drop(emission);
     let copy_root_holders =
         super::bindings::bind_copy_root_holders(&mut bindings, &mut promotion_facts);
     super::method_setups::record_method_setup_protocols(

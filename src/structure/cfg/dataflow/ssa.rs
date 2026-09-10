@@ -6,6 +6,7 @@
 //! SSA 事实后完成。
 //! phi 放置与 rename 共享正式 Def 表及寄存器/指令索引，不另建 Reg 分组或复制身份配对。
 //! trivial phi 收敛后冻结直接值根；compact/remap 只查询该结果，不再次追踪替换图。
+//! use 索引完成后冻结 phi 分量与递归身份，后续短路/循环分析共享同一 canonical 图事实。
 //!
 //! 输入形状：两条分支分别写 r2，随后 merge 读取 r2。
 //! 输出形状：merge 上一个 pruned phi，读取点直接引用 `SsaValue::Phi`，两条 incoming
@@ -25,6 +26,7 @@ pub(super) struct SsaAnalysis {
     pub(super) def_phi_uses: Vec<Vec<PhiId>>,
     pub(super) phi_uses: Vec<Vec<UseSite>>,
     pub(super) phi_phi_uses: Vec<Vec<PhiId>>,
+    pub(super) phi_graph: super::super::common::PhiGraphFacts,
     pub(super) phi_truly_dead: Vec<bool>,
     pub(super) phi_use_blocks: Vec<Option<BlockRef>>,
 }
@@ -91,6 +93,7 @@ pub(super) fn build_ssa(
     let (def_uses, def_phi_uses, phi_uses, phi_phi_uses, phi_use_blocks) =
         index_uses(cfg, defs.len(), &phis, &use_values)?;
     let phi_truly_dead = compute_truly_dead_phis(&phis, &phi_uses);
+    let phi_graph = super::super::common::PhiGraphFacts::build(&phis, &phi_phi_uses);
 
     Ok(SsaAnalysis {
         phis,
@@ -103,6 +106,7 @@ pub(super) fn build_ssa(
         def_phi_uses,
         phi_uses,
         phi_phi_uses,
+        phi_graph,
         phi_truly_dead,
         phi_use_blocks,
     })

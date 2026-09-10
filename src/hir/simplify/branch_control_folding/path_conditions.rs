@@ -10,10 +10,14 @@
 //! 仅关联同一次 HIR 快照的查询与原地改写，不解引用地址；子块完成改写后才截断不可达尾部，
 //! 不移动后续仍待查询的语句。源码身份、控制入口和诊断仍由 DiscardBoundaryFacts 决定保留。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirLocalDecl, HirStmt, HirUnaryOpKind, LocalId, ParamId,
+    HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirLogicalExpr,
+    HirStmt, HirUnaryExpr, HirUnaryOpKind, LocalId, ParamId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 
@@ -22,7 +26,6 @@ use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 use super::super::logical_simplify::{
     simplify_condition_truthiness_shape_with_safety, simplify_logical_shape_with_safety,
 };
-use super::super::mention::stmts_reference_captured_bindings;
 use super::super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_block};
 use super::DiscardBoundaryFacts;
 use crate::hir::visit::{HirVisitor, visit_block};
@@ -86,13 +89,6 @@ impl StableBindingIndex {
         };
         visit_block(body, &mut index);
 
-        let captured = stmts_reference_captured_bindings(&body.stmts);
-        index
-            .unstable
-            .extend(captured.params.into_iter().map(StableBinding::Param));
-        index
-            .unstable
-            .extend(captured.locals.into_iter().map(StableBinding::Local));
         index
     }
 
@@ -120,6 +116,14 @@ impl StableBindingIndex {
 }
 
 impl HirVisitor for StableBindingIndex {
+    fn visit_capture(&mut self, capture: &HirCapture) {
+        if capture.mode == HirCaptureMode::ByReference
+            && let Some(binding) = stable_binding(&capture.binding.expr())
+        {
+            self.unstable.insert(binding);
+        }
+    }
+
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::If(if_stmt) => self.track_condition(&if_stmt.cond),
@@ -173,15 +177,10 @@ pub(super) fn specialize_stable_path_conditions(
                 record_local_declaration(decl, facts, &stable);
             }
             let condition = graph.nodes()[id.index()].condition()?;
-            let mut replacement = condition.clone();
-            specialize_condition(&mut replacement, facts, &stable)
-                .then_some((std::ptr::from_ref(condition), replacement))
+            specialize_condition(condition, facts, &stable)
+                .map(|replacement| (std::ptr::from_ref(condition), replacement))
         },
-        |condition, truthy, facts| match facts_for_condition(facts, condition, truthy, &stable) {
-            None => FlowRefinement::Unreachable,
-            Some(refined) if refined == *facts => FlowRefinement::Unchanged,
-            Some(refined) => FlowRefinement::Refined(refined),
-        },
+        |condition, truthy, facts| facts_for_condition(facts, condition, truthy, &stable),
     );
     let mut replacements = BTreeMap::new();
     let mut live_stmts = BTreeSet::new();
@@ -291,38 +290,51 @@ fn record_local_declaration(
 }
 
 fn specialize_condition(
-    expr: &mut HirExpr,
+    expr: &HirExpr,
     facts: &PathFacts,
     stable: &StableBindingIndex,
-) -> bool {
+) -> Option<HirExpr> {
     if let Some(truthy) = stable_binding(expr)
         .filter(|binding| stable.contains(*binding))
         .and_then(|binding| facts.get(binding))
     {
-        *expr = HirExpr::Boolean(truthy);
-        return true;
+        return Some(HirExpr::Boolean(truthy));
     }
 
-    let mut changed = match expr {
+    // 固定点可能反复访问没有可替换绑定的条件；借用原树做查询，只构造发生变化的路径。
+    let mut replacement = match expr {
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-            specialize_condition(&mut unary.expr, facts, stable)
+            specialize_condition(&unary.expr, facts, stable)
+                .map(|expr| HirExpr::Unary(Box::new(HirUnaryExpr { op: unary.op, expr })))
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            specialize_condition(&mut logical.lhs, facts, stable)
-                | specialize_condition(&mut logical.rhs, facts, stable)
+            let lhs = specialize_condition(&logical.lhs, facts, stable);
+            let rhs = specialize_condition(&logical.rhs, facts, stable);
+            if lhs.is_none() && rhs.is_none() {
+                None
+            } else {
+                let logical = Box::new(HirLogicalExpr {
+                    lhs: lhs.unwrap_or_else(|| logical.lhs.clone()),
+                    rhs: rhs.unwrap_or_else(|| logical.rhs.clone()),
+                });
+                Some(match expr {
+                    HirExpr::LogicalAnd(_) => HirExpr::LogicalAnd(logical),
+                    _ => HirExpr::LogicalOr(logical),
+                })
+            }
         }
-        _ => false,
+        _ => None,
     };
     loop {
-        let replacement = simplify_logical_shape_with_safety(expr, stable.safety)
-            .or_else(|| simplify_condition_truthiness_shape_with_safety(expr, stable.safety));
-        let Some(replacement) = replacement.filter(|replacement| replacement != expr) else {
+        let current = replacement.as_ref().unwrap_or(expr);
+        let next = simplify_logical_shape_with_safety(current, stable.safety)
+            .or_else(|| simplify_condition_truthiness_shape_with_safety(current, stable.safety));
+        let Some(next) = next.filter(|next| next != current) else {
             break;
         };
-        *expr = replacement;
-        changed = true;
+        replacement = Some(next);
     }
-    changed
+    replacement
 }
 
 fn facts_for_condition(
@@ -330,13 +342,20 @@ fn facts_for_condition(
     expr: &HirExpr,
     truthy: bool,
     stable: &StableBindingIndex,
-) -> Option<PathFacts> {
-    let mut extended = facts.clone();
-    extend_condition_facts(&mut extended, expr, truthy, stable).then_some(extended)
+) -> FlowRefinement<PathFacts> {
+    let mut extended = Cow::Borrowed(facts);
+    if !extend_condition_facts(&mut extended, expr, truthy, stable) {
+        return FlowRefinement::Unreachable;
+    }
+    match extended {
+        Cow::Borrowed(_) => FlowRefinement::Unchanged,
+        // 只有插入原状态中不存在的事实才取得所有权；已有一致事实不会触发复制。
+        Cow::Owned(refined) => FlowRefinement::Refined(refined),
+    }
 }
 
 fn extend_condition_facts(
-    facts: &mut PathFacts,
+    facts: &mut Cow<'_, PathFacts>,
     expr: &HirExpr,
     truthy: bool,
     stable: &StableBindingIndex,
@@ -346,7 +365,10 @@ fn extend_condition_facts(
     }
 
     if let Some(binding) = stable_binding(expr).filter(|binding| stable.contains(*binding)) {
-        return facts.insert(binding, truthy);
+        return match facts.get(binding) {
+            Some(known) => known == truthy,
+            None => facts.to_mut().insert(binding, truthy),
+        };
     }
 
     match expr {

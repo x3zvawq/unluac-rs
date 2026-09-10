@@ -1,124 +1,61 @@
 //! 裁剪 Structure 为同槽 `Entry(nil)` region-result phi 物化出的冗余 nil 边写入。
 //!
 //! 候选必须来自 promotion 保留的 direct canonical phi provenance。分析以可信的
-//! `(slot, close epoch)` 为身份，分别传播普通落空、`break` 与 `continue` 状态；循环对
-//! 回边求有限不动点。临时导航共用路径栈，只有保留的计划键拥有路径；验证成功后才
-//! 在原 HIR 上一次性提交删除。
+//! `(slot, close epoch)` 为身份，消费一次共享 HIR CFG 和每个事件的求值/写入事实，
+//! 用四状态位集合求不动点。构图时只为候选写入保存节点 ID 对应的词法路径；收敛后才
+//! 在原 HIR 上一次性提交删除，不用地址或后序树匹配重建语句身份。
 //! reference capture 本身不会让 `nil = nil` 变得可观察，但 capture 逃逸后的调用或
-//! `__close` 可能回写该 cell，因此会把值状态降为 unknown。当前 block 的单调前向
-//! goto 由共享 `LexicalCfg` 精确消费；后置嵌套 island 的自含回环只停用它自身，不会
-//! 抹掉此前已证明的入口 nil 事实。
+//! `__close` 可能回写该 cell，因此会把值状态降为 unknown。共享图解析内部跳转与回边，
+//! 来自候选区域外的 label 引用注入 unknown 入口，不把入口 nil 传播给外部到达路径，
+//! 也不因后置跳转丢弃此前干净路径上的证明。
 //! capture 直接按父级绑定查询可能 home；例如已知 home-free 的 Local 不暴露入口槽，
 //! 未知 home 仍保守视为可能别名，不从临时表达式树重新识别捕获身份。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::simplify::stmt_plan::{
-    PathComponent, StmtPath, remove_planned_stmts, with_path_component,
-};
+use crate::hir::simplify::stmt_plan::{PathComponent, StmtPath, remove_planned_stmts};
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
-    TempId,
+    HirAssign, HirExpr, HirIf, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
-use super::super::expr_facts::expr_truthiness;
-use super::super::label_refs::{count_label_references, stmt_has_label_or_goto};
-use super::super::lexical_cfg::LexicalCfg;
+use super::super::label_refs::count_label_references;
+use super::super::lexical_cfg::{
+    FlowRefinement, HirFlowGraph, HirFlowNodeId, HirFlowNodeKind, HirForBindings,
+};
 use super::super::local_shapes::empty_single_local_decl_binding;
 use crate::hir::visit::{self, HirVisitor};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct NilPathState {
-    known_nil: bool,
-    reference_exposed: bool,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct NilStates(BTreeSet<NilPathState>);
+// bit 下标为 known_nil * 2 + reference_exposed；只存在四个路径状态。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NilStates(u8);
 
 impl NilStates {
     fn entry() -> Self {
-        Self(BTreeSet::from([NilPathState {
-            known_nil: true,
-            reference_exposed: false,
-        }]))
+        Self(0b0100)
     }
-
     fn unknown() -> Self {
-        Self(BTreeSet::from([NilPathState {
-            known_nil: false,
-            reference_exposed: true,
-        }]))
+        Self(0b0010)
     }
-
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0 == 0
     }
-
     fn all_known_nil(&self) -> bool {
-        !self.is_empty() && self.0.iter().all(|state| state.known_nil)
+        !self.is_empty() && self.0 & 0b0011 == 0
     }
-
-    fn union(mut self, other: Self) -> Self {
-        self.0.extend(other.0);
-        self
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
-
     fn set_known_nil(self, known_nil: bool) -> Self {
-        Self(
-            self.0
-                .into_iter()
-                .map(|mut state| {
-                    state.known_nil = known_nil;
-                    state
-                })
-                .collect(),
-        )
+        Self(((self.0 | (self.0 >> 2)) & 0b0011) << (u32::from(known_nil) * 2))
     }
-
     fn expose_reference(self) -> Self {
-        Self(
-            self.0
-                .into_iter()
-                .map(|mut state| {
-                    state.reference_exposed = true;
-                    state
-                })
-                .collect(),
-        )
+        Self((self.0 & 0b1010) | ((self.0 & 0b0101) << 1))
     }
-
     fn opaque_callback(self) -> Self {
-        Self(
-            self.0
-                .into_iter()
-                .map(|mut state| {
-                    if state.reference_exposed {
-                        state.known_nil = false;
-                    }
-                    state
-                })
-                .collect(),
-        )
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct NilFlow {
-    fallthrough: NilStates,
-    breaks: NilStates,
-    continues: NilStates,
-}
-
-impl NilFlow {
-    fn fallthrough(states: NilStates) -> Self {
-        Self {
-            fallthrough: states,
-            ..Self::default()
-        }
+        Self((self.0 & 0b0111) | ((self.0 & 0b1000) >> 2))
     }
 }
 
@@ -131,17 +68,17 @@ enum PruneError {
 
 #[derive(Default)]
 struct PrunePlan {
-    redundant: BTreeSet<StmtPath>,
-    not_redundant: BTreeSet<StmtPath>,
+    redundant: BTreeSet<HirFlowNodeId>,
+    not_redundant: BTreeSet<HirFlowNodeId>,
 }
 
 impl PrunePlan {
-    fn observe_nil_write(&mut self, path: &StmtPath, states: &NilStates) {
-        if states.all_known_nil() && !self.not_redundant.contains(path) {
-            self.redundant.insert(path.clone());
+    fn observe_nil_write(&mut self, node: HirFlowNodeId, states: &NilStates) {
+        if states.all_known_nil() && !self.not_redundant.contains(&node) {
+            self.redundant.insert(node);
         } else {
-            self.redundant.remove(path);
-            self.not_redundant.insert(path.clone());
+            self.redundant.remove(&node);
+            self.not_redundant.insert(node);
         }
     }
 }
@@ -177,40 +114,46 @@ pub(super) fn prune_redundant_entry_nil_writes(
             // 候选拒绝[PolicyBoundary]：候选自身或已证明同 home 的 binding 带 source debug identity 时保留显式 nil 边写，维护源码/调试形状。
             continue;
         }
-        let HirStmt::If(if_stmt) = &mut proto.body.stmts[index + 1] else {
+        let if_owner = &proto.body.stmts[index + 1];
+        if !matches!(if_owner, HirStmt::If(_)) {
             continue;
-        };
+        }
 
-        let mut analyzer = EntryNilAnalyzer {
+        let analyzer = EntryNilAnalyzer {
             local,
             candidate_home,
             facts,
             safety,
             owner_label_refs: &owner_label_refs,
-            plan: PrunePlan::default(),
         };
-        if let Err(error) = analyzer.analyze_if(if_stmt, NilStates::entry()) {
-            match error {
-                PruneError::DeferredDecision => {
-                    // 候选拒绝[LayerBoundary]：Decision 的执行路径由 decision/eliminate owner
-                    // 收敛；owner 会 invalidates LocalBinding/TempChain/BlockStructure，locals
-                    // 依赖这些 tag，因此物化后会重审本候选。
+        let redundant = match analyzer.analyze(if_owner) {
+            Ok(plan) => plan,
+            Err(error) => {
+                match error {
+                    PruneError::DeferredDecision => {
+                        // 候选拒绝[LayerBoundary]：Decision 的执行路径由 decision/eliminate owner
+                        // 收敛；owner 会 invalidates LocalBinding/TempChain/BlockStructure，locals
+                        // 依赖这些 tag，因此物化后会重审本候选。
+                    }
+                    PruneError::DiagnosticResidual => {
+                        // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
+                        // entry-nil 不据未知路径删除边写。
+                    }
+                    PruneError::BindingInvariant => {
+                        panic!("entry-nil local must not be redeclared or reused as a for binding")
+                    }
                 }
-                PruneError::DiagnosticResidual => {
-                    // 候选拒绝[PolicyBoundary]：Unresolved 是 permissive 输出保留的失败证据，
-                    // entry-nil 不据未知路径删除边写。
-                }
-                PruneError::BindingInvariant => {
-                    panic!("entry-nil local must not be redeclared or reused as a for binding")
-                }
+                continue;
             }
-            continue;
-        }
-        if analyzer.plan.redundant.is_empty() {
+        };
+        if redundant.is_empty() {
             continue;
         }
 
-        apply_if_plan(if_stmt, &analyzer.plan.redundant);
+        let HirStmt::If(if_stmt) = &mut proto.body.stmts[index + 1] else {
+            unreachable!()
+        };
+        apply_if_plan(if_stmt, &redundant);
         facts.mark_entry_nil_writes_pruned(local);
         changed = true;
     }
@@ -223,435 +166,206 @@ struct EntryNilAnalyzer<'a> {
     facts: &'a ProtoPromotionFacts,
     safety: HirExprSafety,
     owner_label_refs: &'a std::collections::BTreeMap<crate::hir::HirLabelId, usize>,
-    plan: PrunePlan,
 }
 
-impl EntryNilAnalyzer<'_> {
-    fn analyze_if(&mut self, if_stmt: &HirIf, incoming: NilStates) -> Result<NilFlow, PruneError> {
-        let states = self.evaluate_expr(&if_stmt.cond, incoming)?;
-        let path = &mut Vec::new();
-        let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
-            NilFlow::default()
-        } else {
-            with_path_component(path, PathComponent::Then, |path| {
-                self.analyze_block(&if_stmt.then_block, path, states.clone())
-            })?
+impl<'a> EntryNilAnalyzer<'a> {
+    fn analyze(&self, if_owner: &HirStmt) -> Result<BTreeSet<StmtPath>, PruneError> {
+        let stmts = std::slice::from_ref(if_owner);
+        let internal_refs = count_label_references(stmts);
+        let mut paths = BTreeMap::new();
+        let mut external_entries = Vec::new();
+        let Ok(graph) = HirFlowGraph::for_stmts_with_locations(
+            stmts,
+            self.safety,
+            |id, event, block, index| {
+                match event {
+                    HirFlowNodeKind::Stmt(HirStmt::Assign(assign))
+                        if is_direct_nil_write(assign, self.local) =>
+                    {
+                        let mut path = block.to_stmt_path(index);
+                        // 区域根是单条 If；既有提交器从它的 Then/Else 开始导航。
+                        path.remove(0);
+                        paths.insert(id, path);
+                    }
+                    HirFlowNodeKind::Stmt(HirStmt::Label(label))
+                        if internal_refs.get(&label.id) != self.owner_label_refs.get(&label.id) =>
+                    {
+                        // 区域外的到达不能继承入口 nil；种子也参与回边不动点。
+                        external_entries.push((id, NilStates::unknown()));
+                    }
+                    _ => {}
+                }
+            },
+        ) else {
+            // 候选拒绝[ProofIncomplete]：label 身份不唯一，无法为删除计划证明完整路径。
+            return Ok(BTreeSet::new());
         };
-        let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
-            NilFlow::default()
-        } else if let Some(else_block) = &if_stmt.else_block {
-            with_path_component(path, PathComponent::Else, |path| {
-                self.analyze_block(else_block, path, states)
-            })?
-        } else {
-            NilFlow::fallthrough(states)
-        };
-        Ok(union_flows(then_flow, else_flow))
-    }
-
-    fn analyze_block(
-        &mut self,
-        block: &HirBlock,
-        prefix: &mut StmtPath,
-        mut states: NilStates,
-    ) -> Result<NilFlow, PruneError> {
-        let Ok(cfg) = LexicalCfg::analyze(&block.stmts, self.owner_label_refs, self.safety) else {
-            return self.analyze_unstructured_block(block, prefix);
-        };
-        let Some(label_indices) = cfg.linear_forward_labels() else {
-            return self.analyze_unstructured_block(block, prefix);
-        };
-        let mut breaks = NilStates::default();
-        let mut continues = NilStates::default();
-        let mut index = 0;
-        while let Some(stmt) = block.stmts.get(index) {
-            if states.is_empty() {
-                break;
-            }
-            if let HirStmt::Goto(goto) = stmt {
-                index = *label_indices
-                    .get(&goto.target)
-                    .expect("validated forward goto must retain its local label");
-                continue;
-            }
-            let flow = with_path_component(prefix, PathComponent::Stmt(index), |path| {
-                self.analyze_stmt(stmt, path, states)
-            })?;
-            states = flow.fallthrough;
-            breaks = breaks.union(flow.breaks);
-            continues = continues.union(flow.continues);
-            index += 1;
+        if paths.is_empty() {
+            return Ok(BTreeSet::new());
         }
-        Ok(NilFlow {
-            fallthrough: states,
-            breaks,
-            continues,
-        })
-    }
-
-    fn analyze_unstructured_block(
-        &mut self,
-        block: &HirBlock,
-        prefix: &mut StmtPath,
-    ) -> Result<NilFlow, PruneError> {
-        let conservative = NilStates::unknown();
-        let mut states = conservative.clone();
-        for (index, stmt) in block.stmts.iter().enumerate() {
-            if stmt_has_label_or_goto(stmt) {
-                with_path_component(prefix, PathComponent::Stmt(index), |path| {
-                    self.analyze_unstructured_children(stmt, path)
-                })?;
-                // 分析停用[SemanticBarrier:ControlFlow]：label/goto 可绕过此前 nil 写，回边
-                // 还会带入上一轮值；`::L:: x=nil; x={}; goto L` 的第二轮旧值并非 nil。
-                states = conservative.clone();
-                continue;
-            }
-            if states.is_empty() {
-                continue;
-            }
-            states = with_path_component(prefix, PathComponent::Stmt(index), |path| {
-                self.analyze_stmt(stmt, path, states)
-            })?
-            .fallthrough;
+        let transfers: Vec<_> = graph
+            .nodes()
+            .iter()
+            .map(|node| self.collect_event(node.kind()))
+            .collect();
+        let mut plan = PrunePlan::default();
+        let mut error = None;
+        graph.solve_forward_with_entries(
+            NilStates::entry(),
+            external_entries,
+            |current, incoming| {
+                let joined = current.union(*incoming);
+                let changed = *current != joined;
+                *current = joined;
+                changed
+            },
+            |id, _, states| {
+                if states.is_empty() {
+                    return;
+                }
+                let transfer = &transfers[id.index()];
+                let evaluated = transfer
+                    .failure
+                    .map_or_else(|| transfer.evaluation.apply(*states), Err);
+                match evaluated {
+                    Ok(mut next) => {
+                        if paths.contains_key(&id) {
+                            plan.observe_nil_write(id, &next);
+                        }
+                        if let Some(known_nil) = transfer.overwrite {
+                            next = next.set_known_nil(known_nil);
+                        }
+                        *states = next;
+                    }
+                    Err(failure) => {
+                        error.get_or_insert(failure);
+                        *states = NilStates::default();
+                    }
+                }
+            },
+            |_, _, _| FlowRefinement::Unchanged,
+        );
+        if let Some(error) = error {
+            return Err(error);
         }
-        Ok(NilFlow {
-            fallthrough: conservative.clone(),
-            breaks: conservative.clone(),
-            continues: conservative,
-        })
-    }
-
-    fn analyze_unstructured_children(
-        &mut self,
-        stmt: &HirStmt,
-        path: &mut StmtPath,
-    ) -> Result<(), PruneError> {
-        let mut analyze = |block: &HirBlock, component| {
-            with_path_component(path, component, |path| {
-                self.analyze_unstructured_block(block, path).map(|_| ())
+        Ok(plan
+            .redundant
+            .into_iter()
+            .map(|id| {
+                paths
+                    .remove(&id)
+                    .expect("nil write must retain its snapshot path")
             })
-        };
-        match stmt {
-            HirStmt::LocalRootRelease(_) => {}
-            HirStmt::If(if_stmt) => {
-                analyze(&if_stmt.then_block, PathComponent::Then)?;
-                if let Some(else_block) = &if_stmt.else_block {
-                    analyze(else_block, PathComponent::Else)?;
-                }
-            }
-            HirStmt::While(while_stmt) => analyze(&while_stmt.body, PathComponent::Body)?,
-            HirStmt::Repeat(repeat_stmt) => analyze(&repeat_stmt.body, PathComponent::Body)?,
-            HirStmt::NumericFor(for_stmt) => analyze(&for_stmt.body, PathComponent::Body)?,
-            HirStmt::GenericFor(for_stmt) => analyze(&for_stmt.body, PathComponent::Body)?,
-            HirStmt::Block(nested) => analyze(nested, PathComponent::Body)?,
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
-        Ok(())
+            .collect())
     }
 
-    fn analyze_stmt(
-        &mut self,
-        stmt: &HirStmt,
-        path: &mut StmtPath,
-        states: NilStates,
-    ) -> Result<NilFlow, PruneError> {
-        match stmt {
-            HirStmt::LocalRootRelease(local) => Ok(NilFlow::fallthrough(if *local == self.local {
-                states.set_known_nil(true)
-            } else {
-                states
-            })),
-            HirStmt::Assign(assign) => {
-                let states = self.evaluate_stmt_exprs(stmt, states)?;
-                if is_direct_nil_write(assign, self.local) {
-                    self.plan.observe_nil_write(path, &states);
-                }
-                Ok(NilFlow::fallthrough(self.apply_assignment(assign, states)))
+    fn collect_event(&self, event: HirFlowNodeKind<'_>) -> NilTransfer<'a> {
+        let mut transfer = NilTransfer::default();
+        match event {
+            HirFlowNodeKind::Stmt(HirStmt::If(stmt)) => transfer.evaluation = self.expr(&stmt.cond),
+            HirFlowNodeKind::Stmt(HirStmt::While(stmt)) => {
+                transfer.evaluation = self.expr(&stmt.cond)
             }
-            HirStmt::LocalDecl(local_decl) => {
-                if local_decl.bindings.contains(&self.local) {
-                    return Err(PruneError::BindingInvariant);
+            HirFlowNodeKind::RepeatCondition(stmt) => transfer.evaluation = self.expr(&stmt.cond),
+            HirFlowNodeKind::Stmt(HirStmt::NumericFor(stmt)) => {
+                if stmt.binding == self.local {
+                    transfer.failure = Some(PruneError::BindingInvariant);
                 }
-                let states = self.evaluate_stmt_exprs(stmt, states)?;
-                Ok(NilFlow::fallthrough(
-                    self.apply_local_decl(local_decl, states),
-                ))
+                transfer.evaluation = self.exprs([&stmt.start, &stmt.limit, &stmt.step]);
             }
-            HirStmt::If(if_stmt) => {
-                let states = self.evaluate_expr(&if_stmt.cond, states)?;
-                let then_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(false) {
-                    NilFlow::default()
-                } else {
-                    with_path_component(path, PathComponent::Then, |path| {
-                        self.analyze_block(&if_stmt.then_block, path, states.clone())
-                    })?
+            HirFlowNodeKind::GenericForInit(flow) => {
+                if flow.for_stmt().bindings.contains(&self.local) {
+                    transfer.failure = Some(PruneError::BindingInvariant);
+                }
+                transfer.evaluation = self.exprs(&flow.for_stmt().iterator);
+            }
+            HirFlowNodeKind::GenericForDispatch(_) | HirFlowNodeKind::Stmt(HirStmt::Close(_)) => {
+                transfer.evaluation = NilEvaluation::Opaque;
+            }
+            HirFlowNodeKind::ForBinding(bindings) => {
+                let writes = match bindings {
+                    HirForBindings::Numeric(local) => {
+                        !matches!(self.local_binding_relation(local), BindingRelation::None)
+                    }
+                    HirForBindings::Generic(flow) => {
+                        flow.for_stmt().bindings.iter().any(|&local| {
+                            !matches!(self.local_binding_relation(local), BindingRelation::None)
+                        })
+                    }
                 };
-                let else_flow = if expr_truthiness(&if_stmt.cond, self.safety) == Some(true) {
-                    NilFlow::default()
-                } else if let Some(else_block) = &if_stmt.else_block {
-                    with_path_component(path, PathComponent::Else, |path| {
-                        self.analyze_block(else_block, path, states)
-                    })?
-                } else {
-                    NilFlow::fallthrough(states)
-                };
-                Ok(union_flows(then_flow, else_flow))
+                transfer.overwrite = writes.then_some(false);
             }
-            HirStmt::Block(block) => with_path_component(path, PathComponent::Body, |path| {
-                self.analyze_block(block, path, states)
-            }),
-            HirStmt::While(while_stmt) => with_path_component(path, PathComponent::Body, |path| {
-                self.analyze_while(&while_stmt.body, &while_stmt.cond, path, states)
-            }),
-            HirStmt::Repeat(repeat_stmt) => {
-                with_path_component(path, PathComponent::Body, |path| {
-                    self.analyze_repeat(&repeat_stmt.body, &repeat_stmt.cond, path, states)
-                })
+            HirFlowNodeKind::Stmt(HirStmt::LocalRootRelease(local)) => {
+                transfer.overwrite = (*local == self.local).then_some(true);
             }
-            HirStmt::NumericFor(numeric_for) => {
-                if numeric_for.binding == self.local {
-                    return Err(PruneError::BindingInvariant);
+            HirFlowNodeKind::Exit
+            | HirFlowNodeKind::FunctionExit
+            | HirFlowNodeKind::NumericForDispatch
+            | HirFlowNodeKind::Stmt(
+                HirStmt::Label(_) | HirStmt::Goto(_) | HirStmt::Break | HirStmt::Continue,
+            ) => {}
+            HirFlowNodeKind::UnknownControl => {
+                unreachable!("region graph has no unknown-control sink")
+            }
+            HirFlowNodeKind::Stmt(
+                HirStmt::Block(_) | HirStmt::Repeat(_) | HirStmt::GenericFor(_),
+            ) => {
+                unreachable!("shared graph must split structured owners into typed events")
+            }
+            HirFlowNodeKind::Stmt(stmt) => {
+                let mut effects = ExprEffects::new(self.candidate_home, self.facts);
+                visit::visit_stmts(std::slice::from_ref(stmt), &mut effects);
+                transfer.evaluation = NilEvaluation::Expr(effects);
+                match stmt {
+                    HirStmt::Assign(assign) => {
+                        transfer.overwrite = assign
+                            .targets
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, target)| {
+                                self.binding_relation(target)
+                                    .written_value(assigned_value_is_nil(assign, index))
+                            })
+                            .next_back();
+                    }
+                    HirStmt::LocalDecl(decl) => {
+                        if decl.bindings.contains(&self.local) {
+                            transfer.failure = Some(PruneError::BindingInvariant);
+                        }
+                        transfer.overwrite = decl
+                            .bindings
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, &local)| {
+                                self.local_binding_relation(local)
+                                    .written_value(declared_value_is_nil(decl, index))
+                            })
+                            .next_back();
+                    }
+                    _ => {}
                 }
-                let states = self.evaluate_exprs(
-                    [&numeric_for.start, &numeric_for.limit, &numeric_for.step],
-                    states,
-                )?;
-                let body_states = self.write_local_binding(numeric_for.binding, states.clone());
-                with_path_component(path, PathComponent::Body, |path| {
-                    self.analyze_zero_or_more(
-                        &numeric_for.body,
-                        path,
-                        states,
-                        body_states,
-                        &[numeric_for.binding],
-                        false,
-                    )
-                })
             }
-            HirStmt::GenericFor(generic_for) => {
-                if generic_for.bindings.contains(&self.local) {
-                    return Err(PruneError::BindingInvariant);
-                }
-                let states = self.evaluate_exprs(generic_for.iterator.iter(), states)?;
-                // 即使循环执行零次，也会调用一次 iterator；reference capture 已逃逸时，
-                // 该调用可能经由外部别名回写候选 cell。
-                let zero_exit = states.opaque_callback();
-                let mut body_states = zero_exit.clone();
-                for binding in &generic_for.bindings {
-                    body_states = self.write_local_binding(*binding, body_states);
-                }
-                with_path_component(path, PathComponent::Body, |path| {
-                    self.analyze_zero_or_more(
-                        &generic_for.body,
-                        path,
-                        zero_exit,
-                        body_states,
-                        &generic_for.bindings,
-                        true,
-                    )
-                })
-            }
-            HirStmt::Return(_) => {
-                self.evaluate_stmt_exprs(stmt, states)?;
-                Ok(NilFlow::default())
-            }
-            HirStmt::Break => Ok(NilFlow {
-                breaks: states,
-                ..NilFlow::default()
-            }),
-            HirStmt::Continue => Ok(NilFlow {
-                continues: states,
-                ..NilFlow::default()
-            }),
-            HirStmt::Goto(_) => {
-                unreachable!("block analyzer must consume validated forward gotos")
-            }
-            HirStmt::Label(_) => Ok(NilFlow::fallthrough(states)),
-            HirStmt::Close(_) => Ok(NilFlow::fallthrough(states.opaque_callback())),
-            HirStmt::TableSetList(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::CallStmt(_) => Ok(NilFlow::fallthrough(
-                self.evaluate_stmt_exprs(stmt, states)?,
-            )),
         }
+        transfer
     }
 
-    fn analyze_while(
-        &mut self,
-        body: &HirBlock,
-        condition: &HirExpr,
-        body_prefix: &mut StmtPath,
-        incoming: NilStates,
-    ) -> Result<NilFlow, PruneError> {
-        let truthiness = expr_truthiness(condition, self.safety);
-        let mut entries = incoming.clone();
-        let mut break_exits = NilStates::default();
-        loop {
-            let condition_states = self.evaluate_expr(condition, entries.clone())?;
-            let body_flow = if truthiness == Some(false) {
-                NilFlow::default()
-            } else {
-                self.analyze_block(body, body_prefix, condition_states.clone())?
-            };
-            let next_entries = incoming
-                .clone()
-                .union(body_flow.fallthrough)
-                .union(body_flow.continues);
-            let next_break_exits = break_exits.clone().union(body_flow.breaks);
-            if next_entries == entries && next_break_exits == break_exits {
-                let normal_exits = if truthiness == Some(true) {
-                    NilStates::default()
-                } else {
-                    condition_states
-                };
-                return Ok(NilFlow::fallthrough(normal_exits.union(break_exits)));
-            }
-            entries = next_entries;
-            break_exits = next_break_exits;
-        }
+    fn expr(&self, expr: &HirExpr) -> NilEvaluation<'a> {
+        NilEvaluation::Expr(self.expr_effects(expr))
     }
 
-    fn analyze_repeat(
-        &mut self,
-        body: &HirBlock,
-        condition: &HirExpr,
-        body_prefix: &mut StmtPath,
-        incoming: NilStates,
-    ) -> Result<NilFlow, PruneError> {
-        let truthiness = expr_truthiness(condition, self.safety);
-        let mut entries = incoming.clone();
-        let mut break_exits = NilStates::default();
-        loop {
-            let body_flow = self.analyze_block(body, body_prefix, entries.clone())?;
-            let condition_states =
-                self.evaluate_expr(condition, body_flow.fallthrough.union(body_flow.continues))?;
-            let back_edges = if truthiness == Some(true) {
-                NilStates::default()
-            } else {
-                condition_states.clone()
-            };
-            let next_entries = incoming.clone().union(back_edges);
-            let next_break_exits = break_exits.clone().union(body_flow.breaks);
-            if next_entries == entries && next_break_exits == break_exits {
-                let normal_exits = if truthiness == Some(false) {
-                    NilStates::default()
-                } else {
-                    condition_states
-                };
-                return Ok(NilFlow::fallthrough(normal_exits.union(break_exits)));
-            }
-            entries = next_entries;
-            break_exits = next_break_exits;
-        }
-    }
-
-    fn analyze_zero_or_more(
-        &mut self,
-        body: &HirBlock,
-        body_prefix: &mut StmtPath,
-        zero_exit: NilStates,
-        initial_body_entry: NilStates,
-        bindings: &[LocalId],
-        opaque_each_iteration: bool,
-    ) -> Result<NilFlow, PruneError> {
-        let mut entries = initial_body_entry.clone();
-        let mut break_exits = NilStates::default();
-        loop {
-            let body_flow = self.analyze_block(body, body_prefix, entries.clone())?;
-            let iteration_exits = body_flow.fallthrough.union(body_flow.continues);
-            let callback_exits = if opaque_each_iteration {
-                iteration_exits.clone().opaque_callback()
-            } else {
-                iteration_exits.clone()
-            };
-            let mut back_edges = callback_exits.clone();
-            for binding in bindings {
-                back_edges = self.write_local_binding(*binding, back_edges);
-            }
-            let next_entries = initial_body_entry.clone().union(back_edges);
-            let next_break_exits = break_exits.clone().union(body_flow.breaks);
-            if next_entries == entries && next_break_exits == break_exits {
-                return Ok(NilFlow::fallthrough(
-                    zero_exit.union(callback_exits).union(break_exits),
-                ));
-            }
-            entries = next_entries;
-            break_exits = next_break_exits;
-        }
-    }
-
-    fn evaluate_expr(&self, expr: &HirExpr, states: NilStates) -> Result<NilStates, PruneError> {
+    fn expr_effects(&self, expr: &HirExpr) -> ExprEffects<'a> {
         let mut effects = ExprEffects::new(self.candidate_home, self.facts);
         visit::visit_expr(expr, &mut effects);
-        effects.apply(states)
+        effects
     }
 
-    fn evaluate_exprs<'a>(
-        &self,
-        exprs: impl IntoIterator<Item = &'a HirExpr>,
-        mut states: NilStates,
-    ) -> Result<NilStates, PruneError> {
-        for expr in exprs {
-            states = self.evaluate_expr(expr, states)?;
-        }
-        Ok(states)
-    }
-
-    fn evaluate_stmt_exprs(
-        &self,
-        stmt: &HirStmt,
-        states: NilStates,
-    ) -> Result<NilStates, PruneError> {
-        let mut effects = ExprEffects::new(self.candidate_home, self.facts);
-        visit::visit_stmts(std::slice::from_ref(stmt), &mut effects);
-        effects.apply(states)
-    }
-
-    fn apply_assignment(&self, assign: &HirAssign, mut states: NilStates) -> NilStates {
-        for (index, target) in assign.targets.iter().enumerate() {
-            states = match self.binding_relation(target) {
-                BindingRelation::None => states,
-                BindingRelation::Possible => states.set_known_nil(false),
-                BindingRelation::Definite => {
-                    states.set_known_nil(assigned_value_is_nil(assign, index))
-                }
-            };
-        }
-        states
-    }
-
-    fn apply_local_decl(&self, decl: &HirLocalDecl, mut states: NilStates) -> NilStates {
-        for (index, binding) in decl.bindings.iter().enumerate() {
-            states = match self.local_binding_relation(*binding) {
-                BindingRelation::None => states,
-                BindingRelation::Possible => states.set_known_nil(false),
-                BindingRelation::Definite => {
-                    states.set_known_nil(declared_value_is_nil(decl, index))
-                }
-            };
-        }
-        states
-    }
-
-    fn write_local_binding(&self, binding: LocalId, states: NilStates) -> NilStates {
-        match self.local_binding_relation(binding) {
-            BindingRelation::None => states,
-            BindingRelation::Possible | BindingRelation::Definite => states.set_known_nil(false),
-        }
+    fn exprs<'e>(&self, exprs: impl IntoIterator<Item = &'e HirExpr>) -> NilEvaluation<'a> {
+        NilEvaluation::Ordered(
+            exprs
+                .into_iter()
+                .map(|expr| self.expr_effects(expr))
+                .collect(),
+        )
     }
 
     fn binding_relation(&self, target: &HirLValue) -> BindingRelation {
@@ -688,6 +402,16 @@ enum BindingRelation {
     None,
     Possible,
     Definite,
+}
+
+impl BindingRelation {
+    fn written_value(self, known_nil: bool) -> Option<bool> {
+        match self {
+            Self::None => None,
+            Self::Possible => Some(false),
+            Self::Definite => Some(known_nil),
+        }
+    }
 }
 
 fn relation_for_home(home: Option<HomeSlotKey>, candidate: HomeSlotKey) -> BindingRelation {
@@ -727,11 +451,32 @@ fn value_at_is_nil(fixed: &[HirExpr], has_tail: bool, index: usize) -> bool {
         || (!has_tail && index >= fixed.len())
 }
 
-fn union_flows(left: NilFlow, right: NilFlow) -> NilFlow {
-    NilFlow {
-        fallthrough: left.fallthrough.union(right.fallthrough),
-        breaks: left.breaks.union(right.breaks),
-        continues: left.continues.union(right.continues),
+#[derive(Default)]
+struct NilTransfer<'a> {
+    evaluation: NilEvaluation<'a>,
+    overwrite: Option<bool>,
+    failure: Option<PruneError>,
+}
+
+#[derive(Default)]
+enum NilEvaluation<'a> {
+    #[default]
+    Identity,
+    Opaque,
+    Expr(ExprEffects<'a>),
+    Ordered(Box<[ExprEffects<'a>]>),
+}
+
+impl NilEvaluation<'_> {
+    fn apply(&self, states: NilStates) -> Result<NilStates, PruneError> {
+        match self {
+            Self::Identity => Ok(states),
+            Self::Opaque => Ok(states.opaque_callback()),
+            Self::Expr(effects) => effects.apply(states),
+            Self::Ordered(effects) => effects
+                .iter()
+                .try_fold(states, |states, effect| effect.apply(states)),
+        }
     }
 }
 
@@ -756,7 +501,7 @@ impl<'a> ExprEffects<'a> {
         }
     }
 
-    fn apply(self, mut states: NilStates) -> Result<NilStates, PruneError> {
+    fn apply(&self, mut states: NilStates) -> Result<NilStates, PruneError> {
         if self.decision {
             return Err(PruneError::DeferredDecision);
         }

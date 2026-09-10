@@ -6,10 +6,12 @@
 mod cfg;
 mod dataflow;
 mod graph;
+mod phi_graph;
 mod root_intervals;
 
 pub(crate) use dataflow::RegCaptures;
 pub(crate) use graph::{SccFacts, SccId};
+pub(crate) use phi_graph::PhiGraphFacts;
 pub(crate) use root_intervals::RootIntervalIndex;
 
 pub use cfg::{

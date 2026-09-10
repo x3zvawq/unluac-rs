@@ -18,7 +18,8 @@
 //! local root release 默认作为逻辑 local 写暴露；分析 VM home 的 collector 必须单独
 //! 消费该事件，不得从旧 local 的来源槽位推导一次物理覆盖。
 //! 独立 collector 可组成 tuple 共用遍历；如读集合和写事件一次收集，capture 与 release
-//! 仍逐个交给原 hook，不能由组合器统一解释其语义。
+//! 仍逐个交给原 hook，不能由组合器统一解释其语义。完成的分量不再接收事件；只有
+//! 全部分量完成才停止遍历，例如 effects 已命中后，写集合仍须收齐当前快照的后续写入。
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,
@@ -32,6 +33,11 @@ use crate::hir::traverse::{
 };
 
 pub(crate) trait HirVisitor {
+    /// 本次查询已完成；返回 true 后不再接收节点，完整事实收集器保持默认 false。
+    fn is_complete(&self) -> bool {
+        false
+    }
+
     fn visit_block(&mut self, _block: &HirBlock) {}
 
     fn visit_stmt(&mut self, _stmt: &HirStmt) {}
@@ -56,56 +62,58 @@ pub(crate) trait HirVisitor {
     }
 }
 
+// 同一 hook 只委派给仍在收集的分量，避免各事件的完成规则漂移。
+macro_rules! visit_active_pair {
+    ($($method:ident($arg:ident: $ty:ty)),* $(,)?) => {
+        $(fn $method(&mut self, $arg: $ty) {
+            if !self.0.is_complete() { self.0.$method($arg); }
+            if !self.1.is_complete() { self.1.$method($arg); }
+        })*
+    };
+}
+
 /// 独立事实收集器共用一次遍历；每个 hook 都交给原收集器，保留各自的 capture/release 语义。
 impl<A: HirVisitor, B: HirVisitor> HirVisitor for (A, B) {
-    fn visit_block(&mut self, block: &HirBlock) {
-        self.0.visit_block(block);
-        self.1.visit_block(block);
+    fn is_complete(&self) -> bool {
+        self.0.is_complete() && self.1.is_complete()
     }
 
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        self.0.visit_stmt(stmt);
-        self.1.visit_stmt(stmt);
-    }
+    visit_active_pair!(
+        visit_block(block: &HirBlock),
+        visit_stmt(stmt: &HirStmt),
+        visit_expr(expr: &HirExpr),
+        visit_lvalue(lvalue: &HirLValue),
+        visit_local_root_release(local: LocalId),
+        visit_call(call: &HirCallExpr),
+        visit_capture(capture: &HirCapture),
+    );
+}
 
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        self.0.visit_expr(expr);
-        self.1.visit_expr(expr);
-    }
-
-    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.0.visit_lvalue(lvalue);
-        self.1.visit_lvalue(lvalue);
-    }
-
-    fn visit_local_root_release(&mut self, local: LocalId) {
-        self.0.visit_local_root_release(local);
-        self.1.visit_local_root_release(local);
-    }
-
-    fn visit_call(&mut self, call: &HirCallExpr) {
-        self.0.visit_call(call);
-        self.1.visit_call(call);
-    }
-
-    fn visit_capture(&mut self, capture: &HirCapture) {
-        self.0.visit_capture(capture);
-        self.1.visit_capture(capture);
-    }
+// 子节点宏中的 return 退出当前 walker，避免命中后仍枚举宽表或 value-pack 的剩余成员。
+macro_rules! visit_next {
+    ($visitor:ident, $visit:expr) => {
+        if $visitor.is_complete() {
+            return;
+        }
+        $visit;
+        if $visitor.is_complete() {
+            return;
+        }
+    };
 }
 
 pub(crate) fn visit_proto(proto: &HirProto, visitor: &mut impl HirVisitor) {
-    visit_block(&proto.body, visitor);
+    visit_next!(visitor, visit_block(&proto.body, visitor));
 }
 
 pub(crate) fn visit_block(block: &HirBlock, visitor: &mut impl HirVisitor) {
-    visitor.visit_block(block);
-    visit_stmts(&block.stmts, visitor);
+    visit_next!(visitor, visitor.visit_block(block));
+    visit_next!(visitor, visit_stmts(&block.stmts, visitor));
 }
 
 pub(crate) fn visit_stmts(stmts: &[HirStmt], visitor: &mut impl HirVisitor) {
     for stmt in stmts {
-        visit_stmt(stmt, visitor);
+        visit_next!(visitor, visit_stmt(stmt, visitor));
     }
 }
 
@@ -156,121 +164,109 @@ pub(crate) fn any_stmt_structure(
 }
 
 fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
-    visitor.visit_stmt(stmt);
+    visit_next!(visitor, visitor.visit_stmt(stmt));
     traverse_hir_stmt_children!(
         stmt,
         iter = iter,
         opt = as_ref,
         borrow = [&],
         expr(expr) => {
-            visit_expr(expr, visitor);
+            visit_next!(visitor, visit_expr(expr, visitor));
         },
         lvalue(lvalue) => {
-            visit_lvalue(lvalue, visitor);
+            visit_next!(visitor, visit_lvalue(lvalue, visitor));
         },
-        release(local) => { visitor.visit_local_root_release(*local); },
+        release(local) => { visit_next!(visitor, visitor.visit_local_root_release(*local)); },
         block(block) => {
-            visit_block(block, visitor);
+            visit_next!(visitor, visit_block(block, visitor));
         },
         call(call) => {
-            visit_call(call, visitor);
+            visit_next!(visitor, visit_call(call, visitor));
         },
         condition(cond) => {
-            visit_expr(cond, visitor);
+            visit_next!(visitor, visit_expr(cond, visitor));
         }
     );
 }
 
 /// 只访问本语句的求值部分；嵌套 block 由控制流图在各自的节点访问。
 pub(crate) fn visit_stmt_header(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
-    visitor.visit_stmt(stmt);
+    visit_next!(visitor, visitor.visit_stmt(stmt));
     traverse_hir_stmt_children!(
         stmt,
         iter = iter,
         opt = as_ref,
         borrow = [&],
-        expr(expr) => { visit_expr(expr, visitor); },
-        lvalue(lvalue) => { visit_lvalue(lvalue, visitor); },
-        release(local) => { visitor.visit_local_root_release(*local); },
+        expr(expr) => { visit_next!(visitor, visit_expr(expr, visitor)); },
+        lvalue(lvalue) => { visit_next!(visitor, visit_lvalue(lvalue, visitor)); },
+        release(local) => { visit_next!(visitor, visitor.visit_local_root_release(*local)); },
         block(_block) => {},
-        call(call) => { visit_call(call, visitor); },
-        condition(cond) => { visit_expr(cond, visitor); }
+        call(call) => { visit_next!(visitor, visit_call(call, visitor)); },
+        condition(cond) => { visit_next!(visitor, visit_expr(cond, visitor)); }
     );
 }
 
 pub(crate) fn visit_call(call: &HirCallExpr, visitor: &mut impl HirVisitor) {
-    visitor.visit_call(call);
+    visit_next!(visitor, visitor.visit_call(call));
     traverse_hir_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
-        visit_expr(expr, visitor);
+        visit_next!(visitor, visit_expr(expr, visitor));
     });
 }
 
 pub(crate) fn visit_lvalue(lvalue: &HirLValue, visitor: &mut impl HirVisitor) {
-    visitor.visit_lvalue(lvalue);
+    visit_next!(visitor, visitor.visit_lvalue(lvalue));
     traverse_hir_lvalue_children!(lvalue, borrow = [&], expr(expr) => {
-        visit_expr(expr, visitor);
+        visit_next!(visitor, visit_expr(expr, visitor));
     });
 }
 
 pub(crate) fn visit_expr(expr: &HirExpr, visitor: &mut impl HirVisitor) {
-    visitor.visit_expr(expr);
+    visit_next!(visitor, visitor.visit_expr(expr));
     traverse_hir_expr_children!(
         expr,
         iter = iter,
         borrow = [&],
         expr(e) => {
-            visit_expr(e, visitor);
+            visit_next!(visitor, visit_expr(e, visitor));
         },
         call(c) => {
-            visit_call(c, visitor);
+            visit_next!(visitor, visit_call(c, visitor));
         },
         decision(d) => {
-            visit_decision_expr(d, visitor);
+            visit_next!(visitor, visit_decision_expr(d, visitor));
         },
         table_constructor(t) => {
-            visit_table_constructor(t, visitor);
+            visit_next!(visitor, visit_table_constructor(t, visitor));
         },
         capture(capture) => {
-            visitor.visit_capture(capture);
+            visit_next!(visitor, visitor.visit_capture(capture));
         }
     );
 }
 
 /// 查询当前表达式及其语法子表达式；不沿 Decision 的 Node 引用重复展开共享节点。
 pub(crate) fn any_expr(expr: &HirExpr, predicate: &mut impl FnMut(&HirExpr) -> bool) -> bool {
-    if predicate(expr) {
-        return true;
+    struct AnyExpr<'a, F> {
+        predicate: &'a mut F,
+        found: bool,
     }
-    traverse_hir_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(child) => {
-            if any_expr(child, predicate) { return true; }
-        },
-        call(call) => {
-            traverse_hir_call_children!(call, iter = iter, borrow = [&], expr(child) => {
-                if any_expr(child, predicate) { return true; }
-            });
-        },
-        decision(decision) => {
-            traverse_hir_decision_children!(
-                decision, iter = iter, borrow = [&],
-                expr(child) => { if any_expr(child, predicate) { return true; } },
-                condition(child) => { if any_expr(child, predicate) { return true; } }
-            );
-        },
-        table_constructor(table) => {
-            traverse_hir_table_constructor_children!(
-                table, iter = iter, opt = as_ref, borrow = [&],
-                expr(child) => { if any_expr(child, predicate) { return true; } }
-            );
-        },
-        capture(capture) => {
-            if predicate(&capture.binding.expr()) { return true; }
+
+    impl<F: FnMut(&HirExpr) -> bool> HirVisitor for AnyExpr<'_, F> {
+        fn is_complete(&self) -> bool {
+            self.found
         }
-    );
-    false
+
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            self.found = (self.predicate)(expr);
+        }
+    }
+
+    let mut visitor = AnyExpr {
+        predicate,
+        found: false,
+    };
+    visit_expr(expr, &mut visitor);
+    visitor.found
 }
 
 fn visit_decision_expr(decision: &HirDecisionExpr, visitor: &mut impl HirVisitor) {
@@ -279,10 +275,10 @@ fn visit_decision_expr(decision: &HirDecisionExpr, visitor: &mut impl HirVisitor
         iter = iter,
         borrow = [&],
         expr(e) => {
-            visit_expr(e, visitor);
+            visit_next!(visitor, visit_expr(e, visitor));
         },
         condition(cond) => {
-            visit_expr(cond, visitor);
+            visit_next!(visitor, visit_expr(cond, visitor));
         }
     );
 }
@@ -294,7 +290,7 @@ fn visit_table_constructor(table: &HirTableConstructor, visitor: &mut impl HirVi
         opt = as_ref,
         borrow = [&],
         expr(e) => {
-            visit_expr(e, visitor);
+            visit_next!(visitor, visit_expr(e, visitor));
         }
     );
 }

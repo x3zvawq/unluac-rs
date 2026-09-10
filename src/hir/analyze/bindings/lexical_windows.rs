@@ -23,6 +23,7 @@ pub(super) fn collect_lexical_scopes(
     dataflow: &DataflowFacts,
     graph: &GraphFacts,
     structure: &ReadyStructureFacts,
+    emission: &HirEmissionFacts<'_>,
     mut scopes: Vec<Range<usize>>,
 ) -> Vec<Range<usize>> {
     let debug_bindings = structure.debug_bindings();
@@ -41,7 +42,6 @@ pub(super) fn collect_lexical_scopes(
     if cohorts.is_empty() {
         return retain_non_crossing(scopes);
     }
-    let emission = HirEmissionFacts::new(structure.plan());
     let mut scanned = 0;
     let mut last_observation = None;
     scopes.extend(cohorts.into_iter().filter_map(|(end, facts)| {
@@ -60,7 +60,7 @@ pub(super) fn collect_lexical_scopes(
             dataflow,
             graph,
             structure,
-            &emission,
+            emission,
             (end, &facts, last_observation),
         )
     }));

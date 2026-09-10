@@ -5,6 +5,9 @@
 //! 用户代码时，保留该 root；未逃逸 aggregate 可以获得当前端点的缩短许可。
 //! 同时发布 proto-wide physical-root 集合和 repeat-specific may_end_before_condition，
 //! AST 只消费这些事实并证明自身候选的词法/控制合法性。
+//! 共享图为 repeat 条件发布节点 ID 与稀疏语句路径；首次可达时准备当前快照不变的
+//! binding/home/条件观察事实，回边只更新端点许可。不可达 repeat 仍安装空证书，
+//! 避免沿用旧快照的许可；提交器消费原路径，不用 payload 地址关联可变树。
 
 use crate::hir::HirBinding;
 
@@ -16,9 +19,10 @@ use crate::hir::common::{
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
-use crate::hir::visit::any_stmt_structure;
+use crate::hir::visit::{any_stmt_structure, visit_stmt_structure};
 
 use super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
+use super::stmt_plan::{StmtPath, retain_stmts_with_paths};
 
 use super::object_flow::{
     ProtoEffects, RootAnalysisContext, RootState, binding_from_lvalue, closure_captures_in_block,
@@ -65,7 +69,7 @@ pub(super) fn mark_repeat_trailing_condition_roots(
         proto.physical_root_temps.extend(roots.temps);
         changed |= old_local_count != proto.physical_root_locals.len()
             || old_temp_count != proto.physical_root_temps.len();
-        changed |= install_repeat_condition_lifetime_facts(&mut proto.body, &roots.repeat_facts);
+        changed |= install_repeat_condition_lifetime_facts(&mut proto.body, roots.repeat_facts);
     }
     changed
 }
@@ -74,7 +78,7 @@ pub(super) fn mark_repeat_trailing_condition_roots(
 struct RepeatRoots {
     locals: BTreeSet<LocalId>,
     temps: BTreeSet<TempId>,
-    repeat_facts: BTreeMap<usize, HirRepeatConditionLifetimeFacts>,
+    repeat_facts: BTreeMap<StmtPath, HirRepeatConditionLifetimeFacts>,
 }
 
 fn collect_proto_repeat_roots(
@@ -84,8 +88,24 @@ fn collect_proto_repeat_roots(
     safety: HirExprSafety,
 ) -> RepeatRoots {
     let captures = closure_captures_in_block(&proto.body);
-    let graph = HirFlowGraph::for_block(&proto.body, safety)
-        .expect("HIR labels must be unique before repeat root finalization");
+    let mut sites = BTreeMap::new();
+    let graph = HirFlowGraph::for_stmts_with_locations(
+        &proto.body.stmts,
+        safety,
+        |id, kind, block, index| {
+            if let HirFlowNodeKind::RepeatCondition(_) = kind {
+                sites.insert(
+                    id,
+                    RepeatSite {
+                        path: block.to_stmt_path(index),
+                        observable_bindings: None,
+                        lifetime: HirRepeatConditionLifetimeFacts::default(),
+                    },
+                );
+            }
+        },
+    )
+    .expect("HIR labels must be unique before repeat root finalization");
     let mut initial = RootState::default();
     initial
         .unknown_collectable
@@ -97,131 +117,84 @@ fn collect_proto_repeat_roots(
     graph.solve_forward(
         initial,
         join_state,
-        |_, kind, output| {
+        |id, kind, output| {
             if let HirFlowNodeKind::RepeatCondition(repeat) = kind {
-                note_repeat_condition_lifetimes(repeat, output, facts, &mut roots, safety);
+                let site = sites
+                    .get_mut(&id)
+                    .expect("repeat condition has a published site");
+                let bindings = site.observable_bindings.get_or_insert_with(|| {
+                    site.lifetime.may_end_before_condition = repeat_scoped_bindings(&repeat.body);
+                    let scoped = &site.lifetime.may_end_before_condition;
+                    if scoped.is_empty() || safety.is_discard_safe_without_residual(&repeat.cond) {
+                        return Vec::new();
+                    }
+                    scoped
+                        .iter()
+                        .copied()
+                        .filter(|binding| match binding {
+                            HirRepeatBinding::Local(local) => {
+                                !facts.is_some_and(|facts| facts.local_has_no_physical_home(*local))
+                            }
+                            HirRepeatBinding::Temp(temp) => !facts.is_some_and(|facts| {
+                                facts
+                                    .possible_temp_home_slots(*temp)
+                                    .is_some_and(|homes| homes.is_empty())
+                            }),
+                        })
+                        .collect()
+                });
+                for &binding in bindings.iter() {
+                    let hir_binding = match binding {
+                        HirRepeatBinding::Local(local) => HirBinding::Local(local),
+                        HirRepeatBinding::Temp(temp) => HirBinding::Temp(temp),
+                    };
+                    if output.binding_may_hold_observable_root(hir_binding) {
+                        site.lifetime.may_end_before_condition.remove(&binding);
+                        match binding {
+                            HirRepeatBinding::Local(local) => {
+                                roots.locals.insert(local);
+                            }
+                            HirRepeatBinding::Temp(temp) => {
+                                roots.temps.insert(temp);
+                            }
+                        }
+                    }
+                }
             }
             transfer_root_node(kind, output, &captures, effects, safety);
         },
         |_expr, _truthy, _state| FlowRefinement::Unchanged,
     );
+    roots.repeat_facts = sites
+        .into_values()
+        .map(|site| (site.path, site.lifetime))
+        .collect();
     roots
 }
 
-fn note_repeat_condition_lifetimes(
-    repeat: &crate::hir::common::HirRepeat,
-    state: &RootState,
-    facts: Option<&ProtoPromotionFacts>,
-    roots: &mut RepeatRoots,
-    safety: HirExprSafety,
-) {
-    let scoped_bindings = repeat_scoped_bindings(&repeat.body);
-    let repeat_key = std::ptr::from_ref(repeat).addr();
-    roots
-        .repeat_facts
-        .entry(repeat_key)
-        .or_insert_with(|| HirRepeatConditionLifetimeFacts {
-            may_end_before_condition: scoped_bindings
-                .iter()
-                .filter_map(|binding| repeat_binding(*binding))
-                .collect(),
-        });
-
-    let eventful =
-        !scoped_bindings.is_empty() && !safety.is_discard_safe_without_residual(&repeat.cond);
-    for binding in scoped_bindings {
-        let observable = eventful && state.binding_may_hold_observable_root(binding);
-        let has_physical_home = match binding {
-            HirBinding::Local(local) => {
-                !facts.is_some_and(|facts| facts.local_has_no_physical_home(local))
-            }
-            HirBinding::Temp(temp) => !facts.is_some_and(|facts| {
-                facts
-                    .possible_temp_home_slots(temp)
-                    .is_some_and(|homes| homes.is_empty())
-            }),
-            HirBinding::Param(_) | HirBinding::Upvalue(_) => false,
-        };
-        if observable && has_physical_home {
-            if let Some(binding) = repeat_binding(binding) {
-                roots
-                    .repeat_facts
-                    .get_mut(&repeat_key)
-                    .expect("reachable repeat must have endpoint facts")
-                    .may_end_before_condition
-                    .remove(&binding);
-            }
-            match binding {
-                HirBinding::Local(local) => {
-                    roots.locals.insert(local);
-                }
-                HirBinding::Temp(temp) => {
-                    roots.temps.insert(temp);
-                }
-                HirBinding::Param(_) | HirBinding::Upvalue(_) => {}
-            }
-        }
-    }
-}
-
-fn repeat_binding(binding: HirBinding) -> Option<HirRepeatBinding> {
-    match binding {
-        HirBinding::Local(local) => Some(HirRepeatBinding::Local(local)),
-        HirBinding::Temp(temp) => Some(HirRepeatBinding::Temp(temp)),
-        HirBinding::Param(_) | HirBinding::Upvalue(_) => None,
-    }
+struct RepeatSite {
+    path: StmtPath,
+    observable_bindings: Option<Vec<HirRepeatBinding>>,
+    lifetime: HirRepeatConditionLifetimeFacts,
 }
 
 fn install_repeat_condition_lifetime_facts(
     block: &mut HirBlock,
-    facts: &BTreeMap<usize, HirRepeatConditionLifetimeFacts>,
+    mut facts: BTreeMap<StmtPath, HirRepeatConditionLifetimeFacts>,
 ) -> bool {
     let mut changed = false;
-    for stmt in &mut block.stmts {
-        match stmt {
-            HirStmt::LocalRootRelease(_) => {}
-            HirStmt::If(if_stmt) => {
-                changed |= install_repeat_condition_lifetime_facts(&mut if_stmt.then_block, facts);
-                if let Some(else_block) = &mut if_stmt.else_block {
-                    changed |= install_repeat_condition_lifetime_facts(else_block, facts);
-                }
+    retain_stmts_with_paths(block, &mut Vec::new(), &mut |stmt, path| {
+        if let HirStmt::Repeat(repeat) = stmt {
+            let replacement = facts
+                .remove(path)
+                .expect("repeat has a published endpoint record");
+            if repeat.lifetime != replacement {
+                repeat.lifetime = replacement;
+                changed = true;
             }
-            HirStmt::While(while_stmt) => {
-                changed |= install_repeat_condition_lifetime_facts(&mut while_stmt.body, facts);
-            }
-            HirStmt::Repeat(repeat) => {
-                let repeat_key = std::ptr::from_ref(repeat.as_ref()).addr();
-                let replacement = facts.get(&repeat_key).cloned().unwrap_or_default();
-                if repeat.lifetime != replacement {
-                    repeat.lifetime = replacement;
-                    changed = true;
-                }
-                changed |= install_repeat_condition_lifetime_facts(&mut repeat.body, facts);
-            }
-            HirStmt::NumericFor(for_) => {
-                changed |= install_repeat_condition_lifetime_facts(&mut for_.body, facts);
-            }
-            HirStmt::GenericFor(for_) => {
-                changed |= install_repeat_condition_lifetime_facts(&mut for_.body, facts);
-            }
-            HirStmt::Block(block) => {
-                changed |= install_repeat_condition_lifetime_facts(block, facts);
-            }
-            HirStmt::LocalDecl(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::Assign(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
         }
-    }
+        true
+    });
     changed
 }
 
@@ -230,54 +203,33 @@ fn install_repeat_condition_lifetime_facts(
 /// 直属 binding 支持 AST collective 把 suffix 包进新 `do`；嵌套 block binding 支持
 /// cleanup 删除前层已经存在或 AST 早先生成的尾部 `do`。这里只收集稳定 HIR identity，
 /// 是否真的移动某个 block 仍由 AST 对具体候选证明。
-fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<HirBinding> {
+fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<HirRepeatBinding> {
     let mut bindings = BTreeSet::new();
     for stmt in &block.stmts {
-        match stmt {
-            HirStmt::LocalRootRelease(_) => {}
+        visit_stmt_structure(stmt, &mut |stmt| match stmt {
             HirStmt::LocalDecl(decl) => {
-                bindings.extend(decl.bindings.iter().copied().map(HirBinding::Local))
+                bindings.extend(decl.bindings.iter().copied().map(HirRepeatBinding::Local));
             }
-            HirStmt::Assign(assign) => bindings.extend(
-                assign
-                    .targets
-                    .iter()
-                    .filter_map(binding_from_lvalue)
-                    .filter(|binding| matches!(binding, HirBinding::Temp(_))),
-            ),
-            HirStmt::If(if_stmt) => {
-                bindings.extend(repeat_scoped_bindings(&if_stmt.then_block));
-                if let Some(else_block) = &if_stmt.else_block {
-                    bindings.extend(repeat_scoped_bindings(else_block));
-                }
-            }
-            HirStmt::While(while_stmt) => {
-                bindings.extend(repeat_scoped_bindings(&while_stmt.body));
-            }
-            HirStmt::Repeat(repeat_stmt) => {
-                bindings.extend(repeat_scoped_bindings(&repeat_stmt.body));
-            }
+            HirStmt::Assign(assign) => bindings.extend(assign.targets.iter().filter_map(
+                |target| match binding_from_lvalue(target) {
+                    Some(HirBinding::Temp(temp)) => Some(HirRepeatBinding::Temp(temp)),
+                    _ => None,
+                },
+            )),
             HirStmt::NumericFor(for_stmt) => {
-                bindings.insert(HirBinding::Local(for_stmt.binding));
-                bindings.extend(repeat_scoped_bindings(&for_stmt.body));
+                bindings.insert(HirRepeatBinding::Local(for_stmt.binding));
             }
             HirStmt::GenericFor(for_stmt) => {
-                bindings.extend(for_stmt.bindings.iter().copied().map(HirBinding::Local));
-                bindings.extend(repeat_scoped_bindings(&for_stmt.body));
+                bindings.extend(
+                    for_stmt
+                        .bindings
+                        .iter()
+                        .copied()
+                        .map(HirRepeatBinding::Local),
+                );
             }
-            HirStmt::Block(block) => bindings.extend(repeat_scoped_bindings(block)),
-            HirStmt::GlobalDecl(_)
-            | HirStmt::TableSetList(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
+            _ => {}
+        });
     }
     bindings
 }

@@ -5,12 +5,17 @@
 //! 例如 `a and b()` 的后续条件块进入 decision expression，只有 header 前缀逐指令
 //! 发射；需要在精确 low 位置恢复作用域或 root 退休时，必须先排除这些非 header 位置。
 //! 本查询不包含 HIR global declaration 等后续批量发射协议，它们仍需保护内部边界。
+//! 源码 scope 的原始结束 PC 与可发射交接点分别保留：CFG 排除不可达尾部，冻结的
+//! 无求值 Jump 允许在普通前缀末端交接；有求值的终结器不能据此提前结束来源身份。
+//! 每个 proto 的 lowering 在绑定分配前建立一次投影，词法窗口、copy-root 退休和
+//! 来源身份交接共同借用；这些消费者不改变 plan，最后一次查询后释放索引。
 
 use std::collections::BTreeSet;
 use std::ops::Range;
 
 use crate::structure::{
-    BlockEmissionPlan, BlockRef, LoopVmProtocol, RegionId, RegionPlan, StructurePlan,
+    BlockEmissionPlan, BlockRef, BlockTerminatorKind, Cfg, LoopVmProtocol, RegionId, RegionPlan,
+    StructurePlan,
 };
 use crate::transformer::InstrRef;
 
@@ -166,6 +171,22 @@ impl<'a> HirEmissionFacts<'a> {
         self.plan
             .region_for_block(block)
             .is_some_and(|owner| self.regions[owner.index()].ordinary)
+    }
+
+    /// 将源码 exclusive 末端投影到仍能发射交接语句的 prefix 边界。
+    /// 例如 `copy=owner; use(); goto again; unreachable CLOSE` 在 goto 前结束词法域。
+    /// 仅无求值的 Jump 可移到前缀末尾；Branch/Return 等操作数不能被这项投影越过。
+    /// 窗口的单入口/出口、身份与 cleanup 时序仍由消费者另行证明。
+    pub(super) fn source_scope_prefix_end(&self, cfg: &Cfg, end: usize) -> Option<usize> {
+        let last = cfg.last_reachable_instr_before(end)?;
+        let block = cfg.instr_to_block[last.index()];
+        let prefix = self.regular_prefix(block)?;
+        if prefix.contains(&last.index()) {
+            return Some(last.index() + 1);
+        }
+        matches!(self.plan.block_terminator(block)?.kind,
+            BlockTerminatorKind::Jump { instr, .. } if instr == last)
+        .then_some(prefix.end)
     }
 
     pub(super) fn for_instr(&self, instr: InstrRef) -> bool {
