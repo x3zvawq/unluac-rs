@@ -34,6 +34,8 @@ use super::generic_for::{
 mod blocks;
 mod branches;
 mod edges;
+mod emission;
+use emission::PlannedBlock;
 /// 从最终 region arena 构造 HIR body。
 mod index;
 mod labels;
@@ -48,6 +50,19 @@ pub(super) fn build_planned_body(
 ) -> Result<HirBlock, HirLowerError> {
     let mut lowerer = PlanBodyLowerer::new(proto, lowering)?;
     let body = lowerer.lower_plan_node(lowering.structure.plan().root())?;
+    let expected_boundaries = lowerer
+        .index
+        .scope_starts
+        .values()
+        .map(Vec::len)
+        .sum::<usize>()
+        * 2;
+    if lowerer.emitted_scope_boundaries != expected_boundaries {
+        return lowerer.invalid_region(
+            lowering.structure.plan().root(),
+            "planned lexical scope boundaries were not consumed exactly once",
+        );
+    }
     #[cfg(debug_assertions)]
     if lowerer.emitted_label_count != lowering.structure.plan().labels().len() {
         return Err(HirLowerError::InvalidPlanRegion {
@@ -63,6 +78,7 @@ struct PlanBodyLowerer<'a, 'b> {
     proto: HirProtoRef,
     lowering: &'b ProtoLowering<'a>,
     index: PlanLoweringIndex,
+    emitted_scope_boundaries: usize,
     #[cfg(debug_assertions)]
     emitted_labels: Vec<bool>,
     #[cfg(debug_assertions)]
@@ -76,6 +92,8 @@ struct PlanBodyLowerer<'a, 'b> {
 }
 
 struct PlanLoweringIndex {
+    scope_starts: BTreeMap<usize, Vec<usize>>,
+    scope_ends: BTreeMap<usize, Vec<usize>>,
     plain_block_count: Vec<Option<usize>>,
     single_plain_block: Vec<Option<BlockRef>>,
     region_inputs: Vec<Vec<(PhiId, SsaValue)>>,
@@ -89,7 +107,7 @@ struct PlanLoweringIndex {
 }
 
 struct PlannedLoopCondition {
-    prefix: Vec<HirStmt>,
+    prefix: PlannedBlock,
     cond: HirExpr,
 }
 
@@ -140,15 +158,15 @@ fn copy_assignment_stmt(targets: Vec<HirLValue>, values: Vec<HirExpr>) -> Option
 struct PlannedForRegions {
     preheader: Option<RegionId>,
     control: RegionId,
-    normal_tail: Option<(HirBlock, TempId)>,
+    normal_tail: Option<(PlannedBlock, TempId)>,
 }
 
 struct PlannedLoopParts {
     preheader: Option<RegionId>,
     control: RegionId,
-    body: HirBlock,
+    body: PlannedBlock,
     normal_tail_region: Option<RegionId>,
-    normal_tail_body: Option<HirBlock>,
+    normal_tail_body: Option<PlannedBlock>,
 }
 
 #[derive(Clone, Copy)]
@@ -168,15 +186,15 @@ enum LowerTask {
     },
     FinishSequence {
         region: RegionId,
-        outer_prefix: Vec<HirStmt>,
-        prefix: Vec<HirStmt>,
+        outer_prefix: PlannedBlock,
+        prefix: PlannedBlock,
         result_start: usize,
         child_count: usize,
         single_pass: bool,
     },
     FinishBranch {
         region: RegionId,
-        prefix: Vec<HirStmt>,
+        prefix: PlannedBlock,
         plan: crate::structure::BranchPlanId,
         condition: RegionId,
         has_else: bool,
@@ -184,7 +202,7 @@ enum LowerTask {
     },
     FinishLoop {
         region: RegionId,
-        prefix: Vec<HirStmt>,
+        prefix: PlannedBlock,
         plan: crate::structure::LoopPlanId,
         preheader: Option<RegionId>,
         control: RegionId,
@@ -193,8 +211,8 @@ enum LowerTask {
     },
     FinishUnstructured {
         region: RegionId,
-        outer_prefix: Vec<HirStmt>,
-        prefix: Vec<HirStmt>,
+        outer_prefix: PlannedBlock,
+        prefix: PlannedBlock,
         result_start: usize,
         item_count: usize,
         single_pass: bool,

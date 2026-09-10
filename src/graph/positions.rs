@@ -4,11 +4,7 @@
 //! 这里只解释位置区间，不推断可达性、读取角色或资源生命周期。例如位置 0、4
 //! 不能证明 [1,4) 内有事件；搜索上界早于起点时也不存在活动。
 
-use std::{
-    borrow::Borrow,
-    collections::{BTreeMap, BTreeSet},
-    ops::Range,
-};
+use std::{borrow::Borrow, collections::BTreeMap, ops::Range};
 
 pub(crate) struct PositionIndex<K>(BTreeMap<K, Vec<usize>>);
 
@@ -19,19 +15,6 @@ impl<K> Default for PositionIndex<K> {
 }
 
 impl<K: Ord> PositionIndex<K> {
-    pub(crate) fn from_sets(sets: &[BTreeSet<K>]) -> Self
-    where
-        K: Copy,
-    {
-        let mut index = Self::default();
-        for (position, keys) in sets.iter().enumerate() {
-            for &key in keys {
-                index.record(key, position);
-            }
-        }
-        index
-    }
-
     pub(crate) fn record(&mut self, key: K, position: usize) {
         let positions = self.0.entry(key).or_default();
         if positions.last() != Some(&position) {

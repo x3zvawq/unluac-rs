@@ -3,8 +3,9 @@
 //! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨后续观察点的
 //! table/global lookup result，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
 //! VM GC root。ordinary call 的参数槽由前层标记交接给 callee，只有当前唯一 producer 与
-//! call 参数端点仍匹配时才排除跨调用的 allocation-root 配对，不能把 callee 可覆盖的槽
-//! 物化为额外 caller local。例如 `f({})` 在 f 内丢弃参数后允许对象回收。
+//! call 参数端点仍匹配时才退休 call/lookup/allocation 的对应 home，不能把 callee 可覆盖的槽
+//! 物化为额外 caller local。例如 `object = make(); f(object)` 的参数副本结束于 f，原槽
+//! 则仍需保活至自己的覆盖点；两者共享值身份，不共享物理根终点。
 //! Promotion 另会发布普通 copy root 的单结果 call + 紧邻 MOVE 终点；本层只按 producer / endpoint
 //! temp 与 overwritten home 完整匹配，把它接入同一 local-owner handoff，不从 HIR 相邻文本猜 opcode。
 //! allocation 的内部 aggregate 存储由共享 object_flow 证明是否真正逃逸，不能仅凭
@@ -13,7 +14,8 @@
 //! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
 //! 消费者只能把 producer 与同 home 的精确覆盖配对。
 //! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
-//! 或 cleanup 边界时才允许穿过。消费者可以保留已配对的两次 materialization，也可以在
+//! 或 cleanup 边界时才允许穿过。循环内的 break/continue 由共享 HIR 词法树判定归属，
+//! 不清除循环外 home 的配对。消费者可以保留已配对的两次 materialization，也可以在
 //! 更窄的改写仍保持同一覆盖事务时，连同 owner 已证明的 physical home 一起消费该 pair。
 //! 同值 frame-end copy 的覆盖证明同时消费前层非资源旧值与两个完整 root transaction，
 //! 并复核当前 HIR 未改写 home；删除副本的 owner 必须物化原值根，不能只抹掉负向标记。
@@ -23,7 +25,7 @@
 //! 两类端点共用 producer/home 身份，前缀查询只投影已保活且在边界前正向闭合的事务；
 //! locals 据此建立一次成员索引，不按每个候选重扫语句前缀。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
     HirAssign, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, HirUnaryOpKind,
@@ -34,15 +36,17 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 mod allocation_homes;
 mod call_values;
+mod events;
+mod live_read_changes;
 mod lookup_values;
 mod return_lookup;
 
-use allocation_homes::{ActiveAllocationHome, AllocationHomes};
+use allocation_homes::{ActiveAllocationHome, AllocationHomes, AllocationSite};
 use call_values::CallValues;
+pub(super) use events::{RootEventBlock, RootEventIndex, RootEventStmt};
 use lookup_values::LookupValues;
 
 use super::object_flow::RootAnalysisContext;
-use super::temp_touch::{collect_temp_reads_by_stmt, stmt_consumes_temps_only_in_control_head};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 /// 当前语句中必须只有一个仍匹配 producer 的参数交接端点；共享给内联和身份物化。
@@ -123,8 +127,8 @@ pub(super) struct CallRootLifetimeIndices {
     continuation_owners: BTreeMap<usize, PhysicalRootOwner>,
     call_dispatch_releases: BTreeMap<usize, Vec<PhysicalRootOwner>>,
     pre_dispatch_releases: BTreeMap<usize, BTreeSet<TempId>>,
-    allocation_sites: BTreeMap<usize, usize>,
-    allocation_release_sites: BTreeMap<(usize, TempId), usize>,
+    allocation_sites: BTreeMap<usize, AllocationSite>,
+    allocation_release_sites: BTreeMap<(usize, TempId), AllocationSite>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -164,93 +168,85 @@ pub(super) struct LookupGcRootLifetimeIndices {
 /// `local x = a:m(); x:n()` 链化，而 `local x = a:m(); x:n(); side()` 会保留词法 root。
 pub(super) fn collect_call_result_local_roots(
     stmts: &[HirStmt],
+    events: RootEventBlock<'_>,
     trailing_condition: Option<&HirExpr>,
     safety: HirExprSafety,
 ) -> BTreeSet<LocalId> {
-    let explicit_fences = collect_gc_fence_indices(stmts);
-    let mut observations = stmts
+    // 不同 local 的后缀状态互不影响；只请求最终能发布 root 的直属 call-result 候选。
+    // 必须逆扫候选的完整后缀，不能从逆序第一次遇见 producer 才开始跟踪读取。
+    let candidates = stmts
         .iter()
-        .enumerate()
-        .filter_map(|(index, stmt)| stmt_may_observe_gc_roots(stmt, safety).then_some(index))
+        .filter_map(direct_call_result_local)
         .collect::<BTreeSet<_>>();
-    let mut states = BTreeMap::<LocalId, LocalRootSuffix>::new();
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+    let explicit_fences = collect_gc_fences(stmts, |index, _, temps, locals| {
+        events.is_gc_fence(index, temps, locals)
+    });
+    let mut observations = events.observation_indices();
+    let mut trailing_uses = LocalUseCollector::default();
     if let Some(condition) = trailing_condition {
         if !safety.is_discard_safe_without_residual(condition) {
             observations.insert(stmts.len());
         }
-        let mut uses = LocalUseCollector::default();
-        visit_expr(condition, &mut uses);
-        for local in uses.reads {
-            states.insert(
-                local,
-                LocalRootSuffix {
-                    next_event: stmts.len(),
-                    has_live_read: true,
-                    observed: false,
-                },
-            );
-        }
+        visit_expr(condition, &mut trailing_uses);
     }
     let mut roots = BTreeSet::new();
-    for (index, stmt) in stmts.iter().enumerate().rev() {
-        let mut uses = LocalUseCollector::default();
-        visit_stmts(std::slice::from_ref(stmt), &mut uses);
-        let mut direct_writes = BTreeSet::new();
-        let mut call_result = None;
-        match stmt {
-            HirStmt::LocalRootRelease(local) => {
-                direct_writes.insert(*local);
-            }
-            HirStmt::Assign(assign) => {
-                direct_writes.extend(assign.targets.iter().filter_map(|target| match target {
-                    HirLValue::Local(local) => Some(*local),
-                    _ => None,
-                }));
-                if let ([HirLValue::Local(local)], [HirExpr::Call(_)], None) = (
-                    assign.targets.as_slice(),
-                    assign.values.fixed.as_slice(),
-                    &assign.values.tail,
-                ) {
-                    call_result = Some(*local);
-                }
-            }
-            HirStmt::LocalDecl(decl) => {
-                direct_writes.extend(decl.bindings.iter().copied());
-                if let ([local], [HirExpr::Call(_)], None) = (
-                    decl.bindings.as_slice(),
-                    decl.values.fixed.as_slice(),
-                    &decl.values.tail,
-                ) {
-                    call_result = Some(*local);
-                }
-            }
-            _ => {}
-        }
-        // 相邻读写事件之间的 future-read 状态不变，只查询该窗口是否存在观察点。
-        // 同一语句中的读先于覆盖；nested write 改变 future-read，但不终止直属 call owner。
-        for &local in uses.reads.union(&uses.writes) {
-            let state = states.entry(local).or_insert(LocalRootSuffix {
-                next_event: stmts.len() + 1,
-                has_live_read: false,
-                observed: false,
-            });
+    for local in candidates {
+        let has_live_read = trailing_uses.reads.contains(&local);
+        let mut state = LocalRootSuffix {
+            next_event: stmts.len() + usize::from(!has_live_read),
+            has_live_read,
+            observed: false,
+        };
+        for index in events.local_touch_positions_rev(local) {
+            let stmt = &stmts[index];
             let gap = index + 1..state.next_event;
             state.observed |= explicit_fences.range(gap.clone()).next().is_some()
                 || (!state.has_live_read && observations.range(gap).next().is_some());
-            if direct_writes.contains(&local) {
-                if call_result == Some(local) && state.observed {
+            // nested write 改变 future-read，但只有原先允许的直属覆盖才结束 call owner。
+            if matches!(
+                stmt,
+                HirStmt::Assign(_) | HirStmt::LocalDecl(_) | HirStmt::LocalRootRelease(_)
+            ) && events.stmt(index).writes_local_in_header(local)
+            {
+                if direct_call_result_local(stmt) == Some(local) && state.observed {
                     roots.insert(local);
+                    break;
                 }
-                // 当前覆盖语句的求值仍可观察旧值，所以先消费新值的后缀，再处理当前观察。
                 state.observed = false;
             }
-            state.has_live_read = uses.reads.contains(&local);
+            // 当前 RHS 仍可观察旧值；先消费新值后缀，再处理当前语句观察，同句读优先。
+            state.has_live_read = events.has_local_read_at(local, index);
             state.observed |= explicit_fences.contains(&index)
                 || (!state.has_live_read && observations.contains(&index));
             state.next_event = index;
         }
     }
     roots
+}
+
+fn direct_call_result_local(stmt: &HirStmt) -> Option<LocalId> {
+    match stmt {
+        HirStmt::Assign(assign) => match (
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        ) {
+            ([HirLValue::Local(local)], [HirExpr::Call(_)], None) => Some(*local),
+            _ => None,
+        },
+        HirStmt::LocalDecl(decl) => match (
+            decl.bindings.as_slice(),
+            decl.values.fixed.as_slice(),
+            &decl.values.tail,
+        ) {
+            ([local], [HirExpr::Call(_)], None) => Some(*local),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 impl PhysicalRootOwner {
@@ -414,6 +410,7 @@ impl CallRootLifetimeIndices {
         &self,
         stmts: &[HirStmt],
         facts: &ProtoPromotionFacts,
+        mut preserves_home: impl FnMut(std::ops::Range<usize>, HomeSlotKey) -> bool,
     ) -> Vec<MethodReceiverRootHandoff> {
         // None 表示不同位置都覆盖此 owner；同一位置的重复记录不改变唯一性。
         let mut unique_overwrites = BTreeMap::new();
@@ -466,10 +463,7 @@ impl CallRootLifetimeIndices {
                 continue;
             };
 
-            let writes =
-                StackWriteSummary::for_stmts(&stmts[(producer_index + 1)..=sink_index], facts);
-            if writes.has_unknown_home || writes.has_boundary || writes.homes.contains(&source_home)
-            {
+            if !preserves_home(producer_index + 1..sink_index + 1, source_home) {
                 continue;
             }
 
@@ -576,6 +570,27 @@ pub(super) fn collect_call_root_lifetimes(
 
     for (index, stmt) in stmts.iter().enumerate() {
         active.advance(index);
+        // caller 的参数槽已交给 callee；同值的低槽 owner 仍独立保活。
+        // 必须先消费当前快照的唯一 producer/参数配对，后缀 GC 不能再次选中已交出的 home。
+        let transfers = uses.argument_transfers_at(
+            index,
+            facts,
+            active.tracked_temp_count() + active_allocations.temp_count(),
+            || active.tracked_temps().chain(active_allocations.temps()),
+        );
+        for (temp, producer, home) in transfers {
+            if active.get(&home).is_some_and(|root| {
+                producer >= root.root_index && active.aliases(root.value_id).contains(&temp)
+            }) {
+                active.remove(&home);
+                active.forget_home_aliases(home);
+            }
+            if active_allocations.get(&home).is_some_and(|root| {
+                producer >= root.owner.definition_index && root.aliases.contains(&temp)
+            }) {
+                active_allocations.remove(&home);
+            }
+        }
         let scalar_definition = stmt.scalar_temp_assignment();
         let matching_call_move_homes = scalar_definition
             .filter(|(_, value)| matches!(value, HirExpr::Call(_)))
@@ -619,15 +634,21 @@ pub(super) fn collect_call_root_lifetimes(
                     });
             }
         }
-        let mut current_writes = StackWriteSummary::for_stmt(stmt, facts);
-        current_writes
-            .homes
-            .retain(|home| !matching_call_move_homes.contains(home));
-        if current_writes.has_boundary || current_writes.has_unknown_home {
-            pending_copy_root_call_moves.clear();
-        } else {
-            for home in &current_writes.homes {
-                pending_copy_root_call_moves.remove(home);
+        if !pending_copy_root_call_moves.is_empty() {
+            let writes = snapshot.stack_writes_at(index);
+            if writes.has_boundary() || writes.has_unknown_home() {
+                pending_copy_root_call_moves.clear();
+            } else {
+                let homes = writes.intersection(
+                    pending_copy_root_call_moves.len(),
+                    || pending_copy_root_call_moves.keys().copied(),
+                    |home| pending_copy_root_call_moves.contains_key(&home),
+                );
+                for home in &homes {
+                    if !matching_call_move_homes.contains(home) {
+                        pending_copy_root_call_moves.remove(home);
+                    }
+                }
             }
         }
 
@@ -664,11 +685,9 @@ pub(super) fn collect_call_root_lifetimes(
                     if !root.eligible
                         || !active.aliases(root.value_id).contains(producer)
                         || active.has_live_read_after(root.value_id, home)
-                        || uses.reads_at(index).is_some_and(|reads| {
-                            reads.iter().any(|temp| {
-                                facts.trusted_temp_home_slot(*temp) == Some(home)
-                                    && active.aliases(root.value_id).contains(temp)
-                            })
+                        || active.aliases(root.value_id).iter().any(|temp| {
+                            facts.trusted_temp_home_slot(*temp) == Some(home)
+                                && uses.has_read_at(*temp, index)
                         })
                     {
                         continue;
@@ -686,7 +705,7 @@ pub(super) fn collect_call_root_lifetimes(
                 }
             }
         }
-        let potential_observation = stmt_may_observe_gc_roots(stmt, safety);
+        let potential_observation = uses.events.block().stmt(index).may_observe_gc_roots();
         if uses.is_gc_fence(index) {
             preserve_active_call_roots(&mut active, &mut lifetimes);
         } else if observe_potential_events && potential_observation {
@@ -695,12 +714,7 @@ pub(super) fn collect_call_root_lifetimes(
             // by itself justify materializing every still-active call result.
             observe_active_call_values(&mut active, None);
         }
-        let reads = uses.reads_at(index);
-        let read_values = reads
-            .into_iter()
-            .flatten()
-            .filter_map(|temp| active.value_for_temp(*temp))
-            .collect::<BTreeSet<_>>();
+        let read_values = active.read_values_at(index);
         let read_observations = read_values
             .into_iter()
             .filter(|value| {
@@ -716,7 +730,11 @@ pub(super) fn collect_call_root_lifetimes(
                 // 控制头和纯 copy 本身只转发值；后续显式 GC 仍需要精确物理根配对。
                 if !has_later_fence
                     && (is_loop_control
-                        || stmt_is_direct_if_control_read(stmt, aliases)
+                        || stmt_is_direct_if_control_read(
+                            stmt,
+                            aliases,
+                            snapshot.uses.events.block().stmt(index),
+                        )
                         || stmt_is_transparent_temp_copy(stmt, aliases))
                 {
                     return false;
@@ -732,8 +750,14 @@ pub(super) fn collect_call_root_lifetimes(
                     }
                     has_later_fence
                         || potential_observation
-                        || definite_grouped_home_overwrite(stmt, *home, facts, &mut |_| true)
-                            .is_none()
+                        || definite_grouped_home_overwrite(
+                            stmt,
+                            snapshot.stack_writes_at(index),
+                            *home,
+                            facts,
+                            &mut |_| true,
+                        )
+                        .is_none()
                 })
             })
             .collect::<BTreeSet<_>>();
@@ -765,7 +789,7 @@ pub(super) fn collect_call_root_lifetimes(
             // 此声明已经接管源码 binding；下方写入摘要正常退休旧 Temp home 及其别名。
         }
         let Some((temp, value)) = scalar_definition else {
-            forget_written_known_nil_temps(stmt, &mut known_nil_temps);
+            known_nil_temps.retain(|temp| !uses.has_write_at(*temp, index));
             if let Some(targets) = exact_multi_call_home_targets(stmt, facts) {
                 let target_homes = targets
                     .iter()
@@ -849,13 +873,25 @@ pub(super) fn collect_call_root_lifetimes(
                 }
                 continue;
             }
+            // 摘要只会失效已有 home/alias。空状态不能因嵌套写入产生根，
+            // 不应让每层无本地 producer 的循环为此重扫整棵未改写子树。
+            if active.is_empty() && active_allocations.is_empty() {
+                continue;
+            }
+            let current_writes = snapshot.stack_writes_at(index);
+            let mut current_homes = current_writes.intersection(
+                active.tracked_home_count_bound() + active_allocations.len(),
+                || active.tracked_homes().chain(active_allocations.keys()),
+                |home| active.tracks_home(home) || active_allocations.get(&home).is_some(),
+            );
+            current_homes.retain(|home| !matching_call_move_homes.contains(home));
             let mut proven_homes = BTreeSet::new();
             let grouped_assignment_is_complete =
                 grouped_assignment_targets_are_active(stmt, facts, |home| {
                     active.get(home).is_some() || active_allocations.get(home).is_some()
                 });
             // 共享写入摘要已枚举可能覆盖的 home；不为纯调用重扫全部活动对象。
-            for home in current_writes.homes.iter().copied() {
+            for home in current_homes.iter().copied() {
                 if !grouped_assignment_is_complete {
                     break;
                 }
@@ -864,6 +900,7 @@ pub(super) fn collect_call_root_lifetimes(
                 }
                 let Some(overwrite) = definite_grouped_home_overwrite(
                     stmt,
+                    current_writes,
                     home,
                     facts,
                     &mut overwrite_temp_is_eligible,
@@ -872,12 +909,10 @@ pub(super) fn collect_call_root_lifetimes(
                 };
                 proven_homes.insert(home);
                 let active_root_is_read = active.get(&home).is_some_and(|root| {
-                    reads.is_some_and(|reads| {
-                        active
-                            .aliases(root.value_id)
-                            .iter()
-                            .any(|alias| reads.contains(alias))
-                    })
+                    active
+                        .aliases(root.value_id)
+                        .iter()
+                        .any(|alias| uses.has_read_at(*alias, index))
                 });
                 for temp in &overwrite.temps {
                     active.forget_temp(*temp);
@@ -904,17 +939,23 @@ pub(super) fn collect_call_root_lifetimes(
                     overwrite.eligible,
                 );
             }
-            let mut writes = current_writes;
-            writes.homes.retain(|home| !proven_homes.contains(home));
-            if writes.has_boundary || writes.has_unknown_home {
+            if current_writes.has_boundary() || current_writes.has_unknown_home() {
                 active.clear();
                 active_allocations.clear();
             } else {
-                for home in &writes.homes {
+                for home in current_homes
+                    .iter()
+                    .filter(|home| !proven_homes.contains(home))
+                {
                     active.remove(home);
                     active.forget_home_aliases(*home);
                 }
-                active_allocations.remove_homes(&writes.homes);
+                for home in current_homes
+                    .iter()
+                    .filter(|home| !proven_homes.contains(home))
+                {
+                    active_allocations.remove(home);
+                }
             }
             continue;
         };
@@ -1075,10 +1116,29 @@ pub(super) fn collect_call_root_lifetimes(
     let allocation_roots = std::mem::take(&mut lifetimes.allocation_sites);
     let allocation_releases = std::mem::take(&mut lifetimes.allocation_release_sites);
     if !allocation_roots.is_empty() || !allocation_releases.is_empty() {
-        let objects =
-            super::object_flow::AllocationEscapeFacts::analyze(stmts, context, &opaque_allocations);
+        let queries = allocation_releases
+            .iter()
+            .map(|(&(index, _), site)| (index, site))
+            .chain(
+                lifetimes
+                    .roots_by_overwrite
+                    .iter()
+                    .flat_map(|(&index, pairs)| pairs.iter().map(move |pair| (index, pair)))
+                    .filter_map(|(index, pair)| {
+                        allocation_roots
+                            .get(&pair.root_index)
+                            .map(|site| (index, site))
+                    }),
+            )
+            .map(|(index, site)| (index, site.constructor(stmts)));
+        let objects = super::object_flow::AllocationEscapeFacts::analyze(
+            stmts,
+            context,
+            &opaque_allocations,
+            queries,
+        );
         for ((index, temp), site) in allocation_releases {
-            if objects.proves_unescaped(site, &stmts[index])
+            if objects.proves_unescaped(site.constructor(stmts), index)
                 && let Some(releases) = lifetimes.pre_dispatch_releases.get_mut(&index)
             {
                 releases.remove(&temp);
@@ -1091,7 +1151,7 @@ pub(super) fn collect_call_root_lifetimes(
             pairs.retain(|pair| {
                 allocation_roots
                     .get(&pair.root_index)
-                    .is_none_or(|site| !objects.proves_unescaped(*site, &stmts[*index]))
+                    .is_none_or(|site| !objects.proves_unescaped(site.constructor(stmts), *index))
             });
         }
         lifetimes
@@ -1112,10 +1172,9 @@ pub(super) fn collect_call_root_lifetimes(
         }
     }
     extend_allocation_owner_overwrites(
-        stmts,
+        snapshot,
         facts,
         safety,
-        uses,
         &allocation_roots,
         &mut producer_temp_is_eligible,
         &mut overwrite_temp_is_eligible,
@@ -1128,17 +1187,20 @@ pub(super) fn collect_call_root_lifetimes(
 /// 例如 allocation -> global lookup -> table lookup，不能只保留第一条边，否则
 /// 第二次 lookup 被内联后，global lookup 的接收者会额外存活到源码 local 的作用域末尾。
 /// 只延续已经证明需要物化的 allocation 事务；call/copy 的独立根仍由各自 value owner 管理。
-#[allow(clippy::too_many_arguments)]
 fn extend_allocation_owner_overwrites(
-    stmts: &[HirStmt],
+    snapshot: &RootLifetimeFacts<'_>,
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
-    uses: &TempUseEvents,
-    allocation_roots: &BTreeMap<usize, usize>,
+    allocation_roots: &BTreeMap<usize, AllocationSite>,
     producer_is_eligible: &mut impl FnMut(TempId) -> bool,
     overwrite_is_eligible: &mut impl FnMut(TempId) -> bool,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
+    if allocation_roots.is_empty() {
+        return;
+    }
+    let stmts = snapshot.stmts;
+    let uses = &snapshot.uses;
     let mut owners = BTreeMap::<HomeSlotKey, (usize, TempId)>::new();
     for (index, stmt) in stmts.iter().enumerate() {
         let definition = stmt.scalar_temp_assignment();
@@ -1180,12 +1242,19 @@ fn extend_allocation_owner_overwrites(
                             .is_some_and(|(owner, _)| *owner == pair.root_index()))
             })
         });
-        let writes = StackWriteSummary::for_stmt(stmt, facts);
-        if writes.has_boundary || writes.has_unknown_home {
-            owners.clear();
-        } else {
-            for home in writes.homes {
-                owners.remove(&home);
+        if !owners.is_empty() {
+            let writes = snapshot.stack_writes_at(index);
+            if writes.has_boundary() || writes.has_unknown_home() {
+                owners.clear();
+            } else {
+                let homes = writes.intersection(
+                    owners.len(),
+                    || owners.keys().copied(),
+                    |home| owners.contains_key(&home),
+                );
+                for home in &homes {
+                    owners.remove(home);
+                }
             }
         }
         if let Some((temp, value, home)) = target
@@ -1240,7 +1309,7 @@ fn generic_for_dispatch_result_homes(
 fn release_roots_before_generic_dispatch(
     index: usize,
     result_homes: &BTreeSet<HomeSlotKey>,
-    uses: &TempUseEvents,
+    uses: &TempUseEvents<'_>,
     facts: &ProtoPromotionFacts,
     active_calls: &mut CallValues<'_>,
     active_allocations: &mut AllocationHomes,
@@ -1290,7 +1359,7 @@ fn root_release_temp(
     aliases: &BTreeSet<TempId>,
     home: HomeSlotKey,
     index: usize,
-    uses: &TempUseEvents,
+    uses: &TempUseEvents<'_>,
     facts: &ProtoPromotionFacts,
 ) -> Option<TempId> {
     aliases.iter().copied().find(|temp| {
@@ -1312,7 +1381,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
         matches!(stmt, HirStmt::GenericFor(for_stmt) if !for_stmt.dispatch_results.is_empty())
     }) {
         collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(&block.stmts),
+            &RootLifetimeFacts::new(&block.stmts, facts, context.safety),
             facts,
             context,
             true,
@@ -1445,27 +1514,21 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
         .collect::<BTreeMap<_, _>>();
     let reference_captured_temps = super::mention::stmts_reference_captured_bindings(stmts).temps;
     let mut active = BTreeMap::<HomeSlotKey, ActiveLookupGcHome>::new();
-    let mut values = LookupValues::new(uses, stmts, safety);
+    let mut values = LookupValues::new(uses);
     let mut lifetimes = LookupGcRootLifetimeIndices::default();
 
     for (index, stmt) in stmts.iter().enumerate() {
         values.advance(index);
         // 参数 home 在 dispatch 时交给 callee；不能再把它物化为跨调用存活的 caller local。
         // 同值的其它 home 仍独立保活，只有当前快照中的唯一 producer/端点证明可以结束事务。
-        for temp in &uses.argument_transfers_by_stmt[index] {
-            let Some(home) = facts.trusted_temp_home_slot(*temp) else {
-                continue;
-            };
+        let transfers = uses.argument_transfers_at(index, facts, values.by_temp.len(), || {
+            values.by_temp.keys().copied()
+        });
+        for (temp, producer, home) in transfers {
             let Some(root) = active.get(&home) else {
                 continue;
             };
-            let [producer] = uses.by_temp[temp].writes.as_slice() else {
-                continue;
-            };
-            if root.aliases.contains(temp)
-                && *producer >= root.root_index
-                && uses.has_argument_transfer(*temp, *producer, index)
-            {
+            if root.aliases.contains(&temp) && producer >= root.root_index {
                 let root = active
                     .remove(&home)
                     .expect("matched argument home must remain active");
@@ -1543,25 +1606,31 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 }
                 continue;
             }
+            if active.is_empty() && values.by_temp.is_empty() {
+                continue;
+            }
             let mut proven_homes = BTreeSet::new();
-            let mut writes = StackWriteSummary::for_stmt(stmt, facts);
+            let writes = snapshot.stack_writes_at(index);
             let grouped_assignment_is_complete =
                 grouped_assignment_targets_are_active(stmt, facts, |home| {
                     active.contains_key(home)
                 });
-            let written_active_homes = writes
-                .homes
-                .iter()
-                .copied()
-                .filter(|home| active.contains_key(home))
-                .collect::<Vec<_>>();
-            for home in written_active_homes {
+            let written_active_homes = writes.intersection(
+                active.len(),
+                || active.keys().copied(),
+                |home| active.contains_key(&home),
+            );
+            for home in written_active_homes.iter().copied() {
                 if !grouped_assignment_is_complete {
                     break;
                 }
-                let Some(overwrite) =
-                    definite_grouped_home_overwrite(stmt, home, facts, &mut temp_is_eligible)
-                else {
+                let Some(overwrite) = definite_grouped_home_overwrite(
+                    stmt,
+                    writes,
+                    home,
+                    facts,
+                    &mut temp_is_eligible,
+                ) else {
                     continue;
                 };
                 proven_homes.insert(home);
@@ -1591,13 +1660,15 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                     &mut lifetimes,
                 );
             }
-            writes.homes.retain(|home| !proven_homes.contains(home));
-            if writes.has_boundary || writes.has_unknown_home {
+            if writes.has_boundary() || writes.has_unknown_home() {
                 active.clear();
                 values.clear();
             } else {
-                for home in writes.homes {
-                    if let Some(root) = active.remove(&home) {
+                for home in written_active_homes
+                    .iter()
+                    .filter(|home| !proven_homes.contains(home))
+                {
+                    if let Some(root) = active.remove(home) {
                         for alias in root.aliases {
                             values.remove(&alias, index);
                         }
@@ -1694,7 +1765,7 @@ fn nil_guarded_global_lookup_handoff(
     active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
     values: &LookupValues<'_>,
     reference_captured_temps: &BTreeSet<TempId>,
-    uses: &TempUseEvents,
+    uses: &TempUseEvents<'_>,
     facts: &ProtoPromotionFacts,
 ) -> Option<(LookupValueId, TempId)> {
     let HirStmt::If(if_stmt) = stmt else {
@@ -1761,7 +1832,7 @@ fn record_lookup_root_overwrite(
     index: usize,
     home: HomeSlotKey,
     overwrite_is_eligible: bool,
-    uses: &TempUseEvents,
+    uses: &TempUseEvents<'_>,
     values: &LookupValues<'_>,
     lifetimes: &mut LookupGcRootLifetimeIndices,
 ) {
@@ -1945,16 +2016,16 @@ pub(super) fn exact_multi_call_home_targets(
 
 fn definite_grouped_home_overwrite(
     stmt: &HirStmt,
+    writes: RootEventStmt<'_>,
     home: HomeSlotKey,
     facts: &ProtoPromotionFacts,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
 ) -> Option<ExactHomeOverwrite> {
     let temps = match stmt {
         HirStmt::Assign(assign) if assign.targets.len() > 1 => {
-            let writes = StackWriteSummary::for_stmt(stmt, facts);
-            if writes.has_boundary
-                || writes.has_unknown_home
-                || !writes.homes.contains(&home)
+            if writes.has_boundary()
+                || writes.has_unknown_home()
+                || !writes.contains_home(home)
                 || !assign.targets.iter().all(|target| {
                     matches!(target, HirLValue::Temp(temp) if facts.trusted_temp_home_slot(*temp).is_some())
                 })
@@ -1974,11 +2045,15 @@ fn definite_grouped_home_overwrite(
         }
         HirStmt::If(if_stmt) => {
             let else_block = if_stmt.else_block.as_ref()?;
-            let then_temps = definite_block_home_overwrite(&if_stmt.then_block, home, facts)?;
-            let else_temps = definite_block_home_overwrite(else_block, home, facts)?;
+            let then_temps =
+                definite_block_home_overwrite(&if_stmt.then_block, writes.child(0), home, facts)?;
+            let else_temps =
+                definite_block_home_overwrite(else_block, writes.child(1), home, facts)?;
             then_temps.union(&else_temps).copied().collect()
         }
-        HirStmt::Block(block) => definite_block_home_overwrite(block, home, facts)?,
+        HirStmt::Block(block) => {
+            definite_block_home_overwrite(block, writes.child(0), home, facts)?
+        }
         _ => return None,
     };
     if temps.is_empty() {
@@ -2017,45 +2092,32 @@ fn grouped_assignment_targets_are_active(
 
 fn definite_block_home_overwrite(
     block: &HirBlock,
+    events: RootEventBlock<'_>,
     home: HomeSlotKey,
     facts: &ProtoPromotionFacts,
 ) -> Option<BTreeSet<TempId>> {
-    let (first_index, first_temp) = block.stmts.iter().enumerate().find_map(|(index, stmt)| {
-        let (temp, _) = stmt.scalar_temp_assignment()?;
-        (facts.trusted_temp_home_slot(temp) == Some(home)).then_some((index, temp))
-    })?;
-    if !stmts_preserve_home(&block.stmts[..first_index], home, facts)
-        || !stmts_rewrite_home_only_through_scalar_temps(
-            &block.stmts[(first_index + 1)..],
-            home,
-            facts,
-        )
+    let (first_index, first_temp) =
+        events
+            .home_write_positions_from(home, 0)
+            .find_map(|index| {
+                let (temp, _) = block.stmts[index].scalar_temp_assignment()?;
+                (facts.trusted_temp_home_slot(temp) == Some(home)).then_some((index, temp))
+            })?;
+    let suffix = events.slice(first_index + 1..block.stmts.len());
+    if !events.prefix(first_index).preserves_home(home)
+        || suffix.has_boundary()
+        || suffix.has_unknown_home()
+        || !events
+            .home_write_positions_from(home, first_index + 1)
+            .all(|index| {
+                block.stmts[index]
+                    .scalar_temp_assignment()
+                    .is_some_and(|(temp, _)| facts.trusted_temp_home_slot(temp) == Some(home))
+            })
     {
         return None;
     }
     Some(BTreeSet::from([first_temp]))
-}
-
-fn stmts_preserve_home(stmts: &[HirStmt], home: HomeSlotKey, facts: &ProtoPromotionFacts) -> bool {
-    let writes = StackWriteSummary::for_stmts(stmts, facts);
-    !writes.has_boundary && !writes.has_unknown_home && !writes.homes.contains(&home)
-}
-
-fn stmts_rewrite_home_only_through_scalar_temps(
-    stmts: &[HirStmt],
-    home: HomeSlotKey,
-    facts: &ProtoPromotionFacts,
-) -> bool {
-    stmts.iter().all(|stmt| {
-        let writes = StackWriteSummary::for_stmt(stmt, facts);
-        if writes.has_boundary || writes.has_unknown_home {
-            return false;
-        }
-        !writes.homes.contains(&home)
-            || stmt
-                .scalar_temp_assignment()
-                .is_some_and(|(temp, _)| facts.trusted_temp_home_slot(temp) == Some(home))
-    })
 }
 
 fn stmt_is_transparent_temp_copy(stmt: &HirStmt, aliases: &BTreeSet<TempId>) -> bool {
@@ -2069,7 +2131,11 @@ fn stmt_is_transparent_temp_copy(stmt: &HirStmt, aliases: &BTreeSet<TempId>) -> 
     )
 }
 
-fn stmt_is_direct_if_control_read(stmt: &HirStmt, aliases: &BTreeSet<TempId>) -> bool {
+fn stmt_is_direct_if_control_read(
+    stmt: &HirStmt,
+    aliases: &BTreeSet<TempId>,
+    scope: RootEventStmt<'_>,
+) -> bool {
     let HirStmt::If(if_stmt) = stmt else {
         return false;
     };
@@ -2080,7 +2146,7 @@ fn stmt_is_direct_if_control_read(stmt: &HirStmt, aliases: &BTreeSet<TempId>) ->
         }
         _ => false,
     };
-    reads_alias && stmt_consumes_temps_only_in_control_head(stmt, aliases)
+    reads_alias && scope.consumes_only_control_head(stmt, aliases)
 }
 
 /// 两个原始 home 都保活到 frame end，且当前 HIR 仍保留相同值的覆盖关系。
@@ -2096,12 +2162,12 @@ pub(super) struct ScopeEndCopyRootHandoff {
 pub(super) fn scope_end_copy_root_handoffs(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
+    mut preserves_home: impl FnMut(std::ops::Range<usize>, HomeSlotKey) -> bool,
 ) -> Vec<ScopeEndCopyRootHandoff> {
     let Some((HirStmt::Return(_), prefix)) = stmts.split_last() else {
         return Vec::new();
     };
     let mut first_definitions = BTreeMap::new();
-    let mut suffix_writes = None;
     let mut handoffs = Vec::new();
     for (copy_index, stmt) in prefix.iter().enumerate() {
         let Some((target, value)) = stmt.scalar_temp_assignment() else {
@@ -2134,31 +2200,10 @@ pub(super) fn scope_end_copy_root_handoffs(
         if source_index >= copy_index {
             continue;
         }
-        // 只在存在候选时汇总一次：无 copy 的嵌套 block 不应因此反复遍历整棵子树。
-        // 所有查询都到同一 prefix 末尾；nested 写入仍归属原顶层 stmt。
-        let (last_home_writes, last_boundary) = suffix_writes.get_or_insert_with(|| {
-            let mut last_home_writes = BTreeMap::new();
-            let mut last_boundary = None;
-            for (index, stmt) in prefix.iter().enumerate() {
-                let writes = StackWriteSummary::for_stmt(stmt, facts);
-                if writes.has_boundary || writes.has_unknown_home {
-                    last_boundary = Some(index);
-                }
-                for home in writes.homes {
-                    last_home_writes.insert(home, index);
-                }
-            }
-            (last_home_writes, last_boundary)
-        });
         // 当前 HIR 必须继续满足原始 home 的无覆盖合同；opaque control/cleanup
         // 边界不能用原始负向 root 标记推导出正向覆盖证明。
-        if last_boundary.is_some_and(|last| last > source_index)
-            || last_home_writes
-                .get(&source_home)
-                .is_some_and(|last| *last > source_index)
-            || last_home_writes
-                .get(&target_home)
-                .is_some_and(|last| *last > copy_index)
+        if !preserves_home(source_index + 1..prefix.len(), source_home)
+            || !preserves_home(copy_index + 1..prefix.len(), target_home)
         {
             continue;
         }
@@ -2225,7 +2270,7 @@ fn record_call_root_overwrite(
     index: usize,
     home: HomeSlotKey,
     eligible: bool,
-    uses: &TempUseEvents,
+    uses: &TempUseEvents<'_>,
     active: &CallValues<'_>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
@@ -2318,108 +2363,153 @@ impl HirVisitor for LocalUseCollector {
 
 pub(super) struct RootLifetimeFacts<'a> {
     stmts: &'a [HirStmt],
-    uses: TempUseEvents,
+    uses: TempUseEvents<'a>,
 }
 
 impl<'a> RootLifetimeFacts<'a> {
-    pub(super) fn new(stmts: &'a [HirStmt]) -> Self {
+    pub(super) fn new(
+        stmts: &'a [HirStmt],
+        facts: &ProtoPromotionFacts,
+        safety: HirExprSafety,
+    ) -> Self {
+        Self::with_events(stmts, facts, safety, None)
+    }
+
+    pub(super) fn with_events(
+        stmts: &'a [HirStmt],
+        facts: &ProtoPromotionFacts,
+        safety: HirExprSafety,
+        block: Option<RootEventBlock<'a>>,
+    ) -> Self {
+        let events = match block {
+            Some(block) => RootEvents::Shared(block.prefix(stmts.len())),
+            None => RootEvents::Owned(Box::new(RootEventIndex::new(stmts, facts, safety))),
+        };
+        let scope = events.block();
+        let gc_fence_indices = collect_gc_fences(stmts, |index, _, temps, locals| {
+            scope.is_gc_fence(index, temps, locals)
+        });
         Self {
             stmts,
-            uses: TempUseEvents::new(stmts),
+            uses: TempUseEvents {
+                events,
+                gc_fence_indices,
+            },
+        }
+    }
+
+    fn stack_writes_at(&self, index: usize) -> RootEventStmt<'_> {
+        self.uses.events.block().stmt(index)
+    }
+}
+
+enum RootEvents<'a> {
+    Shared(RootEventBlock<'a>),
+    Owned(Box<RootEventIndex>),
+}
+
+impl RootEvents<'_> {
+    fn block(&self) -> RootEventBlock<'_> {
+        match self {
+            Self::Shared(block) => *block,
+            Self::Owned(index) => index.root(),
         }
     }
 }
 
-struct TempUseEvents {
-    argument_transfers_by_stmt: Vec<Vec<TempId>>,
-    // 只按 identity 查询，不枚举 hash 顺序；事件顺序由语句扫描固定。
-    by_temp: HashMap<TempId, TempEvents>,
-    reads_by_stmt: Vec<BTreeSet<TempId>>,
+struct TempUseEvents<'a> {
+    events: RootEvents<'a>,
     gc_fence_indices: BTreeSet<usize>,
 }
 
-#[derive(Default)]
-struct TempEvents {
-    reads: Vec<usize>,
-    writes: Vec<usize>,
-    argument_transfers: Vec<usize>,
-}
-
-impl TempUseEvents {
-    fn new(stmts: &[HirStmt]) -> Self {
-        let reads_by_stmt = collect_temp_reads_by_stmt(stmts);
-        let mut by_temp = HashMap::<TempId, TempEvents>::new();
-        for (index, temps) in reads_by_stmt.iter().enumerate() {
-            for temp in temps {
-                by_temp.entry(*temp).or_default().reads.push(index);
-            }
-        }
-
-        let mut argument_transfers_by_stmt = Vec::with_capacity(stmts.len());
-        for (index, stmt) in stmts.iter().enumerate() {
-            let mut collector = TempWriteCollector::default();
-            visit_stmts(std::slice::from_ref(stmt), &mut collector);
-            for temp in collector.temps {
-                by_temp.entry(temp).or_default().writes.push(index);
-            }
-            for temp in &collector.argument_transfers {
-                by_temp
-                    .entry(*temp)
-                    .or_default()
-                    .argument_transfers
-                    .push(index);
-            }
-            argument_transfers_by_stmt.push(collector.argument_transfers);
-        }
-        Self {
-            argument_transfers_by_stmt,
-            by_temp,
-            reads_by_stmt,
-            gc_fence_indices: collect_gc_fence_indices(stmts),
+impl TempUseEvents<'_> {
+    fn argument_transfers_at<I: Iterator<Item = TempId>>(
+        &self,
+        index: usize,
+        facts: &ProtoPromotionFacts,
+        candidate_count: usize,
+        candidates: impl FnOnce() -> I,
+    ) -> BTreeSet<(TempId, usize, HomeSlotKey)> {
+        let events = self.events.block().argument_transfers(index);
+        let transfer = |temp| self.argument_transfer_at(temp, index, facts);
+        if events.len() < candidate_count {
+            events
+                .iter()
+                .filter_map(|(_, temp)| transfer(*temp))
+                .collect()
+        } else {
+            candidates().filter_map(transfer).collect()
         }
     }
 
-    /// 精确配对本快照内唯一的 producer 与 call 参数端点。多写或重复 call token 必须拒绝。
+    /// 只查询已绑定的候选 alias，唯一 producer 和端点仍须在整个 block 域内成立。
+    fn argument_transfer_at(
+        &self,
+        temp: TempId,
+        index: usize,
+        facts: &ProtoPromotionFacts,
+    ) -> Option<(TempId, usize, HomeSlotKey)> {
+        let (producer, site) = self.argument_transfer(temp)?;
+        if site != index {
+            return None;
+        }
+        Some((temp, producer, facts.trusted_temp_home_slot(temp)?))
+    }
+
+    fn argument_transfer(&self, temp: TempId) -> Option<(usize, usize)> {
+        let scope = self.events.block();
+        let events = scope.temp(temp)?;
+        let [producer] = scope.positions(&events.writes) else {
+            return None;
+        };
+        let [site] = scope.positions(&events.argument_transfers) else {
+            return None;
+        };
+        let (producer, site) = (scope.ordinal(*producer), scope.ordinal(*site));
+        (producer < site).then_some((producer, site))
+    }
+
     fn has_argument_transfer(&self, temp: TempId, producer: usize, overwrite: usize) -> bool {
-        let Some(events) = self.by_temp.get(&temp) else {
-            return false;
-        };
-        let [site] = events.argument_transfers.as_slice() else {
-            return false;
-        };
-        events.writes.as_slice() == [producer] && producer < *site && *site <= overwrite
+        self.argument_transfer(temp)
+            .is_some_and(|(origin, site)| origin == producer && site <= overwrite)
     }
 
     fn has_live_read_after(&self, temp: TempId, index: usize) -> bool {
         self.has_live_read_from(temp, index + 1)
     }
 
-    fn live_read_changes(&self) -> Vec<(usize, TempId, bool)> {
-        let mut changes = Vec::new();
-        for (temp, events) in &self.by_temp {
-            for index in events.reads.iter().chain(&events.writes).copied() {
-                let live = self.has_live_read_after(*temp, index);
-                if live != self.has_live_read_from(*temp, index) {
-                    changes.push((index + 1, *temp, live));
-                }
-            }
-        }
-        changes.sort_unstable();
-        changes.dedup();
-        changes
-    }
-
     fn has_live_read_from(&self, temp: TempId, index: usize) -> bool {
-        let Some(events) = self.by_temp.get(&temp) else {
+        let scope = self.events.block();
+        let Some(events) = scope.temp(temp) else {
             return false;
         };
-        let next_read = next_event_at_or_after(Some(&events.reads), index);
-        let next_write = next_event_at_or_after(Some(&events.writes), index);
-        next_read.is_some_and(|read| next_write.is_none_or(|write| read <= write))
+        let read = scope.next(&events.reads, index);
+        let write = scope.next(&events.writes, index);
+        read.is_some_and(|read| write.is_none_or(|write| read <= write))
     }
 
-    fn reads_at(&self, index: usize) -> Option<&BTreeSet<TempId>> {
-        self.reads_by_stmt.get(index)
+    /// boundary 是直属语句之后的位置。一次跳过该语句的全部后代重复事件，
+    /// 只在已绑定 alias 到达该点时计算活性，不预展开未消费的后缀或 temp 域。
+    fn next_read_write_boundary(&self, temp: TempId, after: usize) -> Option<usize> {
+        let scope = self.events.block();
+        let events = scope.temp(temp)?;
+        scope
+            .next(&events.reads, after)
+            .into_iter()
+            .chain(scope.next(&events.writes, after))
+            .min()
+            .map(|index| index + 1)
+    }
+
+    fn has_read_at(&self, temp: TempId, index: usize) -> bool {
+        self.events.block().has_read_at(temp, index)
+    }
+
+    fn has_write_at(&self, temp: TempId, index: usize) -> bool {
+        let scope = self.events.block();
+        scope
+            .temp(temp)
+            .is_some_and(|events| scope.contains(&events.writes, index))
     }
 
     fn has_gc_fence_after(&self, index: usize) -> bool {
@@ -2431,19 +2521,28 @@ impl TempUseEvents {
     }
 }
 
-pub(super) fn collect_gc_fence_indices(stmts: &[HirStmt]) -> BTreeSet<usize> {
-    let mut temp_aliases = BTreeSet::new();
-    let mut local_aliases = BTreeSet::new();
-    let mut fences = BTreeSet::new();
-
-    for (index, stmt) in stmts.iter().enumerate() {
+#[cfg(test)]
+fn collect_gc_fence_indices(stmts: &[HirStmt]) -> BTreeSet<usize> {
+    collect_gc_fences(stmts, |_, stmt, temp_aliases, local_aliases| {
         let mut visitor = GcFenceCollector {
-            temp_aliases: &temp_aliases,
-            local_aliases: &local_aliases,
+            temp_aliases,
+            local_aliases,
             found: false,
         };
         visit_stmts(std::slice::from_ref(stmt), &mut visitor);
-        if visitor.found {
+        visitor.found
+    })
+}
+
+fn collect_gc_fences(
+    stmts: &[HirStmt],
+    mut is_fence: impl FnMut(usize, &HirStmt, &BTreeSet<TempId>, &BTreeSet<LocalId>) -> bool,
+) -> BTreeSet<usize> {
+    let mut temp_aliases = BTreeSet::new();
+    let mut local_aliases = BTreeSet::new();
+    let mut fences = BTreeSet::new();
+    for (index, stmt) in stmts.iter().enumerate() {
+        if is_fence(index, stmt, &temp_aliases, &local_aliases) {
             fences.insert(index);
         }
 
@@ -2493,12 +2592,14 @@ fn value_is_collectgarbage(values: &crate::hir::common::HirValuePack) -> bool {
     )
 }
 
+#[cfg(test)]
 struct GcFenceCollector<'a> {
     temp_aliases: &'a BTreeSet<TempId>,
     local_aliases: &'a BTreeSet<LocalId>,
     found: bool,
 }
 
+#[cfg(test)]
 impl HirVisitor for GcFenceCollector<'_> {
     fn visit_call(&mut self, call: &HirCallExpr) {
         self.found |= matches!(
@@ -2507,13 +2608,6 @@ impl HirVisitor for GcFenceCollector<'_> {
         ) || matches!(&call.callee, HirExpr::TempRef(temp) if self.temp_aliases.contains(temp))
             || matches!(&call.callee, HirExpr::LocalRef(local) if self.local_aliases.contains(local));
     }
-}
-
-fn next_event_at_or_after(events: Option<&Vec<usize>>, index: usize) -> Option<usize> {
-    let events = events?;
-    events
-        .get(events.partition_point(|event| *event < index))
-        .copied()
 }
 
 #[derive(Default)]
@@ -2534,14 +2628,6 @@ impl HirVisitor for TempWriteCollector {
         if let HirLValue::Temp(temp) = lvalue {
             self.temps.push(*temp);
         }
-    }
-}
-
-fn forget_written_known_nil_temps(stmt: &HirStmt, known_nil_temps: &mut BTreeSet<TempId>) {
-    let mut collector = TempWriteCollector::default();
-    visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    for temp in collector.temps {
-        known_nil_temps.remove(&temp);
     }
 }
 
@@ -2602,7 +2688,7 @@ fn direct_call_in_stmt(stmt: &HirStmt) -> Option<&HirCallExpr> {
 struct AllocationRootState<'a> {
     active: &'a mut AllocationHomes,
     lifetimes: &'a mut CallRootLifetimeIndices,
-    uses: &'a TempUseEvents,
+    uses: &'a TempUseEvents<'a>,
 }
 
 fn update_allocation_roots(
@@ -2644,8 +2730,8 @@ fn update_allocation_roots(
             eligible,
         );
     }
-    let allocation_site = source_site.or_else(|| match value {
-        HirExpr::TableConstructor(table) => Some(std::ptr::from_ref(table.as_ref()).addr()),
+    let allocation_site = source_site.or(match value {
+        HirExpr::TableConstructor(_) => Some(AllocationSite(index)),
         _ => None,
     });
     if let Some(allocation_site) = allocation_site {
@@ -2665,7 +2751,7 @@ fn update_allocation_roots(
 fn terminate_allocation_home(
     active: &mut AllocationHomes,
     lifetimes: &mut CallRootLifetimeIndices,
-    uses: &TempUseEvents,
+    uses: &TempUseEvents<'_>,
     index: usize,
     home: HomeSlotKey,
     eligible: bool,
@@ -2680,7 +2766,7 @@ fn record_allocation_root_overwrite(
     index: usize,
     home: HomeSlotKey,
     eligible: bool,
-    uses: &TempUseEvents,
+    uses: &TempUseEvents<'_>,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
     let owner = root.owner;
@@ -2710,6 +2796,7 @@ fn record_allocation_root_overwrite(
     }
 }
 
+#[derive(Default)]
 struct StackWriteSummary {
     homes: BTreeSet<HomeSlotKey>,
     has_unknown_home: bool,
@@ -2717,24 +2804,6 @@ struct StackWriteSummary {
 }
 
 impl StackWriteSummary {
-    fn for_stmt(stmt: &HirStmt, facts: &ProtoPromotionFacts) -> Self {
-        Self::for_stmts(std::slice::from_ref(stmt), facts)
-    }
-
-    fn for_stmts(stmts: &[HirStmt], facts: &ProtoPromotionFacts) -> Self {
-        let mut summary = Self {
-            homes: BTreeSet::new(),
-            has_unknown_home: false,
-            has_boundary: false,
-        };
-        let mut collector = StackWriteCollector {
-            facts,
-            summary: &mut summary,
-        };
-        visit_stmts(stmts, &mut collector);
-        summary
-    }
-
     fn note_home(&mut self, home: Option<HomeSlotKey>) {
         match home {
             Some(home) => {
@@ -2772,8 +2841,6 @@ impl HirVisitor for StackWriteCollector<'_> {
             HirStmt::GlobalDecl(_)
             | HirStmt::Close(_)
             | HirStmt::Return(_)
-            | HirStmt::Break
-            | HirStmt::Continue
             | HirStmt::Goto(_)
             | HirStmt::Label(_) => self.summary.has_boundary = true,
             _ => {}
@@ -2815,6 +2882,14 @@ mod tests {
     use crate::hir::common::{
         HirCallStmt, HirGenericFor, HirGenericForDispatchResult, HirTableConstructor, UpvalueId,
     };
+
+    fn event_index(stmts: &[HirStmt], facts: &ProtoPromotionFacts) -> RootEventIndex {
+        RootEventIndex::new(
+            stmts,
+            facts,
+            HirExprSafety::for_dialect(DecompileDialect::Auto),
+        )
+    }
 
     fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
         HirStmt::Assign(Box::new(HirAssign {
@@ -2866,6 +2941,413 @@ mod tests {
     }
 
     #[test]
+    fn physical_write_ranges_keep_home_and_loop_owner_boundaries() {
+        let home = HomeSlotKey::new(0, 0);
+        let absent = HomeSlotKey::new(0, 1);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(TempId(0), home);
+        let write = assign(HirLValue::Temp(TempId(0)), HirExpr::Nil);
+        let stmts = vec![
+            write.clone(),
+            HirStmt::Block(Box::new(HirBlock {
+                stmts: vec![write.clone(), write],
+            })),
+            HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+                body: HirBlock {
+                    stmts: vec![HirStmt::Break],
+                },
+                cond: HirExpr::Boolean(true),
+                lifetime: Default::default(),
+            })),
+            assign(HirLValue::Temp(TempId(1)), HirExpr::Nil),
+            HirStmt::Continue,
+            HirStmt::Return(Box::new(crate::hir::common::HirReturn {
+                source_instr: None,
+                values: HirValuePack::default(),
+            })),
+        ];
+        let index = event_index(&stmts, &facts);
+        let scope = index.root();
+        // 同一 nested block 内的两次写入只投影为一个直属位置；完整循环拥有 break。
+        for start in 0..=stmts.len() {
+            for end in start..=stmts.len() {
+                let range = start..end;
+                let slice = scope.slice(range.clone());
+                let boundary = range.contains(&4) || range.contains(&5);
+                let unknown = range.contains(&3);
+                let positions = [0, 1]
+                    .into_iter()
+                    .filter(|i| range.contains(i))
+                    .map(|i| i - start)
+                    .collect::<Vec<_>>();
+                assert_eq!(slice.has_boundary(), boundary);
+                assert_eq!(slice.has_unknown_home(), unknown);
+                assert_eq!(slice.preserves_home(absent), !boundary && !unknown);
+                assert_eq!(
+                    slice.preserves_home(home),
+                    !boundary && !unknown && positions.is_empty()
+                );
+                for from in 0..=end - start {
+                    assert_eq!(
+                        slice
+                            .home_write_positions_from(home, from)
+                            .collect::<Vec<_>>(),
+                        positions
+                            .iter()
+                            .copied()
+                            .filter(|i| *i >= from)
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+        assert!(!scope.slice(2..3).has_boundary());
+        let body = scope.stmt(2).child(0);
+        assert!(body.has_boundary());
+        assert!(!body.slice(1..1).has_boundary());
+        assert_eq!(
+            scope
+                .slice(1..4)
+                .slice(0..1)
+                .home_write_positions_from(home, 0)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn root_events_project_nested_reads_and_writes_at_statement_boundaries() {
+        use super::live_read_changes::LiveReadChanges;
+        use crate::hir::simplify::temp_touch::TempReadCollector;
+
+        fn check(stmts: &[HirStmt], facts: &ProtoPromotionFacts, scope: RootEventBlock<'_>) {
+            // 独立的完整 visitor 是旧协议的直接定义；索引不能用 header 顺序替代直属坐标。
+            let events = stmts
+                .iter()
+                .map(|stmt| {
+                    let mut visitor = (TempReadCollector::default(), TempWriteCollector::default());
+                    visit_stmts(std::slice::from_ref(stmt), &mut visitor);
+                    visitor
+                })
+                .collect::<Vec<_>>();
+            for len in 0..=stmts.len() {
+                let snapshot = RootLifetimeFacts::with_events(
+                    &stmts[..len],
+                    facts,
+                    HirExprSafety::for_dialect(DecompileDialect::Auto),
+                    Some(scope),
+                );
+                let projection = scope.prefix(len);
+                for temp in [TempId(0), TempId(1)] {
+                    let touched = |i: usize| {
+                        events[i].0.temps.contains(&temp) || events[i].1.temps.contains(&temp)
+                    };
+                    let live = |from: usize| {
+                        let read = (from..len).find(|&i| events[i].0.temps.contains(&temp));
+                        let write = (from..len).find(|&i| events[i].1.temps.contains(&temp));
+                        read.is_some_and(|read| write.is_none_or(|write| read <= write))
+                    };
+                    for from in 0..=len {
+                        assert_eq!(
+                            projection
+                                .touch_positions_from(temp, from)
+                                .collect::<Vec<_>>(),
+                            (from..len).filter(|&i| touched(i)).collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            projection.has_touch_before(temp, from),
+                            (0..from).any(touched)
+                        );
+                        assert_eq!(
+                            projection.has_touch_from(temp, from),
+                            (from..len).any(touched)
+                        );
+                        for end in 0..=len {
+                            assert_eq!(
+                                projection.has_touch_in(temp, from..end),
+                                (from..end).any(touched)
+                            );
+                        }
+                        assert_eq!(snapshot.uses.has_live_read_from(temp, from), live(from));
+                        let mut queue = LiveReadChanges::default();
+                        queue.schedule(&snapshot.uses, temp, 0);
+                        queue.remove(temp);
+                        assert!(queue.pop_through(&snapshot.uses, len).is_none());
+                        queue.schedule(&snapshot.uses, temp, from);
+                        let expected = ((from + 1)..=len)
+                            .filter(|&at| live(at - 1) != live(at))
+                            .map(|at| (at, temp, live(at)))
+                            .collect::<Vec<_>>();
+                        let actual = std::iter::from_fn(|| queue.pop_through(&snapshot.uses, len))
+                            .collect::<Vec<_>>();
+                        assert_eq!(actual, expected);
+                    }
+                    for (i, (reads, writes)) in events.iter().enumerate().take(len) {
+                        assert_eq!(
+                            projection.reads_any(i, &BTreeSet::from([temp])),
+                            reads.temps.contains(&temp)
+                        );
+                        assert_eq!(
+                            snapshot.uses.has_read_at(temp, i),
+                            reads.temps.contains(&temp)
+                        );
+                        assert_eq!(
+                            snapshot.uses.has_write_at(temp, i),
+                            writes.temps.contains(&temp)
+                        );
+                    }
+                }
+            }
+        }
+
+        let facts = ProtoPromotionFacts::default();
+        for pattern in 0..256 {
+            let stmts = (0..4)
+                .map(|i| {
+                    let flags = (pattern >> (2 * i)) & 3;
+                    assign(
+                        HirLValue::Temp(TempId(usize::from(flags & 2 == 0))),
+                        if flags & 1 != 0 {
+                            HirExpr::TempRef(TempId(0))
+                        } else {
+                            HirExpr::Nil
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let index = event_index(&stmts, &facts);
+            check(&stmts, &facts, index.root());
+            let nested = vec![
+                stmts[0].clone(),
+                HirStmt::Block(Box::new(HirBlock {
+                    stmts: stmts[1..3].to_vec(),
+                })),
+                stmts[3].clone(),
+            ];
+            let index = event_index(&nested, &facts);
+            check(&nested, &facts, index.root());
+            check(&stmts[1..3], &facts, index.root().stmt(1).child(0));
+        }
+    }
+
+    #[test]
+    fn control_head_consumption_rejects_body_writes_in_the_same_group() {
+        let head = TempId(0);
+        let body = TempId(1);
+        let stmts = vec![HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+            body: HirBlock {
+                stmts: vec![assign(HirLValue::Temp(body), HirExpr::Nil)],
+            },
+            cond: HirExpr::TempRef(head),
+            lifetime: Default::default(),
+        }))];
+        let index = event_index(&stmts, &Default::default());
+        let scope = index.root().stmt(0);
+        assert!(scope.consumes_only_control_head(&stmts[0], &BTreeSet::from([head])));
+        assert!(!scope.consumes_only_control_head(&stmts[0], &BTreeSet::from([body])));
+        assert!(!scope.consumes_only_control_head(&stmts[0], &BTreeSet::from([head, body])));
+    }
+
+    #[test]
+    fn root_argument_pairs_keep_occurrence_counts_and_current_scope() {
+        let temp = TempId(0);
+        let home = HomeSlotKey::new(0, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_temp_home_slot_for_test(temp, home);
+        let HirExpr::Call(mut call) = call("consume") else {
+            unreachable!()
+        };
+        call.args.fixed.push(HirExpr::TempRef(temp));
+        call.argument_roots
+            .push(crate::hir::common::HirCallArgumentRoot {
+                producer: temp,
+                argument: 0,
+            });
+        let transfer = HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }));
+        let write = assign(HirLValue::Temp(temp), HirExpr::Nil);
+        let body = vec![write.clone(), transfer.clone(), write.clone()];
+        let stmts = vec![
+            write.clone(),
+            HirStmt::Block(Box::new(HirBlock {
+                stmts: body.clone(),
+            })),
+        ];
+        let index = event_index(&stmts, &facts);
+        let scope = index.root().stmt(1).child(0);
+        let prefix = RootLifetimeFacts::with_events(
+            &body[..2],
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Auto),
+            Some(scope),
+        );
+        assert_eq!(
+            prefix.uses.argument_transfer_at(temp, 1, &facts),
+            Some((temp, 0, home))
+        );
+        let whole = RootLifetimeFacts::with_events(
+            &body,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Auto),
+            Some(scope),
+        );
+        assert!(!whole.uses.has_argument_transfer(temp, 0, 1));
+        for (producer, endpoint) in [
+            (
+                HirStmt::Block(Box::new(HirBlock {
+                    stmts: vec![write.clone(), write.clone()],
+                })),
+                transfer.clone(),
+            ),
+            (
+                write,
+                HirStmt::Block(Box::new(HirBlock {
+                    stmts: vec![transfer.clone(), transfer],
+                })),
+            ),
+        ] {
+            let stmts = vec![producer, endpoint];
+            let snapshot = RootLifetimeFacts::new(
+                &stmts,
+                &facts,
+                HirExprSafety::for_dialect(DecompileDialect::Auto),
+            );
+            assert!(!snapshot.uses.has_argument_transfer(temp, 0, 1));
+        }
+    }
+
+    #[test]
+    fn shared_callee_events_keep_block_local_gc_alias_environment() {
+        let temp = TempId(0);
+        let alias = assign(
+            HirLValue::Temp(temp),
+            HirExpr::GlobalRef(crate::hir::common::HirGlobalRef {
+                key: "collectgarbage".into(),
+            }),
+        );
+        let HirExpr::Call(mut call) = call("unused") else {
+            unreachable!()
+        };
+        call.callee = HirExpr::TempRef(temp);
+        let body = vec![
+            assign(HirLValue::Temp(temp), HirExpr::Nil),
+            call_stmt("observe"),
+        ];
+        let stmts = vec![
+            alias,
+            HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+                body: HirBlock {
+                    stmts: body.clone(),
+                },
+                cond: HirExpr::Call(call),
+                lifetime: Default::default(),
+            })),
+        ];
+        let facts = ProtoPromotionFacts::default();
+        let index = event_index(&stmts, &facts);
+        let outer = RootLifetimeFacts::with_events(
+            &stmts,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Auto),
+            Some(index.root()),
+        );
+        assert_eq!(outer.uses.gc_fence_indices, BTreeSet::from([1]));
+        assert_eq!(
+            outer.uses.gc_fence_indices,
+            collect_gc_fence_indices(&stmts)
+        );
+        let inner = RootLifetimeFacts::with_events(
+            &body,
+            &facts,
+            HirExprSafety::for_dialect(DecompileDialect::Auto),
+            Some(index.root().stmt(1).child(0)),
+        );
+        assert!(inner.uses.gc_fence_indices.is_empty());
+        assert_eq!(inner.uses.gc_fence_indices, collect_gc_fence_indices(&body));
+    }
+
+    #[test]
+    fn local_call_roots_keep_complete_suffix_and_direct_overwrite_epochs() {
+        let local = LocalId(0);
+        let producer = assign(HirLValue::Local(local), call("make"));
+        let read = assign(HirLValue::Temp(TempId(0)), HirExpr::LocalRef(local));
+        let clear = HirStmt::LocalRootRelease(local);
+        let nested_clear = HirStmt::Block(Box::new(HirBlock {
+            stmts: vec![clear.clone()],
+        }));
+        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
+        for (stmts, condition, expected) in [
+            (
+                vec![producer.clone(), call_stmt("observe"), read.clone()],
+                None,
+                false,
+            ),
+            (
+                vec![producer.clone(), read.clone(), call_stmt("observe")],
+                None,
+                true,
+            ),
+            (
+                vec![producer.clone(), clear, call_stmt("observe")],
+                None,
+                false,
+            ),
+            (
+                vec![producer.clone(), call_stmt("observe"), nested_clear, read],
+                None,
+                true,
+            ),
+            (
+                vec![producer.clone(), call_stmt("observe")],
+                Some(HirExpr::LocalRef(local)),
+                false,
+            ),
+            (
+                vec![producer.clone(), call_stmt("collectgarbage")],
+                Some(HirExpr::LocalRef(local)),
+                true,
+            ),
+            (vec![producer], Some(call("observe")), true),
+        ] {
+            let index = RootEventIndex::new(&stmts, &Default::default(), safety);
+            let roots =
+                collect_call_result_local_roots(&stmts, index.root(), condition.as_ref(), safety);
+            assert_eq!(
+                roots,
+                if expected {
+                    BTreeSet::from([local])
+                } else {
+                    BTreeSet::new()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn observation_index_fixes_dialect_and_separates_repeat_header_from_body() {
+        let stmts = vec![HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
+            body: HirBlock {
+                stmts: vec![assign(HirLValue::Temp(TempId(1)), HirExpr::Nil)],
+            },
+            cond: HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
+                op: HirBinaryOpKind::Eq,
+                lhs: HirExpr::TempRef(TempId(0)),
+                rhs: HirExpr::Nil,
+            })),
+            lifetime: Default::default(),
+        }))];
+        for (dialect, expected) in [
+            (DecompileDialect::Lua54, false),
+            (DecompileDialect::Luajit, true),
+        ] {
+            let safety = HirExprSafety::for_dialect(dialect);
+            let index = RootEventIndex::new(&stmts, &Default::default(), safety);
+            assert_eq!(index.root().stmt(0).may_observe_gc_roots(), expected);
+            assert_eq!(stmt_may_observe_gc_roots(&stmts[0], safety), expected);
+            assert!(!index.root().stmt(0).child(0).stmt(0).may_observe_gc_roots());
+        }
+    }
+
+    #[test]
     fn certified_copy_root_call_move_reuses_the_overwritten_home_owner() {
         let producer = TempId(0);
         let endpoint = TempId(1);
@@ -2882,7 +3364,11 @@ mod tests {
         ];
 
         let lifetimes = collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(&stmts),
+            &RootLifetimeFacts::new(
+                &stmts,
+                &facts,
+                HirExprSafety::for_dialect(DecompileDialect::Luau),
+            ),
             &facts,
             RootAnalysisContext {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Luau),
@@ -2919,7 +3405,11 @@ mod tests {
         ];
 
         let lifetimes = collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(&stmts),
+            &RootLifetimeFacts::new(
+                &stmts,
+                &facts,
+                HirExprSafety::for_dialect(DecompileDialect::Luau),
+            ),
             &facts,
             RootAnalysisContext {
                 safety: HirExprSafety::for_dialect(DecompileDialect::Luau),

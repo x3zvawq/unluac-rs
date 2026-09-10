@@ -30,7 +30,9 @@
 mod call_roots;
 mod slot_captures;
 
-use crate::hir::common::{HirExpr, HirMethodSetupProtocolId, HirStmt, LocalId, ParamId, TempId};
+use crate::hir::common::{
+    HirBinding, HirExpr, HirMethodSetupProtocolId, HirStmt, LocalId, ParamId, TempId,
+};
 use crate::structure::{
     BlockRef, Cfg, DataflowFacts, EdgeRef, ForwardRouteKind, GraphFacts, InstrEffect,
     LoopConditionPrefixPlacement, LoopVmProtocol, PhiId, PhiIncomingDisposition, RegionId,
@@ -862,6 +864,17 @@ impl ProtoPromotionFacts {
         self.complete_possible_home_slots(self.possible_temp_home_slots(temp))
     }
 
+    /// 读取 binding 的完整 home；upvalue 属于父 frame，不占当前 proto 的物理槽。
+    /// 这里只投影来源，定义处的隐藏 MOVE 写入仍由相应 write query 单独提供。
+    pub(super) fn complete_binding_home_slots(&self, binding: HirBinding) -> HomeSlots<'_> {
+        match binding {
+            HirBinding::Param(param) => self.complete_param_home_slots(param),
+            HirBinding::Local(local) => self.complete_local_home_slots(local),
+            HirBinding::Temp(temp) => self.complete_temp_home_slots(temp),
+            HirBinding::Upvalue(_) => Cow::Owned(BTreeSet::new()),
+        }
+    }
+
     fn complete_possible_home_slots<'a>(
         &'a self,
         possible: Option<HomeSlots<'a>>,
@@ -1051,32 +1064,32 @@ impl ProtoPromotionFacts {
         )
     }
 
-    fn with_supplemental_write_homes(
-        mut homes: HomeSlots<'_>,
-        writes: BTreeSet<HomeSlotKey>,
-    ) -> HomeSlots<'_> {
+    fn with_supplemental_write_homes<'a>(
+        mut homes: HomeSlots<'a>,
+        writes: HomeSlots<'a>,
+    ) -> HomeSlots<'a> {
         if !writes.is_subset(&homes) {
-            homes.to_mut().extend(writes);
+            if homes.is_empty() {
+                return writes;
+            }
+            homes.to_mut().extend(writes.iter().copied());
         }
         homes
     }
 
-    pub(super) fn supplemental_temp_definition_write_homes(
-        &self,
-        temp: TempId,
-    ) -> BTreeSet<HomeSlotKey> {
-        let mut homes = if self
+    pub(super) fn supplemental_temp_definition_write_homes(&self, temp: TempId) -> HomeSlots<'_> {
+        let homes = if self
             .possible_temp_home_slots(temp)
             .is_some_and(|homes| homes.is_empty())
         {
-            BTreeSet::new()
+            Cow::Owned(BTreeSet::new())
         } else {
             self.trusted_immediate_move_write_homes(temp)
-                .cloned()
+                .map(Cow::Borrowed)
                 .unwrap_or_default()
         };
         if let Some(propagated) = self.propagated_temp_definition_write_homes.get(&temp) {
-            homes.extend(propagated.iter().copied());
+            return Self::with_supplemental_write_homes(homes, Cow::Borrowed(propagated));
         }
         homes
     }
@@ -1084,20 +1097,20 @@ impl ProtoPromotionFacts {
     pub(super) fn supplemental_local_definition_write_homes(
         &self,
         local: LocalId,
-    ) -> BTreeSet<HomeSlotKey> {
+    ) -> HomeSlots<'_> {
         self.propagated_local_definition_write_homes
             .get(&local)
-            .cloned()
+            .map(Cow::Borrowed)
             .unwrap_or_default()
     }
 
     pub(super) fn supplemental_param_definition_write_homes(
         &self,
         param: ParamId,
-    ) -> BTreeSet<HomeSlotKey> {
+    ) -> HomeSlots<'_> {
         self.propagated_param_definition_write_homes
             .get(&param)
-            .cloned()
+            .map(Cow::Borrowed)
             .unwrap_or_default()
     }
 
@@ -1106,6 +1119,9 @@ impl ProtoPromotionFacts {
         param: ParamId,
         homes: BTreeSet<HomeSlotKey>,
     ) {
+        if homes.is_empty() {
+            return;
+        }
         self.propagated_param_definition_write_homes
             .entry(param)
             .or_default()
@@ -1117,6 +1133,9 @@ impl ProtoPromotionFacts {
         local: LocalId,
         homes: BTreeSet<HomeSlotKey>,
     ) {
+        if homes.is_empty() {
+            return;
+        }
         self.propagated_local_definition_write_homes
             .entry(local)
             .or_default()
@@ -1128,6 +1147,9 @@ impl ProtoPromotionFacts {
         temp: TempId,
         homes: BTreeSet<HomeSlotKey>,
     ) {
+        if homes.is_empty() {
+            return;
+        }
         self.propagated_temp_definition_write_homes
             .entry(temp)
             .or_default()
@@ -1184,7 +1206,9 @@ impl ProtoPromotionFacts {
     }
 
     pub(super) fn record_temp_to_local_merge(&mut self, temp: TempId, local: LocalId) {
-        let definition_write_homes = self.supplemental_temp_definition_write_homes(temp);
+        let definition_write_homes = self
+            .supplemental_temp_definition_write_homes(temp)
+            .into_owned();
         self.merge_local_definition_write_homes(local, definition_write_homes);
         self.promoted_local_by_temp.insert(temp, local);
         let source_home = self.trusted_temp_home_slot(temp);
@@ -1241,7 +1265,9 @@ impl ProtoPromotionFacts {
     }
 
     pub(super) fn record_local_to_param_merge(&mut self, local: LocalId, param: ParamId) {
-        let definition_write_homes = self.supplemental_local_definition_write_homes(local);
+        let definition_write_homes = self
+            .supplemental_local_definition_write_homes(local)
+            .into_owned();
         self.merge_param_definition_write_homes(param, definition_write_homes);
         let source_home = self.trusted_local_home_slot(local);
         let target_home = self.trusted_param_home_slot(param);
@@ -2733,6 +2759,70 @@ mod tests {
         LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, MoveInstr, NewTableInstr, RegRange,
         ResultPack, ReturnInstr, ValuePack,
     };
+
+    #[test]
+    fn supplemental_writes_borrow_facts_and_survive_binding_merges() {
+        let temp = TempId(0);
+        let local = LocalId(0);
+        let param = ParamId(0);
+        let immediate = HomeSlotKey::new(1, 0);
+        let propagated = HomeSlotKey::new(2, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts
+            .immediate_move_write_homes
+            .push(BTreeSet::from([immediate]));
+        assert!(matches!(
+            facts.supplemental_temp_definition_write_homes(temp),
+            Cow::Borrowed(_)
+        ));
+        facts.merge_temp_definition_write_homes(temp, BTreeSet::from([propagated]));
+        let union = BTreeSet::from([immediate, propagated]);
+        assert_eq!(*facts.supplemental_temp_definition_write_homes(temp), union);
+        assert_eq!(
+            facts.immediate_move_write_homes[0],
+            BTreeSet::from([immediate])
+        );
+
+        facts.record_temp_to_local_merge(temp, local);
+        facts.record_local_to_param_merge(local, param);
+        assert!(matches!(
+            facts.supplemental_local_definition_write_homes(local),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            *facts.supplemental_param_definition_write_homes(param),
+            union
+        );
+
+        // home-free 或失效的 temp 不再补入原 MOVE；已经交接的定义写仍须保留。
+        facts
+            .possible_temp_homes
+            .insert(temp, Some(BTreeSet::new()));
+        assert_eq!(
+            *facts.supplemental_temp_definition_write_homes(temp),
+            BTreeSet::from([propagated])
+        );
+        facts.invalidate_temp_home(temp);
+        assert_eq!(
+            *facts.supplemental_temp_definition_write_homes(temp),
+            BTreeSet::from([propagated])
+        );
+        assert_eq!(
+            *facts.supplemental_param_definition_write_homes(param),
+            union
+        );
+    }
+
+    #[test]
+    fn empty_definition_writes_do_not_create_propagation_records() {
+        let mut facts = ProtoPromotionFacts::default();
+        facts.merge_temp_definition_write_homes(TempId(0), BTreeSet::new());
+        facts.record_temp_to_local_merge(TempId(0), LocalId(0));
+        facts.record_local_to_param_merge(LocalId(0), ParamId(0));
+        assert!(facts.propagated_temp_definition_write_homes.is_empty());
+        assert!(facts.propagated_local_definition_write_homes.is_empty());
+        assert!(facts.propagated_param_definition_write_homes.is_empty());
+    }
 
     #[test]
     fn physical_home_universe_covers_entry_and_close_epochs() {

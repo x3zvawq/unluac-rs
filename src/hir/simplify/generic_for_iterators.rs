@@ -21,8 +21,7 @@ use crate::hir::common::{
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::{
-    ReferenceCapturedBindings, collect_temp_use_counts, stmts_reference_captured_bindings,
-    stmts_value_captured_bindings,
+    collect_temp_use_counts, stmts_reference_captured_bindings, stmts_value_captured_bindings,
 };
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -379,28 +378,11 @@ impl BindingLocations {
     }
 }
 
-fn captured_binding_homes(
-    captured: &ReferenceCapturedBindings,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let mut homes = BTreeSet::new();
-    for local in &captured.locals {
-        homes.extend(facts.complete_local_home_slots(*local).iter().copied());
-    }
-    for param in &captured.params {
-        homes.extend(facts.complete_param_home_slots(*param).iter().copied());
-    }
-    for temp in &captured.temps {
-        homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
-    }
-    homes
-}
-
 fn iterator_reference_capture_homes(
     block: &HirBlock,
     facts: &ProtoPromotionFacts,
 ) -> BTreeSet<HomeSlotKey> {
-    captured_binding_homes(&stmts_reference_captured_bindings(&block.stmts), facts)
+    stmts_reference_captured_bindings(&block.stmts).complete_home_slots(facts)
 }
 
 fn iterator_tbc_protected_homes(
@@ -441,7 +423,7 @@ fn iterator_value_capture_homes(
     stmts_after_producer: &[HirStmt],
     facts: &ProtoPromotionFacts,
 ) -> BTreeSet<HomeSlotKey> {
-    captured_binding_homes(&stmts_value_captured_bindings(stmts_after_producer), facts)
+    stmts_value_captured_bindings(stmts_after_producer).complete_home_slots(facts)
 }
 
 fn iterator_physical_root_bindings(proto: &HirProto) -> BTreeSet<DirectBinding> {

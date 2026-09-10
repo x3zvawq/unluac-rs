@@ -46,7 +46,7 @@ use super::local_shapes::empty_single_local_decl_binding;
 use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_temp};
 use super::object_flow::RootAnalysisContext;
 use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
-use super::temp_touch::collect_temp_refs_by_stmt;
+use super::temp_touch::collect_temp_touch_positions;
 use super::walk::{HirRewritePass, rewrite_block};
 use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::hir::HirLabelId;
@@ -313,13 +313,7 @@ fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> 
         return Vec::new();
     }
 
-    let refs_by_stmt = collect_temp_refs_by_stmt(&proto.body.stmts);
-    let mut stmt_touch_counts = BTreeMap::<TempId, usize>::new();
-    for temps in &refs_by_stmt {
-        for temp in temps {
-            *stmt_touch_counts.entry(*temp).or_default() += 1;
-        }
-    }
+    let temp_touches = collect_temp_touch_positions(&proto.body.stmts);
 
     let mut exposed_temps = Vec::new();
     let inline_dispositions = &proto.inline_dispositions;
@@ -335,7 +329,7 @@ fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> 
         }
         let guards_are_mechanical = guards.iter().all(|guard| {
             // 候选拒绝[SemanticBarrier:ValueFlow]：guard 若还被其它根语句读取，删除其赋值会留下未定义/旧 epoch 的 temp 读取。
-            stmt_touch_counts.get(guard) == Some(&1)
+            temp_touches.span(guard).is_some_and(|(first, last)| first == last)
                 // 候选拒绝[SemanticBarrier:DebugScope]：带 debug-local identity 的 temp 是 IR 已保留的源码 binding，HIR 值折叠不能删除。
                 && proto
                     .temp_debug_locals

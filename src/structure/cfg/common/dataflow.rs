@@ -503,6 +503,44 @@ impl DataflowFacts {
         }
         false
     }
+
+    /// 指令窗口内指定槽域的 live phi 闭包：全部输入和输出都留在窗口内。
+    /// 直接检查每个 phi 的邻接边即可覆盖环，不为每个定义重复遍历同一循环。
+    /// 这只证明 SSA 身份不跨界；调用方仍须证明物理 home 的退休与发射位置。
+    pub(crate) fn closed_phis_in_instruction_window(
+        &self,
+        cfg: &Cfg,
+        window: Range<usize>,
+        floor: Reg,
+    ) -> Option<BTreeSet<PhiId>> {
+        let phis = cfg.instr_to_block[window.clone()]
+            .chunk_by(|a, b| a == b)
+            .flat_map(|run| self.phi_candidates_in_block(run[0]))
+            .filter(|phi| {
+                phi.reg >= floor
+                    && !self.phi_is_truly_dead(phi.id)
+                    && window.contains(&cfg.blocks[phi.block.index()].instrs.start.index())
+            })
+            .map(|phi| phi.id)
+            .collect::<BTreeSet<_>>();
+        for &id in &phis {
+            let phi = self.phi_candidate(id)?;
+            if phi.incoming.iter().any(|incoming| match incoming.value {
+                SsaValue::Entry(_) => true,
+                SsaValue::Def(def) => !window.contains(&self.def_instr(def).index()),
+                SsaValue::Phi(source) => !phis.contains(&source),
+            }) || self.phi_uses[id.index()]
+                .iter()
+                .any(|site| !window.contains(&site.instr.index()))
+                || self.phi_phi_uses[id.index()]
+                    .iter()
+                    .any(|&target| !self.phi_is_truly_dead(target) && !phis.contains(&target))
+            {
+                return None;
+            }
+        }
+        Some(phis)
+    }
 }
 
 /// 一条 low-IR 指令在数据流层的固定/开放读写摘要。
@@ -642,8 +680,15 @@ impl RootObservation {
 
     /// 专用于普通调用的 collective 证明；不能把前缀下界当作排除上界。
     pub fn excludes_homes_from_caller(self, homes: &BTreeSet<Reg>) -> bool {
-        matches!(self, Self::Call { caller_end }
-            if homes.iter().all(|home| home.index() >= caller_end.index()))
+        matches!(self, Self::Call { .. })
+            && homes
+                .iter()
+                .all(|&home| self.excludes_home_from_caller(home))
+    }
+
+    /// 调用已把该槽移出 caller 的根域；不依赖槽中值的类型，也不表示参数没有 callee 根。
+    pub fn excludes_home_from_caller(self, home: Reg) -> bool {
+        matches!(self, Self::Call { caller_end } if home >= caller_end)
     }
 }
 

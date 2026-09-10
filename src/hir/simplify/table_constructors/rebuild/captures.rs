@@ -5,7 +5,7 @@
 //! 例如字段 closure 捕获的 Local 若只由被删除 producer 声明，则拒绝该构造器事务；
 //! 参数及 upvalue 的存活不由本事务签发。这里不重建字段顺序或 capture 来源。
 
-use super::super::bindings::binding_from_capture;
+use super::super::bindings::binding_from_identity;
 use super::*;
 use crate::hir::visit::any_expr;
 
@@ -34,7 +34,7 @@ pub(super) fn binding_is_recursive_closure_slot(
     closure
         .captures
         .iter()
-        .any(|capture| binding_from_capture(capture.binding) == Some(binding))
+        .any(|capture| binding_from_identity(capture.binding) == Some(binding))
 }
 
 pub(super) fn expr_captures_orphaned_binding(
@@ -64,7 +64,7 @@ fn capture_is_orphaned(
     materialized_binding_counts: &[u32],
     removed_materializations: &[u32],
 ) -> bool {
-    let Some(binding) = binding_from_capture(capture.binding) else {
+    let Some(binding) = binding_from_identity(capture.binding) else {
         return false;
     };
     let Some(binding_id) = binding_index.id_of(binding) else {

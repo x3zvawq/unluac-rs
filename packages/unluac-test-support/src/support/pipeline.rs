@@ -830,6 +830,7 @@ fn run_proto_failure_recovery_contract(
         .state
         .hir
         .ok_or_else(|| proto_failure_contract_failure(entry, "HIR baseline returned no module"))?;
+    verify_proto_body_preparation_contract(entry, &module)?;
     let entry_ref = module.entry;
     let root = module.protos.get_mut(entry_ref.index()).ok_or_else(|| {
         proto_failure_contract_failure(entry, "HIR entry references a missing proto")
@@ -935,6 +936,167 @@ fn run_proto_failure_recovery_contract(
     }
 
     Ok(baseline)
+}
+
+/// 从同一官方源码的 HIR 检查准备阶段与 occurrence 消费阶段的边界；错误不得因预分析而提前。
+fn verify_proto_body_preparation_contract(
+    entry: &LuaCaseManifestEntry,
+    original: &unluac::hir::HirModule,
+) -> Result<(), TestFailure> {
+    use unluac::ast::{AstExpr, AstStmt, AstTargetDialect, lower_ast};
+    use unluac::hir::{
+        HirBlock, HirClosureExpr, HirExitRequirement, HirExpr, HirProtoRef, HirReturn, HirStmt,
+        HirTableSetList, HirValuePack,
+    };
+
+    let fail = |detail: String| proto_failure_contract_failure(entry, detail);
+    let target = AstTargetDialect::new(entry.dialect.decompile_dialect());
+    let expect_error = |module: &unluac::hir::HirModule, expected: AstLowerError| match lower_ast(
+        module,
+        target,
+        GenerateMode::Strict,
+    ) {
+        Err(actual)
+            if std::mem::discriminant(&actual) == std::mem::discriminant(&expected)
+                && actual.to_string() == expected.to_string() =>
+        {
+            Ok(())
+        }
+        actual => Err(fail(format!(
+            "body preparation expected {expected:?}, got {actual:?}"
+        ))),
+    };
+    let root = original.entry.index();
+    let child = original
+        .protos
+        .get(root)
+        .and_then(|proto| proto.children.first())
+        .copied()
+        .ok_or_else(|| fail("body preparation fixture needs a direct child".into()))?;
+    let missing = HirProtoRef(original.protos.len());
+    let closure = |proto| {
+        HirExpr::Closure(Box::new(HirClosureExpr {
+            proto,
+            captures: Vec::new(),
+        }))
+    };
+    let return_values = |values| {
+        HirStmt::Return(Box::new(HirReturn {
+            source_instr: None,
+            values: HirValuePack::fixed(values),
+        }))
+    };
+    let residual = || {
+        HirStmt::TableSetList(Box::new(HirTableSetList {
+            base: HirExpr::Nil,
+            start_index: 1,
+            values: HirValuePack::fixed(Vec::new()),
+        }))
+    };
+    let residual_error = |proto| AstLowerError::ResidualHir {
+        proto,
+        kind: "table-set-list",
+    };
+
+    let mut module = original.clone();
+    module.protos[root].body.stmts = vec![residual(), return_values(vec![closure(missing)])];
+    expect_error(&module, residual_error(root))?;
+    module.protos[root].body.stmts.remove(0);
+    expect_error(
+        &module,
+        AstLowerError::MissingChildProto {
+            proto: root,
+            child: missing.index(),
+        },
+    )?;
+
+    module.protos[root].body.stmts = vec![return_values(vec![closure(child)])];
+    let child_proto = &mut module.protos[child.index()];
+    child_proto.body.stmts = vec![residual()];
+    child_proto.signature.has_vararg_param_reg = true;
+    child_proto.signature.legacy_arg_slot = false;
+    child_proto.vararg_param_local = None;
+    expect_error(&module, residual_error(child.index()))?;
+    module.protos[child.index()].body = HirBlock::default();
+    expect_error(
+        &module,
+        AstLowerError::MissingNamedVarargBinding {
+            proto: child.index(),
+        },
+    )?;
+
+    // 不可达 body 的坏节点和缺失入口绑定不发布；全模块 exit requirements 仍必须先行。
+    module.protos[root].body.stmts = vec![return_values(vec![HirExpr::Nil])];
+    module.protos[child.index()].body.stmts =
+        vec![residual(), return_values(vec![closure(missing)])];
+    lower_ast(&module, target, GenerateMode::Strict)
+        .map_err(|error| fail(format!("unreachable bad body leaked an error: {error}")))?;
+    module.protos[child.index()]
+        .exit_requirements
+        .push(HirExitRequirement::UnresolvedValue {
+            source_proto: child.index(),
+            phi: 17,
+            block: 23,
+            register: 5,
+        });
+    module.protos[root].body.stmts.insert(0, residual());
+    expect_error(
+        &module,
+        AstLowerError::UnresolvedHirValue {
+            proto: child.index(),
+            phi: 17,
+            block: 23,
+            register: 5,
+        },
+    )?;
+
+    // 同一个真实 child 的两次引用必须得到完整、各自拥有的 AST body。
+    let mut module = original.clone();
+    module.protos[root].body.stmts = vec![return_values(vec![closure(child)])];
+    let single = lower_ast(&module, target, GenerateMode::Strict)
+        .map_err(|error| fail(format!("single child lowering failed: {error}")))?;
+    let [AstStmt::Return(single_return)] = single.body.stmts.as_slice() else {
+        return Err(fail(
+            "single child fixture did not lower to one return".into(),
+        ));
+    };
+    let [AstExpr::FunctionExpr(expected)] = single_return.values.as_slice() else {
+        return Err(fail(
+            "single child fixture lost its function expression".into(),
+        ));
+    };
+    if expected.body.stmts.is_empty() {
+        return Err(fail(
+            "shared child fixture must have a nonempty body".into(),
+        ));
+    }
+    module.protos[root].body.stmts = vec![return_values(vec![closure(child), closure(child)])];
+    let mut shared = lower_ast(&module, target, GenerateMode::Strict)
+        .map_err(|error| fail(format!("repeated child lowering failed: {error}")))?;
+    let [AstStmt::Return(shared_return)] = shared.body.stmts.as_mut_slice() else {
+        return Err(fail(
+            "repeated child fixture did not lower to one return".into(),
+        ));
+    };
+    let [AstExpr::FunctionExpr(first), AstExpr::FunctionExpr(second)] =
+        shared_return.values.as_mut_slice()
+    else {
+        return Err(fail(
+            "repeated child fixture lost a function occurrence".into(),
+        ));
+    };
+    if first.as_ref() != expected.as_ref() || second.as_ref() != expected.as_ref() {
+        return Err(fail(
+            "repeated child bodies differ from independent lowering".into(),
+        ));
+    }
+    first.body.stmts.clear();
+    if second.as_ref() != expected.as_ref() {
+        return Err(fail(
+            "mutating one child body changed another occurrence".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn proto_failure_contract_failure(

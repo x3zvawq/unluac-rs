@@ -167,4 +167,112 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_523_lua55_global_missing_promotion.lua",
         &[LuaCaseDialect::Lua55],
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_524_debug_scope_object_cohort.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_524_debug_scope_object_cohort.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_525_debug_scope_lookup_root.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_525_debug_scope_lookup_root.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_526_call_argument_root_handoff.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_526_call_argument_root_handoff.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_527_debug_scope_across_branch.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_527_debug_scope_across_branch.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_528_debug_scope_loop_windows.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_528_debug_scope_loop_windows.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_529_repeat_parenthesized_call_separator.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_529_repeat_parenthesized_call_separator.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_530_debug_scope_numeric_for.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_530_debug_scope_numeric_for.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_531_debug_scope_generic_for.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_531_debug_scope_generic_for.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_532_debug_scope_generic_for_close.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_532_debug_scope_generic_for_close.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
 ];

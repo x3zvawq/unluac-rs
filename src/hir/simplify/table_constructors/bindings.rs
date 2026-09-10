@@ -5,6 +5,7 @@
 //! 例如：`t[k] = v` 会在这里识别 `t` 的绑定身份，并把 `k` 作为普通语义表达式统计；
 //! 键最终能否写成 `name = value` 不属于 HIR binding facts。
 //! capture 从类型化父级身份投影到构造器的 Temp/Local 域，两种捕获模式均保留物化依赖。
+//! 物化次数消费共享逻辑写事件；捕获集合独立累积，不把 root release 当作物理槽覆盖。
 
 use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Unbounded};
@@ -12,29 +13,19 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::hir::common::{HirBinding, HirCapture, HirExpr, HirLValue, HirStmt};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
+use super::super::mention::BindingWriteCollector;
 use super::{BindingId, TableBinding};
 use crate::hir::visit::{HirVisitor, visit_block, visit_stmts};
 
 pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<TableBinding> {
-    match lvalue {
-        HirLValue::Temp(temp) => Some(TableBinding::Temp(*temp)),
-        HirLValue::Local(local) => Some(TableBinding::Local(*local)),
-        HirLValue::Param(_)
-        | HirLValue::Upvalue(_)
-        | HirLValue::Global(_)
-        | HirLValue::TableAccess(_) => None,
-    }
+    HirBinding::from_lvalue(lvalue).and_then(binding_from_identity)
 }
 
 pub(super) fn binding_from_expr(expr: &HirExpr) -> Option<TableBinding> {
-    match expr {
-        HirExpr::TempRef(temp) => Some(TableBinding::Temp(*temp)),
-        HirExpr::LocalRef(local) => Some(TableBinding::Local(*local)),
-        _ => None,
-    }
+    HirBinding::from_expr(expr).and_then(binding_from_identity)
 }
 
-pub(super) fn binding_from_capture(binding: HirBinding) -> Option<TableBinding> {
+pub(super) fn binding_from_identity(binding: HirBinding) -> Option<TableBinding> {
     match binding {
         HirBinding::Temp(temp) => Some(TableBinding::Temp(temp)),
         HirBinding::Local(local) => Some(TableBinding::Local(local)),
@@ -68,15 +59,24 @@ pub(super) fn collect_binding_facts(
     temp_count: usize,
     local_count: usize,
 ) -> BindingFacts {
-    let mut collector = BindingFactCollector {
+    let mut materialized = BindingSlots::new(temp_count, local_count);
+    let collector = BindingCaptureCollector {
         promotion_facts,
-        materialized: BindingSlots::new(temp_count, local_count),
         reference_captured: BindingSlots::new(temp_count, local_count),
         reference_captured_home_slots: BTreeSet::new(),
     };
-    visit_block(block, &mut collector);
+    let mut pair = (
+        BindingWriteCollector(|binding| {
+            if let Some(binding) = binding_from_identity(binding) {
+                increment_materialized_count(&mut materialized, binding);
+            }
+        }),
+        collector,
+    );
+    visit_block(block, &mut pair);
+    let collector = pair.1;
     BindingFacts {
-        materialized: collector.materialized,
+        materialized,
         reference_captured: collector.reference_captured,
         reference_captured_home_slots: collector.reference_captured_home_slots,
     }
@@ -359,69 +359,18 @@ impl BindingUseSummary<'_> {
     }
 }
 
-struct BindingFactCollector<'a> {
+struct BindingCaptureCollector<'a> {
     promotion_facts: &'a ProtoPromotionFacts,
-    materialized: BindingSlots<u32>,
     // The table pass must preserve both by-reference cells and by-value snapshots.  A
     // constructor rewrite can otherwise move a declaration before a closure observes it.
     reference_captured: BindingSlots<bool>,
     reference_captured_home_slots: BTreeSet<HomeSlotKey>,
 }
 
-impl HirVisitor for BindingFactCollector<'_> {
-    fn visit_stmt(&mut self, stmt: &HirStmt) {
-        match stmt {
-            HirStmt::LocalRootRelease(local) => {
-                increment_materialized_count(&mut self.materialized, TableBinding::Local(*local))
-            }
-            HirStmt::LocalDecl(local_decl) => {
-                for binding in &local_decl.bindings {
-                    increment_materialized_count(
-                        &mut self.materialized,
-                        TableBinding::Local(*binding),
-                    );
-                }
-            }
-            HirStmt::Assign(assign) => {
-                for target in &assign.targets {
-                    if let Some(binding) = binding_from_lvalue(target) {
-                        increment_materialized_count(&mut self.materialized, binding);
-                    }
-                }
-            }
-            HirStmt::NumericFor(numeric_for) => increment_materialized_count(
-                &mut self.materialized,
-                TableBinding::Local(numeric_for.binding),
-            ),
-            HirStmt::GenericFor(generic_for) => {
-                for binding in &generic_for.bindings {
-                    increment_materialized_count(
-                        &mut self.materialized,
-                        TableBinding::Local(*binding),
-                    );
-                }
-            }
-            HirStmt::TableSetList(_)
-            | HirStmt::GlobalDecl(_)
-            | HirStmt::ErrNil(_)
-            | HirStmt::ToBeClosed(_)
-            | HirStmt::Close(_)
-            | HirStmt::CallStmt(_)
-            | HirStmt::Return(_)
-            | HirStmt::If(_)
-            | HirStmt::While(_)
-            | HirStmt::Repeat(_)
-            | HirStmt::Block(_)
-            | HirStmt::Break
-            | HirStmt::Continue
-            | HirStmt::Goto(_)
-            | HirStmt::Label(_) => {}
-        }
-    }
-
+impl HirVisitor for BindingCaptureCollector<'_> {
     fn visit_capture(&mut self, capture: &HirCapture) {
         // 两种 capture 都依赖父级物化身份；ByValue 也不能随 producer 删除而变成孤儿。
-        if let Some(binding) = binding_from_capture(capture.binding) {
+        if let Some(binding) = binding_from_identity(capture.binding) {
             *self.reference_captured.get_mut_or_default(binding) = true;
             if let Some(slot) = binding_home_slot(binding, self.promotion_facts) {
                 self.reference_captured_home_slots.insert(slot);

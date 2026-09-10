@@ -20,12 +20,14 @@ pub(crate) struct DfsTraversal<N> {
     pub(crate) postorder: Vec<N>,
 }
 
+/// 每个可达可见节点仅在首次访问时请求相邻项，调用方可同时发布该节点的快照事实。
+/// 相邻项可拥有其存储；重复边保留原顺序，但不导致重复构造节点。
 pub(crate) fn depth_first<N: Copy, I: IntoIterator<Item = N>>(
     node_count: usize,
     root: N,
     index: impl Fn(N) -> usize,
     visible: impl Fn(N) -> bool,
-    successors: impl Fn(N) -> I,
+    mut successors: impl FnMut(N) -> I,
 ) -> DfsTraversal<N> {
     let mut traversal = DfsTraversal {
         preorder: Vec::with_capacity(node_count),
@@ -86,4 +88,30 @@ pub(crate) fn strongly_connected_components<N: Copy, I: IntoIterator<Item = N>>(
         components.push(component);
     }
     components
+}
+
+#[cfg(test)]
+mod tests {
+    use super::depth_first;
+
+    #[test]
+    fn depth_first_requests_owned_edges_once_per_reachable_visible_node() {
+        let mut edges = [vec![1, 1, 4], vec![2, 0], vec![], vec![0], vec![]];
+        let mut requested = Vec::new();
+        let traversal = depth_first(
+            edges.len(),
+            0,
+            |node| node,
+            |node| node < 4,
+            |node| {
+                requested.push(node);
+                std::mem::take(&mut edges[node])
+            },
+        );
+        assert_eq!(requested, vec![0, 1, 2]);
+        assert_eq!(traversal.preorder, vec![0, 1, 2]);
+        assert_eq!(traversal.postorder, vec![2, 1, 0]);
+        assert_eq!(traversal.parent, vec![None, Some(0), Some(1), None, None]);
+        assert_eq!(edges[3], vec![0]);
+    }
 }

@@ -57,14 +57,11 @@ use super::mention::{
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
-    CallRootLifetimeIndices, RootLifetimeFacts, collect_call_result_local_roots,
-    collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes, exact_multi_call_home_targets,
-    stmt_has_argument_root_handoff,
+    CallRootLifetimeIndices, RootEventBlock, RootEventIndex, RootEventStmt, RootLifetimeFacts,
+    collect_call_result_local_roots, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
+    exact_multi_call_home_targets, stmt_has_argument_root_handoff,
 };
-use super::temp_touch::{
-    TempRefScopeTracker, TempTouchIndex, collect_temp_reads_by_stmt, collect_temp_refs_by_stmt,
-    collect_temp_refs_in_expr, expr_touches_any_temp, stmt_consumes_temps_only_in_control_head,
-};
+use super::temp_touch::{collect_temp_refs_in_expr, expr_touches_any_temp};
 use crate::hir::common::{
     HirAssign, HirBlock, HirExpr, HirInitializerMergeTransactionId, HirLValue, HirLocalDecl,
     HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, TempId,
@@ -96,6 +93,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     identity_sensitive_temps.extend(to_be_closed_temps.iter().copied());
     let mut cell_sensitive_temps = reference_captured_temps;
     cell_sensitive_temps.extend(to_be_closed_temps.iter().copied());
+    let event_index = RootEventIndex::new(&proto.body.stmts, facts, roots.safety);
     let result = {
         let mut ctx = PromotionCtx {
             proto_id: proto.id,
@@ -121,6 +119,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         promote_block(
             &mut ctx,
             &mut proto.body,
+            event_index.root(),
             &empty_mapping,
             &BTreeMap::new(),
             &|_| false,
@@ -383,6 +382,7 @@ impl PlanAllocator<'_> {
 fn promote_block(
     ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
+    event_block: RootEventBlock<'_>,
     inherited: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
@@ -391,6 +391,7 @@ fn promote_block(
     promote_block_with_protection(
         ctx,
         block,
+        event_block,
         inherited,
         inherited_sticky_slots,
         outer_uses_temp,
@@ -411,6 +412,7 @@ struct BlockProtection<'a> {
 fn promote_block_with_protection(
     ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
+    event_block: RootEventBlock<'_>,
     inherited: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
@@ -419,21 +421,17 @@ fn promote_block_with_protection(
     ctx.physical_root_locals
         .extend(collect_call_result_local_roots(
             &block.stmts,
+            event_block,
             protection.trailing_root_condition,
             ctx.roots.safety,
         ));
-
-    // 每轮控制头等 block 外消费者先保护当前 block；递归进入子作用域时再叠加当前语句
-    // 之外的引用。tracker 维护前缀集合和后缀计数，避免按 index 克隆完整集合。
-    let stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
-    let mut temp_refs = TempRefScopeTracker::new(&stmt_temp_refs);
 
     let block_uses_outer_temp =
         |temp| outer_uses_temp(temp) || protection.current_plan_temps.contains(&temp);
     let plans = collect_plans(
         ctx,
         block,
-        &stmt_temp_refs,
+        event_block,
         inherited.as_ref(),
         inherited_sticky_slots,
         &block_uses_outer_temp,
@@ -471,7 +469,6 @@ fn promote_block_with_protection(
     let mut rewritten = Vec::with_capacity(original_stmts.len());
 
     for (index, mut stmt) in original_stmts.into_iter().enumerate() {
-        temp_refs.enter_stmt(index);
         append_root_releases(index, true, &mut rewritten);
         let mut replaced_stmt = false;
         let mut batched_decl_output_index = None;
@@ -532,22 +529,21 @@ fn promote_block_with_protection(
         );
         if replaced_stmt {
             append_root_releases(index, false, &mut rewritten);
-            temp_refs.leave_stmt(index);
             continue;
         }
 
         if removable.contains(&index) {
-            temp_refs.leave_stmt(index);
             continue;
         }
 
         // 候选拒绝[SemanticBarrier:Scope]：前缀读取可经 goto 回边重访；regress_485 中
         // 子块若把 `next=1; state=next` 合并成新 local，会让外层始终读取入口 state。
+        // 查询原快照：前缀中已删除或替换的语句仍属于本轮外层保护，不按 rewritten 缩域。
         let child_uses_outer_temp = |temp| {
             block_uses_outer_temp(temp)
                 || protection.descendant_temps.contains(&temp)
-                || temp_refs.prefix_contains(temp)
-                || temp_refs.suffix_contains(temp)
+                || event_block.has_touch_before(temp, index)
+                || event_block.has_touch_from(temp, index + 1)
         };
         let stmt_changed = rewrite_stmt(
             ctx,
@@ -555,6 +551,7 @@ fn promote_block_with_protection(
             &mapping,
             &active_sticky_slots,
             &child_uses_outer_temp,
+            event_block.stmt(index),
         );
         changed |= stmt_changed;
         if let Some(decl_index) = batched_decl_output_index {
@@ -565,12 +562,10 @@ fn promote_block_with_protection(
         }
         changed |= prune_binding_self_assigns(&mut stmt);
         if matches!(&stmt, HirStmt::Assign(assign) if assign.targets.is_empty()) {
-            temp_refs.leave_stmt(index);
             continue;
         }
         rewritten.push(stmt);
         append_root_releases(index, false, &mut rewritten);
-        temp_refs.leave_stmt(index);
     }
 
     block.stmts = rewritten;
@@ -637,7 +632,7 @@ fn certify_batched_initializer_merge_transaction(
 fn collect_plans(
     ctx: &mut PromotionCtx<'_>,
     block: &HirBlock,
-    stmt_temp_refs: &[BTreeSet<TempId>],
+    event_block: RootEventBlock<'_>,
     inherited: &BTreeMap<TempId, LocalId>,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
@@ -657,10 +652,9 @@ fn collect_plans(
     let facts = ctx.facts;
     let temp_debug_locals = ctx.temp_debug_locals;
     let temp_debug_scopes = ctx.temp_debug_scopes;
-    let stmt_temp_reads = collect_temp_reads_by_stmt(&block.stmts);
     let mut plans = Vec::new();
-    let temp_touches = TempTouchIndex::from_sets(stmt_temp_refs);
-    let lifetime_snapshot = RootLifetimeFacts::new(lifetime_stmts);
+    let lifetime_snapshot =
+        RootLifetimeFacts::with_events(lifetime_stmts, facts, ctx.roots.safety, Some(event_block));
     let call_root_lifetimes = collect_call_root_lifetimes(
         &lifetime_snapshot,
         facts,
@@ -923,7 +917,7 @@ fn collect_plans(
                 let group = BTreeSet::from([*temp]);
                 if current_slot_locals.get(&home) != Some(&local)
                     || outer_uses_temp(*temp)
-                    || temp_touches.has_before(temp, decl_index)
+                    || event_block.has_touch_before(*temp, decl_index)
                     || has_label_flow
                 {
                     // debug scope 身份不代表当前 HIR 声明可见；也不能只改子块的写入，
@@ -954,8 +948,8 @@ fn collect_plans(
             && targets.iter().all(|(temp, _)| {
                 !ctx.to_be_closed_temps.contains(temp)
                     && !outer_uses_temp(*temp)
-                    && !temp_touches.has_before(temp, decl_index)
-                    && !stmt_temp_reads[decl_index].contains(temp)
+                    && !event_block.has_touch_before(*temp, decl_index)
+                    && !event_block.has_read_at(*temp, decl_index)
             })
         {
             // 完整返回组共用一次求值；只物化其中一个目标会丢失其余目标的后续 home 端点。
@@ -1005,7 +999,7 @@ fn collect_plans(
             // 已被祖先映射或当前 plan 认领的 temp 不再形成新候选。
             continue;
         }
-        if temp_touches.has_before(&root_temp, decl_index) {
+        if event_block.has_touch_before(root_temp, decl_index) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：backedge/goto 可让文本前方读取同一
             // TempId 的入口或上一轮值；在此定义点新建 local 会把该读取切到未初始化 binding。
             continue;
@@ -1025,7 +1019,7 @@ fn collect_plans(
             root_temp,
             facts,
             &is_reserved,
-            &temp_touches,
+            event_block,
         );
 
         if has_label_flow {
@@ -1179,7 +1173,7 @@ fn collect_plans(
             && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
             && std::iter::once(decl_index)
                 .chain(touching_stmt_indices.iter().copied())
-                .all(|index| stmt_temp_reads[index].is_disjoint(&group))
+                .all(|index| !event_block.reads_any(index, &group))
         {
             // 只有写 touch、没有表达式读取的链不承载可恢复的
             // 跨语句 binding。dead-temps 仍按自己的 discard-safe/raw-home 合同清理可删写入；
@@ -1198,7 +1192,10 @@ fn collect_plans(
             // 捕获 local 的重绑定值，仍按原规则保守提升。
             if touching_stmt_indices.len() == 1 {
                 let use_stmt = &block.stmts[first_touch_index.expect("single touch must exist")];
-                if stmt_consumes_temps_only_in_control_head(use_stmt, &group) {
+                if event_block
+                    .stmt(first_touch_index.unwrap())
+                    .consumes_only_control_head(use_stmt, &group)
+                {
                     // 候选拒绝[PolicyBoundary]：只在控制头消费一次的匿名 temp 保持低密度展示；这不是运行语义边界。
                     continue;
                 }
@@ -1313,7 +1310,7 @@ fn collect_plans(
         let mut merge_temps = branch_merge::candidate_temps(
             &block.stmts,
             stmt,
-            &temp_touches,
+            event_block,
             decl_index,
             &is_reserved,
             ctx.roots.safety,
@@ -1432,13 +1429,13 @@ fn collect_promotion_group(
     root_temp: TempId,
     facts: &ProtoPromotionFacts,
     is_reserved: &dyn Fn(TempId) -> bool,
-    temp_touches: &TempTouchIndex,
+    event_block: RootEventBlock<'_>,
 ) -> PromotionGroup {
     let mut temps = BTreeSet::from([root_temp]);
     let mut removable_aliases = BTreeSet::new();
     let mut touching_stmt_indices = BTreeSet::new();
     let mut pending_indices = BTreeSet::new();
-    pending_indices.extend(temp_touches.positions_from(&root_temp, decl_index + 1));
+    pending_indices.extend(event_block.touch_positions_from(root_temp, decl_index + 1));
 
     while let Some(future_index) = pending_indices.pop_first() {
         if removable_aliases.contains(&future_index) {
@@ -1467,12 +1464,12 @@ fn collect_promotion_group(
                 // `next = f(carried); carried = next` 是 loop 回边写回，不是可删除
                 // alias。若 alias 的旧值已在 root 定义语句中参与求值，合并二者会删掉
                 // 下一轮所需的写回，只留下每轮都读取入口 seed 的局部变量。
-                && temp_touches.last_in(alias_temp, decl_index..future_index).is_none()
+                && !event_block.has_touch_in(*alias_temp, decl_index..future_index)
         });
         if let Some(alias_temp) = alias {
             temps.insert(alias_temp);
             removable_aliases.insert(future_index);
-            pending_indices.extend(temp_touches.positions_from(&alias_temp, future_index + 1));
+            pending_indices.extend(event_block.touch_positions_from(alias_temp, future_index + 1));
         } else {
             touching_stmt_indices.insert(future_index);
         }
@@ -1992,6 +1989,7 @@ fn rewrite_stmt(
     mapping: &LocalMapping,
     sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
+    event_stmt: RootEventStmt<'_>,
 ) -> bool {
     match stmt {
         HirStmt::LocalRootRelease(_) => false,
@@ -2028,13 +2026,22 @@ fn rewrite_stmt(
             let then_changed = promote_block(
                 ctx,
                 &mut if_stmt.then_block,
+                event_stmt.child(0),
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
             )
             .changed;
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|else_block| {
-                promote_block(ctx, else_block, mapping, sticky_slots, outer_uses_temp).changed
+                promote_block(
+                    ctx,
+                    else_block,
+                    event_stmt.child(1),
+                    mapping,
+                    sticky_slots,
+                    outer_uses_temp,
+                )
+                .changed
             });
             cond_changed || then_changed || else_changed
         }
@@ -2045,6 +2052,7 @@ fn rewrite_stmt(
             let body_changed = promote_block_with_protection(
                 ctx,
                 &mut while_stmt.body,
+                event_stmt.child(0),
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
@@ -2066,6 +2074,7 @@ fn rewrite_stmt(
             let body_result = promote_block_with_protection(
                 ctx,
                 &mut repeat_stmt.body,
+                event_stmt.child(0),
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
@@ -2086,6 +2095,7 @@ fn rewrite_stmt(
             let body_changed = promote_block(
                 ctx,
                 &mut numeric_for.body,
+                event_stmt.child(0),
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
@@ -2099,6 +2109,7 @@ fn rewrite_stmt(
             let body_changed = promote_block(
                 ctx,
                 &mut generic_for.body,
+                event_stmt.child(0),
                 mapping,
                 sticky_slots,
                 outer_uses_temp,
@@ -2107,7 +2118,15 @@ fn rewrite_stmt(
             iterator_changed || body_changed
         }
         HirStmt::Block(block) => {
-            promote_block(ctx, block, mapping, sticky_slots, outer_uses_temp).changed
+            promote_block(
+                ctx,
+                block,
+                event_stmt.child(0),
+                mapping,
+                sticky_slots,
+                outer_uses_temp,
+            )
+            .changed
         }
         HirStmt::Break
         | HirStmt::Close(_)
@@ -2436,7 +2455,7 @@ mod tests {
         ];
         let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
         let call_roots = collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(&stmts),
+            &RootLifetimeFacts::new(&stmts, &facts, safety),
             &facts,
             RootAnalysisContext {
                 safety,

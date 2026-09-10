@@ -272,6 +272,8 @@ fn stmt_can_absorb_call_suffix(stmt: &crate::ast::AstStmt) -> bool {
         crate::ast::AstStmt::GlobalDecl(decl) => !decl.values.is_empty(),
         crate::ast::AstStmt::Assign(_) | crate::ast::AstStmt::CallStmt(_) => true,
         crate::ast::AstStmt::Return(ret) => !ret.values.is_empty(),
+        // repeat 以 until 表达式结束，下一行的括号仍可能成为其调用后缀。
+        crate::ast::AstStmt::Repeat(_) => true,
         _ => false,
     }
 }

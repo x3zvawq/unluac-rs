@@ -41,8 +41,8 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use self::bindings::{
     BindingFacts, BindingIndex, BindingOccurrenceIndex, BindingSlots, StmtBindingSummary,
-    binding_from_expr, binding_from_lvalue, collect_binding_facts, collect_stmt_binding_summary,
-    expr_uses_binding,
+    binding_from_expr, binding_from_identity, binding_from_lvalue, collect_binding_facts,
+    collect_stmt_binding_summary, expr_uses_binding,
 };
 use self::rebuild::producer_value_can_be_dropped;
 use self::roots::RegionRootFacts;
@@ -52,7 +52,8 @@ use self::scan::{
     try_rebuild_constructor_region,
 };
 use super::mention::{
-    ReferenceCapturedBindings, stmts_reference_captured_bindings, stmts_value_captured_bindings,
+    BindingWriteCollector, ReferenceCapturedBindings, stmts_reference_captured_bindings,
+    stmts_value_captured_bindings,
 };
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::value_facts::value_facts;
@@ -2399,17 +2400,10 @@ fn constructor_has_definite_nil_record_key(constructor: &HirTableConstructor) ->
 /// An array constructor may contain one value whose runtime nil-ness is unknown only when it
 /// is the final array slot.  If a later slot is definitely populated, a preceding nil changes
 /// the VM's array-part/length result (`t[1]=nil; t[2]=1` is not `{nil, 1}`).
-fn expressions_have_safe_nil_shape(values: &[HirExpr]) -> bool {
-    let mut saw_uncertain = false;
-    for value in values {
-        if value_facts(value).is_non_nil() {
-            if saw_uncertain {
-                return false;
-            }
-        } else if saw_uncertain {
-            return false;
-        } else {
-            saw_uncertain = true;
+fn values_have_safe_nil_shape(mut non_nil: impl Iterator<Item = bool>) -> bool {
+    while let Some(definite) = non_nil.next() {
+        if !definite {
+            return non_nil.next().is_none();
         }
     }
     true
@@ -2459,26 +2453,23 @@ fn local_set_list_values_have_safe_nil_shape(
             _ => {
                 // 结构化语句可能按路径改写已知 binding；区间内没有 must-def 合流证明时，
                 // 不能沿用语句之前的 non-nil 事实。
-                for binding in stmt_written_bindings(stmt) {
-                    definitions.insert(binding, false);
-                }
+                visit_stmts(
+                    std::slice::from_ref(stmt),
+                    &mut BindingWriteCollector(|binding| {
+                        if let Some(binding) = binding_from_identity(binding) {
+                            definitions.insert(binding, false);
+                        }
+                    }),
+                );
             }
         }
     }
 
-    let mut saw_uncertain = false;
-    for value in values {
-        if expr_is_definitely_non_nil_from_definitions(value, &definitions) {
-            if saw_uncertain {
-                return false;
-            }
-        } else if saw_uncertain {
-            return false;
-        } else {
-            saw_uncertain = true;
-        }
-    }
-    true
+    values_have_safe_nil_shape(
+        values
+            .iter()
+            .map(|value| expr_is_definitely_non_nil_from_definitions(value, &definitions)),
+    )
 }
 
 fn expr_is_definitely_non_nil_from_definitions(
@@ -2494,55 +2485,11 @@ fn expr_is_definitely_non_nil_from_definitions(
     definitions.get(&binding).copied().unwrap_or(false)
 }
 
-fn stmt_written_bindings(stmt: &HirStmt) -> BTreeSet<TableBinding> {
-    struct Probe {
-        bindings: BTreeSet<TableBinding>,
-    }
-
-    impl HirVisitor for Probe {
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
-            match stmt {
-                HirStmt::LocalDecl(decl) => self
-                    .bindings
-                    .extend(decl.bindings.iter().copied().map(TableBinding::Local)),
-                HirStmt::NumericFor(numeric_for) => {
-                    self.bindings
-                        .insert(TableBinding::Local(numeric_for.binding));
-                }
-                HirStmt::GenericFor(generic_for) => self.bindings.extend(
-                    generic_for
-                        .bindings
-                        .iter()
-                        .copied()
-                        .map(TableBinding::Local),
-                ),
-                _ => {}
-            }
-        }
-
-        fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-            if let Some(binding) = binding_from_lvalue(lvalue) {
-                self.bindings.insert(binding);
-            }
-        }
-    }
-
-    let mut probe = Probe {
-        bindings: BTreeSet::new(),
-    };
-    visit_stmts(std::slice::from_ref(stmt), &mut probe);
-    probe.bindings
-}
-
 fn array_fields_have_safe_nil_shape(fields: &[HirTableField]) -> bool {
-    let values = fields
-        .iter()
-        .filter_map(|field| match field {
-            HirTableField::Array(value) => Some(value.clone()),
-            HirTableField::Record(_) => None,
-        })
-        .collect::<Vec<_>>();
-    expressions_have_safe_nil_shape(&values)
+    values_have_safe_nil_shape(fields.iter().filter_map(|field| match field {
+        HirTableField::Array(value) => Some(value_facts(value).is_non_nil()),
+        HirTableField::Record(_) => None,
+    }))
 }
 
 fn array_fields_contain_uncertain_value(fields: &[HirTableField]) -> bool {

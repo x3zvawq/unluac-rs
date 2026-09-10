@@ -38,9 +38,7 @@ use crate::hir::promotion::{CopyRootOverwrite, HomeSlotKey, ProtoPromotionFacts}
 use super::lexical_cfg::{
     LexicalBlockKind, LexicalBlockPath, LexicalCfgFailure, OwnerReentryFacts,
 };
-use super::mention::{
-    ReferenceCapturedBindings, stmts_protected_locals, stmts_reference_captured_bindings,
-};
+use super::mention::{stmts_protected_locals, stmts_reference_captured_bindings};
 use super::root_lifetimes::stmt_may_observe_gc_roots;
 use super::temp_touch::collect_temp_reads_in_proto;
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -85,8 +83,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
             .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve()),
     );
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
-    let reference_captured_homes =
-        reference_capture_possible_home_slots(&reference_captured, promotion_facts);
+    let reference_captured_homes = reference_captured.complete_home_slots(promotion_facts);
     let protected_locals = stmts_protected_locals(&proto.body.stmts);
     let home_writes = VisibleHomeWrites::collect(proto, promotion_facts);
     // 参数覆盖在本 pass 入口可能仍是写同 home 的 Local/Temp，不能只扫描已经语法化成
@@ -944,28 +941,6 @@ enum VisibleBinding {
     Local(LocalId),
 }
 
-/// 将引用捕获映射到当前 HIR binding 的完整可能 home 集合。
-///
-/// locals 等前序 pass 可能已经合并 binding，使 exact home 失效；此时仍要消费 promotion
-/// 保存的 possible-home 并集。只有 provenance 已退化为 Unknown 时才扩大到整个物理 home
-/// universe，确保 root transaction 不会因捕获已语法化成 Param/Local 而误走接受路径。
-fn reference_capture_possible_home_slots(
-    captured: &ReferenceCapturedBindings,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let mut homes = BTreeSet::new();
-    for param in &captured.params {
-        homes.extend(facts.complete_param_home_slots(*param).iter().copied());
-    }
-    for local in &captured.locals {
-        homes.extend(facts.complete_local_home_slots(*local).iter().copied());
-    }
-    for temp in &captured.temps {
-        homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
-    }
-    homes
-}
-
 struct VisibleHomeWrites<'a> {
     facts: &'a ProtoPromotionFacts,
     homes: BTreeSet<HomeSlotKey>,
@@ -1027,6 +1002,7 @@ mod tests {
         HirAssign, HirCallExpr, HirClose, HirGlobalDecl, HirGoto, HirIf, HirLabel, HirLabelId,
         HirProtoRef, HirReturn, HirTableConstructor, HirValuePack, HirWhile,
     };
+    use crate::hir::simplify::mention::ReferenceCapturedBindings;
     use crate::parser::{ProtoLineRange, ProtoSignature};
 
     fn block(stmts: Vec<HirStmt>) -> HirBlock {
@@ -1096,7 +1072,7 @@ mod tests {
         captured.locals.insert(LocalId(0));
         captured.temps.insert(TempId(0));
 
-        let captured_homes = reference_capture_possible_home_slots(&captured, &facts);
+        let captured_homes = captured.complete_home_slots(&facts);
         assert_eq!(captured_homes, BTreeSet::from([home]));
         assert!(
             captured_homes.contains(
@@ -1116,10 +1092,7 @@ mod tests {
         let mut captured = ReferenceCapturedBindings::default();
         captured.temps.insert(TempId(0));
 
-        assert_eq!(
-            reference_capture_possible_home_slots(&captured, &facts),
-            BTreeSet::from([home])
-        );
+        assert_eq!(captured.complete_home_slots(&facts), BTreeSet::from([home]));
     }
 
     #[test]
@@ -1129,10 +1102,7 @@ mod tests {
         let mut captured = ReferenceCapturedBindings::default();
         captured.locals.insert(LocalId(0));
 
-        assert_eq!(
-            reference_capture_possible_home_slots(&captured, &facts),
-            BTreeSet::new()
-        );
+        assert_eq!(captured.complete_home_slots(&facts), BTreeSet::new());
     }
 
     #[test]

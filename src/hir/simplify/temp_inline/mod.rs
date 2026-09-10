@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirExpr, HirInlineDispositions, HirInlineRetentionReason, HirLValue,
-    HirProto, HirStmt, HirTableField, TempId,
+    HirBinding, HirBlock, HirCallExpr, HirExpr, HirInlineDispositions, HirInlineRetentionReason,
+    HirLValue, HirProto, HirStmt, HirTableField, TempId,
 };
 use crate::hir::expr_safety::{
     HirEvalEffects, HirExprSafety, expr_observes_eval_order, expr_requires_ordered_snapshot,
@@ -85,12 +85,14 @@ use self::usage::{
 };
 use super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::mention::{
-    ReferenceCapturedBindings, expr_mentions_temp, stmt_writes_temp,
-    stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
+    BindingReadCollector, ReferenceCapturedBindings, binding_home_read_collector,
+    expr_mentions_temp, expr_read_homes, stmt_writes_temp, stmts_reference_captured_bindings,
+    stmts_to_be_closed_temps, stmts_value_captured_bindings,
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
-    CallRootLifetimeIndices, RootLifetimeFacts, collect_call_root_lifetimes,
+    CallRootLifetimeIndices, LookupGcRootLifetimeIndices, RootEventBlock, RootEventIndex,
+    RootEventStmt, RootLifetimeFacts, collect_call_root_lifetimes,
     collect_lookup_gc_root_lifetimes, materialize_generic_for_dispatch_root_releases,
     scope_end_copy_root_handoffs, scope_end_copy_roots_needing_materialization,
     stmt_has_argument_root_handoff,
@@ -293,6 +295,7 @@ fn inline_temps_in_proto_with_scope(
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
     let captures = TempInlineCaptureFacts::new(&reference_captured, facts);
+    let event_index = RootEventIndex::new(&proto.body.stmts, facts, roots.safety);
     changed |= inline_temps_in_block(
         &mut proto.body,
         &mut workspace,
@@ -301,6 +304,7 @@ fn inline_temps_in_proto_with_scope(
         readability,
         facts,
         &BTreeSet::new(),
+        event_index.root(),
     );
     let physical_root_count = proto.physical_root_temps.len();
     proto
@@ -316,12 +320,13 @@ impl TempInlineWorkspace<'_> {
         &mut self,
         stmts: &[HirStmt],
         facts: &ProtoPromotionFacts,
+        event_block: Option<RootEventBlock<'_>>,
     ) -> (CallRootLifetimeIndices, Vec<bool>) {
         // 分析停用[LayerBoundary]：普通潜在事件由后续 locals 以
         // `collect_call_root_lifetimes(..., true, ...)` 配对并物化 owner；locals 的 TempChain
         // invalidation 会让 temp-inline 针对已物化 owner 重跑。本轮只消费 lookup 的显式 GC/
         // return 后缀证明与已完成 overwrite pair，避免把尚未配对的普通观察扩成全局 barrier。
-        let snapshot = RootLifetimeFacts::new(stmts);
+        let snapshot = RootLifetimeFacts::with_events(stmts, facts, self.roots.safety, event_block);
         let call_roots =
             collect_call_root_lifetimes(&snapshot, facts, self.roots, false, |_| true, |_| true);
         let mut marked = call_roots.marked_stmts(stmts.len());
@@ -345,10 +350,7 @@ impl TempInlineWorkspace<'_> {
         lookup_roots.mark_stmts(&mut marked);
         if self.block_depth == 1 {
             // handoff 与覆盖配对来自同一改写前快照；先保护接收 home，再递归内联子块。
-            for temp in lookup_roots.into_handoff_roots() {
-                self.physical_root_temps[temp.index()] = true;
-                self.new_physical_root_temps.insert(temp);
-            }
+            self.publish_lookup_handoffs(lookup_roots);
         }
         for (index, stmt) in stmts.iter().enumerate() {
             if !marked[index]
@@ -377,8 +379,16 @@ impl TempInlineWorkspace<'_> {
         }
         (call_roots, marked)
     }
+
+    fn publish_lookup_handoffs(&mut self, roots: LookupGcRootLifetimeIndices) {
+        for temp in roots.into_handoff_roots() {
+            self.physical_root_temps[temp.index()] = true;
+            self.new_physical_root_temps.insert(temp);
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inline_temps_in_block(
     block: &mut HirBlock,
     workspace: &mut TempInlineWorkspace<'_>,
@@ -387,13 +397,14 @@ fn inline_temps_in_block(
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
+    event_scope: RootEventBlock<'_>,
 ) -> bool {
     let reference_captured = captures.bindings;
     let is_proto_root = workspace.block_depth == 0;
     workspace.block_depth += 1;
     let mut changed = false;
     let (mut call_root_indices, mut physical_root_lifetimes) =
-        workspace.collect_temp_root_lifetimes(&block.stmts, facts);
+        workspace.collect_temp_root_lifetimes(&block.stmts, facts, Some(event_scope));
     let mut captured_slots_before_stmt =
         CapturedSlotSnapshots::new(block.stmts.len(), inherited_captured_slots);
     let mut active_captured_slots = inherited_captured_slots.clone();
@@ -414,6 +425,7 @@ fn inline_temps_in_block(
                 readability,
                 facts,
                 &nested_captured_slots,
+                event_scope.stmt(index),
             );
         }
         let stmt = &block.stmts[index];
@@ -434,7 +446,7 @@ fn inline_temps_in_block(
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
         (call_root_indices, physical_root_lifetimes) =
-            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts, None);
     }
 
     if matches!(workspace.scope, TempInlineScope::All)
@@ -449,13 +461,15 @@ fn inline_temps_in_block(
             &mut workspace.physical_root_temps,
             &mut workspace.new_physical_root_temps,
             &workspace.inline_dispositions,
+            workspace.roots.safety,
+            (!changed).then_some(event_scope),
         )
     {
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
         (call_root_indices, physical_root_lifetimes) =
-            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts, None);
     }
 
     if inline_terminal_nil_return_pack(
@@ -470,7 +484,7 @@ fn inline_temps_in_block(
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
         (call_root_indices, physical_root_lifetimes) =
-            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts, None);
     }
 
     if inline_materialization_runs(
@@ -486,13 +500,13 @@ fn inline_temps_in_block(
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
         (call_root_indices, physical_root_lifetimes) =
-            workspace.collect_temp_root_lifetimes(&block.stmts, facts);
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts, None);
     }
 
     if matches!(workspace.scope, TempInlineScope::All)
         && inline_adjacent_call_root_expression_overwrites(
+            &adjacent_call_root_overwrites(&block.stmts, &workspace.uses, live_use_counts),
             block,
-            &workspace.uses,
             live_use_counts,
             facts,
             &captured_slots_before_stmt,
@@ -502,7 +516,8 @@ fn inline_temps_in_block(
         changed = true;
         captured_slots_before_stmt =
             captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        (_, physical_root_lifetimes) = workspace.collect_temp_root_lifetimes(&block.stmts, facts);
+        (_, physical_root_lifetimes) =
+            workspace.collect_temp_root_lifetimes(&block.stmts, facts, None);
     }
 
     // proto 级 live use count 会随成功内联同步减少；当前 block 只需保留下一条
@@ -675,16 +690,42 @@ fn inline_temps_in_block(
     // source binding；因此在同一坐标压缩完成后重算 root/capture 事实，并交回同一个
     // call-root owner 原子消费。
     if adjacent_changed && matches!(workspace.scope, TempInlineScope::All) {
-        let (call_roots, _) = workspace.collect_temp_root_lifetimes(&block.stmts, facts);
-        let captured_slots = captured_slots_before_stmts(block, facts, inherited_captured_slots);
-        changed |= inline_adjacent_call_root_expression_overwrites(
-            block,
-            &workspace.uses,
-            live_use_counts,
-            facts,
-            &captured_slots,
-            &call_roots,
-        );
+        let candidates =
+            adjacent_call_root_overwrites(&block.stmts, &workspace.uses, live_use_counts);
+        if is_proto_root || !candidates.is_empty() {
+            let snapshot = RootLifetimeFacts::new(&block.stmts, facts, workspace.roots.safety);
+            // 根层 lookup handoff 仍会发布 PhysicalRoot，即使没有相邻 call 覆盖候选。
+            // 深层的保护标记已消费完毕，不能为丢弃的投影重扫每层完整子树。
+            if is_proto_root {
+                let lookup_roots = collect_lookup_gc_root_lifetimes(
+                    &snapshot,
+                    facts,
+                    workspace.roots.safety,
+                    |_| true,
+                );
+                workspace.publish_lookup_handoffs(lookup_roots);
+            }
+            if !candidates.is_empty() {
+                let call_roots = collect_call_root_lifetimes(
+                    &snapshot,
+                    facts,
+                    workspace.roots,
+                    false,
+                    |_| true,
+                    |_| true,
+                );
+                let captured_slots =
+                    captured_slots_before_stmts(block, facts, inherited_captured_slots);
+                changed |= inline_adjacent_call_root_expression_overwrites(
+                    &candidates,
+                    block,
+                    live_use_counts,
+                    facts,
+                    &captured_slots,
+                    &call_roots,
+                );
+            }
+        }
     }
 
     workspace.block_depth -= 1;
@@ -892,29 +933,24 @@ fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
     }
 }
 
-fn inline_adjacent_call_root_expression_overwrites(
-    block: &mut HirBlock,
+/// 当前坐标下的重写候选；只筛选语法与删除资格，不能代替整个 block 的 home 配对证明。
+struct AdjacentCallRootOverwrite {
+    overwrite_index: usize,
+    root: TempId,
+}
+
+fn adjacent_call_root_overwrites(
+    stmts: &[HirStmt],
     scratch: &TempUseScratch,
-    live_use_counts: &mut [usize],
-    facts: &ProtoPromotionFacts,
-    captured_slots_before_stmt: &CapturedSlotSnapshots,
-    call_roots: &CallRootLifetimeIndices,
-) -> bool {
-    let mut removed = vec![false; block.stmts.len()];
-    for overwrite_index in 1..block.stmts.len() {
-        let root_index = overwrite_index - 1;
-        let Some(pair) = call_roots
-            .overwrite_pairs(overwrite_index)
-            .find(|pair| pair.root_index() == root_index)
+    live_use_counts: &[usize],
+) -> Vec<AdjacentCallRootOverwrite> {
+    let mut candidates = Vec::new();
+    for overwrite_index in 1..stmts.len() {
+        let Some((root, HirExpr::Call(_))) = stmts[overwrite_index - 1].scalar_temp_assignment()
         else {
             continue;
         };
-        let Some((root, HirExpr::Call(call))) = block.stmts[root_index].scalar_temp_assignment()
-        else {
-            continue;
-        };
-        let Some((target, overwrite)) = block.stmts[overwrite_index].scalar_temp_assignment()
-        else {
+        let Some((target, overwrite)) = stmts[overwrite_index].scalar_temp_assignment() else {
             continue;
         };
         if root == target {
@@ -931,6 +967,42 @@ fn inline_adjacent_call_root_expression_overwrites(
         if !call_root_overwrite_is_inlineable(overwrite, root) {
             continue;
         }
+        candidates.push(AdjacentCallRootOverwrite {
+            overwrite_index,
+            root,
+        });
+    }
+    candidates
+}
+
+fn inline_adjacent_call_root_expression_overwrites(
+    candidates: &[AdjacentCallRootOverwrite],
+    block: &mut HirBlock,
+    live_use_counts: &mut [usize],
+    facts: &ProtoPromotionFacts,
+    captured_slots_before_stmt: &CapturedSlotSnapshots,
+    call_roots: &CallRootLifetimeIndices,
+) -> bool {
+    if candidates.is_empty() {
+        return false;
+    }
+    let mut removed = vec![false; block.stmts.len()];
+    for &AdjacentCallRootOverwrite {
+        overwrite_index,
+        root,
+    } in candidates
+    {
+        let root_index = overwrite_index - 1;
+        let Some(pair) = call_roots
+            .overwrite_pairs(overwrite_index)
+            .find(|pair| pair.root_index() == root_index)
+        else {
+            continue;
+        };
+        // 前一个候选可能已删除同一 temp 的读取；提交仍消费当前计数。
+        if total_use_count(root, live_use_counts) != 1 {
+            continue;
+        }
         let mut captured_slots = captured_slots_before_stmt
             .get(overwrite_index)
             .expect("capture snapshots must cover the call-root overwrite")
@@ -945,7 +1017,10 @@ fn inline_adjacent_call_root_expression_overwrites(
             continue;
         }
 
-        let call = HirExpr::Call(call.clone());
+        let (_, call) = block.stmts[root_index]
+            .scalar_temp_assignment()
+            .expect("adjacent call candidate retains its producer until compaction");
+        let call = call.clone();
         replace_temp_in_stmt(&mut block.stmts[overwrite_index], root, &call);
         removed[root_index] = true;
         remove_live_use(live_use_counts, root);
@@ -986,12 +1061,24 @@ fn inline_covered_root_copies(
     physical_root_temps: &mut [bool],
     new_physical_root_temps: &mut BTreeSet<TempId>,
     inline_dispositions: &HirInlineDispositions,
+    safety: HirExprSafety,
+    event_scope: Option<RootEventBlock<'_>>,
 ) -> bool {
     let reference_captured = captures.bindings;
     let captured_homes = &captures.homes;
     let mut identity_sensitive = stmts_value_captured_bindings(&block.stmts).temps;
     identity_sensitive.extend(stmts_to_be_closed_temps(&block.stmts));
-    let dead_copies = scope_end_copy_root_handoffs(&block.stmts, facts)
+    // 子块改写会使入口快照失效；只有候选实际请求覆盖证明时才建立当前快照。
+    let current_events = std::cell::OnceCell::new();
+    let mut preserves_home = |range, home| {
+        let scope = event_scope.unwrap_or_else(|| {
+            current_events
+                .get_or_init(|| RootEventIndex::new(&block.stmts, facts, safety))
+                .root()
+        });
+        scope.slice(range).preserves_home(home)
+    };
+    let dead_copies = scope_end_copy_root_handoffs(&block.stmts, facts, &mut preserves_home)
         .into_iter()
         // 仍有源码读取的 source 已有自己的 use owner；不额外冻结它而阻止普通 copy 消解。
         .filter(|handoff| total_use_count(handoff.source, live_use_counts) == 1)
@@ -1004,7 +1091,7 @@ fn inline_covered_root_copies(
             use_sites: Vec::new(),
         });
     let method_copies = call_roots
-        .method_receiver_handoffs(&block.stmts, facts)
+        .method_receiver_handoffs(&block.stmts, facts, &mut preserves_home)
         .into_iter()
         .map(|handoff| {
             debug_assert!(handoff.sink_index() < handoff.overwrite_index());
@@ -2273,19 +2360,19 @@ fn root_open_return_remaining_read_relation(
     if protected_slots.is_empty() {
         return RootNilPackGapReadRelation::Disjoint;
     }
-    let mut collector = DirectBindingReadHomeCollector {
-        facts,
-        homes: BTreeSet::new(),
-    };
-    for (index, value) in ret.values.fixed.iter().enumerate() {
-        if index < fixed_start || index >= fixed_start + target_count {
-            visit_expr(value, &mut collector);
+    let mut homes = BTreeSet::new();
+    {
+        let mut collector = binding_home_read_collector(facts, &mut homes);
+        for (index, value) in ret.values.fixed.iter().enumerate() {
+            if index < fixed_start || index >= fixed_start + target_count {
+                visit_expr(value, &mut collector);
+            }
+        }
+        if let Some(tail) = &ret.values.tail {
+            visit_expr(tail.as_expr(), &mut collector);
         }
     }
-    if let Some(tail) = &ret.values.tail {
-        visit_expr(tail.as_expr(), &mut collector);
-    }
-    if collector.homes.is_disjoint(protected_slots) {
+    if homes.is_disjoint(protected_slots) {
         RootNilPackGapReadRelation::Disjoint
     } else {
         RootNilPackGapReadRelation::Overlap
@@ -2296,52 +2383,12 @@ fn direct_binding_read_homes_in_stmt(
     stmt: &HirStmt,
     facts: &ProtoPromotionFacts,
 ) -> BTreeSet<HomeSlotKey> {
-    let mut collector = DirectBindingReadHomeCollector {
-        facts,
-        homes: BTreeSet::new(),
-    };
-    visit_stmts(std::slice::from_ref(stmt), &mut collector);
-    collector.homes
-}
-
-fn direct_binding_read_homes_in_expr(
-    expr: &HirExpr,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let mut collector = DirectBindingReadHomeCollector {
-        facts,
-        homes: BTreeSet::new(),
-    };
-    visit_expr(expr, &mut collector);
-    collector.homes
-}
-
-struct DirectBindingReadHomeCollector<'a> {
-    facts: &'a ProtoPromotionFacts,
-    homes: BTreeSet<HomeSlotKey>,
-}
-
-impl DirectBindingReadHomeCollector<'_> {
-    fn note_homes(&mut self, homes: &BTreeSet<HomeSlotKey>) {
-        self.homes.extend(homes);
-    }
-}
-
-impl HirVisitor for DirectBindingReadHomeCollector<'_> {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        match expr {
-            HirExpr::ParamRef(param) => {
-                self.note_homes(&self.facts.complete_param_home_slots(*param));
-            }
-            HirExpr::LocalRef(local) => {
-                self.note_homes(&self.facts.complete_local_home_slots(*local));
-            }
-            HirExpr::TempRef(temp) => {
-                self.note_homes(&self.facts.complete_temp_home_slots(*temp));
-            }
-            _ => {}
-        }
-    }
+    let mut homes = BTreeSet::new();
+    visit_stmts(
+        std::slice::from_ref(stmt),
+        &mut binding_home_read_collector(facts, &mut homes),
+    );
+    homes
 }
 
 fn root_nil_pack_gap_block_preserves_slots(
@@ -2511,7 +2558,7 @@ fn materialization_run_preserves_value_reads(
     value: &HirExpr,
     facts: &ProtoPromotionFacts,
 ) -> bool {
-    let read_homes = direct_binding_read_homes_in_expr(value, facts);
+    let read_homes = expr_read_homes(value, facts);
     if read_homes.is_empty() {
         return true;
     }
@@ -2556,17 +2603,10 @@ struct TempInlineCaptureFacts<'a> {
 
 impl<'a> TempInlineCaptureFacts<'a> {
     fn new(bindings: &'a ReferenceCapturedBindings, facts: &ProtoPromotionFacts) -> Self {
-        let mut homes = BTreeSet::new();
-        for param in &bindings.params {
-            homes.extend(facts.complete_param_home_slots(*param).iter().copied());
+        Self {
+            bindings,
+            homes: bindings.complete_home_slots(facts),
         }
-        for local in &bindings.locals {
-            homes.extend(facts.complete_local_home_slots(*local).iter().copied());
-        }
-        for temp in &bindings.temps {
-            homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
-        }
-        Self { bindings, homes }
     }
 }
 
@@ -2950,6 +2990,7 @@ fn collect_block_temp_use_totals(stmts: &[HirStmt], scratch: &mut TempUseScratch
     totals
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inline_temps_in_nested_blocks(
     stmt: &mut HirStmt,
     workspace: &mut TempInlineWorkspace<'_>,
@@ -2958,6 +2999,7 @@ fn inline_temps_in_nested_blocks(
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     inherited_captured_slots: &BTreeSet<HomeSlotKey>,
+    event_scope: RootEventStmt<'_>,
 ) -> bool {
     match stmt {
         HirStmt::LocalRootRelease(_) => false,
@@ -2970,6 +3012,7 @@ fn inline_temps_in_nested_blocks(
                 readability,
                 facts,
                 inherited_captured_slots,
+                event_scope.child(0),
             );
             if let Some(else_block) = &mut if_stmt.else_block {
                 changed |= inline_temps_in_block(
@@ -2980,6 +3023,7 @@ fn inline_temps_in_nested_blocks(
                     readability,
                     facts,
                     inherited_captured_slots,
+                    event_scope.child(1),
                 );
             }
             changed
@@ -2992,6 +3036,7 @@ fn inline_temps_in_nested_blocks(
             readability,
             facts,
             inherited_captured_slots,
+            event_scope.child(0),
         ),
         HirStmt::Repeat(repeat_stmt) => {
             let policy = RepeatInlinePolicy {
@@ -3006,6 +3051,7 @@ fn inline_temps_in_nested_blocks(
                 readability,
                 facts,
                 inherited_captured_slots,
+                event_scope.child(0),
             );
             changed |= inline_repeat_head_scalar_temp(
                 repeat_stmt,
@@ -3035,6 +3081,7 @@ fn inline_temps_in_nested_blocks(
             readability,
             facts,
             inherited_captured_slots,
+            event_scope.child(0),
         ),
         HirStmt::GenericFor(generic_for) => inline_temps_in_block(
             &mut generic_for.body,
@@ -3044,6 +3091,7 @@ fn inline_temps_in_nested_blocks(
             readability,
             facts,
             inherited_captured_slots,
+            event_scope.child(0),
         ),
         HirStmt::Block(block) => inline_temps_in_block(
             block,
@@ -3053,6 +3101,7 @@ fn inline_temps_in_nested_blocks(
             readability,
             facts,
             inherited_captured_slots,
+            event_scope.child(0),
         ),
         HirStmt::LocalDecl(_)
         | HirStmt::GlobalDecl(_)
@@ -3215,52 +3264,63 @@ fn repeat_head_dependencies_are_stable(
 ) -> bool {
     if !is_repeat_header_rootless_scalar(value) {
         if !proof.safety.is_repeatable_in_single_value_context(value) {
-            if expr_observes_eval_order(value) {
-                // 候选拒绝[SemanticBarrier:EvalOrder]：call/lookup/元方法运算原本在 body 前求值；
-                // 移进 until 会把调用、__index 或元方法延到整个 body 之后。
-            } else {
-                // 候选拒绝[SemanticBarrier:ValueFlow]：不能证明可重复求值的动态值仍需 producer 快照。
-            }
+            // 不能证明动态值可重复求值时，保留 producer 的求值时点和快照。
             return false;
         }
 
-        let read_homes = direct_binding_read_homes_in_expr(value, proof.facts);
-        let read_identities = direct_binding_identities_in_expr(value);
-        let body_writes = direct_binding_writes_in_stmts(body_suffix, proof.facts);
-        if read_identities.overlaps(&body_writes.identities)
+        let mut read_homes = BTreeSet::new();
+        let mut read_identities = BTreeSet::new();
+        visit_expr(
+            value,
+            &mut BindingReadCollector(|binding| {
+                read_identities.insert(binding);
+                read_homes.extend(
+                    proof
+                        .facts
+                        .complete_binding_home_slots(binding)
+                        .iter()
+                        .copied(),
+                );
+            }),
+        );
+        let source_is_captured = read_identities.iter().any(|&binding| {
+            matches!(binding, HirBinding::Upvalue(_)) || proof.captures.bindings.contains(binding)
+        }) || !read_homes.is_disjoint(&proof.captures.homes);
+        let body_writes = direct_binding_writes_in_stmts(
+            body_suffix,
+            proof.facts,
+            proof.safety,
+            source_is_captured,
+        );
+        if !read_identities.is_disjoint(&body_writes.identities)
             || !read_homes.is_disjoint(&body_writes.homes)
         {
             // 候选拒绝[SemanticBarrier:ValueFlow]：body 重写 source identity 或任一 possible-home 时，
             // body 前 producer 保存旧 epoch；移进 until 会读取 body 后的新 epoch。
             return false;
         }
+        // Close 阈值只按 slot 比较；最小阈值覆盖的尾区间包含其它 Close 的全部槽。
         if body_writes
-            .close_from_regs
-            .iter()
-            .any(|from| read_homes.iter().any(|home| home.slot() >= *from))
+            .first_close_reg
+            .zip(read_homes.last())
+            .is_some_and(|(from, home)| home.slot() >= from)
         {
             // 候选拒绝[SemanticBarrier:Lifetime]：body Close 若结束 source home，producer 是
             // cleanup 前的快照/root；移到 until 会在生命周期结束后读取。
             return false;
         }
 
-        let crosses_observable_eval = stmts_observe_eval_order(body_suffix, proof.safety)
-            || !temp_precedes_observable_eval_in_expr(
-                condition,
-                temp,
-                true,
-                proof.captures.bindings,
-            );
-        if crosses_observable_eval {
-            let source_is_identity_captured = read_identities
-                .overlaps_reference_captured(proof.captures.bindings)
-                || !read_identities.upvalues.is_empty();
-            let source_is_home_captured = !read_homes.is_disjoint(&proof.captures.homes);
-            if source_is_identity_captured || source_is_home_captured {
-                // 候选拒绝[SemanticBarrier:ValueFlow]：body 或 until 前缀的 call/lookup/元方法
-                // 可在延后读取前改写 captured identity/home；producer 冻结的旧值会丢失。
-                return false;
-            }
+        if source_is_captured
+            && (body_writes.observes_eval
+                || !temp_precedes_observable_eval_in_expr(
+                    condition,
+                    temp,
+                    true,
+                    proof.captures.bindings,
+                ))
+        {
+            // body 或 until 前缀的用户事件可改写 captured identity/home；producer 保存旧快照。
+            return false;
         }
     }
 
@@ -3281,158 +3341,91 @@ fn repeat_head_dependencies_are_stable(
 }
 
 #[derive(Default)]
-struct DirectBindingIdentities {
-    params: BTreeSet<crate::hir::common::ParamId>,
-    locals: BTreeSet<crate::hir::common::LocalId>,
-    temps: BTreeSet<TempId>,
-    upvalues: BTreeSet<crate::hir::common::UpvalueId>,
-}
-
-impl DirectBindingIdentities {
-    fn overlaps(&self, other: &Self) -> bool {
-        !self.params.is_disjoint(&other.params)
-            || !self.locals.is_disjoint(&other.locals)
-            || !self.temps.is_disjoint(&other.temps)
-            || !self.upvalues.is_disjoint(&other.upvalues)
-    }
-
-    fn overlaps_reference_captured(&self, captured: &ReferenceCapturedBindings) -> bool {
-        !self.params.is_disjoint(&captured.params)
-            || !self.locals.is_disjoint(&captured.locals)
-            || !self.temps.is_disjoint(&captured.temps)
-    }
-}
-
-fn direct_binding_identities_in_expr(expr: &HirExpr) -> DirectBindingIdentities {
-    let mut collector = DirectBindingIdentityCollector::default();
-    visit_expr(expr, &mut collector);
-    collector.identities
-}
-
-#[derive(Default)]
-struct DirectBindingIdentityCollector {
-    identities: DirectBindingIdentities,
-}
-
-impl HirVisitor for DirectBindingIdentityCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        match expr {
-            HirExpr::ParamRef(param) => {
-                self.identities.params.insert(*param);
-            }
-            HirExpr::LocalRef(local) => {
-                self.identities.locals.insert(*local);
-            }
-            HirExpr::TempRef(temp) => {
-                self.identities.temps.insert(*temp);
-            }
-            HirExpr::UpvalueRef(upvalue) => {
-                self.identities.upvalues.insert(*upvalue);
-            }
-            _ => {}
-        }
-    }
-}
-
 struct DirectBindingWriteSummary {
-    identities: DirectBindingIdentities,
+    identities: BTreeSet<HirBinding>,
     homes: BTreeSet<HomeSlotKey>,
-    close_from_regs: BTreeSet<usize>,
+    first_close_reg: Option<usize>,
+    observes_eval: bool,
 }
 
 fn direct_binding_writes_in_stmts(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+    observe: bool,
 ) -> DirectBindingWriteSummary {
     let mut collector = DirectBindingWriteCollector {
         facts,
-        identities: DirectBindingIdentities::default(),
-        homes: BTreeSet::new(),
-        close_from_regs: BTreeSet::new(),
+        summary: Default::default(),
     };
-    visit_stmts(stmts, &mut collector);
-    DirectBindingWriteSummary {
-        identities: collector.identities,
-        homes: collector.homes,
-        close_from_regs: collector.close_from_regs,
+    if observe {
+        let mut pair = (
+            collector,
+            HirEvalEffects::new(safety, |stmt| {
+                matches!(stmt, HirStmt::TableSetList(_) | HirStmt::ErrNil(_))
+            }),
+        );
+        visit_stmts(stmts, &mut pair);
+        collector = pair.0;
+        collector.summary.observes_eval = pair.1.found();
+    } else {
+        visit_stmts(stmts, &mut collector);
     }
+    collector.summary
 }
 
 struct DirectBindingWriteCollector<'a> {
     facts: &'a ProtoPromotionFacts,
-    identities: DirectBindingIdentities,
-    homes: BTreeSet<HomeSlotKey>,
-    close_from_regs: BTreeSet<usize>,
+    summary: DirectBindingWriteSummary,
 }
 
 impl DirectBindingWriteCollector<'_> {
-    fn note_homes(&mut self, homes: &BTreeSet<HomeSlotKey>) {
-        self.homes.extend(homes);
+    fn note_binding(&mut self, binding: HirBinding) {
+        self.summary.identities.insert(binding);
+        let homes = match binding {
+            HirBinding::Temp(temp) => complete_materialization_write_homes(temp, self.facts),
+            _ => self.facts.complete_binding_home_slots(binding),
+        };
+        self.summary.homes.extend(homes.iter().copied());
     }
 }
 
 impl HirVisitor for DirectBindingWriteCollector<'_> {
     fn visit_local_root_release(&mut self, local: crate::hir::common::LocalId) {
-        self.identities.locals.insert(local);
+        self.summary.identities.insert(HirBinding::Local(local));
     }
 
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(decl) => {
-                for local in &decl.bindings {
-                    self.identities.locals.insert(*local);
-                    self.note_homes(&self.facts.complete_local_home_slots(*local));
+                for &local in &decl.bindings {
+                    self.note_binding(HirBinding::Local(local));
                 }
             }
-            HirStmt::NumericFor(for_stmt) => {
-                self.identities.locals.insert(for_stmt.binding);
-                self.note_homes(&self.facts.complete_local_home_slots(for_stmt.binding));
-            }
+            HirStmt::NumericFor(for_stmt) => self.note_binding(HirBinding::Local(for_stmt.binding)),
             HirStmt::GenericFor(for_stmt) => {
-                for local in &for_stmt.bindings {
-                    self.identities.locals.insert(*local);
-                    self.note_homes(&self.facts.complete_local_home_slots(*local));
+                for &local in &for_stmt.bindings {
+                    self.note_binding(HirBinding::Local(local));
                 }
             }
             HirStmt::Close(close) => {
-                self.close_from_regs.insert(close.from_reg);
+                let from = self.summary.first_close_reg.get_or_insert(close.from_reg);
+                *from = (*from).min(close.from_reg);
             }
             _ => {}
         }
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        match lvalue {
-            HirLValue::Param(param) => {
-                self.identities.params.insert(*param);
-                self.note_homes(&self.facts.complete_param_home_slots(*param));
-            }
-            HirLValue::Local(local) => {
-                self.identities.locals.insert(*local);
-                self.note_homes(&self.facts.complete_local_home_slots(*local));
-            }
-            HirLValue::Temp(temp) => {
-                self.identities.temps.insert(*temp);
-                self.homes.extend(
-                    complete_materialization_write_homes(*temp, self.facts)
-                        .iter()
-                        .copied(),
-                );
-            }
-            HirLValue::Upvalue(upvalue) => {
-                self.identities.upvalues.insert(*upvalue);
-            }
-            HirLValue::Global(_) | HirLValue::TableAccess(_) => {}
-        }
+        let binding = match lvalue {
+            HirLValue::Param(param) => HirBinding::Param(*param),
+            HirLValue::Local(local) => HirBinding::Local(*local),
+            HirLValue::Temp(temp) => HirBinding::Temp(*temp),
+            HirLValue::Upvalue(upvalue) => HirBinding::Upvalue(*upvalue),
+            HirLValue::Global(_) | HirLValue::TableAccess(_) => return,
+        };
+        self.note_binding(binding);
     }
-}
-
-fn stmts_observe_eval_order(stmts: &[HirStmt], safety: HirExprSafety) -> bool {
-    let mut collector = HirEvalEffects::new(safety, |stmt| {
-        matches!(stmt, HirStmt::TableSetList(_) | HirStmt::ErrNil(_))
-    });
-    visit_stmts(stmts, &mut collector);
-    collector.found()
 }
 
 fn inline_repeat_tail_temp(
@@ -4295,6 +4288,41 @@ mod tests {
     }
 
     #[test]
+    fn repeat_head_close_checks_all_possible_source_slots() {
+        let source = LocalId(0);
+        let temp = TempId(0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.record_home_free_temp(temp);
+        facts.record_local_home_slot(source, HomeSlotKey::new(0, 9));
+        facts.record_local_home_merge(source, Some(BTreeSet::from([HomeSlotKey::new(3, 0)])));
+        let captures = ReferenceCapturedBindings::default();
+        for from in 0..=4 {
+            let body = [4, from].map(|from_reg| {
+                HirStmt::Close(Box::new(crate::hir::common::HirClose {
+                    kind: crate::transformer::CloseKind::Explicit,
+                    from_reg,
+                    origins: Vec::new(),
+                }))
+            });
+            assert_eq!(
+                repeat_head_dependencies_are_stable(
+                    &HirExpr::LocalRef(source),
+                    temp,
+                    &body,
+                    &HirExpr::TempRef(temp),
+                    &RepeatHeadDependencyProof {
+                        captures: &TempInlineCaptureFacts::new(&captures, &facts),
+                        safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
+                        facts: &facts,
+                        captured_slots: &BTreeSet::new(),
+                    },
+                ),
+                from > 3
+            );
+        }
+    }
+
+    #[test]
     fn repeat_head_dynamic_producer_keeps_its_pre_body_eval_order() {
         let temp = TempId(0);
         let mut facts = ProtoPromotionFacts::default();
@@ -4458,7 +4486,7 @@ mod tests {
                 effects: &[],
             },
         );
-        let (_, physical_roots) = workspace.collect_temp_root_lifetimes(&block.stmts, &facts);
+        let (_, physical_roots) = workspace.collect_temp_root_lifetimes(&block.stmts, &facts, None);
 
         assert!(!physical_roots[0]);
         assert!(inline_root_open_return_nil_pack(
@@ -4518,7 +4546,7 @@ mod tests {
             },
         );
         let (_, rooted_physical_roots) =
-            rooted_workspace.collect_temp_root_lifetimes(&rooted.stmts, &rooted_facts);
+            rooted_workspace.collect_temp_root_lifetimes(&rooted.stmts, &rooted_facts, None);
 
         assert!(rooted_physical_roots[2]);
         assert!(

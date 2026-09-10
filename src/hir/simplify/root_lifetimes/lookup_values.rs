@@ -8,16 +8,17 @@
 //! 观察只发生在语句写入前：读写事件的状态变化从下一语句生效，映射修改也从 index + 1
 //! 生效。只保存已关闭零窗口中的最后观察，因为 collector 只向前查询当前 root 的后缀。
 
+use super::live_read_changes::LiveReadChanges;
 use super::{
-    ActiveLookupGcHome, BTreeMap, BTreeSet, HirExprSafety, HirStmt, HomeSlotKey, LookupValueId,
-    ProtoPromotionFacts, TempId, TempUseEvents, stmt_may_observe_gc_roots,
+    ActiveLookupGcHome, BTreeMap, BTreeSet, HomeSlotKey, LookupValueId, ProtoPromotionFacts,
+    TempId, TempUseEvents,
 };
 
 pub(super) struct LookupValues<'a> {
     pub(super) by_temp: BTreeMap<TempId, LookupValueId>,
     states: Vec<ValueObservations>,
-    changes: std::vec::IntoIter<(usize, TempId, bool)>,
-    uses: &'a TempUseEvents,
+    changes: LiveReadChanges,
+    uses: &'a TempUseEvents<'a>,
     observations: BTreeSet<usize>,
 }
 
@@ -32,31 +33,24 @@ struct ValueObservations {
 }
 
 impl<'a> LookupValues<'a> {
-    pub(super) fn new(uses: &'a TempUseEvents, stmts: &[HirStmt], safety: HirExprSafety) -> Self {
+    pub(super) fn new(uses: &'a TempUseEvents<'a>) -> Self {
         Self {
             by_temp: BTreeMap::new(),
             states: Vec::new(),
-            changes: uses.live_read_changes().into_iter(),
+            changes: LiveReadChanges::default(),
             uses,
-            observations: stmts
-                .iter()
-                .enumerate()
-                .filter_map(|(index, stmt)| {
-                    (uses.is_gc_fence(index) || stmt_may_observe_gc_roots(stmt, safety))
-                        .then_some(index)
-                })
+            observations: uses
+                .events
+                .block()
+                .observation_indices()
+                .union(&uses.gc_fence_indices)
+                .copied()
                 .collect(),
         }
     }
 
     pub(super) fn advance(&mut self, index: usize) {
-        while self
-            .changes
-            .as_slice()
-            .first()
-            .is_some_and(|event| event.0 <= index)
-        {
-            let (at, temp, live) = self.changes.next().unwrap();
+        while let Some((at, temp, live)) = self.changes.pop_through(self.uses, index) {
             if let Some(value) = self.by_temp.get(&temp) {
                 self.states[value.0].change(
                     live,
@@ -101,9 +95,11 @@ impl<'a> LookupValues<'a> {
                 &self.uses.gc_fence_indices,
             );
         }
+        self.changes.schedule(self.uses, temp, index);
     }
 
     pub(super) fn remove(&mut self, temp: &TempId, index: usize) -> Option<LookupValueId> {
+        self.changes.remove(*temp);
         let value = self.by_temp.remove(temp)?;
         self.states[value.0].aliases.remove(temp);
         if self.uses.has_live_read_from(*temp, index) {
@@ -136,6 +132,7 @@ impl<'a> LookupValues<'a> {
     }
 
     pub(super) fn clear(&mut self) {
+        self.changes.clear();
         for value in self.by_temp.values() {
             self.states[value.0].aliases.clear();
         }

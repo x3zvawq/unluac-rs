@@ -198,8 +198,27 @@ pub(super) fn freeze_numeric_for_protocol(
             region.index()
         )));
     }
+    let mut controls = plan
+        .region_blocks(loop_control_region(plan, region)?)
+        .iter()
+        .filter_map(|&block| match plan.block_terminator(block)?.kind {
+            BlockTerminatorKind::NumericForLoop { instr, .. } => Some(instr),
+            _ => None,
+        });
+    let loop_instr = controls.next();
+    if loop_instr.is_none() && body_completes_normally {
+        return Err(StructureError::invalid(
+            "completing numeric-for body has no frozen loop instruction",
+        ));
+    }
+    if controls.next().is_some() {
+        return Err(StructureError::invalid(
+            "numeric-for control owns multiple loop instructions",
+        ));
+    }
     Ok(NumericForProtocol {
         init_instr: instr,
+        loop_instr,
         body_edge: body,
         exit_edge: exit,
         body_completes_normally,

@@ -94,7 +94,8 @@ impl<'a> AstLowerer<'a> {
                         .ok_or(AstLowerError::MissingNamedVarargBinding {
                             proto: closure.proto.index(),
                         })?;
-                super::analysis::local_is_referenced(&child.body, local)
+                self.proto_bodies
+                    .named_vararg_is_referenced(closure.proto.index())
                     .then_some(crate::ast::common::AstBindingRef::Local(local))
             } else {
                 None

@@ -450,6 +450,7 @@ pub(super) fn build_bindings(
             proto,
             cfg,
             dataflow,
+            graph,
             structure,
             captured_slots.lexical_scopes,
         ),

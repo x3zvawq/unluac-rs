@@ -7,19 +7,19 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         &mut self,
         owner: RegionId,
         block: BlockRef,
-    ) -> Result<HirBlock, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         #[cfg(debug_assertions)]
         self.mark_block_emitted(owner, block, "plan emits one basic block more than once")?;
 
         match self.lowering.structure.plan().block_emission(block) {
             Some(BlockEmissionPlan::Emit) => {}
             Some(BlockEmissionPlan::ForwardedControl { .. }) => {
-                return Ok(HirBlock { stmts: Vec::new() });
+                return Ok(PlannedBlock::new());
             }
             None => return self.invalid_region(owner, "block has no dense emission plan"),
         }
 
-        let mut stmts = Vec::new();
+        let mut stmts = PlannedBlock::new();
         let terminator = self.block_terminator(owner, block)?.clone();
         let range = terminator.instrs;
         let prefix_start = match self
@@ -66,33 +66,33 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         };
         let regular_start =
             self.lower_block_entry(owner, block, prefix_start, regular_end, &mut stmts)?;
-        stmts.extend(self.lower_regular_range(owner, block, regular_start, regular_end)?);
+        stmts.append(self.lower_regular_range(owner, block, regular_start, regular_end)?);
 
         if let Some(cleanup) = trailing_cleanup {
             let Some(edge) = jump_edge else {
                 return self.invalid_region(owner, "cleanup placement has no source jump");
             };
-            let edge_plan = self.planned_edge(owner, edge)?;
-            stmts.extend(self.lower_edge_source_effects(owner, edge)?);
-            stmts.extend(self.lower_regular_range(
+            stmts.extend_plain(self.lower_edge_source_effects(owner, edge)?);
+            stmts.append(self.lower_regular_range(
                 owner,
                 block,
                 cleanup.start.index(),
                 cleanup.end(),
             )?);
-            stmts.extend(self.lower_edge_entry_effects(owner, edge)?);
-            stmts.extend(self.lower_edge_after_effects(owner, edge, edge_plan)?);
-            return Ok(HirBlock { stmts });
+            stmts.extend_plain(self.lower_edge_entry_effects(owner, edge)?);
+            let edge_plan = self.planned_edge(owner, edge)?;
+            stmts.extend_plain(self.lower_edge_after_effects(owner, edge, edge_plan)?);
+            return Ok(stmts);
         }
 
         match terminator.kind {
             BlockTerminatorKind::Linear { edge } => {
                 if let Some(edge) = edge {
-                    stmts.extend(self.lower_edge(owner, edge)?.stmts);
+                    stmts.extend_plain(self.lower_edge(owner, edge)?.stmts);
                 }
             }
             BlockTerminatorKind::Jump { edge, .. } => {
-                stmts.extend(self.lower_edge(owner, edge)?.stmts);
+                stmts.extend_plain(self.lower_edge(owner, edge)?.stmts);
             }
             BlockTerminatorKind::Branch {
                 instr,
@@ -123,7 +123,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 let Some(terminal) = lower_terminal_instr(self.lowering, block, instr, low) else {
                     return self.invalid_region(owner, "planned terminal lowering rejected opcode");
                 };
-                stmts.extend(terminal);
+                stmts.extend_plain(terminal);
             }
             BlockTerminatorKind::NumericForInit { .. }
             | BlockTerminatorKind::NumericForLoop { .. }
@@ -135,7 +135,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 return self.invalid_region(owner, "synthetic exit is owned by an emitted region");
             }
         }
-        Ok(HirBlock { stmts })
+        Ok(stmts)
     }
 
     pub(super) fn single_block_region(&self, region: RegionId) -> Result<BlockRef, HirLowerError> {
@@ -155,7 +155,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         &mut self,
         owner: RegionId,
         block: BlockRef,
-    ) -> Result<Vec<HirStmt>, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         #[cfg(debug_assertions)]
         self.mark_block_emitted(
             owner,
@@ -166,10 +166,10 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let BlockTerminatorKind::Branch { instr, .. } = terminator.kind else {
             return self.invalid_region(owner, "condition block has no frozen branch terminator");
         };
-        let mut stmts = Vec::new();
+        let mut stmts = PlannedBlock::new();
         self.emit_label(block, LabelPlacement::BeforeBlock, &mut stmts)?;
-        stmts.extend(self.lower_unresolved_phis(owner, block)?);
-        stmts.extend(self.lower_regular_range(
+        stmts.extend_plain(self.lower_unresolved_phis(owner, block)?);
+        stmts.append(self.lower_regular_range(
             owner,
             block,
             terminator.instrs.start.index(),
@@ -186,7 +186,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         block: BlockRef,
         start: usize,
         end: usize,
-        stmts: &mut Vec<HirStmt>,
+        stmts: &mut PlannedBlock,
     ) -> Result<usize, HirLowerError> {
         let placement = self
             .lowering
@@ -214,7 +214,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         "label cleanup placement is outside the regular block prefix",
                     );
                 }
-                stmts.extend(self.lower_regular_range(owner, block, start, last.index() + 1)?);
+                stmts.append(self.lower_regular_range(owner, block, start, last.index() + 1)?);
                 self.emit_label(block, LabelPlacement::AfterCleanup(last), stmts)?;
                 last.index() + 1
             }
@@ -224,56 +224,46 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 start
             }
         };
-        stmts.extend(self.lower_unresolved_phis(owner, block)?);
+        stmts.extend_plain(self.lower_unresolved_phis(owner, block)?);
         Ok(remaining_start)
     }
 
-    fn lower_regular_range(
-        &self,
+    pub(super) fn lower_regular_range(
+        &mut self,
         owner: RegionId,
         block: BlockRef,
         start: usize,
         end: usize,
-    ) -> Result<Vec<HirStmt>, HirLowerError> {
-        let intervals = &self.lowering.bindings.lexical_scopes;
-        let candidates = &intervals[intervals.partition_point(|scope| scope.start < start)
-            ..intervals.partition_point(|scope| scope.start < end)];
-        let protocols = &self.lowering.global_decls;
-        let mut starts = BTreeMap::<usize, Vec<usize>>::new();
-        for scope in candidates {
-            if scope.end <= end
-                && self.lowering.cfg.instr_to_block.get(scope.start) == Some(&block)
-                && self.lowering.cfg.instr_to_block.get(scope.end - 1) == Some(&block)
-                && !protocols.splits_protocol(start, scope.start)
-                && !protocols.splits_protocol(start, scope.end)
+    ) -> Result<PlannedBlock, HirLowerError> {
+        let mut output = PlannedBlock::new();
+        let mut index = start;
+        while index < end {
+            self.start_lexical_scopes(index, &mut output);
+            let mut consumed_end = index + 1;
+            if let Some(protocol) =
+                self.lowering
+                    .global_decls
+                    .owner(InstrRef(index))
+                    .filter(|protocol| {
+                        protocol.end <= end
+                            && self
+                                .index
+                                .scope_starts
+                                .range(index + 1..protocol.end)
+                                .next()
+                                .is_none()
+                            && self
+                                .index
+                                .scope_ends
+                                .range(index + 1..protocol.end)
+                                .next()
+                                .is_none()
+                    })
             {
-                starts.entry(scope.start).or_default().push(scope.end);
-            }
-        }
-        let mut root = Vec::new();
-        let mut scopes = Vec::<(usize, Vec<HirStmt>)>::new();
-        let mut instr_index = start;
-        while instr_index < end {
-            if let Some(ends) = starts.get(&instr_index) {
-                scopes.extend(ends.iter().map(|&end| (end, Vec::new())));
-            }
-            let mut consumed_end = instr_index + 1;
-            let lowered = if let Some(protocol) = self
-                .lowering
-                .global_decls
-                .owner(InstrRef(instr_index))
-                .filter(|protocol| {
-                    protocol.end <= end
-                        && starts
-                            .range((instr_index + 1)..protocol.end)
-                            .next()
-                            .is_none()
-                        && scopes.last().is_none_or(|(end, _)| *end >= protocol.end)
-                }) {
                 let stmt = super::super::super::instrs::lower_global_decl_owner(
                     self.lowering,
                     block,
-                    InstrRef(instr_index),
+                    InstrRef(index),
                     protocol,
                 )
                 .ok_or(HirLowerError::InvalidPlanRegion {
@@ -282,28 +272,32 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     detail: "frozen global declaration protocol no longer matches its owner",
                 })?;
                 consumed_end = protocol.end;
-                vec![stmt]
+                output.push(stmt);
             } else {
-                self.lower_planned_regular(owner, block, InstrRef(instr_index))?
-            };
-            if let Some((_, stmts)) = scopes.last_mut() {
-                stmts.extend(lowered);
-            } else {
-                root.extend(lowered);
+                output.extend_plain(self.lower_planned_regular(owner, block, InstrRef(index))?);
             }
-            instr_index = consumed_end;
-            while scopes.last().is_some_and(|(end, _)| *end == instr_index) {
-                let (_, stmts) = scopes.pop().expect("lexical scope stack is non-empty");
-                let block = HirStmt::Block(Box::new(HirBlock { stmts }));
-                if let Some((_, parent)) = scopes.last_mut() {
-                    parent.push(block);
-                } else {
-                    root.push(block);
-                }
+            self.end_lexical_scopes(consumed_end, &mut output);
+            index = consumed_end;
+        }
+        Ok(output)
+    }
+
+    pub(super) fn start_lexical_scopes(&mut self, instr: usize, output: &mut PlannedBlock) {
+        if let Some(scopes) = self.index.scope_starts.get(&instr) {
+            self.emitted_scope_boundaries += scopes.len();
+            for &scope in scopes {
+                output.start_scope(scope);
             }
         }
-        debug_assert!(scopes.is_empty());
-        Ok(root)
+    }
+
+    pub(super) fn end_lexical_scopes(&mut self, instr: usize, output: &mut PlannedBlock) {
+        if let Some(scopes) = self.index.scope_ends.get(&instr) {
+            self.emitted_scope_boundaries += scopes.len();
+            for &scope in scopes.iter().rev() {
+                output.end_scope(scope);
+            }
+        }
     }
 
     pub(super) fn lower_planned_regular(

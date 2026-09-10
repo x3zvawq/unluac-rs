@@ -29,6 +29,9 @@ use crate::hir::expr_safety::HirExprSafety;
 use super::expr_facts::expr_truthiness;
 use crate::hir::visit::visit_stmt_structure;
 
+mod statement_tree;
+pub(super) use statement_tree::{HirStmtId, HirStmtTree};
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum LexicalCfgFailure {
     AmbiguousLabel,

@@ -8,9 +8,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         region: RegionId,
         plan: crate::structure::BranchPlanId,
         condition: RegionId,
-        mut then_arm: HirBlock,
-        else_arm: Option<HirBlock>,
-    ) -> Result<HirBlock, HirLowerError> {
+        then_arm: PlannedBlock,
+        else_arm: Option<PlannedBlock>,
+    ) -> Result<PlannedBlock, HirLowerError> {
         let payload = self.lowering.structure.plan().branch(plan).ok_or(
             HirLowerError::MissingPlanPayload {
                 proto: self.proto.index(),
@@ -24,15 +24,23 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             cond = cond.negate();
         }
 
-        let mut then_block = self.lower_edge(region, payload.then_edge)?;
-        then_block.stmts.append(&mut then_arm.stmts);
-        let mut else_block = self.lower_edge(region, payload.else_edge)?;
-        if let Some(mut arm) = else_arm {
-            else_block.stmts.append(&mut arm.stmts);
+        let mut then_block = PlannedBlock::from(self.lower_edge(region, payload.then_edge)?);
+        then_block.append(then_arm);
+        let mut else_block = PlannedBlock::from(self.lower_edge(region, payload.else_edge)?);
+        if let Some(arm) = else_arm {
+            else_block.append(arm);
         }
-        let else_block = (!else_block.stmts.is_empty()).then_some(else_block);
-        stmts.push(branch_stmt(cond, then_block, else_block));
-        Ok(HirBlock { stmts })
+        let else_block = if else_block.is_empty() {
+            None
+        } else {
+            Some(self.finish_emission(region, else_block)?)
+        };
+        stmts.push(branch_stmt(
+            cond,
+            self.finish_emission(region, then_block)?,
+            else_block,
+        ));
+        Ok(stmts)
     }
 
     pub(super) fn lower_short_circuit_condition(
@@ -40,7 +48,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         owner: RegionId,
         condition_region: RegionId,
         condition_plan: crate::structure::ConditionPlanId,
-    ) -> Result<(Vec<HirStmt>, HirExpr), HirLowerError> {
+    ) -> Result<(PlannedBlock, HirExpr), HirLowerError> {
         let selected = self
             .lowering
             .structure
@@ -89,7 +97,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         &mut self,
         region: RegionId,
         plan: crate::structure::ValueDecisionPlanId,
-    ) -> Result<HirBlock, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         let selected = self.lowering.structure.plan().value_decision(plan).ok_or(
             HirLowerError::MissingPlanPayload {
                 proto: self.proto.index(),
@@ -137,12 +145,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target),
             )],
         ));
-        stmts.extend(self.lower_edge_effects(region, selected.shared_exit_action)?);
+        stmts.extend_plain(self.lower_edge_effects(region, selected.shared_exit_action)?);
         #[cfg(debug_assertions)]
         for block in selected.blocks().filter(|block| *block != header) {
             self.mark_block_emitted(region, block, "plan emits one value block more than once")?;
         }
-        Ok(HirBlock { stmts })
+        Ok(stmts)
     }
 
     pub(super) fn verify_condition_region(

@@ -16,15 +16,16 @@
 //! - 输入：`assign tA, tB, keep = sA, sB, 0; ... assign sA, sB = tA, tB`
 //! - 输出：`assign keep = 0; ...`
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::mention::stmt_writes_temp;
 use super::super::temp_touch::TempTouchIndex;
 use super::super::walk::rewrite_stmts;
 use super::HandoffSafety;
 use super::binding::{
-    BindingHomeOverlap, BindingProtection, CarryBinding, TempBindingRewrite, TempToBindingPass,
-    binding_home_overlap, bindings_share_exact_home_slot, carry_binding_from_lvalue,
+    BindingClassRewritePass, BindingHomeOverlap, BindingProtection, CarryBinding,
+    TempBindingRewrite, binding_home_overlap, bindings_share_exact_home_slot,
+    carry_binding_from_lvalue,
 };
 use super::boundary::LabelJumpIndex;
 use super::prune::{
@@ -166,8 +167,11 @@ fn try_collapse_pure_binding_handoffs(
     };
 
     if !active_rewrites.is_empty() {
-        let mut pass = TempToBindingPass {
-            rewrites: active_rewrites.clone(),
+        let mut pass = BindingClassRewritePass {
+            rewrites: active_rewrites
+                .iter()
+                .map(|rewrite| (CarryBinding::Temp(rewrite.from), rewrite.to))
+                .collect(),
             promotion_facts: safety.promotion_facts,
         };
         assert!(
@@ -237,11 +241,8 @@ fn try_collapse_label_loop_update_handoff(
         return false;
     }
 
-    let mut pass = TempToBindingPass {
-        rewrites: vec![TempBindingRewrite {
-            from: update_temp,
-            to: carried,
-        }],
+    let mut pass = BindingClassRewritePass {
+        rewrites: BTreeMap::from([(CarryBinding::Temp(update_temp), carried)]),
         promotion_facts: safety.promotion_facts,
     };
     assert!(
@@ -323,11 +324,8 @@ fn try_collapse_single_binding_handoff(
 
     let rewritten = rewrite_stmts(
         &mut block.stmts[index + 1..],
-        &mut TempToBindingPass {
-            rewrites: vec![TempBindingRewrite {
-                from: temp,
-                to: binding,
-            }],
+        &mut BindingClassRewritePass {
+            rewrites: BTreeMap::from([(CarryBinding::Temp(temp), binding)]),
             promotion_facts: safety.promotion_facts,
         },
     );
@@ -381,11 +379,8 @@ fn try_collapse_binding_update_handoff(
         assert!(
             rewrite_stmts(
                 &mut block.stmts[index + 1..],
-                &mut TempToBindingPass {
-                    rewrites: vec![TempBindingRewrite {
-                        from: target_temp,
-                        to: carried,
-                    }],
+                &mut BindingClassRewritePass {
+                    rewrites: BTreeMap::from([(CarryBinding::Temp(target_temp), carried)]),
                     promotion_facts: safety.promotion_facts,
                 },
             ),
@@ -784,9 +779,8 @@ mod tests {
         let mut block = HirBlock {
             stmts: vec![effectful_parallel_seed(true)],
         };
-        let stmt_temp_refs =
-            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
+        let temp_touches =
+            super::super::super::temp_touch::collect_temp_touch_positions(&block.stmts);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -820,9 +814,8 @@ mod tests {
                 })),
             ],
         };
-        let stmt_temp_refs =
-            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
+        let temp_touches =
+            super::super::super::temp_touch::collect_temp_touch_positions(&block.stmts);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -859,9 +852,8 @@ mod tests {
                 ),
             ],
         };
-        let stmt_temp_refs =
-            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
+        let temp_touches =
+            super::super::super::temp_touch::collect_temp_touch_positions(&block.stmts);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -912,9 +904,8 @@ mod tests {
                 })),
             ],
         };
-        let stmt_temp_refs =
-            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
+        let temp_touches =
+            super::super::super::temp_touch::collect_temp_touch_positions(&block.stmts);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();
@@ -933,8 +924,8 @@ mod tests {
             &BTreeSet::new(),
             &mut safety,
         ));
-        let refs = super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        assert!(refs.iter().all(BTreeSet::is_empty));
+        let touches = super::super::super::temp_touch::collect_temp_touch_positions(&block.stmts);
+        assert!(touches.is_empty());
         let HirStmt::Assign(seed) = &block.stmts[0] else {
             panic!("expected rewritten update seed");
         };
@@ -968,9 +959,8 @@ mod tests {
                 })),
             ],
         };
-        let stmt_temp_refs =
-            super::super::super::temp_touch::collect_temp_refs_by_stmt(&block.stmts);
-        let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
+        let temp_touches =
+            super::super::super::temp_touch::collect_temp_touch_positions(&block.stmts);
         let label_jumps = LabelJumpIndex::new(&block.stmts);
         let identity_facts = empty_identity_facts();
         let mut promotion_facts = ProtoPromotionFacts::default();

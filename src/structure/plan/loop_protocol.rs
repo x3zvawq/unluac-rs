@@ -83,6 +83,9 @@ pub struct LoopRepeatValuePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NumericForProtocol {
     pub init_instr: InstrRef,
+    /// 真实 latch 的 VM 指令；body 内有分支时不等于 loop header 的终结器。
+    /// body 必定 break/return 等离开循环时，已裁掉的不可达 latch 为 None。
+    pub loop_instr: Option<InstrRef>,
     pub body_edge: EdgeRef,
     pub exit_edge: EdgeRef,
     /// planned body 是否存在一条可落入 protocol tail 的普通完成路径；空 body 为 true。

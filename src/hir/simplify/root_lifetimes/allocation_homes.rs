@@ -1,11 +1,26 @@
 //! 按物理 home 索引分配对象的独立根事务与该槽中的别名。
 //!
-//! 分配身份直接使用不可变 HIR constructor 的 allocation site，home 来自 Promotion；
+//! 分配身份使用当前 block 快照中最初 constructor 的语句位置，home 来自 Promotion；
 //! 本层只维护 collector 已证明的 copy/overwrite，不反查别名或重建 VM 协议。
 //! 例如 a={}、b=a 后两个 home 共享 site；覆盖 a 只取走 a 的 owner 与别名，b 仍保留。
 //! 同 site 再写回已有 home 延续原 producer，不能把一次 SSA copy 当成新的生命周期。
+//! 该身份不跨改写发布，也不是表容量/模板 provenance 或可能重复赋值的 TempId。
 
 use super::{AllocationHomeOwner, BTreeMap, BTreeSet, HomeSlotKey, TempId};
+use crate::hir::common::{HirExpr, HirStmt, HirTableConstructor};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct AllocationSite(pub(super) usize);
+
+impl AllocationSite {
+    pub(super) fn constructor(self, stmts: &[HirStmt]) -> &HirTableConstructor {
+        let Some((_, HirExpr::TableConstructor(table))) = stmts[self.0].scalar_temp_assignment()
+        else {
+            unreachable!("allocation site must retain its original constructor in this snapshot");
+        };
+        table
+    }
+}
 
 #[derive(Default)]
 pub(super) struct AllocationHomes {
@@ -16,15 +31,35 @@ pub(super) struct AllocationHomes {
 pub(super) struct ActiveAllocationHome {
     pub(super) aliases: BTreeSet<TempId>,
     pub(super) owner: AllocationHomeOwner,
-    pub(super) allocation_site: usize,
+    pub(super) allocation_site: AllocationSite,
 }
 
 impl AllocationHomes {
+    pub(super) fn is_empty(&self) -> bool {
+        self.homes.is_empty()
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.homes.len()
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = HomeSlotKey> + '_ {
+        self.homes.keys().copied()
+    }
+
+    pub(super) fn temps(&self) -> impl Iterator<Item = TempId> + '_ {
+        self.by_temp.keys().copied()
+    }
+
+    pub(super) fn temp_count(&self) -> usize {
+        self.by_temp.len()
+    }
+
     pub(super) fn get(&self, home: &HomeSlotKey) -> Option<&ActiveAllocationHome> {
         self.homes.get(home)
     }
 
-    pub(super) fn site_for_temp(&self, temp: TempId) -> Option<usize> {
+    pub(super) fn site_for_temp(&self, temp: TempId) -> Option<AllocationSite> {
         self.by_temp
             .get(&temp)
             .map(|home| self.homes[home].allocation_site)
@@ -40,7 +75,7 @@ impl AllocationHomes {
         &mut self,
         home: HomeSlotKey,
         temp: TempId,
-        allocation_site: usize,
+        allocation_site: AllocationSite,
         owner: AllocationHomeOwner,
     ) {
         // caller 已结束异值目标 home；同值写回保留原 owner，即使旧 SSA 别名已耗尽。

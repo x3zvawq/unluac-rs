@@ -9,8 +9,9 @@
 //! 迭代支配边界统一扩展已有定义与合流种子；值活性、Close 出口及虚拟入口仍由消费者决定。
 
 use std::collections::{BTreeSet, VecDeque};
+use std::ops::Range;
 
-use super::cfg::{BlockRef, EdgeRef};
+use super::cfg::{BlockRef, Cfg, EdgeRef};
 
 /// 一个 proto 的图分析事实，以及它的子 proto 事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +52,47 @@ impl GraphFacts {
     pub fn block_is_cyclic(&self, block: BlockRef) -> bool {
         self.scc_id(block)
             .is_some_and(|scc| self.scc.cyclic[scc.index()])
+    }
+
+    /// 证明 low 区间单入口、单出口；首尾可以切在基本块中间。
+    ///
+    /// 循环体中的 `new; if ...; use; end` 可以是闭合窗口，即使其中每个块都
+    /// 属于外层 SCC。首块之前和末块之后的控制不属于窗口；不能用整块 SCC 拒绝它。
+    /// 窗口也可以包含完整循环；这里只证明图的边界，值身份、源码作用域和指令
+    /// 是否可物化仍由消费者证明，不能用这个查询把循环体内的声明移到循环外。
+    pub(crate) fn closed_instruction_window(&self, cfg: &Cfg, window: Range<usize>) -> bool {
+        let Some(instructions) = cfg.instr_to_block.get(window.clone()) else {
+            return false;
+        };
+        let (Some(&entry), Some(&exit)) = (instructions.first(), instructions.last()) else {
+            return false;
+        };
+        let contains = |block: BlockRef| {
+            block == entry || window.contains(&cfg.blocks[block.index()].instrs.start.index())
+        };
+        for run in instructions.chunk_by(|a, b| a == b) {
+            let block = run[0];
+            let range = cfg.blocks[block.index()].instrs;
+            if !cfg.reachable_blocks.contains(&block)
+                || !self.dominates(entry, block)
+                || !self.post_dominates(exit, block)
+                || (block != entry && range.start.index() < window.start)
+                || (block != exit && range.end() > window.end)
+                || (block != entry
+                    && cfg.preds[block.index()].iter().any(|edge| {
+                        let from = cfg.edges[edge.index()].from;
+                        cfg.reachable_blocks.contains(&from) && !contains(from)
+                    }))
+                || (block != exit
+                    && cfg.succs[block.index()].iter().any(|edge| {
+                        let to = cfg.edges[edge.index()].to;
+                        !contains(to)
+                    }))
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// 返回某个 block 的 dominance frontier。

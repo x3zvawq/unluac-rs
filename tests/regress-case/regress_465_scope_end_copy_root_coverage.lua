@@ -7,6 +7,11 @@ local function retain(callback)
     local source = held
     held = nil
     local duplicate = source
+    -- 子块内联先改变 HIR；随后删除 dead copy 时必须查询当前 home 写入快照。
+    if callback then
+        local n = 1 + 1
+        assert(n == 2)
+    end
     callback()
 end
 

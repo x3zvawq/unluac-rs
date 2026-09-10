@@ -79,3 +79,30 @@ print(
     "regress_172_temp_inline_eval_regions#5",
     table.concat(method_log, ",")
 )
+
+-- 每轮先保存条件，回调修改原 binding 不能改变本轮的条件快照。
+do
+    local ready, ticks = false, 0
+    local function tick() ticks = ticks + 1; ready = true end
+    repeat
+        local stop = ready
+        tick()
+    until stop
+    assert(ticks == 2)
+    print("regress_172_temp_inline_eval_regions#5", ticks)
+end
+
+-- 同一合同也适用于父 frame 的 upvalue；它没有当前函数的物理 home。
+do
+    local ready, ticks = false, 0
+    local function tick() ticks = ticks + 1; ready = true end
+    local function run()
+        repeat
+            local stop = ready
+            tick()
+        until stop
+    end
+    run()
+    assert(ticks == 2)
+    print("regress_172_temp_inline_eval_regions#6", ticks)
+end

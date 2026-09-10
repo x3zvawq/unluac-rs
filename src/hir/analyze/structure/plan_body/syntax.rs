@@ -8,13 +8,13 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         owner: RegionId,
         region: RegionId,
         skipped: Option<InstrRef>,
-    ) -> Result<Vec<HirStmt>, HirLowerError> {
-        let mut stmts = Vec::new();
+    ) -> Result<PlannedBlock, HirLowerError> {
+        let mut stmts = PlannedBlock::new();
         let mut pending = vec![region];
         while let Some(region) = pending.pop() {
             match self.lowering.structure.plan().region(region) {
                 Some(RegionPlan::Block { block, .. }) => {
-                    stmts.extend(self.lower_syntax_block_prefix(owner, *block, skipped)?);
+                    stmts.append(self.lower_syntax_block_prefix(owner, *block, skipped)?);
                 }
                 Some(RegionPlan::Sequence { children, .. }) => {
                     pending.extend(children.iter().rev().copied());
@@ -118,14 +118,14 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         owner: RegionId,
         block: BlockRef,
         skipped: Option<InstrRef>,
-    ) -> Result<Vec<HirStmt>, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         #[cfg(debug_assertions)]
         self.mark_block_emitted(
             owner,
             block,
             "plan emits one loop syntax block more than once",
         )?;
-        let mut stmts = Vec::new();
+        let mut stmts = PlannedBlock::new();
         let terminator = self.block_terminator(owner, block)?.clone();
         let end = terminator
             .kind
@@ -140,10 +140,11 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         )?;
         for index in start..end {
             let instr_ref = InstrRef(index);
-            if skipped == Some(instr_ref) {
-                continue;
+            self.start_lexical_scopes(index, &mut stmts);
+            if skipped != Some(instr_ref) {
+                stmts.extend_plain(self.lower_planned_regular(owner, block, instr_ref)?);
             }
-            stmts.extend(self.lower_planned_regular(owner, block, instr_ref)?);
+            self.end_lexical_scopes(index + 1, &mut stmts);
         }
         Ok(stmts)
     }

@@ -4,86 +4,80 @@
 //! 都留到原 closure occurrence 消费，捕获元数据仍由该 occurrence 的 lowering 负责。
 //! 例如 `return function() return function() end end` 从内到外移动已构造的 body，
 //! 不为每层复制整棵子树；同一 proto 的多个实际 occurrence 才需要复制独立 AST。
+//! 首次访问可达 proto 时一并冻结 hoist 与命名变参引用，后续消费不再回扫 HIR；
+//! 依赖 Vec 保留重复 occurrence 并直接交给 DFS，不为未使用的 proto 构造语法事实。
 
-use crate::hir::visit::{self, HirVisitor};
-use crate::hir::{HirExpr, HirModule};
+use crate::hir::{HirModule, TempId};
 
+use super::analysis::ProtoBuildFacts;
 use super::{AstBlock, AstLowerError};
 
 #[derive(Default)]
 pub(super) struct ProtoBodies {
-    remaining: Vec<usize>,
-    bodies: Vec<Option<Result<AstBlock, AstLowerError>>>,
+    entries: Vec<ProtoBody>,
+}
+
+#[derive(Default)]
+struct ProtoBody {
+    remaining: usize,
+    facts: ProtoBuildFacts,
+    body: Option<Result<AstBlock, AstLowerError>>,
 }
 
 impl ProtoBodies {
     pub(super) fn prepare(module: &HirModule) -> (Self, Vec<usize>) {
-        let dependencies = module
-            .protos
-            .iter()
-            .map(|proto| {
-                let mut references = BodyReferences::default();
-                visit::visit_proto(proto, &mut references);
-                if proto.failure.is_some() {
-                    references.0.extend(
-                        proto
-                            .detached_children
-                            .iter()
-                            .map(|(_, child)| child.index()),
-                    );
-                }
-                references.0
-            })
+        let mut entries = (0..module.protos.len())
+            .map(|_| ProtoBody::default())
             .collect::<Vec<_>>();
         let order = crate::graph::depth_first(
             module.protos.len(),
             module.entry.index(),
             |index| index,
             |index| index < module.protos.len(),
-            |index| dependencies[index].iter().copied(),
+            |index| {
+                let (facts, dependencies) = ProtoBuildFacts::collect(&module.protos[index]);
+                entries[index].facts = facts;
+                for &child in &dependencies {
+                    if let Some(entry) = entries.get_mut(child) {
+                        entry.remaining += 1;
+                    }
+                }
+                dependencies
+            },
         )
         .postorder;
-        let mut remaining = vec![0; module.protos.len()];
-        for &owner in &order {
-            for &child in &dependencies[owner] {
-                if let Some(uses) = remaining.get_mut(child) {
-                    *uses += 1;
-                }
-            }
+        if let Some(entry) = entries.get_mut(module.entry.index()) {
+            entry.remaining += 1;
         }
-        if let Some(uses) = remaining.get_mut(module.entry.index()) {
-            *uses += 1;
-        }
-        let bodies = (0..module.protos.len()).map(|_| None).collect();
-        (Self { remaining, bodies }, order)
+        (Self { entries }, order)
+    }
+
+    pub(super) fn take_hoisted_temps(&mut self, proto: usize) -> Vec<TempId> {
+        std::mem::take(&mut self.entries[proto].facts.hoisted_temps)
+    }
+
+    pub(super) fn named_vararg_is_referenced(&self, proto: usize) -> bool {
+        self.entries[proto].facts.named_vararg_referenced
     }
 
     pub(super) fn insert(&mut self, proto: usize, body: Result<AstBlock, AstLowerError>) {
-        self.bodies[proto] = Some(body);
+        self.entries[proto].body = Some(body);
     }
 
     pub(super) fn take(&mut self, proto: usize) -> Result<AstBlock, AstLowerError> {
-        let remaining = &mut self.remaining[proto];
-        let slot = &mut self.bodies[proto];
-        *remaining -= 1;
-        if *remaining == 0 {
-            slot.take()
+        let entry = &mut self.entries[proto];
+        entry.remaining -= 1;
+        if entry.remaining == 0 {
+            entry
+                .body
+                .take()
                 .expect("child body is constructed before its owner")
         } else {
-            slot.as_ref()
+            entry
+                .body
+                .as_ref()
                 .expect("child body is constructed before its owner")
                 .clone()
-        }
-    }
-}
-
-#[derive(Default)]
-struct BodyReferences(Vec<usize>);
-
-impl HirVisitor for BodyReferences {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        if let HirExpr::Closure(closure) = expr {
-            self.0.push(closure.proto.index());
         }
     }
 }

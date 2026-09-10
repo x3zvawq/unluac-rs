@@ -49,7 +49,7 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
 use super::label_refs::count_label_references;
-use super::temp_touch::{TempTouchIndex, collect_temp_refs_by_stmt};
+use super::temp_touch::collect_temp_touch_positions;
 use super::walk::for_each_nested_block_mut;
 
 use self::adjacent::{try_collapse_adjacent_local_seed_handoff, try_collapse_guarded_local_update};
@@ -257,12 +257,11 @@ fn collapse_block_handoffs(
         control_facts,
     );
     let mut index = 0;
-    let mut stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
     let mut captured_bindings;
 
     loop {
         let action = {
-            let temp_touches = TempTouchIndex::from_sets(&stmt_temp_refs);
+            let temp_touches = collect_temp_touch_positions(&block.stmts);
             let label_jumps = LabelJumpIndex::new(&block.stmts);
             captured_bindings = collect_captured_bindings(&block.stmts);
             let region_results = RegionResultIndex::new(&block.stmts);
@@ -330,7 +329,6 @@ fn collapse_block_handoffs(
         if matches!(action, HandoffAction::AdvanceIndex) {
             index += 1;
         }
-        stmt_temp_refs = collect_temp_refs_by_stmt(&block.stmts);
     }
 
     changed

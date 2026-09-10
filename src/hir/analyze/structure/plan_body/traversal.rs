@@ -13,6 +13,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             proto,
             lowering,
             index,
+            emitted_scope_boundaries: 0,
             #[cfg(debug_assertions)]
             emitted_labels: vec![false; lowering.structure.plan().labels().len()],
             #[cfg(debug_assertions)]
@@ -38,7 +39,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                             region: region.index(),
                         },
                     )?;
-                    let mut prefix = Vec::new();
+                    let mut prefix = PlannedBlock::new();
                     self.emit_region_label(region, &mut prefix)?;
                     let mut region_local_decls = local_decl_stmts(
                         self.lowering
@@ -55,16 +56,16 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         .single_pass_for_region(region)
                         .is_some();
                     let outer_prefix = if single_pass {
-                        std::mem::take(&mut region_local_decls)
+                        PlannedBlock::from(std::mem::take(&mut region_local_decls))
                     } else {
-                        Vec::new()
+                        PlannedBlock::new()
                     };
-                    prefix.append(&mut region_local_decls);
-                    prefix.extend(self.lower_region_inputs(region)?);
+                    prefix.extend_plain(region_local_decls);
+                    prefix.extend_plain(self.lower_region_inputs(region)?);
                     match node {
                         RegionPlan::Block { block, .. } => {
-                            prefix.extend(self.lower_block(region, *block)?.stmts);
-                            results.push(HirBlock { stmts: prefix });
+                            prefix.append(self.lower_block(region, *block)?);
+                            results.push(prefix);
                         }
                         RegionPlan::Sequence { children, .. } => {
                             let result_start = results.len();
@@ -100,8 +101,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                             tasks.push(LowerTask::Region(*then_arm));
                         }
                         RegionPlan::ValueDecision { plan, .. } => {
-                            prefix.extend(self.lower_value_decision(region, *plan)?.stmts);
-                            results.push(HirBlock { stmts: prefix });
+                            prefix.append(self.lower_value_decision(region, *plan)?);
+                            results.push(prefix);
                         }
                         RegionPlan::Loop {
                             plan,
@@ -186,10 +187,10 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                             Ok(stmts) => stmts,
                             Err(detail) => return self.invalid_region(region, detail),
                         };
-                        prefix.extend(fenced);
+                        prefix.append(fenced);
                     } else {
                         for child in children {
-                            prefix.extend(child.stmts);
+                            prefix.append(child);
                         }
                     }
                     if single_pass {
@@ -210,24 +211,24 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                                 "single-pass payload is bound to another region",
                             );
                         }
-                        let mut outer = Vec::new();
+                        let mut outer = PlannedBlock::new();
                         self.emit_label(
                             fence.entry,
                             LabelPlacement::BeforeRegion(region),
                             &mut outer,
                         )?;
-                        outer.append(&mut outer_prefix);
+                        outer.append(outer_prefix);
                         outer.push(HirStmt::Repeat(Box::new(HirRepeat {
-                            body: HirBlock { stmts: prefix },
+                            body: self.finish_emission(region, prefix)?,
                             cond: HirExpr::Boolean(true),
                             lifetime: Default::default(),
                         })));
                         prefix = outer;
                     } else {
-                        outer_prefix.append(&mut prefix);
+                        outer_prefix.append(prefix);
                         prefix = outer_prefix;
                     }
-                    results.push(HirBlock { stmts: prefix });
+                    results.push(prefix);
                 }
                 LowerTask::FinishUnstructured {
                     region,
@@ -240,7 +241,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     for child in
                         self.take_lowered_children(region, &mut results, result_start, child_count)?
                     {
-                        prefix.extend(child.stmts);
+                        prefix.append(child);
                     }
                     if single_pass {
                         let Some((_, fence)) = self
@@ -260,24 +261,24 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                                 "single-pass payload is bound to another region",
                             );
                         }
-                        let mut outer = Vec::new();
+                        let mut outer = PlannedBlock::new();
                         self.emit_label(
                             fence.entry,
                             LabelPlacement::BeforeRegion(region),
                             &mut outer,
                         )?;
-                        outer.append(&mut outer_prefix);
+                        outer.append(outer_prefix);
                         outer.push(HirStmt::Repeat(Box::new(HirRepeat {
-                            body: HirBlock { stmts: prefix },
+                            body: self.finish_emission(region, prefix)?,
                             cond: HirExpr::Boolean(true),
                             lifetime: Default::default(),
                         })));
                         prefix = outer;
                     } else {
-                        outer_prefix.append(&mut prefix);
+                        outer_prefix.append(prefix);
                         prefix = outer_prefix;
                     }
-                    results.push(HirBlock { stmts: prefix });
+                    results.push(prefix);
                 }
                 LowerTask::FinishBranch {
                     region,
@@ -295,11 +296,8 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     )?;
                     let then_arm = children.remove(0);
                     let else_arm = has_else.then(|| children.remove(0));
-                    prefix.extend(
-                        self.lower_branch(region, plan, condition, then_arm, else_arm)?
-                            .stmts,
-                    );
-                    results.push(HirBlock { stmts: prefix });
+                    prefix.append(self.lower_branch(region, plan, condition, then_arm, else_arm)?);
+                    results.push(prefix);
                 }
                 LowerTask::FinishLoop {
                     region,
@@ -318,40 +316,48 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     )?;
                     let body = children.remove(0);
                     let tail = normal_tail.map(|_| children.remove(0));
-                    prefix.extend(
-                        self.lower_loop(
-                            region,
-                            plan,
-                            PlannedLoopParts {
-                                preheader,
-                                control,
-                                body,
-                                normal_tail_region: normal_tail,
-                                normal_tail_body: tail,
-                            },
-                        )?
-                        .stmts,
-                    );
-                    results.push(HirBlock { stmts: prefix });
+                    prefix.append(self.lower_loop(
+                        region,
+                        plan,
+                        PlannedLoopParts {
+                            preheader,
+                            control,
+                            body,
+                            normal_tail_region: normal_tail,
+                            normal_tail_body: tail,
+                        },
+                    )?);
+                    results.push(prefix);
                 }
             }
         }
         if results.len() != 1 {
             return self.invalid_region(id, "iterative region lowering left orphaned results");
         }
-        results.pop().ok_or(HirLowerError::MissingPlanRegion {
-            proto: self.proto.index(),
-            region: id.index(),
-        })
+        self.finish_emission(id, results.pop().expect("exactly one region result"))
+    }
+
+    pub(super) fn finish_emission(
+        &self,
+        region: RegionId,
+        output: PlannedBlock,
+    ) -> Result<HirBlock, HirLowerError> {
+        output
+            .finish()
+            .map_err(|detail| HirLowerError::InvalidPlanRegion {
+                proto: self.proto.index(),
+                region: region.index(),
+                detail,
+            })
     }
 
     pub(super) fn take_lowered_children(
         &self,
         region: RegionId,
-        results: &mut Vec<HirBlock>,
+        results: &mut Vec<PlannedBlock>,
         start: usize,
         expected: usize,
-    ) -> Result<Vec<HirBlock>, HirLowerError> {
+    ) -> Result<Vec<PlannedBlock>, HirLowerError> {
         if results.len() != start.saturating_add(expected) {
             return self.invalid_region(region, "region child results contradict containment");
         }
@@ -385,10 +391,10 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
 }
 
 fn flatten_implicit_root_scope_fence(
-    mut children: Vec<HirBlock>,
+    mut children: Vec<PlannedBlock>,
     planned_children: &[RegionId],
     fence: &ImplicitRootScopeFence,
-) -> Result<Vec<HirStmt>, &'static str> {
+) -> Result<PlannedBlock, &'static str> {
     let Some(start) = planned_children
         .iter()
         .position(|child| *child == fence.first_child)
@@ -409,29 +415,28 @@ fn flatten_implicit_root_scope_fence(
 
     let trailing = children.split_off(end);
     let scoped_children = children.split_off(start);
-    let mut flattened = children
-        .into_iter()
-        .flat_map(|child| child.stmts)
-        .collect::<Vec<_>>();
-    let mut scoped = scoped_children
-        .into_iter()
-        .flat_map(|child| child.stmts)
-        .collect::<Vec<_>>();
+    let mut flattened = PlannedBlock::new();
+    for child in children {
+        flattened.append(child);
+    }
+    let mut scoped = PlannedBlock::new();
+    for child in scoped_children {
+        scoped.append(child);
+    }
     let mut trailing = trailing.into_iter();
     let Some(mut end_child) = trailing.next() else {
         return Err("implicit root scope fence end child is empty");
     };
-    let Some(end_child_tail) = end_child.stmts.pop() else {
-        return Err("implicit root scope fence end child is empty");
-    };
-    if !matches!(end_child_tail, HirStmt::If(_)) {
+    if !matches!(end_child.last(), Some(HirStmt::If(_))) {
         return Err("implicit root scope fence end child has no terminal branch");
     }
-    scoped.extend(end_child.stmts);
-
-    flattened.push(HirStmt::Block(Box::new(HirBlock { stmts: scoped })));
-    flattened.push(end_child_tail);
-    flattened.extend(trailing.flat_map(|child| child.stmts));
+    let end_child_tail = end_child.split_off(end_child.len() - 1);
+    scoped.append(end_child);
+    flattened.push(HirStmt::Block(Box::new(scoped.finish()?)));
+    flattened.append(end_child_tail);
+    for child in trailing {
+        flattened.append(child);
+    }
     Ok(flattened)
 }
 
@@ -467,8 +472,15 @@ mod tests {
             ended_roots: BTreeSet::from([TempId(0), TempId(1)]),
         };
 
-        let flattened = flatten_implicit_root_scope_fence(children, &planned_children, &fence)
-            .expect("valid frozen fence must flatten");
+        let flattened = flatten_implicit_root_scope_fence(
+            children.into_iter().map(Into::into).collect(),
+            &planned_children,
+            &fence,
+        )
+        .expect("valid frozen fence must flatten")
+        .finish()
+        .unwrap()
+        .stmts;
 
         assert_eq!(flattened.len(), 3);
         let HirStmt::Block(scoped) = &flattened[0] else {

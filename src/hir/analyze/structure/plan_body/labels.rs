@@ -7,7 +7,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         &mut self,
         block: BlockRef,
         expected_placement: LabelPlacement,
-        stmts: &mut Vec<HirStmt>,
+        stmts: &mut PlannedBlock,
     ) -> Result<(), HirLowerError> {
         let Some(label) = self.lowering.structure.plan().label_for_block(block) else {
             return Ok(());
@@ -66,7 +66,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
     pub(super) fn emit_region_label(
         &mut self,
         region: RegionId,
-        stmts: &mut Vec<HirStmt>,
+        stmts: &mut PlannedBlock,
     ) -> Result<(), HirLowerError> {
         let entry = match self.lowering.structure.plan().region(region) {
             Some(

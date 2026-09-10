@@ -11,8 +11,6 @@ mod exprs;
 mod patterns;
 mod proto_bodies;
 
-use std::collections::BTreeSet;
-
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};
 use crate::generate::GenerateMode;
 use crate::hir::{
@@ -20,9 +18,7 @@ use crate::hir::{
     HirGlobalDecl, HirModule, HirStmt, TempId,
 };
 
-use self::analysis::{
-    block_has_continue, collect_close_temps, collect_referenced_temps_in_encounter_order,
-};
+use self::analysis::block_has_continue;
 use self::exprs::PackLoweringContext;
 use super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGlobalAttr,
@@ -216,8 +212,8 @@ impl<'a> AstLowerer<'a> {
                     proto: self.module.entry.index(),
                     child: proto_index,
                 })?;
-        let close_temps = collect_close_temps(&proto.body);
-        let mut body = self.lower_block(proto_index, &proto.body, Some(&close_temps), None)?;
+        let hoisted_temps = self.proto_bodies.take_hoisted_temps(proto_index);
+        let mut body = self.lower_block(proto_index, &proto.body, Some(&hoisted_temps), None)?;
         if let Some(failure) = &proto.failure {
             if !self.should_recover_errors() {
                 return Err(AstLowerError::ResidualHir {
@@ -255,15 +251,14 @@ impl<'a> AstLowerer<'a> {
         &mut self,
         proto_index: usize,
         block: &HirBlock,
-        root_close_temps: Option<&BTreeSet<TempId>>,
+        hoisted_temps: Option<&[TempId]>,
         continue_target: Option<AstLabelId>,
     ) -> Result<AstBlock, AstLowerError> {
         let mut stmts = Vec::new();
-        if let Some(close_temps) = root_close_temps {
-            let temp_bindings = collect_referenced_temps_in_encounter_order(block)
-                .into_iter()
-                .filter(|temp| !close_temps.contains(temp))
-                .map(|temp| self.lower_temp_binding(proto_index, temp))
+        if let Some(hoisted_temps) = hoisted_temps {
+            let temp_bindings = hoisted_temps
+                .iter()
+                .map(|&temp| self.lower_temp_binding(proto_index, temp))
                 .collect::<Vec<_>>();
             if !temp_bindings.is_empty() {
                 stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {

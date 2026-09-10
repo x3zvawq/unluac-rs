@@ -6,6 +6,7 @@
 //! 潜在事件排除仅由显式 GC 证明的 copy home；显式 fence 另记是否已物化当前代表。
 //! 不符合根保护资格的 home 仍传播确值身份，但不参与观察代表选择或签发释放事务。
 
+use super::live_read_changes::LiveReadChanges;
 use super::{ActiveCallRoot, BTreeMap, BTreeSet, CallValueId, HomeSlotKey, TempId, TempUseEvents};
 
 pub(super) struct CallValues<'a> {
@@ -15,8 +16,8 @@ pub(super) struct CallValues<'a> {
     aliases_by_home: BTreeMap<HomeSlotKey, BTreeSet<TempId>>,
     pending_observation: BTreeSet<CallValueId>,
     pending_fence: BTreeSet<CallValueId>,
-    changes: std::vec::IntoIter<(usize, TempId, bool)>,
-    uses: &'a TempUseEvents,
+    changes: LiveReadChanges,
+    uses: &'a TempUseEvents<'a>,
     index: usize,
 }
 
@@ -48,7 +49,51 @@ impl CallValue {
 }
 
 impl<'a> CallValues<'a> {
-    pub(super) fn new(uses: &'a TempUseEvents) -> Self {
+    /// 无活动根也无可继续传播的别名；历史 value arena 本身不受后续 home 写入影响。
+    pub(super) fn is_empty(&self) -> bool {
+        self.roots.is_empty() && self.by_temp.is_empty()
+    }
+
+    /// 两个索引可以重合；这个上界只选择较小的查询域，结果仍按 home 去重。
+    pub(super) fn tracked_home_count_bound(&self) -> usize {
+        self.roots.len() + self.aliases_by_home.len()
+    }
+
+    pub(super) fn tracked_homes(&self) -> impl Iterator<Item = super::HomeSlotKey> + '_ {
+        self.roots
+            .keys()
+            .chain(self.aliases_by_home.keys())
+            .copied()
+    }
+
+    pub(super) fn tracks_home(&self, home: HomeSlotKey) -> bool {
+        self.roots.contains_key(&home) || self.aliases_by_home.contains_key(&home)
+    }
+
+    pub(super) fn tracked_temps(&self) -> impl Iterator<Item = TempId> + '_ {
+        self.by_temp.keys().copied()
+    }
+
+    pub(super) fn tracked_temp_count(&self) -> usize {
+        self.by_temp.len()
+    }
+
+    pub(super) fn read_values_at(&self, index: usize) -> BTreeSet<CallValueId> {
+        let events = self.uses.events.block().reads(index);
+        if events.len() < self.by_temp.len() {
+            events
+                .iter()
+                .filter_map(|(_, temp)| self.value_for_temp(*temp))
+                .collect()
+        } else {
+            self.tracked_temps()
+                .filter(|temp| self.uses.has_read_at(*temp, index))
+                .filter_map(|temp| self.value_for_temp(temp))
+                .collect()
+        }
+    }
+
+    pub(super) fn new(uses: &'a TempUseEvents<'a>) -> Self {
         Self {
             roots: BTreeMap::new(),
             values: Vec::new(),
@@ -56,7 +101,7 @@ impl<'a> CallValues<'a> {
             aliases_by_home: BTreeMap::new(),
             pending_observation: BTreeSet::new(),
             pending_fence: BTreeSet::new(),
-            changes: uses.live_read_changes().into_iter(),
+            changes: LiveReadChanges::default(),
             uses,
             index: 0,
         }
@@ -65,13 +110,7 @@ impl<'a> CallValues<'a> {
     pub(super) fn advance(&mut self, index: usize) {
         self.index = index;
         // 释放配对查询的是本条语句读取完毕后的状态；新写入别名也从该点进入集合。
-        while self
-            .changes
-            .as_slice()
-            .first()
-            .is_some_and(|change| change.0 <= index + 1)
-        {
-            let (_, temp, live) = self.changes.next().unwrap();
+        while let Some((_, temp, live)) = self.changes.pop_through(self.uses, index + 1) {
             if let Some((value, home)) = self.by_temp.get(&temp) {
                 self.values[value.0].change_live(*home, live);
             }
@@ -109,6 +148,7 @@ impl<'a> CallValues<'a> {
     }
 
     pub(super) fn forget_temp(&mut self, temp: TempId) {
+        self.changes.remove(temp);
         if let Some((value, home)) = self.by_temp.remove(&temp) {
             self.values[value.0].aliases.remove(&temp);
             if self.uses.has_live_read_after(temp, self.index) {
@@ -131,6 +171,7 @@ impl<'a> CallValues<'a> {
         if self.uses.has_live_read_after(temp, self.index) {
             self.values[value.0].change_live(home, true);
         }
+        self.changes.schedule(self.uses, temp, self.index + 1);
     }
 
     pub(super) fn forget_home_aliases(&mut self, home: HomeSlotKey) {
@@ -185,6 +226,7 @@ impl<'a> CallValues<'a> {
     }
 
     pub(super) fn clear(&mut self) {
+        self.changes.clear();
         self.roots.clear();
         self.values.clear();
         self.by_temp.clear();

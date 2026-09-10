@@ -17,6 +17,8 @@
 //! Decision 节点和 capture binding，不把语法引用查询解释为运行可达性或子 proto 扫描。
 //! local root release 默认作为逻辑 local 写暴露；分析 VM home 的 collector 必须单独
 //! 消费该事件，不得从旧 local 的来源槽位推导一次物理覆盖。
+//! 独立 collector 可组成 tuple 共用遍历；如读集合和写事件一次收集，capture 与 release
+//! 仍逐个交给原 hook，不能由组合器统一解释其语义。
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,
@@ -51,6 +53,44 @@ pub(crate) trait HirVisitor {
         Self: Sized,
     {
         self.visit_expr(&capture.binding.expr());
+    }
+}
+
+/// 独立事实收集器共用一次遍历；每个 hook 都交给原收集器，保留各自的 capture/release 语义。
+impl<A: HirVisitor, B: HirVisitor> HirVisitor for (A, B) {
+    fn visit_block(&mut self, block: &HirBlock) {
+        self.0.visit_block(block);
+        self.1.visit_block(block);
+    }
+
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        self.0.visit_stmt(stmt);
+        self.1.visit_stmt(stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        self.0.visit_expr(expr);
+        self.1.visit_expr(expr);
+    }
+
+    fn visit_lvalue(&mut self, lvalue: &HirLValue) {
+        self.0.visit_lvalue(lvalue);
+        self.1.visit_lvalue(lvalue);
+    }
+
+    fn visit_local_root_release(&mut self, local: LocalId) {
+        self.0.visit_local_root_release(local);
+        self.1.visit_local_root_release(local);
+    }
+
+    fn visit_call(&mut self, call: &HirCallExpr) {
+        self.0.visit_call(call);
+        self.1.visit_call(call);
+    }
+
+    fn visit_capture(&mut self, capture: &HirCapture) {
+        self.0.visit_capture(capture);
+        self.1.visit_capture(capture);
     }
 }
 

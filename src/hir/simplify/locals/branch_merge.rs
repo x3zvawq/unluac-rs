@@ -4,7 +4,7 @@
 //! temp 赋值，合流之后又继续读取这个 temp。这里会把这种 temp 报告给主 pass，让主 pass
 //! 在 if 前分配一个空 local，再由两条分支写回同一个 binding。
 //!
-//! 本文件消费共享 `HirFlowGraph` topology/worklist、当前 HIR 语义事件和 `TempTouchIndex`，
+//! 本文件消费共享 `HirFlowGraph` topology/worklist、当前 HIR 语义事件和 `RootEventBlock`，
 //! 只声明 must 状态的 transfer/intersection，不自行解析 label/goto/loop，也不分配 local、
 //! 不改写语句。分支摘要同时
 //! 维护“所有合流路径都已写入”和“首次写入前可能读取”，因此主 pass 只会在声明可以
@@ -19,9 +19,8 @@
 use std::collections::BTreeSet;
 
 use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
-use super::super::temp_touch::{
-    TempTouchIndex, collect_temp_reads_in_stmts, collect_temp_refs_in_expr,
-};
+use super::super::root_lifetimes::RootEventBlock;
+use super::super::temp_touch::{collect_temp_reads_in_stmts, collect_temp_refs_in_expr};
 use crate::hir::common::{HirBlock, HirLValue, HirStmt, TempId};
 use crate::hir::expr_safety::HirExprSafety;
 
@@ -35,7 +34,7 @@ struct FallthroughSummary {
 pub(super) fn candidate_temps(
     owner_stmts: &[HirStmt],
     stmt: &HirStmt,
-    temp_touches: &TempTouchIndex,
+    event_block: RootEventBlock<'_>,
     stmt_index: usize,
     is_reserved: &dyn Fn(TempId) -> bool,
     safety: HirExprSafety,
@@ -77,7 +76,7 @@ pub(super) fn candidate_temps(
         .filter(|temp| !is_reserved(*temp))
         .filter(|temp| !reads_before_assignment.contains(temp))
         .filter(|temp| {
-            if !temp_touches.has_before(temp, stmt_index)
+            if !event_block.has_touch_before(*temp, stmt_index)
                 || prefix_cfg
                     .get_or_insert_with(|| {
                         RegionTempFlow::for_stmts(&owner_stmts[..stmt_index], safety).ok()
@@ -95,7 +94,7 @@ pub(super) fn candidate_temps(
         })
         // 合流后没有任何后续 touch 的 branch temp 不形成跨语句
         // 源码 binding；dead-temps 会独立审计其中可删除的写，其余 effect/root 写仍保留原形。
-        .filter(|temp| temp_touches.has_at_or_after(temp, stmt_index + 1))
+        .filter(|temp| event_block.has_touch_from(*temp, stmt_index + 1))
         .collect()
 }
 
@@ -366,12 +365,22 @@ mod tests {
     }
 
     fn candidates(stmt: &HirStmt, temp: TempId) -> Vec<TempId> {
-        let stmt_refs = [BTreeSet::from([temp]), BTreeSet::from([temp])];
-        let owner_stmts = [stmt.clone()];
+        let owner_stmts = [
+            stmt.clone(),
+            HirStmt::Return(Box::new(HirReturn {
+                source_instr: None,
+                values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
+            })),
+        ];
+        let index = super::super::super::root_lifetimes::RootEventIndex::new(
+            &owner_stmts,
+            &Default::default(),
+            HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Auto),
+        );
         candidate_temps(
             &owner_stmts,
             stmt,
-            &TempTouchIndex::from_sets(&stmt_refs),
+            index.root(),
             0,
             &|_| false,
             HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Auto),
@@ -388,11 +397,15 @@ mod tests {
                 values: HirValuePack::fixed(vec![HirExpr::TempRef(temp)]),
             })),
         ];
-        let stmt_refs = vec![BTreeSet::from([temp]); stmts.len()];
+        let index = super::super::super::root_lifetimes::RootEventIndex::new(
+            &stmts,
+            &Default::default(),
+            HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Lua54),
+        );
         candidate_temps(
             &stmts,
             &stmts[1],
-            &TempTouchIndex::from_sets(&stmt_refs),
+            index.root(),
             1,
             &|_| false,
             HirExprSafety::for_dialect(crate::decompile::DecompileDialect::Lua54),

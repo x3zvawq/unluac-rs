@@ -1350,6 +1350,16 @@ impl HirBinding {
             _ => None,
         }
     }
+
+    pub(crate) fn from_lvalue(lvalue: &HirLValue) -> Option<Self> {
+        match *lvalue {
+            HirLValue::Param(id) => Some(Self::Param(id)),
+            HirLValue::Local(id) => Some(Self::Local(id)),
+            HirLValue::Temp(id) => Some(Self::Temp(id)),
+            HirLValue::Upvalue(id) => Some(Self::Upvalue(id)),
+            HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
+        }
+    }
 }
 
 /// 父级绑定与捕获方式独立保存；ByValue 读取快照，ByReference 保留可写 cell。

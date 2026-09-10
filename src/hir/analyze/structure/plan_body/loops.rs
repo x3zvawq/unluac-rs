@@ -8,7 +8,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         region: RegionId,
         plan: crate::structure::LoopPlanId,
         parts: PlannedLoopParts,
-    ) -> Result<HirBlock, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         let PlannedLoopParts {
             preheader,
             control,
@@ -40,7 +40,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             normal_tail_body,
         ) {
             (false, None, None) => None,
-            (true, Some(_), Some(tail)) if tail.stmts.is_empty() => None,
+            (true, Some(_), Some(tail)) if tail.is_empty() => None,
             (true, Some(_), Some(tail)) => Some((
                 tail,
                 self.lowering
@@ -113,7 +113,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 return self
                     .invalid_region(region, "propagated break does not target a containing loop");
             }
-            lowered.stmts.push(HirStmt::Break);
+            lowered.push(HirStmt::Break);
         }
         Ok(lowered)
     }
@@ -122,11 +122,11 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         &mut self,
         region: RegionId,
         control: RegionId,
-        mut body: HirBlock,
-        normal_tail: Option<(HirBlock, TempId)>,
+        body: PlannedBlock,
+        normal_tail: Option<(PlannedBlock, TempId)>,
         propagated_break: Option<RegionId>,
         protocol: LoopConditionProtocol,
-    ) -> Result<HirBlock, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         let condition = self.lower_loop_condition(region, control, Some(protocol.condition))?;
         let body_edge = protocol.body_edge;
         let exit_edge = protocol.exit_edge;
@@ -146,7 +146,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             _ => None,
         };
 
-        let mut stmts = Vec::new();
+        let mut stmts = PlannedBlock::new();
         if let Some((_, guard)) = &normal_tail {
             stmts.push(assign_stmt(
                 vec![HirLValue::Temp(*guard)],
@@ -187,31 +187,31 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             && cross_loop_transfer.is_none()
             && matches!(exit.stmts.as_slice(), [HirStmt::Break])
         {
-            loop_body.extend(self.lower_edge(region, body_edge)?.stmts);
-            loop_body.append(&mut body.stmts);
+            loop_body.extend_plain(self.lower_edge(region, body_edge)?.stmts);
+            loop_body.append(body);
             stmts.push(HirStmt::While(Box::new(HirWhile {
                 cond,
-                body: HirBlock { stmts: loop_body },
+                body: self.finish_emission(region, loop_body)?,
             })));
-            return Ok(HirBlock { stmts });
+            return Ok(stmts);
         }
         loop_body.push(branch_stmt(cond.negate(), exit, None));
-        loop_body.extend(self.lower_edge(region, body_edge)?.stmts);
-        loop_body.append(&mut body.stmts);
+        loop_body.extend_plain(self.lower_edge(region, body_edge)?.stmts);
+        loop_body.append(body);
         if normal_tail.is_some()
             && exit_transfer == EdgeTransfer::BranchArm(crate::structure::BranchArm::LoopExit)
         {
             // generalized while 的 normal-tail guard 已把“正常退出”和提前 break
             // 分开；自然 LoopExit 证明这份独占 tail 是 post-tested 词法形状。
             stmts.push(HirStmt::Repeat(Box::new(HirRepeat {
-                body: HirBlock { stmts: loop_body },
+                body: self.finish_emission(region, loop_body)?,
                 cond: HirExpr::Boolean(false),
                 lifetime: Default::default(),
             })));
         } else {
             stmts.push(HirStmt::While(Box::new(HirWhile {
                 cond: HirExpr::Boolean(true),
-                body: HirBlock { stmts: loop_body },
+                body: self.finish_emission(region, loop_body)?,
             })));
         }
         if let Some(target) = cross_loop_transfer {
@@ -223,12 +223,16 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             }
             // control_edges.exit 冻结内层语法退出，edge transfer 冻结退出后继续
             // break 外层；phi actions 只在内层 loop 完成后消费一次。
-            stmts.extend(self.lower_edge(region, exit_edge)?.stmts);
+            stmts.extend_plain(self.lower_edge(region, exit_edge)?.stmts);
         }
         if let Some((tail, guard)) = normal_tail {
-            stmts.push(branch_stmt(HirExpr::TempRef(guard).negate(), tail, None));
+            stmts.push(branch_stmt(
+                HirExpr::TempRef(guard).negate(),
+                self.finish_emission(region, tail)?,
+                None,
+            ));
         }
-        Ok(HirBlock { stmts })
+        Ok(stmts)
     }
 
     pub(super) fn lower_repeat_loop(
@@ -236,9 +240,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         region: RegionId,
         plan: crate::structure::LoopPlanId,
         control: RegionId,
-        mut body: HirBlock,
+        body: PlannedBlock,
         protocol: &LoopRepeatProtocol,
-    ) -> Result<HirBlock, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         let mut condition =
             self.lower_loop_condition(region, control, Some(protocol.condition.condition))?;
         let backedge = protocol.condition.body_edge;
@@ -304,13 +308,13 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             })
             .collect::<Result<Vec<_>, HirLowerError>>()?;
 
-        let mut body_stmts = Vec::new();
+        let mut body_stmts = PlannedBlock::new();
         if protocol.prefix_placement == crate::structure::LoopConditionPrefixPlacement::BeforeBody {
-            body_stmts.append(&mut condition.prefix);
+            body_stmts.append(std::mem::take(&mut condition.prefix));
         }
-        body_stmts.append(&mut body.stmts);
+        body_stmts.append(body);
         if protocol.prefix_placement == crate::structure::LoopConditionPrefixPlacement::AfterBody {
-            body_stmts.extend(condition.prefix);
+            body_stmts.append(condition.prefix);
         }
         if !normal_stage.is_empty() {
             let (targets, values): (Vec<_>, Vec<_>) = normal_stage
@@ -351,20 +355,20 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     "repeat native exit contradicts its staged-result protocol",
                 );
             }
-            body_stmts.extend(backedge_stmts);
-            let mut stmts = vec![HirStmt::Repeat(Box::new(HirRepeat {
-                body: HirBlock { stmts: body_stmts },
+            body_stmts.extend_plain(backedge_stmts);
+            let mut stmts = PlannedBlock::from(vec![HirStmt::Repeat(Box::new(HirRepeat {
+                body: self.finish_emission(region, body_stmts)?,
                 cond: exit_cond,
                 lifetime: Default::default(),
-            }))];
+            }))]);
             if !final_stage.is_empty() {
                 let (targets, values): (Vec<_>, Vec<_>) = final_stage.into_iter().unzip();
                 stmts.push(assign_stmt(targets, values));
             }
             if protocol.exit_after_loop {
-                stmts.extend(self.lower_edge(region, exit)?.stmts);
+                stmts.extend_plain(self.lower_edge(region, exit)?.stmts);
             }
-            return Ok(HirBlock { stmts });
+            return Ok(stmts);
         }
         if !protocol.value_plan.staged_results.is_empty() || protocol.exit_after_loop {
             return self.invalid_region(region, "non-native repeat retains native exit actions");
@@ -381,13 +385,13 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         // 两个 arm 分别执行 final plan 冻结的 exit/backedge actions。显式 continue
         // 会直接跳到 repeat 条件，因而不能在这里把真实条件替换成 false。
         if matches!(protocol.form, LoopRepeatForm::TailBranchRepeat) {
-            return Ok(HirBlock {
-                stmts: vec![HirStmt::Repeat(Box::new(HirRepeat {
-                    body: HirBlock { stmts: body_stmts },
+            return Ok(PlannedBlock::from(vec![HirStmt::Repeat(Box::new(
+                HirRepeat {
+                    body: self.finish_emission(region, body_stmts)?,
                     cond: HirExpr::Boolean(false),
                     lifetime: Default::default(),
-                }))],
-            });
+                },
+            ))]));
         }
         self.invalid_region(region, "repeat protocol has an unknown lowering form")
     }
@@ -396,16 +400,16 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         &mut self,
         region: RegionId,
         control: RegionId,
-        mut body: HirBlock,
-    ) -> Result<HirBlock, HirLowerError> {
+        body: PlannedBlock,
+    ) -> Result<PlannedBlock, HirLowerError> {
         let mut stmts = self.lower_syntax_region_prefix(region, control, None)?;
-        stmts.append(&mut body.stmts);
-        Ok(HirBlock {
-            stmts: vec![HirStmt::While(Box::new(HirWhile {
+        stmts.append(body);
+        Ok(PlannedBlock::from(vec![HirStmt::While(Box::new(
+            HirWhile {
                 cond: HirExpr::Boolean(true),
-                body: HirBlock { stmts },
-            }))],
-        })
+                body: self.finish_emission(region, stmts)?,
+            },
+        ))]))
     }
 
     pub(super) fn lower_numeric_for(
@@ -413,9 +417,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         region: RegionId,
         loop_: PlannedLoopIdentity,
         regions: PlannedForRegions,
-        mut body: HirBlock,
+        body: PlannedBlock,
         protocol: crate::structure::NumericForProtocol,
-    ) -> Result<HirBlock, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         let PlannedForRegions {
             preheader,
             control,
@@ -453,7 +457,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 detail: "numeric for has no selected source binding",
             })?;
         let mut stmts = self.lower_syntax_region_prefix(region, preheader_region, None)?;
-        stmts.extend(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
+        stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
         if let Some((_, guard)) = &normal_tail {
             stmts.push(assign_stmt(
                 vec![HirLValue::Temp(*guard)],
@@ -474,13 +478,16 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             protocol.limit,
         );
         let step = expr_for_reg_use(self.lowering, preheader, protocol.init_instr, protocol.step);
-        let mut loop_stmts = self.lower_loop_value_phase(region, LoopValuePhase::BodyPrologue)?;
-        loop_stmts.append(&mut body.stmts);
+        let mut loop_stmts =
+            PlannedBlock::from(self.lower_loop_value_phase(region, LoopValuePhase::BodyPrologue)?);
+        loop_stmts.append(body);
         if protocol.body_completes_normally {
-            loop_stmts.extend(self.lower_syntax_region_prefix(region, control, None)?);
+            loop_stmts.append(self.lower_syntax_region_prefix(region, control, None)?);
+            loop_stmts.extend_plain(
+                self.lower_loop_value_phase(region, LoopValuePhase::IterationEpilogue)?,
+            );
             loop_stmts
-                .extend(self.lower_loop_value_phase(region, LoopValuePhase::IterationEpilogue)?);
-            loop_stmts.extend(self.lower_loop_value_phase(region, LoopValuePhase::LatchEpilogue)?);
+                .extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::LatchEpilogue)?);
         } else {
             self.consume_syntax_region(region, control)?;
         }
@@ -489,15 +496,19 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             start,
             limit,
             step,
-            body: HirBlock { stmts: loop_stmts },
+            body: self.finish_emission(region, loop_stmts)?,
         })));
-        stmts.extend(self.lower_loop_value_phase(region, LoopValuePhase::AfterLoop)?);
+        stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::AfterLoop)?);
         if let Some((tail, guard)) = normal_tail {
-            stmts.push(branch_stmt(HirExpr::TempRef(guard).negate(), tail, None));
+            stmts.push(branch_stmt(
+                HirExpr::TempRef(guard).negate(),
+                self.finish_emission(region, tail)?,
+                None,
+            ));
         }
         let exit_plan = self.planned_edge(region, protocol.exit_edge)?;
-        stmts.extend(self.lower_edge_after_effects(region, protocol.exit_edge, exit_plan)?);
-        Ok(HirBlock { stmts })
+        stmts.extend_plain(self.lower_edge_after_effects(region, protocol.exit_edge, exit_plan)?);
+        Ok(stmts)
     }
 
     pub(super) fn lower_generic_for(
@@ -505,9 +516,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         region: RegionId,
         loop_: PlannedLoopIdentity,
         regions: PlannedForRegions,
-        mut body: HirBlock,
+        body: PlannedBlock,
         protocol: crate::structure::GenericForProtocol,
-    ) -> Result<HirBlock, HirLowerError> {
+    ) -> Result<PlannedBlock, HirLowerError> {
         let PlannedForRegions {
             preheader,
             control,
@@ -563,43 +574,50 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             protocol,
             self.proto,
             region.index(),
-            &mut stmts,
+            stmts.stmts_mut(),
         );
-        stmts.extend(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
+        stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
         if let Some((_, guard)) = &normal_tail {
             stmts.push(assign_stmt(
                 vec![HirLValue::Temp(*guard)],
                 vec![HirExpr::Boolean(false)],
             ));
         }
-        let mut loop_stmts = self.lower_loop_value_phase(region, LoopValuePhase::BodyPrologue)?;
-        loop_stmts.append(&mut body.stmts);
+        let mut loop_stmts =
+            PlannedBlock::from(self.lower_loop_value_phase(region, LoopValuePhase::BodyPrologue)?);
+        loop_stmts.append(body);
         self.consume_syntax_region(region, control)?;
         if protocol.body_completes_normally {
-            loop_stmts
-                .extend(self.lower_loop_value_phase(region, LoopValuePhase::IterationEpilogue)?);
+            loop_stmts.extend_plain(
+                self.lower_loop_value_phase(region, LoopValuePhase::IterationEpilogue)?,
+            );
             if protocol.immediate_break {
                 loop_stmts.push(HirStmt::Break);
             } else {
-                loop_stmts
-                    .extend(self.lower_loop_value_phase(region, LoopValuePhase::LatchEpilogue)?);
+                loop_stmts.extend_plain(
+                    self.lower_loop_value_phase(region, LoopValuePhase::LatchEpilogue)?,
+                );
             }
         }
         stmts.push(HirStmt::GenericFor(Box::new(HirGenericFor {
             bindings,
             iterator: lower_generic_for_iterator(self.lowering, preheader, protocol).into(),
-            body: HirBlock { stmts: loop_stmts },
+            body: self.finish_emission(region, loop_stmts)?,
             initializer_transaction,
             initializer_roots,
             dispatch_results,
         })));
-        stmts.extend(self.lower_loop_value_phase(region, LoopValuePhase::AfterLoop)?);
+        stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::AfterLoop)?);
         if let Some((tail, guard)) = normal_tail {
-            stmts.push(branch_stmt(HirExpr::TempRef(guard).negate(), tail, None));
+            stmts.push(branch_stmt(
+                HirExpr::TempRef(guard).negate(),
+                self.finish_emission(region, tail)?,
+                None,
+            ));
         }
         let exit_plan = self.planned_edge(region, protocol.exit_edge)?;
-        stmts.extend(self.lower_edge_after_effects(region, protocol.exit_edge, exit_plan)?);
-        Ok(HirBlock { stmts })
+        stmts.extend_plain(self.lower_edge_after_effects(region, protocol.exit_edge, exit_plan)?);
+        Ok(stmts)
     }
 
     pub(super) fn lower_loop_condition(

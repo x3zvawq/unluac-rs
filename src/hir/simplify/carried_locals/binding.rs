@@ -239,22 +239,6 @@ impl HirRewritePass for BindingClassRewritePass<'_> {
     }
 }
 
-pub(super) struct TempToBindingPass<'a> {
-    pub(super) rewrites: Vec<TempBindingRewrite>,
-    pub(super) promotion_facts: &'a mut ProtoPromotionFacts,
-}
-
-impl TempToBindingPass<'_> {
-    fn binding_for_temp(&mut self, temp: TempId) -> Option<CarryBinding> {
-        let rewritten = self
-            .rewrites
-            .iter()
-            .find_map(|rewrite| (rewrite.from == temp).then_some(rewrite.to))?;
-        record_binding_merge(CarryBinding::Temp(temp), rewritten, self.promotion_facts);
-        Some(rewritten)
-    }
-}
-
 pub(super) fn record_binding_merge(
     source: CarryBinding,
     target: CarryBinding,
@@ -271,7 +255,8 @@ pub(super) fn record_binding_merge(
             promotion_facts.supplemental_local_definition_write_homes(local)
         }
         CarryBinding::Temp(temp) => promotion_facts.supplemental_temp_definition_write_homes(temp),
-    };
+    }
+    .into_owned();
     match target {
         CarryBinding::Param(param) => {
             promotion_facts.merge_param_definition_write_homes(param, source_definition_write_homes)
@@ -297,52 +282,52 @@ pub(super) fn record_binding_merge(
     }
 }
 
-impl HirRewritePass for TempToBindingPass<'_> {
-    fn rewrite_capture(&mut self, capture: &mut crate::hir::HirCapture) -> bool {
-        let crate::hir::HirBinding::Temp(temp) = capture.binding else {
-            return false;
-        };
-        let Some(binding) = self.binding_for_temp(temp) else {
-            return false;
-        };
-        capture.binding = carry_capture_binding(binding);
-        true
-    }
-
-    fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
-        let HirExpr::TempRef(temp) = expr else {
-            return false;
-        };
-        let Some(binding) = self.binding_for_temp(*temp) else {
-            return false;
-        };
-        *expr = match binding {
-            CarryBinding::Param(param) => HirExpr::ParamRef(param),
-            CarryBinding::Local(local) => HirExpr::LocalRef(local),
-            CarryBinding::Temp(temp) => HirExpr::TempRef(temp),
-        };
-        true
-    }
-
-    fn rewrite_lvalue(&mut self, lvalue: &mut HirLValue) -> bool {
-        let HirLValue::Temp(temp) = lvalue else {
-            return false;
-        };
-        let Some(binding) = self.binding_for_temp(*temp) else {
-            return false;
-        };
-        *lvalue = match binding {
-            CarryBinding::Param(param) => HirLValue::Param(param),
-            CarryBinding::Local(local) => HirLValue::Local(local),
-            CarryBinding::Temp(temp) => HirLValue::Temp(temp),
-        };
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temp_rewrites_merge_facts_per_hit_without_following_mapping_chains() {
+        use crate::hir::{HirBinding, HirCapture, HirCaptureMode};
+
+        let first = TempId(0);
+        let second = TempId(1);
+        let local = LocalId(0);
+        let home = HomeSlotKey::new(2, 0);
+        let mut facts = ProtoPromotionFacts::default();
+        facts.merge_temp_definition_write_homes(first, BTreeSet::from([home]));
+        let mut pass = BindingClassRewritePass {
+            rewrites: BTreeMap::from([
+                (CarryBinding::Temp(first), CarryBinding::Temp(second)),
+                (CarryBinding::Temp(second), CarryBinding::Local(local)),
+            ]),
+            promotion_facts: &mut facts,
+        };
+        let mut expr = HirExpr::TempRef(first);
+        assert!(pass.rewrite_expr(&mut expr));
+        assert_eq!(expr, HirExpr::TempRef(second));
+        assert!(
+            pass.promotion_facts
+                .supplemental_local_definition_write_homes(local)
+                .is_empty()
+        );
+
+        let mut capture = HirCapture {
+            mode: HirCaptureMode::ByReference,
+            binding: HirBinding::Temp(second),
+        };
+        assert!(pass.rewrite_capture(&mut capture));
+        assert_eq!(capture.binding, HirBinding::Local(local));
+        assert_eq!(capture.mode, HirCaptureMode::ByReference);
+        let mut lvalue = HirLValue::Temp(second);
+        assert!(pass.rewrite_lvalue(&mut lvalue));
+        assert_eq!(lvalue, HirLValue::Local(local));
+        assert!(!pass.rewrite_lvalue(&mut lvalue));
+        assert_eq!(
+            *facts.supplemental_local_definition_write_homes(local),
+            BTreeSet::from([home])
+        );
+    }
 
     #[test]
     fn binding_merge_propagates_finite_possible_home_union() {

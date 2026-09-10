@@ -297,7 +297,23 @@ impl PlanLoweringIndex {
             }
         }
 
+        let mut scope_starts = BTreeMap::<_, Vec<_>>::new();
+        let mut scope_ends = BTreeMap::<_, Vec<_>>::new();
+        for (id, scope) in lowering.bindings.lexical_scopes.iter().enumerate() {
+            let block = lowering.cfg.instr_to_block[scope.start];
+            let start = lowering.cfg.blocks[block.index()].instrs.start.index();
+            // 一个 global declaration transaction 只能整体物化，不能切开其低层输入。
+            if lowering.global_decls.splits_protocol(start, scope.start)
+                || lowering.global_decls.splits_protocol(start, scope.end)
+            {
+                continue;
+            }
+            scope_starts.entry(scope.start).or_default().push(id);
+            scope_ends.entry(scope.end).or_default().push(id);
+        }
         Ok(Self {
+            scope_starts,
+            scope_ends,
             plain_block_count,
             single_plain_block,
             region_inputs,

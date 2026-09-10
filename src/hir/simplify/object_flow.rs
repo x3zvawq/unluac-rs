@@ -16,7 +16,7 @@ use super::lexical_cfg::{
 };
 use crate::hir::common::{
     HirBinding, HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProtoRef, HirStmt,
-    HirTableField, HirValuePack, TempId, UpvalueId,
+    HirTableConstructor, HirTableField, HirValuePack, TempId, UpvalueId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -29,6 +29,12 @@ pub(super) enum ObjectId {
         producer: HirProtoRef,
         closure: HirProtoRef,
     },
+}
+
+impl ObjectId {
+    fn table(table: &HirTableConstructor) -> Self {
+        Self::Table(std::ptr::from_ref(table).addr())
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -428,8 +434,7 @@ fn direct_holder_values(
     match expr {
         HirExpr::Closure(closure) => BTreeSet::from([ObjectId::Closure(closure.proto)]),
         HirExpr::TableConstructor(table) => {
-            let mut holders =
-                BTreeSet::from([ObjectId::Table(std::ptr::from_ref(table.as_ref()).addr())]);
+            let mut holders = BTreeSet::from([ObjectId::table(table)]);
             for field in &table.fields {
                 match field {
                     HirTableField::Array(value) => {
@@ -520,9 +525,7 @@ fn table_values(expr: &HirExpr, state: &RootState) -> BTreeSet<ObjectId> {
         return state.tables.get(&binding).cloned().unwrap_or_default();
     }
     match expr {
-        HirExpr::TableConstructor(table) => {
-            BTreeSet::from([ObjectId::Table(std::ptr::from_ref(table.as_ref()).addr())])
-        }
+        HirExpr::TableConstructor(table) => BTreeSet::from([ObjectId::table(table)]),
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             let mut values = table_values(&logical.lhs, state);
             values.extend(table_values(&logical.rhs, state));
@@ -714,7 +717,7 @@ pub(super) fn observe_expr(
             if let Some(tail) = &table.trailing_multivalue {
                 observe_expr(tail.as_expr(), state, captures, effects, safety);
             }
-            let object = ObjectId::Table(std::ptr::from_ref(table.as_ref()).addr());
+            let object = ObjectId::table(table);
             state.allocations.insert(object);
             let mut contents = holder_values(expr, state, effects);
             contents.remove(&object);
@@ -941,49 +944,63 @@ pub(super) fn closure_captures_in_block(
     closure_captures_in_stmts(&block.stmts)
 }
 
-fn closure_captures_in_stmts(stmts: &[HirStmt]) -> BTreeMap<HirProtoRef, Vec<HirCapture>> {
-    #[derive(Default)]
-    struct CaptureCollector(BTreeMap<HirProtoRef, Vec<HirCapture>>);
+#[derive(Default)]
+struct CaptureCollector(BTreeMap<HirProtoRef, Vec<HirCapture>>);
 
-    impl crate::hir::visit::HirVisitor for CaptureCollector {
-        fn visit_expr(&mut self, expr: &HirExpr) {
-            if let HirExpr::Closure(closure) = expr
-                && let Some(previous) = self.0.insert(closure.proto, closure.captures.clone())
-            {
-                debug_assert_eq!(
-                    previous, closure.captures,
-                    "a child proto must have one capture shape within its lexical parent"
-                );
-            }
+impl crate::hir::visit::HirVisitor for CaptureCollector {
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::Closure(closure) = expr
+            && let Some(previous) = self.0.insert(closure.proto, closure.captures.clone())
+        {
+            debug_assert_eq!(
+                previous, closure.captures,
+                "a child proto must have one capture shape within its lexical parent"
+            );
         }
     }
+}
 
+fn closure_captures_in_stmts(stmts: &[HirStmt]) -> BTreeMap<HirProtoRef, Vec<HirCapture>> {
     let mut captures = CaptureCollector::default();
     crate::hir::visit::visit_stmts(stmts, &mut captures);
     captures.0
 }
 
-/// 当前不可变语句切片内 allocation 到观察点的正向事实；指针只作本次分析的 site key。
+/// 借用当前不可变语句快照；地址只在对象流内部标识 occurrence，不作为跨模块协议。
 /// 缺失或不可达状态不签发未逃逸证明。调用方仍拥有物理 home 与删除事务。
-#[derive(Default)]
-pub(super) struct AllocationEscapeFacts {
+pub(super) struct AllocationEscapeFacts<'hir> {
+    stmts: &'hir [HirStmt],
     unescaped: BTreeMap<usize, BTreeSet<ObjectId>>,
 }
 
-impl AllocationEscapeFacts {
+impl<'hir> AllocationEscapeFacts<'hir> {
     pub(super) fn analyze(
-        stmts: &[HirStmt],
+        stmts: &'hir [HirStmt],
         context: RootAnalysisContext<'_>,
         opaque: &BTreeSet<TempId>,
+        queries: impl IntoIterator<Item = (usize, &'hir HirTableConstructor)>,
     ) -> Self {
+        let mut facts = Self {
+            stmts,
+            unescaped: BTreeMap::new(),
+        };
+        let mut requested = BTreeMap::<_, BTreeSet<_>>::new();
+        for (index, table) in queries {
+            requested
+                .entry(std::ptr::from_ref(&stmts[index]).addr())
+                .or_default()
+                .insert(ObjectId::table(table));
+        }
+        if requested.is_empty() {
+            return facts;
+        }
         let RootAnalysisContext { safety, effects } = context;
         let Ok(graph) = HirFlowGraph::for_stmts(stmts, safety) else {
-            return Self::default();
+            return facts;
         };
         if graph.has_reachable_unresolved_goto() {
-            return Self::default();
+            return facts;
         }
-        let captures = closure_captures_in_stmts(stmts);
         struct ExternalBindings(BTreeSet<HirBinding>);
         impl crate::hir::visit::HirVisitor for ExternalBindings {
             fn visit_expr(&mut self, expr: &HirExpr) {
@@ -992,10 +1009,14 @@ impl AllocationEscapeFacts {
                 }
             }
         }
-        let mut external = ExternalBindings(BTreeSet::new());
-        crate::hir::visit::visit_stmts(stmts, &mut external);
+        let mut inputs = (
+            CaptureCollector::default(),
+            ExternalBindings(BTreeSet::new()),
+        );
+        crate::hir::visit::visit_stmts(stmts, &mut inputs);
+        let (CaptureCollector(captures), ExternalBindings(external)) = inputs;
         let initial = RootState {
-            unknown_collectable: external.0,
+            unknown_collectable: external,
             ..RootState::default()
         };
         let unescaped = graph.solve_forward(
@@ -1006,31 +1027,32 @@ impl AllocationEscapeFacts {
                 let HirFlowNodeKind::Stmt(stmt) = kind else {
                     return None;
                 };
+                let address = std::ptr::from_ref(stmt).addr();
+                let objects = requested.get(&address)?;
                 let escaped = reachable_holders(state.escaped.clone(), state);
                 Some((
-                    std::ptr::from_ref(stmt).addr(),
-                    state
-                        .allocations
+                    address,
+                    objects
                         .iter()
                         .copied()
                         .filter(|object| {
-                            reachable_holders(BTreeSet::from([*object]), state)
-                                .is_disjoint(&escaped)
+                            state.allocations.contains(object)
+                                && reachable_holders(BTreeSet::from([*object]), state)
+                                    .is_disjoint(&escaped)
                         })
                         .collect(),
                 ))
             },
             |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
-        Self {
-            unescaped: unescaped.into_iter().flatten().flatten().collect(),
-        }
+        facts.unescaped = unescaped.into_iter().flatten().flatten().collect();
+        facts
     }
 
-    pub(super) fn proves_unescaped(&self, allocation_site: usize, stmt: &HirStmt) -> bool {
+    pub(super) fn proves_unescaped(&self, table: &HirTableConstructor, stmt_index: usize) -> bool {
         self.unescaped
-            .get(&std::ptr::from_ref(stmt).addr())
-            .is_some_and(|objects| objects.contains(&ObjectId::Table(allocation_site)))
+            .get(&std::ptr::from_ref(&self.stmts[stmt_index]).addr())
+            .is_some_and(|objects| objects.contains(&ObjectId::table(table)))
     }
 }
 

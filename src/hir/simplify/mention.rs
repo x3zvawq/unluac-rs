@@ -3,6 +3,8 @@
 //! 多个 pass 都需要回答“某段 HIR 是否还引用某个 local/temp”以及“某条语句是否写入
 //! temp”。这些问题属于只读树遍历，不应散落在各个 pass 里各写一套 visitor。
 //! 本模块只提供语法树提及事实，不判断 carried-local、branch-value 等业务形状。
+//! 直接读取统一发布 HirBinding，home 投影消费 Promotion 的完整可能集合；例如 closure
+//! capture 只读取父 binding，upvalue 不占当前 frame 的槽，不能从名字或局部编号推断 home。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -59,6 +61,32 @@ pub(super) struct ReferenceCapturedBindings {
 }
 
 impl ReferenceCapturedBindings {
+    /// 身份合并后使用完整 possible homes；Unknown 扩大到 Promotion 的物理 universe。
+    /// ByValue/ByReference 的选择由收集入口决定，投影不把来源槽当成定义写入。
+    pub(super) fn complete_home_slots(&self, facts: &ProtoPromotionFacts) -> BTreeSet<HomeSlotKey> {
+        let bindings = self
+            .locals
+            .iter()
+            .copied()
+            .map(HirBinding::Local)
+            .chain(self.params.iter().copied().map(HirBinding::Param))
+            .chain(self.temps.iter().copied().map(HirBinding::Temp));
+        let mut homes = BTreeSet::new();
+        for binding in bindings {
+            homes.extend(facts.complete_binding_home_slots(binding).iter().copied());
+        }
+        homes
+    }
+
+    pub(super) fn contains(&self, binding: HirBinding) -> bool {
+        match binding {
+            HirBinding::Local(local) => self.locals.contains(&local),
+            HirBinding::Param(param) => self.params.contains(&param),
+            HirBinding::Temp(temp) => self.temps.contains(&temp),
+            HirBinding::Upvalue(_) => false,
+        }
+    }
+
     fn insert(&mut self, binding: HirBinding) {
         match binding {
             HirBinding::Local(local) => {
@@ -75,16 +103,34 @@ impl ReferenceCapturedBindings {
     }
 }
 
-struct BindingRefCollector<'a> {
-    bindings: &'a mut ReferenceCapturedBindings,
-}
+/// 发布当前树中的直接读取身份，含 closure 的父 binding，不进入 child proto。
+/// sink 决定收集 identity、home 或两者，不另建四类引用集合再还原同一个 binding。
+pub(super) struct BindingReadCollector<F>(pub(super) F);
 
-impl HirVisitor for BindingRefCollector<'_> {
+impl<F: FnMut(HirBinding)> HirVisitor for BindingReadCollector<F> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let Some(binding) = HirBinding::from_expr(expr) {
-            self.bindings.insert(binding);
+            (self.0)(binding);
         }
     }
+}
+
+pub(super) fn binding_home_read_collector<'a>(
+    facts: &'a ProtoPromotionFacts,
+    homes: &'a mut BTreeSet<HomeSlotKey>,
+) -> impl HirVisitor + 'a {
+    BindingReadCollector(move |binding| {
+        homes.extend(facts.complete_binding_home_slots(binding).iter().copied());
+    })
+}
+
+pub(super) fn expr_read_homes(
+    expr: &HirExpr,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<HomeSlotKey> {
+    let mut homes = BTreeSet::new();
+    visit_expr(expr, &mut binding_home_read_collector(facts, &mut homes));
+    homes
 }
 
 pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
@@ -176,22 +222,7 @@ impl HirVisitor for ToBeClosedHomeCollector<'_> {
         let HirStmt::ToBeClosed(to_be_closed) = stmt else {
             return;
         };
-        let mut bindings = ReferenceCapturedBindings::default();
-        let mut collector = BindingRefCollector {
-            bindings: &mut bindings,
-        };
-        visit_expr(&to_be_closed.value, &mut collector);
-
-        let mut value_homes = BTreeSet::new();
-        for local in bindings.locals {
-            value_homes.extend(self.facts.complete_local_home_slots(local).iter().copied());
-        }
-        for param in bindings.params {
-            value_homes.extend(self.facts.complete_param_home_slots(param).iter().copied());
-        }
-        for temp in bindings.temps {
-            value_homes.extend(self.facts.complete_temp_home_slots(temp).iter().copied());
-        }
+        let value_homes = expr_read_homes(&to_be_closed.value, self.facts);
         self.homes.extend(
             self.facts
                 .complete_tbc_home_slots(to_be_closed.reg_index, &value_homes),
@@ -241,7 +272,9 @@ pub(super) fn stmt_writes_temp(stmt: &HirStmt, temp: TempId) -> bool {
 }
 
 pub(super) fn stmt_writes_local(stmt: &HirStmt, local: LocalId) -> bool {
-    LocalWriteCollector::writes_in_stmt(stmt, local)
+    let mut written = false;
+    visit_local_writes(stmt, |target| written |= target == local);
+    written
 }
 
 pub(super) fn stmts_write_local(stmts: &[HirStmt], local: LocalId) -> bool {
@@ -396,39 +429,44 @@ impl HirVisitor for TempWriteCollector {
     }
 }
 
-struct LocalWriteCollector {
-    local: LocalId,
-    written: bool,
+/// 枚举当前语句的逻辑 local 写入，包括声明、循环绑定和 root release；不进入子 proto。
+/// 调用者可按身份查询或维护索引，VM home 覆盖仍由各自的物理写入 owner 解释。
+pub(super) fn visit_local_writes(stmt: &HirStmt, mut visit: impl FnMut(LocalId)) {
+    visit_stmts(
+        std::slice::from_ref(stmt),
+        &mut BindingWriteCollector(|binding| {
+            if let HirBinding::Local(local) = binding {
+                visit(local);
+            }
+        }),
+    );
 }
 
-impl LocalWriteCollector {
-    fn writes_in_stmt(stmt: &HirStmt, local: LocalId) -> bool {
-        let mut collector = Self {
-            local,
-            written: false,
-        };
-        visit_stmts(std::slice::from_ref(stmt), &mut collector);
-        collector.written
-    }
-}
+/// 枚举声明、循环绑定与左值的逻辑写入；重复 target 和 root release 各保留一次事件。
+/// 例如 `a, a = x, y` 产生两次写；这些身份事件不证明原 VM home 被覆盖。
+pub(super) struct BindingWriteCollector<F>(pub(super) F);
 
-impl HirVisitor for LocalWriteCollector {
+impl<F: FnMut(HirBinding)> HirVisitor for BindingWriteCollector<F> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(decl) => {
-                self.written |= decl.bindings.contains(&self.local);
+                for &local in &decl.bindings {
+                    (self.0)(HirBinding::Local(local));
+                }
             }
-            HirStmt::NumericFor(for_stmt) => {
-                self.written |= for_stmt.binding == self.local;
-            }
+            HirStmt::NumericFor(for_stmt) => (self.0)(HirBinding::Local(for_stmt.binding)),
             HirStmt::GenericFor(for_stmt) => {
-                self.written |= for_stmt.bindings.contains(&self.local);
+                for &local in &for_stmt.bindings {
+                    (self.0)(HirBinding::Local(local));
+                }
             }
             _ => {}
         }
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
-        self.written |= matches!(lvalue, HirLValue::Local(local) if *local == self.local);
+        if let Some(binding) = HirBinding::from_lvalue(lvalue) {
+            (self.0)(binding);
+        }
     }
 }

@@ -3,6 +3,8 @@
 //! low IR/SSA 只提供 method setup 的原始协议和 canonical callee definition；本模块在
 //! 最终 HIR 上再次证明 producer/call occurrence、旧 target 根与稳定 alias-chain co-holder。AST 只会
 //! 收到不透明 token，不接触 temp、home 或 reaching-def 事实。
+//! 别名状态按实际 local 写入退休直接边，不按每条语句重查所有历史 alias：
+//! `b=c; a=b; c=other` 只结束 b→c，a→b 保持有效，链查询在缺失边处停止。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,6 +17,7 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use super::mention::{
     stmts_mention_local, stmts_protected_locals, stmts_reference_captured_bindings,
     stmts_tbc_protected_home_slots, stmts_value_captured_bindings, stmts_write_local,
+    visit_local_writes,
 };
 
 #[derive(Clone, Copy)]
@@ -39,8 +42,8 @@ pub(super) fn finalize_method_rewrite_transactions(
     let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
     let value_captured = stmts_value_captured_bindings(&proto.body.stmts);
     let protected = stmts_protected_locals(&proto.body.stmts);
-    let mut barred_homes = captured_binding_homes(&reference_captured, facts);
-    barred_homes.extend(captured_binding_homes(&value_captured, facts));
+    let mut barred_homes = reference_captured.complete_home_slots(facts);
+    barred_homes.extend(value_captured.complete_home_slots(facts));
     for local in &protected {
         barred_homes.extend(facts.complete_local_home_slots(*local).iter().copied());
     }
@@ -77,19 +80,23 @@ fn collect_candidates(
     candidates: &mut Vec<Candidate>,
 ) {
     let mut aliases = BTreeMap::<LocalId, DirectAlias>::new();
+    let mut targets_by_source = BTreeMap::<LocalId, BTreeSet<LocalId>>::new();
     for (index, stmt) in block.stmts.iter().enumerate() {
-        for_each_child_block(stmt, &mut |child| {
-            collect_candidates(
-                child,
-                proto,
-                facts,
-                reference_captured,
-                value_captured,
-                protected,
-                barred_homes,
-                candidates,
-            );
-        });
+        // repeat 的尾条件与 body 同域；当前事务不在这种跨尾条件的边界内签发。
+        if !matches!(stmt, HirStmt::Repeat(_)) {
+            crate::hir::visit::for_each_nested_block(stmt, &mut |child| {
+                collect_candidates(
+                    child,
+                    proto,
+                    facts,
+                    reference_captured,
+                    value_captured,
+                    protected,
+                    barred_homes,
+                    candidates,
+                );
+            });
+        }
 
         if let Some(candidate) = candidate_at(
             block,
@@ -105,20 +112,38 @@ fn collect_candidates(
             candidates.push(candidate);
         }
 
-        aliases.retain(|target, source| {
-            !super::mention::stmt_writes_local(stmt, *target)
-                && !super::mention::stmt_writes_local(stmt, source.source)
-        });
         if is_control_boundary(stmt) {
             aliases.clear();
-        } else if let Some((target, source)) = direct_local_alias(stmt) {
-            aliases.insert(
-                target,
-                DirectAlias {
-                    source,
-                    stmt_index: index,
-                },
-            );
+            targets_by_source.clear();
+        } else {
+            if !aliases.is_empty() {
+                visit_local_writes(stmt, |written| {
+                    if let Some(prior) = aliases.remove(&written) {
+                        let targets = targets_by_source
+                            .get_mut(&prior.source)
+                            .expect("direct alias must retain its source index");
+                        targets.remove(&written);
+                        if targets.is_empty() {
+                            targets_by_source.remove(&prior.source);
+                        }
+                    }
+                    if let Some(targets) = targets_by_source.remove(&written) {
+                        for target in targets {
+                            aliases.remove(&target);
+                        }
+                    }
+                });
+            }
+            if let Some((target, source)) = direct_local_alias(stmt) {
+                aliases.insert(
+                    target,
+                    DirectAlias {
+                        source,
+                        stmt_index: index,
+                    },
+                );
+                targets_by_source.entry(source).or_default().insert(target);
+            }
         }
     }
 }
@@ -322,42 +347,6 @@ fn is_control_boundary(stmt: &HirStmt) -> bool {
             | HirStmt::Label(_)
             | HirStmt::Block(_)
     )
-}
-
-fn for_each_child_block(stmt: &HirStmt, visit: &mut impl FnMut(&HirBlock)) {
-    match stmt {
-        HirStmt::If(if_stmt) => {
-            visit(&if_stmt.then_block);
-            if let Some(else_block) = &if_stmt.else_block {
-                visit(else_block);
-            }
-        }
-        HirStmt::While(while_stmt) => visit(&while_stmt.body),
-        // repeat condition shares the body's lexical scope. The first conservative transaction
-        // version does not certify candidates under that trailing-use boundary.
-        HirStmt::Repeat(_) => {}
-        HirStmt::NumericFor(for_stmt) => visit(&for_stmt.body),
-        HirStmt::GenericFor(for_stmt) => visit(&for_stmt.body),
-        HirStmt::Block(block) => visit(block),
-        _ => {}
-    }
-}
-
-fn captured_binding_homes(
-    captured: &super::mention::ReferenceCapturedBindings,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let mut homes = BTreeSet::new();
-    for local in &captured.locals {
-        homes.extend(facts.complete_local_home_slots(*local).iter().copied());
-    }
-    for param in &captured.params {
-        homes.extend(facts.complete_param_home_slots(*param).iter().copied());
-    }
-    for temp in &captured.temps {
-        homes.extend(facts.complete_temp_home_slots(*temp).iter().copied());
-    }
-    homes
 }
 
 fn stmts_may_write_homes(
