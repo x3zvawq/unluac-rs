@@ -73,6 +73,8 @@ pub(crate) struct RegCaptures {
 pub struct DataflowFacts {
     pub instr_effects: Vec<InstrEffect>,
     pub effect_summaries: Vec<SideEffectSummary>,
+    /// 原基本块中新建且未暴露的表读取；只证明当前读取不进入元方法。
+    pub plain_table_reads: Vec<bool>,
     pub defs: Vec<Def>,
     pub open_defs: Vec<OpenDef>,
     /// 同条指令的 fixed Def 按 Reg 严格递增，保留 effect 的有序写入域。
@@ -80,6 +82,7 @@ pub struct DataflowFacts {
     pub(crate) fixed_defs_by_reg: Vec<Vec<DefId>>,
     pub(crate) reg_captures: Vec<RegCaptures>,
     pub(crate) root_intervals: super::RootIntervalIndex,
+    pub(crate) unobserved_forward_exits: Vec<bool>,
     pub block_entry_values: Vec<SsaRegMap>,
     pub block_exit_values: Vec<SsaRegMap>,
     pub(crate) block_end_values: Vec<SsaRegMap>,
@@ -166,6 +169,19 @@ impl DataflowFacts {
     /// FrameExit 与 Close 的协议边界仍由调用方按原控制流处理。
     pub(crate) fn minimum_rooted_prefix(&self, range: Range<usize>) -> Option<usize> {
         self.root_intervals.minimum_rooted_prefix(range)
+    }
+
+    /// 区间内首次覆盖该 home 的 Close 协议边界；不把关闭等同于槽值覆写。
+    pub(crate) fn first_close_in_range(&self, home: Reg, range: Range<usize>) -> Option<InstrRef> {
+        self.root_intervals
+            .first_close(range, home.index())
+            .map(InstrRef)
+    }
+
+    /// 本条之后的所有路径经严格向前边到达 frame 退出，途中没有 GC/cleanup 观察。
+    /// 不包含本条的观察；不证明本条可删、原值已死亡或声明可以跨入这个后缀。
+    pub(crate) fn has_unobserved_forward_exit_after(&self, instr: InstrRef) -> bool {
+        self.unobserved_forward_exits[instr.index()]
     }
 
     /// 返回 exclusive low 区间内最后一次 fixed Def，包括不可达块中的定义。
@@ -660,7 +676,9 @@ pub enum RootObservation {
     None,
     FrameExit,
     /// Close 结束 open-upvalue/TBC 协议而不覆盖槽；不凭空证明此前未被观察的高槽存活。
-    Close,
+    Close {
+        from: Reg,
+    },
     PrefixLowerBound {
         end: usize,
     },
@@ -674,7 +692,7 @@ impl RootObservation {
         match self {
             Self::PrefixLowerBound { end } => home.index() < end,
             Self::Call { caller_end } => home.index() < caller_end.index(),
-            Self::None | Self::FrameExit | Self::Close => false,
+            Self::None | Self::FrameExit | Self::Close { .. } => false,
         }
     }
 

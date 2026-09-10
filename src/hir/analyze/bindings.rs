@@ -34,6 +34,7 @@ use crate::hir::promotion::{HomeSlotKey, SlotEpochFacts};
 
 mod captured_slots;
 mod captured_temps;
+mod copy_roots;
 mod debug_entries;
 mod debug_names;
 mod lexical_windows;
@@ -41,6 +42,7 @@ mod loop_bindings;
 
 use captured_slots::*;
 use captured_temps::*;
+pub(super) use copy_roots::{bind_copy_root_holders, bind_copy_root_scopes};
 use debug_entries::*;
 use debug_names::*;
 use loop_bindings::*;
@@ -362,7 +364,7 @@ pub(super) fn build_bindings(
         }
     }
 
-    let debug_temp_targets = temp_debug_scopes
+    let bound_temp_targets = temp_debug_scopes
         .iter()
         .enumerate()
         .filter_map(|(index, scope)| {
@@ -378,7 +380,7 @@ pub(super) fn build_bindings(
         }
     }
     let mut conflicted_local_debug_scopes = BTreeSet::new();
-    for (&temp, &target) in &debug_temp_targets {
+    for (&temp, &target) in &bound_temp_targets {
         let BoundSlotTarget::Local(local) = target else {
             continue;
         };
@@ -437,9 +439,9 @@ pub(super) fn build_bindings(
         home_free_temps,
         loop_guard_temps,
         repeat_staged_temps,
-        debug_temp_targets,
+        bound_temp_targets,
         captured_temp_targets: captured_temp_facts.targets,
-        captured_temp_decl_locals: captured_temp_facts.decl_temps,
+        temp_decl_locals: captured_temp_facts.decl_temps,
         captured_local_home_slots,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
         capture_entry_local_decls: captured_slots.entry_local_decls,

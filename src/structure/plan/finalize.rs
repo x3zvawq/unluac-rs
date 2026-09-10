@@ -116,9 +116,10 @@ pub(crate) fn validate_final_structure_plan(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &super::super::DataflowFacts,
+    debug_bindings: &crate::structure::DebugBindingFacts,
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
-    validate::validate_final(proto, cfg, graph_facts, dataflow, plan)
+    validate::validate_final(proto, cfg, graph_facts, dataflow, debug_bindings, plan)
 }
 
 pub(crate) fn finalize_loop_contracts(

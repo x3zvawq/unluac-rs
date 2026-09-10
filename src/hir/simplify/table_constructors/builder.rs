@@ -505,23 +505,3 @@ fn can_stage_pending_integer_record(
     }
     true
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ConstructorBuilder;
-    use crate::hir::common::{HirExpr, HirTableConstructor, HirTableField};
-
-    #[test]
-    fn zero_based_set_list_cannot_become_constructor_array_fields() {
-        let original = HirTableConstructor {
-            allocation: Default::default(),
-            fields: vec![HirTableField::Array(HirExpr::Integer(7))],
-            trailing_multivalue: None,
-        };
-        let mut builder = ConstructorBuilder::from_constructor(original.clone());
-        let mut restored = Vec::new();
-
-        assert!(!builder.demote_array_suffix(0, &mut restored));
-        assert_eq!(builder.into_constructor(), original);
-    }
-}

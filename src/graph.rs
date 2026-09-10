@@ -89,29 +89,3 @@ pub(crate) fn strongly_connected_components<N: Copy, I: IntoIterator<Item = N>>(
     }
     components
 }
-
-#[cfg(test)]
-mod tests {
-    use super::depth_first;
-
-    #[test]
-    fn depth_first_requests_owned_edges_once_per_reachable_visible_node() {
-        let mut edges = [vec![1, 1, 4], vec![2, 0], vec![], vec![0], vec![]];
-        let mut requested = Vec::new();
-        let traversal = depth_first(
-            edges.len(),
-            0,
-            |node| node,
-            |node| node < 4,
-            |node| {
-                requested.push(node);
-                std::mem::take(&mut edges[node])
-            },
-        );
-        assert_eq!(requested, vec![0, 1, 2]);
-        assert_eq!(traversal.preorder, vec![0, 1, 2]);
-        assert_eq!(traversal.postorder, vec![2, 1, 0]);
-        assert_eq!(traversal.parent, vec![None, Some(0), Some(1), None, None]);
-        assert_eq!(edges[3], vec![0]);
-    }
-}

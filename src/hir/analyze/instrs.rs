@@ -40,7 +40,7 @@ pub(super) fn lower_regular_instr(
     instr_ref: InstrRef,
     instr: &LowInstr,
 ) -> Option<Vec<HirStmt>> {
-    let stmts = match instr {
+    let mut stmts = match instr {
         LowInstr::Move(move_instr) => fixed_assign(
             lowering,
             instr_ref,
@@ -291,6 +291,29 @@ pub(super) fn lower_regular_instr(
         | LowInstr::Jump(_)
         | LowInstr::Branch(_) => return None,
     };
+    let roots = lowering
+        .promotion_facts
+        .copy_root_before_releases(instr_ref);
+    if !roots.is_empty() {
+        stmts.insert(
+            0,
+            assign_stmt(
+                roots
+                    .iter()
+                    .copied()
+                    .map(|temp| lowering.bindings.lvalue_for_temp(temp))
+                    .collect(),
+                vec![HirExpr::Nil; roots.len()],
+            ),
+        );
+    }
+    let roots = lowering.promotion_facts.copy_root_after_releases(instr_ref);
+    for &temp in roots {
+        let HirLValue::Local(local) = lowering.bindings.lvalue_for_temp(temp) else {
+            return None;
+        };
+        stmts.push(HirStmt::LocalRootRelease(local));
+    }
     Some(stmts)
 }
 
@@ -593,6 +616,7 @@ fn lower_shared_capture_barrier(
         .enumerate()
         .map(|(index, _)| {
             HirExpr::TableAccess(Box::new(HirTableAccess {
+                metamethod_free: false,
                 base: HirExpr::LocalRef(barrier.box_local),
                 key: HirExpr::Integer((index + 1) as i64),
                 method_setup_protocol: None,
@@ -624,7 +648,7 @@ fn fixed_assign(
         .filter_map(|def| {
             lowering
                 .bindings
-                .captured_temp_decl_locals
+                .temp_decl_locals
                 .get(&lowering.bindings.fixed_temps[def.index()])
                 .copied()
         })

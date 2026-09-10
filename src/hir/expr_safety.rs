@@ -45,7 +45,8 @@ impl<F: FnMut(&HirStmt) -> bool> HirVisitor for HirEvalEffects<F> {
     }
 
     fn visit_expr(&mut self, expr: &HirExpr) {
-        self.found |= !self.safety.node_is_discard_safe_without_residual(expr);
+        self.found |= !matches!(expr, HirExpr::TableAccess(access) if access.metamethod_free)
+            && !self.safety.node_is_discard_safe_without_residual(expr);
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {

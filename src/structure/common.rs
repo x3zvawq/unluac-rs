@@ -59,6 +59,8 @@ pub struct DebugBindingFact {
     /// 原 debug 结束 PC 对应的 exclusive low 边界；None 表示已越过所有 low 指令。
     pub end_instr: Option<InstrRef>,
     pub value: SsaValue,
+    /// canonical 声明的控制流 owner；Entry binding 没有指令声明块。
+    pub declaration_block: Option<BlockRef>,
 }
 
 /// 多个源码 scope 竞争同一 canonical SSA 时保留的拒绝证据。
@@ -73,10 +75,19 @@ pub struct DebugBindingConflict {
 pub struct DebugBindingFacts {
     // 生产者按唯一 SsaValue 排序，后层只借用，不能破坏二分查询的不变量。
     pub(super) accepted: Vec<DebugBindingFact>,
+    pub(super) by_scope: Vec<Option<usize>>,
     pub conflicts: Vec<DebugBindingConflict>,
 }
 
 impl DebugBindingFacts {
+    pub fn for_scope(&self, scope: usize) -> Option<&DebugBindingFact> {
+        self.by_scope
+            .get(scope)
+            .copied()
+            .flatten()
+            .map(|index| &self.accepted[index])
+    }
+
     pub fn accepted(&self) -> &[DebugBindingFact] {
         &self.accepted
     }

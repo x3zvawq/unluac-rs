@@ -1,4 +1,4 @@
-//! 索引同一 low 快照内的开放覆写、物理根观察阈值与观察位置，避免逐 producer 重扫后缀。
+//! 索引同一 low 快照内的开放覆写、关闭起点、物理根观察阈值与观察位置。
 //!
 //! 事实只来自 InstrEffect 与 RootObservation；不解码 opcode，也不证明控制流闭合或根释放。
 //! 例如区间内两次观察分别保留前 5、3 个槽，则共同保活前缀为 3；从槽 4 开始的开放
@@ -12,6 +12,7 @@ use super::{InstrEffect, RootObservation, SideEffectSummary};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Thresholds {
     open_write: usize,
+    close: usize,
     rooted_prefix: usize,
 }
 
@@ -19,12 +20,14 @@ impl Thresholds {
     // 支持的 VM 槽阈值都是有限寄存器范围；最大 usize 表示区间没有这种事件。
     const EMPTY: Self = Self {
         open_write: usize::MAX,
+        close: usize::MAX,
         rooted_prefix: usize::MAX,
     };
 
     fn merge(self, other: Self) -> Self {
         Self {
             open_write: self.open_write.min(other.open_write),
+            close: self.close.min(other.close),
             rooted_prefix: self.rooted_prefix.min(other.rooted_prefix),
         }
     }
@@ -49,12 +52,16 @@ impl RootIntervalIndex {
             }
             nodes[leaf_base + index] = Thresholds {
                 open_write: effect.open_must_def.map_or(usize::MAX, |reg| reg.index()),
+                close: match summary.root_observation {
+                    RootObservation::Close { from } => from.index(),
+                    _ => usize::MAX,
+                },
                 rooted_prefix: match summary.root_observation {
                     RootObservation::Call { caller_end } => caller_end.index(),
                     RootObservation::PrefixLowerBound { end } => end,
-                    RootObservation::None | RootObservation::Close | RootObservation::FrameExit => {
-                        usize::MAX
-                    }
+                    RootObservation::None
+                    | RootObservation::Close { .. }
+                    | RootObservation::FrameExit => usize::MAX,
                 },
             };
         }
@@ -98,17 +105,22 @@ impl RootIntervalIndex {
     }
 
     pub(crate) fn first_open_write(&self, range: Range<usize>, home: usize) -> Option<usize> {
-        self.find_open_write(1, 0..self.leaf_base, &range, home)
+        self.find_threshold(1, 0..self.leaf_base, &range, home, |event| event.open_write)
     }
 
-    fn find_open_write(
+    pub(crate) fn first_close(&self, range: Range<usize>, home: usize) -> Option<usize> {
+        self.find_threshold(1, 0..self.leaf_base, &range, home, |event| event.close)
+    }
+
+    fn find_threshold(
         &self,
         node: usize,
         span: Range<usize>,
         range: &Range<usize>,
         home: usize,
+        threshold: impl Fn(Thresholds) -> usize + Copy,
     ) -> Option<usize> {
-        if span.end <= range.start || span.start >= range.end || self.nodes[node].open_write > home
+        if span.end <= range.start || span.start >= range.end || threshold(self.nodes[node]) > home
         {
             return None;
         }
@@ -116,7 +128,7 @@ impl RootIntervalIndex {
             return Some(span.start);
         }
         let middle = span.start + (span.end - span.start) / 2;
-        self.find_open_write(node * 2, span.start..middle, range, home)
-            .or_else(|| self.find_open_write(node * 2 + 1, middle..span.end, range, home))
+        self.find_threshold(node * 2, span.start..middle, range, home, threshold)
+            .or_else(|| self.find_threshold(node * 2 + 1, middle..span.end, range, home, threshold))
     }
 }

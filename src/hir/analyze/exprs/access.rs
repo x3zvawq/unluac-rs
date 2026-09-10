@@ -70,6 +70,7 @@ pub(crate) fn lower_table_access_expr(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        metamethod_free: lowering.dataflow.plain_table_reads[instr_ref.index()],
         base: lower_access_base_expr(lowering, block, instr_ref, base),
         key: lower_access_key_expr(lowering, block, instr_ref, key),
         method_setup_protocol: lowering
@@ -132,6 +133,7 @@ pub(crate) fn lower_table_access_target(
     }
 
     HirLValue::TableAccess(Box::new(HirTableAccess {
+        metamethod_free: false,
         base: lower_access_base_expr(lowering, block, instr_ref, base),
         key: lower_access_key_expr(lowering, block, instr_ref, key),
         method_setup_protocol: None,
@@ -150,6 +152,7 @@ pub(crate) fn lower_table_access_expr_inline(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        metamethod_free: lowering.dataflow.plain_table_reads[instr_ref.index()],
         base: lower_access_base_expr_inline(lowering, block, instr_ref, base),
         key: lower_access_key_expr_inline(lowering, block, instr_ref, key),
         method_setup_protocol: lowering
@@ -239,6 +242,7 @@ pub(crate) fn lower_table_access_expr_single_eval(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        metamethod_free: lowering.dataflow.plain_table_reads[instr_ref.index()],
         base: lower_access_base_expr_single_eval(lowering, block, instr_ref, base),
         key: lower_access_key_expr_single_eval(lowering, block, instr_ref, key),
         method_setup_protocol: lowering

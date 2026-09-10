@@ -18,4 +18,16 @@ do
 end
 collectgarbage("collect")
 assert(next(weak) == nil, "debug call-result scope stayed alive")
+-- 外层函数不属于本次结束的 cohort；其别名不能阻止 scoped 的 debug 边界物化。
+local function outer_use(value)
+    collectgarbage("collect")
+    assert(value ~= nil and weak[value] == true, "object died inside outer call")
+end
+do
+    local scoped = {}
+    weak[scoped] = true
+    outer_use(scoped)
+end
+collectgarbage("collect")
+assert(next(weak) == nil, "outer-callee object survived its scope")
 print("regress_524_debug_scope_object_cohort", "closed")

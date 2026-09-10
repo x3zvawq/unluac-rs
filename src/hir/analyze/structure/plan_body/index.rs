@@ -374,6 +374,13 @@ pub(super) fn build_absorbed_region_result_moves(
         else {
             continue;
         };
+        if lowering
+            .promotion_facts
+            .has_copy_root_boundary(definition.instr.index()..definition.instr.index() + 1)
+        {
+            // 精确物理退休点必须逐指令发射，不能随 RegionResult forwarding 消失。
+            continue;
+        }
         if move_.dst != definition.reg {
             return Err(invalid(
                 root,
@@ -578,10 +585,7 @@ pub(super) fn build_absorbed_region_result_moves(
                 .bindings
                 .captured_temp_targets
                 .contains_key(&fixed_temp)
-            || lowering
-                .bindings
-                .captured_temp_decl_locals
-                .contains_key(&fixed_temp)
+            || lowering.bindings.temp_decl_locals.contains_key(&fixed_temp)
             || lowering.dataflow.reg_is_reference_captured(move_.dst)
             || lowering.dataflow.reg_is_reference_captured(move_.src)
             || lowering

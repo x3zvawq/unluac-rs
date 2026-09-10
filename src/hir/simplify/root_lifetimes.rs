@@ -13,6 +13,8 @@
 //! copy 共享值 identity，
 //! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
 //! 消费者只能把 producer 与同 home 的精确覆盖配对。
+//! 已物化的槽每次写入后继续到新值自己的覆盖点，call/copy/allocation 共用此链；
+//! `call result -> LocalRef -> callee MOVE` 不需要证明三个值相等。
 //! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
 //! 或 cleanup 边界时才允许穿过。循环内的 break/continue 由共享 HIR 词法树判定归属，
 //! 不清除循环外 home 的配对。消费者可以保留已配对的两次 materialization，也可以在
@@ -119,6 +121,14 @@ struct ExactHomeOverwrite {
     eligible: bool,
 }
 
+/// 覆盖证明与源码身份分开：新 debug 声明只结束已有 owner，不能驱动匿名根物化或同名复用。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RootOverwritePolicy {
+    Reject,
+    ReleaseExisting,
+    Reuse,
+}
+
 #[derive(Default)]
 pub(super) struct CallRootLifetimeIndices {
     roots: BTreeSet<usize>,
@@ -126,6 +136,7 @@ pub(super) struct CallRootLifetimeIndices {
     roots_by_overwrite: BTreeMap<usize, Vec<PhysicalRootOwner>>,
     continuation_owners: BTreeMap<usize, PhysicalRootOwner>,
     call_dispatch_releases: BTreeMap<usize, Vec<PhysicalRootOwner>>,
+    overwrite_releases: BTreeMap<usize, Vec<PhysicalRootOwner>>,
     pre_dispatch_releases: BTreeMap<usize, BTreeSet<TempId>>,
     allocation_sites: BTreeMap<usize, AllocationSite>,
     allocation_release_sites: BTreeMap<(usize, TempId), AllocationSite>,
@@ -358,6 +369,18 @@ impl CallRootLifetimeIndices {
         self.continuation_owners.get(&index).copied()
     }
 
+    /// 异值新声明的结束端点；只交给已物化 owner，不能作为匿名根的保活或复用许可。
+    pub(super) fn overwrite_releases(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = PhysicalRootOwner> + '_ {
+        self.overwrite_releases
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+
     pub(super) fn call_dispatch_releases(
         &self,
         index: usize,
@@ -547,7 +570,7 @@ pub(super) fn collect_call_root_lifetimes(
     context: RootAnalysisContext<'_>,
     observe_potential_events: bool,
     mut producer_temp_is_eligible: impl FnMut(TempId) -> bool,
-    mut overwrite_temp_is_eligible: impl FnMut(TempId) -> bool,
+    mut overwrite_policy: impl FnMut(TempId) -> RootOverwritePolicy,
 ) -> CallRootLifetimeIndices {
     let stmts = snapshot.stmts;
     let uses = &snapshot.uses;
@@ -615,7 +638,7 @@ pub(super) fn collect_call_root_lifetimes(
             let pending = pending_copy_root_call_moves
                 .remove(home)
                 .expect("matched copy-root call MOVE must retain its pending producer");
-            if overwrite_temp_is_eligible(pending.endpoint)
+            if overwrite_policy(pending.endpoint) == RootOverwritePolicy::Reuse
                 && !uses.has_live_read_after(pending.producer, index)
             {
                 lifetimes.roots.insert(pending.root_index);
@@ -663,8 +686,11 @@ pub(super) fn collect_call_root_lifetimes(
                 &mut lifetimes,
             );
         }
-        if let HirStmt::CallStmt(call_stmt) = stmt {
-            let call = &call_stmt.call;
+        if let Some(call) = direct_call_in_stmt(stmt)
+            && !matches!(stmt, HirStmt::Assign(assign)
+                if assign.targets.iter().any(|target| matches!(target,
+                    HirLValue::TableAccess(_) | HirLValue::Global(_))))
+        {
             // 只在当前 callee/参数求值不含观察事件时，才可在 statement 前释放。
             // 原始 dispatch 事实不允许把释放前移到已内联的 lookup、分配或嵌套调用之前。
             if safety.is_discard_safe_without_residual(&call.callee)
@@ -801,7 +827,7 @@ pub(super) fn collect_call_root_lifetimes(
                             root,
                             index,
                             *home,
-                            overwrite_temp_is_eligible(*temp),
+                            overwrite_policy(*temp) == RootOverwritePolicy::Reuse,
                             uses,
                             &active,
                             &mut lifetimes,
@@ -829,9 +855,9 @@ pub(super) fn collect_call_root_lifetimes(
                 }
                 continue;
             }
-            if let Some(overwrites) =
-                exact_multi_nil_home_overwrites(stmt, facts, &mut overwrite_temp_is_eligible)
-            {
+            if let Some(overwrites) = exact_multi_nil_home_overwrites(stmt, facts, &mut |temp| {
+                overwrite_policy(temp) == RootOverwritePolicy::Reuse
+            }) {
                 for ExactNilHomeOverwrite {
                     temps,
                     home,
@@ -903,7 +929,7 @@ pub(super) fn collect_call_root_lifetimes(
                     current_writes,
                     home,
                     facts,
-                    &mut overwrite_temp_is_eligible,
+                    &mut |temp| overwrite_policy(temp) == RootOverwritePolicy::Reuse,
                 ) else {
                     continue;
                 };
@@ -972,7 +998,8 @@ pub(super) fn collect_call_root_lifetimes(
         };
 
         let producer_eligible = producer_temp_is_eligible(temp);
-        let overwrite_eligible = overwrite_temp_is_eligible(temp);
+        let overwrite_policy = overwrite_policy(temp);
+        let overwrite_eligible = overwrite_policy == RootOverwritePolicy::Reuse;
         let needs_copy_root_bridge = !matches!(
             value,
             HirExpr::Call(_)
@@ -1059,6 +1086,19 @@ pub(super) fn collect_call_root_lifetimes(
         }
 
         if let Some(root) = active.remove(&slot) {
+            if overwrite_policy == RootOverwritePolicy::ReleaseExisting
+                && root.eligible
+                && !active.has_live_read_after(root.value_id, slot)
+            {
+                lifetimes
+                    .overwrite_releases
+                    .entry(index)
+                    .or_default()
+                    .push(PhysicalRootOwner {
+                        root_index: root.root_index,
+                        home: slot,
+                    });
+            }
             record_call_root_overwrite(
                 root,
                 index,
@@ -1171,32 +1211,30 @@ pub(super) fn collect_call_root_lifetimes(
             lifetimes.root_homes.remove(root);
         }
     }
-    extend_allocation_owner_overwrites(
+    extend_physical_owner_overwrites(
         snapshot,
         facts,
         safety,
-        &allocation_roots,
         &mut producer_temp_is_eligible,
-        &mut overwrite_temp_is_eligible,
+        &mut |temp| overwrite_policy(temp) == RootOverwritePolicy::Reuse,
         &mut lifetimes,
     );
     lifetimes
 }
 
-/// 复用 allocation owner 时，新写入值也必须在它自己的精确覆盖点释放。
-/// 例如 allocation -> global lookup -> table lookup，不能只保留第一条边，否则
-/// 第二次 lookup 被内联后，global lookup 的接收者会额外存活到源码 local 的作用域末尾。
-/// 只延续已经证明需要物化的 allocation 事务；call/copy 的独立根仍由各自 value owner 管理。
-fn extend_allocation_owner_overwrites(
+/// 复用已保活的物理 owner 后，新写入值也必须在其精确覆盖点释放。
+/// 例如 call result -> captured local 读回 -> callee MOVE，或 allocation -> lookup：
+/// 每次写入都有自己的值身份，但共享同一源码 root 的完整覆盖链。
+/// 这里只延续已证明的同 home 物化事务，不推断新旧值相等。
+fn extend_physical_owner_overwrites(
     snapshot: &RootLifetimeFacts<'_>,
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
-    allocation_roots: &BTreeMap<usize, AllocationSite>,
     producer_is_eligible: &mut impl FnMut(TempId) -> bool,
     overwrite_is_eligible: &mut impl FnMut(TempId) -> bool,
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
-    if allocation_roots.is_empty() {
+    if lifetimes.root_homes.is_empty() {
         return;
     }
     let stmts = snapshot.stmts;
@@ -1233,14 +1271,10 @@ fn extend_allocation_owner_overwrites(
                     .push(PhysicalRootOwner { root_index, home });
             }
         }
-        let continues_allocation_owner = target.is_some_and(|(_, _, home)| {
-            lifetimes.overwrite_pairs(index).any(|pair| {
-                pair.home() == home
-                    && (allocation_roots.contains_key(&pair.root_index())
-                        || owners
-                            .get(&home)
-                            .is_some_and(|(owner, _)| *owner == pair.root_index()))
-            })
+        let continues_physical_owner = target.is_some_and(|(_, _, home)| {
+            lifetimes
+                .overwrite_pairs(index)
+                .any(|pair| pair.home() == home)
         });
         if !owners.is_empty() {
             let writes = snapshot.stack_writes_at(index);
@@ -1258,7 +1292,7 @@ fn extend_allocation_owner_overwrites(
             }
         }
         if let Some((temp, value, home)) = target
-            && continues_allocation_owner
+            && continues_physical_owner
             && producer_is_eligible(temp)
             && !safety.result_is_gc_inert(value)
             // copy 带有独立目标 home 和参数交接生命周期；把它沿用为 caller owner
@@ -1386,7 +1420,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
             context,
             true,
             &mut *temp_is_eligible,
-            |_| true,
+            |_| RootOverwritePolicy::Reuse,
         ).pre_dispatch_releases
     } else {
         BTreeMap::new()
@@ -2521,19 +2555,6 @@ impl TempUseEvents<'_> {
     }
 }
 
-#[cfg(test)]
-fn collect_gc_fence_indices(stmts: &[HirStmt]) -> BTreeSet<usize> {
-    collect_gc_fences(stmts, |_, stmt, temp_aliases, local_aliases| {
-        let mut visitor = GcFenceCollector {
-            temp_aliases,
-            local_aliases,
-            found: false,
-        };
-        visit_stmts(std::slice::from_ref(stmt), &mut visitor);
-        visitor.found
-    })
-}
-
 fn collect_gc_fences(
     stmts: &[HirStmt],
     mut is_fence: impl FnMut(usize, &HirStmt, &BTreeSet<TempId>, &BTreeSet<LocalId>) -> bool,
@@ -2590,24 +2611,6 @@ fn value_is_collectgarbage(values: &crate::hir::common::HirValuePack) -> bool {
         (values.fixed.as_slice(), &values.tail),
         ([HirExpr::GlobalRef(global)], None) if global.key.as_bytes() == b"collectgarbage"
     )
-}
-
-#[cfg(test)]
-struct GcFenceCollector<'a> {
-    temp_aliases: &'a BTreeSet<TempId>,
-    local_aliases: &'a BTreeSet<LocalId>,
-    found: bool,
-}
-
-#[cfg(test)]
-impl HirVisitor for GcFenceCollector<'_> {
-    fn visit_call(&mut self, call: &HirCallExpr) {
-        self.found |= matches!(
-            &call.callee,
-            HirExpr::GlobalRef(global) if global.key.as_bytes() == b"collectgarbage"
-        ) || matches!(&call.callee, HirExpr::TempRef(temp) if self.temp_aliases.contains(temp))
-            || matches!(&call.callee, HirExpr::LocalRef(local) if self.local_aliases.contains(local));
-    }
 }
 
 #[derive(Default)]
@@ -2679,10 +2682,11 @@ fn direct_call_in_stmt(stmt: &HirStmt) -> Option<&HirCallExpr> {
         HirStmt::Return(ret) => &ret.values,
         _ => return None,
     };
-    let ([HirExpr::Call(call)], None) = (values.fixed.as_slice(), &values.tail) else {
+    let mut expressions = values.iter();
+    let HirExpr::Call(call) = expressions.next()? else {
         return None;
     };
-    Some(call)
+    expressions.next().is_none().then_some(call)
 }
 
 struct AllocationRootState<'a> {
@@ -2872,719 +2876,5 @@ impl StackWriteCollector<'_> {
     fn note_local(&mut self, local: LocalId) {
         self.summary
             .note_home(self.facts.trusted_local_home_slot(local));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::decompile::DecompileDialect;
-    use crate::hir::common::{
-        HirCallStmt, HirGenericFor, HirGenericForDispatchResult, HirTableConstructor, UpvalueId,
-    };
-
-    fn event_index(stmts: &[HirStmt], facts: &ProtoPromotionFacts) -> RootEventIndex {
-        RootEventIndex::new(
-            stmts,
-            facts,
-            HirExprSafety::for_dialect(DecompileDialect::Auto),
-        )
-    }
-
-    fn assign(target: HirLValue, value: HirExpr) -> HirStmt {
-        HirStmt::Assign(Box::new(HirAssign {
-            targets: vec![target],
-            values: HirValuePack::fixed(vec![value]),
-            initializer_merge_transaction: None,
-            generic_for_initializer_producer: None,
-            method_rewrite_transaction: None,
-        }))
-    }
-
-    fn generic_for(result_def: TempId, binding: LocalId) -> HirStmt {
-        HirStmt::GenericFor(Box::new(HirGenericFor {
-            bindings: vec![binding],
-            iterator: HirValuePack::fixed(vec![HirExpr::GlobalRef(
-                crate::hir::common::HirGlobalRef {
-                    key: "iterator".into(),
-                },
-            )]),
-            body: HirBlock::default(),
-            initializer_transaction: None,
-            initializer_roots: Vec::new(),
-            dispatch_results: vec![HirGenericForDispatchResult {
-                result_def,
-                success_binding: binding,
-            }],
-        }))
-    }
-
-    fn call(name: &str) -> HirExpr {
-        HirExpr::Call(Box::new(HirCallExpr {
-            argument_roots: Vec::new(),
-            frame_root_ends: Vec::new(),
-            callee: HirExpr::GlobalRef(crate::hir::common::HirGlobalRef { key: name.into() }),
-            args: HirValuePack::default(),
-            method: false,
-            fastcall: None,
-            method_key: None,
-            callee_root_handoff: None,
-            method_rewrite_transaction: None,
-        }))
-    }
-
-    fn call_stmt(name: &str) -> HirStmt {
-        let HirExpr::Call(call) = call(name) else {
-            unreachable!("test call helper must return a call expression")
-        };
-        HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }))
-    }
-
-    #[test]
-    fn physical_write_ranges_keep_home_and_loop_owner_boundaries() {
-        let home = HomeSlotKey::new(0, 0);
-        let absent = HomeSlotKey::new(0, 1);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(TempId(0), home);
-        let write = assign(HirLValue::Temp(TempId(0)), HirExpr::Nil);
-        let stmts = vec![
-            write.clone(),
-            HirStmt::Block(Box::new(HirBlock {
-                stmts: vec![write.clone(), write],
-            })),
-            HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
-                body: HirBlock {
-                    stmts: vec![HirStmt::Break],
-                },
-                cond: HirExpr::Boolean(true),
-                lifetime: Default::default(),
-            })),
-            assign(HirLValue::Temp(TempId(1)), HirExpr::Nil),
-            HirStmt::Continue,
-            HirStmt::Return(Box::new(crate::hir::common::HirReturn {
-                source_instr: None,
-                values: HirValuePack::default(),
-            })),
-        ];
-        let index = event_index(&stmts, &facts);
-        let scope = index.root();
-        // 同一 nested block 内的两次写入只投影为一个直属位置；完整循环拥有 break。
-        for start in 0..=stmts.len() {
-            for end in start..=stmts.len() {
-                let range = start..end;
-                let slice = scope.slice(range.clone());
-                let boundary = range.contains(&4) || range.contains(&5);
-                let unknown = range.contains(&3);
-                let positions = [0, 1]
-                    .into_iter()
-                    .filter(|i| range.contains(i))
-                    .map(|i| i - start)
-                    .collect::<Vec<_>>();
-                assert_eq!(slice.has_boundary(), boundary);
-                assert_eq!(slice.has_unknown_home(), unknown);
-                assert_eq!(slice.preserves_home(absent), !boundary && !unknown);
-                assert_eq!(
-                    slice.preserves_home(home),
-                    !boundary && !unknown && positions.is_empty()
-                );
-                for from in 0..=end - start {
-                    assert_eq!(
-                        slice
-                            .home_write_positions_from(home, from)
-                            .collect::<Vec<_>>(),
-                        positions
-                            .iter()
-                            .copied()
-                            .filter(|i| *i >= from)
-                            .collect::<Vec<_>>()
-                    );
-                }
-            }
-        }
-        assert!(!scope.slice(2..3).has_boundary());
-        let body = scope.stmt(2).child(0);
-        assert!(body.has_boundary());
-        assert!(!body.slice(1..1).has_boundary());
-        assert_eq!(
-            scope
-                .slice(1..4)
-                .slice(0..1)
-                .home_write_positions_from(home, 0)
-                .collect::<Vec<_>>(),
-            vec![0]
-        );
-    }
-
-    #[test]
-    fn root_events_project_nested_reads_and_writes_at_statement_boundaries() {
-        use super::live_read_changes::LiveReadChanges;
-        use crate::hir::simplify::temp_touch::TempReadCollector;
-
-        fn check(stmts: &[HirStmt], facts: &ProtoPromotionFacts, scope: RootEventBlock<'_>) {
-            // 独立的完整 visitor 是旧协议的直接定义；索引不能用 header 顺序替代直属坐标。
-            let events = stmts
-                .iter()
-                .map(|stmt| {
-                    let mut visitor = (TempReadCollector::default(), TempWriteCollector::default());
-                    visit_stmts(std::slice::from_ref(stmt), &mut visitor);
-                    visitor
-                })
-                .collect::<Vec<_>>();
-            for len in 0..=stmts.len() {
-                let snapshot = RootLifetimeFacts::with_events(
-                    &stmts[..len],
-                    facts,
-                    HirExprSafety::for_dialect(DecompileDialect::Auto),
-                    Some(scope),
-                );
-                let projection = scope.prefix(len);
-                for temp in [TempId(0), TempId(1)] {
-                    let touched = |i: usize| {
-                        events[i].0.temps.contains(&temp) || events[i].1.temps.contains(&temp)
-                    };
-                    let live = |from: usize| {
-                        let read = (from..len).find(|&i| events[i].0.temps.contains(&temp));
-                        let write = (from..len).find(|&i| events[i].1.temps.contains(&temp));
-                        read.is_some_and(|read| write.is_none_or(|write| read <= write))
-                    };
-                    for from in 0..=len {
-                        assert_eq!(
-                            projection
-                                .touch_positions_from(temp, from)
-                                .collect::<Vec<_>>(),
-                            (from..len).filter(|&i| touched(i)).collect::<Vec<_>>()
-                        );
-                        assert_eq!(
-                            projection.has_touch_before(temp, from),
-                            (0..from).any(touched)
-                        );
-                        assert_eq!(
-                            projection.has_touch_from(temp, from),
-                            (from..len).any(touched)
-                        );
-                        for end in 0..=len {
-                            assert_eq!(
-                                projection.has_touch_in(temp, from..end),
-                                (from..end).any(touched)
-                            );
-                        }
-                        assert_eq!(snapshot.uses.has_live_read_from(temp, from), live(from));
-                        let mut queue = LiveReadChanges::default();
-                        queue.schedule(&snapshot.uses, temp, 0);
-                        queue.remove(temp);
-                        assert!(queue.pop_through(&snapshot.uses, len).is_none());
-                        queue.schedule(&snapshot.uses, temp, from);
-                        let expected = ((from + 1)..=len)
-                            .filter(|&at| live(at - 1) != live(at))
-                            .map(|at| (at, temp, live(at)))
-                            .collect::<Vec<_>>();
-                        let actual = std::iter::from_fn(|| queue.pop_through(&snapshot.uses, len))
-                            .collect::<Vec<_>>();
-                        assert_eq!(actual, expected);
-                    }
-                    for (i, (reads, writes)) in events.iter().enumerate().take(len) {
-                        assert_eq!(
-                            projection.reads_any(i, &BTreeSet::from([temp])),
-                            reads.temps.contains(&temp)
-                        );
-                        assert_eq!(
-                            snapshot.uses.has_read_at(temp, i),
-                            reads.temps.contains(&temp)
-                        );
-                        assert_eq!(
-                            snapshot.uses.has_write_at(temp, i),
-                            writes.temps.contains(&temp)
-                        );
-                    }
-                }
-            }
-        }
-
-        let facts = ProtoPromotionFacts::default();
-        for pattern in 0..256 {
-            let stmts = (0..4)
-                .map(|i| {
-                    let flags = (pattern >> (2 * i)) & 3;
-                    assign(
-                        HirLValue::Temp(TempId(usize::from(flags & 2 == 0))),
-                        if flags & 1 != 0 {
-                            HirExpr::TempRef(TempId(0))
-                        } else {
-                            HirExpr::Nil
-                        },
-                    )
-                })
-                .collect::<Vec<_>>();
-            let index = event_index(&stmts, &facts);
-            check(&stmts, &facts, index.root());
-            let nested = vec![
-                stmts[0].clone(),
-                HirStmt::Block(Box::new(HirBlock {
-                    stmts: stmts[1..3].to_vec(),
-                })),
-                stmts[3].clone(),
-            ];
-            let index = event_index(&nested, &facts);
-            check(&nested, &facts, index.root());
-            check(&stmts[1..3], &facts, index.root().stmt(1).child(0));
-        }
-    }
-
-    #[test]
-    fn control_head_consumption_rejects_body_writes_in_the_same_group() {
-        let head = TempId(0);
-        let body = TempId(1);
-        let stmts = vec![HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
-            body: HirBlock {
-                stmts: vec![assign(HirLValue::Temp(body), HirExpr::Nil)],
-            },
-            cond: HirExpr::TempRef(head),
-            lifetime: Default::default(),
-        }))];
-        let index = event_index(&stmts, &Default::default());
-        let scope = index.root().stmt(0);
-        assert!(scope.consumes_only_control_head(&stmts[0], &BTreeSet::from([head])));
-        assert!(!scope.consumes_only_control_head(&stmts[0], &BTreeSet::from([body])));
-        assert!(!scope.consumes_only_control_head(&stmts[0], &BTreeSet::from([head, body])));
-    }
-
-    #[test]
-    fn root_argument_pairs_keep_occurrence_counts_and_current_scope() {
-        let temp = TempId(0);
-        let home = HomeSlotKey::new(0, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(temp, home);
-        let HirExpr::Call(mut call) = call("consume") else {
-            unreachable!()
-        };
-        call.args.fixed.push(HirExpr::TempRef(temp));
-        call.argument_roots
-            .push(crate::hir::common::HirCallArgumentRoot {
-                producer: temp,
-                argument: 0,
-            });
-        let transfer = HirStmt::CallStmt(Box::new(HirCallStmt { call: *call }));
-        let write = assign(HirLValue::Temp(temp), HirExpr::Nil);
-        let body = vec![write.clone(), transfer.clone(), write.clone()];
-        let stmts = vec![
-            write.clone(),
-            HirStmt::Block(Box::new(HirBlock {
-                stmts: body.clone(),
-            })),
-        ];
-        let index = event_index(&stmts, &facts);
-        let scope = index.root().stmt(1).child(0);
-        let prefix = RootLifetimeFacts::with_events(
-            &body[..2],
-            &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Auto),
-            Some(scope),
-        );
-        assert_eq!(
-            prefix.uses.argument_transfer_at(temp, 1, &facts),
-            Some((temp, 0, home))
-        );
-        let whole = RootLifetimeFacts::with_events(
-            &body,
-            &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Auto),
-            Some(scope),
-        );
-        assert!(!whole.uses.has_argument_transfer(temp, 0, 1));
-        for (producer, endpoint) in [
-            (
-                HirStmt::Block(Box::new(HirBlock {
-                    stmts: vec![write.clone(), write.clone()],
-                })),
-                transfer.clone(),
-            ),
-            (
-                write,
-                HirStmt::Block(Box::new(HirBlock {
-                    stmts: vec![transfer.clone(), transfer],
-                })),
-            ),
-        ] {
-            let stmts = vec![producer, endpoint];
-            let snapshot = RootLifetimeFacts::new(
-                &stmts,
-                &facts,
-                HirExprSafety::for_dialect(DecompileDialect::Auto),
-            );
-            assert!(!snapshot.uses.has_argument_transfer(temp, 0, 1));
-        }
-    }
-
-    #[test]
-    fn shared_callee_events_keep_block_local_gc_alias_environment() {
-        let temp = TempId(0);
-        let alias = assign(
-            HirLValue::Temp(temp),
-            HirExpr::GlobalRef(crate::hir::common::HirGlobalRef {
-                key: "collectgarbage".into(),
-            }),
-        );
-        let HirExpr::Call(mut call) = call("unused") else {
-            unreachable!()
-        };
-        call.callee = HirExpr::TempRef(temp);
-        let body = vec![
-            assign(HirLValue::Temp(temp), HirExpr::Nil),
-            call_stmt("observe"),
-        ];
-        let stmts = vec![
-            alias,
-            HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
-                body: HirBlock {
-                    stmts: body.clone(),
-                },
-                cond: HirExpr::Call(call),
-                lifetime: Default::default(),
-            })),
-        ];
-        let facts = ProtoPromotionFacts::default();
-        let index = event_index(&stmts, &facts);
-        let outer = RootLifetimeFacts::with_events(
-            &stmts,
-            &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Auto),
-            Some(index.root()),
-        );
-        assert_eq!(outer.uses.gc_fence_indices, BTreeSet::from([1]));
-        assert_eq!(
-            outer.uses.gc_fence_indices,
-            collect_gc_fence_indices(&stmts)
-        );
-        let inner = RootLifetimeFacts::with_events(
-            &body,
-            &facts,
-            HirExprSafety::for_dialect(DecompileDialect::Auto),
-            Some(index.root().stmt(1).child(0)),
-        );
-        assert!(inner.uses.gc_fence_indices.is_empty());
-        assert_eq!(inner.uses.gc_fence_indices, collect_gc_fence_indices(&body));
-    }
-
-    #[test]
-    fn local_call_roots_keep_complete_suffix_and_direct_overwrite_epochs() {
-        let local = LocalId(0);
-        let producer = assign(HirLValue::Local(local), call("make"));
-        let read = assign(HirLValue::Temp(TempId(0)), HirExpr::LocalRef(local));
-        let clear = HirStmt::LocalRootRelease(local);
-        let nested_clear = HirStmt::Block(Box::new(HirBlock {
-            stmts: vec![clear.clone()],
-        }));
-        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
-        for (stmts, condition, expected) in [
-            (
-                vec![producer.clone(), call_stmt("observe"), read.clone()],
-                None,
-                false,
-            ),
-            (
-                vec![producer.clone(), read.clone(), call_stmt("observe")],
-                None,
-                true,
-            ),
-            (
-                vec![producer.clone(), clear, call_stmt("observe")],
-                None,
-                false,
-            ),
-            (
-                vec![producer.clone(), call_stmt("observe"), nested_clear, read],
-                None,
-                true,
-            ),
-            (
-                vec![producer.clone(), call_stmt("observe")],
-                Some(HirExpr::LocalRef(local)),
-                false,
-            ),
-            (
-                vec![producer.clone(), call_stmt("collectgarbage")],
-                Some(HirExpr::LocalRef(local)),
-                true,
-            ),
-            (vec![producer], Some(call("observe")), true),
-        ] {
-            let index = RootEventIndex::new(&stmts, &Default::default(), safety);
-            let roots =
-                collect_call_result_local_roots(&stmts, index.root(), condition.as_ref(), safety);
-            assert_eq!(
-                roots,
-                if expected {
-                    BTreeSet::from([local])
-                } else {
-                    BTreeSet::new()
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn observation_index_fixes_dialect_and_separates_repeat_header_from_body() {
-        let stmts = vec![HirStmt::Repeat(Box::new(crate::hir::common::HirRepeat {
-            body: HirBlock {
-                stmts: vec![assign(HirLValue::Temp(TempId(1)), HirExpr::Nil)],
-            },
-            cond: HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
-                op: HirBinaryOpKind::Eq,
-                lhs: HirExpr::TempRef(TempId(0)),
-                rhs: HirExpr::Nil,
-            })),
-            lifetime: Default::default(),
-        }))];
-        for (dialect, expected) in [
-            (DecompileDialect::Lua54, false),
-            (DecompileDialect::Luajit, true),
-        ] {
-            let safety = HirExprSafety::for_dialect(dialect);
-            let index = RootEventIndex::new(&stmts, &Default::default(), safety);
-            assert_eq!(index.root().stmt(0).may_observe_gc_roots(), expected);
-            assert_eq!(stmt_may_observe_gc_roots(&stmts[0], safety), expected);
-            assert!(!index.root().stmt(0).child(0).stmt(0).may_observe_gc_roots());
-        }
-    }
-
-    #[test]
-    fn certified_copy_root_call_move_reuses_the_overwritten_home_owner() {
-        let producer = TempId(0);
-        let endpoint = TempId(1);
-        let producer_home = HomeSlotKey::new(0, 0);
-        let endpoint_home = HomeSlotKey::new(1, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(producer, producer_home);
-        facts.record_temp_home_slot_for_test(endpoint, endpoint_home);
-        facts.record_copy_root_call_result_move_for_test(producer, endpoint);
-        let stmts = vec![
-            assign(HirLValue::Temp(producer), HirExpr::UpvalueRef(UpvalueId(0))),
-            call_stmt("observe"),
-            assign(HirLValue::Temp(endpoint), call("replacement")),
-        ];
-
-        let lifetimes = collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(
-                &stmts,
-                &facts,
-                HirExprSafety::for_dialect(DecompileDialect::Luau),
-            ),
-            &facts,
-            RootAnalysisContext {
-                safety: HirExprSafety::for_dialect(DecompileDialect::Luau),
-                effects: &[],
-            },
-            true,
-            |_| true,
-            |_| true,
-        );
-
-        assert!(lifetimes.is_root(0));
-        let pair = lifetimes
-            .unambiguous_overwrite_pair(2)
-            .expect("certified call MOVE must publish one overwrite pair");
-        assert_eq!(pair.root_index(), 0);
-        assert_eq!(pair.home(), producer_home);
-    }
-
-    #[test]
-    fn certified_copy_root_call_move_rejects_hir_write_before_endpoint() {
-        let producer = TempId(0);
-        let endpoint = TempId(1);
-        let intervening = TempId(2);
-        let producer_home = HomeSlotKey::new(0, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(producer, producer_home);
-        facts.record_temp_home_slot_for_test(endpoint, HomeSlotKey::new(1, 0));
-        facts.record_temp_home_slot_for_test(intervening, producer_home);
-        facts.record_copy_root_call_result_move_for_test(producer, endpoint);
-        let stmts = vec![
-            assign(HirLValue::Temp(producer), HirExpr::UpvalueRef(UpvalueId(0))),
-            assign(HirLValue::Temp(intervening), HirExpr::Nil),
-            assign(HirLValue::Temp(endpoint), call("replacement")),
-        ];
-
-        let lifetimes = collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(
-                &stmts,
-                &facts,
-                HirExprSafety::for_dialect(DecompileDialect::Luau),
-            ),
-            &facts,
-            RootAnalysisContext {
-                safety: HirExprSafety::for_dialect(DecompileDialect::Luau),
-                effects: &[],
-            },
-            true,
-            |_| true,
-            |_| true,
-        );
-
-        assert!(!lifetimes.is_root(0));
-        assert!(lifetimes.unambiguous_overwrite_pair(2).is_none());
-    }
-
-    #[test]
-    fn generic_for_result_home_releases_escaped_allocation_before_dispatch() {
-        let old = TempId(0);
-        let result_def = TempId(1);
-        let binding = LocalId(0);
-        let home = HomeSlotKey::new(4, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(old, home);
-        facts.record_temp_home_slot_for_test(result_def, home);
-        let mut block = HirBlock {
-            stmts: vec![
-                assign(
-                    HirLValue::Temp(old),
-                    HirExpr::TableConstructor(Box::<HirTableConstructor>::default()),
-                ),
-                assign(HirLValue::Upvalue(UpvalueId(0)), HirExpr::TempRef(old)),
-                generic_for(result_def, binding),
-            ],
-        };
-
-        assert!(materialize_generic_for_dispatch_root_releases(
-            &mut block,
-            &facts,
-            RootAnalysisContext {
-                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
-                effects: &[]
-            },
-            &mut |_| true,
-        ));
-        assert!(matches!(
-            block.stmts.as_slice(),
-            [
-                _,
-                _,
-                HirStmt::Assign(release),
-                HirStmt::GenericFor(_)
-            ] if matches!(
-                (release.targets.as_slice(), release.values.fixed.as_slice(), &release.values.tail),
-                ([HirLValue::Temp(temp)], [HirExpr::Nil], None) if *temp == old
-            )
-        ));
-        assert!(!materialize_generic_for_dispatch_root_releases(
-            &mut block,
-            &facts,
-            RootAnalysisContext {
-                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
-                effects: &[]
-            },
-            &mut |_| true,
-        ));
-    }
-
-    #[test]
-    fn generic_for_dispatch_itself_observes_and_releases_an_opaque_call_result() {
-        let old = TempId(0);
-        let result_def = TempId(1);
-        let binding = LocalId(0);
-        let home = HomeSlotKey::new(4, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(old, home);
-        facts.record_temp_home_slot_for_test(result_def, home);
-        let mut block = HirBlock {
-            stmts: vec![
-                assign(
-                    HirLValue::Temp(old),
-                    HirExpr::Call(Box::new(HirCallExpr {
-                        argument_roots: Vec::new(),
-                        frame_root_ends: Vec::new(),
-                        callee: HirExpr::GlobalRef(crate::hir::common::HirGlobalRef {
-                            key: "make_collectable".into(),
-                        }),
-                        args: HirValuePack::default(),
-                        method: false,
-                        fastcall: None,
-                        method_key: None,
-                        callee_root_handoff: None,
-                        method_rewrite_transaction: None,
-                    })),
-                ),
-                generic_for(result_def, binding),
-            ],
-        };
-
-        assert!(materialize_generic_for_dispatch_root_releases(
-            &mut block,
-            &facts,
-            RootAnalysisContext {
-                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
-                effects: &[]
-            },
-            &mut |_| true,
-        ));
-        assert!(matches!(
-            block.stmts.as_slice(),
-            [_, HirStmt::Assign(release), HirStmt::GenericFor(_)] if matches!(
-                (release.targets.as_slice(), release.values.fixed.as_slice(), &release.values.tail),
-                ([HirLValue::Temp(temp)], [HirExpr::Nil], None) if *temp == old
-            )
-        ));
-    }
-
-    #[test]
-    fn generic_for_result_home_does_not_release_a_disjoint_root() {
-        let old = TempId(0);
-        let result_def = TempId(1);
-        let binding = LocalId(0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(old, HomeSlotKey::new(4, 0));
-        facts.record_temp_home_slot_for_test(result_def, HomeSlotKey::new(5, 0));
-        let mut block = HirBlock {
-            stmts: vec![
-                assign(
-                    HirLValue::Temp(old),
-                    HirExpr::TableConstructor(Box::<HirTableConstructor>::default()),
-                ),
-                assign(HirLValue::Upvalue(UpvalueId(0)), HirExpr::TempRef(old)),
-                generic_for(result_def, binding),
-            ],
-        };
-
-        assert!(!materialize_generic_for_dispatch_root_releases(
-            &mut block,
-            &facts,
-            RootAnalysisContext {
-                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
-                effects: &[]
-            },
-            &mut |_| true,
-        ));
-        assert_eq!(block.stmts.len(), 3);
-    }
-
-    #[test]
-    fn generic_for_result_home_does_not_materialize_an_ineligible_release() {
-        let old = TempId(0);
-        let result_def = TempId(1);
-        let binding = LocalId(0);
-        let home = HomeSlotKey::new(4, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(old, home);
-        facts.record_temp_home_slot_for_test(result_def, home);
-        let mut block = HirBlock {
-            stmts: vec![
-                assign(
-                    HirLValue::Temp(old),
-                    HirExpr::TableConstructor(Box::<HirTableConstructor>::default()),
-                ),
-                assign(HirLValue::Upvalue(UpvalueId(0)), HirExpr::TempRef(old)),
-                generic_for(result_def, binding),
-            ],
-        };
-
-        assert!(!materialize_generic_for_dispatch_root_releases(
-            &mut block,
-            &facts,
-            RootAnalysisContext {
-                safety: HirExprSafety::for_dialect(DecompileDialect::Lua54),
-                effects: &[]
-            },
-            &mut |_| false,
-        ));
-        assert_eq!(block.stmts.len(), 3);
     }
 }

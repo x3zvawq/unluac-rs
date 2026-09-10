@@ -22,5 +22,16 @@ do
 end
 regress_525_missing_gc("collect")
 assert(next_key(weak) == nil, "debug object outlived the following call")
+local function outer_use(value)
+    gc("collect")
+    assert(value ~= nil and weak[value] == true, "object died inside outer call")
+end
+do
+    local scoped = {}
+    weak[scoped] = true
+    outer_use(scoped)
+end
+regress_525_missing_gc("collect")
+assert(next_key(weak) == nil, "outer-callee object outlived the following call")
 setmetatable(env, nil)
 print("regress_525_debug_scope_lookup_root", observed, "closed")

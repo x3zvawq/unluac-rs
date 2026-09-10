@@ -509,6 +509,8 @@ pub struct HirGlobalRef {
 pub struct HirTableAccess {
     pub base: HirExpr,
     pub key: HirExpr,
+    /// Dataflow 证明该次读取的接收者没有元表；不证明值不变，也不授权跨写入移动读取。
+    pub metamethod_free: bool,
     /// 仅标记来自同一 low method setup 的 canonical GetTable producer。
     pub(crate) method_setup_protocol: Option<HirMethodSetupProtocolId>,
 }

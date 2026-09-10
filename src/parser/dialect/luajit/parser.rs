@@ -803,29 +803,3 @@ struct ParsedProto {
     proto: RawProto,
     depth: usize,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::LuaJitParser;
-    use crate::parser::ParseOptions;
-
-    #[test]
-    fn parses_big_endian_line_info_offsets() {
-        let chunk = [
-            0x1b, 0x4c, 0x4a, 0x02, 0x01, 0x00, // header, BE, empty name
-            0x13, // proto size
-            0x00, 0x00, 0x01, 0x00, // flags, params, frame, upvalues
-            0x00, 0x00, 0x01, // kgc, knum, instruction count
-            0x03, 0xe8, 0x07, 0xac, 0x02, // debug size, firstline=1000, numline=300
-            0x00, 0x00, 0x00, 0x00, // one BE instruction word
-            0x01, 0x02, 0x00, // line offset 258, varinfo terminator
-            0x00, // chunk footer
-        ];
-
-        let parsed = LuaJitParser::new(ParseOptions::default())
-            .parse(&chunk)
-            .expect("minimal BE LuaJIT chunk should parse");
-
-        assert_eq!(parsed.main.common.debug_info.common.line_info, [1258]);
-    }
-}

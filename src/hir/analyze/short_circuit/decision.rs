@@ -127,10 +127,7 @@ fn expr_for_emitted_header_leaf(
         lowering.bindings.temp_debug_locals.get(temp.index()),
         Some(None)
     ) || lowering.bindings.captured_temp_targets.contains_key(&temp)
-        || lowering
-            .bindings
-            .captured_temp_decl_locals
-            .contains_key(&temp)
+        || lowering.bindings.temp_decl_locals.contains_key(&temp)
         || lowering.dataflow.reg_is_reference_captured(reg)
         || lowering
             .bindings

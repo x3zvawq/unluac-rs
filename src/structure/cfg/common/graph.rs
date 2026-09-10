@@ -67,14 +67,20 @@ impl GraphFacts {
         let (Some(&entry), Some(&exit)) = (instructions.first(), instructions.last()) else {
             return false;
         };
+        if !cfg.reachable_blocks.contains(&entry) || !cfg.reachable_blocks.contains(&exit) {
+            return false;
+        }
         let contains = |block: BlockRef| {
             block == entry || window.contains(&cfg.blocks[block.index()].instrs.start.index())
         };
         for run in instructions.chunk_by(|a, b| a == b) {
             let block = run[0];
+            // 编译器可能在 goto/return 后保留不可达指令；它们不产生窗口的入口或出口。
+            if !cfg.reachable_blocks.contains(&block) {
+                continue;
+            }
             let range = cfg.blocks[block.index()].instrs;
-            if !cfg.reachable_blocks.contains(&block)
-                || !self.dominates(entry, block)
+            if !self.dominates(entry, block)
                 || !self.post_dominates(exit, block)
                 || (block != entry && range.start.index() < window.start)
                 || (block != exit && range.end() > window.end)

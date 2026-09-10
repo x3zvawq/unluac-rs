@@ -1,6 +1,7 @@
 //! 将源码调试 local 生命周期映射到 canonical SSA；依赖 lowering map 与数据流，不负责 HIR 命名；例如在初始化指令后找到唯一 local 候选。
 
 use super::*;
+use crate::structure::SsaValue;
 
 /// 将源码 local 的生命周期入口锚定到 canonical SSA。
 ///
@@ -27,10 +28,14 @@ pub(super) fn analyze_debug_bindings(
         by_value.entry(value).or_default().push(scope);
     }
 
-    let mut facts = DebugBindingFacts::default();
+    let mut facts = DebugBindingFacts {
+        by_scope: vec![None; proto.debug_locals.len()],
+        ..Default::default()
+    };
     for (value, scopes) in by_value {
         if let [scope] = scopes.as_slice() {
             let local = &proto.debug_locals[*scope];
+            facts.by_scope[*scope] = Some(facts.accepted.len());
             facts.accepted.push(DebugBindingFact {
                 scope: *scope,
                 reg: local.reg,
@@ -38,6 +43,11 @@ pub(super) fn analyze_debug_bindings(
                 end_pc: local.end_pc,
                 end_instr: proto.lowering_map.low_instr_at_or_after_pc(local.end_pc),
                 value,
+                declaration_block: match value {
+                    SsaValue::Def(def) => Some(dataflow.def_block(def)),
+                    SsaValue::Phi(phi) => Some(dataflow.phi_candidates[phi.index()].block),
+                    SsaValue::Entry(_) => None,
+                },
             });
         } else {
             facts.conflicts.push(DebugBindingConflict { value, scopes });

@@ -3,18 +3,18 @@
 //! Close 区间来自捕获 cell 的真实 cleanup；debug 窗口来自共同结束的源码 binding：
 //! `local object = {}; local function use(x) end; use(object); debug-end` 恢复为一个 `do`。
 //! 窗口的新对象必须属于这些 binding，或有末端前必定覆盖/被调用排除的 scratch home；捕获 cell、
-//! open 值和跨窗口 SSA 使用仍拒绝。debug end 恢复槽复用边界，不表示 VM 已清空旧槽。
+//! open 值和跨窗口内部 SSA 使用仍拒绝。已在外层建立的源码身份可在窗口内更新；
+//! 末次调用后的纯尾部也只能更新这些外层身份。debug end 恢复槽复用边界，不表示 VM 已清空旧槽。
 //! 这里消费 Structure 的 debug 边界与 SSA/root 事实，不从 HIR 语句或 AST 形状猜作用域。
+//! callee 与其它 scratch 消费同一逐槽退休证书；调用帧保活不等于 caller 槽被清空。
 //! 普通 if/else 与完整循环可处于窗口内部；共享图区间查询证明唯一入口、出口，
 //! 冻结 plan 则保证两端仍在实际发射的指令前缀，不能切入已被表达式或循环语法吸收的位置。
 
 use std::ops::Range;
 
 use super::*;
-use crate::structure::{
-    BlockEmissionPlan, CleanupDisposition, DebugBindingFact, GraphFacts, LoopVmProtocol,
-    RegionPlan, RootObservation,
-};
+use crate::hir::emission::HirEmissionFacts;
+use crate::structure::{CleanupDisposition, DebugBindingFact, GraphFacts, RootObservation};
 use crate::transformer::ResultPack;
 
 pub(super) fn collect_lexical_scopes(
@@ -41,9 +41,28 @@ pub(super) fn collect_lexical_scopes(
     if cohorts.is_empty() {
         return retain_non_crossing(scopes);
     }
-    let emission = DebugEmissionIndex::new(structure);
+    let emission = HirEmissionFacts::new(structure.plan());
+    let mut scanned = 0;
+    let mut last_observation = None;
     scopes.extend(cohorts.into_iter().filter_map(|(end, facts)| {
-        debug_binding_window(proto, cfg, dataflow, graph, &emission, end, &facts)
+        // cohorts 已按结束点排序，共用一次观察前缀扫描，避免每个窗口回扫纯尾部。
+        for index in scanned..end {
+            if dataflow.effect_summaries[index].may_observe_gc_roots()
+                || matches!(proto.instrs[index], LowInstr::Close(_) | LowInstr::Tbc(_))
+            {
+                last_observation = Some(index);
+            }
+        }
+        scanned = end;
+        debug_binding_window(
+            proto,
+            cfg,
+            dataflow,
+            graph,
+            structure,
+            &emission,
+            (end, &facts, last_observation),
+        )
     }));
     retain_non_crossing(scopes)
 }
@@ -53,12 +72,14 @@ fn debug_binding_window(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     graph: &GraphFacts,
-    emission: &DebugEmissionIndex<'_>,
-    end: usize,
-    facts: &[&DebugBindingFact],
+    structure: &ReadyStructureFacts,
+    emission: &HirEmissionFacts<'_>,
+    cohort: (usize, &[&DebugBindingFact], Option<usize>),
 ) -> Option<Range<usize>> {
-    let debug_bindings = emission.structure.debug_bindings();
-    let LowInstr::Call(call) = proto.instrs.get(end - 1)? else {
+    let (end, facts, last_observation) = cohort;
+    let debug_bindings = structure.debug_bindings();
+    let dispatch = last_observation?;
+    let LowInstr::Call(call) = proto.instrs.get(dispatch)? else {
         // 候选拒绝[ProofIncomplete]：debug end 前缺少当前分析能证明的 callee 观察边界。
         return None;
     };
@@ -78,8 +99,9 @@ fn debug_binding_window(
     let (&floor, _) = owners.first_key_value()?;
     let (&ceiling, _) = owners.last_key_value()?;
     // 候选拒绝[ProofIncomplete]：非空结果或更宽 caller 前缀仍需额外结果根、外来 binding 证明。
-    let final_observation = dataflow.effect_summaries.get(end - 1)?.root_observation;
+    let final_observation = dataflow.effect_summaries.get(dispatch)?.root_observation;
     if !matches!(call.results, ResultPack::Ignore)
+        || cfg.instr_to_block[dispatch] != cfg.instr_to_block[end - 1]
         || !matches!(final_observation,
             RootObservation::Call { caller_end } if caller_end.index() == ceiling.index() + 1)
     {
@@ -126,7 +148,7 @@ fn debug_binding_window(
             return None;
         }
     }
-    let mut values = BTreeMap::<DefId, WindowValue>::new();
+    let mut retained_defs = BTreeSet::<DefId>::new();
     for index in window.clone() {
         let instr = &proto.instrs[index];
         let effect = &dataflow.instr_effects[index];
@@ -134,12 +156,12 @@ fn debug_binding_window(
         // 额外 Close 只接纳不涉及捕获 cell/显式 TBC 的已归属词法边界。
         if (instr.is_control_terminator()
             && !matches!(instr, LowInstr::Branch(_) | LowInstr::Jump(_))
-            && !emission.for_instrs.contains(&InstrRef(index)))
+            && !emission.for_instr(InstrRef(index)))
             || matches!(instr, LowInstr::Tbc(_))
             || matches!(instr, LowInstr::Close(close) if close.from < floor
                 || dataflow.reference_captured_regs().any(|reg| reg >= close.from)
-                || emission.structure.plan().cleanup_tbc_origins(InstrRef(index)).is_some_and(|origins| !origins.is_empty())
-                || !matches!(emission.structure.plan().cleanup_disposition(InstrRef(index)),
+                || structure.plan().cleanup_tbc_origins(InstrRef(index)).is_some_and(|origins| !origins.is_empty())
+                || !matches!(structure.plan().cleanup_disposition(InstrRef(index)),
                     Some(CleanupDisposition::LexicalScope(_))))
             || effect.open_use.is_some()
             || effect.open_must_def.is_some()
@@ -155,13 +177,41 @@ fn debug_binding_window(
         }
         for &def in &dataflow.instr_defs[index] {
             let reg = dataflow.def_reg(def);
+            if reg < floor {
+                // 已在窗口外建立的源码 binding 可以在 do 内更新；它仍引用同一
+                // 外层身份。未证明的 scratch/声明不能借此逃出窗口或延长存活期。
+                let outer = proto.lowering_map.pc_map()[index].iter().all(|pc| {
+                    proto
+                        .debug_locals
+                        .source_at(reg, *pc)
+                        .and_then(|(scope, _)| debug_bindings.for_scope(scope))
+                        .is_some_and(|fact| {
+                            fact.end_instr
+                                .is_none_or(|scope_end| scope_end.index() >= end)
+                                && match fact.value {
+                                    SsaValue::Entry(_) => fact.start_pc == 0,
+                                    SsaValue::Def(owner) => {
+                                        dataflow.def_instr(owner).index() < start
+                                            && graph.dominates(dataflow.def_block(owner), entry)
+                                    }
+                                    SsaValue::Phi(_) => false,
+                                }
+                        })
+                });
+                if !outer || proto.lowering_map.pc_map()[index].is_empty() {
+                    return None;
+                }
+                continue;
+            }
+            // caller 排除只能证明 dispatch 前的 scratch；纯尾部不得再建立窗口内根。
+            if index > dispatch {
+                return None;
+            }
             let owner = owners.get(&reg);
             let is_owner = owner == Some(&def);
-            // 候选拒绝[ProofIncomplete]：禁止外层写、声明后的 owner 槽复写、未结束的异期 binding、
+            // 候选拒绝[ProofIncomplete]：禁止声明后的 owner 槽复写、未结束的异期 binding、
             // 捕获 cell 和逃逸 def/phi；窗口不能吞掉其他生命周期或延续其值身份。
-            if reg < floor
-                || (owner.is_some_and(|owner| dataflow.def_instr(*owner).index() <= index)
-                    && !is_owner)
+            if (owner.is_some_and(|owner| dataflow.def_instr(*owner).index() <= index) && !is_owner)
                 || dataflow.reg_is_reference_captured(reg)
                 || (!is_owner
                     && debug_bindings
@@ -186,212 +236,56 @@ fn debug_binding_window(
             {
                 return None;
             }
-            let value = if is_owner {
-                WindowValue::Cohort
+            let retained = if is_owner {
+                true
             } else {
                 match instr {
                     LowInstr::LoadNil(_)
                     | LowInstr::LoadBool(_)
                     | LowInstr::LoadConst(_)
                     | LowInstr::LoadInteger(_)
-                    | LowInstr::LoadNumber(_) => WindowValue::Anchored,
+                    | LowInstr::LoadNumber(_) => true,
                     LowInstr::Move(mov) if mov.src < floor => {
                         // 引用捕获的外层槽可能被调用回写；其副本仍按独立 scratch 证明退休。
-                        if dataflow.reg_is_reference_captured(mov.src) {
-                            WindowValue::Scratch
-                        } else {
-                            WindowValue::Anchored
-                        }
+                        !dataflow.reg_is_reference_captured(mov.src)
                     }
                     LowInstr::Move(mov) => match dataflow.use_value(InstrRef(index), mov.src) {
-                        SsaValue::Def(source) => {
-                            values.get(&source).copied().unwrap_or(WindowValue::Scratch)
-                        }
-                        SsaValue::Phi(_) => WindowValue::Scratch,
+                        SsaValue::Def(source) => retained_defs.contains(&source),
+                        SsaValue::Phi(_) => false,
                         SsaValue::Entry(_) => return None,
                     },
-                    _ => WindowValue::Scratch,
+                    _ => false,
                 }
             };
-            // 该证书只授权 END，不授权在内部提前删根或移动求值。
-            if value == WindowValue::Scratch && !home_retires(reg, index, dataflow.def_block(def)) {
+            // 独立 scratch 的证书只授权当前 home 在 END 退休，不能使其后续 MOVE 免于逐槽证明。
+            if retained {
+                retained_defs.insert(def);
+            } else if !home_retires(reg, index, dataflow.def_block(def)) {
                 return None;
             }
-            values.insert(def, value);
         }
     }
-    let SsaValue::Def(callee) = dataflow.use_value(InstrRef(end - 1), call.callee) else {
-        return None;
-    };
-    // 候选拒绝[ProofIncomplete]：末尾 callee 必须与窗口内某一 owner 的真实别名配对。
-    (values.get(&callee) == Some(&WindowValue::Cohort)).then_some(window)
+    // Call 的 caller_end 就是 callee 槽；其 Def/Phi 已通过窗口闭包和逐槽退休证明。
+    // 调用中的 callee/self 仍由活动帧保活；只封闭词法窗口，不在 debug end 生成 CLEAR。
+    Some(window)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WindowValue {
-    Cohort,
-    Anchored,
-    Scratch,
-}
-
-/// 仅对有 debug cohort 的快照投影一次 plan 发射域；逆后序保证父状态先于子节点。
-struct DebugEmissionIndex<'a> {
-    structure: &'a ReadyStructureFacts,
-    regions: Vec<DebugRegionEmission>,
-    for_instrs: BTreeSet<InstrRef>,
-}
-
-#[derive(Clone, Copy)]
-struct DebugRegionEmission {
-    ordinary: bool,
-    prefix_allowed: bool,
-    prefix_header: Option<BlockRef>,
-    scope_owner: RegionId,
-}
-
-impl DebugRegionEmission {
-    fn restrict_header(&mut self, header: Option<BlockRef>) {
-        self.prefix_allowed &=
-            header.is_some_and(|header| self.prefix_header.is_none_or(|prior| prior == header));
-        self.prefix_header = header;
-    }
-}
-
-impl<'a> DebugEmissionIndex<'a> {
-    fn new(structure: &'a ReadyStructureFacts) -> Self {
-        let plan = structure.plan();
-        let unrestricted = DebugRegionEmission {
-            ordinary: true,
-            prefix_allowed: true,
-            prefix_header: None,
-            scope_owner: plan.root(),
-        };
-        let mut regions = vec![unrestricted; plan.regions().len()];
-        let mut for_instrs = BTreeSet::new();
-        for (id, _) in plan.loops() {
-            match plan.loop_protocol(id) {
-                Some(LoopVmProtocol::NumericFor(protocol)) => {
-                    for_instrs.insert(protocol.init_instr);
-                    for_instrs.extend(protocol.loop_instr);
-                }
-                Some(LoopVmProtocol::GenericFor(protocol)) => {
-                    for_instrs.extend(protocol.prep_instr);
-                    for_instrs.extend([protocol.call_instr, protocol.loop_instr]);
-                }
-                _ => {}
-            }
-        }
-        for &region in plan.region_postorder().iter().rev() {
-            let node = plan
-                .region(region)
-                .expect("ready region order retains every node");
-            let mut state = node
-                .parent()
-                .map_or(unrestricted, |parent| regions[parent.index()]);
-            if let Some(parent) = node.parent().and_then(|parent| plan.region(parent)) {
-                // 条件前缀与循环外前缀仍属于外围语法块；arm/body 是独立词法 owner。
-                match parent {
-                    RegionPlan::Branch {
-                        then_arm, else_arm, ..
-                    } if *then_arm == region || *else_arm == Some(region) => {
-                        state.scope_owner = region
-                    }
-                    RegionPlan::Loop {
-                        body,
-                        control,
-                        normal_tail,
-                        ..
-                    } => {
-                        if *body == region || *control == region {
-                            state.scope_owner = *body;
-                        } else if *normal_tail == Some(region) {
-                            state.scope_owner = region;
-                        }
-                    }
-                    _ => {}
-                }
-                match parent {
-                    RegionPlan::Branch {
-                        plan: branch,
-                        condition,
-                        ..
-                    } if *condition == region => {
-                        state.restrict_header(
-                            plan.branch(*branch)
-                                .and_then(|branch| plan.condition(branch.condition))
-                                .and_then(|condition| condition.header()),
-                        );
-                    }
-                    RegionPlan::Loop { control, .. } if *control == region => {
-                        state.prefix_allowed = false;
-                    }
-                    _ => {}
-                }
-            }
-            if let RegionPlan::ValueDecision { plan: decision, .. } = node {
-                state.restrict_header(
-                    plan.value_decision(*decision)
-                        .and_then(|value| value.header()),
-                );
-            }
-            state.ordinary &= !matches!(
-                node,
-                RegionPlan::Unstructured { .. } | RegionPlan::ValueDecision { .. }
-            ) && plan.single_pass_for_region(region).is_none();
-            regions[region.index()] = state;
-        }
-        Self {
-            structure,
-            regions,
-            for_instrs,
-        }
-    }
-
-    fn scope_owner(&self, block: BlockRef) -> Option<RegionId> {
-        let owner = self.structure.plan().region_for_block(block)?;
-        Some(self.regions[owner.index()].scope_owner)
-    }
-
-    /// 两端必须由 regular/header prefix 发射，不能切入被吸收的表达式或 loop 绑定。
-    fn regular_prefix(&self, block: BlockRef) -> Option<Range<usize>> {
-        let plan = self.structure.plan();
-        if plan.block_emission(block) != Some(BlockEmissionPlan::Emit) {
-            return None;
-        }
-        let owner = plan.region_for_block(block)?;
-        let state = self.regions[owner.index()];
-        if !state.prefix_allowed || state.prefix_header.is_some_and(|header| header != block) {
-            return None;
-        }
-        let terminator = plan.block_terminator(block)?;
-        Some(
-            terminator.instrs.start.index()
-                ..terminator
-                    .kind
-                    .instr()
-                    .map_or(terminator.instrs.end(), InstrRef::index),
-        )
-    }
-}
 /// 图边界已经证明；这里只限制窗口内的发射域和会被新词法块截断的值。
 fn window_emission_is_local(
     cfg: &Cfg,
-    emission: &DebugEmissionIndex<'_>,
+    emission: &HirEmissionFacts<'_>,
     window: &Range<usize>,
 ) -> bool {
     for run in cfg.instr_to_block[window.clone()].chunk_by(|a, b| a == b) {
         let block = run[0];
-        let Some(owner) = emission.structure.plan().region_for_block(block) else {
-            return false;
-        };
-        if !emission.regions[owner.index()].ordinary {
+        if !emission.ordinary_block(block) {
             return false;
         }
     }
     true
 }
 
-fn retain_non_crossing(mut scopes: Vec<Range<usize>>) -> Vec<Range<usize>> {
+pub(super) fn retain_non_crossing(mut scopes: Vec<Range<usize>>) -> Vec<Range<usize>> {
     scopes.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
     scopes.dedup();
     let mut retained = vec![true; scopes.len()];

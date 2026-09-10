@@ -12,6 +12,8 @@
 //!   显式 TBC 全部属于唯一 loop owner 时才交给该循环，HIR 不再重跑活跃性分析
 //! - 显式 Close 的连续 block 前缀可下放到入边，每条边按 may-out 冻结独立事件；
 //!   相同 origin 的其它 Close 仍保留自己的执行位置，不能充当这一事件的替身
+//! - 内层 TBC 的 Close 若仍能观察同轮外层源码 local，就保留显式事件；例如
+//!   `local copy=x; do local guard <close>=g end` 不能把两者合成同一个循环结束域
 //! - branch admission 按真实 container preorder 区间查询 Close；共享透明链只在当前
 //!   候选内解析，例如 Close -> jump -> 候选外 -> effect 不把外部 effect 吸进 arm
 
@@ -20,7 +22,7 @@ use std::{
     ops::Range,
 };
 
-use crate::structure::{BlockRef, Cfg, GraphFacts, StructurePlan};
+use crate::structure::{BlockRef, Cfg, DebugBindingFacts, GraphFacts, StructurePlan};
 use crate::transformer::{InstrRef, LowInstr, LoweredProto, Reg};
 
 use super::common::ScopePlan;
@@ -299,6 +301,7 @@ pub(super) fn analyze_scopes(
 pub(super) fn finalize_cleanup_dispositions(
     proto: &LoweredProto,
     cfg: &Cfg,
+    debug_bindings: &DebugBindingFacts,
     plan: &mut StructurePlan,
 ) -> Result<(), StructureError> {
     let mut lexical_owners = vec![None; proto.instrs.len()];
@@ -328,10 +331,11 @@ pub(super) fn finalize_cleanup_dispositions(
                 LowInstr::Close(_) if plan.tbc_flow.close_origins.contains_key(&instr) => {
                     let origins = &plan.tbc_flow.close_origins[&instr];
                     Some(
-                        explicit_tbc_loop_owner(proto, cfg, plan, instr, origins).map_or(
-                            CleanupDisposition::ExplicitClose,
-                            CleanupDisposition::LoopTbcBoundary,
-                        ),
+                        explicit_tbc_loop_owner(proto, cfg, plan, instr, origins, debug_bindings)
+                            .map_or(
+                                CleanupDisposition::ExplicitClose,
+                                CleanupDisposition::LoopTbcBoundary,
+                            ),
                     )
                 }
                 LowInstr::Close(_) => Some(CleanupDisposition::LexicalScope(
@@ -485,6 +489,7 @@ fn label_entry_cleanup(
 pub(super) fn validate_cleanup_dispositions(
     proto: &LoweredProto,
     cfg: &Cfg,
+    debug_bindings: &DebugBindingFacts,
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
     let explicit_tbc_close_origins = &plan.tbc_flow.close_origins;
@@ -526,7 +531,8 @@ pub(super) fn validate_cleanup_dispositions(
                     )));
                 };
                 if !cfg.reachable_blocks.contains(&block)
-                    || explicit_tbc_loop_owner(proto, cfg, plan, instr_ref, origins) != Some(region)
+                    || explicit_tbc_loop_owner(proto, cfg, plan, instr_ref, origins, debug_bindings)
+                        != Some(region)
                 {
                     return Err(StructureError::invalid(format!(
                         "cleanup @{instr_index} does not belong to loop region {}",
@@ -542,7 +548,8 @@ pub(super) fn validate_cleanup_dispositions(
                 let origins = explicit_tbc_close_origins.get(&instr);
                 if !cfg.reachable_blocks.contains(&block)
                     || origins.is_none_or(|origins| {
-                        explicit_tbc_loop_owner(proto, cfg, plan, instr, origins).is_some()
+                        explicit_tbc_loop_owner(proto, cfg, plan, instr, origins, debug_bindings)
+                            .is_some()
                     })
                 {
                     return Err(StructureError::invalid(format!(
@@ -892,6 +899,7 @@ fn explicit_tbc_loop_owner(
     plan: &StructurePlan,
     close_instr: InstrRef,
     covered_tbc_instrs: &BTreeSet<InstrRef>,
+    debug_bindings: &DebugBindingFacts,
 ) -> Option<RegionId> {
     let close_block = *cfg.instr_to_block.get(close_instr.index())?;
     let LowInstr::Close(close) = proto.instrs.get(close_instr.index())? else {
@@ -914,27 +922,25 @@ fn explicit_tbc_loop_owner(
         } = region_plan
         {
             let candidate = plan.loop_(*loop_id)?;
+            let context = LoopTbcOwnershipContext {
+                proto,
+                cfg,
+                plan,
+                candidate,
+                loop_region: region_id,
+                preheader: *preheader,
+                control: *control,
+                body: *body,
+                covered_origins: covered_tbc_instrs,
+            };
             if loop_tbc_base_is_owned(proto, cfg, candidate, close.from)
                 && covered_tbc_instrs.iter().all(|tbc| {
                     cfg.instr_to_block.get(tbc.index()).is_some_and(|block| {
                         loop_iteration_scope_contains(plan, candidate, *control, *body, *block)
                     })
                 })
-                && loop_tbc_boundary_location_is_owned(
-                    &LoopTbcOwnershipContext {
-                        proto,
-                        cfg,
-                        plan,
-                        candidate,
-                        loop_region: region_id,
-                        preheader: *preheader,
-                        control: *control,
-                        body: *body,
-                        covered_origins: covered_tbc_instrs,
-                    },
-                    close_block,
-                    close_instr,
-                )
+                && loop_tbc_boundary_location_is_owned(&context, close_block, close_instr)
+                && loop_tbc_preserves_debug_scopes(&context, close_instr, debug_bindings)
             {
                 return Some(region_id);
             }
@@ -993,6 +999,63 @@ struct LoopTbcOwnershipContext<'a> {
     control: RegionId,
     body: RegionId,
     covered_origins: &'a BTreeSet<InstrRef>,
+}
+
+fn loop_tbc_preserves_debug_scopes(
+    context: &LoopTbcOwnershipContext<'_>,
+    close_instr: InstrRef,
+    debug_bindings: &DebugBindingFacts,
+) -> bool {
+    let proto = context.proto;
+    let source_end = context
+        .covered_origins
+        .iter()
+        .flat_map(|origin| {
+            let LowInstr::Tbc(tbc) = &proto.instrs[origin.index()] else {
+                unreachable!("TBC flow origins retain their registration instruction");
+            };
+            proto.lowering_map.pc_map()[origin.index()]
+                .iter()
+                .filter_map(move |pc| {
+                    proto
+                        .debug_locals
+                        .source_at(tbc.reg, *pc)
+                        .map(|(_, scope)| scope.end_pc)
+                })
+        })
+        .min();
+    let Some(source_end) = source_end else {
+        return true;
+    };
+    let LowInstr::Close(close) = &proto.instrs[close_instr.index()] else {
+        unreachable!("loop cleanup query only accepts Close");
+    };
+    // 只查原 frame 的槽位，活动区间由 Transformer 的 source_at 索引回答。
+    // Lua54 内层 guard 在 CLOSE 前结束，而同轮外层 copy 在 CLOSE 后才结束；
+    // 若交给整个 loop 的隐式 closing，__close 中 copy 会提前不可见。
+    // 入口 binding 不会随本轮 scope 消失；Def/Phi 的声明 owner 则直接消费 SSA。
+    !proto.lowering_map.pc_map()[close_instr.index()]
+        .iter()
+        .any(|pc| {
+            (0..close.from.index()).any(|reg| {
+                let Some((scope, local)) = proto.debug_locals.source_at(Reg(reg), *pc) else {
+                    return false;
+                };
+                local.end_pc > source_end
+                    && debug_bindings.for_scope(scope).is_none_or(|fact| {
+                        // 未接受或晚起的 Entry scope 不能当作函数入口 binding；缺失证明时保留 Close。
+                        fact.declaration_block.map_or(fact.start_pc != 0, |block| {
+                            loop_iteration_scope_contains(
+                                context.plan,
+                                context.candidate,
+                                context.control,
+                                context.body,
+                                block,
+                            )
+                        })
+                    })
+            })
+        })
 }
 
 fn loop_tbc_boundary_location_is_owned(

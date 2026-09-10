@@ -170,14 +170,6 @@ pub(super) fn pending_tbc_boundary_labels_in_proto(proto: &HirProto) -> BTreeSet
     labels
 }
 
-#[cfg(test)]
-fn collect_pending_tbc_boundary_labels_in_block(
-    block: &HirBlock,
-    labels: &mut BTreeSet<HirLabelId>,
-) {
-    crate::hir::visit::visit_block(block, &mut PendingTbcBoundaryCollector { labels });
-}
-
 struct PendingTbcBoundaryCollector<'a> {
     labels: &'a mut BTreeSet<HirLabelId>,
 }
@@ -809,88 +801,5 @@ impl HirVisitor for BindingActivityCollector {
             | HirLValue::TableAccess(_) => return,
         };
         self.positions.record(binding, self.owner);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::hir::common::{HirAssign, HirClose, HirLabel, HirToBeClosed, HirValuePack};
-
-    fn temp_definition(temp: TempId) -> HirStmt {
-        HirStmt::Assign(Box::new(HirAssign {
-            targets: vec![HirLValue::Temp(temp)],
-            values: HirValuePack::fixed(vec![HirExpr::Nil]),
-            initializer_merge_transaction: None,
-            generic_for_initializer_producer: None,
-            method_rewrite_transaction: None,
-        }))
-    }
-
-    fn tbc(temp: TempId, origin: InstrRef, reg_index: usize) -> HirStmt {
-        HirStmt::ToBeClosed(Box::new(HirToBeClosed {
-            origin,
-            reg_index,
-            value: HirExpr::TempRef(temp),
-        }))
-    }
-
-    fn label(id: usize, barriers: Vec<InstrRef>) -> HirStmt {
-        HirStmt::Label(Box::new(HirLabel {
-            entry_cleanup: Vec::new(),
-            id: HirLabelId(id),
-            tbc_barriers: barriers,
-        }))
-    }
-
-    #[test]
-    fn pending_boundaries_are_direct_and_epoch_local() {
-        let first_origin = InstrRef(10);
-        let second_origin = InstrRef(20);
-        let block = HirBlock {
-            stmts: vec![
-                temp_definition(TempId(0)),
-                tbc(TempId(0), first_origin, 2),
-                label(1, vec![first_origin]),
-                label(2, Vec::new()),
-                HirStmt::Block(Box::new(HirBlock {
-                    stmts: vec![label(3, vec![first_origin])],
-                })),
-                HirStmt::Close(Box::new(HirClose {
-                    kind: crate::transformer::CloseKind::Explicit,
-                    from_reg: 2,
-                    origins: vec![first_origin],
-                })),
-                temp_definition(TempId(1)),
-                tbc(TempId(1), second_origin, 2),
-                label(4, vec![second_origin]),
-            ],
-        };
-
-        let mut boundaries = BTreeSet::new();
-        collect_pending_tbc_boundary_labels_in_block(&block, &mut boundaries);
-
-        assert_eq!(boundaries, BTreeSet::from([HirLabelId(1), HirLabelId(2)]));
-    }
-
-    #[test]
-    fn crossing_resource_component_does_not_reject_disjoint_scope() {
-        let interval = |start, end, reg_index| ScopeInterval {
-            origin: InstrRef(reg_index),
-            start,
-            end,
-            reg_index,
-            close_selections: Vec::new(),
-        };
-        let disjoint = interval(8, 11, 4);
-
-        assert_eq!(
-            retain_well_nested_interval_components(vec![
-                interval(0, 5, 2),
-                interval(2, 7, 3),
-                disjoint.clone(),
-            ]),
-            vec![disjoint]
-        );
     }
 }

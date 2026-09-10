@@ -5,6 +5,8 @@ mod liveness;
 mod moves;
 mod open;
 mod overwrites;
+mod plain_tables;
+mod root_exits;
 mod ssa;
 
 use std::collections::{BTreeSet, VecDeque};
@@ -141,7 +143,9 @@ fn compute_dataflow_proto(
         .instrs
         .iter()
         .zip(&instr_effects)
-        .map(|(instr, effect)| compute_side_effect_summary(instr, effect))
+        .map(|(instr, effect)| {
+            compute_side_effect_summary(instr, effect, usize::from(proto.frame.max_stack_size))
+        })
         .collect::<Vec<_>>();
     let reg_count = compute_reg_count(proto, &instr_effects)?;
     let mut reg_captures = vec![RegCaptures::default(); reg_count];
@@ -159,6 +163,8 @@ fn compute_dataflow_proto(
         }
     }
 
+    let plain_table_reads =
+        plain_tables::collect(proto, cfg, &instr_effects, &effect_summaries, &reg_captures);
     let entry_open_start = proto
         .signature
         .is_vararg
@@ -234,15 +240,18 @@ fn compute_dataflow_proto(
     );
     let canonical_move_values = moves::freeze_move_values(proto, &defs, &ssa.use_values);
     let root_intervals = super::common::RootIntervalIndex::new(&instr_effects, &effect_summaries);
+    let unobserved_forward_exits = root_exits::unobserved_forward_exits(cfg, &effect_summaries);
     Ok(DataflowFacts {
         instr_effects,
         effect_summaries,
+        plain_table_reads,
         defs,
         open_defs,
         instr_defs,
         fixed_defs_by_reg,
         reg_captures,
         root_intervals,
+        unobserved_forward_exits,
         block_entry_values: ssa.block_entry_values,
         block_exit_values: ssa.block_exit_values,
         block_end_values: ssa.block_end_values,

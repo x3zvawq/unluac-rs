@@ -86,13 +86,14 @@ pub(super) fn validate_final(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     dataflow: &DataflowFacts,
+    debug_bindings: &crate::structure::DebugBindingFacts,
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
     validate(proto, cfg, plan)?;
     crate::structure::scope::validate_label_tbc_barriers(cfg, plan)?;
     validate_condition_predicates(proto, plan)?;
     validate_condition_prefix_placements(proto, cfg, plan)?;
-    validate_cleanup(proto, cfg, plan)?;
+    validate_cleanup(proto, cfg, debug_bindings, plan)?;
     validate_phis(cfg, dataflow, plan)?;
     let placements = super::expected_edge_action_placements(proto, cfg, dataflow, plan);
     for (edge, expected) in plan.edge_plans.iter().zip(placements) {

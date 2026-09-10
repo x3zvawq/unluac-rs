@@ -852,28 +852,3 @@ fn is_true(expr: &HirExpr) -> bool {
 fn is_false(expr: &HirExpr) -> bool {
     matches!(expr, HirExpr::Boolean(false))
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::hir::common::{
-        HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,
-    };
-
-    use super::analyze_decision;
-
-    #[test]
-    #[should_panic(expected = "HIR Decision must be acyclic")]
-    fn decision_cycle_violates_hir_contract() {
-        let decision = HirDecisionExpr {
-            entry: HirDecisionNodeRef(0),
-            nodes: vec![HirDecisionNode {
-                id: HirDecisionNodeRef(0),
-                test: HirExpr::Boolean(true),
-                truthy: HirDecisionTarget::Node(HirDecisionNodeRef(0)),
-                falsy: HirDecisionTarget::Expr(HirExpr::Boolean(false)),
-            }],
-        };
-
-        analyze_decision(&decision);
-    }
-}

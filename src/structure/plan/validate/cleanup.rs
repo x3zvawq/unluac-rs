@@ -5,9 +5,10 @@ use super::*;
 pub(super) fn validate_cleanup(
     proto: &LoweredProto,
     cfg: &Cfg,
+    debug_bindings: &crate::structure::DebugBindingFacts,
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
-    crate::structure::scope::validate_cleanup_dispositions(proto, cfg, plan)?;
+    crate::structure::scope::validate_cleanup_dispositions(proto, cfg, debug_bindings, plan)?;
     for (loop_id, loop_) in plan.loops() {
         let Some(tail) = &loop_.exit_tail else {
             continue;

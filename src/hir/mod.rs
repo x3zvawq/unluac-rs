@@ -8,6 +8,7 @@ mod common;
 #[cfg(feature = "decompile-debug")]
 mod debug;
 mod decision;
+mod emission;
 mod error;
 mod expr_safety;
 mod promotion;

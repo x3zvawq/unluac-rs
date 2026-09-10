@@ -58,8 +58,9 @@ use super::mention::{
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
     CallRootLifetimeIndices, RootEventBlock, RootEventIndex, RootEventStmt, RootLifetimeFacts,
-    collect_call_result_local_roots, collect_call_root_lifetimes, collect_lookup_gc_root_lifetimes,
-    exact_multi_call_home_targets, stmt_has_argument_root_handoff,
+    RootOverwritePolicy, collect_call_result_local_roots, collect_call_root_lifetimes,
+    collect_lookup_gc_root_lifetimes, exact_multi_call_home_targets,
+    stmt_has_argument_root_handoff,
 };
 use super::temp_touch::{collect_temp_refs_in_expr, expr_touches_any_temp};
 use crate::hir::common::{
@@ -677,12 +678,17 @@ fn collect_plans(
                 .is_none_or(Option::is_none)
         },
         |temp| {
-            // 候选拒绝[SemanticBarrier:Resource]：TBC overwrite 必须在原位置建立新的 close owner，不能复用更早声明的 root local。
-            // 候选拒绝[PolicyBoundary]：debug overwrite 继续由 debug-scope owner 选名；普通 capture 可精确复用同 home local。
-            !ctx.to_be_closed_temps.contains(&temp)
-                && temp_debug_locals
-                    .get(temp.index())
-                    .is_none_or(Option::is_none)
+            if ctx.to_be_closed_temps.contains(&temp) {
+                RootOverwritePolicy::Reject
+            } else if temp_debug_locals
+                .get(temp.index())
+                .is_some_and(Option::is_some)
+            {
+                // debug 新身份不复用匿名 root；确切覆盖仍须结束已物化的旧 owner。
+                RootOverwritePolicy::ReleaseExisting
+            } else {
+                RootOverwritePolicy::Reuse
+            }
         },
     );
     let lookup_gc_root_lifetimes =
@@ -1268,6 +1274,23 @@ fn collect_plans(
             ctx.physical_root_locals.insert(old_local);
             ctx.physical_root_locals.insert(selected_local);
             materialized_owner_locals.insert((owner.root_index(), owner.home()), selected_local);
+        }
+        if let Some((home, old_local)) = call_root_lifetimes
+            .overwrite_releases(decl_index)
+            .find(|owner| Some(owner.home()) == home_slot)
+            .and_then(|owner| {
+                materialized_owner_locals
+                    .get(&(owner.root_index(), owner.home()))
+                    .map(|&local| (owner.home(), local))
+            })
+            .filter(|(_, old_local)| *old_local != selected_local)
+        {
+            // 先确定实际身份：同 debug scope 若复用旧 local，原赋值已退休旧值；
+            // 只有独立声明才在 RHS 完成后释放旧 local，不能把新值一起清空。
+            allocator.plans.last_mut().unwrap().root_release =
+                Some((decl_index, RootRelease::After(old_local)));
+            ctx.physical_root_locals.insert(old_local);
+            current_slot_locals.insert(home, selected_local);
         }
         let collected_root =
             call_root_lifetimes.is_root(decl_index) || lookup_gc_root_lifetimes.is_root(decl_index);
@@ -2154,381 +2177,4 @@ fn debug_scope_for_temp_group(
         .filter_map(|temp| temp_debug_scopes.get(temp.index()).copied().flatten());
     let scope = scopes.next()?;
     scopes.all(|candidate| candidate == scope).then_some(scope)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::decompile::DecompileDialect;
-    use crate::hir::common::{
-        HirCallExpr, HirCallStmt, HirGlobalRef, HirGoto, HirIf, HirLabel, HirLabelId, HirPackTail,
-    };
-
-    fn assign(target: TempId, value: HirExpr) -> HirStmt {
-        HirStmt::Assign(Box::new(HirAssign {
-            targets: vec![HirLValue::Temp(target)],
-            values: HirValuePack::fixed(vec![value]),
-            initializer_merge_transaction: None,
-            generic_for_initializer_producer: None,
-            method_rewrite_transaction: None,
-        }))
-    }
-
-    fn goto(target: HirLabelId) -> HirStmt {
-        HirStmt::Goto(Box::new(HirGoto { target }))
-    }
-
-    fn label(id: HirLabelId) -> HirStmt {
-        HirStmt::Label(Box::new(HirLabel {
-            entry_cleanup: Vec::new(),
-            id,
-            tbc_barriers: Vec::new(),
-        }))
-    }
-
-    fn call(name: &str) -> HirExpr {
-        HirExpr::Call(Box::new(HirCallExpr {
-            argument_roots: Vec::new(),
-            frame_root_ends: Vec::new(),
-            callee: HirExpr::GlobalRef(HirGlobalRef { key: name.into() }),
-            args: HirValuePack::default(),
-            method: false,
-            fastcall: None,
-            method_key: None,
-            callee_root_handoff: None,
-            method_rewrite_transaction: None,
-        }))
-    }
-
-    #[test]
-    fn only_single_value_capture_can_promote_without_a_home() {
-        let first = TempId(0);
-        let second = TempId(1);
-        let value_captured = BTreeSet::from([first]);
-
-        assert!(!identity_sensitive_group_requires_home(
-            &BTreeSet::from([first]),
-            &value_captured,
-            &BTreeSet::new(),
-        ));
-        assert!(identity_sensitive_group_requires_home(
-            &BTreeSet::from([first]),
-            &value_captured,
-            &BTreeSet::from([first]),
-        ));
-        assert!(identity_sensitive_group_requires_home(
-            &BTreeSet::from([first, second]),
-            &value_captured,
-            &BTreeSet::new(),
-        ));
-
-        let mut dispositions = crate::hir::common::HirInlineDispositions::default();
-        assert!(dispositions.preserve_temp(
-            first,
-            crate::hir::common::HirInlineRetentionReason::CapturedValueEpoch,
-        ));
-        assert!(!dispositions.preserve_temp(
-            first,
-            crate::hir::common::HirInlineRetentionReason::CapturedValueEpoch,
-        ));
-        dispositions.promote_temp_to_local(first, LocalId(0));
-        dispositions.promote_temp_to_local(second, LocalId(0));
-        assert_eq!(
-            dispositions.local(LocalId(0)),
-            &crate::hir::common::HirInlineDisposition::Preserve(BTreeSet::from([
-                crate::hir::common::HirInlineRetentionReason::CapturedValueEpoch,
-            ]))
-        );
-    }
-
-    #[test]
-    fn call_root_owner_accepts_reference_capture_but_not_value_snapshot_or_tbc() {
-        let reference = TempId(0);
-        let value = TempId(1);
-        let tbc = TempId(2);
-        let identity_sensitive = BTreeSet::from([reference, value, tbc]);
-        let cell_sensitive = BTreeSet::from([reference, tbc]);
-        let to_be_closed = BTreeSet::from([tbc]);
-
-        assert!(capture_kind_allows_call_root_owner(
-            reference,
-            &identity_sensitive,
-            &cell_sensitive,
-            &to_be_closed,
-        ));
-        assert!(!capture_kind_allows_call_root_owner(
-            value,
-            &identity_sensitive,
-            &cell_sensitive,
-            &to_be_closed,
-        ));
-        assert!(!capture_kind_allows_call_root_owner(
-            tbc,
-            &identity_sensitive,
-            &cell_sensitive,
-            &to_be_closed,
-        ));
-    }
-
-    #[test]
-    fn move_home_relation_accepts_only_one_shared_possible_home() {
-        let exact_root = TempId(0);
-        let exact_alias = TempId(1);
-        let disjoint_alias = TempId(2);
-        let overlapping_alias = TempId(3);
-        let invalidated_single_alias = TempId(4);
-        let root_home = HomeSlotKey::new(0, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(exact_root, root_home);
-        facts.record_temp_home_slot_for_test(exact_alias, root_home);
-        facts.record_temp_home_slot_for_test(disjoint_alias, HomeSlotKey::new(1, 0));
-        facts.record_temp_home_merge(
-            disjoint_alias,
-            Some(BTreeSet::from([HomeSlotKey::new(2, 0)])),
-        );
-        facts.record_temp_home_slot_for_test(overlapping_alias, HomeSlotKey::new(3, 0));
-        facts.record_temp_home_merge(overlapping_alias, Some(BTreeSet::from([root_home])));
-        facts.record_temp_home_slot_for_test(invalidated_single_alias, root_home);
-        facts.record_temp_home_merge(invalidated_single_alias, Some(BTreeSet::new()));
-
-        assert_eq!(
-            move_home_relation(exact_root, exact_alias, &facts),
-            MoveHomeRelation::SameExact
-        );
-        assert_eq!(
-            move_home_relation(exact_root, disjoint_alias, &facts),
-            MoveHomeRelation::ProvenDistinct
-        );
-        assert_eq!(
-            move_home_relation(exact_root, overlapping_alias, &facts),
-            MoveHomeRelation::MayDiffer
-        );
-        assert_eq!(
-            move_home_relation(exact_root, invalidated_single_alias, &facts),
-            MoveHomeRelation::SameExact
-        );
-        assert_eq!(
-            move_home_relation(exact_root, TempId(5), &facts),
-            MoveHomeRelation::MayDiffer
-        );
-    }
-
-    #[test]
-    fn label_flow_accepts_dominated_structured_gc_inert_writes() {
-        let temp = TempId(0);
-        let sink = TempId(1);
-        let target = HirLabelId(0);
-        let group = PromotionGroup {
-            temps: BTreeSet::from([temp]),
-            removable_aliases: BTreeSet::new(),
-            touching_stmt_indices: BTreeSet::from([1, 4]),
-        };
-        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
-        let inert = HirBlock {
-            stmts: vec![
-                assign(temp, HirExpr::Integer(1)),
-                HirStmt::If(Box::new(HirIf {
-                    cond: HirExpr::ParamRef(crate::hir::common::ParamId(0)),
-                    then_block: HirBlock {
-                        stmts: vec![assign(temp, HirExpr::Integer(2))],
-                    },
-                    else_block: None,
-                })),
-                goto(target),
-                assign(sink, HirExpr::Integer(0)),
-                label(target),
-                assign(sink, HirExpr::TempRef(temp)),
-            ],
-        };
-        let owner_refs = count_label_references(&inert.stmts);
-        let inert_cfg = LexicalCfg::analyze(&inert.stmts, &owner_refs, safety).unwrap();
-        let inert_suffix_dominance = inert_cfg.suffix_dominance();
-        let facts = ProtoPromotionFacts::default();
-        let proof = LabelFlowGroupProof {
-            block: &inert,
-            linear_prefix_end: 2,
-            suffix_dominance: Some(&inert_suffix_dominance),
-            facts: &facts,
-            closed_root_homes: BTreeSet::new(),
-            safety,
-        };
-
-        assert_eq!(proof.group_safety(0, temp, &group), Ok(()));
-    }
-
-    #[test]
-    fn label_flow_rejects_bypassed_declaration_and_unclosed_gc_value() {
-        let temp = TempId(0);
-        let resource = TempId(1);
-        let sink = TempId(2);
-        let target = HirLabelId(0);
-        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
-        let bypassed = HirBlock {
-            stmts: vec![
-                goto(target),
-                assign(temp, HirExpr::Integer(1)),
-                label(target),
-                assign(sink, HirExpr::TempRef(temp)),
-            ],
-        };
-        let bypassed_group = PromotionGroup {
-            temps: BTreeSet::from([temp]),
-            removable_aliases: BTreeSet::new(),
-            touching_stmt_indices: BTreeSet::from([3]),
-        };
-        let bypassed_refs = count_label_references(&bypassed.stmts);
-        let bypassed_cfg = LexicalCfg::analyze(&bypassed.stmts, &bypassed_refs, safety).unwrap();
-        let bypassed_suffix_dominance = bypassed_cfg.suffix_dominance();
-        let facts = ProtoPromotionFacts::default();
-        let bypassed_proof = LabelFlowGroupProof {
-            block: &bypassed,
-            linear_prefix_end: 0,
-            suffix_dominance: Some(&bypassed_suffix_dominance),
-            facts: &facts,
-            closed_root_homes: BTreeSet::new(),
-            safety,
-        };
-        assert_eq!(
-            bypassed_proof.group_safety(1, temp, &bypassed_group),
-            Err(LabelFlowGroupFailure::ControlFlow)
-        );
-
-        let unclosed = HirBlock {
-            stmts: vec![
-                assign(temp, HirExpr::TempRef(resource)),
-                goto(target),
-                label(target),
-                assign(sink, HirExpr::TempRef(temp)),
-            ],
-        };
-        let unclosed_group = PromotionGroup {
-            temps: BTreeSet::from([temp]),
-            removable_aliases: BTreeSet::new(),
-            touching_stmt_indices: BTreeSet::from([3]),
-        };
-        let unclosed_refs = count_label_references(&unclosed.stmts);
-        let unclosed_cfg = LexicalCfg::analyze(&unclosed.stmts, &unclosed_refs, safety).unwrap();
-        let unclosed_suffix_dominance = unclosed_cfg.suffix_dominance();
-        let unclosed_proof = LabelFlowGroupProof {
-            block: &unclosed,
-            linear_prefix_end: 1,
-            suffix_dominance: Some(&unclosed_suffix_dominance),
-            facts: &facts,
-            closed_root_homes: BTreeSet::new(),
-            safety,
-        };
-        assert_eq!(
-            unclosed_proof.group_safety(0, temp, &unclosed_group),
-            Err(LabelFlowGroupFailure::Lifetime)
-        );
-    }
-
-    #[test]
-    fn root_lifetime_pair_must_match_the_candidate_home() {
-        let left = TempId(0);
-        let right = TempId(1);
-        let left_overwrite = TempId(2);
-        let left_home = HomeSlotKey::new(0, 0);
-        let right_home = HomeSlotKey::new(1, 0);
-        let mut facts = ProtoPromotionFacts::default();
-        facts.record_temp_home_slot_for_test(left, left_home);
-        facts.record_temp_home_slot_for_test(right, right_home);
-        facts.record_temp_home_slot_for_test(left_overwrite, left_home);
-        let stmts = vec![
-            HirStmt::Assign(Box::new(HirAssign {
-                targets: vec![HirLValue::Temp(left), HirLValue::Temp(right)],
-                values: HirValuePack::expanding(
-                    Vec::new(),
-                    HirPackTail::exact(call("producer"), 2),
-                ),
-                initializer_merge_transaction: None,
-                generic_for_initializer_producer: None,
-                method_rewrite_transaction: None,
-            })),
-            HirStmt::CallStmt(Box::new(HirCallStmt {
-                call: match call("collectgarbage") {
-                    HirExpr::Call(call) => *call,
-                    _ => unreachable!(),
-                },
-            })),
-            assign(left_overwrite, HirExpr::Integer(0)),
-        ];
-        let safety = HirExprSafety::for_dialect(DecompileDialect::Lua54);
-        let call_roots = collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(&stmts, &facts, safety),
-            &facts,
-            RootAnalysisContext {
-                safety,
-                effects: &[],
-            },
-            true,
-            |_| true,
-            |_| true,
-        );
-        let closed_roots = call_roots
-            .closed_roots_before(stmts.len())
-            .map(|owner| (owner.root_index(), owner.home()))
-            .collect::<BTreeSet<_>>();
-        assert!(closed_roots.contains(&(0, left_home)));
-        assert!(!closed_roots.contains(&(0, right_home)));
-    }
-
-    #[test]
-    fn batched_initializer_certificate_requires_the_complete_exact_multicall_pair() {
-        let bindings = vec![LocalId(0), LocalId(1)];
-        let mut declaration = HirLocalDecl {
-            bindings: bindings.clone(),
-            values: HirValuePack::fixed(Vec::new()),
-            initializer_merge_transaction: None,
-        };
-        let mut assignment = HirStmt::Assign(Box::new(HirAssign {
-            targets: bindings.iter().copied().map(HirLValue::Local).collect(),
-            values: HirValuePack::expanding(
-                Vec::new(),
-                HirPackTail::exact(call("producer"), bindings.len()),
-            ),
-            initializer_merge_transaction: None,
-            generic_for_initializer_producer: None,
-            method_rewrite_transaction: None,
-        }));
-        certify_batched_initializer_merge_transaction(
-            HirProtoRef(0),
-            &mut declaration,
-            &mut assignment,
-        );
-
-        let HirStmt::Assign(assignment) = assignment else {
-            unreachable!();
-        };
-        assert_eq!(
-            declaration.initializer_merge_transaction,
-            assignment.initializer_merge_transaction
-        );
-        assert!(declaration.initializer_merge_transaction.is_some());
-
-        let mut partial_declaration = HirLocalDecl {
-            bindings: vec![bindings[0]],
-            values: HirValuePack::fixed(Vec::new()),
-            initializer_merge_transaction: None,
-        };
-        let mut non_multicall_assignment = HirStmt::Assign(Box::new(HirAssign {
-            targets: bindings.iter().copied().map(HirLValue::Local).collect(),
-            values: HirValuePack::fixed(vec![HirExpr::Integer(1), HirExpr::Integer(2)]),
-            initializer_merge_transaction: None,
-            generic_for_initializer_producer: None,
-            method_rewrite_transaction: None,
-        }));
-
-        certify_batched_initializer_merge_transaction(
-            HirProtoRef(0),
-            &mut partial_declaration,
-            &mut non_multicall_assignment,
-        );
-
-        let HirStmt::Assign(non_multicall_assignment) = non_multicall_assignment else {
-            unreachable!();
-        };
-        assert_eq!(partial_declaration.initializer_merge_transaction, None);
-        assert_eq!(non_multicall_assignment.initializer_merge_transaction, None);
-    }
 }

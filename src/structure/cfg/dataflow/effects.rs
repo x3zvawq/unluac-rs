@@ -212,6 +212,7 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
 pub(super) fn compute_side_effect_summary(
     instr: &LowInstr,
     effect: &InstrEffect,
+    frame_size: usize,
 ) -> SideEffectSummary {
     let mut summary = SideEffectSummary::default();
 
@@ -289,7 +290,7 @@ pub(super) fn compute_side_effect_summary(
         LowInstr::Call(call) => RootObservation::Call {
             caller_end: call.callee,
         },
-        LowInstr::Close(_) => RootObservation::Close,
+        LowInstr::Close(close) => RootObservation::Close { from: close.from },
         LowInstr::Tbc(tbc) => RootObservation::PrefixLowerBound {
             end: tbc.reg.index() + 1,
         },
@@ -300,6 +301,18 @@ pub(super) fn compute_side_effect_summary(
                 .max()
                 .expect("iterator has three fixed inputs"),
         },
+        // 普通索引和算术的 metamethod frame 建在当前函数 frame 末尾之上。
+        // PUC Protect/常规 top、LuaJIT mmcall、Luau callTMres 均保留整个 frame；
+        // 不能仅用显式操作数下界丢失未读取的旧槽。分配、CONCAT、调用及 TBC
+        // 有各自的 top 收缩协议，仍走其专属边界或下面的保守下界。
+        LowInstr::GetTable(_)
+        | LowInstr::SetTable(_)
+        | LowInstr::BinaryOp(_)
+        | LowInstr::UnaryOp(_)
+            if summary.may_observe_gc_roots() =>
+        {
+            RootObservation::PrefixLowerBound { end: frame_size }
+        }
         _ if summary.may_observe_gc_roots() => RootObservation::PrefixLowerBound {
             end: effect
                 .max_fixed_reg()

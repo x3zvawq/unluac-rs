@@ -130,7 +130,7 @@ impl ReturnLookupContext<'_> {
             HirExpr::TableAccess(access) => Some(
                 self.flow(&access.base)?
                     .then(self.flow(&access.key)?)
-                    .consume_result(true),
+                    .consume_result(!access.metamethod_free),
             ),
             HirExpr::Unary(unary) => Some(
                 self.flow(&unary.expr)?

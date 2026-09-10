@@ -246,6 +246,10 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     .owner(InstrRef(index))
                     .filter(|protocol| {
                         protocol.end <= end
+                            && !self
+                                .lowering
+                                .promotion_facts
+                                .has_copy_root_boundary(index..protocol.end)
                             && self
                                 .index
                                 .scope_starts
@@ -275,6 +279,17 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 output.push(stmt);
             } else {
                 output.extend_plain(self.lower_planned_regular(owner, block, InstrRef(index))?);
+            }
+            // cleanup 可能已被结构协议消费；交接属于指令边界，仍须在 scope 结束前发射。
+            for &(source, holder) in self
+                .lowering
+                .promotion_facts
+                .copy_scope_handoffs(InstrRef(consumed_end - 1))
+            {
+                output.push(assign_stmt(
+                    vec![HirLValue::Temp(holder)],
+                    vec![self.lowering.bindings.expr_for_temp(source)],
+                ));
             }
             self.end_lexical_scopes(consumed_end, &mut output);
             index = consumed_end;
@@ -361,7 +376,19 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 // 退出块可以同时承载 loop 词法 cleanup 和循环后的用户指令，因此它
                 // 不一定还是 loop region 的 child。最终 disposition 已在 Structure
                 // 校验过 owner 与边界位置；HIR 只消费该结论，不能再按 lowering 栈重判。
-                CleanupDisposition::LoopTbcBoundary(_) => return Ok(Vec::new()),
+                CleanupDisposition::LoopTbcBoundary(_) => {
+                    // 根交接在原 CLOSE 完成后读取源码 local；发射这段新后缀后，
+                    // loop 末尾不再是该 CLOSE 的原位置，必须保留显式 origins，
+                    // 由 HIR close-scopes 在交接前恢复内层资源作用域。
+                    if self
+                        .lowering
+                        .promotion_facts
+                        .copy_scope_handoffs(instr_ref)
+                        .is_empty()
+                    {
+                        return Ok(Vec::new());
+                    }
+                }
                 CleanupDisposition::IncomingEdges => return Ok(Vec::new()),
                 CleanupDisposition::ExplicitTbc | CleanupDisposition::ExplicitClose => {}
             }

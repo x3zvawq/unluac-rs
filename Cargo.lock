@@ -431,7 +431,6 @@ dependencies = [
  "strum",
  "strum_macros",
  "thiserror",
- "unluac-test-support",
 ]
 
 [[package]]

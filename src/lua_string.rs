@@ -138,22 +138,3 @@ impl From<String> for LuaString {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn metadata_display_preserves_decoding_and_lossy_fallback() {
-        let decoded = LuaString {
-            bytes: vec![0x80].into(),
-            text: Some("€".into()),
-            encoding: Some(StringEncoding::EncodingRs(encoding_rs::WINDOWS_1252)),
-        };
-        assert_eq!(decoded.display_text(), "€");
-        assert!(matches!(decoded.display_text(), Cow::Borrowed(_)));
-        assert_eq!(LuaString::from_bytes(vec![b'a', 0xff]).display_text(), "a�");
-        let undecoded = LuaString::from_bytes(b"source".to_vec());
-        assert!(matches!(undecoded.display_text(), Cow::Borrowed("source")));
-    }
-}

@@ -259,6 +259,7 @@ pub(super) fn extract_assign(
         .map(|target| {
             target.unwrap_or_else(|| {
                 HirLValue::TableAccess(Box::new(HirTableAccess {
+                    metamethod_free: false,
                     base: leading
                         .next()
                         .expect("table lvalue extraction should preserve its base"),
@@ -549,6 +550,7 @@ fn prepare_pure_expr(
         }
         HirExpr::TableAccess(access) => {
             let method_setup_protocol = access.method_setup_protocol;
+            let metamethod_free = access.metamethod_free;
             let (prefix, exprs) =
                 prepare_ordered_exprs(vec![access.base, access.key], state, safety);
             let mut exprs = exprs.into_iter();
@@ -561,6 +563,7 @@ fn prepare_pure_expr(
             (
                 prefix,
                 HirExpr::TableAccess(Box::new(HirTableAccess {
+                    metamethod_free,
                     base,
                     key,
                     method_setup_protocol,
@@ -654,6 +657,7 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
             super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety)
         }
         HirExpr::TableAccess(access) => Some(HirExpr::TableAccess(Box::new(HirTableAccess {
+            metamethod_free: access.metamethod_free,
             base: collapse_expr_to_pure(access.base, safety)?,
             key: collapse_expr_to_pure(access.key, safety)?,
             method_setup_protocol: access.method_setup_protocol,

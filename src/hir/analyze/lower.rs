@@ -55,9 +55,9 @@ pub(super) struct ProtoBindings {
     pub(super) home_free_temps: BTreeSet<TempId>,
     pub(super) loop_guard_temps: Vec<Option<TempId>>,
     pub(super) repeat_staged_temps: Vec<Vec<TempId>>,
-    pub(super) debug_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
+    pub(super) bound_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
-    pub(super) captured_temp_decl_locals: BTreeMap<TempId, LocalId>,
+    pub(super) temp_decl_locals: BTreeMap<TempId, LocalId>,
     pub(super) captured_local_home_slots: Vec<(LocalId, HomeSlotKey)>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) capture_entry_local_decls: Vec<LocalId>,
@@ -96,7 +96,7 @@ impl BoundSlotTarget {
 
 impl ProtoBindings {
     fn temp_target(&self, temp: TempId) -> Option<BoundSlotTarget> {
-        self.debug_temp_targets
+        self.bound_temp_targets
             .get(&temp)
             .or_else(|| self.captured_temp_targets.get(&temp))
             .copied()
@@ -498,12 +498,32 @@ fn lower_proto_one(
     let mut promotion_facts = ProtoPromotionFacts::from_plan(
         proto,
         cfg,
+        graph_facts,
         dataflow,
         structure.plan(),
         &slot_epochs,
         &bindings.fixed_temps,
         &bindings.phi_temps,
     );
+    promotion_facts.record_copy_root_retirements(
+        proto,
+        cfg,
+        dataflow,
+        &bindings.fixed_temps,
+        &bindings.temp_debug_scopes,
+        structure.plan(),
+    );
+    super::bindings::bind_copy_root_scopes(
+        proto,
+        cfg,
+        dataflow,
+        graph_facts,
+        structure,
+        &mut bindings,
+        &mut promotion_facts,
+    )?;
+    let copy_root_holders =
+        super::bindings::bind_copy_root_holders(&mut bindings, &mut promotion_facts);
     super::method_setups::record_method_setup_protocols(
         proto,
         dataflow,
@@ -552,10 +572,41 @@ fn lower_proto_one(
         .iter()
         .map(|upvalue| lowering.bindings.upvalues[upvalue.index()])
         .collect();
-    let body = build_proto_body(id, &mut lowering)?;
+    let mut body = build_proto_body(id, &mut lowering)?;
+    let copy_roots = promotion_facts
+        .copy_root_temps()
+        .iter()
+        .copied()
+        .filter(|temp| matches!(lowering.bindings.lvalue_for_temp(*temp), HirLValue::Temp(_)))
+        .collect::<Vec<_>>();
+    if !copy_roots.is_empty() {
+        body.stmts.insert(
+            0,
+            super::helpers::assign_stmt(
+                copy_roots.iter().copied().map(HirLValue::Temp).collect(),
+                vec![HirExpr::Nil; copy_roots.len()],
+            ),
+        );
+    }
+    if !copy_root_holders.is_empty() {
+        body.stmts.insert(
+            0,
+            HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                bindings: copy_root_holders.clone(),
+                values: vec![HirExpr::Nil; copy_root_holders.len()].into(),
+                initializer_merge_transaction: None,
+            })),
+        );
+    }
     let children = lowering.hir_children();
     let bindings = lowering.bindings;
 
+    let physical_root_locals = promotion_facts
+        .copy_scoped_temps()
+        .iter()
+        .map(|temp| bindings.temp_decl_locals[temp])
+        .chain(copy_root_holders)
+        .collect();
     artifacts.protos[id.index()] = HirProto {
         id,
         source: proto.source.as_ref().map(raw_lua_string),
@@ -568,8 +619,8 @@ fn lower_proto_one(
         local_debug_hints: bindings.local_debug_hints,
         local_debug_scopes: bindings.local_debug_scopes,
         debug_scopes: accepted_debug_scopes(proto, structure),
-        physical_root_temps: BTreeSet::new(),
-        physical_root_locals: BTreeSet::new(),
+        physical_root_temps: promotion_facts.protect_copy_root_temps(),
+        physical_root_locals,
         inline_dispositions: Default::default(),
         upvalues: bindings.upvalues,
         environment_upvalues,

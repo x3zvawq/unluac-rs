@@ -30,6 +30,11 @@ impl Deref for DebugLocals {
 }
 
 impl DebugLocals {
+    /// 是否存在该寄存器的非空 source scope；不重扫原调试表。
+    pub(crate) fn has_source_scope(&self, reg: Reg) -> bool {
+        self.source_boundaries.contains_key(&reg)
+    }
+
     /// 返回该位置首个活动 source scope，保留原始半开区间与表顺序优先级。
     pub fn source_at(&self, reg: Reg, pc: u32) -> Option<(usize, &DebugLocalFact)> {
         let boundaries = self.source_boundaries.get(&reg)?;
