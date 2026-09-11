@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::common::{
     AstBinaryOpKind, AstBindingRef, AstBlock, AstCallKind, AstCallStmt, AstExpr, AstLValue,
-    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef,
+    AstLocalAttr, AstLocalBindingView, AstLocalDecl, AstLocalOrigin, AstModule, AstNameRef,
     AstRewriteAuthority, AstStmt, AstTargetDialect, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
@@ -28,7 +28,7 @@ use super::repeat_lifetime::{
 };
 use super::walk::{self, AstRewritePass, RewriteScope, ScopedAstRewritePass};
 use crate::ast::traverse::BlockKind;
-use crate::ast::traverse::traverse_expr_children;
+use crate::ast::visit::{ExprNode, expr_nodes};
 use crate::hir::HirRepeatConditionLifetimeFacts;
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
@@ -664,16 +664,7 @@ fn trailing_do_block_is_scope_neutral(
     let scoped_bindings = block
         .stmts
         .iter()
-        .flat_map(|stmt| match stmt {
-            AstStmt::LocalDecl(local_decl) => local_decl.bindings.clone(),
-            AstStmt::LocalFunctionDecl(function_decl) => vec![AstLocalBinding {
-                id: function_decl.name,
-                attr: AstLocalAttr::None,
-                origin: function_decl.origin,
-                rewrite_authority: function_decl.rewrite_authority.clone(),
-            }],
-            _ => Vec::new(),
-        })
+        .flat_map(AstStmt::local_bindings)
         .map(|binding| (binding.id, binding))
         .collect::<BTreeMap<_, _>>();
 
@@ -682,7 +673,7 @@ fn trailing_do_block_is_scope_neutral(
         // shared global-scope query 验证；这里仅负责正交的 lifetime/debug 边界。
         AstStmt::GlobalDecl(_) => false,
         AstStmt::LocalDecl(local_decl) => local_decl.bindings.iter().any(|binding| {
-            binding_must_live_through_condition(binding, repeat_lifetime)
+            binding_must_live_through_condition(binding.into(), repeat_lifetime)
                 || matches!(binding.rewrite_authority, AstRewriteAuthority::AstOwned)
                     && (binding.origin.is_physical_root()
                         || local_decl.values.iter().any(expr_contains_function))
@@ -691,7 +682,7 @@ fn trailing_do_block_is_scope_neutral(
             let binding = scoped_bindings
                 .get(&function_decl.name)
                 .expect("direct local function must be indexed as a scoped binding");
-            binding_must_live_through_condition(binding, repeat_lifetime)
+            binding_must_live_through_condition(*binding, repeat_lifetime)
                 // AST-owned local function 没有 HIR endpoint certificate；其闭包 root 继续
                 // 由当前候选的源码层保守证明约束。
                 || matches!(binding.rewrite_authority, AstRewriteAuthority::AstOwned)
@@ -734,32 +725,18 @@ fn trailing_do_block_is_scope_neutral(
 }
 
 fn stmt_declares_debug_binding(stmt: &AstStmt) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .bindings
-            .iter()
-            .any(|binding| binding.origin.is_debug_hinted()),
-        AstStmt::LocalFunctionDecl(function_decl) => function_decl.origin.is_debug_hinted(),
-        _ => false,
-    }
+    stmt.local_bindings()
+        .any(|binding| binding.origin.is_debug_hinted())
 }
 
 fn stmt_declares_hir_preserved_binding(stmt: &AstStmt) -> bool {
-    match stmt {
-        AstStmt::LocalDecl(local_decl) => local_decl
-            .bindings
-            .iter()
-            .any(|binding| binding.rewrite_authority.must_preserve()),
-        AstStmt::LocalFunctionDecl(function_decl) => {
-            function_decl.rewrite_authority.must_preserve()
-        }
-        _ => false,
-    }
+    stmt.local_bindings()
+        .any(|binding| binding.rewrite_authority.must_preserve())
 }
 
 fn closure_target_needs_scope_barrier(
     binding: AstBindingRef,
-    scoped_bindings: &BTreeMap<AstBindingRef, AstLocalBinding>,
+    scoped_bindings: &BTreeMap<AstBindingRef, AstLocalBindingView<'_>>,
     lifetime: &HirRepeatConditionLifetimeFacts,
 ) -> bool {
     if let Some(binding) = scoped_bindings.get(&binding) {
@@ -774,22 +751,7 @@ fn closure_target_needs_scope_barrier(
 }
 
 fn expr_contains_function(expr: &AstExpr) -> bool {
-    if matches!(expr, AstExpr::FunctionExpr(_)) {
-        return true;
-    }
-    let mut found = false;
-    traverse_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(child) => {
-            found |= expr_contains_function(child);
-        },
-        function(_function) => {
-            found = true;
-        }
-    );
-    found
+    expr_nodes(expr).any(|node| matches!(node, ExprNode::Function(_)))
 }
 
 fn can_elide_single_stmt_do_block(stmt: &AstStmt) -> bool {

@@ -16,6 +16,7 @@ use super::super::common::{
     AstBinaryOpKind, AstExpr, AstNameRef, AstTableField, AstTableKey, AstTargetDialect,
     AstUnaryOpKind,
 };
+use crate::ast::visit::{ExprNode, expr_nodes};
 use crate::decompile::DecompileDialect;
 use crate::value_semantics::results::LuaValueFacts;
 use crate::value_semantics::{LuaComparison, LuaLiteral, LuaValueSemantics};
@@ -102,57 +103,26 @@ fn value_facts(expr: &AstExpr) -> LuaValueFacts {
 }
 
 pub(super) fn expr_complexity(expr: &AstExpr) -> usize {
-    match expr {
-        AstExpr::Nil
-        | AstExpr::Boolean(_)
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => 1,
-        AstExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
-        AstExpr::Binary(binary) => 1 + expr_complexity(&binary.lhs) + expr_complexity(&binary.rhs),
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            1 + expr_complexity(&logical.lhs) + expr_complexity(&logical.rhs)
-        }
-        AstExpr::FieldAccess(access) => 1 + expr_complexity(&access.base),
-        AstExpr::IndexAccess(access) => {
-            1 + expr_complexity(&access.base) + expr_complexity(&access.index)
-        }
-        AstExpr::Call(call) => {
-            1 + expr_complexity(&call.callee) + call.args.iter().map(expr_complexity).sum::<usize>()
-        }
-        AstExpr::MethodCall(call) => {
-            1 + expr_complexity(&call.receiver)
-                + call.args.iter().map(expr_complexity).sum::<usize>()
-        }
-        AstExpr::SingleValue(expr) => 1 + expr_complexity(expr),
-        AstExpr::TableConstructor(table) => {
-            1 + table
-                .fields
-                .iter()
-                .map(|field| match field {
-                    AstTableField::Array(value) => expr_complexity(value),
-                    AstTableField::Record(record) => {
-                        let key_cost = match &record.key {
-                            AstTableKey::Name(_) => 1,
-                            AstTableKey::Expr(key) => expr_complexity(key),
-                        };
-                        key_cost + expr_complexity(&record.value)
-                    }
-                })
-                .sum::<usize>()
-        }
-        AstExpr::FunctionExpr(function) => 1 + function.body.stmts.len(),
-    }
+    expr_nodes(expr)
+        .map(|node| match node {
+            ExprNode::Expr(AstExpr::TableConstructor(table)) => {
+                // 裸 record key 不属于表达式子节点，但仍占原有的一个展示成本单位。
+                1 + table.fields.iter().filter(|field| {
+                    matches!(field, AstTableField::Record(record) if matches!(record.key, AstTableKey::Name(_)))
+                }).count()
+            }
+            ExprNode::Expr(_) => 1,
+            // 只计直属语句数，不进入 child body 统计其表达式或 capture。
+            ExprNode::Function(function) => function.body.stmts.len(),
+        })
+        .sum()
 }
 
 pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
+    expr_nodes(expr).all(|node| matches!(node, ExprNode::Expr(expr) if is_context_safe_node(expr)))
+}
+
+fn is_context_safe_node(expr: &AstExpr) -> bool {
     match expr {
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -172,14 +142,8 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
             | AstNameRef::Upvalue(_)
             | AstNameRef::Environment,
         ) => true,
-        AstExpr::Unary(unary) => {
-            matches!(unary.op, super::super::common::AstUnaryOpKind::Not)
-                && is_context_safe_expr(&unary.expr)
-        }
-        AstExpr::SingleValue(expr) => is_context_safe_expr(expr),
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            is_context_safe_expr(&logical.lhs) && is_context_safe_expr(&logical.rhs)
-        }
+        AstExpr::Unary(unary) => matches!(unary.op, AstUnaryOpKind::Not),
+        AstExpr::SingleValue(_) | AstExpr::LogicalAnd(_) | AstExpr::LogicalOr(_) => true,
         AstExpr::Var(AstNameRef::Global(_))
         | AstExpr::FieldAccess(_)
         | AstExpr::IndexAccess(_)
@@ -199,40 +163,31 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
 /// 当前函数里的可写 capture 改变。Upvalue 的其它共享 owner 不在当前 AST 中，无法证明
 /// 分配触发的 `__gc` 回调不会改写它，因此不属于稳定快照。
 pub(super) fn is_stable_context_expr(
-    expr: &AstExpr,
+    mut expr: &AstExpr,
     mutable_snapshots: &BTreeSet<AstNameRef>,
 ) -> bool {
-    // 这些调用点都把前缀放在后续表达式之前，因此 vararg 仍处于单值语境；参数包自身
-    // 不可写且持续持有原值，可以像普通 parameter 一样跨过回调事件。
+    // 根部 vararg 仍是单值语境；此例外不能放行嵌在 logical/not 内的 vararg。
+    while let AstExpr::SingleValue(inner) = expr {
+        expr = inner;
+    }
     if matches!(expr, AstExpr::VarArg) {
         return true;
     }
-    if let AstExpr::SingleValue(inner) = expr {
-        return is_stable_context_expr(inner, mutable_snapshots);
-    }
-    if !is_context_safe_expr(expr) {
-        return false;
-    }
-    match expr {
-        AstExpr::Var(
-            name @ (AstNameRef::Param(_)
-            | AstNameRef::Local(_)
-            | AstNameRef::SyntheticLocal(_)
-            | AstNameRef::Temp(_)),
-        ) => !mutable_snapshots.contains(name),
-        AstExpr::Unary(unary) => {
-            matches!(unary.op, super::super::common::AstUnaryOpKind::Not)
-                && is_stable_context_expr(&unary.expr, mutable_snapshots)
-        }
-        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            is_stable_context_expr(&logical.lhs, mutable_snapshots)
-                && is_stable_context_expr(&logical.rhs, mutable_snapshots)
-        }
-        AstExpr::Var(AstNameRef::Upvalue(_) | AstNameRef::Environment | AstNameRef::Global(_)) => {
-            false
-        }
-        _ => true,
-    }
+    expr_nodes(expr).all(|node| {
+        let ExprNode::Expr(expr) = node else {
+            return false;
+        };
+        is_context_safe_node(expr)
+            && match expr {
+                AstExpr::Var(name) => {
+                    !matches!(
+                        name,
+                        AstNameRef::Upvalue(_) | AstNameRef::Environment | AstNameRef::Global(_)
+                    ) && !mutable_snapshots.contains(name)
+                }
+                _ => true,
+            }
+    })
 }
 
 pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {

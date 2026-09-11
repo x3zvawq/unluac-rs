@@ -16,11 +16,11 @@
 //! capture 边界只消费直接 closure 已保存的 metadata，不进入子函数的独立 LocalId 空间。
 
 use super::super::common::{
-    AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstIf, AstLocalAttr, AstLogicalExpr,
-    AstModule, AstRepeat, AstReturn, AstStmt, AstUnaryExpr, AstUnaryOpKind,
+    AstBlock, AstExpr, AstIf, AstLocalAttr, AstLogicalExpr, AstModule, AstRepeat, AstReturn,
+    AstStmt, AstUnaryExpr, AstUnaryOpKind,
 };
 use super::ReadabilityContext;
-use super::binding_flow::BindingWriteIndex;
+use super::binding_flow::{BindingWriteIndex, block_captures_direct_local};
 use super::control_flow::block_contains_label_or_goto;
 use super::walk::{self, AstRewritePass};
 use crate::ast::traverse::BlockKind;
@@ -87,11 +87,12 @@ impl AstRewritePass for BranchPrettyPass {
             AstStmt::Repeat(repeat_stmt)
                 if matches!(repeat_stmt.cond, AstExpr::Boolean(true))
                     && !block_contains_single_pass_forbidden_nodes(&repeat_stmt.body)
-                    && single_pass_block_flow(&repeat_stmt.body)
-                        .is_some_and(|flow| flow.contains_break)
-                    && single_pass_block_is_foldable(&repeat_stmt.body, false) =>
+                    && let Some(plan) = SinglePassBlockPlan::analyze(&repeat_stmt.body)
+                    && plan.flow.contains_break
+                    && single_pass_block_is_foldable(&repeat_stmt.body, &plan, false) =>
             {
-                let body = fold_single_pass_block(std::mem::take(&mut repeat_stmt.body), None);
+                let body =
+                    fold_single_pass_block(std::mem::take(&mut repeat_stmt.body), plan, None);
                 *stmt = AstStmt::DoBlock(Box::new(body));
                 true
             }
@@ -207,104 +208,127 @@ const FALLTHROUGH_FLOW: SinglePassFlow = SinglePassFlow {
     contains_break: false,
 };
 
-fn single_pass_block_flow(block: &AstBlock) -> Option<SinglePassFlow> {
-    let mut flow = FALLTHROUGH_FLOW;
-    for stmt in &block.stmts {
-        let stmt_flow = single_pass_stmt_flow(stmt)?;
-        flow.contains_break |= stmt_flow.contains_break;
-        flow.falls_through &= stmt_flow.falls_through;
-    }
-    Some(flow)
+// 计划只属于本次不可变候选，与直属语句顺序及 If/Do 子块一一对应；许可完成后随原树
+// 一起移动，不按 AST 地址查找，也不为下沉的 continuation 重建事实。嵌套 loop 保持 opaque，
+// 其 goto/label/Error 仍由独立 forbidden 预检检查。例如连续嵌套的 break arm 只后序分析一次。
+struct SinglePassBlockPlan {
+    flow: SinglePassFlow,
+    stmts: Vec<SinglePassStmtPlan>,
 }
 
-fn single_pass_stmt_flow(stmt: &AstStmt) -> Option<SinglePassFlow> {
-    match stmt {
-        AstStmt::Break => Some(SinglePassFlow {
-            falls_through: false,
-            contains_break: true,
-        }),
-        AstStmt::Return(_) => Some(SinglePassFlow {
-            falls_through: false,
-            contains_break: false,
-        }),
-        AstStmt::If(if_stmt) => {
-            let then_flow = single_pass_block_flow(&if_stmt.then_block)?;
-            let else_flow = match &if_stmt.else_block {
-                Some(else_block) => single_pass_block_flow(else_block)?,
-                None => FALLTHROUGH_FLOW,
-            };
-            Some(SinglePassFlow {
-                falls_through: then_flow.falls_through || else_flow.falls_through,
-                contains_break: then_flow.contains_break || else_flow.contains_break,
-            })
+enum SinglePassStmtPlan {
+    Leaf(SinglePassFlow),
+    If(SinglePassBlockPlan, Option<SinglePassBlockPlan>),
+    Do(SinglePassBlockPlan),
+}
+
+impl SinglePassBlockPlan {
+    fn analyze(block: &AstBlock) -> Option<Self> {
+        let mut flow = FALLTHROUGH_FLOW;
+        let mut stmts = Vec::with_capacity(block.stmts.len());
+        for stmt in &block.stmts {
+            let plan = SinglePassStmtPlan::analyze(stmt)?;
+            let stmt_flow = plan.flow();
+            flow.contains_break |= stmt_flow.contains_break;
+            flow.falls_through &= stmt_flow.falls_through;
+            stmts.push(plan);
         }
-        AstStmt::DoBlock(block) => single_pass_block_flow(block),
-        AstStmt::Continue => {
-            // 候选拒绝[SemanticBarrier:ControlFlow]：当前 repeat owner 的 continue 会跳过
-            // 被下沉的共享后缀并直接进入 latch（regress_294）。
-            None
-        }
-        // goto/label 已由 single-pass 候选入口的 forbidden-node 预检拒绝；这里保留
-        // None 只是让 flow helper 对全部 AST 节点保持封闭。
-        AstStmt::Goto(_) | AstStmt::Label(_) => None,
-        // 候选拒绝[PolicyBoundary]：项目保留 Error 作为 best-effort 反编译诊断，不把它
-        // 当成可执行语句参与 single-pass 控制流美化。
-        AstStmt::Error(_) => None,
-        AstStmt::LocalDecl(_)
-        | AstStmt::GlobalDecl(_)
-        | AstStmt::Assign(_)
-        | AstStmt::CallStmt(_)
-        | AstStmt::While(_)
-        | AstStmt::Repeat(_)
-        | AstStmt::NumericFor(_)
-        | AstStmt::GenericFor(_)
-        | AstStmt::FunctionDecl(_)
-        | AstStmt::LocalFunctionDecl(_) => Some(FALLTHROUGH_FLOW),
+        Some(Self { flow, stmts })
     }
 }
 
-fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -> bool {
-    for stmt in block.stmts.iter().rev() {
+impl SinglePassStmtPlan {
+    fn analyze(stmt: &AstStmt) -> Option<Self> {
+        Some(match stmt {
+            AstStmt::Break => Self::Leaf(SinglePassFlow {
+                falls_through: false,
+                contains_break: true,
+            }),
+            AstStmt::Return(_) => Self::Leaf(SinglePassFlow {
+                falls_through: false,
+                contains_break: false,
+            }),
+            AstStmt::If(if_stmt) => Self::If(
+                SinglePassBlockPlan::analyze(&if_stmt.then_block)?,
+                match &if_stmt.else_block {
+                    Some(block) => Some(SinglePassBlockPlan::analyze(block)?),
+                    None => None,
+                },
+            ),
+            AstStmt::DoBlock(block) => Self::Do(SinglePassBlockPlan::analyze(block)?),
+            // 候选拒绝[SemanticBarrier:ControlFlow]：当前 repeat 的 continue 会跳过下沉
+            // 的后缀（regress_294）；goto/label 及不可执行 Error 由 forbidden 预检拒绝。
+            AstStmt::Continue | AstStmt::Goto(_) | AstStmt::Label(_) | AstStmt::Error(_) => {
+                return None;
+            }
+            AstStmt::LocalDecl(_)
+            | AstStmt::GlobalDecl(_)
+            | AstStmt::Assign(_)
+            | AstStmt::CallStmt(_)
+            | AstStmt::While(_)
+            | AstStmt::Repeat(_)
+            | AstStmt::NumericFor(_)
+            | AstStmt::GenericFor(_)
+            | AstStmt::FunctionDecl(_)
+            | AstStmt::LocalFunctionDecl(_) => Self::Leaf(FALLTHROUGH_FLOW),
+        })
+    }
+
+    fn flow(&self) -> SinglePassFlow {
+        match self {
+            Self::Leaf(flow) => *flow,
+            Self::Do(block) => block.flow,
+            Self::If(then_plan, else_plan) => {
+                let else_flow = else_plan
+                    .as_ref()
+                    .map_or(FALLTHROUGH_FLOW, |plan| plan.flow);
+                SinglePassFlow {
+                    falls_through: then_plan.flow.falls_through || else_flow.falls_through,
+                    contains_break: then_plan.flow.contains_break || else_flow.contains_break,
+                }
+            }
+        }
+    }
+}
+
+fn single_pass_block_is_foldable(
+    block: &AstBlock,
+    plan: &SinglePassBlockPlan,
+    mut tail_is_nonempty: bool,
+) -> bool {
+    for (stmt, stmt_plan) in block.stmts.iter().zip(&plan.stmts).rev() {
         if matches!(stmt, AstStmt::Break) {
             tail_is_nonempty = false;
             continue;
         }
 
-        let Some(stmt_flow) = single_pass_stmt_flow(stmt) else {
-            return false;
-        };
+        let stmt_flow = stmt_plan.flow();
         if !stmt_flow.contains_break {
             tail_is_nonempty = true;
             continue;
         }
 
-        if let AstStmt::DoBlock(do_block) = stmt {
+        if let (AstStmt::DoBlock(do_block), SinglePassStmtPlan::Do(do_plan)) = (stmt, stmt_plan) {
             let do_tail_is_nonempty = stmt_flow.falls_through && tail_is_nonempty;
             if do_tail_is_nonempty && block_prevents_tail_extension(do_block) {
                 return false;
             }
-            if !single_pass_block_is_foldable(do_block, do_tail_is_nonempty) {
+            if !single_pass_block_is_foldable(do_block, do_plan, do_tail_is_nonempty) {
                 return false;
             }
             tail_is_nonempty = true;
             continue;
         }
 
-        let AstStmt::If(if_stmt) = stmt else {
+        let (AstStmt::If(if_stmt), SinglePassStmtPlan::If(then_plan, else_plan)) =
+            (stmt, stmt_plan)
+        else {
             unreachable!("validated direct breaks can only remain under an if");
         };
-        let Some(then_flow) = single_pass_block_flow(&if_stmt.then_block) else {
-            return false;
-        };
-        let else_flow = match &if_stmt.else_block {
-            Some(else_block) => {
-                let Some(flow) = single_pass_block_flow(else_block) else {
-                    return false;
-                };
-                flow
-            }
-            None => FALLTHROUGH_FLOW,
-        };
+        let then_flow = then_plan.flow;
+        let else_flow = else_plan
+            .as_ref()
+            .map_or(FALLTHROUGH_FLOW, |plan| plan.flow);
         if then_flow.falls_through && else_flow.falls_through && tail_is_nonempty {
             // 候选拒绝[PolicyBoundary]：两臂都可能 fallthrough 时只能把非空 continuation
             // 复制进两个互斥 arm；项目不为消除 single-pass fence 复制整段源码或重复声明
@@ -312,23 +336,14 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
             return false;
         }
 
-        if then_flow.falls_through {
-            if tail_is_nonempty && block_prevents_tail_extension(&if_stmt.then_block) {
+        for (arm, arm_plan) in std::iter::once((&if_stmt.then_block, then_plan))
+            .chain(if_stmt.else_block.iter().zip(else_plan))
+        {
+            let arm_tail_is_nonempty = arm_plan.flow.falls_through && tail_is_nonempty;
+            if arm_tail_is_nonempty && block_prevents_tail_extension(arm) {
                 return false;
             }
-            if !single_pass_block_is_foldable(&if_stmt.then_block, tail_is_nonempty) {
-                return false;
-            }
-        } else if !single_pass_block_is_foldable(&if_stmt.then_block, false) {
-            return false;
-        }
-
-        if let Some(else_block) = &if_stmt.else_block {
-            let else_tail_is_nonempty = else_flow.falls_through && tail_is_nonempty;
-            if else_tail_is_nonempty && block_prevents_tail_extension(else_block) {
-                return false;
-            }
-            if !single_pass_block_is_foldable(else_block, else_tail_is_nonempty) {
+            if !single_pass_block_is_foldable(arm, arm_plan, arm_tail_is_nonempty) {
                 return false;
             }
         }
@@ -338,44 +353,49 @@ fn single_pass_block_is_foldable(block: &AstBlock, mut tail_is_nonempty: bool) -
     true
 }
 
-fn fold_single_pass_block(block: AstBlock, tail: Option<AstBlock>) -> AstBlock {
+fn fold_single_pass_block(
+    block: AstBlock,
+    plan: SinglePassBlockPlan,
+    tail: Option<AstBlock>,
+) -> AstBlock {
     let mut reverse_tail: Vec<_> = tail
         .map(|tail| tail.stmts.into_iter().rev().collect())
         .unwrap_or_default();
 
-    for stmt in block.stmts.into_iter().rev() {
+    for (stmt, stmt_plan) in block.stmts.into_iter().zip(plan.stmts).rev() {
         if matches!(stmt, AstStmt::Break) {
             reverse_tail.clear();
             continue;
         }
 
-        let flow = single_pass_stmt_flow(&stmt)
-            .expect("single-pass block is validated before it is rewritten");
+        let flow = stmt_plan.flow();
         if !flow.contains_break {
             reverse_tail.push(stmt);
             continue;
         }
 
-        if let AstStmt::DoBlock(do_block) = stmt {
+        if let SinglePassStmtPlan::Do(do_plan) = stmt_plan {
+            let AstStmt::DoBlock(do_block) = stmt else {
+                unreachable!("single-pass plan must retain its do block");
+            };
             let continuation = AstBlock {
                 stmts: reverse_tail.into_iter().rev().collect(),
             };
             let do_tail = flow.falls_through.then_some(continuation);
-            let do_block = fold_single_pass_block(*do_block, do_tail);
+            let do_block = fold_single_pass_block(*do_block, do_plan, do_tail);
             reverse_tail = vec![AstStmt::DoBlock(Box::new(do_block))];
             continue;
         }
 
-        let AstStmt::If(mut if_stmt) = stmt else {
+        let (AstStmt::If(mut if_stmt), SinglePassStmtPlan::If(then_plan, else_plan)) =
+            (stmt, stmt_plan)
+        else {
             unreachable!("validated direct breaks can only remain under an if");
         };
-        let then_flow = single_pass_block_flow(&if_stmt.then_block)
-            .expect("validated then block must retain its flow");
-        let else_flow = match &if_stmt.else_block {
-            Some(else_block) => single_pass_block_flow(else_block)
-                .expect("validated else block must retain its flow"),
-            None => FALLTHROUGH_FLOW,
-        };
+        let then_flow = then_plan.flow;
+        let else_flow = else_plan
+            .as_ref()
+            .map_or(FALLTHROUGH_FLOW, |plan| plan.flow);
         assert!(
             !(then_flow.falls_through && else_flow.falls_through) || reverse_tail.is_empty(),
             "both fallthrough arms require an empty continuation"
@@ -394,10 +414,13 @@ fn fold_single_pass_block(block: AstBlock, tail: Option<AstBlock>) -> AstBlock {
             (None, None)
         };
 
-        if_stmt.then_block = fold_single_pass_block(if_stmt.then_block, then_tail);
-        if_stmt.else_block = match if_stmt.else_block.take() {
-            Some(else_block) => Some(fold_single_pass_block(else_block, else_tail)),
-            None => else_tail,
+        if_stmt.then_block = fold_single_pass_block(if_stmt.then_block, then_plan, then_tail);
+        if_stmt.else_block = match (if_stmt.else_block.take(), else_plan) {
+            (Some(else_block), Some(else_plan)) => {
+                Some(fold_single_pass_block(else_block, else_plan, else_tail))
+            }
+            (None, None) => else_tail,
+            _ => unreachable!("single-pass plan must retain its else block"),
         };
         reverse_tail = vec![AstStmt::If(if_stmt)];
     }
@@ -628,20 +651,11 @@ struct IdentityBoundaryVisitor(bool);
 
 impl AstVisitor for IdentityBoundaryVisitor {
     fn visit_stmt(&mut self, stmt: &AstStmt) {
-        match stmt {
-            AstStmt::LocalDecl(local_decl) => {
-                self.0 |= local_decl.bindings.iter().any(|binding| {
-                    binding.origin.is_debug_hinted()
-                        || !matches!(binding.attr, AstLocalAttr::None)
-                        || binding.rewrite_authority.must_preserve()
-                });
-            }
-            AstStmt::LocalFunctionDecl(local_function) => {
-                self.0 |= local_function.origin.is_debug_hinted()
-                    || local_function.rewrite_authority.must_preserve();
-            }
-            _ => {}
-        }
+        self.0 |= stmt.local_bindings().any(|binding| {
+            binding.origin.is_debug_hinted()
+                || !matches!(binding.attr, AstLocalAttr::None)
+                || binding.rewrite_authority.must_preserve()
+        });
     }
 }
 
@@ -847,50 +861,6 @@ fn block_prevents_tail_extension(block: &AstBlock) -> bool {
             }
             _ => false,
         })
-}
-
-fn block_captures_direct_local(block: &AstBlock) -> bool {
-    let direct_bindings = block
-        .stmts
-        .iter()
-        .flat_map(|stmt| match stmt {
-            AstStmt::LocalDecl(local_decl) => local_decl
-                .bindings
-                .iter()
-                .map(|binding| binding.id)
-                .collect::<Vec<_>>(),
-            AstStmt::LocalFunctionDecl(local_function) => vec![local_function.name],
-            _ => Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    if direct_bindings.is_empty() {
-        return false;
-    }
-
-    struct DirectCaptureVisitor<'a> {
-        direct_bindings: &'a [AstBindingRef],
-        found: bool,
-    }
-
-    impl AstVisitor for DirectCaptureVisitor<'_> {
-        fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
-            self.found |= self
-                .direct_bindings
-                .iter()
-                .any(|binding| function.captured_bindings.contains(binding));
-            // `captured_bindings` 已完整描述这个直接 closure 对当前 owner 的 capture；
-            // 不能再进入 child body 比较裸 LocalId，因为 child 使用独立的 local
-            // 命名空间，相同数字不表示同一 binding。
-            false
-        }
-    }
-
-    let mut visitor = DirectCaptureVisitor {
-        direct_bindings: &direct_bindings,
-        found: false,
-    };
-    visit::visit_block(block, &mut visitor);
-    visitor.found
 }
 
 fn is_empty_return_stmt(stmt: &AstStmt) -> bool {

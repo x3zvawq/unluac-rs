@@ -6,12 +6,12 @@
 //! 形状重新推断。
 
 use crate::ast::common::{
-    AstBindingRef, AstLocalAttr, AstLocalBinding, AstRewriteAuthority, AstSyntheticLocalId,
+    AstBindingRef, AstLocalAttr, AstLocalBindingView, AstRewriteAuthority, AstSyntheticLocalId,
 };
 use crate::hir::{HirRepeatBinding, HirRepeatConditionLifetimeFacts};
 
 pub(super) fn binding_must_live_through_condition(
-    binding: &AstLocalBinding,
+    binding: AstLocalBindingView<'_>,
     lifetime: &HirRepeatConditionLifetimeFacts,
 ) -> bool {
     binding.attr == AstLocalAttr::Close

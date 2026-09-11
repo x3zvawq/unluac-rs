@@ -14,7 +14,8 @@ use super::super::binding_flow::{
 };
 use super::chain::try_chain_local_method_call_stmt;
 use super::constructor::{
-    try_inline_terminal_constructor_call, try_inline_terminal_constructor_fields,
+    ConstructorRunFacts, try_inline_terminal_constructor_call,
+    try_inline_terminal_constructor_fields,
 };
 use super::direct::lower_direct_function_stmt;
 use super::forwarded::try_lower_forwarded_function_stmt;
@@ -63,6 +64,7 @@ fn rewrite_block(
     // unrelated bindings that happen to reuse the same numeric id.
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_expr);
     let write_index = BindingWriteIndex::for_stmts(&old_stmts);
+    let constructor_runs = ConstructorRunFacts::for_stmts(&old_stmts);
 
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut old_stmts = old_stmts.into_iter();
@@ -75,6 +77,7 @@ fn rewrite_block(
                 try_inline_terminal_constructor_call(
                     remaining,
                     &use_index,
+                    &constructor_runs,
                     index,
                     mutable_snapshots,
                 )

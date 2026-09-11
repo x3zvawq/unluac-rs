@@ -15,16 +15,60 @@
 //! 脚手架形状时，才会收回源码结构。非 plain 字段函数的语句自然终止连续前缀，不由本
 //! pass 改写。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames, binding_mentions_in_stmt};
 use super::super::expr_analysis::is_stable_context_expr;
 use super::super::installer_iife::function_expr_is_substantial;
 use crate::ast::common::{
-    AstAssign, AstBindingRef, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr,
-    AstFunctionName, AstLValue, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstReturn, AstStmt,
-    AstTableField,
+    AstBindingRef, AstCallExpr, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
+    AstLocalAttr, AstLocalBinding, AstLocalDecl, AstReturn, AstStmt, AstTableField,
 };
+
+/// 当前 block 的连续单声明段边界及潜在终端 callee，不提供字段接线或删除许可。
+/// 所有 owner 只消费原数组前缀，未消费后缀不变；下一次 block 改写重新发布。
+pub(super) struct ConstructorRunFacts {
+    starts: Vec<Option<(usize, AstBindingRef)>>,
+}
+
+impl ConstructorRunFacts {
+    pub(super) fn for_stmts(stmts: &[AstStmt]) -> Self {
+        let mut starts = vec![None; stmts.len()];
+        let mut index = 0;
+        while index < stmts.len() {
+            if single_local_alias_decl(&stmts[index]).is_none() {
+                index += 1;
+                continue;
+            }
+            let begin = index;
+            while index < stmts.len() && single_local_alias_decl(&stmts[index]).is_some() {
+                index += 1;
+            }
+            let end = index;
+            let mut sink = end;
+            // 接线只会消费这两类，且它们不能充当 constructor sink。中途接线失败
+            // 仍由原验证拒绝；这里越过它们仅寻找成功候选必需的终端，不授权接线。
+            while matches!(
+                stmts.get(sink),
+                Some(AstStmt::Assign(_) | AstStmt::FunctionDecl(_))
+            ) {
+                sink += 1;
+            }
+            if let Some(call) = stmts.get(sink).and_then(terminal_constructor_call)
+                && let AstExpr::Var(name) = &call.callee
+                && let Some(callee) = AstBindingRef::from_name_ref(name)
+            {
+                starts[begin..end].fill(Some((end, callee)));
+            }
+        }
+        Self { starts }
+    }
+
+    fn declaration_end(&self, index: usize, binding: AstBindingRef) -> Option<usize> {
+        let (end, callee) = self.starts[index]?;
+        (callee == binding).then_some(end)
+    }
+}
 
 pub(super) fn try_inline_terminal_constructor_fields(
     stmts: &[AstStmt],
@@ -46,14 +90,14 @@ pub(super) fn try_inline_terminal_constructor_fields(
     };
     let mut consumed = 1usize;
     let (field, func) = inlineable_local_table_function_stmt(stmts.get(consumed)?, binding)?;
-    if !table_can_append_record_field(table, &field) {
+    if !table_can_append_record_field(table, field) {
         return None;
     }
     table
         .fields
         .push(AstTableField::Record(crate::ast::AstRecordField {
-            key: crate::ast::table_layout::record_key(&table.allocation, field),
-            value: AstExpr::FunctionExpr(Box::new(func)),
+            key: crate::ast::table_layout::record_key(&table.allocation, field.to_owned()),
+            value: AstExpr::FunctionExpr(Box::new(func.clone())),
         }));
     consumed += 1;
 
@@ -61,14 +105,14 @@ pub(super) fn try_inline_terminal_constructor_fields(
         let Some((field, func)) = inlineable_local_table_function_stmt(stmt, binding) else {
             break;
         };
-        if !table_can_append_record_field(table, &field) {
+        if !table_can_append_record_field(table, field) {
             break;
         }
         table
             .fields
             .push(AstTableField::Record(crate::ast::AstRecordField {
-                key: crate::ast::table_layout::record_key(&table.allocation, field),
-                value: AstExpr::FunctionExpr(Box::new(func)),
+                key: crate::ast::table_layout::record_key(&table.allocation, field.to_owned()),
+                value: AstExpr::FunctionExpr(Box::new(func.clone())),
             }));
         consumed += 1;
     }
@@ -82,31 +126,32 @@ pub(super) fn try_inline_terminal_constructor_fields(
 pub(super) fn try_inline_terminal_constructor_call(
     stmts: &[AstStmt],
     use_index: &BindingUseIndex,
+    run_facts: &ConstructorRunFacts,
     stmt_base: usize,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<(AstStmt, usize)> {
     let callee = single_local_alias_decl(stmts.first()?)?;
-    let mut consumed = 1usize;
-    let mut arg_locals = Vec::<ConstructorArg>::new();
-
-    while let Some(stmt) = stmts.get(consumed) {
-        let Some(arg) = single_local_alias_decl(stmt) else {
-            break;
-        };
-        arg_locals.push(ConstructorArg {
-            binding: arg.binding,
-            value: arg.value,
-            pass_to_sink: true,
-            fields_extended: false,
-        });
-        consumed += 1;
-    }
-    if arg_locals.is_empty() {
+    let mut consumed = run_facts.declaration_end(stmt_base, callee.binding.id)? - stmt_base;
+    if consumed < 2 {
         return None;
     }
+    let mut arg_locals = stmts[1..consumed]
+        .iter()
+        .map(|stmt| {
+            let arg = single_local_alias_decl(stmt)
+                .expect("run boundary belongs to unchanged declarations");
+            ConstructorArg {
+                binding: arg.binding.clone(),
+                value: arg.value.clone(),
+                pass_to_sink: true,
+                fields_extended: false,
+            }
+        })
+        .collect::<Vec<_>>();
 
+    let mut table_positions = None;
     while let Some(stmt) = stmts.get(consumed) {
-        if inline_arg_local_table_function(stmt, &mut arg_locals) {
+        if inline_arg_local_table_function(stmt, &mut arg_locals, &mut table_positions) {
             consumed += 1;
             continue;
         }
@@ -129,14 +174,14 @@ pub(super) fn try_inline_terminal_constructor_call(
     let rewritten_sink = rewrite_terminal_constructor_call_sink(
         sink,
         callee.binding.id,
-        &callee.value,
+        callee.value,
         &arg_locals,
         mutable_snapshots,
     )?;
 
     // Removal-only gates intentionally run after the exact sink call has accepted the local
     // sequence. A standalone `<close>`/debug-root local is not a constructor-handoff candidate.
-    if !constructor_local_can_be_removed(&callee.binding)
+    if !constructor_local_can_be_removed(callee.binding)
         || arg_locals
             .iter()
             .any(|arg| !constructor_local_can_be_removed(&arg.binding))
@@ -146,7 +191,7 @@ pub(super) fn try_inline_terminal_constructor_call(
     // This rule exists to remove constructor scaffolding, not to turn a readable named function
     // back into a multiline result-position IIFE. Short callees still benefit from the compact
     // terminal form.
-    if let AstExpr::FunctionExpr(function) = &callee.value
+    if let AstExpr::FunctionExpr(function) = callee.value
         && function_expr_is_substantial(function)
     {
         // 候选拒绝[PolicyBoundary]：多语句/控制流 closure 内联到结果位置会制造难读 IIFE，语义上并非禁止。
@@ -198,12 +243,12 @@ struct ConstructorArg {
     fields_extended: bool,
 }
 
-struct ConstructorLocal {
-    binding: AstLocalBinding,
-    value: AstExpr,
+struct ConstructorLocal<'a> {
+    binding: &'a AstLocalBinding,
+    value: &'a AstExpr,
 }
 
-fn single_local_alias_decl(stmt: &AstStmt) -> Option<ConstructorLocal> {
+fn single_local_alias_decl(stmt: &AstStmt) -> Option<ConstructorLocal<'_>> {
     let AstStmt::LocalDecl(local_decl) = stmt else {
         return None;
     };
@@ -211,8 +256,8 @@ fn single_local_alias_decl(stmt: &AstStmt) -> Option<ConstructorLocal> {
         return None;
     }
     Some(ConstructorLocal {
-        binding: local_decl.bindings[0].clone(),
-        value: local_decl.values[0].clone(),
+        binding: &local_decl.bindings[0],
+        value: &local_decl.values[0],
     })
 }
 
@@ -248,78 +293,86 @@ fn constructor_local_can_be_removed(binding: &AstLocalBinding) -> bool {
 fn inlineable_local_table_function_stmt(
     stmt: &AstStmt,
     binding: AstBindingRef,
-) -> Option<(String, AstFunctionExpr)> {
-    match stmt {
-        AstStmt::Assign(assign) => inlineable_local_table_function_assign(assign, binding),
-        AstStmt::FunctionDecl(function_decl) => {
-            let AstFunctionName::Plain(path) = &function_decl.target else {
+) -> Option<(&str, &AstFunctionExpr)> {
+    let (target, field, function) = local_table_function(stmt)?;
+    (target == binding).then_some((field, function))
+}
+
+/// 从当前接线语句读取一次目标身份和函数；不从实参位置反推目标。
+fn local_table_function(stmt: &AstStmt) -> Option<(AstBindingRef, &str, &AstFunctionExpr)> {
+    let (name, field, function) = match stmt {
+        AstStmt::Assign(assign) => {
+            if assign.targets.len() != 1 || assign.values.len() != 1 {
+                return None;
+            }
+            let AstLValue::FieldAccess(access) = &assign.targets[0] else {
                 return None;
             };
-            if path.fields.len() != 1 || !binding.matches_name_ref(&path.root) {
+            let AstExpr::Var(name) = &access.base else {
                 return None;
-            }
-            // 同 assign 分支：闭包捕获了 constructor binding 时不能折入
-            if function_decl.func.captured_bindings.contains(&binding) {
-                // 候选拒绝[SemanticBarrier:Capture]：`local obj={}; function obj.f() return obj end` 中 closure 原本捕获 local；折进 `local obj={f=function() return obj end}` 后该 local 尚未进入 initializer 作用域，引用会改绑外层名字。
+            };
+            let AstExpr::FunctionExpr(function) = &assign.values[0] else {
                 return None;
-            }
-            Some((path.fields[0].clone(), function_decl.func.clone()))
+            };
+            (name, access.field.as_str(), function.as_ref())
         }
-        _ => None,
-    }
-}
-
-fn inlineable_local_table_function_assign(
-    assign: &AstAssign,
-    binding: AstBindingRef,
-) -> Option<(String, AstFunctionExpr)> {
-    if assign.targets.len() != 1 || assign.values.len() != 1 {
-        return None;
-    }
-    let AstLValue::FieldAccess(access) = &assign.targets[0] else {
-        return None;
+        AstStmt::FunctionDecl(decl) => {
+            let AstFunctionName::Plain(path) = &decl.target else {
+                return None;
+            };
+            if path.fields.len() != 1 {
+                return None;
+            }
+            (&path.root, path.fields[0].as_str(), &decl.func)
+        }
+        _ => return None,
     };
-    let AstFieldAccess { base, field } = access.as_ref();
-    let AstExpr::Var(name) = base else {
-        return None;
-    };
-    if !binding.matches_name_ref(name) {
-        return None;
-    }
-    let AstExpr::FunctionExpr(function) = &assign.values[0] else {
-        return None;
-    };
-    // 如果闭包体捕获了 constructor binding 自身（如 `obj.inc = function() obj.count = ... end`），
-    // 折入 constructor initializer 后该 local 尚未进入词法作用域，闭包引用会改绑。
+    let binding = AstBindingRef::from_name_ref(name)?;
     if function.captured_bindings.contains(&binding) {
-        // 候选拒绝[SemanticBarrier:Capture]：`local obj={}; obj.f=function() return obj end` 折叠后 closure 不再捕获同一个 local。
+        // 候选拒绝[SemanticBarrier:Capture]：`local obj={}; obj.f=function() return obj end`
+        // 折入 initializer 后 obj 尚未进入作用域，closure 会改绑外层名字。
         return None;
     }
-    Some((field.clone(), function.as_ref().clone()))
+    Some((binding, field, function))
 }
 
-fn inline_arg_local_table_function(stmt: &AstStmt, arg_locals: &mut [ConstructorArg]) -> bool {
-    for arg_local in arg_locals {
-        let AstExpr::TableConstructor(table) = &mut arg_local.value else {
-            continue;
-        };
-        let Some((field, func)) = inlineable_local_table_function_stmt(stmt, arg_local.binding.id)
-        else {
-            continue;
-        };
-        if !table_can_append_record_field(table, &field) {
-            return false;
+fn inline_arg_local_table_function(
+    stmt: &AstStmt,
+    arg_locals: &mut [ConstructorArg],
+    table_positions: &mut Option<BTreeMap<AstBindingRef, usize>>,
+) -> bool {
+    let Some((binding, field, func)) = local_table_function(stmt) else {
+        return false;
+    };
+    // 接线只追加字段，不改变实参值的种类。索引属于当前候选，首次字段接线才建立；
+    // 保留旧扫描的首个同身份 table，包括已经接入其他 table 的实参。
+    let positions = table_positions.get_or_insert_with(|| {
+        let mut positions = BTreeMap::new();
+        for (index, arg) in arg_locals.iter().enumerate() {
+            if matches!(arg.value, AstExpr::TableConstructor(_)) {
+                positions.entry(arg.binding.id).or_insert(index);
+            }
         }
-        table
-            .fields
-            .push(AstTableField::Record(crate::ast::common::AstRecordField {
-                key: crate::ast::table_layout::record_key(&table.allocation, field),
-                value: AstExpr::FunctionExpr(Box::new(func)),
-            }));
-        arg_local.fields_extended = true;
-        return true;
+        positions
+    });
+    let Some(&index) = positions.get(&binding) else {
+        return false;
+    };
+    let arg_local = &mut arg_locals[index];
+    let AstExpr::TableConstructor(table) = &mut arg_local.value else {
+        unreachable!("field wiring preserves indexed table values")
+    };
+    if !table_can_append_record_field(table, field) {
+        return false;
     }
-    false
+    table
+        .fields
+        .push(AstTableField::Record(crate::ast::AstRecordField {
+            key: crate::ast::table_layout::record_key(&table.allocation, field.to_owned()),
+            value: AstExpr::FunctionExpr(Box::new(func.clone())),
+        }));
+    arg_local.fields_extended = true;
+    true
 }
 
 fn inline_nested_arg_local_table(stmt: &AstStmt, arg_locals: &mut [ConstructorArg]) -> bool {
@@ -418,6 +471,28 @@ fn inlineable_nested_table_assign(
     ))
 }
 
+fn terminal_constructor_call(stmt: &AstStmt) -> Option<&AstCallExpr> {
+    let expr = match stmt {
+        AstStmt::Return(stmt) => stmt.values.first()?,
+        AstStmt::LocalDecl(stmt) => stmt.values.first()?,
+        AstStmt::If(stmt) => &stmt.cond,
+        AstStmt::NumericFor(stmt) => &stmt.start,
+        AstStmt::GenericFor(stmt) => stmt.iterator.first()?,
+        AstStmt::CallStmt(stmt) => {
+            return match &stmt.call {
+                AstCallKind::Call(call) => Some(call),
+                AstCallKind::MethodCall(_) => None,
+            };
+        }
+        // 循环会重复 initializer，Assign/FunctionDecl 只能是接线而不是终端。
+        _ => return None,
+    };
+    match expr {
+        AstExpr::Call(call) => Some(call),
+        _ => None,
+    }
+}
+
 fn rewrite_terminal_constructor_call_sink(
     stmt: &AstStmt,
     callee_binding: AstBindingRef,
@@ -425,121 +500,70 @@ fn rewrite_terminal_constructor_call_sink(
     arg_locals: &[ConstructorArg],
     mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<AstStmt> {
+    let call = Box::new(rewrite_terminal_constructor_call(
+        terminal_constructor_call(stmt)?,
+        callee_binding,
+        callee_expr,
+        arg_locals,
+        mutable_snapshots,
+    )?);
     match stmt {
         AstStmt::Return(ret) => {
+            let value = AstExpr::Call(call);
             let mut rewritten: AstReturn = ret.as_ref().clone();
-            rewritten.values[0] = rewrite_terminal_constructor_call_expr(
-                ret.values.first()?,
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?;
+            rewritten.values[0] = value;
             Some(AstStmt::Return(Box::new(rewritten)))
         }
         AstStmt::LocalDecl(local_decl) => {
+            let value = AstExpr::Call(call);
             let mut rewritten: AstLocalDecl = local_decl.as_ref().clone();
-            rewritten.values[0] = rewrite_terminal_constructor_call_expr(
-                local_decl.values.first()?,
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?;
+            rewritten.values[0] = value;
             Some(AstStmt::LocalDecl(Box::new(rewritten)))
         }
-        AstStmt::CallStmt(call_stmt) => {
-            let AstCallKind::Call(call) = &call_stmt.call else {
-                return None;
-            };
-            let AstExpr::Call(call) = rewrite_terminal_constructor_call_expr(
-                &AstExpr::Call(call.clone()),
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?
-            else {
-                unreachable!("terminal constructor helper preserves the outer call")
-            };
-            let mut rewritten = call_stmt.as_ref().clone();
-            rewritten.call = AstCallKind::Call(call);
-            // 候选接受[EvalOrderProof]：CallStmt 没有外层求值前缀，constructor initializer 仍在 callee/实参位置按原顺序执行一次。
-            Some(AstStmt::CallStmt(Box::new(rewritten)))
+        AstStmt::CallStmt(_) => {
+            // 候选接受[EvalOrderProof]：直属 call 没有外层前缀，按原序求值一次。
+            Some(AstStmt::CallStmt(Box::new(
+                crate::ast::common::AstCallStmt {
+                    call: AstCallKind::Call(call),
+                },
+            )))
         }
         AstStmt::If(if_stmt) => {
+            let cond = AstExpr::Call(call);
             let mut rewritten = if_stmt.as_ref().clone();
-            rewritten.cond = rewrite_terminal_constructor_call_expr(
-                &if_stmt.cond,
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?;
-            // 候选接受[EvalOrderProof/ValueArityProof]：if 条件是一次性标量 owner，且没有先行运行时事件。
+            rewritten.cond = cond;
+            // 候选接受[EvalOrderProof/ValueArityProof]：condition 是无前缀的一次性标量位置。
             Some(AstStmt::If(Box::new(rewritten)))
         }
         AstStmt::NumericFor(numeric_for) => {
+            let start = AstExpr::Call(call);
             let mut rewritten = numeric_for.as_ref().clone();
-            rewritten.start = rewrite_terminal_constructor_call_expr(
-                &numeric_for.start,
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?;
-            // 候选接受[EvalOrderProof/ValueArityProof]：start 是 header 首个一次性标量事件，limit/step 顺序不动。
+            rewritten.start = start;
+            // 候选接受[EvalOrderProof/ValueArityProof]：start 是 header 首个一次性标量事件。
             Some(AstStmt::NumericFor(Box::new(rewritten)))
         }
         AstStmt::GenericFor(generic_for) => {
+            let first = AstExpr::Call(call);
             let mut rewritten = generic_for.as_ref().clone();
-            let first = rewrite_terminal_constructor_call_expr(
-                generic_for.iterator.first()?,
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?;
             rewritten.iterator[0] = first;
-            // 候选接受[EvalOrderProof/ValueArityProof]：首 iterator 无前缀；单项时保留 open pack，多项时前后都截成单值。
+            // 候选接受[EvalOrderProof/ValueArityProof]：首 iterator 无前缀；原有单值/open 边界保持。
             Some(AstStmt::GenericFor(Box::new(rewritten)))
         }
-        AstStmt::While(while_stmt) => {
-            rewrite_terminal_constructor_call_expr(
-                &while_stmt.cond,
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?;
-            // 候选拒绝[SemanticBarrier:EvalCount]：`local f=make_f(); local a=make_a(); while f(a) do end` 中两个 initializer 原本各执行一次，搬入条件后会逐轮执行。
-            None
-        }
-        AstStmt::Repeat(repeat_stmt) => {
-            rewrite_terminal_constructor_call_expr(
-                &repeat_stmt.cond,
-                callee_binding,
-                callee_expr,
-                arg_locals,
-                mutable_snapshots,
-            )?;
-            // 候选拒绝[SemanticBarrier:EvalCount]：`local f=make_f(); local a=make_a(); repeat until f(a)` 中两个 initializer 原本各执行一次，搬入条件后会逐轮执行。
+        AstStmt::While(_) | AstStmt::Repeat(_) => {
+            // 候选拒绝[SemanticBarrier:EvalCount]：initializer 搬入条件会变成逐轮求值。
             None
         }
         _ => None,
     }
 }
 
-fn rewrite_terminal_constructor_call_expr(
-    expr: &AstExpr,
+fn rewrite_terminal_constructor_call(
+    call: &AstCallExpr,
     callee_binding: AstBindingRef,
     callee_expr: &AstExpr,
     arg_locals: &[ConstructorArg],
     mutable_snapshots: &MutableSnapshotNames,
-) -> Option<AstExpr> {
-    let AstExpr::Call(call) = expr else {
-        return None;
-    };
+) -> Option<AstCallExpr> {
     let AstExpr::Var(name) = &call.callee else {
         return None;
     };
@@ -551,19 +575,28 @@ fn rewrite_terminal_constructor_call_expr(
         return None;
     }
 
-    // First recognize the complete handoff. Missing constructor locals are an ordinary
-    // non-candidate; only a concrete reversal between two participating locals is an
-    // observable ordering barrier.
-    let positions = active_args
-        .iter()
-        .map(|expected| {
-            call.args.iter().position(
-                |arg| matches!(arg, AstExpr::Var(name) if expected.binding.id.matches_name_ref(name)),
-            )
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
-        // 候选拒绝[SemanticBarrier:EvalOrder]：sink 以相反顺序承接两个 constructor local 时，内联会按实参顺序执行 initializer，反转原声明时的事件顺序。
+    // 首次出现位置必须按声明顺序递增。删除已命中的键可忽略后续重复实参；
+    // 不能贪心寻找下一个 expected，否则 [b,a,b] 会错误承接 [a,b]。
+    let mut pending = BTreeMap::new();
+    for (ordinal, expected) in active_args.iter().enumerate() {
+        if pending.insert(expected.binding.id, ordinal).is_some() {
+            return None;
+        }
+    }
+    let mut next = 0;
+    for arg in &call.args {
+        if let AstExpr::Var(name) = arg
+            && let Some(binding) = AstBindingRef::from_name_ref(name)
+            && let Some(ordinal) = pending.remove(&binding)
+        {
+            if ordinal != next {
+                // 候选拒绝[SemanticBarrier:EvalOrder]：实参首次承接顺序反转会反转 initializer 事件。
+                return None;
+            }
+            next += 1;
+        }
+    }
+    if !pending.is_empty() {
         return None;
     }
 
@@ -591,11 +624,8 @@ fn rewrite_terminal_constructor_call_expr(
     }
     debug_assert!(expected_args.next().is_none());
 
-    let mut rewritten = call.as_ref().clone();
-    rewritten.callee = callee_expr.clone();
-    rewritten.args = rewritten_args;
     if last_arg_is_inlined_constructor
-        && let Some(last) = rewritten.args.last_mut()
+        && let Some(last) = rewritten_args.last_mut()
         && matches!(
             last,
             AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg
@@ -606,7 +636,13 @@ fn rewrite_terminal_constructor_call_expr(
         let value = std::mem::replace(last, AstExpr::Nil);
         *last = AstExpr::SingleValue(Box::new(value));
     }
-    Some(AstExpr::Call(Box::new(rewritten)))
+    Some(AstCallExpr {
+        callee: callee_expr.clone(),
+        args: rewritten_args,
+        method_key: call.method_key.clone(),
+        callee_root_handoff: call.callee_root_handoff,
+        method_rewrite_transaction: call.method_rewrite_transaction,
+    })
 }
 
 fn removed_constructor_locals_are_dead_after_sink(

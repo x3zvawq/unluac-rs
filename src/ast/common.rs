@@ -78,6 +78,26 @@ pub enum AstStmt {
     Error(String),
 }
 
+impl AstStmt {
+    /// 本语句向所在块引入的 local；for 的绑定属于子域，不能参与父块的结束边界。
+    pub(crate) fn local_bindings(&self) -> impl Iterator<Item = AstLocalBindingView<'_>> {
+        let (locals, function): (&[AstLocalBinding], Option<&AstLocalFunctionDecl>) = match self {
+            Self::LocalDecl(decl) => (&decl.bindings, None),
+            Self::LocalFunctionDecl(decl) => (&[], Some(decl)),
+            _ => (&[], None),
+        };
+        locals
+            .iter()
+            .map(AstLocalBindingView::from)
+            .chain(function.map(|decl| AstLocalBindingView {
+                id: decl.name,
+                attr: AstLocalAttr::None,
+                origin: decl.origin,
+                rewrite_authority: &decl.rewrite_authority,
+            }))
+    }
+}
+
 /// AST 表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AstExpr {
@@ -393,6 +413,27 @@ pub struct AstLocalBinding {
     ///
     /// HIR 结论与 `origin` 正交：前者约束重写权限，后者只描述 debug/root 来源。
     pub rewrite_authority: AstRewriteAuthority,
+}
+
+/// 声明的借用事实视图；`local function` 直接提供自己的身份与权限，不伪造 local 声明。
+/// 视图只在原语句快照存活期间有效，例如尾 do 的生命周期索引无需复制 HIR Preserve 原因集。
+#[derive(Clone, Copy)]
+pub(crate) struct AstLocalBindingView<'a> {
+    pub id: AstBindingRef,
+    pub attr: AstLocalAttr,
+    pub origin: AstLocalOrigin,
+    pub rewrite_authority: &'a AstRewriteAuthority,
+}
+
+impl<'a> From<&'a AstLocalBinding> for AstLocalBindingView<'a> {
+    fn from(binding: &'a AstLocalBinding) -> Self {
+        Self {
+            id: binding.id,
+            attr: binding.attr,
+            origin: binding.origin,
+            rewrite_authority: &binding.rewrite_authority,
+        }
+    }
 }
 
 /// AST 对 binding 进行生命周期改写时必须服从的上游权限。

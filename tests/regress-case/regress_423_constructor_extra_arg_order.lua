@@ -52,6 +52,39 @@ local prefix_extra, prefix_value = prefix_case()
 assert(prefix_extra == 11 and prefix_value == 8)
 assert(table.concat(events, ",") == "prefix-extra")
 
+-- Many participating locals retain declaration order through the complete handoff.
+-- Each argument starts with its final table layout, so capacity checks do not prune it.
+function __reg423_collect(...)
+    local total = 0
+    for i = 1, select("#", ...) do
+        total = total + select(i, ...).read()
+    end
+    return total
+end
+
+local function wide_case()
+    local callee = __reg423_collect
+    local a = { read = function() return 1 end }
+    local b = { read = function() return 2 end }
+    local c = { read = function() return 3 end }
+    local d = { read = function() return 4 end }
+    local e = { read = function() return 5 end }
+    local f = { read = function() return 6 end }
+    local g = { read = function() return 7 end }
+    local h = { read = function() return 8 end }
+    return callee(a, b, c, d, e, f, g, h)
+end
+
+local function repeated_reversed_case()
+    local callee = __reg423_collect
+    local a = { read = function() return 3 end }
+    local b = { read = function() return 5 end }
+    return callee(b, a, b)
+end
+
+assert(wide_case() == 36)
+assert(repeated_reversed_case() == 13)
+
 print(
     "regress_423_constructor_extra_arg_order",
     suffix_value,

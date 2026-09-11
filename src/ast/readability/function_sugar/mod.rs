@@ -10,6 +10,7 @@ mod constructor;
 mod direct;
 mod forwarded;
 mod method_alias;
+mod method_plan;
 mod rewrite;
 
 pub(super) use method_alias::run_belongs_to_method_alias_owner;

@@ -3,11 +3,12 @@
 //! 它依赖 AST build 已经保留好的合法声明/赋值形状，只把“右值就是函数表达式”的语句改成
 //! `function ... end` 形式，不会处理转发壳或 method alias。
 //! 例如：`local f = function() end` 会在这里变成 `local function f() end`。
+//! 共享声明 target 查询只投影名字与方言限制；函数内容由获准的直接/转发 owner 复制。
 
 use crate::ast::common::{
-    AstAssign, AstExpr, AstFunctionDecl, AstFunctionExpr, AstFunctionName, AstGlobalBindingTarget,
-    AstGlobalDecl, AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstNamePath,
-    AstNameRef, AstStmt, AstTargetDialect,
+    AstAssign, AstExpr, AstFunctionDecl, AstFunctionName, AstGlobalBindingTarget, AstGlobalDecl,
+    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstNamePath, AstNameRef, AstStmt,
+    AstTargetDialect,
 };
 
 pub(super) fn lower_direct_function_stmt(
@@ -86,18 +87,17 @@ fn try_lower_function_assign(assign: &AstAssign, target: AstTargetDialect) -> Op
     let AstExpr::FunctionExpr(func) = &assign.values[0] else {
         return None;
     };
-    let (target, func) = function_decl_target_from_lvalue(&assign.targets[0], func, target)?;
+    let target = function_decl_target_from_lvalue(&assign.targets[0], target)?;
     Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
         target,
-        func,
+        func: func.as_ref().clone(),
     })))
 }
 
 pub(super) fn function_decl_target_from_lvalue(
     target: &AstLValue,
-    func: &AstFunctionExpr,
     dialect: AstTargetDialect,
-) -> Option<(AstFunctionName, AstFunctionExpr)> {
+) -> Option<AstFunctionName> {
     match target {
         AstLValue::Name(AstNameRef::Global(_)) if dialect.caps.global_decl => {
             // 候选拒绝[SemanticBarrier:DeclarationIdentity]：普通赋值若输出成 `global function` 会重复声明已有 global，反例见 regress_411。
@@ -106,13 +106,10 @@ pub(super) fn function_decl_target_from_lvalue(
         AstLValue::Name(name) => {
             // 候选接受[BindingIdentityProof]：Lua 的 plain `function name()` 正是对当前
             // binding 的函数赋值；流水线中的 Temp 已由前置 materialize pass 物化。
-            Some((
-                AstFunctionName::Plain(AstNamePath {
-                    root: name.clone(),
-                    fields: Vec::new(),
-                }),
-                func.clone(),
-            ))
+            Some(AstFunctionName::Plain(AstNamePath {
+                root: name.clone(),
+                fields: Vec::new(),
+            }))
         }
         AstLValue::FieldAccess(access) => {
             // 无 method-definition provenance 时只能生成 plain field function；冒号形式会删除
@@ -122,10 +119,7 @@ pub(super) fn function_decl_target_from_lvalue(
                 return None;
             };
             fields.push(access.field.clone());
-            Some((
-                AstFunctionName::Plain(AstNamePath { root, fields }),
-                func.clone(),
-            ))
+            Some(AstFunctionName::Plain(AstNamePath { root, fields }))
         }
         AstLValue::IndexAccess(_) => {
             // 候选拒绝[TargetConstraint]：Lua function 声明不能用动态索引作为 target。

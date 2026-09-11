@@ -492,4 +492,28 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         retain_debug: true,
         ..LuaCaseOptions::DEFAULT
     }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_554_constructor_run_boundaries.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_554_constructor_run_boundaries.lua",
+        ALL_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_555_constructor_field_targets.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_555_constructor_field_targets.lua",
+        ALL_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
 ];

@@ -60,6 +60,28 @@ pub(in crate::ast::readability) fn expr_references_binding_set(
     bindings.finder().in_expr(expr)
 }
 
+/// 只查直属声明是否被当前函数内的 closure 捕获；子块声明不属于本块的结束边界。
+pub(in crate::ast::readability) fn block_captures_direct_local(block: &AstBlock) -> bool {
+    let direct_bindings = block
+        .stmts
+        .iter()
+        .flat_map(AstStmt::local_bindings)
+        .map(|binding| binding.id)
+        .collect::<BTreeSet<_>>();
+    !direct_bindings.is_empty()
+        && NameFinder::new(|name, access| {
+            matches!(access, NameAccess::Capture)
+                && AstBindingRef::from_name_ref(name)
+                    .is_some_and(|binding| direct_bindings.contains(&binding))
+        })
+        .in_block(block)
+}
+
+pub(in crate::ast::readability) fn expr_reads_name(expr: &AstExpr, target: &AstNameRef) -> bool {
+    NameFinder::new(|name, access| matches!(access, NameAccess::Read) && name == target)
+        .in_expr(expr)
+}
+
 pub(in crate::ast::readability) fn expr_reads_binding(
     expr: &AstExpr,
     binding: AstBindingRef,

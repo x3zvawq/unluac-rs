@@ -27,9 +27,10 @@ use super::super::common::{
 use crate::ast::visit::{self, AstVisitor, NameAccess};
 
 pub(super) use refs::{
-    BindingRefSet, block_references_binding_set, expr_has_binding_read, expr_reads_binding,
-    expr_references_any_binding, expr_references_binding_set, expr_uses_binding,
-    stmt_references_binding_set, stmt_uses_binding, stmt_writes_name,
+    BindingRefSet, block_captures_direct_local, block_references_binding_set,
+    expr_has_binding_read, expr_reads_binding, expr_reads_name, expr_references_any_binding,
+    expr_references_binding_set, expr_uses_binding, stmt_references_binding_set, stmt_uses_binding,
+    stmt_writes_name,
 };
 
 pub(super) type MutableSnapshotNames = BTreeSet<AstNameRef>;

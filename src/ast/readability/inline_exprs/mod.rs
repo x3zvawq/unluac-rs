@@ -45,8 +45,8 @@ use super::super::common::{
 use super::ReadabilityContext;
 use super::binding_flow::{
     BindingUseIndex, BindingWriteIndex, MutableSnapshotNames, binding_mentions_in_expr,
-    expr_reads_binding, expr_uses_binding, mutable_snapshot_names_in_block, stmt_uses_binding,
-    stmt_writes_name,
+    expr_reads_binding, expr_reads_name, expr_uses_binding, mutable_snapshot_names_in_block,
+    stmt_uses_binding, stmt_writes_name,
 };
 use super::binding_tree::{
     stmt_has_access_base_binding_use, stmt_has_direct_call_arg_binding_use,
@@ -57,7 +57,6 @@ use super::expr_analysis::{collect_stable_copy_snapshot_names, result_cannot_roo
 use super::stmt_plan::{PlannedStmt, materialize_stmt_plan};
 use super::walk::{self, AstRewritePass};
 use crate::ast::traverse::BlockKind;
-use crate::ast::visit::AstVisitor;
 
 pub(super) fn apply(module: &mut AstModule, context: ReadabilityContext) -> bool {
     let root_mutable_snapshots = mutable_snapshot_names_in_block(&module.body);
@@ -902,11 +901,7 @@ fn stable_copy_trailing_root_handoff(
         // 可删除 dead carrier assignment；原 alias 本会让旧对象活到词法 block 末尾。
         return None;
     };
-    let condition_references_target = AstBindingRef::from_name_ref(&target).map_or_else(
-        || condition_references_param(condition, &target),
-        |target| expr_reads_binding(condition, target),
-    );
-    if !condition_references_target {
+    if !expr_reads_name(condition, &target) {
         // 候选拒绝[SemanticBarrier:Lifetime]：cleanup 会继续删除 dead target；只有 latch
         // 的保留读取能在当前 pass 组合中保证 carrier 持有旧 root 到 repeat 尾端。
         return None;
@@ -1121,37 +1116,6 @@ fn rewrite_structured_handoff_block(
         changed |= rewrite_structured_handoff_stmt(stmt, candidate, replacement, target);
     }
     changed
-}
-
-fn condition_references_param(condition: &AstExpr, target: &AstNameRef) -> bool {
-    let AstNameRef::Param(_) = target else {
-        // Global/upvalue targets lack a local root and external-write proof. Temp/local-like names
-        // are handled through AstBindingRef above.
-        return false;
-    };
-
-    struct ParamUse<'a> {
-        target: &'a AstNameRef,
-        found: bool,
-    }
-
-    impl AstVisitor for ParamUse<'_> {
-        fn visit_expr(&mut self, expr: &AstExpr) {
-            self.found |= matches!(expr, AstExpr::Var(name) if name == self.target);
-        }
-
-        fn visit_function_expr(&mut self, _function: &AstFunctionExpr) -> bool {
-            // ParamId is function-local; do not confuse a nested function's same-numbered param.
-            false
-        }
-    }
-
-    let mut use_visitor = ParamUse {
-        target,
-        found: false,
-    };
-    crate::ast::visit::visit_expr(condition, &mut use_visitor);
-    use_visitor.found
 }
 
 fn inline_crosses_evaluation_boundary(

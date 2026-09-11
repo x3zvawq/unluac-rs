@@ -4,6 +4,7 @@
 //! 转发壳，不会越权把真正有闭包依赖的 local function 折叠掉，也不会把可变 lvalue
 //! 地址的读取搬到 closure 分配之前。
 //! 例如：`local f = function() ... end; t.f = f` 会在这里尝试合成 `function t.f() ... end`。
+//! 删除许可先消费已有身份与 capture 事实；sink 识别借用函数，成功后才构造一次输出。
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
 use super::super::expr_analysis::is_stable_context_expr;
@@ -31,15 +32,7 @@ pub(super) fn try_lower_forwarded_function_stmt(
     let AstExpr::FunctionExpr(function) = &local_decl.values[0] else {
         return None;
     };
-    let stmt = inline_function_into_stmt(
-        next,
-        binding,
-        function.as_ref().clone(),
-        target,
-        mutable_snapshots,
-    )?;
-
-    // 精确转发 sink 已经形成；从这里开始的退出才会拒绝真实候选。
+    // 先复核删除许可，避免为必须保留的 local 身份复制函数。
     match local_binding.attr {
         AstLocalAttr::None => {}
         AstLocalAttr::Close => {
@@ -73,16 +66,17 @@ pub(super) fn try_lower_forwarded_function_stmt(
         return None;
     }
     if use_index.count_uses_in_suffix(stmt_base + 1, binding) != 1 {
-        // 候选拒绝[SemanticBarrier:EvalCount]：精确 sink 已读取一次；额外读取仍需共享同一个 closure 对象，反例见 regress_333。
+        // 候选拒绝[SemanticBarrier:EvalCount]：转发 sink 必须是唯一读取；额外读取仍需共享同一个 closure 对象，反例见 regress_333。
         return None;
     }
+    let stmt = inline_function_into_stmt(next, binding, function, target, mutable_snapshots)?;
     Some((stmt, 2))
 }
 
 fn inline_function_into_stmt(
     stmt: &AstStmt,
     binding: AstBindingRef,
-    function: AstFunctionExpr,
+    function: &AstFunctionExpr,
     target: AstTargetDialect,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<AstStmt> {
@@ -107,12 +101,12 @@ fn inline_function_into_stmt(
                         root: AstNameRef::Global(name.clone()),
                         fields: Vec::new(),
                     }),
-                    func: function,
+                    func: function.clone(),
                 })));
             }
 
             let mut global_decl = global_decl.as_ref().clone();
-            global_decl.values[0] = AstExpr::FunctionExpr(Box::new(function));
+            global_decl.values[0] = AstExpr::FunctionExpr(Box::new(function.clone()));
             Some(AstStmt::GlobalDecl(Box::new(global_decl)))
         }
         AstStmt::Assign(assign) if assign.targets.len() == 1 && assign.values.len() == 1 => {
@@ -128,17 +122,16 @@ fn inline_function_into_stmt(
                 // 相反顺序，反例见 regress_401。
                 return None;
             }
-            if let Some((target_name, function)) =
-                function_decl_target_from_lvalue(&assign.targets[0], &function, target)
+            if let Some(target_name) = function_decl_target_from_lvalue(&assign.targets[0], target)
             {
                 return Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
                     target: target_name,
-                    func: function,
+                    func: function.clone(),
                 })));
             }
 
             let mut assign = assign.as_ref().clone();
-            assign.values[0] = AstExpr::FunctionExpr(Box::new(function));
+            assign.values[0] = AstExpr::FunctionExpr(Box::new(function.clone()));
             Some(AstStmt::Assign(Box::new(assign)))
         }
         _ => None,

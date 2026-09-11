@@ -22,8 +22,7 @@ pub(super) fn try_chain_local_method_call_stmt(
         return None;
     };
     let (binding, first_call) = single_method_call_local(first)?;
-    let chained =
-        chain_local_method_call_stmt(first_call, binding.id, second, use_index, stmt_base + 1)?;
+    let second_call = chain_receiver_call(binding.id, second, use_index, stmt_base + 1)?;
 
     // 到这里第二句已经精确形成“同一 binding 作为唯一 receiver”的 chain 候选；
     // 声明属性、provenance 和后续生命周期才是候选拒绝条件，不能标记普通相邻语句。
@@ -58,7 +57,20 @@ pub(super) fn try_chain_local_method_call_stmt(
         // 候选拒绝[SemanticBarrier:Lifetime]：链化会删除第二次调用后仍活跃的 receiver，反例见 regress_38。
         return None;
     }
-    Some((chained, 2))
+    // 这里只收回“一次 method 调用立刻接下一次 method 调用”的局部壳：
+    // 它本质上是 VM / HIR 为了保存中间 receiver 才拆出来的临时 local，
+    // 不是源码里有意义的阶段变量。把它压回 `a:b():c()` 能明显更接近原形，
+    // 同时不会放宽到普通任意调用结果的跨语句内联。
+    Some((
+        AstStmt::CallStmt(Box::new(crate::ast::common::AstCallStmt {
+            call: AstCallKind::MethodCall(Box::new(crate::ast::common::AstMethodCallExpr {
+                receiver: AstExpr::MethodCall(Box::new(first_call.clone())),
+                method: second_call.method.clone(),
+                args: second_call.args.clone(),
+            })),
+        })),
+        2,
+    ))
 }
 
 fn single_method_call_local(stmt: &AstStmt) -> Option<(&AstLocalBinding, &AstMethodCallExpr)> {
@@ -75,13 +87,12 @@ fn single_method_call_local(stmt: &AstStmt) -> Option<(&AstLocalBinding, &AstMet
     Some((binding, call))
 }
 
-fn chain_local_method_call_stmt(
-    first_call: &AstMethodCallExpr,
+fn chain_receiver_call<'a>(
     binding: AstBindingRef,
-    second: &AstStmt,
+    second: &'a AstStmt,
     use_index: &BindingUseIndex,
     second_index: usize,
-) -> Option<AstStmt> {
+) -> Option<&'a AstMethodCallExpr> {
     let AstStmt::CallStmt(call_stmt) = second else {
         // 第二句不是可直接接到 receiver 的调用语句。
         return None;
@@ -101,17 +112,5 @@ fn chain_local_method_call_stmt(
         return None;
     }
 
-    // 这里只收回“一次 method 调用立刻接下一次 method 调用”的局部壳：
-    // 它本质上是 VM / HIR 为了保存中间 receiver 才拆出来的临时 local，
-    // 不是源码里有意义的阶段变量。把它压回 `a:b():c()` 能明显更接近原形，
-    // 同时不会放宽到普通任意调用结果的跨语句内联。
-    Some(AstStmt::CallStmt(Box::new(
-        crate::ast::common::AstCallStmt {
-            call: AstCallKind::MethodCall(Box::new(crate::ast::common::AstMethodCallExpr {
-                receiver: AstExpr::MethodCall(Box::new(first_call.clone())),
-                method: second_call.method.clone(),
-                args: second_call.args.clone(),
-            })),
-        },
-    )))
+    Some(second_call)
 }
