@@ -50,12 +50,6 @@ pub(super) fn collect_temp_reads_in_proto(proto: &HirProto) -> BTreeSet<TempId> 
     collector.temps
 }
 
-pub(super) fn collect_temp_reads_in_stmts(stmts: &[HirStmt]) -> BTreeSet<TempId> {
-    let mut collector = TempReadCollector::default();
-    visit_stmts(stmts, &mut collector);
-    collector.temps
-}
-
 /// temp 逻辑读写的直属语句位置；物理 home 与生命周期由各自 owner 解释。
 pub(super) type TempTouchIndex = crate::graph::PositionIndex<TempId>;
 
@@ -66,7 +60,7 @@ pub(super) struct TempReadCollector {
     pub(super) temps: BTreeSet<TempId>,
 }
 
-impl HirVisitor for TempReadCollector {
+impl HirVisitor<'_> for TempReadCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::TempRef(temp) = expr {
             self.temps.insert(*temp);
@@ -74,7 +68,7 @@ impl HirVisitor for TempReadCollector {
     }
 }
 
-impl<F: FnMut(TempId)> HirVisitor for TempRefCollector<F> {
+impl<F: FnMut(TempId)> HirVisitor<'_> for TempRefCollector<F> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::TempRef(temp) = expr {
             (self.0)(*temp);

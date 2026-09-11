@@ -7,16 +7,13 @@
 
 use std::ops::Range;
 
-use crate::ast::traverse::{
-    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
-};
+use crate::ast::traverse::{traverse_call_children, traverse_lvalue_children};
+use crate::ast::visit::{ExprNode, expr_nodes};
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstLocalDecl,
     AstModule, AstStmt, AstSyntheticLocalId,
 };
 use crate::hir::{HirModule, HirProtoRef, LocalId, ParamId, UpvalueId};
-
-use super::NamingError;
 
 /// 按函数记录最终 AST 定义点与本函数声明的可见区间。
 #[derive(Debug, Clone, Default)]
@@ -59,17 +56,14 @@ pub(crate) enum VisibleBinding {
     },
 }
 
-/// 从 AST 结构推导词法上下文。
-pub(crate) fn collect_lexical_contexts(
-    module: &AstModule,
-    hir: &HirModule,
-) -> Result<LexicalContexts, NamingError> {
+/// 从已通过 Naming 入口身份校验的 AST 推导最终词法上下文。
+pub(super) fn collect_lexical_contexts(module: &AstModule, hir: &HirModule) -> LexicalContexts {
     let mut contexts = LexicalContexts {
         functions: vec![FunctionLexicalContext::default(); hir.protos.len()],
         next_definition_position: 0,
     };
-    collect_function_context(module.entry_function, &module.body, hir, &mut contexts)?;
-    Ok(contexts)
+    collect_function_context(module.entry_function, &module.body, hir, &mut contexts);
+    contexts
 }
 
 fn collect_function_context(
@@ -77,12 +71,8 @@ fn collect_function_context(
     body: &AstBlock,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-) -> Result<(), NamingError> {
-    let Some(proto) = hir.protos.get(function.index()) else {
-        return Err(NamingError::MissingFunction {
-            function: function.index(),
-        });
-    };
+) {
+    let proto = &hir.protos[function.index()];
     contexts.functions[function.index()] = FunctionLexicalContext {
         definition_position: contexts.next_definition_position,
         visible_bindings: Vec::new(),
@@ -112,9 +102,8 @@ fn collect_function_context(
         );
     }
 
-    let result = collect_block_context(function, body, hir, contexts, &mut scopes);
+    collect_block_context(function, body, hir, contexts, &mut scopes);
     close_scope(function, contexts, &mut scopes);
-    result
 }
 
 fn collect_block_context(
@@ -123,11 +112,10 @@ fn collect_block_context(
     hir: &HirModule,
     contexts: &mut LexicalContexts,
     scopes: &mut PendingScopes,
-) -> Result<(), NamingError> {
+) {
     for stmt in &block.stmts {
-        collect_stmt_context(function, stmt, hir, contexts, scopes)?;
+        collect_stmt_context(function, stmt, hir, contexts, scopes);
     }
-    Ok(())
 }
 
 fn collect_stmt_context(
@@ -136,61 +124,61 @@ fn collect_stmt_context(
     hir: &HirModule,
     contexts: &mut LexicalContexts,
     scopes: &mut PendingScopes,
-) -> Result<(), NamingError> {
+) {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
-            collect_local_decl_context(function, local_decl, hir, contexts, scopes)?;
+            collect_local_decl_context(function, local_decl, hir, contexts, scopes);
         }
         AstStmt::GlobalDecl(global_decl) => {
             for value in &global_decl.values {
-                collect_expr_context(value, hir, contexts)?;
+                collect_expr_context(value, hir, contexts);
             }
         }
         AstStmt::Assign(assign) => {
             for target in &assign.targets {
-                collect_lvalue_context(target, hir, contexts)?;
+                collect_lvalue_context(target, hir, contexts);
             }
             for value in &assign.values {
-                collect_expr_context(value, hir, contexts)?;
+                collect_expr_context(value, hir, contexts);
             }
         }
         AstStmt::CallStmt(call_stmt) => {
-            collect_call_context(&call_stmt.call, hir, contexts)?;
+            collect_call_context(&call_stmt.call, hir, contexts);
         }
         AstStmt::Return(ret) => {
             for value in &ret.values {
-                collect_expr_context(value, hir, contexts)?;
+                collect_expr_context(value, hir, contexts);
             }
         }
         AstStmt::If(if_stmt) => {
-            collect_expr_context(&if_stmt.cond, hir, contexts)?;
+            collect_expr_context(&if_stmt.cond, hir, contexts);
             with_nested_scope(function, contexts, scopes, |contexts, scopes| {
                 collect_block_context(function, &if_stmt.then_block, hir, contexts, scopes)
-            })?;
+            });
             if let Some(else_block) = &if_stmt.else_block {
                 with_nested_scope(function, contexts, scopes, |contexts, scopes| {
                     collect_block_context(function, else_block, hir, contexts, scopes)
-                })?;
+                });
             }
         }
         AstStmt::While(while_stmt) => {
-            collect_expr_context(&while_stmt.cond, hir, contexts)?;
+            collect_expr_context(&while_stmt.cond, hir, contexts);
             with_nested_scope(function, contexts, scopes, |contexts, scopes| {
                 collect_block_context(function, &while_stmt.body, hir, contexts, scopes)
-            })?;
+            });
         }
         AstStmt::Repeat(repeat_stmt) => {
             // `repeat ... until cond` 的条件仍处在同一个词法块里。
             // 这里不能像 while 一样先跑 body 再弹 scope，否则会丢掉 body 中局部对 cond 的可见性。
             with_nested_scope(function, contexts, scopes, |contexts, scopes| {
-                collect_block_context(function, &repeat_stmt.body, hir, contexts, scopes)?;
+                collect_block_context(function, &repeat_stmt.body, hir, contexts, scopes);
                 collect_expr_context(&repeat_stmt.cond, hir, contexts)
-            })?;
+            });
         }
         AstStmt::NumericFor(numeric_for) => {
-            collect_expr_context(&numeric_for.start, hir, contexts)?;
-            collect_expr_context(&numeric_for.limit, hir, contexts)?;
-            collect_expr_context(&numeric_for.step, hir, contexts)?;
+            collect_expr_context(&numeric_for.start, hir, contexts);
+            collect_expr_context(&numeric_for.limit, hir, contexts);
+            collect_expr_context(&numeric_for.step, hir, contexts);
             with_nested_scope(function, contexts, scopes, |contexts, scopes| {
                 declare_ast_binding(
                     function,
@@ -199,11 +187,11 @@ fn collect_stmt_context(
                     contexts.next_definition_position,
                 );
                 collect_block_context(function, &numeric_for.body, hir, contexts, scopes)
-            })?;
+            });
         }
         AstStmt::GenericFor(generic_for) => {
             for expr in &generic_for.iterator {
-                collect_expr_context(expr, hir, contexts)?;
+                collect_expr_context(expr, hir, contexts);
             }
             with_nested_scope(function, contexts, scopes, |contexts, scopes| {
                 for &binding in &generic_for.bindings {
@@ -215,15 +203,15 @@ fn collect_stmt_context(
                     );
                 }
                 collect_block_context(function, &generic_for.body, hir, contexts, scopes)
-            })?;
+            });
         }
         AstStmt::DoBlock(block) => {
             with_nested_scope(function, contexts, scopes, |contexts, scopes| {
                 collect_block_context(function, block, hir, contexts, scopes)
-            })?;
+            });
         }
         AstStmt::FunctionDecl(function_decl) => {
-            collect_nested_function_context(&function_decl.func, hir, contexts)?;
+            collect_nested_function_context(&function_decl.func, hir, contexts);
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             // `local function f() ... end` 里的 `f` 在函数体内也是可见的，
@@ -234,7 +222,7 @@ fn collect_stmt_context(
                 scopes,
                 contexts.next_definition_position,
             );
-            collect_nested_function_context(&local_function_decl.func, hir, contexts)?;
+            collect_nested_function_context(&local_function_decl.func, hir, contexts);
         }
         AstStmt::Break
         | AstStmt::Continue
@@ -242,7 +230,6 @@ fn collect_stmt_context(
         | AstStmt::Label(_)
         | AstStmt::Error(_) => {}
     }
-    Ok(())
 }
 
 fn collect_local_decl_context(
@@ -251,9 +238,9 @@ fn collect_local_decl_context(
     hir: &HirModule,
     contexts: &mut LexicalContexts,
     scopes: &mut PendingScopes,
-) -> Result<(), NamingError> {
+) {
     for value in &local_decl.values {
-        collect_expr_context(value, hir, contexts)?;
+        collect_expr_context(value, hir, contexts);
     }
     for binding in &local_decl.bindings {
         declare_ast_binding(
@@ -263,56 +250,34 @@ fn collect_local_decl_context(
             contexts.next_definition_position,
         );
     }
-    Ok(())
 }
 
 fn collect_nested_function_context(
     function_expr: &AstFunctionExpr,
     hir: &HirModule,
     contexts: &mut LexicalContexts,
-) -> Result<(), NamingError> {
+) {
     collect_function_context(function_expr.function, &function_expr.body, hir, contexts)
 }
 
-fn collect_call_context(
-    call: &AstCallKind,
-    hir: &HirModule,
-    contexts: &mut LexicalContexts,
-) -> Result<(), NamingError> {
+fn collect_call_context(call: &AstCallKind, hir: &HirModule, contexts: &mut LexicalContexts) {
     traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
-        collect_expr_context(expr, hir, contexts)?;
+        collect_expr_context(expr, hir, contexts);
     });
-    Ok(())
 }
 
-fn collect_lvalue_context(
-    target: &AstLValue,
-    hir: &HirModule,
-    contexts: &mut LexicalContexts,
-) -> Result<(), NamingError> {
+fn collect_lvalue_context(target: &AstLValue, hir: &HirModule, contexts: &mut LexicalContexts) {
     traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
-        collect_expr_context(expr, hir, contexts)?;
+        collect_expr_context(expr, hir, contexts);
     });
-    Ok(())
 }
 
-fn collect_expr_context(
-    expr: &AstExpr,
-    hir: &HirModule,
-    contexts: &mut LexicalContexts,
-) -> Result<(), NamingError> {
-    traverse_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(child) => {
-            collect_expr_context(child, hir, contexts)?;
-        },
-        function(func) => {
-            collect_nested_function_context(func, hir, contexts)?;
+fn collect_expr_context(expr: &AstExpr, hir: &HirModule, contexts: &mut LexicalContexts) {
+    for node in expr_nodes(expr) {
+        if let ExprNode::Function(func) = node {
+            collect_nested_function_context(func, hir, contexts);
         }
-    );
-    Ok(())
+    }
 }
 
 fn declare_ast_binding(
@@ -366,17 +331,13 @@ fn close_scope(function: HirProtoRef, contexts: &mut LexicalContexts, scopes: &m
         );
 }
 
-fn with_nested_scope<T, F>(
+fn with_nested_scope(
     function: HirProtoRef,
     contexts: &mut LexicalContexts,
     scopes: &mut PendingScopes,
-    f: F,
-) -> Result<T, NamingError>
-where
-    F: FnOnce(&mut LexicalContexts, &mut PendingScopes) -> Result<T, NamingError>,
-{
+    f: impl FnOnce(&mut LexicalContexts, &mut PendingScopes),
+) {
     scopes.push(Vec::new());
-    let result = f(contexts, scopes);
+    f(contexts, scopes);
     close_scope(function, contexts, scopes);
-    result
 }

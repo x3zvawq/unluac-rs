@@ -65,7 +65,7 @@ impl ProtoBuildFacts {
 #[derive(Default)]
 struct BodyReferences(Vec<usize>);
 
-impl HirVisitor for BodyReferences {
+impl HirVisitor<'_> for BodyReferences {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::Closure(closure) = expr {
             self.0.push(closure.proto.index());
@@ -87,7 +87,7 @@ impl ReferencedTempCollector {
     }
 }
 
-impl HirVisitor for ReferencedTempCollector {
+impl HirVisitor<'_> for ReferencedTempCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::TempRef(temp) = expr {
             self.note_temp(*temp);
@@ -106,7 +106,7 @@ struct CloseTempCollector {
     temps: BTreeSet<TempId>,
 }
 
-impl HirVisitor for CloseTempCollector {
+impl HirVisitor<'_> for CloseTempCollector {
     fn visit_block(&mut self, block: &HirBlock) {
         for (index, stmt) in block.stmts.iter().enumerate() {
             let HirStmt::ToBeClosed(to_be_closed) = stmt else {
@@ -138,7 +138,7 @@ struct LocalReferenceCollector {
     found: bool,
 }
 
-impl HirVisitor for LocalReferenceCollector {
+impl HirVisitor<'_> for LocalReferenceCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.found |= matches!(expr, HirExpr::LocalRef(local) if Some(*local) == self.local);
     }

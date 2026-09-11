@@ -9,7 +9,7 @@ pub(super) struct BindingFacts {
     pub(super) writes: BTreeMap<CarryBinding, usize>,
 }
 
-impl HirVisitor for BindingFacts {
+impl HirVisitor<'_> for BindingFacts {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let Some(binding) = carry_binding_from_expr(expr) {
             self.reads.insert(binding);

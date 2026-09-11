@@ -331,7 +331,9 @@ fn populate_stmt_live_event(
     node.escaped_gen = observer_effects.escaped_gen;
     node.escape_holders = observer_effects.escape_holders;
     node.holder_writes = observer_effects.holder_writes;
-    node.tbc_gen = tbc_homes_started_by_stmt(stmt, promotion_facts);
+    if let HirStmt::ToBeClosed(tbc) = stmt {
+        node.tbc_gen.insert(promotion_facts.tbc_home(tbc.origin));
+    }
     node.close_from = match stmt {
         HirStmt::Close(close) => Some(close.from_reg),
         _ => None,
@@ -601,7 +603,7 @@ struct CallEscapeCollector<'a> {
     safety: HirExprSafety,
 }
 
-impl HirVisitor for CallEscapeCollector<'_> {
+impl HirVisitor<'_> for CallEscapeCollector<'_> {
     fn visit_call(&mut self, call: &crate::hir::HirCallExpr) {
         self.effects.record_escape(payload_seed_from_expr(
             &call.callee,
@@ -818,22 +820,6 @@ fn record_captured_binding(
     state.homes.extend(homes.iter().copied());
 }
 
-fn tbc_homes_started_by_stmt(
-    stmt: &HirStmt,
-    promotion_facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let HirStmt::ToBeClosed(to_be_closed) = stmt else {
-        return BTreeSet::new();
-    };
-    let value_homes = match &to_be_closed.value {
-        HirExpr::TempRef(temp) => promotion_facts.complete_temp_home_slots(*temp),
-        HirExpr::LocalRef(local) => promotion_facts.complete_local_home_slots(*local),
-        HirExpr::ParamRef(param) => promotion_facts.complete_param_home_slots(*param),
-        _ => Cow::Owned(BTreeSet::new()),
-    };
-    promotion_facts.complete_tbc_home_slots(to_be_closed.reg_index, &value_homes)
-}
-
 fn stmt_header_may_invoke_user_code(stmt: &HirStmt, safety: HirExprSafety) -> bool {
     let mut collector = HirEvalEffects::new(safety, |_| false);
     visit_stmt_header(stmt, &mut collector);
@@ -918,7 +904,7 @@ struct LiveReadCollector<'a> {
     promotion_facts: &'a ProtoPromotionFacts,
 }
 
-impl HirVisitor for LiveReadCollector<'_> {
+impl HirVisitor<'_> for LiveReadCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         let homes = match expr {
             HirExpr::TempRef(temp) => {
@@ -1081,7 +1067,7 @@ impl CandidateValues<'_> {
     }
 }
 
-impl HirVisitor for CandidateValues<'_> {
+impl HirVisitor<'_> for CandidateValues<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         let HirStmt::If(if_stmt) = stmt else {
             return;

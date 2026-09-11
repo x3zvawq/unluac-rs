@@ -313,8 +313,8 @@ pub(super) fn loop_value_source_is_valid(
         },
         LoopValueSource::Carried(phi) => payload
             .header_values
-            .iter()
-            .any(|value| value.phi_id == phi),
+            .binary_search_by_key(&phi, |value| value.phi_id)
+            .is_ok(),
     }
 }
 

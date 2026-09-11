@@ -115,7 +115,7 @@ impl StableBindingIndex {
     }
 }
 
-impl HirVisitor for StableBindingIndex {
+impl HirVisitor<'_> for StableBindingIndex {
     fn visit_capture(&mut self, capture: &HirCapture) {
         if capture.mode == HirCaptureMode::ByReference
             && let Some(binding) = stable_binding(&capture.binding.expr())

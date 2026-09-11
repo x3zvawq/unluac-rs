@@ -480,7 +480,7 @@ impl AliasEvaluationFacts {
     }
 }
 
-impl HirVisitor for AliasEvaluationFacts {
+impl HirVisitor<'_> for AliasEvaluationFacts {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         self.has_opaque_callback |= matches!(stmt, HirStmt::GlobalDecl(_));
     }
@@ -536,7 +536,7 @@ struct ParamWriteCollector {
     written: bool,
 }
 
-impl HirVisitor for ParamWriteCollector {
+impl HirVisitor<'_> for ParamWriteCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.written |= matches!(lvalue, HirLValue::Param(param) if *param == self.param);
     }

@@ -208,27 +208,6 @@ impl CanonicalEdgeCopyTargets {
                 continue;
             }
 
-            let max_reg = loop_
-                .header_values
-                .iter()
-                .map(|value| value.reg.index())
-                .chain(
-                    loop_
-                        .exit_values
-                        .iter()
-                        .flat_map(|exit| exit.values.iter().map(|value| value.reg.index())),
-                )
-                .max();
-            let mut header_by_reg = Vec::new();
-            if let Some(max_reg) = max_reg {
-                let len = max_reg.checked_add(1).ok_or_else(|| {
-                    StructureError::invalid("loop value register index overflows its dense arena")
-                })?;
-                header_by_reg.try_reserve_exact(len).map_err(|_| {
-                    StructureError::invalid("loop value register arena is too large")
-                })?;
-                header_by_reg.resize(len, None);
-            }
             for value in &loop_.header_values {
                 if value.phi_id.index() >= phi_count {
                     return Err(StructureError::invalid(format!(
@@ -237,20 +216,9 @@ impl CanonicalEdgeCopyTargets {
                         value.phi_id
                     )));
                 }
-                let slot = &mut header_by_reg[value.reg.index()];
-                if slot
-                    .replace(value.phi_id)
-                    .is_some_and(|old| old != value.phi_id)
-                {
-                    return Err(StructureError::invalid(format!(
-                        "loop region {} has multiple header phis for {}",
-                        region.index(),
-                        value.reg
-                    )));
-                }
             }
             for value in loop_.exit_values.iter().flat_map(|exit| exit.values.iter()) {
-                let Some(target) = header_by_reg.get(value.reg.index()).copied().flatten() else {
+                let Some(header) = loop_.header_value_for_reg(value.reg) else {
                     continue;
                 };
                 let Some(slot) = by_phi.get_mut(value.phi_id.index()) else {
@@ -262,7 +230,7 @@ impl CanonicalEdgeCopyTargets {
                 };
                 let mapping = CanonicalBreakTarget {
                     owner: region,
-                    target,
+                    target: header.phi_id,
                 };
                 if slot.replace(mapping).is_some_and(|old| old != mapping) {
                     return Err(StructureError::invalid(format!(

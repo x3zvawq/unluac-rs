@@ -80,7 +80,7 @@ struct LabelFacts {
     referenced: BTreeSet<HirLabelId>,
 }
 
-impl HirVisitor for LabelFacts {
+impl HirVisitor<'_> for LabelFacts {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::Goto(goto_stmt) = stmt {
             self.referenced.insert(goto_stmt.target);

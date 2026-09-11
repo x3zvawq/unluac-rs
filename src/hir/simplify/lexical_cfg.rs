@@ -130,6 +130,27 @@ pub(super) enum HirFlowNodeKind<'a> {
     ForBinding(HirForBindings<'a>),
 }
 
+impl<'hir> HirFlowNodeKind<'hir> {
+    /// 访问本事件的显式 HIR 求值与赋值子节点，不进入嵌套块。
+    ///
+    /// for initializer 只访问一次，repeat 条件只在尾端事件访问；隐式 dispatch、
+    /// for binding 写入和控制边界仍由 consumer 解释，不能伪造成源码表达式。
+    pub(super) fn visit_evaluation(self, visitor: &mut impl crate::hir::visit::HirVisitor<'hir>) {
+        use crate::hir::visit::{visit_expr, visit_stmt_header};
+        match self {
+            Self::Stmt(stmt) => visit_stmt_header(stmt, visitor),
+            Self::GenericForInit(flow) => visit_stmt_header(flow.stmt(), visitor),
+            Self::RepeatCondition(stmt) => visit_expr(&stmt.cond, visitor),
+            Self::Exit
+            | Self::FunctionExit
+            | Self::UnknownControl
+            | Self::NumericForDispatch
+            | Self::GenericForDispatch(_)
+            | Self::ForBinding(_) => {}
+        }
+    }
+}
+
 /// for 每轮成功分派后由 VM 写入的源码 binding。
 #[derive(Clone, Copy)]
 pub(super) enum HirForBindings<'a> {

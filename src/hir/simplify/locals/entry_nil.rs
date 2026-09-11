@@ -521,7 +521,7 @@ impl<'a> ExprEffects<'a> {
     }
 }
 
-impl HirVisitor for ExprEffects<'_> {
+impl HirVisitor<'_> for ExprEffects<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         self.has_call |= matches!(stmt, HirStmt::GlobalDecl(_));
     }

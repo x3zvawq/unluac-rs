@@ -173,7 +173,7 @@ impl BindingReadCollector {
     }
 }
 
-impl HirVisitor for BindingReadCollector {
+impl HirVisitor<'_> for BindingReadCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let Some(binding) = carry_binding_from_expr(expr) {
             self.reads.insert(binding);
@@ -186,7 +186,7 @@ struct BindingMentionCollector {
     mentions: BTreeSet<CarryBinding>,
 }
 
-impl HirVisitor for BindingMentionCollector {
+impl HirVisitor<'_> for BindingMentionCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let Some(binding) = carry_binding_from_expr(expr) {
             self.mentions.insert(binding);

@@ -71,8 +71,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::decompile::{DecompileDialect, ReadabilityOptions};
 use crate::hir::common::{
-    HirBinding, HirBlock, HirCallExpr, HirExpr, HirInlineDispositions, HirInlineRetentionReason,
-    HirLValue, HirProto, HirStmt, HirTableField, TempId,
+    HirBinding, HirBlock, HirCallExpr, HirCaptureMode, HirExpr, HirInlineDispositions,
+    HirInlineRetentionReason, HirLValue, HirProto, HirStmt, HirTableField, TempId,
 };
 use crate::hir::expr_safety::{
     HirEvalEffects, HirExprSafety, expr_observes_eval_order, expr_requires_ordered_snapshot,
@@ -91,9 +91,8 @@ use self::usage::{
 };
 use super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::mention::{
-    BindingReadCollector, ReferenceCapturedBindings, binding_home_read_collector,
-    expr_mentions_temp, expr_read_homes, stmt_writes_temp, stmts_reference_captured_bindings,
-    stmts_to_be_closed_temps, stmts_value_captured_bindings,
+    BindingReadCollector, CaptureCollector, ReferenceCapturedBindings, ToBeClosedTempCollector,
+    binding_home_read_collector, expr_mentions_temp, expr_read_homes, stmt_writes_temp,
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
@@ -267,9 +266,19 @@ fn inline_temps_in_proto_with_scope(
     substantial_closure_bodies: &[bool],
     roots: RootAnalysisContext<'_>,
 ) -> bool {
-    let mut identity_sensitive_temps = stmts_reference_captured_bindings(&proto.body.stmts).temps;
-    identity_sensitive_temps.extend(stmts_value_captured_bindings(&proto.body.stmts).temps);
-    identity_sensitive_temps.extend(stmts_to_be_closed_temps(&proto.body.stmts));
+    let mut identities = (
+        CaptureCollector::new(HirCaptureMode::ByReference),
+        (
+            CaptureCollector::new(HirCaptureMode::ByValue),
+            ToBeClosedTempCollector::default(),
+        ),
+    );
+    visit_stmts(&proto.body.stmts, &mut identities);
+    let (reference, (value, closed)) = identities;
+    let reference_captured = reference.bindings;
+    let mut identity_sensitive_temps = reference_captured.temps.clone();
+    identity_sensitive_temps.extend(value.bindings.temps);
+    identity_sensitive_temps.extend(closed.temps);
     let temp_debug_locals = &proto.temp_debug_locals;
     let mut release_temp_is_eligible = |temp: TempId| {
         !identity_sensitive_temps.contains(&temp)
@@ -299,7 +308,7 @@ fn inline_temps_in_proto_with_scope(
         roots,
     );
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
-    let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
+    // 前面的 dispatch root-release 只插入 Temp=nil，保留原 capture/TBC；引用捕获集合仍有效。
     let captures = TempInlineCaptureFacts::new(&reference_captured, facts);
     let event_index = RootEventIndex::new(&proto.body.stmts, facts, roots.safety);
     changed |= inline_temps_in_block(
@@ -1100,8 +1109,14 @@ fn inline_covered_root_copies(
 ) -> bool {
     let reference_captured = captures.bindings;
     let captured_homes = &captures.homes;
-    let mut identity_sensitive = stmts_value_captured_bindings(&block.stmts).temps;
-    identity_sensitive.extend(stmts_to_be_closed_temps(&block.stmts));
+    let mut identities = (
+        CaptureCollector::new(HirCaptureMode::ByValue),
+        ToBeClosedTempCollector::default(),
+    );
+    visit_stmts(&block.stmts, &mut identities);
+    let (value, closed) = identities;
+    let mut identity_sensitive = value.bindings.temps;
+    identity_sensitive.extend(closed.temps);
     // 子块改写会使入口快照失效；只有候选实际请求覆盖证明时才建立当前快照。
     let current_events = std::cell::OnceCell::new();
     let mut preserves_home = |range, home| {
@@ -3512,7 +3527,7 @@ impl DirectBindingWriteCollector<'_> {
     }
 }
 
-impl HirVisitor for DirectBindingWriteCollector<'_> {
+impl HirVisitor<'_> for DirectBindingWriteCollector<'_> {
     fn visit_local_root_release(&mut self, local: crate::hir::common::LocalId) {
         self.summary.identities.insert(HirBinding::Local(local));
     }

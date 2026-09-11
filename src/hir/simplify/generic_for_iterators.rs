@@ -21,7 +21,8 @@ use crate::hir::common::{
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::{
-    collect_temp_use_counts, stmts_reference_captured_bindings, stmts_value_captured_bindings,
+    collect_temp_use_counts, stmts_reference_captured_bindings, stmts_tbc_protected_home_slots,
+    stmts_value_captured_bindings,
 };
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -32,7 +33,7 @@ pub(super) fn fold_generic_for_iterators_in_proto(
 ) -> bool {
     let use_counts = collect_temp_use_counts(proto);
     let reference_capture_homes = iterator_reference_capture_homes(&proto.body, facts);
-    let tbc_protected_homes = iterator_tbc_protected_homes(&proto.body, facts);
+    let tbc_protected_homes = stmts_tbc_protected_home_slots(&proto.body.stmts, facts);
     let physical_root_bindings = iterator_physical_root_bindings(proto);
     let debug_temps = proto
         .temp_debug_locals
@@ -385,40 +386,6 @@ fn iterator_reference_capture_homes(
     stmts_reference_captured_bindings(&block.stmts).complete_home_slots(facts)
 }
 
-fn iterator_tbc_protected_homes(
-    block: &HirBlock,
-    facts: &ProtoPromotionFacts,
-) -> BTreeSet<HomeSlotKey> {
-    let mut homes = BTreeSet::new();
-    struct TbcHomeCollector<'a> {
-        homes: &'a mut BTreeSet<HomeSlotKey>,
-        facts: &'a ProtoPromotionFacts,
-    }
-
-    impl HirVisitor for TbcHomeCollector<'_> {
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
-            let HirStmt::ToBeClosed(tbc) = stmt else {
-                return;
-            };
-            let mut collector = BindingLocationCollector {
-                locations: BindingLocations::default(),
-                facts: self.facts,
-            };
-            visit_expr(&tbc.value, &mut collector);
-            self.homes.extend(collector.locations.physical_homes);
-        }
-    }
-
-    visit_stmts(
-        &block.stmts,
-        &mut TbcHomeCollector {
-            homes: &mut homes,
-            facts,
-        },
-    );
-    homes
-}
-
 fn iterator_value_capture_homes(
     stmts_after_producer: &[HirStmt],
     facts: &ProtoPromotionFacts,
@@ -450,7 +417,7 @@ struct MaterializedBindingCollector {
     bindings: BTreeSet<DirectBinding>,
 }
 
-impl HirVisitor for MaterializedBindingCollector {
+impl HirVisitor<'_> for MaterializedBindingCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(decl) => {
@@ -646,7 +613,7 @@ struct BindingLocationCollector<'a> {
     facts: &'a ProtoPromotionFacts,
 }
 
-impl HirVisitor for BindingLocationCollector<'_> {
+impl HirVisitor<'_> for BindingLocationCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         let binding = match expr {
             HirExpr::ParamRef(param) => Some(DirectBinding::Param(*param)),

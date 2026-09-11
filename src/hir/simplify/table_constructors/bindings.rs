@@ -367,7 +367,7 @@ struct BindingCaptureCollector<'a> {
     reference_captured_home_slots: BTreeSet<HomeSlotKey>,
 }
 
-impl HirVisitor for BindingCaptureCollector<'_> {
+impl HirVisitor<'_> for BindingCaptureCollector<'_> {
     fn visit_capture(&mut self, capture: &HirCapture) {
         // 两种 capture 都依赖父级物化身份；ByValue 也不能随 producer 删除而变成孤儿。
         if let Some(binding) = binding_from_identity(capture.binding) {
@@ -389,7 +389,7 @@ struct BindingUseCollector<'a> {
     mentions: Vec<BindingId>,
 }
 
-impl HirVisitor for BindingUseCollector<'_> {
+impl HirVisitor<'_> for BindingUseCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::NumericFor(numeric_for) => self.mentions.push(

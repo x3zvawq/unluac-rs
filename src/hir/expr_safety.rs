@@ -38,7 +38,7 @@ impl<F: FnMut(&HirStmt) -> bool> HirEvalEffects<F> {
     }
 }
 
-impl<F: FnMut(&HirStmt) -> bool> HirVisitor for HirEvalEffects<F> {
+impl<F: FnMut(&HirStmt) -> bool> HirVisitor<'_> for HirEvalEffects<F> {
     fn is_complete(&self) -> bool {
         self.found
     }

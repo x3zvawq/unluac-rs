@@ -319,12 +319,6 @@ impl DataflowFacts {
         &self.phi_candidates[range.clone()]
     }
 
-    pub fn phi_candidate_for_reg(&self, block: BlockRef, reg: Reg) -> Option<&PhiCandidate> {
-        self.phi_candidates_in_block(block)
-            .iter()
-            .find(|phi| phi.reg == reg)
-    }
-
     pub fn phi_use_count(&self, phi_id: PhiId) -> usize {
         self.phi_uses.get(phi_id.index()).map_or(0, Vec::len)
     }
@@ -845,6 +839,18 @@ impl PhiId {
 impl fmt::Display for PhiId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "phi{}", self.0)
+    }
+}
+
+/// 所属 canonical phi 内的输入槽位；与包含它的 PhiId 共同标识输入。
+///
+/// SSA compact 完成后槽位顺序固定；synthetic entry 也占槽位，平行边各占一个槽位。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) struct PhiIncomingSlot(pub usize);
+
+impl PhiIncomingSlot {
+    pub(crate) const fn index(self) -> usize {
+        self.0
     }
 }
 

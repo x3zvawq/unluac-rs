@@ -57,7 +57,7 @@ pub(super) fn stmt_has_argument_root_handoff(stmt: &HirStmt, temp: TempId) -> bo
         temp: TempId,
         count: usize,
     }
-    impl HirVisitor for Handoffs {
+    impl HirVisitor<'_> for Handoffs {
         fn visit_call(&mut self, call: &HirCallExpr) {
             self.count += usize::from(call.transfers_argument_root(self.temp));
         }
@@ -2269,7 +2269,7 @@ struct ScopeEndRootCollector<'a> {
     facts: &'a ProtoPromotionFacts,
 }
 
-impl HirVisitor for ScopeEndRootCollector<'_> {
+impl HirVisitor<'_> for ScopeEndRootCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::GenericFor(for_stmt) = stmt {
             self.roots.extend(
@@ -2375,7 +2375,7 @@ struct LocalUseCollector {
     writes: BTreeSet<LocalId>,
 }
 
-impl HirVisitor for LocalUseCollector {
+impl HirVisitor<'_> for LocalUseCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::LocalDecl(decl) = stmt {
             self.writes.extend(decl.bindings.iter().copied());
@@ -2619,7 +2619,7 @@ struct TempWriteCollector {
     argument_transfers: Vec<TempId>,
 }
 
-impl HirVisitor for TempWriteCollector {
+impl HirVisitor<'_> for TempWriteCollector {
     fn visit_call(&mut self, call: &HirCallExpr) {
         for root in &call.argument_roots {
             if call.transfers_argument_root(root.producer) {
@@ -2823,7 +2823,7 @@ struct StackWriteCollector<'a> {
     summary: &'a mut StackWriteSummary,
 }
 
-impl HirVisitor for StackWriteCollector<'_> {
+impl HirVisitor<'_> for StackWriteCollector<'_> {
     fn visit_local_root_release(&mut self, _local: LocalId) {}
 
     fn visit_stmt(&mut self, stmt: &HirStmt) {

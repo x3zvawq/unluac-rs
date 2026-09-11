@@ -5,6 +5,8 @@
 //! 本模块只提供语法树提及事实，不判断 carried-local、branch-value 等业务形状。
 //! 直接读取统一发布 HirBinding，home 投影消费 Promotion 的完整可能集合；例如 closure
 //! capture 只读取父 binding，upvalue 不占当前 frame 的槽，不能从名字或局部编号推断 home。
+//! collector 可按查询点组成 tuple，一次收集同一快照的模式与资源身份；例如引用捕获、
+//! 按值捕获和直接 TBC temp 分别输出，不能把它们合成一种跨改写有效的绑定事实。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,7 +109,7 @@ impl ReferenceCapturedBindings {
 /// sink 决定收集 identity、home 或两者，不另建四类引用集合再还原同一个 binding。
 pub(super) struct BindingReadCollector<F>(pub(super) F);
 
-impl<F: FnMut(HirBinding)> HirVisitor for BindingReadCollector<F> {
+impl<F: FnMut(HirBinding)> HirVisitor<'_> for BindingReadCollector<F> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let Some(binding) = HirBinding::from_expr(expr) {
             (self.0)(binding);
@@ -118,7 +120,7 @@ impl<F: FnMut(HirBinding)> HirVisitor for BindingReadCollector<F> {
 pub(super) fn binding_home_read_collector<'a>(
     facts: &'a ProtoPromotionFacts,
     homes: &'a mut BTreeSet<HomeSlotKey>,
-) -> impl HirVisitor + 'a {
+) -> impl for<'hir> HirVisitor<'hir> + 'a {
     BindingReadCollector(move |binding| {
         homes.extend(facts.complete_binding_home_slots(binding).iter().copied());
     })
@@ -134,10 +136,7 @@ pub(super) fn expr_read_homes(
 }
 
 pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
-    let mut collector = CaptureCollector {
-        mode: HirCaptureMode::ByReference,
-        bindings: Default::default(),
-    };
+    let mut collector = CaptureCollector::new(HirCaptureMode::ByReference);
     visit_stmts(stmts, &mut collector);
     collector.bindings
 }
@@ -146,19 +145,13 @@ pub(super) fn stmts_reference_captured_bindings(stmts: &[HirStmt]) -> ReferenceC
 /// capture is a snapshot: a later write to the same physical slot must not be merged back into
 /// the captured binding merely because the snapshot has no ordinary expression use.
 pub(super) fn stmts_value_captured_bindings(stmts: &[HirStmt]) -> ReferenceCapturedBindings {
-    let mut collector = CaptureCollector {
-        mode: HirCaptureMode::ByValue,
-        bindings: Default::default(),
-    };
+    let mut collector = CaptureCollector::new(HirCaptureMode::ByValue);
     visit_stmts(stmts, &mut collector);
     collector.bindings
 }
 
-/// 收集 TBC 原始寄存器在当前 proto 中可能保护的完整物理 home。
-///
-/// HIR value 可能已被改写成 Param/Local/Temp 或复合表达式；先收集所有可见 binding home，
-/// 再由原始 `reg_index` 收窄到对应 epoch。没有可匹配 binding 时退回该寄存器的全部 epoch，
-/// 避免后续 pass 从当前表达式形状猜测 Lua 5.4 close 生命周期。
+/// 按 TBC origin 收集资源注册点的物理 home，不从改写后的 value 重建槽位 epoch。
+/// 当前 value 的逻辑读取与 protected-local 保护由各自查询保留。
 pub(super) fn stmts_tbc_protected_home_slots(
     stmts: &[HirStmt],
     facts: &ProtoPromotionFacts,
@@ -169,12 +162,6 @@ pub(super) fn stmts_tbc_protected_home_slots(
     };
     visit_stmts(stmts, &mut collector);
     collector.homes
-}
-
-pub(super) fn stmts_to_be_closed_temps(stmts: &[HirStmt]) -> BTreeSet<TempId> {
-    let mut collector = ToBeClosedTempCollector::default();
-    visit_stmts(stmts, &mut collector);
-    collector.temps
 }
 
 /// 收集不能改写成普通 local 状态的词法身份。
@@ -188,11 +175,11 @@ pub(super) fn stmts_protected_locals(stmts: &[HirStmt]) -> BTreeSet<LocalId> {
 }
 
 #[derive(Default)]
-struct ProtectedLocalCollector {
-    locals: BTreeSet<LocalId>,
+pub(super) struct ProtectedLocalCollector {
+    pub(super) locals: BTreeSet<LocalId>,
 }
 
-impl HirVisitor for ProtectedLocalCollector {
+impl HirVisitor<'_> for ProtectedLocalCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::NumericFor(for_stmt) => {
@@ -212,30 +199,26 @@ impl HirVisitor for ProtectedLocalCollector {
     }
 }
 
-struct ToBeClosedHomeCollector<'a> {
-    facts: &'a ProtoPromotionFacts,
-    homes: BTreeSet<HomeSlotKey>,
+pub(super) struct ToBeClosedHomeCollector<'a> {
+    pub(super) facts: &'a ProtoPromotionFacts,
+    pub(super) homes: BTreeSet<HomeSlotKey>,
 }
 
-impl HirVisitor for ToBeClosedHomeCollector<'_> {
+impl HirVisitor<'_> for ToBeClosedHomeCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         let HirStmt::ToBeClosed(to_be_closed) = stmt else {
             return;
         };
-        let value_homes = expr_read_homes(&to_be_closed.value, self.facts);
-        self.homes.extend(
-            self.facts
-                .complete_tbc_home_slots(to_be_closed.reg_index, &value_homes),
-        );
+        self.homes.insert(self.facts.tbc_home(to_be_closed.origin));
     }
 }
 
 #[derive(Default)]
-struct ToBeClosedTempCollector {
-    temps: BTreeSet<TempId>,
+pub(super) struct ToBeClosedTempCollector {
+    pub(super) temps: BTreeSet<TempId>,
 }
 
-impl HirVisitor for ToBeClosedTempCollector {
+impl HirVisitor<'_> for ToBeClosedTempCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         let HirStmt::ToBeClosed(to_be_closed) = stmt else {
             return;
@@ -246,12 +229,21 @@ impl HirVisitor for ToBeClosedTempCollector {
     }
 }
 
-struct CaptureCollector {
+pub(super) struct CaptureCollector {
     mode: HirCaptureMode,
-    bindings: ReferenceCapturedBindings,
+    pub(super) bindings: ReferenceCapturedBindings,
 }
 
-impl HirVisitor for CaptureCollector {
+impl CaptureCollector {
+    pub(super) fn new(mode: HirCaptureMode) -> Self {
+        Self {
+            mode,
+            bindings: Default::default(),
+        }
+    }
+}
+
+impl HirVisitor<'_> for CaptureCollector {
     fn visit_capture(&mut self, capture: &HirCapture) {
         if capture.mode != self.mode {
             return;
@@ -298,7 +290,7 @@ struct TempWriteCountCollector {
     counts: BTreeMap<TempId, usize>,
 }
 
-impl HirVisitor for TempWriteCountCollector {
+impl HirVisitor<'_> for TempWriteCountCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         if let HirLValue::Temp(temp) = lvalue {
             *self.counts.entry(*temp).or_default() += 1;
@@ -311,7 +303,7 @@ struct TempUseCollector {
     counts: BTreeMap<TempId, usize>,
 }
 
-impl HirVisitor for TempUseCollector {
+impl HirVisitor<'_> for TempUseCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::TempRef(temp) = expr {
             *self.counts.entry(*temp).or_default() += 1;
@@ -344,7 +336,7 @@ impl LocalMentionCollector {
     }
 }
 
-impl HirVisitor for LocalMentionCollector {
+impl HirVisitor<'_> for LocalMentionCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.mentioned |= matches!(expr, HirExpr::LocalRef(local) if *local == self.local);
     }
@@ -370,7 +362,7 @@ impl LocalCaptureCollector {
     }
 }
 
-impl HirVisitor for LocalCaptureCollector {
+impl HirVisitor<'_> for LocalCaptureCollector {
     fn visit_capture(&mut self, capture: &HirCapture) {
         self.captured |= capture.binding == HirBinding::Local(self.local);
     }
@@ -381,7 +373,7 @@ struct CapturedLocalSetCollector {
     locals: BTreeSet<LocalId>,
 }
 
-impl HirVisitor for CapturedLocalSetCollector {
+impl HirVisitor<'_> for CapturedLocalSetCollector {
     fn visit_capture(&mut self, capture: &HirCapture) {
         if let HirBinding::Local(local) = capture.binding {
             self.locals.insert(local);
@@ -393,7 +385,7 @@ struct LocalMentionSetCollector<'a> {
     locals: &'a mut BTreeSet<LocalId>,
 }
 
-impl HirVisitor for LocalMentionSetCollector<'_> {
+impl HirVisitor<'_> for LocalMentionSetCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::LocalRef(local) = expr {
             self.locals.insert(*local);
@@ -423,7 +415,7 @@ impl TempWriteCollector {
     }
 }
 
-impl HirVisitor for TempWriteCollector {
+impl HirVisitor<'_> for TempWriteCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         self.written |= matches!(lvalue, HirLValue::Temp(temp) if *temp == self.temp);
     }
@@ -446,7 +438,7 @@ pub(super) fn visit_local_writes(stmt: &HirStmt, mut visit: impl FnMut(LocalId))
 /// 例如 `a, a = x, y` 产生两次写；这些身份事件不证明原 VM home 被覆盖。
 pub(super) struct BindingWriteCollector<F>(pub(super) F);
 
-impl<F: FnMut(HirBinding)> HirVisitor for BindingWriteCollector<F> {
+impl<F: FnMut(HirBinding)> HirVisitor<'_> for BindingWriteCollector<F> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(decl) => {

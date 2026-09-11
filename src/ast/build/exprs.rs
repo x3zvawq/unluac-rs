@@ -5,14 +5,14 @@
 //! `SingleValue`，open tail 则保持展开；非 target-counted 上下文若仍收到 exact tail，
 //! 说明 HIR 物化尚未完成并直接报错。
 //! 本地范围清零保留 HIR 的成组生命周期证明，在此落成无需整组 RHS 暂存槽的标量写入。
-//! closure lowering 同时是 `capture_names_by_upvalue` 的唯一 producer：它按 HIR capture
-//! 顺序保留 child UpvalueId 到父级 Param/Local/Temp/Upvalue 名字的对应，供后续精确分析。
+//! closure lowering 消费 HIR capture 身份与 child 写入摘要，发布父级捕获集合及写入子集；
+//! 闭包内部的逃逸和根存活证明归 HIR，AST 不再保留另一份 upvalue 来源映射。
 //! 表构造器的 record key 同样只从 HIR 语义表达式降低：合法 UTF-8 identifier 在本层按
 //! 目标方言写成命名字段，其余键保持显式索引表达式，HIR 不承载这项源码语法选择。
 //! 一元/二元运算通过显式后序栈保留 HIR 原树；例如长加法链不能为减少调用栈而重结合，
 //! 否则会改变浮点结果或元方法执行顺序。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::hir::{
     HirAssign, HirBinaryOpKind, HirCallExpr, HirCaptureMode, HirClosureExpr, HirExpr, HirLValue,
@@ -102,7 +102,6 @@ impl<'a> AstLowerer<'a> {
             };
         let mut captured_bindings = BTreeSet::new();
         let mut captured_params = BTreeSet::new();
-        let mut capture_names_by_upvalue = BTreeMap::new();
         let mut capture_write_names = BTreeSet::new();
         for (capture_index, capture) in closure.captures.iter().enumerate() {
             let name = self.lower_capture_name(owner_proto, capture.binding)?;
@@ -121,9 +120,8 @@ impl<'a> AstLowerer<'a> {
             if capture.mode == HirCaptureMode::ByReference
                 && child.mutable_upvalues.contains(&UpvalueId(capture_index))
             {
-                capture_write_names.insert(name.clone());
+                capture_write_names.insert(name);
             }
-            capture_names_by_upvalue.insert(UpvalueId(capture_index), name);
         }
         Ok(AstFunctionExpr {
             function: closure.proto,
@@ -133,7 +131,6 @@ impl<'a> AstLowerer<'a> {
             body,
             captured_bindings,
             captured_params,
-            capture_names_by_upvalue,
             capture_write_names,
         })
     }

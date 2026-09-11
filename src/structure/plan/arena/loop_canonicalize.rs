@@ -46,25 +46,21 @@ pub(super) fn canonicalize_loops(
         };
 
         for mut candidates in candidate_groups {
-            let kinds = candidates
-                .iter()
-                .map(|candidate| candidate.candidate.kind_hint)
-                .filter(|kind| *kind != crate::structure::LoopKindHint::Unknown)
-                .collect::<BTreeSet<_>>();
-            let mut bindings = Vec::new();
-            for binding in candidates
-                .iter()
-                .filter_map(|candidate| candidate.candidate.source_bindings)
-            {
-                if !bindings.contains(&binding) {
-                    bindings.push(binding);
-                }
-            }
-            let conditions = candidates
-                .iter()
-                .filter_map(|candidate| candidate.condition)
-                .collect::<BTreeSet<_>>();
-            if kinds.len() > 1 || bindings.len() > 1 || conditions.len() > 1 {
+            let conflicting = has_conflicting_values(
+                candidates
+                    .iter()
+                    .map(|candidate| candidate.candidate.kind_hint)
+                    .filter(|kind| *kind != crate::structure::LoopKindHint::Unknown),
+            ) || has_conflicting_values(
+                candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.candidate.source_bindings),
+            ) || has_conflicting_values(
+                candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.condition),
+            );
+            if conflicting {
                 let Some(first) = candidates.first() else {
                     continue;
                 };
@@ -128,10 +124,10 @@ pub(super) fn canonicalize_loops(
                 selected
                     .semantic_continue_edges
                     .extend(candidate.semantic_continue_edges);
-                extend_edges(
-                    &mut selected.candidate.backedges,
-                    candidate.candidate.backedges,
-                );
+                selected
+                    .candidate
+                    .backedges
+                    .extend(candidate.candidate.backedges);
                 extend_value_merges(
                     &mut selected.candidate.header_value_merges,
                     candidate.candidate.header_value_merges,
@@ -159,6 +155,7 @@ pub(super) fn canonicalize_loops(
                 .candidate
                 .backedges
                 .sort_by_key(|edge| edge.index());
+            selected.candidate.backedges.dedup();
             selected.candidate.normalize_control_blocks();
             selected.candidate.normalized_exit_aliases.sort();
             selected.candidate.normalized_exit_aliases.dedup();
@@ -228,10 +225,10 @@ pub(super) fn normalize_break_only_while_body(cfg: &Cfg, loop_: &mut super::supe
     loop_.condition = None;
 }
 
-pub(super) fn extend_edges(target: &mut Vec<EdgeRef>, source: Vec<EdgeRef>) {
-    let mut merged = std::mem::take(target).into_iter().collect::<BTreeSet<_>>();
-    merged.extend(source);
-    target.extend(merged);
+fn has_conflicting_values<T: PartialEq>(mut values: impl Iterator<Item = T>) -> bool {
+    values
+        .next()
+        .is_some_and(|first| values.any(|value| value != first))
 }
 
 pub(super) fn extend_value_merges(
@@ -246,13 +243,13 @@ pub(super) fn extend_value_merges(
     for merge in source {
         if let Some(index) = by_value.get(&(merge.phi_id, merge.reg)).copied() {
             let existing = &mut target[index];
-            extend_value_incomings(
-                &mut existing.inside_arm.incomings,
-                merge.inside_arm.incomings,
+            extend_incoming_slots(
+                &mut existing.inside_arm.incoming_slots,
+                merge.inside_arm.incoming_slots,
             );
-            extend_value_incomings(
-                &mut existing.outside_arm.incomings,
-                merge.outside_arm.incomings,
+            extend_incoming_slots(
+                &mut existing.outside_arm.incoming_slots,
+                merge.outside_arm.incoming_slots,
             );
         } else {
             by_value.insert((merge.phi_id, merge.reg), target.len());
@@ -261,17 +258,11 @@ pub(super) fn extend_value_merges(
     }
 }
 
-pub(super) fn extend_value_incomings(
-    target: &mut Vec<crate::structure::LoopValueIncoming>,
-    source: Vec<crate::structure::LoopValueIncoming>,
+pub(super) fn extend_incoming_slots(
+    target: &mut Vec<crate::structure::PhiIncomingSlot>,
+    source: Vec<crate::structure::PhiIncomingSlot>,
 ) {
-    let mut known = target
-        .iter()
-        .map(|incoming| (incoming.pred, incoming.value))
-        .collect::<BTreeSet<_>>();
-    for incoming in source {
-        if known.insert((incoming.pred, incoming.value)) {
-            target.push(incoming);
-        }
-    }
+    target.extend(source);
+    target.sort_unstable();
+    target.dedup();
 }

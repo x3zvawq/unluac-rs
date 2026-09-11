@@ -26,7 +26,9 @@ pub struct Cfg {
     pub exit_block: BlockRef,
     pub block_order: Vec<BlockRef>,
     pub instr_to_block: Vec<BlockRef>,
+    /// 与 succs 同按 EdgeRef 追加顺序排列；平行边各自保留身份。
     pub preds: Vec<Vec<EdgeRef>>,
+    /// 同一 from→to 边在两侧邻接表中的相对顺序一致，供 SSA incoming 查询消费。
     pub succs: Vec<Vec<EdgeRef>>,
     pub reachable_blocks: BTreeSet<BlockRef>,
 }

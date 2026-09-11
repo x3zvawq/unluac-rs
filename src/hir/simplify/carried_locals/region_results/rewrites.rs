@@ -134,7 +134,7 @@ pub(super) fn result_writes_are_standalone_seed_copies(
         valid: bool,
     }
 
-    impl HirVisitor for CopyWriteCollector {
+    impl HirVisitor<'_> for CopyWriteCollector {
         fn visit_local_root_release(&mut self, local: LocalId) {
             if CarryBinding::Local(local) == self.result {
                 self.writes += 1;

@@ -62,7 +62,7 @@ struct ReturnDependencies<'a> {
     unsupported: bool,
 }
 
-impl HirVisitor for ReturnDependencies<'_> {
+impl HirVisitor<'_> for ReturnDependencies<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
             HirExpr::TempRef(temp) if !self.lookup_values.contains_key(temp) => {

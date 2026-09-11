@@ -20,10 +20,13 @@
 //! 独立 collector 可组成 tuple 共用遍历；如读集合和写事件一次收集，capture 与 release
 //! 仍逐个交给原 hook，不能由组合器统一解释其语义。完成的分量不再接收事件；只有
 //! 全部分量完成才停止遍历，例如 effects 已命中后，写集合仍须收齐当前快照的后续写入。
+//! closure hook 单独借用真实节点的生命周期，供对象流和命名直接引用捕获切片；例如
+//! `function() return x end` 的捕获身份无需复制。expr/lvalue hook 仍只提供短借用，
+//! 因为 capture/root-release 的默认投影会生成临时 binding 叶子，不能把它们保存为树节点。
 
 use crate::hir::common::{
-    HirBlock, HirCallExpr, HirCapture, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,
-    HirTableConstructor, LocalId,
+    HirBlock, HirCallExpr, HirCapture, HirClosureExpr, HirDecisionExpr, HirExpr, HirLValue,
+    HirProto, HirStmt, HirTableConstructor, LocalId,
 };
 
 use crate::hir::traverse::{
@@ -32,7 +35,7 @@ use crate::hir::traverse::{
     traverse_hir_table_constructor_children,
 };
 
-pub(crate) trait HirVisitor {
+pub(crate) trait HirVisitor<'hir> {
     /// 本次查询已完成；返回 true 后不再接收节点，完整事实收集器保持默认 false。
     fn is_complete(&self) -> bool {
         false
@@ -43,6 +46,9 @@ pub(crate) trait HirVisitor {
     fn visit_stmt(&mut self, _stmt: &HirStmt) {}
 
     fn visit_expr(&mut self, _expr: &HirExpr) {}
+
+    /// 真实 HIR 节点的稳定借用；capture 的临时 binding 叶子不经过此 hook。
+    fn visit_closure(&mut self, _closure: &'hir HirClosureExpr) {}
 
     fn visit_lvalue(&mut self, _lvalue: &HirLValue) {}
 
@@ -73,7 +79,7 @@ macro_rules! visit_active_pair {
 }
 
 /// 独立事实收集器共用一次遍历；每个 hook 都交给原收集器，保留各自的 capture/release 语义。
-impl<A: HirVisitor, B: HirVisitor> HirVisitor for (A, B) {
+impl<'hir, A: HirVisitor<'hir>, B: HirVisitor<'hir>> HirVisitor<'hir> for (A, B) {
     fn is_complete(&self) -> bool {
         self.0.is_complete() && self.1.is_complete()
     }
@@ -82,6 +88,7 @@ impl<A: HirVisitor, B: HirVisitor> HirVisitor for (A, B) {
         visit_block(block: &HirBlock),
         visit_stmt(stmt: &HirStmt),
         visit_expr(expr: &HirExpr),
+        visit_closure(closure: &'hir HirClosureExpr),
         visit_lvalue(lvalue: &HirLValue),
         visit_local_root_release(local: LocalId),
         visit_call(call: &HirCallExpr),
@@ -102,16 +109,16 @@ macro_rules! visit_next {
     };
 }
 
-pub(crate) fn visit_proto(proto: &HirProto, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_proto<'hir>(proto: &'hir HirProto, visitor: &mut impl HirVisitor<'hir>) {
     visit_next!(visitor, visit_block(&proto.body, visitor));
 }
 
-pub(crate) fn visit_block(block: &HirBlock, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_block<'hir>(block: &'hir HirBlock, visitor: &mut impl HirVisitor<'hir>) {
     visit_next!(visitor, visitor.visit_block(block));
     visit_next!(visitor, visit_stmts(&block.stmts, visitor));
 }
 
-pub(crate) fn visit_stmts(stmts: &[HirStmt], visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_stmts<'hir>(stmts: &'hir [HirStmt], visitor: &mut impl HirVisitor<'hir>) {
     for stmt in stmts {
         visit_next!(visitor, visit_stmt(stmt, visitor));
     }
@@ -163,7 +170,7 @@ pub(crate) fn any_stmt_structure(
     found
 }
 
-fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
+fn visit_stmt<'hir>(stmt: &'hir HirStmt, visitor: &mut impl HirVisitor<'hir>) {
     visit_next!(visitor, visitor.visit_stmt(stmt));
     traverse_hir_stmt_children!(
         stmt,
@@ -190,7 +197,7 @@ fn visit_stmt(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
 }
 
 /// 只访问本语句的求值部分；嵌套 block 由控制流图在各自的节点访问。
-pub(crate) fn visit_stmt_header(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_stmt_header<'hir>(stmt: &'hir HirStmt, visitor: &mut impl HirVisitor<'hir>) {
     visit_next!(visitor, visitor.visit_stmt(stmt));
     traverse_hir_stmt_children!(
         stmt,
@@ -206,22 +213,25 @@ pub(crate) fn visit_stmt_header(stmt: &HirStmt, visitor: &mut impl HirVisitor) {
     );
 }
 
-pub(crate) fn visit_call(call: &HirCallExpr, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_call<'hir>(call: &'hir HirCallExpr, visitor: &mut impl HirVisitor<'hir>) {
     visit_next!(visitor, visitor.visit_call(call));
     traverse_hir_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
         visit_next!(visitor, visit_expr(expr, visitor));
     });
 }
 
-pub(crate) fn visit_lvalue(lvalue: &HirLValue, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_lvalue<'hir>(lvalue: &'hir HirLValue, visitor: &mut impl HirVisitor<'hir>) {
     visit_next!(visitor, visitor.visit_lvalue(lvalue));
     traverse_hir_lvalue_children!(lvalue, borrow = [&], expr(expr) => {
         visit_next!(visitor, visit_expr(expr, visitor));
     });
 }
 
-pub(crate) fn visit_expr(expr: &HirExpr, visitor: &mut impl HirVisitor) {
+pub(crate) fn visit_expr<'hir>(expr: &'hir HirExpr, visitor: &mut impl HirVisitor<'hir>) {
     visit_next!(visitor, visitor.visit_expr(expr));
+    if let HirExpr::Closure(closure) = expr {
+        visit_next!(visitor, visitor.visit_closure(closure));
+    }
     traverse_hir_expr_children!(
         expr,
         iter = iter,
@@ -251,7 +261,7 @@ pub(crate) fn any_expr(expr: &HirExpr, predicate: &mut impl FnMut(&HirExpr) -> b
         found: bool,
     }
 
-    impl<F: FnMut(&HirExpr) -> bool> HirVisitor for AnyExpr<'_, F> {
+    impl<F: FnMut(&HirExpr) -> bool> HirVisitor<'_> for AnyExpr<'_, F> {
         fn is_complete(&self) -> bool {
             self.found
         }
@@ -269,7 +279,7 @@ pub(crate) fn any_expr(expr: &HirExpr, predicate: &mut impl FnMut(&HirExpr) -> b
     visitor.found
 }
 
-fn visit_decision_expr(decision: &HirDecisionExpr, visitor: &mut impl HirVisitor) {
+fn visit_decision_expr<'hir>(decision: &'hir HirDecisionExpr, visitor: &mut impl HirVisitor<'hir>) {
     traverse_hir_decision_children!(
         decision,
         iter = iter,
@@ -283,7 +293,10 @@ fn visit_decision_expr(decision: &HirDecisionExpr, visitor: &mut impl HirVisitor
     );
 }
 
-fn visit_table_constructor(table: &HirTableConstructor, visitor: &mut impl HirVisitor) {
+fn visit_table_constructor<'hir>(
+    table: &'hir HirTableConstructor,
+    visitor: &mut impl HirVisitor<'hir>,
+) {
     traverse_hir_table_constructor_children!(
         table,
         iter = iter,

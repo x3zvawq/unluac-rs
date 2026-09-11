@@ -13,6 +13,8 @@
 //! statement/function 的 leave hook 仍成对执行，未进入的 child 不产生回调。
 //! 只需跳转事实时使用 any_stmt_structure，跳过求值与 child function；例如外层声明
 //! 能否移动只取决于本函数的 goto，闭包体中的同号 label 不属于这个查询域。
+//! 表达式先序骨架使用显式栈，并向 naming 等借用节点的收集器开放同一事件流；
+//! `a + a + ...` 保持左结合树，遍历不消耗与运算链长度成正比的调用栈。
 
 use std::ops::ControlFlow;
 
@@ -190,18 +192,47 @@ fn visit_lvalue(lvalue: &AstLValue, visitor: &mut impl AstVisitor) -> ControlFlo
 }
 
 fn visit_expr_impl(expr: &AstExpr, visitor: &mut impl AstVisitor) -> ControlFlow<()> {
-    visitor.visit_expr(expr);
-    if let AstExpr::Var(name) = expr {
-        visitor.visit_name(name, NameAccess::Read)?;
+    for node in expr_nodes(expr) {
+        match node {
+            ExprNode::Expr(expr) => {
+                visitor.visit_expr(expr);
+                if let AstExpr::Var(name) = expr {
+                    visitor.visit_name(name, NameAccess::Read)?;
+                }
+            }
+            ExprNode::Function(function) => {
+                visit_function_expr(function, BlockKind::FunctionBody, visitor)?;
+            }
+        }
     }
-    traverse_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(expr) => { visit_expr_impl(expr, visitor)?; },
-        function(function) => { visit_function_expr(function, BlockKind::FunctionBody, visitor)?; }
-    );
     ControlFlow::Continue(())
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ExprNode<'a> {
+    Expr(&'a AstExpr),
+    Function(&'a AstFunctionExpr),
+}
+
+/// 共享先序表达式骨架；函数边界交给消费者处理，不进入 child body 或解释 capture。
+/// 左结合算术可以远深于 Lua 的语法嵌套限制，必须保持原树并使用显式栈。
+pub(super) fn expr_nodes(expr: &AstExpr) -> impl Iterator<Item = ExprNode<'_>> {
+    let mut current = Some(ExprNode::Expr(expr));
+    let mut pending = Vec::new();
+    std::iter::from_fn(move || {
+        let node = current.take()?;
+        let start = pending.len();
+        if let ExprNode::Expr(expr) = node {
+            traverse_expr_children!(
+                expr, iter = iter, borrow = [&],
+                expr(child) => { pending.push(ExprNode::Expr(child)); },
+                function(child) => { pending.push(ExprNode::Function(child)); }
+            );
+        }
+        pending[start..].reverse();
+        current = pending.pop();
+        Some(node)
+    })
 }
 
 fn visit_condition_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) -> ControlFlow<()> {

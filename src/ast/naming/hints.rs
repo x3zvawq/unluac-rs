@@ -5,33 +5,24 @@
 
 use std::collections::BTreeMap;
 
-use crate::ast::traverse::{
-    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
-};
+use crate::ast::traverse::{traverse_call_children, traverse_lvalue_children};
+use crate::ast::visit::{ExprNode, expr_nodes};
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
     AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
 };
-use crate::hir::{HirModule, HirProtoRef, ParamId};
+use crate::hir::{HirProtoRef, ParamId};
 
-use super::NamingError;
 use super::common::{CandidateHint, FunctionHints, LoopContext, NameSource};
 use super::support::normalize_identifier;
-use super::validate::ensure_function_exists;
 
-/// 收集整模块的 function hints。
-pub(super) fn collect_function_hints(
-    module: &AstModule,
-    hir: &HirModule,
-    hints: &mut [FunctionHints],
-) -> Result<(), NamingError> {
-    ensure_function_exists(hir, module.entry_function)?;
+/// 收集已通过 Naming 入口校验的最终 AST hints；不再查询 HIR 身份。
+pub(super) fn collect_function_hints(module: &AstModule, hints: &mut [FunctionHints]) {
     collect_block_hints(
         module.entry_function,
         &module.body,
         hints,
         LoopContext::default(),
-        hir,
     )
 }
 
@@ -40,12 +31,10 @@ fn collect_block_hints(
     block: &AstBlock,
     hints: &mut [FunctionHints],
     loop_ctx: LoopContext,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+) {
     for stmt in &block.stmts {
-        collect_stmt_hints(function, stmt, hints, loop_ctx, hir)?;
+        collect_stmt_hints(function, stmt, hints, loop_ctx);
     }
-    Ok(())
 }
 
 fn collect_stmt_hints(
@@ -53,12 +42,11 @@ fn collect_stmt_hints(
     stmt: &AstStmt,
     hints: &mut [FunctionHints],
     loop_ctx: LoopContext,
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+) {
     match stmt {
         AstStmt::LocalDecl(local_decl) => {
             for value in &local_decl.values {
-                collect_expr_hints(function, value, hints, hir)?;
+                collect_expr_hints(function, value, hints);
             }
             for binding in &local_decl.bindings {
                 record_binding_presence(function, binding.id, hints);
@@ -69,15 +57,15 @@ fn collect_stmt_hints(
         }
         AstStmt::GlobalDecl(global_decl) => {
             for value in &global_decl.values {
-                collect_expr_hints(function, value, hints, hir)?;
+                collect_expr_hints(function, value, hints);
             }
         }
         AstStmt::Assign(assign) => {
             for target in &assign.targets {
-                collect_lvalue_hints(function, target, hints, hir)?;
+                collect_lvalue_hints(function, target, hints);
             }
             for value in &assign.values {
-                collect_expr_hints(function, value, hints, hir)?;
+                collect_expr_hints(function, value, hints);
             }
             if let ([AstLValue::Name(name)], [value]) =
                 (assign.targets.as_slice(), assign.values.as_slice())
@@ -87,26 +75,26 @@ fn collect_stmt_hints(
                 register_binding_expr_hint(function, binding, value, hints);
             }
         }
-        AstStmt::CallStmt(call_stmt) => collect_call_hints(function, &call_stmt.call, hints, hir)?,
+        AstStmt::CallStmt(call_stmt) => collect_call_hints(function, &call_stmt.call, hints),
         AstStmt::Return(ret) => {
             for value in &ret.values {
-                collect_expr_hints(function, value, hints, hir)?;
+                collect_expr_hints(function, value, hints);
             }
         }
         AstStmt::If(if_stmt) => {
-            collect_expr_hints(function, &if_stmt.cond, hints, hir)?;
-            collect_block_hints(function, &if_stmt.then_block, hints, loop_ctx, hir)?;
+            collect_expr_hints(function, &if_stmt.cond, hints);
+            collect_block_hints(function, &if_stmt.then_block, hints, loop_ctx);
             if let Some(else_block) = &if_stmt.else_block {
-                collect_block_hints(function, else_block, hints, loop_ctx, hir)?;
+                collect_block_hints(function, else_block, hints, loop_ctx);
             }
         }
         AstStmt::While(while_stmt) => {
-            collect_expr_hints(function, &while_stmt.cond, hints, hir)?;
-            collect_block_hints(function, &while_stmt.body, hints, loop_ctx, hir)?;
+            collect_expr_hints(function, &while_stmt.cond, hints);
+            collect_block_hints(function, &while_stmt.body, hints, loop_ctx);
         }
         AstStmt::Repeat(repeat_stmt) => {
-            collect_block_hints(function, &repeat_stmt.body, hints, loop_ctx, hir)?;
-            collect_expr_hints(function, &repeat_stmt.cond, hints, hir)?;
+            collect_block_hints(function, &repeat_stmt.body, hints, loop_ctx);
+            collect_expr_hints(function, &repeat_stmt.cond, hints);
         }
         AstStmt::NumericFor(numeric_for) => {
             let candidate = numeric_loop_name(loop_ctx.numeric_depth).to_owned();
@@ -117,9 +105,9 @@ fn collect_stmt_hints(
                 NameSource::LoopRole,
                 hints,
             );
-            collect_expr_hints(function, &numeric_for.start, hints, hir)?;
-            collect_expr_hints(function, &numeric_for.limit, hints, hir)?;
-            collect_expr_hints(function, &numeric_for.step, hints, hir)?;
+            collect_expr_hints(function, &numeric_for.start, hints);
+            collect_expr_hints(function, &numeric_for.limit, hints);
+            collect_expr_hints(function, &numeric_for.step, hints);
             collect_block_hints(
                 function,
                 &numeric_for.body,
@@ -127,12 +115,11 @@ fn collect_stmt_hints(
                 LoopContext {
                     numeric_depth: loop_ctx.numeric_depth + 1,
                 },
-                hir,
-            )?;
+            );
         }
         AstStmt::GenericFor(generic_for) => {
             for expr in &generic_for.iterator {
-                collect_expr_hints(function, expr, hints, hir)?;
+                collect_expr_hints(function, expr, hints);
             }
             for (index, binding) in generic_for.bindings.iter().copied().enumerate() {
                 let candidate = match index {
@@ -149,9 +136,9 @@ fn collect_stmt_hints(
                     hints,
                 );
             }
-            collect_block_hints(function, &generic_for.body, hints, loop_ctx, hir)?;
+            collect_block_hints(function, &generic_for.body, hints, loop_ctx);
         }
-        AstStmt::DoBlock(block) => collect_block_hints(function, block, hints, loop_ctx, hir)?,
+        AstStmt::DoBlock(block) => collect_block_hints(function, block, hints, loop_ctx),
         AstStmt::FunctionDecl(function_decl) => {
             if matches!(function_decl.target, AstFunctionName::Method(_, _))
                 && let Some(first_param) = function_decl.func.params.first().copied()
@@ -164,7 +151,7 @@ fn collect_stmt_hints(
                     hints,
                 );
             }
-            collect_function_expr_hints(&function_decl.func, hints, hir)?;
+            collect_function_expr_hints(&function_decl.func, hints);
         }
         AstStmt::LocalFunctionDecl(local_function_decl) => {
             register_binding_hint(
@@ -174,7 +161,7 @@ fn collect_stmt_hints(
                 NameSource::FunctionShape,
                 hints,
             );
-            collect_function_expr_hints(&local_function_decl.func, hints, hir)?;
+            collect_function_expr_hints(&local_function_decl.func, hints);
         }
         AstStmt::Break
         | AstStmt::Continue
@@ -182,72 +169,42 @@ fn collect_stmt_hints(
         | AstStmt::Label(_)
         | AstStmt::Error(_) => {}
     }
-    Ok(())
 }
 
-fn collect_function_expr_hints(
-    function: &AstFunctionExpr,
-    hints: &mut [FunctionHints],
-    hir: &HirModule,
-) -> Result<(), NamingError> {
-    ensure_function_exists(hir, function.function)?;
+fn collect_function_expr_hints(function: &AstFunctionExpr, hints: &mut [FunctionHints]) {
     collect_block_hints(
         function.function,
         &function.body,
         hints,
         LoopContext::default(),
-        hir,
     )
 }
 
-fn collect_call_hints(
-    function: HirProtoRef,
-    call: &AstCallKind,
-    hints: &mut [FunctionHints],
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+fn collect_call_hints(function: HirProtoRef, call: &AstCallKind, hints: &mut [FunctionHints]) {
     traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
-        collect_expr_hints(function, expr, hints, hir)?;
+        collect_expr_hints(function, expr, hints);
     });
-    Ok(())
 }
 
-fn collect_lvalue_hints(
-    function: HirProtoRef,
-    target: &AstLValue,
-    hints: &mut [FunctionHints],
-    hir: &HirModule,
-) -> Result<(), NamingError> {
+fn collect_lvalue_hints(function: HirProtoRef, target: &AstLValue, hints: &mut [FunctionHints]) {
     if let AstLValue::Name(AstNameRef::SyntheticLocal(local)) = target {
         record_synthetic_local(function, *local, hints);
     }
     traverse_lvalue_children!(target, borrow = [&], expr(expr) => {
-        collect_expr_hints(function, expr, hints, hir)?;
+        collect_expr_hints(function, expr, hints);
     });
-    Ok(())
 }
 
-fn collect_expr_hints(
-    function: HirProtoRef,
-    expr: &AstExpr,
-    hints: &mut [FunctionHints],
-    hir: &HirModule,
-) -> Result<(), NamingError> {
-    if let AstExpr::Var(AstNameRef::SyntheticLocal(local)) = expr {
-        record_synthetic_local(function, *local, hints);
-    }
-    traverse_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(child) => {
-            collect_expr_hints(function, child, hints, hir)?;
-        },
-        function(func) => {
-            collect_function_expr_hints(func, hints, hir)?;
+fn collect_expr_hints(function: HirProtoRef, expr: &AstExpr, hints: &mut [FunctionHints]) {
+    for node in expr_nodes(expr) {
+        match node {
+            ExprNode::Expr(AstExpr::Var(AstNameRef::SyntheticLocal(local))) => {
+                record_synthetic_local(function, *local, hints);
+            }
+            ExprNode::Function(func) => collect_function_expr_hints(func, hints),
+            _ => {}
         }
-    );
-    Ok(())
+    }
 }
 
 fn register_binding_expr_hint(

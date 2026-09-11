@@ -155,7 +155,6 @@ pub(super) fn claim_selected_region_values(
     owner_index: &RegionOwnerIndex,
     dispositions: &mut [Vec<Option<PhiIncomingDisposition>>],
 ) -> Result<(), StructureError> {
-    let mut loop_incomings = LoopIncomingClassifier::new(dataflow)?;
     for (region_id, region) in plan.regions() {
         match region {
             RegionPlan::Branch {
@@ -201,25 +200,11 @@ pub(super) fn claim_selected_region_values(
                     )?;
                 }
                 for value in &loop_plan.header_values {
-                    claim_loop_header_value(
-                        dataflow,
-                        owner_index,
-                        dispositions,
-                        region_id,
-                        value,
-                        &mut loop_incomings,
-                    )?;
+                    claim_loop_header_value(dataflow, owner_index, dispositions, region_id, value)?;
                 }
                 for exit in &loop_plan.exit_values {
                     for value in &exit.values {
-                        claim_loop_result(
-                            dataflow,
-                            owner_index,
-                            dispositions,
-                            region_id,
-                            value,
-                            &mut loop_incomings,
-                        )?;
+                        claim_loop_result(dataflow, owner_index, dispositions, region_id, value)?;
                     }
                 }
             }
@@ -318,10 +303,9 @@ pub(super) fn claim_loop_header_value(
     dispositions: &mut [Vec<Option<PhiIncomingDisposition>>],
     region: RegionId,
     value: &LoopValueMerge,
-    classifier: &mut LoopIncomingClassifier,
 ) -> Result<(), StructureError> {
     let phi = require_phi(dataflow, value.phi_id)?;
-    let classes = classifier.classify(phi, &value.inside_arm, &value.outside_arm)?;
+    let classes = classify_loop_incomings(phi, &value.inside_arm, &value.outside_arm)?;
     for (incoming_index, class) in classes.into_iter().enumerate() {
         if class == (LOOP_INSIDE | LOOP_OUTSIDE) {
             return Err(StructureError::invalid(format!(
@@ -353,10 +337,9 @@ pub(super) fn claim_loop_result(
     dispositions: &mut [Vec<Option<PhiIncomingDisposition>>],
     region: RegionId,
     value: &LoopValueMerge,
-    classifier: &mut LoopIncomingClassifier,
 ) -> Result<(), StructureError> {
     let phi = require_phi(dataflow, value.phi_id)?;
-    let classes = classifier.classify(phi, &value.inside_arm, &value.outside_arm)?;
+    let classes = classify_loop_incomings(phi, &value.inside_arm, &value.outside_arm)?;
     for (incoming_index, class) in classes.into_iter().enumerate() {
         if class == (LOOP_INSIDE | LOOP_OUTSIDE) {
             return Err(StructureError::invalid(format!(

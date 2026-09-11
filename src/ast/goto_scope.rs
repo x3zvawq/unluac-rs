@@ -7,7 +7,8 @@
 
 use std::collections::BTreeMap;
 
-use super::traverse::{traverse_call_children, traverse_expr_children, traverse_lvalue_children};
+use super::traverse::{traverse_call_children, traverse_lvalue_children};
+use super::visit::{ExprNode, expr_nodes};
 use super::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstLabelId,
     AstLocalAttr, AstModule, AstStmt,
@@ -220,17 +221,11 @@ impl FunctionVerifier {
     }
 
     fn visit_expr(&self, expr: &AstExpr) -> Result<(), AstLowerError> {
-        traverse_expr_children!(
-            expr,
-            iter = iter,
-            borrow = [&],
-            expr(child) => {
-                self.visit_expr(child)?;
-            },
-            function(function) => {
+        for node in expr_nodes(expr) {
+            if let ExprNode::Function(function) = node {
                 self.visit_function(function)?;
             }
-        );
+        }
         Ok(())
     }
 

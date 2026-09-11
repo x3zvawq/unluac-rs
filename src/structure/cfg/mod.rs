@@ -14,7 +14,6 @@ use crate::structure::StructureError;
 
 pub use build::build_cfg_graph;
 pub(crate) use build::build_cfg_proto;
-pub(crate) use common::SccId;
 pub use common::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
@@ -22,6 +21,7 @@ pub use common::{
     OpenDefId, OpenUseSources, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
     ReachableSuccessorShape, RootObservation, SideEffectSummary, SsaRegMap, SsaValue, UseSite,
 };
+pub(crate) use common::{PhiIncomingSlot, SccId};
 pub(crate) use dataflow::analyze_dataflow;
 pub use dataflow::compute_dataflow_facts;
 #[cfg(feature = "decompile-debug")]

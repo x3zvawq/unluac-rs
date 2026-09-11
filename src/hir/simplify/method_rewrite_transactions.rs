@@ -9,15 +9,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirMethodRewriteTransactionId, HirProto,
-    HirStmt, LocalId,
+    HirAssign, HirBlock, HirCallExpr, HirCaptureMode, HirExpr, HirLValue,
+    HirMethodRewriteTransactionId, HirProto, HirStmt, LocalId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::mention::{
-    stmts_mention_local, stmts_protected_locals, stmts_reference_captured_bindings,
-    stmts_tbc_protected_home_slots, stmts_value_captured_bindings, stmts_write_local,
-    visit_local_writes,
+    CaptureCollector, ProtectedLocalCollector, ToBeClosedHomeCollector, stmts_mention_local,
+    stmts_write_local, visit_local_writes,
 };
 
 #[derive(Clone, Copy)]
@@ -39,15 +38,30 @@ pub(super) fn finalize_method_rewrite_transactions(
 ) {
     clear_transactions(&mut proto.body);
 
-    let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
-    let value_captured = stmts_value_captured_bindings(&proto.body.stmts);
-    let protected = stmts_protected_locals(&proto.body.stmts);
+    let mut identities = (
+        (
+            CaptureCollector::new(HirCaptureMode::ByReference),
+            CaptureCollector::new(HirCaptureMode::ByValue),
+        ),
+        (
+            ProtectedLocalCollector::default(),
+            ToBeClosedHomeCollector {
+                facts,
+                homes: BTreeSet::new(),
+            },
+        ),
+    );
+    crate::hir::visit::visit_stmts(&proto.body.stmts, &mut identities);
+    let ((reference, value), (protected, closed)) = identities;
+    let reference_captured = reference.bindings;
+    let value_captured = value.bindings;
+    let protected = protected.locals;
     let mut barred_homes = reference_captured.complete_home_slots(facts);
     barred_homes.extend(value_captured.complete_home_slots(facts));
     for local in &protected {
         barred_homes.extend(facts.complete_local_home_slots(*local).iter().copied());
     }
-    barred_homes.extend(stmts_tbc_protected_home_slots(&proto.body.stmts, facts));
+    barred_homes.extend(closed.homes);
     let mut candidates = Vec::new();
     collect_candidates(
         &proto.body,
@@ -375,7 +389,7 @@ impl WatchedHomeWriteCollector<'_> {
     }
 }
 
-impl crate::hir::visit::HirVisitor for WatchedHomeWriteCollector<'_> {
+impl crate::hir::visit::HirVisitor<'_> for WatchedHomeWriteCollector<'_> {
     fn visit_local_root_release(&mut self, _local: crate::hir::common::LocalId) {}
 
     fn visit_stmt(&mut self, stmt: &HirStmt) {

@@ -11,8 +11,8 @@ use super::NamingError;
 use super::common::NamingEvidence;
 use capture::build_capture_evidence;
 
-/// 从当前 HIR 收集捕获来源；与该 HIR 一起交给命名分配。
-pub fn collect_naming_evidence(hir: &HirModule) -> Result<NamingEvidence, NamingError> {
+/// 从当前 HIR 借用捕获来源；与该只读 HIR 一起交给命名分配。
+pub fn collect_naming_evidence(hir: &HirModule) -> Result<NamingEvidence<'_>, NamingError> {
     Ok(NamingEvidence {
         functions: build_capture_evidence(hir)?,
     })

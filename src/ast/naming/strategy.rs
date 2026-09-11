@@ -105,16 +105,21 @@ pub(super) fn choose_local_candidate(
 pub(super) fn choose_upvalue_candidate(
     proto: &HirProto,
     index: usize,
-    capture_evidence: Option<&ClosureCaptureEvidence>,
+    capture_evidence: Option<&ClosureCaptureEvidence<'_>>,
     options: NamingOptions,
     assigned_functions: &[FunctionNameMap],
 ) -> Result<CandidateHint, NamingError> {
     if let Some(evidence) = capture_evidence
-        && let Some(&binding) = evidence.captures.get(index)
+        && let Some(capture) = evidence.captures.get(index)
     {
         // upvalue 不是一个“重新发明名字”的槽位：只要我们知道它捕获自哪个父绑定，
         // 就应该沿用那个绑定在父作用域里已经稳定下来的名字。
-        return resolve_captured_name(proto.id, evidence.parent, binding, assigned_functions);
+        return resolve_captured_name(
+            proto.id,
+            evidence.parent,
+            capture.binding,
+            assigned_functions,
+        );
     }
     if let Some(name) = proto.upvalue_debug_hints.get(index).and_then(as_valid_name) {
         return Ok(CandidateHint {

@@ -6,14 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use super::common::{
-    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,
-};
+use super::common::{AstBindingRef, AstBlock, AstExpr, AstFunctionExpr, AstModule, AstStmt};
 use super::error::AstLowerError;
-use crate::ast::traverse::{
-    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
-    traverse_stmt_children,
-};
+use super::traverse::BlockKind;
+use super::visit::{self, AstVisitor};
 
 pub(super) fn verify_forward_local_captures(module: &AstModule) -> Result<(), AstLowerError> {
     verify_block(module.entry_function.index(), &module.body)
@@ -37,7 +33,12 @@ fn verify_block(function: usize, block: &AstBlock) -> Result<(), AstLowerError> 
 
     for (index, stmt) in block.stmts.iter().enumerate() {
         verify_direct_local_closure(function, index, stmt, &declarations)?;
-        verify_stmt_children(function, stmt)?;
+        let mut children = ChildScopes {
+            function,
+            result: Ok(()),
+        };
+        visit::visit_stmt(stmt, &mut children);
+        children.result?;
     }
     Ok(())
 }
@@ -79,47 +80,24 @@ fn verify_direct_local_closure(
     Ok(())
 }
 
-fn verify_stmt_children(function: usize, stmt: &AstStmt) -> Result<(), AstLowerError> {
-    traverse_stmt_children!(
-        stmt,
-        iter = iter,
-        opt = as_ref,
-        borrow = [&],
-        expr(expr) => { verify_expr(expr)?; },
-        lvalue(lvalue) => { verify_lvalue(lvalue)?; },
-        block(block) => { verify_block(function, block)?; },
-        function(child) => { verify_function(child)?; },
-        condition(condition) => { verify_expr(condition)?; },
-        call(call) => { verify_call(call)?; }
-    );
-    Ok(())
+/// 当前 block 的声明表只用于直属语句；子函数切换身份后建立自己的声明域。
+struct ChildScopes {
+    function: usize,
+    result: Result<(), AstLowerError>,
 }
 
-fn verify_expr(expr: &AstExpr) -> Result<(), AstLowerError> {
-    traverse_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(child) => { verify_expr(child)?; },
-        function(child) => { verify_function(child)?; }
-    );
-    Ok(())
-}
+impl AstVisitor for ChildScopes {
+    fn visit_block(&mut self, block: &AstBlock, _kind: BlockKind) -> bool {
+        if self.result.is_ok() {
+            self.result = verify_block(self.function, block);
+        }
+        false
+    }
 
-fn verify_lvalue(lvalue: &AstLValue) -> Result<(), AstLowerError> {
-    traverse_lvalue_children!(lvalue, borrow = [&], expr(expr) => {
-        verify_expr(expr)?;
-    });
-    Ok(())
-}
-
-fn verify_call(call: &AstCallKind) -> Result<(), AstLowerError> {
-    traverse_call_children!(call, iter = iter, borrow = [&], expr(expr) => {
-        verify_expr(expr)?;
-    });
-    Ok(())
-}
-
-fn verify_function(function: &AstFunctionExpr) -> Result<(), AstLowerError> {
-    verify_block(function.function.index(), &function.body)
+    fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
+        if self.result.is_ok() {
+            self.result = verify_block(function.function.index(), &function.body);
+        }
+        false
+    }
 }

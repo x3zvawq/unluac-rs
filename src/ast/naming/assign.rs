@@ -51,19 +51,19 @@ pub fn assign_name_map(
 /// Naming 核心入口。
 ///
 /// `evidence` 必须对应当前 HIR 的捕获身份；debug 提示直接消费传入的 HIR。
-/// lexical context、AST facts、readability 验证和 hints 同样依赖该 HIR。
+/// 入口验证同一只读 AST/HIR 的函数引用；事实收集器消费此边界，不重复验证身份。
 pub fn assign_names_with_evidence(
     module: &AstModule,
     hir: &HirModule,
-    evidence: &NamingEvidence,
+    evidence: &NamingEvidence<'_>,
     options: NamingOptions,
 ) -> Result<NameMap, NamingError> {
-    validate_readability_ast(module, module.entry_function, hir)?;
+    validate_readability_ast(module, hir)?;
     let ast_facts = collect_ast_naming_facts(module, hir);
-    let lexical_contexts = collect_lexical_contexts(module, hir)?;
+    let lexical_contexts = collect_lexical_contexts(module, hir);
 
     let mut hints = vec![FunctionHints::default(); hir.protos.len()];
-    collect_function_hints(module, hir, &mut hints)?;
+    collect_function_hints(module, &mut hints);
 
     let mut visible_names = VisibleNames::default();
     let mut module_names = ModuleNameAllocator::default();

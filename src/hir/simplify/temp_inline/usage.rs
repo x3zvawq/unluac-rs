@@ -66,7 +66,7 @@ impl TempUseScratch {
             temp_debug_hints[index] = hint.is_some();
         }
         struct Definitions(Vec<usize>);
-        impl HirVisitor for Definitions {
+        impl HirVisitor<'_> for Definitions {
             fn visit_lvalue(&mut self, target: &HirLValue) {
                 if let HirLValue::Temp(temp) = target {
                     self.0[temp.index()] += 1;
@@ -129,7 +129,7 @@ impl TempUseScratch {
     }
 }
 
-impl HirVisitor for TempUseScratch {
+impl HirVisitor<'_> for TempUseScratch {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::TempRef(temp) = expr {
             self.note_temp(*temp);

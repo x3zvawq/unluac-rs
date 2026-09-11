@@ -51,10 +51,7 @@ use std::{
 
 use super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::lexical_cfg::LexicalCfg;
-use super::mention::{
-    stmt_writes_temp, stmts_reference_captured_bindings, stmts_to_be_closed_temps,
-    stmts_value_captured_bindings,
-};
+use super::mention::{CaptureCollector, ToBeClosedTempCollector, stmt_writes_temp};
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
     CallRootLifetimeIndices, RootEventBlock, RootEventIndex, RootEventStmt, RootLifetimeFacts,
@@ -64,8 +61,8 @@ use super::root_lifetimes::{
 };
 use super::temp_touch::{collect_temp_refs_in_expr, expr_touches_any_temp};
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirInitializerMergeTransactionId, HirLValue, HirLocalDecl,
-    HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, TempId,
+    HirAssign, HirBlock, HirCaptureMode, HirExpr, HirInitializerMergeTransactionId, HirLValue,
+    HirLocalDecl, HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -86,10 +83,19 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut promoted_bindings = Vec::new();
     let mut direct_seed_promotions = Vec::new();
     let mut debug_scope_locals = BTreeMap::new();
-    let reference_captured_temps = stmts_reference_captured_bindings(&proto.body.stmts).temps;
+    let mut identities = (
+        CaptureCollector::new(HirCaptureMode::ByReference),
+        (
+            CaptureCollector::new(HirCaptureMode::ByValue),
+            ToBeClosedTempCollector::default(),
+        ),
+    );
+    crate::hir::visit::visit_stmts(&proto.body.stmts, &mut identities);
+    let (reference, (value, closed)) = identities;
+    let reference_captured_temps = reference.bindings.temps;
     let mut identity_sensitive_temps = reference_captured_temps.clone();
-    identity_sensitive_temps.extend(stmts_value_captured_bindings(&proto.body.stmts).temps);
-    let to_be_closed_temps = stmts_to_be_closed_temps(&proto.body.stmts);
+    identity_sensitive_temps.extend(value.bindings.temps);
+    let to_be_closed_temps = closed.temps;
     let label_refs = count_label_references(&proto.body.stmts);
     identity_sensitive_temps.extend(to_be_closed_temps.iter().copied());
     let mut cell_sensitive_temps = reference_captured_temps;

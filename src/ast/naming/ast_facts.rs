@@ -13,9 +13,9 @@ use std::{
 };
 
 use crate::ast::traverse::{
-    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
-    traverse_stmt_children,
+    traverse_call_children, traverse_lvalue_children, traverse_stmt_children,
 };
+use crate::ast::visit::{ExprNode, expr_nodes};
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName,
     AstGlobalBindingTarget, AstLValue, AstModule, AstNameRef, AstStmt, AstSyntheticLocalId,
@@ -135,9 +135,7 @@ fn note_named_vararg_binding(
     hir: &HirModule,
     collector: &mut FunctionAstCollector<'_>,
 ) {
-    let Some(proto) = hir.protos.get(function.index()) else {
-        return;
-    };
+    let proto = &hir.protos[function.index()];
     if let Some(local) = proto.vararg_param_local {
         collector.note_binding(AstBindingRef::Local(local));
     }
@@ -267,18 +265,11 @@ fn collect_expr_facts<'ast>(
     hir: &HirModule,
     facts: &mut AstNamingFacts<'ast>,
 ) {
-    if let AstExpr::Var(name) = expr {
-        collector.note_name_ref(name);
-    }
-    traverse_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(child) => {
-            collect_expr_facts(child, collector, hir, facts);
-        },
-        function(func) => {
-            collect_nested_function_facts(func, hir, facts);
+    for node in expr_nodes(expr) {
+        match node {
+            ExprNode::Expr(AstExpr::Var(name)) => collector.note_name_ref(name),
+            ExprNode::Function(func) => collect_nested_function_facts(func, hir, facts),
+            _ => {}
         }
-    );
+    }
 }

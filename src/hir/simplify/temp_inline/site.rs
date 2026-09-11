@@ -100,7 +100,7 @@ fn stmt_reads_temp(stmt: &HirStmt, temp: TempId) -> bool {
         found: bool,
     }
 
-    impl HirVisitor for TempReadProbe {
+    impl HirVisitor<'_> for TempReadProbe {
         fn visit_expr(&mut self, expr: &HirExpr) {
             self.found |= matches!(expr, HirExpr::TempRef(temp) if *temp == self.temp);
         }
@@ -174,7 +174,7 @@ struct MethodReceiverTempProbe {
     found: bool,
 }
 
-impl HirVisitor for MethodReceiverTempProbe {
+impl HirVisitor<'_> for MethodReceiverTempProbe {
     fn visit_call(&mut self, call: &HirCallExpr) {
         self.found |= call.method_receiver().is_some_and(
             |(receiver, _)| matches!(receiver, HirExpr::TempRef(temp) if *temp == self.temp),

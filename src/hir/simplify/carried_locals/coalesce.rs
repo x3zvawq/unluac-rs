@@ -92,20 +92,9 @@ pub(super) fn coalesce_disjoint_temps(
         .iter()
         .map(|node| {
             let mut event = TempEvent::default();
-            match node.kind() {
-                HirFlowNodeKind::Stmt(stmt) => visit::visit_stmt_header(stmt, &mut event),
-                HirFlowNodeKind::GenericForInit(flow) => {
-                    visit::visit_stmt_header(flow.stmt(), &mut event)
-                }
-                HirFlowNodeKind::RepeatCondition(repeat) => {
-                    visit::visit_expr(&repeat.cond, &mut event)
-                }
-                HirFlowNodeKind::UnknownControl => event.reads.extend(homes.keys().copied()),
-                HirFlowNodeKind::Exit
-                | HirFlowNodeKind::FunctionExit
-                | HirFlowNodeKind::NumericForDispatch
-                | HirFlowNodeKind::GenericForDispatch(_)
-                | HirFlowNodeKind::ForBinding(_) => {}
+            node.kind().visit_evaluation(&mut event);
+            if matches!(node.kind(), HirFlowNodeKind::UnknownControl) {
+                event.reads.extend(homes.keys().copied());
             }
             event.reads.retain(|temp| homes.contains_key(temp));
             event.writes.retain(|temp| homes.contains_key(temp));
@@ -171,7 +160,7 @@ impl ProtocolHomes<'_> {
     }
 }
 
-impl HirVisitor for ProtocolHomes<'_> {
+impl HirVisitor<'_> for ProtocolHomes<'_> {
     fn visit_call(&mut self, call: &HirCallExpr) {
         for root in &call.argument_roots {
             self.protect(root.producer);
@@ -205,7 +194,7 @@ struct TempEvent {
     writes: BTreeSet<TempId>,
 }
 
-impl HirVisitor for TempEvent {
+impl HirVisitor<'_> for TempEvent {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::TempRef(temp) = expr {
             self.reads.insert(*temp);

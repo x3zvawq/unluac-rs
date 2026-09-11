@@ -1265,7 +1265,7 @@ impl TableConstructorPass<'_> {
             found: bool,
         }
 
-        impl HirVisitor for Probe<'_> {
+        impl HirVisitor<'_> for Probe<'_> {
             fn visit_expr(&mut self, expr: &HirExpr) {
                 self.found |= match expr {
                     HirExpr::LocalRef(local) => {
@@ -1389,7 +1389,7 @@ impl TableConstructorPass<'_> {
             found: bool,
         }
 
-        impl HirVisitor for Probe<'_, '_> {
+        impl HirVisitor<'_> for Probe<'_, '_> {
             fn visit_expr(&mut self, expr: &HirExpr) {
                 self.found |= self.pass.expr_may_carry_seed(
                     expr,
@@ -1445,7 +1445,7 @@ impl TableConstructorPass<'_> {
             discovered: BTreeSet<TableBinding>,
         }
 
-        impl HirVisitor for CarrierPropagation<'_, '_> {
+        impl HirVisitor<'_> for CarrierPropagation<'_, '_> {
             fn visit_stmt(&mut self, stmt: &HirStmt) {
                 let (targets, values) = match stmt {
                     HirStmt::LocalDecl(decl) => (
@@ -1507,7 +1507,7 @@ impl TableConstructorPass<'_> {
             unsafe_use: bool,
         }
 
-        impl HirVisitor for HazardProbe<'_, '_> {
+        impl HirVisitor<'_> for HazardProbe<'_, '_> {
             fn visit_stmt(&mut self, stmt: &HirStmt) {
                 self.unsafe_use |= match stmt {
                     HirStmt::LocalDecl(decl) => matches!(
@@ -1961,7 +1961,7 @@ fn collect_range_binding_mentions(
         bindings: BTreeSet<TableBinding>,
     }
 
-    impl HirVisitor for Probe {
+    impl HirVisitor<'_> for Probe {
         fn visit_stmt(&mut self, stmt: &HirStmt) {
             match stmt {
                 HirStmt::NumericFor(numeric_for) => {

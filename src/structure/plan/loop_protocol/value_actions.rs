@@ -293,18 +293,21 @@ pub(super) fn freeze_exit_copy_actions(
             .phi_candidate(target)
             .ok_or_else(|| StructureError::invalid("for exit action targets a missing phi"))?
             .reg;
-        if let Some(header) = payload.header_values.iter().find(|value| value.reg == reg) {
+        if let Some(header) = payload.header_value_for_reg(reg) {
+            let phi = dataflow.phi_candidate(header.phi_id).ok_or_else(|| {
+                StructureError::invalid("for exit action references a missing loop header phi")
+            })?;
             let zero_matches = zero_value.as_ref().is_none_or(|(value, _)| {
                 header
                     .outside_arm
-                    .values()
+                    .values(phi)
                     .any(|incoming| incoming == *value)
             });
             let normal_matches = normal_value.as_ref().is_none_or(|(value, _)| {
                 *value == SsaValue::Phi(header.phi_id)
                     || header
                         .inside_arm
-                        .values()
+                        .values(phi)
                         .any(|incoming| incoming == *value)
             });
             if !zero_matches || !normal_matches {

@@ -174,7 +174,7 @@ struct PendingTbcBoundaryCollector<'a> {
     labels: &'a mut BTreeSet<HirLabelId>,
 }
 
-impl HirVisitor for PendingTbcBoundaryCollector<'_> {
+impl HirVisitor<'_> for PendingTbcBoundaryCollector<'_> {
     fn visit_block(&mut self, block: &HirBlock) {
         collect_direct_pending_tbc_boundary_labels(&block.stmts, self.labels);
     }
@@ -755,7 +755,7 @@ struct BindingActivityCollector {
     owner: usize,
 }
 
-impl HirVisitor for BindingActivityCollector {
+impl HirVisitor<'_> for BindingActivityCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         let locals: &[LocalId] = match stmt {
             HirStmt::LocalRootRelease(_) => &[],

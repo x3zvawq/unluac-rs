@@ -8,6 +8,7 @@
 //! merge 前的来源事实；它不会越权决定最终是 `a and b or c`、`if + assign` 还是
 //! generic phi 物化。
 //! 递归 phi 身份由 canonical Dataflow 图事实提供，此处不重新计算分量。
+//! 值叶按真实出边读取同一 SSA incoming 索引，不按前驱块反复扫描整个 merge。
 //!
 //! 例子：
 //! - `local x = a and b or c` 会产出一个 `merge=#... result_reg=x` 的 value-merge 候选
@@ -146,7 +147,6 @@ struct ValueMergeDagBuilder<'a, 'w> {
     value_leaves: BTreeSet<BlockRef>,
     value_leaf_predecessors: BTreeSet<BlockRef>,
     phi_predecessors: BTreeSet<BlockRef>,
-    decision_incoming_indices: Vec<usize>,
     value_leaf_values: BTreeMap<BlockRef, Option<SsaValue>>,
 }
 
@@ -157,9 +157,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         phi: &'a PhiCandidate,
         node_refs: &'w mut DenseNodeRefs,
     ) -> Option<Self> {
-        if phi.incoming.iter().any(|incoming| incoming.pred.is_none()) {
-            return None;
-        }
+        // root 已由 value_merge_root 选为 merge 的严格支配父分支，并排除了 Entry 输入。
         if ctx.dataflow.phi_graph.is_recursive(phi.id)
             && !phi
                 .incoming
@@ -168,20 +166,15 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         {
             return None;
         }
-        let decision_incoming_indices = phi
+        let decision_incomings = phi
             .incoming
             .iter()
-            .enumerate()
-            .filter_map(|(index, incoming)| {
-                (incoming.value != SsaValue::Phi(phi.id)).then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if decision_incoming_indices.len() < 2 {
+            .filter(|incoming| incoming.value != SsaValue::Phi(phi.id));
+        if decision_incomings.clone().count() < 2 {
             return None;
         }
-        let phi_predecessors = decision_incoming_indices
-            .iter()
-            .filter_map(|index| phi.incoming[*index].pred)
+        let phi_predecessors = decision_incomings
+            .filter_map(|incoming| incoming.pred)
             .collect();
         let node_epoch = node_refs.begin();
 
@@ -203,18 +196,10 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
             value_leaf_predecessors: BTreeSet::new(),
             phi_predecessors,
             value_leaf_values: BTreeMap::new(),
-            decision_incoming_indices,
         })
     }
 
     fn build(mut self) -> Option<ShortCircuitCandidate> {
-        if !self.branch_by_header.contains_key(&self.root)
-            || self.phi.block == self.root
-            || !self.dom_tree.dominates(self.root, self.phi.block)
-        {
-            return None;
-        }
-
         let entry = self.build_nodes()?;
         if entry != ShortCircuitNodeRef(0) {
             return None;
@@ -324,9 +309,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         target: BlockRef,
     ) -> Option<ResolvedValueTarget> {
         if target == self.phi.block {
-            let incoming = self
-                .decision_incomings()
-                .find(|incoming| incoming.pred == Some(from_header))?;
+            let incoming = self.decision_incoming_from(from_header)?;
             if matches!(incoming.value, crate::structure::SsaValue::Entry(_)) {
                 return None;
             }
@@ -385,9 +368,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
         loop {
             let successor = self.cfg.unique_reachable_successor(current)?;
             if successor == self.phi.block {
-                let incoming = self
-                    .decision_incomings()
-                    .find(|incoming| incoming.pred == Some(current))?;
+                let incoming = self.decision_incoming_from(current)?;
                 return self
                     .dataflow
                     .value_contains(incoming.value, leaf_value)
@@ -449,9 +430,18 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
     }
 
     fn decision_incomings(&self) -> impl Iterator<Item = &crate::structure::PhiIncoming> {
-        self.decision_incoming_indices
+        self.phi
+            .incoming
             .iter()
-            .map(|index| &self.phi.incoming[*index])
+            .filter(|incoming| incoming.value != SsaValue::Phi(self.phi.id))
+    }
+
+    fn decision_incoming_from(&self, pred: BlockRef) -> Option<&crate::structure::PhiIncoming> {
+        // CFG 两侧邻接表保留同一 edge 追加顺序；平行边仍选 phi 中首个非 self 输入。
+        self.cfg.succs[pred.index()]
+            .iter()
+            .filter_map(|&edge| self.dataflow.phi_incoming_for_edge(self.phi.id, edge))
+            .find(|incoming| incoming.value != SsaValue::Phi(self.phi.id))
     }
 }
 

@@ -11,8 +11,8 @@
 //!
 //! 例子：
 //! - branch merge 会把 `phi.incoming` 直接整理成 `then_arm / else_arm` 两臂 SSA 值集
-//! - loop header/exit merge 会整理成 `inside_arm / outside_arm` 或按 predecessor
-//!   分组的 incoming facts；最终 plan 再把每个 incoming 唯一归到 region input/result、
+//! - loop header/exit merge 按循环成员关系把 canonical 输入槽位分入两臂；
+//!   最终 plan 再把每个 incoming 唯一归到 region input/result、
 //!   loop-carried、edge copy、dead 或显式 unresolved
 //! - short-circuit value merge 会提前带出 `entry_value / value_incomings`，避免 HIR
 //!   再回头拆 phi
@@ -20,13 +20,14 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::structure::{
-    BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts, PhiCandidate, PhiId, SsaValue,
+    BlockRef, Cfg, DataflowFacts, EdgeRef, GraphFacts, PhiCandidate, PhiId, PhiIncomingSlot,
+    SsaValue,
 };
 use crate::transformer::Reg;
 
 use super::common::{
-    BranchValueMergeArm, BranchValueMergeValue, LoopKindHint, LoopValueArm, LoopValueIncoming,
-    LoopValueMerge, PhiEdgeCopy, ShortCircuitValueIncoming, StructurePlan,
+    BranchValueMergeArm, BranchValueMergeValue, LoopKindHint, LoopValueArm, LoopValueMerge,
+    PhiEdgeCopy, ShortCircuitValueIncoming, StructurePlan,
 };
 use super::plan::{
     EdgeTransfer, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan, PlanRequirement, RegionId,
@@ -159,15 +160,14 @@ pub(super) fn branch_value_merges_in_block(
         .collect()
 }
 
-pub(super) fn loop_value_merge_from_phi(
-    _dataflow: &DataflowFacts,
+fn loop_value_merge_from_phi(
     phi: &PhiCandidate,
     loop_blocks: &BTreeSet<BlockRef>,
-) -> Option<LoopValueMerge> {
+) -> LoopValueMerge {
     let mut inside_arm = LoopValueArm::default();
     let mut outside_arm = LoopValueArm::default();
 
-    for incoming in &phi.incoming {
+    for (slot, incoming) in phi.incoming.iter().enumerate() {
         let arm = if incoming
             .pred
             .is_some_and(|pred| loop_blocks.contains(&pred))
@@ -176,18 +176,15 @@ pub(super) fn loop_value_merge_from_phi(
         } else {
             &mut outside_arm
         };
-        arm.incomings.push(LoopValueIncoming {
-            pred: incoming.pred,
-            value: incoming.value,
-        });
+        arm.incoming_slots.push(PhiIncomingSlot(slot));
     }
 
-    Some(LoopValueMerge {
+    LoopValueMerge {
         phi_id: phi.id,
         reg: phi.reg,
         inside_arm,
         outside_arm,
-    })
+    }
 }
 
 pub(super) fn loop_value_merges_in_block(
@@ -198,7 +195,7 @@ pub(super) fn loop_value_merges_in_block(
     dataflow
         .phi_candidates_in_block(block)
         .iter()
-        .filter_map(|phi| loop_value_merge_from_phi(dataflow, phi, loop_blocks))
+        .map(|phi| loop_value_merge_from_phi(phi, loop_blocks))
         .collect()
 }
 

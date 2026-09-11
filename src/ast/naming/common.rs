@@ -87,17 +87,17 @@ impl NameMap {
     }
 }
 
-/// 当前 HIR 模块的捕获来源快照；调试提示直接从同一 HIR 查询。
+/// 借用当前 HIR 模块的捕获来源；存活期间源 HIR 不可修改，调试提示仍查询同一模块。
 #[derive(Debug, Clone, Default)]
-pub struct NamingEvidence {
-    pub(super) functions: Vec<Option<ClosureCaptureEvidence>>,
+pub struct NamingEvidence<'hir> {
+    pub(super) functions: Vec<Option<ClosureCaptureEvidence<'hir>>>,
 }
 
-/// 单次 closure 观察得到的 capture 证据。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ClosureCaptureEvidence {
+/// 单次 closure 的父级来源；借用完整 capture，但命名一致性只比较有序 binding，不比较 mode。
+#[derive(Debug, Clone)]
+pub(super) struct ClosureCaptureEvidence<'hir> {
     pub(super) parent: HirProtoRef,
-    pub(super) captures: Vec<crate::hir::HirBinding>,
+    pub(super) captures: &'hir [crate::hir::HirCapture],
 }
 
 /// 从 AST 结构收集到的 naming hint。

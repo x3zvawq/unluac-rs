@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
+    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{CopyRootOverwrite, HomeSlotKey, ProtoPromotionFacts};
@@ -38,9 +38,9 @@ use crate::hir::promotion::{CopyRootOverwrite, HomeSlotKey, ProtoPromotionFacts}
 use super::lexical_cfg::{
     LexicalBlockKind, LexicalBlockPath, LexicalCfgFailure, OwnerReentryFacts,
 };
-use super::mention::{stmts_protected_locals, stmts_reference_captured_bindings};
+use super::mention::{CaptureCollector, ProtectedLocalCollector};
 use super::root_lifetimes::stmt_may_observe_gc_roots;
-use super::temp_touch::collect_temp_reads_in_proto;
+use super::temp_touch::TempReadCollector;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::visit::{self, HirVisitor};
 
@@ -49,7 +49,21 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
     promotion_facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> bool {
-    let live_reads = collect_temp_reads_in_proto(proto);
+    let mut inputs = (
+        (
+            TempReadCollector::default(),
+            CaptureCollector::new(HirCaptureMode::ByReference),
+        ),
+        (
+            ProtectedLocalCollector::default(),
+            VisibleHomeWrites::new(promotion_facts),
+        ),
+    );
+    visit::visit_stmts(&proto.body.stmts, &mut inputs);
+    let ((reads, reference), (protected, home_writes)) = inputs;
+    let live_reads = reads.temps;
+    let reference_captured = reference.bindings;
+    let protected_locals = protected.locals;
     let parameters_by_home = proto
         .params
         .iter()
@@ -83,10 +97,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
             .map(TempId)
             .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve()),
     );
-    let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
     let reference_captured_homes = reference_captured.complete_home_slots(promotion_facts);
-    let protected_locals = stmts_protected_locals(&proto.body.stmts);
-    let home_writes = VisibleHomeWrites::collect(proto, promotion_facts);
     // 参数覆盖在本 pass 入口可能仍是写同 home 的 Local/Temp，不能只扫描已经语法化成
     // HirLValue::Param 的目标；缺可信 home 的直接 binding 写也不能用于稳定性正证明。
     let overwritten_visible_params = proto
@@ -806,7 +817,7 @@ struct LastLocalReadCollector<'a> {
     reads: &'a mut BTreeMap<LocalId, usize>,
 }
 
-impl HirVisitor for LastLocalReadCollector<'_> {
+impl HirVisitor<'_> for LastLocalReadCollector<'_> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         if let HirExpr::LocalRef(local) = expr {
             self.reads.insert(*local, self.index);
@@ -951,15 +962,13 @@ struct VisibleHomeWrites<'a> {
 }
 
 impl<'a> VisibleHomeWrites<'a> {
-    fn collect(proto: &HirProto, facts: &'a ProtoPromotionFacts) -> Self {
-        let mut writes = Self {
+    fn new(facts: &'a ProtoPromotionFacts) -> Self {
+        Self {
             facts,
             homes: BTreeSet::new(),
             released_locals: BTreeSet::new(),
             unknown_home_write: false,
-        };
-        visit::visit_stmts(&proto.body.stmts, &mut writes);
-        writes
+        }
     }
 
     fn may_write(&self, binding: VisibleBinding) -> bool {
@@ -976,7 +985,7 @@ impl<'a> VisibleHomeWrites<'a> {
     }
 }
 
-impl HirVisitor for VisibleHomeWrites<'_> {
+impl HirVisitor<'_> for VisibleHomeWrites<'_> {
     fn visit_local_root_release(&mut self, local: LocalId) {
         self.released_locals.insert(local);
     }

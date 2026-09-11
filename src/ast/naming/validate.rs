@@ -4,9 +4,9 @@
 //! 一旦检测到 temp 泄漏或函数引用缺失，就直接报结构错误，而不是让 Naming 继续兜底。
 
 use crate::ast::traverse::{
-    traverse_call_children, traverse_expr_children, traverse_lvalue_children,
-    traverse_stmt_children,
+    traverse_call_children, traverse_lvalue_children, traverse_stmt_children,
 };
+use crate::ast::visit::{ExprNode, expr_nodes};
 use crate::ast::{
     AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue,
     AstModule, AstNameRef, AstStmt,
@@ -16,10 +16,7 @@ use crate::hir::{HirModule, HirProtoRef};
 use super::NamingError;
 
 /// 确保函数 proto 存在。
-pub(super) fn ensure_function_exists(
-    hir: &HirModule,
-    function: HirProtoRef,
-) -> Result<(), NamingError> {
+fn ensure_function_exists(hir: &HirModule, function: HirProtoRef) -> Result<(), NamingError> {
     if hir.protos.get(function.index()).is_some() {
         Ok(())
     } else {
@@ -32,9 +29,9 @@ pub(super) fn ensure_function_exists(
 /// 校验 Readability 输出可以安全进入 Naming。
 pub(super) fn validate_readability_ast(
     module: &AstModule,
-    function: HirProtoRef,
     hir: &HirModule,
 ) -> Result<(), NamingError> {
+    let function = module.entry_function;
     ensure_function_exists(hir, function)?;
     validate_block_has_no_temps(&module.body, function, hir)
 }
@@ -184,22 +181,17 @@ fn validate_expr_has_no_temps(
     function: HirProtoRef,
     hir: &HirModule,
 ) -> Result<(), NamingError> {
-    if let AstExpr::Var(AstNameRef::Temp(temp)) = expr {
-        return Err(NamingError::UnexpectedTemp {
-            function: function.index(),
-            temp: temp.index(),
-        });
-    }
-    traverse_expr_children!(
-        expr,
-        iter = iter,
-        borrow = [&],
-        expr(child) => {
-            validate_expr_has_no_temps(child, function, hir)?;
-        },
-        function(func) => {
-            validate_function_expr_has_no_temps(func, function, hir)?;
+    for node in expr_nodes(expr) {
+        match node {
+            ExprNode::Expr(AstExpr::Var(AstNameRef::Temp(temp))) => {
+                return Err(NamingError::UnexpectedTemp {
+                    function: function.index(),
+                    temp: temp.index(),
+                });
+            }
+            ExprNode::Function(func) => validate_function_expr_has_no_temps(func, function, hir)?,
+            _ => {}
         }
-    );
+    }
     Ok(())
 }

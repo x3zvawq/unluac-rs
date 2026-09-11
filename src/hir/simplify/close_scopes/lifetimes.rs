@@ -183,7 +183,7 @@ fn paired_return_cleanups(stmts: &[HirStmt]) -> BTreeSet<usize> {
             }
         }
     }
-    impl HirVisitor for Collector {
+    impl HirVisitor<'_> for Collector {
         fn visit_block(&mut self, block: &HirBlock) {
             self.record(&block.stmts);
         }

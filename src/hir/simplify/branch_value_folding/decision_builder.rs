@@ -46,7 +46,7 @@ struct BindingRefCollector {
     refs: BindingRefs,
 }
 
-impl HirVisitor for BindingRefCollector {
+impl HirVisitor<'_> for BindingRefCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
             HirExpr::LocalRef(local) => {

@@ -398,7 +398,7 @@ struct PhysicalBindingWriteCollector {
     bindings: BTreeSet<CarryBinding>,
 }
 
-impl HirVisitor for PhysicalBindingWriteCollector {
+impl HirVisitor<'_> for PhysicalBindingWriteCollector {
     fn visit_local_root_release(&mut self, _local: LocalId) {}
 
     fn visit_stmt(&mut self, stmt: &HirStmt) {
@@ -460,7 +460,7 @@ struct BindingWriteCollector {
     counts: BTreeMap<CarryBinding, usize>,
 }
 
-impl HirVisitor for BindingWriteCollector {
+impl HirVisitor<'_> for BindingWriteCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         if let Some(binding) = carry_binding_from_lvalue(lvalue) {
             *self.counts.entry(binding).or_default() += 1;
@@ -601,7 +601,7 @@ struct UnresolvedCollector {
     found: bool,
 }
 
-impl HirVisitor for UnresolvedCollector {
+impl HirVisitor<'_> for UnresolvedCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.found |= matches!(expr, HirExpr::Unresolved(_));
     }

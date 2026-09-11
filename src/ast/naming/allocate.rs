@@ -64,7 +64,7 @@ impl ModuleNameAllocator {
 
 pub(super) struct FunctionAssignContext<'a> {
     pub proto: &'a HirProto,
-    pub capture_evidence: Option<&'a ClosureCaptureEvidence>,
+    pub capture_evidence: Option<&'a ClosureCaptureEvidence<'a>>,
     pub hints: &'a FunctionHints,
     pub ast_facts: &'a FunctionAstNamingFacts,
     pub module_ast_facts: &'a AstNamingFacts<'a>,

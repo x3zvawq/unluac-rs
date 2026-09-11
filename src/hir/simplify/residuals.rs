@@ -22,7 +22,7 @@ impl HirExitResiduals {
     }
 }
 
-impl HirVisitor for HirExitResiduals {
+impl HirVisitor<'_> for HirExitResiduals {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::Goto(_) | HirStmt::Label(_) => self.goto_label = true,

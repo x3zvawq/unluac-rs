@@ -280,7 +280,7 @@ struct WritebackTargetCollector {
     targets: BTreeSet<CarryBinding>,
 }
 
-impl HirVisitor for WritebackTargetCollector {
+impl HirVisitor<'_> for WritebackTargetCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         let HirStmt::Assign(assign) = stmt else {
             return;
@@ -701,7 +701,7 @@ pub(super) fn expr_has_hard_barrier(expr: &HirExpr) -> bool {
     collector.found
 }
 
-impl HirVisitor for UnresolvedExprCollector {
+impl HirVisitor<'_> for UnresolvedExprCollector {
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.found |= matches!(expr, HirExpr::Unresolved(_));
     }

@@ -8,12 +8,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::mention::{
-    collect_temp_use_counts, collect_temp_write_counts, stmts_protected_locals,
-    stmts_reference_captured_bindings, stmts_to_be_closed_temps, stmts_value_captured_bindings,
+    CaptureCollector, ProtectedLocalCollector, ToBeClosedTempCollector, collect_temp_use_counts,
+    collect_temp_write_counts,
 };
 use super::super::walk::for_each_nested_block_mut;
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
+    HirAssign, HirBlock, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use crate::hir::visit::{HirVisitor, visit_block};
@@ -26,14 +26,26 @@ pub(super) fn coalesce_repeat_terminal_snapshots(
     preserved_bindings: &BTreeSet<CarryBinding>,
 ) -> bool {
     let use_counts = collect_temp_use_counts(proto);
-    let reference_captured = stmts_reference_captured_bindings(&proto.body.stmts);
-    let value_captured = stmts_value_captured_bindings(&proto.body.stmts);
+    let mut identities = (
+        (
+            CaptureCollector::new(HirCaptureMode::ByReference),
+            CaptureCollector::new(HirCaptureMode::ByValue),
+        ),
+        (
+            ToBeClosedTempCollector::default(),
+            ProtectedLocalCollector::default(),
+        ),
+    );
+    crate::hir::visit::visit_stmts(&proto.body.stmts, &mut identities);
+    let ((reference, value), (closed, protected)) = identities;
+    let reference_captured = reference.bindings;
+    let value_captured = value.bindings;
     let mut captured_locals = reference_captured.locals;
     captured_locals.extend(value_captured.locals);
     let mut captured_temps = reference_captured.temps;
     captured_temps.extend(value_captured.temps);
-    let closed_temps = stmts_to_be_closed_temps(&proto.body.stmts);
-    let protected_locals = stmts_protected_locals(&proto.body.stmts);
+    let closed_temps = closed.temps;
+    let protected_locals = protected.locals;
     let write_counts = collect_temp_write_counts(proto);
     let facts = RepeatSnapshotFacts {
         use_counts: &use_counts,
@@ -238,7 +250,7 @@ fn repeat_body_declares_local(body: &HirBlock, local: LocalId) -> bool {
         found: bool,
     }
 
-    impl HirVisitor for LocalDeclarationFinder {
+    impl HirVisitor<'_> for LocalDeclarationFinder {
         fn visit_stmt(&mut self, stmt: &HirStmt) {
             self.found |=
                 matches!(stmt, HirStmt::LocalDecl(decl) if decl.bindings.contains(&self.local));

@@ -4,16 +4,17 @@
 //! 不会在这里分配最终名字。节点与 value pack 的遍历由共享 HIR visitor 提供，
 //! 本层只消费 closure 回调，不另行展开 HIR 子节点或进入 child proto。
 //! 例如：子闭包捕获某个 local 时，这里会记录它对应的捕获来源链。
+//! 稳定 closure hook 允许借用 HIR 的原始 capture 切片，不再为每次 occurrence 复制 binding。
 
 use crate::hir::visit::{HirVisitor, visit_proto};
-use crate::hir::{HirCapture, HirClosureExpr, HirExpr, HirModule, HirProtoRef};
+use crate::hir::{HirCapture, HirClosureExpr, HirModule, HirProtoRef};
 
 use super::super::NamingError;
 use super::super::common::ClosureCaptureEvidence;
 
-pub(super) fn build_capture_evidence(
-    hir: &HirModule,
-) -> Result<Vec<Option<ClosureCaptureEvidence>>, NamingError> {
+pub(super) fn build_capture_evidence<'hir>(
+    hir: &'hir HirModule,
+) -> Result<Vec<Option<ClosureCaptureEvidence<'hir>>>, NamingError> {
     let mut evidence = vec![None; hir.protos.len()];
     for proto in &hir.protos {
         let mut collector = CaptureEvidenceCollector {
@@ -28,18 +29,16 @@ pub(super) fn build_capture_evidence(
     Ok(evidence)
 }
 
-struct CaptureEvidenceCollector<'a> {
+struct CaptureEvidenceCollector<'hir, 'out> {
     function: HirProtoRef,
-    hir: &'a HirModule,
-    evidence: &'a mut [Option<ClosureCaptureEvidence>],
+    hir: &'hir HirModule,
+    evidence: &'out mut [Option<ClosureCaptureEvidence<'hir>>],
     result: Result<(), NamingError>,
 }
 
-impl HirVisitor for CaptureEvidenceCollector<'_> {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        if self.result.is_ok()
-            && let HirExpr::Closure(closure) = expr
-        {
+impl<'hir> HirVisitor<'hir> for CaptureEvidenceCollector<'hir, '_> {
+    fn visit_closure(&mut self, closure: &'hir HirClosureExpr) {
+        if self.result.is_ok() {
             self.result =
                 record_closure_capture_evidence(self.function, closure, self.hir, self.evidence);
         }
@@ -49,11 +48,11 @@ impl HirVisitor for CaptureEvidenceCollector<'_> {
     fn visit_capture(&mut self, _capture: &HirCapture) {}
 }
 
-fn record_closure_capture_evidence(
+fn record_closure_capture_evidence<'hir>(
     parent: HirProtoRef,
-    closure: &HirClosureExpr,
-    hir: &HirModule,
-    evidence: &mut [Option<ClosureCaptureEvidence>],
+    closure: &'hir HirClosureExpr,
+    hir: &'hir HirModule,
+    evidence: &mut [Option<ClosureCaptureEvidence<'hir>>],
 ) -> Result<(), NamingError> {
     let child = hir
         .protos
@@ -72,11 +71,7 @@ fn record_closure_capture_evidence(
 
     let candidate = ClosureCaptureEvidence {
         parent,
-        captures: closure
-            .captures
-            .iter()
-            .map(|capture| capture.binding)
-            .collect(),
+        captures: &closure.captures,
     };
 
     match &evidence[closure.proto.index()] {
@@ -84,7 +79,16 @@ fn record_closure_capture_evidence(
             evidence[closure.proto.index()] = Some(candidate);
             Ok(())
         }
-        Some(existing) if *existing == candidate => Ok(()),
+        Some(existing)
+            if existing.parent == candidate.parent
+                && existing
+                    .captures
+                    .iter()
+                    .map(|capture| capture.binding)
+                    .eq(candidate.captures.iter().map(|capture| capture.binding)) =>
+        {
+            Ok(())
+        }
         Some(_) => Err(NamingError::ConflictingCaptureEvidence {
             child: closure.proto.index(),
         }),

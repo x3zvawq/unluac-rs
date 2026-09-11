@@ -237,7 +237,7 @@ impl DirectCopySinkBoundary {
     }
 }
 
-impl HirVisitor for DirectCopySinkBoundary {
+impl HirVisitor<'_> for DirectCopySinkBoundary {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         self.safe &= match stmt {
             HirStmt::LocalDecl(local_decl) => !local_decl
@@ -457,7 +457,7 @@ impl DiscardBoundaryVisitor<'_> {
     }
 }
 
-impl HirVisitor for DiscardBoundaryVisitor<'_> {
+impl HirVisitor<'_> for DiscardBoundaryVisitor<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::LocalDecl(local_decl) => {
@@ -528,7 +528,7 @@ impl ImmutablePrimitiveLocals {
     }
 }
 
-impl HirVisitor for ImmutablePrimitiveLocals {
+impl HirVisitor<'_> for ImmutablePrimitiveLocals {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         let HirStmt::LocalDecl(decl) = stmt else {
             return;
@@ -847,7 +847,7 @@ struct RepeatConditionFoldMovedExprBoundary {
     unresolved: bool,
 }
 
-impl HirVisitor for RepeatConditionFoldMovedExprBoundary {
+impl HirVisitor<'_> for RepeatConditionFoldMovedExprBoundary {
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.decision |= matches!(expr, HirExpr::Decision(_));
         self.unresolved |= matches!(expr, HirExpr::Unresolved(_));

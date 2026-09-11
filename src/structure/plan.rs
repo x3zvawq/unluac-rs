@@ -339,11 +339,24 @@ pub struct LoopPlanData {
     /// 当前 loop 的所有可完成出口都会继续 break 同一个祖先 loop。
     pub(crate) propagated_break: Option<RegionId>,
     /// 唯一的 header 合流事实，供 phi ownership、循环协议和 HIR 捕获绑定共同查询。
+    /// 保持 canonical SSA 的 Reg/PhiId 严格递增顺序；同 header 候选只扩充对应 arms。
     pub(crate) header_values: Vec<LoopValueMerge>,
     pub(crate) exit_values: Vec<LoopExitValueMergeCandidate>,
     /// phi/cleanup 冻结完成后写入的唯一 VM lowering 合同。
     pub(crate) protocol: Option<LoopVmProtocol>,
     pub(crate) value_actions: Option<LoopValueActions>,
+}
+
+impl LoopPlanData {
+    pub(in crate::structure) fn header_value_for_reg(
+        &self,
+        reg: crate::transformer::Reg,
+    ) -> Option<&LoopValueMerge> {
+        self.header_values
+            .binary_search_by_key(&reg, |value| value.reg)
+            .ok()
+            .map(|index| &self.header_values[index])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

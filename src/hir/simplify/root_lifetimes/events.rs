@@ -169,7 +169,7 @@ struct CalleeCollector {
     gc: bool,
 }
 
-impl HirVisitor for CalleeCollector {
+impl HirVisitor<'_> for CalleeCollector {
     fn visit_call(&mut self, call: &HirCallExpr) {
         match &call.callee {
             HirExpr::TempRef(temp) => self.temps.push(*temp),

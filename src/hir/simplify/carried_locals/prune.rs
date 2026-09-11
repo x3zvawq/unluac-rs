@@ -998,7 +998,7 @@ struct BindingWriteCollector {
     temps: BTreeSet<TempId>,
 }
 
-impl HirVisitor for BindingWriteCollector {
+impl HirVisitor<'_> for BindingWriteCollector {
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
         match lvalue {
             HirLValue::Local(local) => {

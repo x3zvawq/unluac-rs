@@ -15,6 +15,8 @@ use crate::transformer::InstrRef;
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HirModule {
     pub entry: HirProtoRef,
+    /// 父先子后的 proto arena：每条 `children` 边都指向更大的下标。
+    /// lowering 预留合成 factory、失败恢复删除并重编号时均保持这个顺序。
     pub protos: Vec<HirProto>,
 }
 
@@ -927,7 +929,8 @@ pub struct HirErrNil {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirToBeClosed {
     /// 原始 `TBC` 指令 identity；与 label 的冻结 active-set 精确配对，避免寄存器复用
-    /// 让 close-scope materialization 把 goto target 放到错误的词法块。
+    /// 让 close-scope materialization 把 goto target 放到错误的词法块；Promotion 同时
+    /// 按此身份持有注册点的物理 home，value 改写不改变资源槽。
     pub origin: InstrRef,
     /// 原始槽位只参与 HIR 候选 epoch 与覆盖阈值查询；资源配对以 origin 为准。
     pub reg_index: usize,

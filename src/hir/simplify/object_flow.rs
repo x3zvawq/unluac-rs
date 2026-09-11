@@ -168,7 +168,7 @@ pub(super) fn snapshot_generic_for_root(
 pub(super) fn dispatch_generic_for_root(
     flow: HirGenericForFlow<'_>,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -207,7 +207,7 @@ pub(super) fn write_for_bindings_root(bindings: HirForBindings<'_>, state: &mut 
 pub(super) fn update_state_for_stmt(
     stmt: &HirStmt,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -540,7 +540,7 @@ fn store_table(
     key: Option<&HirExpr>,
     value: Option<&HirExpr>,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -589,7 +589,7 @@ fn store_table(
 fn observe_stmt(
     stmt: &HirStmt,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -642,7 +642,7 @@ fn observe_stmt(
 fn observe_pack(
     pack: &HirValuePack,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -654,7 +654,7 @@ fn observe_pack(
 pub(super) fn observe_expr(
     expr: &HirExpr,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -746,7 +746,7 @@ pub(super) fn observe_expr(
 fn observe_call(
     call: &crate::hir::common::HirCallExpr,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -761,14 +761,14 @@ fn observe_call(
 fn escape_expr(
     expr: &HirExpr,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
     let holders = holder_values(expr, state, effects);
     state.escaped.extend(&holders);
     struct EscapeBindings<'a>(&'a mut RootState);
-    impl crate::hir::visit::HirVisitor for EscapeBindings<'_> {
+    impl crate::hir::visit::HirVisitor<'_> for EscapeBindings<'_> {
         fn visit_expr(&mut self, expr: &HirExpr) {
             if let Some(binding) = HirBinding::from_expr(expr)
                 && self.0.unknown_collectable.contains(&binding)
@@ -787,7 +787,7 @@ fn escape_expr(
 fn activate_closures(
     expr: &HirExpr,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     include_returns: bool,
     safety: HirExprSafety,
@@ -799,7 +799,7 @@ fn activate_closures(
 fn activate_object_ids(
     holders: &BTreeSet<ObjectId>,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     include_returns: bool,
     _safety: HirExprSafety,
@@ -938,20 +938,19 @@ pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<HirBinding> {
     }
 }
 
-pub(super) fn closure_captures_in_block(
-    block: &HirBlock,
-) -> BTreeMap<HirProtoRef, Vec<HirCapture>> {
+// 捕获身份只在本次只读求解内使用；返回的效果/根事实不携带引用，不跨 HIR 改写缓存。
+type ClosureCaptures<'hir> = BTreeMap<HirProtoRef, &'hir [HirCapture]>;
+
+pub(super) fn closure_captures_in_block(block: &HirBlock) -> ClosureCaptures<'_> {
     closure_captures_in_stmts(&block.stmts)
 }
 
 #[derive(Default)]
-struct CaptureCollector(BTreeMap<HirProtoRef, Vec<HirCapture>>);
+struct CaptureCollector<'hir>(ClosureCaptures<'hir>);
 
-impl crate::hir::visit::HirVisitor for CaptureCollector {
-    fn visit_expr(&mut self, expr: &HirExpr) {
-        if let HirExpr::Closure(closure) = expr
-            && let Some(previous) = self.0.insert(closure.proto, closure.captures.clone())
-        {
+impl<'hir> crate::hir::visit::HirVisitor<'hir> for CaptureCollector<'hir> {
+    fn visit_closure(&mut self, closure: &'hir crate::hir::HirClosureExpr) {
+        if let Some(previous) = self.0.insert(closure.proto, &closure.captures) {
             debug_assert_eq!(
                 previous, closure.captures,
                 "a child proto must have one capture shape within its lexical parent"
@@ -960,7 +959,7 @@ impl crate::hir::visit::HirVisitor for CaptureCollector {
     }
 }
 
-fn closure_captures_in_stmts(stmts: &[HirStmt]) -> BTreeMap<HirProtoRef, Vec<HirCapture>> {
+fn closure_captures_in_stmts(stmts: &[HirStmt]) -> ClosureCaptures<'_> {
     let mut captures = CaptureCollector::default();
     crate::hir::visit::visit_stmts(stmts, &mut captures);
     captures.0
@@ -1002,7 +1001,7 @@ impl<'hir> AllocationEscapeFacts<'hir> {
             return facts;
         }
         struct ExternalBindings(BTreeSet<HirBinding>);
-        impl crate::hir::visit::HirVisitor for ExternalBindings {
+        impl crate::hir::visit::HirVisitor<'_> for ExternalBindings {
             fn visit_expr(&mut self, expr: &HirExpr) {
                 if let Some(binding) = HirBinding::from_expr(expr) {
                     self.0.insert(binding);
@@ -1059,7 +1058,7 @@ impl<'hir> AllocationEscapeFacts<'hir> {
 pub(super) fn transfer_root_node(
     kind: HirFlowNodeKind<'_>,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) {
@@ -1090,7 +1089,7 @@ pub(super) fn transfer_root_node(
 fn transfer_overwrite_node(
     kind: HirFlowNodeKind<'_>,
     state: &mut RootState,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
     opaque: &BTreeSet<TempId>,

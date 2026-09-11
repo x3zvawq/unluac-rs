@@ -26,6 +26,8 @@
 //!   例如 `f({})` 的参数 home 不得在后层被重建成调用后继续持有的 caller root
 //! - possible/complete home query 借用已有集合；定义写需要补充新 home 时才复制。
 //!   跨 provenance 改写保存来源的 owner 显式取得 owned 快照，不让后层缓存整份映射。
+//! - 显式 TBC 的 origin 直接对应注册点的物理 home；值经 phi/alias 合并后的来源 epoch
+//!   不等于注册时的槽身份，后层不从当前 value 反推资源槽。
 
 mod call_roots;
 mod copy_root_retirement;
@@ -332,6 +334,7 @@ pub(super) struct ProtoPromotionFacts {
     propagated_local_definition_write_homes: BTreeMap<LocalId, BTreeSet<HomeSlotKey>>,
     propagated_temp_definition_write_homes: BTreeMap<TempId, BTreeSet<HomeSlotKey>>,
     physical_home_universe: BTreeSet<HomeSlotKey>,
+    tbc_homes: BTreeMap<InstrRef, HomeSlotKey>,
     compact_home_slots: bool,
     argument_roots_by_call: BTreeMap<InstrRef, Vec<crate::hir::common::HirCallArgumentRoot>>,
     argument_root_producers: BTreeSet<TempId>,
@@ -668,6 +671,21 @@ impl ProtoPromotionFacts {
             propagated_param_definition_write_homes: BTreeMap::new(),
             propagated_local_definition_write_homes: BTreeMap::new(),
             propagated_temp_definition_write_homes: BTreeMap::new(),
+            tbc_homes: proto
+                .instrs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instr)| {
+                    let LowInstr::Tbc(tbc) = instr else {
+                        return None;
+                    };
+                    let origin = InstrRef(index);
+                    Some((
+                        origin,
+                        HomeSlotKey::new(tbc.reg.index(), slot_epochs.epoch_at(tbc.reg, origin)),
+                    ))
+                })
+                .collect(),
             physical_home_universe,
             compact_home_slots: false,
             method_setup_protocols: Vec::new(),
@@ -1260,35 +1278,10 @@ impl ProtoPromotionFacts {
             .extend(homes);
     }
 
-    /// 返回 TBC 原始寄存器在当前 proto 中可能对应的完整物理 home 集合。
-    ///
-    /// value binding 的 home 可缩小到精确 epoch；若 value 是 home-free 表达式或其 home
-    /// 与协议寄存器不一致，TBC 仍由原始 `reg_index` 指定物理 cell，因此退回该寄存器的
-    /// 全部 close epoch。原始协议寄存器不在 universe 中属于内部事实错误。
-    pub(super) fn complete_tbc_home_slots(
-        &self,
-        reg_index: usize,
-        value_homes: &BTreeSet<HomeSlotKey>,
-    ) -> BTreeSet<HomeSlotKey> {
-        let matching_value_homes = value_homes
-            .iter()
-            .copied()
-            .filter(|home| home.slot() == reg_index)
-            .collect::<BTreeSet<_>>();
-        if !matching_value_homes.is_empty() {
-            return matching_value_homes;
-        }
-        let physical_homes = self
-            .physical_home_universe
-            .iter()
-            .copied()
-            .filter(|home| home.slot() == reg_index)
-            .collect::<BTreeSet<_>>();
-        assert!(
-            !physical_homes.is_empty(),
-            "to-be-closed register requires a physical home in the proto universe"
-        );
-        physical_homes
+    /// 注册 TBC 时的原始物理槽；不受后续 value/binding 合并影响。
+    /// origin 由 lowering 发布，重写只能保留或删除，缺项表示内部来源事实丢失。
+    pub(super) fn tbc_home(&self, origin: InstrRef) -> HomeSlotKey {
+        self.tbc_homes[&origin]
     }
 
     pub(super) fn param_home_was_invalidated(&self, param: ParamId) -> bool {
@@ -1412,7 +1405,7 @@ struct CapturedHomeSlotCollector<'a> {
     slots: &'a mut BTreeSet<HomeSlotKey>,
 }
 
-impl crate::hir::visit::HirVisitor for CapturedHomeSlotCollector<'_> {
+impl crate::hir::visit::HirVisitor<'_> for CapturedHomeSlotCollector<'_> {
     fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
         // 按值捕获不激活原槽的 sticky 身份；这里只维护尚未物化的 temp home。
         if capture.mode == crate::hir::HirCaptureMode::ByReference

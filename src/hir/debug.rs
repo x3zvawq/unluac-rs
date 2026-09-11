@@ -5,7 +5,6 @@
 //! 入口直接从主 pipeline state 读取 HIR module；如果最终 dump 里还出现
 //! `decision(...)`，那说明 HIR 末端的决策图消除退化了。
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::debug::{
@@ -634,18 +633,17 @@ fn format_environment_upvalues(upvalues: &std::collections::BTreeSet<UpvalueId>)
     }
 }
 
-pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntry<'a>> {
+pub(super) fn collect_hir_entries(module: &HirModule) -> Vec<HirProtoEntry<'_>> {
     // HIR 的 proto 存在扁平数组里，`HirProtoRef(id)` 指 `protos[id]`。
     // 为了生成 focus plan 需要的 DFS 序，我们按 entry 从根开始 DFS 展开。
-    let proto_by_id: BTreeMap<usize, &'a HirProto> =
-        module.protos.iter().map(|p| (p.id.index(), p)).collect();
-
+    let mut seen = vec![false; module.protos.len()];
     let mut entries = Vec::new();
     let mut pending = vec![(module.entry, None)];
     while let Some((current, parent_slot)) = pending.pop() {
-        let Some(proto) = proto_by_id.get(&current.index()).copied() else {
+        let Some(proto) = module.protos.get(current.index()) else {
             continue;
         };
+        seen[current.index()] = true;
         let slot = entries.len();
         entries.push(HirProtoEntry {
             id: slot,
@@ -662,10 +660,8 @@ pub(super) fn collect_hir_entries<'a>(module: &'a HirModule) -> Vec<HirProtoEntr
     }
     // 兜底：如果 module.protos 里有孤岛 proto（没被 entry 可达到），附在末尾，
     // 保证线性下标的稳定性，elided 计数也才准。
-    let seen: std::collections::BTreeSet<usize> =
-        entries.iter().map(|e| e.proto.id.index()).collect();
     for proto in &module.protos {
-        if !seen.contains(&proto.id.index()) {
+        if !seen[proto.id.index()] {
             let id = entries.len();
             entries.push(HirProtoEntry {
                 id,

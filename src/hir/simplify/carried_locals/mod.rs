@@ -439,7 +439,7 @@ struct HandoffIdentityCollector {
     to_be_closed: BTreeSet<CarryBinding>,
 }
 
-impl HirVisitor for HandoffIdentityCollector {
+impl HirVisitor<'_> for HandoffIdentityCollector {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         match stmt {
             HirStmt::NumericFor(numeric_for) => {

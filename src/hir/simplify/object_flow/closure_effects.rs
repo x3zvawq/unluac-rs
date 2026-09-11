@@ -13,8 +13,8 @@ use super::super::lexical_cfg::{
     HirGenericForFlow,
 };
 use super::{
-    EffectClosure, EffectValue, ProtoEffects, binding_from_lvalue, closure_captures_in_block,
-    extend_map_sets, union_set,
+    ClosureCaptures, EffectClosure, EffectValue, ProtoEffects, binding_from_lvalue,
+    closure_captures_in_block, extend_map_sets, union_set,
 };
 use crate::hir::common::{
     HirCapture, HirCaptureMode, HirExpr, HirLValue, HirModule, HirProto, HirProtoRef, HirStmt,
@@ -27,40 +27,6 @@ pub(in crate::hir::simplify) fn collect_proto_effects(
     module: &HirModule,
     safety: HirExprSafety,
 ) -> Vec<ProtoEffects> {
-    // Closure definitions form a lexical DAG. Summarize children first so a direct child call can
-    // project its escaped/returned captures into the parent's upvalue domain.
-    fn collect_one(
-        index: usize,
-        module: &HirModule,
-        effects: &mut [ProtoEffects],
-        visiting: &mut [bool],
-        ready: &mut [bool],
-        safety: HirExprSafety,
-    ) {
-        if ready[index] {
-            return;
-        }
-        assert!(!visiting[index], "HIR lexical child graph must be acyclic");
-        visiting[index] = true;
-        let proto = &module.protos[index];
-        for child in &proto.children {
-            collect_one(child.index(), module, effects, visiting, ready, safety);
-        }
-
-        // 无 upvalue 的叶函数没有可投影的 capture，也不可能返回带 capture 的 child；
-        // 其控制流规模不应增加调用方的 root 证明成本。
-        if proto.upvalues.is_empty() && proto.children.is_empty() {
-            ready[index] = true;
-            visiting[index] = false;
-            return;
-        }
-
-        let captures = closure_captures_in_block(&proto.body);
-        effects[index] = collect_effect_state(proto, &captures, effects, safety);
-        visiting[index] = false;
-        ready[index] = true;
-    }
-
     let mut effects = module
         .protos
         .iter()
@@ -69,19 +35,22 @@ pub(in crate::hir::simplify) fn collect_proto_effects(
             ..ProtoEffects::default()
         })
         .collect::<Vec<_>>();
-    let mut visiting = vec![false; module.protos.len()];
-    let mut ready = vec![false; module.protos.len()];
+    let mut required = vec![false; module.protos.len()];
     // 只有 lexical child 的摘要会被 capture 投影消费；入口/独立根的完整 CFG
     // 不是任何 closure 的 callee 事实，不应为大型无 child 函数反复求一份未使用摘要。
     for child in module.protos.iter().flat_map(|proto| &proto.children) {
-        collect_one(
-            child.index(),
-            module,
-            &mut effects,
-            &mut visiting,
-            &mut ready,
-            safety,
-        );
+        required[child.index()] = true;
+    }
+    // lowering 按父先子后分配 proto；合成 factory 的预留和失败恢复的单调 remap
+    // 也保持该合同。逆序即可先得到全部 child 摘要，不再重建词法图的遍历顺序。
+    for index in (0..module.protos.len()).rev() {
+        let proto = &module.protos[index];
+        // 无 upvalue 的叶函数没有可投影的 capture，也不可能返回带 capture 的 child。
+        if !required[index] || (proto.upvalues.is_empty() && proto.children.is_empty()) {
+            continue;
+        }
+        let captures = closure_captures_in_block(&proto.body);
+        effects[index] = collect_effect_state(proto, &captures, &effects, safety);
     }
     effects
 }
@@ -178,7 +147,7 @@ impl EffectState {
 }
 
 struct EffectContext<'a> {
-    captures: &'a BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &'a ClosureCaptures<'a>,
     effects: &'a [ProtoEffects],
 }
 
@@ -876,7 +845,7 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
 
 fn collect_effect_state(
     proto: &HirProto,
-    captures: &BTreeMap<HirProtoRef, Vec<HirCapture>>,
+    captures: &ClosureCaptures<'_>,
     effects: &[ProtoEffects],
     safety: HirExprSafety,
 ) -> ProtoEffects {

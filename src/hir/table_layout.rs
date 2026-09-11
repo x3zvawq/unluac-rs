@@ -212,7 +212,7 @@ pub(in crate::hir) fn inline_changes_table_initialization(
         replacement: &'a HirExpr,
         changed: bool,
     }
-    impl HirVisitor for Probe<'_> {
+    impl HirVisitor<'_> for Probe<'_> {
         fn visit_expr(&mut self, expr: &HirExpr) {
             let HirExpr::TableConstructor(table) = expr else {
                 return;

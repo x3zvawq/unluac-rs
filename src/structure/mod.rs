@@ -22,7 +22,6 @@ mod scope;
 mod short_circuit;
 
 pub(crate) use analyze::analyze_structure_stage;
-pub(crate) use cfg::SccId;
 pub use cfg::{
     BasicBlock, BlockKind, BlockRef, Cfg, CfgEdge, CfgGraph, DataflowFacts, Def, DefId,
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
@@ -31,12 +30,12 @@ pub use cfg::{
     ReachableSuccessorShape, RootObservation, SideEffectSummary, SsaRegMap, SsaValue, UseSite,
     build_cfg_graph, compute_dataflow_facts,
 };
+pub(crate) use cfg::{PhiIncomingSlot, SccId};
 pub(crate) use common::{
     BranchCandidate, BranchRegionFact, BranchValueMergeCandidate, LoopCandidate, LoopExitAlias,
-    LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueIncoming,
-    LoopValueMerge, RegionFact, ScopePlan, ShortCircuitCandidate, ShortCircuitExit,
-    ShortCircuitNode, ShortCircuitNodeRef, ShortCircuitTarget, ShortCircuitValueIncoming,
-    UnstructuredRegionLayout,
+    LoopExitValueMergeCandidate, LoopKindHint, LoopSourceBindings, LoopValueMerge, RegionFact,
+    ScopePlan, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode, ShortCircuitNodeRef,
+    ShortCircuitTarget, ShortCircuitValueIncoming, UnstructuredRegionLayout,
 };
 pub use common::{
     BranchKind, DebugBindingConflict, DebugBindingFact, DebugBindingFacts, GotoReason, PhiEdgeCopy,

@@ -20,7 +20,7 @@ use std::collections::BTreeSet;
 
 use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
 use super::super::root_lifetimes::RootEventBlock;
-use super::super::temp_touch::{collect_temp_reads_in_stmts, collect_temp_refs_in_expr};
+use super::super::temp_touch::{TempReadCollector, collect_temp_refs_in_expr};
 use crate::hir::common::{HirBlock, HirLValue, HirStmt, TempId};
 use crate::hir::expr_safety::HirExprSafety;
 
@@ -223,85 +223,35 @@ impl<'a> RegionTempFlow<'a> {
 }
 
 fn temp_flow_event(kind: HirFlowNodeKind<'_>, safety: HirExprSafety) -> TempFlowEvent {
-    let reads = match kind {
-        HirFlowNodeKind::Exit
-        | HirFlowNodeKind::FunctionExit
-        | HirFlowNodeKind::UnknownControl
-        | HirFlowNodeKind::NumericForDispatch
-        | HirFlowNodeKind::GenericForDispatch(_)
-        | HirFlowNodeKind::ForBinding(_) => BTreeSet::new(),
-        HirFlowNodeKind::RepeatCondition(repeat_stmt) => {
-            collect_temp_refs_in_expr(&repeat_stmt.cond)
-        }
-        HirFlowNodeKind::Stmt(stmt) => match stmt {
-            HirStmt::Block(_) | HirStmt::Repeat(_) => BTreeSet::new(),
-            HirStmt::If(if_stmt) => collect_temp_refs_in_expr(&if_stmt.cond),
-            HirStmt::While(while_stmt) => collect_temp_refs_in_expr(&while_stmt.cond),
-            HirStmt::NumericFor(for_stmt) => collect_temp_refs_in_expr(&for_stmt.start)
-                .into_iter()
-                .chain(collect_temp_refs_in_expr(&for_stmt.limit))
-                .chain(collect_temp_refs_in_expr(&for_stmt.step))
-                .collect(),
-            HirStmt::GenericFor(for_stmt) => for_stmt
-                .iterator
-                .iter()
-                .flat_map(collect_temp_refs_in_expr)
-                .collect(),
-            _ => collect_temp_reads_in_stmts(std::slice::from_ref(stmt)),
-        },
-        HirFlowNodeKind::GenericForInit(flow) => flow
-            .for_stmt()
-            .iterator
-            .iter()
-            .flat_map(collect_temp_refs_in_expr)
-            .collect(),
-    };
+    let mut collector = TempReadCollector::default();
+    kind.visit_evaluation(&mut collector);
+    let reads = collector.temps;
     let HirFlowNodeKind::Stmt(HirStmt::Assign(assign)) = kind else {
         return TempFlowEvent {
             reads,
             ..TempFlowEvent::default()
         };
     };
-    let writes = assign
-        .targets
-        .iter()
-        .filter_map(|target| match target {
-            HirLValue::Temp(temp) => Some(*temp),
-            HirLValue::Param(_)
-            | HirLValue::Local(_)
-            | HirLValue::Upvalue(_)
-            | HirLValue::Global(_)
-            | HirLValue::TableAccess(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
-    let gc_inert_writes = writes
-        .iter()
-        .copied()
-        .filter(|temp| assignment_final_temp_value_is_gc_inert(assign, *temp, safety))
-        .collect();
+    let mut writes = BTreeSet::new();
+    let mut gc_inert_writes = BTreeSet::new();
+    // 并行赋值的重复目标由最后一次写决定；逆序首次登记时直接读取对应 RHS，
+    // 不为每个 temp 重新扫描整组目标。未知 tail 仍不能证明其结果 GC 惰性。
+    for (index, target) in assign.targets.iter().enumerate().rev() {
+        if let HirLValue::Temp(temp) = target
+            && writes.insert(*temp)
+            && assign.values.fixed.get(index).map_or_else(
+                || assign.values.tail.is_none(),
+                |value| safety.result_is_gc_inert(value),
+            )
+        {
+            gc_inert_writes.insert(*temp);
+        }
+    }
     TempFlowEvent {
         reads,
         writes,
         gc_inert_writes,
     }
-}
-
-fn assignment_final_temp_value_is_gc_inert(
-    assign: &crate::hir::common::HirAssign,
-    temp: TempId,
-    safety: HirExprSafety,
-) -> bool {
-    let Some(index) = assign
-        .targets
-        .iter()
-        .rposition(|target| matches!(target, HirLValue::Temp(target) if *target == temp))
-    else {
-        return false;
-    };
-    assign.values.fixed.get(index).map_or_else(
-        || assign.values.tail.is_none(),
-        |value| safety.result_is_gc_inert(value),
-    )
 }
 
 fn intersect_fallthrough_assignment_sets<'a>(

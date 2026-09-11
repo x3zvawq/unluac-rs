@@ -10,7 +10,7 @@ mod plan_access;
 pub use plan_access::StructurePlan;
 
 use crate::recovery::ProtoFailure;
-use crate::structure::{BlockRef, DefId, EdgeRef, PhiId, SsaValue};
+use crate::structure::{BlockRef, DefId, EdgeRef, PhiCandidate, PhiId, PhiIncomingSlot, SsaValue};
 use crate::transformer::{InstrRef, Reg, RegRange};
 
 use super::cfg::GraphFacts;
@@ -466,29 +466,25 @@ pub enum LoopSourceBindings {
     Generic(RegRange),
 }
 
-/// loop merge 某一臂的稳定 incoming 事实。
+/// 一个 loop value merge 某一臂在所属 phi 中的 canonical 输入槽位集合。
 ///
-/// 和 branch merge 不同，loop state 恢复需要保留“每个 predecessor 分别给了哪些 defs”，
-/// 这样 HIR 才能直接消费 preheader/exit 的来源，不必再回头拆 `phi.incoming`。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoopValueIncoming {
-    pub pred: Option<BlockRef>,
-    pub value: SsaValue,
-}
-
-/// 一个 loop value merge 某一臂的 incoming 集合。
+/// 生产者在 SSA compact 后按槽位顺序分类，合并只对同一 phi 的槽位取并集；
+/// 前驱、边和值仍由 canonical phi 持有，后续安装归属无需反向匹配值的副本。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoopValueArm {
-    pub incomings: Vec<LoopValueIncoming>,
+    pub incoming_slots: Vec<PhiIncomingSlot>,
 }
 
 impl LoopValueArm {
     pub fn is_empty(&self) -> bool {
-        self.incomings.is_empty()
+        self.incoming_slots.is_empty()
     }
 
-    pub fn values(&self) -> impl Iterator<Item = SsaValue> + '_ {
-        self.incomings.iter().map(|incoming| incoming.value)
+    /// 调用方提供该 arm 所属 LoopValueMerge 的 canonical phi。
+    pub fn values<'a>(&'a self, phi: &'a PhiCandidate) -> impl Iterator<Item = SsaValue> + 'a {
+        self.incoming_slots
+            .iter()
+            .map(|slot| phi.incoming[slot.index()].value)
     }
 }
 
