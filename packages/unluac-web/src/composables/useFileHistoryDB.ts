@@ -12,6 +12,8 @@
  * - best-effort：IndexedDB 不可用时静默回退
  */
 
+import type { UnluacDialect } from '@/types/decompiler'
+
 const DB_NAME = 'unluac-file-history'
 const DB_VERSION = 1
 const STORE_NAME = 'files'
@@ -25,6 +27,7 @@ export interface FileHistoryRecord {
   relativePath: string
   bytes: Uint8Array
   size: number
+  dialect: UnluacDialect
   /** 文件添加时间戳，用于排序和清理 */
   addedAt: number
 }
@@ -73,6 +76,20 @@ export async function putFileRecords(records: FileHistoryRecord[]): Promise<void
     }
   } catch {
     // 静默失败
+  }
+}
+
+/** 更新文件选择的方言，保留原始字节和加入时间。 */
+export async function putFileDialect(id: string, dialect: UnluacDialect): Promise<void> {
+  try {
+    const db = await openDB()
+    const store = db.transaction(STORE_NAME, 'readwrite').objectStore(STORE_NAME)
+    const request = store.get(id)
+    request.onsuccess = () => {
+      if (request.result) store.put({ ...request.result, dialect })
+    }
+  } catch {
+    // 历史不可用不影响当前文件。
   }
 }
 

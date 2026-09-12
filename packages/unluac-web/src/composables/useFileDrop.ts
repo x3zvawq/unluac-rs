@@ -69,6 +69,8 @@ async function fileToEntry(file: File, relativePath: string): Promise<FileEntry>
     bytes: new Uint8Array(buffer),
     size: file.size,
     status: 'pending',
+    dialect: 'auto',
+    revision: 0,
   }
 }
 
@@ -135,11 +137,15 @@ export function useFileDrop() {
   }
 
   function handleDragOver(e: DragEvent) {
+    if (!e.dataTransfer?.types.includes('Files')) return
     e.preventDefault()
+    e.dataTransfer.dropEffect = 'copy'
     isDragging.value = true
   }
 
-  function handleDragLeave() {
+  function handleDragLeave(e: DragEvent) {
+    if (e.relatedTarget instanceof Node && (e.currentTarget as Node).contains(e.relatedTarget))
+      return
     isDragging.value = false
   }
 

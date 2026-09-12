@@ -20,8 +20,15 @@ import {
   type FileHistoryRecord,
   getAllFileRecords,
   putFileRecords,
+  putFileDialect,
 } from '@/composables/useFileHistoryDB'
-import type { FileEntry, FileStatus, RichDecompileResult } from '@/types/decompiler'
+import type {
+  DecompileOptions,
+  FileEntry,
+  FileStatus,
+  RichDecompileResult,
+  UnluacDialect,
+} from '@/types/decompiler'
 
 export const useFilesStore = defineStore('files', () => {
   const files = shallowRef<FileEntry[]>([])
@@ -54,9 +61,22 @@ export const useFilesStore = defineStore('files', () => {
   )
 
   function addFiles(entries: FileEntry[]) {
-    // 去重：不添加已有同名同大小的文件
-    const existing = new Set(files.value.map((f) => `${f.relativePath}:${f.size}`))
-    const newEntries = entries.filter((e) => !existing.has(`${e.relativePath}:${e.size}`))
+    // 路径和大小只是候选桶；不同 Lua 版本的同名、同大小字节码仍是不同输入。
+    const existing = new Map<string, FileEntry[]>()
+    const key = (file: FileEntry) => `${file.relativePath}:${file.size}`
+    for (const file of files.value) {
+      const bucket = existing.get(key(file)) ?? []
+      bucket.push(file)
+      existing.set(key(file), bucket)
+    }
+    const newEntries = entries.filter((file) => {
+      const bucket = existing.get(key(file)) ?? []
+      if (bucket.some((old) => old.bytes.every((byte, index) => byte === file.bytes[index])))
+        return false
+      bucket.push(file)
+      existing.set(key(file), bucket)
+      return true
+    })
     if (newEntries.length > 0) {
       files.value = [...files.value, ...newEntries]
       // 新文件加入打开标签列表
@@ -68,10 +88,12 @@ export const useFilesStore = defineStore('files', () => {
         relativePath: e.relativePath,
         bytes: e.bytes,
         size: e.size,
+        dialect: e.dialect,
         addedAt: Date.now(),
       }))
       putFileRecords(records)
     }
+    return newEntries
   }
 
   /** 从文件历史中彻底移除文件（侧边栏操作），同时关闭对应标签 */
@@ -155,6 +177,35 @@ export const useFilesStore = defineStore('files', () => {
     files.value = files.value.map((f) => (f.id === id ? { ...f, richResult } : f))
   }
 
+  function setDialect(id: string, dialect: UnluacDialect) {
+    files.value = files.value.map((f) => (f.id === id ? { ...f, dialect } : f))
+    void putFileDialect(id, dialect)
+  }
+
+  /** 原始文件与冻结参数共同产生一个新结果代次，旧异步任务不得向该代次提交。 */
+  function beginDecompile(id: string, defaults: DecompileOptions): FileEntry | undefined {
+    const file = files.value.find((f) => f.id === id)
+    if (!file) return undefined
+    const resultOptions: DecompileOptions = JSON.parse(JSON.stringify(defaults))
+    resultOptions.dialect = file.dialect
+    const next: FileEntry = {
+      ...file,
+      revision: file.revision + 1,
+      resultOptions,
+      status: 'processing',
+      result: undefined,
+      richResult: undefined,
+      error: undefined,
+      editedResult: undefined,
+    }
+    files.value = files.value.map((f) => (f.id === id ? next : f))
+    return next
+  }
+
+  function isCurrent(id: string, revision: number): boolean {
+    return files.value.some((f) => f.id === id && f.revision === revision)
+  }
+
   function updateEditedResult(id: string, editedResult: string) {
     files.value = files.value.map((f) => (f.id === id ? { ...f, editedResult } : f))
   }
@@ -184,6 +235,8 @@ export const useFilesStore = defineStore('files', () => {
       bytes: r.bytes,
       size: r.size,
       status: 'pending',
+      dialect: r.dialect ?? 'auto',
+      revision: 0,
     }))
     files.value = entries
     // 恢复时所有文件都加入标签栏
@@ -213,6 +266,9 @@ export const useFilesStore = defineStore('files', () => {
     selectFile,
     updateFileStatus,
     updateRichResult,
+    setDialect,
+    beginDecompile,
+    isCurrent,
     updateEditedResult,
     clearEditedResult,
     restoreFromHistory,

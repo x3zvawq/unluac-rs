@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "フォルダを削除"
-    }
+    },
+    "sourceTag": "ソース",
+    "fileDialect": "このファイルの Lua 方言を変更"
   },
   "codeView": {
     "placeholder": "デコンパイルするファイルを選択してください",
@@ -144,7 +146,7 @@
       "comment": "コメント出力"
     },
     "tips": {
-      "dialect": "対象の Lua ダイアレクト。パーサーとジェネレーターの動作に影響します。CLI: --dialect / -D",
+      "dialect": "新しく読み込むファイルにのみ適用します。ファイルのバージョンタグから個別に変更できます。",
       "generateMode": "エラー処理戦略。strict: 非対応構文またはエラーで停止；permissive: 可能な限り出力。CLI: --generate-mode / -g",
       "parseMode": "パーサーの厳密さ。strict: 厳密な検証；permissive: 非標準バイトコードを許容。CLI: --parse-mode / -p",
       "stringEncoding": "文字列定数のデコードに使用するエンコーディング。CLI: --encoding / -e",
@@ -190,12 +192,32 @@
           "description": "ソースコードに加えて、バッチ処理、出力比較、Proto / CFG などの構造化解析も利用できます。"
         }
       }
-    }
+    },
+    "importDialect": "新規ファイルの既定の方言"
   },
   "diff": {
     "left": "左",
     "right": "右",
     "selectFile": "ファイルを選択",
     "hint": "比較するデコンパイル済みファイルを2つ選択してください"
+  },
+  "workspace": {
+    "local": "ローカルで実行",
+    "files": "ワークスペース",
+    "searchFiles": "ファイルを検索…",
+    "fileHint": "ファイルやフォルダーを開いて開始。Lua バージョンはファイルごとに保存されます。",
+    "history": "履歴はこのブラウザーに保存されます",
+    "fileActions": "ファイル操作",
+    "headline": "Lua バイトコードを、",
+    "headlineAccent": "読めるコードへ。",
+    "description": "ソースを復元し、プログラムの構造を探索。すべてブラウザーで完結します。",
+    "importHint": "拡張子を問わず、ファイルやフォルダーを開けます。",
+    "privacy": "処理は端末内で完結し、サーバーに送信しません。",
+    "multiDialect": "複数の方言に対応",
+    "explore": "コードの内側へ",
+    "exploreHint": "関数、定数、制御フローを探索。",
+    "analysis": "構造解析",
+    "wrapLines": "行の折り返し",
+    "settingsHint": "設定は自動で適用されます。Lua 方言はファイルごとに保持されます。"
   }
 }

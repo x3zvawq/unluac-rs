@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "Supprimer le dossier"
-    }
+    },
+    "sourceTag": "Source",
+    "fileDialect": "Modifier le dialecte Lua de ce fichier"
   },
   "codeView": {
     "placeholder": "Sélectionnez un fichier à décompiler",
@@ -144,7 +146,7 @@
       "comment": "Émettre des commentaires"
     },
     "tips": {
-      "dialect": "Dialecte Lua cible, affecte le comportement de l'analyseur et du générateur. CLI : --dialect / -D",
+      "dialect": "Uniquement pour les nouveaux fichiers importés. Cliquez sur la version d’un fichier pour modifier son dialecte.",
       "generateMode": "Stratégie de gestion des erreurs. strict : arrêt sur syntaxe non prise en charge ou erreur ; permissive : produire autant que possible. CLI : --generate-mode / -g",
       "parseMode": "Rigueur de l'analyseur. strict : validation stricte ; permissive : tolérer le bytecode non standard. CLI : --parse-mode / -p",
       "stringEncoding": "Encodage pour le décodage des constantes de chaînes. CLI : --encoding / -e",
@@ -190,12 +192,32 @@
           "description": "En plus du code généré, vous pouvez traiter des fichiers en lot, comparer les sorties et inspecter les analyses structurées Proto / CFG."
         }
       }
-    }
+    },
+    "importDialect": "Dialecte par défaut des nouveaux fichiers"
   },
   "diff": {
     "left": "Gauche",
     "right": "Droite",
     "selectFile": "Sélectionner un fichier",
     "hint": "Sélectionnez deux fichiers décompilés à comparer"
+  },
+  "workspace": {
+    "local": "Exécution locale",
+    "files": "Espace de travail",
+    "searchFiles": "Rechercher un fichier…",
+    "fileHint": "Ouvrez un fichier ou un dossier. Chaque fichier conserve sa version de Lua.",
+    "history": "L’historique reste dans ce navigateur",
+    "fileActions": "Actions du fichier",
+    "headline": "Le bytecode Lua,",
+    "headlineAccent": "à nouveau lisible.",
+    "description": "Retrouvez le code source et explorez la structure du programme. Dans votre navigateur.",
+    "importHint": "Tous les noms de fichiers. Un fichier ou un dossier entier.",
+    "privacy": "Les fichiers sont traités sur votre appareil, sans envoi au serveur.",
+    "multiDialect": "Plusieurs dialectes",
+    "explore": "Explorer le code",
+    "exploreHint": "Consultez les fonctions, constantes et flux de contrôle.",
+    "analysis": "Structure",
+    "wrapLines": "Retour à la ligne",
+    "settingsHint": "Les réglages s’appliquent automatiquement. Chaque fichier conserve son dialecte Lua."
   }
 }

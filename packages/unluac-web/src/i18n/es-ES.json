@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "Eliminar carpeta"
-    }
+    },
+    "sourceTag": "Código fuente",
+    "fileDialect": "Cambiar el dialecto Lua de este archivo"
   },
   "codeView": {
     "placeholder": "Selecciona un archivo para descompilar",
@@ -143,7 +145,7 @@
       "comment": "Emitir comentarios"
     },
     "tips": {
-      "dialect": "Dialecto Lua de destino, afecta el comportamiento del analizador y generador. CLI: --dialect / -D",
+      "dialect": "Solo se aplica a los archivos nuevos. Pulse la etiqueta de versión de un archivo para cambiar su dialecto.",
       "advanced": "Avanzado",
       "generateMode": "Estrategia de manejo de errores. strict: detener en sintaxis no compatible o error; permissive: generar lo máximo posible. CLI: --generate-mode / -g",
       "parseMode": "Nivel de rigor del analizador. strict: validación estricta; permissive: tolerar bytecode no estándar. CLI: --parse-mode / -p",
@@ -190,12 +192,32 @@
           "description": "Además del código fuente, puedes procesar archivos por lotes, comparar resultados e inspeccionar análisis estructurados Proto / CFG."
         }
       }
-    }
+    },
+    "importDialect": "Dialecto predeterminado para archivos nuevos"
   },
   "diff": {
     "left": "Izquierda",
     "right": "Derecha",
     "selectFile": "Seleccionar archivo",
     "hint": "Selecciona dos archivos descompilados para comparar"
+  },
+  "workspace": {
+    "local": "Ejecución local",
+    "files": "Espacio de trabajo",
+    "searchFiles": "Buscar un archivo…",
+    "fileHint": "Abre un archivo o una carpeta. Cada archivo conserva su versión de Lua.",
+    "history": "El historial se guarda en este navegador",
+    "fileActions": "Acciones del archivo",
+    "headline": "Bytecode Lua,",
+    "headlineAccent": "legible de nuevo.",
+    "description": "Recupera el código fuente y explora la estructura del programa. Todo en tu navegador.",
+    "importHint": "Cualquier nombre. Un archivo o una carpeta entera.",
+    "privacy": "Los archivos se procesan en tu dispositivo, sin subirse al servidor.",
+    "multiDialect": "Varios dialectos",
+    "explore": "Explora el código",
+    "exploreHint": "Examina funciones, constantes y flujo de control.",
+    "analysis": "Estructura",
+    "wrapLines": "Ajustar líneas",
+    "settingsHint": "Los cambios se aplican automáticamente. Cada archivo conserva su dialecto Lua."
   }
 }

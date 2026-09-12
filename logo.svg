@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">unluac-rs</title>
+  <desc id="desc">A Lua crescent surrounds bytecode blocks resolving into indented source lines, representing the reconstruction of readable Lua from compiled instructions.</desc>
+  <rect width="256" height="256" rx="56" fill="#171C3D"/>
+  <path d="M174 55a86 86 0 1 0 0 146c-58 10-87-29-87-73s29-83 87-73Z" fill="#E5E9FF"/>
+  <circle cx="194" cy="61" r="13" fill="#83E8CF"/>
+  <path d="M104 98h10v10h-10Zm18 0h10v10h-10Zm-18 25h10v10h-10Zm0 25h10v10h-10Zm18 0h10v10h-10Z" fill="#A6B2EA"/>
+  <g stroke="#83E8CF" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M157 93c-10 0-13 5-13 14v7c0 9-4 14-11 14 7 0 11 5 11 14v7c0 9 3 14 13 14"/>
+    <path d="M176 103h35m-25 25h25m-35 25h28"/>
+  </g>
+</svg>

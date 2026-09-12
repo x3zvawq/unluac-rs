@@ -17,20 +17,21 @@ import {
   h,
   inject,
   onMounted,
-  onUnmounted,
   type ShallowRef,
   shallowRef,
   useTemplateRef,
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { getCached, setCache } from '@/composables/useDecompileCache'
+import { useFileDecompile } from '@/composables/useFileDecompile'
+import type { UnluacDialect } from '@/types/decompiler'
 import type { useDecompiler } from '@/composables/useDecompiler'
 import { matchGlob, useFileDrop } from '@/composables/useFileDrop'
 import { useFilesStore } from '@/stores/files'
 import { useSettingsStore } from '@/stores/settings'
 import { shouldIgnoreDocumentShortcutTarget } from '@/utils/keyboard'
 
+const emit = defineEmits<{ selected: [] }>()
 const { t } = useI18n()
 const filesStore = useFilesStore()
 const settingsStore = useSettingsStore()
@@ -38,6 +39,7 @@ const dialog = useDialog()
 const message = useMessage()
 
 const decompiler = inject<ReturnType<typeof useDecompiler>>('decompiler')!
+const { decompileFile, changeDialect } = useFileDecompile(decompiler)
 const { isDragging, handleDrop, handleDragOver, handleDragLeave, handleFileInput } = useFileDrop()
 
 function browserTextEncoding(encoding: string): string {
@@ -64,7 +66,11 @@ watch(
 // 注册快捷键回调
 const shortcutActions =
   inject<ShallowRef<Record<string, (() => void) | undefined>>>('shortcutActions')!
-shortcutActions.value = { ...shortcutActions.value, openFile: () => openFilePicker() }
+shortcutActions.value = {
+  ...shortcutActions.value,
+  openFile: openFilePicker,
+  openFolder: openFolderPicker,
+}
 
 const fileInputRef = useTemplateRef<HTMLInputElement>('fileInput')
 const folderInputRef = useTemplateRef<HTMLInputElement>('folderInput')
@@ -72,15 +78,20 @@ const folderInputRef = useTemplateRef<HTMLInputElement>('folderInput')
 const BATCH_WARNING_THRESHOLD = 50
 
 /** 是否存在带目录结构的文件，决定使用树形或扁平视图 */
-const hasNestedFiles = computed(() => filesStore.files.some((f) => f.relativePath.includes('/')))
+const searchQuery = shallowRef('')
+const visibleFiles = computed(() =>
+  filesStore.files.filter((file) =>
+    file.relativePath.toLowerCase().includes(searchQuery.value.trim().toLowerCase()),
+  ),
+)
+const hasNestedFiles = computed(() => visibleFiles.value.some((f) => f.relativePath.includes('/')))
 
 /** 批量处理进度（正在处理时显示） */
 const batchProgress = computed(() => {
   const total = filesStore.files.length
   if (total === 0) return null
-  const done = filesStore.files.filter((f) => f.status === 'success' || f.status === 'error').length
-  const processing = filesStore.processingCount > 0
-  if (!processing && done === total) return null
+  const done = total - filesStore.pendingCount - filesStore.processingCount
+  if (done === total) return null
   return { done, total, percentage: Math.round((done / total) * 100) }
 })
 
@@ -121,91 +132,30 @@ async function processFiles(entries: Awaited<ReturnType<typeof handleFileInput>>
     if (!confirmed) return
   }
 
-  filesStore.addFiles(entries)
+  for (const entry of entries) entry.dialect = settingsStore.options.dialect
+  searchQuery.value = ''
+  const added = filesStore.addFiles(entries)
+  if (added.length === 0) return
 
   // 单文件直接选中；批量仅在未选中时选中第一个
-  if (entries.length === 1) {
-    filesStore.selectFile(entries[0].id)
+  if (added.length === 1) {
+    filesStore.selectFile(added[0].id)
   } else if (!filesStore.selectedFileId) {
-    filesStore.selectFile(entries[0].id)
+    filesStore.selectFile(added[0].id)
   }
 
+  emit('selected')
+
   // 逐个发起反编译
-  for (const entry of entries) {
+  for (const entry of added) {
     decompileFile(entry.id)
   }
 }
 
-/**
- * 检测文件是否已经是 Lua 源码（而非字节码）。
- * Lua 字节码以 \x1bLua 开头（标准 Lua），\x1bLJ 开头（LuaJIT），
- * \x00\x06 或包含特定 Luau 签名。
- * 如果不是已知的字节码格式，视为源码文件。
- */
-function isLuaSource(bytes: Uint8Array): boolean {
-  if (bytes.length < 4) return true
-  // 标准 Lua 字节码：\x1bLua
-  if (bytes[0] === 0x1b && bytes[1] === 0x4c && bytes[2] === 0x75 && bytes[3] === 0x61) return false
-  // LuaJIT 字节码：\x1bLJ
-  if (bytes[0] === 0x1b && bytes[1] === 0x4c && bytes[2] === 0x4a) return false
-  // Luau 字节码版本 3-6：前两字节为 \x06\x??（version byte + type version）
-  // Luau bytecode starts with version byte (2-6) + 0x00 or specific patterns
-  if (bytes[0] >= 0x02 && bytes[0] <= 0x06 && bytes[1] === 0x00) return false
-  return true
-}
-
-async function decompileFile(fileId: string) {
-  const file = filesStore.files.find((f) => f.id === fileId)
-  if (!file) return
-
-  // 检测是否已经是源码文件
-  if (isLuaSource(file.bytes)) {
-    // 遵循反编译参数中配置的字符串编码
-    const encoding = settingsStore.options.parse.stringEncoding
-    const sourceText = new TextDecoder(browserTextEncoding(encoding), { fatal: false }).decode(
-      file.bytes,
-    )
-    filesStore.updateFileStatus(fileId, 'skipped', sourceText)
-    return
-  }
-
-  filesStore.updateFileStatus(fileId, 'processing')
-
-  try {
-    const currentFile = filesStore.files.find((f) => f.id === fileId)
-    if (!currentFile) return
-
-    const bytes = new Uint8Array(currentFile.bytes)
-    const options = settingsStore.options
-
-    // 先查询 IndexedDB 缓存
-    const cached = await getCached(bytes, options)
-    if (cached !== undefined) {
-      filesStore.updateFileStatus(fileId, 'success', cached)
-      return
-    }
-
-    const source = await decompiler.decompile(fileId, bytes, options)
-    filesStore.updateFileStatus(fileId, 'success', source)
-
-    // 异步写入缓存（不阻塞 UI）
-    setCache(currentFile.bytes, options, source)
-  } catch (err) {
-    // cancel 引起的拒绝不视为错误
-    if (err instanceof Error && err.message === 'Cancelled') return
-    console.error(`[decompile] file ${fileId} failed:`, err)
-    filesStore.updateFileStatus(
-      fileId,
-      'error',
-      undefined,
-      err instanceof Error ? err.message : String(err),
-    )
-  }
-}
-
 async function onDrop(e: DragEvent) {
+  if (!e.dataTransfer?.types.includes('Files')) return
   const entries = await handleDrop(e)
-  processFiles(entries)
+  await processFiles(entries)
 }
 
 async function onFileInputChange(e: Event) {
@@ -213,14 +163,14 @@ async function onFileInputChange(e: Event) {
   if (!input.files) return
   const entries = await handleFileInput(input.files)
   input.value = '' // 重置以允许再次选择相同文件
-  processFiles(entries)
+  await processFiles(entries)
 }
 
 /**
  * 文件夹选择后弹出 glob 输入对话框，让用户指定匹配模式。
  * 只有匹配的文件才会被加入列表并反编译。
  */
-const folderGlobPattern = shallowRef('**/*.lua')
+const folderGlobPattern = shallowRef('**/*')
 
 async function onFolderInputChange(e: Event) {
   const input = e.target as HTMLInputElement
@@ -243,7 +193,7 @@ async function onFolderInputChange(e: Event) {
           'onUpdate:value': (v: string) => {
             inputRef.value = v
           },
-          placeholder: '**/*.lua',
+          placeholder: '**/*',
         }),
       positiveText: 'OK',
       negativeText: t('filePanel.globDialog.cancel'),
@@ -274,9 +224,10 @@ function openFolderPicker() {
 
 /** 键盘上下导航文件列表，Delete 删除当前选中文件 */
 function handleKeyNavigation(e: KeyboardEvent) {
-  if (shouldIgnoreDocumentShortcutTarget(e.target)) return
+  const target = e.target as HTMLElement
+  if (!target.closest('.file-select') && shouldIgnoreDocumentShortcutTarget(e.target)) return
 
-  const files = filesStore.files
+  const files = visibleFiles.value
   if (files.length === 0) return
 
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -288,7 +239,7 @@ function handleKeyNavigation(e: KeyboardEvent) {
     } else {
       nextIndex = currentIndex > 0 ? currentIndex - 1 : files.length - 1
     }
-    filesStore.selectFile(files[nextIndex].id)
+    selectFile(files[nextIndex].id)
   } else if (e.key === 'Delete') {
     if (filesStore.selectedFileId) {
       filesStore.removeFile(filesStore.selectedFileId)
@@ -297,7 +248,6 @@ function handleKeyNavigation(e: KeyboardEvent) {
 }
 
 onMounted(async () => {
-  document.addEventListener('keydown', handleKeyNavigation)
   // 从 IndexedDB 恢复文件历史并自动反编译
   const restored = await filesStore.restoreFromHistory()
   for (const entry of restored) {
@@ -305,55 +255,43 @@ onMounted(async () => {
   }
 })
 
-onUnmounted(() => {
-  document.removeEventListener('keydown', handleKeyNavigation)
-})
-
-/** 设置变更时取消正在进行的任务并重新反编译所有文件 */
+/** 非方言设置继续应用到已有文件；方言仅是新导入文件的默认值。 */
 watch(
-  () => ({ ...settingsStore.options }),
+  () => [
+    settingsStore.options.parse,
+    settingsStore.options.readability,
+    settingsStore.options.naming,
+    settingsStore.options.generate,
+  ],
   () => {
     decompiler.cancelAll()
-    const filesToRecompile = filesStore.files.filter(
-      (f) => f.status === 'success' || f.status === 'error',
-    )
+    const filesToRecompile = filesStore.files.filter((f) => f.status !== 'skipped')
     for (const file of filesToRecompile) {
       decompileFile(file.id)
     }
   },
   { deep: true },
 )
+function selectFile(id: string) {
+  filesStore.selectFile(id)
+  emit('selected')
+}
+
+defineExpose({ onDrop, isDragging, handleDragOver, handleDragLeave })
 </script>
 
 <template>
-  <aside
-    class="flex shrink-0 flex-col"
-    style="border-right: 1px solid var(--app-border)"
-    @drop="onDrop"
-    @dragover="handleDragOver"
-    @dragleave="handleDragLeave"
-  >
-    <!-- 标题栏 -->
-    <div class="flex items-center justify-between px-3 py-2" style="border-bottom: 1px solid var(--app-border)">
-      <span class="text-sm font-medium">{{ t('filePanel.title') }}</span>
-      <div class="flex gap-1">
-        <NButton quaternary size="tiny" @click="openFilePicker">
-          <template #icon>
-            <NIcon>
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
-            </NIcon>
-          </template>
-        </NButton>
-        <NButton quaternary size="tiny" @click="openFolderPicker">
-          <template #icon>
-            <NIcon>
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-            </NIcon>
-          </template>
-        </NButton>
-      </div>
+  <aside class="file-panel" :aria-label="t('filePanel.title')" @keydown="handleKeyNavigation">
+    <div class="panel-heading">
+      <span>{{ t('workspace.files') }}</span><span class="count-badge">{{ filesStore.files.length }}</span>
     </div>
-
+    <div class="import-actions">
+      <NButton type="primary" @click="openFilePicker"><template #icon><i-mdi-plus /></template>{{ t('filePanel.openFile') }}</NButton>
+      <NButton secondary :title="t('filePanel.openFolder')" :aria-label="t('filePanel.openFolder')" @click="openFolderPicker"><template #icon><i-mdi-folder-plus-outline /></template></NButton>
+    </div>
+    <div v-if="filesStore.files.length" class="px-3 pb-3">
+      <NInput v-model:value="searchQuery" :placeholder="t('workspace.searchFiles')" :input-props="{ 'aria-label': t('workspace.searchFiles') }" clearable size="small"><template #prefix><i-mdi-magnify /></template></NInput>
+    </div>
     <!-- 批量进度条 -->
     <div v-if="batchProgress" class="px-3 py-1.5">
       <NProgress
@@ -382,37 +320,39 @@ watch(
 
     <!-- 文件列表 -->
     <NScrollbar class="flex-1">
-      <div
-        v-if="filesStore.files.length === 0"
-        class="flex h-full flex-col items-center justify-center p-4"
-        :class="{ 'bg-indigo-50 dark:bg-indigo-950/30': isDragging }"
-      >
-        <NEmpty :description="t('filePanel.dropHint')" />
+      <div v-if="filesStore.files.length === 0" class="file-empty">
+        <i-mdi-file-document-multiple-outline class="text-3xl" />
+        <p>{{ t('filePanel.empty') }}</p>
+        <span>{{ t('workspace.fileHint') }}</span>
       </div>
+      <div v-else-if="visibleFiles.length === 0" class="file-empty"><p>{{ t('filePanel.noFiles') }}</p></div>
       <!-- 有目录结构时使用树形视图 -->
       <FileTreeView
         v-else-if="hasNestedFiles"
-        :files="filesStore.files"
+        :files="visibleFiles"
         :selected-file-id="filesStore.selectedFileId"
-        @select="filesStore.selectFile($event)"
+        @select="selectFile($event)"
         @remove="(id: string) => { decompiler.cancel(id); filesStore.removeFile(id) }"
         @remove-folder="(path: string) => { filesStore.removeByPrefix(path + '/') }"
         @recompile="decompileFile($event)"
+        @dialect="(id: string, value: UnluacDialect) => changeDialect(id, value)"
       />
       <!-- 无目录结构时使用扁平列表 -->
       <div v-else class="py-1">
         <FileListItem
-          v-for="file in filesStore.files"
+          v-for="file in visibleFiles"
           :key="file.id"
           :file="file"
           :selected="file.id === filesStore.selectedFileId"
-          @select="filesStore.selectFile(file.id)"
+          @select="selectFile(file.id)"
           @remove="decompiler.cancel(file.id); filesStore.removeFile(file.id)"
           @recompile="decompileFile(file.id)"
+          @dialect="changeDialect(file.id, $event)"
         />
       </div>
     </NScrollbar>
 
+    <div class="file-panel-footer"><i-mdi-harddisk class="shrink-0" /><span>{{ t('workspace.history') }}</span></div>
     <!-- 隐藏的 file inputs -->
     <input
       ref="fileInput"

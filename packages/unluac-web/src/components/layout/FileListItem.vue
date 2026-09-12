@@ -6,9 +6,10 @@
  * 不持有状态，纯展示组件，所有操作通过 emit 通知父组件。
  */
 
-import { computed, inject, shallowRef } from 'vue'
+import { computed, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { FileEntry } from '@/types/decompiler'
+import type { FileEntry, UnluacDialect } from '@/types/decompiler'
+import { dialectOptions } from '@/utils/dialects'
 
 const props = defineProps<{
   file: FileEntry
@@ -19,11 +20,14 @@ const emit = defineEmits<{
   select: []
   remove: []
   recompile: []
+  dialect: [value: UnluacDialect]
 }>()
 
 const { t } = useI18n()
-
-const startCompare = inject<((fileId: string) => void) | null>('startCompare', null)
+const dialectLabel = computed(
+  () => dialectOptions.find((option) => option.value === props.file.dialect)?.label,
+)
+const dialectMenu = dialectOptions.map(({ label, value }) => ({ label, key: value }))
 
 const showContextMenu = shallowRef(false)
 const contextMenuX = shallowRef(0)
@@ -31,7 +35,11 @@ const contextMenuY = shallowRef(0)
 
 const contextMenuOptions = computed(() => [
   { label: t('filePanel.contextMenu.recompile'), key: 'recompile' },
-  { label: t('filePanel.contextMenu.download'), key: 'download' },
+  {
+    label: t('filePanel.contextMenu.download'),
+    key: 'download',
+    disabled: props.file.result === undefined,
+  },
   { label: t('filePanel.contextMenu.remove'), key: 'remove' },
 ])
 
@@ -46,9 +54,6 @@ function handleContextAction(key: string) {
   switch (key) {
     case 'recompile':
       emit('recompile')
-      break
-    case 'compare':
-      startCompare?.(props.file.id)
       break
     case 'download':
       downloadResult()
@@ -66,8 +71,8 @@ function openContextMenu(e: MouseEvent) {
 }
 
 function downloadResult() {
-  if (!props.file.result) return
-  const blob = new Blob([props.file.result], { type: 'text/x-lua' })
+  if (props.file.result === undefined) return
+  const blob = new Blob([props.file.editedResult ?? props.file.result], { type: 'text/x-lua' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -81,17 +86,14 @@ function downloadResult() {
   <!-- NDropdown 使用 x/y 定位时进入 positionManually 模式，不会渲染默认 slot，
        因此必须将菜单与触发元素并列放置，而非让 NDropdown 包裹触发元素 -->
   <div
-    class="group flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm transition-colors"
-    :class="[
-      selected
-        ? 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200'
-        : 'hover:bg-gray-100 dark:hover:bg-gray-800',
-    ]"
-    @click="emit('select')"
+    class="file-row"
+    :class="{ selected }"
+    :title="file.relativePath"
     @contextmenu.prevent="openContextMenu"
   >
+    <button class="file-select" :aria-pressed="selected" @click="emit('select')">
     <!-- 状态指示器 -->
-    <NIcon :size="14">
+    <NIcon :size="17" :title="t(`filePanel.status.${file.status}`)">
       <svg v-if="file.status === 'pending'" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-gray-400"><circle cx="12" cy="12" r="10"/></svg>
       <svg v-else-if="file.status === 'processing'" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin text-blue-500"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
       <svg v-else-if="file.status === 'success'" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-green-500"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
@@ -100,47 +102,27 @@ function downloadResult() {
       <svg v-else xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-red-500"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
     </NIcon>
 
-    <!-- 文件信息 -->
-    <div class="min-w-0 flex-1">
-      <div class="truncate">{{ file.name }}</div>
-      <div
-        v-if="file.relativePath !== file.name"
-        class="truncate text-xs text-gray-400 dark:text-gray-500"
-      >
-        {{ file.relativePath }}
-      </div>
-    </div>
+    <span class="min-w-0 flex-1 text-left">
+      <span class="block truncate font-medium">{{ file.name }}</span>
+      <span class="file-meta">{{ formatSize(file.size) }} · {{ t(`filePanel.status.${file.status}`) }}</span>
+    </span>
+    </button>
+    <NTag v-if="file.status === 'skipped'" size="small" :bordered="false">
+      {{ t('filePanel.sourceTag') }}
+    </NTag>
+    <NDropdown v-else trigger="click" :options="dialectMenu" @select="(value: UnluacDialect) => emit('dialect', value)">
+      <button
+        type="button"
+        class="dialect-tag"
+        :title="t('filePanel.fileDialect')"
+        :aria-label="`${file.name}: ${t('filePanel.fileDialect')}`"
+        @click.stop
+      >{{ dialectLabel }}</button>
+    </NDropdown>
 
-    <!-- 文件大小 / hover 时显示操作按钮 -->
-    <span class="shrink-0 text-xs text-gray-400 group-hover:hidden dark:text-gray-500">
-      {{ formatSize(file.size) }}
-    </span>
-    <span class="hidden shrink-0 items-center gap-0.5 group-hover:flex">
-      <!-- 重新反编译 -->
-      <button
-        class="rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-200 hover:text-blue-600 dark:text-gray-500 dark:hover:bg-gray-700 dark:hover:text-blue-400"
-        :title="t('filePanel.contextMenu.recompile')"
-        @click.stop="emit('recompile')"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-      </button>
-      <!-- 下载结果 -->
-      <button
-        class="rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-200 hover:text-green-600 dark:text-gray-500 dark:hover:bg-gray-700 dark:hover:text-green-400"
-        :title="t('filePanel.contextMenu.download')"
-        @click.stop="downloadResult()"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      </button>
-      <!-- 移除 -->
-      <button
-        class="rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-200 hover:text-red-600 dark:text-gray-500 dark:hover:bg-gray-700 dark:hover:text-red-400"
-        :title="t('filePanel.contextMenu.remove')"
-        @click.stop="emit('remove')"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
-    </span>
+    <NDropdown trigger="click" :options="contextMenuOptions" @select="handleContextAction">
+      <button type="button" class="file-menu icon-button" :aria-label="`${file.name}: ${t('workspace.fileActions')}`" :title="t('workspace.fileActions')"><i-mdi-dots-vertical /></button>
+    </NDropdown>
   </div>
 
   <NDropdown

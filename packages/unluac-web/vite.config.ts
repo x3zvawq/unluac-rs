@@ -9,9 +9,11 @@ import Components from 'unplugin-vue-components/vite'
 import { defineConfig } from 'vite'
 import packageJson from './package.json'
 import { wasmBuildPlugin } from './plugins/vite-plugin-wasm-build'
+import { seoPlugin } from './plugins/vite-plugin-seo'
 
 export default defineConfig({
   plugins: [
+    seoPlugin(),
     wasmBuildPlugin(),
     vue(),
     tailwindcss(),
@@ -38,6 +40,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': resolve(__dirname, 'src'),
+      '@logo': resolve(__dirname, '../../logo.svg'),
     },
   },
   define: {

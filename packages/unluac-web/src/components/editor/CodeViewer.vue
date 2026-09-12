@@ -13,6 +13,7 @@
  * - 移动端表现更好
  */
 
+import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
 import { defaultHighlightStyle, StreamLanguage, syntaxHighlighting } from '@codemirror/language'
 import { lua } from '@codemirror/legacy-modes/mode/lua'
 import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
@@ -105,6 +106,8 @@ const editorContainer = useTemplateRef<HTMLDivElement>('editorContainer')
 let editorView: EditorView | null = null
 
 const copied = shallowRef(false)
+const wrapLines = shallowRef(false)
+const wrapCompartment = new Compartment()
 
 const selectedFile = computed(() => filesStore.selectedFile)
 
@@ -117,7 +120,7 @@ const showError = computed(() => selectedFile.value?.status === 'error')
 const showCode = computed(
   () =>
     (selectedFile.value?.status === 'success' || selectedFile.value?.status === 'skipped') &&
-    selectedFile.value.result,
+    selectedFile.value.result !== undefined,
 )
 
 const codeContent = computed(() => {
@@ -146,6 +149,9 @@ function themeExtension(dark: boolean): Extension {
 function createExtensions(dark: boolean) {
   const extensions = [
     lineNumbers(),
+    history(),
+    keymap.of([...defaultKeymap, ...historyKeymap]),
+    wrapCompartment.of(wrapLines.value ? EditorView.lineWrapping : []),
     highlightActiveLine(),
     highlightSelectionMatches(),
     search(),
@@ -154,7 +160,23 @@ function createExtensions(dark: boolean) {
     highlightField,
     highlightLineTheme,
     EditorView.theme({
-      '&': { height: '100%' },
+      '&': {
+        height: '100%',
+        backgroundColor: 'var(--app-bg)',
+        color: 'var(--app-text)',
+        fontSize: '13px',
+      },
+      '.cm-content': {
+        padding: '16px 0',
+        fontFamily: '"Cascadia Code", "SFMono-Regular", Consolas, monospace',
+        lineHeight: '1.75',
+      },
+      '.cm-gutters': {
+        backgroundColor: 'var(--app-bg)',
+        color: 'var(--app-text-dim)',
+        border: 'none',
+      },
+      '.cm-lineNumbers .cm-gutterElement': { padding: '0 14px' },
       '.cm-scroller': { overflow: 'auto' },
     }),
     themeCompartment.of(themeExtension(dark)),
@@ -186,6 +208,22 @@ function initEditor() {
     parent: editorContainer.value,
   })
 }
+
+// 文件切换需要新的撤销栈，避免撤销操作把上一个文件的源码带入当前文件。
+watch(
+  () => selectedFile.value?.id,
+  () => {
+    editorView?.setState(
+      EditorState.create({ doc: codeContent.value, extensions: createExtensions(isDark.value) }),
+    )
+  },
+)
+
+watch(wrapLines, (wrap) =>
+  editorView?.dispatch({
+    effects: wrapCompartment.reconfigure(wrap ? EditorView.lineWrapping : []),
+  }),
+)
 
 // 代码内容变化时更新编辑器（文件切换触发）
 watch(codeContent, (newCode) => {
@@ -274,7 +312,7 @@ function downloadAll() {
   // 单文件直接下载
   if (successFiles.length === 1) {
     const file = successFiles[0]
-    const blob = new Blob([file.result!], { type: 'text/x-lua' })
+    const blob = new Blob([file.editedResult ?? file.result!], { type: 'text/x-lua' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -286,7 +324,7 @@ function downloadAll() {
 
   // 多文件：逐个下载（后续可替换为 zip 打包）
   for (const file of successFiles) {
-    const blob = new Blob([file.result!], { type: 'text/x-lua' })
+    const blob = new Blob([file.editedResult ?? file.result!], { type: 'text/x-lua' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -316,13 +354,15 @@ function restoreOriginal() {
     <!-- 工具栏 -->
     <div
       v-if="showCode"
-      class="flex shrink-0 items-center gap-1 px-3 py-1.5"
+      class="code-toolbar"
       style="border-bottom: 1px solid var(--app-border)"
     >
       <span class="flex-1 truncate text-sm" style="color: var(--app-text-secondary)">
-        {{ selectedFile?.name }}
+        {{ t('tabs.code') }} <span class="code-file-path">/ {{ selectedFile?.relativePath }}</span>
       </span>
 
+      <NButton quaternary size="small" :aria-label="t('workspace.wrapLines')" :title="t('workspace.wrapLines')" :aria-pressed="wrapLines" @click="wrapLines = !wrapLines"><template #icon><i-mdi-wrap /></template></NButton>
+      <span v-if="copied" class="copy-feedback" role="status">{{ t('codeView.copied') }}</span>
       <!-- 已修改警告 -->
       <NTooltip v-if="isModified">
         <template #trigger>
@@ -337,7 +377,7 @@ function restoreOriginal() {
       <!-- 恢复原始结果 -->
       <NTooltip v-if="isModified">
         <template #trigger>
-          <NButton quaternary size="tiny" @click="restoreOriginal">
+          <NButton quaternary size="small" :aria-label="t('codeView.restore')" @click="restoreOriginal">
             <template #icon>
               <NIcon>
                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
@@ -350,7 +390,7 @@ function restoreOriginal() {
 
       <NTooltip>
         <template #trigger>
-          <NButton quaternary size="tiny" @click="copyToClipboard">
+          <NButton quaternary size="small" :aria-label="t('codeView.copy')" @click="copyToClipboard">
             <template #icon>
               <NIcon>
                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
@@ -363,7 +403,7 @@ function restoreOriginal() {
 
       <NTooltip>
         <template #trigger>
-          <NButton quaternary size="tiny" @click="downloadFile">
+          <NButton quaternary size="small" :aria-label="t('codeView.download')" @click="downloadFile">
             <template #icon>
               <NIcon>
                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -376,7 +416,7 @@ function restoreOriginal() {
 
       <NTooltip v-if="filesStore.files.filter(f => f.status === 'success').length > 1">
         <template #trigger>
-          <NButton quaternary size="tiny" @click="downloadAll">
+          <NButton quaternary size="small" :aria-label="t('codeView.downloadAll')" @click="downloadAll">
             <template #icon>
               <NIcon>
                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/><line x1="3" y1="21" x2="21" y2="21"/></svg>
@@ -425,7 +465,7 @@ function restoreOriginal() {
             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
-          Decompiling...
+          {{ t('filePanel.status.processing') }}…
         </div>
       </div>
     </div>

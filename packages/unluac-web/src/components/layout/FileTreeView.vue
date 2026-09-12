@@ -8,6 +8,7 @@
  * 如果所有文件都在根目录（无嵌套），则退化为普通扁平列表。
  */
 
+import type { UnluacDialect } from '@/types/decompiler'
 import { computed, reactive } from 'vue'
 import type { FileEntry } from '@/types/decompiler'
 
@@ -35,6 +36,7 @@ const emit = defineEmits<{
   remove: [id: string]
   removeFolder: [path: string]
   recompile: [id: string]
+  dialect: [id: string, value: UnluacDialect]
 }>()
 
 // 记录每个目录的折叠状态，默认展开
@@ -105,6 +107,7 @@ const tree = computed<TreeNode[]>(() => {
           @remove="(id: string) => emit('remove', id)"
           @remove-folder="(path: string) => emit('removeFolder', path)"
           @recompile="(id: string) => emit('recompile', id)"
+          @dialect="(id: string, value: UnluacDialect) => emit('dialect', id, value)"
         />
       </template>
       <!-- 根目录文件 -->
@@ -115,6 +118,7 @@ const tree = computed<TreeNode[]>(() => {
           @select="emit('select', node.entry.id)"
           @remove="emit('remove', node.entry.id)"
           @recompile="emit('recompile', node.entry.id)"
+          @dialect="emit('dialect', node.entry.id, $event)"
         />
       </template>
     </template>

@@ -174,6 +174,7 @@ type WasmInitArgument =
 
 interface WasmBindings {
   default(input?: WasmInitArgument): Promise<unknown>;
+  detectDialect(bytes: Uint8Array): Exclude<UnluacDialect, "auto"> | null;
   decompile(bytes: Uint8Array, options: UnluacDecompileOptions): string;
   decompileRich(bytes: Uint8Array, options: UnluacDecompileOptions): UnluacRichResult;
   supportedOptionValues(): UnluacSupportedOptionValues;
@@ -249,6 +250,14 @@ export async function decompile(
   await init();
   const bindings = await loadBindings();
   return bindings.decompile(toUint8Array(bytes), options);
+}
+
+/** Detect bytecode with the core parser; null means ordinary source input. */
+export async function detectDialect(
+  bytes: UnluacBytes
+): Promise<Exclude<UnluacDialect, "auto"> | null> {
+  await init();
+  return (await loadBindings()).detectDialect(toUint8Array(bytes));
 }
 
 export async function decompileRich(

@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "Ordner entfernen"
-    }
+    },
+    "sourceTag": "Quelltext",
+    "fileDialect": "Lua-Dialekt dieser Datei ändern"
   },
   "codeView": {
     "placeholder": "Datei zum Dekompilieren auswählen",
@@ -144,7 +146,7 @@
       "comment": "Kommentare ausgeben"
     },
     "tips": {
-      "dialect": "Ziel-Lua-Dialekt, beeinflusst das Verhalten von Parser und Generator. CLI: --dialect / -D",
+      "dialect": "Gilt nur für neu importierte Dateien. Klicken Sie auf die Versionsmarkierung einer Datei, um ihren Dialekt zu ändern.",
       "generateMode": "Fehlerbehandlungsstrategie. strict: bei nicht unterstützter Syntax oder Fehler stoppen; permissive: so viel wie möglich ausgeben. CLI: --generate-mode / -g",
       "parseMode": "Parser-Strenge. strict: strenge Validierung; permissive: nicht-standardmäßigen Bytecode tolerieren. CLI: --parse-mode / -p",
       "stringEncoding": "Kodierung für die Dekodierung von String-Konstanten. CLI: --encoding / -e",
@@ -190,12 +192,32 @@
           "description": "Neben dem Quelltext kannst du Dateien stapelweise verarbeiten, Ausgaben vergleichen und strukturierte Proto- / CFG-Analysen einsehen."
         }
       }
-    }
+    },
+    "importDialect": "Standarddialekt für neue Dateien"
   },
   "diff": {
     "left": "Links",
     "right": "Rechts",
     "selectFile": "Datei auswählen",
     "hint": "Zwei dekompilierte Dateien zum Vergleichen auswählen"
+  },
+  "workspace": {
+    "local": "Lokal ausgeführt",
+    "files": "Arbeitsbereich",
+    "searchFiles": "Datei suchen…",
+    "fileHint": "Öffne eine Datei oder einen Ordner. Die Lua-Version wird pro Datei gespeichert.",
+    "history": "Der Verlauf bleibt in diesem Browser",
+    "fileActions": "Dateiaktionen",
+    "headline": "Lua-Bytecode,",
+    "headlineAccent": "wieder lesbar.",
+    "description": "Quelltext rekonstruieren und Programmstrukturen erkunden. Direkt im Browser.",
+    "importHint": "Beliebige Dateinamen. Einzelne Dateien oder ganze Ordner.",
+    "privacy": "Dateien werden auf deinem Gerät verarbeitet, ohne Server-Upload.",
+    "multiDialect": "Mehrere Dialekte",
+    "explore": "Code erkunden",
+    "exploreHint": "Funktionen, Konstanten und Kontrollfluss untersuchen.",
+    "analysis": "Struktur",
+    "wrapLines": "Zeilenumbruch",
+    "settingsHint": "Änderungen gelten sofort. Jede Datei behält ihren Lua-Dialekt."
   }
 }

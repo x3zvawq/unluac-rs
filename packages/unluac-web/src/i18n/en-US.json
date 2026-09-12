@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "Remove Folder"
-    }
+    },
+    "sourceTag": "Source",
+    "fileDialect": "Change this file’s Lua dialect"
   },
   "codeView": {
     "placeholder": "Select a file to start decompiling",
@@ -148,7 +150,7 @@
       "comment": "Emit Comments"
     },
     "tips": {
-      "dialect": "Target Lua dialect, affects parser and generator behavior. CLI: --dialect / -D",
+      "dialect": "Applies only to newly imported files. Click a file’s version tag to change its dialect.",
       "generateMode": "Error handling strategy. strict: stop on unsupported syntax or errors; permissive: output as much as possible. CLI: --generate-mode / -g",
       "parseMode": "Parser strictness. strict: strict validation; permissive: tolerate non-standard bytecode. CLI: --parse-mode / -p",
       "stringEncoding": "Encoding for string constant decoding. auto detects common legacy encodings. CLI: --encoding / -e",
@@ -196,12 +198,32 @@
           "description": "Alongside source code, you can batch process files, compare outputs, and inspect structured Proto / CFG analysis."
         }
       }
-    }
+    },
+    "importDialect": "Default dialect for new files"
   },
   "diff": {
     "left": "Left",
     "right": "Right",
     "selectFile": "Select file",
     "hint": "Select two decompiled files to compare"
+  },
+  "workspace": {
+    "local": "Runs locally",
+    "files": "Workspace",
+    "searchFiles": "Find a file…",
+    "fileHint": "Open a file or folder to get started. Each file keeps its own Lua version.",
+    "history": "File history stays in this browser",
+    "fileActions": "File actions",
+    "headline": "Lua bytecode,",
+    "headlineAccent": "made readable.",
+    "description": "Recover source, explore program structure, and make sense of compiled Lua. Available in your browser, too.",
+    "importHint": "Any filename. One file or a whole folder.",
+    "privacy": "Files are processed on your device, without server uploads.",
+    "multiDialect": "Multiple dialects",
+    "explore": "Look inside",
+    "exploreHint": "Explore functions, constants and control flow.",
+    "analysis": "Structure",
+    "wrapLines": "Wrap lines",
+    "settingsHint": "Changes apply automatically. Each file keeps its own Lua dialect."
   }
 }

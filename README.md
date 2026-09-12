@@ -1,290 +1,137 @@
-# unluac-rs
+<p align="center">
+  <img src="./logo.svg" width="112" height="112" alt="unluac-rs logo" />
+</p>
 
-[简体中文](./README_cn.md) | English
+<h1 align="center">unluac-rs</h1>
 
-> This repository is still in a testing phase, and its behavior, APIs, and output details may continue to evolve. Bug reports, problematic test cases, incompatibility findings, usage feedback, and release-related suggestions are all very welcome.
-> If you are using this decompiler and run into bytecode files that decompile poorly, please make sure to share a reproducible sample. Real-world samples are essential for improving the current logic, covering edge cases, and steadily raising output quality.
+<p align="center"><a href="./README_cn.md">简体中文</a> | English</p>
 
-A multi-dialect Lua decompiler written in Rust.
+<p align="center">
+  <a href="https://crates.io/crates/unluac"><img src="https://img.shields.io/crates/v/unluac?style=flat-square&amp;color=147d69" alt="crates.io" /></a>
+  <a href="https://www.npmjs.com/package/unluac-js"><img src="https://img.shields.io/npm/v/unluac-js?style=flat-square&amp;color=147d69" alt="npm" /></a>
+  <a href="https://github.com/x3zvawq/unluac-rs/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/x3zvawq/unluac-rs/release.yml?style=flat-square&amp;label=release%20checks" alt="Release checks" /></a>
+  <a href="https://github.com/x3zvawq/unluac-rs/actions/workflows/deploy-web.yml"><img src="https://img.shields.io/github/actions/workflow/status/x3zvawq/unluac-rs/deploy-web.yml?style=flat-square&amp;label=web%20build" alt="Web build and deployment" /></a>
+  <a href="https://docs.rs/unluac"><img src="https://img.shields.io/docsrs/unluac?style=flat-square" alt="Rust API documentation" /></a>
+  <a href="./LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-596584?style=flat-square" alt="MIT License" /></a>
+</p>
 
-Published entry points:
-
-- Web interface at [unluac.x3zvawq.com](https://unluac.x3zvawq.com)
-- Rust crate [`unluac`](https://crates.io/crates/unluac)
-- Standalone CLI binaries on [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases)
-- npm package [`unluac-js`](https://www.npmjs.com/package/unluac-js)
-- API documentation on [docs.rs](https://docs.rs/unluac)
+<p align="center">
+  <a href="https://unluac.x3zvawq.com">Open the Web App</a> ·
+  <a href="https://github.com/x3zvawq/unluac-rs/releases">Download CLI</a> ·
+  <a href="https://docs.rs/unluac">API Docs</a>
+</p>
 
 ## Introduction
 
-The project currently supports the following Lua versions and dialects:
+**Lua bytecode, made readable.** unluac-rs is a multi-dialect Lua decompiler written in Rust. It reconstructs readable source from compiled chunks, with a browser workspace for exploring the code and libraries for integrating decompilation into your own tools.
 
-- [Lua 5.1](https://www.lua.org/versions.html#5.1)
-- [Lua 5.2](https://www.lua.org/versions.html#5.2)
-- [Lua 5.3](https://www.lua.org/versions.html#5.3)
-- [Lua 5.4](https://www.lua.org/versions.html#5.4)
-- [Lua 5.5](https://www.lua.org/versions.html#5.5)
-- [LuaJIT 2.1](https://luajit.org/)
-- [Luau](https://luau.org/)
-
-It uses control-flow analysis, dominator-tree analysis, and later pipeline normalization passes to eliminate most intermediate variables. For the cases currently tracked in this repository, it can usually reconstruct source code with a close-to-original shape.
-
-The repository is organized roughly like this:
-
-- Root package `unluac`: core decompiler library
-- `packages/unluac-cli`: command-line entry point
-- `packages/unluac-wasm`: wasm bindings
-- `packages/unluac-js`: npm wrapper package
-- `xtask`: test orchestration and Lua toolchain helpers
+- **Lua 5.1–5.5, LuaJIT 2.1 and Luau** in one decompiler, with automatic bytecode dialect detection.
+- **Source recovery built on program analysis:** control flow, bindings and value lifetimes inform the reconstruction of expressions, functions and structured statements.
+- **A workspace for mixed versions:** open files or folders, keep a separate dialect per file, edit and export source, and inspect functions, constants and control-flow graphs.
+- **Runs where you need it:** locally in your browser through WebAssembly, from the command line, or inside Rust and JavaScript applications. The web app processes files on your device without uploading them to a server.
 
 ## Usage
 
-The project is currently distributed through these entry points:
+### Web
 
-1. **Web interface**: visit [unluac.x3zvawq.com](https://unluac.x3zvawq.com) — upload and decompile directly in the browser with no installation required.
-2. **CLI**: use the standalone binary from GitHub Releases, or run/build `unluac-cli` from this repository.
-3. **Rust library**: add the published crate `unluac` to a Rust project and call the decompilation pipeline directly.
-4. **npm package**: install `unluac-js` for Node.js or bundler-based browser environments.
-5. **WebAssembly**: use `packages/unluac-wasm` directly when you want to build your own runtime wrapper on top of the wasm layer.
+**[Open unluac.x3zvawq.com →](https://unluac.x3zvawq.com)**
 
-### Web Interface
+Drop compiled files anywhere in the workspace, or open a file or folder. Bytecode is recognized by its contents, so no particular extension is required. Source files can also be opened for reading and editing.
 
-Visit [unluac.x3zvawq.com](https://unluac.x3zvawq.com) to upload `.luac` / `.out` files and decompile them directly in the browser — no tooling required.
+Each file keeps its own Lua dialect. Click its version tag to change it; the dialect in Settings is only the default for new imports. Other decompilation settings apply to existing files automatically. File bytes and dialect choices are saved in the current browser; results are regenerated on reload, and manual edits should be downloaded before leaving.
 
-The site is hosted on Vercel and may be inaccessible in some network environments (e.g. mainland China). If you run into connectivity issues, consider the alternatives below:
+Use the **Structure** panel to explore functions and constants, then select a function to inspect its control-flow graph. Collapse the panel when you want more room for the source.
 
-- Use the standalone CLI binary — works fully offline
-- Use the npm package to run decompilation locally in a bundled browser environment
-- Self-host the web interface using `packages/unluac-wasm`
+If the hosted site is unavailable on your network, use the CLI below or [run the web app locally](./packages/unluac-web/README.md).
 
 ### CLI
 
-The published CLI package in this repository is `unluac-cli`.
-
-Recommended installation paths:
-
-- Download a standalone binary from [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases) and place it on your PATH under a stable name such as `unluac-cli`
-- Build and install it from a local checkout:
+Download a binary for your platform from [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases), or install from a local checkout:
 
 ```bash
 cargo install --path packages/unluac-cli
 ```
 
-- Run it directly from this repository during development:
+Decompile a chunk with automatic dialect detection:
 
 ```bash
-cargo run -p unluac-cli -- --help
+unluac-cli -i sample.luac -o recovered.lua
 ```
 
-If you are working inside this repository, `.cargo/config.toml` still provides `cargo unluac -- ...` as a local alias, but the documented CLI name is `unluac-cli` because that matches the published package.
-
-Typical usage:
+Choose a dialect explicitly, read from stdin, or compile a source file before decompiling it:
 
 ```bash
-unluac-cli -i /absolute/path/to/chunk.out -D lua5.1
-unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1
-unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false
-unluac-cli -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false --ignore-debug
-unluac-cli -i /absolute/path/to/chunk.out -D lua5.1 -o /tmp/case.lua
-cat /absolute/path/to/chunk.out | unluac-cli -i - -D lua5.1
+unluac-cli -i sample.luac -D lua5.4
+cat sample.luac | unluac-cli -i -
+unluac-cli -s example.lua -D lua5.4
 ```
 
-Notes:
+Source input (`--source`) requires an explicit dialect and a compatible external compiler; release binaries do not bundle one. Set `--luac` to its path, or make it available on PATH. Source compilation strips debug metadata by default; use `--strip false` to retain it. `--ignore-debug` independently excludes available debug information from recovery for either input mode.
 
-- The CLI requires either `-i/--input` or `-s/--source`
-- Pass `-i -` to read a compiled chunk from stdin, which is useful in shell pipelines
-- When `-s/--source` is provided, the CLI first invokes an external compiler to produce a chunk, then decompiles that generated chunk
-- Source compilation strips debug/local metadata by default; pass `--strip false` to retain it
-- Available debug metadata is used as high-confidence binding and naming evidence in every naming mode; pass `--ignore-debug` to parse and validate it without publishing it to recovery or generated comments
-- `--strip` only controls compilation through `--source`; `--ignore-debug` independently applies to both `--source` and `--input`
-- `auto` dialect detection applies to compiled bytecode inputs; `--source` still needs an explicit `--dialect` so the CLI can pick the compiler
-- Standalone GitHub Release binaries do not bundle a Lua compiler; `-s/--source` only works when you pass `-l/--luac` explicitly, or when a compatible compiler is available under `lua/build/<dialect>/` or on PATH. On Windows, bundled executable paths use the `.exe` suffix.
-- When `-o/--output` is provided, the CLI writes the final generated source to the target file instead of stdout
-- `-o/--output` only works for pure final-source runs and cannot be combined with debug / timing flags or `--stop-after` earlier than `generate`
-- The CLI prints plain generated source by default and does not emit debug dumps unless you explicitly request them
-- `unluac-cli --help` and `unluac-cli --version` both include the repository link
-- CLI defaults come from the core library's `DecompileOptions::default()`, with CLI debug output disabled unless you explicitly enable it
+Use `--generate-mode strict` when you require target-compatible Lua output. The default permissive mode can return diagnostic pseudocode for constructs that cannot be represented. `--output` writes final source and cannot be combined with debug dumps, timing output or an earlier pipeline stage.
 
-Input options:
+See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.
 
-| Argument | Description | Default |
-| - | - | - |
-| `-D`, `--dialect` | Dialect used for compilation / decompilation (`auto` detects compiled bytecode headers) | `auto` |
-| `-i`, `--input` | Path to a compiled chunk, or `-` for stdin | None |
-| `-s`, `--source` | Path to Lua source; the CLI invokes an external compiler before decompiling | None |
-| `-l`, `--luac` | Explicit compiler path used by `--source` | First tries `lua/build/<dialect>/`, otherwise falls back to a compatible compiler on PATH |
-| `--strip <BOOL>` | Whether source compilation strips debug and local-variable metadata | `true` |
-| `--ignore-debug` | Parse and validate debug sections, but exclude all debug metadata from recovery and generated comments | `false` |
-| `-e`, `--encoding` | String decoding encoding (`auto` or any [Encoding Standard](https://encoding.spec.whatwg.org/) label, e.g. `utf-8`, `gbk`, `shift_jis`, `euc-kr`, `big5`) | `auto` |
-| `-m`, `--decode-mode` | String decode failure strategy | `strict` |
-| `-p`, `--parse-mode` | Strict vs permissive parser mode | `permissive` |
+### Rust
 
-Debug options:
-
-| Argument | Description | Default |
-| - | - | - |
-| `-d`, `--debug` | Enable debug output using the current target stage as the default dump stage | `false` |
-| `--dump` | Dump one or more outer pipeline stages; repeat to request multiple stages | None |
-| `--detail` | Debug output detail level | `normal` when debug is enabled |
-| `-c`, `--color` | Debug color mode | `auto` |
-| `--proto` | Restrict debug dumps to a specific proto id | None |
-| `--proto-depth` | Max depth of child protos expanded relative to the focused proto (`0`/`1`/`2`/…/`all`; default keeps only the focus, elided children appear as single-line summaries) | `0` |
-| `-t`, `--timing` | Print timing report | `false` |
-| `--dump-pass` | Dump before/after snapshots for specific passes (comma-separated names, e.g. `carried-locals,temp-inline`) | None |
-| `--list-protos` | Print a flat listing of every proto (id, parent, lines, instrs, children) and exit after the parse stage | `false` |
-
-Readability and naming options:
-
-| Argument | Description | Default |
-| - | - | - |
-| `--return-inline-max-complexity` | Max inline complexity for returned expressions | `10` |
-| `--index-inline-max-complexity` | Max inline complexity for table index expressions | `10` |
-| `--args-inline-max-complexity` | Max inline complexity for call arguments | `6` |
-| `--access-base-inline-max-complexity` | Max inline complexity for table access bases | `5` |
-| `-n`, `--naming-mode` | Naming strategy | `debug-like` |
-| `--debug-like-include-function` | Whether debug-like names should include function-shaped names | `true` |
-
-All three naming modes prefer valid debug names when available. The selected mode controls only the fallback used when no valid debug name exists.
-
-Generate and output options:
-
-| Argument | Description | Default |
-| - | - | - |
-| `--indent-width` | Generated source indentation width | `4` |
-| `--max-line-length` | Preferred maximum line length | `100` |
-| `--quote-style` | String quote style | `min-escape` |
-| `--number-format` | Number literal style: `decimal` or `hex` for integer literals | `decimal` |
-| `--table-style` | Table constructor layout style | `balanced` |
-| `--luau-vector-library` | Optional library name for the Luau vector constructor; requires `--luau-vector-constructor` | None |
-| `--luau-vector-constructor` | Constructor used to render Luau vector constants and compile Luau `--source` inputs; requires `--luau-vector-size` | None |
-| `--luau-vector-size` | Luau vector width: `3` or `4`; required with `--luau-vector-constructor` | None |
-| `--comment` | Whether to emit generate-stage comments and metadata | `true` |
-| `-g`, `--generate-mode` | `strict` requires target-compatible source; `permissive` may emit Error-marked diagnostic pseudocode | `permissive` |
-| `--stop-after` | Last pipeline stage to run | `generate` |
-| `-o`, `--output` | Write the final generated source to a file instead of stdout | stdout |
-
-Pipeline checkpoint options such as `--dump` and `--stop-after` accept:
-`parser` (`parse`), `transformer` (`transform`), `structure`, `hir`, `ast`, `generate`.
-The `structure` dump includes CFG, graph-facts, dataflow, and structure-facts sections; the `ast` dump includes AST, readability, and naming sections.
-
-For more debugging examples and CLI workflow details, see [docs/debug.md](./docs/debug.md).
-
-### Rust Library
-
-The published crate name is `unluac`.
-
-For released builds, the recommended setup is the crates.io package:
-
-```toml
-[dependencies]
-unluac = "1"
+```bash
+cargo add unluac
 ```
 
-If you need the latest unreleased changes from `main`, use a `git` dependency instead:
-
-```toml
-[dependencies]
-unluac = { git = "https://github.com/x3zvawq/unluac-rs" }
-```
-
-Minimal example:
+The library accepts bytes of a compiled chunk; default options detect the dialect and run through source generation.
 
 ```rust
 use std::fs;
-
-use unluac::decompile::{decompile, DecompileDialect, DecompileOptions, DecompileStage};
+use unluac::decompile::{decompile, DecompileOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = fs::read("sample.out")?;
-
-    let result = decompile(
-        &bytes,
-        DecompileOptions {
-            dialect: DecompileDialect::Lua51,
-            target_stage: DecompileStage::Generate,
-            ..DecompileOptions::default()
-        },
-    )?;
+    let bytes = fs::read("sample.luac")?;
+    let result = decompile(&bytes, DecompileOptions::default())?;
 
     if let Some(generated) = result.state.generated.as_ref() {
         println!("{}", generated.source);
     }
-
     Ok(())
 }
 ```
 
-Things to keep in mind:
+See the [Rust API documentation](https://docs.rs/unluac) for options and pipeline results.
 
-- The library API accepts bytes of an already compiled chunk and does not compile Lua source for you
-- If all you have is Lua source, the CLI is usually the more convenient entry point
-- The main decompiler entry points are re-exported from [src/decompile/mod.rs](./src/decompile/mod.rs)
-
-### npm Package
-
-The published npm package is [`unluac-js`](https://www.npmjs.com/package/unluac-js).
-
-Install it with:
+### JavaScript / TypeScript
 
 ```bash
 npm install unluac-js
 ```
 
-`unluac-js` is a thin TypeScript wrapper around the wasm bindings produced by `packages/unluac-wasm`, with publishable contents narrowed to the built package output.
-
-The published npm wasm build trims out `debug` / `timing` support to keep the package smaller. The CLI and Rust APIs still keep the full debugging surface. The npm-facing `decompile()` API returns the final source string directly instead of exposing intermediate pipeline metadata.
-
-The main public APIs are:
-
-- `init(input?)`
-- `decompile(bytes, options?)`
-- `supportedOptionValues()`
-
-Minimal Node.js example:
+In Node.js, the package initializes its bundled WebAssembly module automatically:
 
 ```js
-import { decompile } from "unluac-js";
 import { readFile } from "node:fs/promises";
+import { decompile } from "unluac-js";
 
-const chunkBytes = await readFile("./sample.luac");
-const source = await decompile(chunkBytes, {
-  dialect: "auto",
-  generate: {
-    // Required when the chunk contains Luau vector constants.
-    luauVectorConstructor: { library: "Vector3", constructor: "new", size: 3 },
-  },
-});
-
+const bytes = await readFile("sample.luac");
+const source = await decompile(bytes, { dialect: "auto" });
 console.log(source);
 ```
 
-For browser usage and more complete package-level examples, see [packages/unluac-js/README.md](./packages/unluac-js/README.md).
+The package also provides `detectDialect()`, `decompileRich()`, `init()` and `supportedOptionValues()`. See the [JavaScript guide](./packages/unluac-js/README.md) for browser bundling, explicit WASM initialization and Luau vector constructor options. Debug dumps and timing are available through the CLI and Rust library.
 
-### WebAssembly
-
-The wasm binding layer lives at [packages/unluac-wasm](./packages/unluac-wasm).
-
-It uses `wasm-bindgen` and `serde-wasm-bindgen` to expose a JS-friendly object protocol instead of leaking Rust internal layouts across the boundary.
-
-If you only want to use this project from JavaScript or TypeScript, the npm wrapper above is the recommended entry point.
-If you need to integrate the wasm layer into another language or runtime, you can:
-
-- Take the built `unluac_wasm.js` and `unluac_wasm_bg.wasm` files from the published npm package
-- Or build `packages/unluac-wasm` directly in this repository and prepare language-specific bindings yourself
-- Or consume the standalone `unluac_wasm_bg.wasm` asset published alongside GitHub Releases
-
-If you plan to extend the wasm support to a specific language or runtime, PRs are welcome.
+For custom bindings, start with [the WebAssembly package](./packages/unluac-wasm); JavaScript users should normally use `unluac-js`.
 
 ## Contributing and Feedback
 
-Contributions of all kinds are welcome, including code, documentation, test cases, and other improvements.
-If you run into issues while using the project, or have ideas and suggestions, feel free to open an issue. If the project performs poorly on a specific case, attaching the corresponding binary file is also very helpful for diagnosis.
+The project is still in a testing phase. Behavior, APIs and output details may evolve. Bug reports, difficult bytecode samples, compatibility findings and suggestions about the tools or releases are very welcome.
+
+If a file fails to decompile or the result behaves differently, please [open an issue](https://github.com/x3zvawq/unluac-rs/issues) with a reproducible sample, its Lua dialect, the options used, and the expected versus actual behavior. Include the original source when available. Real-world samples help improve both semantic correctness and output quality; decompilation cannot recover comments or information that compilation discarded.
+
+Code, documentation and regression tests are all welcome. For development, start with the [architecture guide](./docs/design.md), [test protocol](./docs/design/11.test.md) and [web development guide](./packages/unluac-web/README.md).
 
 ## License
 
-This project is released under the MIT License. See [LICENSE.txt](./LICENSE.txt) for details.
+Released under the [MIT License](./LICENSE.txt).
 
 ## Acknowledgements
 
-- [metaworms's lua decompiler](https://luadec.metaworm.site) - This project's design and implementation were inspired by it, and the author's tutorial was also very helpful. The website is no longer accessible today.
-- This project contains code generated by GPT and Claude.
+- [metaworms’s Lua decompiler](https://luadec.metaworm.site) and the author’s tutorial inspired the project’s design and implementation.
+- Most of this project’s code was developed with **ChatGPT + Codex**. A special shout-out to **Astra** for its work on the decompiler and its extensive refactoring — seriously impressive. **Claude** also contributed during an earlier stage of development.
+- Thanks to everyone sharing test cases, reporting bugs and helping make recovered Lua more readable.

@@ -2,29 +2,28 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-
-    <title>Unluac — Online Lua Decompiler</title>
-    <meta name="description" content="Free online Lua bytecode decompiler. Paste or upload compiled .luac / .out files and get readable Lua source code instantly. Supports Lua 5.1–5.5, LuaJIT and Luau. Runs entirely in your browser via WebAssembly — no server upload." />
-    <meta name="keywords" content="lua decompiler, lua bytecode decompiler, decompile lua, luac decompiler, luajit decompiler, luau decompiler, online lua decompiler, lua reverse engineering, Unluac, lua5.1 decompiler, lua5.4 decompiler" />
-    <link rel="canonical" href="https://unluac.x3zvawq.com/" />
-    <meta name="robots" content="index, follow" />
-
-    <!-- Open Graph / social sharing -->
-    <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://unluac.x3zvawq.com/" />
-    <meta property="og:title" content="Unluac — Online Lua Decompiler" />
-    <meta property="og:description" content="Free online Lua bytecode decompiler supporting Lua 5.1–5.5, LuaJIT and Luau. Runs entirely in your browser via WebAssembly." />
-    <meta property="og:site_name" content="Unluac" />
-
-    <!-- Twitter Card -->
-    <meta name="twitter:card" content="summary" />
-    <meta name="twitter:title" content="Unluac — Online Lua Decompiler" />
-    <meta name="twitter:description" content="Free online Lua bytecode decompiler supporting Lua 5.1–5.5, LuaJIT and Luau. Runs entirely in your browser via WebAssembly." />
+    <meta name="theme-color" content="#171c3d" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <link rel="icon" type="image/svg+xml" href="../../logo.svg" />
+    <link rel="stylesheet" href="/src/styles/product.css" />
+    <!-- Product metadata and content are inserted by vite-plugin-seo. -->
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app">
+      <main class="static-page">
+        <div class="static-content">
+          <a class="static-brand" href="https://github.com/x3zvawq/unluac-rs">
+            <img src="../../logo.svg" width="64" height="64" alt="" />
+            <span>unluac-rs</span>
+          </a>
+          <h1>Online Lua Decompiler</h1>
+          <p class="static-lead">Lua bytecode, made readable. For Lua 5.1–5.5, LuaJIT and Luau.</p>
+          <noscript><p class="static-notice">Enable JavaScript to use the browser workspace, or choose the CLI, Rust or JavaScript package below.</p></noscript>
+          <!-- product-overview -->
+        </div>
+      </main>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

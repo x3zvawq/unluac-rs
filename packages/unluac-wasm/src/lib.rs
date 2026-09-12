@@ -102,6 +102,18 @@ struct WasmBridgeError {
 
 type BridgeResult<T> = Result<T, WasmBridgeError>;
 
+/// 输入识别只消费 Parser 的协议规则；非字节码返回 null，损坏的已识别头部仍报告错误。
+#[wasm_bindgen(js_name = detectDialect)]
+pub fn detect_dialect_wasm(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    match unluac::parser::detect_dialect(bytes) {
+        Ok(dialect) => Ok(JsValue::from_str(<&str>::from(dialect))),
+        Err(unluac::parser::ParseError::InvalidSignature { .. }) => Ok(JsValue::NULL),
+        Err(error) => Err(
+            WasmBridgeError::new("input-detection-failed", error.to_string(), None).into_js_value(),
+        ),
+    }
+}
+
 #[wasm_bindgen(js_name = decompile)]
 pub fn decompile_wasm(bytes: &[u8], options: JsValue) -> Result<JsValue, JsValue> {
     let options = parse_wasm_options(options).map_err(WasmBridgeError::into_js_value)?;

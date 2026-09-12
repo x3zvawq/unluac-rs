@@ -1,0 +1,47 @@
+<section class="product-overview" aria-label="关于 Lua 反编译器">
+  <h2>在浏览器与自己的工具中使用 Lua 反编译器</h2>
+  <p>unluac-rs 是一个用 Rust 编写的免费开源 Lua 字节码反编译器，从编译后的 chunk 中恢复可读源码，支持 <strong>Lua 5.1、5.2、5.3、5.4、5.5、LuaJIT 2.1 与 Luau</strong>。</p>
+  <p>在线工作区可以查看字节码、编辑恢复出的源码，并探索函数、常量与控制流图。你也可以通过 CLI 离线反编译，或将 Rust 与 JavaScript 库接入自己的工具。</p>
+
+  <h2>选择适合你的使用方式</h2>
+  <div class="product-entrypoints">
+    <article>
+      <h3>在线工作区</h3>
+      <p>在当前页面打开编译后的文件或文件夹。WebAssembly 引擎在你的设备上处理文件，无需上传服务器；每个文件独立保存 Lua 方言。</p>
+    </article>
+    <article>
+      <h3><a href="https://github.com/x3zvawq/unluac-rs/releases">命令行反编译器</a></h3>
+      <p>下载 Windows、macOS 或 Linux 的 CLI 二进制，在本地离线反编译。</p>
+      <pre><code>unluac-cli -i sample.luac -o recovered.lua</code></pre>
+    </article>
+    <article>
+      <h3><a href="https://www.npmjs.com/package/unluac-js">JavaScript / TypeScript</a></h3>
+      <p>在 Node.js 或使用打包器的浏览器应用中使用 <code>unluac-js</code>。</p>
+      <pre><code>npm install unluac-js</code></pre>
+    </article>
+    <article>
+      <h3><a href="https://crates.io/crates/unluac">Rust 库</a></h3>
+      <p>将 <code>unluac</code> 加入项目，在 <a href="https://docs.rs/unluac">Rust API 文档</a>中查看选项与流水线结果。</p>
+      <pre><code>cargo add unluac</code></pre>
+    </article>
+  </div>
+
+  <h2>关于 Lua 反编译的常见问题</h2>
+  <details>
+    <summary>可以反编译哪些文件？</summary>
+    <p>可以打开受支持 Lua 版本或方言编译出的字节码。文件可以使用 <code>.luac</code>、<code>.out</code>、<code>.lua</code> 或其他扩展名，识别依据是文件内容。普通源码文件也可以直接打开阅读和编辑。</p>
+  </details>
+  <details>
+    <summary>文件会上传到服务器吗？</summary>
+    <p>不会。反编译和结构分析通过 WebAssembly 在浏览器本地运行。浏览器保存原始字节与方言选择，供下次访问时恢复。手动编辑的内容请在离开或刷新页面前下载保存。</p>
+  </details>
+  <details>
+    <summary>能恢复完全相同的原始源码吗？</summary>
+    <p>反编译会重建程序结构，但无法找回编译时丢弃的注释等信息。已有调试信息可以帮助恢复命名。项目仍处于测试阶段，不支持的结构或缺陷可能影响输出；请检查生成代码，并反馈可复现的问题。</p>
+  </details>
+  <details>
+    <summary>如何反馈反编译问题？</summary>
+    <p>请<a href="https://github.com/x3zvawq/unluac-rs/issues">提交 GitHub issue</a>，附上可复现样本、Lua 版本、使用的选项，以及预期与实际行为。若有原始源码，也请一并提供。欢迎代码、文档和测试用例方面的贡献。</p>
+  </details>
+  <p class="product-license">采用 <a href="https://github.com/x3zvawq/unluac-rs/blob/main/LICENSE.txt">MIT License</a>。<a href="https://github.com/x3zvawq/unluac-rs">在 GitHub 查看源码</a>。</p>
+</section>

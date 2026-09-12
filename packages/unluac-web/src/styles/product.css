@@ -1,0 +1,26 @@
+/* Product copy is visible with or without JavaScript, using the same content and styles. */
+.product-overview { margin-top: 40px; padding-top: 8px; color: var(--app-text, #202943); font-size: 13px; line-height: 1.85; }
+.product-overview h2 { margin: 28px 0 12px; font-size: 20px; font-weight: 650; letter-spacing: -0.4px; line-height: 1.4; }
+.product-overview h3 { margin: 0 0 8px; font-size: 14px; font-weight: 650; }
+.product-overview p { margin: 0 0 12px; color: var(--app-text-secondary, #62708a); }
+.product-overview a, .welcome-repository { color: var(--app-accent, #147d69); text-decoration: underline; text-underline-offset: 3px; }
+.product-overview a:hover, .welcome-repository:hover { text-decoration-thickness: 2px; }
+.product-entrypoints { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.product-entrypoints article { padding: 20px; border: 1px solid var(--app-border, #e3e8f0); border-radius: 10px; }
+.product-overview code { font-size: 12px; font-family: 'Cascadia Code', Consolas, monospace; }
+.product-overview pre { overflow-x: auto; padding: 10px 12px; border-radius: 6px; background: var(--app-bg-alt, #f5f7fb); }
+.product-overview details { padding: 14px 0; border-bottom: 1px solid var(--app-border, #e3e8f0); }
+.product-overview summary { cursor: pointer; font-weight: 550; }
+.product-overview summary:focus-visible { outline: 2px solid var(--app-accent, #147d69); outline-offset: 4px; }
+.product-overview details p { margin: 12px 0 0; }
+.product-overview .product-license { margin-top: 24px; font-size: 12px; }
+.welcome-repository { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; margin-top: 12px; text-decoration: none; }
+.welcome-repository svg { width: 16px; height: 16px; }
+.static-page { height: 100dvh; overflow: auto; background: #f3f5f9; color: #202943; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.static-content { max-width: 900px; margin: 0 auto; padding: 48px 28px; }
+.static-brand { display: inline-flex; align-items: center; gap: 14px; color: #202943; font-size: 24px; font-weight: 700; text-decoration: none; }
+.static-page h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.2; letter-spacing: -1px; margin: 28px 0 14px; }
+.static-lead { font-size: 17px; color: #147d69; }
+.static-notice { margin: 24px 0; padding: 16px; border: 1px solid #c3ded4; border-radius: 8px; line-height: 1.7; }
+.static-page .product-overview { margin-top: 28px; }
+@media (max-width: 540px) { .product-entrypoints { grid-template-columns: 1fr; } }

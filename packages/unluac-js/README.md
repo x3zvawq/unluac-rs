@@ -210,3 +210,12 @@ Current library defaults used by this package:
 - Root project: [unluac-rs](https://github.com/x3zvawq/unluac-rs)
 - Rust crate: [unluac on crates.io](https://crates.io/crates/unluac)
 - CLI binaries: [GitHub Releases](https://github.com/x3zvawq/unluac-rs/releases)
+
+## Input detection
+
+`await detectDialect(bytes)` returns the core parser's detected dialect, or `null` for ordinary
+source input. A recognized but malformed header throws a bridge error. Detection does not replace
+full bytecode validation by `decompile` or `decompileRich`.
+
+For repository development, run `npm run build` then `npm test`. The package smoke tests load both
+ESM and CommonJS outputs with their packaged WASM and use the repository's official Lua 5.4 toolchain.

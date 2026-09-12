@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "移除目录"
-    }
+    },
+    "sourceTag": "源码",
+    "fileDialect": "修改此文件的 Lua 方言"
   },
   "codeView": {
     "placeholder": "选择一个文件开始反编译",
@@ -148,7 +150,7 @@
       "comment": "生成注释"
     },
     "tips": {
-      "dialect": "目标 Lua 方言，决定解析器和生成器的行为。CLI: --dialect / -D",
+      "dialect": "只影响新导入的文件。点击文件的版本标签可单独修改方言。",
       "generateMode": "生成器错误处理策略。strict: 遇到不支持语法或错误时停止；permissive: 尽可能输出。CLI: --generate-mode / -g",
       "parseMode": "解析器严格程度。strict: 严格校验；permissive: 容忍不规范的字节码。CLI: --parse-mode / -p",
       "stringEncoding": "字符串常量的解码编码。auto 会自动识别常见旧编码。CLI: --encoding / -e",
@@ -196,12 +198,32 @@
           "description": "除了源码结果，还可以批量处理、对比输出，并查看 Proto / CFG 等结构化分析信息。"
         }
       }
-    }
+    },
+    "importDialect": "新文件默认方言"
   },
   "diff": {
     "left": "左侧",
     "right": "右侧",
     "selectFile": "选择文件",
     "hint": "选择两个已反编译的文件进行对比"
+  },
+  "workspace": {
+    "local": "本地运行",
+    "files": "工作区",
+    "searchFiles": "搜索文件…",
+    "fileHint": "打开文件或文件夹即可开始，每个文件独立保留 Lua 版本。",
+    "history": "文件历史保存在当前浏览器",
+    "fileActions": "文件操作",
+    "headline": "从 Lua 字节码，",
+    "headlineAccent": "读回代码的结构。",
+    "description": "还原源码，探索程序结构，让编译后的 Lua 重新可读。一切都可以在浏览器中完成。",
+    "importHint": "不限扩展名，支持单文件与整个文件夹。",
+    "privacy": "文件在你的设备上处理，无需上传服务器。",
+    "multiDialect": "多方言支持",
+    "explore": "深入代码",
+    "exploreHint": "查看函数、常量与控制流。",
+    "analysis": "结构分析",
+    "wrapLines": "自动换行",
+    "settingsHint": "设置自动生效，每个文件独立保留自己的 Lua 方言。"
   }
 }

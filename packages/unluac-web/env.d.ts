@@ -7,3 +7,8 @@ declare module '*.vue' {
 }
 
 declare const __APP_VERSION__: string
+
+declare module '@logo' {
+  const url: string
+  export default url
+}

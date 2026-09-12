@@ -5,15 +5,18 @@
   "description": "Web interface for the unluac Lua decompiler.",
   "type": "module",
   "scripts": {
+    "test": "node --import ./tests/register.mjs --test tests/*.test.mjs",
     "dev": "vite",
     "build": "vite build && vue-tsc --build",
     "preview": "vite preview",
     "check": "biome check .",
     "format": "biome format --write .",
     "lint": "biome lint .",
-    "fix": "biome check --fix ."
+    "fix": "biome check --fix .",
+    "test:browser": "playwright test"
   },
   "dependencies": {
+    "@codemirror/commands": "^6.10.3",
     "@codemirror/lang-javascript": "^6.2.5",
     "@codemirror/language": "^6.12.3",
     "@codemirror/legacy-modes": "^6.5.2",
@@ -37,6 +40,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.4.11",
     "@iconify-json/mdi": "^1.2.3",
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/vite": "^4.2.2",
     "@types/node": "^25.6.0",
     "@vitejs/plugin-vue": "^6.0.5",

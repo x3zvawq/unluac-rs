@@ -10,6 +10,7 @@
  */
 
 import { execSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { Plugin } from 'vite'
@@ -50,6 +51,11 @@ export function wasmBuildPlugin(): Plugin {
             copyFileSync(srcPath, resolve(wasmDest, dest))
           }
         }
+
+        // 缓存身份来自这次真正发布的引擎字节，不依赖手动升级应用版本。
+        const engineId = createHash('sha256')
+          .update(readFileSync(resolve(outDir, 'unluac_wasm_bg.wasm'))).digest('hex')
+        writeFileSync(resolve(wasmDest, 'engine-id.ts'), `export const WASM_ENGINE_ID = '${engineId}'\n`)
 
         // wasm-pack 生成的 .js 不含 @ts-self-types 指令，手动注入
         // 让 TypeScript 在不依赖 bundler moduleResolution 时也能定位类型

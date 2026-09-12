@@ -11,6 +11,7 @@ const wasmCrateDir = resolve(repoRoot, "packages", "unluac-wasm");
 const wasmBuildDir = resolve(packageDir, ".wasm-build");
 const distDir = resolve(packageDir, "dist");
 let wasmBuildPromise: Promise<void> | null = null;
+let publishArtifactsPromise: Promise<void> | null = null;
 
 export default defineConfig({
   entry: ["src/index.ts"],
@@ -26,24 +27,30 @@ export default defineConfig({
       await wasmBuildPromise;
     },
     "build:done": async () => {
-      await mkdir(distDir, { recursive: true });
-      for (const fileName of [
-        "unluac_wasm.js",
-        "unluac_wasm.d.ts",
-        "unluac_wasm_bg.wasm",
-        "unluac_wasm_bg.wasm.d.ts",
-      ]) {
-        await copyFile(resolve(wasmBuildDir, fileName), resolve(distDir, fileName));
-      }
-      await copyFile(resolve(packageDir, "README.md"), resolve(distDir, "README.md"));
-      await copyFile(resolve(repoRoot, "LICENSE.txt"), resolve(distDir, "LICENSE.txt"));
-      await writeFile(
-        resolve(distDir, "package.json"),
-        `${JSON.stringify(await buildPublishPackageJson(), null, 2)}\n`
-      );
+      // ESM/CJS 的完成回调并行执行，共享产物只由一次任务写入。
+      publishArtifactsPromise ??= publishArtifacts();
+      await publishArtifactsPromise;
     },
   },
 });
+
+async function publishArtifacts(): Promise<void> {
+  await mkdir(distDir, { recursive: true });
+  for (const fileName of [
+    "unluac_wasm.js",
+    "unluac_wasm.d.ts",
+    "unluac_wasm_bg.wasm",
+    "unluac_wasm_bg.wasm.d.ts",
+  ]) {
+    await copyFile(resolve(wasmBuildDir, fileName), resolve(distDir, fileName));
+  }
+  await copyFile(resolve(packageDir, "README.md"), resolve(distDir, "README.md"));
+  await copyFile(resolve(repoRoot, "LICENSE.txt"), resolve(distDir, "LICENSE.txt"));
+  await writeFile(
+    resolve(distDir, "package.json"),
+    `${JSON.stringify(await buildPublishPackageJson(), null, 2)}\n`
+  );
+}
 
 async function buildWasmArtifacts(): Promise<void> {
   await rm(wasmBuildDir, { recursive: true, force: true });

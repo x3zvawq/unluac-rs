@@ -89,6 +89,12 @@ export interface FileEntry {
   size: number
   /** 反编译状态 */
   status: FileStatus
+  /** 文件自己的方言；auto 在首次识别后冻结为检测值。 */
+  dialect: UnluacDialect
+  /** 当前反编译代次，缓存与异步结果只提交到同一代。 */
+  revision: number
+  /** 当前结果所属的参数快照，按需分析必须使用它。 */
+  resultOptions?: DecompileOptions
   /** 反编译结果（成功时） */
   result?: string
   /** 用户手动编辑后的结果（仅在用户修改后存在） */
@@ -102,24 +108,20 @@ export interface FileEntry {
 /** Worker 发给主线程的消息类型 */
 export type WorkerResponse =
   | { type: 'ready' }
-  | { type: 'result'; fileId: string; source: string }
-  | { type: 'rich-result'; fileId: string; rich: RichDecompileResult }
-  | { type: 'error'; fileId: string; message: string }
+  | { type: 'result'; requestId: number; value: WorkerResults[keyof WorkerResults] }
+  | { type: 'error'; requestId: number; message: string }
+
+export interface WorkerResults {
+  detect: Exclude<UnluacDialect, 'auto'> | null
+  decompile: string
+  'decompile-rich': RichDecompileResult
+}
 
 /** 主线程发给 Worker 的消息类型 */
-export type WorkerRequest =
-  | {
-      type: 'decompile'
-      fileId: string
-      bytes: Uint8Array
-      options: DecompileOptions
-    }
-  | {
-      type: 'decompile-rich'
-      fileId: string
-      bytes: Uint8Array
-      options: DecompileOptions
-    }
+export type WorkerRequest = { requestId: number; bytes: Uint8Array } & (
+  | { type: 'detect' }
+  | { type: 'decompile' | 'decompile-rich'; options: DecompileOptions }
+)
 
 // ── 结构化反编译结果 ──
 

@@ -1,159 +1,121 @@
-/**
- * 反编译器 Web Worker 通信 composable。
- *
- * 封装 Worker 的生命周期管理和消息通信，对外提供 decompile() 异步方法。
- * Worker 内部加载 WASM 模块执行反编译，避免阻塞主线程。
- *
- * 设计决策：
- * - 使用单一 Worker 实例而非每次创建新 Worker，节省 WASM 初始化开销
- * - 通过 fileId 关联请求和响应，支持并发请求（虽然实际 Worker 串行执行）
- * - ready 状态暴露给调用方，在 Worker 准备好之前可以排队但不丢弃请求
- * - cancel() 从 pending map 移除并拒绝 Promise，WASM 执行无法中断所以会丢弃结果
- * - cancelAll() 终止 Worker 并重建，适用于设置变更后全量重跑的场景
- */
-
+/** Worker 请求身份由这里签发，文件身份只用于归属和取消，不参与响应匹配。 */
 import { onUnmounted, shallowRef } from 'vue'
 import type {
   DecompileOptions,
-  RichDecompileResult,
   WorkerRequest,
   WorkerResponse,
+  WorkerResults,
 } from '@/types/decompiler'
 
-type PendingResolve = {
-  resolve: (value: any) => void
+type Pending = {
+  fileId: string
+  resolve: (value: WorkerResults[keyof WorkerResults]) => void
   reject: (error: Error) => void
+  dispose: () => void
 }
 
 export function useDecompiler() {
   const ready = shallowRef(false)
-
   let worker: Worker | null = null
-  const pendingMap = new Map<string, PendingResolve>()
+  let nextRequestId = 0
+  const pending = new Map<number, Pending>()
+
+  function rejectRequest(id: number, message: string) {
+    const request = pending.get(id)
+    if (!request) return
+    pending.delete(id)
+    request.dispose()
+    request.reject(new Error(message))
+  }
+
+  function terminate(message = 'Worker terminated') {
+    worker?.terminate()
+    worker = null
+    ready.value = false
+    for (const id of pending.keys()) rejectRequest(id, message)
+  }
 
   function ensureWorker(): Worker {
     if (worker) return worker
-
-    worker = new Worker(new URL('@/workers/decompile.worker.ts', import.meta.url), {
+    const current = new Worker(new URL('@/workers/decompile.worker.ts', import.meta.url), {
       type: 'module',
     })
-
-    worker.onmessage = (e: MessageEvent<WorkerResponse>) => {
-      const msg = e.data
+    worker = current
+    current.onmessage = ({ data: msg }: MessageEvent<WorkerResponse>) => {
+      if (worker !== current) return
       if (msg.type === 'ready') {
         ready.value = true
+      } else if (msg.type === 'error') {
+        rejectRequest(msg.requestId, msg.message)
+      } else {
+        const request = pending.get(msg.requestId)
+        if (!request) return
+        pending.delete(msg.requestId)
+        request.dispose()
+        request.resolve(msg.value)
+      }
+    }
+    current.onerror = (event) => {
+      if (worker === current) terminate(event.message || 'Worker error')
+    }
+    return current
+  }
+
+  function request<K extends keyof WorkerResults>(
+    type: K,
+    fileId: string,
+    bytes: Uint8Array,
+    options?: DecompileOptions,
+    signal?: AbortSignal,
+  ): Promise<WorkerResults[K]> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error('Cancelled'))
         return
       }
-
-      const pending = pendingMap.get(msg.fileId)
-      if (!pending) return
-      pendingMap.delete(msg.fileId)
-
-      if (msg.type === 'result') {
-        pending.resolve(msg.source)
-      } else if (msg.type === 'rich-result') {
-        pending.resolve(msg.rich)
-      } else {
-        pending.reject(new Error(msg.message))
-      }
-    }
-
-    worker.onerror = (e) => {
-      console.error('[decompiler worker] uncaught error:', e)
-      // Worker 级别错误，拒绝所有等待中的请求
-      for (const [, pending] of pendingMap) {
-        pending.reject(new Error(e.message || 'Worker error'))
-      }
-      pendingMap.clear()
-    }
-
-    return worker
-  }
-
-  function decompile(
-    fileId: string,
-    bytes: Uint8Array,
-    options: DecompileOptions,
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      pendingMap.set(fileId, { resolve, reject })
-
-      const w = ensureWorker()
-      // options 可能是 reactive 代理，structuredClone 无法克隆代理对象
-      const msg: WorkerRequest = {
-        type: 'decompile',
+      const requestId = nextRequestId++
+      const abort = () => rejectRequest(requestId, 'Cancelled')
+      pending.set(requestId, {
         fileId,
-        bytes,
-        options: toRaw(options),
+        reject,
+        resolve: (value) => resolve(value as WorkerResults[K]),
+        dispose: () => signal?.removeEventListener('abort', abort),
+      })
+      signal?.addEventListener('abort', abort, { once: true })
+      try {
+        // 同步冻结参数，并转移本请求独占的 bytes；调用方保留原始文件。
+        const msg: WorkerRequest =
+          type === 'detect'
+            ? { type, requestId, bytes }
+            : { type, requestId, bytes, options: JSON.parse(JSON.stringify(options)) }
+        ensureWorker().postMessage(msg, [bytes.buffer])
+      } catch (error) {
+        rejectRequest(requestId, error instanceof Error ? error.message : String(error))
       }
-      w.postMessage(msg, [bytes.buffer])
     })
   }
 
-  function decompileRich(
-    fileId: string,
-    bytes: Uint8Array,
-    options: DecompileOptions,
-  ): Promise<RichDecompileResult> {
-    return new Promise((resolve, reject) => {
-      pendingMap.set(fileId, { resolve, reject })
-
-      const w = ensureWorker()
-      const msg: WorkerRequest = {
-        type: 'decompile-rich',
-        fileId,
-        bytes,
-        options: JSON.parse(JSON.stringify(options)),
-      }
-      w.postMessage(msg, [bytes.buffer])
-    })
-  }
-
-  /** 取消单个文件的反编译。WASM 仍在执行但结果会被丢弃。 */
   function cancel(fileId: string) {
-    const pending = pendingMap.get(fileId)
-    if (pending) {
-      pendingMap.delete(fileId)
-      pending.reject(new Error('Cancelled'))
+    for (const [id, request] of pending) {
+      if (request.fileId === fileId) rejectRequest(id, 'Cancelled')
     }
   }
 
-  /** 终止 Worker 取消所有任务，下次 decompile 时自动重建。 */
-  function cancelAll() {
-    worker?.terminate()
-    worker = null
-    ready.value = false
-    for (const [, pending] of pendingMap) {
-      pending.reject(new Error('Cancelled'))
-    }
-    pendingMap.clear()
-    // 预热新 Worker
-    ensureWorker()
-  }
-
-  function terminate() {
-    worker?.terminate()
-    worker = null
-    ready.value = false
-    for (const [, pending] of pendingMap) {
-      pending.reject(new Error('Worker terminated'))
-    }
-    pendingMap.clear()
-  }
-
-  onUnmounted(() => {
-    terminate()
-  })
-
-  // 预热 Worker
-  ensureWorker()
-
+  onUnmounted(() => terminate())
+  // 首页阅读不需要下载 WASM；首个识别/反编译请求才启动 Worker。
   return {
     ready,
-    decompile,
-    decompileRich,
+    detectDialect: (id: string, bytes: Uint8Array) => request('detect', id, bytes),
+    decompile: (id: string, bytes: Uint8Array, options: DecompileOptions) =>
+      request('decompile', id, bytes, options),
+    decompileRich: (
+      id: string,
+      bytes: Uint8Array,
+      options: DecompileOptions,
+      signal?: AbortSignal,
+    ) => request('decompile-rich', id, bytes, options, signal),
     cancel,
-    cancelAll,
+    cancelAll: () => terminate('Cancelled'),
     terminate,
   }
 }

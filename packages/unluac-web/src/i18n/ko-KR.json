@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "폴더 제거"
-    }
+    },
+    "sourceTag": "소스",
+    "fileDialect": "이 파일의 Lua 방언 변경"
   },
   "codeView": {
     "placeholder": "디컴파일할 파일을 선택하세요",
@@ -143,7 +145,7 @@
       "comment": "주석 출력"
     },
     "tips": {
-      "dialect": "대상 Lua 방언으로, 파서와 생성기의 동작에 영향을 줍니다. CLI: --dialect / -D",
+      "dialect": "새로 가져오는 파일에만 적용됩니다. 파일의 버전 태그를 클릭하여 개별 방언을 변경하세요.",
       "advanced": "고급",
       "generateMode": "오류 처리 전략. strict: 지원되지 않는 구문이나 오류 시 중단; permissive: 가능한 한 많이 출력. CLI: --generate-mode / -g",
       "parseMode": "파서 엄격도. strict: 엄격한 검증; permissive: 비표준 바이트코드 허용. CLI: --parse-mode / -p",
@@ -190,12 +192,32 @@
           "description": "소스 코드뿐 아니라 일괄 처리, 결과 비교, Proto / CFG 같은 구조화 분석도 함께 사용할 수 있습니다."
         }
       }
-    }
+    },
+    "importDialect": "새 파일의 기본 방언"
   },
   "diff": {
     "left": "왼쪽",
     "right": "오른쪽",
     "selectFile": "파일 선택",
     "hint": "비교할 디컴파일된 파일 2개를 선택하세요"
+  },
+  "workspace": {
+    "local": "로컬 실행",
+    "files": "작업 공간",
+    "searchFiles": "파일 검색…",
+    "fileHint": "파일이나 폴더를 열어 시작하세요. Lua 버전은 파일별로 유지됩니다.",
+    "history": "파일 기록은 이 브라우저에 저장됩니다",
+    "fileActions": "파일 작업",
+    "headline": "Lua 바이트코드를,",
+    "headlineAccent": "읽기 쉬운 코드로.",
+    "description": "소스를 복원하고 프로그램 구조를 살펴보세요. 모든 작업은 브라우저에서 이루어집니다.",
+    "importHint": "확장자 제한 없이 파일이나 폴더를 여세요.",
+    "privacy": "서버 업로드 없이 기기에서 파일을 처리합니다.",
+    "multiDialect": "다양한 방언 지원",
+    "explore": "코드 내부 탐색",
+    "exploreHint": "함수, 상수, 제어 흐름을 살펴보세요.",
+    "analysis": "구조 분석",
+    "wrapLines": "자동 줄 바꿈",
+    "settingsHint": "설정은 자동 적용됩니다. Lua 방언은 파일별로 유지됩니다."
   }
 }

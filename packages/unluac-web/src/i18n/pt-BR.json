@@ -42,7 +42,9 @@
     },
     "folderContextMenu": {
       "removeFolder": "Remover pasta"
-    }
+    },
+    "sourceTag": "Código-fonte",
+    "fileDialect": "Alterar o dialeto Lua deste arquivo"
   },
   "codeView": {
     "placeholder": "Selecione um arquivo para descompilar",
@@ -143,7 +145,7 @@
       "comment": "Emitir comentários"
     },
     "tips": {
-      "dialect": "Dialeto Lua de destino, afeta o comportamento do analisador e gerador. CLI: --dialect / -D",
+      "dialect": "Aplica-se apenas a novos arquivos importados. Clique na versão de um arquivo para alterar seu dialeto.",
       "advanced": "Avançado",
       "generateMode": "Estratégia de tratamento de erros. strict: parar em sintaxe sem suporte ou erro; permissive: gerar o máximo possível. CLI: --generate-mode / -g",
       "parseMode": "Rigor do analisador. strict: validação rigorosa; permissive: tolerar bytecode não padrão. CLI: --parse-mode / -p",
@@ -190,12 +192,32 @@
           "description": "Além do código gerado, você pode processar arquivos em lote, comparar saídas e inspecionar análises estruturadas Proto / CFG."
         }
       }
-    }
+    },
+    "importDialect": "Dialeto padrão para novos arquivos"
   },
   "diff": {
     "left": "Esquerda",
     "right": "Direita",
     "selectFile": "Selecionar arquivo",
     "hint": "Selecione dois arquivos descompilados para comparar"
+  },
+  "workspace": {
+    "local": "Execução local",
+    "files": "Área de trabalho",
+    "searchFiles": "Buscar arquivo…",
+    "fileHint": "Abra um arquivo ou uma pasta. Cada arquivo mantém sua versão do Lua.",
+    "history": "O histórico fica neste navegador",
+    "fileActions": "Ações do arquivo",
+    "headline": "Bytecode Lua,",
+    "headlineAccent": "legível novamente.",
+    "description": "Recupere o código-fonte e explore a estrutura do programa. Tudo no navegador.",
+    "importHint": "Qualquer nome de arquivo. Um arquivo ou uma pasta inteira.",
+    "privacy": "Os arquivos são processados no seu dispositivo, sem envio ao servidor.",
+    "multiDialect": "Vários dialetos",
+    "explore": "Explore o código",
+    "exploreHint": "Examine funções, constantes e fluxo de controle.",
+    "analysis": "Estrutura",
+    "wrapLines": "Quebrar linhas",
+    "settingsHint": "As alterações são aplicadas automaticamente. Cada arquivo mantém seu dialeto Lua."
   }
 }

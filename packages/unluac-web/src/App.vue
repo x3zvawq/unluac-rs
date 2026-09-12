@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { darkTheme, lightTheme } from 'naive-ui'
-import { computed, provide, shallowRef } from 'vue'
+import { darkTheme, lightTheme, type GlobalThemeOverrides } from 'naive-ui'
+import { computed, provide, shallowRef, useTemplateRef } from 'vue'
+import { useI18n } from 'vue-i18n'
+import FilePanel from '@/components/layout/FilePanel.vue'
 import { useDecompiler } from '@/composables/useDecompiler'
 import { useIsMobile } from '@/composables/useMediaQuery'
 import { useResizable } from '@/composables/useResizable'
@@ -11,11 +13,26 @@ const { isDark } = useTheme()
 const decompiler = useDecompiler()
 const isMobile = useIsMobile()
 const showMobileFiles = shallowRef(false)
+const filePanel = useTemplateRef('filePanel')
+const { t } = useI18n()
 
 provide('decompiler', decompiler)
 provide('isMobile', isMobile)
 
 const naiveTheme = computed(() => (isDark.value ? darkTheme : lightTheme))
+const themeOverrides = computed<GlobalThemeOverrides>(() => ({
+  common: {
+    primaryColor: isDark.value ? '#83e8cf' : '#147d69',
+    primaryColorHover: isDark.value ? '#a3f1de' : '#106c5b',
+    primaryColorPressed: isDark.value ? '#5cd2b5' : '#0d5b4c',
+    borderRadius: '8px',
+    fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    bodyColor: isDark.value ? '#101526' : '#f3f5f9',
+    cardColor: isDark.value ? '#191f34' : '#ffffff',
+    modalColor: isDark.value ? '#191f34' : '#ffffff',
+    popoverColor: isDark.value ? '#191f34' : '#ffffff',
+  },
+}))
 
 const {
   size: sidebarWidth,
@@ -23,8 +40,8 @@ const {
   onPointerDown: onSidebarPointerDown,
 } = useResizable({
   direction: 'horizontal',
-  initialSize: 280,
-  minSize: 180,
+  initialSize: 292,
+  minSize: 240,
   maxSize: 600,
   storageKey: 'unluac-sidebar-width',
 })
@@ -35,6 +52,7 @@ const {
  */
 const shortcutActions = shallowRef<{
   openFile?: () => void
+  openFolder?: () => void
   downloadCurrent?: () => void
   openSettings?: () => void
 }>({})
@@ -49,35 +67,29 @@ useShortcuts({
 </script>
 
 <template>
-  <NConfigProvider :theme="naiveTheme" class="h-full">
+  <NConfigProvider :theme="naiveTheme" :theme-overrides="themeOverrides" class="h-full">
     <NMessageProvider>
       <NDialogProvider>
         <NNotificationProvider>
-          <div class="flex h-full flex-col" style="background: var(--app-bg); color: var(--app-text)">
-            <AppHeader @toggle-files="showMobileFiles = !showMobileFiles" />
-            <div class="flex min-h-0 flex-1">
+          <div class="app-shell" @drop="filePanel?.onDrop($event)" @dragover="filePanel?.handleDragOver($event)" @dragleave="filePanel?.handleDragLeave($event)">
+            <AppHeader :files-open="showMobileFiles" @toggle-files="showMobileFiles = !showMobileFiles" />
+            <div class="workspace-shell">
               <!-- 桌面端：固定侧边栏 + 拖拽分割条 -->
-              <FilePanel v-if="!isMobile" :style="{ width: `${sidebarWidth}px` }" class="shrink-0" />
+              <FilePanel ref="filePanel" v-show="!isMobile || showMobileFiles" :style="{ width: isMobile ? '100%' : `${sidebarWidth}px` }" class="shrink-0" @selected="showMobileFiles = false" />
               <div
                 v-if="!isMobile"
-                class="shrink-0 cursor-col-resize transition-colors hover:bg-indigo-400/40"
+                class="resize-handle shrink-0 cursor-col-resize"
                 :class="{ 'bg-indigo-400/40': sidebarDragging }"
                 :style="{ width: '4px' }"
                 @pointerdown="onSidebarPointerDown"
               />
-              <MainContent />
+              <MainContent v-show="!isMobile || !showMobileFiles" />
             </div>
-            <!-- 移动端：底部抽屉 -->
-            <NDrawer
-              v-if="isMobile"
-              v-model:show="showMobileFiles"
-              placement="bottom"
-              :height="'60vh'"
-            >
-              <NDrawerContent title="Files" closable body-content-class="!p-0">
-                <FilePanel class="w-full! border-0!" />
-              </NDrawerContent>
-            </NDrawer>
+            <Transition name="drop">
+              <div v-if="filePanel?.isDragging" class="drop-overlay">
+                <div><i-mdi-tray-arrow-down class="mx-auto mb-4 text-4xl" />{{ t('filePanel.dropHint') }}</div>
+              </div>
+            </Transition>
           </div>
         </NNotificationProvider>
       </NDialogProvider>

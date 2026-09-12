@@ -7,6 +7,7 @@
  * 右键菜单提供"移除目录"操作。
  */
 
+import type { UnluacDialect } from '@/types/decompiler'
 import { computed, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 
@@ -33,6 +34,7 @@ const emit = defineEmits<{
   remove: [id: string]
   removeFolder: [path: string]
   recompile: [id: string]
+  dialect: [id: string, value: UnluacDialect]
 }>()
 
 const isCollapsed = computed(() => props.collapsed.get(props.node.path) ?? false)
@@ -82,9 +84,9 @@ function handleContextAction(key: string) {
   <div
     class="group flex cursor-pointer items-center gap-1 px-3 py-1 text-xs font-medium text-gray-500 transition-colors hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
     :style="{ paddingLeft: `${depth * 12 + 12}px` }"
-    @click="emit('toggle', node.path)"
     @contextmenu="openContextMenu"
   >
+    <button class="flex min-w-0 flex-1 items-center gap-1 py-1 text-left" :aria-expanded="!isCollapsed" @click="emit('toggle', node.path)">
     <!-- 展开/折叠箭头 -->
     <svg
       xmlns="http://www.w3.org/2000/svg"
@@ -115,9 +117,11 @@ function handleContextAction(key: string) {
     <span class="truncate">{{ node.name }}</span>
     <!-- 文件计数 / hover 时显示移除按钮 -->
     <span class="shrink-0 text-gray-400 group-hover:hidden">{{ fileCount }}</span>
+    </button>
     <button
-      class="ml-auto hidden shrink-0 rounded p-0.5 text-gray-400 transition-colors hover:bg-gray-200 hover:text-red-600 group-hover:inline-block dark:text-gray-500 dark:hover:bg-gray-700 dark:hover:text-red-400"
+      class="icon-button ml-auto"
       :title="t('filePanel.folderContextMenu.removeFolder')"
+      :aria-label="`${node.name}: ${t('filePanel.folderContextMenu.removeFolder')}`"
       @click.stop="emit('removeFolder', node.path)"
     >
       <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
@@ -149,6 +153,7 @@ function handleContextAction(key: string) {
         @remove="(id: string) => emit('remove', id)"
         @remove-folder="(path: string) => emit('removeFolder', path)"
         @recompile="(id: string) => emit('recompile', id)"
+          @dialect="(id: string, value: UnluacDialect) => emit('dialect', id, value)"
       />
       <div v-else :style="{ paddingLeft: `${depth * 12}px` }">
         <FileListItem
@@ -157,6 +162,7 @@ function handleContextAction(key: string) {
           @select="emit('select', child.entry.id)"
           @remove="emit('remove', child.entry.id)"
           @recompile="emit('recompile', child.entry.id)"
+          @dialect="emit('dialect', child.entry.id, $event)"
         />
       </div>
     </template>

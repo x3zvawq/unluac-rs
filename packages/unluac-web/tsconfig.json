@@ -12,7 +12,8 @@
     "skipLibCheck": true,
     "noEmit": true,
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@logo": ["../../logo.svg"]
     },
     "types": ["vite/client", "node", "unplugin-icons/types/vue"]
   },

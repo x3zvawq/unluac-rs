@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { dialectOptions } from '@/utils/dialects'
 /**
  * 设置面板。
  *
@@ -141,17 +142,6 @@ function shellQuote(value: string): string {
   return /^[A-Za-z0-9._/-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`
 }
 
-const dialectOptions = [
-  { label: 'Auto', value: 'auto' },
-  { label: 'Lua 5.1', value: 'lua5.1' },
-  { label: 'Lua 5.2', value: 'lua5.2' },
-  { label: 'Lua 5.3', value: 'lua5.3' },
-  { label: 'Lua 5.4', value: 'lua5.4' },
-  { label: 'Lua 5.5', value: 'lua5.5' },
-  { label: 'LuaJIT', value: 'luajit' },
-  { label: 'Luau', value: 'luau' },
-]
-
 const parseModeOptions = [
   { label: 'strict', value: 'strict' },
   { label: 'permissive', value: 'permissive' },
@@ -207,15 +197,16 @@ const tableStyleOptions = [
 </script>
 
 <template>
-  <NDrawer :show="show" :width="400" placement="right" @update:show="emit('update:show', $event)">
-    <NDrawerContent :title="t('settings.title')" closable :body-content-style="{ padding: '0 16px 16px' }">
-      <NTabs type="line" size="small" animated>
+  <NDrawer :show="show" :width="'min(440px, 100vw)'" placement="right" @update:show="emit('update:show', $event)">
+    <NDrawerContent :title="t('settings.title')" closable :body-content-style="{ padding: '8px 24px 24px' }">
+      <p class="settings-intro">{{ t('workspace.settingsHint') }}</p>
+      <NTabs type="segment" size="small" animated>
         <!-- General Tab -->
         <NTabPane :name="t('settings.tabs.general')" :tab="t('settings.tabs.general')">
-          <NSpace vertical :size="14" class="pt-3">
+          <NSpace vertical :size="22" class="pt-5">
             <div>
               <div class="mb-1 flex items-center gap-1">
-                <label class="text-sm font-medium">{{ t('settings.dialect') }}</label>
+                <label class="text-sm font-medium">{{ t('settings.importDialect') }}</label>
                 <NTooltip>
                   <template #trigger>
                     <NIcon :size="14" class="cursor-help opacity-50"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></NIcon>
@@ -228,6 +219,7 @@ const tableStyleOptions = [
                 :options="dialectOptions"
                 size="small"
               />
+              <p class="setting-hint">{{ t('settings.tips.dialect') }}</p>
             </div>
             <div>
               <div class="mb-1 flex items-center gap-1">
@@ -294,7 +286,7 @@ const tableStyleOptions = [
 
         <!-- Advanced Tab -->
         <NTabPane :name="t('settings.tabs.advanced')" :tab="t('settings.tabs.advanced')">
-          <NSpace vertical :size="14" class="pt-3">
+          <NSpace vertical :size="22" class="pt-5">
             <div>
               <div class="mb-1 flex items-center gap-1">
                 <label class="text-sm">{{ t('settings.parse.mode') }}</label>
@@ -584,7 +576,7 @@ const tableStyleOptions = [
               </div>
             </div>
 
-            <div class="flex gap-2 pt-1">
+            <div class="flex flex-wrap gap-2 pt-1">
               <NButton size="small" secondary @click="copyShareUrl">
                 {{ copied ? t('settings.share.copied') : t('settings.share.button') }}
               </NButton>

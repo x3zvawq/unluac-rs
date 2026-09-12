@@ -1,0 +1,47 @@
+<section class="product-overview" aria-label="About the Lua decompiler">
+  <h2>A Lua decompiler for your browser and your tools</h2>
+  <p>unluac-rs is a free, open-source Lua bytecode decompiler written in Rust. It reconstructs readable Lua source from compiled chunks and supports <strong>Lua 5.1, 5.2, 5.3, 5.4, 5.5, LuaJIT 2.1 and Luau</strong>.</p>
+  <p>Use the online workspace to inspect bytecode, edit recovered source, and explore functions, constants and control-flow graphs. You can also decompile locally with the CLI, or integrate the Rust and JavaScript libraries into your own tools.</p>
+
+  <h2>Choose how you work</h2>
+  <div class="product-entrypoints">
+    <article>
+      <h3>Online workspace</h3>
+      <p>Open a compiled file or folder in this page. The WebAssembly engine processes it on your device, without uploading the file to a server. Each file keeps its own Lua dialect.</p>
+    </article>
+    <article>
+      <h3><a href="https://github.com/x3zvawq/unluac-rs/releases">Command-line decompiler</a></h3>
+      <p>Download a CLI binary for Windows, macOS or Linux and decompile files offline.</p>
+      <pre><code>unluac-cli -i sample.luac -o recovered.lua</code></pre>
+    </article>
+    <article>
+      <h3><a href="https://www.npmjs.com/package/unluac-js">JavaScript / TypeScript</a></h3>
+      <p>Use <code>unluac-js</code> in Node.js or a bundled browser application.</p>
+      <pre><code>npm install unluac-js</code></pre>
+    </article>
+    <article>
+      <h3><a href="https://crates.io/crates/unluac">Rust library</a></h3>
+      <p>Add <code>unluac</code> to your project. The <a href="https://docs.rs/unluac">Rust API documentation</a> covers options and pipeline results.</p>
+      <pre><code>cargo add unluac</code></pre>
+    </article>
+  </div>
+
+  <h2>Questions about Lua decompilation</h2>
+  <details>
+    <summary>Which files can I decompile?</summary>
+    <p>Open compiled bytecode from a supported Lua version or dialect. Files may use <code>.luac</code>, <code>.out</code>, <code>.lua</code> or any other extension: detection uses the file contents. Ordinary source files can also be opened for reading and editing.</p>
+  </details>
+  <details>
+    <summary>Are my files uploaded?</summary>
+    <p>No. Decompilation and structural analysis run locally in your browser using WebAssembly. The browser stores original file bytes and dialect choices for your next visit. Download manual edits before leaving or reloading the page.</p>
+  </details>
+  <details>
+    <summary>Can I recover the exact original source?</summary>
+    <p>Decompilation reconstructs program structure; it cannot recover comments or information discarded during compilation. Available debug information can help recover names. The project is still in testing, and unsupported constructs or bugs can affect the output. Review generated code and report reproducible problems.</p>
+  </details>
+  <details>
+    <summary>How do I report a decompilation problem?</summary>
+    <p><a href="https://github.com/x3zvawq/unluac-rs/issues">Open a GitHub issue</a> with a reproducible sample, the Lua version, options used, and expected versus actual behavior. Include the original source when available. Code, documentation and test cases are welcome.</p>
+  </details>
+  <p class="product-license">Released under the <a href="https://github.com/x3zvawq/unluac-rs/blob/main/LICENSE.txt">MIT License</a>. <a href="https://github.com/x3zvawq/unluac-rs">View the source on GitHub</a>.</p>
+</section>

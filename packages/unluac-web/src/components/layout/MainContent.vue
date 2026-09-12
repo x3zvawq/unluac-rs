@@ -6,28 +6,37 @@
  * 下栏：分析面板，默认显示 ProtoGraph；点击某个 proto 进入该 proto 的 CFG 视图，
  *       左上角提供返回按钮回到 ProtoGraph。
  *
- * 文件切换后自动按需获取 richResult（结构化分析数据），缓存于 FileEntry 上。
- * ProtoGraph / CfgViewer 通过 defineAsyncComponent 懒加载，首屏仅下载 CodeViewer。
+ * 分析面板展开后按需获取 richResult，缓存于 FileEntry 上。
+ * 编辑器和图视图按需加载，无文件时只显示导入引导。
  */
 
-import { computed, defineAsyncComponent, inject, provide, shallowRef, watch } from 'vue'
+import {
+  computed,
+  defineAsyncComponent,
+  inject,
+  provide,
+  shallowRef,
+  watch,
+  type ShallowRef,
+} from 'vue'
 import { useI18n } from 'vue-i18n'
 
 const ProtoGraph = defineAsyncComponent(() => import('@/components/analysis/ProtoGraph.vue'))
 const CfgViewer = defineAsyncComponent(() => import('@/components/analysis/CfgViewer.vue'))
+const CodeViewer = defineAsyncComponent(() => import('@/components/editor/CodeViewer.vue'))
 
 import { useResizable } from '@/composables/useResizable'
 import { useFilesStore } from '@/stores/files'
-import { useSettingsStore } from '@/stores/settings'
-import type { ProtoConstant, RichDecompileResult } from '@/types/decompiler'
+import type { useDecompiler } from '@/composables/useDecompiler'
+import type { ProtoConstant } from '@/types/decompiler'
 
 const { t } = useI18n()
 const filesStore = useFilesStore()
-const settingsStore = useSettingsStore()
-const decompiler = inject<{
-  decompileRich: (fileId: string, bytes: Uint8Array, options: any) => Promise<RichDecompileResult>
-}>('decompiler')!
+const decompiler = inject<ReturnType<typeof useDecompiler>>('decompiler')!
 
+const isMobile = inject<ShallowRef<boolean>>('isMobile')!
+const analysisOpen = shallowRef(!isMobile.value)
+const constantsOpen = shallowRef(false)
 const analyzing = shallowRef(false)
 const analysisError = shallowRef<string | null>(null)
 const selectedProtoId = shallowRef<number | null>(null)
@@ -151,23 +160,37 @@ const openFiles = computed(() => filesStore.openFiles)
  * 文件选中后按需获取 richResult。
  */
 watch(
-  selectedFile,
-  async (file) => {
-    if (!file || (file.status !== 'success' && file.status !== 'skipped') || file.richResult) return
-    // skipped 文件（已是源码）不做 richResult 分析
-    if (file.status === 'skipped') return
-
-    analyzing.value = true
+  () => {
+    const file = selectedFile.value
+    return analysisOpen.value && file?.status === 'success' && !file.richResult
+      ? `${file.id}:${file.revision}`
+      : null
+  },
+  async (key, _, onCleanup) => {
+    analyzing.value = false
     analysisError.value = null
+    const file = selectedFile.value
+    if (!key || !file?.resultOptions) return
+    const controller = new AbortController()
+    onCleanup(() => controller.abort())
+    analyzing.value = true
     try {
       const bytes = new Uint8Array(file.bytes)
-      const result = await decompiler.decompileRich(file.id, bytes, settingsStore.options)
-      filesStore.updateRichResult(file.id, result)
+      const result = await decompiler.decompileRich(
+        file.id,
+        bytes,
+        file.resultOptions,
+        controller.signal,
+      )
+      if (!controller.signal.aborted && filesStore.isCurrent(file.id, file.revision)) {
+        filesStore.updateRichResult(file.id, result)
+      }
     } catch (err) {
-      console.error(`[analysis] richResult for ${file.id} failed:`, err)
-      analysisError.value = err instanceof Error ? err.message : String(err)
+      if (!controller.signal.aborted) {
+        analysisError.value = err instanceof Error ? err.message : String(err)
+      }
     } finally {
-      analyzing.value = false
+      if (!controller.signal.aborted) analyzing.value = false
     }
   },
   { immediate: true },
@@ -195,7 +218,7 @@ function backToProtos() {
 
 /** 文件切换时重置分析状态 */
 watch(
-  () => selectedFile.value?.id,
+  () => `${selectedFile.value?.id}:${selectedFile.value?.revision}`,
   () => {
     selectedProtoId.value = null
     highlightLineRange.value = null
@@ -206,37 +229,17 @@ watch(
 </script>
 
 <template>
-  <main class="flex min-w-0 flex-1 flex-col">
+  <main class="main-content flex min-w-0 flex-1 flex-col">
     <!-- ═══ 上栏：文件标签 + 源码 ═══ -->
     <div class="flex min-h-0 flex-1 flex-col">
       <!-- 文件标签栏 -->
       <div
-        class="flex shrink-0 items-center gap-0 overflow-x-auto"
+        v-if="openFiles.length" class="file-tabs" :aria-label="t('filePanel.title')"
         style="border-bottom: 1px solid var(--app-border); background: var(--app-bg-alt)"
       >
-        <button
-          v-for="file in openFiles"
-          :key="file.id"
-          class="group flex shrink-0 items-center gap-1.5 px-3 py-1.5 text-xs transition-colors"
-          :style="{
-            borderRight: '1px solid var(--app-border)',
-            background: file.id === filesStore.selectedFileId ? 'var(--app-bg)' : undefined,
-            color: file.id === filesStore.selectedFileId ? 'var(--app-text)' : 'var(--app-text-secondary)',
-          }"
-          @click="filesStore.selectFile(file.id)"
-          @contextmenu.prevent="openTabContextMenu($event, file.id)"
-        >
-          <span class="max-w-40 truncate">{{ file.name }}</span>
-          <span
-            class="ml-1 hidden rounded-sm group-hover:inline-block"
-            style="color: var(--app-text-dim)"
-            @click.stop="filesStore.closeTab(file.id)"
-          >
-            ×
-          </span>
-        </button>
-        <div v-if="openFiles.length === 0" class="px-3 py-1.5 text-xs text-gray-400">
-          {{ t('analysis.noFile') }}
+        <div v-for="file in openFiles" :key="file.id" class="file-tab" :class="{ active: file.id === filesStore.selectedFileId }" @contextmenu.prevent="openTabContextMenu($event, file.id)">
+          <button class="tab-select" :aria-pressed="file.id === filesStore.selectedFileId" @click="filesStore.selectFile(file.id)"><i-mdi-code-braces /><span class="max-w-40 truncate">{{ file.name }}</span><span v-if="file.editedResult !== undefined" class="modified-dot" /></button>
+          <button class="tab-close icon-button" :aria-label="`${t('tabs.contextMenu.close')}: ${file.name}`" @click="filesStore.closeTab(file.id)"><i-mdi-close /></button>
         </div>
       </div>
 
@@ -252,13 +255,15 @@ watch(
       />
       <!-- 源码查看器 -->
       <div class="min-h-0 flex-1">
-        <CodeViewer />
+        <WelcomeView v-if="!selectedFile" />
+        <CodeViewer v-else />
       </div>
     </div>
 
+    <template v-if="selectedFile?.status === 'success'">
     <!-- ═══ 分割条 ═══ -->
     <div
-      class="shrink-0 cursor-row-resize transition-colors hover:bg-indigo-400/40"
+      v-if="analysisOpen" class="resize-handle shrink-0 cursor-row-resize"
       :class="{ 'bg-indigo-400/40': bottomDragging }"
       :style="{ height: '4px', borderTop: '1px solid var(--app-border)' }"
       @pointerdown="onBottomPointerDown"
@@ -267,15 +272,17 @@ watch(
     <!-- ═══ 下栏：分析面板 ═══ -->
     <div
       class="flex shrink-0 flex-col"
-      :style="{ height: `${bottomHeight}px` }"
+      :style="{ height: analysisOpen ? `min(${bottomHeight}px, 55dvh)` : '44px' }"
     >
       <!-- 分析面板标题栏 -->
       <div
-        class="flex shrink-0 items-center gap-2 px-3 py-1"
+        class="analysis-toolbar"
         style="border-bottom: 1px solid var(--app-border)"
       >
-        <template v-if="analysisView === 'cfg'">
-          <NButton quaternary size="tiny" @click="backToProtos">
+        <button class="analysis-toggle" :aria-expanded="analysisOpen" @click="analysisOpen = !analysisOpen"><i-mdi-chevron-down v-if="analysisOpen" /><i-mdi-chevron-up v-else />{{ t('workspace.analysis') }}</button>
+        <NButton v-if="isMobile && analysisOpen && hasAnalysisData" quaternary size="tiny" :aria-pressed="constantsOpen" @click="constantsOpen = !constantsOpen">{{ t('analysis.constants.title') }}</NButton>
+        <template v-if="analysisOpen && analysisView === 'cfg'">
+          <NButton quaternary size="tiny" :aria-label="t('tabs.protos')" @click="backToProtos">
             <template #icon>
               <NIcon size="14">
                 <svg
@@ -304,7 +311,7 @@ watch(
               }}
             </template>
           </span>
-          <span v-if="selectedCfg" class="text-xs" style="color: var(--app-text-dim)">
+          <span v-if="selectedCfg" class="hidden text-xs sm:inline" style="color: var(--app-text-dim)">
             {{ t('analysis.cfgViewer.blocks') }}: {{ selectedCfg.blocks.length }}
             · {{ t('analysis.cfgViewer.edges') }}: {{ selectedCfg.edges.length }}
           </span>
@@ -332,7 +339,7 @@ watch(
             </button>
           </span>
         </template>
-        <template v-else>
+        <template v-else-if="analysisOpen">
           <span class="text-xs font-medium" style="color: var(--app-text-secondary)">
             {{ t('tabs.protos') }}
           </span>
@@ -340,38 +347,26 @@ watch(
       </div>
 
       <!-- 分析内容（左：常量表，右：视图） -->
-      <div class="flex min-h-0 flex-1">
+      <div v-if="analysisOpen" class="flex min-h-0 flex-1">
         <!-- 常量表面板（仅在有分析数据时显示） -->
-        <template v-if="hasAnalysisData">
+        <template v-if="hasAnalysisData && (!isMobile || constantsOpen)">
           <div
             class="shrink-0 overflow-hidden"
-            :style="{ width: `${constantsPanelWidth}px`, borderRight: '1px solid var(--app-border)' }"
+            :style="{ width: isMobile ? '100%' : `${constantsPanelWidth}px`, borderRight: '1px solid var(--app-border)' }"
           >
             <ConstantsPanel :constants="constantsList" :proto-name="constantsProtoName" />
           </div>
           <div
-            class="shrink-0 cursor-col-resize transition-colors hover:bg-indigo-400/40"
+            v-if="!isMobile" class="resize-handle shrink-0 cursor-col-resize"
             :class="{ 'bg-indigo-400/40': constantsDragging }"
             :style="{ width: '4px' }"
             @pointerdown="onConstantsPointerDown"
           />
         </template>
         <!-- 主内容区 -->
-        <div class="min-w-0 flex-1">
+        <div v-show="!isMobile || !constantsOpen" class="min-w-0 flex-1">
           <div v-if="analyzing" class="flex h-full items-center justify-center">
             <NSpin :description="t('analysis.loading')" />
-          </div>
-          <div
-            v-else-if="!selectedFile || (selectedFile.status !== 'success' && selectedFile.status !== 'skipped')"
-            class="flex h-full items-center justify-center"
-          >
-            <NEmpty :description="t('analysis.noFile')" />
-          </div>
-          <div
-            v-else-if="selectedFile.status === 'skipped'"
-            class="flex h-full items-center justify-center"
-          >
-            <NEmpty :description="t('analysis.sourceFile')" />
           </div>
           <div
             v-else-if="analysisError"
@@ -399,5 +394,6 @@ watch(
         </div>
       </div>
     </div>
+    </template>
   </main>
 </template>
