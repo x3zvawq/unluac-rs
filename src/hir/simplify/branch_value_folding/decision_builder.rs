@@ -7,6 +7,8 @@
 //!
 //! 例子：`t0=a; if t0 then out=t0 else t1=b; if t1 ... end end` 会先建成两个 Decision
 //! 节点，再一次收敛为 `out = a or b or ...`，而不是每深入一层重扫和 clone 已构造子树。
+//! 无事件且 GC-inert 的叶值可带同 home 的机械 copy；消费 Promotion 的槽身份并保留最终
+//! 覆盖点，例如 `a=true; out=a` 不能因 root endpoint 的存在被迫先物化成可变 local。
 
 use std::collections::BTreeSet;
 
@@ -16,6 +18,7 @@ use crate::hir::common::{
     HirIf, HirLocalDecl, HirStmt, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
+use crate::hir::promotion::ProtoPromotionFacts;
 use crate::hir::visit::{HirVisitor, visit_expr};
 
 #[derive(Default)]
@@ -65,18 +68,20 @@ pub(super) struct CollapsedBranchValueTarget {
     refs: BindingRefs,
 }
 
-pub(super) struct BranchValueDecisionBuilder {
+pub(super) struct BranchValueDecisionBuilder<'a> {
     nodes: Vec<HirDecisionNode>,
     raw_guards: BTreeSet<TempId>,
     safety: HirExprSafety,
+    facts: &'a ProtoPromotionFacts,
 }
 
-impl BranchValueDecisionBuilder {
-    pub(super) fn new(safety: HirExprSafety) -> Self {
+impl<'a> BranchValueDecisionBuilder<'a> {
+    pub(super) fn new(safety: HirExprSafety, facts: &'a ProtoPromotionFacts) -> Self {
         Self {
             nodes: Vec::new(),
             raw_guards: BTreeSet::new(),
             safety,
+            facts,
         }
     }
 
@@ -113,6 +118,28 @@ impl BranchValueDecisionBuilder {
                 Some(CollapsedBranchValueTarget {
                     target: HirDecisionTarget::Expr(expr.clone()),
                     refs: BindingRefs::in_expr(expr),
+                })
+            }
+            [producer, HirStmt::Assign(copy)] => {
+                let (source, value) = producer.scalar_temp_assignment()?;
+                let BranchValueBinding::Temp(target) = binding else {
+                    return None;
+                };
+                if source == target
+                    || !matches!(single_assign_value(copy, binding)?, HirExpr::TempRef(temp) if *temp == source)
+                    || !self.safety.is_discard_safe(value)
+                    || !self.safety.result_is_gc_inert(value)
+                    || self.facts.trusted_temp_home_slot(source)?
+                        != self.facts.trusted_temp_home_slot(target)?
+                {
+                    return None;
+                }
+                // 同 home 的无事件标量写 + 合流 copy 保留同一覆盖点；只删除机械 alias。
+                // 外层仍验证 source 无跨语句使用/捕获/debug 身份（regress_468）。
+                self.raw_guards.insert(source);
+                Some(CollapsedBranchValueTarget {
+                    target: HirDecisionTarget::Expr(value.clone()),
+                    refs: BindingRefs::in_expr(value),
                 })
             }
             [HirStmt::If(if_stmt)] => self.collapse_if(if_stmt, binding),
@@ -213,6 +240,7 @@ impl BranchValueDecisionBuilder {
         self.nodes.push(HirDecisionNode {
             id: node_ref,
             test: test.clone(),
+            test_source: crate::hir::HirDecisionTestSource::Predicate,
             truthy: HirDecisionTarget::CurrentValue,
             falsy: HirDecisionTarget::CurrentValue,
         });
@@ -249,6 +277,7 @@ impl BranchValueDecisionBuilder {
                     nodes: self.nodes,
                 },
                 self.safety,
+                |_| false,
             ),
             HirDecisionTarget::Expr(expr) => expr,
             HirDecisionTarget::CurrentValue => {

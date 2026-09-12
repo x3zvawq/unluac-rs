@@ -564,7 +564,7 @@ fn format_lvalue(target: &HirLValue) -> String {
 }
 
 fn format_call_expr(call: &super::common::HirCallExpr) -> String {
-    let kind = if call.method {
+    let kind = if call.is_method() {
         "method"
     } else if call.fastcall.is_some() {
         "fastcall"

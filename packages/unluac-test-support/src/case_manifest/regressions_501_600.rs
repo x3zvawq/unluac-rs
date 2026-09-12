@@ -516,4 +516,169 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         retain_debug: true,
         ..LuaCaseOptions::DEFAULT
     }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_556_method_chain_frame_roots.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_556_method_chain_frame_roots.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_557_short_circuit_constant_snapshot.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_558_operator_result_gc_roots.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_558_operator_result_gc_roots.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_559_recursive_closure_table_results.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_560_close_return_error_order.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_560_close_return_error_order.lua",
+        &[LuaCaseDialect::Lua54, LuaCaseDialect::Lua55],
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_561_private_constructor_roots.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_561_private_constructor_roots.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_562_shared_short_circuit.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_562_shared_short_circuit.lua",
+        ALL_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_562_short_circuit_entry_gc.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_562_short_circuit_entry_gc.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_563_loop_tail_capture_cleanup.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_563_loop_tail_capture_cleanup.lua",
+        ALL_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_564_pure_decision_graph.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_564_pure_decision_graph.lua",
+        ALL_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_564_pure_decision_gc.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_564_pure_decision_gc.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_565_boolean_value_predicate_gc.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_565_boolean_value_predicate_gc.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_566_short_circuit_root_frontier.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_566_short_circuit_root_frontier.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_568_luajit_logical_literals.lua",
+        LUAJIT_ONLY,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_568_vararg_logical_atoms.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_568_luau_logical_vectors.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LUAU_VECTOR_OPTIONS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_567_scoped_short_circuit_frontier.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_567_scoped_short_circuit_frontier.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
 ];

@@ -38,8 +38,8 @@ use self::access::{
     lower_table_access_expr_single_eval,
 };
 pub(super) use self::branch::{
-    lower_binary_op, lower_branch_cond, lower_branch_subject, lower_branch_subject_single_eval,
-    lower_unary_op,
+    branch_call_result_root_ends_after_test, lower_binary_op, lower_branch_cond,
+    lower_branch_subject, lower_branch_subject_single_eval, lower_unary_op,
 };
 pub(super) use self::defs::expr_for_direct_literal_def;
 use self::defs::expr_for_dup_safe_fixed_def;
@@ -71,7 +71,7 @@ pub(super) fn lower_closure_expr(
             frame_root_ends: Vec::new(),
             callee: HirExpr::LocalRef(lowering.shared_factory_local(factory)),
             args: Default::default(),
-            method: false,
+            method: false.into(),
             fastcall: None,
             method_key: None,
             callee_root_handoff: None,
@@ -256,7 +256,7 @@ fn pack_tail_for_open_def(
                 } else {
                     lower_value_pack(lowering, open_def.block, open_def.instr, call.args)
                 },
-                method: matches!(call.kind, CallKind::Method),
+                method: matches!(call.kind, CallKind::Method).into(),
                 fastcall: match call.kind {
                     CallKind::FastCall(args) => Some(args),
                     CallKind::Normal | CallKind::Method => None,

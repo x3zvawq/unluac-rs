@@ -2,7 +2,7 @@
 -- Allocation may keep the table argument explicit; suffix expansion and prefix ordering remain mandatory.
 -- unluac: expect-contains [[, __reg423_suffix_values())]]
 -- unluac: expect-order [["prefix-table"]] [[__reg423_mark("prefix-extra", 11)]]
--- unluac: expect-contains [[.read = function]]
+-- unluac: expect-contains [[.read()]]
 
 local events = {}
 

@@ -20,8 +20,6 @@ source output; remove `--output` or keep `--stop-after=generate` without debug o
 
 mod args;
 
-#[cfg(test)]
-use args::CliArgs;
 use args::{output_argument_conflict, parse_args};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -462,7 +460,3 @@ impl From<unluac::decompile::DecompileError> for CliError {
         Self::Decompile(value)
     }
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;

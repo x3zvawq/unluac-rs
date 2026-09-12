@@ -338,7 +338,7 @@ pub(super) struct ProtoPromotionFacts {
     compact_home_slots: bool,
     argument_roots_by_call: BTreeMap<InstrRef, Vec<crate::hir::common::HirCallArgumentRoot>>,
     argument_root_producers: BTreeSet<TempId>,
-    unobserved_call_result_ends: BTreeMap<TempId, TempId>,
+    unobserved_call_result_ends: BTreeMap<TempId, Vec<TempId>>,
     frame_result_ends_by_call: BTreeMap<InstrRef, Vec<TempId>>,
     method_setup_protocols: Vec<HirMethodSetupProtocol>,
     method_setup_protocol_by_call: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
@@ -364,7 +364,7 @@ pub(super) struct ImplicitRootScopeFence {
 #[derive(Debug, Clone)]
 pub(super) struct HirMethodSetupProtocol {
     pub(super) callee_temp: TempId,
-    pub(super) prior_callee_root_temp: TempId,
+    pub(super) prior_callee_root_temp: Option<TempId>,
     pub(super) method_key: crate::LuaString,
 }
 
@@ -541,7 +541,12 @@ impl ProtoPromotionFacts {
         };
         self.unobserved_call_result_ends
             .get(&temp)
-            .is_some_and(|end| self.trusted_temp_home_slot(*end) == Some(home))
+            .is_some_and(|ends| {
+                !ends.is_empty()
+                    && ends
+                        .iter()
+                        .all(|end| self.trusted_temp_home_slot(*end) == Some(home))
+            })
     }
 
     /// 精确 dispatch 排除的原始 caller root；当前值流和求值前缀仍由 HIR 消费者核对。
@@ -714,8 +719,9 @@ impl ProtoPromotionFacts {
             .retain(|temp, _| !temps.contains(temp));
         self.argument_root_producers
             .retain(|temp| !temps.contains(temp));
-        self.unobserved_call_result_ends
-            .retain(|producer, end| !temps.contains(producer) && !temps.contains(end));
+        self.unobserved_call_result_ends.retain(|producer, ends| {
+            !temps.contains(producer) && ends.iter().all(|end| !temps.contains(end))
+        });
         self.frame_result_ends_by_call.retain(|_, roots| {
             roots.retain(|temp| !temps.contains(temp));
             !roots.is_empty()
@@ -1321,7 +1327,7 @@ impl ProtoPromotionFacts {
         call: InstrRef,
         get: InstrRef,
         callee_temp: TempId,
-        prior_callee_root_temp: TempId,
+        prior_callee_root_temp: Option<TempId>,
         method_key: crate::LuaString,
     ) {
         let id = HirMethodSetupProtocolId::new(self.method_setup_protocols.len());

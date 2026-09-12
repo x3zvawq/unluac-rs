@@ -5,6 +5,8 @@
 //! 消费 bindings 发布的编号域。capture 两种模式都计入父级绑定引用，不进入子 proto。
 //! 不会在这里改写任何节点。例如 `t0 = a.b` 的读取计数为一时，inline owner 可继续审查
 //! 该定义的求值顺序与生命周期，不能仅凭计数删除它。
+//! 同次遍历保留 Boolean 值进入谓词的边界：`v=not not f(); if v` 的原值存储
+//! 不等于 `if f()`；copy 依赖逆向传播到原 producer，不用最后一个 copy 替代旧槽覆盖。
 
 use super::*;
 
@@ -54,6 +56,7 @@ impl TempUseSummary {
 pub(super) struct TempUseScratch {
     definition_counts: Vec<usize>,
     temp_debug_hints: Vec<bool>,
+    boolean_value_predicates: Vec<bool>,
     counts: Vec<usize>,
     touched: Vec<TempId>,
 }
@@ -65,22 +68,117 @@ impl TempUseScratch {
         for (index, hint) in proto.temp_debug_locals.iter().enumerate().take(temp_count) {
             temp_debug_hints[index] = hint.is_some();
         }
-        struct Definitions(Vec<usize>);
+        struct Definitions {
+            counts: Vec<usize>,
+            boolean_values: Vec<bool>,
+            predicates: Vec<bool>,
+            copies: Vec<Vec<TempId>>,
+            predicate_occurrences: BTreeSet<usize>,
+        }
+        impl Definitions {
+            fn predicate(&mut self, expr: &HirExpr) {
+                self.predicate_occurrences
+                    .insert(std::ptr::from_ref(expr).addr());
+            }
+        }
         impl HirVisitor<'_> for Definitions {
+            fn visit_stmt(&mut self, stmt: &HirStmt) {
+                if let Some((temp, value)) = stmt.scalar_temp_assignment() {
+                    if let HirExpr::TempRef(source) = value {
+                        self.copies[temp.index()].push(*source);
+                    } else if !matches!(value, HirExpr::Boolean(_))
+                        && crate::hir::simplify::expr_facts::expr_is_boolean_valued(value)
+                    {
+                        self.boolean_values[temp.index()] = true;
+                    }
+                }
+                match stmt {
+                    HirStmt::If(branch) => self.predicate(&branch.cond),
+                    HirStmt::While(loop_) => self.predicate(&loop_.cond),
+                    HirStmt::Repeat(loop_) => self.predicate(&loop_.cond),
+                    _ => {}
+                }
+            }
+
+            fn visit_expr(&mut self, expr: &HirExpr) {
+                let predicate = self
+                    .predicate_occurrences
+                    .remove(&std::ptr::from_ref(expr).addr());
+                match expr {
+                    HirExpr::TempRef(temp) if predicate => self.predicates[temp.index()] = true,
+                    HirExpr::Unary(unary) if predicate => self.predicate(&unary.expr),
+                    HirExpr::Binary(binary) if predicate => {
+                        // `flag == true` 也能被编译成条件跳转；原 Boolean store 仍有覆盖含义。
+                        self.predicate(&binary.lhs);
+                        self.predicate(&binary.rhs);
+                    }
+                    HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                        self.predicate(&logical.lhs);
+                        if predicate {
+                            self.predicate(&logical.rhs);
+                        }
+                    }
+                    _ => {}
+                }
+                if let HirExpr::Decision(decision) = expr {
+                    for node in &decision.nodes {
+                        if !matches!(node.truthy, crate::hir::HirDecisionTarget::CurrentValue)
+                            && !matches!(node.falsy, crate::hir::HirDecisionTarget::CurrentValue)
+                        {
+                            self.predicate(&node.test);
+                        }
+                    }
+                }
+            }
+
             fn visit_lvalue(&mut self, target: &HirLValue) {
                 if let HirLValue::Temp(temp) = target {
-                    self.0[temp.index()] += 1;
+                    self.counts[temp.index()] += 1;
                 }
             }
         }
-        let mut definitions = Definitions(vec![0; temp_count]);
+        let mut definitions = Definitions {
+            counts: vec![0; temp_count],
+            boolean_values: vec![false; temp_count],
+            predicates: vec![false; temp_count],
+            copies: vec![Vec::new(); temp_count],
+            predicate_occurrences: BTreeSet::new(),
+        };
         visit_stmts(&proto.body.stmts, &mut definitions);
+        let mut pending = definitions
+            .predicates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.then_some(TempId(index)))
+            .collect::<Vec<_>>();
+        while let Some(source) = pending.pop() {
+            for &copy in &definitions.copies[source.index()] {
+                if !definitions.predicates[copy.index()] {
+                    definitions.predicates[copy.index()] = true;
+                    pending.push(copy);
+                }
+            }
+        }
+        let boolean_value_predicates = definitions
+            .boolean_values
+            .into_iter()
+            .zip(definitions.predicates)
+            .map(|(value, predicate)| value && predicate)
+            .collect();
         Self {
-            definition_counts: definitions.0,
+            definition_counts: definitions.counts,
             temp_debug_hints,
+            boolean_value_predicates,
             counts: vec![0; temp_count],
             touched: Vec::new(),
         }
+    }
+
+    pub(super) fn boolean_value_predicates(&self) -> impl Iterator<Item = TempId> + '_ {
+        self.boolean_value_predicates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, preserve)| preserve.then_some(TempId(index)))
     }
 
     pub(super) fn has_unique_definition(&self, temp: TempId) -> bool {

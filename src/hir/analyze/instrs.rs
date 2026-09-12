@@ -185,7 +185,7 @@ pub(super) fn lower_regular_instr(
                     type_guard.subject,
                 )]
                 .into(),
-                method: false,
+                method: false.into(),
                 fastcall: None,
                 method_key: None,
                 callee_root_handoff: None,
@@ -386,7 +386,7 @@ pub(super) fn lower_terminal_instr(
                         frame_root_ends: Vec::new(),
                         callee,
                         args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                        method: matches!(tail_call.kind, CallKind::Method),
+                        method: matches!(tail_call.kind, CallKind::Method).into(),
                         fastcall: match tail_call.kind {
                             CallKind::FastCall(args) => Some(args),
                             CallKind::Normal | CallKind::Method => None,
@@ -456,7 +456,7 @@ fn generic_for_iterator_call(
         frame_root_ends: Vec::new(),
         callee,
         args,
-        method: false,
+        method: false.into(),
         fastcall: None,
         method_key: None,
         callee_root_handoff: None,
@@ -499,7 +499,7 @@ fn lower_call_expr(
         frame_root_ends: lowering.promotion_facts.call_frame_root_ends(instr_ref),
         callee,
         args: lower_value_pack(lowering, block, instr_ref, call.args),
-        method: matches!(call.kind, CallKind::Method),
+        method: matches!(call.kind, CallKind::Method).into(),
         fastcall: match call.kind {
             CallKind::FastCall(args) => Some(args),
             CallKind::Normal | CallKind::Method => None,

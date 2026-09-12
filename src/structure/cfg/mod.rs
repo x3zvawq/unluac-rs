@@ -19,7 +19,8 @@ pub use common::{
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
     InstrUseValues, NaturalLoop, NaturalLoopAncestors, NaturalLoopForest, NaturalLoopId, OpenDef,
     OpenDefId, OpenUseSources, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
-    ReachableSuccessorShape, RootObservation, SideEffectSummary, SsaRegMap, SsaValue, UseSite,
+    ReachableSuccessorShape, RootObservation, RootOverwriteFrontier, RootOverwriteFrontiers,
+    SideEffectSummary, SsaRegMap, SsaValue, UseSite,
 };
 pub(crate) use common::{PhiIncomingSlot, SccId};
 pub(crate) use dataflow::analyze_dataflow;

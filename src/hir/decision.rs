@@ -7,6 +7,8 @@
 //! 共享语义查询依赖某个 simplify pass 才能解释 Node/CurrentValue 的输入合法性。
 //! 校验同时发布借用当前节点的拓扑顺序和共享性；例如两臂汇入同一个 tail，值分析按
 //! 逆拓扑先算 tail 再合流两臂，payload 按正序传播可达边，不重新排序或按 id 搜索节点。
+//! 首次 lowering 可为当前节点快照提供原根终点 query；归约当场消费，失败不发布许可，
+//! 组合后的 test 也不能继承单个 producer 的证明。后续快照只能使用自身仍有效的事实。
 
 use crate::hir::common::{HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget, HirExpr};
 use crate::hir::expr_safety::HirExprSafety;
@@ -15,6 +17,7 @@ use crate::hir::expr_safety::HirExprSafety;
 pub(in crate::hir) struct DecisionFacts<'a> {
     decision: &'a HirDecisionExpr,
     order: Vec<usize>,
+    incoming: Vec<usize>,
     has_shared_nodes: bool,
 }
 
@@ -25,6 +28,10 @@ impl DecisionFacts<'_> {
 
     pub(in crate::hir) fn has_shared_nodes(&self) -> bool {
         self.has_shared_nodes
+    }
+
+    pub(in crate::hir) fn incoming_counts(&self) -> &[usize] {
+        &self.incoming
     }
 
     pub(in crate::hir) fn topological_nodes(
@@ -57,6 +64,7 @@ pub(in crate::hir) fn analyze_decision(decision: &HirDecisionExpr) -> DecisionFa
         }
     }
     let has_shared_nodes = incoming.iter().any(|&count| count > 1);
+    let mut remaining_incoming = incoming.clone();
     let mut ready = incoming
         .iter()
         .enumerate()
@@ -71,8 +79,8 @@ pub(in crate::hir) fn analyze_decision(decision: &HirDecisionExpr) -> DecisionFa
         let node = &decision.nodes[index];
         for target in [&node.truthy, &node.falsy] {
             if let HirDecisionTarget::Node(next_ref) = target {
-                incoming[next_ref.index()] -= 1;
-                if incoming[next_ref.index()] == 0 {
+                remaining_incoming[next_ref.index()] -= 1;
+                if remaining_incoming[next_ref.index()] == 0 {
                     ready.push(next_ref.index());
                 }
             }
@@ -90,6 +98,7 @@ pub(in crate::hir) fn analyze_decision(decision: &HirDecisionExpr) -> DecisionFa
     DecisionFacts {
         decision,
         order,
+        incoming,
         has_shared_nodes,
     }
 }
@@ -110,7 +119,12 @@ pub(in crate::hir) fn finalize_condition_decision_expr(
 pub(in crate::hir) fn finalize_value_decision_expr(
     decision: HirDecisionExpr,
     safety: HirExprSafety,
+    root_ends: impl Fn(&super::common::HirDecisionNode) -> bool,
 ) -> HirExpr {
-    super::simplify::decision::collapse_value_decision_expr(&analyze_decision(&decision), safety)
-        .unwrap_or_else(|| HirExpr::Decision(Box::new(decision)))
+    super::simplify::decision::collapse_value_decision_expr(
+        &analyze_decision(&decision),
+        safety,
+        root_ends,
+    )
+    .unwrap_or_else(|| HirExpr::Decision(Box::new(decision)))
 }

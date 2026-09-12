@@ -318,26 +318,6 @@ impl<'a> Emitter<'a> {
         function_decl: &AstFunctionDecl,
         function: HirProtoRef,
     ) -> Result<Doc, GenerateError> {
-        // `function a.b(...)` is syntax sugar for `a.b = function(...)` when the target is a
-        // plain non-global path.  The assignment spelling is more faithful to recovered table
-        // fields and avoids presenting a mechanically materialized field as a declaration. Keep
-        // global declarations and method targets on their dedicated syntax: their target
-        // dialects and implicit-self rules are distinct.
-        if let crate::ast::AstFunctionName::Plain(path) = &function_decl.target
-            && !path.fields.is_empty()
-            && matches!(
-                path.root,
-                crate::ast::AstNameRef::Local(_) | crate::ast::AstNameRef::SyntheticLocal(_)
-            )
-            && !function_captures_path_root(&function_decl.func, &path.root)
-        {
-            let target = self.emit_function_name(&function_decl.target, function)?;
-            let value =
-                self.emit_function_with_header(&function_decl.func, Doc::text("function"))?;
-            let assignment = Doc::concat([target, Doc::text(" = "), value]);
-            return Ok(self.prepend_function_comment(function_decl.func.function, assignment));
-        }
-
         let target = self.emit_function_name(&function_decl.target, function)?;
         let header = Doc::concat([
             Doc::text(if self.function_decl_is_global(function_decl) {
@@ -428,25 +408,4 @@ fn emit_error_comment(message: &str) -> Doc {
         .chain(lines.map(|line| Doc::text(format!("-- {line}"))))
         .collect::<Vec<_>>();
     Doc::join(comments, Doc::line())
-}
-
-fn function_captures_path_root(
-    function: &crate::ast::AstFunctionExpr,
-    root: &crate::ast::AstNameRef,
-) -> bool {
-    match root {
-        crate::ast::AstNameRef::Param(param) => function.captured_params.contains(param),
-        crate::ast::AstNameRef::Local(local) => function
-            .captured_bindings
-            .contains(&crate::ast::AstBindingRef::Local(*local)),
-        crate::ast::AstNameRef::SyntheticLocal(local) => function
-            .captured_bindings
-            .contains(&crate::ast::AstBindingRef::SyntheticLocal(*local)),
-        // Upvalue identity is represented by the enclosing function rather than this local
-        // capture summary. Keep declaration syntax when it is the path root.
-        crate::ast::AstNameRef::Upvalue(_)
-        | crate::ast::AstNameRef::Environment
-        | crate::ast::AstNameRef::Temp(_) => true,
-        crate::ast::AstNameRef::Global(_) => false,
-    }
 }

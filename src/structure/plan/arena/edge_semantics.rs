@@ -402,6 +402,19 @@ impl EdgeSemantics {
                         for edge in &cfg.succs[block.index()] {
                             if partition.control.contains(&cfg.edges[edge.index()].to) {
                                 semantics.internal_transitions[edge.index()] = Some(region);
+                                // 完整 body 的词法尾已经到达 control，不能再被早期 branch
+                                // continue 候选抢占；捕获局部的 Close/JMP 也属于该尾（regress_563）。
+                                // 候选拒绝[SemanticBarrier:Lifetime]：repeat 的 staged condition
+                                // 可能仍在 body 内求值；删 continue 会延迟捕获关闭（regress_457）。
+                                if matches!(
+                                    loop_.kind_hint,
+                                    crate::structure::LoopKindHint::NumericForLike
+                                        | crate::structure::LoopKindHint::GenericForLike
+                                ) && semantics.continues[edge.index()] == Some(region)
+                                {
+                                    semantics.continues[edge.index()] = None;
+                                    semantics.early_continues[edge.index()] = false;
+                                }
                             }
                         }
                     }

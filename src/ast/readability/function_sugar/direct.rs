@@ -7,9 +7,60 @@
 
 use crate::ast::common::{
     AstAssign, AstExpr, AstFunctionDecl, AstFunctionName, AstGlobalBindingTarget, AstGlobalDecl,
-    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstNamePath, AstNameRef, AstStmt,
-    AstTargetDialect,
+    AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstLocalOrigin, AstNamePath,
+    AstNameRef, AstStmt, AstTargetDialect,
 };
+
+/// 空声明已把 binding 放进作用域；local function 保留这一点，普通 local initializer 则不保留。
+pub(super) fn lower_declared_function(stmts: &[AstStmt]) -> Option<(AstStmt, usize)> {
+    let [AstStmt::LocalDecl(decl), next, ..] = stmts else {
+        return None;
+    };
+    let [binding] = decl.bindings.as_slice() else {
+        return None;
+    };
+    if !decl.values.is_empty()
+        || decl.initializer_merge_transaction.is_some()
+        || binding.attr != AstLocalAttr::None
+        || binding.origin != AstLocalOrigin::Recovered
+    {
+        // 候选拒绝[LayerBoundary]：只消费 recovered 空声明，不改写 debug 起点、属性或物理根清零事务。
+        return None;
+    }
+    let function = match next {
+        AstStmt::Assign(assign) => {
+            let ([AstLValue::Name(name)], [AstExpr::FunctionExpr(function)]) =
+                (assign.targets.as_slice(), assign.values.as_slice())
+            else {
+                return None;
+            };
+            if !binding.id.matches_name_ref(name) {
+                return None;
+            }
+            function.as_ref()
+        }
+        AstStmt::FunctionDecl(decl) => {
+            let AstFunctionName::Plain(path) = &decl.target else {
+                return None;
+            };
+            if !path.fields.is_empty() || !binding.id.matches_name_ref(&path.root) {
+                return None;
+            }
+            &decl.func
+        }
+        _ => return None,
+    };
+    // 不删除 binding、不改变 capture 的 value epoch；保留 HIR authority，递归函数也无需移出捕获域。
+    Some((
+        AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
+            name: binding.id,
+            origin: binding.origin,
+            rewrite_authority: binding.rewrite_authority.clone(),
+            func: function.clone(),
+        })),
+        2,
+    ))
+}
 
 pub(super) fn lower_direct_function_stmt(
     stmt: &AstStmt,
@@ -112,8 +163,7 @@ pub(super) fn function_decl_target_from_lvalue(
             }))
         }
         AstLValue::FieldAccess(access) => {
-            // 无 method-definition provenance 时只能生成 plain field function；冒号形式会删除
-            // 显式首参并改变 parameter binding，反例见 regress_333。
+            // 先保留完整参数；冒号形式由 method_decl 独立审查 self 的命名与作用域。
             let Some(AstNamePath { root, mut fields }) = name_path_from_expr(&access.base) else {
                 // 候选拒绝[TargetConstraint]：Lua function 声明的 field target 必须是静态点号 name path。
                 return None;

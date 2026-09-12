@@ -126,6 +126,16 @@ impl<'a> AstLowerer<'a> {
         Ok(AstFunctionExpr {
             function: closure.proto,
             params: child.params.clone(),
+            allows_self_param: !child.params.is_empty()
+                && child
+                    .param_debug_hints
+                    .first()
+                    .and_then(Option::as_deref)
+                    .is_none_or(|name| name == "self")
+                && child
+                    .upvalues
+                    .iter()
+                    .all(|upvalue| child.environment_upvalues.contains(upvalue)),
             is_vararg: child.signature.is_vararg,
             named_vararg,
             body,
@@ -451,10 +461,24 @@ impl<'a> AstLowerer<'a> {
         let method_name = call
             .method_receiver()
             .and_then(|(_, method_key)| identifier_from_lua_key(method_key, self.target.version));
+        if call.method == crate::hir::HirMethodCall::Implicit && method_name.is_none() {
+            return Err(AstLowerError::InvalidMethodCallPattern {
+                proto: proto_index,
+                reason: "implicit receiver requires a paired method field valid in the target dialect",
+            });
+        }
         let mut args =
             self.lower_value_pack(proto_index, &call.args, PackLoweringContext::Ordinary)?;
 
         if let Some(method_name) = method_name {
+            if call.method == crate::hir::HirMethodCall::Implicit {
+                let (receiver, _) = call.method_receiver().expect("validated method receiver");
+                return Ok(AstCallKind::MethodCall(Box::new(AstMethodCallExpr {
+                    receiver: self.lower_expr(proto_index, receiver)?,
+                    method: method_name,
+                    args,
+                })));
+            }
             if args.is_empty() {
                 return Err(AstLowerError::InvalidMethodCallPattern {
                     proto: proto_index,
@@ -471,7 +495,7 @@ impl<'a> AstLowerer<'a> {
 
         let callee = self.lower_expr(proto_index, &call.callee)?;
 
-        if call.method && call.method_key.is_none() {
+        if call.is_method() && call.method_key.is_none() {
             if args.is_empty() {
                 return Err(AstLowerError::InvalidMethodCallPattern {
                     proto: proto_index,

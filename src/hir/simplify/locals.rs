@@ -56,7 +56,7 @@ use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
     CallRootLifetimeIndices, RootEventBlock, RootEventIndex, RootEventStmt, RootLifetimeFacts,
     RootOverwritePolicy, collect_call_result_local_roots, collect_call_root_lifetimes,
-    collect_lookup_gc_root_lifetimes, exact_multi_call_home_targets,
+    collect_scalar_gc_root_lifetimes, exact_multi_call_home_targets,
     stmt_has_argument_root_handoff,
 };
 use super::temp_touch::{collect_temp_refs_in_expr, expr_touches_any_temp};
@@ -697,8 +697,8 @@ fn collect_plans(
             }
         },
     );
-    let lookup_gc_root_lifetimes =
-        collect_lookup_gc_root_lifetimes(&lifetime_snapshot, facts, ctx.roots.safety, |temp| {
+    let scalar_gc_root_lifetimes =
+        collect_scalar_gc_root_lifetimes(&lifetime_snapshot, facts, ctx.roots.safety, |temp| {
             !ctx.identity_sensitive_temps.contains(&temp)
                 && !inherited.contains_key(&temp)
                 && !outer_uses_temp(temp)
@@ -714,7 +714,7 @@ fn collect_plans(
         closed_root_homes: suffix_dominance.as_ref().map_or_else(BTreeSet::new, |_| {
             call_root_lifetimes
                 .closed_roots_before(linear_prefix_end)
-                .chain(lookup_gc_root_lifetimes.closed_roots_before(linear_prefix_end))
+                .chain(scalar_gc_root_lifetimes.closed_roots_before(linear_prefix_end))
                 .map(|owner| (owner.root_index(), owner.home()))
                 .collect()
         }),
@@ -845,7 +845,7 @@ fn collect_plans(
             })
             .map(|pair| (pair.root_index(), pair.home()))
             .chain(
-                lookup_gc_root_lifetimes
+                scalar_gc_root_lifetimes
                     .overwrite_pairs(decl_index)
                     .map(|pair| (pair.root_index(), pair.home())),
             )
@@ -898,7 +898,7 @@ fn collect_plans(
             );
             materialized_owner_locals.insert((decl_index, home), local);
             if call_root_lifetimes.is_root(decl_index)
-                || lookup_gc_root_lifetimes.is_root(decl_index)
+                || scalar_gc_root_lifetimes.is_root(decl_index)
             {
                 // A scalar overwrite can terminate one physical-root transaction and produce
                 // the next one in the same local. Preserve that chained owner for its later pair.
@@ -1084,7 +1084,7 @@ fn collect_plans(
                 .and_then(|scope| ctx.debug_scope_locals.get(&(slot, scope)).copied())
         });
         let preceding_lookup_root = home_slot
-            .and_then(|home| lookup_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
+            .and_then(|home| scalar_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
             .map(|pair| (pair.root_index(), pair.home()));
         let preceding_call_root = home_slot
             .and_then(|home| {
@@ -1127,7 +1127,7 @@ fn collect_plans(
             .and_then(|owner| materialized_owner_locals.get(&owner).copied());
         let force_physical_root_local = group_has_physical_root
             || call_root_lifetimes.is_root(decl_index)
-            || lookup_gc_root_lifetimes.is_root(decl_index)
+            || scalar_gc_root_lifetimes.is_root(decl_index)
             || preceding_physical_root_local.is_some()
             || release_local.is_some();
         if sticky_local.is_none()
@@ -1299,7 +1299,7 @@ fn collect_plans(
             current_slot_locals.insert(home, selected_local);
         }
         let collected_root =
-            call_root_lifetimes.is_root(decl_index) || lookup_gc_root_lifetimes.is_root(decl_index);
+            call_root_lifetimes.is_root(decl_index) || scalar_gc_root_lifetimes.is_root(decl_index);
         if let Some(home) = home_slot {
             // Root ownership is keyed by both producer epoch and physical home. A value may be
             // copied through several homes; indexing only by its producer would let a later
@@ -1348,7 +1348,7 @@ fn collect_plans(
             .overwrite_pairs(decl_index)
             .next()
             .is_some()
-            || lookup_gc_root_lifetimes
+            || scalar_gc_root_lifetimes
                 .overwrite_pairs(decl_index)
                 .next()
                 .is_some())
@@ -1380,7 +1380,7 @@ fn collect_plans(
                 continue;
             }
             let preceding_lookup_root = home_slot
-                .and_then(|home| lookup_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
+                .and_then(|home| scalar_gc_root_lifetimes.overwrite_pair_for_home(decl_index, home))
                 .map(|pair| (pair.root_index(), pair.home()));
             let preceding_call_root = home_slot
                 .and_then(|home| call_root_lifetimes.overwrite_pair_for_home(decl_index, home))

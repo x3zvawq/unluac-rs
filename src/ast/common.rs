@@ -213,6 +213,9 @@ pub struct AstReturn {
 pub struct AstFunctionExpr {
     pub function: HirProtoRef,
     pub params: Vec<ParamId>,
+    /// HIR 参数身份允许首参命名为 self，且没有待命名的非环境 upvalue 与它冲突。
+    /// 这不是原始冒号声明的证明；readability 仍需检查当前函数及后代的自由 self。
+    pub(crate) allows_self_param: bool,
     pub is_vararg: bool,
     pub named_vararg: Option<AstBindingRef>,
     pub body: AstBlock,

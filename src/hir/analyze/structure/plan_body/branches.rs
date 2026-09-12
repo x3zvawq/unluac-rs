@@ -143,6 +143,17 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             vec![finalize_value_decision_expr(
                 decision,
                 crate::hir::expr_safety::HirExprSafety::for_dialect(self.lowering.target),
+                |node| {
+                    // 原节点 identity 在本次 lowering 中仍与冻结 plan 一一对应。
+                    // 只在此次归约事务消费证明，不把许可挂到可被后续 pass 改写的节点。
+                    node.test_source == crate::hir::HirDecisionTestSource::Value
+                        && matches!(node.test, HirExpr::Call(_))
+                        && super::super::super::exprs::branch_call_result_root_ends_after_test(
+                            self.lowering,
+                            selected.nodes[node.id.index()].predicate,
+                            &selected.call_root_frontiers,
+                        )
+                },
             )],
         ));
         stmts.extend_plain(self.lower_edge_effects(region, selected.shared_exit_action)?);

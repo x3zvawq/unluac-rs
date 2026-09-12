@@ -96,11 +96,10 @@ use super::mention::{
 };
 use super::object_flow::RootAnalysisContext;
 use super::root_lifetimes::{
-    CallRootLifetimeIndices, LookupGcRootLifetimeIndices, RootEventBlock, RootEventIndex,
-    RootEventStmt, RootLifetimeFacts, collect_call_root_lifetimes,
-    collect_lookup_gc_root_lifetimes, materialize_generic_for_dispatch_root_releases,
-    scope_end_copy_root_handoffs, scope_end_copy_roots_needing_materialization,
-    stmt_has_argument_root_handoff,
+    CallRootLifetimeIndices, RootEventBlock, RootEventIndex, RootEventStmt, RootLifetimeFacts,
+    ScalarGcRootLifetimeIndices, collect_call_root_lifetimes, collect_scalar_gc_root_lifetimes,
+    materialize_generic_for_dispatch_root_releases, scope_end_copy_root_handoffs,
+    scope_end_copy_roots_needing_materialization, stmt_has_argument_root_handoff,
 };
 use crate::hir::rewrite::{replace_temp_in_expr, replace_temp_in_stmt, replace_temps_in_stmt};
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -163,7 +162,7 @@ impl TempInlineScope {
         let Self::BranchValueSinks(exposed) = self else {
             return true;
         };
-        !call_stmt.call.method
+        !call_stmt.call.is_method()
             && call_stmt.call.method_key.is_none()
             && matches!(callee_value, HirExpr::GlobalRef(_))
             && terminal_candidate.is_some_and(|temp| {
@@ -307,6 +306,13 @@ fn inline_temps_in_proto_with_scope(
         inline_dispositions,
         roots,
     );
+    for temp in workspace.uses.boolean_value_predicates() {
+        changed |= workspace
+            .inline_dispositions
+            .preserve_temp(temp, HirInlineRetentionReason::BooleanValueContext);
+        workspace.physical_root_temps[temp.index()] = true;
+        workspace.new_physical_root_temps.insert(temp);
+    }
     let mut live_use_counts = collect_block_temp_use_totals(&proto.body.stmts, &mut workspace.uses);
     // 前面的 dispatch root-release 只插入 Temp=nil，保留原 capture/TBC；引用捕获集合仍有效。
     let captures = TempInlineCaptureFacts::new(&reference_captured, facts);
@@ -367,7 +373,7 @@ impl TempInlineWorkspace<'_> {
             }
         }
         let lookup_roots =
-            collect_lookup_gc_root_lifetimes(&snapshot, facts, self.roots.safety, |_| true);
+            collect_scalar_gc_root_lifetimes(&snapshot, facts, self.roots.safety, |_| true);
         lookup_roots.mark_stmts(&mut marked);
         if self.block_depth == 1 {
             // handoff 与覆盖配对来自同一改写前快照；先保护接收 home，再递归内联子块。
@@ -401,7 +407,7 @@ impl TempInlineWorkspace<'_> {
         (call_roots, marked)
     }
 
-    fn publish_lookup_handoffs(&mut self, roots: LookupGcRootLifetimeIndices) {
+    fn publish_lookup_handoffs(&mut self, roots: ScalarGcRootLifetimeIndices) {
         for temp in roots.into_handoff_roots() {
             self.physical_root_temps[temp.index()] = true;
             self.new_physical_root_temps.insert(temp);
@@ -740,7 +746,7 @@ fn inline_temps_in_block(
             // 根层 lookup handoff 仍会发布 PhysicalRoot，即使没有相邻 call 覆盖候选。
             // 深层的保护标记已消费完毕，不能为丢弃的投影重扫每层完整子树。
             if is_proto_root {
-                let lookup_roots = collect_lookup_gc_root_lifetimes(
+                let lookup_roots = collect_scalar_gc_root_lifetimes(
                     &snapshot,
                     facts,
                     workspace.roots.safety,
@@ -1003,8 +1009,13 @@ fn adjacent_call_root_overwrites(
         if total_use_count(root, live_use_counts) != 1 {
             continue;
         }
-        // 候选拒绝[PolicyBoundary]：DebugScope 标注的 root/target 保留独立源码 binding 身份。
-        if scratch.has_debug_local_hint(root) || scratch.has_debug_local_hint(target) {
+        // 只删除 source root；Boolean 值覆盖融合仍保留 target 的原声明与 debug 身份。
+        // 其它运算继续保持既有 debug 边界。
+        if scratch.has_debug_local_hint(root)
+            || (scratch.has_debug_local_hint(target)
+                && !matches!(overwrite, HirExpr::Unary(unary)
+                    if unary.op == crate::hir::HirUnaryOpKind::Not))
+        {
             continue;
         }
         if !call_root_overwrite_is_inlineable(overwrite, root) {
@@ -1037,7 +1048,8 @@ fn inline_adjacent_call_root_expression_overwrites(
     {
         let root_index = overwrite_index - 1;
         let Some(pair) = call_roots
-            .overwrite_pairs(overwrite_index)
+            // 精确终点独立于是否选择额外保活；融合消费原覆盖事实，不要求先物化 root。
+            .owner_overwrites(overwrite_index)
             .find(|pair| pair.root_index() == root_index)
         else {
             continue;
@@ -1190,6 +1202,16 @@ fn inline_covered_root_copies(
 
 fn call_root_overwrite_is_inlineable(expr: &HirExpr, root: TempId) -> bool {
     match expr {
+        HirExpr::Unary(unary) if unary.op == crate::hir::HirUnaryOpKind::Not => {
+            let mut operand = &unary.expr;
+            while let HirExpr::Unary(nested) = operand
+                && nested.op == crate::hir::HirUnaryOpKind::Not
+            {
+                operand = &nested.expr;
+            }
+            // 同 home 覆盖由原配对证明；NOT 链仍在赋值的值语境中，不能转为 if 极性。
+            matches!(operand, HirExpr::TempRef(source) if *source == root)
+        }
         HirExpr::Binary(binary) => {
             matches!(&binary.lhs, HirExpr::TempRef(source) if *source == root)
         }

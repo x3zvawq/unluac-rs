@@ -1,5 +1,5 @@
 -- regress_365_constructor_fields_other_return: folding constructor fields does not delete or rewrite an unrelated return
--- unluac: expect-contains [[get = function()]]
+-- unluac: expect-contains [[.get()]]
 -- Preserve the return identity whether allocation permits field folding or requires a write.
 
 local function build(returned)

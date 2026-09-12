@@ -117,6 +117,7 @@ pub(crate) fn initializer_root_profile(
 pub(crate) struct HirExprSafety {
     dynamic_primitive_equality_is_stable: bool,
     concat_preserves_rightmost_operand: bool,
+    length_result_is_numeric: bool,
     values: LuaValueSemantics,
 }
 
@@ -124,6 +125,7 @@ impl HirExprSafety {
     pub(crate) const fn for_dialect(dialect: DecompileDialect) -> Self {
         Self {
             concat_preserves_rightmost_operand: matches!(dialect, DecompileDialect::Lua51),
+            length_result_is_numeric: matches!(dialect, DecompileDialect::Luau),
             dynamic_primitive_equality_is_stable: matches!(
                 dialect,
                 DecompileDialect::Lua51
@@ -365,7 +367,13 @@ impl HirExprSafety {
     /// proto 常量表持有。无论 vector 的宿主表示是内嵌值还是 boxed GC 对象，这些常量的
     /// 存活期都不由某个栈槽是否继续引用决定。
     pub(crate) fn result_is_gc_inert(self, expr: &HirExpr) -> bool {
-        super::value_facts::value_facts(expr).is_gc_inert()
+        super::value_facts::value_facts_with(expr, &|expr| {
+            // Luau 的 luaV_dolen 强制 __len 返回 number；其它 VM 不能套用此结果合同。
+            (self.length_result_is_numeric
+                && matches!(expr, HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Length))
+            .then_some(crate::value_semantics::results::LuaValueFacts::NUMERIC)
+        })
+        .is_gc_inert()
     }
 
     /// 表达式是否可以在同一个无副作用逻辑区域内合并重复求值。

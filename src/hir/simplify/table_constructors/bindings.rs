@@ -6,6 +6,8 @@
 //! 键最终能否写成 `name = value` 不属于 HIR binding facts。
 //! capture 从类型化父级身份投影到构造器的 Temp/Local 域，两种捕获模式均保留物化依赖。
 //! 物化次数消费共享逻辑写事件；捕获集合独立累积，不把 root release 当作物理槽覆盖。
+//! 同一遍访问区分普通值观察与直接写 base / 单值 return；仅后两类 occurrence 不会提前
+//! 暴露新表。`t.x=f(t)` 的 RHS 仍是观察，capture 和同 home 的源码身份由原索引继续保护。
 
 use std::collections::BTreeSet;
 use std::ops::Bound::{Excluded, Unbounded};
@@ -41,6 +43,7 @@ pub(super) struct BindingFacts {
     pub(super) materialized: BindingSlots<u32>,
     pub(super) reference_captured: BindingSlots<bool>,
     pub(super) reference_captured_home_slots: BTreeSet<HomeSlotKey>,
+    pub(super) observed_before_exit: BindingSlots<bool>,
 }
 
 fn binding_home_slot(
@@ -64,6 +67,8 @@ pub(super) fn collect_binding_facts(
         promotion_facts,
         reference_captured: BindingSlots::new(temp_count, local_count),
         reference_captured_home_slots: BTreeSet::new(),
+        observed_before_exit: BindingSlots::new(temp_count, local_count),
+        private_occurrences: BTreeSet::new(),
     };
     let mut pair = (
         BindingWriteCollector(|binding| {
@@ -79,6 +84,7 @@ pub(super) fn collect_binding_facts(
         materialized,
         reference_captured: collector.reference_captured,
         reference_captured_home_slots: collector.reference_captured_home_slots,
+        observed_before_exit: collector.observed_before_exit,
     }
 }
 
@@ -327,6 +333,10 @@ impl BindingOccurrenceIndex {
             .and_then(|occurrences| occurrences.last().copied())
     }
 
+    pub(super) fn has_source_identity(&self, binding_id: BindingId) -> bool {
+        self.sticky_uses[binding_id]
+    }
+
     pub(super) fn remove_stmt(&mut self, stmt_id: usize, summary: &StmtBindingSummary) {
         for binding_id in summary.uses() {
             self.uses[binding_id].remove(&stmt_id);
@@ -365,13 +375,49 @@ struct BindingCaptureCollector<'a> {
     // constructor rewrite can otherwise move a declaration before a closure observes it.
     reference_captured: BindingSlots<bool>,
     reference_captured_home_slots: BTreeSet<HomeSlotKey>,
+    observed_before_exit: BindingSlots<bool>,
+    // 只豁免这一 expression occurrence；同语句 RHS 再读相同 binding 仍然是观察。
+    private_occurrences: BTreeSet<usize>,
 }
 
 impl HirVisitor<'_> for BindingCaptureCollector<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::Assign(assign) => {
+                for target in &assign.targets {
+                    if let HirLValue::TableAccess(access) = target {
+                        self.private_occurrences
+                            .insert(std::ptr::from_ref(&access.base).addr());
+                    }
+                }
+            }
+            HirStmt::TableSetList(batch) => {
+                self.private_occurrences
+                    .insert(std::ptr::from_ref(&batch.base).addr());
+            }
+            HirStmt::Return(ret) if ret.values.tail.is_none() && ret.values.fixed.len() == 1 => {
+                self.private_occurrences
+                    .insert(std::ptr::from_ref(&ret.values.fixed[0]).addr());
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if !self
+            .private_occurrences
+            .remove(&std::ptr::from_ref(expr).addr())
+            && let Some(binding) = binding_from_expr(expr)
+        {
+            *self.observed_before_exit.get_mut_or_default(binding) = true;
+        }
+    }
+
     fn visit_capture(&mut self, capture: &HirCapture) {
         // 两种 capture 都依赖父级物化身份；ByValue 也不能随 producer 删除而变成孤儿。
         if let Some(binding) = binding_from_identity(capture.binding) {
             *self.reference_captured.get_mut_or_default(binding) = true;
+            *self.observed_before_exit.get_mut_or_default(binding) = true;
             if let Some(slot) = binding_home_slot(binding, self.promotion_facts) {
                 self.reference_captured_home_slots.insert(slot);
             }

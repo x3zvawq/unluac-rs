@@ -28,14 +28,7 @@ pub(crate) fn naturalize_pure_logical_expr(
     }
 
     let mut current = normalize_candidate_expr(expr.clone(), safety);
-    let mut refs = BTreeSet::new();
-    collect_refs_from_expr(&current, &mut refs);
-    let refs = refs.into_iter().collect::<Vec<_>>();
-    let mut literals = BTreeSet::new();
-    collect_literals_from_expr(&current, &mut literals);
-    let domain = build_validation_domain(&literals, safety);
-    let mut verifier = SymbolicVerifier::new(refs, domain, safety);
-    let expected = verifier.eval_expr(expr)?;
+    let mut validation = None;
     let mut changed = false;
     // 每次提交都严格降低有限的 expr_cost；因此即使深层候选需要超过八轮，也会在有限步内
     // 收敛，不需要用任意轮数截断已证明安全的改写。
@@ -45,12 +38,24 @@ pub(crate) fn naturalize_pure_logical_expr(
         visit_pure_logical_rewrite_candidates(&current, &mut |candidate| {
             let candidate = normalize_candidate_expr(candidate, safety);
             let candidate_cost = super::expr_cost(&candidate);
-            if verifier.eval_expr(&candidate) != Some(expected) {
+            if candidate_cost >= current_cost {
+                // 候选拒绝[PolicyBoundary]：不降低可读性成本的候选不会提交，
+                // 无需为它求解整棵表达式的 MDD。
                 return;
             }
-            if candidate_cost >= current_cost {
-                // 候选拒绝[PolicyBoundary]：候选已由同一 MDD 证明等价，但不严格降低
-                // 可读性成本；自然化 pass 不用等价的高密度形状替换当前表达式。
+            // 常见的已恢复短路链没有更短候选；仅在实际需要等价证明时建立共享验证域。
+            let (verifier, expected) = validation.get_or_insert_with(|| {
+                let mut refs = BTreeSet::new();
+                collect_refs_from_expr(&current, &mut refs);
+                let mut literals = BTreeSet::new();
+                collect_literals_from_expr(&current, &mut literals);
+                let domain = build_validation_domain(&literals, safety);
+                let mut verifier =
+                    SymbolicVerifier::new(refs.into_iter().collect(), domain, safety);
+                let expected = verifier.eval_expr(expr);
+                (verifier, expected)
+            });
+            if expected.is_none() || verifier.eval_expr(&candidate) != *expected {
                 return;
             }
             if next

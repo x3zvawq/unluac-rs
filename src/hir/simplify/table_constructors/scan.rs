@@ -11,7 +11,7 @@
 //! constructor step 前移；赋值仍在原位完成 capture cell 更新和物理 root handoff。
 //! 同一 seed 的声明前缀按需归约一次，逐槽 nil 事实只在当前不可变语句快照内有效。
 //! 后缀读屏障直接消费上游逐语句 binding 摘要，不按每个保留变量重新遍历表达式。
-//! 调用结果 TempId 以 Promotion 的可信 home 进入 producer 计划；删除须由精确覆盖
+//! 调用及一元/二元运算结果 TempId 以 Promotion 的可信 home 进入 producer 计划；删除须由精确覆盖
 //! 终点或完整 constructor 的强字段持有/退出事务批准，单写身份自身不签发根释放许可。
 //! ConstructorRegion 只发布成功前缀的步骤，保留 producer binding/缺失槽投影、原字段
 //! 表达式与批次引用。rebuild 和 commit 消费同一角色划分，不从 stmt_index 反向匹配语法。
@@ -554,8 +554,13 @@ fn producer_steps<'a>(
             let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
                 unreachable!("checked scalar temp producer")
             };
-            if !matches!(assign.values.fixed.as_slice(), [HirExpr::Call(_)])
-                || promotion_facts.trusted_temp_home_slot(*temp).is_none()
+            if !matches!(
+                assign.values.fixed.as_slice(),
+                [HirExpr::Call(_)
+                    | HirExpr::Unary(_)
+                    | HirExpr::Binary(_)
+                    | HirExpr::TableConstructor(_)]
+            ) || promotion_facts.trusted_temp_home_slot(*temp).is_none()
             {
                 return None;
             }
@@ -635,7 +640,11 @@ fn producer_steps_from_bindings<'a>(
         debug_assert!(surplus.iter().all(seed_delay_expr_is_unobservable));
     }
 
-    let scalar_call = bindings.len() == 1 && matches!(values.fixed.as_slice(), [HirExpr::Call(_)]);
+    let scalar_result = bindings.len() == 1
+        && matches!(
+            values.fixed.as_slice(),
+            [HirExpr::Call(_) | HirExpr::Unary(_) | HirExpr::Binary(_)]
+        );
     let source_gc_inert = values.fixed.iter().all(producer_value_can_be_dropped);
     steps.extend(
         bindings
@@ -652,7 +661,7 @@ fn producer_steps_from_bindings<'a>(
                     PendingProducerSource::ImplicitNil { stmt_index }
                 },
                 value: values.fixed.get(slot_index).unwrap_or(&HirExpr::Nil),
-                scalar_call,
+                scalar_result,
                 source_gc_inert,
                 source_preservation,
             }),

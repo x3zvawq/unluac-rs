@@ -747,6 +747,11 @@ fn fill_failed_proto(
         .map(|(index, child)| (LocalId(vararg_param_locals + index), child.id))
         .collect::<Vec<_>>();
     let local_count = vararg_param_locals + detached_children.len();
+    // 失败产物只保留诊断和独立展示的子 proto；这些占位 local 不是已恢复的 VM binding。
+    // 与合成 factory 一样显式登记 home-free，后层不能把缺失原型事实当作未知物理根。
+    for local in (0..local_count).map(LocalId) {
+        artifacts.promotion_facts[id.index()].record_home_free_local(local);
+    }
     let mut local_debug_hints = vec![None; vararg_param_locals];
     local_debug_hints.extend(
         frame

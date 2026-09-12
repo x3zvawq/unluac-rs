@@ -7,11 +7,13 @@ mod cfg;
 mod dataflow;
 mod graph;
 mod phi_graph;
+mod root_frontiers;
 mod root_intervals;
 
 pub(crate) use dataflow::{PhiIncomingSlot, RegCaptures};
 pub(crate) use graph::{SccFacts, SccId};
 pub(crate) use phi_graph::PhiGraphFacts;
+pub use root_frontiers::{RootOverwriteFrontier, RootOverwriteFrontiers};
 pub(crate) use root_intervals::RootIntervalIndex;
 
 pub use cfg::{

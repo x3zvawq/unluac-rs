@@ -1,6 +1,7 @@
 -- regress_349_luau_nested_continue_owner: nested continue belongs to the inner loop and must not block folding the outer repeat tail
 -- unluac: expect-contains [[until not p1_1 and p1_2 or p1_3]]
--- unluac: expect-contains [[continue]]
+-- 内层 continue 可恢复为跳过本轮输出的条件；仍须保留筛选条件且不能阻止外层尾条件合并。
+-- unluac: expect-contains [[if not p1_0 or r1_0 ~= 2 then]]
 -- unluac: expect-not-contains [[if p1_1 then]]
 -- unluac: expect-not-contains [[if p1_2 then]]
 -- unluac: expect-contains [[if not p2_1 then]]

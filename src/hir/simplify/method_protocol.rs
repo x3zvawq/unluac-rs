@@ -20,7 +20,7 @@ pub(super) fn match_method_setup_pair(
         return None;
     };
     (call_protocol == protocol
-        && call.method
+        && call.is_method()
         && call.method_key.as_ref() == Some(method_key)
         && &call.callee == expected_callee
         && call.args.first() == Some(&access.base))

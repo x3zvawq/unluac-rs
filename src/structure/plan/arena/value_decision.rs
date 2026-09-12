@@ -172,16 +172,51 @@ pub(super) fn freeze_value_decision(
         .first()
         .map(|leaf| leaf.terminal_edge)
         .ok_or_else(|| StructureError::invalid("value decision has no result leaf"))?;
+    let blocks = candidate.blocks.iter().copied().collect::<Vec<_>>();
+    let mut call_tests = nodes
+        .iter()
+        .filter_map(|node| {
+            let LowInstr::Branch(branch) = &proto.instrs[node.predicate.index()] else {
+                return None;
+            };
+            let BranchSubject::Truthy(crate::transformer::CondOperand::Reg(reg)) =
+                branch.cond.subject
+            else {
+                return None;
+            };
+            if reg != result_reg || dataflow.reg_is_reference_captured(reg) {
+                return None;
+            }
+            let SsaValue::Def(def) = dataflow.use_value(node.predicate, reg) else {
+                return None;
+            };
+            matches!(
+                proto.instrs[dataflow.def_instr(def).index()],
+                LowInstr::Call(_)
+            )
+            .then_some(def)
+        })
+        .collect::<Vec<_>>();
+    call_tests.sort_unstable();
+    call_tests.dedup();
+    let call_root_frontiers = crate::structure::RootOverwriteFrontiers::build(
+        dataflow,
+        cfg,
+        result_reg,
+        &blocks,
+        &call_tests,
+    );
     Ok(super::super::ValueDecisionPlan {
         entry: super::super::ValueDecisionNodeId(candidate.entry.index()),
         nodes,
         leaves,
-        blocks: candidate.blocks.iter().copied().collect(),
+        blocks,
         merge,
         shared_exit_action,
         result_phi,
         absorbed_phis: Vec::new(),
         result_reg,
+        call_root_frontiers,
     })
 }
 

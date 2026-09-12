@@ -306,7 +306,7 @@ fn expr_for_fixed_call(
         frame_root_ends: lowering.promotion_facts.call_frame_root_ends(instr_ref),
         callee,
         args: lower_value_pack_single_eval(lowering, block, instr_ref, call.args),
-        method: matches!(call.kind, CallKind::Method),
+        method: matches!(call.kind, CallKind::Method).into(),
         fastcall: match call.kind {
             CallKind::FastCall(args) => Some(args),
             CallKind::Normal | CallKind::Method => None,

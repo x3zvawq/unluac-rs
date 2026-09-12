@@ -65,25 +65,26 @@ pub(super) fn record_method_setup_protocols(
             let [result_def] = dataflow.instr_defs.get(get_ref.index())?.as_slice() else {
                 return None;
             };
-            let SsaValue::Def(prior_callee_def) = dataflow.def_overwritten_value(callee_def)?
-            else {
-                return None;
-            };
-            if dataflow.def_block(prior_callee_def) != dataflow.def_block(callee_def)
-                || dataflow.def_instr(prior_callee_def).index() >= get_ref.index()
-            {
-                return None;
-            }
-            let SsaValue::Def(prior_callee_root) =
-                dataflow.canonical_move_value(SsaValue::Def(prior_callee_def))?
-            else {
-                return None;
-            };
-            let prior_callee_root_temp = crate::hir::TempId(prior_callee_root.index());
-            if bindings.fixed_temps.get(prior_callee_root.index()) != Some(&prior_callee_root_temp)
-            {
-                return None;
-            }
+            // setup/call 配对与旧 callee 根是独立事实。首次使用入口 nil 槽时没有旧根，
+            // 但仍必须保留完整 method 协议，不能迫使后层重新猜 SELF。
+            let prior_callee_root_temp = (|| {
+                let SsaValue::Def(prior_callee_def) = dataflow.def_overwritten_value(callee_def)?
+                else {
+                    return None;
+                };
+                if dataflow.def_block(prior_callee_def) != dataflow.def_block(callee_def)
+                    || dataflow.def_instr(prior_callee_def).index() >= get_ref.index()
+                {
+                    return None;
+                }
+                let SsaValue::Def(prior_callee_root) =
+                    dataflow.canonical_move_value(SsaValue::Def(prior_callee_def))?
+                else {
+                    return None;
+                };
+                let temp = crate::hir::TempId(prior_callee_root.index());
+                (bindings.fixed_temps.get(prior_callee_root.index()) == Some(&temp)).then_some(temp)
+            })();
             let RawLiteralConst::String(raw_key) = proto.constants.get(method_key.index())? else {
                 return None;
             };

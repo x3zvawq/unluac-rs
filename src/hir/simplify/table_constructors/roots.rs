@@ -3,6 +3,8 @@
 //! scanner/rebuild 提供已经验证的消费与事件序，本模块证明删除的 producer 根由独立
 //! 字段持有到 frame 出口。例如三次调用写入三个不同键后立即 return，不能先合并
 //! 三个结果身份再要求后层恢复。这里不从 may-alias 集合推导 must-hold 关系。
+//! 调用与元方法运算共用单值 producer 证明：完整 indexed constructor 里的不同强字段
+//! 持有结果直到返回；任意后续字段覆盖、逃逸或 cleanup 仍不在该许可内（regress_468/471）。
 
 use super::*;
 
@@ -13,7 +15,8 @@ pub(super) struct RegionRootFacts {
     pub(super) has_exact_width_tail: bool,
     pub(super) has_removed_object_producer: bool,
     pub(super) has_followup_object_write: bool,
-    scalar_calls_held: bool,
+    pub(super) removed_roots_are_inert_tables: bool,
+    scalar_results_held: bool,
 }
 
 impl RegionRootFacts {
@@ -23,18 +26,21 @@ impl RegionRootFacts {
             has_exact_width_tail: false,
             has_removed_object_producer: false,
             has_followup_object_write: false,
-            scalar_calls_held: true,
+            removed_roots_are_inert_tables: true,
+            scalar_results_held: true,
         };
         let mut first_write_after_object = false;
         let mut pending = BTreeSet::new();
-        let mut keys = Vec::new();
+        let mut integer_keys = BTreeSet::new();
+        let mut string_keys = BTreeSet::new();
         for (index, step) in steps.iter().enumerate() {
             match step {
                 RegionStep::Producer {
                     binding,
                     source,
-                    scalar_call,
+                    scalar_result,
                     source_gc_inert,
+                    value,
                     ..
                 } => {
                     if let TableBinding::Temp(temp) = binding {
@@ -43,15 +49,17 @@ impl RegionRootFacts {
                     let stmt_index = source.stmt_index();
                     if preserved.binary_search(&stmt_index).is_err() && !source_gc_inert {
                         facts.has_removed_object_producer = true;
+                        facts.removed_roots_are_inert_tables &= inert_table_contents(value);
                     }
-                    facts.scalar_calls_held &= *scalar_call;
+                    facts.scalar_results_held &= *scalar_result;
                     pending.insert(*binding);
                 }
                 RegionStep::Record { key, value, .. } => {
-                    facts.scalar_calls_held &=
-                        matches!(key, HirExpr::Integer(_) | HirExpr::String(_))
-                            && !keys.contains(key);
-                    keys.push(*key);
+                    facts.scalar_results_held &= match key {
+                        HirExpr::Integer(key) => integer_keys.insert(*key),
+                        HirExpr::String(key) => string_keys.insert(key),
+                        _ => false,
+                    };
                     if let Some(binding) = binding_from_expr(value) {
                         pending.remove(&binding);
                     }
@@ -62,8 +70,11 @@ impl RegionRootFacts {
                         .tail
                         .as_ref()
                         .is_some_and(|tail| tail.exact_width().is_some());
-                    facts.scalar_calls_held &= index + 1 == steps.len()
-                        && !keys.iter().any(|key| matches!(key, HirExpr::Integer(key) if *key >= i64::from(batch.start_index)));
+                    facts.scalar_results_held &= index + 1 == steps.len()
+                        && integer_keys
+                            .range(i64::from(batch.start_index)..)
+                            .next()
+                            .is_none();
                     for value in &batch.values.fixed {
                         if let Some(binding) = binding_from_expr(value) {
                             pending.remove(&binding);
@@ -76,9 +87,28 @@ impl RegionRootFacts {
                 first_write_after_object = true;
             }
         }
-        facts.scalar_calls_held &= pending.is_empty();
+        facts.scalar_results_held &= pending.is_empty();
         facts
     }
+}
+
+/// 新建表尚未暴露时，只有其内容也不持有外部可观察资源，才能丢弃独立临时根。
+/// 表身份仍由原构造器分配一次；此查询不授权移动分配或删除字段求值。
+fn inert_table_contents(value: &HirExpr) -> bool {
+    let HirExpr::TableConstructor(table) = value else {
+        return false;
+    };
+    table.trailing_multivalue.is_none()
+        && table.fields.iter().all(|field| match field {
+            HirTableField::Array(value) => {
+                producer_value_can_be_dropped(value) || inert_table_contents(value)
+            }
+            HirTableField::Record(record) => {
+                producer_value_can_be_dropped(&record.key)
+                    && (producer_value_can_be_dropped(&record.value)
+                        || inert_table_contents(&record.value))
+            }
+        })
 }
 
 impl TableConstructorPass<'_> {
@@ -104,7 +134,7 @@ impl TableConstructorPass<'_> {
             return false;
         };
         if self.has_cleanup
-            || !roots.scalar_calls_held
+            || !roots.scalar_results_held
             || !preserved.is_empty()
             || ret.values.tail.is_some()
             || ret.values.fixed.len() != 1

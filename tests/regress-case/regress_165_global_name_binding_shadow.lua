@@ -1,6 +1,6 @@
 -- regress_165_global_name_binding_shadow#1: debug 名不能遮蔽同函数内的全局引用
 -- unluac: expect-contains [[function(print2)]]
--- unluac: expect-contains [[function(self2)]]
+-- unluac: expect-contains [[function methods.call(self2)]]
 -- unluac: expect-not-contains [[function methods:call]]
 -- unluac: expect-not-contains [[unluac error]]
 (function(print)

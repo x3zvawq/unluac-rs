@@ -1,4 +1,4 @@
-//! 为 lookup 的共享值身份维护别名、全局来源与无后续活读的观察窗口。
+//! 为 lookup 和动态运算结果的共享值身份维护别名、全局来源与无后续活读的观察窗口。
 //!
 //! temp 的读写顺序消费当前 RootLifetimeFacts；identity 与 alias 的建立、退休仍由父层
 //! collector 证明。本层记录其来源和反向别名，整值退休只访问这些别名已证明的 home，
@@ -10,12 +10,12 @@
 
 use super::live_read_changes::LiveReadChanges;
 use super::{
-    ActiveLookupGcHome, BTreeMap, BTreeSet, HomeSlotKey, LookupValueId, ProtoPromotionFacts,
+    ActiveScalarGcHome, BTreeMap, BTreeSet, HomeSlotKey, ProtoPromotionFacts, ScalarValueId,
     TempId, TempUseEvents,
 };
 
-pub(super) struct LookupValues<'a> {
-    pub(super) by_temp: BTreeMap<TempId, LookupValueId>,
+pub(super) struct ScalarValues<'a> {
+    pub(super) by_temp: BTreeMap<TempId, ScalarValueId>,
     states: Vec<ValueObservations>,
     changes: LiveReadChanges,
     uses: &'a TempUseEvents<'a>,
@@ -32,7 +32,7 @@ struct ValueObservations {
     last_observation: Option<usize>,
 }
 
-impl<'a> LookupValues<'a> {
+impl<'a> ScalarValues<'a> {
     pub(super) fn new(uses: &'a TempUseEvents<'a>) -> Self {
         Self {
             by_temp: BTreeMap::new(),
@@ -66,8 +66,8 @@ impl<'a> LookupValues<'a> {
         &mut self,
         index: usize,
         global_home: Option<HomeSlotKey>,
-    ) -> LookupValueId {
-        let value = LookupValueId(self.states.len());
+    ) -> ScalarValueId {
+        let value = ScalarValueId(self.states.len());
         self.states.push(ValueObservations {
             aliases: BTreeSet::new(),
             global_home,
@@ -79,11 +79,11 @@ impl<'a> LookupValues<'a> {
         value
     }
 
-    pub(super) fn global_home(&self, value: LookupValueId) -> Option<HomeSlotKey> {
+    pub(super) fn global_home(&self, value: ScalarValueId) -> Option<HomeSlotKey> {
         self.states[value.0].global_home
     }
 
-    pub(super) fn insert(&mut self, temp: TempId, value: LookupValueId, index: usize) {
+    pub(super) fn insert(&mut self, temp: TempId, value: ScalarValueId, index: usize) {
         self.remove(&temp, index);
         self.by_temp.insert(temp, value);
         self.states[value.0].aliases.insert(temp);
@@ -98,7 +98,7 @@ impl<'a> LookupValues<'a> {
         self.changes.schedule(self.uses, temp, index);
     }
 
-    pub(super) fn remove(&mut self, temp: &TempId, index: usize) -> Option<LookupValueId> {
+    pub(super) fn remove(&mut self, temp: &TempId, index: usize) -> Option<ScalarValueId> {
         self.changes.remove(*temp);
         let value = self.by_temp.remove(temp)?;
         self.states[value.0].aliases.remove(temp);
@@ -115,9 +115,9 @@ impl<'a> LookupValues<'a> {
 
     pub(super) fn retire_value(
         &mut self,
-        value: LookupValueId,
+        value: ScalarValueId,
         index: usize,
-        active: &mut BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
+        active: &mut BTreeMap<HomeSlotKey, ActiveScalarGcHome>,
         facts: &ProtoPromotionFacts,
     ) {
         // collector 只在完整语句边界退役值；每个活动 home 都至少持有一个映射中的 alias。
@@ -148,9 +148,14 @@ impl<'a> LookupValues<'a> {
             .is_some()
     }
 
-    pub(super) fn observed(&self, root: &ActiveLookupGcHome, end: usize) -> bool {
+    pub(super) fn observed(
+        &self,
+        root: &ActiveScalarGcHome,
+        end: usize,
+        paired_overwrite: bool,
+    ) -> bool {
         let state = &self.states[root.value_id.0];
-        let (positions, last) = if root.pure_scope_end_copy_root {
+        let (positions, last) = if root.pure_scope_end_copy_root || paired_overwrite {
             (&self.observations, state.last_observation)
         } else if state.global_home.is_none() {
             (&self.uses.gc_fence_indices, state.last_fence)

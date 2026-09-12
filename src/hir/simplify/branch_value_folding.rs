@@ -70,7 +70,7 @@ pub(super) fn fold_branch_values_in_proto(
     roots: RootAnalysisContext<'_>,
 ) -> bool {
     let safety = HirExprSafety::for_dialect(dialect);
-    let exposed_temps = fold_root_branch_value_temps(proto, safety);
+    let exposed_temps = fold_root_branch_value_temps(proto, safety, facts);
     let raw_temp_changed = !exposed_temps.is_empty();
     inline_exposed_branch_value_sinks_in_proto_with_facts(
         proto,
@@ -303,7 +303,11 @@ fn fold_branch_value_locals_in_block(
 
 /// `locals` 之前只处理 proto 根 block 的机械 temp 值树。每个 proto 单独调用，因此同号
 /// TempId 不会跨 child proto 混合；现有 per-stmt touch facts 证明 guard 没有逃出候选语句。
-fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> Vec<TempId> {
+fn fold_root_branch_value_temps(
+    proto: &mut HirProto,
+    safety: HirExprSafety,
+    facts: &ProtoPromotionFacts,
+) -> Vec<TempId> {
     if !proto
         .body
         .stmts
@@ -318,7 +322,8 @@ fn fold_root_branch_value_temps(proto: &mut HirProto, safety: HirExprSafety) -> 
     let mut exposed_temps = Vec::new();
     let inline_dispositions = &proto.inline_dispositions;
     for stmt in &mut proto.body.stmts {
-        let Some((target, replacement, guards)) = collapsible_branch_value_temp(stmt, safety)
+        let Some((target, replacement, guards)) =
+            collapsible_branch_value_temp(stmt, safety, facts)
         else {
             continue;
         };
@@ -535,6 +540,7 @@ fn collapsible_branch_value_local(
 fn collapsible_branch_value_temp(
     stmt: &HirStmt,
     safety: HirExprSafety,
+    facts: &ProtoPromotionFacts,
 ) -> Option<(TempId, HirStmt, BTreeSet<TempId>)> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
@@ -543,7 +549,7 @@ fn collapsible_branch_value_temp(
     let BranchValueBinding::Temp(target) = binding else {
         return None;
     };
-    let mut builder = BranchValueDecisionBuilder::new(safety);
+    let mut builder = BranchValueDecisionBuilder::new(safety, facts);
     let root = builder.collapse_if(if_stmt, binding)?;
     // raw temp 没有 local 壳提供稳定的中间边界；若整棵树尚不能收成值表达式，
     // 只折叠内层会生成一份新的控制形状，并可能让下一次反编译失去原短路 owner。
@@ -667,11 +673,12 @@ fn finalize_branch_value_targets(
         nodes: vec![HirDecisionNode {
             id: HirDecisionNodeRef(0),
             test: cond.clone(),
+            test_source: crate::hir::HirDecisionTestSource::Predicate,
             truthy,
             falsy,
         }],
     };
-    let value = crate::hir::decision::finalize_value_decision_expr(decision, safety);
+    let value = crate::hir::decision::finalize_value_decision_expr(decision, safety, |_| false);
     // 候选拒绝[TargetConstraint]：Lua 没有一般三元值表达式；例如
     // `local x; if probe() then x=false end` 既要区分 false/nil，又只能调用 probe 一次；
     // 无额外 local 的 `and/or` 无法承载。保留控制树，避免与 eliminate-decisions 振荡。
@@ -680,7 +687,9 @@ fn finalize_branch_value_targets(
 
 fn branch_value_binding_in_block(block: &HirBlock) -> Option<BranchValueBinding> {
     match block.stmts.as_slice() {
-        [HirStmt::Assign(assign)] => single_assign_binding(assign),
+        [HirStmt::Assign(assign)] | [HirStmt::Assign(_), HirStmt::Assign(assign)] => {
+            single_assign_binding(assign)
+        }
         [HirStmt::If(if_stmt)]
         | [HirStmt::LocalDecl(_), HirStmt::If(if_stmt)]
         | [HirStmt::Assign(_), HirStmt::If(if_stmt)] => {

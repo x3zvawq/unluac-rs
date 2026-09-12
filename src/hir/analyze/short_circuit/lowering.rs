@@ -10,7 +10,7 @@ pub(crate) fn lower_short_circuit_subject(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     predicate: crate::transformer::InstrRef,
-) -> Option<HirExpr> {
+) -> Option<(HirExpr, crate::hir::HirDecisionTestSource)> {
     let LowInstr::Branch(branch) = &lowering.proto.instrs[predicate.index()] else {
         return None;
     };
@@ -27,7 +27,7 @@ pub(crate) fn lower_short_circuit_subject_single_eval(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
     predicate: crate::transformer::InstrRef,
-) -> Option<HirExpr> {
+) -> Option<(HirExpr, crate::hir::HirDecisionTestSource)> {
     let LowInstr::Branch(branch) = &lowering.proto.instrs[predicate.index()] else {
         return None;
     };

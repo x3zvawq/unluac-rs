@@ -17,6 +17,7 @@
 - 复现反编译错误或可读性问题时，使用 [unluac-debug 技能](.agents/skills/unluac-debug/SKILL.md)；命令细节见 [调试手册](docs/debug.md)。普通文档或构建配置修改不加载这套诊断流程。
 - 写、改或审查 Rust 代码时使用环境中可用的 `rust-skills`；纯文档任务不需要它。
 - 测试协议与验证范围见 [测试体系](docs/design/11.test.md)；只有需要初始化或修复 Lua toolchain 时读 [Lua 环境说明](lua/README.md)。
+- 各 crate 的 `src` 只放实现，不添加 Rust 内嵌测试；新增单元/回归统一使用 Lua 样例。同一完整主题集中验证与提交，不按每个小改动重复全量测试。
 
 ## 实现约束
 

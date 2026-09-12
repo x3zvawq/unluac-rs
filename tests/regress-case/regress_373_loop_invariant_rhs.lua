@@ -1,6 +1,9 @@
--- regress_373_loop_invariant_rhs: eventless stable dependencies may move into loop headers
--- unluac: expect-contains [[while not not p1_0 == true do]]
--- unluac: expect-contains [[until not not p2_0 == true]]
+-- regress_373_loop_invariant_rhs: stable aliases fold while Boolean value storage remains explicit
+-- 值运算没有事件不等于可以消除原写入；条件继续消费原 Boolean 结果。
+-- unluac: expect-contains [[local r1_0 = not not p1_0]]
+-- unluac: expect-contains [[while r1_0 == true do]]
+-- unluac: expect-contains [[local r2_0 = not not p2_0]]
+-- unluac: expect-contains [[until r2_0 == true]]
 
 local function stable_while(flag)
     local count = 0

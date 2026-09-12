@@ -137,6 +137,8 @@ pub enum HirInlineRetentionReason {
     CapturedValueEpoch,
     /// 常量替换会改变运行时建表与模板复制的分配方式。
     TableInitialization,
+    /// 值计算中的 Boolean 覆盖不能转为谓词极性；后者可能不再发射原覆盖操作。
+    BooleanValueContext,
 }
 
 /// 单个 proto 内跨 temp/local 身份提升保存的重写结论。
@@ -568,8 +570,19 @@ impl HirDecisionNodeRef {
 pub struct HirDecisionNode {
     pub id: HirDecisionNodeRef,
     pub test: HirExpr,
+    pub test_source: HirDecisionTestSource,
     pub truthy: HirDecisionTarget,
     pub falsy: HirDecisionTarget,
+}
+
+/// 测试来自原操作数值，还是由分支关系合成的谓词。
+///
+/// `TEST (NOT r)` 保留原 Boolean 值运算；`if not r` 的反向边和比较指令只提供极性。
+/// 两者不能互作物理写回证书；来源由 subject lowering 发布，混合组合保守保留 Predicate。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirDecisionTestSource {
+    Value,
+    Predicate,
 }
 
 /// 决策 DAG 上的目标。
@@ -620,7 +633,7 @@ pub struct HirCallExpr {
     pub(crate) frame_root_ends: Vec<TempId>,
     pub callee: HirExpr,
     pub args: HirValuePack,
-    pub method: bool,
+    pub method: HirMethodCall,
     /// Luau FASTCALL 协议证明 fallback callee setup 位于参数物化之后，仅用于恢复源码求值顺序。
     pub fastcall: Option<FastCallArgs>,
     /// 来自 `SELF` / `NAMECALL` 的 method raw key 事实。
@@ -654,7 +667,27 @@ pub enum HirCallRootHandoff {
     MethodCallee(HirMethodSetupProtocolId),
 }
 
+/// method 协议在 HIR 中的接收者表示。
+/// 最终树化后 receiver 只由 callee 的 TableAccess.base 持有，避免 n 段链复制成 2^n 个节点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirMethodCall {
+    None,
+    /// setup 尚未收回，args[0] 保留独立 receiver 快照。
+    Explicit,
+    /// callee 已是配对字段查询，args 只包含显式参数；receiver 由字段查询持有一次。
+    Implicit,
+}
+
+impl From<bool> for HirMethodCall {
+    fn from(method: bool) -> Self {
+        if method { Self::Explicit } else { Self::None }
+    }
+}
+
 impl HirCallExpr {
+    pub(crate) fn is_method(&self) -> bool {
+        self.method != HirMethodCall::None
+    }
     pub(crate) fn transfers_argument_root(&self, temp: TempId) -> bool {
         self.argument_roots.iter().any(|root| {
             root.producer == temp
@@ -664,11 +697,18 @@ impl HirCallExpr {
 
     /// 返回由前层 method 协议证明的 receiver 与字段名。
     pub(crate) fn method_receiver(&self) -> Option<(&HirExpr, &LuaString)> {
-        if !self.method {
+        if !self.is_method() {
             return None;
         }
         let method_key = self.method_key.as_ref()?;
-        let receiver = self.args.first()?;
+        let HirExpr::TableAccess(access) = &self.callee else {
+            return None;
+        };
+        let receiver = if self.method == HirMethodCall::Implicit {
+            &access.base
+        } else {
+            self.args.first()?
+        };
         matches!(&self.callee,
             HirExpr::TableAccess(access)
                 if access.base == *receiver

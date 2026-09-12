@@ -13,6 +13,7 @@ mod eliminate;
 mod eliminate_materialize;
 mod eliminate_state;
 mod helpers;
+mod short_circuit;
 mod synthesize;
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness, expr_truthiness_assuming};
@@ -186,7 +187,9 @@ fn reduce_decision_expr(
         ResolvedDecisionTarget::Node(entry) => {
             let (rebuilt, topology_changed) = rebuild_decision(entry, &nodes);
             changed |= topology_changed;
-            if let Some(expr) = collapse_value_decision_expr(&analyze_decision(&rebuilt), safety) {
+            if let Some(expr) =
+                collapse_value_decision_expr(&analyze_decision(&rebuilt), safety, |_| false)
+            {
                 return Some(ReducedDecision::Expr(expr));
             }
             if changed {
@@ -282,6 +285,7 @@ fn rebuild_decision(
             HirDecisionNode {
                 id: HirDecisionNodeRef(index),
                 test: old.test.clone(),
+                test_source: old.test_source,
                 truthy: remap_target(&old.truthy, &remap),
                 falsy: remap_target(&old.falsy, &remap),
             }
@@ -313,7 +317,7 @@ pub(super) fn project_value_decision_target(
         HirDecisionTarget::CurrentValue => current_value,
         HirDecisionTarget::Node(entry) => {
             let (projected, _) = rebuild_decision(*entry, &decision.nodes);
-            collapse_value_decision_expr(&analyze_decision(&projected), safety)
+            collapse_value_decision_expr(&analyze_decision(&projected), safety, |_| false)
                 .unwrap_or_else(|| HirExpr::Decision(Box::new(projected)))
         }
     }
@@ -336,18 +340,26 @@ fn remap_target(
 pub(in crate::hir) fn collapse_value_decision_expr(
     topology: &DecisionFacts<'_>,
     safety: HirExprSafety,
+    root_ends: impl Fn(&HirDecisionNode) -> bool,
 ) -> Option<HirExpr> {
     let decision = topology.decision();
 
+    if !topology.has_shared_nodes()
+        && let Some(expr) = collapse_linear_value_chain(decision)
+    {
+        return Some(expr);
+    }
+    // 共同 continuation 也可以是 Expr 终端，不仅是多入边 Node；原 Boolean test 的
+    // 极性归约必须在这两种图上都先于值到谓词物化。
+    if let Some(expr) = short_circuit::collapse_short_circuit_graph(topology, safety, root_ends) {
+        return Some(expr);
+    }
     if topology.has_shared_nodes() {
         synthesize::synthesize_value_decision_expr(decision, safety).or_else(|| {
             let mut memo = BTreeMap::new();
             collapse_value_node(decision, decision.entry, &mut memo, safety)
         })
     } else {
-        if let Some(expr) = collapse_linear_value_chain(decision) {
-            return Some(expr);
-        }
         let mut memo = BTreeMap::new();
         collapse_value_node(decision, decision.entry, &mut memo, safety)
             .or_else(|| synthesize::synthesize_value_decision_expr(decision, safety))
@@ -361,29 +373,38 @@ enum LinearValueOp {
 }
 
 fn collapse_linear_value_chain(decision: &HirDecisionExpr) -> Option<HirExpr> {
+    collapse_linear_value_chain_with(decision.entry, |node| {
+        decision.nodes.get(node.index()).cloned()
+    })
+}
+
+fn collapse_linear_value_chain_with(
+    entry: HirDecisionNodeRef,
+    mut take_node: impl FnMut(HirDecisionNodeRef) -> Option<HirDecisionNode>,
+) -> Option<HirExpr> {
     let mut steps = Vec::new();
-    let mut current = decision.entry;
+    let mut current = entry;
     let tail = loop {
-        let node = decision.nodes.get(current.index())?;
-        match (&node.truthy, &node.falsy) {
+        let node = take_node(current)?;
+        match (node.truthy, node.falsy) {
             (HirDecisionTarget::CurrentValue, HirDecisionTarget::Node(next)) => {
-                steps.push((LinearValueOp::Or, node.test.clone()));
-                current = *next;
+                steps.push((LinearValueOp::Or, node.test));
+                current = next;
             }
             (HirDecisionTarget::Node(next), HirDecisionTarget::CurrentValue) => {
-                steps.push((LinearValueOp::And, node.test.clone()));
-                current = *next;
+                steps.push((LinearValueOp::And, node.test));
+                current = next;
             }
             (HirDecisionTarget::CurrentValue, HirDecisionTarget::Expr(expr)) => {
-                steps.push((LinearValueOp::Or, node.test.clone()));
-                break expr.clone();
+                steps.push((LinearValueOp::Or, node.test));
+                break expr;
             }
             (HirDecisionTarget::Expr(expr), HirDecisionTarget::CurrentValue) => {
-                steps.push((LinearValueOp::And, node.test.clone()));
-                break expr.clone();
+                steps.push((LinearValueOp::And, node.test));
+                break expr;
             }
             (HirDecisionTarget::CurrentValue, HirDecisionTarget::CurrentValue) => {
-                break node.test.clone();
+                break node.test;
             }
             _ => return None,
         }

@@ -33,10 +33,11 @@ pub(crate) fn build_condition_decision_expr(
         .iter()
         .filter(|node| node.materialized_value.is_none())
         .map(|node| {
-            let test = subjects.get_mut(node.id.index())?.take()?;
+            let (test, test_source) = subjects.get_mut(node.id.index())?.take()?;
             Some(HirDecisionNode {
                 id: remap[node.id.index()]?,
                 test,
+                test_source,
                 truthy: lower_target(node.semantic_target(true), &resolved)?,
                 falsy: lower_target(node.semantic_target(false), &resolved)?,
             })
@@ -54,7 +55,7 @@ pub(crate) fn build_value_decision_expr(
         .nodes
         .iter()
         .map(|node| {
-            let test = if node.id == decision.entry {
+            let (test, test_source) = if node.id == decision.entry {
                 lower_short_circuit_subject(lowering, node.block, node.predicate)
             } else {
                 lower_short_circuit_subject_single_eval(lowering, node.block, node.predicate)
@@ -62,6 +63,7 @@ pub(crate) fn build_value_decision_expr(
             Some(HirDecisionNode {
                 id: HirDecisionNodeRef(node.id.index()),
                 test,
+                test_source,
                 truthy: lower_value_target(lowering, decision, node.truthy.target)?,
                 falsy: lower_value_target(lowering, decision, node.falsy.target)?,
             })
@@ -144,7 +146,7 @@ fn lower_condition_subjects(
     lowering: &ProtoLowering<'_>,
     condition: &ConditionPlan,
     values_by_consumer: &[Vec<crate::structure::ConditionNodeId>],
-) -> Option<Vec<Option<HirExpr>>> {
+) -> Option<Vec<Option<(HirExpr, crate::hir::HirDecisionTestSource)>>> {
     let mut subjects = vec![None; condition.nodes.len()];
     let mut state = vec![0u8; condition.nodes.len()];
 
@@ -166,7 +168,7 @@ fn lower_condition_subjects(
                 ) {
                     return None;
                 }
-                let mut expr = if node.id == condition.entry {
+                let (mut expr, mut test_source) = if node.id == condition.entry {
                     lower_short_circuit_subject(lowering, node.block, node.predicate)
                 } else {
                     lower_short_circuit_subject_single_eval(lowering, node.block, node.predicate)
@@ -174,7 +176,9 @@ fn lower_condition_subjects(
                 for producer_id in values_by_consumer.get(index)? {
                     let producer = condition.nodes.get(producer_id.index())?;
                     let value = producer.materialized_value?;
-                    let mut replacement = subjects.get_mut(producer_id.index())?.take()?;
+                    let (mut replacement, _) = subjects.get_mut(producer_id.index())?.take()?;
+                    // 合流值的极性替换不是原 operand 写回证明，不能给外层表达式签 Value。
+                    test_source = crate::hir::HirDecisionTestSource::Predicate;
                     if value.negated {
                         replacement = HirExpr::Unary(Box::new(crate::hir::HirUnaryExpr {
                             op: crate::hir::HirUnaryOpKind::Not,
@@ -196,7 +200,7 @@ fn lower_condition_subjects(
                     }
                 }
                 state[index] = 2;
-                subjects[index] = Some(expr);
+                subjects[index] = Some((expr, test_source));
                 continue;
             }
 

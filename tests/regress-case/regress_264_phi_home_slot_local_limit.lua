@@ -1,6 +1,7 @@
--- regress_264_phi_home_slot_local_limit#1: 顺序branch phi复用状态binding且不物化条件scratch
+-- regress_264_phi_home_slot_local_limit#1: 顺序 branch phi 复用状态 binding，不逐条件累积 scratch。
+-- 最后一次 TEST 的原槽没有后续覆盖，可以保留到出口；不能用源码形状断言抹掉这份根事实。
 -- unluac: expect-contains [[if p1_0[2] then]]
--- unluac: expect-contains [[if p1_0[200] then]]
+-- unluac: expect-contains [[if p1_0[199] then]]
 -- unluac: expect-not-contains [[    r1_1 = p1_0]]
 local function run(flags)
     local value = 0

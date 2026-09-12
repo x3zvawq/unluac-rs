@@ -658,6 +658,8 @@ pub struct ValueDecisionPlan {
     /// decision 内部被表达式 DAG 一并消去的中间 phi；按 PhiId 严格递增。
     pub absorbed_phis: Vec<crate::structure::PhiId>,
     pub result_reg: crate::transformer::Reg,
+    /// 最终互斥域内，仅 result_reg 的原 Call test epoch 可查询的无观察覆盖前沿。
+    pub call_root_frontiers: crate::structure::RootOverwriteFrontiers,
 }
 
 impl ValueDecisionPlan {

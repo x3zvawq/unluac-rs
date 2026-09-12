@@ -414,7 +414,7 @@ fn materialize_decision_into_target(
     safety: HirExprSafety,
 ) -> Vec<HirStmt> {
     if let Some(expr) =
-        super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety)
+        super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety, |_| false)
     {
         return materialize_expr_into_target(expr, target, state, safety);
     }
@@ -654,7 +654,9 @@ fn prepare_ordered_exprs(
 fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
     match expr {
         HirExpr::Decision(decision) => {
-            super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety)
+            super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety, |_| {
+                false
+            })
         }
         HirExpr::TableAccess(access) => Some(HirExpr::TableAccess(Box::new(HirTableAccess {
             metamethod_free: access.metamethod_free,

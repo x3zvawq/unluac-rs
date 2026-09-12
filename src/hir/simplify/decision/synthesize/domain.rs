@@ -10,6 +10,8 @@
 //! 例如：`temp == nil` 会成为以 `temp` 为变量的共享多值分支；整数与浮点数的判等按 Lua
 //! 数值语义计算，而 terminal 仍保留两种结果身份。Decision 的 `CurrentValue` 始终绑定当前
 //! node 已求出的 test diagram，不会重求值或跨节点复用。
+//! 原子键同时供验证域收集、求值和形状成本使用；例如 `a and 1LL or 2LL` 中的
+//! LuaJIT 常量不能在值验证时合法、在成本模型中却没有对应身份。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +33,19 @@ pub(super) enum RefKey {
     VarArg,
 }
 
+impl RefKey {
+    fn from_expr(expr: &HirExpr) -> Option<Self> {
+        match expr {
+            HirExpr::ParamRef(value) => Some(Self::Param(*value)),
+            HirExpr::LocalRef(value) => Some(Self::Local(*value)),
+            HirExpr::UpvalueRef(value) => Some(Self::Upvalue(*value)),
+            HirExpr::TempRef(value) => Some(Self::Temp(*value)),
+            HirExpr::VarArg => Some(Self::VarArg),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(super) enum AbstractValue {
     Nil,
@@ -44,6 +59,42 @@ pub(super) enum AbstractValue {
     Vector([u32; 4]),
     Complex { real_bits: u64, imag_bits: u64 },
     TruthySymbol(u8),
+}
+
+impl AbstractValue {
+    fn from_literal(expr: &HirExpr) -> Option<Self> {
+        match expr {
+            HirExpr::Nil => Some(Self::Nil),
+            HirExpr::Boolean(false) => Some(Self::False),
+            HirExpr::Boolean(true) => Some(Self::True),
+            HirExpr::Integer(value) => Some(Self::Integer(*value)),
+            HirExpr::Number(value) => Some(Self::Number(value.to_bits())),
+            HirExpr::String(value) => Some(Self::String(value.clone())),
+            HirExpr::Int64(value) => Some(Self::Int64(*value)),
+            HirExpr::UInt64(value) => Some(Self::UInt64(*value)),
+            HirExpr::Vector(value) => Some(Self::Vector(value.components)),
+            HirExpr::Complex { real, imag } => Some(Self::Complex {
+                real_bits: real.to_bits(),
+                imag_bits: imag.to_bits(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// 综合域与成本模型共用原子身份，后者不再维护一份可能漏掉方言值的字面量清单。
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) enum AtomKey {
+    Value(AbstractValue),
+    Ref(RefKey),
+}
+
+impl AtomKey {
+    pub(super) fn from_expr(expr: &HirExpr) -> Option<Self> {
+        RefKey::from_expr(expr)
+            .map(Self::Ref)
+            .or_else(|| AbstractValue::from_literal(expr).map(Self::Value))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -112,31 +163,13 @@ impl SymbolicVerifier {
     }
 
     pub(super) fn eval_expr(&mut self, expr: &HirExpr) -> Option<DiagramId> {
+        if let Some(atom) = AtomKey::from_expr(expr) {
+            return match atom {
+                AtomKey::Value(value) => Some(self.intern_terminal(value)),
+                AtomKey::Ref(key) => self.ref_value(key),
+            };
+        }
         match expr {
-            HirExpr::Nil => Some(self.intern_terminal(AbstractValue::Nil)),
-            HirExpr::Boolean(false) => Some(self.intern_terminal(AbstractValue::False)),
-            HirExpr::Boolean(true) => Some(self.intern_terminal(AbstractValue::True)),
-            HirExpr::Integer(value) => Some(self.intern_terminal(AbstractValue::Integer(*value))),
-            HirExpr::Number(value) => {
-                Some(self.intern_terminal(AbstractValue::Number(value.to_bits())))
-            }
-            HirExpr::String(value) => {
-                Some(self.intern_terminal(AbstractValue::String(value.clone())))
-            }
-            HirExpr::Int64(value) => Some(self.intern_terminal(AbstractValue::Int64(*value))),
-            HirExpr::UInt64(value) => Some(self.intern_terminal(AbstractValue::UInt64(*value))),
-            HirExpr::Vector(vector) => {
-                Some(self.intern_terminal(AbstractValue::Vector(vector.components)))
-            }
-            HirExpr::Complex { real, imag } => Some(self.intern_terminal(AbstractValue::Complex {
-                real_bits: real.to_bits(),
-                imag_bits: imag.to_bits(),
-            })),
-            HirExpr::ParamRef(param) => self.ref_value(RefKey::Param(*param)),
-            HirExpr::LocalRef(local) => self.ref_value(RefKey::Local(*local)),
-            HirExpr::UpvalueRef(upvalue) => self.ref_value(RefKey::Upvalue(*upvalue)),
-            HirExpr::TempRef(temp) => self.ref_value(RefKey::Temp(*temp)),
-            HirExpr::VarArg => self.ref_value(RefKey::VarArg),
             HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Not => {
                 let value = self.eval_expr(&unary.expr)?;
                 Some(self.apply_not(value))
@@ -167,15 +200,7 @@ impl SymbolicVerifier {
                 };
                 self.apply_binary(op, lhs, rhs)
             }
-            HirExpr::Decision(_)
-            | HirExpr::GlobalRef(_)
-            | HirExpr::TableAccess(_)
-            | HirExpr::Unary(_)
-            | HirExpr::Binary(_)
-            | HirExpr::Call(_)
-            | HirExpr::TableConstructor(_)
-            | HirExpr::Closure(_)
-            | HirExpr::Unresolved(_) => None,
+            _ => None,
         }
     }
 
@@ -483,22 +508,11 @@ pub(super) fn collect_refs_from_decision(decision: &HirDecisionExpr) -> Vec<RefK
 }
 
 pub(super) fn collect_refs_from_expr(expr: &HirExpr, refs: &mut BTreeSet<RefKey>) {
+    if let Some(key) = RefKey::from_expr(expr) {
+        refs.insert(key);
+        return;
+    }
     match expr {
-        HirExpr::ParamRef(param) => {
-            refs.insert(RefKey::Param(*param));
-        }
-        HirExpr::LocalRef(local) => {
-            refs.insert(RefKey::Local(*local));
-        }
-        HirExpr::UpvalueRef(upvalue) => {
-            refs.insert(RefKey::Upvalue(*upvalue));
-        }
-        HirExpr::TempRef(temp) => {
-            refs.insert(RefKey::Temp(*temp));
-        }
-        HirExpr::VarArg => {
-            refs.insert(RefKey::VarArg);
-        }
         HirExpr::Unary(unary) => collect_refs_from_expr(&unary.expr, refs),
         HirExpr::Binary(binary) => {
             collect_refs_from_expr(&binary.lhs, refs);
@@ -508,51 +522,22 @@ pub(super) fn collect_refs_from_expr(expr: &HirExpr, refs: &mut BTreeSet<RefKey>
             collect_refs_from_expr(&logical.lhs, refs);
             collect_refs_from_expr(&logical.rhs, refs);
         }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::Decision(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Call(_)
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => {}
+        _ => {}
     }
 }
 
 pub(super) fn collect_literals_from_expr(expr: &HirExpr, literals: &mut BTreeSet<AbstractValue>) {
+    if let Some(value) = AbstractValue::from_literal(expr) {
+        // nil/Boolean 已固定包含在验证域中，不随表达式重复加入。
+        if !matches!(
+            value,
+            AbstractValue::Nil | AbstractValue::False | AbstractValue::True
+        ) {
+            literals.insert(value);
+        }
+        return;
+    }
     match expr {
-        HirExpr::Integer(value) => {
-            literals.insert(AbstractValue::Integer(*value));
-        }
-        HirExpr::Number(value) => {
-            literals.insert(AbstractValue::Number(value.to_bits()));
-        }
-        HirExpr::String(value) => {
-            literals.insert(AbstractValue::String(value.clone()));
-        }
-        HirExpr::Int64(value) => {
-            literals.insert(AbstractValue::Int64(*value));
-        }
-        HirExpr::UInt64(value) => {
-            literals.insert(AbstractValue::UInt64(*value));
-        }
-        HirExpr::Vector(vector) => {
-            literals.insert(AbstractValue::Vector(vector.components));
-        }
-        HirExpr::Complex { real, imag } => {
-            literals.insert(AbstractValue::Complex {
-                real_bits: real.to_bits(),
-                imag_bits: imag.to_bits(),
-            });
-        }
         HirExpr::Unary(unary) => collect_literals_from_expr(&unary.expr, literals),
         HirExpr::Binary(binary) => {
             collect_literals_from_expr(&binary.lhs, literals);
@@ -562,20 +547,7 @@ pub(super) fn collect_literals_from_expr(expr: &HirExpr, literals: &mut BTreeSet
             collect_literals_from_expr(&logical.lhs, literals);
             collect_literals_from_expr(&logical.rhs, literals);
         }
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_)
-        | HirExpr::Decision(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => {}
+        _ => {}
     }
 }
 

@@ -4,7 +4,8 @@
 //! CALL 参数位于 caller prefix 之外，callee 可覆盖这些槽；它们不是跨调用继续存在的
 //! 独立 caller root。例如 t = {}; f(t) 的参数槽可交给 f，而 local owner; f(owner) 中
 //! owner 的原始低槽不随参数 MOVE 一并交出。这里只发布同 basic block 的 direct def，
-//! phi、跨 block use 和按引用捕获槽不产生证明；实际 producer 删除由 HIR 求值顺序 owner 审查。
+//! phi、跨 block use 和按引用捕获槽不产生证明；调用结果最后读取后的覆盖可以位于各直接
+//! successor，由 Dataflow 发布完整 frontier。实际 producer 删除由 HIR 求值顺序 owner 审查。
 
 use super::*;
 use crate::hir::common::HirCallArgumentRoot;
@@ -81,7 +82,7 @@ pub(super) fn collect_unobserved_result_ends(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
-) -> BTreeMap<TempId, TempId> {
+) -> BTreeMap<TempId, Vec<TempId>> {
     dataflow
         .defs
         .iter()
@@ -93,9 +94,15 @@ pub(super) fn collect_unobserved_result_ends(
             {
                 return None;
             }
-            let end = dataflow.unobserved_root_overwrite_after_last_use(def.id, cfg)?;
-            let endpoint = TempId(end.index());
-            (fixed_temps[end.index()] == endpoint).then_some((producer, endpoint))
+            let ends = dataflow.unobserved_root_overwrite_frontier_after_last_use(def.id, cfg)?;
+            let endpoints = ends
+                .into_iter()
+                .map(|end| {
+                    let endpoint = TempId(end.index());
+                    (fixed_temps[end.index()] == endpoint).then_some(endpoint)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((producer, endpoints))
         })
         .collect()
 }

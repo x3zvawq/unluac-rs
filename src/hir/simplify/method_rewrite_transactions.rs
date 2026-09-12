@@ -224,13 +224,14 @@ fn candidate_at(
     }
 
     let protocol = facts.method_setup_protocol(protocol_id)?;
+    let prior_callee_root_temp = protocol.prior_callee_root_temp?;
     if access.method_setup_protocol != Some(protocol_id)
         || protocol.method_key != *method_key
-        || !facts.is_pure_scope_end_copy_root_temp(protocol.prior_callee_root_temp)
+        || !facts.is_pure_scope_end_copy_root_temp(prior_callee_root_temp)
     {
         return None;
     }
-    let root_homes = facts.complete_temp_home_slots(protocol.prior_callee_root_temp);
+    let root_homes = facts.complete_temp_home_slots(prior_callee_root_temp);
     let alias = alias_root_for_homes(*target, aliases, &root_homes, facts)?;
     let source = alias.source;
     if source == *target

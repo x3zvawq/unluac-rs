@@ -17,7 +17,7 @@ use super::constructor::{
     ConstructorRunFacts, try_inline_terminal_constructor_call,
     try_inline_terminal_constructor_fields,
 };
-use super::direct::lower_direct_function_stmt;
+use super::direct::{lower_declared_function, lower_direct_function_stmt};
 use super::forwarded::try_lower_forwarded_function_stmt;
 use super::method_alias::{
     MethodRewriteTransactionIndex, recover_proven_direct_method_calls,
@@ -44,6 +44,7 @@ pub(in crate::ast::readability) fn apply(
             None,
             &method_transactions,
         )
+        | super::method_decl::apply(module)
 }
 
 fn rewrite_block(
@@ -72,6 +73,7 @@ fn rewrite_block(
     while let Some(first) = old_stmts.as_slice().first() {
         let remaining = old_stmts.as_slice();
         let rewritten = try_recover_certified_method_setup(remaining, method_transactions)
+            .or_else(|| lower_declared_function(remaining))
             .or_else(|| try_inline_terminal_constructor_fields(remaining))
             .or_else(|| {
                 try_inline_terminal_constructor_call(

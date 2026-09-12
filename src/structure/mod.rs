@@ -27,8 +27,8 @@ pub use cfg::{
     DominatorTree, EdgeKind, EdgeRef, EffectTag, GraphFacts, InstrEffect, InstrRange,
     InstrUseValues, NaturalLoop, NaturalLoopAncestors, NaturalLoopForest, NaturalLoopId, OpenDef,
     OpenDefId, OpenUseSources, PhiCandidate, PhiId, PhiIncoming, PostDominatorTree,
-    ReachableSuccessorShape, RootObservation, SideEffectSummary, SsaRegMap, SsaValue, UseSite,
-    build_cfg_graph, compute_dataflow_facts,
+    ReachableSuccessorShape, RootObservation, RootOverwriteFrontier, RootOverwriteFrontiers,
+    SideEffectSummary, SsaRegMap, SsaValue, UseSite, build_cfg_graph, compute_dataflow_facts,
 };
 pub(crate) use cfg::{PhiIncomingSlot, SccId};
 pub(crate) use common::{

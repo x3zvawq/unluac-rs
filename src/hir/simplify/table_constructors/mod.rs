@@ -73,7 +73,7 @@ enum RegionStep<'a> {
         binding: TableBinding,
         source: PendingProducerSource,
         value: &'a HirExpr,
-        scalar_call: bool,
+        scalar_result: bool,
         source_gc_inert: bool,
         source_preservation: ProducerSourcePreservation,
     },
@@ -210,12 +210,14 @@ pub(super) fn stabilize_table_constructors_in_proto(
         materialized: materialized_bindings,
         reference_captured: reference_captured_bindings,
         reference_captured_home_slots,
+        observed_before_exit,
     } = collect_binding_facts(&proto.body, promotion_facts, temp_count, first_new_local);
     let mut pass = TableConstructorPass {
         has_cleanup: proto_has_cleanup(proto),
         materialized_bindings,
         reference_captured_bindings,
         reference_captured_home_slots,
+        observed_before_exit,
         debug_identity_bindings: BindingSlots::from_debug_hints(
             &proto.temp_debug_locals,
             &proto.local_debug_hints,
@@ -246,6 +248,7 @@ struct TableConstructorPass<'a> {
     materialized_bindings: BindingSlots<u32>,
     reference_captured_bindings: BindingSlots<bool>,
     reference_captured_home_slots: std::collections::BTreeSet<HomeSlotKey>,
+    observed_before_exit: BindingSlots<bool>,
     debug_identity_bindings: BindingSlots<bool>,
     promotion_facts: &'a ProtoPromotionFacts,
     temp_count: usize,
@@ -319,10 +322,19 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     let returned_batch = self.returned_batch_is_safe(block, index, binding, region);
                     let indexed_owner =
                         self.returned_indexed_region_is_safe(block, index, binding, region, &roots);
+                    let private_owner = !self.has_cleanup
+                        && roots.removed_roots_are_inert_tables
+                        && !self
+                            .observed_before_exit
+                            .get(binding)
+                            .copied()
+                            .unwrap_or_default()
+                        && !binding_occurrences.has_source_identity(binding_id);
                     let open_owner = rebuilt_constructor.trailing_multivalue.is_some()
                         && self
                             .open_constructor_region_is_safe(block, index, binding, region, &roots);
                     if !indexed_owner
+                        && !private_owner
                         && roots.temp_producers.iter().any(|temp| {
                             !open_owner
                                 || !self
@@ -330,7 +342,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                                     .call_result_root_ends_after_value_use(*temp)
                         })
                     {
-                        // 原始调用结果只能由完整 open-owner 事务消费；不能先提交字段前缀，
+                        // 原始标量结果须由完整 indexed/open-owner 事务消费；不能先提交字段前缀，
                         // 再让后缀重建已经删除的 physical root 身份。
                         return false;
                     }
@@ -373,6 +385,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 候选拒绝[SemanticBarrier:Lifetime]：反例见
                     // tests/unit-case/lua54_01_close.lua#lua54_01_close#13/#14/#16。
                     let producer_root_is_observable = !indexed_owner
+                        && !private_owner
                         && !open_owner
                         && !returned_batch
                         && roots.has_removed_object_producer
@@ -381,6 +394,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 候选拒绝[SemanticBarrier:Lifetime]：对象 producer 后再覆盖 table field
                     // 时，删除 producer 会提前释放最后一个强引用；反例同上。
                     let has_followup_object_write = !indexed_owner
+                        && !private_owner
                         && !(open_owner
                             && rebuilt_constructor
                                 .allocation
@@ -573,6 +587,11 @@ impl TableConstructorPass<'_> {
                 index += 1;
                 continue;
             };
+
+            if self.fold_fixed_batch_across_root_copy(block, index, binding, &set_list) {
+                changed = true;
+                continue;
+            }
 
             // 相邻的源码 LocalDecl 与 SETLIST 是 VM 对同一个构造器初始化的拆分编码。
             // direct-seed provenance 证明 allocation 仍在原声明位置，SETLIST start 又证明数组
@@ -1931,6 +1950,64 @@ impl TableConstructorPass<'_> {
                 RegionStep::Record { .. } => {}
             }
         }
+        true
+    }
+
+    /// 根 holder 的纯 copy 可以留在完整初始化之后；分配仍先发生，SETLIST 不执行用户代码。
+    /// `seed={}; root=source; SETLIST seed(root)` 变为 `seed={source}; root=source`，
+    /// 保留显式 root 的覆盖与释放，避免为恢复构造器而删除前层签发的生命周期事务。
+    fn fold_fixed_batch_across_root_copy(
+        &self,
+        block: &mut crate::hir::common::HirBlock,
+        index: usize,
+        binding: TableBinding,
+        batch: &crate::hir::common::HirTableSetList,
+    ) -> bool {
+        let Some(seed_index) = index.checked_sub(2) else {
+            return false;
+        };
+        let Some((owner, seed)) = constructor_seed(&block.stmts[seed_index]) else {
+            return false;
+        };
+        let HirStmt::Assign(copy) = &block.stmts[index - 1] else {
+            return false;
+        };
+        let ([HirLValue::Local(root)], [source], None) = (
+            copy.targets.as_slice(),
+            copy.values.fixed.as_slice(),
+            &copy.values.tail,
+        ) else {
+            return false;
+        };
+        if owner != binding
+            || !seed.fields.is_empty()
+            || seed.trailing_multivalue.is_some()
+            || batch.start_index != 1
+            || batch.values.tail.is_some()
+            || !matches!(batch.values.fixed.as_slice(), [HirExpr::LocalRef(value)] if value == root)
+            || !matches!(
+                source,
+                HirExpr::ParamRef(_)
+                    | HirExpr::LocalRef(_)
+                    | HirExpr::UpvalueRef(_)
+                    | HirExpr::TempRef(_)
+            )
+            || expr_uses_binding(source, binding)
+            || binding == TableBinding::Local(*root)
+        {
+            return false;
+        }
+        let mut rewritten_batch = batch.clone();
+        rewritten_batch.values.fixed[0] = source.clone();
+        let constructor = constructor_with_set_list(seed, &rewritten_batch);
+        if !constructor_nil_shape_is_supported(seed, &constructor) {
+            // 候选拒绝[SemanticBarrier:TableShape]：容量不符时 SETLIST 可能扩容，不能当作无事件写。
+            return false;
+        }
+        // 候选接受[EvalOrderProof]：空表分配保持原位；随后仅复制同一引用并完成预分配写入，
+        // 没有调用、分配或元方法可改变 source。root 赋值仍保留，旧值也只多跨过无事件 SETLIST。
+        install_constructor_seed(&mut block.stmts[seed_index], constructor);
+        block.stmts.remove(index);
         true
     }
 }

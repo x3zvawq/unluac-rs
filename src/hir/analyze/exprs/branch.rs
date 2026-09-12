@@ -3,6 +3,8 @@
 //! 它依赖 Transformer 已经解析好的 `BranchCond`，只回答“条件本身长什么样”，不会在这里
 //! 决定 if/while/短路结构应该怎么组织。
 //! 例如：`if not r0 then ...` 会先在这里得到 `not r0` 的表达式形式。
+//! Subject 同时签发原 operand / 合成 predicate 来源：比较结果虽为 Boolean，
+//! 条件跳转本身并不证明发生过 Boolean 值写回，后续 Decision 不能混用这两种事实。
 
 use super::*;
 
@@ -12,7 +14,7 @@ pub(crate) fn lower_branch_cond(
     instr_ref: InstrRef,
     cond: BranchCond,
 ) -> HirExpr {
-    let expr = lower_branch_subject(lowering, block, instr_ref, cond);
+    let (expr, _) = lower_branch_subject(lowering, block, instr_ref, cond);
 
     if cond.negated {
         HirExpr::Unary(Box::new(HirUnaryExpr {
@@ -33,7 +35,7 @@ pub(crate) fn lower_branch_subject(
     block: BlockRef,
     instr_ref: InstrRef,
     cond: BranchCond,
-) -> HirExpr {
+) -> (HirExpr, crate::hir::HirDecisionTestSource) {
     lower_branch_subject_with(cond, |operand| {
         lower_cond_operand(lowering, block, instr_ref, operand)
     })
@@ -49,31 +51,65 @@ pub(crate) fn lower_branch_subject_single_eval(
     block: BlockRef,
     instr_ref: InstrRef,
     cond: BranchCond,
-) -> HirExpr {
+) -> (HirExpr, crate::hir::HirDecisionTestSource) {
     lower_branch_subject_with(cond, |operand| {
         lower_cond_operand_single_eval(lowering, block, instr_ref, operand)
     })
 }
 
+/// 只为当前测试的 direct CALL epoch 消费已冻结的原 home 覆盖证明。
+/// 调用表达式展开后仍须由调用方匹配此测试；不能沿 MOVE 借另一个槽的旧 producer。
+pub(in crate::hir::analyze) fn branch_call_result_root_ends_after_test(
+    lowering: &ProtoLowering<'_>,
+    instr: InstrRef,
+    frontiers: &crate::structure::RootOverwriteFrontiers,
+) -> bool {
+    let LowInstr::Branch(branch) = &lowering.proto.instrs[instr.index()] else {
+        return false;
+    };
+    let BranchSubject::Truthy(CondOperand::Reg(reg)) = branch.cond.subject else {
+        return false;
+    };
+    let SsaValue::Def(def) = lowering.dataflow.use_value(instr, reg) else {
+        return false;
+    };
+    let uses = &lowering.dataflow.def_uses[def.index()];
+    matches!(
+        lowering.proto.instrs[lowering.dataflow.def_instr(def).index()],
+        LowInstr::Call(_)
+    ) && uses.len() == 1
+        && uses[0].instr == instr
+        && (frontiers
+            .for_def(def)
+            .is_some_and(|frontier| frontier.home() == reg)
+            || lowering
+                .promotion_facts
+                .call_result_root_ends_after_value_use(lowering.bindings.fixed_temps[def.index()]))
+}
+
 fn lower_branch_subject_with(
     cond: BranchCond,
     mut lower_operand: impl FnMut(CondOperand) -> HirExpr,
-) -> HirExpr {
+) -> (HirExpr, crate::hir::HirDecisionTestSource) {
+    use crate::hir::HirDecisionTestSource;
     match cond.subject {
-        BranchSubject::Truthy(operand) => lower_operand(operand),
+        BranchSubject::Truthy(operand) => (lower_operand(operand), HirDecisionTestSource::Value),
         BranchSubject::Compare {
             predicate,
             lhs,
             rhs,
-        } => HirExpr::Binary(Box::new(HirBinaryExpr {
-            op: match predicate {
-                BranchPredicate::Eq => HirBinaryOpKind::Eq,
-                BranchPredicate::Lt => HirBinaryOpKind::Lt,
-                BranchPredicate::Le => HirBinaryOpKind::Le,
-            },
-            lhs: lower_operand(lhs),
-            rhs: lower_operand(rhs),
-        })),
+        } => (
+            HirExpr::Binary(Box::new(HirBinaryExpr {
+                op: match predicate {
+                    BranchPredicate::Eq => HirBinaryOpKind::Eq,
+                    BranchPredicate::Lt => HirBinaryOpKind::Lt,
+                    BranchPredicate::Le => HirBinaryOpKind::Le,
+                },
+                lhs: lower_operand(lhs),
+                rhs: lower_operand(rhs),
+            })),
+            HirDecisionTestSource::Predicate,
+        ),
     }
 }
 

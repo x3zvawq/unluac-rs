@@ -3,10 +3,12 @@
 //! 这里的职责不是判断语义是否正确，语义等价已经由外层的抽象值校验负责。这个模块只
 //! 回答一个更工程化的问题：当几种候选都等价时，哪一种更接近源码短路直觉、也更不容易
 //! 把共享子图机械展开成难读的乘积式。
+//! 字面量及引用身份直接消费综合域的 AtomKey，包括 cdata、vector 和单值 vararg；
+//! 不维护另一份“哪些是原子值”的分类，以免合法方言常量在成本遍历中变成不可达分支。
 
 use crate::hir::common::{HirBinaryOpKind, HirExpr, HirUnaryOpKind};
 
-use super::domain::AbstractValue;
+use super::domain::{AbstractValue, AtomKey};
 
 const AND_WITH_OR_CHILD_PENALTY: usize = 8;
 const COMPLEX_AND_WITH_OR_EXTRA_PENALTY: usize = 4;
@@ -41,12 +43,12 @@ fn structural_expr_cost(expr: &HirExpr) -> usize {
         | HirExpr::ParamRef(_)
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_) => 1,
+        | HirExpr::TempRef(_)
+        | HirExpr::VarArg => 1,
         HirExpr::Decision(_)
         | HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
         | HirExpr::Call(_)
-        | HirExpr::VarArg
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => usize::MAX / 4,
@@ -197,53 +199,28 @@ fn expr_is_compact_logical_branch(expr: &HirExpr) -> bool {
     ) || matches!(expr, HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq)
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-enum AtomicValueKey<'a> {
-    Nil,
-    Boolean(bool),
-    Integer(i64),
-    Number(u64),
-    String(&'a [u8]),
-    Param(usize),
-    Local(usize),
-    Upvalue(usize),
-    Temp(usize),
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum AtomicOccurrenceKey {
+    Value(AtomKey),
+    Not(AtomKey),
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-enum AtomicOccurrenceKey<'a> {
-    Value(AtomicValueKey<'a>),
-    Not(AtomicValueKey<'a>),
-}
-
-fn collect_atomic_occurrences<'a>(expr: &'a HirExpr, atoms: &mut Vec<AtomicOccurrenceKey<'a>>) {
-    if let Some(key) = atomic_value_key(expr) {
+fn collect_atomic_occurrences(expr: &HirExpr, atoms: &mut Vec<AtomicOccurrenceKey>) {
+    if let Some(key) = AtomKey::from_expr(expr) {
         atoms.push(AtomicOccurrenceKey::Value(key));
         return;
     }
 
     match expr {
-        HirExpr::Nil
-        | HirExpr::Boolean(_)
-        | HirExpr::Integer(_)
-        | HirExpr::Number(_)
-        | HirExpr::String(_)
-        | HirExpr::Int64(_)
-        | HirExpr::UInt64(_)
-        | HirExpr::Vector(_)
-        | HirExpr::Complex { .. }
-        | HirExpr::ParamRef(_)
-        | HirExpr::LocalRef(_)
-        | HirExpr::UpvalueRef(_)
-        | HirExpr::TempRef(_) => {
-            unreachable!("atomic exprs should have been handled before recursing")
+        HirExpr::Unary(unary) => {
+            if unary.op == HirUnaryOpKind::Not
+                && let Some(key) = AtomKey::from_expr(&unary.expr)
+            {
+                atoms.push(AtomicOccurrenceKey::Not(key));
+            } else {
+                collect_atomic_occurrences(&unary.expr, atoms);
+            }
         }
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not && is_atomic_expr(&unary.expr) => {
-            atoms.push(AtomicOccurrenceKey::Not(
-                atomic_value_key(&unary.expr).expect("atomic expr must map to an atomic key"),
-            ));
-        }
-        HirExpr::Unary(unary) => collect_atomic_occurrences(&unary.expr, atoms),
         HirExpr::Binary(binary) => {
             collect_atomic_occurrences(&binary.lhs, atoms);
             collect_atomic_occurrences(&binary.rhs, atoms);
@@ -252,47 +229,6 @@ fn collect_atomic_occurrences<'a>(expr: &'a HirExpr, atoms: &mut Vec<AtomicOccur
             collect_atomic_occurrences(&logical.lhs, atoms);
             collect_atomic_occurrences(&logical.rhs, atoms);
         }
-        HirExpr::Decision(_)
-        | HirExpr::GlobalRef(_)
-        | HirExpr::TableAccess(_)
-        | HirExpr::Call(_)
-        | HirExpr::VarArg
-        | HirExpr::TableConstructor(_)
-        | HirExpr::Closure(_)
-        | HirExpr::Unresolved(_) => {}
-    }
-}
-
-fn is_atomic_expr(expr: &HirExpr) -> bool {
-    matches!(
-        expr,
-        HirExpr::Nil
-            | HirExpr::Boolean(_)
-            | HirExpr::Integer(_)
-            | HirExpr::Number(_)
-            | HirExpr::String(_)
-            | HirExpr::Int64(_)
-            | HirExpr::UInt64(_)
-            | HirExpr::Vector(_)
-            | HirExpr::Complex { .. }
-            | HirExpr::ParamRef(_)
-            | HirExpr::LocalRef(_)
-            | HirExpr::UpvalueRef(_)
-            | HirExpr::TempRef(_)
-    )
-}
-
-fn atomic_value_key(expr: &HirExpr) -> Option<AtomicValueKey<'_>> {
-    match expr {
-        HirExpr::Nil => Some(AtomicValueKey::Nil),
-        HirExpr::Boolean(value) => Some(AtomicValueKey::Boolean(*value)),
-        HirExpr::Integer(value) => Some(AtomicValueKey::Integer(*value)),
-        HirExpr::Number(value) => Some(AtomicValueKey::Number(value.to_bits())),
-        HirExpr::String(value) => Some(AtomicValueKey::String(value.as_bytes())),
-        HirExpr::ParamRef(param) => Some(AtomicValueKey::Param(param.index())),
-        HirExpr::LocalRef(local) => Some(AtomicValueKey::Local(local.index())),
-        HirExpr::UpvalueRef(upvalue) => Some(AtomicValueKey::Upvalue(upvalue.index())),
-        HirExpr::TempRef(temp) => Some(AtomicValueKey::Temp(temp.index())),
-        _ => None,
+        _ => {}
     }
 }

@@ -373,6 +373,45 @@ impl DataflowFacts {
     /// producer/use、捕获与求值顺序。例如 CALL r; SETLIST(..., r); MOVE r,callee
     /// 的结果不再跨后续调用独立保活，赋值给弱表且随后先 GC 的情况则没有此证明。
     pub fn unobserved_root_overwrite_after_last_use(&self, def: DefId, cfg: &Cfg) -> Option<DefId> {
+        let (block, home, start) = self.root_suffix_after_last_use(def, cfg)?;
+        self.unobserved_root_overwrite_in_range(home, start..cfg.blocks[block.index()].instrs.end())
+    }
+
+    /// 原槽在最后读取之后，可以由各直接后继分别终止，而不必共享单个覆盖 def。
+    ///
+    /// 短路入口 TEST 的两条路径可能先 MOVE 新 callee 再 CALL；把入口调用另存为源码
+    /// local 会让旧对象跨过原本已释放的槽。此处保留所有路径的精确覆盖身份；不沿任意
+    /// CFG 路径重新求解，后继在首个观察前没有 fixed 覆盖时便不签发证书。
+    pub fn unobserved_root_overwrite_frontier_after_last_use(
+        &self,
+        def: DefId,
+        cfg: &Cfg,
+    ) -> Option<Vec<DefId>> {
+        let (block, home, start) = self.root_suffix_after_last_use(def, cfg)?;
+        let end = cfg.blocks[block.index()].instrs.end();
+        match super::root_frontiers::range_end(self, home, start..end) {
+            super::root_frontiers::RangeEnd::Overwrite(def) => return Some(vec![def]),
+            super::root_frontiers::RangeEnd::Rejected => return None,
+            super::root_frontiers::RangeEnd::Forward => {}
+        }
+        let successors = cfg.reachable_successors(block);
+        if successors.is_empty() {
+            return None;
+        }
+        successors
+            .into_iter()
+            .map(|successor| {
+                let range = cfg.blocks[successor.index()].instrs;
+                self.unobserved_root_overwrite_in_range(home, range.start.index()..range.end())
+            })
+            .collect()
+    }
+
+    pub(super) fn root_suffix_after_last_use(
+        &self,
+        def: DefId,
+        cfg: &Cfg,
+    ) -> Option<(BlockRef, Reg, usize)> {
         let block = self.def_block(def);
         let producer = self.def_instr(def).index();
         let home = self.def_reg(def);
@@ -386,17 +425,15 @@ impl DataflowFacts {
             return None;
         }
         let last_use = uses.iter().map(|use_| use_.instr.index()).max()?;
-        let start = last_use + 1;
-        let overwrite =
-            self.first_must_write_in_range(home, start..cfg.blocks[block.index()].instrs.end())?;
-        // 覆写本条指令也可能先观察旧 root；无观察的 open 覆写仍须具有精确 fixed Def。
-        if self
-            .root_intervals
-            .has_observation(start..overwrite.index() + 1)
-        {
-            return None;
+        Some((block, home, last_use + 1))
+    }
+
+    fn unobserved_root_overwrite_in_range(&self, home: Reg, range: Range<usize>) -> Option<DefId> {
+        match super::root_frontiers::range_end(self, home, range) {
+            super::root_frontiers::RangeEnd::Overwrite(def) => Some(def),
+            super::root_frontiers::RangeEnd::Forward
+            | super::root_frontiers::RangeEnd::Rejected => None,
         }
-        self.instr_def_for_reg(overwrite, home)
     }
 
     pub fn instr_def_for_reg(&self, instr: InstrRef, reg: Reg) -> Option<DefId> {

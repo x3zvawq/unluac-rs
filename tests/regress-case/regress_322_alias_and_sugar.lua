@@ -1,14 +1,11 @@
--- regress_322_alias_and_sugar: stripped alias/field sugar 与 call-result PhysicalRoot 边界
+-- regress_322_alias_and_sugar: 字段声明风格与已证明的原调用帧树化。
 -- unluac: expect-contains [[return p1_0.first .. " " .. p1_0.last]]
 -- unluac: expect-not-contains [[p1_0["]]
--- Assignment-to-method syntax is not recoverable from stripped bytecode without explicit provenance.
--- unluac: expect-contains [[add = function]]
--- unluac: expect-contains [[value_text = function]]
--- unluac: expect-not-contains [[function r2_0:add]]
--- unluac: expect-not-contains [[function r2_0:value_text]]
--- unluac: expect-order [[local r0_5 = print]] [[r0_6 = r0_7.value_text]]
--- unluac: expect-not-contains [[r0_7:value_text()]]
--- unluac: expect-contains [[r0_5(r0_4, r0_6(r0_7))]]
+-- Method keys only suggest style; parameter identity and lexical scope separately allow self.
+-- unluac: expect-contains [[function r2_0:add(p3_1)]]
+-- unluac: expect-contains [[function r2_0:value_text()]]
+-- unluac: expect-not-contains [[local r0_5 = print]]
+-- unluac: expect-contains [[print(r0_4, r0_3:add(2):add(3):value_text())]]
 
 local function display_name(user)
     local first = user["first"]

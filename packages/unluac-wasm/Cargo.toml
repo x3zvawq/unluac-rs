@@ -15,6 +15,3 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde-wasm-bindgen = "0.6.5"
 unluac = { path = "../..", default-features = false }
 wasm-bindgen = "0.2.115"
-
-[dev-dependencies]
-unluac-test-support = { path = "../unluac-test-support" }

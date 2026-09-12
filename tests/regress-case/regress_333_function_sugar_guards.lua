@@ -1,9 +1,8 @@
 -- Function-sugar guards must preserve nested global lookup semantics and source identities.
--- unluac: expect-contains [[plain = function(value)]]
--- unluac: expect-contains [[method = function]]
--- unluac: expect-contains [[after = function]]
--- unluac: expect-not-contains [[function prefix_owner:method()]]
--- Original preallocation may require plain fields to remain separate assignments.
+-- unluac: expect-contains [[function prefix_owner.plain(value)]]
+-- unluac: expect-contains [[function prefix_owner:method()]]
+-- unluac: expect-contains [[function nonterminal_owner.after(value)]]
+-- Declarations preserve separate field writes and the original explicit parameter identities.
 
 self = "global-self"
 

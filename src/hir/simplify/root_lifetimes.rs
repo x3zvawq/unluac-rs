@@ -1,7 +1,7 @@
 //! 这个文件识别普通 HIR 值活跃性看不到的物理槽 root 生命周期。
 //!
 //! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨后续观察点的
-//! table/global lookup result，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
+//! table/global lookup 与动态运算结果，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
 //! VM GC root。ordinary call 的参数槽由前层标记交接给 callee，只有当前唯一 producer 与
 //! call 参数端点仍匹配时才退休 call/lookup/allocation 的对应 home，不能把 callee 可覆盖的槽
 //! 物化为额外 caller local。例如 `object = make(); f(object)` 的参数副本结束于 f，原槽
@@ -46,7 +46,7 @@ mod return_lookup;
 use allocation_homes::{ActiveAllocationHome, AllocationHomes, AllocationSite};
 use call_values::CallValues;
 pub(super) use events::{RootEventBlock, RootEventIndex, RootEventStmt};
-use lookup_values::LookupValues;
+use lookup_values::ScalarValues;
 
 use super::object_flow::RootAnalysisContext;
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
@@ -87,20 +87,22 @@ struct PendingCopyRootCallMove {
 struct CallValueId(usize);
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-struct LookupValueId(usize);
+struct ScalarValueId(usize);
 
-struct ActiveLookupGcHome {
-    value_id: LookupValueId,
+struct ActiveScalarGcHome {
+    value_id: ScalarValueId,
     root_index: usize,
     aliases: BTreeSet<TempId>,
     eligible: bool,
     crossed_observation: bool,
-    /// 该 home 由原始 lookup 写入；跨 home 的机械 copy 不是 return 后缀要保留的独立 owner。
-    direct_lookup_home: bool,
+    /// 该 home 由原始表达式结果写入；跨 home 的机械 copy 不是 return 后缀要保留的独立 owner。
+    direct_result_home: bool,
     /// low CFG 已证明该原始 home 在观察事件后仍活到 frame end。
     scope_end_copy_root: bool,
     /// 所有动态路径都到 frame end，不需要同步提交更早的 overwrite endpoint。
     pure_scope_end_copy_root: bool,
+    /// low CFG 已证明观察期间保活并以精确 overwrite 结束；只用于同-home 覆盖配对。
+    has_overwrite_proof: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -165,7 +167,7 @@ pub(super) struct MethodReceiverRootHandoff {
 }
 
 #[derive(Default)]
-pub(super) struct LookupGcRootLifetimeIndices {
+pub(super) struct ScalarGcRootLifetimeIndices {
     roots: BTreeSet<usize>,
     roots_by_overwrite: BTreeMap<usize, Vec<PhysicalRootOwner>>,
     handoff_roots: BTreeSet<TempId>,
@@ -505,7 +507,7 @@ impl CallRootLifetimeIndices {
     }
 }
 
-impl LookupGcRootLifetimeIndices {
+impl ScalarGcRootLifetimeIndices {
     pub(super) fn closed_roots_before(
         &self,
         end: usize,
@@ -1061,8 +1063,17 @@ pub(super) fn collect_call_root_lifetimes(
                         &mut lifetimes,
                     );
                 }
+                // CALL 后的透明 MOVE 也会结束 allocation 的旧 home；不能只移除索引，
+                // 否则 locals 会新建返回值 binding，留下跨后续 GC 的旧分配根。
+                terminate_allocation_home(
+                    &mut active_allocations,
+                    &mut lifetimes,
+                    uses,
+                    index,
+                    *write_home,
+                    overwrite_eligible,
+                );
             }
-            active_allocations.remove_homes(&extra_write_homes);
         }
 
         // Copying the active value back into its own home leaves the same GC root in place.
@@ -1520,7 +1531,9 @@ fn materialize_generic_for_dispatch_root_releases_in_stmt(
     }
 }
 
-/// 识别跨后续用户代码/GC 事件，或 return 表达式内部后续事件的 lookup 物理 root。
+/// 识别跨后续用户代码/GC 事件，或 return 表达式内部后续事件的标量结果物理 root。
+/// 动态一元/二元运算可经元方法返回对象，与 lookup 共用 home、别名与观察窗口。
+/// 例如 `a = x * 2; b = a + 1; if b > 10 then ... end` 的比较元方法仍可观察 a。
 ///
 /// Call 的观察、allocation owner 与相邻 overwrite 合同保持在既有 collector 中；这里不把
 /// 普通 lookup 一概提升为 source local。GlobalRef 只在 low CFG 已经证明所有路径都活到 scope
@@ -1529,27 +1542,28 @@ fn materialize_generic_for_dispatch_root_releases_in_stmt(
 /// 用户事件，或在 return 子表达式中先被消费、随后又跨过用户事件的 lookup，由当前 HIR
 /// block 的词法 local 保活到 block end。block 外的 successor 不属于该 local 的可见区间，
 /// 因此无需猜测跨块 home 复用。
-pub(super) fn collect_lookup_gc_root_lifetimes(
+pub(super) fn collect_scalar_gc_root_lifetimes(
     snapshot: &RootLifetimeFacts<'_>,
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
     mut temp_is_eligible: impl FnMut(TempId) -> bool,
-) -> LookupGcRootLifetimeIndices {
+) -> ScalarGcRootLifetimeIndices {
     let stmts = snapshot.stmts;
     let uses = &snapshot.uses;
     if uses.gc_fence_indices.is_empty()
+        && uses.events.block().observation_indices().is_empty()
         && !stmts.iter().any(|stmt| matches!(stmt, HirStmt::Return(_)))
     {
-        return LookupGcRootLifetimeIndices::default();
+        return ScalarGcRootLifetimeIndices::default();
     }
     let definitions = stmts
         .iter()
         .filter_map(HirStmt::scalar_temp_assignment)
         .collect::<BTreeMap<_, _>>();
     let reference_captured_temps = super::mention::stmts_reference_captured_bindings(stmts).temps;
-    let mut active = BTreeMap::<HomeSlotKey, ActiveLookupGcHome>::new();
-    let mut values = LookupValues::new(uses);
-    let mut lifetimes = LookupGcRootLifetimeIndices::default();
+    let mut active = BTreeMap::<HomeSlotKey, ActiveScalarGcHome>::new();
+    let mut values = ScalarValues::new(uses);
+    let mut lifetimes = ScalarGcRootLifetimeIndices::default();
 
     for (index, stmt) in stmts.iter().enumerate() {
         values.advance(index);
@@ -1695,6 +1709,11 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                 );
             }
             if writes.has_boundary() || writes.has_unknown_home() {
+                // 清空嵌套控制流的 home 状态前消费观察；只接受 low CFG 的全路径保活证明。
+                // 仅在失效时访问这些 home，不在每个普通 call 上重扫全部活动根。
+                for root in active.values() {
+                    preserve_observed_scope_end_root(root, &values, index + 1, &mut lifetimes);
+                }
                 active.clear();
                 values.clear();
             } else {
@@ -1703,6 +1722,7 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
                     .filter(|home| !proven_homes.contains(home))
                 {
                     if let Some(root) = active.remove(home) {
+                        preserve_observed_scope_end_root(&root, &values, index + 1, &mut lifetimes);
                         for alias in root.aliases {
                             values.remove(&alias, index);
                         }
@@ -1719,6 +1739,11 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
         let eligible = temp_is_eligible(temp);
         let incoming_value = match value {
             HirExpr::TableAccess(_) => Some(values.new_value(index, None)),
+            HirExpr::Unary(_) | HirExpr::Binary(_) if !safety.result_is_gc_inert(value) => {
+                // 元方法可返回任意对象；独立结果槽在最后一次读取后仍可能是 GC root。
+                // 与 lookup 共用 identity/home 生命周期，不能把算术外形当作数值证明。
+                Some(values.new_value(index, None))
+            }
             HirExpr::GlobalRef(_) if facts.is_pure_scope_end_copy_root_temp(temp) => {
                 Some(values.new_value(index, Some(home)))
             }
@@ -1765,18 +1790,25 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
             values.insert(temp, value_id, index);
             active.insert(
                 home,
-                ActiveLookupGcHome {
+                ActiveScalarGcHome {
                     value_id,
                     root_index: index,
                     aliases: BTreeSet::from([temp]),
-                    eligible,
+                    // 已有前置读写的 temp 由现存状态/循环 owner 管理，不能在此新建词法根。
+                    eligible: eligible
+                        && !uses.events.block().has_touch_before(temp, index)
+                        && !uses.has_read_at(temp, index),
                     crossed_observation: false,
-                    direct_lookup_home: matches!(
+                    direct_result_home: matches!(
                         value,
-                        HirExpr::TableAccess(_) | HirExpr::GlobalRef(_)
+                        HirExpr::TableAccess(_)
+                            | HirExpr::GlobalRef(_)
+                            | HirExpr::Unary(_)
+                            | HirExpr::Binary(_)
                     ),
                     scope_end_copy_root: facts.is_scope_end_copy_root_temp(temp),
                     pure_scope_end_copy_root: facts.is_pure_scope_end_copy_root_temp(temp),
+                    has_overwrite_proof: facts.copy_root_overwrites(temp).is_some(),
                 },
             );
         }
@@ -1796,12 +1828,12 @@ pub(super) fn collect_lookup_gc_root_lifetimes(
 fn nil_guarded_global_lookup_handoff(
     index: usize,
     stmt: &HirStmt,
-    active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
-    values: &LookupValues<'_>,
+    active: &BTreeMap<HomeSlotKey, ActiveScalarGcHome>,
+    values: &ScalarValues<'_>,
     reference_captured_temps: &BTreeSet<TempId>,
     uses: &TempUseEvents<'_>,
     facts: &ProtoPromotionFacts,
-) -> Option<(LookupValueId, TempId)> {
+) -> Option<(ScalarValueId, TempId)> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
     };
@@ -1826,7 +1858,7 @@ fn nil_guarded_global_lookup_handoff(
     let root_home = values.global_home(value_id)?;
     let root = active.get(&root_home)?;
     // copy 沿用 identity，却不能重新建立已覆盖的直接 lookup 事务。
-    if root.value_id != value_id || !root.direct_lookup_home || !root.pure_scope_end_copy_root {
+    if root.value_id != value_id || !root.direct_result_home || !root.pure_scope_end_copy_root {
         return None;
     }
 
@@ -1862,19 +1894,19 @@ fn nil_compared_temp(lhs: &HirExpr, rhs: &HirExpr) -> Option<TempId> {
 }
 
 fn record_lookup_root_overwrite(
-    root: ActiveLookupGcHome,
+    root: ActiveScalarGcHome,
     index: usize,
     home: HomeSlotKey,
     overwrite_is_eligible: bool,
     uses: &TempUseEvents<'_>,
-    values: &LookupValues<'_>,
-    lifetimes: &mut LookupGcRootLifetimeIndices,
+    values: &ScalarValues<'_>,
+    lifetimes: &mut ScalarGcRootLifetimeIndices,
 ) {
     if values.global_home(root.value_id).is_none()
         // 已跨语句观察的 lookup 即使仍有活读，物化后也必须在后续 GC 前精确释放。
         // overwrite 自身的求值不属于此前区间；相邻 lookup/copy 可由同一表达式临时槽接管。
         && (root.crossed_observation
-            || values.observed(&root, index + 1)
+            || values.observed(&root, index + 1, root.has_overwrite_proof)
             || (uses.has_gc_fence_after(index)
                 && values.crossed_observer_before(root.root_index, index)))
         && root.eligible
@@ -1896,11 +1928,22 @@ fn record_lookup_root_overwrite(
     }
 }
 
-fn preserve_lookup_roots_to_scope_end(
-    active: &BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
-    values: &LookupValues<'_>,
+fn preserve_observed_scope_end_root(
+    root: &ActiveScalarGcHome,
+    values: &ScalarValues<'_>,
     end: usize,
-    lifetimes: &mut LookupGcRootLifetimeIndices,
+    lifetimes: &mut ScalarGcRootLifetimeIndices,
+) {
+    if root.eligible && root.pure_scope_end_copy_root && values.observed(root, end, false) {
+        lifetimes.roots.insert(root.root_index);
+    }
+}
+
+fn preserve_lookup_roots_to_scope_end(
+    active: &BTreeMap<HomeSlotKey, ActiveScalarGcHome>,
+    values: &ScalarValues<'_>,
+    end: usize,
+    lifetimes: &mut ScalarGcRootLifetimeIndices,
 ) {
     // collector 按 HirBlock 独立运行，locals pass 也把 producer 提升为同一 block 内的词法
     // local。active 说明本 block 内没有已证明的同-home overwrite；一旦离开 block，源码
@@ -1911,7 +1954,7 @@ fn preserve_lookup_roots_to_scope_end(
             .values()
             .filter(|root| {
                 root.eligible
-                    && (root.crossed_observation || values.observed(root, end))
+                    && (root.crossed_observation || values.observed(root, end, false))
                     && (values.global_home(root.value_id).is_none()
                         || root.pure_scope_end_copy_root)
             })
@@ -1928,8 +1971,8 @@ fn preserve_lookup_roots_to_scope_end(
 fn observe_lookup_return_post_use_roots(
     values: &crate::hir::common::HirValuePack,
     definitions: &BTreeMap<TempId, &HirExpr>,
-    value_by_temp: &BTreeMap<TempId, LookupValueId>,
-    active: &mut BTreeMap<HomeSlotKey, ActiveLookupGcHome>,
+    value_by_temp: &BTreeMap<TempId, ScalarValueId>,
+    active: &mut BTreeMap<HomeSlotKey, ActiveScalarGcHome>,
     safety: HirExprSafety,
 ) {
     if active.is_empty() {
@@ -1942,7 +1985,7 @@ fn observe_lookup_return_post_use_roots(
     };
 
     for root in active.values_mut() {
-        if root.direct_lookup_home
+        if root.direct_result_home
             && root.scope_end_copy_root
             && needs_independent_root.contains(&root.value_id)
         {
@@ -2269,6 +2312,24 @@ struct ScopeEndRootCollector<'a> {
     facts: &'a ProtoPromotionFacts,
 }
 
+impl ScopeEndRootCollector<'_> {
+    fn control_test(&mut self, expr: &HirExpr) {
+        let temp = match expr {
+            HirExpr::TempRef(temp) => Some(*temp),
+            HirExpr::Unary(unary) => match &unary.expr {
+                HirExpr::TempRef(temp) => Some(*temp),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(temp) = temp
+            && self.facts.is_scope_end_copy_root_temp(temp)
+        {
+            self.roots.insert(temp);
+        }
+    }
+}
+
 impl HirVisitor<'_> for ScopeEndRootCollector<'_> {
     fn visit_stmt(&mut self, stmt: &HirStmt) {
         if let HirStmt::GenericFor(for_stmt) = stmt {
@@ -2283,18 +2344,22 @@ impl HirVisitor<'_> for ScopeEndRootCollector<'_> {
         let HirStmt::If(if_stmt) = stmt else {
             return;
         };
-        let temp = match &if_stmt.cond {
-            HirExpr::TempRef(temp) => Some(*temp),
-            HirExpr::Unary(unary) => match &unary.expr {
-                HirExpr::TempRef(temp) => Some(*temp),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(temp) = temp
-            && self.facts.is_scope_end_copy_root_temp(temp)
-        {
-            self.roots.insert(temp);
+        self.control_test(&if_stmt.cond);
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        match expr {
+            // 同一原始 test 不因 If 变成短路表达式就失去低槽 root；例如 regress_562
+            // 的 saved 在下一次高槽调用期间仍存活，源 TEST 自身没有结束这个 home。
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                self.control_test(&logical.lhs);
+            }
+            HirExpr::Decision(decision) => {
+                for node in &decision.nodes {
+                    self.control_test(&node.test);
+                }
+            }
+            _ => {}
         }
     }
 }

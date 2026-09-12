@@ -8,6 +8,7 @@
 mod boolean_shells;
 mod branch_control_folding;
 mod branch_value_folding;
+mod call_frames;
 mod carried_locals;
 mod close_scopes;
 mod dead_labels;
@@ -403,6 +404,7 @@ pub(super) fn simplify_hir(
         for proto in &mut module.protos {
             if let Some(facts) = promotion_facts.get(proto.id.index()) {
                 method_rewrite_transactions::finalize_method_rewrite_transactions(proto, facts);
+                call_frames::restore_terminal_call_frame(proto, facts, dialect);
             }
         }
     });

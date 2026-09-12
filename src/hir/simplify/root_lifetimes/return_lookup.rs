@@ -1,4 +1,4 @@
-//! 按当前返回值的定义图计算 lookup 消费后跨观察点所需的根。
+//! 按当前返回值的定义图计算 lookup / 动态运算结果消费后跨观察点所需的根。
 //!
 //! 值身份来自同一 collector 的 lookup 映射，定义与表达式顺序来自不可变 HIR 快照；
 //! 本层不重新解释 VM home，也不决定哪个 binding 可以删除。例如 `a=lookup; b=a+a;
@@ -13,14 +13,14 @@ use crate::hir::common::{HirBinaryOpKind, HirExpr, HirValuePack, TempId};
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::visit::{HirVisitor, visit_expr};
 
-use super::LookupValueId;
+use super::ScalarValueId;
 
 pub(super) fn observed_return_lookup_roots(
     values: &HirValuePack,
     definitions: &BTreeMap<TempId, &HirExpr>,
-    lookup_values: &BTreeMap<TempId, LookupValueId>,
+    lookup_values: &BTreeMap<TempId, ScalarValueId>,
     safety: HirExprSafety,
-) -> Option<BTreeSet<LookupValueId>> {
+) -> Option<BTreeSet<ScalarValueId>> {
     let mut dependencies = ReturnDependencies {
         lookup_values,
         remaining: BTreeMap::new(),
@@ -56,7 +56,7 @@ pub(super) fn observed_return_lookup_roots(
 }
 
 struct ReturnDependencies<'a> {
-    lookup_values: &'a BTreeMap<TempId, LookupValueId>,
+    lookup_values: &'a BTreeMap<TempId, ScalarValueId>,
     remaining: BTreeMap<TempId, usize>,
     pending: Vec<TempId>,
     unsupported: bool,
@@ -85,7 +85,7 @@ impl HirVisitor<'_> for ReturnDependencies<'_> {
 
 struct ReturnLookupContext<'a> {
     definitions: &'a BTreeMap<TempId, &'a HirExpr>,
-    lookup_values: &'a BTreeMap<TempId, LookupValueId>,
+    lookup_values: &'a BTreeMap<TempId, ScalarValueId>,
     safety: HirExprSafety,
     remaining: BTreeMap<TempId, usize>,
     cached: BTreeMap<TempId, ReturnLookupFlow>,
@@ -212,14 +212,14 @@ impl ReturnLookupContext<'_> {
 
 #[derive(Clone, Default)]
 struct ReturnLookupFlow {
-    handed_roots: BTreeSet<LookupValueId>,
-    pending_releases: BTreeSet<LookupValueId>,
-    needs_independent_root: BTreeSet<LookupValueId>,
+    handed_roots: BTreeSet<ScalarValueId>,
+    pending_releases: BTreeSet<ScalarValueId>,
+    needs_independent_root: BTreeSet<ScalarValueId>,
     has_observation: bool,
 }
 
 impl ReturnLookupFlow {
-    fn lookup(value: LookupValueId) -> Self {
+    fn lookup(value: ScalarValueId) -> Self {
         Self {
             handed_roots: BTreeSet::from([value]),
             ..Self::default()

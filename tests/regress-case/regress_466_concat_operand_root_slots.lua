@@ -55,4 +55,21 @@ assert(followed_by_call(user, function()
     assert(weak.last ~= nil, "concat operand root leaked into a later expression proof")
     return 5
 end) == 12)
+-- Alias compression must retain lookup order and the right-to-left concat metamethod order.
+local events = {}
+local left = setmetatable({}, {__concat = function(_, tail)
+    events[#events + 1] = "concat-first"
+    return "Ada" .. tail
+end})
+local right = setmetatable({}, {__concat = function(prefix, _)
+    events[#events + 1] = "concat-last"
+    return prefix .. "Lovelace"
+end})
+local indexed = setmetatable({}, {__index = function(_, key)
+    events[#events + 1] = key
+    if key == "first" then return left end
+    return right
+end})
+assert(rightmost(indexed) == "Ada Lovelace")
+assert(table.concat(events, ",") == "first,last,concat-last,concat-first")
 print("regress_466_concat_operand_root_slots", "OK")
