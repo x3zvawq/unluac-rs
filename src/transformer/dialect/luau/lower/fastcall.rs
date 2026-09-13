@@ -21,21 +21,22 @@ impl ProtoLowerer<'_> {
                 None
             }
             LuauOpcode::FastCall => {
-                let (_, skip) = expect_ac(raw_pc, opcode, operands)?;
-                Some((skip, PendingFastCall::All))
+                let (builtin, skip) = expect_ac(raw_pc, opcode, operands)?;
+                Some((skip, PendingFastCall::All { builtin }))
             }
             LuauOpcode::FastCall1 => {
-                let (_, source, skip) = expect_abc(raw_pc, opcode, operands)?;
+                let (builtin, source, skip) = expect_abc(raw_pc, opcode, operands)?;
                 Some((
                     skip,
                     PendingFastCall::Fixed {
+                        builtin,
                         sources: [Some(reg_from_u8(source)), None, None],
                         len: 1,
                     },
                 ))
             }
             LuauOpcode::FastCall2 | LuauOpcode::FastCall2K => {
-                let (_, source, skip) = expect_abc(raw_pc, opcode, operands)?;
+                let (builtin, source, skip) = expect_abc(raw_pc, opcode, operands)?;
                 let second = if opcode == LuauOpcode::FastCall2 {
                     Some(reg_from_u8(aux_reg(raw_pc, opcode, extra)?))
                 } else {
@@ -45,13 +46,14 @@ impl ProtoLowerer<'_> {
                 Some((
                     skip,
                     PendingFastCall::Fixed {
+                        builtin,
                         sources: [Some(reg_from_u8(source)), second, None],
                         len: 2,
                     },
                 ))
             }
             LuauOpcode::FastCall3 => {
-                let (_, source, skip) = expect_abc(raw_pc, opcode, operands)?;
+                let (builtin, source, skip) = expect_abc(raw_pc, opcode, operands)?;
                 let aux = required_aux(raw_pc, opcode, extra)?;
                 if aux >> 16 != 0 {
                     return Err(TransformError::UnexpectedOperands {
@@ -63,6 +65,7 @@ impl ProtoLowerer<'_> {
                 Some((
                     skip,
                     PendingFastCall::Fixed {
+                        builtin,
                         sources: [
                             Some(reg_from_u8(source)),
                             Some(reg_from_u8(aux as u8)),

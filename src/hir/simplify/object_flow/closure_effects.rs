@@ -9,51 +9,17 @@
 use crate::hir::HirBinding;
 
 use super::super::lexical_cfg::{
-    FlowRefinement, HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
-    HirGenericForFlow,
+    FlowRefinement, HirFlowNodeKind, HirFlowProtocolId, HirForBindings, HirGenericForFlow,
 };
 use super::{
-    ClosureCaptures, EffectClosure, EffectValue, ProtoEffects, binding_from_lvalue,
-    closure_captures_in_block, extend_map_sets, union_set,
+    ClosureCaptures, EffectClosure, EffectValue, ProtoEffects, ProtoFlowFacts, extend_map_sets,
+    union_set,
 };
 use crate::hir::common::{
-    HirCapture, HirCaptureMode, HirExpr, HirLValue, HirModule, HirProto, HirProtoRef, HirStmt,
-    HirTableField, HirValuePack, UpvalueId,
+    HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProto, HirProtoRef, HirStmt, HirTableField,
+    HirValuePack, UpvalueId,
 };
-use crate::hir::expr_safety::HirExprSafety;
 use std::collections::{BTreeMap, BTreeSet};
-
-pub(in crate::hir::simplify) fn collect_proto_effects(
-    module: &HirModule,
-    safety: HirExprSafety,
-) -> Vec<ProtoEffects> {
-    let mut effects = module
-        .protos
-        .iter()
-        .map(|proto| ProtoEffects {
-            writes: proto.mutable_upvalues.clone(),
-            ..ProtoEffects::default()
-        })
-        .collect::<Vec<_>>();
-    let mut required = vec![false; module.protos.len()];
-    // 只有 lexical child 的摘要会被 capture 投影消费；入口/独立根的完整 CFG
-    // 不是任何 closure 的 callee 事实，不应为大型无 child 函数反复求一份未使用摘要。
-    for child in module.protos.iter().flat_map(|proto| &proto.children) {
-        required[child.index()] = true;
-    }
-    // lowering 按父先子后分配 proto；合成 factory 的预留和失败恢复的单调 remap
-    // 也保持该合同。逆序即可先得到全部 child 摘要，不再重建词法图的遍历顺序。
-    for index in (0..module.protos.len()).rev() {
-        let proto = &module.protos[index];
-        // 无 upvalue 的叶函数没有可投影的 capture，也不可能返回带 capture 的 child。
-        if !required[index] || (proto.upvalues.is_empty() && proto.children.is_empty()) {
-            continue;
-        }
-        let captures = closure_captures_in_block(&proto.body);
-        effects[index] = collect_effect_state(proto, &captures, &effects, safety);
-    }
-    effects
-}
 
 #[derive(Clone, Default, Eq, PartialEq)]
 struct EffectState {
@@ -230,6 +196,7 @@ fn effect_expr_origins(
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => {}
     }
@@ -571,6 +538,7 @@ fn effect_note_expr_escapes(
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
         | HirExpr::Closure(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => {}
     }
@@ -763,7 +731,7 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
                 match target {
                     HirLValue::Param(_) | HirLValue::Temp(_) | HirLValue::Local(_) => {
                         state.write_binding(
-                            binding_from_lvalue(target).expect("direct binding target"),
+                            HirBinding::from_lvalue(target).expect("direct binding target"),
                             origins,
                             closures,
                             call_targets,
@@ -843,18 +811,24 @@ fn update_effect_for_stmt(stmt: &HirStmt, state: &mut EffectState, context: &Eff
     }
 }
 
-fn collect_effect_state(
-    proto: &HirProto,
-    captures: &ClosureCaptures<'_>,
+pub(super) fn collect_effect_state(
+    flow: &ProtoFlowFacts<'_>,
     effects: &[ProtoEffects],
-    safety: HirExprSafety,
 ) -> ProtoEffects {
+    let ProtoFlowFacts {
+        proto,
+        captures,
+        graph,
+        live_out,
+        reference_cells,
+        ..
+    } = flow;
     let context = EffectContext { captures, effects };
     // 复用 HIR 共享 topology：若通过重复扫描结构树求收敛，没有回边的后续赋值
     // 也会倒灌到先前调用。for initializer 与 loop dispatch 必须是不同节点，避免每次
     // 回边伪造对 initializer 的重复观测。
-    let graph = HirFlowGraph::for_block(&proto.body, safety)
-        .expect("HIR labels must be unique before effect finalization");
+    // may-effect 的已知 closure 仍能间接读取当前 reference cell。直接 liveness 只裁
+    // 普通 binding；不能删除这种环境后把后续 callback 投影成无效果。
     // 输出只需要可观察效果；中间 binding/loop 状态不能汇入函数摘要。
     let mut summary = ProtoEffects {
         writes: proto.mutable_upvalues.clone(),
@@ -863,7 +837,7 @@ fn collect_effect_state(
     graph.solve_forward(
         EffectState::new(proto),
         EffectState::join,
-        |_, kind, output| {
+        |id, kind, output| {
             match kind {
                 HirFlowNodeKind::Exit
                 | HirFlowNodeKind::FunctionExit
@@ -887,6 +861,14 @@ fn collect_effect_state(
             summary.escapes.extend(&output.escapes);
             summary.returns.extend(output.returns.iter().cloned());
             summary.calls.extend(&output.calls);
+            let retained = |binding: &HirBinding| {
+                live_out[id.index()].contains(binding) || reference_cells.contains(binding)
+            };
+            output.origins.retain(|binding, _| retained(binding));
+            output.closures.retain(|binding, _| retained(binding));
+            output.call_targets.retain(|binding, _| retained(binding));
+            // returns/escapes/calls 与 generic_for 快照承载已累计或独立持有的效果，
+            // 不属于死 binding；这些集合不参与上述投影。
         },
         |_expr, _truthy, _state| FlowRefinement::Unchanged,
     );

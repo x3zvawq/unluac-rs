@@ -99,7 +99,10 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
             continue;
         };
         if bindings.iter().any(|binding| {
-            binding.origin.is_debug_hinted() || !binding.rewrite_authority.may_move_scope_start()
+            binding.origin.is_debug_hinted()
+                || !binding
+                    .rewrite_authority
+                    .may_merge_adjacent_empty_declarations()
         }) {
             // 候选拒绝[SemanticBarrier:DebugScope]：`local debug_name; local t` 合并后，
             // 首个 binding 要到第二条声明之后才进入作用域；原第二行的 line hook 本可
@@ -113,7 +116,9 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
         for next_bindings in old_stmts.iter().map_while(empty_local_decl_bindings) {
             if next_bindings.iter().any(|binding| {
                 binding.origin.is_debug_hinted()
-                    || !binding.rewrite_authority.may_move_scope_start()
+                    || !binding
+                        .rewrite_authority
+                        .may_merge_adjacent_empty_declarations()
             }) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：line hook 能在相邻声明间观察
                 // DebugHinted local 的边界，不能把后续声明提前到同一 local list。

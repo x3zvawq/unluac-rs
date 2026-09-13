@@ -32,6 +32,7 @@ pub(super) fn coalesce_disjoint_temps(
         .iter()
         .chain(&identity.to_be_closed)
         .chain(&identity.preserved)
+        .chain(&identity.physical_roots)
     {
         let homes = match *binding {
             CarryBinding::Param(param) => facts.complete_param_home_slots(param),
@@ -40,17 +41,11 @@ pub(super) fn coalesce_disjoint_temps(
         };
         blocked.extend(homes.iter().copied());
     }
-    for &local in identity
-        .debug
-        .iter()
-        .chain(&identity.for_bindings)
-        .chain(&identity.physical_roots)
-    {
+    for &local in identity.debug.iter().chain(&identity.for_bindings) {
         blocked.extend(facts.complete_local_home_slots(local).iter().copied());
     }
     for temp in (0..proto.temp_count).map(TempId) {
-        if proto.physical_root_temps.contains(&temp)
-            || facts.is_scope_end_copy_root_temp(temp)
+        if facts.is_scope_end_copy_root_temp(temp)
             || facts.is_copy_root_endpoint(temp)
             || proto
                 .temp_debug_locals

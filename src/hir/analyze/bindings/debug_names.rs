@@ -10,14 +10,7 @@ pub(super) fn target_for_slot(
     epochs: &SlotEpochFacts,
     captured_slots: &CapturedSlotTargets,
 ) -> Option<LocalId> {
-    captured_slots
-        .slot_targets
-        .get(&CapturedSlotKey::new(
-            reg.index(),
-            epochs.epoch_at(reg, InstrRef(instr_index)),
-        ))
-        .filter(|binding| instr_index >= binding.start_instr)
-        .map(|binding| binding.target)
+    captured_slots.target_at(reg, InstrRef(instr_index), epochs)
 }
 
 pub(super) fn debug_local_name_for_reg_at_instr(

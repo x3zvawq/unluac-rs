@@ -1,18 +1,17 @@
--- regress_387_stable_copy_eventless_snapshot: stable-copy may recover eventless truthiness
--- snapshots, but must keep declaration-time snapshots and metamethod evaluation counts
--- unluac: expect-contains [[return not p1_0, not p1_0]]
--- unluac: expect-not-contains [[local r1_0 = not p1_0]]
+-- 稳定 truthiness 仍保留调用前缀；完整 RETURN 事务只消除结果区副本，保持快照与元方法次数。
+-- unluac: expect-contains [[return r1_0, r1_0]]
+-- unluac: expect-contains [[local r1_0 = not p1_0]]
 -- unluac: expect-contains [[return p2_0 and p2_1 or p2_2]]
 -- unluac: expect-not-contains [[local r2_0 = p2_0 and]]
 -- unluac: expect-contains [[local r3_0 = not p3_0]]
 -- unluac: expect-contains [[local r5_0 = p5_0 == p5_1]]
--- unluac: expect-contains [[p8_1(not p8_0)]]
--- unluac: expect-not-contains [[local r8_0 = not p8_0]]
+-- unluac: expect-contains [[p8_1(r8_0)]]
+-- unluac: expect-contains [[local r8_0 = not p8_0]]
 -- unluac: expect-contains [[local r9_0 = not p9_0]]
 -- unluac: expect-contains [[p10_1[1] = not p10_0]]
 -- unluac: expect-not-contains [[local r10_0 = not p10_0]]
--- unluac: expect-contains [[p11_1(p11_0)]]
--- unluac: expect-not-contains [[local r11_0 = p11_0]]
+-- unluac: expect-contains [[p11_1(r11_0)]]
+-- unluac: expect-contains [[local r11_0 = p11_0]]
 -- An unchanged parameter is itself the declaration-time truthiness snapshot.
 -- unluac: expect-contains [[until p13_0]]
 -- unluac: expect-not-contains [[r13_0 = p13_0]]

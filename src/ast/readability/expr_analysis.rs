@@ -62,7 +62,9 @@ fn value_facts(expr: &AstExpr) -> LuaValueFacts {
     match expr {
         AstExpr::Nil => LuaValueFacts::NIL,
         AstExpr::Boolean(value) => LuaValueFacts::boolean(*value),
-        AstExpr::Integer(_) | AstExpr::Number(_) => LuaValueFacts::NUMERIC,
+        AstExpr::CaptureInitializer(_) | AstExpr::Integer(_) | AstExpr::Number(_) => {
+            LuaValueFacts::NUMERIC
+        }
         AstExpr::String(_) => LuaValueFacts::STRING,
         // typed 常量节点保留原 proto 的锚点；结果惰性不授权复制 cdata 身份或构造求值。
         AstExpr::Int64(_) | AstExpr::UInt64(_) | AstExpr::Vector(_) | AstExpr::Complex { .. } => {
@@ -124,6 +126,7 @@ pub(super) fn is_context_safe_expr(expr: &AstExpr) -> bool {
 
 fn is_context_safe_node(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -192,6 +195,7 @@ pub(super) fn is_stable_context_expr(
 
 pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::CaptureInitializer(_) => true,
         AstExpr::Var(AstNameRef::Global(_))
         | AstExpr::FieldAccess(_)
         | AstExpr::IndexAccess(_)
@@ -241,6 +245,7 @@ pub(super) fn expr_requires_ordered_snapshot(
 
 pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -304,6 +309,7 @@ pub(super) fn is_lookup_inline_expr(expr: &AstExpr) -> bool {
 
 pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -442,6 +448,7 @@ fn eventless_literal_kind(
     integer_arithmetic_is_defined: bool,
 ) -> Option<EventlessLiteralKind> {
     match expr {
+        AstExpr::CaptureInitializer(_) => None,
         AstExpr::Nil => Some(EventlessLiteralKind::Nil),
         AstExpr::Boolean(_) => Some(EventlessLiteralKind::Boolean),
         AstExpr::Integer(value) => Some(EventlessLiteralKind::Integer(if *value == 0 {
@@ -558,6 +565,7 @@ pub(super) fn is_eventless_primitive_expr_for_target(
         integer_arithmetic_is_defined: bool,
     ) -> bool {
         match expr {
+            AstExpr::CaptureInitializer(_) => false,
             AstExpr::Number(value) => value.is_finite(),
             AstExpr::SingleValue(inner) => {
                 has_stable_literal_materialization(inner, integer_arithmetic_is_defined)
@@ -690,6 +698,7 @@ pub(super) fn is_discard_safe_expr_for_target(expr: &AstExpr, target: AstTargetD
 
 fn is_discard_safe_expr_with_facts(expr: &AstExpr, facts: DiscardSafetyFacts) -> bool {
     match expr {
+        AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -747,6 +756,7 @@ fn is_discard_safe_expr_with_facts(expr: &AstExpr, facts: DiscardSafetyFacts) ->
 
 pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
         | AstExpr::Integer(_)
@@ -790,7 +800,11 @@ pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
 pub(super) fn is_direct_return_inline_expr(expr: &AstExpr) -> bool {
     !matches!(
         expr,
-        AstExpr::Call(_) | AstExpr::MethodCall(_) | AstExpr::VarArg | AstExpr::Error(_)
+        AstExpr::CaptureInitializer(_)
+            | AstExpr::Call(_)
+            | AstExpr::MethodCall(_)
+            | AstExpr::VarArg
+            | AstExpr::Error(_)
     )
 }
 
@@ -868,6 +882,7 @@ pub(super) fn direct_return_logical_cost(expr: &AstExpr) -> Option<usize> {
 /// 的 binding、顺序、root 与多返回门槛。
 fn is_direct_return_budget_term_safe(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::CaptureInitializer(_) => false,
         AstExpr::Number(value) => value.is_finite(),
         AstExpr::Complex { real, imag } => real.is_finite() && imag.is_finite(),
         AstExpr::Vector(vector) => vector

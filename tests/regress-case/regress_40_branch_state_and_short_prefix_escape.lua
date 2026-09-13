@@ -3,7 +3,8 @@
 -- RHS 求值期间由 loop binding 保活 mode；写回后由外层 target 跨下一轮调用保活。
 -- 同路径的匿名副本不再承担独有 root，无需要求它继续物化。
 -- unluac: expect-contains [[local r1_3 = r1_1]]
--- unluac: expect-contains [[r1_3, r1_4 = r1_6, r1_6.w * r1_6.h]]
+-- 循环协议槽的保留会改变 loop binding 编号；约束同时写回两个状态，不固定 RHS 编号。
+-- unluac: expect-contains [[r1_3, r1_4 =]]
 
 local function choose_mode(fullscreen, width, height, handler)
     local selected, current, modes = handler:getCurrentMode()

@@ -1,5 +1,6 @@
 -- regress_354_adjacent_final_arg_value_arity: a call moved from a local initializer into the final argument remains single-valued
--- unluac: expect-contains [[((p]]
+-- 保留原 seed local 同样正确；强制 ((pair_fn())) 会要求搬动原 CALL 帧。
+-- 若以后证明可内联，下方 argc 仍验证末参数必须只取一个结果。
 
 local function pair()
     return 7, 99

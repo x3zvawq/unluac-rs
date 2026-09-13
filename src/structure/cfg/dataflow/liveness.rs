@@ -104,12 +104,12 @@ pub(super) fn solve_liveness(
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct DenseRegSet {
-    bits: Vec<bool>,
+pub(super) struct DenseRegSet {
+    pub(super) bits: Vec<bool>,
 }
 
 impl DenseRegSet {
-    fn new(reg_count: usize) -> Self {
+    pub(super) fn new(reg_count: usize) -> Self {
         Self {
             bits: vec![false; reg_count],
         }
@@ -138,10 +138,13 @@ impl DenseRegSet {
         })
     }
 
-    fn extend_from(&mut self, other: &Self) {
+    pub(super) fn extend_from(&mut self, other: &Self) -> bool {
+        let mut changed = false;
         for (slot, incoming) in self.bits.iter_mut().zip(other.bits.iter()) {
+            changed |= *incoming && !*slot;
             *slot |= *incoming;
         }
+        changed
     }
 
     fn extend_without(&mut self, values: &Self, excluded: &Self) {

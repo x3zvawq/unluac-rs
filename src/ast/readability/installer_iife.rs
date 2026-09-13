@@ -289,6 +289,7 @@ fn expr_looks_like_exported_function_value(
         | AstExpr::Call(_)
         | AstExpr::MethodCall(_)
         | AstExpr::SingleValue(_)
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::TableConstructor(_)
         | AstExpr::Error(_) => false,

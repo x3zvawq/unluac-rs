@@ -50,7 +50,7 @@ impl<F: FnMut(&HirStmt) -> bool> HirVisitor<'_> for HirEvalEffects<F> {
 
     fn visit_expr(&mut self, expr: &HirExpr) {
         self.found |= !matches!(expr, HirExpr::TableAccess(access) if access.metamethod_free)
-            && !self.safety.node_is_discard_safe_without_residual(expr);
+            && self.safety.node_may_observe_gc_roots(expr);
     }
 
     fn visit_lvalue(&mut self, lvalue: &HirLValue) {
@@ -303,6 +303,12 @@ impl HirExprSafety {
         !matches!(expr, HirExpr::Unresolved(_)) && self.node_is_discard_safe(expr)
     }
 
+    /// 源码保留屏障不是 VM 观察事件；它的固定 vararg 读取在原事务内不检查 GC。
+    pub(crate) fn node_may_observe_gc_roots(self, expr: &HirExpr) -> bool {
+        !matches!(expr, HirExpr::CaptureInitializer(_))
+            && !self.node_is_discard_safe_without_residual(expr)
+    }
+
     fn discard_safe(self, expr: &HirExpr, allow_residual: bool) -> bool {
         if !self.node_is_discard_safe(expr)
             || (!allow_residual && matches!(expr, HirExpr::Unresolved(_)))
@@ -325,6 +331,7 @@ impl HirExprSafety {
 
     fn node_is_discard_safe(self, expr: &HirExpr) -> bool {
         match expr {
+            HirExpr::CaptureInitializer(_) => false,
             HirExpr::Nil
             | HirExpr::Boolean(_)
             | HirExpr::Integer(_)
@@ -394,6 +401,7 @@ impl HirExprSafety {
 
     fn is_repeatable_with_context(self, expr: &HirExpr, single_value_vararg: bool) -> bool {
         match expr {
+            HirExpr::CaptureInitializer(_) => false,
             HirExpr::Nil
             | HirExpr::Boolean(_)
             | HirExpr::Integer(_)
@@ -448,6 +456,7 @@ impl HirExprSafety {
     /// 已物化且 Lua 代码无法按名字访问的快照，vararg 则在函数入口固定。
     pub(crate) fn is_effect_invariant_in_single_value_context(self, expr: &HirExpr) -> bool {
         match expr {
+            HirExpr::CaptureInitializer(_) => false,
             HirExpr::Nil
             | HirExpr::Boolean(_)
             | HirExpr::Integer(_)
@@ -497,6 +506,7 @@ impl HirExprSafety {
 
 pub(crate) fn expr_observes_eval_order(expr: &HirExpr) -> bool {
     match expr {
+        HirExpr::CaptureInitializer(_) => true,
         HirExpr::GlobalRef(_) | HirExpr::TableAccess(_) | HirExpr::Call(_) => true,
         HirExpr::Unary(_) | HirExpr::Binary(_) | HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_) => {
             true

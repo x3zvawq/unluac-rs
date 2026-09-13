@@ -76,10 +76,7 @@ fn primitive_key(proto: &LoweredProto, key: AccessKey) -> bool {
 }
 
 fn source_visible(proto: &LoweredProto, reg: Reg, index: usize) -> bool {
-    let pcs = &proto.lowering_map.pc_map()[index];
-    if pcs.is_empty() {
-        return proto.debug_locals.has_source_scope(reg);
-    }
-    pcs.iter()
-        .any(|pc| proto.debug_locals.source_at(reg, *pc).is_some())
+    proto
+        .debug_locals
+        .source_visible_at(reg, &proto.lowering_map.pc_map()[index])
 }

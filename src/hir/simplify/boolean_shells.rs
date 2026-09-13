@@ -25,8 +25,9 @@ use old_values::OldValueFacts;
 use std::collections::BTreeSet;
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirExpr, HirIf, HirLValue, HirLocalDecl, HirLogicalExpr, HirProto,
-    HirStmt, HirUnaryExpr, HirUnaryOpKind, HirValuePack, LocalId,
+    HirAssign, HirBinaryOpKind, HirBlock, HirDebugScope, HirExpr, HirIf, HirLValue, HirLocalDecl,
+    HirLogicalExpr, HirProto, HirSourceSite, HirStmt, HirUnaryExpr, HirUnaryOpKind, HirValuePack,
+    LocalId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -44,6 +45,8 @@ pub(super) fn remove_boolean_materialization_shells_in_proto(
     let facts = BooleanShellFacts {
         temp_debug_hints: &proto.temp_debug_locals,
         local_debug_hints: &proto.local_debug_hints,
+        local_debug_scopes: &proto.local_debug_scopes,
+        debug_scopes: &proto.debug_scopes,
         physical_root_locals: &proto.physical_root_locals,
         promotion_facts,
     };
@@ -66,6 +69,8 @@ impl HirRewritePass for BooleanShellPass<'_> {
 struct BooleanShellFacts<'a> {
     temp_debug_hints: &'a [Option<String>],
     local_debug_hints: &'a [Option<String>],
+    local_debug_scopes: &'a [Option<usize>],
+    debug_scopes: &'a [Option<HirDebugScope>],
     physical_root_locals: &'a BTreeSet<LocalId>,
     promotion_facts: &'a ProtoPromotionFacts,
 }
@@ -206,6 +211,7 @@ fn collapse_live_boolean_materialization_shells_in_block(
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
                 generic_for_initializer_producer: None,
+                generic_for_dispatch_release: None,
                 method_rewrite_transaction: None,
             }));
         }
@@ -226,11 +232,63 @@ fn declaration_can_absorb_boolean_shell(
     facts: &BooleanShellFacts,
 ) -> bool {
     // 候选拒绝[SemanticBarrier:Scope]：regress_342 retain-debug 证明条件中的调用能观察到原声明；合并会把 debug 作用域起点后移。
-    if matches!(facts.local_debug_hints.get(local.index()), Some(Some(_))) {
+    if matches!(facts.local_debug_hints.get(local.index()), Some(Some(_)))
+        && !debug_branch_initializer_matches(local, value, facts)
+    {
         return false;
     }
     // 候选拒绝[SemanticBarrier:Scope]：regress_342 stripped 证明初始化器中的同名引用会改绑到外层 local，而不是读取已经声明的当前 local。
     !expr_mentions_local(value, local)
+}
+
+fn debug_branch_initializer_matches(
+    local: LocalId,
+    value: &HirExpr,
+    facts: &BooleanShellFacts,
+) -> bool {
+    let matched = || {
+        let scope = facts
+            .local_debug_scopes
+            .get(local.index())
+            .copied()
+            .flatten()?;
+        let initializer = facts
+            .debug_scopes
+            .get(scope)
+            .copied()
+            .flatten()?
+            .branch_initializer?;
+        // Phi 的 promoted binding 与原 predicate 必须同时吻合；后续同 local 的另一次
+        // 布尔赋值不能领取这个初始化边界，也不把缺 home 的合流当成原槽声明。
+        let home = facts
+            .promotion_facts
+            .trusted_temp_home_slot(initializer.result)?;
+        (facts
+            .promotion_facts
+            .promoted_local_for_temp(initializer.result)
+            == Some(local)
+            && facts.promotion_facts.trusted_local_home_slot(local) == Some(home)
+            && boolean_predicate_source(value) == Some(initializer.condition))
+        .then_some(())
+    };
+    matched().is_some()
+}
+
+fn boolean_predicate_source(value: &HirExpr) -> Option<HirSourceSite> {
+    match value {
+        HirExpr::Binary(binary)
+            if matches!(
+                binary.op,
+                HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+            ) =>
+        {
+            binary.source_site
+        }
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not && unary.source_site.is_none() => {
+            boolean_predicate_source(&unary.expr)
+        }
+        _ => None,
+    }
 }
 
 fn collapse_live_boolean_materialization_shell(stmt: &mut HirStmt) -> Option<(HirLValue, HirExpr)> {
@@ -259,6 +317,7 @@ fn collapse_live_boolean_materialization_shell(stmt: &mut HirStmt) -> Option<(Hi
         booleanized_truthiness_expr(cond)
     } else {
         HirExpr::Unary(Box::new(HirUnaryExpr {
+            source_site: None,
             op: HirUnaryOpKind::Not,
             expr: cond,
         }))

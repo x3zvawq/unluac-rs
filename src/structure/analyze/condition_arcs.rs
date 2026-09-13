@@ -169,6 +169,7 @@ pub(super) fn synthesize_direct_condition_arc(
 }
 
 pub(super) fn safe_condition_candidate(
+    proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     candidate: &ShortCircuitCandidate,
@@ -181,7 +182,7 @@ pub(super) fn safe_condition_candidate(
         .skip(1)
         .find_map(|(index, node)| {
             (dataflow.block_defs_have_use_outside(cfg, node.header, &candidate.blocks)
-                || block_has_unabsorbed_effects(cfg, dataflow, node.header, workspace))
+                || block_has_unabsorbed_effects(proto, cfg, dataflow, node.header, workspace))
             .then_some(index)
         });
     match cut_index {
@@ -227,6 +228,7 @@ impl ConditionSafetyWorkspace {
 }
 
 pub(super) fn block_has_unabsorbed_effects(
+    proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     block: super::super::BlockRef,
@@ -288,9 +290,25 @@ pub(super) fn block_has_unabsorbed_effects(
     }
 
     (range.start.index()..predicate.index()).any(|index| {
-        dataflow.effect_summaries.get(index).is_none_or(|summary| {
-            summary.has_effect_tags() && !workspace.needs_instr(InstrRef(index))
-        })
+        // 候选拒绝[SemanticBarrier:NamedRootWrite]：和值判定共享原 local 写入边界，
+        // 不能在 value DAG 被拒绝后由 condition DAG 再吸收同一写入（regress_578）。
+        instr_writes_source_binding(proto, dataflow, InstrRef(index))
+            || dataflow.effect_summaries.get(index).is_none_or(|summary| {
+                summary.has_effect_tags() && !workspace.needs_instr(InstrRef(index))
+            })
+    })
+}
+
+pub(super) fn instr_writes_source_binding(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    instr: InstrRef,
+) -> bool {
+    let pcs = &proto.lowering_map.pc_map()[instr.index()];
+    dataflow.instr_defs[instr.index()].iter().any(|def| {
+        proto
+            .debug_locals
+            .source_visible_at(dataflow.def_reg(*def), pcs)
     })
 }
 

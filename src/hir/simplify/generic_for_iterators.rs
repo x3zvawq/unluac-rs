@@ -512,6 +512,7 @@ fn stable_value_locations(
             | HirExpr::LogicalAnd(_)
             | HirExpr::LogicalOr(_)
             | HirExpr::Call(_)
+            | HirExpr::CaptureInitializer(_)
             | HirExpr::VarArg
             | HirExpr::TableConstructor(_)
             | HirExpr::Closure(_) => return Err(LocationFactError::Observable),
@@ -737,6 +738,37 @@ fn producer_matches_iterator_span(
         .all(|(target, value)| {
             matches!((target, value), (HirLValue::Temp(target), HirExpr::TempRef(value)) if target == value)
         })
+}
+
+/// 完整帧 owner 可借用已冻结的单 CALL 初始化 occurrence；不在这里移动 CALL 或释放根。
+/// 多段 value pack 仍由本 pass 的原事务负责，不能把一个局部 span 冒充整个循环头。
+pub(super) fn single_call_initializer<'a>(
+    assign: &'a crate::hir::common::HirAssign,
+    generic_for: &HirGenericFor,
+) -> Option<&'a crate::hir::common::HirCallExpr> {
+    let transaction = generic_for.initializer_transaction.as_ref()?;
+    let [span] = transaction.producers.as_slice() else {
+        return None;
+    };
+    if assign.generic_for_initializer_producer != Some(span.producer)
+        || span.producer.transaction() != transaction.id
+        || span.value_start != 0
+        || span.value_count != transaction.iterator_width
+        || generic_for.iterator.fixed.len() != transaction.iterator_width
+        || generic_for.iterator.tail.is_some()
+        || !assign.values.fixed.is_empty()
+        || !producer_matches_iterator_span(assign, generic_for, span)
+    {
+        return None;
+    }
+    let tail = assign.values.tail.as_ref()?;
+    if tail.exact_width() != Some(transaction.iterator_width) {
+        return None;
+    }
+    let HirExpr::Call(call) = tail.as_expr() else {
+        return None;
+    };
+    Some(call)
 }
 
 fn iterator_target_can_be_deleted(

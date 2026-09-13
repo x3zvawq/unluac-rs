@@ -2,16 +2,49 @@
 //! 不负责 temp 映射；loop body 块直接借用 Structure 的 containment 索引；例如把同一槽
 //! 的不同时代分成独立 local。capture 后写入按 slot/epoch 批量消费 GraphFacts 的 SCC
 //! 拓扑与前驱；例如无环块内先写后捕获不需要写回，回边上的同一次静态写则可能再次执行。
+//! CLOSE 窗口还区分互斥分支的独立 cell 激活；两个分支都在 r2 捕获并关闭自己的 value，
+//! 不能仅因物理 epoch 相同就共用只在 then 声明的 LocalId。未关闭的共同外层 cell 不拆分。
+//! 共同 cell 的初始化若支配所有捕获与后续写，直接以该写声明；后续 Phi 不另造 nil carrier。
 
 use super::*;
 use crate::structure::SccId;
+
+/// 每个物理 epoch 按原 low 起点索引互不重叠的已关闭 cell 激活。
+type CapturedActivationWindows = BTreeMap<CapturedSlotKey, BTreeMap<usize, usize>>;
 
 pub(super) struct CapturedSlotTargets {
     pub(super) slot_targets: BTreeMap<CapturedSlotKey, CapturedSlotBinding>,
     pub(super) capture_targets: BTreeMap<(usize, usize), LocalId>,
     pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
+    activation_windows: CapturedActivationWindows,
     pub(super) entry_local_decls: Vec<LocalId>,
     pub(super) region_local_decls: BTreeMap<RegionId, Vec<LocalId>>,
+}
+
+impl CapturedSlotTargets {
+    pub(super) fn target_at(
+        &self,
+        reg: Reg,
+        instr: InstrRef,
+        epochs: &SlotEpochFacts,
+    ) -> Option<LocalId> {
+        let mut key = CapturedSlotKey::new(reg.index(), epochs.epoch_at(reg, instr));
+        key.activation = activation_at(&self.activation_windows, key, instr.index());
+        self.slot_targets
+            .get(&key)
+            .filter(|binding| instr.index() >= binding.start_instr)
+            .map(|binding| binding.target)
+    }
+}
+
+/// 同一物理 epoch 的独立 CLOSE 窗口互不重叠；按原指令位置查本次 cell 激活。
+fn activation_at(
+    windows: &CapturedActivationWindows,
+    key: CapturedSlotKey,
+    instr: usize,
+) -> Option<usize> {
+    let (&start, &end) = windows.get(&key)?.range(..=instr).next_back()?;
+    (instr < end).then_some(start)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -204,7 +237,7 @@ pub(super) fn collect_captured_slot_targets(
         &mut write_queries,
         &mut captured_uses,
     );
-    let lexical_scopes = collect_lexical_close_scopes(
+    let (lexical_scopes, activation_windows) = collect_lexical_close_scopes(
         proto,
         cfg,
         dataflow,
@@ -212,18 +245,43 @@ pub(super) fn collect_captured_slot_targets(
         epochs,
         &captured_uses,
     );
+    for captured in &mut captured_uses {
+        captured.key.activation =
+            activation_at(&activation_windows, captured.key, captured.instr_index);
+        if captured.key.activation.is_some() {
+            // 原窗口首写建立 cell，关闭后销毁；不能改为入口 cell 或跨兄弟分支复用。
+            captured.entry_local_safe = false;
+        }
+    }
+    let initializers = dominating_cell_initializers(
+        proto,
+        cfg,
+        graph,
+        dataflow,
+        structure,
+        epochs,
+        &activation_windows,
+        &captured_uses,
+    );
+    for captured in &mut captured_uses {
+        if let Some(&start) = initializers.get(&captured.key) {
+            captured.start_instr = start;
+        }
+    }
     for captured in &captured_uses {
         entry_safe_by_key
             .entry(captured.key)
             .and_modify(|safe| *safe &= captured.entry_local_safe)
             .or_insert(captured.entry_local_safe);
         if captured.requires_local
+            && !initializers.contains_key(&captured.key)
             && captured.entry_local_safe
             && graph.block_is_cyclic(cfg.instr_to_block[captured.instr_index])
         {
             entry_decl_keys.insert(captured.key);
         }
         if captured.requires_local
+            && !initializers.contains_key(&captured.key)
             && let Some(region) = captured_slot_declaration_region(
                 dataflow,
                 structure.plan(),
@@ -309,9 +367,124 @@ pub(super) fn collect_captured_slot_targets(
         slot_targets,
         capture_targets,
         lexical_scopes,
+        activation_windows,
         entry_local_decls,
         region_local_decls,
     }
+}
+
+/// 原支配初始化已经声明 cell 时，后续 reaching Phi 不再触发另一份 region 空声明。
+/// 同一 key 的全部捕获、固定写和正常 phi 都由该写支配；Entry 活读保持入口 owner。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "仅在 binding owner 汇合同一快照的 source、SSA、支配与 cell 激活事实"
+)]
+fn dominating_cell_initializers(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    structure: &ReadyStructureFacts,
+    epochs: &SlotEpochFacts,
+    activations: &CapturedActivationWindows,
+    captures: &[CapturedSlotUse],
+) -> BTreeMap<CapturedSlotKey, usize> {
+    struct Candidate {
+        start: usize,
+        source_init: Option<usize>,
+        source_consistent: bool,
+    }
+    let mut groups = BTreeMap::<CapturedSlotKey, Candidate>::new();
+    for capture in captures {
+        let source_init =
+            debug_local_hint_for_reg_at_instr(proto, capture.reg, InstrRef(capture.instr_index))
+                .and_then(|hint| structure.debug_bindings().for_scope(hint.scope))
+                .filter(|fact| fact.reg == capture.reg)
+                .and_then(|fact| match fact.value {
+                    SsaValue::Def(def) => Some(dataflow.def_instr(def).index()),
+                    _ => None,
+                });
+        groups
+            .entry(capture.key)
+            .and_modify(|group| {
+                group.start = group.start.min(capture.start_instr);
+                group.source_consistent &= group.source_init == source_init;
+            })
+            .or_insert(Candidate {
+                start: capture.start_instr,
+                source_init,
+                source_consistent: true,
+            });
+    }
+    let key_at = |reg: Reg, instr: InstrRef| {
+        let mut key = CapturedSlotKey::new(reg.index(), epochs.epoch_at(reg, instr));
+        key.activation = activation_at(activations, key, instr.index());
+        key
+    };
+    let mut entry_observed = BTreeMap::new();
+    let mut initializers = groups
+        .into_iter()
+        .filter_map(|(key, candidate)| {
+            let reg = Reg(key.slot);
+            let start = candidate
+                .source_init
+                .filter(|&source| {
+                    candidate.source_consistent
+                        && source <= candidate.start
+                        && key_at(reg, InstrRef(source)) == key
+                })
+                .unwrap_or(candidate.start);
+            let instr = InstrRef(start);
+            if dataflow.instr_def_for_reg(instr, reg).is_none()
+                || key_at(reg, instr) != key
+                || epochs.reference_capture_may_be_open(reg, instr)
+                || (key.activation.is_none()
+                    && key.epoch == 0
+                    && *entry_observed
+                        .entry(reg)
+                        .or_insert_with(|| entry_reg_is_observed(dataflow, structure.plan(), reg)))
+            {
+                return None;
+            }
+            Some((key, start))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let dominates = |start: usize, instr: usize| {
+        graph.dominates(cfg.instr_to_block[start], cfg.instr_to_block[instr])
+            && (cfg.instr_to_block[start] != cfg.instr_to_block[instr] || start <= instr)
+    };
+    for capture in captures {
+        if initializers
+            .get(&capture.key)
+            .is_some_and(|&start| !dominates(start, capture.instr_index))
+        {
+            initializers.remove(&capture.key);
+        }
+    }
+    // 批量验证真正会投影到该 binding 的写入，不为每个 cell 重扫后缀。
+    for def in &dataflow.defs {
+        let key = key_at(def.reg, def.instr);
+        if initializers.get(&key).is_some_and(|&start| {
+            def.instr.index() >= start && !dominates(start, def.instr.index())
+        }) {
+            initializers.remove(&key);
+        }
+    }
+    for phi in structure
+        .plan()
+        .phis()
+        .filter(|phi| phi_participates_in_normal_binding(phi))
+    {
+        let instr = cfg.blocks[phi.block.index()].instrs.start;
+        let key = key_at(phi.reg, instr);
+        if initializers
+            .get(&key)
+            .is_some_and(|&start| instr.index() >= start && !dominates(start, instr.index()))
+        {
+            initializers.remove(&key);
+        }
+    }
+    initializers
 }
 
 fn collect_lexical_close_scopes(
@@ -321,63 +494,122 @@ fn collect_lexical_close_scopes(
     plan: &StructurePlan,
     epochs: &SlotEpochFacts,
     captured_uses: &[CapturedSlotUse],
-) -> Vec<std::ops::Range<usize>> {
-    let mut starts_by_key = BTreeMap::<CapturedSlotKey, BTreeSet<usize>>::new();
+) -> (Vec<std::ops::Range<usize>>, CapturedActivationWindows) {
+    // 每个 capture 只加入当前执行块一次；Close 按槽范围退休 pending 组。
+    // 不能让兄弟分支或同块后续 activation 污染当前窗口，也不对每条 Close 重扫历史 cell。
     let local_keys = captured_uses
         .iter()
         .filter(|captured| captured.requires_local)
         .map(|captured| captured.key)
         .collect::<BTreeSet<_>>();
-    for captured in captured_uses {
-        starts_by_key
-            .entry(captured.key)
-            .or_default()
-            .insert(captured.start_instr);
-    }
-
+    let captured_regs = dataflow.reference_captured_regs().collect::<Vec<_>>();
+    let mut pending = BTreeMap::<CapturedSlotKey, BTreeSet<usize>>::new();
+    let mut capture_cursor = 0;
+    let mut current_block = None;
     let mut candidates = Vec::new();
+    let mut activations = CapturedActivationWindows::new();
     for (close_instr, instr) in proto.instrs.iter().enumerate() {
+        let close_block = cfg.instr_to_block[close_instr];
+        if current_block != Some(close_block) {
+            pending.clear();
+            current_block = Some(close_block);
+        }
+        while let Some(captured) = captured_uses.get(capture_cursor)
+            && captured.instr_index == close_instr
+        {
+            pending
+                .entry(captured.key)
+                .or_default()
+                .insert(captured.start_instr);
+            capture_cursor += 1;
+        }
+        if matches!(instr, LowInstr::Return(_)) {
+            // RETURN 关闭整个 activation；这里只区分 cell 身份，不新增 do 或提前结束返回值读取。
+            // 外层旧 cell 可以同时存在，逐个核对新 cell 的声明支配本块全部捕获即可。
+            for (key, slot_starts) in std::mem::take(&mut pending) {
+                let &first = slot_starts
+                    .first()
+                    .expect("pending cell has an initializer");
+                let defs = dataflow.fixed_defs_for_reg(Reg(key.slot));
+                let first_def =
+                    defs.partition_point(|&def| dataflow.def_instr(def).index() < first);
+                if local_keys.contains(&key)
+                    // Entry/no-reaching 的 start 只是坐标，不是一次新 cell 初始化写。
+                    // 它必须保留入口 owner，否则后续 Entry 读取会退化为 nil。
+                    && dataflow.instr_def_for_reg(InstrRef(first), Reg(key.slot)).is_some()
+                    && slot_starts.iter().all(|&start| {
+                        start <= close_instr && cfg.instr_to_block[start] == close_block
+                    })
+                    && !epochs.reference_capture_may_be_open(Reg(key.slot), InstrRef(first))
+                    && !defs[first_def..]
+                        .iter()
+                        .copied()
+                        .take_while(|&def| dataflow.def_instr(def).index() <= close_instr)
+                        .filter(|&def| {
+                            epochs.epoch_at(Reg(key.slot), dataflow.def_instr(def)) == key.epoch
+                        })
+                        .any(|def| {
+                            captured_definition_escapes(dataflow, def, first, close_instr + 1)
+                        })
+                {
+                    activations
+                        .entry(key)
+                        .or_default()
+                        .insert(first, close_instr + 1);
+                }
+            }
+            continue;
+        }
         let LowInstr::Close(close) = instr else {
             continue;
         };
+        let closed = pending.split_off(&CapturedSlotKey::new(close.from.index(), 0));
         if !matches!(
             plan.cleanup_disposition(InstrRef(close_instr)),
             Some(CleanupDisposition::LexicalScope(_))
         ) {
             continue;
         }
-        let close_block = cfg.instr_to_block[close_instr];
         let mut start = None;
         let mut exact = true;
-        for (key, slot_starts) in &starts_by_key {
-            if key.slot < close.from.index()
-                || key.epoch != epochs.epoch_at(Reg(key.slot), InstrRef(close_instr))
-            {
-                continue;
-            }
-            for &slot_start in slot_starts {
-                if slot_start >= close_instr || cfg.instr_to_block[slot_start] != close_block {
-                    exact = false;
-                    break;
-                }
-                let Some(scope_start) = lexical_scope_evaluation_start(
-                    dataflow,
-                    cfg,
-                    close_block,
-                    close.from,
-                    slot_start,
-                ) else {
-                    exact = false;
-                    break;
-                };
-                start = Some(start.map_or(scope_start, |current: usize| current.min(scope_start)));
-            }
-            if !exact {
+        let mut closed_keys = Vec::new();
+        for (key, slot_starts) in closed {
+            if key.epoch != epochs.epoch_at(Reg(key.slot), InstrRef(close_instr)) {
+                exact = false;
                 break;
+            }
+            let &first = slot_starts
+                .first()
+                .expect("pending cell has a capture initializer");
+            if dataflow
+                .instr_def_for_reg(InstrRef(first), Reg(key.slot))
+                .is_none()
+                || slot_starts.iter().any(|&slot_start| {
+                    slot_start >= close_instr || cfg.instr_to_block[slot_start] != close_block
+                })
+                || epochs.reference_capture_may_be_open(Reg(key.slot), InstrRef(first))
+            {
+                exact = false;
+                break;
+            }
+            // 后续重赋值仍使用已经打开的同一 cell；仅最早初始化之前必须没有旧捕获。
+            let Some(scope_start) =
+                lexical_scope_evaluation_start(dataflow, cfg, close_block, close.from, first)
+            else {
+                exact = false;
+                break;
+            };
+            start = Some(start.map_or(scope_start, |current: usize| current.min(scope_start)));
+            if local_keys.contains(&key) {
+                closed_keys.push(key);
             }
         }
         if exact
             && let Some(start) = start
+            // CLOSE 关闭整个后缀；不能遗漏从前驱传入、在本块没有再次 capture 的旧 cell。
+            // 查询范围受 VM 固定槽数约束，不随闭包/声明总数增长。
+            && captured_regs[captured_regs.partition_point(|reg| reg.index() < close.from.index())..]
+                .iter().all(|&reg| !epochs.reference_capture_may_be_open(reg, InstrRef(start)))
             && !scope_window_local_def_escapes(
                 dataflow,
                 epochs,
@@ -388,11 +620,14 @@ fn collect_lexical_close_scopes(
             )
             && !scope_window_open_def_escapes(dataflow, start, close_instr, close.from)
         {
-            candidates.push(start..close_instr + 1);
+            let end = close_instr + 1;
+            for key in closed_keys {
+                activations.entry(key).or_default().insert(start, end);
+            }
+            candidates.push(start..end);
         }
     }
-
-    candidates
+    (candidates, activations)
 }
 
 fn scope_window_local_def_escapes(
@@ -413,20 +648,23 @@ fn scope_window_local_def_escapes(
                     epochs.epoch_at(reg, dataflow.def_instr(**def)),
                 ))
         })
-        .any(|def| {
-            // 候选拒绝[SemanticBarrier:Scope]：`requires_local` 的精确 slot epoch 会在
-            // 窗口内降低成 LocalDecl；若其 def/phi use 逃到 Close 后，提前结束词法块会
-            // 让 `Close r0; return r0` 的读取失去同一 binding（regress342）。不属于这些
-            // key 的 fixed def 仍是函数级 TempId，跨 HIR Block handoff 不改变身份
-            // （regress154）。
-            dataflow.def_uses.get(def.index()).is_none_or(|uses| {
-                uses.iter()
-                    .any(|site| site.instr.index() < start || site.instr.index() >= close)
-            }) || dataflow
-                .def_phi_uses
-                .get(def.index())
-                .is_none_or(|uses| uses.iter().any(|phi| !dataflow.phi_is_truly_dead(*phi)))
-        })
+        .any(|def| captured_definition_escapes(dataflow, *def, start, close))
+}
+
+/// 绑定的原 fixed/phi 读取必须落在激活窗口；CLOSE 不含本条，RETURN 包含原返回读取。
+fn captured_definition_escapes(
+    dataflow: &DataflowFacts,
+    def: DefId,
+    start: usize,
+    end: usize,
+) -> bool {
+    dataflow.def_uses.get(def.index()).is_none_or(|uses| {
+        uses.iter()
+            .any(|site| site.instr.index() < start || site.instr.index() >= end)
+    }) || dataflow
+        .def_phi_uses
+        .get(def.index())
+        .is_none_or(|uses| uses.iter().any(|phi| !dataflow.phi_is_truly_dead(*phi)))
 }
 
 fn scope_window_open_def_escapes(

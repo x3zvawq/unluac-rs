@@ -181,6 +181,7 @@ fn lower_condition_subjects(
                     test_source = crate::hir::HirDecisionTestSource::Predicate;
                     if value.negated {
                         replacement = HirExpr::Unary(Box::new(crate::hir::HirUnaryExpr {
+                            source_site: None,
                             op: crate::hir::HirUnaryOpKind::Not,
                             expr: replacement,
                         }));

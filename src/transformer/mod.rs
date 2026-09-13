@@ -22,7 +22,7 @@ pub use common::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchInstr, BranchPredicate,
     BranchSubject, CallInstr, CallKind, Capture, CaptureSource, CloseInstr, CloseKind,
     ClosureCreation, ClosureInstr, ConcatInstr, CondOperand, ConstRef, DebugLocalFact,
-    DebugLocalKind, ErrNilInstr, FastCallArgs, GenericForCallInstr, GenericForLoopInstr,
+    DebugLocalKind, ErrNilInstr, FastCallProtocol, GenericForCallInstr, GenericForLoopInstr,
     GenericForPrepInstr, GetTableInstr, GetTableKind, GetUpvalueInstr, InstrRef, JumpInstr,
     LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LoadNumberInstr, LowInstr,
     LoweredChunk, LoweredProto, LoweringMap, MethodNameHint, MoveInstr, NewTableInstr,

@@ -107,4 +107,21 @@ end
 assert(provenance_a:m() == "self")
 assert(provenance_b.m(5) == "x")
 
+-- 保留 debug 身份的 local 可在 lookup 期间被反射写入，不能少读一次 receiver。
+local debug_replacement = {}
+local debug_receiver = setmetatable({}, {__index = function()
+    for index = 1, 64 do
+        local name = debug.getlocal(2, index)
+        if name == "debug_receiver" then
+            debug.setlocal(2, index, debug_replacement)
+            break
+        end
+    end
+    return function(self)
+        assert(self == debug_replacement)
+        return 61
+    end
+end})
+assert(debug_receiver.lookup_debug(debug_receiver) == 61)
+
 print("function-sugar-guards", nested_self, constructor_result.value)

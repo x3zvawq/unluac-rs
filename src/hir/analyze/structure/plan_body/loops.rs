@@ -491,12 +491,18 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         } else {
             self.consume_syntax_region(region, control)?;
         }
+        let header = self
+            .lowering
+            .promotion_facts
+            .numeric_for_header(protocol.init_instr);
         stmts.push(HirStmt::NumericFor(Box::new(HirNumericFor {
             binding,
             start,
             limit,
             step,
             body: self.finish_emission(region, loop_stmts)?,
+            control_homes: header.homes,
+            control_values: header.values,
         })));
         stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::AfterLoop)?);
         if let Some((tail, guard)) = normal_tail {
@@ -600,6 +606,10 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             }
         }
         stmts.push(HirStmt::GenericFor(Box::new(HirGenericFor {
+            body_frame_source: Some(crate::hir::common::HirSourceSite {
+                proto: self.proto,
+                instr: protocol.call_instr,
+            }),
             bindings,
             iterator: lower_generic_for_iterator(self.lowering, preheader, protocol).into(),
             body: self.finish_emission(region, loop_stmts)?,

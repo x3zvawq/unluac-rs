@@ -275,6 +275,7 @@ fn analyze_structure_proto_one(
         .filter(|candidate| matches!(candidate.exit, ShortCircuitExit::BranchExit { .. }))
         .filter_map(|candidate| {
             safe_condition_candidate(
+                proto,
                 cfg,
                 dataflow,
                 candidate,
@@ -284,6 +285,7 @@ fn analyze_structure_proto_one(
         .collect::<Vec<_>>();
     short_circuit_candidates_for_loops.extend(closed_control_dags.iter().filter_map(|evidence| {
         safe_condition_candidate(
+            proto,
             cfg,
             dataflow,
             &evidence.candidate,
@@ -295,6 +297,7 @@ fn analyze_structure_proto_one(
             .iter()
             .filter_map(|candidate| {
                 safe_condition_candidate(
+                    proto,
                     cfg,
                     dataflow,
                     candidate,

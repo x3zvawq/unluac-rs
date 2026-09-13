@@ -15,6 +15,7 @@
 //! 的词法作用域后去掉条件壳；已知真值或两臂相同但有求值事件的条件会先物化在独立
 //! 短作用域中，再进入唯一保留的 arm。
 
+mod alternative_arms;
 mod path_conditions;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,11 +68,13 @@ pub(super) fn fold_branch_control_in_proto(
         );
         let first_new_local = proto.local_count;
         let mut pass = BranchControlPass {
+            promotion_facts,
             discard_facts: &discard_facts,
             forward_move_facts: &forward_move_facts,
             primitive_locals: &primitive_locals,
             next_local_index: first_new_local,
             safety,
+            read_alternatives: Default::default(),
         };
         let rewrite_changed = rewrite_block(&mut proto.body, &mut pass);
         let next_local_index = pass.next_local_index;
@@ -92,6 +95,8 @@ pub(super) fn fold_branch_control_in_proto(
 }
 
 struct BranchControlPass<'a> {
+    read_alternatives: alternative_arms::ReadAlternativeCache,
+    promotion_facts: &'a ProtoPromotionFacts,
     discard_facts: &'a DiscardBoundaryFacts<'a>,
     forward_move_facts: &'a ForwardBranchMoveFacts<'a>,
     primitive_locals: &'a ImmutablePrimitiveLocals,
@@ -106,6 +111,8 @@ impl HirRewritePass for BranchControlPass<'_> {
             self.discard_facts,
             self.safety,
             &mut self.next_local_index,
+            self.promotion_facts,
+            &mut self.read_alternatives,
         );
         let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
         let adjacent_goto_changed = fold_adjacent_conditional_gotos(&mut block.stmts);
@@ -259,6 +266,8 @@ fn fold_constant_control(
     discard_facts: &DiscardBoundaryFacts,
     safety: HirExprSafety,
     next_local_index: &mut usize,
+    promotion_facts: &ProtoPromotionFacts,
+    read_alternatives: &mut alternative_arms::ReadAlternativeCache,
 ) -> bool {
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
@@ -316,11 +325,24 @@ fn fold_constant_control(
             if_stmt.else_block = None;
             changed = true;
         }
-        let arms_are_equal = if_stmt
+        let truthiness = expr_truthiness(&if_stmt.cond, safety);
+        let exact_arms = if_stmt
             .else_block
             .as_ref()
             .is_some_and(|else_block| if_stmt.then_block == *else_block);
-        let truthiness = expr_truthiness(&if_stmt.cond, safety);
+        let merged_arm = if truthiness.is_none() && !exact_arms {
+            if_stmt.else_block.as_ref().and_then(|else_block| {
+                alternative_arms::merge_read_alternatives(
+                    &if_stmt.then_block,
+                    else_block,
+                    promotion_facts,
+                    read_alternatives,
+                )
+            })
+        } else {
+            None
+        };
+        let arms_are_equal = exact_arms || merged_arm.is_some();
         let discard_condition = safety.is_discard_safe_without_residual(&if_stmt.cond);
         let selected_then = truthiness.or(arms_are_equal.then_some(true));
         let Some(selected_then) = selected_then else {
@@ -367,11 +389,14 @@ fn fold_constant_control(
         }
 
         let selected = if selected_then {
-            if_stmt.then_block
+            merged_arm.unwrap_or(if_stmt.then_block)
         } else {
             if_stmt.else_block.take().unwrap_or_default()
         };
-        if !selected.stmts.is_empty() {
+        if matches!(selected.stmts.as_slice(), [HirStmt::Return(_)]) {
+            // 单条返回没有该 arm 独有的声明或资源范围；不制造阻断外层同臂合并的空作用域。
+            rewritten.extend(selected.stmts);
+        } else if !selected.stmts.is_empty() {
             rewritten.push(HirStmt::Block(Box::new(selected)));
         }
         changed = true;

@@ -236,19 +236,41 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                             && self.lowering.bindings.lvalue_for_temp(fixed) == capture.lvalue()
                             && self.lowering.bindings.lvalue_for_temp(target) == capture.lvalue()
                     });
+                // source scope 已把原 MOVE 目标与 phi 结果绑定到同一 Local/Param。
+                // 只在原目标槽的 block-end 值仍是该 incoming Def 时读取它，不能沿
+                // canonical Move 又回到已复制的 producer，制造一次 scope 外活读。
+                let shares_source_target = self
+                    .lowering
+                    .bindings
+                    .bound_temp_targets
+                    .get(&fixed)
+                    .copied()
+                    .is_some_and(|binding| {
+                        self.lowering.bindings.bound_temp_targets.get(&target) == Some(&binding)
+                            && self.lowering.bindings.lvalue_for_temp(fixed) == binding.lvalue()
+                            && self.lowering.bindings.lvalue_for_temp(target) == binding.lvalue()
+                            && self
+                                .lowering
+                                .dataflow
+                                .block_end_value(source_block, definition.reg)
+                                == Some(value)
+                    });
                 let read_exact = !absorbed
                     && writes_fixed_binding
-                    && (fixed == target || shares_capture_target || {
+                    && (fixed == target || shares_capture_target || shares_source_target || {
                         let canonical_expr = self.edge_ssa_expr(owner, source_block, canonical)?;
                         match self
                             .lowering
                             .dataflow
                             .block_end_value(source_block, self.ssa_reg(owner, canonical)?)
                         {
-                            Some(current) if current != canonical => {
-                                self.edge_ssa_expr(owner, source_block, current)? == canonical_expr
+                            // canonical 描述值身份，不证明原 source home 仍持有它。
+                            // 该槽已被别的值覆盖时，即使旧值有独立 SSA temp，也不能
+                            // 延长它的物理活读；保留原 MOVE 的实际读取与目标快照。
+                            Some(current) => {
+                                self.lowering.dataflow.canonical_move_value(current)
+                                    != Some(canonical)
                             }
-                            Some(_) => false,
                             None => match canonical_expr {
                                 HirExpr::LocalRef(_) => true,
                                 HirExpr::TempRef(temp) => self

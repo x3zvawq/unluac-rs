@@ -252,6 +252,7 @@ macro_rules! traverse_hir_expr_children {
             | crate::hir::HirExpr::UpvalueRef(_)
             | crate::hir::HirExpr::TempRef(_)
             | crate::hir::HirExpr::GlobalRef(_)
+            | crate::hir::HirExpr::CaptureInitializer(_)
             | crate::hir::HirExpr::VarArg
             | crate::hir::HirExpr::Unresolved(_) => {}
         }

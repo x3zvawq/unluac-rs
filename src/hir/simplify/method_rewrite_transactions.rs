@@ -225,7 +225,10 @@ fn candidate_at(
 
     let protocol = facts.method_setup_protocol(protocol_id)?;
     let prior_callee_root_temp = protocol.prior_callee_root_temp?;
-    if access.method_setup_protocol != Some(protocol_id)
+    if !matches!(
+        access.sources,
+        crate::hir::common::HirOperationSources::Single(_)
+    ) || access.method_setup_protocol != Some(protocol_id)
         || protocol.method_key != *method_key
         || !facts.is_pure_scope_end_copy_root_temp(prior_callee_root_temp)
     {

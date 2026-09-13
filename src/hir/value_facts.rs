@@ -25,7 +25,9 @@ pub(in crate::hir) fn value_facts_with(
     match expr {
         HirExpr::Nil => LuaValueFacts::NIL,
         HirExpr::Boolean(value) => LuaValueFacts::boolean(*value),
-        HirExpr::Integer(_) | HirExpr::Number(_) => LuaValueFacts::NUMERIC,
+        HirExpr::CaptureInitializer(_) | HirExpr::Integer(_) | HirExpr::Number(_) => {
+            LuaValueFacts::NUMERIC
+        }
         HirExpr::String(_) => LuaValueFacts::STRING,
         HirExpr::Int64(_) | HirExpr::UInt64(_) | HirExpr::Vector(_) | HirExpr::Complex { .. } => {
             LuaValueFacts::ANCHORED

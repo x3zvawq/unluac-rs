@@ -23,6 +23,7 @@ pub(super) fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNa
         AstExpr::Nil => "nil".to_owned(),
         AstExpr::Boolean(value) => value.to_string(),
         AstExpr::Integer(value) => value.to_string(),
+        AstExpr::CaptureInitializer(value) => format!("capture-init({value:?})"),
         AstExpr::Number(value) => value.to_string(),
         AstExpr::String(value) => value.debug_literal(),
         AstExpr::Int64(value) => format!("{value}LL"),

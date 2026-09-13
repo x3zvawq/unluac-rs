@@ -293,7 +293,7 @@ fn visit_decision_expr<'hir>(decision: &'hir HirDecisionExpr, visitor: &mut impl
     );
 }
 
-fn visit_table_constructor<'hir>(
+pub(crate) fn visit_table_constructor<'hir>(
     table: &'hir HirTableConstructor,
     visitor: &mut impl HirVisitor<'hir>,
 ) {

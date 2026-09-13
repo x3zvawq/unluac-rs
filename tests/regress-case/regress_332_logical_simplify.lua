@@ -5,6 +5,7 @@
 -- unluac: expect-not-contains [["unexpected"]]
 -- unluac: expect-contains [[if not ((p11_0 or]]
 -- unluac: expect-contains [[return p12_0 and p12_1 or {}]]
+-- unluac: expect-contains [[return p16_0 and p16_1 and p16_2 or {}]]
 
 local trace = {}
 
@@ -129,3 +130,18 @@ print(
     rounded,
     nan ~= nan
 )
+
+-- 三个互斥分配来源逐层汇合；共享尾仍只分配一个新对象，并保留已有值的身份。
+-- 这覆盖持久来源图继续合并的路径，不依赖输出里选择了哪一条原指令作代表。
+do
+    local function nested_shared_allocation(first, second, value)
+        return first and (second and (value or {}) or {}) or {}
+    end
+    local carried = {}
+    assert(nested_shared_allocation(true, true, carried) == carried)
+    local first = nested_shared_allocation(true, true, false)
+    local second = nested_shared_allocation(true, false, carried)
+    local third = nested_shared_allocation(false, true, carried)
+    assert(type(first) == "table" and type(second) == "table" and type(third) == "table")
+    assert(first ~= second and second ~= third and first ~= third)
+end

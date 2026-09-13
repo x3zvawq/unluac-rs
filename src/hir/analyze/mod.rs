@@ -6,6 +6,7 @@
 
 mod artifact_recovery;
 mod bindings;
+mod capture_initializers;
 mod exprs;
 mod global_decls;
 mod helpers;

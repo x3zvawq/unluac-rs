@@ -1,12 +1,14 @@
 //! low-IR 到 canonical SSA、liveness 与副作用事实的统一入口。
 
 mod effects;
+mod execution;
 mod liveness;
 mod moves;
 mod open;
 mod overwrites;
 mod plain_tables;
 mod root_exits;
+mod scratch;
 mod ssa;
 
 use std::collections::{BTreeSet, VecDeque};
@@ -240,6 +242,25 @@ fn compute_dataflow_proto(
     );
     let canonical_move_values = moves::freeze_move_values(proto, &defs, &ssa.use_values);
     let root_intervals = super::common::RootIntervalIndex::new(&instr_effects, &effect_summaries);
+    let execution = execution::collect(
+        proto,
+        cfg,
+        &defs,
+        &ssa.use_values,
+        &reg_captures,
+        &root_intervals,
+    );
+    let unknown_scratch_overwrites = scratch::collect(
+        proto,
+        cfg,
+        graph_facts,
+        &instr_effects,
+        &effect_summaries,
+        &defs,
+        &instr_defs,
+        reg_count,
+        &execution,
+    );
     let unobserved_forward_exits = root_exits::unobserved_forward_exits(cfg, &effect_summaries);
     Ok(DataflowFacts {
         instr_effects,
@@ -259,6 +280,7 @@ fn compute_dataflow_proto(
         def_uses: ssa.def_uses,
         def_overwritten_values,
         canonical_move_values,
+        unknown_scratch_overwrites,
         def_phi_uses: ssa.def_phi_uses,
         phi_uses: ssa.phi_uses,
         phi_phi_uses: ssa.phi_phi_uses,

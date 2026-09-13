@@ -94,6 +94,9 @@ pub struct NumericForProtocol {
     pub limit: Reg,
     pub step: Reg,
     pub binding: Reg,
+    /// 连续 limit/step/index 协议的可写用户 binding；每轮入口 COPY 由源码 for 重发。
+    /// 原控制槽不改名，只有完整单块 body 的复制/后续写同时被证明时存在。
+    pub writable_binding: Option<(InstrRef, Reg)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

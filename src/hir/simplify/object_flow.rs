@@ -2,24 +2,102 @@
 //!
 //! 消费 HIR 控制流图及显式 capture，不重建 VM 寄存器。fresh table 的内部存储仅传播
 //! 持有关系，真正外部调用/存储才使可达对象逃逸；例如 a={}; b={}; a.x=b 不等于 sink(b)。
-//! repeat endpoint 与物理 root overwrite 共同消费此模型和模块入口提供的 child 效果快照，
-//! 分别决定生命周期事务；局部消费者不得用 capture 清单合成另一份调用效果。
+//! repeat endpoint 与构造器原根窗口共同消费此模型和模块入口提供的 child 效果快照；
+//! 物理覆盖终点仍由root_lifetimes发布，局部消费者不得重造终点或另一份调用效果。
 //! binding 状态只存正向 root 与非空对象集合，缺项就是该域的空值；未知 collectable
 //! 单独记录，不能随空 holder 清除。例如 `object=nil` 清除持有者，但不撤销已经发生的逃逸。
 
 mod closure_effects;
-pub(super) use closure_effects::collect_proto_effects;
+mod fields;
+mod return_values;
+pub(super) use return_values::ReturnValueFacts;
+
+/// 一个不可变 HIR 模块快照同时发布 may-capture 效果和正常返回值；两者的证明域不同。
+/// constructor/root 消费结果查询，不能把 may-holder 子集当成完整 callee 身份。
+pub(super) struct ModuleEffects {
+    protos: Vec<ProtoEffects>,
+    pub(super) values: ReturnValueFacts,
+}
+
+pub(super) fn collect_proto_effects(
+    module: &crate::hir::HirModule,
+    safety: HirExprSafety,
+) -> ModuleEffects {
+    let mut facts = ModuleEffects {
+        protos: module
+            .protos
+            .iter()
+            .map(|proto| ProtoEffects {
+                writes: proto.mutable_upvalues.clone(),
+                ..ProtoEffects::default()
+            })
+            .collect(),
+        values: ReturnValueFacts::new(module),
+    };
+    let mut required = vec![false; module.protos.len()];
+    for child in module.protos.iter().flat_map(|proto| &proto.children) {
+        required[child.index()] = true;
+    }
+    // arena 父先子后；两域共用一次 child-first 调度和当前 proto 的不可变控制流快照。
+    for index in (0..module.protos.len()).rev() {
+        let proto = &module.protos[index];
+        if !required[index] && proto.children.is_empty() {
+            continue;
+        }
+        let flow = ProtoFlowFacts::new(proto, safety);
+        if required[index] && !(proto.upvalues.is_empty() && proto.children.is_empty()) {
+            facts.protos[index] = closure_effects::collect_effect_state(&flow, &facts.protos);
+        }
+        facts.values.analyze_proto(&flow);
+    }
+    facts
+}
+pub(super) use fields::PrivateAllocationFacts;
 
 use super::lexical_cfg::{
-    FlowRefinement, HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
-    HirGenericForFlow,
+    HirFlowGraph, HirFlowNodeKind, HirFlowProtocolId, HirForBindings, HirGenericForFlow,
 };
 use crate::hir::common::{
-    HirBinding, HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProtoRef, HirStmt,
-    HirTableConstructor, HirTableField, HirValuePack, TempId, UpvalueId,
+    HirBinding, HirBlock, HirCapture, HirCaptureMode, HirExpr, HirLValue, HirProto, HirProtoRef,
+    HirStmt, HirTableConstructor, HirTableField, HirValuePack, UpvalueId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+/// 两个值域求解同一只读 proto 时共享 topology、直接读取需求和捕获身份。
+/// 例如局部 f 的 capture 效果与调用结果都使用这一图；求解状态仍各自拥有，不混淆
+/// may-origin 的 bottom 和正常值的 UNKNOWN。快照只活过当前 proto 的两次求解。
+struct ProtoFlowFacts<'hir> {
+    proto: &'hir HirProto,
+    safety: HirExprSafety,
+    graph: HirFlowGraph<'hir>,
+    live_out: Vec<BTreeSet<HirBinding>>,
+    captures: ClosureCaptures<'hir>,
+    reference_cells: BTreeSet<HirBinding>,
+}
+
+impl<'hir> ProtoFlowFacts<'hir> {
+    fn new(proto: &'hir HirProto, safety: HirExprSafety) -> Self {
+        let graph = HirFlowGraph::for_block(&proto.body, safety)
+            .expect("HIR labels must be valid before module value analysis");
+        let live_out = graph.binding_live_out();
+        let captures = closure_captures_in_block(&proto.body);
+        let reference_cells = captures
+            .values()
+            .flat_map(|captures| captures.iter())
+            .filter(|capture| capture.mode == HirCaptureMode::ByReference)
+            .map(|capture| capture.binding)
+            .collect();
+        Self {
+            proto,
+            safety,
+            graph,
+            live_out,
+            captures,
+            reference_cells,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectId {
@@ -69,7 +147,7 @@ pub(super) struct ProtoEffects {
 #[derive(Clone, Copy)]
 pub(super) struct RootAnalysisContext<'a> {
     pub(super) safety: HirExprSafety,
-    pub(super) effects: &'a [ProtoEffects],
+    pub(super) effects: &'a ModuleEffects,
 }
 
 #[derive(Clone, Default)]
@@ -81,10 +159,28 @@ pub(super) struct RootState {
     pub(super) escaped: BTreeSet<ObjectId>,
     contents: BTreeMap<ObjectId, BTreeSet<ObjectId>>,
     allocations: BTreeSet<ObjectId>,
+    // 构造窗口需要确定字段身份；物理根覆盖分析仍使用原来的 may-holder 投影。
+    fields: Option<fields::FieldFacts>,
     pub(super) generic_for: BTreeMap<HirFlowProtocolId, GenericForRootSnapshot>,
 }
 
 impl RootState {
+    fn publish_objects(&mut self, objects: &BTreeSet<ObjectId>) {
+        self.escaped.extend(objects);
+        if let Some(fields) = &mut self.fields {
+            for &object in objects {
+                fields.mark_observed(object);
+            }
+        }
+    }
+
+    fn store_objects(&mut self, owner: ObjectId, children: &BTreeSet<ObjectId>) {
+        self.contents.entry(owner).or_default().extend(children);
+        if let Some(fields) = &mut self.fields {
+            fields.record_contents(owner, children);
+        }
+    }
+
     pub(super) fn binding_may_hold_observable_root(&self, binding: HirBinding) -> bool {
         self.roots.contains(&binding)
             || !self
@@ -148,7 +244,7 @@ fn extend_map_sets<K: Copy + Ord, V: Clone + Ord>(
 pub(super) fn snapshot_generic_for_root(
     flow: HirGenericForFlow<'_>,
     state: &mut RootState,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
 ) {
     let Some(callee) = flow.for_stmt().iterator.result_source(0) else {
         return;
@@ -169,14 +265,14 @@ pub(super) fn dispatch_generic_for_root(
     flow: HirGenericForFlow<'_>,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
     let Some(snapshot) = state.generic_for.get(&flow.protocol()).cloned() else {
         return;
     };
     activate_object_ids(&snapshot.callees, state, captures, effects, false, safety);
-    state.escaped.extend(&snapshot.arguments);
+    state.publish_objects(&snapshot.arguments);
     activate_object_ids(&snapshot.arguments, state, captures, effects, true, safety);
 }
 
@@ -208,9 +304,17 @@ pub(super) fn update_state_for_stmt(
     stmt: &HirStmt,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
+    // 多目标赋值的表 RHS 来自统一旧快照；当前确定字段投影不跨这种事务签发事实。
+    // may-holder 历史继续保留，故失效只扩大构造窗口的拒绝范围。
+    if matches!(stmt, HirStmt::Assign(assign) if assign.targets.len() > 1
+        && assign.targets.iter().any(|target| matches!(target, HirLValue::TableAccess(_))))
+        && let Some(fields) = &mut state.fields
+    {
+        fields.invalidate_values();
+    }
     observe_stmt(stmt, state, captures, effects, safety);
     match stmt {
         HirStmt::LocalRootRelease(local) => {
@@ -229,11 +333,12 @@ pub(super) fn update_state_for_stmt(
                 .iter()
                 .enumerate()
                 .map(|(index, target)| {
-                    binding_from_lvalue(target).map(|binding| {
+                    HirBinding::from_lvalue(target).map(|binding| {
                         (
                             binding,
                             BindingValue::resolve(
                                 assign.values.result_source(index),
+                                effects.values.pack_slot(&assign.values, index),
                                 state,
                                 effects,
                                 safety,
@@ -269,10 +374,10 @@ pub(super) fn update_state_for_stmt(
             }
         }
         HirStmt::TableSetList(set) => {
-            for value in &set.values {
+            for (index, value) in (&set.values).into_iter().enumerate() {
                 store_table(
                     &set.base,
-                    None,
+                    Some(&HirExpr::Integer(i64::from(set.start_index) + index as i64)),
                     Some(value),
                     state,
                     captures,
@@ -289,7 +394,7 @@ fn assign_bindings(
     bindings: impl Iterator<Item = HirBinding>,
     values: &HirValuePack,
     state: &mut RootState,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
     let values = bindings
@@ -297,7 +402,13 @@ fn assign_bindings(
         .map(|(index, binding)| {
             (
                 binding,
-                BindingValue::resolve(values.result_source(index), state, effects, safety),
+                BindingValue::resolve(
+                    values.result_source(index),
+                    effects.values.pack_slot(values, index),
+                    state,
+                    effects,
+                    safety,
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -314,24 +425,53 @@ struct BindingValue {
     tables: BTreeSet<ObjectId>,
     unknown: bool,
     root: bool,
+    known: Option<fields::KnownValue>,
 }
 
 impl BindingValue {
     fn resolve(
         value: Option<&HirExpr>,
+        result: crate::value_semantics::results::LuaValueFacts,
         state: &RootState,
-        effects: &[ProtoEffects],
+        effects: &ModuleEffects,
         safety: HirExprSafety,
     ) -> Self {
         Self {
-            holders: value.map_or_else(BTreeSet::new, |value| holder_values(value, state, effects)),
+            holders: value.map_or_else(BTreeSet::new, |value| {
+                if state.fields.is_some() {
+                    direct_holder_values(value, state, effects)
+                } else {
+                    holder_values(value, state, effects)
+                }
+            }),
             tables: value.map_or_else(BTreeSet::new, |value| table_values(value, state)),
-            unknown: adjusted_value_may_be_unknown(value, state, safety),
-            root: value.is_some_and(|value| expr_may_root(value, state, safety)),
+            // tail 的第 n 槽已在 pack owner 投影；不能再用同一个 Call 表达式的首槽
+            // 否定这里的资源可能性，例如 f() 返回 `1, object`。
+            unknown: !result.is_gc_inert()
+                && (matches!(value, Some(HirExpr::Call(_)))
+                    || adjusted_value_may_be_unknown(value, state, effects, safety)),
+            root: !result.is_gc_inert()
+                && value.is_some_and(|value| {
+                    matches!(value, HirExpr::Call(_))
+                        || expr_may_root(value, state, effects, safety)
+                }),
+            known: fields::known_value(value.unwrap_or(&HirExpr::Nil), state),
         }
     }
 
     fn install(self, binding: HirBinding, state: &mut RootState) {
+        // 引用cell可能早在其值为nil时就经closure公开；随后写入的新对象不能继承
+        // 当时的未逃逸状态。此发布仅服务完整构造窗口，默认may-root投影保持原策略。
+        if state
+            .fields
+            .as_ref()
+            .is_some_and(|fields| fields.publishes_binding(binding))
+        {
+            state.publish_objects(&reachable_holders(self.holders.clone(), state));
+        }
+        if let Some(fields) = &mut state.fields {
+            fields.install(binding, self.known);
+        }
         for (map, objects) in [
             (&mut state.holders, self.holders),
             (&mut state.tables, self.tables),
@@ -358,12 +498,21 @@ impl BindingValue {
 fn adjusted_value_may_be_unknown(
     value: Option<&HirExpr>,
     state: &RootState,
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) -> bool {
-    value.is_some_and(|value| expr_may_be_unknown(value, state, safety))
+    value.is_some_and(|value| expr_may_be_unknown(value, state, effects, safety))
 }
 
-fn expr_may_be_unknown(expr: &HirExpr, state: &RootState, safety: HirExprSafety) -> bool {
+fn expr_may_be_unknown(
+    expr: &HirExpr,
+    state: &RootState,
+    effects: &ModuleEffects,
+    safety: HirExprSafety,
+) -> bool {
+    if fields::known_value(expr, state).is_some() {
+        return false;
+    }
     match expr {
         HirExpr::ParamRef(id) => state.unknown_collectable.contains(&HirBinding::Param(*id)),
         HirExpr::LocalRef(id) => state.unknown_collectable.contains(&HirBinding::Local(*id)),
@@ -372,40 +521,47 @@ fn expr_may_be_unknown(expr: &HirExpr, state: &RootState, safety: HirExprSafety)
             .unknown_collectable
             .contains(&HirBinding::Upvalue(*id)),
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_may_be_unknown(&logical.lhs, state, safety)
-                || expr_may_be_unknown(&logical.rhs, state, safety)
+            expr_may_be_unknown(&logical.lhs, state, effects, safety)
+                || expr_may_be_unknown(&logical.rhs, state, effects, safety)
         }
         HirExpr::TableConstructor(_) | HirExpr::Closure(_) => false,
-        _ => !safety.result_is_gc_inert(expr),
+        _ => !safety.result_is_gc_inert(expr) && !effects.values.value_facts(expr).is_gc_inert(),
     }
 }
 
-fn expr_may_root(expr: &HirExpr, state: &RootState, safety: HirExprSafety) -> bool {
+fn expr_may_root(
+    expr: &HirExpr,
+    state: &RootState,
+    effects: &ModuleEffects,
+    safety: HirExprSafety,
+) -> bool {
+    if let Some(value) = fields::known_value(expr, state) {
+        return value
+            .object()
+            .is_some_and(|object| state.escaped.contains(&object));
+    }
     if let Some(binding) = HirBinding::from_expr(expr) {
         return state.binding_may_hold_observable_root(binding);
     }
     match expr {
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-            expr_may_root(&logical.lhs, state, safety) || expr_may_root(&logical.rhs, state, safety)
+            expr_may_root(&logical.lhs, state, effects, safety)
+                || expr_may_root(&logical.rhs, state, effects, safety)
         }
         HirExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
-            HirTableField::Array(value) => expr_may_root(value, state, safety),
+            HirTableField::Array(value) => expr_may_root(value, state, effects, safety),
             HirTableField::Record(record) => {
-                expr_may_root(&record.key, state, safety)
-                    || expr_may_root(&record.value, state, safety)
+                expr_may_root(&record.key, state, effects, safety)
+                    || expr_may_root(&record.value, state, effects, safety)
             }
         }),
         HirExpr::Closure(_) => false,
-        _ => !safety.result_is_gc_inert(expr),
+        _ => !safety.result_is_gc_inert(expr) && !effects.values.value_facts(expr).is_gc_inert(),
     }
 }
 
 /// 对象持有关系按 allocation identity 保存，不能随某个临时 binding 被覆盖而丢失。
-fn holder_values(
-    expr: &HirExpr,
-    state: &RootState,
-    effects: &[ProtoEffects],
-) -> BTreeSet<ObjectId> {
+fn holder_values(expr: &HirExpr, state: &RootState, effects: &ModuleEffects) -> BTreeSet<ObjectId> {
     reachable_holders(direct_holder_values(expr, state, effects), state)
 }
 
@@ -426,8 +582,11 @@ fn reachable_holders(mut holders: BTreeSet<ObjectId>, state: &RootState) -> BTre
 fn direct_holder_values(
     expr: &HirExpr,
     state: &RootState,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
 ) -> BTreeSet<ObjectId> {
+    if let Some(value) = fields::known_value(expr, state) {
+        return value.object().into_iter().collect();
+    }
     if let Some(binding) = HirBinding::from_expr(expr) {
         return state.holders.get(&binding).cloned().unwrap_or_default();
     }
@@ -453,6 +612,9 @@ fn direct_holder_values(
             values.extend(holder_values(&logical.rhs, state, effects));
             values
         }
+        HirExpr::TableAccess(access) if state.fields.is_some() => {
+            direct_holder_values(&access.base, state, effects)
+        }
         HirExpr::TableAccess(access) => holder_values(&access.base, state, effects),
         HirExpr::Call(call) => {
             returned_holder_values(&holder_values(&call.callee, state, effects), effects)
@@ -463,17 +625,17 @@ fn direct_holder_values(
 
 fn returned_holder_values(
     callees: &BTreeSet<ObjectId>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
 ) -> BTreeSet<ObjectId> {
     let mut returned = BTreeSet::new();
     for &callee in callees {
         let (producer, returns) = match callee {
             ObjectId::Closure(proto) => {
-                let effect = &effects[proto.index()];
+                let effect = &effects.protos[proto.index()];
                 (proto, &effect.returns)
             }
             ObjectId::ReturnedClosure { producer, closure } => {
-                let effect = &effects[producer.index()];
+                let effect = &effects.protos[producer.index()];
                 for closure in returned_closures(&effect.returns, closure) {
                     returned.extend(closure.returns.iter().filter_map(|value| match value {
                         EffectValue::Upvalue(_) => None,
@@ -521,6 +683,9 @@ fn returned_closures(values: &BTreeSet<EffectValue>, target: HirProtoRef) -> Vec
 }
 
 fn table_values(expr: &HirExpr, state: &RootState) -> BTreeSet<ObjectId> {
+    if let Some(value) = fields::known_value(expr, state) {
+        return value.object().into_iter().collect();
+    }
     if let Some(binding) = HirBinding::from_expr(expr) {
         return state.tables.get(&binding).cloned().unwrap_or_default();
     }
@@ -541,7 +706,7 @@ fn store_table(
     value: Option<&HirExpr>,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
     let tables = table_values(base, state);
@@ -562,19 +727,32 @@ fn store_table(
         return;
     }
 
-    let mut stored = key.map_or_else(BTreeSet::new, |key| holder_values(key, state, effects));
+    fields::store(&tables, key, value, state);
+
+    let project_holders = |value| {
+        if state.fields.is_some() {
+            direct_holder_values(value, state, effects)
+        } else {
+            holder_values(value, state, effects)
+        }
+    };
+    let mut stored = key.map_or_else(BTreeSet::new, project_holders);
     if let Some(value) = value {
-        stored.extend(holder_values(value, state, effects));
+        stored.extend(project_holders(value));
     }
-    let may_root = key.is_some_and(|key| expr_may_root(key, state, safety))
-        || value.is_some_and(|value| expr_may_root(value, state, safety));
-    let aliases = state
-        .tables
-        .iter()
-        .filter_map(|(&binding, values)| (!values.is_disjoint(&tables)).then_some(binding))
-        .collect::<Vec<_>>();
+    let may_root = key.is_some_and(|key| expr_may_root(key, state, effects, safety))
+        || value.is_some_and(|value| expr_may_root(value, state, effects, safety));
+    let aliases = if state.fields.is_none() {
+        state
+            .tables
+            .iter()
+            .filter_map(|(&binding, values)| (!values.is_disjoint(&tables)).then_some(binding))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     for table in tables {
-        state.contents.entry(table).or_default().extend(&stored);
+        state.store_objects(table, &stored);
     }
     for binding in aliases {
         if !stored.is_empty() {
@@ -590,7 +768,7 @@ fn observe_stmt(
     stmt: &HirStmt,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
     match stmt {
@@ -643,7 +821,7 @@ fn observe_pack(
     pack: &HirValuePack,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
     for value in pack {
@@ -655,7 +833,7 @@ pub(super) fn observe_expr(
     expr: &HirExpr,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
     match expr {
@@ -665,7 +843,7 @@ pub(super) fn observe_expr(
             let tables = table_values(&access.base, state);
             if tables.is_empty()
                 || !tables.is_disjoint(&state.escaped)
-                || expr_may_be_unknown(&access.base, state, safety)
+                || expr_may_be_unknown(&access.base, state, effects, safety)
             {
                 // 未知接收者的 __index 可把 key/receiver 留给外部；普通读取不等于无逃逸。
                 escape_expr(&access.base, state, captures, effects, safety);
@@ -674,14 +852,18 @@ pub(super) fn observe_expr(
         }
         HirExpr::Unary(unary) => {
             observe_expr(&unary.expr, state, captures, effects, safety);
-            if safety.unary_operator_may_observe_gc_roots(unary.op) {
+            if safety.unary_operator_may_observe_gc_roots(unary.op)
+                && !fields::operator_is_plain(expr, state)
+            {
                 escape_expr(&unary.expr, state, captures, effects, safety);
             }
         }
         HirExpr::Binary(binary) => {
             observe_expr(&binary.lhs, state, captures, effects, safety);
             observe_expr(&binary.rhs, state, captures, effects, safety);
-            if safety.binary_operator_may_observe_gc_roots(binary.op, &binary.lhs, &binary.rhs) {
+            if safety.binary_operator_may_observe_gc_roots(binary.op, &binary.lhs, &binary.rhs)
+                && !fields::operator_is_plain(expr, state)
+            {
                 escape_expr(&binary.lhs, state, captures, effects, safety);
                 escape_expr(&binary.rhs, state, captures, effects, safety);
             }
@@ -703,6 +885,10 @@ pub(super) fn observe_expr(
         }
         HirExpr::Call(call) => observe_call(call, state, captures, effects, safety),
         HirExpr::TableConstructor(table) => {
+            let epoch = state
+                .fields
+                .as_ref()
+                .map(fields::FieldFacts::observation_epoch);
             for field in &table.fields {
                 match field {
                     HirTableField::Array(value) => {
@@ -719,9 +905,31 @@ pub(super) fn observe_expr(
             }
             let object = ObjectId::table(table);
             state.allocations.insert(object);
-            let mut contents = holder_values(expr, state, effects);
+            let mut contents = if state.fields.is_some() {
+                let mut contents = BTreeSet::new();
+                for field in &table.fields {
+                    match field {
+                        HirTableField::Array(value) => {
+                            contents.extend(direct_holder_values(value, state, effects))
+                        }
+                        HirTableField::Record(record) => {
+                            contents.extend(direct_holder_values(&record.key, state, effects));
+                            contents.extend(direct_holder_values(&record.value, state, effects));
+                        }
+                    }
+                }
+                contents
+            } else {
+                holder_values(expr, state, effects)
+            };
             contents.remove(&object);
-            state.contents.entry(object).or_default().extend(contents);
+            state.store_objects(object, &contents);
+            let stable = epoch
+                == state
+                    .fields
+                    .as_ref()
+                    .map(fields::FieldFacts::observation_epoch);
+            fields::construct(table, state, stable);
         }
         HirExpr::Nil
         | HirExpr::Boolean(_)
@@ -737,6 +945,7 @@ pub(super) fn observe_expr(
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => {}
@@ -747,9 +956,12 @@ fn observe_call(
     call: &crate::hir::common::HirCallExpr,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
+    if let Some(fields) = &mut state.fields {
+        fields.observe();
+    }
     activate_closures(&call.callee, state, captures, effects, false, safety);
     observe_expr(&call.callee, state, captures, effects, safety);
     for arg in &call.args {
@@ -762,11 +974,14 @@ fn escape_expr(
     expr: &HirExpr,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
+    if let Some(fields) = &mut state.fields {
+        fields.observe();
+    }
     let holders = holder_values(expr, state, effects);
-    state.escaped.extend(&holders);
+    state.publish_objects(&holders);
     struct EscapeBindings<'a>(&'a mut RootState);
     impl crate::hir::visit::HirVisitor<'_> for EscapeBindings<'_> {
         fn visit_expr(&mut self, expr: &HirExpr) {
@@ -788,7 +1003,7 @@ fn activate_closures(
     expr: &HirExpr,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     include_returns: bool,
     safety: HirExprSafety,
 ) {
@@ -800,7 +1015,7 @@ fn activate_object_ids(
     holders: &BTreeSet<ObjectId>,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     include_returns: bool,
     _safety: HirExprSafety,
 ) {
@@ -816,7 +1031,7 @@ fn activate_object_ids(
                 let Some(closure_captures) = captures.get(&proto) else {
                     continue;
                 };
-                let effect = &effects[proto.index()];
+                let effect = &effects.protos[proto.index()];
                 activate_projected_effect(
                     proto,
                     closure_captures,
@@ -833,7 +1048,7 @@ fn activate_object_ids(
                 let Some(closure_captures) = captures.get(&producer) else {
                     continue;
                 };
-                let effect = &effects[producer.index()];
+                let effect = &effects.protos[producer.index()];
                 for returned in returned_closures(&effect.returns, closure) {
                     activate_projected_effect(
                         producer,
@@ -869,6 +1084,9 @@ fn activate_projected_effect(
             continue;
         };
         if capture.mode == HirCaptureMode::ByReference {
+            if let Some(fields) = &mut state.fields {
+                fields.install(capture.binding, None);
+            }
             state.roots.insert(capture.binding);
             state.unknown_collectable.insert(capture.binding);
         }
@@ -883,7 +1101,7 @@ fn activate_projected_effect(
             continue;
         };
         let captured_holders = state.binding_holder_values(capture.binding);
-        state.escaped.extend(&captured_holders);
+        state.publish_objects(&captured_holders);
         pending.extend(captured_holders);
         if state.unknown_collectable.contains(&capture.binding) {
             state.roots.insert(capture.binding);
@@ -898,14 +1116,14 @@ fn activate_projected_effect(
                 producer,
                 closure: closure.proto,
             };
-            state.escaped.insert(returned);
+            state.publish_objects(&BTreeSet::from([returned]));
             pending.push_back(returned);
             for upvalue in &closure.captures {
                 let Some(capture) = closure_captures.get(upvalue.index()) else {
                     continue;
                 };
                 let captured_holders = state.binding_holder_values(capture.binding);
-                state.escaped.extend(&captured_holders);
+                state.publish_objects(&captured_holders);
                 pending.extend(captured_holders);
                 if state.unknown_collectable.contains(&capture.binding) {
                     state.roots.insert(capture.binding);
@@ -926,16 +1144,6 @@ fn returned_upvalues(values: &BTreeSet<EffectValue>) -> impl Iterator<Item = &Up
         EffectValue::Upvalue(upvalue) => Some(upvalue),
         EffectValue::Closure(_) => None,
     })
-}
-
-pub(super) fn binding_from_lvalue(lvalue: &HirLValue) -> Option<HirBinding> {
-    match lvalue {
-        HirLValue::Param(param) => Some(HirBinding::Param(*param)),
-        HirLValue::Local(local) => Some(HirBinding::Local(*local)),
-        HirLValue::Temp(temp) => Some(HirBinding::Temp(*temp)),
-        HirLValue::Upvalue(upvalue) => Some(HirBinding::Upvalue(*upvalue)),
-        HirLValue::Global(_) | HirLValue::TableAccess(_) => None,
-    }
 }
 
 // 捕获身份只在本次只读求解内使用；返回的效果/根事实不携带引用，不跨 HIR 改写缓存。
@@ -965,101 +1173,11 @@ fn closure_captures_in_stmts(stmts: &[HirStmt]) -> ClosureCaptures<'_> {
     captures.0
 }
 
-/// 借用当前不可变语句快照；地址只在对象流内部标识 occurrence，不作为跨模块协议。
-/// 缺失或不可达状态不签发未逃逸证明。调用方仍拥有物理 home 与删除事务。
-pub(super) struct AllocationEscapeFacts<'hir> {
-    stmts: &'hir [HirStmt],
-    unescaped: BTreeMap<usize, BTreeSet<ObjectId>>,
-}
-
-impl<'hir> AllocationEscapeFacts<'hir> {
-    pub(super) fn analyze(
-        stmts: &'hir [HirStmt],
-        context: RootAnalysisContext<'_>,
-        opaque: &BTreeSet<TempId>,
-        queries: impl IntoIterator<Item = (usize, &'hir HirTableConstructor)>,
-    ) -> Self {
-        let mut facts = Self {
-            stmts,
-            unescaped: BTreeMap::new(),
-        };
-        let mut requested = BTreeMap::<_, BTreeSet<_>>::new();
-        for (index, table) in queries {
-            requested
-                .entry(std::ptr::from_ref(&stmts[index]).addr())
-                .or_default()
-                .insert(ObjectId::table(table));
-        }
-        if requested.is_empty() {
-            return facts;
-        }
-        let RootAnalysisContext { safety, effects } = context;
-        let Ok(graph) = HirFlowGraph::for_stmts(stmts, safety) else {
-            return facts;
-        };
-        if graph.has_reachable_unresolved_goto() {
-            return facts;
-        }
-        struct ExternalBindings(BTreeSet<HirBinding>);
-        impl crate::hir::visit::HirVisitor<'_> for ExternalBindings {
-            fn visit_expr(&mut self, expr: &HirExpr) {
-                if let Some(binding) = HirBinding::from_expr(expr) {
-                    self.0.insert(binding);
-                }
-            }
-        }
-        let mut inputs = (
-            CaptureCollector::default(),
-            ExternalBindings(BTreeSet::new()),
-        );
-        crate::hir::visit::visit_stmts(stmts, &mut inputs);
-        let (CaptureCollector(captures), ExternalBindings(external)) = inputs;
-        let initial = RootState {
-            unknown_collectable: external,
-            ..RootState::default()
-        };
-        let unescaped = graph.solve_forward(
-            initial,
-            join_state,
-            |_, kind, state| {
-                transfer_overwrite_node(kind, state, &captures, effects, safety, opaque);
-                let HirFlowNodeKind::Stmt(stmt) = kind else {
-                    return None;
-                };
-                let address = std::ptr::from_ref(stmt).addr();
-                let objects = requested.get(&address)?;
-                let escaped = reachable_holders(state.escaped.clone(), state);
-                Some((
-                    address,
-                    objects
-                        .iter()
-                        .copied()
-                        .filter(|object| {
-                            state.allocations.contains(object)
-                                && reachable_holders(BTreeSet::from([*object]), state)
-                                    .is_disjoint(&escaped)
-                        })
-                        .collect(),
-                ))
-            },
-            |_expr, _truthy, _state| FlowRefinement::Unchanged,
-        );
-        facts.unescaped = unescaped.into_iter().flatten().flatten().collect();
-        facts
-    }
-
-    pub(super) fn proves_unescaped(&self, table: &HirTableConstructor, stmt_index: usize) -> bool {
-        self.unescaped
-            .get(&std::ptr::from_ref(&self.stmts[stmt_index]).addr())
-            .is_some_and(|objects| objects.contains(&ObjectId::table(table)))
-    }
-}
-
 pub(super) fn transfer_root_node(
     kind: HirFlowNodeKind<'_>,
     state: &mut RootState,
     captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) {
     match kind {
@@ -1083,32 +1201,5 @@ pub(super) fn transfer_root_node(
         HirFlowNodeKind::Exit
         | HirFlowNodeKind::FunctionExit
         | HirFlowNodeKind::NumericForDispatch => {}
-    }
-}
-
-fn transfer_overwrite_node(
-    kind: HirFlowNodeKind<'_>,
-    state: &mut RootState,
-    captures: &ClosureCaptures<'_>,
-    effects: &[ProtoEffects],
-    safety: HirExprSafety,
-    opaque: &BTreeSet<TempId>,
-) {
-    transfer_root_node(kind, state, captures, effects, safety);
-    if let HirFlowNodeKind::Stmt(stmt) = kind {
-        if let HirStmt::LocalDecl(decl) = stmt {
-            for local in &decl.bindings {
-                escape_expr(&HirExpr::LocalRef(*local), state, captures, effects, safety);
-            }
-        }
-        if let HirStmt::Assign(assign) = stmt {
-            for target in &assign.targets {
-                if let HirLValue::Temp(temp) = target
-                    && opaque.contains(temp)
-                {
-                    escape_expr(&HirExpr::TempRef(*temp), state, captures, effects, safety);
-                }
-            }
-        }
     }
 }

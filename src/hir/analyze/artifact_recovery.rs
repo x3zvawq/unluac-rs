@@ -57,8 +57,68 @@ struct ProtoRefRewrite {
     removed_reference: Option<HirProtoRef>,
 }
 
+impl ProtoRefRewrite {
+    fn rewrite_operation_sources(
+        &mut self,
+        sources: &mut crate::hir::common::HirOperationSources,
+    ) -> bool {
+        sources.rewrite_sites(|site| {
+            if let Some(proto) = self.remap.apply(site.proto) {
+                site.proto = proto;
+            } else {
+                self.removed_reference = Some(site.proto);
+            }
+        })
+    }
+
+    fn rewrite_source_site(
+        &mut self,
+        site: &mut Option<crate::hir::common::HirSourceSite>,
+    ) -> bool {
+        let Some(site) = site else {
+            return false;
+        };
+        let Some(proto) = self.remap.apply(site.proto) else {
+            self.removed_reference = Some(site.proto);
+            return false;
+        };
+        site.proto = proto;
+        true
+    }
+}
+
 impl HirRewritePass for ProtoRefRewrite {
+    fn rewrite_stmt(&mut self, stmt: &mut crate::hir::common::HirStmt) -> bool {
+        match stmt {
+            crate::hir::common::HirStmt::Return(ret) => {
+                self.rewrite_source_site(&mut ret.frame_source)
+            }
+            crate::hir::common::HirStmt::TableSetList(batch) => {
+                self.rewrite_source_site(&mut batch.source_site)
+            }
+            crate::hir::common::HirStmt::GenericFor(for_) => {
+                self.rewrite_source_site(&mut for_.body_frame_source)
+            }
+            _ => false,
+        }
+    }
+
+    fn rewrite_call(&mut self, call: &mut crate::hir::common::HirCallExpr) -> bool {
+        self.rewrite_source_site(&mut call.source_site)
+    }
+
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+        match expr {
+            HirExpr::Unary(unary) => return self.rewrite_source_site(&mut unary.source_site),
+            HirExpr::Binary(binary) => return self.rewrite_source_site(&mut binary.source_site),
+            HirExpr::TableConstructor(table) => {
+                return self.rewrite_operation_sources(&mut table.sources);
+            }
+            HirExpr::TableAccess(access) => {
+                return self.rewrite_operation_sources(&mut access.sources);
+            }
+            _ => {}
+        }
         let HirExpr::Closure(closure) = expr else {
             return false;
         };
@@ -69,6 +129,15 @@ impl HirRewritePass for ProtoRefRewrite {
         closure.proto = proto;
         true
     }
+
+    fn rewrite_lvalue(&mut self, target: &mut crate::hir::common::HirLValue) -> bool {
+        match target {
+            crate::hir::common::HirLValue::TableAccess(access) => {
+                self.rewrite_operation_sources(&mut access.sources)
+            }
+            _ => false,
+        }
+    }
 }
 
 fn remap_artifact_proto_refs(
@@ -77,6 +146,7 @@ fn remap_artifact_proto_refs(
 ) -> Result<(), HirLowerError> {
     for (index, proto) in artifacts.protos.iter_mut().enumerate() {
         proto.id = HirProtoRef(index);
+        artifacts.promotion_facts[index].relocate_proto_owner(proto.id);
         for child in &mut proto.children {
             *child = remap_proto_ref(*child, remap)?;
         }

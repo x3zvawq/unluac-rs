@@ -133,6 +133,39 @@ impl<T> BindingSlots<T> {
 }
 
 impl BindingSlots<bool> {
+    /// 声明身份与跨 pass 保留事实共享删除边界，不把后者伪装成 debug scope。
+    pub(super) fn from_preserved_identities(proto: &crate::hir::common::HirProto) -> Self {
+        use crate::hir::common::{LocalId, TempId};
+        Self {
+            temps: (0..proto.temp_count)
+                .map(|index| {
+                    proto
+                        .temp_debug_locals
+                        .get(index)
+                        .is_some_and(Option::is_some)
+                        || proto
+                            .inline_dispositions
+                            .temp(TempId(index))
+                            .must_preserve()
+                })
+                .collect(),
+            locals: (0..proto.local_count)
+                .map(|index| {
+                    proto
+                        .local_debug_hints
+                        .get(index)
+                        .is_some_and(Option::is_some)
+                        || proto
+                            .inline_dispositions
+                            .local(LocalId(index))
+                            .must_preserve()
+                })
+                .collect(),
+            temp_limit: proto.temp_count,
+            local_limit: proto.local_count,
+        }
+    }
+
     pub(super) fn from_debug_hints(
         temp_hints: &[Option<String>],
         local_hints: &[Option<String>],
@@ -190,9 +223,14 @@ impl BindingIndex {
 pub(super) struct StmtBindingSummary {
     uses: Vec<BindingId>,
     mentions: Vec<BindingId>,
+    writes: Vec<BindingId>,
 }
 
 impl StmtBindingSummary {
+    pub(super) fn writes(&self) -> impl Iterator<Item = BindingId> + '_ {
+        self.writes.iter().copied()
+    }
+
     pub(super) fn uses(&self) -> impl Iterator<Item = BindingId> + '_ {
         self.uses.iter().copied()
     }
@@ -207,7 +245,23 @@ pub(super) fn collect_stmt_binding_summary(
     binding_index: &mut BindingIndex,
 ) -> StmtBindingSummary {
     intern_stmt_bindings(stmt, binding_index);
-    collect_stmt_slice_binding_summary(std::slice::from_ref(stmt), binding_index)
+    let mut summary = collect_stmt_slice_binding_summary(std::slice::from_ref(stmt), binding_index);
+    match stmt {
+        HirStmt::LocalDecl(decl) => summary.writes.extend(
+            decl.bindings
+                .iter()
+                .filter_map(|local| binding_index.id_of(TableBinding::Local(*local))),
+        ),
+        HirStmt::Assign(assign) => {
+            summary
+                .writes
+                .extend(assign.targets.iter().filter_map(|target| {
+                    binding_from_lvalue(target).and_then(|binding| binding_index.id_of(binding))
+                }))
+        }
+        _ => {}
+    }
+    summary
 }
 
 pub(super) fn intern_stmt_bindings(stmt: &HirStmt, binding_index: &mut BindingIndex) {
@@ -270,6 +324,7 @@ pub(super) fn collect_stmt_slice_binding_summary(
     StmtBindingSummary {
         uses: collector.uses,
         mentions: collector.mentions,
+        writes: Vec::new(),
     }
 }
 
@@ -278,6 +333,8 @@ pub(super) struct BindingOccurrenceIndex {
     uses: Vec<BTreeSet<usize>>,
     mentions: Vec<BTreeSet<usize>>,
     sticky_uses: Vec<bool>,
+    writes: Vec<BTreeSet<usize>>,
+    private_values: Vec<bool>,
 }
 
 impl BindingOccurrenceIndex {
@@ -286,12 +343,19 @@ impl BindingOccurrenceIndex {
         stmts: &[StmtBindingSummary],
         reference_captured_bindings: &BindingSlots<bool>,
         reference_captured_home_slots: &BTreeSet<HomeSlotKey>,
-        debug_identity_bindings: &BindingSlots<bool>,
+        preserved_identity_bindings: &BindingSlots<bool>,
         promotion_facts: &ProtoPromotionFacts,
+        private_allocations: &super::PrivateAllocationFacts,
     ) -> Self {
         let mut index = Self {
             uses: vec![BTreeSet::new(); binding_index.len()],
             mentions: vec![BTreeSet::new(); binding_index.len()],
+            writes: vec![BTreeSet::new(); binding_index.len()],
+            private_values: binding_index
+                .bindings
+                .iter()
+                .map(|binding| private_allocations.contains(super::binding_identity(*binding)))
+                .collect(),
             sticky_uses: binding_index
                 .bindings
                 .iter()
@@ -300,7 +364,7 @@ impl BindingOccurrenceIndex {
                         .get(*binding)
                         .copied()
                         .unwrap_or_default()
-                        || debug_identity_bindings
+                        || preserved_identity_bindings
                             .get(*binding)
                             .copied()
                             .unwrap_or_default()
@@ -310,6 +374,9 @@ impl BindingOccurrenceIndex {
                 .collect(),
         };
         for (stmt_id, summary) in stmts.iter().enumerate() {
+            for &binding_id in &summary.writes {
+                index.writes[binding_id].insert(stmt_id);
+            }
             for binding_id in summary.uses() {
                 index.uses[binding_id].insert(stmt_id);
             }
@@ -327,7 +394,21 @@ impl BindingOccurrenceIndex {
         }
     }
 
-    pub(super) fn last_use(&self, binding_id: BindingId) -> Option<usize> {
+    pub(super) fn last_value_use_after(
+        &self,
+        binding_id: BindingId,
+        stmt_id: usize,
+    ) -> Option<usize> {
+        if self.private_values[binding_id]
+            && let Some(write) = self.writes[binding_id]
+                .range((Excluded(stmt_id), Unbounded))
+                .next()
+        {
+            return self.uses[binding_id]
+                .range((Excluded(stmt_id), std::ops::Bound::Included(*write)))
+                .next_back()
+                .copied();
+        }
         self.uses
             .get(binding_id)
             .and_then(|occurrences| occurrences.last().copied())
@@ -337,7 +418,35 @@ impl BindingOccurrenceIndex {
         self.sticky_uses[binding_id]
     }
 
+    pub(super) fn has_mention_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
+        self.mentions[binding_id]
+            .range((Excluded(stmt_id), Unbounded))
+            .next()
+            .is_some()
+    }
+
+    pub(super) fn replace_stmt(
+        &mut self,
+        stmt_id: usize,
+        old: &StmtBindingSummary,
+        new: &StmtBindingSummary,
+    ) {
+        self.remove_stmt(stmt_id, old);
+        for binding in new.uses() {
+            self.uses[binding].insert(stmt_id);
+        }
+        for binding in new.mentions() {
+            self.mentions[binding].insert(stmt_id);
+        }
+        for &binding in &new.writes {
+            self.writes[binding].insert(stmt_id);
+        }
+    }
+
     pub(super) fn remove_stmt(&mut self, stmt_id: usize, summary: &StmtBindingSummary) {
+        for &binding_id in &summary.writes {
+            self.writes[binding_id].remove(&stmt_id);
+        }
         for binding_id in summary.uses() {
             self.uses[binding_id].remove(&stmt_id);
         }
@@ -361,10 +470,16 @@ impl BindingUseSummary<'_> {
             .copied()
             .unwrap_or_default()
             || self.index.uses.get(binding_id).is_some_and(|occurrences| {
-                occurrences
+                let next_use = occurrences
                     .range((Excluded(self.after_stmt), Unbounded))
-                    .next()
-                    .is_some()
+                    .next();
+                next_use.is_some_and(|next_use| {
+                    !self.index.private_values[binding_id]
+                        || self.index.writes[binding_id]
+                            .range((Excluded(self.after_stmt), Unbounded))
+                            .next()
+                            .is_none_or(|write| next_use <= write)
+                })
             })
     }
 }

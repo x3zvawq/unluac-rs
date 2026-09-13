@@ -67,6 +67,7 @@ pub(super) fn lower_closure_expr(
 ) -> HirExpr {
     if let Some(factory) = lowering.shared_closure_replacement(instr_ref) {
         return HirExpr::Call(Box::new(HirCallExpr {
+            source_site: None,
             argument_roots: Vec::new(),
             frame_root_ends: Vec::new(),
             callee: HirExpr::LocalRef(lowering.shared_factory_local(factory)),
@@ -97,7 +98,18 @@ pub(super) fn lower_plain_closure_expr(
             lower_closure_capture(lowering, block, instr_ref, closure.dst, capture.source)
         })
         .collect::<Result<Vec<_>, _>>();
-    capture_closure_expr(lowering.child_refs[closure.proto.index()], captures)
+    capture_closure_expr(
+        lowering.child_refs[closure.proto.index()],
+        captures,
+        Some(match closure.creation {
+            crate::transformer::ClosureCreation::Fresh => {
+                crate::hir::common::HirClosureCreation::Fresh
+            }
+            crate::transformer::ClosureCreation::Reusable(_) => {
+                crate::hir::common::HirClosureCreation::MayReuse
+            }
+        }),
+    )
 }
 
 pub(super) fn lower_composite_factory_expr(
@@ -118,15 +130,21 @@ pub(super) fn lower_composite_factory_expr(
             factory,
             plan.outer_captures.iter().copied(),
         ),
+        None,
     )
 }
 
 fn capture_closure_expr(
     proto: crate::hir::HirProtoRef,
     captures: Result<Vec<HirCapture>, crate::hir::HirUnresolvedExpr>,
+    creation: Option<crate::hir::common::HirClosureCreation>,
 ) -> HirExpr {
     match captures {
-        Ok(captures) => HirExpr::Closure(Box::new(HirClosureExpr { proto, captures })),
+        Ok(captures) => HirExpr::Closure(Box::new(HirClosureExpr {
+            proto,
+            captures,
+            creation,
+        })),
         Err(error) => HirExpr::Unresolved(Box::new(error)),
     }
 }
@@ -241,6 +259,10 @@ fn pack_tail_for_open_def(
                 expr_for_reg_use(lowering, open_def.block, open_def.instr, call.callee)
             };
             Some(HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                source_site: Some(crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: open_def.instr,
+                }),
                 argument_roots: lowering.promotion_facts.call_argument_roots(open_def.instr),
                 frame_root_ends: lowering
                     .promotion_facts

@@ -124,6 +124,7 @@ impl<'a> AstLowerer<'a> {
             }
         }
         Ok(AstFunctionExpr {
+            creation: closure.creation,
             function: closure.proto,
             params: child.params.clone(),
             allows_self_param: !child.params.is_empty()
@@ -316,6 +317,15 @@ impl<'a> AstLowerer<'a> {
                 AstCallKind::Call(call) => AstExpr::Call(call),
                 AstCallKind::MethodCall(call) => AstExpr::MethodCall(call),
             },
+            HirExpr::CaptureInitializer(value) => {
+                if self.target.version != crate::decompile::DecompileDialect::Luau
+                    || (matches!(value, crate::hir::HirCaptureInitializer::FirstVararg(_))
+                        && !self.module.protos[proto_index].signature.is_vararg)
+                {
+                    return Err(AstLowerError::InvalidCaptureInitializer { proto: proto_index });
+                }
+                AstExpr::CaptureInitializer(*value)
+            }
             HirExpr::VarArg => AstExpr::VarArg,
             HirExpr::TableConstructor(table) => {
                 let mut fields = table

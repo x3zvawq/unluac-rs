@@ -1,15 +1,18 @@
 //! 这个文件识别普通 HIR 值活跃性看不到的物理槽 root 生命周期。
 //!
-//! fixed call result（包括已物化 local）、已逃逸 table allocation，以及已跨后续观察点的
+//! fixed call result（包括已物化 local）、table allocation，以及已跨后续观察点的
 //! table/global lookup 与动态运算结果，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
 //! VM GC root。ordinary call 的参数槽由前层标记交接给 callee，只有当前唯一 producer 与
 //! call 参数端点仍匹配时才退休 call/lookup/allocation 的对应 home，不能把 callee 可覆盖的槽
 //! 物化为额外 caller local。例如 `object = make(); f(object)` 的参数副本结束于 f，原槽
 //! 则仍需保活至自己的覆盖点；两者共享值身份，不共享物理根终点。
+//! 内嵌 method lookup/call 保留原 SELF 配对时，callee 槽已覆盖旧 receiver，首参另行
+//! 交接；`subject.worker:touch()` 不把已结束的低槽根延续到下一次字段读取。显式 local
+//! receiver 的异槽根和已经签发的独立保活事务不由这条协议退休。
 //! Promotion 另会发布普通 copy root 的单结果 call + 紧邻 MOVE 终点；本层只按 producer / endpoint
 //! temp 与 overwritten home 完整匹配，把它接入同一 local-owner handoff，不从 HIR 相邻文本猜 opcode。
-//! allocation 的内部 aggregate 存储由共享 object_flow 证明是否真正逃逸，不能仅凭
-//! store 外形把不同 value epoch 合成一个 local。缺失正向证明时仍保留原配对。
+//! allocation 的原覆盖配对不依赖当时是否逃逸：`t={child={}}; publish(t.child)` 中
+//! 子表可以晚于旧槽覆盖才被外部观察。是否消除独立物化由消费事务的完整证明决定。
 //! copy 共享值 identity，
 //! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
 //! 消费者只能把 producer 与同 home 的精确覆盖配对。
@@ -30,8 +33,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirAssign, HirBinaryOpKind, HirBlock, HirCallExpr, HirExpr, HirLValue, HirStmt, HirUnaryOpKind,
-    HirValuePack, LocalId, ParamId, TempId,
+    HirAssign, HirBinaryOpKind, HirBinding, HirBlock, HirCallExpr, HirExpr,
+    HirGenericForDispatchRelease, HirLValue, HirSourceSite, HirStmt, HirUnaryOpKind, HirValuePack,
+    LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -41,14 +45,13 @@ mod call_values;
 mod events;
 mod live_read_changes;
 mod lookup_values;
-mod return_lookup;
+mod return_roots;
 
 use allocation_homes::{ActiveAllocationHome, AllocationHomes, AllocationSite};
 use call_values::CallValues;
 pub(super) use events::{RootEventBlock, RootEventIndex, RootEventStmt};
 use lookup_values::ScalarValues;
 
-use super::object_flow::RootAnalysisContext;
 use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 /// 当前语句中必须只有一个仍匹配 producer 的参数交接端点；共享给内联和身份物化。
@@ -74,6 +77,8 @@ struct ActiveCallRoot {
     observed: bool,
     preserved: bool,
     explicit_fence_only: bool,
+    /// 参数已交给 callee，不再选择 caller 根；若 producer 仍被独立物化，需保留原覆写终点。
+    transferred: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -95,6 +100,8 @@ struct ActiveScalarGcHome {
     aliases: BTreeSet<TempId>,
     eligible: bool,
     crossed_observation: bool,
+    /// 写入本身清除了 CALL 残值，不能仅按新值是否被 GC 观察判定可删除。
+    required_scratch_write: bool,
     /// 该 home 由原始表达式结果写入；跨 home 的机械 copy 不是 return 后缀要保留的独立 owner。
     direct_result_home: bool,
     /// low CFG 已证明该原始 home 在观察事件后仍活到 frame end。
@@ -136,12 +143,11 @@ pub(super) struct CallRootLifetimeIndices {
     roots: BTreeSet<usize>,
     root_homes: BTreeMap<usize, BTreeSet<HomeSlotKey>>,
     roots_by_overwrite: BTreeMap<usize, Vec<PhysicalRootOwner>>,
+    retained_overwrites: BTreeSet<usize>,
     continuation_owners: BTreeMap<usize, PhysicalRootOwner>,
     call_dispatch_releases: BTreeMap<usize, Vec<PhysicalRootOwner>>,
     overwrite_releases: BTreeMap<usize, Vec<PhysicalRootOwner>>,
-    pre_dispatch_releases: BTreeMap<usize, BTreeSet<TempId>>,
-    allocation_sites: BTreeMap<usize, AllocationSite>,
-    allocation_release_sites: BTreeMap<(usize, TempId), AllocationSite>,
+    pre_dispatch_releases: BTreeMap<usize, BTreeSet<(TempId, HomeSlotKey)>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -170,6 +176,8 @@ pub(super) struct MethodReceiverRootHandoff {
 pub(super) struct ScalarGcRootLifetimeIndices {
     roots: BTreeSet<usize>,
     roots_by_overwrite: BTreeMap<usize, Vec<PhysicalRootOwner>>,
+    retained_overwrites: BTreeSet<usize>,
+    call_dispatch_releases: BTreeMap<usize, Vec<PhysicalRootOwner>>,
     handoff_roots: BTreeSet<TempId>,
 }
 
@@ -194,9 +202,7 @@ pub(super) fn collect_call_result_local_roots(
     if candidates.is_empty() {
         return BTreeSet::new();
     }
-    let explicit_fences = collect_gc_fences(stmts, |index, _, temps, locals| {
-        events.is_gc_fence(index, temps, locals)
-    });
+    let explicit_fences = collect_gc_fences(stmts, events);
     let mut observations = events.observation_indices();
     let mut trailing_uses = LocalUseCollector::default();
     if let Some(condition) = trailing_condition {
@@ -316,6 +322,9 @@ impl CallRootLifetimeIndices {
     }
 
     fn preserve_call_root(&mut self, root: &ActiveCallRoot, home: HomeSlotKey) {
+        if root.transferred {
+            return;
+        }
         self.roots.insert(root.root_index);
         self.root_homes
             .entry(root.root_index)
@@ -405,6 +414,7 @@ impl CallRootLifetimeIndices {
         for index in self
             .roots
             .iter()
+            .chain(&self.retained_overwrites)
             .chain(
                 self.roots_by_overwrite
                     .iter()
@@ -508,15 +518,27 @@ impl CallRootLifetimeIndices {
 }
 
 impl ScalarGcRootLifetimeIndices {
+    pub(super) fn call_dispatch_releases(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = PhysicalRootOwner> + '_ {
+        self.call_dispatch_releases
+            .get(&index)
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+
     pub(super) fn closed_roots_before(
         &self,
         end: usize,
     ) -> impl Iterator<Item = PhysicalRootOwner> {
         root_owners_before(&self.roots_by_overwrite, end)
+            .filter(|owner| self.is_root(owner.root_index))
     }
 
-    pub(super) fn into_handoff_roots(self) -> BTreeSet<TempId> {
-        self.handoff_roots
+    pub(super) fn handoff_roots(&self) -> impl Iterator<Item = TempId> + '_ {
+        self.handoff_roots.iter().copied()
     }
 
     pub(super) fn is_root(&self, index: usize) -> bool {
@@ -539,6 +561,14 @@ impl ScalarGcRootLifetimeIndices {
         &self,
         index: usize,
     ) -> impl Iterator<Item = PhysicalRootOwner> + '_ {
+        self.owner_overwrites(index)
+            .filter(|owner| self.is_root(owner.root_index))
+    }
+
+    pub(super) fn owner_overwrites(
+        &self,
+        index: usize,
+    ) -> impl Iterator<Item = PhysicalRootOwner> + '_ {
         self.roots_by_overwrite
             .get(&index)
             .into_iter()
@@ -547,7 +577,7 @@ impl ScalarGcRootLifetimeIndices {
     }
 
     pub(super) fn mark_stmts(&self, marked: &mut [bool]) {
-        for index in self.roots.iter().chain(self.roots_by_overwrite.keys()) {
+        for index in self.roots.iter().chain(&self.retained_overwrites) {
             marked[*index] = true;
         }
     }
@@ -569,22 +599,13 @@ fn root_owners_before(
 pub(super) fn collect_call_root_lifetimes(
     snapshot: &RootLifetimeFacts<'_>,
     facts: &ProtoPromotionFacts,
-    context: RootAnalysisContext<'_>,
+    safety: HirExprSafety,
     observe_potential_events: bool,
     mut producer_temp_is_eligible: impl FnMut(TempId) -> bool,
     mut overwrite_policy: impl FnMut(TempId) -> RootOverwritePolicy,
 ) -> CallRootLifetimeIndices {
     let stmts = snapshot.stmts;
     let uses = &snapshot.uses;
-    let safety = context.safety;
-    let opaque_allocations = stmts
-        .iter()
-        .filter_map(HirStmt::scalar_temp_assignment)
-        .filter_map(|(temp, value)| {
-            (matches!(value, HirExpr::TableConstructor(_)) && !producer_temp_is_eligible(temp))
-                .then_some(temp)
-        })
-        .collect::<BTreeSet<_>>();
     let mut active = CallValues::new(uses);
     let mut active_allocations = AllocationHomes::default();
     let mut pending_copy_root_call_moves = BTreeMap::<HomeSlotKey, PendingCopyRootCallMove>::new();
@@ -607,7 +628,7 @@ pub(super) fn collect_call_root_lifetimes(
             if active.get(&home).is_some_and(|root| {
                 producer >= root.root_index && active.aliases(root.value_id).contains(&temp)
             }) {
-                active.remove(&home);
+                active.transfer(home);
                 active.forget_home_aliases(home);
             }
             if active_allocations.get(&home).is_some_and(|root| {
@@ -688,49 +709,34 @@ pub(super) fn collect_call_root_lifetimes(
                 &mut lifetimes,
             );
         }
-        if let Some(call) = direct_call_in_stmt(stmt)
-            && !matches!(stmt, HirStmt::Assign(assign)
-                if assign.targets.iter().any(|target| matches!(target,
-                    HirLValue::TableAccess(_) | HirLValue::Global(_))))
-        {
-            // 只在当前 callee/参数求值不含观察事件时，才可在 statement 前释放。
-            // 原始 dispatch 事实不允许把释放前移到已内联的 lookup、分配或嵌套调用之前。
-            if safety.is_discard_safe_without_residual(&call.callee)
-                && call.args.tail.is_none()
-                && call
-                    .args
-                    .fixed
-                    .iter()
-                    .all(|arg| safety.is_discard_safe_without_residual(arg))
-            {
-                for producer in &call.frame_root_ends {
-                    let Some(home) = facts.trusted_temp_home_slot(*producer) else {
-                        continue;
-                    };
-                    let Some(root) = active.get(&home) else {
-                        continue;
-                    };
-                    if !root.eligible
-                        || !active.aliases(root.value_id).contains(producer)
-                        || active.has_live_read_after(root.value_id, home)
-                        || active.aliases(root.value_id).iter().any(|temp| {
-                            facts.trusted_temp_home_slot(*temp) == Some(home)
-                                && uses.has_read_at(*temp, index)
-                        })
-                    {
-                        continue;
-                    }
-                    let root = active.remove(&home).unwrap();
-                    lifetimes.preserve_call_root(&root, home);
-                    lifetimes
-                        .call_dispatch_releases
-                        .entry(index)
-                        .or_default()
-                        .push(PhysicalRootOwner {
-                            root_index: root.root_index,
-                            home,
-                        });
+        if let Some(call) = call_with_inert_dispatch_prefix(stmt, safety) {
+            for producer in &call.frame_root_ends {
+                let Some(home) = facts.trusted_temp_home_slot(*producer) else {
+                    continue;
+                };
+                let Some(root) = active.get(&home) else {
+                    continue;
+                };
+                if !root.eligible
+                    || !active.aliases(root.value_id).contains(producer)
+                    || active.has_live_read_after(root.value_id, home)
+                    || active.aliases(root.value_id).iter().any(|temp| {
+                        facts.trusted_temp_home_slot(*temp) == Some(home)
+                            && uses.has_read_at(*temp, index)
+                    })
+                {
+                    continue;
                 }
+                let root = active.remove(&home).unwrap();
+                lifetimes.preserve_call_root(&root, home);
+                lifetimes
+                    .call_dispatch_releases
+                    .entry(index)
+                    .or_default()
+                    .push(PhysicalRootOwner {
+                        root_index: root.root_index,
+                        home,
+                    });
             }
         }
         let potential_observation = uses.events.block().stmt(index).may_observe_gc_roots();
@@ -743,6 +749,36 @@ pub(super) fn collect_call_root_lifetimes(
             observe_active_call_values(&mut active, None);
         }
         let read_values = active.read_values_at(index);
+        if let HirStmt::Return(ret) = stmt
+            && !active.is_empty()
+        {
+            let value_by_temp = active
+                .tracked_temps()
+                .filter_map(|temp| active.value_for_temp(temp).map(|value| (temp, value)))
+                .collect();
+            if let Some(observed) = return_roots::observed_return_roots(
+                &ret.values,
+                snapshot.scalar_definitions(),
+                &value_by_temp,
+                safety,
+            ) {
+                for value in observed {
+                    for &home in active.homes(value) {
+                        let root = active.get(&home).expect("active call value owns its home");
+                        if root.eligible
+                            && !root.explicit_fence_only
+                            && stmts[root.root_index].scalar_temp_assignment().is_some_and(
+                                |(temp, _)| facts.is_pure_scope_end_copy_root_temp(temp),
+                            )
+                        {
+                            // 参数内 callee 已消费后，外层调用仍可能观察原低槽根；
+                            // return 自身结束 frame 不能提前到内层调用结束（regress_352）。
+                            lifetimes.preserve_call_root(root, home);
+                        }
+                    }
+                }
+            }
+        }
         let read_observations = read_values
             .into_iter()
             .filter(|value| {
@@ -802,7 +838,7 @@ pub(super) fn collect_call_root_lifetimes(
             // SSA target。LocalRef 尚无本 collector 的值流事实，不在这里扩展为同 home 即同值。
             let root_index = active
                 .get(&home)
-                .filter(|root| active.aliases(root.value_id).contains(source))
+                .filter(|root| !root.transferred && active.aliases(root.value_id).contains(source))
                 .map(|root| root.root_index)
                 .or_else(|| {
                     let root = active_allocations.get(&home)?;
@@ -852,6 +888,7 @@ pub(super) fn collect_call_root_lifetimes(
                             observed: false,
                             preserved: false,
                             explicit_fence_only: false,
+                            transferred: false,
                         },
                     );
                 }
@@ -1040,7 +1077,7 @@ pub(super) fn collect_call_root_lifetimes(
         let same_value_in_target_home = matches!(value, HirExpr::TempRef(source)
             if active
                 .get(&slot)
-                .is_some_and(|root| active.aliases(root.value_id).contains(source)));
+                .is_some_and(|root| !root.transferred && active.aliases(root.value_id).contains(source)));
         active.forget_temp(temp);
 
         if matches!(value, HirExpr::Call(_))
@@ -1139,6 +1176,7 @@ pub(super) fn collect_call_root_lifetimes(
                         // its consuming expression. Only an explicit collection fence proves
                         // that the otherwise unread target home needs a standalone source owner.
                         explicit_fence_only: true,
+                        transferred: false,
                     },
                 );
             }
@@ -1157,71 +1195,14 @@ pub(super) fn collect_call_root_lifetimes(
                     observed: false,
                     preserved: false,
                     explicit_fence_only: false,
+                    transferred: false,
                 },
             );
         }
     }
 
-    // 物理槽复用不代表对象已被外部观察。共享对象流证明原始 allocation 在
-    // 覆盖点仍未逃逸时，不把内部 aggregate 存储固化成同一 local 的释放事务。
-    let allocation_roots = std::mem::take(&mut lifetimes.allocation_sites);
-    let allocation_releases = std::mem::take(&mut lifetimes.allocation_release_sites);
-    if !allocation_roots.is_empty() || !allocation_releases.is_empty() {
-        let queries = allocation_releases
-            .iter()
-            .map(|(&(index, _), site)| (index, site))
-            .chain(
-                lifetimes
-                    .roots_by_overwrite
-                    .iter()
-                    .flat_map(|(&index, pairs)| pairs.iter().map(move |pair| (index, pair)))
-                    .filter_map(|(index, pair)| {
-                        allocation_roots
-                            .get(&pair.root_index)
-                            .map(|site| (index, site))
-                    }),
-            )
-            .map(|(index, site)| (index, site.constructor(stmts)));
-        let objects = super::object_flow::AllocationEscapeFacts::analyze(
-            stmts,
-            context,
-            &opaque_allocations,
-            queries,
-        );
-        for ((index, temp), site) in allocation_releases {
-            if objects.proves_unescaped(site.constructor(stmts), index)
-                && let Some(releases) = lifetimes.pre_dispatch_releases.get_mut(&index)
-            {
-                releases.remove(&temp);
-            }
-        }
-        lifetimes
-            .pre_dispatch_releases
-            .retain(|_, releases| !releases.is_empty());
-        for (index, pairs) in &mut lifetimes.roots_by_overwrite {
-            pairs.retain(|pair| {
-                allocation_roots
-                    .get(&pair.root_index)
-                    .is_none_or(|site| !objects.proves_unescaped(site.constructor(stmts), *index))
-            });
-        }
-        lifetimes
-            .roots_by_overwrite
-            .retain(|_, pairs| !pairs.is_empty());
-        let retained = lifetimes
-            .roots_by_overwrite
-            .values()
-            .flatten()
-            .map(|pair| pair.root_index)
-            .collect::<BTreeSet<_>>();
-        for root in allocation_roots
-            .keys()
-            .filter(|root| !retained.contains(root))
-        {
-            lifetimes.roots.remove(root);
-            lifetimes.root_homes.remove(root);
-        }
-    }
+    // 覆盖当时尚未逃逸不授权丢弃终点：对象可以在之后经父表发布，而独立 HIR
+    // binding 仍可能被物化。完整构造器事务可消费自己的私有证明，原 home 终点始终保留。
     extend_physical_owner_overwrites(
         snapshot,
         facts,
@@ -1375,7 +1356,7 @@ fn release_roots_before_generic_dispatch(
                 .pre_dispatch_releases
                 .entry(index)
                 .or_default()
-                .insert(temp);
+                .insert((temp, *home));
         }
     }
 
@@ -1389,13 +1370,10 @@ fn release_roots_before_generic_dispatch(
                 .find(|temp| !uses.has_live_read_from(*temp, index))
         {
             lifetimes
-                .allocation_release_sites
-                .insert((index, temp), root.allocation_site);
-            lifetimes
                 .pre_dispatch_releases
                 .entry(index)
                 .or_default()
-                .insert(temp);
+                .insert((temp, *home));
         }
     }
 }
@@ -1418,7 +1396,7 @@ fn root_release_temp(
 pub(super) fn materialize_generic_for_dispatch_root_releases(
     block: &mut HirBlock,
     facts: &ProtoPromotionFacts,
-    context: RootAnalysisContext<'_>,
+    safety: HirExprSafety,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
 ) -> bool {
     // 释放端点只可能是当前 block 的显式 dispatch；子块由下面的递归独立处理。
@@ -1426,9 +1404,9 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
         matches!(stmt, HirStmt::GenericFor(for_stmt) if !for_stmt.dispatch_results.is_empty())
     }) {
         collect_call_root_lifetimes(
-            &RootLifetimeFacts::new(&block.stmts, facts, context.safety),
+            &RootLifetimeFacts::new(&block.stmts, facts, safety),
             facts,
-            context,
+            safety,
             true,
             &mut *temp_is_eligible,
             |_| RootOverwritePolicy::Reuse,
@@ -1440,13 +1418,32 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
     let old_stmts = std::mem::take(&mut block.stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len() + releases.len());
     for (index, mut stmt) in old_stmts.into_iter().enumerate() {
-        if let Some(temps) = releases.get(&index) {
-            for temp in temps {
+        if let Some(pairs) = releases.get(&index) {
+            let dispatch_results = dispatch_release_results(&stmt, facts);
+            let mut release_homes = BTreeMap::<TempId, Option<HomeSlotKey>>::new();
+            for &(temp, home) in pairs {
+                // 同一 allocation alias 可承担多个结果槽的旧根；仍只清零一次，但不
+                // 把一个 binding 的多个端点任意签成其中一个 result identity。
+                release_homes
+                    .entry(temp)
+                    .and_modify(|home| *home = None)
+                    .or_insert(Some(home));
+            }
+            for (temp, home) in release_homes {
+                let generic_for_dispatch_release = home.and_then(|home| {
+                    let (dispatch, results) = dispatch_results.as_ref()?;
+                    Some(HirGenericForDispatchRelease {
+                        dispatch: *dispatch,
+                        result_def: *results.get(&home)?,
+                        released: temp,
+                    })
+                });
                 new_stmts.push(HirStmt::Assign(Box::new(HirAssign {
-                    targets: vec![HirLValue::Temp(*temp)],
+                    targets: vec![HirLValue::Temp(temp)],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
                     initializer_merge_transaction: None,
                     generic_for_initializer_producer: None,
+                    generic_for_dispatch_release,
                     method_rewrite_transaction: None,
                 })));
             }
@@ -1454,7 +1451,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
         changed |= materialize_generic_for_dispatch_root_releases_in_stmt(
             &mut stmt,
             facts,
-            context,
+            safety,
             temp_is_eligible,
         );
         new_stmts.push(stmt);
@@ -1463,10 +1460,29 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
     changed
 }
 
+/// dispatch source 与 raw result home 由同一 loop owner 验证；缺少来源时保留原 nil 写，
+/// 不从相邻 iterator 文本或被释放 binding 的 possible home 反推协议身份。
+fn dispatch_release_results(
+    stmt: &HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> Option<(HirSourceSite, BTreeMap<HomeSlotKey, TempId>)> {
+    let HirStmt::GenericFor(for_) = stmt else {
+        return None;
+    };
+    facts.generic_for_body_frame(for_)?;
+    let dispatch = for_.body_frame_source?;
+    let results = for_
+        .dispatch_results
+        .iter()
+        .map(|result| Some((facts.home_slot(result.result_def)?, result.result_def)))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    Some((dispatch, results))
+}
+
 fn materialize_generic_for_dispatch_root_releases_in_stmt(
     stmt: &mut HirStmt,
     facts: &ProtoPromotionFacts,
-    context: RootAnalysisContext<'_>,
+    safety: HirExprSafety,
     temp_is_eligible: &mut impl FnMut(TempId) -> bool,
 ) -> bool {
     match stmt {
@@ -1475,14 +1491,14 @@ fn materialize_generic_for_dispatch_root_releases_in_stmt(
             let then_changed = materialize_generic_for_dispatch_root_releases(
                 &mut if_stmt.then_block,
                 facts,
-                context,
+                safety,
                 temp_is_eligible,
             );
             let else_changed = if_stmt.else_block.as_mut().is_some_and(|block| {
                 materialize_generic_for_dispatch_root_releases(
                     block,
                     facts,
-                    context,
+                    safety,
                     temp_is_eligible,
                 )
             });
@@ -1491,29 +1507,29 @@ fn materialize_generic_for_dispatch_root_releases_in_stmt(
         HirStmt::While(while_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut while_stmt.body,
             facts,
-            context,
+            safety,
             temp_is_eligible,
         ),
         HirStmt::Repeat(repeat_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut repeat_stmt.body,
             facts,
-            context,
+            safety,
             temp_is_eligible,
         ),
         HirStmt::NumericFor(for_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut for_stmt.body,
             facts,
-            context,
+            safety,
             temp_is_eligible,
         ),
         HirStmt::GenericFor(for_stmt) => materialize_generic_for_dispatch_root_releases(
             &mut for_stmt.body,
             facts,
-            context,
+            safety,
             temp_is_eligible,
         ),
         HirStmt::Block(block) => {
-            materialize_generic_for_dispatch_root_releases(block, facts, context, temp_is_eligible)
+            materialize_generic_for_dispatch_root_releases(block, facts, safety, temp_is_eligible)
         }
         HirStmt::LocalDecl(_)
         | HirStmt::GlobalDecl(_)
@@ -1556,10 +1572,6 @@ pub(super) fn collect_scalar_gc_root_lifetimes(
     {
         return ScalarGcRootLifetimeIndices::default();
     }
-    let definitions = stmts
-        .iter()
-        .filter_map(HirStmt::scalar_temp_assignment)
-        .collect::<BTreeMap<_, _>>();
     let reference_captured_temps = super::mention::stmts_reference_captured_bindings(stmts).temps;
     let mut active = BTreeMap::<HomeSlotKey, ActiveScalarGcHome>::new();
     let mut values = ScalarValues::new(uses);
@@ -1586,11 +1598,74 @@ pub(super) fn collect_scalar_gc_root_lifetimes(
             }
         }
 
+        if let HirStmt::CallStmt(call_stmt) = stmt
+            && let call = &call_stmt.call
+            && let HirExpr::TableAccess(access) = &call.callee
+            && let Some(protocol) =
+                super::method_protocol::match_method_setup_pair(access, &call.callee, call)
+                    .and_then(|id| facts.method_setup_protocol(id))
+            && let Some(prior) = protocol.prior_callee_root_temp
+            && let Some(home) = facts.trusted_temp_home_slot(protocol.callee_temp)
+            && facts.trusted_temp_home_slot(prior) == Some(home)
+            && let Some(root) = active.get(&home)
+            && root.eligible
+            && root.aliases.contains(&prior)
+            && !lifetimes.is_root(root.root_index)
+            && !root
+                .aliases
+                .iter()
+                .any(|temp| uses.has_live_read_after(*temp, index))
+        {
+            // 完整 SELF lookup 已在原 callee home 覆盖 receiver；独立首参 home 由
+            // argument handoff 管理。内嵌 lookup 仍须保持协议双端匹配，不能把已结束
+            // 的低槽根延续到下一次 receiver 读取（regress_316）。这里不删 producer
+            // 或插入提前释放，已有独立保活事务仍交给其原 endpoint owner。
+            let root = active.remove(&home).unwrap();
+            for alias in root.aliases {
+                values.remove(&alias, index);
+            }
+        }
+
+        if let Some(call) = call_with_inert_dispatch_prefix(stmt, safety) {
+            for producer in &call.frame_root_ends {
+                let Some(home) = facts.trusted_temp_home_slot(*producer) else {
+                    continue;
+                };
+                let Some(root) = active.get(&home) else {
+                    continue;
+                };
+                if !root.eligible
+                    || !root.aliases.contains(producer)
+                    || root
+                        .aliases
+                        .iter()
+                        .any(|temp| uses.has_live_read_from(*temp, index))
+                {
+                    continue;
+                }
+                let root = active.remove(&home).unwrap();
+                for alias in root.aliases {
+                    values.remove(&alias, index);
+                }
+                // 原 frame 在 dispatch 排除该 home。保留 producer 与终点为同一事务，
+                // 不能将读取结果提升为越过 callee 的独立 local（包括 LuaJIT frame gap）。
+                lifetimes.roots.insert(root.root_index);
+                lifetimes
+                    .call_dispatch_releases
+                    .entry(index)
+                    .or_default()
+                    .push(PhysicalRootOwner {
+                        root_index: root.root_index,
+                        home,
+                    });
+            }
+        }
+
         let Some((temp, value)) = stmt.scalar_temp_assignment() else {
             if let HirStmt::Return(return_stmt) = stmt {
                 observe_lookup_return_post_use_roots(
                     &return_stmt.values,
-                    &definitions,
+                    snapshot.scalar_definitions(),
                     &values.by_temp,
                     &mut active,
                     safety,
@@ -1738,6 +1813,16 @@ pub(super) fn collect_scalar_gc_root_lifetimes(
         };
         let eligible = temp_is_eligible(temp);
         let incoming_value = match value {
+            HirExpr::ParamRef(_) if facts.overwrites_unknown_scratch(temp) => {
+                Some(values.new_value(index, None))
+            }
+            HirExpr::TempRef(source) if facts.overwrites_unknown_scratch(temp) => Some(
+                values
+                    .by_temp
+                    .get(source)
+                    .copied()
+                    .unwrap_or_else(|| values.new_value(index, None)),
+            ),
             HirExpr::TableAccess(_) => Some(values.new_value(index, None)),
             HirExpr::Unary(_) | HirExpr::Binary(_) if !safety.result_is_gc_inert(value) => {
                 // 元方法可返回任意对象；独立结果槽在最后一次读取后仍可能是 GC root。
@@ -1799,6 +1884,7 @@ pub(super) fn collect_scalar_gc_root_lifetimes(
                         && !uses.events.block().has_touch_before(temp, index)
                         && !uses.has_read_at(temp, index),
                     crossed_observation: false,
+                    required_scratch_write: facts.overwrites_unknown_scratch(temp),
                     direct_result_home: matches!(
                         value,
                         HirExpr::TableAccess(_)
@@ -1902,13 +1988,7 @@ fn record_lookup_root_overwrite(
     values: &ScalarValues<'_>,
     lifetimes: &mut ScalarGcRootLifetimeIndices,
 ) {
-    if values.global_home(root.value_id).is_none()
-        // 已跨语句观察的 lookup 即使仍有活读，物化后也必须在后续 GC 前精确释放。
-        // overwrite 自身的求值不属于此前区间；相邻 lookup/copy 可由同一表达式临时槽接管。
-        && (root.crossed_observation
-            || values.observed(&root, index + 1, root.has_overwrite_proof)
-            || (uses.has_gc_fence_after(index)
-                && values.crossed_observer_before(root.root_index, index)))
+    if (root.required_scratch_write || values.global_home(root.value_id).is_none())
         && root.eligible
         && overwrite_is_eligible
         && !root
@@ -1916,7 +1996,20 @@ fn record_lookup_root_overwrite(
             .iter()
             .any(|alias| uses.has_live_read_after(*alias, index))
     {
-        lifetimes.roots.insert(root.root_index);
+        // 是否必须新增 root 与原 home 何时结束是两份事实。即使没有识别到显式 GC，
+        // 后续任意 callback 都能观察多保留的 lookup 值；已物化 owner 必须消费原端点。
+        if root.required_scratch_write
+            || root.crossed_observation
+            || values.observed(&root, index + 1, root.has_overwrite_proof)
+            || (uses.has_gc_fence_after(index)
+                && values.crossed_observer_before(root.root_index, index))
+        {
+            lifetimes.roots.insert(root.root_index);
+            lifetimes.retained_overwrites.insert(index);
+        }
+        if values.exposed(root.value_id) {
+            lifetimes.retained_overwrites.insert(index);
+        }
         lifetimes
             .roots_by_overwrite
             .entry(index)
@@ -1954,8 +2047,11 @@ fn preserve_lookup_roots_to_scope_end(
             .values()
             .filter(|root| {
                 root.eligible
-                    && (root.crossed_observation || values.observed(root, end, false))
-                    && (values.global_home(root.value_id).is_none()
+                    && (root.required_scratch_write
+                        || root.crossed_observation
+                        || values.observed(root, end, false))
+                    && (root.required_scratch_write
+                        || values.global_home(root.value_id).is_none()
                         || root.pure_scope_end_copy_root)
             })
             .map(|root| root.root_index),
@@ -1979,7 +2075,7 @@ fn observe_lookup_return_post_use_roots(
         return;
     }
     let Some(needs_independent_root) =
-        return_lookup::observed_return_lookup_roots(values, definitions, value_by_temp, safety)
+        return_roots::observed_return_roots(values, definitions, value_by_temp, safety)
     else {
         return;
     };
@@ -2378,7 +2474,15 @@ fn record_call_root_overwrite(
     if !eligible || !root.eligible || active.has_live_read_after(root.value_id, home) {
         return;
     }
-    if root.observed
+    if root.transferred || root.explicit_fence_only && uses.has_gc_fence_after(index) {
+        // 参数交接停止选择新增根，但不允许提前内联掉已有 owner 的最后覆写。
+        // COPY 也可因多次逻辑读取而在 locals 中物化，即使其原存活窗口没有显式 GC。
+        // 后续 GC 能观察延长的旧根，因此先保留精确结束写；物化选择仍留给 binding
+        // owner，不能为了保住端点而把每个透明 COPY 升级成必须新增的 root。
+        lifetimes.retained_overwrites.insert(index);
+    }
+    if !root.transferred
+        && root.observed
         && (root.preserved
             || uses.has_gc_fence_after(index)
             || !active.value_has_live_read_after(root.value_id))
@@ -2463,6 +2567,7 @@ impl HirVisitor<'_> for LocalUseCollector {
 pub(super) struct RootLifetimeFacts<'a> {
     stmts: &'a [HirStmt],
     uses: TempUseEvents<'a>,
+    scalar_definitions: std::cell::OnceCell<BTreeMap<TempId, &'a HirExpr>>,
 }
 
 impl<'a> RootLifetimeFacts<'a> {
@@ -2485,11 +2590,10 @@ impl<'a> RootLifetimeFacts<'a> {
             None => RootEvents::Owned(Box::new(RootEventIndex::new(stmts, facts, safety))),
         };
         let scope = events.block();
-        let gc_fence_indices = collect_gc_fences(stmts, |index, _, temps, locals| {
-            scope.is_gc_fence(index, temps, locals)
-        });
+        let gc_fence_indices = collect_gc_fences(stmts, scope);
         Self {
             stmts,
+            scalar_definitions: std::cell::OnceCell::new(),
             uses: TempUseEvents {
                 events,
                 gc_fence_indices,
@@ -2499,6 +2603,15 @@ impl<'a> RootLifetimeFacts<'a> {
 
     fn stack_writes_at(&self, index: usize) -> RootEventStmt<'_> {
         self.uses.events.block().stmt(index)
+    }
+
+    fn scalar_definitions(&self) -> &BTreeMap<TempId, &'a HirExpr> {
+        self.scalar_definitions.get_or_init(|| {
+            self.stmts
+                .iter()
+                .filter_map(HirStmt::scalar_temp_assignment)
+                .collect()
+        })
     }
 }
 
@@ -2620,62 +2733,66 @@ impl TempUseEvents<'_> {
     }
 }
 
-fn collect_gc_fences(
-    stmts: &[HirStmt],
-    mut is_fence: impl FnMut(usize, &HirStmt, &BTreeSet<TempId>, &BTreeSet<LocalId>) -> bool,
-) -> BTreeSet<usize> {
-    let mut temp_aliases = BTreeSet::new();
-    let mut local_aliases = BTreeSet::new();
+fn collect_gc_fences(stmts: &[HirStmt], events: RootEventBlock<'_>) -> BTreeSet<usize> {
+    let mut aliases = BTreeSet::new();
     let mut fences = BTreeSet::new();
+    let mut writes = Vec::new();
     for (index, stmt) in stmts.iter().enumerate() {
-        if is_fence(index, stmt, &temp_aliases, &local_aliases) {
+        if events.is_gc_fence(index, &aliases) {
             fences.insert(index);
         }
-
+        let is_alias = |value: Option<&HirExpr>| {
+            value.is_some_and(|value| {
+                matches!(value, HirExpr::GlobalRef(global) if global.key.as_bytes() == b"collectgarbage")
+                    || HirBinding::from_expr(value).is_some_and(|binding| aliases.contains(&binding))
+            })
+        };
+        // 所有 RHS 读取同一个旧快照；即使 f,g=g,f 或 f=f，也先求值再更新目标。
+        // MOVE 只转交 callable 身份，不能丢掉之后 GC 对旧物理根覆盖端点的观察。
         match stmt {
             HirStmt::Assign(assign) => {
-                if let [target] = assign.targets.as_slice() {
-                    match target {
-                        HirLValue::Temp(temp) => {
-                            temp_aliases.remove(temp);
-                            if value_is_collectgarbage(&assign.values) {
-                                temp_aliases.insert(*temp);
-                            }
-                        }
-                        HirLValue::Local(local) => {
-                            local_aliases.remove(local);
-                            if value_is_collectgarbage(&assign.values) {
-                                local_aliases.insert(*local);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                writes.extend(assign.targets.iter().enumerate().filter_map(|(i, target)| {
+                    HirBinding::from_lvalue(target)
+                        .filter(|binding| {
+                            matches!(binding, HirBinding::Temp(_) | HirBinding::Local(_))
+                        })
+                        .map(|binding| (binding, is_alias(assign.values.result_source(i))))
+                }))
             }
             HirStmt::LocalDecl(decl) => {
-                if let ([binding], [value], None) = (
-                    decl.bindings.as_slice(),
-                    decl.values.fixed.as_slice(),
-                    &decl.values.tail,
-                ) {
-                    local_aliases.remove(binding);
-                    if matches!(value, HirExpr::GlobalRef(global) if global.key.as_bytes() == b"collectgarbage")
-                    {
-                        local_aliases.insert(*binding);
-                    }
-                }
+                writes.extend(decl.bindings.iter().enumerate().map(|(i, local)| {
+                    (
+                        HirBinding::Local(*local),
+                        is_alias(decl.values.result_source(i)),
+                    )
+                }))
             }
-            _ => {}
+            HirStmt::LocalRootRelease(local) => writes.push((HirBinding::Local(*local), false)),
+            HirStmt::If(_)
+            | HirStmt::While(_)
+            | HirStmt::Repeat(_)
+            | HirStmt::NumericFor(_)
+            | HirStmt::GenericFor(_)
+            | HirStmt::Block(_) => {
+                // 本投影不求解分支后态；嵌套调用已按入口别名纳入当前语句。
+                events.invalidate_written_aliases(index, &mut aliases);
+                continue;
+            }
+            HirStmt::Label(_) | HirStmt::Goto(_) => {
+                aliases.clear();
+                continue;
+            }
+            _ => continue,
+        };
+        for (binding, known) in writes.drain(..) {
+            if known {
+                aliases.insert(binding);
+            } else {
+                aliases.remove(&binding);
+            }
         }
     }
     fences
-}
-
-fn value_is_collectgarbage(values: &crate::hir::common::HirValuePack) -> bool {
-    matches!(
-        (values.fixed.as_slice(), &values.tail),
-        ([HirExpr::GlobalRef(global)], None) if global.key.as_bytes() == b"collectgarbage"
-    )
 }
 
 #[derive(Default)]
@@ -2737,6 +2854,23 @@ fn method_receiver_protocol_sink(
         return None;
     };
     Some(*candidate)
+}
+
+fn call_with_inert_dispatch_prefix(stmt: &HirStmt, safety: HirExprSafety) -> Option<&HirCallExpr> {
+    let call = direct_call_in_stmt(stmt)?;
+    // 只能在当前 callee/参数求值无观察时，于 statement 前释放精确 dispatch 终止的根。
+    // 表/global 目标在调用前也可能求值，不允许把释放前移越过这些事件。
+    (!matches!(stmt, HirStmt::Assign(assign)
+        if assign.targets.iter().any(|target| matches!(target,
+            HirLValue::TableAccess(_) | HirLValue::Global(_))))
+        && safety.is_discard_safe_without_residual(&call.callee)
+        && call.args.tail.is_none()
+        && call
+            .args
+            .fixed
+            .iter()
+            .all(|arg| safety.is_discard_safe_without_residual(arg)))
+    .then_some(call)
 }
 
 fn direct_call_in_stmt(stmt: &HirStmt) -> Option<&HirCallExpr> {
@@ -2848,9 +2982,6 @@ fn record_allocation_root_overwrite(
             .any(|alias| uses.has_live_read_after(*alias, index))
     {
         let root_index = owner.definition_index;
-        lifetimes
-            .allocation_sites
-            .insert(root_index, root.allocation_site);
         lifetimes.roots.insert(root_index);
         lifetimes
             .root_homes
@@ -2905,6 +3036,11 @@ impl HirVisitor<'_> for StackWriteCollector<'_> {
                 for result in &for_stmt.dispatch_results {
                     self.summary
                         .note_home(self.facts.home_slot(result.result_def));
+                }
+            }
+            HirStmt::NumericFor(for_stmt) => {
+                for home in for_stmt.control_homes {
+                    self.summary.note_home(Some(home));
                 }
             }
             HirStmt::GlobalDecl(_)

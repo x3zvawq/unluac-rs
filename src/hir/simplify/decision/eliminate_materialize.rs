@@ -7,9 +7,11 @@
 //!
 //! 例子：
 //! - 输入：`target = Decision(a ? b : c)`
-//! - 输出：`local tmp; if a then tmp = b else tmp = c end; target = tmp`
+//! - 输出：`if a then target = b else target = c end`
 //! - 两臂相同或 truthiness 已知时，只有可安全丢弃的 test 才能删除控制壳
 //! - 后项产生 statement prefix 时，先快照此前仍待求值的同级表达式
+//! - Decision 的现存目标只在选中终端值后写入；例如 `x = d ? next : x` 可直接
+//!   还原条件赋值。逻辑值物化会先写中间值，仍需独立 carrier，不能提前覆盖旧 root/cell。
 
 use std::mem;
 
@@ -67,6 +69,7 @@ pub(super) fn extract_call_expr(
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirCallExpr, bool) {
     let HirCallExpr {
+        source_site,
         argument_roots,
         frame_root_ends,
         callee,
@@ -85,6 +88,7 @@ pub(super) fn extract_call_expr(
     (
         prefix,
         HirCallExpr {
+            source_site,
             argument_roots,
             frame_root_ends,
             callee,
@@ -238,6 +242,7 @@ pub(super) fn extract_assign(
 ) -> (Vec<HirStmt>, HirAssign, bool) {
     let initializer_merge_transaction = assign.initializer_merge_transaction;
     let generic_for_initializer_producer = assign.generic_for_initializer_producer;
+    let generic_for_dispatch_release = assign.generic_for_dispatch_release;
     let mut leading = Vec::new();
     let mut target_shapes = Vec::with_capacity(assign.targets.len());
     for target in assign.targets {
@@ -245,9 +250,9 @@ pub(super) fn extract_assign(
             HirLValue::TableAccess(access) => {
                 leading.push(access.base);
                 leading.push(access.key);
-                target_shapes.push(None);
+                target_shapes.push(Err(access.sources));
             }
-            target => target_shapes.push(Some(target)),
+            target => target_shapes.push(Ok(target)),
         }
     }
 
@@ -257,8 +262,9 @@ pub(super) fn extract_assign(
     let targets = target_shapes
         .into_iter()
         .map(|target| {
-            target.unwrap_or_else(|| {
+            target.unwrap_or_else(|sources| {
                 HirLValue::TableAccess(Box::new(HirTableAccess {
+                    sources,
                     metamethod_free: false,
                     base: leading
                         .next()
@@ -286,6 +292,9 @@ pub(super) fn extract_assign(
                 .flatten(),
             generic_for_initializer_producer: (!changed)
                 .then_some(generic_for_initializer_producer)
+                .flatten(),
+            generic_for_dispatch_release: (!changed)
+                .then_some(generic_for_dispatch_release)
                 .flatten(),
             method_rewrite_transaction: None,
         },
@@ -348,6 +357,15 @@ pub(super) fn materialize_expr_for_assignment(
 ) -> Vec<HirStmt> {
     if matches!(target, HirLValue::Temp(_)) {
         return materialize_expr_into_target(expr, target, state, safety);
+    }
+
+    if !expr_contains_eliminable_decision(&expr) {
+        return vec![assign_stmt(target, expr)];
+    }
+    if let HirExpr::Decision(decision) = expr {
+        // Decision 的测试不写目标，且每条终端路径只提交一次。不能先折成 logical
+        // 再使用其逐步物化通道；后者可能在后续 RHS 事件前覆盖旧 local/upvalue。
+        return materialize_decision_node(&decision, decision.entry.index(), target, state, safety);
     }
 
     let result = state.alloc_local();
@@ -518,7 +536,7 @@ fn materialize_decision_target(
             current_value.cloned().unwrap_or_else(|| node.test.clone()),
         )],
         HirDecisionTarget::Expr(expr) => {
-            materialize_expr_into_target(expr.clone(), target, state, safety)
+            materialize_expr_for_assignment(expr.clone(), target, state, safety)
         }
     }
 }
@@ -549,6 +567,7 @@ fn prepare_pure_expr(
             (prefix, HirExpr::LocalRef(local))
         }
         HirExpr::TableAccess(access) => {
+            let sources = access.sources;
             let method_setup_protocol = access.method_setup_protocol;
             let metamethod_free = access.metamethod_free;
             let (prefix, exprs) =
@@ -563,6 +582,7 @@ fn prepare_pure_expr(
             (
                 prefix,
                 HirExpr::TableAccess(Box::new(HirTableAccess {
+                    sources,
                     metamethod_free,
                     base,
                     key,
@@ -574,7 +594,11 @@ fn prepare_pure_expr(
             let (prefix, expr) = prepare_pure_expr(unary.expr, state, safety);
             (
                 prefix,
-                HirExpr::Unary(Box::new(HirUnaryExpr { op: unary.op, expr })),
+                HirExpr::Unary(Box::new(HirUnaryExpr {
+                    source_site: unary.source_site,
+                    op: unary.op,
+                    expr,
+                })),
             )
         }
         HirExpr::Binary(binary) => {
@@ -590,6 +614,7 @@ fn prepare_pure_expr(
             (
                 prefix,
                 HirExpr::Binary(Box::new(HirBinaryExpr {
+                    source_site: binary.source_site,
                     op: binary.op,
                     lhs,
                     rhs,
@@ -659,16 +684,19 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
             })
         }
         HirExpr::TableAccess(access) => Some(HirExpr::TableAccess(Box::new(HirTableAccess {
+            sources: access.sources.clone(),
             metamethod_free: access.metamethod_free,
             base: collapse_expr_to_pure(access.base, safety)?,
             key: collapse_expr_to_pure(access.key, safety)?,
             method_setup_protocol: access.method_setup_protocol,
         }))),
         HirExpr::Unary(unary) => Some(HirExpr::Unary(Box::new(HirUnaryExpr {
+            source_site: unary.source_site,
             op: unary.op,
             expr: collapse_expr_to_pure(unary.expr, safety)?,
         }))),
         HirExpr::Binary(binary) => Some(HirExpr::Binary(Box::new(HirBinaryExpr {
+            source_site: binary.source_site,
             op: binary.op,
             lhs: collapse_expr_to_pure(binary.lhs, safety)?,
             rhs: collapse_expr_to_pure(binary.rhs, safety)?,
@@ -715,7 +743,9 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
                 None => None,
             };
             Some(HirExpr::TableConstructor(Box::new(HirTableConstructor {
+                sources: table.sources,
                 allocation: table.allocation,
+                implicit_template_fields: table.implicit_template_fields,
                 fields,
                 trailing_multivalue,
             })))
@@ -737,6 +767,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         None => None,
     };
     Some(HirCallExpr {
+        source_site: call.source_site,
         argument_roots: Vec::new(),
         frame_root_ends: call.frame_root_ends,
         callee,
@@ -817,7 +848,9 @@ fn prepare_table_constructor(
     (
         extracted.prefix,
         HirTableConstructor {
+            sources: table.sources,
             allocation: table.allocation,
+            implicit_template_fields: table.implicit_template_fields,
             fields,
             trailing_multivalue,
         },
@@ -897,6 +930,7 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => false,
     };
@@ -956,6 +990,7 @@ fn assign_stmt(target: HirLValue, value: HirExpr) -> HirStmt {
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        generic_for_dispatch_release: None,
         method_rewrite_transaction: None,
     }))
 }

@@ -63,7 +63,7 @@ fn materialize_tail_scopes(
                 let HirStmt::Return(ret) = &block.stmts[return_index] else {
                     unreachable!("the terminal empty Return was checked above");
                 };
-                if ret.source_instr != Some(source) {
+                if ret.pending_cleanup_source != Some(source) {
                     // 候选拒绝[ProofIncomplete]：原始返回事务的两部分已不匹配，不能切开尾部猜词法边界。
                     return false;
                 }

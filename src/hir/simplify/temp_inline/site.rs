@@ -428,6 +428,7 @@ impl EvalOrderProbe<'_> {
             | HirExpr::LocalRef(_)
             | HirExpr::UpvalueRef(_)
             | HirExpr::GlobalRef(_)
+            | HirExpr::CaptureInitializer(_)
             | HirExpr::VarArg
             | HirExpr::Unresolved(_) => None,
         }
@@ -480,6 +481,11 @@ fn find_site_in_call(call: &HirCallExpr, temp: TempId, site: InlineSite) -> Opti
         } else {
             InlineSite::CallCallee
         }
+    } else if site == InlineSite::CallArg {
+        // 参数内的调用仍必达，callee 是其 eager operand；不能降成只允许纯值的
+        // Nested，也不能冒充外层 CallCallee，后者会把更早参数误判为跨 callee 移动。
+        // 实际前缀事件、捕获与物理根继续由共同 inline guard 证明。
+        InlineSite::EagerOperand
     } else {
         site.nested()
     };
@@ -651,6 +657,7 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
         | HirExpr::LocalRef(_)
         | HirExpr::UpvalueRef(_)
         | HirExpr::GlobalRef(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => None,
     }
@@ -726,6 +733,7 @@ fn expr_complexity(expr: &HirExpr) -> usize {
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::GlobalRef(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => 1,
         HirExpr::Unary(unary) => 1 + expr_complexity(&unary.expr),
@@ -1072,7 +1080,8 @@ fn is_small_pure_nested_inline_expr(expr: &HirExpr) -> bool {
             is_small_pure_nested_inline_expr(&logical.lhs)
                 && is_small_pure_nested_inline_expr(&logical.rhs)
         }
-        HirExpr::VarArg
+        HirExpr::CaptureInitializer(_)
+        | HirExpr::VarArg
         | HirExpr::TableAccess(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)

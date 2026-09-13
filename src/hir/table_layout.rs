@@ -73,8 +73,54 @@ pub(in crate::hir) fn candidate_template_array_capacity(
     crate::value_semantics::table::template_array_capacity(fields, count as u32)
 }
 
-/// 完整构造区域提交时，为必须在运行时读取的常量建立显式 operand binding。
-/// 只提前求值无事件的原始字面量叶子，运算、比较与错误仍留在原字段位置。
+#[derive(Default)]
+pub(in crate::hir) struct RuntimeTableOperandRequirements {
+    pub keys: bool,
+    pub values: bool,
+}
+
+impl RuntimeTableOperandRequirements {
+    pub fn any(&self) -> bool {
+        self.keys || self.values
+    }
+}
+
+/// 当前树还需物化的常量操作数；构造器合并与调用帧前缀共同消费分配约束。
+pub(in crate::hir) fn runtime_table_operand_requirements(
+    table: &super::common::HirTableConstructor,
+) -> RuntimeTableOperandRequirements {
+    #[derive(Default)]
+    struct Probe(RuntimeTableOperandRequirements);
+    impl Probe {
+        fn table(&mut self, table: &super::common::HirTableConstructor) {
+            let Some(constraint) = table.allocation.initialization_constraint() else {
+                return;
+            };
+            let mut next_array = 0;
+            for field in &table.fields {
+                match runtime_table_operand(constraint, field_ref(field, &mut next_array)) {
+                    Some(TableRuntimeOperand::Key) => self.0.keys = true,
+                    Some(TableRuntimeOperand::Value) => self.0.values = true,
+                    None => {}
+                }
+            }
+        }
+    }
+    impl HirVisitor<'_> for Probe {
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            if let HirExpr::TableConstructor(table) = expr {
+                self.table(table);
+            }
+        }
+    }
+    let mut probe = Probe::default();
+    probe.table(table);
+    super::visit::visit_table_constructor(table, &mut probe);
+    probe.0
+}
+
+/// 完整构造区域提交时只物化无事件的字面量叶子，运算与错误留在原字段位置。
+/// 与只读需求查询消费相同的字段约束，调用方先证明新增声明的位置合法。
 pub(in crate::hir) fn materialize_runtime_table_operands(
     table: &mut super::common::HirTableConstructor,
     next_local: &mut usize,

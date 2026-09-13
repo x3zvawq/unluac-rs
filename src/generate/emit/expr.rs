@@ -132,6 +132,25 @@ impl<'a> Emitter<'a> {
             AstExpr::Integer(value) => {
                 numeric_literal(format_integer(*value, self.options.number_format))
             }
+            AstExpr::CaptureInitializer(value) => {
+                if self.target.version != crate::decompile::DecompileDialect::Luau {
+                    return Err(GenerateError::UnsupportedFeature {
+                        dialect: self.target.version,
+                        feature: "Luau capture initializer",
+                    });
+                }
+                // HIR 已证明 r0/r1 的初始化事务；不能先降成普通表达式树再折叠。
+                if let crate::hir::HirCaptureInitializer::NegatedNumericString(number) = value {
+                    let opposite = format_number(-number.to_f64(), false);
+                    return Ok(Doc::text(format!("(-\"{opposite}\")")));
+                }
+                let literal = format_number(value.number().to_f64(), false);
+                (
+                    Doc::text(format!("((...) and ({literal}) or ({literal}))")),
+                    PREC_LITERAL,
+                    Assoc::Non,
+                )
+            }
             AstExpr::Number(value) => numeric_literal(format_number(
                 *value,
                 target_preserves_float_type(self.target.version),

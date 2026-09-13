@@ -231,6 +231,15 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let mut targets = Vec::with_capacity(copies.len());
         let mut values = Vec::with_capacity(copies.len());
         for (phi, value) in copies {
+            // 已消费的 numeric-for 协议把该 phi 的读取投影到语法 binding；同值
+            // BodyPrologue 动作也由它提供。不能绕回 phi_temps 再产生一个带 debug
+            // 名字的无人读取副本，否则每次再编译都新增 index2。这里只省略合成
+            // phase/edge copy，原指令的数组 buffer MOVE 仍由 instr lowering 保留。
+            if matches!(self.lowering.bindings.expr_for_phi(phi),
+                HirExpr::LocalRef(local) if value == HirExpr::LocalRef(local))
+            {
+                continue;
+            }
             let target = self
                 .lowering
                 .bindings

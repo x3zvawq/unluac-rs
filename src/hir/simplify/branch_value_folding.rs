@@ -44,7 +44,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::label_refs::count_label_references;
 use super::local_shapes::empty_single_local_decl_binding;
 use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_temp};
-use super::object_flow::RootAnalysisContext;
 use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
 use super::temp_touch::collect_temp_touch_positions;
 use super::walk::{HirRewritePass, rewrite_block};
@@ -67,9 +66,8 @@ pub(super) fn fold_branch_values_in_proto(
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
-    roots: RootAnalysisContext<'_>,
+    safety: HirExprSafety,
 ) -> bool {
-    let safety = HirExprSafety::for_dialect(dialect);
     let exposed_temps = fold_root_branch_value_temps(proto, safety, facts);
     let raw_temp_changed = !exposed_temps.is_empty();
     inline_exposed_branch_value_sinks_in_proto_with_facts(
@@ -78,7 +76,7 @@ pub(super) fn fold_branch_values_in_proto(
         readability,
         facts,
         dialect,
-        roots,
+        safety,
     );
     let label_refs = count_label_references(&proto.body.stmts);
     let local_scope_facts = BranchValueLocalScopeFacts::new(
@@ -198,6 +196,7 @@ fn fold_nil_fallback_decision_locals_in_block(
                         values: HirValuePack::fixed(vec![rewrite.fallback]),
                         initializer_merge_transaction: None,
                         generic_for_initializer_producer: None,
+                        generic_for_dispatch_release: None,
                         method_rewrite_transaction: None,
                     }))],
                 },
@@ -462,6 +461,7 @@ fn negated_nil_check_local(expr: &HirExpr) -> Option<LocalId> {
 
 fn nil_check_for_local(local: LocalId) -> HirExpr {
     HirExpr::Binary(Box::new(HirBinaryExpr {
+        source_site: None,
         op: HirBinaryOpKind::Eq,
         lhs: HirExpr::LocalRef(local),
         rhs: HirExpr::Nil,
@@ -1052,6 +1052,7 @@ fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt 
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        generic_for_dispatch_release: None,
         method_rewrite_transaction: None,
     }))
 }

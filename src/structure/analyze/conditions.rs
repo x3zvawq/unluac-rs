@@ -85,9 +85,13 @@ pub(super) fn selected_conditions(
         if condition_crosses_foreign_loop_header(candidate, loops, &loops_by_condition_header) {
             continue;
         }
-        let Some(candidate) =
-            safe_condition_candidate(cfg, dataflow, candidate, &mut condition_safety_workspace)
-        else {
+        let Some(candidate) = safe_condition_candidate(
+            proto,
+            cfg,
+            dataflow,
+            candidate,
+            &mut condition_safety_workspace,
+        ) else {
             continue;
         };
         let arcs =
@@ -119,6 +123,7 @@ pub(super) fn selected_conditions(
             continue;
         }
         let Some(candidate) = safe_condition_candidate(
+            proto,
             cfg,
             dataflow,
             &evidence.candidate,

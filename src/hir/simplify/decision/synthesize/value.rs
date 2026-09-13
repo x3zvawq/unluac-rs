@@ -128,6 +128,7 @@ fn exact_eval_trace(
 
 fn trace_sequence_expr(discarded: HirExpr, continuation: HirExpr) -> HirExpr {
     let booleanized = HirExpr::Unary(Box::new(HirUnaryExpr {
+        source_site: None,
         op: HirUnaryOpKind::Not,
         expr: discarded,
     }));

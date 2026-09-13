@@ -83,7 +83,7 @@ impl AbstractValue {
 }
 
 /// 综合域与成本模型共用原子身份，后者不再维护一份可能漏掉方言值的字面量清单。
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(super) enum AtomKey {
     Value(AbstractValue),
     Ref(RefKey),

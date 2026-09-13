@@ -5,10 +5,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod operation_sources;
+pub(crate) use operation_sources::{HirOperationSources, HirSourceFactsCache};
+
 use crate::LuaString;
 use crate::parser::{ProtoLineRange, ProtoSignature};
 use crate::recovery::ProtoFailure;
-use crate::transformer::FastCallArgs;
+use crate::transformer::FastCallProtocol;
 use crate::transformer::InstrRef;
 
 /// 整个 chunk 的 HIR 根对象。
@@ -135,10 +138,14 @@ impl HirInlineDisposition {
 pub enum HirInlineRetentionReason {
     /// 删除快照会让引用捕获观察到另一个 value epoch。
     CapturedValueEpoch,
+    /// 常量传播会删除原按值捕获，改变 Fresh 或非自反 capture 的闭包对象身份。
+    SharedClosureIdentity,
     /// 常量替换会改变运行时建表与模板复制的分配方式。
     TableInitialization,
     /// 值计算中的 Boolean 覆盖不能转为谓词极性；后者可能不再发射原覆盖操作。
     BooleanValueContext,
+    /// 原调用或 scratch 覆盖事务依赖已有声明组成的物理帧前缀，不能删除、移位或提前结束。
+    PhysicalFramePrefix,
 }
 
 /// 单个 proto 内跨 temp/local 身份提升保存的重写结论。
@@ -219,10 +226,22 @@ pub enum HirControlFlowFeature {
 /// 已由 Structure 绑定到唯一 SSA 身份的源码 debug local 区间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HirDebugScope {
+    /// 原显式声明的 canonical 结果身份；Entry/phi 不伪造一条初始化指令。
+    pub(crate) initializer_temp: Option<TempId>,
+    /// 原作用域恰从这个布尔分支结果的合流开始；只供同一 predicate/result 的壳恢复。
+    pub(crate) branch_initializer: Option<HirDebugBranchInitializer>,
     pub start_pc: u32,
     pub end_pc: u32,
     /// 该 debug 区间在函数终结 Return 指令执行前结束。
     pub ends_before_return: bool,
+}
+
+/// 单谓词的 true/false region-result 与 debug 声明入口共同证明的初始化身份。
+/// condition 保留具体原指令，防止同一 local 后续的其它布尔写借用声明证明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HirDebugBranchInitializer {
+    pub(crate) result: TempId,
+    pub(crate) condition: HirSourceSite,
 }
 
 /// proto 的稳定引用。
@@ -445,6 +464,21 @@ impl HirStmt {
     }
 }
 
+/// 原 owner 已证明的标量捕获初始化方式；两类事务不能由后层按源码上下文互换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirCaptureInitializer {
+    FirstVararg(crate::transformer::NumberLiteral),
+    NegatedNumericString(crate::transformer::NumberLiteral),
+}
+
+impl HirCaptureInitializer {
+    pub fn number(self) -> crate::transformer::NumberLiteral {
+        match self {
+            Self::FirstVararg(number) | Self::NegatedNumericString(number) => number,
+        }
+    }
+}
+
 /// HIR 表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirExpr {
@@ -452,10 +486,15 @@ pub enum HirExpr {
     Boolean(bool),
     Integer(i64),
     Number(f64),
+    /// 已证明的 r0/r1 标量捕获初始化；值域不授权删除其原槽准备。
+    CaptureInitializer(HirCaptureInitializer),
     String(LuaString),
     Int64(i64),
     UInt64(u64),
-    Complex { real: f64, imag: f64 },
+    Complex {
+        real: f64,
+        imag: f64,
+    },
     Vector(crate::parser::VectorLiteral),
     ParamRef(ParamId),
     LocalRef(LocalId),
@@ -481,6 +520,7 @@ impl HirExpr {
         match self {
             HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => unary.expr,
             expr => HirExpr::Unary(Box::new(HirUnaryExpr {
+                source_site: None,
                 op: HirUnaryOpKind::Not,
                 expr,
             })),
@@ -511,6 +551,8 @@ pub struct HirGlobalRef {
 /// 表访问。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirTableAccess {
+    /// 互斥合并保留全部原访问；合成访问无来源，物理许可须对每个原操作求交。
+    pub(crate) sources: HirOperationSources,
     pub base: HirExpr,
     pub key: HirExpr,
     /// Dataflow 证明该次读取的接收者没有元表；不证明值不变，也不授权跨写入移动读取。
@@ -522,6 +564,8 @@ pub struct HirTableAccess {
 /// 一元表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirUnaryExpr {
+    /// 原操作身份随表达式内联保留；物理写回由 Promotion 查询，不由表达式外形推断。
+    pub(crate) source_site: Option<HirSourceSite>,
     pub op: HirUnaryOpKind,
     pub expr: HirExpr,
 }
@@ -529,9 +573,34 @@ pub struct HirUnaryExpr {
 /// 二元表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirBinaryExpr {
+    /// 原二元操作或比较谓词身份；CONCAT 只在最外节点记录。条件比较本身没有结果槽，
+    /// 后继 LOADBOOL 的物理写回必须另由冻结的 region/phi 事实证明。
+    pub(crate) source_site: Option<HirSourceSite>,
     pub op: HirBinaryOpKind,
     pub lhs: HirExpr,
     pub rhs: HirExpr,
+}
+
+impl HirBinaryExpr {
+    /// 一条原 CONCAT 的右结合展开；只有最外节点持有指令身份，内部没有独立写回事件。
+    pub(crate) fn concat(source: HirSourceSite, mut parts: Vec<HirExpr>) -> Option<HirExpr> {
+        let last = parts.pop()?;
+        if parts.is_empty() {
+            return Some(last);
+        }
+        let mut value = parts.into_iter().rfold(last, |rhs, lhs| {
+            HirExpr::Binary(Box::new(Self {
+                source_site: None,
+                op: HirBinaryOpKind::Concat,
+                lhs,
+                rhs,
+            }))
+        });
+        if let HirExpr::Binary(binary) = &mut value {
+            binary.source_site = Some(source);
+        }
+        Some(value)
+    }
 }
 
 /// 逻辑短路表达式。
@@ -623,19 +692,28 @@ pub enum HirBinaryOpKind {
     Le,
 }
 
+/// 原指令的跨改写身份。相同原操作的 clone 保留身份；合成操作没有此证书。
+/// 它不证明当前操作数不变，值摘要仍须在同一模块快照内合流全部 occurrence。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HirSourceSite {
+    pub(crate) proto: HirProtoRef,
+    pub(crate) instr: InstrRef,
+}
+
 /// 调用表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCallExpr {
+    pub(crate) source_site: Option<HirSourceSite>,
     /// 原始参数槽交给该 call 的事实；只供 HIR 消费，不向 AST 泄漏物理槽协议。
     pub argument_roots: Vec<HirCallArgumentRoot>,
-    /// 原始 caller home 在该精确 dispatch 处结束的 call result 身份。
+    /// 原始 caller home 在该精确 dispatch 处结束的固定定义身份。
     /// 此前可能已有观察；消费者须核对当前值流与 callee/参数求值顺序，不能提前释放。
     pub(crate) frame_root_ends: Vec<TempId>,
     pub callee: HirExpr,
     pub args: HirValuePack,
     pub method: HirMethodCall,
     /// Luau FASTCALL 协议证明 fallback callee setup 位于参数物化之后，仅用于恢复源码求值顺序。
-    pub fastcall: Option<FastCallArgs>,
+    pub fastcall: Option<FastCallProtocol>,
     /// 来自 `SELF` / `NAMECALL` 的 method raw key 事实。
     ///
     /// 这一层显式保留字段的原始字节，是为了避免后面的 AST build 再去猜
@@ -939,8 +1017,20 @@ pub struct HirAssign {
     /// 只证明该 assignment occurrence 属于某个 generic-for initializer；删除、移动、
     /// 展开与 capture/lifetime 合法性仍由 consumer 重新验证。
     pub generic_for_initializer_producer: Option<HirGenericForInitializerProducerId>,
+    /// 原 generic-for dispatch 的旧根释放端点；仍是普通 nil 写，不授权独立删除。
+    pub(crate) generic_for_dispatch_release: Option<HirGenericForDispatchRelease>,
     /// 与紧邻 method call 配对的一次性 HIR 改写事务。
     pub method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
+}
+
+/// 将原 root binding 与同一 generic-for dispatch 的 result endpoint 配对。
+/// producer 或 outer constructor 被消费不代表 endpoint 可删除；完整 header 事务还须
+/// 核对原 initializer、result home 与源码前缀。released 保留 locals 改名之前的身份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HirGenericForDispatchRelease {
+    pub(crate) dispatch: HirSourceSite,
+    pub(crate) result_def: TempId,
+    pub(crate) released: TempId,
 }
 
 /// 表数组段批量写入。
@@ -951,9 +1041,27 @@ pub struct HirAssign {
 /// 看清前后文之后决定是折叠进 `TableConstructor`，还是继续保守保留。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirTableSetList {
+    /// 原批次来源用于查询独立数组缓冲区，不从 table base 猜方言槽距。
+    pub(crate) source_site: Option<HirSourceSite>,
     pub base: HirExpr,
     pub start_index: u32,
     pub values: HirValuePack,
+    /// 原批次的下一条 low 指令开始这个源码 local 的 debug 区间；lowering 已核对同一 SSA。
+    /// 只允许恢复该 local 的 initializer，不授权移动已进入作用域的后置写入。
+    pub initializer_debug_scope: Option<usize>,
+}
+
+impl HirTableSetList {
+    /// 合成批次没有原缓冲区或 debug 初始化时点证明。
+    pub fn synthetic(base: HirExpr, start_index: u32, values: HirValuePack) -> Self {
+        Self {
+            source_site: None,
+            base,
+            start_index,
+            values,
+            initializer_debug_scope: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1036,10 +1144,23 @@ pub struct HirClose {
 ///
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirReturn {
+    /// 原结果布局等价类的代表来源；同布局返回可合并，cleanup 生命周期独立。
+    pub(crate) frame_source: Option<HirSourceSite>,
     /// 尚待 HIR 消费的 frame cleanup 事务身份；严格配对的 cleanup 被消费时一起退休。
     /// 普通返回和前层已完成 cleanup 的返回没有此标记，不以诊断来源阻止语义合并。
-    pub source_instr: Option<InstrRef>,
+    pub pending_cleanup_source: Option<InstrRef>,
     pub values: HirValuePack,
+}
+
+impl HirReturn {
+    /// 合成返回不继承原 VM 结果区或 cleanup 身份。
+    pub fn synthetic(values: HirValuePack) -> Self {
+        Self {
+            frame_source: None,
+            pending_cleanup_source: None,
+            values,
+        }
+    }
 }
 
 /// if 语句。
@@ -1092,11 +1213,19 @@ pub struct HirNumericFor {
     pub limit: HirExpr,
     pub step: HirExpr,
     pub body: HirBlock,
+    /// 原 protocol 的 index/limit/step home 在 header 求值后由数值循环接管。
+    /// 即使常量准备写已折入表达式，后层也不能把这些槽的旧根跨循环延续。
+    /// 只用于失效旧 home，不授权在 header 求值前释放原值。
+    pub(super) control_homes: [super::promotion::HomeSlotKey; 3],
+    /// 原 FORPREP 的 start/limit/step 值版本，由完整 header 事务消费，不从后层 LocalId 猜测。
+    pub(super) control_values: [Option<TempId>; 3],
 }
 
 /// 泛型 for。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirGenericFor {
+    /// 循环体的原隐式槽布局身份，不随一次性 initializer 事务消费而退休。
+    pub(crate) body_frame_source: Option<HirSourceSite>,
     pub bindings: Vec<LocalId>,
     pub iterator: HirValuePack,
     pub body: HirBlock,
@@ -1186,7 +1315,11 @@ pub struct HirLabel {
 /// 表构造器。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HirTableConstructor {
+    /// 全部互斥原分配时点；合并字段保留它们，合成 capture 数组不冒充原 VM 分配。
+    pub(crate) sources: HirOperationSources,
     pub fields: Vec<HirTableField>,
+    /// Luau 模板中隐式预置零值的字段位置；混合常量模板也可发布，消费后移除角色。
+    pub(crate) implicit_template_fields: BTreeSet<usize>,
     pub trailing_multivalue: Option<HirPackTail>,
     /// 前层发布的分配语义；模板默认值已进入 fields，但复制布局与普通预分配不同。
     pub allocation: HirTableAllocation,
@@ -1199,9 +1332,9 @@ pub enum HirTableAllocation {
     Synthetic,
     /// Luau NEWTABLE 的精确预分配，与模板复制保持区别。
     Luau(crate::value_semantics::table::allocation::TablePreallocation),
-    /// DUPTABLE 的原始有序键身份，不能由吸收后续写入的字段重新推算。
+    /// DUPTABLE 的原始键成员索引，字段求值顺序另由 fields 保持。
     LuauTemplate {
-        hash_keys: std::sync::Arc<[crate::value_semantics::table::TableTemplateKey]>,
+        hash_keys: std::sync::Arc<BTreeSet<crate::value_semantics::table::TableTemplateKey>>,
     },
     PucBatched(crate::value_semantics::table::allocation::TablePreallocation),
     Indexed {
@@ -1212,7 +1345,7 @@ pub enum HirTableAllocation {
         /// 包含索引 0；零槽与仅有索引 0 的模板必须区分。
         array_slots: u32,
         /// 含 nil marker 的原始 hash 键集合；普通字段写入不能增添模板键。
-        hash_keys: std::sync::Arc<[crate::value_semantics::table::TableTemplateKey]>,
+        hash_keys: std::sync::Arc<BTreeSet<crate::value_semantics::table::TableTemplateKey>>,
     },
 }
 
@@ -1277,8 +1410,27 @@ impl HirTableAllocation {
 }
 
 impl HirTableConstructor {
+    /// 调用者先证明两处求值互斥且轨迹不变；这里只核对完整构造形状并合并原来源。
+    /// 子表达式仍按原身份比较，不能借此把不同调用或内部物理操作当成同一求值。
+    pub(in crate::hir) fn merge_alternative(&self, other: &Self) -> Option<Self> {
+        if self.fields != other.fields
+            || self.implicit_template_fields != other.implicit_template_fields
+            || self.trailing_multivalue != other.trailing_multivalue
+            || self.allocation != other.allocation
+        {
+            return None;
+        }
+        let mut merged = self.clone();
+        merged.sources = self.sources.alternatives(&other.sources);
+        Some(merged)
+    }
+
     /// 比较候选与原 NEWTABLE 的完整预分配；PUC 不因此获得 indexed 写入协议的许可。
     pub(in crate::hir) fn matches_allocation_capacity(&self, array_fields: usize) -> bool {
+        if matches!(self.allocation, HirTableAllocation::Luau(_)) {
+            // Luau 的 open call / vararg 与字段语法参与容量计算，不能只数 fixed 槽。
+            return crate::hir::table_layout::matches_luau_allocation(self);
+        }
         self.allocation
             .batched_capacity_matches(array_fields, self.fields.len() - array_fields)
             .unwrap_or_else(|| self.matches_indexed_array_capacity(array_fields))
@@ -1345,9 +1497,18 @@ pub struct HirRecordField {
     pub value: HirExpr,
 }
 
+/// 原闭包对象的创建约束。共享对象的 low 常量池身份仍由 shared-closure owner 持有。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirClosureCreation {
+    Fresh,
+    MayReuse,
+}
+
 /// 闭包表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirClosureExpr {
+    /// 原 closure 指令的分配方式；合成节点无权伪造原 Fresh/共享身份。
+    pub creation: Option<HirClosureCreation>,
     pub proto: HirProtoRef,
     pub captures: Vec<HirCapture>,
 }

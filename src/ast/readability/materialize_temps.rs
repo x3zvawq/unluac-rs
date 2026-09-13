@@ -100,6 +100,7 @@ impl AstRewritePass for MaterializeTempsPass {
             | AstExpr::Call(_)
             | AstExpr::MethodCall(_)
             | AstExpr::SingleValue(_)
+            | AstExpr::CaptureInitializer(_)
             | AstExpr::VarArg
             | AstExpr::TableConstructor(_)
             | AstExpr::Error(_) => false,

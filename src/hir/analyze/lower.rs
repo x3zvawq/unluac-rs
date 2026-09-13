@@ -23,9 +23,9 @@ use crate::decompile::{DecompileContext, DecompileDialect, DecompileState};
 use crate::generate::GenerateMode;
 use crate::hir::HirLowerError;
 use crate::hir::common::{
-    HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirControlFlowFeature, HirDebugScope,
-    HirExitRequirement, HirExpr, HirLValue, HirLocalDecl, HirProto, HirProtoRef, HirStmt,
-    HirValuePack, LocalId, ParamId, TempId, UpvalueId,
+    HirBlock, HirCapture, HirCaptureMode, HirClosureExpr, HirControlFlowFeature,
+    HirDebugBranchInitializer, HirDebugScope, HirExitRequirement, HirExpr, HirLValue, HirLocalDecl,
+    HirProto, HirProtoRef, HirStmt, HirValuePack, LocalId, ParamId, TempId, UpvalueId,
 };
 use crate::hir::emission::HirEmissionFacts;
 use crate::recovery::{ProtoArtifactStage, ProtoFailure};
@@ -59,7 +59,7 @@ pub(super) struct ProtoBindings {
     pub(super) bound_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) captured_temp_targets: BTreeMap<TempId, BoundSlotTarget>,
     pub(super) temp_decl_locals: BTreeMap<TempId, LocalId>,
-    pub(super) captured_local_home_slots: Vec<(LocalId, HomeSlotKey)>,
+    pub(super) declared_local_home_slots: Vec<(LocalId, HomeSlotKey)>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) capture_entry_local_decls: Vec<LocalId>,
     pub(super) debug_entry_local_decls: Vec<LocalId>,
@@ -68,6 +68,7 @@ pub(super) struct ProtoBindings {
     pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
     pub(super) entry_local_regs: BTreeMap<Reg, LocalId>,
     pub(super) numeric_for_locals: BTreeMap<BlockRef, LocalId>,
+    pub(super) numeric_binding_copies: BTreeSet<InstrRef>,
     pub(super) numeric_binding_phi_locals: Vec<Option<LocalId>>,
     pub(super) generic_for_locals: BTreeMap<BlockRef, Vec<LocalId>>,
     pub(super) block_local_regs: BTreeMap<BlockRef, BTreeMap<Reg, LocalId>>,
@@ -172,6 +173,7 @@ impl ProtoBindings {
 }
 
 pub(super) struct ProtoLowering<'a> {
+    pub(super) id: HirProtoRef,
     pub(super) target: DecompileDialect,
     pub(super) proto: &'a LoweredProto,
     pub(super) cfg: &'a Cfg,
@@ -218,6 +220,8 @@ pub(super) struct CapturedSharedClosureLowering<'a> {
     plan: SharedClosurePlan,
     factory_locals: Vec<LocalId>,
     capture_barriers: Vec<Option<SharedCaptureBarrier>>,
+    /// 原 scalar NaN 定义的相邻初始化事务；后续同 Def 的 factory 复用其不透明快照。
+    literal_initializers: BTreeMap<InstrRef, TempId>,
     // frame 保留列表供失败回滚；lowering 只借用已预留的身份。
     composite_protos: &'a [HirProtoRef],
 }
@@ -483,13 +487,6 @@ fn lower_proto_one(
     let self_value_capture_locals = build_self_value_capture_locals(proto, &mut bindings);
     let shared_closure_locals =
         build_shared_closure_locals(proto, &captured_shared_plan, &mut bindings);
-    let captured_shared_closures = CapturedSharedClosureLowering::new(
-        captured_shared_plan,
-        composite_protos,
-        proto,
-        dataflow,
-        &mut bindings,
-    );
     let open_pack_owners = build_open_pack_owners(proto, cfg, dataflow);
     let mut owned_open_producers = vec![false; proto.instrs.len()];
     for def in &dataflow.open_defs {
@@ -500,6 +497,7 @@ fn lower_proto_one(
     let global_decls = GlobalDeclProtocols::analyze(proto, cfg, dataflow);
     let mut promotion_facts = ProtoPromotionFacts::from_plan(
         proto,
+        id,
         cfg,
         graph_facts,
         dataflow,
@@ -507,6 +505,15 @@ fn lower_proto_one(
         &slot_epochs,
         &bindings.fixed_temps,
         &bindings.phi_temps,
+    );
+    let captured_shared_closures = CapturedSharedClosureLowering::new(
+        captured_shared_plan,
+        composite_protos,
+        proto,
+        cfg,
+        dataflow,
+        &promotion_facts,
+        &mut bindings,
     );
     promotion_facts.record_copy_root_retirements(
         proto,
@@ -544,7 +551,14 @@ fn lower_proto_one(
     for (&reg, &local) in &bindings.entry_local_regs {
         promotion_facts.record_local_home_slot(local, HomeSlotKey::new(reg.index(), 0));
     }
-    for &(local, home) in &bindings.captured_local_home_slots {
+    // Lua 5.5 的隐式 vararg 参数占用固定参数之后的源码槽，即使没有 Entry 读取也存在。
+    if let Some(local) = bindings.vararg_param_local {
+        promotion_facts.record_local_home_slot(
+            local,
+            HomeSlotKey::new(usize::from(proto.signature.num_params), 0),
+        );
+    }
+    for &(local, home) in &bindings.declared_local_home_slots {
         promotion_facts.record_local_home_slot(local, home);
     }
     record_loop_binding_local_homes(
@@ -553,7 +567,15 @@ fn lower_proto_one(
         &bindings,
         &mut promotion_facts,
     );
+    captured_shared_closures.record_anchor_homes(
+        proto,
+        dataflow,
+        &slot_epochs,
+        &bindings,
+        &mut promotion_facts,
+    );
     let mut lowering = ProtoLowering {
+        id,
         target,
         proto,
         cfg,
@@ -604,6 +626,25 @@ fn lower_proto_one(
         );
     }
     let children = lowering.hir_children();
+    let mut inline_dispositions = crate::hir::common::HirInlineDispositions::default();
+    for &temp in lowering
+        .captured_shared_closures
+        .literal_initializers
+        .values()
+    {
+        inline_dispositions.preserve_temp(
+            temp,
+            crate::hir::common::HirInlineRetentionReason::SharedClosureIdentity,
+        );
+    }
+    if lowering
+        .captured_shared_closures
+        .plan
+        .composites()
+        .is_empty()
+    {
+        super::capture_initializers::preserve(&lowering, &mut body, &mut inline_dispositions);
+    }
     let bindings = lowering.bindings;
 
     let physical_root_locals = promotion_facts
@@ -623,10 +664,17 @@ fn lower_proto_one(
         vararg_param_local: bindings.vararg_param_local,
         local_debug_hints: bindings.local_debug_hints,
         local_debug_scopes: bindings.local_debug_scopes,
-        debug_scopes: accepted_debug_scopes(proto, structure),
+        debug_scopes: accepted_debug_scopes(
+            id,
+            proto,
+            dataflow,
+            structure,
+            &bindings.fixed_temps,
+            &bindings.phi_temps,
+        ),
         physical_root_temps: promotion_facts.protect_copy_root_temps(),
         physical_root_locals,
-        inline_dispositions: Default::default(),
+        inline_dispositions,
         upvalues: bindings.upvalues,
         environment_upvalues,
         mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
@@ -665,9 +713,12 @@ fn record_loop_binding_local_homes(
                 else {
                     continue;
                 };
+                let (site, reg) = protocol
+                    .writable_binding
+                    .unwrap_or((protocol.init_instr, reg));
                 facts.record_local_home_slot(
                     local,
-                    HomeSlotKey::new(reg.index(), slot_epochs.epoch_at(reg, protocol.init_instr)),
+                    HomeSlotKey::new(reg.index(), slot_epochs.epoch_at(reg, site)),
                 );
                 let Some(BlockTerminatorKind::NumericForLoop { instr, .. }) = plan
                     .block_terminator(loop_plan.header)
@@ -820,12 +871,32 @@ fn fill_failed_proto(
 }
 
 fn accepted_debug_scopes(
+    id: HirProtoRef,
     proto: &LoweredProto,
+    dataflow: &DataflowFacts,
     structure: &ReadyStructureFacts,
+    fixed_temps: &[TempId],
+    phi_temps: &[TempId],
 ) -> Vec<Option<HirDebugScope>> {
     let mut scopes = vec![None; proto.debug_locals.len()];
     for fact in structure.debug_bindings().accepted() {
         scopes[fact.scope] = Some(HirDebugScope {
+            initializer_temp: match fact.value {
+                SsaValue::Def(def) => fixed_temps.get(def.index()).copied(),
+                SsaValue::Entry(_) | SsaValue::Phi(_) => None,
+            },
+            branch_initializer: match fact.value {
+                SsaValue::Phi(phi) => debug_branch_initializer(
+                    id,
+                    proto,
+                    dataflow,
+                    structure.plan(),
+                    phi,
+                    fact.start_pc,
+                    phi_temps,
+                ),
+                SsaValue::Entry(_) | SsaValue::Def(_) => None,
+            },
             start_pc: fact.start_pc,
             end_pc: fact.end_pc,
             ends_before_return: fact
@@ -834,6 +905,80 @@ fn accepted_debug_scopes(
         });
     }
     scopes
+}
+
+/// 只有原 scope 从已选 branch 的 continuation 开始，才把合流临时声明还原成
+/// initializer；不能将比较前已可见的 local（regress_342）误判为新声明。
+fn debug_branch_initializer(
+    id: HirProtoRef,
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    phi: PhiId,
+    start_pc: u32,
+    phi_temps: &[TempId],
+) -> Option<HirDebugBranchInitializer> {
+    use crate::structure::{PhiIncomingDisposition, RegionPlan};
+
+    let phi_plan = plan.phi_plan(phi)?;
+    let [first, second] = phi_plan.incomings.as_slice() else {
+        return None;
+    };
+    let PhiIncomingDisposition::RegionResult(owner) = first.disposition else {
+        return None;
+    };
+    if second.disposition != PhiIncomingDisposition::RegionResult(owner) {
+        return None;
+    }
+    let RegionPlan::Branch {
+        plan: branch,
+        continuation: Some(continuation),
+        ..
+    } = plan.region(owner)?
+    else {
+        return None;
+    };
+    let scope_entry = proto.lowering_map.low_instr_at_or_after_pc(start_pc)?;
+    if *continuation != phi_plan.block
+        || plan.block_terminator(phi_plan.block)?.instrs.start != scope_entry
+    {
+        return None;
+    }
+    let condition = plan.condition(plan.branch(*branch)?.condition)?;
+    let [node] = condition.nodes.as_slice() else {
+        return None;
+    };
+    if node.materialized_value.is_some()
+        || !matches!(proto.instrs.get(node.predicate.index()),
+            Some(LowInstr::Branch(branch))
+                if matches!(branch.cond.subject, crate::transformer::BranchSubject::Compare { .. }))
+    {
+        return None;
+    }
+    let mut values = [false; 2];
+    for (index, incoming) in [first, second].into_iter().enumerate() {
+        let SsaValue::Def(def) = incoming.value else {
+            return None;
+        };
+        let site = dataflow.def_instr(def);
+        let LowInstr::LoadBool(value) = proto.instrs.get(site.index())? else {
+            return None;
+        };
+        if value.dst != phi_plan.reg
+            || site.index() <= node.predicate.index()
+            || site.index() >= scope_entry.index()
+        {
+            return None;
+        }
+        values[index] = value.value;
+    }
+    (values[0] != values[1]).then_some(HirDebugBranchInitializer {
+        result: *phi_temps.get(phi.index())?,
+        condition: crate::hir::common::HirSourceSite {
+            proto: id,
+            instr: node.predicate,
+        },
+    })
 }
 
 fn collect_exit_requirements(
@@ -942,7 +1087,9 @@ fn build_shared_closure_locals(
             _ => None,
         })
     {
-        if captured_plan.is_consumed(InstrRef(index)) {
+        if captured_plan.is_consumed(InstrRef(index))
+            || captured_plan.replacement_at(InstrRef(index)).is_some()
+        {
             continue;
         }
         let ClosureCreation::Reusable(identity) = closure.creation else {
@@ -969,11 +1116,14 @@ impl<'a> CapturedSharedClosureLowering<'a> {
         plan: SharedClosurePlan,
         composite_protos: &'a [HirProtoRef],
         proto: &LoweredProto,
+        cfg: &Cfg,
         dataflow: &DataflowFacts,
+        facts: &ProtoPromotionFacts,
         bindings: &mut ProtoBindings,
     ) -> Self {
         let mut factory_locals = Vec::with_capacity(plan.composites().len());
         let mut capture_barriers = Vec::with_capacity(plan.composites().len());
+        let mut literal_initializers = BTreeMap::new();
         for composite in plan.composites() {
             let instr = composite.anchor;
             let index = instr.index();
@@ -998,6 +1148,36 @@ impl<'a> CapturedSharedClosureLowering<'a> {
                 {
                     continue;
                 }
+                if let Some(def) = captured_fixed_def(dataflow, instr, source) {
+                    let producer = dataflow.def_instr(def);
+                    if literal_initializers.contains_key(&producer) {
+                        continue;
+                    }
+                    // 只移动严格相邻的 scalar NaN 屏障；原 slot 相邻且存在原 scratch
+                    // 容量，不把跨调用/控制流或多分量字面量准备当作无观察初始化。
+                    let scalar_nan = match proto.instrs.get(producer.index()) {
+                        Some(LowInstr::LoadNumber(load)) => load.value.is_nan(),
+                        Some(LowInstr::LoadConst(load)) => matches!(
+                            proto.constants.get(load.value.index()),
+                            Some(crate::parser::RawLiteralConst::Number(value)) if value.is_nan()
+                        ),
+                        _ => false,
+                    };
+                    let temp = bindings.fixed_temps[def.index()];
+                    if scalar_nan
+                        && producer.index() + 1 == index
+                        && cfg.instr_to_block[producer.index()] == cfg.instr_to_block[index]
+                        && dataflow.def_reg(def).index() + 1 == owner_dst.index()
+                        && owner_dst.index() + 1 < usize::from(proto.frame.max_stack_size)
+                        && bindings.temp_target(temp).is_none()
+                        && !composite.preserve_owner_value
+                        // 表分配先于读取写回；原 NaN 槽的旧资源不能因此跨过 GC 观察。
+                        && facts.overwrites_gc_inert(temp)
+                    {
+                        literal_initializers.insert(producer, temp);
+                        continue;
+                    }
+                }
                 let local = LocalId(bindings.local_count);
                 bindings.local_count += 1;
                 bindings.local_debug_hints.push(None);
@@ -1020,12 +1200,59 @@ impl<'a> CapturedSharedClosureLowering<'a> {
             plan,
             factory_locals,
             capture_barriers,
+            literal_initializers,
             composite_protos,
         }
     }
 
     pub(super) fn factory_local(&self, factory: CompositeFactoryRef) -> LocalId {
         self.factory_locals[factory.0]
+    }
+
+    pub(super) fn has_literal_initializer(&self, instr: InstrRef) -> bool {
+        self.literal_initializers.contains_key(&instr)
+    }
+
+    /// factory 独占替换原 owner 的一次写时，沿用该写的物理 home，不能传播原函数值身份。
+    /// 保留 owner 或 NaN capture 屏障会新增声明，不能把最后一个 factory 冒充原 dst；
+    /// 已打开引用的 dst 也属于现有 cell。最终源码声明顺序仍由 source_frames 核对。
+    fn record_anchor_homes(
+        &self,
+        proto: &LoweredProto,
+        dataflow: &DataflowFacts,
+        slot_epochs: &SlotEpochFacts,
+        bindings: &ProtoBindings,
+        facts: &mut ProtoPromotionFacts,
+    ) {
+        for (index, composite) in self.plan.composites().iter().enumerate() {
+            let anchor = composite.anchor;
+            if composite.preserve_owner_value
+                || self.plan.is_consumed(anchor)
+                || self.capture_barriers[index].is_some()
+                || bindings
+                    .capture_empty_local_decls
+                    .get(&anchor.index())
+                    .is_some_and(|locals| !locals.is_empty())
+            {
+                continue;
+            }
+            let Some(LowInstr::Closure(closure)) = proto.instrs.get(anchor.index()) else {
+                continue;
+            };
+            if slot_epochs.reference_capture_may_be_open(closure.dst, anchor) {
+                continue;
+            }
+            let Some(def) = dataflow.instr_def_for_reg(anchor, closure.dst) else {
+                continue;
+            };
+            let temp = bindings.fixed_temps[def.index()];
+            if bindings.temp_target(temp).is_some() {
+                continue;
+            }
+            if let Some(home) = facts.trusted_temp_home_slot(temp) {
+                facts.record_local_home_slot(self.factory_locals[index], home);
+            }
+        }
     }
 
     pub(super) fn composite_proto(&self, id: CompositeFactoryRef) -> HirProtoRef {
@@ -1050,11 +1277,7 @@ fn capture_needs_non_reflexive_barrier(
     instr: InstrRef,
     source: CaptureSource,
 ) -> bool {
-    let CaptureSource::ByValue(reg) = source else {
-        return false;
-    };
-    let Some(SsaValue::Def(def)) = dataflow.canonical_move_value(dataflow.use_value(instr, reg))
-    else {
+    let Some(def) = captured_fixed_def(dataflow, instr, source) else {
         return false;
     };
     let def_instr = dataflow.def_instr(def);
@@ -1072,6 +1295,20 @@ fn capture_needs_non_reflexive_barrier(
             _ => false,
         },
         _ => false,
+    }
+}
+
+fn captured_fixed_def(
+    dataflow: &DataflowFacts,
+    instr: InstrRef,
+    source: CaptureSource,
+) -> Option<crate::structure::DefId> {
+    let CaptureSource::ByValue(reg) = source else {
+        return None;
+    };
+    match dataflow.canonical_move_value(dataflow.use_value(instr, reg))? {
+        SsaValue::Def(def) => Some(def),
+        _ => None,
     }
 }
 
@@ -1182,6 +1419,7 @@ fn build_composite_factory_proto(
             .collect::<Option<Vec<_>>>()
             .ok_or_else(error)?;
         let closure = HirExpr::Closure(Box::new(HirClosureExpr {
+            creation: None,
             proto: child_ref,
             captures,
         }));
@@ -1196,6 +1434,7 @@ fn build_composite_factory_proto(
     }
     body.stmts.push(return_stmt(
         HirValuePack::fixed(vec![HirExpr::LocalRef(LocalId(plan.root.index()))]),
+        None,
         None,
     ));
     let local_count = plan.nodes.len();
@@ -1545,6 +1784,7 @@ fn build_proto_body(
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![*local],
                     values: HirValuePack::fixed(vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        creation: None,
                         proto: lowering.child_refs[proto.index()],
                         captures: Vec::new(),
                     }))]),

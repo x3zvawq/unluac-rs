@@ -232,6 +232,7 @@ impl<'a> AstLowerer<'a> {
                 let function = self.lower_function_expr(
                     proto_index,
                     &HirClosureExpr {
+                        creation: None,
                         proto: *child,
                         captures: Vec::new(),
                     },

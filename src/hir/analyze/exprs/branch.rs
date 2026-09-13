@@ -7,6 +7,7 @@
 //! 条件跳转本身并不证明发生过 Boolean 值写回，后续 Decision 不能混用这两种事实。
 
 use super::*;
+use crate::hir::common::HirSourceSite;
 
 pub(crate) fn lower_branch_cond(
     lowering: &ProtoLowering<'_>,
@@ -18,6 +19,7 @@ pub(crate) fn lower_branch_cond(
 
     if cond.negated {
         HirExpr::Unary(Box::new(HirUnaryExpr {
+            source_site: None,
             op: HirUnaryOpKind::Not,
             expr,
         }))
@@ -36,9 +38,14 @@ pub(crate) fn lower_branch_subject(
     instr_ref: InstrRef,
     cond: BranchCond,
 ) -> (HirExpr, crate::hir::HirDecisionTestSource) {
-    lower_branch_subject_with(cond, |operand| {
-        lower_cond_operand(lowering, block, instr_ref, operand)
-    })
+    lower_branch_subject_with(
+        HirSourceSite {
+            proto: lowering.id,
+            instr: instr_ref,
+        },
+        cond,
+        |operand| lower_cond_operand(lowering, block, instr_ref, operand),
+    )
 }
 
 /// 值型短路恢复需要的是“当前这一跳可以直接表达”的 subject，而不是“可任意复制”的值。
@@ -52,9 +59,14 @@ pub(crate) fn lower_branch_subject_single_eval(
     instr_ref: InstrRef,
     cond: BranchCond,
 ) -> (HirExpr, crate::hir::HirDecisionTestSource) {
-    lower_branch_subject_with(cond, |operand| {
-        lower_cond_operand_single_eval(lowering, block, instr_ref, operand)
-    })
+    lower_branch_subject_with(
+        HirSourceSite {
+            proto: lowering.id,
+            instr: instr_ref,
+        },
+        cond,
+        |operand| lower_cond_operand_single_eval(lowering, block, instr_ref, operand),
+    )
 }
 
 /// 只为当前测试的 direct CALL epoch 消费已冻结的原 home 覆盖证明。
@@ -88,6 +100,7 @@ pub(in crate::hir::analyze) fn branch_call_result_root_ends_after_test(
 }
 
 fn lower_branch_subject_with(
+    source: HirSourceSite,
     cond: BranchCond,
     mut lower_operand: impl FnMut(CondOperand) -> HirExpr,
 ) -> (HirExpr, crate::hir::HirDecisionTestSource) {
@@ -100,6 +113,7 @@ fn lower_branch_subject_with(
             rhs,
         } => (
             HirExpr::Binary(Box::new(HirBinaryExpr {
+                source_site: Some(source),
                 op: match predicate {
                     BranchPredicate::Eq => HirBinaryOpKind::Eq,
                     BranchPredicate::Lt => HirBinaryOpKind::Lt,

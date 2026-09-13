@@ -350,6 +350,7 @@ fn rewrite_function_exprs_in_expr(expr: &mut AstExpr, target: AstTargetDialect) 
         | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
     }

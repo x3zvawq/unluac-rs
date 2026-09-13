@@ -17,16 +17,19 @@ pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: impl Into<HirValuePac
         values: values.into(),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        generic_for_dispatch_release: None,
         method_rewrite_transaction: None,
     }))
 }
 
 pub(super) fn return_stmt(
     values: HirValuePack,
-    source_instr: Option<crate::transformer::InstrRef>,
+    frame_source: Option<crate::hir::common::HirSourceSite>,
+    pending_cleanup_source: Option<crate::transformer::InstrRef>,
 ) -> HirStmt {
     HirStmt::Return(Box::new(HirReturn {
-        source_instr,
+        frame_source,
+        pending_cleanup_source,
         values,
     }))
 }
@@ -59,25 +62,26 @@ pub(super) fn unresolved_expr(summary: impl Into<String>) -> HirExpr {
     }))
 }
 
-pub(super) fn concat_expr(parts: impl IntoIterator<Item = HirExpr>) -> HirExpr {
-    let mut parts = parts.into_iter().collect::<Vec<_>>();
-    let Some(last) = parts.pop() else {
-        return unresolved_expr("concat empty source");
-    };
-    // Lua 源码里的 `..` 默认是右结合；CONCAT 指令只告诉我们“这一串值需要拼接”，
-    // 不携带显式括号。这里统一用右折叠做 canonical shape，避免不同 lowering 路径
-    // 各自长出一份左折叠实现，最后再让后层被迫补括号。
-    parts.into_iter().rfold(last, |rhs, lhs| {
-        HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
-            op: crate::hir::common::HirBinaryOpKind::Concat,
-            lhs,
-            rhs,
-        }))
-    })
+pub(super) fn concat_expr(
+    source_site: crate::hir::common::HirSourceSite,
+    parts: impl IntoIterator<Item = HirExpr>,
+) -> HirExpr {
+    HirBinaryExpr::concat(source_site, parts.into_iter().collect())
+        .unwrap_or_else(|| unresolved_expr("concat empty source"))
 }
 
-pub(super) fn binary_expr(op: HirBinaryOpKind, lhs: HirExpr, rhs: HirExpr) -> HirExpr {
-    HirExpr::Binary(Box::new(HirBinaryExpr { op, lhs, rhs }))
+pub(super) fn binary_expr(
+    source_site: crate::hir::common::HirSourceSite,
+    op: HirBinaryOpKind,
+    lhs: HirExpr,
+    rhs: HirExpr,
+) -> HirExpr {
+    HirExpr::Binary(Box::new(HirBinaryExpr {
+        source_site: Some(source_site),
+        op,
+        lhs,
+        rhs,
+    }))
 }
 
 pub(super) fn decode_raw_string(raw: &crate::parser::RawString) -> String {

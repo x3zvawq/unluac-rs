@@ -4,6 +4,8 @@
 //! 字段，不再读取 raw opcode。模板中的 nil 数组槽与 hash 项也属于初始化事实，
 //! 例如 TDUP {nil, nil, true} 不能变成空表后的一条 [3] 写入。
 //! 同次降低同时发布原 hash 键身份；后续构造区域融合后，不能从 fields 猜哪些键属于模板。
+//! 分配保留原 source site，跨字段重建仍能查询该时点的 home 和开放引用状态。
+//! 键成员索引在此建立并共享，字段保持原顺序；后层逐字段查询不再线性扫描整个模板。
 //! 模板数组槽数包含索引 0，不能把只有零索引的模板和没有数组的模板合并为同一个容量。
 //! Luau 的动态模板项以数值 0 预置；这里保留初值和原键，后续真实写入由构造区域消费。
 
@@ -18,15 +20,17 @@ use super::expr_for_const;
 pub(in crate::hir::analyze) fn expr_for_new_table(
     proto: &LoweredProto,
     instruction: &NewTableInstr,
+    source_site: crate::hir::common::HirSourceSite,
 ) -> HirExpr {
     let mut table = HirTableConstructor::default();
+    table.sources = crate::hir::common::HirOperationSources::Single(source_site);
     table.allocation = match &instruction.allocation {
         TableAllocation::Luau(allocation) => HirTableAllocation::Luau(*allocation),
         TableAllocation::LuauTemplate(entries) => {
-            let mut hash_keys = Vec::with_capacity(entries.len());
+            let mut hash_keys = std::collections::BTreeSet::new();
             for (key, value) in entries {
                 let key = expr_for_const(proto, *key);
-                hash_keys.push(
+                hash_keys.insert(
                     key.table_key()
                         .expect("template key is a primitive constant"),
                 );
@@ -35,6 +39,14 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
                     value: value.map_or(HirExpr::Integer(0), |value| expr_for_const(proto, value)),
                 }));
             }
+            // None 项是模板原子预置的零值，Some 项是真正模板常量；两者可交错。
+            // 按位置发布一次性角色，后层不能把再次出现的数值 0 当成模板初值。
+            table.implicit_template_fields.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (_, value))| value.is_none().then_some(index)),
+            );
             HirTableAllocation::LuauTemplate {
                 hash_keys: hash_keys.into(),
             }
@@ -61,10 +73,10 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
                     table.fields.push(HirTableField::Array(value));
                 }
             }
-            let mut hash_keys = Vec::with_capacity(template.hash.len());
+            let mut hash_keys = std::collections::BTreeSet::new();
             for (key, value) in &template.hash {
                 let key = expr_for_const(proto, *key);
-                hash_keys.push(
+                hash_keys.insert(
                     key.table_key()
                         .expect("template hash key is a primitive constant"),
                 );

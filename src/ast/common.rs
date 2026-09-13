@@ -105,6 +105,8 @@ pub enum AstExpr {
     Boolean(bool),
     Integer(i64),
     Number(f64),
+    /// 原捕获初始化事务的不可折叠源码形式，直到发射仍与普通 literal 区分。
+    CaptureInitializer(crate::hir::HirCaptureInitializer),
     String(LuaString),
     Int64(i64),
     UInt64(u64),
@@ -211,6 +213,7 @@ pub struct AstReturn {
 /// 函数表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstFunctionExpr {
+    pub creation: Option<crate::hir::HirClosureCreation>,
     pub function: HirProtoRef,
     pub params: Vec<ParamId>,
     /// HIR 参数身份允许首参命名为 self，且没有待命名的非环境 upvalue 与它冲突。
@@ -459,6 +462,14 @@ impl AstRewriteAuthority {
 
     pub const fn may_move_scope_start(&self) -> bool {
         !self.must_preserve()
+    }
+
+    /// 空声明相邻合并仍保持每个槽的 nil 写、顺序和所有观察点之前的前缀。
+    /// 其它 HIR 保留理由及 debug/属性限制仍由各自 owner 检查。
+    pub fn may_merge_adjacent_empty_declarations(&self) -> bool {
+        self.may_move_scope_start()
+            || matches!(self, Self::Hir(HirInlineDisposition::Preserve(reasons))
+                if reasons.iter().all(|reason| *reason == crate::hir::HirInlineRetentionReason::PhysicalFramePrefix))
     }
 
     pub const fn may_shorten_lifetime(&self) -> bool {

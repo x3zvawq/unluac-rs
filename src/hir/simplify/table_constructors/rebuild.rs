@@ -115,29 +115,7 @@ fn flush_constructor_segment(
             return set_list.is_none().then_some(());
         }
         if let Some(set_list) = set_list {
-            if set_list.start_index < builder.next_array_index()
-                && !builder.demote_array_suffix(
-                    set_list.start_index,
-                    &mut context.scratch.restored_array_fields,
-                )
-            {
-                // 候选拒绝[SemanticBarrier:TableShape]：唯一失败形状是 raw SETLIST
-                // 起点 0；吸收到 constructor array 会把原键 0 改写成键 1。
-                return None;
-            }
-            builder
-                .drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
-            if set_list.start_index != builder.next_array_index() {
-                // 候选拒绝[SemanticBarrier:TableShape]：SETLIST 起点与隐式数组下标不连续，
-                // 直接追加会改写键集合与 `#table` 结果。
-                return None;
-            }
-            for value in &set_list.values.fixed {
-                builder.push_array_value(value.clone());
-            }
-            if let Some(trailing) = &set_list.values.tail {
-                builder.trailing_multivalue = Some(trailing.clone());
-            }
+            builder.append_batch(set_list, context.scratch)?;
         } else {
             builder
                 .drain_pending_integer_fields(&mut context.scratch.restored_pending_integer_fields);
@@ -498,6 +476,7 @@ fn collect_source_eval_events(
         | HirExpr::GlobalRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::LocalRef(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Closure(_)
         | HirExpr::Unresolved(_) => {}
@@ -667,9 +646,9 @@ fn preserve_producer_source(
     match producer.source_preservation {
         ProducerSourcePreservation::Safe => {}
         ProducerSourcePreservation::InertWholeStatement => {}
-        ProducerSourcePreservation::DebugIdentity => {
-            // 候选拒绝[PolicyBoundary]：把字段提前到 source-visible producer 声明之前会让
-            // hook 在该声明行观察到已填充的 table；debug identity 声明必须保持原边界。
+        ProducerSourcePreservation::PreservedIdentity => {
+            // 候选拒绝[SemanticBarrier:BindingIdentity]：debug 与调用帧前缀保留事实
+            // 都要求 producer 维持原声明和物化边界（regress_577）。
             return None;
         }
         ProducerSourcePreservation::ObservableReplay => {

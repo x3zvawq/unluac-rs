@@ -43,6 +43,16 @@ fn field_ref<'a>(field: &'a AstTableField, next_array: &mut u32) -> TableFieldRe
 
 /// 字段扩展事务完成后统一投影候选大小，不在每次追加时重复扫描整个构造器。
 pub(crate) fn matches_preallocation(table: &AstTableConstructor) -> bool {
+    if let Some(constraint) = table.allocation.initialization_constraint() {
+        let mut next_array = 0;
+        if table.fields.iter().any(|field| {
+            runtime_table_operand(constraint, field_ref(field, &mut next_array)).is_some()
+        }) {
+            // 候选拒绝[SemanticBarrier:TableInitialization]：字段扩展不能把原模板外的
+            // 键放进编译期模板。AST 没有新增原运行时操作数的权限，消费 HIR 分配约束。
+            return false;
+        }
+    }
     if let crate::hir::HirTableAllocation::Luau(allocation) = table.allocation {
         let mut next_array = 0;
         return allocation.matches_luau(

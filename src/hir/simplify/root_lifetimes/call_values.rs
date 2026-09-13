@@ -5,6 +5,8 @@
 //! b、c 仍可选出另一个根。观察优先选择已观察的最低 home，否则选择最低可用 home。
 //! 潜在事件排除仅由显式 GC 证明的 copy home；显式 fence 另记是否已物化当前代表。
 //! 不符合根保护资格的 home 仍传播确值身份，但不参与观察代表选择或签发释放事务。
+//! 参数交接后撤销该 home 的值别名与观察代表，只保留原 owner 的固定覆写责任；
+//! 后续同值 COPY 是新的写入 epoch，不能据旧记录推断 callee 尚未改变此槽。
 
 use super::live_read_changes::LiveReadChanges;
 use super::{ActiveCallRoot, BTreeMap, BTreeSet, CallValueId, HomeSlotKey, TempId, TempUseEvents};
@@ -201,10 +203,10 @@ impl<'a> CallValues<'a> {
         let value = root.value_id;
         let state = &mut self.values[value.0];
         state.active_homes += 1;
-        if root.eligible {
+        if root.eligible && !root.transferred {
             state.representatives.insert((!root.observed, home));
         }
-        if root.eligible && !root.explicit_fence_only {
+        if root.eligible && !root.transferred && !root.explicit_fence_only {
             state
                 .ordinary_representatives
                 .insert((!root.observed, home));
@@ -223,6 +225,15 @@ impl<'a> CallValues<'a> {
             .remove(&(!root.observed, *home));
         self.refresh_pending(root.value_id);
         Some(root)
+    }
+
+    /// 交接只撤销观察代表，精确固定覆写仍由同一 home 状态机处理；不再新增 caller 根。
+    pub(super) fn transfer(&mut self, home: HomeSlotKey) {
+        let mut root = self
+            .remove(&home)
+            .expect("transferred call root owns its home");
+        root.transferred = true;
+        self.insert(home, root);
     }
 
     pub(super) fn clear(&mut self) {

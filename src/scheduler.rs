@@ -12,6 +12,7 @@
 //! - **Tag**：一组粗粒度变化标签（如 `StatementAdjacency`、`TempChain`），由各层自行定义。
 //! - **Phase**：可选的阶段分区。标记为 `Deferred` 的 pass 只在所有 `Normal` pass
 //!   收敛后才执行；如果 `Deferred` pass 又产出新 invalidation，会触发 `Normal` pass 重跑。
+//!   `Final` 等这两个阶段均稳定后才消费不可逆的高层事实；有变化仍回到同一收敛循环。
 //! - **收敛**：当一轮遍历中没有任何 pass 返回 `changed=true` 时收敛。
 //! - **上限**：达到轮数上限不等于收敛；调用层必须把它作为显式错误处理，不能继续消费
 //!   可能仍处于中间态的产物。
@@ -27,6 +28,9 @@ pub enum PassPhase {
     /// 延迟阶段：等 Normal pass 全部收敛后才执行。
     /// 如果执行后产出新 invalidation，会触发 Normal pass 再次收敛。
     Deferred,
+    /// 最终阶段：Normal/Deferred 联合稳定后才执行，避免提前降低仍可消费的事实。
+    /// 产生变化后同样计入总轮数并回到 Normal，不另设或重置收敛预算。
+    Final,
 }
 
 /// 一个 pass 的静态描述。
@@ -58,12 +62,13 @@ pub enum InvalidationConvergence {
 ///
 /// 接受一组 pass 描述和对应的执行函数，按固定点策略执行。
 /// `run_pass(index, name)` 执行第 `index` 个 pass，返回是否产生了变化。
-/// `prerequisites` 指定 consumer 的唯一直接 owner；owner 可继续声明自己的依赖。
+/// `prerequisites` 按声明顺序刷新 consumer 的直接 owner；owner 可继续声明更早的依赖。
 ///
 /// 调度顺序：
 /// 1. 反复执行所有 `Normal` phase 的 pass，直到 dirty set 清空（Normal 收敛）。
 /// 2. 执行一遍所有 `Deferred` phase 的 pass。
-/// 3. 如果 Deferred 产出了新的 dirty tag，回到步骤 1；否则整体收敛。
+/// 3. 如果 Deferred 有变化，回到步骤 1；否则执行 Final。
+/// 4. Final 有变化仍回到步骤 1；否则整体收敛。
 pub fn run_invalidation_loop<T, F>(
     passes: &[PassDescriptor<T>],
     prerequisites: &[(&str, &str)],
@@ -75,7 +80,7 @@ where
     F: FnMut(usize, &str) -> bool,
 {
     // 依赖只能指向同阶段更早的 owner，排除循环并保留既有阶段顺序。
-    let mut required = vec![None; passes.len()];
+    let mut required = vec![Vec::new(); passes.len()];
     for &(consumer, owner) in prerequisites {
         let consumer = passes
             .iter()
@@ -90,9 +95,10 @@ where
             "pass prerequisites must be earlier owners in the same phase"
         );
         assert!(
-            required[consumer].replace(owner).is_none(),
-            "consumer has one direct prerequisite owner"
+            !required[consumer].contains(&owner),
+            "consumer must not repeat a prerequisite owner"
         );
+        required[consumer].push(owner);
     }
     // 初始：所有 tag 都 dirty（第一轮每个 pass 都要跑）
     let mut dirty: BTreeSet<T> = T::all().iter().copied().collect();
@@ -125,20 +131,31 @@ where
             &mut run_pass,
         );
         if !deferred_changed {
-            return InvalidationConvergence::Converged;
+            // Deferred 无变化会消费掉所有 dirty tag；Final 仍须获得首次审理机会。
+            // 用 changed 而非 tag 是否为空判断稳定：有些语法终结 pass 不发布形状 tag。
+            dirty = T::all().iter().copied().collect();
+            if !run_single_round(
+                passes,
+                &required,
+                PassPhase::Final,
+                &mut dirty,
+                &mut run_pass,
+            ) {
+                return InvalidationConvergence::Converged;
+            }
         }
         rounds += 1;
         if rounds >= max_rounds {
             return InvalidationConvergence::LimitExceeded { rounds };
         }
-        // Deferred 产出了新 dirty → 回到 Normal 重新收敛
+        // Deferred/Final 有变化 → 回到 Normal，继续使用同一个总轮数预算。
     }
 }
 
 /// 反复执行某个 phase 的所有 pass 直到 dirty set 中没有该 phase 关心的 tag。
 fn run_phase_until_converged<T, F>(
     passes: &[PassDescriptor<T>],
-    required: &[Option<usize>],
+    required: &[Vec<usize>],
     phase: PassPhase,
     dirty: &mut BTreeSet<T>,
     run_pass: &mut F,
@@ -173,7 +190,7 @@ where
 /// - 遍历结束后，dirty set = newly_dirty（快照中的旧 tag 已被消费掉）。
 fn run_single_round<T, F>(
     passes: &[PassDescriptor<T>],
-    required: &[Option<usize>],
+    required: &[Vec<usize>],
     phase: PassPhase,
     dirty: &mut BTreeSet<T>,
     run_pass: &mut F,
@@ -221,7 +238,7 @@ where
 /// owner 执行后若又有输入变化，必须在身份消费前刷新；不提前重跑其它 pass。
 fn run_current_pass<T, F>(
     passes: &[PassDescriptor<T>],
-    required: &[Option<usize>],
+    required: &[Vec<usize>],
     index: usize,
     current: &mut [bool],
     newly_dirty: &mut BTreeSet<T>,
@@ -235,7 +252,7 @@ where
         return false;
     }
     let mut changed = false;
-    if let Some(owner) = required[index] {
+    for &owner in &required[index] {
         changed |= run_current_pass(passes, required, owner, current, newly_dirty, run_pass);
     }
     let desc = &passes[index];

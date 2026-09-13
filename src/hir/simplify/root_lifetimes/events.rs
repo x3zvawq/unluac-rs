@@ -16,7 +16,7 @@ use super::{
     HomeSlotKey, LocalId, LocalUseCollector, ProtoPromotionFacts, StackWriteCollector,
     StackWriteSummary, TempId, TempWriteCollector,
 };
-use crate::hir::common::{HirCallExpr, HirExpr, HirStmt};
+use crate::hir::common::{HirBinding, HirCallExpr, HirExpr, HirLValue, HirStmt};
 use crate::hir::expr_safety::{HirEvalEffects, HirExprSafety};
 use crate::hir::simplify::lexical_cfg::{HirStmtId, HirStmtTree};
 use crate::hir::simplify::temp_touch::TempReadCollector;
@@ -31,8 +31,10 @@ pub(in crate::hir::simplify) struct RootEventIndex {
     by_temp: BTreeMap<TempId, TempEvents>,
     reads: Vec<(usize, TempId)>,
     temp_writes: Vec<(usize, TempId)>,
+    local_writes: Vec<(usize, LocalId)>,
     argument_transfers: Vec<(usize, TempId)>,
-    local_calls: BTreeMap<LocalId, Vec<usize>>,
+    binding_calls: Vec<(usize, HirBinding)>,
+    exposed_values: Vec<(usize, TempId)>,
     gc_calls: Vec<usize>,
     observations: Vec<usize>,
     by_local: BTreeMap<LocalId, LocalEvents>,
@@ -49,7 +51,6 @@ pub(super) struct TempEvents {
     pub(super) reads: Vec<usize>,
     pub(super) writes: Vec<usize>,
     pub(super) argument_transfers: Vec<usize>,
-    calls: Vec<usize>,
 }
 
 impl RootEventIndex {
@@ -65,8 +66,10 @@ impl RootEventIndex {
         let mut by_temp = BTreeMap::<TempId, TempEvents>::new();
         let mut read_events = Vec::new();
         let mut temp_writes = Vec::new();
+        let mut local_writes = Vec::new();
         let mut argument_transfers = Vec::new();
-        let mut local_calls = BTreeMap::<_, Vec<_>>::new();
+        let mut binding_calls = Vec::new();
+        let mut exposed_values = Vec::new();
         let mut gc_calls = Vec::new();
         let mut observations = Vec::new();
         let mut by_local = BTreeMap::<LocalId, LocalEvents>::new();
@@ -99,6 +102,7 @@ impl RootEventIndex {
             }
             for local in locals.writes {
                 by_local.entry(local).or_default().writes.push(position);
+                local_writes.push((position, local));
             }
             for temp in reads.temps {
                 by_temp.entry(temp).or_default().reads.push(position);
@@ -116,12 +120,10 @@ impl RootEventIndex {
                     .push(position);
                 argument_transfers.push((position, temp));
             }
-            for temp in calls.temps {
-                by_temp.entry(temp).or_default().calls.push(position);
+            for binding in calls.bindings {
+                binding_calls.push((position, binding));
             }
-            for local in calls.locals {
-                local_calls.entry(local).or_default().push(position);
-            }
+            exposed_values.extend(calls.exposed.into_iter().map(|temp| (position, temp)));
             if calls.gc {
                 gc_calls.push(position);
             }
@@ -145,8 +147,10 @@ impl RootEventIndex {
             by_temp,
             reads: read_events,
             temp_writes,
+            local_writes,
             argument_transfers,
-            local_calls,
+            binding_calls,
+            exposed_values,
             gc_calls,
             observations,
             by_local,
@@ -164,17 +168,59 @@ impl RootEventIndex {
 
 #[derive(Default)]
 struct CalleeCollector {
-    temps: Vec<TempId>,
-    locals: Vec<LocalId>,
+    bindings: Vec<HirBinding>,
+    exposed: Vec<TempId>,
     gc: bool,
 }
 
 impl HirVisitor<'_> for CalleeCollector {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        match stmt {
+            HirStmt::Assign(assign) => {
+                for (i, target) in assign.targets.iter().enumerate() {
+                    if let HirLValue::TableAccess(access) = target {
+                        self.expose(&access.key);
+                    }
+                    if matches!(
+                        target,
+                        HirLValue::TableAccess(_) | HirLValue::Global(_) | HirLValue::Upvalue(_)
+                    ) && let Some(value) = assign.values.result_source(i)
+                    {
+                        self.expose(value);
+                    }
+                }
+            }
+            HirStmt::TableSetList(set) => {
+                for value in &set.values {
+                    self.expose(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn visit_call(&mut self, call: &HirCallExpr) {
-        match &call.callee {
-            HirExpr::TempRef(temp) => self.temps.push(*temp),
-            HirExpr::LocalRef(local) => self.locals.push(*local),
-            HirExpr::GlobalRef(global) => self.gc |= global.key.as_bytes() == b"collectgarbage",
+        for value in &call.args {
+            self.expose(value);
+        }
+        if let Some(binding) = HirBinding::from_expr(&call.callee) {
+            self.bindings.push(binding);
+        }
+        if let HirExpr::GlobalRef(global) = &call.callee {
+            self.gc |= global.key.as_bytes() == b"collectgarbage";
+        }
+    }
+}
+
+impl CalleeCollector {
+    // 记录可能被存储/交给用户代码的原值身份；作为callee或比较操作数使用不等于传出该值。
+    fn expose(&mut self, value: &HirExpr) {
+        match value {
+            HirExpr::TempRef(temp) => self.exposed.push(*temp),
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                self.expose(&logical.lhs);
+                self.expose(&logical.rhs);
+            }
             _ => {}
         }
     }
@@ -263,6 +309,17 @@ impl<'a> RootEventBlock<'a> {
 
     pub(in crate::hir::simplify) fn has_touch_from(self, temp: TempId, ordinal: usize) -> bool {
         self.touch_positions_from(temp, ordinal).next().is_some()
+    }
+
+    /// 最后一次直属语句读写，含子域及 capture；借用冻结索引，不逐候选重扫后缀。
+    pub(in crate::hir::simplify) fn last_touch(self, temp: TempId) -> Option<usize> {
+        let events = self.temp(temp)?;
+        self.positions(&events.reads)
+            .last()
+            .into_iter()
+            .chain(self.positions(&events.writes).last())
+            .max()
+            .map(|position| self.ordinal(*position))
     }
 
     /// 每次跳过整条直属语句的全部后代，读写重合仍只发布一个 ordinal。
@@ -375,28 +432,35 @@ impl<'a> RootEventBlock<'a> {
         self.events_at(&self.index.argument_transfers, ordinal)
     }
 
+    pub(super) fn exposed_values(self, ordinal: usize) -> &'a [(usize, TempId)] {
+        self.events_at(&self.index.exposed_values, ordinal)
+    }
+
     fn events_at<T>(self, events: &'a [(usize, T)], ordinal: usize) -> &'a [(usize, T)] {
         let range = &self.index.tree.stmt(self.stmts[ordinal]).range;
         events_in_range(events, range)
     }
 
-    pub(super) fn is_gc_fence(
+    pub(super) fn is_gc_fence(self, ordinal: usize, aliases: &super::BTreeSet<HirBinding>) -> bool {
+        self.contains(&self.index.gc_calls, ordinal)
+            || self
+                .events_at(&self.index.binding_calls, ordinal)
+                .iter()
+                .any(|(_, binding)| aliases.contains(binding))
+    }
+
+    /// 控制流的后态不传播 callable 值；只失效实际被写的别名，保留未触碰身份。
+    pub(super) fn invalidate_written_aliases(
         self,
         ordinal: usize,
-        temps: &super::BTreeSet<TempId>,
-        locals: &super::BTreeSet<LocalId>,
-    ) -> bool {
-        self.contains(&self.index.gc_calls, ordinal)
-            || temps.iter().any(|temp| {
-                self.temp(*temp)
-                    .is_some_and(|events| self.contains(&events.calls, ordinal))
-            })
-            || locals.iter().any(|local| {
-                self.index
-                    .local_calls
-                    .get(local)
-                    .is_some_and(|events| self.contains(events, ordinal))
-            })
+        aliases: &mut super::BTreeSet<HirBinding>,
+    ) {
+        for (_, temp) in self.events_at(&self.index.temp_writes, ordinal) {
+            aliases.remove(&HirBinding::Temp(*temp));
+        }
+        for (_, local) in self.events_at(&self.index.local_writes, ordinal) {
+            aliases.remove(&HirBinding::Local(*local));
+        }
     }
 }
 

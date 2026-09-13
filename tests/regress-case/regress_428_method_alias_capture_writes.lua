@@ -1,5 +1,5 @@
--- regress_428_method_alias_capture_writes: read-only captures do not block method sugar, writable captures keep the old receiver root
--- unluac: expect-contains [[:readonly_each() do]]
+-- 只读 capture 不授权将 GETTABLE 后的 receiver COPY 提前为 SELF；两类 capture 均须保留原根事件。
+-- unluac: expect-contains [[.readonly_each(]]
 -- unluac: expect-not-contains [[:writable_each() do]]
 -- unluac: expect-not-contains [[function p8_0.field]]
 

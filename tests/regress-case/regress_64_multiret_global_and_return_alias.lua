@@ -7,7 +7,9 @@
 -- unluac: expect-contains [[ymax = r1_5]]
 -- unluac: expect-contains [[xmin = r1_2]]
 -- unluac: expect-contains [[local r2_4 = math.abs(r2_2 - r2_0)]]
--- unluac: expect-contains [[return r2_4, (math.abs(r2_3 - r2_1))]]
+-- 保留原 height 初始化与 CALL 槽；不强制把它改成返回参数区里的新调用。
+-- unluac: expect-contains [[local r2_5 = math.abs(r2_3 - r2_1)]]
+-- unluac: expect-contains [[return r2_4, r2_5]]
 -- unluac: expect-not-contains [[unluac error]]
 
 local function circle(self, x, y, radius)

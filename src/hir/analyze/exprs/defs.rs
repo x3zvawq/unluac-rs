@@ -31,27 +31,39 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
         }
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
             Some(HirExpr::Unary(Box::new(HirUnaryExpr {
+                source_site: Some(crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: def_instr,
+                }),
                 op: lower_unary_op(unary.op),
                 expr: expr_for_reg_use(lowering, def_block, def_instr, unary.src),
             })))
         }
         LowInstr::BinaryOp(binary) if binary.dst == def_reg => {
             Some(super::super::helpers::binary_expr(
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: def_instr,
+                },
                 lower_binary_op(binary.op),
                 expr_for_value_operand(lowering, def_block, def_instr, binary.lhs),
                 expr_for_value_operand(lowering, def_block, def_instr, binary.rhs),
             ))
         }
-        LowInstr::Concat(concat) if concat.dst == def_reg => {
-            Some(concat_expr((0..concat.src.len).map(|offset| {
+        LowInstr::Concat(concat) if concat.dst == def_reg => Some(concat_expr(
+            crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: def_instr,
+            },
+            (0..concat.src.len).map(|offset| {
                 expr_for_reg_use(
                     lowering,
                     def_block,
                     def_instr,
                     Reg(concat.src.start.index() + offset),
                 )
-            })))
-        }
+            }),
+        )),
         LowInstr::GetTable(get_table) if get_table.dst == def_reg => {
             Some(if get_table.kind == GetTableKind::Raw {
                 lower_raw_table_get_expr_inline(
@@ -72,7 +84,14 @@ pub(crate) fn expr_for_fixed_def(lowering: &ProtoLowering<'_>, def_id: DefId) ->
             })
         }
         LowInstr::NewTable(new_table) if new_table.dst == def_reg => {
-            Some(super::expr_for_new_table(lowering.proto, new_table))
+            Some(super::expr_for_new_table(
+                lowering.proto,
+                new_table,
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: def_instr,
+                },
+            ))
         }
         LowInstr::Call(call) => expr_for_fixed_call(lowering, def_block, def_instr, call, def_reg),
         LowInstr::VarArg(vararg) => expr_for_fixed_vararg(vararg.results, def_reg),
@@ -155,6 +174,10 @@ pub(crate) fn expr_for_fixed_def_single_eval(
                 return None;
             }
             return Some(HirExpr::Unary(Box::new(HirUnaryExpr {
+                source_site: Some(crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: def_instr,
+                }),
                 op: lower_unary_op(unary.op),
                 expr: expr_for_reg_use_single_eval_with_call_policy(
                     lowering, def_block, def_instr, unary.src, true,
@@ -177,6 +200,10 @@ pub(crate) fn expr_for_fixed_def_single_eval(
                 return None;
             }
             return Some(super::super::helpers::binary_expr(
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: def_instr,
+                },
                 lower_binary_op(binary.op),
                 expr_for_value_operand_single_eval_pure_operand(
                     lowering, def_block, def_instr, binary.lhs,
@@ -194,15 +221,21 @@ pub(crate) fn expr_for_fixed_def_single_eval(
             {
                 return None;
             }
-            let value = concat_expr((0..concat.src.len).map(|offset| {
-                expr_for_reg_use_single_eval_with_call_policy(
-                    lowering,
-                    def_block,
-                    def_instr,
-                    Reg(concat.src.start.index() + offset),
-                    true,
-                )
-            }));
+            let value = concat_expr(
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: def_instr,
+                },
+                (0..concat.src.len).map(|offset| {
+                    expr_for_reg_use_single_eval_with_call_policy(
+                        lowering,
+                        def_block,
+                        def_instr,
+                        Reg(concat.src.start.index() + offset),
+                        true,
+                    )
+                }),
+            );
             return Some(value);
         }
         _ => {}
@@ -243,6 +276,10 @@ pub(crate) fn expr_for_dup_safe_fixed_def(
         }
         LowInstr::UnaryOp(unary) if unary.dst == def_reg => {
             Some(HirExpr::Unary(Box::new(HirUnaryExpr {
+                source_site: Some(crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: def_instr,
+                }),
                 op: lower_unary_op(unary.op),
                 expr: expr_for_reg_use_dup_safe(lowering, def_block, def_instr, unary.src)?,
             })))
@@ -302,6 +339,10 @@ fn expr_for_fixed_call(
     );
 
     Some(HirExpr::Call(Box::new(HirCallExpr {
+        source_site: Some(crate::hir::common::HirSourceSite {
+            proto: lowering.id,
+            instr: instr_ref,
+        }),
         argument_roots: lowering.promotion_facts.call_argument_roots(instr_ref),
         frame_root_ends: lowering.promotion_facts.call_frame_root_ends(instr_ref),
         callee,

@@ -877,6 +877,7 @@ fn unused_value_rejection(expr: &AstExpr, target: AstTargetDialect) -> UnusedVal
             .then(|| unused_value_rejection(child, target))
     };
     match expr {
+        AstExpr::CaptureInitializer(_) => UnusedValueRejection::TargetConstraint,
         AstExpr::SingleValue(inner) => unused_value_rejection(inner, target),
         AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
             unused_value_rejection(&unary.expr, target)

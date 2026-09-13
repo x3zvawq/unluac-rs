@@ -25,8 +25,8 @@ use super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
 use super::stmt_plan::{StmtPath, retain_stmts_with_paths};
 
 use super::object_flow::{
-    ProtoEffects, RootAnalysisContext, RootState, binding_from_lvalue, closure_captures_in_block,
-    join_state, transfer_root_node,
+    ModuleEffects, RootAnalysisContext, RootState, closure_captures_in_block, join_state,
+    transfer_root_node,
 };
 
 /// Deferred 阶段补齐 repeat 条件仍可观察的物理 root。
@@ -84,7 +84,7 @@ struct RepeatRoots {
 fn collect_proto_repeat_roots(
     proto: &HirProto,
     facts: Option<&ProtoPromotionFacts>,
-    effects: &[ProtoEffects],
+    effects: &ModuleEffects,
     safety: HirExprSafety,
 ) -> RepeatRoots {
     let captures = closure_captures_in_block(&proto.body);
@@ -210,12 +210,14 @@ fn repeat_scoped_bindings(block: &HirBlock) -> BTreeSet<HirRepeatBinding> {
             HirStmt::LocalDecl(decl) => {
                 bindings.extend(decl.bindings.iter().copied().map(HirRepeatBinding::Local));
             }
-            HirStmt::Assign(assign) => bindings.extend(assign.targets.iter().filter_map(
-                |target| match binding_from_lvalue(target) {
-                    Some(HirBinding::Temp(temp)) => Some(HirRepeatBinding::Temp(temp)),
-                    _ => None,
-                },
-            )),
+            HirStmt::Assign(assign) => {
+                bindings.extend(assign.targets.iter().filter_map(|target| {
+                    match HirBinding::from_lvalue(target) {
+                        Some(HirBinding::Temp(temp)) => Some(HirRepeatBinding::Temp(temp)),
+                        _ => None,
+                    }
+                }))
+            }
             HirStmt::NumericFor(for_stmt) => {
                 bindings.insert(HirRepeatBinding::Local(for_stmt.binding));
             }

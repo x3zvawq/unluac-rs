@@ -8,10 +8,14 @@
 //!   会直接产出一个 `LocalId` 绑定到该 loop header
 //! - `for k, v in iter() do ... end` 对应的 `LoopSourceBindings::Generic(rA..)` 会直接产出
 //!   一组 header locals，而不是再从 `GenericForLoop` terminator 回扫一次
+//! - 可写 numeric-for 用户槽只消费 protocol 的原入口 COPY 和目标寄存器；body 的读写
+//!   都绑定到同一语法 local，不把 hidden control 当作可写变量，也不在这里猜 MOVE 形状。
 //! - 同一 `(slot, close epoch)` 的引用捕获会共用一次反向写后分析，不会按
 //!   `closure 数 × def 数` 重复扫描；这里只决定绑定身份，不改写 closure 语义
 //! - loop local 与 captured-slot owner 判定直接借用 Structure 的 region 块切片；
 //!   例如嵌套循环的 body 覆盖由已校验的 containment 给出，不再展开 region tree。
+//! - 原显式 nil 声明的未捕获 debug scope 在原指令位置绑定，内层写和外层读共用身份；
+//!   例如 `local result; do result = closure end; return result` 不交给 AST 另造前向声明。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -52,6 +56,8 @@ use loop_bindings::*;
 struct CapturedSlotKey {
     slot: usize,
     epoch: usize,
+    /// 原 CLOSE 窗口的独立 cell 激活；物理 close epoch 不区分互斥分支的声明。
+    activation: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +68,11 @@ struct DebugBindingHint<'a> {
 
 impl CapturedSlotKey {
     fn new(slot: usize, epoch: usize) -> Self {
-        Self { slot, epoch }
+        Self {
+            slot,
+            epoch,
+            activation: None,
+        }
     }
 }
 
@@ -105,6 +115,7 @@ pub(super) fn build_bindings(
     let mut local_debug_hints = Vec::new();
     let mut entry_local_regs = BTreeMap::new();
     let mut numeric_for_locals = BTreeMap::new();
+    let mut numeric_binding_copies = BTreeSet::new();
     let mut generic_for_locals = BTreeMap::new();
     let mut block_local_regs = BTreeMap::new();
     let numeric_binding_phis = numeric_for_binding_phis(structure.plan());
@@ -133,7 +144,7 @@ pub(super) fn build_bindings(
         None
     };
 
-    let (debug_entry_local_decls, debug_scope_targets) = allocate_debug_entry_bindings(
+    let (debug_entry_local_decls, mut debug_scope_targets) = allocate_debug_entry_bindings(
         proto,
         structure,
         &mut entry_local_regs,
@@ -164,7 +175,16 @@ pub(super) fn build_bindings(
             continue;
         };
         match loop_plan.source_bindings {
-            Some(LoopSourceBindings::Numeric(reg)) => {
+            Some(LoopSourceBindings::Numeric(control)) => {
+                let reg = match structure.plan().loop_protocol(loop_id) {
+                    Some(LoopVmProtocol::NumericFor(protocol)) => {
+                        protocol.writable_binding.map_or(control, |(copy, reg)| {
+                            numeric_binding_copies.insert(copy);
+                            reg
+                        })
+                    }
+                    _ => control,
+                };
                 let local = LocalId(local_count);
                 local_count += 1;
                 local_debug_hints.push(
@@ -180,6 +200,18 @@ pub(super) fn build_bindings(
                     ),
                 );
                 numeric_for_locals.insert(loop_plan.header, local);
+                if let Some(LoopVmProtocol::NumericFor(protocol)) =
+                    structure.plan().loop_protocol(loop_id)
+                    && let Some((copy, _)) = protocol.writable_binding
+                {
+                    // 单块 numeric body 的普通指令可归在 control region 的前缀，未必
+                    // 出现在语法 body 的 region_blocks。原 COPY 的已验执行块才是用户
+                    // 槽每轮读写的 owner；否则跳过入口 COPY 后仍会读取未初始化 temp。
+                    block_local_regs
+                        .entry(cfg.instr_to_block[copy.index()])
+                        .or_insert_with(BTreeMap::new)
+                        .insert(reg, local);
+                }
 
                 for &block in body_blocks {
                     block_local_regs
@@ -373,6 +405,39 @@ pub(super) fn build_bindings(
         }
     }
 
+    // 显式 nil 声明已经有原位置与 source scope。后续内层写和外层读共用该身份，
+    // 不能等 block-local promotion 把它们分开后，再由 AST 给跨块 temp 补另一份声明。
+    // 捕获槽仍由原 cell owner 分配；这里不接管其快照或 CLOSE 协议。
+    let mut debug_nil_decls = BTreeMap::new();
+    let mut declared_local_home_slots = Vec::new();
+    for fact in structure.debug_bindings().accepted() {
+        let SsaValue::Def(def) = fact.value else {
+            continue;
+        };
+        let instr = dataflow.def_instr(def);
+        let temp = fixed_temps[def.index()];
+        if !matches!(proto.instrs[instr.index()], LowInstr::LoadNil(_))
+            || temp != TempId(def.index())
+            || dataflow.reg_is_captured(fact.reg)
+            || debug_scope_targets.contains_key(&fact.scope)
+        {
+            continue;
+        }
+        let local = LocalId(local_count);
+        local_count += 1;
+        local_debug_hints.push(Some(decode_raw_string(
+            &proto.debug_locals[fact.scope].name,
+        )));
+        debug_scope_targets.insert(fact.scope, BoundSlotTarget::Local(local));
+        debug_nil_decls.insert(temp, local);
+        declared_local_home_slots.push((
+            local,
+            HomeSlotKey::new(
+                fact.reg.index(),
+                captured_slot_epochs.epoch_at(fact.reg, instr),
+            ),
+        ));
+    }
     let bound_temp_targets = temp_debug_scopes
         .iter()
         .enumerate()
@@ -408,7 +473,7 @@ pub(super) fn build_bindings(
         }
     }
 
-    let captured_temp_facts = collect_captured_temp_facts(CapturedTempFactsInput {
+    let mut captured_temp_facts = collect_captured_temp_facts(CapturedTempFactsInput {
         proto,
         cfg,
         dataflow,
@@ -419,14 +484,16 @@ pub(super) fn build_bindings(
         epochs: captured_slot_epochs,
         numeric_binding_phis: &numeric_binding_phis.bindings,
     });
+    captured_temp_facts.decl_temps.extend(debug_nil_decls);
 
-    // CapturedSlotKey 与 HomeSlotKey 使用同一 `(reg, close epoch)` 坐标；保留全部 pair，
-    // 若未来一个 local 吸收多个 key，promotion facts 会把它合流成 Conflict。
-    let captured_local_home_slots = captured_slots
-        .slot_targets
-        .iter()
-        .map(|(key, binding)| (binding.target, HomeSlotKey::new(key.slot, key.epoch)))
-        .collect();
+    // 独立词法 cell 可以复用同一物理 `(reg, close epoch)`；activation 只区分绑定，
+    // 不伪造新 home。一个 local 若吸收多个物理 key，promotion 仍合流成 Conflict。
+    declared_local_home_slots.extend(
+        captured_slots
+            .slot_targets
+            .iter()
+            .map(|(key, binding)| (binding.target, HomeSlotKey::new(key.slot, key.epoch))),
+    );
 
     // 这一层默认只消费 reachable 子图，所以 label/temp 也贴着 shared CFG/Dataflow 的约定。
     let _ = cfg;
@@ -451,7 +518,7 @@ pub(super) fn build_bindings(
         bound_temp_targets,
         captured_temp_targets: captured_temp_facts.targets,
         temp_decl_locals: captured_temp_facts.decl_temps,
-        captured_local_home_slots,
+        declared_local_home_slots,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
         capture_entry_local_decls: captured_slots.entry_local_decls,
         debug_entry_local_decls,
@@ -468,6 +535,7 @@ pub(super) fn build_bindings(
         ),
         entry_local_regs,
         numeric_for_locals,
+        numeric_binding_copies,
         numeric_binding_phi_locals,
         generic_for_locals,
         block_local_regs,

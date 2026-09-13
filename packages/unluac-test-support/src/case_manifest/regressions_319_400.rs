@@ -137,9 +137,16 @@ LuaCaseMatrixEntry::new(
     }),
 LuaCaseMatrixEntry::new(
     "tests/regress-case/regress_337_table_constructor_local_acceptance.lua",
-    PUC_LUA_54,
+    ALL_DIALECTS,
+),
+LuaCaseMatrixEntry::new(
+    "tests/regress-case/regress_337_table_constructor_local_acceptance.lua",
+    ALL_DIALECTS,
 )
-.with_expectation(LuaCaseExpectation::TableSetListResidual),
+.with_options(LuaCaseOptions {
+    retain_debug: true,
+    ..LuaCaseOptions::DEFAULT
+}),
 LuaCaseMatrixEntry::new(
     "tests/regress-case/regress_338_locals_value_flow.lua",
     PUC_LUA_ALL,
@@ -282,12 +289,7 @@ LuaCaseMatrixEntry::new(
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_352_multi_return_call_root.lua",
         PUC_LUA_ALL,
-    )
-    .with_options(LuaCaseOptions {
-        // 该 case 锁定首轮 run owner；重编译后的嵌套 callee 会重新展开为另一组 local。
-        recompile_rounds: Some(0),
-        ..LuaCaseOptions::DEFAULT
-    }),
+    ),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_352_multi_return_call_run_order.lua",
         PUC_LUA_ALL,

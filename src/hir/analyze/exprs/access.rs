@@ -70,6 +70,12 @@ pub(crate) fn lower_table_access_expr(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        sources: crate::hir::common::HirOperationSources::Single(
+            crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: instr_ref,
+            },
+        ),
         metamethod_free: lowering.dataflow.plain_table_reads[instr_ref.index()],
         base: lower_access_base_expr(lowering, block, instr_ref, base),
         key: lower_access_key_expr(lowering, block, instr_ref, key),
@@ -104,6 +110,7 @@ pub(crate) fn lower_raw_table_set_call(
 ) -> HirCallExpr {
     // 同 raw read，不把 VM primitive 伪装成会触发 `__newindex` 的普通赋值。
     HirCallExpr {
+        source_site: None,
         argument_roots: Vec::new(),
         frame_root_ends: Vec::new(),
         callee: unresolved_expr("LuaJIT raw table write has no exact Lua source form"),
@@ -133,6 +140,12 @@ pub(crate) fn lower_table_access_target(
     }
 
     HirLValue::TableAccess(Box::new(HirTableAccess {
+        sources: crate::hir::common::HirOperationSources::Single(
+            crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: instr_ref,
+            },
+        ),
         metamethod_free: false,
         base: lower_access_base_expr(lowering, block, instr_ref, base),
         key: lower_access_key_expr(lowering, block, instr_ref, key),
@@ -152,6 +165,12 @@ pub(crate) fn lower_table_access_expr_inline(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        sources: crate::hir::common::HirOperationSources::Single(
+            crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: instr_ref,
+            },
+        ),
         metamethod_free: lowering.dataflow.plain_table_reads[instr_ref.index()],
         base: lower_access_base_expr_inline(lowering, block, instr_ref, base),
         key: lower_access_key_expr_inline(lowering, block, instr_ref, key),
@@ -242,6 +261,12 @@ pub(crate) fn lower_table_access_expr_single_eval(
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
+        sources: crate::hir::common::HirOperationSources::Single(
+            crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: instr_ref,
+            },
+        ),
         metamethod_free: lowering.dataflow.plain_table_reads[instr_ref.index()],
         base: lower_access_base_expr_single_eval(lowering, block, instr_ref, base),
         key: lower_access_key_expr_single_eval(lowering, block, instr_ref, key),
@@ -266,6 +291,7 @@ pub(crate) fn lower_raw_table_get_expr_single_eval(
 
 fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
     HirExpr::Call(Box::new(HirCallExpr {
+        source_site: None,
         argument_roots: Vec::new(),
         frame_root_ends: Vec::new(),
         callee: unresolved_expr("LuaJIT raw table read has no exact Lua source form"),

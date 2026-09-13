@@ -1,6 +1,7 @@
 -- Assignment-to-method syntax is retained as plain field syntax without explicit provenance.
 -- unluac: expect-contains [[.capture_root(p]]
--- unluac: expect-contains [[:effectful_relaxed(]]
+-- receiver 的独立根不能因缩写调用而删除；源码本身也是普通点调用。
+-- unluac: expect-contains [[.effectful_relaxed(]]
 -- unluac: expect-contains [[:direct_statement_only()]]
 -- unluac: expect-contains [[()()]]
 
@@ -117,3 +118,36 @@ end
 
 call_terminal_callee()
 assert(terminal_callee_events == 2)
+
+-- 调用糖不能删除仍在使用的 receiver 根。
+local receiver_weak = setmetatable({}, {__mode = "v"})
+local function make_retained_receiver()
+    local object = setmetatable({}, {__index = function(_, key)
+        assert(key == "retained_receiver")
+        collectgarbage("collect")
+        assert(type(receiver_weak[1]) == "table")
+        return function(self)
+            collectgarbage("collect")
+            assert(receiver_weak[1] == self)
+            return 53
+        end
+    end})
+    receiver_weak[1] = object
+    return object
+end
+local retained_receiver = make_retained_receiver()
+assert(retained_receiver.retained_receiver(retained_receiver) == 53)
+collectgarbage("collect")
+assert(receiver_weak[1] == retained_receiver)
+
+-- 字段 lookup 可通过捕获改写 receiver；此时第二次读取必须取得新对象。
+local changed_receiver
+local replacement_receiver = {}
+changed_receiver = setmetatable({}, {__index = function()
+    changed_receiver = replacement_receiver
+    return function(self)
+        assert(self == replacement_receiver)
+        return 59
+    end
+end})
+assert(changed_receiver.lookup_rebind(changed_receiver) == 59)

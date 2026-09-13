@@ -471,7 +471,7 @@ fn paired_return_cleanup(stmts: &[HirStmt], index: usize) -> bool {
     matches!((stmts.get(index), stmts.get(index + 1)),
         (Some(HirStmt::Close(close)), Some(HirStmt::Return(ret)))
         if matches!(close.kind, crate::transformer::CloseKind::Return(source)
-            if ret.source_instr == Some(source)))
+            if ret.pending_cleanup_source == Some(source)))
 }
 
 fn frame_cleanup_end(stmts: &[HirStmt], index: usize) -> Option<usize> {
@@ -486,7 +486,7 @@ fn paired_frame_cleanup(close: &HirClose, next: Option<&HirStmt>) -> bool {
         crate::transformer::CloseKind::TailCall(source) if close.origins.is_empty() => source,
         _ => return false,
     };
-    matches!(next, Some(HirStmt::Return(ret)) if ret.source_instr == Some(source))
+    matches!(next, Some(HirStmt::Return(ret)) if ret.pending_cleanup_source == Some(source))
 }
 
 /// 删除 cleanup 的原子提交入口；next 必须来自改写前同一直属 block 的真实后继。
@@ -500,7 +500,7 @@ fn consume_cleanup_return_identity(close: &HirClose, next: Option<&mut HirStmt>)
     let Some(HirStmt::Return(ret)) = next else {
         unreachable!("validated frame cleanup has its original return successor");
     };
-    ret.source_instr = None;
+    ret.pending_cleanup_source = None;
     true
 }
 

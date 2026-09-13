@@ -45,6 +45,7 @@ fn structural_expr_cost(expr: &HirExpr) -> usize {
         | HirExpr::UpvalueRef(_)
         | HirExpr::TempRef(_)
         | HirExpr::VarArg => 1,
+        HirExpr::CaptureInitializer(_) => 7,
         HirExpr::Decision(_)
         | HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
@@ -114,6 +115,7 @@ fn logical_shape_penalty(expr: &HirExpr) -> usize {
         | HirExpr::GlobalRef(_)
         | HirExpr::TableAccess(_)
         | HirExpr::Call(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)

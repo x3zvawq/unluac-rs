@@ -305,7 +305,11 @@ fn specialize_condition(
     let mut replacement = match expr {
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
             specialize_condition(&unary.expr, facts, stable)
-                .map(|expr| HirExpr::Unary(Box::new(HirUnaryExpr { op: unary.op, expr })))
+                .map(|expr| HirExpr::Unary(Box::new(HirUnaryExpr {
+                    source_site: unary.source_site,
+                    op: unary.op,
+                    expr,
+                })))
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             let lhs = specialize_condition(&logical.lhs, facts, stable);

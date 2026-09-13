@@ -586,6 +586,7 @@ fn rewrite_boundary_assignment_reads(
         values: assign.values.clone(),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        generic_for_dispatch_release: None,
         method_rewrite_transaction: None,
     }));
     let rewritten = rewrite_stmts(std::slice::from_mut(&mut scratch), pass);
@@ -609,6 +610,7 @@ fn rewrite_boundary_assignment_reads(
         .collect();
     if rewritten {
         assign.generic_for_initializer_producer = None;
+        assign.generic_for_dispatch_release = None;
     }
     rewritten
 }

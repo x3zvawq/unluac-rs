@@ -1,9 +1,12 @@
-//! 这个文件恢复 Luau 带 capture 的重复 `DUPCLOSURE` 所属词法 factory。
+//! 这个文件恢复 Luau 重复 `DUPCLOSURE` 所属的已证明词法 factory。
 //!
 //! 带 capture 的 reusable closure 不能直接降低成多个独立闭包字面量：Luau 会按 capture
 //! identity 复用闭包，且 VM 对 NaN 的 identity 比较不满足自反性。因此必须在 HIR 改变
 //! 形态前证明共同词法 owner。这里仅描述 closure dependency DAG；被内联 factory 的调用、
-//! 参数求值及其他可观察指令仍留在父 proto 原位。
+//! 参数求值及其他可观察指令仍留在父 proto 原位。恢复原 factory 调用会重新建立 activation，
+//! 不能依赖目标编译器再次内联来保持原调用栈与效果槽。
+//! capture-free 组若同样有唯一未使用 owner，也沿用其 anchor；否则由既有共享 pool 保持身份，
+//! 不能为了声明前缀给入口 pool 猜测一个原物理 home。
 //!
 //! 输入示例：父 proto 的 `@3/@7 DUPCLOSURE s2` 分别只被 `@6/@10 DUPCLOSURE s5`
 //! 捕获。输出计划：在共同 owner 处声明一次 synthetic factory，消费 `@3/@7`，并把
@@ -117,14 +120,16 @@ pub(super) fn build_shared_closure_plan(
     structure: &StructurePlan,
 ) -> Result<SharedClosurePlan, HirLowerError> {
     let groups = collect_reusable_groups(proto, &cfg_graph.cfg, dataflow);
-    let targets = groups
+    let mut targets = groups
         .values()
-        .filter(|group| group.instrs.len() > 1 && group.has_captures)
+        .filter(|group| group.instrs.len() > 1)
         .map(|group| group.shared)
         .collect::<Vec<_>>();
     if targets.is_empty() {
         return Ok(SharedClosurePlan::default());
     }
+    // 必须恢复的 captured 组件先保有依赖；可选 pool 锚定不能抢占这些现有 owner。
+    targets.sort_by_key(|shared| (!groups[shared].has_captures, *shared));
 
     let owner_templates = collect_owner_templates(proto, cfg_graph, dataflow);
     let mut owners_by_root = BTreeMap::<_, Vec<_>>::new();
@@ -138,13 +143,20 @@ pub(super) fn build_shared_closure_plan(
     let mut lexical_scopes = LexicalScopeIndex::new(structure);
     let mut shape_cache = BTreeMap::new();
     let mut roots = Vec::new();
+    let mut matched_groups = BTreeSet::new();
+    let mut matched_owners = BTreeSet::new();
     for shared in &targets {
         let group = &groups[shared];
-        let dominance = group_dominance_envelope(group, &cfg_graph.cfg, graph_facts)
-            .ok_or_else(|| group.error())?;
-        let lexical_scope =
-            group_lexical_scope_envelope(group, &cfg_graph.cfg, &mut lexical_scopes)
-                .ok_or_else(|| group.error())?;
+        let Some((dominance, lexical_scope)) =
+            group_dominance_envelope(group, &cfg_graph.cfg, graph_facts).zip(
+                group_lexical_scope_envelope(group, &cfg_graph.cfg, &mut lexical_scopes),
+            )
+        else {
+            if group.has_captures {
+                return Err(group.error());
+            }
+            continue;
+        };
         let mut matched = None;
         let origin = proto
             .children
@@ -157,6 +169,9 @@ pub(super) fn build_shared_closure_plan(
             .flatten()
         {
             let owner = &owner_templates[*index];
+            if !group.has_captures && !owner_definition_is_unused(proto, dataflow, owner.instr) {
+                continue;
+            }
             let Some(component) =
                 (owner_dominates_envelope(owner.instr, dominance, &cfg_graph.cfg, graph_facts)
                     && lexical_scopes
@@ -170,11 +185,28 @@ pub(super) fn build_shared_closure_plan(
             else {
                 continue;
             };
-            if matched.replace((owner, component)).is_some() {
-                return Err(group.error());
+            if matched.is_some() {
+                if group.has_captures {
+                    return Err(group.error());
+                }
+                matched = None;
+                break;
             }
+            matched = Some((owner, component));
         }
         if let Some(root) = matched {
+            if !group.has_captures
+                && (matched_owners.contains(&root.0.instr)
+                    || root
+                        .1
+                        .node_groups
+                        .iter()
+                        .any(|shared| matched_groups.contains(shared)))
+            {
+                continue;
+            }
+            matched_owners.insert(root.0.instr);
+            matched_groups.extend(root.1.node_groups.iter().copied());
             roots.push(root);
         }
     }
@@ -234,7 +266,7 @@ pub(super) fn build_shared_closure_plan(
 
     if let Some(unclaimed) = targets
         .into_iter()
-        .find(|shared| !claimed_groups.contains(shared))
+        .find(|shared| groups[shared].has_captures && !claimed_groups.contains(shared))
     {
         return Err(groups[&unclaimed].error());
     }

@@ -96,6 +96,8 @@ pub(super) fn freeze_protocol(
         }
         LoopKindHint::NumericForLike => LoopVmProtocol::NumericFor(freeze_numeric_for_protocol(
             proto,
+            cfg,
+            dataflow,
             plan,
             region,
             payload,
@@ -168,6 +170,8 @@ pub(super) fn freeze_condition_protocol(
 
 pub(super) fn freeze_numeric_for_protocol(
     proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
     plan: &StructurePlan,
     region: RegionId,
     payload: &LoopPlanData,
@@ -226,7 +230,90 @@ pub(super) fn freeze_numeric_for_protocol(
         limit: init.limit,
         step: init.step,
         binding: init.binding,
+        writable_binding: numeric_writable_binding(
+            proto, cfg, dataflow, preheader, init, loop_instr,
+        ),
     })
+}
+
+/// 独立控制 index 后的可写用户槽是原 VM-for 协议的一部分，不是任意 body COPY。
+/// 只接单块正常 body：首条复制每次必达，控制值除此以外不作普通读取，用户槽确有
+/// 后续写且不捕获。`for i=1,n do local old=i; i=i+1 end` 因而保持控制槽和 old 快照，
+/// 不会在重编译时把可写 i 变成一个不可写的循环变量并触发新的展开。
+fn numeric_writable_binding(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    preheader: BlockRef,
+    init: &crate::transformer::NumericForInitInstr,
+    loop_instr: Option<InstrRef>,
+) -> Option<(InstrRef, Reg)> {
+    let latch = loop_instr?;
+    let body = *cfg.instr_to_block.get(init.body_target.index())?;
+    let block = cfg.blocks.get(body.index())?;
+    if init.index != init.binding
+        || init.index.index() != init.limit.index().checked_add(2)?
+        || init.step.index() != init.limit.index().checked_add(1)?
+        || block.instrs.start != init.body_target
+        || block.instrs.end() != latch.index() + 1
+        || cfg.preds[body.index()].iter().any(|edge| {
+            let source = cfg.edges[edge.index()].from;
+            source != preheader && source != body
+        })
+    {
+        return None;
+    }
+    let LowInstr::NumericForLoop(loop_) = proto.instrs.get(latch.index())? else {
+        return None;
+    };
+    let LowInstr::Move(copy) = proto.instrs.get(init.body_target.index())? else {
+        return None;
+    };
+    if loop_.index != init.index
+        || loop_.binding != init.binding
+        || loop_.limit != init.limit
+        || loop_.step != init.step
+        || loop_.body_target != init.body_target
+        || loop_.exit_target != init.exit_target
+        || copy.src != init.index
+        || copy.dst.index() != init.index.index().checked_add(1)?
+        || dataflow.reg_is_captured(copy.dst)
+        || dataflow.reg_is_captured(init.index)
+    {
+        return None;
+    }
+    let mut written = false;
+    let mut debug_scope = None;
+    for index in init.body_target.index()..latch.index() {
+        let effects = &dataflow.instr_effects[index];
+        if [init.limit, init.step, init.index].into_iter().any(|reg| {
+            effects.fixed_must_defs().contains(&reg)
+                || effects.uses_fixed(reg)
+                    && !(index == init.body_target.index() && reg == init.index)
+        }) {
+            return None;
+        }
+        // OPEN 后缀不能借固定寄存器集合证明未触及控制/用户槽。
+        if effects.open_use.is_some() || effects.open_must_def.is_some() {
+            return None;
+        }
+        if index != init.body_target.index() && effects.fixed_must_defs().contains(&copy.dst) {
+            written = true;
+        }
+        for &pc in &proto.lowering_map.pc_map()[index] {
+            // 有源码控制 binding 时，首 COPY 是另一个显式 local，不能吞掉两个 debug 身份。
+            if proto.debug_locals.source_at(init.index, pc).is_some() {
+                return None;
+            }
+            if let Some((scope, _)) = proto.debug_locals.source_at(copy.dst, pc) {
+                if debug_scope.is_some_and(|previous| previous != scope) {
+                    return None;
+                }
+                debug_scope = Some(scope);
+            }
+        }
+    }
+    written.then_some((init.body_target, copy.dst))
 }
 
 pub(super) fn freeze_generic_for_protocol(

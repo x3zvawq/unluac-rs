@@ -42,7 +42,7 @@ pub(crate) trait TableExpression: Sized {
 }
 
 /// 原模板中的稳定 key 身份。LuaJIT/Luau 数字使用 binary64 身份，字符串保留原始字节。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TableTemplateKey {
     Boolean(bool),
     Number(u64),
@@ -65,7 +65,7 @@ pub(crate) enum TableInitializationConstraint<'a> {
     Runtime,
     Template {
         array_slots: u32,
-        hash_keys: &'a [TableTemplateKey],
+        hash_keys: &'a std::collections::BTreeSet<TableTemplateKey>,
     },
 }
 

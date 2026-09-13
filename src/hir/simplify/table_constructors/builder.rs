@@ -7,6 +7,8 @@
 //! 输入形状：已有构造器字段 + 后续 array / record / set-list 值。
 //! 输出形状：按 Lua 构造器语义重新排序后的 `HirTableConstructor`。未来整数键只有在后续
 //! 写入可证明不别名时才能晋升为 array；open list 覆盖已有后缀时先降回显式整数字段。
+//! 完整 Luau 初始化消费 lower 标记的隐式模板位置：默认零值和原同键写只对应一个源码
+//! 字段，实际写仍全部按原顺序输出，避免每轮编译重复增加一份默认零值写。
 
 use std::collections::BTreeMap;
 
@@ -39,7 +41,9 @@ pub(super) enum RecordPromotionPolicy {
 
 #[derive(Debug, Clone)]
 pub(super) struct ConstructorBuilder {
+    sources: crate::hir::common::HirOperationSources,
     allocation: HirTableAllocation,
+    implicit_template_fields: std::collections::BTreeSet<usize>,
     fields: Vec<BuilderField>,
     pub(super) trailing_multivalue: Option<HirPackTail>,
     next_array_index: u32,
@@ -63,9 +67,34 @@ pub(super) struct BuilderCheckpoint {
 }
 
 impl ConstructorBuilder {
+    /// 无 producer 的批次追加共用相同整数键/开放覆盖规则；时序与槽证明由调用方负责。
+    pub(super) fn append_batch(
+        &mut self,
+        batch: &crate::hir::common::HirTableSetList,
+        scratch: &mut RebuildScratch,
+    ) -> Option<()> {
+        if self.trailing_multivalue.is_some()
+            || (batch.start_index < self.next_array_index()
+                && !self.demote_array_suffix(batch.start_index, &mut scratch.restored_array_fields))
+        {
+            return None;
+        }
+        self.drain_pending_integer_fields(&mut scratch.restored_pending_integer_fields);
+        if batch.start_index != self.next_array_index() {
+            return None;
+        }
+        for value in &batch.values.fixed {
+            self.push_array_value(value.clone());
+        }
+        self.trailing_multivalue = batch.values.tail.clone();
+        Some(())
+    }
+
     pub(super) fn from_constructor(constructor: HirTableConstructor) -> Self {
         let mut builder = Self {
+            sources: constructor.sources,
             allocation: constructor.allocation,
+            implicit_template_fields: constructor.implicit_template_fields,
             fields: Vec::with_capacity(constructor.fields.len()),
             trailing_multivalue: constructor.trailing_multivalue,
             next_array_index: 1,
@@ -115,10 +144,14 @@ impl ConstructorBuilder {
             }
         }
         let mut constructor = HirTableConstructor {
+            sources: self.sources,
             fields,
             trailing_multivalue: self.trailing_multivalue,
             allocation: self.allocation,
+            implicit_template_fields: self.implicit_template_fields,
         };
+        restore_luau_template_initialization(&mut constructor);
+        restore_template_nil_slots(&mut constructor);
         restore_indexed_array_fields(&mut constructor);
         constructor
     }
@@ -402,6 +435,171 @@ impl ConstructorBuilder {
     }
 }
 
+/// Luau 模板把 None 项预置为零，Some 项则在分配时已有真正的常量值。
+/// 原运行写填回同键的隐式位置时，仍在源码字段中求值一次；不能删掉 Some 常量，
+/// 也不能重新识别已经消费的零值。只跨初始常量和无事件的字面量写，运行字段保持
+/// 单调顺序；原前缀位置不删除，所以未消费角色的索引在后缀压缩后仍然有效。
+fn restore_luau_template_initialization(constructor: &mut HirTableConstructor) {
+    if constructor.implicit_template_fields.is_empty() || constructor.trailing_multivalue.is_some()
+    {
+        return;
+    }
+    let HirTableAllocation::LuauTemplate { hash_keys } = &constructor.allocation else {
+        return;
+    };
+    let prefix = hash_keys.len();
+    // compileExprTable 只对至多 32 个裸名 record 选择 DUPTABLE。最多消费每个隐式
+    // 位置一次；即使全消费仍超过上界的候选无需扫描，也不能改变为 NEWTABLE。
+    if prefix >= constructor.fields.len()
+        || constructor
+            .implicit_template_fields
+            .iter()
+            .any(|index| *index >= prefix)
+        || constructor.fields.len() - constructor.implicit_template_fields.len() > 32
+    {
+        return;
+    }
+    let mut initial = BTreeMap::new();
+    let mut last_runtime_field = None;
+    for (index, field) in constructor.fields[..prefix].iter().enumerate() {
+        let HirTableField::Record(record) = field else {
+            return;
+        };
+        let Some(key) = record.key.table_key() else {
+            return;
+        };
+        if !hash_keys.contains(&key) || initial.insert(key, index).is_some() {
+            return;
+        }
+        if constructor.implicit_template_fields.contains(&index)
+            && record.value != HirExpr::Integer(0)
+        {
+            return;
+        }
+        if !is_template_literal(&record.value) {
+            last_runtime_field = Some(index);
+        }
+    }
+    let mut pending = constructor.implicit_template_fields.clone();
+    let mut fills = Vec::new();
+    for (index, field) in constructor.fields.iter().enumerate() {
+        let HirTableField::Record(record) = field else {
+            return;
+        };
+        let HirExpr::String(name) = &record.key else {
+            return;
+        };
+        if !name
+            .as_utf8()
+            .is_some_and(|name| crate::decompile::DecompileDialect::Luau.is_identifier_name(name))
+        {
+            return;
+        }
+        let Some(destination) = record
+            .key
+            .table_key()
+            .and_then(|key| initial.get(&key).copied())
+        else {
+            return;
+        };
+        if index < prefix {
+            continue;
+        }
+        if pending.contains(&destination)
+            && last_runtime_field.is_none_or(|last| last <= destination)
+        {
+            pending.remove(&destination);
+            fills.push((index, destination));
+            if !is_template_literal(&record.value) {
+                last_runtime_field = Some(destination);
+            }
+        } else {
+            // 未收回的真实字段写仍在这里，不能把后面的求值移到它前面。
+            last_runtime_field = Some(index);
+        }
+    }
+    if fills.is_empty() || constructor.fields.len() - fills.len() > 32 {
+        return;
+    }
+    let mut removed = vec![false; constructor.fields.len()];
+    for (source, destination) in fills {
+        constructor.fields[destination] = std::mem::replace(
+            &mut constructor.fields[source],
+            HirTableField::Array(HirExpr::Nil),
+        );
+        removed[source] = true;
+    }
+    let mut removed = removed.into_iter();
+    constructor
+        .fields
+        .retain(|_| !removed.next().expect("one decision per field"));
+    constructor.implicit_template_fields = pending;
+}
+
+/// TDUP 的 nil 数组槽不是必须输出的源码字段：`{nil,"tail"}; t[1]=f()` 可以复原
+/// `{f(),"tail"}`。只跨过字面量，运行时字段的目的位置必须保持单调，不能把倒序
+/// `t[2]=a(); t[1]=b()` 变成先 b 后 a。这里仅归约完整候选，原 builder 不变，失败仍
+/// 由外层整区间事务丢弃；容量、owner 独立性及 producer 根另由原有提交证明核对。
+fn restore_template_nil_slots(constructor: &mut HirTableConstructor) {
+    if !matches!(constructor.allocation, HirTableAllocation::Template { .. }) {
+        return;
+    }
+    let mut nil_slots = Vec::new();
+    let mut last_runtime_field = None;
+    let mut removed = vec![false; constructor.fields.len()];
+    for (index, removed) in removed.iter_mut().enumerate() {
+        let slot = match &constructor.fields[index] {
+            HirTableField::Array(value) => {
+                nil_slots.push(matches!(value, HirExpr::Nil).then_some(index));
+                if !is_template_literal(value) {
+                    last_runtime_field = Some(index);
+                }
+                continue;
+            }
+            HirTableField::Record(record) => match record.key {
+                HirExpr::Integer(key) => {
+                    usize::try_from(key).ok().and_then(|key| key.checked_sub(1))
+                }
+                _ => None,
+            },
+        };
+        let destination = slot.and_then(|slot| nil_slots.get_mut(slot)?.take());
+        let Some(destination) = destination
+            .filter(|destination| last_runtime_field.is_none_or(|last| last <= *destination))
+        else {
+            // record 写入可能改变表布局；即使 key/value 是常量也不能跨它搬动调用。
+            last_runtime_field = Some(index);
+            continue;
+        };
+        let HirTableField::Record(record) = std::mem::replace(
+            &mut constructor.fields[index],
+            HirTableField::Array(HirExpr::Nil),
+        ) else {
+            unreachable!()
+        };
+        if !is_template_literal(&record.value) {
+            last_runtime_field = Some(destination);
+        }
+        constructor.fields[destination] = HirTableField::Array(record.value);
+        *removed = true;
+    }
+    let mut removed = removed.into_iter();
+    constructor
+        .fields
+        .retain(|_| !removed.next().expect("one removal decision per field"));
+}
+
+fn is_template_literal(value: &HirExpr) -> bool {
+    matches!(
+        value,
+        HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+    )
+}
+
 /// 索引式构造器的预分配是前层事实；只有完整有序前缀能复现该容量时才恢复数组字段。
 /// 字段没有换序，故 indexed VM 的写入事件也不变；不把零散整数键猜成数组初始化。
 fn restore_indexed_array_fields(constructor: &mut HirTableConstructor) {
@@ -462,6 +660,7 @@ fn statically_known_numeric_key(key: &HirExpr) -> Option<Option<i64>> {
         | HirExpr::LogicalOr(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => None,
     }

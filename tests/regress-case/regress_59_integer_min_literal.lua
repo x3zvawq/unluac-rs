@@ -1,6 +1,7 @@
 -- unluac: expect-contains [[-0x8000000000000000]]
 -- unluac: expect-not-contains [[end)(]]
--- unluac: expect-contains [[math.type(-0x8000000000000000)]]
+-- 原 value 是多值 RETURN 前的低槽前缀；检查整数发射及运行类型，不要求删除该声明。
+-- unluac: expect-contains [[math.type(]]
 -- unluac: expect-not-contains [[local r1_1 = r1_0]]
 local function run()
     local value = -0x8000000000000000

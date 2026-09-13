@@ -19,6 +19,8 @@ use super::*;
 #[derive(Clone, Debug, Default)]
 pub(super) struct CopyRootRetirements {
     pub(super) producers: BTreeSet<TempId>,
+    /// 已有原始定义且在同块覆盖的源值；需要结束写，但不需要入口 nil holder。
+    pub(super) defined_sources: BTreeSet<TempId>,
     pub(super) releases: BTreeMap<InstrRef, Vec<TempId>>,
     pub(super) after_releases: BTreeMap<InstrRef, Vec<TempId>>,
     pub(super) boundaries: BTreeSet<InstrRef>,
@@ -53,6 +55,18 @@ impl CopyRootRetirements {
             for (temp, producer, releases) in
                 retirement_points(proto, cfg, dataflow, home, &candidates)
             {
+                let def = &dataflow.defs[temp.index()];
+                if dataflow.def_overwrites_unknown_scratch(def.id)
+                    && releases.iter().all(|release| {
+                        release.instr.index() > producer.index()
+                            && cfg.instr_to_block[release.instr.index()] == def.block
+                    })
+                {
+                    // 同块 COPY 的写入还负责清除 CALL 残值，不能改为函数入口的额外
+                    // home-free holder；它会抬高实际槽序。交给共享 scalar root owner，
+                    // 由 scratch 覆盖事实保留原写入及同 home 终点，而非另造保活槽。
+                    continue;
+                }
                 if !releases.iter().all(|release| emitted(release.instr))
                     // Entry 参数没有可交接的 producer 表达式，必须在此保存匿名快照。
                     // Def 值由后续表达式/root owner 复核；for 操作数由循环协议保有，

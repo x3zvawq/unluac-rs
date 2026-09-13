@@ -218,6 +218,7 @@ fn loop_header_rhs_is_invariant(
         | AstExpr::Binary(_)
         | AstExpr::Call(_)
         | AstExpr::MethodCall(_)
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::TableConstructor(_)
         | AstExpr::FunctionExpr(_)
@@ -407,6 +408,7 @@ impl EvalPrefixCollector<'_> {
             | AstExpr::Vector(_)
             | AstExpr::Complex { .. }
             | AstExpr::Var(_)
+            | AstExpr::CaptureInitializer(_)
             | AstExpr::VarArg
             | AstExpr::Error(_) => {}
         }

@@ -5,13 +5,16 @@
 //! 例如：`not (a == nil)` 可能在这里被整理成更顺的逻辑表达式。
 
 use std::collections::BTreeSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::hir::common::HirExpr;
 use crate::hir::expr_safety::HirExprSafety;
+use crate::hir::visit::{HirVisitor, visit_expr};
 
 use super::super::{logical_and, logical_or};
 use super::domain::{
-    SymbolicVerifier, build_validation_domain, collect_literals_from_expr, collect_refs_from_expr,
+    AbstractValue, AtomKey, SymbolicVerifier, build_validation_domain, collect_literals_from_expr,
+    collect_refs_from_expr,
 };
 use super::normalize_candidate_expr;
 use super::safety::expr_is_synth_safe;
@@ -27,7 +30,28 @@ pub(crate) fn naturalize_pure_logical_expr(
         return None;
     }
 
-    let mut current = normalize_candidate_expr(expr.clone(), safety);
+    // 只有已证明纯且稳定的逻辑综合可以重排/合并谓词。候选里的比较是值公式，
+    // 不再代表某一次原跳转；否则相同 a==1 会因不同 PC 无法提取公因子。提交仍须
+    // 成本下降与 MDD 等价证明，不能让合成比较借任一原谓词的 LOADBOOL 写回证书。
+    struct SynthesizedPredicates;
+    impl crate::hir::simplify::walk::HirRewritePass for SynthesizedPredicates {
+        fn rewrite_expr_before_children(&mut self, expr: &mut HirExpr) -> bool {
+            if let HirExpr::Binary(binary) = expr
+                && matches!(
+                    binary.op,
+                    crate::hir::HirBinaryOpKind::Eq
+                        | crate::hir::HirBinaryOpKind::Lt
+                        | crate::hir::HirBinaryOpKind::Le
+                )
+            {
+                return binary.source_site.take().is_some();
+            }
+            false
+        }
+    }
+    let mut current = expr.clone();
+    crate::hir::simplify::walk::rewrite_expr(&mut current, &mut SynthesizedPredicates);
+    let mut current = normalize_candidate_expr(current, safety);
     let mut validation = None;
     let mut changed = false;
     // 每次提交都严格降低有限的 expr_cost；因此即使深层候选需要超过八轮，也会在有限步内
@@ -226,20 +250,75 @@ fn factor_or_of_ands(lhs: &HirExpr, rhs: &HirExpr) -> Vec<HirExpr> {
     candidates
 }
 
+/// 只索引可能有共同首项或末项的分支。保留原 left/right 枚举次序和所有候选，
+/// 不用排序键替代完整表达式比较或 Lua 值等价验证；配对流不分配平方大小的集合。
 fn visit_factor_or_chain_of_ands(expr: &HirExpr, emit: &mut impl FnMut(HirExpr)) {
     let terms = flatten_or_chain(expr);
     if terms.len() < 3 {
         return;
     }
+    let parts = terms
+        .iter()
+        .map(|term| flatten_and_chain(term))
+        .collect::<Vec<_>>();
+    let mut entries = Vec::with_capacity(terms.len() * 2);
+    for (term, parts) in parts.iter().enumerate() {
+        if parts.len() >= 2 {
+            for (side, factor) in [parts[0], parts[parts.len() - 1]].into_iter().enumerate() {
+                entries.push((side, factor_key(factor), term));
+            }
+        }
+    }
+    entries.sort_unstable();
+    let mut memberships = vec![None; terms.len()];
+    let mut start = 0;
+    while start < entries.len() {
+        let (side, key, _) = entries[start];
+        let mut end = start + 1;
+        while end < entries.len() && (entries[end].0, entries[end].1) == (side, key) {
+            end += 1;
+        }
+        for &(_, _, term) in &entries[start..end] {
+            memberships[term].get_or_insert([0..0, 0..0])[side] = start..end;
+        }
+        start = end;
+    }
 
-    for left in 0..terms.len() {
-        for right in left + 1..terms.len() {
-            if let Some(factored) = factor_and_term_pair(terms[left], terms[right]) {
+    for (left, membership) in memberships.into_iter().enumerate() {
+        let Some([first, last]) = membership else {
+            continue;
+        };
+        let first = &entries[first];
+        let last = &entries[last];
+        let mut first = first[first.partition_point(|entry| entry.2 <= left)..]
+            .iter()
+            .map(|entry| entry.2)
+            .peekable();
+        let mut last = last[last.partition_point(|entry| entry.2 <= left)..]
+            .iter()
+            .map(|entry| entry.2)
+            .peekable();
+        while let Some(right) = match (first.peek().copied(), last.peek().copied()) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    first.next();
+                }
+                if b <= a {
+                    last.next();
+                }
+                Some(a.min(b))
+            }
+            (Some(_), None) => first.next(),
+            (None, Some(_)) => last.next(),
+            (None, None) => None,
+        } {
+            if let Some(factored) = factor_and_term_pair(&parts[left], &parts[right]) {
                 let mut rebuilt = Vec::with_capacity(terms.len() - 1);
-                for (index, term) in terms.iter().enumerate() {
-                    if index == left {
-                        rebuilt.push(factored.clone());
-                    } else if index != right {
+                let mut factored = Some(factored);
+                for (position, term) in terms.iter().enumerate() {
+                    if position == left {
+                        rebuilt.push(factored.take().expect("left occurs once"));
+                    } else if position != right {
                         rebuilt.push((*term).clone());
                     }
                 }
@@ -249,15 +328,52 @@ fn visit_factor_or_chain_of_ands(expr: &HirExpr, emit: &mut impl FnMut(HirExpr))
     }
 }
 
-fn factor_and_term_pair(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
-    let lhs_terms = flatten_and_chain(lhs);
-    let rhs_terms = flatten_and_chain(rhs);
+/// 指纹只过滤不可能相等的项；碰撞仍经过完整 HIR 比较与 MDD 验证。
+/// 共享 visitor 保留节点顺序，原子身份来自综合域，不另建表达式树或分配 token 序列。
+fn factor_key(expr: &HirExpr) -> u64 {
+    struct Fingerprint(DefaultHasher);
+    impl HirVisitor<'_> for Fingerprint {
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            std::mem::discriminant(expr).hash(&mut self.0);
+            if let Some(mut atom) = AtomKey::from_expr(expr) {
+                // HIR 结构比较把正负零视为相等；过滤键不能漏掉这些原有候选。
+                let canonical_zero = |bits: &mut u64| {
+                    if *bits == (-0.0f64).to_bits() {
+                        *bits = 0;
+                    }
+                };
+                match &mut atom {
+                    AtomKey::Value(AbstractValue::Number(bits)) => canonical_zero(bits),
+                    AtomKey::Value(AbstractValue::Complex {
+                        real_bits,
+                        imag_bits,
+                    }) => {
+                        canonical_zero(real_bits);
+                        canonical_zero(imag_bits);
+                    }
+                    _ => {}
+                }
+                atom.hash(&mut self.0);
+            } else {
+                match expr {
+                    HirExpr::Unary(unary) => unary.op.hash(&mut self.0),
+                    HirExpr::Binary(binary) => binary.op.hash(&mut self.0),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut fingerprint = Fingerprint(DefaultHasher::new());
+    visit_expr(expr, &mut fingerprint);
+    fingerprint.0.finish()
+}
+
+fn factor_and_term_pair(lhs_terms: &[&HirExpr], rhs_terms: &[&HirExpr]) -> Option<HirExpr> {
     if lhs_terms.len() < 2 || rhs_terms.len() < 2 {
         return None;
     }
 
-    if let Some((lhs_prefix, rhs_prefix, common_prefix)) =
-        split_common_prefix(&lhs_terms, &rhs_terms)
+    if let Some((lhs_prefix, rhs_prefix, common_prefix)) = split_common_prefix(lhs_terms, rhs_terms)
     {
         return Some(logical_and(
             rebuild_and_chain(common_prefix),
@@ -265,8 +381,7 @@ fn factor_and_term_pair(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
         ));
     }
 
-    if let Some((lhs_suffix, rhs_suffix, common_suffix)) =
-        split_common_suffix(&lhs_terms, &rhs_terms)
+    if let Some((lhs_suffix, rhs_suffix, common_suffix)) = split_common_suffix(lhs_terms, rhs_terms)
     {
         return Some(logical_and(
             logical_or(rebuild_and_chain(lhs_suffix), rebuild_and_chain(rhs_suffix)),

@@ -363,17 +363,31 @@ pub enum BinaryOpKind {
     Shr,
 }
 
-/// Luau FASTCALL 参数是否由当前调用直接物化。
+/// 原 Luau FASTCALL 的 builtin 身份与直接参数域；不能从 fallback callee 名字反推 builtin。
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum FastCallArgs {
-    All,
-    Mask { direct_fixed: u8, direct_tail: bool },
+pub enum FastCallProtocol {
+    All {
+        builtin: u8,
+    },
+    Mask {
+        builtin: u8,
+        direct_fixed: u8,
+        /// fast path 从指令常量读取、fallback 才 LOADK 的参数；不同于预先算入参数槽的 direct 值。
+        constant_fixed: u8,
+        direct_tail: bool,
+    },
 }
 
-impl FastCallArgs {
+impl FastCallProtocol {
+    pub const fn builtin(self) -> u8 {
+        match self {
+            Self::All { builtin } | Self::Mask { builtin, .. } => builtin,
+        }
+    }
+
     pub const fn fixed_is_direct(self, index: usize) -> bool {
         match self {
-            Self::All => true,
+            Self::All { .. } => true,
             Self::Mask { direct_fixed, .. } => {
                 index < u8::BITS as usize && direct_fixed & (1 << index) != 0
             }
@@ -382,8 +396,17 @@ impl FastCallArgs {
 
     pub const fn tail_is_direct(self) -> bool {
         match self {
-            Self::All => true,
+            Self::All { .. } => true,
             Self::Mask { direct_tail, .. } => direct_tail,
+        }
+    }
+
+    pub const fn fixed_is_embedded_constant(self, index: usize) -> bool {
+        match self {
+            Self::All { .. } => false,
+            Self::Mask { constant_fixed, .. } => {
+                index < u8::BITS as usize && constant_fixed & (1 << index) != 0
+            }
         }
     }
 }
@@ -393,7 +416,7 @@ impl FastCallArgs {
 pub enum CallKind {
     Normal,
     Method,
-    FastCall(FastCallArgs),
+    FastCall(FastCallProtocol),
 }
 
 /// 方言 method setup 协议在 low-IR 上携带的 method 名提示。

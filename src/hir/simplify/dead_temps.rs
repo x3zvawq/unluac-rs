@@ -22,6 +22,8 @@
 //! 接回同一个 PhysicalRoot，不能把 `t` 的 root 无条件延长到函数结束。
 //! copy-root 候选只读借用当前 HIR 的 RHS；各块一次计算直线 GC-inert return 后缀，
 //! 位置查询复用该边界。提交计划只保存身份，不把借用或后缀位置带过树改写。
+//! 当前 CALL 的 Boolean 预写先保留到完整帧审理；例如 `false; assert(a() == 1 and b() == 2)`
+//! 的 false 仍是原参数缓冲事件。Final 才用同一死写证明清理未消费项，不生成永久保留声明。
 //! 候选位置使用当前树的语句先序编号与块结束位置；每个 scalar 写只保存固定大小的坐标，
 //! 不保存祖先路径，也不从这个词法索引推导动态支配或可达性。
 //! 可见 binding 的稳定性消费入口的一份 home 写入摘要；未知 home 写影响所有查询，
@@ -44,23 +46,55 @@ use super::temp_touch::TempReadCollector;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::visit::{self, HirVisitor};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeadTempStage {
+    BeforeNativeFrames,
+    Final,
+}
+
+struct PendingBooleanPrewrites<'a> {
+    facts: &'a ProtoPromotionFacts,
+    stage: DeadTempStage,
+    temps: BTreeSet<TempId>,
+}
+
+impl HirVisitor<'_> for PendingBooleanPrewrites<'_> {
+    fn visit_call(&mut self, call: &crate::hir::common::HirCallExpr) {
+        if self.stage == DeadTempStage::BeforeNativeFrames {
+            self.temps.extend(
+                self.facts
+                    .boolean_argument_prewrites(call)
+                    .map(|write| write.initial),
+            );
+        }
+    }
+}
+
 pub(super) fn remove_dead_temp_materializations_in_proto(
     proto: &mut HirProto,
     promotion_facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
+    stage: DeadTempStage,
 ) -> bool {
     let mut inputs = (
         (
-            TempReadCollector::default(),
-            CaptureCollector::new(HirCaptureMode::ByReference),
+            (
+                TempReadCollector::default(),
+                CaptureCollector::new(HirCaptureMode::ByReference),
+            ),
+            (
+                ProtectedLocalCollector::default(),
+                VisibleHomeWrites::new(promotion_facts),
+            ),
         ),
-        (
-            ProtectedLocalCollector::default(),
-            VisibleHomeWrites::new(promotion_facts),
-        ),
+        PendingBooleanPrewrites {
+            facts: promotion_facts,
+            stage,
+            temps: BTreeSet::new(),
+        },
     );
     visit::visit_stmts(&proto.body.stmts, &mut inputs);
-    let ((reads, reference), (protected, home_writes)) = inputs;
+    let (((reads, reference), (protected, home_writes)), pending) = inputs;
     let live_reads = reads.temps;
     let reference_captured = reference.bindings;
     let protected_locals = protected.locals;
@@ -97,6 +131,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
             .map(TempId)
             .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve()),
     );
+    protected_temps.extend(pending.temps);
     let reference_captured_homes = reference_captured.complete_home_slots(promotion_facts);
     // 参数覆盖在本 pass 入口可能仍是写同 home 的 Local/Temp，不能只扫描已经语法化成
     // HirLValue::Param 的目标；缺可信 home 的直接 binding 写也不能用于稳定性正证明。
@@ -913,6 +948,7 @@ fn expr_may_alias_overwritten_param(expr: &HirExpr, params: &BTreeSet<ParamId>) 
         | HirExpr::Binary(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)

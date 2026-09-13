@@ -1,5 +1,5 @@
 -- regress_30_table_setlist_nested_producer#1: SETLIST 队首 producer 的右侧依赖也要随构造器一起消费
--- unluac: expect-contains [[local r5_2 = {]]
+-- unluac: expect-contains [[.sequence({]]
 -- unluac: expect-contains [[whilst(function()]]
 -- unluac: expect-contains [[block())]]
 -- unluac: expect-not-contains [[unluac error]]

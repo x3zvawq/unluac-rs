@@ -661,6 +661,7 @@ fn rewrite_expr_use_sites(
         | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
     }

@@ -40,6 +40,15 @@ pub(super) fn lower_regular_instr(
     instr_ref: InstrRef,
     instr: &LowInstr,
 ) -> Option<Vec<HirStmt>> {
+    if lowering
+        .bindings
+        .numeric_binding_copies
+        .contains(&instr_ref)
+    {
+        // Structure 已共同证明可写 for binding 与每轮入口 COPY；源码 for 在同槽重发它。
+        // 其它 MOVE（包括数组 buffer 和前值快照）仍按原指令降低。
+        return Some(Vec::new());
+    }
     let mut stmts = match instr {
         LowInstr::Move(move_instr) => fixed_assign(
             lowering,
@@ -57,7 +66,11 @@ pub(super) fn lower_regular_instr(
         LowInstr::LoadConst(load_const) => fixed_assign(
             lowering,
             instr_ref,
-            vec![expr_for_const(lowering.proto, load_const.value)],
+            vec![lower_literal_initializer(
+                lowering,
+                instr_ref,
+                expr_for_const(lowering.proto, load_const.value),
+            )],
         ),
         LowInstr::LoadInteger(load_integer) => fixed_assign(
             lowering,
@@ -67,12 +80,20 @@ pub(super) fn lower_regular_instr(
         LowInstr::LoadNumber(load_number) => fixed_assign(
             lowering,
             instr_ref,
-            vec![HirExpr::Number(load_number.value)],
+            vec![lower_literal_initializer(
+                lowering,
+                instr_ref,
+                HirExpr::Number(load_number.value),
+            )],
         ),
         LowInstr::UnaryOp(unary) => fixed_assign(
             lowering,
             instr_ref,
             vec![HirExpr::Unary(Box::new(HirUnaryExpr {
+                source_site: Some(crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: instr_ref,
+                }),
                 op: lower_unary_op(unary.op),
                 expr: expr_for_reg_use(lowering, block, instr_ref, unary.src),
             }))],
@@ -81,20 +102,30 @@ pub(super) fn lower_regular_instr(
             lowering,
             instr_ref,
             vec![binary_expr(
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: instr_ref,
+                },
                 lower_binary_op(binary.op),
                 expr_for_value_operand(lowering, block, instr_ref, binary.lhs),
                 expr_for_value_operand(lowering, block, instr_ref, binary.rhs),
             )],
         ),
         LowInstr::Concat(concat) => {
-            let value = concat_expr((0..concat.src.len).map(|offset| {
-                expr_for_reg_use(
-                    lowering,
-                    block,
-                    instr_ref,
-                    Reg(concat.src.start.index() + offset),
-                )
-            }));
+            let value = concat_expr(
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: instr_ref,
+                },
+                (0..concat.src.len).map(|offset| {
+                    expr_for_reg_use(
+                        lowering,
+                        block,
+                        instr_ref,
+                        Reg(concat.src.start.index() + offset),
+                    )
+                }),
+            );
             fixed_assign(lowering, instr_ref, vec![value])
         }
         LowInstr::GetUpvalue(get_upvalue)
@@ -172,6 +203,7 @@ pub(super) fn lower_regular_instr(
                 "it can raise a LuaJIT-specific argument error without producing a Lua value"
             };
             let call = HirCallExpr {
+                source_site: None,
                 argument_roots: Vec::new(),
                 frame_root_ends: Vec::new(),
                 callee: unresolved_expr(format!(
@@ -200,7 +232,14 @@ pub(super) fn lower_regular_instr(
         LowInstr::NewTable(new_table) => fixed_assign(
             lowering,
             instr_ref,
-            vec![super::exprs::expr_for_new_table(lowering.proto, new_table)],
+            vec![super::exprs::expr_for_new_table(
+                lowering.proto,
+                new_table,
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: instr_ref,
+                },
+            )],
         ),
         LowInstr::SetList(set_list) => lower_set_list(lowering, block, instr_ref, set_list),
         LowInstr::Call(call) => lower_call(lowering, block, instr_ref, call),
@@ -370,6 +409,7 @@ pub(super) fn lower_terminal_instr(
     match instr {
         LowInstr::Return(ret) => Some(vec![return_stmt(
             lower_value_pack(lowering, block, instr_ref, ret.values),
+            lowering.promotion_facts.return_frame_source(instr_ref),
             lowering
                 .pending_frame_returns
                 .contains(&instr_ref)
@@ -382,6 +422,10 @@ pub(super) fn lower_terminal_instr(
                 HirValuePack::expanding(
                     Vec::new(),
                     HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                        source_site: Some(crate::hir::common::HirSourceSite {
+                            proto: lowering.id,
+                            instr: instr_ref,
+                        }),
                         argument_roots: Vec::new(),
                         frame_root_ends: Vec::new(),
                         callee,
@@ -399,6 +443,7 @@ pub(super) fn lower_terminal_instr(
                         method_rewrite_transaction: None,
                     }))),
                 ),
+                None,
                 lowering
                     .pending_frame_returns
                     .contains(&instr_ref)
@@ -416,10 +461,30 @@ fn lower_set_list(
     set_list: &crate::transformer::SetListInstr,
 ) -> Vec<HirStmt> {
     let values = lower_value_pack(lowering, block, instr_ref, set_list.values);
+    let initializer_debug_scope = lowering
+        .structure
+        .debug_bindings()
+        .for_value(lowering.dataflow.use_value(instr_ref, set_list.base))
+        .filter(|scope| {
+            let pcs = &lowering.proto.lowering_map.pc_map()[instr_ref.index()];
+            !pcs.is_empty()
+                && pcs.iter().all(|pc| *pc < scope.start_pc)
+                && lowering
+                    .proto
+                    .lowering_map
+                    .low_instr_at_or_after_pc(scope.start_pc)
+                    .is_some_and(|entry| entry.index() == instr_ref.index() + 1)
+        })
+        .map(|scope| scope.scope);
     vec![HirStmt::TableSetList(Box::new(HirTableSetList {
+        source_site: Some(crate::hir::common::HirSourceSite {
+            proto: lowering.id,
+            instr: instr_ref,
+        }),
         base: expr_for_reg_use(lowering, block, instr_ref, set_list.base),
         start_index: set_list.start_index,
         values,
+        initializer_debug_scope,
     }))]
 }
 
@@ -452,6 +517,10 @@ fn generic_for_iterator_call(
     .into();
 
     HirExpr::Call(Box::new(HirCallExpr {
+        source_site: Some(crate::hir::common::HirSourceSite {
+            proto: lowering.id,
+            instr: instr_ref,
+        }),
         argument_roots: Vec::new(),
         frame_root_ends: Vec::new(),
         callee,
@@ -495,6 +564,10 @@ fn lower_call_expr(
     let method_key = lower_method_key(lowering, call.method_name);
     let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
     HirCallExpr {
+        source_site: Some(crate::hir::common::HirSourceSite {
+            proto: lowering.id,
+            instr: instr_ref,
+        }),
         argument_roots: lowering.promotion_facts.call_argument_roots(instr_ref),
         frame_root_ends: lowering.promotion_facts.call_frame_root_ends(instr_ref),
         callee,
@@ -578,6 +651,31 @@ fn lower_result_assign(
     fixed_assign(lowering, instr_ref, values)
 }
 
+/// 已证相邻的 NaN capture 初始化保留不透明字段读取，避免目标编译器删除捕获。
+/// 合成表和读取不继承原 VM 操作来源；原标量 binding 的 SharedClosureIdentity 禁止折回常量。
+fn lower_literal_initializer(
+    lowering: &ProtoLowering<'_>,
+    instr: InstrRef,
+    value: HirExpr,
+) -> HirExpr {
+    if !lowering
+        .captured_shared_closures
+        .has_literal_initializer(instr)
+    {
+        return value;
+    }
+    HirExpr::TableAccess(Box::new(HirTableAccess {
+        sources: Default::default(),
+        metamethod_free: true,
+        base: HirExpr::TableConstructor(Box::new(HirTableConstructor {
+            fields: vec![HirTableField::Array(value)],
+            ..Default::default()
+        })),
+        key: HirExpr::Integer(1),
+        method_setup_protocol: None,
+    }))
+}
+
 fn lower_shared_capture_barrier(
     lowering: &ProtoLowering<'_>,
     block: BlockRef,
@@ -607,7 +705,9 @@ fn lower_shared_capture_barrier(
         }));
     }
     let table = HirExpr::TableConstructor(Box::new(HirTableConstructor {
+        sources: Default::default(),
         allocation: Default::default(),
+        implicit_template_fields: Default::default(),
         fields,
         trailing_multivalue: None,
     }));
@@ -616,6 +716,7 @@ fn lower_shared_capture_barrier(
         .enumerate()
         .map(|(index, _)| {
             HirExpr::TableAccess(Box::new(HirTableAccess {
+                sources: Default::default(),
                 metamethod_free: false,
                 base: HirExpr::LocalRef(barrier.box_local),
                 key: HirExpr::Integer((index + 1) as i64),

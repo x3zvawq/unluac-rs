@@ -7,6 +7,8 @@ use crate::ast::{AstBindingRef, AstLabelId, DecompileDialect};
 /// HIR -> AST lowering 可能失败的原因。
 #[derive(Debug, Clone, Error)]
 pub enum AstLowerError {
+    #[error("HIR proto#{proto} capture initializer requires its proven Luau entry frame")]
+    InvalidCaptureInitializer { proto: usize },
     #[error(
         "target dialect `{dialect}` does not support feature `{feature}` required by {context}"
     )]

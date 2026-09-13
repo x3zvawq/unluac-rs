@@ -152,9 +152,11 @@ fn eliminate_stmt(
                 .pop()
                 .expect("table-set-list extraction should preserve its base");
             prefix.push(HirStmt::TableSetList(Box::new(HirTableSetList {
+                source_site: set_list.source_site,
                 base,
                 start_index: set_list.start_index,
                 values,
+                initializer_debug_scope: set_list.initializer_debug_scope,
             })));
             (prefix, changed)
         }
@@ -184,7 +186,8 @@ fn eliminate_stmt(
         HirStmt::Return(ret) => {
             let (mut prefix, values, changed) = extract_value_pack(ret.values, state, safety);
             prefix.push(HirStmt::Return(Box::new(HirReturn {
-                source_instr: ret.source_instr,
+                frame_source: ret.frame_source,
+                pending_cleanup_source: ret.pending_cleanup_source,
                 values,
             })));
             (prefix, changed)
@@ -506,6 +509,7 @@ fn materialize_condition_into_flag(
         values: crate::hir::common::HirValuePack::fixed(vec![value.negate().negate()]),
         initializer_merge_transaction: None,
         generic_for_initializer_producer: None,
+        generic_for_dispatch_release: None,
         method_rewrite_transaction: None,
     })));
     HirStmt::Block(Box::new(HirBlock { stmts: prefix }))

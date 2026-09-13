@@ -15,6 +15,13 @@ pub(super) fn match_method_setup_pair(
     let HirExpr::String(method_key) = &access.key else {
         return None;
     };
+    // SELF 是单次原 lookup/call 双端协议，互斥合并的普通读取不能借用一条边。
+    if !matches!(
+        access.sources,
+        crate::hir::common::HirOperationSources::Single(_)
+    ) {
+        return None;
+    }
     let protocol = access.method_setup_protocol?;
     let Some(HirCallRootHandoff::MethodCallee(call_protocol)) = call.callee_root_handoff else {
         return None;

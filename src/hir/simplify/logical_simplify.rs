@@ -370,6 +370,19 @@ fn pull_shared_or_tail(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> O
     pull_shared_or_tail_one_side(lhs, rhs, safety)
 }
 
+/// 已证互斥的共同尾可共享构造形状，但后续物理许可仍须覆盖全部原分配。
+/// 不改变一般表达式相等关系，也不忽略构造器内部操作与字段求值的来源。
+fn merge_alternative_tail(lhs: &HirExpr, rhs: &HirExpr) -> Option<HirExpr> {
+    if lhs == rhs {
+        return Some(lhs.clone());
+    }
+    let (HirExpr::TableConstructor(lhs), HirExpr::TableConstructor(rhs)) = (lhs, rhs) else {
+        return None;
+    };
+    lhs.merge_alternative(rhs)
+        .map(|table| HirExpr::TableConstructor(Box::new(table)))
+}
+
 fn pull_shared_or_tail_one_side(
     lhs: &HirExpr,
     rhs: &HirExpr,
@@ -381,9 +394,6 @@ fn pull_shared_or_tail_one_side(
     let HirExpr::LogicalOr(inner_or) = &lhs_and.rhs else {
         return None;
     };
-    if rhs != &inner_or.rhs {
-        return None;
-    }
     // 候选拒绝[SemanticBarrier:EvalCount]：`a and (b or f()) or f()` 在 `a` truthy、`b` falsy且首个 `f()` falsy时调用两次，提取后只调用一次。
     // 接受路径[SemanticProof:ShortCircuitReachability]：若共享 tail 恒真，两处 occurrence
     // 互斥；提取只把所选 occurrence 移到同一求值点，不会合并两次求值。
@@ -392,13 +402,14 @@ fn pull_shared_or_tail_one_side(
     {
         return None;
     }
+    let shared_tail = merge_alternative_tail(rhs, &inner_or.rhs)?;
 
     Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
         lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
             lhs: lhs_and.lhs.clone(),
             rhs: inner_or.lhs.clone(),
         })),
-        rhs: rhs.clone(),
+        rhs: shared_tail,
     })))
 }
 
@@ -631,9 +642,6 @@ fn factor_condition_shared_and_tail(
     let (HirExpr::LogicalAnd(lhs_and), HirExpr::LogicalAnd(rhs_and)) = (lhs, rhs) else {
         return None;
     };
-    if lhs_and.rhs != rhs_and.rhs {
-        return None;
-    }
     if expr_truthiness(&lhs_and.rhs, safety) != Some(true) {
         // 候选拒绝[SemanticBarrier:EvalCount]：条件 `(a and f()) or (b and f())` 在首个 `f()` falsy且 b truthy 时调用两次，提取后只调用一次。
         if !safety.is_repeatable_in_single_value_context(&lhs_and.rhs) {
@@ -644,6 +652,7 @@ fn factor_condition_shared_and_tail(
             return None;
         }
     }
+    let shared_tail = merge_alternative_tail(&lhs_and.rhs, &rhs_and.rhs)?;
 
     // 接受路径[SemanticProof:ConditionTruthiness]：恒真 tail 只会在被选中的一臂求值一次；
     // 首臂一旦到达 tail 就令外层 or 短路，因此不会删除 b，也不会重复求值 tail。
@@ -653,7 +662,7 @@ fn factor_condition_shared_and_tail(
             lhs: lhs_and.lhs.clone(),
             rhs: rhs_and.lhs.clone(),
         })),
-        rhs: lhs_and.rhs.clone(),
+        rhs: shared_tail,
     })))
 }
 

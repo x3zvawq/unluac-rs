@@ -447,6 +447,15 @@ pub(super) fn value_decision_control_dag_is_closed(
                 }
             }
             let terminator = range.last() == Some(instr_ref) && instr.is_control_terminator();
+            if *block != entry
+                && scratch.common_needs_instr(instr_ref)
+                && instr_writes_source_binding(proto, dataflow, instr_ref)
+            {
+                // 候选拒绝[SemanticBarrier:NamedRootWrite]：regress_578 的
+                // item=#owner 必须先覆盖活动 local，再执行后续 __eq 观察；
+                // 把它吸收到判定表达式会把 local 覆盖推迟到整个表达式结束。
+                return false;
+            }
             if *block == entry || terminator || scratch.common_needs_instr(instr_ref) {
                 continue;
             }

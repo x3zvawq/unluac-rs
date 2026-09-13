@@ -13,6 +13,12 @@ pub(super) fn decompile_options(entry: &LuaCaseManifestEntry) -> DecompileOption
         options.naming.mode = mode;
     }
     options.parse.ignore_debug = entry.options.ignore_debug;
+    // 收敛比较源码本体；来源路径和行号随每轮产物变化。由 Generate 关闭元信息注释，
+    // 避免比较器解析文本时误删 Lua 字符串；普通 debug/注释回归仍使用默认输出。
+    options.generate.comment = !entry
+        .options
+        .recompile_rounds
+        .is_some_and(|rounds| rounds > 0);
     options.generate.luau_vector_constructor =
         entry
             .options

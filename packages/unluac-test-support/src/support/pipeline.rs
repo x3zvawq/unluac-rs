@@ -976,22 +976,19 @@ fn verify_proto_body_preparation_contract(
     let missing = HirProtoRef(original.protos.len());
     let closure = |proto| {
         HirExpr::Closure(Box::new(HirClosureExpr {
+            creation: None,
             proto,
             captures: Vec::new(),
         }))
     };
-    let return_values = |values| {
-        HirStmt::Return(Box::new(HirReturn {
-            source_instr: None,
-            values: HirValuePack::fixed(values),
-        }))
-    };
+    let return_values =
+        |values| HirStmt::Return(Box::new(HirReturn::synthetic(HirValuePack::fixed(values))));
     let residual = || {
-        HirStmt::TableSetList(Box::new(HirTableSetList {
-            base: HirExpr::Nil,
-            start_index: 1,
-            values: HirValuePack::fixed(Vec::new()),
-        }))
+        HirStmt::TableSetList(Box::new(HirTableSetList::synthetic(
+            HirExpr::Nil,
+            1,
+            HirValuePack::fixed(Vec::new()),
+        )))
     };
     let residual_error = |proto| AstLowerError::ResidualHir {
         proto,

@@ -30,6 +30,7 @@ struct ValueObservations {
     dead_since: usize,
     last_fence: Option<usize>,
     last_observation: Option<usize>,
+    exposed: bool,
 }
 
 impl<'a> ScalarValues<'a> {
@@ -50,6 +51,11 @@ impl<'a> ScalarValues<'a> {
     }
 
     pub(super) fn advance(&mut self, index: usize) {
+        for (_, temp) in self.uses.events.block().exposed_values(index) {
+            if let Some(value) = self.by_temp.get(temp) {
+                self.states[value.0].exposed = true;
+            }
+        }
         while let Some((at, temp, live)) = self.changes.pop_through(self.uses, index) {
             if let Some(value) = self.by_temp.get(&temp) {
                 self.states[value.0].change(
@@ -75,12 +81,17 @@ impl<'a> ScalarValues<'a> {
             dead_since: index + 1,
             last_fence: None,
             last_observation: None,
+            exposed: false,
         });
         value
     }
 
     pub(super) fn global_home(&self, value: ScalarValueId) -> Option<HomeSlotKey> {
         self.states[value.0].global_home
+    }
+
+    pub(super) fn exposed(&self, value: ScalarValueId) -> bool {
+        self.states[value.0].exposed
     }
 
     pub(super) fn insert(&mut self, temp: TempId, value: ScalarValueId, index: usize) {

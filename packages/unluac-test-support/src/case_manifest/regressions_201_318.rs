@@ -426,7 +426,10 @@ pub(super) const REGRESSION_CASES_201_318: &[LuaCaseMatrixEntry] = &[
         "tests/regress-case/regress_296_luau_captured_shared_factory.lua",
         LUAU_ONLY,
     )
-    .with_options(LUAU_OPTIMIZED_CONVERGENCE_OPTIONS),
+    .with_options(LuaCaseOptions {
+        recompile_rounds: Some(4),
+        ..LUAU_OPTIMIZED_CONVERGENCE_OPTIONS
+    }),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_297_luau_decision_guard_mutation.lua",
         LUAU_ONLY,

@@ -719,6 +719,7 @@ fn apply_candidate(
             values,
             initializer_merge_transaction: None,
             generic_for_initializer_producer: None,
+            generic_for_dispatch_release: None,
             method_rewrite_transaction: None,
         }));
         rewrite_stmts(

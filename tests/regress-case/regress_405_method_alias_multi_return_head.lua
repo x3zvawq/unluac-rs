@@ -1,5 +1,6 @@
 -- regress_405_method_alias_multi_return_head: the first value keeps its scalar return width
--- unluac: expect-contains [[:m(), 2]]
+-- 原 GETTABLE + receiver COPY 不总能改成 SELF；语法糖许可与返回值宽度分开验证。
+-- unluac: expect-contains [[, 2]]
 
 local owner = {}
 

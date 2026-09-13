@@ -193,6 +193,7 @@ fn invert_test(node: &mut HirDecisionNode) {
     // 严格保留内部 Boolean 值操作；negate() 的双 not 消解会重新退化成裸调用谓词。
     let test = std::mem::replace(&mut node.test, HirExpr::Nil);
     node.test = HirExpr::Unary(Box::new(HirUnaryExpr {
+        source_site: None,
         op: HirUnaryOpKind::Not,
         expr: test,
     }));

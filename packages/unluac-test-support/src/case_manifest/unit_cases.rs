@@ -18,8 +18,7 @@ pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new(
         "tests/unit-case/common_07_return_and_multiret.lua",
         ALL_DIALECTS,
-    )
-    .with_expectation(LuaCaseExpectation::TableSetListResidual),
+    ),
     LuaCaseMatrixEntry::new("tests/unit-case/common_08_closures.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new(
         "tests/unit-case/common_09_method_and_self.lua",

@@ -149,7 +149,7 @@ impl TableConstructorPass<'_> {
             )
             || constructor_uses_binding(constructor, binding)
             || self
-                .debug_identity_bindings
+                .preserved_identity_bindings
                 .get(binding)
                 .copied()
                 .unwrap_or_default()

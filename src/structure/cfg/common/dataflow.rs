@@ -90,6 +90,7 @@ pub struct DataflowFacts {
     pub(crate) def_uses: Vec<Vec<UseSite>>,
     pub(crate) def_overwritten_values: Vec<Option<SsaValue>>,
     pub(crate) canonical_move_values: Vec<Option<SsaValue>>,
+    pub(crate) unknown_scratch_overwrites: Vec<bool>,
     pub(crate) def_phi_uses: Vec<Vec<PhiId>>,
     pub(crate) phi_uses: Vec<Vec<UseSite>>,
     pub(crate) phi_phi_uses: Vec<Vec<PhiId>>,
@@ -108,6 +109,20 @@ pub struct DataflowFacts {
 }
 
 impl DataflowFacts {
+    /// 原 fixed 写覆盖了 CALL/OPEN 协议可能留下的未知物理残值；与逻辑 SSA 旧值分离。
+    pub(crate) fn def_overwrites_unknown_scratch(&self, def: DefId) -> bool {
+        self.unknown_scratch_overwrites[def.index()]
+    }
+
+    /// 指定原指令/home 的 fixed 写覆盖责任；没有该 fixed Def 时不签发证书。
+    pub(crate) fn instr_overwrites_unknown_scratch(&self, instr: InstrRef, reg: Reg) -> bool {
+        self.instr_defs[instr.index()]
+            .binary_search_by_key(&reg, |def| self.defs[def.index()].reg)
+            .is_ok_and(|index| {
+                self.def_overwrites_unknown_scratch(self.instr_defs[instr.index()][index])
+            })
+    }
+
     /// 按块内指令顺序借用已冻结的 fixed Def 身份；不含 open result，也不裁剪不可达块。
     pub(crate) fn fixed_defs_in_block(
         &self,

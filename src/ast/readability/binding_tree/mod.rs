@@ -168,6 +168,7 @@ fn expr_contains_table_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
         | AstExpr::UInt64(_)
         | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
     }
@@ -433,6 +434,7 @@ fn expr_has_contextual_binding_use(
         | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
     }

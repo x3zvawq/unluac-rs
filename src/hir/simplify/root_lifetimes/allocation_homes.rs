@@ -7,20 +7,9 @@
 //! 该身份不跨改写发布，也不是表容量/模板 provenance 或可能重复赋值的 TempId。
 
 use super::{AllocationHomeOwner, BTreeMap, BTreeSet, HomeSlotKey, TempId};
-use crate::hir::common::{HirExpr, HirStmt, HirTableConstructor};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct AllocationSite(pub(super) usize);
-
-impl AllocationSite {
-    pub(super) fn constructor(self, stmts: &[HirStmt]) -> &HirTableConstructor {
-        let Some((_, HirExpr::TableConstructor(table))) = stmts[self.0].scalar_temp_assignment()
-        else {
-            unreachable!("allocation site must retain its original constructor in this snapshot");
-        };
-        table
-    }
-}
 
 #[derive(Default)]
 pub(super) struct AllocationHomes {

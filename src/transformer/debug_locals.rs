@@ -43,6 +43,15 @@ impl DebugLocals {
         Some((scope, &self.entries[scope]))
     }
 
+    /// 一条 low 指令映射的任一 PC 是否处于 source scope；无 PC 时不证明不可见。
+    pub(crate) fn source_visible_at(&self, reg: Reg, pcs: &[u32]) -> bool {
+        if pcs.is_empty() {
+            self.has_source_scope(reg)
+        } else {
+            pcs.iter().any(|pc| self.source_at(reg, *pc).is_some())
+        }
+    }
+
     fn new(entries: Vec<DebugLocalFact>) -> Self {
         let mut events_by_reg = BTreeMap::<Reg, Vec<(u32, bool, usize)>>::new();
         for (scope, local) in entries.iter().enumerate() {

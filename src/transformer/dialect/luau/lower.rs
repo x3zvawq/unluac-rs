@@ -22,7 +22,7 @@ use crate::transformer::operands::define_operand_expecters;
 use crate::transformer::{
     AccessBase, AccessKey, BinaryOpInstr, BinaryOpKind, BranchCond, BranchPredicate, CallInstr,
     CallKind, Capture, CaptureSource, CloseInstr, ClosureCreation, ClosureInstr, ConcatInstr,
-    CondOperand, ConstRef, FastCallArgs, GenericForCallInstr, GetTableInstr, GetTableKind,
+    CondOperand, ConstRef, FastCallProtocol, GenericForCallInstr, GetTableInstr, GetTableKind,
     GetUpvalueInstr, LoadBoolInstr, LoadConstInstr, LoadIntegerInstr, LoadNilInstr, LowInstr,
     LoweredChunk, LoweredProto, LoweringMap, MoveInstr, NewTableInstr, ProtoRef, Reg, RegRange,
     ResultPack, ReturnInstr, SetListInstr, SetTableInstr, SetTableKind, SetUpvalueInstr,
@@ -100,15 +100,25 @@ enum LogicalSelectValue {
 
 #[derive(Debug, Clone, Copy)]
 enum PendingFastCall {
-    All,
-    Fixed { sources: [Option<Reg>; 3], len: u8 },
+    All {
+        builtin: u8,
+    },
+    Fixed {
+        builtin: u8,
+        sources: [Option<Reg>; 3],
+        len: u8,
+    },
 }
 
 impl PendingFastCall {
-    fn freeze(self, callee: Reg, args: ValuePack) -> Option<FastCallArgs> {
+    fn freeze(self, callee: Reg, args: ValuePack) -> Option<FastCallProtocol> {
         match self {
-            Self::All => Some(FastCallArgs::All),
-            Self::Fixed { sources, len } => {
+            Self::All { builtin } => Some(FastCallProtocol::All { builtin }),
+            Self::Fixed {
+                builtin,
+                sources,
+                len,
+            } => {
                 let (start, direct_tail) = match args {
                     ValuePack::Fixed(range) if range.len == usize::from(len) => {
                         (range.start, false)
@@ -121,14 +131,20 @@ impl PendingFastCall {
                     return None;
                 }
                 let mut direct_fixed = 0_u8;
+                let mut constant_fixed = 0_u8;
                 for (index, source) in sources[..usize::from(len)].iter().enumerate() {
                     let target = Reg(start.index() + index);
                     if source.is_none_or(|source| source == target) {
                         direct_fixed |= 1 << index;
                     }
+                    if source.is_none() {
+                        constant_fixed |= 1 << index;
+                    }
                 }
-                Some(FastCallArgs::Mask {
+                Some(FastCallProtocol::Mask {
+                    builtin,
                     direct_fixed,
+                    constant_fixed,
                     direct_tail,
                 })
             }

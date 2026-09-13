@@ -355,6 +355,7 @@ fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
         | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::Error(_) => None,
     }

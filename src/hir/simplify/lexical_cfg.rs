@@ -24,11 +24,12 @@ use std::{
 };
 
 use crate::hir::common::{
-    HirBlock, HirExpr, HirGenericFor, HirLabelId, HirRepeat, HirStmt, LocalId,
+    HirBinding, HirBlock, HirExpr, HirGenericFor, HirLabelId, HirRepeat, HirStmt, LocalId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 
 use super::expr_facts::expr_truthiness;
+use super::mention::{BindingReadCollector, BindingWriteCollector};
 use super::stmt_plan::{PathComponent, StmtPath};
 use crate::hir::visit::visit_stmt_structure;
 
@@ -270,6 +271,64 @@ impl<'a> HirFlowGraph<'a> {
 
     pub(super) fn nodes(&self) -> &[HirFlowNode<'a>] {
         &self.nodes
+    }
+
+    /// 当前图的直接 binding 活跃性，按共享 visitor 读取 RHS、条件、参数与 capture。
+    /// for 只在成功的 binding 边写入；例如各自作用域内的 f 调用结束后，后续分支不再
+    /// 携带它的直接值需求。间接 ByReference 环境或对象持有需求由具体 consumer 补充。
+    pub(super) fn binding_live_out(&self) -> Vec<BTreeSet<HirBinding>> {
+        let events = self
+            .nodes()
+            .iter()
+            .map(|node| {
+                let mut reads = BTreeSet::new();
+                let mut writes = BTreeSet::new();
+                node.kind().visit_evaluation(&mut (
+                    BindingReadCollector(|binding| {
+                        reads.insert(binding);
+                    }),
+                    BindingWriteCollector(|binding| {
+                        writes.insert(binding);
+                    }),
+                ));
+                match node.kind() {
+                    HirFlowNodeKind::Stmt(HirStmt::NumericFor(_))
+                    | HirFlowNodeKind::GenericForInit(_) => {
+                        writes.clear();
+                    }
+                    HirFlowNodeKind::ForBinding(HirForBindings::Numeric(local)) => {
+                        writes.insert(HirBinding::Local(local));
+                    }
+                    HirFlowNodeKind::ForBinding(HirForBindings::Generic(flow)) => {
+                        writes.extend(
+                            flow.for_stmt()
+                                .bindings
+                                .iter()
+                                .copied()
+                                .map(HirBinding::Local),
+                        );
+                    }
+                    _ => {}
+                }
+                (reads, writes)
+            })
+            .collect::<Vec<_>>();
+        let mut live_out = vec![BTreeSet::new(); self.nodes().len()];
+        self.solve_backward(
+            BTreeSet::<HirBinding>::new(),
+            |current, incoming| {
+                let before = current.len();
+                current.extend(incoming.iter().copied());
+                current.len() != before
+            },
+            |id, _, live| {
+                live_out[id.index()].clone_from(live);
+                let (reads, writes) = &events[id.index()];
+                live.retain(|binding| !writes.contains(binding));
+                live.extend(reads.iter().copied());
+            },
+        );
+        live_out
     }
 
     /// 在同一 topology 快照上求前向抽象状态不动点。

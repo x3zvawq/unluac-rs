@@ -13,15 +13,20 @@
 //! 后缀读屏障直接消费上游逐语句 binding 摘要，不按每个保留变量重新遍历表达式。
 //! 调用及一元/二元运算结果 TempId 以 Promotion 的可信 home 进入 producer 计划；删除须由精确覆盖
 //! 终点或完整 constructor 的强字段持有/退出事务批准，单写身份自身不签发根释放许可。
+//! 原 SETLIST 固定前缀还发布 CONST/COPY 与批量 LOADNIL 的准备角色；结果分类按共享
+//! 正常返回包逐槽查询。保留源语句消费同一写入摘要，不假定 producer 必须是 local 声明。
 //! ConstructorRegion 只发布成功前缀的步骤，保留 producer binding/缺失槽投影、原字段
 //! 表达式与批次引用。rebuild 和 commit 消费同一角色划分，不从 stmt_index 反向匹配语法。
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::hir::common::{HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack, LocalId};
+use crate::hir::common::{
+    HirExpr, HirLValue, HirStmt, HirTableConstructor, HirValuePack, LocalId, TempId,
+};
 use crate::hir::expr_safety::{expr_observes_eval_order, expr_requires_ordered_snapshot};
 use crate::hir::promotion::ProtoPromotionFacts;
+use crate::hir::simplify::object_flow::ReturnValueFacts;
 use crate::value_semantics::table::TableExpression;
 
 use super::bindings::{
@@ -49,14 +54,22 @@ pub(super) struct ConstructorRegion<'a> {
 ///
 /// 空表 seed 只有在后面存在同 binding 的 record 或 SETLIST 时才需要扫描中间 producer；
 /// 以最后位置作为 horizon，既允许跨过其他 seed，又能在线性预处理后排除独立 seed 的后缀扫描。
+/// 固定批次的 Temp 角色同时来自现存 SETLIST pack 与 Promotion home；它允许 scanner
+/// 认识原 CONST/COPY 等准备写，不代表能删除旧根，提交仍需完整生命周期事务。
 pub(super) struct ConstructorWriteIndex {
     last_write: Vec<Option<usize>>,
+    fixed_batch_producers: BTreeMap<BindingId, BTreeSet<TempId>>,
 }
 
 impl ConstructorWriteIndex {
-    pub(super) fn new(stmts: &[HirStmt], binding_index: &BindingIndex) -> Self {
+    pub(super) fn new(
+        stmts: &[HirStmt],
+        binding_index: &BindingIndex,
+        facts: &ProtoPromotionFacts,
+    ) -> Self {
         let mut index = Self {
             last_write: vec![None; binding_index.len()],
+            fixed_batch_producers: BTreeMap::new(),
         };
         for (stmt_id, stmt) in stmts.iter().enumerate() {
             if let Some(binding) = keyed_write_binding(stmt) {
@@ -69,6 +82,34 @@ impl ConstructorWriteIndex {
                     .id_of(binding)
                     .expect("table set-list binding should be indexed");
                 index.last_write[binding_id] = Some(stmt_id);
+                let HirStmt::TableSetList(batch) = stmt else {
+                    unreachable!()
+                };
+                let Some(owner_home) = (match binding {
+                    TableBinding::Temp(temp) => facts.trusted_temp_home_slot(temp),
+                    TableBinding::Local(local) => facts.trusted_local_home_slot(local),
+                }) else {
+                    continue;
+                };
+                index
+                    .fixed_batch_producers
+                    .entry(binding_id)
+                    .or_default()
+                    .extend(
+                        batch
+                            .values
+                            .fixed
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(offset, value)| {
+                                let HirExpr::TempRef(temp) = value else {
+                                    return None;
+                                };
+                                (facts.trusted_temp_home_slot(*temp)?.slot()
+                                    == owner_home.slot() + offset + 1)
+                                    .then_some(*temp)
+                            }),
+                    );
             }
         }
         index
@@ -76,6 +117,10 @@ impl ConstructorWriteIndex {
 
     pub(super) fn has_write_after(&self, binding_id: BindingId, stmt_id: usize) -> bool {
         self.last_write[binding_id].is_some_and(|last| last > stmt_id)
+    }
+
+    pub(super) fn fixed_batch_producers(&self, binding_id: BindingId) -> Option<&BTreeSet<TempId>> {
+        self.fixed_batch_producers.get(&binding_id)
     }
 }
 
@@ -147,9 +192,12 @@ pub(super) fn try_rebuild_constructor_region<'a>(
     binding_occurrences: &BindingOccurrenceIndex,
     stmt_bindings: &[StmtBindingSummary],
     materialized_binding_counts: &[u32],
-    debug_identity_bindings: &BindingSlots<bool>,
+    preserved_identity_bindings: &BindingSlots<bool>,
     promotion_facts: &ProtoPromotionFacts,
     stmt_ids: &[usize],
+    private_overwrites: &BTreeSet<usize>,
+    fixed_batch_producers: Option<&BTreeSet<TempId>>,
+    value_facts: &ReturnValueFacts,
     scratch: &mut RebuildScratch,
 ) -> Option<ConstructorRegion<'a>> {
     let allocation = constructor.allocation.clone();
@@ -171,7 +219,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
     for (offset, stmt) in scan_stmts.iter().enumerate() {
         let index = seed_index + 1 + offset;
         let remaining_uses = binding_occurrences.remaining_uses_after(stmt_ids[index]);
-        if let Some(bindings) = preserved_nil_local_bindings(stmt, debug_identity_bindings) {
+        if let Some(bindings) = preserved_nil_local_bindings(stmt, preserved_identity_bindings) {
             preserved_stmt_indices.push(index);
             preserved_bindings.extend(bindings.into_iter().map(preserved_binding_id));
             continue;
@@ -181,7 +229,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
             binding,
             binding_index,
             materialized_binding_counts,
-            debug_identity_bindings,
+            preserved_identity_bindings,
             |local| {
                 seed_local_values
                     .get_or_init(|| local_nil_values_before_seed(&block.stmts[..seed_index]))
@@ -206,9 +254,10 @@ pub(super) fn try_rebuild_constructor_region<'a>(
             // 与 call、lookup、allocation 或 metamethod-capable constructor work 交换顺序。
             break;
         }
-        let boundary_step = if let Some((owner, key, value)) = keyed_write_parts(stmt)
+        let boundary_step = if let Some((owner, access, value)) = keyed_write_parts(stmt)
             && owner == binding
         {
+            let key = &access.key;
             if !allocation.permits_record_key(key.table_key()) {
                 // 候选拒绝[SemanticBarrier:TableShape]：新键不能提前进入原 DUPTABLE；
                 // 模板扩大会改变运行时插入/扩容与 pairs 顺序（regress_513）。
@@ -223,15 +272,20 @@ pub(super) fn try_rebuild_constructor_region<'a>(
             stmt,
             index,
             binding,
-            debug_identity_bindings,
+            preserved_identity_bindings,
             promotion_facts,
+            private_overwrites.contains(&stmt_ids[index]),
+            fixed_batch_producers,
+            value_facts,
             &mut steps,
         ) {
             for producer_binding in producer_bindings {
                 let binding_id = binding_index
                     .id_of(producer_binding)
                     .expect("producer binding should be indexed");
-                let Some(last_use) = binding_occurrences.last_use(binding_id) else {
+                let Some(last_use) =
+                    binding_occurrences.last_value_use_after(binding_id, stmt_ids[index])
+                else {
                     continue;
                 };
                 // 同一原始批次还要消费这个 producer 时，不能先把它冻结为区间外声明。
@@ -283,13 +337,9 @@ pub(super) fn try_rebuild_constructor_region<'a>(
                     preserved_stmt_indices.push(stmt_index);
                     preserved_stmt_indices.sort_unstable();
                 }
-                let HirStmt::LocalDecl(local_decl) = &block.stmts[stmt_index] else {
-                    unreachable!("preservable producer source must be a local declaration")
-                };
-                for local in &local_decl.bindings {
-                    let binding = TableBinding::Local(*local);
-                    preserved_bindings.insert(preserved_binding_id(binding));
-                }
+                // 同一 producer 可以来自 local 声明或原生 Temp 批次；消费冻结的写入身份，
+                // 不从保留语句反向假设它一定是 LocalDecl。
+                preserved_bindings.extend(stmt_bindings[stmt_index].writes());
             }
             best_end = Some((index, preserved_stmt_indices.len()));
             committed_steps.append(&mut steps);
@@ -322,7 +372,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
 /// transaction，以便所有被消费槽一起投影成隐式 nil。
 fn preserved_nil_local_bindings(
     stmt: &HirStmt,
-    debug_identity_bindings: &BindingSlots<bool>,
+    preserved_identity_bindings: &BindingSlots<bool>,
 ) -> Option<Vec<TableBinding>> {
     let HirStmt::LocalDecl(local_decl) = stmt else {
         return None;
@@ -345,13 +395,13 @@ fn preserved_nil_local_bindings(
         .map(TableBinding::Local)
         .collect::<Vec<_>>();
     if bindings.iter().any(|binding| {
-        debug_identity_bindings
+        preserved_identity_bindings
             .get(*binding)
             .copied()
             .unwrap_or_default()
     }) {
-        // 候选拒绝[SemanticBarrier:DebugScope]：即使 nil 初始化没有求值事件，把后续字段
-        // 提前到 debug local 声明之前仍会改变 hook 在该行观察到的 table 内容。
+        // 候选拒绝[SemanticBarrier:BindingIdentity]：nil 无求值事件也不能越过
+        // debug 或调用帧已要求保留的声明边界。
         return None;
     }
     Some(bindings)
@@ -362,7 +412,7 @@ fn preserved_eventless_assignment_binding(
     constructor_binding: TableBinding,
     binding_index: &BindingIndex,
     materialized_binding_counts: &[u32],
-    debug_identity_bindings: &BindingSlots<bool>,
+    preserved_identity_bindings: &BindingSlots<bool>,
     local_is_nil: impl FnOnce(LocalId) -> bool,
 ) -> Option<TableBinding> {
     let HirStmt::Assign(assign) = stmt else {
@@ -378,7 +428,7 @@ fn preserved_eventless_assignment_binding(
         // 移到 assignment 前；只有旧值已证明为 nil 时，才不会跨过 root release 点。
         return None;
     }
-    if debug_identity_bindings
+    if preserved_identity_bindings
         .get(binding)
         .copied()
         .unwrap_or_default()
@@ -493,11 +543,31 @@ fn stmt_uses_any_binding(
         && summary.uses().any(|binding| bindings.contains(&binding))
 }
 
+/// 字段语法只由构造器 owner 投影；调用帧消费者不再次匹配赋值/SETLIST 壳。
+pub(in crate::hir::simplify) fn constructor_write(
+    stmt: &HirStmt,
+) -> Option<super::ConstructorWrite<'_>> {
+    if let Some((binding, access, value)) = keyed_write_parts(stmt) {
+        return Some(super::ConstructorWrite::Record {
+            binding,
+            access,
+            value,
+        });
+    }
+    let binding = table_set_list_binding(stmt)?;
+    let HirStmt::TableSetList(batch) = stmt else {
+        unreachable!()
+    };
+    Some(super::ConstructorWrite::Batch { binding, batch })
+}
+
 fn keyed_write_binding(stmt: &HirStmt) -> Option<TableBinding> {
     keyed_write_parts(stmt).map(|(binding, _, _)| binding)
 }
 
-fn keyed_write_parts(stmt: &HirStmt) -> Option<(TableBinding, &HirExpr, &HirExpr)> {
+fn keyed_write_parts(
+    stmt: &HirStmt,
+) -> Option<(TableBinding, &crate::hir::common::HirTableAccess, &HirExpr)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -516,18 +586,43 @@ fn keyed_write_parts(stmt: &HirStmt) -> Option<(TableBinding, &HirExpr, &HirExpr
         // `local t = { ... }`，initializer 内的 `t` 不再指向刚创建的 owner。
         return None;
     }
-    Some((binding, &access.key, value))
+    Some((binding, access, value))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn producer_steps<'a>(
     stmt: &'a HirStmt,
     stmt_index: usize,
     constructor_binding: TableBinding,
-    debug_identity_bindings: &BindingSlots<bool>,
+    preserved_identity_bindings: &BindingSlots<bool>,
     promotion_facts: &ProtoPromotionFacts,
+    private_overwrite: bool,
+    fixed_batch_producers: Option<&BTreeSet<TempId>>,
+    value_facts: &ReturnValueFacts,
     steps: &mut Vec<RegionStep<'a>>,
 ) -> Option<(Vec<TableBinding>, ProducerSourcePreservation)> {
     match stmt {
+        HirStmt::Assign(assign) if private_overwrite => {
+            let [HirLValue::Local(local)] = assign.targets.as_slice() else {
+                unreachable!("private overwrite has one local owner")
+            };
+            let bindings = vec![TableBinding::Local(*local)];
+            let preservation = producer_source_preservation(
+                &bindings,
+                &assign.values,
+                preserved_identity_bindings,
+            );
+            producer_steps_from_bindings(
+                bindings,
+                &assign.values,
+                constructor_binding,
+                stmt_index,
+                preservation,
+                value_facts,
+                steps,
+            )
+            .map(|bindings| (bindings, preservation))
+        }
         HirStmt::LocalDecl(local_decl) => {
             let bindings = local_decl
                 .bindings
@@ -538,7 +633,7 @@ fn producer_steps<'a>(
             let source_preservation = producer_source_preservation(
                 &bindings,
                 &local_decl.values,
-                debug_identity_bindings,
+                preserved_identity_bindings,
             );
             producer_steps_from_bindings(
                 bindings,
@@ -546,35 +641,57 @@ fn producer_steps<'a>(
                 constructor_binding,
                 stmt_index,
                 source_preservation,
+                value_facts,
                 steps,
             )
             .map(|bindings| (bindings, source_preservation))
         }
-        HirStmt::Assign(assign) if matches!(assign.targets.as_slice(), [HirLValue::Temp(_)]) => {
-            let [HirLValue::Temp(temp)] = assign.targets.as_slice() else {
-                unreachable!("checked scalar temp producer")
-            };
-            if !matches!(
-                assign.values.fixed.as_slice(),
-                [HirExpr::Call(_)
-                    | HirExpr::Unary(_)
-                    | HirExpr::Binary(_)
-                    | HirExpr::TableConstructor(_)]
-            ) || promotion_facts.trusted_temp_home_slot(*temp).is_none()
+        HirStmt::Assign(assign)
+            if !assign.targets.is_empty()
+                && assign
+                    .targets
+                    .iter()
+                    .all(|target| matches!(target, HirLValue::Temp(_))) =>
+        {
+            let temps = assign.targets.iter().map(|target| {
+                let HirLValue::Temp(temp) = target else {
+                    unreachable!()
+                };
+                *temp
+            });
+            let native_batch = fixed_batch_producers
+                .is_some_and(|producers| temps.clone().all(|temp| producers.contains(&temp)));
+            if !(native_batch
+                || assign.targets.len() == 1
+                    && matches!(
+                        assign.values.fixed.as_slice(),
+                        [HirExpr::Call(_)
+                            | HirExpr::Unary(_)
+                            | HirExpr::Binary(_)
+                            | HirExpr::TableConstructor(_)]
+                    ))
+                || temps
+                    .clone()
+                    .any(|temp| promotion_facts.trusted_temp_home_slot(temp).is_none())
             {
                 return None;
             }
             // scanner 只保留原始值身份；commit 消费精确覆盖终点或终点强持有证明，
             // 不能把可信 home 与单写 TempId 自身当成任意 assignment 的删除许可。
-            let bindings = vec![TableBinding::Temp(*temp)];
-            let preservation =
-                producer_source_preservation(&bindings, &assign.values, debug_identity_bindings);
+            // LOADNIL 可一次准备多个原 fixed 槽；仍按同一 closed pack 原子删除，不能拆尾包。
+            let bindings = temps.map(TableBinding::Temp).collect::<Vec<_>>();
+            let preservation = producer_source_preservation(
+                &bindings,
+                &assign.values,
+                preserved_identity_bindings,
+            );
             producer_steps_from_bindings(
                 bindings,
                 &assign.values,
                 constructor_binding,
                 stmt_index,
                 preservation,
+                value_facts,
                 steps,
             )
             .map(|bindings| (bindings, preservation))
@@ -594,6 +711,7 @@ fn producer_steps_from_bindings<'a>(
     constructor_binding: TableBinding,
     stmt_index: usize,
     source_preservation: ProducerSourcePreservation,
+    value_facts: &ReturnValueFacts,
     steps: &mut Vec<RegionStep<'a>>,
 ) -> Option<Vec<TableBinding>> {
     if bindings.is_empty() {
@@ -645,7 +763,6 @@ fn producer_steps_from_bindings<'a>(
             values.fixed.as_slice(),
             [HirExpr::Call(_) | HirExpr::Unary(_) | HirExpr::Binary(_)]
         );
-    let source_gc_inert = values.fixed.iter().all(producer_value_can_be_dropped);
     steps.extend(
         bindings
             .iter()
@@ -662,7 +779,7 @@ fn producer_steps_from_bindings<'a>(
                 },
                 value: values.fixed.get(slot_index).unwrap_or(&HirExpr::Nil),
                 scalar_result,
-                source_gc_inert,
+                source_gc_inert: value_facts.pack_slot(values, slot_index).is_gc_inert(),
                 source_preservation,
             }),
     );
@@ -672,7 +789,7 @@ fn producer_steps_from_bindings<'a>(
 fn producer_source_preservation(
     bindings: &[TableBinding],
     values: &HirValuePack,
-    debug_identity_bindings: &BindingSlots<bool>,
+    preserved_identity_bindings: &BindingSlots<bool>,
 ) -> ProducerSourcePreservation {
     if values
         .fixed
@@ -682,12 +799,12 @@ fn producer_source_preservation(
         return ProducerSourcePreservation::UnsupportedShape;
     }
     if bindings.iter().any(|binding| {
-        debug_identity_bindings
+        preserved_identity_bindings
             .get(*binding)
             .copied()
             .unwrap_or_default()
     }) {
-        return ProducerSourcePreservation::DebugIdentity;
+        return ProducerSourcePreservation::PreservedIdentity;
     }
     if values.fixed.iter().any(expr_requires_ordered_snapshot) {
         return ProducerSourcePreservation::ObservableReplay;
@@ -779,6 +896,18 @@ pub(super) fn seed_overwrite_delay_is_unobservable(
 }
 
 pub(super) fn seed_delay_expr_is_unobservable(expr: &HirExpr) -> bool {
+    if let HirExpr::Unary(_) = expr {
+        // 数值字面量取负没有回调或 GC 观察；仍保留原表达式，不能折掉 -0 的符号（598）。
+        // 不由正常结果值域推出此权限，未知 local、字符串转换及 FFI 数值均不在本证明内。
+        let mut operand = expr;
+        while let HirExpr::Unary(unary) = operand {
+            if unary.op != crate::hir::common::HirUnaryOpKind::Neg {
+                return false;
+            }
+            operand = &unary.expr;
+        }
+        return matches!(operand, HirExpr::Integer(_) | HirExpr::Number(_));
+    }
     matches!(
         expr,
         HirExpr::Nil

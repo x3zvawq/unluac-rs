@@ -757,6 +757,7 @@ fn payload_seed_from_expr(
         | HirExpr::Unary(_)
         | HirExpr::Binary(_)
         | HirExpr::Call(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::Unresolved(_) => {}
     }
@@ -1417,6 +1418,7 @@ fn value_at_class(
         | HirExpr::LogicalOr(_)
         | HirExpr::Decision(_)
         | HirExpr::Call(_)
+        | HirExpr::CaptureInitializer(_)
         | HirExpr::VarArg
         | HirExpr::TableConstructor(_)
         | HirExpr::Closure(_)

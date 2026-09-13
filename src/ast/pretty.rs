@@ -111,7 +111,7 @@ fn expr_display_complexity(expr: &AstExpr) -> usize {
         | AstExpr::Vector(_)
         | AstExpr::Complex { .. } => 1,
         // 把变量刻意排在常量之上，这样 `0 < value` 会更倾向翻成 `value > 0`。
-        AstExpr::Var(_) | AstExpr::VarArg => 2,
+        AstExpr::Var(_) | AstExpr::CaptureInitializer(_) | AstExpr::VarArg => 2,
         AstExpr::Unary(unary) => 1 + expr_display_complexity(&unary.expr),
         AstExpr::FieldAccess(access) => 2 + expr_display_complexity(&access.base),
         AstExpr::IndexAccess(access) => {

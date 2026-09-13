@@ -80,9 +80,9 @@ fn inline_constructor_value_inner(
             match producer.source_preservation {
                 ProducerSourcePreservation::Safe => {}
                 ProducerSourcePreservation::InertWholeStatement => {}
-                ProducerSourcePreservation::DebugIdentity => {
-                    // 候选拒绝[PolicyBoundary]：producer 声明虽可保留，但把 table field 提前
-                    // 到 source-visible 声明之前会改变 hook 在该行观察到的 table 内容。
+                ProducerSourcePreservation::PreservedIdentity => {
+                    // 候选拒绝[SemanticBarrier:BindingIdentity]：debug 声明或调用帧前缀
+                    // 的保留要求不允许把物化值提前到该声明之前（regress_577）。
                     return None;
                 }
                 ProducerSourcePreservation::ObservableReplay => {
@@ -121,16 +121,19 @@ fn inline_constructor_value_inner(
     let records_barrier = !context.inside_producer_value && expr_requires_ordered_snapshot(value);
     let inlined = match value {
         HirExpr::Unary(unary) => HirExpr::Unary(Box::new(HirUnaryExpr {
+            source_site: unary.source_site,
             op: unary.op,
             expr: inline_constructor_value_inner(context, &unary.expr)?,
         })),
         HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {
+            source_site: binary.source_site,
             op: binary.op,
             lhs: inline_constructor_value_inner(context, &binary.lhs)?,
             rhs: inline_constructor_value_inner(context, &binary.rhs)?,
         })),
         HirExpr::TableAccess(access) => {
             HirExpr::TableAccess(Box::new(crate::hir::common::HirTableAccess {
+                sources: access.sources.clone(),
                 metamethod_free: access.metamethod_free,
                 base: inline_constructor_value_inner(context, &access.base)?,
                 key: inline_constructor_value_inner(context, &access.key)?,
@@ -201,7 +204,9 @@ fn inline_nested_constructor(
         None => None,
     };
     Some(HirTableConstructor {
+        sources: table.sources.clone(),
         allocation: table.allocation.clone(),
+        implicit_template_fields: table.implicit_template_fields.clone(),
         fields,
         trailing_multivalue,
     })
@@ -282,6 +287,7 @@ pub(super) fn inline_constructor_call(
         (callee, args)
     };
     Some(HirCallExpr {
+        source_site: call.source_site,
         argument_roots: call.argument_roots.clone(),
         frame_root_ends: call.frame_root_ends.clone(),
         callee,

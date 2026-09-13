@@ -31,11 +31,13 @@ fn normalize_candidate_expr(expr: HirExpr, safety: HirExprSafety) -> HirExpr {
             HirUnaryOpKind::Not => match normalize_candidate_expr(unary.expr, safety) {
                 HirExpr::Boolean(value) => HirExpr::Boolean(!value),
                 inner => HirExpr::Unary(Box::new(HirUnaryExpr {
+                    source_site: unary.source_site,
                     op: HirUnaryOpKind::Not,
                     expr: inner,
                 })),
             },
             _ => HirExpr::Unary(Box::new(HirUnaryExpr {
+                source_site: unary.source_site,
                 op: unary.op,
                 expr: normalize_candidate_expr(unary.expr, safety),
             })),
@@ -73,6 +75,7 @@ fn normalize_candidate_expr(expr: HirExpr, safety: HirExprSafety) -> HirExpr {
             }
         }
         HirExpr::Binary(binary) => HirExpr::Binary(Box::new(HirBinaryExpr {
+            source_site: binary.source_site,
             op: binary.op,
             lhs: normalize_candidate_expr(binary.lhs, safety),
             rhs: normalize_candidate_expr(binary.rhs, safety),

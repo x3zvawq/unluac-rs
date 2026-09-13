@@ -255,10 +255,11 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
             HirStmt::TableSetList(set_list) => {
                 let _ = writeln!(
                     output,
-                    "{indent}table-set-list {} start={} values={}",
+                    "{indent}table-set-list {} start={} values={} initializer-scope={:?}",
                     format_expr(&set_list.base),
                     set_list.start_index,
                     format_value_pack(&set_list.values),
+                    set_list.initializer_debug_scope,
                 );
             }
             HirStmt::ErrNil(err_nnil) => {
@@ -427,6 +428,7 @@ fn format_expr(expr: &HirExpr) -> String {
         HirExpr::Nil => "nil".to_owned(),
         HirExpr::Boolean(value) => value.to_string(),
         HirExpr::Integer(value) => value.to_string(),
+        HirExpr::CaptureInitializer(value) => format!("capture-init({value:?})"),
         HirExpr::Number(value) => value.to_string(),
         HirExpr::String(value) => value.debug_literal(),
         HirExpr::Int64(value) => format!("{value}LL"),

@@ -1,6 +1,6 @@
-//! 按当前返回值的定义图计算 lookup / 动态运算结果消费后跨观察点所需的根。
+//! 按当前返回值定义图计算调用、lookup 与动态运算结果消费后跨观察点所需的根。
 //!
-//! 值身份来自同一 collector 的 lookup 映射，定义与表达式顺序来自不可变 HIR 快照；
+//! 值身份由各自 collector 的类型化映射提供，定义与表达式顺序来自不可变 HIR 快照；
 //! 本层不重新解释 VM home，也不决定哪个 binding 可以删除。例如 `a=lookup; b=a+a;
 //! c=b+b; return c` 只分析一次 b 的共享定义，各引用仍按原顺序合并相同的观察事实。
 //! 引用次数按可达定义图的 TempRef 边统计，不能使用按语句去重的活读位置。仍有后续边
@@ -13,16 +13,14 @@ use crate::hir::common::{HirBinaryOpKind, HirExpr, HirValuePack, TempId};
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::visit::{HirVisitor, visit_expr};
 
-use super::ScalarValueId;
-
-pub(super) fn observed_return_lookup_roots(
+pub(super) fn observed_return_roots<Id: Copy + Ord>(
     values: &HirValuePack,
     definitions: &BTreeMap<TempId, &HirExpr>,
-    lookup_values: &BTreeMap<TempId, ScalarValueId>,
+    root_values: &BTreeMap<TempId, Id>,
     safety: HirExprSafety,
-) -> Option<BTreeSet<ScalarValueId>> {
+) -> Option<BTreeSet<Id>> {
     let mut dependencies = ReturnDependencies {
-        lookup_values,
+        root_values,
         remaining: BTreeMap::new(),
         pending: Vec::new(),
         unsupported: false,
@@ -39,9 +37,9 @@ pub(super) fn observed_return_lookup_roots(
     if dependencies.unsupported {
         return None;
     }
-    let mut context = ReturnLookupContext {
+    let mut context = ReturnRootContext {
         definitions,
-        lookup_values,
+        root_values,
         safety,
         remaining: dependencies.remaining,
         cached: BTreeMap::new(),
@@ -49,23 +47,23 @@ pub(super) fn observed_return_lookup_roots(
     };
     let flow = values
         .iter()
-        .try_fold(ReturnLookupFlow::default(), |flow, value| {
+        .try_fold(ReturnRootFlow::default(), |flow, value| {
             Some(flow.then(context.flow(value)?))
         })?;
     Some(flow.needs_independent_root)
 }
 
-struct ReturnDependencies<'a> {
-    lookup_values: &'a BTreeMap<TempId, ScalarValueId>,
+struct ReturnDependencies<'a, Id> {
+    root_values: &'a BTreeMap<TempId, Id>,
     remaining: BTreeMap<TempId, usize>,
     pending: Vec<TempId>,
     unsupported: bool,
 }
 
-impl HirVisitor<'_> for ReturnDependencies<'_> {
+impl<Id> HirVisitor<'_> for ReturnDependencies<'_, Id> {
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
-            HirExpr::TempRef(temp) if !self.lookup_values.contains_key(temp) => {
+            HirExpr::TempRef(temp) if !self.root_values.contains_key(temp) => {
                 let count = self.remaining.entry(*temp).or_default();
                 if *count == 0 {
                     self.pending.push(*temp);
@@ -83,19 +81,19 @@ impl HirVisitor<'_> for ReturnDependencies<'_> {
     }
 }
 
-struct ReturnLookupContext<'a> {
+struct ReturnRootContext<'a, Id> {
     definitions: &'a BTreeMap<TempId, &'a HirExpr>,
-    lookup_values: &'a BTreeMap<TempId, ScalarValueId>,
+    root_values: &'a BTreeMap<TempId, Id>,
     safety: HirExprSafety,
     remaining: BTreeMap<TempId, usize>,
-    cached: BTreeMap<TempId, ReturnLookupFlow>,
+    cached: BTreeMap<TempId, ReturnRootFlow<Id>>,
     resolving: BTreeSet<TempId>,
 }
 
-impl ReturnLookupContext<'_> {
-    fn temp_flow(&mut self, temp: TempId) -> Option<ReturnLookupFlow> {
-        if let Some(value) = self.lookup_values.get(&temp).copied() {
-            return Some(ReturnLookupFlow::lookup(value));
+impl<Id: Copy + Ord> ReturnRootContext<'_, Id> {
+    fn temp_flow(&mut self, temp: TempId) -> Option<ReturnRootFlow<Id>> {
+        if let Some(value) = self.root_values.get(&temp).copied() {
+            return Some(ReturnRootFlow::root(value));
         }
         let remaining = self
             .remaining
@@ -123,10 +121,10 @@ impl ReturnLookupContext<'_> {
         Some(flow)
     }
 
-    fn flow(&mut self, expr: &HirExpr) -> Option<ReturnLookupFlow> {
+    fn flow(&mut self, expr: &HirExpr) -> Option<ReturnRootFlow<Id>> {
         match expr {
             HirExpr::TempRef(temp) => self.temp_flow(*temp),
-            HirExpr::GlobalRef(_) => Some(ReturnLookupFlow::observation()),
+            HirExpr::GlobalRef(_) => Some(ReturnRootFlow::observation()),
             HirExpr::TableAccess(access) => Some(
                 self.flow(&access.base)?
                     .then(self.flow(&access.key)?)
@@ -172,7 +170,8 @@ impl ReturnLookupContext<'_> {
             | HirExpr::ParamRef(_)
             | HirExpr::LocalRef(_)
             | HirExpr::UpvalueRef(_)
-            | HirExpr::VarArg => Some(ReturnLookupFlow::default()),
+            | HirExpr::CaptureInitializer(_)
+            | HirExpr::VarArg => Some(ReturnRootFlow::default()),
             HirExpr::LogicalAnd(_)
             | HirExpr::LogicalOr(_)
             | HirExpr::Decision(_)
@@ -185,7 +184,7 @@ impl ReturnLookupContext<'_> {
     /// 右结合 concat 源码会合成一条 PUC 5.1 CONCAT；求值依然从左到右，合并从右到左。
     /// 最右 operand 的原槽一直保留，中间 operand 的槽会被部分结果覆盖。只在本次 CONCAT
     /// 内延后最右根的释放；返回 caller flow 时所有 operand 都按已消费结果交出。
-    fn concat_flow(&mut self, expr: &HirExpr) -> Option<ReturnLookupFlow> {
+    fn concat_flow(&mut self, expr: &HirExpr) -> Option<ReturnRootFlow<Id>> {
         let mut operands = Vec::new();
         let mut cursor = expr;
         while let HirExpr::Binary(binary) = cursor
@@ -195,7 +194,7 @@ impl ReturnLookupContext<'_> {
             cursor = &binary.rhs;
         }
         operands.push(cursor);
-        let mut flow = ReturnLookupFlow::default();
+        let mut flow = ReturnRootFlow::default();
         let mut operand_roots = Vec::new();
         for operand in operands {
             let next = self.flow(operand)?;
@@ -210,16 +209,27 @@ impl ReturnLookupContext<'_> {
     }
 }
 
-#[derive(Clone, Default)]
-struct ReturnLookupFlow {
-    handed_roots: BTreeSet<ScalarValueId>,
-    pending_releases: BTreeSet<ScalarValueId>,
-    needs_independent_root: BTreeSet<ScalarValueId>,
+#[derive(Clone)]
+struct ReturnRootFlow<Id> {
+    handed_roots: BTreeSet<Id>,
+    pending_releases: BTreeSet<Id>,
+    needs_independent_root: BTreeSet<Id>,
     has_observation: bool,
 }
 
-impl ReturnLookupFlow {
-    fn lookup(value: ScalarValueId) -> Self {
+impl<Id> Default for ReturnRootFlow<Id> {
+    fn default() -> Self {
+        Self {
+            handed_roots: BTreeSet::new(),
+            pending_releases: BTreeSet::new(),
+            needs_independent_root: BTreeSet::new(),
+            has_observation: false,
+        }
+    }
+}
+
+impl<Id: Copy + Ord> ReturnRootFlow<Id> {
+    fn root(value: Id) -> Self {
         Self {
             handed_roots: BTreeSet::from([value]),
             ..Self::default()

@@ -11,8 +11,9 @@
 //! captured local 也不能作为纯 alias handoff 的来源：闭包调用可能在后缀没有显式提及
 //! 该 local 时写回它，跨过这类调用消除快照会改变后续读值。
 //! 所有 owner 还共享 proto 级 source/resource 身份门：debug、for、physical-root、
-//! reference capture/TBC binding 与其 raw home may-alias 都不得成为改写两端。By-value
-//! capture 是创建点快照，由具体 transaction 的 reaching relation 验证其读取值。
+//! reference capture/TBC binding 与其 raw home may-alias 都不得成为改写两端。
+//! 物理根覆盖 TempId 和 LocalId；尚未物化的 CALL 结果不能先被合进 callee carrier。
+//! By-value capture 是创建点快照，由具体 transaction 的 reaching relation 验证其读取值。
 //! 唯一例外是 proven internal loop-carrier temp mirror：它先在 `prune.rs` 里被要求满足
 //! no-read、non-debug、loop-carrier owner、same-exact-home write audit 之后，才会在冻结
 //! identity 前删除；源码作者可见的 for binding 身份本身仍继续受这里的保护。
@@ -344,7 +345,7 @@ struct RegionControlFacts {
 struct HandoffIdentityFacts {
     debug: BTreeSet<LocalId>,
     for_bindings: BTreeSet<LocalId>,
-    physical_roots: BTreeSet<LocalId>,
+    physical_roots: BTreeSet<CarryBinding>,
     reference_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
     preserved: BTreeSet<CarryBinding>,
@@ -362,7 +363,19 @@ impl HandoffIdentityFacts {
         Self {
             debug,
             for_bindings: collector.for_bindings,
-            physical_roots: proto.physical_root_locals.clone(),
+            physical_roots: proto
+                .physical_root_locals
+                .iter()
+                .copied()
+                .map(CarryBinding::Local)
+                .chain(
+                    proto
+                        .physical_root_temps
+                        .iter()
+                        .copied()
+                        .map(CarryBinding::Temp),
+                )
+                .collect(),
             reference_captured: collector.reference_captured,
             to_be_closed: collector.to_be_closed,
             preserved,
@@ -372,7 +385,7 @@ impl HandoffIdentityFacts {
     fn contains(&self, local: LocalId) -> bool {
         self.debug.contains(&local)
             || self.for_bindings.contains(&local)
-            || self.physical_roots.contains(&local)
+            || self.physical_roots.contains(&CarryBinding::Local(local))
             || self.preserved.contains(&CarryBinding::Local(local))
     }
 
@@ -401,6 +414,8 @@ impl HandoffIdentityFacts {
         // carried-local 的跨身份 merge 删除；不相关 Preserve 不影响当前事务。
         !self.preserved.contains(&source)
             && !self.preserved.contains(&target)
+            && !self.physical_roots.contains(&source)
+            && !self.physical_roots.contains(&target)
             && !source.local().is_some_and(|local| self.contains(local))
             && !target.local().is_some_and(|local| self.contains(local))
             && (!endpoint_is_reference_captured || shares_exact_home)

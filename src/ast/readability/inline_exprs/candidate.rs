@@ -417,6 +417,7 @@ fn expr_contains_direct_call_callee_var(expr: &AstExpr, binding: Option<AstBindi
         | AstExpr::Vector(_)
         | AstExpr::Complex { .. }
         | AstExpr::Var(_)
+        | AstExpr::CaptureInitializer(_)
         | AstExpr::VarArg
         | AstExpr::Error(_) => false,
     }
