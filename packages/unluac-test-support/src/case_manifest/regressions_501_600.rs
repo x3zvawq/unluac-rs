@@ -931,10 +931,20 @@ pub(super) const REGRESSION_CASES_501_600: &[LuaCaseMatrixEntry] = &[
         LUAU_ONLY,
     )
     .with_options(LuaCaseOptions {
+        // O0 第4次生成完成原帧保护后的声明规范化，第5次逐字节相同；其它配置不外推。
+        recompile_rounds: Some(4),
+        ..LuaCaseOptions::DEFAULT
+    })
+    .with_variants(&[LuaCaseVariant::LuauO0]),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_592_luau_fresh_constant_capture.lua",
+        LUAU_ONLY,
+    )
+    .with_options(LuaCaseOptions {
         recompile_rounds: Some(3),
         ..LuaCaseOptions::DEFAULT
     })
-    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    .with_variants(&[LuaCaseVariant::LuauO1, LuaCaseVariant::LuauO2]),
     LuaCaseMatrixEntry::new(
         "tests/regress-case/regress_592_luau_fresh_constant_capture.lua",
         LUAU_ONLY,

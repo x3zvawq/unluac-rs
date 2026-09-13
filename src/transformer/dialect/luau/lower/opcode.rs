@@ -873,6 +873,8 @@ impl<'a> ProtoLowerer<'a> {
                             limit,
                             step,
                             binding: index,
+                            normalizes_controls: true,
+                            normalizes_binding: true,
                             body_target: TargetPlaceholder::Raw(
                                 self.ensure_targetable_pc(raw_pc, self.next_raw_pc(raw_index))?,
                             ),

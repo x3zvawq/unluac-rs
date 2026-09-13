@@ -451,6 +451,7 @@ pub(super) struct ProtoPromotionFacts {
     unobserved_call_result_ends: BTreeMap<TempId, Vec<TempId>>,
     frame_root_ends_by_call: BTreeMap<InstrRef, Vec<TempId>>,
     numeric_for_headers: BTreeMap<InstrRef, NativeNumericForHeader>,
+    nil_write_temps: BTreeMap<TempId, Vec<TempId>>,
     generic_for_body_frames: BTreeMap<InstrRef, NativeGenericForFrame>,
     method_setup_protocols: Vec<HirMethodSetupProtocol>,
     method_setup_protocol_by_call: BTreeMap<InstrRef, HirMethodSetupProtocolId>,
@@ -703,6 +704,19 @@ impl ProtoPromotionFacts {
     /// 最终数值 for 协议接管的三个控制槽；不从折叠后的 HIR operand 重建寄存器。
     pub(super) fn numeric_for_header(&self, init: InstrRef) -> NativeNumericForHeader {
         self.numeric_for_headers[&init]
+    }
+
+    /// 原 LOADNIL 的全部 canonical 定义，按真实槽序保存；不从当前相邻 nil 反猜批次。
+    pub(super) fn nil_write_temps(&self, first: TempId) -> Option<&[TempId]> {
+        self.nil_write_temps.get(&first).map(Vec::as_slice)
+    }
+
+    pub(super) fn has_nil_writes(&self) -> bool {
+        !self.nil_write_temps.is_empty()
+    }
+
+    pub(super) fn nil_write_groups(&self) -> impl Iterator<Item = &[TempId]> {
+        self.nil_write_temps.values().map(Vec::as_slice)
     }
 
     /// control_homes 来自原 NumericForProtocol，binding home 来自同一协议的语法绑定。
@@ -1580,6 +1594,31 @@ impl ProtoPromotionFacts {
                         },
                     )),
                     _ => None,
+                })
+                .collect(),
+            nil_write_temps: proto
+                .instrs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instr)| {
+                    let LowInstr::LoadNil(nil) = instr else {
+                        return None;
+                    };
+                    let defs = &dataflow.instr_defs[index];
+                    if defs.len() != nil.dst.len
+                        || defs.is_empty()
+                        || defs.iter().enumerate().any(|(offset, def)| {
+                            fixed_temps[def.index()] != TempId(def.index())
+                                || dataflow.def_reg(*def).index() != nil.dst.start.index() + offset
+                        })
+                    {
+                        return None;
+                    }
+                    let temps = defs
+                        .iter()
+                        .map(|def| TempId(def.index()))
+                        .collect::<Vec<_>>();
+                    Some((temps[0], temps))
                 })
                 .collect(),
             generic_for_body_frames: plan
@@ -3329,8 +3368,10 @@ fn low_instr_def_may_hold_gc_root(instr: &LowInstr, reg: Reg) -> bool {
         {
             false
         }
-        LowInstr::NumericForInit(init) if init.index == reg || init.binding == reg => false,
-        LowInstr::NumericForLoop(loop_) if loop_.index == reg || loop_.binding == reg => false,
+        LowInstr::NumericForInit(init) if init.normalizes_slot(reg) => false,
+        // body 可改写独立用户槽，退出边未必再写它；JIT dual-number 溢出也可先退出。
+        // 这里只保留内部 index 的数值事实，binding 与它共槽时自然消费同一保证。
+        LowInstr::NumericForLoop(loop_) if loop_.index == reg => false,
         _ => true,
     }
 }

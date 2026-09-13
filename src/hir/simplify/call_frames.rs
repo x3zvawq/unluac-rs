@@ -305,6 +305,18 @@ impl FrameBuilder<'_> {
             };
             self.facts.operation_result_temp(call.source_site?)
         });
+        // 编译位置只比较 slot；写入集合仍匹配该原值版本的完整 home，包括 epoch。
+        // CALL+COPY 可能由低槽 local 承接，不能拿该 local 的展示 home 冒充 CALL 结果。
+        let target_home = producer.map_or_else(
+            || self.facts.trusted_local_home_slot(local),
+            |producer| self.facts.trusted_temp_home_slot(producer),
+        );
+        let Some(target_home) = target_home else {
+            return false;
+        };
+        if target_home.slot() != slot && receiver != Some(target_home.slot()) {
+            return false;
+        }
         let homes = if let Some(producer) = producer {
             if self.facts.promoted_local_for_temp(producer) != Some(local) {
                 return false;
@@ -318,7 +330,7 @@ impl FrameBuilder<'_> {
                     .complete_temp_non_move_write_homes(producer)
                     .iter()
                     .any(|home| {
-                        *home != HomeSlotKey::new(slot, 0)
+                        *home != target_home
                             && !receiver.is_some_and(|slot| *home == HomeSlotKey::new(slot, 0))
                     })
             {
@@ -332,7 +344,7 @@ impl FrameBuilder<'_> {
         };
         !homes.is_empty()
             && homes.iter().all(|home| {
-                *home == HomeSlotKey::new(slot, 0)
+                *home == target_home
                     || receiver.is_some_and(|slot| *home == HomeSlotKey::new(slot, 0))
                     || self
                         .result_move
@@ -360,10 +372,12 @@ impl FrameBuilder<'_> {
         match expr {
             HirExpr::TempRef(temp) if self.native.is_some() && original_producer == Some(*temp) => {
                 let index = *self.temp_definitions.get(temp)?;
+                let target_home = self.facts.trusted_temp_home_slot(*temp)?;
                 if index >= before
                     || index < self.next_event
+                    || target_home.slot() != slot
                     || self.native.is_some_and(|context| {
-                        context.closed.contains(&HomeSlotKey::new(slot, 0))
+                        context.closed.contains(&target_home)
                             || context
                                 .proto
                                 .inline_dispositions
@@ -374,7 +388,7 @@ impl FrameBuilder<'_> {
                         .facts
                         .complete_temp_definition_write_homes(*temp)
                         .iter()
-                        .any(|home| *home != HomeSlotKey::new(slot, 0))
+                        .any(|home| *home != target_home)
                 {
                     return None;
                 }
@@ -615,6 +629,7 @@ impl FrameBuilder<'_> {
                             matches!(scalar_local(self.run[index]),
                                 Some((_, HirExpr::Call(_) | HirExpr::Unary(_))))
                         }))
+                        || self.luau_global_comparison_subject(binary, before, slot)
                         || !matches!(
                             self.dialect,
                             DecompileDialect::Luajit | DecompileDialect::Luau
@@ -829,6 +844,34 @@ impl FrameBuilder<'_> {
         crate::hir::common::HirBinaryExpr::concat(binary.source_site?, values)
     }
 
+    /// GlobalRef 本身没有 source site；只消费仍有原定义的高槽读取，并由比较的
+    /// operand 布局证明该 home。全局读取可触发环境元方法，仍走 expr 的事件游标。
+    fn luau_global_comparison_subject(
+        &self,
+        binary: &crate::hir::common::HirBinaryExpr,
+        before: usize,
+        slot: usize,
+    ) -> bool {
+        if self.dialect != DecompileDialect::Luau
+            || binary.op != crate::hir::common::HirBinaryOpKind::Eq
+            || !self
+                .facts
+                .native_binary_layout(binary)
+                .is_some_and(|layout| {
+                    layout.lhs == Some(HomeSlotKey::new(slot + 1, 0)) && layout.rhs.is_none()
+                })
+        {
+            return false;
+        }
+        let HirExpr::LocalRef(local) = binary.lhs else {
+            return false;
+        };
+        self.definition(local, before).is_some_and(|index| {
+            matches!(scalar_local(self.run[index]), Some((_, HirExpr::GlobalRef(global)))
+                if global.key.as_utf8().is_some_and(|name| self.dialect.is_identifier_name(name)))
+        })
+    }
+
     fn comparison_rhs_is_supported(&self, expr: &HirExpr, before: usize, slot: usize) -> bool {
         if matches!(
             expr,
@@ -1031,7 +1074,7 @@ impl FrameBuilder<'_> {
             None
         };
         let args_start = if let Some(frame) = native_frame {
-            if frame.home != HomeSlotKey::new(slot, 0)
+            if frame.home.slot() != slot
                 || !match (width, frame.results) {
                     (CallWidth::Ignore, Some(ResultPack::Ignore)) => true,
                     (CallWidth::Single, Some(ResultPack::Fixed(range))) => {

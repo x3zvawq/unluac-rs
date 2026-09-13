@@ -6,6 +6,7 @@
 //!
 //! 例子：
 //! - `if not cond then a() else b() end` 会整理成 `if cond then b() else a() end`
+//! - 只有受保护匿名 nil 声明的一臂保持完整并置于 else；普通 not 交换服从该方向，避免反复翻转
 //! - `if cond then body else end` 会整理成 `if cond then body end`
 //! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
 //! - `repeat if cond then break end; tail() until true` 会整理成 `if not cond then tail() end`
@@ -72,12 +73,31 @@ impl AstRewritePass for BranchPrettyPass {
                 let mut changed = false;
                 if let AstExpr::Unary(unary) = &if_stmt.cond
                     && unary.op == AstUnaryOpKind::Not
+                    && !(if_stmt
+                        .else_block
+                        .as_ref()
+                        .is_some_and(only_preserved_nil_declarations)
+                        && !only_preserved_nil_declarations(&if_stmt.then_block))
                     && let Some(mut else_block) = if_stmt.else_block.take()
                 {
                     let inner = unary.expr.clone();
                     std::mem::swap(&mut if_stmt.then_block, &mut else_block);
                     if_stmt.else_block = Some(else_block);
                     if_stmt.cond = inner;
+                    changed = true;
+                }
+                if only_preserved_nil_declarations(&if_stmt.then_block)
+                    && if_stmt.else_block.as_ref().is_some_and(|block| {
+                        !block.stmts.is_empty() && !only_preserved_nil_declarations(block)
+                    })
+                {
+                    let else_block = if_stmt.else_block.take().unwrap();
+                    let old_then = std::mem::replace(&mut if_stmt.then_block, else_block);
+                    if_stmt.else_block = Some(old_then);
+                    if_stmt.cond = negate_guard_condition(std::mem::replace(
+                        &mut if_stmt.cond,
+                        AstExpr::Boolean(false),
+                    ));
                     changed = true;
                 }
                 changed |= normalize_empty_if_arms(if_stmt);
@@ -514,6 +534,28 @@ fn merge_exact_nested_if(if_stmt: &mut AstIf) -> bool {
     }));
     *if_stmt = *inner;
     true
+}
+
+/// 保留原清槽臂，只把有实际主体的一臂放在前面。否定规范化必须服从同一方向，
+/// 否则下一轮又会翻回去；这不删除 nil、缩短其块或改变条件的求值次数。
+fn only_preserved_nil_declarations(block: &AstBlock) -> bool {
+    !block.stmts.is_empty()
+        && block.stmts.iter().all(|stmt| {
+            let AstStmt::LocalDecl(decl) = stmt else {
+                return false;
+            };
+            !decl.bindings.is_empty()
+                && decl.values.len() == decl.bindings.len()
+                && decl
+                    .values
+                    .iter()
+                    .all(|value| matches!(value, AstExpr::Nil))
+                && decl.bindings.iter().all(|binding| {
+                    binding.attr == AstLocalAttr::None
+                        && !binding.origin.is_debug_hinted()
+                        && binding.rewrite_authority.must_preserve()
+                })
+        })
 }
 
 fn normalize_empty_if_arms(if_stmt: &mut AstIf) -> bool {

@@ -151,11 +151,17 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             fixed_uses.push(instr.limit);
             fixed_uses.push(instr.step);
             fixed_must_defs.push(instr.index);
+            if instr.normalizes_controls {
+                // 读取仍是 FORPREP 之前的输入；正常后态的新数值版本结束旧 COPY 根，
+                // 不把可收集输入错误延续到整个循环与后继覆盖点。
+                fixed_must_defs.extend([instr.limit, instr.step]);
+            }
             // `binding` 是循环可见变量槽位；在 CFG 模型下 NumericForInit 直接跳
             // 向循环体入口（body_target），此时体内首次读取 binding 前，它已经
             // 被 FORLOOP/FORI 写入。如果不把 binding 计入 must-def，则体外对该
             // 寄存器的值会经过 phi 合流进入循环体，制造出虚假的 exit phi，把
             // 纯粹的体内作用域寄存器误判为循环承载变量（见 luajit_01 回归）。
+            // 该逻辑 Def 不保证 skip 边写入；物理根/残值消费者另查 normalizes_slot。
             fixed_must_defs.push(instr.binding);
         }
         LowInstr::NumericForLoop(instr) => {
@@ -166,6 +172,7 @@ pub(super) fn compute_instr_effect(instr: &LowInstr) -> InstrEffect {
             // FORLOOP/IFORL/JFORL 回边在迭代继续时会把新的 index 写入
             // binding，与 NumericForInit 对称，避免体内重新定义前的 phi 被错
             // 误当成真正的入口值。
+            // 退出边可能保留用户写入的对象；此处只定义下一次body所读的逻辑版本。
             fixed_must_defs.push(instr.binding);
         }
         LowInstr::GenericForPrep(instr) => {

@@ -438,7 +438,8 @@ pub(super) fn simplify_hir(
 
     timings.record("method-rewrite-transactions", || {
         for proto in &mut module.protos {
-            if let Some(facts) = promotion_facts.get(proto.id.index()) {
+            if let Some(facts) = promotion_facts.get_mut(proto.id.index()) {
+                source_frames::restore_nil_writes(proto, facts, dialect, proto.id == module.entry);
                 method_rewrite_transactions::finalize_method_rewrite_transactions(proto, facts);
                 call_frames::restore_terminal_method_frames(proto, facts, dialect);
                 source_frames::preserve_scratch_prefixes(

@@ -39,11 +39,13 @@ use crate::hir::promotion::{HomeSlotKey, SlotEpochFacts};
 
 mod captured_slots;
 mod captured_temps;
+mod closed_outputs;
 mod copy_roots;
 mod debug_entries;
 mod debug_names;
 mod lexical_windows;
 mod loop_bindings;
+mod reused_frames;
 
 use captured_slots::*;
 use captured_temps::*;
@@ -51,6 +53,7 @@ pub(super) use copy_roots::{bind_copy_root_holders, bind_copy_root_scopes};
 use debug_entries::*;
 use debug_names::*;
 use loop_bindings::*;
+pub(super) use reused_frames::bind_reused_frames;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 struct CapturedSlotKey {
@@ -144,7 +147,7 @@ pub(super) fn build_bindings(
         None
     };
 
-    let (debug_entry_local_decls, mut debug_scope_targets) = allocate_debug_entry_bindings(
+    let (mut entry_nil_local_decls, mut debug_scope_targets) = allocate_debug_entry_bindings(
         proto,
         structure,
         &mut entry_local_regs,
@@ -416,9 +419,13 @@ pub(super) fn build_bindings(
         };
         let instr = dataflow.def_instr(def);
         let temp = fixed_temps[def.index()];
+        let home = HomeSlotKey::new(
+            fact.reg.index(),
+            captured_slot_epochs.epoch_at(fact.reg, instr),
+        );
         if !matches!(proto.instrs[instr.index()], LowInstr::LoadNil(_))
             || temp != TempId(def.index())
-            || dataflow.reg_is_captured(fact.reg)
+            || !captured_slots.debug_nil_binding_is_uncaptured(home, fact.scope)
             || debug_scope_targets.contains_key(&fact.scope)
         {
             continue;
@@ -430,15 +437,9 @@ pub(super) fn build_bindings(
         )));
         debug_scope_targets.insert(fact.scope, BoundSlotTarget::Local(local));
         debug_nil_decls.insert(temp, local);
-        declared_local_home_slots.push((
-            local,
-            HomeSlotKey::new(
-                fact.reg.index(),
-                captured_slot_epochs.epoch_at(fact.reg, instr),
-            ),
-        ));
+        declared_local_home_slots.push((local, home));
     }
-    let bound_temp_targets = temp_debug_scopes
+    let mut bound_temp_targets = temp_debug_scopes
         .iter()
         .enumerate()
         .filter_map(|(index, scope)| {
@@ -486,6 +487,101 @@ pub(super) fn build_bindings(
     });
     captured_temp_facts.decl_temps.extend(debug_nil_decls);
 
+    let lexical_scopes = lexical_windows::collect_lexical_scopes(
+        proto,
+        cfg,
+        dataflow,
+        graph,
+        structure,
+        emission,
+        captured_slots.lexical_scopes.clone(),
+    );
+    let captured_entry_locals = captured_slots
+        .entry_local_decls
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let occupied_entry_slots = entry_local_regs
+        .keys()
+        .map(|reg| reg.index())
+        .chain(
+            captured_slots
+                .slot_targets
+                .iter()
+                .filter_map(|(home, binding)| {
+                    captured_entry_locals
+                        .contains(&binding.target)
+                        .then_some(home.slot)
+                }),
+        )
+        .collect::<BTreeSet<_>>();
+    let captured_entry_first_slot = captured_slots
+        .slot_targets
+        .iter()
+        .filter_map(|(home, binding)| {
+            captured_entry_locals
+                .contains(&binding.target)
+                .then_some(home.slot)
+        })
+        .min();
+    let original_entry_nil_locals = entry_nil_local_decls
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let original_entry_nil_last_slot = entry_local_regs
+        .iter()
+        .filter_map(|(reg, local)| {
+            original_entry_nil_locals
+                .contains(local)
+                .then_some(reg.index())
+        })
+        .max();
+    let mut new_entry_nil_locals = BTreeMap::new();
+    for output in closed_outputs::collect(
+        proto,
+        cfg,
+        graph,
+        dataflow,
+        structure,
+        emission,
+        captured_slot_epochs,
+        &captured_slots,
+        &lexical_scopes,
+        &fixed_temps,
+    ) {
+        let temps = output.initial.into_iter().chain([output.output]);
+        if (output.initial.is_none()
+            && (occupied_entry_slots.contains(&output.home.slot())
+                || original_entry_nil_last_slot.is_some_and(|last| output.home.slot() <= last)
+                // 入口 nil 组在 capture entry 声明之前发射；不能交换已有 cell 的槽位置。
+                || captured_entry_first_slot.is_some_and(|first| output.home.slot() >= first)))
+            || temps.clone().any(|temp| {
+                bound_temp_targets.contains_key(&temp)
+                    || captured_temp_facts.targets.contains_key(&temp)
+                    || captured_temp_facts.decl_temps.contains_key(&temp)
+                    || temp_debug_scopes[temp.index()].is_some()
+                    || temp_debug_locals[temp.index()].is_some()
+            })
+        {
+            continue;
+        }
+        let local = LocalId(local_count);
+        local_count += 1;
+        local_debug_hints.push(None);
+        local_debug_scopes.push(None);
+        for temp in temps {
+            bound_temp_targets.insert(temp, BoundSlotTarget::Local(local));
+        }
+        if let Some(initial) = output.initial {
+            captured_temp_facts.decl_temps.insert(initial, local);
+        } else {
+            // 不改 entry_local_regs：旧 Entry SSA 读取仍是 nil，只有原输出 Def 写入 holder。
+            new_entry_nil_locals.insert(output.home.slot(), local);
+        }
+        declared_local_home_slots.push((local, output.home));
+    }
+    entry_nil_local_decls.extend(new_entry_nil_locals.into_values());
+
     // 独立词法 cell 可以复用同一物理 `(reg, close epoch)`；activation 只区分绑定，
     // 不伪造新 home。一个 local 若吸收多个物理 key，promotion 仍合流成 Conflict。
     declared_local_home_slots.extend(
@@ -521,18 +617,10 @@ pub(super) fn build_bindings(
         declared_local_home_slots,
         capture_empty_local_decls: captured_temp_facts.empty_decls,
         capture_entry_local_decls: captured_slots.entry_local_decls,
-        debug_entry_local_decls,
+        entry_nil_local_decls,
         capture_region_local_decls: captured_slots.region_local_decls,
         closure_capture_targets: captured_slots.capture_targets,
-        lexical_scopes: lexical_windows::collect_lexical_scopes(
-            proto,
-            cfg,
-            dataflow,
-            graph,
-            structure,
-            emission,
-            captured_slots.lexical_scopes,
-        ),
+        lexical_scopes,
         entry_local_regs,
         numeric_for_locals,
         numeric_binding_copies,

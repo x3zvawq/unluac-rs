@@ -170,11 +170,13 @@ pub fn format_low_instr(instr: &LowInstr) -> String {
         LowInstr::Close(instr) => format!("close from {}", format_reg(instr.from)),
         LowInstr::Tbc(instr) => format!("tbc {}", format_reg(instr.reg)),
         LowInstr::NumericForInit(instr) => format!(
-            "numeric-for-init index={} limit={} step={} binding={} body={} exit={}",
+            "numeric-for-init index={} limit={} step={} binding={} normalizes-controls={} normalizes-binding={} body={} exit={}",
             format_reg(instr.index),
             format_reg(instr.limit),
             format_reg(instr.step),
             format_reg(instr.binding),
+            instr.normalizes_controls,
+            instr.normalizes_binding,
             format_instr_ref(instr.body_target),
             format_instr_ref(instr.exit_target)
         ),

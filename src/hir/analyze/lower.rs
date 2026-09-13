@@ -62,7 +62,7 @@ pub(super) struct ProtoBindings {
     pub(super) declared_local_home_slots: Vec<(LocalId, HomeSlotKey)>,
     pub(super) capture_empty_local_decls: BTreeMap<usize, Vec<LocalId>>,
     pub(super) capture_entry_local_decls: Vec<LocalId>,
-    pub(super) debug_entry_local_decls: Vec<LocalId>,
+    pub(super) entry_nil_local_decls: Vec<LocalId>,
     pub(super) capture_region_local_decls: BTreeMap<crate::structure::RegionId, Vec<LocalId>>,
     pub(super) closure_capture_targets: BTreeMap<(usize, usize), LocalId>,
     pub(super) lexical_scopes: Vec<std::ops::Range<usize>>,
@@ -533,9 +533,19 @@ fn lower_proto_one(
         &mut bindings,
         &mut promotion_facts,
     )?;
-    drop(emission);
+    // 原副本根先发布完整身份，后续帧候选才能按现有绑定拒绝冲突，不能反向覆盖声明的读取目标。
     let copy_root_holders =
         super::bindings::bind_copy_root_holders(&mut bindings, &mut promotion_facts);
+    let reused_frame_locals = super::bindings::bind_reused_frames(
+        proto,
+        cfg,
+        dataflow,
+        structure,
+        &emission,
+        &mut bindings,
+        &mut promotion_facts,
+    );
+    drop(emission);
     super::method_setups::record_method_setup_protocols(
         proto,
         dataflow,
@@ -560,6 +570,11 @@ fn lower_proto_one(
     }
     for &(local, home) in &bindings.declared_local_home_slots {
         promotion_facts.record_local_home_slot(local, home);
+    }
+    // 原声明和 simplify 后的提升都拥有真实 Temp→Local 身份；只记录 home 会使
+    // 完整原写组无法识别已在 lowering 物化的成员，debug nil 因而丢失其帧末端。
+    for (&temp, &local) in &bindings.temp_decl_locals {
+        promotion_facts.record_temp_to_local_merge(temp, local);
     }
     record_loop_binding_local_homes(
         structure.plan(),
@@ -627,6 +642,12 @@ fn lower_proto_one(
     }
     let children = lowering.hir_children();
     let mut inline_dispositions = crate::hir::common::HirInlineDispositions::default();
+    for local in reused_frame_locals {
+        inline_dispositions.preserve_local(
+            local,
+            crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix,
+        );
+    }
     for &temp in lowering
         .captured_shared_closures
         .literal_initializers
@@ -1763,13 +1784,13 @@ fn build_proto_body(
     lowering: &mut ProtoLowering<'_>,
 ) -> Result<HirBlock, HirLowerError> {
     let mut body = build_structured_body(proto, lowering)?;
-    let debug_entry_bindings = std::mem::take(&mut lowering.bindings.debug_entry_local_decls);
-    let mut prefix = if debug_entry_bindings.is_empty() {
+    let entry_nil_bindings = std::mem::take(&mut lowering.bindings.entry_nil_local_decls);
+    let mut prefix = if entry_nil_bindings.is_empty() {
         Vec::new()
     } else {
         vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
-            values: HirValuePack::fixed(vec![HirExpr::Nil; debug_entry_bindings.len()]),
-            bindings: debug_entry_bindings,
+            values: HirValuePack::fixed(vec![HirExpr::Nil; entry_nil_bindings.len()]),
+            bindings: entry_nil_bindings,
             initializer_merge_transaction: None,
         }))]
     };

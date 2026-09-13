@@ -39,7 +39,7 @@ fn clobber_start(
 /// 循环协议的逻辑 binding/control 定义可只在继续边物理写入；退出边仍保留残值。
 fn clears_scratch(instr: &LowInstr, reg: Reg) -> bool {
     match instr {
-        LowInstr::NumericForInit(init) => reg != init.binding || reg == init.index,
+        LowInstr::NumericForInit(init) => init.normalizes_slot(reg),
         // PUC 5.1 FORLOOP 在退出边连内部 index 也不写；其它方言不借此假定清空。
         LowInstr::NumericForLoop(_) => false,
         LowInstr::GenericForLoop(loop_) => reg != loop_.control_target,

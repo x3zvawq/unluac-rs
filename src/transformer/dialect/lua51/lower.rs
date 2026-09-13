@@ -547,6 +547,8 @@ impl<'a> ProtoLowerer<'a> {
                             limit: Reg(index.index() + 1),
                             step: Reg(index.index() + 2),
                             binding: Reg(index.index() + 3),
+                            normalizes_controls: true,
+                            normalizes_binding: false,
                             body_target: TargetPlaceholder::Raw(
                                 self.ensure_targetable_pc(
                                     raw_pc,

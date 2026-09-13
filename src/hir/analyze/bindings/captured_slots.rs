@@ -5,6 +5,8 @@
 //! CLOSE 窗口还区分互斥分支的独立 cell 激活；两个分支都在 r2 捕获并关闭自己的 value，
 //! 不能仅因物理 epoch 相同就共用只在 then 声明的 LocalId。未关闭的共同外层 cell 不拆分。
 //! 共同 cell 的初始化若支配所有捕获与后续写，直接以该写声明；后续 Phi 不另造 nil carrier。
+//! 同一遍捕获枚举也保留全部 capture home 和已接受 debug scope；例如旧 r2 cell 关闭后，
+//! 新的未捕获 `next_first` 可沿自己的 nil 声明绑定，不能被旧 epoch 的捕获永久阻止。
 
 use super::*;
 use crate::structure::SccId;
@@ -19,9 +21,21 @@ pub(super) struct CapturedSlotTargets {
     activation_windows: CapturedActivationWindows,
     pub(super) entry_local_decls: Vec<LocalId>,
     pub(super) region_local_decls: BTreeMap<RegionId, Vec<LocalId>>,
+    captured_homes: BTreeSet<HomeSlotKey>,
+    captured_debug_scopes: BTreeSet<usize>,
 }
 
 impl CapturedSlotTargets {
+    /// 同一 epoch 的未来捕获和同一 source scope 的其它 epoch 都仍交给 capture owner。
+    /// 集合包含不需要分配 cell 的 ByValue/self/loop 捕获，不能用 slot_targets 的缺项证明。
+    pub(super) fn debug_nil_binding_is_uncaptured(&self, home: HomeSlotKey, scope: usize) -> bool {
+        self.home_is_uncaptured(home) && !self.captured_debug_scopes.contains(&scope)
+    }
+
+    pub(super) fn home_is_uncaptured(&self, home: HomeSlotKey) -> bool {
+        !self.captured_homes.contains(&home)
+    }
+
     pub(super) fn target_at(
         &self,
         reg: Reg,
@@ -135,6 +149,8 @@ pub(super) fn collect_captured_slot_targets(
     } = inputs;
     let mut slot_targets = BTreeMap::<CapturedSlotKey, CapturedSlotBinding>::new();
     let mut capture_targets = BTreeMap::new();
+    let mut captured_homes = BTreeSet::new();
+    let mut captured_debug_scopes = BTreeSet::new();
     let mut captured_uses = Vec::new();
     let mut loop_owned_slots = BTreeSet::new();
     for (loop_id, loop_plan) in structure.plan().loops() {
@@ -180,6 +196,16 @@ pub(super) fn collect_captured_slot_targets(
             continue;
         };
         for (capture_index, capture) in closure.captures.iter().enumerate() {
+            if let CaptureSource::ByReference(reg) | CaptureSource::ByValue(reg) = capture.source {
+                let instr = InstrRef(instr_index);
+                captured_homes.insert(HomeSlotKey::new(reg.index(), epochs.epoch_at(reg, instr)));
+                if let Some(fact) = structure
+                    .debug_bindings()
+                    .for_value(dataflow.use_value(instr, reg))
+                {
+                    captured_debug_scopes.insert(fact.scope);
+                }
+            }
             let CaptureSource::ByReference(reg) = capture.source else {
                 continue;
             };
@@ -370,6 +396,8 @@ pub(super) fn collect_captured_slot_targets(
         activation_windows,
         entry_local_decls,
         region_local_decls,
+        captured_homes,
+        captured_debug_scopes,
     }
 }
 

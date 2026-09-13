@@ -1214,8 +1214,8 @@ pub struct HirNumericFor {
     pub step: HirExpr,
     pub body: HirBlock,
     /// 原 protocol 的 index/limit/step home 在 header 求值后由数值循环接管。
-    /// 即使常量准备写已折入表达式，后层也不能把这些槽的旧根跨循环延续。
-    /// 只用于失效旧 home，不授权在 header 求值前释放原值。
+    /// 即使常量准备写已折入表达式，也仍由原源码 for 重发转换与 skip 行为。
+    /// 只用于失效旧显式 home owner，不承诺 skip 边清空全部隐式根或授权提前释放输入。
     pub(super) control_homes: [super::promotion::HomeSlotKey; 3],
     /// 原 FORPREP 的 start/limit/step 值版本，由完整 header 事务消费，不从后层 LocalId 猜测。
     pub(super) control_values: [Option<TempId>; 3],

@@ -11,6 +11,8 @@
 //! receiver 的异槽根和已经签发的独立保活事务不由这条协议退休。
 //! Promotion 另会发布普通 copy root 的单结果 call + 紧邻 MOVE 终点；本层只按 producer / endpoint
 //! temp 与 overwritten home 完整匹配，把它接入同一 local-owner handoff，不从 HIR 相邻文本猜 opcode。
+//! 参数 COPY 也消费已有精确覆盖证书：`copy=parameter; weak[1]=copy; lookup(); copy=nil`
+//! 中 lookup 可改写 parameter，故 copy 必须作为独立根保持到原 nil；先前槽为 nil 不免除这项义务。
 //! allocation 的原覆盖配对不依赖当时是否逃逸：`t={child={}}; publish(t.child)` 中
 //! 子表可以晚于旧槽覆盖才被外部观察。是否消除独立物化由消费事务的完整证明决定。
 //! copy 共享值 identity，
@@ -1813,7 +1815,12 @@ pub(super) fn collect_scalar_gc_root_lifetimes(
         };
         let eligible = temp_is_eligible(temp);
         let incoming_value = match value {
-            HirExpr::ParamRef(_) if facts.overwrites_unknown_scratch(temp) => {
+            HirExpr::ParamRef(_)
+                if facts.overwrites_unknown_scratch(temp)
+                    || facts.copy_root_overwrites(temp).is_some() =>
+            {
+                // 参数在回调中可被 debug.setlocal 改写；独立 COPY 的精确纯覆盖终点
+                // 已由原 owner 证明，不能因目标原先为 nil 就丢弃这个快照根。
                 Some(values.new_value(index, None))
             }
             HirExpr::TempRef(source) if facts.overwrites_unknown_scratch(temp) => Some(

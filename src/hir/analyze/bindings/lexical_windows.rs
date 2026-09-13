@@ -9,6 +9,10 @@
 //! callee 与其它 scratch 消费同一逐槽退休证书；调用帧保活不等于 caller 槽被清空。
 //! 普通 if/else 与完整循环可处于窗口内部；共享图区间查询证明唯一入口、出口，
 //! 冻结 plan 则保证两端仍在实际发射的指令前缀，不能切入已被表达式或循环语法吸收的位置。
+//! Def 与 Phi debug 声明共同构成槽前缀；例如 `do local a=f(); local ok=a==1;
+//! print(ok) end; g()` 中遗漏 ok 会错误拒绝 do，并使后继调用物化额外载体。
+//! Phi 同槽输入只证明该声明值的归属；旧 scratch 的覆盖另外核对全部真实输入写与必经
+//! 合流块，不把 Phi 本身当写。同一源码 scope 内的后续赋值保持原身份，其它覆盖仍拒绝。
 
 use std::ops::Range;
 
@@ -30,13 +34,12 @@ pub(super) fn collect_lexical_scopes(
     // 同一结束点的 local 共同拥有窗口；producer 可以分属 if 前缀和合流后的基本块。
     let mut cohorts = BTreeMap::<_, Vec<&DebugBindingFact>>::new();
     for fact in debug_bindings.accepted() {
-        if let (SsaValue::Def(def), Some(end)) = (fact.value, fact.end_instr)
+        if let Some(end) = fact.end_instr
             && proto.debug_locals[fact.scope].is_source()
+            && let Some(origin) = binding_origin(fact.value, dataflow, cfg)
+            && origin < end.index()
         {
-            let origin = dataflow.def_instr(def).index();
-            if origin < end.index() {
-                cohorts.entry(end.index()).or_default().push(fact);
-            }
+            cohorts.entry(end.index()).or_default().push(fact);
         }
     }
     if cohorts.is_empty() {
@@ -67,6 +70,43 @@ pub(super) fn collect_lexical_scopes(
     retain_non_crossing(scopes)
 }
 
+fn binding_origin(value: SsaValue, dataflow: &DataflowFacts, cfg: &Cfg) -> Option<usize> {
+    match value {
+        SsaValue::Def(def) => Some(dataflow.def_instr(def).index()),
+        SsaValue::Phi(phi) => Some(
+            cfg.blocks[dataflow.phi_candidate(phi)?.block.index()]
+                .instrs
+                .start
+                .index(),
+        ),
+        SsaValue::Entry(_) => None,
+    }
+}
+
+/// 原声明的必经写下界：Phi 本身没有写，只有全部入口都由同槽真实 Def 形成时，
+/// 才可在合流块必经的前提下使用最早输入写。嵌套 Phi/Entry 不冒充物理覆盖。
+fn binding_overwrite_floor(value: SsaValue, dataflow: &DataflowFacts) -> Option<usize> {
+    match value {
+        SsaValue::Def(def) => Some(dataflow.def_instr(def).index()),
+        SsaValue::Phi(id) => {
+            let phi = dataflow.phi_candidate(id)?;
+            let mut earliest = None;
+            for incoming in &phi.incoming {
+                let SsaValue::Def(def) = incoming.value else {
+                    return None;
+                };
+                if dataflow.def_reg(def) != phi.reg {
+                    return None;
+                }
+                let at = dataflow.def_instr(def).index();
+                earliest = Some(earliest.map_or(at, |old: usize| old.min(at)));
+            }
+            earliest
+        }
+        SsaValue::Entry(_) => None,
+    }
+}
+
 fn debug_binding_window(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -84,17 +124,23 @@ fn debug_binding_window(
         return None;
     };
     let mut owners = BTreeMap::new();
+    let mut overwrite_floors = BTreeMap::new();
     let mut origin = end;
     for fact in facts {
-        let SsaValue::Def(def) = fact.value else {
-            unreachable!("cohort contains only definition bindings");
+        let reg = match fact.value {
+            SsaValue::Def(def) => dataflow.def_reg(def),
+            SsaValue::Phi(phi) => dataflow.phi_candidate(phi)?.reg,
+            SsaValue::Entry(_) => return None,
         };
         // 候选拒绝[ProofIncomplete]：canonical 身份若来自其他槽，或同槽存在多个 owner，
         // 不能把 source scope 直接当作该固定定义的生命周期。
-        if dataflow.def_reg(def) != fact.reg || owners.insert(fact.reg, def).is_some() {
+        if reg != fact.reg || owners.insert(fact.reg, *fact).is_some() {
             return None;
         }
-        origin = origin.min(dataflow.def_instr(def).index());
+        origin = origin.min(binding_origin(fact.value, dataflow, cfg)?);
+        if let Some(at) = binding_overwrite_floor(fact.value, dataflow) {
+            overwrite_floors.insert(fact.reg, (at, fact.declaration_block?));
+        }
     }
     let (&floor, _) = owners.first_key_value()?;
     let (&ceiling, _) = owners.last_key_value()?;
@@ -121,29 +167,63 @@ fn debug_binding_window(
     if entry != exit
         && (!graph.closed_instruction_window(cfg, window.clone())
             || !window_emission_is_local(cfg, emission, &window)
-            || owners
-                .values()
-                .any(|&def| !graph.dominates(dataflow.def_block(def), exit)))
+            || owners.values().any(|fact| {
+                fact.declaration_block
+                    .is_none_or(|block| !graph.dominates(block, exit))
+            }))
     {
         return None;
     }
     // 调用排除上界与必经覆盖写共同证明末端退休；高槽不需要再重建 for 的动态值类型。
     let home_retires = |reg: Reg, at: usize, block: BlockRef| {
         final_observation.excludes_home_from_caller(reg)
-            || owners.get(&reg).is_some_and(|owner| {
-                dataflow.def_instr(*owner).index() > at
-                    && graph.post_dominates(dataflow.def_block(*owner), block)
-            })
+            || overwrite_floors
+                .get(&reg)
+                .is_some_and(|&(first_write, merge)| {
+                    first_write > at && graph.post_dominates(merge, block)
+                })
     };
     let local_phis = dataflow.closed_phis_in_instruction_window(cfg, window.clone(), floor)?;
+    // 已接受的 Phi 声明拥有同槽输入形成的值。每个邻接边只遍历一次，闭包仍须完整
+    // 位于该窗口；不能把其它槽的 COPY 源根或窗口外的 Entry 一起认作声明身份。
+    let mut owned_phis = BTreeSet::new();
+    let mut owned_defs = BTreeSet::new();
+    let mut pending = owners
+        .values()
+        .filter_map(|fact| match fact.value {
+            SsaValue::Phi(phi) => Some(phi),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        if !owned_phis.insert(id) {
+            continue;
+        }
+        if !local_phis.contains(&id) {
+            return None;
+        }
+        let phi = dataflow.phi_candidate(id)?;
+        for incoming in &phi.incoming {
+            match incoming.value {
+                SsaValue::Def(def) if dataflow.def_reg(def) == phi.reg => {
+                    owned_defs.insert(def);
+                }
+                SsaValue::Phi(source) if dataflow.phi_candidate(source)?.reg == phi.reg => {
+                    pending.push(source);
+                }
+                _ => return None,
+            }
+        }
+    }
     for &id in &local_phis {
         let phi = dataflow.phi_candidate(id)?;
         if dataflow.reg_is_reference_captured(phi.reg)
-            || !home_retires(
-                phi.reg,
-                cfg.blocks[phi.block.index()].instrs.start.index(),
-                phi.block,
-            )
+            || (!owned_phis.contains(&id)
+                && !home_retires(
+                    phi.reg,
+                    cfg.blocks[phi.block.index()].instrs.start.index(),
+                    phi.block,
+                ))
         {
             return None;
         }
@@ -208,12 +288,27 @@ fn debug_binding_window(
                 return None;
             }
             let owner = owners.get(&reg);
-            let is_owner = owner == Some(&def);
-            // 候选拒绝[ProofIncomplete]：禁止声明后的 owner 槽复写、未结束的异期 binding、
+            let is_owner = owner.is_some_and(|fact| fact.value == SsaValue::Def(def))
+                || owned_defs.contains(&def);
+            let source_write = owner.is_some_and(|fact| {
+                let pcs = &proto.lowering_map.pc_map()[index];
+                !pcs.is_empty()
+                    && pcs.iter().all(|pc| {
+                        proto
+                            .debug_locals
+                            .source_at(reg, *pc)
+                            .is_some_and(|(scope, _)| scope == fact.scope)
+                    })
+            });
+            // 候选拒绝[ProofIncomplete]：禁止未归属源码身份的 owner 槽复写、未结束的异期 binding、
             // 捕获 cell 和逃逸 def/phi；窗口不能吞掉其他生命周期或延续其值身份。
-            if (owner.is_some_and(|owner| dataflow.def_instr(*owner).index() <= index) && !is_owner)
+            if (owner.is_some_and(|owner| {
+                binding_origin(owner.value, dataflow, cfg).is_none_or(|at| at <= index)
+            }) && !is_owner
+                && !source_write)
                 || dataflow.reg_is_reference_captured(reg)
                 || (!is_owner
+                    && !source_write
                     && debug_bindings
                         .for_value(SsaValue::Def(def))
                         .is_some_and(|binding| {
@@ -222,8 +317,8 @@ fn debug_binding_window(
                                     binding_end.index() > end
                                         || (!final_observation.excludes_home_from_caller(reg)
                                             && owner.is_none_or(|owner| {
-                                                binding_end.index()
-                                                    > dataflow.def_instr(*owner).index()
+                                                binding_origin(owner.value, dataflow, cfg)
+                                                    .is_none_or(|at| binding_end.index() > at)
                                             }))
                                 })
                         }))
@@ -236,7 +331,7 @@ fn debug_binding_window(
             {
                 return None;
             }
-            let retained = if is_owner {
+            let retained = if is_owner || source_write {
                 true
             } else {
                 match instr {
@@ -251,7 +346,7 @@ fn debug_binding_window(
                     }
                     LowInstr::Move(mov) => match dataflow.use_value(InstrRef(index), mov.src) {
                         SsaValue::Def(source) => retained_defs.contains(&source),
-                        SsaValue::Phi(_) => false,
+                        SsaValue::Phi(phi) => owned_phis.contains(&phi),
                         SsaValue::Entry(_) => return None,
                     },
                     _ => false,

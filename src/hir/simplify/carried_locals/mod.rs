@@ -53,6 +53,7 @@ use super::label_refs::count_label_references;
 use super::temp_touch::collect_temp_touch_positions;
 use super::walk::for_each_nested_block_mut;
 
+pub(super) use self::adjacent::adjacent_nil_initializer_bindings;
 use self::adjacent::{try_collapse_adjacent_local_seed_handoff, try_collapse_guarded_local_update};
 use self::binding::{
     BindingProtection, binding_home_slot, bindings_may_share_raw_home_slot,

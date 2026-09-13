@@ -20,7 +20,7 @@
 //! 被同槽惰性常量覆盖时可丢弃结果，但必须同时保留调用帧与随后声明，不能只删 producer。
 
 use super::*;
-use crate::hir::common::{HirBinding, HirInlineRetentionReason, HirLocalDecl};
+use crate::hir::common::{HirBinding, HirInlineRetentionReason, HirLocalDecl, TempId};
 use crate::hir::simplify::mention::{BindingReadCollector, BindingWriteCollector};
 use crate::hir::visit::visit_stmts;
 
@@ -197,8 +197,15 @@ fn validate_plan_batch(
         .iter()
         .map(Plan::prefix_request)
         .collect::<BTreeMap<_, _>>();
-    let preserved =
-        prefix::validate_prefixes(proto, facts, dialect, is_chunk_entry, removed, &candidates)?;
+    let preserved = prefix::validate_prefixes(
+        proto,
+        facts,
+        dialect,
+        is_chunk_entry,
+        removed,
+        &candidates,
+        false,
+    )?;
     let retained = plans
         .iter()
         .flat_map(|plan| {
@@ -1065,16 +1072,18 @@ fn numeric_header_base(
     for_: &crate::hir::common::HirNumericFor,
     dialect: DecompileDialect,
 ) -> Option<HomeSlotKey> {
-    // 候选拒绝[ProofIncomplete]：Luau 控制槽不是 start/limit/step 顺序；PUC/JIT 连续槽由下面核对。
-    // JIT 的 FR2 调用帧隙仍由 FrameBuilder.call 的原 args.start 消费，不改变三个控制值的槽序。
-    if dialect == DecompileDialect::Luau {
-        return None;
-    }
-    let base = for_.control_homes[0];
+    // Luau 的物理顺序是 limit/step/index，求值顺序仍为 start/limit/step。
+    // JIT 的 FR2 帧隙由 FrameBuilder.call 消费，不改变三个控制值的槽序。
+    let order = if dialect == DecompileDialect::Luau {
+        [2, 0, 1]
+    } else {
+        [0, 1, 2]
+    };
+    let base = for_.control_homes[usize::from(dialect == DecompileDialect::Luau)];
     for_.control_homes
         .iter()
         .enumerate()
-        .all(|(offset, home)| *home == HomeSlotKey::new(base.slot() + offset, 0))
+        .all(|(offset, home)| *home == HomeSlotKey::new(base.slot() + order[offset], 0))
         .then_some(base)
 }
 
@@ -1103,20 +1112,35 @@ fn numeric_for_plan(
         return None;
     }
     let mut builder = frame_builder(context, run, facts, dialect, base.slot())?;
+    let luau_top = if dialect == DecompileDialect::Luau {
+        Some(facts.numeric_for_body_frame(for_)?.binding.slot() + 1)
+    } else {
+        None
+    };
     let mut values = Vec::with_capacity(3);
     for (offset, value) in [&for_.start, &for_.limit, &for_.step]
         .into_iter()
         .enumerate()
     {
-        values.push(builder.expr(
-            value,
-            run.len(),
-            base.slot() + offset,
-            None,
-            false,
-            true,
-            for_.control_values[offset],
-        )?);
+        values.push(if let Some(top) = luau_top {
+            luau_numeric_control(
+                &mut builder,
+                value,
+                for_.control_homes[offset],
+                for_.control_values[offset],
+                top,
+            )?
+        } else {
+            builder.expr(
+                value,
+                run.len(),
+                base.slot() + offset,
+                None,
+                false,
+                true,
+                for_.control_values[offset],
+            )?
+        });
     }
     let start = builder.first_event?;
     if builder.next_event != run.len() {
@@ -1133,6 +1157,125 @@ fn numeric_for_plan(
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
+}
+
+/// compileStatFor 先预留控制区与可写 index，再以 compileExprTemp 求三个值。
+/// 只有 top-1 目标上的 CALL 原位返回，其余 CALL 在 top 返回并紧邻 MOVE 到控制槽。
+/// 控制 COPY 在循环语法中重发，不使用“后缀仍保留 COPY”的另一种证书。
+fn luau_numeric_control(
+    builder: &mut FrameBuilder<'_>,
+    value: &HirExpr,
+    target: HomeSlotKey,
+    original: Option<TempId>,
+    top: usize,
+) -> Option<HirExpr> {
+    let definition = match value {
+        HirExpr::TempRef(temp) => Some((
+            HirBinding::Temp(*temp),
+            *builder.temp_definitions.get(temp)?,
+        )),
+        HirExpr::LocalRef(local)
+            if builder.facts.trusted_local_home_slot(*local)?.slot() >= builder.base =>
+        {
+            Some((
+                HirBinding::Local(*local),
+                builder.definition(*local, builder.run.len())?,
+            ))
+        }
+        _ => None,
+    };
+    let expression = if let Some((_, index)) = definition {
+        scalar_binding(builder.run[index])?.1
+    } else {
+        value
+    };
+    let HirExpr::Call(call) = expression else {
+        return builder.expr(
+            value,
+            builder.run.len(),
+            target.slot(),
+            None,
+            false,
+            true,
+            original,
+        );
+    };
+    let facts = builder.facts;
+    let frame = facts.native_call_frame(call)?;
+    let producer = facts.operation_result_temp(call.source_site?)?;
+    let original = original?;
+    let slot = if target.slot() + 1 == top {
+        target.slot()
+    } else {
+        top
+    };
+    if frame.home != HomeSlotKey::new(slot, 0)
+        || facts.trusted_temp_home_slot(original) != Some(target)
+        || facts
+            .complete_temp_non_move_write_homes(producer)
+            .iter()
+            .any(|home| *home != frame.home)
+    {
+        return None;
+    }
+    let moves = facts.trusted_immediate_moves(producer)?;
+    if target == frame.home {
+        if original != producer || !moves.is_empty() {
+            return None;
+        }
+    } else if !matches!(moves, [copy] if copy.source == Some(producer)
+        && copy.source_home == frame.home && copy.target == original && copy.target_home == target)
+    {
+        return None;
+    }
+    if facts
+        .complete_temp_definition_write_homes(producer)
+        .iter()
+        .any(|home| *home != frame.home && *home != target)
+    {
+        return None;
+    }
+    let before = if let Some((binding, index)) = definition {
+        if index < builder.next_event {
+            return None;
+        }
+        let context = builder.native?;
+        match binding {
+            HirBinding::Temp(temp) => {
+                if (temp != producer && temp != original)
+                    || context.proto.inline_dispositions.temp(temp).must_preserve()
+                {
+                    return None;
+                }
+            }
+            HirBinding::Local(local) => {
+                if (facts.promoted_local_for_temp(producer) != Some(local)
+                    && facts.promoted_local_for_temp(original) != Some(local))
+                    || context.proto.local_debug_scopes[local.index()].is_some()
+                    || context.proto.local_debug_hints[local.index()].is_some()
+                    || context
+                        .proto
+                        .inline_dispositions
+                        .local(local)
+                        .must_preserve()
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        if context.closed.contains(&target) || context.closed.contains(&frame.home) {
+            return None;
+        }
+        index
+    } else {
+        builder.run.len()
+    };
+    let call = builder.call(call, before, slot, false, CallWidth::Single)?;
+    if let Some((_, index)) = definition {
+        builder.finish_event(index)?;
+    }
+    Some(HirExpr::Call(Box::new(call)))
 }
 
 fn plan(
@@ -1196,8 +1339,13 @@ fn fastcall_plan(
     {
         return fastcall_open_plan(context, run, facts, dialect, sink, call, width);
     }
-    if matches!(width, CallWidth::Single | CallWidth::Ignore) && fastcall_has_copy_arguments(call) {
-        return fastcall_copy_arguments_plan(context, run, facts, dialect, sink, call, width);
+    if matches!(width, CallWidth::Single | CallWidth::Ignore)
+        && (fastcall_has_copy_arguments(call)
+            || matches!(call.fastcall,
+                Some(crate::transformer::FastCallProtocol::Mask { builtin, .. })
+                    if builtin != 1 || matches!(width, CallWidth::Single)))
+    {
+        return fastcall_fixed_arguments_plan(context, run, facts, dialect, sink, call, width);
     }
     // Luau Bytecode.h 的 LBF_ASSERT = 1；保留原编号，不凭 fallback 名字猜内建语义。
     let protocol @ crate::transformer::FastCallProtocol::Mask {
@@ -1542,7 +1690,8 @@ fn fastcall_callee_is_named(callee: &HirExpr) -> bool {
 /// 非 direct 参数保持快速路径的低槽直读和 fallback 的逐参数 COPY，然后才求 callee。
 /// direct 参数先按原槽准备，嵌入常量在 fallback 才 LOADK；不按当前语句位置任意排序。
 /// 这两条路径必须一起恢复；不能按普通 CALL 的 callee-first 顺序提前移动参数准备。
-fn fastcall_copy_arguments_plan(
+/// 全 direct 参数使用同一准备协议；是否存在 COPY 不决定表分配事务的恢复资格。
+fn fastcall_fixed_arguments_plan(
     context: NativeFrameContext<'_>,
     run: &[&HirStmt],
     facts: &ProtoPromotionFacts,
@@ -1628,8 +1777,13 @@ fn fastcall_copy_arguments_plan(
                 // CALL 的单结果与完整原槽准备由 builder.call 签证；direct 阶段仍先于
                 // fallback COPY/lookup，不能借此移动未纳入同一事务的根释放。
                 let call = !embedded && matches!(value, HirExpr::Call(_));
+                // compileExprFastcallN 对非 local 参数调用 compileExprTempTop；已有
+                // builder 证明表字段/事件，原 allocation 还须落在当前 direct 参数槽。
+                let table = !embedded
+                    && matches!(&value, HirExpr::TableConstructor(table)
+                        if facts.allocation_result_home(table).is_some_and(|home| home.slot() == slot));
                 // 嵌入常量不能变成有事件的 RHS；其余表达式尚无此准备协议的证明。
-                if !literal && !lookup && !call {
+                if !literal && !lookup && !call && !table {
                     return None;
                 }
                 arguments[index] = Some(value);

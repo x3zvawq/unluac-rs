@@ -822,6 +822,7 @@ impl<'a> ProtoLowerer<'a> {
                         &mut self.lowering,
                         raw_index,
                         regs,
+                        false,
                         body_target,
                         exit_target,
                     );

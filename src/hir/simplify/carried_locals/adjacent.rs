@@ -34,6 +34,33 @@ use super::prune::{
 };
 use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in_expr};
 
+/// 原无读取 nil 写可由紧邻 empty declaration 的同一次 nil 初始化承接。
+/// 不合并两个值 epoch、不改写后缀；调用方证明原组完整且所有源 Temp 无 read/capture。
+/// 与一般 seed/carried handoff 不同，两次相邻初始化都写 nil，因此无需逐候选扫描后缀。
+pub(in crate::hir::simplify) fn adjacent_nil_initializer_bindings(
+    temps: &[crate::hir::common::TempId],
+    next: &HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> Option<Vec<LocalId>> {
+    let HirStmt::LocalDecl(decl) = next else {
+        return None;
+    };
+    if decl.bindings.len() != temps.len()
+        || !decl.values.is_empty()
+        || decl.initializer_merge_transaction.is_some()
+        || !temps.iter().zip(&decl.bindings).all(|(temp, local)| {
+            bindings_share_exact_home_slot(
+                CarryBinding::Temp(*temp),
+                CarryBinding::Local(*local),
+                facts,
+            )
+        })
+    {
+        return None;
+    }
+    Some(decl.bindings.clone())
+}
+
 pub(super) fn try_collapse_guarded_local_update(
     block: &mut HirBlock,
     index: usize,

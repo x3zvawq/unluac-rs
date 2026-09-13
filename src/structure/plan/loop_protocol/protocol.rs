@@ -220,6 +220,7 @@ pub(super) fn freeze_numeric_for_protocol(
             "numeric-for control owns multiple loop instructions",
         ));
     }
+    validate_normalized_numeric_controls(dataflow, instr, init, loop_instr)?;
     Ok(NumericForProtocol {
         init_instr: instr,
         loop_instr,
@@ -234,6 +235,46 @@ pub(super) fn freeze_numeric_for_protocol(
             proto, cfg, dataflow, preheader, init, loop_instr,
         ),
     })
+}
+
+/// FORPREP 的原位转换由源码 for 隐式执行，不存在可供普通语句读取的转换结果 Temp。
+/// 例如字符串 step 在准备后成为数字，只能继续交给同一 latch；把新的 SSA Def 映射回
+/// header 输入会恢复成字符串。Phi 的通用 control 分类只证明使用区域，不能证明它仍是
+/// 同一转换值，因此没有独立值归属的合流必须在协议发布处拒绝，而不是留给 HIR 猜测。
+fn validate_normalized_numeric_controls(
+    dataflow: &DataflowFacts,
+    init_instr: InstrRef,
+    init: &crate::transformer::NumericForInitInstr,
+    loop_instr: Option<InstrRef>,
+) -> Result<(), StructureError> {
+    if !init.normalizes_controls {
+        return Ok(());
+    }
+    for reg in [init.limit, init.step] {
+        let def = dataflow.instr_def_for_reg(init_instr, reg).ok_or_else(|| {
+            StructureError::invalid(format!(
+                "numeric-for normalization at {init_instr} has no definition for {reg}",
+            ))
+        })?;
+        if let Some(site) = dataflow.def_uses[def.index()]
+            .iter()
+            .find(|site| Some(site.instr) != loop_instr || site.reg != reg)
+        {
+            return Err(StructureError::invalid(format!(
+                "normalized numeric-for control {reg} at {init_instr} has an unowned value read at {}",
+                site.instr,
+            )));
+        }
+        if dataflow.def_phi_uses[def.index()]
+            .iter()
+            .any(|&phi| !dataflow.phi_is_truly_dead(phi))
+        {
+            return Err(StructureError::invalid(format!(
+                "normalized numeric-for control {reg} at {init_instr} enters an SSA merge without a source value owner",
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 独立控制 index 后的可写用户槽是原 VM-for 协议的一部分，不是任意 body COPY。

@@ -232,6 +232,7 @@ pub(crate) fn emit_numeric_for_init(
     lowering: &mut PendingLoweringState,
     raw_index: usize,
     regs: NumericForRegs,
+    normalizes_controls: bool,
     body_target: usize,
     exit_target: usize,
 ) {
@@ -243,6 +244,8 @@ pub(crate) fn emit_numeric_for_init(
             limit: regs.limit,
             step: regs.step,
             binding: regs.binding,
+            normalizes_controls,
+            normalizes_binding: false,
             body_target: TargetPlaceholder::Raw(body_target),
             exit_target: TargetPlaceholder::Raw(exit_target),
         },

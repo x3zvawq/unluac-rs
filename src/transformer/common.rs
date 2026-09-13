@@ -852,8 +852,21 @@ pub struct NumericForInitInstr {
     pub limit: Reg,
     pub step: Reg,
     pub binding: Reg,
+    /// 所有正常后继（含零次迭代）都已原位数值化 index/limit/step；错误路径不在此合同内。
+    /// Lua 5.4/5.5 可在转换写回前跳过循环，不能发布这个 must-def 证明。
+    pub normalizes_controls: bool,
+    /// 所有正常后继都已把用户 binding 原位数值化；不能从 body 的逻辑 Def 反推 skip 写入。
+    pub normalizes_binding: bool,
     pub body_target: InstrRef,
     pub exit_target: InstrRef,
+}
+
+impl NumericForInitInstr {
+    /// 只回答该原物理槽的全正常路径保证，不表示异常路径或整个对象已退休。
+    pub(crate) fn normalizes_slot(self, reg: Reg) -> bool {
+        (self.normalizes_controls && (reg == self.index || reg == self.limit || reg == self.step))
+            || (self.normalizes_binding && reg == self.binding)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
