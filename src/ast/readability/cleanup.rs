@@ -648,7 +648,10 @@ fn trailing_do_block_is_scope_neutral(
 ) -> bool {
     let Some(repeat_lifetime) = repeat_lifetime else {
         if block.stmts.iter().any(|stmt| {
-            stmt_declares_debug_binding(stmt) || stmt_declares_hir_preserved_binding(stmt)
+            stmt_declares_debug_binding(stmt)
+                || stmt
+                    .local_bindings()
+                    .any(|binding| !binding.rewrite_authority.may_merge_tail_scope())
         }) {
             // 候选拒绝[SemanticBarrier:DebugScope]：函数 Return hook 可以在 return event
             // 观察直属 local。拍平尾 do 会把原本在 Return 前结束的 debug local 延长到
@@ -727,11 +730,6 @@ fn trailing_do_block_is_scope_neutral(
 fn stmt_declares_debug_binding(stmt: &AstStmt) -> bool {
     stmt.local_bindings()
         .any(|binding| binding.origin.is_debug_hinted())
-}
-
-fn stmt_declares_hir_preserved_binding(stmt: &AstStmt) -> bool {
-    stmt.local_bindings()
-        .any(|binding| binding.rewrite_authority.must_preserve())
 }
 
 fn closure_target_needs_scope_barrier(

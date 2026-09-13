@@ -1,5 +1,7 @@
 -- 05 的返回值在 __close 前求值；正常退出与错误展开都只关闭一次。
 -- unluac: expect-contains [[<close>]]
+-- unluac: expect-contains [[.name .. ":" .. tostring(]]
+-- unluac: expect-not-contains [[= tostring(]]
 local function make_resource(log)
     local resource <close> = setmetatable({name = "buffer"}, {
         __close = function(value, message)

@@ -974,13 +974,7 @@ fn verify_proto_body_preparation_contract(
         .copied()
         .ok_or_else(|| fail("body preparation fixture needs a direct child".into()))?;
     let missing = HirProtoRef(original.protos.len());
-    let closure = |proto| {
-        HirExpr::Closure(Box::new(HirClosureExpr {
-            creation: None,
-            proto,
-            captures: Vec::new(),
-        }))
-    };
+    let closure = |proto| HirExpr::Closure(Box::new(HirClosureExpr::synthetic(proto, Vec::new())));
     let return_values =
         |values| HirStmt::Return(Box::new(HirReturn::synthetic(HirValuePack::fixed(values))));
     let residual = || {

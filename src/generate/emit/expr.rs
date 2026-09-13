@@ -6,7 +6,7 @@
 //! 例如：`AstExpr::SingleValue(call)` 会在这里带括号输出成单值调用表达式；Luau vector
 //! 只消费显式宿主构造器配置，不从 bytecode 猜 API 名。
 
-use crate::ast::pretty::{preferred_negated_relational_render, preferred_relational_render};
+use crate::ast::pretty::preferred_negated_relational_render;
 use crate::ast::{
     AstCallExpr, AstCallKind, AstExpr, AstFieldAccess, AstFunctionExpr, AstFunctionName,
     AstIndexAccess, AstLValue, AstLogicalExpr, AstMethodCallExpr, AstNamePath, AstNameRef,
@@ -263,16 +263,7 @@ impl<'a> Emitter<'a> {
             };
             let ((prec, assoc, op), lhs, rhs) = match expr {
                 AstExpr::Binary(binary) => {
-                    let (prec, assoc, op) = binary_meta(binary.op);
-                    if let Some(preferred) = preferred_relational_render(binary) {
-                        (
-                            (prec, assoc, preferred.op_text),
-                            Some(preferred.lhs),
-                            Some(preferred.rhs),
-                        )
-                    } else {
-                        ((prec, assoc, op), Some(&binary.lhs), Some(&binary.rhs))
-                    }
+                    (binary_meta(binary.op), Some(&binary.lhs), Some(&binary.rhs))
                 }
                 AstExpr::Unary(unary) => {
                     if let Some(preferred) = preferred_negated_relational_render(unary) {

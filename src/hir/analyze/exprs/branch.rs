@@ -5,9 +5,11 @@
 //! 例如：`if not r0 then ...` 会先在这里得到 `not r0` 的表达式形式。
 //! Subject 同时签发原 operand / 合成 predicate 来源：比较结果虽为 Boolean，
 //! 条件跳转本身并不证明发生过 Boolean 值写回，后续 Decision 不能混用这两种事实。
+//! 原右侧快照早于左侧 CALL 时，使用显式 Gt/Ge 保存准备顺序。例如原 `global > f()`
+//! 的 VM 谓词是 LT(call_result, global_snapshot)；HIR 不能强制留下占槽到分支内的别名。
 
 use super::*;
-use crate::hir::common::HirSourceSite;
+use crate::hir::common::{HirSourceSite, TempId};
 
 pub(crate) fn lower_branch_cond(
     lowering: &ProtoLowering<'_>,
@@ -44,6 +46,7 @@ pub(crate) fn lower_branch_subject(
             instr: instr_ref,
         },
         cond,
+        comparison_reads_right_first(lowering, instr_ref, cond),
         |operand| lower_cond_operand(lowering, block, instr_ref, operand),
     )
 }
@@ -65,6 +68,7 @@ pub(crate) fn lower_branch_subject_single_eval(
             instr: instr_ref,
         },
         cond,
+        comparison_reads_right_first(lowering, instr_ref, cond),
         |operand| lower_cond_operand_single_eval(lowering, block, instr_ref, operand),
     )
 }
@@ -99,9 +103,176 @@ pub(in crate::hir::analyze) fn branch_call_result_root_ends_after_test(
                 .call_result_root_ends_after_value_use(lowering.bindings.fixed_temps[def.index()]))
 }
 
+/// 原内嵌字面量不占准备槽，可以右置；其余只恢复同块、单用且无开放引用的读取
+/// 快照→CALL。已有源码 local、Phi、MOVE 或跨块值不靠指令号排序；方向改变不删除
+/// producer，后续内联仍消费原事件与根事务。
+fn comparison_reads_right_first(
+    lowering: &ProtoLowering<'_>,
+    instr: InstrRef,
+    cond: BranchCond,
+) -> bool {
+    let BranchSubject::Compare {
+        predicate: BranchPredicate::Lt | BranchPredicate::Le,
+        lhs,
+        rhs: CondOperand::Reg(rhs),
+    } = cond.subject
+    else {
+        return false;
+    };
+    let CondOperand::Reg(lhs) = lhs else {
+        return match lhs {
+            CondOperand::Integer(_) | CondOperand::Number(_) => true,
+            CondOperand::Const(key) => matches!(
+                lowering.proto.constants.get(key.index()),
+                Some(
+                    RawLiteralConst::Integer(_)
+                        | RawLiteralConst::Number(_)
+                        | RawLiteralConst::String(_)
+                )
+            ),
+            _ => false,
+        };
+    };
+    let block = lowering.cfg.instr_to_block[instr.index()];
+    let anonymous_single_use = |def: DefId| {
+        let temp = lowering.bindings.fixed_temps[def.index()];
+        let uses = &lowering.dataflow.def_uses[def.index()];
+        temp == TempId(def.index())
+            && matches!(lowering.bindings.expr_for_temp(temp), HirExpr::TempRef(_))
+            && lowering.bindings.temp_debug_locals[temp.index()].is_none()
+            && uses.len() == 1
+            && uses[0].instr == instr
+            && lowering.dataflow.def_phi_uses[def.index()].is_empty()
+    };
+    let literal_load = |site: InstrRef| match &lowering.proto.instrs[site.index()] {
+        LowInstr::LoadInteger(_) | LowInstr::LoadNumber(_) => true,
+        LowInstr::LoadConst(load) => matches!(
+            lowering.proto.constants.get(load.value.index()),
+            Some(
+                RawLiteralConst::Integer(_)
+                    | RawLiteralConst::Number(_)
+                    | RawLiteralConst::String(_)
+            )
+        ),
+        _ => false,
+    };
+    let direct_home = |reg| {
+        let value = lowering.dataflow.use_value(instr, reg);
+        let expression = if let Some(local) = lowering.bindings.local_for_reg_in_block(block, reg) {
+            HirExpr::LocalRef(local)
+        } else {
+            match value {
+                SsaValue::Def(def) => lowering
+                    .bindings
+                    .expr_for_temp(lowering.bindings.fixed_temps[def.index()]),
+                SsaValue::Phi(phi) => lowering.bindings.expr_for_phi(phi),
+                SsaValue::Entry(_) => {
+                    HirExpr::ParamRef(*lowering.bindings.params.get(reg.index())?)
+                }
+            }
+        };
+        match expression {
+            HirExpr::LocalRef(local) => lowering.promotion_facts.trusted_local_home_slot(local),
+            HirExpr::ParamRef(param) => lowering.promotion_facts.trusted_param_home_slot(param),
+            HirExpr::TempRef(temp)
+                if match value {
+                    // Phi/carried 身份及已有其它消费者的值不是一次新 operand 准备。
+                    // 它们可能到 AST 才物化；原共享绑定身份不依赖 HIR locals pass 的时点。
+                    SsaValue::Phi(_) => true,
+                    SsaValue::Def(def) => {
+                        temp != TempId(def.index())
+                            || lowering.dataflow.def_uses[def.index()].len() > 1
+                            || !lowering.dataflow.def_phi_uses[def.index()].is_empty()
+                    }
+                    SsaValue::Entry(_) => false,
+                } =>
+            {
+                lowering.promotion_facts.trusted_temp_home_slot(temp)
+            }
+            _ => None,
+        }
+        .filter(|home| home.slot() == reg.index())
+    };
+    let Some(layout) = lowering
+        .promotion_facts
+        .native_binary_layout_at(HirSourceSite {
+            proto: lowering.id,
+            instr,
+        })
+    else {
+        return false;
+    };
+    let left_value = lowering.dataflow.use_value(instr, lhs);
+    let right_value = lowering.dataflow.use_value(instr, rhs);
+    let available_before = |value, preparation: InstrRef| match value {
+        SsaValue::Def(def) => {
+            lowering.dataflow.def_block(def) != block
+                || lowering.dataflow.def_instr(def).index() < preparation.index()
+        }
+        SsaValue::Phi(_) | SsaValue::Entry(_) => true,
+    };
+    // 既有低槽引用不复制到 scratch。常量输入或 Length 结果仍在原高槽准备，
+    // 因此可按 `value > constant` / `#value >= index` 发射，且不改变任何准备写。
+    if let SsaValue::Def(left) = left_value
+        && lowering.dataflow.def_block(left) == block
+        && anonymous_single_use(left)
+        && literal_load(lowering.dataflow.def_instr(left))
+        && available_before(right_value, lowering.dataflow.def_instr(left))
+        && let Some(right) = direct_home(rhs)
+        && layout.rhs == Some(right)
+        && layout.lhs.is_some_and(|left| right.slot() < left.slot())
+    {
+        return true;
+    }
+    if let SsaValue::Def(right) = right_value
+        && lowering.dataflow.def_block(right) == block
+        && anonymous_single_use(right)
+        && available_before(left_value, lowering.dataflow.def_instr(right))
+        && matches!(&lowering.proto.instrs[lowering.dataflow.def_instr(right).index()],
+            LowInstr::UnaryOp(unary) if unary.op == UnaryOpKind::Length)
+        && let Some(left) = direct_home(lhs)
+        && layout.lhs == Some(left)
+        && layout.rhs.is_some_and(|right| left.slot() < right.slot())
+    {
+        return true;
+    }
+    let (SsaValue::Def(left), SsaValue::Def(right)) = (left_value, right_value) else {
+        return false;
+    };
+    let left_site = lowering.dataflow.def_instr(left);
+    let right_site = lowering.dataflow.def_instr(right);
+    if lowering.dataflow.def_block(right) != block || lowering.dataflow.def_block(left) != block {
+        return false;
+    }
+    // `f() > 1000` 的 LOADK 在 CALL 之后；打印成 `1000 < f()` 会把该物理准备
+    // 移到调用前。此处保留原方向，不能因为常量值可重排就忽略它原来占用的槽。
+    if right_site.index() < left_site.index()
+        && matches!(lowering.proto.instrs[right_site.index()], LowInstr::Call(_))
+        && anonymous_single_use(left)
+        && anonymous_single_use(right)
+        && literal_load(left_site)
+    {
+        return true;
+    }
+    right_site.index() < left_site.index()
+        && anonymous_single_use(right)
+        && matches!(lowering.proto.instrs[left_site.index()], LowInstr::Call(_))
+        && matches!(
+            lowering.proto.instrs[right_site.index()],
+            LowInstr::GetTable(_)
+        )
+        && lowering
+            .promotion_facts
+            .operation_result_reference_unaliased(HirSourceSite {
+                proto: lowering.id,
+                instr: right_site,
+            })
+}
+
 fn lower_branch_subject_with(
     source: HirSourceSite,
     cond: BranchCond,
+    reads_right_first: bool,
     mut lower_operand: impl FnMut(CondOperand) -> HirExpr,
 ) -> (HirExpr, crate::hir::HirDecisionTestSource) {
     use crate::hir::HirDecisionTestSource;
@@ -111,19 +282,38 @@ fn lower_branch_subject_with(
             predicate,
             lhs,
             rhs,
-        } => (
-            HirExpr::Binary(Box::new(HirBinaryExpr {
-                source_site: Some(source),
-                op: match predicate {
-                    BranchPredicate::Eq => HirBinaryOpKind::Eq,
-                    BranchPredicate::Lt => HirBinaryOpKind::Lt,
-                    BranchPredicate::Le => HirBinaryOpKind::Le,
-                },
-                lhs: lower_operand(lhs),
-                rhs: lower_operand(rhs),
-            })),
-            HirDecisionTestSource::Predicate,
-        ),
+        } => {
+            let (op, lhs, rhs) = if reads_right_first {
+                (
+                    match predicate {
+                        BranchPredicate::Lt => HirBinaryOpKind::Gt,
+                        BranchPredicate::Le => HirBinaryOpKind::Ge,
+                        BranchPredicate::Eq => unreachable!("equality has no reversed ordering"),
+                    },
+                    rhs,
+                    lhs,
+                )
+            } else {
+                (
+                    match predicate {
+                        BranchPredicate::Eq => HirBinaryOpKind::Eq,
+                        BranchPredicate::Lt => HirBinaryOpKind::Lt,
+                        BranchPredicate::Le => HirBinaryOpKind::Le,
+                    },
+                    lhs,
+                    rhs,
+                )
+            };
+            (
+                HirExpr::Binary(Box::new(HirBinaryExpr {
+                    source_site: Some(source),
+                    op,
+                    lhs: lower_operand(lhs),
+                    rhs: lower_operand(rhs),
+                })),
+                HirDecisionTestSource::Predicate,
+            )
+        }
     }
 }
 

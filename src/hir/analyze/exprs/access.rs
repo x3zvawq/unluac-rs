@@ -4,7 +4,7 @@
 //! 越权去恢复短路结构或 merge 来源。
 //! 例如：`GETTABLE r0, r1, "x"` 会先在这里变成 `r1["x"]` 对应的访问
 //! 表达式骨架；已证明的 `_ENV[key]` 则无论 key 能否写成裸标识符，都保留为
-//! raw-byte `HirGlobalRef`，目标语法合法性留给 AST 验证。
+//! raw-byte `HirGlobalRef`，并保留原读取来源供物理帧查询；目标语法合法性留给 AST 验证。
 
 use super::*;
 
@@ -66,7 +66,7 @@ pub(crate) fn lower_table_access_expr(
     key: AccessKey,
 ) -> HirExpr {
     if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
-        return HirExpr::GlobalRef(HirGlobalRef { key });
+        return global_read(lowering, instr_ref, key);
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
@@ -136,7 +136,10 @@ pub(crate) fn lower_table_access_target(
     key: AccessKey,
 ) -> HirLValue {
     if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
-        return HirLValue::Global(HirGlobalRef { key });
+        return HirLValue::Global(HirGlobalRef {
+            sources: Default::default(),
+            key,
+        });
     }
 
     HirLValue::TableAccess(Box::new(HirTableAccess {
@@ -161,7 +164,7 @@ pub(crate) fn lower_table_access_expr_inline(
     key: AccessKey,
 ) -> HirExpr {
     if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
-        return HirExpr::GlobalRef(HirGlobalRef { key });
+        return global_read(lowering, instr_ref, key);
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
@@ -257,7 +260,7 @@ pub(crate) fn lower_table_access_expr_single_eval(
     key: AccessKey,
 ) -> HirExpr {
     if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
-        return HirExpr::GlobalRef(HirGlobalRef { key });
+        return global_read(lowering, instr_ref, key);
     }
 
     HirExpr::TableAccess(Box::new(HirTableAccess {
@@ -373,6 +376,18 @@ fn lower_access_key_expr_inline(
         AccessKey::Const(const_ref) => expr_for_const(lowering.proto, const_ref),
         AccessKey::Integer(value) => HirExpr::Integer(value),
     }
+}
+
+fn global_read(lowering: &ProtoLowering<'_>, instr: InstrRef, key: crate::LuaString) -> HirExpr {
+    HirExpr::GlobalRef(HirGlobalRef {
+        sources: crate::hir::common::HirOperationSources::Single(
+            crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr,
+            },
+        ),
+        key,
+    })
 }
 
 pub(crate) fn global_key_for_access(

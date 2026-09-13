@@ -608,6 +608,8 @@ fn format_binary_op(op: super::common::HirBinaryOpKind) -> &'static str {
         super::common::HirBinaryOpKind::Eq => "==",
         super::common::HirBinaryOpKind::Lt => "<",
         super::common::HirBinaryOpKind::Le => "<=",
+        super::common::HirBinaryOpKind::Gt => ">",
+        super::common::HirBinaryOpKind::Ge => ">=",
     }
 }
 

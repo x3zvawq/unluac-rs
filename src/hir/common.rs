@@ -543,8 +543,11 @@ pub enum HirLValue {
 ///
 /// key 保留 VM 常量的原始字节身份；能否写成目标方言的裸标识符由
 /// AST lowering 验证，不得反向影响 HIR 对环境访问的分类。
-#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HirGlobalRef {
+    /// 环境访问归一化不丢掉原 GETTABLE 身份；互斥读取合并须保留全部来源。
+    /// 写目标没有读取求值帧，使用 Unknown。
+    pub(crate) sources: HirOperationSources,
     pub key: LuaString,
 }
 
@@ -690,6 +693,9 @@ pub enum HirBinaryOpKind {
     Eq,
     Lt,
     Le,
+    /// 显式保留源码的左右求值顺序；不能在后层换回 Lt(rhs, lhs) 后再猜顺序。
+    Gt,
+    Ge,
 }
 
 /// 原指令的跨改写身份。相同原操作的 clone 保留身份；合成操作没有此证书。
@@ -1507,10 +1513,24 @@ pub enum HirClosureCreation {
 /// 闭包表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirClosureExpr {
+    /// 原创建指令的身份；COPY 不改写来源，合成闭包不能借用原参数分配槽。
+    pub(crate) source_site: Option<HirSourceSite>,
     /// 原 closure 指令的分配方式；合成节点无权伪造原 Fresh/共享身份。
     pub creation: Option<HirClosureCreation>,
     pub proto: HirProtoRef,
     pub captures: Vec<HirCapture>,
+}
+
+impl HirClosureExpr {
+    /// 合成闭包没有原 VM 创建或槽位证书。
+    pub fn synthetic(proto: HirProtoRef, captures: Vec<HirCapture>) -> Self {
+        Self {
+            source_site: None,
+            creation: None,
+            proto,
+            captures,
+        }
+    }
 }
 
 /// 闭包捕获父级值的方式。

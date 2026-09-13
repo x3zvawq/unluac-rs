@@ -147,7 +147,11 @@ impl TableExpression for AstExpr {
             Self::Binary(binary)
                 if matches!(
                     binary.op,
-                    AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le
+                    AstBinaryOpKind::Eq
+                        | AstBinaryOpKind::Lt
+                        | AstBinaryOpKind::Le
+                        | AstBinaryOpKind::Gt
+                        | AstBinaryOpKind::Ge
                 ) =>
             {
                 Expr::Comparison(&binary.lhs, &binary.rhs)

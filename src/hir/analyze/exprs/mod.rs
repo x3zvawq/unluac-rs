@@ -101,6 +101,10 @@ pub(super) fn lower_plain_closure_expr(
     capture_closure_expr(
         lowering.child_refs[closure.proto.index()],
         captures,
+        Some(crate::hir::common::HirSourceSite {
+            proto: lowering.id,
+            instr: instr_ref,
+        }),
         Some(match closure.creation {
             crate::transformer::ClosureCreation::Fresh => {
                 crate::hir::common::HirClosureCreation::Fresh
@@ -131,16 +135,19 @@ pub(super) fn lower_composite_factory_expr(
             plan.outer_captures.iter().copied(),
         ),
         None,
+        None,
     )
 }
 
 fn capture_closure_expr(
     proto: crate::hir::HirProtoRef,
     captures: Result<Vec<HirCapture>, crate::hir::HirUnresolvedExpr>,
+    source_site: Option<crate::hir::common::HirSourceSite>,
     creation: Option<crate::hir::common::HirClosureCreation>,
 ) -> HirExpr {
     match captures {
         Ok(captures) => HirExpr::Closure(Box::new(HirClosureExpr {
+            source_site,
             proto,
             captures,
             creation,

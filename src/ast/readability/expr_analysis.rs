@@ -28,17 +28,18 @@ pub(super) fn primitive_literal_comparison_value(
     rhs: &AstExpr,
     target: AstTargetDialect,
 ) -> Option<bool> {
-    let op = match op {
-        AstBinaryOpKind::Eq => LuaComparison::Eq,
-        AstBinaryOpKind::Lt => LuaComparison::Lt,
-        AstBinaryOpKind::Le => LuaComparison::Le,
+    let lhs = primitive_literal(lhs)?;
+    let rhs = primitive_literal(rhs)?;
+    // 只交换已取得的原始值以复用共享比较语义，不改变 AST 的求值顺序。
+    let (op, lhs, rhs) = match op {
+        AstBinaryOpKind::Eq => (LuaComparison::Eq, lhs, rhs),
+        AstBinaryOpKind::Lt => (LuaComparison::Lt, lhs, rhs),
+        AstBinaryOpKind::Le => (LuaComparison::Le, lhs, rhs),
+        AstBinaryOpKind::Gt => (LuaComparison::Lt, rhs, lhs),
+        AstBinaryOpKind::Ge => (LuaComparison::Le, rhs, lhs),
         _ => return None,
     };
-    LuaValueSemantics::for_dialect(target.version).compare(
-        op,
-        primitive_literal(lhs)?,
-        primitive_literal(rhs)?,
-    )
+    LuaValueSemantics::for_dialect(target.version).compare(op, lhs, rhs)
 }
 
 fn primitive_literal(expr: &AstExpr) -> Option<LuaLiteral<'_>> {
@@ -81,9 +82,11 @@ fn value_facts(expr: &AstExpr) -> LuaValueFacts {
             }
         }
         AstExpr::Binary(binary) => match binary.op {
-            AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le => {
-                LuaValueFacts::BOOLEAN
-            }
+            AstBinaryOpKind::Eq
+            | AstBinaryOpKind::Lt
+            | AstBinaryOpKind::Le
+            | AstBinaryOpKind::Gt
+            | AstBinaryOpKind::Ge => LuaValueFacts::BOOLEAN,
             AstBinaryOpKind::Add
             | AstBinaryOpKind::Sub
             | AstBinaryOpKind::Mul
@@ -512,7 +515,10 @@ fn eventless_literal_kind(
                     Some(EventlessLiteralKind::Integer(ZeroKnowledge::Unknown))
                 }
                 AstBinaryOpKind::Eq => Some(EventlessLiteralKind::Boolean),
-                AstBinaryOpKind::Lt | AstBinaryOpKind::Le
+                AstBinaryOpKind::Lt
+                | AstBinaryOpKind::Le
+                | AstBinaryOpKind::Gt
+                | AstBinaryOpKind::Ge
                     if (lhs.is_numeric() && rhs.is_numeric())
                         || (lhs == EventlessLiteralKind::String
                             && rhs == EventlessLiteralKind::String) =>
@@ -529,7 +535,9 @@ fn eventless_literal_kind(
                 | AstBinaryOpKind::Shr
                 | AstBinaryOpKind::Concat
                 | AstBinaryOpKind::Lt
-                | AstBinaryOpKind::Le => None,
+                | AstBinaryOpKind::Le
+                | AstBinaryOpKind::Gt
+                | AstBinaryOpKind::Ge => None,
             }
         }
         AstExpr::Int64(_)
@@ -575,9 +583,14 @@ pub(super) fn is_eventless_primitive_expr_for_target(
             }
             AstExpr::Binary(binary) => {
                 let locale_sensitive_string_order =
-                    matches!(binary.op, AstBinaryOpKind::Lt | AstBinaryOpKind::Le)
-                        && eventless_literal_kind(&binary.lhs, integer_arithmetic_is_defined)
-                            == Some(EventlessLiteralKind::String)
+                    matches!(
+                        binary.op,
+                        AstBinaryOpKind::Lt
+                            | AstBinaryOpKind::Le
+                            | AstBinaryOpKind::Gt
+                            | AstBinaryOpKind::Ge
+                    ) && eventless_literal_kind(&binary.lhs, integer_arithmetic_is_defined)
+                        == Some(EventlessLiteralKind::String)
                         && eventless_literal_kind(&binary.rhs, integer_arithmetic_is_defined)
                             == Some(EventlessLiteralKind::String);
                 !locale_sensitive_string_order
@@ -952,7 +965,11 @@ pub(super) fn is_multi_return_inline_expr(expr: &AstExpr) -> bool {
         AstExpr::Binary(binary)
             if matches!(
                 binary.op,
-                AstBinaryOpKind::Eq | AstBinaryOpKind::Lt | AstBinaryOpKind::Le
+                AstBinaryOpKind::Eq
+                    | AstBinaryOpKind::Lt
+                    | AstBinaryOpKind::Le
+                    | AstBinaryOpKind::Gt
+                    | AstBinaryOpKind::Ge
             ) =>
         {
             is_multi_return_comparison_operand(&binary.lhs)

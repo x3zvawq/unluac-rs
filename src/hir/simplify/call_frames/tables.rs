@@ -74,7 +74,7 @@ pub(super) fn nested_producers<'a>(
 
 /// 当前 proto 字面量出现数给出生成常量池的保守上界；不以原常量池编号猜重编译 RK。
 /// nil/两个 Boolean 可由后续语法化引入，预留这三个值；不进入子 proto 的常量域。
-pub(super) fn constants_fit_rk(proto: &HirProto) -> bool {
+pub(in crate::hir::simplify) fn constants_fit_rk(proto: &HirProto) -> bool {
     struct Count(usize);
     impl HirVisitor<'_> for Count {
         fn is_complete(&self) -> bool {

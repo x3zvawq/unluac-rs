@@ -656,6 +656,8 @@ fn lower_binary_op(op: HirBinaryOpKind) -> AstBinaryOpKind {
         HirBinaryOpKind::Eq => AstBinaryOpKind::Eq,
         HirBinaryOpKind::Lt => AstBinaryOpKind::Lt,
         HirBinaryOpKind::Le => AstBinaryOpKind::Le,
+        HirBinaryOpKind::Gt => AstBinaryOpKind::Gt,
+        HirBinaryOpKind::Ge => AstBinaryOpKind::Ge,
     }
 }
 

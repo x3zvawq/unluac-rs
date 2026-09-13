@@ -9,9 +9,14 @@
 //! 例如 `p=print; c=table.concat; p("x",c(t))` 原子恢复成原生嵌套调用，可避免
 //! 多出的低槽 local 抬高后续 GC 的 caller top；`print(obj:make():next())` 则由
 //! 同一 builder 消费原方法 receiver/参数槽，终端边界维持其既有独立合同。
+//! CONCAT 输入按各自原值版本核对写域；同一 Local 承接拼接结果后附带的低槽 MOVE，
+//! 仍属于输出责任，不应使原输入 COPY 被永久物化并在每轮重编译中增长。
 
 mod native;
 mod tables;
+
+pub(super) use native::prepare_source_frames;
+pub(super) use tables::constants_fit_rk;
 
 use crate::transformer::{ResultPack, ValuePack};
 use std::collections::{BTreeMap, BTreeSet};
@@ -214,6 +219,7 @@ fn plan(
         definitions,
         constructors: BTreeMap::new(),
         constructor_depth: 0,
+        indexed_key_base: None,
         facts,
         dialect,
         base: base.slot(),
@@ -238,6 +244,8 @@ struct FrameBuilder<'a> {
     definitions: BTreeMap<LocalId, Vec<usize>>,
     constructors: BTreeMap<usize, Vec<(usize, super::table_constructors::ConstructorWrite<'a>)>>,
     constructor_depth: usize,
+    // PUC 上值索引先为 base 保留一槽，key 中间结果可以暂用该槽。
+    indexed_key_base: Option<usize>,
     facts: &'a ProtoPromotionFacts,
     dialect: DecompileDialect,
     base: usize,
@@ -451,6 +459,9 @@ impl FrameBuilder<'_> {
                                         value,
                                         HirExpr::GlobalRef(_)
                                             | HirExpr::TableAccess(_)
+                                            // 原 GETUPVAL callee 也在同一准备槽写入；
+                                            // 下一次 CALL 的 callee Def 核对这一次覆盖。
+                                            | HirExpr::UpvalueRef(_)
                                             | HirExpr::LocalRef(_)
                                             | HirExpr::ParamRef(_)
                                             // 完整 callee 链的每个 CALL 在下方核对同槽固定单结果，
@@ -480,7 +491,9 @@ impl FrameBuilder<'_> {
                         receiver,
                         callee_chain,
                         argument_home,
-                        None,
+                        matches!(value, HirExpr::Closure(_))
+                            .then_some(original_producer)
+                            .flatten(),
                     )?;
                     self.finish_event(index)?;
                     Some(result)
@@ -498,6 +511,34 @@ impl FrameBuilder<'_> {
             HirExpr::Closure(_)
                 if self.constructor_depth > 0 && self.constructor_field_is_preserved(expr) =>
             {
+                Some(expr.clone())
+            }
+            HirExpr::Closure(closure)
+                if self.native.is_some()
+                    && argument_home
+                    && closure.creation.is_some()
+                    && closure
+                        .source_site
+                        .and_then(|source| self.facts.operation_result_temp(source))
+                        .is_some_and(|producer| {
+                            Some(producer) == original_producer
+                                && self
+                                    .facts
+                                    .trusted_temp_home_slot(producer)
+                                    .is_some_and(|home| {
+                                        home.slot() == slot
+                                            && self
+                                                .facts
+                                                .complete_temp_definition_write_homes(producer)
+                                                .iter()
+                                                .copied()
+                                                .eq(std::iter::once(home))
+                                    })
+                        })
+                    && self.constructor_field_is_preserved(expr) =>
+            {
+                // 原参数 CLOSURE 仍在同一槽创建；只消费当前 CALL 的精确 Def 和低槽
+                // capture，不按匿名函数外形或子 proto 猜测原分配。合成 factory 无此来源。
                 Some(expr.clone())
             }
             HirExpr::Binary(binary)
@@ -581,7 +622,9 @@ impl FrameBuilder<'_> {
                 // 已由完整 CALL 核对。Boolean 仍写入同一参数槽，不转为谓词语境。
                 Some(expr.clone())
             }
-            HirExpr::Binary(binary) if self.constructor_depth > 0 => {
+            HirExpr::Binary(binary)
+                if self.constructor_depth > 0 || self.indexed_key_base.is_some() =>
+            {
                 let layout = self.facts.native_binary_layout(binary)?;
                 if self.facts.operation_result_home(binary.source_site?)
                     != Some(HomeSlotKey::new(slot, 0))
@@ -602,10 +645,21 @@ impl FrameBuilder<'_> {
                 let lhs_home = layout.lhs?;
                 if lhs_home != HomeSlotKey::new(slot, 0)
                     && self.direct_home(&binary.lhs) != Some(lhs_home)
+                    && !(self.indexed_key_base == Some(lhs_home.slot())
+                        && lhs_home == HomeSlotKey::new(lhs_home.slot(), 0)
+                        && slot == lhs_home.slot() + 1)
                 {
                     return None;
                 }
-                let lhs = self.expr(&binary.lhs, before, slot, None, false, false, None)?;
+                let lhs = self.expr(
+                    &binary.lhs,
+                    before,
+                    lhs_home.slot(),
+                    None,
+                    false,
+                    false,
+                    None,
+                )?;
                 Some(HirExpr::Binary(Box::new(
                     crate::hir::common::HirBinaryExpr {
                         source_site: binary.source_site,
@@ -635,11 +689,18 @@ impl FrameBuilder<'_> {
                             DecompileDialect::Luajit | DecompileDialect::Luau
                         ) && self.native.is_some_and(|context| context.constants_fit_rk)
                             && match &binary.lhs {
-                                HirExpr::LocalRef(_) | HirExpr::ParamRef(_)
-                                    if self.dialect == DecompileDialect::Lua51 =>
-                                {
-                                    self.direct_home(&binary.lhs)
-                                        .is_some_and(|home| home.slot() < self.base)
+                                HirExpr::LocalRef(_) | HirExpr::ParamRef(_) => {
+                                    self.direct_home(&binary.lhs).is_some_and(|home| {
+                                        home.slot() < self.base
+                                            && (self.dialect == DecompileDialect::Lua51
+                                                || self
+                                                    .facts
+                                                    .native_binary_layout(binary)
+                                                    .is_some_and(|layout| {
+                                                        layout.lhs == Some(home)
+                                                            && layout.rhs.is_none()
+                                                    }))
+                                    })
                                 }
                                 HirExpr::TableAccess(access) => self
                                     .facts
@@ -683,6 +744,16 @@ impl FrameBuilder<'_> {
                         rhs,
                     },
                 )))
+            }
+            HirExpr::Unary(unary)
+                if self.indexed_key_base.is_some()
+                    && self.facts.unary_result_home(unary) == Some(HomeSlotKey::new(slot, 0))
+                    && self
+                        .facts
+                        .operation_operand_preparation(unary.source_site?, &unary.expr)
+                        == Some(HomeSlotKey::new(slot, 0)) =>
+            {
+                Some(expr.clone())
             }
             HirExpr::Unary(unary)
                 if self.native.is_some()
@@ -833,7 +904,15 @@ impl FrameBuilder<'_> {
         }
         let mut values = Vec::with_capacity(operands.len());
         for (offset, operand) in operands.into_iter().enumerate() {
-            let value = self.expr(operand, before, slot + offset, None, false, true, None)?;
+            let value = self.expr(
+                operand,
+                before,
+                slot + offset,
+                None,
+                false,
+                true,
+                self.facts.concat_operand_value(binary, offset),
+            )?;
             if matches!(&value, HirExpr::Binary(nested)
                 if nested.op == crate::hir::common::HirBinaryOpKind::Concat)
             {
@@ -909,8 +988,8 @@ impl FrameBuilder<'_> {
         binary: &crate::hir::common::HirBinaryExpr,
         slot: usize,
     ) -> bool {
-        use crate::hir::common::HirBinaryOpKind::{Eq, Le, Lt};
-        if self.dialect != DecompileDialect::Luau || !matches!(binary.op, Eq | Lt | Le) {
+        use crate::hir::common::HirBinaryOpKind::{Eq, Ge, Gt, Le, Lt};
+        if self.dialect != DecompileDialect::Luau || !matches!(binary.op, Eq | Lt | Le | Gt | Ge) {
             return false;
         }
         if let (Some(lhs), Some(rhs)) =
@@ -923,12 +1002,13 @@ impl FrameBuilder<'_> {
                 .native_binary_layout(binary)
                 .is_some_and(|layout| layout.lhs == Some(lhs) && layout.rhs == Some(rhs));
         }
-        if matches!(binary.op, Lt | Le) {
+        if matches!(binary.op, Lt | Le | Gt | Ge) {
             let Some(layout) = self.facts.native_binary_layout(binary) else {
                 return false;
             };
             // 有序比较的常量仍占 operand scratch；不把 Eq 的内嵌常量规则
-            // 套到 LT/LE。保持原左右顺序，因此元方法方向和短路位置不变。
+            // 套到有序关系。Gt/Ge 的 layout 已按当前方向投影，仍核对同一低槽引用和
+            // slot+1 常量准备；没有 CALL operand 或 COPY，也不改变元方法与短路位置。
             let constant = |value: &HirExpr| {
                 matches!(
                     value,
@@ -1234,7 +1314,7 @@ impl FrameBuilder<'_> {
                         }
                         // 已处于参数表达式中的表没有待删除的 binding；完整 CALL 恢复
                         // 原参数槽时仍在此语境求值，不能要求不存在的 Local 身份。
-                        HirExpr::TableConstructor(_) => true,
+                        HirExpr::TableConstructor(_) | HirExpr::Closure(_) => true,
                         _ => false,
                     };
                 self.expr(
@@ -1247,14 +1327,44 @@ impl FrameBuilder<'_> {
                     self.facts
                         .call_argument_value(call, index)
                         .or_else(|| argument_roots.get(&index).copied())
-                        .filter(|producer| {
-                            matches!(arg, HirExpr::LocalRef(local)
-                            if self.facts.promoted_local_for_temp(*producer) == Some(*local))
+                        .filter(|producer| match arg {
+                            HirExpr::LocalRef(local) => {
+                                self.facts.promoted_local_for_temp(*producer) == Some(*local)
+                            }
+                            HirExpr::Closure(closure) => {
+                                closure
+                                    .source_site
+                                    .and_then(|source| self.facts.operation_result_temp(source))
+                                    == Some(*producer)
+                            }
+                            _ => false,
                         }),
                 )
             })
             .collect::<Option<Vec<_>>>()?;
         let tail = match &call.args.tail {
+            Some(tail) if matches!(tail.as_expr(), HirExpr::VarArg) => {
+                if tail.exact_width().is_some()
+                    || self.native.is_none()
+                    || !matches!(
+                        self.dialect,
+                        DecompileDialect::Lua51
+                            | DecompileDialect::Lua52
+                            | DecompileDialect::Lua53
+                            | DecompileDialect::Lua54
+                            | DecompileDialect::Lua55
+                    )
+                    || self
+                        .facts
+                        .call_vararg_tail_home(call)
+                        .map(HomeSlotKey::slot)
+                        != Some(args_start + call.args.fixed.len())
+                    || !native_frame.is_some_and(|frame| frame.arguments_unaliased)
+                {
+                    return None;
+                }
+                Some(tail.clone())
+            }
             Some(tail) => {
                 let HirExpr::Call(nested) = tail.as_expr() else {
                     return None;

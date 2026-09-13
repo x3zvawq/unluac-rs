@@ -1440,6 +1440,7 @@ fn build_composite_factory_proto(
             .collect::<Option<Vec<_>>>()
             .ok_or_else(error)?;
         let closure = HirExpr::Closure(Box::new(HirClosureExpr {
+            source_site: None,
             creation: None,
             proto: child_ref,
             captures,
@@ -1805,6 +1806,7 @@ fn build_proto_body(
                 HirStmt::LocalDecl(Box::new(HirLocalDecl {
                     bindings: vec![*local],
                     values: HirValuePack::fixed(vec![HirExpr::Closure(Box::new(HirClosureExpr {
+                        source_site: None,
                         creation: None,
                         proto: lowering.child_refs[proto.index()],
                         captures: Vec::new(),

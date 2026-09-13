@@ -177,15 +177,21 @@ impl SymbolicVerifier {
             HirExpr::Binary(binary)
                 if matches!(
                     binary.op,
-                    HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+                    HirBinaryOpKind::Eq
+                        | HirBinaryOpKind::Lt
+                        | HirBinaryOpKind::Le
+                        | HirBinaryOpKind::Gt
+                        | HirBinaryOpKind::Ge
                 ) =>
             {
                 let lhs = self.eval_expr(&binary.lhs)?;
                 let rhs = self.eval_expr(&binary.rhs)?;
-                let op = match binary.op {
-                    HirBinaryOpKind::Eq => DiagramBinaryOp::Eq,
-                    HirBinaryOpKind::Lt => DiagramBinaryOp::Lt,
-                    HirBinaryOpKind::Le => DiagramBinaryOp::Le,
+                let (op, lhs, rhs) = match binary.op {
+                    HirBinaryOpKind::Eq => (DiagramBinaryOp::Eq, lhs, rhs),
+                    HirBinaryOpKind::Lt => (DiagramBinaryOp::Lt, lhs, rhs),
+                    HirBinaryOpKind::Le => (DiagramBinaryOp::Le, lhs, rhs),
+                    HirBinaryOpKind::Gt => (DiagramBinaryOp::Lt, rhs, lhs),
+                    HirBinaryOpKind::Ge => (DiagramBinaryOp::Le, rhs, lhs),
                     _ => unreachable!(),
                 };
                 self.apply_binary(op, lhs, rhs)

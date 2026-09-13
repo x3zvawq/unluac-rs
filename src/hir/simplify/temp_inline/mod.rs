@@ -631,7 +631,7 @@ fn inline_temps_in_block(
                 }))
             // 候选拒绝[PolicyBoundary]：DebugScope 标注该 temp 是显式源码 binding，保留其独立声明身份。
             && !workspace.uses.has_debug_local_hint(temp)
-            // 候选拒绝[LayerBoundary]：原低槽初始化、FASTCALL 参数源与 CALL 写回由完整帧共同消费。
+            // 候选拒绝[LayerBoundary]：原低槽分配/初始化、FASTCALL 参数源与 CALL 写回由完整帧共同消费。
             && !facts.temp_requires_call_frame(temp)
             // 候选拒绝[SemanticBarrier:Capture]：若 closure 已按引用捕获该 home，删除写入会让 closure 观察旧值；见 regress_310。
             && !temp_rebinds_captured_slot(

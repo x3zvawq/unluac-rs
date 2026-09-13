@@ -279,7 +279,11 @@ fn boolean_predicate_source(value: &HirExpr) -> Option<HirSourceSite> {
         HirExpr::Binary(binary)
             if matches!(
                 binary.op,
-                HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+                HirBinaryOpKind::Eq
+                    | HirBinaryOpKind::Lt
+                    | HirBinaryOpKind::Le
+                    | HirBinaryOpKind::Gt
+                    | HirBinaryOpKind::Ge
             ) =>
         {
             binary.source_site

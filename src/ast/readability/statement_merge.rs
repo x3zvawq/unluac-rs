@@ -102,7 +102,7 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
             binding.origin.is_debug_hinted()
                 || !binding
                     .rewrite_authority
-                    .may_merge_adjacent_empty_declarations()
+                    .may_merge_adjacent_inert_declarations()
         }) {
             // 候选拒绝[SemanticBarrier:DebugScope]：`local debug_name; local t` 合并后，
             // 首个 binding 要到第二条声明之后才进入作用域；原第二行的 line hook 本可
@@ -118,7 +118,7 @@ fn merge_adjacent_empty_local_decls(block: &mut AstBlock) -> bool {
                 binding.origin.is_debug_hinted()
                     || !binding
                         .rewrite_authority
-                        .may_merge_adjacent_empty_declarations()
+                        .may_merge_adjacent_inert_declarations()
             }) {
                 // 候选拒绝[SemanticBarrier:DebugScope]：line hook 能在相邻声明间观察
                 // DebugHinted local 的边界，不能把后续声明提前到同一 local list。
@@ -197,6 +197,20 @@ fn local_attr_merge_barrier(
     None
 }
 
+fn may_merge_single_value_declaration(binding: &AstLocalBinding, value: &AstExpr) -> bool {
+    binding.rewrite_authority.may_move_scope_start()
+        || matches!(
+            value,
+            AstExpr::Nil
+                | AstExpr::Boolean(_)
+                | AstExpr::Integer(_)
+                | AstExpr::Number(_)
+                | AstExpr::String(_)
+        ) && binding
+            .rewrite_authority
+            .may_merge_adjacent_inert_declarations()
+}
+
 fn merge_adjacent_single_value_local_decls(
     block: &mut AstBlock,
     trailing_condition: Option<&AstExpr>,
@@ -214,7 +228,7 @@ fn merge_adjacent_single_value_local_decls(
             index += 1;
             continue;
         };
-        if binding.origin.is_debug_hinted() || !binding.rewrite_authority.may_move_scope_start() {
+        if binding.origin.is_debug_hinted() || !may_merge_single_value_declaration(binding, value) {
             // 候选拒绝[SemanticBarrier:DebugScope]：后续 RHS 求值期间 line hook/元方法可观察
             // 当前 DebugHinted local；并行声明会把它的作用域起点推迟到整组 RHS 之后。
             new_stmts.push(stmt);
@@ -243,7 +257,7 @@ fn merge_adjacent_single_value_local_decls(
             .and_then(single_value_local_decl)
         {
             if next_binding.origin.is_debug_hinted()
-                || !next_binding.rewrite_authority.may_move_scope_start()
+                || !may_merge_single_value_declaration(next_binding, next_value)
             {
                 // 候选拒绝[SemanticBarrier:DebugScope]：line hook 可在相邻声明间观察
                 // DebugHinted local；并行声明会让该名字提前可见。

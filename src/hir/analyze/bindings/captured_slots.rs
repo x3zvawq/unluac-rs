@@ -7,6 +7,9 @@
 //! 共同 cell 的初始化若支配所有捕获与后续写，直接以该写声明；后续 Phi 不另造 nil carrier。
 //! 同一遍捕获枚举也保留全部 capture home 和已接受 debug scope；例如旧 r2 cell 关闭后，
 //! 新的未捕获 `next_first` 可沿自己的 nil 声明绑定，不能被旧 epoch 的捕获永久阻止。
+//! RETURN 自带的非 TBC 关闭由同源的紧邻 Return 承接 activation，不恢复成提前结束的 do；
+//! 例如 `local x=1; local f=function() return x end; return f` 保持函数作用域及返回求值。
+//! 显式 CLOSE 和资源 cleanup 仍沿原词法窗口处理，不能借终端关闭放宽普通 scope 边界。
 
 use super::*;
 use crate::structure::SccId;
@@ -591,6 +594,19 @@ fn collect_lexical_close_scopes(
         let LowInstr::Close(close) = instr else {
             continue;
         };
+        if close.kind == crate::transformer::CloseKind::Return(InstrRef(close_instr + 1))
+            && matches!(proto.instrs.get(close_instr + 1), Some(LowInstr::Return(_)))
+            && cfg.instr_to_block[close_instr + 1] == close_block
+            && matches!(
+                plan.cleanup_disposition(InstrRef(close_instr)),
+                Some(CleanupDisposition::LexicalScope(_))
+            )
+        {
+            // Transformer 把同一 RETURN 的关闭与传值拆为两条 LowInstr；这里不能
+            // 在传值前另造源码词法末端。保留 pending，交给上面的原 Return activation。
+            // TBC 的 ExplicitClose 不在此域，资源回调与返回值的先后仍由 cleanup owner 保证。
+            continue;
+        }
         let closed = pending.split_off(&CapturedSlotKey::new(close.from.index(), 0));
         if !matches!(
             plan.cleanup_disposition(InstrRef(close_instr)),

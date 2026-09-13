@@ -117,6 +117,9 @@ impl HirRewritePass for ProtoRefRewrite {
             HirExpr::TableAccess(access) => {
                 return self.rewrite_operation_sources(&mut access.sources);
             }
+            HirExpr::GlobalRef(global) => {
+                return self.rewrite_operation_sources(&mut global.sources);
+            }
             _ => {}
         }
         let HirExpr::Closure(closure) = expr else {
@@ -127,6 +130,7 @@ impl HirRewritePass for ProtoRefRewrite {
             return false;
         };
         closure.proto = proto;
+        self.rewrite_source_site(&mut closure.source_site);
         true
     }
 

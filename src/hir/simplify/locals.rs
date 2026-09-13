@@ -30,6 +30,12 @@
 //! temp occurrence index 访问真实 touch，不按“每个定义 × 全部后缀语句”重复扫描。
 //! 没有 debug/capture 身份且只被写入、从未被表达式读取的 temp 链继续保留为 temp，交给
 //! dead-temp 清理删除纯写入；把这类链提升成 local 只会把可删除的 SSA 壳固化到源码里。
+//! 原完整 LOADNIL 组若已有成员承担 root handoff，其余匿名成员在同一原位补齐分组声明；
+//! 后续 COPY 沿当前槽身份复用，避免留下半 Local 半 Temp 的批次或另建同槽 holder。
+//! 没有 root handoff 时，整组仅复用已结束全部旧 SSA 需求的匿名同槽 Local；原 nil 写入
+//! 仍留在原位置，使完整帧消费旧定义后能在真实覆盖点重建声明，不从后缀 COPY 猜初值。
+//! PUC 原 GETTABLE 若直接读取低槽 base 和内嵌常量 key，也复用已退休的匿名目标；
+//! 单次原结果与输入布局共同证明赋值不引入准备槽，CALL 和构造器不借此获得写回许可。
 //! carried-local fixed point 若已让某个 binding 吸收不同或未知 home，后续 promotion 仍可
 //! 建立源码 local，但不能借原始槽号复用 sticky/debug local：raw home 只登记给 capture/TBC
 //! 保护，组内所有 temp 的 trusted home 完全一致时才参与正向复用，taint 再传播到新 local；
@@ -101,9 +107,11 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     let mut cell_sensitive_temps = reference_captured_temps;
     cell_sensitive_temps.extend(to_be_closed_temps.iter().copied());
     let event_index = RootEventIndex::new(&proto.body.stmts, facts, safety);
+    let constants_fit_rk = super::call_frames::constants_fit_rk(proto);
     let result = {
         let mut ctx = PromotionCtx {
             dialect,
+            constants_fit_rk,
             proto_id: proto.id,
             facts,
             safety,
@@ -270,6 +278,7 @@ fn capture_kind_allows_call_root_owner(
 
 struct PromotionCtx<'a> {
     dialect: crate::decompile::DecompileDialect,
+    constants_fit_rk: bool,
     proto_id: HirProtoRef,
     facts: &'a ProtoPromotionFacts,
     safety: HirExprSafety,
@@ -932,6 +941,7 @@ fn collect_plans(
             direct_seed_promotions: ctx.direct_seed_promotions,
             debug_scope_locals: ctx.debug_scope_locals,
         };
+        let has_physical_root_handoff = !physical_root_handoffs.is_empty();
         for (temps, home, local) in physical_root_handoffs {
             ctx.physical_root_locals.insert(local);
             // 原 scalar/parallel-nil/branch 语句继续留在原位；这里只把已证明 home 的
@@ -955,6 +965,102 @@ fn collect_plans(
             }
         }
 
+        let nil_members = (|| {
+            if has_label_flow {
+                return None;
+            }
+            let HirStmt::Assign(assign) = stmt else {
+                return None;
+            };
+            let HirLValue::Temp(first) = assign.targets.first()? else {
+                return None;
+            };
+            let temps = facts.nil_write_temps(*first)?;
+            if assign.targets.len() != temps.len()
+                || assign.values.fixed.len() != temps.len()
+                || assign.values.tail.is_some()
+                || !assign
+                    .values
+                    .fixed
+                    .iter()
+                    .all(|value| matches!(value, HirExpr::Nil))
+            {
+                return None;
+            }
+            let base = facts.trusted_temp_home_slot(*first)?;
+            let mut members = Vec::new();
+            for (offset, (&temp, target)) in temps.iter().zip(&assign.targets).enumerate() {
+                let home = facts.trusted_temp_home_slot(temp)?;
+                if *target != HirLValue::Temp(temp)
+                    || home.slot() != base.slot() + offset
+                    || !facts
+                        .complete_temp_definition_write_homes(temp)
+                        .iter()
+                        .copied()
+                        .eq([home])
+                {
+                    return None;
+                }
+                if allocator.reserved_temps.contains(&temp) {
+                    // 只承接本次原 root handoff，不能借别处已保留的身份补组。
+                    materialized_owner_locals.get(&(decl_index, home))?;
+                    continue;
+                }
+                if inherited.contains_key(&temp)
+                    || ctx.identity_sensitive_temps.contains(&temp)
+                    || ctx.to_be_closed_temps.contains(&temp)
+                    || outer_uses_temp(temp)
+                    || event_block.has_touch_before(temp, decl_index)
+                    || temp_debug_locals
+                        .get(temp.index())
+                        .is_some_and(Option::is_some)
+                    || temp_debug_scopes
+                        .get(temp.index())
+                        .is_some_and(Option::is_some)
+                {
+                    return None;
+                }
+                let local = if let Some(&local) = current_slot_locals.get(&home) {
+                    // 与后续 COPY 使用同一退休证明：该 Local 的所有匿名 SSA 版本
+                    // 都已结束需求。原 nil 在当前指令覆盖，不提前清根或扩展旧 cell。
+                    if !copy_reuse_last_touch
+                        .get(&local)
+                        .is_some_and(|last| *last < decl_index)
+                    {
+                        return None;
+                    }
+                    Some(local)
+                } else if has_physical_root_handoff {
+                    None
+                } else {
+                    // 无 root handoff 不建立新 holder；每个原槽都须已有可复用声明。
+                    return None;
+                };
+                members.push((temp, home, local));
+            }
+            Some(members)
+        })();
+        if let Some(members) = nil_members {
+            // 先验证整组再登记；既有 Local 的原 nil Assign 不改写。新成员仅补
+            // 相邻 empty 声明，完整 source-frame 事务再合并该声明与原 LOADNIL 批次。
+            for (temp, home, local) in members {
+                let local = if let Some(local) = local {
+                    allocator.reuse_existing_local(
+                        decl_index,
+                        local,
+                        Some(home),
+                        BTreeSet::from([temp]),
+                        BTreeSet::new(),
+                        PromotionInit::Empty,
+                    );
+                    local
+                } else {
+                    allocator.allocate_batched_empty_local(decl_index, home, temp)
+                };
+                materialized_owner_locals.insert((decl_index, home), local);
+                current_slot_locals.insert(home, local);
+            }
+        }
         if let HirStmt::Assign(assign) = stmt
             && assign.targets.len() > 1
         {
@@ -1273,6 +1379,57 @@ fn collect_plans(
                     // 否则其后同 scope 写会另建身份而留下旧根。
                     (source_home != home
                         && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+                        && group
+                            .iter()
+                            .all(|temp| !ctx.identity_sensitive_temps.contains(temp))
+                        && copy_reuse_last_touch
+                            .get(&local)
+                            .is_some_and(|last| *last < decl_index))
+                    .then_some(local)
+                })
+                .or_else(|| {
+                    if has_label_flow
+                        || !ctx.constants_fit_rk
+                        || !matches!(
+                            ctx.dialect,
+                            crate::decompile::DecompileDialect::Lua51
+                                | crate::decompile::DecompileDialect::Lua52
+                                | crate::decompile::DecompileDialect::Lua53
+                                | crate::decompile::DecompileDialect::Lua54
+                                | crate::decompile::DecompileDialect::Lua55
+                        )
+                    {
+                        return None;
+                    }
+                    let home = home_slot?;
+                    let HirExpr::TableAccess(access) = stmt.scalar_temp_assignment()?.1 else {
+                        return None;
+                    };
+                    let crate::hir::common::HirOperationSources::Single(source) = access.sources
+                    else {
+                        return None;
+                    };
+                    let layout = facts.native_table_read_layout(access)?;
+                    let base = match &access.base {
+                        HirExpr::TempRef(temp) => facts.trusted_temp_home_slot(*temp),
+                        HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
+                        HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
+                        _ => None,
+                    }?;
+                    let local = *current_slot_locals.get(&home)?;
+                    // 原 GETTABLE 已在此写目标槽，低槽 base 与内嵌 key 不额外准备
+                    // scratch；只复用已退休匿名身份，不能从查表外形推断 RHS 写回布局。
+                    (facts.operation_result_temp(source) == Some(root_temp)
+                        && facts.trusted_temp_home_slot(root_temp) == Some(home)
+                        && layout.base == base
+                        && base.slot() < home.slot()
+                        && layout.key.is_none()
+                        && matches!(
+                            access.key,
+                            HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+                        )
+                        && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+                        && debug_scope_for_temp_group(temp_debug_scopes, &group).is_none()
                         && group
                             .iter()
                             .all(|temp| !ctx.identity_sensitive_temps.contains(temp))

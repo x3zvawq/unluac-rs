@@ -45,7 +45,11 @@ pub(in crate::hir) fn value_facts_with(
         HirExpr::Binary(binary) => {
             if matches!(
                 binary.op,
-                HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+                HirBinaryOpKind::Eq
+                    | HirBinaryOpKind::Lt
+                    | HirBinaryOpKind::Le
+                    | HirBinaryOpKind::Gt
+                    | HirBinaryOpKind::Ge
             ) {
                 return LuaValueFacts::BOOLEAN;
             }

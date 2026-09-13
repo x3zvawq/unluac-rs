@@ -9,10 +9,14 @@ use crate::hir::common::{HirBlock, HirExpr, HirOperationSources};
 use crate::hir::simplify::walk::{HirRewritePass, rewrite_block};
 use crate::hir::visit::{HirVisitor, visit_block};
 
-pub(super) type ReadAlternativeCache = crate::hir::common::HirSourceFactsCache<(
-    crate::hir::promotion::HomeSlotKey,
-    crate::hir::promotion::NativeTableReadLayout,
-)>;
+pub(super) type ReadAlternativeCache =
+    crate::hir::common::HirSourceFactsCache<(crate::hir::promotion::HomeSlotKey, ReadLayout)>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadLayout {
+    Table(crate::hir::promotion::NativeTableReadLayout),
+    Global,
+}
 
 pub(super) fn merge_read_alternatives(
     left: &HirBlock,
@@ -28,6 +32,8 @@ pub(super) fn merge_read_alternatives(
         fn visit_expr(&mut self, expr: &HirExpr) {
             if let HirExpr::TableAccess(access) = expr {
                 self.0.push(access.sources.clone());
+            } else if let HirExpr::GlobalRef(global) = expr {
+                self.0.push(global.sources.clone());
             }
         }
     }
@@ -46,8 +52,10 @@ pub(super) fn merge_read_alternatives(
     impl HirRewritePass for Project<'_> {
         const PRESERVES_GENERIC_FOR_INITIALIZER_TRANSACTION: bool = true;
         fn rewrite_expr_before_children(&mut self, expr: &mut HirExpr) -> bool {
-            let HirExpr::TableAccess(access) = expr else {
-                return false;
+            let own = match expr {
+                HirExpr::TableAccess(access) => &mut access.sources,
+                HirExpr::GlobalRef(global) => &mut global.sources,
+                _ => return false,
             };
             let index = self.index;
             self.index += 1;
@@ -55,9 +63,9 @@ pub(super) fn merge_read_alternatives(
                 return false;
             };
             if self.merge {
-                self.merged.push(access.sources.alternatives(source));
+                self.merged.push(own.alternatives(source));
             }
-            access.sources = source.clone();
+            *own = source.clone();
             true
         }
     }
@@ -82,7 +90,11 @@ pub(super) fn merge_read_alternatives(
             }
             Some((
                 facts.operation_result_home(site)?,
-                facts.native_table_read_layout_at(site)?,
+                if facts.direct_global_read_home(site).is_some() {
+                    ReadLayout::Global
+                } else {
+                    ReadLayout::Table(facts.native_table_read_layout_at(site)?)
+                },
             ))
         })?;
     }

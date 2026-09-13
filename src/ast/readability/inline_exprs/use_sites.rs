@@ -546,7 +546,9 @@ fn rewrite_expr_use_sites(
             let operand_site = match binary.op {
                 super::super::super::common::AstBinaryOpKind::Eq
                 | super::super::super::common::AstBinaryOpKind::Lt
-                | super::super::super::common::AstBinaryOpKind::Le => InlineSite::ComparisonOperand,
+                | super::super::super::common::AstBinaryOpKind::Le
+                | super::super::super::common::AstBinaryOpKind::Gt
+                | super::super::super::common::AstBinaryOpKind::Ge => InlineSite::ComparisonOperand,
                 _ => site.descend_value_expr(),
             };
             let mut changed = rewrite_expr_use_sites(

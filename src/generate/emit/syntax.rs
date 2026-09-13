@@ -67,6 +67,8 @@ pub(super) fn binary_meta(op: AstBinaryOpKind) -> (u8, Assoc, &'static str) {
         AstBinaryOpKind::Eq => (PREC_COMPARE, Assoc::Non, "=="),
         AstBinaryOpKind::Lt => (PREC_COMPARE, Assoc::Non, "<"),
         AstBinaryOpKind::Le => (PREC_COMPARE, Assoc::Non, "<="),
+        AstBinaryOpKind::Gt => (PREC_COMPARE, Assoc::Non, ">"),
+        AstBinaryOpKind::Ge => (PREC_COMPARE, Assoc::Non, ">="),
     }
 }
 

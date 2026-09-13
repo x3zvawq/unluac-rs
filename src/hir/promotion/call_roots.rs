@@ -9,6 +9,8 @@
 //! 调用布局独立于 callee 值身份；完整帧另需 canonical Def/phi 保留同一 home，
 //! 如 `assert(check()==12)` 的 Boolean 合流不创建新 callee。参数区的捕获状态独立
 //! 保存，不能因某个参数没有 direct Def 而丢失布局，也不把布局当作一般根退休许可。
+//! 开放 VARARG 参数消费 Dataflow 已解析的唯一包来源及原起点；完整帧据此恢复省略号，
+//! 不将 `f(...)` 的源码外形当作原 VARARG 与 CALL 相邻或槽距相同的证明。
 
 use super::*;
 use crate::hir::common::HirCallArgumentRoot;
@@ -19,6 +21,7 @@ use crate::transformer::ValuePack;
 pub(super) struct NativeCallFacts {
     pub(super) argument_roots: Vec<HirCallArgumentRoot>,
     pub(super) argument_values: Vec<Option<TempId>>,
+    pub(super) vararg_tail_home: Option<HomeSlotKey>,
     pub(super) layout: NativeCallLayout,
     pub(super) callee: Option<TempId>,
     pub(super) assignment_copies: Option<[TempId; 2]>,
@@ -176,6 +179,26 @@ pub(super) fn collect(
             call_ref,
             NativeCallFacts {
                 argument_roots: roots,
+                vararg_tail_home: match args {
+                    ValuePack::Open(_) => {
+                        let sources = &dataflow.open_use_sources[index];
+                        if !sources.has_entry() && sources.defs().len() == 1 {
+                            let def = &dataflow.open_defs[sources.defs().first().unwrap().index()];
+                            // 原开放包必须直接来自同块的最后一条 VARARG，不能把 CALL
+                            // 返回包或跨路径 pack phi 当作源码中的直接省略号。
+                            (def.block == cfg.instr_to_block[index]
+                                && def.instr.index() + 1 == index
+                                && matches!(proto.instrs[def.instr.index()], LowInstr::VarArg(_)))
+                            .then_some(HomeSlotKey::new(
+                                def.start_reg.index(),
+                                epochs.epoch_at(def.start_reg, call_ref),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    ValuePack::Fixed(_) => None,
+                },
                 argument_values: match args {
                     ValuePack::Fixed(pack) => (0..pack.len)
                         .map(|offset| {

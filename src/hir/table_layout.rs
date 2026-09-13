@@ -352,7 +352,11 @@ impl crate::value_semantics::table::TableExpression for HirExpr {
             Self::Binary(binary)
                 if matches!(
                     binary.op,
-                    HirBinaryOpKind::Eq | HirBinaryOpKind::Lt | HirBinaryOpKind::Le
+                    HirBinaryOpKind::Eq
+                        | HirBinaryOpKind::Lt
+                        | HirBinaryOpKind::Le
+                        | HirBinaryOpKind::Gt
+                        | HirBinaryOpKind::Ge
                 ) =>
             {
                 Expr::Comparison(&binary.lhs, &binary.rhs)

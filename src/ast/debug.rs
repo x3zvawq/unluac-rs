@@ -41,9 +41,7 @@ use super::common::{
     AstLValue, AstMethodCallExpr, AstModule, AstNamePath, AstNameRef, AstStmt, AstSyntheticLocalId,
     AstTableField,
 };
-use super::pretty::{
-    is_default_numeric_for_step, preferred_negated_relational_render, preferred_relational_render,
-};
+use super::pretty::{is_default_numeric_for_step, preferred_negated_relational_render};
 
 mod expressions;
 mod operators;

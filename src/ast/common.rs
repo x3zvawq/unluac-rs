@@ -464,10 +464,18 @@ impl AstRewriteAuthority {
         !self.must_preserve()
     }
 
-    /// 空声明相邻合并仍保持每个槽的 nil 写、顺序和所有观察点之前的前缀。
-    /// 其它 HIR 保留理由及 debug/属性限制仍由各自 owner 检查。
-    pub fn may_merge_adjacent_empty_declarations(&self) -> bool {
+    /// 无求值事件的空声明或基本字面量声明相邻合并，保持每个槽的原写与完整前缀。
+    /// 调用方核对 RHS 类别，其它 HIR 保留理由及 debug/属性限制仍独立检查。
+    pub fn may_merge_adjacent_inert_declarations(&self) -> bool {
         self.may_move_scope_start()
+            || matches!(self, Self::Hir(HirInlineDisposition::Preserve(reasons))
+                if reasons.iter().all(|reason| *reason == crate::hir::HirInlineRetentionReason::PhysicalFramePrefix))
+    }
+
+    /// 普通父块的尾 do 合并不移动初始化或声明槽，也不改变共同退出时点。
+    /// 调用方必须排除 repeat 尾条件与 debug 可见边界，不能用于一般 scope-start 移动。
+    pub fn may_merge_tail_scope(&self) -> bool {
+        !self.must_preserve()
             || matches!(self, Self::Hir(HirInlineDisposition::Preserve(reasons))
                 if reasons.iter().all(|reason| *reason == crate::hir::HirInlineRetentionReason::PhysicalFramePrefix))
     }
@@ -744,4 +752,8 @@ pub enum AstBinaryOpKind {
     Eq,
     Lt,
     Le,
+    /// 原比较准备顺序要求左侧先求值，不能交换回 Lt。
+    Gt,
+    /// 原比较准备顺序要求左侧先求值，不能交换回 Le。
+    Ge,
 }

@@ -27,6 +27,8 @@ pub(super) fn format_binary_op(op: super::super::common::AstBinaryOpKind) -> &'s
         super::super::common::AstBinaryOpKind::Eq => "==",
         super::super::common::AstBinaryOpKind::Lt => "<",
         super::super::common::AstBinaryOpKind::Le => "<=",
+        super::super::common::AstBinaryOpKind::Gt => ">",
+        super::super::common::AstBinaryOpKind::Ge => ">=",
     }
 }
 

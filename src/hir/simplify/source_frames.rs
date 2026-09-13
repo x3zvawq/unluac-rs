@@ -21,8 +21,8 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use crate::hir::simplify::mention::BindingReadCollector;
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
-mod nil_writes;
-pub(super) use nil_writes::restore_nil_writes;
+mod materializations;
+pub(super) use materializations::restore_materializations;
 
 /// 候选除原 freereg 外，还可要求特定低槽身份在开始前已声明；不能借后缀新声明替代。
 pub(super) struct PrefixRequest {
@@ -143,12 +143,30 @@ pub(super) fn validate_prefixes(
     let mut declared = BTreeSet::new();
     let mut header_slots = proto.params.len();
     if let Some(local) = proto.vararg_param_local {
-        // Lua 5.5 的签名明确包含原隐式变参槽；目标编译器仍在固定参数后保留该槽。
-        // legacy arg 有不同建表/兼容语义，不能借这个签名证明。
-        if dialect != DecompileDialect::Lua55
+        // Lua 5.1 的 parlist 为 HASARG 保留一槽；当前函数真实使用省略号时，
+        // 编译器清除 NEEDSARG，不再建兼容表，但仍保留该槽。没有省略号不能借此
+        // 推断 legacy arg 的建表语义；Lua 5.5 则由其独立签名合同提供隐式槽。
+        let header_supported = match dialect {
+            DecompileDialect::Lua55 => !proto.signature.legacy_arg_slot,
+            DecompileDialect::Lua51 if proto.signature.legacy_arg_slot && !is_chunk_entry => {
+                struct VarargUse(bool);
+                impl HirVisitor<'_> for VarargUse {
+                    fn is_complete(&self) -> bool {
+                        self.0
+                    }
+                    fn visit_expr(&mut self, expr: &crate::hir::common::HirExpr) {
+                        self.0 |= matches!(expr, crate::hir::common::HirExpr::VarArg);
+                    }
+                }
+                let mut usage = VarargUse(false);
+                visit_stmts(&proto.body.stmts, &mut usage);
+                usage.0
+            }
+            _ => false,
+        };
+        if !header_supported
             || !proto.signature.is_vararg
             || !proto.signature.has_vararg_param_reg
-            || proto.signature.legacy_arg_slot
             || facts.trusted_local_home_slot(local).map(HomeSlotKey::slot) != Some(header_slots)
         {
             return Err(0);
@@ -325,6 +343,15 @@ impl PrefixScan<'_> {
                         _ => true,
                     }) => {}
                 HirStmt::CallStmt(_) | HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue => {}
+                HirStmt::ToBeClosed(tbc)
+                    if matches!(tbc.value, crate::hir::common::HirExpr::LocalRef(local)
+                        if self.declared.contains(&local)
+                            && self.facts.trusted_local_home_slot(local)
+                                == Some(self.facts.tbc_home(tbc.origin))) =>
+                {
+                    // TBC 激活已声明的同一槽，不新增声明位置；其资源与关闭边界仍由原
+                    // owner 保留。后续帧可以验证该前缀，不能吸收或移动这条 activation。
+                }
                 HirStmt::LocalRootRelease(local) if self.declared.contains(local) => {}
                 _ => return Err(index),
             }

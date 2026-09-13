@@ -42,6 +42,8 @@ pub(crate) fn naturalize_pure_logical_expr(
                     crate::hir::HirBinaryOpKind::Eq
                         | crate::hir::HirBinaryOpKind::Lt
                         | crate::hir::HirBinaryOpKind::Le
+                        | crate::hir::HirBinaryOpKind::Gt
+                        | crate::hir::HirBinaryOpKind::Ge
                 )
             {
                 return binary.source_site.take().is_some();

@@ -152,10 +152,12 @@ impl HirExprSafety {
         lhs: &HirExpr,
         rhs: &HirExpr,
     ) -> Option<bool> {
-        let op = match op {
-            HirBinaryOpKind::Eq => LuaComparison::Eq,
-            HirBinaryOpKind::Lt => LuaComparison::Lt,
-            HirBinaryOpKind::Le => LuaComparison::Le,
+        let (op, lhs, rhs) = match op {
+            HirBinaryOpKind::Eq => (LuaComparison::Eq, lhs, rhs),
+            HirBinaryOpKind::Lt => (LuaComparison::Lt, lhs, rhs),
+            HirBinaryOpKind::Le => (LuaComparison::Le, lhs, rhs),
+            HirBinaryOpKind::Gt => (LuaComparison::Lt, rhs, lhs),
+            HirBinaryOpKind::Ge => (LuaComparison::Le, rhs, lhs),
             _ => return None,
         };
         self.values
@@ -239,23 +241,23 @@ fn primitive_literal_comparison_is_eventless(
     matches!(
         (op, lhs, rhs),
         (
-            HirBinaryOpKind::Lt | HirBinaryOpKind::Le,
+            HirBinaryOpKind::Lt | HirBinaryOpKind::Le | HirBinaryOpKind::Gt | HirBinaryOpKind::Ge,
             HirExpr::Integer(_),
             HirExpr::Integer(_)
         ) | (
-            HirBinaryOpKind::Lt | HirBinaryOpKind::Le,
+            HirBinaryOpKind::Lt | HirBinaryOpKind::Le | HirBinaryOpKind::Gt | HirBinaryOpKind::Ge,
             HirExpr::Number(_),
             HirExpr::Number(_)
         ) | (
-            HirBinaryOpKind::Lt | HirBinaryOpKind::Le,
+            HirBinaryOpKind::Lt | HirBinaryOpKind::Le | HirBinaryOpKind::Gt | HirBinaryOpKind::Ge,
             HirExpr::Integer(_),
             HirExpr::Number(_)
         ) | (
-            HirBinaryOpKind::Lt | HirBinaryOpKind::Le,
+            HirBinaryOpKind::Lt | HirBinaryOpKind::Le | HirBinaryOpKind::Gt | HirBinaryOpKind::Ge,
             HirExpr::Number(_),
             HirExpr::Integer(_)
         ) | (
-            HirBinaryOpKind::Lt | HirBinaryOpKind::Le,
+            HirBinaryOpKind::Lt | HirBinaryOpKind::Le | HirBinaryOpKind::Gt | HirBinaryOpKind::Ge,
             HirExpr::String(_),
             HirExpr::String(_)
         )

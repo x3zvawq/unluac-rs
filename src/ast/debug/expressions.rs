@@ -62,21 +62,12 @@ pub(super) fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNa
             }
         }
         AstExpr::Binary(binary) => {
-            if let Some(preferred) = preferred_relational_render(binary) {
-                format!(
-                    "({} {} {})",
-                    format_expr(preferred.lhs, indent, names),
-                    preferred.op_text,
-                    format_expr(preferred.rhs, indent, names)
-                )
-            } else {
-                format!(
-                    "({} {} {})",
-                    format_expr(&binary.lhs, indent, names),
-                    format_binary_op(binary.op),
-                    format_expr(&binary.rhs, indent, names)
-                )
-            }
+            format!(
+                "({} {} {})",
+                format_expr(&binary.lhs, indent, names),
+                format_binary_op(binary.op),
+                format_expr(&binary.rhs, indent, names)
+            )
         }
         AstExpr::LogicalAnd(logical) => {
             format!(
