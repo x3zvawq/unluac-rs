@@ -213,6 +213,11 @@ pub(super) fn finalize_normal_tail_guards(
         };
         entries.sort_by_key(|edge| edge.index());
         entries.dedup();
+        if tail.in_exit_arm && !entries.is_empty() {
+            return Err(StructureError::invalid(
+                "private while exit arm has a bypass after freezing",
+            ));
+        }
         tail.early_exits = entries;
     }
     Ok(())

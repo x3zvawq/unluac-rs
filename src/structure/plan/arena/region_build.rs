@@ -105,7 +105,7 @@ pub(super) fn build_regions(
     }
 
     let mut admitted_loops = vec![false; input.loops.len()];
-    for (index, loop_) in input.loops.iter().enumerate() {
+    for (index, admitted) in admitted_loops.iter_mut().enumerate() {
         let id = super::super::LoopPlanId(index);
         let blocks = partitions
             .get(index)
@@ -130,7 +130,7 @@ pub(super) fn build_regions(
             || loop_exit_crosses_resource_boundary(
                 proto,
                 cfg,
-                &loop_.candidate,
+                &input.loops[id.index()].candidate,
                 partition,
                 &input.scopes,
                 flow,
@@ -144,7 +144,7 @@ pub(super) fn build_regions(
             blocks,
             graph_facts,
         )?);
-        admitted_loops[index] = true;
+        *admitted = true;
     }
 
     let mut value_decision_blocks = BTreeSet::new();

@@ -289,8 +289,8 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         name: "final-dead-unresolved-temps",
         phase: PassPhase::Final,
         depends_on: HIR_SHAPE_INPUTS,
-        // 完整调用帧已稳定；未消费的 Boolean 预写重新接受原死写清理证明。
-        invalidates: &[TempChain],
+        // 完整调用帧已稳定；nil 声明前缀先交词法事务，未消费项与 Boolean 预写仍按原证明清理。
+        invalidates: &[TempChain, LocalBinding, BlockStructure, TablePattern],
     },
 ];
 
@@ -405,12 +405,24 @@ pub(super) fn simplify_hir(
                             roots(),
                             table_constructors::TableConstructorStage::LowerFixedBatches,
                         ),
-                        18 => dead_temps::remove_dead_temp_materializations_in_proto(
-                            proto,
-                            facts,
-                            safety,
-                            dead_temps::DeadTempStage::Final,
-                        ),
+                        18 => {
+                            let mut changed = false;
+                            if !source_frames::pending_nil_prefix_temps(proto, facts).is_empty() {
+                                changed |= source_frames::restore_materializations(
+                                    proto,
+                                    facts,
+                                    dialect,
+                                    proto.id == chunk_entry,
+                                );
+                            }
+                            changed |= dead_temps::remove_dead_temp_materializations_in_proto(
+                                proto,
+                                facts,
+                                safety,
+                                dead_temps::DeadTempStage::Final,
+                            );
+                            changed
+                        }
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })

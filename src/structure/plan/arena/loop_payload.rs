@@ -23,8 +23,16 @@ pub(super) fn loop_exit_crosses_resource_boundary(
     if partition.owned.contains(&continuation) {
         return Ok(false);
     }
+    // 唯一自然出口可能被词法 arm 收入正文，尤其 Lua 5.5 的 Close+Jump pad。
+    // 资源退出区间仍从这个原入口开始；从后移的 continuation 重新取状态会丢失
+    // pad 已关闭 inner 的事实，误以为 outer 可以和它一起在 break 处关闭。
+    let entry = if candidate.exits.len() == 1 {
+        candidate.exits.first().copied().unwrap_or(continuation)
+    } else {
+        continuation
+    };
     let before = flow
-        .active_at_entry(continuation)
+        .active_at_entry(entry)
         .ok_or_else(|| StructureError::invalid("loop normal exit has no TBC entry facts"))?;
     let mut required = before
         .iter()
@@ -40,11 +48,14 @@ pub(super) fn loop_exit_crosses_resource_boundary(
     }
     // Lua 5.4 的 goto pad 可只有 Jump，5.5 可把 Close 放在同一个 pad 内。
     // 沿已有 cleanup connector 保留关闭状态，不能跳过 Close 后再重置生命周期。
-    let mut target = continuation;
+    let mut target = entry;
     let mut connectors = BTreeSet::new();
     let mut closed_resource = false;
     let crosses = 'tail: loop {
-        if partition.owned.contains(&target) || !connectors.insert(target) {
+        if candidate.blocks.contains(&target)
+            || candidate.control_blocks.binary_search(&target).is_ok()
+            || !connectors.insert(target)
+        {
             break false;
         }
         let after = flow
@@ -85,13 +96,11 @@ pub(super) fn loop_exit_crosses_resource_boundary(
     if !crosses {
         return Ok(false);
     }
-    // 仅有交错资源边界时才冻结控制边；正常出口不依赖内部 terminal 细分。
-    let control = freeze_loop_control_edges(cfg, candidate, partition, None)?;
-    Ok(control
-        .exit
-        .into_iter()
-        .chain(control.preheader_exit)
-        .any(|edge| cfg.edges[edge.index()].to == continuation))
+    // 资源范围由真实退出边决定。Unknown header 归入 while true 正文后，control
+    // 可以为空；只检查语法条件出口会漏掉正文 break，让 outer 在 inner 后的观察前关闭。
+    Ok(cfg.preds[entry.index()]
+        .iter()
+        .any(|edge| loop_body_owns_block(partition, cfg.edges[edge.index()].from)))
 }
 
 fn loop_body_owns_block(partition: &LoopPartitions, block: BlockRef) -> bool {

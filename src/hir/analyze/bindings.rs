@@ -299,6 +299,7 @@ pub(super) fn build_bindings(
         &nested_carried_parents,
         (&numeric_binding_phis.bindings, &phi_debug_hints),
         (&mut phi_temps, &mut fixed_temps),
+        captured_slot_epochs,
     );
     preserve_loop_state_overwrites(
         proto,
@@ -316,12 +317,16 @@ pub(super) fn build_bindings(
         .plan()
         .loops()
         .map(|(_, loop_plan)| {
-            loop_plan.normal_tail.as_ref().map(|_| {
-                let temp = TempId(next_temp_index);
-                next_temp_index += 1;
-                home_free_temps.insert(temp);
-                temp
-            })
+            loop_plan
+                .normal_tail
+                .as_ref()
+                .filter(|tail| !tail.in_exit_arm)
+                .map(|_| {
+                    let temp = TempId(next_temp_index);
+                    next_temp_index += 1;
+                    home_free_temps.insert(temp);
+                    temp
+                })
         })
         .collect::<Vec<_>>();
     let repeat_staged_temps = structure

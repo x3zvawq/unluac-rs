@@ -2,6 +2,12 @@
 
 use super::*;
 
+fn private_tail_owns_exit(partition: &LoopPartitions, edge: EdgeRef) -> bool {
+    partition.normal_tail.as_ref().is_some_and(|tail| {
+        tail.contract.in_exit_arm && tail.contract.normal_exits.binary_search(&edge).is_ok()
+    })
+}
+
 impl EdgeSemantics {
     pub(super) fn new(
         proto: &LoweredProto,
@@ -20,13 +26,13 @@ impl EdgeSemantics {
                 continue;
             };
             let region = arena.slots[spec_index].region();
-            for edge in partitions
+            let partition = partitions
                 .get(loop_id.index())
-                .ok_or_else(|| StructureError::invalid("selected loop has no frozen partitions"))?
-                .break_routes
-                .keys()
-                .copied()
-            {
+                .ok_or_else(|| StructureError::invalid("selected loop has no frozen partitions"))?;
+            for edge in partition.break_routes.keys().copied() {
+                if private_tail_owns_exit(partition, edge) {
+                    continue;
+                }
                 let slot = planned_breaks.get_mut(edge.index()).ok_or_else(|| {
                     StructureError::invalid("loop break route starts outside the CFG arena")
                 })?;
@@ -162,6 +168,11 @@ impl EdgeSemantics {
                         semantics.backedges[edge.index()] = Some(region);
                     }
                     for (edge, route) in &partition.break_routes {
+                        if private_tail_owns_exit(partition, *edge) {
+                            // 原私有尾已独占其 MOVE/phi 和完成边；不能再把同一路径
+                            // 转发到条件入口，否则会提前消费尚未执行的尾部写入。
+                            continue;
+                        }
                         if route
                             .iter()
                             .any(|edge| semantics.single_pass_breaks[edge.index()].is_some())

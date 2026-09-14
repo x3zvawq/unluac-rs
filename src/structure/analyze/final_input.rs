@@ -83,7 +83,7 @@ pub(super) fn final_plan_input(
         .map(|loop_| {
             let condition = required_loop_condition_header(cfg, &loop_)
                 .and_then(|header| condition_by_header.get(&header).copied());
-            let continuation = loop_continuation(
+            let (continuation, private_exit_tail) = loop_continuation(
                 proto,
                 &loop_,
                 condition.and_then(|id| conditions.get(id.index())),
@@ -94,6 +94,7 @@ pub(super) fn final_plan_input(
             LoopPlanInput {
                 condition,
                 continuation,
+                private_exit_tail,
                 candidate: loop_,
                 semantic_continue_edges: BTreeSet::new(),
             }

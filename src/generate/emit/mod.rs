@@ -221,15 +221,13 @@ impl<'a> Emitter<'a> {
             push_comment_text(&mut proto_meta, &source.display_text());
         }
 
-        let mut comments = Vec::with_capacity(2);
         if metadata.line_range.defined_start != 0 || metadata.line_range.defined_end != 0 {
-            comments.push(Doc::text(format!(
-                "-- line {}-{}",
+            proto_meta.push_str(&format!(
+                " lines={}-{}",
                 metadata.line_range.defined_start, metadata.line_range.defined_end
-            )));
+            ));
         }
-        comments.push(Doc::text(proto_meta));
-        Some(Doc::join(comments, Doc::line()))
+        Some(Doc::text(proto_meta))
     }
 
     fn emit_stmt_separator(&self, prev: &crate::ast::AstStmt, next: &crate::ast::AstStmt) -> Doc {

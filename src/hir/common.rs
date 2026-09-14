@@ -1498,6 +1498,9 @@ pub enum HirTableField {
 /// 表记录字段。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirRecordField {
+    /// 被构造区域吸收的原 SETTABLE 来源；模板预置和数组降级不冒充显式字段写。
+    /// 完成内层 `{[key]=value}` 后，外层帧仍据此核对原 key/value 暂存布局。
+    pub(crate) write_sources: HirOperationSources,
     /// 字段键的语义表达式；是否能写成 `name = value` 由目标 AST 方言决定。
     pub key: HirExpr,
     pub value: HirExpr,

@@ -179,6 +179,7 @@ pub(super) fn coalesce_loop_state_temps(
     nested_carried_parents: &[Option<PhiId>],
     binding_barriers: (&[bool], &[Option<DebugBindingHint<'_>>]),
     binding_temps: (&mut [TempId], &mut [TempId]),
+    epochs: &SlotEpochFacts,
 ) {
     let (numeric_binding_phis, phi_debug_hints) = binding_barriers;
     let (phi_temps, fixed_temps) = binding_temps;
@@ -274,6 +275,11 @@ pub(super) fn coalesce_loop_state_temps(
                 Some(LoopVmProtocol::Repeat(_))
             ))
         .then_some(*loop_control);
+        let while_control_def = (!has_nested_parent
+            && phi_debug_hints[phi.phi.index()].is_none()
+            && matches!(plan.loop_protocol(*loop_id), Some(LoopVmProtocol::While(_))))
+        .then(|| direct_while_control_write(cfg, dataflow, plan, epochs, phi.phi, *loop_control))
+        .flatten();
         let direct_region = if has_nested_parent {
             carried.owner
         } else {
@@ -289,6 +295,7 @@ pub(super) fn coalesce_loop_state_temps(
             match incoming.value {
                 SsaValue::Def(def)
                     if def_is_same_reg_in_region(dataflow, plan, def, phi.reg, direct_region)
+                        || while_control_def == Some(def)
                         || repeat_control.is_some_and(|control| {
                             def_is_same_reg_in_region(dataflow, plan, def, phi.reg, control)
                         }) =>
@@ -432,6 +439,52 @@ pub(super) fn coalesce_loop_state_temps(
             *temp = target;
         }
     }
+}
+
+/// while 头的原同槽覆盖在条件前已经发生，不能等回边 phi COPY 才写回。
+/// 例如 `<close> guard; state = state + 1; if stop then break end`，提前保留旧 state
+/// 会让回边从已关闭的临时声明读取。这里只接同块、同 epoch 的唯一覆盖，且旧 phi
+/// 只在原覆盖指令读取；额外 COPY 可能保留旧快照，不能借 raw SSA 读索引将其合并。
+fn direct_while_control_write(
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    epochs: &SlotEpochFacts,
+    phi_id: PhiId,
+    control: RegionId,
+) -> Option<DefId> {
+    let phi = plan.phi_plan(phi_id)?;
+    let carried = phi.loop_carried()?;
+    let mut output = None;
+    for incoming in &phi.incomings {
+        if incoming.disposition != PhiIncomingDisposition::LoopCarried(carried.owner) {
+            continue;
+        }
+        let SsaValue::Def(def) = incoming.value else {
+            return None;
+        };
+        if output.replace(def).is_some_and(|previous| previous != def) {
+            return None;
+        }
+    }
+    let def = output?;
+    let definition = &dataflow.defs[def.index()];
+    let header_start = cfg.blocks[phi.block.index()].instrs.start;
+    (definition.block == phi.block
+        && def_is_same_reg_in_region(dataflow, plan, def, phi.reg, control)
+        && dataflow.canonical_move_value(SsaValue::Def(def)) == Some(SsaValue::Def(def))
+        && dataflow.def_overwritten_value(def) == Some(SsaValue::Phi(phi_id))
+        && epochs.epoch_at(phi.reg, header_start) == epochs.epoch_at(phi.reg, definition.instr)
+        && dataflow.phi_uses[phi_id.index()]
+            .iter()
+            .all(|site| site.instr == definition.instr && site.reg == phi.reg)
+        && dataflow.phi_phi_uses[phi_id.index()]
+            .iter()
+            .all(|&consumer| dataflow.phi_is_truly_dead(consumer))
+        && dataflow.def_phi_uses[def.index()]
+            .iter()
+            .all(|&consumer| consumer == phi_id || dataflow.phi_is_truly_dead(consumer)))
+    .then_some(def)
 }
 
 /// 普通 loop control prefix 可能在 exit 前观察 binding，因此这里只接受无普通前缀的

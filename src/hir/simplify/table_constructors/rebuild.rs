@@ -162,7 +162,14 @@ fn flush_constructor_segment(
                 *source_preservation,
                 context.scratch,
             ),
-            RegionStep::Record { key, value, .. } => prepare_record_step(key, value, context)?,
+            RegionStep::Record {
+                write_sources,
+                key,
+                value,
+                ..
+            } => {
+                prepare_record_step(write_sources, key, value, context)?;
+            }
             RegionStep::SetList { .. } => {
                 unreachable!("set-list should terminate constructor segment")
             }
@@ -557,6 +564,7 @@ fn register_single_producer(
 }
 
 fn prepare_record_step(
+    write_sources: &crate::hir::common::HirOperationSources,
     key: &HirExpr,
     value: &HirExpr,
     context: &mut RegionRebuildContext<'_>,
@@ -630,7 +638,11 @@ fn prepare_record_step(
     }
     let prepared_record_index = context.scratch.prepared_records.len();
     context.scratch.prepared_records.push(PreparedRecord {
-        field: crate::hir::common::HirRecordField { key, value },
+        field: crate::hir::common::HirRecordField {
+            write_sources: write_sources.clone(),
+            key,
+            value,
+        },
         eval_events: eval_event_start..context.scratch.prepared_eval_events.len(),
     });
     context.scratch.tokens.push(SegmentToken::Record {

@@ -906,6 +906,12 @@ impl InlineSite {
                 !matches!(replacement, HirExpr::Closure(_))
                     && expr_complexity(replacement) <= CONTROL_HEAD_INLINE_MAX_COMPLEXITY
             }
+            Self::ReturnValue if matches!(replacement, HirExpr::Decision(_)) => {
+                // 候选拒绝[LayerBoundary]：残余 Decision 需由 eliminate-decisions 在原
+                // producer 上物化，保留结果 home 供 carried-locals 合并；吞入 return
+                // 会丢掉该身份并重建 home-free carrier。纯表达式化后仍会重审内联。
+                false
+            }
             Self::ReturnValue | Self::Index | Self::CallArg | Self::FastCallArg => {
                 // 候选拒绝[PolicyBoundary]：return/index/arg 的用户可配置复杂度阈值只控制源码展示密度。
                 self.complexity_limit(options)

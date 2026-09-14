@@ -34,6 +34,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         if self.lowering.structure.plan().loop_region(plan) != Some(region) {
             return self.invalid_region(region, "loop payload is bound to another region");
         }
+        let mut exit_tail = None;
         let normal_tail = match (
             identity.has_normal_tail,
             normal_tail_region,
@@ -41,6 +42,26 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         ) {
             (false, None, None) => None,
             (true, Some(_), Some(tail)) if tail.is_empty() => None,
+            (true, Some(_), Some(tail))
+                if payload
+                    .normal_tail
+                    .as_ref()
+                    .is_some_and(|tail| tail.in_exit_arm) =>
+            {
+                if payload.kind != crate::structure::LoopKindHint::WhileLike
+                    || payload
+                        .normal_tail
+                        .as_ref()
+                        .is_some_and(|tail| !tail.early_exits.is_empty())
+                {
+                    return self.invalid_region(
+                        region,
+                        "private exit arm requires a while without bypass",
+                    );
+                }
+                exit_tail = Some(tail);
+                None
+            }
             (true, Some(_), Some(tail)) => Some((
                 tail,
                 self.lowering
@@ -72,6 +93,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 control,
                 body,
                 normal_tail,
+                exit_tail,
                 propagated_break,
                 *protocol,
             ),
@@ -118,12 +140,17 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         Ok(lowered)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "冻结的普通尾与私有退出臂具有不同执行位置，不能合并其guard身份"
+    )]
     pub(super) fn lower_while_loop(
         &mut self,
         region: RegionId,
         control: RegionId,
         body: PlannedBlock,
         normal_tail: Option<(PlannedBlock, TempId)>,
+        exit_tail: Option<PlannedBlock>,
         propagated_break: Option<RegionId>,
         protocol: LoopConditionProtocol,
     ) -> Result<PlannedBlock, HirLowerError> {
@@ -154,7 +181,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             ));
         }
         let mut loop_body = condition.prefix;
-        let exit = match exit_transfer {
+        let mut exit = match exit_transfer {
             EdgeTransfer::BranchArm(crate::structure::BranchArm::LoopExit) => {
                 let mut exit = self.lower_edge(region, exit_edge)?;
                 exit.stmts.push(HirStmt::Break);
@@ -182,6 +209,22 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 );
             }
         };
+        if let Some(tail) = exit_tail {
+            if normal_tail.is_some()
+                || cross_loop_transfer.is_some()
+                || exit_transfer != EdgeTransfer::BranchArm(crate::structure::BranchArm::LoopExit)
+                || !matches!(exit.stmts.pop(), Some(HirStmt::Break))
+            {
+                return self.invalid_region(
+                    region,
+                    "private tail has no single current-loop condition exit",
+                );
+            }
+            // 只消费 Structure 冻结的原回边前私有域；所有读取和 Close 仍在 break 之前。
+            // 循环内本轮 CALL 结果因此不必越过 while 形成外层 carrier。
+            exit.stmts.extend(self.finish_emission(region, tail)?.stmts);
+            exit.stmts.push(HirStmt::Break);
+        }
         if normal_tail.is_none()
             && loop_body.is_empty()
             && cross_loop_transfer.is_none()

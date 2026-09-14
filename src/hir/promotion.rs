@@ -1483,8 +1483,16 @@ impl ProtoPromotionFacts {
         &self,
         access: &crate::hir::common::HirTableAccess,
     ) -> Option<NativeTableWriteLayout> {
+        self.native_record_write_layout(&access.sources)
+    }
+
+    /// 字段并入构造器后继续消费原显式写来源，不从完成后的字段形状猜 SETTABLE 布局。
+    pub(super) fn native_record_write_layout(
+        &self,
+        sources: &crate::hir::common::HirOperationSources,
+    ) -> Option<NativeTableWriteLayout> {
         let mut result = None;
-        access.sources.try_for_each_known(|source| {
+        sources.try_for_each_known(|source| {
             if self.source_proto != Some(source.proto) {
                 return None;
             }
@@ -1893,6 +1901,35 @@ impl ProtoPromotionFacts {
             .filter_map(|call| call.assignment_copies)
             .flatten()
             .collect::<BTreeSet<_>>();
+        // CONCAT 的原输入 COPY 从低于整批缓冲的常量 local 读取时，那个独立声明
+        // 仍是后继完整帧的低槽前缀。只内联其 LOADCONST 会让结果声明提前占低一槽，
+        // 例如 `suffix="tail"; key="slot_"..suffix; t={...}` 丢掉 suffix 的原 r0。
+        // 复用已发布的每个 CONCAT 输入 Def 和 cached MOVE 来源；不把 CALL/闭包等
+        // 有独立生命周期的源纳入这项纯标量保留，也不逐候选重扫整个指令后缀。
+        call_frame_temps.extend(concat_frames.values().flat_map(|frame| {
+            frame.operands.iter().flatten().filter_map(|temp| {
+                if temp.index() >= dataflow.defs.len() {
+                    return None;
+                }
+                let input = crate::structure::DefId(temp.index());
+                let site = dataflow.def_instr(input);
+                let LowInstr::Move(copy) = &proto.instrs[site.index()] else {
+                    return None;
+                };
+                let SsaValue::Def(source) =
+                    dataflow.canonical_move_value(dataflow.use_value(site, copy.src))?
+                else {
+                    return None;
+                };
+                (fixed_temps[source.index()] == TempId(source.index())
+                    && dataflow.def_reg(source).index() < frame.buffer.start.index()
+                    && matches!(
+                        proto.instrs[dataflow.def_instr(source).index()],
+                        LowInstr::LoadConst(_)
+                    ))
+                .then_some(TempId(source.index()))
+            })
+        }));
         // 无返回值调用的具名闭包由 statement owner 恢复；原低槽 CLOSURE 是 caller
         // 前缀中的独立分配，不能把其定义身份换成高槽 callee COPY。
         // 保留这个 canonical 定义，让 locals 按原 home 声明；完整调用帧再消费 COPY。

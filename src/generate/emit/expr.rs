@@ -5,6 +5,8 @@
 //! 保留每个节点的括号边界，避免把 AST 深运算链继续传给 Doc 渲染与析构。
 //! 例如：`AstExpr::SingleValue(call)` 会在这里带括号输出成单值调用表达式；Luau vector
 //! 只消费显式宿主构造器配置，不从 bytecode 猜 API 名。
+//! 所有函数的可选元信息共用函数头行尾位置，不受声明/字段/参数/IIFE 语法影响。
+//! 注释之后的正文使用硬换行，既不改变表达式括号，也不与正文开头的子函数元信息混淆。
 
 use crate::ast::pretty::preferred_negated_relational_render;
 use crate::ast::{
@@ -532,7 +534,12 @@ impl<'a> Emitter<'a> {
         params: Doc,
     ) -> Result<Doc, GenerateError> {
         let body = self.emit_block(&func.body, func.function)?;
-        let mut parts = vec![header, params, self.emit_indented_body(&func.body, body)];
+        let body = self.emit_indented_body(&func.body, body);
+        let mut parts = vec![header, params];
+        if let Some(comment) = self.emit_function_comment(func.function) {
+            parts.extend([Doc::text(" "), comment]);
+        }
+        parts.push(body);
         parts.push(Doc::line());
         parts.push(Doc::text("end"));
         Ok(Doc::concat(parts))

@@ -106,6 +106,7 @@ enum RegionStep<'a> {
     },
     Record {
         stmt_index: usize,
+        write_sources: &'a crate::hir::common::HirOperationSources,
         key: &'a HirExpr,
         value: &'a HirExpr,
     },
@@ -197,6 +198,7 @@ struct PreparedRecord {
 #[derive(Debug, Clone)]
 struct RestoredPendingIntegerField {
     field_index: usize,
+    write_sources: crate::hir::common::HirOperationSources,
     key: i64,
     value: HirExpr,
 }

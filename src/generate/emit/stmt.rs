@@ -334,9 +334,7 @@ impl<'a> Emitter<'a> {
                 crate::ast::AstFunctionName::Method(_, _)
             ),
         )?;
-        let decl =
-            self.emit_function_with_header_and_params(&function_decl.func, header, params)?;
-        Ok(self.prepend_function_comment(function_decl.func.function, decl))
+        self.emit_function_with_header_and_params(&function_decl.func, header, params)
     }
 
     fn emit_local_function_decl(
@@ -348,8 +346,7 @@ impl<'a> Emitter<'a> {
             .names
             .resolve_binding_ref(function, &local_function_decl.name)?;
         let header = Doc::concat([Doc::text("local function "), Doc::text(name)]);
-        let decl = self.emit_function_with_header(&local_function_decl.func, header)?;
-        Ok(self.prepend_function_comment(local_function_decl.func.function, decl))
+        self.emit_function_with_header(&local_function_decl.func, header)
     }
 
     fn emit_value_list(
@@ -391,13 +388,6 @@ impl<'a> Emitter<'a> {
 
     fn emit_indented_body_nonempty(&self, body: Doc) -> Doc {
         Doc::indent(Doc::concat([Doc::line(), body]))
-    }
-
-    fn prepend_function_comment(&self, function: HirProtoRef, doc: Doc) -> Doc {
-        let Some(comment) = self.emit_function_comment(function) else {
-            return doc;
-        };
-        Doc::concat([comment, Doc::line(), doc])
     }
 }
 

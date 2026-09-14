@@ -24,7 +24,138 @@ c5c8e11f 将它替换为完整原 LOADNIL 组，并恢复后继低槽调用前�
 0cf0f78c提交比较准备与后继root覆盖的联合帧事务；随后主题将原输入准备复用于
 LEN/ADD和嵌套上值字段。所有回归仍保留，验证范围以以下实际日志为准。
 
-## 最新完成主题：05 的计算索引与拼接赋值帧
+## 最新完成主题：common_13_path_conditions 的条件返回结果身份
+
+用户已纠正：额外的 `r15_1` 指 common13 的 proto15，与 common10/common11 无关。
+基于 `ad0d2d3e` 的真实复现中，原 r2 同槽条件更新被 temp-inline 吞入 Return，
+eliminate-decisions 因表达式位置新建 home-free carrier，后续 carried-locals 缺少原
+home 而不能合并。现在 ReturnValue 根 Decision 沿用现有延期边界，保留原 producer
+直到原目标物化；既有同槽/身份/活性证明自然消除空 local。不新增 Phi 共址或放宽 guard。
+
+新增641覆盖循环后更新、未更新路径、元方法调用次数、返回false和独立旧值快照。
+最初比较探针使用 table/number，在Lua51源码baseline不支持，已改为各版本均支持的
+同元表 table/table 比较并同时断言真假两臂，矩阵与断言未缩减。最终定向
+`tmp/test/audit.common13.targeted-final.txt`：17项、49个proto全部通过。
+最终全量 `tmp/test/audit.common13.full.txt`：**3165项全部通过，0失败，0超时；2030个proto全部通过**。
+全工作区Clippy、WASM通过，日志同前缀 `.clippy.txt`、`.wasm.txt`。用户原命令已更新
+`tests/unit-case/common_13_path_conditions.lua.decompiled.lua`，构建日志 `.build-final.txt`。
+proto15不再有r15_1，条件更新与return均使用原r15_0；原源码/生成源码7行输出逐字一致，
+证据 `.sample-check.json`。`.gitignore` 为用户改动，生成文件被忽略，二者不纳入提交。
+没有遗留运行中的测试或子代理工作；本主题完成不代表长期系统审计完成。
+
+## 上一完成主题：common_11_runtime 的短路值帧与循环退出身份
+
+基于 `22cd3101` 复现用户的 `common_11_runtime.lua -D lua54`。proto13 的 CALL 短路值
+没有进入完整 CONCAT 帧；proto19 的私有终止臂落在循环外，导致本轮 CALL 结果外提，
+随后 native frame 三类遍历遗漏 While 正文，整组初始化不能消费。现已在原 owner
+补齐值帧、私有退出尾和 While 正文的同一遍历坐标，不新增 AST 空声明删除许可。
+proto20 自身正常，函数头前的空声明属于父 proto19。当前 common11 的 proto15 没有
+`r15_1`；common10 中的同名变量对应源码的 `key`，被多次用作表键，保留合理。
+
+新增639覆盖 CALL or/and 低槽备用值、回调改写、旧快照、多返回宽度和协程 yield。
+640 results/scope/readability 三文件保留多结果循环、公共后缀、提前退出、外部入口、
+关闭顺序和精确局部初始化行。新增边界实际暴露两处旧缺口：Unknown 退出臂没有进入
+原循环词法 arm 证明，以及 While control 的原同槽覆盖延迟为 Close 后的 phi COPY，
+后者让 do 外读取已经离开作用域的临时声明。分别在 Structure 和 binding owner 修复。
+
+定向 `tmp/test/audit.common11-agent.focused2.txt`：60项、56个proto全部通过。
+首次全量 `tmp/test/audit.common11.full.txt`：3155项中3150通过、5失败、无超时，
+2028个proto检查全部通过。失败为35 Lua51 round1，以及485 Lua54/55 strip/debug
+round1。35 的私有 MOVE 尾同时被 ExclusiveBreak 登记和转发消费；485 的 Unknown 头
+归入正文后，资源边界检查只看 control.exit 而漏掉正文 break。两处原 owner 已修复，
+Lua55 的 Close/Jump pad 还要求资源扫描从原唯一自然出口开始，不能从后移 continuation
+丢失已关闭 inner 的事实。旧Phi覆盖许可已收紧到仅原覆盖指令同reg读取，额外COPY
+不借此共址。最终边界矩阵 `tmp/test/audit.common11.boundary-final.txt`：20项全部通过。
+早期 full/focused/focused3 日志属于已闭合修复过程，不要据其中失败重做旧问题。
+
+最终全量 `tmp/test/audit.common11.full-final.txt`：**3155项全部通过，0失败，0超时；2030个proto全部通过**。
+全工作区Clippy、WASM check通过，日志同前缀 `.clippy.txt`、`.wasm.txt`。用户原命令已
+成功构建并更新 `tests/unit-case/common_11_runtime.decompiled.lua`，构建日志 `.build.txt`。
+原源码/生成源码9行输出逐字一致，proto13完整return、proto19多结果初始化一行且无空声明，
+20个函数均有函数头行尾元信息；证据 `tmp/test/audit.common11.sample-check.json`。
+所有失败样例和原断言保留，未提高已有预算。`.gitignore` 是用户改动，提交时排除；
+生成文件由该规则忽略，不纳入提交。没有遗留运行中的测试或子代理工作。
+本主题通过不代表长期系统审计完成。
+
+## 上一完成主题：common_10_tables 的完整表达式帧
+
+基于 `d0f7cd7d` 复现用户的 `common_10_tables.lua -D lua54`。本主题只处理该样例暴露的
+多层索引、算术赋值、调用参数与嵌套构造器，不重做已闭合注释布局或旧回归主题。
+新增635覆盖原闭包字段/数组构造器，636覆盖深层/动态索引及赋值，637覆盖元方法改变
+低槽key、目标来源与GC；638保留CONCAT前原nil/global临时根的真实语义反例。
+已有断言和收敛预算未降低；`.gitignore` 是用户改动，提交时排除。
+
+已证缺口：目标GETTABLE的唯一Def未进入完整赋值证明；连续空声明阻挡原源码前缀；
+内层record合并丢失SETTABLE来源；PUC索引与算术原槽树未被共享帧消费。
+新增 `write_sources` 保留原字段写身份，模板/array降级为Unknown，重建与proto重定位同步。
+CONCAT原低槽LOADCONST来源保留到完整帧，避免丢失后继声明前缀；递归索引/构造器
+逐层重建，避免克隆整棵子树后再次递归造成平方复制。debug路径同时修复空声明插在
+构造区内，以及无后继写的完整keys表抢占候选的问题。
+
+638的真实GC错误已闭合：Deferred先删nil锚点、scope预览遗漏独立构造器、ASSERT
+嵌套字段比较入口漏覆盖是依次出现的三处拒绝。现复用原nil形状与完整scope事务，
+普通恢复/未提交预览共享整批调用和构造器计划；比较进入原同槽lookup证明，不放宽guard。
+该反例Lua54/55 strip/debug四配置均通过，日志 `tmp/test/audit.common10-agent.638.targeted.txt`。
+早期 `audit.common10.targeted*.txt` 是修复过程日志，不能据其中已闭合失败重做旧问题。
+
+最终全量 `tmp/test/audit.common10.full.txt`：**3130项全部通过，0失败，0超时；2030个proto全部通过**。
+全工作区Clippy、WASM check、debug CLI构建通过，日志同前缀 `.clippy.txt`、`.wasm.txt`、`.build.txt`。
+全量后仅删除一个Clippy判定多余的lint标注，随后Clippy/WASM及实际CLI命令均通过。
+已执行用户原命令重新生成 `tests/unit-case/common_10_tables.decompiled.lua`；源码/生成源码
+9行输出逐字相同、无 `= print` 残留、20个函数均各有一份函数头行尾元信息，证据
+`tmp/test/audit.common10.sample-check.json`。生成文件由用户.gitignore规则忽略，不纳入提交。
+没有遗留运行中的测试或子代理工作；本主题完成不代表长期系统审计完成。
+
+## 上一完成主题：统一函数头行尾注释
+
+基于 `04386983`，按用户明确选择，将所有函数元信息统一放在 `function(...)` 行尾，
+正文不放自身元信息。具名/局部声明、表字段、参数、IIFE共用唯一函数头入口；
+原独立行范围注释并成 `lines=start-end`。没有额外括号或独立的前置/正文注释分支。
+633扩展嵌套定义并检查空字段函数的同行注释；新增634以单个父子函数树检查注释归属，
+避免不同VM兄弟proto排序差异。旧回归断言没有修改，已有收敛预算没有调整。
+
+曾尝试独立前置注释布局，`tmp/test/audit.function-comment-placement.full.txt` 为废弃方案
+日志：3102项中3069通过、33项连续源码拼写断言失败。用户确认行尾方案后已移除该实现，
+不要据此日志重做旧失败。最终定向 `tmp/test/audit.function-comment-header.targeted.txt`
+49项及22个proto全部通过。
+最终全量 `tmp/test/audit.function-comment-header.full.txt`：**3102项全部通过，0失败，0超时；2030个proto全通过**。
+全工作区Clippy、WASM check和最终debug CLI构建通过，日志同前缀 `.clippy.txt`、`.wasm.txt`、`.build.txt`。
+
+已重新生成 `tmp/test/03.arithmetic-gc.decompile.lua`，五个子proto元信息均在函数头行尾，
+原源码/生成源码输出相同的 `doubled-alive true`，证据同前缀 `.sample-check.json`。
+数组函数、函数表键、多值/IIFE与返回函数探针在三种表布局/24列偏好下均可编译运行，
+九个函数各有一份同行元信息，证据 `.boundaries.json`。
+关闭注释时，与上个提交同一633源码的输出逐字相同，证据 `.disabled-check.json`。
+没有遗留运行中的测试或子代理任务；本主题通过不代表长期系统审计完成。
+
+## 上一主题：03 的低槽比较与函数表达式注释
+
+基于 `139935ee`，修复 `tmp/test/03.arithmetic-gc.lua` 末尾
+`assert(run_iife(seed) == shifted)` 的机械拆分，以及开启注释时匿名函数缺少proto元信息。
+该临时文件的算术GC探针与已注册558的分支测试对应；tmp无版本记录，未追溯具体创建会话。
+call_frames 的比较参数证明原本只接受常量等已覆盖RHS，漏掉原比较直接读取的低槽
+Local/Param。现在精确消费原rhs HomeSlotKey，仍在左侧CALL后读取；captured cell更新
+不被提前快照，高槽COPY不借许可。没有删除IIFE内部用于保活的算术结果Local。
+Generate的函数表达式入口在function头后、正文前发射元信息，具名声明继续前置注释。
+每个实际定义出现位置一份，不按proto全局去重；注释关闭路径保持原布局。
+
+新增632覆盖用户GC形状、低槽参数、CALL改写captured RHS与独立旧快照，54/55
+stripped/debug四配置，三轮显式预算通过。633覆盖局部函数值、表字段、空函数、
+具名方法、函数参数和IIFE的七个proto，所有七种方言通过；原558继续保留。
+定向 `tmp/test/audit.03-targeted.txt`：23项全部通过。
+完整 `tmp/test/audit.03-complete.full.txt`：**3095项全部通过，0失败，0超时；2030个proto全通过**。
+全工作区Clippy与WASM检查通过，日志 `tmp/test/audit.03-final.clippy.txt`、`.wasm.txt`。
+本批最终代码的debug CLI构建通过，日志 `tmp/test/audit.03-first-build.txt`，之后无实现修改。
+
+用户原命令已更新 `tmp/test/03.arithmetic-gc.decompile.lua`：末尾assert完整，五个子proto
+都有元信息，原源码/生成源码均退出0并输出相同的 `doubled-alive true`，证据
+`tmp/test/audit.03-command-check.json`。关闭元信息后第一次重编译即源码固定，运行仍一致，
+证据 `tmp/test/audit.03-convergence.json`。633的紧凑表/24列布局及关闭注释均可编译运行；
+七个实际定义各有一份元信息，关闭注释无残留，证据 `tmp/test/audit.03-comments-check.json`。
+没有删除旧断言或提高已有预算，没有遗留运行中的测试或子代理任务。
+本主题通过不代表长期系统审计完成。
+
+## 上一主题：05 的计算索引与拼接赋值帧
 
 基于 `2485d79c`，修复用户命令 `cargo unluac -s tmp/test/05.no-const.lua -D lua54`
 中 `__close` 与 if 主体被拆成多个临时赋值的可读性缺口。Promotion 复用操作输入准备

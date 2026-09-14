@@ -446,4 +446,139 @@ pub(super) const REGRESSION_CASES_601_700: &[LuaCaseMatrixEntry] = &[
         recompile_rounds: Some(3),
         ..LuaCaseOptions::DEFAULT
     }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_632_call_comparison_low_operand.lua",
+        PUC_LUA_GE_54,
+    )
+    .with_options(LuaCaseOptions {
+        recompile_rounds: Some(3),
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_632_call_comparison_low_operand.lua",
+        PUC_LUA_GE_54,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        recompile_rounds: Some(3),
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_633_function_expression_comments.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_634_nested_function_comment_placement.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_635_nested_closure_constructors.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_635_nested_closure_constructors.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_636_nested_lookup_assignment_frames.lua",
+        PUC_LUA_GE_54,
+    )
+    .with_options(LuaCaseOptions {
+        recompile_rounds: Some(3),
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_636_nested_lookup_assignment_frames.lua",
+        PUC_LUA_GE_54,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        recompile_rounds: Some(3),
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_637_indexed_arithmetic_order.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_637_indexed_arithmetic_order.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_638_concat_prefix_scratch_lifetime.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_638_concat_prefix_scratch_lifetime.lua",
+        PUC_LUA_GE_54,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_639_concat_call_fallback.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        recompile_rounds: Some(3),
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_639_concat_call_fallback.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        recompile_rounds: Some(3),
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_640_loop_private_exit_results.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_640_loop_private_exit_results.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_640_loop_private_exit_scope.lua",
+        PUC_LUA_GE_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_640_loop_private_exit_scope.lua",
+        PUC_LUA_GE_54,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_640_loop_private_exit_readability.lua",
+        PUC_LUA_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_641_return_decision_result_home.lua",
+        PUC_LUA_ALL,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_641_return_decision_result_home.lua",
+        PUC_LUA_ALL,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
 ];

@@ -190,7 +190,11 @@ fn inline_nested_constructor(
             HirTableField::Record(field) => {
                 let key = inline_constructor_value_inner(context, &field.key)?;
                 let value = inline_constructor_value_inner(context, &field.value)?;
-                Some(HirTableField::Record(HirRecordField { key, value }))
+                Some(HirTableField::Record(HirRecordField {
+                    write_sources: field.write_sources.clone(),
+                    key,
+                    value,
+                }))
             }
         })
         .collect::<Option<Vec<_>>>()?;

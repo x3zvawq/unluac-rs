@@ -6,6 +6,10 @@
 //! 的固定缓冲槽与开放返回槽；字段写完不清空 scratch，也不意味着旧根已经退休。
 //! LuaJIT 的纯静态 TDUP 前缀不分配字段暂存槽，尾 CALL 单独核对原相邻 home/gap；
 //! 开放数组覆盖和初始化约束复用构造器 builder，不复制零返回后缀的字段重排逻辑。
+//! PUC 独立 record 和嵌套数组同样由完整原帧消费；闭包使用自身 CLOSURE 定义与写域，
+//! 已合并数组保留原 allocation/SETLIST 缓冲身份，不把字段外形作为删除暂存根的证明。
+//! 已合并 record 继续携带原字段写来源；例如 `{meta={[key]=7}}` 只在原 key
+//! 直接读取低槽、7 原本内嵌时省去内层 binding，不遗漏曾经存在的 LOADK/COPY 暂存。
 
 use super::*;
 use crate::hir::common::{HirBinding, HirRecordField};
@@ -235,18 +239,61 @@ impl FrameBuilder<'_> {
         if !self.native?.constants_fit_rk {
             return None;
         }
-        let mut rebuilt = table.clone();
+        // 逐层重建字段，不能先 clone 整棵表树再递归替换子树，避免深嵌套重复复制。
+        let mut rebuilt = crate::hir::common::HirTableConstructor {
+            sources: table.sources.clone(),
+            allocation: table.allocation.clone(),
+            implicit_template_fields: table.implicit_template_fields.clone(),
+            fields: Vec::with_capacity(table.fields.len()),
+            trailing_multivalue: None,
+        };
         let mut arrays = 0;
         self.constructor_depth += 1;
-        for field in &mut rebuilt.fields {
+        for field in &table.fields {
             match field {
                 HirTableField::Array(value) => {
-                    *value =
-                        self.expr(value, before, slot + arrays + 1, None, false, false, None)?;
+                    let scratch = slot + arrays + 1;
+                    let value = if matches!(value, HirExpr::TableConstructor(_)) {
+                        // 已完成内层表仍在这个原 Batch 元素槽分配；递归使用同一字段帧，
+                        // 不把嵌套 constructor 当作无暂存区的常量。
+                        self.record_operand(
+                            value,
+                            Some(HomeSlotKey::new(scratch, 0)),
+                            before,
+                            scratch,
+                        )?
+                        .0
+                    } else {
+                        self.expr(value, before, scratch, None, false, false, None)?
+                    };
+                    rebuilt.fields.push(HirTableField::Array(value));
                     arrays += 1;
                 }
                 HirTableField::Record(record)
-                    if literal_rk(&record.key) && literal_rk(&record.value) => {}
+                    if literal_rk(&record.key) && literal_rk(&record.value) =>
+                {
+                    rebuilt.fields.push(field.clone());
+                }
+                HirTableField::Record(record)
+                    if self.completed_puc_record_field(record, HomeSlotKey::new(slot, 0)) =>
+                {
+                    let layout = self
+                        .facts
+                        .native_record_write_layout(&record.write_sources)?;
+                    let (key, key_scratch) =
+                        self.record_operand(&record.key, layout.key, before, slot + arrays + 1)?;
+                    let (value, _) = self.record_operand(
+                        &record.value,
+                        layout.value,
+                        before,
+                        slot + arrays + 1 + usize::from(key_scratch),
+                    )?;
+                    rebuilt.fields.push(HirTableField::Record(HirRecordField {
+                        write_sources: record.write_sources.clone(),
+                        key,
+                        value,
+                    }));
+                }
                 _ => return None,
             }
         }
@@ -318,9 +365,11 @@ impl FrameBuilder<'_> {
                         *index,
                         slot + 1 + usize::from(key_scratch),
                     )?;
-                    rebuilt
-                        .fields
-                        .push(HirTableField::Record(HirRecordField { key, value }));
+                    rebuilt.fields.push(HirTableField::Record(HirRecordField {
+                        write_sources: access.sources.clone(),
+                        key,
+                        value,
+                    }));
                     records += 1;
                 }
                 ConstructorWrite::Batch { batch, .. } => {
@@ -475,7 +524,11 @@ impl FrameBuilder<'_> {
             if !matches!(value, HirExpr::Call(_)) {
                 return None;
             }
-            records.push(HirRecordField { key, value });
+            records.push(HirRecordField {
+                write_sources: access.sources.clone(),
+                key,
+                value,
+            });
             self.finish_event(index)?;
         }
         super::super::table_constructors::constructor_with_native_records(table, records)
@@ -557,6 +610,7 @@ impl FrameBuilder<'_> {
                 return None;
             }
             rebuilt.fields.push(HirTableField::Record(HirRecordField {
+                write_sources: access.sources.clone(),
                 key: access.key.clone(),
                 value: (*value).clone(),
             }));
@@ -611,6 +665,26 @@ impl FrameBuilder<'_> {
         }
     }
 
+    /// 完成字段不能再次吸收 producer：当前低槽引用须与原 SETTABLE 直接输入相同，
+    /// 字面量须原本内嵌。嵌套表只获得递归入口，其 allocation/字段/Batch 的全部
+    /// 证明随后仍由 record_operand 消费，不能把这里的当前层检查当作完整表证明。
+    fn completed_puc_record_field(&self, record: &HirRecordField, home: HomeSlotKey) -> bool {
+        let Some(layout) = self.facts.native_record_write_layout(&record.write_sources) else {
+            return false;
+        };
+        let matches_operand = |expr: &HirExpr, original: Option<HomeSlotKey>| match original {
+            Some(original) => {
+                original.slot() < self.base && self.direct_home(expr) == Some(original)
+            }
+            None => literal_rk(expr),
+        };
+        layout.base == home
+            && matches_operand(&record.key, layout.key)
+            && (matches_operand(&record.value, layout.value)
+                || (matches!(record.value, HirExpr::TableConstructor(_))
+                    && layout.value == Some(HomeSlotKey::new(home.slot() + 1, 0))))
+    }
+
     fn record_operand(
         &mut self,
         expr: &HirExpr,
@@ -627,7 +701,80 @@ impl FrameBuilder<'_> {
         if home != HomeSlotKey::new(scratch, 0) {
             return None;
         }
-        let value = self.expr(expr, before, scratch, None, false, false, None)?;
+        let definition = if let HirExpr::LocalRef(local) = expr {
+            self.definition(*local, before)
+        } else {
+            None
+        };
+        let prepared = definition
+            .and_then(|index| scalar_local(self.run[index]).map(|(_, value)| value))
+            .unwrap_or(expr);
+        let producer = if let HirExpr::Closure(closure) = prepared {
+            Some(self.constructor_closure_producer(closure, home)?)
+        } else {
+            None
+        };
+        let completed_table = if let HirExpr::TableConstructor(table) = prepared
+            && !definition.is_some_and(|index| self.constructors.contains_key(&index))
+        {
+            if !matches!(table.allocation, HirTableAllocation::PucBatched(_))
+                || self.facts.allocation_result_home(table) != Some(home)
+                || table.trailing_multivalue.is_some()
+            {
+                return None;
+            }
+            if table
+                .fields
+                .iter()
+                .all(|field| matches!(field, HirTableField::Record(_)))
+            {
+                if table
+                    .allocation
+                    .batched_capacity_matches(0, table.fields.len())
+                    != Some(true)
+                    || !table.fields.iter().all(|field| {
+                        matches!(field, HirTableField::Record(record)
+                            if self.completed_puc_record_field(record, home))
+                    })
+                {
+                    return None;
+                }
+            } else {
+                // 原 SETLIST 已由字段 owner 合并；仍核对完整数组来源和连续缓冲。
+                let batch = self.facts.native_allocation_batch_layout(table)?;
+                if batch.base != home
+                    || batch.buffer != HomeSlotKey::new(home.slot() + 1, 0)
+                    || batch.start_index != 1
+                    || batch.fixed_width != Some(table.fields.len())
+                    || !table
+                        .fields
+                        .iter()
+                        .all(|field| matches!(field, HirTableField::Array(_)))
+                {
+                    return None;
+                }
+                for (offset, field) in table.fields.iter().enumerate() {
+                    if let HirTableField::Array(HirExpr::Closure(closure)) = field {
+                        self.constructor_closure_producer(
+                            closure,
+                            HomeSlotKey::new(home.slot() + offset + 1, 0),
+                        )?;
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        };
+        let value = self.expr(
+            expr,
+            before,
+            scratch,
+            None,
+            false,
+            completed_table,
+            producer,
+        )?;
         // RK 常量及现成 local/param 都不写 scratch；不能用它们替代原 LOADK/COPY，
         // 否则后续 lookup 的 GC 可能看到原本已覆盖的 activation 残值（regress_579）。
         if matches!(value, HirExpr::LocalRef(_) | HirExpr::ParamRef(_))
@@ -636,6 +783,25 @@ impl FrameBuilder<'_> {
             return None;
         }
         Some((value, true))
+    }
+
+    /// 闭包字段仍在原 CLOSURE 的目标槽创建，捕获可见性再由共享 expr 分支核对。
+    /// 不用合并 Local 的其它值版本代替这次分配，隐藏 MOVE 也不能被 record 消费。
+    fn constructor_closure_producer(
+        &self,
+        closure: &crate::hir::common::HirClosureExpr,
+        home: HomeSlotKey,
+    ) -> Option<crate::hir::common::TempId> {
+        closure.creation.as_ref()?;
+        let producer = self.facts.operation_result_temp(closure.source_site?)?;
+        (self.facts.trusted_temp_home_slot(producer) == Some(home)
+            && self
+                .facts
+                .complete_temp_definition_write_homes(producer)
+                .iter()
+                .copied()
+                .eq([home]))
+        .then_some(producer)
     }
 
     pub(super) fn finish_dispatch(&mut self, call: &HirCallExpr, before: usize) -> Option<()> {

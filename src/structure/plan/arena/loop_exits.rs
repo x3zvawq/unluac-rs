@@ -45,6 +45,8 @@ pub(super) struct WhileLexicalArmDomain<'a> {
     pub(super) natural: &'a BTreeSet<BlockRef>,
     pub(super) condition_blocks: Option<&'a BTreeSet<BlockRef>>,
     pub(super) continuation: Option<BlockRef>,
+    /// 带无关副作用的 Unknown header 留在 while true 正文，条件臂也属于本轮正文。
+    pub(super) header_is_body: bool,
 }
 
 pub(super) fn verified_while_lexical_arms(
@@ -66,11 +68,13 @@ pub(super) fn verified_while_lexical_arms(
             workspace.pending.push_back(block);
         }
     }
-    for block in std::iter::once(candidate.header)
-        .chain(candidate.control_blocks.iter().copied())
-        .chain(domain.condition_blocks.into_iter().flatten().copied())
-    {
-        workspace.insert(block, WHILE_ARM_EXCLUDED)?;
+    if !domain.header_is_body {
+        for block in std::iter::once(candidate.header)
+            .chain(candidate.control_blocks.iter().copied())
+            .chain(domain.condition_blocks.into_iter().flatten().copied())
+        {
+            workspace.insert(block, WHILE_ARM_EXCLUDED)?;
+        }
     }
 
     let mut added = Vec::new();
@@ -108,7 +112,6 @@ pub(super) fn verified_while_lexical_arms(
                     graph_facts,
                     context,
                     workspace,
-                    source,
                     entry_edge,
                     continuation,
                 )?
@@ -146,7 +149,6 @@ pub(super) fn closed_while_lexical_arm(
     graph_facts: &GraphFacts,
     context: &LoopPartitionContext<'_>,
     workspace: &mut WhileLexicalArmWorkspace,
-    source: BlockRef,
     entry_edge: EdgeRef,
     continuation: BlockRef,
 ) -> Result<bool, StructureError> {
@@ -218,7 +220,10 @@ pub(super) fn closed_while_lexical_arm(
             {
                 continue;
             }
-            if block != entry || edge.from != source || *incoming != entry_edge {
+            // 短路条件可从多个本轮 block 进入同一退出臂。单入口是 block 身份，
+            // 不等于只能有一条入边；entry 支配整个闭合域，全部外部入边仍须来自
+            // 当前 loop 已认领的正文，不能接纳公共后缀或其它循环的入口。
+            if block != entry || !workspace.contains(edge.from, WHILE_ARM_OWNED)? {
                 return Ok(false);
             }
         }
@@ -245,6 +250,7 @@ pub(super) fn continue_pad_sibling_reaches_target(
 
 pub(super) struct NormalLoopTailDomain<'a> {
     pub(super) candidate: &'a crate::structure::LoopCandidate,
+    pub(super) private_exit_tail: bool,
     pub(super) preheader: Option<BlockRef>,
     pub(super) control: &'a BTreeSet<BlockRef>,
     pub(super) body: &'a BTreeSet<BlockRef>,
@@ -313,7 +319,7 @@ pub(super) fn detect_normal_loop_tail(
 
     // 候选阶段只证明存在 bypass；精确 guard 依赖最终 Break owner 与
     // forwarding target，由 plan finalizer 统一冻结。
-    if !body
+    let has_bypass = body
         .iter()
         .flat_map(|block| cfg.succs[block.index()].iter().copied())
         .any(|edge| {
@@ -321,8 +327,9 @@ pub(super) fn detect_normal_loop_tail(
             edge_data.to == continuation
                 && edge_data.kind != EdgeKind::LoopExit
                 && candidate.backedges.binary_search(&edge).is_err()
-        })
-    {
+        });
+    let in_exit_arm = !has_bypass && domain.private_exit_tail;
+    if !has_bypass && !in_exit_arm {
         return None;
     }
     normal_exits.sort_by_key(|edge| edge.index());
@@ -410,6 +417,7 @@ pub(super) fn detect_normal_loop_tail(
     Some(NormalTailPartition {
         blocks,
         contract: LoopNormalTailPlan {
+            in_exit_arm,
             entry,
             continuation,
             early_exits: Vec::new(),

@@ -112,7 +112,13 @@ impl HirRewritePass for ProtoRefRewrite {
             HirExpr::Unary(unary) => return self.rewrite_source_site(&mut unary.source_site),
             HirExpr::Binary(binary) => return self.rewrite_source_site(&mut binary.source_site),
             HirExpr::TableConstructor(table) => {
-                return self.rewrite_operation_sources(&mut table.sources);
+                let mut changed = self.rewrite_operation_sources(&mut table.sources);
+                for field in &mut table.fields {
+                    if let crate::hir::common::HirTableField::Record(record) = field {
+                        changed |= self.rewrite_operation_sources(&mut record.write_sources);
+                    }
+                }
+                return changed;
             }
             HirExpr::TableAccess(access) => {
                 return self.rewrite_operation_sources(&mut access.sources);

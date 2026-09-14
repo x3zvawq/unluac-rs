@@ -267,6 +267,8 @@ pub(super) struct LoopPlanInput {
     pub(super) candidate: LoopCandidate,
     pub(super) condition: Option<ConditionPlanId>,
     pub(super) continuation: Option<BlockRef>,
+    /// continuation 已由原前向 break 的闭合私有域证明；后续分区只消费，不重扫 CFG。
+    pub(super) private_exit_tail: bool,
     /// 最终复合 condition 与 loop owner 共同证明的显式 continue transfer。
     pub(super) semantic_continue_edges: BTreeSet<EdgeRef>,
 }
@@ -282,9 +284,11 @@ pub struct LoopControlEdges {
     pub continues: Vec<EdgeRef>,
 }
 
-/// `for` 正常退出专属尾部的冻结控制契约。
+/// 循环退出专属尾部的冻结控制契约，区分循环后的正常尾与原私有退出臂。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopNormalTailPlan {
+    /// 原回边前的私有退出域，在 while 的条件退出臂内执行；不适用于公共正常尾。
+    pub(crate) in_exit_arm: bool,
     pub entry: BlockRef,
     pub continuation: BlockRef,
     pub early_exits: Vec<EdgeRef>,

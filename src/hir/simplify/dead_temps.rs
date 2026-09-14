@@ -132,6 +132,14 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
             .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve()),
     );
     protected_temps.extend(pending.temps);
+    if stage == DeadTempStage::BeforeNativeFrames {
+        // 原无读 nil 仍可能是紧邻全局读取的低槽声明前缀，先交完整 scope 事务。
+        // 不把 GC-inert 判定改成永久保留；Final 审理后仍执行原清理。
+        protected_temps.extend(super::source_frames::pending_nil_prefix_temps(
+            proto,
+            promotion_facts,
+        ));
+    }
     let reference_captured_homes = reference_captured.complete_home_slots(promotion_facts);
     // 参数覆盖在本 pass 入口可能仍是写同 home 的 Local/Temp，不能只扫描已经语法化成
     // HirLValue::Param 的目标；缺可信 home 的直接 binding 写也不能用于稳定性正证明。

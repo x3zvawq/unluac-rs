@@ -385,6 +385,14 @@ pub(super) fn validate_loop_plans(
                         expected_normal_tail_guards[loop_id.index()],
                     )));
                 }
+                if tail.in_exit_arm
+                    && (payload.kind != crate::structure::LoopKindHint::WhileLike
+                        || !tail.early_exits.is_empty())
+                {
+                    return Err(StructureError::invalid(
+                        "private normal-tail arm has incompatible loop or bypass",
+                    ));
+                }
             }
             _ => {
                 return Err(StructureError::invalid(format!(

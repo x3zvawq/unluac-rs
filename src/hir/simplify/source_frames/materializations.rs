@@ -52,6 +52,49 @@ enum NilMaterialization {
     Existing,
 }
 
+/// 原完整 nil 组若紧接同一源码声明前缀的全局读取，须等词法末端 owner 审理。
+/// 这里只延期删除，不签发永久保留；是否无读/capture、能否恢复原 scope 和整个后缀，
+/// 仍由 restore_materializations 判断，Final 对未消费项沿用原死写清理。
+pub(in crate::hir::simplify) fn pending_nil_prefix_temps(
+    proto: &HirProto,
+    facts: &ProtoPromotionFacts,
+) -> BTreeSet<TempId> {
+    fn collect(block: &HirBlock, facts: &ProtoPromotionFacts, pending: &mut BTreeSet<TempId>) {
+        for window in block.stmts.windows(2) {
+            let Some(temps) = original_nil_write_shape(&window[0], facts) else {
+                continue;
+            };
+            let Some((temp, HirExpr::GlobalRef(global))) = window[1].scalar_temp_assignment()
+            else {
+                continue;
+            };
+            let Some(home) = facts.trusted_temp_home_slot(temp) else {
+                continue;
+            };
+            if facts
+                .trusted_temp_home_slot(temps[0])
+                .is_some_and(|base| home.slot() == base.slot() + temps.len())
+                && global
+                    .sources
+                    .try_for_each_known(|source| {
+                        (facts.direct_global_read_home(source) == Some(home)).then_some(())
+                    })
+                    .is_some()
+            {
+                pending.extend(temps.iter().copied());
+            }
+        }
+        for stmt in &block.stmts {
+            crate::hir::visit::for_each_nested_block(stmt, &mut |child| {
+                collect(child, facts, pending)
+            });
+        }
+    }
+    let mut pending = BTreeSet::new();
+    collect(&proto.body, facts, &mut pending);
+    pending
+}
+
 pub(in crate::hir::simplify) fn restore_materializations(
     proto: &mut HirProto,
     facts: &mut ProtoPromotionFacts,
@@ -795,6 +838,17 @@ fn original_nil_write<'a>(
     read: &BTreeSet<TempId>,
     writes: &BTreeMap<TempId, usize>,
 ) -> Option<&'a [TempId]> {
+    let temps = original_nil_write_shape(stmt, facts)?;
+    temps
+        .iter()
+        .all(|temp| !read.contains(temp) && writes.get(temp) == Some(&1))
+        .then_some(temps)
+}
+
+fn original_nil_write_shape<'a>(
+    stmt: &HirStmt,
+    facts: &'a ProtoPromotionFacts,
+) -> Option<&'a [TempId]> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
@@ -818,8 +872,6 @@ fn original_nil_write<'a>(
         let home = facts.trusted_temp_home_slot(temp)?;
         let definition_homes = facts.complete_temp_definition_write_homes(temp);
         if *target != HirLValue::Temp(temp)
-            || read.contains(&temp)
-            || writes.get(&temp) != Some(&1)
             || home.slot() != base + offset
             || definition_homes.len() != 1
             || !definition_homes.contains(&home)

@@ -732,6 +732,7 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
                     HirTableField::Record(field) => {
                         let key = collapse_expr_to_pure(field.key, safety)?;
                         fields.push(HirTableField::Record(HirRecordField {
+                            write_sources: field.write_sources,
                             key,
                             value: collapse_expr_to_pure(field.value, safety)?,
                         }));
@@ -793,8 +794,12 @@ fn prepare_table_constructor(
                 shapes.push(PreparedTableFieldShape::Array);
                 exprs.push(expr);
             }
-            HirTableField::Record(HirRecordField { key, value }) => {
-                shapes.push(PreparedTableFieldShape::Record);
+            HirTableField::Record(HirRecordField {
+                write_sources,
+                key,
+                value,
+            }) => {
+                shapes.push(PreparedTableFieldShape::Record(write_sources));
                 exprs.push(key);
                 exprs.push(value);
             }
@@ -830,14 +835,17 @@ fn prepare_table_constructor(
                     .next()
                     .expect("array field extraction should preserve its value"),
             ),
-            PreparedTableFieldShape::Record => HirTableField::Record(HirRecordField {
-                key: exprs
-                    .next()
-                    .expect("record field extraction should preserve its key"),
-                value: exprs
-                    .next()
-                    .expect("record field extraction should preserve its value"),
-            }),
+            PreparedTableFieldShape::Record(write_sources) => {
+                HirTableField::Record(HirRecordField {
+                    write_sources,
+                    key: exprs
+                        .next()
+                        .expect("record field extraction should preserve its key"),
+                    value: exprs
+                        .next()
+                        .expect("record field extraction should preserve its value"),
+                })
+            }
         })
         .collect();
     assert!(
@@ -859,7 +867,7 @@ fn prepare_table_constructor(
 
 enum PreparedTableFieldShape {
     Array,
-    Record,
+    Record(crate::hir::common::HirOperationSources),
 }
 
 pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety) -> bool {

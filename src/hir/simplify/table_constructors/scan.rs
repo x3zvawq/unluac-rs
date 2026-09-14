@@ -265,6 +265,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
             }
             RegionStep::Record {
                 stmt_index: index,
+                write_sources: &access.sources,
                 key,
                 value,
             }

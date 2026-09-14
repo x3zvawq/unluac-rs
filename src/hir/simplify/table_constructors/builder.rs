@@ -23,7 +23,11 @@ use crate::value_semantics::table::TableExpression;
 #[derive(Debug, Clone)]
 enum BuilderField {
     Final(HirTableField),
-    PendingInt { key: i64, value: HirExpr },
+    PendingInt {
+        write_sources: crate::hir::common::HirOperationSources,
+        key: i64,
+        value: HirExpr,
+    },
     MovedPendingInt,
 }
 
@@ -134,8 +138,13 @@ impl ConstructorBuilder {
         for field in self.fields {
             match field {
                 BuilderField::Final(field) => fields.push(field),
-                BuilderField::PendingInt { key, value } => {
+                BuilderField::PendingInt {
+                    write_sources,
+                    key,
+                    value,
+                } => {
                     fields.push(HirTableField::Record(crate::hir::common::HirRecordField {
+                        write_sources,
                         key: HirExpr::Integer(key),
                         value,
                     }));
@@ -202,6 +211,7 @@ impl ConstructorBuilder {
         {
             if restored.field_index < checkpoint.fields_len {
                 self.fields[restored.field_index] = BuilderField::PendingInt {
+                    write_sources: restored.write_sources.clone(),
                     key: restored.key,
                     value: restored.value.clone(),
                 };
@@ -314,6 +324,7 @@ impl ConstructorBuilder {
                 {
                     let field_index = self.fields.len();
                     self.fields.push(BuilderField::PendingInt {
+                        write_sources: field.write_sources,
                         key: value,
                         value: field.value,
                     });
@@ -324,6 +335,7 @@ impl ConstructorBuilder {
                 } else {
                     self.fields.push(BuilderField::Final(HirTableField::Record(
                         crate::hir::common::HirRecordField {
+                            write_sources: field.write_sources,
                             key: HirExpr::Integer(value),
                             value: field.value,
                         },
@@ -332,6 +344,7 @@ impl ConstructorBuilder {
             }
             _ => self.fields.push(BuilderField::Final(HirTableField::Record(
                 crate::hir::common::HirRecordField {
+                    write_sources: field.write_sources,
                     key: field.key,
                     value: field.value,
                 },
@@ -363,11 +376,17 @@ impl ConstructorBuilder {
             let old_field =
                 std::mem::replace(&mut self.fields[field_index], BuilderField::MovedPendingInt);
             self.moved_fields += 1;
-            let BuilderField::PendingInt { key, value } = old_field else {
+            let BuilderField::PendingInt {
+                write_sources,
+                key,
+                value,
+            } = old_field
+            else {
                 unreachable!("pending integer field index should always point at a pending field");
             };
             restored_pending_integer_fields.push(RestoredPendingIntegerField {
                 field_index,
+                write_sources,
                 key,
                 value: value.clone(),
             });
@@ -408,6 +427,7 @@ impl ConstructorBuilder {
                 });
                 *field = BuilderField::Final(HirTableField::Record(
                     crate::hir::common::HirRecordField {
+                        write_sources: crate::hir::common::HirOperationSources::Unknown,
                         key: HirExpr::Integer(i64::from(array_index)),
                         value: value.clone(),
                     },

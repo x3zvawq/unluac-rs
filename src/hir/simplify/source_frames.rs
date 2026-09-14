@@ -22,7 +22,7 @@ use crate::hir::simplify::mention::BindingReadCollector;
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
 mod materializations;
-pub(super) use materializations::restore_materializations;
+pub(super) use materializations::{pending_nil_prefix_temps, restore_materializations};
 
 /// 候选除原 freereg 外，还可要求特定低槽身份在开始前已声明；不能借后缀新声明替代。
 pub(super) struct PrefixRequest {

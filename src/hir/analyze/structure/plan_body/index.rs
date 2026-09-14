@@ -173,6 +173,12 @@ impl PlanLoweringIndex {
             let Some(tail) = &payload.normal_tail else {
                 continue;
             };
+            if tail.in_exit_arm {
+                if !tail.early_exits.is_empty() {
+                    return Err(invalid(root, "private while exit arm has early exits"));
+                }
+                continue;
+            }
             let region = plan
                 .loop_region(loop_id)
                 .ok_or(HirLowerError::MissingPlanPayload {

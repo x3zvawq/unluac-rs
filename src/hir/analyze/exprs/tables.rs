@@ -35,6 +35,7 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
                         .expect("template key is a primitive constant"),
                 );
                 table.fields.push(HirTableField::Record(HirRecordField {
+                    write_sources: crate::hir::common::HirOperationSources::Unknown,
                     key,
                     value: value.map_or(HirExpr::Integer(0), |value| expr_for_const(proto, value)),
                 }));
@@ -65,6 +66,7 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
                 if index == 0 {
                     if !matches!(value, HirExpr::Nil) {
                         table.fields.push(HirTableField::Record(HirRecordField {
+                            write_sources: crate::hir::common::HirOperationSources::Unknown,
                             key: HirExpr::Integer(0),
                             value,
                         }));
@@ -81,6 +83,7 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
                         .expect("template hash key is a primitive constant"),
                 );
                 table.fields.push(HirTableField::Record(HirRecordField {
+                    write_sources: crate::hir::common::HirOperationSources::Unknown,
                     key,
                     value: expr_for_const(proto, *value),
                 }));

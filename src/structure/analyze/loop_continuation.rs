@@ -9,7 +9,7 @@ pub(super) fn loop_continuation(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     exit_block: super::super::BlockRef,
-) -> Option<super::super::BlockRef> {
+) -> (Option<super::super::BlockRef>, bool) {
     let condition_exit = condition.and_then(|condition| {
         let ShortCircuitExit::BranchExit { truthy, falsy } = condition.candidate.exit else {
             return None;
@@ -27,7 +27,9 @@ pub(super) fn loop_continuation(
         Some(loops::transparent_loop_exit_target(proto, cfg, direct).unwrap_or(direct))
     });
     let mut exits = candidate.exits.iter().copied();
-    let first = exits.next()?;
+    let Some(first) = exits.next() else {
+        return (None, false);
+    };
     let common = exits
         .try_fold(first, |common, exit| {
             graph_facts.nearest_common_postdom(common, exit)
@@ -50,9 +52,15 @@ pub(super) fn loop_continuation(
         // Unknown/while-true 的 header guard 可以直接 return；它不是 loop 的 break
         // continuation。若另有唯一 Close-only 路径落到空 return，则该路径才是词法
         // break 后的函数尾，选它可保留 loop scope 而无需伪 goto。
-        return Some(continuation);
+        return (Some(continuation), false);
     }
-    match (condition_exit, common) {
+    if let Some(entry) = common
+        && let Some(continuation) =
+            loops::private_forward_exit_continuation(proto, cfg, candidate, entry)
+    {
+        return (Some(continuation), true);
+    }
+    let continuation = match (condition_exit, common) {
         (Some(direct), Some(common))
             if direct != common && !linear_loop_exit_tail(cfg, candidate, direct, common) =>
         {
@@ -60,7 +68,8 @@ pub(super) fn loop_continuation(
         }
         (Some(direct), None) => Some(direct),
         (_, common) => common,
-    }
+    };
+    (continuation, false)
 }
 
 pub(super) fn unique_cleanup_to_empty_return_exit(

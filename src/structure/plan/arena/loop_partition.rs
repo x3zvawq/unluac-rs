@@ -282,12 +282,27 @@ pub(super) fn build_loop_partition(
                     natural: &natural,
                     condition_blocks: condition_blocks.as_ref(),
                     continuation: lexical_continuation,
+                    header_is_body: false,
                 },
                 &mut workspaces.while_arm,
             )?;
             owned.extend(lexical_arms);
         }
         LoopKindHint::Unknown => {
+            let lexical_arms = verified_while_lexical_arms(
+                cfg,
+                graph_facts,
+                context,
+                WhileLexicalArmDomain {
+                    candidate,
+                    natural: &owned,
+                    condition_blocks: condition_blocks.as_ref(),
+                    continuation: loop_.continuation,
+                    header_is_body: true,
+                },
+                &mut workspaces.while_arm,
+            )?;
+            owned.extend(lexical_arms);
             let terminal_condition_arm = loop_
                 .condition
                 .and_then(|id| input.conditions.get(id.index()))
@@ -533,7 +548,7 @@ pub(super) fn build_loop_partition(
         .collect::<Vec<_>>();
     let continuation = loop_
         .continuation
-        .filter(|target| exit_targets.contains(target))
+        .filter(|target| exit_targets.contains(target) || loop_.private_exit_tail)
         .or_else(|| {
             (candidate.exits.len() == 1)
                 .then(|| candidate.exits.first().copied())
@@ -584,6 +599,7 @@ pub(super) fn build_loop_partition(
         cfg,
         NormalLoopTailDomain {
             candidate,
+            private_exit_tail: loop_.private_exit_tail,
             preheader,
             control: &control,
             body: &body,

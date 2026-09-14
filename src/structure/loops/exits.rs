@@ -2,6 +2,91 @@
 
 use super::*;
 
+/// natural loop 的唯一退出若仍位于回边之前，原前向跳转可界定一个私有 break 尾。
+/// 例如 `local ok,v=f(); if not ok then use(v); break end` 的 use 不属于公共后缀。
+/// 只接受前向无环域、完整入边来自同一 loop 出口、所有完成边跳过整个回边区间；
+/// 普通 while 后代码已在回边之后，外部 label 入边及共享退出域都不借此改变 owner。
+pub(in crate::structure) fn private_forward_exit_continuation(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    candidate: &LoopCandidate,
+    entry: BlockRef,
+) -> Option<BlockRef> {
+    if candidate.kind_hint != LoopKindHint::WhileLike
+        || candidate.exits.len() != 1
+        || !candidate.exits.contains(&entry)
+    {
+        return None;
+    }
+    // CFG 按指令起点升序分配真实块；两个集合都保持 BlockRef 顺序。
+    let last = candidate
+        .blocks
+        .last()
+        .max(candidate.control_blocks.last())?;
+    let body_end = cfg.blocks[last.index()].instrs.end();
+    let entry_start = cfg.blocks.get(entry.index())?.instrs.start.index();
+    if entry_start >= body_end {
+        return None;
+    }
+    let owns = |block: BlockRef| {
+        candidate.blocks.contains(&block)
+            || candidate.control_blocks.binary_search(&block).is_ok()
+            || block == candidate.header
+    };
+    let mut pending = vec![entry];
+    let mut visited = BTreeSet::new();
+    let mut continuation = None;
+    while let Some(block) = pending.pop() {
+        if !visited.insert(block) {
+            continue;
+        }
+        let start = cfg.blocks.get(block.index())?.instrs.start.index();
+        if owns(block)
+            || block == cfg.exit_block
+            || start < entry_start
+            || start >= body_end
+            || cfg.succs[block.index()].is_empty()
+        {
+            return None;
+        }
+        for edge in &cfg.succs[block.index()] {
+            let edge = cfg.edges[edge.index()];
+            if owns(edge.to) || edge.to == cfg.exit_block {
+                return None;
+            }
+            let target_start = cfg.blocks[edge.to.index()].instrs.start.index();
+            if target_start >= body_end {
+                if edge.kind != EdgeKind::Jump
+                    || !matches!(
+                        cfg.terminator(&proto.instrs, block),
+                        Some(LowInstr::Jump(_))
+                    )
+                    || continuation.is_some_and(|target| target != edge.to)
+                {
+                    return None;
+                }
+                continuation = Some(edge.to);
+            } else {
+                if target_start <= start {
+                    return None;
+                }
+                pending.push(edge.to);
+            }
+        }
+    }
+    for block in &visited {
+        if cfg.preds[block.index()].iter().any(|edge| {
+            let from = cfg.edges[edge.index()].from;
+            cfg.reachable_blocks.contains(&from)
+                && !visited.contains(&from)
+                && !(*block == entry && owns(from))
+        }) {
+            return None;
+        }
+    }
+    continuation
+}
+
 pub(super) struct SharedExitContinuation {
     pub(super) merge: BlockRef,
     path_blocks: BTreeSet<BlockRef>,
