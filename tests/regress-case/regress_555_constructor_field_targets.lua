@@ -1,4 +1,5 @@
 -- Several field targets share one constructor call; both field syntaxes matter.
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 function __reg555_collect(...)
     local total = 0
     for i = 1, select("#", ...) do

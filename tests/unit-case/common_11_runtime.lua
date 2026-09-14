@@ -143,3 +143,7 @@ test_coroutine_shadow()
 test_xpcall_reuse()
 test_pcall_multiret()
 test_coro_resume_loop()
+-- handler 的短路 CONCAT 与 resume 多结果初始化保留完整表达式。
+-- unluac: expect-ast-max [[local-decl]] [[0]] [[@dialect=lua5.4]] [[@proto=13]]
+-- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=19]]
+-- unluac: expect-ast-count [[numeric-for]] [[1]] [[@dialect=lua5.4]] [[@proto=20]]

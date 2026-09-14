@@ -1,4 +1,6 @@
 -- regress_140_luajit_prior_handoff_target#1: 前置goto臂写过的temp不能当成新handoff target
+-- unluac: expect-ast-min [[while]] [[1]]
+-- unluac: expect-ast-min [[repeat]] [[2]]
 local state = 0
 local total = 1
 

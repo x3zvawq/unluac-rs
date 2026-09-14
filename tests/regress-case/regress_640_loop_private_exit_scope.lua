@@ -1,3 +1,5 @@
+-- unluac: expect-ast-min [[while]] [[2]]
+-- unluac: expect-ast-min [[break]] [[1]]
 local events = {}
 local function resource(label)
     return setmetatable({}, {

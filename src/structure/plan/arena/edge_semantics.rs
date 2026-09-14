@@ -18,6 +18,20 @@ impl EdgeSemantics {
         partitions: &[LoopPartitions],
         forwarding: &ForwardingBoundaries,
     ) -> Result<Self, StructureError> {
+        let mut residual_continue_entries_by_target = vec![Vec::new(); cfg.blocks.len()];
+        for residual in &input.residual_transfers {
+            if !matches!(
+                residual.reason,
+                crate::structure::GotoReason::UnstructuredContinueLike
+                    | crate::structure::GotoReason::CrossLoopContinueLike
+            ) {
+                continue;
+            }
+            let edge = cfg.edges.get(residual.edge.index()).ok_or_else(|| {
+                StructureError::invalid("residual continue entry is outside the CFG arena")
+            })?;
+            residual_continue_entries_by_target[edge.to.index()].push(residual.edge);
+        }
         let layout_edges = layout_edge_facts(cfg, &arena.regions, &arena.navigation);
         let loops = LoopQueryIndex::build(cfg, arena, input, partitions, &layout_edges)?;
         let mut planned_breaks = vec![None; cfg.edges.len()];
@@ -375,6 +389,49 @@ impl EdgeSemantics {
                             semantics.early_continues[edge.index()] = true;
                         }
                     }
+                    // 残余 continue 的入口本身不属于前面的 early-continue 候选；但它若
+                    // 跳到纯 latch pad，pad 到 header 的 phi copy 仍是同一轮必须执行的
+                    // 动作。按 target 索引签发 ContinueLatch route，使它成为内部过渡，
+                    // 防止后续的 `goto -> continue` 快路径绕过 pad 的动作。
+                    if let Some(target) = loop_.continue_target
+                        && let Some(entries) =
+                            residual_continue_entries_by_target.get(target.index())
+                        && !entries.is_empty()
+                        && let Some(edges) = direct_latch_edges.as_deref()
+                    {
+                        let eligible_entries = entries
+                            .iter()
+                            .copied()
+                            .filter(|entry| {
+                                cfg.edges.get(entry.index()).is_some_and(|edge| {
+                                    edge.to == target
+                                        && partition.body.contains(&edge.from)
+                                        && semantics.continue_target_region(*entry) == Some(region)
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        if !eligible_entries.is_empty() {
+                            let route = if let Some(route) = direct_latch_route {
+                                route
+                            } else {
+                                let Some(route) = semantics.forward_routes.install(
+                                    cfg,
+                                    ForwardRouteKind::ContinueLatch,
+                                    region,
+                                    edges,
+                                )?
+                                else {
+                                    return Err(StructureError::invalid(
+                                        "eligible residual continue latch route was not installed",
+                                    ));
+                                };
+                                route
+                            };
+                            for entry in eligible_entries {
+                                semantics.forward_routes.bind(entry, route)?;
+                            }
+                        }
+                    }
                     let forwarded_edges = std::mem::take(
                         &mut semantics.forward_routes.edges_by_owner[region.index()],
                     );
@@ -581,7 +638,7 @@ impl EdgeSemantics {
             && self.early_continues[edge_ref.index()]
             && let Some(region) = self.continues[edge_ref.index()]
             && !self.is_nested_loop_exit_to_ancestor(edge_ref, edge.from, region)
-            && !self.exits_nested_loop_before_continue(edge_ref, edge.from, region)
+            && !self.exits_nested_loop_before_continue(cfg, edge_ref, edge.from, region)
             && (!self.layout_edges[edge_ref.index()].natural
                 || self.loops.control_by_block[edge.to.index()] == Some(region))
         {
@@ -734,7 +791,7 @@ impl EdgeSemantics {
         if let Some(region) = self.continues[edge_ref.index()]
             && self.early_continues[edge_ref.index()]
             && !self.is_nested_loop_exit_to_ancestor(edge_ref, edge.from, region)
-            && !self.exits_nested_loop_before_continue(edge_ref, edge.from, region)
+            && !self.exits_nested_loop_before_continue(cfg, edge_ref, edge.from, region)
             && (!self.layout_edges[edge_ref.index()].natural
                 || self.loops.control_by_block[edge.to.index()] == Some(region))
         {
@@ -938,12 +995,29 @@ impl EdgeSemantics {
 
     fn exits_nested_loop_before_continue(
         &self,
+        cfg: &Cfg,
         edge: EdgeRef,
         source: BlockRef,
         continue_target: RegionId,
     ) -> bool {
-        self.break_region(edge).is_some_and(|break_target| {
-            break_target != continue_target && self.loops.innermost(source) == Some(break_target)
-        })
+        let exits_nested = |edge| {
+            self.break_region(edge).is_some_and(|break_target| {
+                break_target != continue_target
+                    && self.loops.innermost(source) == Some(break_target)
+            })
+        };
+        if exits_nested(edge) {
+            return true;
+        }
+        // 条件 arm 可以先落到仅含 jump 的 break pad，再由该 pad 退出最内层
+        // loop。早期 continue 若只看 arm 本身，会把 `break` 变成外层 continue，
+        // 从而错误执行 nested repeat 的 until 条件。
+        let pad = cfg.edges[edge.index()].to;
+        let [next] = cfg.succs[pad.index()].as_slice() else {
+            return false;
+        };
+        cfg.blocks[pad.index()].instrs.len == 1
+            && cfg.edges[next.index()].kind == EdgeKind::Jump
+            && exits_nested(*next)
     }
 }

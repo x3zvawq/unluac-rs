@@ -1,4 +1,6 @@
 -- common_07_return_and_multiret#1: 函数调用与多返回值
+-- 固定多结果调用应直接初始化接收组，不增加空声明。
+-- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=1]]
 local function test_calls_returns()
     local function pair(a, b)
         return a + b, a * b

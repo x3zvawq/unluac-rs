@@ -196,3 +196,5 @@ test_crazy_init()
 test_nested_call()
 test_dynamic_overwrite()
 test_ctor_function_mix()
+-- 顶层嵌套构造器不得把整个 chunk 套进额外作用域。
+-- unluac: expect-ast-max [[do-block]] [[0]] [[@dialect=lua5.4]] [[@proto=0]]

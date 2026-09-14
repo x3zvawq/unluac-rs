@@ -1,4 +1,5 @@
 -- 正常后继的step残根：54/55 skip可保留字符串，51–53先数值化；一次迭代后均释放。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 local seen = {}
 local baseline = 0
 local old = getmetatable(_G)

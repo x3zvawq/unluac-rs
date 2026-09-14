@@ -1,4 +1,5 @@
 -- numeric-for 的语法 binding 已提供本轮 phi 值；原 SETLIST buffer COPY 仍须保留。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 -- retain-debug 再编译不能每轮新建一个 local index2 = index。
 local total = 0
 for index = 1, 3 do

@@ -369,6 +369,11 @@ pub fn unit_case_specs() -> Vec<UnitCaseSpec> {
         .collect()
 }
 
+/// 在 runner 列表阶段校验源码断言的 manifest selector，避免拼写过期后静默跳过全部实例。
+pub fn validate_readability_selector_coverage(specs: &[UnitCaseSpec]) -> Result<(), String> {
+    validate_readability_selectors(specs)
+}
+
 pub fn find_unit_case_spec(suite: UnitSuite, id: LuaCaseId) -> Option<UnitCaseSpec> {
     unit_case_specs()
         .into_iter()
@@ -389,24 +394,90 @@ enum ReadabilityAssertion {
     Contains {
         line: usize,
         needle: String,
+        selector: ReadabilitySelector,
     },
     NotContains {
         line: usize,
         needle: String,
+        selector: ReadabilitySelector,
     },
     NotLine {
         line: usize,
         needle: String,
+        selector: ReadabilitySelector,
     },
     Order {
         line: usize,
         before: String,
         after: String,
+        selector: ReadabilitySelector,
     },
     MaxLineLength {
         line: usize,
         max: usize,
+        selector: ReadabilitySelector,
     },
+    SourceCount {
+        line: usize,
+        needle: String,
+        bound: ReadabilityCountBound,
+        selector: ReadabilitySelector,
+    },
+    AstCount {
+        line: usize,
+        metric: ReadabilityAstMetric,
+        bound: ReadabilityCountBound,
+        selector: ReadabilitySelector,
+    },
+}
+
+/// `unluac:` 断言的计数边界；执行轮次由文本或 AST 断言类别决定。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReadabilityCountBound {
+    Exact(usize),
+    Min(usize),
+    Max(usize),
+}
+
+/// 可由最终 readability AST 直接证明的少量展示指标，避免把变量名或源文本当作结构事实。
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum ReadabilityAstMetric {
+    EmptyLocal,
+    EmptyFunction,
+    If,
+    While,
+    Repeat,
+    NumericFor,
+    GenericFor,
+    Goto,
+    Label,
+    Break,
+    Continue,
+    DoBlock,
+    Function,
+    LocalFunction,
+    LocalDecl,
+    Call,
+    MethodCall,
+    Error,
+}
+
+/// 源码断言对 manifest 已展开实例的精确筛选；不在测试源码中重复方言或编译选项矩阵。
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct ReadabilitySelector {
+    dialect: Option<LuaCaseDialect>,
+    debug: Option<ReadabilityDebugSelector>,
+    /// 直接与 manifest entry 的展示标签比较，允许新增 variant 无需同步这套断言原语。
+    variant: Option<String>,
+    /// 仅 AST 指标使用；数值是 `HirProtoRef::index()`，以目标 proto 的函数体为统计域。
+    proto: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReadabilityDebugSelector {
+    Retained,
+    Stripped,
+    Ignored,
 }
 
 #[path = "support/chunk_patch.rs"]

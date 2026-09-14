@@ -1,4 +1,5 @@
 -- FORI的整数和浮点路径在skip判断前覆盖FOR_EXT，独立于三个control的保证。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 local weak = setmetatable({}, {__mode = "v"})
 local results = {}
 local old = getmetatable(_G)

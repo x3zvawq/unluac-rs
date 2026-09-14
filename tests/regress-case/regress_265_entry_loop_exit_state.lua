@@ -3,6 +3,7 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[while]] [[1]] [[@proto=1]]
 local function run(a, b, c)
     repeat
         if b then

@@ -1,4 +1,6 @@
 -- 同一上值的两次读取分别配对自己的原槽与 CALL，不能按上值名复用准备证书。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
+-- unluac: expect-ast-min [[if]] [[1]]
 local captured = 1
 local weak = setmetatable({}, {__mode = "v"})
 local observed = {}

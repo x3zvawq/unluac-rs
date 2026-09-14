@@ -2,6 +2,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[repeat]] [[1]] [[@proto=1]]
 local function run(stop, left, right)
     local x = 0
     repeat

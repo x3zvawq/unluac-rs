@@ -1,4 +1,5 @@
 -- regress_413_repeat_condition_binding_use: until shares the repeat body's local scope
+-- unluac: expect-ast-min [[repeat]] [[1]]
 
 local provider = {}
 

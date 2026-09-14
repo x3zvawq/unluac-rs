@@ -1,4 +1,6 @@
 -- regress_180_numeric_for_shared_tail#1: 分支汇入 numeric-for 共享尾时不能提前 continue
+-- unluac: expect-ast-min [[numeric-for]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-min [[if]] [[1]] [[@proto=1]]
 
 local function run(n, value, cond)
     local sink = {}

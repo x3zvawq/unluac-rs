@@ -3,6 +3,8 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[while]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-min [[break]] [[1]] [[@proto=1]]
 local function run(a, b, c)
     while a do
         if c then

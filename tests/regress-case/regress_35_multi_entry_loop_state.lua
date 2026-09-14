@@ -2,6 +2,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[while]] [[1]] [[@proto=1]]
 
 local function count_previous_levels(meta, start_index, unlocked)
     local count = 1

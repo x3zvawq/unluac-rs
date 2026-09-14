@@ -1,4 +1,5 @@
 -- regress_529_repeat_parenthesized_call_separator: until 条件不能吸收下一条括号调用。
+-- unluac: expect-ast-min [[repeat]] [[1]]
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[;]]
 -- unluac: expect-contains [[(function(]]

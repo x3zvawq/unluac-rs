@@ -1,5 +1,7 @@
 -- regress_397_generic_for_exact_tail_arity: exact call results must not become an open generic-for pack
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[generic-for]] [[1]]
+-- unluac: expect-ast-min [[break]] [[1]]
 
 local function factory()
     return next, { x = 1 }, nil, "extra"

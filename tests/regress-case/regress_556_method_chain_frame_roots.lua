@@ -1,4 +1,5 @@
 -- 原 SELF 覆盖前一调用结果；额外源码 local 会把已交给 callee 的 root 留在 caller。
+-- unluac: expect-ast-min [[method-call]] [[2]]
 -- unluac: expect-contains [[:make():next():finish()]]
 local weak = setmetatable({}, {__mode = "v"})
 local provider = {}

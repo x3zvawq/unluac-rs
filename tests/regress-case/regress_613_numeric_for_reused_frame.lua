@@ -1,4 +1,5 @@
 -- 原声明帧在 numeric-for header 前结束；不提前清根，保留header求值和额外别名的观察。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 -- integer_skip
 do
 local weak = setmetatable({}, {__mode="v"})

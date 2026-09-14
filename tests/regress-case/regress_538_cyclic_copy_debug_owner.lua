@@ -1,4 +1,5 @@
 -- assert 值物化形成 label flow；debug source owner 与跨轮副本必须分别退休。
+-- unluac: expect-ast-min [[while]] [[1]]
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })
 local iteration = 0

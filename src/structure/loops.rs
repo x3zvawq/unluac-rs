@@ -22,9 +22,9 @@
 //!   cleanup pad 把循环变量身份带到 post-loop
 //! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
 //!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
-//! - 同一 header 的全部 natural backedge 只形成一个候选；源码里的重叠循环写法若
-//!   编译成同一控制身份，由这个 region 内的 branch/break/continue 表达，不在后层
-//!   重新按回边拆候选
+//! - 同一 header 的 natural backedge 默认共享控制身份；仅当 VM latch 或严格内层域
+//!   与外层尾条件证明完整嵌套时在本层分区。内层入口两臂都在域内时，全部退出必须
+//!   经唯一汇点到外层尾条件；后层不按回边重新拆候选，兄弟 latch 也不因数量拆分
 //! - 全部出口都直接终止时，多条 sibling latch 共同归一个 while-true owner，header
 //!   作为它们共享的下一轮入口
 //! - `WhileLike` 的 header 前缀必须属于 branch 条件的数据依赖链，或是可丢弃的

@@ -142,3 +142,5 @@ test_effectful_conditions()
 test_mutable_lookup()
 test_disjunctions()
 test_loop_exit()
+-- 循环后仍更新原 result，不重建条件返回的空 carrier。
+-- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=15]]

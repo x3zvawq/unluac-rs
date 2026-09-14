@@ -1,4 +1,6 @@
 -- common_01_basics#1: 多赋值与局部变量初始化
+-- 标量初始化不应退化成先空声明再逐项写入。
+-- unluac: expect-ast-max [[empty-local]] [[0]] [[@dialect=lua5.4]] [[@proto=1]]
 local function test_assignments()
     local a, b, c = "alpha", 42, true
     local x, y, z = 1, 2, 3

@@ -1,4 +1,6 @@
 -- regress_279_repeat_short_body_scope_break#1: repeat 的短路 body 臂可先进入内层 loop，再 break 外层
+-- unluac: expect-ast-min [[repeat]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-min [[break]] [[1]] [[@proto=1]]
 local function run(a, b, c, xs)
     local x = 0
     repeat

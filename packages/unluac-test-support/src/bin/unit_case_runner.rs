@@ -7,6 +7,7 @@ use std::process;
 
 use unluac_test_support::{
     LuaCaseId, UnitSuite, find_unit_case_spec, format_case_failure, run_unit_case, unit_case_specs,
+    validate_readability_selector_coverage,
 };
 
 enum CommandLine {
@@ -55,7 +56,9 @@ fn main() {
 fn run() -> Result<ExitKind, String> {
     match parse_args(env::args().skip(1))? {
         CommandLine::List => {
-            for spec in unit_case_specs() {
+            let specs = unit_case_specs();
+            validate_readability_selector_coverage(&specs)?;
+            for spec in specs {
                 println!(
                     "{}\t{}\t{}\t{}\t{}",
                     spec.suite.label(),

@@ -1,4 +1,5 @@
 -- 覆写后的两条纯分支可共享 frame 出口；分支内的观察仍须结束旧对象的根。
+-- unluac: expect-ast-min [[if]] [[1]]
 local gc = collectgarbage
 local weak = setmetatable({}, {__mode = "v"})
 local function make()

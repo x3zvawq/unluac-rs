@@ -1,4 +1,5 @@
 -- 内层资源的 __close 执行时，外层 copy 的命名作用域仍有效，且 debug 写入不能留下隐藏根。
+-- unluac: expect-ast-min [[while]] [[1]]
 local function run(owner, gc, closer)
     local iteration = 0
     while true do

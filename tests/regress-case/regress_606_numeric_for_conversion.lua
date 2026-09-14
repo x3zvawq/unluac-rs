@@ -1,4 +1,5 @@
 -- 三个输入必须按源码顺序求值；FORPREP 的成功后态不能提前应用到 header CALL。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 local trace = ""
 local function control(label, value)
     trace = trace .. label

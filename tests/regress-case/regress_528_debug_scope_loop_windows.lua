@@ -1,4 +1,6 @@
 -- 循环体内的闭合窗口不等于 SCC；包住整个循环时 scratch 必须在末端前真正退休。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
+-- unluac: expect-ast-min [[do-block]] [[1]] [[@debug=retained]]
 local function body_window(flag)
     local weak = setmetatable({}, { __mode = "k" })
     for i = 1, 3 do

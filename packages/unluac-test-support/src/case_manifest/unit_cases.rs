@@ -4,6 +4,27 @@ use super::*;
 
 pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     // ── common cases ──
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/readability_assertion_protocol.lua",
+        PUC_LUA_54,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/readability_assertion_protocol.lua",
+        PUC_LUA_54,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/readability_assertion_protocol.lua",
+        PUC_LUA_54,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ignore_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
     // 每个文件内部以 `local function test_xxx()` 包裹，print 首参带 file#N 标签以便逐 proto 定位。
     LuaCaseMatrixEntry::new("tests/unit-case/common_01_basics.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new("tests/unit-case/common_02_control_flow.lua", ALL_DIALECTS),
@@ -38,6 +59,49 @@ pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
         "tests/unit-case/common_14_loop_lexical_arms.lua",
         ALL_DIALECTS,
     ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/common_15_loop_exit_observations.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/common_15_loop_exit_observations.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/common_15_loop_exit_observations.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/common_15_loop_exit_observations.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    // 字面量发射是稳定的基础合同；各自保留独立的源码、断言及方言矩阵。
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/literal_leading_newline_string.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/literal_negative_zero_float.lua",
+        PUC_LUA_GE_53,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/literal_utf8_control_string.lua",
+        ALL_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/unit-case/literal_binary_string_bytes.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
     // ── dialect-specific cases ──
     LuaCaseMatrixEntry::new("tests/unit-case/lua51_01.lua", PUC_LUA_51),
     LuaCaseMatrixEntry::new("tests/unit-case/lua52_01_env.lua", PUC_LUA_GE_52).with_options(
@@ -63,4 +127,12 @@ pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new("tests/unit-case/luau_01.lua", LUAU_ONLY),
     LuaCaseMatrixEntry::new("tests/unit-case/luau_02_vector.lua", LUAU_ONLY)
         .with_options(LUAU_VECTOR_OPTIONS),
+    LuaCaseMatrixEntry::new("tests/unit-case/luau_03_loop_continue_actions.lua", LUAU_ONLY)
+        .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new("tests/unit-case/luau_03_loop_continue_actions.lua", LUAU_ONLY)
+        .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+        .with_options(LuaCaseOptions {
+            retain_debug: true,
+            ..LuaCaseOptions::DEFAULT
+        }),
 ];

@@ -1,5 +1,9 @@
 -- regress_336_loop_branch_state_copy: branch state 恢复必须证明所有回边及可重入写后的入口关系
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[while]] [[1]]
+-- unluac: expect-ast-min [[repeat]] [[1]]
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
+-- unluac: expect-ast-min [[generic-for]] [[1]]
 
 local handler = {}
 

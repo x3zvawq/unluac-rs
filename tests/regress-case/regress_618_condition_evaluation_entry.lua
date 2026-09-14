@@ -1,4 +1,6 @@
 -- 完整条件入口包含外层 callee/左全局读取，不能把首个执行的 CALL 当作入口。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
+-- unluac: expect-ast-min [[if]] [[1]]
 local weak = setmetatable({}, {__mode = "v"})
 local calls = 0
 local left_reads = 0

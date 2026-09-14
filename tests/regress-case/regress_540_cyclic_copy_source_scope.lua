@@ -1,4 +1,5 @@
 -- 源码 copy 只在循环体内可见；debug 修改后的当前值才允许跨作用域交接保活。
+-- unluac: expect-ast-min [[while]] [[1]]
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })
 local iteration = 0

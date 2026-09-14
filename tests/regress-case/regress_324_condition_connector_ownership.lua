@@ -1,3 +1,4 @@
+-- unluac: expect-ast-min [[if]] [[1]] [[@proto=1]]
 local RateUs = {}
 
 RateUs.isAvailable = function()

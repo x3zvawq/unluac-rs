@@ -160,7 +160,7 @@ pub(super) fn partition_repeat_like_natural_loop(
     let LoopAnalysisContext {
         proto,
         cfg,
-        graph_facts: _,
+        graph_facts,
         dataflow: _,
     } = *context;
     if natural_loop.backedges.len() < 2 {
@@ -187,7 +187,18 @@ pub(super) fn partition_repeat_like_natural_loop(
         &residual_backedges,
         domain_workspace,
     )?;
-    if !residual_cycle_is_nested(cfg, natural_loop, &residual_blocks, &residual_backedges) {
+    let outer = build_loop_candidate(
+        context,
+        shared_exit_workspace,
+        header,
+        natural_loop.blocks.clone(),
+        outer_backedges,
+    );
+    if !residual_cycle_is_nested(cfg, natural_loop, &residual_blocks, &residual_backedges)
+        && !residual_cycle_precedes_repeat_condition(
+            proto, cfg, graph_facts, &residual_blocks, &outer,
+        )
+    {
         return None;
     }
 
@@ -199,14 +210,50 @@ pub(super) fn partition_repeat_like_natural_loop(
         residual_backedges,
     );
     child.header_value_merges.clear();
-    let outer = build_loop_candidate(
-        context,
-        shared_exit_workspace,
-        header,
-        natural_loop.blocks.clone(),
-        outer_backedges,
-    );
     Some(vec![child, outer])
+}
+
+/// 同 header 的内层入口可以两臂都留在内层，例如 `repeat repeat if b then ... end
+/// until d until a`。所有内层退出先汇入外层尾条件入口或其前置 continuation，才证明
+/// 本轮内层已完整结束；
+/// sibling latch 的另一臂若绕过此条件则不满足。只穿透已有单跳/清理 pad 查询，
+/// pad 仍由后续词法域和 cleanup owner 发射，不在此删除其事件。
+fn residual_cycle_precedes_repeat_condition(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph_facts: &GraphFacts,
+    residual: &BTreeSet<BlockRef>,
+    outer: &LoopCandidate,
+) -> bool {
+    let Some(condition) = outer.continue_target else {
+        return false;
+    };
+    if outer.kind_hint != LoopKindHint::RepeatLike
+        || residual == &outer.blocks
+        || residual.len() <= 1
+        || residual.contains(&condition)
+        || !cfg.branch_edges(outer.header).is_some_and(|(truthy, falsy)| {
+            [truthy, falsy]
+                .iter()
+                .all(|edge| residual.contains(&cfg.edges[edge.index()].to))
+        })
+        || !is_reducible_region(cfg, outer.header, residual)
+    {
+        return false;
+    }
+    let exits = collect_region_exits(cfg, residual);
+    let normalized = |exit| transparent_loop_exit_target(proto, cfg, exit).unwrap_or(exit);
+    let Some(entry) = exits.first().copied().map(normalized) else {
+        return false;
+    };
+    // `until a or xs[i]` 的已知 continue target 可能只是最后一个条件叶。
+    // 唯一退出汇点必须在内层之外且支配该叶；中间短路节点仍留给外层的原条件分析。
+    !residual.contains(&entry)
+        && outer.blocks.contains(&entry)
+        && graph_facts.dominates(entry, condition)
+        && exits
+            .iter()
+            .all(|exit| outer.blocks.contains(exit) && normalized(*exit) == entry)
 }
 
 pub(super) struct NaturalLoopDomainWorkspace {

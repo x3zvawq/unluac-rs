@@ -581,4 +581,108 @@ pub(super) const REGRESSION_CASES_601_700: &[LuaCaseMatrixEntry] = &[
         retain_debug: true,
         ..LuaCaseOptions::DEFAULT
     }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_642_nested_repeat_break_condition.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_642_nested_repeat_break_condition.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_642_nested_repeat_break_condition.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_642_nested_repeat_break_condition.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_643_nested_exit_condition_owner.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_643_nested_exit_condition_owner.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_643_nested_exit_condition_owner.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_643_nested_exit_condition_owner.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_644_shared_repeat_body_branch.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_644_shared_repeat_body_branch.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_644_shared_repeat_body_branch.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_644_shared_repeat_body_branch.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_645_shared_repeat_short_exit.lua",
+        ALL_NON_LUAU_DIALECTS,
+    ),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_645_shared_repeat_short_exit.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_645_shared_repeat_short_exit.lua",
+        ALL_NON_LUAU_DIALECTS,
+    )
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
+    LuaCaseMatrixEntry::new(
+        "tests/regress-case/regress_645_shared_repeat_short_exit.lua",
+        LUAU_ONLY,
+    )
+    .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+    .with_options(LuaCaseOptions {
+        retain_debug: true,
+        ..LuaCaseOptions::DEFAULT
+    }),
 ];

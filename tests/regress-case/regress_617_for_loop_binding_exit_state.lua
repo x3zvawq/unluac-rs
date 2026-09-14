@@ -1,4 +1,5 @@
 -- 用户槽在body可持有对象，最后一次FORLOOP退出不等于再次物理写入该槽。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 local weak = setmetatable({}, {__mode="v"})
 local observed
 local old = getmetatable(_G)

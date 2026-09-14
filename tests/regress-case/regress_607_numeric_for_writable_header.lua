@@ -1,4 +1,5 @@
 -- 可写 index 另占源码槽；Luau 三个 header CALL 均在完整预留区之后返回。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 -- Lua 5.5 的 index 是 const，本样例按现有可写 numeric-for 方言矩阵注册。
 local trace = ""
 local function control(label, value)

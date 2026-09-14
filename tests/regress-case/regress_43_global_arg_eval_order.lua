@@ -1,4 +1,5 @@
 -- regress_43_global_arg_eval_order#1: global 参数读取不能越过 callee 读取
+-- unluac: expect-order [[local r0_1 = source]] [[sink(r0_1)]]
 local log = {}
 
 setmetatable(_G, {

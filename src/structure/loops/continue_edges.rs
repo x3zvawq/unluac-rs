@@ -54,6 +54,7 @@ pub(in crate::structure) fn assign_continue_edge_ownership(
                     let candidate = &candidates[*index];
                     // repeat 的 backedge pad 还承载条件求值，不能仅凭 jump 形状认作 continue。
                     candidate.kind_hint != LoopKindHint::RepeatLike
+                        && !exits_inner_natural_loop(graph_facts, candidate, edge)
                         && candidate.continue_target != Some(branch.header)
                         && candidate.blocks.contains(&branch.header)
                         && (candidate.backedges.binary_search(&edge_ref).is_err()
@@ -114,10 +115,34 @@ pub(in crate::structure) fn assign_continue_edge_ownership(
                 else {
                     continue;
                 };
+                if exits_inner_natural_loop(graph_facts, candidate, cfg.edges[edge_ref.index()]) {
+                    continue;
+                }
                 candidate.continue_edges.insert(edge_ref);
             }
         }
     }
+}
+
+/// 进入祖先 latch 前仍要先完成内层循环退出，不能提前把这条边标成祖先 continue。
+/// 例如双 repeat 的共同出口接外层 while latch，错误标记会使完整 until DAG 的
+/// 终端动作被误判为不可合并。这里只消费 natural-loop forest 的唯一嵌套身份；
+/// 具体 break/continue 的源码位置仍由最终 region owner 冻结。
+fn exits_inner_natural_loop(
+    graph_facts: &GraphFacts,
+    candidate: &LoopCandidate,
+    edge: crate::structure::CfgEdge,
+) -> bool {
+    let forest = &graph_facts.natural_loop_forest;
+    let (Some(owner), Some(inner)) = (
+        forest.loop_for_header(candidate.header),
+        forest.innermost_loop(edge.from),
+    ) else {
+        return false;
+    };
+    owner != inner
+        && forest.is_ancestor_or_self(owner, inner)
+        && !forest.contains(inner, edge.to)
 }
 
 pub(super) fn numeric_continue_target_carries_body_tail(

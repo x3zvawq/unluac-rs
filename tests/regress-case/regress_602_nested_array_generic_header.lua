@@ -1,4 +1,5 @@
 -- 原数组 batch、内表缓冲槽与 iterator dispatch endpoint 必须由完整事务共同消费。
+-- unluac: expect-ast-min [[generic-for]] [[1]]
 -- unluac: expect-contains [[in ipairs(]]
 -- unluac: expect-not-contains [[ = nil]]
 local function identity(value)

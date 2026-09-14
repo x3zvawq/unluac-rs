@@ -1,4 +1,6 @@
 -- 迭代器、dispatch 结果与清理位置来自冻结协议，debug 名字不能额外保留外层对象。
+-- unluac: expect-ast-min [[generic-for]] [[1]]
+-- unluac: expect-ast-min [[do-block]] [[1]] [[@debug=retained]]
 local function run(values)
     local weak = setmetatable({}, { __mode = "k" })
     do

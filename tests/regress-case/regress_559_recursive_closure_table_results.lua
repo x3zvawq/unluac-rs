@@ -1,4 +1,5 @@
 -- 03 的递归自捕获声明；同一 binding 的空声明和闭包赋值应恢复为 local function。
+-- unluac: expect-ast-min [[local-function]] [[1]]
 -- unluac: expect-contains [[local function r1_0(]]
 -- unluac: expect-not-line [[local r1_0]]
 -- unluac: expect-contains [[labels = { "raw", "derived" }]]

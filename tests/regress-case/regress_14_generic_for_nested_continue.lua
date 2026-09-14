@@ -2,6 +2,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[generic-for]] [[3]] [[@proto=1]]
 local episodes = {
     {
         pages = {

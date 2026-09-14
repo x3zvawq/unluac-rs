@@ -1,6 +1,9 @@
 -- regress_488_loop_iteration_branch_join: a next-iteration postdom is not this iteration's branch join
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
+-- unluac: expect-ast-min [[repeat]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-min [[while]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-min [[break]] [[1]] [[@proto=1]]
 local function run(a, b, c)
     local x = 0
     repeat

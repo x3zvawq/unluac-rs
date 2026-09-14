@@ -1,4 +1,5 @@
 -- 跨回边的独立副本越过下轮全局查找，在原参数槽覆盖后退休。
+-- unluac: expect-ast-min [[while]] [[1]]
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })
 local iteration = 0

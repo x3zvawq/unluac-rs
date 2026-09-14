@@ -34,3 +34,6 @@ end
 
 test_return_arm()
 test_closed_sibling()
+-- 含纯 return 的循环臂应由结构化控制表达。
+-- unluac: expect-ast-max [[goto]] [[0]] [[@dialect=lua5.4]] [[@proto=2]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@dialect=lua5.4]] [[@proto=2]]

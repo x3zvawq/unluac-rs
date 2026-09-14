@@ -1,4 +1,5 @@
 -- Both decision leaves and the merged write must use the live generic-for binding.
+-- unluac: expect-ast-min [[generic-for]] [[1]]
 local function inspect(input)
     for key, value in pairs({ item = input }) do
         if type(value) == "function" then value = value() end

@@ -1,4 +1,5 @@
 -- 同一 debug 作用域里的表与函数必须一起结束局部根的保活期。
+-- unluac: expect-ast-min [[do-block]] [[1]] [[@debug=retained]]
 local function make() return {} end
 local weak = setmetatable({}, { __mode = "k" })
 do

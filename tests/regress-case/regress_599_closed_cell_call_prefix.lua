@@ -1,4 +1,5 @@
 -- 已关闭的循环 cell 不属于循环后调用的活动声明前缀。
+-- unluac: expect-ast-min [[numeric-for]] [[1]]
 local function closed_prefix()
     local readers = {}
     for index = 1, 2 do

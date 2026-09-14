@@ -1,4 +1,5 @@
 -- 原同槽临时值应由循环头、开放变参调用与字段写完整消费。
+-- unluac: expect-ast-min [[generic-for]] [[1]]
 -- unluac: expect-not-contains [[= ipairs]]
 -- unluac: expect-contains [[.extra_count = select("#", ...)]]
 -- unluac: expect-contains [[.extra_first = select(1, ...)]]

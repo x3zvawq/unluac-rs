@@ -1,4 +1,5 @@
 -- 同槽纯链位于带 Close 的回边区域；前缀副本不属于末端赋值的依赖闭包。
+-- unluac: expect-ast-min [[while]] [[1]]
 -- 保留真实寄存器/作用域形状，验证相邻后缀能共享 DAG 展开且不改变循环入口。
 local function run(a, done)
  ::again::

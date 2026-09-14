@@ -1,5 +1,7 @@
 -- regress_410_lua55_wide_mixed_global_rhs: wide leading target must reject the direct suffix
 -- unluac: expect-not-contains [[global tail_b, tail_c =]]
+-- unluac: expect-min-count [[err-nnil]] [[1]]
+-- unluac: expect-ast-min [[error]] [[1]] [[@proto=0]]
 
 global<const> print
 

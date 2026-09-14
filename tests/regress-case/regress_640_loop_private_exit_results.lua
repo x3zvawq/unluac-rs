@@ -1,3 +1,5 @@
+-- unluac: expect-ast-min [[while]] [[3]]
+-- unluac: expect-ast-min [[break]] [[2]]
 local function private_exit()
     local co = coroutine.create(function()
         coroutine.yield(10)

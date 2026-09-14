@@ -1,4 +1,7 @@
 -- 残余 Decision 保留原结果 home，循环后的条件更新不重建空 carrier。
+-- unluac: expect-ast-min [[while]] [[1]]
+-- unluac: expect-ast-min [[if]] [[2]]
+-- unluac: expect-ast-min [[break]] [[1]]
 -- unluac: expect-not-line [[local r1_1]]
 local function run(flag, limit)
     local result = 0

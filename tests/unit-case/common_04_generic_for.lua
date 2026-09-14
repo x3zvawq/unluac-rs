@@ -1,4 +1,6 @@
 -- common_04_generic_for#1: 基础ipairs泛型for
+-- 迭代协议保持原生 generic-for，不拆为手写调用循环。
+-- unluac: expect-ast-count [[generic-for]] [[1]] [[@dialect=lua5.4]] [[@proto=1]]
 local function test_basic_ipairs()
     local colors = { "red", "green", "blue" }
     local parts = {}

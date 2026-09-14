@@ -1,4 +1,7 @@
 -- common_02_control_flow#1: if-elseif-else与提前返回
+-- classify 的两个判定保持结构化分支，不引入跳转标签。
+-- unluac: expect-ast-count [[if]] [[2]] [[@dialect=lua5.4]] [[@proto=2]]
+-- unluac: expect-ast-max [[goto]] [[0]] [[@dialect=lua5.4]] [[@proto=2]]
 local function test_if_return()
     local function classify(x)
         if x > 0 then

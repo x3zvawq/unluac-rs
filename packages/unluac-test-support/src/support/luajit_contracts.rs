@@ -580,6 +580,16 @@ pub(super) fn run_unsupported_island_contract(
         )));
     }
 
+    let assertions = read_readability_assertions(entry.path)?;
+    assert_readability(
+        "permissive",
+        &generated.source,
+        permissive.state.readability.as_ref(),
+        entry,
+        &assertions,
+        true,
+    )?;
+
     Ok(TestSuccess { proto_count: 1 })
 }
 

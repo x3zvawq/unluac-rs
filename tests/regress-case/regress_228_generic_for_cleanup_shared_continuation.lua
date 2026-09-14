@@ -2,6 +2,7 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-min [[generic-for]] [[1]]
 local function run(a, b, c, items, value, fallback)
     if (a or b) and c ~= nil then
         for _ in items do

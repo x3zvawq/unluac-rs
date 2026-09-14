@@ -1,4 +1,5 @@
 -- 第四返回值的隐式关闭由原生 for 持有，外层 do 只能恢复自己的根结束点。
+-- unluac: expect-ast-min [[generic-for]] [[1]]
 local function iterator(values, weak, events)
     local guard = setmetatable({}, {
         __close = function()

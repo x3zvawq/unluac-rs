@@ -1,3 +1,4 @@
+-- unluac: expect-ast-min [[repeat]] [[2]]
 local d, e, f = 117
 local g = 1
 

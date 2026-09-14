@@ -1,3 +1,5 @@
+-- unluac: expect-ast-min [[while]] [[1]]
+-- unluac: expect-ast-min [[break]] [[1]]
 -- unluac: expect-contains [[local r1_2, r1_3 = coroutine.resume(r1_0)]]
 -- unluac: expect-not-line [[local r1_2, r1_3]]
 
