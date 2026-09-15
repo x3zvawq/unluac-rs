@@ -14,7 +14,7 @@ use unluac::decompile::{
 };
 
 /// 开发时最常改的是这几个常量，直接编辑代码通常比来回敲命令更顺手。
-const SOURCE: &str = "tests/unit-case/luajit_01.lua";
+const SOURCE: &str = "tests/case_runtime/ffi_01_luajit_cdata_ffi_numeric_matrix.lua";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompilerProtocol {

@@ -4,15 +4,15 @@ use std::env;
 
 use anyhow::{Result, bail};
 
+mod case_test;
 mod toolchain;
-mod unit_test;
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
 
     match args.next().as_deref() {
         None | Some("help") => print_help(),
-        Some("test-unit") => unit_test::run(args)?,
+        Some("test-cases") => case_test::run(args)?,
         Some(command @ ("list" | "init" | "fetch" | "build" | "clean")) => {
             let forwarded = std::iter::once(command.to_owned()).chain(args);
             toolchain::run(forwarded)?;

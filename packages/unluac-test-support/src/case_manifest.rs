@@ -1,30 +1,39 @@
 //! 这个模块集中声明仓库里的 Lua case 测试矩阵。
 //!
-//! 目录区分 `unit` / `regression`；矩阵集中声明方言、编译选项和验证合同。
-//! 每个 suite 展开时签发实例 ID，让调度与产物路径直接保留完整条目身份；
+//! 每份源码只登记一次，标签和保护边界归属于源码；配置数组声明方言、编译选项和验证合同。
+//! 全部主题统一展开实例 ID，让调度与产物路径直接保留完整条目身份；
 //! 例如同一 Lua 5.4 源码的 stripped/debug 两项分别执行，不由展示标签反向重建选项。
 
 use strum_macros::{Display, IntoStaticStr};
 use unluac::ast::NamingMode;
 use unluac::decompile::DecompileDialect;
 
-mod regressions_001_100;
-mod regressions_101_200;
-mod regressions_201_318;
-mod regressions_319_400;
-mod regressions_401_500;
-mod regressions_501_600;
-mod regressions_601_700;
-mod unit_cases;
-
-use regressions_001_100::REGRESSION_CASES_001_100;
-use regressions_101_200::REGRESSION_CASES_101_200;
-use regressions_201_318::REGRESSION_CASES_201_318;
-use regressions_319_400::REGRESSION_CASES_319_400;
-use regressions_401_500::REGRESSION_CASES_401_500;
-use regressions_501_600::REGRESSION_CASES_501_600;
-use regressions_601_700::REGRESSION_CASES_601_700;
-use unit_cases::UNIT_CASES;
+mod bindings;
+mod calls;
+mod closures;
+mod control_flow;
+mod lifetime;
+mod literals;
+mod operators;
+mod protocol;
+mod runtime;
+mod stress;
+mod syntax;
+mod tables;
+const CASE_GROUPS: &[&[LuaCaseDefinition]] = &[
+    bindings::CASES,
+    calls::CASES,
+    closures::CASES,
+    control_flow::CASES,
+    lifetime::CASES,
+    literals::CASES,
+    operators::CASES,
+    protocol::CASES,
+    runtime::CASES,
+    stress::CASES,
+    syntax::CASES,
+    tables::CASES,
+];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Display, IntoStaticStr)]
 pub enum LuaCaseDialect {
@@ -58,10 +67,34 @@ impl LuaCaseDialect {
     }
 }
 
-/// 矩阵里的单个 case 定义。
+/// 源码是唯一登记单位，多个标签表达交叉主题，配置数组保留各实例完整合同。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LuaCaseDefinition {
+    path: &'static str,
+    tags: &'static [&'static str],
+    purpose: &'static str,
+    configurations: &'static [LuaCaseConfiguration],
+}
+
+impl LuaCaseDefinition {
+    const fn new(
+        path: &'static str,
+        tags: &'static [&'static str],
+        purpose: &'static str,
+        configurations: &'static [LuaCaseConfiguration],
+    ) -> Self {
+        Self {
+            path,
+            tags,
+            purpose,
+            configurations,
+        }
+    }
+}
+
+/// 一个源码合同可展开多组配置；配置不重复声明源码路径和主题元信息。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct LuaCaseMatrixEntry {
-    pub(crate) path: &'static str,
+pub(crate) struct LuaCaseConfiguration {
     pub(crate) dialects: &'static [LuaCaseDialect],
     pub(crate) options: LuaCaseOptions,
     pub(crate) variants: &'static [LuaCaseVariant],
@@ -69,10 +102,9 @@ pub(crate) struct LuaCaseMatrixEntry {
     pub(crate) structure_contracts: &'static [LuaCaseStructureContract],
 }
 
-impl LuaCaseMatrixEntry {
-    const fn new(path: &'static str, dialects: &'static [LuaCaseDialect]) -> Self {
+impl LuaCaseConfiguration {
+    const fn new(dialects: &'static [LuaCaseDialect]) -> Self {
         Self {
-            path,
             dialects,
             options: LuaCaseOptions::DEFAULT,
             variants: &[],
@@ -177,13 +209,15 @@ pub(crate) struct LuauVectorCaseOptions {
     pub(crate) components: u8,
 }
 
-/// 同一 suite 的矩阵展开顺序签发的实例身份；选项相异的条目不能靠 path/dialect 重新匹配。
+/// 全部主题统一签发实例身份；选项相异的条目不能靠 path/dialect 重新匹配。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LuaCaseId(pub usize);
 
 /// 已展开并具有独立执行与产物身份的测试单元。
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LuaCaseManifestEntry {
+    pub tags: &'static [&'static str],
+    pub purpose: &'static str,
     pub id: LuaCaseId,
     pub path: &'static str,
     pub dialect: LuaCaseDialect,
@@ -194,6 +228,23 @@ pub struct LuaCaseManifestEntry {
 }
 
 impl LuaCaseManifestEntry {
+    /// 目录主分类只决定归属；交叉语义由 tags 表达。
+    pub fn category(self) -> &'static str {
+        self.path
+            .split('/')
+            .nth(1)
+            .and_then(|part| part.strip_prefix("case_"))
+            .expect("case paths must carry a category directory")
+    }
+
+    /// 导出展开后的配置，索引与迁移核对不从展示标签猜测配置。
+    pub fn configuration_description(self) -> String {
+        format!(
+            "{:?}; {:?}; {:?}",
+            self.options, self.expectation, self.structure_contracts
+        )
+    }
+
     /// 展示编译档位和 debug 策略；实例选择始终使用矩阵签发的 id。
     pub fn variant_label(self) -> String {
         let mut labels = Vec::new();
@@ -344,52 +395,110 @@ const NO_RECOMPILE_STRESS_OPTIONS: LuaCaseOptions = LuaCaseOptions {
     ..LuaCaseOptions::DEFAULT
 };
 
-pub(crate) fn unit_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
-    manifest_entries(UNIT_CASES.iter())
+fn case_definitions() -> impl Iterator<Item = &'static LuaCaseDefinition> {
+    CASE_GROUPS.iter().flat_map(|group| group.iter())
 }
 
-pub(crate) fn regression_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
-    manifest_entries(
-        [
-            REGRESSION_CASES_001_100,
-            REGRESSION_CASES_101_200,
-            REGRESSION_CASES_201_318,
-            REGRESSION_CASES_319_400,
-            REGRESSION_CASES_401_500,
-            REGRESSION_CASES_501_600,
-            REGRESSION_CASES_601_700,
-        ]
-        .into_iter()
-        .flatten(),
-    )
+/// 目录分类、唯一登记与索引字段是源码合同的输入约束；列表阶段一次校验，执行实例不重复扫描。
+pub fn validate_case_catalog() -> Result<(), String> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut group_numbers = std::collections::BTreeSet::new();
+    for case in case_definitions() {
+        if !paths.insert(case.path) {
+            return Err(format!(
+                "case source registered more than once: {}",
+                case.path
+            ));
+        }
+        let relative = case
+            .path
+            .strip_prefix("tests/case_")
+            .ok_or_else(|| format!("case path lacks a category: {}", case.path))?;
+        let (category, filename) = relative
+            .split_once('/')
+            .ok_or_else(|| format!("case path lacks a filename: {}", case.path))?;
+        let mut name = filename.strip_suffix(".lua").unwrap_or("").splitn(3, '_');
+        let subtopic = name.next().unwrap_or("");
+        let number = name.next().unwrap_or("");
+        let title = name.next().unwrap_or("");
+        if category.is_empty()
+            || !category
+                .bytes()
+                .all(|ch| ch.is_ascii_lowercase() || ch == b'_')
+            || subtopic.is_empty()
+            || !subtopic
+                .bytes()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+            || number.len() != 2
+            || !number.bytes().all(|ch| ch.is_ascii_digit())
+            || number == "00"
+            || title.is_empty()
+            || title.contains(['/', '\\'])
+        {
+            return Err(format!(
+                "invalid category/subtopic_number_title case path: {}",
+                case.path
+            ));
+        }
+        if !group_numbers.insert((category, subtopic, number)) {
+            return Err(format!(
+                "duplicate case number in {category}/{subtopic}: {number} ({})",
+                case.path
+            ));
+        }
+        if case.purpose.trim().is_empty()
+            || case.purpose.contains(['\t', '\r', '\n'])
+            || case.tags.is_empty()
+            || case.configurations.is_empty()
+        {
+            return Err(format!(
+                "case needs a one-line purpose, tags and configurations: {}",
+                case.path
+            ));
+        }
+        let mut tags = std::collections::BTreeSet::new();
+        for tag in case.tags {
+            if tag.is_empty()
+                || !tag
+                    .bytes()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'-')
+                || !tags.insert(tag)
+            {
+                return Err(format!("invalid or repeated tag {tag:?} in {}", case.path));
+            }
+        }
+    }
+    Ok(())
 }
 
-fn manifest_entries(
-    cases: impl Iterator<Item = &'static LuaCaseMatrixEntry>,
-) -> impl Iterator<Item = LuaCaseManifestEntry> {
-    cases
-        .flat_map(|entry| {
-            entry.dialects.iter().copied().flat_map(move |dialect| {
-                std::iter::once(None)
-                    .filter(move |_| entry.variants.is_empty())
-                    .chain(entry.variants.iter().copied().map(Some))
-                    .map(move |variant| (entry, dialect, variant))
+pub(crate) fn manifest_cases() -> impl Iterator<Item = LuaCaseManifestEntry> {
+    case_definitions()
+        .flat_map(|case| {
+            case.configurations.iter().flat_map(move |config| {
+                config.dialects.iter().copied().flat_map(move |dialect| {
+                    std::iter::once(None)
+                        .filter(move |_| config.variants.is_empty())
+                        .chain(config.variants.iter().copied().map(Some))
+                        .map(move |variant| (case, config, dialect, variant))
+                })
             })
         })
         .enumerate()
-        .map(|(id, (entry, dialect, variant))| {
-            let mut options = entry.options;
+        .map(|(id, (case, config, dialect, variant))| {
+            let mut options = config.options;
             if let Some(variant) = variant {
                 variant.apply(&mut options);
             }
             LuaCaseManifestEntry {
                 id: LuaCaseId(id),
-                path: entry.path,
+                path: case.path,
+                tags: case.tags,
+                purpose: case.purpose,
                 dialect,
                 variant,
                 options,
-                expectation: entry.expectation,
-                structure_contracts: entry.structure_contracts,
+                expectation: config.expectation,
+                structure_contracts: config.structure_contracts,
             }
         })
 }

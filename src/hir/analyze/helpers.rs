@@ -122,6 +122,7 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
         inline_dispositions: Default::default(),
         upvalues: Vec::new(),
         environment_upvalues: BTreeSet::new(),
+        lexical_environment_local: None,
         mutable_upvalues: BTreeSet::new(),
         upvalue_debug_hints: Vec::new(),
         temp_count: 0,

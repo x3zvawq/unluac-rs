@@ -168,6 +168,35 @@ impl HirExprSafety {
         self.values
     }
 
+    /// PUC 整数域中的直接字面量运算：既无元方法/分配，也不会抛错，结果为整数。
+    /// 只检查本节点，不递归重扫子树；浮点转换、动态值和零除数不借用此证明。
+    pub(crate) fn is_total_integer_literal_operation(self, expr: &HirExpr) -> bool {
+        if !self.values.distinguishes_integer_number_values() {
+            return false;
+        }
+        match expr {
+            HirExpr::Unary(unary) => {
+                unary.op == HirUnaryOpKind::BitNot && matches!(unary.expr, HirExpr::Integer(_))
+            }
+            HirExpr::Binary(binary) => {
+                let (HirExpr::Integer(_), HirExpr::Integer(rhs)) = (&binary.lhs, &binary.rhs)
+                else {
+                    return false;
+                };
+                match binary.op {
+                    HirBinaryOpKind::FloorDiv | HirBinaryOpKind::Mod => *rhs != 0,
+                    HirBinaryOpKind::BitAnd
+                    | HirBinaryOpKind::BitOr
+                    | HirBinaryOpKind::BitXor
+                    | HirBinaryOpKind::Shl
+                    | HirBinaryOpKind::Shr => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn equality_is_stable(self, op: HirBinaryOpKind, lhs: &HirExpr, rhs: &HirExpr) -> bool {
         if op != HirBinaryOpKind::Eq {
             return false;

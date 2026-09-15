@@ -1,7 +1,8 @@
-//! 原调用返回后未进入普通 SSA 的物理槽残值。
+//! 函数入口或原调用返回后未进入普通 SSA 的物理槽残值。
 //!
 //! CALL（包括 Ignore）可让 callee 的值留在 caller 高槽；逻辑 reaching value 仍是 Entry
-//! 不代表该槽仍为 nil。本域只记录这种可能的未知残值，以及后续 fixed Def 覆盖它的责任，
+//! 不代表该槽仍为 nil。入口只在 Transformer 明确证明 VM 清槽时为空；否则非参数槽
+//! 从未知残值开始。本域记录这些残值，以及后续 fixed Def 覆盖它的责任，
 //! 不创建逻辑 Def，也不推导源码 local。例如 CALL r4 后两路 MOVE r6,r0 合流，后面的
 //! GETTABLE r6 可在 __index 中观察旧槽；两路 MOVE 的物理覆盖不能因同值 phi 而丢弃。
 //!
@@ -91,6 +92,11 @@ pub(super) fn collect(
 
     let mut entries = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
     let mut exits = entries.clone();
+    if !proto.clears_entry_scratch {
+        let start = usize::from(proto.signature.num_params)
+            + usize::from(proto.signature.has_vararg_param_reg);
+        entries[cfg.entry_block.index()].bits[start..].fill(true);
+    }
     let mut queue = graph
         .rpo
         .iter()

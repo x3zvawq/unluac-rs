@@ -405,6 +405,29 @@ impl HirRewritePass for TableConstructorPass<'_> {
                         preserved_stmt_indices,
                         steps,
                     } = region;
+                    if matches!(seed_ctor.allocation,
+                        crate::hir::HirTableAllocation::Luau(_)
+                            | crate::hir::HirTableAllocation::LuauTemplate { .. })
+                        && steps.iter().any(|step| match step {
+                            RegionStep::SetList { batch, .. } => self.promotion_facts
+                                .native_table_batch_layout(batch)
+                                .is_some_and(|layout| layout.buffer.slot() > layout.base.slot() + 1),
+                            RegionStep::Record { stmt_index, .. }
+                                if matches!(seed_ctor.allocation, crate::hir::HirTableAllocation::LuauTemplate { .. }) => {
+                                matches!(scan::constructor_write(&block.stmts[*stmt_index]),
+                                    Some(ConstructorWrite::Record { access, .. })
+                                    if self.promotion_facts.native_table_write_layout(access)
+                                        .is_some_and(|layout| layout.key.is_none()
+                                            && layout.value.is_some_and(|value|
+                                                value.slot() > layout.base.slot() + 1)))
+                            }
+                            _ => false,
+                        })
+                    {
+                        // 候选拒绝[LayerBoundary]：高于相邻槽的共享准备区由 native 的完整
+                        // 声明/调用帧消费；先折叠单个 RHS 会丢掉组内原 SETLIST/record 角色。
+                        return false;
+                    }
                     let roots = RegionRootFacts::new(steps, preserved_stmt_indices);
                     let runtime_operands = crate::hir::table_layout::runtime_table_operand_requirements(rebuilt_constructor);
                     if runtime_operands.keys {
@@ -501,7 +524,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 更精确的整区间证明：producer 只为该 initializer 的最终 open tail
                     // 服务，不能再让通用“后续仍提到 table”近似覆盖这项结论。
                     // 候选拒绝[SemanticBarrier:Lifetime]：反例见
-                    // tests/unit-case/lua54_01_close.lua#lua54_01_close#13/#14/#16。
+                    // tests/case_lifetime/close_23_close.lua#lua54_01_close#13/#14/#16。
                     let producer_root_is_observable = !indexed_owner
                         && !private_owner
                         && !open_owner
@@ -644,26 +667,27 @@ pub(super) fn debug_initializer_home(
     debug_scope: Option<usize>,
     facts: &ProtoPromotionFacts,
 ) -> Option<HomeSlotKey> {
-    let (binding, _) = constructor_seed(seed)?;
+    let (binding, constructor) = constructor_seed(seed)?;
     if debug_scope.is_none()
         || batch.initializer_debug_scope != debug_scope
         || binding_from_expr(&batch.base) != Some(binding)
     {
         return None;
     }
-    match binding {
-        TableBinding::Temp(temp)
-            if facts.is_direct_table_seed_temp(temp) && facts.overwrites_entry_nil(temp) =>
-        {
-            facts.trusted_temp_home_slot(temp)
+    let home = match binding {
+        TableBinding::Temp(temp) if facts.is_direct_table_seed_temp(temp) => {
+            facts.trusted_temp_home_slot(temp)?
         }
         TableBinding::Local(local)
             if matches!(seed, HirStmt::LocalDecl(_)) && facts.is_direct_table_seed_local(local) =>
         {
-            facts.trusted_local_home_slot(local)
+            facts.trusted_local_home_slot(local)?
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    // 声明身份在 batch 后开始，但 NEWTABLE 在 initializer 起点就写入目标 home。
+    // 此处证明原分配仍写同槽，不能用“覆盖入口 nil”替代它；前面的 CALL 可以已用过此槽。
+    (facts.allocation_result_home(constructor) == Some(home)).then_some(home)
 }
 
 impl TableConstructorPass<'_> {
@@ -2253,10 +2277,14 @@ pub(super) fn constructor_with_native_records(
         builder.push_record_field(record);
     }
     let constructor = builder.into_constructor();
-    (matches!(
-        constructor.allocation,
-        crate::hir::HirTableAllocation::LuauTemplate { .. }
-    ) && constructor.fields.len() <= 32
+    let allocation_matches = match constructor.allocation {
+        crate::hir::HirTableAllocation::LuauTemplate { .. } => constructor.fields.len() <= 32,
+        crate::hir::HirTableAllocation::Template { .. } => {
+            constructor.matches_allocation_capacity(0)
+        }
+        _ => false,
+    };
+    (allocation_matches
         && constructor.fields.iter().all(|field| {
             matches!(field,
             HirTableField::Record(record)

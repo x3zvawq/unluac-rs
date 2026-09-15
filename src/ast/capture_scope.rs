@@ -55,9 +55,7 @@ fn verify_direct_local_closure(
                 AstExpr::FunctionExpr(function) => Some(function.as_ref()),
                 _ => None,
             });
-            let self_binding =
-                (decl.bindings.len() == 1 && decl.values.len() == 1).then_some(decl.bindings[0].id);
-            (closures.collect::<Vec<_>>(), self_binding)
+            (closures.collect::<Vec<_>>(), None)
         }
         AstStmt::LocalFunctionDecl(decl) => (vec![&decl.func], Some(decl.name)),
         _ => return Ok(()),

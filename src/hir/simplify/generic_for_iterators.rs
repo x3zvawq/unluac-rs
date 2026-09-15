@@ -735,13 +735,16 @@ fn producer_matches_iterator_span(
         .targets
         .iter()
         .zip(iterator_values)
-        .all(|(target, value)| {
-            matches!((target, value), (HirLValue::Temp(target), HirExpr::TempRef(value)) if target == value)
+        .all(|(target, value)| match (target, value) {
+            (HirLValue::Temp(target), HirExpr::TempRef(value)) => target == value,
+            (HirLValue::Local(target), HirExpr::LocalRef(value)) => target == value,
+            _ => false,
         })
 }
 
 /// 完整帧 owner 可借用已冻结的单 CALL 初始化 occurrence；不在这里移动 CALL 或释放根。
 /// 多段 value pack 仍由本 pass 的原事务负责，不能把一个局部 span 冒充整个循环头。
+/// locals 提升后的对应绑定仍只证明 occurrence；Local 的删除与声明义务交给完整帧。
 pub(super) fn single_call_initializer<'a>(
     assign: &'a crate::hir::common::HirAssign,
     generic_for: &HirGenericFor,

@@ -17,8 +17,8 @@ description: 在 unluac-rs 中复现并定位反编译语义错误、可读性�
 以下示例在仓库根目录运行；替换 case、方言和 pass 为当前复现条件：
 
 ```powershell
-cargo unluac -s tests/regress-case/regress_460_non_tail_callable_root.lua -D lua5.4 --dump-pass temp-inline,inline-exprs --detail verbose
-cargo unit-test --suite regression --case-filter regress_460 --output verbose
+cargo unluac -s tests/case_calls/roots_01_non_tail_callable_root.lua -D lua5.4 --dump-pass temp-inline,inline-exprs --detail verbose
+cargo case-test --case-filter non_tail_callable_root --output verbose
 ```
 
 第一条用于观察生成过程，第二条才走编译、运行比较与断言的测试链。参数解析和默认值有疑问时

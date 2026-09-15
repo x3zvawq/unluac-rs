@@ -11,6 +11,8 @@
 //! 保存，不能因某个参数没有 direct Def 而丢失布局，也不把布局当作一般根退休许可。
 //! 开放 VARARG 参数消费 Dataflow 已解析的唯一包来源及原起点；完整帧据此恢复省略号，
 //! 不将 `f(...)` 的源码外形当作原 VARARG 与 CALL 相邻或槽距相同的证明。
+//! 低槽调用更新保存初值、callee/receiver 准备 COPY 和结果写回三个 Def；它们共享值时
+//! 仍各自承担物理写。例如 `v=v:next()` 的下次 SELF 准备不能归到上一次 CALL 的写域。
 
 use super::*;
 use crate::hir::common::HirCallArgumentRoot;
@@ -24,7 +26,8 @@ pub(super) struct NativeCallFacts {
     pub(super) vararg_tail_home: Option<HomeSlotKey>,
     pub(super) layout: NativeCallLayout,
     pub(super) callee: Option<TempId>,
-    pub(super) assignment_copies: Option<[TempId; 2]>,
+    pub(super) assignment_copies: Option<[TempId; 3]>,
+    pub(super) scalar_assignment: Option<NativeScalarAssignment>,
     pub(super) boolean_prewrites: Vec<BooleanArgumentPrewrite>,
     pub(super) fastcall_argument_copies: Vec<FastCallArgumentCopy>,
 }
@@ -72,6 +75,18 @@ pub(in crate::hir) struct NativeCallFrame {
     pub(in crate::hir) arguments_unaliased: bool,
 }
 
+/// 固定单结果 CALL 后先向低槽写惰性常量，再将结果 COPY 到另一低槽。
+/// 例如 `a,b=f(),9`；三个 canonical Def 保留原写序，不能以最终槽号猜出赋值协议。
+#[derive(Debug, Clone, Copy)]
+pub(in crate::hir) struct NativeScalarAssignment {
+    pub(in crate::hir) result: TempId,
+    pub(in crate::hir) scalar: TempId,
+    pub(in crate::hir) writeback: TempId,
+    pub(in crate::hir) scalar_home: HomeSlotKey,
+    pub(in crate::hir) target_home: HomeSlotKey,
+    pub(in crate::hir) value: CopyRootScalarValue,
+}
+
 pub(super) fn collect(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -79,9 +94,8 @@ pub(super) fn collect(
     epochs: &SlotEpochFacts,
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
-    plan: &StructurePlan,
+    prewrites: &BTreeMap<PhiId, (TempId, TempId)>,
 ) -> BTreeMap<InstrRef, NativeCallFacts> {
-    let prewrites = boolean_prewrites(proto, dataflow, plan, fixed_temps, phi_temps);
     let mut calls = BTreeMap::new();
     for (index, instr) in proto.instrs.iter().enumerate() {
         let (callee, args, results, fastcall) = match instr {
@@ -215,6 +229,14 @@ pub(super) fn collect(
                 layout,
                 callee,
                 assignment_copies: assignment_copies(proto, cfg, dataflow, fixed_temps, call_ref),
+                scalar_assignment: scalar_assignment(
+                    proto,
+                    cfg,
+                    dataflow,
+                    epochs,
+                    fixed_temps,
+                    call_ref,
+                ),
                 fastcall_argument_copies: fastcall_argument_copies(
                     proto,
                     cfg,
@@ -250,7 +272,9 @@ pub(super) fn collect(
 }
 
 /// 原协议已区分快路径直读与 fallback 准备；非 direct 槽只有真实 MOVE 才有两路对应。
-/// 源槽必须低于整个 CALL 区，并在 MOVE 到 CALL 间保留同一 SSA 值和捕获 epoch。
+/// 源槽必须低于整个 CALL 区，并在 MOVE 到 CALL 间保持位置与捕获 epoch。
+/// 开放 cell 的读取只有槽身份，不发布 canonical 值快照；完整帧仍在原 fallback
+/// 时点重发 COPY，不能据此把它移动到 direct 参数的可观察求值之前。
 fn fastcall_argument_copies(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -293,19 +317,23 @@ fn fastcall_argument_copies(
                     .is_some()
                 || epochs.epoch_at(copy.src, write) != epochs.epoch_at(copy.src, site)
                 || epochs.epoch_at(target, write) != epochs.epoch_at(target, site)
-                || epochs.reference_capture_may_be_open(copy.src, write)
-                || epochs.reference_capture_may_be_open(copy.src, site)
                 || epochs.reference_capture_may_be_open(target, write)
                 || epochs.reference_capture_may_be_open(target, site)
             {
                 return None;
             }
-            let source = canonical_value_temp(
-                dataflow.use_value(write, copy.src),
-                dataflow.defs.len(),
-                fixed_temps,
-                phi_temps,
-            );
+            let source = if epochs.reference_capture_may_be_open(copy.src, write)
+                || epochs.reference_capture_may_be_open(copy.src, site)
+            {
+                None
+            } else {
+                canonical_value_temp(
+                    dataflow.use_value(write, copy.src),
+                    dataflow.defs.len(),
+                    fixed_temps,
+                    phi_temps,
+                )
+            };
             Some(FastCallArgumentCopy {
                 argument,
                 producer,
@@ -317,6 +345,69 @@ fn fastcall_argument_copies(
         .collect()
 }
 
+/// 每个 CALL 只检查两个相邻指令，不按候选重扫后缀。只接受无求值的标量写，
+/// 任一分支边界、额外结果读取或非 canonical 定义都不产生完整赋值事实。
+fn scalar_assignment(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    fixed_temps: &[TempId],
+    site: InstrRef,
+) -> Option<NativeScalarAssignment> {
+    let index = site.index();
+    let LowInstr::Call(call) = proto.instrs.get(index)? else {
+        return None;
+    };
+    let scalar_site = InstrRef(index + 1);
+    let copy_site = InstrRef(index + 2);
+    let scalar_instr = proto.instrs.get(scalar_site.index())?;
+    let scalar_reg = match scalar_instr {
+        LowInstr::LoadNil(load) if load.dst.len == 1 => load.dst.start,
+        LowInstr::LoadBool(load) => load.dst,
+        LowInstr::LoadInteger(load) => load.dst,
+        LowInstr::LoadNumber(load) => load.dst,
+        _ => return None,
+    };
+    let value = direct_scalar_overwrite_value(scalar_instr, scalar_reg)?;
+    let LowInstr::Move(copy) = proto.instrs.get(copy_site.index())? else {
+        return None;
+    };
+    if !matches!(call.results, ResultPack::Fixed(pack)
+        if pack.start == call.callee && pack.len == 1)
+        || copy.src != call.callee
+        || copy.dst == scalar_reg
+        || copy.dst.index() >= call.callee.index()
+        || scalar_reg.index() >= call.callee.index()
+        || cfg.instr_to_block[index] != cfg.instr_to_block[scalar_site.index()]
+        || cfg.instr_to_block[index] != cfg.instr_to_block[copy_site.index()]
+        || epochs.reference_capture_may_be_open(scalar_reg, scalar_site)
+        || epochs.reference_capture_may_be_open(copy.dst, copy_site)
+    {
+        return None;
+    }
+    let result = dataflow.instr_def_for_reg(site, call.callee)?;
+    let scalar = dataflow.instr_def_for_reg(scalar_site, scalar_reg)?;
+    let writeback = dataflow.instr_def_for_reg(copy_site, copy.dst)?;
+    if dataflow.use_value(copy_site, copy.src) != SsaValue::Def(result)
+        || !dataflow.def_phi_uses[result.index()].is_empty()
+        || !matches!(dataflow.def_uses[result.index()].as_slice(), [use_] if use_.instr == copy_site)
+        || [result, scalar, writeback]
+            .iter()
+            .any(|def| fixed_temps[def.index()] != TempId(def.index()))
+    {
+        return None;
+    }
+    Some(NativeScalarAssignment {
+        result: TempId(result.index()),
+        scalar: TempId(scalar.index()),
+        writeback: TempId(writeback.index()),
+        scalar_home: HomeSlotKey::new(scalar_reg.index(), epochs.epoch_at(scalar_reg, scalar_site)),
+        target_home: HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, copy_site)),
+        value,
+    })
+}
+
 /// 低槽初始化、callee COPY、单结果 CALL、写回组成同一源码赋值帧。
 /// 保留两端 canonical 定义，使 `local x = f; x = x()` 的低槽不会在完整帧恢复前消失。
 /// 此处只识别协议，不允许删除写入；实际槽序和剩余读取仍由完整事务核对。
@@ -326,7 +417,7 @@ fn assignment_copies(
     dataflow: &DataflowFacts,
     fixed_temps: &[TempId],
     site: InstrRef,
-) -> Option<[TempId; 2]> {
+) -> Option<[TempId; 3]> {
     let index = site.index();
     let LowInstr::Call(call) = proto.instrs.get(index)? else {
         return None;
@@ -338,38 +429,58 @@ fn assignment_copies(
         return None;
     };
     let callee_site = dataflow.def_instr(callee_def);
-    let LowInstr::Move(callee) = proto.instrs.get(callee_site.index())? else {
-        return None;
+    let (copy_site, callee) = match proto.instrs.get(callee_site.index())? {
+        LowInstr::Move(copy) => (callee_site, copy),
+        LowInstr::GetTable(access) if call.kind == crate::transformer::CallKind::Method => {
+            let crate::transformer::AccessBase::Reg(receiver) = access.base else {
+                return None;
+            };
+            let SsaValue::Def(receiver_def) = dataflow.use_value(callee_site, receiver) else {
+                return None;
+            };
+            let copy_site = dataflow.def_instr(receiver_def);
+            let LowInstr::Move(copy) = proto.instrs.get(copy_site.index())? else {
+                return None;
+            };
+            if copy.dst != receiver || copy_site.index() >= callee_site.index() {
+                return None;
+            }
+            (copy_site, copy)
+        }
+        _ => return None,
     };
-    let SsaValue::Def(initial_def) = dataflow.use_value(callee_site, callee.src) else {
+    let SsaValue::Def(initial_def) = dataflow.use_value(copy_site, callee.src) else {
         return None;
     };
     let initial_site = dataflow.def_instr(initial_def);
     if result.src != call.callee
-        || callee.dst != call.callee
+        || (call.kind != crate::transformer::CallKind::Method && callee.dst != call.callee)
         || result.dst != callee.src
         || dataflow.def_reg(initial_def) != callee.src
         || result.dst.index() >= call.callee.index()
         || !matches!(call.results, ResultPack::Fixed(pack) if pack.start == call.callee && pack.len == 1)
-        || initial_site.index() >= callee_site.index()
+        || initial_site.index() >= copy_site.index()
         || callee_site.index() >= index
         || cfg.instr_to_block[initial_site.index()] != cfg.instr_to_block[index]
         || cfg.instr_to_block[callee_site.index()] != cfg.instr_to_block[index]
+        || cfg.instr_to_block[copy_site.index()] != cfg.instr_to_block[index]
         || cfg.instr_to_block[index] != cfg.instr_to_block[index + 1]
     {
         return None;
     }
     let result = dataflow.instr_def_for_reg(InstrRef(index + 1), result.dst)?;
-    // 只保留原低槽值与写回身份，初值可以来自 GETTABLE 的真实 Def（598）；并不将其
-    // 求值移入高槽 CALL。两个端点的删除仍由完整帧 owner 核对原顺序、槽及后缀读取。
-    let temps = [TempId(initial_def.index()), TempId(result.index())];
-    (fixed_temps[initial_def.index()] == temps[0] && fixed_temps[result.index()] == temps[1])
-        .then_some(temps)
+    // 初值、准备 COPY 与结果写回分别保留真实 Def；初值可以来自 GETTABLE，不能将其
+    // 求值移入高槽 CALL。三者的删除由完整帧 owner 核对原顺序、槽及后缀读取。
+    let preparation = dataflow.instr_def_for_reg(copy_site, callee.dst)?;
+    let defs = [initial_def, preparation, result];
+    defs.iter()
+        .all(|def| fixed_temps[def.index()] == TempId(def.index()))
+        .then(|| defs.map(|def| TempId(def.index())))
 }
 
 /// 只消费已选中的值决策：各叶为原 Boolean 写，入口 false 与最终 phi 共享 result_reg。
 /// 后层不能从 `a and b` 文本猜测这次预写；无入口预写的普通比较没有此项责任。
-fn boolean_prewrites(
+pub(super) fn boolean_prewrites(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
@@ -392,7 +503,10 @@ fn boolean_prewrites(
                     return None;
                 }
                 if dataflow.def_block(def) == header {
-                    if value.value || leaf.latest_local_def != Some(def) {
+                    if value.value
+                        || leaf.latest_local_def != Some(def)
+                        || fixed_temps[def.index()] != TempId(def.index())
+                    {
                         return None;
                     }
                     if initial.is_some_and(|old| old != fixed_temps[def.index()]) {
@@ -400,6 +514,11 @@ fn boolean_prewrites(
                     }
                     initial = Some(fixed_temps[def.index()]);
                 }
+            }
+            if phi_temps[decision.result_phi.index()]
+                != TempId(fixed_temps.len() + decision.result_phi.index())
+            {
+                return None;
             }
             Some((
                 decision.result_phi,

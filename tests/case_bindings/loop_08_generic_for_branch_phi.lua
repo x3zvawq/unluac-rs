@@ -1,0 +1,31 @@
+-- regress_181_generic_for_branch_phi#1: generic-for body 的局部分支 Phi 归本轮 soft merge
+-- unluac: expect-contains [[in p1_0:gmatch(".")]]
+-- unluac: expect-not-contains [[in r1_2:gmatch]]
+-- unluac: expect-not-contains [[local r1_2 = "."]]
+-- unluac: expect-contains [[r1_1 =]]
+-- unluac: expect-not-contains [[r1_1,]]
+-- unluac: expect-not-contains [[    continue]]
+
+local function run(text, should_break)
+    local values = {}
+    local last = nil
+    for char in text:gmatch(".") do
+        local value = nil
+        if char == "A" then
+            value = 1
+        elseif char == "B" then
+            value = 2
+        elseif char == "N" and should_break then
+            break
+        end
+        if value then
+            values[#values + 1] = value
+            last = value
+        end
+    end
+    return last
+end
+
+local result = run("BA", false)
+assert(result == 1)
+print("regress_181_generic_for_branch_phi#1", result)

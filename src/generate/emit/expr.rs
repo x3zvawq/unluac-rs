@@ -3,6 +3,8 @@
 //! 它依赖 AST 已经保真的表达式形状、precedence helper 和 naming 结果，只负责发射语法，
 //! 不会在这里再猜补缺失的 sugar。一元/二元运算使用显式任务栈发射为同一 Doc 序列，
 //! 保留每个节点的括号边界，避免把 AST 深运算链继续传给 Doc 渲染与析构。
+//! 二元符号之前提供折行点，由 Fill 按行宽排列 token 段；`a - (b - c)` 即使换行
+//! 也保留原括号，不为缩短长链重结合运算或增加随链长增长的布局树深度。
 //! 例如：`AstExpr::SingleValue(call)` 会在这里带括号输出成单值调用表达式；Luau vector
 //! 只消费显式宿主构造器配置，不从 bytecode 猜 API 名。
 //! 所有函数的可选元信息共用函数头行尾位置，不受声明/字段/参数/IIFE 语法影响。
@@ -251,15 +253,23 @@ impl<'a> Emitter<'a> {
         enum Step<'ast> {
             Expr(&'ast AstExpr, u8, ExprSide),
             Text(&'static str),
+            BinaryOperator(&'static str),
         }
 
         let mut pending = vec![Step::Expr(expr, parent_prec, side)];
         let mut parts = Vec::new();
+        let mut segments = Vec::new();
         while let Some(step) = pending.pop() {
             let (expr, parent_prec, side) = match step {
                 Step::Expr(expr, parent_prec, side) => (expr, parent_prec, side),
                 Step::Text(text) => {
                     parts.push(Doc::text(text));
+                    continue;
+                }
+                Step::BinaryOperator(op) => {
+                    segments.push(Doc::concat(std::mem::take(&mut parts)));
+                    parts.push(Doc::text(op));
+                    parts.push(Doc::text(" "));
                     continue;
                 }
             };
@@ -305,15 +315,20 @@ impl<'a> Emitter<'a> {
                 pending.push(Step::Expr(rhs, prec, ExprSide::Right));
             }
             if let Some(lhs) = lhs {
-                pending.push(Step::Text(" "));
-                pending.push(Step::Text(op));
-                pending.push(Step::Text(" "));
+                pending.push(Step::BinaryOperator(op));
                 pending.push(Step::Expr(lhs, prec, ExprSide::Left));
             } else {
                 parts.push(Doc::text(op));
             }
         }
-        Ok(Doc::concat(parts))
+        if segments.is_empty() {
+            return Ok(Doc::concat(parts));
+        }
+        segments.push(Doc::concat(parts));
+        Ok(Doc::group(Doc::indent(Doc::fill(
+            segments,
+            Doc::soft_line(),
+        ))))
     }
 
     fn emit_logical_chain(

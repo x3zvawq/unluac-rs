@@ -58,6 +58,9 @@ pub struct DebugBindingFact {
     pub end_pc: u32,
     /// 原 debug 结束 PC 对应的 exclusive low 边界；None 表示已越过所有 low 指令。
     pub end_instr: Option<InstrRef>,
+    /// 紧邻 scope 入口且全部原 PC 仍在入口前的最后一条 low 指令；
+    /// 只表示初始化窗口的末端，值身份、构造事件及删除权限仍由消费者核对。
+    pub initializer_end_instr: Option<InstrRef>,
     pub value: SsaValue,
     /// canonical 声明的控制流 owner；Entry binding 没有指令声明块。
     pub declaration_block: Option<BlockRef>,

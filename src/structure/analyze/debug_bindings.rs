@@ -42,6 +42,14 @@ pub(super) fn analyze_debug_bindings(
                 start_pc: local.start_pc,
                 end_pc: local.end_pc,
                 end_instr: proto.lowering_map.low_instr_at_or_after_pc(local.end_pc),
+                initializer_end_instr: proto
+                    .lowering_map
+                    .low_instr_at_or_after_pc(local.start_pc)
+                    .and_then(|entry| entry.index().checked_sub(1))
+                    // 正式查询返回首个含 PC >= start 的 low；此前所有 PC 必已小于
+                    // start，只需排除无来源的前项，不为共享入口的每个 local 重扫来源。
+                    .filter(|&index| !proto.lowering_map.pc_map()[index].is_empty())
+                    .map(InstrRef),
                 value,
                 declaration_block: match value {
                     SsaValue::Def(def) => Some(dataflow.def_block(def)),

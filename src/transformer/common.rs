@@ -31,6 +31,8 @@ pub struct LoweredProto {
     pub line_range: ProtoLineRange,
     pub signature: ProtoSignature,
     pub frame: ProtoFrameInfo,
+    /// VM 在函数入口是否把全部非参数物理槽清为 nil；逻辑 Entry 不提供此保证。
+    pub clears_entry_scratch: bool,
     /// 与 Parser 共享的冻结字面量域，ConstRef 顺序不变；方言池条目已经降低为指令和模板事实。
     pub constants: Arc<[RawLiteralConst]>,
     /// 本 proto 的 upvalue 身份域；描述符已经投影为 Closure 的显式 Capture。
@@ -739,7 +741,7 @@ pub enum TableAllocation {
 pub struct TableTemplate {
     /// 包含索引 0；每个元素均引用本 proto 的常量池。
     pub array: Vec<ConstRef>,
-    /// 包含 nil-valued 预置项，保留模板键集合。
+    /// 包含 nil-valued 预置项，保留模板键集合；VM 的 hash 枚举次序不是源码求值顺序。
     pub hash: Vec<(ConstRef, ConstRef)>,
 }
 

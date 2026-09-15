@@ -278,6 +278,7 @@ pub(super) fn lower_proto(
     let dataflow = state.require_dataflow()?;
     let structure = state.require_structure_facts()?;
     Ok(lower_proto_node(
+        lowered.header.version,
         context.requested_target.version,
         ProtoNodeFacts {
             proto: &lowered.main,
@@ -293,6 +294,7 @@ pub(super) fn lower_proto(
 }
 
 fn lower_proto_node(
+    source: DecompileDialect,
     target: DecompileDialect,
     node: ProtoNodeFacts<'_>,
     artifacts: &mut LowerArtifacts,
@@ -398,7 +400,7 @@ fn lower_proto_node(
         let result = if let Some(failure) = frame.structure.failure() {
             fill_failed_proto(&frame, failure.clone(), artifacts)
         } else {
-            match lower_proto_one(&mut frame, artifacts) {
+            match lower_proto_one(&mut frame, artifacts, source) {
                 Ok(result) => result,
                 Err(error) if recover_failures => {
                     super::artifact_recovery::discard_composite_factory_protos(
@@ -437,6 +439,7 @@ fn lower_proto_node(
 fn lower_proto_one(
     frame: &mut ProtoLowerFrame<'_>,
     artifacts: &mut LowerArtifacts,
+    source: DecompileDialect,
 ) -> Result<LoweredProtoResult, HirLowerError> {
     let target = frame.target;
     let proto = frame.proto;
@@ -497,15 +500,20 @@ fn lower_proto_one(
     let global_decls = GlobalDeclProtocols::analyze(proto, cfg, dataflow);
     let mut promotion_facts = ProtoPromotionFacts::from_plan(
         proto,
+        source,
         id,
         cfg,
         graph_facts,
         dataflow,
         structure.plan(),
+        structure.debug_bindings(),
         &slot_epochs,
         &bindings.fixed_temps,
         &bindings.phi_temps,
     );
+    super::bindings::bind_parameter_slots(&mut bindings, &promotion_facts, dataflow, &emission);
+    let lexical_environment_local =
+        global_decls.bind_environment(&mut bindings, &mut promotion_facts)?;
     let captured_shared_closures = CapturedSharedClosureLowering::new(
         captured_shared_plan,
         composite_protos,
@@ -518,10 +526,27 @@ fn lower_proto_one(
     promotion_facts.record_copy_root_retirements(
         proto,
         cfg,
+        graph_facts,
         dataflow,
         &bindings.fixed_temps,
         &bindings.temp_debug_scopes,
         &emission,
+    );
+    let initialized_copy_root_locals = super::bindings::bind_copy_root_initializers(
+        proto,
+        cfg,
+        dataflow,
+        &emission,
+        &mut bindings,
+        &mut promotion_facts,
+    );
+    super::bindings::bind_allocation_copy_scopes(
+        proto,
+        cfg,
+        dataflow,
+        &emission,
+        &mut bindings,
+        &mut promotion_facts,
     );
     super::bindings::bind_copy_root_scopes(
         proto,
@@ -541,6 +566,14 @@ fn lower_proto_one(
         cfg,
         dataflow,
         structure,
+        &emission,
+        &mut bindings,
+        &mut promotion_facts,
+    );
+    let discarded_call_locals = super::bindings::bind_discarded_call_results(
+        proto,
+        cfg,
+        dataflow,
         &emission,
         &mut bindings,
         &mut promotion_facts,
@@ -642,7 +675,16 @@ fn lower_proto_one(
     }
     let children = lowering.hir_children();
     let mut inline_dispositions = crate::hir::common::HirInlineDispositions::default();
-    for local in reused_frame_locals {
+    if let Some(local) = lexical_environment_local {
+        inline_dispositions.preserve_local(
+            local,
+            crate::hir::common::HirInlineRetentionReason::LexicalEnvironment,
+        );
+    }
+    for local in reused_frame_locals
+        .into_iter()
+        .chain(discarded_call_locals.iter().copied())
+    {
         inline_dispositions.preserve_local(
             local,
             crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix,
@@ -673,6 +715,8 @@ fn lower_proto_one(
         .iter()
         .map(|temp| bindings.temp_decl_locals[temp])
         .chain(copy_root_holders)
+        .chain(initialized_copy_root_locals)
+        .chain(discarded_call_locals)
         .collect();
     artifacts.protos[id.index()] = HirProto {
         id,
@@ -693,11 +737,17 @@ fn lower_proto_one(
             &bindings.fixed_temps,
             &bindings.phi_temps,
         ),
-        physical_root_temps: promotion_facts.protect_copy_root_temps(),
+        physical_root_temps: promotion_facts
+            .protect_copy_root_temps()
+            .into_iter()
+            .chain(promotion_facts.return_copy_inputs())
+            .chain(promotion_facts.entry_parameter_copy_roots())
+            .collect(),
         physical_root_locals,
         inline_dispositions,
         upvalues: bindings.upvalues,
         environment_upvalues,
+        lexical_environment_local,
         mutable_upvalues: mutable_upvalue_ids(&mutable_upvalues),
         upvalue_debug_hints: bindings.upvalue_debug_hints,
         temp_count: bindings.temp_count,
@@ -858,6 +908,7 @@ fn fill_failed_proto(
         upvalues: (0..usize::from(proto.upvalue_count))
             .map(UpvalueId)
             .collect(),
+        lexical_environment_local: None,
         environment_upvalues: proto
             .environment_upvalues
             .iter()
@@ -1487,6 +1538,7 @@ fn build_composite_factory_proto(
         physical_root_locals: BTreeSet::new(),
         inline_dispositions: Default::default(),
         upvalues: (0..plan.outer_captures.len()).map(UpvalueId).collect(),
+        lexical_environment_local: None,
         environment_upvalues: plan
             .outer_captures
             .iter()

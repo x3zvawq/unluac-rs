@@ -1,17 +1,22 @@
 //! Region arena 的构建与物化。输入规范化 container/loop partitions，输出 containment tree、direct block owner 与导航索引；不负责冻结 edge transfer。例如 structured child 会先物化，再嵌入最小 residual island。
 //! branch 的整体单入口与各 arm 的词法入口分别证明；`if c then A else ... goto A end`
 //! 中 A 不能因自支配而成为 then 子作用域，必须由 residual 控制保留共享入口。
+//! `::retry:: for value in iter do ... goto retry end` 会形成等域的外层 retry natural loop
+//! 与内层 VM-for；只有 residual、preheader、continuation 和外层 body 分区共同证明这层
+//! 语义嵌套时，才允许两个 loop container 共享物理 block 集。
 
 use super::*;
-
 pub(super) fn build_regions(
     proto: &LoweredProto,
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     input: &FinalPlanInput,
-    partitions: &[LoopPartitions],
+    loop_snapshot: &LoopRegionSnapshot<'_>,
     flow: &crate::structure::scope::TbcFlowFacts,
 ) -> Result<RegionArena, StructureError> {
+    let partitions = loop_snapshot.partitions;
+    let loop_container_blocks = loop_snapshot.domains;
+    let equal_loops = loop_snapshot.equal_nestings;
     let mut pending = Vec::new();
     let mut residuals = Vec::new();
     let mut unstructured_blocks = Vec::new();
@@ -104,19 +109,28 @@ pub(super) fn build_regions(
         )?);
     }
 
+    let mut equal_loop_parent_by_child = vec![None; input.loops.len()];
+    for relation in equal_loops {
+        let slot = equal_loop_parent_by_child
+            .get_mut(relation.child.index())
+            .ok_or_else(|| StructureError::invalid("equal-domain loop child is missing"))?;
+        if slot
+            .replace((relation.parent, relation.retry_edge))
+            .is_some()
+        {
+            return Err(StructureError::invalid(
+                "equal-domain VM-for has multiple retry parents",
+            ));
+        }
+    }
+
     let mut admitted_loops = vec![false; input.loops.len()];
     for (index, admitted) in admitted_loops.iter_mut().enumerate() {
         let id = super::super::LoopPlanId(index);
-        let blocks = partitions
+        let blocks = loop_container_blocks
             .get(index)
-            .map_or_else(BTreeSet::new, |partition| {
-                let mut blocks = partition.owned.clone();
-                if let Some(normal_tail) = &partition.normal_tail {
-                    blocks.extend(normal_tail.blocks.iter().copied());
-                }
-                blocks
-            });
-        let blocks = reachable_nonempty_blocks(cfg, blocks);
+            .cloned()
+            .unwrap_or_default();
         if blocks.is_empty() {
             continue;
         }
@@ -139,11 +153,14 @@ pub(super) fn build_regions(
             push_residual_seed(&mut residuals, entry, blocks);
             continue;
         }
-        pending.push(PendingContainer::exact(
-            ContainerKind::Loop(id),
-            blocks,
-            graph_facts,
-        )?);
+        let candidate = PendingContainer::exact(ContainerKind::Loop(id), blocks, graph_facts)?;
+        pending.push(
+            if let Some((parent, retry_edge)) = equal_loop_parent_by_child[index] {
+                candidate.with_equal_loop_parent(parent, retry_edge)
+            } else {
+                candidate
+            },
+        );
         *admitted = true;
     }
 
@@ -416,6 +433,7 @@ pub(super) fn build_regions(
         (
             Reverse(pending.block_count),
             Reverse(container_same_size_rank(pending.kind)),
+            pending.equal_loop_parent.is_some(),
             pending_kind_index(pending.kind),
         )
     });

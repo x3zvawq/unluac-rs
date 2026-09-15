@@ -196,7 +196,11 @@ pub(super) fn partition_repeat_like_natural_loop(
     );
     if !residual_cycle_is_nested(cfg, natural_loop, &residual_blocks, &residual_backedges)
         && !residual_cycle_precedes_repeat_condition(
-            proto, cfg, graph_facts, &residual_blocks, &outer,
+            proto,
+            cfg,
+            graph_facts,
+            &residual_blocks,
+            &outer,
         )
     {
         return None;
@@ -232,11 +236,13 @@ fn residual_cycle_precedes_repeat_condition(
         || residual == &outer.blocks
         || residual.len() <= 1
         || residual.contains(&condition)
-        || !cfg.branch_edges(outer.header).is_some_and(|(truthy, falsy)| {
-            [truthy, falsy]
-                .iter()
-                .all(|edge| residual.contains(&cfg.edges[edge.index()].to))
-        })
+        || !cfg
+            .branch_edges(outer.header)
+            .is_some_and(|(truthy, falsy)| {
+                [truthy, falsy]
+                    .iter()
+                    .all(|edge| residual.contains(&cfg.edges[edge.index()].to))
+            })
         || !is_reducible_region(cfg, outer.header, residual)
     {
         return false;

@@ -17,25 +17,34 @@
 //! reason 恰好也会命中 capture/home guard。
 //! RHS 的可删除性与 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
 //!
-//! 例子：根前缀里的机械 `t = false` 若 `t` 是非参数槽首个 fixed def，可删成空；
+//! 例子：根前缀里的机械 `t = false` 仅在原槽已证 entry nil 时可删成空；
+//! 入口或 CALL 未知残值的覆盖须传成 PhysicalRoot，不能因 boolean 结果无用而删除。
 //! `t = stable_local` 若目标覆盖 entry nil 可删；`t = p; p = false` 则必须把后写精确
 //! 接回同一个 PhysicalRoot，不能把 `t` 的 root 无条件延长到函数结束。
 //! copy-root 候选只读借用当前 HIR 的 RHS；各块一次计算直线 GC-inert return 后缀，
-//! 位置查询复用该边界。提交计划只保存身份，不把借用或后缀位置带过树改写。
+//! 位置查询复用该边界。提交计划只保存身份与已证明标量，不把借用或后缀位置带过树改写。
 //! 当前 CALL 的 Boolean 预写先保留到完整帧审理；例如 `false; assert(a() == 1 and b() == 2)`
 //! 的 false 仍是原参数缓冲事件。Final 才用同一死写证明清理未消费项，不生成永久保留声明。
 //! 候选位置使用当前树的语句先序编号与块结束位置；每个 scalar 写只保存固定大小的坐标，
 //! 不保存祖先路径，也不从这个词法索引推导动态支配或可达性。
 //! 可见 binding 的稳定性消费入口的一份 home 写入摘要；未知 home 写影响所有查询，
 //! LocalRootRelease 只影响被释放的 Local 身份，不扩散到同 home 的其它 binding。
+//! 所有帧事务结束后，无读的无事件 primitive initializer 可消费原操作数布局证明改为 nil；
+//! constructor 即使已有逃逸读取也消费完整跨分支退休证书：`t={}; weak.k=t; ...`
+//! 的无读 scalar 覆盖必须接回 t，不能因 t 有逻辑读取而留下独立长寿对象根。
+//! `local dead = value == nil` 因而保留 `local dead = nil` 的原槽覆盖及声明前缀。
+//! 该收尾不删除 binding，不吸收高槽准备，也不把改写后的 RHS 交回旧 Promotion 快照。
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
+    HirBinding, HirBlock, HirCapture, HirCaptureMode, HirExpr, HirInlineDisposition,
+    HirInlineRetentionReason, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
-use crate::hir::promotion::{CopyRootOverwrite, HomeSlotKey, ProtoPromotionFacts};
+use crate::hir::promotion::{
+    CopyRootOverwrite, CopyRootScalarValue, HomeSlotKey, ProtoPromotionFacts,
+};
 
 use super::lexical_cfg::{
     LexicalBlockKind, LexicalBlockPath, LexicalCfgFailure, OwnerReentryFacts,
@@ -45,6 +54,197 @@ use super::root_lifetimes::stmt_may_observe_gc_roots;
 use super::temp_touch::TempReadCollector;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::visit::{self, HirVisitor};
+
+/// 原生帧已经最终提交后，仅去掉无读 primitive 的计算，保留原点写入与声明身份。
+pub(super) fn simplify_unused_primitive_initializers(
+    proto: &mut HirProto,
+    facts: &ProtoPromotionFacts,
+    safety: HirExprSafety,
+) {
+    #[derive(Default)]
+    struct Reads {
+        locals: BTreeSet<LocalId>,
+        last_root_statement: BTreeMap<LocalId, usize>,
+        captured_homes: BTreeSet<HomeSlotKey>,
+        has_goto: bool,
+    }
+    struct ReadScan<'a> {
+        reads: &'a mut Reads,
+        facts: &'a ProtoPromotionFacts,
+        root_statement: usize,
+    }
+    impl HirVisitor<'_> for ReadScan<'_> {
+        fn visit_expr(&mut self, expr: &HirExpr) {
+            if let HirExpr::LocalRef(local) = expr {
+                self.reads.locals.insert(*local);
+                self.reads
+                    .last_root_statement
+                    .insert(*local, self.root_statement);
+            }
+        }
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            self.reads.has_goto |= matches!(stmt, HirStmt::Goto(_));
+        }
+        fn visit_capture(&mut self, capture: &HirCapture) {
+            if let HirBinding::Local(local) = capture.binding {
+                self.reads.locals.insert(local);
+            }
+            self.reads.captured_homes.extend(
+                self.facts
+                    .complete_binding_home_slots(capture.binding)
+                    .iter()
+                    .copied(),
+            );
+        }
+    }
+    let mut reads = Reads::default();
+    let mut writes = BTreeMap::<LocalId, usize>::new();
+    let mut tbc = super::mention::ToBeClosedHomeCollector {
+        facts,
+        homes: BTreeSet::new(),
+    };
+    for (root_statement, stmt) in proto.body.stmts.iter().enumerate() {
+        visit::visit_stmts(
+            std::slice::from_ref(stmt),
+            &mut (
+                ReadScan {
+                    reads: &mut reads,
+                    facts,
+                    root_statement,
+                },
+                super::mention::BindingWriteCollector(|binding| {
+                    if let HirBinding::Local(local) = binding {
+                        *writes.entry(local).or_default() += 1;
+                    }
+                }),
+            ),
+        );
+    }
+    visit::visit_stmts(&proto.body.stmts, &mut tbc);
+    let mut excluded_homes = tbc.homes;
+    excluded_homes.extend(reads.captured_homes);
+    for local in (0..proto.local_count).map(LocalId) {
+        if proto
+            .local_debug_hints
+            .get(local.index())
+            .is_some_and(Option::is_some)
+            || proto
+                .local_debug_scopes
+                .get(local.index())
+                .is_some_and(Option::is_some)
+        {
+            excluded_homes.extend(
+                facts
+                    .complete_binding_home_slots(HirBinding::Local(local))
+                    .iter()
+                    .copied(),
+            );
+        }
+    }
+    let eligible = writes
+        .keys()
+        .copied()
+        .filter(|&local| {
+            let disposition_allowed = match proto.inline_dispositions.local(local) {
+                HirInlineDisposition::Unknown => true,
+                HirInlineDisposition::Preserve(reasons) => reasons
+                    .iter()
+                    .all(|reason| *reason == HirInlineRetentionReason::PhysicalFramePrefix),
+            };
+            disposition_allowed
+                && (proto.physical_root_locals.contains(&local)
+                    || proto.inline_dispositions.local(local).must_preserve())
+                && proto
+                    .local_debug_hints
+                    .get(local.index())
+                    .is_none_or(Option::is_none)
+                && proto
+                    .local_debug_scopes
+                    .get(local.index())
+                    .is_none_or(Option::is_none)
+                && facts
+                    .trusted_local_home_slot(local)
+                    .is_some_and(|home| !excluded_homes.contains(&home))
+        })
+        .collect::<BTreeSet<_>>();
+    let candidates = eligible
+        .iter()
+        .copied()
+        .filter(|local| writes.get(local) == Some(&1) && !reads.locals.contains(local))
+        .collect::<BTreeSet<_>>();
+    struct Rewrite<'a> {
+        candidates: &'a BTreeSet<LocalId>,
+        facts: &'a ProtoPromotionFacts,
+        safety: HirExprSafety,
+    }
+    impl HirRewritePass for Rewrite<'_> {
+        fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
+            let HirStmt::LocalDecl(decl) = stmt else {
+                return false;
+            };
+            let ([local], [value], None) = (
+                decl.bindings.as_slice(),
+                decl.values.fixed.as_mut_slice(),
+                &decl.values.tail,
+            ) else {
+                return false;
+            };
+            if !self.candidates.contains(local)
+                || !unused_primitive_evaluation_is_inert(self.safety, value)
+                || !self
+                    .facts
+                    .local_primitive_write_has_no_operand_scratch(*local, value)
+            {
+                // 候选拒绝[ProofIncomplete]：无读和纯值本身不证明原操作数 scratch 可省略；
+                // 未通过原布局证明的表达式继续保留，包括有高槽准备的比较。
+                return false;
+            }
+            *value = HirExpr::Nil;
+            decl.initializer_merge_transaction = None;
+            true
+        }
+    }
+    rewrite_proto(
+        proto,
+        &mut Rewrite {
+            candidates: &candidates,
+            facts,
+            safety,
+        },
+    );
+    if !reads.has_goto {
+        // 只处理函数根块的后写：其后的所有嵌套语句均已计入 last-read，结构化循环
+        // 无法回到循环外的该写。含 goto 的 owner 不凭词法次序证明动态最后一次读取。
+        for (index, stmt) in proto.body.stmts.iter_mut().enumerate() {
+            let HirStmt::Assign(assign) = stmt else {
+                continue;
+            };
+            let ([HirLValue::Local(local)], [value], None) = (
+                assign.targets.as_slice(),
+                assign.values.fixed.as_mut_slice(),
+                &assign.values.tail,
+            ) else {
+                continue;
+            };
+            if eligible.contains(local)
+                && reads
+                    .last_root_statement
+                    .get(local)
+                    .is_none_or(|last| *last < index)
+                && unused_primitive_evaluation_is_inert(safety, value)
+                && facts.local_primitive_write_has_no_operand_scratch(*local, value)
+            {
+                *value = HirExpr::Nil;
+                assign.generic_for_initializer_producer = None;
+            }
+        }
+    }
+}
+
+fn unused_primitive_evaluation_is_inert(safety: HirExprSafety, value: &HirExpr) -> bool {
+    safety.is_total_integer_literal_operation(value)
+        || (safety.is_discard_safe_without_residual(value) && safety.result_is_gc_inert(value))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeadTempStage {
@@ -72,7 +272,7 @@ impl HirVisitor<'_> for PendingBooleanPrewrites<'_> {
 
 pub(super) fn remove_dead_temp_materializations_in_proto(
     proto: &mut HirProto,
-    promotion_facts: &ProtoPromotionFacts,
+    promotion_facts: &mut ProtoPromotionFacts,
     safety: HirExprSafety,
     stage: DeadTempStage,
 ) -> bool {
@@ -217,15 +417,16 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         &mut LexicalBlockPath::root(),
         &dead_entry_context,
     );
-    changed |= preserve_copy_roots_in_proto(
+    let (roots_changed, retargeted_roots) = preserve_copy_roots_in_proto(
         proto,
         &live_reads,
         &pass.protected_temps,
-        &pass.stable_visible_bindings.reference_captured_homes,
+        &pass.stable_visible_bindings,
         promotion_facts,
         safety,
         &mut pass.physical_root_temps,
     );
+    changed |= roots_changed;
     changed |= preserve_adjacent_dead_physical_overwrites(
         &mut proto.body,
         &live_reads,
@@ -240,6 +441,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
         .physical_root_temps
         .extend(pass.physical_root_temps.iter().copied());
     changed |= proto.physical_root_temps.len() != original_physical_root_count;
+    promotion_facts.record_retargeted_scalar_roots(retargeted_roots);
     changed
 }
 
@@ -319,37 +521,49 @@ fn preserve_copy_roots_in_proto(
     proto: &mut HirProto,
     live_reads: &BTreeSet<TempId>,
     protected_temps: &BTreeSet<TempId>,
-    reference_captured_homes: &BTreeSet<HomeSlotKey>,
+    stable_visible_bindings: &StableVisibleBindings,
     facts: &ProtoPromotionFacts,
     safety: HirExprSafety,
     physical_root_temps: &mut BTreeSet<TempId>,
-) -> bool {
+) -> (bool, BTreeSet<TempId>) {
     let mut sites = CopyRootAssignmentSites::default();
     sites.collect_block(&proto.body, live_reads, safety);
 
-    let mut rewrite_targets = BTreeMap::<TempId, TempId>::new();
+    let mut rewrite_targets = BTreeMap::<TempId, CopyRootRetarget>::new();
     let mut roots = BTreeSet::new();
+    let mut retargeted_roots = BTreeSet::new();
     for (&producer, producer_site) in &sites.temps {
         if protected_temps.contains(&producer) {
             // 候选拒绝[LayerBoundary]：copy-root retarget 会把 endpoint 写改绑到 producer
             // 并交给 PhysicalRoot owner；它不能顺带消解上游 HIR 的 binding Preserve。
             continue;
         }
-        let Some(producer_value) = producer_site.unique_dead_value() else {
+        let Some(producer_value) = producer_site.unique_value() else {
             continue;
         };
+        if !producer_site.dead && !matches!(producer_value, HirExpr::TableConstructor(_)) {
+            continue;
+        }
         if safety.result_is_gc_inert(producer_value) {
             continue;
         }
         let scope_end = facts.is_scope_end_copy_root_temp(producer);
         let overwrites = facts.copy_root_overwrites(producer);
+        // 表即使已有逻辑读取/逃逸，原 home 的退休仍须覆盖同一个对象根。
+        // 这里只补齐完整 endpoint 事务，不为仍被读取的表新增 scope-end 保活。
+        if !producer_site.dead && overwrites.is_none() {
+            continue;
+        }
         if !scope_end && overwrites.is_none() {
             continue;
         }
         let Some(home) = facts.trusted_temp_home_slot(producer) else {
             continue;
         };
-        if reference_captured_homes.contains(&home) {
+        if stable_visible_bindings
+            .reference_captured_homes
+            .contains(&home)
+        {
             // 候选拒绝[SemanticBarrier:Capture]：同槽 capture 会观察 overwrite 是否仍写回
             // 原 cell；regress_431 的 captured root 证明不能把 transaction 改绑到别的 identity。
             continue;
@@ -361,6 +575,7 @@ fn preserve_copy_roots_in_proto(
             protected_temps,
             facts,
             existing_rewrites: &rewrite_targets,
+            stable_locals: &stable_visible_bindings.locals,
         };
         let all_overwrites_match = overwrites.into_iter().flatten().all(|overwrite| {
             copy_root_overwrite_matches_hir(
@@ -375,6 +590,9 @@ fn preserve_copy_roots_in_proto(
             continue;
         }
         roots.insert(producer);
+        if !scope_end && overwrites.is_some_and(|ends| ends.len() == candidate_rewrites.len()) {
+            retargeted_roots.insert(producer);
+        }
         rewrite_targets.extend(candidate_rewrites);
     }
 
@@ -386,7 +604,7 @@ fn preserve_copy_roots_in_proto(
     // 每个 key 已由同一只读快照的唯一 scalar Temp 写签发，期间没有改变树；提交必须一一命中。
     assert_eq!(rewritten, rewrite_targets.len());
     physical_root_temps.extend(roots);
-    rewritten != 0
+    (rewritten != 0, retargeted_roots)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,10 +634,6 @@ struct CopyRootAssignmentSite<'hir> {
 impl CopyRootAssignmentSite<'_> {
     fn unique_value(&self) -> Option<&HirExpr> {
         (self.writes == 1).then_some(self.value).flatten()
-    }
-
-    fn unique_dead_value(&self) -> Option<&HirExpr> {
-        self.unique_value().filter(|_| self.dead)
     }
 
     fn is_unique_dead_pure(&self) -> bool {
@@ -526,7 +740,14 @@ struct CopyRootMatchContext<'a> {
     sites: &'a CopyRootAssignmentSites<'a>,
     protected_temps: &'a BTreeSet<TempId>,
     facts: &'a ProtoPromotionFacts,
-    existing_rewrites: &'a BTreeMap<TempId, TempId>,
+    existing_rewrites: &'a BTreeMap<TempId, CopyRootRetarget>,
+    stable_locals: &'a BTreeSet<LocalId>,
+}
+
+#[derive(Clone, Copy)]
+struct CopyRootRetarget {
+    producer: TempId,
+    value: CopyRootScalarValue,
 }
 
 fn copy_root_overwrite_matches_hir(
@@ -534,7 +755,7 @@ fn copy_root_overwrite_matches_hir(
     producer: TempId,
     producer_site: &CopyRootAssignmentSite<'_>,
     context: &CopyRootMatchContext<'_>,
-    candidate_rewrites: &mut BTreeMap<TempId, TempId>,
+    candidate_rewrites: &mut BTreeMap<TempId, CopyRootRetarget>,
 ) -> bool {
     let temp = overwrite.temp();
     let temp_site = context.sites.temps.get(&temp);
@@ -555,15 +776,34 @@ fn copy_root_overwrite_matches_hir(
     let Some(overwrite_location) = &site.location else {
         return false;
     };
+    // 常量准备可能因 TESTSET 的条件读取已物化为 local。只读取当前唯一、
+    // 无写入/引用捕获的可见声明，且声明作用域必须覆盖 endpoint；不递归猜值。
+    let matched_value = if let HirExpr::LocalRef(local) = value {
+        context.sites.locals.get(local).and_then(|source| {
+            (context.stable_locals.contains(local)
+                && source.location.is_some_and(|location| {
+                    location.owns(*overwrite_location, &context.sites.block_ends)
+                }))
+            .then(|| source.unique_value())
+            .flatten()
+        })
+    } else {
+        Some(value)
+    };
     if context.protected_temps.contains(&temp)
-        || !overwrite.matches_hir_expr(value)
+        || !matched_value.is_some_and(|value| overwrite.matches_hir_expr(value))
         || !producer_location.owns(*overwrite_location, &context.sites.block_ends)
         || context.existing_rewrites.contains_key(&temp)
     {
         return false;
     }
     if temp_site.is_some() && site.is_unique_dead_pure() {
-        candidate_rewrites.insert(temp, producer).is_none()
+        let CopyRootOverwrite::Scalar { value, .. } = overwrite else {
+            return false;
+        };
+        candidate_rewrites
+            .insert(temp, CopyRootRetarget { producer, value })
+            .is_none()
     } else {
         // Keeping the producer local alive past this raw primitive overwrite is observable only
         // if the remaining path can allocate, call user code, inspect a weak table, or otherwise
@@ -575,15 +815,18 @@ fn copy_root_overwrite_matches_hir(
 
 fn rewrite_copy_root_overwrites(
     block: &mut HirBlock,
-    rewrites: &BTreeMap<TempId, TempId>,
+    rewrites: &BTreeMap<TempId, CopyRootRetarget>,
 ) -> usize {
     let mut rewritten = 0;
     for stmt in &mut block.stmts {
         if let HirStmt::Assign(assign) = stmt
             && let [HirLValue::Temp(temp)] = assign.targets.as_mut_slice()
-            && let Some(producer) = rewrites.get(temp).copied()
+            && let Some(rewrite) = rewrites.get(temp).copied()
         {
-            *temp = producer;
+            *temp = rewrite.producer;
+            // 当前 RHS 已逐位匹配，稳定 LocalRef 的读取没有事件；端点直接保留
+            // 被证明的标量，避免后层重新推断准备 local 的值类。
+            assign.values.fixed[0] = rewrite.value.into_hir_expr();
             assign.generic_for_initializer_producer = None;
             rewritten += 1;
         }
@@ -909,8 +1152,12 @@ impl HirRewritePass for DeadTempPass<'_> {
                 return true;
             }
             if self.root_write_temps.contains(&temp) {
-                if expr_may_alias_overwritten_param(value, &self.overwritten_visible_params) {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：RHS 参数会在当前 slot 生命周期
+                if (self.safety.result_is_gc_inert(value)
+                    && self.facts.write_clears_unknown_scratch(temp))
+                    || expr_may_alias_overwritten_param(value, &self.overwritten_visible_params)
+                {
+                    // 候选拒绝[SemanticBarrier:Lifetime]：原写也可能负责清除入口/CALL 残值，
+                    // 即使 RHS 为 boolean/nil 也须向 AST 传递覆盖责任。另一类是 RHS 参数在当前 slot 生命周期
                     // 结束前被同 home 写覆盖。把该 temp 标成 PhysicalRoot，防止 AST
                     // cleanup 再删除这个保活 alias；完整 root transaction 的精确区间由
                     // 后置 copy-root owner 统一处理。
@@ -919,9 +1166,8 @@ impl HirRewritePass for DeadTempPass<'_> {
                 // 候选拒绝[SemanticBarrier:Lifetime]：原始 home 或已有 PhysicalRoot 的写不能
                 // 仅因没有逻辑读取而删除；scope-end 合成 holder 也有交接与退休义务。
                 // regress_398 证明 inert/稳定副本写会在原点释放旧 root，regress_377
-                // 证明不同 home 的副本会在源参数覆盖后成为唯一新 root。只有上述两类
-                // 完整 transaction 才向 AST 传 PhysicalRoot，避免阻塞普通 dead primitive
-                // 声明的 readability cleanup（regress_381）。
+                // 证明不同 home 的副本会在源参数覆盖后成为唯一新 root。原槽残值的覆盖
+                // 与新值保活分别取证；GC-inert 结果不能免除前者。
                 return true;
             }
             changed = true;

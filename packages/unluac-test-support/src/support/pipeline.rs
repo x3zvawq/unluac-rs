@@ -1,4 +1,7 @@
-//! 编排源码执行、编译、反编译、回编译与收敛检查；依赖 toolchain 和专题断言，不负责解析 case 清单；例如执行 unit/regression 的完整往返流水线。
+//! 编排源码执行、编译、反编译、回编译与收敛检查；依赖 toolchain 和专题断言，不负责解析 case 清单；例如对主题源码执行完整往返验证。
+//!
+//! 每份生成源码在本轮完成编译与运行验证后，把同一 chunk 交给下一轮反编译。
+//! 编译选项在 case 内固定；不为改变轮次路径重复编译已验证源码，新生成结果仍完整验证。
 
 use super::*;
 
@@ -33,6 +36,27 @@ pub(super) fn run_lua_file_with_args(
         std::iter::once(input_path.as_os_str()).chain(args.iter().map(OsStr::new)),
         toolchain.runtime_name,
     )
+}
+
+/// 执行实际编译产物；Luau CLI 只读源码，不能用重新编译源码代替原优化档的 chunk。
+fn run_compiled_lua_file(
+    dialect_label: &str,
+    input_path: &Path,
+    observer: Option<&runtime_observer::RuntimeObserver>,
+) -> Result<LuaCommandOutput, String> {
+    let toolchain = lua_toolchain(dialect_label)?;
+    let runtime = lua_tool_path(dialect_label, toolchain.compiled_runtime_name)?;
+    let output = run_command(
+        &runtime,
+        [input_path.as_os_str()],
+        toolchain.compiled_runtime_name,
+    )?;
+    if output.success()
+        && let Some(observer) = observer
+    {
+        observer.check_chunk(input_path)?;
+    }
+    Ok(output)
 }
 
 /// 使用 vendored 的 `luac` 把一个仓库内 case 编译到 health suite 的稳定产物路径。
@@ -73,14 +97,17 @@ pub(crate) fn build_case_baseline(
     suite_label: &str,
 ) -> Result<CaseBaseline, TestFailure> {
     let dialect_label = <&'static str>::from(entry.dialect);
-    let toolchain = lua_toolchain(dialect_label).map_err(|error| {
-        TestFailure::new(
-            FailureKind::RunSourceFailed,
-            "unknown test dialect",
-            format!("unknown test dialect {dialect_label}: {error}"),
+    let source_output = (if dialect_label == "luau" {
+        let optimization = format!("-O{}", entry.options.luau_optimization_level.unwrap_or(1));
+        run_lua_file_with_args(
+            dialect_label,
+            &repo_root().join(entry.path),
+            &[&optimization],
         )
-    })?;
-    let source_output = run_lua_case(dialect_label, entry.path).map_err(|error| {
+    } else {
+        run_lua_case(dialect_label, entry.path)
+    })
+    .map_err(|error| {
         TestFailure::new(
             FailureKind::RunSourceFailed,
             "run source failed",
@@ -102,6 +129,14 @@ pub(crate) fn build_case_baseline(
         ));
     }
 
+    let runtime_observer =
+        runtime_observer::RuntimeObserver::prepare(entry, suite_label).map_err(|error| {
+            TestFailure::new(
+                FailureKind::RunSourceFailed,
+                "prepare runtime observer failed",
+                error,
+            )
+        })?;
     let (compiled_path, compile_output) = compile_lua_case_to_suite_artifact(
         entry,
         suite_label,
@@ -131,17 +166,16 @@ pub(crate) fn build_case_baseline(
         ));
     }
 
-    if !toolchain.can_run_compiled_chunks {
-        return Ok(CaseBaseline { source_output });
-    }
-
-    let chunk_output = run_lua_file(dialect_label, &compiled_path).map_err(|error| {
-        TestFailure::new(
-            FailureKind::RunCompiledChunkFailed,
-            "run compiled chunk failed",
-            format!("run compiled chunk failed: {error}"),
-        )
-    })?;
+    let chunk_output =
+        run_compiled_lua_file(dialect_label, &compiled_path, runtime_observer.as_ref()).map_err(
+            |error| {
+                TestFailure::new(
+                    FailureKind::RunCompiledChunkFailed,
+                    "run compiled chunk failed",
+                    format!("run compiled chunk failed: {error}"),
+                )
+            },
+        )?;
     if !chunk_output.success() {
         let reason = primary_command_reason(&chunk_output)
             .map(|reason| format!(": {reason}"))
@@ -172,24 +206,24 @@ pub(crate) fn build_case_baseline(
         ));
     }
 
-    Ok(CaseBaseline { source_output })
+    Ok(CaseBaseline {
+        source_output,
+        runtime_observer,
+    })
 }
 
-pub(crate) fn run_pipeline_case(
-    suite: UnitSuite,
-    entry: &LuaCaseManifestEntry,
-) -> Result<TestSuccess, TestFailure> {
+pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSuccess, TestFailure> {
     if entry.expectation == LuaCaseExpectation::GlobalDeclResidual {
-        return run_global_decl_residual_contract(suite, entry);
+        return run_global_decl_residual_contract(entry);
     }
     if let LuaCaseExpectation::UnsupportedIsland { jump_pc, target_pc } = entry.expectation {
         return run_unsupported_island_contract(entry, jump_pc, target_pc);
     }
     if entry.expectation == LuaCaseExpectation::ProtoFailureRecovery {
-        return run_proto_failure_recovery_contract(suite, entry);
+        return run_proto_failure_recovery_contract(entry);
     }
     let dialect_label = <&'static str>::from(entry.dialect);
-    let suite_label = suite.label();
+    let suite_label = "cases";
     let toolchain = lua_toolchain(dialect_label).map_err(|error| {
         TestFailure::new(
             FailureKind::RunGeneratedChunkFailed,
@@ -312,14 +346,7 @@ pub(crate) fn run_pipeline_case(
         )
     })?;
     assert_source_chunk("generated", generated.kind, entry.path)?;
-    assert_readability(
-        "generated",
-        &generated.source,
-        result.state.readability.as_ref(),
-        entry,
-        &assertions,
-        true,
-    )?;
+    // 形状合同失败也需要保留实际输出，才能按批次审查断言与证明缺口。
     let generated_source_path = write_generated_case_source(entry, suite_label, &generated.source)
         .map_err(|error| {
             TestFailure::new(
@@ -328,6 +355,14 @@ pub(crate) fn run_pipeline_case(
                 format!("write generated source failed: {error}"),
             )
         })?;
+    assert_readability(
+        "generated",
+        &generated.source,
+        result.state.readability.as_ref(),
+        entry,
+        &assertions,
+        true,
+    )?;
 
     let (generated_chunk_path, compile_output) = compile_generated_source_to_suite_artifact(
         entry,
@@ -363,19 +398,19 @@ pub(crate) fn run_pipeline_case(
         ));
     }
 
-    let generated_runtime_path = if toolchain.can_run_compiled_chunks {
-        &generated_chunk_path
-    } else {
-        &generated_source_path
-    };
-    let generated_output =
-        run_lua_file(dialect_label, generated_runtime_path).map_err(|error| {
-            TestFailure::new(
-                FailureKind::RunGeneratedChunkFailed,
-                "run generated artifact failed",
-                format!("run generated artifact failed: {error}"),
-            )
-        })?;
+    let generated_runtime_path = &generated_chunk_path;
+    let generated_output = run_compiled_lua_file(
+        dialect_label,
+        generated_runtime_path,
+        baseline.runtime_observer.as_ref(),
+    )
+    .map_err(|error| {
+        TestFailure::new(
+            FailureKind::RunGeneratedChunkFailed,
+            "run generated artifact failed",
+            format!("run generated artifact failed: {error}"),
+        )
+    })?;
     if !generated_output.success() {
         let reason = primary_command_reason(&generated_output)
             .map(|reason| format!(": {reason}"))
@@ -425,7 +460,7 @@ pub(crate) fn run_pipeline_case(
         ).with_proto_stats(proto_count, failed_tags));
     }
 
-    // 重编译轮次：拿上一轮生成的源码，再走一遍 compile → decompile → compile → run → 对比 baseline，
+    // 上一轮源码已经编译并通过运行比较；直接消费同一 chunk，再生成后仍须 compile → run。
     // 同时做前后两轮生成源码的文本收敛检查。
     let rounds = entry
         .options
@@ -436,55 +471,9 @@ pub(crate) fn run_pipeline_case(
         .recompile_rounds
         .is_some_and(|rounds| rounds > 0);
     let mut prev_generated_source = generated.source.clone();
+    let mut prev_chunk_path = generated_chunk_path;
     for round in 1..=rounds {
         let round_label = format!("recompile-round-{round}");
-
-        // 把上一轮生成的源码编译成 chunk
-        let prev_source_path = write_generated_case_source(
-            entry,
-            &format!("{suite_label}/{round_label}"),
-            &prev_generated_source,
-        )
-        .map_err(|error| {
-            TestFailure::new(
-                FailureKind::WriteGeneratedSourceFailed,
-                format!("[{round_label}] write generated source failed"),
-                format!("[{round_label}] write generated source failed: {error}"),
-            )
-        })?;
-        let (prev_chunk_path, prev_compile_output) = compile_generated_source_to_suite_artifact(
-            entry,
-            &format!("{suite_label}/{round_label}"),
-            &prev_source_path,
-            !entry.options.retain_debug,
-        )
-        .map_err(|error| {
-            TestFailure::new(
-                FailureKind::RecompileGeneratedSourceCompilationFailed,
-                format!("[{round_label}] compile generated source failed"),
-                format!("[{round_label}] compile generated source failed: {error}"),
-            )
-        })?;
-        if !prev_compile_output.success() {
-            let reason = primary_command_reason(&prev_compile_output)
-                .map(|reason| format!(": {reason}"))
-                .unwrap_or_default();
-            let summary = format!(
-                "[{round_label}] generated source compilation failed{reason} (status: {})",
-                prev_compile_output.status_code.unwrap_or_default(),
-            );
-            return Err(TestFailure::new(
-                FailureKind::RecompileGeneratedSourceCompilationFailed,
-                summary.clone(),
-                format!(
-                    "{summary}\nsource artifact: {}\nchunk artifact: {}\n{}\ngenerated source:\n{}",
-                    repo_relative_display(&prev_source_path),
-                    repo_relative_display(&prev_chunk_path),
-                    prev_compile_output.render(),
-                    prev_generated_source,
-                ),
-            ));
-        }
 
         // 反编译 chunk
         let prev_chunk_bytes = fs::read(&prev_chunk_path).map_err(|error| {
@@ -522,19 +511,7 @@ pub(crate) fn run_pipeline_case(
             )
         })?;
         assert_source_chunk(&round_label, recompile_generated.kind, entry.path)?;
-        // 正向 shape 只约束原始 bytecode 的首次恢复；目标编译器可能把合法的
-        // `break`/`while true` 等价规范化成 `return`/`repeat`。安全型负向约束仍需
-        // 在每个 roundtrip 重验，防止 goto、unresolved 或诊断源码回流。
-        assert_readability(
-            &round_label,
-            &recompile_generated.source,
-            recompile_result.state.readability.as_ref(),
-            entry,
-            &assertions,
-            false,
-        )?;
-
-        // 写出、编译、执行再次生成的源码
+        // 先保留本轮输出，包括随后被安全型形状合同拒绝的源码。
         let regen_source_path = write_generated_case_source(
             entry,
             &format!("{suite_label}/{round_label}-regen"),
@@ -547,6 +524,17 @@ pub(crate) fn run_pipeline_case(
                 format!("[{round_label}] write regen source failed: {error}"),
             )
         })?;
+        // 正向 shape 只约束原始 bytecode 的首次恢复；目标编译器可能把合法的
+        // `break`/`while true` 等价规范化成 `return`/`repeat`。安全型负向约束仍需
+        // 在每个 roundtrip 重验，防止 goto、unresolved 或诊断源码回流。
+        assert_readability(
+            &round_label,
+            &recompile_generated.source,
+            recompile_result.state.readability.as_ref(),
+            entry,
+            &assertions,
+            false,
+        )?;
         let (regen_chunk_path, regen_compile_output) = compile_generated_source_to_suite_artifact(
             entry,
             &format!("{suite_label}/{round_label}-regen"),
@@ -581,12 +569,13 @@ pub(crate) fn run_pipeline_case(
             ));
         }
 
-        let regen_runtime_path = if toolchain.can_run_compiled_chunks {
-            &regen_chunk_path
-        } else {
-            &regen_source_path
-        };
-        let regen_output = run_lua_file(dialect_label, regen_runtime_path).map_err(|error| {
+        let regen_runtime_path = &regen_chunk_path;
+        let regen_output = run_compiled_lua_file(
+            dialect_label,
+            regen_runtime_path,
+            baseline.runtime_observer.as_ref(),
+        )
+        .map_err(|error| {
             TestFailure::new(
                 FailureKind::RecompileGeneratedChunkExecutionFailed,
                 format!("[{round_label}] run regen artifact failed"),
@@ -655,6 +644,7 @@ pub(crate) fn run_pipeline_case(
         }
 
         prev_generated_source = recompile_generated.source.clone();
+        prev_chunk_path = regen_chunk_path;
     }
 
     match entry.expectation {
@@ -684,10 +674,9 @@ pub(crate) fn run_pipeline_case(
 }
 
 fn run_global_decl_residual_contract(
-    suite: UnitSuite,
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
-    let baseline = build_case_baseline(entry, suite.label()).map_err(|failure| {
+    let baseline = build_case_baseline(entry, "cases").map_err(|failure| {
         TestFailure::new(
             FailureKind::BaselineFailed,
             format!("baseline failed first: {}", failure.summary()),
@@ -819,7 +808,6 @@ fn global_decl_residual_contract_failure(
 }
 
 fn run_proto_failure_recovery_contract(
-    suite: UnitSuite,
     entry: &LuaCaseManifestEntry,
 ) -> Result<TestSuccess, TestFailure> {
     use unluac::ast::{AstExpr, AstStmt, AstTargetDialect, lower_ast};
@@ -830,7 +818,7 @@ fn run_proto_failure_recovery_contract(
         expectation: LuaCaseExpectation::Source,
         ..*entry
     };
-    let baseline = run_pipeline_case(suite, &source_entry)?;
+    let baseline = run_pipeline_case(&source_entry)?;
     let chunk = compile_manifest_case(entry);
     let mut options = decompile_options(entry);
     options.target_stage = DecompileStage::Hir;

@@ -10,6 +10,8 @@
 //! 此处将未失效的唯一原 home 投影到源码槽序，不要求原 cell 的 epoch 为零。例如
 //! `do local x; capture(x) end; assert(f())` 中已关闭的 r2 可供后续帧使用，原新 epoch
 //! 仍由调用/capture owner 核对；位置相等不合并 binding，也不把根释放当作声明出栈。
+//! 请求错位撤回该词法块的后缀，防止恢复的声明改变后续请求的前缀；正常退栈后仍可
+//! 验证外层独立请求。声明状态无法解释时停止；撤回后从原快照重建并整体验证一次。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,6 +23,7 @@ use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use crate::hir::simplify::mention::BindingReadCollector;
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
+pub(super) mod coordinates;
 mod materializations;
 pub(super) use materializations::{pending_nil_prefix_temps, restore_materializations};
 
@@ -30,15 +33,62 @@ pub(super) struct PrefixRequest {
     pub(super) required: BTreeSet<LocalId>,
 }
 
-/// COPY 的旧槽覆盖要求实际源码前缀与原 home 一致；单独保留 COPY local 不足以证明。
+/// 请求不匹配撤回当前词法作用域的后缀；无法解释声明栈时，整个后缀未知。
+/// 例如循环体内的错位帧不阻止退出该作用域后验证外层帧。消费者撤回计划后仍须
+/// 重建预览并整批验证，不能把这个快照中的其它成功请求直接当作提交许可。
+/// 区间覆盖本次请求窗口；扫描可能在最后请求处结束，不用于查询任意后续坐标。
+pub(super) struct PrefixFailures {
+    rejected: BTreeMap<usize, usize>,
+    invalid_from: Option<usize>,
+}
+
+impl PrefixFailures {
+    pub(super) fn invalid_from(index: usize) -> Self {
+        Self {
+            rejected: BTreeMap::new(),
+            invalid_from: Some(index),
+        }
+    }
+
+    pub(super) fn first(&self) -> usize {
+        self.rejected
+            .first_key_value()
+            .map(|(&start, _)| start)
+            .into_iter()
+            .chain(self.invalid_from)
+            .min()
+            .expect("prefix failure contains a rejected request or invalid suffix")
+    }
+
+    pub(super) fn rejects(&self, start: usize) -> bool {
+        self.rejected
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, &end)| start < end)
+            || self.invalid_from.is_some_and(|index| start >= index)
+    }
+
+    /// 后缀帧属于更早的根退休事务时，将其失败归回该 owner，不能局部接受依赖链。
+    pub(super) fn with_dependent_suffix(mut self, owner: Option<usize>) -> Self {
+        if let Some(owner) = owner
+            && (self.rejected.values().any(|&end| end > owner)
+                || self.invalid_from.is_some_and(|index| index >= owner))
+        {
+            self.invalid_from = Some(self.invalid_from.map_or(owner, |index| index.min(owner)));
+        }
+        self
+    }
+}
+
+/// COPY 的旧槽覆盖及返回残根要求实际源码前缀与原 home 一致；只保留 COPY local 不足以证明。
 /// 复用调用帧的声明验证，避免 AST 删除低槽参数别名后让全部 scratch 左移。
-pub(super) fn preserve_scratch_prefixes(
+pub(super) fn preserve_copy_prefixes(
     proto: &mut HirProto,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
     is_chunk_entry: bool,
 ) -> bool {
-    let locals = facts.scratch_overwrite_locals();
+    let locals = facts.physical_copy_prefix_locals(&proto.physical_root_locals);
     if locals.is_empty() {
         return false;
     }
@@ -48,22 +98,21 @@ pub(super) fn preserve_scratch_prefixes(
         cursor: usize,
         starts: BTreeMap<usize, PrefixRequest>,
     }
-    impl HirVisitor<'_> for Candidates<'_> {
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
+    impl Candidates<'_> {
+        fn visit_stmt(&mut self, index: usize, stmt: &HirStmt) {
             if let HirStmt::LocalDecl(decl) = stmt
                 && let [local] = decl.bindings.as_slice()
                 && self.locals.contains(local)
                 && let Some(home) = self.facts.trusted_local_home_slot(*local)
             {
                 self.starts.insert(
-                    self.cursor,
+                    index,
                     PrefixRequest {
                         home,
                         required: BTreeSet::new(),
                     },
                 );
             }
-            self.cursor += 1;
         }
     }
     let mut scan = Candidates {
@@ -72,28 +121,53 @@ pub(super) fn preserve_scratch_prefixes(
         cursor: 0,
         starts: BTreeMap::new(),
     };
-    visit_stmts(&proto.body.stmts, &mut scan);
-    let removed = vec![false; scan.cursor];
+    let mut cursor = 0;
+    coordinates::visit(&proto.body, &mut cursor, &mut |index, kind, stmt| {
+        if kind == coordinates::PointKind::Statement {
+            scan.visit_stmt(index, stmt);
+        }
+    });
+    scan.cursor = cursor;
+    preserve_prefix_requests(
+        proto,
+        facts,
+        dialect,
+        is_chunk_entry,
+        scan.cursor,
+        scan.starts,
+    )
+}
+
+/// 已由各帧 owner 核对的入口请求，共用一次声明扫描发布保留事实；不改写 HIR 语句。
+pub(super) fn preserve_prefix_requests(
+    proto: &mut HirProto,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    is_chunk_entry: bool,
+    stmt_count: usize,
+    mut starts: BTreeMap<usize, PrefixRequest>,
+) -> bool {
+    let removed = vec![false; stmt_count];
     let preserved = match validate_prefixes(
         proto,
         facts,
         dialect,
         is_chunk_entry,
         &removed,
-        &scan.starts,
+        &starts,
         false,
     ) {
         Ok(preserved) => preserved,
-        Err(index) => {
+        Err(failures) => {
             // 一次截断只保留已通过的独立前缀；不为每个候选重扫整个 proto。
-            drop(scan.starts.split_off(&index));
+            drop(starts.split_off(&failures.first()));
             let Ok(preserved) = validate_prefixes(
                 proto,
                 facts,
                 dialect,
                 is_chunk_entry,
                 &removed,
-                &scan.starts,
+                &starts,
                 false,
             ) else {
                 return false;
@@ -110,9 +184,9 @@ pub(super) fn preserve_scratch_prefixes(
     changed
 }
 
-/// 词法 Block、If/While 子块及已有原槽协议的 for 使用声明栈；未知资源和未物化 Temp 不签证。
-/// candidates 使用全 proto 的词法 DFS 坐标，removed 必须覆盖同一快照。成功集合尚未发布；
-/// 失败返回首个未证位置，调用方可截断独立候选前缀后统一重验，不能忽略中间声明。
+/// 词法 Block、If/While 子块及已有原槽协议的 for 使用声明栈；Repeat 的声明延续到尾条件点。
+/// candidates 使用 coordinates 的全 proto 帧坐标，removed 必须覆盖同一快照。成功集合尚未发布；
+/// 失败区分可继续扫描的请求拒绝与未知后缀，调用方撤回相关计划后必须整批重验。
 /// scan_suffix 用于新增声明的完整事务：最后一次写之后仍须检查其余 owner，不能只证明起点。
 pub(super) fn validate_prefixes(
     proto: &HirProto,
@@ -122,12 +196,12 @@ pub(super) fn validate_prefixes(
     removed: &[bool],
     candidates: &BTreeMap<usize, PrefixRequest>,
     scan_suffix: bool,
-) -> Result<BTreeSet<LocalId>, usize> {
+) -> Result<BTreeSet<LocalId>, PrefixFailures> {
     let Some((&last_candidate, _)) = candidates.last_key_value() else {
         return Ok(BTreeSet::new());
     };
     if last_candidate >= removed.len() {
-        return Err(0);
+        return Err(PrefixFailures::invalid_from(0));
     }
     let last_start = if scan_suffix {
         removed.len() - 1
@@ -136,7 +210,7 @@ pub(super) fn validate_prefixes(
     };
     for (slot, &param) in proto.params.iter().enumerate() {
         if facts.trusted_param_home_slot(param).map(HomeSlotKey::slot) != Some(slot) {
-            return Err(0);
+            return Err(PrefixFailures::invalid_from(0));
         }
     }
 
@@ -169,7 +243,7 @@ pub(super) fn validate_prefixes(
             || !proto.signature.has_vararg_param_reg
             || facts.trusted_local_home_slot(local).map(HomeSlotKey::slot) != Some(header_slots)
         {
-            return Err(0);
+            return Err(PrefixFailures::invalid_from(0));
         }
         if !is_chunk_entry {
             // chunk 的 entry 从模块 body 发射，不经过函数 parlist；Lua 5.5 main
@@ -189,11 +263,31 @@ pub(super) fn validate_prefixes(
         declared,
         pending: BTreeSet::new(),
         preserved: BTreeSet::new(),
+        rejected: BTreeMap::new(),
+        scope_rejected: None,
         unproven_prefix: false,
         scan_suffix,
     };
-    scan.block(&proto.body)?;
-    Ok(scan.preserved)
+    let invalid_from = scan.block(&proto.body).err();
+    if invalid_from.is_some() || !scan.rejected.is_empty() {
+        // 嵌套块的区间可能被父块包含；合并后才能用一次前驱查询判断候选。
+        let mut rejected = BTreeMap::<usize, usize>::new();
+        for (start, end) in scan.rejected {
+            if let Some(mut previous) = rejected.last_entry()
+                && *previous.get() >= start
+            {
+                *previous.get_mut() = (*previous.get()).max(end);
+            } else {
+                rejected.insert(start, end);
+            }
+        }
+        Err(PrefixFailures {
+            rejected,
+            invalid_from,
+        })
+    } else {
+        Ok(scan.preserved)
+    }
 }
 
 struct PrefixScan<'a> {
@@ -207,12 +301,48 @@ struct PrefixScan<'a> {
     declared: BTreeSet<LocalId>,
     pending: BTreeSet<usize>,
     preserved: BTreeSet<LocalId>,
+    rejected: BTreeMap<usize, usize>,
+    scope_rejected: Option<usize>,
     unproven_prefix: bool,
     scan_suffix: bool,
 }
 
 impl PrefixScan<'_> {
     fn block(&mut self, block: &HirBlock) -> Result<(), usize> {
+        self.block_contents(block, false)
+    }
+
+    fn check_request(&mut self, index: usize) -> bool {
+        if let Some(request) = self.candidates.get(&index) {
+            if self.unproven_prefix
+                || request.home.slot() != self.header_slots + self.locals.len()
+                || !request.required.is_subset(&self.declared)
+            {
+                return false;
+            }
+            for pending in std::mem::take(&mut self.pending) {
+                self.preserved
+                    .insert(self.locals[pending].expect("only named slots are pending"));
+            }
+        }
+        true
+    }
+
+    fn block_contents(&mut self, block: &HirBlock, keep_scope: bool) -> Result<(), usize> {
+        // 候选撤回后，原声明重新占槽；依赖这些槽的同块后缀必须一并撤回。
+        // 子块出栈后该依赖结束，不沿先序坐标误伤外层后缀，也不为每个请求重扫树。
+        let incoming = self.scope_rejected.take();
+        let result = self.scan_block_contents(block, keep_scope);
+        if let Some(start) = self.scope_rejected.take() {
+            // repeat 的 body 声明仍延续到额外的 condition 坐标。
+            self.rejected
+                .insert(start, self.cursor + usize::from(keep_scope));
+        }
+        self.scope_rejected = incoming;
+        result
+    }
+
+    fn scan_block_contents(&mut self, block: &HirBlock, keep_scope: bool) -> Result<(), usize> {
         let scope_start = self.locals.len();
         let incoming_unproven = self.unproven_prefix;
         for stmt in &block.stmts {
@@ -221,19 +351,8 @@ impl PrefixScan<'_> {
             }
             let index = self.cursor;
             self.cursor += 1;
-            if let Some(request) = self.candidates.get(&index) {
-                // 候选拒绝[ProofIncomplete]：精确原 home 已由调用方持有；这里验证源码位置及活动声明身份。
-                if self.unproven_prefix
-                    || request.home.slot() != self.header_slots + self.locals.len()
-                    || !request.required.is_subset(&self.declared)
-                {
-                    return Err(index);
-                }
-                // 每个身份只发布一次；不在每个嵌套 block 重扫/复制整个祖先前缀。
-                for pending in std::mem::take(&mut self.pending) {
-                    self.preserved
-                        .insert(self.locals[pending].expect("only named slots are pending"));
-                }
+            if !self.check_request(index) {
+                self.scope_rejected.get_or_insert(index);
             }
             if index == self.last_start && !self.scan_suffix {
                 break;
@@ -243,6 +362,35 @@ impl PrefixScan<'_> {
             }
             if let HirStmt::Block(child) = stmt {
                 self.block(child)?;
+                continue;
+            }
+            if let HirStmt::Repeat(repeat) = stmt {
+                let repeat_start = self.locals.len();
+                let repeat_unproven = self.unproven_prefix;
+                self.block_contents(&repeat.body, true)?;
+                // 条件在 body 的局部作用域内，额外坐标与 coordinates owner 一致。
+                if self.cursor <= self.last_start {
+                    let condition = self.cursor;
+                    self.cursor += 1;
+                    if !self.check_request(condition) {
+                        self.rejected.insert(condition, condition + 1);
+                    }
+                    if self.removed.get(condition) != Some(&false) {
+                        return Err(condition);
+                    }
+                    let mut has_temp = false;
+                    crate::hir::visit::visit_stmt_header(
+                        stmt,
+                        &mut BindingReadCollector(|binding| {
+                            has_temp |= matches!(binding, HirBinding::Temp(_));
+                        }),
+                    );
+                    if has_temp {
+                        return Err(condition);
+                    }
+                }
+                self.leave_scope(repeat_start);
+                self.unproven_prefix = repeat_unproven;
                 continue;
             }
             let mut has_temp = false;
@@ -342,7 +490,11 @@ impl PrefixScan<'_> {
                         HirLValue::Local(local) => self.declared.contains(local),
                         _ => true,
                     }) => {}
-                HirStmt::CallStmt(_) | HirStmt::Return(_) | HirStmt::Break | HirStmt::Continue => {}
+                HirStmt::GlobalDecl(_)
+                | HirStmt::CallStmt(_)
+                | HirStmt::Return(_)
+                | HirStmt::Break
+                | HirStmt::Continue => {}
                 HirStmt::ToBeClosed(tbc)
                     if matches!(tbc.value, crate::hir::common::HirExpr::LocalRef(local)
                         if self.declared.contains(&local)
@@ -356,8 +508,10 @@ impl PrefixScan<'_> {
                 _ => return Err(index),
             }
         }
-        self.leave_scope(scope_start);
-        self.unproven_prefix = incoming_unproven;
+        if !keep_scope {
+            self.leave_scope(scope_start);
+            self.unproven_prefix = incoming_unproven;
+        }
         Ok(())
     }
 

@@ -9,6 +9,8 @@
 //! debug 身份直接查询 proto 的 canonical 映射；删除已证明的重复写不更新状态，语句列表
 //! 按原顺序传播事实并只压缩一次，避免每个重复写都搬移整个尾部。相邻复制裁剪也保留
 //! 上一条存活语句的已分类关系；删除项不改变邻接事实，非复制语句则清空它。
+//! 原调用准备 COPY 消费 Promotion 的身份索引并保留到完整调用帧事务；单纯值相等
+//! 不证明该准备写多余，例如 `v=callee; callee=v; callee()` 仍有独立的 caller 槽责任。
 //! 多目标赋值默认仍不拆分；唯一例外是这里证明过的 dead loop-carrier mirror 分量：
 //! 被删 RHS 只能是纯 `LocalRef`，且目标 temp 的每一次写都必须属于同一 active-for、
 //! same-sole-possible-home 删除事务，因此不会留下旧值写而改变并行求值、副作用或 GC root 行为。
@@ -62,6 +64,7 @@ pub(super) fn prune_empty_assign_stmts(block: &mut HirBlock) -> bool {
 pub(super) fn prune_redundant_copy_stmts(
     block: &mut HirBlock,
     preserved_bindings: &BTreeSet<CarryBinding>,
+    call_preparations: &BTreeSet<(CarryBinding, CarryBinding)>,
 ) -> bool {
     let mut previous_copy = None;
     let mut changed = false;
@@ -83,6 +86,9 @@ pub(super) fn prune_redundant_copy_stmts(
                         && first_target == source
                         && first_source == target
                         && !preserved_bindings.contains(&target)
+                        // 候选拒绝[LayerBoundary]：前次 CALL 写回后的反向 COPY 仍是下次
+                        // callee/SELF 的原准备事件，由完整调用帧消费，不能仅据同值裁剪。
+                        && !call_preparations.contains(&(target, source))
                 },
             )
         {

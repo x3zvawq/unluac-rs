@@ -38,8 +38,8 @@ use self::access::{
     lower_table_access_expr_single_eval,
 };
 pub(super) use self::branch::{
-    branch_call_result_root_ends_after_test, lower_binary_op, lower_branch_cond,
-    lower_branch_subject, lower_branch_subject_single_eval, lower_unary_op,
+    branch_call_result_ending_after_test, lower_binary_op, lower_branch_cond, lower_branch_subject,
+    lower_branch_subject_single_eval, lower_unary_op,
 };
 pub(super) use self::defs::expr_for_direct_literal_def;
 use self::defs::expr_for_dup_safe_fixed_def;
@@ -77,6 +77,7 @@ pub(super) fn lower_closure_expr(
             method_key: None,
             callee_root_handoff: None,
             method_rewrite_transaction: None,
+            plain_method_syntax: false,
         }));
     }
     if let Some(local) = lowering.shared_closure_local(closure.creation) {
@@ -293,6 +294,7 @@ fn pack_tail_for_open_def(
                 method_key,
                 callee_root_handoff: lower_call_root_handoff(lowering, open_def.instr, call.kind),
                 method_rewrite_transaction: None,
+                plain_method_syntax: false,
             }))))
         }
         LowInstr::VarArg(vararg) if matches!(vararg.results, ResultPack::Open(_)) => {

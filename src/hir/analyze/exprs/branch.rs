@@ -75,22 +75,22 @@ pub(crate) fn lower_branch_subject_single_eval(
 
 /// 只为当前测试的 direct CALL epoch 消费已冻结的原 home 覆盖证明。
 /// 调用表达式展开后仍须由调用方匹配此测试；不能沿 MOVE 借另一个槽的旧 producer。
-pub(in crate::hir::analyze) fn branch_call_result_root_ends_after_test(
+pub(in crate::hir::analyze) fn branch_call_result_ending_after_test(
     lowering: &ProtoLowering<'_>,
     instr: InstrRef,
     frontiers: &crate::structure::RootOverwriteFrontiers,
-) -> bool {
+) -> Option<DefId> {
     let LowInstr::Branch(branch) = &lowering.proto.instrs[instr.index()] else {
-        return false;
+        return None;
     };
     let BranchSubject::Truthy(CondOperand::Reg(reg)) = branch.cond.subject else {
-        return false;
+        return None;
     };
     let SsaValue::Def(def) = lowering.dataflow.use_value(instr, reg) else {
-        return false;
+        return None;
     };
     let uses = &lowering.dataflow.def_uses[def.index()];
-    matches!(
+    (matches!(
         lowering.proto.instrs[lowering.dataflow.def_instr(def).index()],
         LowInstr::Call(_)
     ) && uses.len() == 1
@@ -100,7 +100,8 @@ pub(in crate::hir::analyze) fn branch_call_result_root_ends_after_test(
             .is_some_and(|frontier| frontier.home() == reg)
             || lowering
                 .promotion_facts
-                .call_result_root_ends_after_value_use(lowering.bindings.fixed_temps[def.index()]))
+                .call_result_root_ends_after_value_use(lowering.bindings.fixed_temps[def.index()])))
+    .then_some(def)
 }
 
 /// 原内嵌字面量不占准备槽，可以右置；其余只恢复同块、单用且无开放引用的读取

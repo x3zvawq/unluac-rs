@@ -9,6 +9,9 @@
 //!
 //! 普通 `obj.method(obj)` 不足以证明 method call：字段查询可能通过 `__index` 改写
 //! `obj`，而冒号调用只会求值一次 receiver。没有独立 receiver 快照的形状必须保留。
+//! 即使有独立快照，普通字段读取也没有 SELF 的 receiver 预写；旧 scratch 根可在
+//! `__index` 中被观察（methods_05 的额外实参弱引用）。两种 alias 计划都只消费原
+//! method key，不从双次同值读取补签协议。
 //! field alias lookup 与事件型 receiver initializer 原本只求值一次，因此不能搬入
 //! while/repeat；所有 alias 也不能越过外层调用、左侧操作数、复杂赋值目标等可观察前缀。
 
@@ -280,7 +283,13 @@ fn plan_with_receiver_alias<'a>(
         let [AstExpr::Var(receiver), args @ ..] = call.args.as_slice() else {
             return None;
         };
-        if !field_binding.matches_name_ref(callee) || !receiver_binding.matches_name_ref(receiver) {
+        if !field_binding.matches_name_ref(callee)
+            || !receiver_binding.matches_name_ref(receiver)
+            || call.method_key.as_ref().and_then(|key| key.as_utf8())
+                != Some(field_access.field.as_str())
+        {
+            // 候选拒绝[SemanticBarrier:Lifetime]：普通 GETFIELD 后 COPY 与 SELF
+            // 的 receiver 预写顺序不同；独立 alias 及同值读取不证明旧 scratch 根不可观察。
             return None;
         }
         Some(MethodCallParts {
@@ -351,6 +360,8 @@ fn plan_receiver_alias_direct_method_call<'a>(
             };
             if !receiver_binding.matches_name_ref(base)
                 || !receiver_binding.matches_name_ref(receiver)
+                || call.method_key.as_ref().and_then(|key| key.as_utf8())
+                    != Some(access.field.as_str())
             {
                 return None;
             }

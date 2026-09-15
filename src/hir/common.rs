@@ -21,6 +21,18 @@ pub struct HirModule {
     /// 父先子后的 proto arena：每条 `children` 边都指向更大的下标。
     /// lowering 预留合成 factory、失败恢复删除并重编号时均保持这个顺序。
     pub protos: Vec<HirProto>,
+    /// 完整展开帧只在指定调用消失时等价；Generate 必须核对最终源码并发射编译要求。
+    pub(crate) required_luau_inlining: Vec<HirRequiredLuauInlining>,
+}
+
+/// 原闭包保持创建位置，结果声明逐项绑定必须内联的调用 occurrence。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HirRequiredLuauInlining {
+    pub owner: HirProtoRef,
+    pub callee: LocalId,
+    pub child: HirProtoRef,
+    pub field: LuaString,
+    pub results: Vec<LocalId>,
 }
 
 /// 单个 proto 的 HIR 结果。
@@ -68,6 +80,9 @@ pub struct HirProto {
     /// 集合成员仍使用普通 `UpvalueId`，使读写、capture、mutability 和 root/lifetime
     /// consumer 共享同一身份；AST 只消费这项 role 事实决定是否写成 `_ENV`。
     pub environment_upvalues: BTreeSet<UpvalueId>,
+    /// HIR 完整 global 协议证明的局部词法环境。保留原声明/槽位，Naming 固定为 `_ENV`；
+    /// 它是普通 upvalue 读取的快照，不改变 `environment_upvalues` 的根环境 cell 身份。
+    pub lexical_environment_local: Option<LocalId>,
     /// Upvalues that this proto or one of its descendant closures may write.
     ///
     /// The set is transitive through by-reference captures. A by-value capture may mutate the
@@ -146,6 +161,8 @@ pub enum HirInlineRetentionReason {
     BooleanValueContext,
     /// 原调用或 scratch 覆盖事务依赖已有声明组成的物理帧前缀，不能删除、移位或提前结束。
     PhysicalFramePrefix,
+    /// global 初始化隐式读取的局部环境，不能删除、移位、合并或缩短其词法绑定。
+    LexicalEnvironment,
 }
 
 /// 单个 proto 内跨 temp/local 身份提升保存的重写结论。
@@ -732,6 +749,9 @@ pub struct HirCallExpr {
     pub callee_root_handoff: Option<HirCallRootHandoff>,
     /// 与 method lookup producer 配对的一次性 HIR 改写事务。
     pub method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
+    /// HIR 最终出口证明普通字段调用可使用冒号语法；不冒充原 SELF 协议，
+    /// 不授权删除 producer 或改变调用帧。只由最终语法签证写入，AST build 消费。
+    pub(crate) plain_method_syntax: bool,
 }
 
 /// 一个 canonical definition 的原始 home 在该参数位置交给 callee。
@@ -1324,7 +1344,8 @@ pub struct HirTableConstructor {
     /// 全部互斥原分配时点；合并字段保留它们，合成 capture 数组不冒充原 VM 分配。
     pub(crate) sources: HirOperationSources,
     pub fields: Vec<HirTableField>,
-    /// Luau 模板中隐式预置零值的字段位置；混合常量模板也可发布，消费后移除角色。
+    /// 模板中不代表独立源码求值的占位字段位置：Luau 的隐式零值以及 LuaJIT TDUP
+    /// 为后继动态 hash 写预置的 nil marker。完整构造事务消费后移除角色。
     pub(crate) implicit_template_fields: BTreeSet<usize>,
     pub trailing_multivalue: Option<HirPackTail>,
     /// 前层发布的分配语义；模板默认值已进入 fields，但复制布局与普通预分配不同。

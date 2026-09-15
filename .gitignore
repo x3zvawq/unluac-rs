@@ -9,3 +9,4 @@ dist
 *.tsbuildinfo
 /tmp
 luac.out
+**/*.decompiled.lua

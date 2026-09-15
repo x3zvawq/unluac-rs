@@ -1,4 +1,7 @@
 //! 将分支、短路条件和值判定区域降低为 HIR；依赖冻结的 condition/value payload，不负责选择候选；例如生成带边动作的 if/else。
+//! ValueDecision 的入口 CALL 与前缀在同一事务内交接：只有原覆盖前沿证明后继先覆写结果槽，
+//! 才把唯一末尾调用接入测试。例如 `f() and g()` 不应新增跨 g 的 f 结果强根；独立 saved
+//! 处于后继调用低槽时没有该证明，仍保留原声明与前缀。
 
 use super::*;
 
@@ -115,7 +118,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             region: region.index(),
             detail: "value decision has no entry node",
         })?;
-        let decision = build_value_decision_expr(self.lowering, selected).ok_or(
+        let mut decision = build_value_decision_expr(self.lowering, selected).ok_or(
             HirLowerError::InvalidPlanRegion {
                 proto: self.proto.index(),
                 region: region.index(),
@@ -123,6 +126,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             },
         )?;
         let mut stmts = self.lower_condition_prefix(region, header)?;
+        self.absorb_value_entry_call(selected, &mut stmts, &mut decision);
         let target = self
             .lowering
             .bindings
@@ -148,11 +152,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     // 只在此次归约事务消费证明，不把许可挂到可被后续 pass 改写的节点。
                     node.test_source == crate::hir::HirDecisionTestSource::Value
                         && matches!(node.test, HirExpr::Call(_))
-                        && super::super::super::exprs::branch_call_result_root_ends_after_test(
+                        && super::super::super::exprs::branch_call_result_ending_after_test(
                             self.lowering,
                             selected.nodes[node.id.index()].predicate,
                             &selected.call_root_frontiers,
                         )
+                        .is_some()
                 },
             )],
         ));
@@ -162,6 +167,73 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             self.mark_block_emitted(region, block, "plan emits one value block more than once")?;
         }
         Ok(stmts)
+    }
+
+    fn absorb_value_entry_call(
+        &self,
+        selected: &crate::structure::ValueDecisionPlan,
+        prefix: &mut PlannedBlock,
+        decision: &mut crate::hir::common::HirDecisionExpr,
+    ) {
+        let node = &mut decision.nodes[decision.entry.index()];
+        let HirExpr::TempRef(temp) = node.test else {
+            return;
+        };
+        let predicate = selected.nodes[selected.entry.index()].predicate;
+        if node.test_source != crate::hir::HirDecisionTestSource::Value {
+            return;
+        }
+        let Some(def) = super::super::super::exprs::branch_call_result_ending_after_test(
+            self.lowering,
+            predicate,
+            &selected.call_root_frontiers,
+        ) else {
+            return;
+        };
+        let reg = self.lowering.dataflow.def_reg(def);
+        let source = self.lowering.dataflow.def_instr(def);
+        let LowInstr::Call(call) = &self.lowering.proto.instrs[source.index()] else {
+            return;
+        };
+        if call.results
+            != crate::transformer::ResultPack::Fixed(crate::transformer::RegRange {
+                start: reg,
+                len: 1,
+            })
+            || self.lowering.bindings.fixed_temps[def.index()] != temp
+            || !self.lowering.dataflow.def_phi_uses[def.index()].is_empty()
+            || self.lowering.dataflow.reg_is_reference_captured(reg)
+            || self.lowering.bindings.temp_debug_locals[temp.index()].is_some()
+            || self
+                .lowering
+                .bindings
+                .captured_temp_targets
+                .contains_key(&temp)
+            || self.lowering.bindings.temp_decl_locals.contains_key(&temp)
+        {
+            return;
+        }
+        let Some((target, HirExpr::Call(value))) =
+            prefix.last().and_then(HirStmt::scalar_temp_assignment)
+        else {
+            return;
+        };
+        if target != temp
+            || value
+                .source_site
+                .is_none_or(|site| site.proto != self.lowering.id || site.instr != source)
+        {
+            return;
+        }
+        // 最后一条唯一 CALL 移到随后的入口测试；没有跨过任何参数准备或其它求值。
+        let Some(HirStmt::Assign(mut assign)) = prefix.pop_trailing_without_scope_boundary() else {
+            return;
+        };
+        node.test = assign
+            .values
+            .fixed
+            .pop()
+            .expect("scalar CALL assignment has its fixed result");
     }
 
     pub(super) fn verify_condition_region(

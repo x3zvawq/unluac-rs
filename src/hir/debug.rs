@@ -119,6 +119,9 @@ pub(crate) fn dump_hir_module(
                 .map_or_else(|| "-".to_owned(), |local| format!("l{}", local.index())),
         );
         write_debug_bindings(&mut output, proto);
+        if let Some(local) = proto.lexical_environment_local {
+            let _ = writeln!(output, "  lexical-environment=l{}", local.index());
+        }
         write_exit_requirements(&mut output, proto);
         let _ = writeln!(output, "  body");
         write_block(&mut output, "    ", &proto.body);

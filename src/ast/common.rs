@@ -464,6 +464,14 @@ impl AstRewriteAuthority {
         !self.must_preserve()
     }
 
+    /// 直接函数初始化只改变声明语法，保留同一 binding、原分配槽和初始化事件。
+    /// 函数体的显式 capture 身份仍由 AST build/命名维护，不许可吸收转发壳或删声明。
+    pub fn may_use_local_function_syntax(&self) -> bool {
+        self.may_move_scope_start()
+            || matches!(self, Self::Hir(HirInlineDisposition::Preserve(reasons))
+                if reasons.iter().all(|reason| *reason == crate::hir::HirInlineRetentionReason::PhysicalFramePrefix))
+    }
+
     /// 无求值事件的空声明或基本字面量声明相邻合并，保持每个槽的原写与完整前缀。
     /// 调用方核对 RHS 类别，其它 HIR 保留理由及 debug/属性限制仍独立检查。
     pub fn may_merge_adjacent_inert_declarations(&self) -> bool {

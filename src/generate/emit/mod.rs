@@ -5,12 +5,13 @@
 //! 布局意图，以及基于稳定 metadata 的可选注释输出。
 
 mod expr;
+mod luau_inlining;
 mod names;
 mod stmt;
 mod syntax;
 
 use crate::ast::{AstBlock, AstFeature, AstModule, AstTargetDialect, collect_ast_features};
-use crate::decompile::{DecompileContext, DecompileError, DecompileState};
+use crate::decompile::{DecompileContext, DecompileDialect, DecompileError, DecompileState};
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
 use names::NameResolver;
@@ -61,6 +62,13 @@ pub(crate) fn generate_chunk(
     let options = &context.options.generate;
     let hir = state.require_hir()?;
     let module = state.require_readability()?;
+    let required_inlining = !hir.required_luau_inlining.is_empty();
+    let unproven_inlining = required_inlining
+        && (context.requested_target.version != DecompileDialect::Luau
+            || !luau_inlining::validate(module, &hir.required_luau_inlining));
+    if unproven_inlining && options.mode != GenerateMode::Permissive {
+        return Err(GenerateError::UnprovenLuauInlining.into());
+    }
     let names = state.require_naming()?;
     let metadata = if options.comment {
         Some(GenerateCommentMetadata::from_hir(
@@ -75,7 +83,7 @@ pub(crate) fn generate_chunk(
         .into_iter()
         .filter(|feature| !context.requested_target.supports_feature(*feature))
         .collect::<Vec<_>>();
-    let diagnostic = has_errors || !unsupported.is_empty();
+    let diagnostic = has_errors || !unsupported.is_empty() || unproven_inlining;
     let generated = {
         let emitter = Emitter {
             names: NameResolver::new(names),
@@ -84,14 +92,23 @@ pub(crate) fn generate_chunk(
             options,
         };
         let mut doc = emitter.emit_module(module)?;
+        if required_inlining && !unproven_inlining {
+            doc = Doc::concat([Doc::text("--!optimize 2"), Doc::line(), doc]);
+        }
         if diagnostic {
             let features = format_ast_features(&unsupported);
-            let reason = match (unsupported.is_empty(), has_errors) {
+            let mut reason = match (unsupported.is_empty(), has_errors) {
                 (false, true) => format!("unsupported {features} and recovery errors"),
                 (false, false) => format!("unsupported {features}"),
                 (true, true) => "recovery errors".to_owned(),
-                (true, false) => unreachable!("diagnostic output must have a reason"),
+                (true, false) => String::new(),
             };
+            if unproven_inlining {
+                if !reason.is_empty() {
+                    reason.push_str(" and ");
+                }
+                reason.push_str("unproven Luau inline compiler contract");
+            }
             doc = Doc::concat([
                 Doc::text(format!(
                     "-- [unluac error] diagnostic pseudocode: {reason}; output may not recompile or preserve behavior"

@@ -86,9 +86,9 @@ fn try_lower_local_function_decl(local_decl: &AstLocalDecl) -> Option<AstStmt> {
         // 候选拒绝[TargetConstraint]：Lua 的 `local function` 语法没有 `<const>`/`<close>` 属性槽，不能丢弃原声明属性。
         return None;
     }
-    if !binding.rewrite_authority.may_move_scope_start() {
-        // 候选拒绝[LayerBoundary]：`local f = function` 与 `local function f` 的 binding
-        // 可见起点不同；HIR 已保留的身份不能由 AST 改写。
+    if !binding.rewrite_authority.may_use_local_function_syntax() {
+        // 候选拒绝[LayerBoundary]：除只要求原槽前缀的身份外，其它 HIR 起点保留不能
+        // 由声明糖改写；这里保留 binding/capture 身份和同点 CLOSURE 初始化。
         return None;
     }
     let name = binding.id;

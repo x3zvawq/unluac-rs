@@ -1,7 +1,7 @@
 //! 这个文件承载所有 dump 层共享的「聚焦 proto + 限深展开」模型。
 //!
 //! 为什么要有这个文件：
-//! - `tests/unit-case/*.lua` 与 `tests/regress-case/*.lua` 里一个根 proto 常嵌十几个子 case proto，
+//! - `tests/case_*/*.lua` 里一个根 proto 常嵌十几个子 case proto，
 //!   旧的 `DebugFilters::proto` 只能做「全量」或「只看那个 proto」两档，
 //!   导致默认 dump 爆炸、传 `--proto` 又看不到子 proto 存在性。
 //! - 我们需要一个跨所有 dump 层统一的「聚焦」模型：给定焦点 proto 和

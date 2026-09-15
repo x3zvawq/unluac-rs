@@ -16,6 +16,8 @@
 //!   例如嵌套循环的 body 覆盖由已校验的 containment 给出，不再展开 region tree。
 //! - 原显式 nil 声明的未捕获 debug scope 在原指令位置绑定，内层写和外层读共用身份；
 //!   例如 `local result; do result = closure end; return result` 不交给 AST 另造前向声明。
+//! - 未捕获、无 debug 的参数同样拥有入口槽；可信 epoch 0 的后续写仍写回 ParamId，
+//!   避免 `p=q; return p` 另建 local 后让旧 p 成为额外的 GC 根。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -37,6 +39,44 @@ use super::helpers::decode_raw_string;
 use super::lower::{BoundSlotTarget, ProtoBindings};
 use crate::hir::promotion::{HomeSlotKey, SlotEpochFacts};
 
+pub(super) fn bind_parameter_slots(
+    bindings: &mut ProtoBindings,
+    facts: &crate::hir::promotion::ProtoPromotionFacts,
+    dataflow: &DataflowFacts,
+    emission: &HirEmissionFacts<'_>,
+) {
+    let mut hoisted_temps = BTreeSet::new();
+    for def in &dataflow.defs {
+        if emission.prefix_is_hoisted(def.block) {
+            hoisted_temps.insert(bindings.fixed_temps[def.id.index()]);
+        }
+    }
+    for index in 0..bindings.temp_count {
+        let temp = TempId(index);
+        let Some(home) = facts.trusted_temp_home_slot(temp) else {
+            continue;
+        };
+        let Some(&param) = bindings.params.get(home.slot()) else {
+            continue;
+        };
+        if facts.trusted_param_home_slot(param) != Some(home)
+            || bindings.home_free_temps.contains(&temp)
+            || bindings.temp_debug_scopes[index].is_some()
+            || bindings.captured_temp_targets.contains_key(&temp)
+            || hoisted_temps.contains(&temp)
+        {
+            continue;
+        }
+        // 完整合流的 home 必须仍为入口参数槽；跨槽、CLOSE 后的新 epoch 与
+        // 合成 staging 不具备此身份。旧值 COPY 仍保留它自己的目标槽和 SSA 定义。
+        bindings
+            .bound_temp_targets
+            .entry(temp)
+            .or_insert(BoundSlotTarget::Param(param));
+    }
+}
+
+mod call_results;
 mod captured_slots;
 mod captured_temps;
 mod closed_outputs;
@@ -47,9 +87,13 @@ mod lexical_windows;
 mod loop_bindings;
 mod reused_frames;
 
+pub(super) use call_results::bind_discarded_call_results;
 use captured_slots::*;
 use captured_temps::*;
-pub(super) use copy_roots::{bind_copy_root_holders, bind_copy_root_scopes};
+pub(super) use copy_roots::{
+    bind_allocation_copy_scopes, bind_copy_root_holders, bind_copy_root_initializers,
+    bind_copy_root_scopes,
+};
 use debug_entries::*;
 use debug_names::*;
 use loop_bindings::*;

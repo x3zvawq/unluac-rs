@@ -143,12 +143,19 @@ fn atom(expr: &HirExpr, state: &RootState) -> Option<KnownValue> {
             };
             fields.values.get(&object)?.get(&key)?.clone()
         }
-        HirExpr::Unary(unary)
-            if unary.op == HirUnaryOpKind::Length
-                && matches!(known_value(&unary.expr, state), Some(KnownValue::Table(object))
-                if !state.escaped.contains(&object)) =>
-        {
-            KnownValue::Scalar(LuaValueFacts::NUMERIC)
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Length => {
+            let operand = known_value(&unary.expr, state)?;
+            let facts = if matches!(operand, KnownValue::Table(object)
+                if !state.escaped.contains(&object))
+            {
+                LuaValueFacts::NUMERIC
+            } else {
+                operand.facts().string_length()
+            };
+            if !facts.is_gc_inert() {
+                return None;
+            }
+            KnownValue::Scalar(facts)
         }
         _ => return None,
     })
@@ -156,10 +163,23 @@ fn atom(expr: &HirExpr, state: &RootState) -> Option<KnownValue> {
 
 pub(super) fn known_value(expr: &HirExpr, state: &RootState) -> Option<KnownValue> {
     state.fields.as_ref()?;
+    if is_field_projection(expr) {
+        return atom(expr, state);
+    }
     atom(expr, state).or_else(|| {
-        let facts = value_facts_with(expr, &|expr| atom(expr, state).map(|value| value.facts()));
+        let facts = value_facts_with(expr, &|expr| {
+            atom(expr, state)
+                .map(|value| value.facts())
+                // 字段/长度投影已经查询过子表达式；未知是结果，不能触发第二次递归。
+                .or_else(|| is_field_projection(expr).then_some(LuaValueFacts::UNKNOWN))
+        });
         facts.is_gc_inert().then_some(KnownValue::Scalar(facts))
     })
+}
+
+fn is_field_projection(expr: &HirExpr) -> bool {
+    matches!(expr, HirExpr::TableAccess(_))
+        || matches!(expr, HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Length)
 }
 
 pub(super) fn operator_is_plain(expr: &HirExpr, state: &RootState) -> bool {

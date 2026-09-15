@@ -304,12 +304,13 @@ fn specialize_condition(
     // 固定点可能反复访问没有可替换绑定的条件；借用原树做查询，只构造发生变化的路径。
     let mut replacement = match expr {
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
-            specialize_condition(&unary.expr, facts, stable)
-                .map(|expr| HirExpr::Unary(Box::new(HirUnaryExpr {
+            specialize_condition(&unary.expr, facts, stable).map(|expr| {
+                HirExpr::Unary(Box::new(HirUnaryExpr {
                     source_site: unary.source_site,
                     op: unary.op,
                     expr,
-                })))
+                }))
+            })
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             let lhs = specialize_condition(&logical.lhs, facts, stable);

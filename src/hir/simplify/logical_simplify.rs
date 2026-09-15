@@ -10,10 +10,12 @@
 //!
 //! 例子：
 //! - `x and x` 只会在 `x` 可稳定重复求值时折成 `x`
+//! - `not x and x` 对同一稳定 binding 统一为 `x and false`，保留 falsy 路径的 nil
 //! - `(a and b) or (a and c)` 只会在整段表达式均可稳定重复求值时整理
 //! - `not a and x or y` 在 `x/y` 恒真时整理成 `a and y or x`
 //! - 条件中的 `not (a or b)` 会在一次遍历中下推成 `not a and not b`
 //! - 值语境的连续 NOT 按共享布尔结果事实归一；未知值的偶数链仍保留两层布尔转换
+//! - `(x and true) or false` 统一为 `not not x`，两个标量分支无事件且 x 仍只求值一次
 //!   整条链只查询一次底层操作数并移交原节点，不为每对 NOT 复制或重算同一子树
 //! - `x or x` 会折成 `x`
 //! - 它不会把一般 `if/branch` 结构强行改写成逻辑表达式，那仍然属于更前面的结构恢复职责
@@ -21,7 +23,9 @@
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::decompile::DecompileDialect;
-use crate::hir::common::{HirBinaryOpKind, HirExpr, HirLogicalExpr, HirProto, HirUnaryOpKind};
+use crate::hir::common::{
+    HirBinaryOpKind, HirBinding, HirExpr, HirLogicalExpr, HirProto, HirUnaryExpr, HirUnaryOpKind,
+};
 use crate::hir::expr_safety::{HirExprSafety, luau_literal_addition_value};
 
 /// 对单个 proto 递归执行安全的逻辑表达式整理。
@@ -48,7 +52,13 @@ impl LogicalExprPass {
 
 impl HirRewritePass for LogicalExprPass {
     fn rewrite_expr_before_children(&mut self, expr: &mut HirExpr) -> bool {
-        simplify_value_not_chain(expr)
+        if simplify_boolean_coercion(expr) {
+            // 先让 walker 消费嵌套转换；下一轮统一压缩 NOT 链，避免每个外层
+            // coercion 都重新查询尚未归一的完整 operand 值域。
+            true
+        } else {
+            simplify_value_not_chain(expr)
+        }
     }
 
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
@@ -108,6 +118,35 @@ impl HirRewritePass for LogicalExprPass {
     }
 }
 
+/// 两个分支都返回确切 Boolean 时，统一保留一次求值及布尔转换。
+/// 这不适用于 `x and true` 或 `x or false`，它们仍可能返回 nil/原值。
+/// 原子移动 operand，嵌套转换不反复复制增长的子树。
+fn simplify_boolean_coercion(expr: &mut HirExpr) -> bool {
+    if !matches!(expr, HirExpr::LogicalOr(or)
+        if matches!(or.rhs, HirExpr::Boolean(false))
+            && matches!(&or.lhs, HirExpr::LogicalAnd(and)
+                if matches!(and.rhs, HirExpr::Boolean(true))))
+    {
+        return false;
+    }
+    let HirExpr::LogicalOr(or) = std::mem::replace(expr, HirExpr::Nil) else {
+        unreachable!("boolean coercion retains its outer or");
+    };
+    let HirExpr::LogicalAnd(and) = or.lhs else {
+        unreachable!("boolean coercion retains its inner and");
+    };
+    let mut value = and.lhs;
+    for _ in 0..2 {
+        value = HirExpr::Unary(Box::new(HirUnaryExpr {
+            op: HirUnaryOpKind::Not,
+            expr: value,
+            source_site: None,
+        }));
+    }
+    *expr = value;
+    true
+}
+
 fn simplify_value_not_chain(expr: &mut HirExpr) -> bool {
     let mut operand = &*expr;
     let mut depth = 0;
@@ -149,6 +188,20 @@ pub(super) fn simplify_logical_shape_with_safety(
 }
 
 fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
+    if let HirExpr::Unary(unary) = lhs
+        && unary.op == HirUnaryOpKind::Not
+        && let Some(binding) = HirBinding::from_expr(rhs)
+        && HirBinding::from_expr(&unary.expr) == Some(binding)
+        && safety.is_repeatable_in_single_value_context(rhs)
+    {
+        // binding 身份比较为 O(1)，不为复合子树引入重复相等性扫描。
+        // falsy 路径必须返回原 nil/false；不能把整个表达式折为 false。
+        return Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            lhs: binding.expr(),
+            rhs: HirExpr::Boolean(false),
+        })));
+    }
+
     // 候选拒绝[SemanticBarrier:EvalCount]：`f() and f()` 折成 `f()` 会在首个结果 truthy 时少调用一次。
     if lhs == rhs && safety.is_repeatable_in_single_value_context(lhs) {
         return Some(lhs.clone());

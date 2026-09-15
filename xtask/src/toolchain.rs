@@ -557,12 +557,29 @@ fn build_luau(root: &Path, toolchain: &Toolchain) -> Result<()> {
     );
     run_windows_command(&command, root)?;
 
+    // 上游 CLI 来自 add_subdirectory(luau)，只有本项目 runner 位于 CMake 根目录。
+    // 先核对实际产物，再替换已安装工具链，避免路径错误先删掉可用 runtime。
+    let outputs = LUAU_TARGETS
+        .iter()
+        .map(|target| {
+            let directory = if *target == "luau-bytecode-runner" {
+                temporary.clone()
+            } else {
+                temporary.join("luau")
+            };
+            (*target, directory.join(format!("{target}.exe")))
+        })
+        .collect::<Vec<_>>();
+    for (_, output) in &outputs {
+        anyhow::ensure!(
+            output.is_file(),
+            "missing Luau build output: {}",
+            output.display()
+        );
+    }
     reset_build_dir(&build)?;
-    for target in LUAU_TARGETS {
-        copy_executable(
-            &temporary.join(format!("{target}.exe")),
-            &build.join(executable_name(target)),
-        )?;
+    for (target, output) in outputs {
+        copy_executable(&output, &build.join(executable_name(target)))?;
     }
     remove_dir_if_exists(&temporary)?;
 

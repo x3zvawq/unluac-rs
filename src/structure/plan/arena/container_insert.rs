@@ -281,13 +281,32 @@ pub(super) fn try_insert_candidate(
         return Ok(InsertDisposition::Rejected(candidate));
     };
     let kind = candidate.kind;
+    if candidate.equal_loop_parent.is_some() != candidate.equal_loop_retry_edge.is_some() {
+        return Err(StructureError::invalid(
+            "equal-domain loop relation is missing its retry edge or parent",
+        ));
+    }
+    let mut matching_equal_loop_parent = false;
     if let Some(parent_index) = parent {
         let parent_spec = &specs[parent_index];
+        matching_equal_loop_parent = matches!(
+            (
+                parent_spec.kind,
+                kind,
+                candidate.equal_loop_parent,
+            ),
+            (
+                ContainerKind::Loop(parent),
+                ContainerKind::Loop(_),
+                Some(expected),
+            ) if parent == expected
+        ) && parent_spec.block_count == candidate.block_count
+            && parent_spec.ranges == candidate.ranges;
         if parent_spec.block_count == candidate.block_count {
             let duplicate_allowed = matches!(
                 (parent_spec.kind, kind),
                 (ContainerKind::Loop(_), ContainerKind::Branch(_))
-            );
+            ) || matching_equal_loop_parent;
             let value_decision_exact = matches!(kind, ContainerKind::ValueDecision(_));
             if !duplicate_allowed || value_decision_exact {
                 return Ok(InsertDisposition::Rejected(candidate));
@@ -297,6 +316,9 @@ pub(super) fn try_insert_candidate(
         {
             return Ok(InsertDisposition::Rejected(candidate));
         }
+    }
+    if candidate.equal_loop_parent.is_some() && !matching_equal_loop_parent {
+        return Ok(InsertDisposition::Rejected(candidate));
     }
     let index = specs.len();
     owners.assign(&candidate.ranges, index)?;
@@ -885,33 +907,48 @@ pub(super) fn attachment_for_container(
                 normal_tail,
                 ..
             },
-        ) => match if child.blocks.is_empty() {
-            Some(loop_part(&partitions[id.index()], child.representative)?)
-        } else {
-            loop_part_for_blocks(&partitions[id.index()], &child.blocks)?
-        } {
-            Some(LoopPart::Preheader) => preheader.ok_or_else(|| {
-                StructureError::invalid("loop child requires a missing preheader region")
-            }),
-            Some(LoopPart::Control) => Ok(control),
-            Some(LoopPart::Body) => Ok(body),
-            Some(LoopPart::NormalTail) => normal_tail.ok_or_else(|| {
-                StructureError::invalid("loop child requires a missing normal-tail region")
-            }),
-            None => Err(StructureError::invalid(format!(
-                "child {:?} ranges {:?} cross loop #{} partitions: preheader={:?} control={:?} body={:?} normal_tail={:?}",
-                child.kind,
-                child.ranges,
-                id.index(),
-                partitions[id.index()].preheader,
-                partitions[id.index()].control,
-                partitions[id.index()].body,
-                partitions[id.index()]
-                    .normal_tail
-                    .as_ref()
-                    .map(|tail| &tail.blocks),
-            ))),
-        },
+        ) => {
+            if child.equal_loop_parent == Some(id) {
+                if !matches!(child.kind, ContainerKind::Loop(_))
+                    || child.block_count != specs[parent].block_count
+                    || child.ranges != specs[parent].ranges
+                    || loop_part_for_blocks(&partitions[id.index()], &child.blocks)?
+                        != Some(LoopPart::Body)
+                {
+                    return Err(StructureError::invalid(
+                        "equal-domain loop child does not match its proven retry parent",
+                    ));
+                }
+                return Ok(body);
+            }
+            match if child.blocks.is_empty() {
+                Some(loop_part(&partitions[id.index()], child.representative)?)
+            } else {
+                loop_part_for_blocks(&partitions[id.index()], &child.blocks)?
+            } {
+                Some(LoopPart::Preheader) => preheader.ok_or_else(|| {
+                    StructureError::invalid("loop child requires a missing preheader region")
+                }),
+                Some(LoopPart::Control) => Ok(control),
+                Some(LoopPart::Body) => Ok(body),
+                Some(LoopPart::NormalTail) => normal_tail.ok_or_else(|| {
+                    StructureError::invalid("loop child requires a missing normal-tail region")
+                }),
+                None => Err(StructureError::invalid(format!(
+                    "child {:?} ranges {:?} cross loop #{} partitions: preheader={:?} control={:?} body={:?} normal_tail={:?}",
+                    child.kind,
+                    child.ranges,
+                    id.index(),
+                    partitions[id.index()].preheader,
+                    partitions[id.index()].control,
+                    partitions[id.index()].body,
+                    partitions[id.index()]
+                        .normal_tail
+                        .as_ref()
+                        .map(|tail| &tail.blocks),
+                ))),
+            }
+        }
         (
             ContainerKind::Island(_) | ContainerKind::Residual(_),
             ContainerSlots::Island { region },

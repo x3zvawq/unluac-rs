@@ -64,6 +64,12 @@ pub(super) fn choose_local_candidate(
     options: NamingOptions,
 ) -> CandidateHint {
     let index = local.index();
+    if proto.lexical_environment_local == Some(local) {
+        return CandidateHint {
+            text: "_ENV".to_owned(),
+            source: NameSource::LexicalEnvironment,
+        };
+    }
     if proto.signature.legacy_arg_slot && proto.vararg_param_local == Some(local) {
         return CandidateHint {
             text: "arg".to_owned(),

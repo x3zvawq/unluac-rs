@@ -140,9 +140,7 @@ fn exits_inner_natural_loop(
     ) else {
         return false;
     };
-    owner != inner
-        && forest.is_ancestor_or_self(owner, inner)
-        && !forest.contains(inner, edge.to)
+    owner != inner && forest.is_ancestor_or_self(owner, inner) && !forest.contains(inner, edge.to)
 }
 
 pub(super) fn numeric_continue_target_carries_body_tail(

@@ -5,7 +5,8 @@
 //! 例如 TDUP {nil, nil, true} 不能变成空表后的一条 [3] 写入。
 //! 同次降低同时发布原 hash 键身份；后续构造区域融合后，不能从 fields 猜哪些键属于模板。
 //! 分配保留原 source site，跨字段重建仍能查询该时点的 home 和开放引用状态。
-//! 键成员索引在此建立并共享，字段保持原顺序；后层逐字段查询不再线性扫描整个模板。
+//! 键成员索引在此建立并共享；JIT 原子模板的 hash 按稳定 key 身份发布，数组保持原顺序。
+//! hash dump 次序受 VM 随机散列影响，不是字段求值顺序；后续运行时写入仍保持事件顺序。
 //! 模板数组槽数包含索引 0，不能把只有零索引的模板和没有数组的模板合并为同一个容量。
 //! Luau 的动态模板项以数值 0 预置；这里保留初值和原键，后续真实写入由构造区域消费。
 
@@ -75,18 +76,35 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
                     table.fields.push(HirTableField::Array(value));
                 }
             }
+            let mut hash_fields: Vec<_> = template
+                .hash
+                .iter()
+                .map(|(key, value)| {
+                    let key = expr_for_const(proto, *key);
+                    let identity = key
+                        .table_key()
+                        .expect("template hash key is a primitive constant");
+                    (identity, key, expr_for_const(proto, *value))
+                })
+                .collect();
+            // TDUP 的常量 hash 项属于同一次分配，没有彼此间的求值事件。
+            // 只在首次生成字段序列时消除随机 dump 次序，不能排序后续融合的真实写入。
+            hash_fields.sort_by(|left, right| left.0.cmp(&right.0));
             let mut hash_keys = std::collections::BTreeSet::new();
-            for (key, value) in &template.hash {
-                let key = expr_for_const(proto, *key);
-                hash_keys.insert(
-                    key.table_key()
-                        .expect("template hash key is a primitive constant"),
-                );
+            for (identity, key, value) in hash_fields {
+                let implicit_nil = matches!(&value, HirExpr::Nil);
+                hash_keys.insert(identity);
+                let field_index = table.fields.len();
                 table.fields.push(HirTableField::Record(HirRecordField {
                     write_sources: crate::hir::common::HirOperationSources::Unknown,
                     key,
-                    value: expr_for_const(proto, *value),
+                    value,
                 }));
+                if implicit_nil {
+                    // TDUP hash 中的 nil marker 携带原模板 key；lowering 不从相邻指令
+                    // 猜它是否会被覆盖，只有完整 constructor 事务看到同键后写时才消费。
+                    table.implicit_template_fields.insert(field_index);
+                }
             }
             HirTableAllocation::Template {
                 array_slots: u32::try_from(template.array.len())

@@ -284,6 +284,13 @@ impl<'a> RootEventBlock<'a> {
             .is_some_and(|events| self.contains(&events.reads, ordinal))
     }
 
+    /// 首次初始化后的逻辑需求；直接查询共享读索引，不把后续纯写视作活读。
+    pub(in crate::hir::simplify) fn has_read_from(self, temp: TempId, ordinal: usize) -> bool {
+        self.temp(temp)
+            .and_then(|events| self.next(&events.reads, ordinal))
+            .is_some()
+    }
+
     pub(in crate::hir::simplify) fn reads_any(
         self,
         ordinal: usize,

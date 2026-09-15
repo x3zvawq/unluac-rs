@@ -384,6 +384,7 @@ pub(crate) fn finish_lowered_proto(
         line_range: raw.common.line_range,
         signature: raw.common.signature,
         frame: raw.common.frame,
+        clears_entry_scratch: matches!(raw.extra, crate::parser::DialectProtoExtra::Lua51(_)),
         constants: raw.common.constants.common.literals.clone(),
         upvalue_count: raw.common.upvalues.common.count,
         environment_upvalues,

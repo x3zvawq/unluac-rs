@@ -1,4 +1,4 @@
-//! 最终 CFG edge 的语义分类。输入 loop query、forward routes、syntax arms 与 residual evidence，为每条 edge 选择唯一 owner/transfer；不负责 phi copy。例如 VM-for exit 与祖先 single-pass break 共边时仍由内层 for owner 发射外层 transfer。
+//! 最终 CFG edge 的语义分类。输入 loop query、forward routes、syntax arms 与 residual evidence，为每条 edge 选择唯一 owner/transfer；不负责 phi copy。例如 VM-for exit 与祖先 single-pass break 共边时仍由内层 for owner发射外层 transfer；从 VM-for body 回到外层 retry header 的 residual edge 则保留显式 goto，不能降成祖先的隐式 loopback。
 
 use super::*;
 
@@ -71,6 +71,7 @@ impl EdgeSemantics {
             continues: vec![None; cfg.edges.len()],
             syntax_arms: vec![None; cfg.edges.len()],
             forced_gotos: vec![None; cfg.edges.len()],
+            equal_loop_retry_gotos: vec![None; cfg.edges.len()],
             branch_by_header: vec![None; cfg.blocks.len()],
             loops,
             forward_routes: ForwardRouteBuilder::new(cfg.edges.len(), arena.regions.len()),
@@ -569,6 +570,67 @@ impl EdgeSemantics {
         Ok(semantics)
     }
 
+    pub(super) fn install_equal_loop_retry_gotos(
+        &mut self,
+        cfg: &Cfg,
+        arena: &RegionArena,
+        input: &FinalPlanInput,
+        residual_reason_by_edge: &[Option<crate::structure::GotoReason>],
+    ) -> Result<(), StructureError> {
+        for (index, spec) in arena.specs.iter().enumerate() {
+            let (Some(parent), Some(retry_edge)) =
+                (spec.equal_loop_parent, spec.equal_loop_retry_edge)
+            else {
+                continue;
+            };
+            let ContainerKind::Loop(_) = spec.kind else {
+                return Err(StructureError::invalid(
+                    "equal-domain relation points to a non-loop child",
+                ));
+            };
+            let edge = cfg.edges.get(retry_edge.index()).ok_or_else(|| {
+                StructureError::invalid("equal-domain retry edge is outside the CFG arena")
+            })?;
+            let child_region = arena.slots[index].region();
+            let parent_region = *arena
+                .loop_region_by_plan
+                .get(parent.index())
+                .ok_or_else(|| StructureError::invalid("equal-domain retry parent is missing"))?;
+            let parent_loop = input
+                .loops
+                .get(parent.index())
+                .ok_or_else(|| StructureError::invalid("equal-domain retry loop is missing"))?;
+            if !arena.navigation.contains(parent_region, child_region)
+                || parent_region == child_region
+                || edge.to != parent_loop.candidate.header
+                || !parent_loop.candidate.backedges.contains(&retry_edge)
+                || self.loops.innermost(edge.from) != Some(child_region)
+                || residual_reason_by_edge
+                    .get(retry_edge.index())
+                    .copied()
+                    .flatten()
+                    != Some(crate::structure::GotoReason::CrossLoopContinueLike)
+            {
+                return Err(StructureError::invalid(
+                    "equal-domain retry edge lost its admitted loop relation",
+                ));
+            }
+            let slot = self
+                .equal_loop_retry_gotos
+                .get_mut(retry_edge.index())
+                .ok_or_else(|| StructureError::invalid("equal-domain retry edge is missing"))?;
+            if slot
+                .replace(crate::structure::GotoReason::CrossLoopContinueLike)
+                .is_some()
+            {
+                return Err(StructureError::invalid(
+                    "one retry edge belongs to multiple equal-domain loop relations",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn classify(
         &self,
         cfg: &Cfg,
@@ -645,6 +707,14 @@ impl EdgeSemantics {
             // 显式 continue 可以同时是物理 backedge；语义 transfer 必须先于
             // natural-loop latch 分类，否则 HIR 会把条件 arm 静默吞成隐式回边。
             return (region, EdgeTransfer::Continue(region));
+        }
+        if let Some(reason) = self.equal_loop_retry_gotos[edge_ref.index()] {
+            // admission 已把该 residual edge 绑定到唯一的等域 retry/VM-for 关系；
+            // 它不能再降成祖先的隐式 LoopBack，否则条件重启会被吞掉。
+            return (
+                default_owner,
+                EdgeTransfer::Goto(LabelPlanId(edge.to.index()), reason),
+            );
         }
         if let Some(region) = self.backedges[edge_ref.index()] {
             let source_loop = self.loops.innermost(edge.from);

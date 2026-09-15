@@ -222,6 +222,7 @@ pub(super) fn lower_regular_instr(
                 method_key: None,
                 callee_root_handoff: None,
                 method_rewrite_transaction: None,
+                plain_method_syntax: false,
             };
             if type_guard.kind.normalizes_subject() {
                 fixed_assign(lowering, instr_ref, vec![HirExpr::Call(Box::new(call))])
@@ -334,17 +335,29 @@ pub(super) fn lower_regular_instr(
         .promotion_facts
         .copy_root_before_releases(instr_ref);
     if !roots.is_empty() {
-        stmts.insert(
-            0,
-            assign_stmt(
-                roots
-                    .iter()
-                    .copied()
-                    .map(|temp| lowering.bindings.lvalue_for_temp(temp))
-                    .collect(),
-                vec![HirExpr::Nil; roots.len()],
-            ),
-        );
+        let declared_nil_locals = if matches!(instr, LowInstr::LoadNil(_)) {
+            lowering.dataflow.instr_defs[instr_ref.index()]
+                .iter()
+                .filter_map(|def| {
+                    lowering
+                        .bindings
+                        .temp_decl_locals
+                        .get(&lowering.bindings.fixed_temps[def.index()])
+                        .copied()
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        } else {
+            Default::default()
+        };
+        let roots = roots.iter().copied()
+            .map(|temp| lowering.bindings.lvalue_for_temp(temp))
+            // 原 nil 声明已在同一指令清空这个槽；不能在声明前另写一次未绑定的 local。
+            .filter(|target| !matches!(target, HirLValue::Local(local) if declared_nil_locals.contains(local)))
+            .collect::<Vec<_>>();
+        if !roots.is_empty() {
+            let count = roots.len();
+            stmts.insert(0, assign_stmt(roots, vec![HirExpr::Nil; count]));
+        }
     }
     let roots = lowering.promotion_facts.copy_root_after_releases(instr_ref);
     for &temp in roots {
@@ -436,11 +449,14 @@ pub(super) fn lower_terminal_instr(
                             CallKind::Normal | CallKind::Method => None,
                         },
                         method_key,
-                        // TailCall 不会返回当前 frame，普通 method transaction 因而没有 post-call
-                        // callee root 可接管。HIR 仍保留 raw method 事实；终结表达式能否写成冒号
-                        // 语法由 AST 证明。
-                        callee_root_handoff: None,
+                        // 尾调用保留 SELF 双端身份，原 owner 不为它签发 post-call 根。
+                        callee_root_handoff: lower_call_root_handoff(
+                            lowering,
+                            instr_ref,
+                            tail_call.kind,
+                        ),
                         method_rewrite_transaction: None,
+                        plain_method_syntax: false,
                     }))),
                 ),
                 None,
@@ -465,16 +481,7 @@ fn lower_set_list(
         .structure
         .debug_bindings()
         .for_value(lowering.dataflow.use_value(instr_ref, set_list.base))
-        .filter(|scope| {
-            let pcs = &lowering.proto.lowering_map.pc_map()[instr_ref.index()];
-            !pcs.is_empty()
-                && pcs.iter().all(|pc| *pc < scope.start_pc)
-                && lowering
-                    .proto
-                    .lowering_map
-                    .low_instr_at_or_after_pc(scope.start_pc)
-                    .is_some_and(|entry| entry.index() == instr_ref.index() + 1)
-        })
+        .filter(|scope| scope.initializer_end_instr == Some(instr_ref))
         .map(|scope| scope.scope);
     vec![HirStmt::TableSetList(Box::new(HirTableSetList {
         source_site: Some(crate::hir::common::HirSourceSite {
@@ -530,6 +537,7 @@ fn generic_for_iterator_call(
         method_key: None,
         callee_root_handoff: None,
         method_rewrite_transaction: None,
+        plain_method_syntax: false,
     }))
 }
 
@@ -580,6 +588,7 @@ fn lower_call_expr(
         method_key,
         callee_root_handoff: lower_call_root_handoff(lowering, instr_ref, call.kind),
         method_rewrite_transaction: None,
+        plain_method_syntax: false,
     }
 }
 
@@ -766,8 +775,33 @@ fn fixed_assign(
             initializer_merge_transaction: None,
         }))]
     } else {
+        let declared = decl_locals
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut stmts = local_decl_stmts(decl_locals);
-        stmts.push(assign_stmt(targets, values));
+        if matches!(
+            lowering.proto.instrs[instr_ref.index()],
+            LowInstr::LoadNil(_)
+        ) {
+            if let Some(HirStmt::LocalDecl(decl)) = stmts.first_mut() {
+                decl.values = vec![HirExpr::Nil; decl.bindings.len()].into();
+            }
+            // LOADNIL 没有求值事件；新 local 声明中的 nil 已消费它自己的原槽写。
+            // 混合组里的其它目标仍逐一保留，不能为同一 local 再重复一次 nil 赋值。
+            let remaining = targets
+                .into_iter()
+                .filter(
+                    |target| !matches!(target, HirLValue::Local(local) if declared.contains(local)),
+                )
+                .collect::<Vec<_>>();
+            if !remaining.is_empty() {
+                let count = remaining.len();
+                stmts.push(assign_stmt(remaining, vec![HirExpr::Nil; count]));
+            }
+        } else {
+            stmts.push(assign_stmt(targets, values));
+        }
         stmts
     }
 }

@@ -4,6 +4,9 @@
 //! candidate、重选候选或截断控制图。入口 block 的 prefix 由结构 lowering 显式发射，
 //! 其余被折叠节点使用单次求值表达式，避免引用不会单独发射的中间 temp。入口 prefix
 //! 里的匿名稳定字面量允许直接成为 value leaf；动态值和源码 binding 仍引用已发射身份。
+//! LuaJIT 的比较可触发 cdata __eq；两条物理终端已在同一结果槽写入 true/false 时，
+//! 直接返回该次比较的 Boolean 值。例如 `not ok and value == 9` 不必先拆成 if，
+//! 也不需要把比较声明为可重复求值。这里只消费冻结的终端身份，不为合成谓词猜写槽。
 
 use super::*;
 use crate::hir::rewrite::replace_temp_in_expr;
@@ -60,16 +63,65 @@ pub(crate) fn build_value_decision_expr(
             } else {
                 lower_short_circuit_subject_single_eval(lowering, node.block, node.predicate)
             }?;
-            Some(HirDecisionNode {
+            let mut lowered = HirDecisionNode {
                 id: HirDecisionNodeRef(node.id.index()),
                 test,
                 test_source,
                 truthy: lower_value_target(lowering, decision, node.truthy.target)?,
                 falsy: lower_value_target(lowering, decision, node.falsy.target)?,
-            })
+            };
+            if materialized_boolean_comparison(lowering, decision, node, &lowered) {
+                lowered.truthy = HirDecisionTarget::CurrentValue;
+                lowered.falsy = HirDecisionTarget::CurrentValue;
+            }
+            Some(lowered)
         })
         .collect::<Option<Vec<_>>>()?;
     (!nodes.is_empty() && entry.index() < nodes.len()).then_some(HirDecisionExpr { entry, nodes })
+}
+
+/// 冻结 plan 已验证 terminal edge 到 result_phi 的物理 incoming；再核对原 LOADBOOL
+/// 与当前 test/终端，才把显式常量写译为该次比较的返回值，不留下可跨改写复用的许可。
+fn materialized_boolean_comparison(
+    lowering: &ProtoLowering<'_>,
+    decision: &ValueDecisionPlan,
+    node: &crate::structure::ValueDecisionNodePlan,
+    lowered: &HirDecisionNode,
+) -> bool {
+    let HirExpr::Binary(binary) = &lowered.test else {
+        return false;
+    };
+    if lowering.target != crate::decompile::DecompileDialect::Luajit
+        || lowered.test_source != crate::hir::HirDecisionTestSource::Predicate
+        || binary.op != crate::hir::HirBinaryOpKind::Eq
+        || binary.source_site
+            != Some(crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: node.predicate,
+            })
+        || !matches!(
+            lowered.truthy,
+            HirDecisionTarget::Expr(HirExpr::Boolean(true))
+        )
+        || !matches!(
+            lowered.falsy,
+            HirDecisionTarget::Expr(HirExpr::Boolean(false))
+        )
+    {
+        return false;
+    }
+    [(node.truthy.target, true), (node.falsy.target, false)]
+        .into_iter()
+        .all(|(target, expected)| {
+            let ValueDecisionTarget::Leaf(leaf) = target else {
+                return false;
+            };
+            let crate::structure::SsaValue::Def(def) = decision.leaves[leaf.index()].physical_value else {
+                return false;
+            };
+            matches!(lowering.proto.instrs[lowering.dataflow.def_instr(def).index()],
+                LowInstr::LoadBool(load) if load.dst == decision.result_reg && load.value == expected)
+        })
 }
 
 fn lower_value_target(

@@ -4,7 +4,8 @@
 //! 并用稳定 stmt id 索引 binding 的 use/mention 位置；不会扫描候选 region 或重建字段序列。
 //! 例如：`t[k] = v` 会在这里识别 `t` 的绑定身份，并把 `k` 作为普通语义表达式统计；
 //! 键最终能否写成 `name = value` 不属于 HIR binding facts。
-//! capture 从类型化父级身份投影到构造器的 Temp/Local 域，两种捕获模式均保留物化依赖。
+//! capture 从类型化父级身份投影到构造器的 Temp/Local 域，两种捕获模式均保留物化依赖；
+//! 只有 ByReference 扩展为 home 约束，ByValue 不把同槽其它值版本误认为被捕获的 cell。
 //! 物化次数消费共享逻辑写事件；捕获集合独立累积，不把 root release 当作物理槽覆盖。
 //! 同一遍访问区分普通值观察与直接写 base / 单值 return；仅后两类 occurrence 不会提前
 //! 暴露新表。`t.x=f(t)` 的 RHS 仍是观察，capture 和同 home 的源码身份由原索引继续保护。
@@ -533,7 +534,12 @@ impl HirVisitor<'_> for BindingCaptureCollector<'_> {
         if let Some(binding) = binding_from_identity(capture.binding) {
             *self.reference_captured.get_mut_or_default(binding) = true;
             *self.observed_before_exit.get_mut_or_default(binding) = true;
-            if let Some(slot) = binding_home_slot(binding, self.promotion_facts) {
+            // ByValue 只快照这次 binding；同槽的更早/更晚值并不因此成为 cell。
+            // 例如数组 scratch r2=NaN 后 r2=t[1] 被按值捕获，前一个 NaN 仍可
+            // 由构造器消费，否则会留下额外声明并改变全部后继调用的源码前缀。
+            if capture.mode == crate::hir::common::HirCaptureMode::ByReference
+                && let Some(slot) = binding_home_slot(binding, self.promotion_facts)
+            {
                 self.reference_captured_home_slots.insert(slot);
             }
         }

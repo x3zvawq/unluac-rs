@@ -199,18 +199,28 @@ pub(super) fn read_readability_assertions(
 
 /// `--list` 只在启动整批测试前执行一次该校验；按路径分组可避免同一源码在方言/variant
 /// 矩阵中重复读盘。普通 child runner 仍只读取自己正在执行的单个 case。
-pub(super) fn validate_readability_selectors(specs: &[UnitCaseSpec]) -> Result<(), String> {
-    let mut entries_by_path: BTreeMap<&str, Vec<&LuaCaseManifestEntry>> = BTreeMap::new();
-    for spec in specs {
-        entries_by_path
-            .entry(spec.entry.path)
-            .or_default()
-            .push(&spec.entry);
+pub(super) fn readability_summaries(
+    entries: &[LuaCaseManifestEntry],
+) -> Result<BTreeMap<&'static str, CaseReadabilitySummary>, String> {
+    let mut entries_by_path: BTreeMap<&'static str, Vec<&LuaCaseManifestEntry>> = BTreeMap::new();
+    for entry in entries {
+        entries_by_path.entry(entry.path).or_default().push(entry);
     }
 
+    let mut summaries = BTreeMap::new();
     for (path, entries) in entries_by_path {
         let assertions =
             read_readability_assertions(path).map_err(|failure| failure.detail().to_owned())?;
+        summaries.insert(
+            path,
+            CaseReadabilitySummary {
+                total: assertions.len(),
+                ast: assertions
+                    .iter()
+                    .filter(|assertion| matches!(assertion, ReadabilityAssertion::AstCount { .. }))
+                    .count(),
+            },
+        );
         for assertion in &assertions {
             let selector = assertion_selector(assertion);
             if !selector.is_configured() {
@@ -231,7 +241,7 @@ pub(super) fn validate_readability_selectors(specs: &[UnitCaseSpec]) -> Result<(
         }
     }
 
-    Ok(())
+    Ok(summaries)
 }
 
 fn split_assertion_args(
@@ -363,6 +373,10 @@ fn parse_ast_metric(
         "close-binding" => ReadabilityAstMetric::CloseBinding,
         "global-decl" => ReadabilityAstMetric::GlobalDecl,
         "named-vararg-function" => ReadabilityAstMetric::NamedVarargFunction,
+        "table-constructor" => ReadabilityAstMetric::TableConstructor,
+        "table-list-field" => ReadabilityAstMetric::TableListField,
+        "table-record-field" => ReadabilityAstMetric::TableRecordField,
+        "repeat-condition-local" => ReadabilityAstMetric::RepeatConditionLocal,
         _ => {
             return Err(readability_parse_failure(
                 source_relative,
@@ -392,14 +406,22 @@ pub(super) fn parse_long_bracket_args(mut raw: &str) -> Result<Vec<String>, &'st
         if raw.is_empty() {
             return Ok(args);
         }
-        let Some(rest) = raw.strip_prefix("[[") else {
-            return Err("arguments must use Lua long-bracket form [[...]]");
+        let Some(after_open) = raw.strip_prefix('[') else {
+            return Err("arguments must use Lua long-bracket form [[...]] or [=[...]=]");
         };
-        let Some(end) = rest.find("]]") else {
-            return Err("missing closing ]] in readability assertion argument");
+        let level = after_open.bytes().take_while(|&ch| ch == b'=').count();
+        let Some(rest) = after_open[level..].strip_prefix('[') else {
+            return Err("invalid opening delimiter in readability assertion argument");
+        };
+        // 与 Lua 的长括号定界相同，允许模式本身包含 ]] 或以 ] 结尾。
+        let closing = format!("]{}]", &after_open[..level]);
+        let Some(end) = rest.find(&closing) else {
+            return Err(
+                "missing matching long-bracket closing delimiter in readability assertion argument",
+            );
         };
         args.push(rest[..end].to_owned());
-        raw = &rest[end + 2..];
+        raw = &rest[end + closing.len()..];
     }
 }
 

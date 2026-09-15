@@ -115,12 +115,14 @@ struct PlannedLoopCondition {
 enum CopyBinding {
     Temp(TempId),
     Local(crate::hir::common::LocalId),
+    Param(crate::hir::common::ParamId),
 }
 
 fn copy_target_binding(target: &HirLValue) -> Option<CopyBinding> {
     match target {
         HirLValue::Temp(temp) => Some(CopyBinding::Temp(*temp)),
         HirLValue::Local(local) => Some(CopyBinding::Local(*local)),
+        HirLValue::Param(param) => Some(CopyBinding::Param(*param)),
         _ => None,
     }
 }
@@ -129,6 +131,7 @@ fn copy_value_binding(value: &HirExpr) -> Option<CopyBinding> {
     match value {
         HirExpr::TempRef(temp) => Some(CopyBinding::Temp(*temp)),
         HirExpr::LocalRef(local) => Some(CopyBinding::Local(*local)),
+        HirExpr::ParamRef(param) => Some(CopyBinding::Param(*param)),
         _ => None,
     }
 }

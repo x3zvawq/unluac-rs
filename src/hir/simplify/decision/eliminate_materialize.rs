@@ -79,6 +79,7 @@ pub(super) fn extract_call_expr(
         method_key,
         callee_root_handoff,
         method_rewrite_transaction,
+        plain_method_syntax,
     } = call;
     let (prefix, mut leading, args, changed) =
         extract_value_pack_with_leading(vec![callee], args, state, safety);
@@ -98,6 +99,7 @@ pub(super) fn extract_call_expr(
             method_key,
             callee_root_handoff,
             method_rewrite_transaction,
+            plain_method_syntax,
         },
         changed,
     )
@@ -778,6 +780,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         method_key: call.method_key,
         callee_root_handoff: call.callee_root_handoff,
         method_rewrite_transaction: call.method_rewrite_transaction,
+        plain_method_syntax: false,
     })
 }
 

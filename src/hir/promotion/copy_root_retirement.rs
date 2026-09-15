@@ -19,7 +19,7 @@ use super::*;
 #[derive(Clone, Debug, Default)]
 pub(super) struct CopyRootRetirements {
     pub(super) producers: BTreeSet<TempId>,
-    /// 已有原始定义且在同块覆盖的源值；需要结束写，但不需要入口 nil holder。
+    /// 已有原始定义支配退休写的值；保留结束写，但不需要入口 nil holder。
     pub(super) defined_sources: BTreeSet<TempId>,
     pub(super) releases: BTreeMap<InstrRef, Vec<TempId>>,
     pub(super) after_releases: BTreeMap<InstrRef, Vec<TempId>>,

@@ -15,6 +15,8 @@ use crate::hir::{HirModule, HirProtoRef};
 
 use super::NamingError;
 
+mod environment;
+
 /// 确保函数 proto 存在。
 fn ensure_function_exists(hir: &HirModule, function: HirProtoRef) -> Result<(), NamingError> {
     if hir.protos.get(function.index()).is_some() {
@@ -33,6 +35,7 @@ pub(super) fn validate_readability_ast(
 ) -> Result<(), NamingError> {
     let function = module.entry_function;
     ensure_function_exists(hir, function)?;
+    environment::validate(&module.body, &hir.protos[function.index()])?;
     validate_block_has_no_temps(&module.body, function, hir)
 }
 
@@ -109,6 +112,10 @@ fn validate_function_expr_has_no_temps(
     hir: &HirModule,
 ) -> Result<(), NamingError> {
     ensure_function_exists(hir, function_expr.function)?;
+    environment::validate(
+        &function_expr.body,
+        &hir.protos[function_expr.function.index()],
+    )?;
     if let Some(named_vararg) = function_expr.named_vararg {
         validate_binding_has_no_temp(named_vararg, function_expr.function)?;
     }

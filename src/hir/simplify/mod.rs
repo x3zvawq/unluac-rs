@@ -26,6 +26,7 @@ mod mention;
 mod method_protocol;
 mod method_rewrite_transactions;
 mod object_flow;
+mod plain_method_syntax;
 mod repeat_root_lifetimes;
 mod residuals;
 mod root_lifetimes;
@@ -292,6 +293,19 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         // 完整调用帧已稳定；nil 声明前缀先交词法事务，未消费项与 Boolean 预写仍按原证明清理。
         invalidates: &[TempChain, LocalBinding, BlockStructure, TablePattern],
     },
+    PassDescriptor {
+        name: "parameter-return-frames",
+        phase: PassPhase::Normal,
+        depends_on: HIR_SHAPE_INPUTS,
+        // 参数返回树不依赖模块调用摘要；完整树先收成表达式，再交 Normal 消费。
+        invalidates: &[LocalBinding, BlockStructure, LogicalExpr],
+    },
+    PassDescriptor {
+        name: "tbc-initializer-frames",
+        phase: PassPhase::Normal,
+        depends_on: HIR_SHAPE_INPUTS,
+        invalidates: &[LocalBinding, TempChain, TablePattern],
+    },
 ];
 
 /// 对已经构造完成的 HIR 做 fixed-point 收敛。
@@ -317,7 +331,7 @@ pub(super) fn simplify_hir(
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
-                let effects = matches!(index, 3 | 15 | 17).then(|| {
+                let effects = matches!(index, 3 | 15 | 16 | 17).then(|| {
                     effect_snapshot.get_or_insert_with(|| {
                         timings.record("closure-effects", || {
                             object_flow::collect_proto_effects(module, safety)
@@ -334,6 +348,16 @@ pub(super) fn simplify_hir(
                         module,
                         promotion_facts,
                         roots(),
+                    );
+                }
+                if index == 16 {
+                    return call_frames::restore_native_call_frames(
+                        module,
+                        promotion_facts,
+                        &effects
+                            .expect("native frames require module value facts")
+                            .values,
+                        dialect,
                     );
                 }
                 if index == 4 {
@@ -393,12 +417,7 @@ pub(super) fn simplify_hir(
                             dead_temps::DeadTempStage::BeforeNativeFrames,
                         ),
                         14 => dead_labels::remove_unused_labels_in_proto(proto),
-                        16 => call_frames::restore_native_call_frames(
-                            proto,
-                            facts,
-                            dialect,
-                            proto.id == chunk_entry,
-                        ),
+                        16 => unreachable!("native frames require one immutable module snapshot"),
                         17 => table_constructors::stabilize_table_constructors_in_proto(
                             proto,
                             facts,
@@ -423,6 +442,13 @@ pub(super) fn simplify_hir(
                             );
                             changed
                         }
+                        19 => call_frames::restore_parameter_return_frames(proto, facts, dialect),
+                        20 => call_frames::restore_tbc_initializer_frames(
+                            proto,
+                            facts,
+                            dialect,
+                            proto.id == chunk_entry,
+                        ),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
                 })
@@ -459,7 +485,13 @@ pub(super) fn simplify_hir(
                 );
                 method_rewrite_transactions::finalize_method_rewrite_transactions(proto, facts);
                 call_frames::restore_terminal_method_frames(proto, facts, dialect);
-                source_frames::preserve_scratch_prefixes(
+                call_frames::preserve_existing_call_prefixes(
+                    proto,
+                    facts,
+                    dialect,
+                    proto.id == module.entry,
+                );
+                source_frames::preserve_copy_prefixes(
                     proto,
                     facts,
                     dialect,
@@ -467,6 +499,24 @@ pub(super) fn simplify_hir(
                 );
             }
         }
+    });
+    timings.record("expanded-source-frames", || {
+        call_frames::restore_expanded_frames(module, promotion_facts, dialect);
+    });
+    timings.record("dead-boolean-initializers", || {
+        for proto in &mut module.protos {
+            if let Some(facts) = promotion_facts.get(proto.id.index()) {
+                dead_temps::simplify_unused_primitive_initializers(proto, facts, safety);
+            }
+        }
+    });
+    timings.record("plain-method-syntax", || {
+        if dialect != crate::decompile::DecompileDialect::Lua54 {
+            return;
+        }
+        // 最终声明/根事务已改变 HIR；在该不可变版本上重新取得值事实，不沿用旧快照。
+        let effects = object_flow::collect_proto_effects(module, safety);
+        plain_method_syntax::finalize(module, promotion_facts, &effects.values, dialect);
     });
     let residuals = residuals::finalize_hir_exit_requirements(module);
     if residuals.has_soft_residuals() && generate_mode != GenerateMode::Permissive {

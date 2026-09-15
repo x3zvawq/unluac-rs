@@ -14,13 +14,13 @@
 cargo unluac -i /path/to/chunk.out -D lua5.1
 
 # 从源码编译后再反编译
-cargo unluac -s tests/unit-case/lua51_01.lua -D lua5.1
+cargo unluac -s tests/case_bindings/environment_04_lua51_legacy_environment.lua -D lua5.1
 
 # 保留编译器生成的 debug/local 信息后再反编译
-cargo unluac -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false
+cargo unluac -s tests/case_bindings/environment_04_lua51_legacy_environment.lua -D lua5.1 --strip false
 
 # 保留编译产物中的 debug 段，但验证忽略 debug 后的纯字节码恢复路径
-cargo unluac -s tests/unit-case/lua51_01.lua -D lua5.1 --strip false --ignore-debug
+cargo unluac -s tests/case_bindings/environment_04_lua51_legacy_environment.lua -D lua5.1 --strip false --ignore-debug
 
 # 查看某一层的 dump
 cargo unluac -i /path/to/chunk.out -D lua5.4 --dump hir --detail verbose

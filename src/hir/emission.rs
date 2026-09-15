@@ -23,6 +23,7 @@ pub(super) struct HirEmissionFacts<'a> {
     plan: &'a StructurePlan,
     regions: Vec<RegionEmission>,
     for_instrs: BTreeSet<InstrRef>,
+    hoisted_prefixes: BTreeSet<BlockRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,8 +52,21 @@ impl<'a> HirEmissionFacts<'a> {
         };
         let mut regions = vec![unrestricted; plan.regions().len()];
         let mut for_instrs = BTreeSet::new();
-        for (id, _) in plan.loops() {
+        let mut hoisted_prefixes = BTreeSet::new();
+        for (id, payload) in plan.loops() {
             match plan.loop_protocol(id) {
+                Some(LoopVmProtocol::Repeat(protocol))
+                    if protocol.prefix_placement
+                        == crate::structure::LoopConditionPrefixPlacement::BeforeBody =>
+                {
+                    if let Some(header) = plan
+                        .condition(protocol.condition.condition)
+                        .and_then(crate::structure::ConditionPlan::header)
+                        && header != payload.header
+                    {
+                        hoisted_prefixes.insert(header);
+                    }
+                }
                 Some(LoopVmProtocol::NumericFor(protocol)) => {
                     for_instrs.insert(protocol.init_instr);
                     for_instrs.extend(protocol.loop_instr);
@@ -138,6 +152,7 @@ impl<'a> HirEmissionFacts<'a> {
             plan,
             regions,
             for_instrs,
+            hoisted_prefixes,
         }
     }
 
@@ -191,5 +206,11 @@ impl<'a> HirEmissionFacts<'a> {
 
     pub(super) fn for_instr(&self, instr: InstrRef) -> bool {
         self.for_instrs.contains(&instr)
+    }
+
+    /// repeat/continue 协议把惰性条件前缀移到 body 前，只承诺独立 SSA 值的求值。
+    /// 该处若改成原可写 binding，会提前覆盖 body 仍要读取的旧值。
+    pub(super) fn prefix_is_hoisted(&self, block: BlockRef) -> bool {
+        self.hoisted_prefixes.contains(&block)
     }
 }

@@ -31,6 +31,7 @@ pub(super) fn build_container_topology(
         (
             Reverse(spec.block_count),
             Reverse(container_same_size_rank(spec.kind)),
+            spec.equal_loop_parent.is_some(),
             *index,
         )
     });
@@ -43,6 +44,25 @@ pub(super) fn build_container_topology(
                 specs[index].representative
             )));
         };
+        if specs[index].equal_loop_parent.is_some() != specs[index].equal_loop_retry_edge.is_some()
+        {
+            return Err(StructureError::invalid(format!(
+                "equal-domain loop container #{index} has an incomplete relation"
+            )));
+        }
+        if let Some(expected) = specs[index].equal_loop_parent {
+            let valid = parent.is_some_and(|parent| {
+                matches!(specs[parent].kind, ContainerKind::Loop(actual) if actual == expected)
+                    && matches!(specs[index].kind, ContainerKind::Loop(_))
+                    && specs[parent].block_count == specs[index].block_count
+                    && specs[parent].ranges == specs[index].ranges
+            });
+            if !valid {
+                return Err(StructureError::invalid(format!(
+                    "equal-domain loop container #{index} lost its proven parent"
+                )));
+            }
+        }
         specs[index].parent = parent;
         owners.assign(&specs[index].ranges, index)?;
     }

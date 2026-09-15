@@ -112,7 +112,10 @@ impl<'a> FunctionNameAllocator<'a> {
     }
 
     fn allocate(&mut self, candidate: CandidateHint) -> NameInfo {
-        if candidate.source == NameSource::LegacyArg {
+        if matches!(
+            candidate.source,
+            NameSource::LegacyArg | NameSource::LexicalEnvironment
+        ) {
             self.used.insert(candidate.text.clone());
             return NameInfo {
                 text: candidate.text,
@@ -196,6 +199,18 @@ pub(super) fn assign_names_for_function(
         }
     }
 
+    // 语义角色先占名，普通参数/local 的 debug 或推测名称必须避让。
+    if proto.lexical_environment_local.is_some() {
+        if upvalue_candidates.iter().any(|candidate| {
+            candidate.source == NameSource::CaptureProvenance && candidate.text == "_ENV"
+        }) {
+            return Err(NamingError::InvalidLexicalEnvironment {
+                function: proto.id.index(),
+                reason: "local environment would shadow a captured _ENV binding",
+            });
+        }
+        names.used.insert("_ENV".to_owned());
+    }
     let params = proto
         .params
         .iter()

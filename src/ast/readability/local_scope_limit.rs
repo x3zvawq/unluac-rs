@@ -321,8 +321,8 @@ fn scope_ranges(
                 // 候选接受：当前 pass 不生成 global 访问，只把同序连续语句放入子 do；
                 // 它声明 BindingStructure/ControlFlowShape invalidation，下一 Deferred 固定点
                 // 的 global-decl-pretty 会按新 block 边界、逐名/通配属性及 nested write
-                // 补全后缀所需声明。regress438 锁定 declaration 与 global-function 可跨
-                // local-budget range，最终生成源码仍可重编译运行。
+                // 补全后缀所需声明。global 语法不单独阻断 range，但原 binding 的
+                // origin/authority 仍须允许缩短生命期，不能越过物理帧前缀证明。
                 safe_end = Some((end, scoped_locals));
                 if scoped_locals >= scope_target {
                     break;

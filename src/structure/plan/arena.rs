@@ -25,6 +25,7 @@ mod condition_routes;
 mod container_insert;
 mod container_topology;
 mod edge_semantics;
+mod equal_loop;
 mod forward_routes;
 mod layout;
 mod loop_canonicalize;
@@ -42,6 +43,7 @@ use branch_payload::*;
 use condition_routes::*;
 use container_insert::*;
 use container_topology::*;
+use equal_loop::*;
 use forward_routes::*;
 pub(super) use layout::{LayoutEdgeFact, layout_edge_facts};
 use layout::{build_requirements, freeze_labels};
@@ -72,6 +74,9 @@ struct ContainerSpec {
     ranges: Vec<std::ops::Range<usize>>,
     block_count: usize,
     representative: BlockRef,
+    /// 仅用于已证明与外层 retry loop 等域的 VM-for；其它同尺寸 loop 不得借此嵌套。
+    equal_loop_parent: Option<super::LoopPlanId>,
+    equal_loop_retry_edge: Option<EdgeRef>,
     first_rank: usize,
     parent: Option<usize>,
 }
@@ -82,6 +87,8 @@ struct PendingContainer {
     ranges: Vec<std::ops::Range<usize>>,
     block_count: usize,
     representative: BlockRef,
+    equal_loop_parent: Option<super::LoopPlanId>,
+    equal_loop_retry_edge: Option<EdgeRef>,
 }
 
 impl PendingContainer {
@@ -129,7 +136,15 @@ impl PendingContainer {
             ranges,
             block_count,
             representative: first,
+            equal_loop_parent: None,
+            equal_loop_retry_edge: None,
         })
+    }
+
+    fn with_equal_loop_parent(mut self, parent: super::LoopPlanId, retry_edge: EdgeRef) -> Self {
+        self.equal_loop_parent = Some(parent);
+        self.equal_loop_retry_edge = Some(retry_edge);
+        self
     }
 
     fn materialize_blocks(
@@ -146,6 +161,8 @@ impl PendingContainer {
             ranges: self.ranges,
             block_count: self.block_count,
             representative: self.representative,
+            equal_loop_parent: self.equal_loop_parent,
+            equal_loop_retry_edge: self.equal_loop_retry_edge,
             first_rank: usize::MAX,
             parent: None,
         }
@@ -846,18 +863,51 @@ pub(super) fn build(
     let partition_context = LoopPartitionContext::new(cfg, &input, &forwarding)?;
     let mut loop_partitions =
         build_loop_partitions(proto, cfg, graph_facts, caps, &input, &partition_context)?;
-    if normalize_effectful_unknown_loop_conditions(
+    let mut loop_container_blocks = loop_container_domains(cfg, &loop_partitions);
+    let mut equal_loop_nestings = analyze_equal_loop_nestings(
+        cfg,
+        graph_facts,
+        &input,
+        &loop_partitions,
+        &loop_container_blocks,
+    )?;
+    let admitted_equal_loop_nestings = equal_loop_nestings.iter().copied().collect::<BTreeSet<_>>();
+    let unknown_loop_changed = normalize_effectful_unknown_loop_conditions(
         cfg,
         graph_facts,
         &mut input,
         &loop_partitions,
         &partition_context.branch_by_header,
-    )? {
+    )?;
+    let equal_loop_changed =
+        normalize_equal_loop_retry_guards(graph_facts, &mut input, &equal_loop_nestings)?;
+    if unknown_loop_changed || equal_loop_changed {
         loop_partitions =
             build_loop_partitions(proto, cfg, graph_facts, caps, &input, &partition_context)?;
+        loop_container_blocks = loop_container_domains(cfg, &loop_partitions);
     }
+    let refreshed_equal_loop_nestings = analyze_equal_loop_nestings(
+        cfg,
+        graph_facts,
+        &input,
+        &loop_partitions,
+        &loop_container_blocks,
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if !admitted_equal_loop_nestings.is_subset(&refreshed_equal_loop_nestings) {
+        return Err(StructureError::invalid(
+            "equal-domain loop normalization invalidated its admission proof",
+        ));
+    }
+    equal_loop_nestings = refreshed_equal_loop_nestings.into_iter().collect();
     let tbc_flow = crate::structure::scope::analyze_tbc_flow(proto, cfg);
-    let mut arena = build_regions(proto, cfg, graph_facts, &input, &loop_partitions, &tbc_flow)?;
+    let loop_snapshot = LoopRegionSnapshot {
+        partitions: &loop_partitions,
+        domains: &loop_container_blocks,
+        equal_nestings: &equal_loop_nestings,
+    };
+    let mut arena = build_regions(proto, cfg, graph_facts, &input, &loop_snapshot, &tbc_flow)?;
     prune_non_iteration_branch_tail_continues(
         proto,
         cfg,
@@ -895,6 +945,7 @@ pub(super) fn build(
         &loop_partitions,
         &forwarding,
     )?;
+    semantics.install_equal_loop_retry_gotos(cfg, &arena, &input, &residual_reason_by_edge)?;
     let mut edge_plans = cfg
         .edges
         .iter()
@@ -1006,6 +1057,7 @@ struct EdgeSemantics {
     continues: Vec<Option<RegionId>>,
     syntax_arms: Vec<Option<(RegionId, super::BranchArm)>>,
     forced_gotos: Vec<Option<crate::structure::GotoReason>>,
+    equal_loop_retry_gotos: Vec<Option<crate::structure::GotoReason>>,
     branch_by_header: Vec<Option<RegionId>>,
     loops: LoopQueryIndex,
     forward_routes: ForwardRouteBuilder,

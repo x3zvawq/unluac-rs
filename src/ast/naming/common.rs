@@ -41,6 +41,7 @@ impl Default for NamingOptions {
 #[strum(serialize_all = "kebab-case")]
 pub enum NameSource {
     LegacyArg,
+    LexicalEnvironment,
     Debug,
     CaptureProvenance,
     SelfParam,

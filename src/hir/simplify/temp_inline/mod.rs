@@ -54,7 +54,7 @@
 //! root 复制而来，allocation-root pair 与稳定 source home 可共同证明 alternate-root handoff；
 //! 即使 receiver 的覆盖 RHS 可能触发 GC，也可删除该 copy。普通点调用仍按两次读取处理。
 //! 纯 frame-end 的无读 copy 与 receiver 交接共用提交器；前层证明目标旧值非资源后，
-//! 保留 source 的 PhysicalRoot 而删除副本，不把两个负向保护标记直接解释成可删除。
+//! 保留 source 的 PhysicalRoot 而删除副本。debug 身份、引用捕获及当前 home 写入另行检查。
 //! 相邻 sink 若是无条件 `Block`，只递归穿过零前缀的第一条语句；第二条及更晚消费仍需
 //! block-prefix 的求值、写入、capture 与控制流摘要，不能把整个词法块视为透明。
 //! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
@@ -392,7 +392,10 @@ impl TempInlineWorkspace<'_> {
                     // 候选拒绝[SemanticBarrier:Lifetime]：regress_509 的 lookup 必须先于
                     // dispatch root release；locals 安装释放位置前不能收回操作数求值点。
                     dispatch_operands.contains(&temp)
-                        || facts.is_copy_root_endpoint(temp)
+                        || facts.is_copy_root_endpoint(temp, |producer| {
+                            self.uses.has_definition(producer)
+                                || facts.promoted_local_for_temp(producer).is_some()
+                        })
                         || self
                             .physical_root_temps
                             .get(temp.index())
@@ -649,15 +652,16 @@ fn inline_temps_in_block(
             // 候选拒绝[SemanticBarrier:Lifetime]：`t=t+1; return t` 若删 producer，状态槽不再完成本次更新。
             && !expr_mentions_temp(value, temp)
             && let Some(next_stmt) = kept_rev.last()
-            // 候选拒绝[LayerBoundary]：参数 COPY 的来源 CALL 仍属于独立结果槽；把它直接改写到参数 Temp
-            // 会丢掉独立结果 home，后续 SELF/完整帧无法再区分结果与 receiver 副本。
-            // 保留两次定义，由完整调用事务同时消费 COPY 与参数交接。
-            && !(matches!(value, HirExpr::Call(_))
-                && next_stmt.scalar_temp_assignment().is_some_and(|(target, copied)| {
+            // 候选拒绝[LayerBoundary]：参数 COPY 的来源 CALL 保留独立结果槽，交完整帧消费。
+            // 候选拒绝[SemanticBarrier:Lifetime]：前层签发的 copy root 也不能改挂到异槽定义。
+            // 647 的副本被用作 callee 后覆写，源槽仍跨 GC 存活；同值不代表同生命周期。
+            && !next_stmt.scalar_temp_assignment().is_some_and(|(target, copied)| {
                     matches!(copied, HirExpr::TempRef(source) if *source == temp)
-                        && facts.temp_is_transferred_call_argument(target)
                         && facts.trusted_temp_home_slot(temp) != facts.trusted_temp_home_slot(target)
-                }))
+                        && (facts.is_scope_end_copy_root_temp(temp)
+                            || (matches!(value, HirExpr::Call(_))
+                                && facts.temp_is_transferred_call_argument(target)))
+                })
             && let use_count = total_use_count(temp, live_use_counts)
             // 候选拒绝[SemanticBarrier:Lifetime]：两个以上消费不能随 producer 一并替换；零消费属于 dead-temps owner。
             // 候选拒绝[LayerBoundary]：零消费 producer 的 effect-preserving 删除由 dead-temps pass 负责。

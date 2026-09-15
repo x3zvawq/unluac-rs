@@ -35,6 +35,7 @@ pub(crate) fn analyze_hir(
     let mut module = HirModule {
         entry,
         protos: artifacts.protos,
+        required_luau_inlining: Vec::new(),
     };
 
     let dump_config = PassDumpConfig {

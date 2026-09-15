@@ -5,6 +5,11 @@ use thiserror::Error;
 /// Naming 阶段可能遇到的结构错误。
 #[derive(Debug, Error)]
 pub enum NamingError {
+    #[error("invalid lexical environment in proto#{function}: {reason}")]
+    InvalidLexicalEnvironment {
+        function: usize,
+        reason: &'static str,
+    },
     #[error("ast references function proto#{function}, but that function does not exist in HIR")]
     MissingFunction { function: usize },
     #[error(

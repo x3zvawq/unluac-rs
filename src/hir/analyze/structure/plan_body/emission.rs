@@ -40,6 +40,19 @@ impl PlannedBlock {
         self.stmts.last()
     }
 
+    /// 将末尾求值接到紧随其后的条件时，不能跨过词法边界；其余位置和事件保持原样。
+    pub(super) fn pop_trailing_without_scope_boundary(&mut self) -> Option<HirStmt> {
+        let position = self.stmts.len().checked_sub(1)?;
+        if self
+            .boundaries
+            .last()
+            .is_some_and(|event| event.position >= position)
+        {
+            return None;
+        }
+        self.stmts.pop()
+    }
+
     /// 只允许原位标注语句，不暴露改变长度而使边界位置失效的 Vec。
     pub(super) fn stmts_mut(&mut self) -> &mut [HirStmt] {
         &mut self.stmts

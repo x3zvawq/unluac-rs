@@ -1,7 +1,7 @@
 //! 完整调用帧内的原构造步骤与暂存槽。
 //!
 //! 字段/SETLIST 角色由构造器 owner 提供，原操作槽由 Promotion 提供。本模块只在
-//! PUC 的同一构造/调用事务中重放分配、字段求值、批次和 dispatch，不能用字段持有关系
+//! 同一构造/调用事务中重放分配、字段求值、批次和 dispatch，不能用字段持有关系
 //! 替代原根。例如 `callee; t={}; v=f(); SETLIST t(v,g()...); callee(t)` 保持 table 后
 //! 的固定缓冲槽与开放返回槽；字段写完不清空 scratch，也不意味着旧根已经退休。
 //! LuaJIT 的纯静态 TDUP 前缀不分配字段暂存槽，尾 CALL 单独核对原相邻 home/gap；
@@ -10,6 +10,23 @@
 //! 已合并数组保留原 allocation/SETLIST 缓冲身份，不把字段外形作为删除暂存根的证明。
 //! 已合并 record 继续携带原字段写来源；例如 `{meta={[key]=7}}` 只在原 key
 //! 直接读取低槽、7 原本内嵌时省去内层 binding，不遗漏曾经存在的 LOADK/COPY 暂存。
+//! SETLIST 前的数组 producer 按读取版本与 record 交错重放，已完成的内层开放数组
+//! 继续消费原分配/批次和尾 CALL。例如 `{{f()}, key={v=3}, [{2}]=3}` 保持每次槽覆盖。
+//! LuaJIT Indexed 数组逐字段写入且复用 table+1 暂存；原容量与动态值语境共同阻止
+//! 重编译误用 TDUP。比较值的 Boolean 写回消费 Promotion 的原双分支结果身份。
+//! 最后 TSETM 的开放 CALL 仍复用 table+1；例如 `{f(), g()}` 的首结果已入表，
+//! g 的任意返回宽度由原批次承接，不引入 PUC 式固定数组缓冲。
+//! Indexed 的零数组容量与 hash 预分配要求保留数字 record，例如 `{[1]=f(),[2]=g()}`
+//! 不能改为数组或空表逐项扩容。TDUP 初值之后的动态 record/数组交错写同样逐项核对
+//! table+1，再由字段 owner 恢复数组前缀与开放尾；初始 nil 标记不当作可删除的普通字段。
+//! TDUP 动态 record 没有后续开放尾时也使用同一字段事务；共享声明 preview 负责
+//! 在消费暂存绑定后恢复后继同槽分配。Luau 多目标声明由 declarations 提供预留 top，
+//! 数组缓冲和 record 暂存均相对该 top 核对，不能把任意 table+2 当作可移动的空洞。
+//! 模板字段中的完整数组复用相同 allocation/Batch/缓冲查询；例如 `{nested={1,false}}`
+//! 仍在原字段 scratch 分配并填充子表，不因树已合并而跳过原数组准备，也不把它当成空表。
+//! Luau record 的源码 debug 声明只在原末次字段写后开始；Structure 发布该末端，
+//! Promotion 绑定原表 Def，当前单声明及分配来源再次匹配后才恢复 `local t={a=f()}`。
+//! scope 已开始后的 `t.a=f()` 没有该证书，不能借相同名字或槽位并回初始化。
 
 use super::*;
 use crate::hir::common::{HirBinding, HirRecordField};
@@ -192,7 +209,19 @@ impl FrameBuilder<'_> {
         table: &crate::hir::common::HirTableConstructor,
         slot: usize,
     ) -> Option<HirExpr> {
-        let batch = self.facts.native_allocation_batch_layout(table)?;
+        self.luau_array_frame_matches(table, slot)
+            .then(|| HirExpr::TableConstructor(Box::new(table.clone())))
+    }
+
+    /// 数组元素与模板字段共享已完成数组的布局证明；查询不复制待保留的表达式树。
+    fn luau_array_frame_matches(
+        &self,
+        table: &crate::hir::common::HirTableConstructor,
+        slot: usize,
+    ) -> bool {
+        let Some(batch) = self.facts.native_allocation_batch_layout(table) else {
+            return false;
+        };
         if !matches!(table.allocation, HirTableAllocation::Luau(_))
             || table.trailing_multivalue.is_some()
             || !table.matches_allocation_capacity(table.fields.len())
@@ -223,9 +252,9 @@ impl FrameBuilder<'_> {
                                 == Some(HomeSlotKey::new(slot + 1 + table.fields.len(), 0)))
             })
         {
-            return None;
+            return false;
         }
-        Some(HirExpr::TableConstructor(Box::new(table.clone())))
+        true
     }
 
     /// 构造器 owner 已合并的完整值仍携带各内部操作的 source site；调用帧只核对
@@ -324,6 +353,9 @@ impl FrameBuilder<'_> {
     ) -> Option<HirExpr> {
         let context = self.native?;
         if self.dialect == DecompileDialect::Luajit {
+            if matches!(table.allocation, HirTableAllocation::Indexed { .. }) {
+                return self.indexed_constructor(seed, table, slot);
+            }
             return self.template_constructor(seed, table, slot);
         }
         if self.dialect == DecompileDialect::Luau {
@@ -345,6 +377,10 @@ impl FrameBuilder<'_> {
             return None;
         }
         let writes = self.constructors.remove(&seed)?;
+        let pending_batch = writes.last().and_then(|(index, write)| match write {
+            ConstructorWrite::Batch { batch, .. } => Some((*index, *batch)),
+            ConstructorWrite::Record { .. } => None,
+        });
         let mut rebuilt = table.clone();
         let mut arrays = 0;
         let mut records = table.fields.len();
@@ -353,17 +389,42 @@ impl FrameBuilder<'_> {
         for (position, (index, write)) in writes.iter().enumerate() {
             match write {
                 ConstructorWrite::Record { access, value, .. } => {
+                    // SETLIST 延后提交数组，但数组 producer 可以先于 record 求值。
+                    // 按最终 batch 读取的值版本推进一次游标；不从复用后的 local 名字猜顺序。
+                    // 每个值仍由 expr 核对原缓冲槽，finish_event 核对期间没有遗漏事件。
+                    if let Some((batch_index, batch)) = pending_batch {
+                        while let Some(HirExpr::LocalRef(local)) = batch.values.fixed.get(arrays) {
+                            // 低槽现成 binding 的定义不是本次数组 MOVE 的读取时点。
+                            if self
+                                .direct_home(&HirExpr::LocalRef(*local))
+                                .is_none_or(|home| home.slot() < self.base)
+                                || self
+                                    .definition(*local, batch_index)
+                                    .is_none_or(|def| def <= seed || def >= *index)
+                            {
+                                break;
+                            }
+                            rebuilt
+                                .fields
+                                .push(HirTableField::Array(self.puc_array_element(
+                                    &batch.values.fixed[arrays],
+                                    *index,
+                                    slot + arrays + 1,
+                                )?));
+                            arrays += 1;
+                        }
+                    }
                     let layout = self.facts.native_table_write_layout(access)?;
                     if layout.base != HomeSlotKey::new(slot, 0) {
                         return None;
                     }
                     let (key, key_scratch) =
-                        self.record_operand(&access.key, layout.key, *index, slot + 1)?;
+                        self.record_operand(&access.key, layout.key, *index, slot + arrays + 1)?;
                     let (value, _) = self.record_operand(
                         value,
                         layout.value,
                         *index,
-                        slot + 1 + usize::from(key_scratch),
+                        slot + arrays + 1 + usize::from(key_scratch),
                     )?;
                     rebuilt.fields.push(HirTableField::Record(HirRecordField {
                         write_sources: access.sources.clone(),
@@ -373,22 +434,38 @@ impl FrameBuilder<'_> {
                     records += 1;
                 }
                 ConstructorWrite::Batch { batch, .. } => {
-                    if position + 1 != writes.len()
-                        || batch.start_index != 1
-                        || batch.initializer_debug_scope.is_some()
-                    {
+                    if position + 1 != writes.len() || batch.start_index != 1 {
                         return None;
                     }
-                    for (offset, value) in batch.values.fixed.iter().enumerate() {
-                        rebuilt.fields.push(HirTableField::Array(self.expr(
-                            value,
-                            *index,
-                            slot + offset + 1,
-                            None,
-                            false,
-                            false,
-                            None,
-                        )?));
+                    if batch.initializer_debug_scope.is_some() {
+                        let (owner, _) = scalar_local(self.run[seed])?;
+                        let scope = context
+                            .proto
+                            .local_debug_scopes
+                            .get(owner.index())
+                            .copied()
+                            .flatten();
+                        let home = super::super::table_constructors::debug_initializer_home(
+                            self.run[seed],
+                            batch,
+                            scope,
+                            self.facts,
+                        )?;
+                        if home != HomeSlotKey::new(slot, 0)
+                            || context.barred.contains(&home)
+                            || context.closed.contains(&home)
+                        {
+                            return None;
+                        }
+                    }
+                    for (offset, value) in batch.values.fixed.iter().enumerate().skip(arrays) {
+                        rebuilt
+                            .fields
+                            .push(HirTableField::Array(self.puc_array_element(
+                                value,
+                                *index,
+                                slot + offset + 1,
+                            )?));
                     }
                     arrays = batch.values.fixed.len();
                     if let Some(tail) = &batch.values.tail {
@@ -418,6 +495,121 @@ impl FrameBuilder<'_> {
         Some(HirExpr::TableConstructor(Box::new(rebuilt)))
     }
 
+    /// 数组元素也会在原缓冲槽重新分配已合并的嵌套表；复用 record operand 的
+    /// allocation/SETLIST 证明，普通标量仍使用数组值语境，不套用 RK 的省槽规则。
+    fn puc_array_element(
+        &mut self,
+        value: &HirExpr,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        let prepared = match value {
+            HirExpr::LocalRef(local) => self
+                .definition(*local, before)
+                .and_then(|index| scalar_local(self.run[index]).map(|(_, value)| value))
+                .unwrap_or(value),
+            _ => value,
+        };
+        if matches!(prepared, HirExpr::TableConstructor(_)) {
+            self.record_operand(value, Some(HomeSlotKey::new(slot, 0)), before, slot)
+                .map(|(value, _)| value)
+        } else {
+            self.expr(value, before, slot, None, false, false, None)
+        }
+    }
+
+    fn indexed_constructor(
+        &mut self,
+        seed: usize,
+        table: &crate::hir::common::HirTableConstructor,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        let context = self.native?;
+        let home = HomeSlotKey::new(slot, 0);
+        let HirTableAllocation::Indexed { array_capacity, .. } = table.allocation else {
+            return None;
+        };
+        let array_fields = array_capacity != 0;
+        if !table.fields.is_empty()
+            || table.trailing_multivalue.is_some()
+            || self.facts.allocation_result_home(table) != Some(home)
+            || context.barred.contains(&home)
+            || context.closed.contains(&home)
+        {
+            return None;
+        }
+        let writes = self.constructors.remove(&seed)?;
+        if array_fields && !table.matches_indexed_array_capacity(writes.len()) {
+            return None;
+        }
+        self.finish_event(seed)?;
+        self.constructor_depth += 1;
+        let mut rebuilt = table.clone();
+        let write_count = writes.len();
+        for (offset, (index, write)) in writes.into_iter().enumerate() {
+            if let ConstructorWrite::Batch { batch, .. } = write {
+                // TSETM 的尾 CALL 复用 table+1，而非 PUC 的固定数组缓冲末端。
+                // 先前逐字段写已提交到表中；开放结果只能接在完整数组前缀之后。
+                let layout = self.facts.native_table_batch_layout(batch)?;
+                let tail = batch.values.tail.as_ref()?;
+                if !array_fields
+                    || offset + 1 != write_count
+                    || !batch.values.fixed.is_empty()
+                    || batch.initializer_debug_scope.is_some()
+                    || batch.start_index as usize != offset + 1
+                    || layout.base != home
+                    || layout.buffer != HomeSlotKey::new(slot + 1, 0)
+                    || layout.fixed_width.is_some()
+                    || tail.exact_width().is_some()
+                {
+                    return None;
+                }
+                let HirExpr::Call(call) = tail.as_expr() else {
+                    return None;
+                };
+                let call = self.call(call, index, slot + 1, false, CallWidth::Open)?;
+                let mut batch = batch.clone();
+                batch.values.tail = Some(HirPackTail::open(HirExpr::Call(Box::new(call))));
+                self.finish_event(index)?;
+                self.constructor_depth -= 1;
+                return super::super::table_constructors::constructor_with_native_batch(
+                    &rebuilt, &batch,
+                )
+                .map(|table| HirExpr::TableConstructor(Box::new(table)));
+            }
+            let ConstructorWrite::Record { access, value, .. } = write else {
+                return None;
+            };
+            let layout = self.facts.native_table_write_layout(access)?;
+            if layout.base != home
+                || layout.key.is_some()
+                || access.key != HirExpr::Integer(i64::try_from(offset + 1).ok()?)
+            {
+                return None;
+            }
+            let (value, _) = self.record_operand(value, layout.value, index, slot + 1)?;
+            // 字面量数组会被 JIT 编译为模板；动态字段必须保留原 TNEW/TSETB 分配方式。
+            if crate::value_semantics::table::table_constant_kind(&value).is_some() {
+                return None;
+            }
+            if array_fields {
+                rebuilt.fields.push(HirTableField::Array(value));
+            } else {
+                // 原数字 record 使用 hash 预分配，不能改成数组或从空表开始逐项扩容。
+                rebuilt.fields.push(HirTableField::Record(HirRecordField {
+                    write_sources: access.sources.clone(),
+                    key: access.key.clone(),
+                    value,
+                }));
+            }
+            self.finish_event(index)?;
+        }
+        self.constructor_depth -= 1;
+        rebuilt
+            .matches_allocation_capacity(if array_fields { write_count } else { 0 })
+            .then(|| HirExpr::TableConstructor(Box::new(rebuilt)))
+    }
+
     fn template_constructor(
         &mut self,
         seed: usize,
@@ -436,27 +628,70 @@ impl FrameBuilder<'_> {
             return None;
         }
         let writes = self.constructors.remove(&seed)?;
-        let [(index, ConstructorWrite::Batch { batch, .. })] = writes.as_slice() else {
-            return None;
+        let (batch, records) = match writes.split_last()? {
+            ((index, ConstructorWrite::Batch { batch, .. }), records) => {
+                if !batch.values.fixed.is_empty() || batch.initializer_debug_scope.is_some() {
+                    return None;
+                }
+                let tail = batch.values.tail.as_ref()?;
+                if tail.exact_width().is_some() {
+                    return None;
+                }
+                let HirExpr::Call(call) = tail.as_expr() else {
+                    return None;
+                };
+                (Some((*index, *batch, call)), records)
+            }
+            _ => (None, writes.as_slice()),
         };
-        if !batch.values.fixed.is_empty() || batch.initializer_debug_scope.is_some() {
+        let home = HomeSlotKey::new(slot, 0);
+        if !records.is_empty() && self.facts.allocation_result_home(table) != Some(home) {
             return None;
         }
-        let tail = batch.values.tail.as_ref()?;
-        if tail.exact_width().is_some() {
-            return None;
-        }
-        let HirExpr::Call(call) = tail.as_expr() else {
-            return None;
-        };
         self.finish_event(seed)?;
+        let mut rebuilt = table.clone();
+        let mut added = Vec::new();
+        self.constructor_depth += 1;
+        for (index, write) in records {
+            let ConstructorWrite::Record { access, value, .. } = write else {
+                return None;
+            };
+            let layout = self.facts.native_table_write_layout(access)?;
+            if layout.base != home
+                || layout.key.is_some()
+                || layout.value != Some(HomeSlotKey::new(slot + 1, 0))
+                || !literal_rk(&access.key)
+            {
+                return None;
+            }
+            let value = self.expr(value, *index, slot + 1, None, false, true, None)?;
+            // 保持 TDUP 之后的动态写；常量不能借此提前移入模板初值。
+            if crate::value_semantics::table::table_constant_kind(&value).is_some() {
+                return None;
+            }
+            added.push(HirRecordField {
+                write_sources: access.sources.clone(),
+                key: access.key.clone(),
+                value,
+            });
+            self.finish_event(*index)?;
+        }
+        let Some((index, batch, call)) = batch else {
+            self.constructor_depth -= 1;
+            return super::super::table_constructors::constructor_with_native_records(table, added)
+                .map(|table| HirExpr::TableConstructor(Box::new(table)));
+        };
+        rebuilt
+            .fields
+            .extend(added.into_iter().map(HirTableField::Record));
         // TDUP 的静态字段不占运行时数组缓冲槽；原 TSETM 的开放 CALL 紧邻 table。
         // CALL owner 核对原 home 与 frame gap，字段覆盖语义仍交还构造器 owner。
-        let call = self.call(call, *index, slot + 1, false, CallWidth::Open)?;
+        let call = self.call(call, index, slot + 1, false, CallWidth::Open)?;
         let mut batch = (*batch).clone();
         batch.values.tail = Some(HirPackTail::open(HirExpr::Call(Box::new(call))));
-        self.finish_event(*index)?;
-        super::super::table_constructors::constructor_with_native_batch(table, &batch)
+        self.finish_event(index)?;
+        self.constructor_depth -= 1;
+        super::super::table_constructors::constructor_with_native_batch(&rebuilt, &batch)
             .map(|table| HirExpr::TableConstructor(Box::new(table)))
     }
 
@@ -472,25 +707,48 @@ impl FrameBuilder<'_> {
         let home = HomeSlotKey::new(slot, 0);
         let (owner, _) = scalar_local(self.run[seed])?;
         if table.trailing_multivalue.is_some()
-            || table.fields.len() != table.implicit_template_fields.len()
+            // seed 已有的常量（包括混合模板的 Some 项）仍在分配时建立；这里只
+            // 吸收后继动态写，不重放或删除构造器 owner 已完成的字段事务。
+            || !table.fields.iter().all(|field| matches!(field,
+                HirTableField::Record(record)
+                    if literal_rk(&record.key) && literal_rk(&record.value)))
             || table.fields.is_empty()
             || self.facts.allocation_result_home(table) != Some(home)
             || context.barred.contains(&home)
             || context.closed.contains(&home)
-            || context
-                .proto
-                .local_debug_scopes
-                .get(owner.index())
-                .is_some_and(Option::is_some)
         {
             return None;
         }
         let writes = self.constructors.remove(&seed)?;
+        if let Some(scope) = context.proto.local_debug_scopes[owner.index()] {
+            if !matches!(self.run[seed], HirStmt::LocalDecl(decl)
+                if decl.bindings.as_slice() == [owner])
+            {
+                return None;
+            }
+            let (_, ConstructorWrite::Record { access, .. }) = writes.last()? else {
+                return None;
+            };
+            let (producer, initializer_scope) =
+                self.facts.native_table_write_layout(access)?.initializer?;
+            let crate::hir::common::HirOperationSources::Single(source) = table.sources else {
+                return None;
+            };
+            // 名字在最后一次字段写之后才进入生命周期；原表 Def、当前声明及 scope
+            // 必须仍是同一身份。coalesce 后失去 producer 映射时不能借同槽继续消费。
+            if initializer_scope != scope
+                || self.facts.operation_result_temp(source) != Some(producer)
+                || self.facts.promoted_local_for_temp(producer) != Some(owner)
+            {
+                return None;
+            }
+        }
         // 超过源码 DUPTABLE 的 32 字段上界时，必然改变分配协议，无需重建各个 RHS。
         if writes.len() > 32 {
             return None;
         }
         self.finish_event(seed)?;
+        let scratch = self.constructor_reserved_top.unwrap_or(0).max(slot + 1);
         let mut records = Vec::with_capacity(writes.len());
         for (index, write) in writes {
             let ConstructorWrite::Record { access, value, .. } = write else {
@@ -500,10 +758,10 @@ impl FrameBuilder<'_> {
             if layout.base != home
                 || layout
                     .key
-                    .is_some_and(|key| key != HomeSlotKey::new(slot + 1, 0))
+                    .is_some_and(|key| key != HomeSlotKey::new(scratch, 0))
                 || layout.value
                     != Some(HomeSlotKey::new(
-                        slot + 1 + usize::from(layout.key.is_some()),
+                        scratch + usize::from(layout.key.is_some()),
                         0,
                     ))
             {
@@ -519,9 +777,14 @@ impl FrameBuilder<'_> {
                 return None;
             }
             let value = self.expr(value, index, layout.value?.slot(), None, false, true, None)?;
-            // compileExprAuto 对 CALL 分配独立结果槽；字面量/低槽 local 可能被模板
-            // 常量化或直接读取，不能按当前结果值纯度省掉原字段 scratch 的写入。
-            if !matches!(value, HirExpr::Call(_)) {
+            // compileExprAuto 对 CALL 和表分配独立结果槽；非空数组还须复用原 allocation/
+            // Batch/连续缓冲证明。字面量和低槽 local 可能直接读取，不能省掉原 scratch 写。
+            if !matches!(value, HirExpr::Call(_))
+                && !matches!(&value, HirExpr::TableConstructor(table)
+                    if (table.fields.is_empty() && table.trailing_multivalue.is_none()
+                        && self.facts.allocation_result_home(table) == layout.value)
+                        || self.luau_array_frame_matches(table, scratch))
+            {
                 return None;
             }
             records.push(HirRecordField {
@@ -577,10 +840,11 @@ impl FrameBuilder<'_> {
                 return None;
             }
         }
+        let buffer = self.constructor_reserved_top.unwrap_or(0).max(slot + 1);
         if !(1..=16).contains(&arrays)
             || batch.start_index != 1
             || layout.base != HomeSlotKey::new(slot, 0)
-            || layout.buffer != HomeSlotKey::new(slot + 1, 0)
+            || layout.buffer != HomeSlotKey::new(buffer, 0)
             || match layout.fixed_width {
                 Some(width) => batch.values.tail.is_some() || width != batch.values.fixed.len(),
                 None => batch
@@ -595,7 +859,7 @@ impl FrameBuilder<'_> {
         self.finish_event(seed)?;
         let mut rebuilt = table.clone();
         // Luau 先预留整批数组缓冲，再在它上方计算 record 的值；record 不采用 RK value。
-        let record_home = HomeSlotKey::new(slot + 1 + arrays, 0);
+        let record_home = HomeSlotKey::new(buffer + arrays, 0);
         for (index, write) in records {
             let ConstructorWrite::Record { access, value, .. } = write else {
                 return None;
@@ -626,7 +890,7 @@ impl FrameBuilder<'_> {
                 self.expr(
                     value,
                     *batch_index,
-                    slot + 1 + offset,
+                    buffer + offset,
                     None,
                     false,
                     false,
@@ -642,7 +906,7 @@ impl FrameBuilder<'_> {
                 Some(HirPackTail::open(HirExpr::Call(Box::new(self.call(
                     call,
                     *batch_index,
-                    slot + 1 + fixed.len(),
+                    buffer + fixed.len(),
                     false,
                     CallWidth::Open,
                 )?))))
@@ -719,14 +983,14 @@ impl FrameBuilder<'_> {
         {
             if !matches!(table.allocation, HirTableAllocation::PucBatched(_))
                 || self.facts.allocation_result_home(table) != Some(home)
-                || table.trailing_multivalue.is_some()
             {
                 return None;
             }
-            if table
-                .fields
-                .iter()
-                .all(|field| matches!(field, HirTableField::Record(_)))
+            if table.trailing_multivalue.is_none()
+                && table
+                    .fields
+                    .iter()
+                    .all(|field| matches!(field, HirTableField::Record(_)))
             {
                 if table
                     .allocation
@@ -745,7 +1009,11 @@ impl FrameBuilder<'_> {
                 if batch.base != home
                     || batch.buffer != HomeSlotKey::new(home.slot() + 1, 0)
                     || batch.start_index != 1
-                    || batch.fixed_width != Some(table.fields.len())
+                    || batch.fixed_width
+                        != table
+                            .trailing_multivalue
+                            .is_none()
+                            .then_some(table.fields.len())
                     || !table
                         .fields
                         .iter()

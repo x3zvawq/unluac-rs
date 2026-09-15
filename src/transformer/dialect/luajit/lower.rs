@@ -70,6 +70,7 @@ fn lower_proto(raw: &RawProto, fr2: bool) -> Result<LoweredProto, TransformError
         line_range: raw.common.line_range,
         signature: raw.common.signature,
         frame: raw.common.frame,
+        clears_entry_scratch: false,
         constants: raw.common.constants.common.literals.clone(),
         upvalue_count: raw.common.upvalues.common.count,
         environment_upvalues: Vec::new(),

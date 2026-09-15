@@ -301,6 +301,7 @@ pub(super) fn inline_constructor_call(
         method_key: call.method_key.clone(),
         callee_root_handoff: call.callee_root_handoff,
         method_rewrite_transaction: call.method_rewrite_transaction,
+        plain_method_syntax: false,
     })
 }
 

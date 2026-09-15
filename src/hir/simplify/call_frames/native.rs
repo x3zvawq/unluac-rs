@@ -1,16 +1,26 @@
-//! 为根块的普通调用建立一次完整源码帧事务，并验证删除后的全局声明身份。
+//! 为普通调用建立一次完整源码帧事务，并验证删除后的全局声明身份。
 //!
 //! 调用树、Def 版本与槽距由父模块的共享 FrameBuilder 核对，实际源码低槽前缀由
 //! prefix owner 核对。callee 为零返回时原槽可能未覆写，因此这里只整体吸收调用树，
 //! 不单独撤销 root 保护。多个调用可复用同一匿名 LocalId；事务在同一 preview 中删除
 //! 已消费的声明/读取，并把该身份的下一次独立写移为声明，禁止留下悬空 read/capture。
+//! Repeat 的条件使用共享坐标中的 body 尾点，保持循环内声明直到条件求值完毕；
+//! `repeat local f=g until f(x)` 的 COPY 只由原 CALL 完整重发，不向 AST 开放删根权限。
+//! Lua5.5 global 初始化只重建完整 RHS 调用帧，保留名字顺序、固定结果宽度及原 probe/store；
+//! 例如 `local f=maker(); global a,b=f()` 可在原 home 恢复为 `global a,b=maker()()`。
 //! 例如先 `c=table.concat; print(c(t))` 后 `c=table; print(c.concat(t))`，必须同时
 //! 核对每次原 home 与后缀身份，不能凭第一次调用布局删除后续还在读取的 source local。
+//! 被消费 epoch 的恢复必须覆盖后续使用：原 owner 内的独立写可恢复，子块内恢复则
+//! 要求剩余使用全部留在该块；外层 `local f=g; f()` 后 `if c then f=1 else f=0 end;
+//! use(f)` 不能把其中一臂改为声明后认定合流已恢复。
+//! 缺失 epoch 记录消费它的事务起点；后缀声明恢复失败时截去该事务，不能以失败
+//! 语句的位置保留坏事务，也不丢掉前面的独立构造器。声明恢复截断未知后缀，前缀
+//! 校验按请求批量撤回失败计划；各至多重建一次，最终整批再验失败则完全不提交。
 //! 单返回初始化同样保留原结果 home 与目标声明；已有参数表消费原 argument-root 交接。
 //! PUC 的完整构造器事务还消费构造器 owner 的字段/SETLIST 角色，并由 tables 核对
 //! 原暂存槽与事件；普通 CALL 与 TAILCALL 保持各自结果协议。没有固定返回值不表示
 //! callee 槽必然被清空；无物理根的辅助初始化也可能是后续完整帧所需的声明前缀。
-//! PUC 与 Luau 的既有低槽单结果赋值共同消费原 CALL 和首 MOVE，后继低槽 COPY
+//! PUC、LuaJIT 与 Luau 的既有低槽单结果赋值共同消费原 CALL 和首 MOVE，后继低槽 COPY
 //! 仍由原身份与写域保护；不能将 CALL scratch 独立冻结为永久声明来绕过赋值事务。
 //! 比较准备和后继数值循环头可将原 CALL scratch 误留成跨段 Local；这里向作用域
 //! owner 提供未提交的完整帧预览，由它同时恢复 do 末端并核对整个后缀后提交。
@@ -20,29 +30,59 @@
 //! builder 签证，作用域 owner 不把有读取的 receiver 误当作死声明吸收。
 //! 独立构造器与接收 CALL 的构造器共用 builder 和前缀提交；已被调用拥有的构造器
 //! 不重复建计划，其余候选同批验证，避免拆开原来必须共同退休的帧。
+//! generic-for 的原 producer occurrence 在 Temp 提升为 Local 后仍可消费；
+//! `local a,b,c,d; a,b,c,d=iter(t); release; for ...` 的声明、CALL 与 dispatch 释放
+//! 属于同一事务。初始化接收区与 body 控制前缀各用原协议事实，不能混用两种宽度。
+//! Boolean 参数的原 false 预写同样可能提升成 Local；原 Def/home 证书与当前写入
+//! 联合定位，才可恢复 `assert(a == 1 and b == 2)`，保留比较前覆盖旧 scratch 的时点。
+//! 表条件的同值结果也消费原 branch/phi 关系：`({f()}) and 7 or 7` 先保留低结果槽，
+//! 再在高槽分配表及调用缓冲；不能因结果已化简为7而凭空提前写一个 nil。
+//! PUC/JIT 的 `v=v()+1` 保留已有低槽目标，完整帧从原空闲高槽调用并写回；消除
+//! CALL scratch 的永久声明后，后继同槽 `t={make()}` 才能由原 epoch 事务恢复声明。
 //! PUC 空表与 Luau 静态模板赋值先在空闲槽分配，再 MOVE 到已有低槽 local；同一事务
 //! 可收回相邻 allocation/COPY，避免给原临时槽留下永久声明。全局/索引赋值有独立
 //! 提交事件，不使用这个许可；被删 scratch 的后续读取/capture 仍由整批 preview 拒绝。
 //! 多结果 RETURN 的连续准备区同样重发原 COPY；Luau 连续低槽直返优化不能省去原高槽写。
+//! PUC 的高返回 COPY 同样可能跨 frame 保根：caller 覆写低槽后触发 GC，仍可观察
+//! 原高槽的返回对象。无 cleanup、末尾无事件及低来源尚存，都不足以授权缩短返回区。
+//! 例如 `local a=x; local b=y; return a,b` 不能仅凭终端 COPY 改为 `return x,y`；
+//! 物理覆盖与原高槽根都须保留，不能只核对 RETURN 前最后一次求值。
 //! 永久来源与 cleanup 事务分开，不能因清理已消费而重新猜测返回槽。单结果 CALL 紧邻
 //! 被同槽惰性常量覆盖时可丢弃结果，但必须同时保留调用帧与随后声明，不能只删 producer。
+//! Luau 的 `upvalue = a .. b` 保留独立结果槽和高一槽起的 operand 区；完整恢复
+//! GETUPVAL/COPY 与 CONCAT 后仍在原终点写回上值，不把该许可扩展到有求值的索引左值。
+//! PUC SETTABUP 的 `u.key=f()` 直接消费原上值 cell、内嵌 key 与单结果 CALL 布局。
+//! 完整事务撤销额外 callee 声明并在原空闲槽调用；u 仍在 CALL 后读取，不能提前快照。
+//! 短路 CALL 结果在共同原 home 初始化：HIR 的 callee 准备与结果写回一起恢复为
+//! `local result=mark(a) or mark(b)`，避免把原 scratch 变成永久 local 后逐轮增加调用 COPY。
 
+use super::fastcalls::callee_is_named as fastcall_callee_is_named;
 use super::*;
 use crate::hir::common::{HirBinding, HirInlineRetentionReason, HirLocalDecl, TempId};
 use crate::hir::simplify::mention::{BindingReadCollector, BindingWriteCollector};
 use crate::hir::visit::visit_stmts;
+use prefix::coordinates::{PointKind, compact as compact_scope, visit_mut as visit_scope_mut};
 
+mod declarations;
+mod expanded;
 mod indexed;
+mod retained_inputs;
+mod tbc_initializers;
+
+pub(in crate::hir::simplify) use expanded::restore as restore_expanded_frames;
+pub(in crate::hir::simplify) use tbc_initializers::restore as restore_tbc_initializer_frames;
 
 struct Plan {
     start: usize,
     sink: usize,
     base: HomeSlotKey,
     values: HirValuePack,
-    result_local: Option<LocalId>,
+    result_locals: Vec<LocalId>,
     discarded_result: Option<LocalId>,
-    assignment_targets: Vec<LocalId>,
+    assignment_targets: Vec<HirLValue>,
     indexed_target: Option<crate::hir::common::HirTableAccess>,
+    /// 完整表达式仍在原高槽留下的输入根；后缀必须继续保持该槽的观察与覆盖。
+    continuing_root: Option<crate::hir::promotion::NativeConditionalValueResult>,
     retained_copies: Vec<(usize, LocalId, LocalId)>,
     removed: Vec<usize>,
 }
@@ -52,7 +92,30 @@ struct Preview {
     removed: Vec<bool>,
 }
 
+struct MissingEpoch {
+    needs_declaration: bool,
+    owner: usize,
+    /// 消费本次值/声明的事务起点；后缀拒绝须归到该事务，不能归到读取位置。
+    start: usize,
+}
+
 impl Plan {
+    fn only_preserves_call_prefix(&self) -> bool {
+        self.start == self.sink
+            && self.removed.is_empty()
+            && self.result_locals.is_empty()
+            && self.discarded_result.is_none()
+            && self.assignment_targets.is_empty()
+            && self.indexed_target.is_none()
+            && (matches!(self.values.fixed.as_slice(), [HirExpr::Call(_)])
+                || (self.values.fixed.is_empty()
+                    && self
+                        .values
+                        .tail
+                        .as_ref()
+                        .is_some_and(|tail| matches!(tail.as_expr(), HirExpr::Call(_)))))
+    }
+
     fn prefix_request(&self) -> (usize, prefix::PrefixRequest) {
         (
             self.start,
@@ -62,7 +125,14 @@ impl Plan {
                     .retained_copies
                     .iter()
                     .flat_map(|(_, target, source)| [*target, *source])
-                    .chain(self.assignment_targets.iter().copied())
+                    .chain(
+                        self.assignment_targets
+                            .iter()
+                            .filter_map(|target| match target {
+                                HirLValue::Local(local) => Some(*local),
+                                _ => None,
+                            }),
+                    )
                     .collect(),
             },
         )
@@ -109,44 +179,273 @@ pub(in crate::hir::simplify) fn prepare_source_frames(
         dialect,
     );
     plans.retain(|plan| {
-        plan.retained_copies.is_empty()
-            && plan.result_local.is_none_or(|local| {
-                facts.trusted_local_home_slot(local) == Some(plan.base)
-                    && matches!((plan.values.fixed.as_slice(), &plan.values.tail),
-                        ([HirExpr::TableConstructor(table)], None)
-                            if facts.allocation_result_home(table) == Some(plan.base))
-            })
+        !plan.only_preserves_call_prefix()
+            && plan.retained_copies.is_empty()
+            && (plan.result_locals.is_empty()
+                || (plan.values.tail.is_none()
+                    && plan.result_locals.len() == plan.values.fixed.len()
+                    && plan.result_locals.iter().zip(&plan.values.fixed).enumerate().all(
+                        |(offset, (&local, value))| {
+                            let home = HomeSlotKey::new(plan.base.slot() + offset, 0);
+                            facts.trusted_local_home_slot(local) == Some(home)
+                                && matches!(value, HirExpr::TableConstructor(table)
+                                    if facts.allocation_result_home(table) == Some(home))
+                        },
+                    )))
             && plan.discarded_result.is_none()
             // 候选拒绝[LayerBoundary]：计算左值也占用入口帧；作用域 owner 尚只从 RHS 恢复请求。
             && plan.indexed_target.is_none()
+            // Luau CONCAT 的入口还包含低于 operand 的结果预留槽；作用域 owner
+            // 尚不能从 RHS 重建此语境，留给持有原 base 的完整 native 事务。
+            && !(dialect == DecompileDialect::Luau
+                && matches!(plan.values.fixed.as_slice(), [HirExpr::Binary(binary)]
+                    if binary.op == crate::hir::common::HirBinaryOpKind::Concat))
     });
     if plans.is_empty() {
         return Some(proto);
     }
-    let mut preview = apply_preview(proto, &plans, count)?;
+    let mut preview = apply_preview(proto, &plans, count, &mut None)?;
     compact_scope(&mut preview.proto.body, &preview.removed, &mut 0);
     Some(preview.proto)
 }
 
-pub(super) fn restore(
-    proto: &mut HirProto,
+pub(super) struct PreparedFrames {
+    plans: Vec<Plan>,
+    stmt_count: usize,
+}
+
+impl PreparedFrames {
+    pub(super) fn commit(
+        self,
+        proto: &mut HirProto,
+        facts: &ProtoPromotionFacts,
+        dialect: DecompileDialect,
+        is_chunk_entry: bool,
+    ) -> bool {
+        commit_plans(
+            proto,
+            facts,
+            dialect,
+            is_chunk_entry,
+            self.plans,
+            self.stmt_count,
+        )
+    }
+}
+
+pub(super) fn prepare(
+    proto: &HirProto,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
     barred: &BTreeSet<HomeSlotKey>,
     closed: &BTreeSet<HomeSlotKey>,
+    terminal: &TerminalClosureFacts,
+) -> PreparedFrames {
+    let context = NativeFrameContext {
+        proto,
+        barred,
+        closed,
+        constants_fit_rk: tables::constants_fit_rk(proto),
+    };
+    let (mut plans, stmt_count) = collect_native_plans(context, facts, dialect);
+    if dialect != DecompileDialect::Lua54 {
+        // 条件输入仍留在原高槽时，已有完整 CALL 也是后缀证明的一部分。
+        // 同批核对它们的前缀，不能先提交条件恢复、再由最终 prefix owner 补救拒绝。
+        if !plans.iter().any(|plan| plan.continuing_root.is_some()) {
+            plans.retain(|plan| !plan.only_preserves_call_prefix());
+        }
+        return PreparedFrames { plans, stmt_count };
+    }
+    let occupied = plans
+        .iter()
+        .filter(|plan| !plan.only_preserves_call_prefix())
+        .flat_map(|plan| plan.removed.iter().copied().chain([plan.sink]))
+        .collect::<BTreeSet<_>>();
+    let mut flat = Vec::new();
+    flatten_scope(&proto.body, &mut 0, &mut flat);
+    for window in flat.windows(3) {
+        if let [Some(first), Some(sink), Some(last)] = window
+            && !occupied.contains(&first.id)
+            && !occupied.contains(&sink.id)
+            && matches!(last.stmt, HirStmt::Return(ret) if ret.values.is_empty())
+            && let Some(plan) = terminal_closure_result(context, facts, terminal, first, sink)
+        {
+            plans.push(plan);
+        }
+    }
+    // 纯前缀声明义务在 HIR 所有帧 owner 收尾后发布；提前冻结会阻止它们消费完整帧。
+    plans.retain(|plan| !plan.only_preserves_call_prefix());
+    plans.sort_unstable_by_key(|plan| plan.sink);
+    PreparedFrames { plans, stmt_count }
+}
+
+/// 完整改写结束后，为已嵌入的 CALL 向 AST 发布前缀要求；不再改写调用或消费根协议。
+pub(in crate::hir::simplify) fn preserve_existing_call_prefixes(
+    proto: &mut HirProto,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
     is_chunk_entry: bool,
-) -> bool {
-    let (plans, stmt_count) = collect_native_plans(
+) {
+    let restrictions = frame_restrictions(proto, facts);
+    let (mut plans, count) = collect_native_plans(
         NativeFrameContext {
             proto,
-            barred,
-            closed,
+            barred: &restrictions.barred,
+            closed: &restrictions.closed,
             constants_fit_rk: tables::constants_fit_rk(proto),
         },
         facts,
         dialect,
     );
-    commit_plans(proto, facts, dialect, is_chunk_entry, plans, stmt_count)
+    plans.retain(Plan::only_preserves_call_prefix);
+    let starts = plans.iter().map(Plan::prefix_request).collect();
+    prefix::preserve_prefix_requests(proto, facts, dialect, is_chunk_entry, count, starts);
+}
+
+/// 非 vararg 的单值 r0 RETURN 在调用者相邻槽留下相同返回值，因此后继 callee COPY
+/// 不会覆盖另一份旧资源。必须消费当前 HIR Return 的原布局；原字节码尾部不可达
+/// RETURN0 不能代表当前正常出口。每个 proto 只扫描一次，候选只查 exact maker 索引。
+pub(super) struct TerminalClosureFacts<'a> {
+    values: &'a super::super::object_flow::ReturnValueFacts,
+    protos: Vec<(bool, bool)>,
+}
+
+pub(super) fn terminal_closure_facts<'a>(
+    module: &crate::hir::HirModule,
+    promotion: &[ProtoPromotionFacts],
+    values: &'a super::super::object_flow::ReturnValueFacts,
+    dialect: DecompileDialect,
+) -> TerminalClosureFacts<'a> {
+    struct Returns<'a> {
+        facts: &'a ProtoPromotionFacts,
+        seen: bool,
+        valid: bool,
+    }
+    impl crate::hir::visit::HirVisitor<'_> for Returns<'_> {
+        fn is_complete(&self) -> bool {
+            !self.valid
+        }
+
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            if let HirStmt::Return(ret) = stmt {
+                self.seen = true;
+                self.valid = ret.values.tail.is_none()
+                    && ret.values.fixed.len() == 1
+                    && self.facts.native_return_frame(ret).is_some_and(|frame| {
+                        frame.home == HomeSlotKey::new(0, 0)
+                            && matches!(frame.values, ValuePack::Fixed(pack)
+                                if pack.start.index() == 0 && pack.len == 1)
+                    });
+            }
+        }
+    }
+    let protos = module
+        .protos
+        .iter()
+        .map(|proto| {
+            if dialect != DecompileDialect::Lua54 || proto.signature.is_vararg {
+                return (false, false);
+            }
+            let Some(facts) = promotion.get(proto.id.index()) else {
+                return (false, false);
+            };
+            let returns = Returns {
+                facts,
+                seen: false,
+                valid: true,
+            };
+            let effects = crate::hir::expr_safety::HirEvalEffects::new(
+                crate::hir::expr_safety::HirExprSafety::for_dialect(dialect),
+                |stmt| matches!(stmt, HirStmt::TableSetList(_) | HirStmt::ErrNil(_)
+                    | HirStmt::ToBeClosed(_) | HirStmt::NumericFor(_) | HirStmt::GenericFor(_))
+                    || matches!(stmt, HirStmt::Return(ret) if ret.pending_cleanup_source.is_some()),
+            );
+            let mut collectors = (returns, effects);
+            visit_stmts(&proto.body.stmts, &mut collectors);
+            let (returns, effects) = collectors;
+            (
+                returns.seen && returns.valid,
+                facts.empty_call_preserves_frame() && !effects.found(),
+            )
+        })
+        .collect();
+    TerminalClosureFacts { values, protos }
+}
+
+/// 终端普通 CALL 的值必为 Lua closure，且 maker 在原 r0 返回相同值时，额外
+/// callee COPY 才不承担旧 scratch 资源的覆盖责任；闭包还须没有入口调整与原槽写入。
+/// 即使本体无观察，下移的写入也会改变返回后下一次 lookup 看到的旧根（results_06）。
+/// 两槽写域、当前 lexical epoch 与整个源码前缀仍由原 owner 签证；未知 callable、
+/// 参数准备及非终端后缀不领此许可。
+fn terminal_closure_result(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    terminal: &TerminalClosureFacts,
+    first: &FlatStmt<'_>,
+    sink: &FlatStmt<'_>,
+) -> Option<Plan> {
+    let dialect = DecompileDialect::Lua54;
+    let HirStmt::LocalDecl(decl) = first.stmt else {
+        return None;
+    };
+    let ([local], [HirExpr::Call(inner)], None) = (
+        decl.bindings.as_slice(),
+        decl.values.fixed.as_slice(),
+        &decl.values.tail,
+    ) else {
+        return None;
+    };
+    let HirStmt::CallStmt(outer) = sink.stmt else {
+        return None;
+    };
+    let outer = &outer.call;
+    if outer.callee != HirExpr::LocalRef(*local)
+        || !outer.args.is_empty()
+        || outer.is_method()
+        || inner.is_method()
+        || outer.fastcall.is_some()
+        || !terminal.protos[terminal.values.call_target(inner)?.index()].0
+        || !terminal.protos[terminal.values.call_result_callee(inner, 0)?.index()].1
+        || context.proto.local_debug_hints[local.index()].is_some()
+        || context.proto.local_debug_scopes[local.index()].is_some()
+        || matches!(context.proto.inline_dispositions.local(*local),
+            crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix))
+    {
+        return None;
+    }
+    let base = facts.call_result_statement_home(*local, inner, outer)?;
+    if facts
+        .complete_local_definition_write_homes(*local)
+        .iter()
+        .any(|home| context.barred.contains(home) || context.closed.contains(home))
+    {
+        return None;
+    }
+    let mut builder = frame_builder(context, &[], facts, dialect, base.slot())?;
+    let inner = builder.call(inner, 0, base.slot(), false, CallWidth::Single)?;
+    let mut call = outer.clone();
+    call.callee = HirExpr::Call(Box::new(inner));
+    // 原外层 CALL/COPY 的物理布局已整体消费。新调用复用内层结果 home，不能让
+    // 后续 query 再把原 source site 的高槽参数/根协议当作当前重发帧。
+    call.source_site = None;
+    call.argument_roots.clear();
+    call.frame_root_ends.clear();
+    call.callee_root_handoff = None;
+    call.method_rewrite_transaction = None;
+    Some(Plan {
+        start: first.id,
+        sink: sink.id,
+        base,
+        values: vec![HirExpr::Call(Box::new(call))].into(),
+        result_locals: Vec::new(),
+        discarded_result: None,
+        assignment_targets: Vec::new(),
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        removed: vec![first.id],
+    })
 }
 
 /// 普通帧和独立构造器共用同一坐标/占用索引；未提交的 scope preview 与直接提交
@@ -187,6 +486,26 @@ fn collect_native_plans(
     plans.extend(constructors.into_iter().filter(|plan| {
         !occupied.contains(&plan.sink) && plan.removed.iter().all(|index| !occupied.contains(index))
     }));
+    // ProofIncomplete：正向 preview 的 missing 检查不证明下一轮写前读取。
+    // repeat 内既有 binding 的赋值不能退休；每轮新建的 LocalDecl 仍走原身份/帧证明。
+    // 普通帧与构造器统一过滤，避免新增的 body 候选绕过同一回边限制。
+    let mut repeat_assignments = vec![false; stmt_count];
+    let mut repeat_depth = 0;
+    prefix::coordinates::visit(
+        &context.proto.body,
+        &mut 0,
+        &mut |index, kind, stmt| match (kind, stmt) {
+            (PointKind::Statement, HirStmt::Repeat(_)) => repeat_depth += 1,
+            (PointKind::RepeatCondition, _) => repeat_depth -= 1,
+            (PointKind::Statement, HirStmt::Assign(_))
+                if repeat_depth > 0 && scalar_binding(stmt).is_some() =>
+            {
+                repeat_assignments[index] = true;
+            }
+            _ => {}
+        },
+    );
+    plans.retain(|plan| plan.removed.iter().all(|index| !repeat_assignments[*index]));
     plans.sort_unstable_by_key(|plan| plan.sink);
     (plans, stmt_count)
 }
@@ -216,18 +535,30 @@ fn commit_plans(
     if plans.is_empty() {
         return false;
     }
-    let Some(mut preview) = build_preview(proto, &plans, stmt_count) else {
-        return false;
-    };
-    let preserved = match validate_plan_batch(&mut preview, &plans, facts, dialect, is_chunk_entry)
-    {
-        Ok(preserved) => preserved,
+    // 声明恢复截断未知后缀，前缀验证撤回被拒绝请求所在词法块的后缀；各重建至多一次。
+    // 不循环逐个试探候选，整批树预览仍只有常数次扫描/克隆。
+    let mut preview = match build_preview(proto, &plans, stmt_count) {
+        Ok(preview) => preview,
         Err(index) => {
             plans.retain(|plan| plan.start < index);
             if plans.is_empty() {
                 return false;
             }
-            let Some(revised) = build_preview(proto, &plans, stmt_count) else {
+            let Ok(preview) = build_preview(proto, &plans, stmt_count) else {
+                return false;
+            };
+            preview
+        }
+    };
+    let preserved = match validate_plan_batch(&mut preview, &plans, facts, dialect, is_chunk_entry)
+    {
+        Ok(preserved) => preserved,
+        Err(failures) => {
+            plans.retain(|plan| !failures.rejects(plan.start));
+            if plans.is_empty() {
+                return false;
+            }
+            let Ok(revised) = build_preview(proto, &plans, stmt_count) else {
                 return false;
             };
             preview = revised;
@@ -240,31 +571,40 @@ fn commit_plans(
         }
     };
     let mut preserved = preserved;
-    preserved.extend(plans.iter().filter_map(|plan| plan.result_local));
+    preserved.extend(
+        plans
+            .iter()
+            .flat_map(|plan| plan.result_locals.iter().copied()),
+    );
     compact_scope(&mut preview.proto.body, &preview.removed, &mut 0);
+    let mut changed = plans.iter().any(|plan| !plan.only_preserves_call_prefix());
     for local in preserved {
-        preview
+        changed |= preview
             .proto
             .inline_dispositions
             .preserve_local(local, HirInlineRetentionReason::PhysicalFramePrefix);
     }
     *proto = preview.proto;
-    true
+    changed
 }
 
-/// 两类声明/依赖验证都返回首个无证候选的开始位置；统一截断一次，避免后段阻塞独立前缀。
+/// 前缀拒绝按词法后缀返回，声明/退休依赖失败保持其未知后缀；撤回后统一重建验证。
 fn validate_plan_batch(
     preview: &mut Preview,
     plans: &[Plan],
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
     is_chunk_entry: bool,
-) -> Result<BTreeSet<LocalId>, usize> {
+) -> Result<BTreeSet<LocalId>, prefix::PrefixFailures> {
     let Preview { proto, removed } = preview;
-    let candidates = plans
+    let mut candidates = plans
         .iter()
+        .filter(|plan| !plan.only_preserves_call_prefix())
         .map(Plan::prefix_request)
         .collect::<BTreeMap<_, _>>();
+    let dependent =
+        retained_inputs::require_suffix_frames(proto, removed, plans, facts, &mut candidates)
+            .map_err(prefix::PrefixFailures::invalid_from)?;
     let preserved = prefix::validate_prefixes(
         proto,
         facts,
@@ -273,7 +613,8 @@ fn validate_plan_batch(
         removed,
         &candidates,
         false,
-    )?;
+    )
+    .map_err(|failed| failed.with_dependent_suffix(dependent))?;
     let retained = plans
         .iter()
         .flat_map(|plan| {
@@ -284,7 +625,7 @@ fn validate_plan_batch(
         .collect::<BTreeMap<_, _>>();
     let mut failed = 0;
     if !retained.is_empty() {
-        visit_scope_mut(&mut proto.body, &mut 0, &mut |index, stmt| {
+        visit_scope_mut(&mut proto.body, &mut 0, &mut |index, _, stmt| {
             let Some(&(target, source, owner)) = retained.get(&index) else {
                 return Some(());
             };
@@ -299,7 +640,7 @@ fn validate_plan_batch(
             }
             Some(())
         })
-        .ok_or(failed)?;
+        .ok_or_else(|| prefix::PrefixFailures::invalid_from(failed))?;
     }
     Ok(preserved)
 }
@@ -320,6 +661,25 @@ fn collect_plans(
     plans: &mut Vec<Plan>,
 ) {
     let first_plan = plans.len();
+    let mut boolean_prewrites = BTreeMap::new();
+    for (initial, result, home) in facts.boolean_value_prewrites() {
+        if let Some(local) = facts.promoted_local_for_temp(result) {
+            // 多个值版本落入同一 Local 时，不按遍历次序任选原结果身份。
+            boolean_prewrites
+                .entry(local)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some((initial, result, home)));
+        }
+    }
+    let mut read_locals = BTreeSet::new();
+    visit_stmts(
+        &proto.body.stmts,
+        &mut super::super::mention::BindingReadCollector(|binding| {
+            if let HirBinding::Local(local) = binding {
+                read_locals.insert(local);
+            }
+        }),
+    );
     let mut flat = Vec::new();
     flatten_scope(block, stmt_count, &mut flat);
     let nested = tables::nested_producers(flat.iter().map(|entry| entry.map(|entry| entry.stmt)));
@@ -358,6 +718,10 @@ fn collect_plans(
     }
     let mut start = 0;
     let mut lookup_attempt_start = None;
+    let mut conditional_attempt_start = None;
+    let mut operation_attempt_start = None;
+    let mut logical_attempt_start = None;
+    let mut scalar_assignment_attempt_start = None;
     let mut constructor_high = None::<usize>;
     for (index, entry) in flat.iter().enumerate() {
         if index < start {
@@ -368,6 +732,182 @@ fn collect_plans(
             constructor_high = None;
             continue;
         };
+        if dialect == DecompileDialect::Lua54
+            && scalar_assignment_attempt_start != Some(start)
+            && let Some((_, HirExpr::Call(call))) = scalar_local(stmt)
+            && facts.native_scalar_assignment(call).is_some()
+            && let (Some(Some(scalar)), Some(Some(copy))) =
+                (flat.get(index + 1), flat.get(index + 2))
+        {
+            // 一个未闭合 run 只建一次定义索引；拒绝后不对增长的前缀逐 CALL 重试。
+            scalar_assignment_attempt_start = Some(start);
+            let run = flat[start..=index]
+                .iter()
+                .map(|entry| entry.unwrap().stmt)
+                .collect::<Vec<_>>();
+            if let Some(mut plan) = scalar_assignment_plan(
+                NativeFrameContext {
+                    proto,
+                    barred,
+                    closed,
+                    constants_fit_rk,
+                },
+                &run,
+                facts,
+                dialect,
+                scalar.stmt,
+                copy.stmt,
+            ) {
+                plan.removed = flat[start + plan.start..index + 2]
+                    .iter()
+                    .map(|entry| entry.unwrap().id)
+                    .collect();
+                plan.start = plan.removed[0];
+                plan.sink = copy.id;
+                plans.push(plan);
+                start = index + 3;
+                constructor_high = None;
+                continue;
+            }
+        }
+        if dialect == DecompileDialect::Luau
+            && index > start
+            && let HirStmt::LocalDecl(decl) = stmt
+            && let [target] = decl.bindings.as_slice()
+            && let Some(&Some((initial, result, home))) = boolean_prewrites.get(target)
+            // 高槽 Boolean 可能仍属于后续较低 CALL 的参数准备；独立 initializer
+            // 不能先消费其 false 预写并截断 run，否则完整调用再无入口事件可用。
+            && following_frame_floor[index]
+                .all
+                .is_none_or(|floor| home.slot() < floor)
+            && let Some(previous) = flat[index - 1]
+            && let Some(plan) = boolean_value_initializer(
+                NativeFrameContext {
+                    proto,
+                    barred,
+                    closed,
+                    constants_fit_rk,
+                },
+                facts,
+                previous,
+                FlatStmt { id: stmt_id, stmt },
+                (initial, result, home),
+                &read_locals,
+            )
+        {
+            plans.push(plan);
+            start = index + 1;
+            constructor_high = None;
+            continue;
+        }
+        if conditional_attempt_start != Some(start)
+            && matches!(scalar_local(stmt), Some((_, HirExpr::Call(call)))
+                if call.source_site.and_then(|source| facts.conditional_value_result(source)).is_some())
+            && let Some(next) = flat.get(index + 1).and_then(|entry| *entry)
+            && matches!(scalar_local(next.stmt), Some((_, HirExpr::Integer(_))))
+        {
+            conditional_attempt_start = Some(start);
+            let run = flat[start..=index]
+                .iter()
+                .map(|entry| entry.unwrap().stmt)
+                .collect::<Vec<_>>();
+            if let Some(mut plan) = conditional_value_initializer(
+                NativeFrameContext {
+                    proto,
+                    barred,
+                    closed,
+                    constants_fit_rk,
+                },
+                &run,
+                facts,
+                dialect,
+                index - start,
+                next.stmt,
+            ) {
+                plan.removed = flat[start + plan.start..=index]
+                    .iter()
+                    .map(|entry| entry.unwrap().id)
+                    .collect();
+                plan.start = plan.removed[0];
+                plan.sink = next.id;
+                plans.push(plan);
+                start = index + 2;
+                constructor_high = None;
+                continue;
+            }
+        }
+        if (dialect == DecompileDialect::Luau || matches!(stmt, HirStmt::Assign(_)))
+            && operation_attempt_start != Some(start)
+            && scalar_local(stmt)
+                .and_then(|(_, value)| operation_call_input(value))
+                .is_some_and(|(source, _)| facts.operation_result_home(source).is_some())
+        {
+            operation_attempt_start = Some(start);
+            let run = flat[start..index]
+                .iter()
+                .map(|entry| entry.unwrap().stmt)
+                .collect::<Vec<_>>();
+            if let Some(mut plan) = operation_call_frame(
+                NativeFrameContext {
+                    proto,
+                    barred,
+                    closed,
+                    constants_fit_rk,
+                },
+                &run,
+                facts,
+                dialect,
+                stmt,
+            ) {
+                plan.removed = flat[start + plan.start..index]
+                    .iter()
+                    .map(|entry| entry.unwrap().id)
+                    .collect();
+                plan.start = *plan
+                    .removed
+                    .first()
+                    .expect("arithmetic frame consumes its CALL input");
+                plan.sink = stmt_id;
+                plans.push(plan);
+                start = index + 1;
+                constructor_high = None;
+                continue;
+            }
+        }
+        if logical_attempt_start != Some(start)
+            && scalar_local(stmt).is_some_and(|(_, value)| {
+                matches!(value, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+            })
+        {
+            logical_attempt_start = Some(start);
+            let run = flat[start..index]
+                .iter()
+                .map(|entry| entry.unwrap().stmt)
+                .collect::<Vec<_>>();
+            if let Some(mut plan) = logical_call_result_frame(
+                NativeFrameContext {
+                    proto,
+                    barred,
+                    closed,
+                    constants_fit_rk,
+                },
+                &run,
+                facts,
+                dialect,
+                stmt,
+            ) {
+                plan.removed = flat[start + plan.start..index]
+                    .iter()
+                    .map(|entry| entry.unwrap().id)
+                    .collect();
+                plan.start = plan.removed[0];
+                plan.sink = stmt_id;
+                plans.push(plan);
+                start = index + 1;
+                constructor_high = None;
+                continue;
+            }
+        }
         if let HirStmt::GenericFor(for_) = stmt {
             let run = flat[start..index]
                 .iter()
@@ -400,7 +940,10 @@ fn collect_plans(
                 continue;
             }
         }
-        if matches!(stmt, HirStmt::If(_) | HirStmt::NumericFor(_)) {
+        if matches!(
+            stmt,
+            HirStmt::If(_) | HirStmt::NumericFor(_) | HirStmt::Repeat(_)
+        ) {
             let run = flat[start..index]
                 .iter()
                 .map(|entry| entry.as_ref().unwrap().stmt)
@@ -414,6 +957,9 @@ fn collect_plans(
             let candidate = match stmt {
                 HirStmt::If(if_) => comparison_plan(context, &run, facts, dialect, &if_.cond),
                 HirStmt::NumericFor(for_) => numeric_for_plan(context, &run, facts, dialect, for_),
+                HirStmt::Repeat(repeat) => {
+                    repeat_condition_plan(context, &run, facts, dialect, &repeat.cond)
+                }
                 _ => unreachable!(),
             };
             if let Some(mut plan) = candidate {
@@ -431,6 +977,42 @@ fn collect_plans(
             start = index + 1;
             constructor_high = None;
             continue;
+        }
+        if dialect == DecompileDialect::Luau
+            && index > start
+            && lookup_attempt_start != Some(start)
+            && let Some((HirBinding::Temp(target), HirExpr::TableAccess(access))) =
+                scalar_binding(stmt)
+            && let Some(home) = facts.trusted_temp_home_slot(target)
+            && following_frame_floor[index].all.is_none()
+        {
+            // cleanup 前的临时结果仍由原 Assign 拥有；不跨 CLOSE 合并 RETURN。
+            // 同一 run 至多构建一次索引，原始布局与整批 prefix 决定是否能收回 CALL。
+            lookup_attempt_start = Some(start);
+            let run = flat[start..index]
+                .iter()
+                .map(|entry| entry.unwrap().stmt)
+                .collect::<Vec<_>>();
+            let context = NativeFrameContext {
+                proto,
+                barred,
+                closed,
+                constants_fit_rk,
+            };
+            if let Some(mut plan) =
+                lookup_initializer(context, &run, facts, dialect, None, access, home)
+            {
+                plan.removed = flat[start + plan.start..index]
+                    .iter()
+                    .map(|entry| entry.unwrap().id)
+                    .collect();
+                plan.start = plan.removed[0];
+                plan.sink = stmt_id;
+                plans.push(plan);
+                start = index + 1;
+                constructor_high = None;
+                continue;
+            }
         }
         if !matches!(dialect, DecompileDialect::Luajit | DecompileDialect::Luau)
             && index > start
@@ -465,7 +1047,7 @@ fn collect_plans(
                 constants_fit_rk,
             };
             if let Some(mut plan) =
-                lookup_initializer(context, &run, facts, dialect, target, access, home)
+                lookup_initializer(context, &run, facts, dialect, Some(target), access, home)
             {
                 plan.removed = flat[start + plan.start..index]
                     .iter()
@@ -505,6 +1087,7 @@ fn collect_plans(
         if index > start
             && let Some(Some(previous)) =
                 index.checked_sub(1).and_then(|previous| flat.get(previous))
+            && !matches!(stmt, HirStmt::Assign(assign) if assign.generic_for_initializer_producer.is_some())
             && let Some((call, width)) = batched_initializer(previous.stmt, stmt, facts)
         {
             // locals 的整组空声明只是待消费的初始化事务；按原 CALL 帧重发后，
@@ -553,10 +1136,13 @@ fn collect_plans(
                         fixed: Vec::new(),
                         tail: Some(HirPackTail::exact(HirExpr::Call(Box::new(call)), width)),
                     },
-                    result_local: None,
+                    result_locals: Vec::new(),
                     discarded_result: None,
-                    assignment_targets: assignment.map_or_else(Vec::new, |(_, targets)| targets),
+                    assignment_targets: assignment.map_or_else(Vec::new, |(_, targets)| {
+                        targets.into_iter().map(HirLValue::Local).collect()
+                    }),
                     indexed_target: None,
+                    continuing_root: None,
                     retained_copies: Vec::new(),
                     removed,
                 });
@@ -662,6 +1248,7 @@ fn collect_plans(
                 | DecompileDialect::Lua54
                 | DecompileDialect::Lua55
                 | DecompileDialect::Luau
+                | DecompileDialect::Luajit
         ) && index > start
             && let HirStmt::Assign(assign) = stmt
             && let ([target], [HirExpr::LocalRef(source)], None) = (
@@ -687,8 +1274,8 @@ fn collect_plans(
             // CALL 会冻结外层 seed 的前缀，使原开放数组无法合并（regress_33）。
             && (!assignment_targets.is_empty() || !nested.contains(&(index - 1)))
         {
-            // PUC/Luau 的活动低槽赋值在空闲区准备单结果调用，再 MOVE 回目标。把该 scratch
-            // 留成独立 local 会让每次重编译再开一槽；完整事务保留目标与两次原写。
+            // 活动低槽赋值在空闲区准备单结果调用，再 MOVE 回目标。LuaJIT 的 frame gap
+            // 由原 args 布局和共享 builder 核对；完整事务保留目标与两次原写。
             let run = flat[start..index]
                 .iter()
                 .map(|entry| entry.unwrap().stmt)
@@ -737,10 +1324,14 @@ fn collect_plans(
                     sink: stmt_id,
                     base: frame.home,
                     values: vec![value].into(),
-                    result_local: None,
+                    result_locals: Vec::new(),
                     discarded_result: None,
-                    assignment_targets,
+                    assignment_targets: assignment_targets
+                        .into_iter()
+                        .map(HirLValue::Local)
+                        .collect(),
                     indexed_target: None,
+                    continuing_root: None,
                     retained_copies,
                     removed,
                 });
@@ -750,8 +1341,11 @@ fn collect_plans(
             continue;
         }
         if let HirStmt::Return(ret) = stmt
-            && !ret.values.fixed.is_empty()
+            && (!ret.values.fixed.is_empty()
+                || (dialect == DecompileDialect::Luau && ret.values.tail.is_some()))
         {
+            // Luau 的 return f(...) 是普通开放 CALL 加 RETURN，没有 TAILCALL。
+            // 连同原 RETURN 来源走开放返回帧，不能向 CALL 请求不存在的 Tail 协议。
             let run = flat[start..index]
                 .iter()
                 .map(|entry| entry.as_ref().unwrap().stmt)
@@ -835,20 +1429,38 @@ fn collect_plans(
                         .all
                         .is_some_and(|floor| frame.home.slot() < floor)
                 });
-        let concat_initializer = scalar_local(stmt).and_then(|(local, value)| {
+        let concat_value = scalar_local(stmt)
+            .map(|(local, value)| (Some(local), value))
+            .or_else(|| {
+                let HirStmt::Assign(assign) = stmt else {
+                    return None;
+                };
+                let ([HirLValue::Upvalue(_)], [value], None) = (
+                    assign.targets.as_slice(),
+                    assign.values.fixed.as_slice(),
+                    &assign.values.tail,
+                ) else {
+                    return None;
+                };
+                (dialect == DecompileDialect::Luau).then_some((None, value))
+            });
+        let concat_sink = concat_value.and_then(|(local, value)| {
             let HirExpr::Binary(binary) = value else {
                 return None;
             };
-            if matches!(dialect, DecompileDialect::Luajit | DecompileDialect::Luau)
+            if dialect == DecompileDialect::Luajit
+                || (dialect == DecompileDialect::Luau && local.is_some())
                 || binary.op != crate::hir::common::HirBinaryOpKind::Concat
             {
                 return None;
             }
             let home = facts.operation_result_home(binary.source_site?)?;
-            (facts.trusted_local_home_slot(local) == Some(home)
-                && following_frame_floor[index]
-                    .all
-                    .is_none_or(|floor| home.slot() < floor))
+            (local.is_none_or(|local| facts.trusted_local_home_slot(local) == Some(home))
+                // 上值写不冻结新的源码 local；只有独立 local 初始化需要低于后继帧。
+                && (local.is_none()
+                    || following_frame_floor[index]
+                        .all
+                        .is_none_or(|floor| home.slot() < floor)))
             .then_some((local, binary, home))
         });
         let discarded_result = (|| {
@@ -920,10 +1532,11 @@ fn collect_plans(
                     sink: stmt_id,
                     base: home,
                     values: vec![HirExpr::Call(Box::new(call))].into(),
-                    result_local: None,
+                    result_locals: Vec::new(),
                     discarded_result: Some(local),
                     assignment_targets: Vec::new(),
                     indexed_target: None,
+                    continuing_root: None,
                     retained_copies: Vec::new(),
                     removed,
                 });
@@ -941,15 +1554,32 @@ fn collect_plans(
                     let frame = facts.generic_for_body_frame(for_)?;
                     if tail
                         .exact_width()
-                        .is_some_and(|width| width != frame.iterator_width)
-                        || facts.native_call_layout(call)?.home != *frame.controls.first()?
+                        .is_some_and(|width| width != frame.initializers.len())
+                        || facts.native_call_layout(call)?.home != *frame.initializers.first()?
                     {
                         return None;
                     }
-                    Some((call.as_ref(), CallWidth::Fixed(frame.iterator_width)))
+                    Some((call.as_ref(), CallWidth::Fixed(frame.initializers.len())))
                 })
             }
             HirStmt::CallStmt(sink) => Some((&sink.call, CallWidth::Ignore)),
+            HirStmt::GlobalDecl(decl) if dialect == DecompileDialect::Lua55 => {
+                // 只消费 protocol owner 已恢复的完整调用 RHS，不拆分 probe/store 或补结果。
+                match (decl.values.fixed.as_slice(), &decl.values.tail) {
+                    ([HirExpr::Call(call)], None) if decl.names.len() == 1 => {
+                        Some((call.as_ref(), CallWidth::Single))
+                    }
+                    ([], Some(tail)) if tail.exact_width() == Some(decl.names.len()) => {
+                        match tail.as_expr() {
+                            HirExpr::Call(call) => {
+                                Some((call.as_ref(), CallWidth::Fixed(decl.names.len())))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
             HirStmt::Return(ret) if ret.values.fixed.is_empty() => {
                 ret.values.tail.as_ref().and_then(|tail| {
                     if tail.exact_width().is_some() {
@@ -973,7 +1603,7 @@ fn collect_plans(
             }),
             _ => None,
         };
-        if sink.is_some() || concat_initializer.is_some() {
+        if sink.is_some() || concat_sink.is_some() {
             // 无条件 scope 入口没有求值；只借用当前连续语句，出口 marker 切断 run。
             let stmts = flat[start..=index]
                 .iter()
@@ -995,7 +1625,7 @@ fn collect_plans(
                     call,
                     width,
                 ),
-                None => concat_initializer.and_then(|(local, binary, home)| {
+                None => concat_sink.and_then(|(local, binary, home)| {
                     let run = &stmts[..stmts.len() - 1];
                     let mut builder = frame_builder(context, run, facts, dialect, home.slot())?;
                     let value = builder.concat(binary, run.len(), home.slot())?;
@@ -1005,10 +1635,11 @@ fn collect_plans(
                         sink: run.len(),
                         base: home,
                         values: vec![value].into(),
-                        result_local: Some(local),
+                        result_locals: local.into_iter().collect(),
                         discarded_result: None,
                         assignment_targets: Vec::new(),
                         indexed_target: None,
+                        continuing_root: None,
                         retained_copies: Vec::new(),
                         removed: Vec::new(),
                     })
@@ -1019,23 +1650,20 @@ fn collect_plans(
                     .iter()
                     .map(|entry| entry.as_ref().unwrap().id)
                     .collect();
-                plan.start = *plan
-                    .removed
-                    .first()
-                    .expect("accepted frame consumes a producer");
+                plan.start = plan.removed.first().copied().unwrap_or(stmt_id);
                 plan.sink = stmt_id;
                 plans.push(plan);
             }
         }
-        let constructor_step =
-            !matches!(dialect, DecompileDialect::Luajit | DecompileDialect::Luau)
-                && (super::super::table_constructors::constructor_write(stmt).is_some()
-                    || matches!(stmt, HirStmt::LocalRootRelease(_)));
+        // 三类 VM 的字段/SETLIST 都已由 FrameBuilder 核对原布局与事件；
+        // 收集器保留完整参数构造区，不能在接收 CALL 前先丢掉其 allocation/callee。
+        let constructor_step = super::super::table_constructors::constructor_write(stmt).is_some()
+            || matches!(stmt, HirStmt::LocalRootRelease(_));
         let pending_initializer = matches!(stmt, HirStmt::LocalDecl(decl)
             if decl.values.is_empty() && decl.initializer_merge_transaction.is_some())
             || matches!(stmt, HirStmt::Assign(assign) if assign.generic_for_initializer_producer.is_some());
         if initializer
-            || concat_initializer.is_some()
+            || concat_sink.is_some()
             || (scalar_binding(stmt).is_none() && !constructor_step && !pending_initializer)
         {
             // 含表的完整 initializer 每段最多尝试一次；拒绝的表也不能作为后续调用树
@@ -1100,10 +1728,7 @@ fn generic_for_dispatch_plan(
 ) -> Option<Plan> {
     let frame = facts.generic_for_body_frame(for_)?;
     let dispatch = for_.body_frame_source?;
-    if frame.controls.len() != frame.iterator_width {
-        return None;
-    }
-    let base = *frame.controls.first()?;
+    let base = *frame.initializers.first()?;
     let results = for_
         .dispatch_results
         .iter()
@@ -1149,47 +1774,72 @@ fn generic_for_dispatch_plan(
     if assign
         .targets
         .iter()
-        .zip(&frame.controls)
+        .zip(&frame.initializers)
         .any(|(target, home)| {
-            let HirLValue::Temp(temp) = target else {
-                return true;
+            let (home_slot, has_debug) = match target {
+                HirLValue::Temp(temp) => (
+                    facts.trusted_temp_home_slot(*temp),
+                    context
+                        .proto
+                        .temp_debug_locals
+                        .get(temp.index())
+                        .is_some_and(Option::is_some),
+                ),
+                HirLValue::Local(local) => (
+                    facts.trusted_local_home_slot(*local),
+                    context.proto.local_debug_hints[local.index()].is_some()
+                        || context.proto.local_debug_scopes[local.index()].is_some(),
+                ),
+                _ => return true,
             };
-            facts.trusted_temp_home_slot(*temp) != Some(*home)
-                || context
-                    .proto
-                    .temp_debug_locals
-                    .get(temp.index())
-                    .is_some_and(Option::is_some)
+            home_slot != Some(*home)
+                || has_debug
                 || context.barred.contains(home)
                 || context.closed.contains(home)
         })
     {
         return None;
     }
-    let prefix_run = &run[..initializer];
+    // locals 的整组空声明必须与同一 CALL 初始化一起消费，不能抬高准备区前缀。
+    let prefix_end = if assign
+        .targets
+        .iter()
+        .any(|target| matches!(target, HirLValue::Local(_)))
+    {
+        let declaration = initializer.checked_sub(1)?;
+        let (_, width) = batched_initializer(run[declaration], run[initializer], facts)?;
+        if width != frame.initializers.len() {
+            return None;
+        }
+        declaration
+    } else {
+        initializer
+    };
+    let prefix_run = &run[..prefix_end];
     let mut builder = frame_builder(context, prefix_run, facts, dialect, base.slot())?;
     let call = builder.call(
         call,
         prefix_run.len(),
         base.slot(),
         true,
-        CallWidth::Fixed(frame.iterator_width),
+        CallWidth::Fixed(frame.initializers.len()),
     )?;
     if builder.first_event.is_some() && builder.next_event != prefix_run.len() {
         return None;
     }
     Some(Plan {
-        start: builder.first_event.unwrap_or(initializer),
+        start: builder.first_event.unwrap_or(prefix_end),
         sink: run.len(),
         base,
         values: HirValuePack {
             fixed: Vec::new(),
             tail: Some(HirPackTail::open(HirExpr::Call(Box::new(call)))),
         },
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -1240,8 +1890,92 @@ fn batched_initializer<'a>(
     Some((call, width))
 }
 
-/// 低槽 Local 写与低槽表字段写共用单结果 CALL 帧。字段目标在源码 RHS 前求值，
-/// 因此仅接受未捕获的直接低槽 base 和原内嵌 key，不能提前快照可被 CALL 改写的 base。
+/// `a,b=f(),9` 的 CALL、标量写和结果 COPY 共同恢复；先在原 scratch 求值，再按
+/// 原顺序写回两项。参数是已存在的低槽绑定，不为它创建 Local 占位或改写返回身份。
+/// 三个原 Def 由 Promotion 签证；这里只匹配当前树并复用完整帧/声明后缀事务。
+fn scalar_assignment_plan(
+    context: NativeFrameContext<'_>,
+    run: &[&HirStmt],
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    scalar: &HirStmt,
+    copy: &HirStmt,
+) -> Option<Plan> {
+    let (source, HirExpr::Call(call)) = scalar_local(run.last()?)? else {
+        return None;
+    };
+    let frame = facts.native_call_frame(call)?;
+    let assignment = facts.native_scalar_assignment(call)?;
+    let (HirStmt::Assign(scalar), HirStmt::Assign(copy)) = (scalar, copy) else {
+        return None;
+    };
+    let ([scalar_target], [value], None) = (
+        scalar.targets.as_slice(),
+        scalar.values.fixed.as_slice(),
+        &scalar.values.tail,
+    ) else {
+        return None;
+    };
+    let ([target], [HirExpr::LocalRef(read)], None) = (
+        copy.targets.as_slice(),
+        copy.values.fixed.as_slice(),
+        &copy.values.tail,
+    ) else {
+        return None;
+    };
+    let home = |target: &HirLValue| match target {
+        HirLValue::Local(local) => facts.trusted_local_home_slot(*local),
+        HirLValue::Param(param) => facts.trusted_param_home_slot(*param),
+        _ => None,
+    };
+    if *read != source
+        || facts.promoted_local_for_temp(assignment.result) != Some(source)
+        || facts.trusted_local_home_slot(source) != Some(frame.home)
+        || home(scalar_target) != Some(assignment.scalar_home)
+        || home(target) != Some(assignment.target_home)
+        || !assignment.value.matches_hir_expr(value)
+        || [assignment.scalar_home, assignment.target_home]
+            .iter()
+            .any(|home| context.barred.contains(home) || context.closed.contains(home))
+    {
+        return None;
+    }
+    let mut builder = frame_builder(context, run, facts, dialect, frame.home.slot())?;
+    builder.result_move = Some((
+        source,
+        run.len() - 1,
+        BTreeSet::from([assignment.target_home]),
+    ));
+    let call = builder.expr(
+        &HirExpr::LocalRef(source),
+        run.len(),
+        frame.home.slot(),
+        None,
+        false,
+        true,
+        None,
+    )?;
+    let start = builder.first_event?;
+    if builder.next_event != run.len() {
+        return None;
+    }
+    Some(Plan {
+        start,
+        sink: 0,
+        base: frame.home,
+        values: vec![call, value.clone()].into(),
+        result_locals: Vec::new(),
+        discarded_result: None,
+        assignment_targets: vec![target.clone(), scalar_target.clone()],
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        removed: Vec::new(),
+    })
+}
+
+/// 低槽 Local 写与表字段写共用单结果 CALL 帧。寄存器 base 必须保持原低槽身份；
+/// PUC SETTABUP 则在 CALL 后直接读取原上值 cell，不提前快照可被 CALL 改写的 base。
 fn call_assignment_targets(
     target: &HirLValue,
     result: HomeSlotKey,
@@ -1259,6 +1993,28 @@ fn call_assignment_targets(
             if constants_fit_rk
                 && !matches!(dialect, DecompileDialect::Luau | DecompileDialect::Luajit) =>
         {
+            if let HirExpr::UpvalueRef(base) = access.base {
+                // 候选拒绝[TargetConstraint]：只有 PUC5.2+ 原 SETTABUP 可无 base 临时槽；
+                // 动态 key 仍需独立准备协议，不能按当前字面量形状忽略原 key 槽。
+                if !matches!(
+                    dialect,
+                    DecompileDialect::Lua52
+                        | DecompileDialect::Lua53
+                        | DecompileDialect::Lua54
+                        | DecompileDialect::Lua55
+                ) {
+                    return None;
+                }
+                let layout = facts.native_upvalue_table_write_layout(access)?;
+                return (base == layout.base
+                    && layout.key.is_none()
+                    && layout.value == Some(result)
+                    && matches!(
+                        access.key,
+                        HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+                    ))
+                .then(Vec::new);
+            }
             let layout = facts.native_table_write_layout(access)?;
             let base = match &access.base {
                 HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
@@ -1395,10 +2151,18 @@ fn following_frame_floors(
         }
 
         fn visit_call(&mut self, call: &HirCallExpr) {
+            // 后继 FASTCALL 同样拥有原帧；布局已证明时不把它当成未知零下界。
+            // 此查询只决定候选边界，builtin、准备顺序及删除仍由 FASTCALL builder 核对。
             let slot = self
                 .facts
                 .native_call_layout(call)
-                .map_or(0, |frame| frame.home.slot());
+                .map(|frame| frame.home.slot())
+                .or_else(|| {
+                    self.facts
+                        .native_fastcall_frame(call)
+                        .map(|frame| frame.home.slot())
+                })
+                .unwrap_or(0);
             self.floor.all = Some(self.floor.all.map_or(slot, |old| old.min(slot)));
             // 合成 factory 调用没有原 CALL 参数区；不据它猜原 buffer 布局。
             // 有原来源但缺布局的调用仍以零下界阻断独立原 initializer 恢复。
@@ -1445,40 +2209,60 @@ fn flatten_scope<'a>(
     cursor: &mut usize,
     output: &mut Vec<Option<FlatStmt<'a>>>,
 ) {
-    for stmt in &block.stmts {
-        let id = *cursor;
-        *cursor += 1;
-        if let HirStmt::Block(child) = stmt {
-            flatten_scope(child, cursor, output);
-            output.push(None);
-        } else if let HirStmt::NumericFor(for_) = stmt {
-            output.push(Some(FlatStmt { id, stmt }));
-            output.push(None);
-            flatten_scope(&for_.body, cursor, output);
-            output.push(None);
-        } else if let HirStmt::While(while_) = stmt {
-            // 条件每轮求值；循环体的完整帧不能消费循环外或条件的准备。
+    prefix::coordinates::visit(block, cursor, &mut |id, kind, stmt| match (kind, stmt) {
+        (PointKind::Boundary, _) | (PointKind::Statement, HirStmt::Repeat(_)) => output.push(None),
+        (PointKind::Statement, HirStmt::Block(_)) => {}
+        (PointKind::Statement, HirStmt::While(_)) => {
             output.push(None);
             output.push(Some(FlatStmt { id, stmt }));
             output.push(None);
-            flatten_scope(&while_.body, cursor, output);
-            output.push(None);
-        } else if let HirStmt::GenericFor(for_) = stmt {
-            output.push(Some(FlatStmt { id, stmt }));
-            flatten_scope(&for_.body, cursor, output);
-            output.push(None);
-        } else if let HirStmt::If(if_) = stmt {
-            output.push(Some(FlatStmt { id, stmt }));
-            flatten_scope(&if_.then_block, cursor, output);
-            output.push(None);
-            if let Some(else_block) = &if_.else_block {
-                flatten_scope(else_block, cursor, output);
-                output.push(None);
-            }
-        } else {
-            output.push(Some(FlatStmt { id, stmt }));
         }
+        (PointKind::Statement, HirStmt::NumericFor(_)) => {
+            output.push(Some(FlatStmt { id, stmt }));
+            output.push(None);
+        }
+        _ => output.push(Some(FlatStmt { id, stmt })),
+    });
+}
+
+/// until 与 body 尾部准备属于同一轮；完整 CALL 重发原 callee 覆盖及参数帧。
+/// 分叉/continue/goto 已由扁平视图隔断，capture/debug/TBC 仍由共享 builder 拒绝。
+fn repeat_condition_plan(
+    context: NativeFrameContext<'_>,
+    run: &[&HirStmt],
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    condition: &HirExpr,
+) -> Option<Plan> {
+    let HirExpr::Call(call) = condition else {
+        return comparison_plan(context, run, facts, dialect, condition);
+    };
+    let frame = facts.native_call_frame(call)?;
+    let mut builder = frame_builder(context, run, facts, dialect, frame.home.slot())?;
+    let call = builder.call(
+        call,
+        run.len(),
+        frame.home.slot(),
+        true,
+        CallWidth::Fixed(1),
+    )?;
+    let start = builder.first_event?;
+    if builder.next_event != run.len() {
+        return None;
     }
+    Some(Plan {
+        start,
+        sink: run.len(),
+        base: frame.home,
+        values: vec![HirExpr::Call(Box::new(call))].into(),
+        result_locals: Vec::new(),
+        discarded_result: None,
+        assignment_targets: Vec::new(),
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        removed: Vec::new(),
+    })
 }
 
 fn numeric_header_base(
@@ -1604,10 +2388,11 @@ fn comparison_plan(
         sink: run.len(),
         base,
         values: vec![condition].into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -1676,10 +2461,11 @@ fn numeric_for_plan(
         sink: run.len(),
         base,
         values: values.into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -1815,22 +2601,40 @@ fn plan(
 ) -> Option<Plan> {
     if call.fastcall.is_some() {
         let mut plan = fastcall_plan(context, &stmts[..sink], facts, dialect, sink, call, width)?;
-        plan.result_local = scalar_local(stmts[sink]).map(|(local, _)| local);
+        plan.result_locals = scalar_local(stmts[sink])
+            .map(|(local, _)| local)
+            .into_iter()
+            .collect();
         return Some(plan);
     }
     let frame = facts.native_call_frame(call)?;
     let run = &stmts[..sink];
     let mut builder = frame_builder(context, run, facts, dialect, frame.home.slot())?;
     let call = builder.call(call, run.len(), frame.home.slot(), true, width)?;
-    let first = builder.first_event?;
-    if builder.next_event != run.len() {
-        return None;
-    }
+    let first = match builder.first_event {
+        Some(first) if builder.next_event == run.len() => first,
+        // 已经嵌入的完整 CALL 仍依赖原低槽声明前缀；没有 producer 可删不表示
+        // AST 可以删除前缀常量，让观察点的整帧下移。TAILCALL 搬移参数后，原准备区
+        // 仍可能留下 caller 可观察的残根；开放返回包同样发布前缀。共享 builder 核对全部事件。
+        None if matches!(width, CallWidth::Ignore | CallWidth::Tail)
+            || matches!(stmts[sink], HirStmt::GlobalDecl(_)) =>
+        {
+            sink
+        }
+        _ => return None,
+    };
     Some(Plan {
         start: first,
         sink,
         base: frame.home,
-        values: if matches!(width, CallWidth::Tail | CallWidth::Fixed(_)) {
+        values: if let CallWidth::Fixed(width) = width
+            && matches!(stmts[sink], HirStmt::GlobalDecl(_))
+        {
+            HirValuePack::expanding(
+                Vec::new(),
+                HirPackTail::exact(HirExpr::Call(Box::new(call)), width),
+            )
+        } else if matches!(width, CallWidth::Tail | CallWidth::Fixed(_)) {
             HirValuePack {
                 fixed: Vec::new(),
                 tail: Some(HirPackTail::open(HirExpr::Call(Box::new(call)))),
@@ -1838,12 +2642,87 @@ fn plan(
         } else {
             vec![HirExpr::Call(Box::new(call))].into()
         },
-        result_local: scalar_local(stmts[sink]).map(|(local, _)| local),
+        result_locals: scalar_local(stmts[sink])
+            .map(|(local, _)| local)
+            .into_iter()
+            .collect(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
+    })
+}
+
+/// 独立 Boolean initializer 也在原结果槽重发 ValueDecision 的 false 预写。
+/// 两个声明的身份来自同一原值决策，不按相邻 false/and 的源码外形猜配对。
+fn boolean_value_initializer(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    first: FlatStmt<'_>,
+    sink: FlatStmt<'_>,
+    (initial, result, home): (
+        crate::hir::common::TempId,
+        crate::hir::common::TempId,
+        HomeSlotKey,
+    ),
+    read_locals: &BTreeSet<LocalId>,
+) -> Option<Plan> {
+    let HirStmt::LocalDecl(initial_decl) = first.stmt else {
+        return None;
+    };
+    let ([initial_local], [HirExpr::Boolean(false)], None) = (
+        initial_decl.bindings.as_slice(),
+        initial_decl.values.fixed.as_slice(),
+        &initial_decl.values.tail,
+    ) else {
+        return None;
+    };
+    let (target, value) = scalar_local(sink.stmt)?;
+    if target == *initial_local
+        || !matches!(value, HirExpr::LogicalAnd(_))
+        || facts.promoted_local_for_temp(initial) != Some(*initial_local)
+        || facts.promoted_local_for_temp(result) != Some(target)
+        || read_locals.contains(initial_local)
+        || context.barred.contains(&home)
+        || context.closed.contains(&home)
+        || [*initial_local, target].iter().any(|local| {
+            context.proto.local_debug_hints[local.index()].is_some()
+                || context.proto.local_debug_scopes[local.index()].is_some()
+                || context
+                    .proto
+                    .inline_dispositions
+                    .local(*local)
+                    .must_preserve()
+                || facts.trusted_local_home_slot(*local) != Some(home)
+        })
+    {
+        return None;
+    }
+    let run = [first.stmt, sink.stmt];
+    let mut builder = frame_builder(context, &run, facts, DecompileDialect::Luau, home.slot())?;
+    if !builder.homes_match(*initial_local, 0, home.slot(), None, Some(initial))
+        || !builder.homes_match(target, 1, home.slot(), None, Some(result))
+    {
+        return None;
+    }
+    builder.finish_event(0)?;
+    builder.boolean_frame = Some(home.slot());
+    let value = builder.expr(value, 1, home.slot(), None, false, true, Some(result))?;
+    builder.finish_event(1)?;
+    Some(Plan {
+        start: first.id,
+        sink: sink.id,
+        base: home,
+        values: vec![value].into(),
+        result_locals: vec![target],
+        discarded_result: None,
+        assignment_targets: Vec::new(),
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        removed: vec![first.id],
     })
 }
 
@@ -1927,11 +2806,42 @@ fn fastcall_plan(
         {
             return None;
         }
-        let index = *builder.temp_definitions.get(&prewrite.initial)?;
-        if !matches!(scalar_binding(run[index]), Some((HirBinding::Temp(temp), HirExpr::Boolean(false))) if temp == prewrite.initial)
-        {
-            return None;
-        }
+        let index = if let Some(&index) = builder.temp_definitions.get(&prewrite.initial) {
+            if !matches!(scalar_binding(run[index]), Some((HirBinding::Temp(temp), HirExpr::Boolean(false))) if temp == prewrite.initial)
+            {
+                return None;
+            }
+            index
+        } else {
+            // 同一原预写可被 locals 接到复用的 callee Local；提升不改变其 Def 和 home。
+            // 只消费此 Local 的当前 false 写，旧声明及后续读取仍由整批 epoch 预览核对。
+            let local = facts.promoted_local_for_temp(prewrite.initial)?;
+            let index = builder.definition(local, run.len())?;
+            // 候选拒绝[ProofIncomplete]：当前写须与原预写的值、home 和完整写域对应。
+            // 候选拒绝[SemanticBarrier:BindingIdentity]：debug、捕获及已保留的声明身份不能借预写证书解除。
+            if !matches!(scalar_local(run[index]), Some((target, HirExpr::Boolean(false))) if target == local)
+                || facts.trusted_local_home_slot(local) != Some(prewrite.home)
+                || !builder.homes_match(
+                    local,
+                    index,
+                    prewrite.home.slot(),
+                    None,
+                    Some(prewrite.initial),
+                )
+                || context.proto.local_debug_hints[local.index()].is_some()
+                || context.proto.local_debug_scopes[local.index()].is_some()
+                || context
+                    .proto
+                    .inline_dispositions
+                    .local(local)
+                    .must_preserve()
+                || context.barred.contains(&prewrite.home)
+                || context.closed.contains(&prewrite.home)
+            {
+                return None;
+            }
+            index
+        };
         builder.finish_event(index)?;
     } else if !(matches!(value, HirExpr::Binary(_))
         || matches!(value, HirExpr::Unary(unary)
@@ -1956,12 +2866,17 @@ fn fastcall_plan(
     let mut arguments = vec![argument];
     if let [message] = message {
         let value = match message {
-            HirExpr::LocalRef(local) => {
-                scalar_local(run[builder.definition(*local, run.len())?])?.1
-            }
+            HirExpr::LocalRef(local) => builder
+                .definition(*local, run.len())
+                .and_then(|index| scalar_local(run[index]))
+                .map_or(message, |(_, value)| value),
             value => value,
         };
-        if !matches!(value, HirExpr::String(_)) {
+        if !matches!(value, HirExpr::String(_))
+            && !builder
+                .direct_home(value)
+                .is_some_and(|home| home.slot() < frame.home.slot())
+        {
             return None;
         }
         arguments.push(builder.expr(
@@ -1997,10 +2912,11 @@ fn fastcall_plan(
         sink,
         base: frame.home,
         values: vec![HirExpr::Call(Box::new(rebuilt))].into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -2107,10 +3023,11 @@ fn fastcall_open_plan(
         sink,
         base: frame.home,
         values: vec![HirExpr::Call(Box::new(rebuilt))].into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -2202,20 +3119,6 @@ fn fastcall_has_copy_arguments(call: &HirCallExpr) -> bool {
             if (0..call.args.fixed.len()).any(|index| !protocol.fixed_is_direct(index)))
 }
 
-/// 原 FASTCALL 已签发 builtin 身份，重建仍须保留裸全局或库字段拼写以重发快路径。
-fn fastcall_callee_is_named(callee: &HirExpr) -> bool {
-    let identifier = |name: &crate::lua_string::LuaString| {
-        name.as_utf8()
-            .is_some_and(|name| DecompileDialect::Luau.is_identifier_name(name))
-    };
-    match callee {
-        HirExpr::GlobalRef(global) => identifier(&global.key),
-        HirExpr::TableAccess(access) => matches!((&access.base, &access.key),
-            (HirExpr::GlobalRef(global), HirExpr::String(key)) if identifier(&global.key) && identifier(key)),
-        _ => false,
-    }
-}
-
 /// 非 direct 参数保持快速路径的低槽直读和 fallback 的逐参数 COPY，然后才求 callee。
 /// direct 参数先按原槽准备，嵌入常量在 fallback 才 LOADK；不按当前语句位置任意排序。
 /// 这两条路径必须一起恢复；不能按普通 CALL 的 callee-first 顺序提前移动参数准备。
@@ -2229,161 +3132,23 @@ fn fastcall_fixed_arguments_plan(
     call: &HirCallExpr,
     width: CallWidth,
 ) -> Option<Plan> {
-    let protocol @ crate::transformer::FastCallProtocol::Mask {
-        direct_tail: false, ..
-    } = call.fastcall?
-    else {
-        return None;
-    };
-    if dialect != DecompileDialect::Luau
-        || call.method != HirMethodCall::None
-        || call.args.tail.is_some()
-        || !(1..=3).contains(&call.args.fixed.len())
-    {
-        return None;
-    }
     let frame = facts.native_fastcall_frame(call)?;
-    let ValuePack::Fixed(args) = frame.args else {
-        return None;
-    };
-    if args.len != call.args.fixed.len()
-        || args.start.index() != frame.home.slot() + 1
-        || !match (width, frame.results) {
-            (CallWidth::Ignore, Some(ResultPack::Ignore)) => true,
-            (CallWidth::Single, Some(ResultPack::Fixed(pack))) => {
-                pack.start.index() == frame.home.slot() && pack.len == 1
-            }
-            _ => false,
-        }
-        || !frame.arguments_unaliased
-    {
-        return None;
-    }
-    let copies = facts.fastcall_argument_copies(call)?;
-    if copies.len()
-        != (0..args.len)
-            .filter(|index| !protocol.fixed_is_direct(*index))
-            .count()
-    {
-        return None;
-    }
     let mut builder = frame_builder(context, run, facts, dialect, frame.home.slot())?;
-    let mut arguments = vec![None; args.len];
-    let mut copies = copies.iter();
-    for prepare_direct in [true, false] {
-        for (index, argument) in call.args.fixed.iter().enumerate() {
-            let direct = protocol.fixed_is_direct(index);
-            let embedded = protocol.fixed_is_embedded_constant(index);
-            if (direct && !embedded) != prepare_direct {
-                continue;
-            }
-            let slot = args.start.index() + index;
-            if direct {
-                let value = builder.expr(
-                    argument,
-                    run.len(),
-                    slot,
-                    None,
-                    false,
-                    true,
-                    facts.call_argument_value(call, index),
-                )?;
-                let literal = matches!(
-                    value,
-                    HirExpr::Nil
-                        | HirExpr::Boolean(_)
-                        | HirExpr::Integer(_)
-                        | HirExpr::Number(_)
-                        | HirExpr::String(_)
-                );
-                let lookup = !embedded
-                    && matches!(&value, HirExpr::TableAccess(access)
-                if facts.table_read_result_home(access) == Some(HomeSlotKey::new(slot, 0))
-                    && facts.native_table_read_layout(access).is_some_and(|layout|
-                        layout.key.is_none()
-                            && layout.base.slot() < frame.home.slot()
-                            && builder.direct_home(&access.base) == Some(layout.base)));
-                // CALL 的单结果与完整原槽准备由 builder.call 签证；direct 阶段仍先于
-                // fallback COPY/lookup，不能借此移动未纳入同一事务的根释放。
-                let call = !embedded && matches!(value, HirExpr::Call(_));
-                // compileExprFastcallN 对非 local 参数调用 compileExprTempTop；已有
-                // builder 证明表字段/事件，原 allocation 还须落在当前 direct 参数槽。
-                let table = !embedded
-                    && matches!(&value, HirExpr::TableConstructor(table)
-                        if facts.allocation_result_home(table).is_some_and(|home| home.slot() == slot));
-                // 嵌入常量不能变成有事件的 RHS；其余表达式尚无此准备协议的证明。
-                if !literal && !lookup && !call && !table {
-                    return None;
-                }
-                arguments[index] = Some(value);
-                continue;
-            }
-            let copy = copies.next()?;
-            if copy.argument != index
-                || copy.home != HomeSlotKey::new(slot, 0)
-                || copy.source_home.slot() >= frame.home.slot()
-            {
-                return None;
-            }
-            let value = builder.expr(
-                argument,
-                run.len(),
-                slot,
-                None,
-                false,
-                true,
-                Some(copy.producer),
-            )?;
-            let home = match &value {
-                HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
-                HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
-                _ => None,
-            };
-            if home != Some(copy.source_home) {
-                return None;
-            }
-            arguments[index] = Some(value);
-        }
-    }
-    let arguments = arguments.into_iter().collect::<Option<Vec<_>>>()?;
-    let callee = builder.expr(
-        &call.callee,
-        run.len(),
-        frame.home.slot(),
-        None,
-        true,
-        false,
-        Some(frame.callee),
-    )?;
-    // 全局 builtin 拼写保留原 FASTCALL 分类；不把一般函数别名当作重新产生快路径的证书。
-    if !fastcall_callee_is_named(&callee) {
-        return None;
-    }
+    let rebuilt = builder.fastcall_fixed(call, run.len(), frame.home.slot(), width)?;
     let first = builder.first_event?;
     if builder.next_event != run.len() {
         return None;
     }
-    let rebuilt = HirCallExpr {
-        callee,
-        args: arguments.into(),
-        method: call.method,
-        method_key: call.method_key.clone(),
-        callee_root_handoff: call.callee_root_handoff,
-        method_rewrite_transaction: call.method_rewrite_transaction,
-        frame_root_ends: call.frame_root_ends.clone(),
-        source_site: call.source_site,
-        fastcall: call.fastcall,
-        argument_roots: call.argument_roots.clone(),
-    };
     Some(Plan {
         start: first,
         sink,
         base: frame.home,
         values: vec![HirExpr::Call(Box::new(rebuilt))].into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -2409,11 +3174,13 @@ fn return_plan(
         matches!(value, Some(HirExpr::Binary(binary))
             if binary.op == crate::hir::common::HirBinaryOpKind::Concat)
     });
+    let single_lookup = dialect == DecompileDialect::Luau
+        && matches!(ret.values.fixed.as_slice(), [HirExpr::TableAccess(_)]);
     match frame.values {
         ValuePack::Fixed(pack)
             if ret.values.tail.is_none()
                 && pack.len == ret.values.fixed.len()
-                && (pack.len > 1 || single_concat) => {}
+                && (pack.len > 1 || single_concat || single_lookup) => {}
         ValuePack::Open(_)
             if ret
                 .values
@@ -2428,6 +3195,11 @@ fn return_plan(
         .iter()
         .enumerate()
         .map(|(index, expr)| {
+            if dialect == DecompileDialect::Luau
+                && let HirExpr::TableAccess(access) = expr
+            {
+                return builder.luau_lookup(access, run.len(), frame.home.slot() + index);
+            }
             builder.expr(
                 expr,
                 run.len(),
@@ -2474,10 +3246,11 @@ fn return_plan(
         sink: run.len(),
         base: frame.home,
         values: HirValuePack { fixed, tail },
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -2563,8 +3336,9 @@ fn frame_builder<'a>(
         definitions,
         constructors,
         constructor_depth: 0,
+        constructor_reserved_top: None,
         indexed_key_base: None,
-        puc_operand: false,
+        register_operand: false,
         facts,
         dialect,
         base,
@@ -2611,6 +3385,16 @@ fn constructor_ends(
             continue;
         }
         if let Some((local, value)) = scalar_local(entry.stmt) {
+            // initializer 之外的读取（含闭包捕获）结束该 seed 的待构造窗口。
+            // 先前已收集的字段终点仍有效，后续普通写不能扩大它并遮挡独立子构造器。
+            crate::hir::visit::visit_expr(
+                value,
+                &mut BindingReadCollector(|binding| {
+                    if let HirBinding::Local(read) = binding {
+                        definitions.remove(&read);
+                    }
+                }),
+            );
             if let HirExpr::TableConstructor(table) = value {
                 definitions.insert(
                     local,
@@ -2619,7 +3403,9 @@ fn constructor_ends(
                         matches!(
                             table.allocation,
                             HirTableAllocation::LuauTemplate { .. }
+                                | HirTableAllocation::Template { .. }
                                 | HirTableAllocation::PucBatched(_)
+                                | HirTableAllocation::Indexed { .. }
                         ),
                     ),
                 );
@@ -2714,6 +3500,20 @@ fn collect_constructor_plans(
         .collect::<BTreeSet<_>>();
     // 每个直线构造区只在最后一次 record 写审理，避免对逐渐增长的字段前缀重复建树。
     let ends = constructor_ends(&flat, &empty);
+    let grouped = declarations::collect(
+        context,
+        facts,
+        dialect,
+        &flat,
+        &empty,
+        &ends,
+        &arguments.owned,
+    );
+    let grouped_statements = grouped
+        .iter()
+        .flat_map(|plan| plan.removed.iter().copied().chain([plan.sink]))
+        .collect::<BTreeSet<_>>();
+    plans.extend(grouped);
     let mut first_seed = None;
     let mut start = 0;
     for (index, entry) in flat.iter().enumerate() {
@@ -2723,6 +3523,11 @@ fn collect_constructor_plans(
             continue;
         };
         if empty.contains(&entry.id) {
+            continue;
+        }
+        if grouped_statements.contains(&entry.id) {
+            first_seed = None;
+            start = index + 1;
             continue;
         }
         if first_seed.is_none()
@@ -2756,6 +3561,27 @@ fn collect_constructor_plans(
                     .iter()
                     .filter(|entry| !empty.contains(&entry.as_ref().unwrap().id))
                     .count();
+                if let Some(next) = flat.get(index + 1).and_then(|entry| *entry)
+                    && let Some(mut plan) = conditional_value_initializer(
+                        context,
+                        &run,
+                        facts,
+                        dialect,
+                        seed_in_run,
+                        next.stmt,
+                    )
+                {
+                    plan.start = flat[seed].unwrap().id;
+                    plan.sink = next.id;
+                    plan.removed = flat[seed..=index]
+                        .iter()
+                        .map(|entry| entry.unwrap().id)
+                        .collect();
+                    plans.push(plan);
+                    first_seed = None;
+                    start = index + 2;
+                    continue;
+                }
                 if let Some(mut builder) = frame_builder(context, &run, facts, dialect, base.slot())
                     && let HirExpr::TableConstructor(table) =
                         scalar_local(run[seed_in_run]).unwrap().1
@@ -2769,10 +3595,11 @@ fn collect_constructor_plans(
                         sink: entry.id,
                         base,
                         values: vec![value].into(),
-                        result_local: Some(owner),
+                        result_locals: vec![owner],
                         discarded_result: None,
                         assignment_targets: Vec::new(),
                         indexed_target: None,
+                        continuing_root: None,
                         retained_copies: Vec::new(),
                         removed: flat[seed..index]
                             .iter()
@@ -2792,6 +3619,288 @@ fn collect_constructor_plans(
     }
 }
 
+/// 短路 CALL 树共同重发准备区与结果声明；右臂没有无条件事件可消费。
+/// Luau initializer 消费保留的原结果身份，按值/条件位置分别核对叶 CALL；
+/// 后继异槽 Phi/COPY 仍由独立返回事务消费，不能从首个 predicate CALL 推测结果 home。
+fn logical_call_result_frame(
+    context: NativeFrameContext<'_>,
+    run: &[&HirStmt],
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    stmt: &HirStmt,
+) -> Option<Plan> {
+    if dialect == DecompileDialect::Luau && !matches!(stmt, HirStmt::LocalDecl(_)) {
+        // Luau initializer 已预留结果槽；普通赋值另分配暂存结果，不能共用槽距。
+        return None;
+    }
+    let (target, value) = scalar_local(stmt)?;
+    let mut first = value;
+    while let HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) = first {
+        first = &logical.lhs;
+    }
+    let HirExpr::Call(call) = first else {
+        return None;
+    };
+    let base = if dialect == DecompileDialect::Luau {
+        facts.trusted_local_home_slot(target)?
+    } else {
+        facts.native_call_frame(call)?.home
+    };
+    // 候选拒绝[ProofIncomplete]：异槽结果需要保留逐路径的原 COPY 写回，不能只凭值相等合并。
+    if facts.trusted_local_home_slot(target) != Some(base)
+        || context.barred.contains(&base)
+        || context.closed.contains(&base)
+        || context.proto.local_debug_hints[target.index()].is_some()
+        || context.proto.local_debug_scopes[target.index()].is_some()
+        || context
+            .proto
+            .inline_dispositions
+            .local(target)
+            .must_preserve()
+        || !facts
+            .complete_local_definition_write_homes(target)
+            .iter()
+            .copied()
+            .eq(std::iter::once(base))
+    {
+        return None;
+    }
+    let mut builder = frame_builder(context, run, facts, dialect, base.slot())?;
+    let value = if dialect == DecompileDialect::Luau {
+        builder.luau_logical_value(value, run.len(), base)?
+    } else {
+        builder.comparison_tree(value, run.len(), base.slot())?
+    };
+    let start = builder.first_event?;
+    if builder.next_event != run.len() {
+        return None;
+    }
+    Some(Plan {
+        start,
+        sink: run.len(),
+        base,
+        values: vec![value].into(),
+        result_locals: vec![target],
+        discarded_result: None,
+        assignment_targets: Vec::new(),
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        removed: Vec::new(),
+    })
+}
+
+fn operation_call_input(value: &HirExpr) -> Option<(crate::hir::common::HirSourceSite, &HirExpr)> {
+    match value {
+        HirExpr::Binary(binary) if numeric_rk_arithmetic(binary) => {
+            Some((binary.source_site?, &binary.lhs))
+        }
+        HirExpr::Unary(unary) if unary.op == crate::hir::HirUnaryOpKind::Neg => {
+            Some((unary.source_site?, &unary.expr))
+        }
+        _ => None,
+    }
+}
+
+/// 原 CALL 在高槽求值，RK 算术或取负随后写低结果槽；Luau initializer 与 PUC/JIT
+/// 既有 local 赋值分别保持各自入口前缀。输入 Def、事件及后缀身份共用同一 builder。
+fn operation_call_frame(
+    context: NativeFrameContext<'_>,
+    run: &[&HirStmt],
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    stmt: &HirStmt,
+) -> Option<Plan> {
+    let (target, value) = scalar_local(stmt)?;
+    let (source, operand) = operation_call_input(value)?;
+    if !context.constants_fit_rk {
+        return None;
+    }
+    let base = facts.operation_result_home(source)?;
+    let result = facts.operation_result_temp(source)?;
+    let input_home = match value {
+        HirExpr::Binary(binary) => {
+            let layout = facts.native_binary_layout(binary)?;
+            if layout.rhs.is_some() {
+                return None;
+            }
+            layout.lhs?
+        }
+        HirExpr::Unary(unary) => facts.unary_operand_home(unary)?,
+        _ => return None,
+    };
+    // Luau initializer 预留低结果槽；PUC/JIT 已有 local 赋值从空闲高槽调用，再写低目标。
+    // 后者不能新增目标声明，否则会把 CALL 的临时身份永久留给后续 table allocation。
+    // JIT 的 FR2 间隙仍由共享 call builder 核对，不由算术消费方另外计算。
+    let assignment = dialect != DecompileDialect::Luau;
+    if (assignment && (!matches!(stmt, HirStmt::Assign(_)) || base.slot() >= input_home.slot()))
+        || (!assignment && input_home != HomeSlotKey::new(base.slot() + 1, 0))
+    {
+        return None;
+    }
+    let frame_base = if assignment { input_home } else { base };
+    if facts.trusted_local_home_slot(target) != Some(base)
+        || context.proto.local_debug_hints[target.index()].is_some()
+        || context.proto.local_debug_scopes[target.index()].is_some()
+        || context
+            .proto
+            .inline_dispositions
+            .local(target)
+            .must_preserve()
+        || context.barred.contains(&base)
+        || context.closed.contains(&base)
+    {
+        return None;
+    }
+    let mut complete = run.to_vec();
+    complete.push(stmt);
+    let mut builder = frame_builder(context, &complete, facts, dialect, frame_base.slot())?;
+    let input = match operand {
+        HirExpr::LocalRef(local) => scalar_local(run[builder.definition(*local, run.len())?])?.1,
+        value => value,
+    };
+    if !matches!(input, HirExpr::Call(_)) {
+        return None;
+    }
+    let (producer, home) = facts.operation_input_preparation(source, input)?;
+    if home != input_home
+        || !builder.homes_match(target, run.len(), base.slot(), None, Some(result))
+    {
+        return None;
+    }
+    let lhs = builder.expr(
+        operand,
+        run.len(),
+        home.slot(),
+        None,
+        false,
+        true,
+        Some(producer),
+    )?;
+    builder.finish_event(run.len())?;
+    let first = builder.first_event?;
+    if first == run.len() || builder.next_event != complete.len() {
+        return None;
+    }
+    let value = match value {
+        HirExpr::Binary(binary) => HirExpr::Binary(Box::new(crate::hir::common::HirBinaryExpr {
+            lhs,
+            ..binary.as_ref().clone()
+        })),
+        HirExpr::Unary(unary) => HirExpr::Unary(Box::new(crate::hir::common::HirUnaryExpr {
+            expr: lhs,
+            ..unary.as_ref().clone()
+        })),
+        _ => return None,
+    };
+    Some(Plan {
+        start: first,
+        sink: run.len(),
+        base: frame_base,
+        values: vec![value].into(),
+        result_locals: if assignment { Vec::new() } else { vec![target] },
+        discarded_result: None,
+        assignment_targets: if assignment {
+            vec![HirLValue::Local(target)]
+        } else {
+            Vec::new()
+        },
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        removed: Vec::new(),
+    })
+}
+
+/// 原表或 CALL 测试后写入整数结果，才恢复完整条件表达式帧。
+/// 当前声明和值版本必须同时匹配；原叶只含 LOADINT 的证明由 Promotion 提供。
+fn conditional_value_initializer(
+    context: NativeFrameContext<'_>,
+    run: &[&HirStmt],
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    seed: usize,
+    result_stmt: &HirStmt,
+) -> Option<Plan> {
+    if dialect != DecompileDialect::Luau {
+        return None;
+    }
+    let (owner, input) = scalar_local(run[seed])?;
+    let (target, HirExpr::Integer(value)) = scalar_local(result_stmt)? else {
+        return None;
+    };
+    let original = match input {
+        HirExpr::TableConstructor(table) => facts.table_value_result(table)?,
+        HirExpr::Call(call) => facts.conditional_value_result(call.source_site?)?,
+        _ => return None,
+    };
+    let base = facts.trusted_temp_home_slot(original.result)?;
+    let home = facts.trusted_temp_home_slot(original.input)?;
+    if *value != original.value
+        || home != HomeSlotKey::new(base.slot() + 1, 0)
+        || facts.promoted_local_for_temp(original.input) != Some(owner)
+        || facts.promoted_local_for_temp(original.result) != Some(target)
+        || facts.trusted_local_home_slot(target) != Some(base)
+        || [base, home]
+            .iter()
+            .any(|home| context.barred.contains(home) || context.closed.contains(home))
+        || [owner, target].iter().any(|local| {
+            context.proto.local_debug_hints[local.index()].is_some()
+                || context.proto.local_debug_scopes[local.index()].is_some()
+                || context
+                    .proto
+                    .inline_dispositions
+                    .local(*local)
+                    .must_preserve()
+        })
+    {
+        return None;
+    }
+    let mut complete = run.to_vec();
+    complete.push(result_stmt);
+    let mut builder = frame_builder(context, &complete, facts, dialect, base.slot())?;
+    if !builder.homes_match(owner, seed, home.slot(), None, Some(original.input))
+        || !builder.homes_match(target, run.len(), base.slot(), None, Some(original.result))
+    {
+        return None;
+    }
+    let input = match input {
+        HirExpr::TableConstructor(table) => builder.constructor(seed, table, home.slot())?,
+        HirExpr::Call(call) if seed + 1 == run.len() => {
+            let call = builder.call(call, seed, home.slot(), false, CallWidth::Single)?;
+            builder.finish_event(seed)?;
+            HirExpr::Call(Box::new(call))
+        }
+        _ => return None,
+    };
+    builder.finish_event(run.len())?;
+    if builder.next_event != complete.len() {
+        return None;
+    }
+    let value = HirExpr::Integer(*value);
+    let selected = HirExpr::LogicalAnd(Box::new(crate::hir::common::HirLogicalExpr {
+        lhs: input,
+        rhs: value.clone(),
+    }));
+    let value = HirExpr::LogicalOr(Box::new(crate::hir::common::HirLogicalExpr {
+        lhs: selected,
+        rhs: value,
+    }));
+    Some(Plan {
+        start: builder.first_event?,
+        sink: run.len(),
+        base,
+        values: vec![value].into(),
+        result_locals: vec![target],
+        discarded_result: None,
+        assignment_targets: Vec::new(),
+        indexed_target: None,
+        continuing_root: Some(original),
+        retained_copies: Vec::new(),
+        removed: Vec::new(),
+    })
+}
+
 /// 原 table 临时位于新标量声明之上；整个 initializer 重放 table/SETLIST/GETTABLE，
 /// 不给 scratch 留下永久声明。旧身份的其它 read/capture 仍由同一 preview 拒绝。
 /// 低于后续原 CALL 或作为后继 SETTABLE 的稳定低槽表，可成为独立索引声明；
@@ -2801,12 +3910,16 @@ fn lookup_initializer(
     run: &[&HirStmt],
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
-    target: LocalId,
+    target: Option<LocalId>,
     access: &crate::hir::common::HirTableAccess,
     home: HomeSlotKey,
 ) -> Option<Plan> {
     let mut builder = frame_builder(context, run, facts, dialect, home.slot())?;
-    let value = builder.puc_lookup(access, run.len(), home.slot())?;
+    let value = if dialect == DecompileDialect::Luau {
+        builder.luau_lookup(access, run.len(), home.slot())?
+    } else {
+        builder.register_lookup(access, run.len(), home.slot())?
+    };
     let start = builder.first_event?;
     if builder.next_event != run.len() {
         return None;
@@ -2816,10 +3929,11 @@ fn lookup_initializer(
         sink: run.len(),
         base: home,
         values: vec![value].into(),
-        result_local: Some(target),
+        result_locals: target.into_iter().collect(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -2883,10 +3997,11 @@ fn scalar_array_lookup_plan(
         sink: 0,
         base,
         values: vec![tables::scalar_array_lookup(facts, table, access, base)?].into(),
-        result_local: Some(*target),
+        result_locals: vec![*target],
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -2961,18 +4076,22 @@ fn completed_table_assignment(
         sink,
         base,
         values: vec![HirExpr::TableConstructor(table.clone())].into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
-        assignment_targets: vec![*target],
+        assignment_targets: vec![HirLValue::Local(*target)],
         indexed_target: None,
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
 }
 
-/// 每次批次只克隆一次树，所有剩余读写/capture 共用一次扫描；不为每个 LocalId 扫后缀。
-fn build_preview(proto: &HirProto, plans: &[Plan], stmt_count: usize) -> Option<Preview> {
-    apply_preview(proto.clone(), plans, stmt_count)
+/// 每次预览只克隆一次树，所有剩余读写/capture 共用一次扫描；不为每个 LocalId 扫后缀。
+fn build_preview(proto: &HirProto, plans: &[Plan], stmt_count: usize) -> Result<Preview, usize> {
+    let mut failure = None;
+    apply_preview(proto.clone(), plans, stmt_count, &mut failure).ok_or_else(|| {
+        failure.unwrap_or_else(|| plans.iter().map(|plan| plan.start).min().unwrap_or(0))
+    })
 }
 
 /// 原 nil 批次可同时覆盖旧 owner 并声明新的槽。Locals 已原位绑定整个组；
@@ -3027,18 +4146,31 @@ fn adjacent_nil_declarations(
         .collect()
 }
 
-fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Option<Preview> {
+fn apply_preview(
+    mut preview: HirProto,
+    plans: &[Plan],
+    stmt_count: usize,
+    failure: &mut Option<usize>,
+) -> Option<Preview> {
     let mut removed = vec![false; stmt_count];
+    let mut origins = vec![usize::MAX; stmt_count];
     for plan in plans {
+        origins[plan.sink] = origins[plan.sink].min(plan.start);
         for &index in &plan.removed {
             removed[index] = true;
+            origins[index] = origins[index].min(plan.start);
         }
     }
     let mut sinks = plans.iter().peekable();
-    visit_scope_mut(&mut preview.body, &mut 0, &mut |index, stmt| {
+    visit_scope_mut(&mut preview.body, &mut 0, &mut |index, _, stmt| {
         let Some(plan) = sinks.peek().filter(|plan| plan.sink == index) else {
             return Some(());
         };
+        if plan.only_preserves_call_prefix() {
+            // 只签声明前缀，不重发已有 CALL 或重新消费其根协议。
+            sinks.next();
+            return Some(());
+        }
         if plan.discarded_result.is_some() {
             let [HirExpr::Call(call)] = plan.values.fixed.as_slice() else {
                 unreachable!()
@@ -3049,13 +4181,13 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
             sinks.next();
             return Some(());
         }
-        if let Some(local) = plan.result_local
+        if !plan.result_locals.is_empty()
             && super::super::table_constructors::constructor_write(stmt).is_some()
         {
             // record 与 Batch 都是完整构造事务的终点；保持 seed 的声明身份，
             // 不能把整张新构造器仍赋给原最后一个 record 左值。
             *stmt = HirStmt::LocalDecl(Box::new(HirLocalDecl {
-                bindings: vec![local],
+                bindings: plan.result_locals.clone(),
                 values: plan.values.clone(),
                 initializer_merge_transaction: None,
             }));
@@ -3072,16 +4204,14 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
             HirStmt::LocalDecl(sink) => {
                 sink.values = plan.values.clone();
             }
+            HirStmt::GlobalDecl(sink) => {
+                sink.values = plan.values.clone();
+            }
             HirStmt::Assign(sink) => {
                 if let Some(target) = &plan.indexed_target {
                     sink.targets = vec![HirLValue::TableAccess(Box::new(target.clone()))];
                 } else if !plan.assignment_targets.is_empty() {
-                    sink.targets = plan
-                        .assignment_targets
-                        .iter()
-                        .copied()
-                        .map(HirLValue::Local)
-                        .collect();
+                    sink.targets = plan.assignment_targets.clone();
                 }
                 sink.values = plan.values.clone();
             }
@@ -3105,20 +4235,66 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
                 };
                 sink.cond = condition.clone();
             }
+            HirStmt::Repeat(sink) => {
+                let [condition] = plan.values.fixed.as_slice() else {
+                    unreachable!("repeat condition plan has one condition")
+                };
+                sink.cond = condition.clone();
+            }
             _ => unreachable!(),
         }
         sinks.next();
         Some(())
     })?;
     let nil_declarations = adjacent_nil_declarations(&preview, &removed);
+    // 每个 owner 的最后一条直接语句仍在该词法块内；用这个保守边界允许整个后缀
+    // 都留在子块的声明下沉。索引只建一次，不逐候选重扫后缀或复制累计绑定集合。
+    let mut owner_last_stmt = vec![0; stmt_count];
+    let mut last_mentions = BTreeMap::new();
+    visit_scope_mut(&mut preview.body, &mut 0, &mut |index, owner, stmt| {
+        owner_last_stmt[owner] = index;
+        if !removed[index] && !matches!(stmt, HirStmt::Block(_)) {
+            let mut mentions = BindingReadCollector(|binding| {
+                last_mentions.insert(binding, index);
+            });
+            if matches!(
+                stmt,
+                HirStmt::GenericFor(_)
+                    | HirStmt::NumericFor(_)
+                    | HirStmt::If(_)
+                    | HirStmt::While(_)
+                    | HirStmt::Repeat(_)
+            ) {
+                crate::hir::visit::visit_stmt_header(stmt, &mut mentions);
+            } else {
+                visit_stmts(std::slice::from_ref(stmt), &mut mentions);
+            }
+            let mut mentions = BindingWriteCollector(|binding| {
+                last_mentions.insert(binding, index);
+            });
+            if matches!(
+                stmt,
+                HirStmt::GenericFor(_)
+                    | HirStmt::NumericFor(_)
+                    | HirStmt::If(_)
+                    | HirStmt::While(_)
+                    | HirStmt::Repeat(_)
+            ) {
+                crate::hir::visit::visit_stmt_header(stmt, &mut mentions);
+            } else {
+                visit_stmts(std::slice::from_ref(stmt), &mut mentions);
+            }
+        }
+        Some(())
+    })?;
     // 标记被消费的 value epoch，而非从函数入口把所有同名 local 都看作未声明。
     // 已有声明上的 Assign 也必须等到下一次独立写才允许重新读取。
-    let mut missing = BTreeMap::<HirBinding, bool>::new();
+    let mut missing = BTreeMap::<HirBinding, MissingEpoch>::new();
     let discarded = plans
         .iter()
         .filter_map(|plan| plan.discarded_result.map(|local| (plan.sink, local)))
         .collect::<BTreeMap<_, _>>();
-    visit_scope_mut(&mut preview.body, &mut 0, &mut |index, stmt| {
+    visit_scope_mut(&mut preview.body, &mut 0, &mut |index, owner, stmt| {
         if let HirStmt::LocalRootRelease(local) = stmt
             && missing.contains_key(&HirBinding::Local(*local))
         {
@@ -3133,32 +4309,51 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
             }
             if let HirStmt::LocalDecl(decl) = stmt {
                 for &local in &decl.bindings {
-                    missing.insert(HirBinding::Local(local), true);
+                    missing.insert(
+                        HirBinding::Local(local),
+                        MissingEpoch {
+                            needs_declaration: true,
+                            owner,
+                            start: origins[index],
+                        },
+                    );
                 }
             } else if let HirStmt::Assign(assign) = stmt {
                 // 完整 generic-for initializer 可同时消费多个控制 Temp；后缀仍逐身份查悬空读取。
                 for target in &assign.targets {
                     let binding = match target {
+                        HirLValue::Param(param) => HirBinding::Param(*param),
                         HirLValue::Temp(temp) => HirBinding::Temp(*temp),
                         HirLValue::Local(local) => HirBinding::Local(*local),
                         _ => return None,
                     };
-                    missing.entry(binding).or_default();
+                    missing.entry(binding).or_insert(MissingEpoch {
+                        needs_declaration: false,
+                        owner,
+                        start: origins[index],
+                    });
                 }
             } else {
                 let (binding, _) = scalar_binding(stmt)?;
-                missing.entry(binding).or_default();
+                missing.entry(binding).or_insert(MissingEpoch {
+                    needs_declaration: false,
+                    owner,
+                    start: origins[index],
+                });
             }
             return Some(());
         }
         if matches!(stmt, HirStmt::Block(_)) {
             return Some(());
         }
-        let mut read_missing = false;
+        let mut read_missing = None::<usize>;
         let mut written_missing = BTreeSet::new();
         let mut mentions = (
             BindingReadCollector(|binding| {
-                read_missing |= missing.contains_key(&binding);
+                if let Some(epoch) = missing.get(&binding) {
+                    read_missing =
+                        Some(read_missing.map_or(epoch.start, |old| old.min(epoch.start)));
+                }
             }),
             BindingWriteCollector(|binding| {
                 if missing.contains_key(&binding) {
@@ -3168,13 +4363,36 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
         );
         if matches!(
             stmt,
-            HirStmt::GenericFor(_) | HirStmt::NumericFor(_) | HirStmt::If(_) | HirStmt::While(_)
+            HirStmt::GenericFor(_)
+                | HirStmt::NumericFor(_)
+                | HirStmt::If(_)
+                | HirStmt::While(_)
+                | HirStmt::Repeat(_)
         ) {
             crate::hir::visit::visit_stmt_header(stmt, &mut mentions);
         } else {
             visit_stmts(std::slice::from_ref(stmt), &mut mentions);
         }
-        if read_missing {
+        if let Some(start) = read_missing {
+            *failure = Some(start);
+            return None;
+        }
+        // 以下恢复失败只能归到当前写涉及的缺失 epoch；不能截在失败语句之后保留坏事务。
+        *failure = written_missing
+            .iter()
+            .map(|binding| missing[binding].start)
+            .min();
+        // 候选拒绝[SemanticBarrier]：子块或兄弟臂内的写既不支配原 owner 的后缀，
+        // 也不能在原声明被消费后给它提供词法绑定；DFS 的访问先后不是路径证明。
+        // 同 owner 的独立写仍沿用已有恢复协议，不为每个候选重建控制流分析。
+        if written_missing.iter().any(|binding| {
+            missing
+                .get(binding)
+                .is_none_or(|epoch| epoch.owner != owner)
+                && last_mentions
+                    .get(binding)
+                    .is_none_or(|last| *last > owner_last_stmt[owner])
+        }) {
             return None;
         }
         if matches!(stmt, HirStmt::Assign(assign) if assign.generic_for_dispatch_release.is_some())
@@ -3185,18 +4403,32 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
         }
         if let Some(&local) = discarded.get(&index) {
             // CALL 与紧邻常量写之间没有观察；结束结果绑定，并在下一次原槽写重建声明。
-            missing.insert(HirBinding::Local(local), true);
+            missing.insert(
+                HirBinding::Local(local),
+                MissingEpoch {
+                    needs_declaration: true,
+                    owner,
+                    start: origins[index],
+                },
+            );
         }
         if written_missing.is_empty() {
+            return Some(());
+        }
+        if let HirStmt::LocalDecl(decl) = stmt {
+            for local in &decl.bindings {
+                missing.remove(&HirBinding::Local(*local));
+            }
             return Some(());
         }
         if let HirStmt::Assign(assign) = stmt
             && assign.targets.len() > 1
         {
-            if written_missing
-                .iter()
-                .all(|binding| missing.get(binding) == Some(&false))
-            {
+            if written_missing.iter().all(|binding| {
+                missing
+                    .get(binding)
+                    .is_some_and(|epoch| !epoch.needs_declaration)
+            }) {
                 // 原声明仍在，仅当前值版本的 COPY 被消费；多结果 RHS 已先查悬空读。
                 // 整组写原位重新定义这些已有身份，不应把它们变成新的 local 声明。
                 for binding in &written_missing {
@@ -3212,7 +4444,9 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
                     let HirLValue::Local(local) = target else {
                         return None;
                     };
-                    (missing.get(&HirBinding::Local(*local)) == Some(&true)
+                    (missing
+                        .get(&HirBinding::Local(*local))
+                        .is_some_and(|epoch| epoch.needs_declaration)
                         || nil_declaration.is_some_and(|(_, bindings)| bindings.contains(local)))
                     .then_some(*local)
                 })
@@ -3238,7 +4472,7 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
         if written_missing.len() != 1 {
             return None;
         }
-        let needs_declaration = missing.remove(&binding)?;
+        let needs_declaration = missing.remove(&binding)?.needs_declaration;
         if !needs_declaration || matches!(stmt, HirStmt::LocalDecl(_)) {
             return Some(());
         }
@@ -3260,54 +4494,4 @@ fn apply_preview(mut preview: HirProto, plans: &[Plan], stmt_count: usize) -> Op
         proto: preview,
         removed,
     })
-}
-
-/// 词法 Block、条件各臂与已有布局证明的数值/泛型循环共用 DFS 坐标。
-fn visit_scope_mut(
-    block: &mut HirBlock,
-    cursor: &mut usize,
-    action: &mut impl FnMut(usize, &mut HirStmt) -> Option<()>,
-) -> Option<()> {
-    for stmt in &mut block.stmts {
-        let index = *cursor;
-        *cursor += 1;
-        action(index, stmt)?;
-        if let HirStmt::Block(child) = stmt {
-            visit_scope_mut(child, cursor, action)?;
-        } else if let HirStmt::NumericFor(for_) = stmt {
-            visit_scope_mut(&mut for_.body, cursor, action)?;
-        } else if let HirStmt::While(while_) = stmt {
-            visit_scope_mut(&mut while_.body, cursor, action)?;
-        } else if let HirStmt::GenericFor(for_) = stmt {
-            visit_scope_mut(&mut for_.body, cursor, action)?;
-        } else if let HirStmt::If(if_) = stmt {
-            visit_scope_mut(&mut if_.then_block, cursor, action)?;
-            if let Some(else_block) = &mut if_.else_block {
-                visit_scope_mut(else_block, cursor, action)?;
-            }
-        }
-    }
-    Some(())
-}
-
-fn compact_scope(block: &mut HirBlock, removed: &[bool], cursor: &mut usize) {
-    block.stmts.retain_mut(|stmt| {
-        let index = *cursor;
-        *cursor += 1;
-        if let HirStmt::Block(child) = stmt {
-            compact_scope(child, removed, cursor);
-        } else if let HirStmt::NumericFor(for_) = stmt {
-            compact_scope(&mut for_.body, removed, cursor);
-        } else if let HirStmt::While(while_) = stmt {
-            compact_scope(&mut while_.body, removed, cursor);
-        } else if let HirStmt::GenericFor(for_) = stmt {
-            compact_scope(&mut for_.body, removed, cursor);
-        } else if let HirStmt::If(if_) = stmt {
-            compact_scope(&mut if_.then_block, removed, cursor);
-            if let Some(else_block) = &mut if_.else_block {
-                compact_scope(else_block, removed, cursor);
-            }
-        }
-        !removed[index]
-    });
 }

@@ -46,7 +46,7 @@ pub(super) fn coalesce_disjoint_temps(
     }
     for temp in (0..proto.temp_count).map(TempId) {
         if facts.is_scope_end_copy_root_temp(temp)
-            || facts.is_copy_root_endpoint(temp)
+            || facts.is_copy_root_endpoint(temp, |_| true)
             || proto
                 .temp_debug_locals
                 .get(temp.index())

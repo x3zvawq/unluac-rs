@@ -23,6 +23,11 @@ pub(super) fn collect_proto_effects(
     module: &crate::hir::HirModule,
     safety: HirExprSafety,
 ) -> ModuleEffects {
+    let mut captures = module
+        .protos
+        .iter()
+        .map(|proto| closure_captures_in_block(&proto.body))
+        .collect::<Vec<_>>();
     let mut facts = ModuleEffects {
         protos: module
             .protos
@@ -32,23 +37,28 @@ pub(super) fn collect_proto_effects(
                 ..ProtoEffects::default()
             })
             .collect(),
-        values: ReturnValueFacts::new(module),
+        values: ReturnValueFacts::new(module, &captures),
     };
     let mut required = vec![false; module.protos.len()];
     for child in module.protos.iter().flat_map(|proto| &proto.children) {
         required[child.index()] = true;
     }
     // arena 父先子后；两域共用一次 child-first 调度和当前 proto 的不可变控制流快照。
+    let mut value_flows = Vec::new();
     for index in (0..module.protos.len()).rev() {
         let proto = &module.protos[index];
         if !required[index] && proto.children.is_empty() {
             continue;
         }
-        let flow = ProtoFlowFacts::new(proto, safety);
+        let flow = ProtoFlowFacts::new(proto, safety, std::mem::take(&mut captures[index]));
         if required[index] && !(proto.upvalues.is_empty() && proto.children.is_empty()) {
             facts.protos[index] = closure_effects::collect_effect_state(&flow, &facts.protos);
         }
         facts.values.analyze_proto(&flow);
+        value_flows.push(flow);
+    }
+    for flow in &value_flows {
+        facts.values.finalize_calls(flow);
     }
     facts
 }
@@ -77,11 +87,10 @@ struct ProtoFlowFacts<'hir> {
 }
 
 impl<'hir> ProtoFlowFacts<'hir> {
-    fn new(proto: &'hir HirProto, safety: HirExprSafety) -> Self {
+    fn new(proto: &'hir HirProto, safety: HirExprSafety, captures: ClosureCaptures<'hir>) -> Self {
         let graph = HirFlowGraph::for_block(&proto.body, safety)
             .expect("HIR labels must be valid before module value analysis");
         let live_out = graph.binding_live_out();
-        let captures = closure_captures_in_block(&proto.body);
         let reference_cells = captures
             .values()
             .flat_map(|captures| captures.iter())

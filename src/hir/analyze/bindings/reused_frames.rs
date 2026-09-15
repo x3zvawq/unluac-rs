@@ -6,6 +6,9 @@
 //! 让参数查找、CALL 和 FORPREP 各自在原位置观察或覆盖旧根，而不是提前生成 nil。
 //! 这里只接受入口直线帧：首次定义按原槽递增，后续同槽写仍属于该窗口，所有高槽使用
 //! 和 Phi 都不逃出；低槽前缀限参数及单写常量。窗口内 CALL/open/capture 不借此改址。
+//! 窗口前已由紧邻 SETUPVAL 发布的无名闭包准备不属于声明帧；它仍在原位置创建和写入。
+//! 例如先发布 `clear=function() parameter=nil end`，再进入上面的 do，不能把闭包的
+//! scratch home 与随后 a 的 debug scope 合成一个窗口，也不能把参数 capture 移进 do。
 //! 每个 preheader 只处理一次，全部绑定和不交叉边界先证明，再一起发布；后层不重建原槽。
 
 use super::*;
@@ -163,6 +166,21 @@ fn candidate(
                 return None;
             }
             let scope = bindings.temp_debug_scopes[temp.index()];
+            if start.is_none()
+                && slots.is_empty()
+                && offset == 0
+                && scope.is_none()
+                && matches!(instr, LowInstr::Closure(_))
+                && matches!(dataflow.def_uses[def.index()].as_slice(), [site]
+                    if site.instr.index() == index + 1)
+                && matches!(proto.instrs.get(index + 1), Some(LowInstr::SetUpvalue(set))
+                    if set.src == crate::transformer::ValueOperand::Reg(reg))
+            {
+                // 闭包已在候选前独立发布；只排除其临时准备，不移动创建/捕获/SETUPVAL。
+                // 高槽 capture 已由上方 fixed-use/引用捕获检查排除，窗口尚未开始。
+                defined.insert(def);
+                continue;
+            }
             if offset == slots.len()
                 && scope.is_none()
                 && matches!(instr, LowInstr::GetUpvalue(_))

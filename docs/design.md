@@ -1,7 +1,22 @@
 # 维护地图
 
-这组文档是仓库的代码导航地图。每章按 **入口 → 模块布局 → 数据流 → pass 清单 → 排错指引** 组织，
-目的是让维护者最快地定位「某个问题出在哪一层、该看哪个文件、该 dump 什么」。
+这组文档维护各层的职责、实现导航与层间约定，帮助开发者定位事实的生产者和消费者。
+先读对应层的入口与子阶段，再沿链接进入具体实现；不依靠文档中的局部规则代替读代码。
+
+## 文档边界
+
+| 内容 | 维护位置 |
+| --- | --- |
+| 层的输入输出、子阶段、pass 职责、生产消费关系与失效边界 | `docs/design/` 对应章节 |
+| 跨层身份、协议、不变量与错误边界 | 事实所属层的设计章节；消费者链接引用 |
+| 候选树形、具体 guard、方言槽距、算法步骤与提交细节 | 对应实现的模块说明及代码注释 |
+| 被保护的运行行为与可读性结构 | 已注册 Lua 样例及其断言；配置与标签按测试协议维护 |
+| 本次改动、验证结果与未完成范围 | 本次任务交付；临时 dump、报告放 `tmp/` |
+
+层文档按“入口与数据流 → 子阶段/生产消费 → 稳定合同 → 排错”组织。
+修改局部实现时不追加一段 guard 解说；只有职责、事实接口、调度或层间约定变化才更新设计。
+新增 pass 或子处理层时补导航；现有文件拆分则更新链接，不复制实现全文。
+不在仓库维护不断追加的审计流水账、逐样例迁移清单或历史通过数副本。
 
 ## Pipeline 总览
 
@@ -38,7 +53,7 @@ bytes ──→ Parser ──→ Transformer ──→ Structure ──→ HIR �
 | 6 | AST | [6.ast.md](./design/6.ast.md) | `analyze_ast_stage` |
 | 9 | Generate | [9.generate.md](./design/9.generate.md) | `generate_chunk(state, context)` |
 | 10 | Debugging | [10.debugging.md](./design/10.debugging.md) | `dump_*` / `--dump-pass` |
-| 11 | Test | [11.test.md](./design/11.test.md) | `cargo unit-test` |
+| 11 | Test | [11.test.md](./design/11.test.md) | `cargo case-test` |
 
 AST 的两个子主题仍保留单独导航，方便按 pass 排错：
 [AST readability](./design/7.readability.md) / [AST naming](./design/8.naming.md)。

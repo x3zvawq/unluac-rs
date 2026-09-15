@@ -116,7 +116,6 @@ struct ActiveScalarGcHome {
 
 #[derive(Clone, Copy)]
 struct AllocationHomeOwner {
-    producer: TempId,
     definition_index: usize,
     eligible: bool,
 }
@@ -636,7 +635,7 @@ pub(super) fn collect_call_root_lifetimes(
             if active_allocations.get(&home).is_some_and(|root| {
                 producer >= root.owner.definition_index && root.aliases.contains(&temp)
             }) {
-                active_allocations.remove(&home);
+                active_allocations.transfer(home);
             }
         }
         let scalar_definition = stmt.scalar_temp_assignment();
@@ -844,8 +843,9 @@ pub(super) fn collect_call_root_lifetimes(
                 .map(|root| root.root_index)
                 .or_else(|| {
                     let root = active_allocations.get(&home)?;
-                    (active_allocations.site_for_temp(*source) == Some(root.allocation_site))
-                        .then_some(root.owner.definition_index)
+                    (!root.transferred
+                        && active_allocations.site_for_temp(*source) == Some(root.allocation_site))
+                    .then_some(root.owner.definition_index)
                 });
             if let Some(root_index) = root_index {
                 lifetimes
@@ -2918,7 +2918,7 @@ fn update_allocation_roots(
         state
             .active
             .get(&slot)
-            .is_some_and(|root| root.allocation_site == site)
+            .is_some_and(|root| !root.transferred && root.allocation_site == site)
     });
     if continues_home {
         state.lifetimes.continuation_owners.insert(
@@ -2950,7 +2950,6 @@ fn update_allocation_roots(
             temp,
             allocation_site,
             AllocationHomeOwner {
-                producer: temp,
                 definition_index: index,
                 eligible,
             },
@@ -2980,8 +2979,7 @@ fn record_allocation_root_overwrite(
     lifetimes: &mut CallRootLifetimeIndices,
 ) {
     let owner = root.owner;
-    if !uses.has_argument_transfer(owner.producer, owner.definition_index, index)
-        && owner.eligible
+    if owner.eligible
         && eligible
         && !root
             .aliases
@@ -2989,12 +2987,16 @@ fn record_allocation_root_overwrite(
             .any(|alias| uses.has_live_read_after(*alias, index))
     {
         let root_index = owner.definition_index;
-        lifetimes.roots.insert(root_index);
-        lifetimes
-            .root_homes
-            .entry(root_index)
-            .or_default()
-            .insert(home);
+        // 交接后的端点仅供已物化 owner 消费。单独固定 endpoint 会阻断完整调用事务，
+        // 反而迫使原本可消费的参数副本成为跨调用的源码强引用。
+        if !root.transferred {
+            lifetimes.roots.insert(root_index);
+            lifetimes
+                .root_homes
+                .entry(root_index)
+                .or_default()
+                .insert(home);
+        }
         lifetimes
             .roots_by_overwrite
             .entry(index)

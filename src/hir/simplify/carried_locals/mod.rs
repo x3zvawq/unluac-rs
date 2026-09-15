@@ -13,6 +13,8 @@
 //! 所有 owner 还共享 proto 级 source/resource 身份门：debug、for、physical-root、
 //! reference capture/TBC binding 与其 raw home may-alias 都不得成为改写两端。
 //! 物理根覆盖 TempId 和 LocalId；尚未物化的 CALL 结果不能先被合进 callee carrier。
+//! Promotion 发布的原 callee/receiver 准备 COPY 另建一次身份索引；即使 `a=b; b=a`
+//! 在值域上冗余，也由完整帧消费第二次准备写，不能让后层从相等值重建物理事件。
 //! By-value capture 是创建点快照，由具体 transaction 的 reaching relation 验证其读取值。
 //! 唯一例外是 proven internal loop-carrier temp mirror：它先在 `prune.rs` 里被要求满足
 //! no-read、non-debug、loop-carrier owner、same-exact-home write audit 之后，才会在冻结
@@ -102,7 +104,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
         label_refs: count_label_references(&proto.body.stmts),
         expr_safety,
     };
-    let identity_facts = HandoffIdentityFacts::new(proto, preserved_bindings);
+    let identity_facts = HandoffIdentityFacts::new(proto, promotion_facts, preserved_bindings);
     let coalesced =
         coalesce::coalesce_disjoint_temps(proto, promotion_facts, &identity_facts, expr_safety);
     let mentions = BindingMentionIndex::new(&proto.body.stmts);
@@ -210,7 +212,11 @@ fn collapse_handoffs_recursive<'a>(
         inherited_locals,
         control_facts.expr_safety,
     );
-    changed |= prune_redundant_copy_stmts(block, &identity_facts.preserved);
+    changed |= prune_redundant_copy_stmts(
+        block,
+        &identity_facts.preserved,
+        &identity_facts.call_preparations,
+    );
     changed
 }
 
@@ -350,10 +356,15 @@ struct HandoffIdentityFacts {
     reference_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
     preserved: BTreeSet<CarryBinding>,
+    call_preparations: BTreeSet<(CarryBinding, CarryBinding)>,
 }
 
 impl HandoffIdentityFacts {
-    fn new(proto: &HirProto, preserved: BTreeSet<CarryBinding>) -> Self {
+    fn new(
+        proto: &HirProto,
+        promotion_facts: &ProtoPromotionFacts,
+        preserved: BTreeSet<CarryBinding>,
+    ) -> Self {
         let debug = (0..proto.local_count)
             .map(LocalId)
             .zip(&proto.local_debug_hints)
@@ -380,6 +391,10 @@ impl HandoffIdentityFacts {
             reference_captured: collector.reference_captured,
             to_be_closed: collector.to_be_closed,
             preserved,
+            call_preparations: promotion_facts
+                .call_preparation_local_copies()
+                .map(|(target, source)| (CarryBinding::Local(target), CarryBinding::Local(source)))
+                .collect(),
         }
     }
 

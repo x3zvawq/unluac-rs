@@ -109,7 +109,7 @@ pub struct DataflowFacts {
 }
 
 impl DataflowFacts {
-    /// 原 fixed 写覆盖了 CALL/OPEN 协议可能留下的未知物理残值；与逻辑 SSA 旧值分离。
+    /// 原 fixed 写覆盖了入口或 CALL/OPEN 协议可能留下的未知物理残值；与逻辑 SSA 旧值分离。
     pub(crate) fn def_overwrites_unknown_scratch(&self, def: DefId) -> bool {
         self.unknown_scratch_overwrites[def.index()]
     }
@@ -465,9 +465,17 @@ impl DataflowFacts {
 
     /// 展开 phi 链，返回最终可到达的 entry/def 身份。
     pub fn leaf_values(&self, root: SsaValue) -> BTreeSet<SsaValue> {
+        self.leaf_values_from([root])
+    }
+
+    /// 同一快照的多个读取共用 Phi 访问集，避免逐个出口重复展开共享合流链。
+    pub fn leaf_values_from(
+        &self,
+        roots: impl IntoIterator<Item = SsaValue>,
+    ) -> BTreeSet<SsaValue> {
         let mut leaves = BTreeSet::new();
         let mut seen = BTreeSet::new();
-        let mut pending = vec![root];
+        let mut pending = roots.into_iter().collect::<Vec<_>>();
         while let Some(value) = pending.pop() {
             match value {
                 SsaValue::Entry(_) | SsaValue::Def(_) => {

@@ -83,6 +83,7 @@ pub(super) fn fold_branch_values_in_proto(
         &proto.local_debug_hints,
         &proto.physical_root_locals,
         &proto.inline_dispositions,
+        dialect,
     );
     let other_changed = rewrite_block(
         &mut proto.body,
@@ -125,6 +126,7 @@ struct BranchValueLocalScopeFacts<'a> {
     debug_locals: &'a [Option<String>],
     physical_root_locals: &'a BTreeSet<LocalId>,
     inline_dispositions: &'a HirInlineDispositions,
+    dialect: DecompileDialect,
 }
 
 impl<'a> BranchValueLocalScopeFacts<'a> {
@@ -132,12 +134,29 @@ impl<'a> BranchValueLocalScopeFacts<'a> {
         debug_locals: &'a [Option<String>],
         physical_root_locals: &'a BTreeSet<LocalId>,
         inline_dispositions: &'a HirInlineDispositions,
+        dialect: DecompileDialect,
     ) -> Self {
         Self {
             debug_locals,
             physical_root_locals,
             inline_dispositions,
+            dialect,
         }
+    }
+
+    fn can_initialize_nil_alias(&self, local: LocalId) -> bool {
+        if self.dialect != DecompileDialect::Luajit
+            && matches!(self.inline_dispositions.local(local),
+                crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                    if reasons.iter().all(|reason| *reason ==
+                        crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix))
+        {
+            // nil 测试无观察：fallback 路径仍先写 nil，另一条路径把同一 COPY 提前。
+            // 声明位置、数量和 home 均不变；不借此移除前缀、真实根清除或 debug 身份。
+            return !matches!(self.debug_locals.get(local.index()), Some(Some(_)))
+                && !self.physical_root_locals.contains(&local);
+        }
+        self.can_move_scope(local)
     }
 
     fn can_move_scope(&self, local: LocalId) -> bool {
@@ -395,7 +414,7 @@ fn nil_fallback_alias_rewrite(
     local_scope_facts: &BranchValueLocalScopeFacts,
 ) -> Option<NilFallbackAliasRewrite> {
     let target = empty_single_local_decl_binding(decl_stmt)?;
-    if !local_scope_facts.can_move_scope(target) {
+    if !local_scope_facts.can_initialize_nil_alias(target) {
         return None;
     }
     let HirStmt::If(if_stmt) = if_stmt else {

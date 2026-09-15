@@ -470,7 +470,21 @@ impl<'a> AstLowerer<'a> {
     ) -> Result<AstCallKind, AstLowerError> {
         let method_name = call
             .method_receiver()
-            .and_then(|(_, method_key)| identifier_from_lua_key(method_key, self.target.version));
+            .and_then(|(_, method_key)| identifier_from_lua_key(method_key, self.target.version))
+            .or_else(|| {
+                if !call.plain_method_syntax {
+                    return None;
+                }
+                let HirExpr::TableAccess(access) = &call.callee else {
+                    return None;
+                };
+                let HirExpr::String(key) = &access.key else {
+                    return None;
+                };
+                (call.args.first() == Some(&access.base))
+                    .then(|| identifier_from_lua_key(key, self.target.version))
+                    .flatten()
+            });
         if call.method == crate::hir::HirMethodCall::Implicit && method_name.is_none() {
             return Err(AstLowerError::InvalidMethodCallPattern {
                 proto: proto_index,

@@ -108,7 +108,7 @@ jobs:
       - name: Run Rust lint and tests
         run: |
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo unit-test --jobs 8
+          cargo case-test --jobs 8
 
       - name: Dry-run crate publish
         run: cargo publish -p unluac --locked --dry-run

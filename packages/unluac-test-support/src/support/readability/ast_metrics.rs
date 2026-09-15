@@ -5,16 +5,19 @@
 //! child function。例如根 proto#0 声明一个 child proto#1，root 的 `function` 为 1，
 //! 但 proto#0 不计 child body 中的 `if`，proto#1 才计该 `if`。一次遍历同时建立全模块和
 //! 各 proto 的指标，供同一 case 的多个 AST 断言复用。
+//! repeat 条件的局部绑定关系使用当前循环直属声明的身份集，不把显示名称或子函数同号
+//! Local 当作条件来源；例如 `repeat local done = step() until done` 计一个绑定。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use unluac::ast::{
-    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstLocalAttr, AstModule, AstStmt,
+    AstBindingRef, AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstLocalAttr,
+    AstModule, AstStmt,
 };
 
 use super::super::ReadabilityAstMetric;
 
-const AST_METRIC_COUNT: usize = 21;
+const AST_METRIC_COUNT: usize = 25;
 
 #[derive(Clone, Default)]
 struct AstMetricCounts([usize; AST_METRIC_COUNT]);
@@ -30,6 +33,7 @@ pub(super) struct AstMetricSummary {
     total: AstMetricCounts,
     proto_counts: Vec<AstMetricCounts>,
     proto_indexes: BTreeMap<usize, usize>,
+    repeat_condition_locals: BTreeSet<AstBindingRef>,
 }
 
 impl AstMetricSummary {
@@ -39,6 +43,7 @@ impl AstMetricSummary {
             total: AstMetricCounts::default(),
             proto_counts: vec![AstMetricCounts::default()],
             proto_indexes: BTreeMap::from([(entry_proto, 0)]),
+            repeat_condition_locals: BTreeSet::new(),
         };
         summary.visit_block(0, &module.body);
         summary
@@ -117,7 +122,19 @@ impl AstMetricSummary {
             AstStmt::Repeat(repeat_stmt) => {
                 self.increment(scope, ReadabilityAstMetric::Repeat);
                 self.visit_block(scope, &repeat_stmt.body);
+                // 只扫描直属声明；各循环的直属语句不重叠，不为每个候选重扫整个子树。
+                self.repeat_condition_locals = repeat_stmt
+                    .body
+                    .stmts
+                    .iter()
+                    .filter_map(|stmt| match stmt {
+                        AstStmt::LocalDecl(decl) if !decl.values.is_empty() => Some(decl),
+                        _ => None,
+                    })
+                    .flat_map(|decl| decl.bindings.iter().map(|binding| binding.id))
+                    .collect();
                 self.visit_expr(scope, &repeat_stmt.cond);
+                self.repeat_condition_locals.clear();
             }
             AstStmt::NumericFor(for_stmt) => {
                 self.increment(scope, ReadabilityAstMetric::NumericFor);
@@ -205,10 +222,15 @@ impl AstMetricSummary {
             AstExpr::MethodCall(call) => self.visit_method_call_expr(scope, call),
             AstExpr::SingleValue(inner) => self.visit_expr(scope, inner),
             AstExpr::TableConstructor(table) => {
+                self.increment(scope, ReadabilityAstMetric::TableConstructor);
                 for field in &table.fields {
                     match field {
-                        unluac::ast::AstTableField::Array(value) => self.visit_expr(scope, value),
+                        unluac::ast::AstTableField::Array(value) => {
+                            self.increment(scope, ReadabilityAstMetric::TableListField);
+                            self.visit_expr(scope, value);
+                        }
                         unluac::ast::AstTableField::Record(record) => {
+                            self.increment(scope, ReadabilityAstMetric::TableRecordField);
                             if let unluac::ast::AstTableKey::Expr(key) = &record.key {
                                 self.visit_expr(scope, key);
                             }
@@ -219,6 +241,13 @@ impl AstMetricSummary {
             }
             AstExpr::FunctionExpr(function) => self.visit_function(scope, function),
             AstExpr::Error(_) => self.increment(scope, ReadabilityAstMetric::Error),
+            AstExpr::Var(name) => {
+                if let Some(binding) = AstBindingRef::from_name_ref(name)
+                    && self.repeat_condition_locals.remove(&binding)
+                {
+                    self.increment(scope, ReadabilityAstMetric::RepeatConditionLocal);
+                }
+            }
             AstExpr::Nil
             | AstExpr::Boolean(_)
             | AstExpr::Integer(_)
@@ -229,12 +258,13 @@ impl AstMetricSummary {
             | AstExpr::UInt64(_)
             | AstExpr::Complex { .. }
             | AstExpr::Vector(_)
-            | AstExpr::Var(_)
             | AstExpr::VarArg => {}
         }
     }
 
     fn visit_function(&mut self, parent_scope: usize, function: &AstFunctionExpr) {
+        // 条件中出现函数表达式时，child body 的同号 local 不属于外层 until 的读取。
+        let repeat_condition_locals = std::mem::take(&mut self.repeat_condition_locals);
         self.increment(parent_scope, ReadabilityAstMetric::Function);
         if function.named_vararg.is_some() {
             self.increment(parent_scope, ReadabilityAstMetric::NamedVarargFunction);
@@ -253,6 +283,7 @@ impl AstMetricSummary {
             }
         };
         self.visit_block(scope, &function.body);
+        self.repeat_condition_locals = repeat_condition_locals;
     }
 }
 
@@ -280,6 +311,10 @@ impl ReadabilityAstMetric {
             Self::CloseBinding => 18,
             Self::GlobalDecl => 19,
             Self::NamedVarargFunction => 20,
+            Self::TableConstructor => 21,
+            Self::TableListField => 22,
+            Self::TableRecordField => 23,
+            Self::RepeatConditionLocal => 24,
         }
     }
 
@@ -306,6 +341,10 @@ impl ReadabilityAstMetric {
             Self::CloseBinding => "close-binding",
             Self::GlobalDecl => "global-decl",
             Self::NamedVarargFunction => "named-vararg-function",
+            Self::TableConstructor => "table-constructor",
+            Self::TableListField => "table-list-field",
+            Self::TableRecordField => "table-record-field",
+            Self::RepeatConditionLocal => "repeat-condition-local",
         }
     }
 }

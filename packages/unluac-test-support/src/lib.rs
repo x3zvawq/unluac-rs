@@ -1,6 +1,6 @@
 //! 这个 crate 承载仓库源码 case 的统一端到端测试流水线。
 //!
-//! unit 与 regression 共用官方 toolchain 编译、反编译、回编译、执行和可读性/结构合同；
+//! 所有主题共用官方 toolchain 编译、反编译、回编译、执行和可读性/结构合同；
 //! 少数 VM 内建协议或普通小样例难以稳定触发的宽度边界，只能由 manifest 显式授权，
 //! 再从同一源码通过 pinned 运行时动态导出临时 chunk。这里不提交 bytecode fixture，
 //! 也不改变业务 lowering。
@@ -32,10 +32,12 @@ use unluac::transformer::{
 
 #[allow(dead_code)]
 mod case_manifest;
-pub use case_manifest::{LuaCaseDialect, LuaCaseId, LuaCaseManifestEntry, LuaCaseVariant};
+pub use case_manifest::{
+    LuaCaseDialect, LuaCaseId, LuaCaseManifestEntry, LuaCaseVariant, validate_case_catalog,
+};
 use case_manifest::{
     LuaCaseExpectation, LuaCaseLoopProtocol, LuaCaseOptions, LuaCaseStructureContract,
-    regression_cases, unit_cases,
+    manifest_cases,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -70,40 +72,40 @@ enum LuaCompilerProtocol {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct LuaToolchain {
     runtime_name: &'static str,
+    compiled_runtime_name: &'static str,
     compiler_name: &'static str,
     compiler_protocol: LuaCompilerProtocol,
     chunk_extension: &'static str,
-    can_run_compiled_chunks: bool,
 }
 
 impl LuaToolchain {
     const fn stock_puc_lua() -> Self {
         Self {
             runtime_name: "lua",
+            compiled_runtime_name: "lua",
             compiler_name: "luac",
             compiler_protocol: LuaCompilerProtocol::LuacStyle,
             chunk_extension: "luac",
-            can_run_compiled_chunks: true,
         }
     }
 
     const fn luau() -> Self {
         Self {
             runtime_name: "luau",
+            compiled_runtime_name: "luau-bytecode-runner",
             compiler_name: "luau-compile",
             compiler_protocol: LuaCompilerProtocol::LuauBinaryStdout,
             chunk_extension: "luau",
-            can_run_compiled_chunks: false,
         }
     }
 
     const fn luajit() -> Self {
         Self {
             runtime_name: "luajit",
+            compiled_runtime_name: "luajit",
             compiler_name: "luac",
             compiler_protocol: LuaCompilerProtocol::LuaJitBytecodeTool,
             chunk_extension: "luajit",
-            can_run_compiled_chunks: true,
         }
     }
 }
@@ -325,68 +327,36 @@ fn failure_separator() -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum UnitSuite {
-    Unit,
-    Regression,
+pub fn case_entries() -> Vec<LuaCaseManifestEntry> {
+    manifest_cases().collect()
 }
 
-impl UnitSuite {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Unit => "unit",
-            Self::Regression => "regression",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "unit" => Ok(Self::Unit),
-            "regression" => Ok(Self::Regression),
-            _ => Err(format!(
-                "unknown test suite: {value} (expected `unit` or `regression`)"
-            )),
-        }
-    }
+/// 索引只统计源码指令，不把指令数量当作运行路径覆盖率。
+#[derive(Debug, Clone, Copy)]
+pub struct CaseReadabilitySummary {
+    pub total: usize,
+    pub ast: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct UnitCaseSpec {
-    pub suite: UnitSuite,
-    pub entry: LuaCaseManifestEntry,
+/// 列表阶段按源码校验 selector 并复用本次解析的统计，避免按配置重复读取文件。
+pub fn inspect_case_readability(
+    entries: &[LuaCaseManifestEntry],
+) -> Result<std::collections::BTreeMap<&'static str, CaseReadabilitySummary>, String> {
+    readability_summaries(entries)
 }
 
-pub fn unit_case_specs() -> Vec<UnitCaseSpec> {
-    unit_cases()
-        .map(|entry| UnitCaseSpec {
-            suite: UnitSuite::Unit,
-            entry,
-        })
-        .chain(regression_cases().map(|entry| UnitCaseSpec {
-            suite: UnitSuite::Regression,
-            entry,
-        }))
-        .collect()
+pub fn find_case_entry(id: LuaCaseId) -> Option<LuaCaseManifestEntry> {
+    manifest_cases().nth(id.0)
 }
 
-/// 在 runner 列表阶段校验源码断言的 manifest selector，避免拼写过期后静默跳过全部实例。
-pub fn validate_readability_selector_coverage(specs: &[UnitCaseSpec]) -> Result<(), String> {
-    validate_readability_selectors(specs)
-}
-
-pub fn find_unit_case_spec(suite: UnitSuite, id: LuaCaseId) -> Option<UnitCaseSpec> {
-    unit_case_specs()
-        .into_iter()
-        .find(|spec| spec.suite == suite && spec.entry.id == id)
-}
-
-pub fn run_unit_case(spec: UnitCaseSpec) -> Result<TestSuccess, TestFailure> {
-    run_pipeline_case(spec.suite, &spec.entry)
+pub fn run_case(entry: LuaCaseManifestEntry) -> Result<TestSuccess, TestFailure> {
+    run_pipeline_case(&entry)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct CaseBaseline {
     pub(crate) source_output: LuaCommandOutput,
+    pub(crate) runtime_observer: Option<runtime_observer::RuntimeObserver>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -463,6 +433,10 @@ enum ReadabilityAstMetric {
     CloseBinding,
     GlobalDecl,
     NamedVarargFunction,
+    TableConstructor,
+    TableListField,
+    TableRecordField,
+    RepeatConditionLocal,
 }
 
 /// 源码断言对 manifest 已展开实例的精确筛选；不在测试源码中重复方言或编译选项矩阵。
@@ -495,6 +469,8 @@ mod output_diff;
 mod pipeline;
 #[path = "support/readability.rs"]
 mod readability;
+#[path = "support/runtime_observer.rs"]
+mod runtime_observer;
 #[path = "support/toolchain.rs"]
 mod toolchain;
 

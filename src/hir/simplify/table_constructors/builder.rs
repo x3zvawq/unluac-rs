@@ -7,8 +7,8 @@
 //! 输入形状：已有构造器字段 + 后续 array / record / set-list 值。
 //! 输出形状：按 Lua 构造器语义重新排序后的 `HirTableConstructor`。未来整数键只有在后续
 //! 写入可证明不别名时才能晋升为 array；open list 覆盖已有后缀时先降回显式整数字段。
-//! 完整 Luau 初始化消费 lower 标记的隐式模板位置：默认零值和原同键写只对应一个源码
-//! 字段，实际写仍全部按原顺序输出，避免每轮编译重复增加一份默认零值写。
+//! 完整模板初始化消费 lower 标记的隐式位置：Luau 默认零值和 LuaJIT TDUP nil hash
+//! marker 与原同键写只对应一个源码字段，实际写仍全部按原顺序输出，避免重复占位或改序。
 
 use std::collections::BTreeMap;
 
@@ -18,7 +18,7 @@ use crate::hir::common::{
 
 use super::{RebuildScratch, RestoredArrayField, RestoredPendingIntegerField};
 use crate::hir::value_facts::value_facts;
-use crate::value_semantics::table::TableExpression;
+use crate::value_semantics::table::{TableExpression, initializes_template};
 
 #[derive(Debug, Clone)]
 enum BuilderField {
@@ -95,10 +95,11 @@ impl ConstructorBuilder {
     }
 
     pub(super) fn from_constructor(constructor: HirTableConstructor) -> Self {
+        let implicit_template_fields = constructor.implicit_template_fields;
         let mut builder = Self {
             sources: constructor.sources,
             allocation: constructor.allocation,
-            implicit_template_fields: constructor.implicit_template_fields,
+            implicit_template_fields: std::collections::BTreeSet::new(),
             fields: Vec::with_capacity(constructor.fields.len()),
             trailing_multivalue: constructor.trailing_multivalue,
             next_array_index: 1,
@@ -107,7 +108,11 @@ impl ConstructorBuilder {
             numeric_key_first_fields: BTreeMap::new(),
             moved_fields: 0,
         };
-        for field in constructor.fields {
+        for (index, field) in constructor.fields.into_iter().enumerate() {
+            if implicit_template_fields.contains(&index) {
+                builder.push_implicit_template_field(field);
+                continue;
+            }
             match field {
                 HirTableField::Array(value) => {
                     builder.push_array_value(value);
@@ -135,7 +140,9 @@ impl ConstructorBuilder {
 
     pub(super) fn into_constructor(self) -> HirTableConstructor {
         let mut fields = Vec::with_capacity(self.fields.len());
-        for field in self.fields {
+        let mut implicit_template_fields = std::collections::BTreeSet::new();
+        for (index, field) in self.fields.into_iter().enumerate() {
+            let output_index = fields.len();
             match field {
                 BuilderField::Final(field) => fields.push(field),
                 BuilderField::PendingInt {
@@ -149,7 +156,12 @@ impl ConstructorBuilder {
                         value,
                     }));
                 }
-                BuilderField::MovedPendingInt => {}
+                BuilderField::MovedPendingInt => {
+                    debug_assert!(!self.implicit_template_fields.contains(&index));
+                }
+            }
+            if fields.len() != output_index && self.implicit_template_fields.contains(&index) {
+                implicit_template_fields.insert(output_index);
             }
         }
         let mut constructor = HirTableConstructor {
@@ -157,9 +169,10 @@ impl ConstructorBuilder {
             fields,
             trailing_multivalue: self.trailing_multivalue,
             allocation: self.allocation,
-            implicit_template_fields: self.implicit_template_fields,
+            implicit_template_fields,
         };
         restore_luau_template_initialization(&mut constructor);
+        restore_template_nil_hash_fields(&mut constructor);
         restore_template_nil_slots(&mut constructor);
         restore_indexed_array_fields(&mut constructor);
         constructor
@@ -179,6 +192,8 @@ impl ConstructorBuilder {
 
     pub(super) fn rollback(&mut self, checkpoint: BuilderCheckpoint, scratch: &mut RebuildScratch) {
         self.fields.truncate(checkpoint.fields_len);
+        self.implicit_template_fields
+            .retain(|index| *index < checkpoint.fields_len);
         self.last_unknown_key_field = checkpoint.last_unknown_key_field;
         self.numeric_key_first_fields
             .retain(|_, first_field| *first_field < checkpoint.fields_len);
@@ -271,6 +286,27 @@ impl ConstructorBuilder {
         self.fields
             .push(BuilderField::Final(HirTableField::Array(value)));
         self.next_array_index += 1;
+    }
+
+    /// Lowering 发布的模板占位保持原字段角色；不能让通用整数 record 晋升或暂存后再从
+    /// nil 外形反猜其来源。当前两个生产者都发布 record，数组分支只保持索引完备性。
+    fn push_implicit_template_field(&mut self, field: HirTableField) {
+        let field_index = self.fields.len();
+        match field {
+            HirTableField::Array(value) => self.push_array_value(value),
+            HirTableField::Record(record) => {
+                self.shadow_aliased_pending_integer_fields(&record.key);
+                let numeric_key = record.key.table_integer_key();
+                self.fields
+                    .push(BuilderField::Final(HirTableField::Record(record)));
+                if let Some(key) = numeric_key {
+                    self.numeric_key_first_fields
+                        .entry(key)
+                        .or_insert(field_index);
+                }
+            }
+        }
+        self.implicit_template_fields.insert(field_index);
     }
 
     pub(super) fn push_record_field(&mut self, field: crate::hir::common::HirRecordField) {
@@ -568,6 +604,12 @@ fn restore_template_nil_slots(constructor: &mut HirTableConstructor) {
     let mut last_runtime_field = None;
     let mut removed = vec![false; constructor.fields.len()];
     for (index, removed) in removed.iter_mut().enumerate() {
+        if constructor.implicit_template_fields.contains(&index) {
+            // 未消费的 TDUP hash marker 仍描述原 hash key，不能借相同数字外形把它
+            // 改成数组槽；该位置也隔开其前后的运行时字段移动。
+            last_runtime_field = Some(index);
+            continue;
+        }
         let slot = match &constructor.fields[index] {
             HirTableField::Array(value) => {
                 nil_slots.push(matches!(value, HirExpr::Nil).then_some(index));
@@ -603,10 +645,79 @@ fn restore_template_nil_slots(constructor: &mut HirTableConstructor) {
         constructor.fields[destination] = HirTableField::Array(record.value);
         *removed = true;
     }
-    let mut removed = removed.into_iter();
-    constructor
-        .fields
-        .retain(|_| !removed.next().expect("one removal decision per field"));
+    retain_fields_and_template_roles(constructor, &removed);
+}
+
+/// LuaJIT TDUP 的 nil hash marker 只描述原模板 key，不是独立源码求值。完整 region 已按
+/// 原事件顺序追加同键运行字段后，可删除 marker 而保留后继字段位置；后继字段仍须满足
+/// LuaJIT 模板初始化规则，保证重新编译时原 key 集合不缩小。未匹配 marker 继续显式输出。
+fn restore_template_nil_hash_fields(constructor: &mut HirTableConstructor) {
+    let HirTableAllocation::Template { hash_keys, .. } = &constructor.allocation else {
+        return;
+    };
+    if constructor.implicit_template_fields.is_empty() {
+        return;
+    }
+
+    let mut markers = BTreeMap::new();
+    for &index in &constructor.implicit_template_fields {
+        let Some(HirTableField::Record(record)) = constructor.fields.get(index) else {
+            continue;
+        };
+        let Some(key) = record.key.table_key() else {
+            continue;
+        };
+        if matches!(&record.value, HirExpr::Nil) && hash_keys.contains(&key) {
+            markers.insert(key, index);
+        }
+    }
+    if markers.is_empty() {
+        return;
+    }
+
+    let mut removed = vec![false; constructor.fields.len()];
+    for (index, field) in constructor.fields.iter().enumerate() {
+        let HirTableField::Record(record) = field else {
+            continue;
+        };
+        let Some(marker) = record
+            .key
+            .table_key()
+            .and_then(|key| markers.get(&key).copied())
+        else {
+            continue;
+        };
+        if index > marker && initializes_template(&record.key, &record.value) {
+            removed[marker] = true;
+        }
+    }
+    if !removed.iter().any(|removed| *removed) {
+        return;
+    }
+
+    retain_fields_and_template_roles(constructor, &removed);
+}
+
+/// 字段压缩和 lowering role 使用同一旧坐标；任何 owner 删除字段时都必须在同一遍扫描中
+/// 重映射角色，不能让后续模板恢复把已移动的索引解释成另一个字段。
+fn retain_fields_and_template_roles(constructor: &mut HirTableConstructor, removed: &[bool]) {
+    debug_assert_eq!(constructor.fields.len(), removed.len());
+    let old_implicit = std::mem::take(&mut constructor.implicit_template_fields);
+    let mut new_implicit = std::collections::BTreeSet::new();
+    let mut old_index = 0;
+    let mut new_index = 0;
+    constructor.fields.retain(|_| {
+        let retain = !removed[old_index];
+        if retain {
+            if old_implicit.contains(&old_index) {
+                new_implicit.insert(new_index);
+            }
+            new_index += 1;
+        }
+        old_index += 1;
+        retain
+    });
+    constructor.implicit_template_fields = new_implicit;
 }
 
 fn is_template_literal(value: &HirExpr) -> bool {
@@ -623,9 +734,11 @@ fn is_template_literal(value: &HirExpr) -> bool {
 /// 索引式构造器的预分配是前层事实；只有完整有序前缀能复现该容量时才恢复数组字段。
 /// 字段没有换序，故 indexed VM 的写入事件也不变；不把零散整数键猜成数组初始化。
 fn restore_indexed_array_fields(constructor: &mut HirTableConstructor) {
-    if constructor.trailing_multivalue.is_some() {
+    if constructor.trailing_multivalue.is_some() || !constructor.implicit_template_fields.is_empty()
+    {
         // open tail 的起点已由 rebuild 核对；容量相同不能证明扩大固定前缀合法。
         // {"head", [2] = "old", many()} 中的 record 必须保留覆盖后的空返回路径。
+        // 未消费的 TDUP marker 还必须保持 hash key 角色，不能改写成连续 array 字段。
         return;
     }
     let mut array_fields = 0;

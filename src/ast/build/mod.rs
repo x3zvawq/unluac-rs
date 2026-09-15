@@ -5,6 +5,8 @@
 //! StructureFacts。这里不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实，也不会把
 //! 没有等价源码语义的残余 HIR 节点拆成表面合法的 AST。
 //! LocalRootRelease 已由 HIR 证明只结束旧源码根，在此生成 local 清零，不回推 VM 覆写。
+//! 单绑定闭包的引用自捕获必须生成 local function，使 binding 在初始化前可见；普通
+//! `local f = function() ... end` 的 RHS 不在 f 的词法域内，不能留给可选 sugar 修正。
 
 mod analysis;
 mod exprs;
@@ -23,9 +25,9 @@ use self::exprs::PackLoweringContext;
 use super::common::{
     AstAssign, AstBindingRef, AstBlock, AstCallStmt, AstExpr, AstGenericFor, AstGlobalAttr,
     AstGlobalBinding, AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf,
-    AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl, AstLocalOrigin,
-    AstModule, AstNameRef, AstNumericFor, AstRepeat, AstReturn, AstRewriteAuthority, AstStmt,
-    AstTargetDialect, AstWhile,
+    AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
+    AstLocalFunctionDecl, AstLocalOrigin, AstModule, AstNameRef, AstNumericFor, AstRepeat,
+    AstReturn, AstRewriteAuthority, AstStmt, AstTargetDialect, AstWhile,
 };
 use super::error::AstLowerError;
 
@@ -307,12 +309,35 @@ impl<'a> AstLowerer<'a> {
         }
 
         match &block.stmts[index] {
-            HirStmt::LocalDecl(local_decl) => Ok((
-                vec![AstStmt::LocalDecl(Box::new(
-                    self.lower_local_decl(proto_index, local_decl)?,
-                ))],
-                1,
-            )),
+            HirStmt::LocalDecl(local_decl) => {
+                let recursive = matches!(
+                    (local_decl.bindings.as_slice(), local_decl.values.fixed.as_slice(), &local_decl.values.tail),
+                    ([binding], [crate::hir::HirExpr::Closure(closure)], None)
+                        if closure.captures.iter().any(|capture|
+                            capture.binding == crate::hir::HirBinding::Local(*binding)
+                                && capture.mode == crate::hir::HirCaptureMode::ByReference)
+                );
+                let mut lowered = self.lower_local_decl(proto_index, local_decl)?;
+                let stmt = if recursive {
+                    // 引用自捕获必须在初始化前进入词法域。这里是必需的源码语义，
+                    // 不依赖可选 function-sugar，也不受 binding 的重写权限影响。
+                    let binding = lowered.bindings.pop().expect("single recursive binding");
+                    let AstExpr::FunctionExpr(function) =
+                        lowered.values.pop().expect("recursive closure")
+                    else {
+                        unreachable!("HIR closure lowers to a function expression");
+                    };
+                    AstStmt::LocalFunctionDecl(Box::new(AstLocalFunctionDecl {
+                        name: binding.id,
+                        origin: binding.origin,
+                        rewrite_authority: binding.rewrite_authority,
+                        func: *function,
+                    }))
+                } else {
+                    AstStmt::LocalDecl(Box::new(lowered))
+                };
+                Ok((vec![stmt], 1))
+            }
             HirStmt::GlobalDecl(global_decl) => Ok((
                 vec![AstStmt::GlobalDecl(Box::new(
                     self.lower_hir_global_decl(proto_index, global_decl)?,

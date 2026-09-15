@@ -7,6 +7,8 @@
 //! RHS 回调再次改写 log 则不能影响已保存目标。这里不以表达式同名代替读取身份。
 //! 普通算术同样消费 SETTABLE 的唯一 GETTABLE base Def：`t.a[1]=t.b[2]+5`
 //! 必须先保存 t.a 再执行 RHS；低槽动态 key 则保持原 SETTABLE 的直接读取时点。
+//! 固定字段 key 的 CONCAT 共用标量 RHS 事务；`self.value=a..":"..b` 的整个原
+//! 连续输入区由 CONCAT 重发，不能把每轮编译产生的 COPY 当作额外源码声明保留。
 
 use super::*;
 use crate::hir::common::{HirAssign, HirBinaryOpKind, HirExpr, HirTableAccess};
@@ -56,8 +58,8 @@ pub(super) fn plan(
         }
         _ => return None,
     };
-    if binary.op != HirBinaryOpKind::Concat {
-        return arithmetic(
+    if binary.op != HirBinaryOpKind::Concat || layout.key.is_none() {
+        return scalar_rhs(
             context,
             run,
             facts,
@@ -152,7 +154,7 @@ pub(super) fn plan(
         sink: run.len(),
         base,
         values: vec![value].into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: Some(HirTableAccess {
@@ -160,6 +162,7 @@ pub(super) fn plan(
             key,
             ..access.as_ref().clone()
         }),
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })
@@ -169,7 +172,7 @@ pub(super) fn plan(
     clippy::too_many_arguments,
     reason = "沿用已解析的赋值终点与原 RHS，避免重新扫描候选区"
 )]
-fn arithmetic(
+fn scalar_rhs(
     context: NativeFrameContext<'_>,
     run: &[&HirStmt],
     facts: &ProtoPromotionFacts,
@@ -187,6 +190,7 @@ fn arithmetic(
             | HirBinaryOpKind::Div
             | HirBinaryOpKind::Mod
             | HirBinaryOpKind::Pow
+            | HirBinaryOpKind::Concat
     ) {
         return None;
     }
@@ -238,7 +242,9 @@ fn arithmetic(
     };
     let target_base = if let Some((producer, home)) = snapshot {
         match &access.base {
-            HirExpr::TableAccess(access) => builder.puc_lookup(access, run.len(), home.slot())?,
+            HirExpr::TableAccess(access) => {
+                builder.register_lookup(access, run.len(), home.slot())?
+            }
             _ => builder.expr(
                 &access.base,
                 run.len(),
@@ -262,6 +268,8 @@ fn arithmetic(
             true,
             facts.operation_result_temp(binary.source_site?),
         )?
+    } else if binary.op == HirBinaryOpKind::Concat {
+        builder.concat(binary, run.len(), value_home.slot())?
     } else {
         builder.puc_arithmetic(binary, run.len(), value_home.slot())?
     };
@@ -274,7 +282,7 @@ fn arithmetic(
         sink: run.len(),
         base,
         values: vec![value].into(),
-        result_local: None,
+        result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
         indexed_target: Some(HirTableAccess {
@@ -282,6 +290,7 @@ fn arithmetic(
             key,
             ..access.clone()
         }),
+        continuing_root: None,
         retained_copies: Vec::new(),
         removed: Vec::new(),
     })

@@ -34,7 +34,9 @@ Outputs:
 - stock Lua builds produce `lua` and `luac`
 - `luajit` produces `luajit`, its bundled `jit/` modules, and a compatibility wrapper `luac` that runs `luajit -b`
 - `luau` produces `luau`, `luau-analyze`, `luau-compile`, `luau-bytecode`, and
-  `luau-bytecode-runner`; the runner only executes binary chunks for explicit VM contract tests
+  `luau-bytecode-runner`; the runner executes original and regenerated binary chunks for case validation
+  and explicit VM contracts, including the pinned CLI's `collectgarbage` entry point. It accepts an
+  optional observer chunk that receives the original loaded function as its argument.
 - Windows appends `.exe` to each executable name; Unix keeps the names extensionless
 
 Host prerequisites:

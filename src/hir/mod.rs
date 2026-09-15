@@ -5,6 +5,7 @@
 
 mod analyze;
 mod common;
+pub(crate) use common::HirRequiredLuauInlining;
 #[cfg(feature = "decompile-debug")]
 mod debug;
 mod decision;

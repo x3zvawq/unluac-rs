@@ -185,6 +185,12 @@ impl TempUseScratch {
         self.definition_counts.get(temp.index()) == Some(&1)
     }
 
+    pub(super) fn has_definition(&self, temp: TempId) -> bool {
+        self.definition_counts
+            .get(temp.index())
+            .is_some_and(|count| *count != 0)
+    }
+
     pub(super) fn temp_count(&self) -> usize {
         self.counts.len()
     }

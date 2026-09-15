@@ -265,41 +265,44 @@ pub(in crate::hir::simplify) fn restore_materializations(
     }
     let mut requests = BTreeMap::new();
     count = 0;
-    for stmt in &preview.body.stmts {
-        crate::hir::visit::visit_stmt_structure(stmt, &mut |stmt| {
-            let home = match stmt {
-                HirStmt::LocalDecl(decl)
-                    if decl.bindings.iter().any(|local| nil_locals.contains(local)) =>
-                {
-                    preview_facts.trusted_local_home_slot(decl.bindings[0])
-                }
-                _ => statement_frame(stmt, &preview_facts, dialect),
-            };
-            if let Some(home) = home {
-                requests.insert(
-                    count,
-                    PrefixRequest {
-                        home,
-                        required: match stmt {
-                            HirStmt::Assign(assign) => assign
-                                .targets
-                                .iter()
-                                .filter_map(|target| {
-                                    if let HirLValue::Local(local) = target {
-                                        Some(*local)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect(),
-                            _ => BTreeSet::new(),
-                        },
-                    },
-                );
+    super::coordinates::visit(&preview.body, &mut count, &mut |index, kind, stmt| {
+        if kind == super::coordinates::PointKind::Boundary
+            || (kind == super::coordinates::PointKind::Statement
+                && matches!(stmt, HirStmt::Repeat(_)))
+        {
+            return;
+        }
+        let home = match stmt {
+            HirStmt::LocalDecl(decl)
+                if decl.bindings.iter().any(|local| nil_locals.contains(local)) =>
+            {
+                preview_facts.trusted_local_home_slot(decl.bindings[0])
             }
-            count += 1;
-        });
-    }
+            _ => statement_frame(stmt, &preview_facts, dialect),
+        };
+        if let Some(home) = home {
+            requests.insert(
+                index,
+                PrefixRequest {
+                    home,
+                    required: match stmt {
+                        HirStmt::Assign(assign) => assign
+                            .targets
+                            .iter()
+                            .filter_map(|target| {
+                                if let HirLValue::Local(local) = target {
+                                    Some(*local)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect(),
+                        _ => BTreeSet::new(),
+                    },
+                },
+            );
+        }
+    });
     let Ok(preserved) = validate_prefixes(
         &preview,
         &preview_facts,
@@ -362,6 +365,7 @@ fn statement_frame(
             .generic_for_body_frame(for_)
             .and_then(|frame| frame.controls.first().copied()),
         HirStmt::Return(ret) => single_value_frame(&ret.values, facts, dialect),
+        HirStmt::GlobalDecl(decl) => single_value_frame(&decl.values, facts, dialect),
         HirStmt::Assign(assign) => {
             let entry = single_value_frame(&assign.values, facts, dialect)?;
             if let ([HirLValue::Local(local)], [HirExpr::GlobalRef(_)], None) = (
@@ -387,6 +391,7 @@ fn statement_frame(
         }
         HirStmt::If(if_) => expression_frame(&if_.cond, facts, dialect),
         HirStmt::While(while_) => expression_frame(&while_.cond, facts, dialect),
+        HirStmt::Repeat(repeat) => expression_frame(&repeat.cond, facts, dialect),
         _ => None,
     }
 }
