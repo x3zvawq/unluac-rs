@@ -276,3 +276,156 @@ proto 要求双 repeat、全模块无 goto。644/645、103/128 的相邻嵌套�
 全工作区 Clippy、WASM `wasm32-unknown-unknown` 及差异检查通过；完整日志为
 `tmp/test/audit.shared-repeat.{full,clippy,wasm}.txt`。两项此前记录的临时循环支持缺口现均有修复和
 注册回归；这不代表所有样例的可读性合同或长期系统审计已完成。
+
+## 2026-09-13：方言语法指标与不可观察的运行结果
+
+本轮从当前无可读性指令的 165 个文件中审阅方言 unit 与四个早期 regression，没有把已有 GC、
+生命周期或专用 residual 合同判为无效。新增三项 AST 指标，使指标总数为 21：`close-binding`、
+`global-decl`、`named-vararg-function`。仍从最终 readability AST 一次遍历收集，不解析生成文本。
+计数单位和父/子 proto 边界已写入 `design/11.test.md`。
+
+四个方言 unit 补充关闭绑定、global 声明、命名变参以及可规约 goto 的结构合同；goto 约束只作用于
+已检查的可规约 proto，未套到不可规约网格。协议样例新增三项零计数，并打印含相应语法的字符串，
+证明文本中的关键字不会被算成 AST 节点。12 项定向配置、74 项 proto 通过。
+另分别注入错误 close-binding exact、global-decl max 和 named-vararg-function min，三个探针
+均被 `readability-assertion-failed` 拒绝，随后按字节恢复源码；日志为
+`tmp/test/audit.dialect-metrics.{protocol,negative}.txt`。
+
+GPT-5.6 Sol 只读审阅四个早期回归，主侧整合并验证：
+
+- 09 只约束原生 generic-for，不把当前物理 home 准备链冻结为文本。其源码注释所述 escaped-root
+  生命周期尚无本 case 的 GC/弱引用观察，不能把这个结构断言称为生命周期证明，也未据此报告错码。
+- 147 新增三项调用展示顺序合同；现有 log 输出继续检查运行时求值顺序。
+- 179 原 Luau 配置将长度与相等比较全部折成常量，两个目标字符串没有进入 Generate。最终 print
+  现在同时携带原字符串，七种方言实际生成它们，并由两项分隔符断言与编译/执行检查保护边界。
+- 207 原源码只返回 chunk 结果，进程 stdout/退出码比较不观察返回值。现保留 80 参数宽链，显式
+  断言并打印未命中、尾部命中、中部命中和首部优先四条路径；目标 proto 的 if/goto 为零，父 proto
+  保留唯一函数。增加运行观察后 PUC 合法采用 local 赋函数表达式，故本轮新合同使用 `function`
+  计数，不强制 `local-function` 拼写；旧断言及预算没有降低。
+
+四个回归合计 22/22 配置通过，细分日志为 `tmp/test/audit.dialect-metrics.early.txt`、
+`tmp/test/audit.dialect-metrics.literal-carrier.txt` 和 `tmp/test/audit.dialect-metrics.wide-chain-final.txt`。
+本轮新增 23 条指令，八份原无指令文件获得针对性合同；当前 737 个源码文件中仍有 157 份无指令。
+源码/manifest 配置数未变化，没有按数字前缀重编号或删除语义未证明重复的样例。
+
+集中全量 `cargo unit-test --jobs 8`：3,264/3,264 配置、2,133/2,133 proto 通过，无失败、无超时；
+全工作区 Clippy 通过，日志为 `tmp/test/audit.dialect-metrics.{full,clippy}.txt`。本轮只修改测试支持、
+样例与测试文档，未修改核心实现、依赖或 WASM 接口，未重跑 WASM 检查。
+
+207 的发现还提示继续检查只返回 chunk 值、没有可观察输出的普通 case。静态候选清单位于
+`tmp/test/audit.no-visible-oracle-candidates.txt`；该列表仅按文本筛选，包含专用 expectation、
+间接输出或压力测试，不能直接当作失效测试名单，后续必须逐项核对 manifest 和真实执行。
+
+## 2026-09-13：早期回归的实际调用与运行观察
+
+核对 manifest 和 `support/pipeline.rs` 后，03/04/05/11_branch/63/64/65/69/70/72 均为普通
+Source expectation、Lua 5.1 stripped 配置。03/04/11/63/64/65/69/70 原来没有执行被测函数，
+05/72 仅返回结果且没有可观察输出。原展示合同仍有效，但不能据此声称对应行为已有运行验证。
+
+保留十份样例的被测逻辑及全部旧可读性断言，在原文件补入观察：03 检查事件分支、回调次数和
+含 nil 的三返回值；04 检查非函数短路和 Lua 真值；05 归一化无序 hits 并逐项检查材料分支；
+11 检查优先分支、各闭包的独立 needed 与共享对象更新；63/64 检查四返回值、fallback 次数、
+global 写入和无效边界；65 刻意区分捕获 owner 与调用 receiver。69 通过已有 yield 边界观察
+队列消费，70 在下一轮入口的回调暂停并观察上轮状态，两者均有限次恢复且不修改原无限循环。
+72 显式断言并打印退出结果。
+
+65 的新增观察最初使用冒号调用，合法触发冒号声明恢复而与原点号声明合同冲突。新增调用改用
+`owner.read(owner)` 后通过，未删除或降低旧断言。七个有限函数样例还分别在 tmp 中注入返回值、
+分支动作或对象身份错误，七个单点变异均被 runtime assertion 拒绝；探针不改仓库原文件。
+
+定向注册验证合计 10/10 配置、11/11 proto 通过，无失败、无超时；日志为
+`tmp/test/audit.runtime-oracles.{focused-final,loops,negative}.txt`。本主题只改变 case 与文档，
+未修改 manifest、runner 或核心实现，未重复运行全量、Clippy 和 WASM。
+
+进一步审计 common_12 后，新增字节观察在其六个注册方言全部触发 generated-chunk-execution-failed，
+证明存在被旧无输出样例掩盖的字符串语义问题；该问题转入 Generate 字面量 owner 单独修复。
+
+## 2026-09-13：生成字符串的原始字节身份
+
+common_12 原来只调用并丢弃 GBK 字符串，文本合同要求输出 `"中文"`。给返回值添加长度与逐字节
+断言后，六个原注册方言均在生成产物执行时失败；独立 CLI/runtime 探针也确认原输出为
+`4 214 208 206 196`，生成输出变成 `6 228 184 173 230 150 135`。这是实际不等价，
+不是单纯的显示编码差别。原失败日志为 `tmp/test/audit.string-bytes.before.txt`。
+
+RawString/LuaString 一直持有正确原始字节，首次错误消费位于 Generate 的 `emit/syntax.rs`：
+长括号选择、引号正文和转义成本均优先使用 `preferred_text`，把 GBK 展示视图当成 UTF-8 源码值。
+三个决策点现统一消费 `as_utf8()` 的原字节视图，非 UTF-8 继续使用原有逐字节十进制转义；
+未引入新编码通道或深拷贝。解码视图保留用于元数据与调试展示。
+
+原要求将 GBK 字节输出成 UTF-8 中文的合同与运行语义冲突，已改为精确 GBK 字节转义合同；
+另加入真正 UTF-8 字节并要求它仍显示为中文且只出现一次，避免用全转义掩盖可读性退化。
+同一 unit 覆盖非 UTF-8 换行、引号、数字续接和 NUL/高位二进制字节，均逐字节断言并输出。
+Luau 无实际编译/运行限制，故将已有 unit 扩为 ALL_DIALECTS，保留单份源码。
+
+原六方言及相邻字面量 69/69 配置、26/26 proto 通过；扩入 Luau 后 common_12 的 7/7 配置、
+14/14 proto 通过。另对 auto、显式 GBK、显式 UTF-8 各自可解析输入，组合三种引号策略，
+九项 Lua 5.4 CLI/runtime 字节输出均与源程序一致。显式 GBK 仍按 Parser 合同拒绝不可解码的
+任意二进制字节，未改变该选项行为。日志为 `tmp/test/audit.string-bytes.{focused,all-dialects,options}.txt`。
+
+集中全量 `cargo unit-test --jobs 8`：3,265/3,265 配置、2,158/2,158 proto 通过，无失败、无超时。
+全工作区 Clippy、WASM `wasm32-unknown-unknown` 和差异检查通过；日志为
+`tmp/test/audit.string-bytes.{full,clippy,wasm}.txt`。这是当前实现的验证结果，长期覆盖审计仍未完成。
+
+后续运行观察候选仍有 120/123/124/128/131 的返回函数、320 的深闭包链、324 的未调用方法、
+402_function_sugar_nested_local_ids 的未调用构造器，以及 extraarg/133 的宽常量边界。
+这些目前是覆盖缺口，不是已确认错码。410 的两个 GlobalDeclResidual 样例通过专用协议验证，
+509 通过 report 间接输出，不能因文本检索未发现 print/assert 而判作无效或删除。
+其余候选的 manifest/执行路径证据及建议观察入口见临时审阅记录 `tmp/runtime_coverage_audit_sol.md`。
+
+## 2026-09-13：宽常量、返回函数与延迟回调的运行观察
+
+沿上一轮候选补强八份现有源码，未修改原被测函数体或旧可读性断言，也未新增副本或 manifest
+配置。普通 Source 的执行入口仍按现有协议比较输出和退出状态，观察逻辑放在各 case 内：
+
+- `lua52_03_extraarg_boundary` 在巨表及 marker 之后逐项断言 262145 个值，并打印 SETLIST 边界
+  两侧与最后一个值。使用官方 Lua 5.2 反汇编比较，新增观察前后指令 1..272124 完全一致，包含
+  原数组 SETLIST 和 LOADKX/EXTRAARG 常量 262145；新 global/string 常量位于原边界之后。
+  保留压力样例原 `recompile_rounds=0`，没有增加预算。
+- 123 经表调用遍历三个布尔输入的八种组合，检查两臂结果；新增 if 数量上限保护不再拆散，
+  不要求永远保留可等价简化的三个 if。124 观察空、一项、四项迭代域的 break 与正常退出路径；
+  两种非终止参数组合仅用于空域，未声称执行其无限循环体。
+- 128 执行跳过 while 与 inner break 两种有限路径，检查零返回宽度，并用 AST 数量保护原主题的
+  一层 repeat 与一层 while。131 检查匿名变参零参数、单 nil、对象及中间/末尾 nil 的四返回宽度，
+  要求 named-vararg-function 为零。
+- 320 逐层调用 300 次，到达最终值 0，并要求 300 个函数节点，确保深 proto 压力未被观察代码消去。
+- 324 用独立列出的期望表检查九条渠道、状态、等级路径，同时检查 open/official/require/lv 顺序，
+  验证短路不会提前加载 player。402_function_sugar 区分 begin 与 finish 的 receiver，保存回调并在
+  build 返回后执行，检查 token 身份与 begin/finish/side/use 顺序；原链式展示断言仍通过。
+
+定向注册验证共 14/14 配置、14/14 proto 通过，无失败、无超时；123 最终采用 if 上限后再次通过。
+八份 tmp 副本分别注入边界元素、返回值、变参宽度或调用参数错误，八个单点变异均被运行断言拒绝。
+日志为 `tmp/test/audit.returned-functions.{focused,callbacks,shape-final,negative}.txt`；原边界指令
+比较见 `tmp/test/audit.extraarg-observation-layout.txt`。本主题仅 case/文档修改，未重复运行全量、
+Clippy 或 WASM，也没有借上一轮全量结果宣称本轮全量通过。
+
+本轮未发现新的反编译语义反例。120 仍需为非终止路径设计有意义的观察方式；132/133 已有精确
+文本合同，但 chunk 返回值尚未观察，其中 133 不能用无参时恒为 false 的比较充当宽操作数证明。
+
+## 2026-09-13：剩余返回值与有限循环观察
+
+132 改为显式检查正负无限复数的实部为零、虚部分别为正负 math.huge，再输出各分量；原 numeric
+token 三条合同保留。133 将原 vararg chunk 的完整主体放进独立 compare proto，父 proto 提供
+命中、低字节错误常量、末项 padding 与 nil 输入，并观察 sink。官方 LuaJIT 反汇编确认前后全部
+269 条目标指令一致，ISEQS 的 D 仍为 260，错误截断到低字节 4 仍会引用 padding-005。
+
+133 的“比较不得拆成机械 local”合同随被测 proto 从 0 迁移到 1 更新名字，并增加目标 proto 的
+if 为零合同；没有降低比较展示要求。未命中输入用 string.format 在父 proto 构造，避免测试载体
+自身引入 padding-005 字面量与原禁止错误常量的断言冲突。正负号错误与 D 截断错误的 tmp 变异
+分别被运行断言拒绝。
+
+120 根据 Sol 只读审阅补入 pcall 和带 __index 的表，分别执行 a=true 时的 break/continue 路径，
+检查结果 3 与索引序列 1,2,3。pcall 使 Luau O2 保留被测函数；正式载体与原样例的 O2 stripped
+Function 0 反汇编完全一致。索引偏移一位的 tmp 变异被新增断言拒绝。
+该观察保护 x 的跨轮携带、查表次数和顺序及有限终止；a=false 的非终止分支仍未执行。
+在这组 a=true 输入下，某些错误 continue 归属可以行为等价，不能用通过结果声称证明全部 owner；
+原 repeat/continue/break 和禁止 goto 的结构合同继续保留，没有用超时或人为异常扩大证据。
+
+另确认基础 `literal_binary_string_bytes` 在当前 Luau 可保留目标字面量并正确执行，将该独立 unit
+扩为 ALL_DIALECTS，未复制源码。10/10 注册配置、3/3 输出 proto 检查通过，无失败、无超时；
+Clippy 通过。仅 case/manifest/文档变化，未重复全量或 WASM。日志为
+`tmp/test/audit.remaining-observers.{focused,loop,luajit-negative,loop-negative,clippy}.txt`；
+字节码布局证据为 `tmp/test/audit.wide-compare-layout.txt` 与 `tmp/test/audit.loop120-layout.txt`。
+
+本轮未发现新的语义反例。静态“没有显式 print/assert”候选已逐项补观察或确认专用/间接观察协议，
+但这不意味着所有函数与路径已覆盖。另筛选 type 输出时确认 268 已有限调用 run，280 的无限循环
+仍主要由自身结构断言及已有有限反例 642 保护；不能把 type(run) 输出单独称作循环运行验证。

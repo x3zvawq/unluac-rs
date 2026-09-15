@@ -3,6 +3,8 @@
 //! 它依赖 AST 运算符、目标方言和引号策略，只回答括号、字面量和标签这些稳定语法细节，
 //! 不会在这里改变表达式语义。
 //! 例如：当子表达式优先级不足时，这里会决定是否补上一层括号。
+//! 字符串源码只消费 LuaString 的原始字节：GBK 的 D6 D0 不能借展示视图变成 UTF-8 的 E4 B8 AD，
+//! 应发射为字节转义；原字节本身为 UTF-8 时才可直接输出文本或长括号字面量。
 
 use crate::LuaString;
 use crate::ast::{AstBinaryOpKind, AstGlobalAttr, AstGlobalBinding, AstLabelId};
@@ -163,7 +165,7 @@ pub(super) fn format_complex_literal(real: f64, imag: f64) -> Result<String, Gen
 }
 
 pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) -> String {
-    if let Some(text) = value.preferred_text().or_else(|| value.as_utf8())
+    if let Some(text) = value.as_utf8()
         && can_use_long_bracket_string(text)
     {
         return format_long_bracket_string(text);
@@ -191,7 +193,7 @@ pub(super) fn format_string_literal(value: &LuaString, quote_style: QuoteStyle) 
 }
 
 fn push_quoted_string_body(rendered: &mut String, value: &LuaString, quote: char) {
-    if let Some(text) = value.preferred_text().or_else(|| value.as_utf8()) {
+    if let Some(text) = value.as_utf8() {
         push_utf8_string_body(rendered, text, quote);
     } else {
         push_byte_string_body(rendered, value.as_bytes(), quote);
@@ -276,7 +278,7 @@ fn long_bracket_eqs(value: &str) -> String {
 }
 
 fn escape_cost(value: &LuaString, quote: char) -> usize {
-    if let Some(text) = value.preferred_text().or_else(|| value.as_utf8()) {
+    if let Some(text) = value.as_utf8() {
         return text
             .chars()
             .map(|ch| match ch {

@@ -5,7 +5,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
-return function(a, b)
+-- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
+local subject = function(a, b)
     repeat
         while a do
             if b then
@@ -14,3 +16,8 @@ return function(a, b)
         end
     until b
 end
+
+local dispatch = { subject }
+assert(select("#", dispatch[1](false, true)) == 0)
+assert(select("#", dispatch[1](true, true)) == 0)
+print("regress_128#1", "empty-while", "inner-break")

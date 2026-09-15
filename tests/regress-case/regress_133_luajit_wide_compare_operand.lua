@@ -1,7 +1,10 @@
 -- regress_133_luajit_wide_compare_operand#1: compare 必须保留 16-bit D 常量索引
 -- unluac: expect-contains [["target-compare"]]
 -- unluac: expect-not-contains [["padding-005"]]
--- unluac: expect-not-contains [[local r0_1 = r0_0 == "target-compare"]]
+-- unluac: expect-not-contains [[local r1_1 = r1_0 == "target-compare"]]
+-- 被测常量池属于独立 proto；调用参数放到父 proto，避免向宽 D 索引前插入常量。
+-- unluac: expect-ast-max [[if]] [[0]] [[@proto=1]]
+local function compare(...)
 local x = ...
 local sink
 sink = "padding-001"
@@ -265,3 +268,11 @@ sink = "padding-258"
 sink = "padding-259"
 sink = "padding-260"
 return x == "target-compare", sink
+end
+local matched, sink = compare("target-compare")
+assert(matched == true and sink == "padding-260")
+local missed, missed_sink = compare(string.format("padding-%03d", 5))
+assert(missed == false and missed_sink == "padding-260")
+assert(compare("padding-260") == false)
+assert(compare(nil) == false)
+print("regress_133#1", matched, sink, missed, missed_sink)

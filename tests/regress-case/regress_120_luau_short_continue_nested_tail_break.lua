@@ -6,7 +6,7 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
-return function(a, b, c, xs)
+local function tested(a, b, c, xs)
     local x = 0
     for i = 1, 3 do
         x = x + 1
@@ -34,4 +34,20 @@ return function(a, b, c, xs)
         until a
     end
     return x
+end
+
+-- pcall 保留优化编译时的目标 proto；__index 观察 x 的跨轮状态及查表次数、顺序。
+-- a=false 的非终止分支没有等价的有限退出，本观察不声称覆盖那些路径或全部 continue owner。
+local indexes, take_break = {}, false
+local xs = setmetatable({}, {
+    __index = function(_, key)
+        indexes[#indexes + 1] = key
+        return take_break
+    end,
+})
+for _, mode in ipairs({ false, true }) do
+    indexes, take_break = {}, mode
+    local ok, result = pcall(tested, true, false, false, xs)
+    assert(ok and result == 3 and table.concat(indexes, ",") == "1,2,3")
+    print("regress_120#1", mode, result, table.concat(indexes, ","))
 end

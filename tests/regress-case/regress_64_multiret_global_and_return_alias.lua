@@ -32,4 +32,28 @@ local function size(self)
     return width, height
 end
 
-return circle, size
+local calls = 0
+local bounds = { 2, 4, 10, 16 }
+local owner = {}
+function owner:getAdjustedRect()
+    assert(self == owner)
+    calls = calls + 1
+    return unpack(bounds, 1, 4)
+end
+local x, y, r = circle(owner, 0, 0, 0)
+assert(x == 0 and y == 0 and r == 0 and calls == 0)
+x, y, r = circle(owner, nil, 1, 2)
+assert(x == 6 and y == 10 and r == 4 and calls == 1)
+assert(xmin == 2 and ymin == 4 and xmax == 10 and ymax == 16)
+local w, h = size(owner)
+assert(w == 8 and h == 12 and calls == 2)
+bounds = { 10, 16, 2, 4 }
+w, h = size(owner)
+assert(w == 8 and h == 12 and calls == 3)
+for invalid = 1, 4 do
+    bounds = { 2, 4, 10, 16 }
+    if invalid <= 2 then bounds[invalid] = nil else bounds[invalid] = 0 end
+    w, h = size(owner)
+    assert(w == 0 and h == 0 and calls == 3 + invalid)
+end
+print("regress_64#1", x, y, r, xmin, ymin, xmax, ymax, calls)

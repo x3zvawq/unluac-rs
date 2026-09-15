@@ -1,3 +1,7 @@
+-- 宽逻辑链应保持表达式，不因决策自然化预算退化为大量条件语句。
+-- unluac: expect-ast-max [[if]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-max [[goto]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[function]] [[1]] [[@proto=0]]
 local function wide_boolean_chain(
     a01, a02, a03, a04, a05, a06, a07, a08, a09, a10,
     a11, a12, a13, a14, a15, a16, a17, a18, a19, a20,
@@ -20,13 +24,20 @@ local function wide_boolean_chain(
         or (a73 and a74) or (a75 and a76) or (a77 and a78) or (a79 and a80)
 end
 
-return wide_boolean_chain(
-    false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false, false, true
-)
+-- chunk 的返回值不会成为进程 stdout，必须显式观察结果及最早命中的优先级。
+local unpack_values = table.unpack or unpack
+local values = {}
+for i = 1, 80 do values[i] = false end
+values[80] = true
+local none = wide_boolean_chain(unpack_values(values, 1, 80))
+assert(none == false)
+values[79], values[80] = true, "tail"
+local tail = wide_boolean_chain(unpack_values(values, 1, 80))
+assert(tail == "tail")
+values[39], values[40] = true, "middle"
+local middle = wide_boolean_chain(unpack_values(values, 1, 80))
+assert(middle == "middle")
+values[1], values[2] = true, "first"
+local first = wide_boolean_chain(unpack_values(values, 1, 80))
+assert(first == "first")
+print("regress_207#1", none, tail, middle, first)

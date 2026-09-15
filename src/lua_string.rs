@@ -76,10 +76,11 @@ impl LuaString {
             .map_or_else(|| String::from_utf8_lossy(self.as_bytes()), Cow::Borrowed)
     }
 
+    /// 调试字面量的展示视图，可能与原始字节采用不同编码，不能用于生成可执行源码。
     pub fn preferred_text(&self) -> Option<&str> {
         match self.encoding {
             // auto 检测到 windows-1252 时常只是给任意单字节高位数据一个展示视图；
-            // 这里保留 byte escape，避免把二进制字符串改成 UTF-8 文本。
+            // 调试字面量保留字节视图，避免把任意二进制误报为文本。
             Some(StringEncoding::EncodingRs(enc))
                 if std::ptr::eq(enc, encoding_rs::WINDOWS_1252) =>
             {

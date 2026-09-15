@@ -1,4 +1,6 @@
 -- lua54_01_close#1: to-be-closed基础
+-- unluac: expect-ast-count [[close-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[close-binding]] [[2]] [[@proto=7]]
 local function test_tbc_basic()
     local log = {}
 

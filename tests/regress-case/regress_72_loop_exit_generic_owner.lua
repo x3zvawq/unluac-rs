@@ -11,4 +11,6 @@ while result < 2 do
         break
     end
 end
+assert(result == 2)
+print("regress_72#1", result)
 return result

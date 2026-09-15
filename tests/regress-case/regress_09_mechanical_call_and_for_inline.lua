@@ -1,4 +1,5 @@
 -- regress_09_mechanical_call_and_for_inline#1: collapse call and generic-for preparation runs
+-- unluac: expect-ast-count [[generic-for]] [[1]] [[@proto=0]]
 scriptPath = "base"
 
 function loadLuaFile(path, suffix)

@@ -1,4 +1,7 @@
 -- regress_147_inline_call_alias_eval_order#1: sink 参数顺序不得重排前置调用
+-- unluac: expect-order [[("first")]] [[("second")]]
+-- unluac: expect-order [[("before")]] [[("keep")]]
+-- unluac: expect-order [[("keep")]] [[("after")]]
 local log = {}
 
 local function mark(value)

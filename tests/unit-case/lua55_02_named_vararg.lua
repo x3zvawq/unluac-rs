@@ -1,4 +1,7 @@
 -- lua55_02_named_vararg#1: 命名变参基础
+-- unluac: expect-ast-count [[named-vararg-function]] [[6]]
+-- unluac: expect-ast-count [[named-vararg-function]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[named-vararg-function]] [[0]] [[@proto=0]]
 local function test_basic()
     local function reshape(head, ...vals)
         local before = vals[1] * 10 + vals[vals.n]

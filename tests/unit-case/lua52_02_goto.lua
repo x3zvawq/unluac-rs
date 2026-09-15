@@ -1,4 +1,9 @@
 -- lua52_02_goto#1: goto基础与标签
+-- 单一回边和模拟 continue 应恢复结构化循环，不能将该要求套到后面的不可规约网格。
+-- unluac: expect-ast-count [[goto]] [[0]] [[@dialect=lua5.4]] [[@proto=1]]
+-- unluac: expect-ast-count [[label]] [[0]] [[@dialect=lua5.4]] [[@proto=1]]
+-- unluac: expect-ast-count [[goto]] [[0]] [[@dialect=lua5.4]] [[@proto=3]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@dialect=lua5.4]] [[@proto=3]]
 local function test_goto_label()
     local i = 0
 

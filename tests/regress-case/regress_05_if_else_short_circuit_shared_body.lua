@@ -38,4 +38,20 @@ end
 
 remove_blocks()
 
-return hits
+-- pairs 顺序不稳定，只归一化观测结果；保留原来的遍历和分支形状。
+table.sort(hits)
+assert(table.concat(hits, ",") == "bubble,bubble,four,pig,wood")
+print("regress_05#1", table.concat(hits, ","))
+local cases = {
+  { "wood", "wood" }, { "stone", "stone" }, { "glass", "glass" },
+  { "bubble", "bubble" }, { "bossBubble", "bubble" },
+  { "pig", "pig" }, { "unknown", "other" }, { "stop", "" },
+}
+for i, case in ipairs(cases) do
+  dead_blocks = { one = { material = case[1] } }
+  hits = {}
+  local result = remove_blocks()
+  assert(table.concat(hits, ",") == case[2])
+  if case[1] == "stop" then assert(result == hits) else assert(result == nil) end
+  print("regress_05#2", i, table.concat(hits, ","))
+end

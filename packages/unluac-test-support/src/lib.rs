@@ -460,6 +460,9 @@ enum ReadabilityAstMetric {
     Call,
     MethodCall,
     Error,
+    CloseBinding,
+    GlobalDecl,
+    NamedVarargFunction,
 }
 
 /// 源码断言对 manifest 已展开实例的精确筛选；不在测试源码中重复方言或编译选项矩阵。

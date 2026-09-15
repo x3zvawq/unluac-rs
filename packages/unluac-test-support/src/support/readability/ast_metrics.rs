@@ -8,11 +8,13 @@
 
 use std::collections::BTreeMap;
 
-use unluac::ast::{AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt};
+use unluac::ast::{
+    AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstLocalAttr, AstModule, AstStmt,
+};
 
 use super::super::ReadabilityAstMetric;
 
-const AST_METRIC_COUNT: usize = 18;
+const AST_METRIC_COUNT: usize = 21;
 
 #[derive(Clone, Default)]
 struct AstMetricCounts([usize; AST_METRIC_COUNT]);
@@ -70,11 +72,17 @@ impl AstMetricSummary {
                 if decl.values.is_empty() {
                     self.increment(scope, ReadabilityAstMetric::EmptyLocal);
                 }
+                for binding in &decl.bindings {
+                    if binding.attr == AstLocalAttr::Close {
+                        self.increment(scope, ReadabilityAstMetric::CloseBinding);
+                    }
+                }
                 for value in &decl.values {
                     self.visit_expr(scope, value);
                 }
             }
             AstStmt::GlobalDecl(decl) => {
+                self.increment(scope, ReadabilityAstMetric::GlobalDecl);
                 for value in &decl.values {
                     self.visit_expr(scope, value);
                 }
@@ -228,6 +236,9 @@ impl AstMetricSummary {
 
     fn visit_function(&mut self, parent_scope: usize, function: &AstFunctionExpr) {
         self.increment(parent_scope, ReadabilityAstMetric::Function);
+        if function.named_vararg.is_some() {
+            self.increment(parent_scope, ReadabilityAstMetric::NamedVarargFunction);
+        }
         if function.body.stmts.is_empty() {
             self.increment(parent_scope, ReadabilityAstMetric::EmptyFunction);
         }
@@ -266,6 +277,9 @@ impl ReadabilityAstMetric {
             Self::Call => 15,
             Self::MethodCall => 16,
             Self::Error => 17,
+            Self::CloseBinding => 18,
+            Self::GlobalDecl => 19,
+            Self::NamedVarargFunction => 20,
         }
     }
 
@@ -289,6 +303,9 @@ impl ReadabilityAstMetric {
             Self::Call => "call",
             Self::MethodCall => "method-call",
             Self::Error => "error",
+            Self::CloseBinding => "close-binding",
+            Self::GlobalDecl => "global-decl",
+            Self::NamedVarargFunction => "named-vararg-function",
         }
     }
 }

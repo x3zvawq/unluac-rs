@@ -11,6 +11,9 @@
 -- unluac: expect-ast-max [[while]] [[0]]
 -- unluac: expect-ast-min [[call]] [[1]] [[@proto=0]] [[@dialect=lua5.4]]
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@debug=stripped]] [[@variant=default]]
+-- unluac: expect-ast-count [[close-binding]] [[0]]
+-- unluac: expect-ast-count [[global-decl]] [[0]]
+-- unluac: expect-ast-count [[named-vararg-function]] [[0]]
 -- unluac: expect-contains [[local outer =]] [[@debug=retained]]
 -- unluac: expect-not-contains [[local outer =]] [[@debug=ignored]]
 local function outer()
@@ -19,3 +22,4 @@ end
 assert(type(outer()) == "function")
 assert(outer()() == nil)
 print("readability_assertion_protocol", "@literal-if-while-function")
+print("<close> global function(a, ...named) end")

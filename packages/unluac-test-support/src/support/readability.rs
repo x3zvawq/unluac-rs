@@ -360,6 +360,9 @@ fn parse_ast_metric(
         "call" => ReadabilityAstMetric::Call,
         "method-call" => ReadabilityAstMetric::MethodCall,
         "error" => ReadabilityAstMetric::Error,
+        "close-binding" => ReadabilityAstMetric::CloseBinding,
+        "global-decl" => ReadabilityAstMetric::GlobalDecl,
+        "named-vararg-function" => ReadabilityAstMetric::NamedVarargFunction,
         _ => {
             return Err(readability_parse_failure(
                 source_relative,

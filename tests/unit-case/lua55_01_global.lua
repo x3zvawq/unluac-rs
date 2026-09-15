@@ -1,4 +1,6 @@
 -- lua55_01_global#1: global关键字基础
+-- unluac: expect-ast-min [[global-decl]] [[1]] [[@proto=1]]
+-- unluac: expect-contains [[global function step(]]
 local function test_global_basic()
     global none, print
     global counter, label = 9, "seed"

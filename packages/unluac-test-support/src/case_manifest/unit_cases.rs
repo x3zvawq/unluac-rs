@@ -49,7 +49,7 @@ pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     LuaCaseMatrixEntry::new("tests/unit-case/common_11_runtime.lua", ALL_DIALECTS),
     LuaCaseMatrixEntry::new(
         "tests/unit-case/common_12_string_encoding.lua",
-        ALL_NON_LUAU_DIALECTS,
+        ALL_DIALECTS,
     ),
     LuaCaseMatrixEntry::new(
         "tests/unit-case/common_13_path_conditions.lua",
@@ -100,7 +100,7 @@ pub(super) const UNIT_CASES: &[LuaCaseMatrixEntry] = &[
     ),
     LuaCaseMatrixEntry::new(
         "tests/unit-case/literal_binary_string_bytes.lua",
-        ALL_NON_LUAU_DIALECTS,
+        ALL_DIALECTS,
     ),
     // ── dialect-specific cases ──
     LuaCaseMatrixEntry::new("tests/unit-case/lua51_01.lua", PUC_LUA_51),
