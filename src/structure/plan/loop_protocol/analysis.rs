@@ -159,6 +159,8 @@ pub(super) fn def_is_vm_for_control(
     dataflow: &DataflowFacts,
     def: crate::structure::DefId,
 ) -> bool {
+    // GenericForCall 定义用户可见的迭代变量，即使与 control 共槽也不是隐藏值；
+    // 它们可作为内层循环的普通输入。独立的 control 写回由 GenericForLoop 定义。
     dataflow.defs.get(def.index()).is_some_and(|definition| {
         matches!(
             proto.instrs.get(definition.instr.index()),
@@ -166,7 +168,6 @@ pub(super) fn def_is_vm_for_control(
                 LowInstr::NumericForInit(_)
                     | LowInstr::NumericForLoop(_)
                     | LowInstr::GenericForPrep(_)
-                    | LowInstr::GenericForCall(_)
                     | LowInstr::GenericForLoop(_)
             )
         )

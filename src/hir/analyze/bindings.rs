@@ -259,6 +259,16 @@ pub(super) fn build_bindings(
                     let local = LocalId(local_count);
                     local_count += 1;
                     let reg = crate::transformer::Reg(bindings.start.index() + offset);
+                    if let Some(LoopVmProtocol::GenericFor(protocol)) =
+                        structure.plan().loop_protocol(loop_id)
+                        && let Some(def) = dataflow.instr_def_for_reg(protocol.call_instr, reg)
+                        && let Some(hint) =
+                            debug_local_hint_for_ssa(proto, structure, SsaValue::Def(def))
+                    {
+                        // 循环语法已经声明了这个 source scope。内层循环的 phi 和入口
+                        // 复制也须复用它，不能因保留 debug 信息再提升一套同名 carried local。
+                        debug_scope_targets.insert(hint.scope, BoundSlotTarget::Local(local));
+                    }
                     local_debug_hints.push(
                         debug_local_name_for_reg_in_blocks(proto, cfg, body_blocks, reg).or_else(
                             || {

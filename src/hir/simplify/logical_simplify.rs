@@ -545,7 +545,7 @@ pub(super) fn simplify_condition_truthiness_shape_with_safety(
     expr: &HirExpr,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
-    match expr {
+    let replacement = match expr {
         HirExpr::LogicalAnd(logical) => {
             simplify_condition_logical_and(&logical.lhs, &logical.rhs, safety)
         }
@@ -553,7 +553,16 @@ pub(super) fn simplify_condition_truthiness_shape_with_safety(
             simplify_condition_logical_or(&logical.lhs, &logical.rhs, safety)
         }
         _ => None,
+    }?;
+    // 候选拒绝[PolicyBoundary]：纯条件与值表达式综合共用成本方向，避免先展开
+    // `(a or b) and c`，再提取共同尾部，导致同一 pass 每轮往返而无法收敛。
+    // 含可观察求值的条件不参与纯综合，仍由各归约的语义证明决定是否接受。
+    if safety.is_repeatable_in_single_value_context(expr)
+        && super::decision::expr_cost(&replacement) >= super::decision::expr_cost(expr)
+    {
+        return None;
     }
+    Some(replacement)
 }
 
 /// 只读投影正、反条件规范形的显式 `not` 成本，不构造任一表达式。

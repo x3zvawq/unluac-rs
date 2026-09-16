@@ -1,6 +1,41 @@
 //! control_flow 主题源码合同；标签描述交叉语义，配置保留原方言及专用验证边界。
 use super::*;
+
+// Lua 5.5 的首个 generic-for binding 为 const，其余方言允许源码重赋值。
+const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
+    LuaCaseDialect::Lua51,
+    LuaCaseDialect::Lua52,
+    LuaCaseDialect::Lua53,
+    LuaCaseDialect::Lua54,
+    LuaCaseDialect::Luajit,
+    LuaCaseDialect::Luau,
+];
+
 pub(super) const CASES: &[LuaCaseDefinition] = &[
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/loop_43_nested_generic_key.lua",
+        &["generic-for", "numeric-for", "phi"],
+        "内层循环重赋值外层可见 key/value 时，外层迭代器的隐藏 control 仍按原顺序推进。",
+        &[
+            LuaCaseConfiguration::new(MUTABLE_GENERIC_KEY_DIALECTS),
+            LuaCaseConfiguration::new(MUTABLE_GENERIC_KEY_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/loop_42_nested_generic_binding.lua",
+        &["generic-for", "numeric-for", "phi", "metamethod"],
+        "外层 generic-for 的可见迭代变量进入内层循环并重赋值，不误判成 VM 控制槽或改写隐藏 control。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_26_condition_value_boundary.lua",
         &["short-circuit", "numeric-for", "metamethod", "phi"],
