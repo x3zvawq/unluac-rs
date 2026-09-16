@@ -32,6 +32,7 @@ pub(super) fn final_plan_input(
         caps,
         branches: &branches,
         candidates: condition_candidates,
+        value_candidates,
         closed_control_dags,
         residual_transfers: &residual_transfers,
     })?;

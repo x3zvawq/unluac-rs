@@ -2,6 +2,18 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_26_condition_value_boundary.lua",
+        &["short-circuit", "numeric-for", "metamethod", "phi"],
+        "嵌套 or 取值先形成独立 ValueDecision，再由外层条件消费，保持字段读取和循环累加。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_ALL),
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/return_16_short_circuit_open_call.lua",
         &["short-circuit", "multiret", "metamethod"],
         "短路值 DAG 沿开放参数追踪嵌套调用依赖，保持共享 fallback、字段读取及转换次数。",

@@ -44,6 +44,7 @@ pub(super) struct ConditionSelectionInput<'a> {
     pub(super) caps: ControlFlowCaps,
     pub(super) branches: &'a [BranchCandidate],
     pub(super) candidates: &'a [ShortCircuitCandidate],
+    pub(super) value_candidates: &'a [ShortCircuitCandidate],
     pub(super) closed_control_dags: &'a [ClosedControlDagEvidence],
     pub(super) residual_transfers: &'a [ResidualTransferEvidence],
 }
@@ -65,6 +66,7 @@ pub(super) fn selected_conditions(
         caps,
         branches,
         candidates,
+        value_candidates,
         closed_control_dags,
         residual_transfers,
     } = input;
@@ -76,7 +78,7 @@ pub(super) fn selected_conditions(
         }
     }
     let mut condition_arc_workspace = ConditionArcWorkspace::new(cfg.blocks.len());
-    let mut condition_safety_workspace = ConditionSafetyWorkspace::new(dataflow);
+    let mut condition_safety_workspace = ConditionSafetyWorkspace::new(dataflow, value_candidates);
     let mut selected = BTreeMap::<super::super::BlockRef, (usize, ConditionPlanInput)>::new();
     for (index, candidate) in candidates.iter().enumerate() {
         if !candidate.reducible || !matches!(candidate.exit, ShortCircuitExit::BranchExit { .. }) {

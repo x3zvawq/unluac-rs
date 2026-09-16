@@ -181,7 +181,8 @@ pub(super) fn safe_condition_candidate(
         .enumerate()
         .skip(1)
         .find_map(|(index, node)| {
-            (dataflow.block_defs_have_use_outside(cfg, node.header, &candidate.blocks)
+            (workspace.value_headers.contains(&node.header)
+                || dataflow.block_defs_have_use_outside(cfg, node.header, &candidate.blocks)
                 || block_has_unabsorbed_effects(proto, cfg, dataflow, node.header, workspace))
             .then_some(index)
         });
@@ -192,6 +193,7 @@ pub(super) fn safe_condition_candidate(
 }
 
 pub(super) struct ConditionSafetyWorkspace {
+    value_headers: BTreeSet<super::super::BlockRef>,
     epoch: usize,
     needed_instr_epochs: Vec<usize>,
     def_epochs: Vec<usize>,
@@ -200,8 +202,15 @@ pub(super) struct ConditionSafetyWorkspace {
 }
 
 impl ConditionSafetyWorkspace {
-    pub(super) fn new(dataflow: &DataflowFacts) -> Self {
+    pub(super) fn new(dataflow: &DataflowFacts, candidates: &[ShortCircuitCandidate]) -> Self {
         Self {
+            // 取值 DAG 的 phi 结果由 ValueDecision 消费；外层条件不能把它吞成
+            // 只有 bool 出口的节点，否则 condition region 会嵌入另一个控制 owner。
+            value_headers: candidates
+                .iter()
+                .filter(|candidate| matches!(candidate.exit, ShortCircuitExit::ValueMerge(_)))
+                .map(|candidate| candidate.header)
+                .collect(),
             epoch: 0,
             needed_instr_epochs: vec![0; dataflow.instr_effects.len()],
             def_epochs: vec![0; dataflow.defs.len()],

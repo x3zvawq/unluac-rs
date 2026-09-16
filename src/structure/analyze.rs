@@ -261,7 +261,8 @@ fn analyze_structure_proto_one(
     // 同一个 header 最终就可能拿到一份更窄、且仍指向 loop body 的伪尾条件。
     // 这里只查询 BranchExit；ValueMerge 往往携带最大的 blocks/nodes/leaf payload，
     // 把整张 short-circuit 表复制一遍既无语义作用，也会按 phi 放大内存。
-    let mut loop_condition_safety_workspace = ConditionSafetyWorkspace::new(dataflow);
+    let mut loop_condition_safety_workspace =
+        ConditionSafetyWorkspace::new(dataflow, &short_circuit_candidates);
     let mut short_circuit_candidates_for_loops = short_circuit_candidates
         .iter()
         .filter(|candidate| matches!(candidate.exit, ShortCircuitExit::BranchExit { .. }))
