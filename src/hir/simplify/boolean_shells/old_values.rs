@@ -1,30 +1,9 @@
-//! 在同一 HIR 控制流快照上证明死布尔壳的旧值与读取者生命周期。
+//! 证明死布尔壳的旧值类别、观察者和读取者生命周期。
 //!
-//! 每个候选 binding/raw home 分别跟踪 `GC-inert / 可承载资源 / 证明不完整`。旧值分类、
-//! closure/TBC 观察者和后向 may-live 共用一份 `HirFlowGraph`：label/goto、回边与不可达
-//! 分支由图统一解释，本文件仅提供各自的有限单调域和 typed event 写入/观察语义。
-//! 例如 `x = nil; goto L; ...; ::L:: if c then x=true else x=false end`，旧值沿实际
-//! 到达 L 的路径合流；若任一回边带入对象，shell 必须保留释放旧根的写入职责。
-//! 所有不动点完成后才按当前语句路径签发删除计划，不在中间迭代批准删除或重建控制边。
-//! 构图时只为实际 shell 发布节点 ID 与词法路径；两臂的单赋值节点消费条件后继，
-//! 不再用语句地址关联身份或另走全树重建候选位置。常量裁掉的臂不参与后向活跃性。
-//! 候选 local 按完整 possible-home 集合建立反向索引，写入只更新可能命中的候选；
-//! 未知 provenance 仍覆盖 home universe，home-free local 仍接收直接 binding 写入。
-//! 数据流节点只投影 observer reads 与 shell 删除判定，不保存供后续重放的整份输入状态。
-//! closure/TBC 观察者先完整解析，再把后向 gen 集合投影到候选 binding 与全部 possible-home；
-//! 域外 holder 仍可传递候选 capture，不能在观察者 reaching 收敛前按候选过滤它。
-//!
-//! for initializer、dispatch 和每轮 binding write 各占独立节点；最终 dispatch 的 raw
-//! result 写入也更新 home 分类，不能被源码零轮出口或成功 binding 写入掩盖。参数入口
-//! home 集合直接来自 promotion，不按 ParamId 重建槽位。没有 shell 形状则不构建图。
-//! home-free temp 虽不进入 local/raw-home 集合，仍是需要读取证明的真实候选。
-//!
-//! 节点先 gen RHS、条件与左值地址读取，再 kill 精确 local/temp 或唯一 possible-home 写入。
-//! closure payload 前向 reaching 使用 Temp/Local/Param holder 的确定覆写 kill 旧 instance；
-//! 只有当前 reaching closure 被调用、返回或写到外部位置时，其 ByReference cell 才进入
-//! observer。ByValue capture 在创建点读取 snapshot。TBC 在标记点激活 home，并由 Close/
-//! 函数出口读取后结束。引用捕获和资源协议不会退化成全 proto blanket guard。
-//! 值是否 GC-inert 统一消费目标方言安全上下文；本文件不从底层 opcode 重新推断根协议。
+//! 旧值分类、closure/TBC 观察者及后向 may-live 共用当前 HirFlowGraph；本模块提供
+//! 有限单调域和事件转移，控制边与循环归属由图持有。所有不动点收敛后才签发删除计划。
+//! 例如 x=nil; goto L; ...; ::L:: if c then x=true else x=false end，
+//! 任一回边带入对象时仍须保留覆盖旧根的写入，不能只看文本前方的 nil。
 
 use crate::hir::simplify::stmt_plan::{StmtPath, remove_planned_stmts};
 
@@ -279,6 +258,7 @@ impl<'a> ShellFlowFacts<'a> {
             },
             |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
+        // 域外 holder 仍可传递候选 capture，不能在观察者 reaching 收敛前过滤它。
         // 观察者 reaching 已收敛；后向 gen/kill 按 binding/home 分量独立，不会从域外
         // 状态生成候选读取。写入仍消费原有精确 kill，不能用 possible-home 当作确定覆写。
         for node in &mut nodes {

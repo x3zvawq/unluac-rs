@@ -1,34 +1,9 @@
-//! 这个文件实现共享循环候选提取。
+//! 从 CFG、GraphFacts、Dataflow 和 low-IR 提取共享循环候选。
 //!
-//! 这个 pass 只消费 CFG / GraphFacts / Dataflow / low-IR terminator，产出“循环形态 hint +
-//! 可直接复用的源码绑定证据 + loop merge incoming 事实”，不会越权决定最终
-//! `while/repeat/for` 语法。
-//!
-//! 例子：
-//! - `NumericForInit/Loop` 会产出 `LoopKindHint::NumericForLike`，并把源码绑定寄存器
-//!   记录成 `LoopSourceBindings::Numeric`
-//! - `GenericForCall/Loop` 会产出 `LoopKindHint::GenericForLike`，并把源码绑定区间
-//!   记录成 `LoopSourceBindings::Generic`
-//! - 无自身回边的 generic-for 以 body target 支配区域恢复完整语义 owner，零次迭代
-//!   出口仍保持在 body 外侧
-//! - `while ... do ... end` 的 header/exit phi 会被整理成 `inside/outside` 两臂的
-//!   incoming facts，后续 HIR 直接消费这些结构事实，不再自己回头拆 `phi.incoming`
-//! - 普通 `while/repeat` 只保留形态 hint，不会伪造额外 binding 证据
-//! - branch 经共享 backedge pad 提前进入下一轮时，会在 branch 候选齐备后记录唯一
-//!   `continue_edges` owner，HIR 不再按 jump 形状猜测归属
-//! - 多条 loop-exclusive exit 可先写回 live-out 再直接汇入同一 continuation；需要跨越
-//!   中间 pad 时仍只接受 `Close + Jump` 或 `Close-only + fallthrough`
-//! - for binding 的提前退出域在多个物理 exit 的共同后继前结束，不会穿过
-//!   cleanup pad 把循环变量身份带到 post-loop
-//! - repeat body 的首个条件可能让 natural-loop 暂时呈现为 while；若该 header 的局部
-//!   break pad 严格汇入独立尾条件出口，则由 Structure 恢复真正的 repeat 形态
-//! - 同一 header 的 natural backedge 默认共享控制身份；仅当 VM latch 或严格内层域
-//!   与外层尾条件证明完整嵌套时在本层分区。内层入口两臂都在域内时，全部退出必须
-//!   经唯一汇点到外层尾条件；后层不按回边重新拆候选，兄弟 latch 也不因数量拆分
-//! - 全部出口都直接终止时，多条 sibling latch 共同归一个 while-true owner，header
-//!   作为它们共享的下一轮入口
-//! - `WhileLike` 的 header 前缀必须属于 branch 条件的数据依赖链，或是可丢弃的
-//!   无副作用残留；带副作用但不参与条件的语句应保守留给 repeat/unknown/goto 形态
+//! 发布循环形态 hint、源码 binding、merge incoming 和控制转移归属，供 HIR 直接
+//! 消费；最终 while/repeat/for 语法不在这里决定。各类循环的细化与出口证明见子模块。
+//! 例如 NumericForInit/Loop 产生 NumericForLike 及用户寄存器绑定；普通 while
+//! 只提供循环形态与 incoming 事实，不伪造 for binding。
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,19 +1,9 @@
-//! branch-control 收敛：删除无求值行为的空/常量分支，把公共 direct-copy 尾部移出分支，
-//! 将 repeat 尾部的单次 break guard 收回 until 条件，并把残留前向 goto 壳恢复成普通条件结构。
+//! 清理空/常量分支、公共复制尾部和前向 goto 壳，并恢复 repeat 尾部条件。
 //!
-//! 这里只消费已经存在的 `If/Goto/Label`，不重新解释 CFG，也不接管同一 lvalue 选值；
-//! branch-value 形状仍由 `branch_value_folding` 先处理。每轮先为当前 block 建一次 label
-//! 位置和引用计数，再选取不交叉区间一次移动原语句，避免多个 guard 共用 label 时反复全块
-//! 扫描、深复制和搬移后缀。
-//! 条件能否删除或合并重复求值统一消费入口按目标方言构造的表达式安全上下文。
-//! 身份元数据在 body 改写期间只读借用；label/resource 分析仍按每轮改写前的 body 冻结。
-//! 新建 local 的 debug 空槽与 home-free 事实在 body 改写结束后一起发布。
-//! forward 区域的后写位置和 join 后 mention 各收集一次，声明检查消费同一区域快照，
-//! 不再逐个 binding 重扫后缀；嵌套写入归属其直接外层语句的位置。
-//!
-//! 例如 `if false then body end` 会被删除，`if true then body end` 会保留原 branch block
-//! 的词法作用域后去掉条件壳；已知真值或两臂相同但有求值事件的条件会先物化在独立
-//! 短作用域中，再进入唯一保留的 arm。
+//! 消费当前 HIR 的 If/Goto/Label、词法入口与目标方言安全事实，不重新解释 CFG；
+//! 同一 binding 选值仍由 branch_value_folding 先处理。
+//! 例如 if false then body end 可删除，if true then body end 则须保留 body
+//! 的词法作用域；有事件的条件仍在原位置求值。
 
 mod alternative_arms;
 mod path_conditions;

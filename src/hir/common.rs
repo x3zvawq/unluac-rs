@@ -776,7 +776,7 @@ pub enum HirCallRootHandoff {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HirMethodCall {
     None,
-    /// setup 尚未收回，args[0] 保留独立 receiver 快照。
+    /// setup 尚未收回，`args[0]` 保留独立 receiver 快照。
     Explicit,
     /// callee 已是配对字段查询，args 只包含显式参数；receiver 由字段查询持有一次。
     Implicit,

@@ -1,30 +1,10 @@
-//! `installer_iife`：把需要独立展示的匿名立即调用从合法 AST 收回成局部函数名。
+//! 为需要独立展示的匿名立即调用恢复局部函数名。
 //!
-//! 这个 pass 处理两类 IIFE。匿名安装器会先得到一个局部函数名：
-//!
-//! ` (function(x) local f = function(y) return x, y end; emit = f end)("ax") `
-//!
-//! 会收成
-//!
-//! ` do local l0 = function(x) local f = function(y) return x, y end; emit = f end; l0("ax") end `
-//!
-//! 其它包含多条语句或复合控制流的 IIFE 同样放进最小 `do` 作用域：
-//!
-//! ` do local l0 = function() BODY end; l0() end `
-//!
-//! 这样新增 closure binding 会在原调用点后立即死亡，不会把 closure root 生命周期延长到
-//! 父 block 末尾。改写只新增一个 `Recovered`、无 attr 的 synthetic binding；原 function 与
-//! 调用参数以完整 AST 节点克隆，既有 PhysicalRoot/DebugHinted origin、local attr、binding ref
-//! 与 capture 身份都不重建。单条简单语句的短 IIFE 保留原样。两类结果都交给后面的
-//! `function_sugar` 再决定是否继续变成 `local function l0(...) ... end`。
-//!
-//! AST build 已把 callee 落成合法 `FunctionExpr`。新增 binding 从模块分配器取得
-//! `Ast` 身份，与 `materialize-temps` 保留的 `HirTemp` 分域；分配进度随模块快照保存，
-//! 不因进入子函数或新一轮改写重置，也不扫描前层编号来避让。
-//!
-//! 它不负责：
-//! - 判断多值转发与物化约束，它们由 HIR value-pack owner 负责；
-//! - 把这个局部函数进一步降成方法声明或 `local function`，那属于 `function_sugar`。
+//! 消费 AST build 已合法化的 FunctionExpr 和显式 binding/capture 身份，处理匿名
+//! 安装器及含多条语句或复合控制流的 IIFE；短小单语句调用保持原样。
+//! 例如 (function() BODY end)() 变为 do local f=function() BODY end; f() end，
+//! 最小 do 作用域使新增 closure root 在原调用点后结束。local function 语法交给
+//! function_sugar，多值与物化语义仍由 HIR 负责。
 
 use std::collections::BTreeSet;
 
@@ -42,6 +22,7 @@ use super::local_scope_limit::{
 use super::walk::{self, ScopedAstRewritePass};
 
 pub(super) fn apply(module: &mut AstModule, _context: ReadabilityContext) -> bool {
+    // 分配进度随模块保存，不能在子函数或下一轮重置；Ast 与 HirTemp 身份分域。
     let mut pass = InstallerIifePass {
         next_synthetic_local: module.next_synthetic_local,
     };
@@ -102,6 +83,8 @@ fn rewrite_installer_iife_stmt(stmt: &AstStmt, next_synthetic_local: usize) -> O
 
     let binding_id = AstSyntheticLocalId::Ast(next_synthetic_local);
 
+    // 只新增无属性的 Recovered binding；原函数及参数整节点保留，避免重建
+    // PhysicalRoot/DebugHinted origin、attr 或 capture 身份。
     let rewritten = vec![
         AstStmt::LocalDecl(Box::new(AstLocalDecl {
             bindings: vec![AstLocalBinding {

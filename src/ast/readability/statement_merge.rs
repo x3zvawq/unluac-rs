@@ -1,29 +1,8 @@
-//! 这个文件负责把被前层机械拆开的相邻语句重新合并回更像源码的一次声明。
+//! 合并机械拆开的声明与初始化，并将 hoisted local 下沉到实际使用的作用域。
 //!
-//! 它依赖 binding/use 分析已经给出稳定引用关系，因此这里只合并“明显属于同一段
-//! 源码声明”的 local/assign/temp-hoist 形状，而不会越权跨阶段重排有副作用的语句。
-//! 这一步的目标是消掉 VM/结构恢复留下的机械拆分，不是随意把多条语句压成一行。
-//!
-//! 例子：
-//! - `local a; a = f()` 会合成 `local a = f()`
-//! - `local a = x; local b = y` 在两者确实属于同一组声明且后续使用形状允许时，
-//!   会合成 `local a, b = x, y`
-//! - 单次使用的独立 local 会留给 `inline-exprs`，不会先被并入后层无法拆开的 multi-local
-//! - 提前 hoist 出来的 `local t0; if cond then t0 = x end` 会尽量把 `t0` 下沉回
-//!   真正使用它的分支/循环体里
-//! - 如果同一条 hoisted 声明里前面的 carried binding 还要跨分支后缀继续活着，
-//!   后面的 `staged` 之类一次性临时 binding 仍应允许单独沉回某个分支
-//! - 但如果当前位置之前已经有会跳到更后面 label 的 forward goto，
-//!   这里会停止继续下沉，避免生成“goto 跳进 local 作用域”的非法 Lua
-//! - 如果某个 hoisted temp 在声明点与候选下沉点之间已经被读取过，也不能把它下沉
-//!   成后置 `local`，否则 fallback/goto 回边会读到未初始化的局部变量
-//! - repeat body 的 until 条件是正文之后的读取，引用到的声明不能沉入更窄的嵌套块
-//! - 后缀即使只有赋值也需要原声明支配；把声明沉入前面的 if 会让后缀写入全局环境
-//!
-//! 嵌套下沉先检查作用域，再原地提交；每次修改必消费非空 binding，因此失败不改树，
-//! 成功只返回已消费数量和必须留在外层的依赖，无需复制候选控制语句。
-//! initializer 合并也在完整证明后移动原 RHS；失败不改 declaration 或 assignment，
-//! 成功才清除已消费的 transaction/profile，避免复制任意深度的表达式树。
+//! 消费 AST binding/use 和词法控制流事实，保持声明对读写的支配及原求值顺序。
+//! 例如 local a; a=f() 可合成 local a=f()；仍在分支外被读取或写入的声明不能
+//! 只沉入某个分支。单次别名内联属于 inline-exprs，不在这里提前固化成多目标声明。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -905,6 +884,8 @@ fn single_value_local_decl(
     Some((binding, value))
 }
 
+// 完整证明后才移动原 RHS，并清除已消费的 transaction/profile；
+// 失败须保持 declaration 和 assignment 原样，不能提交半次初始化合并。
 fn try_merge_local_decl_with_assign(current: &mut AstStmt, next: &mut AstStmt) -> bool {
     let AstStmt::LocalDecl(local_decl) = current else {
         return false;

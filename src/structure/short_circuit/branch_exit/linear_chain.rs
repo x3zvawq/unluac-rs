@@ -201,6 +201,8 @@ pub(super) fn infer_longest_linear_branch_exit(
     best
 }
 
+// 不同 root 可能共享长后缀；前缀选择只向前扫描一次，增量维护外部出口约束。
+// 同一前缀保留 strict-before-relaxed 优先级，选出最长候选后才构造节点。
 pub(super) fn infer_longest_if_else_branch_exit(
     proto: &LoweredProto,
     cfg: &Cfg,

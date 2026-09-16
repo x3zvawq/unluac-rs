@@ -1,60 +1,10 @@
-//! 为普通调用建立一次完整源码帧事务，并验证删除后的全局声明身份。
+//! 恢复普通调用、构造器和控制头的完整源码帧，并原子验证声明身份。
 //!
-//! 调用树、Def 版本与槽距由父模块的共享 FrameBuilder 核对，实际源码低槽前缀由
-//! prefix owner 核对。callee 为零返回时原槽可能未覆写，因此这里只整体吸收调用树，
-//! 不单独撤销 root 保护。多个调用可复用同一匿名 LocalId；事务在同一 preview 中删除
-//! 已消费的声明/读取，并把该身份的下一次独立写移为声明，禁止留下悬空 read/capture。
-//! Repeat 的条件使用共享坐标中的 body 尾点，保持循环内声明直到条件求值完毕；
-//! `repeat local f=g until f(x)` 的 COPY 只由原 CALL 完整重发，不向 AST 开放删根权限。
-//! Lua5.5 global 初始化只重建完整 RHS 调用帧，保留名字顺序、固定结果宽度及原 probe/store；
-//! 例如 `local f=maker(); global a,b=f()` 可在原 home 恢复为 `global a,b=maker()()`。
-//! 例如先 `c=table.concat; print(c(t))` 后 `c=table; print(c.concat(t))`，必须同时
-//! 核对每次原 home 与后缀身份，不能凭第一次调用布局删除后续还在读取的 source local。
-//! 被消费 epoch 的恢复必须覆盖后续使用：原 owner 内的独立写可恢复，子块内恢复则
-//! 要求剩余使用全部留在该块；外层 `local f=g; f()` 后 `if c then f=1 else f=0 end;
-//! use(f)` 不能把其中一臂改为声明后认定合流已恢复。
-//! 缺失 epoch 记录消费它的事务起点；后缀声明恢复失败时截去该事务，不能以失败
-//! 语句的位置保留坏事务，也不丢掉前面的独立构造器。声明恢复截断未知后缀，前缀
-//! 校验按请求批量撤回失败计划；各至多重建一次，最终整批再验失败则完全不提交。
-//! 单返回初始化同样保留原结果 home 与目标声明；已有参数表消费原 argument-root 交接。
-//! PUC 的完整构造器事务还消费构造器 owner 的字段/SETLIST 角色，并由 tables 核对
-//! 原暂存槽与事件；普通 CALL 与 TAILCALL 保持各自结果协议。没有固定返回值不表示
-//! callee 槽必然被清空；无物理根的辅助初始化也可能是后续完整帧所需的声明前缀。
-//! PUC、LuaJIT 与 Luau 的既有低槽单结果赋值共同消费原 CALL 和首 MOVE，后继低槽 COPY
-//! 仍由原身份与写域保护；不能将 CALL scratch 独立冻结为永久声明来绕过赋值事务。
-//! 比较准备和后继数值循环头可将原 CALL scratch 误留成跨段 Local；这里向作用域
-//! owner 提供未提交的完整帧预览，由它同时恢复 do 末端并核对整个后缀后提交。
-//! 例如 `do local n=nil; local v=g end; if captured~=f() then h() end; for ...`
-//! 必须共同重发两个比较 operand 和后继控制帧，不能把比较读取视为提前退休 CALL 根。
-//! 双 CALL 比较也能在此消费原 SELF receiver 的双用途 carrier；方法协议仍由共享
-//! builder 签证，作用域 owner 不把有读取的 receiver 误当作死声明吸收。
-//! 独立构造器与接收 CALL 的构造器共用 builder 和前缀提交；已被调用拥有的构造器
-//! 不重复建计划，其余候选同批验证，避免拆开原来必须共同退休的帧。
-//! generic-for 的原 producer occurrence 在 Temp 提升为 Local 后仍可消费；
-//! `local a,b,c,d; a,b,c,d=iter(t); release; for ...` 的声明、CALL 与 dispatch 释放
-//! 属于同一事务。初始化接收区与 body 控制前缀各用原协议事实，不能混用两种宽度。
-//! Boolean 参数的原 false 预写同样可能提升成 Local；原 Def/home 证书与当前写入
-//! 联合定位，才可恢复 `assert(a == 1 and b == 2)`，保留比较前覆盖旧 scratch 的时点。
-//! 表条件的同值结果也消费原 branch/phi 关系：`({f()}) and 7 or 7` 先保留低结果槽，
-//! 再在高槽分配表及调用缓冲；不能因结果已化简为7而凭空提前写一个 nil。
-//! PUC/JIT 的 `v=v()+1` 保留已有低槽目标，完整帧从原空闲高槽调用并写回；消除
-//! CALL scratch 的永久声明后，后继同槽 `t={make()}` 才能由原 epoch 事务恢复声明。
-//! PUC 空表与 Luau 静态模板赋值先在空闲槽分配，再 MOVE 到已有低槽 local；同一事务
-//! 可收回相邻 allocation/COPY，避免给原临时槽留下永久声明。全局/索引赋值有独立
-//! 提交事件，不使用这个许可；被删 scratch 的后续读取/capture 仍由整批 preview 拒绝。
-//! 多结果 RETURN 的连续准备区同样重发原 COPY；Luau 连续低槽直返优化不能省去原高槽写。
-//! PUC 的高返回 COPY 同样可能跨 frame 保根：caller 覆写低槽后触发 GC，仍可观察
-//! 原高槽的返回对象。无 cleanup、末尾无事件及低来源尚存，都不足以授权缩短返回区。
-//! 例如 `local a=x; local b=y; return a,b` 不能仅凭终端 COPY 改为 `return x,y`；
-//! 物理覆盖与原高槽根都须保留，不能只核对 RETURN 前最后一次求值。
-//! 永久来源与 cleanup 事务分开，不能因清理已消费而重新猜测返回槽。单结果 CALL 紧邻
-//! 被同槽惰性常量覆盖时可丢弃结果，但必须同时保留调用帧与随后声明，不能只删 producer。
-//! Luau 的 `upvalue = a .. b` 保留独立结果槽和高一槽起的 operand 区；完整恢复
-//! GETUPVAL/COPY 与 CONCAT 后仍在原终点写回上值，不把该许可扩展到有求值的索引左值。
-//! PUC SETTABUP 的 `u.key=f()` 直接消费原上值 cell、内嵌 key 与单结果 CALL 布局。
-//! 完整事务撤销额外 callee 声明并在原空闲槽调用；u 仍在 CALL 后读取，不能提前快照。
-//! 短路 CALL 结果在共同原 home 初始化：HIR 的 callee 准备与结果写回一起恢复为
-//! `local result=mark(a) or mark(b)`，避免把原 scratch 变成永久 local 后逐轮增加调用 COPY。
+//! 调用树、Def 版本及槽距由共享 FrameBuilder 核对，源码低槽前缀由 prefix owner
+//! 核对。本模块组织候选与整批预览，使准备写、结果写回和后继声明恢复一起提交；
+//! 不以值相等或零返回推断物理根已经退休。
+//! 例如先后复用同一匿名 callee local 的两次调用，必须连同后缀读写一起验证，
+//! 不能只按第一次调用的布局删除声明。
 
 use super::fastcalls::callee_is_named as fastcall_callee_is_named;
 use super::*;
@@ -92,6 +42,7 @@ struct Preview {
     removed: Vec<bool>,
 }
 
+// 记录消费旧 epoch 的事务起点；恢复失败须撤回该事务，不能从失败语句位置截断。
 struct MissingEpoch {
     needs_declaration: bool,
     owner: usize,
@@ -682,7 +633,8 @@ fn collect_plans(
     );
     let mut flat = Vec::new();
     flatten_scope(block, stmt_count, &mut flat);
-    let nested = tables::nested_producers(flat.iter().map(|entry| entry.map(|entry| entry.stmt)));
+    let nested =
+        tables::nested_initializers(flat.iter().map(|entry| entry.map(|entry| entry.stmt)));
     let following_frame_floor = following_frame_floors(&flat, facts, dialect);
     // 后继 SETTABLE 直接读取的低槽表是已需存在的前缀身份。唯一 base 准备仍由
     // indexed 事务整体消费，不提前声明；这里仅为跨写表存活的索引结果提供锚点。
@@ -1175,33 +1127,39 @@ fn collect_plans(
         let indexed_sink = match stmt {
             HirStmt::Assign(assign)
                 if indexed::is_candidate(assign)
-                    && (matches!(assign.values.fixed.as_slice(), [HirExpr::Binary(_)])
+                    && (assign
+                        .values
+                        .fixed
+                        .first()
+                        .is_some_and(indexed::is_rhs_candidate)
                         || matches!(assign.values.fixed.as_slice(), [HirExpr::LocalRef(value)]
                             if index.checked_sub(1).and_then(|previous| flat.get(previous))
                                 .and_then(Option::as_ref)
                                 .and_then(|previous| scalar_local(previous.stmt))
-                                .is_some_and(|(local, expr)| local == *value && matches!(expr, HirExpr::Binary(_))))) =>
+                                .is_some_and(|(local, expr)| local == *value && indexed::is_rhs_candidate(expr)))) =>
             {
                 Some((index, assign.as_ref()))
             }
-            _ if matches!(scalar_local(stmt), Some((_, HirExpr::Binary(_)))) => flat
-                .get(index + 1)
-                .and_then(Option::as_ref)
-                .and_then(|next| {
-                    let HirStmt::Assign(assign) = next.stmt else {
-                        return None;
-                    };
-                    (indexed::is_candidate(assign)
-                        && matches!(assign.values.fixed.as_slice(), [HirExpr::LocalRef(value)]
+            _ if scalar_local(stmt).is_some_and(|(_, value)| indexed::is_rhs_candidate(value)) => {
+                flat.get(index + 1)
+                    .and_then(Option::as_ref)
+                    .and_then(|next| {
+                        let HirStmt::Assign(assign) = next.stmt else {
+                            return None;
+                        };
+                        (indexed::is_candidate(assign)
+                            && matches!(assign.values.fixed.as_slice(), [HirExpr::LocalRef(value)]
                                 if scalar_local(stmt).is_some_and(|(local, _)| local == *value)))
-                    .then_some((index + 1, assign.as_ref()))
-                }),
+                        .then_some((index + 1, assign.as_ref()))
+                    })
+            }
             _ => None,
         };
         if let Some((end, assign)) = indexed_sink
             && end > start
             // 未完成构造器的字段准备属于原构造事务，不在这里拆走其 CONCAT 或 key。
-            && !nested.contains(&(end - 1))
+            && !nested.writes.contains(&end)
+            && !nested.producers.contains(&(end - 1))
         {
             let run = flat[start..end]
                 .iter()
@@ -1272,7 +1230,7 @@ fn collect_plans(
             )
             // 候选拒绝[LayerBoundary]：未结束构造器的字段 producer 仍属于整个构造/SETLIST 事务；先消费内层
             // CALL 会冻结外层 seed 的前缀，使原开放数组无法合并（regress_33）。
-            && (!assignment_targets.is_empty() || !nested.contains(&(index - 1)))
+            && (!assignment_targets.is_empty() || !nested.producers.contains(&(index - 1)))
         {
             // 活动低槽赋值在空闲区准备单结果调用，再 MOVE 回目标。LuaJIT 的 frame gap
             // 由原 args 布局和共享 builder 核对；完整事务保留目标与两次原写。
@@ -1392,10 +1350,10 @@ fn collect_plans(
                         .map(|next| next.stmt),
                     facts,
                     following_frame_floor[index].all,
-                    nested.contains(&index),
+                    nested.producers.contains(&index),
                 )
                 || (constructor_high.is_some()
-                    && !nested.contains(&index)
+                    && !nested.producers.contains(&index)
                     && scalar_local(stmt).is_some_and(|(_, value)| {
                         let HirExpr::Call(call) = value else {
                             return false;
@@ -3154,6 +3112,8 @@ fn fastcall_fixed_arguments_plan(
     })
 }
 
+// local a=x; local b=y; return a,b 的高返回 COPY 可能在 caller 覆写低槽后
+// 继续保根；终端无事件或低来源仍存活，都不足以直接收成 return x,y。
 fn return_plan(
     context: NativeFrameContext<'_>,
     run: &[&HirStmt],
@@ -4249,6 +4209,8 @@ fn apply_preview(
     let nil_declarations = adjacent_nil_declarations(&preview, &removed);
     // 每个 owner 的最后一条直接语句仍在该词法块内；用这个保守边界允许整个后缀
     // 都留在子块的声明下沉。索引只建一次，不逐候选重扫后缀或复制累计绑定集合。
+    // local f=g; f(); if c then f=1 else f=0 end; use(f) 的某一臂重声明
+    // 不能恢复合流后的身份；只有剩余使用全部留在子块时才允许在该块恢复。
     let mut owner_last_stmt = vec![0; stmt_count];
     let mut last_mentions = BTreeMap::new();
     visit_scope_mut(&mut preview.body, &mut 0, &mut |index, owner, stmt| {

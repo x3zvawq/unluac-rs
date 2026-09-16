@@ -1,18 +1,9 @@
-//! 保留独立副本在控制流中的物理根及其精确退休时序。
+//! 为独立 COPY holder 签发跨控制流的物理根退休时序。
 //!
-//! 普通 copy-root 证书要求 producer 支配终点，适合在声明后的词法后缀复用写入。
-//! 循环头可能先于 producer 首次执行，不能借这个条件丢弃独立的 VM root。
-//! 本模块消费共享 CFG、Dataflow 写集合和 RootObservation，为独立空 holder 签发
-//! producer 与覆盖时序：纯覆盖前退休，可观察求值完成并写回后退休。
-//! 例如 body 的 `MOVE r3,r2` 跨回边经过 header 的全局查找，再由 `LOADK r3`
-//! 覆盖；holder 必须跨越查找，不能在 body 末尾释放。本层不重建循环语法或调用协议。
-//! 同 home 的互斥 producer 可以汇入同一后缀；按 home 共享块摘要和 SCC 求解，避免
-//! `if ... MOVE ... elseif ... MOVE ... end; 长后缀` 为每个 producer 重扫整段指令。
-//! 退休点以共享 DAG 保存；实际候选共同求值，集合在最后一次读取时移交给消费者，
-//! 单候选的长链不保留逐层增长的后代集合。
-//! 值读取不终止物理生命周期；被读取后再交给另一 holder 的 MOVE 仍消费同一退休证明。
-//! 非循环 `snapshot=parameter; parameter=snapshot; lookup()` 也需覆盖写回证明：
-//! lookup 回调可能清空 parameter，快照必须活过回调，在原槽写回后才能释放。
+//! 消费 CFG、Dataflow 写集合与 RootObservation，区分纯覆盖前退休和可观察求值
+//! 写回后退休；不重建循环语法或调用协议，值的最后读取不等于物理生命周期结束。
+//! 例如循环 body 的 MOVE 跨回边经过全局查找后才被 LOADK 覆盖，holder 必须
+//! 活过查找，不能在 body 末端提前释放。
 
 use super::*;
 

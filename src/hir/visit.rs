@@ -1,28 +1,9 @@
-//! 这个文件提供 HIR 及其消费者共享的只读 visitor。
+//! 提供 HIR 及其消费者共享的只读 visitor 和短路查询。
 //!
-//! HIR pass 和 AST lowering 在真正改写前，需要遍历当前 HIR 快照收集事实，例如：
-//! - 哪些 label 仍然被 `goto` 引用
-//! - 哪些 temp 在当前 proto 里有显式定义
-//! - 某段 stmt 切片里还会读到哪些 local/temp
-//!
-//! `block/stmt/lvalue/call/expr` 子节点关系只由 HIR traverse 宏定义，collector 只声明
-//! "看到某个节点时记录什么"。例如 `x = f(t); return t` 可收集到一次 callee 和两次 temp
-//! 引用；不得在 AST 另写一套 HIR 遍历并重新解释 pack 或 closure 子节点。
-//!
-//! 它不会跨层补事实，也不会主动进入子 proto 的 body 重新扫描整棵模块树；这里的
-//! 作用域就是当前这一个 proto。closure 仅投影 capture 的父级绑定引用。
-//! capture hook 持有 mode 与 binding，默认访问一次引用叶子；读取分析可以只进入 ByValue，
-//! 例如 `f(x, function() return x end)` 的直接 x 读取不会被 ByReference capture 抵消。
-//! `any_expr` 按同一子节点骨架进行先序短路查询，命中后不访问剩余子树；包含所有
-//! Decision 节点和 capture binding，不把语法引用查询解释为运行可达性或子 proto 扫描。
-//! local root release 默认作为逻辑 local 写暴露；分析 VM home 的 collector 必须单独
-//! 消费该事件，不得从旧 local 的来源槽位推导一次物理覆盖。
-//! 独立 collector 可组成 tuple 共用遍历；如读集合和写事件一次收集，capture 与 release
-//! 仍逐个交给原 hook，不能由组合器统一解释其语义。完成的分量不再接收事件；只有
-//! 全部分量完成才停止遍历，例如 effects 已命中后，写集合仍须收齐当前快照的后续写入。
-//! closure hook 单独借用真实节点的生命周期，供对象流和命名直接引用捕获切片；例如
-//! `function() return x end` 的捕获身份无需复制。expr/lvalue hook 仍只提供短借用，
-//! 因为 capture/root-release 的默认投影会生成临时 binding 叶子，不能把它们保存为树节点。
+//! 子节点关系统一来自 HIR traverse 宏，collector 只解释自己需要的事件；作用域限
+//! 当前 proto，closure 仅投影父级 capture，不进入 child body 重建事实。
+//! 例如 x=f(t); return t 可收集 callee 与两次 temp 引用；这些语法引用不等同于
+//! 运行可达性。需要共享遍历的独立 collector 可组成 tuple。
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirClosureExpr, HirDecisionExpr, HirExpr, HirLValue,
@@ -48,6 +29,7 @@ pub(crate) trait HirVisitor<'hir> {
     fn visit_expr(&mut self, _expr: &HirExpr) {}
 
     /// 真实 HIR 节点的稳定借用；capture 的临时 binding 叶子不经过此 hook。
+    /// expr/lvalue 默认投影可产生临时叶子，只有这里的真实 closure 可被保存为树节点引用。
     fn visit_closure(&mut self, _closure: &'hir HirClosureExpr) {}
 
     fn visit_lvalue(&mut self, _lvalue: &HirLValue) {}
@@ -79,6 +61,8 @@ macro_rules! visit_active_pair {
 }
 
 /// 独立事实收集器共用一次遍历；每个 hook 都交给原收集器，保留各自的 capture/release 语义。
+/// 已完成的分量停止接收事件，但必须等全部完成才结束遍历；例如 effects 已命中时，
+/// 写集合仍需收齐后续节点。
 impl<'hir, A: HirVisitor<'hir>, B: HirVisitor<'hir>> HirVisitor<'hir> for (A, B) {
     fn is_complete(&self) -> bool {
         self.0.is_complete() && self.1.is_complete()

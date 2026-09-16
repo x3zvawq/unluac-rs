@@ -1,22 +1,9 @@
-//! 这个子模块负责从连续 stmt 区域里扫描表构造器候选步骤。
+//! 扫描连续 HIR 语句，发布构造器 seed、字段、SETLIST 和 producer 步骤。
 //!
-//! 它依赖 HIR 已经稳定的赋值/构造器形状，只回答“哪些 stmt 可视为构造器 seed、record、
-//! setlist 或 producer”，不会在这里直接改写语句。
-//! 例如：`local t = {}; t.x = 1; t.y = 2` 会在这里被扫描成一串 constructor steps。
-//! 全 nil 且没有 debug identity 的 local 声明不产生求值事件；scanner 会把它记入保留计划，
-//! 只有后续 constructor step 不读取这些 binding 时才继续，commit 因而能保留声明本身。
-//! closed short pack 的缺失槽则显式投影为 `ImplicitNil` producer；同一声明的槽要么全部删除，
-//! 要么由 source preservation plan 整句保留，不能只删一部分 materialization。
-//! 旧值已证明为 nil 的简单 local assignment 也可保留，但从该点起只允许独立、无事件的
-//! constructor step 前移；赋值仍在原位完成 capture cell 更新和物理 root handoff。
-//! 同一 seed 的声明前缀按需归约一次，逐槽 nil 事实只在当前不可变语句快照内有效。
-//! 后缀读屏障直接消费上游逐语句 binding 摘要，不按每个保留变量重新遍历表达式。
-//! 调用及一元/二元运算结果 TempId 以 Promotion 的可信 home 进入 producer 计划；删除须由精确覆盖
-//! 终点或完整 constructor 的强字段持有/退出事务批准，单写身份自身不签发根释放许可。
-//! 原 SETLIST 固定前缀还发布 CONST/COPY 与批量 LOADNIL 的准备角色；结果分类按共享
-//! 正常返回包逐槽查询。保留源语句消费同一写入摘要，不假定 producer 必须是 local 声明。
-//! ConstructorRegion 只发布成功前缀的步骤，保留 producer binding/缺失槽投影、原字段
-//! 表达式与批次引用。rebuild 和 commit 消费同一角色划分，不从 stmt_index 反向匹配语法。
+//! 消费当前赋值形状、binding 摘要与 Promotion 来源，形成 ConstructorRegion；
+//! 本模块只识别和证明候选，不直接改树。rebuild/commit 消费同一类型化角色，
+//! 不从语句位置重新推导字段来源。
+//! 例如 local t={}; t.x=1; t.y=2 被投影为一个 seed 和两次 record 写。
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};

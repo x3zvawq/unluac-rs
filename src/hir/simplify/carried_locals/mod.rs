@@ -1,37 +1,10 @@
-//! carried-local handoff 折叠 pass 的编排入口。
+//! 编排 carried-local 交接收敛，将机械 seed/update 身份认回原状态绑定。
 //!
-//! 这个 pass 把 fallback label/goto 区域里“交棒出去的 carried 状态”认回原绑定，
-//! 也会收敛结构化分支/循环里相邻的 `seed local + empty carried local`。它只负责
-//! 后序遍历、外层 binding 活跃性保护，以及在当前 block 内按既定顺序调用各类 owner：
-//! `adjacent.rs` 处理相邻 local seed，`boundary.rs` 索引 label/goto 边界，
-//! `handoffs.rs` 处理具体 seed/update handoff，`binding.rs` 和 `prune.rs` 提供共享工具。
-//!
-//! 它不会发明新 local，也不会在原 local 仍然活跃时强行合并两段状态；所有折叠都必须
-//! 先证明 seed 在后续不再可观察、temp 不被外层作用域消费，并且写回形状可证明。
-//! captured local 也不能作为纯 alias handoff 的来源：闭包调用可能在后缀没有显式提及
-//! 该 local 时写回它，跨过这类调用消除快照会改变后续读值。
-//! 所有 owner 还共享 proto 级 source/resource 身份门：debug、for、physical-root、
-//! reference capture/TBC binding 与其 raw home may-alias 都不得成为改写两端。
-//! 物理根覆盖 TempId 和 LocalId；尚未物化的 CALL 结果不能先被合进 callee carrier。
-//! Promotion 发布的原 callee/receiver 准备 COPY 另建一次身份索引；即使 `a=b; b=a`
-//! 在值域上冗余，也由完整帧消费第二次准备写，不能让后层从相等值重建物理事件。
-//! By-value capture 是创建点快照，由具体 transaction 的 reaching relation 验证其读取值。
-//! 唯一例外是 proven internal loop-carrier temp mirror：它先在 `prune.rs` 里被要求满足
-//! no-read、non-debug、loop-carrier owner、same-exact-home write audit 之后，才会在冻结
-//! identity 前删除；源码作者可见的 for binding 身份本身仍继续受这里的保护。
-//! `HirInlineDispositions::Preserve` 作为独立的 transaction protection 参与每个候选：
-//! 只要 rewrite map 或前置裁剪触及该 binding 就拒绝该事务，不把它混进 outer-scope
-//! 可见性，也不因 proto 中另一个无关 binding 被保护而停用整个 pass。
-//! 词法可用 Local 用共享集合和本层新增日志维护；兄弟子块返回时恢复入口状态，后序
-//! owner 执行前再撤销本块声明，避免把后置声明误认为入口已存在的写回目标。
-//! 前序保护借用入口树的一次 mention 索引；子块只改自身，父 owner 在所有子块返回后
-//! 才执行，因此未处理兄弟的入口快照仍有效。后序仅在子块改变时重新索引当前块。
-//!
-//! 例子：
-//! - 输入：`local l0 = 1; do t4 = l0; ::L1:: if t4 < 3 then t4 = t4 + 1; goto L1 end end`
-//! - 输出：`local l0 = 1; do ::L1:: if l0 < 3 then l0 = l0 + 1; goto L1 end end`
-//! - 输入：`assign t8, t9, t10 = t1, t2, 0; ... assign t1, t2 = t8, t9`
-//! - 输出：`assign t10 = 0; ...`
+//! 消费 promotion、binding mention 与资源身份事实，负责后序遍历、外层活跃性保护
+//! 和各 handoff owner 的调度；具体证明与提交分别位于 adjacent、handoffs、
+//! loop_updates、region_results 和 prune，不在入口重建它们的规则。
+//! 例如 local s=1; local c; c=s; use(c) 在身份及路径证明成立时可收成
+//! local s=1; use(s)，仍被外层或闭包观察的状态不得合并。
 
 mod adjacent;
 mod binding;

@@ -1,30 +1,9 @@
-//! 这个文件负责把“稳定的建表片段”收回 `TableConstructor`。
+//! 把连续的建表、字段写和 SETLIST 片段恢复为 HIR TableConstructor。
 //!
-//! `NewTable + SetTable + SetList` 在 low-IR 里天然是分散的；如果 HIR 一直把它们保留成
-//! 零散语句，后面 AST 虽然还能继续工作，但整层会长期带着明显的机械噪音。这里专门吃一类
-//! 很稳的构造区域：
-//! 1. 先出现一个空表构造器 seed；
-//! 2. 后面紧跟一段 keyed write、简单值生产和 `table-set-list`；
-//! 3. 这段时间里表值没有逃逸，也没有跨语句依赖还没落地的中间绑定。
-//!
-//! 非递归闭包字段可以作为 record 值进入构造器；如果闭包捕获的 binding 会因为本次重建
-//! 被移除成孤儿，后面的 orphan-capture 检查会保留原形，避免破坏 upvalue 身份。
-//!
-//! 这样做的目的不是“尽可能多地猜源码”，而是把已经能够证明安全的构造片段收回更自然的
-//! HIR 形状，为后续 AST 降低继续减负。
-//! 全量 binding facts 只服务这些候选；没有 seed/SETLIST 根形状的 proto 先通过
-//! statement/block 骨架门跳过，不递归扫描无关表达式。
-//! fixed SETLIST 的 local 路径只改写 SETLIST 本身，fresh seed 的声明或重赋值保持原位；
-//! 该边界同时保留 initializer/overwrite 的求值时点与独立 GC root，不用复制表达式来换取展示折叠。
-//! record key 始终保留为 HIR 表达式；本 pass 不读取目标方言，也不提前选择命名字段语法。
-//! 单次完整 raw 数组批次直接返回时，提交保留其 nil-hole 批次语义；无 cleanup/capture
-//! 观察者的函数出口同时终结 producer 根，不能将这一情形误判成逐字段写入后的长期持有。
-//! scanner 的 typed steps 保留到提交，producer 投影与字段/batch 角色不从语句重新推导。
-//! 提交消费每个构造器的分配事实；Indexed 字段中的常量通过受保护的字面量 local
-//! 保持运行时读取，避免 `{a,true,c}` 改用会裁掉尾部 nil 槽的模板初始化。
-//! 声明删除与 producer 移动同时消费 HIR 保留要求；调试可见性仍有自己的 scope 查询。
-//! 已恢复调用的声明前缀不能新增常量 local，例如把同槽 callee 挤到更高位置会改变 GC 观察。
-//! 原 Batch 的索引展开最后执行；如嵌套数组仍需完整帧核对缓冲槽，不能先丢弃其 SETLIST 身份。
+//! scanner 提供带类型的构造步骤，binding/root 分析验证使用与保留要求，rebuild/commit
+//! 消费同一计划完成改写；不会根据最终字段外形重新猜分配方式或原暂存槽。
+//! 例如 t={}; t.x=1; t.y=2 在表未逃逸、依赖及身份证明成立时可收成 t={x=1,y=2}。
+//! record key 保持 HIR 表达式，命名字段语法由后层决定。
 
 mod bindings;
 mod builder;

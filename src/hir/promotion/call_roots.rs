@@ -1,18 +1,9 @@
-//! 将 Dataflow 的调用边界与 canonical 参数 def 配对，冻结 caller 槽交接事实。
-//! 同时保留调用结果的同槽覆盖与所有固定定义的精确 dispatch 终点，使 HIR 不必重扫低层后缀。
+//! 冻结 CALL 的 caller 槽交接、结果覆盖与 dispatch 终点事实。
 //!
-//! CALL 参数位于 caller prefix 之外，callee 可覆盖这些槽；它们不是跨调用继续存在的
-//! 独立 caller root。例如 t = {}; f(t) 的参数槽可交给 f，而 local owner; f(owner) 中
-//! owner 的原始低槽不随参数 MOVE 一并交出。这里只发布同 basic block 的 direct def，
-//! phi、跨 block use 和按引用捕获槽不产生证明；调用结果最后读取后的覆盖可以位于各直接
-//! successor，由 Dataflow 发布完整 frontier。实际 producer 删除由 HIR 求值顺序 owner 审查。
-//! 调用布局独立于 callee 值身份；完整帧另需 canonical Def/phi 保留同一 home，
-//! 如 `assert(check()==12)` 的 Boolean 合流不创建新 callee。参数区的捕获状态独立
-//! 保存，不能因某个参数没有 direct Def 而丢失布局，也不把布局当作一般根退休许可。
-//! 开放 VARARG 参数消费 Dataflow 已解析的唯一包来源及原起点；完整帧据此恢复省略号，
-//! 不将 `f(...)` 的源码外形当作原 VARARG 与 CALL 相邻或槽距相同的证明。
-//! 低槽调用更新保存初值、callee/receiver 准备 COPY 和结果写回三个 Def；它们共享值时
-//! 仍各自承担物理写。例如 `v=v:next()` 的下次 SELF 准备不能归到上一次 CALL 的写域。
+//! 消费 Dataflow 调用边界、canonical Def 与完整覆盖 frontier，分别保留布局、
+//! 值版本及捕获状态；实际 producer 删除仍由 HIR 求值顺序 owner 证明。
+//! 例如 f(owner) 的参数槽可交给 callee，owner 的原低槽不随参数 COPY 交出。
+//! 同值的 callee/receiver 准备与结果写回仍是不同物理事件。
 
 use super::*;
 use crate::hir::common::HirCallArgumentRoot;

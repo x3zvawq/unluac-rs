@@ -1,39 +1,9 @@
-//! 这个文件负责清理 simplify 出口上已经没有任何读取者的无副作用 temp 赋值。
+//! 清理没有读取者的 HIR 临时赋值，并保留仍承担物理槽覆盖职责的写入。
 //!
-//! 结构层在 block 入口会先把一批 phi/temp 物化出来，后续 branch/loop/readability pass
-//! 再把真正活着的那部分折进源码结构。对大函数来说，最后常会留下"只赋值一次、后面从未
-//! 再读"的机械 temp 壳；它们继续留在 HIR 里不仅会制造残余 unresolved warning，
-//! 还会直接挡住 AST lowering。
-//!
-//! 清理范围：目标 temp 全局无读者，且 RHS 不含潜在副作用（调用、metamethod 触发、
-//! table 构造等）的赋值语句。它依赖 promotion 保存的物理 home 与 entry-nil provenance：
-//! 无物理 home 的纯死写可直接删除；参数同槽写改回参数赋值；不经过循环或可达反向边的
-//! 结构化前缀中，`entry nil -> GC-inert value` 的写入也可删除；只被前向 goto 引用的
-//! label 不会停用整段证明。复制无 capture-home
-//! 别名、无后写且后缀仍读取的可见 binding 同样不需要建立第二个 root。其余有 home 的
-//! 写入不在这里猜 reaching value，因为它仍可能决定旧对象或新对象的 GC root 生命周期。
-//! debug identity 与 `HirInlineDisposition::Preserve` 统一进入 protected-temp 集；普通死写、
-//! copy-root retarget 和相邻 overwrite 事务都必须显式避开它，而不能依赖某个 retention
-//! reason 恰好也会命中 capture/home guard。
-//! RHS 的可删除性与 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
-//!
-//! 例子：根前缀里的机械 `t = false` 仅在原槽已证 entry nil 时可删成空；
-//! 入口或 CALL 未知残值的覆盖须传成 PhysicalRoot，不能因 boolean 结果无用而删除。
-//! `t = stable_local` 若目标覆盖 entry nil 可删；`t = p; p = false` 则必须把后写精确
-//! 接回同一个 PhysicalRoot，不能把 `t` 的 root 无条件延长到函数结束。
-//! copy-root 候选只读借用当前 HIR 的 RHS；各块一次计算直线 GC-inert return 后缀，
-//! 位置查询复用该边界。提交计划只保存身份与已证明标量，不把借用或后缀位置带过树改写。
-//! 当前 CALL 的 Boolean 预写先保留到完整帧审理；例如 `false; assert(a() == 1 and b() == 2)`
-//! 的 false 仍是原参数缓冲事件。Final 才用同一死写证明清理未消费项，不生成永久保留声明。
-//! 候选位置使用当前树的语句先序编号与块结束位置；每个 scalar 写只保存固定大小的坐标，
-//! 不保存祖先路径，也不从这个词法索引推导动态支配或可达性。
-//! 可见 binding 的稳定性消费入口的一份 home 写入摘要；未知 home 写影响所有查询，
-//! LocalRootRelease 只影响被释放的 Local 身份，不扩散到同 home 的其它 binding。
-//! 所有帧事务结束后，无读的无事件 primitive initializer 可消费原操作数布局证明改为 nil；
-//! constructor 即使已有逃逸读取也消费完整跨分支退休证书：`t={}; weak.k=t; ...`
-//! 的无读 scalar 覆盖必须接回 t，不能因 t 有逻辑读取而留下独立长寿对象根。
-//! `local dead = value == nil` 因而保留 `local dead = nil` 的原槽覆盖及声明前缀。
-//! 该收尾不删除 binding，不吸收高槽准备，也不把改写后的 RHS 交回旧 Promotion 快照。
+//! 消费目标方言的表达式安全事实、promotion 的 home/entry-nil 和 root 退休证书；
+//! 无读取不代表没有 GC root、capture 或 debug 身份，不能仅凭 use-count 删写。
+//! 例如原槽已证为 entry nil 时，根前缀的 t=false 可删除；覆盖未知旧值则须保留
+//! 原物理写入。完整调用帧尚需消费的准备写留到 Final 阶段再清理。
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,21 +1,8 @@
-//! 这个文件实现词法 scope 计划提取与 cleanup owner 消解。
+//! 提取词法 scope 计划并为显式 cleanup 确定唯一 owner。
 //!
-//! 它依赖 graph facts 和显式 `Close` 指令，负责把真正含 cleanup 的 block 整理成
-//! `ScopePlan`。
-//! 它不会越权恢复最终词法块，只保留 HIR 需要的 entry/exit/close-point 事实。
-//!
-//! 例子：
-//! - 不含 `Close` 的 loop/branch 不会产生空的 scope 候选
-//! - 含 `Close` 的普通 block 会产出 scope 候选，让后面的结构化阶段直接知道
-//!   这些 cleanup 点属于词法边界，而不是把 `Close` 当普通语句往后拖
-//! - 每条 `Close/Tbc` 最终取得唯一 `CleanupDisposition`；for 词法边界只有在覆盖的
-//!   显式 TBC 全部属于唯一 loop owner 时才交给该循环，HIR 不再重跑活跃性分析
-//! - 显式 Close 的连续 block 前缀可下放到入边，每条边按 may-out 冻结独立事件；
-//!   相同 origin 的其它 Close 仍保留自己的执行位置，不能充当这一事件的替身
-//! - 内层 TBC 的 Close 若仍能观察同轮外层源码 local，就保留显式事件；例如
-//!   `local copy=x; do local guard <close>=g end` 不能把两者合成同一个循环结束域
-//! - branch admission 按真实 container preorder 区间查询 Close；共享透明链只在当前
-//!   候选内解析，例如 Close -> jump -> 候选外 -> effect 不把外部 effect 吸进 arm
+//! 消费 graph facts、Close/TBC 与结构候选，向 HIR 发布 entry/exit/close-point
+//! 及 CleanupDisposition，不在这里物化最终 do/loop 语法。
+//! 例如含 Close 的 block 发布对应词法边界，不含 cleanup 的普通分支不产生空 scope。
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},

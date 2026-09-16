@@ -1,6 +1,11 @@
 -- aggregate 持有关系不得随着中间 binding 的覆盖丢失；外层逃逸必须传播到后加入的 child。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- 完整左值/读取/常量写帧不保留中转声明；外层调用恢复后也不产生 print 别名。
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
+-- 外层仅保留 weak、child/inner/outer 和 repeat 的三份对象声明；末尾调用不另立 callee。
+-- unluac: expect-ast-count [[local-decl]] [[7]] [[@proto=0]] [[@dialect=lua5.1]]
+-- unluac: expect-not-contains [[ = print]] [[@dialect=lua5.1]]
 local weak = setmetatable({}, { __mode = "v" })
 local function clear(holder)
     weak[1] = holder.inner.child
@@ -37,6 +42,32 @@ local function lookup_escape()
     value = nil
     collectgarbage("collect")
     assert(weak[1] == nil)
+    -- Lua 5.1 的 GETUPVAL 目标快照先于 RHS；__index 改写 weak 后仍写入原表。
+    -- 5.4/5.5 的 SETTABUP 有不同的 cell 读取时点，不套用这一方言专属断言。
+    if _VERSION == "Lua 5.1" then
+        local saved = weak
+        local replacement = {}
+        local value = {}
+        local member = { child = value }
+        local reads = 0
+        local holder = setmetatable({}, {
+            __index = function(_, key)
+                assert(key == "inner")
+                reads = reads + 1
+                if reads == 1 then
+                    weak = replacement
+                else
+                    assert(saved[1] == value and replacement[1] == nil)
+                end
+                return member
+            end,
+        })
+        assert(not clear(holder))
+        assert(reads == 2 and member.child == nil)
+        assert(saved[1] == value and replacement[1] == nil)
+        weak = saved
+        weak[1] = nil
+    end
     return result
 end
 assert(lookup_escape() == 1)

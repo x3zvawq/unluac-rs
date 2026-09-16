@@ -1,20 +1,9 @@
-//! 这个文件负责把“结构等价但不好看”的条件语句收回更像源码的形状。
+//! 将合法 AST 条件语句整理为更直接的源码形状。
 //!
-//! 它依赖 AST build / HIR 已经保证语义正确，只在 Readability 阶段做局部可读性整理，
-//! 比如 guard flatten、`not` 交换 then/else。它不会越权补语义，也不会替前层兜底
-//! 修错误控制流。
-//!
-//! 例子：
-//! - `if not cond then a() else b() end` 会整理成 `if cond then b() else a() end`
-//! - 只有受保护匿名 nil 声明的一臂保持完整并置于 else；普通 not 交换服从该方向，避免反复翻转
-//! - `if cond then body else end` 会整理成 `if cond then body end`
-//! - `if cond then return end else tail()` 会拉平成 `if cond then return end; tail()`
-//! - `repeat if cond then break end; tail() until true` 会整理成 `if not cond then tail() end`
-//! - `repeat ...; if G then continue; if B then break until C` 会整理成
-//!   `repeat ... until not G and B or C`
-//! - 嵌套循环自己的 `continue` 保留原 owner，不会阻止外层 `repeat` 的尾部整理
-//!
-//! capture 边界只消费直接 closure 已保存的 metadata，不进入子函数的独立 LocalId 空间。
+//! 消费已有 binding/capture 与控制流事实，处理 guard flatten、then/else 极性
+//! 和 repeat 尾部条件；不补 HIR 语义或重新恢复错误控制流。
+//! 例如 if not c then a() else b() end 可交换为 if c then b() else a() end，
+//! 涉及声明、退出及嵌套循环的情况仍须保持原作用域和控制 owner。
 
 use super::super::common::{
     AstBlock, AstExpr, AstIf, AstLocalAttr, AstLogicalExpr, AstModule, AstRepeat, AstReturn,

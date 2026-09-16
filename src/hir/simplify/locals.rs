@@ -1,68 +1,10 @@
-//! 这个文件负责把“已经明显跨语句存活的 temp”提升成 HIR local，并收回由此暴露的
-//! 函数入口参数别名。
-//! 已证明的 Temp -> Local 映射同时改写 generic-for producer 和 iterator；此类
-//! 身份提升保留原 occurrence，具体值替换仍由普通 rewrite owner 使相关 span 失效。
+//! 把跨语句存活的 temp 链提升为源码 local，并收敛函数入口的参数别名。
 //!
-//! 我们这里故意不去猜所有 temp 都是不是源码变量，而是只抓一类非常稳的形状：
-//! 当前 block 顶层先有一次初始化，后面这批 SSA temp 通过简单别名链继续流动，并且
-//! 在后续语句里继续被读/写。对这类值，继续保留 `t12 / t13 / ...` 只会让 HIR 充满
-//! 版本噪音，把它们折回同一个 `LocalId` 更接近源码，也能为后续 AST/Naming 铺路。
-//! 如果整条 temp 链只被一个后续语句消费，则仍把它视为寄存器级中转值，不在这里提升；
-//! 后续 temp-inline / table-constructor 会结合具体消费站点继续收敛。
-//!
-//! 另外，如果某个 local 已经被 closure capture 观察到，后续来自同一词法槽位的
-//! 新 def 不该再长成新的 local，而应继续写回原绑定。这里的“同一词法槽位”会把
-//! `close from rX` 纳入身份；close 后复用同一个寄存器号不能再写回旧 upvalue。
-//! 否则 closure 会继续指向旧 local，后半段写回却被拆到新绑定里，或把 close 后的
-//! 普通临时值误写进已关闭 upvalue，直接改掉源码语义。
-//! fallback label/goto 还可能让 loop 回边快照在文本上早于 temp 定义出现；这种 temp
-//! 不能在定义点提升成 `local`，否则前缀快照会读到尚未初始化的局部变量。首个 label/goto
-//! 之前、不再跨边界存活的 GC-inert 只读链则不受回边影响，可以继续消除前缀版本噪音。
-//! dead-temps 完整提交 scalar 退休后，label-flow owner 消费其声明证书，仍核对后缀
-//! 支配与组内后写：`t={}; weak.k=t; if c then t=true; goto L end; t=false; ::L::`
-//! 保留原点 `local t={}`，不能因忽略已完成的退休而拆出会增加 allocation scratch 的赋值。
-//! 参数别名收敛是 locals 的收尾步骤：如果提升后只得到 `local L = param` / `local L; L = param`
-//! 这类函数入口机械别名，且后续不会观察到参数原值和 alias local 的差异，就直接把
-//! 后续读写改回参数身份。它不重新推断 phi 或 loop state，只处理 locals 自己稳定暴露的
-//! binding 形状。
-//! 不同 home slot 上的 move alias 是当时值的快照，不能与来源槽位后续的状态合并；
-//! 没有 trusted home slot 的 phi temp 可以单独提升，但不能吸收 move alias：缺少未污染的
-//! 物理身份时无法证明两个槽位的 GC root、capture cell 与跨块 value epoch 相同。
-//! 对没有 debug local 证据、home-slot 定义和根 block 直接 temp 绑定压力都已经超过
-//! 源码局部槽上限的大函数，同一 `(slot, close epoch)` 会复用一个 local；两个门同时
-//! 成立才能证明这是源码层的局部数压力，而不是单纯由 SSA 拆分制造的定义数。物理覆盖
-//! 保证旧值已死，close epoch 与 capture sticky 事实继续隔离不同词法身份。候选扩张只沿
-//! temp occurrence index 访问真实 touch，不按“每个定义 × 全部后缀语句”重复扫描。
-//! 没有 debug/capture 身份且只被写入、从未被表达式读取的 temp 链继续保留为 temp，交给
-//! dead-temp 清理删除纯写入；把这类链提升成 local 只会把可删除的 SSA 壳固化到源码里。
-//! 原完整 LOADNIL 组若已有成员承担 root handoff，其余匿名成员在同一原位补齐分组声明；
-//! 后续 COPY 沿当前槽身份复用，避免留下半 Local 半 Temp 的批次或另建同槽 holder。
-//! 没有 root handoff 时，整组复用已结束全部旧 SSA 需求的匿名同槽 Local；原 nil 写入
-//! 仍留在原位置，使完整帧消费旧定义后能在真实覆盖点重建声明，不从后缀 COPY 猜初值。
-//! 尚无 owner 的连续 nil 组若含引用捕获，则按各自唯一写 home 原子建立独立 local；
-//! 例如 `local d,e; local t={d,e}; f=function() d=1 end` 保留两个 cell 和数组快照，
-//! 不让未物化 Temp 阻塞后续完整构造帧，也不借初始 nil 相同合并两个 cell。
-//! 并行 carried seed 的同 home 纯副本可继续使用已物化的匿名物理根：例如 `v=make();
-//! state,n=v,0; while ... do state={} end` 的 v/state 原属同槽时，只保留同一存活链。
-//! 旧版本需求、debug/capture 身份和事件型 RHS 分别校验，不能从相邻赋值猜根已退休；
-//! 普通数值状态保留原分组提升路径，不能因修复强根生命周期而拆散其 phi 初始化。
-//! PUC 原 GETTABLE 若直接读取低槽 base 和内嵌常量 key，也复用已退休的匿名目标；
-//! 单次原结果与输入布局共同证明赋值不引入准备槽，CALL 和构造器不借此获得写回许可。
-//! carried-local fixed point 若已让某个 binding 吸收不同或未知 home，后续 promotion 仍可
-//! 建立源码 local，但不能借原始槽号复用 sticky/debug local：raw home 只登记给 capture/TBC
-//! 保护，组内所有 temp 的 trusted home 完全一致时才参与正向复用，taint 再传播到新 local；
-//! 含引用 capture 的 temp 组若不能证明同槽，则保持 temp，避免丢失 capture cell 身份。
-//! promotion plan 会在候选形成时冻结初始化值；apply 只消费已验证的 plan，不再重新匹配
-//! anchor 语句。`while` 条件里的 temp 则作为跨迭代消费者保护到 body，避免把回边写回
-//! 误删成一次性的 move alias。子作用域还继承父块的前缀引用；goto 回边可再次读取
-//! 这些状态，不能因为读点在文本前方就让内层 alias promotion 吞掉跨块写回。
-//! 并行的原始常量 seed 也可整组建立新绑定：逐项核对连续 trusted home、首次写入与
-//! 后续跨语句活读、无外部使用，保留原初始化位置且不插入 nil 预写。单个 SETLIST 等
-//! 消费的准备组仍留给原 owner。例 `count,value=0,0; while ...`
-//! 的循环状态在 HIR 即有 Local 身份，后续完整返回帧无需等 AST 再猜声明前缀。
-//! 原 CLOSURE 的引用自捕获是初始化 cell，不是读取旧值的自更新；只有原结果 Def/home
-//! 和 touch-before 证明齐备时才能提升，ByValue 仍拒绝。AST 负责将其落成递归声明语法。
-//!
+//! 消费 promotion 的 home、close epoch、capture/debug 身份及物理根事实，
+//! 为同一存活链建立稳定绑定；只在后续单个站点消费的中转值仍留给内联或构造器 owner。
+//! 例如同一槽和 close epoch 的多个 SSA 版本可写回同一 local；close 后复用该槽
+//! 属于新的词法身份，不能继续写入旧闭包 cell。
+
 mod branch_merge;
 mod entry_nil;
 mod param_alias;
@@ -97,6 +39,8 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
     safety: HirExprSafety,
     dialect: crate::decompile::DecompileDialect,
 ) -> bool {
+    // 定义数和根块实际绑定压力须同时超限；单纯 SSA 版本多不证明源码局部槽不足。
+    // 无 debug 身份时才允许同 home/epoch 复用，避免把源码声明压成同一绑定。
     let compact_home_slots = hir_block_local_pressure(&proto.body) > crate::SOURCE_LOCAL_LIMIT
         && facts.home_slot_definition_count() > crate::SOURCE_LOCAL_LIMIT
         && proto.temp_debug_locals.iter().all(Option::is_none);
@@ -207,6 +151,7 @@ struct PromotionPlan {
     home_slot: Option<HomeSlotKey>,
     temps: BTreeSet<TempId>,
     removable_aliases: BTreeSet<usize>,
+    // 候选形成时冻结初始化值，apply 不重新匹配可能已被其它 plan 改写的 anchor。
     init: PromotionInit,
     action: PromotionAction,
     batch_declaration: Option<BatchDeclaration>,
@@ -1683,9 +1628,15 @@ fn collect_plans(
             // 捕获 local 的重绑定值，仍按原规则保守提升。
             if touching_stmt_indices.len() == 1 {
                 let use_stmt = &block.stmts[first_touch_index.expect("single touch must exist")];
+                // 未被 temp-inline 消费的闭包仍需在原创建点拥有 binding。仅在循环条件
+                // 出现一次不是一次执行；交给 AST 才物化会使后续 HIR 源码帧缺少这个前缀身份。
                 if event_block
                     .stmt(first_touch_index.unwrap())
                     .consumes_only_control_head(use_stmt, &group)
+                    && !matches!(
+                        single_temp_assign_value(stmt, root_temp),
+                        Some(HirExpr::Closure(_))
+                    )
                 {
                     // 候选拒绝[PolicyBoundary]：只在控制头消费一次的匿名 temp 保持低密度展示；这不是运行语义边界。
                     continue;
@@ -2383,6 +2334,8 @@ fn stmt_self_updates_temp(stmt: &HirStmt, temp: TempId) -> bool {
 
 /// 原 CLOSURE 的引用自捕获读取新建 cell，而不是赋值前的值。已由前面的 touch-before
 /// 检查排除外层状态写回，且原结果 Def/home 必须保持不变；ByValue 自读取仍是旧值观察。
+// 引用自捕获建立初始化 cell，不是读取旧值的自更新；只有原 CLOSURE Def/home
+// 与 touch-before 证明齐备才可提升，ByValue 仍须按创建点快照处理。
 fn is_recursive_closure_initializer(
     stmt: &HirStmt,
     temp: TempId,

@@ -1,22 +1,9 @@
-//! 这个文件提供 HIR simplify 共用的词法控制流事实。
+//! 提供当前 HIR 区域共享的控制流图与 block-local 词法查询。
 //!
-//! `HirFlowGraph` 按当前区域的唯一 LabelId 连接 goto；源码标签布局的合法性由
-//! Structure/AST 的 scope 合同负责。`break` / `continue` 由最近的 loop owner 消费，
-//! 分支与循环出口使用目标方言 truthiness 事实判定。该图是当前 HIR 树
-//! 的 owner-wide topology 单一来源；它区分 for 的一次性求值节点与循环 dispatch，并为
-//! dataflow consumer 提供稳定 node id 和后继。block-local `LexicalCfg` 从同一图的可达
-//! 出口投影线性 rewrite 所需的 successor、外部出口和支配查询，不另行解释控制结构。
-//! 每个语义事件同时借用创建它的 HIR 语句；repeat 条件与 for 分派/写入即使拆成多个
-//! 节点也保留同一 owner，消费者不从子 payload 指针反查原语句。合成出口没有语句 owner。
-//! 例如 `do ... goto outer end; ...; ::outer::` 由子图的未解析出口连接直属 label，
-//! 子图内自含的回环则只通过真实可达的正常出口影响后续语句。
-//! 本模块不推断 temp reaching-def 或 root lifetime；这些仍由具体 pass 结合 promotion facts
-//! 判断。
-//! `validate_region_entry` 独立验证区域 label 唯一性和外部入口；只需要检查词法入口的
-//! consumer 直接消费它，完整 CFG 也复用该结果，不为验证边界而构造后继与可达性。
-//! 构图与重入查询的临时词法导航复用路径栈，仅已登记 label 和重入边界拥有路径副本。
-//! 需要删除计划的 consumer 可在节点创建时按需投影原语句位置；例如 if 内的 nil 写
-//! 直接关联图节点与 Stmt/Then/Stmt 路径，不再用节点地址反查语句，也不为全图复制路径。
+//! HirFlowGraph 统一解释 label/goto、最近循环的 break/continue 和 for 分派事件；
+//! LexicalCfg 从同一图投影 successor、外部出口及支配关系，不重复解释控制结构。
+//! 例如子块的 goto outer 连接到外层标签；自含回环仅通过真实可达出口影响后缀。
+//! 图及节点坐标只对当前树快照有效，不提供 reaching-def 或 root-lifetime 证明。
 
 use std::{
     cell::OnceCell,

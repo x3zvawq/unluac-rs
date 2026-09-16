@@ -1,43 +1,9 @@
-//! branch-value 收敛：把“分支只是在为同一个 binding 选值”的 HIR 形态收回值语义。
+//! 将为同一 binding 选值的分支树和 fallback label/goto 壳收回 HIR 值语义。
 //!
-//! 这个文件承接四类已经进入 HIR、但还没有完全结构化的 branch-value 形状：
-//! 1. `locals` 前仍以 temp 表示的“所有分支只给同一 target 选值”树；
-//! 2. fallback CFG 遗留的 `if cond then x=v; goto L end; x=d; label L` 壳；
-//! 3. `locals` fallback 提升后暴露的 `local X; if cond then X=a else X=b end` 壳；
-//! 4. nil-only fallback alias：`local X; if A == nil then X=b else X=A end`。
-//!
-//! 它依赖前层 HIR/StructureFacts 已经给出合法的 branch、label/goto 和 binding 边界；
-//! 这里只做 HIR 内部的语义收敛，不重新解释 CFG，也不会跨过仍有其它入边的 label。
-//! 对需要复制默认值的形状，只允许复制无副作用的常量或引用，避免为了可读性改变求值语义。
-//! 作用域 guard 借用 proto 的 debug、物理根和 rewrite authority；三个元数据源在 body
-//! 改写期间保持不变，不需要另外冻结同义身份集合。
-//! nil fallback 不会被恢复成 `A or b`，因为 `or` 会把 `false` 也视为 fallback 条件。
-//!
-//! 对 Temp/Local binding，除了平铺的两臂形状以外，结构恢复阶段经常因为短路条件被翻译成多层嵌套 `if`
-//! 而把同一个 binding 的赋值散落在树形 if/else 的所有叶子上。raw Temp 没有稳定的中间
-//! 源码身份，因此由 `BranchValueDecisionBuilder` 一次建立完整 Decision 后统一 finalize；
-//! Local 则保留逐层 finalize 的严格恢复边界。两条路径最终都由 logical-simplify 还原
-//! 成扁平的 and/or 链，不能为共用实现而放宽 Local 候选。
-//! 短路链常见的 guard local 可依靠词法作用域直接消解；raw temp 只有在完整候选根语句之外
-//! 没有 touch、候选表达式不再引用它，且没有 debug local 身份时才会提前消解。无法证明的形状
-//! 保持原树，交给 `locals::branch_merge` 物化稳定 binding 后在下一轮重试，不能为追求折叠丢状态。
-//! guard producer 的结果通过 `CurrentValue` 进入 Decision 结果臂，带调用或动态读取的 producer
-//! 也只在原位置求值一次，不能把同一表达式 clone 成条件与结果后重复执行。
-//! raw Temp 收成值后，仅把本轮新生成的 target 交给 temp-inline 的根级 Call/Return 定向入口；
-//! 不能重跑全 proto 的普通内联，也不能让 `locals` 延后到另一个 phase。
-//! goto/label 壳先建立一次 label facts，再选择不交叉区间线性重建 block；独立候选不会每命中一个
-//! 就重新扫描整块。fallback assignment 只会被放进互斥分支，整条 value-pack 与 lvalue
-//! 保持原样，因此每条运行路径仍只求值一次，不需要按表达式形状维护复制白名单。
-//!
-//! 例子：
-//! - 输入：`local l0; if cond then l0 = "a" else l0 = "b" end`
-//! - 输出：`local l0 = cond and "a" or "b"`
-//! - 输入：`local l0; if c1 then if c2 then l0 = a else l0 = b end else l0 = c end`
-//! - 输出：`local l0 = c1 and (c2 and a or b) or c`
-//! - 输入：`t0=v; if t0 then t1=t0 else t1=d end; use(t1)`，且 t0 无其它 touch/capture
-//! - 输出：`t1=v or d; use(t1)`
-//! - 输入：`if a then if b then t=v; goto L end end; t=0; label L`
-//! - 输出：`if a then if b then t=v else t=0 end else t=0 end`
+//! 消费已有 branch、binding 与词法入口事实；raw Temp 的完整树交给 Decision builder，
+//! Local 保留逐层证明边界，表达式归一交给 logical-simplify，不重新解释 CFG。
+//! 例如 local x; if c then x="a" else x="b" end 可恢复为 local x=c and "a" or "b"。
+//! nil-only fallback 仍须区分 nil 与 false，不能直接改成 or。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -738,6 +704,7 @@ struct PreparedBranchValueGotoFold {
     replacement: HirStmt,
 }
 
+// 共享一次 label 索引并选择不交叉区间，避免每命中一个独立壳就重扫整个 block。
 fn plan_branch_value_goto_folds(
     stmts: &[HirStmt],
     label_refs: &BTreeMap<HirLabelId, usize>,
@@ -959,6 +926,8 @@ fn rewrite_direct_goto_value_if(if_stmt: HirStmt, fallback_stmt: HirStmt) -> Hir
     HirStmt::If(if_stmt)
 }
 
+// 默认赋值只进入互斥叶臂，完整保留 value-pack 和左值；每条运行路径仍只求值一次，
+// 因而无需按 RHS 外形限制复制。
 fn rewrite_nested_default_goto_value_if(
     outer_stmt: HirStmt,
     prefix_stmts: Vec<HirStmt>,

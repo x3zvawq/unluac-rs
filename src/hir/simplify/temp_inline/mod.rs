@@ -1,69 +1,10 @@
-//! 这个文件实现 HIR 的第一批 temp inlining。
+//! 将 HIR 中单次消费的临时值收回表达式，并编排调用准备区的整体内联。
 //!
-//! 原始参数槽交接证明只在当前唯一 producer/参数 occurrence 配对后消费；capture、
-//! 执行区域与求值顺序仍需正证，展示复杂度不能迫使该参数变成额外 caller root。
-//! 常规路径以 use-count、home/capture 与求值区域事实证明等价性，只折叠“单目标 temp
-//! 赋值，并且被紧邻下一条
-//! 简单语句使用一次”的情况。调用表达式另有一条更窄的连续融合规则，用来处理
-//! `callee_temp = f; arg_temp = expr; callee_temp(arg_temp)` 这种 bytecode 为保持 Lua
-//! “先求 callee、再求参数”而拆出的形状；融合时必须把 callee 和参数一起放回同一条
-//! call，不能只把 callee 延后到参数求值之后。run 中无读取且可安全丢弃的匿名 temp
-//! 不构成求值事件，但带 debug/capture 身份的赋值仍会阻断整包融合；已有 copy-root
-//! 终点证书的非 GC-inert 结果交给 dead-temps 完整消费，零使用不表示独立根可删除。
-//! 同一 transaction 还覆盖 `If` 条件中首个必达 call：只有连续 lookup/callee/arg run
-//! 的每个节点都唯一进入该 call 的 eager 求值子图时才整体收回；短路 RHS、额外 use、
-//! PhysicalRoot、capture/debug identity 或反向依赖均保留原形。
-//! 同一 block 的独立 run 沿进入本函数时的语句索引批量判定：sink 原位改写，删除区间
-//! 延迟到扫描结束后一次压缩，使 capture 与求值顺序快照始终处在同一坐标系。
-//! order-sensitive def 索引由 proto 级 scratch 复用，每个 block 只清理上次实际写过的槽，
-//! 避免结构块数量与全局 temp 数相乘的稠密初始化成本。
-//! 相邻提交点统一消费连续纯依赖链：例如 `t0=not p; t1=not t0; box.x=t1`
-//! 在原站点、根、捕获及左值求值前缀允许时，一次展开为 `box.x=not not p`，
-//! callee、参数和 return 也复用该入口。每个原 producer 仅有一个读取叶，其余为常量；
-//! 依赖沿既有站点 query 传播，保留 FASTCALL direct 参数上下文与 callee 物化位置，
-//! 不反复重扫增长中的 sink。多读取分支仍需展开后的前缀证明，保留逐站点处理；
-//! 逻辑归一仍由 logical-simplify 负责。
-//! 相邻内联以可观察事件前缀而非语法子节点顺序判定：纯 local/param 读取本身不是
-//! 屏障，但读取结果形成的 temp 快照不能越过可能改写 binding 的事件；lookup、调用、
-//! 运算和 method sugar 的隐式 lookup 是屏障。while/repeat 条件还属于每轮重新求值的
-//! 独立区域，不能接收循环外快照。跨边界折叠现在有四个窄合同：repeat body 尾写入与
-//! until 属于同一轮；open return 的 fixed alias 必须先于完整保留的 tail setup；终态
-//! fixed return 前的纯 nil 并行写可在候选自身无 physical-root/capture 冲突时直接并入 return；PUC Lua
-//! 5.2–5.5 的单 upvalue table 左值可把相邻 producer 收回 key。四项仍要求唯一消费
-//! 且不绕过原求值点；前两项不允许相关 home 被跨越区间写入或 capture，nil pack 的
-//! raw temp 必须保有未失效的 `(slot, close epoch)`，table key 则继续服从内部前缀顺序证明。
-//! numeric-for 前的连续 materialization run 还允许越过保留下来的状态赋值收回稳定字面量
-//! header temp；未被引用 capture、且区间内没有其它同 home 写的 LocalRef/ParamRef 也可沿纯
-//! TempRef 链收回。例如 `t0 = source; t1 = setup(); t2 = t0; for i = t2, 3` 在 setup
-//! 不能改写 source 时恢复成 `t1 = setup(); for i = source, 3`。lookup/call/运算仍走相邻
-//! 求值顺序证明，不跨状态赋值猜可变快照。
-//! repeat 的 frozen condition prefix 因直接 continue 被移到 body 首句时，若它是只由 latch
-//! 读取一次的稳定标量，也可直接收回条件；continue 仍抵达同一 latch，break/return 则跳过。
-//! closure 的复杂度无法代表 child proto 函数体，因此不把 closure producer 内联进 loop head；
-//! 普通 `local function iter()` 应保留为独立声明，避免生成多行匿名 iterator。
-//! 具有返回值的 call 同样按 child proto 当前 body 判断：复杂 callee 保留 producer binding，
-//! 单条简单 body 才继续内联，避免把命名函数压回赋值或 return 中的多行 IIFE。
-//! call/lookup 的相邻同槽覆盖直接消费 root-lifetime owner 冻结的原 producer 与 home。
-//! call 保持原 RHS、运算和覆盖顺序；lookup 只穿过常量 key 的 base 链，例如
-//! `t = object.parent; next = t.child` 在同 home 覆盖证明下恢复 `next = object.parent.child`。
-//! 动态 key 需要独立的求值窗口证明；跨 home 的 MOVE 交接不能借此删除结果根。
-//! method 协议的 callee base 与隐式首参虽是两个语法 use，却只求值一次 receiver；相邻
-//! 裸 binding 或命名字段链快照可在严格匹配这对 use 后原子收回，例如
-//! `t = subject.worker; t:touch()` 会恢复成 `subject.worker:touch()`；终结调用的连续物化 run
-//! 还可收回 owner 保持存活的裸 receiver。若独立 receiver owner 只是从另一个 pure scope-end
-//! root 复制而来，allocation-root pair 与稳定 source home 可共同证明 alternate-root handoff；
-//! 即使 receiver 的覆盖 RHS 可能触发 GC，也可删除该 copy。普通点调用仍按两次读取处理。
-//! 纯 frame-end 的无读 copy 与 receiver 交接共用提交器；前层证明目标旧值非资源后，
-//! 保留 source 的 PhysicalRoot 而删除副本。debug 身份、引用捕获及当前 home 写入另行检查。
-//! 相邻 sink 若是无条件 `Block`，只递归穿过零前缀的第一条语句；第二条及更晚消费仍需
-//! block-prefix 的求值、写入、capture 与控制流摘要，不能把整个词法块视为透明。
-//! branch-values 的定向入口只重用同一证明去处理本轮新暴露的根级 global-call run 或
-//! 单值 terminal return，不递归，也不开放其它普通内联 site。
-//! promotion 已失去单一 binding home 时，本 pass 使用 proto 的完整 `(slot, close epoch)`
-//! 全集继续做 may-alias；Unknown 因而只能命中既有 capture/value-flow/lifetime 屏障，不能
-//! 被不同 HIR identity 误当成物理不相交。
-//! Indexed 构造器直接消费 HIR 分配事实；若内联引入模板初始化，则发布操作数保留
-//! 身份，例如 `t=true; return {a,t,c}` 保持运行时 t，不将 TNEW 的容量改成 TDUP 裁尾。
+//! 消费 use-count、promotion、capture、root-lifetime 与求值区域事实，证明 producer
+//! 移入使用点后仍保持原求值顺序、值宽度和身份。具体站点由 site/use_sites 判定，
+//! 逻辑表达式归一交给 logical-simplify，无读临时值的删除交给 dead-temps。
+//! 例如 callee=f; arg=g(); callee(arg) 必须整体恢复为 f(g())，
+//! 不能单独延后 callee 的读取。
 
 mod site;
 mod usage;
@@ -1477,6 +1418,8 @@ fn single_pure_dependency(value: &HirExpr) -> Option<Option<TempId>> {
     clippy::too_many_arguments,
     reason = "候选、原坐标根快照和可变 callee 顺序分别由相邻 owner 持有"
 )]
+// t0=not p; t1=not t0; box.x=t1 可沿唯一读取叶一次展开为 box.x=not not p。
+// 保留原站点和 callee 物化位置传播证明，避免每展开一层就重扫增长中的 sink。
 fn inline_pure_dependency_chain(
     sink: &mut HirStmt,
     first: (usize, &HirStmt, InlineSite),
@@ -1660,6 +1603,8 @@ struct EagerConditionMaterializationProof<'a> {
     safety: HirExprSafety,
 }
 
+// If 只吸收首个必达 call 的完整 eager 依赖闭包；短路 RHS 未必执行，
+// 不能把原先无条件求值的 producer 移入其中。
 fn inline_eager_condition_materialization_run(
     block: &mut HirBlock,
     run_start: usize,
@@ -2792,6 +2737,8 @@ fn direct_lvalue_possible_home_slots<'a>(
     }
 }
 
+// t0=source; t1=setup(); t2=t0; for i=t2,3 只有在 setup 不能改写 source 时
+// 才可把头部改为 for i=source,3；稳定 binding 读取不等于任意可跨事件的快照。
 fn inline_numeric_for_stable_header_aliases(
     block: &mut HirBlock,
     run: std::ops::Range<usize>,
@@ -3244,6 +3191,7 @@ fn call_arg_inline_crosses_materialized_callee(
         && callee_materialized_at.is_some_and(|callee_index| stmt_index < callee_index)
 }
 
+// 每个 block 只重置上次实际写过的槽，避免块数与 proto temp 数相乘的稠密初始化。
 struct OrderSensitiveDefWorkspace {
     defs: Vec<Option<usize>>,
     touched: Vec<TempId>,

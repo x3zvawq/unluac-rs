@@ -1,16 +1,9 @@
-//! AST build：表达式、左值和 value pack 的机械 lowering。
+//! 将 HIR 表达式、左值和 value pack 降低为合法目标 AST。
 //!
-//! 这里依赖 HIR 已经把标量表达式与唯一可展开的 pack tail 分开，不再从 Call/VarArg
-//! 形状猜多值语义。固定 pack 尾调用只在普通列表或目标槽位会暴露额外返回值时降成
-//! `SingleValue`，open tail 则保持展开；非 target-counted 上下文若仍收到 exact tail，
-//! 说明 HIR 物化尚未完成并直接报错。
-//! 本地范围清零保留 HIR 的成组生命周期证明，在此落成无需整组 RHS 暂存槽的标量写入。
-//! closure lowering 消费 HIR capture 身份与 child 写入摘要，发布父级捕获集合及写入子集；
-//! 闭包内部的逃逸和根存活证明归 HIR，AST 不再保留另一份 upvalue 来源映射。
-//! 表构造器的 record key 同样只从 HIR 语义表达式降低：合法 UTF-8 identifier 在本层按
-//! 目标方言写成命名字段，其余键保持显式索引表达式，HIR 不承载这项源码语法选择。
-//! 一元/二元运算通过显式后序栈保留 HIR 原树；例如长加法链不能为减少调用栈而重结合，
-//! 否则会改变浮点结果或元方法执行顺序。
+//! 消费 HIR 已分开的标量/pack tail、capture 及构造器分配事实，负责语法选择，
+//! 不从 Call/VarArg 外形补多值语义，也不重建闭包根证明。
+//! 例如可能暴露额外返回值的固定尾调用用 SingleValue 保持宽度，open tail 保持展开；
+//! record key 则按目标方言选择命名字段或显式索引语法。
 
 use std::collections::BTreeSet;
 
@@ -394,6 +387,7 @@ impl<'a> AstLowerer<'a> {
     }
 
     /// 运算节点按原来的左到右顺序降低，叶子仍使用相同 lowering 和错误路径。
+    /// 显式后序栈避免深链耗尽调用栈；不能重结合算术树，否则会改变浮点或元方法结果。
     fn lower_operator_expr(
         &mut self,
         proto_index: usize,

@@ -1,18 +1,9 @@
-//! 正常返回包与完整 callee 值身份的共享分析。
+//! 分析正常返回包与确定的 callee 值身份，供 HIR 消费者查询。
 //!
-//! 复用 HIR CFG、显式 capture 与 LuaValueFacts；缺少 binding 就是未知值，而不是
-//! may-holder 的空集合。CALL 先快照 callee 再求参数，任何观察只撤销可能被引用
-//! capture 改写的 binding。例如 `f(change_f())` 仍调用参数求值前取得的 f。
-//! 返回包保留实际槽与数量，`return` 在单值位置补 nil，不能把 open tail 的首槽
-//! 复制给所有结果。字符串/cdata 常量只有执行中的词法祖先仍持有原 proto 时才
-//! 发布栈根无关事实；本摘要不授权删除调用、改变 SETLIST 或缩短物理根。
-//! 调用查询使用 lowering 发布的原调用身份；同一指令的多个 occurrence 必须合流。
-//! 表达式求值缓存不离开求值器；构造器地址只在模块只读快照内标识字段来源。
-//! 摘要随 HIR 改写失效。
-//! 父级顶层唯一初始化的直接闭包可给后继 capture 提供精确入口；父级写入与所有
-//! 引用子函数的可变 upvalue 一起排除。这里发布必然 callee，不借用 may-capture 集合。
-//! 新表的直接闭包字段沿普通返回包传播，遇到写表或观察即失效；它只描述下一次查找
-//! 的 callee，不授权重排 lookup/COPY 或删除 receiver 根。表身份复用本模块快照的 ObjectId。
+//! 复用 HIR CFG、显式 capture 和 LuaValueFacts，保留返回值的槽与数量；
+//! 缺失 binding 表示未知，不能当作空 holder 集。摘要随 HIR 改写失效，
+//! 不授权删除调用、重排 lookup/COPY 或缩短物理根。
+//! 例如 f(change_f()) 的 callee 在参数求值前快照，仍调用原先取得的 f。
 
 use std::collections::{BTreeMap, BTreeSet};
 

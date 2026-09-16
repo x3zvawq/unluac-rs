@@ -1,18 +1,9 @@
-//! 相邻 seed/carried local handoff 收敛。
+//! 收敛相邻 seed/carried local 的单目标交接。
 //!
-//! 这个规则只处理结构化后暴露出的窄形状：
-//! `local state = init; local next; ... next = state ...`。主模块负责调度不同
-//! handoff owner；这里只在 seed 不再可观察、carried 没有闭包捕获、且后续写回形状
-//! 明确时，把 carried 的使用点认回 seed。相邻 owner 只接受单目标 `carried = seed`
-//! 复制；`seed = carried` 尤其是多目标并行写回会保守保留两个 binding。
-//! capture/TBC direct 身份及 raw-home may-alias 由父模块统一保护，不在这里改写资源 cell。
-//! 接受相邻 local 合并前，本 owner 还在结构化 HIR 上计算 `Unwritten/Written` 路径事实：
-//! 分支合并可能状态，循环通过有限状态不动点消费自然/continue 回边和 break 出口，赋值按
-//! “先读 RHS/左值地址、再同时写 targets”转移。goto/label 若能绕过 handoff 写，改名会让
-//! 未初始化路径读取 seed 的旧值；本 owner 不在这种非结构路径上提交。
-//!
-//! - 接受：`local s=1; local c; c=s; print(c)` -> `local s=1; print(s)`
-//! - 拒绝：`local s=1; local c; print(c); c=s`，因为 nil 读取不受 handoff 写支配
+//! 消费父模块的 capture/TBC/home 保护与结构化路径事实，仅在 seed 不再可观察、
+//! carried 的读取受交接写支配时合并身份；反向或多目标写回由其它 owner 处理。
+//! 例如 local s=1; local c; c=s; print(c) 可收成 local s=1; print(s)，
+//! 但 print(c) 位于 c=s 之前时必须保留原 nil 读取。
 
 use std::collections::BTreeMap;
 
@@ -308,6 +299,8 @@ enum DominanceError {
     UnstructuredControl,
 }
 
+// 跟踪 Unwritten/Written 路径状态：先读 RHS/左值地址，再同时写 targets；
+// 循环合流包含自然与 continue 回边，不能用文本上出现过写入代替支配证明。
 fn carried_write_dominance(
     stmts: &[HirStmt],
     carried: LocalId,

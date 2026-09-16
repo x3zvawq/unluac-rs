@@ -1,20 +1,9 @@
-//! 这个文件提供 AST 各消费者共享的只读 visitor。
+//! 提供 AST 消费者共享的只读遍历、名字事件和短路查询。
 //!
-//! readability、方言特性和调试编号收集器经常只是想“遍历 AST 收集一批事实”，例如统计 method 名、
-//! 扫描 temp、寻找 synthetic local。过去这些分析各自复制了一整套
-//! `block/stmt/lvalue/call/expr` 递归骨架；这里把只读遍历收成共享设施，让分析代码
-//! 更专注在“看到某个节点时记录什么”，而不是重复维护递归。需要保持词法边界的分析
-//! 可以在 `visit_block` 返回 false，裁掉由 scoped walker 另行处理的子 block。
-//! 本层只枚举当前 AST 与显式 capture 元数据，不提供 HIR/VM 语义或改写许可。
-//! 名字事件保留读、写、局部声明与 capture 的角色，consumer 不再各自解释函数 target。
-//! 例如 `function t.m() end` 读取 t，而 `function t() end` 写入 t；把赋值改成声明语法
-//! 不得丢掉前者的基址读取。函数边界的 capture 事件来自显式元数据，不遍历 child 重建。
-//! 名字回调可返回 Break 结束本次入口遍历；停止信号穿过子节点循环立即返回，已进入
-//! statement/function 的 leave hook 仍成对执行，未进入的 child 不产生回调。
-//! 只需跳转事实时使用 any_stmt_structure，跳过求值与 child function；例如外层声明
-//! 能否移动只取决于本函数的 goto，闭包体中的同号 label 不属于这个查询域。
-//! 表达式先序骨架使用显式栈，并向 naming 等借用节点的收集器开放同一事件流；
-//! `a + a + ...` 保持左结合树，遍历不消耗与运算链长度成正比的调用栈。
+//! 枚举当前 AST 与显式 capture 元数据，保留读、写、声明及函数边界；不提供
+//! HIR/VM 语义或改写许可。需要词法裁剪的分析可在 visit_block 停止进入子块。
+//! 例如 function t.m() end 读取 t，function t() end 写入 t，
+//! 不能因两者都是函数声明而丢失前者的基址读取。
 
 use std::ops::ControlFlow;
 
@@ -48,6 +37,8 @@ pub(super) fn function_target_name(target: &AstFunctionName) -> (&AstNameRef, Na
 }
 
 pub(super) trait AstVisitor {
+    /// Break 结束本次入口遍历；已进入的 statement/function 仍执行成对 leave hook，
+    /// 未进入的子节点不产生回调，避免短路查询破坏收集器的作用域状态。
     fn visit_name(&mut self, _name: &AstNameRef, _access: NameAccess) -> ControlFlow<()> {
         ControlFlow::Continue(())
     }

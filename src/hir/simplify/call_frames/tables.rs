@@ -1,48 +1,32 @@
-//! 完整调用帧内的原构造步骤与暂存槽。
+//! 在完整源码帧中重放表分配、字段求值及 SETLIST 暂存区。
 //!
-//! 字段/SETLIST 角色由构造器 owner 提供，原操作槽由 Promotion 提供。本模块只在
-//! 同一构造/调用事务中重放分配、字段求值、批次和 dispatch，不能用字段持有关系
-//! 替代原根。例如 `callee; t={}; v=f(); SETLIST t(v,g()...); callee(t)` 保持 table 后
-//! 的固定缓冲槽与开放返回槽；字段写完不清空 scratch，也不意味着旧根已经退休。
-//! LuaJIT 的纯静态 TDUP 前缀不分配字段暂存槽，尾 CALL 单独核对原相邻 home/gap；
-//! 开放数组覆盖和初始化约束复用构造器 builder，不复制零返回后缀的字段重排逻辑。
-//! PUC 独立 record 和嵌套数组同样由完整原帧消费；闭包使用自身 CLOSURE 定义与写域，
-//! 已合并数组保留原 allocation/SETLIST 缓冲身份，不把字段外形作为删除暂存根的证明。
-//! 已合并 record 继续携带原字段写来源；例如 `{meta={[key]=7}}` 只在原 key
-//! 直接读取低槽、7 原本内嵌时省去内层 binding，不遗漏曾经存在的 LOADK/COPY 暂存。
-//! SETLIST 前的数组 producer 按读取版本与 record 交错重放，已完成的内层开放数组
-//! 继续消费原分配/批次和尾 CALL。例如 `{{f()}, key={v=3}, [{2}]=3}` 保持每次槽覆盖。
-//! LuaJIT Indexed 数组逐字段写入且复用 table+1 暂存；原容量与动态值语境共同阻止
-//! 重编译误用 TDUP。比较值的 Boolean 写回消费 Promotion 的原双分支结果身份。
-//! 最后 TSETM 的开放 CALL 仍复用 table+1；例如 `{f(), g()}` 的首结果已入表，
-//! g 的任意返回宽度由原批次承接，不引入 PUC 式固定数组缓冲。
-//! Indexed 的零数组容量与 hash 预分配要求保留数字 record，例如 `{[1]=f(),[2]=g()}`
-//! 不能改为数组或空表逐项扩容。TDUP 初值之后的动态 record/数组交错写同样逐项核对
-//! table+1，再由字段 owner 恢复数组前缀与开放尾；初始 nil 标记不当作可删除的普通字段。
-//! TDUP 动态 record 没有后续开放尾时也使用同一字段事务；共享声明 preview 负责
-//! 在消费暂存绑定后恢复后继同槽分配。Luau 多目标声明由 declarations 提供预留 top，
-//! 数组缓冲和 record 暂存均相对该 top 核对，不能把任意 table+2 当作可移动的空洞。
-//! 模板字段中的完整数组复用相同 allocation/Batch/缓冲查询；例如 `{nested={1,false}}`
-//! 仍在原字段 scratch 分配并填充子表，不因树已合并而跳过原数组准备，也不把它当成空表。
-//! Luau record 的源码 debug 声明只在原末次字段写后开始；Structure 发布该末端，
-//! Promotion 绑定原表 Def，当前单声明及分配来源再次匹配后才恢复 `local t={a=f()}`。
-//! scope 已开始后的 `t.a=f()` 没有该证书，不能借相同名字或槽位并回初始化。
+//! 构造器 owner 提供字段/批次角色，Promotion 提供原操作槽，FrameBuilder 统一
+//! 核对 Def 版本与事件顺序；字段持有值不代表原 scratch 根可以提前退休。
+//! 例如 t={}; v=f(); SETLIST t(v,g()...) 必须保留原固定缓冲与开放尾，
+//! 各 VM 的分配方式和槽布局在对应构造路径中验证。
 
 use super::*;
 use crate::hir::common::{HirBinding, HirRecordField};
 use crate::hir::simplify::table_constructors::{ConstructorWrite, TableBinding, constructor_write};
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
+/// 嵌套初始化的准备语句与字段写边界；二者都应留给完整构造事务。
+pub(super) struct NestedInitializers {
+    pub producers: BTreeSet<usize>,
+    pub writes: BTreeSet<usize>,
+}
+
 /// 只界定嵌套 initializer 的候选边界，不签发删除许可。定义边均指向较早语句，
 /// 反向一次传播所属 seed 下界，避免对每个父构造器重扫整个 producer 链。
-pub(super) fn nested_producers<'a>(
+pub(super) fn nested_initializers<'a>(
     stmts: impl Iterator<Item = Option<&'a HirStmt>>,
-) -> BTreeSet<usize> {
+) -> NestedInitializers {
     use crate::hir::simplify::mention::BindingReadCollector;
     let mut definitions = BTreeMap::<LocalId, usize>::new();
     let mut constructor_seeds = BTreeSet::new();
     let mut dependencies = Vec::<BTreeSet<usize>>::new();
     let mut owners = Vec::<Option<usize>>::new();
+    let mut writes = BTreeSet::new();
     for stmt in stmts {
         let index = dependencies.len();
         let mut reads = BTreeSet::new();
@@ -78,6 +62,11 @@ pub(super) fn nested_producers<'a>(
             definitions.clear();
         }
         dependencies.push(reads);
+        if owner.is_some() {
+            // RK 常量字段没有单独 producer；仅查看前一条语句会把该写误当成
+            // 独立赋值终点，在候选拒绝时截断仍未完成的构造器准备区。
+            writes.insert(index);
+        }
         owners.push(owner);
     }
     let mut nested = BTreeSet::new();
@@ -90,7 +79,10 @@ pub(super) fn nested_producers<'a>(
             }
         }
     }
-    nested
+    NestedInitializers {
+        producers: nested,
+        writes,
+    }
 }
 
 /// 当前 proto 字面量出现数给出生成常量池的保守上界；不以原常量池编号猜重编译 RK。

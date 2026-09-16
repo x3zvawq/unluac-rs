@@ -1,18 +1,9 @@
-//! 把已证明的词法生命周期统一为 exclusive low 区间，供 plan body 原子物化。
+//! 将已证明的词法生命周期投影为 low 指令区间，供 plan body 原子物化。
 //!
-//! Close 区间来自捕获 cell 的真实 cleanup；debug 窗口来自共同结束的源码 binding：
-//! `local object = {}; local function use(x) end; use(object); debug-end` 恢复为一个 `do`。
-//! 窗口的新对象必须属于这些 binding，或有末端前必定覆盖/被调用排除的 scratch home；捕获 cell、
-//! open 值和跨窗口内部 SSA 使用仍拒绝。已在外层建立的源码身份可在窗口内更新；
-//! 末次调用后的纯尾部也只能更新这些外层身份。debug end 恢复槽复用边界，不表示 VM 已清空旧槽。
-//! 这里消费 Structure 的 debug 边界与 SSA/root 事实，不从 HIR 语句或 AST 形状猜作用域。
-//! callee 与其它 scratch 消费同一逐槽退休证书；调用帧保活不等于 caller 槽被清空。
-//! 普通 if/else 与完整循环可处于窗口内部；共享图区间查询证明唯一入口、出口，
-//! 冻结 plan 则保证两端仍在实际发射的指令前缀，不能切入已被表达式或循环语法吸收的位置。
-//! Def 与 Phi debug 声明共同构成槽前缀；例如 `do local a=f(); local ok=a==1;
-//! print(ok) end; g()` 中遗漏 ok 会错误拒绝 do，并使后继调用物化额外载体。
-//! Phi 同槽输入只证明该声明值的归属；旧 scratch 的覆盖另外核对全部真实输入写与必经
-//! 合流块，不把 Phi 本身当写。同一源码 scope 内的后续赋值保持原身份，其它覆盖仍拒绝。
+//! 消费 Structure 的 cleanup/debug 边界、SSA/root 与冻结发射域，验证唯一入口、
+//! 出口及值是否逃出窗口，不从 HIR 或 AST 外形猜作用域。
+//! 例如 local object={}; use(object); debug-end 可恢复为 do 块；debug end
+//! 只表示源码槽复用边界，不证明 VM 已清空旧根。
 
 use std::ops::Range;
 

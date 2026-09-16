@@ -1,16 +1,8 @@
-//! 这个文件负责 Structure 层的总调度。
+//! 编排 Structure 层的分析顺序并汇总结果。
 //!
-//! 各类候选的提取规则已经拆到独立模块里，避免结构层继续膨胀成单个巨型文件；
-//! 这里仅保留“先准备底层事实，再按顺序汇总结构候选”的壳。
-//!
-//! 它从主 pipeline 的 `DecompileState` 读取 low-IR，依次写回 CFG、GraphFacts、
-//! Dataflow 和 StructureFacts；它不会越权恢复 HIR/AST 语法，只负责调度结构层内部
-//! 分析并汇总结果。
-//!
-//! 例子：
-//! - 一个 proto 如果同时包含 loop、branch 和 short-circuit 候选，这里会先提 loop/
-//!   branch 骨架，再在同一套共享事实上继续推 short-circuit、region、scope 和 goto 约束
-//! - 子 proto 会递归走完全相同的结构分析顺序，保证父子层结构事实口径一致
+//! 从 DecompileState 读取 low-IR，建立 CFG、GraphFacts、Dataflow 和
+//! StructureFacts；loop/branch 等候选的具体规则由各自模块负责，不在这里恢复
+//! HIR/AST 语法。父子 proto 使用同一分析顺序和事实口径。
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};

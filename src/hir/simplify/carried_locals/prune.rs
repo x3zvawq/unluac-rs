@@ -1,19 +1,9 @@
-//! carried-local 收敛后的冗余赋值裁剪。
+//! 裁剪 carried-local 收敛后已证明冗余的赋值。
 //!
-//! handoff owner 在主模块里完成语义判断；这个模块只删除已经由 owner 或局部控制流证明
-//! 无效的复制。除了单目标 `x = x`、空 assign、直接 binding 的整句 `x, y = x, y`，
-//! 还收回分支 arm 中“支配初值之后没有任何 binding 写入”的 `target = temp` 快照：
-//! `local target = temp; if cond then target = temp end` 变成只保留初值声明。
-//! 分支规则在每个 arm 独立维护已证明的 `(local -> temp)` 状态，并让循环入口状态收敛到
-//! 首轮入口与所有自然/continue 回边的交集；它不会跨未知 goto 或 reference capture 猜测。
-//! debug 身份直接查询 proto 的 canonical 映射；删除已证明的重复写不更新状态，语句列表
-//! 按原顺序传播事实并只压缩一次，避免每个重复写都搬移整个尾部。相邻复制裁剪也保留
-//! 上一条存活语句的已分类关系；删除项不改变邻接事实，非复制语句则清空它。
-//! 原调用准备 COPY 消费 Promotion 的身份索引并保留到完整调用帧事务；单纯值相等
-//! 不证明该准备写多余，例如 `v=callee; callee=v; callee()` 仍有独立的 caller 槽责任。
-//! 多目标赋值默认仍不拆分；唯一例外是这里证明过的 dead loop-carrier mirror 分量：
-//! 被删 RHS 只能是纯 `LocalRef`，且目标 temp 的每一次写都必须属于同一 active-for、
-//! same-sole-possible-home 删除事务，因此不会留下旧值写而改变并行求值、副作用或 GC root 行为。
+//! 消费 handoff owner 的身份保护与局部路径事实，处理自复制、空赋值及重复快照，
+//! 不以值相等代替物理写入证明。原调用准备 COPY 留给完整调用帧 owner。
+//! 例如 local t=v; if c then t=v end 在路径上没有相关写入时可只保留初值；
+//! dead loop-carrier mirror 的分量删除另有完整 same-home 事务。
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,14 +1,8 @@
-//! 这个文件负责串起 Naming 主流程。
+//! 编排 Naming 的证据收集、候选生成和名字分配。
 //!
-//! Naming 现在已经拆成多个关注点模块：
-//! - evidence：从 HIR 收集捕获来源
-//! - lexical：从 AST 重建定义点可见域
-//! - validate：保证 Readability 已经收敛到 Naming 可消费的边界
-//! - hints：从 AST 结构收集稳定 hint
-//! - strategy：把证据和 hint 组合成候选名字
-//! - allocate：做最终分配与冲突消解
-//!
-//! 这里刻意只保留 orchestrator，避免再次把所有逻辑重新堆回一个巨型文件。
+//! evidence 提供 HIR 捕获来源，lexical/validate 确认 AST 可见域与消费边界，
+//! hints/strategy 生成候选，allocate 完成分配和冲突消解。本模块只串联这些阶段，
+//! 不重建各 owner 的规则。
 
 use crate::ast::AstModule;
 use crate::decompile::{DecompileContext, DecompileError, DecompileState};

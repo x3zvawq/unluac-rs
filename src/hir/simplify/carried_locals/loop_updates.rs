@@ -1,21 +1,9 @@
-//! 循环内 `next -> carried` 写回的窄化折叠。
+//! 将循环中的 next -> carried 机械写回收敛为原状态绑定。
 //!
-//! 结构计划会保留 SSA 中“本轮新值”和“下轮 carried 值”的独立身份。局部提升后，
-//! 若循环中途 `break`/`return`，这种身份边界通常表现为
-//! `local next = f(carried)`，并在循环尾写回 `carried = next`。当 local 身份在循环外
-//! 已死时可以直接复用 carried；repeat 的 next-value 若只是唯一的尾部 temp，则还可在
-//! 所有路径必经写回、后缀无状态改写与词法跳转的前提下，把条件和 live-out 一并归回
-//! carried。
-//!
-//! 该规则依赖结构化 loop、binding mentions/capture/TBC 身份和 promotion 提供的精确
-//! `(slot, close epoch)`；它不重新推断 loop owner，也不会跨 distinct slot 移动可观察状态。
-//! 相邻 `next = carried + 1; carried = next` 可直接收回；中间若有 `guard = xs[next]` 之类
-//! consumer，则只有 next/carried 同一 home-slot、consumer 不提旧 carried 且没有控制转移时，
-//! 才恢复为 `carried = carried + 1; guard = xs[carried]`。capture、for binding、TBC、提前退出
-//! 或 label barrier 均保留原形。旧 local 形状即使尾写回前只有提前退出，也必须有同一可信
-//! home；compaction 标志和不与该 home alias 的 cleanup 不改变这项 slot/epoch 证明。
-//! local fold 的 apply 会在任何修改前重验 seed 与尾写回；只有完整提交才返回 changed，避免
-//! candidate 形状漂移污染 fixed-point 信号。
+//! 消费结构化 loop、binding mention/capture/TBC 与 Promotion 的精确 home；
+//! 不重建循环归属，也不跨不同物理槽移动状态。
+//! 例如 next=carried+1; carried=next 在身份和路径证明成立时可直接更新 carried；
+//! 中间存在读取、提前退出或 repeat 条件时，由对应事务证明整个消费区。
 
 use std::collections::{BTreeMap, BTreeSet};
 

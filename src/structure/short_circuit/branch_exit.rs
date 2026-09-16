@@ -1,22 +1,8 @@
-//! 这个文件负责“条件出口型”短路候选提取。
+//! 提取直接流向整体真假出口的短路条件链。
 //!
-//! 它解决的是 `if a and b then ... end`、`if a or b then ... end`，以及
-//! `if a or b then ... else ... end` 这类最终直接流向“整体为真/整体为假”两个出口的
-//! 形状。这里特意不碰 value merge，让“条件出口识别”和“值合流 DAG 提取”各自拥有
-//! 单一职责。
-//!
-//! 它依赖 branch 候选、支配/后支配关系和共享线性跟随规则，只负责回答
-//! “这一串判断是不是一个纯条件出口短路”；它不会越权去拆 phi，也不会替 value merge
-//! 做值来源分类。
-//!
-//! 例子：
-//! - `if a and b then return end` 会产出“整体真时流向 then、整体假时流向 fallthrough”的
-//!   短路候选
-//! - `if a or b then body() end` 会产出“整体真时进入 body、整体假时直接跳过”的候选
-//!
-//! `IfElse` 链的每个 root 都可能看到同一条长后缀，因此前缀选择只前向扫描一次：
-//! 增量维护当前前缀的外部出口计数和严格真假出口约束，仍保留最长候选及其原始
-//! strict-before-relaxed 优先级，最后才构造 nodes/blocks。
+//! 消费 branch 候选、支配/后支配与共享线性跟随规则，发布条件出口候选；
+//! 不拆 phi，不承担 value-merge 的值来源分类。
+//! 例如 if a or b then body() end 的真出口进入 body，假出口直接跳过。
 
 use std::collections::{BTreeMap, BTreeSet};
 

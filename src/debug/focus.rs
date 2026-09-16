@@ -1,27 +1,8 @@
-//! 这个文件承载所有 dump 层共享的「聚焦 proto + 限深展开」模型。
+//! 为各 dump 层提供统一的 proto 聚焦、限深展开计划和 summary 格式。
 //!
-//! 为什么要有这个文件：
-//! - `tests/case_*/*.lua` 里一个根 proto 常嵌十几个子 case proto，
-//!   旧的 `DebugFilters::proto` 只能做「全量」或「只看那个 proto」两档，
-//!   导致默认 dump 爆炸、传 `--proto` 又看不到子 proto 存在性。
-//! - 我们需要一个跨所有 dump 层统一的「聚焦」模型：给定焦点 proto 和
-//!   向下展开的层数，计算出哪些 proto 要完整渲染、哪些用一行 summary 占位。
-//! - 把这个计算下放到每个 dump 层各自写一份会产生漂移，尤其容易在「什么时候
-//!   该打 elided 行」上出 bug，所以集中到这个文件，让每层传一颗 proto 树就行。
-//!
-//! 这个文件不承担业务事实的查询：各层自己决定在 elided 行里填哪些字段，
-//! 这里统一树形产物的前序调试身份、focus 计划及 summary 格式，不转换业务 proto id。
-//! `collect_proto_tree` 仅借用原对象，children 回调保留各层的树结构；例如根的第二个子树
-//! 会在第一个子树遍历完成后编号。HIR/AST 的扁平 id 映射仍由各层投影到 focus 节点。
-//!
-//! 输入形状 -> 输出形状例子：
-//!   protos=[(id=0, parent=-), (id=1, parent=0), (id=2, parent=1)]
-//!   filters={ proto=None, proto_depth=Fixed(0) }
-//!     -> FocusPlan{ focus=Some(0), visible={0}, elided_at=[1] }
-//!   filters={ proto=Some(1), proto_depth=Fixed(0) }
-//!     -> FocusPlan{ focus=Some(1), visible={1}, elided_at=[2], ancestors=[0] }
-//!   filters={ proto=None, proto_depth=All }
-//!     -> FocusPlan{ focus=Some(0), visible={0,1,2}, elided_at=[] }
+//! 各层传入自身 proto 树并提供业务字段，本模块统一前序调试身份及可见/省略节点，
+//! 不转换业务 proto id。这样各层对同一焦点和深度使用一致的展开边界。
+//! 例如选择 proto 1、深度 0 时，完整显示 1，其子树只显示 summary。
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -143,6 +124,10 @@ impl FocusPlan {
 ///
 /// 当 `focus` 指向的 id 不存在时，返回空 plan：所有 proto 都被隐藏，
 /// 调用方应显示类似 `<no proto matched filters>` 的提示。
+///
+/// 对链 0 -> 1 -> 2：默认焦点、深度 0 得 visible={0}, elided_at=[1]；
+/// 焦点 1、深度 0 得 visible={1}, elided_at=[2], ancestors=[0]；
+/// 深度 All 则从所选焦点完整展开。
 pub(crate) fn compute_focus_plan(nodes: &[ProtoNode], filters: &FocusRequest) -> FocusPlan {
     if nodes.is_empty() {
         return FocusPlan::default();

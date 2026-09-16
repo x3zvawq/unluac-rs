@@ -1,20 +1,9 @@
-//! 这个文件负责 `locals` pass 内部的 if/else fallthrough 赋值汇总。
+//! 汇总 if/else 合流后的必写 temp，供 locals 建立稳定绑定。
 //!
-//! 主 pass 在普通 temp 链之外，还需要识别一种稳定形状：`if` 的 then/else 两侧都给同一个
-//! temp 赋值，合流之后又继续读取这个 temp。这里会把这种 temp 报告给主 pass，让主 pass
-//! 在 if 前分配一个空 local，再由两条分支写回同一个 binding。
-//!
-//! 本文件消费共享 `HirFlowGraph` topology/worklist、当前 HIR 语义事件和 `RootEventBlock`，
-//! 只声明 must 状态的 transfer/intersection，不自行解析 label/goto/loop，也不分配 local、
-//! 不改写语句。分支摘要同时
-//! 维护“所有合流路径都已写入”和“首次写入前可能读取”，因此主 pass 只会在声明可以
-//! 支配所有读取时接受候选。global 声明只向全局名字提交写入，它的 RHS temp 读取仍纳入
-//! read-before-def；不会因为 AST-owned 声明身份而丢掉同 arm 后续的 temp must-def。常真
-//! while 还会汇总所有 break 出口的 must-def；普通 while 保留零次执行路径，不会把 body
-//! 写入误报成 loop fallthrough 写入。
-//!
-//! 输入形状：`if c then t1 = a else t1 = b end; use(t1)`。
-//! 输出形状：候选 temp 集合 `{ t1 }`，后续由主 pass 物化成 `local l; if c then l = a else l = b end`。
+//! 消费 HirFlowGraph、当前 HIR 事件和 RootEventBlock，只计算 must-write 与
+//! read-before-def，不自行解析控制边，也不分配 local 或改写语句。
+//! 例如 if c then t=a else t=b end; use(t) 报告候选 t，主 pass 再在 if 前
+//! 建立空 local；候选必须保证该声明能支配全部读取。
 
 use std::collections::BTreeSet;
 
@@ -223,6 +212,7 @@ impl<'a> RegionTempFlow<'a> {
 }
 
 fn temp_flow_event(kind: HirFlowNodeKind<'_>, safety: HirExprSafety) -> TempFlowEvent {
+    // GlobalDecl 只写全局名字，但 RHS 仍可先读 temp；不能因不是 Temp Assign 就漏掉读取。
     let mut collector = TempReadCollector::default();
     kind.visit_evaluation(&mut collector);
     let reads = collector.temps;

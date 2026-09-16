@@ -1,20 +1,8 @@
-//! carried-local seed handoff 的逐条折叠策略。
+//! 收敛 fallback block 中的 seed 复制、多目标 alias 和更新后交接。
 //!
-//! 这个模块处理 fallback block 中形如 `assign t = local/temp`、多目标 alias handoff、
-//! 以及 `assign next = state + 1; ... state = next` 的更新后交棒。它依赖当前块的
-//! temp touch 索引、边界 goto 判断和 binding rewrite 工具；不负责递归遍历，也不负责
-//! label/goto mesh 的全局等价类收敛。source/target 若承载 capture/TBC 身份或可能与其
-//! 共用物理 home，会在父模块冻结的 proto 身份事实下保留原形。任何把 temp 的求值提前
-//! 写入已有 binding 的 handoff 还必须证明两端属于相同的 `(slot, close epoch)`，避免改变
-//! 弱表、`__gc` 或异常 cleanup 可观察到的旧值存活期。
-//! seed 与 suffix 作为一个事务提交：seed 的替换形状先在副本上冻结，suffix rewrite 命中后
-//! 才执行不可失败的替换或删除，避免 plan/apply 漂移留下半提交状态。
-//!
-//! 例子：
-//! - 输入：`assign t = s; ... t = t + 1`
-//! - 输出：`... s = s + 1`
-//! - 输入：`assign tA, tB, keep = sA, sB, 0; ... assign sA, sB = tA, tB`
-//! - 输出：`assign keep = 0; ...`
+//! 消费当前块的 temp-touch、goto 边界与父模块冻结的身份保护，证明同 home/epoch
+//! 后原子改写 seed 和 suffix；不负责递归或 label/goto mesh 的全局等价类收敛。
+//! 例如 assign t=s; ... t=t+1 在原 s 不再被分别观察时，可归回 s 的状态写入。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -155,6 +143,7 @@ fn try_collapse_pure_binding_handoffs(
         return false;
     }
 
+    // 先冻结 seed 的替换形状，suffix 改写后只做不可失败的提交，避免留下半次交接。
     let rewritten_seed = if seed.retained_pairs.is_empty() {
         None
     } else {

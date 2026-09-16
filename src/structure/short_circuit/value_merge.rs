@@ -1,22 +1,9 @@
-//! 这个文件负责“值合流型”短路 DAG 提取。
+//! 提取在 merge block 合成结果值的短路 DAG，并发布叶值来源。
 //!
-//! 它解决的是 `local x = a and b or c`、`local y = (a and b) or (c and d)` 这类
-//! 最终在 merge block 合成一个值的短路形状。这里会把 `phi -> 叶子 defs` 的来源
-//! 直接前移成 `StructureFacts`，避免 HIR 再回头拆 `phi.incoming`。
-//!
-//! 它依赖 branch 骨架、Dataflow phi 和共享短路跟随规则，只负责产出值合流候选与
-//! merge 前的来源事实；它不会越权决定最终是 `a and b or c`、`if + assign` 还是
-//! generic phi 物化。
-//! 递归 phi 身份由 canonical Dataflow 图事实提供，此处不重新计算分量。
-//! 值叶按真实出边读取同一 SSA incoming 索引，不按前驱块反复扫描整个 merge。
-//!
-//! 例子：
-//! - `local x = a and b or c` 会产出一个 `merge=#... result_reg=x` 的 value-merge 候选
-//! - `local y = (a and b) or (c and d)` 会允许多个失败路径汇到同一 merge，而不是强行
-//!   压回线性链
-//! - 如果某个判断链里存在回边或 merge 不受 root 支配，这里会直接放弃候选
-//! - 候选 root 只从 merge 的严格支配祖先中枚举，并在构建完整 DAG 前排除首跳
-//!   已不可能汇入当前 phi 的分支，避免大函数中的交叉扫描
+//! 消费 branch 骨架、Dataflow phi 与共享图规则，将 incoming 关系前移为
+//! StructureFacts；最终表达式或赋值语法仍由 HIR 决定。
+//! 例如 (a and b) or (c and d) 可以共享 continuation，无须压成线性条件链；
+//! 递归 phi 的身份由 Dataflow 提供，不在本层重算。
 
 use std::collections::{BTreeMap, BTreeSet};
 

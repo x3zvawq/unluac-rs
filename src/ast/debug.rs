@@ -1,25 +1,8 @@
-//! AST 层的人类可读 dump。
+//! 渲染 AST、Readability 和 Naming 的人类可读调试输出。
 //!
-//! 聚焦策略：AST 已经把闭包内联成 `AstFunctionExpr` 表达式，天然是一棵嵌套的
-//! 函数树。我们把每个 `AstFunctionExpr.function.0`（= HirProtoRef 内部的 proto
-//! DFS id）当作该函数在聚焦语义里的稳定 id，模块本身等同 `module.entry_function`
-//! 对应的 proto，因此 `--proto`、`--proto-depth` 在 AST/Readability 层直接复用
-//! parser / HIR 一路沿用的 proto 编号。
-//!
-//! 实现上：
-//! - 先 DFS 收集本模块可见的 `(proto_id, parent_proto_id)` 对，交给
-//!   `src/debug/focus.rs::compute_focus_plan` 得到 `FocusPlan`。
-//! - 把 "可见 / elided" 的 proto id 塞进 thread-local，避免把一个 `&FocusPlan`
-//!   参数沿着十几层 `format_*` helper 往下传。thread-local 在 WASM 单线程模型下
-//!   行为与普通 static 一致，同时被 guard 对象限定在一次 dump 调用里。
-//! - `format_function_expr` 以及 `write_block` 里直接渲染 FunctionDecl 的两条
-//!   分支，统一在渲染 body 前查询 thread-local：不可见的函数退化为一行
-//!   `function(...) --[[ body elided proto#K ]] end` 占位。
-//!
-//! stage dump 入口直接从主 pipeline state 读取 AST / Readability / Naming 产物并
-//! 拼成一个 AST 层输出。选择不在 generate 层做 elision 的原因：generate 层产出的是最终 Lua 源码，
-//! 对它做局部截断会输出非法语法。对于"只看某个函数最终长什么样"的需求，用
-//! `--stop-after ast --proto N` 得到的函数形状已足够；generate 层改为整文件直出。
+//! 使用 AST 保留的 HirProtoRef 身份与共享 focus 计划，按 --proto/--proto-depth
+//! 展开函数，其余 body 显示 elided 占位。截断仅用于 dump；Generate 负责完整的
+//! 最终 Lua 源码，不能套用这里的省略策略。
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,8 +52,8 @@ struct AstFocusState {
 }
 
 thread_local! {
-    /// dump 期间共享的聚焦状态。WASM 只有单线程，行为与普通 static 一致；
-    /// `AstFocusGuard` 保证每次 dump 结束后被清空，避免影响后续调用。
+    /// 在格式化 helper 间共享本次 dump 的聚焦状态，避免逐层传递 FocusPlan。
+    /// AstFocusGuard 在 dump 结束时清空状态，避免影响后续调用。
     static AST_FOCUS: RefCell<AstFocusState> = RefCell::new(AstFocusState::default());
 }
 

@@ -462,6 +462,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["aggregate", "closure-effect", "gc-root", "metamethod"],
         "用四段运行探针覆盖聚合 holder 后加入 child 的持有传播、__index 暴露 key、已知 closure 的 capture escape、repeat 条件查询传递持有边，以及并行交换后的对象身份。",
         &[LuaCaseConfiguration::new(&[
+            LuaCaseDialect::Lua51,
             LuaCaseDialect::Lua54,
             LuaCaseDialect::Lua55,
         ])],

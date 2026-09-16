@@ -1,35 +1,9 @@
-//! 这个文件承载 HIR 内部给 simplify 使用的 promotion facts。
+//! 将 analyze 阶段的物理来源与协议事实带给 HIR simplify。
 //!
-//! `locals` pass 只看 HIR 语法本身时，能判断“哪些 temp 正在沿别名链流动”，却不知道
-//! “这个 temp 最早来自哪个词法槽位”。一旦某个 local 已经被 closure reference capture，
-//! 后续同一词法槽位的新 def 就不该再长成新的 local，而应继续写回原绑定；按值 capture
-//! 只保存当前快照，不激活这条 sticky 身份。`close` 之后复用同一个寄存器号已经是新的
-//! 词法槽位，不能继续沿用旧 upvalue 的 local。
-//!
-//! 这里专门把那份“temp -> home slot”事实从 analyze 阶段带给 simplify：
-//! - 它依赖 Dataflow 已经给出的 fixed def/reg 与 phi incoming 身份，以及
-//!   Transformer 保留下来的 `close from rX` 词法边界
-//! - 它不会重新做结构恢复，也不会把事实暴露成公开 HIR API
-//! - 例子：`t0(slot 0, epoch 0)` 被闭包 capture 之后，后续同 epoch 的
-//!   `t7(slot 0, epoch 0)` 与同槽 phi 会被 locals 认成同一个源码 local 的写回；
-//!   若中间经过 `close from r0`，后续 `t8(slot 0, epoch 1)` 会被视为新的词法槽位
-//! - carried-local 后续若把不同 home 的 binding 并入同一目标，会失效单一 home
-//!   的正向 provenance，但保留完整有限的可能 home 并集；未知来源则传播未知。原始
-//!   物理槽事实仍保留给 capture/TBC 等负向保护
-//! - root 观察期间的有效槽位只消费 Dataflow 的 `RootObservation`；这里负责路径闭合和
-//!   producer/endpoint 配对，不重建 CALL、TFORCALL、TBC 的 VM 栈协议
-//! - 由 `NewTable` canonical def 直接产生的 temp 单独保留 constructor origin；MOVE、
-//!   phi 或后续 local 物化不能冒充分配本身
-//! - 覆盖前的非资源值按 canonical def 保存为入口 nil 或已定义 scalar；例如 LOADNIL
-//!   的 temp 被后续 HIR 内联删除，下一次 MOVE 仍能证明没有旧对象需要释放
-//! - ordinary CALL 参数交接沿 Dataflow SSA 固定前缀与 caller 边界发布到具体调用，
-//!   例如 `f({})` 的参数 home 不得在后层被重建成调用后继续持有的 caller root
-//! - possible/complete home query 借用已有集合；定义写需要补充新 home 时才复制。
-//!   跨 provenance 改写保存来源的 owner 显式取得 owned 快照，不让后层缓存整份映射。
-//! - 显式 TBC 的 origin 直接对应注册点的物理 home；值经 phi/alias 合并后的来源 epoch
-//!   不等于注册时的槽身份，后层不从当前 value 反推资源槽。
-//! - 同值条件结果绑定原分配/CALL Def 和延后写回的结果身份；纯值化简可丢弃测试引用，
-//!   完整 initializer 仍可消费原关系。例如 `({f()}) and 7 or 7` 不能提前填写结果槽。
+//! 消费 Dataflow 的 Def/phi、root observation 及 Transformer 的 close 边界，
+//! 保存 temp 的 home、捕获身份和原操作来源；不重新恢复结构，也不作为公开 HIR API。
+//! 例如 t0 与 t7 同属 (slot 0, epoch 0) 时可由 locals 复用绑定，close 后的 epoch 1
+//! 必须独立。合并不同 home 后失效单一来源的正向证明，可能 home 集仍服务负向保护。
 
 mod call_roots;
 mod comparison_preparations;

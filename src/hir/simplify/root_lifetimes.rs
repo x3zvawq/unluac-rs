@@ -1,36 +1,10 @@
-//! 这个文件识别普通 HIR 值活跃性看不到的物理槽 root 生命周期。
+//! 为 HIR call、allocation、lookup 和 copy 建立物理根生命周期与覆盖配对。
 //!
-//! fixed call result（包括已物化 local）、table allocation，以及已跨后续观察点的
-//! table/global lookup 与动态运算结果，即使没有 HIR 读取，也会在同一 stack home 被覆盖前继续充当
-//! VM GC root。ordinary call 的参数槽由前层标记交接给 callee，只有当前唯一 producer 与
-//! call 参数端点仍匹配时才退休 call/lookup/allocation 的对应 home，不能把 callee 可覆盖的槽
-//! 物化为额外 caller local。例如 `object = make(); f(object)` 的参数副本结束于 f，原槽
-//! 则仍需保活至自己的覆盖点；两者共享值身份，不共享物理根终点。
-//! 内嵌 method lookup/call 保留原 SELF 配对时，callee 槽已覆盖旧 receiver，首参另行
-//! 交接；`subject.worker:touch()` 不把已结束的低槽根延续到下一次字段读取。显式 local
-//! receiver 的异槽根和已经签发的独立保活事务不由这条协议退休。
-//! Promotion 另会发布普通 copy root 的单结果 call + 紧邻 MOVE 终点；本层只按 producer / endpoint
-//! temp 与 overwritten home 完整匹配，把它接入同一 local-owner handoff，不从 HIR 相邻文本猜 opcode。
-//! 参数 COPY 也消费已有精确覆盖证书：`copy=parameter; weak[1]=copy; lookup(); copy=nil`
-//! 中 lookup 可改写 parameter，故 copy 必须作为独立根保持到原 nil；先前槽为 nil 不免除这项义务。
-//! allocation 的原覆盖配对不依赖当时是否逃逸：`t={child={}}; publish(t.child)` 中
-//! 子表可以晚于旧槽覆盖才被外部观察。是否消除独立物化由消费事务的完整证明决定。
-//! copy 共享值 identity，
-//! 但每个目标 home 都是独立 root transaction；同一 parallel overwrite 可终止多个 home，
-//! 消费者只能把 producer 与同 home 的精确覆盖配对。
-//! 已物化的槽每次写入后继续到新值自己的覆盖点，call/copy/allocation 共用此链；
-//! `call result -> LocalRef -> callee MOVE` 不需要证明三个值相等。
-//! 分析只在单个 block 内追踪；只有 nested structure 不写 active home，且没有 opaque transfer
-//! 或 cleanup 边界时才允许穿过。循环内的 break/continue 由共享 HIR 词法树判定归属，
-//! 不清除循环外 home 的配对。消费者可以保留已配对的两次 materialization，也可以在
-//! 更窄的改写仍保持同一覆盖事务时，连同 owner 已证明的 physical home 一起消费该 pair。
-//! 同值 frame-end copy 的覆盖证明同时消费前层非资源旧值与两个完整 root transaction，
-//! 并复核当前 HIR 未改写 home；删除副本的 owner 必须物化原值根，不能只抹掉负向标记。
-//! 潜在求值事件与分支覆盖值的 GC 惰性统一消费入口按目标方言构造的表达式安全上下文。
-//! 同一语句快照的读写、参数交接与 GC fence 索引由 RootLifetimeFacts 共享；借用期间
-//! 不允许改写语句，例如 locals 可用同一快照分别配对 call 与 lookup 的覆盖端点。
-//! 两类端点共用 producer/home 身份，前缀查询只投影已保活且在边界前正向闭合的事务；
-//! locals 据此建立一次成员索引，不按每个候选重扫语句前缀。
+//! 逻辑上没有读取的值仍可能在原 stack home 中充当 GC root。本模块消费 Promotion
+//! 冻结的 producer、home 和端点，并结合当前 HIR 事件证明配对；不从相邻语句猜 VM 协议。
+//! 例如 object=make(); f(object) 的参数副本可交给 callee，object 的独立低槽根
+//! 仍须活到自己的覆盖点。消费者只能在保持完整覆盖事务时消除物化。
+//! RootLifetimeFacts 属于当前语句快照，借用期间不得改写对应树。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -2571,6 +2545,9 @@ impl HirVisitor<'_> for LocalUseCollector {
     }
 }
 
+/// 同一 block 的只读事件快照，供多个覆盖查询共享；语句改写后必须重建。
+/// 穿过嵌套结构仍须证明 active home 未写且没有 opaque transfer/cleanup 边界，
+/// 不能把词法上相邻的两个端点直接当作同一次覆盖事务。
 pub(super) struct RootLifetimeFacts<'a> {
     stmts: &'a [HirStmt],
     uses: TempUseEvents<'a>,

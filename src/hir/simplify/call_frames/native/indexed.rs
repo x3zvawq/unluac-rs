@@ -9,9 +9,25 @@
 //! 必须先保存 t.a 再执行 RHS；低槽动态 key 则保持原 SETTABLE 的直接读取时点。
 //! 固定字段 key 的 CONCAT 共用标量 RHS 事务；`self.value=a..":"..b` 的整个原
 //! 连续输入区由 CONCAT 重发，不能把每轮编译产生的 COPY 当作额外源码声明保留。
+//! 字段读取 RHS 与内嵌常量写也消费同一左值快照协议；如 `weak[1]=holder.inner.child`
+//! 保持先 GETUPVAL、后 RHS，再 SETTABLE，`holder.inner.child=nil` 则不新增 RHS 准备槽。
 
 use super::*;
 use crate::hir::common::{HirAssign, HirBinaryOpKind, HirExpr, HirTableAccess};
+
+/// 仅用于识别完整赋值候选；原结果槽、RK 与左值准备仍由 plan 验证。
+pub(super) fn is_rhs_candidate(value: &HirExpr) -> bool {
+    matches!(
+        value,
+        HirExpr::Binary(_)
+            | HirExpr::TableAccess(_)
+            | HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_)
+    )
+}
 
 pub(super) fn is_candidate(assign: &HirAssign) -> bool {
     matches!(
@@ -44,21 +60,19 @@ pub(super) fn plan(
         return None;
     };
     let layout = facts.native_table_write_layout(access)?;
-    let value_home = layout.value?;
-    let (binary, result_local) = match value {
-        HirExpr::Binary(binary) => (binary.as_ref(), None),
+    let (rhs, result_local) = match value {
         HirExpr::LocalRef(local) => {
-            let (target, HirExpr::Binary(binary)) = scalar_local(run.last()?)? else {
-                return None;
-            };
+            let (target, rhs) = scalar_local(run.last()?)?;
             if target != *local {
                 return None;
             }
-            (binary.as_ref(), Some(*local))
+            (rhs, Some(*local))
         }
-        _ => return None,
+        value => (value, None),
     };
-    if binary.op != HirBinaryOpKind::Concat || layout.key.is_none() {
+    if !matches!(rhs, HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Concat)
+        || layout.key.is_none()
+    {
         return scalar_rhs(
             context,
             run,
@@ -66,10 +80,14 @@ pub(super) fn plan(
             dialect,
             access,
             value,
-            binary,
+            rhs,
             result_local,
         );
     }
+    let HirExpr::Binary(binary) = rhs else {
+        return None;
+    };
+    let value_home = layout.value?;
     let key_home = layout.key?;
     if facts.operation_result_home(binary.source_site?) != Some(value_home)
         || value_home != HomeSlotKey::new(key_home.slot() + 1, 0)
@@ -179,45 +197,79 @@ fn scalar_rhs(
     dialect: DecompileDialect,
     access: &HirTableAccess,
     value: &HirExpr,
-    binary: &crate::hir::common::HirBinaryExpr,
+    rhs: &HirExpr,
     result_local: Option<LocalId>,
 ) -> Option<Plan> {
-    if !matches!(
-        binary.op,
-        HirBinaryOpKind::Add
-            | HirBinaryOpKind::Sub
-            | HirBinaryOpKind::Mul
-            | HirBinaryOpKind::Div
-            | HirBinaryOpKind::Mod
-            | HirBinaryOpKind::Pow
-            | HirBinaryOpKind::Concat
-    ) {
-        return None;
-    }
     let layout = facts.native_table_write_layout(access)?;
-    let value_home = layout.value?;
-    if facts.operation_result_home(binary.source_site?) != Some(value_home) {
+    let source = match rhs {
+        HirExpr::Binary(binary)
+            if matches!(
+                binary.op,
+                HirBinaryOpKind::Add
+                    | HirBinaryOpKind::Sub
+                    | HirBinaryOpKind::Mul
+                    | HirBinaryOpKind::Div
+                    | HirBinaryOpKind::Mod
+                    | HirBinaryOpKind::Pow
+                    | HirBinaryOpKind::Concat
+            ) =>
+        {
+            Some(binary.source_site?)
+        }
+        HirExpr::TableAccess(read) => match read.sources {
+            crate::hir::common::HirOperationSources::Single(source) => Some(source),
+            _ => return None,
+        },
+        HirExpr::Nil
+        | HirExpr::Boolean(_)
+        | HirExpr::Integer(_)
+        | HirExpr::Number(_)
+        | HirExpr::String(_)
+            if layout.value.is_none() && result_local.is_none() =>
+        {
+            None
+        }
+        _ => return None,
+    };
+    if let Some(source) = source
+        && facts.operation_result_home(source) != Some(layout.value?)
+    {
         return None;
     }
-    let mut builder = frame_builder(context, run, facts, dialect, value_home.slot())?;
-    // 只有 SETTABLE 的唯一原 GETTABLE Def 才是可消费的左值快照；多次读取的现成表仍是低槽变量。
+    let mut builder = frame_builder(
+        context,
+        run,
+        facts,
+        dialect,
+        layout.value.unwrap_or(layout.base).slot(),
+    )?;
+    // 只有 SETTABLE 的唯一原读取 Def 才是可消费的左值快照；多次读取的现成表仍是低槽变量。
     let snapshot = match &access.base {
         HirExpr::LocalRef(local) => builder.definition(*local, run.len()).and_then(|index| {
-            let (_, source @ HirExpr::TableAccess(_)) = scalar_local(run[index])? else {
+            let (_, source @ (HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_))) =
+                scalar_local(run[index])?
+            else {
                 return None;
             };
             let (producer, home) = facts.table_write_base_preparation(access, source)?;
             (facts.promoted_local_for_temp(producer) == Some(*local)).then_some((producer, home))
         }),
-        HirExpr::TableAccess(_) => facts.table_write_base_preparation(access, &access.base),
+        HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) => {
+            facts.table_write_base_preparation(access, &access.base)
+        }
         _ => None,
     };
     let base = if let Some((_, home)) = snapshot {
-        if home != layout.base || value_home != HomeSlotKey::new(home.slot() + 1, 0) {
+        if home != layout.base
+            || layout
+                .value
+                .is_some_and(|value_home| value_home != HomeSlotKey::new(home.slot() + 1, 0))
+        {
             return None;
         }
         home
     } else {
+        let value_home = layout.value?;
         if builder.direct_home(&access.base) != Some(layout.base)
             || layout.base.slot() >= value_home.slot()
         {
@@ -259,19 +311,34 @@ fn scalar_rhs(
         access.base.clone()
     };
     let value = if result_local.is_some() {
-        builder.expr(
+        let previous = builder.register_operand;
+        if matches!(rhs, HirExpr::TableAccess(_)) {
+            builder.register_operand = true;
+        }
+        let rebuilt = builder.expr(
             value,
             run.len(),
-            value_home.slot(),
+            layout.value?.slot(),
             None,
             false,
             true,
-            facts.operation_result_temp(binary.source_site?),
-        )?
-    } else if binary.op == HirBinaryOpKind::Concat {
-        builder.concat(binary, run.len(), value_home.slot())?
+            facts.operation_result_temp(source?),
+        );
+        builder.register_operand = previous;
+        rebuilt?
     } else {
-        builder.puc_arithmetic(binary, run.len(), value_home.slot())?
+        match rhs {
+            HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Concat => {
+                builder.concat(binary, run.len(), layout.value?.slot())?
+            }
+            HirExpr::Binary(binary) => {
+                builder.puc_arithmetic(binary, run.len(), layout.value?.slot())?
+            }
+            HirExpr::TableAccess(read) => {
+                builder.register_lookup(read, run.len(), layout.value?.slot())?
+            }
+            value => value.clone(),
+        }
     };
     let start = builder.first_event?;
     if builder.next_event != run.len() {

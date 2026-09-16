@@ -1,21 +1,8 @@
-//! 这个文件负责清理 HIR 里已经没有入边的机械 label。
+//! 删除 HIR 中没有 goto 引用且不再承担 cleanup 边界的机械标签。
 //!
-//! fallback label/goto body 会先给每个可能成为跳转目标的 block 发一个稳定 label。
-//! 但经过 close-scope 物化、branch/loop 恢复之后，入口块和大量中间 pad 的 label 往往
-//! 已经不再被任何 `goto` 命中。它们继续留在 HIR 里不仅会让源码多出 `::L0::` 这类
-//! 噪音，还会挡住后续 locals pass 对顶层 temp 的提升。
-//!
-//! 它依赖更前面的 HIR 结构恢复和 scope/loop pass 已经稳定了真正需要保留的 goto，
-//! 这里只做“没有任何引用”的 label 清扫，不重新判断控制流是否可结构化，也不会替
-//! 前层兜底重写 jump 目标。raw TBC/Close 尚未收敛时，同一直接 block 与 TBC epoch
-//! 内的 label 仍是 close-scopes 的 active-set 边界，因此延迟到资源 cleanup 被消费后
-//! 的下一轮再删除；其它 sibling/epoch 的机械 label 不受牵连。
-//!
-//! 例子：
-//! - `::L1::` 如果已经没有任何 `goto L1` 且不再承载 pending TBC 边界，这里会把它删掉
-//! - fallback body 里为了每个 block 都预发的 label，经过 branch/loop 吸收后只要
-//!   失去引用，就会在这里统一清理
-//! - 它不会删除仍被 `goto` 命中的 label，也不会主动合并 block 或改写 goto 结构
+//! 消费当前 label 引用与 pending TBC/Close 事实，不合并 block 或改写跳转目标。
+//! 例如无人引用的 ::L1:: 可删除；仍是 close-scopes active-set 边界的标签，
+//! 须等对应资源协议消费后再清理。
 
 use std::collections::BTreeSet;
 

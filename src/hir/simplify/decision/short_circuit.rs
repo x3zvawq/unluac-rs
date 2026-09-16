@@ -1,20 +1,9 @@
-//! 消费 Decision 已有的共享连边，把串联短路子图归约为单次求值表达式。
+//! 沿 Decision 共享连边归约短路子图，保持每个 test 的单次求值。
 //!
-//! 节点与 continuation 身份来自 HIR Decision，不能先复制成树再靠 AST 寻找共同尾。
-//! 只有唯一入边的 child 才能移入 parent；两节点共享的另一条出口保持原身份与极性。
-//! 例如 `a ? (b ? d : (c ? d : e)) : e` 中先合并 `b or c`，再恢复
-//! `a and (b or c) and d or e`（d 的真出口返回 CurrentValue）。每个 test 只移动一次，
-//! 对应路径上的调用顺序、条件执行及返回原值均不依赖纯表达式代数猜测。
-//! 纯 test 的布尔终端先按共享值域对齐极性：`d ? fallback : true` 可成为
-//! `not d ? CurrentValue : fallback`，从而保留共同失败尾。归约后的线性值链直接
-//! 消费当前节点，不丢弃已建立的共享事实后重新构造表达式树；物理根仍由其原 owner 证明。
-//! 已来自原 operand 的 Boolean test 可严格加外层 NOT 翻转连边，保留内部值运算：
-//! `a ? (not f() ? tail : (b ? CurrentValue : tail)) : tail`
-//! 恢复 `a and not not f() and b or tail`。
-//! If 极性和比较谓词不提供这种值来源证明，不能据此给未知调用插入 Boolean 覆写。
-//! 未知 CALL 只有在首次 lowering 对当前 test epoch 提供精确根终点证明时才能翻边；
-//! 例如 `a and not f() or fallback()` 的两个后继先覆盖原调用槽，而 `methods.next()`
-//! 的 __index 可在覆盖之前观察该槽，后者没有这种许可。
+//! 消费 HIR Decision 的节点与 continuation 身份，仅将唯一入边的 child 移入 parent；
+//! 不先复制成树，也不靠纯表达式代数猜调用顺序或物理根终点。
+//! 例如 a ? (b ? d : (c ? d : e)) : e 可先合并 b or c，再归约外层值链，
+//! 共同出口保留原身份与极性。
 
 use crate::hir::common::{
     HirDecisionNode, HirDecisionTarget, HirDecisionTestSource, HirExpr, HirUnaryExpr,

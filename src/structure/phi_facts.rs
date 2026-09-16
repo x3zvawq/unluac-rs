@@ -1,21 +1,9 @@
-//! 这个文件集中承载“StructureFacts 如何消费 Dataflow phi”的共享翻译规则。
+//! 为 StructureFacts 统一翻译 Dataflow phi 的 incoming 与值身份。
 //!
-//! `loops / branch_values / short_circuit` 都会把 `phi.incoming` 重新整理成更贴近
-//! 源码恢复的结构事实。如果每个 pass 都各自维护一套 `incoming -> arm/value identity`
-//! 转换，规则一变就会三处平行返工。这里把这层翻译集中成单一 owner，让结构层
-//! 共享同一套 phi 语义。
-//!
-//! 它依赖 Dataflow 已经提供稳定的 `phi_candidates / SsaValue / def 元数据`，
-//! 这里只负责把这些底层 merge 事实改写成 StructureFacts 可直接消费的形状；
-//! 它不会越权决定最终 HIR 表达式或语法结构。
-//!
-//! 例子：
-//! - branch merge 会把 `phi.incoming` 直接整理成 `then_arm / else_arm` 两臂 SSA 值集
-//! - loop header/exit merge 按循环成员关系把 canonical 输入槽位分入两臂；
-//!   最终 plan 再把每个 incoming 唯一归到 region input/result、
-//!   loop-carried、edge copy、dead 或显式 unresolved
-//! - short-circuit value merge 会提前带出 `entry_value / value_incomings`，避免 HIR
-//!   再回头拆 phi
+//! branch、loop、short-circuit 共用 Dataflow 的 canonical SSA 与 def 元数据，
+//! 不各自重建 merge 语义；最终 HIR 表达式及语法选择不属于本模块。
+//! 例如 branch merge 按 then/else 分组 incoming，loop merge 按循环成员关系分组，
+//! 后续 plan 再确定各输入承担的 carried、copy 或 region-result 职责。
 
 use std::collections::{BTreeSet, VecDeque};
 

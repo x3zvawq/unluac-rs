@@ -1,23 +1,9 @@
-//! 这个文件专门负责把 Dataflow 的定义身份提升成 HIR 可直接消费的绑定表。
+//! 将 Dataflow 定义与 Structure 证据映射为 HIR 稳定绑定。
 //!
-//! 这个 pass 依赖前层已经给好的结构证据和数据流事实，不再回头重扫 CFG/low-IR 去猜
-//! loop binding 或 merge 形状；它只负责“分配稳定身份”。
-//!
-//! 例子：
-//! - `for i = 1, n do ... end` 对应的 `NumericForLike + LoopSourceBindings::Numeric(rX)`
-//!   会直接产出一个 `LocalId` 绑定到该 loop header
-//! - `for k, v in iter() do ... end` 对应的 `LoopSourceBindings::Generic(rA..)` 会直接产出
-//!   一组 header locals，而不是再从 `GenericForLoop` terminator 回扫一次
-//! - 可写 numeric-for 用户槽只消费 protocol 的原入口 COPY 和目标寄存器；body 的读写
-//!   都绑定到同一语法 local，不把 hidden control 当作可写变量，也不在这里猜 MOVE 形状。
-//! - 同一 `(slot, close epoch)` 的引用捕获会共用一次反向写后分析，不会按
-//!   `closure 数 × def 数` 重复扫描；这里只决定绑定身份，不改写 closure 语义
-//! - loop local 与 captured-slot owner 判定直接借用 Structure 的 region 块切片；
-//!   例如嵌套循环的 body 覆盖由已校验的 containment 给出，不再展开 region tree。
-//! - 原显式 nil 声明的未捕获 debug scope 在原指令位置绑定，内层写和外层读共用身份；
-//!   例如 `local result; do result = closure end; return result` 不交给 AST 另造前向声明。
-//! - 未捕获、无 debug 的参数同样拥有入口槽；可信 epoch 0 的后续写仍写回 ParamId，
-//!   避免 `p=q; return p` 另建 local 后让旧 p 成为额外的 GC 根。
+//! 消费前层发布的 loop binding、debug scope、capture 与词法槽事实，分配 LocalId
+//! 或复用参数身份；不回扫 CFG/low-IR 猜循环形状。
+//! 例如 NumericForLike + LoopSourceBindings::Numeric(rX) 直接为用户循环变量
+//! 建立 local，hidden control 不成为可写源码变量。
 
 use std::collections::{BTreeMap, BTreeSet};
 

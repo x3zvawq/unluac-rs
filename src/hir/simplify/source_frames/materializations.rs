@@ -1,32 +1,9 @@
-//! 在原写入位置恢复完整 LOADNIL 批次、闭包创建声明及原槽复用所需的词法末端。
+//! 恢复原 LOADNIL 批次、闭包声明及槽复用所需的词法末端。
 //!
-//! Promotion 保存原指令的有序 canonical 定义组；普通 HIR 完整帧收敛后，只接受仍然
-//! 完整、每员单写且无 read/capture 的全 nil 赋值。源槽覆盖是原语句已有的义务，与旧
-//! 根来自 CALL、循环 skip 或分支无关；源码前缀证明在原点重发整组物理写，而非猜旧值。
-//! 例如 `for i=long_numeric_string(),1 do ... end; if flag then local a,b=nil,nil;
-//! observe() end` 中，skip 可留下原字符串；必须原位清空全部原槽，不能在 for/if 前
-//! 新建 holder，也不能只保留原 LOADNIL 的一个成员。成功后整组 LocalDecl 进入 AST，
-//! 避免普通多目标赋值降低先拆散它，再把无逻辑读的 nil 当作死声明删除。
-//! 声明起点不是完整生命周期证明。线性 nil/未读全局读取 run 的后继原帧若重用首槽，
-//! 则在同一预览中恢复整个 run 的 do 末端；其它活出值、部分槽退休或未知前缀不借此授权。
-//! 未读全局值也能独立形成 run：`do local v=lookup end; local function f() ... end; f()`
-//! 中原 CLOSURE 覆盖 v 的槽，不能因没有 LOADNIL 而让 v 活过 f 内的 GC。闭包声明的 home
-//! 来自保留的原定义；此处不从 closure 的子 proto 或 MOVE 后的 carrier 反猜创建位置。
-//! 单写闭包若只由紧邻 CALL 读取，后继原帧复用其槽时也恢复两条语句的 do 末端；
-//! 闭包对象可以被弱表观察，但 caller binding 不能被 capture 或在 run 外再次读取。
-//! 临时多返回组只被逐项 COPY 到低槽、且后继原帧完整复用结果区时，可保留 COPY 并
-//! 结束临时声明；含其它值版本的多结果赋值由 native assignment owner 处理。
-//! 低槽表写若保持原内嵌常量与操作数槽，可以留在闭包 run 内；元方法仍在原位置执行，
-//! 不能为提前缩域把观察搬到闭包退休后。
-//! 后缀也验证原声明、调用与 for 的帧，避免 `do local n=nil; local v=lookup end; f()`
-//! 被扩成父块 Local，导致 v 跨过原低槽 f 的 GC 观察继续存活。
-//! 条件消费原内嵌常量及全局读取来源，区分完整 callee 准备入口与内层 CALL 执行时点；
-//! 不把内联后的字面量或比较的语义左右次序当成原物理准备顺序。
-//! 未树化的普通 CALL、比较与后继 for 准备由 native frame owner 在同一预览中先消费；这里随后
-//! 重建候选坐标和完整后缀请求，不把未验证的中间帧或旧 DFS 编号发布给其它 pass。
-//! 入口表示源码表达式的完整空闲前缀：动态 key 可先写 base 上一槽，再写 base，
-//! 必须同时消费两次原准备及其顺序；不能把“第一条写指令的槽”一律当作 free-base。
-//! 候选、读写计数及声明验证均按整棵树批量处理；只在存在候选时复制一次事务预览。
+//! 消费 Promotion 的原定义组与源码前缀事实，在完整帧收敛后批量预览声明和作用域；
+//! 不从 HIR 名字、逻辑死值或单个声明起点猜物理生命周期。
+//! 例如 do local v=lookup end; local function f() ... end; f() 中，
+//! 原 CLOSURE 复用 v 的槽时，必须同时恢复 do 末端，避免 v 活过 f 内的 GC 观察。
 
 use std::collections::{BTreeMap, BTreeSet};
 

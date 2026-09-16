@@ -1,24 +1,9 @@
-//! 这个文件承载 HIR 的保守逻辑表达式整理。
+//! 按 Lua 值语义整理 HIR 逻辑表达式和条件。
 //!
-//! Lua 的 `and/or` 返回的是原始操作数，不是布尔值，所以很多看似显然的布尔代数
-//! 恒等式其实并不安全。这里故意只实现一小撮在 Lua 值语义下也严格成立的规则，
-//! 用来压掉短路 DAG 恢复后最机械的重复，而不越权重写控制流结构。
-//!
-//! 它依赖前面的 short-circuit / decision 恢复已经把候选逻辑表达式保守落成 HIR，
-//! 这里仅做“值语义严格不变”的局部整理，不重新分析 CFG，也不替前层兜底修坏掉的
-//! 短路结构。
-//!
-//! 例子：
-//! - `x and x` 只会在 `x` 可稳定重复求值时折成 `x`
-//! - `not x and x` 对同一稳定 binding 统一为 `x and false`，保留 falsy 路径的 nil
-//! - `(a and b) or (a and c)` 只会在整段表达式均可稳定重复求值时整理
-//! - `not a and x or y` 在 `x/y` 恒真时整理成 `a and y or x`
-//! - 条件中的 `not (a or b)` 会在一次遍历中下推成 `not a and not b`
-//! - 值语境的连续 NOT 按共享布尔结果事实归一；未知值的偶数链仍保留两层布尔转换
-//! - `(x and true) or false` 统一为 `not not x`，两个标量分支无事件且 x 仍只求值一次
-//!   整条链只查询一次底层操作数并移交原节点，不为每对 NOT 复制或重算同一子树
-//! - `x or x` 会折成 `x`
-//! - 它不会把一般 `if/branch` 结构强行改写成逻辑表达式，那仍然属于更前面的结构恢复职责
+//! 消费 short-circuit/decision 已恢复的表达式与共享值域、安全性事实，消除机械
+//! 重复及 NOT 链；不重新分析 CFG 或改写一般控制结构。
+//! Lua 的 and/or 返回原操作数，因此 x and x 只有在 x 可稳定重复求值时才可折为 x，
+//! 未知值的偶数 NOT 链仍需保留两层布尔转换。具体恒等式的证明放在对应归约处。
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::walk::{HirRewritePass, rewrite_proto};
@@ -147,6 +132,8 @@ fn simplify_boolean_coercion(expr: &mut HirExpr) -> bool {
     true
 }
 
+// 未知值的偶数 NOT 链仍需两层布尔转换；只查询一次底层操作数并移交原节点，
+// 避免逐对归约时反复复制或分析同一深链。
 fn simplify_value_not_chain(expr: &mut HirExpr) -> bool {
     let mut operand = &*expr;
     let mut depth = 0;

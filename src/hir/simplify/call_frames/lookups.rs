@@ -1,18 +1,9 @@
-//! 完整源码帧中的索引、比较与算术准备。
+//! 在完整源码帧中恢复索引、比较和算术输入准备。
 //!
-//! 每次访问消费 Promotion 的原结果和输入布局，共享 builder 仍拥有 Def 写域、事件顺序
-//! 及声明身份。例 `root.nodes[keys[2]].value` 先在当前槽逐层读取 base，再在其上一槽
-//! 读取动态 key，最后原位覆盖；不能把动态键的原暂存槽或中间表快照交给 AST 猜测。
-//! LuaJIT 的 RI 算术只在原低槽读取操作数、原目标槽写结果；例如
-//! `return value, value+1, value+2` 可与 COPY 一起重发连续返回区，不额外提升 local。
-//! 比较中的 TGETB/TGETS 则按原 operand 和结果 home 重发，例如两个索引相等时仍
-//! 从左到右占用相邻 scratch；这里只消费已嵌入的原访问，不推断新的求值或根退休权限。
-//! PUC/JIT 的寄存器 GETTABLE 共用输入准备 owner；如 `f() == expected[bits + 1]`
-//! 保留 CALL 结果后，在相邻槽完成 ADD 和 TGETV，再由原 Boolean 参数帧写回。
-//! JIT 有序比较的数字常量仍占原寄存器，不能套用 Eq 的内嵌常量规则。
-//! Luau Boolean 值保留目标槽：`bits % 4 >= 2` 在高一槽执行 MOD，再在高两槽准备 2；
-//! HIR 若反向展示为 `2 <= bits % 4`，重发时恢复算术先求值的 Gt/Ge 方向。
-//! 动态表键也保留 lookup 结果槽，复用同一 RK 算术输入/输出证明，不扩展到未知准备区。
+//! 消费 Promotion 的原结果及操作数布局，由共享 FrameBuilder 验证 Def 写域、
+//! 事件顺序和声明身份，不从表达式外形推断暂存槽或根退休权限。
+//! 例如 root.nodes[keys[2]].value 必须保持 base 与动态 key 的原求值次序和覆盖点；
+//! 各 VM 的内嵌常量及寄存器操作数在对应路径中核对。
 
 use super::*;
 use crate::hir::common::HirTableAccess;

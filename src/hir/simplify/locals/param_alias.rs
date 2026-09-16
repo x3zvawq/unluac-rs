@@ -1,28 +1,9 @@
-//! 参数 alias 收敛是 locals pass 的后置步骤。
+//! 收敛 locals 提升后暴露的函数入口参数别名。
 //!
-//! locals pass 把跨语句存活的 temp 提升成 local 后，函数入口处可能出现机械别名：
-//! `local L = P` 或 `local L; L = P`。如果后续代码只通过这个别名继续读写参数槽位，
-//! 保留新 local 会把同一个源码身份拆成两个 binding，并把修复压力推给 AST/Naming。
-//!
-//! 输入形状 -> 输出形状：
-//! ```text
-//! local l0 = p0             if p0 > 0 then
-//! if p0 > 0 then      =>      p0 = p0 + 1
-//!   l0 = p0 + 1             end
-//! end                       return p0
-//! return l0
-//! ```
-//!
-//! 这里不重新推断前层 phi，也不处理任意 local 对；它消费共享 HIR 控制流图，证明参数
-//! 与 alias 从入口相同值开始不会被分别观察。节点事实只收集一次，逐路径状态记录最后
-//! 写入的一侧与已经逃逸的 reference capture。return/break/continue、label/goto 及循环
-//! 分派的后继由共享图提供，有限位集合由其 worklist 收敛；本层只解释求值与 binding。
-//! alias 后续写入会提前覆盖参数，因此还要求两者属于同一可信物理 home；仅有显式读写
-//! 等价不足以排除弱表、`__gc` 或异常 cleanup 对旧参数存活期的观察。
-//! 实际发生的 `Local -> Param` 引用改写还会把失效的 home provenance 传播到参数，避免
-//! deferred carried-local 的下一轮把换壳后的参数重新当作可信物理槽。
-//! 同一语句的读取、capture、回调和 lvalue 写入共用一次事实收集；状态转换仍先处理
-//! 读取与回调，再应用最终覆盖，不把 visitor 的左值先序误当成运行时 store 顺序。
+//! 消费共享 HIR 控制流图、可信 home 与 capture 事实，证明参数和 alias 从入口同值
+//! 开始不会被分别观察；不重新推断 phi，也不处理任意 local 对。
+//! 例如 local l=p; l=l+1; return l 在同 home 且旧 p 不再被观察时可改为
+//! p=p+1; return p。仅显式读写等价不足以允许改变旧参数的根生命周期。
 
 use crate::hir::common::{
     HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,

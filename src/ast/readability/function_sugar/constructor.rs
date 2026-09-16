@@ -1,19 +1,9 @@
-//! 这个子模块负责把“构造器尾部立刻安装方法/字段函数”的模式收成更自然的函数 sugar。
+//! 将构造器尾部连续安装的方法/字段函数收回函数 sugar。
 //!
-//! 它依赖前缀 local alias、可写 capture 快照和已经合法化的 AST，只吸收终端构造器链
-//! 上的局部模式，不会在这里重写一般赋值语句。
-//! 例如：
-//! - `local t = {}; t.pick = function(...) end; return t`
-//!   -> `local t = { pick = function(...) end }; return t`
-//! - `local meta = {}; local methods = {}; function methods.bump(...) end; meta.__index = methods;
-//!    local ctor = ffi.metatype("x", meta)`
-//!   -> `local ctor = ffi.metatype("x", { __index = { bump = function(...) end } })`
-//! - `local f=ctor; local t={}; return f(stable, t)`
-//!   -> `return ctor(stable, {})`，其中 `stable` 必须是不受 initializer 回调影响的快照
-//!
-//! 这里不会去猜任意跨语句的数据流；只有“构造器 local -> 构造器字段接线”仍保持机械
-//! 脚手架形状时，才会收回源码结构。非 plain 字段函数的语句自然终止连续前缀，不由本
-//! pass 改写。
+//! 消费合法 AST、前缀 alias 与可写 capture 快照，只处理终端构造器的连续接线，
+//! 不推断任意跨语句数据流。
+//! 例如 local t={}; t.pick=function(...) end; return t 在证明成立时可收成
+//! local t={pick=function(...) end}; return t。
 
 use std::collections::{BTreeMap, BTreeSet};
 

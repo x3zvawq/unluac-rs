@@ -1,23 +1,9 @@
-//! 这个文件提供 HIR simplify pass 共享的递归 walker。
+//! 提供 HIR simplify 共用的递归改写骨架。
 //!
-//! 很多 simplify pass 都只是"后序遍历整棵 HIR，然后在局部 block/stmt/expr 上做保守
-//! 重写"。如果每个 pass 都各自维护一套 `block/stmt/lvalue/call/expr` 骨架，后面一旦
-//! 新增 HIR 节点或调整遍历顺序，就得在多处同步返工。
-//!
-//! `HirRewritePass` 统一提供 block/stmt/expr 等回调，pass 只实现自己负责的改写。
-//! block 入口允许直接借用 proto 的只读事实并独立修改 body，不为可变借用复制元数据。
-//!
-//! 它不会替具体 pass 决定"哪些节点该改、哪些事实可信"；这些语义仍然由各个 pass
-//! 自己负责。这个文件只统一递归顺序和进入子节点的边界，避免不同 pass 各自长出
-//! 一套不一致的 walker。generic-for operand 改写只撤销对应 producer span，未变的区间
-//! 继续保留 lowering 证明；例如替换 callee 不会抹掉另一段 nil initializer 的身份。
-//!
-//! 例子：
-//! - `logical_simplify` 实现表达式与条件回调，区分值语境与 truthiness 语境
-//!   并在进入子节点前压平整条 NOT 链，避免先递归进入内联制造的深链或反复复制操作数
-//! - `dead_labels` 这类要在整段 block 上做删改的 pass，则实现 `HirRewritePass`
-//! - `close_scopes / decision-eliminate` 这类自带 block rebuild 的 pass，则可以只复用
-//!   下面的 `for_each_nested_block_mut / rewrite_nested_blocks_in_stmt`
+//! HirRewritePass 提供 block/stmt/expr 等回调，统一子节点顺序和遍历边界；具体
+//! 候选、语义证明与事实有效性仍由各 pass 负责。自带 block rebuild 的 pass 可只用
+//! nested-block helper，不必复制整套递归。
+//! 例如 logical_simplify 使用表达式及条件回调，dead_labels 在 block 回调中删标签。
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,

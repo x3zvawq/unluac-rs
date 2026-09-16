@@ -1,22 +1,9 @@
-//! 受阈值约束的保守表达式内联。
+//! 将合法 AST 中的机械 local 别名收回使用点，受展示复杂度和求值证明约束。
 //!
-//! 这里只处理非常窄的一类模式：
-//! - 单值 local 别名；原生 temp 的语义内联归 HIR
-//! - 通用候选只使用一次；稳定 local copy 可原子替换多个顶层语句内的全部后续读取
-//! - 使用点出现在 return / 调用参数 / 索引位 / 调用目标
-//! - 被内联表达式必须是我们能证明“纯且无元方法副作用”的安全子集
-//! - 相邻调用准备 run 中的简单表构造参数，可以随同 receiver/callee 一起收回调用位
-//! - 相邻 recovered local run 里，只有末尾 local 仍会跨语句存活的机械链
-//! - while/repeat 条件只接收无事件且循环不变的机械 RHS；依赖候选会递归展开，
-//!   外部 local/param 则必须未捕获且循环体没有直接写入
-//! - generic-for 的 method receiver 允许收回一个紧邻的 recovered binding 别名
-//! - repeat body 的 stable-copy 事务把 until 条件计作可改写的尾随 owner，正文、条件与
-//!   declaration removal 必须一起提交
-//! - 多值 return 顶层只收回 context-safe 或已证明为单值布尔比较的唯一 alias；可变快照仍通过求值前缀证明
-//! - 单值 return 短路树只收回最左、必达位置的布尔比较 alias；右臂仍保留原 binding
-//! - 稳定 local copy 与无事件 truthiness 快照可跨越无关语句收回；复合/primitive 多 use
-//!   仍只在同一 owner 内替换，避免跨业务语句复制概念值
-//! - 完整 call-alias run 先于单项相邻内联取得所有权；run 拒绝后，单项规则仍可消费局部安全形状
+//! 消费 binding/use、capture 与表达式安全事实，支持单项别名、稳定副本和完整调用
+//! 准备 run；原生 temp 的语义内联仍由 HIR 负责。
+//! 例如 local f=callee; f(x) 可在读取时点与身份证明成立时收成 callee(x)。
+//! 具体候选、使用站点和 run 的接受边界分别由各子模块维护。
 
 mod candidate;
 mod eval_order;
