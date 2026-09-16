@@ -105,6 +105,7 @@ impl HirRewritePass for BranchControlPass<'_> {
             &mut self.read_alternatives,
         );
         let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
+        let leading_escape_changed = fold_leading_branch_escapes(&mut block.stmts);
         let adjacent_goto_changed = fold_adjacent_conditional_gotos(&mut block.stmts);
         let empty_changed =
             remove_discard_safe_empty_ifs(&mut block.stmts, self.safety, self.primitive_locals);
@@ -127,6 +128,7 @@ impl HirRewritePass for BranchControlPass<'_> {
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         constant_changed
             || common_tail_changed
+            || leading_escape_changed
             || adjacent_goto_changed
             || empty_changed
             || terminal_changed
@@ -1113,6 +1115,83 @@ fn fold_forward_gotos(
     rewritten.extend(original);
     *stmts = rewritten;
     true
+}
+
+// 前导 guard 跳到整个 if 的紧随出口时，只将 guard 并入条件，body 的词法层不移动。
+// 条件沿原路径各求值一次；多层 guard 用短路 AND 表达，不复制后继 body。
+fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
+    let mut changed = false;
+    for index in 0..stmts.len().saturating_sub(1) {
+        let HirStmt::Label(label) = &stmts[index + 1] else {
+            continue;
+        };
+        // 候选拒绝[ProofIncomplete]：这里只证明无资源交接的前导退出；尚未核对
+        // 带 close/cleanup 的跳转边改为条件 fallthrough 后的清理归属。
+        if !label.tbc_barriers.is_empty() || !label.entry_cleanup.is_empty() {
+            continue;
+        }
+        let target = label.id;
+        let HirStmt::If(branch) = &mut stmts[index] else {
+            continue;
+        };
+        if branch
+            .else_block
+            .as_ref()
+            .is_some_and(|block| !block.stmts.is_empty())
+        {
+            continue;
+        }
+        let mut guards = Vec::new();
+        for stmt in &branch.then_block.stmts {
+            let Some(escape) = leading_escape_condition(stmt, target) else {
+                break;
+            };
+            guards.push(normalize_condition_context(escape, true));
+        }
+        if guards.is_empty() {
+            continue;
+        }
+        let count = guards.len();
+        for guard in guards {
+            branch.cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                lhs: std::mem::replace(&mut branch.cond, HirExpr::Boolean(false)),
+                rhs: guard,
+            }));
+        }
+        // 一次收完连续 guard，避免逐轮 remove(0) 搬移整个后缀并耗尽调度预算。
+        drop(branch.then_block.stmts.drain(..count));
+        changed = true;
+    }
+    changed
+}
+
+fn leading_escape_condition(mut stmt: &HirStmt, target: HirLabelId) -> Option<HirExpr> {
+    let mut conditions = Vec::new();
+    while let HirStmt::If(guard) = stmt {
+        if guard
+            .else_block
+            .as_ref()
+            .is_some_and(|block| !block.stmts.is_empty())
+        {
+            return None;
+        }
+        let [child] = guard.then_block.stmts.as_slice() else {
+            return None;
+        };
+        conditions.push(&guard.cond);
+        stmt = child;
+    }
+    if !matches!(stmt, HirStmt::Goto(jump) if jump.target == target) {
+        return None;
+    }
+    let mut condition = conditions.pop()?.clone();
+    for outer in conditions.into_iter().rev() {
+        condition = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            lhs: outer.clone(),
+            rhs: condition,
+        }));
+    }
+    Some(condition)
 }
 
 fn fold_adjacent_conditional_gotos(stmts: &mut [HirStmt]) -> bool {

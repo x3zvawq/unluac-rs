@@ -1107,12 +1107,15 @@ fn collect_plans(
         }
         if let Some(Some(previous)) = index.checked_sub(1).and_then(|previous| flat.get(previous))
             && let Some(mut plan) = completed_table_assignment(
-                proto,
+                NativeFrameContext {
+                    proto,
+                    barred,
+                    closed,
+                    constants_fit_rk,
+                },
                 &[previous.stmt, stmt],
                 facts,
                 dialect,
-                barred,
-                closed,
                 1,
             )
         {
@@ -3968,14 +3971,13 @@ fn scalar_array_lookup_plan(
 }
 
 /// 完整构造器在 freereg 求值，再 MOVE 到已有低槽 local；只消除两条紧邻语句间的声明。
-/// PUC 空表与 Luau 静态模板共用此前缀事务，字段树原样保留，不重新合并任何字段写。
+/// Lua 5.1 的全局安装同样在原 freereg 分配，再直接 SETGLOBAL；收回临时声明后，
+/// 后续同槽新值由 preview 重新声明，避免把其 SETLIST 初始化误接到旧 table 身份。
 fn completed_table_assignment(
-    proto: &HirProto,
+    context: NativeFrameContext<'_>,
     stmts: &[&HirStmt],
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
-    barred: &BTreeSet<HomeSlotKey>,
-    closed: &BTreeSet<HomeSlotKey>,
     sink: usize,
 ) -> Option<Plan> {
     if dialect == DecompileDialect::Luajit {
@@ -3984,7 +3986,7 @@ fn completed_table_assignment(
     let HirStmt::Assign(assign) = &stmts[sink] else {
         return None;
     };
-    let ([HirLValue::Local(target)], [HirExpr::LocalRef(source)], None) = (
+    let ([target], [HirExpr::LocalRef(source)], None) = (
         assign.targets.as_slice(),
         assign.values.fixed.as_slice(),
         &assign.values.tail,
@@ -3997,9 +3999,21 @@ fn completed_table_assignment(
     };
     let base = facts.trusted_local_home_slot(producer)?;
     let allocation_home = facts.allocation_result_home(table)?;
-    let target_home = facts.trusted_local_home_slot(*target)?;
+    let target_home = match target {
+        HirLValue::Local(target) => Some(facts.trusted_local_home_slot(*target)?),
+        HirLValue::Global(_) if dialect == DecompileDialect::Lua51 => None,
+        _ => return None,
+    };
     let write_homes = facts.complete_local_definition_write_homes(producer);
-    let supported_constructor = if dialect == DecompileDialect::Luau {
+    let supported_constructor = if target_home.is_none() {
+        // 原 SETGLOBAL 没有左值准备区；常量 record 只使用 RK，不增加缓冲槽。
+        // 候选拒绝[LayerBoundary]：含动态字段或数组的完整准备帧须由 constructor owner
+        // 另行证明，不能仅凭最终字段形状省去其 scratch 写入。
+        context.constants_fit_rk
+            && table.allocation.batched_capacity_matches(0, table.fields.len()) == Some(true)
+            && table.fields.iter().all(|field| matches!(field,
+                HirTableField::Record(record) if tables::literal_rk(&record.key) && tables::literal_rk(&record.value)))
+    } else if dialect == DecompileDialect::Luau {
         matches!(table.allocation, HirTableAllocation::LuauTemplate { .. })
             && table.fields.iter().all(|field| matches!(field,
                 HirTableField::Record(record) if matches!(record.key, HirExpr::String(_))
@@ -4009,25 +4023,25 @@ fn completed_table_assignment(
     };
     if producer != *source
         || allocation_home != base
-        || target_home.slot() >= base.slot()
+        || target_home.is_some_and(|target| target.slot() >= base.slot())
         || !supported_constructor
         || table.trailing_multivalue.is_some()
-        || proto
+        || context.proto
             .local_debug_hints
             .get(producer.index())
             .is_some_and(Option::is_some)
-        || proto
+        || context.proto
             .local_debug_scopes
             .get(producer.index())
             .is_some_and(Option::is_some)
-        || proto.inline_dispositions.local(producer).must_preserve()
+        || context.proto.inline_dispositions.local(producer).must_preserve()
         // 透明 MOVE 的低槽目标可能已被捕获；该写在 sink 原位保留。这里只删除
         // scratch 身份，不删目标 cell 写，额外隐藏写仍不属于本事务。
-        || (barred.contains(&base) && !facts.allocation_result_reference_unaliased(table))
-        || write_homes.iter().any(|home| *home != base && *home != target_home)
+        || (context.barred.contains(&base) && !facts.allocation_result_reference_unaliased(table))
+        || write_homes.iter().any(|home| *home != base && Some(*home) != target_home)
         || !facts
             .complete_local_definition_write_homes(producer)
-            .is_disjoint(closed)
+            .is_disjoint(context.closed)
     {
         return None;
     }
@@ -4038,7 +4052,7 @@ fn completed_table_assignment(
         values: vec![HirExpr::TableConstructor(table.clone())].into(),
         result_locals: Vec::new(),
         discarded_result: None,
-        assignment_targets: vec![HirLValue::Local(*target)],
+        assignment_targets: vec![target.clone()],
         indexed_target: None,
         continuing_root: None,
         retained_copies: Vec::new(),

@@ -292,6 +292,30 @@ pub(super) fn collect_captured_slot_targets(
         &activation_windows,
         &captured_uses,
     );
+    // 父先子后传播最外层 single-pass 的外部 owner，避免逐 cell 回扫整条祖先链。
+    let plan = structure.plan();
+    let mut single_pass_owners = vec![None; plan.regions().len()];
+    for &region in plan.region_postorder().iter().rev() {
+        let parent = plan.region(region).and_then(RegionPlan::parent);
+        single_pass_owners[region.index()] = parent
+            .and_then(|parent| single_pass_owners[parent.index()])
+            .or_else(|| plan.single_pass_for_region(region).and(parent));
+    }
+    for (&key, &start) in &initializers {
+        // 显式 CLOSE 激活窗口仍由原词法 scope 拥有，不能外提成跨窗口共享 cell。
+        if key.activation.is_some() {
+            continue;
+        }
+        let Some(region) = plan.region_for_block(cfg.instr_to_block[start]) else {
+            continue;
+        };
+        if let Some(owner) = single_pass_owners[region.index()] {
+            // 支配写仍在原位置执行，但 single-pass 的 repeat 壳不是原 cell 的词法域。
+            // 在壳外声明身份，避免后继 return/phi 读取变成域外引用；原初始化写不前移。
+            // branch_24_nested_branch_escape 的 trace 同时被 guard closure 和出口读取。
+            region_decl_keys.insert(key, owner);
+        }
+    }
     for captured in &mut captured_uses {
         if let Some(&start) = initializers.get(&captured.key) {
             captured.start_instr = start;

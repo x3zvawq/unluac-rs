@@ -519,4 +519,28 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "九组表基础覆盖混合构造器、元表、深层读写、动态key、嵌套调用和构造器闭包。",
         &[LuaCaseConfiguration::new(ALL_DIALECTS)],
     ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_11_nested_table_before_compaction.lua",
+        &["constructor", "nested-table", "local-pressure"],
+        "大型嵌套构造器在物理槽复用前保留完整 producer 身份及所有数组元素。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/capture_02_table_nil_batch.lua",
+        &["capture", "nil-hole", "setlist"],
+        "原全局安装与后续同槽表初始化保留分配及捕获时序，nil batch 的内容和长度保持一致。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
 ];

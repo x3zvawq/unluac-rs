@@ -1273,4 +1273,40 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 }),
         ],
     ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_23_stale_transfer_requirement.lua",
+        &["path-condition", "short-circuit", "exit-requirement"],
+        "HIR 删除矛盾分支后退役过期 goto 要求，Lua 5.1 Strict 仍生成可执行源码。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_24_nested_branch_escape.lua",
+        &["early-return", "short-circuit", "forward-guard"],
+        "嵌套前导退出折入外层条件，八种布尔组合保留返回值与后继分支。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_25_alternative_guard_routes.lua",
+        &["short-circuit", "forward-guard", "shared-tail"],
+        "交替成功与失败 guard 保留条件选择及共同尾部的一次执行。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
 ];

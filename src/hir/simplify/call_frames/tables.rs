@@ -146,7 +146,7 @@ pub(super) fn index<'a>(
     frames
 }
 
-fn literal_rk(expr: &HirExpr) -> bool {
+pub(super) fn literal_rk(expr: &HirExpr) -> bool {
     matches!(
         expr,
         HirExpr::Nil
