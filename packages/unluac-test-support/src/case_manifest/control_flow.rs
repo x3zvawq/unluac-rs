@@ -2,6 +2,18 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/return_16_short_circuit_open_call.lua",
+        &["short-circuit", "multiret", "metamethod"],
+        "短路值 DAG 沿开放参数追踪嵌套调用依赖，保持共享 fallback、字段读取及转换次数。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_ALL),
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/return_01_guarded_return_chain.lua",
         &["callbacks", "multiret", "short-circuit"],
         "固定 Lua 5.1 中 guarded return 链的分支所有权以及 handled 路径三返回值中的 nil 槽。",

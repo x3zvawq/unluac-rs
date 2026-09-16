@@ -252,7 +252,7 @@ pub(super) struct ValueDecisionCandidateScratch {
     relevant_defs: Vec<super::super::DefId>,
     boundary_live_phis: Vec<super::super::PhiId>,
     result_required_instrs: Vec<InstrRef>,
-    pending_values: Vec<super::super::SsaValue>,
+    pending_values: Vec<ValueDecisionDependency>,
     pending_phis: Vec<super::super::PhiId>,
 }
 
@@ -728,7 +728,7 @@ pub(super) fn mark_value_decision_result_dependencies(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn mark_value_decision_dependencies(
+fn mark_value_decision_dependencies(
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     block_epochs: &[usize],
@@ -737,19 +737,19 @@ pub(super) fn mark_value_decision_dependencies(
     dependency_def_epochs: &mut [usize],
     dependency_phi_epochs: &mut [usize],
     dependency_epoch: usize,
-    pending_values: &mut Vec<super::super::SsaValue>,
+    pending_values: &mut Vec<ValueDecisionDependency>,
     root: super::super::SsaValue,
     already_proven: impl Fn(super::super::SsaValue) -> bool,
 ) -> bool {
     pending_values.clear();
-    pending_values.push(root);
-    while let Some(value) = pending_values.pop() {
-        if already_proven(value) {
+    pending_values.push(ValueDecisionDependency::Value(root));
+    while let Some(dependency) = pending_values.pop() {
+        if matches!(dependency, ValueDecisionDependency::Value(value) if already_proven(value)) {
             continue;
         }
-        match value {
-            super::super::SsaValue::Entry(_) => {}
-            super::super::SsaValue::Def(def) => {
+        match dependency {
+            ValueDecisionDependency::Value(super::super::SsaValue::Entry(_)) => {}
+            ValueDecisionDependency::Value(super::super::SsaValue::Def(def)) => {
                 let Some(stamp) = dependency_def_epochs.get_mut(def.index()) else {
                     return false;
                 };
@@ -760,18 +760,36 @@ pub(super) fn mark_value_decision_dependencies(
                 let Some(definition) = dataflow.defs.get(def.index()) else {
                     return false;
                 };
-                if block_epochs.get(definition.block.index()).copied() != Some(block_epoch) {
-                    continue;
-                }
-                let Some(needed) = needed_instr_epochs.get_mut(definition.instr.index()) else {
+                pending_values.push(ValueDecisionDependency::Instruction(definition.instr));
+            }
+            ValueDecisionDependency::Instruction(instr) => {
+                let Some(block) = cfg.instr_to_block.get(instr.index()) else {
                     return false;
                 };
+                if block_epochs.get(block.index()).copied() != Some(block_epoch) {
+                    continue;
+                }
+                let Some(needed) = needed_instr_epochs.get_mut(instr.index()) else {
+                    return false;
+                };
+                if *needed == dependency_epoch {
+                    continue;
+                }
                 *needed = dependency_epoch;
-                if let Some(uses) = dataflow.use_values.get(definition.instr.index()) {
-                    pending_values.extend(uses.fixed.values());
+                if let Some(uses) = dataflow.use_values.get(instr.index()) {
+                    pending_values.extend(uses.fixed.values().map(ValueDecisionDependency::Value));
+                }
+                // f(g()) 的 g 只定义 open pack，不出现在 fixed SSA reads 中。
+                // 必须沿 Dataflow 已证明的 producer 追踪，才能保留调用次数、顺序与参数宽度；
+                // 指令 epoch 同时去重 fixed/open 两条依赖路径及嵌套开放调用链。
+                for def in dataflow.open_use_sources_at(instr).defs() {
+                    let Some(producer) = dataflow.open_defs.get(def.index()) else {
+                        return false;
+                    };
+                    pending_values.push(ValueDecisionDependency::Instruction(producer.instr));
                 }
             }
-            super::super::SsaValue::Phi(phi) => {
+            ValueDecisionDependency::Value(super::super::SsaValue::Phi(phi)) => {
                 let Some(stamp) = dependency_phi_epochs.get_mut(phi.index()) else {
                     return false;
                 };
@@ -797,9 +815,19 @@ pub(super) fn mark_value_decision_dependencies(
                 {
                     continue;
                 }
-                pending_values.extend(phi.incoming.iter().map(|incoming| incoming.value));
+                pending_values.extend(
+                    phi.incoming
+                        .iter()
+                        .map(|incoming| ValueDecisionDependency::Value(incoming.value)),
+                );
             }
         }
     }
     true
+}
+
+#[derive(Clone, Copy)]
+enum ValueDecisionDependency {
+    Value(super::super::SsaValue),
+    Instruction(InstrRef),
 }
