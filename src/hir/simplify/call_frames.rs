@@ -470,6 +470,20 @@ impl FrameBuilder<'_> {
                         return None;
                     }
                     let value = scalar_local(self.run[index])?.1;
+                    let constructor_result_unaliased = self.constructor_depth > 0
+                        && match value {
+                            HirExpr::Call(call) => call.source_site,
+                            HirExpr::Closure(closure) => closure.source_site,
+                            _ => None,
+                        }
+                        .is_some_and(|source| {
+                            self.facts.operation_result_reference_unaliased(source)
+                                && self.facts.operation_result_home(source)
+                                    == Some(HomeSlotKey::new(slot, 0))
+                                && self.facts.operation_result_temp(source).is_some_and(|temp| {
+                                    self.facts.promoted_local_for_temp(temp) == Some(*local)
+                                })
+                        });
                     if let Some(native) = self.native {
                         // callee 原 home 已在 NativeCallFrame 的 CALL 时点证明没有
                         // 打开的 ByRef；整链逐步核对同 home，未来 capture 不回溯生效。
@@ -491,6 +505,9 @@ impl FrameBuilder<'_> {
                                         crate::hir::common::HirInlineRetentionReason::BooleanValueContext))
                             || (!callee_chain
                                 && !argument_home
+                                // 构造器在原缓冲槽重发同一次 CALL/CLOSURE；未来复用此槽的
+                                // capture 不回溯到该值版本。后续读取与 capture 仍由整帧 preview 核对。
+                                && !constructor_result_unaliased
                                 && !self
                                     .facts
                                     .complete_local_definition_write_homes(*local)

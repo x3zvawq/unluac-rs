@@ -13,6 +13,18 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_29_loop_header_arm_boundary.lua",
+        &["branch", "loop-backedge", "region-owner", "coroutine"],
+        "循环 header 作为一臂出口时，不将另一臂的条件尾部移到 branch 外。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/branch_28_preserved_predicates.lua",
         &["short-circuit", "path-condition", "source-fidelity"],
         "保留原字节码的重复条件检查，不依据前一条路径事实删除。",

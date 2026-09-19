@@ -169,8 +169,8 @@ enum PromotionInit {
 enum BatchDeclaration {
     /// 原 CALL/nil 批次的准备写继续留给原协议 owner 消费。
     Empty,
-    /// 新绑定直接接收已验证的原常量组，不引入 nil 预写。
-    Primitive,
+    /// 新绑定直接接收原固定常量组或 VARARG 包，不引入 nil 预写。
+    Direct,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -552,21 +552,21 @@ fn promote_block_with_protection(
             let HirStmt::LocalDecl(local_decl) = &mut rewritten[decl_index] else {
                 unreachable!("batched declaration output must remain a local declaration");
             };
-            if declaration == BatchDeclaration::Primitive {
+            if declaration == BatchDeclaration::Direct {
                 let HirStmt::Assign(assign) = &mut stmt else {
-                    unreachable!("primitive declaration retains its original assignment");
+                    unreachable!("direct declaration retains its original assignment");
                 };
                 assert!(
-                    primitive_fixed_initializer(assign)
+                    direct_fixed_initializer(assign)
                         && local_decl.bindings.len() == assign.targets.len()
                         && local_decl
                             .bindings
                             .iter()
                             .zip(&assign.targets)
                             .all(|(local, target)| *target == HirLValue::Local(*local)),
-                    "primitive declaration must own the complete original initializer"
+                    "direct declaration must own the complete original initializer"
                 );
-                // 整组新绑定直接接收原常量写；不先发空声明，避免增加原来没有的 nil 覆写。
+                // 整组新绑定直接接收原初始化；不先发空声明，避免增加原来没有的 nil 覆写。
                 local_decl.values = std::mem::take(&mut assign.values);
                 append_root_releases(index, false, &mut rewritten);
                 continue;
@@ -642,18 +642,30 @@ fn certify_batched_initializer_merge_transaction(
     assign.initializer_merge_transaction = Some(token);
 }
 
-fn primitive_fixed_initializer(assign: &HirAssign) -> bool {
+fn fixed_vararg_initializer(assign: &HirAssign) -> bool {
+    assign.values.fixed.is_empty()
+        && assign.values.tail.as_ref().is_some_and(|tail| {
+            tail.exact_width() == Some(assign.targets.len())
+                && matches!(tail.as_expr(), HirExpr::VarArg)
+        })
+}
+
+fn direct_fixed_initializer(assign: &HirAssign) -> bool {
     assign.initializer_merge_transaction.is_none()
         && assign.generic_for_initializer_producer.is_none()
         && assign.method_rewrite_transaction.is_none()
-        && assign.values.tail.is_none()
-        && assign.values.fixed.len() == assign.targets.len()
-        && assign.values.fixed.iter().all(|value| {
-            matches!(
-                value,
-                HirExpr::Nil | HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_)
-            )
-        })
+        && (fixed_vararg_initializer(assign)
+            || (assign.values.tail.is_none()
+                && assign.values.fixed.len() == assign.targets.len()
+                && assign.values.fixed.iter().all(|value| {
+                    matches!(
+                        value,
+                        HirExpr::Nil
+                            | HirExpr::Boolean(_)
+                            | HirExpr::Integer(_)
+                            | HirExpr::Number(_)
+                    )
+                })))
 }
 
 fn collect_plans(
@@ -1088,9 +1100,9 @@ fn collect_plans(
         if let HirStmt::Assign(assign) = stmt
             && assign.targets.len() > 1
         {
+            let vararg_initializer = fixed_vararg_initializer(assign);
             let fresh_group = (|| {
-                if has_label_flow || ctx.compact_home_slots || !primitive_fixed_initializer(assign)
-                {
+                if has_label_flow || ctx.compact_home_slots || !direct_fixed_initializer(assign) {
                     return None;
                 }
                 let mut members = Vec::with_capacity(assign.targets.len());
@@ -1108,19 +1120,21 @@ fn collect_plans(
                         || outer_uses_temp(*temp)
                         || event_block.has_touch_before(*temp, decl_index)
                         || !event_block.has_read_from(*temp, decl_index + 1)
-                        || event_block
+                        // 固定 VARARG 必须整包保持宽度，不能逐元素内联；嵌套块的
+                        // 多次读取在当前事件索引只占一个位置，也仍需要这组源码绑定。
+                        || (!vararg_initializer && event_block
                             .touch_positions_from(*temp, decl_index + 1)
                             .take(2)
                             .count()
-                            < 2
+                            < 2)
                         || ctx.identity_sensitive_temps.contains(temp)
                         || ctx.to_be_closed_temps.contains(temp)
-                        || temp_debug_locals
+                        || (!vararg_initializer && (temp_debug_locals
                             .get(temp.index())
                             .is_some_and(Option::is_some)
                         || temp_debug_scopes
                             .get(temp.index())
-                            .is_some_and(Option::is_some)
+                            .is_some_and(Option::is_some)))
                         || !facts
                             .complete_temp_definition_write_homes(*temp)
                             .iter()
@@ -1140,7 +1154,7 @@ fn collect_plans(
                         decl_index,
                         home,
                         temp,
-                        BatchDeclaration::Primitive,
+                        BatchDeclaration::Direct,
                     );
                     materialized_owner_locals.insert((decl_index, home), local);
                     current_slot_locals.insert(home, local);

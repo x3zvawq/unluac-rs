@@ -429,27 +429,7 @@ impl FrameBuilder<'_> {
                     if position + 1 != writes.len() || batch.start_index != 1 {
                         return None;
                     }
-                    if batch.initializer_debug_scope.is_some() {
-                        let (owner, _) = scalar_local(self.run[seed])?;
-                        let scope = context
-                            .proto
-                            .local_debug_scopes
-                            .get(owner.index())
-                            .copied()
-                            .flatten();
-                        let home = super::super::table_constructors::debug_initializer_home(
-                            self.run[seed],
-                            batch,
-                            scope,
-                            self.facts,
-                        )?;
-                        if home != HomeSlotKey::new(slot, 0)
-                            || context.barred.contains(&home)
-                            || context.closed.contains(&home)
-                        {
-                            return None;
-                        }
-                    }
+                    self.batch_initializer_matches(seed, table, batch, slot)?;
                     for (offset, value) in batch.values.fixed.iter().enumerate().skip(arrays) {
                         rebuilt
                             .fields
@@ -510,6 +490,39 @@ impl FrameBuilder<'_> {
         }
     }
 
+    /// debug binding 在末批次之后才激活；未来 capture 不妨碍重放其原始初始化。
+    /// 已经打开的引用及资源边界仍需拒绝，后续 binding 身份由整帧 preview 验证。
+    fn batch_initializer_matches(
+        &self,
+        seed: usize,
+        table: &crate::hir::common::HirTableConstructor,
+        batch: &crate::hir::common::HirTableSetList,
+        slot: usize,
+    ) -> Option<()> {
+        if batch.initializer_debug_scope.is_none() {
+            return Some(());
+        }
+        let context = self.native?;
+        let (owner, _) = scalar_local(self.run[seed])?;
+        let scope = context
+            .proto
+            .local_debug_scopes
+            .get(owner.index())
+            .copied()
+            .flatten();
+        let home = super::super::table_constructors::debug_initializer_home(
+            self.run[seed],
+            batch,
+            scope,
+            self.facts,
+        )?;
+        (home == HomeSlotKey::new(slot, 0)
+            && (!context.barred.contains(&home)
+                || self.facts.allocation_result_reference_unaliased(table))
+            && !context.closed.contains(&home))
+        .then_some(())
+    }
+
     fn indexed_constructor(
         &mut self,
         seed: usize,
@@ -525,7 +538,8 @@ impl FrameBuilder<'_> {
         if !table.fields.is_empty()
             || table.trailing_multivalue.is_some()
             || self.facts.allocation_result_home(table) != Some(home)
-            || context.barred.contains(&home)
+            || (context.barred.contains(&home)
+                && !self.facts.allocation_result_reference_unaliased(table))
             || context.closed.contains(&home)
         {
             return None;
@@ -547,7 +561,6 @@ impl FrameBuilder<'_> {
                 if !array_fields
                     || offset + 1 != write_count
                     || !batch.values.fixed.is_empty()
-                    || batch.initializer_debug_scope.is_some()
                     || batch.start_index as usize != offset + 1
                     || layout.base != home
                     || layout.buffer != HomeSlotKey::new(slot + 1, 0)
@@ -556,6 +569,7 @@ impl FrameBuilder<'_> {
                 {
                     return None;
                 }
+                self.batch_initializer_matches(seed, table, batch, slot)?;
                 let HirExpr::Call(call) = tail.as_expr() else {
                     return None;
                 };
@@ -810,28 +824,7 @@ impl FrameBuilder<'_> {
         };
         let layout = self.facts.native_table_batch_layout(batch)?;
         let arrays = batch.values.fixed.len() + usize::from(batch.values.tail.is_some());
-        if batch.initializer_debug_scope.is_some() {
-            let context = self.native?;
-            let scope = match batch.base {
-                HirExpr::LocalRef(local) => context.proto.local_debug_scopes.get(local.index()),
-                HirExpr::TempRef(temp) => context.proto.temp_debug_scopes.get(temp.index()),
-                _ => None,
-            }
-            .copied()
-            .flatten();
-            let home = crate::hir::simplify::table_constructors::debug_initializer_home(
-                self.run[seed],
-                batch,
-                scope,
-                self.facts,
-            )?;
-            if home != HomeSlotKey::new(slot, 0)
-                || context.barred.contains(&home)
-                || context.closed.contains(&home)
-            {
-                return None;
-            }
-        }
+        self.batch_initializer_matches(seed, table, batch, slot)?;
         let buffer = self.constructor_reserved_top.unwrap_or(0).max(slot + 1);
         if !(1..=16).contains(&arrays)
             || batch.start_index != 1

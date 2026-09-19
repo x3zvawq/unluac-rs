@@ -2,6 +2,24 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/setlist_11_captured_constructor_frames.lua",
+        &[
+            "constructor",
+            "setlist",
+            "multi-return",
+            "capture",
+            "call-frame",
+        ],
+        "构造帧内固定元素与开放尾保持原求值顺序和返回宽度，后续捕获不阻断原帧恢复。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/fields_01_global_table_install_readability.lua",
         &["callbacks", "inline-alias", "table-constructor"],
         "把全局表字段安装恢复为直接构造器与函数字段，同时内联 make_level 的三个参数别名。",

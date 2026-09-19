@@ -769,8 +769,13 @@ pub(super) fn branch_part(
         return Some(BranchPart::Condition);
     }
     let (then_entry, else_entry) = branch_arm_entries(branch, input)?;
-    let in_then = graph_facts.dominates(then_entry, block);
-    let in_else = else_entry.is_some_and(|entry| graph_facts.dominates(entry, block));
+    // continuation 是 arm 的出口，不是其词法入口。循环 header 作为回边出口时
+    // 支配整个循环，不能据此把另一臂的 gated tail 同时归给两臂并逐出 branch。
+    let in_then =
+        Some(then_entry) != branch.branch.merge && graph_facts.dominates(then_entry, block);
+    let in_else = else_entry.is_some_and(|entry| {
+        Some(entry) != branch.branch.merge && graph_facts.dominates(entry, block)
+    });
     match (in_then, in_else) {
         (true, false) => Some(BranchPart::Then),
         (false, true) => Some(BranchPart::Else),
