@@ -585,6 +585,7 @@ pub(super) fn run_unsupported_island_contract(
         "permissive",
         &generated.source,
         permissive.state.readability.as_ref(),
+        permissive.state.naming.as_ref(),
         entry,
         &assertions,
         true,

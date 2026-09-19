@@ -1,4 +1,5 @@
 {
+    "autoimport.filesToScan": "packages/unluac-web/**/*.{ts,tsx}",
     "json.schemaDownload.trustedDomains": {
         "https://raw.githubusercontent.com/DavidAnson/markdownlint/": true
     },

@@ -54,7 +54,7 @@ fn primitive_literal(expr: &AstExpr) -> Option<LuaLiteral<'_>> {
 }
 
 /// 表达式是否保证只产生布尔值。
-pub(super) fn expr_is_boolean_valued(expr: &AstExpr) -> bool {
+pub(crate) fn expr_is_boolean_valued(expr: &AstExpr) -> bool {
     value_facts(expr).is_boolean()
 }
 

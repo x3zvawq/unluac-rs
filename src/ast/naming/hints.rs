@@ -1,7 +1,5 @@
-//! 这个文件负责从 AST 结构收集 naming hint。
-//!
-//! 这些 hint 不是必需信息，但它们能让 `Simple/Heuristic` 比纯 fallback 更接近源码：
-//! 例如 `self`、loop 角色、field/table/function/result 形状等。
+//! 从最终 AST 收集命名提示，区分基础语法角色与 heuristic 的形状、调用和用途线索。
+//! 同级冲突保留歧义，不让遍历顺序决定名称；提示不参与语义改写或 binding 身份恢复。
 
 use std::collections::BTreeMap;
 
@@ -13,8 +11,12 @@ use crate::ast::{
 };
 use crate::hir::{HirProtoRef, ParamId};
 
-use super::common::{CandidateHint, FunctionHints, LoopContext, NameSource};
+use super::common::{CandidateHint, FunctionHints, HintChoice, LoopContext, NameSource};
 use super::support::normalize_identifier;
+
+mod expressions;
+mod stdlib;
+use expressions::{candidate_from_expr, field_name, initializer_for_slot};
 
 /// 收集已通过 Naming 入口校验的最终 AST hints；不再查询 HIR 身份。
 pub(super) fn collect_function_hints(module: &AstModule, hints: &mut [FunctionHints]) {
@@ -23,7 +25,10 @@ pub(super) fn collect_function_hints(module: &AstModule, hints: &mut [FunctionHi
         &module.body,
         hints,
         LoopContext::default(),
-    )
+    );
+    if hints[module.entry_function.index()].heuristic {
+        stdlib::collect_hints(module, hints);
+    }
 }
 
 fn collect_block_hints(
@@ -51,8 +56,10 @@ fn collect_stmt_hints(
             for binding in &local_decl.bindings {
                 record_binding_presence(function, binding.id, hints);
             }
-            for (binding, value) in local_decl.bindings.iter().zip(local_decl.values.iter()) {
-                register_binding_expr_hint(function, binding.id, value, hints);
+            for (index, binding) in local_decl.bindings.iter().enumerate() {
+                if let Some(value) = initializer_for_slot(&local_decl.values, index) {
+                    register_binding_expr_hint(function, binding.id, value, hints);
+                }
             }
         }
         AstStmt::GlobalDecl(global_decl) => {
@@ -67,12 +74,19 @@ fn collect_stmt_hints(
             for value in &assign.values {
                 collect_expr_hints(function, value, hints);
             }
-            if let ([AstLValue::Name(name)], [value]) =
-                (assign.targets.as_slice(), assign.values.as_slice())
-                && let Some(binding) = final_binding_from_name_ref(name)
-            {
-                record_binding_presence(function, binding, hints);
-                register_binding_expr_hint(function, binding, value, hints);
+            for (index, target) in assign.targets.iter().enumerate() {
+                if let Some(value) = initializer_for_slot(&assign.values, index) {
+                    if let AstLValue::Name(name) = target
+                        && let Some(binding) = final_binding_from_name_ref(name)
+                    {
+                        register_binding_expr_hint(function, binding, value, hints);
+                    }
+                    // 开放多返回尾包的每个位置没有独立 AST operand，不能把同一
+                    // callee 误当作这些字段的源码变量。
+                    if index < assign.values.len() {
+                        register_usage_hint(function, value, field_name(target), hints);
+                    }
+                }
             }
         }
         AstStmt::CallStmt(call_stmt) => collect_call_hints(function, &call_stmt.call, hints),
@@ -198,6 +212,18 @@ fn collect_lvalue_hints(function: HirProtoRef, target: &AstLValue, hints: &mut [
 fn collect_expr_hints(function: HirProtoRef, expr: &AstExpr, hints: &mut [FunctionHints]) {
     for node in expr_nodes(expr) {
         match node {
+            ExprNode::Expr(AstExpr::TableConstructor(table)) => {
+                for field in &table.fields {
+                    if let crate::ast::AstTableField::Record(record) = field {
+                        let name = match &record.key {
+                            crate::ast::AstTableKey::Name(name) => Some(name.as_str()),
+                            crate::ast::AstTableKey::Expr(AstExpr::String(name)) => name.as_utf8(),
+                            _ => None,
+                        };
+                        register_usage_hint(function, &record.value, name, hints);
+                    }
+                }
+            }
             ExprNode::Expr(AstExpr::Var(AstNameRef::SyntheticLocal(local))) => {
                 record_synthetic_local(function, *local, hints);
             }
@@ -220,6 +246,25 @@ fn register_binding_expr_hint(
     register_binding_hint(function, binding, candidate, source, hints);
 }
 
+fn register_usage_hint(
+    function: HirProtoRef,
+    value: &AstExpr,
+    field: Option<&str>,
+    hints: &mut [FunctionHints],
+) {
+    let Some(name) = field.and_then(normalize_identifier) else {
+        return;
+    };
+    let AstExpr::Var(source) = value else {
+        return;
+    };
+    if let AstNameRef::Param(param) = source {
+        register_param_hint(function, *param, &name, NameSource::Usage, hints);
+    } else if let Some(binding) = final_binding_from_name_ref(source) {
+        register_binding_hint(function, binding, name, NameSource::Usage, hints);
+    }
+}
+
 fn record_binding_presence(
     function: HirProtoRef,
     binding: AstBindingRef,
@@ -238,6 +283,11 @@ fn register_binding_hint(
     source: NameSource,
     hints: &mut [FunctionHints],
 ) {
+    if !hints[function.index()].heuristic
+        && !matches!(source, NameSource::LoopRole | NameSource::FunctionShape)
+    {
+        return;
+    }
     match binding {
         AstBindingRef::Local(local) => {
             insert_hint(
@@ -270,6 +320,9 @@ fn register_param_hint(
     source: NameSource,
     hints: &mut [FunctionHints],
 ) {
+    if !hints[function.index()].heuristic && source != NameSource::SelfParam {
+        return;
+    }
     let Some(candidate) = normalize_identifier(candidate) else {
         return;
     };
@@ -285,27 +338,33 @@ fn record_synthetic_local(
     hints[function.index()].synthetic_locals.insert(local);
 }
 
-fn insert_hint<K>(
-    map: &mut BTreeMap<K, CandidateHint>,
-    key: K,
-    candidate: String,
-    source: NameSource,
-) where
+fn insert_hint<K>(map: &mut BTreeMap<K, HintChoice>, key: K, candidate: String, source: NameSource)
+where
     K: Ord,
 {
-    let should_replace = map
-        .get(&key)
-        .map(|existing| hint_priority(source) > hint_priority(existing.source))
-        .unwrap_or(true);
-    if should_replace {
-        map.insert(
-            key,
-            CandidateHint {
-                text: candidate,
-                source,
-            },
-        );
+    if let Some(existing) = map.get(&key) {
+        match hint_priority(source).cmp(&hint_priority(existing.source())) {
+            std::cmp::Ordering::Less => return,
+            std::cmp::Ordering::Equal => {
+                // 两个同等可信的用途不应由出现顺序定胜负；后续重复提示也不能解除歧义。
+                if existing
+                    .candidate()
+                    .is_some_and(|hint| hint.text != candidate)
+                {
+                    map.insert(key, HintChoice::Ambiguous(source));
+                }
+                return;
+            }
+            std::cmp::Ordering::Greater => {}
+        }
     }
+    map.insert(
+        key,
+        HintChoice::Unique(CandidateHint {
+            text: candidate,
+            source,
+        }),
+    );
 }
 
 fn hint_priority(source: NameSource) -> usize {
@@ -316,79 +375,17 @@ fn hint_priority(source: NameSource) -> usize {
         NameSource::CaptureProvenance => 95,
         NameSource::SelfParam => 90,
         NameSource::LoopRole => 80,
+        NameSource::ModulePath => 78,
+        NameSource::Usage => 75,
         NameSource::FieldName => 70,
+        NameSource::LibrarySignature => 68,
+        NameSource::CallResult => 65,
         NameSource::TableShape | NameSource::BoolShape | NameSource::FunctionShape => 60,
+        NameSource::NumberShape | NameSource::StringShape => 60,
         NameSource::ResultShape => 50,
         NameSource::Discard => 20,
         NameSource::DebugLike | NameSource::Simple | NameSource::ConflictFallback => 10,
     }
-}
-
-fn candidate_from_expr(expr: &AstExpr) -> Option<(String, NameSource)> {
-    match expr {
-        AstExpr::FieldAccess(access) => {
-            Some((normalize_identifier(&access.field)?, NameSource::FieldName))
-        }
-        AstExpr::IndexAccess(access) => Some((
-            candidate_from_index_base(&access.base)?,
-            NameSource::FieldName,
-        )),
-        AstExpr::TableConstructor(_) => Some(("tbl".to_owned(), NameSource::TableShape)),
-        AstExpr::FunctionExpr(_) => Some(("fn".to_owned(), NameSource::FunctionShape)),
-        AstExpr::Call(_) | AstExpr::MethodCall(_) => {
-            Some(("result".to_owned(), NameSource::ResultShape))
-        }
-        AstExpr::SingleValue(expr) => candidate_from_expr(expr),
-        AstExpr::Boolean(_)
-        | AstExpr::LogicalAnd(_)
-        | AstExpr::LogicalOr(_)
-        | AstExpr::Unary(_)
-        | AstExpr::Binary(_) => Some(("ok".to_owned(), NameSource::BoolShape)),
-        AstExpr::Var(AstNameRef::Global(global)) => {
-            Some((normalize_identifier(&global.text)?, NameSource::FieldName))
-        }
-        AstExpr::Nil
-        | AstExpr::Integer(_)
-        | AstExpr::Number(_)
-        | AstExpr::String(_)
-        | AstExpr::Int64(_)
-        | AstExpr::UInt64(_)
-        | AstExpr::Vector(_)
-        | AstExpr::Complex { .. }
-        | AstExpr::Var(_)
-        | AstExpr::CaptureInitializer(_)
-        | AstExpr::VarArg
-        | AstExpr::Error(_) => None,
-    }
-}
-
-fn candidate_from_index_base(base: &AstExpr) -> Option<String> {
-    match base {
-        AstExpr::FieldAccess(access) => Some(singularize_field_name(&access.field)),
-        AstExpr::IndexAccess(access) => candidate_from_index_base(&access.base),
-        AstExpr::Var(AstNameRef::Global(global)) => normalize_identifier(&global.text),
-        AstExpr::Var(_) => Some("item".to_owned()),
-        _ => None,
-    }
-}
-
-fn singularize_field_name(field: &str) -> String {
-    let singular = if let Some(stem) = field.strip_suffix("ies") {
-        format!("{stem}y")
-    } else if let Some(stem) = field.strip_suffix("ches") {
-        format!("{stem}ch")
-    } else if let Some(stem) = field.strip_suffix("shes") {
-        format!("{stem}sh")
-    } else if let Some(stem) = field.strip_suffix("sses") {
-        format!("{stem}ss")
-    } else if let Some(stem) = field.strip_suffix("xes") {
-        format!("{stem}x")
-    } else if field.len() > 1 {
-        field.strip_suffix('s').unwrap_or(field).to_owned()
-    } else {
-        field.to_owned()
-    };
-    normalize_identifier(&singular).unwrap_or_else(|| "item".to_owned())
 }
 
 fn final_binding_from_name_ref(name: &AstNameRef) -> Option<AstBindingRef> {

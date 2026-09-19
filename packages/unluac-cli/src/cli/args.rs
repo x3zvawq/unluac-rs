@@ -272,7 +272,8 @@ struct ReadabilityArgs {
     /// Max inline complexity for table access bases.
     #[arg(long, help_heading = "Generate")]
     access_base_inline_max_complexity: Option<usize>,
-    /// Naming strategy.
+    /// Fallback names: debug-like uses numbered names, simple uses generic roles,
+    /// heuristic infers names from expressions and usage. All modes prefer debug names.
     #[arg(
         short = 'n',
         long,
@@ -280,7 +281,7 @@ struct ReadabilityArgs {
         help_heading = "Generate"
     )]
     naming_mode: Option<NamingMode>,
-    /// Whether debug-like names should include function-shaped names.
+    /// Whether debug-like names should include the function index.
     #[arg(
         long,
         value_name = "BOOL",

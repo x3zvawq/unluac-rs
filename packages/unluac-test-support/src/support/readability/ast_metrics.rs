@@ -32,6 +32,7 @@ impl AstMetricCounts {
 pub(super) struct AstMetricSummary {
     total: AstMetricCounts,
     proto_counts: Vec<AstMetricCounts>,
+    local_bindings: Vec<Vec<AstBindingRef>>,
     proto_indexes: BTreeMap<usize, usize>,
     repeat_condition_locals: BTreeSet<AstBindingRef>,
 }
@@ -42,6 +43,7 @@ impl AstMetricSummary {
         let mut summary = Self {
             total: AstMetricCounts::default(),
             proto_counts: vec![AstMetricCounts::default()],
+            local_bindings: vec![Vec::new()],
             proto_indexes: BTreeMap::from([(entry_proto, 0)]),
             repeat_condition_locals: BTreeSet::new(),
         };
@@ -59,6 +61,14 @@ impl AstMetricSummary {
         }
     }
 
+    /// 使用最终声明顺序，避免把已消除的 HIR local 或 SyntheticLocal 当作源码槽位。
+    pub(super) fn local_binding(&self, proto: usize, index: usize) -> Option<AstBindingRef> {
+        self.local_bindings
+            .get(*self.proto_indexes.get(&proto)?)?
+            .get(index)
+            .copied()
+    }
+
     fn increment(&mut self, scope: usize, metric: ReadabilityAstMetric) {
         self.total.increment(metric);
         self.proto_counts[scope].increment(metric);
@@ -73,6 +83,7 @@ impl AstMetricSummary {
     fn visit_stmt(&mut self, scope: usize, stmt: &AstStmt) {
         match stmt {
             AstStmt::LocalDecl(decl) => {
+                self.local_bindings[scope].extend(decl.bindings.iter().map(|binding| binding.id));
                 self.increment(scope, ReadabilityAstMetric::LocalDecl);
                 if decl.values.is_empty() {
                     self.increment(scope, ReadabilityAstMetric::EmptyLocal);
@@ -137,6 +148,7 @@ impl AstMetricSummary {
                 self.repeat_condition_locals.clear();
             }
             AstStmt::NumericFor(for_stmt) => {
+                self.local_bindings[scope].push(for_stmt.binding);
                 self.increment(scope, ReadabilityAstMetric::NumericFor);
                 self.visit_expr(scope, &for_stmt.start);
                 self.visit_expr(scope, &for_stmt.limit);
@@ -144,6 +156,7 @@ impl AstMetricSummary {
                 self.visit_block(scope, &for_stmt.body);
             }
             AstStmt::GenericFor(for_stmt) => {
+                self.local_bindings[scope].extend(for_stmt.bindings.iter().copied());
                 self.increment(scope, ReadabilityAstMetric::GenericFor);
                 for iterator in &for_stmt.iterator {
                     self.visit_expr(scope, iterator);
@@ -160,6 +173,7 @@ impl AstMetricSummary {
             }
             AstStmt::FunctionDecl(decl) => self.visit_function(scope, &decl.func),
             AstStmt::LocalFunctionDecl(decl) => {
+                self.local_bindings[scope].push(decl.name);
                 self.increment(scope, ReadabilityAstMetric::LocalFunction);
                 self.visit_function(scope, &decl.func);
             }
@@ -278,6 +292,7 @@ impl AstMetricSummary {
             None => {
                 let index = self.proto_counts.len();
                 self.proto_counts.push(AstMetricCounts::default());
+                self.local_bindings.push(Vec::new());
                 self.proto_indexes.insert(proto, index);
                 index
             }

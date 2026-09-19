@@ -2,6 +2,58 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/naming_04_stdlib_signatures.lua",
+        &["naming", "stdlib", "debug", "multiret"],
+        "标准库实参角色按模式命名，保留 debug 与字段优先级，并拒绝冲突或未知宽度重载。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_variants(ALL_NAMING_VARIANTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS)
+                .with_variants(ALL_NAMING_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/naming_05_stdlib_overrides.lua",
+        &["naming", "stdlib", "shadow", "mutation"],
+        "标准库成员及全局库对象的显式重定义不使用签名提示；Luau 只读库不支持原地替换。",
+        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_variants(ALL_NAMING_VARIANTS)],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/naming_01_mode_boundaries.lua",
+        &["naming", "debug", "array"],
+        "同一 binding 分别断言 debug-like、simple、heuristic 名字，并验证 debug 优先及 ignore-debug。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_variants(ALL_NAMING_VARIANTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS)
+                .with_variants(ALL_NAMING_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(PUC_LUA_54).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ignore_debug: true,
+                naming_mode: Some(NamingMode::Heuristic),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/naming_02_expression_results.lua",
+        &["naming", "multiret", "operators"],
+        "区分算术、连接、长度、布尔与逻辑选值，并为多返回所有槽提供一致命名提示。",
+        &[LuaCaseConfiguration::new(ALL_DIALECTS).with_variants(ALL_NAMING_VARIANTS)],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_bindings/naming_03_usage_and_calls.lua",
+        &["naming", "capture", "usage", "module"],
+        "字段反向用途、模块与调用命名保持冲突处理及 capture 身份，丢弃参数仍保留参数位置。",
+        &[LuaCaseConfiguration::new(ALL_DIALECTS).with_variants(ALL_NAMING_VARIANTS)],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/scope_01_repeat_inner_ref.lua",
         &["repeat", "scope", "short-circuit"],
         "证明 repeat 体内声明的 a、b 在 until 条件中仍可见，并保持两个局部计算参与短路退出。",

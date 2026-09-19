@@ -361,6 +361,12 @@ pub(crate) struct CaseBaseline {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum ReadabilityAssertion {
+    Name {
+        line: usize,
+        binding: NamingBindingSelector,
+        expected: String,
+        selector: ReadabilitySelector,
+    },
     Contains {
         line: usize,
         needle: String,
@@ -442,12 +448,21 @@ enum ReadabilityAstMetric {
 /// 源码断言对 manifest 已展开实例的精确筛选；不在测试源码中重复方言或编译选项矩阵。
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct ReadabilitySelector {
+    naming_mode: Option<unluac::ast::NamingMode>,
     dialect: Option<LuaCaseDialect>,
     debug: Option<ReadabilityDebugSelector>,
     /// 直接与 manifest entry 的展示标签比较，允许新增 variant 无需同步这套断言原语。
     variant: Option<String>,
-    /// 仅 AST 指标使用；数值是 `HirProtoRef::index()`，以目标 proto 的函数体为统计域。
+    /// AST 指标及 NameMap 断言使用；数值是 `HirProtoRef::index()`。
     proto: Option<usize>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum NamingBindingSelector {
+    Param(usize),
+    /// 最终 AST 中的声明序号，包含循环、local function 和 synthetic local。
+    Local(usize),
+    Upvalue(usize),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

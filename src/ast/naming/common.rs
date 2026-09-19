@@ -14,9 +14,12 @@ use strum_macros::{Display, EnumString, IntoStaticStr};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Display, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum NamingMode {
+    /// 优先保留 debug 名，缺失时使用稳定的函数/绑定编号。
     DebugLike,
+    /// 使用通用递增名以及循环、函数等基本语法角色，不推断业务用途。
     #[default]
     Simple,
+    /// 在通用策略上利用表达式形状、字段用途和调用线索推断名字。
     Heuristic,
 }
 
@@ -51,6 +54,12 @@ pub enum NameSource {
     BoolShape,
     FunctionShape,
     ResultShape,
+    NumberShape,
+    StringShape,
+    Usage,
+    ModulePath,
+    CallResult,
+    LibrarySignature,
     Discard,
     DebugLike,
     Simple,
@@ -104,10 +113,33 @@ pub(super) struct ClosureCaptureEvidence<'hir> {
 /// 从 AST 结构收集到的 naming hint。
 #[derive(Debug, Clone, Default)]
 pub(super) struct FunctionHints {
-    pub(super) param_hints: BTreeMap<ParamId, CandidateHint>,
-    pub(super) local_hints: BTreeMap<LocalId, CandidateHint>,
+    pub(super) heuristic: bool,
+    pub(super) param_hints: BTreeMap<ParamId, HintChoice>,
+    pub(super) local_hints: BTreeMap<LocalId, HintChoice>,
     pub(super) synthetic_locals: BTreeSet<AstSyntheticLocalId>,
-    pub(super) synthetic_local_hints: BTreeMap<AstSyntheticLocalId, CandidateHint>,
+    pub(super) synthetic_local_hints: BTreeMap<AstSyntheticLocalId, HintChoice>,
+}
+
+/// 同级证据冲突时不采用遍历顺序碰巧选中的名字；更强证据仍可覆盖冲突。
+#[derive(Debug, Clone)]
+pub(super) enum HintChoice {
+    Unique(CandidateHint),
+    Ambiguous(NameSource),
+}
+
+impl HintChoice {
+    pub(super) fn candidate(&self) -> Option<&CandidateHint> {
+        match self {
+            Self::Unique(candidate) => Some(candidate),
+            Self::Ambiguous(_) => None,
+        }
+    }
+    pub(super) fn source(&self) -> NameSource {
+        match self {
+            Self::Unique(candidate) => candidate.source,
+            Self::Ambiguous(source) => *source,
+        }
+    }
 }
 
 /// 一个候选名字及其来源。

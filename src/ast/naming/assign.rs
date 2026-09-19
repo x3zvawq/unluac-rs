@@ -11,7 +11,9 @@ use crate::hir::HirModule;
 use super::NamingError;
 use super::allocate::{FunctionAssignContext, assign_names_for_function};
 use super::ast_facts::collect_ast_naming_facts;
-use super::common::{FunctionHints, ModuleNameAllocator, NameMap, NamingEvidence, NamingOptions};
+use super::common::{
+    FunctionHints, ModuleNameAllocator, NameMap, NamingEvidence, NamingMode, NamingOptions,
+};
 use super::evidence::collect_naming_evidence;
 use super::hints::collect_function_hints;
 use super::lexical::collect_lexical_contexts;
@@ -53,10 +55,26 @@ pub fn assign_names_with_evidence(
     options: NamingOptions,
 ) -> Result<NameMap, NamingError> {
     validate_readability_ast(module, hir)?;
-    let ast_facts = collect_ast_naming_facts(module, hir);
+    let mut ast_facts = collect_ast_naming_facts(module, hir);
+    // 子函数通过 upvalue 读取的参数仍有用；当前函数 AST 的直接读取并不完整。
+    for capture in evidence.functions.iter().flatten() {
+        for captured in capture.captures {
+            if let crate::hir::HirBinding::Param(param) = captured.binding {
+                ast_facts.functions[capture.parent.index()]
+                    .used_params
+                    .insert(param);
+            }
+        }
+    }
     let lexical_contexts = collect_lexical_contexts(module, hir);
 
-    let mut hints = vec![FunctionHints::default(); hir.protos.len()];
+    let mut hints = vec![
+        FunctionHints {
+            heuristic: options.mode == NamingMode::Heuristic,
+            ..FunctionHints::default()
+        };
+        hir.protos.len()
+    ];
     collect_function_hints(module, &mut hints);
 
     let mut visible_names = VisibleNames::default();

@@ -11,6 +11,7 @@ mod branch_pretty;
 mod cleanup;
 mod control_flow;
 mod expr_analysis;
+pub(crate) use expr_analysis::expr_is_boolean_valued;
 mod field_access_sugar;
 mod function_sugar;
 mod global_decl_pretty;

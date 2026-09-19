@@ -70,6 +70,18 @@ Source input (`--source`) requires an explicit dialect and a compatible external
 
 Use `--generate-mode strict` when you require target-compatible Lua output. The default permissive mode can return diagnostic pseudocode for constructs that cannot be represented. `--output` writes final source and cannot be combined with debug dumps, timing output or an earlier pipeline stage.
 
+Choose fallback names with `--naming-mode` / `-n`. All modes prefer valid debug names; use `--ignore-debug` to disregard them.
+
+| Mode | Names without debug information |
+| --- | --- |
+| `debug-like` (default) | Numbered names such as `p1_0` and `r1_0` for cross-referencing |
+| `simple` | Generic `a`, `b`, `value`, plus basic loop/function roles |
+| `heuristic` | Hints from expressions, field usage, module paths and call names, such as `arr`, `lvl`, `slot` and `user` |
+
+For example: `unluac-cli -i sample.luac -n heuristic`. Heuristic names are readability hints, not recovered original names or runtime type guarantees. See [Naming](./docs/design/8.naming.md) for the mode boundaries.
+
+Heuristic mode also uses a small standard-library signature table: arguments to `os.date` can suggest `format` and `time`, while `string.sub` suggests `text`, `start_index` and `end_index`. More specific field usage takes priority; conflicting roles keep generic names.
+
 See `unluac-cli --help` for all formatting, naming and decoding options, and the [debugging guide](./docs/debug.md) for pipeline inspection.
 
 ### Rust

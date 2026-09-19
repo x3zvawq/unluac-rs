@@ -24,6 +24,7 @@ export type UnluacStringEncoding =
   | "windows-874"
   | (string & {});
 export type UnluacStringDecodeMode = "strict" | "lossy";
+/** Fallback names: numbered, generic roles, or expression/usage hints. All modes prefer debug names. */
 export type UnluacNamingMode = "debug-like" | "simple" | "heuristic";
 export type UnluacGenerateMode = "strict" | "permissive";
 export type UnluacQuoteStyle = "prefer-double" | "prefer-single" | "min-escape";

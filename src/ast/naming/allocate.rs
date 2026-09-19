@@ -218,7 +218,7 @@ pub(super) fn assign_names_for_function(
         .map(|(index, param)| {
             allocate_param_name(
                 module_names.reserve_function_shape_name(
-                    choose_param_candidate(proto, *param, index, hints, options),
+                    choose_param_candidate(proto, *param, index, hints, ast_facts, options),
                     &names,
                     options.mode,
                 ),

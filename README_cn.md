@@ -70,6 +70,18 @@ unluac-cli -s example.lua -D lua5.4
 
 需要目标方言可接受的 Lua 源码时，请使用 `--generate-mode strict`。默认的 permissive 模式可能为不可表达的结构输出诊断伪源码。`--output` 用于保存最终源码，不能与调试 dump、计时输出或提前停止流水线的选项组合。
 
+通过 `--naming-mode` / `-n` 选择后备命名策略。所有模式优先保留合法 debug 名；使用 `--ignore-debug` 可忽略它们。
+
+| 模式 | 无 debug 信息时的名字 |
+| --- | --- |
+| `debug-like`（默认） | `p1_0`、`r1_0` 等带编号名字，便于对照 |
+| `simple` | `a`、`b`、`value` 等通用名，保留基本循环和函数角色 |
+| `heuristic` | 根据表达式、字段用途、模块路径和调用名称推测，如 `arr`、`lvl`、`slot`、`user` |
+
+例如：`unluac-cli -i sample.luac -n heuristic`。启发式名字是可读性提示，不保证恢复原名或运行时类型。具体边界见 [Naming 设计](./docs/design/8.naming.md)。
+
+Heuristic 还会使用小型标准库签名表：`os.date` 的实参可提示 `format/time`，`string.sub` 可提示 `text/start_index/end_index`。更具体的字段用途优先，角色冲突时保留通用名。
+
 完整的格式化、命名和解码选项见 `unluac-cli --help`；查看流水线中间结果的方法见[调试手册](./docs/debug.md)。
 
 ### Rust 库

@@ -9,8 +9,8 @@ use crate::hir::{HirBinding, HirProto, HirProtoRef, LocalId, ParamId};
 use super::NamingError;
 use super::ast_facts::FunctionAstNamingFacts;
 use super::common::{
-    CandidateHint, ClosureCaptureEvidence, FunctionHints, FunctionNameMap, NameSource, NamingMode,
-    NamingOptions,
+    CandidateHint, ClosureCaptureEvidence, FunctionHints, FunctionNameMap, HintChoice, NameSource,
+    NamingMode, NamingOptions,
 };
 use super::lexical::VisibleBinding;
 use super::support::{alphabetical_name, as_valid_name};
@@ -21,9 +21,13 @@ pub(super) fn choose_param_candidate(
     param: ParamId,
     index: usize,
     hints: &FunctionHints,
+    ast_facts: &FunctionAstNamingFacts,
     options: NamingOptions,
 ) -> CandidateHint {
-    if let Some(hint) = hints.param_hints.get(&param)
+    if let Some(hint) = hints
+        .param_hints
+        .get(&param)
+        .and_then(HintChoice::candidate)
         && hint.source == NameSource::SelfParam
     {
         return hint.clone();
@@ -43,7 +47,18 @@ pub(super) fn choose_param_candidate(
             alphabetical_name(index).unwrap_or_else(|| format!("arg{}", index + 1)),
         );
     }
-    if let Some(hint) = hints.param_hints.get(&param) {
+    if options.mode == NamingMode::Heuristic && !ast_facts.used_params.contains(&param) {
+        return CandidateHint {
+            text: "_".to_owned(),
+            source: NameSource::Discard,
+        };
+    }
+    if let Some(hint) = hints
+        .param_hints
+        .get(&param)
+        .and_then(HintChoice::candidate)
+        && accepts_hint(options.mode, hint.source)
+    {
         return hint.clone();
     }
     mode_fallback_candidate(
@@ -101,7 +116,12 @@ pub(super) fn choose_local_candidate(
             "value".to_owned(),
         );
     }
-    if let Some(hint) = hints.local_hints.get(&local) {
+    if let Some(hint) = hints
+        .local_hints
+        .get(&local)
+        .and_then(HintChoice::candidate)
+        && accepts_hint(options.mode, hint.source)
+    {
         return hint.clone();
     }
     mode_fallback_candidate(options, proto.id, "l", index, "value".to_owned())
@@ -189,7 +209,12 @@ pub(super) fn choose_synthetic_local_candidate(
             source: NameSource::Discard,
         };
     }
-    if let Some(hint) = hints.synthetic_local_hints.get(&local) {
+    if let Some(hint) = hints
+        .synthetic_local_hints
+        .get(&local)
+        .and_then(HintChoice::candidate)
+        && accepts_hint(options.mode, hint.source)
+    {
         return hint.clone();
     }
     mode_fallback_candidate(options, proto.id, "sl", index, "value".to_owned())
@@ -200,6 +225,14 @@ fn debug_like_binding_index(
     binding: crate::ast::AstBindingRef,
 ) -> Option<usize> {
     ast_facts.debug_like_binding_order.get(&binding).copied()
+}
+
+fn accepts_hint(mode: NamingMode, source: NameSource) -> bool {
+    mode == NamingMode::Heuristic
+        || matches!(
+            source,
+            NameSource::SelfParam | NameSource::LoopRole | NameSource::FunctionShape
+        )
 }
 
 pub(super) fn resolve_visible_binding_name(

@@ -50,7 +50,7 @@ pub(super) fn read_readability_assertions(
             | "expect-not-line"
             | "expect-max-line-length" => 1,
             "expect-order" | "expect-count" | "expect-min-count" | "expect-max-count"
-            | "expect-ast-count" | "expect-ast-min" | "expect-ast-max" => 2,
+            | "expect-ast-count" | "expect-ast-min" | "expect-ast-max" | "expect-name" => 2,
             other => {
                 return Err(readability_parse_failure(
                     source_relative,
@@ -61,17 +61,30 @@ pub(super) fn read_readability_assertions(
         };
         let (args, selector) = split_assertion_args(args, required_data_args)
             .map_err(|error| readability_parse_failure(source_relative, line_no, error))?;
-        if selector.proto.is_some() && !directive.starts_with("expect-ast-") {
+        if selector.proto.is_some()
+            && !directive.starts_with("expect-ast-")
+            && directive != "expect-name"
+        {
             return Err(readability_parse_failure(
                 source_relative,
                 line_no,
                 format!(
-                    "{directive} cannot use @proto; proto scopes require an expect-ast-* directive"
+                    "{directive} cannot use @proto; proto scopes require expect-ast-* or expect-name"
                 ),
             ));
         }
 
         match directive {
+            "expect-name" => {
+                let binding = parse_naming_binding(&args[0])
+                    .map_err(|error| readability_parse_failure(source_relative, line_no, error))?;
+                assertions.push(ReadabilityAssertion::Name {
+                    line: line_no,
+                    binding,
+                    expected: args[1].clone(),
+                    selector,
+                });
+            }
             "expect-contains" => {
                 let [needle] = args.as_slice() else {
                     return Err(readability_parse_failure(
@@ -266,6 +279,16 @@ fn split_assertion_args(
             return Err(format!("selector {argument:?} has an empty value"));
         }
         match key {
+            "naming-mode" => {
+                if selector.naming_mode.is_some() {
+                    return Err("selector @naming-mode may appear at most once".to_owned());
+                }
+                selector.naming_mode = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("unknown @naming-mode value {value:?}"))?,
+                );
+            }
             "dialect" => {
                 if selector.dialect.is_some() {
                     return Err("selector @dialect may appear at most once".to_owned());
@@ -318,6 +341,21 @@ fn parse_selector_dialect(value: &str) -> Result<LuaCaseDialect, String> {
         "luajit" => Ok(LuaCaseDialect::Luajit),
         "luau" => Ok(LuaCaseDialect::Luau),
         _ => Err(format!("unknown @dialect value {value:?}")),
+    }
+}
+
+fn parse_naming_binding(value: &str) -> Result<NamingBindingSelector, String> {
+    let (kind, index) = value
+        .split_once(':')
+        .ok_or_else(|| "expect-name requires param:N, local:N, or upvalue:N".to_owned())?;
+    let index = index
+        .parse::<usize>()
+        .map_err(|_| "expect-name requires a non-negative binding index".to_owned())?;
+    match kind {
+        "param" => Ok(NamingBindingSelector::Param(index)),
+        "local" => Ok(NamingBindingSelector::Local(index)),
+        "upvalue" => Ok(NamingBindingSelector::Upvalue(index)),
+        _ => Err(format!("unknown naming binding kind {kind:?}")),
     }
 }
 
@@ -442,6 +480,7 @@ pub(super) fn assert_readability(
     stage_label: &str,
     generated_source: &str,
     readability: Option<&AstModule>,
+    naming: Option<&unluac::ast::NameMap>,
     entry: &LuaCaseManifestEntry,
     assertions: &[ReadabilityAssertion],
     check_positive_shape: bool,
@@ -449,14 +488,16 @@ pub(super) fn assert_readability(
     let mut source_counts = BTreeMap::new();
     let ast_metrics = if check_positive_shape
         && assertions.iter().any(|assertion| {
-            matches!(assertion, ReadabilityAssertion::AstCount { .. })
-                && assertion_selector_matches(assertion, entry)
+            matches!(
+                assertion,
+                ReadabilityAssertion::AstCount { .. } | ReadabilityAssertion::Name { .. }
+            ) && assertion_selector_matches(assertion, entry)
         }) {
         let module = readability.ok_or_else(|| {
             readability_assertion_failure(
                 stage_label,
                 0,
-                "expected final readability AST for expect-ast-* assertion".to_owned(),
+                "expected final readability AST for AST/name assertion".to_owned(),
                 generated_source,
             )
         })?;
@@ -470,6 +511,46 @@ pub(super) fn assert_readability(
             continue;
         }
         match assertion {
+            ReadabilityAssertion::Name {
+                line,
+                binding,
+                expected,
+                selector,
+            } if check_positive_shape => {
+                let proto = selector
+                    .proto
+                    .unwrap_or_else(|| naming.map_or(0, |names| names.entry_function.index()));
+                let actual = ast_metrics
+                    .as_ref()
+                    .filter(|metrics| metrics.count(Some(proto)).is_some())
+                    .and(naming)
+                    .and_then(|names| names.functions.get(proto))
+                    .and_then(|names| match binding {
+                        NamingBindingSelector::Param(index) => names.params.get(*index),
+                        NamingBindingSelector::Local(index) => match ast_metrics
+                            .as_ref()?
+                            .local_binding(proto, *index)?
+                        {
+                            unluac::ast::AstBindingRef::Local(id) => names.locals.get(id.index()),
+                            unluac::ast::AstBindingRef::SyntheticLocal(id) => {
+                                names.synthetic_locals.get(&id)
+                            }
+                            unluac::ast::AstBindingRef::Temp(_) => None,
+                        },
+                        NamingBindingSelector::Upvalue(index) => names.upvalues.get(*index),
+                    });
+                if actual.is_none_or(|name| name.text != *expected) {
+                    return Err(readability_assertion_failure(
+                        stage_label,
+                        *line,
+                        format!(
+                            "expected name {binding:?} in proto#{proto} to be {expected:?}; actual {:?}",
+                            actual.map(|name| &name.text)
+                        ),
+                        generated_source,
+                    ));
+                }
+            }
             ReadabilityAssertion::Contains { line, needle, .. } if check_positive_shape => {
                 if !generated_source.contains(needle) {
                     return Err(readability_assertion_failure(
@@ -604,7 +685,8 @@ pub(super) fn assert_readability(
                     ));
                 }
             }
-            ReadabilityAssertion::Contains { .. }
+            ReadabilityAssertion::Name { .. }
+            | ReadabilityAssertion::Contains { .. }
             | ReadabilityAssertion::Order { .. }
             | ReadabilityAssertion::SourceCount { .. }
             | ReadabilityAssertion::AstCount { .. } => {}
@@ -623,7 +705,8 @@ fn assertion_selector_matches(
 
 fn assertion_selector(assertion: &ReadabilityAssertion) -> &ReadabilitySelector {
     match assertion {
-        ReadabilityAssertion::Contains { selector, .. }
+        ReadabilityAssertion::Name { selector, .. }
+        | ReadabilityAssertion::Contains { selector, .. }
         | ReadabilityAssertion::NotContains { selector, .. }
         | ReadabilityAssertion::NotLine { selector, .. }
         | ReadabilityAssertion::Order { selector, .. }
@@ -635,7 +718,8 @@ fn assertion_selector(assertion: &ReadabilityAssertion) -> &ReadabilitySelector 
 
 fn assertion_line(assertion: &ReadabilityAssertion) -> usize {
     match assertion {
-        ReadabilityAssertion::Contains { line, .. }
+        ReadabilityAssertion::Name { line, .. }
+        | ReadabilityAssertion::Contains { line, .. }
         | ReadabilityAssertion::NotContains { line, .. }
         | ReadabilityAssertion::NotLine { line, .. }
         | ReadabilityAssertion::Order { line, .. }
@@ -646,7 +730,12 @@ fn assertion_line(assertion: &ReadabilityAssertion) -> usize {
 }
 
 fn selector_matches_entry(selector: &ReadabilitySelector, entry: &LuaCaseManifestEntry) -> bool {
-    selector
+    selector.naming_mode.is_none_or(|mode| {
+        mode == entry
+            .options
+            .naming_mode
+            .unwrap_or_else(|| DecompileOptions::default().naming.mode)
+    }) && selector
         .dialect
         .is_none_or(|dialect| dialect == entry.dialect)
         && selector
@@ -675,7 +764,8 @@ fn debug_selector_for_entry(entry: &LuaCaseManifestEntry) -> ReadabilityDebugSel
 
 impl ReadabilitySelector {
     fn is_configured(&self) -> bool {
-        self.dialect.is_some()
+        self.naming_mode.is_some()
+            || self.dialect.is_some()
             || self.debug.is_some()
             || self.variant.is_some()
             || self.proto.is_some()
@@ -683,6 +773,9 @@ impl ReadabilitySelector {
 
     fn describe(&self) -> String {
         let mut terms = Vec::new();
+        if let Some(mode) = self.naming_mode {
+            terms.push(format!("@naming-mode={mode}"));
+        }
         if let Some(dialect) = self.dialect {
             terms.push(format!("@dialect={}", <&'static str>::from(dialect)));
         }

@@ -43,6 +43,7 @@ impl AstNamingFacts<'_> {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct FunctionAstNamingFacts {
+    pub(super) used_params: BTreeSet<crate::hir::ParamId>,
     pub(super) debug_like_binding_order: BTreeMap<AstBindingRef, usize>,
     pub(super) unused_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
     global_name_range: Range<usize>,
@@ -62,6 +63,7 @@ pub(super) fn collect_ast_naming_facts<'ast>(
 
 #[derive(Debug, Default)]
 struct FunctionAstCollector<'ast> {
+    used_params: BTreeSet<crate::hir::ParamId>,
     binding_order: BTreeMap<AstBindingRef, usize>,
     declared_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
     mentioned_synthetic_locals: BTreeSet<AstSyntheticLocalId>,
@@ -78,6 +80,9 @@ impl<'ast> FunctionAstCollector<'ast> {
     }
 
     fn note_name_ref(&mut self, name: &'ast AstNameRef) {
+        if let AstNameRef::Param(param) = name {
+            self.used_params.insert(*param);
+        }
         match AstBindingRef::from_name_ref(name) {
             Some(AstBindingRef::Local(local)) => self.note_binding(AstBindingRef::Local(local)),
             Some(AstBindingRef::SyntheticLocal(local)) => {
@@ -108,6 +113,7 @@ impl<'ast> FunctionAstCollector<'ast> {
             .collect();
 
         FunctionAstNamingFacts {
+            used_params: self.used_params,
             debug_like_binding_order: self.binding_order,
             unused_synthetic_locals,
             global_name_range,
