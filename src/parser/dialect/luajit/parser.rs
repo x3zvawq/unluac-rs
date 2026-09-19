@@ -758,7 +758,7 @@ impl LuaJitParser {
             // LuaJIT varinfo uses internal proto pc; dump instructions omit pc=0.
             let start_pc = start_pc.saturating_sub(1);
             let end_pc = end_pc.saturating_sub(1);
-            if start_pc < end_pc {
+            if start_pc <= end_pc {
                 local_vars.push(RawLocalVar {
                     name,
                     start_pc,

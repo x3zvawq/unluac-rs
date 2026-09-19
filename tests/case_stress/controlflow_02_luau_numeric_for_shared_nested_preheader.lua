@@ -7,7 +7,8 @@
 -- unluac: expect-not-contains [[r1_5 = r1_8]]
 -- unluac: expect-not-contains [[r1_3 = r1_6]]
 -- unluac: expect-not-contains [[while not false do]]
--- unluac: expect-contains [[while true do]]
+-- unluac: expect-contains [[while not p1_1 do]]
+-- unluac: expect-not-contains [[while true do]]
 local function run(a, b, c, xs)
     local x = 0
     if a and b then

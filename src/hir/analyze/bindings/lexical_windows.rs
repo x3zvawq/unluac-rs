@@ -109,10 +109,14 @@ fn debug_binding_window(
 ) -> Option<Range<usize>> {
     let (end, facts, last_observation) = cohort;
     let debug_bindings = structure.debug_bindings();
-    let dispatch = last_observation?;
-    let LowInstr::Call(call) = proto.instrs.get(dispatch)? else {
-        // 候选拒绝[ProofIncomplete]：debug end 前缺少当前分析能证明的 callee 观察边界。
-        return None;
+    // 空区间证明最后一个声明初始化后立即离域；必须恢复这个词法末端，
+    // 否则保留名称会把 local 延长到后继求值，并抬高其 CALL/临时槽。
+    // 非空区间仍需原有调用退休证明，不能单凭 debug end 推断旧根已死亡。
+    let immediate_end = facts.iter().any(|fact| fact.start_pc == fact.end_pc);
+    let dispatch = if immediate_end {
+        end - 1
+    } else {
+        last_observation?
     };
     let mut owners = BTreeMap::new();
     let mut overwrite_floors = BTreeMap::new();
@@ -137,10 +141,11 @@ fn debug_binding_window(
     let (&ceiling, _) = owners.last_key_value()?;
     // 候选拒绝[ProofIncomplete]：非空结果或更宽 caller 前缀仍需额外结果根、外来 binding 证明。
     let final_observation = dataflow.effect_summaries.get(dispatch)?.root_observation;
-    if !matches!(call.results, ResultPack::Ignore)
-        || cfg.instr_to_block[dispatch] != cfg.instr_to_block[end - 1]
-        || !matches!(final_observation,
-            RootObservation::Call { caller_end } if caller_end.index() == ceiling.index() + 1)
+    if !immediate_end
+        && (!matches!(proto.instrs.get(dispatch), Some(LowInstr::Call(call)) if matches!(call.results, ResultPack::Ignore))
+            || cfg.instr_to_block[dispatch] != cfg.instr_to_block[end - 1]
+            || !matches!(final_observation,
+            RootObservation::Call { caller_end } if caller_end.index() == ceiling.index() + 1))
     {
         return None;
     }
@@ -165,9 +170,11 @@ fn debug_binding_window(
     {
         return None;
     }
-    // 调用排除上界与必经覆盖写共同证明末端退休；高槽不需要再重建 for 的动态值类型。
+    // 空区间末端只关闭原声明及其高槽求值临时量，不清空物理残值；普通窗口
+    // 仍由调用排除上界与必经覆盖写证明退休，不重建 for 的动态值类型。
     let home_retires = |reg: Reg, at: usize, block: BlockRef| {
-        final_observation.excludes_home_from_caller(reg)
+        (immediate_end && reg > ceiling)
+            || final_observation.excludes_home_from_caller(reg)
             || overwrite_floors
                 .get(&reg)
                 .is_some_and(|&(first_write, merge)| {
@@ -351,8 +358,8 @@ fn debug_binding_window(
             }
         }
     }
-    // Call 的 caller_end 就是 callee 槽；其 Def/Phi 已通过窗口闭包和逐槽退休证明。
-    // 调用中的 callee/self 仍由活动帧保活；只封闭词法窗口，不在 debug end 生成 CLEAR。
+    // Def/Phi 已通过窗口闭包和逐槽归属证明；只封闭词法窗口，不在 debug end
+    // 生成 CLEAR。调用中的 callee/self 仍由活动帧保活。
     Some(window)
 }
 

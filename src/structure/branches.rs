@@ -33,8 +33,7 @@ pub(super) use classify::{find_soft_merge, transparent_jump_target};
 use fences::*;
 use one_arm::*;
 pub(super) use one_arm::{for_loop_body_entry, for_loop_exit_owner};
-pub(super) use regions::analyze_branch_regions;
-use regions::*;
+pub(super) use regions::{BranchIndex, analyze_branch_regions};
 
 pub(super) fn analyze_branches(
     proto: &LoweredProto,

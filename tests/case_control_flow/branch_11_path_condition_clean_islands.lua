@@ -1,6 +1,5 @@
--- regress_374_path_condition_clean_islands#1: a clean structured prefix still specializes inside a goto-tainted proto
--- unluac: expect-contains [[if mark("inner", true) then]]
--- unluac: expect-not-contains [[not flag or mark("inner", true)]]
+-- 稳定路径事实也不能删除 clean prefix/arm、fallthrough 或 label 入口上的原检查。
+-- unluac: expect-contains [[not flag or mark("inner", true)]]
 
 local events = {}
 
@@ -84,8 +83,11 @@ assert(closed_merge(false, false, false) == "left")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true", table.concat(events, ","))
 
 -- regress_374_path_condition_clean_islands#3: a clean arm has one structured entry even when its sibling jumps to a label
--- unluac: expect-contains [[if mark("clean-arm", true) then]]
--- unluac: expect-not-contains [[not flag or mark("clean-arm", true)]]
+-- unluac: expect-contains [[not flag or mark("clean-arm", true)]] [[@dialect=lua5.2]]
+-- unluac: expect-contains [[not flag or mark("clean-arm", true)]] [[@dialect=lua5.3]]
+-- Lua 5.4/5.5 经值 Decision 恢复为嵌套 if，第二次 flag 检查仍须存在。
+-- unluac: expect-ast-count [[if]] [[4]] [[@proto=4]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[if]] [[4]] [[@proto=4]] [[@dialect=lua5.5]]
 
 local function clean_arm(flag, jump_right)
     local result = "none"
@@ -109,9 +111,8 @@ assert(clean_arm(true, false) == "clean")
 assert(clean_arm(false, true) == "right")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm", table.concat(events, ","))
 
--- regress_374_path_condition_clean_islands#4: consecutive clean statements propagate fallthrough facts before a tainted graph
--- unluac: expect-not-contains [[flag and mark("clean-run", true)]]
--- unluac: expect-not-contains [[mark("clean-run", true)]]
+-- 即使前一条 return 已排除这条路径，仍保留原字节码的检查和分支。
+-- unluac: expect-contains [[flag and mark("clean-run", true)]]
 
 local function clean_run(flag, jump_right, cycle)
     if flag then
@@ -150,9 +151,8 @@ assert(clean_run(false, true, false) == "right")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm", table.concat(events, ","))
 
 -- regress_374_path_condition_clean_islands#5: a forward label with one guarded predecessor
--- inherits that edge's stable truthiness when lexical fallthrough is closed.
--- unluac: expect-contains [[if not mark("label-pred", true) then]]
--- unluac: expect-not-contains [[not flag or mark("label-pred", true)]]
+-- 保留 label 后的检查，不因唯一前驱推导而删去 flag。
+-- unluac: expect-contains [[flag and not mark("label-pred", true)]]
 
 local function unique_label_predecessor(flag)
     if flag then
@@ -174,9 +174,8 @@ assert(unique_label_predecessor(true) == "true")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,label-pred", table.concat(events, ","))
 
 -- regress_374_path_condition_clean_islands#6: a clean prefix before the terminal
--- guarded goto contributes its fallthrough facts to the unique forward label.
--- unluac: expect-contains [[if not mark("prefixed-label", true) then]]
--- unluac: expect-not-contains [[not flag or mark("prefixed-label", true)]]
+-- guarded goto 后也保留原条件。
+-- unluac: expect-contains [[flag and not mark("prefixed-label", true)]]
 
 local function prefixed_label_predecessor(flag)
     if flag then

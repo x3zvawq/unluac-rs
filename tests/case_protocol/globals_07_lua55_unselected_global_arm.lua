@@ -1,7 +1,7 @@
--- regress_440_lua55_unselected_global_arm: a dead global declaration does not keep a proven constant branch shell
+-- 常量传播可证明未选的 global arm 仍保留；不能删除字节码中实际存在的检查与声明。
 -- unluac: expect-not-contains [[if true then]]
 -- unluac: expect-not-contains [[if false then]]
--- unluac: expect-not-contains [[global dead_value]]
+-- unluac: expect-contains [[global dead_value]]
 
 global<const> assert, setmetatable, collectgarbage
 

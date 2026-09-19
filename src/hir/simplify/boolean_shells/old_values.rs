@@ -20,7 +20,7 @@ use crate::hir::promotion::{HomeSlotKey, HomeSlots, ProtoPromotionFacts};
 use super::{BooleanShellFacts, OldValueClass};
 use crate::hir::simplify::expr_facts::expr_truthiness;
 use crate::hir::simplify::lexical_cfg::{
-    FlowRefinement, HirFlowGraph, HirFlowNodeId, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
+    HirFlowGraph, HirFlowNodeId, HirFlowNodeKind, HirFlowProtocolId, HirForBindings,
 };
 use crate::hir::visit::{self, HirVisitor, visit_stmt_header};
 
@@ -256,7 +256,6 @@ impl<'a> ShellFlowFacts<'a> {
                 }
                 active.apply(node);
             },
-            |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
         // 域外 holder 仍可传递候选 capture，不能在观察者 reaching 收敛前过滤它。
         // 观察者 reaching 已收敛；后向 gen/kill 按 binding/home 分量独立，不会从域外
@@ -984,25 +983,20 @@ impl DeadShellPlan {
             .values()
             .map(|site| (site.node, site))
             .collect::<BTreeMap<_, _>>();
-        let entries = graph.solve_forward(
-            initial_state,
-            join_states,
-            |id, kind, state| {
-                let removable = sites_by_node.get(&id).is_some_and(|site| {
-                    super::removable_dead_materialization_shell(
-                        site.stmt,
-                        facts,
-                        None,
-                        state,
-                        &site.live_after,
-                        safety,
-                    )
-                });
-                *state = transfer.apply(kind, std::mem::take(state));
-                removable
-            },
-            |_expr, _truthy, _state| FlowRefinement::Unchanged,
-        );
+        let entries = graph.solve_forward(initial_state, join_states, |id, kind, state| {
+            let removable = sites_by_node.get(&id).is_some_and(|site| {
+                super::removable_dead_materialization_shell(
+                    site.stmt,
+                    facts,
+                    None,
+                    state,
+                    &site.live_after,
+                    safety,
+                )
+            });
+            *state = transfer.apply(kind, std::mem::take(state));
+            removable
+        });
         let removable = shell_facts
             .shells
             .into_iter()

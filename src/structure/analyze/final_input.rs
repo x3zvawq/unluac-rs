@@ -45,6 +45,7 @@ pub(super) fn final_plan_input(
         value_candidates,
     );
 
+    let branch_index = branches::BranchIndex::new(cfg, graph_facts, &loops);
     let branches = branches
         .into_iter()
         .map(|mut branch| {
@@ -58,6 +59,7 @@ pub(super) fn final_plan_input(
                     cfg,
                     graph_facts,
                     &loops,
+                    &branch_index,
                     &mut branch,
                     condition_ref,
                 );
@@ -121,6 +123,7 @@ pub(super) fn normalize_branch_condition_boundary(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
     loops: &[LoopCandidate],
+    branch_index: &branches::BranchIndex<'_>,
     branch: &mut BranchCandidate,
     condition: Option<&ConditionPlanInput>,
 ) -> bool {
@@ -146,6 +149,17 @@ pub(super) fn normalize_branch_condition_boundary(
         branch.merge = Some(continuation);
         branch.kind = BranchKind::Guard;
         branch.invert_hint = false;
+        return true;
+    }
+    // 短路条件吸收了原合流块后，旧边界已经变成条件内部节点。
+    // 重新消费既有 loop-exit/frontier 证明，保留 break 臂和本轮共享 tail 的归属；
+    // 不能把共享 tail 留成跳出外层 if 的 residual goto。
+    if branch
+        .merge
+        .is_some_and(|merge| condition.candidate.blocks.contains(&merge))
+        && let Some(normalized) = branch_index.loop_exit_boundary(cfg, branch.header, truthy, falsy)
+    {
+        *branch = normalized;
         return true;
     }
     let Some(merge) = branches::find_soft_merge(cfg, graph_facts, branch.header, truthy, falsy)

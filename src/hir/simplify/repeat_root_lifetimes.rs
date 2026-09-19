@@ -21,7 +21,7 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 use crate::hir::visit::{any_stmt_structure, visit_stmt_structure};
 
-use super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
+use super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind};
 use super::stmt_plan::{StmtPath, retain_stmts_with_paths};
 
 use super::object_flow::{
@@ -114,57 +114,52 @@ fn collect_proto_repeat_roots(
         .unknown_collectable
         .extend(proto.upvalues.iter().copied().map(HirBinding::Upvalue));
     let mut roots = RepeatRoots::default();
-    graph.solve_forward(
-        initial,
-        join_state,
-        |id, kind, output| {
-            if let HirFlowNodeKind::RepeatCondition(repeat) = kind {
-                let site = sites
-                    .get_mut(&id)
-                    .expect("repeat condition has a published site");
-                let bindings = site.observable_bindings.get_or_insert_with(|| {
-                    site.lifetime.may_end_before_condition = repeat_scoped_bindings(&repeat.body);
-                    let scoped = &site.lifetime.may_end_before_condition;
-                    if scoped.is_empty() || safety.is_discard_safe_without_residual(&repeat.cond) {
-                        return Vec::new();
-                    }
-                    scoped
-                        .iter()
-                        .copied()
-                        .filter(|binding| match binding {
-                            HirRepeatBinding::Local(local) => {
-                                !facts.is_some_and(|facts| facts.local_has_no_physical_home(*local))
-                            }
-                            HirRepeatBinding::Temp(temp) => !facts.is_some_and(|facts| {
-                                facts
-                                    .possible_temp_home_slots(*temp)
-                                    .is_some_and(|homes| homes.is_empty())
-                            }),
-                        })
-                        .collect()
-                });
-                for &binding in bindings.iter() {
-                    let hir_binding = match binding {
-                        HirRepeatBinding::Local(local) => HirBinding::Local(local),
-                        HirRepeatBinding::Temp(temp) => HirBinding::Temp(temp),
-                    };
-                    if output.binding_may_hold_observable_root(hir_binding) {
-                        site.lifetime.may_end_before_condition.remove(&binding);
-                        match binding {
-                            HirRepeatBinding::Local(local) => {
-                                roots.locals.insert(local);
-                            }
-                            HirRepeatBinding::Temp(temp) => {
-                                roots.temps.insert(temp);
-                            }
+    graph.solve_forward(initial, join_state, |id, kind, output| {
+        if let HirFlowNodeKind::RepeatCondition(repeat) = kind {
+            let site = sites
+                .get_mut(&id)
+                .expect("repeat condition has a published site");
+            let bindings = site.observable_bindings.get_or_insert_with(|| {
+                site.lifetime.may_end_before_condition = repeat_scoped_bindings(&repeat.body);
+                let scoped = &site.lifetime.may_end_before_condition;
+                if scoped.is_empty() || safety.is_discard_safe_without_residual(&repeat.cond) {
+                    return Vec::new();
+                }
+                scoped
+                    .iter()
+                    .copied()
+                    .filter(|binding| match binding {
+                        HirRepeatBinding::Local(local) => {
+                            !facts.is_some_and(|facts| facts.local_has_no_physical_home(*local))
+                        }
+                        HirRepeatBinding::Temp(temp) => !facts.is_some_and(|facts| {
+                            facts
+                                .possible_temp_home_slots(*temp)
+                                .is_some_and(|homes| homes.is_empty())
+                        }),
+                    })
+                    .collect()
+            });
+            for &binding in bindings.iter() {
+                let hir_binding = match binding {
+                    HirRepeatBinding::Local(local) => HirBinding::Local(local),
+                    HirRepeatBinding::Temp(temp) => HirBinding::Temp(temp),
+                };
+                if output.binding_may_hold_observable_root(hir_binding) {
+                    site.lifetime.may_end_before_condition.remove(&binding);
+                    match binding {
+                        HirRepeatBinding::Local(local) => {
+                            roots.locals.insert(local);
+                        }
+                        HirRepeatBinding::Temp(temp) => {
+                            roots.temps.insert(temp);
                         }
                     }
                 }
             }
-            transfer_root_node(kind, output, &captures, effects, safety);
-        },
-        |_expr, _truthy, _state| FlowRefinement::Unchanged,
-    );
+        }
+        transfer_root_node(kind, output, &captures, effects, safety);
+    });
     roots.repeat_facts = sites
         .into_values()
         .map(|site| (site.path, site.lifetime))

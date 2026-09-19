@@ -120,22 +120,8 @@ fn reduce_decision_expr(
         let index = node_ref.index();
         let node = &nodes[index];
 
-        let truthy = reduce_target(
-            &nodes,
-            &replacements,
-            &node.test,
-            &node.truthy,
-            true,
-            safety,
-        );
-        let falsy = reduce_target(
-            &nodes,
-            &replacements,
-            &node.test,
-            &node.falsy,
-            false,
-            safety,
-        );
+        let truthy = reduce_target(&replacements, &node.truthy);
+        let falsy = reduce_target(&replacements, &node.falsy);
         let resolved_truthy = truthy.as_ref().unwrap_or(&node.truthy);
         let resolved_falsy = falsy.as_ref().unwrap_or(&node.falsy);
 
@@ -202,30 +188,17 @@ fn reduce_decision_expr(
 }
 
 fn reduce_target(
-    nodes: &[HirDecisionNode],
     replacements: &[Option<ResolvedDecisionTarget>],
-    test: &HirExpr,
     target: &HirDecisionTarget,
-    truthy: bool,
-    safety: HirExprSafety,
 ) -> Option<HirDecisionTarget> {
     let HirDecisionTarget::Node(child_ref) = target else {
         return None;
     };
-    let child = &nodes[child_ref.index()];
-    // 候选拒绝[SemanticBarrier:EvalCount]：父子同为 f() 时跳过子 test 会把两次调用缩成一次。
-    if child.test == *test && safety.is_repeatable(test) {
-        let branch = if truthy { &child.truthy } else { &child.falsy };
-        Some(replacement_as_target(&resolve_target_in_node_context(
-            replacements,
-            &child.test,
-            branch,
-        )))
-    } else {
-        replacements[child_ref.index()]
-            .as_ref()
-            .map(replacement_as_target)
-    }
+    // 候选拒绝[PolicyBoundary]：父子 test 即使相同且稳定，也代表两次显式检查；
+    // 父边 truthiness 不能授权跳过子节点，只消费子节点自身已经完成的归约。
+    replacements[child_ref.index()]
+        .as_ref()
+        .map(replacement_as_target)
 }
 
 fn resolve_target_in_node_context(

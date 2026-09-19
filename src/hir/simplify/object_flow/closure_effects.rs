@@ -9,7 +9,7 @@
 use crate::hir::HirBinding;
 
 use super::super::lexical_cfg::{
-    FlowRefinement, HirFlowNodeKind, HirFlowProtocolId, HirForBindings, HirGenericForFlow,
+    HirFlowNodeKind, HirFlowProtocolId, HirForBindings, HirGenericForFlow,
 };
 use super::{
     ClosureCaptures, EffectClosure, EffectValue, ProtoEffects, ProtoFlowFacts, extend_map_sets,
@@ -870,7 +870,6 @@ pub(super) fn collect_effect_state(
             // returns/escapes/calls 与 generic_for 快照承载已累计或独立持有的效果，
             // 不属于死 binding；这些集合不参与上述投影。
         },
-        |_expr, _truthy, _state| FlowRefinement::Unchanged,
     );
     summary
 }

@@ -178,13 +178,6 @@ impl<'a> HirFlowNode<'a> {
     }
 }
 
-/// 条件边上的状态细化；矛盾路径不安装输入，也不参与合流。
-pub(super) enum FlowRefinement<S> {
-    Unchanged,
-    Refined(S),
-    Unreachable,
-}
-
 /// 当前 proto HIR 树的 owner-wide 控制流 topology。
 ///
 /// 图只借用 HIR 节点，必须在对应树发生改写前丢弃。它不附带任何特定 pass 的
@@ -322,8 +315,6 @@ impl<'a> HirFlowGraph<'a> {
     ///
     /// `None` 仅表示不可达，首次到达直接安装状态；之后由 consumer 的 `join` 区分
     /// may-union 与 must-intersection。`transfer` 只解释当前 typed event，不重复建边。
-    /// `refine` 只在有极性的条件边上调用；矛盾边不参与合流。它必须随输入状态的
-    /// 单调变化而单调：弱化输入可以使原先矛盾的边可达，不能撤回已传播的状态。
     /// consumer 必须使用有限单调域和单调 transfer，并仅在 join 改变状态时返回 true；观察副产物也
     /// 必须单调合并，因为回边可能使同一节点再次执行。返回值只保存 consumer 从当前
     /// 事件投影出的结果，不强迫它保存整份输入状态再重放 transfer。
@@ -334,9 +325,8 @@ impl<'a> HirFlowGraph<'a> {
         initial: S,
         join: impl FnMut(&mut S, &S) -> bool,
         transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S) -> R,
-        refine: impl FnMut(&'a HirExpr, bool, &S) -> FlowRefinement<S>,
     ) -> Vec<Option<R>> {
-        self.solve_forward_with_entries(initial, std::iter::empty(), join, transfer, refine)
+        self.solve_forward_with_entries(initial, std::iter::empty(), join, transfer)
     }
 
     /// 与 solve_forward 共用求解过程，额外入口由 consumer 提供本图节点及其输入事实。
@@ -351,7 +341,6 @@ impl<'a> HirFlowGraph<'a> {
         additional_entries: impl IntoIterator<Item = (HirFlowNodeId, S)>,
         mut join: impl FnMut(&mut S, &S) -> bool,
         mut transfer: impl FnMut(HirFlowNodeId, HirFlowNodeKind<'a>, &mut S) -> R,
-        mut refine: impl FnMut(&'a HirExpr, bool, &S) -> FlowRefinement<S>,
     ) -> Vec<Option<R>> {
         let incoming_edges = self.incoming_multiplicity.get_or_init(|| {
             let mut incoming = vec![0u8; self.nodes.len()];
@@ -401,22 +390,11 @@ impl<'a> HirFlowGraph<'a> {
             results[id.index()] = Some(transfer(id, node.kind(), &mut output));
             propagate_flow_state(
                 output,
-                node.successors()
-                    .iter()
-                    .map(|(&target, &truthy)| (target, truthy)),
+                node.successors().keys().copied(),
                 &mut entries,
                 &mut pending,
                 &mut queued,
                 &mut join,
-                |truthy, state| match truthy {
-                    Some(truthy) => refine(
-                        node.condition()
-                            .expect("condition edge has a condition owner"),
-                        truthy,
-                        state,
-                    ),
-                    None => FlowRefinement::Unchanged,
-                },
             );
         }
         results
@@ -426,7 +404,7 @@ impl<'a> HirFlowGraph<'a> {
     ///
     /// 所有可达节点从 lattice 的 bottom 开始执行，包含无法到达函数出口的循环；
     /// 否则无限循环中的读取会被错误视为不可观察。
-    /// 此查询使用静态 topology，不消费前向路径条件的细化结果。
+    /// 此查询与前向分析共用静态 topology。
     /// `transfer` 从输出状态计算输入状态，`join` 将它传播到前驱。
     /// 图负责方向与调度；consumer 只提供有限单调域及当前 typed event 的 gen/kill。
     /// 入口、分支和合流点保留状态用于收敛比较，线性链直接转交状态。每个入口可达环
@@ -468,14 +446,11 @@ impl<'a> HirFlowGraph<'a> {
             transfer(id, self.nodes[id.index()].kind(), &mut input);
             propagate_flow_state(
                 input,
-                predecessors[id.index()]
-                    .iter()
-                    .map(|&target| (target, None)),
+                predecessors[id.index()].iter().copied(),
                 &mut outputs,
                 &mut pending,
                 &mut queued,
                 &mut join,
-                |_, _| FlowRefinement::Unchanged,
             );
         }
     }
@@ -539,34 +514,19 @@ impl<'a> HirFlowGraph<'a> {
 /// 最后一条边可直接移动状态，避免在线性链或已建立的循环 checkpoint 上复制集合。
 fn propagate_flow_state<S: Clone>(
     state: S,
-    edges: impl Iterator<Item = (HirFlowNodeId, Option<bool>)>,
+    edges: impl Iterator<Item = HirFlowNodeId>,
     entries: &mut [Option<S>],
     pending: &mut VecDeque<HirFlowNodeId>,
     queued: &mut [bool],
     join: &mut impl FnMut(&mut S, &S) -> bool,
-    mut refine: impl FnMut(Option<bool>, &S) -> FlowRefinement<S>,
 ) {
     let mut state = Some(state);
     let mut edges = edges.peekable();
-    while let Some((target, truthy)) = edges.next() {
-        let mut refined = match refine(truthy, state.as_ref().expect("remaining edges share state"))
-        {
-            FlowRefinement::Unchanged => None,
-            FlowRefinement::Refined(state) => Some(state),
-            FlowRefinement::Unreachable => continue,
-        };
+    while let Some(target) = edges.next() {
         let changed = match &mut entries[target.index()] {
-            Some(current) => join(
-                current,
-                refined
-                    .as_ref()
-                    .or(state.as_ref())
-                    .expect("edge has a state"),
-            ),
+            Some(current) => join(current, state.as_ref().expect("edge has a state")),
             entry @ None => {
-                *entry = if refined.is_some() {
-                    refined.take()
-                } else if edges.peek().is_none() {
+                *entry = if edges.peek().is_none() {
                     state.take()
                 } else {
                     state.clone()

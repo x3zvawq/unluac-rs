@@ -16,9 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::hir::common::{HirAssign, HirBlock, HirExpr, HirLValue, HirStmt, HirValuePack, LocalId};
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::super::super::lexical_cfg::{
-    FlowRefinement, HirFlowGraph, HirFlowNodeKind, validate_region_entry,
-};
+use super::super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind, validate_region_entry};
 use super::super::super::walk::rewrite_stmts;
 use super::super::binding::{
     BindingClassRewritePass, BindingProtection, CarryBinding, binding_home_slot,
@@ -398,7 +396,6 @@ impl FlowVerifier {
                 rejected |= states.is_err();
                 *states
             },
-            |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
         if rejected {
             return None;

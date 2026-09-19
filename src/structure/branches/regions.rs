@@ -32,7 +32,7 @@ pub(in crate::structure) fn analyze_branch_regions(
 /// `dominance_frontier[from]` 包含 `to` 时，存在一条由 `from` 支配的路径真实汇入
 /// `to`；这正是 branch arm 可以把 `to` 当作词法 continuation 的证明。它比任意
 /// CFG reachability 更强，也避免按每个 branch source 重新遍历整张图。
-pub(super) struct BranchIndex<'a> {
+pub(in crate::structure) struct BranchIndex<'a> {
     graph_facts: &'a GraphFacts,
     loop_candidates: &'a [LoopCandidate],
     loops_by_endpoint: Vec<Vec<usize>>,
@@ -60,7 +60,7 @@ impl FrontierShape {
 }
 
 impl<'a> BranchIndex<'a> {
-    pub(super) fn new(
+    pub(in crate::structure) fn new(
         cfg: &Cfg,
         graph_facts: &'a GraphFacts,
         loop_candidates: &'a [LoopCandidate],
@@ -145,6 +145,23 @@ impl<'a> BranchIndex<'a> {
             .dominance_frontier
             .get(from.index())
             .is_some_and(|frontier| frontier.contains(&target))
+    }
+
+    pub(in crate::structure) fn loop_exit_boundary(
+        &self,
+        cfg: &Cfg,
+        header: BlockRef,
+        truthy: BlockRef,
+        falsy: BlockRef,
+    ) -> Option<BranchCandidate> {
+        classify_loop_exit_bounded_one_arm_branch(
+            cfg,
+            self.graph_facts,
+            self,
+            header,
+            truthy,
+            falsy,
+        )
     }
 
     pub(super) fn has_single_local_join(&self, from: BlockRef, target: BlockRef) -> bool {

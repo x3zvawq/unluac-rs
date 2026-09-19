@@ -97,7 +97,7 @@ impl DebugLocals {
 }
 
 /// 非 Luau 格式的第 N 个活动局部对应寄存器 N，同起点仍按原表顺序排槽。
-/// 无有效区间且没有显式槽位的项保持丢弃；显式 Luau 表的长度不符时沿用推导规则。
+/// 空区间仍记录初始化完成边界上的声明；倒置区间不能推导槽位。
 pub(crate) fn normalize_debug_locals(raw: &RawProto) -> DebugLocals {
     let locals = &raw.common.debug_info.common.local_vars;
     let explicit_regs = raw
@@ -137,8 +137,10 @@ pub(crate) fn normalize_debug_locals(raw: &RawProto) -> DebugLocals {
 fn inferred_registers(locals: &[RawLocalVar]) -> Vec<Option<usize>> {
     let mut events = Vec::with_capacity(locals.len() * 2);
     for (index, local) in locals.iter().enumerate() {
-        if local.start_pc < local.end_pc {
+        if local.start_pc <= local.end_pc {
             events.push((local.start_pc, true, index));
+        }
+        if local.start_pc < local.end_pc {
             events.push((local.end_pc, false, index));
         }
     }
@@ -146,11 +148,28 @@ fn inferred_registers(locals: &[RawLocalVar]) -> Vec<Option<usize>> {
     events.sort_unstable();
     let mut active = ActiveLocalRanks(vec![0; locals.len() + 1]);
     let mut registers = vec![None; locals.len()];
-    for (_, entering, index) in events {
-        if entering {
-            registers[index] = Some(active.before(index));
+    let mut cursor = 0;
+    while cursor < events.len() {
+        let pc = events[cursor].0;
+        let end = cursor + events[cursor..].partition_point(|event| event.0 == pc);
+        let group = &events[cursor..end];
+        // 空区间的 initializer 在边界之前求值；同 PC 离域的外层 local 仍占槽。
+        // 同批声明按原表顺序占据后续槽，但不加入边界之后的活动集合。
+        for (offset, &(_, _, index)) in group.iter().filter(|event| event.1).enumerate() {
+            if locals[index].start_pc == locals[index].end_pc {
+                registers[index] = Some(active.before(index) + offset);
+            }
         }
-        active.set(index, entering);
+        for &(_, entering, index) in group {
+            if locals[index].start_pc == locals[index].end_pc {
+                continue;
+            }
+            if entering {
+                registers[index] = Some(active.before(index));
+            }
+            active.set(index, entering);
+        }
+        cursor = end;
     }
     registers
 }

@@ -13,6 +13,18 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_28_preserved_predicates.lua",
+        &["short-circuit", "path-condition", "source-fidelity"],
+        "保留原字节码的重复条件检查，不依据前一条路径事实删除。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/branch_27_short_circuit_capture_scope.lua",
         &["short-circuit", "closure-capture", "close", "metamethod"],
         "短路复合条件与闭包 scope 共存时保持单入口结构、字段读取顺序及 close 后捕获身份。",
@@ -917,7 +929,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_11_path_condition_clean_islands.lua",
         &["goto", "island", "label", "path-fact"],
-        "系统证明goto-tainted proto中clean prefix/arm/run及唯一label predecessor仍可局部传播路径事实。",
+        "保留 clean prefix/arm/run 与唯一 label predecessor 后的原条件，路径事实不授权删除检查。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_GE_52).with_options(LuaCaseOptions {
                 retain_debug: true,

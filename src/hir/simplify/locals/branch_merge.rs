@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
+use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind, LexicalCfgFailure};
 use super::super::root_lifetimes::RootEventBlock;
 use super::super::temp_touch::{TempReadCollector, collect_temp_refs_in_expr};
 use crate::hir::common::{HirBlock, HirLValue, HirStmt, TempId};
@@ -176,7 +176,6 @@ impl<'a> RegionTempFlow<'a> {
                 }
                 incoming
             },
-            |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
 
         incoming[self.graph.exit().index()] == Some(true)
@@ -204,7 +203,6 @@ impl<'a> RegionTempFlow<'a> {
                 }
                 outgoing.extend(event.writes.iter().copied());
             },
-            |_expr, _truthy, _state| FlowRefinement::Unchanged,
         );
 
         summary

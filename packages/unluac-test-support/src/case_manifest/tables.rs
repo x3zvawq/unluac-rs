@@ -122,9 +122,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/setlist_05_adjacent_uncertain_setlist.lua",
-        &["debug", "false", "fixed-list", "nil"],
-        "保证带debug local的相邻fixed SETLIST恢复原构造器并保留nil/false槽。",
         &[
+            "debug",
+            "false",
+            "fixed-list",
+            "nil",
+            "dynamic-key",
+            "evaluation-order",
+        ],
+        "相邻 fixed SETLIST 恢复字段/动态索引构造器，保留求值次数、顺序及 nil/false 槽。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
                 ..LuaCaseOptions::DEFAULT

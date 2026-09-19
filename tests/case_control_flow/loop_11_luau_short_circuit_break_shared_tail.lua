@@ -35,3 +35,4 @@ local function run(a, b, c, xs)
 end
 
 print("regress_158_luau_short_circuit_break_shared_tail#1", run(true, true, false, {}))
+assert(run(false, true, true, {[0] = true}) == 0)

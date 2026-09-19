@@ -192,7 +192,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_protocol/globals_07_lua55_unselected_global_arm.lua",
         &["constant-branch", "gc", "global"],
-        "验证未选中的global声明与GC根逻辑不会迫使已证明常量分支保留if壳。",
+        "保留原有检查及未选arm中的global声明与GC根逻辑，验证它们不被执行。",
         &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55])],
     ),
     LuaCaseDefinition::new(

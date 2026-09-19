@@ -4,7 +4,8 @@
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[p1_0:add("button")]]
--- unluac: expect-contains [[and p1_0.purchased then]]
+-- 内层仍检查 enabled；不能利用外层 not enabled 删除这次检查。
+-- unluac: expect-contains [[and (p1_0.purchased or r1_0) then]]
 -- unluac: expect-not-contains [[local r1_1 = p1_0]]
 
 local function maybe_add_button(state)

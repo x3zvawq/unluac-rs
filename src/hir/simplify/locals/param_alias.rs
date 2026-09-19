@@ -11,7 +11,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
+use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind};
 use super::super::mention::{expr_mentions_local, stmts_reference_captured_bindings};
 use super::super::walk::{self, HirRewritePass};
 use crate::hir::visit::{self, HirVisitor};
@@ -273,7 +273,6 @@ fn validate_alias_flow(
                 }
             }
         },
-        |_, _, _| FlowRefinement::Unchanged,
     );
     error.map_or(Ok(()), Err)
 }

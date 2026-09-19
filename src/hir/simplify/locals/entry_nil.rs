@@ -22,9 +22,7 @@ use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 
 use super::super::label_refs::count_label_references;
-use super::super::lexical_cfg::{
-    FlowRefinement, HirFlowGraph, HirFlowNodeId, HirFlowNodeKind, HirForBindings,
-};
+use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeId, HirFlowNodeKind, HirForBindings};
 use super::super::local_shapes::empty_single_local_decl_binding;
 use crate::hir::visit::{self, HirVisitor};
 
@@ -243,7 +241,6 @@ impl<'a> EntryNilAnalyzer<'a> {
                     }
                 }
             },
-            |_, _, _| FlowRefinement::Unchanged,
         );
         if let Some(error) = error {
             return Err(error);

@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::super::lexical_cfg::{FlowRefinement, HirFlowNodeKind, HirForBindings};
+use super::super::lexical_cfg::{HirFlowNodeKind, HirForBindings};
 use super::{ObjectId, ProtoFlowFacts};
 use crate::hir::common::{
     HirBinding, HirCallExpr, HirExpr, HirLValue, HirModule, HirProtoRef, HirSourceSite, HirStmt,
@@ -297,7 +297,6 @@ impl ReturnValueFacts {
                     .0
                     .retain(|binding, _| live_out[id.index()].contains(binding));
             },
-            |_, _, _| FlowRefinement::Unchanged,
         );
         if update_summary {
             self.summaries[proto.id.index()] = summary;

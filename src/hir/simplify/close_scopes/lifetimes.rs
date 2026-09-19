@@ -8,7 +8,7 @@
 //! 分别计数。候选以区间计数相等证明 must 覆盖，不逐候选重扫整张事件表。
 //! 事件的根层位置在共享图构建时投影到节点索引；不另走语句树建立地址到位置的关联。
 
-use super::super::lexical_cfg::{FlowRefinement, HirFlowGraph, HirFlowNodeKind};
+use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind};
 use super::{ScopeCandidate, paired_return_cleanup};
 use crate::hir::common::{HirBlock, HirStmt};
 use crate::hir::expr_safety::HirExprSafety;
@@ -117,7 +117,6 @@ pub(super) fn scope_ends(
                 accepted.map(|accepted| (position, accepted))
             })
         },
-        |_expr, _truthy, _state| FlowRefinement::Unchanged,
     );
     let mut event_prefix = vec![0usize; stmts.len() + 1];
     let mut accepted_positions = BTreeMap::<InstrRef, Vec<usize>>::new();

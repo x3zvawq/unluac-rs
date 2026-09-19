@@ -6,7 +6,6 @@
 //! 的词法作用域；有事件的条件仍在原位置求值。
 
 mod alternative_arms;
-mod path_conditions;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,52 +35,39 @@ pub(super) fn fold_branch_control_in_proto(
     promotion_facts: &mut ProtoPromotionFacts,
     safety: HirExprSafety,
 ) -> bool {
-    let mut changed = false;
-    loop {
-        let primitive_locals = ImmutablePrimitiveLocals::new(&proto.body);
-        let discard_facts = DiscardBoundaryFacts {
-            local_debug_hints: &proto.local_debug_hints,
-            temp_debug_hints: &proto.temp_debug_locals,
-            physical_root_locals: &proto.physical_root_locals,
-            label_refs: count_label_references(&proto.body.stmts),
-        };
-        let forward_move_facts = ForwardBranchMoveFacts {
-            local_debug_hints: &proto.local_debug_hints,
-            local_debug_scopes: &proto.local_debug_scopes,
-            physical_root_locals: &proto.physical_root_locals,
-            resource_locals: stmts_protected_locals(&proto.body.stmts),
-        };
-        let path_changed = path_conditions::specialize_stable_path_conditions(
-            &mut proto.body,
-            &discard_facts,
-            safety,
-        );
-        let first_new_local = proto.local_count;
-        let mut pass = BranchControlPass {
-            promotion_facts,
-            discard_facts: &discard_facts,
-            forward_move_facts: &forward_move_facts,
-            primitive_locals: &primitive_locals,
-            next_local_index: first_new_local,
-            safety,
-            read_alternatives: Default::default(),
-        };
-        let rewrite_changed = rewrite_block(&mut proto.body, &mut pass);
-        let next_local_index = pass.next_local_index;
-        for index in first_new_local..next_local_index {
-            let local = LocalId(index);
-            proto.local_debug_hints.push(None);
-            proto.local_debug_scopes.push(None);
-            promotion_facts.record_home_free_local(local);
-        }
-        proto.local_count = next_local_index;
-        changed |= path_changed | rewrite_changed;
-        // 删除不可达写可能让下一项 local 立刻满足稳定性证明。这里收完本 pass 自己的
-        // 单调链，避免合法的长链逐项消耗全局 scheduler 的固定轮次预算。
-        if !path_changed {
-            return changed;
-        }
+    let primitive_locals = ImmutablePrimitiveLocals::new(&proto.body);
+    let discard_facts = DiscardBoundaryFacts {
+        local_debug_hints: &proto.local_debug_hints,
+        temp_debug_hints: &proto.temp_debug_locals,
+        physical_root_locals: &proto.physical_root_locals,
+        label_refs: count_label_references(&proto.body.stmts),
+    };
+    let forward_move_facts = ForwardBranchMoveFacts {
+        local_debug_hints: &proto.local_debug_hints,
+        local_debug_scopes: &proto.local_debug_scopes,
+        physical_root_locals: &proto.physical_root_locals,
+        resource_locals: stmts_protected_locals(&proto.body.stmts),
+    };
+    let first_new_local = proto.local_count;
+    let mut pass = BranchControlPass {
+        promotion_facts,
+        discard_facts: &discard_facts,
+        forward_move_facts: &forward_move_facts,
+        primitive_locals: &primitive_locals,
+        next_local_index: first_new_local,
+        safety,
+        read_alternatives: Default::default(),
+    };
+    let rewrite_changed = rewrite_block(&mut proto.body, &mut pass);
+    let next_local_index = pass.next_local_index;
+    for index in first_new_local..next_local_index {
+        let local = LocalId(index);
+        proto.local_debug_hints.push(None);
+        proto.local_debug_scopes.push(None);
+        promotion_facts.record_home_free_local(local);
     }
+    proto.local_count = next_local_index;
+    rewrite_changed
 }
 
 struct BranchControlPass<'a> {
@@ -109,6 +95,35 @@ impl HirRewritePass for BranchControlPass<'_> {
         let adjacent_goto_changed = fold_adjacent_conditional_gotos(&mut block.stmts);
         let empty_changed =
             remove_discard_safe_empty_ifs(&mut block.stmts, self.safety, self.primitive_locals);
+        let mut exit_changed = false;
+        for index in 0..block.stmts.len().saturating_sub(1) {
+            let HirStmt::Label(label) = &block.stmts[index + 1] else {
+                continue;
+            };
+            // 紧随整个 if 的无 cleanup label 也是两臂的正常出口；只向现有
+            // forward-fold 提供这个已知边界，不把真实 label 移进子作用域。
+            // 候选拒绝[ProofIncomplete]：带资源交接的外层出口尚不能投影为 arm fallthrough。
+            if !label.tbc_barriers.is_empty() || !label.entry_cleanup.is_empty() {
+                continue;
+            }
+            let target = label.id;
+            let HirStmt::If(branch) = &mut block.stmts[index] else {
+                continue;
+            };
+            for arm in std::iter::once(&mut branch.then_block).chain(branch.else_block.iter_mut()) {
+                for kind in [FoldKind::TerminalElse, FoldKind::Guard] {
+                    exit_changed |= fold_forward_gotos(
+                        &mut arm.stmts,
+                        kind,
+                        self.forward_move_facts,
+                        &self.discard_facts.label_refs,
+                        self.safety,
+                        self.primitive_locals,
+                        Some(target),
+                    );
+                }
+            }
+        }
         let terminal_changed = fold_forward_gotos(
             &mut block.stmts,
             FoldKind::TerminalElse,
@@ -116,6 +131,7 @@ impl HirRewritePass for BranchControlPass<'_> {
             &self.discard_facts.label_refs,
             self.safety,
             self.primitive_locals,
+            None,
         );
         let guard_changed = fold_forward_gotos(
             &mut block.stmts,
@@ -124,6 +140,7 @@ impl HirRewritePass for BranchControlPass<'_> {
             &self.discard_facts.label_refs,
             self.safety,
             self.primitive_locals,
+            None,
         );
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         constant_changed
@@ -131,6 +148,7 @@ impl HirRewritePass for BranchControlPass<'_> {
             || leading_escape_changed
             || adjacent_goto_changed
             || empty_changed
+            || exit_changed
             || terminal_changed
             || guard_changed
             || nop_changed
@@ -929,6 +947,7 @@ struct FoldGroup {
     label: HirLabelId,
     label_index: usize,
     candidates: Vec<FoldCandidate>,
+    block_exit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -976,8 +995,12 @@ fn fold_forward_gotos(
     owner_label_refs: &BTreeMap<HirLabelId, usize>,
     safety: HirExprSafety,
     primitive_locals: &ImmutablePrimitiveLocals,
+    continuation: Option<HirLabelId>,
 ) -> bool {
-    let label_indices = index_top_level_labels(stmts);
+    let mut label_indices = index_top_level_labels(stmts);
+    if let Some(target) = continuation {
+        label_indices.entry(target).or_insert(stmts.len());
+    }
     let mut boundaries = PositionIndex::default();
     let mut indexed_end = 0;
     let mut groups = BTreeMap::<usize, FoldGroup>::new();
@@ -1019,7 +1042,7 @@ fn fold_forward_gotos(
         indexed_end = indexed_end.max(range.end);
         let region = BranchMoveRegion {
             stmts: &stmts[range.clone()],
-            suffix: &stmts[(label_index + 1)..],
+            suffix: &stmts[(label_index + 1).min(stmts.len())..],
             has_label: boundaries
                 .last_in(&MoveBoundary::Label, range.clone())
                 .is_some(),
@@ -1038,6 +1061,7 @@ fn fold_forward_gotos(
                     label: target,
                     label_index,
                     candidates: Vec::new(),
+                    block_exit: label_index == stmts.len(),
                 })
                 .candidates
                 .push(FoldCandidate {
@@ -1084,7 +1108,7 @@ fn fold_forward_gotos(
     // 区间内的 self-contained label/goto 可以随整个区域移动；因此不同目标的候选可能
     // 嵌套或交叉。本轮只取从右向左互不重叠的组，未选候选由 scheduler 下一轮消费。
     let mut selected = Vec::new();
-    let mut next_start = stmts.len();
+    let mut next_start = stmts.len() + 1;
     for group in groups.into_values().rev() {
         let start = group.candidates[0].if_index;
         if group.label_index >= next_start {
@@ -1105,11 +1129,12 @@ fn fold_forward_gotos(
             .take(group.label_index - first + 1)
             .collect();
         position = group.label_index + 1;
-        let keep_label = owner_label_refs
-            .get(&group.label)
-            .copied()
-            .unwrap_or_default()
-            > group.candidates.len();
+        let keep_label = !group.block_exit
+            && owner_label_refs
+                .get(&group.label)
+                .copied()
+                .unwrap_or_default()
+                > group.candidates.len();
         rewritten.extend(rewrite_fold_group(region, group, kind, keep_label));
     }
     rewritten.extend(original);
@@ -1239,7 +1264,7 @@ fn rewrite_fold_group(
     keep_label: bool,
 ) -> Vec<HirStmt> {
     let first = group.candidates[0].if_index;
-    let label = stmts.pop().expect("fold region ends at its label");
+    let label = (!group.block_exit).then(|| stmts.pop().expect("fold region ends at its label"));
     let mut nested = Vec::new();
 
     for candidate in group.candidates.into_iter().rev() {
@@ -1257,7 +1282,7 @@ fn rewrite_fold_group(
     }
 
     if keep_label {
-        nested.push(label);
+        nested.push(label.expect("retained label belongs to this block"));
     }
     nested
 }

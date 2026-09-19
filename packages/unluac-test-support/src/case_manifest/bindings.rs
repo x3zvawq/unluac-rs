@@ -2,6 +2,18 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_bindings/debug_05_empty_scope_initializers.lua",
+        &["debug", "unused", "scope", "multiret"],
+        "空 debug 区间保留单值、多值及嵌套作用域末端声明，初始化调用不丢失、不重复。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_bindings/naming_04_stdlib_signatures.lua",
         &["naming", "stdlib", "debug", "multiret"],
         "标准库实参角色按模式命名，保留 debug 与字段优先级，并拒绝冲突或未知宽度重载。",

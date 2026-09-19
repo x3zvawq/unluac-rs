@@ -2,8 +2,8 @@
 -- unluac: expect-contains [[for ]]
 -- unluac: expect-contains [[repeat]]
 -- unluac: expect-contains [[    continue]]
--- unluac: expect-not-contains [[p1_0 or p1_2]]
--- unluac: expect-not-contains [[p1_0 and p1_1]]
+-- unluac: expect-contains [[p1_0 or p1_2]]
+-- unluac: expect-contains [[p1_0 and p1_1]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
@@ -40,3 +40,8 @@ local function run(a, b, c, xs)
 end
 
 print("regress_111_result", run(false, true, false, {}), run(false, true, false, { 1 }), run(false, true, true, { 1 }))
+
+-- 从表中读取参数，实际执行保留检查后的两臂和共享 tail。
+for _, input in {{false, false, 1}, {false, true, 1}, {true, false, 7}} do
+    assert(run(input[1], true, input[2], {1}) == input[3])
+end

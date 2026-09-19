@@ -1,7 +1,9 @@
 -- regress_280_nested_loop_break_shared_tail#1: active-loop break 与 sibling 路径共享 repeat tail
 -- unluac: expect-ast-min [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-min [[repeat]] [[1]] [[@proto=1]]
--- unluac: expect-ast-min [[break]] [[2]] [[@proto=1]]
+-- 末尾 if a then break 可与 until 合成短路条件，但不能根据 while a 消掉检查。
+-- unluac: expect-ast-count [[break]] [[1]] [[@proto=1]]
+-- unluac: expect-contains [[until p1_0 or p1_3]]
 local function run(a, b, c, xs)
     local x = 0
     while a do
