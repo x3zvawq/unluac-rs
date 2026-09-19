@@ -176,7 +176,29 @@ pub(super) fn selected_conditions(
             );
         }
     }
-    selected = compose_adjacent_condition_guards(cfg, dataflow, loops, selected, &edge_actions);
+    let mut absorbable_headers = vec![false; cfg.blocks.len()];
+    for (header, (_, input)) in &selected {
+        absorbable_headers[header.index()] = input.candidate.nodes.len() == 1
+            && loops_by_condition_header[header.index()].is_empty()
+            && condition_node_can_be_absorbed(
+                proto,
+                cfg,
+                dataflow,
+                &input.candidate,
+                *header,
+                &mut condition_safety_workspace,
+            );
+    }
+    selected = compose_adjacent_condition_guards(
+        &ConditionCompositionContext {
+            cfg,
+            dataflow,
+            loops,
+            absorbable_headers: &absorbable_headers,
+            edge_actions: &edge_actions,
+        },
+        selected,
+    );
     let mut conditions = Vec::with_capacity(selected.len());
     let mut by_header = BTreeMap::new();
     for (header, (_, condition)) in selected {
@@ -204,13 +226,19 @@ fn normalized_condition_input(
     ConditionPlanInput { candidate, arcs }
 }
 
-pub(super) fn compose_adjacent_condition_guards(
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    loops: &[LoopCandidate],
+struct ConditionCompositionContext<'a> {
+    cfg: &'a Cfg,
+    dataflow: &'a DataflowFacts,
+    loops: &'a [LoopCandidate],
+    absorbable_headers: &'a [bool],
+    edge_actions: &'a [PreliminaryEdgeAction],
+}
+
+fn compose_adjacent_condition_guards(
+    context: &ConditionCompositionContext<'_>,
     selected: BTreeMap<super::super::BlockRef, (usize, ConditionPlanInput)>,
-    edge_actions: &[PreliminaryEdgeAction],
 ) -> BTreeMap<super::super::BlockRef, (usize, ConditionPlanInput)> {
+    let cfg = context.cfg;
     let mut entries = selected
         .into_iter()
         .map(|(header, (score, input))| (header, score, Some(input)))
@@ -234,15 +262,7 @@ pub(super) fn compose_adjacent_condition_guards(
             continue;
         }
         let Some(input) = input else { continue };
-        let Some(child) = adjacent_condition_guard(
-            cfg,
-            dataflow,
-            loops,
-            input,
-            &entries,
-            &by_header,
-            edge_actions,
-        ) else {
+        let Some(child) = adjacent_condition_guard(context, input, &entries, &by_header) else {
             continue;
         };
         child_by_parent[index] = Some(child);
@@ -251,6 +271,11 @@ pub(super) fn compose_adjacent_condition_guards(
         let Some(child) = child_by_parent[parent] else {
             continue;
         };
+        // 同一轮只组合链的叶端，不能同时发布 A+B 与 B+C 两个交叠的 owner。
+        // 完整长链仍由短路候选构建负责，这里只补相邻单节点的组合。
+        if child_by_parent[child].is_some() {
+            continue;
+        }
         let Some(mut downstream) = entries[child].2.clone() else {
             continue;
         };
@@ -266,15 +291,19 @@ pub(super) fn compose_adjacent_condition_guards(
         .collect()
 }
 
-pub(super) fn adjacent_condition_guard(
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    loops: &[LoopCandidate],
+fn adjacent_condition_guard(
+    context: &ConditionCompositionContext<'_>,
     root: &ConditionPlanInput,
     entries: &[(super::super::BlockRef, usize, Option<ConditionPlanInput>)],
     by_header: &[Option<usize>],
-    edge_actions: &[PreliminaryEdgeAction],
 ) -> Option<usize> {
+    let ConditionCompositionContext {
+        cfg,
+        dataflow,
+        loops,
+        edge_actions,
+        ..
+    } = *context;
     let ShortCircuitExit::BranchExit { truthy, falsy } = &root.candidate.exit else {
         return None;
     };
@@ -311,8 +340,12 @@ pub(super) fn adjacent_condition_guard(
                 .blocks
                 .is_disjoint(&root.candidate.blocks)
             || (!downstream_other_truthy && other != *downstream_falsy)
-            || !repeated_loop_break_guard(cfg, dataflow, loops, downstream.candidate.header, other)
             || !actions_match
+        {
+            continue;
+        }
+        if !ordinary_condition_guard(context, root, downstream, other_truthy)
+            && !repeated_loop_break_guard(cfg, dataflow, loops, downstream.candidate.header, other)
         {
             continue;
         }
@@ -321,6 +354,72 @@ pub(super) fn adjacent_condition_guard(
         }
     }
     selected
+}
+
+fn ordinary_condition_guard(
+    context: &ConditionCompositionContext<'_>,
+    root: &ConditionPlanInput,
+    downstream: &ConditionPlanInput,
+    other_truthy: bool,
+) -> bool {
+    let ConditionCompositionContext {
+        cfg,
+        absorbable_headers,
+        edge_actions,
+        ..
+    } = *context;
+    if !absorbable_headers[downstream.candidate.header.index()] {
+        return false;
+    }
+    let ShortCircuitExit::BranchExit { truthy, falsy } = downstream.candidate.exit else {
+        return false;
+    };
+    if [truthy, falsy].iter().any(|block| {
+        root.candidate.blocks.contains(block) || downstream.candidate.blocks.contains(block)
+    }) {
+        return false;
+    }
+    // 共享出口不代表共享入口；只吸收由当前条件独占进入的纯条件节点。
+    // 进入边改成内部弧后不能丢掉 phi 写入或循环控制动作。
+    if downstream.candidate.blocks.iter().any(|block| {
+        cfg.preds[block.index()].iter().any(|edge| {
+            let from = cfg.edges[edge.index()].from;
+            cfg.reachable_blocks.contains(&from)
+                && !root.candidate.blocks.contains(&from)
+                && !downstream.candidate.blocks.contains(&from)
+        })
+    }) {
+        return false;
+    }
+    let shared_exit = match root.candidate.exit {
+        ShortCircuitExit::BranchExit { truthy, falsy } => {
+            if other_truthy {
+                truthy
+            } else {
+                falsy
+            }
+        }
+        _ => return false,
+    };
+    if !condition_exit_action(downstream, shared_exit == truthy, edge_actions)
+        .is_some_and(|action| action.goto.is_none())
+    {
+        return false;
+    }
+    root.arcs.iter().all(|arc| {
+        let is_other = matches!(
+            (&arc.target, other_truthy),
+            (ShortCircuitTarget::TruthyExit, true) | (ShortCircuitTarget::FalsyExit, false)
+        );
+        matches!(arc.target, ShortCircuitTarget::Node(_))
+            || arc.edges.iter().all(|edge| {
+                let action = &edge_actions[edge.index()];
+                action.goto.is_none()
+                    && !action.has_continue_evidence
+                    && action.iteration.is_none()
+                    && (is_other || action.phi_inputs.is_empty())
+            })
+    })
 }
 
 pub(super) fn repeated_loop_break_guard(

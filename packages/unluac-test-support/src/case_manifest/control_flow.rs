@@ -13,6 +13,18 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_27_short_circuit_capture_scope.lua",
+        &["short-circuit", "closure-capture", "close", "metamethod"],
+        "短路复合条件与闭包 scope 共存时保持单入口结构、字段读取顺序及 close 后捕获身份。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/loop_43_nested_generic_key.lua",
         &["generic-for", "numeric-for", "phi"],
         "内层循环重赋值外层可见 key/value 时，外层迭代器的隐藏 control 仍按原顺序推进。",

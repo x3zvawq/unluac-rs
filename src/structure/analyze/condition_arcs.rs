@@ -181,15 +181,33 @@ pub(super) fn safe_condition_candidate(
         .enumerate()
         .skip(1)
         .find_map(|(index, node)| {
-            (workspace.value_headers.contains(&node.header)
-                || dataflow.block_defs_have_use_outside(cfg, node.header, &candidate.blocks)
-                || block_has_unabsorbed_effects(proto, cfg, dataflow, node.header, workspace))
+            (!condition_node_can_be_absorbed(
+                proto,
+                cfg,
+                dataflow,
+                candidate,
+                node.header,
+                workspace,
+            ))
             .then_some(index)
         });
     match cut_index {
         Some(cut_index) => truncate_condition_at(candidate, cut_index),
         None => Some(candidate.clone()),
     }
+}
+
+pub(super) fn condition_node_can_be_absorbed(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    candidate: &ShortCircuitCandidate,
+    header: super::super::BlockRef,
+    workspace: &mut ConditionSafetyWorkspace,
+) -> bool {
+    !workspace.value_headers.contains(&header)
+        && !dataflow.block_defs_have_use_outside(cfg, header, &candidate.blocks)
+        && !block_has_unabsorbed_effects(proto, cfg, dataflow, header, workspace)
 }
 
 pub(super) struct ConditionSafetyWorkspace {
