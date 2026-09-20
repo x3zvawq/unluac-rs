@@ -1088,11 +1088,12 @@ impl FrameBuilder<'_> {
             HirExpr::TableAccess(access)
                 if self.native.is_some()
                     && self.dialect == DecompileDialect::Luau
-                    && matches!(access.key, HirExpr::Binary(_))
-                    && self.facts.native_table_read_layout(access).is_some_and(|layout| layout.key.is_some()) =>
+                    && ((matches!(access.key, HirExpr::Binary(_))
+                        && self.facts.native_table_read_layout(access).is_some_and(|layout| layout.key.is_some()))
+                        || (self.constructor_depth > 0 && matches!(access.base, HirExpr::TableAccess(_)))) =>
             {
                 // O0 的字面键也可能占寄存器，仍由既有字面 lookup 入口重发；
-                // 此处分派的是含算术准备的键，不能用 key home 的有无抢占旧能力。
+                // 另外，构造器内已经树化的字段链仍需递归验证每次同槽读取。
                 self.luau_lookup(access, before, slot)
             }
             HirExpr::TableAccess(access)

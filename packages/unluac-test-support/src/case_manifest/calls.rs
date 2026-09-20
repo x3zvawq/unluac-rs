@@ -2,6 +2,36 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_calls/callee_06_truthy_call_chain_frame.lua",
+        &["callee", "condition", "call-frame", "eval-order"],
+        "条件调用链整体重发原单结果帧，保持 truthiness、求值顺序和具名结果身份。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/results_07_arithmetic_initializer_frame.lua",
+        &[
+            "initializer",
+            "arithmetic",
+            "call-frame",
+            "metamethod",
+            "eval-order",
+        ],
+        "算术声明帧保持左侧元方法先于右侧 CALL，并保留 debug 声明和结果截断。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/callee_01_short_circuit_header_call.lua",
         &["eval-count", "short-circuit", "truthiness"],
         "证明 type guard 阻止非函数调用，函数 operand 仅求值一次且 0 仍按 Lua 规则为真。",

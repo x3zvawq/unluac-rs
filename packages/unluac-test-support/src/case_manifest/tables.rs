@@ -2,6 +2,24 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/setlist_12_iterator_carried_binding_frames.lua",
+        &[
+            "setlist",
+            "generic-for",
+            "call-frame",
+            "loop-carried",
+            "eval-order",
+        ],
+        "循环携带绑定与列表 iterator 初始化共同恢复，保留字段读取顺序和列表值。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/setlist_11_captured_constructor_frames.lua",
         &[
             "constructor",

@@ -788,29 +788,42 @@ fn collect_plans(
                 continue;
             }
         }
-        if (dialect == DecompileDialect::Luau || matches!(stmt, HirStmt::Assign(_)))
+        let arithmetic_initializer =
+            !matches!(dialect, DecompileDialect::Luajit | DecompileDialect::Luau)
+                && matches!(stmt, HirStmt::LocalDecl(_))
+                && scalar_local(stmt).is_some_and(|(_, value)| {
+                    let HirExpr::Binary(binary) = value else {
+                        return false;
+                    };
+                    use crate::hir::common::HirBinaryOpKind::{Add, Div, Mod, Mul, Pow, Sub};
+                    matches!(binary.op, Add | Sub | Mul | Div | Mod | Pow)
+                        && (matches!(binary.lhs, HirExpr::Call(_))
+                            || matches!(binary.rhs, HirExpr::Call(_)))
+                });
+        if (arithmetic_initializer
+            || (dialect == DecompileDialect::Luau || matches!(stmt, HirStmt::Assign(_)))
+                && scalar_local(stmt)
+                    .and_then(|(_, value)| operation_call_input(value))
+                    .is_some_and(|(source, _)| facts.operation_result_home(source).is_some()))
             && operation_attempt_start != Some(start)
-            && scalar_local(stmt)
-                .and_then(|(_, value)| operation_call_input(value))
-                .is_some_and(|(source, _)| facts.operation_result_home(source).is_some())
         {
             operation_attempt_start = Some(start);
             let run = flat[start..index]
                 .iter()
                 .map(|entry| entry.unwrap().stmt)
                 .collect::<Vec<_>>();
-            if let Some(mut plan) = operation_call_frame(
-                NativeFrameContext {
-                    proto,
-                    barred,
-                    closed,
-                    constants_fit_rk,
-                },
-                &run,
-                facts,
-                dialect,
-                stmt,
-            ) {
+            let context = NativeFrameContext {
+                proto,
+                barred,
+                closed,
+                constants_fit_rk,
+            };
+            let candidate = if arithmetic_initializer {
+                arithmetic_initializer_plan(context, &run, facts, dialect, stmt)
+            } else {
+                operation_call_frame(context, &run, facts, dialect, stmt)
+            };
+            if let Some(mut plan) = candidate {
                 plan.removed = flat[start + plan.start..index]
                     .iter()
                     .map(|entry| entry.unwrap().id)
@@ -907,10 +920,10 @@ fn collect_plans(
                 constants_fit_rk,
             };
             let candidate = match stmt {
-                HirStmt::If(if_) => comparison_plan(context, &run, facts, dialect, &if_.cond),
+                HirStmt::If(if_) => condition_plan(context, &run, facts, dialect, &if_.cond),
                 HirStmt::NumericFor(for_) => numeric_for_plan(context, &run, facts, dialect, for_),
                 HirStmt::Repeat(repeat) => {
-                    repeat_condition_plan(context, &run, facts, dialect, &repeat.cond)
+                    condition_plan(context, &run, facts, dialect, &repeat.cond)
                 }
                 _ => unreachable!(),
             };
@@ -1724,9 +1737,8 @@ fn generic_for_dispatch_plan(
         }
         release_start -= 1;
     }
-    if seen_results.is_empty() {
-        return None;
-    }
+    // dispatch release 是可选的尾部协议；没有 release 时仍需把 initializer
+    // CALL 与其构造准备作为完整帧证明，不能要求 iterator 先独立折叠。
     let initializer = release_start.checked_sub(1)?;
     let HirStmt::Assign(assign) = run[initializer] else {
         return None;
@@ -1778,6 +1790,11 @@ fn generic_for_dispatch_plan(
     };
     let prefix_run = &run[..prefix_end];
     let mut builder = frame_builder(context, prefix_run, facts, dialect, base.slot())?;
+    if dialect == DecompileDialect::Luau {
+        // Luau 在初始化表达式前预留 iterator/state/control；表的数组缓冲从
+        // 整个协议槽组之后开始，不一定紧邻 table 参数槽。
+        builder.constructor_reserved_top = Some(base.slot() + frame.initializers.len());
+    }
     let call = builder.call(
         call,
         prefix_run.len(),
@@ -2186,27 +2203,51 @@ fn flatten_scope<'a>(
     });
 }
 
-/// until 与 body 尾部准备属于同一轮；完整 CALL 重发原 callee 覆盖及参数帧。
-/// 分叉/continue/goto 已由扁平视图隔断，capture/debug/TBC 仍由共享 builder 拒绝。
-fn repeat_condition_plan(
+/// 条件前的 CALL 结果可与准备链共同恢复；必须重发原单结果槽，不能只因
+/// 唯一条件读取就撤销物理根。分叉由扁平视图隔断，后继身份由整批 preview 核对。
+fn condition_plan(
     context: NativeFrameContext<'_>,
     run: &[&HirStmt],
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
     condition: &HirExpr,
 ) -> Option<Plan> {
-    let HirExpr::Call(call) = condition else {
+    let (value, producer) = if let HirExpr::LocalRef(local) = condition {
+        let (target, value) = scalar_local(run.last()?)?;
+        if target != *local {
+            return None;
+        }
+        let HirExpr::Call(call) = value else {
+            return None;
+        };
+        (value, Some(facts.operation_result_temp(call.source_site?)?))
+    } else {
+        (condition, None)
+    };
+    let HirExpr::Call(call) = value else {
         return comparison_plan(context, run, facts, dialect, condition);
     };
     let frame = facts.native_call_frame(call)?;
     let mut builder = frame_builder(context, run, facts, dialect, frame.home.slot())?;
-    let call = builder.call(
-        call,
-        run.len(),
-        frame.home.slot(),
-        true,
-        CallWidth::Fixed(1),
-    )?;
+    let value = if producer.is_some() {
+        builder.expr(
+            condition,
+            run.len(),
+            frame.home.slot(),
+            None,
+            true,
+            false,
+            producer,
+        )?
+    } else {
+        HirExpr::Call(Box::new(builder.call(
+            call,
+            run.len(),
+            frame.home.slot(),
+            true,
+            CallWidth::Fixed(1),
+        )?))
+    };
     let start = builder.first_event?;
     if builder.next_event != run.len() {
         return None;
@@ -2215,7 +2256,7 @@ fn repeat_condition_plan(
         start,
         sink: run.len(),
         base: frame.home,
-        values: vec![HirExpr::Call(Box::new(call))].into(),
+        values: vec![value].into(),
         result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: Vec::new(),
@@ -2571,6 +2612,12 @@ fn plan(
     let frame = facts.native_call_frame(call)?;
     let run = &stmts[..sink];
     let mut builder = frame_builder(context, run, facts, dialect, frame.home.slot())?;
+    if dialect == DecompileDialect::Luau
+        && let HirStmt::GenericFor(for_) = stmts[sink]
+    {
+        let iterator = facts.generic_for_body_frame(for_)?;
+        builder.constructor_reserved_top = Some(frame.home.slot() + iterator.initializers.len());
+    }
     let call = builder.call(call, run.len(), frame.home.slot(), true, width)?;
     let first = match builder.first_event {
         Some(first) if builder.next_event == run.len() => first,
@@ -3663,6 +3710,43 @@ fn operation_call_input(value: &HirExpr) -> Option<(crate::hir::common::HirSourc
         }
         _ => None,
     }
+}
+
+/// 声明 initializer 在原结果槽计算整棵算术树；保留声明本身及 debug 身份，
+/// 只消费共享 builder 已证明的操作数准备，不能把原 CALL 跨过左侧算术事件。
+fn arithmetic_initializer_plan(
+    context: NativeFrameContext<'_>,
+    run: &[&HirStmt],
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    stmt: &HirStmt,
+) -> Option<Plan> {
+    let (target, value @ HirExpr::Binary(binary)) = scalar_local(stmt)? else {
+        return None;
+    };
+    let base = facts.operation_result_home(binary.source_site?)?;
+    if facts.trusted_local_home_slot(target) != Some(base) {
+        return None;
+    }
+    let mut builder = frame_builder(context, run, facts, dialect, base.slot())?;
+    let value = builder.expr(value, run.len(), base.slot(), None, false, true, None)?;
+    let start = builder.first_event?;
+    if builder.next_event != run.len() {
+        return None;
+    }
+    Some(Plan {
+        start,
+        sink: run.len(),
+        base,
+        values: vec![value].into(),
+        result_locals: vec![target],
+        discarded_result: None,
+        assignment_targets: Vec::new(),
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        removed: Vec::new(),
+    })
 }
 
 /// 原 CALL 在高槽求值，RK 算术或取负随后写低结果槽；Luau initializer 与 PUC/JIT
