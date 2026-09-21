@@ -361,7 +361,19 @@ pub(crate) struct CaseBaseline {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+enum InstructionOperation {
+    Not,
+    Call,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum ReadabilityAssertion {
+    InstructionCount {
+        line: usize,
+        operation: InstructionOperation,
+        expected: usize,
+        selector: ReadabilitySelector,
+    },
     Name {
         line: usize,
         binding: NamingBindingSelector,
@@ -444,6 +456,8 @@ enum ReadabilityAstMetric {
     TableListField,
     TableRecordField,
     RepeatConditionLocal,
+    LocalBinding,
+    Assign,
 }
 
 /// 源码断言对 manifest 已展开实例的精确筛选；不在测试源码中重复方言或编译选项矩阵。

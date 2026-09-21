@@ -49,8 +49,15 @@ pub(super) fn read_readability_assertions(
             | "expect-not-contains"
             | "expect-not-line"
             | "expect-max-line-length" => 1,
-            "expect-order" | "expect-count" | "expect-min-count" | "expect-max-count"
-            | "expect-ast-count" | "expect-ast-min" | "expect-ast-max" | "expect-name" => 2,
+            "expect-order"
+            | "expect-count"
+            | "expect-min-count"
+            | "expect-max-count"
+            | "expect-ast-count"
+            | "expect-ast-min"
+            | "expect-ast-max"
+            | "expect-name"
+            | "expect-instruction-count" => 2,
             other => {
                 return Err(readability_parse_failure(
                     source_relative,
@@ -75,6 +82,32 @@ pub(super) fn read_readability_assertions(
         }
 
         match directive {
+            "expect-instruction-count" => {
+                let operation = match args[0].as_str() {
+                    "not" => InstructionOperation::Not,
+                    "call" => InstructionOperation::Call,
+                    _ => {
+                        return Err(readability_parse_failure(
+                            source_relative,
+                            line_no,
+                            "expect-instruction-count supports not and call operations",
+                        ));
+                    }
+                };
+                let expected = args[1].parse::<usize>().map_err(|_| {
+                    readability_parse_failure(
+                        source_relative,
+                        line_no,
+                        "instruction count must be a non-negative integer",
+                    )
+                })?;
+                assertions.push(ReadabilityAssertion::InstructionCount {
+                    line: line_no,
+                    operation,
+                    expected,
+                    selector,
+                });
+            }
             "expect-name" => {
                 let binding = parse_naming_binding(&args[0])
                     .map_err(|error| readability_parse_failure(source_relative, line_no, error))?;
@@ -405,6 +438,8 @@ fn parse_ast_metric(
         "function" => ReadabilityAstMetric::Function,
         "local-function" => ReadabilityAstMetric::LocalFunction,
         "local-decl" => ReadabilityAstMetric::LocalDecl,
+        "local-binding" => ReadabilityAstMetric::LocalBinding,
+        "assign" => ReadabilityAstMetric::Assign,
         "call" => ReadabilityAstMetric::Call,
         "method-call" => ReadabilityAstMetric::MethodCall,
         "error" => ReadabilityAstMetric::Error,
@@ -685,7 +720,8 @@ pub(super) fn assert_readability(
                     ));
                 }
             }
-            ReadabilityAssertion::Name { .. }
+            ReadabilityAssertion::InstructionCount { .. }
+            | ReadabilityAssertion::Name { .. }
             | ReadabilityAssertion::Contains { .. }
             | ReadabilityAssertion::Order { .. }
             | ReadabilityAssertion::SourceCount { .. }
@@ -694,6 +730,102 @@ pub(super) fn assert_readability(
     }
 
     Ok(())
+}
+
+pub(super) fn assert_instruction_contracts(
+    stage: &str,
+    lowered: &LoweredChunk,
+    entry: &LuaCaseManifestEntry,
+    assertions: &[ReadabilityAssertion],
+) -> Result<(), TestFailure> {
+    let expected = assertions
+        .iter()
+        .filter_map(|assertion| {
+            if let ReadabilityAssertion::InstructionCount {
+                line,
+                operation,
+                expected,
+                ..
+            } = assertion
+                && assertion_selector_matches(assertion, entry)
+            {
+                Some((*line, operation, *expected))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let mut counts = [0usize; 2];
+    let mut pending = vec![&lowered.main];
+    while let Some(proto) = pending.pop() {
+        for instr in &proto.instrs {
+            match instr {
+                LowInstr::UnaryOp(unary) if unary.op == unluac::transformer::UnaryOpKind::Not => {
+                    counts[0] += 1
+                }
+                LowInstr::Call(_) => counts[1] += 1,
+                _ => {}
+            }
+        }
+        pending.extend(proto.children.iter().map(AsRef::as_ref));
+    }
+    for (line, operation, expected) in expected {
+        let (count, name) = match operation {
+            InstructionOperation::Not => (counts[0], "NOT"),
+            InstructionOperation::Call => (counts[1], "CALL"),
+        };
+        if count != expected {
+            let summary = format!(
+                "[{stage}] instruction assertion failed at source line {line}: expected {expected} {name} operations, got {count}"
+            );
+            return Err(TestFailure::new(
+                FailureKind::ReadabilityAssertionFailed,
+                summary.clone(),
+                format!("{}: {summary}", entry.path),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn assert_compiled_instruction_contracts(
+    stage: &str,
+    path: &Path,
+    entry: &LuaCaseManifestEntry,
+    assertions: &[ReadabilityAssertion],
+) -> Result<(), TestFailure> {
+    if !assertions.iter().any(|assertion| {
+        matches!(assertion, ReadabilityAssertion::InstructionCount { .. })
+            && assertion_selector_matches(assertion, entry)
+    }) {
+        return Ok(());
+    }
+    // 仅显式要求这项合同的实例额外执行 Parse/Transformer；不重复 HIR 与 Generate。
+    let mut options = decompile_options(entry);
+    options.target_stage = DecompileStage::Transformer;
+    let bytes = fs::read(path).map_err(|error| {
+        TestFailure::new(
+            FailureKind::ReadabilityAssertionFailed,
+            format!("[{stage}] read instruction artifact failed"),
+            error.to_string(),
+        )
+    })?;
+    let result = decompile(&bytes, options).map_err(|error| {
+        TestFailure::new(
+            FailureKind::ReadabilityAssertionFailed,
+            format!("[{stage}] lower instruction artifact failed"),
+            error.to_string(),
+        )
+    })?;
+    let lowered = result
+        .state
+        .lowered
+        .as_ref()
+        .expect("Transformer stage publishes LoweredChunk");
+    assert_instruction_contracts(stage, lowered, entry, assertions)
 }
 
 fn assertion_selector_matches(
@@ -705,7 +837,8 @@ fn assertion_selector_matches(
 
 fn assertion_selector(assertion: &ReadabilityAssertion) -> &ReadabilitySelector {
     match assertion {
-        ReadabilityAssertion::Name { selector, .. }
+        ReadabilityAssertion::InstructionCount { selector, .. }
+        | ReadabilityAssertion::Name { selector, .. }
         | ReadabilityAssertion::Contains { selector, .. }
         | ReadabilityAssertion::NotContains { selector, .. }
         | ReadabilityAssertion::NotLine { selector, .. }
@@ -718,7 +851,8 @@ fn assertion_selector(assertion: &ReadabilityAssertion) -> &ReadabilitySelector 
 
 fn assertion_line(assertion: &ReadabilityAssertion) -> usize {
     match assertion {
-        ReadabilityAssertion::Name { line, .. }
+        ReadabilityAssertion::InstructionCount { line, .. }
+        | ReadabilityAssertion::Name { line, .. }
         | ReadabilityAssertion::Contains { line, .. }
         | ReadabilityAssertion::NotContains { line, .. }
         | ReadabilityAssertion::NotLine { line, .. }

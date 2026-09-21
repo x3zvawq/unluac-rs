@@ -17,7 +17,7 @@ use unluac::ast::{
 
 use super::super::ReadabilityAstMetric;
 
-const AST_METRIC_COUNT: usize = 25;
+const AST_METRIC_COUNT: usize = 27;
 
 #[derive(Clone, Default)]
 struct AstMetricCounts([usize; AST_METRIC_COUNT]);
@@ -48,6 +48,11 @@ impl AstMetricSummary {
             repeat_condition_locals: BTreeSet::new(),
         };
         summary.visit_block(0, &module.body);
+        let metric = ReadabilityAstMetric::LocalBinding.index();
+        for (counts, bindings) in summary.proto_counts.iter_mut().zip(&summary.local_bindings) {
+            counts.0[metric] = bindings.len();
+            summary.total.0[metric] += bindings.len();
+        }
         summary
     }
 
@@ -104,6 +109,7 @@ impl AstMetricSummary {
                 }
             }
             AstStmt::Assign(assign) => {
+                self.increment(scope, ReadabilityAstMetric::Assign);
                 for target in &assign.targets {
                     self.visit_lvalue(scope, target);
                 }
@@ -330,6 +336,8 @@ impl ReadabilityAstMetric {
             Self::TableListField => 22,
             Self::TableRecordField => 23,
             Self::RepeatConditionLocal => 24,
+            Self::LocalBinding => 25,
+            Self::Assign => 26,
         }
     }
 
@@ -360,6 +368,8 @@ impl ReadabilityAstMetric {
             Self::TableListField => "table-list-field",
             Self::TableRecordField => "table-record-field",
             Self::RepeatConditionLocal => "repeat-condition-local",
+            Self::LocalBinding => "local-binding",
+            Self::Assign => "assign",
         }
     }
 }

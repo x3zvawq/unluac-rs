@@ -349,6 +349,16 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
         entry.path,
     )?;
     assert_structure_contracts(entry, result.state.structure_facts.as_ref())?;
+    assert_instruction_contracts(
+        "original",
+        result
+            .state
+            .lowered
+            .as_ref()
+            .expect("Generate includes Transformer"),
+        entry,
+        &assertions,
+    )?;
 
     let generated = result.state.generated.as_ref().ok_or_else(|| {
         TestFailure::new(
@@ -411,6 +421,7 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
         ));
     }
 
+    assert_compiled_instruction_contracts("generated", &generated_chunk_path, entry, &assertions)?;
     let generated_runtime_path = &generated_chunk_path;
     let generated_output = run_compiled_lua_file(
         dialect_label,
@@ -583,6 +594,7 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
             ));
         }
 
+        assert_compiled_instruction_contracts(&round_label, &regen_chunk_path, entry, &assertions)?;
         let regen_runtime_path = &regen_chunk_path;
         let regen_output = run_compiled_lua_file(
             dialect_label,

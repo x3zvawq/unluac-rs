@@ -1,5 +1,6 @@
 -- 结构计数来自最终 AST：字符串里的关键字不算节点，proto 作用域不包含子函数体。
 -- unluac: expect-count [[@literal-if-while-function]] [[1]]
+-- unluac: expect-instruction-count [[not]] [[0]]
 -- unluac: expect-min-count [[assert(]] [[2]]
 -- unluac: expect-max-count [[@literal-if-while-function]] [[1]]
 -- unluac: expect-contains [[@literal-if-while-function]]
@@ -7,6 +8,12 @@
 -- unluac: expect-ast-count [[function]] [[1]] [[@proto=0]]
 -- unluac: expect-ast-count [[function]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[function]] [[0]] [[@proto=2]]
+-- local-binding 包含命名函数、普通声明和 for binding；不把函数参数或子函数成员算入父域。
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- assign 不把声明初始化或字符串里的等号计为赋值。
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=0]] [[@debug=retained]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=1]]
 -- unluac: expect-ast-count [[empty-function]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-max [[while]] [[0]]
 -- unluac: expect-ast-min [[call]] [[1]] [[@proto=0]] [[@dialect=lua5.4]]
