@@ -16,7 +16,10 @@ where
     let options = parse_args(args)?;
     let root = workspace_root()?;
 
-    let runner = build_case_runner(&root)?;
+    let build_started = Instant::now();
+    let runner = build_case_runner(&root, &options.profile)?;
+    let build_elapsed = build_started.elapsed();
+    let catalog_started = Instant::now();
     let cases = list_cases(&root, &runner)?;
     let cases = cases
         .into_iter()
@@ -25,6 +28,7 @@ where
         .filter(|case| options.dialect == "all" || case.dialect == options.dialect)
         .filter(|case| matches_case_filters(case, &options.case_filters))
         .collect::<Vec<_>>();
+    let catalog_elapsed = catalog_started.elapsed();
 
     if cases.is_empty() {
         let filter_text = if options.case_filters.is_empty() {
@@ -199,6 +203,9 @@ where
         let report = serde_json::json!({
             "total": total, "completed": completed, "failed": failed, "timed_out": timed_out,
             "elapsed_ms": started.elapsed().as_millis(), "worker_error": worker_error,
+            "profile": options.profile, "jobs": jobs,
+            "build_elapsed_ms": build_elapsed.as_millis(),
+            "catalog_elapsed_ms": catalog_elapsed.as_millis(),
             "entries": report_entries,
         });
         let file = std::fs::File::create(path)
@@ -245,6 +252,9 @@ pub(crate) fn print_help() {
     println!("                  [--output <simple|verbose>] [--timeout-seconds <n>]");
     println!("                  [--progress <auto|on|off>] [--color <auto|always|never>]");
     println!("                  [--verbose]");
-    println!("                  [--jobs <n>]");
+    println!("                  [--jobs <n>] (default: available parallelism, up to 8)");
+    println!(
+        "                  [--profile <cargo-profile>] (default: case-test; dev for fast rebuilds)"
+    );
     println!("                  [--recompile-rounds <n>]");
 }

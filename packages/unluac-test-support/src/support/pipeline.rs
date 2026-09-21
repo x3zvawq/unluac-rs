@@ -206,8 +206,20 @@ pub(crate) fn build_case_baseline(
         ));
     }
 
+    // 初次反编译消费实际运行过的同一 chunk，避免按相同选项再次调用编译器。
+    let compiled_chunk = fs::read(&compiled_path).map_err(|error| {
+        TestFailure::new(
+            FailureKind::CompileSourceFailed,
+            "read compiled baseline failed",
+            format!(
+                "read {} failed: {error}",
+                repo_relative_display(&compiled_path)
+            ),
+        )
+    })?;
     Ok(CaseBaseline {
         source_output,
+        compiled_chunk,
         runtime_observer,
     })
 }
@@ -241,7 +253,7 @@ pub(crate) fn run_pipeline_case(entry: &LuaCaseManifestEntry) -> Result<TestSucc
     })?;
     let expected_dialect = entry.dialect.decompile_dialect();
 
-    let mut chunk = compile_manifest_case(entry);
+    let mut chunk = baseline.compiled_chunk;
     if let LuaCaseExpectation::LuauSelfValueCaptureCarrier {
         closure_pc,
         save_pc,
@@ -685,7 +697,7 @@ fn run_global_decl_residual_contract(
             format!("baseline failed first\n{}", failure.detail()),
         )
     })?;
-    let chunk = compile_manifest_case(entry);
+    let chunk = baseline.compiled_chunk;
 
     let mut hir_options = decompile_options(entry);
     hir_options.target_stage = DecompileStage::Hir;

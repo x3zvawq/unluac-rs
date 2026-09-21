@@ -21,7 +21,8 @@ where
         progress: parse_env_or_default(PROGRESS_ENV, "auto", ProgressMode::parse)?,
         color: parse_env_or_default(COLOR_ENV, "auto", ColorMode::parse)?,
         plain_progress_detail: PlainProgressDetail::Sparse,
-        jobs: 1,
+        jobs: thread::available_parallelism().map_or(1, |count| count.get().min(8)),
+        profile: "case-test".to_owned(),
         recompile_rounds: 1,
     };
 
@@ -91,6 +92,13 @@ where
                 cursor += 1;
                 let value = args.get(cursor).context("missing value for `--color`")?;
                 options.color = ColorMode::parse(value)?;
+            }
+            "--profile" => {
+                cursor += 1;
+                options.profile = args
+                    .get(cursor)
+                    .context("missing value for `--profile`")?
+                    .clone();
             }
             "--jobs" => {
                 cursor += 1;

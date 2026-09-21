@@ -356,6 +356,7 @@ pub fn run_case(entry: LuaCaseManifestEntry) -> Result<TestSuccess, TestFailure>
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct CaseBaseline {
     pub(crate) source_output: LuaCommandOutput,
+    pub(crate) compiled_chunk: Vec<u8>,
     pub(crate) runtime_observer: Option<runtime_observer::RuntimeObserver>,
 }
 

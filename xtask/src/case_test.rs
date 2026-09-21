@@ -114,6 +114,7 @@ pub(crate) struct Options {
     color: ColorMode,
     plain_progress_detail: PlainProgressDetail,
     jobs: usize,
+    profile: String,
     recompile_rounds: u32,
 }
 

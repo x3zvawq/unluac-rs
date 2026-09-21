@@ -35,6 +35,11 @@ members = [
 ]
 resolver = "3"
 
+# 全量 case 矩阵以运行耗时为主；保留 dev 的断言与溢出检查。
+[profile.case-test]
+inherits = "dev"
+opt-level = 2
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

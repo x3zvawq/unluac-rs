@@ -1,6 +1,7 @@
 //! 构建 case runner 并消费 Cargo 返回的 executable identity，枚举 case、调度 worker、处理超时并解析机器输出；依赖子进程与 channel，不负责终端渲染；例如杀死超时 case 并归一化失败详情。
 
 use super::*;
+use wait_timeout::ChildExt;
 
 pub(super) fn workspace_root() -> Result<PathBuf> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -11,7 +12,7 @@ pub(super) fn workspace_root() -> Result<PathBuf> {
 
 /// 构建产物路径由 Cargo 的 compiler-artifact 事实返回，不能在后层按 target/debug 重建。
 /// 自定义 target-dir、Cargo 配置或 host target 都由同一次构建解析。
-pub(super) fn build_case_runner(root: &Path) -> Result<PathBuf> {
+pub(super) fn build_case_runner(root: &Path, profile: &str) -> Result<PathBuf> {
     let output = Command::new("cargo")
         .args([
             "build",
@@ -21,6 +22,8 @@ pub(super) fn build_case_runner(root: &Path) -> Result<PathBuf> {
             "unluac-test-support",
             "--bin",
             "case_runner",
+            "--profile",
+            profile,
         ])
         .current_dir(root)
         .stderr(Stdio::inherit())
@@ -247,76 +250,70 @@ pub(super) fn run_case_with_timeout(
     let stderr_reader = spawn_output_reader(stderr);
 
     let start = Instant::now();
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed to poll `{}`", runner.display()))?
-        {
-            let output = collect_child_output(status, stdout_reader, stderr_reader)?;
-            return match status.code() {
-                Some(0) => {
-                    let proto_count = parse_machine_success(&output);
-                    Ok(CaseExecution {
-                        elapsed: start.elapsed(),
-                        outcome: CaseOutcome::Passed,
-                        classification: None,
-                        rendered_failure: None,
-                        proto_count,
-                        failed_proto_tags: Vec::new(),
-                    })
-                }
-                Some(1) => {
-                    let failure = parse_machine_failure(&output)?;
-                    Ok(CaseExecution {
-                        elapsed: start.elapsed(),
-                        outcome: CaseOutcome::Failed,
-                        classification: Some(failure.classification),
-                        rendered_failure: Some(failure.rendered),
-                        proto_count: failure.proto_count,
-                        failed_proto_tags: failure.failed_proto_tags,
-                    })
-                }
-                _ => {
-                    let child_output = preferred_child_output(&output);
-                    let rendered_failure = if child_output.is_empty() {
-                        format!("case runner exited unexpectedly with status {status}")
-                    } else {
-                        format!(
-                            "case runner exited unexpectedly with status {status}\n{child_output}"
-                        )
-                    };
-                    Ok(CaseExecution {
-                        elapsed: start.elapsed(),
-                        outcome: CaseOutcome::Failed,
-                        classification: Some("runner-crashed".to_owned()),
-                        rendered_failure: Some(rendered_failure),
-                        proto_count: 0,
-                        failed_proto_tags: Vec::new(),
-                    })
-                }
-            };
-        }
-
-        if start.elapsed() >= timeout {
-            terminate_timed_out_runner(&mut child)
-                .with_context(|| format!("failed to kill timed out `{}`", runner.display()))?;
-            let status = child
-                .wait()
-                .with_context(|| format!("failed to wait for timed out `{}`", runner.display()))?;
-            let output = collect_child_output(status, stdout_reader, stderr_reader)?;
-            let rendered_failure = preferred_child_output(&output);
-            return Ok(CaseExecution {
-                elapsed: start.elapsed(),
-                outcome: CaseOutcome::TimedOut,
-                classification: Some("timed-out".to_owned()),
-                rendered_failure: (!rendered_failure.trim().is_empty()).then_some(rendered_failure),
-                proto_count: 0,
-                failed_proto_tags: Vec::new(),
-            });
-        }
-
-        thread::sleep(Duration::from_millis(50));
+    // 退出通知直接唤醒 worker，避免短 case 等待下一个固定轮询周期。
+    // 两条输出管道仍由独立 reader 持续排空；超时分支仍先终止进程树再收集输出。
+    if let Some(status) = child
+        .wait_timeout(timeout)
+        .with_context(|| format!("failed to wait for `{}`", runner.display()))?
+    {
+        let output = collect_child_output(status, stdout_reader, stderr_reader)?;
+        return match status.code() {
+            Some(0) => {
+                let proto_count = parse_machine_success(&output);
+                Ok(CaseExecution {
+                    elapsed: start.elapsed(),
+                    outcome: CaseOutcome::Passed,
+                    classification: None,
+                    rendered_failure: None,
+                    proto_count,
+                    failed_proto_tags: Vec::new(),
+                })
+            }
+            Some(1) => {
+                let failure = parse_machine_failure(&output)?;
+                Ok(CaseExecution {
+                    elapsed: start.elapsed(),
+                    outcome: CaseOutcome::Failed,
+                    classification: Some(failure.classification),
+                    rendered_failure: Some(failure.rendered),
+                    proto_count: failure.proto_count,
+                    failed_proto_tags: failure.failed_proto_tags,
+                })
+            }
+            _ => {
+                let child_output = preferred_child_output(&output);
+                let rendered_failure = if child_output.is_empty() {
+                    format!("case runner exited unexpectedly with status {status}")
+                } else {
+                    format!("case runner exited unexpectedly with status {status}\n{child_output}")
+                };
+                Ok(CaseExecution {
+                    elapsed: start.elapsed(),
+                    outcome: CaseOutcome::Failed,
+                    classification: Some("runner-crashed".to_owned()),
+                    rendered_failure: Some(rendered_failure),
+                    proto_count: 0,
+                    failed_proto_tags: Vec::new(),
+                })
+            }
+        };
     }
+
+    terminate_timed_out_runner(&mut child)
+        .with_context(|| format!("failed to kill timed out `{}`", runner.display()))?;
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for timed out `{}`", runner.display()))?;
+    let output = collect_child_output(status, stdout_reader, stderr_reader)?;
+    let rendered_failure = preferred_child_output(&output);
+    Ok(CaseExecution {
+        elapsed: start.elapsed(),
+        outcome: CaseOutcome::TimedOut,
+        classification: Some("timed-out".to_owned()),
+        rendered_failure: (!rendered_failure.trim().is_empty()).then_some(rendered_failure),
+        proto_count: 0,
+        failed_proto_tags: Vec::new(),
+    })
 }
 
 pub(super) fn terminate_timed_out_runner(child: &mut std::process::Child) -> Result<()> {
@@ -331,7 +328,7 @@ pub(super) fn terminate_timed_out_runner(child: &mut std::process::Child) -> Res
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .output()
             .context("failed to spawn taskkill for timed out runner")?;
-        // runner 可以在上次 poll 与 taskkill 之间自然结束；此时无需再终止。
+        // runner 可以在等待超时与 taskkill 之间自然结束；此时无需再终止。
         if !output.status.success() && child.try_wait()?.is_none() {
             bail!(
                 "taskkill failed with status {}: {}",
