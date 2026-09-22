@@ -2,6 +2,22 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_literals/number_07_scientific_roundtrip.lua",
+        &["float", "format", "roundtrip", "sign-bit"],
+        "极端 f64 的科学计数法保持有效数字、负零和浮点类型，常用量级仍用十进制。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_literals/nonfinite_01_luajit_infinite_imaginary.lua",
         &["imaginary", "nonfinite", "numeric-token"],
         "将正负无穷虚部发射为 LuaJIT 可重编译的 `1e999i` token。",

@@ -103,7 +103,14 @@ pub(super) fn format_number(value: f64, preserve_integral_float: bool) -> String
     if value == 0.0 && value.is_sign_negative() {
         return "-0.0".to_owned();
     }
-    let rendered = value.to_string();
+    // 极小/极大的有限数不展开成数百位零；两种格式均使用可 round-trip 的有效数字。
+    // 常用量级保留十进制，指数本身也能保留 Lua 5.3+ 的浮点类型。
+    let magnitude = value.abs();
+    let rendered = if magnitude != 0.0 && !(1e-6..1e16).contains(&magnitude) {
+        format!("{value:e}")
+    } else {
+        value.to_string()
+    };
     if !preserve_integral_float || rendered.contains(['.', 'e', 'E']) {
         rendered
     } else {
