@@ -46,6 +46,9 @@ impl AstVisitor for FeatureCollector {
                     self.features.insert(AstFeature::GlobalConst);
                 }
             }
+            AstStmt::FunctionDecl(decl) if decl.global_declaration => {
+                self.features.insert(AstFeature::GlobalDecl);
+            }
             AstStmt::Continue => {
                 self.features.insert(AstFeature::ContinueStmt);
             }
@@ -59,5 +62,8 @@ impl AstVisitor for FeatureCollector {
 
     fn visit_expr(&mut self, expr: &AstExpr) {
         self.has_errors |= matches!(expr, AstExpr::Error(_));
+        if matches!(expr, AstExpr::IfExpr(_)) {
+            self.features.insert(AstFeature::IfExpr);
+        }
     }
 }

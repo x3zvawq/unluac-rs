@@ -239,7 +239,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_stress/expressions_05_value_chain.lua",
         &["metamethod", "multiret", "not", "truthiness"],
         "256次NOT链、callback多返回截断、比较元方法和error传播共同验证布尔化不暴露原值或额外结果。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_stress/controlflow_07_pure_suffix_close_loop.lua",

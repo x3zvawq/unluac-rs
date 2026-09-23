@@ -251,6 +251,8 @@ pub struct ProtoSignature {
     pub has_vararg_param_reg: bool,
     pub named_vararg_table: bool,
     pub legacy_arg_slot: bool,
+    /// Lua 5.1 NEEDSARG 独立于 HASARG：入口是否实际创建旧式 arg 表。
+    pub legacy_arg_table: bool,
 }
 
 /// 后续层需要的调用帧信息。

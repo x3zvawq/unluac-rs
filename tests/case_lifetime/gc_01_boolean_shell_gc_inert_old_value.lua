@@ -1,5 +1,6 @@
--- regress_342_boolean_shell_gc_inert_old_value: 非相邻 primitive 旧值允许删除 dead boolean shell
--- unluac: expect-not-contains [[not not]]
+-- 非相邻 primitive 旧值不承载 GC 资源，但不能因此删除原 truthiness 检查。
+-- unluac: expect-contains [[not not]]
+-- unluac: expect-ast-count [[assign]] [[2]]
 
 for _, value in ipairs({ 1 }) do
     value = nil

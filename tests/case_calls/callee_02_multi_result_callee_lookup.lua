@@ -1,4 +1,6 @@
 -- callee lookup 内仍可观察第二个旧根，只有进入实际调用后它才退出 caller 根域。
+-- unluac: expect-not-contains [[ = assert]]
+-- unluac: expect-ast-count [[local-binding]] [[9]] [[@proto=0]]
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })
 local left, right

@@ -13,17 +13,20 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 
+use crate::decompile::DecompileDialect;
 use crate::structure::{
     BlockEmissionPlan, BlockRef, BlockTerminatorKind, Cfg, LoopVmProtocol, RegionId, RegionPlan,
     StructurePlan,
 };
-use crate::transformer::InstrRef;
+use crate::transformer::{InstrRef, LowInstr, LoweredProto, ValuePack};
 
 pub(super) struct HirEmissionFacts<'a> {
     plan: &'a StructurePlan,
     regions: Vec<RegionEmission>,
     for_instrs: BTreeSet<InstrRef>,
     hoisted_prefixes: BTreeSet<BlockRef>,
+    island_entry_prefixes: BTreeSet<BlockRef>,
+    target: DecompileDialect,
 }
 
 #[derive(Clone, Copy)]
@@ -43,7 +46,7 @@ impl RegionEmission {
 }
 
 impl<'a> HirEmissionFacts<'a> {
-    pub(super) fn new(plan: &'a StructurePlan) -> Self {
+    pub(super) fn new(plan: &'a StructurePlan, cfg: &Cfg, target: DecompileDialect) -> Self {
         let unrestricted = RegionEmission {
             ordinary: true,
             prefix_allowed: true,
@@ -53,6 +56,7 @@ impl<'a> HirEmissionFacts<'a> {
         let mut regions = vec![unrestricted; plan.regions().len()];
         let mut for_instrs = BTreeSet::new();
         let mut hoisted_prefixes = BTreeSet::new();
+        let mut island_entry_prefixes = BTreeSet::new();
         for (id, payload) in plan.loops() {
             match plan.loop_protocol(id) {
                 Some(LoopVmProtocol::Repeat(protocol))
@@ -82,6 +86,20 @@ impl<'a> HirEmissionFacts<'a> {
             let node = plan
                 .region(region)
                 .expect("ready region order retains every node");
+            if let RegionPlan::Unstructured {
+                entry,
+                entries,
+                layout,
+                ..
+            } = node
+                && matches!(layout.first(), Some(crate::structure::UnstructuredLayoutItem::Block(first)) if first == entry)
+                && entries
+                    .iter()
+                    .all(|edge| cfg.edges[edge.index()].to == *entry)
+            {
+                // 每个区域只检查一次入口，避免同块的多个 debug 声明重复扫描全部边。
+                island_entry_prefixes.insert(*entry);
+            }
             let mut state = node
                 .parent()
                 .map_or(unrestricted, |parent| regions[parent.index()]);
@@ -142,6 +160,10 @@ impl<'a> HirEmissionFacts<'a> {
                         .and_then(|value| value.header()),
                 );
             }
+            if plan.single_pass_for_region(region).is_some() {
+                // 单次 repeat 包装同样形成词法块；其中的声明不能冒充函数入口声明。
+                state.scope_owner = region;
+            }
             state.ordinary &= !matches!(
                 node,
                 RegionPlan::Unstructured { .. } | RegionPlan::ValueDecision { .. }
@@ -153,12 +175,21 @@ impl<'a> HirEmissionFacts<'a> {
             regions,
             for_instrs,
             hoisted_prefixes,
+            island_entry_prefixes,
+            target,
         }
     }
 
     pub(super) fn scope_owner(&self, block: BlockRef) -> Option<RegionId> {
         let owner = self.plan.region_for_block(block)?;
         Some(self.regions[owner.index()].scope_owner)
+    }
+
+    /// 声明可以供其词法子域写入，但 CFG 支配本身不授权逃出源码作用域。
+    pub(super) fn scope_contains(&self, declaration: BlockRef, write: BlockRef) -> bool {
+        self.scope_owner(declaration)
+            .zip(self.scope_owner(write))
+            .is_some_and(|(outer, inner)| self.plan.region_contains(outer, inner))
     }
 
     /// 两端必须由 regular/header prefix 发射，不能切入被吸收的表达式或 loop 绑定。
@@ -186,6 +217,93 @@ impl<'a> HirEmissionFacts<'a> {
         self.plan
             .region_for_block(block)
             .is_some_and(|owner| self.regions[owner.index()].ordinary)
+    }
+
+    /// island 的所有外部入口落在同一个首块时，其前缀仍可拥有原位置的声明。
+    /// 是否会由内部回边再次进入，由调用方的 CFG 循环事实另证。
+    pub(super) fn island_entry_prefix(&self, block: BlockRef) -> bool {
+        self.island_entry_prefixes.contains(&block)
+    }
+
+    /// 词法窗口可包住完整值决策，但不能从表达式内部开始或结束。
+    /// CFG/SSA 与生命周期闭包由调用方另证，这里只核对 lowering 的原子发射边界。
+    pub(super) fn window_emission_is_local(&self, cfg: &Cfg, window: &Range<usize>) -> bool {
+        let mut seen = BTreeSet::new();
+        for run in cfg.instr_to_block[window.clone()].chunk_by(|a, b| a == b) {
+            let block = run[0];
+            if self.ordinary_block(block) {
+                continue;
+            }
+            let Some(owner) = self.plan.region_for_block(block) else {
+                return false;
+            };
+            if !seen.insert(owner) {
+                continue;
+            }
+            let Some(RegionPlan::ValueDecision { plan, parent, .. }) = self.plan.region(owner)
+            else {
+                return false;
+            };
+            if !self.regions[parent.index()].ordinary {
+                return false;
+            }
+            let Some(decision) = self.plan.value_decision(*plan) else {
+                return false;
+            };
+            if decision.blocks().any(|block| {
+                let range = cfg.blocks[block.index()].instrs;
+                range.start.index() < window.start || range.end() > window.end
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Lua 5.1 的函数根块在隐式空 RETURN 前结束 debug local，已提供该词法终点。
+    pub(super) fn function_body_ends_at(
+        &self,
+        proto: &LoweredProto,
+        block: BlockRef,
+        end: usize,
+    ) -> bool {
+        self.target == DecompileDialect::Lua51
+            && self.scope_owner(block) == Some(self.plan.root())
+            && end + 1 == proto.instrs.len()
+            && matches!(self.plan.block_terminator(block).map(|term| term.kind),
+                Some(BlockTerminatorKind::Return { instr, .. }) if instr.index() == end)
+            && matches!(proto.instrs.get(end), Some(LowInstr::Return(ret))
+                if matches!(ret.values, ValuePack::Fixed(values) if values.len == 0))
+    }
+
+    /// 无附加动作的 while 回边已结束 body 的词法域，不再为同一末端增加 do。
+    pub(super) fn loop_body_ends_at(&self, block: BlockRef, end: usize) -> bool {
+        let Some(terminator) = self.plan.block_terminator(block) else {
+            return false;
+        };
+        let BlockTerminatorKind::Jump { instr, edge } = terminator.kind else {
+            return false;
+        };
+        let Some(edge) = self.plan.edge_plan(edge) else {
+            return false;
+        };
+        let crate::structure::EdgeTransfer::LoopBack(region) = edge.transfer else {
+            return false;
+        };
+        let Some(RegionPlan::Loop { plan, body, .. }) = self.plan.region(region) else {
+            return false;
+        };
+        // repeat 条件仍处于 body 作用域，不能借回边把条件前的 debug 终点延后。
+        instr.index() == end
+            && self.scope_owner(block) == Some(*body)
+            && matches!(
+                self.plan.loop_protocol(*plan),
+                Some(LoopVmProtocol::While(_) | LoopVmProtocol::WhileTrue)
+            )
+            && edge.phi_copies.is_empty()
+            && edge.cleanup.is_empty()
+            && edge.iteration.is_empty()
+            && edge.forward_route.is_none()
     }
 
     /// 将源码 exclusive 末端投影到仍能发射交接语句的 prefix 边界。

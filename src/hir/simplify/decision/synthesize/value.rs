@@ -133,7 +133,9 @@ fn trace_sequence_expr(discarded: HirExpr, continuation: HirExpr) -> HirExpr {
         expr: discarded,
     }));
     HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
         lhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: booleanized,
             rhs: HirExpr::Boolean(true),
         })),

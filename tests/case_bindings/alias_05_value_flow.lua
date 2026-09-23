@@ -5,6 +5,10 @@
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=3]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[1]] [[@proto=3]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[0]] [[@proto=0]]
+-- repeat 的入口状态与回边共用身份，返回前不另建只转交数值的 local。
+-- unluac: expect-ast-max [[local-decl]] [[3]] [[@proto=3]]
+-- unluac: expect-not-contains [[= r0_4(true)]]
+-- unluac: expect-not-contains [[= r0_5(true)]]
 -- unluac: expect-not-contains [[unluac error]]
 
 local function loop_alias(value)

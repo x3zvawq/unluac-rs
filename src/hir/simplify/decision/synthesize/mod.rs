@@ -12,12 +12,10 @@
 
 mod cost;
 mod domain;
-mod readable;
 mod safety;
 mod value;
 
 pub(crate) use cost::expr_cost;
-pub(crate) use readable::naturalize_pure_logical_expr;
 pub(crate) use value::synthesize_value_decision_expr;
 
 use crate::hir::common::{HirBinaryExpr, HirExpr, HirLogicalExpr, HirUnaryExpr, HirUnaryOpKind};
@@ -53,7 +51,11 @@ fn normalize_candidate_expr(expr: HirExpr, safety: HirExprSafety) -> HirExpr {
             {
                 HirExpr::Boolean(false)
             } else {
-                let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }));
+                let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                    preserves_boolean_prewrite: false,
+                    lhs,
+                    rhs,
+                }));
                 super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
                     .unwrap_or(expr)
             }
@@ -69,7 +71,11 @@ fn normalize_candidate_expr(expr: HirExpr, safety: HirExprSafety) -> HirExpr {
             } else if super::expr_is_boolean_valued(&lhs) && matches!(rhs, HirExpr::Boolean(true)) {
                 HirExpr::Boolean(true)
             } else {
-                let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
+                let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                    preserves_boolean_prewrite: false,
+                    lhs,
+                    rhs,
+                }));
                 super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
                     .unwrap_or(expr)
             }

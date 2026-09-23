@@ -1,6 +1,7 @@
 -- regress_272_lua52_goto_capture_identity: backward goto 不能把共享 capture 槽降成逐轮 local
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-binding]] [[2]]
 
 local functions = {}
 local value

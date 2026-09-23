@@ -38,12 +38,51 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         } else {
             Some(self.finish_emission(region, else_block)?)
         };
-        stmts.push(branch_stmt(
-            cond,
-            self.finish_emission(region, then_block)?,
-            else_block,
-        ));
+        let preserves_test = self.condition_reads_literal(payload.condition);
+        let mut branch = branch_stmt(cond, self.finish_emission(region, then_block)?, else_block);
+        if let HirStmt::If(if_stmt) = &mut branch {
+            // PolicyBoundary：原 TEST 即使读取已知常量也不是合成控制壳；两臂相同
+            // 不能授权 value folding 将它改成恒值后再消除。
+            if_stmt.preserves_empty_test = preserves_test;
+        }
+        stmts.push(branch);
         Ok(stmts)
+    }
+
+    /// 只供 TEST 的字面量临时不属于合成控制壳；短路结果仍读取该值时留给值恢复。
+    fn condition_reads_literal(&self, plan: crate::structure::ConditionPlanId) -> bool {
+        use crate::transformer::{BranchSubject, CondOperand};
+        let Some(plan) = self.lowering.structure.plan().condition(plan) else {
+            return false;
+        };
+        let [node] = plan.nodes.as_slice() else {
+            return false;
+        };
+        let LowInstr::Branch(branch) = &self.lowering.proto.instrs[node.predicate.index()] else {
+            return false;
+        };
+        let BranchSubject::Truthy(CondOperand::Reg(reg)) = branch.cond.subject else {
+            return false;
+        };
+        let value = self.lowering.dataflow.use_value(node.predicate, reg);
+        let SsaValue::Def(def) = value else {
+            return false;
+        };
+        let uses = &self.lowering.dataflow.def_uses[def.index()];
+        if uses.len() != 1
+            || uses[0].instr != node.predicate
+            || !self.lowering.dataflow.def_phi_uses[def.index()].is_empty()
+        {
+            return false;
+        }
+        matches!(
+            self.lowering.proto.instrs[self.lowering.dataflow.def_instr(def).index()],
+            LowInstr::LoadBool(_)
+                | LowInstr::LoadNil(_)
+                | LowInstr::LoadInteger(_)
+                | LowInstr::LoadNumber(_)
+                | LowInstr::LoadConst(_)
+        )
     }
 
     pub(super) fn lower_short_circuit_condition(

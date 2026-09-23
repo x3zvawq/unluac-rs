@@ -1,5 +1,8 @@
 -- regress_364_terminal_else_single_goto: a single fallback goto can become the terminal else arm
--- unluac: expect-order [[goto L2]] [[r1_1 = r1_0]]
+-- 状态 carrier 合并后不再要求机械交接；入口跳转仍须越过 first 的写入到达 second。
+-- unluac: expect-order [[goto L2]] [[= 100]]
+-- unluac: expect-ast-count [[goto]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[label]] [[2]] [[@proto=1]]
 
 local function run(entry, first_exit, second_exit, cycle)
     local value = 0

@@ -27,7 +27,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_28_preserved_predicates.lua",
         &["short-circuit", "path-condition", "source-fidelity"],
-        "保留原字节码的重复条件检查，不依据前一条路径事实删除。",
+        "保留原字节码的重复检查及两边同出口的TEST，不依据路径事实或空臂删除。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
@@ -514,7 +514,30 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_control_flow/branch_09_short_circuit_exit_jump_pad.lua",
         &["jump-pad", "method", "short-circuit"],
         "短路出口空pad随条件消费并保留state:add。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/loop_37_loop_branch_merge.lua",
@@ -735,7 +758,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_control_flow/branch_05_nested_loop_header_arm.lua",
         &["branch-arm", "early-return", "header", "nested-while"],
         "证明 branch arm 可直接进入唯一 nested-loop header，而不需残余跳转或机械局部。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/loop_23_enclosing_loop_escape_fence.lua",
@@ -860,7 +893,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_control_flow/branch_06_lua51_short_while_break_shared_tail.lua",
         &["break", "short-circuit", "while"],
         "保证短路 while 的 early break 不抢占非空共享 tail。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/ownership_17_puc_nested_repeat_break_live_out.lua",
@@ -878,7 +921,21 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_control_flow/branch_07_luau_decision_guard_mutation.lua",
         &["guard", "if-expression", "mutation"],
         "保证 decision 所选臂改变 guard 后不会误执行另一臂。",
-        &[LuaCaseConfiguration::new(LUAU_ONLY).with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)],
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/loop_31_lua51_loop_region_ownership.lua",
@@ -896,7 +953,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_control_flow/branch_08_connector_ownership.lua",
         &["call-order", "require", "short-circuit"],
         "固定条件connector对渠道/status/level短路调用的所有权。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/continue_10_luau_nested_continue_owner.lua",
@@ -936,7 +1003,30 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_control_flow/branch_10_repeat_prefix_decision.lua",
         &["nested-loop", "prefix", "repeat"],
         "证明未触碰prefix Decision不拥有repeat tail。",
-        &[LuaCaseConfiguration::new(PUC_LUA_GE_54)],
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_11_path_condition_clean_islands.lua",
@@ -945,6 +1035,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &[
             LuaCaseConfiguration::new(PUC_LUA_GE_52).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -988,14 +1079,24 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_12_naturalize_unbounded.lua",
         &["boolean-chain", "truthiness", "unbounded"],
-        "验证超过固定小阈值的18臂and/or决策链仍能整体自然化。",
-        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
+        "保留18臂and/or链各自的原条件检查及所有返回出口，不以值等价提取公共guard。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_13_environment_partition.lua",
         &["boolean-chain", "environment", "partition"],
-        "验证共享a条件但环境不同的内外决策区仍恢复为嵌套布尔表达式。",
-        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
+        "保留不同短路入口的两次a检查，恢复内外逻辑树并覆盖各个提前返回值。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/continue_13_luau_repeat_continue_scope_latch.lua",
@@ -1006,13 +1107,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_14_shell_flow_old_values.lua",
         &["backedge", "closure-cell", "coroutine", "goto"],
-        "系统覆盖 boolean shell 删除所需旧值事实：前向跨 goto、资源回边、双入口循环、并行 closure observer、删除后的 occurrence 路径、无出口协程读取及 relay 捕获。",
+        "未使用的 Boolean 结果仍保留原检查，覆盖 goto 双入口、资源回边、并行 closure observer、嵌套块、协程读取及 relay 捕获。",
         &[LuaCaseConfiguration::new(&[
             LuaCaseDialect::Lua52,
             LuaCaseDialect::Lua53,
             LuaCaseDialect::Lua54,
             LuaCaseDialect::Lua55,
-        ])],
+        ])
+        .with_options(LuaCaseOptions {
+            recompile_rounds: Some(3),
+            ..LuaCaseOptions::DEFAULT
+        })],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/ownership_19_flow_paths.lua",
@@ -1404,4 +1509,5 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             }),
         ],
     ),
+
 ];

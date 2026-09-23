@@ -169,7 +169,12 @@ pub(super) fn write_block(
                 let function_names = collect_function_render_names(&function_decl.func.body);
                 let proto_id = function_decl.func.function.0;
                 let header = format!(
-                    "{indent}{}({})",
+                    "{indent}{}{}({})",
+                    if function_decl.global_declaration {
+                        "global "
+                    } else {
+                        ""
+                    },
                     format_function_name(&function_decl.target, names),
                     format_decl_params(
                         &function_decl.func,

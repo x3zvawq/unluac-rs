@@ -294,6 +294,7 @@ impl Lua55ParserState {
                 has_vararg_param_reg: semantic_flag & (PF_VAHID | PF_VATAB) != 0,
                 named_vararg_table: semantic_flag & PF_VATAB != 0,
                 legacy_arg_slot: false,
+                legacy_arg_table: false,
             },
             PucLuaProtoSections {
                 instructions,

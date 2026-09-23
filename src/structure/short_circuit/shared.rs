@@ -86,6 +86,7 @@ impl<'a> LinearFollowCtx<'a> {
         start: BlockRef,
         mut extra_valid: impl FnMut(BlockRef) -> bool,
         mut is_terminal: impl FnMut(BlockRef) -> bool,
+        mut is_preparation: impl FnMut(BlockRef) -> bool,
     ) -> Option<LinearFollowResult> {
         let mut current = start;
         let mut visited = BTreeSet::new();
@@ -116,7 +117,12 @@ impl<'a> LinearFollowCtx<'a> {
             }
 
             match successor {
-                Some(succ) if block_is_passthrough(self.proto, self.cfg, current) => current = succ,
+                Some(succ)
+                    if block_is_passthrough(self.proto, self.cfg, current)
+                        || is_preparation(current) =>
+                {
+                    current = succ
+                }
                 _ => return None,
             }
         }

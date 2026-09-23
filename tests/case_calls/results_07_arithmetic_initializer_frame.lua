@@ -1,6 +1,11 @@
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=lua5.1]] [[@debug=retained]]
--- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]] [[@dialect=lua5.4]] [[@debug=retained]]
--- unluac: expect-contains [[local cd =]] [[@debug=retained]]
+-- 算术准备与条件写回共用一个状态身份；LuaJIT 的函数编号按子 proto 逆序排列。
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=5]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@dialect=luajit]]
+-- unluac: expect-not-contains [[else]]
+-- unluac: expect-contains [[local cd = act_data.cd + event.pull_time - clock()]] [[@debug=retained]]
+-- unluac: expect-contains [[return value + rhs]] [[@debug=retained]]
 -- 左侧算术可能调用元方法，必须先完成它，再调用 clock，最后执行减法。
 local function remaining(act_data, event, clock, total_seconds)
     local cd = act_data.cd + event.pull_time - clock()

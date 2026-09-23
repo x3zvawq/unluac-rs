@@ -6,10 +6,23 @@
 -- unluac: expect-contains [[xmin = r1_0]]
 -- unluac: expect-contains [[return p1_1, p1_2, p1_3]]
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]]
+-- CALL 初始化以当前事务的左值归属为准，不因后续 owner 合并退回空声明。
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
+-- 多返回值完成全局写入后，参数算术仍按原准备槽求值，不保留逐指令中转。
+-- unluac: expect-contains [[p1_1 = (xmin + xmax) / 2]]
+-- unluac: expect-contains [[p1_2 = (ymin + ymax) / 2]]
+-- unluac: expect-contains [[p1_3 = math.min((xmax - xmin) / 2, (ymax - ymin) / 2)]]
 -- unluac: expect-contains [[local r2_4 = math.abs(r2_2 - r2_0)]]
 -- 保留原 height 初始化与 CALL 槽；不强制把它改成返回参数区里的新调用。
 -- unluac: expect-contains [[local r2_5 = math.abs(r2_3 - r2_1)]]
 -- unluac: expect-contains [[return r2_4, r2_5]]
+-- 完整数组直接写回原捕获 cell，不能让临时声明占住后续 CALL 的准备区。
+-- unluac: expect-contains [[r0_3 = { 10, 16, 2, 4 }]]
+-- unluac: expect-count [[r0_3 = { 2, 4, 10, 16 }]] [[2]]
+-- 循环内写回同一低槽，不能改成新声明后再逐项交接。
+-- unluac: expect-count [[r0_8, r0_9 = r0_1(r0_4)]] [[3]]
+-- 条件末项的算术按原短路顺序在 Boolean 槽求值，不拆出 callee 和参数别名。
+-- unluac: expect-contains [[assert(r0_8 == 0 and r0_9 == 0 and r0_2 == 3 + r0_10)]]
 -- unluac: expect-not-contains [[unluac error]]
 
 local function circle(self, x, y, radius)

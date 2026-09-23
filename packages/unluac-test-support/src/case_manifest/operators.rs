@@ -119,7 +119,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "short-circuit",
         ],
         "确认同值条件保留求值和后继弱表根观察，完整算术调用帧不阻塞再编译后的表构造。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_operators/boolean_08_fallback_value_merge.lua",
@@ -142,8 +147,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_operators/arithmetic_01_decision_numeric_equality.lua",
         &["equality", "float", "integer", "representation"],
-        "保证Decision按Lua整数/浮点数值相等建模，同时保留返回表示。",
-        &[LuaCaseConfiguration::new(PUC_LUA_54)],
+        "保留整数/浮点数值相等时的两次原比较以及返回值的数值表示。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_operators/order_03_loop_lookup_eval_count.lua",
@@ -154,19 +164,19 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_operators/discard_01_safe_truthiness.lua",
         &["dead-value", "gc-root", "truthiness", "vararg"],
-        "删除无用not计算及不可达分支，保留原槽写和and/or/vararg潜在对象根。",
+        "保留原NOT、显式比较及其分支，以及and/or/vararg潜在对象根。",
         &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
     ),
     LuaCaseDefinition::new(
         "tests/case_operators/bitwise_01_safe_integer_ops.lua",
         &["bitwise", "dead-value", "integer"],
-        "直接整数字面量的无事件floor/mod/bitwise死计算可省略，保留原结果槽写。",
+        "保留原比较、短路路径与 floor/mod/bitwise 运算，不按恒值删除字节码操作。",
         &[LuaCaseConfiguration::new(PUC_LUA_GE_53)],
     ),
     LuaCaseDefinition::new(
         "tests/case_operators/discard_02_safe_literal_ops.lua",
         &["arithmetic", "error", "literal"],
-        "区分可丢弃literal算术/字符串长度与仍会抛错的数字长度、异型排序。",
+        "保留原 literal 算术、字符串长度与显式检查，并观察数字长度、异型排序的错误。",
         &[
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
             LuaCaseConfiguration::new(LUAU_ONLY).with_variants(LUAU_O0_ONLY),
@@ -175,7 +185,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_operators/discard_03_safe_primitive_equality.lua",
         &["dead-value", "equality", "gc-root", "nil", "primitive"],
-        "无读且无操作数scratch的纯比较可省略计算，但保留原槽写以清除旧弱表根。",
+        "保留无读纯比较及其原槽覆盖，验证旧弱表根仍在相同时点释放。",
         &[LuaCaseConfiguration::new(PUC_LUA_ALL)],
     ),
     LuaCaseDefinition::new(
@@ -199,7 +209,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_operators/comparison_02_bytewise_string_order.lua",
         &["constant-fold", "ordering"],
-        "允许bytewise方言把ä与z比较常量折叠为false/false。",
+        "保留 bytewise 方言的两个原字符串比较，运行结果仍为 false/false。",
         &[
             LuaCaseConfiguration::new(LUAJIT_ONLY),
             LuaCaseConfiguration::new(LUAU_ONLY).with_variants(LUAU_O0_ONLY),
@@ -208,7 +218,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_operators/equality_04_mismatched_primitive_equality.lua",
         &["constant-fold", "primitive"],
-        "允许跨nil/boolean/string/number类型的primitive equality折叠为false。",
+        "保留跨 nil/boolean/string/number 类型的原 equality，并验证结果。",
         &[
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
             LuaCaseConfiguration::new(LUAU_ONLY).with_variants(LUAU_O0_ONLY),
@@ -217,7 +227,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_operators/arithmetic_02_binary64_mixed_numeric.lua",
         &["binary64", "float", "integer", "ordering"],
-        "验证纯binary64方言的mixed numeric equality/order常量折叠。",
+        "验证 binary64 方言保留 mixed numeric equality/order 与原结果。",
         &[
             LuaCaseConfiguration::new(&[LuaCaseDialect::Luajit]),
             LuaCaseConfiguration::new(LUAU_ONLY).with_variants(LUAU_O0_ONLY),
@@ -329,7 +339,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_operators/folding_02_indexed_logical_factors.lua",
         &["enumeration", "factoring", "identity", "short-circuit"],
-        "非相邻分支提取共同prefix/suffix，同时值级or不能按索引命中交换顺序。",
+        "保留非相邻分支的原比较次数与顺序，值级or也不能按索引命中交换顺序。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_ALL),
             LuaCaseConfiguration::new(LUAU_ONLY),
@@ -468,7 +478,10 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
                 recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
-            LuaCaseConfiguration::new(LUAU_ONLY),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
         ],
     ),
     LuaCaseDefinition::new(
@@ -477,4 +490,5 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "七组Lua5.3整数能力覆盖位运算、整除、浮点混合、方法表、capture、分发循环和位非管线。",
         &[LuaCaseConfiguration::new(PUC_LUA_GE_53)],
     ),
+
 ];

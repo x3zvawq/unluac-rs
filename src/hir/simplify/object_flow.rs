@@ -11,6 +11,7 @@ mod closure_effects;
 mod fields;
 mod return_values;
 pub(super) use return_values::ReturnValueFacts;
+pub(super) use return_values::gc_inert_bindings;
 
 /// 一个不可变 HIR 模块快照同时发布 may-capture 效果和正常返回值；两者的证明域不同。
 /// constructor/root 消费结果查询，不能把 may-holder 子集当成完整 callee 身份。
@@ -22,6 +23,7 @@ pub(super) struct ModuleEffects {
 pub(super) fn collect_proto_effects(
     module: &crate::hir::HirModule,
     safety: HirExprSafety,
+    dialect: crate::decompile::DecompileDialect,
 ) -> ModuleEffects {
     let mut captures = module
         .protos
@@ -59,6 +61,17 @@ pub(super) fn collect_proto_effects(
     }
     for flow in &value_flows {
         facts.values.finalize_calls(flow);
+    }
+    // PUC/LuaJIT 的 debug.setlocal 可改写未捕获形参；封闭调用集并不关闭这个入口。
+    if dialect == crate::decompile::DecompileDialect::Luau
+        && facts.values.install_closed_parameter_entries(module)
+    {
+        for flow in &value_flows {
+            facts.values.analyze_proto(flow);
+        }
+        for flow in &value_flows {
+            facts.values.finalize_calls(flow);
+        }
     }
     facts
 }

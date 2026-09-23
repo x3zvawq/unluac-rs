@@ -3,6 +3,9 @@
 -- unluac: expect-contains [[type(condition and r0_2(r0_3))]]
 -- unluac: expect-not-contains [[type(condition and r0_2(r0_1()))]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[selected = type(condition and r0_2(r0_3))]]
+-- unluac: expect-not-contains [[ = assert]]
+-- unluac: expect-not-contains [[ = print]]
 
 local hits = 0
 

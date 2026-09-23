@@ -14,13 +14,28 @@ use crate::transformer::ValuePack;
 pub(super) struct NativeCallFacts {
     pub(super) argument_roots: Vec<HirCallArgumentRoot>,
     pub(super) argument_values: Vec<Option<TempId>>,
+    pub(super) argument_preparations: BTreeMap<usize, operand_preparations::OperandPreparation>,
+    pub(super) argument_copies: BTreeMap<usize, NativeArgumentCopy>,
+    pub(super) fixed_results: Option<Vec<TempId>>,
     pub(super) vararg_tail_home: Option<HomeSlotKey>,
     pub(super) layout: NativeCallLayout,
     pub(super) callee: Option<TempId>,
     pub(super) assignment_copies: Option<[TempId; 3]>,
     pub(super) scalar_assignment: Option<NativeScalarAssignment>,
+    pub(super) result_writebacks: Option<Vec<NativeResultWriteback>>,
     pub(super) boolean_prewrites: Vec<BooleanArgumentPrewrite>,
     pub(super) fastcall_argument_copies: Vec<FastCallArgumentCopy>,
+    pub(super) fastcall_callee_before_copies: bool,
+}
+
+/// 普通 CALL 参数的最后一次 MOVE；两端 Def 与时点独立于已合并的展示 Local。
+#[derive(Debug, Clone, Copy)]
+pub(in crate::hir) struct NativeArgumentCopy {
+    pub(in crate::hir) source: TempId,
+    pub(in crate::hir) target: TempId,
+    pub(in crate::hir) source_home: HomeSlotKey,
+    pub(in crate::hir) target_home: HomeSlotKey,
+    pub(in crate::hir) instruction: InstrRef,
 }
 
 /// FASTCALL 的非 direct 参数在慢路径才复制到 CALL 参数区；快速路径读取原低槽。
@@ -34,13 +49,16 @@ pub(in crate::hir) struct FastCallArgumentCopy {
     pub(in crate::hir) source_home: HomeSlotKey,
 }
 
-/// ValueDecision 的入口 Boolean 写与结果 phi 属于同一参数槽；仅完整值帧可重发这次写。
+/// 原入口 Boolean 写与结果 phi 属于同一参数槽；仅完整值帧可重发这次写。
 #[derive(Debug, Clone, Copy)]
 pub(in crate::hir) struct BooleanArgumentPrewrite {
     pub(in crate::hir) argument: usize,
     pub(in crate::hir) initial: TempId,
+    pub(in crate::hir) initial_value: bool,
     pub(in crate::hir) result: TempId,
     pub(in crate::hir) home: HomeSlotKey,
+    /// 槽仅有值捕获时，其它值版本的快照不能观察这次 Boolean 写回。
+    pub(in crate::hir) reference_uncaptured: bool,
 }
 
 /// 原参数/结果的物理布局不依赖 callee 是否能归一成单个 canonical Def。
@@ -52,6 +70,8 @@ pub(in crate::hir) struct NativeCallLayout {
     pub(in crate::hir) results: Option<ResultPack>,
     /// 原调用时整个参数区没有打开的引用捕获；不依赖参数值是否是 canonical Def。
     pub(in crate::hir) arguments_unaliased: bool,
+    /// 固定结果写入时没有打开的引用 cell；旧值的 ByValue 快照不观察新结果。
+    pub(in crate::hir) fixed_results_unaliased: bool,
     pub(in crate::hir) fastcall: Option<crate::transformer::FastCallProtocol>,
 }
 
@@ -78,6 +98,17 @@ pub(in crate::hir) struct NativeScalarAssignment {
     pub(in crate::hir) value: CopyRootScalarValue,
 }
 
+/// 固定结果 CALL 后连续的原 MOVE，按执行顺序保留结果位置、写入 Def 和目标 cell。
+/// 这是原指令事实；HIR 的并行 Phi 转移不能自行重建其写序。
+#[derive(Debug, Clone, Copy)]
+pub(in crate::hir) struct NativeResultWriteback {
+    pub(in crate::hir) result_index: usize,
+    pub(in crate::hir) writeback: TempId,
+    /// COPY 覆盖的原定义，供声明 owner 连接初始化；不以相同槽号猜 binding。
+    pub(in crate::hir) previous: Option<TempId>,
+    pub(in crate::hir) target_home: HomeSlotKey,
+}
+
 pub(super) fn collect(
     proto: &LoweredProto,
     cfg: &Cfg,
@@ -85,7 +116,7 @@ pub(super) fn collect(
     epochs: &SlotEpochFacts,
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
-    prewrites: &BTreeMap<PhiId, (TempId, TempId)>,
+    prewrites: &BTreeMap<PhiId, (TempId, TempId, bool)>,
 ) -> BTreeMap<InstrRef, NativeCallFacts> {
     let mut calls = BTreeMap::new();
     for (index, instr) in proto.instrs.iter().enumerate() {
@@ -151,6 +182,9 @@ pub(super) fn collect(
             home: HomeSlotKey::new(callee.index(), epochs.epoch_at(callee, call_ref)),
             args,
             results,
+            fixed_results_unaliased: matches!(results, Some(ResultPack::Fixed(pack))
+                if (pack.start.index()..pack.start.index() + pack.len)
+                    .all(|slot| !epochs.reference_capture_may_be_open(Reg(slot), call_ref))),
             arguments_unaliased: {
                 let end = match args {
                     ValuePack::Fixed(pack) => pack.start.index() + pack.len,
@@ -180,10 +214,109 @@ pub(super) fn collect(
             }
             _ => None,
         };
+        let fastcall_argument_copies = fastcall_argument_copies(
+            proto,
+            cfg,
+            dataflow,
+            epochs,
+            fixed_temps,
+            phi_temps,
+            call_ref,
+        );
+        // 固定前缀加 VARARG 的 fallback 可先查找 callee，再 COPY 低槽参数。
+        // 保存原 Def 顺序；消费者不能把普通 FASTCALL 的 lookup-after-copy 顺序硬套进来。
+        let fastcall_callee_before_copies = !fastcall_argument_copies.is_empty()
+            && callee.is_some_and(|callee| {
+                callee.index() < dataflow.defs.len()
+                    && fastcall_argument_copies.iter().all(|copy| {
+                        dataflow.def_instr(crate::structure::DefId(callee.index()))
+                            < dataflow.def_instr(crate::structure::DefId(copy.producer.index()))
+                    })
+            });
         calls.insert(
             call_ref,
             NativeCallFacts {
                 argument_roots: roots,
+                argument_copies: dataflow
+                    .use_values_at(call_ref)
+                    .iter()
+                    .filter(|(reg, _)| reg.index() >= args_start.index())
+                    .filter_map(|(reg, value)| {
+                        let SsaValue::Def(target) = value else {
+                            return None;
+                        };
+                        let instruction = dataflow.def_instr(target);
+                        let LowInstr::Move(copy) = &proto.instrs[instruction.index()] else {
+                            return None;
+                        };
+                        let SsaValue::Def(source) = dataflow.use_value(instruction, copy.src)
+                        else {
+                            return None;
+                        };
+                        if copy.dst != reg
+                            || fixed_temps[target.index()] != TempId(target.index())
+                            || fixed_temps[source.index()] != TempId(source.index())
+                            || cfg.instr_to_block[instruction.index()]
+                                != cfg.instr_to_block[call_ref.index()]
+                            || epochs.reference_capture_may_be_open(copy.src, instruction)
+                            || epochs.reference_capture_may_be_open(copy.dst, instruction)
+                        {
+                            return None;
+                        }
+                        Some((
+                            reg.index() - args_start.index(),
+                            NativeArgumentCopy {
+                                source: TempId(source.index()),
+                                target: TempId(target.index()),
+                                source_home: HomeSlotKey::new(
+                                    copy.src.index(),
+                                    epochs.epoch_at(copy.src, instruction),
+                                ),
+                                target_home: HomeSlotKey::new(
+                                    copy.dst.index(),
+                                    epochs.epoch_at(copy.dst, instruction),
+                                ),
+                                instruction,
+                            },
+                        ))
+                    })
+                    .collect(),
+                argument_preparations: dataflow
+                    .use_values_at(call_ref)
+                    .iter()
+                    .filter(|(reg, _)| reg.index() >= args_start.index())
+                    .filter_map(|(reg, _)| {
+                        Some((
+                            reg.index() - args_start.index(),
+                            operand_preparations::collect(
+                                proto,
+                                cfg,
+                                dataflow,
+                                epochs,
+                                fixed_temps,
+                                call_ref,
+                                reg,
+                            )?,
+                        ))
+                    })
+                    .collect(),
+                fixed_results: match layout.results {
+                    Some(ResultPack::Fixed(pack))
+                        if dataflow.instr_defs[index].len() == pack.len =>
+                    {
+                        dataflow.instr_defs[index]
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, def)| {
+                                let temp = TempId(def.index());
+                                (dataflow.def_reg(*def).index() == pack.start.index() + offset
+                                    && fixed_temps[def.index()] == temp)
+                                    .then_some(temp)
+                            })
+                            .collect()
+                    }
+                    _ => None,
+                },
                 vararg_tail_home: match args {
                     ValuePack::Open(_) => {
                         let sources = &dataflow.open_use_sources[index];
@@ -215,7 +348,16 @@ pub(super) fn collect(
                             )
                         })
                         .collect(),
-                    ValuePack::Open(_) => Vec::new(),
+                    // Open SSA use map 只包含已证明的连续固定前缀；动态尾没有逐槽 Def。
+                    // TAILCALL 同样需要这些值版本，不能因不签发参数根交接而丢弃布局事实。
+                    ValuePack::Open(start) => dataflow
+                        .use_values_at(call_ref)
+                        .iter()
+                        .filter(|(reg, _)| reg.index() >= start.index())
+                        .map(|(_, value)| {
+                            canonical_value_temp(value, dataflow.defs.len(), fixed_temps, phi_temps)
+                        })
+                        .collect(),
                 },
                 layout,
                 callee,
@@ -228,15 +370,9 @@ pub(super) fn collect(
                     fixed_temps,
                     call_ref,
                 ),
-                fastcall_argument_copies: fastcall_argument_copies(
-                    proto,
-                    cfg,
-                    dataflow,
-                    epochs,
-                    fixed_temps,
-                    phi_temps,
-                    call_ref,
-                ),
+                result_writebacks: result_writebacks(proto, cfg, dataflow, epochs, call_ref),
+                fastcall_argument_copies,
+                fastcall_callee_before_copies,
                 boolean_prewrites: dataflow
                     .use_values_at(call_ref)
                     .iter()
@@ -247,12 +383,14 @@ pub(super) fn collect(
                         let SsaValue::Phi(phi) = value else {
                             return None;
                         };
-                        let &(initial, result) = prewrites.get(&phi)?;
+                        let &(initial, result, initial_value) = prewrites.get(&phi)?;
                         Some(BooleanArgumentPrewrite {
                             argument: reg.index() - args_start.index(),
                             initial,
+                            initial_value,
                             result,
                             home: HomeSlotKey::new(reg.index(), epochs.epoch_at(reg, call_ref)),
+                            reference_uncaptured: !dataflow.reg_is_reference_captured(reg),
                         })
                     })
                     .collect(),
@@ -260,6 +398,58 @@ pub(super) fn collect(
         );
     }
     calls
+}
+
+fn result_writebacks(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    site: InstrRef,
+) -> Option<Vec<NativeResultWriteback>> {
+    let LowInstr::Call(call) = &proto.instrs[site.index()] else {
+        return None;
+    };
+    let ResultPack::Fixed(pack) = call.results else {
+        return None;
+    };
+    if pack.len < 2 || pack.start != call.callee {
+        return None;
+    }
+    let mut writes = Vec::with_capacity(pack.len);
+    let mut sources = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    for offset in 0..pack.len {
+        let copy_site = InstrRef(site.index() + offset + 1);
+        let LowInstr::Move(copy) = proto.instrs.get(copy_site.index())? else {
+            return None;
+        };
+        let result_index = copy.src.index().checked_sub(pack.start.index())?;
+        if result_index >= pack.len
+            || copy.dst.index() >= pack.start.index()
+            || cfg.instr_to_block[copy_site.index()] != cfg.instr_to_block[site.index()]
+            || !sources.insert(copy.src)
+            || !targets.insert(copy.dst)
+            || epochs.reference_capture_may_be_open(copy.dst, copy_site)
+        {
+            return None;
+        }
+        let result = dataflow.instr_def_for_reg(site, copy.src)?;
+        if dataflow.use_value(copy_site, copy.src) != SsaValue::Def(result) {
+            return None;
+        }
+        let writeback = dataflow.instr_def_for_reg(copy_site, copy.dst)?;
+        writes.push(NativeResultWriteback {
+            result_index,
+            writeback: TempId(writeback.index()),
+            previous: match dataflow.def_overwritten_value(writeback) {
+                Some(SsaValue::Def(def)) => Some(TempId(def.index())),
+                _ => None,
+            },
+            target_home: HomeSlotKey::new(copy.dst.index(), epochs.epoch_at(copy.dst, copy_site)),
+        });
+    }
+    Some(writes)
 }
 
 /// 原协议已区分快路径直读与 fallback 准备；非 direct 槽只有真实 MOVE 才有两路对应。
@@ -278,10 +468,19 @@ fn fastcall_argument_copies(
     let LowInstr::Call(call) = &proto.instrs[site.index()] else {
         return Vec::new();
     };
-    let (crate::transformer::CallKind::FastCall(protocol), ValuePack::Fixed(args)) =
-        (call.kind, call.args)
-    else {
+    let crate::transformer::CallKind::FastCall(protocol) = call.kind else {
         return Vec::new();
+    };
+    let args = match call.args {
+        ValuePack::Fixed(args) => args,
+        ValuePack::Open(start) => crate::transformer::RegRange {
+            start,
+            len: dataflow
+                .use_values_at(site)
+                .iter()
+                .filter(|(reg, _)| reg.index() >= start.index())
+                .count(),
+        },
     };
     (0..args.len)
         .filter_map(|argument| {
@@ -469,16 +668,18 @@ fn assignment_copies(
         .then(|| defs.map(|def| TempId(def.index())))
 }
 
-/// 只消费已选中的值决策：各叶为原 Boolean 写，入口 false 与最终 phi 共享 result_reg。
-/// 后层不能从 `a and b` 文本猜测这次预写；无入口预写的普通比较没有此项责任。
+/// 冻结入口 Boolean 与同槽结果 phi；已选值决策直接提供配对，未树化的前向合流
+/// 则由原 Def 支配关系证明。此事实不授权折叠控制树，后层仍须重发整个参数帧。
 pub(super) fn boolean_prewrites(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
+    graph: &GraphFacts,
     plan: &StructurePlan,
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
-) -> BTreeMap<PhiId, (TempId, TempId)> {
-    plan.value_decisions()
+) -> BTreeMap<PhiId, (TempId, TempId, bool)> {
+    let mut prewrites = plan
+        .value_decisions()
         .filter_map(|(_, decision)| {
             let header = decision.header()?;
             let mut initial = None;
@@ -486,37 +687,232 @@ pub(super) fn boolean_prewrites(
                 let SsaValue::Def(def) = leaf.value else {
                     return None;
                 };
-                let LowInstr::LoadBool(value) = proto.instrs[dataflow.def_instr(def).index()]
-                else {
-                    return None;
-                };
-                if value.dst != decision.result_reg {
+                if dataflow.def_reg(def) != decision.result_reg {
                     return None;
                 }
                 if dataflow.def_block(def) == header {
-                    if value.value
-                        || leaf.latest_local_def != Some(def)
-                        || fixed_temps[def.index()] != TempId(def.index())
-                    {
+                    let LowInstr::LoadBool(value) = proto.instrs[dataflow.def_instr(def).index()]
+                    else {
+                        return None;
+                    };
+                    if fixed_temps[def.index()] != TempId(def.index()) {
                         return None;
                     }
-                    if initial.is_some_and(|old| old != fixed_temps[def.index()]) {
+                    if initial.is_some_and(|old| old != (fixed_temps[def.index()], value.value)) {
                         return None;
                     }
-                    initial = Some(fixed_temps[def.index()]);
+                    initial = Some((fixed_temps[def.index()], value.value));
                 }
+                // `predicate and/or table.field` 的末叶保留任意字段值；它仍与入口 Boolean
+                // 共用结果槽。预写身份不要求所有叶都是 Boolean，后层仍完整重发每个叶。
             }
             if phi_temps[decision.result_phi.index()]
                 != TempId(fixed_temps.len() + decision.result_phi.index())
             {
                 return None;
             }
+            let (initial, initial_value) = initial?;
             Some((
                 decision.result_phi,
-                (initial?, phi_temps[decision.result_phi.index()]),
+                (
+                    initial,
+                    phi_temps[decision.result_phi.index()],
+                    initial_value,
+                ),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (_, decision) in plan.value_decisions() {
+        for operand in &decision.operands {
+            let phi = &dataflow.phi_candidates[operand.phi.index()];
+            let header = decision.nodes[operand.entry.index()].block;
+            let initial = operand.leaves.values().find_map(|value| {
+                let SsaValue::Def(def) = *value else {
+                    return None;
+                };
+                if dataflow.def_block(def) != header || dataflow.def_reg(def) != phi.reg {
+                    return None;
+                }
+                let LowInstr::LoadBool(load) = proto.instrs[dataflow.def_instr(def).index()] else {
+                    return None;
+                };
+                (fixed_temps[def.index()] == TempId(def.index()))
+                    .then_some((fixed_temps[def.index()], load.value))
+            });
+            // 操作数与外层结果各自占原槽；入口预写即使来自同一 header，也不能
+            // 只把最外层预写登记为 CALL 参数而遗失内部值树的覆盖事件。
+            if let Some((initial, value)) = initial
+                && phi_temps[phi.id.index()] == TempId(fixed_temps.len() + phi.id.index())
+            {
+                prewrites.insert(phi.id, (initial, phi_temps[phi.id.index()], value));
+            }
+        }
+    }
+    for phi in plan.phis() {
+        if prewrites.contains_key(&phi.phi)
+            || dataflow.phi_candidates[phi.phi.index()]
+                .incoming
+                .iter()
+                .any(|incoming| {
+                    incoming
+                        .pred
+                        .is_some_and(|pred| graph.dominates(phi.block, pred))
+                })
+            || phi.has_unresolved()
+            || phi_temps[phi.phi.index()] != TempId(fixed_temps.len() + phi.phi.index())
+        {
+            continue;
+        }
+        // 展开调用可能让准备区跨越多个基本块；最早的 Boolean Def 仍须支配
+        // 每个分支结果和合流点。循环体内的前向合流同样成立，但回边 phi
+        // 会跨迭代携带值，不能领取当前准备区的初始化证明。
+        let Some(defs) = phi
+            .incomings
+            .iter()
+            .map(|incoming| {
+                let SsaValue::Def(def) = incoming.value else {
+                    return None;
+                };
+                (fixed_temps[def.index()] == TempId(def.index())
+                    && dataflow.def_reg(def) == phi.reg)
+                    .then_some(def)
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let Some(&initial) = defs.iter().min_by_key(|&&def| dataflow.def_instr(def)) else {
+            continue;
+        };
+        let initial_block = dataflow.def_block(initial);
+        let LowInstr::LoadBool(value) = proto.instrs[dataflow.def_instr(initial).index()] else {
+            continue;
+        };
+        if !graph.dominates(initial_block, phi.block)
+            || defs
+                .iter()
+                .any(|&def| !graph.dominates(initial_block, dataflow.def_block(def)))
+        {
+            continue;
+        }
+        prewrites.insert(
+            phi.phi,
+            (
+                fixed_temps[initial.index()],
+                phi_temps[phi.phi.index()],
+                value.value,
+            ),
+        );
+    }
+    prewrites
+}
+
+/// 合流后的首条 MOVE 是显式结果写回；其它语句或跨块 COPY 不属于这份事实。
+pub(super) fn value_result_copies(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    epochs: &SlotEpochFacts,
+    plan: &StructurePlan,
+    fixed_temps: &[TempId],
+    phi_temps: &[TempId],
+) -> BTreeMap<TempId, ImmediateMoveWrite> {
+    plan.phis()
+        .filter_map(|phi| {
+            let result = canonical_value_temp(
+                SsaValue::Phi(phi.phi),
+                fixed_temps.len(),
+                fixed_temps,
+                phi_temps,
+            )?;
+            let instr = cfg.blocks[phi.block.index()].instrs.start;
+            let LowInstr::Move(copy) = proto.instrs[instr.index()] else {
+                return None;
+            };
+            if copy.src != phi.reg || dataflow.use_value(instr, copy.src) != SsaValue::Phi(phi.phi)
+            {
+                return None;
+            }
+            let [def] = dataflow.instr_defs[instr.index()].as_slice() else {
+                return None;
+            };
+            let target = canonical_value_temp(
+                SsaValue::Def(*def),
+                fixed_temps.len(),
+                fixed_temps,
+                phi_temps,
+            )?;
+            Some((
+                result,
+                ImmediateMoveWrite {
+                    source: Some(result),
+                    target,
+                    source_home: HomeSlotKey::new(
+                        copy.src.index(),
+                        epochs.epoch_at(copy.src, instr),
+                    ),
+                    target_home: HomeSlotKey::new(
+                        copy.dst.index(),
+                        epochs.epoch_at(copy.dst, instr),
+                    ),
+                },
             ))
         })
         .collect()
+}
+
+/// 值决策入口的 MOVE 与结果 phi 同槽；后层必须连同完整短路值树重发这次准备。
+pub(super) fn copy_prewrites(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    fixed_temps: &[TempId],
+    phi_temps: &[TempId],
+) -> BTreeMap<TempId, TempId> {
+    let mut copies = BTreeMap::new();
+    let mut record = |header, reg, phi: PhiId, leaves: Vec<SsaValue>| {
+        let mut initial = None;
+        for leaf in leaves {
+            let SsaValue::Def(def) = leaf else { continue };
+            if dataflow.def_block(def) != header || dataflow.def_reg(def) != reg {
+                continue;
+            }
+            if !matches!(
+                proto.instrs[dataflow.def_instr(def).index()],
+                LowInstr::Move(_)
+            ) || fixed_temps[def.index()] != TempId(def.index())
+                || initial.is_some_and(|old| old != fixed_temps[def.index()])
+            {
+                return;
+            }
+            initial = Some(fixed_temps[def.index()]);
+        }
+        let result = phi_temps[phi.index()];
+        if result == TempId(fixed_temps.len() + phi.index())
+            && let Some(initial) = initial
+        {
+            copies.insert(result, initial);
+        }
+    };
+    for (_, decision) in plan.value_decisions() {
+        if let Some(header) = decision.header() {
+            record(
+                header,
+                decision.result_reg,
+                decision.result_phi,
+                decision.leaves.iter().map(|leaf| leaf.value).collect(),
+            );
+        }
+        for operand in &decision.operands {
+            record(
+                decision.nodes[operand.entry.index()].block,
+                dataflow.phi_candidates[operand.phi.index()].reg,
+                operand.phi,
+                operand.leaves.values().copied().collect(),
+            );
+        }
+    }
+    copies
 }
 
 /// 同一共享 Dataflow 事实给出 call result 的独立 root 后缀终点；HIR 不从后缀文本猜 MOVE。

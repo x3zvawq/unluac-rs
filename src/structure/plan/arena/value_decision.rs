@@ -124,6 +124,14 @@ pub(super) fn freeze_value_decision(
         });
     }
 
+    let mut operands = evidence.operands.clone();
+    for operand in &mut operands {
+        operand.current_values = operand
+            .proven_current_values(proto, dataflow, &nodes)
+            .ok_or_else(|| {
+                StructureError::invalid("value operand has invalid predicate identity")
+            })?;
+    }
     let mut leaves = Vec::with_capacity(leaf_evidence.len());
     let mut terminal_edges = BTreeSet::new();
     for (index, (evidence, binding)) in leaf_evidence.into_iter().zip(leaf_bindings).enumerate() {
@@ -215,6 +223,7 @@ pub(super) fn freeze_value_decision(
         shared_exit_action,
         result_phi,
         absorbed_phis: Vec::new(),
+        operands,
         result_reg,
         call_root_frontiers,
     })

@@ -47,6 +47,15 @@ local pn, pv = p()
 assert(fn == "changed" and fv == 7 and sn == "star" and sv == 3 and pn == "plain" and pv == 0)
 print("regress_11_branch#1", fn, fv, sn, sv, pn, pv)
 
--- unluac: expect-contains [[return function()]]
--- unluac: expect-contains [[return p1_0.name, r1_0]]
+-- unluac: expect-contains [[return function()]] [[@dialect=lua5.1]] [[@debug=stripped]]
+-- unluac: expect-contains [[return p1_0.name, r1_0]] [[@dialect=lua5.1]] [[@debug=stripped]]
 -- unluac: expect-not-contains [[unluac error]]
+-- debug 的原声明及后续分支写必须共用 needed；捕获时不能再引入交接变量。
+-- unluac: expect-contains [[local needed = 0]] [[@debug=retained]]
+-- unluac: expect-count [[needed = ]] [[4]] [[@debug=retained]]
+-- unluac: expect-not-contains [[needed2]] [[@debug=retained]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[18]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[19]] [[@debug=retained]]
+-- 并列字段写及 if 分支尾部均不需要额外词法壳，保持写入顺序与 debug 出口。
+-- unluac: expect-ast-count [[do-block]] [[0]]

@@ -103,6 +103,11 @@ fn value_facts(expr: &AstExpr) -> LuaValueFacts {
                 value_facts(&logical.rhs)
             }),
         AstExpr::SingleValue(inner) => value_facts(inner),
+        AstExpr::IfExpr(branch) => match value_facts(&branch.cond).truthiness() {
+            Some(true) => value_facts(&branch.then_expr),
+            Some(false) => value_facts(&branch.else_expr),
+            None => value_facts(&branch.then_expr).join(value_facts(&branch.else_expr)),
+        },
         _ => LuaValueFacts::UNKNOWN,
     }
 }
@@ -149,7 +154,10 @@ fn is_context_safe_node(expr: &AstExpr) -> bool {
             | AstNameRef::Environment,
         ) => true,
         AstExpr::Unary(unary) => matches!(unary.op, AstUnaryOpKind::Not),
-        AstExpr::SingleValue(_) | AstExpr::LogicalAnd(_) | AstExpr::LogicalOr(_) => true,
+        AstExpr::SingleValue(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::IfExpr(_) => true,
         AstExpr::Var(AstNameRef::Global(_))
         | AstExpr::FieldAccess(_)
         | AstExpr::IndexAccess(_)
@@ -204,9 +212,11 @@ pub(super) fn expr_observes_eval_order(expr: &AstExpr) -> bool {
         | AstExpr::IndexAccess(_)
         | AstExpr::Call(_)
         | AstExpr::MethodCall(_) => true,
-        AstExpr::Unary(_) | AstExpr::Binary(_) | AstExpr::LogicalAnd(_) | AstExpr::LogicalOr(_) => {
-            true
-        }
+        AstExpr::Unary(_)
+        | AstExpr::Binary(_)
+        | AstExpr::LogicalAnd(_)
+        | AstExpr::LogicalOr(_)
+        | AstExpr::IfExpr(_) => true,
         AstExpr::TableConstructor(_) | AstExpr::FunctionExpr(_) => true,
         AstExpr::SingleValue(expr) => expr_observes_eval_order(expr),
         AstExpr::Nil
@@ -248,6 +258,7 @@ pub(super) fn expr_requires_ordered_snapshot(
 
 pub(super) fn is_stable_inline_value(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::IfExpr(_) => false,
         AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -312,6 +323,7 @@ pub(super) fn is_lookup_inline_expr(expr: &AstExpr) -> bool {
 
 pub(super) fn is_copy_like_expr(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::IfExpr(_) => false,
         AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -451,6 +463,7 @@ fn eventless_literal_kind(
     integer_arithmetic_is_defined: bool,
 ) -> Option<EventlessLiteralKind> {
     match expr {
+        AstExpr::IfExpr(_) => None,
         AstExpr::CaptureInitializer(_) => None,
         AstExpr::Nil => Some(EventlessLiteralKind::Nil),
         AstExpr::Boolean(_) => Some(EventlessLiteralKind::Boolean),
@@ -573,6 +586,7 @@ pub(super) fn is_eventless_primitive_expr_for_target(
         integer_arithmetic_is_defined: bool,
     ) -> bool {
         match expr {
+            AstExpr::IfExpr(_) => false,
             AstExpr::CaptureInitializer(_) => false,
             AstExpr::Number(value) => value.is_finite(),
             AstExpr::SingleValue(inner) => {
@@ -711,6 +725,10 @@ pub(super) fn is_discard_safe_expr_for_target(expr: &AstExpr, target: AstTargetD
 
 fn is_discard_safe_expr_with_facts(expr: &AstExpr, facts: DiscardSafetyFacts) -> bool {
     match expr {
+        // 原生条件来自原控制边，不能因两臂没有副作用而删除这次显式检查。
+        AstExpr::IfExpr(_) => false,
+        AstExpr::Binary(binary) if binary.original_operation => false,
+        AstExpr::Unary(unary) if unary.original_operation => false,
         AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -735,7 +753,8 @@ fn is_discard_safe_expr_with_facts(expr: &AstExpr, facts: DiscardSafetyFacts) ->
             is_discard_safe_expr_with_facts(&unary.expr, facts)
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            is_discard_safe_expr_with_facts(&logical.lhs, facts)
+            !logical.preserves_boolean_prewrite
+                && is_discard_safe_expr_with_facts(&logical.lhs, facts)
                 && is_discard_safe_expr_with_facts(&logical.rhs, facts)
         }
         AstExpr::Binary(binary)
@@ -769,6 +788,11 @@ fn is_discard_safe_expr_with_facts(expr: &AstExpr, facts: DiscardSafetyFacts) ->
 
 pub(super) fn is_mechanical_run_inline_expr(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::IfExpr(branch) => {
+            is_mechanical_run_inline_expr(&branch.cond)
+                && is_mechanical_run_inline_expr(&branch.then_expr)
+                && is_mechanical_run_inline_expr(&branch.else_expr)
+        }
         AstExpr::CaptureInitializer(_) => false,
         AstExpr::Nil
         | AstExpr::Boolean(_)
@@ -895,6 +919,11 @@ pub(super) fn direct_return_logical_cost(expr: &AstExpr) -> Option<usize> {
 /// 的 binding、顺序、root 与多返回门槛。
 fn is_direct_return_budget_term_safe(expr: &AstExpr) -> bool {
     match expr {
+        AstExpr::IfExpr(branch) => {
+            is_direct_return_budget_term_safe(&branch.cond)
+                && is_direct_return_budget_term_safe(&branch.then_expr)
+                && is_direct_return_budget_term_safe(&branch.else_expr)
+        }
         AstExpr::CaptureInitializer(_) => false,
         AstExpr::Number(value) => value.is_finite(),
         AstExpr::Complex { real, imag } => real.is_finite() && imag.is_finite(),

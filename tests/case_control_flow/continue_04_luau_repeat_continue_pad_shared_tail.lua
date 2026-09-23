@@ -1,6 +1,7 @@
 -- regress_117_luau_repeat_continue_pad_shared_tail#1: repeat continue pad 不消费共享 tail 与 condition
 -- unluac: expect-contains [[continue]]
--- unluac: expect-contains [[#1", 6)]]
+-- O2 内联并展开循环后仍有六次 ADD；运行输出为 6 不代表可以删除这些运算。
+-- unluac: expect-contains [[0 + 1 + 1 + 1 + 1 + 1 + 1]]
 -- 重复的 a 检查决定原 continue 边，不能按外层路径假设删除。
 -- unluac: expect-contains [[                if p1_0 then]]
 -- unluac: expect-not-contains [[goto ]]

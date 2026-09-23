@@ -363,6 +363,9 @@ pub(in crate::ast::readability) fn local_attr_belongs_to_inline_pipeline(
 
 fn expr_contains_direct_call_callee_var(expr: &AstExpr, binding: Option<AstBindingRef>) -> bool {
     match expr {
+        AstExpr::IfExpr(branch) => [&branch.cond, &branch.then_expr, &branch.else_expr]
+            .into_iter()
+            .any(|expr| expr_contains_direct_call_callee_var(expr, binding)),
         AstExpr::Call(call) => {
             matches!(&call.callee, AstExpr::Var(name)
                 if binding.is_none_or(|binding| binding.matches_name_ref(name)))

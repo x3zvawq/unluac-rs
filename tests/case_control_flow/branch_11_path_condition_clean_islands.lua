@@ -1,5 +1,8 @@
 -- 稳定路径事实也不能删除 clean prefix/arm、fallthrough 或 label 入口上的原检查。
 -- unluac: expect-contains [[not flag or mark("inner", true)]]
+-- label 合流中的 SSA 版本仍属于 x/y 的原 debug 声明，不能另造交接变量。
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=2]]
+-- unluac: expect-ast-count [[if]] [[5]] [[@proto=2]]
 
 local events = {}
 
@@ -46,6 +49,12 @@ end
 local x, y = clean_prefix(true, true, false)
 assert(x == 2 and y == 1, x .. "," .. y)
 assert(table.concat(events, ",") == "outer,inner,body", table.concat(events, ","))
+x, y = clean_prefix(false, false, false)
+assert(x == 1 and y == 10)
+x, y = clean_prefix(false, false, true)
+assert(x == 4 and y == 21)
+x, y = clean_prefix(false, true, true)
+assert(x == 3 and y == 11)
 
 -- regress_374_path_condition_clean_islands#2: a closed multi-entry label graph cannot inherit lexical false facts
 -- unluac: expect-contains [[if flag and mark("merge-true", "true") then]]
@@ -83,16 +92,14 @@ assert(closed_merge(false, false, false) == "left")
 assert(table.concat(events, ",") == "outer,inner,body,merge-true", table.concat(events, ","))
 
 -- regress_374_path_condition_clean_islands#3: a clean arm has one structured entry even when its sibling jumps to a label
--- unluac: expect-contains [[not flag or mark("clean-arm", true)]] [[@dialect=lua5.2]]
--- unluac: expect-contains [[not flag or mark("clean-arm", true)]] [[@dialect=lua5.3]]
--- Lua 5.4/5.5 经值 Decision 恢复为嵌套 if，第二次 flag 检查仍须存在。
--- unluac: expect-ast-count [[if]] [[4]] [[@proto=4]] [[@dialect=lua5.4]]
--- unluac: expect-ast-count [[if]] [[4]] [[@proto=4]] [[@dialect=lua5.5]]
+-- unluac: expect-contains [[not flag or mark("clean-arm", accepted)]]
+-- 第二次 flag 检查保留在短路条件内，不拆成两个重复赋值分支。
+-- unluac: expect-ast-count [[if]] [[3]] [[@proto=4]]
 
-local function clean_arm(flag, jump_right)
+local function clean_arm(flag, jump_right, accepted)
     local result = "none"
     if flag then
-        if not flag or mark("clean-arm", true) then
+        if not flag or mark("clean-arm", accepted) then
             result = "clean"
         end
     elseif jump_right then
@@ -107,9 +114,11 @@ local function clean_arm(flag, jump_right)
     return result
 end
 
-assert(clean_arm(true, false) == "clean")
-assert(clean_arm(false, true) == "right")
-assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm", table.concat(events, ","))
+assert(clean_arm(true, false, true) == "clean")
+assert(clean_arm(false, true, true) == "right")
+assert(clean_arm(true, false, false) == "none")
+assert(clean_arm(false, false, true) == "none")
+assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,clean-arm", table.concat(events, ","))
 
 -- 即使前一条 return 已排除这条路径，仍保留原字节码的检查和分支。
 -- unluac: expect-contains [[flag and mark("clean-run", true)]]
@@ -148,7 +157,7 @@ end
 assert(clean_run(true, false, false) == "early")
 assert(clean_run(false, false, false) == "left")
 assert(clean_run(false, true, false) == "right")
-assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm", table.concat(events, ","))
+assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,clean-arm", table.concat(events, ","))
 
 -- regress_374_path_condition_clean_islands#5: a forward label with one guarded predecessor
 -- 保留 label 后的检查，不因唯一前驱推导而删去 flag。
@@ -171,7 +180,7 @@ end
 
 assert(unique_label_predecessor(false) == "false")
 assert(unique_label_predecessor(true) == "true")
-assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,label-pred", table.concat(events, ","))
+assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,clean-arm,label-pred", table.concat(events, ","))
 
 -- regress_374_path_condition_clean_islands#6: a clean prefix before the terminal
 -- guarded goto 后也保留原条件。
@@ -195,4 +204,4 @@ end
 
 assert(prefixed_label_predecessor(false) == "false")
 assert(prefixed_label_predecessor(true) == "true")
-assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,label-pred,goto-prefix,prefixed-label", table.concat(events, ","))
+assert(table.concat(events, ",") == "outer,inner,body,merge-true,clean-arm,clean-arm,label-pred,goto-prefix,prefixed-label", table.concat(events, ","))

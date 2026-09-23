@@ -1,6 +1,11 @@
 -- regress_311_repeat_exit_parallel_snapshot: repeat 正常退出必须保留并行赋值的 RHS 快照
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[        else]]
+-- 循环状态的成组入口声明必须能供完整 RETURN 帧使用，不再为返回值增加副本。
+-- LuaJIT 的 child proto 顺序与 PUC/Luau 相反；两项约束同时覆盖交换函数。
+-- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-decl]] [[1]] [[@proto=3]]
+-- unluac: expect-count [[>= 1 then]] [[1]]
 
 local function swap_or_break(stop)
     local left, right = 1, 2

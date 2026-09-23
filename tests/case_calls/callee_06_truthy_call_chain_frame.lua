@@ -1,6 +1,8 @@
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
 -- unluac: expect-contains [[local active =]] [[@debug=retained]]
+-- unluac: expect-contains [[trace[#trace + 1] = name]] [[@debug=retained]]
+-- unluac: expect-count [[("named").active()]] [[1]]
 -- 条件链保留 load、字段读取、active 调用的次数与顺序，包括 false/nil 和 truthy 结果。
 local function enabled(load)
     if load("event").active() then

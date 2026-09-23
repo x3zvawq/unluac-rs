@@ -10,6 +10,8 @@ local function test_const_local()
 end
 
 -- lua54_02_const#2: const闭包交叉
+-- 索引赋值保留求 key 再调用 RHS 的顺序，不留下独立参数和结果副本。
+-- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=7]]
 local function test_const_closure()
     local function make_pipeline(seed)
         local bias <const> = seed * 3

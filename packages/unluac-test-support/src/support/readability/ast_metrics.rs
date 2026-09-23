@@ -224,6 +224,11 @@ impl AstMetricSummary {
 
     fn visit_expr(&mut self, scope: usize, expr: &AstExpr) {
         match expr {
+            AstExpr::IfExpr(branch) => {
+                self.visit_expr(scope, &branch.cond);
+                self.visit_expr(scope, &branch.then_expr);
+                self.visit_expr(scope, &branch.else_expr);
+            }
             AstExpr::FieldAccess(access) => self.visit_expr(scope, &access.base),
             AstExpr::IndexAccess(access) => {
                 self.visit_expr(scope, &access.base);

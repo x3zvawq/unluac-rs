@@ -7,6 +7,8 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[if p1_0 or p1_2 then]]
+-- unluac: expect-ast-count [[continue]] [[1]] [[@proto=1]]
 local function run(a, b, c, xs)
     local x = 0
     repeat

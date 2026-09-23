@@ -138,15 +138,16 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         value: crate::structure::SsaValue,
     ) -> Result<HirExpr, HirLowerError> {
         self.ensure_ssa_binding(owner, value)?;
-        let target = match value {
-            SsaValue::Entry(_) => None,
-            SsaValue::Def(def) => self.lowering.bindings.fixed_temps.get(def.index()).copied(),
-            SsaValue::Phi(phi) => self.lowering.bindings.phi_temps.get(phi.index()).copied(),
-        };
-        Ok(target.map_or_else(
-            || super::super::super::exprs::expr_for_ssa_value(self.lowering, value),
-            |temp| self.lowering.bindings.expr_for_temp(temp),
-        ))
+        Ok(match value {
+            SsaValue::Entry(_) => {
+                super::super::super::exprs::expr_for_ssa_value(self.lowering, value)
+            }
+            SsaValue::Def(def) => self
+                .lowering
+                .bindings
+                .expr_for_temp(self.lowering.bindings.fixed_temps[def.index()]),
+            SsaValue::Phi(phi) => self.lowering.bindings.expr_for_phi(phi),
+        })
     }
 
     pub(super) fn ensure_ssa_binding(
@@ -215,7 +216,9 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         self.lowering,
                         definition.block,
                     );
-                let canonical = if self.index.edge_action_use_count[def.index()] == 0 {
+                let canonical = if self.index.edge_action_use_count[def.index()] == 0
+                    || self.index.move_reads_capture[def.index()]
+                {
                     value
                 } else {
                     self.lowering

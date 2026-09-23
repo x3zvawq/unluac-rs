@@ -1,4 +1,9 @@
 -- Source parameter identity survives rebinding, captures, phi edges and shadow scopes.
+-- 局部遮蔽结束后，闭包读取与比较应保持同一个调用参数表达式。
+-- unluac: expect-not-contains [[= assert]]
+-- unluac: expect-count [[() == ]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-contains [[assert(read() == value)]] [[@debug=retained]]
 local function update(value, count)
     assert(value == 5)
     for i = 1, count do value = value + i end

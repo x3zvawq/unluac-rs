@@ -219,6 +219,7 @@ fn eliminate_stmt(
                 let condition = mem::replace(&mut while_stmt.cond, HirExpr::Boolean(true));
                 let (flag, condition_scope) = materialize_condition_flag(condition, state, safety);
                 let exit_guard = HirStmt::If(Box::new(crate::hir::common::HirIf {
+                    preserves_empty_test: false,
                     cond: HirExpr::LocalRef(flag).negate(),
                     then_block: HirBlock {
                         stmts: vec![HirStmt::Break],
@@ -505,6 +506,10 @@ fn materialize_condition_into_flag(
         "condition extraction must eliminate every Decision"
     );
     prefix.push(HirStmt::Assign(Box::new(crate::hir::common::HirAssign {
+        luau_compound_global: false,
+        upvalue_write_source: None,
+        is_phi_transfer: false,
+        parallel_nil_frame: None,
         targets: vec![HirLValue::Local(flag)],
         values: crate::hir::common::HirValuePack::fixed(vec![value.negate().negate()]),
         initializer_merge_transaction: None,

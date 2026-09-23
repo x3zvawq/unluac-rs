@@ -1,9 +1,9 @@
--- regress_345_dead_temp_entry_nil: 已证明 entry-nil 的死写可删除；原帧需要的占位保留为 nil。
--- 关闭 structured loop 后的 root sibling 同样不得留下无读 false 值。
--- unluac: expect-not-contains [[local r0_0 = false]]
--- unluac: expect-not-contains [[local r1_0 = false]]
--- unluac: expect-contains [[local r0_0 = nil]]
+-- 原调用帧需要的声明仍保留初始化值；entry-nil 只说明旧槽值，不能把 false 改成 nil。
+-- 循环后的同级声明也保留原值，不因没有读取而变成空初始化。
+-- unluac: expect-count [[ = false]] [[3]]
+-- unluac: expect-not-contains [[ = nil]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
 
 local discarded = false
 

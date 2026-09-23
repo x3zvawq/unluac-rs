@@ -1,14 +1,7 @@
 //! 将已接受的源码 debug local 尾区间物化为 HIR 词法块。
 //!
-//! DebugHinted 只保留名字身份并不足以保留 `debug.getlocal` 可观察的生命周期。Structure
-//! 已经把每个可信 debug entry 绑定到唯一 SSA，并保留原始 PC 区间；locals promotion
-//! 必须把 scope identity 继续带到 LocalId。这里仅消费一种边界完全可证明的形状：debug
-//! 区间的终点直接落在当前 HIR block 的空终结 Return 上。此时声明到 Return 前之间没有
-//! 未表示的 low-IR 指令，Return 也不携带可能由物理 copy 间接依赖该 scope 的结果，因而
-//! 可以安全恢复尾部 `do ... end`；其它 PC/HIR value 布局不靠声明位置猜测。
-//! 接受的起点按当前语句位置递增；提交消费同一快照的段长，移动节点而不复制 HIR 子树。
-//! 独立 cleanup 与 Return 内含 cleanup 不共享尾部规则：前者只有全部资源绑定都由新块
-//! 拥有时才随该词法边界消费；后者保持同来源的 Close/Return 相邻，不按零槽猜协议。
+//! 消费 Structure 的可信区间和 LocalId 的 scope 身份，保留 `debug.getlocal` 可观察的
+//! 生命周期；结合目标方言的函数边界与显式 cleanup，避免为同一尾部终点重复嵌套块。
 
 use crate::hir::common::{HirBlock, HirDebugScope, HirExpr, HirLValue, HirProto, HirStmt};
 use crate::hir::visit::visit_stmt_structure;
@@ -16,14 +9,24 @@ use crate::transformer::{CloseKind, InstrRef};
 use std::collections::BTreeSet;
 
 use super::label_refs::label_references_by_stmt;
-use super::walk::{HirRewritePass, rewrite_block};
+use super::walk::{HirRewritePass, rewrite_stmts};
 
-pub(super) fn materialize_tail_debug_scopes_in_proto(proto: &mut HirProto) -> bool {
+pub(super) fn materialize_tail_debug_scopes_in_proto(
+    proto: &mut HirProto,
+    dialect: crate::decompile::DecompileDialect,
+) -> bool {
     let mut pass = TailDebugScopePass {
         local_debug_scopes: &proto.local_debug_scopes,
         debug_scopes: &proto.debug_scopes,
     };
-    rewrite_block(&mut proto.body, &mut pass)
+    let nested_changed = rewrite_stmts(&mut proto.body.stmts, &mut pass);
+    let root_changed = materialize_tail_scopes(
+        &mut proto.body,
+        &proto.local_debug_scopes,
+        &proto.debug_scopes,
+        dialect == crate::decompile::DecompileDialect::Lua51,
+    );
+    root_changed || nested_changed
 }
 
 struct TailDebugScopePass<'a> {
@@ -33,7 +36,7 @@ struct TailDebugScopePass<'a> {
 
 impl HirRewritePass for TailDebugScopePass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
-        materialize_tail_scopes(block, self.local_debug_scopes, self.debug_scopes)
+        materialize_tail_scopes(block, self.local_debug_scopes, self.debug_scopes, false)
     }
 }
 
@@ -41,7 +44,10 @@ fn materialize_tail_scopes(
     block: &mut HirBlock,
     local_debug_scopes: &[Option<usize>],
     debug_scopes: &[Option<HirDebugScope>],
+    function_end_closes_debug_scopes: bool,
 ) -> bool {
+    // 只处理空终结 Return：它没有可能经物理 COPY 依赖待退出 scope 的结果。
+    // 区间终点由前层证明，不能从声明位置推测其它 PC/HIR 布局。
     let Some(return_index) = block
         .stmts
         .len()
@@ -72,14 +78,21 @@ fn materialize_tail_scopes(
         }
     }
 
+    // Lua 5.1 close_func 在生成隐式 RETURN 前调用 removevars；函数根块自身
+    // 就提供此 debug 终点。额外 do 会引入原本属于 RETURN 的 upvalue CLOSE。
+    // 独立 CLOSE 仍要求显式词法边界；嵌套块不能借函数根块的编译规则省略边界。
+    if function_end_closes_debug_scopes && explicit_cleanup.is_none() {
+        return false;
+    }
+
     // 空 Return 没有结果快照；原始 frame cleanup 的配对仍保留在新块外。
     let label_refs = std::cell::OnceCell::new();
-    let starts = block
+    let first_start = block
         .stmts
         .iter()
         .enumerate()
         .take(body_end)
-        .filter_map(|(index, stmt)| {
+        .find_map(|(index, stmt)| {
             let HirStmt::LocalDecl(local_decl) = stmt else {
                 return None;
             };
@@ -106,9 +119,8 @@ fn materialize_tail_scopes(
                     })
                     .has_incoming_outside(index..body_end, index..block.stmts.len()))
             .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let Some(first_start) = starts.first().copied() else {
+        });
+    let Some(first_start) = first_start else {
         return false;
     };
     if let Some(index) = explicit_cleanup {
@@ -125,14 +137,15 @@ fn materialize_tail_scopes(
             // 候选拒绝[ProofIncomplete]：cleanup 还关闭新块之外或身份未发布的资源，不能用局部词法退出代替。
             return false;
         }
-        // 新建的所有尾块在同一位置结束；其资源按原声明逆序关闭，共同拥有这条 cleanup。
+        // 同一尾块内的资源按原声明逆序关闭，共同拥有这条 cleanup。
         body_end = index;
     }
 
     let mut stmts = std::mem::take(&mut block.stmts).into_iter();
     let mut rewritten: Vec<_> = stmts.by_ref().take(first_start).collect();
     rewritten.push(HirStmt::Block(Box::new(HirBlock {
-        stmts: nest_tail(&mut stmts, first_start, body_end, &starts[1..]),
+        // local 的起点由声明自身限定；相同末端无需为后续每个 local 再套一层块。
+        stmts: stmts.by_ref().take(body_end - first_start).collect(),
     })));
     if explicit_cleanup.is_some() {
         stmts
@@ -177,20 +190,4 @@ fn declared_resource_origins(stmts: &[HirStmt]) -> BTreeSet<InstrRef> {
         });
     }
     origins
-}
-
-fn nest_tail(
-    stmts: &mut std::vec::IntoIter<HirStmt>,
-    start: usize,
-    end: usize,
-    nested_starts: &[usize],
-) -> Vec<HirStmt> {
-    let Some((&next_start, rest)) = nested_starts.split_first() else {
-        return stmts.by_ref().take(end - start).collect();
-    };
-    let mut nested: Vec<_> = stmts.by_ref().take(next_start - start).collect();
-    nested.push(HirStmt::Block(Box::new(HirBlock {
-        stmts: nest_tail(stmts, next_start, end, rest),
-    })));
-    nested
 }

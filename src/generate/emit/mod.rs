@@ -65,7 +65,7 @@ pub(crate) fn generate_chunk(
     let required_inlining = !hir.required_luau_inlining.is_empty();
     let unproven_inlining = required_inlining
         && (context.requested_target.version != DecompileDialect::Luau
-            || !luau_inlining::validate(module, &hir.required_luau_inlining));
+            || !luau_inlining::validate(module, hir));
     if unproven_inlining && options.mode != GenerateMode::Permissive {
         return Err(GenerateError::UnprovenLuauInlining.into());
     }

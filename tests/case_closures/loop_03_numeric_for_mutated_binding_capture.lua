@@ -2,6 +2,9 @@
 -- unluac: expect-not-contains [[end)(]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[p2_1(function()]] [[@debug=stripped]]
+-- unluac: expect-contains [[mutate(function()]] [[@debug=retained]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
 local globals = {}
 for name in pairs(_G) do
     globals[name] = true

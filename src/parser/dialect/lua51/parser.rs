@@ -35,6 +35,7 @@ const LUA_TNUMBER: u8 = 3;
 const LUA_TSTRING: u8 = 4;
 const VARARG_HASARG: u8 = 1;
 const VARARG_ISVARARG: u8 = 2;
+const VARARG_NEEDSARG: u8 = 4;
 
 pub(crate) struct Lua51Parser {
     options: ParseOptions,
@@ -177,6 +178,7 @@ impl Lua51Parser {
                     has_vararg_param_reg: raw_is_vararg & VARARG_HASARG != 0,
                     named_vararg_table: false,
                     legacy_arg_slot: raw_is_vararg & VARARG_HASARG != 0,
+                    legacy_arg_table: raw_is_vararg & VARARG_NEEDSARG != 0,
                 },
                 frame: ProtoFrameInfo { max_stack_size },
                 instructions,

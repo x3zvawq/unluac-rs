@@ -794,6 +794,10 @@ fn apply_fold(
         promotion_facts,
     );
     body.stmts[fold.seed_index] = HirStmt::Assign(Box::new(HirAssign {
+        luau_compound_global: false,
+        upvalue_write_source: None,
+        is_phi_transfer: false,
+        parallel_nil_frame: None,
         targets: vec![HirLValue::Local(fold.carried)],
         values,
         initializer_merge_transaction: None,

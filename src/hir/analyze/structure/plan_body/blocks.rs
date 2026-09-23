@@ -106,11 +106,28 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         "branch terminator plan references a non-branch opcode",
                     );
                 };
-                stmts.push(branch_stmt(
-                    lower_branch_cond(self.lowering, block, instr, branch.cond),
-                    self.lower_edge(owner, truthy)?,
-                    Some(self.lower_edge(owner, falsy)?),
-                ));
+                let then_block = self.lower_edge(owner, truthy)?;
+                let else_block = self.lower_edge(owner, falsy)?;
+                let mut cond = branch.cond;
+                if branch.then_target == branch.else_target
+                    && then_block.stmts.is_empty()
+                    && else_block.stmts.is_empty()
+                {
+                    // 同一后继且两边均无边效果时，跳转极性不承载源码控制差异。
+                    // 保留原 subject 的一次检查，去掉控制反转，避免空 if 重编译后反复翻转。
+                    cond.negated = false;
+                }
+                let mut lowered = branch_stmt(
+                    lower_branch_cond(self.lowering, block, instr, cond),
+                    then_block,
+                    Some(else_block),
+                );
+                if branch.then_target == branch.else_target
+                    && let HirStmt::If(if_stmt) = &mut lowered
+                {
+                    if_stmt.preserves_empty_test = true;
+                }
+                stmts.push(lowered);
             }
             BlockTerminatorKind::Return { instr, .. }
             | BlockTerminatorKind::TailCall { instr, .. } => {
@@ -238,32 +255,30 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         let mut output = PlannedBlock::new();
         let mut index = start;
         while index < end {
-            self.start_lexical_scopes(index, &mut output);
             let mut consumed_end = index + 1;
-            if let Some(protocol) =
-                self.lowering
-                    .global_decls
-                    .owner(InstrRef(index))
-                    .filter(|protocol| {
-                        protocol.end <= end
-                            && !self
-                                .lowering
-                                .promotion_facts
-                                .has_copy_root_boundary(index..protocol.end)
-                            && self
-                                .index
-                                .scope_starts
-                                .range(index + 1..protocol.end)
-                                .next()
-                                .is_none()
-                            && self
-                                .index
-                                .scope_ends
-                                .range(index + 1..protocol.end)
-                                .next()
-                                .is_none()
-                    })
-            {
+            let stmts = if let Some(protocol) = self
+                .lowering
+                .global_decls
+                .owner(InstrRef(index))
+                .filter(|protocol| {
+                    protocol.end <= end
+                        && !self
+                            .lowering
+                            .promotion_facts
+                            .has_copy_root_boundary(index..protocol.end)
+                        && self
+                            .index
+                            .scope_starts
+                            .range(index + 1..protocol.end)
+                            .next()
+                            .is_none()
+                        && self
+                            .index
+                            .scope_ends
+                            .range(index + 1..protocol.end)
+                            .next()
+                            .is_none()
+                }) {
                 let stmt = super::super::super::instrs::lower_global_decl_owner(
                     self.lowering,
                     block,
@@ -276,10 +291,11 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     detail: "frozen global declaration protocol no longer matches its owner",
                 })?;
                 consumed_end = protocol.end;
-                output.push(stmt);
+                vec![stmt]
             } else {
-                output.extend_plain(self.lower_planned_regular(owner, block, InstrRef(index))?);
-            }
+                self.lower_planned_regular(owner, block, InstrRef(index))?
+            };
+            self.emit_scoped_instr(owner, index, stmts, &mut output)?;
             // cleanup 可能已被结构协议消费；交接属于指令边界，仍须在 scope 结束前发射。
             for &(source, holder) in self
                 .lowering
@@ -297,13 +313,55 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         Ok(output)
     }
 
-    pub(super) fn start_lexical_scopes(&mut self, instr: usize, output: &mut PlannedBlock) {
+    pub(super) fn emit_scoped_instr(
+        &mut self,
+        owner: RegionId,
+        instr: usize,
+        mut stmts: Vec<HirStmt>,
+        output: &mut PlannedBlock,
+    ) -> Result<(), HirLowerError> {
         if let Some(scopes) = self.index.scope_starts.get(&instr) {
             self.emitted_scope_boundaries += scopes.len();
             for &scope in scopes {
+                if let Some(floor) = self.lowering.bindings.lexical_scopes[scope].initial_nil_floor
+                {
+                    let mut prefix = self.lowering.dataflow.instr_defs[instr]
+                        .iter()
+                        .filter(|&&def| self.lowering.dataflow.def_reg(def) < floor)
+                        .filter_map(|def| {
+                            crate::hir::common::HirBinding::from_lvalue(
+                                &self.lowering.bindings.lvalue_for_reg_result(
+                                    self.lowering.cfg.instr_to_block[instr],
+                                    self.lowering.dataflow.def_reg(*def),
+                                    self.lowering.bindings.fixed_temps[def.index()],
+                                ),
+                            )
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if instr == 0 {
+                        prefix.extend(
+                            self.lowering
+                                .bindings
+                                .entry_local_regs
+                                .iter()
+                                .filter(|(reg, _)| **reg < floor)
+                                .map(|(_, &local)| crate::hir::common::HirBinding::Local(local)),
+                        );
+                    }
+                    let prefix = emission::split_nil_prefix(&mut stmts, &prefix).ok_or(
+                        HirLowerError::InvalidPlanRegion {
+                            proto: self.proto.index(),
+                            region: owner.index(),
+                            detail: "split nil scope contains an invalid declaration or write",
+                        },
+                    )?;
+                    output.extend_plain(prefix);
+                }
                 output.start_scope(scope);
             }
         }
+        output.extend_plain(stmts);
+        Ok(())
     }
 
     pub(super) fn end_lexical_scopes(&mut self, instr: usize, output: &mut PlannedBlock) {

@@ -9,6 +9,8 @@
 -- unluac: expect-not-contains [[{ t = nil, f = nil }]] [[@dialect=luajit]]
 -- judge 的第二个参数只需两次读取和一次形参声明；再生成不得复制共同条件尾。
 -- unluac: expect-max-count [[p3_1]] [[3]] [[@dialect=luau]]
+-- 嵌套构造器的原槽复用应恢复初始化，不能留下逐轮生成 nil 的匿名空声明。
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=6]] [[@dialect=luau]]
 -- Luau 的优先级循环只保留 expected 表，不拆分比较参数、judge callee 和 assert 参数。
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]] [[@dialect=luau]]
 -- judge 的纯值选择应直接返回，不拆成局部中转；LuaJIT 的兄弟 proto 顺序相反。

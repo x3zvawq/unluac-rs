@@ -644,6 +644,7 @@ impl ValueDecisionRouteContext<'_> {
 pub(super) fn validate_value_decision_values(
     proto: &LoweredProto,
     cfg: &Cfg,
+    graph: &GraphFacts,
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
 ) -> Result<(), StructureError> {
@@ -667,6 +668,7 @@ pub(super) fn validate_value_decision_values(
     let mut incoming_by_edge = vec![None; cfg.edges.len()];
     let mut terminal_edge_owner = vec![None; cfg.edges.len()];
     for (decision_id, decision) in plan.value_decisions() {
+        validate_value_operands(proto, cfg, graph, dataflow, decision)?;
         let region = plan
             .value_decision_region(decision_id)
             .ok_or_else(|| StructureError::invalid("value decision has no final region owner"))?;
@@ -867,6 +869,133 @@ pub(super) fn validate_value_decision_values(
                 decision_id.index()
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_value_operands(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    decision: &ValueDecisionPlan,
+) -> Result<(), StructureError> {
+    if decision.operands.is_empty() {
+        return Ok(());
+    }
+    let invalid =
+        || StructureError::invalid("value decision operand has stale ownership or value flow");
+    if decision
+        .operands
+        .windows(2)
+        .any(|pair| pair[0].phi >= pair[1].phi)
+    {
+        return Err(invalid());
+    }
+    let root = decision.operands.len();
+    let mut owners = vec![root; decision.nodes.len()];
+    for (index, operand) in decision.operands.iter().enumerate() {
+        if operand
+            .proven_current_values(proto, dataflow, &decision.nodes)
+            .as_ref()
+            != Some(&operand.current_values)
+        {
+            return Err(invalid());
+        }
+        let phi = dataflow.phi_candidate(operand.phi).ok_or_else(invalid)?;
+        let consumer = decision
+            .nodes
+            .get(operand.consumer.index())
+            .ok_or_else(invalid)?;
+        let [site] = dataflow.phi_uses[phi.id.index()].as_slice() else {
+            return Err(invalid());
+        };
+        if decision
+            .nodes
+            .get(operand.continuation.index())
+            .is_none_or(|node| node.block != phi.block)
+            || site.instr != consumer.predicate
+            || !graph.post_dominates(consumer.block, phi.block)
+            || dataflow.instr_effects[site.instr.index()].repeats_fixed_use(site.reg)
+            || !dataflow.phi_consumer_ids(phi.id).is_empty()
+            || decision.absorbed_phis.binary_search(&phi.id).is_err()
+            || phi.incoming.len() != operand.leaves.len()
+            || !phi.incoming.iter().all(|incoming| {
+                incoming
+                    .edge
+                    .is_some_and(|edge| operand.leaves.get(&edge) == Some(&incoming.value))
+            })
+        {
+            return Err(invalid());
+        }
+        for node in &operand.nodes {
+            let owner = owners.get_mut(node.index()).ok_or_else(invalid)?;
+            if *owner != root {
+                return Err(invalid());
+            }
+            *owner = index;
+        }
+    }
+    let mut children = vec![Vec::new(); root + 1];
+    let mut entries = vec![std::collections::BTreeMap::new(); root + 1];
+    for (index, operand) in decision.operands.iter().enumerate() {
+        let parent = owners[operand.consumer.index()];
+        if entries[parent]
+            .insert(operand.entry.index(), index)
+            .is_some()
+        {
+            return Err(invalid());
+        }
+        children[parent].push(index);
+    }
+    let mut visited = vec![false; root + 1];
+    let mut pending = vec![root];
+    while let Some(group) = pending.pop() {
+        if std::mem::replace(&mut visited[group], true) {
+            return Err(invalid());
+        }
+        pending.extend(children[group].iter().copied());
+    }
+    if visited.iter().any(|visited| !visited) {
+        return Err(invalid());
+    }
+    let mut covered = vec![BTreeSet::new(); root];
+    for node in &decision.nodes {
+        let owner = owners[node.id.index()];
+        for arc in [&node.truthy, &node.falsy] {
+            if owner != root {
+                let operand = &decision.operands[owner];
+                let edge = *arc.route.last().ok_or_else(invalid)?;
+                if operand.leaves.contains_key(&edge) {
+                    if arc.target != ValueDecisionTarget::Node(operand.continuation)
+                        || cfg.edges[edge.index()].to
+                            != decision.nodes[operand.continuation.index()].block
+                    {
+                        return Err(invalid());
+                    }
+                    covered[owner].insert(edge);
+                    continue;
+                }
+            }
+            match arc.target {
+                ValueDecisionTarget::Node(target) if owners[target.index()] == owner => {}
+                ValueDecisionTarget::Node(target) => {
+                    if !entries[owner].contains_key(&target.index()) {
+                        return Err(invalid());
+                    }
+                }
+                _ if owner == root => {}
+                _ => return Err(invalid()),
+            }
+        }
+    }
+    if decision
+        .operands
+        .iter()
+        .zip(&covered)
+        .any(|(operand, covered)| operand.leaves.keys().copied().ne(covered.iter().copied()))
+    {
+        return Err(invalid());
     }
     Ok(())
 }

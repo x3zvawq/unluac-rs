@@ -1,5 +1,9 @@
 -- FASTCALL1 在参数求值之后读取 fallback；__index 可在此期间替换全局 assert。
 -- Boolean AND 的入口 false 写与原结果槽配对，不能因 header 的逻辑引用消失就单删。
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
+-- unluac: expect-not-contains [[ = print]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
 local trace = {}
 local saved_assert = assert
 local environment = getfenv()

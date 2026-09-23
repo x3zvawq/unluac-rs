@@ -40,6 +40,7 @@ pub(super) fn final_plan_input(
         proto,
         cfg,
         dataflow,
+        graph_facts,
         &loops,
         &residual_transfers,
         value_candidates,
@@ -52,17 +53,17 @@ pub(super) fn final_plan_input(
             let condition = condition_by_header.get(&branch.header).copied();
             let condition_ref = condition.and_then(|id| conditions.get(id.index()));
             let frozen_region = branch_regions.remove(&branch.header);
-            let boundary_changed = frozen_region
-                .as_ref()
-                .is_none_or(|region| region.single_pass_fence.is_none())
-                && normalize_branch_condition_boundary(
-                    cfg,
-                    graph_facts,
-                    &loops,
-                    &branch_index,
-                    &mut branch,
-                    condition_ref,
-                );
+            let boundary_changed = frozen_region.as_ref().is_none_or(|region| {
+                region.single_pass_fence.is_none()
+                    || condition_consumes_single_pass(region, condition_ref)
+            }) && normalize_branch_condition_boundary(
+                cfg,
+                graph_facts,
+                &loops,
+                &branch_index,
+                &mut branch,
+                condition_ref,
+            );
             let value_merge = branch
                 .merge
                 .and_then(|merge| branch_value_merges.remove(&(branch.header, merge)));
@@ -119,6 +120,37 @@ pub(super) fn final_plan_input(
     })
 }
 
+/// 已选条件 DAG 若完整承接所有 early escape，tail 就是普通单臂；不能继续用
+/// 早期图形候选的 repeat 包装条件入口前缀，令出口后仍使用的定义落入假作用域。
+fn condition_consumes_single_pass(
+    region: &BranchRegionFact,
+    condition: Option<&ConditionPlanInput>,
+) -> bool {
+    let Some(fence) = &region.single_pass_fence else {
+        return false;
+    };
+    let Some(condition) = condition else {
+        return false;
+    };
+    let ShortCircuitExit::BranchExit { truthy, falsy } = condition.candidate.exit else {
+        return false;
+    };
+    if condition.candidate.header != region.header
+        || !((truthy == region.merge && falsy == fence.exit)
+            || (falsy == region.merge && truthy == fence.exit))
+    {
+        return false;
+    }
+    // 消费已通过 connector、escaping-def 和边动作验证的 arc，不重新猜测短路边。
+    // 未被 DAG 认领的 break 仍属于 SinglePass，不能仅凭两个出口相同就去掉 fence。
+    let edges = condition
+        .arcs
+        .iter()
+        .flat_map(|arc| arc.edges.iter().copied())
+        .collect::<BTreeSet<_>>();
+    fence.escape_edges.is_subset(&edges)
+}
+
 pub(super) fn normalize_branch_condition_boundary(
     cfg: &Cfg,
     graph_facts: &GraphFacts,
@@ -143,7 +175,9 @@ pub(super) fn normalize_branch_condition_boundary(
         branch.invert_hint = false;
         return true;
     }
-    if let Some((then_entry, continuation)) = branch_endpoint_boundary(graph_facts, truthy, falsy) {
+    if let Some((then_entry, continuation)) =
+        branch_endpoint_boundary(graph_facts, branch_index, truthy, falsy)
+    {
         branch.then_entry = then_entry;
         branch.else_entry = None;
         branch.merge = Some(continuation);
@@ -151,14 +185,10 @@ pub(super) fn normalize_branch_condition_boundary(
         branch.invert_hint = false;
         return true;
     }
-    // 短路条件吸收了原合流块后，旧边界已经变成条件内部节点。
-    // 重新消费既有 loop-exit/frontier 证明，保留 break 臂和本轮共享 tail 的归属；
-    // 不能把共享 tail 留成跳出外层 if 的 residual goto。
-    if branch
-        .merge
-        .is_some_and(|merge| condition.candidate.blocks.contains(&merge))
-        && let Some(normalized) = branch_index.loop_exit_boundary(cfg, branch.header, truthy, falsy)
-    {
+    // 有 break 的臂同时汇入本轮 tail 和 loop exit，不满足单一局部 frontier。
+    // 对短路条件的新端点重新消费 loop-exit 证明；即使旧 merge 未被条件吸收，
+    // 也不能让旧边界把共享 tail 留成 residual goto。
+    if let Some(normalized) = branch_index.loop_exit_boundary(cfg, branch.header, truthy, falsy) {
         *branch = normalized;
         return true;
     }
@@ -185,17 +215,16 @@ pub(super) fn normalize_branch_condition_boundary(
 
 pub(super) fn branch_endpoint_boundary(
     graph_facts: &GraphFacts,
+    branch_index: &branches::BranchIndex<'_>,
     truthy: super::super::BlockRef,
     falsy: super::super::BlockRef,
 ) -> Option<(super::super::BlockRef, super::super::BlockRef)> {
-    let truthy_joins_falsy = graph_facts
-        .dominance_frontier
-        .get(truthy.index())
-        .is_some_and(|frontier| frontier.contains(&falsy));
-    let falsy_joins_truthy = graph_facts
-        .dominance_frontier
-        .get(falsy.index())
-        .is_some_and(|frontier| frontier.contains(&truthy));
+    // 一条边汇入另一端点不代表整臂在此结束；内嵌值选择还可能绕过它，
+    // 在更后的共同出口合流。复用原 branch 的单臂证明，避免吞入共享 tail。
+    let truthy_joins_falsy = graph_facts.post_dominates(falsy, truthy)
+        || branch_index.has_single_local_join(truthy, falsy);
+    let falsy_joins_truthy = graph_facts.post_dominates(truthy, falsy)
+        || branch_index.has_single_local_join(falsy, truthy);
     match (truthy_joins_falsy, falsy_joins_truthy) {
         (true, false) => Some((truthy, falsy)),
         (false, true) => Some((falsy, truthy)),

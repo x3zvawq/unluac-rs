@@ -277,7 +277,14 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         depends_on: HIR_SHAPE_INPUTS,
         // 完整调用消费后，同一身份的下一次写可能恢复为声明；构造器应在新词法
         // owner 上继续证明 initializer，不能等 AST 再次重建 HIR 已经拥有的事实。
-        invalidates: &[LocalBinding, TablePattern, TempChain],
+        invalidates: &[LocalBinding, TablePattern, TempChain, BlockStructure],
+    },
+    PassDescriptor {
+        name: "expanded-source-frames",
+        phase: PassPhase::Final,
+        depends_on: HIR_SHAPE_INPUTS,
+        // 展开帧仍消费原 SETLIST 和内部值版本，必须先于不可逆的固定批次降低。
+        invalidates: &[TablePattern, TempChain, LocalBinding, BlockStructure],
     },
     PassDescriptor {
         name: "lower-fixed-table-batches",
@@ -287,10 +294,11 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[TablePattern, TempChain, LocalBinding],
     },
     PassDescriptor {
-        name: "final-dead-unresolved-temps",
+        name: "source-frame-materializations",
         phase: PassPhase::Final,
         depends_on: HIR_SHAPE_INPUTS,
-        // 完整调用帧已稳定；nil 声明前缀先交词法事务，未消费项与 Boolean 预写仍按原证明清理。
+        // 词法事务可能同时消费 CALL 准备，暴露循环入口 guard；须交还 Normal
+        // consumers 收敛，不能在调度结束后才产生新的表达式和控制形状。
         invalidates: &[TempChain, LocalBinding, BlockStructure, TablePattern],
     },
     PassDescriptor {
@@ -298,13 +306,20 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         phase: PassPhase::Normal,
         depends_on: HIR_SHAPE_INPUTS,
         // 参数返回树不依赖模块调用摘要；完整树先收成表达式，再交 Normal 消费。
-        invalidates: &[LocalBinding, BlockStructure, LogicalExpr],
+        invalidates: &[LocalBinding, BlockStructure, LogicalExpr, DecisionShape],
     },
     PassDescriptor {
         name: "tbc-initializer-frames",
         phase: PassPhase::Normal,
         depends_on: HIR_SHAPE_INPUTS,
         invalidates: &[LocalBinding, TempChain, TablePattern],
+    },
+    PassDescriptor {
+        name: "final-dead-unresolved-temps",
+        phase: PassPhase::Final,
+        depends_on: HIR_SHAPE_INPUTS,
+        // 原 nil 声明前缀已交词法事务，未消费项与 Boolean 预写仍按原证明清理。
+        invalidates: &[TempChain, LocalBinding, BlockStructure, TablePattern],
     },
 ];
 
@@ -313,7 +328,7 @@ pub(super) fn simplify_hir(
     module: &mut HirModule,
     readability: ReadabilityOptions,
     timings: &TimingCollector,
-    promotion_facts: &mut [ProtoPromotionFacts],
+    promotion_facts: &mut Vec<ProtoPromotionFacts>,
     generate_mode: GenerateMode,
     dialect: DecompileDialect,
     dump_config: &PassDumpConfig,
@@ -331,13 +346,27 @@ pub(super) fn simplify_hir(
             let before_snapshots = capture_hir_snapshots_if_requested(module, dump_config, name);
 
             let changed = timings.record(name, || {
-                let effects = matches!(index, 3 | 15 | 16 | 17).then(|| {
-                    effect_snapshot.get_or_insert_with(|| {
-                        timings.record("closure-effects", || {
-                            object_flow::collect_proto_effects(module, safety)
-                        })
+                // 空候选 pass 不需要 closure-effects；先判定适用性，避免其它 pass
+                // 改写后为没有建表工作的模块反复重建整模块效果快照。
+                if matches!(index, 3 | 18)
+                    && !module.protos.iter().any(|proto| {
+                        table_constructors::block_has_table_constructor_candidate(&proto.body)
                     })
-                });
+                {
+                    return false;
+                }
+                if index == 17 {
+                    return call_frames::restore_expanded_frames(module, promotion_facts, dialect);
+                }
+                let effects = (matches!(index, 3 | 15 | 16 | 18)
+                    || index == 4 && dialect == DecompileDialect::Luau)
+                    .then(|| {
+                        effect_snapshot.get_or_insert_with(|| {
+                            timings.record("closure-effects", || {
+                                object_flow::collect_proto_effects(module, safety, dialect)
+                            })
+                        })
+                    });
                 let effects = effects.as_deref();
                 let roots = || object_flow::RootAnalysisContext {
                     safety,
@@ -368,6 +397,7 @@ pub(super) fn simplify_hir(
                         &empty_facts,
                         dialect,
                         safety,
+                        effects.map(|effects| &effects.values),
                     );
                 }
                 let chunk_entry = module.entry;
@@ -378,7 +408,7 @@ pub(super) fn simplify_hir(
                     match index {
                         0 => decision::simplify_decision_exprs_in_proto(proto, safety),
                         1 => boolean_shells::remove_boolean_materialization_shells_in_proto(
-                            proto, facts, safety,
+                            proto, facts,
                         ),
                         2 => logical_simplify::simplify_logical_exprs_in_proto(proto, dialect),
                         3 => table_constructors::stabilize_table_constructors_in_proto(
@@ -405,7 +435,7 @@ pub(super) fn simplify_hir(
                             proto, facts, safety,
                         ),
                         9 => decision::eliminate_remaining_decisions_in_proto(proto, facts, safety),
-                        10 => debug_scopes::materialize_tail_debug_scopes_in_proto(proto),
+                        10 => debug_scopes::materialize_tail_debug_scopes_in_proto(proto, dialect),
                         11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto, safety),
                         12 => carried_locals::collapse_carried_local_handoffs_in_proto(
                             proto, facts, safety,
@@ -418,36 +448,30 @@ pub(super) fn simplify_hir(
                         ),
                         14 => dead_labels::remove_unused_labels_in_proto(proto),
                         16 => unreachable!("native frames require one immutable module snapshot"),
-                        17 => table_constructors::stabilize_table_constructors_in_proto(
+                        18 => table_constructors::stabilize_table_constructors_in_proto(
                             proto,
                             facts,
                             roots(),
                             table_constructors::TableConstructorStage::LowerFixedBatches,
                         ),
-                        18 => {
-                            let mut changed = false;
-                            if !source_frames::pending_nil_prefix_temps(proto, facts).is_empty() {
-                                changed |= source_frames::restore_materializations(
-                                    proto,
-                                    facts,
-                                    dialect,
-                                    proto.id == chunk_entry,
-                                );
-                            }
-                            changed |= dead_temps::remove_dead_temp_materializations_in_proto(
-                                proto,
-                                facts,
-                                safety,
-                                dead_temps::DeadTempStage::Final,
-                            );
-                            changed
-                        }
-                        19 => call_frames::restore_parameter_return_frames(proto, facts, dialect),
-                        20 => call_frames::restore_tbc_initializer_frames(
+                        19 => source_frames::restore_materializations(
                             proto,
                             facts,
                             dialect,
                             proto.id == chunk_entry,
+                        ),
+                        20 => call_frames::restore_parameter_return_frames(proto, facts, dialect),
+                        21 => call_frames::restore_tbc_initializer_frames(
+                            proto,
+                            facts,
+                            dialect,
+                            proto.id == chunk_entry,
+                        ),
+                        22 => dead_temps::remove_dead_temp_materializations_in_proto(
+                            proto,
+                            facts,
+                            safety,
+                            dead_temps::DeadTempStage::Final,
                         ),
                         _ => unreachable!("invalid HIR pass index: {index}"),
                     }
@@ -477,12 +501,6 @@ pub(super) fn simplify_hir(
     timings.record("method-rewrite-transactions", || {
         for proto in &mut module.protos {
             if let Some(facts) = promotion_facts.get_mut(proto.id.index()) {
-                source_frames::restore_materializations(
-                    proto,
-                    facts,
-                    dialect,
-                    proto.id == module.entry,
-                );
                 method_rewrite_transactions::finalize_method_rewrite_transactions(proto, facts);
                 call_frames::restore_terminal_method_frames(proto, facts, dialect);
                 call_frames::preserve_existing_call_prefixes(
@@ -500,22 +518,12 @@ pub(super) fn simplify_hir(
             }
         }
     });
-    timings.record("expanded-source-frames", || {
-        call_frames::restore_expanded_frames(module, promotion_facts, dialect);
-    });
-    timings.record("dead-boolean-initializers", || {
-        for proto in &mut module.protos {
-            if let Some(facts) = promotion_facts.get(proto.id.index()) {
-                dead_temps::simplify_unused_primitive_initializers(proto, facts, safety);
-            }
-        }
-    });
     timings.record("plain-method-syntax", || {
         if dialect != crate::decompile::DecompileDialect::Lua54 {
             return;
         }
         // 最终声明/根事务已改变 HIR；在该不可变版本上重新取得值事实，不沿用旧快照。
-        let effects = object_flow::collect_proto_effects(module, safety);
+        let effects = object_flow::collect_proto_effects(module, safety, dialect);
         plain_method_syntax::finalize(module, promotion_facts, &effects.values, dialect);
     });
     let residuals = residuals::finalize_hir_exit_requirements(module);
@@ -535,7 +543,19 @@ fn apply_temp_inline_pass(
     empty_facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
     safety: HirExprSafety,
+    values: Option<&object_flow::ReturnValueFacts>,
 ) -> bool {
+    // 在当前模块快照上冻结原单结果 producer 的值域证书。temp-inline 只搬移同值
+    // producer/use，不更换 CALL 的输入；提交之后不再查询已失效的模块分析。
+    let inert_results = module
+        .protos
+        .iter()
+        .map(|proto| {
+            values.map_or_else(std::collections::BTreeSet::new, |values| {
+                values.inert_scalar_call_results(proto)
+            })
+        })
+        .collect::<Vec<_>>();
     // HIR proto ids are allocated parent-first. Walk the flat arena backwards so every direct
     // child has already reached its current temp-inline shape before the parent decides whether
     // a one-use closure is substantial enough to keep as a named callee. Unknown/backward refs
@@ -551,7 +571,10 @@ fn apply_temp_inline_pass(
             readability,
             facts,
             dialect,
-            &substantial_closure_bodies,
+            temp_inline::InlineModuleFacts {
+                substantial_closure_bodies: &substantial_closure_bodies,
+                inert_call_results: &inert_results[proto_index],
+            },
             safety,
         );
         if let Some(slot) = substantial_closure_bodies.get_mut(proto_id) {

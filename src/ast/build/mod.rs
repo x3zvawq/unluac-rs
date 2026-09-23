@@ -5,7 +5,7 @@
 //! StructureFacts。这里不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实，也不会把
 //! 没有等价源码语义的残余 HIR 节点拆成表面合法的 AST。
 //! LocalRootRelease 已由 HIR 证明只结束旧源码根，在此生成 local 清零，不回推 VM 覆写。
-//! 单绑定闭包的引用自捕获必须生成 local function，使 binding 在初始化前可见；普通
+//! 单绑定闭包的自捕获必须生成 local function，使 binding 在初始化前可见；普通
 //! `local f = function() ... end` 的 RHS 不在 f 的词法域内，不能留给可选 sugar 修正。
 
 mod analysis;
@@ -314,12 +314,12 @@ impl<'a> AstLowerer<'a> {
                     (local_decl.bindings.as_slice(), local_decl.values.fixed.as_slice(), &local_decl.values.tail),
                     ([binding], [crate::hir::HirExpr::Closure(closure)], None)
                         if closure.captures.iter().any(|capture|
-                            capture.binding == crate::hir::HirBinding::Local(*binding)
-                                && capture.mode == crate::hir::HirCaptureMode::ByReference)
+                              capture.binding == crate::hir::HirBinding::Local(*binding))
                 );
                 let mut lowered = self.lower_local_decl(proto_index, local_decl)?;
                 let stmt = if recursive {
-                    // 引用自捕获必须在初始化前进入词法域。这里是必需的源码语义，
+                    // 自捕获必须在初始化前进入词法域；按值自捕获的独立结果身份由
+                    // HIR 分配，不会接收原槽的后续写入。这里是必需的源码语义，
                     // 不依赖可选 function-sugar，也不受 binding 的重写权限影响。
                     let binding = lowered.bindings.pop().expect("single recursive binding");
                     let AstExpr::FunctionExpr(function) =
@@ -350,6 +350,7 @@ impl<'a> AstLowerer<'a> {
                     targets: vec![AstLValue::Name(AstNameRef::Local(*local))],
                     values: vec![AstExpr::Nil],
                     initializer_merge_transaction: None,
+                    luau_compound_global: false,
                     method_rewrite_transaction: None,
                 }))],
                 1,
@@ -385,6 +386,7 @@ impl<'a> AstLowerer<'a> {
             HirStmt::If(if_stmt) => Ok((
                 vec![AstStmt::If(Box::new(AstIf {
                     cond: self.lower_expr(proto_index, &if_stmt.cond)?,
+                    preserves_empty_test: if_stmt.preserves_empty_test,
                     then_block: self.lower_block(
                         proto_index,
                         &if_stmt.then_block,

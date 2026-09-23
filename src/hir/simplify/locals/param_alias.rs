@@ -1,12 +1,14 @@
-//! 收敛 locals 提升后暴露的函数入口参数别名。
+//! 消解只读参数的纯合流别名，并收敛 locals 提升后的函数入口参数别名。
 //!
-//! 消费共享 HIR 控制流图、可信 home 与 capture 事实，证明参数和 alias 从入口同值
-//! 开始不会被分别观察；不重新推断 phi，也不处理任意 local 对。
-//! 例如 local l=p; l=l+1; return l 在同 home 且旧 p 不再被观察时可改为
-//! p=p+1; return p。仅显式读写等价不足以允许改变旧参数的根生命周期。
+//! 纯合流转移检查整个 proto 的写入与身份约束；入口可写 alias 则由共享控制流图
+//! 和可信 home 证明不会被分别观察，不以值相等替代原参数的根生命周期。
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::decompile::DecompileDialect;
 use crate::hir::common::{
-    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId, ParamId,
+    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirLocalDecl, HirProto, HirStmt, LocalId,
+    ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -15,6 +17,113 @@ use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind};
 use super::super::mention::{expr_mentions_local, stmts_reference_captured_bindings};
 use super::super::walk::{self, HirRewritePass};
 use crate::hir::visit::{self, HirVisitor};
+
+/// 所有 incoming 都已归一到同一只读形参时，phi 不再需要独立源码身份。
+/// 只删除合成转移；仍存在的原 MOVE、根覆盖或 debug 初始化由原 owner 保留。
+pub(super) fn remove_readonly_parameter_phis(
+    proto: &mut HirProto,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    sensitive: &BTreeSet<TempId>,
+    reference_params: &BTreeSet<ParamId>,
+) -> bool {
+    // PUC/JIT 的 debug.setlocal 可在回调中改写形参；显式 HIR 写集合不能证明其只读。
+    if dialect != DecompileDialect::Luau {
+        return false;
+    }
+    #[derive(Default)]
+    struct Incoming {
+        aliases: BTreeMap<TempId, Option<ParamId>>,
+        written_params: BTreeSet<ParamId>,
+    }
+    impl HirVisitor<'_> for Incoming {
+        fn visit_stmt(&mut self, stmt: &HirStmt) {
+            let HirStmt::Assign(assign) = stmt else {
+                return;
+            };
+            let value = match (
+                assign.targets.as_slice(),
+                assign.values.fixed.as_slice(),
+                &assign.values.tail,
+            ) {
+                ([HirLValue::Temp(_)], [HirExpr::ParamRef(param)], None)
+                    if assign.is_phi_transfer
+                        && assign.initializer_merge_transaction.is_none()
+                        && assign.generic_for_initializer_producer.is_none()
+                        && assign.generic_for_dispatch_release.is_none()
+                        && assign.method_rewrite_transaction.is_none() =>
+                {
+                    Some(*param)
+                }
+                _ => None,
+            };
+            for target in &assign.targets {
+                if let HirLValue::Temp(temp) = target {
+                    self.aliases
+                        .entry(*temp)
+                        .and_modify(|old| {
+                            if *old != value {
+                                *old = None;
+                            }
+                        })
+                        .or_insert(value);
+                }
+            }
+        }
+
+        fn visit_lvalue(&mut self, value: &HirLValue) {
+            if let HirLValue::Param(param) = value {
+                self.written_params.insert(*param);
+            }
+        }
+    }
+    let mut incoming = Incoming::default();
+    visit::visit_stmts(&proto.body.stmts, &mut incoming);
+    let aliases = incoming
+        .aliases
+        .into_iter()
+        .filter_map(|(temp, param)| {
+            let param = param?;
+            (facts.is_phi_carrier_temp(temp)
+                && !incoming.written_params.contains(&param)
+                && !reference_params.contains(&param)
+                && !sensitive.contains(&temp)
+                && !proto.physical_root_temps.contains(&temp)
+                && !proto.inline_dispositions.temp(temp).must_preserve()
+                && proto.temp_debug_locals[temp.index()].is_none()
+                && proto.temp_debug_scopes[temp.index()].is_none())
+            .then_some((temp, param))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if aliases.is_empty() {
+        return false;
+    }
+
+    struct Replace(BTreeMap<TempId, ParamId>);
+    impl HirRewritePass for Replace {
+        fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
+            let HirExpr::TempRef(temp) = expr else {
+                return false;
+            };
+            let Some(&param) = self.0.get(temp) else {
+                return false;
+            };
+            *expr = HirExpr::ParamRef(param);
+            true
+        }
+
+        fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+            let original = block.stmts.len();
+            block.stmts.retain(|stmt| {
+                !matches!(stmt,
+                HirStmt::Assign(assign) if matches!(assign.targets.as_slice(),
+                    [HirLValue::Temp(temp)] if self.0.contains_key(temp)))
+            });
+            block.stmts.len() != original
+        }
+    }
+    walk::rewrite_proto(proto, &mut Replace(aliases))
+}
 
 pub(super) fn coalesce_param_aliases_in_proto(
     proto: &mut HirProto,

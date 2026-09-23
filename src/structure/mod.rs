@@ -38,8 +38,8 @@ pub(crate) use common::{
     ShortCircuitTarget, ShortCircuitValueIncoming, UnstructuredRegionLayout,
 };
 pub use common::{
-    BranchKind, DebugBindingConflict, DebugBindingFact, DebugBindingFacts, GotoReason, PhiEdgeCopy,
-    ReadyStructureFacts, StructureFacts, StructureOutcome, StructurePlan,
+    BranchKind, DebugBindingConflict, DebugBindingFact, DebugBindingFacts, DebugBindingValue,
+    GotoReason, PhiEdgeCopy, ReadyStructureFacts, StructureFacts, StructureOutcome, StructurePlan,
 };
 #[cfg(feature = "decompile-debug")]
 pub use debug::dump_structure;
@@ -59,7 +59,7 @@ pub use plan::{
     PhiPlan, PlanRequirement, PlanRequirementId, PlanRequirements, RegionId, RegionPlan,
     ScopePlanId, SinglePassPlan, SinglePassPlanId, UnstructuredLayoutItem, ValueDecisionArcPlan,
     ValueDecisionLeafId, ValueDecisionLeafPlan, ValueDecisionNodeId, ValueDecisionNodePlan,
-    ValueDecisionPlan, ValueDecisionPlanId, ValueDecisionTarget,
+    ValueDecisionOperandPlan, ValueDecisionPlan, ValueDecisionPlanId, ValueDecisionTarget,
 };
 #[cfg(not(feature = "decompile-debug"))]
 mod debug {

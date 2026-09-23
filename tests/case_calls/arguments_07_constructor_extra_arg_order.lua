@@ -3,6 +3,14 @@
 -- unluac: expect-contains [[, __reg423_suffix_values())]]
 -- unluac: expect-order [["prefix-table"]] [[__reg423_mark("prefix-extra", 11)]]
 -- unluac: expect-contains [[.read()]]
+-- unluac: expect-contains [[return callee(value, __reg423_suffix_values())]] [[@debug=retained]]
+-- unluac: expect-contains [[total = total + select(i, ...).read()]] [[@debug=retained]]
+-- unluac: expect-not-contains [[= select]]
+-- unluac: expect-contains [[lookup_events[#lookup_events + 1] = "add" .. right.value]] [[@debug=retained]]
+-- unluac: expect-contains [[return left + right.value]] [[@debug=retained]]
+-- unluac: expect-contains [[return setmetatable({ value = number }, {]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=5]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.4]]
 
 local events = {}
 
@@ -84,6 +92,24 @@ end
 
 assert(wide_case() == 36)
 assert(repeated_reversed_case() == 13)
+
+-- 索引和返回的函数均可产生副作用；累计表达式仍须逐项完成 lookup、CALL、加法。
+local lookup_events = {}
+local function deferred(number)
+    return setmetatable({}, { __index = function(_, key)
+        assert(key == "read")
+        lookup_events[#lookup_events + 1] = "lookup" .. number
+        return function()
+            lookup_events[#lookup_events + 1] = "call" .. number
+            return setmetatable({ value = number }, { __add = function(left, right)
+                lookup_events[#lookup_events + 1] = "add" .. right.value
+                return left + right.value
+            end })
+        end
+    end })
+end
+assert(__reg423_collect(deferred(2), deferred(5)) == 7)
+assert(table.concat(lookup_events, ",") == "lookup2,call2,add2,lookup5,call5,add5")
 
 print(
     "regress_423_constructor_extra_arg_order",

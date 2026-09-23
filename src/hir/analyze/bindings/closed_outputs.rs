@@ -29,7 +29,7 @@ pub(super) fn collect(
     emission: &HirEmissionFacts<'_>,
     epochs: &SlotEpochFacts,
     captured: &CapturedSlotTargets,
-    lexical_scopes: &[std::ops::Range<usize>],
+    lexical_scopes: &[LexicalScope],
     fixed_temps: &[TempId],
 ) -> Vec<ClosedOutputBinding> {
     if captured.lexical_scopes.is_empty()
@@ -41,9 +41,19 @@ pub(super) fn collect(
     }
     // 一次标出所有已接受词法窗口；nil 必须在函数父级，而不是另一个已关闭窗口中。
     let mut depths = vec![0isize; proto.instrs.len() + 1];
+    let mut nil_prefix_floors = BTreeMap::<usize, Vec<Reg>>::new();
     for scope in lexical_scopes {
         depths[scope.start] += 1;
         depths[scope.end] -= 1;
+        if let Some(floor) = scope.initial_nil_floor {
+            nil_prefix_floors
+                .entry(scope.start)
+                .or_default()
+                .push(floor);
+        }
+    }
+    for floors in nil_prefix_floors.values_mut() {
+        floors.sort_unstable();
     }
     let mut depth = 0;
     for value in &mut depths {
@@ -68,7 +78,7 @@ pub(super) fn collect(
         })
         .map(|(index, _)| index)
         .next_back();
-    // PUC RETURN 可降低为同来源的 CLOSE + RETURN；词法 cleanup 没有另一次 TBC
+    // 已证明的函数退出可降低为配对的 CLOSE + RETURN；词法 cleanup 没有另一次 TBC
     // 观察。只在最终原退出协议处结束根窗口，普通 CLOSE 仍是禁止跨越的边界。
     let root_end = proto
         .instrs
@@ -92,11 +102,23 @@ pub(super) fn collect(
         .collect::<BTreeSet<_>>();
     let windows = lexical_scopes
         .iter()
-        .map(|scope| (scope.start, scope.end))
-        .filter(|scope| capture_windows.contains(scope))
+        .filter(|scope| capture_windows.contains(&(scope.start, scope.end)))
+        .map(|scope| (scope.start, scope.end, scope.initial_nil_floor))
         .collect::<BTreeSet<_>>();
     let mut result = Vec::new();
-    for (start, end) in windows {
+    let mut claimed_outputs = BTreeSet::new();
+    // 只接回每个原槽的末次单值写。先索引这些定义，嵌套窗口不再重复扫描整个指令区间。
+    let mut final_defs = dataflow
+        .defs
+        .iter()
+        .filter(|def| {
+            dataflow.fixed_defs_for_reg(def.reg).last() == Some(&def.id)
+                && dataflow.instr_defs[def.instr.index()].len() == 1
+        })
+        .map(|def| (def.instr.index(), def.id))
+        .collect::<Vec<_>>();
+    final_defs.sort_unstable();
+    for (start, end, nil_floor) in windows {
         let Some(close_index) = end.checked_sub(1) else {
             continue;
         };
@@ -104,18 +126,18 @@ pub(super) fn collect(
             continue;
         };
         let block = cfg.instr_to_block[start];
-        if depths[start] != 1
-            || cfg.instr_to_block[close_index] != block
+        if cfg.instr_to_block[close_index] != block
             || graph.block_is_cyclic(block)
             || emission.scope_owner(block) != Some(structure.plan().root())
         {
             continue;
         }
-        // 深度为一的非交叉窗口互不重叠；每个窗口内的定义只审理一次。
-        for index in start..close_index {
-            let [output_def] = dataflow.instr_defs[index].as_slice() else {
+        let first = final_defs.partition_point(|(index, _)| *index < start);
+        let last = final_defs.partition_point(|(index, _)| *index < close_index);
+        for &(index, ref output_def) in &final_defs[first..last] {
+            if claimed_outputs.contains(output_def) {
                 continue;
-            };
+            }
             let reg = dataflow.def_reg(*output_def);
             if reg >= close.from || !is_closure_output(proto, dataflow, fixed_temps, start, index) {
                 continue;
@@ -124,8 +146,13 @@ pub(super) fn collect(
             if definitions.last() != Some(output_def) {
                 continue;
             }
-            let before =
-                definitions.partition_point(|&def| dataflow.def_instr(def).index() < start);
+            let before = definitions.partition_point(|&def| {
+                let index = dataflow.def_instr(def).index();
+                index < start
+                    || (index == start
+                        && nil_floor.is_some_and(|floor| reg < floor)
+                        && matches!(proto.instrs[index], LowInstr::LoadNil(_)))
+            });
             let initial_def = before
                 .checked_sub(1)
                 .and_then(|index| definitions.get(index))
@@ -139,12 +166,18 @@ pub(super) fn collect(
             let initial = if let Some(initial_def) = initial_def {
                 let initial_index = dataflow.def_instr(initial_def).index();
                 let initial = fixed_temps[initial_def.index()];
+                // 同一 LOADNIL 可以穿过多个同时开始的窗口；只有位于所有边界之前
+                // 的低槽成员才是函数父级 holder，不能只减去当前窗口的一层深度。
+                let initial_depth = depths[initial_index]
+                    - nil_prefix_floors.get(&initial_index).map_or(0, |floors| {
+                        (floors.len() - floors.partition_point(|&floor| floor <= reg)) as isize
+                    });
                 if initial != TempId(initial_def.index())
                     || aliases.contains(&initial)
                     || !matches!(proto.instrs[initial_index], LowInstr::LoadNil(_))
                     || HomeSlotKey::new(reg.index(), epochs.epoch_at(reg, InstrRef(initial_index)))
                         != home
-                    || depths[initial_index] != 0
+                    || initial_depth != 0
                     || cfg.instr_to_block[initial_index] != block
                     || !emission
                         .regular_prefix(block)
@@ -204,6 +237,7 @@ pub(super) fn collect(
                 output,
                 home,
             });
+            claimed_outputs.insert(*output_def);
         }
     }
     result

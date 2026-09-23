@@ -2,6 +2,13 @@
 -- 观察输出使用每个 VM 自己的源码基线，不假设不同 VM 具有相同的弱根时机。
 -- unluac: expect-not-contains [[if p1_0 then]]
 -- unluac: expect-not-contains [[if a then]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=3]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=7]] [[@dialect=lua5.4]]
+-- unluac: expect-contains [[return left and not first() or right and not methods.second() or methods.fallback()]] [[@dialect=lua5.4]] [[@debug=retained]]
+-- unluac: expect-contains [[trace[#trace + 1] = label .. ":" .. tostring(weak.value ~= nil)]] [[@dialect=lua5.4]] [[@debug=retained]]
+-- unluac: expect-contains [[observe("lookup-" .. key)]] [[@dialect=lua5.4]] [[@debug=retained]]
 local function direct(a,b,first,second,fallback)
     return a and not first() or b and not second() or fallback()
 end
@@ -49,4 +56,8 @@ print("false-first", direct(true,true,falsy,second,fallback))
 print("nil-first", direct(true,true,absent,second,fallback))
 print("false-second", direct(true,true,first,falsy,fallback))
 print("nil-second", direct(true,true,first,absent,fallback))
+print("lookup-false-first", lookup(true,true,falsy,methods))
+print("lookup-nil-first", lookup(true,true,absent,methods))
+print("lookup-false-second", lookup(true,true,first,{second=falsy,fallback=fallback}))
+print("lookup-nil-second", lookup(true,true,first,{second=absent,fallback=fallback}))
 print("trace", table.concat(trace, ","))

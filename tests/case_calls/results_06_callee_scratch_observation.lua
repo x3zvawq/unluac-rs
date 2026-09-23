@@ -8,6 +8,9 @@
 -- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=8]]
 -- 无观察不代表没有后续可见的槽写；下方 post-return 场景要求保留该 COPY。
 -- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=13]] [[@dialect=lua5.4]] [[@debug=stripped]]
+-- 单结果返回帧收回 callee 准备，具名 debug 结果仍保留。
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=27]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=27]] [[@debug=retained]]
 local check, report = assert, print
 local make_counter = setmetatable
 local weak = setmetatable({}, { __mode = "v" })
@@ -129,7 +132,7 @@ end
 local function post_observer()
     local result = missing
     local a, b, c, d = false, false, false, false
-    return result
+    return result, "discarded"
 end
 local function drive_post(fn)
     -- 后续实参覆盖 fresh 的返回残副本，弱表只观察第三个实参的原槽。
@@ -143,7 +146,9 @@ check(results[10] == false and results[11] == true)
 report("terminal-post-return", results[10], results[11])
 
 -- 真正不写任何槽的零参数闭包仍可合并，防止修复退化为全面禁用。
--- unluac: expect-ast-max [[local-decl]] [[0]] [[@proto=30]] [[@dialect=lua5.4]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=30]] [[@dialect=lua5.3]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=30]] [[@dialect=lua5.4]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=30]] [[@dialect=lua5.5]] [[@debug=stripped]]
 local function make_no_write() return function() end end
 local function call_no_write()
     local f = make_no_write()
@@ -159,6 +164,8 @@ local function call_missing_parameter()
     local f = make_missing_parameter()
     f()
 end
-drive_post(call_missing_parameter)
+-- 普通 CALL 的固定单结果不能恢复为尾调用或开放返回，把第二个返回值带出来。
+local first_result, extra_result = drive_post(call_missing_parameter)
+check(first_result ~= nil and extra_result == nil)
 check(results[13] == false)
 report("terminal-missing-parameter", results[13])

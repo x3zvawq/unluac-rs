@@ -1,7 +1,7 @@
 //! 按 Lua 值语义整理 HIR 逻辑表达式和条件。
 //!
 //! 消费 short-circuit/decision 已恢复的表达式与共享值域、安全性事实，消除机械
-//! 重复及 NOT 链；不重新分析 CFG 或改写一般控制结构。
+//! 重复及合成 NOT 链；原字节码的显式运算保留，不重新分析 CFG 或改写一般控制结构。
 //! Lua 的 and/or 返回原操作数，因此 x and x 只有在 x 可稳定重复求值时才可折为 x，
 //! 未知值的偶数 NOT 链仍需保留两层布尔转换。具体恒等式的证明放在对应归约处。
 
@@ -37,7 +37,9 @@ impl LogicalExprPass {
 
 impl HirRewritePass for LogicalExprPass {
     fn rewrite_expr_before_children(&mut self, expr: &mut HirExpr) -> bool {
-        if simplify_boolean_coercion(expr) {
+        if simplify_equality_negation(expr) {
+            true
+        } else if simplify_boolean_coercion(expr) {
             // 先让 walker 消费嵌套转换；下一轮统一压缩 NOT 链，避免每个外层
             // coercion 都重新查询尚未归一的完整 operand 值域。
             true
@@ -50,6 +52,7 @@ impl HirRewritePass for LogicalExprPass {
         let mut changed = false;
 
         if let HirExpr::Binary(binary) = expr
+            && binary.source_site.is_none()
             && let Some(value) =
                 self.safety
                     .primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs)
@@ -59,6 +62,8 @@ impl HirRewritePass for LogicalExprPass {
         }
 
         if let HirExpr::Binary(binary) = expr
+            // 原字节码显式运算即使已知结果也要保留；这里只折叠恢复过程合成的表达式。
+            && binary.source_site.is_none()
             && binary.op == HirBinaryOpKind::Add
             && let Some(value) = luau_literal_addition_value(&binary.lhs, &binary.rhs)
         {
@@ -71,11 +76,6 @@ impl HirRewritePass for LogicalExprPass {
         }
 
         if let Some(replacement) = simplify_logical_shape_with_safety(expr, self.safety) {
-            *expr = replacement;
-            changed = true;
-        }
-        if let Some(replacement) = super::decision::naturalize_pure_logical_expr(expr, self.safety)
-        {
             *expr = replacement;
             changed = true;
         }
@@ -103,15 +103,64 @@ impl HirRewritePass for LogicalExprPass {
     }
 }
 
+/// 相等比较树的合成外层 NOT 可下推为 ~=，保留各叶比较及原短路求值顺序。
+/// 原 NOT 指令不领此许可；一般值叶或有序比较也不按 Boolean/Eq 的源码发射规则处理。
+fn simplify_equality_negation(expr: &mut HirExpr) -> bool {
+    fn equality_tree(expr: &HirExpr) -> bool {
+        match expr {
+            HirExpr::Binary(binary) => binary.op == HirBinaryOpKind::Eq,
+            HirExpr::Unary(unary)
+                if unary.op == HirUnaryOpKind::Not && unary.source_site.is_none() =>
+            {
+                matches!(&unary.expr, HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq)
+            }
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                equality_tree(&logical.lhs) && equality_tree(&logical.rhs)
+            }
+            _ => false,
+        }
+    }
+
+    if !matches!(expr, HirExpr::Unary(unary)
+        if unary.op == HirUnaryOpKind::Not
+            && unary.source_site.is_none()
+            && matches!(unary.expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+            && equality_tree(&unary.expr))
+    {
+        return false;
+    }
+    let HirExpr::Unary(unary) = std::mem::replace(expr, HirExpr::Nil) else {
+        unreachable!()
+    };
+    *expr = normalize_condition_context(unary.expr, true);
+    true
+}
+
 /// 两个分支都返回确切 Boolean 时，统一保留一次求值及布尔转换。
 /// 这不适用于 `x and true` 或 `x or false`，它们仍可能返回 nil/原值。
 /// 原子移动 operand，嵌套转换不反复复制增长的子树。
 fn simplify_boolean_coercion(expr: &mut HirExpr) -> bool {
     if !matches!(expr, HirExpr::LogicalOr(or)
-        if matches!(or.rhs, HirExpr::Boolean(false))
+        if !or.preserves_boolean_prewrite
+            && matches!(or.rhs, HirExpr::Boolean(false))
             && matches!(&or.lhs, HirExpr::LogicalAnd(and)
-                if matches!(and.rhs, HirExpr::Boolean(true))))
+                if !and.preserves_boolean_prewrite && matches!(and.rhs, HirExpr::Boolean(true))))
     {
+        return false;
+    }
+    let HirExpr::LogicalOr(or) = &*expr else {
+        unreachable!()
+    };
+    let HirExpr::LogicalAnd(and) = &or.lhs else {
+        unreachable!()
+    };
+    if !matches!(
+        and.lhs,
+        HirExpr::LocalRef(_) | HirExpr::ParamRef(_) | HirExpr::TempRef(_)
+    ) && !crate::hir::value_facts::value_facts(&and.lhs).is_gc_inert()
+    {
+        // 候选拒绝[ProofIncomplete:RootLifetime]：CALL/读取的结果可能仍占原 scratch；
+        // 双 NOT 会提前覆盖它。无新增准备的绑定读取及 GC-inert 结果不承担此旧根。
         return false;
     }
     let HirExpr::LogicalOr(or) = std::mem::replace(expr, HirExpr::Nil) else {
@@ -139,6 +188,9 @@ fn simplify_value_not_chain(expr: &mut HirExpr) -> bool {
     let mut depth = 0;
     while let HirExpr::Unary(unary) = operand
         && unary.op == HirUnaryOpKind::Not
+        // SemanticBarrier：原 NOT 即使只改变已知 Boolean 的极性也不能按奇偶性删除。
+        // 合成外壳可在原运算边界处停止归约，内层原节点仍由 walker 原样保留。
+        && unary.source_site.is_none()
     {
         depth += 1;
         operand = &unary.expr;
@@ -168,10 +220,22 @@ pub(super) fn simplify_logical_shape_with_safety(
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     match expr {
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical)
+            if logical.preserves_boolean_prewrite
+                || preserves_boolean_prewrite(&logical.lhs)
+                || preserves_boolean_prewrite(&logical.rhs) =>
+        {
+            None
+        }
         HirExpr::LogicalAnd(logical) => simplify_logical_and(&logical.lhs, &logical.rhs, safety),
         HirExpr::LogicalOr(logical) => simplify_logical_or(&logical.lhs, &logical.rhs, safety),
         _ => None,
     }
+}
+
+fn preserves_boolean_prewrite(expr: &HirExpr) -> bool {
+    matches!(expr, HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical)
+        if logical.preserves_boolean_prewrite)
 }
 
 fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
@@ -184,6 +248,7 @@ fn simplify_logical_and(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> 
         // binding 身份比较为 O(1)，不为复合子树引入重复相等性扫描。
         // falsy 路径必须返回原 nil/false；不能把整个表达式折为 false。
         return Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: binding.expr(),
             rhs: HirExpr::Boolean(false),
         })));
@@ -253,9 +318,8 @@ fn simplify_logical_or(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> O
     if let Some(replacement) = naturalize_truthy_ternary(lhs, rhs, safety) {
         return Some(replacement);
     }
-    if let Some(replacement) = factor_shared_and_guards(lhs, rhs, safety) {
-        return Some(replacement);
-    }
+    // SemanticBarrier:ControlFlow：公共 guard 即使是稳定绑定，也仍代表两次原检查；
+    // 此处没有共享 CFG 节点的证明，不能把 (a and b) or (a and c) 提取成一次 a。
     if let Some(replacement) = pull_shared_or_tail(lhs, rhs, safety) {
         return Some(replacement);
     }
@@ -310,7 +374,9 @@ fn naturalize_truthy_ternary(
     }
 
     Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
         lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: guard.expr.clone(),
             rhs: rhs.clone(),
         })),
@@ -360,52 +426,6 @@ fn fold_associative_duplicate_or(
     }
 }
 
-fn factor_shared_and_guards(
-    lhs: &HirExpr,
-    rhs: &HirExpr,
-    safety: HirExprSafety,
-) -> Option<HirExpr> {
-    factor_shared_and_guards_one_side(lhs, rhs, safety)
-}
-
-fn factor_shared_and_guards_one_side(
-    lhs: &HirExpr,
-    rhs: &HirExpr,
-    safety: HirExprSafety,
-) -> Option<HirExpr> {
-    let HirExpr::LogicalAnd(lhs_and) = lhs else {
-        return None;
-    };
-    let HirExpr::LogicalAnd(rhs_and) = rhs else {
-        return None;
-    };
-
-    if lhs_and.lhs == rhs_and.lhs {
-        // 候选拒绝[SemanticBarrier:EvalCount]：`(f() and b) or (f() and c)` 在首个 `f()` falsy 时调用两次，提取后只调用一次。
-        if !safety.is_repeatable_in_single_value_context(&lhs_and.lhs) {
-            return None;
-        }
-        // 候选拒绝[SemanticBarrier:EvalOrder]：若 `b()` 把 captured guard 从 true 改成 false，原式会在 b 后重读并跳过 c，提取 guard 后却会求值 c。
-        // 接受路径[SemanticProof:ShortCircuitReachability]：恒真的 b 执行后外层 or 必定短路，
-        // 第二次 guard 读取不可达；即使 b 会分配新身份，也不需要把它误判成可重复表达式。
-        if !safety.is_effect_invariant_in_single_value_context(&lhs_and.lhs)
-            && expr_truthiness(&lhs_and.rhs, safety) != Some(true)
-            && !safety.is_repeatable_in_single_value_context(&lhs_and.rhs)
-        {
-            return None;
-        }
-        return Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
-            lhs: lhs_and.lhs.clone(),
-            rhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
-                lhs: lhs_and.rhs.clone(),
-                rhs: rhs_and.rhs.clone(),
-            })),
-        })));
-    }
-
-    None
-}
-
 fn pull_shared_or_tail(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
     pull_shared_or_tail_one_side(lhs, rhs, safety)
 }
@@ -445,7 +465,9 @@ fn pull_shared_or_tail_one_side(
     let shared_tail = merge_alternative_tail(rhs, &inner_or.rhs)?;
 
     Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
         lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: lhs_and.lhs.clone(),
             rhs: inner_or.lhs.clone(),
         })),
@@ -461,9 +483,9 @@ fn fold_constant_short_circuit_and(
 ) -> Option<HirExpr> {
     match expr_truthiness(lhs, safety) {
         Some(true) if safety.is_discard_safe(lhs) => Some(rhs.clone()),
-        Some(false) => Some(lhs.clone()),
+        Some(false) if safety.is_discard_safe(lhs) => Some(lhs.clone()),
         // 候选拒绝[SemanticBarrier:EvalCount]：已知 truthy 的 `{ f() }` 仍不可删除，否则字段表达式中的一次 `f()` 消失。
-        Some(true) => None,
+        Some(true) | Some(false) => None,
         None => None,
     }
 }
@@ -474,10 +496,10 @@ fn fold_constant_short_circuit_or(
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     match expr_truthiness(lhs, safety) {
-        Some(true) => Some(lhs.clone()),
+        Some(true) if safety.is_discard_safe(lhs) => Some(lhs.clone()),
         Some(false) if safety.is_discard_safe(lhs) => Some(rhs.clone()),
         // 候选拒绝[SemanticBarrier:EvalCount]：已知 falsy 但不可丢弃的 lhs 仍必须求值一次，不能直接选 rhs。
-        Some(false) => None,
+        Some(false) | Some(true) => None,
         None => None,
     }
 }
@@ -526,6 +548,7 @@ fn fold_prefixed_shared_fallback_or(
         return None;
     };
     let prefix = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
         lhs: lhs.clone(),
         rhs: rhs_or.lhs.clone(),
     }));
@@ -546,6 +569,13 @@ pub(super) fn simplify_condition_truthiness_shape_with_safety(
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let replacement = match expr {
+        HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical)
+            if logical.preserves_boolean_prewrite
+                || preserves_boolean_prewrite(&logical.lhs)
+                || preserves_boolean_prewrite(&logical.rhs) =>
+        {
+            return None;
+        }
         HirExpr::LogicalAnd(logical) => {
             simplify_condition_logical_and(&logical.lhs, &logical.rhs, safety)
         }
@@ -571,6 +601,7 @@ pub(super) fn simplify_condition_truthiness_shape_with_safety(
 /// 只沿 and/or/not 条件骨架计算，不把调用参数或索引操作数中的 NOT 当作条件极性成本。
 pub(super) fn condition_not_costs(expr: &HirExpr) -> [usize; 2] {
     match expr {
+        _ if preserves_boolean_prewrite(expr) => [0, 1],
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
             let [positive, negative] = condition_not_costs(&unary.expr);
             [negative, positive]
@@ -592,6 +623,10 @@ pub(super) fn condition_not_costs(expr: &HirExpr) -> [usize; 2] {
 /// 移交已选定方向的条件规范形；复用逻辑节点，不为未选方向或未变化的条件复制操作数。
 /// De Morgan 只沿 and/or/not 下推，保持 lhs、rhs 顺序；原子反形仍通过 negate 表达。
 pub(super) fn normalize_condition_context(expr: HirExpr, negated: bool) -> HirExpr {
+    // 原预写与其 TEST 是完整值帧；极性变换只能包住它，不能拆开内部的 and/or。
+    if preserves_boolean_prewrite(&expr) {
+        return if negated { expr.negate() } else { expr };
+    }
     let is_and = matches!(expr, HirExpr::LogicalAnd(_));
     match expr {
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
@@ -613,11 +648,13 @@ pub(super) fn normalize_condition_context(expr: HirExpr, negated: bool) -> HirEx
 
 pub(super) fn condition_needs_normalization(expr: &HirExpr) -> bool {
     match expr {
+        _ if preserves_boolean_prewrite(expr) => false,
         HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
             matches!(
                 &unary.expr,
                 HirExpr::Unary(inner) if inner.op == HirUnaryOpKind::Not
-            ) || matches!(&unary.expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+            ) || (matches!(&unary.expr, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+                && !preserves_boolean_prewrite(&unary.expr))
         }
         HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
             condition_needs_normalization(&logical.lhs)
@@ -707,7 +744,9 @@ fn factor_condition_shared_and_tail(
     // 首臂一旦到达 tail 就令外层 or 短路，因此不会删除 b，也不会重复求值 tail。
 
     Some(HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
         lhs: HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: lhs_and.lhs.clone(),
             rhs: rhs_and.lhs.clone(),
         })),
@@ -736,8 +775,10 @@ fn absorb_stable_or_guard(lhs: &HirExpr, rhs: &HirExpr, safety: HirExprSafety) -
     }
 
     Some(HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
         lhs: lhs.clone(),
         rhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: inner_or.rhs.clone(),
             rhs: and_expr.rhs.clone(),
         })),

@@ -55,10 +55,14 @@ pub(super) fn collect_captured_temp_facts(input: CapturedTempFactsInput<'_>) -> 
     };
     let mut decl_temps = BTreeMap::new();
     let mut empty_decls = BTreeMap::<usize, Vec<LocalId>>::new();
+    if !captured_slots.closed_entry_local_decls.is_empty() {
+        empty_decls.insert(0, captured_slots.closed_entry_local_decls.clone());
+    }
     let mut declared_locals = captured_slots
         .entry_local_decls
         .iter()
         .chain(captured_slots.region_local_decls.values().flatten())
+        .chain(&captured_slots.closed_entry_local_decls)
         .copied()
         .collect::<BTreeSet<_>>();
     for (instr_index, instr) in proto.instrs.iter().enumerate() {

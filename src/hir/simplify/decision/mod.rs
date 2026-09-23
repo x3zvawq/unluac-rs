@@ -33,19 +33,28 @@ pub(super) fn simplify_decision_exprs_in_proto(
     rewrite_proto(proto, &mut DecisionExprPass { safety })
 }
 
-/// 把前面保留在 HIR 内部的 `Decision` 彻底消掉。
-///
-/// `Decision` 只应该是 HIR 内部为了保住共享短路子图而暂存的过渡节点；一旦进入最终
-/// HIR 输出，它就应该已经被重新线性化成普通 `if/local/assign` 或纯表达式，避免把
-/// 共享图的语义恢复继续后移给 AST。
+/// 消除未签发的 Decision；完整源码帧已证明的 Luau if 表达式留给 AST 机械降低。
+/// 共享图的语义恢复必须在 HIR 完成，AST 不承担决策或帧证明。
 pub(crate) use eliminate::eliminate_remaining_decisions_in_proto;
-pub(crate) use synthesize::{expr_cost, naturalize_pure_logical_expr};
+pub(crate) use synthesize::expr_cost;
 
 struct DecisionExprPass {
     safety: HirExprSafety,
 }
 
 impl HirRewritePass for DecisionExprPass {
+    fn rewrite_condition_expr_before_children(&mut self, expr: &mut HirExpr) -> bool {
+        if let HirExpr::Decision(decision) = expr
+            && !decision.emit_as_luau_if
+            && let Some(replacement) =
+                short_circuit::collapse_condition_graph(&analyze_decision(decision), self.safety)
+        {
+            *expr = replacement;
+            return true;
+        }
+        false
+    }
+
     fn rewrite_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut decision_replacement = None;
         let mut changed = false;
@@ -66,6 +75,7 @@ impl HirRewritePass for DecisionExprPass {
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
         let mut changed = false;
         if let HirExpr::Decision(decision) = expr
+            && !decision.emit_as_luau_if
             && let Some(replacement) =
                 collapse_condition_decision_expr(&analyze_decision(decision), self.safety)
         {
@@ -80,6 +90,9 @@ fn simplify_decision_expr(
     decision: &mut HirDecisionExpr,
     safety: HirExprSafety,
 ) -> (bool, Option<HirExpr>) {
+    if decision.emit_as_luau_if {
+        return (false, None);
+    }
     let Some(reduced) = reduce_decision_expr(decision, safety) else {
         return (false, None);
     };
@@ -113,11 +126,45 @@ fn reduce_decision_expr(
     let mut nodes = decision.nodes.clone();
     let mut replacements = vec![None; nodes.len()];
     let mut changed = false;
+    let mut linear_nodes = vec![false; nodes.len()];
+    let mut consumed = vec![false; nodes.len()];
+    if !topology.has_shared_nodes() {
+        for node in topology.topological_nodes().rev() {
+            linear_nodes[node.id.index()] = match (&node.truthy, &node.falsy) {
+                (HirDecisionTarget::CurrentValue, HirDecisionTarget::Expr(_))
+                | (HirDecisionTarget::Expr(_), HirDecisionTarget::CurrentValue)
+                | (HirDecisionTarget::CurrentValue, HirDecisionTarget::CurrentValue) => true,
+                (HirDecisionTarget::CurrentValue, HirDecisionTarget::Node(next))
+                | (HirDecisionTarget::Node(next), HirDecisionTarget::CurrentValue) => {
+                    linear_nodes[next.index()]
+                }
+                _ => false,
+            };
+        }
+        // 外层一般条件选择不能折成 and/or，其内部的短路值链仍可独立恢复。
+        // CurrentValue 保留本次 test 的值和后继求值顺序，不重测父 guard；每条
+        // 最大链只消费一次，避免从每个节点重复扫描或复制不断增长的后缀表达式。
+        for node in topology.topological_nodes() {
+            if !linear_nodes[node.id.index()] || consumed[node.id.index()] {
+                continue;
+            }
+            let expr = collapse_linear_value_chain_with(node.id, |next| {
+                consumed[next.index()] = true;
+                Some(decision.nodes[next.index()].clone())
+            })
+            .expect("linear Decision chain must have a value exit");
+            replacements[node.id.index()] = Some(ResolvedDecisionTarget::Expr(expr));
+            changed = true;
+        }
+    }
 
     // arena 重编号只保留稠密身份，不保证拓扑顺序；共享 tail 必须先于所有父节点归约。
     for original in topology.topological_nodes().rev() {
         let node_ref = original.id;
         let index = node_ref.index();
+        if consumed[index] {
+            continue;
+        }
         let node = &nodes[index];
 
         let truthy = reduce_target(&replacements, &node.truthy);
@@ -267,6 +314,7 @@ fn rebuild_decision(
 
     (
         HirDecisionExpr {
+            emit_as_luau_if: false,
             entry: HirDecisionNodeRef(0),
             nodes: rebuilt_nodes,
         },
@@ -366,6 +414,20 @@ fn collapse_linear_value_chain_with(
             }
             (HirDecisionTarget::Node(next), HirDecisionTarget::CurrentValue) => {
                 steps.push((LinearValueOp::And, node.test));
+                current = next;
+            }
+            (HirDecisionTarget::Node(next), HirDecisionTarget::Expr(HirExpr::Boolean(false)))
+                if expr_is_boolean_valued(&node.test) =>
+            {
+                // 原比较已产生 Boolean，false 出口可由 and 承载；不要求比较可重复，
+                // 也不复制其求值。归一化后的外层极性不能因这个显式出口退回原 DAG。
+                steps.push((LinearValueOp::And, node.test));
+                current = next;
+            }
+            (HirDecisionTarget::Expr(HirExpr::Boolean(true)), HirDecisionTarget::Node(next))
+                if expr_is_boolean_valued(&node.test) =>
+            {
+                steps.push((LinearValueOp::Or, node.test));
                 current = next;
             }
             (HirDecisionTarget::CurrentValue, HirDecisionTarget::Expr(expr)) => {
@@ -529,11 +591,40 @@ fn collapse_value_target(
 }
 
 fn combine_value_expr(
-    subject: HirExpr,
-    truthy: CollapsedValueTarget,
-    falsy: CollapsedValueTarget,
+    mut subject: HirExpr,
+    mut truthy: CollapsedValueTarget,
+    mut falsy: CollapsedValueTarget,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
+    // `not call() and value` 的 Boolean guard 已可直接承载任意假值；若翻成
+    // call() ? false : value，Lua 无法在一般 value 上用 and/or 表达这组三元值。
+    // 两侧均为一般值可交后续因式恢复，两个 Boolean 出口则有单次求值的物化形式。
+    let is_boolean_target = |target: &CollapsedValueTarget| {
+        matches!(
+            target,
+            CollapsedValueTarget::CurrentValue | CollapsedValueTarget::Expr(HirExpr::Boolean(_))
+        )
+    };
+    let normalize_polarity = is_boolean_target(&truthy) == is_boolean_target(&falsy);
+    // 控制极性的合成 NOT 不是原 VM 的值写入。先交换出口，避免把 TEST 的
+    // Boolean 合流变成双 NOT，提前覆盖仍可能被下一次 GC 观察到的操作数根。
+    while normalize_polarity
+        && matches!(&subject, HirExpr::Unary(unary)
+        if unary.op == crate::hir::HirUnaryOpKind::Not && unary.source_site.is_none())
+    {
+        // CurrentValue 指被测试的 NOT 结果；翻转极性后不能误指向原操作数。
+        if matches!(truthy, CollapsedValueTarget::CurrentValue) {
+            truthy = CollapsedValueTarget::Expr(HirExpr::Boolean(true));
+        }
+        if matches!(falsy, CollapsedValueTarget::CurrentValue) {
+            falsy = CollapsedValueTarget::Expr(HirExpr::Boolean(false));
+        }
+        let HirExpr::Unary(unary) = subject else {
+            unreachable!()
+        };
+        subject = unary.expr;
+        std::mem::swap(&mut truthy, &mut falsy);
+    }
     let truthy = normalize_collapsed_target(&subject, truthy, safety);
     let falsy = normalize_collapsed_target(&subject, falsy, safety);
 
@@ -559,24 +650,18 @@ fn combine_value_expr(
             {
                 return Some(subject);
             }
-            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
-                if expr_is_boolean_valued(lhs) && is_false(rhs) =>
-            {
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs)) if is_false(rhs) => {
+                // subject 已是 Boolean，false 分支可直接由 and 承载；选中的值臂
+                // 可以返回 nil、对象或任意值。这里不重复 test，也不删除原 false 出口。
                 return Some(logical_and(subject, lhs.clone()));
             }
-            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
-                if is_true(lhs) && expr_is_boolean_valued(rhs) =>
-            {
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs)) if is_true(lhs) => {
                 return Some(logical_or(subject, rhs.clone()));
             }
-            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
-                if is_false(lhs) && expr_is_boolean_valued(rhs) =>
-            {
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs)) if is_false(lhs) => {
                 return Some(logical_and(subject.negate(), rhs.clone()));
             }
-            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs))
-                if expr_is_boolean_valued(lhs) && is_true(rhs) =>
-            {
+            (CollapsedValueTarget::Expr(lhs), CollapsedValueTarget::Expr(rhs)) if is_true(rhs) => {
                 return Some(logical_or(subject.negate(), lhs.clone()));
             }
             _ => {}
@@ -640,6 +725,10 @@ pub(in crate::hir) fn collapse_condition_decision_expr(
     topology: &DecisionFacts<'_>,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
+    // 先按原连边消费串并联子图，避免树化共享 continuation 后合成重复 guard。
+    if let Some(expr) = short_circuit::collapse_condition_graph(topology, safety) {
+        return Some(expr);
+    }
     let decision = topology.decision();
 
     let mut memo = BTreeMap::new();

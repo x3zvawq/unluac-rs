@@ -139,6 +139,19 @@ fn loop_header_rhs_is_invariant(
     }
 
     match value {
+        AstExpr::IfExpr(branch) => [&branch.cond, &branch.then_expr, &branch.else_expr]
+            .into_iter()
+            .all(|expr| {
+                loop_header_rhs_is_invariant(
+                    expr,
+                    removed_values,
+                    loop_stmt_index,
+                    target,
+                    mutable_snapshots,
+                    write_index,
+                    visiting,
+                )
+            }),
         AstExpr::Var(name) => {
             if let Some(binding) = AstBindingRef::from_name_ref(name)
                 && let Some(candidate_value) = removed_values.get(&binding)
@@ -335,6 +348,19 @@ impl EvalPrefixCollector<'_> {
         }
 
         match value {
+            AstExpr::IfExpr(branch) => {
+                self.expr(&branch.cond, mode);
+                if matches!(mode, WalkMode::Dependency)
+                    && [&branch.then_expr, &branch.else_expr]
+                        .into_iter()
+                        .any(|arm| {
+                            expr_has_binding_read(arm, |binding| self.values.contains_key(&binding))
+                        })
+                {
+                    // 必达 producer 不能搬进条件选择的一臂；condition 仍在原位置求值。
+                    self.barrier();
+                }
+            }
             AstExpr::FieldAccess(access) => self.expr(&access.base, mode),
             AstExpr::IndexAccess(access) => {
                 self.expr(&access.base, mode);

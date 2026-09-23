@@ -1,4 +1,6 @@
--- 布尔值拥有合法 __call；callee 依赖链必须在同一相邻内联入口批量提交。
+-- 布尔值拥有合法 __call；保留原本逐次写回的 NOT，不增加 callee 中转声明。
+-- unluac: expect-count [[ = not ]] [[64]]
+-- unluac: expect-ast-count [[local-binding]] [[3]]
 local function check(value)
  value=not value; value=not value; value=not value; value=not value
  value=not value; value=not value; value=not value; value=not value

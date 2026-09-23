@@ -9,6 +9,7 @@
 //! 其余成员归 `Unstructured`，每条 CFG edge 同时得到唯一 owner。
 
 mod arena;
+mod branch_initializers;
 mod cleanup;
 mod finalize;
 mod loop_protocol;
@@ -29,7 +30,7 @@ pub use terminator::{BlockTerminatorKind, BlockTerminatorPlan};
 pub(in crate::structure) use value::loop_carried_input;
 pub use value::{LoopCarriedPhi, PhiIncomingDisposition, PhiIncomingPlan, PhiPlan};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::common::ResidualTransferEvidence;
 pub use super::error::StructureError;
@@ -645,6 +646,61 @@ pub struct ValueDecisionLeafPlan {
     pub physical_value: SsaValue,
 }
 
+/// 内嵌取值表达式与外层共用物理节点；nodes 只记录直接归属，避免逐层复制子图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueDecisionOperandPlan {
+    pub phi: crate::structure::PhiId,
+    pub entry: ValueDecisionNodeId,
+    pub continuation: ValueDecisionNodeId,
+    pub consumer: ValueDecisionNodeId,
+    pub nodes: Vec<ValueDecisionNodeId>,
+    pub leaves: BTreeMap<EdgeRef, SsaValue>,
+    /// 叶值复用对应谓词的本次求值，包含 Luau 结果槽的透明 MOVE。
+    pub current_values: BTreeSet<(ValueDecisionNodeId, EdgeRef)>,
+}
+
+impl ValueDecisionOperandPlan {
+    fn proven_current_values(
+        &self,
+        proto: &LoweredProto,
+        dataflow: &DataflowFacts,
+        nodes: &[ValueDecisionNodePlan],
+    ) -> Option<BTreeSet<(ValueDecisionNodeId, EdgeRef)>> {
+        let result_reg = dataflow.phi_candidate(self.phi)?.reg;
+        let mut current = BTreeSet::new();
+        for id in &self.nodes {
+            let node = nodes.get(id.index())?;
+            let crate::transformer::LowInstr::Branch(predicate) =
+                proto.instrs.get(node.predicate.index())?
+            else {
+                return None;
+            };
+            for arc in [&node.truthy, &node.falsy] {
+                let edge = *arc.route.last()?;
+                let Some(&value) = self.leaves.get(&edge) else {
+                    continue;
+                };
+                let latest = match value {
+                    SsaValue::Def(def) => Some(def),
+                    _ => None,
+                };
+                if value_leaf_is_current(
+                    proto,
+                    dataflow,
+                    node.predicate,
+                    predicate,
+                    result_reg,
+                    value,
+                    latest,
+                ) {
+                    current.insert((*id, edge));
+                }
+            }
+        }
+        Some(current)
+    }
+}
+
 /// value-merge short-circuit 的最终、稠密执行计划。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueDecisionPlan {
@@ -661,6 +717,8 @@ pub struct ValueDecisionPlan {
     pub result_phi: crate::structure::PhiId,
     /// decision 内部被表达式 DAG 一并消去的中间 phi；按 PhiId 严格递增。
     pub absorbed_phis: Vec<crate::structure::PhiId>,
+    /// 按 phi 排序，消费者可直接定位内部操作数而不逐 phi 扫描整个 DAG。
+    pub operands: Vec<ValueDecisionOperandPlan>,
     pub result_reg: crate::transformer::Reg,
     /// 最终互斥域内，仅 result_reg 的原 Call test epoch 可查询的无观察覆盖前沿。
     pub call_root_frontiers: crate::structure::RootOverwriteFrontiers,
@@ -697,6 +755,7 @@ pub(super) struct ConditionPlanInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ValueDecisionPlanInput {
     pub(super) candidate: ShortCircuitCandidate,
+    pub(super) operands: Vec<ValueDecisionOperandPlan>,
 }
 
 /// 已移入最终计划的 mixed-lowering island payload。

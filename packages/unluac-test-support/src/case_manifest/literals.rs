@@ -68,7 +68,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_literals/vector_01_boolean_shell_luau_vector_old_value.lua",
         &["boolean-shell", "vector"],
-        "证明Luau vector常量归proto所有，可删除被覆写槽的dead shell。",
+        "Luau vector 常量归 proto 所有，但未使用的布尔写回仍保留原检查。",
         &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_VECTOR_OPTIONS)],
     ),
     LuaCaseDefinition::new(
@@ -80,7 +80,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_literals/truthiness_01_literal_not_truthiness.lua",
         &["alias-cleanup", "literal", "not"],
-        "验证alias清理暴露出truthy字面量后，机械not壳直接折叠为false。",
+        "验证alias清理保留原NOT，区分Luau在编译阶段已经折叠的常量结果。",
         &[LuaCaseConfiguration::new(ALL_DIALECTS)],
     ),
     LuaCaseDefinition::new(

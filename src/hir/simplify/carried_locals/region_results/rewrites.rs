@@ -579,6 +579,10 @@ fn rewrite_boundary_assignment_reads(
         })
         .collect::<Vec<_>>();
     let mut scratch = HirStmt::Assign(Box::new(HirAssign {
+        luau_compound_global: false,
+        upvalue_write_source: None,
+        is_phi_transfer: false,
+        parallel_nil_frame: None,
         targets: retained_indices
             .iter()
             .map(|index| original_targets[*index].clone())

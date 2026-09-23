@@ -1,4 +1,4 @@
-//! 汇总 if/else 合流后的必写 temp，供 locals 建立稳定绑定。
+//! 汇总 if/else 合流和直线词法块输出的必写 temp，供 locals 建立稳定绑定。
 //!
 //! 消费 HirFlowGraph、当前 HIR 事件和 RootEventBlock，只计算 must-write 与
 //! read-before-def，不自行解析控制边，也不分配 local 或改写语句。
@@ -28,32 +28,58 @@ pub(super) fn candidate_temps(
     is_reserved: &dyn Fn(TempId) -> bool,
     safety: HirExprSafety,
 ) -> Vec<TempId> {
-    let HirStmt::If(if_stmt) = stmt else {
-        return Vec::new();
+    let (summaries, condition_reads) = match stmt {
+        HirStmt::If(if_stmt) => {
+            let Some(else_block) = &if_stmt.else_block else {
+                return Vec::new();
+            };
+            (
+                vec![
+                    summarize_block_fallthrough_assignments(&if_stmt.then_block, safety),
+                    summarize_block_fallthrough_assignments(else_block, safety),
+                ],
+                collect_temp_refs_in_expr(&if_stmt.cond),
+            )
+        }
+        HirStmt::Block(block)
+            if block.stmts.iter().all(|stmt| {
+                matches!(
+                    stmt,
+                    HirStmt::Assign(_)
+                        | HirStmt::LocalDecl(_)
+                        | HirStmt::CallStmt(_)
+                        | HirStmt::LocalRootRelease(_)
+                )
+            }) =>
+        {
+            // CLOSE 包围的直线区间也可向外写回结果。声明放在块前，避免 AST
+            // 在函数入口补全所有输出 temp 后改变此前的源码槽布局。仅扫描直线
+            // 子块，嵌套控制流继续由自身 owner 处理，不逐层重扫整棵子树。
+            (
+                vec![summarize_block_fallthrough_assignments(block, safety)],
+                BTreeSet::new(),
+            )
+        }
+        _ => return Vec::new(),
     };
-    let Some(else_block) = &if_stmt.else_block else {
-        return Vec::new();
-    };
-
-    let then_summary = summarize_block_fallthrough_assignments(&if_stmt.then_block, safety);
-    let else_summary = summarize_block_fallthrough_assignments(else_block, safety);
-    if matches!(then_summary, Err(RegionCfgFailure::ExternalGoto))
-        || matches!(else_summary, Err(RegionCfgFailure::ExternalGoto))
+    if summaries
+        .iter()
+        .any(|summary| matches!(summary, Err(RegionCfgFailure::ExternalGoto)))
     {
         // 候选拒绝[SemanticBarrier:ControlFlow]：`if c then goto L else t=1 end;
         // ::L:: use(t)` 的 arm 外 goto 可能重入当前 if 的外层后缀；这里没有目标边，
         // 若把该路径当成终止路径会凭另一 arm 的写入错误物化 branch local。
         return Vec::new();
     }
-    let then_summary = then_summary.expect("HIR label ids must be unique within a branch region");
-    let else_summary = else_summary.expect("HIR label ids must be unique within a branch region");
-    let Some(common_temps) = intersect_fallthrough_assignment_sets([&then_summary, &else_summary])
-    else {
+    let summaries = summaries
+        .into_iter()
+        .map(|summary| summary.expect("HIR label ids must be unique within a branch region"))
+        .collect::<Vec<_>>();
+    let Some(common_temps) = intersect_fallthrough_assignment_sets(summaries.iter()) else {
         return Vec::new();
     };
-    let condition_reads = collect_temp_refs_in_expr(&if_stmt.cond);
-    let reads_before_assignment = [&then_summary, &else_summary]
-        .into_iter()
+    let reads_before_assignment = summaries
+        .iter()
         .flat_map(|summary| summary.reads_before_assignment.iter())
         .copied()
         .chain(condition_reads)

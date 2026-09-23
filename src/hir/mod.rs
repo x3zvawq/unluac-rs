@@ -5,10 +5,10 @@
 
 mod analyze;
 mod common;
-pub(crate) use common::HirRequiredLuauInlining;
+pub(crate) use common::{HirLuauInliningBody, HirSourceSite, luau_loop_unroll_blocked};
 #[cfg(feature = "decompile-debug")]
 mod debug;
-mod decision;
+pub(crate) mod decision;
 mod emission;
 mod error;
 mod expr_safety;

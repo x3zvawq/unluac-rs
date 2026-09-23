@@ -362,10 +362,12 @@ impl AstVisitor for GlobalFactsCollector {
                     } else {
                         self.nested_written_here.insert(name.to_owned());
                     }
-                } else if self.function_depth == 0
-                    && let Some(name) = global_function_root_read(function_decl)
-                {
-                    self.note_observation(name, GlobalObservationKind::Read);
+                } else if let Some((name, kind)) = global_function_access(function_decl) {
+                    if self.function_depth == 0 {
+                        self.note_observation(name, kind);
+                    } else if kind == GlobalObservationKind::Write {
+                        self.nested_written_here.insert(name.to_owned());
+                    }
                 }
             }
             AstStmt::LocalDecl(_)
@@ -437,15 +439,28 @@ impl AstVisitor for GlobalFactsCollector {
 }
 
 fn global_declared_name(function_decl: &AstFunctionDecl) -> Option<&str> {
+    if !function_decl.global_declaration {
+        return None;
+    }
     match visit::function_target_name(&function_decl.target) {
         (AstNameRef::Global(global), NameAccess::Write) => Some(global.text.as_str()),
         _ => None,
     }
 }
 
-fn global_function_root_read(function_decl: &AstFunctionDecl) -> Option<&str> {
+fn global_function_access(
+    function_decl: &AstFunctionDecl,
+) -> Option<(&str, GlobalObservationKind)> {
+    if function_decl.global_declaration {
+        return None;
+    }
     match visit::function_target_name(&function_decl.target) {
-        (AstNameRef::Global(global), NameAccess::Read) => Some(global.text.as_str()),
+        (AstNameRef::Global(global), NameAccess::Read) => {
+            Some((global.text.as_str(), GlobalObservationKind::Read))
+        }
+        (AstNameRef::Global(global), NameAccess::Write) => {
+            Some((global.text.as_str(), GlobalObservationKind::Write))
+        }
         _ => None,
     }
 }
@@ -549,8 +564,8 @@ impl<F: FnMut(bool)> AstVisitor for GlobalPermissionVisitor<'_, F> {
                 self.repeat_body_pending = true;
             }
             AstStmt::FunctionDecl(decl) => {
-                if let Some(name) = global_function_root_read(decl) {
-                    self.access(name, GlobalObservationKind::Read);
+                if let Some((name, kind)) = global_function_access(decl) {
+                    self.access(name, kind);
                 }
             }
             _ => {}

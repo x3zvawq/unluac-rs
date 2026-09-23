@@ -6,6 +6,7 @@ pub(super) fn selected_value_decisions(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
+    graph_facts: &GraphFacts,
     loops: &[LoopCandidate],
     residual_transfers: &[ResidualTransferEvidence],
     candidates: &[ShortCircuitCandidate],
@@ -91,11 +92,27 @@ pub(super) fn selected_value_decisions(
             break;
         }
     }
+    let by_phi = selected
+        .iter()
+        .flatten()
+        .map(|(_, candidate)| *candidate)
+        .filter_map(|candidate| candidate.result_phi_id.map(|phi| (phi, candidate)))
+        .collect::<BTreeMap<_, _>>();
     selected
         .into_iter()
         .flatten()
-        .map(|(_, candidate)| ValueDecisionPlanInput {
-            candidate: candidate.clone(),
+        .filter(|(_, candidate)| !candidate.is_value_operand_only())
+        .filter_map(|(_, candidate)| {
+            Some(ValueDecisionPlanInput {
+                operands: super::value_operands::select_operands(
+                    cfg,
+                    dataflow,
+                    graph_facts,
+                    candidate,
+                    &by_phi,
+                )?,
+                candidate: candidate.clone(),
+            })
         })
         .collect()
 }

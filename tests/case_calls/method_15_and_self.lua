@@ -1,5 +1,7 @@
 -- common_09_method_and_self#1: 方法语法糖(:)
 -- unluac: expect-contains [[:add(3):add(2):read()]]
+-- unluac: expect-ast-count [[local-binding]] [[14]]
+-- unluac: expect-ast-count [[if]] [[0]]
 local function test_method_sugar()
     local obj = {
         value = 4,

@@ -1,6 +1,13 @@
 -- HIR captures and AST-created installer bindings keep separate identities.
 -- unluac: expect-not-contains [[(function(]]
 -- unluac: expect-ast-count [[function]] [[7]]
+-- 原固定结果直接写回已有绑定，后继 CALL 复用同槽不能污染这次写回的证明。
+-- unluac: expect-contains [[token, remembered, count, value = exported.first(3)]] [[@debug=retained]]
+-- unluac: expect-contains [[token, remembered, value = exported.second()]] [[@debug=retained]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[14]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=1]]
+-- unluac: expect-contains [[debug.getinfo(2, "f").func] = true]]
 
 local exported = {}
 local weak_installers = setmetatable({}, { __mode = "k" })

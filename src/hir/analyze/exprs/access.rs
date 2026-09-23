@@ -110,6 +110,7 @@ pub(crate) fn lower_raw_table_set_call(
 ) -> HirCallExpr {
     // 同 raw read，不把 VM primitive 伪装成会触发 `__newindex` 的普通赋值。
     HirCallExpr {
+        required_luau_inlining: None,
         source_site: None,
         argument_roots: Vec::new(),
         frame_root_ends: Vec::new(),
@@ -126,6 +127,7 @@ pub(crate) fn lower_raw_table_set_call(
         callee_root_handoff: None,
         method_rewrite_transaction: None,
         plain_method_syntax: false,
+        boolean_prewrite_arguments: Vec::new(),
     }
 }
 
@@ -138,7 +140,12 @@ pub(crate) fn lower_table_access_target(
 ) -> HirLValue {
     if let Some(key) = global_key_for_access(lowering, block, instr_ref, base, key) {
         return HirLValue::Global(HirGlobalRef {
-            sources: Default::default(),
+            sources: crate::hir::common::HirOperationSources::Single(
+                crate::hir::common::HirSourceSite {
+                    proto: lowering.id,
+                    instr: instr_ref,
+                },
+            ),
             key,
         });
     }
@@ -295,6 +302,7 @@ pub(crate) fn lower_raw_table_get_expr_single_eval(
 
 fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
     HirExpr::Call(Box::new(HirCallExpr {
+        required_luau_inlining: None,
         source_site: None,
         argument_roots: Vec::new(),
         frame_root_ends: Vec::new(),
@@ -306,6 +314,7 @@ fn raw_table_get_expr(base: HirExpr, key: HirExpr) -> HirExpr {
         callee_root_handoff: None,
         method_rewrite_transaction: None,
         plain_method_syntax: false,
+        boolean_prewrite_arguments: Vec::new(),
     }))
 }
 

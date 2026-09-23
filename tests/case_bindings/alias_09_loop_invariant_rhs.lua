@@ -6,8 +6,10 @@
 -- unluac: expect-contains [[local r2_1 = p2_0]]
 -- unluac: expect-ast-count [[while]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat]] [[1]] [[@proto=2]]
--- unluac: expect-ast-max [[local-decl]] [[5]] [[@proto=1]]
--- unluac: expect-ast-max [[local-decl]] [[5]] [[@proto=2]]
+-- unluac: expect-ast-max [[local-decl]] [[4]] [[@proto=1]]
+-- unluac: expect-ast-max [[local-decl]] [[4]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=5]]
+-- unluac: expect-contains [[+ 1] = type(]]
 
 local function stable_while(flag)
     local count = 0

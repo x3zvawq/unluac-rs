@@ -369,8 +369,12 @@ impl BindingOccurrenceIndex {
                             .get(*binding)
                             .copied()
                             .unwrap_or_default()
+                        // 同槽未来 cell 不拥有当前 fixed 值；实际捕获的 binding
+                        // 已在上方保护，原写入时开放的 cell 仍由 home 屏障保留。
                         || binding_home_slot(*binding, promotion_facts)
                             .is_some_and(|slot| reference_captured_home_slots.contains(&slot))
+                            && !matches!(binding, TableBinding::Temp(temp)
+                                if promotion_facts.temp_definition_reference_unaliased(*temp))
                 })
                 .collect(),
         };

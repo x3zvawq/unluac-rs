@@ -4,7 +4,8 @@
 -- unluac: expect-contains [[while p1_0 do]]
 -- unluac: expect-not-contains [[local r1_0 = p1_0]]
 -- unluac: expect-contains [[local r2_0 = p2_0]]
--- unluac: expect-contains [[local r3_1 = p3_0]]
+-- unluac: expect-count [[= p3_0]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=3]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved(multi-value use]]
 

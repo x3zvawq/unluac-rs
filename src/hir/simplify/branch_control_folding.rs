@@ -81,6 +81,12 @@ struct BranchControlPass<'a> {
 }
 
 impl HirRewritePass for BranchControlPass<'_> {
+    fn rewrite_stmt_before_children(&mut self, stmt: &mut HirStmt) -> bool {
+        // 循环入口 guard 属于 while 条件；先恢复这个归属，否则子块的常量
+        // 化简会把 `if not false then break end` 变成裸 break，丢失条件形状。
+        fold_leading_while_break_guard(stmt)
+    }
+
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let constant_changed = fold_constant_control(
             &mut block.stmts,
@@ -90,8 +96,10 @@ impl HirRewritePass for BranchControlPass<'_> {
             self.promotion_facts,
             &mut self.read_alternatives,
         );
-        let common_tail_changed = sink_common_direct_copy_tails(&mut block.stmts);
+        let common_tail_changed = sink_common_branch_tails(&mut block.stmts);
+        let return_guard_changed = fold_negated_return_goto_guards(&mut block.stmts);
         let leading_escape_changed = fold_leading_branch_escapes(&mut block.stmts);
+        let shared_goto_changed = fold_same_target_goto_guards(&mut block.stmts);
         let adjacent_goto_changed = fold_adjacent_conditional_gotos(&mut block.stmts);
         let empty_changed =
             remove_discard_safe_empty_ifs(&mut block.stmts, self.safety, self.primitive_locals);
@@ -111,6 +119,12 @@ impl HirRewritePass for BranchControlPass<'_> {
                 continue;
             };
             for arm in std::iter::once(&mut branch.then_block).chain(branch.else_block.iter_mut()) {
+                if matches!(arm.stmts.last(), Some(HirStmt::Goto(goto)) if goto.target == target) {
+                    // 分支尾到紧随 if 的同一 label 已是 fallthrough；只去掉机械跳转，
+                    // arm 内的原赋值和显式 cleanup 留在原位置。
+                    arm.stmts.pop();
+                    exit_changed = true;
+                }
                 for kind in [FoldKind::TerminalElse, FoldKind::Guard] {
                     exit_changed |= fold_forward_gotos(
                         &mut arm.stmts,
@@ -145,7 +159,9 @@ impl HirRewritePass for BranchControlPass<'_> {
         let nop_changed = remove_nop_goto_labels(&mut block.stmts);
         constant_changed
             || common_tail_changed
+            || return_guard_changed
             || leading_escape_changed
+            || shared_goto_changed
             || adjacent_goto_changed
             || empty_changed
             || exit_changed
@@ -162,7 +178,7 @@ impl HirRewritePass for BranchControlPass<'_> {
     }
 }
 
-fn sink_common_direct_copy_tails(stmts: &mut Vec<HirStmt>) -> bool {
+fn sink_common_branch_tails(stmts: &mut Vec<HirStmt>) -> bool {
     let original = std::mem::take(stmts);
     let mut rewritten = Vec::with_capacity(original.len());
     let mut changed = false;
@@ -172,7 +188,7 @@ fn sink_common_direct_copy_tails(stmts: &mut Vec<HirStmt>) -> bool {
             rewritten.push(stmt);
             continue;
         };
-        let Some(common_tail) = take_common_direct_copy_tail(&mut if_stmt) else {
+        let Some(common_tail) = take_common_branch_tail(&mut if_stmt) else {
             rewritten.push(HirStmt::If(if_stmt));
             continue;
         };
@@ -185,35 +201,45 @@ fn sink_common_direct_copy_tails(stmts: &mut Vec<HirStmt>) -> bool {
     changed
 }
 
-fn take_common_direct_copy_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
+fn take_common_branch_tail(if_stmt: &mut HirIf) -> Option<HirStmt> {
     let else_block = if_stmt.else_block.as_ref()?;
     let then_tail = if_stmt.then_block.stmts.last()?;
     let else_tail = else_block.stmts.last()?;
     if then_tail != else_tail {
         return None;
     }
-    let (target, source) = single_binding_copy(then_tail)?;
-    if !arm_allows_direct_copy_sink(&if_stmt.then_block, target, source)
-        || !arm_allows_direct_copy_sink(else_block, target, source)
-    {
-        return None;
+    if matches!(then_tail, HirStmt::Break) {
+        // 两臂直接尾部的 break 指向同一外层循环；移到 if 后仍依次退出
+        // arm 和循环，不跨越求值或改变 cleanup 顺序。
+        if if_stmt.then_block.stmts.len() == 1 && else_block.stmts.len() == 1 {
+            // 候选拒绝[ProofIncomplete]：不能留下会被后续清理删除的空 if，
+            // 原字节码中的显式条件检查仍须保留。
+            return None;
+        }
+    } else {
+        let (target, source) = single_binding_copy(then_tail)?;
+        if !arm_allows_direct_copy_sink(&if_stmt.then_block, target, source)
+            || !arm_allows_direct_copy_sink(else_block, target, source)
+        {
+            return None;
+        }
     }
 
     let common_tail = if_stmt
         .then_block
         .stmts
         .pop()
-        .expect("validated common-copy then arm must have a tail");
+        .expect("validated common-tail then arm must have a tail");
     let removed_else_tail = if_stmt
         .else_block
         .as_mut()
-        .expect("validated common-copy candidate must have an else arm")
+        .expect("validated common-tail candidate must have an else arm")
         .stmts
         .pop()
-        .expect("validated common-copy else arm must have a tail");
+        .expect("validated common-tail else arm must have a tail");
     assert_eq!(
         removed_else_tail, common_tail,
-        "validated common-copy arm tails must remain equal until apply"
+        "validated common arm tails must remain equal until apply"
     );
     Some(common_tail)
 }
@@ -334,6 +360,13 @@ fn fold_constant_control(
         {
             if_stmt.else_block = None;
             changed = true;
+        }
+        if if_stmt.preserves_empty_test || HirExprSafety::contains_original_operation(&if_stmt.cond)
+        {
+            // PolicyBoundary：值域已知不授权删除原检查及其控制关系；不把检查改成
+            // 独立临时值后丢弃分支，也不因两个 arm 相同而消除原条件。
+            rewritten.push(HirStmt::If(if_stmt));
+            continue;
         }
         let truthiness = expr_truthiness(&if_stmt.cond, safety);
         let exact_arms = if_stmt
@@ -529,7 +562,7 @@ fn fold_effect_only_call(stmt: &mut HirStmt) -> bool {
     let HirStmt::If(if_stmt) = stmt else {
         return false;
     };
-    if !if_arms_are_empty(if_stmt) {
+    if if_stmt.preserves_empty_test || !if_arms_are_empty(if_stmt) {
         return false;
     }
 
@@ -610,10 +643,12 @@ fn is_discard_safe_with_primitive_locals(
         return true;
     }
     match expr {
-        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => {
+        HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not && unary.source_site.is_none() => {
             is_discard_safe_with_primitive_locals(&unary.expr, safety, primitive_locals)
         }
-        HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Eq => {
+        HirExpr::Binary(binary)
+            if binary.op == HirBinaryOpKind::Eq && binary.source_site.is_none() =>
+        {
             primitive_value_is_known(&binary.lhs, primitive_locals)
                 && primitive_value_is_known(&binary.rhs, primitive_locals)
         }
@@ -636,6 +671,7 @@ fn remove_discard_safe_empty_ifs(
             stmt,
             HirStmt::If(if_stmt)
                 if if_arms_are_empty(if_stmt)
+                    && !if_stmt.preserves_empty_test
                     // 候选拒绝[SemanticBarrier:Metamethod]：LuaJIT cdata equality 可调用 ctype `__eq`；删除空 if 会漏掉这次调用（regress_391）。
                     // 候选接受：若 equality 两侧都由 immutable primitive local/literal 证明为原始值，LuaJIT 也不会进入 ctype `__eq`。
                     && is_discard_safe_with_primitive_locals(
@@ -724,7 +760,11 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt, safety: HirExprSafet
         guard.cond
     };
     let rhs = std::mem::replace(&mut repeat_stmt.cond, HirExpr::Boolean(false));
-    let folded = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
+    let folded = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
+        lhs,
+        rhs,
+    }));
     // branch-control synthesizes this condition after the general logical pass.  Re-run only
     // the condition-safe normalizer here so shared stable guards are absorbed without changing
     // Lua value semantics in ordinary expression positions.
@@ -896,17 +936,15 @@ fn fold_leading_while_break_guard(stmt: &mut HirStmt) -> bool {
     if while_stmt.cond != HirExpr::Boolean(true) {
         return false;
     }
-    let Some(HirStmt::If(guard)) = while_stmt.body.stmts.first() else {
+    let Some(condition) = while_stmt.body.stmts.first().and_then(|stmt| {
+        leading_guard_condition(stmt, |terminal| matches!(terminal, HirStmt::Break))
+    }) else {
         return false;
     };
-    if guard.else_block.is_some() || !matches!(guard.then_block.stmts.as_slice(), [HirStmt::Break])
-    {
-        return false;
-    }
-    let HirStmt::If(guard) = while_stmt.body.stmts.remove(0) else {
-        unreachable!("validated loop guard remains the first statement");
-    };
-    while_stmt.cond = normalize_condition_context(guard.cond, true);
+    // 嵌套单臂 guard 仍只在循环入口依次求值；中间没有声明、cleanup 或其它语句，
+    // 合为短路条件不会改变任何输入快照、作用域或 break 的循环归属。
+    while_stmt.body.stmts.remove(0);
+    while_stmt.cond = normalize_condition_context(condition, true);
     true
 }
 
@@ -1168,7 +1206,10 @@ fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
         }
         let mut guards = Vec::new();
         for stmt in &branch.then_block.stmts {
-            let Some(escape) = leading_escape_condition(stmt, target) else {
+            let Some(escape) = leading_guard_condition(
+                stmt,
+                |terminal| matches!(terminal, HirStmt::Goto(jump) if jump.target == target),
+            ) else {
                 break;
             };
             guards.push(normalize_condition_context(escape, true));
@@ -1179,6 +1220,7 @@ fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
         let count = guards.len();
         for guard in guards {
             branch.cond = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                preserves_boolean_prewrite: false,
                 lhs: std::mem::replace(&mut branch.cond, HirExpr::Boolean(false)),
                 rhs: guard,
             }));
@@ -1190,7 +1232,10 @@ fn fold_leading_branch_escapes(stmts: &mut [HirStmt]) -> bool {
     changed
 }
 
-fn leading_escape_condition(mut stmt: &HirStmt, target: HirLabelId) -> Option<HirExpr> {
+fn leading_guard_condition(
+    mut stmt: &HirStmt,
+    is_exit: impl FnOnce(&HirStmt) -> bool,
+) -> Option<HirExpr> {
     let mut conditions = Vec::new();
     while let HirStmt::If(guard) = stmt {
         if guard
@@ -1206,17 +1251,118 @@ fn leading_escape_condition(mut stmt: &HirStmt, target: HirLabelId) -> Option<Hi
         conditions.push(&guard.cond);
         stmt = child;
     }
-    if !matches!(stmt, HirStmt::Goto(jump) if jump.target == target) {
+    if !is_exit(stmt) {
         return None;
     }
     let mut condition = conditions.pop()?.clone();
     for outer in conditions.into_iter().rev() {
         condition = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: outer.clone(),
             rhs: condition,
         }));
     }
     Some(condition)
+}
+
+/// 岛内退出投影可能把同一 RETURN 复制到负条件臂及 GOTO 后；统一为正条件跳转，
+/// 避免回编译改变 fallthrough 后，两种极性在相邻生成轮次之间交替。
+fn fold_negated_return_goto_guards(stmts: &mut Vec<HirStmt>) -> bool {
+    let mut removed = vec![false; stmts.len()];
+    let mut changed = false;
+    for index in 0..stmts.len().saturating_sub(2) {
+        let (prefix, suffix) = stmts.split_at_mut(index + 1);
+        let HirStmt::If(branch) = &mut prefix[index] else {
+            continue;
+        };
+        let HirExpr::Unary(negative) = &branch.cond else {
+            continue;
+        };
+        // 候选拒绝[SemanticBarrier:Operation]：这里只消除分支极性的合成 NOT，
+        // 原字节码中的显式 NOT 仍有自己的求值身份。
+        if negative.op != HirUnaryOpKind::Not
+            || negative.source_site.is_some()
+            || branch
+                .else_block
+                .as_ref()
+                .is_some_and(|arm| !arm.stmts.is_empty())
+        {
+            continue;
+        }
+        let [HirStmt::Return(early)] = branch.then_block.stmts.as_slice() else {
+            continue;
+        };
+        let (HirStmt::Goto(_), HirStmt::Return(tail)) = (&suffix[0], &suffix[1]) else {
+            continue;
+        };
+        // 候选拒绝[SemanticBarrier:Lifetime]：返回值、原帧与未消费 cleanup 必须一致；
+        // 未结束的 cleanup 事务不能仅靠两条 Return 的外形在分支间移动。
+        if early != tail || early.pending_cleanup_source.is_some() {
+            continue;
+        }
+        let HirExpr::Unary(negative) = std::mem::replace(&mut branch.cond, HirExpr::Nil) else {
+            unreachable!("validated negative return guard")
+        };
+        branch.cond = negative.expr;
+        // 候选接受[ControlFlowProof]：三个相邻位置没有声明、入口或清理，原负路径
+        // 仍执行同一次 RETURN，正路径仍走同一 GOTO；条件只在原点求值一次。
+        branch.then_block.stmts[0] =
+            std::mem::replace(&mut suffix[0], HirStmt::Block(Box::default()));
+        removed[index + 1] = true;
+        changed = true;
+    }
+    if changed {
+        let mut index = 0;
+        stmts.retain(|_| {
+            let keep = !removed[index];
+            index += 1;
+            keep
+        });
+    }
+    changed
+}
+
+fn fold_same_target_goto_guards(stmts: &mut Vec<HirStmt>) -> bool {
+    fn target(branch: &HirIf) -> Option<HirLabelId> {
+        if branch
+            .else_block
+            .as_ref()
+            .is_some_and(|arm| !arm.stmts.is_empty())
+        {
+            return None;
+        }
+        let [HirStmt::Goto(goto)] = branch.then_block.stmts.as_slice() else {
+            return None;
+        };
+        Some(goto.target)
+    }
+
+    let mut result = Vec::with_capacity(stmts.len());
+    let mut changed = false;
+    for stmt in std::mem::take(stmts) {
+        if let HirStmt::If(mut next) = stmt {
+            if let Some(HirStmt::If(previous)) = result.last_mut()
+                && let Some(label) = target(previous)
+                && target(&next) == Some(label)
+            {
+                // 候选接受[ControlFlowProof]：相邻单臂只有同目标 Goto，没有入口、声明或
+                // cleanup 夹在检查之间；or 保留先后次序与第二次 TEST 的原惰性条件。
+                previous.cond = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                    lhs: std::mem::replace(&mut previous.cond, HirExpr::Nil),
+                    rhs: std::mem::replace(&mut next.cond, HirExpr::Nil),
+                    preserves_boolean_prewrite: false,
+                }));
+                previous.preserves_empty_test |= next.preserves_empty_test;
+                changed = true;
+                continue;
+            }
+            result.push(HirStmt::If(next));
+        } else {
+            result.push(stmt);
+        }
+    }
+    *stmts = result;
+    changed
 }
 
 fn fold_adjacent_conditional_gotos(stmts: &mut [HirStmt]) -> bool {

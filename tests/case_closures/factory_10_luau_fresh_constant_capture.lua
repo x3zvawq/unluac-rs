@@ -1,6 +1,14 @@
 -- 原 NEWCLOSURE 的局部 capture 不能因重新编译常量传播而变成共享 DUPCLOSURE。
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- O2 的发布表展开体与外层 CALL 一起恢复，不留下根交接或 callee 赋值。
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
+-- unluac: expect-contains [[print("capture-boundaries",]]
+-- 前一组的展开表写入不能把后续 selector 声明退化为 callee 交接。
+-- unluac: expect-ast-count [[do-block]] [[4]] [[@proto=0]] [[@debug=stripped]]
+-- unluac: expect-contains [[local missing = scalar_factory()]] [[@debug=retained]]
+-- unluac: expect-contains [[local falsy = scalar_factory(false)]] [[@debug=retained]]
+-- unluac: expect-contains [[local truthy = scalar_factory(true)]] [[@debug=retained]]
 local function opaque(value) return value end
 
 local function nan_factory(...)

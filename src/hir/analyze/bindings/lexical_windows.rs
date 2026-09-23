@@ -19,15 +19,53 @@ pub(super) fn collect_lexical_scopes(
     graph: &GraphFacts,
     structure: &ReadyStructureFacts,
     emission: &HirEmissionFacts<'_>,
-    mut scopes: Vec<Range<usize>>,
-) -> Vec<Range<usize>> {
+    captured: &CapturedSlotTargets,
+) -> Vec<LexicalScope> {
+    let mut scopes = captured.lexical_scopes.clone();
+    let ends = scopes
+        .iter()
+        .map(|scope| scope.end)
+        .collect::<BTreeSet<_>>();
+    // 函数入口或同一 CLOSE 后只检查最早的新 cell 入口，候选区间互不重叠。旧帧中的
+    // Def/Phi 全部在入口前用完时，恢复窗口可避免后层把它们并入新帧 scratch。
+    let mut restarts = BTreeMap::<usize, (usize, Reg)>::new();
+    for (base, end) in captured.activation_starts() {
+        let start = ends.range(..end).next_back().copied().unwrap_or(0);
+        if start == end
+            || if start == 0 {
+                base != Reg(0)
+            } else {
+                !matches!(proto.instrs.get(start - 1), Some(LowInstr::Close(close)) if close.from == base)
+            }
+        {
+            continue;
+        }
+        restarts
+            .entry(start)
+            .and_modify(|old| {
+                if end < old.0 {
+                    *old = (end, base);
+                }
+            })
+            .or_insert((end, base));
+    }
+    scopes.extend(restarts.into_iter().filter_map(|(start, (end, base))| {
+        let window = start..end;
+        closed_prefix_window(
+            proto, cfg, dataflow, graph, structure, emission, &window, base,
+        )
+        .then(|| window.into())
+    }));
     let debug_bindings = structure.debug_bindings();
     // 同一结束点的 local 共同拥有窗口；producer 可以分属 if 前缀和合流后的基本块。
     let mut cohorts = BTreeMap::<_, Vec<&DebugBindingFact>>::new();
     for fact in debug_bindings.accepted() {
         if let Some(end) = fact.end_instr
             && proto.debug_locals[fact.scope].is_source()
-            && let Some(origin) = binding_origin(fact.value, dataflow, cfg)
+            && let Some(origin) = fact
+                .value
+                .ssa()
+                .and_then(|value| binding_origin(value, dataflow, cfg))
             && origin < end.index()
         {
             cohorts.entry(end.index()).or_default().push(fact);
@@ -57,8 +95,85 @@ pub(super) fn collect_lexical_scopes(
             emission,
             (end, &facts, last_observation),
         )
+        .map(Into::into)
     }));
     retain_non_crossing(scopes)
+}
+
+/// 旧无捕获帧在原新 cell 初始化前结束；不清零、不发出额外 CLOSE，也不移动求值。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "词法窗口共用冻结的 SSA、发射域和捕获边界"
+)]
+fn closed_prefix_window(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    graph: &GraphFacts,
+    structure: &ReadyStructureFacts,
+    emission: &HirEmissionFacts<'_>,
+    window: &Range<usize>,
+    base: Reg,
+) -> bool {
+    let entry = cfg.instr_to_block[window.start];
+    let exit = cfg.instr_to_block[window.end - 1];
+    if !dataflow.instr_defs[window.start]
+        .iter()
+        .any(|&def| dataflow.def_reg(def) == base)
+        || emission.scope_owner(entry) != emission.scope_owner(exit)
+        || emission
+            .regular_prefix(entry)
+            .is_none_or(|range| !range.contains(&window.start))
+        || emission
+            .regular_prefix(exit)
+            .is_none_or(|range| !range.contains(&(window.end - 1)))
+        || !graph.closed_instruction_window(cfg, window.clone())
+    {
+        return false;
+    }
+    let Some(phis) = dataflow.closed_phis_in_instruction_window(cfg, window.clone(), base..) else {
+        return false;
+    };
+    for index in window.clone() {
+        let instr = &proto.instrs[index];
+        let effect = &dataflow.instr_effects[index];
+        if matches!(
+            instr,
+            LowInstr::Close(_) | LowInstr::Tbc(_) | LowInstr::Return(_)
+        ) || effect.open_use.is_some()
+            || effect.open_must_def.is_some()
+            || effect.fixed_must_defs().iter().any(|reg| *reg < base)
+            || matches!(instr, LowInstr::Closure(closure) if closure.captures.iter()
+                .any(|capture| matches!(capture.source, CaptureSource::ByReference(reg) if reg >= base)))
+            || effect.fixed_uses_from(base).iter().any(|&reg| {
+                match dataflow.use_value(InstrRef(index), reg) {
+                    SsaValue::Def(def) => !window.contains(&dataflow.def_instr(def).index()),
+                    SsaValue::Phi(phi) => !phis.contains(&phi),
+                    SsaValue::Entry(_) => true,
+                }
+            })
+        {
+            return false;
+        }
+        for &def in &dataflow.instr_defs[index] {
+            if dataflow.def_uses[def.index()]
+                .iter()
+                .any(|site| !window.contains(&site.instr.index()))
+                || dataflow.def_phi_uses[def.index()]
+                    .iter()
+                    .any(|phi| !dataflow.phi_is_truly_dead(*phi) && !phis.contains(phi))
+                || structure
+                    .debug_bindings()
+                    .for_value(SsaValue::Def(def))
+                    .is_some_and(|binding| {
+                        binding.end_instr.is_none_or(|end| end.index() > window.end)
+                    })
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn binding_origin(value: SsaValue, dataflow: &DataflowFacts, cfg: &Cfg) -> Option<usize> {
@@ -122,7 +237,8 @@ fn debug_binding_window(
     let mut overwrite_floors = BTreeMap::new();
     let mut origin = end;
     for fact in facts {
-        let reg = match fact.value {
+        let value = fact.value.ssa()?;
+        let reg = match value {
             SsaValue::Def(def) => dataflow.def_reg(def),
             SsaValue::Phi(phi) => dataflow.phi_candidate(phi)?.reg,
             SsaValue::Entry(_) => return None,
@@ -132,8 +248,8 @@ fn debug_binding_window(
         if reg != fact.reg || owners.insert(fact.reg, *fact).is_some() {
             return None;
         }
-        origin = origin.min(binding_origin(fact.value, dataflow, cfg)?);
-        if let Some(at) = binding_overwrite_floor(fact.value, dataflow) {
+        origin = origin.min(binding_origin(value, dataflow, cfg)?);
+        if let Some(at) = binding_overwrite_floor(value, dataflow) {
             overwrite_floors.insert(fact.reg, (at, fact.declaration_block?));
         }
     }
@@ -151,18 +267,20 @@ fn debug_binding_window(
     }
     let entry = cfg.instr_to_block[origin];
     let exit = cfg.instr_to_block[end - 1];
-    let start = lexical_scope_evaluation_start(dataflow, cfg, entry, floor, origin)?;
+    let start = lexical_scope_evaluation_start(proto, dataflow, cfg, entry, floor, origin)?;
     let window = start..end;
 
     if !emission.regular_prefix(entry)?.contains(&start)
         || !emission.regular_prefix(exit)?.contains(&(end - 1))
         || emission.scope_owner(entry) != emission.scope_owner(exit)
+        || emission.loop_body_ends_at(exit, end)
+        || emission.function_body_ends_at(proto, exit, end)
     {
         return None;
     }
     if entry != exit
         && (!graph.closed_instruction_window(cfg, window.clone())
-            || !window_emission_is_local(cfg, emission, &window)
+            || !emission.window_emission_is_local(cfg, &window)
             || owners.values().any(|fact| {
                 fact.declaration_block
                     .is_none_or(|block| !graph.dominates(block, exit))
@@ -181,15 +299,15 @@ fn debug_binding_window(
                     first_write > at && graph.post_dominates(merge, block)
                 })
     };
-    let local_phis = dataflow.closed_phis_in_instruction_window(cfg, window.clone(), floor)?;
+    let local_phis = dataflow.closed_phis_in_instruction_window(cfg, window.clone(), floor..)?;
     // 已接受的 Phi 声明拥有同槽输入形成的值。每个邻接边只遍历一次，闭包仍须完整
     // 位于该窗口；不能把其它槽的 COPY 源根或窗口外的 Entry 一起认作声明身份。
     let mut owned_phis = BTreeSet::new();
     let mut owned_defs = BTreeSet::new();
     let mut pending = owners
         .values()
-        .filter_map(|fact| match fact.value {
-            SsaValue::Phi(phi) => Some(phi),
+        .filter_map(|fact| match fact.value.ssa() {
+            Some(SsaValue::Phi(phi)) => Some(phi),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -266,13 +384,13 @@ fn debug_binding_window(
                         .is_some_and(|fact| {
                             fact.end_instr
                                 .is_none_or(|scope_end| scope_end.index() >= end)
-                                && match fact.value {
-                                    SsaValue::Entry(_) => fact.start_pc == 0,
-                                    SsaValue::Def(owner) => {
+                                && match fact.value.ssa() {
+                                    Some(SsaValue::Entry(_)) => fact.start_pc == 0,
+                                    Some(SsaValue::Def(owner)) => {
                                         dataflow.def_instr(owner).index() < start
                                             && graph.dominates(dataflow.def_block(owner), entry)
                                     }
-                                    SsaValue::Phi(_) => false,
+                                    Some(SsaValue::Phi(_)) | None => false,
                                 }
                         })
                 });
@@ -286,7 +404,7 @@ fn debug_binding_window(
                 return None;
             }
             let owner = owners.get(&reg);
-            let is_owner = owner.is_some_and(|fact| fact.value == SsaValue::Def(def))
+            let is_owner = owner.is_some_and(|fact| fact.value.ssa() == Some(SsaValue::Def(def)))
                 || owned_defs.contains(&def);
             let source_write = owner.is_some_and(|fact| {
                 let pcs = &proto.lowering_map.pc_map()[index];
@@ -301,7 +419,11 @@ fn debug_binding_window(
             // 候选拒绝[ProofIncomplete]：禁止未归属源码身份的 owner 槽复写、未结束的异期 binding、
             // 捕获 cell 和逃逸 def/phi；窗口不能吞掉其他生命周期或延续其值身份。
             if (owner.is_some_and(|owner| {
-                binding_origin(owner.value, dataflow, cfg).is_none_or(|at| at <= index)
+                owner
+                    .value
+                    .ssa()
+                    .and_then(|value| binding_origin(value, dataflow, cfg))
+                    .is_none_or(|at| at <= index)
             }) && !is_owner
                 && !source_write)
                 || dataflow.reg_is_reference_captured(reg)
@@ -315,7 +437,12 @@ fn debug_binding_window(
                                     binding_end.index() > end
                                         || (!final_observation.excludes_home_from_caller(reg)
                                             && owner.is_none_or(|owner| {
-                                                binding_origin(owner.value, dataflow, cfg)
+                                                owner
+                                                    .value
+                                                    .ssa()
+                                                    .and_then(|value| {
+                                                        binding_origin(value, dataflow, cfg)
+                                                    })
                                                     .is_none_or(|at| binding_end.index() > at)
                                             }))
                                 })
@@ -363,24 +490,15 @@ fn debug_binding_window(
     Some(window)
 }
 
-/// 图边界已经证明；这里只限制窗口内的发射域和会被新词法块截断的值。
-fn window_emission_is_local(
-    cfg: &Cfg,
-    emission: &HirEmissionFacts<'_>,
-    window: &Range<usize>,
-) -> bool {
-    for run in cfg.instr_to_block[window.clone()].chunk_by(|a, b| a == b) {
-        let block = run[0];
-        if !emission.ordinary_block(block) {
-            return false;
-        }
-    }
-    true
-}
-
-pub(super) fn retain_non_crossing(mut scopes: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    scopes.sort_unstable_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)));
-    scopes.dedup();
+pub(super) fn retain_non_crossing(mut scopes: Vec<LexicalScope>) -> Vec<LexicalScope> {
+    scopes.sort_unstable_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| b.end.cmp(&a.end))
+            .then_with(|| b.initial_nil_floor.cmp(&a.initial_nil_floor))
+    });
+    // 同一窗口的 CLOSE 证据比整指令 debug 区间精确，保留它给出的首条 nil 分界。
+    scopes.dedup_by(|a, b| a.start == b.start && a.end == b.end);
     let mut retained = vec![true; scopes.len()];
     let mut all_ends = BTreeSet::new();
     let mut pending = BTreeMap::<usize, Vec<usize>>::new();

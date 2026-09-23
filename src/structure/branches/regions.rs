@@ -164,7 +164,11 @@ impl<'a> BranchIndex<'a> {
         )
     }
 
-    pub(super) fn has_single_local_join(&self, from: BlockRef, target: BlockRef) -> bool {
+    pub(in crate::structure) fn has_single_local_join(
+        &self,
+        from: BlockRef,
+        target: BlockRef,
+    ) -> bool {
         if target == self.exit_block || !self.joins_at(from, target) {
             return false;
         }

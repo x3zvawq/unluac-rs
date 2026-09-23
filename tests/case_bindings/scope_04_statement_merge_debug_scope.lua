@@ -1,5 +1,7 @@
 -- Sequential locals become visible one by one; a later metamethod can observe that scope.
 -- unluac: expect-not-contains [[local first_single, second_single]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-contains [[local first_group, second_group = 41, probe.value]]
 
 local function scope_probe(expected, forbidden)
     return setmetatable({}, {
@@ -45,6 +47,15 @@ local function run_single_adjacent()
     return first_single, first_single, second_single, second_single, saw_gap
 end
 
+-- 并列声明在全部 RHS 求值后才共同可见；不能因 HIR 拆分让第一个名字提前生效。
+local function run_grouped()
+    local probe = scope_probe("probe", "first_group")
+    local first_group, second_group = 41, probe.value
+    return first_group, second_group
+end
+
+local grouped_value, grouped_observed = run_grouped()
+assert(grouped_value == 41 and grouped_observed == true)
 local first_a, first_b, observed_a, observed_b = run_adjacent()
 assert(first_a == 41 and first_b == 41)
 assert(observed_a == true and observed_b == true)

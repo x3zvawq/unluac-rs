@@ -120,6 +120,6 @@ pub(super) fn validate_final(
     validate_block_emissions(cfg, plan)?;
     super::loop_protocol::validate(proto, cfg, graph_facts, dataflow, plan, loop_analysis)?;
     validate_condition_values(proto, cfg, dataflow, plan)?;
-    validate_value_decision_values(proto, cfg, dataflow, plan)?;
+    validate_value_decision_values(proto, cfg, graph_facts, dataflow, plan)?;
     Ok(())
 }

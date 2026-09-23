@@ -36,6 +36,7 @@ mod debug_bindings;
 mod final_input;
 mod loop_continuation;
 mod value_decisions;
+mod value_operands;
 
 use condition_arcs::*;
 use conditions::*;
@@ -242,6 +243,7 @@ fn analyze_structure_proto_one(
     let value_decision_blocks = short_circuit_candidates
         .iter()
         .filter(|candidate| matches!(candidate.exit, ShortCircuitExit::ValueMerge(_)))
+        .filter(|candidate| !candidate.is_value_operand_only())
         .flat_map(|candidate| candidate.blocks.iter().copied())
         .collect::<BTreeSet<_>>();
     let closed_control_dags = short_circuit::analyze_closed_control_dags(
@@ -354,7 +356,7 @@ fn analyze_structure_proto_one(
     )?;
     let mut plan =
         plan::build_final_structure_plan(proto, cfg, graph_facts, dataflow, caps, input)?;
-    let debug_bindings = analyze_debug_bindings(proto, cfg, dataflow);
+    let debug_bindings = analyze_debug_bindings(proto, cfg, graph_facts, dataflow, &plan);
     scope::finalize_cleanup_dispositions(proto, cfg, &debug_bindings, &mut plan)?;
     scope::finalize_label_placements(cfg, &mut plan)?;
     phi_facts::finalize_phi_ownership(cfg, graph_facts, dataflow, &mut plan)?;

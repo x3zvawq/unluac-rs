@@ -28,6 +28,14 @@
 -- unluac: expect-contains [[until p15_0]]
 -- unluac: expect-contains [[return p15_0]]
 -- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=15]]
+-- 捕获的初始化保留结果绑定；嵌套比较与后继构造器不新增 callee/operand 交接。
+-- unluac: expect-ast-count [[local-decl]] [[17]] [[@proto=0]]
+-- unluac: expect-not-contains [[= assert]]
+-- unluac: expect-contains [[[2] == (_VERSION ~= "Lua 5.1"))]]
+-- 计算左值与 Boolean RHS 共用原赋值帧；短路返回共用原 RETURN 槽。
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=21]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=25]]
+-- unluac: expect-contains [[return p25_0 and p25_1 or p25_2]]
 
 local function stable_not(value, sink)
     local inverted = not value

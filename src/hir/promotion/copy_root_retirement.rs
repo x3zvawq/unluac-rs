@@ -40,6 +40,22 @@ impl CopyRootRetirements {
             {
                 continue;
             }
+            if let LowInstr::Move(copy) = proto.instrs[def.instr.index()]
+                && let SsaValue::Def(source) = dataflow.use_value(def.instr, copy.src)
+                && !dataflow.reg_is_reference_captured(dataflow.def_reg(source))
+                && matches!(
+                    proto.instrs[dataflow.def_instr(source).index()],
+                    LowInstr::LoadNil(_)
+                        | LowInstr::LoadBool(_)
+                        | LowInstr::LoadConst(_)
+                        | LowInstr::LoadInteger(_)
+                        | LowInstr::LoadNumber(_)
+                )
+            {
+                // 原 COPY 仍由求值帧消费；常量及常量池持有的值没有独立栈根寿命，
+                // 不为跨循环的常量副本制造额外 holder 和 nil 退休写。
+                continue;
+            }
             by_home.entry(def.reg).or_default().push((temp, def.instr));
         }
         for (home, candidates) in by_home {
@@ -141,24 +157,28 @@ fn summarize_block(
     }
     if overwrite == Some(InstrRef(stop)) {
         let instr = &proto.instrs[stop];
-        // 仅在单条、无观察的常量覆盖前清空 holder；调用结果与 MOVE 的
-        // 求值/参数交接有独立事务，不借这个位置证明提前释放。
-        let pure = matches!(
+        // 无观察的常量或异槽 NOT 可在写入点退休旧根；NOT 不调用元方法，
+        // 但原位 NOT 仍读取旧值，不能先清空它的输入。CALL/MOVE 另有交接协议。
+        let pure = (matches!(
             instr,
             LowInstr::LoadNil(_)
                 | LowInstr::LoadBool(_)
                 | LowInstr::LoadConst(_)
                 | LowInstr::LoadInteger(_)
                 | LowInstr::LoadNumber(_)
-        ) && !dataflow.effect_summaries[stop].may_observe_gc_roots();
+        ) || matches!(instr, LowInstr::UnaryOp(unary)
+            if unary.op == crate::transformer::UnaryOpKind::Not && unary.src != home))
+            && !dataflow.effect_summaries[stop].may_observe_gc_roots();
         // 这些固定结果指令先执行完整求值（含 metamethod），然后才写回目标。
         // CALL 的栈顶/参数交接不同，不能据此推导它的退休时刻。
-        let after = matches!(
-            instr,
-            LowInstr::GetTable(_) | LowInstr::BinaryOp(_) | LowInstr::UnaryOp(_)
-        ) && dataflow.effect_summaries[stop]
-            .root_observation
-            .keeps_home_rooted(home);
+        let after = !pure
+            && matches!(
+                instr,
+                LowInstr::GetTable(_) | LowInstr::BinaryOp(_) | LowInstr::UnaryOp(_)
+            )
+            && dataflow.effect_summaries[stop]
+                .root_observation
+                .keeps_home_rooted(home);
         if !pure && !after {
             return None;
         }

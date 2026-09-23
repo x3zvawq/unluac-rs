@@ -25,14 +25,103 @@ pub struct HirModule {
     pub(crate) required_luau_inlining: Vec<HirRequiredLuauInlining>,
 }
 
-/// 原闭包保持创建位置，结果声明逐项绑定必须内联的调用 occurrence。
+/// 原闭包保持创建位置，用展开体内的原操作逐项标识必须内联的调用 occurrence。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HirRequiredLuauInlining {
     pub owner: HirProtoRef,
     pub callee: LocalId,
     pub child: HirProtoRef,
+    /// 由 body 区分表字段/方法名、标量函数体的全局 callee 名、事件标签与捕获更新的拼接后缀。
     pub field: LuaString,
-    pub results: Vec<LocalId>,
+    pub body: HirLuauInliningBody,
+    /// 捕获更新型展开体的父级 cell、发布表工厂的只读容器，或递归闭包工厂的自身绑定。
+    pub capture: Option<LocalId>,
+    pub occurrences: Vec<HirSourceSite>,
+    /// 固定结果帧须预留原槽；Generate 核对最终声明或赋值的词法前缀。
+    pub result_frame_slots: BTreeMap<HirSourceSite, usize>,
+}
+
+/// 已匹配完整函数体的编译合同；不能将任意同字段访问当作相同的展开帧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum HirLuauInliningBody {
+    /// 固定单参数原样返回；调用结果阻止捕获/条件常量折叠，O2 内联后仍是原标量写。
+    Identity,
+    /// 原事件调用与两层 reusable closure 一起恢复，固定字符串参数，O2 cost=26。
+    EventClosureFactory {
+        intermediate: usize,
+        result: usize,
+    },
+    /// 外层发布 inner factory 的返回闭包，再返回捕获 inner 的 reusable closure。
+    PublishedClosureFactory {
+        intermediate: usize,
+        leaf: usize,
+        result: usize,
+    },
+    CapturedConcatSum,
+    CapturedAddIdentity,
+    /// 只读捕获产生 callable，非尾调用后返回固定标签与一个结果。
+    CapturedCallablePair,
+    /// 单参数快照、条件方法调用及字段返回，完整函数体按模板身份配对。
+    ConditionalMethod {
+        template: usize,
+    },
+    TableFactory {
+        shared: usize,
+    },
+    /// 分配空表、发布到只读捕获表的整数键，再返回同一对象。
+    PublishedTableFactory {
+        key: i64,
+    },
+    ClosureFactory {
+        shared: usize,
+    },
+    ValueClosureFactory {
+        template: usize,
+    },
+    /// 直线求值、按值闭包创建及后续调用整体展开；结果在原低槽承接。
+    SnapshotClosureFactory {
+        template: usize,
+    },
+    NestedValueClosureFactory {
+        intermediate: usize,
+        result: usize,
+    },
+    UnpackedTable,
+    FrozenTableIndex,
+    ScalarNotCall {
+        prefix: usize,
+        suffix: usize,
+        /// 原 builtin 身份及 direct 参数域已在 HIR 核对；Generate 保持对应返回语境。
+        fastcall: bool,
+    },
+}
+
+/// 在循环 binding 不产生常量折扣时，按 pinned Luau 的阈值证明循环不会展开。
+/// 成本下界在 HIR 候选和最终 AST 各核对一次，避免展示改写削弱这份编译条件。
+pub(crate) fn luau_loop_unroll_blocked(start: i64, limit: i64, step: i64, cost: usize) -> bool {
+    // 候选拒绝[ProofIncomplete]：次数证明只覆盖非零步长的精确整数域，不外推浮点取整边界。
+    if step == 0
+        || [start, limit, step]
+            .iter()
+            .any(|v| i32::try_from(*v).is_err())
+    {
+        return false;
+    }
+    let distance = if step > 0 {
+        i128::from(limit) - i128::from(start)
+    } else {
+        i128::from(start) - i128::from(limit)
+    };
+    if distance < 0 {
+        // 候选拒绝[TargetConstraint]：空循环会被 O2 删除，不能作为原控制流的稳定表示。
+        return false;
+    }
+    let trips = distance / i128::from(step).abs() + 1;
+    if trips > 25 {
+        return true;
+    }
+    let cost = cost.min(127) as i128;
+    cost > 0 && trips * cost > 25 * (100 * (cost + 1) / cost).min(300) / 100
 }
 
 /// 单个 proto 的 HIR 结果。
@@ -245,6 +334,11 @@ pub enum HirControlFlowFeature {
 pub struct HirDebugScope {
     /// 原显式声明的 canonical 结果身份；Entry/phi 不伪造一条初始化指令。
     pub(crate) initializer_temp: Option<TempId>,
+    /// 原 scope 从这个合流结果开始；与有初始化指令的 Def 分开，避免伪造写入来源。
+    pub(crate) initializer_phi: Option<TempId>,
+    /// Structure 已确认的初始化末条指令及 exclusive 结束边界；只供原区间归属证明。
+    pub(crate) initializer_end_instr: Option<InstrRef>,
+    pub(crate) end_instr: Option<InstrRef>,
     /// 原作用域恰从这个布尔分支结果的合流开始；只供同一 predicate/result 的壳恢复。
     pub(crate) branch_initializer: Option<HirDebugBranchInitializer>,
     pub start_pc: u32,
@@ -532,16 +626,14 @@ pub enum HirExpr {
 }
 
 impl HirExpr {
-    /// 对表达式取逻辑否定，自动消除双重 `not`。
+    /// 构造值语境的逻辑否定；双重 `not` 仍需把任意值转换成 Boolean。
+    /// 条件极性和可省略的合成 NOT 链由所属 simplify owner 另行证明。
     pub fn negate(self) -> Self {
-        match self {
-            HirExpr::Unary(unary) if unary.op == HirUnaryOpKind::Not => unary.expr,
-            expr => HirExpr::Unary(Box::new(HirUnaryExpr {
-                source_site: None,
-                op: HirUnaryOpKind::Not,
-                expr,
-            })),
-        }
+        HirExpr::Unary(Box::new(HirUnaryExpr {
+            source_site: None,
+            op: HirUnaryOpKind::Not,
+            expr: self,
+        }))
     }
 }
 
@@ -562,8 +654,8 @@ pub enum HirLValue {
 /// AST lowering 验证，不得反向影响 HIR 对环境访问的分类。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirGlobalRef {
-    /// 环境访问归一化不丢掉原 GETTABLE 身份；互斥读取合并须保留全部来源。
-    /// 写目标没有读取求值帧，使用 Unknown。
+    /// 环境访问归一化保留原 GETTABLE/SETTABLE 身份；互斥合并须保留全部来源。
+    /// 读取与写入布局由各自的 Promotion query 区分。
     pub(crate) sources: HirOperationSources,
     pub key: LuaString,
 }
@@ -626,6 +718,8 @@ impl HirBinaryExpr {
 /// 逻辑短路表达式。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirLogicalExpr {
+    /// 原短路值选择仍检查已物化的 Boolean；不得按真值删除预写或控制边。
+    pub(crate) preserves_boolean_prewrite: bool,
     pub lhs: HirExpr,
     pub rhs: HirExpr,
 }
@@ -634,11 +728,13 @@ pub struct HirLogicalExpr {
 ///
 /// 这类表达式只服务 HIR 内部的恢复与收敛：当共享短路子图如果立刻树化会明显重复展开时，
 /// 先用 DAG 暂存共享关系，再由 HIR simplify 把它重新线性化成普通表达式或
-/// `local + if + assign`。它不应该继续流到最终 AST。
+/// `local + if + assign`。只有完整源码帧已证明的 Luau 条件选值树可作为原生 if 表达式流到 AST。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirDecisionExpr {
     pub entry: HirDecisionNodeRef,
     pub nodes: Vec<HirDecisionNode>,
+    /// 完整原帧事务已证明可发射为 Luau 条件表达式；普通 DAG 仍必须由 HIR 消除。
+    pub emit_as_luau_if: bool,
 }
 
 /// 决策 DAG 中的稳定节点引用。
@@ -727,6 +823,8 @@ pub(crate) struct HirSourceSite {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirCallExpr {
     pub(crate) source_site: Option<HirSourceSite>,
+    /// 恢复的调用必须重新内联；身份来自原展开帧内的操作，不冒充原 CALL。
+    pub(crate) required_luau_inlining: Option<HirSourceSite>,
     /// 原始参数槽交给该 call 的事实；只供 HIR 消费，不向 AST 泄漏物理槽协议。
     pub argument_roots: Vec<HirCallArgumentRoot>,
     /// 原始 caller home 在该精确 dispatch 处结束的固定定义身份。
@@ -752,6 +850,9 @@ pub struct HirCallExpr {
     /// HIR 最终出口证明普通字段调用可使用冒号语法；不冒充原 SELF 协议，
     /// 不授权删除 producer 或改变调用帧。只由最终语法签证写入，AST build 消费。
     pub(crate) plain_method_syntax: bool,
+    /// 完整 FASTCALL 帧已消费的 Boolean 预写；AST 按原真假值重发合取或析取。
+    /// 元组为固定参数索引及预写值，只由帧事务签发，不从最终表达式形状猜测。
+    pub(crate) boolean_prewrite_arguments: Vec<(usize, bool)>,
 }
 
 /// 一个 canonical definition 的原始 home 在该参数位置交给 callee。
@@ -1036,6 +1137,17 @@ pub struct HirGlobalDecl {
 /// 普通赋值。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirAssign {
+    /// 已证明的 Luau 全局复合赋值帧。values 仍保留完整二元式及全局读取，
+    /// 后层必须发射复合语法，不能把原同槽读取改成普通 RHS 的额外 scratch。
+    pub(crate) luau_compound_global: bool,
+    /// 原 SETUPVAL 的写回位置；合成赋值不携带来源，改写后仍须核对目标与 RHS 帧。
+    pub(crate) upvalue_write_source: Option<HirSourceSite>,
+    /// Structure 合流的值转移，不对应额外的原指令写入。
+    /// 身份合并后可据 must-state 删除重复转移；不授权删除初始化或 RHS 操作。
+    pub(crate) is_phi_transfer: bool,
+    /// 完整并列 nil 帧的 RHS 起点；源码前缀 owner 继续核对，AST 不按范围清零拆开。
+    /// 只对无 tail、逐目标 nil 的 local 赋值有效；新建或改写 RHS 时重新签发。
+    pub(in crate::hir) parallel_nil_frame: Option<super::promotion::HomeSlotKey>,
     pub targets: Vec<HirLValue>,
     pub values: HirValuePack,
     /// 仅授权与同 token、紧邻且形状仍匹配的 empty local declaration 合并。
@@ -1047,6 +1159,13 @@ pub struct HirAssign {
     pub(crate) generic_for_dispatch_release: Option<HirGenericForDispatchRelease>,
     /// 与紧邻 method call 配对的一次性 HIR 改写事务。
     pub method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
+}
+
+impl HirAssign {
+    /// 完整帧的 nil 包必须保留并列语法，不能降低成无 RHS scratch 的逐槽清零。
+    pub(crate) fn preserves_parallel_nil(&self) -> bool {
+        self.parallel_nil_frame.is_some()
+    }
 }
 
 /// 将原 root binding 与同一 generic-for dispatch 的 result endpoint 配对。
@@ -1193,6 +1312,8 @@ impl HirReturn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirIf {
     pub cond: HirExpr,
+    /// 原 branch 的空臂或已知常量条件仍拥有 TEST，不能按值域或相同分支删除。
+    pub(crate) preserves_empty_test: bool,
     pub then_block: HirBlock,
     pub else_block: Option<HirBlock>,
 }
@@ -1527,11 +1648,16 @@ pub struct HirRecordField {
     pub value: HirExpr,
 }
 
-/// 原闭包对象的创建约束。共享对象的 low 常量池身份仍由 shared-closure owner 持有。
+/// 原闭包对象的创建约束；函数体模板来源跨 proto 保留，不混同模板与对象身份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HirClosureCreation {
-    Fresh,
-    MayReuse,
+    /// 模板只标识函数体来源；同模板的 Fresh occurrence 仍各自分配新对象。
+    Fresh {
+        template: usize,
+    },
+    MayReuse {
+        template: usize,
+    },
 }
 
 /// 闭包表达式。

@@ -251,6 +251,7 @@ fn inline_decision_entry(
     let mut nodes = decision.nodes.clone();
     nodes[entry_index].test = inline_constructor_value_inner(context, &entry.test)?;
     Some(HirDecisionExpr {
+        emit_as_luau_if: false,
         entry: decision.entry,
         nodes,
     })
@@ -291,6 +292,7 @@ pub(super) fn inline_constructor_call(
         (callee, args)
     };
     Some(HirCallExpr {
+        required_luau_inlining: call.required_luau_inlining,
         source_site: call.source_site,
         argument_roots: call.argument_roots.clone(),
         frame_root_ends: call.frame_root_ends.clone(),
@@ -302,6 +304,7 @@ pub(super) fn inline_constructor_call(
         callee_root_handoff: call.callee_root_handoff,
         method_rewrite_transaction: call.method_rewrite_transaction,
         plain_method_syntax: false,
+        boolean_prewrite_arguments: call.boolean_prewrite_arguments.clone(),
     })
 }
 
@@ -323,6 +326,7 @@ fn inline_short_circuit_expr(
     }
 
     Some(ctor(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: logical.preserves_boolean_prewrite,
         lhs: inline_constructor_value_inner(context, &logical.lhs)?,
         rhs: logical.rhs.clone(),
     })))

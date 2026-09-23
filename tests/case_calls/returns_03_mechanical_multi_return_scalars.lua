@@ -5,6 +5,7 @@
 -- unluac: expect-ast-max [[local-decl]] [[2]] [[@proto=1]]
 -- unluac: expect-contains [[return p5_0 + 1, p5_1 + 2]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=5]]
+-- unluac: expect-ast-max [[local-binding]] [[1]] [[@proto=4]]
 local function run(lhs, rhs)
     local first = lhs + 1
     local second = rhs + 2
@@ -79,3 +80,15 @@ observe(run)
 observe(direct)
 collectgarbage("restart")
 assert(table.concat(observations, ",") == "table,nil")
+
+-- 赋值 RHS 与两个比较头各执行一次字段读取，树化不能合并或提前缓存 __index。
+local lookups = 0
+local dynamic = setmetatable({ n = 40 }, {
+    __index = function(_, key)
+        assert(key == "id")
+        lookups = lookups + 1
+        return 1
+    end,
+})
+local dynamic_result = arithmetic.__add(dynamic, 1)
+assert(dynamic_result.n == 41 and lookups == 3)

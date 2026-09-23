@@ -3,6 +3,9 @@
 -- unluac: expect-not-contains [[= ipairs]]
 -- unluac: expect-contains [[.extra_count = select("#", ...)]]
 -- unluac: expect-contains [[.extra_first = select(1, ...)]]
+-- 数组元素已经进入构造器，不能再留下独立的常量占位声明。
+-- unluac: expect-not-contains [[ = 4]]
+-- unluac: expect-contains [[= setmetatable({}, {]]
 local function collect(values, ...)
     local result = {
         count = #values,

@@ -1,6 +1,20 @@
 -- 正常返回值域必须按槽传播；已知callee与未知候选、可变capture不能合并成肯定证明。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[table-set-list]]
+-- unluac: expect-ast-count [[local-binding]] [[22]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=5]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=5]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=5]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=5]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=5]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=20]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=9]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=9]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]] [[@dialect=luajit]]
 
 local function constants()
     return 11, "second", false
@@ -87,6 +101,19 @@ local function recursive(count)
     return recursive(count - 1)
 end
 print("regress_575#recursive", recursive(2))
+
+-- 已有读者捕获的 cell 必须共享后续写回，不能按新递归结果拆成独立身份。
+local function shared_recursive_cell()
+    local callee = function() return "old" end
+    local function read() return callee end
+    callee = function(count)
+        if count == 0 then return "new" end
+        return callee(count - 1)
+    end
+    assert(read() == callee)
+    return read()(2)
+end
+print("regress_575#shared-recursive-cell", shared_recursive_cell())
 
 local function second_result_root()
     local function pair() return 1, {} end

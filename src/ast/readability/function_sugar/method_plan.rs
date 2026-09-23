@@ -167,8 +167,10 @@ impl<'a> MethodRoot<'a> {
         cross_allocation: bool,
     ) -> Option<Self> {
         match self {
-            // 候选拒绝[SemanticBarrier:ControlFlow]：短路 rhs 不能接收无条件 initializer。
-            Self::Expr(AstExpr::LogicalAnd(_) | AstExpr::LogicalOr(_)) if selected != 0 => {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：短路 rhs 或条件选值臂不能接收无条件 initializer。
+            Self::Expr(AstExpr::LogicalAnd(_) | AstExpr::LogicalOr(_) | AstExpr::IfExpr(_))
+                if selected != 0 =>
+            {
                 return None;
             }
             // 候选拒绝[SemanticBarrier:EvalOrder]：method args 已越过 receiver 字段查询。

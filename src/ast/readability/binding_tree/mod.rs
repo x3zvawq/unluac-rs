@@ -118,6 +118,9 @@ pub(super) fn stmt_stores_binding_in_table(stmt: &AstStmt, binding: AstBindingRe
 
 fn expr_contains_table_binding(expr: &AstExpr, binding: AstBindingRef) -> bool {
     match expr {
+        AstExpr::IfExpr(branch) => [&branch.cond, &branch.then_expr, &branch.else_expr]
+            .into_iter()
+            .any(|expr| expr_contains_table_binding(expr, binding)),
         AstExpr::TableConstructor(table) => table.fields.iter().any(|field| match field {
             AstTableField::Array(value) => expr_reads_binding(value, binding),
             AstTableField::Record(record) => {
@@ -376,6 +379,9 @@ fn expr_has_contextual_binding_use(
     context: BindingUseContext,
 ) -> bool {
     match expr {
+        AstExpr::IfExpr(branch) => [&branch.cond, &branch.then_expr, &branch.else_expr]
+            .into_iter()
+            .any(|expr| expr_has_contextual_binding_use(expr, binding, context.nested_expr())),
         AstExpr::Var(name) if binding.matches_name_ref(name) => context.matches_var(),
         AstExpr::FieldAccess(access) => {
             expr_has_contextual_binding_use(&access.base, binding, context.field_base())

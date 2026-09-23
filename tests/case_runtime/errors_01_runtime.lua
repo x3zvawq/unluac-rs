@@ -1,5 +1,5 @@
 -- common_11_runtime#1: pcall保护调用
--- 混合返回保持一条表达式；Luau 的首项仍需原返回槽副本。
+-- 混合返回保持一条表达式；首项 COPY 与后续算术在同一原返回帧重发。
 -- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.1]]
 -- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.2]]
 -- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.3]]
@@ -7,7 +7,8 @@
 -- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=lua5.5]]
 -- unluac: expect-contains [[return p5_1, p5_1 + 1, p5_1 + 2]] [[@dialect=luajit]]
 -- unluac: expect-not-contains [[return r5_]] [[@dialect=luajit]]
--- unluac: expect-contains [[return r17_0, p17_1 + 1, p17_1 + 2]] [[@dialect=luau]]
+-- unluac: expect-contains [[return p17_1, p17_1 + 1, p17_1 + 2]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=17]] [[@dialect=luau]]
 -- unluac: expect-not-contains [[r9_0 = r9_0 or p9_0]]
 -- unluac: expect-not-contains [[r13_0 = r13_0 or p13_0]]
 local function test_pcall()

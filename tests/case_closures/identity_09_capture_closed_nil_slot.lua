@@ -1,4 +1,8 @@
 -- 捕获的 nil cell 关闭后，同一寄存器的新 epoch 不能替换旧闭包的身份。
+-- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-max [[local-binding]] [[8]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@debug=retained]]
+-- unluac: expect-ast-count [[do-block]] [[2]] [[@debug=retained]]
 local function number_reuse()
     local saved
     do

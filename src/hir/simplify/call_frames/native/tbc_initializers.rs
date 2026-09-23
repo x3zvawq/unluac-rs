@@ -12,7 +12,7 @@ use crate::hir::common::HirTbcDeclaration;
 
 pub(in crate::hir::simplify) fn restore(
     proto: &mut HirProto,
-    facts: &ProtoPromotionFacts,
+    facts: &mut ProtoPromotionFacts,
     dialect: DecompileDialect,
     is_chunk_entry: bool,
 ) -> bool {
@@ -75,9 +75,11 @@ pub(in crate::hir::simplify) fn restore(
                     .collect::<Vec<_>>();
                 let candidate = plan(
                     NativeFrameContext {
+                        expanded_callees: None,
                         proto,
                         barred: &restrictions.barred,
                         closed: &restrictions.closed,
+                        callee_aliases: &restrictions.callee_aliases,
                         constants_fit_rk,
                     },
                     &stmts,

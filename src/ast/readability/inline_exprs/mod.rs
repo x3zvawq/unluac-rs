@@ -596,10 +596,14 @@ fn collapse_stable_copy_aliases(
                 // 候选拒绝[SemanticBarrier:EvalOrder]：声明后、最后 use 前的 direct write 会让内联表达式读取新值，regress_387 的 written dependency 可观察差异。
                 continue;
             }
-            if matches!(stmts[last_use], AstStmt::While(_) | AstStmt::Repeat(_))
-                && snapshot_names
-                    .iter()
-                    .any(|name| write_index.stmt_directly_writes_name(last_use, name))
+            // until 的虚拟 use 位于 stmts.len()；其 body 写入已由上面的区间查询核对。
+            // 只有实际语句作为末次 use 时，才另外检查该循环语句内部的回写。
+            if matches!(
+                stmts.get(last_use),
+                Some(AstStmt::While(_) | AstStmt::Repeat(_))
+            ) && snapshot_names
+                .iter()
+                .any(|name| write_index.stmt_directly_writes_name(last_use, name))
             {
                 // 候选拒绝[SemanticBarrier:EvalTime]：while/repeat condition 会在 body write
                 // 后逐轮重读 source；声明点 snapshot 不能改成循环时读取（regress_387）。

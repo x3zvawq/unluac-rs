@@ -1,4 +1,6 @@
 -- 静态展开保留连续 NOT 指令，检查内联后仍能被官方解析器重新编译。
+-- unluac: expect-min-count [[not ]] [[256]]
+-- unluac: expect-max-line-length [[600]]
 local function coerce(value)
     local result = value
     result = not result; result = not result; result = not result; result = not result; result = not result; result = not result; result = not result; result = not result

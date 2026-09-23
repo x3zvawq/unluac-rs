@@ -3,8 +3,9 @@
 -- unluac: expect-contains [[local Left, Right = pair()]] [[@debug=retained]]
 -- unluac: expect-contains [[local Tail = load_config("nested")]] [[@debug=retained]]
 -- unluac: expect-contains [[local Last = ]] [[@debug=retained]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=5]] [[@dialect=lua5.4]] [[@debug=retained]]
--- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=5]] [[@dialect=lua5.5]] [[@debug=retained]]
+-- unluac: expect-contains [[load_config("after")]]
+-- unluac: expect-not-contains [[ = nil]]
+-- unluac: expect-ast-count [[do-block]] [[1]]
 local events = {}
 function load_config(name)
     events[#events + 1] = name

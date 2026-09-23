@@ -1,5 +1,6 @@
 -- regress_37_shared_terminal_closure_tail#1: 带 closure 的共享 terminal tail 不能被复制进 if/else 双臂
 -- unluac: expect-contains [[callback = function]]
+-- unluac: expect-contains [[return "skip"]]
 -- unluac: expect-not-contains [[closure capture evidence is ambiguous]]
 -- unluac: expect-not-contains [[unluac error]]
 
@@ -106,6 +107,8 @@ end
 local added = show(make_obj(1, 2))
 local unchanged = show(make_obj(4, 2))
 assert(added == "score" and unchanged == nil)
+Manager = nil
+assert(show(make_obj(1, 2)) == "skip")
 print(
     "regress_37_shared_terminal_closure_tail#1",
     added,

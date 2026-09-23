@@ -2,6 +2,8 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[until stop_repeat() or r0_1() == r0_1()]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]]
+-- unluac: expect-contains [[repeat_attempts += 1]]
 local value = _G
 
 repeat_attempts = 0

@@ -3,8 +3,11 @@
 -- unluac: expect-ast-count [[method-call]] [[0]] [[@proto=2]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
 -- unluac: expect-ast-count [[call]] [[1]] [[@proto=2]]
--- unluac: expect-contains [[p2_2, p2_3 = r2_0.m(r2_0), 9]]
--- unluac: expect-contains [[return p2_2, p2_3]]
+-- unluac: expect-contains [[p2_2, p2_3 = r2_0.m(r2_0), 9]] [[@debug=stripped]]
+-- unluac: expect-contains [[return p2_2, p2_3]] [[@debug=stripped]]
+-- unluac: expect-contains [[first, second = receiver.m(receiver), 9]] [[@debug=retained]]
+-- unluac: expect-contains [[first, second = run(owner, false, 41, 43)]] [[@debug=retained]]
+-- unluac: expect-not-contains [[= assert]]
 
 local owner = {}
 

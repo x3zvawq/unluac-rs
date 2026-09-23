@@ -6,9 +6,17 @@
 use crate::hir::common::{HirExpr, HirLogicalExpr};
 
 pub(super) fn logical_and(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
-    HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }))
+    HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
+        lhs,
+        rhs,
+    }))
 }
 
 pub(super) fn logical_or(lhs: HirExpr, rhs: HirExpr) -> HirExpr {
-    HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }))
+    HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+        preserves_boolean_prewrite: false,
+        lhs,
+        rhs,
+    }))
 }

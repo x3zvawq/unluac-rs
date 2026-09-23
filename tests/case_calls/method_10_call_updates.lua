@@ -1,5 +1,7 @@
 local sum = 0
 -- unluac: expect-ast-count [[method-call]] [[16]]
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[32]] [[@proto=0]]
 local function mark(value)
     sum = sum + value
     return value

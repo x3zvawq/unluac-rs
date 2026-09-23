@@ -121,7 +121,11 @@ pub(in crate::hir::analyze) fn bind_allocation_copy_scopes(
             .lexical_scopes
             .iter()
             .cloned()
-            .chain(candidates.iter().map(|(window, _, _)| window.clone()))
+            .chain(
+                candidates
+                    .iter()
+                    .map(|(window, _, _)| window.clone().into()),
+            )
             .collect(),
     )
     .into_iter()
@@ -145,7 +149,7 @@ pub(in crate::hir::analyze) fn bind_allocation_copy_scopes(
             .bound_temp_targets
             .insert(temp, BoundSlotTarget::Local(local));
         bindings.temp_decl_locals.insert(temp, local);
-        bindings.lexical_scopes.push(window);
+        bindings.lexical_scopes.push(window.into());
         facts.record_local_home_slot(local, home);
         facts.record_temp_to_local_merge(temp, local);
         scoped.insert(temp);
@@ -227,12 +231,14 @@ fn bind_allocation_copy_target(
 pub(in crate::hir::analyze) fn bind_copy_root_initializers(
     proto: &LoweredProto,
     cfg: &Cfg,
+    graph: &GraphFacts,
     dataflow: &DataflowFacts,
     emission: &HirEmissionFacts<'_>,
     bindings: &mut ProtoBindings,
     facts: &mut ProtoPromotionFacts,
 ) -> Vec<LocalId> {
-    let mut locals = Vec::new();
+    let mut locals =
+        bind_entry_copy_root_initializers(proto, cfg, graph, dataflow, emission, bindings, facts);
     let mut nil_sites = BTreeSet::new();
     for (root, site) in facts.single_copy_root_before_releases() {
         let def = &dataflow.defs[root.index()];
@@ -324,6 +330,119 @@ pub(in crate::hir::analyze) fn bind_copy_root_initializers(
     locals
 }
 
+/// 回边 holder 可承接支配全函数的原 nil 声明，不再提前制造第二份入口初始化。
+/// 只合并未读、无 debug/capture 身份的 seed；实际退休点继续由原 root 协议发射。
+fn bind_entry_copy_root_initializers(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    emission: &HirEmissionFacts<'_>,
+    bindings: &mut ProtoBindings,
+    facts: &mut ProtoPromotionFacts,
+) -> Vec<LocalId> {
+    if graph.block_is_cyclic(cfg.entry_block) || emission.prefix_is_hoisted(cfg.entry_block) {
+        return Vec::new();
+    }
+    let Some(prefix) = emission.regular_prefix(cfg.entry_block) else {
+        return Vec::new();
+    };
+    let scope_start = bindings
+        .lexical_scopes
+        .iter()
+        .filter(|scope| scope.end > prefix.start && scope.start < prefix.end)
+        .map(|scope| scope.start)
+        .min()
+        .unwrap_or(prefix.end);
+    let observing = facts.observing_copy_root_temps();
+    let mut roots = BTreeMap::new();
+    for &root in facts.copy_root_temps() {
+        if let Some(home) = facts.trusted_temp_home_slot(root) {
+            roots.entry(home).or_insert_with(Vec::new).push(root);
+        }
+    }
+    let mut seeds = BTreeMap::new();
+    let mut blocked = BTreeSet::new();
+    let mut retiring_writes = BTreeMap::<HomeSlotKey, Vec<TempId>>::new();
+    // 一次索引全部定义，不为每个 holder 重扫函数；其它已发布身份不能被同槽合并遮住。
+    for def in &dataflow.defs {
+        let temp = TempId(def.id.index());
+        let Some(home) = facts.trusted_temp_home_slot(temp) else {
+            continue;
+        };
+        if !roots.contains_key(&home) {
+            continue;
+        }
+        if dataflow.reg_is_reference_captured(def.reg)
+            || bindings.fixed_temps[temp.index()] != temp
+            || bindings.bound_temp_targets.contains_key(&temp)
+            || bindings.captured_temp_targets.contains_key(&temp)
+            || bindings.temp_decl_locals.contains_key(&temp)
+            || bindings.temp_debug_scopes[temp.index()].is_some()
+        {
+            blocked.insert(home);
+        }
+        if def.block == cfg.entry_block
+            && prefix.contains(&def.instr.index())
+            && matches!(proto.instrs[def.instr.index()], LowInstr::LoadNil(_))
+            // 原 LOADNIL 仍在原位置清除未知入口 scratch；无需假设旧物理槽已经为 nil。
+            && matches!(dataflow.def_overwritten_value(def.id), Some(SsaValue::Entry(reg))
+                if reg == def.reg && reg.index() >= usize::from(proto.signature.num_params)
+                    && !(proto.signature.has_vararg_param_reg
+                        && reg.index() == usize::from(proto.signature.num_params)))
+            && dataflow.def_uses[temp.index()].is_empty()
+            && dataflow.def_phi_uses[temp.index()].is_empty()
+            && def.instr.index() < scope_start
+        {
+            seeds.insert(home, temp);
+        }
+        let boolean_write = matches!(proto.instrs[def.instr.index()], LowInstr::LoadBool(_))
+            || matches!(proto.instrs[def.instr.index()], LowInstr::UnaryOp(unary)
+                if unary.op == crate::transformer::UnaryOpKind::Not && unary.src != def.reg);
+        if boolean_write
+            && dataflow.def_uses[temp.index()].is_empty()
+            && dataflow.def_phi_uses[temp.index()].is_empty()
+            && roots.get(&home).is_some_and(|roots| {
+                matches!(roots.as_slice(), [root]
+                    if facts.copy_root_before_releases(def.instr).contains(root))
+            })
+        {
+            retiring_writes.entry(home).or_default().push(temp);
+        }
+    }
+    let mut locals = Vec::new();
+    for (home, roots) in roots {
+        let [root] = roots.as_slice() else {
+            continue;
+        };
+        let Some(&seed) = seeds.get(&home) else {
+            continue;
+        };
+        if blocked.contains(&home) || observing.contains(root) {
+            continue;
+        }
+        let local = LocalId(bindings.local_count);
+        bindings.local_count += 1;
+        bindings.local_debug_hints.push(None);
+        bindings.local_debug_scopes.push(None);
+        facts.record_local_home_slot(local, home);
+        // 原无读取的 Boolean 覆盖仍属于这个物理 holder；保留其真/假写，
+        // 由指令 lowering 消费同槽退休，不再另发一个替代原写的 nil。
+        for temp in [seed, *root]
+            .into_iter()
+            .chain(retiring_writes.remove(&home).unwrap_or_default())
+        {
+            bindings
+                .bound_temp_targets
+                .insert(temp, BoundSlotTarget::Local(local));
+            facts.record_temp_to_local_merge(temp, local);
+        }
+        bindings.temp_decl_locals.insert(seed, local);
+        locals.push(local);
+    }
+    locals
+}
+
 /// 参数快照的各 epoch 已在首次同槽写回截断；共用同一 home 的 holder 不会重叠。
 /// 例如展开 224 次 `owner,n=owner,0; lookup()`，只需一个额外 local，而不是 224 个。
 /// holder 是独立保活身份，不参与后续 ordinary home compaction 的写入复用。
@@ -389,7 +508,7 @@ pub(in crate::hir::analyze) fn bind_copy_root_scopes(
             .for_scope(scope)
             .ok_or_else(|| HirLowerError::invalid("copy root source scope is not accepted"))?;
         // 已存在 binding 的后续写入没有新的源码声明边界；其身份由原入口绑定持有。
-        if fact.value != SsaValue::Def(def.id) {
+        if fact.value.ssa() != Some(SsaValue::Def(def.id)) {
             continue;
         }
         let raw_end = fact
@@ -449,7 +568,7 @@ pub(in crate::hir::analyze) fn bind_copy_root_scopes(
                 .trusted_temp_home_slot(temp)
                 .expect("canonical copy root retains its physical home"),
         ));
-        scopes.push(start..end);
+        scopes.push((start..end).into());
         handoffs.push((temp, holder, InstrRef(end - 1)));
     }
     let expected = scopes

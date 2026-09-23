@@ -1,4 +1,7 @@
 -- lua51_01#1: setfenv环境切换
+-- unluac: expect-ast-count [[local-decl]] [[3]]
+-- unluac: expect-ast-count [[do-block]] [[0]]
+-- unluac: expect-contains [[return read, function()]] [[@debug=retained]]
 local function test_setfenv()
     local function read_value()
         return value

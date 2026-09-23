@@ -40,7 +40,7 @@ use self::handoffs::{HandoffAction, try_collapse_handoff_at};
 use self::loop_updates::collapse_dead_loop_update_handoffs;
 use self::prune::{
     prune_dead_for_binding_temp_mirrors, prune_redundant_branch_state_copies,
-    prune_redundant_copy_stmts,
+    prune_redundant_copy_stmts, restore_phi_copy_writes,
 };
 use self::reads::{BindingMentionIndex, BlockMentions, collect_binding_mentions_in_expr};
 use self::region_results::{
@@ -60,6 +60,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
     promotion_facts: &mut ProtoPromotionFacts,
     expr_safety: HirExprSafety,
 ) -> bool {
+    let restored_copies = restore_phi_copy_writes(proto, promotion_facts);
     let preserved_bindings = collect_preserved_bindings(proto);
     let branch_copies_changed =
         prune_redundant_branch_state_copies(proto, expr_safety, &preserved_bindings);
@@ -82,6 +83,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
         coalesce::coalesce_disjoint_temps(proto, promotion_facts, &identity_facts, expr_safety);
     let mentions = BindingMentionIndex::new(&proto.body.stmts);
     branch_copies_changed
+        | restored_copies
         | coalesced
         | snapshots_changed
         | dead_for_binding_mirrors_changed
@@ -189,6 +191,7 @@ fn collapse_handoffs_recursive<'a>(
         block,
         &identity_facts.preserved,
         &identity_facts.call_preparations,
+        &identity_facts.reference_captured,
     );
     changed
 }
@@ -384,9 +387,45 @@ impl HandoffIdentityFacts {
         target: CarryBinding,
         promotion_facts: &ProtoPromotionFacts,
     ) -> bool {
+        self.binding_merge_preserves_identity_with_nil_target(
+            source,
+            target,
+            promotion_facts,
+            false,
+        )
+    }
+
+    /// 相邻 nil initializer 原位保留；只退休后面的空 carrier 声明，不退休目标根。
+    fn binding_merge_preserves_identity_with_nil_target(
+        &self,
+        source: CarryBinding,
+        target: CarryBinding,
+        promotion_facts: &ProtoPromotionFacts,
+        retains_nil_target: bool,
+    ) -> bool {
+        self.binding_merge_preserves_retained_target(
+            source,
+            target,
+            promotion_facts,
+            retains_nil_target,
+            false,
+        )
+    }
+
+    // 原同槽结果写入继续使用已有 target；只有 synthetic phi 写回可以退休。
+    // 调用方还须证明完整路径上的写回关系，不能凭同槽提前覆盖旧 target。
+    fn binding_merge_preserves_retained_target(
+        &self,
+        source: CarryBinding,
+        target: CarryBinding,
+        promotion_facts: &ProtoPromotionFacts,
+        retains_nil_target: bool,
+        retains_phi_target: bool,
+    ) -> bool {
         let shares_exact_home = binding_home_slot(source, promotion_facts)
             .zip(binding_home_slot(target, promotion_facts))
             .is_some_and(|(source, target)| source == target);
+        let retains_target = (retains_nil_target || retains_phi_target) && shares_exact_home;
         let endpoint_is_reference_captured =
             self.reference_captured.contains(&source) || self.reference_captured.contains(&target);
         // 候选拒绝[PolicyBoundary]：debug binding 是项目选择保留的源码身份。
@@ -402,11 +441,18 @@ impl HandoffIdentityFacts {
         // 候选拒绝[LayerBoundary]：HIR 已证明必须保留的 binding definition 不得被
         // carried-local 的跨身份 merge 删除；不相关 Preserve 不影响当前事务。
         !self.preserved.contains(&source)
-            && !self.preserved.contains(&target)
+            && (retains_target || !self.preserved.contains(&target))
             && !self.physical_roots.contains(&source)
-            && !self.physical_roots.contains(&target)
+            && (retains_target || !self.physical_roots.contains(&target))
             && !source.local().is_some_and(|local| self.contains(local))
-            && !target.local().is_some_and(|local| self.contains(local))
+            && !target.local().is_some_and(|local| {
+                if retains_target {
+                    (!retains_phi_target && self.debug.contains(&local))
+                        || self.for_bindings.contains(&local)
+                } else {
+                    self.contains(local)
+                }
+            })
             && (!endpoint_is_reference_captured || shares_exact_home)
             && !self.to_be_closed.contains(&source)
             && !self.to_be_closed.contains(&target)

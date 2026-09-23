@@ -130,7 +130,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_lifetime/gc_01_boolean_shell_gc_inert_old_value.lua",
         &["boolean-shell", "dead-write", "primitive"],
-        "确认非相邻primitive旧值没有GC身份，可删除dead boolean shell。",
+        "非相邻 primitive 旧值不授权删除原 truthiness 检查及布尔写回。",
         &[LuaCaseConfiguration::new(PUC_LUA_54)],
     ),
     LuaCaseDefinition::new(
@@ -274,8 +274,8 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["allocation", "branch", "gc"],
         "保证branch两臂boolean覆写都在GC前释放escaped allocation root。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_54).with_options(LuaCaseOptions {
-                // 直接 TESTSET 入口先恢复 if/goto，再统一到 Boolean 转换；两轮达到固定点。
+            LuaCaseConfiguration::new(PUC_LUA_GE_52).with_options(LuaCaseOptions {
+                // 重复生成仍须保留 TESTSET 的预写检查及旧对象根覆盖点。
                 recompile_rounds: Some(2),
                 ..LuaCaseOptions::DEFAULT
             }),
@@ -375,8 +375,18 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_lifetime/lookup_02_alias_capture_writes.lua",
         &["capture", "gc", "generic-for", "receiver"],
-        "验证GETTABLE后的receiver COPY在只读或可写capture存在时不能提前改成SELF并丢失根事件。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
+        "保留GETTABLE后receiver COPY的根事件，以及字段闭包安装回调对共享参数cell的改写。",
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54]).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_lifetime/copy_08_dead_temp_stable_local.lua",

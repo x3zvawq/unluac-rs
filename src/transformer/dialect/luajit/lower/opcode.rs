@@ -837,15 +837,33 @@ impl<'a> ProtoLowerer<'a> {
                 }
                 LuaJitOpcode::UClose => {
                     let (a, d) = expect_ad(raw_pc, opcode, operands)?;
+                    let target = self.jump_target(raw_pc, raw_index, d)?;
+                    // 零槽 UCLO 与相邻返回/尾调用是完整函数退出；原结果或 callee/参数
+                    // 已准备完成。独立块也可有相同指令，debug 终点仍由词法 owner 保留。
+                    // 非零槽与非相邻跳转不能借用此协议，开放 RETURN 仍由原桥接 owner 处理。
+                    // 分支中的提前返回具有相同协议，不要求它位于字节码末端。
+                    let kind = if a == 0 && target == raw_index + 1 {
+                        let exit = crate::transformer::InstrRef(self.lowering.next_low_index());
+                        match opcode_at(self.raw, target) {
+                            LuaJitOpcode::Ret | LuaJitOpcode::Ret0 | LuaJitOpcode::Ret1 => {
+                                crate::transformer::CloseKind::Return(exit)
+                            }
+                            LuaJitOpcode::CallT | LuaJitOpcode::CallMT => {
+                                crate::transformer::CloseKind::TailCall(exit)
+                            }
+                            _ => crate::transformer::CloseKind::Explicit,
+                        }
+                    } else {
+                        crate::transformer::CloseKind::Explicit
+                    };
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
-                            kind: crate::transformer::CloseKind::Explicit,
+                            kind,
                             from: reg_from_u8(a),
                         })),
                     );
-                    let target = self.jump_target(raw_pc, raw_index, d)?;
                     if target != raw_index + 1 {
                         self.emit(
                             None,

@@ -627,6 +627,7 @@ fn rewrite_terminal_constructor_call(
         *last = AstExpr::SingleValue(Box::new(value));
     }
     Some(AstCallExpr {
+        required_luau_inlining: call.required_luau_inlining,
         callee: callee_expr.clone(),
         args: rewritten_args,
         method_key: call.method_key.clone(),

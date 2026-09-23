@@ -90,6 +90,10 @@ impl<'a> BranchValueDecisionBuilder<'a> {
         if_stmt: &HirIf,
         binding: BranchValueBinding,
     ) -> Option<CollapsedBranchValueTarget> {
+        if if_stmt.preserves_empty_test {
+            // PolicyBoundary：Decision 不持有原 TEST 保留事实，不能在这里丢掉它。
+            return None;
+        }
         let (node_ref, mut refs) = self.reserve_node(&if_stmt.cond);
         let truthy = self.collapse_block(&if_stmt.then_block, binding)?;
         // 候选拒绝[SemanticBarrier:ControlFlow]：无 else 时 false-path 保留 binding 旧值；改成有值 Decision 会凭空定义该路径。
@@ -127,7 +131,7 @@ impl<'a> BranchValueDecisionBuilder<'a> {
                 };
                 if source == target
                     || !matches!(single_assign_value(copy, binding)?, HirExpr::TempRef(temp) if *temp == source)
-                    || !self.safety.is_discard_safe(value)
+                    || self.safety.may_observe_gc_roots(value)
                     || !self.safety.result_is_gc_inert(value)
                     || self.facts.trusted_temp_home_slot(source)?
                         != self.facts.trusted_temp_home_slot(target)?
@@ -273,6 +277,7 @@ impl<'a> BranchValueDecisionBuilder<'a> {
         let value = match root.target {
             HirDecisionTarget::Node(entry) => crate::hir::decision::finalize_value_decision_expr(
                 HirDecisionExpr {
+                    emit_as_luau_if: false,
                     entry,
                     nodes: self.nodes,
                 },

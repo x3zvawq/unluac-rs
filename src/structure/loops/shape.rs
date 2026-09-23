@@ -69,6 +69,25 @@ pub(super) fn infer_loop_shape(
     if block_is_while_header_like(proto, cfg, dataflow, header, header_value_merges)
         && branch_has_loop_body_and_exit(cfg, header, blocks)
     {
+        // 独立尾条件与入口分支都可解释循环时，入口准备值若还被正文/出口
+        // 使用，就属于本轮 binding。优先保留 repeat，避免将提前返回挤到循环外。
+        // 没有独立尾条件的 while-true 仍交给现有出口 owner，不降为未知循环。
+        let repeat_tail = (backedge_sources.len() == 1)
+            .then(|| *backedge_sources.first().unwrap())
+            .filter(|source| *source != header)
+            .and_then(|source| {
+                if branch_has_header_and_exit(cfg, source, header, blocks) {
+                    Some(source)
+                } else {
+                    repeat_continue_target_via_backedge_pad(proto, cfg, source, blocks)
+                        .filter(|condition| *condition != header)
+                }
+            });
+        if let Some(tail) = repeat_tail
+            && dataflow.block_defs_have_use_outside(cfg, header, &BTreeSet::from([header]))
+        {
+            return (LoopKindHint::RepeatLike, Some(tail), None);
+        }
         return (LoopKindHint::WhileLike, Some(header), None);
     }
 

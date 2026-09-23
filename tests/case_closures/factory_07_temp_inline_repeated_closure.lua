@@ -2,6 +2,9 @@
 -- unluac: expect-contains [[while condition and consume(]]
 -- unluac: expect-not-contains [[consume(function()]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 字面量全局写不占用闭包的源码槽，回调仍只分配一次。
+-- unluac: expect-contains [[condition = true]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=0]]
 
 state = { count = 0 }
 

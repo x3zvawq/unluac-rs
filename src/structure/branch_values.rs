@@ -41,6 +41,7 @@ pub(super) fn analyze_branch_value_merges(
     let loop_owned_preds_by_header = loop_owned_preds_by_header(loop_candidates);
     let short_circuit_merges = short_circuit_candidates
         .iter()
+        .filter(|candidate| !candidate.is_value_operand_only())
         .filter_map(|candidate| match candidate.exit {
             ShortCircuitExit::ValueMerge(merge) => {
                 Some((candidate.header, merge, candidate.result_reg))

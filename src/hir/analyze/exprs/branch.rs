@@ -47,7 +47,10 @@ pub(crate) fn lower_branch_subject(
         },
         cond,
         comparison_reads_right_first(lowering, instr_ref, cond),
-        |operand| lower_cond_operand(lowering, block, instr_ref, operand),
+        |operand| {
+            literal_test_initializer(lowering, instr_ref, operand)
+                .unwrap_or_else(|| lower_cond_operand(lowering, block, instr_ref, operand))
+        },
     )
 }
 
@@ -69,7 +72,11 @@ pub(crate) fn lower_branch_subject_single_eval(
         },
         cond,
         comparison_reads_right_first(lowering, instr_ref, cond),
-        |operand| lower_cond_operand_single_eval(lowering, block, instr_ref, operand),
+        |operand| {
+            literal_test_initializer(lowering, instr_ref, operand).unwrap_or_else(|| {
+                lower_cond_operand_single_eval(lowering, block, instr_ref, operand)
+            })
+        },
     )
 }
 
@@ -245,10 +252,13 @@ fn comparison_reads_right_first(
     if lowering.dataflow.def_block(right) != block || lowering.dataflow.def_block(left) != block {
         return false;
     }
-    // `f() > 1000` 的 LOADK 在 CALL 之后；打印成 `1000 < f()` 会把该物理准备
-    // 移到调用前。此处保留原方向，不能因为常量值可重排就忽略它原来占用的槽。
+    // CALL 或字段/全局读取后的 LOADK 仍占原操作数槽；反向打印会把常量准备
+    // 移到该观察点前。保留原方向，不能因常量值可重排而忽略其物理准备顺序。
     if right_site.index() < left_site.index()
-        && matches!(lowering.proto.instrs[right_site.index()], LowInstr::Call(_))
+        && matches!(
+            lowering.proto.instrs[right_site.index()],
+            LowInstr::Call(_) | LowInstr::GetTable(_)
+        )
         && anonymous_single_use(left)
         && anonymous_single_use(right)
         && literal_load(left_site)
@@ -376,4 +386,34 @@ fn lower_cond_operand_single_eval(
         CondOperand::Integer(value) => HirExpr::Integer(value),
         CondOperand::Number(value) => HirExpr::Number(value.to_f64()),
     }
+}
+
+/// 已签证的恒等宏代替原 Boolean 准备；唯一 TEST 读取它，不能按普通字面量再复制。
+fn literal_test_initializer(
+    lowering: &ProtoLowering<'_>,
+    site: InstrRef,
+    operand: CondOperand,
+) -> Option<HirExpr> {
+    let CondOperand::Reg(reg) = operand else {
+        return None;
+    };
+    let SsaValue::Def(def) = lowering.dataflow.use_value(site, reg) else {
+        return None;
+    };
+    let producer = lowering.dataflow.def_instr(def);
+    if !lowering
+        .captured_shared_closures
+        .identity_initializers
+        .contains_key(&producer)
+    {
+        return None;
+    }
+    let LowInstr::LoadBool(load) = &lowering.proto.instrs[producer.index()] else {
+        return None;
+    };
+    Some(super::super::instrs::lower_literal_initializer(
+        lowering,
+        producer,
+        HirExpr::Boolean(load.value),
+    ))
 }

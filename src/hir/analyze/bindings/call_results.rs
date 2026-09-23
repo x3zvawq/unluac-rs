@@ -90,7 +90,11 @@ pub(in crate::hir::analyze) fn bind_discarded_call_results(
             .lexical_scopes
             .iter()
             .cloned()
-            .chain(candidates.iter().map(|(window, _, _)| window.clone()))
+            .chain(
+                candidates
+                    .iter()
+                    .map(|(window, _, _)| window.clone().into()),
+            )
             .collect(),
     )
     .into_iter()
@@ -109,7 +113,7 @@ pub(in crate::hir::analyze) fn bind_discarded_call_results(
             .bound_temp_targets
             .insert(temp, BoundSlotTarget::Local(local));
         bindings.temp_decl_locals.insert(temp, local);
-        bindings.lexical_scopes.push(window);
+        bindings.lexical_scopes.push(window.into());
         facts.record_local_home_slot(local, home);
         facts.record_temp_to_local_merge(temp, local);
         locals.push(local);

@@ -72,6 +72,10 @@ fn rewrite_installer_iife_stmt(stmt: &AstStmt, next_synthetic_local: usize) -> O
     let AstCallKind::Call(call) = &call_stmt.call else {
         return None;
     };
+    if call.required_luau_inlining.is_some() {
+        // 候选拒绝[ProofGap]：必须内联的调用不能改换已证明的 callee 身份。
+        return None;
+    }
     let AstExpr::FunctionExpr(function) = &call.callee else {
         return None;
     };
@@ -99,6 +103,7 @@ fn rewrite_installer_iife_stmt(stmt: &AstStmt, next_synthetic_local: usize) -> O
         })),
         AstStmt::CallStmt(Box::new(AstCallStmt {
             call: AstCallKind::Call(Box::new(AstCallExpr {
+                required_luau_inlining: None,
                 callee: AstExpr::Var(AstNameRef::SyntheticLocal(binding_id)),
                 args: call.args.clone(),
                 method_key: None,
@@ -269,6 +274,7 @@ fn expr_looks_like_exported_function_value(
         | AstExpr::Binary(_)
         | AstExpr::LogicalAnd(_)
         | AstExpr::LogicalOr(_)
+        | AstExpr::IfExpr(_)
         | AstExpr::Call(_)
         | AstExpr::MethodCall(_)
         | AstExpr::SingleValue(_)

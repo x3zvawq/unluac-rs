@@ -45,7 +45,33 @@ pub struct ReadyStructureFacts {
     pub debug_bindings: DebugBindingFacts,
 }
 
-/// debug local 在其源码生命周期入口对应的 canonical SSA 身份。
+/// debug local 的初始化身份；无读取的分支结果没有 SSA phi，不能冒充 Entry 值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DebugBindingValue {
+    Ssa(SsaValue),
+    BranchInitializer(RegionId),
+}
+
+impl DebugBindingValue {
+    /// 分支初始化没有 canonical SSA 值；要求 SSA 的消费者不能以某一臂或 Entry 代替。
+    pub const fn ssa(self) -> Option<SsaValue> {
+        match self {
+            Self::Ssa(value) => Some(value),
+            Self::BranchInitializer(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DebugBindingValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ssa(value) => value.fmt(f),
+            Self::BranchInitializer(owner) => write!(f, "branch-initializer(r{})", owner.index()),
+        }
+    }
+}
+
+/// debug local 在其源码生命周期入口对应的初始化事实。
 ///
 /// `scope` 是 Transformer 归一化 debug local arena 的稳定索引。这里不携带名称，避免
 /// Structure 越权处理字符串和命名合法性；HIR 只需把这个索引与归一化 local 事实连接，
@@ -61,28 +87,30 @@ pub struct DebugBindingFact {
     /// 紧邻 scope 入口且全部原 PC 仍在入口前的最后一条 low 指令；
     /// 只表示初始化窗口的末端，值身份、构造事件及删除权限仍由消费者核对。
     pub initializer_end_instr: Option<InstrRef>,
-    pub value: SsaValue,
+    pub value: DebugBindingValue,
     /// canonical 声明的控制流 owner；Entry binding 没有指令声明块。
     pub declaration_block: Option<BlockRef>,
 }
 
-/// 多个源码 scope 竞争同一 canonical SSA 时保留的拒绝证据。
+/// 不能证明为同一只读视图或唯一外层声明的 scope 竞争同一初始化身份时保留的拒绝证据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugBindingConflict {
-    pub value: SsaValue,
+    pub value: DebugBindingValue,
     pub scopes: Vec<usize>,
 }
 
 /// 一个 proto 已冻结的 debug binding 映射及被拒绝的冲突证据。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DebugBindingFacts {
-    // 生产者按唯一 SsaValue 排序，后层只借用，不能破坏二分查询的不变量。
+    // 生产者按唯一初始化身份排序，后层只借用，不能破坏二分查询的不变量。
     pub(super) accepted: Vec<DebugBindingFact>,
     pub(super) by_scope: Vec<Option<usize>>,
     pub conflicts: Vec<DebugBindingConflict>,
 }
 
 impl DebugBindingFacts {
+    /// 只读且区间重合的别名可共享同一事实；返回的 `scope` 是原表序优先的名称视图，
+    /// 不一定等于查询索引，但初始化身份及生命周期相同。
     pub fn for_scope(&self, scope: usize) -> Option<&DebugBindingFact> {
         self.by_scope
             .get(scope)
@@ -97,7 +125,7 @@ impl DebugBindingFacts {
 
     pub fn for_value(&self, value: SsaValue) -> Option<&DebugBindingFact> {
         self.accepted
-            .binary_search_by_key(&value, |fact| fact.value)
+            .binary_search_by_key(&DebugBindingValue::Ssa(value), |fact| fact.value)
             .ok()
             .map(|index| &self.accepted[index])
     }
@@ -534,6 +562,17 @@ pub struct ShortCircuitCandidate {
 }
 
 impl ShortCircuitCandidate {
+    /// 单分支的两条独立赋值臂只为嵌套谓词提供操作数证据；没有外层消费者
+    /// 认领时保留普通 branch，让 Boolean 物化与循环尾条件继续使用原协议。
+    pub(crate) fn is_value_operand_only(&self) -> bool {
+        matches!(self.exit, ShortCircuitExit::ValueMerge(_))
+            && self.nodes.len() == 1
+            && self
+                .value_incomings
+                .iter()
+                .all(|incoming| incoming.pred != self.nodes[0].header)
+    }
+
     pub(crate) fn branch_exit_leaf_preds(&self, want_truthy: bool) -> BTreeSet<BlockRef> {
         self.nodes
             .iter()

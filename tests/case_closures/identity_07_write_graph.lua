@@ -2,6 +2,12 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-ast-count [[repeat]] [[1]]
+-- 条件写回保留三个 if；捕获 cell 不经额外的 phi、CALL 或 CLOSURE local 交接。
+-- unluac: expect-ast-count [[if]] [[3]]
+-- unluac: expect-ast-max [[local-binding]] [[6]] [[@proto=0]]
+-- Luau 剥离 debug 后已把只读常量 50 编入子函数，保留 debug 时仍有原声明。
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]] [[@dialect=luau]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]] [[@debug=retained]]
 local function branches(flag)
     local value = 10
     local first = function() return value end

@@ -22,7 +22,7 @@ use crate::hir::common::{
 use crate::transformer::InstrRef;
 
 use super::label_refs::label_references_by_stmt;
-use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_block};
+use super::walk::{HirRewritePass, for_each_nested_block_mut, rewrite_stmts};
 use crate::hir::visit::{HirVisitor, visit_proto, visit_stmt_structure, visit_stmts};
 
 mod closes;
@@ -38,6 +38,7 @@ struct ScopeInterval {
     end: usize,
     reg_index: usize,
     close_selections: Vec<CloseSelection>,
+    use_function_scope: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +151,16 @@ pub(super) fn materialize_tbc_close_scopes_in_proto(
         temp_debug_scopes: &proto.temp_debug_scopes,
         debug_scopes: &proto.debug_scopes,
     };
-    rewrite_block(&mut proto.body, &mut pass)
+    let nested_changed = rewrite_stmts(&mut proto.body.stmts, &mut pass);
+    let root_changed = materialize_block(
+        &mut proto.body,
+        &proto.local_debug_scopes,
+        &proto.temp_debug_scopes,
+        &proto.debug_scopes,
+        safety,
+        true,
+    );
+    nested_changed || root_changed
 }
 
 /// 返回仍被 close-scope materialization 当作 TBC active-set 边界读取的 label。
@@ -222,6 +232,7 @@ impl HirRewritePass for CloseScopePass<'_> {
             self.temp_debug_scopes,
             self.debug_scopes,
             self.safety,
+            false,
         )
     }
 }
@@ -232,6 +243,7 @@ fn materialize_block(
     temp_debug_scopes: &[Option<usize>],
     debug_scopes: &[Option<HirDebugScope>],
     safety: crate::hir::expr_safety::HirExprSafety,
+    function_body: bool,
 ) -> bool {
     let facts = ScopeFacts::new(&block.stmts);
     let mut intervals =
@@ -259,6 +271,33 @@ fn materialize_block(
     }
     if intervals.is_empty() {
         return remove_paired_frame_cleanup(&mut block.stmts);
+    }
+
+    if function_body
+        && let Some(close_index) = block.stmts.len().checked_sub(2)
+        && paired_return_cleanup(&block.stmts, close_index)
+        && let HirStmt::Close(close) = &block.stmts[close_index]
+    {
+        // 原 RETURN 清理在结果求值后退出整个函数。已通过活跃域和嵌套验证的
+        // 尾区间可由函数本身承载，但 debug 不能另有内层来源终点。
+        // 仍保留 interval 的 cleanup 所有权，和普通建块事务一起退休原 origins。
+        let returned_origins = close.origins.iter().copied().collect::<BTreeSet<_>>();
+        for interval in &mut intervals {
+            let scope = &facts.candidates[facts
+                .candidates
+                .binary_search_by_key(&interval.start, |scope| scope.start)
+                .expect("scope interval retains its candidate")];
+            interval.use_function_scope = interval.end == block.stmts.len()
+                && returned_origins.contains(&interval.origin)
+                // 内层 do 中的非空 return 也会延长 cleanup 区间，但 debug 仍给出
+                // 早于函数尾的独立来源终点；不能将其冒充函数级资源声明。
+                && !binding_debug_scope_ends_before_return(
+                    scope.binding,
+                    local_debug_scopes,
+                    temp_debug_scopes,
+                    debug_scopes,
+                );
+        }
     }
 
     let owned_close_indices = facts.direct_closes().owned_closes(
@@ -335,6 +374,7 @@ fn collect_scope_intervals(
                 end: scope_end.end,
                 reg_index: scope_start.reg_index,
                 close_selections: scope_end.close_selections,
+                use_function_scope: false,
             })
         })
         .collect();
@@ -673,7 +713,11 @@ fn rebuild_slice(
                 if introduced_owner {
                     cleanup_owners.remove(&interval.origin);
                 }
-                rewritten.push(HirStmt::Block(Box::new(HirBlock { stmts: inner })));
+                if interval.use_function_scope {
+                    rewritten.extend(inner);
+                } else {
+                    rewritten.push(HirStmt::Block(Box::new(HirBlock { stmts: inner })));
+                }
                 index = interval.end;
                 continue;
             }

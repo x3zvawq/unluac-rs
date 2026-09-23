@@ -1,5 +1,18 @@
 -- regress_251_method_alias_sink_order: method alias 不跨外层 callee 或循环边界
 -- unluac: expect-not-contains [[end)(]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]] [[@variant=default]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]] [[@variant=O0]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]] [[@variant=O1]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=0]] [[@variant=O2]]
+-- unluac: expect-ast-count [[while]] [[1]] [[@proto=0]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[break]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=6]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=7]]
+-- unluac: expect-not-line [[local loop_receiver = make_loop_receiver]] [[@debug=retained]]
+-- unluac: expect-contains [[local loop_method = loop_receiver.m]] [[@debug=retained]]
+-- unluac: expect-contains [[while loop_method(loop_receiver) do]] [[@debug=retained]]
+-- unluac: expect-contains [[return method_count < 3]] [[@debug=retained]]
 
 local obj = {}
 local wrap

@@ -1,6 +1,7 @@
--- 无用 Boolean 计算可以省略；承接槽与 and/or/vararg 的潜在对象根不能一并删除。
--- unluac: expect-not-contains [[ = not ]]
--- unluac: expect-not-contains [[unreachable]]
+-- 结果未使用不授权删除原 NOT 或显式比较；and/or/vararg 的潜在对象根也须保留。
+-- unluac: expect-count [[ = not ]] [[1]]
+-- unluac: expect-count [[if 1 == 1 then]] [[4]]
+-- unluac: expect-count [[print("unreachable",]] [[4]]
 -- unluac: expect-contains [[print("discard-not",]]
 -- unluac: expect-contains [[print("discard-and",]]
 -- unluac: expect-contains [[print("discard-or",]]

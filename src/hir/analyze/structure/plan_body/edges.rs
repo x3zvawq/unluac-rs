@@ -208,6 +208,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
 
     pub(super) fn repeat_stage_is_direct(&self, target: PhiId, stage: TempId) -> bool {
         self.lowering.bindings.phi_temps.get(target.index()) == Some(&stage)
+            || self.lowering.bindings.for_binding_phi_locals[target.index()].is_some()
     }
 
     pub(super) fn lower_loop_exit_tail(
@@ -440,6 +441,15 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             } else {
                 self.edge_copy_expr(owner, source_block, phi_target, copy.value)?
             };
+            // 真实寄存器写已投影到 for binding；这里只移除同身份的合成 phi copy，
+            // 不生成 repeat stage 来保存一个源码变量之外无人读取的重复结果。
+            // 普通 captured phi 也可能读为 LocalRef，但提前 break 仍需保存独立 stage；
+            // 只有绑定分析明确发布的 for 投影才能省略这整个合成动作。
+            if self.lowering.bindings.for_binding_phi_locals[copy.phi_id.index()]
+                .is_some_and(|local| value == HirExpr::LocalRef(local))
+            {
+                continue;
+            }
             let staged_target = match effective_transfer {
                 EdgeTransfer::Break(loop_region) => self
                     .index

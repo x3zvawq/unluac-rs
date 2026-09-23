@@ -22,7 +22,7 @@ use crate::transformer::{
 };
 
 use super::helpers::decode_raw_string;
-use super::lower::{BoundSlotTarget, ProtoBindings};
+use super::lower::{BoundSlotTarget, LexicalScope, ProtoBindings};
 use crate::hir::promotion::{HomeSlotKey, SlotEpochFacts};
 
 pub(super) fn bind_parameter_slots(
@@ -72,6 +72,7 @@ mod debug_names;
 mod lexical_windows;
 mod loop_bindings;
 mod reused_frames;
+mod scalar_slots;
 
 pub(super) use call_results::bind_discarded_call_results;
 use captured_slots::*;
@@ -84,6 +85,45 @@ use debug_entries::*;
 use debug_names::*;
 use loop_bindings::*;
 pub(super) use reused_frames::bind_reused_frames;
+pub(super) use scalar_slots::bind_scalar_slots;
+
+/// 无读取的比较结果没有 SSA phi，但互斥的 Boolean 初始化仍属于同一物理结果。
+/// 在分配 debug/capture 身份前接回该绑定，让现有 branch-values 保留比较并恢复初始化。
+fn coalesce_unused_comparison_initializers(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    structure: &ReadyStructureFacts,
+    epochs: &SlotEpochFacts,
+    fixed_temps: &mut [TempId],
+) {
+    let plan = structure.plan();
+    for (owner, _) in plan.regions() {
+        let Some(initializer) = plan.unused_comparison_initializer(owner, proto, cfg, dataflow)
+        else {
+            continue;
+        };
+        let [then_def, else_def] = initializer.defs;
+        let independent = initializer.defs.iter().all(|&def| {
+            fixed_temps[def.index()] == TempId(def.index())
+                && debug_local_hint_for_ssa(proto, structure, SsaValue::Def(def)).is_none()
+                && debug_local_hint_for_reg_at_instr(
+                    proto,
+                    initializer.reg,
+                    dataflow.def_instr(def),
+                )
+                .is_none()
+        });
+        if independent
+            && epochs.epoch_at(initializer.reg, dataflow.def_instr(then_def))
+                == epochs.epoch_at(initializer.reg, dataflow.def_instr(else_def))
+        {
+            // SemanticBarrier:Binding：原有独立绑定和不同 CLOSE epoch 不能合并。
+            // 同一源码 scope 在分支汇合后生效，由 debug binding fact 连接共同结果。
+            fixed_temps[else_def.index()] = fixed_temps[then_def.index()];
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 struct CapturedSlotKey {
@@ -192,6 +232,7 @@ pub(super) fn build_bindings(
             graph,
             dataflow,
             structure,
+            emission,
             epochs: captured_slot_epochs,
             child_mutable_upvalues,
             numeric_binding_phis: &numeric_binding_phis.bindings,
@@ -200,13 +241,19 @@ pub(super) fn build_bindings(
         &mut local_count,
         &mut local_debug_hints,
     );
+    let closed_entry_locals = captured_slots
+        .closed_entry_local_decls
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    // debug 入口声明也属于同一 cell；已确认 CLOSE 窗口后由窗口内部发射一次。
+    entry_nil_local_decls.retain(|local| !closed_entry_locals.contains(local));
 
     for (loop_id, loop_plan) in structure.plan().loops() {
-        let Some(body_blocks) = loop_body_region(structure.plan(), loop_id)
-            .map(|body| structure.plan().region_blocks(body))
-        else {
+        let Some(binding_blocks) = loop_binding_blocks(structure.plan(), loop_id) else {
             continue;
         };
+        let binding_blocks = binding_blocks.copied().collect::<Vec<_>>();
         match loop_plan.source_bindings {
             Some(LoopSourceBindings::Numeric(control)) => {
                 let reg = match structure.plan().loop_protocol(loop_id) {
@@ -221,7 +268,7 @@ pub(super) fn build_bindings(
                 let local = LocalId(local_count);
                 local_count += 1;
                 local_debug_hints.push(
-                    debug_local_name_for_reg_in_blocks(proto, cfg, body_blocks, reg).or_else(
+                    debug_local_name_for_reg_in_blocks(proto, cfg, &binding_blocks, reg).or_else(
                         || {
                             debug_local_name_for_reg_at_block_entry(
                                 proto,
@@ -233,20 +280,27 @@ pub(super) fn build_bindings(
                     ),
                 );
                 numeric_for_locals.insert(loop_plan.header, local);
-                if let Some(LoopVmProtocol::NumericFor(protocol)) =
-                    structure.plan().loop_protocol(loop_id)
-                    && let Some((copy, _)) = protocol.writable_binding
-                {
-                    // 单块 numeric body 的普通指令可归在 control region 的前缀，未必
-                    // 出现在语法 body 的 region_blocks。原 COPY 的已验执行块才是用户
-                    // 槽每轮读写的 owner；否则跳过入口 COPY 后仍会读取未初始化 temp。
-                    block_local_regs
-                        .entry(cfg.instr_to_block[copy.index()])
-                        .or_insert_with(BTreeMap::new)
-                        .insert(reg, local);
+                let binding_debug =
+                    debug_local_hint_for_reg_at_block_entry(proto, cfg, loop_plan.header, reg)
+                        .or_else(|| {
+                            let LoopVmProtocol::NumericFor(protocol) =
+                                structure.plan().loop_protocol(loop_id)?
+                            else {
+                                return None;
+                            };
+                            let instr = protocol
+                                .writable_binding
+                                .map_or(protocol.init_instr, |(copy, _)| copy);
+                            let def = dataflow.instr_def_for_reg(instr, reg)?;
+                            debug_local_hint_for_ssa(proto, structure, SsaValue::Def(def))
+                        });
+                if let Some(hint) = binding_debug {
+                    // 循环语法已经声明这个 scope；分支出口的同一 debug phi
+                    // 必须认回它，不能再次物化为另一个同名 local。
+                    debug_scope_targets.insert(hint.scope, BoundSlotTarget::Local(local));
+                    local_debug_hints[local.index()] = Some(decode_raw_string(hint.name));
                 }
-
-                for &block in body_blocks {
+                for &block in &binding_blocks {
                     block_local_regs
                         .entry(block)
                         .or_insert_with(BTreeMap::new)
@@ -259,6 +313,7 @@ pub(super) fn build_bindings(
                     let local = LocalId(local_count);
                     local_count += 1;
                     let reg = crate::transformer::Reg(bindings.start.index() + offset);
+                    let mut binding_debug = None;
                     if let Some(LoopVmProtocol::GenericFor(protocol)) =
                         structure.plan().loop_protocol(loop_id)
                         && let Some(def) = dataflow.instr_def_for_reg(protocol.call_instr, reg)
@@ -268,22 +323,25 @@ pub(super) fn build_bindings(
                         // 循环语法已经声明了这个 source scope。内层循环的 phi 和入口
                         // 复制也须复用它，不能因保留 debug 信息再提升一套同名 carried local。
                         debug_scope_targets.insert(hint.scope, BoundSlotTarget::Local(local));
+                        binding_debug = Some(decode_raw_string(hint.name));
                     }
                     local_debug_hints.push(
-                        debug_local_name_for_reg_in_blocks(proto, cfg, body_blocks, reg).or_else(
-                            || {
+                        binding_debug
+                            .or_else(|| {
+                                debug_local_name_for_reg_in_blocks(proto, cfg, &binding_blocks, reg)
+                            })
+                            .or_else(|| {
                                 debug_local_name_for_reg_at_block_entry(
                                     proto,
                                     cfg,
                                     loop_plan.header,
                                     reg,
                                 )
-                            },
-                        ),
+                            }),
                     );
                     locals_for_loop.push(local);
 
-                    for &block in body_blocks {
+                    for &block in &binding_blocks {
                         block_local_regs
                             .entry(block)
                             .or_insert_with(BTreeMap::new)
@@ -295,7 +353,7 @@ pub(super) fn build_bindings(
             None => {}
         }
     }
-    let numeric_binding_phi_locals = numeric_binding_phis
+    let mut for_binding_phi_locals = numeric_binding_phis
         .source_direct
         .iter()
         .enumerate()
@@ -307,6 +365,14 @@ pub(super) fn build_bindings(
             numeric_for_locals.get(&header).copied()
         })
         .collect::<Vec<_>>();
+    bind_generic_for_phis(
+        cfg,
+        dataflow,
+        structure.plan(),
+        &generic_for_locals,
+        &block_local_regs,
+        &mut for_binding_phi_locals,
+    );
 
     let mut fixed_temps = (0..dataflow.defs.len()).map(TempId).collect::<Vec<_>>();
     let mut next_temp_index = fixed_temps.len();
@@ -337,7 +403,11 @@ pub(super) fn build_bindings(
         dataflow,
         structure.plan(),
         &nested_carried_parents,
-        (&numeric_binding_phis.bindings, &phi_debug_hints),
+        (
+            &numeric_binding_phis.bindings,
+            &phi_debug_hints,
+            &captured_slots,
+        ),
         (&mut phi_temps, &mut fixed_temps),
         captured_slot_epochs,
     );
@@ -349,6 +419,14 @@ pub(super) fn build_bindings(
         captured_slot_epochs,
         (&numeric_binding_phis.bindings, &phi_debug_hints),
         (&phi_temps, &mut fixed_temps),
+    );
+    coalesce_unused_comparison_initializers(
+        proto,
+        cfg,
+        dataflow,
+        structure,
+        captured_slot_epochs,
+        &mut fixed_temps,
     );
     // 只有下面实际分配 HIR staging 身份的 owner 才登记；复用 carried temp 的
     // repeat stage 保留其 canonical physical provenance。
@@ -434,10 +512,9 @@ pub(super) fn build_bindings(
             _ => debug_local_hint_for_ssa(proto, structure, SsaValue::Def(def.id))
                 .or_else(|| debug_local_hint_for_reg_at_instr(proto, def.reg, def.instr)),
         };
-        temp_debug_locals[temp.index()] = hint
-            .as_ref()
-            .map(|hint| decode_raw_string(hint.name))
-            .or_else(|| closure_debug_name(proto, instr));
+        // Luau 的子函数 debug_name 也会来自字段名，它不证明创建点存在源码 local。
+        // 只有变量表的 binding hint 能建立声明身份，否则匿名字段闭包会被强制拆出。
+        temp_debug_locals[temp.index()] = hint.as_ref().map(|hint| decode_raw_string(hint.name));
         temp_debug_scopes[temp.index()] = hint.map(|hint| hint.scope);
     }
 
@@ -453,14 +530,91 @@ pub(super) fn build_bindings(
         }
     }
 
-    // 显式 nil 声明已经有原位置与 source scope。后续内层写和外层读共用该身份，
+    for fact in structure.debug_bindings().accepted() {
+        let crate::structure::DebugBindingValue::BranchInitializer(owner) = fact.value else {
+            continue;
+        };
+        let Some(initializer) = structure
+            .plan()
+            .unused_comparison_initializer(owner, proto, cfg, dataflow)
+        else {
+            continue;
+        };
+        let [then_def, else_def] = initializer.defs;
+        let temp = fixed_temps[then_def.index()];
+        if temp == fixed_temps[else_def.index()] {
+            temp_debug_locals[temp.index()] =
+                Some(decode_raw_string(&proto.debug_locals[fact.scope].name));
+            temp_debug_scopes[temp.index()] = Some(fact.scope);
+        }
+    }
+
+    let lexical_scopes = lexical_windows::collect_lexical_scopes(
+        proto,
+        cfg,
+        dataflow,
+        graph,
+        structure,
+        emission,
+        &captured_slots,
+    );
+    let mut scope_starts = lexical_scopes.iter().peekable();
+    let mut scope_ends = Vec::new();
+    let lexical_end_at = (0..proto.instrs.len())
+        .map(|index| {
+            while scope_ends.last().is_some_and(|&end| end <= index) {
+                scope_ends.pop();
+            }
+            while scope_starts
+                .peek()
+                .is_some_and(|scope| scope.start == index)
+            {
+                scope_ends.push(scope_starts.next().expect("queried scope exists").end);
+            }
+            scope_ends.last().copied()
+        })
+        .collect::<Vec<_>>();
+
+    // 显式 nil、根作用域字面量或 MOVE 声明已有原位置与 source scope。后续内层写和外层读共用该身份，
     // 不能等 block-local promotion 把它们分开后，再由 AST 给跨块 temp 补另一份声明。
     // 捕获槽仍由原 cell owner 分配；这里不接管其快照或 CLOSE 协议。
-    let mut debug_nil_decls = BTreeMap::new();
+    let mut debug_initializer_decls = BTreeMap::new();
+    let mut debug_preheader_targets = BTreeMap::new();
     let mut declared_local_home_slots = Vec::new();
+    let mut debug_scope_values = vec![0usize; proto.debug_locals.len()];
+    for &scope in temp_debug_scopes.iter().flatten() {
+        debug_scope_values[scope] += 1;
+    }
+    let function_exit_start = proto
+        .instrs
+        .last()
+        .filter(|instr| matches!(instr, LowInstr::Return(_)))
+        .map(|_| {
+            let return_index = proto.instrs.len() - 1;
+            return_index
+                - proto.instrs[..return_index]
+                    .iter()
+                    .rev()
+                    .take_while(|instr| matches!(instr, LowInstr::Close(_)))
+                    .count()
+        });
     for fact in structure.debug_bindings().accepted() {
-        let SsaValue::Def(def) = fact.value else {
-            continue;
+        let def = match fact.value.ssa() {
+            Some(SsaValue::Def(def)) => def,
+            Some(SsaValue::Phi(phi)) => {
+                let Some(SsaValue::Def(def)) = structure
+                    .plan()
+                    .phi_plan(phi)
+                    .and_then(|phi| phi.loop_carried())
+                    .map(|binding| binding.input)
+                else {
+                    continue;
+                };
+                // 声明紧接循环入口时，debug 入口看到的是回边 phi。唯一 preheader
+                // 输入才是本次初始化；循环内其它值版本仍属于同一个源码 scope。
+                def
+            }
+            Some(SsaValue::Entry(_)) | None => continue,
         };
         let instr = dataflow.def_instr(def);
         let temp = fixed_temps[def.index()];
@@ -468,11 +622,51 @@ pub(super) fn build_bindings(
             fact.reg.index(),
             captured_slot_epochs.epoch_at(fact.reg, instr),
         );
-        if !matches!(proto.instrs[instr.index()], LowInstr::LoadNil(_))
-            || temp != TempId(def.index())
-            || !captured_slots.debug_nil_binding_is_uncaptured(home, fact.scope)
+        if !matches!(
+            proto.instrs[instr.index()],
+            LowInstr::LoadNil(_)
+                | LowInstr::LoadBool(_)
+                | LowInstr::LoadConst(_)
+                | LowInstr::LoadInteger(_)
+                | LowInstr::LoadNumber(_)
+                | LowInstr::Move(_)
+        ) || temp != TempId(def.index())
+            || dataflow.def_reg(def) != fact.reg
+            || !captured_slots.debug_binding_is_uncaptured(home, fact.scope)
             || debug_scope_targets.contains_key(&fact.scope)
         {
+            continue;
+        }
+        if matches!(proto.instrs[instr.index()], LowInstr::Move(_))
+            && fact
+                .end_instr
+                .is_some_and(|end| function_exit_start.is_none_or(|exit| end.index() < exit))
+        {
+            // 候选拒绝[ProofIncomplete]：这里只持有函数根作用域 owner，不能接管中途
+            // 结束的对象快照 scope；否则 numeric-for 重用旧槽时会延长其 GC root。
+            continue;
+        }
+        let block = cfg.instr_to_block[instr.index()];
+        // goto 区域的共同入口也可位于前置循环之后。所有外部边都经过其首块，且
+        // 内部没有回边再进初始化时，原前缀声明先于整个区域，仍由根词法 owner 持有。
+        if !matches!(proto.instrs[instr.index()], LowInstr::LoadNil(_))
+            && (emission.scope_owner(block) != Some(structure.plan().root())
+                || (block != cfg.entry_block
+                    && !emission.ordinary_block(block)
+                    && !(emission.island_entry_prefix(block) && !graph.block_is_cyclic(block)))
+                || emission.prefix_is_hoisted(block)
+                || !emission
+                    .regular_prefix(block)
+                    .is_some_and(|range| range.contains(&instr.index()))
+                || debug_scope_values[fact.scope] < 2
+                || lexical_end_at[instr.index()].is_some_and(|window_end| {
+                    fact.end_instr.is_none_or(|end| end.index() > window_end)
+                }))
+        {
+            // 候选拒绝[ProofIncomplete]：这里只统一函数根作用域声明的多次写；前置分支或
+            // 循环不改变后继声明的 owner，不能用 CFG 入口块替代词法可见性。内层声明的
+            // 词法提升、单写声明帧的槽复用仍由原 owner 决定。CLOSE 窗口早于 debug
+            // scope 结束时，也不能把本应跨窗口的身份声明固定在窗口内部。
             continue;
         }
         let local = LocalId(local_count);
@@ -481,7 +675,10 @@ pub(super) fn build_bindings(
             &proto.debug_locals[fact.scope].name,
         )));
         debug_scope_targets.insert(fact.scope, BoundSlotTarget::Local(local));
-        debug_nil_decls.insert(temp, local);
+        debug_initializer_decls.insert(temp, local);
+        if matches!(fact.value.ssa(), Some(SsaValue::Phi(_))) {
+            debug_preheader_targets.insert(temp, BoundSlotTarget::Local(local));
+        }
         declared_local_home_slots.push((local, home));
     }
     let mut bound_temp_targets = temp_debug_scopes
@@ -493,6 +690,9 @@ pub(super) fn build_bindings(
             Some((TempId(index), target))
         })
         .collect::<BTreeMap<_, _>>();
+    // phi 入口的 preheader Def 早于 debug start，未必带名称 hint；原初始化发射为
+    // local 后，其出边读取也必须指向该身份，不能留下未定义的旧 temp。
+    bound_temp_targets.extend(debug_preheader_targets);
     let mut local_debug_scopes = vec![None; local_count];
     for (&scope, &target) in &debug_scope_targets {
         if let BoundSlotTarget::Local(local) = target {
@@ -530,17 +730,10 @@ pub(super) fn build_bindings(
         epochs: captured_slot_epochs,
         numeric_binding_phis: &numeric_binding_phis.bindings,
     });
-    captured_temp_facts.decl_temps.extend(debug_nil_decls);
+    captured_temp_facts
+        .decl_temps
+        .extend(debug_initializer_decls);
 
-    let lexical_scopes = lexical_windows::collect_lexical_scopes(
-        proto,
-        cfg,
-        dataflow,
-        graph,
-        structure,
-        emission,
-        captured_slots.lexical_scopes.clone(),
-    );
     let captured_entry_locals = captured_slots
         .entry_local_decls
         .iter()
@@ -651,6 +844,14 @@ pub(super) fn build_bindings(
         temp_count: next_temp_index,
         temp_debug_locals,
         temp_debug_scopes,
+        closed_capture_temps: captured_slots
+            .closed_capture_defs
+            .iter()
+            .filter_map(|def| {
+                (fixed_temps[def.index()] == TempId(def.index()))
+                    .then_some(fixed_temps[def.index()])
+            })
+            .collect(),
         fixed_temps,
         phi_temps,
         home_free_temps,
@@ -669,7 +870,7 @@ pub(super) fn build_bindings(
         entry_local_regs,
         numeric_for_locals,
         numeric_binding_copies,
-        numeric_binding_phi_locals,
+        for_binding_phi_locals,
         generic_for_locals,
         block_local_regs,
     }

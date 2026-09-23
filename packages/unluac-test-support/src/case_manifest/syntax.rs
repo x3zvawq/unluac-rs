@@ -89,7 +89,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_syntax/functions_02_lua55_global_function_assignment.lua",
         &["function-sugar", "global"],
         "保证已声明global的后续function值写保持赋值，不能重写成global function声明。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55]).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_syntax/tables_01_constructor_field_name_sugar.lua",

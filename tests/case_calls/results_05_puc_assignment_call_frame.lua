@@ -1,4 +1,9 @@
 -- 原高槽 CALL 的单结果经两次低槽 MOVE 写回；完整帧须保留赋值和后继 COPY，避免每轮新增 callee。
+-- 返回 COPY 只承担原返回槽，不能继承同名 HIR local 的旧 CALL 写域而产生中转声明。
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]]
+-- unluac: expect-contains [[return first, second, target]] [[@debug=retained]]
+-- unluac: expect-contains [[if _VERSION == "Lua 5.1" then]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
 -- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]

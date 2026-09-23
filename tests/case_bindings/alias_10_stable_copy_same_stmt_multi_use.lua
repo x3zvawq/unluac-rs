@@ -7,6 +7,8 @@
 -- unluac: expect-contains [[return r6_0, r6_0, r6_0]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=6]]
 -- unluac: expect-not-contains [[local r9_0 = p9_0]]
+-- unluac: expect-contains [[.value = p9_0()]]
+-- unluac: expect-ast-count [[local-decl]] [[6]] [[@proto=9]]
 
 local function return_alias()
     local source = {}

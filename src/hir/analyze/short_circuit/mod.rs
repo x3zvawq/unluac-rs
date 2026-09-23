@@ -6,6 +6,7 @@
 
 mod decision;
 mod lowering;
+mod operands;
 
 use crate::hir::common::{
     HirDecisionExpr, HirDecisionNode, HirDecisionNodeRef, HirDecisionTarget, HirExpr,

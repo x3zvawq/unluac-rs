@@ -33,7 +33,7 @@ impl HirVisitor<'_> for HirExitResiduals {
 
     fn visit_expr(&mut self, expr: &HirExpr) {
         match expr {
-            HirExpr::Decision(_) => self.decisions += 1,
+            HirExpr::Decision(decision) if !decision.emit_as_luau_if => self.decisions += 1,
             HirExpr::Unresolved(_) => self.unresolved += 1,
             _ => {}
         }

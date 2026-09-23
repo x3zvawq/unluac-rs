@@ -1,4 +1,8 @@
 -- Decision 可在终端直接写回现存 cell；逻辑叶的中间结果不能提前写回。
+-- Boolean 参数与消息 COPY 共用完整 FASTCALL 帧，不留下预写占位和后继调用中转。
+-- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=0]]
+-- 先完成短路 RHS，再写回 captured cell；不为谓词 CALL 留下独立 callee 副本。
+-- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=1]]
 local function choose(flag, first)
     local current = "old"
     local trace = {}

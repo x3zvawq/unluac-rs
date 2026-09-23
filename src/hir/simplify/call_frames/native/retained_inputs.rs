@@ -178,9 +178,11 @@ pub(super) fn require_suffix_frames(
 fn closure_initializers(proto: &HirProto, facts: &ProtoPromotionFacts) -> BTreeMap<usize, TempId> {
     let restrictions = frame_restrictions(proto, facts);
     let context = NativeFrameContext {
+        expanded_callees: None,
         proto,
         barred: &restrictions.barred,
         closed: &restrictions.closed,
+        callee_aliases: &restrictions.callee_aliases,
         constants_fit_rk: tables::constants_fit_rk(proto),
     };
     let mut flat = Vec::new();

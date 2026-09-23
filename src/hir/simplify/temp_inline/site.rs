@@ -123,7 +123,13 @@ pub(super) fn transparent_block_head(mut stmt: &HirStmt) -> Option<&HirStmt> {
 }
 
 pub(super) fn inline_site_in_repeat_condition(cond: &HirExpr, temp: TempId) -> Option<InlineSite> {
-    find_site_in_expr(cond, temp, InlineSite::LoopCondition)
+    // 调用方已证明 producer 位于本轮 body；移到 until 不增加求值轮次。
+    // 短路右臂仍由 conditional 分类拒绝，循环外 producer 继续走 LoopCondition。
+    if let HirExpr::Call(call) = cond {
+        find_site_in_call(call, temp, InlineSite::Direct)
+    } else {
+        find_site_in_expr(cond, temp, InlineSite::Condition)
+    }
 }
 
 /// 判断相邻赋值是否只是在 method 协议前冻结可直接写回源码的 receiver。

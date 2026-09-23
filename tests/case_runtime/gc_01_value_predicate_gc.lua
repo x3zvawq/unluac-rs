@@ -63,6 +63,19 @@ local function compared_value(b)
     if flag == true then return methods.next() else return true end
 end
 
+-- 低目标 Boolean 写回不覆盖高槽 CALL 结果；后继 __index 可在准备 callee 前观察旧根。
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@dialect=lua5.1]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@dialect=lua5.2]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@dialect=lua5.3]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@dialect=lua5.4]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@dialect=lua5.5]] [[@proto=13]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@dialect=luajit]] [[@proto=1]]
+local function predicate_writeback()
+    local flag
+    if probe() then flag = true else flag = false end
+    return methods.next(), flag
+end
+
 print("double_value", double_value(true,false))
 print("double_local", double_local())
 print("predicate", predicate(true,false))
@@ -72,3 +85,4 @@ print("retained_value", retained_value(true))
 print("logical_value", logical_value(false))
 print("copied_value", copied_value(false))
 print("compared_value", compared_value(false))
+print("predicate_writeback", predicate_writeback())

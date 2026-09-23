@@ -1,4 +1,5 @@
 -- regress_401_forwarded_lvalue_eval_order: closure allocation stays before an eventful lvalue prefix
+-- unluac: expect-contains [[return {}]]
 
 local observed
 local target = setmetatable({}, {

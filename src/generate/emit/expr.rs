@@ -209,6 +209,27 @@ impl<'a> Emitter<'a> {
                 PREC_PREFIX,
                 Assoc::Left,
             ),
+            AstExpr::IfExpr(branch) => {
+                if self.target.version != DecompileDialect::Luau {
+                    return Err(GenerateError::UnsupportedFeature {
+                        dialect: self.target.version,
+                        feature: "Luau if expression",
+                    });
+                }
+                (
+                    Doc::concat([
+                        Doc::text("(if "),
+                        self.emit_expr(&branch.cond, function, 0, ExprSide::Standalone)?,
+                        Doc::text(" then "),
+                        self.emit_expr(&branch.then_expr, function, 0, ExprSide::Standalone)?,
+                        Doc::text(" else "),
+                        self.emit_expr(&branch.else_expr, function, 0, ExprSide::Standalone)?,
+                        Doc::text(")"),
+                    ]),
+                    PREC_LITERAL,
+                    Assoc::Non,
+                )
+            }
             AstExpr::MethodCall(call) => (
                 self.emit_method_call_expr(call, function)?,
                 PREC_PREFIX,

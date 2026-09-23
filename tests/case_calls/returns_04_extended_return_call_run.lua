@@ -1,13 +1,15 @@
 -- regress_353_extended_return_producers: each producer keeps its complete non-tail dynamic-callee preparation run
--- unluac: expect-count [[local r4_0 =]] [[1]]
--- unluac: expect-count [[local r4_1 =]] [[1]]
--- unluac: expect-count [[local r7_0 =]] [[1]]
--- unluac: expect-count [[local r7_1 =]] [[1]]
--- unluac: expect-count [[local r11_0 =]] [[1]]
--- unluac: expect-count [[local r11_1 =]] [[1]]
+-- unluac: expect-count [[local r4_0 =]] [[1]] [[@debug=stripped]]
+-- unluac: expect-count [[local r4_1 =]] [[1]] [[@debug=stripped]]
+-- unluac: expect-count [[local r7_0 =]] [[1]] [[@debug=stripped]]
+-- unluac: expect-count [[local r7_1 =]] [[1]] [[@debug=stripped]]
+-- unluac: expect-count [[local r11_0 =]] [[1]] [[@debug=stripped]]
+-- unluac: expect-count [[local r11_1 =]] [[1]] [[@debug=stripped]]
 -- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=4]]
 -- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=7]]
 -- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=11]]
+
+-- unluac: expect-contains [[{ nested = { value = 47 } }]]
 
 do
     -- Call producer.

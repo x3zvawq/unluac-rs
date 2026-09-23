@@ -328,10 +328,50 @@ impl PlanLoweringIndex {
             consumed_loop_copy_targets,
             repeat_staged_result_by_phi,
             edge_action_use_count,
+            move_reads_capture: collect_move_capture_reads(lowering),
             absorbed_region_result_moves,
             shared_ssa_temps,
         })
     }
+}
+
+// SSA 不记录 child 经 upvalue 的写入。MOVE 链一旦读过可变 cell，就不能用
+// canonical 初始化来源替代实际快照；缓存每条链的结果，避免逐 edge 重走长链。
+fn collect_move_capture_reads(lowering: &ProtoLowering<'_>) -> Vec<bool> {
+    let dataflow = lowering.dataflow;
+    let mut resolved = vec![None; dataflow.defs.len()];
+    let mut path = Vec::new();
+    for definition in &dataflow.defs {
+        let mut value = SsaValue::Def(definition.id);
+        let reads_capture = loop {
+            let SsaValue::Def(def) = value else {
+                break false;
+            };
+            if let Some(reads_capture) = resolved[def.index()] {
+                break reads_capture;
+            }
+            resolved[def.index()] = Some(true);
+            path.push(def.index());
+            let site = dataflow.def_instr(def);
+            let LowInstr::Move(copy) = lowering.proto.instrs[site.index()] else {
+                break false;
+            };
+            if lowering
+                .promotion_facts
+                .move_crosses_reference_cell(lowering.bindings.fixed_temps[def.index()])
+            {
+                break true;
+            }
+            let Some(source) = dataflow.use_values[site.index()].fixed.get(copy.src) else {
+                break true;
+            };
+            value = source;
+        };
+        for index in path.drain(..) {
+            resolved[index] = Some(reads_capture);
+        }
+    }
+    resolved.into_iter().map(|value| value.unwrap()).collect()
 }
 
 pub(super) fn record_edge_action_use(
@@ -380,6 +420,12 @@ pub(super) fn build_absorbed_region_result_moves(
         else {
             continue;
         };
+        if lowering
+            .promotion_facts
+            .move_crosses_reference_cell(lowering.bindings.fixed_temps[definition.id.index()])
+        {
+            continue;
+        }
         if lowering
             .promotion_facts
             .has_copy_root_boundary(definition.instr.index()..definition.instr.index() + 1)

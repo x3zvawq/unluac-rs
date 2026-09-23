@@ -489,10 +489,14 @@ pub(super) fn classify_loop_continue_guard(
     } else {
         (else_entry, then_entry, true)
     };
-    // 普通 while/generic-for 的 normal arm 若只在 escape 汇入，就是源码 gated tail。
+    // normal arm 若只在 escape 汇入，就是源码 gated tail。repeat 的条件前也可能
+    // 还有一次 TEST；先将它归入正常臂，不能把空 guard 与后续测试串成无条件顺序。
     if matches!(
         owner.0.kind_hint,
-        LoopKindHint::WhileLike | LoopKindHint::WhileTrueLike | LoopKindHint::GenericForLike
+        LoopKindHint::WhileLike
+            | LoopKindHint::WhileTrueLike
+            | LoopKindHint::RepeatLike
+            | LoopKindHint::GenericForLike
     ) && branch_index.has_single_local_join(merge, then_entry)
     {
         return None;

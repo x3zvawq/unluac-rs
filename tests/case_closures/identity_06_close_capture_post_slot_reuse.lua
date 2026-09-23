@@ -1,6 +1,10 @@
 -- regress_273_close_capture_post_slot_reuse: Close 后复用物理槽不得越过循环体 local 的词法边界
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 根函数保留两个迭代绑定；assert 的动态索引参数不另建中转 local。
+-- unluac: expect-ast-count [[local-binding]] [[6]] [[@proto=0]]
+-- 循环内同一 value 供读写闭包共享，不引入捕获交接绑定。
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
 
 local function build()
     local readers = {}

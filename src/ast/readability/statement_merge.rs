@@ -196,6 +196,7 @@ fn merge_adjacent_single_value_local_decls(
 ) -> bool {
     let old_stmts = std::mem::take(&mut block.stmts);
     let use_index = BindingUseIndex::for_stmts_with_trailing_expr(&old_stmts, trailing_condition);
+    let write_index = BindingWriteIndex::for_stmts(&old_stmts);
     let mut old_stmts = VecDeque::from(old_stmts);
     let mut new_stmts = Vec::with_capacity(old_stmts.len());
     let mut changed = false;
@@ -220,9 +221,9 @@ fn merge_adjacent_single_value_local_decls(
             index += 1;
             continue;
         }
-        if binding_is_owned_by_inline_exprs(&use_index, index + 1, binding) {
-            // 候选拒绝[LayerBoundary]：单次-use 的独立 local 保持为 inline-exprs
-            // candidate；若先并入 multi-local，后层将无法再消费该 binding。
+        if binding_needs_independent_declaration(&use_index, &write_index, index + 1, binding) {
+            // 候选拒绝[LayerBoundary]：待清理或内联的独立 local 不能先固化为 multi-local；
+            // cleanup 无法删除其中的非尾槽，残留的无用别名还可能延长对象生命周期。
             new_stmts.push(stmt);
             index += 1;
             continue;
@@ -249,9 +250,13 @@ fn merge_adjacent_single_value_local_decls(
                 // 候选拒绝[PolicyBoundary]：复杂 RHS 受展示预算限制。
                 break;
             }
-            if binding_is_owned_by_inline_exprs(&use_index, lookahead + 1, next_binding) {
-                // 候选拒绝[LayerBoundary]：单次-use 声明是当前连续 merge run 的分段点；
-                // 已形成的前缀仍可合并，该声明及其后缀交给后续扫描与 inline-exprs。
+            if binding_needs_independent_declaration(
+                &use_index,
+                &write_index,
+                lookahead + 1,
+                next_binding,
+            ) {
+                // 候选拒绝[LayerBoundary]：cleanup/inline-exprs 的独立候选是合并分段点。
                 break;
             }
             if bindings
@@ -287,9 +292,10 @@ fn merge_adjacent_single_value_local_decls(
         }
 
         if bindings.len() >= 2
-            && bindings
-                .iter()
-                .any(|b| use_index.count_uses_in_suffix(lookahead, b.id) > 1)
+            && bindings.iter().any(|b| {
+                use_index.count_uses_in_suffix(lookahead, b.id) > 1
+                    || write_index.has_write_after(index, b.id)
+            })
         {
             new_stmts.push(AstStmt::LocalDecl(Box::new(AstLocalDecl {
                 bindings,
@@ -312,13 +318,22 @@ fn merge_adjacent_single_value_local_decls(
     changed
 }
 
-fn binding_is_owned_by_inline_exprs(
+fn binding_needs_independent_declaration(
     use_index: &BindingUseIndex,
+    write_index: &BindingWriteIndex,
     suffix_start: usize,
     binding: &AstLocalBinding,
 ) -> bool {
+    let uses = use_index.count_uses_in_suffix(suffix_start, binding.id);
+    if uses == 0 {
+        // 下沉可能刚产生尚未被 cleanup 消费的 dead copy；不能让它因并入另一个
+        // 有用声明而继续持有对象。仍有生命周期职责的 binding 也保持原独立边界。
+        return true;
+    }
     super::inline_exprs::local_attr_belongs_to_inline_pipeline(binding.attr)
-        && use_index.count_uses_in_suffix(suffix_start, binding.id) == 1
+        && uses == 1
+        // 分支更新后的唯一读取不是初始化值的单次使用，不能把这种状态绑定留给内联。
+        && !write_index.has_write_after(suffix_start - 1, binding.id)
 }
 
 fn sink_hoisted_temp_decls(block: &mut AstBlock, trailing_condition: Option<&AstExpr>) -> bool {

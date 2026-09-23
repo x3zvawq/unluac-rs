@@ -1,10 +1,7 @@
-//! Luau 短路值树的完整调用准备，消费已有 CALL 来源和原逻辑结果 home。
+//! 短路值树的完整调用准备，消费已有 CALL 来源和原逻辑结果 home。
 //!
-//! 值叶写结果槽，只作真假判断的叶在其高一槽调用。例如 `(a() and b()) or c()`
-//! 的 a 不产生最终值，CALL 位于 result+1；b/c 则写 result。temp-inline 必须保留
-//! 逻辑结果及后继异槽 COPY，不能从首个 CALL 推测整棵树的结果身份。本模块只投影
-//! 已有源码树的值/条件语境；事件、callee/参数 Def 和生命周期仍由共享 builder 证明。
-//! 只用于已经预留结果槽的 local initializer；普通 Assign 的额外结果准备不属于此合同。
+//! Luau 的值/条件叶使用不同准备槽；单次 CALL 与标量备用值则消费原分支合流事实。
+//! 事件、callee/参数 Def 和生命周期由共享 builder 证明，实际源码前缀由 native owner 核对。
 
 use super::*;
 
@@ -15,13 +12,103 @@ enum LogicalUse {
 }
 
 impl FrameBuilder<'_> {
+    /// 原入口 COPY 是这棵值树的初值；按 Def 与 home 消费，不能沿展示 local 猜来源。
+    pub(super) fn luau_copy_value(
+        &mut self,
+        expr: &HirExpr,
+        before: usize,
+        initial: crate::hir::common::TempId,
+        home: HomeSlotKey,
+    ) -> Option<HirExpr> {
+        let owner = self.facts.promoted_local_for_temp(initial)?;
+        let mut rebuilt = expr.clone();
+        let mut head = &mut rebuilt;
+        while let HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) = head {
+            head = &mut logical.lhs;
+        }
+        if *head != HirExpr::LocalRef(owner) {
+            return None;
+        }
+        *head = self.expr(head, before, home.slot(), None, false, true, Some(initial))?;
+        self.luau_logical_value(&rebuilt, before, home)
+    }
+
+    pub(super) fn scalar_call_selection_layout(
+        &self,
+        logical: &crate::hir::common::HirLogicalExpr,
+        before: usize,
+        logical_and: bool,
+    ) -> Option<(HomeSlotKey, HomeSlotKey)> {
+        let lhs = match &logical.lhs {
+            HirExpr::LocalRef(local) => scalar_local(self.run[self.definition(*local, before)?])?.1,
+            lhs => lhs,
+        };
+        let HirExpr::Call(call) = lhs else {
+            return None;
+        };
+        self.facts
+            .short_circuit_call_homes(call, &logical.rhs, logical_and)
+    }
+
+    pub(super) fn scalar_call_selection(
+        &mut self,
+        logical: &crate::hir::common::HirLogicalExpr,
+        before: usize,
+        slot: usize,
+        logical_and: bool,
+        (input, result): (HomeSlotKey, HomeSlotKey),
+    ) -> Option<HirExpr> {
+        let context = self.native?;
+        // Luau 可先保留逻辑结果，在高一槽调用后按分支 COPY；O0 与 PUC/JIT 可直接复用结果槽。
+        if result != HomeSlotKey::new(slot, 0)
+            || !(input == result
+                || self.dialect == DecompileDialect::Luau && input.slot() == slot + 1)
+            || context.barred.contains(&input)
+            || context.closed.contains(&input)
+            || context.closed.contains(&result)
+        {
+            return None;
+        }
+        let lhs = self.expr(&logical.lhs, before, input.slot(), None, false, true, None)?;
+        let rebuilt = Box::new(crate::hir::common::HirLogicalExpr {
+            preserves_boolean_prewrite: logical.preserves_boolean_prewrite,
+            lhs,
+            rhs: logical.rhs.clone(),
+        });
+        Some(if logical_and {
+            HirExpr::LogicalAnd(rebuilt)
+        } else {
+            HirExpr::LogicalOr(rebuilt)
+        })
+    }
+
+    /// 值叶写结果槽，只作真假判断的叶在其高一槽调用，例如 `(a() and b()) or c()`
+    /// 的 a。声明 initializer 预留结果槽，现存低槽写回则保留独立 RHS 暂存槽。
     pub(super) fn luau_logical_value(
         &mut self,
         expr: &HirExpr,
         before: usize,
         result: HomeSlotKey,
     ) -> Option<HirExpr> {
-        self.luau_logical_tree(expr, before, result, LogicalUse::Value)
+        if let HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) = expr
+            && let Some(layout) = self.scalar_call_selection_layout(
+                logical,
+                before,
+                matches!(expr, HirExpr::LogicalAnd(_)),
+            )
+        {
+            return self.scalar_call_selection(
+                logical,
+                before,
+                result.slot(),
+                matches!(expr, HirExpr::LogicalAnd(_)),
+                layout,
+            );
+        }
+        let previous = self.boolean_frame.replace(result.slot());
+        let value = self.luau_logical_tree(expr, before, result, LogicalUse::Value);
+        self.boolean_frame = previous;
+        value
     }
 
     fn luau_logical_tree(
@@ -60,7 +147,11 @@ impl FrameBuilder<'_> {
                 if checkpoint != (self.first_event, self.next_event) {
                     return None;
                 }
-                let logical = Box::new(crate::hir::common::HirLogicalExpr { lhs, rhs });
+                let logical = Box::new(crate::hir::common::HirLogicalExpr {
+                    preserves_boolean_prewrite: logical.preserves_boolean_prewrite,
+                    lhs,
+                    rhs,
+                });
                 Some(if and {
                     HirExpr::LogicalAnd(logical)
                 } else {
@@ -95,8 +186,46 @@ impl FrameBuilder<'_> {
                 }
                 self.expr(expr, before, home.slot(), None, false, false, None)
             }
+            HirExpr::Binary(binary)
+                if matches!(usage, LogicalUse::Condition { .. })
+                    && matches!(
+                        binary.op,
+                        crate::hir::common::HirBinaryOpKind::Eq
+                            | crate::hir::common::HirBinaryOpKind::Lt
+                            | crate::hir::common::HirBinaryOpKind::Le
+                            | crate::hir::common::HirBinaryOpKind::Gt
+                            | crate::hir::common::HirBinaryOpKind::Ge
+                    ) =>
+            {
+                // 比较仍位于值树原来的条件位置；外层已消费该结果槽的 Boolean
+                // 预写，既保留低槽读取，也不把整个值树改成无写回的纯谓词。
+                self.expr(expr, before, result.slot(), None, false, true, None)
+            }
             HirExpr::Binary(_) if matches!(usage, LogicalUse::Value) => {
                 self.expr(expr, before, result.slot(), None, false, false, None)
+            }
+            HirExpr::Unary(unary) if unary.op == crate::hir::common::HirUnaryOpKind::Neg => {
+                let predicate = matches!(
+                    usage,
+                    LogicalUse::Condition {
+                        retain_value: false,
+                        ..
+                    }
+                );
+                let slot = result.slot() + usize::from(predicate);
+                self.expr(expr, before, slot, None, false, false, None)
+            }
+            HirExpr::Nil
+            | HirExpr::Boolean(_)
+            | HirExpr::Integer(_)
+            | HirExpr::Number(_)
+            | HirExpr::String(_) => Some(expr.clone()),
+            HirExpr::LocalRef(_) | HirExpr::ParamRef(_)
+                if self
+                    .direct_home(expr)
+                    .is_some_and(|home| home.slot() < self.base) =>
+            {
+                Some(expr.clone())
             }
             _ => None,
         }

@@ -260,6 +260,19 @@ fn write_value_decisions(output: &mut String, indent: &str, plan: &super::Struct
             decision.result_reg.index(),
             format_display_set(&decision.blocks),
         );
+        for operand in &decision.operands {
+            let _ = writeln!(
+                output,
+                "{indent}      operand phi{} entry=n{} continuation=n{} consumer=n{} nodes={:?} leaves={:?} current-values={:?}",
+                operand.phi.index(),
+                operand.entry.index(),
+                operand.continuation.index(),
+                operand.consumer.index(),
+                operand.nodes,
+                operand.leaves,
+                operand.current_values
+            );
+        }
         for node in &decision.nodes {
             let _ = writeln!(
                 output,

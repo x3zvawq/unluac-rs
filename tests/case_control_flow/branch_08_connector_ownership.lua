@@ -1,4 +1,15 @@
--- unluac: expect-ast-min [[if]] [[1]] [[@proto=1]]
+-- unluac: expect-ast-min [[if]] [[1]]
+-- unluac: expect-ast-count [[local-binding]] [[10]] [[@proto=0]]
+-- unluac: expect-ast-min [[if]] [[1]] [[@proto=1]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=5]] [[@dialect=luajit]]
+-- unluac: expect-not-contains [[unresolved]]
+-- unluac: expect-contains [[function GFunc.isOpenstor()]]
+-- unluac: expect-contains [[function GFunc.isOfficialChannel()]]
 local RateUs = {}
 
 RateUs.isAvailable = function()

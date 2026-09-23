@@ -2,6 +2,10 @@
 -- 各方言的 GC 观察与自己的源码基线比较，不约定跨 VM 的残余槽存活。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[.child(5)]]
+-- unluac: expect-contains [[return flag and sink(observe("first"), provider.child(observe("argument")))]] [[@debug=retained]]
+-- unluac: expect-contains [[while sink(observe("first"), callee(observe("argument"))) == 12 do]] [[@debug=retained]]
+-- unluac: expect-not-contains [[ = print]]
+-- unluac: expect-not-contains [[while true do]]
 local weak = setmetatable({}, {__mode = "v"})
 local trace = {}
 local function observe(label)

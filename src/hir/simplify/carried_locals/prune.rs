@@ -55,6 +55,7 @@ pub(super) fn prune_redundant_copy_stmts(
     block: &mut HirBlock,
     preserved_bindings: &BTreeSet<CarryBinding>,
     call_preparations: &BTreeSet<(CarryBinding, CarryBinding)>,
+    reference_captured: &BTreeSet<CarryBinding>,
 ) -> bool {
     let mut previous_copy = None;
     let mut changed = false;
@@ -79,6 +80,9 @@ pub(super) fn prune_redundant_copy_stmts(
                         // 候选拒绝[LayerBoundary]：前次 CALL 写回后的反向 COPY 仍是下次
                         // callee/SELF 的原准备事件，由完整调用帧消费，不能仅据同值裁剪。
                         && !call_preparations.contains(&(target, source))
+                        // 捕获 cell 的回读可开启新的赋值快照；同值不授权把它并回
+                        // 前一次 CALL 结果，否则后续帧失去独立消费这两个版本的边界。
+                        && !reference_captured.contains(&source)
                 },
             )
         {
@@ -89,6 +93,266 @@ pub(super) fn prune_redundant_copy_stmts(
             true
         }
     });
+    changed
+}
+
+/// 原同槽 COPY 已完成写入时，把合流身份接回该写点；不把逻辑转移推迟到计算之后。
+pub(super) fn restore_phi_copy_writes(
+    proto: &mut HirProto,
+    facts: &mut ProtoPromotionFacts,
+) -> bool {
+    use super::super::mention::{BindingReadCollector, stmts_captured_locals};
+    use crate::hir::common::HirBinding;
+    let mut read_temps = BTreeSet::new();
+    visit_stmts(
+        &proto.body.stmts,
+        &mut BindingReadCollector(|binding| {
+            if let HirBinding::Temp(temp) = binding {
+                read_temps.insert(temp);
+            }
+        }),
+    );
+    let captured = stmts_captured_locals(&proto.body.stmts);
+    struct Restore<'a> {
+        facts: &'a mut ProtoPromotionFacts,
+        read: &'a BTreeSet<TempId>,
+        captured: &'a BTreeSet<LocalId>,
+        debug: &'a [Option<String>],
+        debug_scopes: &'a [Option<usize>],
+        merges: Vec<(TempId, LocalId)>,
+    }
+    impl HirRewritePass for Restore<'_> {
+        fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+            let Some(HirStmt::Assign(phi)) = block.stmts.last() else {
+                return false;
+            };
+            if !phi.is_phi_transfer
+                || phi.values.tail.is_some()
+                || phi.targets.len() != phi.values.fixed.len()
+            {
+                return false;
+            }
+            let mut candidates = BTreeMap::new();
+            let targets = phi
+                .targets
+                .iter()
+                .filter_map(|target| match target {
+                    HirLValue::Local(local) => Some(*local),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            for (component, (target, source)) in
+                phi.targets.iter().zip(&phi.values.fixed).enumerate()
+            {
+                let HirLValue::Local(target) = target else {
+                    continue;
+                };
+                let Some(source @ (HirBinding::Local(_) | HirBinding::Param(_))) =
+                    HirBinding::from_expr(source)
+                else {
+                    continue;
+                };
+                if self.captured.contains(target)
+                    || matches!(source, HirBinding::Local(local) if targets.contains(&local))
+                {
+                    continue;
+                }
+                if let Some(home) = self.facts.trusted_local_home_slot(*target) {
+                    candidates.insert(home, (component, *target, source));
+                }
+            }
+            if candidates.is_empty() {
+                return false;
+            }
+            // phi 持有 canonical producer，原 MOVE 则可能读取它的另一份低槽副本。
+            // 只在同一顺序区间跟踪未捕获 local 的当前值版本；写入立即换版本，
+            // 因而不能把曾经同值、后来已被覆盖的 binding 当作原 COPY 的来源。
+            let suffix = block.stmts[..block.stmts.len() - 1]
+                .iter()
+                .rposition(|stmt| {
+                    matches!(
+                        stmt,
+                        HirStmt::Block(_)
+                            | HirStmt::If(_)
+                            | HirStmt::While(_)
+                            | HirStmt::Repeat(_)
+                            | HirStmt::NumericFor(_)
+                            | HirStmt::GenericFor(_)
+                            | HirStmt::Goto(_)
+                            | HirStmt::Label(_)
+                            | HirStmt::Break
+                            | HirStmt::Continue
+                            | HirStmt::Return(_)
+                    )
+                })
+                .map_or(0, |index| index + 1);
+            let mut versions = BTreeMap::new();
+            let mut next_version = 0usize;
+            let mut copy_versions = Vec::new();
+            for (index, stmt) in block
+                .stmts
+                .iter()
+                .enumerate()
+                .take(block.stmts.len() - 1)
+                .skip(suffix)
+            {
+                let source = single_binding_copy(stmt).and_then(|(target, source)| {
+                    let CarryBinding::Local(source) = source else {
+                        return None;
+                    };
+                    if self.captured.contains(&source) {
+                        return None;
+                    }
+                    let version = *versions.entry(source).or_insert_with(|| {
+                        next_version += 1;
+                        next_version
+                    });
+                    Some((target, version))
+                });
+                let mut writes = BindingWriteCollector::default();
+                visit_stmts(std::slice::from_ref(stmt), &mut writes);
+                if let HirStmt::LocalDecl(decl) = stmt {
+                    writes.locals.extend(decl.bindings.iter().copied());
+                }
+                for local in writes.locals {
+                    let version = source
+                        .filter(|(target, _)| *target == CarryBinding::Local(local))
+                        .map_or_else(
+                            || {
+                                next_version += 1;
+                                next_version
+                            },
+                            |(_, version)| version,
+                        );
+                    versions.insert(local, version);
+                }
+                if let Some((CarryBinding::Temp(temp), version)) = source {
+                    copy_versions.push((index, temp, version));
+                }
+            }
+            let equivalent_copies = copy_versions
+                .into_iter()
+                .filter_map(|(index, temp, version)| {
+                    let home = self.facts.trusted_temp_home_slot(temp)?;
+                    let (_, _, HirBinding::Local(expected)) = candidates.get(&home)? else {
+                        return None;
+                    };
+                    (!self.captured.contains(expected) && versions.get(expected) == Some(&version))
+                        .then_some(index)
+                })
+                .collect::<BTreeSet<_>>();
+            let mut touched = BTreeSet::new();
+            let mut written = BTreeSet::new();
+            let mut replacements = Vec::new();
+            for (index, stmt) in block
+                .stmts
+                .iter()
+                .enumerate()
+                .take(block.stmts.len() - 1)
+                .skip(suffix)
+                .rev()
+            {
+                if let Some((temp, value)) = stmt.scalar_temp_assignment()
+                    && let Some(source @ (HirBinding::Local(_) | HirBinding::Param(_))) =
+                        HirBinding::from_expr(value)
+                    && !self.read.contains(&temp)
+                    && self.debug.get(temp.index()).is_none_or(Option::is_none)
+                    && self
+                        .debug_scopes
+                        .get(temp.index())
+                        .is_none_or(Option::is_none)
+                    && let Some(home) = self.facts.trusted_temp_home_slot(temp)
+                    && let Some(&(component, target, expected)) = candidates.get(&home)
+                    && match expected {
+                        HirBinding::Local(_) => {
+                            source == expected || equivalent_copies.contains(&index)
+                        }
+                        // canonical phi 已绕过高槽 COPY；用原 SSA 的只读参数身份认回
+                        // 这次写，将目标接回 phi local，保留当前 RHS 与原覆盖位置。
+                        HirBinding::Param(param) => {
+                            self.facts.readonly_parameter_copy(temp) == Some(param)
+                        }
+                        _ => false,
+                    }
+                    && !touched.contains(&target)
+                    && !matches!(source, HirBinding::Local(local) if written.contains(&local))
+                    && matches!(stmt, HirStmt::Assign(copy)
+                        if !copy.is_phi_transfer
+                            && copy.initializer_merge_transaction.is_none()
+                            && copy.generic_for_initializer_producer.is_none()
+                            && copy.generic_for_dispatch_release.is_none()
+                            && copy.method_rewrite_transaction.is_none())
+                {
+                    replacements.push((index, component, temp, target));
+                    candidates.remove(&home);
+                    written.insert(target);
+                }
+                let mut collector = (
+                    BindingReadCollector(|binding| {
+                        if let HirBinding::Local(local) = binding {
+                            touched.insert(local);
+                        }
+                    }),
+                    BindingWriteCollector::default(),
+                );
+                visit_stmts(std::slice::from_ref(stmt), &mut collector);
+                let (_, writes) = collector;
+                touched.extend(writes.locals.iter().copied());
+                written.extend(writes.locals);
+                if let HirStmt::LocalDecl(decl) = stmt {
+                    touched.extend(decl.bindings.iter().copied());
+                    written.extend(decl.bindings.iter().copied());
+                }
+            }
+            if replacements.is_empty() {
+                return false;
+            }
+            let mut removed = BTreeSet::new();
+            for (index, component, temp, target) in replacements {
+                let HirStmt::Assign(copy) = &mut block.stmts[index] else {
+                    unreachable!()
+                };
+                copy.targets[0] = HirLValue::Local(target);
+                self.facts.record_temp_to_local_merge(temp, target);
+                self.merges.push((temp, target));
+                removed.insert(component);
+            }
+            let Some(HirStmt::Assign(phi)) = block.stmts.last_mut() else {
+                unreachable!()
+            };
+            let mut component = 0;
+            phi.targets.retain(|_| {
+                let keep = !removed.contains(&component);
+                component += 1;
+                keep
+            });
+            component = 0;
+            phi.values.fixed.retain(|_| {
+                let keep = !removed.contains(&component);
+                component += 1;
+                keep
+            });
+            if phi.targets.is_empty() {
+                block.stmts.pop();
+            }
+            true
+        }
+    }
+    let mut restore = Restore {
+        facts,
+        read: &read_temps,
+        captured: &captured,
+        debug: &proto.temp_debug_locals,
+        debug_scopes: &proto.temp_debug_scopes,
+        merges: Vec::new(),
+    };
+    let changed = super::super::walk::rewrite_block(&mut proto.body, &mut restore);
+    for (temp, local) in restore.merges {
+        proto.inline_dispositions.promote_temp_to_local(temp, local);
+        if proto.physical_root_temps.contains(&temp) {
+            proto.physical_root_locals.insert(local);
+        }
+    }
     changed
 }
 
@@ -352,7 +616,8 @@ fn dead_for_binding_temp_mirror_can_be_pruned(
         return false;
     };
     if !facts.active_for_bindings.contains(local)
-        || !facts.promotion_facts.is_loop_carrier_temp(*temp)
+        || !(facts.promotion_facts.is_loop_carrier_temp(*temp)
+            || facts.promotion_facts.is_phi_carrier_temp(*temp))
     {
         return false;
     }
@@ -547,7 +812,10 @@ fn mirror_write_disposition(
     let (HirLValue::Temp(temp), HirExpr::LocalRef(local)) = (target, value) else {
         return MirrorWriteDisposition::Survives;
     };
-    if !active_for_bindings.contains(local) || !promotion_facts.is_loop_carrier_temp(*temp) {
+    if !active_for_bindings.contains(local)
+        || !(promotion_facts.is_loop_carrier_temp(*temp)
+            || promotion_facts.is_phi_carrier_temp(*temp))
+    {
         return MirrorWriteDisposition::Survives;
     }
     let Some(target_home) = promotion_facts.home_slot(*temp) else {
@@ -577,9 +845,9 @@ struct BranchStateCopyFacts<'a> {
 fn rewrite_branch_state_block(
     block: &mut HirBlock,
     facts: &BranchStateCopyFacts<'_>,
-    mut known: BTreeMap<LocalId, TempId>,
+    mut known: BTreeMap<LocalId, CarryBinding>,
     allow_prune: bool,
-) -> (bool, BTreeMap<LocalId, TempId>) {
+) -> (bool, BTreeMap<LocalId, CarryBinding>) {
     let mut changed = false;
     block.stmts.retain_mut(|stmt| {
         match stmt {
@@ -606,9 +874,8 @@ fn rewrite_branch_state_block(
                     rewrite_branch_state_block(nested, facts, known.clone(), allow_prune);
                 changed |= nested_changed;
                 known = nested_known;
-                for local in declared {
-                    known.remove(&local);
-                }
+                known.retain(|local, source| !declared.contains(local)
+                    && !matches!(source, CarryBinding::Local(source) if declared.contains(source)));
             }
             HirStmt::While(while_stmt) => {
                 invalidate_capture_writes_from_expr(&mut known, &while_stmt.cond, facts);
@@ -616,9 +883,7 @@ fn rewrite_branch_state_block(
                     &while_stmt.body,
                     &known,
                     facts,
-                    !facts
-                        .safety
-                        .is_discard_safe_without_residual(&while_stmt.cond),
+                    facts.safety.may_observe_gc_roots(&while_stmt.cond),
                 );
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut while_stmt.body, facts, loop_entry, true);
@@ -632,9 +897,7 @@ fn rewrite_branch_state_block(
                     &repeat_stmt.body,
                     &known,
                     facts,
-                    !facts
-                        .safety
-                        .is_discard_safe_without_residual(&repeat_stmt.cond),
+                    facts.safety.may_observe_gc_roots(&repeat_stmt.cond),
                 );
                 let (body_changed, _) =
                     rewrite_branch_state_block(&mut repeat_stmt.body, facts, loop_entry, true);
@@ -675,8 +938,8 @@ fn rewrite_branch_state_block(
             }
             stmt => {
                 if allow_prune
-                    && direct_local_temp_copy(stmt).is_some_and(|(local, temp)| {
-                        known.get(&local) == Some(&temp) && facts.can_remove(local, temp)
+                    && direct_local_binding_copy(stmt).is_some_and(|(local, temp)| {
+                        known.get(&local) == Some(&temp) && facts.can_remove(stmt, local, temp)
                     })
                 {
                     changed = true;
@@ -697,8 +960,16 @@ fn rewrite_branch_state_block(
 }
 
 impl BranchStateCopyFacts<'_> {
-    fn can_remove(&self, local: LocalId, temp: TempId) -> bool {
-        // 候选拒绝[PolicyBoundary]：retain-debug 模式保留源码 local/temp 的显式写入位置与值 epoch，不把它压成支配声明（regress_336 retain-debug）。
+    fn can_remove(&self, stmt: &HirStmt, local: LocalId, source: CarryBinding) -> bool {
+        if matches!(stmt, HirStmt::Assign(assign) if assign.is_phi_transfer) {
+            // 合流转移没有独立的 VM 写事件；已建立且未失效的同值关系足以删除
+            // 重复转移。仍保留目标声明、原初始化和 PhysicalFramePrefix 身份。
+            return true;
+        }
+        let CarryBinding::Temp(temp) = source else {
+            // 原 local/param COPY 不由路径同值证明删除，留给其完整帧 owner。
+            return false;
+        };
         self.debug_locals
             .get(local.index())
             .is_none_or(Option::is_none)
@@ -712,60 +983,58 @@ impl BranchStateCopyFacts<'_> {
     }
 }
 
-fn direct_local_temp_copy(stmt: &HirStmt) -> Option<(LocalId, TempId)> {
+fn direct_local_binding_copy(stmt: &HirStmt) -> Option<(LocalId, CarryBinding)> {
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
-    let ([HirLValue::Local(local)], [HirExpr::TempRef(temp)], None) = (
+    let ([HirLValue::Local(local)], [value], None) = (
         assign.targets.as_slice(),
         assign.values.fixed.as_slice(),
         &assign.values.tail,
     ) else {
         return None;
     };
-    Some((*local, *temp))
+    Some((*local, carry_binding_from_expr(value)?))
 }
 
-fn direct_local_temp_decl(stmt: &HirStmt) -> Option<(LocalId, TempId)> {
+fn direct_local_binding_decl(stmt: &HirStmt) -> Option<(LocalId, CarryBinding)> {
     let HirStmt::LocalDecl(decl) = stmt else {
         return None;
     };
-    let ([local], [HirExpr::TempRef(temp)], None) = (
+    let ([local], [value], None) = (
         decl.bindings.as_slice(),
         decl.values.fixed.as_slice(),
         &decl.values.tail,
     ) else {
         return None;
     };
-    Some((*local, *temp))
+    Some((*local, carry_binding_from_expr(value)?))
 }
 
 fn update_known_state(
     stmt: &HirStmt,
-    known: &mut BTreeMap<LocalId, TempId>,
+    known: &mut BTreeMap<LocalId, CarryBinding>,
     facts: &BranchStateCopyFacts<'_>,
 ) {
     invalidate_capture_writes_from_stmt(known, stmt, facts);
-    if let Some((local, temp)) =
-        direct_local_temp_copy(stmt).or_else(|| direct_local_temp_decl(stmt))
-    {
-        known.insert(local, temp);
-        return;
-    }
+    let copy = direct_local_binding_copy(stmt).or_else(|| direct_local_binding_decl(stmt));
     let mut writes = BindingWriteCollector::default();
     visit_stmts(std::slice::from_ref(stmt), &mut writes);
     invalidate_known_state(known, &writes);
+    if let Some((local, source)) = copy {
+        known.insert(local, source);
+    }
 }
 
 /// 循环体里的删除必须在首轮入口和每一条实际回边上都成立。这里对有限的
-/// `(local -> temp)` must-state 做单调递减迭代；goto 会把回边降到 unknown，nested loop
+/// `(local -> binding)` must-state 做单调递减迭代；goto 会把回边降到 unknown，nested loop
 /// 则只按其完整写集失效当前关系，不把内层 continue 错认成外层回边。
 fn stable_loop_entry(
     body: &HirBlock,
-    initial: &BTreeMap<LocalId, TempId>,
+    initial: &BTreeMap<LocalId, CarryBinding>,
     facts: &BranchStateCopyFacts<'_>,
     backedge_may_execute_user_code: bool,
-) -> BTreeMap<LocalId, TempId> {
+) -> BTreeMap<LocalId, CarryBinding> {
     let mut entry = initial.clone();
     loop {
         let mut flow = analyze_loop_flow(body, entry.clone(), facts);
@@ -785,13 +1054,13 @@ fn stable_loop_entry(
 }
 
 struct LoopFlow {
-    fallthrough: Option<BTreeMap<LocalId, TempId>>,
-    backedges: Option<BTreeMap<LocalId, TempId>>,
+    fallthrough: Option<BTreeMap<LocalId, CarryBinding>>,
+    backedges: Option<BTreeMap<LocalId, CarryBinding>>,
 }
 
 fn analyze_loop_flow(
     block: &HirBlock,
-    initial: BTreeMap<LocalId, TempId>,
+    initial: BTreeMap<LocalId, CarryBinding>,
     facts: &BranchStateCopyFacts<'_>,
 ) -> LoopFlow {
     let mut flow = LoopFlow {
@@ -884,9 +1153,9 @@ fn analyze_loop_flow(
 }
 
 fn merge_known_paths(
-    left: Option<BTreeMap<LocalId, TempId>>,
-    right: Option<BTreeMap<LocalId, TempId>>,
-) -> Option<BTreeMap<LocalId, TempId>> {
+    left: Option<BTreeMap<LocalId, CarryBinding>>,
+    right: Option<BTreeMap<LocalId, CarryBinding>>,
+) -> Option<BTreeMap<LocalId, CarryBinding>> {
     match (left, right) {
         (Some(left), Some(right)) => Some(intersect_known_states(left, right)),
         (Some(known), None) | (None, Some(known)) => Some(known),
@@ -894,23 +1163,34 @@ fn merge_known_paths(
     }
 }
 
-fn remove_known_locals(known: &mut Option<BTreeMap<LocalId, TempId>>, locals: &BTreeSet<LocalId>) {
+fn remove_known_locals(
+    known: &mut Option<BTreeMap<LocalId, CarryBinding>>,
+    locals: &BTreeSet<LocalId>,
+) {
     if let Some(known) = known {
-        for local in locals {
-            known.remove(local);
-        }
+        known.retain(|local, source| {
+            !locals.contains(local)
+                && !matches!(source, CarryBinding::Local(source) if locals.contains(source))
+        });
     }
 }
 
-fn invalidate_known_state(known: &mut BTreeMap<LocalId, TempId>, writes: &BindingWriteCollector) {
+fn invalidate_known_state(
+    known: &mut BTreeMap<LocalId, CarryBinding>,
+    writes: &BindingWriteCollector,
+) {
     for local in &writes.locals {
         known.remove(local);
     }
-    known.retain(|_, temp| !writes.temps.contains(temp));
+    known.retain(|_, source| match source {
+        CarryBinding::Local(local) => !writes.locals.contains(local),
+        CarryBinding::Temp(temp) => !writes.temps.contains(temp),
+        CarryBinding::Param(param) => !writes.params.contains(param),
+    });
 }
 
 fn invalidate_capture_writes_from_stmt(
-    known: &mut BTreeMap<LocalId, TempId>,
+    known: &mut BTreeMap<LocalId, CarryBinding>,
     stmt: &HirStmt,
     facts: &BranchStateCopyFacts<'_>,
 ) {
@@ -922,7 +1202,7 @@ fn invalidate_capture_writes_from_stmt(
 }
 
 fn invalidate_capture_writes_from_block(
-    known: &mut BTreeMap<LocalId, TempId>,
+    known: &mut BTreeMap<LocalId, CarryBinding>,
     block: &HirBlock,
     facts: &BranchStateCopyFacts<'_>,
 ) {
@@ -934,27 +1214,31 @@ fn invalidate_capture_writes_from_block(
 }
 
 fn invalidate_capture_writes_from_expr(
-    known: &mut BTreeMap<LocalId, TempId>,
+    known: &mut BTreeMap<LocalId, CarryBinding>,
     expr: &HirExpr,
     facts: &BranchStateCopyFacts<'_>,
 ) {
-    if !facts.safety.is_discard_safe_without_residual(expr) {
+    if facts.safety.may_observe_gc_roots(expr) {
         invalidate_reference_captured_state(known, facts);
     }
 }
 
 fn invalidate_reference_captured_state(
-    known: &mut BTreeMap<LocalId, TempId>,
+    known: &mut BTreeMap<LocalId, CarryBinding>,
     facts: &BranchStateCopyFacts<'_>,
 ) {
     known.retain(|local, temp| {
         !facts.reference_captured_locals.contains(local)
-            && !facts.reference_captured_temps.contains(temp)
+            && match temp {
+                CarryBinding::Local(source) => !facts.reference_captured_locals.contains(source),
+                CarryBinding::Temp(source) => !facts.reference_captured_temps.contains(source),
+                CarryBinding::Param(_) => false,
+            }
     });
 }
 
 fn invalidate_optional_reference_captured_state(
-    known: &mut Option<BTreeMap<LocalId, TempId>>,
+    known: &mut Option<BTreeMap<LocalId, CarryBinding>>,
     facts: &BranchStateCopyFacts<'_>,
 ) {
     if let Some(known) = known {
@@ -962,16 +1246,16 @@ fn invalidate_optional_reference_captured_state(
     }
 }
 
-fn invalidate_written_bindings(known: &mut BTreeMap<LocalId, TempId>, body: &HirBlock) {
+fn invalidate_written_bindings(known: &mut BTreeMap<LocalId, CarryBinding>, body: &HirBlock) {
     let mut writes = BindingWriteCollector::default();
     visit_stmts(&body.stmts, &mut writes);
     invalidate_known_state(known, &writes);
 }
 
 fn intersect_known_states(
-    mut left: BTreeMap<LocalId, TempId>,
-    right: BTreeMap<LocalId, TempId>,
-) -> BTreeMap<LocalId, TempId> {
+    mut left: BTreeMap<LocalId, CarryBinding>,
+    right: BTreeMap<LocalId, CarryBinding>,
+) -> BTreeMap<LocalId, CarryBinding> {
     left.retain(|local, temp| right.get(local) == Some(temp));
     left
 }
@@ -990,6 +1274,7 @@ fn declared_locals(block: &HirBlock) -> BTreeSet<LocalId> {
 
 #[derive(Default)]
 struct BindingWriteCollector {
+    params: BTreeSet<crate::hir::common::ParamId>,
     locals: BTreeSet<LocalId>,
     temps: BTreeSet<TempId>,
 }
@@ -1003,10 +1288,10 @@ impl HirVisitor<'_> for BindingWriteCollector {
             HirLValue::Temp(temp) => {
                 self.temps.insert(*temp);
             }
-            HirLValue::Param(_)
-            | HirLValue::Upvalue(_)
-            | HirLValue::Global(_)
-            | HirLValue::TableAccess(_) => {}
+            HirLValue::Param(param) => {
+                self.params.insert(*param);
+            }
+            HirLValue::Upvalue(_) | HirLValue::Global(_) | HirLValue::TableAccess(_) => {}
         }
     }
 }

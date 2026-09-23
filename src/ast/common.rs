@@ -122,6 +122,7 @@ pub enum AstExpr {
     Binary(Box<AstBinaryExpr>),
     LogicalAnd(Box<AstLogicalExpr>),
     LogicalOr(Box<AstLogicalExpr>),
+    IfExpr(Box<AstIfExpr>),
     Call(Box<AstCallExpr>),
     MethodCall(Box<AstMethodCallExpr>),
     SingleValue(Box<AstExpr>),
@@ -135,12 +136,37 @@ pub enum AstExpr {
 /// 赋值语句。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstAssign {
+    /// HIR 已证明的 Luau 全局原地更新；values 保留完整读取与运算，供分析访问。
+    pub(crate) luau_compound_global: bool,
     pub targets: Vec<AstLValue>,
     pub values: Vec<AstExpr>,
     /// 从 HIR 原样传入的、仅供相邻 initializer merge 消费的一次性 token。
     pub initializer_merge_transaction: Option<HirInitializerMergeTransactionId>,
     /// 从 HIR 原样传入的 method setup 原子改写事务。
     pub(crate) method_rewrite_transaction: Option<HirMethodRewriteTransactionId>,
+}
+
+impl AstAssign {
+    /// 只检查 HIR 证书的剩余语法形状，不从同名读写重新推断复合更新许可。
+    pub(crate) fn compound_global_binary(&self) -> Option<&AstBinaryExpr> {
+        let ([AstLValue::Name(AstNameRef::Global(target))], [AstExpr::Binary(binary)]) =
+            (self.targets.as_slice(), self.values.as_slice())
+        else {
+            return None;
+        };
+        (self.luau_compound_global
+            && matches!(&binary.lhs, AstExpr::Var(AstNameRef::Global(input)) if input == target)
+            && matches!(
+                binary.op,
+                AstBinaryOpKind::Add
+                    | AstBinaryOpKind::Sub
+                    | AstBinaryOpKind::Mul
+                    | AstBinaryOpKind::Div
+                    | AstBinaryOpKind::Mod
+                    | AstBinaryOpKind::Pow
+            ))
+        .then_some(binary)
+    }
 }
 
 /// 赋值左值。
@@ -241,6 +267,8 @@ pub struct AstFunctionExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstFunctionDecl {
     pub target: AstFunctionName,
+    /// 来自显式 global 声明；普通 `function name()` 仍是赋值，不能打开 global 词法域。
+    pub global_declaration: bool,
     pub func: AstFunctionExpr,
 }
 
@@ -279,6 +307,7 @@ pub struct AstTargetDialect {
 pub struct AstDialectCaps {
     pub goto_label: bool,
     pub continue_stmt: bool,
+    pub if_expr: bool,
     pub local_const: bool,
     pub local_close: bool,
     pub global_decl: bool,
@@ -292,6 +321,8 @@ pub enum AstFeature {
     GotoLabel,
     #[strum(serialize = "continue")]
     ContinueStmt,
+    #[strum(serialize = "if-expression")]
+    IfExpr,
     #[strum(serialize = "local<const>")]
     LocalConst,
     #[strum(serialize = "local<close>")]
@@ -309,6 +340,7 @@ impl AstTargetDialect {
             DecompileDialect::Auto => AstDialectCaps {
                 goto_label: control.goto_label,
                 continue_stmt: control.continue_stmt,
+                if_expr: matches!(version, DecompileDialect::Luau),
                 local_const: false,
                 local_close: false,
                 global_decl: false,
@@ -317,6 +349,7 @@ impl AstTargetDialect {
             DecompileDialect::Lua51 => AstDialectCaps {
                 goto_label: control.goto_label,
                 continue_stmt: control.continue_stmt,
+                if_expr: matches!(version, DecompileDialect::Luau),
                 local_const: false,
                 local_close: false,
                 global_decl: false,
@@ -325,6 +358,7 @@ impl AstTargetDialect {
             DecompileDialect::Lua52 | DecompileDialect::Lua53 => AstDialectCaps {
                 goto_label: control.goto_label,
                 continue_stmt: control.continue_stmt,
+                if_expr: matches!(version, DecompileDialect::Luau),
                 local_const: false,
                 local_close: false,
                 global_decl: false,
@@ -333,6 +367,7 @@ impl AstTargetDialect {
             DecompileDialect::Lua54 => AstDialectCaps {
                 goto_label: control.goto_label,
                 continue_stmt: control.continue_stmt,
+                if_expr: matches!(version, DecompileDialect::Luau),
                 local_const: true,
                 local_close: true,
                 global_decl: false,
@@ -341,6 +376,7 @@ impl AstTargetDialect {
             DecompileDialect::Lua55 => AstDialectCaps {
                 goto_label: control.goto_label,
                 continue_stmt: control.continue_stmt,
+                if_expr: matches!(version, DecompileDialect::Luau),
                 local_const: true,
                 local_close: true,
                 global_decl: true,
@@ -349,6 +385,7 @@ impl AstTargetDialect {
             DecompileDialect::Luajit => AstDialectCaps {
                 goto_label: control.goto_label,
                 continue_stmt: control.continue_stmt,
+                if_expr: matches!(version, DecompileDialect::Luau),
                 local_const: false,
                 local_close: false,
                 global_decl: false,
@@ -357,6 +394,7 @@ impl AstTargetDialect {
             DecompileDialect::Luau => AstDialectCaps {
                 goto_label: control.goto_label,
                 continue_stmt: control.continue_stmt,
+                if_expr: matches!(version, DecompileDialect::Luau),
                 local_const: false,
                 local_close: false,
                 global_decl: false,
@@ -382,6 +420,7 @@ impl AstDialectCaps {
         match feature {
             AstFeature::GotoLabel => self.goto_label,
             AstFeature::ContinueStmt => self.continue_stmt,
+            AstFeature::IfExpr => self.if_expr,
             AstFeature::LocalConst => self.local_const,
             AstFeature::LocalClose => self.local_close,
             AstFeature::GlobalDecl => self.global_decl,
@@ -569,6 +608,8 @@ pub struct AstIndexAccess {
 pub struct AstUnaryExpr {
     pub op: AstUnaryOpKind,
     pub expr: AstExpr,
+    /// 原 NOT/取负等操作的保留义务，与其结果是否已知分开。
+    pub(crate) original_operation: bool,
 }
 
 /// 二元表达式。
@@ -577,6 +618,8 @@ pub struct AstBinaryExpr {
     pub op: AstBinaryOpKind,
     pub lhs: AstExpr,
     pub rhs: AstExpr,
+    /// 原字节码中的操作不能因操作数已知而删除；合成节点没有这项义务。
+    pub(crate) original_operation: bool,
 }
 
 /// 逻辑表达式。
@@ -584,11 +627,23 @@ pub struct AstBinaryExpr {
 pub struct AstLogicalExpr {
     pub lhs: AstExpr,
     pub rhs: AstExpr,
+    /// HIR 已消费原 Boolean 预写；逻辑外壳负责重发该写，不能按值恒等式删除。
+    pub(crate) preserves_boolean_prewrite: bool,
+}
+
+/// Luau 条件选值；只求值被选中的一臂，结果始终为单值。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AstIfExpr {
+    pub cond: AstExpr,
+    pub then_expr: AstExpr,
+    pub else_expr: AstExpr,
 }
 
 /// 普通调用。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstCallExpr {
+    /// 保留 HIR 对该调用的必须内联要求；树化、复制后由 Generate 核对完整 occurrence 集。
+    pub(crate) required_luau_inlining: Option<crate::hir::HirSourceSite>,
     pub callee: AstExpr,
     pub args: Vec<AstExpr>,
     /// HIR 已确认的 SELF/NAMECALL 原始字段 key。`Call` 形状仍保留这份
@@ -654,6 +709,8 @@ pub enum AstTableKey {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AstIf {
     pub cond: AstExpr,
+    /// HIR 标记的原退化 TEST；即使条件已知或两臂为空也要保留检查。
+    pub(crate) preserves_empty_test: bool,
     pub then_block: AstBlock,
     pub else_block: Option<AstBlock>,
 }

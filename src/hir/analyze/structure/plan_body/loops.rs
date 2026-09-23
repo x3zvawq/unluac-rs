@@ -499,7 +499,10 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 region: region.index(),
                 detail: "numeric for has no selected source binding",
             })?;
-        let mut stmts = self.lower_syntax_region_prefix(region, preheader_region, None)?;
+        let mut stmts = PlannedBlock::from(
+            self.lower_loop_value_phase(region, LoopValuePhase::BeforePreheader)?,
+        );
+        stmts.append(self.lower_syntax_region_prefix(region, preheader_region, None)?);
         stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
         if let Some((_, guard)) = &normal_tail {
             stmts.push(assign_stmt(
@@ -615,7 +618,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 "generic for dispatch result definitions changed after planning",
             );
         };
-        let mut stmts =
+        let mut preheader_stmts =
             self.lower_syntax_region_prefix(region, preheader_region, protocol.prep_instr)?;
         let (initializer_transaction, initializer_roots) = lower_generic_for_initializer_facts(
             self.lowering,
@@ -623,8 +626,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             protocol,
             self.proto,
             region.index(),
-            stmts.stmts_mut(),
+            preheader_stmts.stmts_mut(),
         );
+        let mut stmts = PlannedBlock::from(
+            self.lower_loop_value_phase(region, LoopValuePhase::BeforePreheader)?,
+        );
+        stmts.append(preheader_stmts);
         stmts.extend_plain(self.lower_loop_value_phase(region, LoopValuePhase::BeforeLoop)?);
         if let Some((_, guard)) = &normal_tail {
             stmts.push(assign_stmt(

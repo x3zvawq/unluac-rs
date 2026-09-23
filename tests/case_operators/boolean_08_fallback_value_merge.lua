@@ -3,8 +3,11 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[repeat]]
 -- unluac: expect-not-contains [[if true then]]
--- unluac: expect-contains [[do]]
--- unluac: expect-order [[do]] [[assert]]
+-- 原 callee 的低槽前缀保留 hardware_type；比较指令本身仍须位于 assert 前。
+-- unluac: expect-count [[local r0_0 = "mobile"]] [[1]]
+-- unluac: expect-count [[if r0_0 == "mobile" then]] [[1]]
+-- unluac: expect-order [[local r0_0 = "mobile"]] [[if r0_0 == "mobile" then]]
+-- unluac: expect-order [[if r0_0 == "mobile" then]] [[assert]]
 
 local hardware_type = "mobile"
 local environment = {

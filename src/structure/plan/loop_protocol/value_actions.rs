@@ -114,7 +114,65 @@ pub(super) fn freeze_value_actions(
     actions.elided.extend(exit.elided);
     actions.elided.sort();
     actions.elided.dedup();
+    place_entry_nil_initializers(&context, &mut actions);
     Ok(actions)
+}
+
+fn place_entry_nil_initializers(context: &LoopValueContext<'_>, actions: &mut LoopValueActions) {
+    if !context.proto.clears_entry_scratch
+        || context.payload.preheader_block != Some(context.cfg.entry_block)
+        || context.proto.signature.has_vararg_param_reg
+    {
+        return;
+    }
+    // Entry SSA 与 VM 清槽共同证明初始化已在 preheader 之前发生。这里只发布
+    // 紧接参数的连续源码前缀；有空洞、实际 Def 或其它初始化的槽不靠 nil 补齐。
+    let mut candidates = BTreeMap::new();
+    for (batch_index, batch) in actions.batches.iter().enumerate() {
+        if batch.phase != LoopValuePhase::BeforeLoop {
+            continue;
+        }
+        for (write_index, write) in batch.writes.iter().enumerate() {
+            let LoopValueSource::Ssa(SsaValue::Entry(reg)) = write.source else {
+                continue;
+            };
+            if context
+                .plan
+                .phi_plan(write.target)
+                .is_some_and(|phi| phi.reg == reg)
+            {
+                candidates
+                    .entry(reg.index())
+                    .or_insert_with(Vec::new)
+                    .push((batch_index, write_index));
+            }
+        }
+    }
+    let mut selected = BTreeSet::new();
+    let mut slot = usize::from(context.proto.signature.num_params);
+    while let Some(writes) = candidates.remove(&slot) {
+        // 同槽多个独立结果 phi 不能同时占用一个源码声明槽。
+        if writes.len() != 1 {
+            break;
+        }
+        selected.extend(writes);
+        slot += 1;
+    }
+    let mut entry = Vec::new();
+    for (batch_index, batch) in actions.batches.iter_mut().enumerate() {
+        let mut write_index = 0;
+        batch.writes.retain(|write| {
+            let move_to_entry = selected.contains(&(batch_index, write_index));
+            write_index += 1;
+            if move_to_entry {
+                entry.push(write.clone());
+            }
+            !move_to_entry
+        });
+    }
+    entry.sort_by_key(|write| context.plan.phi_plan(write.target).unwrap().reg.index());
+    actions.batches.retain(|batch| !batch.writes.is_empty());
+    push_batch(&mut actions.batches, LoopValuePhase::BeforePreheader, entry);
 }
 
 pub(super) fn freeze_exit_actions(

@@ -5,6 +5,8 @@
 //! 例如：`local f = function() end` 会在这里变成 `local function f() end`。
 //! 共享声明 target 查询只投影名字与方言限制；函数内容由获准的直接/转发 owner 复制。
 
+use super::super::binding_flow::MutableSnapshotNames;
+use super::forwarded::lvalue_prefix_can_move_before_closure;
 use crate::ast::common::{
     AstAssign, AstExpr, AstFunctionDecl, AstFunctionName, AstGlobalBindingTarget, AstGlobalDecl,
     AstLValue, AstLocalAttr, AstLocalDecl, AstLocalFunctionDecl, AstLocalOrigin, AstNamePath,
@@ -65,11 +67,12 @@ pub(super) fn lower_declared_function(stmts: &[AstStmt]) -> Option<(AstStmt, usi
 pub(super) fn lower_direct_function_stmt(
     stmt: &AstStmt,
     target: AstTargetDialect,
+    mutable_snapshots: &MutableSnapshotNames,
 ) -> Option<AstStmt> {
     match stmt {
         AstStmt::LocalDecl(local_decl) => try_lower_local_function_decl(local_decl),
         AstStmt::GlobalDecl(global_decl) => try_lower_global_function_decl(global_decl, target),
-        AstStmt::Assign(assign) => try_lower_function_assign(assign, target),
+        AstStmt::Assign(assign) => try_lower_function_assign(assign, target, mutable_snapshots),
         _ => None,
     }
 }
@@ -127,33 +130,39 @@ fn try_lower_global_function_decl(
             root: AstNameRef::Global(name.clone()),
             fields: Vec::new(),
         }),
+        global_declaration: true,
         func: func.as_ref().clone(),
     })))
 }
 
-fn try_lower_function_assign(assign: &AstAssign, target: AstTargetDialect) -> Option<AstStmt> {
+fn try_lower_function_assign(
+    assign: &AstAssign,
+    target: AstTargetDialect,
+    mutable_snapshots: &MutableSnapshotNames,
+) -> Option<AstStmt> {
     if assign.targets.len() != 1 || assign.values.len() != 1 {
         return None;
     }
     let AstExpr::FunctionExpr(func) = &assign.values[0] else {
         return None;
     };
-    let target = function_decl_target_from_lvalue(&assign.targets[0], target)?;
+    if target.version == crate::decompile::DecompileDialect::Luau
+        && !lvalue_prefix_can_move_before_closure(&assign.targets[0], mutable_snapshots)
+    {
+        // 候选拒绝[SemanticBarrier:EvalOrder]：Luau 普通赋值先求目标，函数声明
+        // 却先分配闭包；带读取事件的目标不能仅为语法糖与 CLOSURE 交换顺序。
+        return None;
+    }
+    let target = function_decl_target_from_lvalue(&assign.targets[0])?;
     Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
         target,
+        global_declaration: false,
         func: func.as_ref().clone(),
     })))
 }
 
-pub(super) fn function_decl_target_from_lvalue(
-    target: &AstLValue,
-    dialect: AstTargetDialect,
-) -> Option<AstFunctionName> {
+pub(super) fn function_decl_target_from_lvalue(target: &AstLValue) -> Option<AstFunctionName> {
     match target {
-        AstLValue::Name(AstNameRef::Global(_)) if dialect.caps.global_decl => {
-            // 候选拒绝[SemanticBarrier:DeclarationIdentity]：普通赋值若输出成 `global function` 会重复声明已有 global，反例见 regress_411。
-            None
-        }
         AstLValue::Name(name) => {
             // 候选接受[BindingIdentityProof]：Lua 的 plain `function name()` 正是对当前
             // binding 的函数赋值；流水线中的 Temp 已由前置 materialize pass 物化。

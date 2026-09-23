@@ -51,6 +51,20 @@ struct CleanupPass {
 }
 
 impl AstRewritePass for CleanupPass {
+    fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
+        match stmt {
+            AstStmt::NumericFor(for_stmt) => flatten_closed_tail_scope(&mut for_stmt.body),
+            AstStmt::If(branch) => {
+                let mut changed = flatten_closed_tail_scope(&mut branch.then_block);
+                if let Some(block) = &mut branch.else_block {
+                    changed |= flatten_closed_tail_scope(block);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
     fn rewrite_block(&mut self, block: &mut AstBlock, kind: BlockKind) -> bool {
         cleanup_block(
             block,
@@ -63,6 +77,33 @@ impl AstRewritePass for CleanupPass {
     fn rewrite_repeat_body(&mut self, block: &mut AstBlock, condition: &AstExpr) -> bool {
         cleanup_block(block, false, Some(condition), self.target)
     }
+}
+
+// 仅由 if 分支和 numeric-for 正文调用：两个词法域在同一出口结束，后面没有
+// 仍属于父域的 Return hook 或 repeat condition，debug local 的可见区间也不延长。
+fn flatten_closed_tail_scope(block: &mut AstBlock) -> bool {
+    let mut changed = false;
+    while let Some(AstStmt::DoBlock(nested)) = block.stmts.last() {
+        if nested
+            .stmts
+            .iter()
+            .flat_map(AstStmt::local_bindings)
+            .any(|binding| {
+                binding.attr == AstLocalAttr::Close
+                    || !binding.rewrite_authority.may_merge_tail_scope()
+            })
+        {
+            // 候选拒绝[SemanticBarrier:Lifetime]：仍保留 HIR 的 root/capture 边界和
+            // 资源关闭动作；父块出口相同不替代这些独立的生命周期证明。
+            break;
+        }
+        let Some(AstStmt::DoBlock(nested)) = block.stmts.pop() else {
+            unreachable!("tail scope candidate was checked above");
+        };
+        block.stmts.extend(nested.stmts);
+        changed = true;
+    }
+    changed
 }
 
 struct RepeatTailCleanupPass;
@@ -103,15 +144,17 @@ fn cleanup_block(
     for (index, stmt) in old_stmts.into_iter().enumerate() {
         match stmt {
             AstStmt::DoBlock(nested)
-                if nested.stmts.len() == 1
-                    && can_elide_single_stmt_do_block(&nested.stmts[0])
+                if nested.stmts.iter().all(can_elide_single_stmt_do_block)
+                    && (nested.stmts.len() == 1
+                        || !nested.stmts.iter().any(|stmt| {
+                            matches!(stmt, AstStmt::Return(_) | AstStmt::Break | AstStmt::Continue)
+                        }))
                     // repeat 条件在正文末句之后求值；尾 do 必须交给下方携带 condition
                     // 的证明，否则通用单句清理会抢先删除唯一能在条件前释放 root 的作用域。
                     && !(trailing_condition.is_some() && index + 1 == stmt_count) =>
             {
-                // 这里专门清理“只剩一条非局部作用域语句”的机械 do-end。
-                // 它通常是前层为了暂存中间 local 范围而留下来的壳；一旦内部局部已经被
-                // 其他 pass 收回，这层壳继续保留只会让源码多出无意义缩进。
+                // 每条直属语句均不引入 binding 时，中间 local 已回收的多语句壳同样
+                // 不承载词法身份。保留求值顺序；多语句中的终结语法仍交给原控制流 owner。
                 flattened_stmts.extend(nested.stmts);
                 changed = true;
             }
@@ -875,6 +918,14 @@ fn unused_value_rejection(expr: &AstExpr, target: AstTargetDialect) -> UnusedVal
             .then(|| unused_value_rejection(child, target))
     };
     match expr {
+        AstExpr::Unary(unary) if unary.original_operation => UnusedValueRejection::PolicyBoundary,
+        AstExpr::IfExpr(branch) => rejected_child(&branch.cond)
+            .or_else(|| rejected_child(&branch.then_expr))
+            .or_else(|| rejected_child(&branch.else_expr))
+            .unwrap_or(UnusedValueRejection::ControlFlow),
+        AstExpr::Binary(binary) if binary.original_operation => {
+            UnusedValueRejection::PolicyBoundary
+        }
         AstExpr::CaptureInitializer(_) => UnusedValueRejection::TargetConstraint,
         AstExpr::SingleValue(inner) => unused_value_rejection(inner, target),
         AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {

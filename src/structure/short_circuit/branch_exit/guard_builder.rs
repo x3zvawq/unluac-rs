@@ -228,7 +228,7 @@ impl<'a, 'w> GuardBranchExitDagBuilder<'a, 'w> {
             dom_tree: self.dom_tree,
             root: self.root,
         }
-        .follow(target, |_| true, |_| false);
+        .follow(target, |_| true, |_| false, |_| false);
         let target = match followed.map(|followed| followed.target) {
             Some(LinearFollowTarget::Header(target)) => target,
             Some(LinearFollowTarget::Terminal(target)) => {

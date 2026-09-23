@@ -1,6 +1,7 @@
--- unluac: expect-not-contains [[9007199254740993 == 9007199254740992.0]]
--- unluac: expect-not-contains [[9007199254740992.0 < 9007199254740993]]
--- unluac: expect-contains [[return false, false, true]]
+-- 三个 return 操作数都保留，整数与浮点的精度边界交给目标 VM 判断。
+-- unluac: expect-count [[9007199254740993]] [[3]]
+-- unluac: expect-count [[9007199254740992.0]] [[3]]
+-- unluac: expect-contains [[9007199254740993 <= 9007199254740992.0]]
 
 -- 两端边界与分数比较不能通过 integer -> f64 舍入决定。
 assert(9223372036854775807 < 9223372036854775808.0)

@@ -1,4 +1,4 @@
-//! 为入口 debug scope 分配参数或 local 绑定并提取 closure 名称；依赖 Structure 的入口 SSA 身份，不负责循环/捕获合并。例如参数 scope 的后续 nil 写仍写回 ParamId。
+//! 为函数入口已有的 debug scope 分配参数或 local 绑定，沿用 Structure 确认的入口 SSA 身份。
 
 use super::*;
 
@@ -24,7 +24,7 @@ pub(super) fn allocate_debug_entry_bindings(
     let mut scope_targets = BTreeMap::new();
 
     for fact in structure.debug_bindings().accepted() {
-        let SsaValue::Entry(reg) = fact.value else {
+        let Some(SsaValue::Entry(reg)) = fact.value.ssa() else {
             continue;
         };
         if fact.start_pc != 0 || Some(reg) == vararg_reg {
@@ -51,16 +51,4 @@ pub(super) fn allocate_debug_entry_bindings(
     }
 
     (declarations, scope_targets)
-}
-
-pub(super) fn closure_debug_name(proto: &LoweredProto, instr: Option<&LowInstr>) -> Option<String> {
-    let LowInstr::Closure(closure) = instr? else {
-        return None;
-    };
-    proto
-        .children
-        .get(closure.proto.index())?
-        .debug_name
-        .as_ref()
-        .map(decode_raw_string)
 }

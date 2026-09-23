@@ -245,7 +245,12 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
             HirStmt::Assign(assign) => {
                 let _ = writeln!(
                     output,
-                    "{indent}assign {} = {}",
+                    "{indent}assign{} {} = {}",
+                    if assign.luau_compound_global {
+                        "[luau-compound-global]"
+                    } else {
+                        ""
+                    },
                     assign
                         .targets
                         .iter()

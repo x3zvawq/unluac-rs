@@ -3,8 +3,13 @@
 -- unluac: expect-ast-min [[method-call]] [[1]]
 -- Luau must retain the shared RHS scratch of the two-target declaration and absorb call comparisons.
 -- unluac: expect-count [[nested = {}]] [[2]] [[@dialect=luau]]
--- Three closure bindings plus the grouped tables, selection, and two retained lookup temporaries.
--- unluac: expect-ast-max [[local-decl]] [[7]] [[@dialect=luau]] [[@proto=0]]
+-- 嵌套 callee 的原同槽读取应保留为完整比较参数，不产生读取、调用和比较的声明链。
+-- unluac: expect-contains [[.nested.field() == 23)]]
+-- unluac: expect-ast-max [[local-decl]] [[6]] [[@proto=0]]
+-- unluac: expect-contains [[.nested.field()]]
+-- 三个 installer 各只保留条件选出的 alias，闭包转发不额外声明函数。
+-- unluac: expect-ast-count [[local-function]] [[3]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-function]] [[3]]
 local function install(flag, left, right)
     local alias = flag and left or right
     function alias.field()

@@ -21,8 +21,8 @@ pub use common::{
     AstAssign, AstBinaryExpr, AstBinaryOpKind, AstBindingRef, AstBlock, AstCallExpr, AstCallKind,
     AstCallStmt, AstDialectCaps, AstExpr, AstFeature, AstFieldAccess, AstFunctionDecl,
     AstFunctionExpr, AstFunctionName, AstGenericFor, AstGlobalAttr, AstGlobalBinding,
-    AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIndexAccess,
-    AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
+    AstGlobalBindingTarget, AstGlobalDecl, AstGlobalName, AstGoto, AstIf, AstIfExpr,
+    AstIndexAccess, AstLValue, AstLabel, AstLabelId, AstLocalAttr, AstLocalBinding, AstLocalDecl,
     AstLocalFunctionDecl, AstLocalOrigin, AstLogicalExpr, AstMethodCallExpr, AstModule,
     AstNamePath, AstNameRef, AstNumericFor, AstRecordField, AstRepeat, AstReturn,
     AstRewriteAuthority, AstStmt, AstSyntheticLocalId, AstTableConstructor, AstTableField,
@@ -42,6 +42,7 @@ pub use naming::{
     FunctionNameMap, NameInfo, NameMap, NameSource, NamingError, NamingEvidence, NamingMode,
     NamingOptions, assign_name_map, assign_names_with_evidence, collect_naming_evidence,
 };
+pub(crate) use visit::written_locals;
 
 pub(crate) fn analyze_ast_stage(
     state: &mut crate::decompile::DecompileState,

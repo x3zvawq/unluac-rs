@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::decompile::DecompileDialect;
 use crate::hir::common::{
-    HirBinding, HirBlock, HirInlineRetentionReason, HirLValue, HirProto, HirStmt, LocalId,
+    HirBinding, HirBlock, HirInlineRetentionReason, HirLValue, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
 use crate::hir::simplify::mention::BindingReadCollector;
@@ -25,6 +25,7 @@ use crate::hir::visit::{HirVisitor, visit_stmts};
 
 pub(super) mod coordinates;
 mod materializations;
+pub(super) use materializations::close_gc_inert_terminal_prefix;
 pub(super) use materializations::{pending_nil_prefix_temps, restore_materializations};
 
 /// 候选除原 freereg 外，还可要求特定低槽身份在开始前已声明；不能借后缀新声明替代。
@@ -217,9 +218,8 @@ pub(super) fn validate_prefixes(
     let mut declared = BTreeSet::new();
     let mut header_slots = proto.params.len();
     if let Some(local) = proto.vararg_param_local {
-        // Lua 5.1 的 parlist 为 HASARG 保留一槽；当前函数真实使用省略号时，
-        // 编译器清除 NEEDSARG，不再建兼容表，但仍保留该槽。没有省略号不能借此
-        // 推断 legacy arg 的建表语义；Lua 5.5 则由其独立签名合同提供隐式槽。
+        // Lua 5.1 的 parlist 为 HASARG 保留一槽；省略号决定重编译时是否清除
+        // NEEDSARG。必须匹配原入口的建表事实，不能仅凭槽存在推断 GC 分配相同。
         let header_supported = match dialect {
             DecompileDialect::Lua55 => !proto.signature.legacy_arg_slot,
             DecompileDialect::Lua51 if proto.signature.legacy_arg_slot && !is_chunk_entry => {
@@ -234,7 +234,7 @@ pub(super) fn validate_prefixes(
                 }
                 let mut usage = VarargUse(false);
                 visit_stmts(&proto.body.stmts, &mut usage);
-                usage.0
+                usage.0 != proto.signature.legacy_arg_table
             }
             _ => false,
         };
@@ -252,6 +252,15 @@ pub(super) fn validate_prefixes(
             header_slots += 1;
         }
     }
+    let mut read_temps = BTreeSet::new();
+    visit_stmts(
+        &proto.body.stmts,
+        &mut BindingReadCollector(|binding| {
+            if let HirBinding::Temp(temp) = binding {
+                read_temps.insert(temp);
+            }
+        }),
+    );
     let mut scan = PrefixScan {
         facts,
         removed,
@@ -266,6 +275,7 @@ pub(super) fn validate_prefixes(
         rejected: BTreeMap::new(),
         scope_rejected: None,
         unproven_prefix: false,
+        read_temps,
         scan_suffix,
     };
     let invalid_from = scan.block(&proto.body).err();
@@ -304,6 +314,7 @@ struct PrefixScan<'a> {
     rejected: BTreeMap<usize, usize>,
     scope_rejected: Option<usize>,
     unproven_prefix: bool,
+    read_temps: BTreeSet<TempId>,
     scan_suffix: bool,
 }
 
@@ -358,6 +369,13 @@ impl PrefixScan<'_> {
                 break;
             }
             if *self.removed.get(index).ok_or(index)? {
+                // 删除整块只取消其声明效果，后续请求仍使用原快照的 DFS 坐标。
+                crate::hir::visit::for_each_nested_block(stmt, &mut |child| {
+                    coordinates::visit(child, &mut self.cursor, &mut |_, _, _| {});
+                });
+                if matches!(stmt, HirStmt::Repeat(_)) {
+                    self.cursor += 1;
+                }
                 continue;
             }
             if let HirStmt::Block(child) = stmt {
@@ -438,7 +456,7 @@ impl PrefixScan<'_> {
                         }
                         self.locals.push(None);
                     }
-                    if frame.binding.slot() != self.header_slots + self.locals.len()
+                    if frame.binding_slot != self.header_slots + self.locals.len()
                         || !self.declared.insert(for_.binding)
                     {
                         return Err(index);
@@ -470,6 +488,8 @@ impl PrefixScan<'_> {
                         }
                         self.locals.push(Some(local));
                     }
+                    self.locals
+                        .extend(std::iter::repeat_n(None, frame.binding_padding));
                     self.block(&for_.body)?;
                     self.leave_scope(loop_start);
                 }
@@ -486,10 +506,19 @@ impl PrefixScan<'_> {
                 }
                 HirStmt::Assign(assign)
                     if assign.targets.iter().all(|target| match target {
-                        HirLValue::Temp(_) => false,
+                        HirLValue::Temp(temp) => !self.read_temps.contains(temp),
                         HirLValue::Local(local) => self.declared.contains(local),
                         _ => true,
-                    }) => {}
+                    }) =>
+                {
+                    // 无读取或捕获的 Temp 不会为后续使用跨块提升声明，因此未知
+                    // 占槽只影响当前词法作用域。读取集合覆盖最后一个帧请求之后，
+                    // 防止提前结束扫描而漏掉后缀逃逸；有使用的 Temp 仍拒绝整个后缀。
+                    self.unproven_prefix |= assign
+                        .targets
+                        .iter()
+                        .any(|target| matches!(target, HirLValue::Temp(_)));
+                }
                 HirStmt::GlobalDecl(_)
                 | HirStmt::CallStmt(_)
                 | HirStmt::Return(_)

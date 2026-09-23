@@ -5,6 +5,7 @@
 -- unluac: expect-not-contains [[(function()]]
 -- unluac: expect-ast-min [[repeat]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[repeat-condition-local]] [[2]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[4]] [[@proto=1]]
 local function test_until_inner_ref()
     local result = {}
     local i = 0

@@ -4,6 +4,8 @@
 -- unluac: expect-not-contains [[local r1_]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
+-- 外层 CALL 的 NOT 参数保持完整表达式，不为 callee、结果或末尾 print 留中转声明。
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=0]]
 local anchor = {}
 local function is_anchor(value)
     return value == anchor

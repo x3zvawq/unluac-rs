@@ -1,6 +1,5 @@
--- unluac: expect-not-contains [[1 == 1.0]]
--- unluac: expect-not-contains [[1 < 1.5]]
--- unluac: expect-contains [[return true, true, false]]
+-- binary64 不区分 1 与 1.0 的表示，但原比较不因此变成常量。
+-- unluac: expect-contains [[return 1 == 1, 1 < 1.5, 1.5 <= 1]]
 
 assert(2147483647 < 2147483647.5)
 assert(-2147483648 == -2147483648.0)

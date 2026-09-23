@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::label_refs::count_label_references;
-use super::local_shapes::empty_single_local_decl_binding;
+use super::local_shapes::{empty_single_local_decl_binding, initialized_single_local_decl};
 use super::mention::{block_mentions_local, expr_mentions_local, expr_mentions_temp};
 use super::temp_inline::inline_exposed_branch_value_sinks_in_proto_with_facts;
 use super::temp_touch::collect_temp_touch_positions;
@@ -23,6 +23,7 @@ use crate::hir::common::{
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
+mod boolean_prewrite;
 mod decision_builder;
 
 use decision_builder::BranchValueDecisionBuilder;
@@ -34,8 +35,10 @@ pub(super) fn fold_branch_values_in_proto(
     dialect: DecompileDialect,
     safety: HirExprSafety,
 ) -> bool {
-    let exposed_temps = fold_root_branch_value_temps(proto, safety, facts);
-    let raw_temp_changed = !exposed_temps.is_empty();
+    let prewrite_changed = boolean_prewrite::restore(proto, facts, dialect);
+    let (exposed_temps, preserved_targets_changed) =
+        fold_root_branch_value_temps(proto, safety, facts);
+    let raw_temp_changed = !exposed_temps.is_empty() || preserved_targets_changed;
     inline_exposed_branch_value_sinks_in_proto_with_facts(
         proto,
         &exposed_temps,
@@ -59,7 +62,7 @@ pub(super) fn fold_branch_values_in_proto(
             safety,
         },
     );
-    raw_temp_changed || other_changed
+    prewrite_changed || raw_temp_changed || other_changed
 }
 
 struct BranchValuePass<'a> {
@@ -174,9 +177,14 @@ fn fold_nil_fallback_decision_locals_in_block(
         stmts.insert(
             index + 1,
             HirStmt::If(Box::new(HirIf {
+                preserves_empty_test: false,
                 cond: nil_check_for_local(rewrite.target),
                 then_block: HirBlock {
                     stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        luau_compound_global: false,
+                        upvalue_write_source: None,
+                        is_phi_transfer: false,
+                        parallel_nil_frame: None,
                         targets: vec![HirLValue::Local(rewrite.target)],
                         values: HirValuePack::fixed(vec![rewrite.fallback]),
                         initializer_merge_transaction: None,
@@ -255,8 +263,8 @@ fn fold_branch_value_goto_labels_in_block(
     true
 }
 
-/// 扫描 block 中的 `local X; if cond then X=a else X=b end` 形状，
-/// 尝试把它收回 `local X = cond and a or b` 一类的值表达式。
+/// 恢复空声明的分支 initializer，以及已有绑定的无求值选值。
+/// 声明合并须证明 scope 可移动，原位写回则保留声明和旧值覆盖位置。
 fn fold_branch_value_locals_in_block(
     stmts: &mut Vec<HirStmt>,
     local_scope_facts: &BranchValueLocalScopeFacts,
@@ -270,7 +278,14 @@ fn fold_branch_value_locals_in_block(
         let Some((binding, value)) = original.peek().and_then(|next| {
             collapsible_branch_value_local(&stmt, next, local_scope_facts, safety)
         }) else {
-            rewritten.push(stmt);
+            if let Some(replacement) =
+                collapsible_bound_assignment(&stmt, local_scope_facts, safety)
+            {
+                rewritten.push(replacement);
+                changed = true;
+            } else {
+                rewritten.push(stmt);
+            }
             continue;
         };
         original.next();
@@ -285,27 +300,172 @@ fn fold_branch_value_locals_in_block(
     changed
 }
 
+fn collapsible_bound_assignment(
+    stmt: &HirStmt,
+    local_scope_facts: &BranchValueLocalScopeFacts,
+    safety: HirExprSafety,
+) -> Option<HirStmt> {
+    let HirStmt::If(if_) = stmt else {
+        return None;
+    };
+    if if_.preserves_empty_test {
+        return None;
+    }
+    let [HirStmt::Assign(truthy)] = if_.then_block.stmts.as_slice() else {
+        return None;
+    };
+    let [HirStmt::Assign(falsy)] = if_.else_block.as_ref()?.stmts.as_slice() else {
+        return None;
+    };
+    let binding @ BranchValueBinding::Local(local) = single_assign_binding(truthy)? else {
+        return None;
+    };
+    let plain_copy = |assign: &HirAssign| {
+        assign.initializer_merge_transaction.is_none()
+            && assign.generic_for_initializer_producer.is_none()
+            && assign.generic_for_dispatch_release.is_none()
+            && assign.method_rewrite_transaction.is_none()
+    };
+    let direct_value = |expr: &HirExpr| {
+        matches!(
+            expr,
+            HirExpr::LocalRef(_)
+                | HirExpr::ParamRef(_)
+                | HirExpr::TempRef(_)
+                | HirExpr::Nil
+                | HirExpr::Boolean(_)
+                | HirExpr::Integer(_)
+                | HirExpr::Number(_)
+                | HirExpr::String(_)
+        )
+    };
+    if matches!(
+        if_.cond,
+        HirExpr::LocalRef(_) | HirExpr::ParamRef(_) | HirExpr::TempRef(_)
+    ) && plain_copy(truthy)
+        && plain_copy(falsy)
+        && let Some(truthy_value) = single_assign_value(truthy, binding)
+        && let Some(falsy_value) = single_assign_value(falsy, binding)
+        && direct_value(truthy_value)
+        && direct_value(falsy_value)
+    {
+        let selection = if *truthy_value == if_.cond {
+            Some((true, falsy_value))
+        } else if *falsy_value == if_.cond {
+            Some((false, truthy_value))
+        } else {
+            None
+        };
+        if let Some((is_or, rhs)) = selection {
+            // 原位写回只改变选值语法：保留同一次 TEST、目标声明和 COPY 覆盖。
+            // 两臂没有调用或运算，因而不会在旧 root 覆盖前插入新的观察点。
+            let logical = Box::new(crate::hir::HirLogicalExpr {
+                preserves_boolean_prewrite: false,
+                lhs: if_.cond.clone(),
+                rhs: rhs.clone(),
+            });
+            return Some(assign_binding_value(
+                binding,
+                if is_or {
+                    HirExpr::LogicalOr(logical)
+                } else {
+                    HirExpr::LogicalAnd(logical)
+                },
+            ));
+        }
+    }
+    if matches!((single_assign_value(truthy, binding), single_assign_value(falsy, binding)),
+        (Some(HirExpr::Boolean(lhs)), Some(HirExpr::Boolean(rhs))) if lhs != rhs)
+        && (crate::hir::visit::any_expr(&if_.cond, &mut |expr| matches!(expr, HirExpr::Call(_)))
+            || matches!(local_scope_facts.inline_dispositions.local(local), crate::hir::HirInlineDisposition::Preserve(reasons)
+                if reasons.contains(&crate::hir::HirInlineRetentionReason::PhysicalFramePrefix)))
+    {
+        // 候选拒绝[ProofIncomplete:RootLifetime]：帧前缀只证明既有声明，原 TEST
+        // 的值合流还须由完整帧 owner 核对目标与 scratch 的写入边界。
+        return None;
+    }
+    // PolicyBoundary：debug 绑定或捕获 cell 可先于值恢复成为 Local。前者保留声明身份，
+    // 后者只接已恢复 CALL 的谓词值树；普通匿名 cell 的直接测试仍保留控制形状。
+    if local_scope_facts.debug_locals[local.index()].is_none()
+        && !crate::hir::visit::any_expr(&if_.cond, &mut |expr| matches!(expr, HirExpr::Call(_)))
+    {
+        return None;
+    }
+    let target_value = |assign: &HirAssign| {
+        let value = single_assign_value(assign, binding)?;
+        if assign.initializer_merge_transaction.is_some()
+            || assign.generic_for_initializer_producer.is_some()
+            || assign.generic_for_dispatch_release.is_some()
+            || assign.method_rewrite_transaction.is_some()
+            || !matches!(
+                value,
+                HirExpr::Nil
+                    | HirExpr::Boolean(_)
+                    | HirExpr::Integer(_)
+                    | HirExpr::Number(_)
+                    | HirExpr::String(_)
+            )
+        {
+            return None;
+        }
+        Some(HirDecisionTarget::Expr(value.clone()))
+    };
+    // 已有 local 在原位置接收同一次字面量写入，不移动 debug 声明或消除旧根。
+    // 无分支内求值/事务，选择只保留原谓词一次；一般表达式仍由完整帧证明准备顺序。
+    let truthy = target_value(truthy)?;
+    let falsy = target_value(falsy)?;
+    if [&truthy, &falsy].iter().all(|target| {
+        matches!(
+            target,
+            HirDecisionTarget::Expr(HirExpr::Nil | HirExpr::Boolean(false))
+        )
+    }) {
+        // SemanticBarrier:Lifetime：nil/false 两臂不能用普通单测试 and/or 选值；一般合成会引入额外
+        // Boolean 检查及中转写，不能借此改变原分支直接覆盖旧 root 的终点。
+        return None;
+    }
+    let value = finalize_branch_value_targets(&if_.cond, truthy, falsy, safety)?;
+    Some(assign_binding_value(binding, value))
+}
+
 /// `locals` 之前只处理 proto 根 block 的机械 temp 值树。每个 proto 单独调用，因此同号
 /// TempId 不会跨 child proto 混合；现有 per-stmt touch facts 证明 guard 没有逃出候选语句。
 fn fold_root_branch_value_temps(
     proto: &mut HirProto,
     safety: HirExprSafety,
     facts: &ProtoPromotionFacts,
-) -> Vec<TempId> {
+) -> (Vec<TempId>, bool) {
     if !proto
         .body
         .stmts
         .iter()
         .any(|stmt| matches!(stmt, HirStmt::If(_)))
     {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let temp_touches = collect_temp_touch_positions(&proto.body.stmts);
 
     let mut exposed_temps = Vec::new();
-    let inline_dispositions = &proto.inline_dispositions;
+    let mut preserved_targets_changed = false;
+    let inline_dispositions = &mut proto.inline_dispositions;
     for stmt in &mut proto.body.stmts {
+        if let HirStmt::If(if_stmt) = stmt
+            && let Some(BranchValueBinding::Temp(target)) =
+                branch_value_binding_in_block(&if_stmt.then_block)
+            && matches!(if_stmt.then_block.stmts.as_slice(), [HirStmt::Assign(assign)]
+                if matches!(single_assign_value(assign, BranchValueBinding::Temp(target)), Some(HirExpr::Boolean(_))))
+            && if_stmt.else_block.as_ref().is_some_and(|block|
+                matches!(block.stmts.as_slice(), [HirStmt::Assign(assign)]
+                    if matches!(single_assign_value(assign, BranchValueBinding::Temp(target)), Some(HirExpr::Boolean(_)))))
+            && predicate_call_requires_bound_target(&if_stmt.cond, target, facts)
+        {
+            preserved_targets_changed |= inline_dispositions.preserve_temp(
+                target,
+                crate::hir::HirInlineRetentionReason::PhysicalFramePrefix,
+            );
+            continue;
+        }
         let Some((target, replacement, guards)) =
             collapsible_branch_value_temp(stmt, safety, facts)
         else {
@@ -331,7 +491,7 @@ fn fold_root_branch_value_temps(
             exposed_temps.push(target);
         }
     }
-    exposed_temps
+    (exposed_temps, preserved_targets_changed)
 }
 
 /// 扫描 block 中相邻的 `local X; if A == nil then X=b else X=A end` 形状，
@@ -357,6 +517,7 @@ fn fold_nil_fallback_alias_locals_in_block(
             initializer_merge_transaction: None,
         }));
         stmts[index + 1] = HirStmt::If(Box::new(HirIf {
+            preserves_empty_test: false,
             cond: nil_check_for_local(rewrite.target),
             then_block: rewrite.then_block,
             else_block: None,
@@ -379,7 +540,12 @@ fn nil_fallback_alias_rewrite(
     if_stmt: &HirStmt,
     local_scope_facts: &BranchValueLocalScopeFacts,
 ) -> Option<NilFallbackAliasRewrite> {
-    let target = empty_single_local_decl_binding(decl_stmt)?;
+    // 原 LOADNIL 绑定到 capture owner 后可显式携带 nil；它与空声明产生同一初值，
+    // 不应仅因表示形式不同阻断既有的 nil-only alias 证明。
+    let target = empty_single_local_decl_binding(decl_stmt).or_else(|| {
+        let (local, value) = initialized_single_local_decl(decl_stmt)?;
+        matches!(value, HirExpr::Nil).then_some(local)
+    })?;
     if !local_scope_facts.can_initialize_nil_alias(target) {
         return None;
     }
@@ -544,12 +710,41 @@ fn collapsible_branch_value_temp(
     Some((target, replacement, guards))
 }
 
+fn predicate_call_requires_bound_target(
+    mut subject: &HirExpr,
+    target: TempId,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    while let HirExpr::Unary(unary) = subject
+        && unary.op == HirUnaryOpKind::Not
+        && unary.source_site.is_none()
+    {
+        subject = &unary.expr;
+    }
+    if let HirExpr::Call(call) = subject
+        && facts.native_call_frame(call).is_some_and(|frame| {
+            facts
+                .trusted_temp_home_slot(target)
+                .is_some_and(|home| home.slot() < frame.home.slot())
+        })
+    {
+        // 候选拒绝[ProofIncomplete:RootLifetime]：低槽分支结果需要先有声明才能让
+        // TEST 的高槽 CALL 根留在原位置；raw Temp initializer 尚无这份声明边界。
+        return true;
+    }
+    false
+}
+
 fn branch_value_expr(
     binding: BranchValueBinding,
     if_stmt: &HirIf,
     local_scope_facts: &BranchValueLocalScopeFacts,
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
+    if if_stmt.preserves_empty_test {
+        // PolicyBoundary：表达式化不能丢弃原 TEST 的保留合同。
+        return None;
+    }
     let truthy =
         try_collapse_block_to_value(&if_stmt.then_block, binding, local_scope_facts, safety)?;
     let falsy = if let Some(else_block) = &if_stmt.else_block {
@@ -654,6 +849,7 @@ fn finalize_branch_value_targets(
     safety: HirExprSafety,
 ) -> Option<HirExpr> {
     let decision = HirDecisionExpr {
+        emit_as_luau_if: false,
         entry: HirDecisionNodeRef(0),
         nodes: vec![HirDecisionNode {
             id: HirDecisionNodeRef(0),
@@ -1036,6 +1232,10 @@ fn single_assign_binding(assign: &HirAssign) -> Option<BranchValueBinding> {
 
 fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
+        luau_compound_global: false,
+        upvalue_write_source: None,
+        is_phi_transfer: false,
+        parallel_nil_frame: None,
         targets: vec![binding.into_lvalue()],
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,

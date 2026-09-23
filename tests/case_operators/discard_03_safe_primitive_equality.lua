@@ -1,6 +1,6 @@
--- unluac: expect-not-contains [[ == nil]]
--- unluac: expect-contains [[local r1_0 = nil]]
--- unluac: expect-contains [[r2_0 = nil]]
+-- 原比较和原槽覆盖都需要保留，不能用 nil 写代替比较。
+-- unluac: expect-count [[ == nil]] [[2]]
+-- unluac: expect-count [[if 1 == 1 then]] [[2]]
 
 local function discard_literal_equality(value)
     local unused = value == nil
@@ -13,7 +13,7 @@ end
 
 discard_literal_equality(false)
 
--- 比较写回必须仍清除同槽的旧弱表根；只删除整个声明会让旧对象活过 GC。
+-- 比较写回必须仍清除同槽的旧弱表根；删除声明或把结果留到更高槽会改变 GC 观察。
 local function clear_old_root(weak, value)
     do
         local old = {}

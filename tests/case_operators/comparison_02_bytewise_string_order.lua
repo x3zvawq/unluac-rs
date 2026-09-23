@@ -1,6 +1,4 @@
--- unluac: expect-not-contains [["ä" < "z"]]
--- unluac: expect-not-contains [["ä" <= "z"]]
--- unluac: expect-contains [[return false, false]]
+-- unluac: expect-contains [[return "ä" < "z", "ä" <= "z"]]
 
 local function compare_strings()
     return "ä" < "z", "ä" <= "z"

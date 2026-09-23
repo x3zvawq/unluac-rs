@@ -1,3 +1,7 @@
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=6]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=6]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
 -- Boolean 参数的 CALL operands 各占结果槽之上的一格；比较元方法与两次调用顺序都可观察。
 local metatable = {
     __eq = function(left, right)

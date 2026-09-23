@@ -1,16 +1,8 @@
-//! 这个文件恢复 Luau 重复 `DUPCLOSURE` 所属的已证明词法 factory。
+//! 恢复 Luau 重复 DUPCLOSURE 所属的共同词法工厂，保留 capture 与模板身份。
 //!
-//! 带 capture 的 reusable closure 不能直接降低成多个独立闭包字面量：Luau 会按 capture
-//! identity 复用闭包，且 VM 对 NaN 的 identity 比较不满足自反性。因此必须在 HIR 改变
-//! 形态前证明共同词法 owner。这里仅描述 closure dependency DAG；被内联 factory 的调用、
-//! 参数求值及其他可观察指令仍留在父 proto 原位。恢复原 factory 调用会重新建立 activation，
-//! 不能依赖目标编译器再次内联来保持原调用栈与效果槽。
-//! capture-free 组若同样有唯一未使用 owner，也沿用其 anchor；否则由既有共享 pool 保持身份，
-//! 不能为了声明前缀给入口 pool 猜测一个原物理 home。
-//!
-//! 输入示例：父 proto 的 `@3/@7 DUPCLOSURE s2` 分别只被 `@6/@10 DUPCLOSURE s5`
-//! 捕获。输出计划：在共同 owner 处声明一次 synthetic factory，消费 `@3/@7`，并把
-//! `@6/@10` 改为 factory call；若 `@3` 同时是另一组的 owner，则只保留其 factory 声明。
+//! 普通恢复只搬回已证明的闭包依赖链，调用及参数求值留在父函数原位。
+//! 完整事件前缀另需逐实例的帧匹配与 O2 内联合同；未证明调用消失时不能重建 activation。
+//! capture-free 组没有唯一未使用 owner 时仍由共享 pool 保持身份，不猜测原物理 home。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -27,8 +19,10 @@ use crate::transformer::{
 };
 
 mod composite;
+mod effects;
 mod groups;
 mod lexical_scope;
+mod publications;
 mod templates;
 
 use composite::*;
@@ -52,6 +46,7 @@ impl CompositeNodeRef {
 pub(super) enum CompositeCapture {
     Outer(usize),
     Dependency(CompositeNodeRef),
+    Integer(i64),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -72,13 +67,28 @@ pub(super) struct CompositeFactoryPlan {
     /// dependency-first 拓扑序；`root` 索引这个数组。
     pub(super) nodes: Vec<CompositeClosureNode>,
     pub(super) root: CompositeNodeRef,
+    pub(super) effect: Option<SharedFactoryEffect>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct SharedFactoryEffect {
+    pub(super) kind: SharedFactoryEffectKind,
+    pub(super) field: crate::LuaString,
+    pub(super) calls: BTreeMap<InstrRef, Vec<crate::LuaString>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum SharedFactoryEffectKind {
+    Print,
+    Publish,
+}
+
+#[derive(Debug, Default, Clone)]
 pub(super) struct SharedClosurePlan {
     replacements: BTreeMap<InstrRef, CompositeFactoryRef>,
     owners: BTreeMap<InstrRef, CompositeFactoryRef>,
     consumed: BTreeSet<InstrRef>,
+    effect_prefixes: BTreeSet<InstrRef>,
     composites: Vec<CompositeFactoryPlan>,
     claimed_children: BTreeSet<ProtoRef>,
 }
@@ -238,6 +248,7 @@ pub(super) fn build_shared_closure_plan(
             outer_captures: composite.outer_captures,
             nodes: composite.nodes,
             root: composite.root,
+            effect: None,
         });
 
         if plan.replacements.contains_key(&owner.instr)

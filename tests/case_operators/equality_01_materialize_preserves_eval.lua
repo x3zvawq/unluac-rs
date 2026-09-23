@@ -1,12 +1,12 @@
 -- regress_252_materialize_preserves_eval: 等值/常量短路不能删除可观察求值
 -- unluac: expect-not-contains [["logic") then]]
--- PUC/JIT 可直接保留调用语句；Luau 的完整短路 initializer 还承担待写结果槽。
--- unluac: expect-not-contains [[ = r0_1("logic")]] [[@dialect=lua5.1]]
--- unluac: expect-not-contains [[ = r0_1("logic")]] [[@dialect=lua5.2]]
--- unluac: expect-not-contains [[ = r0_1("logic")]] [[@dialect=lua5.3]]
--- unluac: expect-not-contains [[ = r0_1("logic")]] [[@dialect=lua5.4]]
--- unluac: expect-not-contains [[ = r0_1("logic")]] [[@dialect=luajit]]
--- unluac: expect-not-contains [[ = r0_2("logic")]] [[@dialect=lua5.5]]
+-- 原 CALL 的显式 TEST 应随完整短路 initializer 保留，不能只留下裸调用和常量。
+-- unluac: expect-contains [[("logic") and false or 9]] [[@dialect=lua5.1]]
+-- unluac: expect-contains [[("logic") and false or 9]] [[@dialect=lua5.2]]
+-- unluac: expect-contains [[("logic") and false or 9]] [[@dialect=lua5.3]]
+-- unluac: expect-contains [[("logic") and false or 9]] [[@dialect=lua5.4]]
+-- unluac: expect-contains [[("logic") and false or 9]] [[@dialect=luajit]]
+-- unluac: expect-contains [[("logic") and false or 9]] [[@dialect=lua5.5]]
 -- unluac: expect-not-line [[local r0_3 = r0_1("logic")]] [[@dialect=luau]]
 -- unluac: expect-contains [[{ r0_1("table") } and 7 or 7]] [[@dialect=luau]]
 -- unluac: expect-contains [[r0_1("logic") and 9 or 9]] [[@dialect=luau]]
@@ -20,12 +20,12 @@
 -- unluac: expect-contains [[local r2_6 = -r2_2()]] [[@dialect=luau]]
 -- unluac: expect-ast-count [[table-list-field]] [[2]] [[@dialect=luau]] [[@proto=2]]
 -- PUC/JIT 已有低槽赋值保留目标，CALL scratch 不能在再编译时阻塞后继表声明。
--- unluac: expect-contains [[r2_4 = r2_4() + 1]] [[@dialect=lua5.1]]
--- unluac: expect-contains [[r2_4 = r2_4() + 1]] [[@dialect=lua5.2]]
--- unluac: expect-contains [[r2_4 = r2_4() + 1]] [[@dialect=lua5.3]]
--- unluac: expect-contains [[r2_4 = r2_4() + 1]] [[@dialect=lua5.4]]
--- unluac: expect-contains [[r2_4 = r2_4() + 1]] [[@dialect=lua5.5]]
--- unluac: expect-contains [[r1_4 = r1_4() + 1]] [[@dialect=luajit]]
+-- unluac: expect-contains [[local r2_4 = r2_2() + 1]] [[@dialect=lua5.1]]
+-- unluac: expect-contains [[local r2_4 = r2_2() + 1]] [[@dialect=lua5.2]]
+-- unluac: expect-contains [[local r2_4 = r2_2() + 1]] [[@dialect=lua5.3]]
+-- unluac: expect-contains [[local r2_4 = r2_2() + 1]] [[@dialect=lua5.4]]
+-- unluac: expect-contains [[local r2_4 = r2_2() + 1]] [[@dialect=lua5.5]]
+-- unluac: expect-contains [[local r1_4 = r1_2() + 1]] [[@dialect=luajit]]
 
 local trace = ""
 

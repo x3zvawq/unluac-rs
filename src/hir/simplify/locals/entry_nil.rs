@@ -152,7 +152,6 @@ pub(super) fn prune_redundant_entry_nil_writes(
             unreachable!()
         };
         apply_if_plan(if_stmt, &redundant);
-        facts.mark_entry_nil_writes_pruned(local);
         changed = true;
     }
     changed

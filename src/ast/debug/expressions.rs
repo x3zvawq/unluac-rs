@@ -83,6 +83,12 @@ pub(super) fn format_expr(expr: &AstExpr, indent: &str, names: &FunctionRenderNa
                 format_expr(&logical.rhs, indent, names)
             )
         }
+        AstExpr::IfExpr(branch) => format!(
+            "(if {} then {} else {})",
+            format_expr(&branch.cond, indent, names),
+            format_expr(&branch.then_expr, indent, names),
+            format_expr(&branch.else_expr, indent, names),
+        ),
         AstExpr::Call(call) => format_call_expr(call, indent, names),
         AstExpr::MethodCall(call) => format_method_call_expr(call, indent, names),
         AstExpr::SingleValue(expr) => format!("({})", format_expr(expr, indent, names)),
@@ -200,19 +206,11 @@ pub(super) fn format_function_name(
     match target {
         AstFunctionName::Plain(path) => {
             let rendered = format_name_path(path, names);
-            if matches!(path.root, AstNameRef::Global(_)) {
-                format!("global function {rendered}")
-            } else {
-                format!("function {rendered}")
-            }
+            format!("function {rendered}")
         }
         AstFunctionName::Method(path, method) => {
             let rendered = format!("{}:{method}", format_name_path(path, names));
-            if matches!(path.root, AstNameRef::Global(_)) {
-                format!("global function {rendered}")
-            } else {
-                format!("function {rendered}")
-            }
+            format!("function {rendered}")
         }
     }
 }

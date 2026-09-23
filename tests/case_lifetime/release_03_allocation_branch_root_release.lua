@@ -2,6 +2,9 @@
 -- 对象根与两臂覆盖共用一个 local；再生成运行同时检验 TESTSET 的清根时点。
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=1]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=2]]
+-- unluac: expect-count [[ and true or false]] [[1]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]]
+-- unluac: expect-not-contains [[goto ]]
 
 local weak = setmetatable({}, { __mode = "v" })
 

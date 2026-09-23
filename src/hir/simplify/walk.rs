@@ -25,6 +25,11 @@ pub(crate) trait HirRewritePass {
         false
     }
 
+    /// 先恢复父语句拥有的控制结构，避免子块改写先消除其结构证据。
+    fn rewrite_stmt_before_children(&mut self, _stmt: &mut HirStmt) -> bool {
+        false
+    }
+
     fn rewrite_expr(&mut self, _expr: &mut HirExpr) -> bool {
         false
     }
@@ -49,6 +54,11 @@ pub(crate) trait HirRewritePass {
 
     fn rewrite_condition_expr(&mut self, expr: &mut HirExpr) -> bool {
         self.rewrite_expr(expr)
+    }
+
+    /// 条件 owner 先消费控制图，避免普通值改写先物化真假结果或复制共享 guard。
+    fn rewrite_condition_expr_before_children(&mut self, _expr: &mut HirExpr) -> bool {
+        false
     }
 
     /// Generic-for 自身可以裁掉已由 transaction 宽度独立保存的 trailing nil；其它
@@ -121,6 +131,7 @@ fn rewrite_stmt<P: HirRewritePass>(stmt: &mut HirStmt, pass: &mut P) -> bool {
         }
         _ => None,
     };
+    let prefix_changed = pass.rewrite_stmt_before_children(stmt);
     let mut nested_changed = false;
     traverse_hir_stmt_children!(
         stmt,
@@ -169,7 +180,7 @@ fn rewrite_stmt<P: HirRewritePass>(stmt: &mut HirStmt, pass: &mut P) -> bool {
     {
         metadata_changed |= generic_for.retain_unchanged_initializer_spans(&original_iterator);
     }
-    stmt_changed || nested_changed || metadata_changed
+    stmt_changed || nested_changed || metadata_changed || prefix_changed
 }
 
 pub(super) fn rewrite_lvalue(lvalue: &mut HirLValue, pass: &mut impl HirRewritePass) -> bool {
@@ -264,6 +275,7 @@ fn rewrite_table_constructor(
 }
 
 fn rewrite_condition_expr(expr: &mut HirExpr, pass: &mut impl HirRewritePass) -> bool {
+    let prefix_changed = pass.rewrite_condition_expr_before_children(expr);
     let nested_changed = rewrite_expr(expr, pass);
-    pass.rewrite_condition_expr(expr) || nested_changed
+    pass.rewrite_condition_expr(expr) || nested_changed || prefix_changed
 }

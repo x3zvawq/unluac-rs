@@ -1,7 +1,5 @@
--- unluac: expect-not-contains [[nil == false]]
--- unluac: expect-not-contains [[true == "true"]]
--- unluac: expect-not-contains [[7 == "7"]]
--- unluac: expect-contains [[return false, false, false]]
+-- 不同编译器可能交换相等比较的操作数，但三个原比较都必须保留。
+-- unluac: expect-count [[ == ]] [[3]]
 
 local function compare_mismatched_primitives()
     return nil == false, true == "true", 7 == "7"

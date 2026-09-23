@@ -789,11 +789,28 @@ impl<'a> ProtoLowerer<'a> {
                 LuauOpcode::CloseUpVals => {
                     let a = expect_a(raw_pc, opcode, operands)?;
                     self.clear_all_method_hints();
+                    // compileStatReturn 先准备结果，再 closeLocals(0)，最后 RETURN。
+                    // CLOSEUPVALS 的 A 是最低 captured 槽，未必为零；紧邻的返回已承接
+                    // 原结果区，其后还可有不可达的块尾关闭。独立 debug 终点仍由词法 owner 保留。
+                    let kind = if self
+                        .raw
+                        .common
+                        .instructions
+                        .get(raw_index + 1)
+                        .and_then(|instr| instr.luau())
+                        .is_some_and(|(opcode, _, _)| opcode == LuauOpcode::Return)
+                    {
+                        crate::transformer::CloseKind::Return(crate::transformer::InstrRef(
+                            self.lowering.next_low_index(),
+                        ))
+                    } else {
+                        crate::transformer::CloseKind::Explicit
+                    };
                     self.emit(
                         Some(raw_index),
                         vec![raw_index],
                         PendingLowInstr::Ready(LowInstr::Close(CloseInstr {
-                            kind: crate::transformer::CloseKind::Explicit,
+                            kind,
                             from: reg_from_u8(a),
                         })),
                     );

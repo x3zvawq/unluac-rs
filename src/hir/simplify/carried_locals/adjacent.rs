@@ -30,26 +30,37 @@ use super::reads::{collect_binding_mentions_by_stmt, collect_binding_mentions_in
 /// 与一般 seed/carried handoff 不同，两次相邻初始化都写 nil，因此无需逐候选扫描后缀。
 pub(in crate::hir::simplify) fn adjacent_nil_initializer_bindings(
     temps: &[crate::hir::common::TempId],
-    next: &HirStmt,
+    next: &[HirStmt],
     facts: &ProtoPromotionFacts,
 ) -> Option<Vec<LocalId>> {
-    let HirStmt::LocalDecl(decl) = next else {
-        return None;
-    };
-    if decl.bindings.len() != temps.len()
-        || !decl.values.is_empty()
-        || decl.initializer_merge_transaction.is_some()
-        || !temps.iter().zip(&decl.bindings).all(|(temp, local)| {
-            bindings_share_exact_home_slot(
-                CarryBinding::Temp(*temp),
+    let mut locals = Vec::with_capacity(temps.len());
+    for stmt in next {
+        let HirStmt::LocalDecl(decl) = stmt else {
+            return None;
+        };
+        if !decl.values.is_empty()
+            || decl.bindings.is_empty()
+            || decl.initializer_merge_transaction.is_some()
+            || locals.len() + decl.bindings.len() > temps.len()
+        {
+            return None;
+        }
+        for local in &decl.bindings {
+            let temp = temps[locals.len()];
+            if !bindings_share_exact_home_slot(
+                CarryBinding::Temp(temp),
                 CarryBinding::Local(*local),
                 facts,
-            )
-        })
-    {
-        return None;
+            ) {
+                return None;
+            }
+            locals.push(*local);
+        }
+        if locals.len() == temps.len() {
+            return Some(locals);
+        }
     }
-    Some(decl.bindings.clone())
+    None
 }
 
 pub(super) fn try_collapse_guarded_local_update(
@@ -114,6 +125,10 @@ pub(super) fn try_collapse_guarded_local_update(
         _ => return false,
     };
     block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
+        luau_compound_global: false,
+        upvalue_write_source: None,
+        is_phi_transfer: false,
+        parallel_nil_frame: None,
         targets: vec![binding_lvalue(state)],
         values,
         initializer_merge_transaction: None,
@@ -180,7 +195,7 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
     identity_facts: &HandoffIdentityFacts,
     safety: HirExprSafety,
 ) -> bool {
-    let Some((seed, _)) = initialized_single_local_decl(&block.stmts[index]) else {
+    let Some((seed, initial)) = initialized_single_local_decl(&block.stmts[index]) else {
         return false;
     };
     let Some(carried) = block
@@ -203,10 +218,11 @@ pub(super) fn try_collapse_adjacent_local_seed_handoff(
             CarryBinding::Local(seed),
             promotion_facts,
         )
-        || !identity_facts.binding_merge_preserves_identity(
+        || !identity_facts.binding_merge_preserves_identity_with_nil_target(
             CarryBinding::Local(carried),
             CarryBinding::Local(seed),
             promotion_facts,
+            matches!(initial, HirExpr::Nil),
         )
         || tail.is_empty()
         || !stmts_mention_local(tail, carried)

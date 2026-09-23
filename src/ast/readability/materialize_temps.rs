@@ -97,6 +97,7 @@ impl AstRewritePass for MaterializeTempsPass {
             | AstExpr::Binary(_)
             | AstExpr::LogicalAnd(_)
             | AstExpr::LogicalOr(_)
+            | AstExpr::IfExpr(_)
             | AstExpr::Call(_)
             | AstExpr::MethodCall(_)
             | AstExpr::SingleValue(_)

@@ -1,6 +1,9 @@
 -- 非 vararg NEWCLOSURE 的数值 capture 不能因常量传播变成共享 DUPCLOSURE。
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[5e-324]]
+-- unluac: expect-contains [[1.7976931348623157e308]]
+-- unluac: expect-not-contains [[000000000000000000000000000000]]
 local function opaque(value) return value end
 local function integer_factory()
     local value = opaque(7)

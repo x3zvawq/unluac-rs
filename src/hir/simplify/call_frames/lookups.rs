@@ -9,7 +9,7 @@ use super::*;
 use crate::hir::common::HirTableAccess;
 
 impl FrameBuilder<'_> {
-    /// Luau 先保留 Boolean 目标，再计算 RK 算术，最后为有序比较准备常量。
+    /// Luau 先保留 Boolean 目标，再计算 RK 算术，最后准备比较右值。
     /// 返回算术操作数所在侧；LocalRef 仍交共享 builder 按原 Def 和事件游标消费。
     pub(super) fn luau_arithmetic_comparison_operand(
         &self,
@@ -22,20 +22,32 @@ impl FrameBuilder<'_> {
             return None;
         }
         let layout = self.facts.native_binary_layout(binary)?;
+        let operand_slot = self.boolean_operand_start(slot);
         [
             (true, &binary.lhs, layout.lhs, &binary.rhs, layout.rhs),
             (false, &binary.rhs, layout.rhs, &binary.lhs, layout.lhs),
         ]
         .into_iter()
         .find_map(|(left, value, original, constant, constant_home)| {
-            if original != Some(HomeSlotKey::new(slot + 1, 0))
-                || !matches!(constant, HirExpr::Integer(_) | HirExpr::Number(_))
-                || if binary.op == Eq {
-                    !left || constant_home.is_some()
-                } else {
-                    constant_home != Some(HomeSlotKey::new(slot + 2, 0))
+            let other_matches = match constant {
+                HirExpr::Integer(_) | HirExpr::Number(_) => {
+                    if binary.op == Eq {
+                        left && constant_home
+                            .is_none_or(|home| home == HomeSlotKey::new(operand_slot + 1, 0))
+                    } else {
+                        constant_home == Some(HomeSlotKey::new(operand_slot + 1, 0))
+                    }
                 }
-            {
+                HirExpr::TableAccess(access) => {
+                    left && constant_home == Some(HomeSlotKey::new(operand_slot + 1, 0))
+                        && self.luau_comparison_table_read(access, operand_slot + 1)
+                }
+                HirExpr::LocalRef(_) | HirExpr::ParamRef(_) => self
+                    .direct_home(constant)
+                    .is_some_and(|home| home.slot() < self.base && constant_home == Some(home)),
+                _ => false,
+            };
+            if original != Some(HomeSlotKey::new(operand_slot, 0)) || !other_matches {
                 return None;
             }
             let value = match value {
@@ -47,8 +59,11 @@ impl FrameBuilder<'_> {
             let HirExpr::Binary(arithmetic) = value else {
                 return None;
             };
+            // 这里只选择原算术结果；输入准备、写域和消费事件由随后的 expr 验证，
+            // 不能要求它预先属于“低槽与常量”的更窄协议。
             (numeric_rk_arithmetic(arithmetic)
-                && self.direct_rk_arithmetic(arithmetic, slot + 1).is_some())
+                && self.facts.operation_result_home(arithmetic.source_site?)
+                    == Some(HomeSlotKey::new(operand_slot, 0)))
             .then_some(left)
         })
     }
@@ -86,21 +101,38 @@ impl FrameBuilder<'_> {
             return false;
         };
         let home = HomeSlotKey::new(slot, 0);
-        let operand = |value: &HirExpr, original| {
+        let operand = |index, value: &HirExpr, original| {
             if self
-                .direct_home(value)
+                .facts
+                .direct_binary_operand_home(binary, index)
                 .is_some_and(|low| low.slot() < self.base && original == Some(low))
             {
                 return Some(false);
             }
+            if matches!(value, HirExpr::UpvalueRef(_))
+                && original == Some(home)
+                && self
+                    .facts
+                    .comparison_read_preparation(binary, value)
+                    .is_some_and(|(_, preparation)| preparation == home)
+            {
+                return Some(true);
+            }
             (original == Some(home)
                 && matches!(value, HirExpr::Binary(arithmetic)
-                    if numeric_rk_arithmetic(arithmetic) && self.direct_rk_arithmetic(arithmetic, slot).is_some()))
+                    if numeric_rk_arithmetic(arithmetic) && self.direct_numeric_arithmetic(arithmetic, slot).is_some()))
                 .then_some(true)
         };
         let numeric = |value: &HirExpr| matches!(value, HirExpr::Integer(_) | HirExpr::Number(_));
+        // 两个既有低槽值的相等/有序比较均不占 operand scratch；保留原方向和
+        // 可能的比较元方法，并由 Boolean frame 核对结果的物化位置。
+        if operand(0, &binary.lhs, layout.lhs) == Some(false)
+            && operand(1, &binary.rhs, layout.rhs) == Some(false)
+        {
+            return true;
+        }
         if binary.op == Eq {
-            return operand(&binary.lhs, layout.lhs).is_some()
+            return operand(0, &binary.lhs, layout.lhs).is_some()
                 && layout.rhs.is_none()
                 && matches!(
                     binary.rhs,
@@ -112,13 +144,13 @@ impl FrameBuilder<'_> {
                 );
         }
         [
-            (&binary.lhs, layout.lhs, &binary.rhs, layout.rhs),
-            (&binary.rhs, layout.rhs, &binary.lhs, layout.lhs),
+            (0, &binary.lhs, layout.lhs, &binary.rhs, layout.rhs),
+            (1, &binary.rhs, layout.rhs, &binary.lhs, layout.lhs),
         ]
         .into_iter()
-        .any(|(value, original, constant, constant_home)| {
+        .any(|(index, value, original, constant, constant_home)| {
             numeric(constant)
-                && operand(value, original).is_some_and(|scratch| {
+                && operand(index, value, original).is_some_and(|scratch| {
                     constant_home == Some(HomeSlotKey::new(slot + usize::from(scratch), 0))
                 })
         })
@@ -126,7 +158,7 @@ impl FrameBuilder<'_> {
 
     /// JIT 比较参数复用首个 lookup 的槽；第二个 lookup 才占其相邻后一槽。
     /// `assert(t[1] == value and t[2] == nil)` 保留原 TGETB、低槽读取与 Boolean 写回；
-    /// 不消费 run 中的新 producer，也不把动态键或先前 COPY 当作直接读取。
+    /// 不消费 run 中的新 producer；动态键须由原输入准备证明，不能借先前 COPY 的槽。
     pub(super) fn jit_lookup_comparison(
         &self,
         binary: &crate::hir::common::HirBinaryExpr,
@@ -140,38 +172,16 @@ impl FrameBuilder<'_> {
         let Some(layout) = self.facts.native_binary_layout(binary) else {
             return false;
         };
-        let lookup = |value: &HirExpr, home: HomeSlotKey| {
-            let HirExpr::TableAccess(access) = value else {
-                return false;
-            };
-            let key_fits = match &access.key {
-                HirExpr::Integer(0..=255) => true,
-                HirExpr::String(_) => self.native.is_some_and(|context| context.constants_fit_rk),
-                _ => false,
-            };
-            key_fits
-                && self.native.is_some_and(|context| !context.closed.contains(&home))
-                // JIT 只有 ByReference capture，消费原操作时点的开放引用事实；
-                // 后缀新 binding 的同槽 capture 不能回溯禁止此处原写。
-                && access
-                    .sources
-                    .try_for_each_known(|source| {
-                        self.facts
-                            .operation_result_reference_unaliased(source)
-                            .then_some(())
-                    })
-                    .is_some()
-                && self.facts.table_read_result_home(access) == Some(home)
-                && self
-                    .facts
-                    .native_table_read_layout(access)
-                    .is_some_and(|layout| {
-                        layout.key.is_none()
-                            && layout.base.slot() < self.base
-                            && self.direct_home(&access.base) == Some(layout.base)
-                    })
-        };
+        let lookup = |value: &HirExpr, home: HomeSlotKey| matches!(value, HirExpr::TableAccess(access) if self.jit_direct_lookup(access, home));
         let home = HomeSlotKey::new(slot, 0);
+        // 既有低槽位于左侧时不准备新值，右侧 TGET 独占 Boolean scratch；
+        // 不交换比较方向，也不把右侧读取移到前一个短路条件之外。
+        if self
+            .direct_home(&binary.lhs)
+            .is_some_and(|low| low.slot() < self.base && layout.lhs == Some(low))
+        {
+            return layout.rhs == Some(home) && lookup(&binary.rhs, home);
+        }
         if layout.lhs != Some(home) || !lookup(&binary.lhs, home) {
             return false;
         }
@@ -192,6 +202,49 @@ impl FrameBuilder<'_> {
         }
     }
 
+    /// 原 TGET 读取低槽或同槽上值 base；键保留原布局，结果写原 scratch。
+    pub(super) fn jit_direct_lookup(&self, access: &HirTableAccess, home: HomeSlotKey) -> bool {
+        let key_fits = match &access.key {
+            HirExpr::Integer(0..=255) => true,
+            HirExpr::String(_) => self.native.is_some_and(|context| context.constants_fit_rk),
+            _ => false,
+        };
+        self.native.is_some_and(|context| !context.closed.contains(&home))
+            // JIT 只有 ByReference capture，消费原操作时点的开放引用事实；
+            // 后缀新 binding 的同槽 capture 不能回溯禁止此处原写。
+            && access
+                .sources
+                .try_for_each_known(|source| {
+                    self.facts
+                        .operation_result_reference_unaliased(source)
+                        .then_some(())
+                })
+                .is_some()
+            && self.facts.table_read_result_home(access) == Some(home)
+            && self
+                .facts
+                .native_table_read_layout(access)
+                .is_some_and(|layout| {
+                    ((layout.base.slot() < self.base
+                        && self.facts.table_read_base_home(access) == Some(layout.base))
+                        // GETUPVAL 与 TGET 同槽接续；依赖证书绑定到此次读取，
+                        // 不给同名上值或不同槽的提前快照借用该准备位置。
+                        || (layout.base == home
+                            && matches!(access.base, HirExpr::UpvalueRef(_))
+                            && matches!(access.sources, crate::hir::common::HirOperationSources::Single(source)
+                                if self.facts.operation_input_preparation(source, &access.base)
+                                    .is_some_and(|(_, base)| base == home))))
+                        && match layout.key {
+                            None => key_fits,
+                            Some(key) => (key.slot() < self.base
+                                && self.direct_home(&access.key) == Some(key))
+                                || matches!(access.key, HirExpr::UpvalueRef(_))
+                                    && key == home
+                                    && self.facts.table_key_preparation(access) == Some(key),
+                        }
+                })
+    }
+
     /// 原 OR 的两臂在同槽合流；备用分配不消费 run 中的无条件 producer。
     pub(super) fn luau_table_or_empty(
         &mut self,
@@ -203,6 +256,7 @@ impl FrameBuilder<'_> {
         let lhs = self.expr(&logical.lhs, before, slot, None, false, true, None)?;
         Some(HirExpr::LogicalOr(Box::new(
             crate::hir::common::HirLogicalExpr {
+                preserves_boolean_prewrite: logical.preserves_boolean_prewrite,
                 lhs,
                 rhs: logical.rhs.clone(),
             },
@@ -240,7 +294,7 @@ impl FrameBuilder<'_> {
             || context.closed.contains(&home)
             || layout.key.is_some()
             || layout.base.slot() >= self.base
-            || self.direct_home(&access.base) != Some(layout.base)
+            || self.facts.table_read_base_home(access) != Some(layout.base)
             || !matches!(&access.key, HirExpr::String(key) if key.as_utf8().is_some_and(|key| self.dialect.is_identifier_name(key)))
             || !matches!(table.allocation, HirTableAllocation::Luau(allocation)
                 if allocation.array_capacity == 0 && allocation.hash_capacity == 0)
@@ -254,7 +308,8 @@ impl FrameBuilder<'_> {
 
     /// Luau 的整数索引先保留结果，再由 compileExprAuto 在高一槽调用 base；
     /// 外层具名字段在临时结果槽原位继续读取。只消费原嵌入键和完整单结果 CALL，
-    /// 动态键也先保留结果，低槽 base 后在高一槽准备键；原 RK 算术须逐项核对输入和输出。
+    /// 动态键也先保留结果：现成 base 直接读取，复合 base 与 key 依次在高槽准备；
+    /// 原 RK 算术须逐项核对输入和输出。
     pub(super) fn luau_lookup(
         &mut self,
         access: &HirTableAccess,
@@ -264,27 +319,71 @@ impl FrameBuilder<'_> {
         let context = self.native?;
         let result = HomeSlotKey::new(slot, 0);
         let layout = self.facts.native_table_read_layout(access)?;
+        // 未来复用此槽的 capture 不回溯到当前 GETTABLE；每个原读取 Def 在执行时
+        // 均须未被引用捕获，实际后续使用仍由完整事务的 binding/前缀预览保护。
         if self.dialect != DecompileDialect::Luau
             || self.facts.table_read_result_home(access) != Some(result)
-            || context.barred.contains(&result)
+            || (context.barred.contains(&result)
+                && access
+                    .sources
+                    .try_for_each_known(|source| {
+                        self.facts
+                            .operation_result_reference_unaliased(source)
+                            .then_some(())
+                    })
+                    .is_none())
             || context.closed.contains(&result)
         {
             return None;
         }
+        if context.expanded_callees.is_some() && layout.base == HomeSlotKey::new(slot + 2, 0) {
+            return self
+                .expanded_index(access, before, slot)
+                .map(|(call, _)| HirExpr::Call(Box::new(call)));
+        }
         let direct = self
-            .direct_home(&access.base)
+            .facts
+            .table_read_base_home(access)
             .is_some_and(|home| home == layout.base && home.slot() < self.base);
         if let Some(key_home) = layout.key {
-            if !direct || key_home != HomeSlotKey::new(slot + 1, 0) {
+            if crate::value_semantics::table::TableExpression::table_integer_key(&access.key)
+                .is_some_and(|key| (1..=256).contains(&key))
+                && layout.base == HomeSlotKey::new(slot + 1, 0)
+                && key_home == HomeSlotKey::new(slot + 2, 0)
+            {
+                // O0 在 CALL 单结果之后显式加载整数键；保留结果、base、key 三槽，
+                // 不能套用 GETTABLEN 的两槽布局，也不能提前读取调用结果。
+                let base = self.expr(&access.base, before, slot + 1, None, false, true, None)?;
+                if !matches!(base, HirExpr::Call(_)) {
+                    return None;
+                }
+                return Some(HirExpr::TableAccess(Box::new(HirTableAccess {
+                    base,
+                    ..access.clone()
+                })));
+            }
+            if !direct {
+                // Luau 为动态索引保留结果槽，再依次准备 base 与 key；key 回调
+                // 可以改写 base 的来源，不能在 key 之后重新读取它。
+                if layout.base != HomeSlotKey::new(slot + 1, 0)
+                    || key_home != HomeSlotKey::new(slot + 2, 0)
+                {
+                    return None;
+                }
+                let base = self.register_operand(&access.base, before, slot + 1)?;
+                let key = self.register_operand(&access.key, before, slot + 2)?;
+                return Some(HirExpr::TableAccess(Box::new(HirTableAccess {
+                    base,
+                    key,
+                    ..access.clone()
+                })));
+            }
+            if key_home != HomeSlotKey::new(slot + 1, 0) {
                 return None;
             }
-            let HirExpr::Binary(key) = &access.key else {
-                return None;
-            };
-            if !numeric_rk_arithmetic(key) {
-                return None;
-            }
-            let key = self.direct_rk_arithmetic(key, slot + 1)?;
+            // 动态 key 的结果槽在 GETTABLE 结果上方；共享 operand builder
+            // 继续核对算术、LEN 等原操作的输入，不能按表达式形状假定可移动。
+            let key = self.register_operand(&access.key, before, slot + 1)?;
             return Some(HirExpr::TableAccess(Box::new(HirTableAccess {
                 key,
                 ..access.clone()
@@ -298,21 +397,40 @@ impl FrameBuilder<'_> {
                         .as_utf8()
                         .is_some_and(|name| self.dialect.is_identifier_name(name)) =>
             {
-                let HirExpr::TableAccess(inner) = &access.base else {
-                    return None;
-                };
-                self.luau_lookup(inner, before, slot)?
+                if let HirExpr::TableAccess(inner) = &access.base {
+                    self.luau_lookup(inner, before, slot)?
+                } else {
+                    // CALL 的单结果可在同槽继续 GETTABLEKS；仍按完整调用帧
+                    // 消费准备，不能把任意高槽 base 当成可省略的快照。
+                    let value = self.expr(&access.base, before, slot, None, false, true, None)?;
+                    if !matches!(value, HirExpr::Call(_)) {
+                        return None;
+                    }
+                    value
+                }
             }
             HirExpr::Integer(key) if (1..=256).contains(key) => {
                 if direct {
                     access.base.clone()
                 } else {
-                    if layout.base != HomeSlotKey::new(slot + 1, 0) {
+                    // generic-for 已预留整个控制帧；嵌套数字索引的 base 从当前
+                    // freereg 准备，不能误用参数结果槽的紧邻位置覆盖控制槽。
+                    let scratch = self.declaration_reserved_top.unwrap_or(0).max(slot + 1);
+                    if layout.base != HomeSlotKey::new(scratch, 0) {
                         return None;
                     }
+                    // 未提升的 base 已由 HIR 保留精确 Temp 身份；随原 home 一起
+                    // 交给共享定义/写域检查，不能在递归入口丢掉这个 producer。
+                    let producer = match access.base {
+                        HirExpr::TempRef(temp) => Some(temp),
+                        _ => None,
+                    };
                     let value =
-                        self.expr(&access.base, before, slot + 1, None, false, true, None)?;
-                    if !matches!(value, HirExpr::Call(_)) {
+                        self.expr(&access.base, before, scratch, None, false, true, producer)?;
+                    if !matches!(value, HirExpr::Call(_) | HirExpr::TableAccess(_))
+                        && !matches!(&value, HirExpr::GlobalRef(global)
+                            if self.facts.global_read_frame(global, self.dialect) == Some(layout.base))
+                    {
                         return None;
                     }
                     value
@@ -326,8 +444,8 @@ impl FrameBuilder<'_> {
         })))
     }
 
-    /// JIT/Luau 的原 RK 指令直接读取低槽并写同一 scratch；调用方限定数字 RK 算术。
-    pub(super) fn direct_rk_arithmetic(
+    /// JIT/Luau 数值算术直接读取低槽并写同一 scratch；Luau 也可在高一槽准备 RHS 常量。
+    pub(super) fn direct_numeric_arithmetic(
         &self,
         binary: &crate::hir::common::HirBinaryExpr,
         slot: usize,
@@ -335,21 +453,141 @@ impl FrameBuilder<'_> {
         let context = self.native?;
         let result = HomeSlotKey::new(slot, 0);
         let layout = self.facts.native_binary_layout(binary)?;
-        if !context.constants_fit_rk
-            || self.facts.operation_result_home(binary.source_site?) != Some(result)
+        if self.facts.operation_result_home(binary.source_site?) != Some(result)
             || context.barred.contains(&result)
             || context.closed.contains(&result)
-            || layout.rhs.is_some()
-            || !self
-                .direct_home(&binary.lhs)
-                .is_some_and(|home| home.slot() < self.base && layout.lhs == Some(home))
+            || ![
+                (&binary.lhs, layout.lhs, &binary.rhs, layout.rhs),
+                (&binary.rhs, layout.rhs, &binary.lhs, layout.lhs),
+            ]
+            .into_iter()
+            .enumerate()
+            .any(|(side, (value, original, constant, constant_home))| {
+                (if constant_home.is_none() {
+                    context.constants_fit_rk
+                } else {
+                    // O0 不使用 RK opcode，仍在结果上一槽写相同常量，再执行原运算。
+                    self.dialect == DecompileDialect::Luau
+                        && side == 0
+                        && constant_home == Some(HomeSlotKey::new(slot + 1, 0))
+                }) && matches!(constant, HirExpr::Integer(_) | HirExpr::Number(_))
+                    && self
+                        .direct_home(value)
+                        .is_some_and(|home| home.slot() < self.base && original == Some(home))
+            })
         {
-            // 候选拒绝[ProofIncomplete]：需要原 RI 操作、同槽结果和原低槽读取；
-            // 常量准备、其它 operand scratch 或开放结果 cell 不由该协议覆盖。
+            // 候选拒绝[ProofIncomplete]：需要同槽结果、原低槽读取，以及内嵌或相邻的
+            // 数值常量准备；其它 operand scratch 或开放结果 cell 不由该协议覆盖。
             return None;
         }
-        // 不展开低槽 producer；原 RI 指令直接读取它，元方法与先前返回项的顺序不变。
+        // 不展开低槽 producer，元方法与先前返回项的顺序不变。
         Some(HirExpr::Binary(Box::new(binary.clone())))
+    }
+
+    /// Luau 直接读取低槽操作数，或在结果上方准备输入；常量按原 RK/LOADK 布局重发。
+    pub(super) fn luau_prepared_arithmetic(
+        &mut self,
+        binary: &crate::hir::common::HirBinaryExpr,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        let home = HomeSlotKey::new(slot, 0);
+        let layout = self.facts.native_binary_layout(binary)?;
+        let direct = |value: &HirExpr, original| {
+            self.direct_home(value)
+                .is_some_and(|input| input.slot() < self.base && original == Some(input))
+        };
+        let lhs_low = direct(&binary.lhs, layout.lhs);
+        let rhs_low = direct(&binary.rhs, layout.rhs);
+        let rhs_constant = matches!(binary.rhs, HirExpr::Integer(_) | HirExpr::Number(_))
+            && (layout.rhs.is_none()
+                || self
+                    .facts
+                    .operation_input_preparation(binary.source_site?, &binary.rhs)
+                    .is_some_and(|(_, prepared)| {
+                        Some(prepared) == layout.rhs
+                            && prepared == HomeSlotKey::new(slot + 1 + usize::from(!lhs_low), 0)
+                    }));
+        if self.dialect != DecompileDialect::Luau
+            || !self.native?.constants_fit_rk
+            || self.native?.barred.contains(&home)
+            || self.native?.closed.contains(&home)
+            || self.facts.operation_result_home(binary.source_site?) != Some(home)
+            || (!lhs_low && layout.lhs != Some(HomeSlotKey::new(slot + 1, 0)))
+            || (!rhs_low
+                && !rhs_constant
+                && layout.rhs != Some(HomeSlotKey::new(slot + 1 + usize::from(!lhs_low), 0)))
+        {
+            return None;
+        }
+        // 低槽只借用同一绑定，不展开 producer。复合左侧仍逐层重发原 scratch，
+        // 保持每次元方法的顺序与覆盖点，不能将它提前写进最终结果槽。
+        let prepared_lhs = match &binary.lhs {
+            HirExpr::LocalRef(local) => self
+                .definition(*local, before)
+                .and_then(|index| scalar_local(self.run[index]))
+                .map_or(&binary.lhs, |(_, value)| value),
+            value => value,
+        };
+        let lhs = if lhs_low {
+            binary.lhs.clone()
+        } else if matches!(prepared_lhs, HirExpr::UpvalueRef(_)) {
+            // GETUPVAL 的身份来自本次运算的 use→Def；不能将同名 cell 的另一读取
+            // 当成准备值，也不跨过原算术的观察边界重新读取。
+            let (producer, prepared) = self
+                .facts
+                .operation_input_preparation(binary.source_site?, prepared_lhs)?;
+            if prepared != HomeSlotKey::new(slot + 1, 0) {
+                return None;
+            }
+            let previous = std::mem::replace(&mut self.register_operand, false);
+            let rebuilt = self.expr(
+                &binary.lhs,
+                before,
+                slot + 1,
+                None,
+                false,
+                true,
+                Some(producer),
+            );
+            self.register_operand = previous;
+            rebuilt?
+        } else {
+            self.binary_register_operand(binary, 0, before, slot + 1)?
+        };
+        let rhs = if rhs_low || rhs_constant {
+            binary.rhs.clone()
+        } else {
+            self.binary_register_operand(binary, 1, before, slot + 1 + usize::from(!lhs_low))?
+        };
+        Some(HirExpr::Binary(Box::new(
+            crate::hir::common::HirBinaryExpr {
+                lhs,
+                rhs,
+                ..binary.clone()
+            },
+        )))
+    }
+
+    /// 原算术 use 读取的 phi 将 MOVE 预写交给完整操作数，不让内部值树先截断准备区。
+    fn binary_register_operand(
+        &mut self,
+        binary: &crate::hir::common::HirBinaryExpr,
+        operand: usize,
+        before: usize,
+        slot: usize,
+    ) -> Option<HirExpr> {
+        let value = [&binary.lhs, &binary.rhs][operand];
+        if let Some(result) = self.facts.binary_value_operand(binary, operand)
+            && self.facts.copy_value_prewrite(result).is_some()
+        {
+            let previous = std::mem::replace(&mut self.register_operand, true);
+            let rebuilt = self.expr(value, before, slot, None, false, true, Some(result));
+            self.register_operand = previous;
+            rebuilt
+        } else {
+            self.register_operand(value, before, slot)
+        }
     }
 
     pub(super) fn register_lookup(
@@ -358,7 +596,23 @@ impl FrameBuilder<'_> {
         before: usize,
         slot: usize,
     ) -> Option<HirExpr> {
+        if let Some(home) = self.facts.upvalue_table_read_frame(access) {
+            // GETTABUP 已直接读取原 cell 和原键，不存在需要重放的 base 寄存器。
+            // 算术/赋值仍在完整帧内消费该结果，不能因此移动读取或消除写回后的再读。
+            return (home == HomeSlotKey::new(slot, 0)
+                && self.native?.constants_fit_rk
+                && !self.native?.closed.contains(&home))
+            .then(|| HirExpr::TableAccess(Box::new(access.clone())));
+        }
         let layout = self.facts.native_table_read_layout(access)?;
+        if self.dialect == DecompileDialect::Luau
+            && self.native?.expanded_callees.is_some()
+            && layout.base == HomeSlotKey::new(slot + 2, 0)
+        {
+            return self
+                .expanded_index(access, before, slot)
+                .map(|(call, _)| HirExpr::Call(Box::new(call)));
+        }
         let result = HomeSlotKey::new(slot, 0);
         // 未来同槽 capture 不能反向阻止这次读取；只有原操作尚未打开 ByRef 时才可借证。
         // 当前声明/捕获身份及后继窗口仍由完整帧的原子 preview 验证。
@@ -371,22 +625,64 @@ impl FrameBuilder<'_> {
             return None;
         }
         let direct_base = self
-            .direct_home(&access.base)
+            .facts
+            .table_read_base_home(access)
             .is_some_and(|home| home == layout.base && home.slot() < self.base);
-        if !direct_base && layout.base != result {
+        // PUC 的计算左值预留 base 槽，key 的 CALL 可先借该槽，再把字段结果写到 key 槽；
+        // indexed owner 会在 key 完成后重发原目标读取，不能把中间 CALL 固定成声明。
+        let indexed_base = self.indexed_key_base == Some(layout.base.slot())
+            && result == HomeSlotKey::new(layout.base.slot() + 1, 0)
+            && layout.key.is_none();
+        if !direct_base && layout.base != result && !indexed_base {
             // 候选拒绝[ProofIncomplete]：高槽 base 必须在当前结果槽完成，不能省略不同槽快照。
             return None;
         }
-        let base = self.register_operand(&access.base, before, slot)?;
+        let base = if direct_base {
+            access.base.clone()
+        } else if let Some(home) = self.prepared_upvalue_lookup_base(access) {
+            if home != layout.base {
+                return None;
+            }
+            // GETUPVAL 的单次 Def 仍在原 base 槽准备；不能将同名上值当成既有低槽。
+            access.base.clone()
+        } else {
+            self.register_operand(
+                &access.base,
+                before,
+                if indexed_base {
+                    layout.base.slot()
+                } else {
+                    slot
+                },
+            )?
+        };
         let key = if let Some(home) = layout.key {
             let direct_key = self
                 .direct_home(&access.key)
                 .is_some_and(|key| key == home && key.slot() < self.base);
-            let key_slot = slot + usize::from(!direct_base);
+            let key_slot =
+                slot + usize::from(!direct_base || self.dialect == DecompileDialect::Luau);
             if !direct_key && home != HomeSlotKey::new(key_slot, 0) {
                 return None;
             }
-            self.register_operand(&access.key, before, key_slot)?
+            if self.dialect == DecompileDialect::Luau
+                && tables::literal_rk(&access.key)
+                && self.facts.table_key_preparation(access) == Some(home)
+            {
+                // O0 在结果上方显式加载原字面键；该 use→Def 不能被当作可省略的 RK。
+                access.key.clone()
+            } else if matches!(access.key, HirExpr::UpvalueRef(_))
+                && !matches!(
+                    self.dialect,
+                    DecompileDialect::Luau | DecompileDialect::Luajit
+                )
+                && self.facts.table_key_preparation(access) == Some(home)
+            {
+                // 原 GETUPVAL 只供本次索引使用，仍在 key_slot 重发；base 已在上方验证。
+                access.key.clone()
+            } else {
+                self.register_operand(&access.key, before, key_slot)?
+            }
         } else {
             if !self.native?.constants_fit_rk
                 || !matches!(
@@ -405,6 +701,22 @@ impl FrameBuilder<'_> {
             metamethod_free: access.metamethod_free,
             method_setup_protocol: access.method_setup_protocol,
         })))
+    }
+
+    /// 原 GETUPVAL→GETTABLE 的 base 准备；直接 GETTABUP 没有这个寄存器输入。
+    pub(super) fn prepared_upvalue_lookup_base(
+        &self,
+        access: &HirTableAccess,
+    ) -> Option<HomeSlotKey> {
+        if !matches!(access.base, HirExpr::UpvalueRef(_)) {
+            return None;
+        }
+        let crate::hir::common::HirOperationSources::Single(source) = access.sources else {
+            return None;
+        };
+        self.facts
+            .operation_input_preparation(source, &access.base)
+            .map(|(_, home)| home)
     }
 
     /// 新增帧内操作逐层核对原输入；旧的简单字段入口不承担嵌套准备证明。
@@ -447,7 +759,8 @@ impl FrameBuilder<'_> {
         }
     }
 
-    pub(super) fn puc_arithmetic(
+    /// PUC/JIT 在结果槽准备复合左值，相邻槽准备右值；逐层核对原读写与事件。
+    pub(super) fn register_arithmetic(
         &mut self,
         binary: &crate::hir::common::HirBinaryExpr,
         before: usize,
@@ -475,7 +788,36 @@ impl FrameBuilder<'_> {
             if !lhs_low && layout.lhs != Some(result) {
                 return None;
             }
-            self.register_operand(&binary.lhs, before, slot)?
+            let prepared = match &binary.lhs {
+                HirExpr::LocalRef(local) => self
+                    .definition(*local, before)
+                    .and_then(|index| scalar_local(self.run[index]))
+                    .map_or(&binary.lhs, |(_, value)| value),
+                value => value,
+            };
+            if matches!(
+                prepared,
+                HirExpr::UpvalueRef(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+            ) && !lhs_low
+            {
+                // 上值和字面量没有独立的表达式来源；用原 use→Def 证明输入在
+                // 结果槽准备。尤其 0 / 0 不可折叠，左侧仍须重发原 LOADI。
+                let (producer, home) = self
+                    .facts
+                    .operation_input_preparation(binary.source_site?, prepared)?;
+                if home != result {
+                    return None;
+                }
+                // 准备写可能已提升成匿名 Local；消费同一个原输入 Def 的声明，
+                // 不能让通用寄存器操作数入口把这份已证明的读取重新拒绝。
+                let previous = std::mem::replace(&mut self.register_operand, false);
+                let rebuilt =
+                    self.expr(&binary.lhs, before, slot, None, false, true, Some(producer));
+                self.register_operand = previous;
+                rebuilt?
+            } else {
+                self.register_operand(&binary.lhs, before, slot)?
+            }
         };
         let rhs_slot = slot + usize::from(!lhs_low && layout.lhs.is_some());
         let rhs = if layout.rhs.is_none() && constant(&binary.rhs) {

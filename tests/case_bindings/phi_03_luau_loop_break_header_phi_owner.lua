@@ -6,6 +6,9 @@
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[in ipairs({ {}, { 10 }, { 10, 20, 30, 40 } })]]
+-- unluac: expect-not-contains [[ = nil]]
+-- unluac: expect-ast-max [[local-binding]] [[8]]
 local subject = function(a, b, t)
     local x = 0
     for _ in t do

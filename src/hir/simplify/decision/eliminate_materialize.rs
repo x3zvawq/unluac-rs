@@ -69,6 +69,7 @@ pub(super) fn extract_call_expr(
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirCallExpr, bool) {
     let HirCallExpr {
+        required_luau_inlining,
         source_site,
         argument_roots,
         frame_root_ends,
@@ -80,6 +81,7 @@ pub(super) fn extract_call_expr(
         callee_root_handoff,
         method_rewrite_transaction,
         plain_method_syntax,
+        boolean_prewrite_arguments,
     } = call;
     let (prefix, mut leading, args, changed) =
         extract_value_pack_with_leading(vec![callee], args, state, safety);
@@ -89,6 +91,7 @@ pub(super) fn extract_call_expr(
     (
         prefix,
         HirCallExpr {
+            required_luau_inlining,
             source_site,
             argument_roots,
             frame_root_ends,
@@ -100,6 +103,7 @@ pub(super) fn extract_call_expr(
             callee_root_handoff,
             method_rewrite_transaction,
             plain_method_syntax,
+            boolean_prewrite_arguments,
         },
         changed,
     )
@@ -242,6 +246,10 @@ pub(super) fn extract_assign(
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirAssign, bool) {
+    let luau_compound_global = assign.luau_compound_global;
+    let upvalue_write_source = assign.upvalue_write_source;
+    let is_phi_transfer = assign.is_phi_transfer;
+    let parallel_nil_frame = assign.parallel_nil_frame;
     let initializer_merge_transaction = assign.initializer_merge_transaction;
     let generic_for_initializer_producer = assign.generic_for_initializer_producer;
     let generic_for_dispatch_release = assign.generic_for_dispatch_release;
@@ -287,6 +295,10 @@ pub(super) fn extract_assign(
     (
         prefix,
         HirAssign {
+            luau_compound_global,
+            upvalue_write_source: (!changed).then_some(upvalue_write_source).flatten(),
+            is_phi_transfer,
+            parallel_nil_frame: (!changed).then_some(parallel_nil_frame).flatten(),
             targets,
             values,
             initializer_merge_transaction: (!changed)
@@ -334,7 +346,7 @@ pub(super) fn materialize_expr_into_target(
     safety: HirExprSafety,
 ) -> Vec<HirStmt> {
     match expr {
-        HirExpr::Decision(decision) => {
+        HirExpr::Decision(decision) if !decision.emit_as_luau_if => {
             materialize_decision_into_target(*decision, target, state, safety)
         }
         HirExpr::LogicalAnd(logical) => {
@@ -367,6 +379,7 @@ pub(super) fn materialize_expr_for_assignment(
     if let HirExpr::Decision(decision) = expr {
         // Decision 的测试不写目标，且每条终端路径只提交一次。不能先折成 logical
         // 再使用其逐步物化通道；后者可能在后续 RHS 事件前覆盖旧 local/upvalue。
+        let decision = super::short_circuit::prepare_control_materialization(*decision, safety);
         return materialize_decision_node(&decision, decision.entry.index(), target, state, safety);
     }
 
@@ -420,6 +433,7 @@ fn materialize_logical_expr_into_target(
         stmts: materialize_expr_into_target(logical.rhs, target, state, safety),
     };
     stmts.push(HirStmt::If(Box::new(HirIf {
+        preserves_empty_test: false,
         cond: guard,
         then_block,
         else_block: None,
@@ -439,6 +453,7 @@ fn materialize_decision_into_target(
         return materialize_expr_into_target(expr, target, state, safety);
     }
 
+    let decision = super::short_circuit::prepare_control_materialization(decision, safety);
     materialize_decision_node(&decision, decision.entry.index(), target, state, safety)
 }
 
@@ -513,6 +528,7 @@ fn materialize_decision_node(
     };
 
     prefix.push(HirStmt::If(Box::new(HirIf {
+        preserves_empty_test: false,
         cond,
         then_block,
         else_block,
@@ -538,6 +554,15 @@ fn materialize_decision_target(
             current_value.cloned().unwrap_or_else(|| node.test.clone()),
         )],
         HirDecisionTarget::Expr(expr) => {
+            if matches!((&target, expr),
+                (HirLValue::Local(left), HirExpr::LocalRef(right)) if left == right)
+                || matches!((&target, expr),
+                    (HirLValue::Temp(left), HirExpr::TempRef(right)) if left == right)
+            {
+                // 该终端沿用目标的当前 SSA 值，没有原写入；直接保留空路径，
+                // 不先合成自赋值再丢失短路控制关系。全局和上值不领取此许可。
+                return Vec::new();
+            }
             materialize_expr_for_assignment(expr.clone(), target, state, safety)
         }
     }
@@ -635,7 +660,11 @@ fn prepare_pure_expr(
                 .expect("logical extraction should preserve its rhs");
             (
                 prefix,
-                HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs })),
+                HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                    preserves_boolean_prewrite: false,
+                    lhs,
+                    rhs,
+                })),
             )
         }
         HirExpr::LogicalOr(logical) => {
@@ -650,7 +679,11 @@ fn prepare_pure_expr(
                 .expect("logical extraction should preserve its rhs");
             (
                 prefix,
-                HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs })),
+                HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                    preserves_boolean_prewrite: false,
+                    lhs,
+                    rhs,
+                })),
             )
         }
         HirExpr::Call(call) => {
@@ -680,6 +713,9 @@ fn prepare_ordered_exprs(
 
 fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr> {
     match expr {
+        HirExpr::Decision(decision) if decision.emit_as_luau_if => {
+            Some(HirExpr::Decision(decision))
+        }
         HirExpr::Decision(decision) => {
             super::collapse_value_decision_expr(&super::analyze_decision(&decision), safety, |_| {
                 false
@@ -706,7 +742,11 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
         HirExpr::LogicalAnd(logical) => {
             let lhs = collapse_expr_to_pure(logical.lhs, safety)?;
             let rhs = collapse_expr_to_pure(logical.rhs, safety)?;
-            let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr { lhs, rhs }));
+            let expr = HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                preserves_boolean_prewrite: false,
+                lhs,
+                rhs,
+            }));
             Some(
                 super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
                     .unwrap_or(expr),
@@ -715,7 +755,11 @@ fn collapse_expr_to_pure(expr: HirExpr, safety: HirExprSafety) -> Option<HirExpr
         HirExpr::LogicalOr(logical) => {
             let lhs = collapse_expr_to_pure(logical.lhs, safety)?;
             let rhs = collapse_expr_to_pure(logical.rhs, safety)?;
-            let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr { lhs, rhs }));
+            let expr = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+                preserves_boolean_prewrite: false,
+                lhs,
+                rhs,
+            }));
             Some(
                 super::super::logical_simplify::simplify_logical_shape_with_safety(&expr, safety)
                     .unwrap_or(expr),
@@ -770,6 +814,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         None => None,
     };
     Some(HirCallExpr {
+        required_luau_inlining: call.required_luau_inlining,
         source_site: call.source_site,
         argument_roots: Vec::new(),
         frame_root_ends: call.frame_root_ends,
@@ -781,6 +826,7 @@ fn collapse_call_to_pure(call: HirCallExpr, safety: HirExprSafety) -> Option<Hir
         callee_root_handoff: call.callee_root_handoff,
         method_rewrite_transaction: call.method_rewrite_transaction,
         plain_method_syntax: false,
+        boolean_prewrite_arguments: call.boolean_prewrite_arguments,
     })
 }
 
@@ -892,8 +938,11 @@ pub(super) fn eliminate_condition_expr(expr: &mut HirExpr, safety: HirExprSafety
             lhs_changed || rhs_changed
         }
         HirExpr::Decision(decision) => {
-            if let Some(replacement) =
-                super::collapse_condition_decision_expr(&super::analyze_decision(decision), safety)
+            if !decision.emit_as_luau_if
+                && let Some(replacement) = super::collapse_condition_decision_expr(
+                    &super::analyze_decision(decision),
+                    safety,
+                )
             {
                 *expr = replacement;
                 true
@@ -976,7 +1025,10 @@ fn eliminate_condition_call(call: &mut HirCallExpr, safety: HirExprSafety) -> bo
 }
 
 pub(super) fn expr_contains_eliminable_decision(expr: &HirExpr) -> bool {
-    any_expr(expr, &mut |expr| matches!(expr, HirExpr::Decision(_)))
+    any_expr(
+        expr,
+        &mut |expr| matches!(expr, HirExpr::Decision(decision) if !decision.emit_as_luau_if),
+    )
 }
 
 pub(super) fn empty_local_decl(local: LocalId) -> HirStmt {
@@ -997,6 +1049,10 @@ fn local_decl_with_value(local: LocalId, value: HirExpr) -> HirStmt {
 
 fn assign_stmt(target: HirLValue, value: HirExpr) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
+        luau_compound_global: false,
+        upvalue_write_source: None,
+        is_phi_transfer: false,
+        parallel_nil_frame: None,
         targets: vec![target],
         values: HirValuePack::fixed(vec![value]),
         initializer_merge_transaction: None,

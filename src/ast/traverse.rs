@@ -125,6 +125,20 @@ macro_rules! traverse_expr_children {
                     $on_expr
                 }
             }
+            crate::ast::AstExpr::IfExpr(branch) => {
+                {
+                    let $expr = $($borrow)+ branch.cond;
+                    $on_expr
+                }
+                {
+                    let $expr = $($borrow)+ branch.then_expr;
+                    $on_expr
+                }
+                {
+                    let $expr = $($borrow)+ branch.else_expr;
+                    $on_expr
+                }
+            }
             crate::ast::AstExpr::MethodCall(call) => {
                 {
                     let $expr = $($borrow)+ call.receiver;

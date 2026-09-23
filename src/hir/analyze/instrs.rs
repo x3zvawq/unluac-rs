@@ -41,6 +41,31 @@ pub(super) fn lower_regular_instr(
     instr: &LowInstr,
 ) -> Option<Vec<HirStmt>> {
     if lowering
+        .captured_shared_closures
+        .effect_prefix_at(instr_ref)
+    {
+        return Some(Vec::new());
+    }
+    let stmts = lower_regular_instr_body(lowering, block, instr_ref, instr)?;
+    if matches!(instr, LowInstr::Closure(_)) {
+        return Some(stmts);
+    }
+    // 已证明的 Entry nil 在 CLOSE 窗口起点声明；不必等到首次 CLOSURE 才建 cell。
+    let mut declarations = capture_empty_local_decl_stmts(lowering, instr_ref);
+    if declarations.is_empty() {
+        return Some(stmts);
+    }
+    declarations.extend(stmts);
+    Some(declarations)
+}
+
+fn lower_regular_instr_body(
+    lowering: &ProtoLowering<'_>,
+    block: BlockRef,
+    instr_ref: InstrRef,
+    instr: &LowInstr,
+) -> Option<Vec<HirStmt>> {
+    if lowering
         .bindings
         .numeric_binding_copies
         .contains(&instr_ref)
@@ -60,6 +85,14 @@ pub(super) fn lower_regular_instr(
             instr_ref,
             vec![HirExpr::Nil; lowering.dataflow.instr_defs[instr_ref.index()].len()],
         ),
+        LowInstr::LoadBool(_)
+            if lowering
+                .captured_shared_closures
+                .identity_initializers
+                .contains_key(&instr_ref) =>
+        {
+            Vec::new()
+        }
         LowInstr::LoadBool(load_bool) => {
             fixed_assign(lowering, instr_ref, vec![HirExpr::Boolean(load_bool.value)])
         }
@@ -75,7 +108,11 @@ pub(super) fn lower_regular_instr(
         LowInstr::LoadInteger(load_integer) => fixed_assign(
             lowering,
             instr_ref,
-            vec![HirExpr::Integer(load_integer.value)],
+            vec![lower_literal_initializer(
+                lowering,
+                instr_ref,
+                HirExpr::Integer(load_integer.value),
+            )],
         ),
         LowInstr::LoadNumber(load_number) => fixed_assign(
             lowering,
@@ -138,15 +175,25 @@ pub(super) fn lower_regular_instr(
             instr_ref,
             vec![lower_upvalue_operand_expr(lowering, get_upvalue.src)],
         ),
-        LowInstr::SetUpvalue(set_upvalue) => vec![assign_stmt(
-            vec![lower_upvalue_operand_target(lowering, set_upvalue.dst)],
-            vec![expr_for_value_operand(
-                lowering,
-                block,
-                instr_ref,
-                set_upvalue.src,
-            )],
-        )],
+        LowInstr::SetUpvalue(set_upvalue) => {
+            let mut stmt = assign_stmt(
+                vec![lower_upvalue_operand_target(lowering, set_upvalue.dst)],
+                vec![expr_for_value_operand(
+                    lowering,
+                    block,
+                    instr_ref,
+                    set_upvalue.src,
+                )],
+            );
+            let HirStmt::Assign(assign) = &mut stmt else {
+                unreachable!()
+            };
+            assign.upvalue_write_source = Some(crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: instr_ref,
+            });
+            vec![stmt]
+        }
         LowInstr::GetTable(get_table) => fixed_assign(
             lowering,
             instr_ref,
@@ -203,6 +250,7 @@ pub(super) fn lower_regular_instr(
                 "it can raise a LuaJIT-specific argument error without producing a Lua value"
             };
             let call = HirCallExpr {
+                required_luau_inlining: None,
                 source_site: None,
                 argument_roots: Vec::new(),
                 frame_root_ends: Vec::new(),
@@ -223,6 +271,7 @@ pub(super) fn lower_regular_instr(
                 callee_root_handoff: None,
                 method_rewrite_transaction: None,
                 plain_method_syntax: false,
+                boolean_prewrite_arguments: Vec::new(),
             };
             if type_guard.kind.normalizes_subject() {
                 fixed_assign(lowering, instr_ref, vec![HirExpr::Call(Box::new(call))])
@@ -257,11 +306,20 @@ pub(super) fn lower_regular_instr(
                 // capture 保存的是 closure 对象本身。先用独立 binding 固定这个快照，
                 // 再写真实 dst；AST capture 元数据不保留 VM capture mode，且 dst 可重绑。
                 debug_assert!(owner.is_none() && !consumed);
+                let value = lower_closure_expr(lowering, block, instr_ref, closure);
+                if lower_fixed_targets(lowering, instr_ref).as_slice()
+                    == [HirLValue::Local(snapshot)]
+                {
+                    // 独立结果 Def 直接建立递归 local，没有需要额外快照的旧 dst cell。
+                    stmts.push(HirStmt::LocalDecl(Box::new(HirLocalDecl {
+                        bindings: vec![snapshot],
+                        values: vec![value].into(),
+                        initializer_merge_transaction: None,
+                    })));
+                    return Some(stmts);
+                }
                 stmts.extend(local_decl_stmts(vec![snapshot]));
-                stmts.push(assign_stmt(
-                    vec![HirLValue::Local(snapshot)],
-                    vec![lower_closure_expr(lowering, block, instr_ref, closure)],
-                ));
+                stmts.push(assign_stmt(vec![HirLValue::Local(snapshot)], vec![value]));
                 stmts.extend(fixed_assign(
                     lowering,
                     instr_ref,
@@ -335,6 +393,19 @@ pub(super) fn lower_regular_instr(
         .promotion_facts
         .copy_root_before_releases(instr_ref);
     if !roots.is_empty() {
+        // 异槽 NOT 在读完输入后写 Boolean；它不调用元方法，也不需要先清除目标根。
+        let boolean_overwrite = (matches!(instr, LowInstr::LoadBool(_))
+            || matches!(instr, LowInstr::UnaryOp(unary)
+                if unary.op == crate::transformer::UnaryOpKind::Not && unary.src != unary.dst))
+        .then(|| {
+            let def = *lowering.dataflow.instr_defs[instr_ref.index()].first()?;
+            let temp = lowering.bindings.fixed_temps[def.index()];
+            Some((
+                lowering.bindings.lvalue_for_temp(temp),
+                lowering.promotion_facts.trusted_temp_home_slot(temp)?,
+            ))
+        })
+        .flatten();
         let declared_nil_locals = if matches!(instr, LowInstr::LoadNil(_)) {
             lowering.dataflow.instr_defs[instr_ref.index()]
                 .iter()
@@ -350,6 +421,12 @@ pub(super) fn lower_regular_instr(
             Default::default()
         };
         let roots = roots.iter().copied()
+            // 原 Boolean 写已更新同一 binding/home，且没有 RHS 观察事件；
+            // 不提前发 nil 清除，也不能让其后无读取的 Boolean Def 被误删。
+            .filter(|temp| boolean_overwrite.as_ref().is_none_or(|(target, home)| {
+                lowering.bindings.lvalue_for_temp(*temp) != *target
+                    || lowering.promotion_facts.trusted_temp_home_slot(*temp) != Some(*home)
+            }))
             .map(|temp| lowering.bindings.lvalue_for_temp(temp))
             // 原 nil 声明已在同一指令清空这个槽；不能在声明前另写一次未绑定的 local。
             .filter(|target| !matches!(target, HirLValue::Local(local) if declared_nil_locals.contains(local)))
@@ -435,6 +512,7 @@ pub(super) fn lower_terminal_instr(
                 HirValuePack::expanding(
                     Vec::new(),
                     HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                        required_luau_inlining: None,
                         source_site: Some(crate::hir::common::HirSourceSite {
                             proto: lowering.id,
                             instr: instr_ref,
@@ -457,6 +535,7 @@ pub(super) fn lower_terminal_instr(
                         ),
                         method_rewrite_transaction: None,
                         plain_method_syntax: false,
+                        boolean_prewrite_arguments: Vec::new(),
                     }))),
                 ),
                 None,
@@ -524,6 +603,7 @@ fn generic_for_iterator_call(
     .into();
 
     HirExpr::Call(Box::new(HirCallExpr {
+        required_luau_inlining: None,
         source_site: Some(crate::hir::common::HirSourceSite {
             proto: lowering.id,
             instr: instr_ref,
@@ -538,6 +618,7 @@ fn generic_for_iterator_call(
         callee_root_handoff: None,
         method_rewrite_transaction: None,
         plain_method_syntax: false,
+        boolean_prewrite_arguments: Vec::new(),
     }))
 }
 
@@ -572,6 +653,7 @@ fn lower_call_expr(
     let method_key = lower_method_key(lowering, call.method_name);
     let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
     HirCallExpr {
+        required_luau_inlining: None,
         source_site: Some(crate::hir::common::HirSourceSite {
             proto: lowering.id,
             instr: instr_ref,
@@ -589,6 +671,7 @@ fn lower_call_expr(
         callee_root_handoff: lower_call_root_handoff(lowering, instr_ref, call.kind),
         method_rewrite_transaction: None,
         plain_method_syntax: false,
+        boolean_prewrite_arguments: Vec::new(),
     }
 }
 
@@ -662,11 +745,35 @@ fn lower_result_assign(
 
 /// 已证相邻的 NaN capture 初始化保留不透明字段读取，避免目标编译器删除捕获。
 /// 合成表和读取不继承原 VM 操作来源；原标量 binding 的 SharedClosureIdentity 禁止折回常量。
-fn lower_literal_initializer(
+pub(in crate::hir::analyze) fn lower_literal_initializer(
     lowering: &ProtoLowering<'_>,
     instr: InstrRef,
     value: HirExpr,
 ) -> HirExpr {
+    if let Some(initializer) = lowering
+        .captured_shared_closures
+        .identity_initializers
+        .get(&instr)
+    {
+        return HirExpr::Call(Box::new(HirCallExpr {
+            required_luau_inlining: Some(crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr,
+            }),
+            source_site: None,
+            argument_roots: Vec::new(),
+            frame_root_ends: Vec::new(),
+            callee: HirExpr::LocalRef(initializer.callee),
+            args: vec![value].into(),
+            method: false.into(),
+            fastcall: None,
+            method_key: None,
+            callee_root_handoff: None,
+            method_rewrite_transaction: None,
+            plain_method_syntax: false,
+            boolean_prewrite_arguments: Vec::new(),
+        }));
+    }
     if !lowering
         .captured_shared_closures
         .has_literal_initializer(instr)
@@ -720,6 +827,23 @@ fn lower_shared_capture_barrier(
         fields,
         trailing_multivalue: None,
     }));
+    // 单个快照只读取合成表一次，表本身从不逃逸，所捕获值仍由
+    // 快照持有；没有保留独立 box binding 的身份或生命周期要求。仍在原 capture 锚点分配并读取，不能
+    // 提前到原 NaN 写入之前，也不能将不透明读取折回常量。
+    let Some(box_local) = barrier.box_local else {
+        return vec![HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: locals,
+            values: vec![HirExpr::TableAccess(Box::new(HirTableAccess {
+                sources: Default::default(),
+                metamethod_free: true,
+                base: table,
+                key: HirExpr::Integer(1),
+                method_setup_protocol: None,
+            }))]
+            .into(),
+            initializer_merge_transaction: None,
+        }))];
+    };
     let snapshots = locals
         .iter()
         .enumerate()
@@ -727,7 +851,7 @@ fn lower_shared_capture_barrier(
             HirExpr::TableAccess(Box::new(HirTableAccess {
                 sources: Default::default(),
                 metamethod_free: false,
-                base: HirExpr::LocalRef(barrier.box_local),
+                base: HirExpr::LocalRef(box_local),
                 key: HirExpr::Integer((index + 1) as i64),
                 method_setup_protocol: None,
             }))
@@ -735,7 +859,7 @@ fn lower_shared_capture_barrier(
         .collect::<Vec<_>>();
     vec![
         HirStmt::LocalDecl(Box::new(HirLocalDecl {
-            bindings: vec![barrier.box_local],
+            bindings: vec![box_local],
             values: vec![table].into(),
             initializer_merge_transaction: None,
         })),

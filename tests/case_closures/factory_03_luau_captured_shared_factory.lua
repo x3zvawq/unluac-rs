@@ -2,10 +2,19 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[rawequal]]
+-- O2 的常量初始化仍保留原 TEST，恒等调用不能改变两条工厂创建路径。
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=0]]
 -- unluac: expect-not-contains [[if true then]]
--- 两组 NaN 捕获仍需各自的不透明表读取；收敛不能通过删掉身份屏障获得。
--- unluac: expect-ast-count [[table-constructor]] [[2]] [[@proto=0]]
--- unluac: expect-ast-count [[table-list-field]] [[2]] [[@proto=0]]
+-- 恢复原恒等调用后，NaN 捕获保持不透明且无需合成表；两组闭包身份由运行输出核对。
+-- unluac: expect-ast-count [[table-constructor]] [[0]] [[@proto=0]]
+-- unluac: expect-contains [[--!optimize 2]]
+-- unluac: expect-contains [[print("regress_296_transitive",]]
+-- unluac: expect-contains [[print("regress_296_noisy",]]
+-- unluac: expect-contains [[print("regress_296_noisy_nan",]]
+-- unluac: expect-contains [[print("regress_296_branch",]]
+-- unluac: expect-count [[print("regress_296_event",]] [[1]]
+-- unluac: expect-count [[print("regress_296_nan_event",]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=0]]
 local function opaque(value)
     return value
 end

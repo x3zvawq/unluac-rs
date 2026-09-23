@@ -23,6 +23,46 @@ use crate::ast::common::{
 };
 
 impl<'a> AstLowerer<'a> {
+    fn lower_native_if_expr(
+        &mut self,
+        proto: usize,
+        decision: &crate::hir::HirDecisionExpr,
+    ) -> Result<AstExpr, AstLowerError> {
+        use crate::hir::HirDecisionTarget;
+        let topology = crate::hir::decision::analyze_decision(decision);
+        if topology.has_shared_nodes() {
+            return Err(AstLowerError::ResidualHir {
+                proto,
+                kind: "shared native if expression",
+            });
+        }
+        let mut values = vec![None; decision.nodes.len()];
+        for node in topology.topological_nodes().rev() {
+            let mut arm = |target: &HirDecisionTarget| -> Result<AstExpr, AstLowerError> {
+                match target {
+                    HirDecisionTarget::Expr(expr) => self.lower_expr(proto, expr),
+                    HirDecisionTarget::Node(next) => Ok(values[next.index()]
+                        .take()
+                        .expect("native if child is built once before its parent")),
+                    HirDecisionTarget::CurrentValue => Err(AstLowerError::ResidualHir {
+                        proto,
+                        kind: "native if reuses its condition value",
+                    }),
+                }
+            };
+            let then_expr = arm(&node.truthy)?;
+            let else_expr = arm(&node.falsy)?;
+            values[node.id.index()] = Some(AstExpr::IfExpr(Box::new(crate::ast::AstIfExpr {
+                cond: self.lower_expr(proto, &node.test)?,
+                then_expr,
+                else_expr,
+            })));
+        }
+        Ok(values[decision.entry.index()]
+            .take()
+            .expect("native if has an entry"))
+    }
+
     pub(super) fn lower_value_pack(
         &mut self,
         proto_index: usize,
@@ -173,6 +213,7 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         assign: &HirAssign,
     ) -> Result<Vec<AstStmt>, AstLowerError> {
+        let preserve_parallel_nil = assign.preserves_parallel_nil();
         let assign = AstAssign {
             targets: assign
                 .targets
@@ -185,9 +226,26 @@ impl<'a> AstLowerer<'a> {
                 PackLoweringContext::TargetCounted(assign.targets.len()),
             )?,
             initializer_merge_transaction: assign.initializer_merge_transaction,
+            luau_compound_global: assign.luau_compound_global,
             method_rewrite_transaction: assign.method_rewrite_transaction,
         };
-        if assign.targets.len() > 1
+        if assign.luau_compound_global {
+            if self.target.version != DecompileDialect::Luau {
+                return Err(AstLowerError::UnsupportedFeature {
+                    dialect: self.target.version,
+                    feature: "compound assignment",
+                    context: "HIR assignment frame",
+                });
+            }
+            if assign.compound_global_binary().is_none() {
+                return Err(AstLowerError::ResidualHir {
+                    proto: proto_index,
+                    kind: "invalid compound assignment frame",
+                });
+            }
+        }
+        if !preserve_parallel_nil
+            && assign.targets.len() > 1
             && assign.targets.len() == assign.values.len()
             && assign
                 .values
@@ -204,6 +262,7 @@ impl<'a> AstLowerer<'a> {
             && assign.initializer_merge_transaction.is_none()
             && assign.method_rewrite_transaction.is_none()
         {
+            // 原范围清零没有并列 RHS 准备；HIR 已验证的完整赋值帧必须保留。
             // HIR 保留范围清零的共同覆盖端点；源码多值赋值却为整组 RHS 预留临时寄存器，
             // 128 个活跃 local 再接 128 个 nil 就不可重编译。标量本地清零直接写原槽，
             // 没有 RHS 读取、地址求值或 GC 观察点，不改变 binding/capture 的身份与释放点。
@@ -215,6 +274,7 @@ impl<'a> AstLowerer<'a> {
                         targets: vec![target],
                         values: vec![AstExpr::Nil],
                         initializer_merge_transaction: None,
+                        luau_compound_global: false,
                         method_rewrite_transaction: None,
                     }))
                 })
@@ -285,11 +345,30 @@ impl<'a> AstLowerer<'a> {
             HirExpr::Unary(_) | HirExpr::Binary(_) => {
                 self.lower_operator_expr(proto_index, expr)?
             }
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical)
+                if logical.preserves_boolean_prewrite =>
+            {
+                let value = Box::new(AstLogicalExpr {
+                    lhs: self.lower_expr(proto_index, &logical.lhs)?,
+                    rhs: self.lower_expr(proto_index, &logical.rhs)?,
+                    preserves_boolean_prewrite: true,
+                });
+                if matches!(expr, HirExpr::LogicalAnd(_)) {
+                    AstExpr::LogicalAnd(value)
+                } else {
+                    AstExpr::LogicalOr(value)
+                }
+            }
             HirExpr::LogicalAnd(_) => {
                 self.lower_logical_chain(proto_index, expr, LogicalKind::And)?
             }
             HirExpr::LogicalOr(_) => {
                 self.lower_logical_chain(proto_index, expr, LogicalKind::Or)?
+            }
+            HirExpr::Decision(decision)
+                if decision.emit_as_luau_if && self.target.version == DecompileDialect::Luau =>
+            {
+                self.lower_native_if_expr(proto_index, decision)?
             }
             HirExpr::Decision(_) => {
                 if !self.should_recover_errors() {
@@ -395,8 +474,8 @@ impl<'a> AstLowerer<'a> {
     ) -> Result<AstExpr, AstLowerError> {
         enum Step<'hir> {
             Expr(&'hir HirExpr),
-            Unary(AstUnaryOpKind),
-            Binary(AstBinaryOpKind),
+            Unary(AstUnaryOpKind, bool),
+            Binary(AstBinaryOpKind, bool),
         }
 
         let mut pending = vec![Step::Expr(expr)];
@@ -404,25 +483,40 @@ impl<'a> AstLowerer<'a> {
         while let Some(step) = pending.pop() {
             match step {
                 Step::Expr(HirExpr::Unary(unary)) => {
-                    pending.push(Step::Unary(lower_unary_op(unary.op)));
+                    pending.push(Step::Unary(
+                        lower_unary_op(unary.op),
+                        unary.source_site.is_some(),
+                    ));
                     pending.push(Step::Expr(&unary.expr));
                 }
                 Step::Expr(HirExpr::Binary(binary)) => {
-                    pending.push(Step::Binary(lower_binary_op(binary.op)));
+                    pending.push(Step::Binary(
+                        lower_binary_op(binary.op),
+                        binary.source_site.is_some(),
+                    ));
                     pending.push(Step::Expr(&binary.rhs));
                     pending.push(Step::Expr(&binary.lhs));
                 }
                 Step::Expr(leaf) => values.push(self.lower_expr(proto_index, leaf)?),
-                Step::Unary(op) => {
+                Step::Unary(op, original_operation) => {
                     let expr = values
                         .pop()
                         .expect("unary operand is lowered before its node");
-                    values.push(AstExpr::Unary(Box::new(AstUnaryExpr { op, expr })));
+                    values.push(AstExpr::Unary(Box::new(AstUnaryExpr {
+                        op,
+                        expr,
+                        original_operation,
+                    })));
                 }
-                Step::Binary(op) => {
+                Step::Binary(op, original_operation) => {
                     let rhs = values.pop().expect("binary rhs is lowered before its node");
                     let lhs = values.pop().expect("binary lhs is lowered before its node");
-                    values.push(AstExpr::Binary(Box::new(AstBinaryExpr { op, lhs, rhs })));
+                    values.push(AstExpr::Binary(Box::new(AstBinaryExpr {
+                        op,
+                        lhs,
+                        rhs,
+                        original_operation,
+                    })));
                 }
             }
         }
@@ -442,7 +536,11 @@ impl<'a> AstLowerer<'a> {
         while let Some(expr) = pending.pop() {
             let logical = match (kind, expr) {
                 (LogicalKind::And, HirExpr::LogicalAnd(logical))
-                | (LogicalKind::Or, HirExpr::LogicalOr(logical)) => logical,
+                | (LogicalKind::Or, HirExpr::LogicalOr(logical))
+                    if !logical.preserves_boolean_prewrite =>
+                {
+                    logical
+                }
                 _ => {
                     operands.push(self.lower_expr(proto_index, expr)?);
                     continue;
@@ -487,6 +585,21 @@ impl<'a> AstLowerer<'a> {
         }
         let mut args =
             self.lower_value_pack(proto_index, &call.args, PackLoweringContext::Ordinary)?;
+        // HIR 已证明并消费原比较前的 Boolean 写。Luau 裸比较只在分支后写结果，
+        // 合取 true / 析取 false 分别重发 false / true 预写；这里不再推断原槽。
+        for &(index, initial_value) in &call.boolean_prewrite_arguments {
+            let lhs = std::mem::replace(&mut args[index], AstExpr::Nil);
+            let logical = Box::new(AstLogicalExpr {
+                lhs,
+                rhs: AstExpr::Boolean(!initial_value),
+                preserves_boolean_prewrite: true,
+            });
+            args[index] = if initial_value {
+                AstExpr::LogicalOr(logical)
+            } else {
+                AstExpr::LogicalAnd(logical)
+            };
+        }
 
         if let Some(method_name) = method_name {
             if call.method == crate::hir::HirMethodCall::Implicit {
@@ -535,6 +648,7 @@ impl<'a> AstLowerer<'a> {
         }
 
         Ok(AstCallKind::Call(Box::new(AstCallExpr {
+            required_luau_inlining: call.required_luau_inlining,
             callee,
             args,
             method_key: call.method_key.clone(),
@@ -600,7 +714,11 @@ fn build_balanced_logical_expr(
     let left_len = len / 2;
     let lhs = build_balanced_logical_expr(kind, operands, left_len);
     let rhs = build_balanced_logical_expr(kind, operands, len - left_len);
-    let logical = Box::new(AstLogicalExpr { lhs, rhs });
+    let logical = Box::new(AstLogicalExpr {
+        lhs,
+        rhs,
+        preserves_boolean_prewrite: false,
+    });
     match kind {
         LogicalKind::And => AstExpr::LogicalAnd(logical),
         LogicalKind::Or => AstExpr::LogicalOr(logical),

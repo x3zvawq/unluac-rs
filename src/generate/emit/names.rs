@@ -5,8 +5,8 @@
 
 use crate::ast::NameMap;
 use crate::ast::{
-    AstBindingRef, AstFeature, AstFunctionDecl, AstFunctionName, AstGlobalBinding,
-    AstGlobalBindingTarget, AstLocalAttr, AstLocalBinding, AstNameRef,
+    AstBindingRef, AstFeature, AstGlobalBinding, AstGlobalBindingTarget, AstLocalAttr,
+    AstLocalBinding, AstNameRef,
 };
 use crate::generate::doc::Doc;
 use crate::hir::HirProtoRef;
@@ -139,14 +139,5 @@ impl<'a> Emitter<'a> {
             AstGlobalBindingTarget::Name(name) => Doc::text(name.text.clone()),
             AstGlobalBindingTarget::Wildcard => Doc::text("*"),
         }
-    }
-
-    pub(super) fn function_decl_is_global(&self, function_decl: &AstFunctionDecl) -> bool {
-        self.target.caps.global_decl
-            && matches!(
-                &function_decl.target,
-                AstFunctionName::Plain(path)
-                    if path.fields.is_empty() && matches!(path.root, AstNameRef::Global(_))
-            )
     }
 }

@@ -1,4 +1,7 @@
 -- lua52_01_env#1: _ENV环境重定向
+-- unluac: expect-not-contains [[= {}]]
+-- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=3]]
+-- unluac: expect-contains [[return function(suffix)]]
 local function test_env_redirect()
     local _ENV = {
         print = print,

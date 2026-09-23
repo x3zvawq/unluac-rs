@@ -2,8 +2,22 @@
 -- 快照可由局部 binding 或 IIFE 承担；以下断言验证实际值、次数与求值位置。
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[unresolved]]
--- unluac: expect-not-contains [[and 1 == 1]]
--- unluac: expect-not-contains [[and true]]
+-- 相邻作用域的 scalar/CALL 前缀与未使用结果应完整恢复，不能让后段构造器退回逐槽交接。
+-- unluac: expect-count [[= setmetatable({}, {]] [[2]]
+-- 写回 captured cell 后，后继上值返回复用原 scratch，不另引入源码声明。
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=2]]
+-- 字段初始化只保留实际字段，模板占位不能与同键闭包一起输出。
+-- unluac: expect-ast-count [[table-record-field]] [[5]] [[@proto=0]]
+-- PUC/LuaJIT 原字节码保留常量 local 的比较，不能因 stripped 后内联为 1 而删掉。
+-- unluac: expect-not-contains [[and 1 == 1]] [[@dialect=luau]]
+-- Luau 的常量传播保留一次 Boolean false 预写，不能用全方言禁令删除原写入。
+-- unluac: expect-count [[and true]] [[1]] [[@dialect=luau]]
+-- unluac: expect-not-contains [[and true]] [[@dialect=lua5.1]]
+-- unluac: expect-not-contains [[and true]] [[@dialect=lua5.2]]
+-- unluac: expect-not-contains [[and true]] [[@dialect=lua5.3]]
+-- unluac: expect-not-contains [[and true]] [[@dialect=lua5.4]]
+-- unluac: expect-not-contains [[and true]] [[@dialect=lua5.5]]
+-- unluac: expect-not-contains [[and true]] [[@dialect=luajit]]
 do
     local x
     local old = {}

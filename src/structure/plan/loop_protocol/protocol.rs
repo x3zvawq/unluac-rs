@@ -278,7 +278,7 @@ fn validate_normalized_numeric_controls(
 }
 
 /// 独立控制 index 后的可写用户槽是原 VM-for 协议的一部分，不是任意 body COPY。
-/// 只接单块正常 body：首条复制每次必达，控制值除此以外不作普通读取，用户槽确有
+/// 单入口 body 的首条复制每次必达，控制值除此以外不作普通读取，用户槽确有
 /// 后续写且不捕获。`for i=1,n do local old=i; i=i+1 end` 因而保持控制槽和 old 快照，
 /// 不会在重编译时把可写 i 变成一个不可写的循环变量并触发新的展开。
 fn numeric_writable_binding(
@@ -291,15 +291,16 @@ fn numeric_writable_binding(
 ) -> Option<(InstrRef, Reg)> {
     let latch = loop_instr?;
     let body = *cfg.instr_to_block.get(init.body_target.index())?;
+    let latch_block = *cfg.instr_to_block.get(latch.index())?;
     let block = cfg.blocks.get(body.index())?;
     if init.index != init.binding
         || init.index.index() != init.limit.index().checked_add(2)?
         || init.step.index() != init.limit.index().checked_add(1)?
         || block.instrs.start != init.body_target
-        || block.instrs.end() != latch.index() + 1
+        || body.index() > latch_block.index()
         || cfg.preds[body.index()].iter().any(|edge| {
             let source = cfg.edges[edge.index()].from;
-            source != preheader && source != body
+            source != preheader && source != latch_block
         })
     {
         return None;
@@ -326,6 +327,11 @@ fn numeric_writable_binding(
     let mut written = false;
     let mut debug_scope = None;
     for index in init.body_target.index()..latch.index() {
+        // 候选拒绝[ProofIncomplete]：嵌套 numeric-for 需共享区间摘要；当前扫描
+        // 不越过其入口，避免每层外循环重复遍历同一内层协议而形成平方复杂度。
+        if matches!(proto.instrs[index], LowInstr::NumericForInit(_)) {
+            return None;
+        }
         let effects = &dataflow.instr_effects[index];
         if [init.limit, init.step, init.index].into_iter().any(|reg| {
             effects.fixed_must_defs().contains(&reg)
@@ -352,6 +358,16 @@ fn numeric_writable_binding(
                 }
                 debug_scope = Some(scope);
             }
+        }
+    }
+    // 分支可以把本轮 body 切成多个块，但不可从外部绕过入口 COPY。
+    // 按原连续指令区间一次检查 incoming edges；不为每个 use 重建支配关系。
+    for block_index in body.index() + 1..=latch_block.index() {
+        if cfg.preds[block_index].iter().any(|edge| {
+            let source = cfg.edges[edge.index()].from.index();
+            source < body.index() || source > latch_block.index()
+        }) {
+            return None;
         }
     }
     written.then_some((init.body_target, copy.dst))

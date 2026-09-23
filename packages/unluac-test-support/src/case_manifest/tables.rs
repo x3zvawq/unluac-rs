@@ -136,7 +136,14 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "call-frame",
         ],
         "恢复完整 open SETLIST 展开帧及必须内联的原闭包调用，保持输入覆盖端点和调用层。",
-        &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS)],
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/order_04_table_constructor_handoff_snapshot.lua",
@@ -587,4 +594,5 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             }),
         ],
     ),
+
 ];

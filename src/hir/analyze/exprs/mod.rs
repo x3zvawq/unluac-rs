@@ -66,18 +66,37 @@ pub(super) fn lower_closure_expr(
     closure: &ClosureInstr,
 ) -> HirExpr {
     if let Some(factory) = lowering.shared_closure_replacement(instr_ref) {
+        let event = lowering
+            .captured_shared_closures
+            .composite_plan(factory)
+            .effect
+            .as_ref();
         return HirExpr::Call(Box::new(HirCallExpr {
+            required_luau_inlining: event.map(|_| crate::hir::common::HirSourceSite {
+                proto: lowering.id,
+                instr: instr_ref,
+            }),
             source_site: None,
             argument_roots: Vec::new(),
             frame_root_ends: Vec::new(),
             callee: HirExpr::LocalRef(lowering.shared_factory_local(factory)),
-            args: Default::default(),
+            args: event
+                .map(|event| {
+                    event.calls[&instr_ref]
+                        .iter()
+                        .cloned()
+                        .map(HirExpr::String)
+                        .collect::<Vec<_>>()
+                        .into()
+                })
+                .unwrap_or_default(),
             method: false.into(),
             fastcall: None,
             method_key: None,
             callee_root_handoff: None,
             method_rewrite_transaction: None,
             plain_method_syntax: false,
+            boolean_prewrite_arguments: Vec::new(),
         }));
     }
     if let Some(local) = lowering.shared_closure_local(closure.creation) {
@@ -108,10 +127,22 @@ pub(super) fn lower_plain_closure_expr(
         }),
         Some(match closure.creation {
             crate::transformer::ClosureCreation::Fresh => {
-                crate::hir::common::HirClosureCreation::Fresh
+                crate::hir::common::HirClosureCreation::Fresh {
+                    template: lowering.proto.children[closure.proto.index()]
+                        .origin
+                        .span
+                        .offset,
+                }
             }
             crate::transformer::ClosureCreation::Reusable(_) => {
-                crate::hir::common::HirClosureCreation::MayReuse
+                // DUPCLOSURE 常量索引只在父 proto 内有效；序列化 child 的起点
+                // 才能在不同父节点的实例之间标识同一模板。
+                crate::hir::common::HirClosureCreation::MayReuse {
+                    template: lowering.proto.children[closure.proto.index()]
+                        .origin
+                        .span
+                        .offset,
+                }
             }
         }),
     )
@@ -267,6 +298,7 @@ fn pack_tail_for_open_def(
                 expr_for_reg_use(lowering, open_def.block, open_def.instr, call.callee)
             };
             Some(HirPackTail::open(HirExpr::Call(Box::new(HirCallExpr {
+                required_luau_inlining: None,
                 source_site: Some(crate::hir::common::HirSourceSite {
                     proto: lowering.id,
                     instr: open_def.instr,
@@ -295,6 +327,7 @@ fn pack_tail_for_open_def(
                 callee_root_handoff: lower_call_root_handoff(lowering, open_def.instr, call.kind),
                 method_rewrite_transaction: None,
                 plain_method_syntax: false,
+                boolean_prewrite_arguments: Vec::new(),
             }))))
         }
         LowInstr::VarArg(vararg) if matches!(vararg.results, ResultPack::Open(_)) => {

@@ -4,6 +4,15 @@
 -- unluac: expect-count [[(b)]] [[1]]
 -- unluac: expect-count [[(c)]] [[1]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 递归作用域、循环头和 until 的临时绑定不能抬高后继帧的源码槽位。
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=0]]
+-- unluac: expect-not-contains [[= assert]]
+-- unluac: expect-contains [[= (function(]]
+-- unluac: expect-contains [[until (function(]]
+-- unluac: expect-contains [[assert(make(10)(20)(30) == 31)]] [[@debug=retained]]
+-- unluac: expect-contains [[assert(factories[3](3) == 4 and factories[4](3) == 5)]] [[@debug=retained]]
+-- unluac: expect-contains [[assert(count == 2)]] [[@debug=retained]]
 local function make(a)
     print("parent", a)
     local function child(b)

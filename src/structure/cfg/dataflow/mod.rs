@@ -9,6 +9,7 @@ mod overwrites;
 mod plain_tables;
 mod root_exits;
 mod scratch;
+mod slot_captures;
 mod ssa;
 
 use std::collections::{BTreeSet, VecDeque};
@@ -263,6 +264,15 @@ fn compute_dataflow_proto(
     );
     let unobserved_forward_exits = root_exits::unobserved_forward_exits(cfg, &effect_summaries);
     Ok(DataflowFacts {
+        reference_capture_before: reg_captures
+            .iter()
+            .enumerate()
+            .map(|(reg, capture)| {
+                capture.by_reference.then(|| {
+                    std::sync::Arc::from(slot_captures::before_instructions(proto, cfg, Reg(reg)))
+                })
+            })
+            .collect(),
         instr_effects,
         effect_summaries,
         plain_table_reads,

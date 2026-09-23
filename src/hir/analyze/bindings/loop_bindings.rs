@@ -177,11 +177,15 @@ pub(super) fn coalesce_loop_state_temps(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
     nested_carried_parents: &[Option<PhiId>],
-    binding_barriers: (&[bool], &[Option<DebugBindingHint<'_>>]),
+    binding_barriers: (
+        &[bool],
+        &[Option<DebugBindingHint<'_>>],
+        &CapturedSlotTargets,
+    ),
     binding_temps: (&mut [TempId], &mut [TempId]),
     epochs: &SlotEpochFacts,
 ) {
-    let (numeric_binding_phis, phi_debug_hints) = binding_barriers;
+    let (numeric_binding_phis, phi_debug_hints, captured_slots) = binding_barriers;
     let (phi_temps, fixed_temps) = binding_temps;
     let pure_result_owners = plan
         .phis()
@@ -251,12 +255,34 @@ pub(super) fn coalesce_loop_state_temps(
     let mut phi_candidates = vec![BindingCandidate::default(); phi_temps.len()];
 
     for phi in plan.phis() {
-        if dataflow.reg_is_captured(phi.reg) || numeric_binding_phis[phi.phi.index()] {
+        if numeric_binding_phis[phi.phi.index()] {
             continue;
         }
         let Some(carried) = phi.loop_carried() else {
             continue;
         };
+        if dataflow.reg_is_captured(phi.reg) {
+            let epoch = epochs.epoch_at(phi.reg, cfg.blocks[phi.block.index()].instrs.start);
+            let home = HomeSlotKey::new(phi.reg.index(), epoch);
+            // CLOSE 后的旧 cell 或其它 SSA 版本的 ByValue 快照不观察当前状态。
+            // 只接纳同 epoch、未被捕获的直接回边定义，不混合嵌套结果或捕获身份。
+            if !captured_slots.version_is_uncaptured(home, SsaValue::Phi(phi.phi))
+                || !phi
+                    .incomings
+                    .iter()
+                    .filter(|incoming| {
+                        incoming.disposition == PhiIncomingDisposition::LoopCarried(carried.owner)
+                    })
+                    .all(|incoming| {
+                        matches!(incoming.value, SsaValue::Def(def)
+                        if dataflow.def_reg(def) == phi.reg
+                            && epochs.epoch_at(phi.reg, dataflow.def_instr(def)) == epoch
+                            && captured_slots.version_is_uncaptured(home, incoming.value))
+                    })
+            {
+                continue;
+            }
+        }
         let Some(RegionPlan::Loop {
             plan: loop_id,
             control: loop_control,
@@ -574,17 +600,84 @@ pub(super) fn repeat_stage_carried_temp(
     phi_temps.get(target.index()).copied()
 }
 
-pub(super) fn loop_body_region(plan: &StructurePlan, loop_id: LoopPlanId) -> Option<RegionId> {
+/// NumericFor 的 control 前缀在本轮 body 尾部发射，仍处于同一 binding 作用域。
+/// GenericFor 的 control 包含下一次 iterator 调用，不能同样归入当前 yield 的绑定。
+pub(super) fn loop_binding_blocks(
+    plan: &StructurePlan,
+    loop_id: LoopPlanId,
+) -> Option<impl Iterator<Item = &BlockRef>> {
     let region = plan.loop_region(loop_id)?;
-    match plan.region(region)? {
-        RegionPlan::Loop { body, .. } => Some(*body),
-        _ => None,
-    }
+    let RegionPlan::Loop { body, control, .. } = plan.region(region)? else {
+        return None;
+    };
+    let tail = matches!(plan.loop_protocol(loop_id),
+        Some(LoopVmProtocol::NumericFor(protocol)) if protocol.body_completes_normally)
+    .then_some(*control);
+    Some(
+        plan.region_blocks(*body)
+            .iter()
+            .chain(tail.into_iter().flat_map(|tail| plan.region_blocks(tail))),
+    )
 }
 
 pub(super) struct NumericBindingPhiFacts {
     pub(super) bindings: Vec<bool>,
     pub(super) source_direct: Vec<bool>,
+}
+
+/// generic-for 的语法变量已承接 body 中的真实写入；其内部合流不再分配第二套状态。
+pub(super) fn bind_generic_for_phis(
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    plan: &StructurePlan,
+    generic_locals: &BTreeMap<BlockRef, Vec<LocalId>>,
+    block_locals: &BTreeMap<BlockRef, BTreeMap<Reg, LocalId>>,
+    phi_locals: &mut [Option<LocalId>],
+) {
+    let mut dispatch_results = BTreeMap::new();
+    let mut locals = BTreeSet::new();
+    for (loop_id, payload) in plan.loops() {
+        let Some(bindings) = generic_locals.get(&payload.header) else {
+            continue;
+        };
+        let Some(LoopVmProtocol::GenericFor(protocol)) = plan.loop_protocol(loop_id) else {
+            continue;
+        };
+        let Some(LoopSourceBindings::Generic(regs)) = payload.source_bindings else {
+            continue;
+        };
+        for (offset, &local) in bindings.iter().enumerate() {
+            locals.insert(local);
+            if let Some(def) =
+                dataflow.instr_def_for_reg(protocol.call_instr, Reg(regs.start.index() + offset))
+            {
+                dispatch_results.insert(def, local);
+            }
+        }
+    }
+    for phi in plan.phis() {
+        let Some(&local) = block_locals
+            .get(&phi.block)
+            .and_then(|bindings| bindings.get(&phi.reg))
+        else {
+            continue;
+        };
+        if !locals.contains(&local) || phi.has_unresolved() {
+            continue;
+        }
+        // 每条输入必须是该边末端的当前寄存器值，且由同一语法变量或原 dispatch
+        // 建立。旧 Def 快照、循环外状态与不同绑定不能借相同槽号取得这个身份。
+        if phi.incomings.iter().all(|incoming| {
+            if incoming.disposition == PhiIncomingDisposition::Dead { return true; }
+            let Some(edge) = incoming.edge else { return false };
+            let source = cfg.edges[edge.index()].from;
+            dataflow.block_exit_value(source, phi.reg) == incoming.value
+                && (block_locals.get(&source).and_then(|bindings| bindings.get(&phi.reg)) == Some(&local)
+                    || matches!(incoming.value, SsaValue::Def(def) if dispatch_results.get(&def) == Some(&local)))
+        }) {
+            phi_locals[phi.phi.index()] = Some(local);
+        }
+    }
 }
 
 /// capture 所有权需要识别全部 exact header phi；只有 Structure 已冻结为 elided target 的

@@ -1,5 +1,6 @@
 -- CALL 后的比较直接读取原低槽，同时保留算术中间对象的物理根。
 -- unluac: expect-not-contains [[= assert]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=9]]
 local function run_iife(seed)
     local result = (function(value)
         local doubled = value * 2

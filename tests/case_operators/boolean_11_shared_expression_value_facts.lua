@@ -99,6 +99,7 @@ assert(weak[1] == nil)
 print("regress_468_shared_expression_value_facts", "OK")
 
 -- 相同 CALL 语法不代表同一稳定 binding；falsy 路径仍须执行两次。
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=0]]
 events = 0
 assert((not mark(nil) and mark(nil)) == nil)
 assert(events == 2)

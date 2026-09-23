@@ -1,4 +1,5 @@
 -- A boolean shell must not move a local declaration across an initializer that reads it.
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]]
 
 local result = true
 

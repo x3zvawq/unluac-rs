@@ -3,7 +3,10 @@
 -- 只读 capture 不授权将 GETTABLE 后的 receiver COPY 提前为 SELF；两类 capture 均须保留原根事件。
 -- unluac: expect-contains [[.readonly_each(]]
 -- unluac: expect-not-contains [[:writable_each() do]]
--- unluac: expect-not-contains [[function p8_0.field]]
+-- 完整 HIR 帧可收回匿名 forwarded 声明，但 replace 的共享捕获身份和 debug 声明必须保留。
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=8]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=8]] [[@debug=retained]]
+-- unluac: expect-contains [[local function forwarded(]] [[@debug=retained]]
 
 local methods = {}
 
@@ -81,6 +84,18 @@ end
 local forwarded_target = {}
 assert(install_forwarded(forwarded_target) == forwarded_target)
 assert(type(forwarded_target.field()) == "function")
+
+local installed_forwarded
+local forwarded_proxy = setmetatable({}, {
+    __newindex = function(_, key, value)
+        assert(key == "field")
+        installed_forwarded = value
+        value()()
+    end,
+})
+-- setter 在安装期间调用两层闭包，RETURN 必须读取同一个已被改写的参数 cell。
+assert(install_forwarded(forwarded_proxy) == forwarded_replacement)
+assert(type(installed_forwarded()) == "function")
 
 print("regress_428_method_alias_capture_writes", readonly, writable)
 

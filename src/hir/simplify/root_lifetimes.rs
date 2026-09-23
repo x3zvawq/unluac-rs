@@ -181,7 +181,7 @@ pub(super) fn collect_call_result_local_roots(
     let mut observations = events.observation_indices();
     let mut trailing_uses = LocalUseCollector::default();
     if let Some(condition) = trailing_condition {
-        if !safety.is_discard_safe_without_residual(condition) {
+        if safety.may_observe_gc_roots(condition) {
             observations.insert(stmts.len());
         }
         visit_expr(condition, &mut trailing_uses);
@@ -752,6 +752,30 @@ pub(super) fn collect_call_root_lifetimes(
                         }
                     }
                 }
+            }
+        }
+        if let HirStmt::If(if_stmt) = stmt
+            && if_stmt.preserves_empty_test
+        {
+            let tested = match &if_stmt.cond {
+                HirExpr::TempRef(temp) => Some(*temp),
+                HirExpr::Unary(unary) if unary.op == crate::hir::HirUnaryOpKind::Not => {
+                    match &unary.expr {
+                        HirExpr::TempRef(temp) => Some(*temp),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(temp) = tested
+                && let Some(home) = facts.trusted_temp_home_slot(temp)
+                && let Some(root) = active.get(&home)
+                && root.eligible
+                && active.aliases(root.value_id).contains(&temp)
+            {
+                // 原空 TEST 仍读取此 home。该 carrier 留在 HIR 时，结束它的覆盖写
+                // 也须保留；不能先内联覆盖值，留下跨下一次 callback 的旧调用结果。
+                lifetimes.preserve_call_root(root, home);
             }
         }
         let read_observations = read_values
@@ -1415,6 +1439,10 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
                     })
                 });
                 new_stmts.push(HirStmt::Assign(Box::new(HirAssign {
+                    luau_compound_global: false,
+                    upvalue_write_source: None,
+                    is_phi_transfer: false,
+                    parallel_nil_frame: None,
                     targets: vec![HirLValue::Temp(temp)],
                     values: HirValuePack::fixed(vec![HirExpr::Nil]),
                     initializer_merge_transaction: None,
@@ -2589,6 +2617,10 @@ impl<'a> RootLifetimeFacts<'a> {
         self.uses.events.block().stmt(index)
     }
 
+    pub(super) fn has_read_after(&self, temp: TempId, index: usize) -> bool {
+        self.uses.events.block().has_read_from(temp, index + 1)
+    }
+
     fn scalar_definitions(&self) -> &BTreeMap<TempId, &'a HirExpr> {
         self.scalar_definitions.get_or_init(|| {
             self.stmts
@@ -2847,13 +2879,13 @@ fn call_with_inert_dispatch_prefix(stmt: &HirStmt, safety: HirExprSafety) -> Opt
     (!matches!(stmt, HirStmt::Assign(assign)
         if assign.targets.iter().any(|target| matches!(target,
             HirLValue::TableAccess(_) | HirLValue::Global(_))))
-        && safety.is_discard_safe_without_residual(&call.callee)
+        && !safety.may_observe_gc_roots(&call.callee)
         && call.args.tail.is_none()
         && call
             .args
             .fixed
             .iter()
-            .all(|arg| safety.is_discard_safe_without_residual(arg)))
+            .all(|arg| !safety.may_observe_gc_roots(arg)))
     .then_some(call)
 }
 

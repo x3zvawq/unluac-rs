@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::ops::Range;
+use std::ops::{Range, RangeBounds};
 
 use crate::transformer::{InstrRef, Reg};
 
@@ -81,6 +81,7 @@ pub struct DataflowFacts {
     pub instr_defs: Vec<Vec<DefId>>,
     pub(crate) fixed_defs_by_reg: Vec<Vec<DefId>>,
     pub(crate) reg_captures: Vec<RegCaptures>,
+    pub(crate) reference_capture_before: Vec<Option<std::sync::Arc<[bool]>>>,
     pub(crate) root_intervals: super::RootIntervalIndex,
     pub(crate) unobserved_forward_exits: Vec<bool>,
     pub block_entry_values: Vec<SsaRegMap>,
@@ -146,6 +147,20 @@ impl DataflowFacts {
         self.reg_captures
             .get(reg.index())
             .is_some_and(|capture| capture.by_reference)
+    }
+
+    /// 原 Capture/Close 沿 CFG 传播的开放 cell 状态；未来捕获不回溯保护早先的临时值。
+    pub(crate) fn reference_capture_may_be_open(&self, reg: Reg, instr: InstrRef) -> bool {
+        self.reference_capture_before
+            .get(reg.index())
+            .and_then(Option::as_ref)
+            .is_some_and(|flow| flow[instr.index()])
+    }
+
+    pub(crate) fn reference_capture_flow(&self, reg: Reg) -> Option<std::sync::Arc<[bool]>> {
+        self.reference_capture_before
+            .get(reg.index())
+            .and_then(Clone::clone)
     }
 
     pub(crate) fn reference_captured_regs(&self) -> impl Iterator<Item = Reg> + '_ {
@@ -582,13 +597,13 @@ impl DataflowFacts {
         &self,
         cfg: &Cfg,
         window: Range<usize>,
-        floor: Reg,
+        slots: impl RangeBounds<Reg>,
     ) -> Option<BTreeSet<PhiId>> {
         let phis = cfg.instr_to_block[window.clone()]
             .chunk_by(|a, b| a == b)
             .flat_map(|run| self.phi_candidates_in_block(run[0]))
             .filter(|phi| {
-                phi.reg >= floor
+                slots.contains(&phi.reg)
                     && !self.phi_is_truly_dead(phi.id)
                     && window.contains(&cfg.blocks[phi.block.index()].instrs.start.index())
             })
@@ -619,6 +634,7 @@ impl DataflowFacts {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstrEffect {
     fixed_uses: Box<[Reg]>,
+    repeated_fixed_uses: Box<[Reg]>,
     fixed_must_defs: Box<[Reg]>,
     pub open_use: Option<Reg>,
     pub open_must_def: Option<Reg>,
@@ -632,11 +648,19 @@ impl InstrEffect {
         open_must_def: Option<Reg>,
     ) -> Self {
         fixed_uses.sort_unstable();
+        // 活性/SSA 只需读取集合，表达式展开还需知道同一指令是否重复读取。
+        // 在去重前冻结这一事实，避免后层重新解释各类 low 指令的操作数。
+        let mut repeated_fixed_uses = fixed_uses
+            .windows(2)
+            .filter_map(|pair| (pair[0] == pair[1]).then_some(pair[0]))
+            .collect::<Vec<_>>();
+        repeated_fixed_uses.dedup();
         fixed_uses.dedup();
         fixed_must_defs.sort_unstable();
         fixed_must_defs.dedup();
         Self {
             fixed_uses: fixed_uses.into_boxed_slice(),
+            repeated_fixed_uses: repeated_fixed_uses.into_boxed_slice(),
             fixed_must_defs: fixed_must_defs.into_boxed_slice(),
             open_use,
             open_must_def,
@@ -646,6 +670,11 @@ impl InstrEffect {
     /// 完整固定读取域，按 Reg 严格递增；不包含 open use 的动态后缀。
     pub fn fixed_uses(&self) -> &[Reg] {
         &self.fixed_uses
+    }
+
+    /// 同一固定寄存器是否被多个操作数读取；不把读取集合的大小当作求值次数。
+    pub(crate) fn repeats_fixed_use(&self, reg: Reg) -> bool {
+        self.repeated_fixed_uses.binary_search(&reg).is_ok()
     }
 
     /// 完整固定必定写入域，按 Reg 严格递增。
@@ -760,6 +789,7 @@ impl RootObservation {
     }
 
     /// 调用已把该槽移出 caller 的根域；不依赖槽中值的类型，也不表示参数没有 callee 根。
+    /// 这不是物理清槽证明：callee 扩展栈顶后仍可能在自动 GC 中观察到高槽残值。
     pub fn excludes_home_from_caller(self, home: Reg) -> bool {
         matches!(self, Self::Call { caller_end } if home >= caller_end)
     }

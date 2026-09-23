@@ -5,6 +5,8 @@
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=5]]
 -- unluac: expect-not-contains [[:m(41)]]
 -- unluac: expect-not-contains [[:m(1)]]
+-- unluac: expect-ast-count [[local-binding]] [[8]] [[@proto=6]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=7]]
 
 local owner = { value = 1 }
 

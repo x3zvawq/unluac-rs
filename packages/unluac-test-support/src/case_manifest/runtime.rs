@@ -12,9 +12,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["boolean", "callee-lookup", "gc", "predicate"],
         "区分Boolean值写回与仅谓词极性，覆盖double/single/local/saved/copied/compared槽。",
         &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],

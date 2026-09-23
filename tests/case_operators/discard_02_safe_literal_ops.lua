@@ -1,8 +1,10 @@
--- unluac: expect-not-contains [[11 + 7]]
--- unluac: expect-not-contains [[-(13 * 5)]]
--- unluac: expect-not-contains [[29 / 3]]
--- unluac: expect-not-contains [[2 ^ 8]]
--- unluac: expect-not-contains [[#"literal-length"]]
+-- 无观察事件不等于没有原操作；包括永不到达的分支关系也保留。
+-- unluac: expect-contains [[11 + 7]]
+-- unluac: expect-contains [[-(13 * 5)]]
+-- unluac: expect-contains [[29 / 3]]
+-- unluac: expect-contains [[2 ^ 8]]
+-- unluac: expect-contains [[#"literal-length"]]
+-- unluac: expect-count [[if 1 == 1 then]] [[7]]
 
 local function discard_add()
     local left = 11

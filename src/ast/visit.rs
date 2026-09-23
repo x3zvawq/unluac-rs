@@ -78,6 +78,36 @@ pub(super) fn visit_expr(expr: &AstExpr, visitor: &mut impl AstVisitor) {
     let _ = visit_expr_impl(expr, visitor);
 }
 
+/// 当前函数中被重新写入的 local，包含子闭包的捕获写；不混入 child 的同号身份。
+pub(crate) fn written_locals(block: &AstBlock) -> std::collections::BTreeSet<crate::hir::LocalId> {
+    #[derive(Default)]
+    struct Writes(std::collections::BTreeSet<crate::hir::LocalId>);
+    impl AstVisitor for Writes {
+        fn visit_name(&mut self, name: &AstNameRef, access: NameAccess) -> ControlFlow<()> {
+            if matches!(access, NameAccess::Write)
+                && let AstNameRef::Local(local) = name
+            {
+                self.0.insert(*local);
+            }
+            ControlFlow::Continue(())
+        }
+        fn visit_function_expr(&mut self, function: &AstFunctionExpr) -> bool {
+            self.0
+                .extend(function.capture_write_names.iter().filter_map(|name| {
+                    if let AstNameRef::Local(local) = name {
+                        Some(*local)
+                    } else {
+                        None
+                    }
+                }));
+            false
+        }
+    }
+    let mut writes = Writes::default();
+    visit_block(block, &mut writes);
+    writes.0
+}
+
 /// 当前函数语句骨架的先序查询；表达式、函数体和 capture 不含本域的 label/goto。
 pub(super) fn any_stmt_structure(
     stmt: &AstStmt,

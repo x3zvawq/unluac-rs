@@ -13,6 +13,10 @@ use crate::hir::common::{
 
 pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: impl Into<HirValuePack>) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
+        luau_compound_global: false,
+        upvalue_write_source: None,
+        is_phi_transfer: false,
+        parallel_nil_frame: None,
         targets,
         values: values.into(),
         initializer_merge_transaction: None,
@@ -51,6 +55,7 @@ pub(super) fn branch_stmt(
 ) -> HirStmt {
     HirStmt::If(Box::new(HirIf {
         cond,
+        preserves_empty_test: false,
         then_block,
         else_block,
     }))
@@ -109,6 +114,7 @@ pub(super) fn empty_proto(id: HirProtoRef) -> HirProto {
             has_vararg_param_reg: false,
             named_vararg_table: false,
             legacy_arg_slot: false,
+            legacy_arg_table: false,
         },
         params: Vec::new(),
         param_debug_hints: Vec::new(),

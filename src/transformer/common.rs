@@ -831,7 +831,8 @@ fn instantiate_closure_child(
 pub enum CloseKind {
     /// 独立 CLOSE / JMP-close 操作，后续求值必须发生在关闭之后。
     Explicit,
-    /// 同一返回指令的 frame cleanup；返回结果已由 VM 返回协议承接。
+    /// 完整返回协议的 frame cleanup：同一 PUC 返回指令、相邻零槽 UCLO/固定 RETURN，
+    /// 或 Luau 紧邻的 CLOSEUPVALS/RETURN。返回结果已由原协议承接。
     Return(InstrRef),
     /// 同一尾调用关闭旧 frame 的 upvalue；受支持 Lua 的此路径没有待关闭 TBC。
     TailCall(InstrRef),

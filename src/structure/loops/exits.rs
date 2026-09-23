@@ -380,14 +380,29 @@ pub(super) fn block_is_while_header_like(
     }
 
     let terminator_index = range.end() - 1;
-    let Some(branch_effect) = dataflow.instr_effects.get(terminator_index) else {
-        return false;
+    // OPEN 参数包的起点不是完整读取域；其 fixed 前缀和更高槽的 OPEN producer
+    // 都由 SSA 提供。只按起始寄存器回溯会漏掉 f(g(), h()) 中的 h()，误判循环正文。
+    let mut needed = vec![false; range.len];
+    let include_uses = |instr_index, needed: &mut [bool]| {
+        let instr = crate::transformer::InstrRef(instr_index);
+        let fixed = dataflow.use_values_at(instr).values().filter_map(|value| {
+            let crate::structure::SsaValue::Def(def) = value else {
+                return None;
+            };
+            Some(dataflow.defs[def.index()].instr.index())
+        });
+        let open = dataflow
+            .open_use_sources_at(instr)
+            .defs()
+            .iter()
+            .map(|def| dataflow.open_defs[def.index()].instr.index());
+        for producer in fixed.chain(open) {
+            if (range.start.index()..instr_index).contains(&producer) {
+                needed[producer - range.start.index()] = true;
+            }
+        }
     };
-    let mut needed_regs = branch_effect
-        .fixed_uses()
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    include_uses(terminator_index, &mut needed);
 
     (range.start.index()..terminator_index)
         .rev()
@@ -403,24 +418,14 @@ pub(super) fn block_is_while_header_like(
             {
                 return false;
             }
-            let writes_needed = needed_regs.iter().any(|reg| effect.must_define(*reg));
-            if !writes_needed {
+            if !needed[instr_index - range.start.index()] {
                 return dataflow
                     .effect_summaries
                     .get(instr_index)
                     .is_some_and(|summary| !summary.has_effect_tags());
             }
 
-            for reg in effect.fixed_must_defs() {
-                needed_regs.remove(reg);
-            }
-            if let Some(open_def) = effect.open_must_def {
-                needed_regs.retain(|reg| reg.index() < open_def.index());
-            }
-            needed_regs.extend(effect.fixed_uses().iter().copied());
-            if let Some(open_use) = effect.open_use {
-                needed_regs.insert(open_use);
-            }
+            include_uses(instr_index, &mut needed);
             true
         })
 }

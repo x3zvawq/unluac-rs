@@ -1,6 +1,10 @@
 -- regress_329_closure_self_capture#1: 递归 closure 覆盖 loop binding 时 capture 与写入目标必须保持同一身份
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-function]] [[0]] [[@proto=3]]
+-- unluac: expect-ast-count [[local-function]] [[0]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[empty-local]] [[0]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=1]] [[@dialect=luau]]
 local function recurse_through_loop_binding()
     for binding = 1, 1 do
         binding = function(depth)

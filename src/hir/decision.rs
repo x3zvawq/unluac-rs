@@ -14,7 +14,7 @@ use crate::hir::common::{HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget,
 use crate::hir::expr_safety::HirExprSafety;
 
 /// 当前不可变 Decision 快照的拓扑事实；借用期间不能改写节点或沿用旧身份。
-pub(in crate::hir) struct DecisionFacts<'a> {
+pub(crate) struct DecisionFacts<'a> {
     decision: &'a HirDecisionExpr,
     order: Vec<usize>,
     incoming: Vec<usize>,
@@ -26,7 +26,7 @@ impl DecisionFacts<'_> {
         self.decision
     }
 
-    pub(in crate::hir) fn has_shared_nodes(&self) -> bool {
+    pub(crate) fn has_shared_nodes(&self) -> bool {
         self.has_shared_nodes
     }
 
@@ -34,14 +34,14 @@ impl DecisionFacts<'_> {
         &self.incoming
     }
 
-    pub(in crate::hir) fn topological_nodes(
+    pub(crate) fn topological_nodes(
         &self,
     ) -> impl DoubleEndedIterator<Item = &super::common::HirDecisionNode> {
         self.order.iter().map(|&index| &self.decision.nodes[index])
     }
 }
 
-pub(in crate::hir) fn analyze_decision(decision: &HirDecisionExpr) -> DecisionFacts<'_> {
+pub(crate) fn analyze_decision(decision: &HirDecisionExpr) -> DecisionFacts<'_> {
     assert!(!decision.nodes.is_empty(), "HIR Decision must not be empty");
     assert!(
         decision.entry.index() < decision.nodes.len(),

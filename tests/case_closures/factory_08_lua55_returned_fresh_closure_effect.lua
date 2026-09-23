@@ -1,4 +1,6 @@
 -- A fresh closure returned by a known factory must retain its projected call effect.
+-- 初始化闭包只更新两个上值，不为字段写入保留机械的表快照声明。
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]]
 
 local weak
 local rooted_during_condition

@@ -1,3 +1,5 @@
+-- unluac: expect-ast-count [[local-binding]] [[7]] [[@proto=0]]
+-- unluac: expect-contains [[print("regress_160_captured_slot_receiver_eval#1",]]
 -- regress_160_captured_slot_receiver_eval#1: callee 求值副作用后重新读取被捕获槽
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]

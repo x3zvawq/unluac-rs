@@ -339,6 +339,7 @@ fn expr_for_fixed_call(
     );
 
     Some(HirExpr::Call(Box::new(HirCallExpr {
+        required_luau_inlining: None,
         source_site: Some(crate::hir::common::HirSourceSite {
             proto: lowering.id,
             instr: instr_ref,
@@ -356,6 +357,7 @@ fn expr_for_fixed_call(
         callee_root_handoff: lower_call_root_handoff(lowering, instr_ref, call.kind),
         method_rewrite_transaction: None,
         plain_method_syntax: false,
+        boolean_prewrite_arguments: Vec::new(),
     })))
 }
 

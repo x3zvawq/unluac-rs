@@ -314,6 +314,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
         let mut changed = false;
         let mut scratch = RebuildScratch::default();
         let mut rewritten_seeds = BTreeSet::new();
+        let mut emptied_declarations = BTreeSet::new();
         // 稳定 stmt id 让 occurrence index 在删除已折叠 region 后仍能按源码顺序查询；
         // 每个 seed 只做当前位置之后的有序集合查找，不重建完整 suffix summary。
         let mut binding_index = BindingIndex::new(self.temp_count, self.next_local_index);
@@ -353,8 +354,6 @@ impl HirRewritePass for TableConstructorPass<'_> {
             let Some((binding, seed_ctor)) = constructor_seed(&block.stmts[index]) else {
                 continue;
             };
-            let seed_ctor = seed_ctor.clone();
-
             let binding_id = binding_index
                 .id_of(binding)
                 .expect("constructor seed binding should be indexed");
@@ -474,7 +473,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // a nil literal happened to occur in a producer. A final absent array slot and
                     // a nil-valued record field preserve the same key set as the original writes.
                     let nil_shape_is_supported = returned_batch
-                        || constructor_nil_shape_is_supported(&seed_ctor, rebuilt_constructor);
+                        || constructor_nil_shape_is_supported(seed_ctor, rebuilt_constructor);
                     // Lua emits constructor array fields through a deferred SETLIST batch.  A
                     // later numeric record that aliases an earlier array field therefore cannot
                     // represent a later overwrite: `{ value, [1] = nil }` leaves `value` at key
@@ -483,7 +482,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     // 候选拒绝[SemanticBarrier:TableShape]：constructor codegen 的 array batch
                     // 会覆盖源码中更晚的同键 record，不能表达原语句的最终 table 内容。
                     let adds_late_array_overwrite =
-                        !constructor_has_late_record_overwriting_array(&seed_ctor)
+                        !constructor_has_late_record_overwriting_array(seed_ctor)
                             && constructor_has_late_record_overwriting_array(rebuilt_constructor);
                     // 候选拒绝[SemanticBarrier:ValueArity]：`HirTableConstructor` 只有 open
                     // trailing pack，AST lowering 也拒绝 exact-width tail。若 `f()` 返回三个值，
@@ -580,6 +579,24 @@ impl HirRewritePass for TableConstructorPass<'_> {
                             unreachable!()
                         };
                         // 只移走已通过完整private窗口的initializer；原local身份/声明位置仍保留。
+                        if !decl.values.is_empty()
+                            && decl.initializer_merge_transaction.is_none()
+                            && decl.bindings.iter().all(|local| {
+                                let binding = TableBinding::Local(*local);
+                                !self
+                                    .debug_identity_bindings
+                                    .get(binding)
+                                    .copied()
+                                    .unwrap_or_default()
+                                    && !self
+                                        .reference_captured_bindings
+                                        .get(binding)
+                                        .copied()
+                                        .unwrap_or_default()
+                            })
+                        {
+                            emptied_declarations.extend(decl.bindings.iter().copied());
+                        }
                         decl.values = HirValuePack::default();
                         let summary =
                             collect_stmt_binding_summary(&block.stmts[read], &mut binding_index);
@@ -626,8 +643,93 @@ impl HirRewritePass for TableConstructorPass<'_> {
                 block.stmts.push(stmt);
             }
         }
+        reuse_following_initializers(block, &emptied_declarations, self.promotion_facts);
         changed |= self.materialize_safe_fixed_set_lists(block);
         changed
+    }
+}
+
+/// 只处理本次提交移走 initializer 后留下的匿名占位，不删除源码原有的 nil 初始化。
+/// 连续占位后的同序原写承接声明；nil 以及原位 NEWTABLE 不需要额外 RHS 准备槽。
+fn reuse_following_initializers(
+    block: &mut crate::hir::common::HirBlock,
+    emptied: &BTreeSet<LocalId>,
+    facts: &ProtoPromotionFacts,
+) {
+    if emptied.is_empty() {
+        return;
+    }
+    let mut removed = BTreeSet::new();
+    let mut replacements = BTreeMap::new();
+    let mut cursor = 0;
+    while cursor < block.stmts.len() {
+        let start = cursor;
+        let mut locals = Vec::new();
+        while let Some(HirStmt::LocalDecl(decl)) = block.stmts.get(cursor)
+            && decl.values.is_empty()
+            && decl.initializer_merge_transaction.is_none()
+            && matches!(decl.bindings.as_slice(), [local] if emptied.contains(local))
+        {
+            locals.push(decl.bindings[0]);
+            cursor += 1;
+        }
+        if locals.is_empty() {
+            cursor += 1;
+            continue;
+        }
+        let matches_initializers = locals.iter().enumerate().all(|(offset, local)| {
+            matches!(block.stmts.get(cursor + offset), Some(HirStmt::Assign(assign))
+                if assign.targets.as_slice() == [HirLValue::Local(*local)]
+                    && matches!(assign.values.fixed.as_slice(), [value] if match value {
+                        HirExpr::Nil => true,
+                        HirExpr::TableConstructor(table) => {
+                            matches!(table.sources, crate::hir::common::HirOperationSources::Single(source)
+                                if facts.operation_result_home(source).is_some_and(|home|
+                                    facts.trusted_local_home_slot(*local) == Some(home)))
+                                && locals[offset..].iter().all(|local|
+                                    !constructor_uses_binding(table, TableBinding::Local(*local)))
+                        }
+                        _ => false,
+                    })
+                    && assign.values.tail.is_none()
+                    && !assign.is_phi_transfer
+                    && assign.parallel_nil_frame.is_none()
+                    && assign.initializer_merge_transaction.is_none()
+                    && assign.generic_for_initializer_producer.is_none()
+                    && assign.generic_for_dispatch_release.is_none()
+                    && assign.method_rewrite_transaction.is_none())
+        });
+        if matches_initializers {
+            removed.extend(start..cursor);
+            let width = locals.len();
+            replacements.extend(
+                locals
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, local)| (cursor + offset, local)),
+            );
+            cursor += width;
+        }
+    }
+    if replacements.is_empty() {
+        return;
+    }
+    // 整批压缩一次，不在每个声明处搬移后缀。
+    let old = std::mem::take(&mut block.stmts);
+    for (index, mut stmt) in old.into_iter().enumerate() {
+        if let Some(&local) = replacements.get(&index) {
+            let HirStmt::Assign(assign) = stmt else {
+                unreachable!()
+            };
+            stmt = HirStmt::LocalDecl(Box::new(crate::hir::common::HirLocalDecl {
+                bindings: vec![local],
+                values: assign.values,
+                initializer_merge_transaction: None,
+            }));
+        }
+        if !removed.contains(&index) {
+            block.stmts.push(stmt);
+        }
     }
 }
 
@@ -669,8 +771,36 @@ pub(super) fn debug_initializer_home(
     (facts.allocation_result_home(constructor) == Some(home)).then_some(home)
 }
 
+/// 末次 record 写的 scope 与原分配 Def 配对；debug 名字尚未生效，不存在可观察的延迟赋值。
+pub(super) fn debug_record_initializer_home(
+    seed: &HirStmt,
+    writes: &crate::hir::common::HirOperationSources,
+    debug_scope: Option<usize>,
+    facts: &ProtoPromotionFacts,
+) -> Option<HomeSlotKey> {
+    let scope = debug_scope?;
+    let (binding, table) = constructor_seed(seed)?;
+    let layout = facts.native_record_write_layout(writes)?;
+    let (producer, initializer_scope) = layout.initializer?;
+    let crate::hir::common::HirOperationSources::Single(source) = table.sources else {
+        return None;
+    };
+    let same_binding = match binding {
+        TableBinding::Temp(temp) => temp == producer,
+        TableBinding::Local(local) => {
+            matches!(seed, HirStmt::LocalDecl(decl) if decl.bindings.as_slice() == [local])
+                && facts.promoted_local_for_temp(producer) == Some(local)
+        }
+    };
+    (scope == initializer_scope
+        && same_binding
+        && facts.operation_result_temp(source) == Some(producer)
+        && facts.allocation_result_home(table) == Some(layout.base))
+    .then_some(layout.base)
+}
+
 impl TableConstructorPass<'_> {
-    /// Structure 的 scope 身份与 lowering 的批次位置共同证明字段属于尚未开始的声明。
+    /// Structure 的 scope 身份与原末次字段/批次位置共同证明字段属于尚未开始的声明。
     /// GC/求值序仍走同一 region guard；这里仅撤销对 initializer 的过宽 debug 身份拒绝。
     fn source_debug_initializer_is_safe(
         &self,
@@ -679,9 +809,6 @@ impl TableConstructorPass<'_> {
         binding: TableBinding,
         region: &scan::ConstructorRegion<'_>,
     ) -> bool {
-        let Some(RegionStep::SetList { batch, .. }) = region.steps.last() else {
-            return false;
-        };
         if self
             .reference_captured_bindings
             .get(binding)
@@ -690,13 +817,25 @@ impl TableConstructorPass<'_> {
         {
             return false;
         }
-        let home = debug_initializer_home(
-            &block.stmts[seed_index],
-            batch,
-            self.debug_scopes.get(&binding).copied(),
-            self.promotion_facts,
-        );
-        home.is_some_and(|home| !self.reference_captured_home_slots.contains(&home))
+        let scope = self.debug_scopes.get(&binding).copied();
+        let seed = &block.stmts[seed_index];
+        let home = match region.steps.last() {
+            Some(RegionStep::SetList { batch, .. }) => {
+                debug_initializer_home(seed, batch, scope, self.promotion_facts)
+            }
+            Some(RegionStep::Record { write_sources, .. }) => {
+                debug_record_initializer_home(seed, write_sources, scope, self.promotion_facts)
+            }
+            _ => None,
+        };
+        home.is_some_and(|home| {
+            !self.reference_captured_home_slots.contains(&home)
+                // 后继 cell 复用同一 epoch 不回溯到原分配；当前 binding 的 capture
+                // 已在上方拒绝，完整 initializer 仍由 region 验证事件与写入顺序。
+                || constructor_seed(seed).is_some_and(|(_, table)| {
+                    self.promotion_facts.allocation_result_reference_unaliased(table)
+                })
+        })
     }
 
     /// 一次 raw 数组批次直接离开无 cleanup 的函数时，槽根与结果构造器同时结束当前 frame。
@@ -785,12 +924,18 @@ impl TableConstructorPass<'_> {
         block: &mut crate::hir::common::HirBlock,
     ) -> bool {
         let mut changed = false;
+        let mut non_nil = BTreeMap::new();
         let mut index = 0;
         while index < block.stmts.len() {
             let Some(set_list) = (match &block.stmts[index] {
                 HirStmt::TableSetList(set_list) => Some(set_list.clone()),
                 _ => None,
             }) else {
+                record_local_non_nil_definitions(
+                    &block.stmts[index],
+                    &mut non_nil,
+                    &self.reference_captured_bindings,
+                );
                 index += 1;
                 continue;
             };
@@ -843,8 +988,9 @@ impl TableConstructorPass<'_> {
             // allocation and SETLIST. Preserve those statements and replace only the raw fixed
             // batch, so neither the table allocation nor a physical-root overwrite moves.
             if self.stage == TableConstructorStage::LowerFixedBatches
-                && let Some(_seed_index) = self
-                    .find_local_set_list_seed_for_indexed_writes(block, index, binding, &set_list)
+                && let Some(_seed_index) = self.find_local_set_list_seed_for_indexed_writes(
+                    block, index, binding, &set_list, &non_nil,
+                )
             {
                 let base = set_list.base.clone();
                 let fixed_len = set_list.values.fixed.len();
@@ -859,6 +1005,10 @@ impl TableConstructorPass<'_> {
                             .checked_add(u32::try_from(offset).expect("SETLIST offset fits u32"))
                             .expect("SETLIST index overflow");
                         HirStmt::Assign(Box::new(HirAssign {
+                            luau_compound_global: false,
+                            upvalue_write_source: None,
+                            is_phi_transfer: false,
+                            parallel_nil_frame: None,
                             targets: vec![HirLValue::TableAccess(Box::new(HirTableAccess {
                                 sources: Default::default(),
                                 metamethod_free: false,
@@ -1117,6 +1267,7 @@ impl TableConstructorPass<'_> {
         set_list_index: usize,
         binding: TableBinding,
         set_list: &crate::hir::common::HirTableSetList,
+        non_nil: &BTreeMap<TableBinding, bool>,
     ) -> Option<usize> {
         let TableBinding::Local(_local) = binding else {
             return None;
@@ -1173,11 +1324,12 @@ impl TableConstructorPass<'_> {
             if !array_fields_have_safe_nil_shape(&seed.fields) || !set_list_can_overwrite_seed {
                 return None;
             }
-            if !local_set_list_values_have_safe_nil_shape(
-                block,
-                seed_index,
-                set_list_index,
-                &set_list.values.fixed,
+            if !values_have_safe_nil_shape(
+                set_list
+                    .values
+                    .fixed
+                    .iter()
+                    .map(|value| expr_is_definitely_non_nil_from_definitions(value, non_nil)),
             ) {
                 // 候选拒绝[SemanticBarrier:TableShape]：raw SETLIST 与逐项 SETTABLE 对中间
                 // nil hole 的 array part/`#table` 不等价；官方 Lua 5.4 反例见 regress_337。
@@ -2205,6 +2357,35 @@ impl TableConstructorPass<'_> {
         ) else {
             return false;
         };
+        if let Some(HirStmt::Assign(assign)) = block.stmts.get(index + 1)
+            && assign.targets.as_slice() == [HirLValue::Local(*root)]
+            && let ([HirExpr::Closure(closure)], None) =
+                (assign.values.fixed.as_slice(), &assign.values.tail)
+            && let Some(home) = closure
+                .source_site
+                .and_then(|site| self.promotion_facts.operation_result_home(site))
+            && Some(home) == self.promotion_facts.trusted_local_home_slot(*root)
+        {
+            // 候选拒绝[LayerBoundary]：后继 CLOSURE 要成为同槽的新声明。
+            // 留下 buffer COPY 会使它变成已有 local 的赋值，再编译时另占分配槽；
+            // SETLIST、COPY 退休和新声明必须由完整构造帧一起验证。
+            return false;
+        }
+        if matches!(block.stmts.get(index + 1), Some(HirStmt::Assign(assign))
+            if assign.targets.as_slice() == [HirLValue::Local(*root)])
+            && let Some(HirStmt::CallStmt(call)) = block.stmts.get(index + 2)
+            && call.call.callee == HirExpr::LocalRef(*root)
+            && self
+                .promotion_facts
+                .native_call_frame(&call.call)
+                .is_some_and(|frame| {
+                    self.promotion_facts.trusted_local_home_slot(*root) == Some(frame.home)
+                })
+        {
+            // 候选拒绝[LayerBoundary]：后继 callee 立即覆盖原 buffer root。
+            // 完整帧须一起消费 SETLIST 与该覆盖；先留下 COPY 会制造新的永久声明。
+            return false;
+        }
         if owner != binding
             || !seed.fields.is_empty()
             || seed.trailing_multivalue.is_some()
@@ -2256,18 +2437,31 @@ pub(super) fn constructor_with_native_records(
         builder.push_record_field(record);
     }
     let constructor = builder.into_constructor();
+    let arrays = constructor
+        .fields
+        .iter()
+        .filter(|field| matches!(field, HirTableField::Array(_)))
+        .count();
     let allocation_matches = match constructor.allocation {
         crate::hir::HirTableAllocation::LuauTemplate { .. } => constructor.fields.len() <= 32,
         crate::hir::HirTableAllocation::Template { .. } => {
-            constructor.matches_allocation_capacity(0)
+            constructor.matches_allocation_capacity(arrays)
         }
+        crate::hir::HirTableAllocation::Luau(_) => constructor.matches_allocation_capacity(0),
         _ => false,
     };
     (allocation_matches
         && constructor.fields.iter().all(|field| {
-            matches!(field,
-            HirTableField::Record(record)
-                if constructor.allocation.permits_record_key(record.key.table_key()))
+            match field {
+                // TDUP 的 nil 数组位由同一 builder 按单调写序恢复；保留原模板容量和初值约束。
+                HirTableField::Array(_) => matches!(
+                    constructor.allocation,
+                    crate::hir::HirTableAllocation::Template { .. }
+                ),
+                HirTableField::Record(record) => constructor
+                    .allocation
+                    .permits_record_key(record.key.table_key()),
+            }
         })
         && constructor.implicit_template_fields.is_empty()
         && !crate::hir::table_layout::runtime_table_operand_requirements(&constructor).any())
@@ -2554,7 +2748,7 @@ fn record_key_is_data_only(key: &HirExpr) -> bool {
 }
 
 /// 只沿 statement/block 骨架查找本 pass 可能改写的根形状，不进入表达式子树。
-fn block_has_table_constructor_candidate(block: &crate::hir::common::HirBlock) -> bool {
+pub(super) fn block_has_table_constructor_candidate(block: &crate::hir::common::HirBlock) -> bool {
     block.stmts.iter().any(stmt_has_table_constructor_candidate)
 }
 
@@ -2713,67 +2907,58 @@ fn values_have_safe_nil_shape(mut non_nil: impl Iterator<Item = bool>) -> bool {
     true
 }
 
-/// 这里按语句顺序追踪 direct binding 当前 definition 的 nil 性；producer 语句保持原位，
-/// 因此不会继承 generic fold transaction 的表达式 clone 或 root lifetime 风险。
-fn local_set_list_values_have_safe_nil_shape(
-    block: &crate::hir::common::HirBlock,
-    seed_index: usize,
-    set_list_index: usize,
-    values: &[HirExpr],
-) -> bool {
-    let mut definitions = BTreeMap::<TableBinding, bool>::new();
-    for stmt in &block.stmts[seed_index + 1..set_list_index] {
-        match stmt {
-            HirStmt::LocalDecl(decl) => {
-                let value_facts = decl
-                    .values
-                    .fixed
-                    .iter()
-                    .map(|value| expr_is_definitely_non_nil_from_definitions(value, &definitions))
-                    .collect::<Vec<_>>();
-                for (index, local) in decl.bindings.iter().enumerate() {
-                    let definitely_non_nil = value_facts.get(index).copied().unwrap_or(false);
-                    definitions.insert(TableBinding::Local(*local), definitely_non_nil);
-                }
-            }
-            HirStmt::Assign(assign) => {
-                let value_facts = assign
-                    .values
-                    .fixed
-                    .iter()
-                    .map(|value| expr_is_definitely_non_nil_from_definitions(value, &definitions))
-                    .collect::<Vec<_>>();
-                let exact_width = assign.values.tail.is_none()
-                    && assign.targets.len() == assign.values.fixed.len();
-                for (index, target) in assign.targets.iter().enumerate() {
-                    let Some(binding) = binding_from_lvalue(target) else {
-                        continue;
-                    };
-                    let definitely_non_nil =
-                        exact_width && value_facts.get(index).copied().unwrap_or(false);
-                    definitions.insert(binding, definitely_non_nil);
-                }
-            }
-            _ => {
-                // 结构化语句可能按路径改写已知 binding；区间内没有 must-def 合流证明时，
-                // 不能沿用语句之前的 non-nil 事实。
-                visit_stmts(
-                    std::slice::from_ref(stmt),
-                    &mut BindingWriteCollector(|binding| {
-                        if let Some(binding) = binding_from_identity(binding) {
-                            definitions.insert(binding, false);
-                        }
-                    }),
-                );
-            }
+/// 顺序扫描当前块，保留建表前已有值经 COPY 传入 SETLIST 的 non-nil 事实。
+/// 只维护本块的当前定义；结构化写失效，引用捕获 cell 不跨语句缓存。
+fn record_local_non_nil_definitions(
+    stmt: &HirStmt,
+    definitions: &mut BTreeMap<TableBinding, bool>,
+    captured: &BindingSlots<bool>,
+) {
+    let (targets, values) = match stmt {
+        HirStmt::LocalDecl(decl) => (
+            decl.bindings
+                .iter()
+                .copied()
+                .map(TableBinding::Local)
+                .map(Some)
+                .collect::<Vec<_>>(),
+            &decl.values,
+        ),
+        HirStmt::Assign(assign) => (
+            assign.targets.iter().map(binding_from_lvalue).collect(),
+            &assign.values,
+        ),
+        HirStmt::LocalRootRelease(local) => {
+            definitions.remove(&TableBinding::Local(*local));
+            return;
+        }
+        _ => {
+            visit_stmts(
+                std::slice::from_ref(stmt),
+                &mut BindingWriteCollector(|binding| {
+                    if let Some(binding) = binding_from_identity(binding) {
+                        definitions.remove(&binding);
+                    }
+                }),
+            );
+            return;
+        }
+    };
+    // 并行赋值的所有 RHS 消费同一旧快照，再统一发布新定义。
+    let values = values
+        .fixed
+        .iter()
+        .map(|value| expr_is_definitely_non_nil_from_definitions(value, definitions))
+        .collect::<Vec<_>>();
+    for (index, target) in targets.into_iter().enumerate() {
+        if let Some(binding) = target {
+            definitions.insert(
+                binding,
+                !captured.get(binding).copied().unwrap_or_default()
+                    && values.get(index).copied().unwrap_or(false),
+            );
         }
     }
-
-    values_have_safe_nil_shape(
-        values
-            .iter()
-            .map(|value| expr_is_definitely_non_nil_from_definitions(value, &definitions)),
-    )
 }
 
 fn expr_is_definitely_non_nil_from_definitions(

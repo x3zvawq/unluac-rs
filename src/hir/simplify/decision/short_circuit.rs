@@ -21,6 +21,80 @@ pub(super) fn collapse_short_circuit_graph(
     safety: HirExprSafety,
     root_ends: impl Fn(&HirDecisionNode) -> bool,
 ) -> Option<HirExpr> {
+    collapse_graph(topology, safety, root_ends, false)
+}
+
+pub(super) fn collapse_condition_graph(
+    topology: &DecisionFacts<'_>,
+    safety: HirExprSafety,
+) -> Option<HirExpr> {
+    // 这里只收回纯控制出口；CurrentValue 和一般值叶继续由值选择合同处理。
+    if topology.decision().nodes.iter().any(|node| {
+        [&node.truthy, &node.falsy].iter().any(|target| {
+            !matches!(
+                target,
+                HirDecisionTarget::Node(_) | HirDecisionTarget::Expr(HirExpr::Boolean(_))
+            )
+        })
+    }) {
+        return None;
+    }
+    collapse_graph(topology, safety, |_| false, true)
+}
+
+fn collapse_graph(
+    topology: &DecisionFacts<'_>,
+    safety: HirExprSafety,
+    root_ends: impl Fn(&HirDecisionNode) -> bool,
+    condition: bool,
+) -> Option<HirExpr> {
+    let decision = topology.decision();
+    let mut nodes = reduce_graph(topology, safety, root_ends, condition)?;
+
+    let (root, _) = nodes[decision.entry.index()].as_ref()?;
+    if matches!(root.truthy, HirDecisionTarget::Node(_))
+        || matches!(root.falsy, HirDecisionTarget::Node(_))
+    {
+        if condition {
+            return None;
+        }
+        // 图归约后的共享 fallback 已变为唯一值链；直接消费该链，不能丢弃归约结果
+        // 再从原 DAG 复制 memo 表达式。非线性残余仍由原 Decision owner 处理。
+        return super::collapse_linear_value_chain_with(decision.entry, |node| {
+            nodes[node.index()].take().map(|(node, _)| node)
+        });
+    }
+    let (root, _) = nodes[decision.entry.index()].take()?;
+    if condition {
+        let (HirDecisionTarget::Expr(truthy), HirDecisionTarget::Expr(falsy)) =
+            (root.truthy, root.falsy)
+        else {
+            return None;
+        };
+        return super::combine_condition_expr(root.test, truthy, falsy, safety);
+    }
+    let collapse_target = |target| match target {
+        HirDecisionTarget::CurrentValue => Some(CollapsedValueTarget::CurrentValue),
+        HirDecisionTarget::Expr(expr) => Some(CollapsedValueTarget::Expr(expr)),
+        // 候选拒绝[ProofIncomplete]：非串联短路图尚有独立共享入口，不能复制 test 来强行合并。
+        HirDecisionTarget::Node(_) => None,
+    };
+    combine_value_expr(
+        root.test,
+        collapse_target(root.truthy)?,
+        collapse_target(root.falsy)?,
+        safety,
+    )
+}
+
+type ReducedNodes = Vec<Option<(HirDecisionNode, bool)>>;
+
+fn reduce_graph(
+    topology: &DecisionFacts<'_>,
+    safety: HirExprSafety,
+    root_ends: impl Fn(&HirDecisionNode) -> bool,
+    condition: bool,
+) -> Option<ReducedNodes> {
     let decision = topology.decision();
     let mut incoming = topology.incoming_counts().to_vec();
     let mut nodes = decision
@@ -29,7 +103,9 @@ pub(super) fn collapse_short_circuit_graph(
         .cloned()
         .map(|mut node| {
             let root_ends = root_ends(&node);
-            normalize_boolean_terminals(&mut node, safety, root_ends);
+            if !condition {
+                normalize_boolean_terminals(&mut node, safety, root_ends);
+            }
             Some((node, root_ends))
         })
         .collect::<Vec<_>>();
@@ -66,8 +142,9 @@ pub(super) fn collapse_short_circuit_graph(
                 } else {
                     &child_node.falsy
                 };
-                (inverse_common == common && can_invert_test(child_node, safety, *root_ends))
-                    .then_some((child.index(), is_and, true))
+                (inverse_common == common
+                    && (condition || can_invert_test(child_node, safety, *root_ends)))
+                .then_some((child.index(), is_and, true))
             });
             let Some((child_index, is_and, invert)) = merge else {
                 break;
@@ -104,29 +181,32 @@ pub(super) fn collapse_short_circuit_graph(
         }
     }
 
-    let (root, _) = nodes[decision.entry.index()].as_ref()?;
-    if matches!(root.truthy, HirDecisionTarget::Node(_))
-        || matches!(root.falsy, HirDecisionTarget::Node(_))
-    {
-        // 图归约后的共享 fallback 已变为唯一值链；直接消费该链，不能丢弃归约结果
-        // 再从原 DAG 复制 memo 表达式。非线性残余仍由原 Decision owner 处理。
-        return super::collapse_linear_value_chain_with(decision.entry, |node| {
-            nodes[node.index()].take().map(|(node, _)| node)
-        });
+    Some(nodes)
+}
+
+/// 终端赋值的控制测试也能消费局部短路归约；不要求整图可折成一个 Lua 值。
+pub(super) fn prepare_control_materialization(
+    decision: crate::hir::common::HirDecisionExpr,
+    safety: HirExprSafety,
+) -> crate::hir::common::HirDecisionExpr {
+    if decision.nodes.iter().any(|node| {
+        matches!(node.truthy, HirDecisionTarget::CurrentValue)
+            || matches!(node.falsy, HirDecisionTarget::CurrentValue)
+    }) {
+        // 候选拒绝[SemanticBarrier:ValueArity]：CurrentValue 仍消费原测试值，不能按纯控制边翻转。
+        return decision;
     }
-    let (root, _) = nodes[decision.entry.index()].take()?;
-    let collapse_target = |target| match target {
-        HirDecisionTarget::CurrentValue => Some(CollapsedValueTarget::CurrentValue),
-        HirDecisionTarget::Expr(expr) => Some(CollapsedValueTarget::Expr(expr)),
-        // 候选拒绝[ProofIncomplete]：非串联短路图尚有独立共享入口，不能复制 test 来强行合并。
-        HirDecisionTarget::Node(_) => None,
-    };
-    combine_value_expr(
-        root.test,
-        collapse_target(root.truthy)?,
-        collapse_target(root.falsy)?,
-        safety,
-    )
+    let topology = super::analyze_decision(&decision);
+    let reduced = reduce_graph(&topology, safety, |_| false, true)
+        .expect("validated decision reduction retains its live parents");
+    // 只移动唯一入边 child，保持检查次数和惰性次序；终端仍在选中后提交，不提前写目标。
+    // 未归约部分连同已归约节点一起物化，不能因整图值表达式失败而丢弃局部证明。
+    let nodes = reduced
+        .into_iter()
+        .zip(&decision.nodes)
+        .map(|(node, original)| node.map_or_else(|| original.clone(), |(node, _)| node))
+        .collect::<Vec<_>>();
+    super::rebuild_decision(decision.entry, &nodes).0
 }
 
 fn normalize_boolean_terminals(node: &mut HirDecisionNode, safety: HirExprSafety, root_ends: bool) {
@@ -169,7 +249,8 @@ fn can_invert_test(node: &HirDecisionNode, safety: HirExprSafety, root_ends: boo
     // CurrentValue 返回原 test 的值，翻边后不能把它静默换成相反的 Boolean。
     // 候选拒绝[SemanticBarrier:Lifetime]：未知调用或合成谓词没有原 Boolean 值操作；
     // 不能靠外层 not 插入原图未证明的根覆盖。Value 路径严格保留已有内部操作；
-    // root_ends 仅由当前 lowering 快照对精确 CALL test 签发，并在组合时失效。
+    // callback 由 lowering 的精确覆盖证书，或完整返回帧事务签发；后者必须在提交前
+    // 核对整个候选的原位调用布局，不表示旧根已经结束。组合后单节点许可失效。
     !matches!(node.truthy, HirDecisionTarget::CurrentValue)
         && !matches!(node.falsy, HirDecisionTarget::CurrentValue)
         && (root_ends
@@ -179,7 +260,7 @@ fn can_invert_test(node: &HirDecisionNode, safety: HirExprSafety, root_ends: boo
 }
 
 fn invert_test(node: &mut HirDecisionNode) {
-    // 严格保留内部 Boolean 值操作；negate() 的双 not 消解会重新退化成裸调用谓词。
+    // 严格保留内部 Boolean 值操作；翻边只增加外层极性，不消解原有 NOT。
     let test = std::mem::replace(&mut node.test, HirExpr::Nil);
     node.test = HirExpr::Unary(Box::new(HirUnaryExpr {
         source_site: None,

@@ -60,6 +60,7 @@ pub(super) fn build_composite(
                         .get(&upvalue)
                         .copied()
                         .map(CompositeCapture::Outer),
+                    TemplateCapture::Integer(value) => Some(CompositeCapture::Integer(value)),
                     TemplateCapture::Dependency(dependency) => {
                         Some(CompositeCapture::Dependency(dependency))
                     }

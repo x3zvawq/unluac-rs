@@ -22,6 +22,7 @@ pub(super) fn expr_is_synth_safe(expr: &HirExpr, safety: HirExprSafety) -> bool 
     // 单值 Decision/logical operand 中的 vararg 是函数入口已冻结的首值，可以和普通
     // ref 一样进入 MDD；调用、lookup、动态环境与元方法仍由上面的 trace owner 拒绝。
     safety.is_repeatable_in_single_value_context(expr)
+        && !HirExprSafety::contains_original_operation(expr)
 }
 
 fn target_is_synth_safe(target: &HirDecisionTarget, safety: HirExprSafety) -> bool {

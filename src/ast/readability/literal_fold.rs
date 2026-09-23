@@ -28,23 +28,27 @@ struct LiteralFoldPass {
 impl AstRewritePass for LiteralFoldPass {
     fn rewrite_expr(&mut self, expr: &mut AstExpr) -> bool {
         let replacement = match expr {
-            AstExpr::Binary(binary) => {
+            AstExpr::Binary(binary) if !binary.original_operation => {
                 primitive_literal_comparison_value(binary.op, &binary.lhs, &binary.rhs, self.target)
                     .map(AstExpr::Boolean)
             }
             AstExpr::LogicalAnd(logical)
-                if expr_is_boolean_valued(&logical.lhs)
+                if !logical.preserves_boolean_prewrite
+                    && expr_is_boolean_valued(&logical.lhs)
                     && matches!(logical.rhs, AstExpr::Boolean(true)) =>
             {
                 Some(logical.lhs.clone())
             }
             AstExpr::LogicalOr(logical)
-                if expr_is_boolean_valued(&logical.lhs)
+                if !logical.preserves_boolean_prewrite
+                    && expr_is_boolean_valued(&logical.lhs)
                     && matches!(logical.rhs, AstExpr::Boolean(false)) =>
             {
                 Some(logical.lhs.clone())
             }
-            AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => {
+            AstExpr::Unary(unary)
+                if unary.op == AstUnaryOpKind::Not && !unary.original_operation =>
+            {
                 constant_truthiness(&unary.expr)
                     .filter(|_| is_discard_safe_expr_for_target(&unary.expr, self.target))
                     .map(|value| AstExpr::Boolean(!value))

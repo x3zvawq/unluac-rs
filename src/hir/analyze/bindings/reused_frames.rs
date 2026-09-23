@@ -47,9 +47,14 @@ pub(in crate::hir::analyze) fn bind_reused_frames(
         if base > protocol.limit || base > protocol.step {
             continue;
         }
-        let Some(end) =
-            lexical_scope_evaluation_start(dataflow, cfg, block, base, protocol.init_instr.index())
-        else {
+        let Some(end) = lexical_scope_evaluation_start(
+            proto,
+            dataflow,
+            cfg,
+            block,
+            base,
+            protocol.init_instr.index(),
+        ) else {
             continue;
         };
         let Some((start, slots)) =
@@ -64,7 +69,7 @@ pub(in crate::hir::analyze) fn bind_reused_frames(
             continue;
         }
         let mut scopes = bindings.lexical_scopes.clone();
-        scopes.push(start..end);
+        scopes.push((start..end).into());
         let expected = scopes
             .iter()
             .map(|range| (range.start, range.end))

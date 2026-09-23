@@ -11,19 +11,70 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_closures/identity_02_carried_closure_capture.lua",
         &["branch", "capture-cell", "readability"],
         "确保三个分支计算出的 needed 被返回闭包各自捕获，同时 level 保持对象引用而不是值快照。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/capture_01_captured_slot_receiver_eval.lua",
         &["eval-order", "for-binding", "receiver"],
-        "先观察captured receiver槽重读，再覆盖numeric/generic for binding closure身份。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        "captured receiver在callee求值后重读，CALL低槽写回保留后继声明前缀，循环闭包保持binding身份。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/identity_03_captured_alias_group_home_slot.lua",
         &["alias", "home-slot", "phi", "snapshot"],
-        "phi别名组赋值须写回已捕获seed home，同时proxy记录赋值前reader快照。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        "两臂均写回原 captured seed，proxy 保存各方言原写入时点的 reader 结果，字段 CALL 与返回包不留中转。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/capture_02_child_writes_parent_capture.lua",
@@ -40,8 +91,22 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_closures/identity_04_luau_capture_value_reuse.lua",
         &["capture-val", "slot-reuse"],
-        "CAPTURE VAL与后续物理register复用隔离。",
-        &[LuaCaseConfiguration::new(LUAU_ONLY)],
+        "CAPTURE VAL 快照与后续槽复用隔离，调用准备及 callee 不留中转。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/identity_05_branch_close_capture_epoch.lua",
@@ -89,7 +154,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_closures/loop_01_lua52_goto_capture_identity.lua",
         &["capture", "goto", "loop-iteration", "shared-slot"],
         "保证 backward goto 重复创建的闭包共享同一 capture 槽，而非逐轮局部。",
-        &[LuaCaseConfiguration::new(LUA_GOTO_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(LUA_GOTO_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUA_GOTO_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/identity_06_close_capture_post_slot_reuse.lua",
@@ -108,8 +183,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["lexical-child", "o2", "proto"],
         "保证 O2 复用的 flat proto 展开到每个词法 child slot。",
         &[
-            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS),
             LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
                 retain_debug: true,
                 ignore_debug: true,
                 ..LUAU_OPTIMIZED_OPTIONS
@@ -120,7 +199,18 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_closures/factory_02_luau_closure_creation_identity.lua",
         &["dupclosure", "identity", "newclosure"],
         "区分 O2 DUPCLOSURE 与 NEWCLOSURE 的每次创建身份。",
-        &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS)],
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ignore_debug: true,
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/factory_03_luau_captured_shared_factory.lua",
@@ -128,6 +218,12 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "覆盖 O2 内联后带 capture DUPCLOSURE 的共同词法 owner、事件工厂和分支工厂。",
         &[
             LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(4),
+                ..LUAU_OPTIMIZED_CONVERGENCE_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ignore_debug: true,
                 recompile_rounds: Some(4),
                 ..LUAU_OPTIMIZED_CONVERGENCE_OPTIONS
             }),
@@ -141,23 +237,46 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/factory_05_luau_captured_shared_owner_dependency.lua",
-        &["factory", "nan", "owner"],
+        &["convergence", "factory", "nan", "owner"],
         "防止同一 closure 同时被当作 factory owner 和复合 DAG dependency。",
-        &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS)],
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(4),
+                ..LUAU_OPTIMIZED_CONVERGENCE_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ignore_debug: true,
+                recompile_rounds: Some(4),
+                ..LUAU_OPTIMIZED_CONVERGENCE_OPTIONS
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/loop_02_luau_captured_shared_repeat_condition.lua",
         &["factory", "repeat", "scope"],
         "保证 repeat body local factory 在 until 条件仍可见并每轮创建新闭包。",
-        &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_OPTIONS)],
+        &[LuaCaseConfiguration::new(LUAU_ONLY).with_options(LUAU_OPTIMIZED_CONVERGENCE_OPTIONS)],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/loop_03_numeric_for_mutated_binding_capture.lua",
         &["capture", "global-leak", "mutable-binding", "numeric-for"],
         "保证赋值后的 numeric-for binding 捕获不回读 header phi。",
-        &[LuaCaseConfiguration::new(
-            MUTABLE_NUMERIC_FOR_BINDING_DIALECTS,
-        )],
+        &[
+            LuaCaseConfiguration::new(MUTABLE_NUMERIC_FOR_BINDING_DIALECTS).with_options(
+                LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                },
+            ),
+            LuaCaseConfiguration::new(MUTABLE_NUMERIC_FOR_BINDING_DIALECTS).with_options(
+                LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                },
+            ),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/factory_06_luau_captured_shared_diamond.lua",
@@ -168,10 +287,21 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_closures/loop_04_closure_self_capture.lua",
         &["numeric-for", "recursion", "self-capture"],
-        "覆盖递归closure覆写loop binding及各迭代capture独立写回。",
+        "保持递归 closure 及各轮 capture 身份，按原帧直接调用并写入表字段。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_51),
-            LuaCaseConfiguration::new(PUC_LUA_54),
+            LuaCaseConfiguration::new(MUTABLE_NUMERIC_FOR_BINDING_DIALECTS).with_options(
+                LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                },
+            ),
+            LuaCaseConfiguration::new(MUTABLE_NUMERIC_FOR_BINDING_DIALECTS).with_options(
+                LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                },
+            ),
         ],
     ),
     LuaCaseDefinition::new(
@@ -190,26 +320,52 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_closures/capture_09_boolean_shell_distinct_capture_home.lua",
         &["boolean-shell", "capture", "home"],
-        "证明另一物理槽的引用捕获不使dead loop-local boolean shell变得可观察。",
-        &[LuaCaseConfiguration::new(PUC_LUA_54)],
+        "另一物理槽的引用捕获保持独立，未使用的布尔写回仍保留原检查。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/capture_10_boolean_shell_lua51_entry_capture_home.lua",
         &["boolean-shell", "entry-home", "vararg"],
         "确认Lua5.1隐式arg表的entry home不与dead loop shell混同。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/capture_11_boolean_shell_lua55_entry_capture_home.lua",
         &["boolean-shell", "entry-home", "named-vararg"],
         "确认Lua5.5 named vararg pack的entry home不与dead loop shell混同。",
-        &[LuaCaseConfiguration::new(PUC_LUA_GE_55)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_GE_55).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/factory_07_temp_inline_repeated_closure.lua",
-        &["callback", "single-allocation", "while"],
+        &["callback", "convergence", "single-allocation", "while"],
         "防止loop condition的nested call参数每轮重复分配closure。",
-        &[LuaCaseConfiguration::new(PUC_LUA_ALL)],
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ignore_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/flow_03_forwarded_lvalue_eval_order.lua",
@@ -225,9 +381,14 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/factory_08_lua55_returned_fresh_closure_effect.lua",
-        &["call-effect", "factory", "gc-root"],
+        &["call-effect", "convergence", "factory", "gc-root"],
         "证明已知 factory 返回的新鲜闭包在跨函数投影后仍携带 initialize 的 captured-root 写效应，holder() 执行后 item 必须活到 repeat condition。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55])],
+        &[
+            LuaCaseConfiguration::new(&[LuaCaseDialect::Lua55]).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/scope_01_nested_capture_local_namespace.lua",
@@ -250,8 +411,18 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_closures/identity_07_write_graph.lua",
         &["backedge", "branch", "capture-cell", "epoch"],
-        "验证同一 close epoch 的多个闭包共享未来写入，repeat 回边产生的三个闭包共享可写 cell，而三个独立 do scope 的 close epoch 保持40/50/60系列身份。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        "同一 close epoch 共享条件写回与 repeat 回边的 cell，独立 do scope 保持捕获身份；单臂写回不退化成自引用选值或额外 phi 交接。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/identity_08_creation_reads.lua",
@@ -274,17 +445,31 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_closures/identity_09_capture_closed_nil_slot.lua",
         &["capture-cell", "epoch", "nil", "register-reuse"],
-        "旧nil capture cell关闭后，同寄存器新epoch分别复用为number17和function23，旧saved闭包仍必须返回nil。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        "同批 nil 的外层 holder 与内层 capture cell 各归原作用域；关闭后槽复用为数值或函数，旧闭包仍返回 nil，后续 CALL 不留交接。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_closures/loop_06_tail_capture_cleanup.lua",
         &["capture", "cleanup", "goto", "numeric-for"],
         "body末尾布尔合流后的Close/JMP是正常迭代尾，不能误转continue。",
         &[
-            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],

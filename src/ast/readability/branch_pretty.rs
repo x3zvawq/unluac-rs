@@ -47,8 +47,9 @@ impl AstRewritePass for BranchPrettyPass {
             }
         }
         block.stmts = flattened_stmts;
+        let merged_continues = merge_adjacent_continues(&mut block.stmts);
         let folded_terminal_guard = fold_terminal_guard_return(block, kind);
-        changed || folded_terminal_guard
+        changed || merged_continues || folded_terminal_guard
     }
 
     fn rewrite_stmt(&mut self, stmt: &mut AstStmt) -> bool {
@@ -110,6 +111,51 @@ impl AstRewritePass for BranchPrettyPass {
     }
 }
 
+fn merge_adjacent_continues(stmts: &mut Vec<AstStmt>) -> bool {
+    let mut merged = Vec::with_capacity(stmts.len());
+    let mut changed = false;
+    for stmt in std::mem::take(stmts) {
+        let AstStmt::If(mut next) = stmt else {
+            merged.push(stmt);
+            continue;
+        };
+        let Some(AstStmt::If(previous)) = merged.last_mut() else {
+            merged.push(AstStmt::If(next));
+            continue;
+        };
+        if previous.else_block.is_some() || next.else_block.is_some() {
+            merged.push(AstStmt::If(next));
+            continue;
+        }
+        let same_exit = matches!(
+            (
+                previous.then_block.stmts.as_slice(),
+                next.then_block.stmts.as_slice(),
+            ),
+            ([AstStmt::Continue], [AstStmt::Continue])
+        );
+        if !same_exit {
+            // 候选拒绝[SemanticBarrier:ControlFlow]：arm 还含求值、声明、cleanup
+            // 或不同退出动作时，不能仅凭出口相似合并（continue_17）。
+            // break 还可能属于待消除的 single-pass fence；先并成 OR 会把原来
+            // 逐层取反的 guard 变成整棵 not(OR)，因此留给该 fence owner 整理。
+            merged.push(AstStmt::If(next));
+            continue;
+        }
+        // 相邻的纯退出 arm 处于同一词法块，最近循环 owner 相同；第二条件仍只在
+        // 第一条件为假时执行，不跨越声明、不删除任一次原检查或条件求值。
+        previous.cond = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
+            lhs: std::mem::replace(&mut previous.cond, AstExpr::Boolean(false)),
+            rhs: std::mem::replace(&mut next.cond, AstExpr::Boolean(false)),
+            preserves_boolean_prewrite: false,
+        }));
+        previous.preserves_empty_test |= next.preserves_empty_test;
+        changed = true;
+    }
+    *stmts = merged;
+    changed
+}
+
 fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
     let len = repeat_stmt.body.stmts.len();
     if len < 2 {
@@ -146,8 +192,10 @@ fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
         lhs: AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
             lhs: continued,
             rhs: broken,
+            preserves_boolean_prewrite: false,
         })),
         rhs: latch,
+        preserves_boolean_prewrite: false,
     }));
     true
 }
@@ -520,7 +568,9 @@ fn merge_exact_nested_if(if_stmt: &mut AstIf) -> bool {
     inner.cond = AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
         lhs,
         rhs: inner.cond,
+        preserves_boolean_prewrite: false,
     }));
+    inner.preserves_empty_test |= if_stmt.preserves_empty_test;
     *if_stmt = *inner;
     true
 }
@@ -617,6 +667,10 @@ fn fold_constant_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
     let AstStmt::If(mut if_stmt) = stmt else {
         return Err(stmt);
     };
+    if if_stmt.preserves_empty_test {
+        // PolicyBoundary：常量结果不授权删除原 branch 的 TEST。
+        return Err(AstStmt::If(if_stmt));
+    }
     let selected_then = match &if_stmt.cond {
         AstExpr::Boolean(value) => *value,
         _ => return Err(AstStmt::If(if_stmt)),
@@ -917,6 +971,7 @@ fn negate_guard_condition(expr: AstExpr) -> AstExpr {
         other => AstExpr::Unary(Box::new(AstUnaryExpr {
             op: AstUnaryOpKind::Not,
             expr: other,
+            original_operation: false,
         })),
     }
 }

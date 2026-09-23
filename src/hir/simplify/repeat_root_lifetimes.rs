@@ -122,7 +122,7 @@ fn collect_proto_repeat_roots(
             let bindings = site.observable_bindings.get_or_insert_with(|| {
                 site.lifetime.may_end_before_condition = repeat_scoped_bindings(&repeat.body);
                 let scoped = &site.lifetime.may_end_before_condition;
-                if scoped.is_empty() || safety.is_discard_safe_without_residual(&repeat.cond) {
+                if scoped.is_empty() || !safety.may_observe_gc_roots(&repeat.cond) {
                     return Vec::new();
                 }
                 scoped

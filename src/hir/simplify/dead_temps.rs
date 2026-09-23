@@ -8,8 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirBinding, HirBlock, HirCapture, HirCaptureMode, HirExpr, HirInlineDisposition,
-    HirInlineRetentionReason, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
+    HirBlock, HirCaptureMode, HirExpr, HirLValue, HirProto, HirStmt, LocalId, ParamId, TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{
@@ -24,197 +23,6 @@ use super::root_lifetimes::stmt_may_observe_gc_roots;
 use super::temp_touch::TempReadCollector;
 use super::walk::{HirRewritePass, rewrite_proto};
 use crate::hir::visit::{self, HirVisitor};
-
-/// 原生帧已经最终提交后，仅去掉无读 primitive 的计算，保留原点写入与声明身份。
-pub(super) fn simplify_unused_primitive_initializers(
-    proto: &mut HirProto,
-    facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
-) {
-    #[derive(Default)]
-    struct Reads {
-        locals: BTreeSet<LocalId>,
-        last_root_statement: BTreeMap<LocalId, usize>,
-        captured_homes: BTreeSet<HomeSlotKey>,
-        has_goto: bool,
-    }
-    struct ReadScan<'a> {
-        reads: &'a mut Reads,
-        facts: &'a ProtoPromotionFacts,
-        root_statement: usize,
-    }
-    impl HirVisitor<'_> for ReadScan<'_> {
-        fn visit_expr(&mut self, expr: &HirExpr) {
-            if let HirExpr::LocalRef(local) = expr {
-                self.reads.locals.insert(*local);
-                self.reads
-                    .last_root_statement
-                    .insert(*local, self.root_statement);
-            }
-        }
-        fn visit_stmt(&mut self, stmt: &HirStmt) {
-            self.reads.has_goto |= matches!(stmt, HirStmt::Goto(_));
-        }
-        fn visit_capture(&mut self, capture: &HirCapture) {
-            if let HirBinding::Local(local) = capture.binding {
-                self.reads.locals.insert(local);
-            }
-            self.reads.captured_homes.extend(
-                self.facts
-                    .complete_binding_home_slots(capture.binding)
-                    .iter()
-                    .copied(),
-            );
-        }
-    }
-    let mut reads = Reads::default();
-    let mut writes = BTreeMap::<LocalId, usize>::new();
-    let mut tbc = super::mention::ToBeClosedHomeCollector {
-        facts,
-        homes: BTreeSet::new(),
-    };
-    for (root_statement, stmt) in proto.body.stmts.iter().enumerate() {
-        visit::visit_stmts(
-            std::slice::from_ref(stmt),
-            &mut (
-                ReadScan {
-                    reads: &mut reads,
-                    facts,
-                    root_statement,
-                },
-                super::mention::BindingWriteCollector(|binding| {
-                    if let HirBinding::Local(local) = binding {
-                        *writes.entry(local).or_default() += 1;
-                    }
-                }),
-            ),
-        );
-    }
-    visit::visit_stmts(&proto.body.stmts, &mut tbc);
-    let mut excluded_homes = tbc.homes;
-    excluded_homes.extend(reads.captured_homes);
-    for local in (0..proto.local_count).map(LocalId) {
-        if proto
-            .local_debug_hints
-            .get(local.index())
-            .is_some_and(Option::is_some)
-            || proto
-                .local_debug_scopes
-                .get(local.index())
-                .is_some_and(Option::is_some)
-        {
-            excluded_homes.extend(
-                facts
-                    .complete_binding_home_slots(HirBinding::Local(local))
-                    .iter()
-                    .copied(),
-            );
-        }
-    }
-    let eligible = writes
-        .keys()
-        .copied()
-        .filter(|&local| {
-            let disposition_allowed = match proto.inline_dispositions.local(local) {
-                HirInlineDisposition::Unknown => true,
-                HirInlineDisposition::Preserve(reasons) => reasons
-                    .iter()
-                    .all(|reason| *reason == HirInlineRetentionReason::PhysicalFramePrefix),
-            };
-            disposition_allowed
-                && (proto.physical_root_locals.contains(&local)
-                    || proto.inline_dispositions.local(local).must_preserve())
-                && proto
-                    .local_debug_hints
-                    .get(local.index())
-                    .is_none_or(Option::is_none)
-                && proto
-                    .local_debug_scopes
-                    .get(local.index())
-                    .is_none_or(Option::is_none)
-                && facts
-                    .trusted_local_home_slot(local)
-                    .is_some_and(|home| !excluded_homes.contains(&home))
-        })
-        .collect::<BTreeSet<_>>();
-    let candidates = eligible
-        .iter()
-        .copied()
-        .filter(|local| writes.get(local) == Some(&1) && !reads.locals.contains(local))
-        .collect::<BTreeSet<_>>();
-    struct Rewrite<'a> {
-        candidates: &'a BTreeSet<LocalId>,
-        facts: &'a ProtoPromotionFacts,
-        safety: HirExprSafety,
-    }
-    impl HirRewritePass for Rewrite<'_> {
-        fn rewrite_stmt(&mut self, stmt: &mut HirStmt) -> bool {
-            let HirStmt::LocalDecl(decl) = stmt else {
-                return false;
-            };
-            let ([local], [value], None) = (
-                decl.bindings.as_slice(),
-                decl.values.fixed.as_mut_slice(),
-                &decl.values.tail,
-            ) else {
-                return false;
-            };
-            if !self.candidates.contains(local)
-                || !unused_primitive_evaluation_is_inert(self.safety, value)
-                || !self
-                    .facts
-                    .local_primitive_write_has_no_operand_scratch(*local, value)
-            {
-                // 候选拒绝[ProofIncomplete]：无读和纯值本身不证明原操作数 scratch 可省略；
-                // 未通过原布局证明的表达式继续保留，包括有高槽准备的比较。
-                return false;
-            }
-            *value = HirExpr::Nil;
-            decl.initializer_merge_transaction = None;
-            true
-        }
-    }
-    rewrite_proto(
-        proto,
-        &mut Rewrite {
-            candidates: &candidates,
-            facts,
-            safety,
-        },
-    );
-    if !reads.has_goto {
-        // 只处理函数根块的后写：其后的所有嵌套语句均已计入 last-read，结构化循环
-        // 无法回到循环外的该写。含 goto 的 owner 不凭词法次序证明动态最后一次读取。
-        for (index, stmt) in proto.body.stmts.iter_mut().enumerate() {
-            let HirStmt::Assign(assign) = stmt else {
-                continue;
-            };
-            let ([HirLValue::Local(local)], [value], None) = (
-                assign.targets.as_slice(),
-                assign.values.fixed.as_mut_slice(),
-                &assign.values.tail,
-            ) else {
-                continue;
-            };
-            if eligible.contains(local)
-                && reads
-                    .last_root_statement
-                    .get(local)
-                    .is_none_or(|last| *last < index)
-                && unused_primitive_evaluation_is_inert(safety, value)
-                && facts.local_primitive_write_has_no_operand_scratch(*local, value)
-            {
-                *value = HirExpr::Nil;
-                assign.generic_for_initializer_producer = None;
-            }
-        }
-    }
-}
-
-fn unused_primitive_evaluation_is_inert(safety: HirExprSafety, value: &HirExpr) -> bool {
-    safety.is_total_integer_literal_operation(value)
-        || (safety.is_discard_safe_without_residual(value) && safety.result_is_gc_inert(value))
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeadTempStage {
@@ -303,6 +111,7 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
     );
     protected_temps.extend(pending.temps);
     if stage == DeadTempStage::BeforeNativeFrames {
+        protected_temps.extend(promotion_facts.parallel_target_seeds());
         // 原无读 nil 仍可能是紧邻全局读取的低槽声明前缀，先交完整 scope 事务。
         // 不把 GC-inert 判定改成永久保留；Final 审理后仍执行原清理。
         protected_temps.extend(super::source_frames::pending_nil_prefix_temps(
@@ -1096,7 +905,18 @@ struct DeadTempPass<'a> {
 impl HirRewritePass for DeadTempPass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
         let mut changed = false;
+        let adjacent_handoffs = block
+            .stmts
+            .windows(2)
+            .enumerate()
+            .filter_map(|(index, pair)| {
+                adjacent_same_value_visible_handoff(pair, self.facts).map(|_| index)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut index = 0;
         block.stmts.retain_mut(|stmt| {
+            let current = index;
+            index += 1;
             let Some(temp) = dead_pure_temp_assignment(stmt, self.live_reads, self.safety) else {
                 return true;
             };
@@ -1104,6 +924,12 @@ impl HirRewritePass for DeadTempPass<'_> {
             // 候选拒绝[LayerBoundary]：HIR Preserve temp 的 definition 也不能由通用 dead-write owner 删除。
             if self.protected_temps.contains(&temp) {
                 return true;
+            }
+            if adjacent_handoffs.contains(&current) {
+                // 紧邻的同槽 visible 写完整承接这次 COPY；两句之间没有观察或入口，
+                // 因而即使位于回边区域也不需要“首次写 entry nil”的单次执行证明。
+                changed = true;
+                return false;
             }
             let HirStmt::Assign(assign) = stmt else {
                 unreachable!("dead temp candidate must remain an assignment")

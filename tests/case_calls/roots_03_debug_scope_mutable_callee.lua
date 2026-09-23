@@ -1,3 +1,5 @@
+-- unluac: expect-ast-count [[assign]] [[4]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=0]]
 -- 外层捕获 cell 被 __call 清空后，callee scratch 与局部对象仍须保留原 VM 的两个 GC 时点。
 local gc = collectgarbage
 local weak = setmetatable({}, { __mode = "v" })

@@ -8,7 +8,127 @@
 
 use std::collections::BTreeSet;
 
-use crate::hir::common::{HirBlock, HirStmt};
+use crate::hir::common::{HirBinding, HirBlock, HirExpr, HirStmt};
+
+/// 按原定义归属拆分同一次 nil 写，不跨过任何求值事件，也不新增初始化。
+pub(super) fn split_nil_prefix(
+    stmts: &mut Vec<HirStmt>,
+    prefix: &BTreeSet<HirBinding>,
+) -> Option<Vec<HirStmt>> {
+    let mut outer = Vec::new();
+    let mut inner = Vec::new();
+    let mut input = std::mem::take(stmts).into_iter();
+    while let Some(stmt) = input.next() {
+        // Entry nil 声明可以与首条 CLOSURE 一起发射；只拆其前导声明，真正的
+        // 指令及后继事件仍在全部 Start 边界之后，不能跨过它再搜 nil 写。
+        let leading_nil = match &stmt {
+            HirStmt::LocalDecl(decl) => {
+                decl.values.tail.is_none()
+                    && decl
+                        .values
+                        .fixed
+                        .iter()
+                        .all(|value| matches!(value, HirExpr::Nil))
+            }
+            HirStmt::Assign(assign) => {
+                assign.values.tail.is_none()
+                    && assign
+                        .values
+                        .fixed
+                        .iter()
+                        .all(|value| matches!(value, HirExpr::Nil))
+            }
+            HirStmt::LocalRootRelease(_) => true,
+            _ => false,
+        };
+        if !leading_nil {
+            inner.push(stmt);
+            inner.extend(input);
+            break;
+        }
+        match stmt {
+            HirStmt::LocalDecl(mut decl) => {
+                if decl.values.tail.is_some()
+                    || !decl
+                        .values
+                        .fixed
+                        .iter()
+                        .all(|value| matches!(value, HirExpr::Nil))
+                    || (!decl.values.fixed.is_empty()
+                        && decl.values.fixed.len() != decl.bindings.len())
+                {
+                    return None;
+                }
+                let initialized = !decl.values.fixed.is_empty();
+                let (outside, inside): (Vec<_>, Vec<_>) = decl
+                    .bindings
+                    .into_iter()
+                    .partition(|local| prefix.contains(&HirBinding::Local(*local)));
+                decl.bindings = inside;
+                decl.values.fixed = if initialized {
+                    vec![HirExpr::Nil; decl.bindings.len()]
+                } else {
+                    Vec::new()
+                };
+                if !outside.is_empty() {
+                    let mut before = decl.clone();
+                    before.bindings = outside;
+                    before.values.fixed = if initialized {
+                        vec![HirExpr::Nil; before.bindings.len()]
+                    } else {
+                        Vec::new()
+                    };
+                    outer.push(HirStmt::LocalDecl(before));
+                }
+                if !decl.bindings.is_empty() {
+                    inner.push(HirStmt::LocalDecl(decl));
+                }
+            }
+            HirStmt::Assign(mut assign) => {
+                if assign.values.tail.is_some()
+                    || assign.values.fixed.len() != assign.targets.len()
+                    || !assign
+                        .values
+                        .fixed
+                        .iter()
+                        .all(|value| matches!(value, HirExpr::Nil))
+                    || assign
+                        .targets
+                        .iter()
+                        .any(|target| HirBinding::from_lvalue(target).is_none())
+                {
+                    return None;
+                }
+                let (outside, inside): (Vec<_>, Vec<_>) =
+                    assign.targets.into_iter().partition(|target| {
+                        HirBinding::from_lvalue(target)
+                            .is_some_and(|binding| prefix.contains(&binding))
+                    });
+                assign.targets = inside;
+                assign.values.fixed = vec![HirExpr::Nil; assign.targets.len()];
+                if !outside.is_empty() {
+                    let mut before = assign.clone();
+                    before.targets = outside;
+                    before.values.fixed = vec![HirExpr::Nil; before.targets.len()];
+                    outer.push(HirStmt::Assign(before));
+                }
+                if !assign.targets.is_empty() {
+                    inner.push(HirStmt::Assign(assign));
+                }
+            }
+            HirStmt::LocalRootRelease(local) => {
+                if prefix.contains(&HirBinding::Local(local)) {
+                    outer.push(HirStmt::LocalRootRelease(local));
+                } else {
+                    inner.push(HirStmt::LocalRootRelease(local));
+                }
+            }
+            _ => return None,
+        }
+    }
+    *stmts = inner;
+    Some(outer)
+}
 
 #[derive(Default)]
 pub(super) struct PlannedBlock {

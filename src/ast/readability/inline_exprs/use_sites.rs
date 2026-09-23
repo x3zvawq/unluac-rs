@@ -17,7 +17,7 @@ use super::super::super::common::{
     AstTableField, AstTableKey,
 };
 use super::super::expr_analysis::{
-    direct_return_concat_cost, direct_return_logical_cost, expr_complexity,
+    constant_truthiness, direct_return_concat_cost, direct_return_logical_cost, expr_complexity,
     is_access_base_inline_expr, is_call_arg_constructor_inline_expr, is_context_safe_expr,
     is_direct_return_inline_expr, is_mechanical_run_inline_expr, is_multi_return_inline_expr,
 };
@@ -74,7 +74,7 @@ pub(super) fn rewrite_stmt_use_sites_with_policy(
             options,
             policy,
         ),
-        AstStmt::If(if_stmt) => rewrite_expr_use_sites(
+        AstStmt::If(if_stmt) => rewrite_test_use_sites(
             &mut if_stmt.cond,
             candidate,
             replacement,
@@ -82,7 +82,7 @@ pub(super) fn rewrite_stmt_use_sites_with_policy(
             options,
             policy,
         ),
-        AstStmt::While(while_stmt) => rewrite_expr_use_sites(
+        AstStmt::While(while_stmt) => rewrite_test_use_sites(
             &mut while_stmt.cond,
             candidate,
             replacement,
@@ -90,7 +90,7 @@ pub(super) fn rewrite_stmt_use_sites_with_policy(
             options,
             policy,
         ),
-        AstStmt::Repeat(repeat_stmt) => rewrite_expr_use_sites(
+        AstStmt::Repeat(repeat_stmt) => rewrite_test_use_sites(
             &mut repeat_stmt.cond,
             candidate,
             replacement,
@@ -258,7 +258,7 @@ pub(super) fn rewrite_condition_use_sites_with_policy(
     options: ReadabilityOptions,
     policy: InlinePolicy,
 ) -> bool {
-    rewrite_top_level_expr_use_sites(
+    rewrite_test_use_sites(
         condition,
         candidate,
         replacement,
@@ -493,6 +493,44 @@ fn try_rewrite_raw_global_call_arg(
     true
 }
 
+fn rewrite_test_use_sites(
+    expr: &mut AstExpr,
+    candidate: InlineCandidate,
+    replacement: &AstExpr,
+    site: InlineSite,
+    options: ReadabilityOptions,
+    policy: InlinePolicy,
+) -> bool {
+    if constant_truthiness(replacement).is_none() {
+        return rewrite_expr_use_sites(expr, candidate, replacement, site, options, policy);
+    }
+    if matches!(expr, AstExpr::Var(name) if candidate.binding().matches_name_ref(name)) {
+        // 候选拒绝[PolicyBoundary]：原 binding 仍是 TEST 的输入；替换成已知真值会让
+        // 后续整理或目标编译器删除显式检查。无副作用不等于获准删掉原控制边。
+        return false;
+    }
+    // 随原 use-site 遍历传播 TEST 上下文，不对每层短路树重新扫描整个子树。
+    let child_site = site.descend_value_expr();
+    let rewrite = |child: &mut AstExpr| {
+        rewrite_test_use_sites(child, candidate, replacement, child_site, options, policy)
+    };
+    match expr {
+        AstExpr::SingleValue(value) => rewrite(value),
+        AstExpr::Unary(unary) if unary.op == super::super::super::common::AstUnaryOpKind::Not => {
+            rewrite(&mut unary.expr)
+        }
+        AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
+            rewrite(&mut logical.lhs) | rewrite(&mut logical.rhs)
+        }
+        AstExpr::IfExpr(branch) => {
+            rewrite(&mut branch.cond)
+                | rewrite(&mut branch.then_expr)
+                | rewrite(&mut branch.else_expr)
+        }
+        _ => rewrite_expr_use_sites(expr, candidate, replacement, site, options, policy),
+    }
+}
+
 fn rewrite_expr_use_sites(
     expr: &mut AstExpr,
     candidate: InlineCandidate,
@@ -507,6 +545,27 @@ fn rewrite_expr_use_sites(
     }
 
     match expr {
+        AstExpr::IfExpr(branch) => {
+            let mut changed = rewrite_test_use_sites(
+                &mut branch.cond,
+                candidate,
+                replacement,
+                site.descend_value_expr(),
+                options,
+                policy,
+            );
+            for child in [&mut branch.then_expr, &mut branch.else_expr] {
+                changed |= rewrite_expr_use_sites(
+                    child,
+                    candidate,
+                    replacement,
+                    site.descend_value_expr(),
+                    options,
+                    policy,
+                );
+            }
+            changed
+        }
         AstExpr::FieldAccess(access) => rewrite_expr_use_sites(
             &mut access.base,
             candidate,
@@ -533,6 +592,16 @@ fn rewrite_expr_use_sites(
                 policy,
             );
             changed
+        }
+        AstExpr::Unary(unary) if unary.op == super::super::super::common::AstUnaryOpKind::Not => {
+            rewrite_test_use_sites(
+                &mut unary.expr,
+                candidate,
+                replacement,
+                site.descend_value_expr(),
+                options,
+                policy,
+            )
         }
         AstExpr::Unary(unary) => rewrite_expr_use_sites(
             &mut unary.expr,
@@ -570,7 +639,7 @@ fn rewrite_expr_use_sites(
             changed
         }
         AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) => {
-            let mut changed = rewrite_expr_use_sites(
+            let mut changed = rewrite_test_use_sites(
                 &mut logical.lhs,
                 candidate,
                 replacement,

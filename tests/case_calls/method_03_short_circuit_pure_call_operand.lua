@@ -4,6 +4,10 @@
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[::L]]
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-decl]] [[3]] [[@proto=0]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=0]]
+-- unluac: expect-ast-count [[local-function]] [[1]] [[@proto=0]]
+-- unluac: expect-ast-count [[table-record-field]] [[11]] [[@proto=0]]
 local settingsWrapper = {
     bought = true,
 }

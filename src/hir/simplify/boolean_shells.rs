@@ -1,25 +1,16 @@
-//! 删除失去值物化职责的布尔分支壳，或将其收回单条赋值。
+//! 将布尔物化分支收回赋值，同时保留原条件检查和目标写入。
 //!
-//! 消费已有 HIR 决策、目标方言的值/安全事实及 binding/root 身份；不重新判断
-//! branch/loop 是否可结构化。死壳删除还须由 old_values 证明旧值与观察者生命周期。
-//! 例如 if c then t=true else t=false end 在条件和值域证明成立时可收成
-//! t=c or false；无读取也不能单独证明整段可以删除。
-
-mod old_values;
-
-use old_values::OldValueFacts;
-
-use std::collections::BTreeSet;
+//! 消费现有 HIR 决策、debug 初始化区间与物理帧约束；即使结果无后续读取，
+//! 也不能整段删除原分支。高槽 CALL 的布尔写回仍交给完整调用帧 owner。
 
 use crate::hir::common::{
     HirAssign, HirBinaryOpKind, HirBlock, HirDebugScope, HirExpr, HirIf, HirLValue, HirLocalDecl,
     HirLogicalExpr, HirProto, HirSourceSite, HirStmt, HirUnaryExpr, HirUnaryOpKind, HirValuePack,
     LocalId,
 };
-use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::ProtoPromotionFacts;
 
-use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
+use super::expr_facts::expr_is_boolean_valued;
 use super::local_shapes::empty_single_local_decl_binding;
 use super::mention::expr_mentions_local;
 use super::walk::{HirRewritePass, rewrite_block};
@@ -27,20 +18,16 @@ use super::walk::{HirRewritePass, rewrite_block};
 pub(super) fn remove_boolean_materialization_shells_in_proto(
     proto: &mut HirProto,
     promotion_facts: &ProtoPromotionFacts,
-    safety: HirExprSafety,
 ) -> bool {
     let facts = BooleanShellFacts {
-        temp_debug_hints: &proto.temp_debug_locals,
         local_debug_hints: &proto.local_debug_hints,
         local_debug_scopes: &proto.local_debug_scopes,
         debug_scopes: &proto.debug_scopes,
-        physical_root_locals: &proto.physical_root_locals,
+        inline_dispositions: &proto.inline_dispositions,
         promotion_facts,
     };
-    let old_value_plan = old_values::DeadShellPlan::collect(proto, &facts, safety);
-    let old_value_changed = old_value_plan.apply(&mut proto.body);
     let mut pass = BooleanShellPass { facts: &facts };
-    old_value_changed | rewrite_block(&mut proto.body, &mut pass)
+    rewrite_block(&mut proto.body, &mut pass)
 }
 
 struct BooleanShellPass<'a> {
@@ -54,129 +41,30 @@ impl HirRewritePass for BooleanShellPass<'_> {
 }
 
 struct BooleanShellFacts<'a> {
-    temp_debug_hints: &'a [Option<String>],
     local_debug_hints: &'a [Option<String>],
     local_debug_scopes: &'a [Option<usize>],
     debug_scopes: &'a [Option<HirDebugScope>],
-    physical_root_locals: &'a BTreeSet<LocalId>,
+    inline_dispositions: &'a crate::hir::HirInlineDispositions,
     promotion_facts: &'a ProtoPromotionFacts,
-}
-
-struct DeadWriteProof<'a> {
-    live_after: &'a old_values::LiveBindingState,
-    adjacent_nil_local: Option<LocalId>,
-    old_values: &'a OldValueFacts,
-}
-
-impl BooleanShellFacts<'_> {
-    fn target_write_is_unobservable(
-        &self,
-        target: &HirLValue,
-        written_value_is_gc_inert: bool,
-        proof: &DeadWriteProof<'_>,
-    ) -> bool {
-        match target {
-            HirLValue::Temp(temp) => {
-                // 候选拒绝[SemanticBarrier:DebugScope]：debug temp 是 IR 已保留的源码 binding；删除其分支写入会抹掉该 source identity。
-                if matches!(self.temp_debug_hints.get(temp.index()), Some(Some(_))) {
-                    return false;
-                }
-                if !written_value_is_gc_inert {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：把对象引用写入 raw home 会建立新的 VM root；删除死写可能让该对象在后续显式 GC 中提前终结。
-                    return false;
-                }
-                let homes = self.promotion_facts.complete_temp_home_slots(*temp);
-                for home in homes.iter() {
-                    if proof.live_after.homes.contains(home) {
-                        // 候选拒绝[SemanticBarrier:ValueFlow]：shell 外仍通过同一 trusted home 的 param/local 读取布尔写；仅检查 target TempId 会漏掉该观察者。
-                        return false;
-                    }
-                    match proof.old_values.home(*home) {
-                        OldValueClass::GcInert => {
-                            // 候选接受：所有 reaching path 上该 raw home 的旧值均为 nil/primitive；布尔新值也不承载 GC root。
-                        }
-                        OldValueClass::Unknown => {
-                            // 候选拒绝[SemanticBarrier:Lifetime]：`regress_342_boolean_shell_local_gc_lifetime` 命中该 raw-home 路径；删除覆盖写会让未分类的旧对象跨显式 GC 继续存活。
-                            return false;
-                        }
-                        OldValueClass::MayCarryResource => {
-                            // 候选拒绝[SemanticBarrier:Lifetime]：regress_342 local-gc 中 reaching old value 是可终结的 call result；删除覆盖写会让它跨显式 GC 继续存活。
-                            return false;
-                        }
-                    }
-                }
-                // 候选拒绝[SemanticBarrier:ValueFlow]：shell 后仍有路径读取该 temp 时，删除写入会改变后续值；CFG live-out 会排除只发生在 shell 前的读取，并合流循环回边。
-                !proof.live_after.temps.contains(temp)
-            }
-            HirLValue::Local(local) => {
-                if !written_value_is_gc_inert {
-                    // 候选拒绝[SemanticBarrier:Lifetime]：把对象引用写入 local 会建立新的可见 root；删除死写可能让该对象在后续显式 GC 中提前终结。
-                    return false;
-                }
-                // 候选拒绝[SemanticBarrier:DebugScope]：retain-debug local 是 IR 已保留的源码 binding；删除显式分支写入会抹掉该 source identity。
-                if matches!(self.local_debug_hints.get(local.index()), Some(Some(_))) {
-                    return false;
-                }
-                // 候选拒绝[SemanticBarrier:Lifetime]：物理根 local 的写入决定可观察的 GC 存活区间，不能按普通死值删除。
-                if self.physical_root_locals.contains(local) {
-                    return false;
-                }
-                let homes = self.promotion_facts.complete_local_home_slots(*local);
-                for home in homes.iter() {
-                    if proof.live_after.homes.contains(home) {
-                        // 候选拒绝[SemanticBarrier:ValueFlow]：candidate local 的 possible-home 与后续 param/local 读取相交时，raw cell 上的布尔写仍可见；只查 LocalId 会漏掉合流后的别名。
-                        return false;
-                    }
-                }
-                if proof.adjacent_nil_local == Some(*local) {
-                    // 候选接受：紧邻空声明已把旧值确定为 nil；域外无读取/capture，删除布尔写不会改变值流或 GC root 生命周期。
-                    return !proof.live_after.locals.contains(local);
-                }
-                match proof.old_values.local(*local) {
-                    OldValueClass::GcInert => {
-                        // 候选接受：所有 reaching path 都证明旧值为 nil/primitive；域外无读取/capture，删除布尔写不会改变值流或 GC root 生命周期。
-                        !proof.live_after.locals.contains(local)
-                    }
-                    OldValueClass::Unknown => {
-                        // 候选拒绝[SemanticBarrier:Lifetime]：未分类旧值可能是 `regress_342_boolean_shell_local_gc_lifetime` 同类可终结对象；删除覆盖写会延长其 root 生命周期。
-                        false
-                    }
-                    OldValueClass::MayCarryResource => {
-                        // 候选拒绝[SemanticBarrier:Lifetime]：regress_342 local-gc 的 reaching old value 是可终结对象，删除覆盖写会推迟显式 GC 可观察的释放。
-                        false
-                    }
-                }
-            }
-            HirLValue::Param(_) => {
-                // 候选拒绝[SemanticBarrier:Lifetime]：regress_342 中参数写入会释放任意可回收实参；即使没有值读取，删除写入仍会推迟 GC。
-                false
-            }
-            // 候选拒绝[SemanticBarrier:ValueFlow]：upvalue 写入可被共享该 cell 的 closure 观察，不能由当前 proto 的读取数证明为死写。
-            HirLValue::Upvalue(_) => false,
-            // 候选拒绝[SemanticBarrier:Metamethod]：global 写入会更新外部环境，并可能触发环境表的 `__newindex`。
-            HirLValue::Global(_) => false,
-            // 候选拒绝[SemanticBarrier:Metamethod]：table 写入会更新外部对象，并可能触发目标表的 `__newindex`。
-            HirLValue::TableAccess(_) => false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OldValueClass {
-    GcInert,
-    MayCarryResource,
-    Unknown,
 }
 
 fn collapse_live_boolean_materialization_shells_in_block(
     block: &mut HirBlock,
     facts: &BooleanShellFacts,
 ) -> bool {
-    let mut retained = 0;
+    let mut retained: usize = 0;
     let mut changed = false;
     for index in 0..block.stmts.len() {
-        if let Some((target, value)) =
-            collapse_live_boolean_materialization_shell(&mut block.stmts[index])
+        let needs_call_frame = boolean_shell_has_high_call_result(
+            &block.stmts[index],
+            retained
+                .checked_sub(1)
+                .map(|previous| &block.stmts[previous]),
+            facts.promotion_facts,
+        );
+        if !needs_call_frame
+            && let Some((target, value)) =
+                collapse_live_boolean_materialization_shell(&mut block.stmts[index], facts)
         {
             changed = true;
             if retained > 0
@@ -194,6 +82,10 @@ fn collapse_live_boolean_materialization_shells_in_block(
             }
 
             block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
+                luau_compound_global: false,
+                upvalue_write_source: None,
+                is_phi_transfer: false,
+                parallel_nil_frame: None,
                 targets: vec![target],
                 values: HirValuePack::fixed(vec![value]),
                 initializer_merge_transaction: None,
@@ -213,11 +105,84 @@ fn collapse_live_boolean_materialization_shells_in_block(
     changed
 }
 
+fn boolean_shell_has_high_call_result(
+    stmt: &HirStmt,
+    previous: Option<&HirStmt>,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let HirStmt::If(if_) = stmt else {
+        return false;
+    };
+    let Some([(target, HirExpr::Boolean(_)), (other, HirExpr::Boolean(_))]) =
+        fixed_assign_arms(if_)
+    else {
+        return false;
+    };
+    if target != other {
+        return false;
+    }
+    let home = match target {
+        HirLValue::Local(local) => facts.trusted_local_home_slot(*local),
+        HirLValue::Param(param) => facts.trusted_param_home_slot(*param),
+        _ => None,
+    };
+    let Some(home) = home else {
+        return false;
+    };
+    let mut subject = &if_.cond;
+    while let HirExpr::Unary(unary) = subject
+        && unary.op == HirUnaryOpKind::Not
+        && unary.source_site.is_none()
+    {
+        subject = &unary.expr;
+    }
+    let value = match (subject, previous) {
+        (HirExpr::Call(_), _) => subject,
+        (HirExpr::TempRef(temp), Some(previous)) => {
+            let Some((producer, value)) = previous.scalar_temp_assignment() else {
+                return false;
+            };
+            if producer != *temp {
+                return false;
+            }
+            value
+        }
+        (HirExpr::LocalRef(local), Some(HirStmt::LocalDecl(decl)))
+            if decl.bindings.as_slice() == [*local]
+                && decl.values.tail.is_none()
+                && decl.values.fixed.len() == 1 =>
+        {
+            &decl.values.fixed[0]
+        }
+        (HirExpr::LocalRef(local), Some(HirStmt::Assign(assign)))
+            if assign.targets.as_slice() == [HirLValue::Local(*local)]
+                && assign.values.tail.is_none()
+                && assign.values.fixed.len() == 1 =>
+        {
+            &assign.values.fixed[0]
+        }
+        _ => return false,
+    };
+    let HirExpr::Call(call) = value else {
+        return false;
+    };
+    // 候选拒绝[LayerBoundary]：低槽 Boolean 写回与高槽 CALL 是同一 TEST 帧。
+    // 保留控制头供 native-call-frames 原位消费准备，不能先改成会覆盖结果的双 NOT。
+    facts
+        .native_call_frame(call)
+        .is_some_and(|frame| home.slot() < frame.home.slot())
+}
+
 fn declaration_can_absorb_boolean_shell(
     local: LocalId,
     value: &HirExpr,
     facts: &BooleanShellFacts,
 ) -> bool {
+    if facts.inline_dispositions.local(local).must_preserve() {
+        // 候选拒绝[LayerBoundary]：原 TEST 的低槽目标可能承担高槽 CALL 的前缀；
+        // 原位 Boolean 写回不授权把声明移到调用之后或改变 CALL 的结果槽。
+        return false;
+    }
     // 候选拒绝[SemanticBarrier:Scope]：regress_342 retain-debug 证明条件中的调用能观察到原声明；合并会把 debug 作用域起点后移。
     if matches!(facts.local_debug_hints.get(local.index()), Some(Some(_)))
         && !debug_branch_initializer_matches(local, value, facts)
@@ -282,13 +247,24 @@ fn boolean_predicate_source(value: &HirExpr) -> Option<HirSourceSite> {
     }
 }
 
-fn collapse_live_boolean_materialization_shell(stmt: &mut HirStmt) -> Option<(HirLValue, HirExpr)> {
+fn collapse_live_boolean_materialization_shell(
+    stmt: &mut HirStmt,
+    facts: &BooleanShellFacts,
+) -> Option<(HirLValue, HirExpr)> {
     let HirStmt::If(if_stmt) = stmt else {
         return None;
     };
     let [(then_target, then_value), (else_target, else_value)] = fixed_assign_arms(if_stmt)?;
     if then_target != else_target {
         // 候选拒绝[SemanticBarrier:ValueFlow]：same-home 不代表可见 binding 等价；统一 local/param 写入会改变分支结果。
+        return None;
+    }
+    if let HirLValue::Local(local) = then_target
+        && matches!(facts.inline_dispositions.local(*local), crate::hir::HirInlineDisposition::Preserve(reasons)
+            if reasons.contains(&crate::hir::HirInlineRetentionReason::PhysicalFramePrefix))
+    {
+        // 候选拒绝[ProofIncomplete:RootLifetime]：低目标与高 scratch 的 TEST 写回需要
+        // 完整帧 owner；单独改成值表达式会改变下一轮编译的 CALL 结果槽和根退休点。
         return None;
     }
     // 候选拒绝[SemanticBarrier:EvalOrder]：regress_249 中 table 左值会把地址求值移出已选分支，条件改写的 holder 因而指向不同 table。
@@ -314,59 +290,6 @@ fn collapse_live_boolean_materialization_shell(stmt: &mut HirStmt) -> Option<(Hi
         }))
     };
     Some((target, value))
-}
-
-fn removable_dead_materialization_shell(
-    stmt: &HirStmt,
-    facts: &BooleanShellFacts,
-    adjacent_nil_local: Option<LocalId>,
-    old_values: &OldValueFacts,
-    live_after: &old_values::ShellArmLiveOut,
-    safety: HirExprSafety,
-) -> bool {
-    let HirStmt::If(if_stmt) = stmt else {
-        return false;
-    };
-    let Some([(then_target, then_value), (else_target, else_value)]) = fixed_assign_arms(if_stmt)
-    else {
-        return false;
-    };
-    let truthiness = expr_truthiness(&if_stmt.cond, safety);
-    let then_write_is_unobservable = truthiness == Some(false)
-        || facts.target_write_is_unobservable(
-            then_target,
-            safety.result_is_gc_inert(then_value),
-            &DeadWriteProof {
-                live_after: &live_after.then_arm,
-                adjacent_nil_local,
-                old_values,
-            },
-        );
-    let else_write_is_unobservable = truthiness == Some(true)
-        || facts.target_write_is_unobservable(
-            else_target,
-            safety.result_is_gc_inert(else_value),
-            &DeadWriteProof {
-                live_after: &live_after.else_arm,
-                adjacent_nil_local,
-                old_values,
-            },
-        );
-    if !then_write_is_unobservable || !else_write_is_unobservable {
-        return false;
-    }
-    // 候选拒绝[SemanticBarrier:EvalCount]：删除 `if f() then t=true else t=false end` 会漏掉仍需执行一次的 `f()`。
-    // 候选拒绝[SemanticBarrier:Metamethod]：LuaJIT cdata 与 primitive 的 equality 可能调用 ctype `__eq`；删除布尔壳会漏掉这次调用（regress_391）。
-    // 候选拒绝[PolicyBoundary]：项目在 permissive 输出中保留 Unresolved 诊断，不能随
-    // 死布尔壳静默删除失败证据。
-    if !safety.is_discard_safe_without_residual(&if_stmt.cond) {
-        return false;
-    }
-
-    // 候选拒绝[SemanticBarrier:EvalCount]：死 binding 的 `t=f()` 仍必须调用一次 `f()`，不能随布尔壳一起丢弃。
-    // 候选拒绝[PolicyBoundary]：任一 arm 的 Unresolved 都是 permissive 输出保留的失败证据。
-    (truthiness == Some(false) || safety.is_discard_safe_without_residual(then_value))
-        && (truthiness == Some(true) || safety.is_discard_safe_without_residual(else_value))
 }
 
 fn fixed_assign_arms(if_stmt: &HirIf) -> Option<[(&HirLValue, &HirExpr); 2]> {
@@ -409,7 +332,9 @@ fn booleanized_truthiness_expr(cond: HirExpr) -> HirExpr {
         cond
     } else {
         HirExpr::LogicalOr(Box::new(HirLogicalExpr {
+            preserves_boolean_prewrite: false,
             lhs: HirExpr::LogicalAnd(Box::new(HirLogicalExpr {
+                preserves_boolean_prewrite: false,
                 lhs: cond,
                 rhs: HirExpr::Boolean(true),
             })),

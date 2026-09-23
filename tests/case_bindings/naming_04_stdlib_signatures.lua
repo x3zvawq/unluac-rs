@@ -1,10 +1,9 @@
 -- 实参角色只在 heuristic 下参与命名，且不覆盖 debug 或业务字段提供的更具体名字。
 -- unluac: expect-name [[local:0]] [[format]] [[@naming-mode=heuristic]] [[@debug=stripped]]
 -- unluac: expect-name [[local:1]] [[time]] [[@naming-mode=heuristic]] [[@debug=stripped]]
--- unluac: expect-name [[local:0]] [[fmt]] [[@debug=retained]] [[@dialect=lua5.4]]
--- unluac: expect-name [[local:1]] [[epoch]] [[@debug=retained]] [[@dialect=lua5.4]]
--- unluac: expect-name [[local:1]] [[fmt]] [[@debug=retained]] [[@dialect=luau]]
--- unluac: expect-name [[local:2]] [[epoch]] [[@debug=retained]] [[@dialect=luau]]
+-- unluac: expect-name [[local:0]] [[fmt]] [[@debug=retained]]
+-- unluac: expect-name [[local:1]] [[epoch]] [[@debug=retained]]
+-- unluac: expect-not-contains [[local function naming_inputs]] [[@debug=retained]]
 -- unluac: expect-contains [[local fmt, epoch]] [[@debug=retained]]
 -- unluac: expect-name [[local:0]] [[value]] [[@naming-mode=simple]] [[@debug=stripped]] [[@dialect=lua5.4]]
 -- unluac: expect-name [[local:0]] [[r0_0]] [[@naming-mode=debug-like]] [[@debug=stripped]] [[@dialect=lua5.4]]

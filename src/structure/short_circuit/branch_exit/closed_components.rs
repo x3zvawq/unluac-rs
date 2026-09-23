@@ -53,7 +53,7 @@ pub(in crate::structure::short_circuit) fn analyze_closed_control_dag_candidates
     candidates
 }
 
-/// 把互相直连、最终只有两个源码 arm 的 branch component 冻结成一个条件 DAG。
+/// 把经单入口 connector 相连、最终只有两个源码 arm 的 branch component 冻结成条件 DAG。
 ///
 /// 普通 branch 候选会把共享 continuation 的复合条件拆成多个同层 `if`。这里先排除
 /// loop、不可规约区域和值 decision，再对剩余 branch 图做一次弱连通分量扫描；每个
@@ -172,15 +172,37 @@ pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
             continue;
         };
         let make_arc = |truthy: bool, edge: EdgeRef| {
-            let target = cfg.edges[edge.index()].to;
+            let mut target = cfg.edges[edge.index()].to;
+            let mut edges = vec![edge];
+            let mut connector_blocks = Vec::new();
+            // 单前驱 connector 只属于一条 decision arc，遍历成本不随候选数量放大。
+            // 共享判断则不能按前驱数量截断；完整分量仍需通过单入口、无环和两出口证明。
+            while target != cfg.exit_block
+                && !blocked[target.index()]
+                && !loop_control[target.index()]
+                && loop_owner[target.index()] == loop_owner[block.index()]
+                && !eligible[target.index()]
+                && reachable_predecessor_count(cfg, target) == 1
+                && super::super::shared::block_is_passthrough(proto, cfg, target)
+            {
+                let [next] = cfg.succs[target.index()].as_slice() else {
+                    break;
+                };
+                connector_blocks.push(target);
+                edges.push(*next);
+                target = cfg.edges[next.index()].to;
+            }
             RawConditionArc {
                 source: block,
                 truthy,
-                edges: vec![edge],
-                connector_blocks: Vec::new(),
+                edges,
+                connector_blocks,
                 target: if eligible.get(target.index()).copied().unwrap_or(false)
                     && loop_owner[target.index()] == loop_owner[block.index()]
-                    && reachable_predecessor_count(cfg, target) == 1
+                    // 循环内多入口还可能汇合 break 和尾条件；在 loop owner 发布该
+                    // 边界前，不能把整段当成一个普通分支条件。单入口链沿用原合同。
+                    && (loop_owner[target.index()].is_none()
+                        || reachable_predecessor_count(cfg, target) == 1)
                 {
                     RawConditionTarget::Node(target)
                 } else {

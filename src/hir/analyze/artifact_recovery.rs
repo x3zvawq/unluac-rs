@@ -142,6 +142,9 @@ impl HirRewritePass for ProtoRefRewrite {
 
     fn rewrite_lvalue(&mut self, target: &mut crate::hir::common::HirLValue) -> bool {
         match target {
+            crate::hir::common::HirLValue::Global(global) => {
+                self.rewrite_operation_sources(&mut global.sources)
+            }
             crate::hir::common::HirLValue::TableAccess(access) => {
                 self.rewrite_operation_sources(&mut access.sources)
             }

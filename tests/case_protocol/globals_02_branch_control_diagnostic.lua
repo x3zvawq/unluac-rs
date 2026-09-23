@@ -1,6 +1,7 @@
--- Lua 5.5 global 声明只在执行到 initializer 时运行 ERRNNIL；恒定未选 arm 不会执行，
--- 且声明的词法效力不越过该 arm；外层 flag 事实不能消去内层显式检查和尾部声明。
--- unluac: expect-not-contains [[global unreachable_export]]
+-- 恒定未选 arm 不执行 ERRNNIL，但字节码仍有 TEST 和受其控制的 global initializer；
+-- 不能据常量或外层 flag 删除原检查、未选 arm 和尾部声明。
+-- unluac: expect-contains [[global unreachable_export]]
+-- unluac: expect-ast-count [[if]] [[1]] [[@proto=1]]
 -- unluac: expect-contains [[global tail_export]]
 
 local function unreachable_arm()

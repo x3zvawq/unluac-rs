@@ -9,6 +9,16 @@ local function test_assignments()
 end
 
 -- common_01_basics#2: do-end块作用域与变量遮蔽
+-- 内层声明结束后，复用低槽的调用仍应保持完整。
+-- unluac: expect-count [[print("common_01_basics#2",]] [[2]]
+-- 初始化应直接给出拼接值；LuaJIT 的子函数编号与 PUC/Luau 相反。
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=2]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[assign]] [[0]] [[@proto=5]] [[@dialect=luajit]]
 local function test_locals_and_blocks()
     local name = "outer"
 
@@ -34,6 +44,15 @@ local function test_alias_mutation()
 end
 
 -- common_01_basics#4: 多层嵌套变量遮蔽与条件返回
+-- unluac: expect-count [[print("common_01_basics#4",]] [[3]]
+-- stripped 仍更新原低槽变量，不为 CONCAT 写回增加局部副本。
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=5]] [[@dialect=luau]]
+-- unluac: expect-ast-max [[local-decl]] [[2]] [[@debug=stripped]] [[@proto=3]] [[@dialect=luajit]]
 local function test_shadowed_locals()
     local function choose(flag)
         local value = "root"
@@ -60,6 +79,7 @@ local function test_shadowed_locals()
 end
 
 -- common_01_basics#5: 数值for循环控制变量不可变性
+-- unluac: expect-count [[print("common_01_basics#5",]] [[1]]
 local function test_for_rebound()
     local start, stop, step = 1, 7, 2
     local values = {}

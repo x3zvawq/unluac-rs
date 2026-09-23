@@ -136,6 +136,32 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_assign(&self, assign: &AstAssign, function: HirProtoRef) -> Result<Doc, GenerateError> {
+        if assign.luau_compound_global {
+            if self.target.version != crate::ast::DecompileDialect::Luau {
+                return Err(GenerateError::UnsupportedFeature {
+                    dialect: self.target.version,
+                    feature: "compound assignment",
+                });
+            }
+            let binary = assign
+                .compound_global_binary()
+                .ok_or(GenerateError::UnprovenCompoundAssignment)?;
+            use crate::ast::AstBinaryOpKind;
+            let operator = match binary.op {
+                AstBinaryOpKind::Add => " += ",
+                AstBinaryOpKind::Sub => " -= ",
+                AstBinaryOpKind::Mul => " *= ",
+                AstBinaryOpKind::Div => " /= ",
+                AstBinaryOpKind::Mod => " %= ",
+                AstBinaryOpKind::Pow => " ^= ",
+                _ => return Err(GenerateError::UnprovenCompoundAssignment),
+            };
+            return Ok(Doc::concat([
+                self.emit_lvalue(&assign.targets[0], function)?,
+                Doc::text(operator),
+                self.emit_expr(&binary.rhs, function, 0, ExprSide::Standalone)?,
+            ]));
+        }
         let targets = assign
             .targets
             .iter()
@@ -320,7 +346,7 @@ impl<'a> Emitter<'a> {
     ) -> Result<Doc, GenerateError> {
         let target = self.emit_function_name(&function_decl.target, function)?;
         let header = Doc::concat([
-            Doc::text(if self.function_decl_is_global(function_decl) {
+            Doc::text(if function_decl.global_declaration {
                 "global function "
             } else {
                 "function "

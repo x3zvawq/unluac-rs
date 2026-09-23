@@ -227,6 +227,7 @@ impl ConditionSafetyWorkspace {
             value_headers: candidates
                 .iter()
                 .filter(|candidate| matches!(candidate.exit, ShortCircuitExit::ValueMerge(_)))
+                .filter(|candidate| !candidate.is_value_operand_only())
                 .map(|candidate| candidate.header)
                 .collect(),
             epoch: 0,
@@ -320,6 +321,20 @@ pub(super) fn block_has_unabsorbed_effects(
         // 候选拒绝[SemanticBarrier:NamedRootWrite]：和值判定共享原 local 写入边界，
         // 不能在 value DAG 被拒绝后由 condition DAG 再吸收同一写入（regress_578）。
         instr_writes_source_binding(proto, dataflow, InstrRef(index))
+            // 候选拒绝[SemanticBarrier:EvaluationCount]：谓词依赖闭包只证明
+            // producer 被使用，不证明它只被使用一次。条件内没有共享值声明，
+            // 吸收多用的 CALL/GETTABLE 或计算会让 HIR 在每个读取处重新求值。
+            // 字面量与透明 COPY 没有独立求值事件；其上游 producer 仍逐一定义检查。
+            || (!matches!(proto.instrs[index],
+                LowInstr::LoadNil(_) | LowInstr::LoadBool(_) | LowInstr::LoadConst(_)
+                    | LowInstr::LoadInteger(_) | LowInstr::LoadNumber(_) | LowInstr::Move(_))
+                && dataflow.instr_defs[index].iter().any(|def| {
+                    dataflow.def_uses[def.index()].len() > 1
+                        || dataflow.def_uses[def.index()].first().is_some_and(|site| {
+                            dataflow.instr_effects[site.instr.index()].repeats_fixed_use(site.reg)
+                        })
+                        || !dataflow.def_phi_uses[def.index()].is_empty()
+                }))
             || dataflow.effect_summaries.get(index).is_none_or(|summary| {
                 summary.has_effect_tags() && !workspace.needs_instr(InstrRef(index))
             })

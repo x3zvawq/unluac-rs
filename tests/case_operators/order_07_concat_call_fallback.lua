@@ -1,6 +1,13 @@
 -- CALL 的单值结果与短路备用值共用原 CONCAT 操作数槽。
 -- unluac: expect-not-contains [[= string.match]]
 -- unluac: expect-contains [[.. (string.match(]]
+-- unluac: expect-ast-count [[local-decl]] [[0]] [[@proto=5]] [[@dialect=lua5.4]]
+-- unluac: expect-contains [[return "<" .. (p5_0() and p5_1) .. ">"]] [[@dialect=lua5.4]] [[@debug=stripped]]
+-- unluac: expect-contains [[return "<" .. (call() and fallback) .. ">"]] [[@dialect=lua5.4]] [[@debug=retained]]
+-- unluac: expect-contains [[print("regress_639_concat_call_fallback", r0_0("plain"), r0_1())]] [[@dialect=lua5.4]] [[@debug=stripped]]
+-- unluac: expect-contains [[print("regress_639_concat_call_fallback", handler("plain"), fallback_after_call())]] [[@dialect=lua5.4]] [[@debug=retained]]
+-- unluac: expect-contains [[return "<" .. (r10_1() or r10_0) .. ">"]] [[@dialect=lua5.4]] [[@debug=stripped]]
+-- unluac: expect-contains [[return "<" .. (replace() or snapshot) .. ">"]] [[@dialect=lua5.4]] [[@debug=retained]]
 local function handler(err)
     return "handled<" .. (string.match(err, "boom:[^>]+") or err) .. ">"
 end

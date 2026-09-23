@@ -48,6 +48,12 @@ use crate::hir::visit::{HirVisitor, visit_expr, visit_stmts};
 
 const NESTED_INLINE_MAX_COMPLEXITY: usize = 5;
 const CONTROL_HEAD_INLINE_MAX_COMPLEXITY: usize = 5;
+
+pub(super) struct InlineModuleFacts<'a> {
+    pub(super) substantial_closure_bodies: &'a [bool],
+    pub(super) inert_call_results: &'a BTreeSet<TempId>,
+}
+
 struct TempInlineWorkspace<'a> {
     uses: TempUseScratch,
     order_sensitive_defs: OrderSensitiveDefWorkspace,
@@ -56,7 +62,7 @@ struct TempInlineWorkspace<'a> {
     dialect: DecompileDialect,
     safety: HirExprSafety,
     readability: ReadabilityOptions,
-    substantial_closure_bodies: &'a [bool],
+    module: InlineModuleFacts<'a>,
     physical_root_temps: Vec<bool>,
     new_physical_root_temps: BTreeSet<TempId>,
     inline_dispositions: HirInlineDispositions,
@@ -120,7 +126,7 @@ impl<'a> TempInlineWorkspace<'a> {
         scope: TempInlineScope,
         dialect: DecompileDialect,
         readability: ReadabilityOptions,
-        substantial_closure_bodies: &'a [bool],
+        module: InlineModuleFacts<'a>,
         inline_dispositions: HirInlineDispositions,
         safety: HirExprSafety,
     ) -> Self {
@@ -139,7 +145,7 @@ impl<'a> TempInlineWorkspace<'a> {
             dialect,
             safety,
             readability,
-            substantial_closure_bodies,
+            module,
             physical_root_temps,
             new_physical_root_temps: BTreeSet::new(),
             inline_dispositions,
@@ -152,7 +158,7 @@ pub(super) fn inline_temps_in_proto_with_facts(
     readability: ReadabilityOptions,
     facts: &ProtoPromotionFacts,
     dialect: DecompileDialect,
-    substantial_closure_bodies: &[bool],
+    module: InlineModuleFacts<'_>,
     safety: HirExprSafety,
 ) -> bool {
     inline_temps_in_proto_with_scope(
@@ -161,7 +167,7 @@ pub(super) fn inline_temps_in_proto_with_facts(
         facts,
         TempInlineScope::All,
         dialect,
-        substantial_closure_bodies,
+        module,
         safety,
     )
 }
@@ -193,7 +199,10 @@ pub(super) fn inline_exposed_branch_value_sinks_in_proto_with_facts(
         facts,
         TempInlineScope::BranchValueSinks(exposed),
         dialect,
-        &[],
+        InlineModuleFacts {
+            substantial_closure_bodies: &[],
+            inert_call_results: &BTreeSet::new(),
+        },
         safety,
     );
 }
@@ -204,7 +213,7 @@ fn inline_temps_in_proto_with_scope(
     facts: &ProtoPromotionFacts,
     scope: TempInlineScope,
     dialect: DecompileDialect,
-    substantial_closure_bodies: &[bool],
+    module: InlineModuleFacts<'_>,
     safety: HirExprSafety,
 ) -> bool {
     let mut identities = (
@@ -244,7 +253,7 @@ fn inline_temps_in_proto_with_scope(
         scope,
         dialect,
         readability,
-        substantial_closure_bodies,
+        module,
         inline_dispositions,
         safety,
     );
@@ -299,7 +308,7 @@ impl TempInlineWorkspace<'_> {
             facts,
             self.safety,
             false,
-            |_| true,
+            |temp| !self.module.inert_call_results.contains(&temp),
             |_| super::root_lifetimes::RootOverwritePolicy::Reuse,
         );
         let mut marked = call_roots.marked_stmts(stmts.len());
@@ -314,6 +323,17 @@ impl TempInlineWorkspace<'_> {
             marked[index] |= call_roots.owner_overwrites(index).any(|owner| {
                 matches!(&stmts[owner.root_index()], HirStmt::Assign(assign)
                     if assign.targets.len() > 1 && assign.generic_for_initializer_producer.is_none())
+                    // 未读的固定单结果同样由 locals 物化；保留其原槽覆盖，避免 COPY
+                    // 内联后只剩高槽 scratch，丢失后续赋值沿用该 binding 的事实。
+                    || stmts[owner.root_index()].scalar_temp_assignment().is_some_and(|(temp, value)| {
+                        matches!(value, HirExpr::Call(call)
+                            if !snapshot.has_read_after(temp, owner.root_index())
+                                && facts.fixed_call_result(call, 0) == Some(temp)
+                                && facts.native_call_frame(call).is_some_and(|frame|
+                                    frame.home == owner.home()
+                                        && matches!(frame.results, Some(crate::transformer::ResultPack::Fixed(pack))
+                                            if pack.len == 1 && pack.start.index() == frame.home.slot())))
+                    })
             });
             if call_roots.call_dispatch_releases(index).next().is_some()
                 || lookup_roots.call_dispatch_releases(index).next().is_some()
@@ -593,13 +613,27 @@ fn inline_temps_in_block(
             // 候选拒绝[SemanticBarrier:Lifetime]：`t=t+1; return t` 若删 producer，状态槽不再完成本次更新。
             && !expr_mentions_temp(value, temp)
             && let Some(next_stmt) = kept_rev.last()
+            // 候选拒绝[LayerBoundary]：多目标 Phi 只有合流关系，不能把低槽的
+            // 逐次计算改成高槽并行 RHS；carried-local owner 负责恢复目标身份。
+            && !(matches!(value, HirExpr::Binary(_) | HirExpr::Unary(_))
+                && phi_value_writes_target_slot(temp, next_stmt, facts))
+            // 候选拒绝[LayerBoundary]：callee 下方的 producer 属于原声明前缀。
+            // 即使值是常量，也不能局部删除后让完整 CALL/作用域事务失去其原槽占位。
+            && !occupies_scalar_call_prefix(temp, value, next_stmt, facts)
+            && !occupies_closure_call_prefix(temp, value, next_stmt, facts)
+            // 候选拒绝[LayerBoundary]：一元操作在更高槽写结果时，原 CALL 结果
+            // 是它下方仍存活的输入声明；保留两槽事实供源码帧 owner 同批恢复。
+            && !occupies_unary_input_prefix(temp, value, next_stmt, facts)
             // 候选拒绝[LayerBoundary]：参数 COPY 的来源 CALL 保留独立结果槽，交完整帧消费。
+            // CLOSURE 的原分配槽也不能改挂到 callee COPY；否则 locals 会把闭包声明
+            // 提升到调用 scratch，后续帧无法证明原声明前缀和两槽生命周期。
             // 候选拒绝[SemanticBarrier:Lifetime]：前层签发的 copy root 也不能改挂到异槽定义。
             // 647 的副本被用作 callee 后覆写，源槽仍跨 GC 存活；同值不代表同生命周期。
             && !next_stmt.scalar_temp_assignment().is_some_and(|(target, copied)| {
                     matches!(copied, HirExpr::TempRef(source) if *source == temp)
                         && facts.trusted_temp_home_slot(temp) != facts.trusted_temp_home_slot(target)
                         && (facts.is_scope_end_copy_root_temp(temp)
+                            || matches!(value, HirExpr::Closure(_))
                             || (matches!(value, HirExpr::Call(_))
                                 && facts.temp_is_transferred_call_argument(target)))
                 })
@@ -648,13 +682,14 @@ fn inline_temps_in_block(
                 site,
                 value,
                 next_stmt,
-                workspace.substantial_closure_bodies,
+                workspace.module.substantial_closure_bodies,
             )
             && (site.allows(value, readability, workspace.safety)
                 || (site == InlineSite::CallArg
                     && workspace.uses.has_unique_definition(temp)
                     && facts.temp_is_transferred_call_argument(temp)
                     && stmt_has_argument_root_handoff(next_stmt, temp)))
+            && inline_expansion_budget(next_stmt, value).is_some()
         {
             let next_stmt = kept_rev
                 .last_mut()
@@ -906,6 +941,31 @@ fn call_result_can_enter_set_list(
         && facts.call_result_root_ends_after_value_use(temp)
         && facts.is_direct_table_seed_temp(seed)
         && facts.trusted_temp_home_slot(seed).is_some()
+}
+
+/// 连续低槽 Phi 按原 home 定位成员，再核对真实两端；不逐 producer 重扫整个结果组。
+fn phi_value_writes_target_slot(temp: TempId, stmt: &HirStmt, facts: &ProtoPromotionFacts) -> bool {
+    let HirStmt::Assign(assign) = stmt else {
+        return false;
+    };
+    let Some(HirLValue::Temp(first)) = assign.targets.first() else {
+        return false;
+    };
+    if !assign.is_phi_transfer || assign.targets.len() < 2 {
+        return false;
+    }
+    let Some(home) = facts.trusted_temp_home_slot(temp) else {
+        return false;
+    };
+    let Some(first) = facts.trusted_temp_home_slot(*first) else {
+        return false;
+    };
+    let Some(offset) = home.slot().checked_sub(first.slot()) else {
+        return false;
+    };
+    matches!((assign.targets.get(offset), assign.values.fixed.get(offset)),
+        (Some(HirLValue::Temp(target)), Some(HirExpr::TempRef(source)))
+            if *source == temp && facts.trusted_temp_home_slot(*target) == Some(home))
 }
 
 fn stmt_stores_temp_in_table(stmt: &HirStmt, temp: TempId) -> bool {
@@ -1398,6 +1458,92 @@ impl PureInlineContext<'_> {
     }
 }
 
+fn occupies_unary_input_prefix(
+    temp: TempId,
+    value: &HirExpr,
+    sink: &HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let HirExpr::Call(call) = value else {
+        return false;
+    };
+    let Some((_, HirExpr::Unary(unary))) = sink.scalar_temp_assignment() else {
+        return false;
+    };
+    matches!(unary.expr, HirExpr::TempRef(input) if input == temp)
+        && facts
+            .unary_operand_home(unary)
+            .zip(facts.unary_result_home(unary))
+            .is_some_and(|(input, output)| {
+                input.slot() < output.slot()
+                    && facts.trusted_temp_home_slot(temp) == Some(input)
+                    && call
+                        .source_site
+                        .and_then(|source| facts.operation_result_home(source))
+                        == Some(input)
+            })
+}
+
+/// callee/参数 COPY 可先被逆向扫描收回；调用槽下方的原闭包仍属于声明前缀。
+fn occupies_closure_call_prefix(
+    temp: TempId,
+    value: &HirExpr,
+    sink: &HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    if !matches!(value, HirExpr::Closure(_)) {
+        return false;
+    }
+    let call = match sink {
+        HirStmt::CallStmt(stmt) => Some(&stmt.call),
+        stmt => {
+            let values = match stmt {
+                HirStmt::Assign(assign) => &assign.values,
+                HirStmt::LocalDecl(decl) => &decl.values,
+                HirStmt::Return(ret) => &ret.values,
+                _ => return false,
+            };
+            match (values.fixed.as_slice(), &values.tail) {
+                ([HirExpr::Call(call)], None) => Some(call.as_ref()),
+                ([], Some(tail)) => match tail.as_expr() {
+                    HirExpr::Call(call) => Some(call.as_ref()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+    };
+    call.is_some_and(|call| {
+        facts
+            .trusted_temp_home_slot(temp)
+            .zip(facts.native_call_layout(call))
+            .is_some_and(|(home, frame)| home.slot() < frame.home.slot())
+    })
+}
+
+fn occupies_scalar_call_prefix(
+    temp: TempId,
+    value: &HirExpr,
+    sink: &HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    if !matches!(
+        value,
+        HirExpr::Nil | HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+    ) {
+        // 可收集值与带求值事件的 producer 仍消费已有 root/求值顺序证明；
+        // 此处只延期此前因值稳定而直接删除的标量声明前缀。
+        return false;
+    }
+    let HirStmt::CallStmt(stmt) = sink else {
+        return false;
+    };
+    facts
+        .trusted_temp_home_slot(temp)
+        .zip(facts.native_call_layout(&stmt.call))
+        .is_some_and(|(home, frame)| home.slot() < frame.home.slot())
+}
+
 /// 一个读取叶与常量组成的纯表达式没有需再次物化的 sibling 快照；返回继续追溯的 Temp。
 /// 多读取分支需要展开后的前缀事实，仍交给原逐站点路径，不能用 repeatable 猜测。
 fn single_pure_dependency(value: &HirExpr) -> Option<Option<TempId>> {
@@ -1431,16 +1577,13 @@ fn inline_pure_dependency_chain(
     callee_materialized_at: &mut Option<usize>,
 ) -> bool {
     let (first_index, first_stmt, mut site) = first;
-    let (mut expected, _) = first_stmt
+    let (mut expected, first_value) = first_stmt
         .scalar_temp_assignment()
         .expect("adjacent scalar producer");
-    if !temp_precedes_observable_eval_in_stmt(sink, expected, true, reference_captured) {
-        // 候选拒绝[SemanticBarrier:EvalOrder]：来源快照不能越过 sink 的事件或先前可变读取。
-        return false;
-    }
     let mut first = Some((first_index, first_stmt));
     let mut replacements = BTreeMap::new();
     let mut callee = *callee_materialized_at;
+    let mut budget = matches!(first_value, HirExpr::Unary(_)).then(|| inline_syntax_budget(sink));
     loop {
         let from_iterator = first.is_none();
         let Some((index, stmt)) =
@@ -1467,6 +1610,8 @@ fn inline_pure_dependency_chain(
                     | InlineSite::PrefixedBlock
             )
             || !context.candidate_is_safe(temp, value, index)
+            || occupies_scalar_call_prefix(temp, value, sink, context.facts)
+            || occupies_closure_call_prefix(temp, value, sink, context.facts)
             || !site.allows(value, context.readability, context.safety)
             || call_arg_inline_crosses_materialized_callee(site, value, index, callee)
         {
@@ -1477,6 +1622,22 @@ fn inline_pure_dependency_chain(
             // 候选拒绝[ProofIncomplete]：多读取分支需要展开后的 sibling 前缀，仍由逐站点路径证明。
             break;
         };
+        // 先核对原 producer 的小表达式，再扫描可能很大的 sink。非 repeatable 的
+        // 算术链不会进入批量路径，不能每折叠一层又为必然拒绝的候选重扫整条链。
+        if first.is_some()
+            && !temp_precedes_observable_eval_in_stmt(sink, expected, true, reference_captured)
+        {
+            // 候选拒绝[SemanticBarrier:EvalOrder]：来源快照不能越过 sink 的事件或先前可变读取。
+            return false;
+        }
+        if let Some(remaining) = budget {
+            let Some(remaining) = spend_inline_syntax_budget(value, remaining) else {
+                // 候选拒绝[TargetConstraint:SyntaxDepth]：每个一元 producer 单独很小，
+                // 但展开总和仍可能超过解析嵌套上限；保留边界赋值，不删除原运算。
+                break;
+            };
+            budget = Some(remaining);
+        }
         if dependency.is_some_and(|temp| replacements.contains_key(&temp)) {
             // 候选拒绝[SemanticBarrier:ValueFlow]：向后依赖已选 producer 会形成不同 epoch 或环。
             break;
@@ -1509,6 +1670,44 @@ fn inline_pure_dependency_chain(
     context.commit(sink, &replacements);
     *callee_materialized_at = callee;
     true
+}
+
+// PUC 的语法递归上限约为 200；为外围调用、控制结构和源码投影留出余量。
+// 只约束一元链的拼接；左结合算术的长度不等于解析递归深度。
+// 节点预算保守覆盖一元嵌套，每次查询最多访问固定数量节点。
+const INLINE_SYNTAX_NODE_BUDGET: usize = 128;
+
+struct InlineSyntaxBudget(usize);
+
+impl HirVisitor<'_> for InlineSyntaxBudget {
+    fn is_complete(&self) -> bool {
+        self.0 == 0
+    }
+
+    fn visit_expr(&mut self, _expr: &HirExpr) {
+        self.0 -= 1;
+    }
+}
+
+fn inline_syntax_budget(sink: &HirStmt) -> usize {
+    let mut budget = InlineSyntaxBudget(INLINE_SYNTAX_NODE_BUDGET);
+    crate::hir::visit::visit_stmt_header(sink, &mut budget);
+    budget.0
+}
+
+fn spend_inline_syntax_budget(value: &HirExpr, remaining: usize) -> Option<usize> {
+    // 代换移除一个 TempRef 叶子；至少留一格，区分刚好到界与提前终止遍历。
+    let mut budget = InlineSyntaxBudget(remaining + 1);
+    visit_expr(value, &mut budget);
+    (budget.0 != 0).then_some(budget.0)
+}
+
+fn inline_expansion_budget(sink: &HirStmt, value: &HirExpr) -> Option<usize> {
+    if matches!(value, HirExpr::Unary(_)) {
+        spend_inline_syntax_budget(value, inline_syntax_budget(sink))
+    } else {
+        Some(INLINE_SYNTAX_NODE_BUDGET)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3802,7 +4001,11 @@ fn temp_rebinds_captured_slot(
     facts: &ProtoPromotionFacts,
     captured_slots: &BTreeSet<HomeSlotKey>,
 ) -> bool {
-    !facts
-        .complete_temp_home_slots(temp)
-        .is_disjoint(captured_slots)
+    // HIR 子树的 capture 并集可能来自已经返回的分支；原 fixed 写入的 CFG 事实
+    // 可以排除该次写入仍有开放 cell。已合并或失去 home 身份的 temp 不借用此证明，
+    // 实际捕获当前 binding 的 use 仍由各内联站点保护。
+    !facts.temp_definition_reference_unaliased(temp)
+        && !facts
+            .complete_temp_home_slots(temp)
+            .is_disjoint(captured_slots)
 }

@@ -1,5 +1,8 @@
 -- regress_288_luau_shared_proto_dag: O2复用的flat proto必须展开到每个词法child slot
 -- unluac: expect-contains [[function]]
+-- unluac: expect-not-contains [[= print]]
+-- unluac: expect-not-contains [[= assert]]
+-- unluac: expect-ast-count [[local-binding]] [[2]] [[@proto=0]]
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 local function outer(z)

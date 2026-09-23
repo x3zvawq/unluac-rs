@@ -11,7 +11,7 @@ use crate::structure::{
     BlockRef, Cfg, DataflowFacts, DominatorTree, GraphFacts, PhiCandidate, PostDominatorTree,
     SsaValue,
 };
-use crate::transformer::LoweredProto;
+use crate::transformer::{CaptureSource, InstrRef, LowInstr, LoweredProto};
 
 use super::super::common::{
     BranchCandidate, ShortCircuitCandidate, ShortCircuitExit, ShortCircuitNode,
@@ -31,7 +31,22 @@ pub(super) fn analyze_value_merge_candidates(
     branch_by_header: &BTreeMap<BlockRef, &BranchCandidate>,
 ) -> Vec<ShortCircuitCandidate> {
     let dom_tree = &graph_facts.dominator_tree;
+    // 一次枚举捕获源，避免每个候选沿 phi uses 再扫描同一 CLOSURE 的全部捕获。
+    let mut reference_captured_phis = vec![false; dataflow.phi_candidates.len()];
+    for (index, instr) in proto.instrs.iter().enumerate() {
+        let LowInstr::Closure(closure) = instr else {
+            continue;
+        };
+        for capture in &closure.captures {
+            if let CaptureSource::ByReference(reg) = capture.source
+                && let SsaValue::Phi(phi) = dataflow.use_value(InstrRef(index), reg)
+            {
+                reference_captured_phis[phi.index()] = true;
+            }
+        }
+    }
     let build_ctx = ValueMergeBuildCtx {
+        reference_captured_phis: &reference_captured_phis,
         proto,
         cfg,
         dataflow,
@@ -41,6 +56,7 @@ pub(super) fn analyze_value_merge_candidates(
     };
     let mut candidates = Vec::new();
     let mut node_refs = DenseNodeRefs::new(cfg.blocks.len());
+    let operand_entries = operand_entries(cfg, graph_facts, dataflow, branch_by_header);
     for phi in &dataflow.phi_candidates {
         if phi.incoming.len() < 2 {
             continue;
@@ -48,16 +64,59 @@ pub(super) fn analyze_value_merge_candidates(
         let Some(root) = value_merge_root(dom_tree, branch_by_header, phi) else {
             continue;
         };
-        let Some(builder) = ValueMergeDagBuilder::new(&build_ctx, root.header, phi, &mut node_refs)
-        else {
-            continue;
-        };
-        let Some(candidate) = builder.build() else {
-            continue;
-        };
-        candidates.push(candidate);
+        let operand_entry = operand_entries[root.header.index()];
+        for header in std::iter::once(root.header)
+            .chain((operand_entry != root.header).then_some(operand_entry))
+        {
+            if let Some(candidate) =
+                ValueMergeDagBuilder::new(&build_ctx, header, phi, &mut node_refs)
+                    .and_then(ValueMergeDagBuilder::build)
+            {
+                candidates.push(candidate);
+            }
+        }
     }
     candidates
+}
+
+/// 比较的单次 phi 输入可以先于外层决策入口完成。沿支配树缓存最早的准备入口，
+/// 避免逐候选回溯；实际控制闭合与操作数归属仍由完整候选和 selected owner 证明。
+fn operand_entries(
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    branches: &BTreeMap<BlockRef, &BranchCandidate>,
+) -> Vec<BlockRef> {
+    let mut entries = (0..cfg.blocks.len()).map(BlockRef).collect::<Vec<_>>();
+    let mut order = branches.keys().copied().collect::<Vec<_>>();
+    order.sort_unstable_by_key(|block| graph.dominator_tree.preorder_index[block.index()]);
+    for block in order {
+        let Some(parent) = graph.dominator_tree.parent[block.index()] else {
+            continue;
+        };
+        if !branches.contains_key(&parent) || !graph.post_dominates(block, parent) {
+            continue;
+        }
+        let consumes_operand = dataflow.phi_candidates_in_block(block).iter().any(|phi| {
+            // 只排除当前开放的 cell；寄存器之后另作捕获槽，不改变此处临时取值的身份。
+            matches!(dataflow.phi_uses[phi.id.index()].as_slice(), [site]
+                if cfg.blocks[block.index()].instrs.last() == Some(site.instr)
+                    && !dataflow.reference_capture_may_be_open(phi.reg, site.instr)
+                    && !dataflow.instr_effects[site.instr.index()].repeats_fixed_use(site.reg))
+                && phi.incoming.iter().all(|incoming| match incoming.value {
+                    SsaValue::Def(def) => {
+                        !dataflow.reference_capture_may_be_open(phi.reg, dataflow.def_instr(def))
+                    }
+                    _ => !dataflow.reg_is_reference_captured(phi.reg),
+                })
+                && dataflow.phi_consumer_ids(phi.id).is_empty()
+                && phi.incoming.iter().all(|incoming| incoming.pred.is_some())
+        });
+        if consumes_operand {
+            entries[block.index()] = entries[parent.index()];
+        }
+    }
+    entries
 }
 
 fn value_merge_root<'a>(
@@ -80,6 +139,7 @@ struct ValueMergeBuildCtx<'a> {
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     dom_tree: &'a DominatorTree,
     postdom_tree: &'a PostDominatorTree,
+    reference_captured_phis: &'a [bool],
 }
 
 struct DenseNodeRefs {
@@ -124,6 +184,7 @@ struct ValueMergeDagBuilder<'a, 'w> {
     branch_by_header: &'a BTreeMap<BlockRef, &'a BranchCandidate>,
     dom_tree: &'a DominatorTree,
     postdom_tree: &'a PostDominatorTree,
+    reference_captured_phis: &'a [bool],
     root: BlockRef,
     phi: &'a PhiCandidate,
     nodes: Vec<ShortCircuitNode>,
@@ -172,6 +233,7 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
             branch_by_header: ctx.branch_by_header,
             dom_tree: ctx.dom_tree,
             postdom_tree: ctx.postdom_tree,
+            reference_captured_phis: ctx.reference_captured_phis,
             root,
             phi,
             nodes: Vec::new(),
@@ -199,7 +261,14 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
             .value_leaves
             .iter()
             .any(|leaf| self.node_refs.get(*leaf, self.node_epoch).is_some());
-        if self.nodes.len() == 1 && !has_header_leaf {
+        let predicate_operand = self.dataflow.phi_uses[self.phi.id.index()].as_slice();
+        let predicate_operand = matches!(predicate_operand, [site]
+            if self.cfg.blocks[self.cfg.instr_to_block[site.instr.index()].index()].instrs.last() == Some(site.instr)
+                && self.cfg.branch_edges(self.cfg.instr_to_block[site.instr.index()]).is_some()
+                && self.postdom_tree.dominates(self.cfg.instr_to_block[site.instr.index()], self.phi.block));
+        // 编译器可省掉真值已知的中间 TEST，使嵌套 `a and 2 or 0` 只剩一个
+        // 判断。若 phi 紧接着被谓词消费，它仍是取值操作数，不是独立语句分支。
+        if self.nodes.len() == 1 && !has_header_leaf && !predicate_operand {
             return None;
         }
         if !self.value_leaves_feed_phi() || !short_circuit_nodes_are_acyclic(&self.nodes, entry) {
@@ -208,6 +277,26 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
 
         let phi_facts =
             short_circuit_phi_facts(self.dataflow, self.root, self.phi.reg, &self.value_leaves);
+        if self.nodes.len() == 1 && self.value_leaves.contains(&self.root) {
+            let predicate = self.cfg.blocks[self.root.index()].instrs.last()?;
+            let captured_result = self
+                .dataflow
+                .reference_capture_may_be_open(self.phi.reg, predicate)
+                || self.reference_captured_phis[self.phi.id.index()];
+            if captured_result
+                && self
+                    .dataflow
+                    .use_values_at(predicate)
+                    .get(self.phi.reg)
+                    .is_none()
+            {
+                // 候选拒绝[PolicyBoundary]：已打开或在合流处捕获的 cell 在直达边保持
+                // 旧值，条件又不读取它；保留条件写回，让普通 branch 和 phi carry
+                // 恢复同一身份。匿名 Boolean 预写仍可参与取值 DAG，不按槽号曾被捕获
+                // 就把无关的后继临时量认作 cell。
+                return None;
+            }
+        }
         let reducible = is_reducible_candidate(self.cfg, self.root, &self.blocks);
         Some(ShortCircuitCandidate {
             header: self.root,
@@ -297,7 +386,9 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
     ) -> Option<ResolvedValueTarget> {
         if target == self.phi.block {
             let incoming = self.decision_incoming_from(from_header)?;
-            if matches!(incoming.value, crate::structure::SsaValue::Entry(_)) {
+            if matches!(incoming.value, crate::structure::SsaValue::Entry(reg)
+                if reg.index() >= usize::from(self.proto.signature.num_params))
+            {
                 return None;
             }
             self.record_value_leaf(from_header, from_header);
@@ -320,6 +411,25 @@ impl<'a, 'w> ValueMergeDagBuilder<'a, 'w> {
             |block| {
                 terminal = self.value_leaf_carrier(block);
                 terminal.is_some()
+            },
+            |block| {
+                // 内嵌取值表达式的字面量臂不是外层 result leaf；继续收集到其
+                // 消费谓词，由最终选择证明内部 phi、原写入与单次消费的归属。
+                let range = self.cfg.blocks[block.index()].instrs;
+                self.proto.instrs[range.start.index()..range.end()]
+                    .iter()
+                    .all(|instr| {
+                        matches!(
+                            instr,
+                            crate::transformer::LowInstr::LoadNil(_)
+                                | crate::transformer::LowInstr::LoadBool(_)
+                                | crate::transformer::LowInstr::LoadConst(_)
+                                | crate::transformer::LowInstr::LoadInteger(_)
+                                | crate::transformer::LowInstr::LoadNumber(_)
+                                | crate::transformer::LowInstr::Move(_)
+                                | crate::transformer::LowInstr::Jump(_)
+                        )
+                    })
             },
         )?;
         self.blocks.extend(followed.traversed);

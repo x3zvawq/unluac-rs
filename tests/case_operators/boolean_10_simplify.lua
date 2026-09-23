@@ -1,8 +1,9 @@
 -- regress_332_logical_simplify: occurrence 级逻辑化简保留求值轨迹、标量宽度与 Luau number 语义
--- unluac: expect-contains [[return p2_0 and (p2_1 or]]
+-- 稳定或恒真分支也不授权合并两个原 guard 检查。
+-- unluac: expect-contains [[return p2_0 and p2_1 or p2_0 and]]
 -- unluac: expect-contains [[p6_0 and r6_0() or p6_0 and r6_1()]]
--- unluac: expect-contains [[return p9_0 and {}]]
--- unluac: expect-not-contains [["unexpected"]]
+-- unluac: expect-contains [[return p9_0 and {} or p9_0 and]]
+-- unluac: expect-contains [[("unexpected", "fallback")]]
 -- unluac: expect-contains [[if not ((p11_0 or]]
 -- unluac: expect-contains [[return p12_0 and p12_1 or {}]]
 -- unluac: expect-contains [[return p16_0 and p16_1 and p16_2 or {}]]
@@ -19,6 +20,10 @@ local function shared_guard_with_call(guard, first)
 end
 
 assert(shared_guard_with_call(true, false) == "fallback")
+assert(table.concat(trace, ",") == "c")
+assert(shared_guard_with_call(false, false) == false)
+assert(shared_guard_with_call(nil, false) == nil)
+assert(shared_guard_with_call(true, "first") == "first")
 assert(table.concat(trace, ",") == "c")
 
 local function shared_vararg_with_calls(first, second, ...)
@@ -56,8 +61,8 @@ end
 local guarded_value, guarded_trace = mutable_param_guard(true)
 assert(guarded_value == false and guarded_trace == "b")
 
--- 首臂虽然分配 table、因对象身份而不可重复，但其结果恒真；一旦该臂执行，
--- 外层 or 不会进入第二臂，也就不存在“effect 后重读 guard”的路径。
+-- 首臂分配的 table 恒真，运行时不会调用 fallback；字节码仍有该调用及控制路径，
+-- 不得仅凭结果真值把它们删除。
 local function truthy_allocating_first_arm(guard)
     return (guard and {}) or (guard and mark("unexpected", "fallback"))
 end
@@ -65,6 +70,9 @@ end
 trace = {}
 local allocated = truthy_allocating_first_arm(true)
 assert(type(allocated) == "table" and #trace == 0)
+assert(truthy_allocating_first_arm(false) == false)
+assert(truthy_allocating_first_arm(nil) == nil)
+assert(#trace == 0)
 
 local function condition_mark()
     return mark("condition-b", true)

@@ -1,5 +1,11 @@
 -- 原低槽 alias/Boolean 也是 caller 前缀；稳定值不能证明删除声明后原残值位置不变。
 -- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[5]] [[@proto=6]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=3]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=8]]
+-- unluac: expect-contains [[if weak[2] then]] [[@debug=retained]]
+-- unluac: expect-contains [[seen = type(weak[1])]] [[@debug=retained]]
 
 local function not_prefix()
     local weak = setmetatable({}, { __mode = "v" })

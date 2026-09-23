@@ -6,6 +6,7 @@
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-not-contains [[local r1_0]]
+-- unluac: expect-ast-count [[continue]] [[0]] [[@proto=1]]
 
 local function run(outer, inner, stop)
     while outer do

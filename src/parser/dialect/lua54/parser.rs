@@ -248,6 +248,7 @@ impl Lua54Parser {
                 has_vararg_param_reg: false,
                 named_vararg_table: false,
                 legacy_arg_slot: false,
+                legacy_arg_table: false,
             },
             PucLuaProtoSections {
                 instructions,

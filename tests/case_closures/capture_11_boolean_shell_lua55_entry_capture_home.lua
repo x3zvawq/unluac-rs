@@ -1,5 +1,6 @@
 -- A Lua 5.5 named vararg pack is an entry local with the vararg register's home.
--- unluac: expect-not-contains [[not not]]
+-- unluac: expect-contains [[not not]]
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]]
 
 local function run(...pack)
     local read = function()

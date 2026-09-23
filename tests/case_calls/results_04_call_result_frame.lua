@@ -18,6 +18,31 @@
 -- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=2]] [[@dialect=luajit]]
 -- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=2]] [[@dialect=luajit]]
 -- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-contains [[local value = factory() and false or 9]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=9]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=9]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=9]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=9]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=9]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=9]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=9]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=9]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=3]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=9]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=9]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=7]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=7]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=1]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[assign]] [[1]] [[@proto=1]] [[@dialect=luajit]]
 -- unluac: expect-ast-count [[empty-local]] [[0]]
 local weak = setmetatable({}, {__mode = "v"})
 local trace = ""
@@ -79,3 +104,11 @@ extended_result(fill_parameters)
 collectgarbage("restart")
 assert(observations[1] == "table")
 assert(observations[2] == "nil")
+
+-- 原空 TEST 要保留，但不能因此把随后覆盖的调用结果延长到 observer。
+do
+    local value = result()
+    if value then end
+    value = 9
+    observe(value)
+end

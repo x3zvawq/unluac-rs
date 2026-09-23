@@ -63,7 +63,7 @@ pub(super) fn preserve(
             _ => None,
         };
         matches!(value, Some(HirExpr::Closure(closure))
-            if closure.creation == Some(HirClosureCreation::Fresh)
+            if matches!(closure.creation, Some(HirClosureCreation::Fresh { .. }))
             && closure.proto == proof.child
             && closure.captures.as_slice() == [expected])
     }) else {

@@ -140,10 +140,12 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
         )?;
         for index in start..end {
             let instr_ref = InstrRef(index);
-            self.start_lexical_scopes(index, &mut stmts);
-            if skipped != Some(instr_ref) {
-                stmts.extend_plain(self.lower_planned_regular(owner, block, instr_ref)?);
-            }
+            let lowered = if skipped != Some(instr_ref) {
+                self.lower_planned_regular(owner, block, instr_ref)?
+            } else {
+                Vec::new()
+            };
+            self.emit_scoped_instr(owner, index, lowered, &mut stmts)?;
             self.end_lexical_scopes(index + 1, &mut stmts);
         }
         Ok(stmts)
@@ -208,15 +210,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     region: owner.index(),
                     detail: "loop action binding lost its selected local",
                 })?,
-            LoopValueSource::Carried(phi) => self.lowering.bindings.expr_for_temp(
-                *self.lowering.bindings.phi_temps.get(phi.index()).ok_or(
-                    HirLowerError::InvalidPlanRegion {
-                        proto: self.proto.index(),
-                        region: owner.index(),
-                        detail: "loop action carried source has no temp binding",
-                    },
-                )?,
-            ),
+            LoopValueSource::Carried(phi) => self.ssa_expr(owner, SsaValue::Phi(phi))?,
         })
     }
 

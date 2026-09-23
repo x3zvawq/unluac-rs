@@ -1,7 +1,7 @@
--- 非相邻 Boolean 分支仍可提取共同首项/末项；索引不能删掉原搜索的有效候选。
--- LuaJIT 的未知参数比较不属于这项纯表达式证明，因此形状合同仅用于 PUC Lua/Luau。
--- unluac: expect-contains [[p1_0 == 1 and (p1_1 == 2 or p1_3 == 4)]]
--- unluac: expect-contains [[(p2_0 == 1 or p2_3 == 4) and p2_1 == 2]]
+-- 非相邻 Boolean 分支不能因值相等而提取原比较的公因子，须保留出现次数与短路顺序。
+-- unluac: expect-contains [[return p1_0 == 1 and p1_1 == 2 or p1_2 == 3 or p1_0 == 1 and p1_3 == 4]]
+-- unluac: expect-contains [[return p2_0 == 1 and p2_1 == 2 or p2_2 == 3 or p2_3 == 4 and p2_1 == 2]]
+-- unluac: expect-count [[p3_0 == 1 or p3_1 == 2]] [[2]]
 local function prefix(a,b,c,d)
     return (a == 1 and b == 2) or c == 3 or (a == 1 and d == 4)
 end

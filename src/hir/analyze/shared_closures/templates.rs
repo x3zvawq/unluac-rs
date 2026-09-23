@@ -21,6 +21,7 @@ pub(super) struct TemplateNode {
 pub(super) enum TemplateCapture {
     Outer(UpvalueRef),
     Dependency(CompositeNodeRef),
+    Integer(i64),
 }
 
 pub(super) fn extract_template(
@@ -150,6 +151,10 @@ impl TemplateBuilder<'_> {
                 CaptureSource::ByValue(reg) if reg == closure_dst => return None,
                 CaptureSource::ByValue(reg) => {
                     let value = self.dataflow.use_value(current_instr, reg);
+                    if let Some(value) = captured_integer(self.proto, self.dataflow, value) {
+                        frame.captures.push(TemplateCapture::Integer(value));
+                        continue;
+                    }
                     let dependency = resolve_closure_value(self.proto, self.dataflow, value)?;
                     if let Some(node) = self.node_by_instr.get(&dependency) {
                         frame.captures.push(TemplateCapture::Dependency(*node));
@@ -454,6 +459,25 @@ impl ComponentMatcher<'_> {
                                 next_capture: next_capture + 1,
                             });
                         }
+                        TemplateCapture::Integer(expected) => {
+                            let CaptureSource::ByValue(reg) = capture.source else {
+                                return None;
+                            };
+                            if reg == closure.dst
+                                || captured_integer(
+                                    self.proto,
+                                    self.dataflow,
+                                    self.dataflow.use_value(instr_ref, reg),
+                                ) != Some(expected)
+                            {
+                                return None;
+                            }
+                            stack.push(MatchFrame::Captures {
+                                node,
+                                instr_ref,
+                                next_capture: next_capture + 1,
+                            });
+                        }
                         TemplateCapture::Dependency(dependency) => {
                             let CaptureSource::ByValue(reg) = capture.source else {
                                 return None;
@@ -488,5 +512,22 @@ impl ComponentMatcher<'_> {
             }
         }
         Some(())
+    }
+}
+
+/// Luau 可将外层常量复制到 owner 内部，而内联 occurrence 仍读取原局部槽。
+/// 整数的 capture identity 按值自反；只消费显式整数定义，不将 NaN、资源或
+/// 计算出的相等值混为同一捕获，也不删除父 proto 的原初始化。
+fn captured_integer(
+    proto: &LoweredProto,
+    dataflow: &DataflowFacts,
+    value: SsaValue,
+) -> Option<i64> {
+    let SsaValue::Def(def) = dataflow.canonical_move_value(value)? else {
+        return None;
+    };
+    match proto.instrs.get(dataflow.def_instr(def).index())? {
+        LowInstr::LoadInteger(load) => Some(load.value),
+        _ => None,
     }
 }

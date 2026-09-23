@@ -7,6 +7,8 @@
 -- unluac: expect-contains [[local function debug_nested()]]
 -- unluac: expect-not-contains [[goto ]]
 -- unluac: expect-not-contains [[unluac error]]
+-- 函数级 debug 区间不应被重建为逐声明嵌套的尾部作用域。
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=0]]
 local debug_values = { 1, 2, 3 }
 
 local function debug_sum(debug_limit)

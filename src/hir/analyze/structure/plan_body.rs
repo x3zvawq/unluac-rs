@@ -102,6 +102,7 @@ struct PlanLoweringIndex {
     consumed_loop_copy_targets: Vec<Vec<PhiId>>,
     repeat_staged_result_by_phi: Vec<Option<(RegionId, TempId)>>,
     edge_action_use_count: Vec<usize>,
+    move_reads_capture: Vec<bool>,
     absorbed_region_result_moves: Vec<bool>,
     shared_ssa_temps: Vec<bool>,
 }
@@ -155,7 +156,13 @@ fn copy_assignment_stmt(targets: Vec<HirLValue>, values: Vec<HirExpr>) -> Option
             retained_values.push(value);
         }
     }
-    (!retained_targets.is_empty()).then(|| assign_stmt(retained_targets, retained_values))
+    (!retained_targets.is_empty()).then(|| {
+        let mut stmt = assign_stmt(retained_targets, retained_values);
+        if let HirStmt::Assign(assign) = &mut stmt {
+            assign.is_phi_transfer = true;
+        }
+        stmt
+    })
 }
 
 struct PlannedForRegions {

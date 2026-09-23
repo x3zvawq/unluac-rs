@@ -101,6 +101,7 @@ fn inline_function_into_stmt(
                         root: AstNameRef::Global(name.clone()),
                         fields: Vec::new(),
                     }),
+                    global_declaration: true,
                     func: function.clone(),
                 })));
             }
@@ -116,16 +117,23 @@ fn inline_function_into_stmt(
             if !binding.matches_name_ref(name) {
                 return None;
             }
-            if !lvalue_prefix_can_move_before_closure(&assign.targets[0], mutable_snapshots) {
+            let target_name = function_decl_target_from_lvalue(&assign.targets[0]);
+            // Luau 的具名函数声明先创建闭包再求目标，与当前转发序列相同；
+            // 普通赋值仍先求 lvalue，不能把该许可传给无法使用声明语法的目标。
+            let preserves_closure_first =
+                target.version == crate::decompile::DecompileDialect::Luau && target_name.is_some();
+            if !preserves_closure_first
+                && !lvalue_prefix_can_move_before_closure(&assign.targets[0], mutable_snapshots)
+            {
                 // 候选拒绝[SemanticBarrier:EvalOrder]：转发会把 lvalue 的地址求值
                 // 搬到 closure 分配之前；lookup、global 读取或其它运行时事件可观察到
                 // 相反顺序，反例见 regress_401。
                 return None;
             }
-            if let Some(target_name) = function_decl_target_from_lvalue(&assign.targets[0], target)
-            {
+            if let Some(target_name) = target_name {
                 return Some(AstStmt::FunctionDecl(Box::new(AstFunctionDecl {
                     target: target_name,
+                    global_declaration: false,
                     func: function.clone(),
                 })));
             }
@@ -138,7 +146,7 @@ fn inline_function_into_stmt(
     }
 }
 
-fn lvalue_prefix_can_move_before_closure(
+pub(super) fn lvalue_prefix_can_move_before_closure(
     target: &AstLValue,
     mutable_snapshots: &MutableSnapshotNames,
 ) -> bool {

@@ -14,6 +14,13 @@ use super::visit::HirVisitor;
 use crate::decompile::DecompileDialect;
 use crate::value_semantics::{LuaComparison, LuaLiteral, LuaValueSemantics};
 
+fn node_has_original_operation(expr: &HirExpr) -> bool {
+    matches!(expr, HirExpr::Binary(binary) if binary.source_site.is_some())
+        || matches!(expr, HirExpr::Unary(unary) if unary.source_site.is_some())
+        || matches!(expr, HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical)
+            if logical.preserves_boolean_prewrite)
+}
+
 /// 共享表达式、写目标和调用的观察边界；遍历范围与额外语句事件由消费者决定。
 ///
 /// 例如 generic-for header 的求值与隐式 dispatch 是不同事件，CFG 消费者不能把
@@ -168,35 +175,6 @@ impl HirExprSafety {
         self.values
     }
 
-    /// PUC 整数域中的直接字面量运算：既无元方法/分配，也不会抛错，结果为整数。
-    /// 只检查本节点，不递归重扫子树；浮点转换、动态值和零除数不借用此证明。
-    pub(crate) fn is_total_integer_literal_operation(self, expr: &HirExpr) -> bool {
-        if !self.values.distinguishes_integer_number_values() {
-            return false;
-        }
-        match expr {
-            HirExpr::Unary(unary) => {
-                unary.op == HirUnaryOpKind::BitNot && matches!(unary.expr, HirExpr::Integer(_))
-            }
-            HirExpr::Binary(binary) => {
-                let (HirExpr::Integer(_), HirExpr::Integer(rhs)) = (&binary.lhs, &binary.rhs)
-                else {
-                    return false;
-                };
-                match binary.op {
-                    HirBinaryOpKind::FloorDiv | HirBinaryOpKind::Mod => *rhs != 0,
-                    HirBinaryOpKind::BitAnd
-                    | HirBinaryOpKind::BitOr
-                    | HirBinaryOpKind::BitXor
-                    | HirBinaryOpKind::Shl
-                    | HirBinaryOpKind::Shr => true,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
-    }
-
     fn equality_is_stable(self, op: HirBinaryOpKind, lhs: &HirExpr, rhs: &HirExpr) -> bool {
         if op != HirBinaryOpKind::Eq {
             return false;
@@ -319,7 +297,7 @@ pub(crate) fn luau_literal_addition_value(lhs: &HirExpr, rhs: &HirExpr) -> Optio
 }
 
 impl HirExprSafety {
-    /// 表达式的求值能否在不改变 Lua 可观察行为的前提下被删除。
+    /// 表达式能否删除：既没有必须保留的原操作，也不改变 Lua 可观察行为。
     pub(crate) fn is_discard_safe(self, expr: &HirExpr) -> bool {
         self.discard_safe(expr, true)
     }
@@ -340,8 +318,16 @@ impl HirExprSafety {
             && !self.node_is_discard_safe_without_residual(expr)
     }
 
+    /// 完整表达式的 VM 观察能力；移动根边界或失效 capture 事实并不删除表达式。
+    pub(crate) fn may_observe_gc_roots(self, expr: &HirExpr) -> bool {
+        let mut effects = HirEvalEffects::new(self, |_| false);
+        super::visit::visit_expr(expr, &mut effects);
+        effects.found()
+    }
+
     fn discard_safe(self, expr: &HirExpr, allow_residual: bool) -> bool {
-        if !self.node_is_discard_safe(expr)
+        if node_has_original_operation(expr)
+            || !self.node_is_discard_safe(expr)
             || (!allow_residual && matches!(expr, HirExpr::Unresolved(_)))
         {
             return false;
@@ -358,6 +344,22 @@ impl HirExprSafety {
             }
             _ => true,
         }
+    }
+
+    /// 原操作的存在性独立于值域和 VM 观察事件；控制清理不能借恒值删除原检查。
+    pub(crate) fn contains_original_operation(expr: &HirExpr) -> bool {
+        struct Original(bool);
+        impl HirVisitor<'_> for Original {
+            fn is_complete(&self) -> bool {
+                self.0
+            }
+            fn visit_expr(&mut self, expr: &HirExpr) {
+                self.0 |= node_has_original_operation(expr);
+            }
+        }
+        let mut original = Original(false);
+        super::visit::visit_expr(expr, &mut original);
+        original.0
     }
 
     fn node_is_discard_safe(self, expr: &HirExpr) -> bool {
@@ -466,7 +468,8 @@ impl HirExprSafety {
                     && self.is_repeatable_with_context(&binary.rhs, single_value_vararg)
             }
             HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
-                self.is_repeatable_with_context(&logical.lhs, single_value_vararg)
+                !logical.preserves_boolean_prewrite
+                    && self.is_repeatable_with_context(&logical.lhs, single_value_vararg)
                     && self.is_repeatable_with_context(&logical.rhs, single_value_vararg)
             }
             HirExpr::GlobalRef(_)

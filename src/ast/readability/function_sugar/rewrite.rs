@@ -103,7 +103,9 @@ fn rewrite_block(
                     mutable_snapshots,
                 )
             })
-            .or_else(|| lower_direct_function_stmt(first, target).map(|stmt| (stmt, 1)));
+            .or_else(|| {
+                lower_direct_function_stmt(first, target, mutable_snapshots).map(|stmt| (stmt, 1))
+            });
 
         if let Some((stmt, consumed)) = rewritten {
             new_stmts.push(stmt);
@@ -293,6 +295,11 @@ fn rewrite_function_exprs_in_lvalue(
 
 fn rewrite_function_exprs_in_expr(expr: &mut AstExpr, target: AstTargetDialect) -> bool {
     match expr {
+        AstExpr::IfExpr(branch) => {
+            rewrite_function_exprs_in_expr(&mut branch.cond, target)
+                | rewrite_function_exprs_in_expr(&mut branch.then_expr, target)
+                | rewrite_function_exprs_in_expr(&mut branch.else_expr, target)
+        }
         AstExpr::FieldAccess(access) => rewrite_function_exprs_in_expr(&mut access.base, target),
         AstExpr::IndexAccess(access) => {
             rewrite_function_exprs_in_expr(&mut access.base, target)

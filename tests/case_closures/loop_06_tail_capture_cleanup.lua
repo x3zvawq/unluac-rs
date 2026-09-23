@@ -1,6 +1,7 @@
 -- body 末尾布尔值合流后的 Close/JMP 是正常迭代尾，不能误认为跳过 body 的 continue。
 -- unluac: expect-ast-min [[numeric-for]] [[2]]
 -- unluac: expect-not-contains [[goto ]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=0]]
 local function invoke(callback)
     return callback()
 end

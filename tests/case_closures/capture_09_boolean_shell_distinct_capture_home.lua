@@ -1,5 +1,6 @@
--- A reference-captured local in another slot does not observe the dead loop-local shell.
--- unluac: expect-not-contains [[not not]]
+-- 另一槽的 capture 不改变布尔写回；即使写回值未使用，也保留原 truthiness 检查。
+-- unluac: expect-contains [[not not]]
+-- unluac: expect-ast-count [[assign]] [[2]] [[@proto=1]]
 -- unluac: expect-not-contains [[if ]]
 
 local function run()

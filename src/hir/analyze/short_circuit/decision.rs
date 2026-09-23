@@ -46,13 +46,20 @@ pub(crate) fn build_condition_decision_expr(
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    (!nodes.is_empty()).then_some(HirDecisionExpr { entry, nodes })
+    (!nodes.is_empty()).then_some(HirDecisionExpr {
+        entry,
+        nodes,
+        emit_as_luau_if: false,
+    })
 }
 
 pub(crate) fn build_value_decision_expr(
     lowering: &ProtoLowering<'_>,
     decision: &ValueDecisionPlan,
 ) -> Option<HirDecisionExpr> {
+    if !decision.operands.is_empty() {
+        return super::operands::build_value_operands(lowering, decision);
+    }
     let entry = HirDecisionNodeRef(decision.entry.index());
     let nodes = decision
         .nodes
@@ -77,12 +84,16 @@ pub(crate) fn build_value_decision_expr(
             Some(lowered)
         })
         .collect::<Option<Vec<_>>>()?;
-    (!nodes.is_empty() && entry.index() < nodes.len()).then_some(HirDecisionExpr { entry, nodes })
+    (!nodes.is_empty() && entry.index() < nodes.len()).then_some(HirDecisionExpr {
+        entry,
+        nodes,
+        emit_as_luau_if: false,
+    })
 }
 
 /// 冻结 plan 已验证 terminal edge 到 result_phi 的物理 incoming；再核对原 LOADBOOL
 /// 与当前 test/终端，才把显式常量写译为该次比较的返回值，不留下可跨改写复用的许可。
-fn materialized_boolean_comparison(
+pub(super) fn materialized_boolean_comparison(
     lowering: &ProtoLowering<'_>,
     decision: &ValueDecisionPlan,
     node: &crate::structure::ValueDecisionNodePlan,
@@ -124,7 +135,7 @@ fn materialized_boolean_comparison(
         })
 }
 
-fn lower_value_target(
+pub(super) fn lower_value_target(
     lowering: &ProtoLowering<'_>,
     decision: &ValueDecisionPlan,
     target: ValueDecisionTarget,
@@ -134,22 +145,44 @@ fn lower_value_target(
             .then_some(HirDecisionTarget::Node(HirDecisionNodeRef(node.index()))),
         ValueDecisionTarget::Leaf(leaf) => {
             let leaf = decision.leaves.get(leaf.index())?;
-            let expr = match leaf.latest_local_def {
-                // entry prefix 会正常发射其中的定义。此时 leaf 必须继续引用这次已经
-                // 求值的 SSA identity；重新展开定义会把全局读取等动态操作执行两次。
-                Some(def)
-                    if lowering.dataflow.def_block(def) == decision.header()?
-                        && leaf.value == crate::structure::SsaValue::Def(def) =>
+            // 值叶可以直接转交同一 decision 内较早的 LOADBOOL/LOADK，定义不一定
+            // 位于叶块。其原块不会发射；继续引用 temp 会把 false 变成未初始化 nil。
+            // 这里只展开无独立求值事件的字面量，动态共享 producer 仍保留身份。
+            let carried_literal = match leaf.value {
+                crate::structure::SsaValue::Def(def)
+                    if lowering.dataflow.def_block(def) != decision.header()?
+                        && lowering
+                            .structure
+                            .plan()
+                            .region_for_block(lowering.dataflow.def_block(def))
+                            == lowering
+                                .structure
+                                .plan()
+                                .region_for_block(decision.header()?) =>
                 {
-                    expr_for_emitted_header_leaf(lowering, decision.header()?, def)
+                    expr_for_direct_literal_def(lowering, def)
                 }
-                // ValueDecision 吞掉了 leaf block 的普通指令，必须优先沿完整单次求值
-                // 依赖链展开；普通 def lowering 可能返回引用那些不会再被发射的中间 temp。
-                Some(def) => expr_for_fixed_def_single_eval(lowering, def)
-                    .or_else(|| expr_for_fixed_def(lowering, def))?,
-                None => super::super::exprs::expr_for_ssa_value_in_block(
-                    lowering, leaf.block, leaf.value,
-                )?,
+                _ => None,
+            };
+            let expr = if let Some(literal) = carried_literal {
+                literal
+            } else if let crate::structure::SsaValue::Def(def) = leaf.value
+                && lowering.dataflow.def_block(def) == decision.header()?
+            {
+                // 内部操作数可以把入口写入转交到较晚的叶；latest_local_def 只描述
+                // 该叶块，不能因此丢掉已经冻结的入口 SSA 身份。
+                // Header prefix 正常发射，动态 producer 必须读取原值，不能再次求值。
+                expr_for_emitted_header_leaf(lowering, decision.header()?, def)
+            } else {
+                match leaf.latest_local_def {
+                    // ValueDecision 吞掉了 leaf block 的普通指令，必须优先沿完整单次求值
+                    // 依赖链展开；普通 def lowering 可能返回引用那些不会再被发射的中间 temp。
+                    Some(def) => expr_for_fixed_def_single_eval(lowering, def)
+                        .or_else(|| expr_for_fixed_def(lowering, def))?,
+                    None => super::super::exprs::expr_for_ssa_value_in_block(
+                        lowering, leaf.block, leaf.value,
+                    )?,
+                }
             };
             Some(HirDecisionTarget::Expr(expr))
         }
@@ -160,7 +193,7 @@ fn lower_value_target(
     }
 }
 
-fn expr_for_emitted_header_leaf(
+pub(super) fn expr_for_emitted_header_leaf(
     lowering: &ProtoLowering<'_>,
     header: BlockRef,
     def: crate::structure::DefId,
@@ -177,12 +210,12 @@ fn expr_for_emitted_header_leaf(
 
     // Header prefix 仍按原位置发射。这里只把没有源码/捕获身份的稳定字面量交给
     // decision leaf；随后 dead-temp 才能在确认无剩余引用后删除那条机械赋值。
+    // 捕获身份由当前 temp/local binding 判断；同槽未来另一版本的 capture 不约束本次字面量。
     if !matches!(
         lowering.bindings.temp_debug_locals.get(temp.index()),
         Some(None)
     ) || lowering.bindings.captured_temp_targets.contains_key(&temp)
         || lowering.bindings.temp_decl_locals.contains_key(&temp)
-        || lowering.dataflow.reg_is_reference_captured(reg)
         || lowering
             .bindings
             .local_for_reg_in_block(header, reg)
@@ -191,7 +224,12 @@ fn expr_for_emitted_header_leaf(
         return fallback();
     }
 
-    expr_for_direct_literal_def(lowering, def).unwrap_or_else(fallback)
+    // Boolean 预写由完整帧按原结果槽重发；其他入口常量仍可能是分支前已经生效的
+    // 初始化。先保留其读取身份，不能把入口写改成仅在未选中另一臂时才执行的字面量。
+    match expr_for_direct_literal_def(lowering, def) {
+        Some(value @ HirExpr::Boolean(_)) => value,
+        _ => fallback(),
+    }
 }
 
 fn lower_condition_subjects(

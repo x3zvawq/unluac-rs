@@ -1,4 +1,5 @@
 -- 原 nil 声明的 scope 跨过内层 CLOSE；写入和外层返回必须沿同一绑定，不逐轮补新声明。
+-- unluac: expect-ast-count [[do-block]] [[1]] [[@proto=1]] [[@dialect=luau]]
 local function build()
     local result
     do

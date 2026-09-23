@@ -102,14 +102,14 @@ fn find_candidate(
         let target_states =
             writeback_targets(&block.stmts[declaration + 1..=last_mention], result_binding)
                 .into_iter()
-                .filter(|state| *state != result_binding)
+                .filter(|(state, _)| *state != result_binding)
                 .collect::<Vec<_>>();
         if target_states.is_empty() {
             continue;
         }
         let available_states = target_states
             .into_iter()
-            .filter(|state| {
+            .filter(|(state, _)| {
                 binding_available_before(
                     block,
                     declaration,
@@ -126,16 +126,19 @@ fn find_candidate(
         }
         let eligible_states = available_states
             .into_iter()
-            .filter(|state| {
-                identity_facts.binding_merge_preserves_identity(
+            .filter(|(state, phi_writeback)| {
+                identity_facts.binding_merge_preserves_retained_target(
                     result_binding,
                     *state,
                     promotion_facts,
+                    false,
+                    *phi_writeback,
                 ) && !state
                     .local()
                     .is_some_and(|local| identity_facts.for_bindings.contains(&local))
                     && same_exact_home_slot(result_binding, *state, promotion_facts)
             })
+            .map(|(state, _)| state)
             .collect::<Vec<_>>();
         if eligible_states.is_empty() {
             // 候选拒绝[SemanticBarrier:Lifetime]：capture/for/异槽 state 与 result 具有
@@ -181,13 +184,13 @@ fn candidate_declaration(stmt: &HirStmt) -> Option<(LocalId, Option<&HirValuePac
     ))
 }
 
-fn writeback_targets(stmts: &[HirStmt], result: CarryBinding) -> Vec<CarryBinding> {
+fn writeback_targets(stmts: &[HirStmt], result: CarryBinding) -> BTreeMap<CarryBinding, bool> {
     let mut collector = WritebackTargetCollector {
         result,
-        targets: BTreeSet::new(),
+        targets: BTreeMap::new(),
     };
     visit_stmts(stmts, &mut collector);
-    collector.targets.into_iter().collect()
+    collector.targets
 }
 
 fn completed_writeback_states(
@@ -275,7 +278,7 @@ pub(super) fn region_rewrites_preserve_external_transfers(
 
 struct WritebackTargetCollector {
     result: CarryBinding,
-    targets: BTreeSet<CarryBinding>,
+    targets: BTreeMap<CarryBinding, bool>,
 }
 
 impl HirVisitor<'_> for WritebackTargetCollector {
@@ -293,7 +296,13 @@ impl HirVisitor<'_> for WritebackTargetCollector {
                 && let Some(target) = carry_binding_from_lvalue(target)
                 && target != self.result
             {
-                self.targets.insert(target);
+                let phi_writeback = assign.is_phi_transfer
+                    && assign.values.tail.is_none()
+                    && value.and_then(carry_binding_from_expr) == Some(self.result);
+                self.targets
+                    .entry(target)
+                    .and_modify(|all_phi| *all_phi &= phi_writeback)
+                    .or_insert(phi_writeback);
             }
         }
     }
@@ -712,6 +721,10 @@ fn apply_candidate(
     let result = CarryBinding::Local(candidate.result);
     if let Some(values) = candidate.initializer {
         block.stmts[candidate.declaration] = HirStmt::Assign(Box::new(HirAssign {
+            luau_compound_global: false,
+            upvalue_write_source: None,
+            is_phi_transfer: false,
+            parallel_nil_frame: None,
             targets: vec![binding_lvalue(candidate.state)],
             values,
             initializer_merge_transaction: None,

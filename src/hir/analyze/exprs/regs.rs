@@ -198,14 +198,21 @@ pub(crate) fn expr_for_reg_use_single_eval_with_call_policy(
             .unwrap_or_else(|| expr_for_entry_reg(lowering, entry_reg)),
         SsaValue::Def(def) => {
             let temp = lowering.bindings.fixed_temps[def.index()];
-            if lowering.bindings.captured_temp_targets.contains_key(&temp) {
-                return lowering.bindings.expr_for_temp(temp);
-            }
             let def_block = lowering.dataflow.def_block(def);
             let def_is_absorbed = decision_owner.is_some_and(|owner| {
                 absorbed_decision_owner(lowering, def_block) == Some(owner)
                     && absorbed_decision_entry(lowering, owner) != Some(def_block)
             });
+            // 内部定义不会单独发射；未来才创建的 capture 不能把当前初始化值
+            // 改读成尚未写入的 cell。已有开放引用或入口 prefix 仍读取原绑定。
+            if lowering.bindings.captured_temp_targets.contains_key(&temp)
+                && !(def_is_absorbed
+                    && lowering
+                        .promotion_facts
+                        .temp_definition_reference_unaliased(temp))
+            {
+                return lowering.bindings.expr_for_temp(temp);
+            }
             if def_block != block && !def_is_absorbed {
                 return lowering
                     .bindings
