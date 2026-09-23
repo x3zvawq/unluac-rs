@@ -2,6 +2,54 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_lifetime/scope_11_scalar_call_prefix.lua",
+        &["call-frame", "scope", "scalar", "metamethod", "recompile"],
+        "单读标量保留原 CALL 前缀，前段声明及时出栈，后段构造器与短路元方法仍各求值一次。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_lifetime/scope_10_captured_branch_close.lua",
+        &["scope", "capture", "branch", "debug"],
+        "捕获声明跨内部条件后在独立 CLOSE 处结束，后继调用不再看到其 debug local，闭包仍读到正确值。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_lifetime/scope_09_call_root_frame_reuse.lua",
+        &["gc", "call-root", "scope", "slot-reuse"],
+        "匿名 CALL 结果保活到精确槽覆盖，后继完整调用同时退休旧声明与高槽参数残根。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_lifetime/close_01_scope_slot_reuse.lua",
         &["capture-cell", "slot-reuse", "upvalue"],
         "区分离开 do scope 后已关闭 count cell 与后续同槽复用，并验证 RHS 闭包捕获 inner 时不污染 outer。",
@@ -1029,6 +1077,44 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
                 retain_debug: true,
                 ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_lifetime/copy_19_call_result_scratch_root.lua",
+        &[
+            "call-result",
+            "copy",
+            "gc",
+            "runtime-observer",
+            "scratch-root",
+        ],
+        "Luau O2内联CALL结果与低槽COPY分别保活，参数覆盖副本后原结果仍可被后继回调观察。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_lifetime/copy_20_fastcall_result_scratch_root.lua",
+        &["fastcall", "copy", "gc", "runtime-observer", "scratch-root"],
+        "Luau O2展开FASTCALL在环境覆盖时仍保留高结果根、低COPY及短路路径，不引入实际helper调用。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
             }),
         ],
     ),
