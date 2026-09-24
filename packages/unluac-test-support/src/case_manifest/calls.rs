@@ -2,6 +2,138 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_10_dynamic_lookup_message.lua",
+        &[
+            "fastcall",
+            "dynamic-key",
+            "concat",
+            "metamethod",
+            "snapshot",
+        ],
+        "索引首参数与 CONCAT 消息同帧求值，消息元方法改写原表时仍使用先前索引快照。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/results_11_writeback_before_capture.lua",
+        &["multi-result", "capture", "slot-reuse", "recompile"],
+        "多结果写回与同槽未来捕获区分原 Def，保持调用次数、低槽赋值和后继闭包的 cell。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/results_10_return_arithmetic_frame.lua",
+        &["return", "multi-result", "metamethod", "recompile"],
+        "RETURN 首项快照和后一项算术同帧恢复，保留对象身份、元方法次数及三轮收敛。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/results_09_reused_writeback_versions.lua",
+        &[
+            "call-frame",
+            "multi-result",
+            "slot-reuse",
+            "eval-order",
+            "recompile",
+        ],
+        "不同宽度 CALL 复用结果槽时按原 Def 证明低槽写回，后续新声明不继承旧 scratch 身份。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/callee_07_nested_lookup_frame.lua",
+        &[
+            "call-frame",
+            "lookup-order",
+            "metamethod",
+            "callee-snapshot",
+        ],
+        "嵌套字段 callee 在参数改写前各读取一次，保留完整调用比较及原函数快照。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/results_08_grouped_call_declarations.lua",
+        &[
+            "call-frame",
+            "declaration",
+            "eval-order",
+            "fastcall",
+            "recompile",
+        ],
+        "并列 CALL 声明保持共同 scratch、求值顺序、单值截断及独立对象身份，反复重编译不产生 COPY 链。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/callee_06_truthy_call_chain_frame.lua",
         &["callee", "condition", "call-frame", "eval-order"],
         "条件调用链整体重发原单结果帧，保持 truthiness、求值顺序和具名结果身份。",
@@ -496,6 +628,69 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_calls/method_17_inlined_factory_identity.lua",
+        &[
+            "closure-identity",
+            "evaluation-order",
+            "method-call",
+            "inlining",
+        ],
+        "同形工厂的共享方法仍属不同原始模板，展开捕获更新与receiver写回保持身份、次数及debug绑定。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/method_16_open_tail_writeback.lua",
+        &["method", "open-tail", "eval-order", "writeback"],
+        "观察开放尾参数、方法 lookup 与 dispatch 的顺序，并保持多返回宽度和原 receiver 写回。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/roots_02_call_dispatch_root_order.lua",
         &["argument", "callee-lookup", "gc-root"],
         "对Luajit动态环境调用分别把pair结果home作为被覆盖callee或独立argument，观察callee lookup、dispatch、value清空与caller清空时根存活差异。",
@@ -743,6 +938,30 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)],
     ),
     LuaCaseDefinition::new(
+        "tests/case_calls/roots_05_closed_parameter_returns.lua",
+        &["callable", "gc-root", "parameter", "return-value", "escape"],
+        "闭包实参汇总包含资源调用，存表后的入口不沿用局部原始值调用域；非尾调用保留资源根。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/results_04_call_result_frame.lua",
         &["boolean", "call-result", "gc", "scratch", "scope"],
         "单结果CALL保留接收宽度及原词法末端；常量覆盖与后继CALL复用均不得延长旧根或抬高帧。",
@@ -799,6 +1018,26 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_05_saved_builtin_aliases.lua",
+        &["fastcall", "lookup-order", "open-return", "snapshot"],
+        "保存的 builtin 与多级别名在参数回调替换全局后仍读取原快照，固定与开放参数保留原调用协议。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_calls/fastcall_04_fastcall_direct_tables.lua",
         &[
             "fastcall",
@@ -813,6 +1052,86 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             LuaCaseConfiguration::new(LUAU_ONLY)
                 .with_options(LuaCaseOptions {
                     retain_debug: true,
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_06_library_open_tail.lua",
+        &["fastcall", "lookup-order", "open-return"],
+        "保存的库表在开放尾回调后读取 fallback 字段，保留固定首参数与多返回尾宽度。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_07_expanded_indexed_result.lua",
+        &["fastcall", "inlining", "lookup-order", "recompile"],
+        "Luau 内联参数保留高槽输入，嵌套开放 CALL 的单结果索引写回低槽，并在后继调用中观察冻结状态。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_08_expanded_indexed_comparison.lua",
+        &["fastcall", "inlining", "lookup-order", "recompile"],
+        "Luau 展开索引结果参与比较时，保留 Boolean 结果槽、原调用者以及临时根后缀。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/fastcall_09_expanded_short_circuit.lua",
+        &["fastcall", "inlining", "short-circuit", "recompile"],
+        "Luau 展开索引调用参与短路参数时，保留 Boolean 预写、条件调用与原临时根。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
                     ..LuaCaseOptions::DEFAULT
                 })
                 .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
@@ -861,6 +1180,22 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["generic-for", "open-return", "table-field", "vararg"],
         "表构造、泛型for、开放变参select与字段写共享临时槽时保持计数、首值和赋值顺序。",
         &[LuaCaseConfiguration::new(PUC_LUA_ALL)],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_calls/arguments_12_constructor_capture_reuse.lua",
+        &["table-field", "capture", "call-frame", "readability"],
+        "构造器准备槽随后被新捕获变量复用时，保留真实cell且不重复物化早期元素。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_calls/results_06_callee_scratch_observation.lua",
