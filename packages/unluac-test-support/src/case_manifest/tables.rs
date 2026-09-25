@@ -2,6 +2,215 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_tables/constructor_15_reused_nil_initializer.lua",
+        &["constructor", "nil", "identity", "recompile"],
+        "嵌套构造器槽随后复用为 nil 声明时，由原初始化承接匿名占位，避免重编译增加声明。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_14_return_frame.lua",
+        &[
+            "constructor",
+            "return",
+            "call-frame",
+            "identity",
+            "recompile",
+        ],
+        "前一次 CALL 写入上值后，原槽新建的表直接返回，保持各次分配身份和调用次数。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/indexing_14_nested_dynamic_return.lua",
+        &[
+            "return",
+            "dynamic-key",
+            "metamethod",
+            "target-snapshot",
+            "recompile",
+        ],
+        "嵌套 base 和动态 key 按原槽依次求值，key 回调替换来源后仍查询先前读取的表。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                })
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/indexing_13_captured_field_update.lua",
+        &[
+            "upvalue",
+            "arithmetic",
+            "short-circuit",
+            "metamethod",
+            "recompile",
+        ],
+        "上值字段算术保留短路输入、写回与后继重新读取，直接 GETTABUP 不需要额外 base 槽。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_13_nested_before_method_install.lua",
+        &["constructor", "closure", "method", "call-frame"],
+        "嵌套表 initializer 与后续方法安装分别重放，临时槽复用不成为跨对象声明。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/indexing_12_upvalue_rhs_frame.lua",
+        &["indexed-assignment", "upvalue", "metamethod", "convergence"],
+        "字段赋值保留原目标与 RHS 的上值读取，元方法改写 cell 后下次调用才读取新值。",
+        &[
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(PUC_LUA_ALL).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/indexing_11_closure_rhs_frame.lua",
+        &["indexed-assignment", "closure", "capture", "metamethod"],
+        "SETTABLE/SETTABUP 在原 scratch 创建字段闭包，安装回调和后继写继续共享捕获 cell。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/indexing_10_direct_rhs_key_frame.lua",
+        &["indexed-assignment", "direct-rhs", "capture", "eval-order"],
+        "动态key改写目标或captured绑定后，SETTABLE仍在原时点读取低槽RHS并保留目标快照。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/indexing_09_literal_rhs_key_frame.lua",
+        &[
+            "indexed-assignment",
+            "call-frame",
+            "metamethod",
+            "eval-order",
+        ],
+        "PUC RK 与 LuaJIT 寄存器字面量赋值保持 key 的 CALL/字段读取及目标 cell 快照，整帧不保留中转声明。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_tables/template_07_record_closure_initializers.lua",
+        &["constructor", "template", "closure", "capture"],
+        "闭包 record 初始化消费原模板占位，保留常量字段及多个闭包共享的捕获 cell。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/setlist_12_iterator_carried_binding_frames.lua",
         &[
             "setlist",
@@ -548,6 +757,27 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_tables/indexing_08_indexed_call_snapshot.lua",
+        &[
+            "call-frame",
+            "indexed-assignment",
+            "metamethod",
+            "target-snapshot",
+        ],
+        "计算索引与单结果CALL保持原SETTABLE/SETTABUP的目标读取时点，显式快照不被同名cell替代，匿名闭包直接返回。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_tables/constructor_09_table_initializer_after_call.lua",
         &[
             "call-frame",
@@ -594,5 +824,29 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             }),
         ],
     ),
-
+    LuaCaseDefinition::new(
+        "tests/case_tables/constructor_12_empty_array_frame.lua",
+        &["call-frame", "readability", "recompile"],
+        "空数组与相邻非空数组在原缓冲槽创建，完整 iterator 初始化不残留临时根和清零。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LUAU_OPTIMIZED_OPTIONS
+            }),
+        ],
+    ),
 ];
