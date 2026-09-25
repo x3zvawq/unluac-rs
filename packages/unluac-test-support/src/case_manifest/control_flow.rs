@@ -13,6 +13,102 @@ const MUTABLE_GENERIC_KEY_DIALECTS: &[LuaCaseDialect] = &[
 
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_33_condition_prefix_scope.lua",
+        &["short-circuit", "scope", "single-pass"],
+        "完整条件接管 early escape 后保留入口定义的外层作用域。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_32_parameter_phi_snapshot.lua",
+        &["phi", "parameter", "capture", "snapshot"],
+        "参数被后续写入或引用捕获时，同值合流仍保留选择时的独立快照。",
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_31_local_prefix_return_frame.lua",
+        &[
+            "return",
+            "short-circuit",
+            "call-frame",
+            "identity",
+            "recompile",
+        ],
+        "已有低槽 local 后的纯值返回判定树在共同 scratch 写回，叶 COPY 随完整前缀恢复。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/branch_30_shared_return_connector.lua",
+        &["short-circuit", "return", "shared-condition", "truth-table"],
+        "共享判断经单入口connector汇入返回臂时仍恢复完整短路条件。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/branch_29_loop_header_arm_boundary.lua",
         &["branch", "loop-backedge", "region-owner", "coroutine"],
         "循环 header 作为一臂出口时，不将另一臂的条件尾部移到 branch 外。",
@@ -403,6 +499,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["goto", "irreducible", "numeric-for", "while"],
         "island内plain loop只保留必要goto，同时前置for保持结构化。",
         &[LuaCaseConfiguration::new(LUA_GOTO_DIALECTS)],
+    ),
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/island_09_return_goto_polarity.lua",
+        &["convergence", "goto", "irreducible", "metamethod"],
+        "双入口岛的条件回跳与相同退出返回稳定极性，保留比较输入的每次元方法观察。",
+        &[
+            LuaCaseConfiguration::new(LUA_GOTO_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/return_06_terminal_empty_return_guard.lua",
@@ -1394,6 +1501,28 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         ],
     ),
     LuaCaseDefinition::new(
+        "tests/case_control_flow/loop_44_open_call_condition.lua",
+        &[
+            "while",
+            "open-call",
+            "condition",
+            "break",
+            "evaluation-order",
+        ],
+        "OPEN尾包与fixed参数共同归属while条件，观察零轮、条件退出和break退出时的求值顺序与状态。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_control_flow/loop_40_flow.lua",
         &["break", "if", "numeric-for", "while"],
         "九组基础控制流覆盖提前return、while/for、嵌套break、分支phi、call条件、参数重赋值和目标搜索。",
@@ -1509,5 +1638,24 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             }),
         ],
     ),
-
+    LuaCaseDefinition::new(
+        "tests/case_control_flow/continue_17_shared_short_circuit_exit.lua",
+        &["continue", "short-circuit", "repeat", "evaluation-order"],
+        "共享 continue 的条件恢复短路表达式，保留调用顺序和 repeat 尾条件，区分 break 出口。",
+        &[
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    retain_debug: true,
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
+        ],
+    ),
 ];
