@@ -246,12 +246,16 @@ fn analyze_structure_proto_one(
         .filter(|candidate| !candidate.is_value_operand_only())
         .flat_map(|candidate| candidate.blocks.iter().copied())
         .collect::<BTreeSet<_>>();
+    let mut loop_condition_safety_workspace =
+        ConditionSafetyWorkspace::new(proto, cfg, graph_facts, dataflow, &short_circuit_candidates);
+    let source_initializer_blocks = loop_condition_safety_workspace.source_initializer_blocks(cfg);
     let closed_control_dags = short_circuit::analyze_closed_control_dags(
         short_circuit::ClosedControlDagContext {
             proto,
             cfg,
             graph_facts,
             dataflow,
+            source_initializer_blocks: &source_initializer_blocks,
         },
         &irreducible_regions,
         &loop_candidates,
@@ -263,8 +267,6 @@ fn analyze_structure_proto_one(
     // 同一个 header 最终就可能拿到一份更窄、且仍指向 loop body 的伪尾条件。
     // 这里只查询 BranchExit；ValueMerge 往往携带最大的 blocks/nodes/leaf payload，
     // 把整张 short-circuit 表复制一遍既无语义作用，也会按 phi 放大内存。
-    let mut loop_condition_safety_workspace =
-        ConditionSafetyWorkspace::new(dataflow, &short_circuit_candidates);
     let mut short_circuit_candidates_for_loops = short_circuit_candidates
         .iter()
         .filter(|candidate| matches!(candidate.exit, ShortCircuitExit::BranchExit { .. }))

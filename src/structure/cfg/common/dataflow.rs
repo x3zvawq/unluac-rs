@@ -289,6 +289,22 @@ impl DataflowFacts {
             .fixed
     }
 
+    /// 同时枚举固定 SSA 值与开放包 producer；f(g()) 的 g 不属于 fixed reads。
+    /// 这里只提供直接依赖，控制域截断与去重由各消费者的分析快照负责。
+    pub(crate) fn evaluation_inputs(
+        &self,
+        instr: InstrRef,
+    ) -> impl Iterator<Item = EvaluationDependency> + '_ {
+        self.use_values_at(instr)
+            .values()
+            .map(EvaluationDependency::Value)
+            .chain(
+                self.open_use_sources_at(instr).defs().iter().map(|def| {
+                    EvaluationDependency::Instruction(self.open_defs[def.index()].instr)
+                }),
+            )
+    }
+
     pub fn open_use_sources_at(&self, instr: InstrRef) -> &OpenUseSources {
         self.open_use_sources
             .get(instr.index())
@@ -972,4 +988,11 @@ impl fmt::Display for SsaValue {
             Self::Phi(phi) => phi.fmt(f),
         }
     }
+}
+
+/// fixed 值沿 SSA 追踪，开放包沿其真实产出指令追踪。
+#[derive(Clone, Copy)]
+pub(crate) enum EvaluationDependency {
+    Value(SsaValue),
+    Instruction(InstrRef),
 }

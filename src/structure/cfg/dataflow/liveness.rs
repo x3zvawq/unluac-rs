@@ -1,8 +1,7 @@
 //! 这个文件实现 Dataflow 内部的寄存器活跃性固定点求解。
 //!
-//! 它只消费 CFG 后继关系与已经解析的真实寄存器 use/def，产出后续 phi
-//! 与 StructureFacts 可复用的 live-in/live-out 集合；这里不判断 branch/loop/短路候选，
-//! 也不把活跃性解释成源码级变量身份。
+//! 逻辑活性只消费真实 use/def；SSA 保留活性额外消费物理 root 观察前缀。
+//! 两者独立求解，后者不产生读取身份，也不改变对外的逻辑活性。
 //!
 //! 例子：某个 block 之后的后继仍读取 r3，则 r3 会进入当前 block 的 live_out；
 //! 如果当前 block 先定义 r3 再读取后继值，固定点会把该定义挡在 live_in 之外。
@@ -30,6 +29,7 @@ pub(super) fn solve_liveness(
     instr_effects: &[InstrEffect],
     fixed_uses: &FixedUseFacts<'_>,
     reg_count: usize,
+    root_observations: Option<&[SideEffectSummary]>,
 ) -> Result<BlockLiveness, StructureError> {
     let mut block_uses = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
     let mut block_defs = vec![DenseRegSet::new(reg_count); cfg.blocks.len()];
@@ -41,8 +41,26 @@ pub(super) fn solve_liveness(
 
         let defs = &mut block_defs[block.index()];
         let uses = &mut block_uses[block.index()];
+        let mut observed_prefix_end = 0;
 
         for instr_index in instr_indices {
+            // root 观察是 SSA 保留需求，不是真实读取；独立求解，不能伪造 UseSite
+            // 或改变对外发布的逻辑 live-in/live-out。
+            if let Some(summaries) = root_observations {
+                let end = match summaries[instr_index].root_observation {
+                    RootObservation::PrefixLowerBound { end } => end,
+                    RootObservation::Call { caller_end } => caller_end.index(),
+                    _ => 0,
+                };
+                // uses/defs 在块内只增不减；每个观察前缀槽只检查一次。
+                let end = end.min(reg_count);
+                for reg in (observed_prefix_end..end).map(Reg) {
+                    if !defs.contains(reg)? {
+                        uses.insert(reg)?;
+                    }
+                }
+                observed_prefix_end = observed_prefix_end.max(end);
+            }
             for reg in fixed_uses.liveness_regs(InstrRef(instr_index)) {
                 if !defs.contains(reg)? {
                     uses.insert(reg)?;

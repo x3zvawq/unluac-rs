@@ -1,6 +1,7 @@
 //! 选择并证明值短路判定 DAG；依赖 SSA、phi 与闭合性证据，不负责普通布尔条件；例如筛除结果定义逃逸的 and/or value merge。
 
 use super::*;
+use crate::structure::cfg::EvaluationDependency;
 
 pub(super) fn selected_value_decisions(
     proto: &LoweredProto,
@@ -14,7 +15,7 @@ pub(super) fn selected_value_decisions(
     let mut group_by_dag = HashMap::<ValueDecisionDagKey<'_>, usize>::new();
     let mut groups = Vec::<Vec<(usize, &ShortCircuitCandidate)>>::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        let (ShortCircuitExit::ValueMerge(merge), Some(_), Some(_), Some(_)) = (
+        let (ShortCircuitExit::ValueMerge(merge), Some(_), Some(reg), Some(entry_value)) = (
             &candidate.exit,
             candidate.result_phi_id,
             candidate.result_reg,
@@ -24,6 +25,23 @@ pub(super) fn selected_value_decisions(
         };
         if !candidate.reducible || candidate.nodes.is_empty() || candidate.value_incomings.len() < 2
         {
+            continue;
+        }
+        let branch_instr = cfg.blocks[candidate.header.index()].instrs.end() - 1;
+        if proto
+            .debug_locals
+            .source_visible_at(reg, &proto.lowering_map.pc_map()[branch_instr])
+            && candidate.value_incomings.iter().any(|incoming| {
+                incoming.value == entry_value && incoming.latest_local_def.is_none()
+            })
+            && !candidate.nodes.iter().any(|node| {
+                let test = cfg.blocks[node.header.index()].instrs.end() - 1;
+                dataflow.instr_effects[test].uses_fixed(reg)
+            })
+        {
+            // 候选拒绝[SemanticBarrier:BindingIdentity]：活动源码 local 在未赋值臂
+            // 只是沿边保留旧值；把它当作短路结果会新增 fallback 读取及一次自赋值。
+            // 仍由条件/分支 owner 恢复更新，显式测试结果 local 的 and/or 不受影响。
             continue;
         }
         let key = ValueDecisionDagKey::new(candidate, *merge);
@@ -44,7 +62,16 @@ pub(super) fn selected_value_decisions(
     for mut group in groups {
         // 同一控制 DAG 最终只能有一个 containment owner。按最终 payload 的 PhiId
         // 顺序寻找首个合法 result，和 arena 原本的稳定胜出顺序一致；控制闭包只证明一次。
-        group.sort_by_key(|(index, candidate)| (candidate.result_phi_id, *index));
+        // 物理 root 合流不能抢走同一 DAG 的实际返回值身份。
+        group.sort_by_key(|(index, candidate)| {
+            (
+                candidate
+                    .result_phi_id
+                    .is_some_and(|phi| dataflow.phi_is_truly_dead(phi)),
+                candidate.result_phi_id,
+                *index,
+            )
+        });
         let Some((_, representative)) = group.first().copied() else {
             continue;
         };
@@ -269,7 +296,7 @@ pub(super) struct ValueDecisionCandidateScratch {
     relevant_defs: Vec<super::super::DefId>,
     boundary_live_phis: Vec<super::super::PhiId>,
     result_required_instrs: Vec<InstrRef>,
-    pending_values: Vec<ValueDecisionDependency>,
+    pending_values: Vec<EvaluationDependency>,
     pending_phis: Vec<super::super::PhiId>,
 }
 
@@ -754,19 +781,19 @@ fn mark_value_decision_dependencies(
     dependency_def_epochs: &mut [usize],
     dependency_phi_epochs: &mut [usize],
     dependency_epoch: usize,
-    pending_values: &mut Vec<ValueDecisionDependency>,
+    pending_values: &mut Vec<EvaluationDependency>,
     root: super::super::SsaValue,
     already_proven: impl Fn(super::super::SsaValue) -> bool,
 ) -> bool {
     pending_values.clear();
-    pending_values.push(ValueDecisionDependency::Value(root));
+    pending_values.push(EvaluationDependency::Value(root));
     while let Some(dependency) = pending_values.pop() {
-        if matches!(dependency, ValueDecisionDependency::Value(value) if already_proven(value)) {
+        if matches!(dependency, EvaluationDependency::Value(value) if already_proven(value)) {
             continue;
         }
         match dependency {
-            ValueDecisionDependency::Value(super::super::SsaValue::Entry(_)) => {}
-            ValueDecisionDependency::Value(super::super::SsaValue::Def(def)) => {
+            EvaluationDependency::Value(super::super::SsaValue::Entry(_)) => {}
+            EvaluationDependency::Value(super::super::SsaValue::Def(def)) => {
                 let Some(stamp) = dependency_def_epochs.get_mut(def.index()) else {
                     return false;
                 };
@@ -777,9 +804,9 @@ fn mark_value_decision_dependencies(
                 let Some(definition) = dataflow.defs.get(def.index()) else {
                     return false;
                 };
-                pending_values.push(ValueDecisionDependency::Instruction(definition.instr));
+                pending_values.push(EvaluationDependency::Instruction(definition.instr));
             }
-            ValueDecisionDependency::Instruction(instr) => {
+            EvaluationDependency::Instruction(instr) => {
                 let Some(block) = cfg.instr_to_block.get(instr.index()) else {
                     return false;
                 };
@@ -793,20 +820,9 @@ fn mark_value_decision_dependencies(
                     continue;
                 }
                 *needed = dependency_epoch;
-                if let Some(uses) = dataflow.use_values.get(instr.index()) {
-                    pending_values.extend(uses.fixed.values().map(ValueDecisionDependency::Value));
-                }
-                // f(g()) 的 g 只定义 open pack，不出现在 fixed SSA reads 中。
-                // 必须沿 Dataflow 已证明的 producer 追踪，才能保留调用次数、顺序与参数宽度；
-                // 指令 epoch 同时去重 fixed/open 两条依赖路径及嵌套开放调用链。
-                for def in dataflow.open_use_sources_at(instr).defs() {
-                    let Some(producer) = dataflow.open_defs.get(def.index()) else {
-                        return false;
-                    };
-                    pending_values.push(ValueDecisionDependency::Instruction(producer.instr));
-                }
+                pending_values.extend(dataflow.evaluation_inputs(instr));
             }
-            ValueDecisionDependency::Value(super::super::SsaValue::Phi(phi)) => {
+            EvaluationDependency::Value(super::super::SsaValue::Phi(phi)) => {
                 let Some(stamp) = dependency_phi_epochs.get_mut(phi.index()) else {
                     return false;
                 };
@@ -835,16 +851,10 @@ fn mark_value_decision_dependencies(
                 pending_values.extend(
                     phi.incoming
                         .iter()
-                        .map(|incoming| ValueDecisionDependency::Value(incoming.value)),
+                        .map(|incoming| EvaluationDependency::Value(incoming.value)),
                 );
             }
         }
     }
     true
-}
-
-#[derive(Clone, Copy)]
-enum ValueDecisionDependency {
-    Value(super::super::SsaValue),
-    Instruction(InstrRef),
 }

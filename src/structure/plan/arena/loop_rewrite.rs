@@ -853,6 +853,9 @@ pub(super) fn loop_iteration_escape_entry(
             cfg.edges.get(edge_ref.index()).is_some_and(|edge| {
                 edge.from == entry
                     && edge.to == candidate.header
+                    // 单指令 fallthrough 仍可执行 SETTABLE 等真实动作；只有原 Jump
+                    // 才是纯转发的 continue 垫块，不能将尾部写入移出条件臂。
+                    && edge.kind == EdgeKind::Jump
                     && cfg.blocks[entry.index()].instrs.len == 1
                     && cfg.succs[entry.index()].as_slice() == [*edge_ref]
             })

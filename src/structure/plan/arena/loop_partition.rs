@@ -251,9 +251,9 @@ pub(super) fn build_loop_partition(
                 owned.remove(&exit);
             }
         }
-        LoopKindHint::NumericForLike | LoopKindHint::GenericForLike if !caps.goto_label => {
-            // 无 goto 目标不能把首轮 body prefix 或 terminal arm 留成跨 loop 跳转；
-            // goto-capable 目标则保留 mixed island，避免把不可规约 for 网格强压进树。
+        LoopKindHint::NumericForLike | LoopKindHint::GenericForLike => {
+            // loops 已按支配关系与真实 LoopExit 冻结词法边界；支持 goto 不会改变
+            // 提前退出分支的源码作用域，否则循环绑定会泄漏到循环外。
             owned.extend(candidate.body_scope_blocks.iter().copied());
         }
         LoopKindHint::WhileLike => {
@@ -606,7 +606,21 @@ pub(super) fn build_loop_partition(
             owned: &owned,
             continuation,
         },
-    );
+    )
+    .filter(|tail| {
+        // 无指令的独占跳转链已有完整 forwarding 证明，phi 随原边转移即可。
+        // 把它再归为 normal-tail 会凭空引入 guard；含 MOVE 的尾域仍必须由
+        // tail owner 执行，不能在定义之前提前消费完成边上的 phi。
+        !(tail
+            .contract
+            .normal_exits
+            .iter()
+            .all(|edge| break_routes.contains_key(edge))
+            && tail.blocks.iter().all(|block| {
+                cfg.non_control_instr_range(&proto.instrs, *block)
+                    .is_empty()
+            }))
+    });
 
     Ok(LoopPartitions {
         preheader,

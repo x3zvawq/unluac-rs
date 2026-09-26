@@ -59,14 +59,18 @@ pub(in crate::structure::short_circuit) fn analyze_closed_control_dag_candidates
 /// loop、不可规约区域和值 decision，再对剩余 branch 图做一次弱连通分量扫描；每个
 /// block/edge 只登记一次。只有单入口、无环、恰好两个出口的分量才成为 evidence。
 pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
-    proto: &LoweredProto,
-    cfg: &Cfg,
-    graph_facts: &GraphFacts,
-    dataflow: &DataflowFacts,
+    context: super::super::ClosedControlDagContext<'_>,
     irreducible_regions: &[IrreducibleRegion],
     loops: &[LoopCandidate],
     value_decision_blocks: &BTreeSet<BlockRef>,
 ) -> Vec<ClosedControlDagEvidence> {
+    let super::super::ClosedControlDagContext {
+        proto,
+        cfg,
+        graph_facts,
+        dataflow,
+        source_initializer_blocks,
+    } = context;
     let mut blocked = vec![false; cfg.blocks.len()];
     for block in irreducible_regions
         .iter()
@@ -198,11 +202,17 @@ pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
                 edges,
                 connector_blocks,
                 target: if eligible.get(target.index()).copied().unwrap_or(false)
+                    // 声明属于新条件的入口，不能被前一个条件吞入同一分量。
+                    // 在建连通分量前切边，入口之后的共享短路 DAG 才仍有独立候选。
+                    && !source_initializer_blocks[target.index()]
                     && loop_owner[target.index()] == loop_owner[block.index()]
-                    // 循环内多入口还可能汇合 break 和尾条件；在 loop owner 发布该
-                    // 边界前，不能把整段当成一个普通分支条件。单入口链沿用原合同。
+                    // 计数/迭代循环的 control 与 body 已有独立协议；body 内的共享
+                    // 判断仍由完整 DAG 验证。while/repeat 的共享节点可能同时承担
+                    // break 和尾条件，继续要求 loop owner 的专门边界证据。
                     && (loop_owner[target.index()].is_none()
-                        || reachable_predecessor_count(cfg, target) == 1)
+                        || reachable_predecessor_count(cfg, target) == 1
+                        || loop_owner[target.index()].is_some_and(|owner| matches!(loops[owner].kind_hint,
+                            crate::structure::LoopKindHint::NumericForLike | crate::structure::LoopKindHint::GenericForLike)))
                 {
                     RawConditionTarget::Node(target)
                 } else {
@@ -266,7 +276,16 @@ pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
             .copied()
             .filter(|block| indegree[block.index()] == 0);
         let Some(root) = roots.next() else { continue };
+        // 多入口弱连通分量可由先前的取值区域或独立分支汇合而成。
+        // 分割后的每段仍须独立通过 finalize 的单入口证明，不能整组丢弃。
         if roots.next().is_some() || exits.len() != 2 {
+            evidence.extend(partition_condition_chain(
+                cfg,
+                graph_facts,
+                dataflow,
+                &headers,
+                &arcs_by_header,
+            ));
             continue;
         }
         let mut exits = exits.into_iter();
@@ -284,6 +303,115 @@ pub(in crate::structure::short_circuit) fn analyze_closed_branch_components(
         }
     }
     evidence.sort_by_key(|candidate| candidate.candidate.header);
+    evidence
+}
+
+/// 连续 elseif 的条件也是弱连通的，但每段拥有自己的两个出口。
+/// 逆拓扑传播出口对；只有子段出口包含另一臂入口，或两子段出口相同，才吸收它。
+/// 否则把该子段入口保留为边界。随后按相同出口对分组，完整单入口/边动作证明仍
+/// 由 finalize 完成。每个节点和边只处理常数次，不为每个 header 重扫后缀。
+fn partition_condition_chain(
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+    headers: &BTreeSet<BlockRef>,
+    arcs: &[Option<[RawConditionArc; 2]>],
+) -> Vec<ClosedControlDagEvidence> {
+    let mut indegrees = BTreeMap::new();
+    for header in headers {
+        indegrees.insert(*header, 0usize);
+    }
+    for header in headers {
+        for arc in arcs[header.index()].as_ref().into_iter().flatten() {
+            if let RawConditionTarget::Node(target) = arc.target {
+                *indegrees.get_mut(&target).unwrap() += 1;
+            }
+        }
+    }
+    let mut pending = indegrees
+        .iter()
+        .filter_map(|(block, degree)| (*degree == 0).then_some(*block))
+        .collect::<Vec<_>>();
+    let mut order = Vec::with_capacity(headers.len());
+    while let Some(block) = pending.pop() {
+        order.push(block);
+        for arc in arcs[block.index()].as_ref().into_iter().flatten() {
+            if let RawConditionTarget::Node(target) = arc.target {
+                let degree = indegrees.get_mut(&target).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    pending.push(target);
+                }
+            }
+        }
+    }
+    if order.len() != headers.len() {
+        return Vec::new();
+    }
+    let mut pairs = BTreeMap::<BlockRef, [BlockRef; 2]>::new();
+    let target = |arc: &RawConditionArc| match arc.target {
+        RawConditionTarget::Node(block) | RawConditionTarget::Exit(block) => block,
+    };
+    for header in order.iter().rev() {
+        let Some([left, right]) = arcs[header.index()].as_ref() else {
+            continue;
+        };
+        let (left, right) = (target(left), target(right));
+        let (a, b) = (pairs.get(&left), pairs.get(&right));
+        let pair = if let Some(pair) = a.filter(|pair| Some(*pair) == b || pair.contains(&right)) {
+            *pair
+        } else if let Some(pair) = b.filter(|pair| pair.contains(&left)) {
+            *pair
+        } else if left != right {
+            [left.min(right), left.max(right)]
+        } else {
+            continue;
+        };
+        pairs.insert(*header, pair);
+    }
+    let mut claimed = BTreeSet::new();
+    let mut evidence = Vec::new();
+    for root in order {
+        if claimed.contains(&root) {
+            continue;
+        }
+        let Some(&[first, second]) = pairs.get(&root) else {
+            continue;
+        };
+        let mut nodes = BTreeSet::new();
+        let mut raw = Vec::new();
+        let mut pending = vec![root];
+        while let Some(block) = pending.pop() {
+            if !nodes.insert(block) {
+                continue;
+            }
+            claimed.insert(block);
+            for arc in arcs[block.index()].as_ref().into_iter().flatten() {
+                let mut arc = arc.clone();
+                let next = target(&arc);
+                if next != first && next != second && pairs.get(&next) == Some(&[first, second]) {
+                    arc.target = RawConditionTarget::Node(next);
+                    pending.push(next);
+                } else {
+                    arc.target = RawConditionTarget::Exit(next);
+                }
+                raw.push(arc);
+            }
+        }
+        if nodes.len() < 2 {
+            continue;
+        }
+        let (truthy, falsy) = if graph.post_dominator_tree.dominates(first, second) {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        if let Some(candidate) =
+            finalize_closed_control_dag(cfg, dataflow, root, nodes, raw, truthy, falsy)
+        {
+            evidence.push(candidate);
+        }
+    }
     evidence
 }
 

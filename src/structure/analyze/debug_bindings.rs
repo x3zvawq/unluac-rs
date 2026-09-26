@@ -16,34 +16,12 @@ pub(super) fn analyze_debug_bindings(
     dataflow: &DataflowFacts,
     plan: &StructurePlan,
 ) -> DebugBindingFacts {
-    let mut scope_entries = Vec::new();
+    let scope_entries = debug_scope_entries(proto, cfg, graph, dataflow);
     let mut named_defs = vec![false; dataflow.defs.len()];
-    for (scope, local) in proto
-        .debug_locals
-        .iter()
-        .enumerate()
-        .filter(|(_, local)| local.is_source())
-    {
-        let Some(instr) = proto.lowering_map.low_instr_at_or_after_pc(local.start_pc) else {
-            continue;
-        };
-        let ssa_value = empty_generic_for_binding(proto, cfg, dataflow, instr, local)
-            .map(SsaValue::Def)
-            .unwrap_or_else(|| {
-                ssa_value_at_debug_scope_entry(
-                    proto,
-                    cfg,
-                    graph,
-                    dataflow,
-                    instr,
-                    local.reg,
-                    local.start_pc,
-                )
-            });
-        if let SsaValue::Def(def) = ssa_value {
+    for &(_, _, value) in &scope_entries {
+        if let SsaValue::Def(def) = value {
             named_defs[def.index()] = true;
         }
-        scope_entries.push((scope, instr, ssa_value));
     }
     let branch_initializers = plan
         .regions()
@@ -86,6 +64,20 @@ pub(super) fn analyze_debug_bindings(
                     }
                 }
             }
+        }
+        if value == DebugBindingValue::Ssa(SsaValue::Entry(local.reg))
+            && local.start_pc == local.end_pc
+            && let Some(previous) = instr.index().checked_sub(1).map(InstrRef)
+            && let Some(def) = dataflow.instr_def_for_reg(previous, local.reg)
+            && proto.lowering_map.pc_map()[previous.index()]
+                .last()
+                .and_then(|pc| pc.checked_add(1))
+                == Some(local.start_pc)
+            && cfg.unique_reachable_successor(dataflow.def_block(def)) == Some(block)
+        {
+            // 空区间在分支合流前已经结束，初始化只需归属于紧邻的原写入，
+            // 不需要支配合流后的其它路径。整组选值初始化先由上面的 region 事实认领。
+            value = DebugBindingValue::Ssa(SsaValue::Def(def));
         }
         by_value.entry(value).or_default().push(scope);
     }
@@ -148,6 +140,63 @@ pub(super) fn analyze_debug_bindings(
         }
     }
     facts
+}
+
+/// 候选吸收和最终命名共用作用域入口的 SSA 归属，不以 producer 的活动区间猜初始化。
+pub(super) fn debug_scope_entries(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    graph: &GraphFacts,
+    dataflow: &DataflowFacts,
+) -> Vec<(usize, InstrRef, SsaValue)> {
+    if proto.debug_locals.is_empty() {
+        return Vec::new();
+    }
+    // Luau 把同一 nil 声明拆成多条 LOADNIL；循环头的 pruned SSA 可能
+    // 省去某个未读成员的入口 phi。一次索引连续批次，避免逐 scope 反扫前缀。
+    let mut nil_starts = vec![None; proto.instrs.len() + 1];
+    for (index, instruction) in proto.instrs.iter().enumerate() {
+        if matches!(instruction, LowInstr::LoadNil(_)) {
+            nil_starts[index + 1] = Some(nil_starts[index].unwrap_or(index));
+        }
+    }
+    let mut scope_entries = Vec::new();
+    for (scope, local) in proto
+        .debug_locals
+        .iter()
+        .enumerate()
+        .filter(|(_, local)| local.is_source())
+    {
+        let Some(instr) = proto.lowering_map.low_instr_at_or_after_pc(local.start_pc) else {
+            continue;
+        };
+        let mut ssa_value = empty_generic_for_binding(proto, cfg, dataflow, instr, local)
+            .map(SsaValue::Def)
+            .unwrap_or_else(|| {
+                ssa_value_at_debug_scope_entry(
+                    proto,
+                    cfg,
+                    graph,
+                    dataflow,
+                    instr,
+                    local.reg,
+                    local.start_pc,
+                )
+            });
+        if ssa_value == SsaValue::Entry(local.reg)
+            && let Some(start) = nil_starts[instr.index()]
+            && let Some(def) = dataflow.last_fixed_def_in_range(local.reg, start..instr.index())
+            && proto.lowering_map.pc_map()[instr.index() - 1]
+                .last()
+                .and_then(|pc| pc.checked_add(1))
+                == Some(local.start_pc)
+            && graph.dominates(dataflow.def_block(def), cfg.instr_to_block[instr.index()])
+        {
+            ssa_value = SsaValue::Def(def);
+        }
+        scope_entries.push((scope, instr, ssa_value));
+    }
+    scope_entries
 }
 
 /// 完全重合且只读的同槽 scope 是同一运行时 binding 的名称视图。选择

@@ -39,12 +39,14 @@ pub(super) fn unique_branch_value_merges(
 pub(super) struct ConditionSelectionInput<'a> {
     pub(super) proto: &'a LoweredProto,
     pub(super) cfg: &'a Cfg,
+    pub(super) graph: &'a GraphFacts,
     pub(super) dataflow: &'a DataflowFacts,
     pub(super) loops: &'a [LoopCandidate],
     pub(super) caps: ControlFlowCaps,
     pub(super) branches: &'a [BranchCandidate],
     pub(super) candidates: &'a [ShortCircuitCandidate],
     pub(super) value_candidates: &'a [ShortCircuitCandidate],
+    pub(super) selected_values: &'a [ValueDecisionPlanInput],
     pub(super) closed_control_dags: &'a [ClosedControlDagEvidence],
     pub(super) residual_transfers: &'a [ResidualTransferEvidence],
 }
@@ -61,15 +63,23 @@ pub(super) fn selected_conditions(
     let ConditionSelectionInput {
         proto,
         cfg,
+        graph,
         dataflow,
         loops,
         caps,
         branches,
         candidates,
         value_candidates,
+        selected_values,
         closed_control_dags,
         residual_transfers,
     } = input;
+    let mut value_owned = vec![false; cfg.blocks.len()];
+    for value in selected_values {
+        for block in &value.candidate.blocks {
+            value_owned[block.index()] = true;
+        }
+    }
     let edge_actions = preliminary_edge_actions(cfg, dataflow, loops, residual_transfers, caps);
     let mut loops_by_condition_header = vec![Vec::new(); cfg.blocks.len()];
     for (index, loop_) in loops.iter().enumerate() {
@@ -78,10 +88,16 @@ pub(super) fn selected_conditions(
         }
     }
     let mut condition_arc_workspace = ConditionArcWorkspace::new(cfg.blocks.len());
-    let mut condition_safety_workspace = ConditionSafetyWorkspace::new(dataflow, value_candidates);
+    let mut condition_safety_workspace =
+        ConditionSafetyWorkspace::new(proto, cfg, graph, dataflow, value_candidates);
     let mut selected = BTreeMap::<super::super::BlockRef, (usize, ConditionPlanInput)>::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        if !candidate.reducible || !matches!(candidate.exit, ShortCircuitExit::BranchExit { .. }) {
+        // 已选值区域拥有自己的控制节点；不能让同起点的更大条件候选越过
+        // 其 merge，吞掉后继仍需独立发射的 guard。
+        if value_owned[candidate.header.index()]
+            || !candidate.reducible
+            || !matches!(candidate.exit, ShortCircuitExit::BranchExit { .. })
+        {
             continue;
         }
         if condition_crosses_foreign_loop_header(candidate, loops, &loops_by_condition_header) {
@@ -100,7 +116,10 @@ pub(super) fn selected_conditions(
             synthesize_direct_condition_arcs(proto, cfg, &candidate, &mut condition_arc_workspace)?
                 .unwrap_or_default();
         let input = normalized_condition_input(candidate, arcs);
-        if input.arcs.is_empty() || !condition_terminal_actions_are_uniform(&input, &edge_actions) {
+        if input.arcs.is_empty()
+            || !condition_terminal_actions_are_uniform(&input, &edge_actions)
+            || !condition_internal_values_are_owned(proto, cfg, dataflow, &input, &edge_actions)?
+        {
             continue;
         }
         let score = score_condition(&input, index);
@@ -112,7 +131,8 @@ pub(super) fn selected_conditions(
         }
     }
     for (index, evidence) in closed_control_dags.iter().enumerate() {
-        if !evidence.candidate.reducible
+        if value_owned[evidence.candidate.header.index()]
+            || !evidence.candidate.reducible
             || !matches!(evidence.candidate.exit, ShortCircuitExit::BranchExit { .. })
         {
             continue;
@@ -140,7 +160,10 @@ pub(super) fn selected_conditions(
                 .unwrap_or_default()
         };
         let input = normalized_condition_input(candidate, arcs);
-        if input.arcs.is_empty() || !condition_terminal_actions_are_uniform(&input, &edge_actions) {
+        if input.arcs.is_empty()
+            || !condition_terminal_actions_are_uniform(&input, &edge_actions)
+            || !condition_internal_values_are_owned(proto, cfg, dataflow, &input, &edge_actions)?
+        {
             continue;
         }
         let score = score_condition(&input, candidates.len() + index);
@@ -152,7 +175,7 @@ pub(super) fn selected_conditions(
         }
     }
     for branch in branches {
-        if selected.contains_key(&branch.header) {
+        if value_owned[branch.header.index()] || selected.contains_key(&branch.header) {
             continue;
         }
         if let Some(input) = simple_condition_input(proto, cfg, branch.header) {
@@ -602,6 +625,40 @@ pub(super) fn score_condition(
         condition.candidate.blocks.len(),
         Reverse(index),
     )
+}
+
+/// 终端动作一致不意味着内部 phi 已被消费；沿用最终冻结 owner 的证明，
+/// 避免先把赋值合流吞成条件节点，再留下无处发射的 COPY。
+fn condition_internal_values_are_owned(
+    proto: &LoweredProto,
+    cfg: &Cfg,
+    dataflow: &DataflowFacts,
+    input: &ConditionPlanInput,
+    actions: &[PreliminaryEdgeAction],
+) -> Result<bool, StructureError> {
+    let mut required = BTreeSet::new();
+    for arc in &input.arcs {
+        let count =
+            arc.edges.len() - usize::from(!matches!(arc.target, ShortCircuitTarget::Node(_)));
+        for edge in arc.edges.iter().take(count) {
+            required.extend(
+                actions[edge.index()]
+                    .phi_inputs
+                    .iter()
+                    .filter_map(|(phi, _)| (!dataflow.phi_is_truly_dead(*phi)).then_some(*phi)),
+            );
+        }
+    }
+    if required.is_empty() {
+        return Ok(true);
+    }
+    let frozen = crate::structure::plan::freeze_condition(proto, cfg, dataflow, input, None)?;
+    for node in frozen.nodes {
+        if let Some(value) = node.materialized_value {
+            required.remove(&value.phi);
+        }
+    }
+    Ok(required.is_empty())
 }
 
 pub(super) fn condition_terminal_actions_are_uniform(

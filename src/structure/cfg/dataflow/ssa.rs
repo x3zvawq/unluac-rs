@@ -14,6 +14,7 @@
 
 use super::super::common::{InstrUseValues, PhiId, PhiIncoming, SsaRegMap, UseSite};
 use super::*;
+use std::collections::BTreeMap;
 
 pub(super) struct SsaAnalysis {
     pub(super) phis: Vec<PhiCandidate>,
@@ -33,18 +34,40 @@ pub(super) struct SsaAnalysis {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_ssa(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph: &GraphFacts,
     defs: &[Def],
     instr_defs: &[Vec<DefId>],
     fixed_defs_by_reg: &[Vec<DefId>],
     fixed_uses: &FixedUseFacts<'_>,
-    live_in: &[BTreeSet<Reg>],
-    live_out: &[BTreeSet<Reg>],
+    liveness: &BlockLiveness,
     reg_count: usize,
     incoming_slots: &[Option<usize>],
+    retained_roots: &BlockLiveness,
 ) -> Result<SsaAnalysis, StructureError> {
-    let mut phis = place_phis(cfg, graph, defs, fixed_defs_by_reg, live_in);
+    let mut phis = place_phis(
+        proto,
+        cfg,
+        graph,
+        defs,
+        fixed_defs_by_reg,
+        &liveness.live_in,
+        &retained_roots.live_in,
+    );
+    // 物理扩展只保留已证明的直接合流及其 incoming。其他未读取的历史槽
+    // 仍是未知，不能把观察前缀直接发布为整块的源码活跃快照。
+    let mut live_in = liveness.live_in.clone();
+    let mut live_out = liveness.live_out.clone();
+    for phi in &phis {
+        if live_in[phi.block.index()].insert(phi.reg) {
+            for incoming in &phi.incoming {
+                if let Some(pred) = incoming.pred {
+                    live_out[pred.index()].insert(phi.reg);
+                }
+            }
+        }
+    }
     let phi_block_ranges = super::index_phi_candidate_ranges(cfg, &phis);
     let mut block_entry_values = vec![SsaRegMap::default(); cfg.blocks.len()];
     let mut block_exit_values = vec![SsaRegMap::default(); cfg.blocks.len()];
@@ -56,8 +79,8 @@ pub(super) fn build_ssa(
         defs,
         instr_defs,
         fixed_uses,
-        live_in,
-        live_out,
+        &live_in,
+        &live_out,
         reg_count,
         &phi_block_ranges,
         &mut phis,
@@ -138,13 +161,19 @@ fn compute_truly_dead_phis(phis: &[PhiCandidate], phi_uses: &[Vec<UseSite>]) -> 
 }
 
 fn place_phis(
+    proto: &LoweredProto,
     cfg: &Cfg,
     graph: &GraphFacts,
     defs: &[Def],
     fixed_defs_by_reg: &[Vec<DefId>],
     live_in: &[BTreeSet<Reg>],
+    retained_in: &[BTreeSet<Reg>],
 ) -> Vec<PhiCandidate> {
     let mut placements = BTreeSet::new();
+    let mut written_regs = vec![BTreeMap::new(); cfg.blocks.len()];
+    for def in defs {
+        written_regs[def.block.index()].insert(def.reg, def.id);
+    }
     let entry_loop = graph
         .natural_loop_forest()
         .loop_for_header(cfg.entry_block)
@@ -161,6 +190,18 @@ fn place_phis(
         let mut placed = BTreeSet::new();
         graph.extend_dominance_frontier(&blocks, &mut placed, |block| {
             live_in[block.index()].contains(&reg)
+                // 候选拒绝[ProofIncomplete:RootLifetime]：循环 carried 与退出 root
+                // 由其协议恢复；这里只发布各无环前驱均直接覆写的物理合流。
+                || (retained_in[block.index()].contains(&reg)
+                    && !graph.block_is_cyclic(block)
+                    && graph.dominator_tree.parent[block.index()]
+                        .and_then(|parent| written_regs[parent.index()].get(&reg))
+                        .is_some_and(|def| matches!(proto.instrs[defs[def.index()].instr.index()],
+                            LowInstr::NewTable(_) | LowInstr::Closure(_)))
+                    && cfg.preds[block.index()].iter().all(|edge| {
+                        let pred = cfg.edges[edge.index()].from;
+                        !graph.block_is_cyclic(pred) && written_regs[pred.index()].contains_key(&reg)
+                    }))
         });
 
         // 入口块同时是 loop header 时，CFG 没有一条显式“函数入口边”，普通

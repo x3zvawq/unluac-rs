@@ -53,6 +53,7 @@ use loop_partition::*;
 use loop_payload::*;
 use loop_query::*;
 use loop_rewrite::*;
+pub(in crate::structure) use payload_select::freeze_condition;
 use payload_select::*;
 use region_build::*;
 use unknown_loop::*;
@@ -1053,9 +1054,11 @@ pub(super) fn build(
 struct EdgeSemantics {
     single_pass_breaks: Vec<Option<RegionId>>,
     backedges: Vec<Option<RegionId>>,
+    non_tail_backedges: Vec<bool>,
     breaks: Vec<Option<RegionId>>,
     continues: Vec<Option<RegionId>>,
     syntax_arms: Vec<Option<(RegionId, super::BranchArm)>>,
+    contained_branch_arms: Vec<bool>,
     forced_gotos: Vec<Option<crate::structure::GotoReason>>,
     equal_loop_retry_gotos: Vec<Option<crate::structure::GotoReason>>,
     branch_by_header: Vec<Option<RegionId>>,

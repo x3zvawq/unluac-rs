@@ -606,6 +606,14 @@ pub(super) fn connector_block_is_safe(
         if instr.is_control_terminator() && index + 1 != range.end() {
             return false;
         }
+        // 无值消费者的写仍可能覆盖可由弱引用观察的原寄存器根。条件 connector
+        // 不会发射结果绑定，不能按“纯指令且 SSA 死值”删除该写；交给值/生命周期 owner。
+        if dataflow.instr_defs[index].iter().any(|def| {
+            dataflow.def_uses[def.index()].is_empty()
+                && dataflow.def_phi_uses[def.index()].is_empty()
+        }) {
+            return false;
+        }
         dataflow
             .effect_summaries
             .get(index)

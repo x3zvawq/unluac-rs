@@ -22,7 +22,7 @@ pub use common::{
     ReachableSuccessorShape, RootObservation, RootOverwriteFrontier, RootOverwriteFrontiers,
     SideEffectSummary, SsaRegMap, SsaValue, UseSite,
 };
-pub(crate) use common::{PhiIncomingSlot, SccId};
+pub(crate) use common::{EvaluationDependency, PhiIncomingSlot, SccId};
 pub(crate) use dataflow::analyze_dataflow;
 pub use dataflow::compute_dataflow_facts;
 #[cfg(feature = "decompile-debug")]

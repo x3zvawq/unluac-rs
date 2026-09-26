@@ -9,6 +9,7 @@
 //! 其余成员归 `Unstructured`，每条 CFG edge 同时得到唯一 owner。
 
 mod arena;
+pub(in crate::structure) use arena::freeze_condition;
 mod branch_initializers;
 mod cleanup;
 mod finalize;

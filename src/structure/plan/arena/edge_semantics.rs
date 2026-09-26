@@ -2,9 +2,11 @@
 
 use super::*;
 
-fn private_tail_owns_exit(partition: &LoopPartitions, edge: EdgeRef) -> bool {
+fn normal_tail_owns_exit(partition: &LoopPartitions, edge: EdgeRef) -> bool {
     partition.normal_tail.as_ref().is_some_and(|tail| {
-        tail.contract.in_exit_arm && tail.contract.normal_exits.binary_search(&edge).is_ok()
+        // normal-tail 自己执行完成边的 phi；入口不能再 forward 同一段边动作，
+        // 否则会在 tail 的实际定义之前读取结果。带 early-break guard 的尾域亦同。
+        tail.contract.normal_exits.binary_search(&edge).is_ok()
     })
 }
 
@@ -44,7 +46,7 @@ impl EdgeSemantics {
                 .get(loop_id.index())
                 .ok_or_else(|| StructureError::invalid("selected loop has no frozen partitions"))?;
             for edge in partition.break_routes.keys().copied() {
-                if private_tail_owns_exit(partition, edge) {
+                if normal_tail_owns_exit(partition, edge) {
                     continue;
                 }
                 let slot = planned_breaks.get_mut(edge.index()).ok_or_else(|| {
@@ -67,9 +69,11 @@ impl EdgeSemantics {
         let mut semantics = Self {
             single_pass_breaks: vec![None; cfg.edges.len()],
             backedges: vec![None; cfg.edges.len()],
+            non_tail_backedges: vec![false; cfg.edges.len()],
             breaks: planned_breaks,
             continues: vec![None; cfg.edges.len()],
             syntax_arms: vec![None; cfg.edges.len()],
+            contained_branch_arms: vec![false; cfg.edges.len()],
             forced_gotos: vec![None; cfg.edges.len()],
             equal_loop_retry_gotos: vec![None; cfg.edges.len()],
             branch_by_header: vec![None; cfg.blocks.len()],
@@ -161,6 +165,8 @@ impl EdgeSemantics {
                                         .is_some_and(|target_region| {
                                             arena.navigation.contains(region, target_region)
                                         });
+                                    semantics.contained_branch_arms[edge.index()] =
+                                        target_is_inside;
                                     if !target_is_inside && branch.branch.merge != Some(target) {
                                         // condition evidence 只能决定真假语义，不能把
                                         // 跳回 branch containment 外的边一律当空 arm；
@@ -183,7 +189,7 @@ impl EdgeSemantics {
                         semantics.backedges[edge.index()] = Some(region);
                     }
                     for (edge, route) in &partition.break_routes {
-                        if private_tail_owns_exit(partition, *edge) {
+                        if normal_tail_owns_exit(partition, *edge) {
                             // 原私有尾已独占其 MOVE/phi 和完成边；不能再把同一路径
                             // 转发到条件入口，否则会提前消费尚未执行的尾部写入。
                             continue;
@@ -466,6 +472,16 @@ impl EdgeSemantics {
                             .navigation
                             .region_can_complete_from(body, source, *block)
                         {
+                            for edge in &cfg.succs[block.index()] {
+                                if semantics.backedges[edge.index()] == Some(region)
+                                    && matches!(
+                                        loop_.kind_hint,
+                                        crate::structure::LoopKindHint::WhileLike
+                                    )
+                                {
+                                    semantics.non_tail_backedges[edge.index()] = true;
+                                }
+                            }
                             continue;
                         }
                         for edge in &cfg.succs[block.index()] {
@@ -683,6 +699,8 @@ impl EdgeSemantics {
         if self.breaks[edge_ref.index()].is_none()
             && self.break_region(edge_ref).is_none()
             && !self.layout_edges[edge_ref.index()].natural
+            // 当前 branch arm 自己会发射目标；只有跨布局共享出口才由边复制 terminal。
+            && !self.contained_branch_arms[edge_ref.index()]
             && let Some(kind) = shared_pure_terminal_kind(cfg, edge.to)
         {
             return (
@@ -757,6 +775,24 @@ impl EdgeSemantics {
                 && self.loops.innermost(edge.from) == Some(inner)
             {
                 return (inner, EdgeTransfer::Break(inner));
+            }
+            // 物理回边只有完成整个源码 body 后才能隐式发射。island 中间的
+            // branch 若直接回到 header，省略转移会错误执行其后的 sibling。
+            if self.non_tail_backedges[edge_ref.index()]
+                && !self.for_syntax_edges[edge_ref.index()]
+                && source_loop == Some(region)
+            {
+                return if caps.continue_stmt {
+                    (region, EdgeTransfer::Continue(region))
+                } else {
+                    (
+                        default_owner,
+                        EdgeTransfer::Goto(
+                            LabelPlanId(edge.to.index()),
+                            crate::structure::GotoReason::UnstructuredContinueLike,
+                        ),
+                    )
+                };
             }
             // Luau 可把内层空 generic-for 的 VM exit 与祖先 loop backedge 合并成
             // 同一条物理边；祖先回边负责最终 transfer，内层 VM protocol 隐式吸收语法边。

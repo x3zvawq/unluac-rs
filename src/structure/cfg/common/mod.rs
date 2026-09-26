@@ -10,7 +10,7 @@ mod phi_graph;
 mod root_frontiers;
 mod root_intervals;
 
-pub(crate) use dataflow::{PhiIncomingSlot, RegCaptures};
+pub(crate) use dataflow::{EvaluationDependency, PhiIncomingSlot, RegCaptures};
 pub(crate) use graph::{SccFacts, SccId};
 pub(crate) use phi_graph::PhiGraphFacts;
 pub use root_frontiers::{RootOverwriteFrontier, RootOverwriteFrontiers};

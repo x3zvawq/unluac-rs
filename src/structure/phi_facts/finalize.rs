@@ -22,7 +22,12 @@ pub(in crate::structure) fn finalize_phi_ownership(
         .collect::<Vec<Vec<Option<PhiIncomingDisposition>>>>();
 
     for phi in &dataflow.phi_candidates {
-        if dataflow.phi_is_truly_dead(phi.id) {
+        // 逻辑无读取的结果仍可能完成可观察的旧 root 覆写。已选区域消费其
+        // 物理合流身份时保留 RegionResult，不能提前把 incoming 标成 Dead。
+        if dataflow.phi_is_truly_dead(phi.id)
+            && plan.condition_value_owner(phi.id).is_none()
+            && plan.value_decision_owner(phi.id).is_none()
+        {
             dispositions[phi.id.index()].fill(Some(PhiIncomingDisposition::Dead));
             continue;
         }

@@ -231,7 +231,7 @@ pub(super) fn compact_selected_payloads(
     })
 }
 
-pub(super) fn freeze_condition(
+pub(in crate::structure) fn freeze_condition(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,

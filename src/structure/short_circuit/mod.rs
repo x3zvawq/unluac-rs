@@ -76,6 +76,7 @@ pub(super) struct ClosedControlDagContext<'a> {
     pub(super) cfg: &'a Cfg,
     pub(super) graph_facts: &'a GraphFacts,
     pub(super) dataflow: &'a DataflowFacts,
+    pub(super) source_initializer_blocks: &'a [bool],
 }
 
 pub(super) fn analyze_closed_control_dags(
@@ -90,6 +91,7 @@ pub(super) fn analyze_closed_control_dags(
         cfg,
         graph_facts,
         dataflow,
+        ..
     } = context;
     let mut evidence = branch_exit::analyze_closed_control_dag_candidates(
         proto,
@@ -100,10 +102,7 @@ pub(super) fn analyze_closed_control_dags(
         loops,
     );
     evidence.extend(branch_exit::analyze_closed_branch_components(
-        proto,
-        cfg,
-        graph_facts,
-        dataflow,
+        context,
         irreducible_regions,
         loops,
         value_decision_blocks,

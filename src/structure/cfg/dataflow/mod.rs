@@ -187,8 +187,16 @@ fn compute_dataflow_proto(
         &instr_effects,
         &open.fixed_uses,
         reg_count,
+        None,
     )?;
-
+    let retained_roots = solve_liveness(
+        cfg,
+        graph_facts,
+        &instr_effects,
+        &open.fixed_uses,
+        reg_count,
+        Some(&effect_summaries),
+    )?;
     let mut defs = Vec::new();
     let mut instr_defs = vec![Vec::new(); proto.instrs.len()];
     for block in cfg.block_order.iter().copied() {
@@ -216,16 +224,17 @@ fn compute_dataflow_proto(
     }
 
     let ssa = build_ssa(
+        proto,
         cfg,
         graph_facts,
         &defs,
         &instr_defs,
         &fixed_defs_by_reg,
         &open.fixed_uses,
-        &liveness.live_in,
-        &liveness.live_out,
+        &liveness,
         reg_count,
         &incoming_slots,
+        &retained_roots,
     )?;
     let open::OpenAnalysis {
         defs: open_defs,

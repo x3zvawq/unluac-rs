@@ -329,7 +329,10 @@ pub(super) fn freeze_exit_copy_actions(
 
     let mut actions = FrozenExitActions::default();
     for (target, (zero_value, normal_value)) in by_target {
-        if break_targets.contains(&target) {
+        let has_break = break_targets.contains(&target);
+        let distinct_defaults = matches!((&zero_value, &normal_value),
+            (Some((zero, _)), Some((normal, _))) if zero != normal);
+        if has_break && !distinct_defaults {
             let (value, origins) = common_exit_value(
                 target,
                 zero_value,
@@ -351,7 +354,7 @@ pub(super) fn freeze_exit_copy_actions(
             .phi_candidate(target)
             .ok_or_else(|| StructureError::invalid("for exit action targets a missing phi"))?
             .reg;
-        if let Some(header) = payload.header_value_for_reg(reg) {
+        if !has_break && let Some(header) = payload.header_value_for_reg(reg) {
             let phi = dataflow.phi_candidate(header.phi_id).ok_or_else(|| {
                 StructureError::invalid("for exit action references a missing loop header phi")
             })?;
@@ -390,6 +393,9 @@ pub(super) fn freeze_exit_copy_actions(
             continue;
         }
 
+        // 零次迭代与正常完成可以携带不同状态，即使同一个 phi 还有 break 输入。
+        // 初值放在循环前，正常写回放在 iteration epilogue；break 自己的边动作保留，
+        // 不能要求两种默认值相同，也不能在循环后覆盖提前退出时写入的值。
         if let (Some((zero, zero_origins)), Some((normal, normal_origins))) =
             (zero_value.as_ref(), normal_value.as_ref())
             && zero != normal

@@ -1,6 +1,7 @@
 //! 为直接条件候选合成弧证据并执行副作用/定义逃逸检查；依赖 CFG 与 SSA，不负责候选排序；例如截断包含未吸收副作用的条件尾。
 
 use super::*;
+use crate::structure::cfg::EvaluationDependency;
 
 pub(super) fn synthesize_direct_condition_arcs(
     proto: &LoweredProto,
@@ -212,16 +213,30 @@ pub(super) fn condition_node_can_be_absorbed(
 
 pub(super) struct ConditionSafetyWorkspace {
     value_headers: BTreeSet<super::super::BlockRef>,
+    source_initializers: Vec<bool>,
     epoch: usize,
     needed_instr_epochs: Vec<usize>,
     def_epochs: Vec<usize>,
     phi_epochs: Vec<usize>,
-    pending: Vec<super::super::SsaValue>,
+    pending: Vec<EvaluationDependency>,
 }
 
 impl ConditionSafetyWorkspace {
-    pub(super) fn new(dataflow: &DataflowFacts, candidates: &[ShortCircuitCandidate]) -> Self {
+    pub(super) fn new(
+        proto: &LoweredProto,
+        cfg: &Cfg,
+        graph: &GraphFacts,
+        dataflow: &DataflowFacts,
+        candidates: &[ShortCircuitCandidate],
+    ) -> Self {
+        let mut source_initializers = vec![false; proto.instrs.len()];
+        for (_, _, value) in debug_scope_entries(proto, cfg, graph, dataflow) {
+            if let super::super::SsaValue::Def(def) = value {
+                source_initializers[dataflow.def_instr(def).index()] = true;
+            }
+        }
         Self {
+            source_initializers,
             // 取值 DAG 的 phi 结果由 ValueDecision 消费；外层条件不能把它吞成
             // 只有 bool 出口的节点，否则 condition region 会嵌入另一个控制 owner。
             value_headers: candidates
@@ -250,6 +265,16 @@ impl ConditionSafetyWorkspace {
         self.pending.clear();
     }
 
+    pub(super) fn source_initializer_blocks(&self, cfg: &Cfg) -> Vec<bool> {
+        cfg.blocks
+            .iter()
+            .map(|block| {
+                (block.instrs.start.index()..block.instrs.start.index() + block.instrs.len)
+                    .any(|index| self.source_initializers[index])
+            })
+            .collect()
+    }
+
     fn needs_instr(&self, instr: InstrRef) -> bool {
         self.needed_instr_epochs.get(instr.index()).copied() == Some(self.epoch)
     }
@@ -269,14 +294,13 @@ pub(super) fn block_has_unabsorbed_effects(
     let Some(predicate) = range.last() else {
         return true;
     };
-    let Some(uses) = dataflow.use_values.get(predicate.index()) else {
-        return true;
-    };
-    workspace.pending.extend(uses.fixed.values());
+    workspace
+        .pending
+        .extend(dataflow.evaluation_inputs(predicate));
     while let Some(value) = workspace.pending.pop() {
         match value {
-            super::super::SsaValue::Entry(_) => {}
-            super::super::SsaValue::Def(def) => {
+            EvaluationDependency::Value(super::super::SsaValue::Entry(_)) => {}
+            EvaluationDependency::Value(super::super::SsaValue::Def(def)) => {
                 let Some(stamp) = workspace.def_epochs.get_mut(def.index()) else {
                     return true;
                 };
@@ -287,19 +311,21 @@ pub(super) fn block_has_unabsorbed_effects(
                 let Some(definition) = dataflow.defs.get(def.index()) else {
                     return true;
                 };
-                let Some(needed) = workspace
-                    .needed_instr_epochs
-                    .get_mut(definition.instr.index())
-                else {
-                    return true;
-                };
-                *needed = workspace.epoch;
-                let Some(uses) = dataflow.use_values.get(definition.instr.index()) else {
-                    return true;
-                };
-                workspace.pending.extend(uses.fixed.values());
+                workspace
+                    .pending
+                    .push(EvaluationDependency::Instruction(definition.instr));
             }
-            super::super::SsaValue::Phi(phi) => {
+            EvaluationDependency::Instruction(instr) => {
+                let Some(needed) = workspace.needed_instr_epochs.get_mut(instr.index()) else {
+                    return true;
+                };
+                if *needed == workspace.epoch {
+                    continue;
+                }
+                *needed = workspace.epoch;
+                workspace.pending.extend(dataflow.evaluation_inputs(instr));
+            }
+            EvaluationDependency::Value(super::super::SsaValue::Phi(phi)) => {
                 let Some(stamp) = workspace.phi_epochs.get_mut(phi.index()) else {
                     return true;
                 };
@@ -310,9 +336,11 @@ pub(super) fn block_has_unabsorbed_effects(
                 let Some(phi) = dataflow.phi_candidate(phi) else {
                     return true;
                 };
-                workspace
-                    .pending
-                    .extend(phi.incoming.iter().map(|incoming| incoming.value));
+                workspace.pending.extend(
+                    phi.incoming
+                        .iter()
+                        .map(|incoming| EvaluationDependency::Value(incoming.value)),
+                );
             }
         }
     }
@@ -320,7 +348,9 @@ pub(super) fn block_has_unabsorbed_effects(
     (range.start.index()..predicate.index()).any(|index| {
         // 候选拒绝[SemanticBarrier:NamedRootWrite]：和值判定共享原 local 写入边界，
         // 不能在 value DAG 被拒绝后由 condition DAG 再吸收同一写入（regress_578）。
-        instr_writes_source_binding(proto, dataflow, InstrRef(index))
+        // 初始化通常在 debug 活动区间开始前；即使未被谓词读取，也必须作为声明发射。
+        workspace.source_initializers[index]
+            || instr_writes_source_binding(proto, dataflow, InstrRef(index))
             // 候选拒绝[SemanticBarrier:EvaluationCount]：谓词依赖闭包只证明
             // producer 被使用，不证明它只被使用一次。条件内没有共享值声明，
             // 吸收多用的 CALL/GETTABLE 或计算会让 HIR 在每个读取处重新求值。

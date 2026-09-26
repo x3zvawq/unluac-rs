@@ -164,6 +164,22 @@ impl<'a> BranchIndex<'a> {
         )
     }
 
+    /// 两臂都只正常汇入同一个局部出口；提前 RETURN 可另达函数 exit。
+    /// 出口可以由外层 guard 共享，不要求内层 condition 支配它。
+    pub(in crate::structure) fn common_local_join(
+        &self,
+        left: BlockRef,
+        right: BlockRef,
+    ) -> Option<BlockRef> {
+        match (
+            self.local_frontiers[left.index()],
+            self.local_frontiers[right.index()],
+        ) {
+            (FrontierShape::One(left), FrontierShape::One(right)) if left == right => Some(left),
+            _ => None,
+        }
+    }
+
     pub(in crate::structure) fn has_single_local_join(
         &self,
         from: BlockRef,

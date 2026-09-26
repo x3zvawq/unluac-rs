@@ -45,10 +45,11 @@ pub(super) fn refine_single_pass_fences(
         }
     }
 
-    let branch_headers = branch_candidates
+    let branch_by_header = branch_candidates
         .iter()
-        .map(|candidate| candidate.header)
-        .collect::<BTreeSet<_>>();
+        .enumerate()
+        .map(|(index, candidate)| (candidate.header, index))
+        .collect::<BTreeMap<_, _>>();
     let loop_headers = loop_candidates
         .iter()
         .map(|candidate| candidate.header)
@@ -68,7 +69,7 @@ pub(super) fn refine_single_pass_fences(
             let tail = edge.from;
             if !cfg.reachable_blocks.contains(&tail)
                 || !graph_facts.dominates(header, tail)
-                || branch_headers.contains(&tail)
+                || branch_by_header.contains_key(&tail)
                 || loop_headers.contains(&tail)
                 || cfg.succs[tail.index()].as_slice() != [*edge_ref]
             {
@@ -89,6 +90,12 @@ pub(super) fn refine_single_pass_fences(
         if tails.next().is_some() {
             continue;
         }
+        // 共享 tail 属于其直接支配分支；外层 guard 的跳过边不属于该 fence。
+        let candidate_index = graph_facts.dominator_tree.parent[tail.index()]
+            .and_then(|owner| branch_by_header.get(&owner).copied())
+            .filter(|&index| branch_candidates[index].merge == Some(exit))
+            .unwrap_or(candidate_index);
+        let header = branch_candidates[candidate_index].header;
         // loop header 也可能是外层迭代的合法 single-pass continuation，但此时 fence
         // 必须完整位于该 natural loop 内。否则这里只是循环前的普通 branch 汇入
         // header，真实 backedge 会被误收为 early escape，并把 branch merge 提前。
@@ -193,6 +200,7 @@ pub(super) fn refine_single_pass_fences(
 /// 两臂都不支配 tail 时，它才可能是 single-pass 的共享 tail；两臂都支配则候选边界
 /// 已经歧义。这个查询同时供纯控制分区和 value-result 闭合证明使用。
 fn opposite_if_else_arm_for_owned_tail(
+    cfg: &Cfg,
     graph_facts: &GraphFacts,
     candidate: &BranchCandidate,
     tail: BlockRef,
@@ -206,14 +214,25 @@ fn opposite_if_else_arm_for_owned_tail(
         return None;
     }
 
-    match (
+    let (tail_arm, opposite) = match (
         graph_facts.dominates(candidate.then_entry, tail),
         graph_facts.dominates(else_entry, tail),
     ) {
-        (true, false) => Some(else_entry),
-        (false, true) => Some(candidate.then_entry),
-        (true, true) | (false, false) => None,
-    }
+        (true, false) => (candidate.then_entry, else_entry),
+        (false, true) => (else_entry, candidate.then_entry),
+        (true, true) | (false, false) => return None,
+    };
+    // tail 本身为一臂入口时，“该入口支配 tail”是平凡事实；另一臂仍可能
+    // 进入它（例如 a and {} or fallback）。必须核对入口边，才是两臂各自闭合。
+    cfg.preds[tail.index()]
+        .iter()
+        .all(|edge| {
+            let from = cfg.edges[edge.index()].from;
+            !cfg.reachable_blocks.contains(&from)
+                || from == candidate.header
+                || graph_facts.dominates(tail_arm, from)
+        })
+        .then_some(opposite)
 }
 
 /// 拒绝把两臂各自完成到 strict exit 的普通 `if/else` 伪装成 single-pass fence。
@@ -225,11 +244,13 @@ fn closed_if_else_partitions_tail_and_escapes(
     exit: BlockRef,
     escape_edges: &BTreeSet<EdgeRef>,
 ) -> bool {
-    if graph_facts.block_is_cyclic(candidate.header) || graph_facts.block_is_cyclic(tail) {
+    // 循环体内的普通 if/else 也在 CFG 的环中；这里要求 exit 位于本次分支之后，
+    // 而非用全局 SCC 排除它。指向祖先 header 的回边不构成闭合的两臂。
+    if graph_facts.dominates(exit, candidate.header) {
         return false;
     }
     let Some(opposite_arm) =
-        opposite_if_else_arm_for_owned_tail(graph_facts, candidate, tail, exit)
+        opposite_if_else_arm_for_owned_tail(cfg, graph_facts, candidate, tail, exit)
     else {
         return false;
     };
@@ -255,7 +276,8 @@ pub(super) fn closed_if_else_owns_value_result(
     let Some(else_entry) = candidate.else_entry else {
         return false;
     };
-    let Some(result_arm) = opposite_if_else_arm_for_owned_tail(graph_facts, candidate, tail, exit)
+    let Some(result_arm) =
+        opposite_if_else_arm_for_owned_tail(cfg, graph_facts, candidate, tail, exit)
     else {
         return false;
     };
