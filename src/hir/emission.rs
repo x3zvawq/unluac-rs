@@ -141,7 +141,10 @@ impl<'a> HirEmissionFacts<'a> {
                         plan: loop_id,
                         control,
                         ..
-                    } if *control == region => {
+                    } if *control == region
+                        && !matches!(plan.loop_protocol(*loop_id),
+                            Some(LoopVmProtocol::NumericFor(protocol)) if protocol.body_completes_normally) =>
+                    {
                         // while/repeat 的首条件块经 lower_condition_prefix 单独发射；
                         // 只有后续条件节点被吸收进 decision expression。
                         state.restrict_header(
@@ -151,6 +154,8 @@ impl<'a> HirEmissionFacts<'a> {
                                 .and_then(|condition| condition.header()),
                         );
                     }
+                    // numeric-for 的 latch 前缀由 lower_numeric_for 在 body 末端
+                    // 原位发射；只有终结指令归循环协议，前面的 CALL/声明仍有源码边界。
                     _ => {}
                 }
             }

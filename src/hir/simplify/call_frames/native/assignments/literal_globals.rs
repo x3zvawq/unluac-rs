@@ -47,7 +47,8 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
             .and_then(Option::as_ref)
             .is_some_and(|entry| {
                 plain_copy(entry.stmt)
-                    && scalar_local(entry.stmt).is_some_and(|(_, value)| literal(value))
+                    && (scalar_local(entry.stmt).is_some_and(|(_, value)| literal(value))
+                        || nil_argument_group(entry.stmt, facts).is_some())
             })
         {
             index += 1;
@@ -61,8 +62,13 @@ pub(in crate::hir::simplify::call_frames::native) fn plans(
             .get(index)
             .and_then(Option::as_ref)
             .is_some_and(|entry| {
-                global_write(entry.stmt).is_some_and(|(_, _, value)| {
-                    literal(value) || matches!(value, HirExpr::LocalRef(_))
+                global_write(entry.stmt).is_some_and(|(_, global, value)| {
+                    matches!(value, HirExpr::LocalRef(_) | HirExpr::TempRef(_))
+                        || literal(value)
+                            && (facts.global_write_has_no_preparation(global, dialect)
+                                || facts
+                                    .global_write_value_preparation(global, value)
+                                    .is_some())
                 })
             })
         {
@@ -93,17 +99,32 @@ fn candidate(
     definitions: &[FlatStmt<'_>],
     writes: &[FlatStmt<'_>],
 ) -> Option<Plan> {
-    if !context.constants_fit_rk {
-        return None;
-    }
-    let base = facts.trusted_local_home_slot(scalar_local(definitions.first()?.stmt)?.0)?;
-    let mut locals = BTreeMap::new();
+    let mut inputs = BTreeMap::new();
+    let mut base = None;
     for entry in definitions {
-        let (local, value) = scalar_local(entry.stmt)?;
-        if locals.insert(local, value).is_some() {
-            return None;
+        if let Some((local, value)) = scalar_local(entry.stmt) {
+            base.get_or_insert(facts.trusted_local_home_slot(local)?);
+            if inputs
+                .insert(HirBinding::Local(local), value.clone())
+                .is_some()
+            {
+                return None;
+            }
+        } else {
+            // LOADNIL 的整组 Temp 由同一个原写产生；不能拆成单项初始化，
+            // 否则会改变全局写元方法调用时可见的 scratch 根。
+            for &temp in nil_argument_group(entry.stmt, facts)? {
+                base.get_or_insert(facts.trusted_temp_home_slot(temp)?);
+                if inputs
+                    .insert(HirBinding::Temp(temp), HirExpr::Nil)
+                    .is_some()
+                {
+                    return None;
+                }
+            }
         }
     }
+    let base = base?;
     let run = definitions
         .iter()
         .map(|entry| entry.stmt)
@@ -118,20 +139,25 @@ fn candidate(
             writes.len() - offset - 1
         }];
         let (target, global, value) = global_write(write.stmt)?;
-        let original = if let HirExpr::LocalRef(local) = value {
-            *locals.get(local)?
+        let original = if let Some(binding) = HirBinding::from_expr(value) {
+            inputs.get(&binding)?
         } else {
             value
         };
         if !literal(original) {
             return None;
         }
-        let input = if let Some((temp, home)) =
-            facts.global_write_value_preparation(global, original)
-        {
-            if home != HomeSlotKey::new(base.slot() + offset, 0)
+        let input = if let Some((temp, home)) = facts
+            .global_write_value_preparation(global, original)
+            .or_else(|| {
+                matches!(original, HirExpr::Nil)
+                    .then(|| facts.global_nil_batch_preparation(global))
+                    .flatten()
+            }) {
+            if home.slot() != base.slot() + offset
                 || facts.global_write_value_home(global, dialect) != Some(home)
                 || matches!(value, HirExpr::LocalRef(local) if facts.promoted_local_for_temp(temp) != Some(*local))
+                || matches!(value, HirExpr::TempRef(input) if *input != temp)
             {
                 return None;
             }
@@ -142,6 +168,7 @@ fn candidate(
                 || offset + 1 != writes.len()
                 || !literal(value)
                 || !facts.global_write_has_no_preparation(global, dialect)
+                || builder.literal_uses_rk(value, Some((&global.sources, true))) != Some(true)
             {
                 return None;
             }
@@ -163,6 +190,8 @@ fn candidate(
     }
     let sink = writes.last()?.id;
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: definitions[0].id,
         sink,
         base,

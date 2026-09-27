@@ -711,6 +711,8 @@ pub struct AstIf {
     pub cond: AstExpr,
     /// HIR 标记的原退化 TEST；即使条件已知或两臂为空也要保留检查。
     pub(crate) preserves_empty_test: bool,
+    /// 宽常量池要求两臂保持已恢复的发射顺序，否则 RK 会改变临时槽覆盖。
+    pub(crate) preserves_arm_order: bool,
     pub then_block: AstBlock,
     pub else_block: Option<AstBlock>,
 }
@@ -727,6 +729,8 @@ pub struct AstWhile {
 pub struct AstRepeat {
     pub body: AstBlock,
     pub cond: AstExpr,
+    /// 条件承载原字节码检查；即使已知恒真，也不能按合成单次包装删除。
+    pub preserves_condition: bool,
     /// HIR 在这个 repeat 的条件边界证明的物理生命周期事实。
     ///
     /// 集合里的 binding 只获准在“当前 repeat body -> condition”这一条边界提前结束；

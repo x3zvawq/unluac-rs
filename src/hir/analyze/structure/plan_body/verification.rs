@@ -212,10 +212,14 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                     .bindings
                     .local_for_reg_in_block(definition.block, definition.reg)
                     .is_none()
-                    && !super::super::super::exprs::block_is_absorbed_decision(
+                    && (!super::super::super::exprs::block_is_absorbed_decision(
                         self.lowering,
                         definition.block,
-                    );
+                    ) || self
+                        .lowering
+                        .emission
+                        .regular_prefix(definition.block)
+                        .is_some_and(|prefix| prefix.contains(&definition.instr.index())));
                 let canonical = if self.index.edge_action_use_count[def.index()] == 0
                     || self.index.move_reads_capture[def.index()]
                 {
@@ -258,34 +262,54 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                                 .block_end_value(source_block, definition.reg)
                                 == Some(value)
                     });
+                // 匿名 loop state 尚未成为 Local，但同 home 的原 COPY 仍是
+                // 块末的确切值。低槽身份不能仅因没有 debug 名称就沿恒等链退回
+                // 高槽；后者可能在先前基本块已覆盖，并被稀疏 SSA 省略。
+                let shares_physical_target = self
+                    .lowering
+                    .promotion_facts
+                    .trusted_temp_home_slot(fixed)
+                    .is_some_and(|home| {
+                        self.lowering.promotion_facts.trusted_temp_home_slot(target) == Some(home)
+                            && self
+                                .lowering
+                                .dataflow
+                                .block_end_value(source_block, definition.reg)
+                                == Some(value)
+                    });
                 let read_exact = !absorbed
                     && writes_fixed_binding
-                    && (fixed == target || shares_capture_target || shares_source_target || {
-                        let canonical_expr = self.edge_ssa_expr(owner, source_block, canonical)?;
-                        match self
-                            .lowering
-                            .dataflow
-                            .block_end_value(source_block, self.ssa_reg(owner, canonical)?)
-                        {
-                            // canonical 描述值身份，不证明原 source home 仍持有它。
-                            // 该槽已被别的值覆盖时，即使旧值有独立 SSA temp，也不能
-                            // 延长它的物理活读；保留原 MOVE 的实际读取与目标快照。
-                            Some(current) => {
-                                self.lowering.dataflow.canonical_move_value(current)
-                                    != Some(canonical)
+                    && (fixed == target
+                        || shares_capture_target
+                        || shares_source_target
+                        || shares_physical_target
+                        || {
+                            let canonical_expr =
+                                self.edge_ssa_expr(owner, source_block, canonical)?;
+                            match self
+                                .lowering
+                                .dataflow
+                                .block_end_value(source_block, self.ssa_reg(owner, canonical)?)
+                            {
+                                // canonical 描述值身份，不证明原 source home 仍持有它。
+                                // 该槽已被别的值覆盖时，即使旧值有独立 SSA temp，也不能
+                                // 延长它的物理活读；保留原 MOVE 的实际读取与目标快照。
+                                Some(current) => {
+                                    self.lowering.dataflow.canonical_move_value(current)
+                                        != Some(canonical)
+                                }
+                                None => match canonical_expr {
+                                    HirExpr::LocalRef(_) => true,
+                                    HirExpr::TempRef(temp) => self
+                                        .index
+                                        .shared_ssa_temps
+                                        .get(temp.index())
+                                        .copied()
+                                        .unwrap_or(true),
+                                    _ => false,
+                                },
                             }
-                            None => match canonical_expr {
-                                HirExpr::LocalRef(_) => true,
-                                HirExpr::TempRef(temp) => self
-                                    .index
-                                    .shared_ssa_temps
-                                    .get(temp.index())
-                                    .copied()
-                                    .unwrap_or(true),
-                                _ => false,
-                            },
-                        }
-                    });
+                        });
                 if read_exact { value } else { canonical }
             }
             _ => value,

@@ -147,6 +147,38 @@ impl FrameBuilder<'_> {
                 if checkpoint != (self.first_event, self.next_event) {
                     return None;
                 }
+                // Boolean 化是结构层对 false 分支的表示；真假选择的右值已知为
+                // truthy 时恢复 `predicate and value or false`，避免输出 synthetic NOT
+                // 令复编译产生原 chunk 没有的运算。原生 NOT 有来源，不能走此规约。
+                if and
+                    && matches!(
+                        rhs,
+                        HirExpr::Boolean(true)
+                            | HirExpr::String(_)
+                            | HirExpr::Integer(_)
+                            | HirExpr::Number(_)
+                    )
+                    && let HirExpr::Unary(outer) = &lhs
+                    && outer.source_site.is_none()
+                    && outer.op == crate::hir::common::HirUnaryOpKind::Not
+                    && let HirExpr::Unary(inner) = &outer.expr
+                    && inner.source_site.is_none()
+                    && inner.op == crate::hir::common::HirUnaryOpKind::Not
+                {
+                    return Some(HirExpr::LogicalOr(Box::new(
+                        crate::hir::common::HirLogicalExpr {
+                            preserves_boolean_prewrite: logical.preserves_boolean_prewrite,
+                            lhs: HirExpr::LogicalAnd(Box::new(
+                                crate::hir::common::HirLogicalExpr {
+                                    preserves_boolean_prewrite: false,
+                                    lhs: inner.expr.clone(),
+                                    rhs,
+                                },
+                            )),
+                            rhs: HirExpr::Boolean(false),
+                        },
+                    )));
+                }
                 let logical = Box::new(crate::hir::common::HirLogicalExpr {
                     preserves_boolean_prewrite: logical.preserves_boolean_prewrite,
                     lhs,
@@ -157,6 +189,33 @@ impl FrameBuilder<'_> {
                 } else {
                     HirExpr::LogicalOr(logical)
                 })
+            }
+            HirExpr::Unary(outer)
+                if outer.source_site.is_none()
+                    && outer.op == crate::hir::common::HirUnaryOpKind::Not
+                    && matches!(&outer.expr, HirExpr::Unary(inner)
+                        if inner.source_site.is_none()
+                            && inner.op == crate::hir::common::HirUnaryOpKind::Not) =>
+            {
+                let HirExpr::Unary(inner) = &outer.expr else {
+                    unreachable!()
+                };
+                // 结构恢复的 Boolean 化包装把 CALL 结果转成真假，值槽仍是外层
+                // 逻辑结果；CALL 只作谓词，须在高一槽按原准备事件重放。
+                let value = self.luau_logical_tree(
+                    &inner.expr,
+                    before,
+                    result,
+                    LogicalUse::Condition {
+                        retain_value: false,
+                        truthy: true,
+                    },
+                )?;
+                let mut inner = inner.as_ref().clone();
+                inner.expr = value;
+                let mut outer = outer.as_ref().clone();
+                outer.expr = HirExpr::Unary(Box::new(inner));
+                Some(HirExpr::Unary(Box::new(outer)))
             }
             HirExpr::Call(call) => {
                 let predicate = matches!(

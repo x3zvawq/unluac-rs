@@ -12,6 +12,13 @@ pub(super) fn collect_readonly_parameter_copies(
     proto: &LoweredProto,
     dataflow: &DataflowFacts,
 ) -> BTreeMap<TempId, ParamId> {
+    // 开放结果只覆盖其起始槽及以上；高槽尾调用不会改写低槽形参。
+    // MOVE 链仍逐 Def 查询，遇到开放值或 phi 时不发布只读身份。
+    let open_floor = dataflow
+        .open_defs
+        .iter()
+        .map(|def| def.start_reg.index())
+        .min();
     let mut resolved = vec![None; dataflow.defs.len()];
     let mut path = Vec::new();
     for start in 0..dataflow.defs.len() {
@@ -23,6 +30,7 @@ pub(super) fn collect_readonly_parameter_copies(
             match value {
                 SsaValue::Entry(reg) => {
                     break (reg.index() < usize::from(proto.signature.num_params)
+                        && open_floor.is_none_or(|floor| reg.index() < floor)
                         && !dataflow.reg_is_reference_captured(reg)
                         && dataflow
                             .fixed_defs_by_reg
@@ -65,46 +73,63 @@ pub(super) fn collect_readonly_parameter_copies(
         .collect()
 }
 
-/// 首项在高槽准备 nil 或旧值快照，再写第二项 nil 和第一项 COPY。
-#[derive(Debug, Clone, Copy)]
-pub(super) struct NilPairFrame {
-    pub(super) temps: [TempId; 3],
-    pub(super) homes: [HomeSlotKey; 3],
+/// 首项在高槽准备字面量或旧值快照，再写第二项字面量和第一项 COPY。
+#[derive(Debug, Clone)]
+pub(in crate::hir) struct ScalarPairFrame {
+    pub(in crate::hir) temps: [TempId; 3],
+    pub(in crate::hir) homes: [HomeSlotKey; 3],
     pub(super) copied_input: Option<(TempId, HomeSlotKey)>,
+    pub(in crate::hir) literal_input: Option<HirExpr>,
+    pub(in crate::hir) tail: HirExpr,
+    pub(super) copied_tail: Option<(TempId, HomeSlotKey)>,
 }
 
-pub(super) fn collect_nil_pairs(
+pub(super) fn collect_scalar_pairs(
     proto: &LoweredProto,
     cfg: &Cfg,
     dataflow: &DataflowFacts,
     epochs: &SlotEpochFacts,
     fixed_temps: &[TempId],
     phi_temps: &[TempId],
-) -> Vec<NilPairFrame> {
+) -> Vec<ScalarPairFrame> {
     proto.instrs.windows(3).enumerate().filter_map(|(index, window)| {
-        let [first, LowInstr::LoadNil(second), LowInstr::Move(last)] = window else {
+        let [first, second, LowInstr::Move(last)] = window else {
             return None;
         };
+        let second_site = InstrRef(index + 1);
+        let (second_reg, tail, copied_tail) = if let LowInstr::Move(copy) = second {
+            if copy.src == last.src || epochs.reference_capture_may_be_open(copy.src, second_site) {
+                return None;
+            }
+            let input = canonical_value_temp(dataflow.use_value(second_site, copy.src),
+                dataflow.defs.len(), fixed_temps, phi_temps)?;
+            (copy.dst, HirExpr::TempRef(input), Some((input,
+                HomeSlotKey::new(copy.src.index(), epochs.epoch_at(copy.src, second_site)))))
+        } else {
+            let (reg, value) = scalar_literal(proto, second)?;
+            (reg, value, None)
+        };
         let first_site = InstrRef(index);
-        let (snapshot_reg, copied_input) = match first {
-            LowInstr::LoadNil(first) if first.dst.len == 1 => (first.dst.start, None),
+        let (snapshot_reg, copied_input, literal_input) = match first {
             LowInstr::Move(first) if first.src < first.dst
                 && !epochs.reference_capture_may_be_open(first.src, first_site) => {
                 let input = canonical_value_temp(dataflow.use_value(first_site, first.src),
                     dataflow.defs.len(), fixed_temps, phi_temps)?;
-                (first.dst, Some((input, HomeSlotKey::new(first.src.index(), epochs.epoch_at(first.src, first_site)))))
+                (first.dst, Some((input, HomeSlotKey::new(first.src.index(), epochs.epoch_at(first.src, first_site)))), None)
             }
-            _ => return None,
+            _ => {
+                let (reg, value) = scalar_literal(proto, first)?;
+                (reg, None, Some(value))
+            },
         };
-        if second.dst.len != 1
-            || last.src != snapshot_reg || last.dst == second.dst.start
+        if last.src != snapshot_reg || last.dst == second_reg
             || last.dst.index() >= last.src.index()
-            || second.dst.start.index() >= last.src.index()
+            || second_reg.index() >= last.src.index()
             || cfg.instr_to_block[index] != cfg.instr_to_block[index + 2]
         {
             return None;
         }
-        let regs = [snapshot_reg, second.dst.start, last.dst];
+        let regs = [snapshot_reg, second_reg, last.dst];
         let mut temps = [TempId(0); 3];
         let mut homes = [HomeSlotKey::new(0, 0); 3];
         for (offset, reg) in regs.into_iter().enumerate() {
@@ -127,8 +152,30 @@ pub(super) fn collect_nil_pairs(
         {
             return None;
         }
-        Some(NilPairFrame { temps, homes, copied_input })
+        Some(ScalarPairFrame { temps, homes, copied_input, literal_input, tail, copied_tail })
     }).collect()
+}
+
+fn scalar_literal(proto: &LoweredProto, instr: &LowInstr) -> Option<(Reg, HirExpr)> {
+    match instr {
+        LowInstr::LoadNil(load) if load.dst.len == 1 => Some((load.dst.start, HirExpr::Nil)),
+        LowInstr::LoadBool(load) => Some((load.dst, HirExpr::Boolean(load.value))),
+        LowInstr::LoadInteger(load) => Some((load.dst, HirExpr::Integer(load.value))),
+        LowInstr::LoadNumber(load) => Some((load.dst, HirExpr::Number(load.value))),
+        LowInstr::LoadConst(load) => {
+            use crate::parser::RawLiteralConst;
+            let value = match &proto.constants[load.value.index()] {
+                RawLiteralConst::Integer(value) => HirExpr::Integer(*value),
+                RawLiteralConst::Number(value) => HirExpr::Number(*value),
+                RawLiteralConst::String(value) => {
+                    HirExpr::String(crate::LuaString::from_raw(value))
+                }
+                _ => return None,
+            };
+            Some((load.dst, value))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -63,6 +63,7 @@ impl AstRewritePass for BranchPrettyPass {
                 let mut changed = false;
                 if let AstExpr::Unary(unary) = &if_stmt.cond
                     && unary.op == AstUnaryOpKind::Not
+                    && !if_stmt.preserves_arm_order
                     && !(if_stmt
                         .else_block
                         .as_ref()
@@ -76,7 +77,8 @@ impl AstRewritePass for BranchPrettyPass {
                     if_stmt.cond = inner;
                     changed = true;
                 }
-                if only_preserved_nil_declarations(&if_stmt.then_block)
+                if !if_stmt.preserves_arm_order
+                    && only_preserved_nil_declarations(&if_stmt.then_block)
                     && if_stmt.else_block.as_ref().is_some_and(|block| {
                         !block.stmts.is_empty() && !only_preserved_nil_declarations(block)
                     })
@@ -95,7 +97,8 @@ impl AstRewritePass for BranchPrettyPass {
                 changed
             }
             AstStmt::Repeat(repeat_stmt)
-                if matches!(repeat_stmt.cond, AstExpr::Boolean(true))
+                if !repeat_stmt.preserves_condition
+                    && matches!(repeat_stmt.cond, AstExpr::Boolean(true))
                     && !block_contains_single_pass_forbidden_nodes(&repeat_stmt.body)
                     && let Some(plan) = SinglePassBlockPlan::analyze(&repeat_stmt.body)
                     && plan.flow.contains_break
@@ -150,6 +153,7 @@ fn merge_adjacent_continues(stmts: &mut Vec<AstStmt>) -> bool {
             preserves_boolean_prewrite: false,
         }));
         previous.preserves_empty_test |= next.preserves_empty_test;
+        previous.preserves_arm_order |= next.preserves_arm_order;
         changed = true;
     }
     *stmts = merged;
@@ -188,6 +192,7 @@ fn fold_repeat_tail_continue_break(repeat_stmt: &mut AstRepeat) -> bool {
     let broken = break_if.cond.clone();
     let latch = std::mem::replace(&mut repeat_stmt.cond, AstExpr::Boolean(false));
     repeat_stmt.body.stmts.truncate(len - 2);
+    repeat_stmt.preserves_condition = true;
     repeat_stmt.cond = AstExpr::LogicalOr(Box::new(AstLogicalExpr {
         lhs: AstExpr::LogicalAnd(Box::new(AstLogicalExpr {
             lhs: continued,
@@ -571,6 +576,7 @@ fn merge_exact_nested_if(if_stmt: &mut AstIf) -> bool {
         preserves_boolean_prewrite: false,
     }));
     inner.preserves_empty_test |= if_stmt.preserves_empty_test;
+    inner.preserves_arm_order |= if_stmt.preserves_arm_order;
     *if_stmt = *inner;
     true
 }
@@ -637,7 +643,7 @@ fn flatten_terminating_if(stmt: AstStmt) -> Result<Vec<AstStmt>, AstStmt> {
         return Ok(stmts);
     }
 
-    if else_terminates {
+    if else_terminates && !if_stmt.preserves_arm_order {
         if_stmt.cond = negate_guard_condition(if_stmt.cond);
         let then_block = std::mem::replace(&mut if_stmt.then_block, else_block);
         if_stmt.else_block = None;
@@ -964,6 +970,33 @@ fn stmt_requires_scope_barrier(stmt: &AstStmt) -> bool {
 }
 
 fn negate_guard_condition(expr: AstExpr) -> AstExpr {
+    let mut leading = &expr;
+    while let AstExpr::LogicalAnd(logical) | AstExpr::LogicalOr(logical) = leading {
+        leading = &logical.lhs;
+    }
+    if matches!(leading, AstExpr::Unary(unary)
+        if unary.op == AstUnaryOpKind::Not && !unary.original_operation)
+    {
+        // 换臂后的合成否定可沿左脊消去条件极性包装，保持所有叶子的求值顺序。
+        // 只拆含可消去 NOT 的左脊，避免把其余 `not (b or c)` 无谓展开。
+        fn invert_left(expr: AstExpr) -> AstExpr {
+            match expr {
+                AstExpr::Unary(unary) => unary.expr,
+                AstExpr::LogicalAnd(mut logical) => {
+                    logical.lhs = invert_left(logical.lhs);
+                    logical.rhs = negate_guard_condition(logical.rhs);
+                    AstExpr::LogicalOr(logical)
+                }
+                AstExpr::LogicalOr(mut logical) => {
+                    logical.lhs = invert_left(logical.lhs);
+                    logical.rhs = negate_guard_condition(logical.rhs);
+                    AstExpr::LogicalAnd(logical)
+                }
+                _ => unreachable!("left spine ends at the synthetic NOT"),
+            }
+        }
+        return invert_left(expr);
+    }
     match expr {
         AstExpr::Unary(unary) if unary.op == AstUnaryOpKind::Not => unary.expr,
         // Lua 的 `<`/`<=` 可能走元方法，number 还可能遇到 NaN；`not (a < b)`

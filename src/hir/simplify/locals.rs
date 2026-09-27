@@ -7,6 +7,7 @@
 
 mod branch_merge;
 mod entry_nil;
+pub(super) use entry_nil::restore_entry_frame;
 mod nil_initializers;
 mod param_alias;
 mod rewrite;
@@ -92,6 +93,7 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             safety,
             temp_debug_locals: &proto.temp_debug_locals,
             temp_debug_scopes: &proto.temp_debug_scopes,
+            debug_scopes: &proto.debug_scopes,
             next_local_index: &mut proto.local_count,
             local_debug_hints: &mut proto.local_debug_hints,
             local_debug_scopes: &mut proto.local_debug_scopes,
@@ -149,7 +151,9 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
         facts.record_temp_to_local_merge(temp, local);
     }
     proto.physical_root_locals.extend(physical_root_locals);
-    let nil_initializers_changed = nil_initializers::restore(proto, facts);
+    let nil_initializers_changed =
+        super::source_frames::restore_split_nil_declarations(proto, facts)
+            | nil_initializers::restore(proto, facts);
     let entry_nil_changed = entry_nil::prune_redundant_entry_nil_writes(proto, facts, safety);
     let alias_changed = param_alias::coalesce_param_aliases_in_proto(proto, facts, safety);
     result.changed
@@ -332,6 +336,7 @@ struct PromotionCtx<'a> {
     safety: HirExprSafety,
     temp_debug_locals: &'a [Option<String>],
     temp_debug_scopes: &'a [Option<usize>],
+    debug_scopes: &'a [Option<crate::hir::common::HirDebugScope>],
     next_local_index: &'a mut usize,
     local_debug_hints: &'a mut Vec<Option<String>>,
     local_debug_scopes: &'a mut Vec<Option<usize>>,
@@ -747,6 +752,33 @@ fn direct_fixed_initializer(assign: &HirAssign) -> bool {
                 })))
 }
 
+/// 只有同一初始化入口和作用域的 canonical debug 身份可成为一个声明组。
+/// 其它名称仍由独立声明/复用路径处理，不能仅按相邻寄存器合并生命周期。
+fn direct_debug_initializer_group(
+    assign: &HirAssign,
+    scopes: &[Option<usize>],
+    facts: &[Option<crate::hir::common::HirDebugScope>],
+) -> bool {
+    let mut window = None;
+    for target in &assign.targets {
+        let HirLValue::Temp(temp) = target else {
+            return false;
+        };
+        let Some(scope) = scopes[temp.index()].and_then(|id| facts[id]) else {
+            return false;
+        };
+        if scope.initializer_temp != Some(*temp) && scope.initializer_phi != Some(*temp) {
+            return false;
+        }
+        let current = (scope.start_pc, scope.end_pc);
+        if window.is_some_and(|window| window != current) {
+            return false;
+        }
+        window = Some(current);
+    }
+    window.is_some()
+}
+
 fn collect_plans(
     ctx: &mut PromotionCtx<'_>,
     block: &HirBlock,
@@ -859,6 +891,36 @@ fn collect_plans(
         }),
         safety: ctx.safety,
     };
+    // 外层匿名绑定可承接原 MOVE 的同槽覆盖；一次汇总其全部版本，避免每个候选重扫映射。
+    let mut inherited_homes = BTreeMap::<LocalId, Option<HomeSlotKey>>::new();
+    for (&temp, &local) in inherited {
+        let home = facts.trusted_temp_home_slot(temp).filter(|_| {
+            !ctx.identity_sensitive_temps.contains(&temp)
+                && !ctx.identity_sensitive_locals.contains(&local)
+                && ctx
+                    .local_debug_hints
+                    .get(local.index())
+                    .is_none_or(Option::is_none)
+                && ctx
+                    .local_debug_scopes
+                    .get(local.index())
+                    .is_none_or(Option::is_none)
+                && temp_debug_locals
+                    .get(temp.index())
+                    .is_none_or(Option::is_none)
+                && temp_debug_scopes
+                    .get(temp.index())
+                    .is_none_or(Option::is_none)
+        });
+        inherited_homes
+            .entry(local)
+            .and_modify(|known| {
+                if *known != home {
+                    *known = None;
+                }
+            })
+            .or_insert(home);
+    }
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
     // 当前词法身份独立于 compaction 资格：受保护的 debug local 仍须接收后续同 scope 清零。
@@ -1291,6 +1353,8 @@ fn collect_plans(
             && assign.targets.len() > 1
         {
             let vararg_initializer = fixed_vararg_initializer(assign);
+            let debug_initializer =
+                direct_debug_initializer_group(assign, temp_debug_scopes, ctx.debug_scopes);
             let fresh_group = (|| {
                 if has_label_flow || ctx.compact_home_slots || !direct_fixed_initializer(assign) {
                     return None;
@@ -1319,10 +1383,12 @@ fn collect_plans(
                             .touch_positions_from(*temp, decl_index + 1)
                             .take(2)
                             .count()
-                            < 2)
+                            < 2
+                            && event_block.touch_positions_from(*temp, decl_index + 1).next()
+                                == Some(decl_index + 1))
                         || ctx.identity_sensitive_temps.contains(temp)
                         || ctx.to_be_closed_temps.contains(temp)
-                        || (!vararg_initializer && (temp_debug_locals
+                        || (!vararg_initializer && !debug_initializer && (temp_debug_locals
                             .get(temp.index())
                             .is_some_and(Option::is_some)
                         || temp_debug_scopes
@@ -1681,6 +1747,24 @@ fn collect_plans(
                 .or(debug_local)
                 .or(preceding_physical_root_local)
                 .or_else(|| {
+                    let home = home_slot?;
+                    let predecessor = facts.copy_predecessor(root_temp)?;
+                    let local = *inherited.get(&predecessor)?;
+                    // COPY 仍留在原写入点；只接回它实际覆盖的匿名外层 Def。
+                    // 标签流、debug 新身份和 capture 不由此证明，完整帧恢复另行验证。
+                    // 本组若有独立 PhysicalRoot 生命周期，必须走已配对的覆盖/释放链，
+                    // 不能仅凭同槽前驱接入外层 local 后遗失块内的释放点。
+                    (!has_label_flow
+                        && !force_physical_root_local
+                        && inherited_homes.get(&local) == Some(&Some(home))
+                        && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
+                        && debug_scope_for_temp_group(temp_debug_scopes, &group).is_none()
+                        && group
+                            .iter()
+                            .all(|temp| !ctx.identity_sensitive_temps.contains(temp)))
+                    .then_some(local)
+                })
+                .or_else(|| {
                     if ctx.dialect != crate::decompile::DecompileDialect::Luau
                         || !facts.is_local_comparison_result(
                             root_temp,
@@ -1923,6 +2007,7 @@ fn collect_plans(
                 if event_block
                     .stmt(first_touch_index.unwrap())
                     .consumes_only_control_head(use_stmt, &group)
+                    && first_touch_index == Some(decl_index + 1)
                     && !matches!(
                         single_temp_assign_value(stmt, root_temp),
                         Some(HirExpr::Closure(_))
@@ -1939,7 +2024,9 @@ fn collect_plans(
                             )
                         ))
                 {
-                    // 候选拒绝[PolicyBoundary]：只在控制头消费一次的匿名 temp 保持低密度展示；这不是运行语义边界。
+                    // 候选拒绝[LayerBoundary]：紧邻控制头的准备仍交完整条件帧恢复。
+                    // 跨过其它语句才读取的值必须先物化，否则中间 CALL/构造器的源码前缀
+                    // 会缺少它的原槽；不能仅凭最终消费者是条件就永久搁置声明。
                     continue;
                 }
                 if single_use_seed_can_stay_temp(stmt, root_temp, use_stmt) {
@@ -2820,6 +2907,7 @@ fn rewrite_plan_anchor_stmt(
                 _ => None,
             };
             Some(HirStmt::Assign(Box::new(HirAssign {
+                luau_function_declaration: false,
                 luau_compound_global: false,
                 upvalue_write_source: None,
                 is_phi_transfer: matches!(original, HirStmt::Assign(assign) if assign.is_phi_transfer),

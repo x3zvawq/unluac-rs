@@ -794,6 +794,7 @@ fn apply_fold(
         promotion_facts,
     );
     body.stmts[fold.seed_index] = HirStmt::Assign(Box::new(HirAssign {
+        luau_function_declaration: false,
         luau_compound_global: false,
         upvalue_write_source: None,
         is_phi_transfer: false,

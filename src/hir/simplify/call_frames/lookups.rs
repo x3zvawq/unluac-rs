@@ -444,16 +444,17 @@ impl FrameBuilder<'_> {
         })))
     }
 
-    /// JIT/Luau 数值算术直接读取低槽并写同一 scratch；Luau 也可在高一槽准备 RHS 常量。
+    /// 数值算术直接读取低槽并写同一 scratch；Luau 可在高一槽准备常量。
     pub(super) fn direct_numeric_arithmetic(
         &self,
         binary: &crate::hir::common::HirBinaryExpr,
         slot: usize,
     ) -> Option<HirExpr> {
         let context = self.native?;
+        let source = binary.source_site?;
         let result = HomeSlotKey::new(slot, 0);
         let layout = self.facts.native_binary_layout(binary)?;
-        if self.facts.operation_result_home(binary.source_site?) != Some(result)
+        if self.facts.operation_result_home(source) != Some(result)
             || context.barred.contains(&result)
             || context.closed.contains(&result)
             || ![
@@ -466,10 +467,17 @@ impl FrameBuilder<'_> {
                 (if constant_home.is_none() {
                     context.constants_fit_rk
                 } else {
-                    // O0 不使用 RK opcode，仍在结果上一槽写相同常量，再执行原运算。
+                    // O0 的 RHS 和位于左侧的常量都可能显式准备；另一侧是低槽
+                    // binding 时，LOADK 仍占结果上一槽。左常量还须由 use→Def
+                    // 确认该次准备，不能通过交换操作数绕过它或改变元方法方向。
                     self.dialect == DecompileDialect::Luau
-                        && side == 0
                         && constant_home == Some(HomeSlotKey::new(slot + 1, 0))
+                        && (side == 0
+                            || self
+                                .facts
+                                .operation_input_preparation(source, constant)
+                                .map(|(_, home)| home)
+                                == constant_home)
                 }) && matches!(constant, HirExpr::Integer(_) | HirExpr::Number(_))
                     && self
                         .direct_home(value)
@@ -510,7 +518,10 @@ impl FrameBuilder<'_> {
                     }));
         if self.dialect != DecompileDialect::Luau
             || !self.native?.constants_fit_rk
-            || self.native?.barred.contains(&home)
+            || (self.native?.barred.contains(&home)
+                && !self
+                    .facts
+                    .operation_result_reference_unaliased(binary.source_site?))
             || self.native?.closed.contains(&home)
             || self.facts.operation_result_home(binary.source_site?) != Some(home)
             || (!lhs_low && layout.lhs != Some(HomeSlotKey::new(slot + 1, 0)))
@@ -590,6 +601,41 @@ impl FrameBuilder<'_> {
         }
     }
 
+    /// 已树化的全局字段不消费外部 producer；只在原同槽 GETGLOBAL/GETTABLE
+    /// 布局可完整重发时供已完成数组的只读证明使用。
+    pub(super) fn completed_global_lookup(&self, value: &HirExpr, slot: usize) -> bool {
+        let HirExpr::TableAccess(access) = value else {
+            return false;
+        };
+        let HirExpr::GlobalRef(global) = &access.base else {
+            return false;
+        };
+        let Some(context) = self.native else {
+            return false;
+        };
+        let home = HomeSlotKey::new(slot, 0);
+        self.literal_uses_rk(&access.key, Some((&access.sources, false))) == Some(true)
+            && !context.closed.contains(&home)
+            && self.facts.global_read_frame(global, self.dialect) == Some(home)
+            && self.facts.table_read_result_home(access) == Some(home)
+            && self
+                .facts
+                .native_table_read_layout(access)
+                .is_some_and(|layout| layout.base == home && layout.key.is_none())
+            && matches!(&access.key, HirExpr::String(key)
+                if self.dialect != DecompileDialect::Luau
+                    || key.as_utf8().is_some_and(|key| self.dialect.is_identifier_name(key)))
+            && (!context.barred.contains(&home)
+                || access
+                    .sources
+                    .try_for_each_known(|source| {
+                        self.facts
+                            .operation_result_reference_unaliased(source)
+                            .then_some(())
+                    })
+                    .is_some())
+    }
+
     pub(super) fn register_lookup(
         &mut self,
         access: &HirTableAccess,
@@ -613,10 +659,10 @@ impl FrameBuilder<'_> {
                 .expanded_index(access, before, slot)
                 .map(|(call, _)| HirExpr::Call(Box::new(call)));
         }
-        let result = HomeSlotKey::new(slot, 0);
+        let result = self.facts.table_read_result_home(access)?;
         // 未来同槽 capture 不能反向阻止这次读取；只有原操作尚未打开 ByRef 时才可借证。
         // 当前声明/捕获身份及后继窗口仍由完整帧的原子 preview 验证。
-        if self.facts.table_read_result_home(access) != Some(result)
+        if result.slot() != slot
             || (self.native?.barred.contains(&result)
                 && !matches!(access.sources, crate::hir::common::HirOperationSources::Single(source)
                     if self.facts.operation_result_reference_unaliased(source)))
@@ -645,6 +691,43 @@ impl FrameBuilder<'_> {
             }
             // GETUPVAL 的单次 Def 仍在原 base 槽准备；不能将同名上值当成既有低槽。
             access.base.clone()
+        } else if let HirExpr::TempRef(temp) = access.base {
+            if self.facts.table_read_base_value(access) != Some(temp) {
+                return None;
+            }
+            let previous = std::mem::replace(&mut self.register_operand, true);
+            let base = self.expr(
+                &access.base,
+                before,
+                layout.base.slot(),
+                None,
+                false,
+                true,
+                Some(temp),
+            );
+            self.register_operand = previous;
+            base?
+        } else if let HirExpr::LocalRef(local) = access.base
+            && self
+                .definition(local, before)
+                .and_then(|index| scalar_local(self.run[index]))
+                .is_some_and(|(_, value)| matches!(value, HirExpr::UpvalueRef(_)))
+        {
+            // 尚未树化的 GETUPVAL 也是原 base 准备；按这次 use 的 Def 消费，
+            // 不能要求它先通过禁止裸上值的通用寄存器 operand 入口。
+            let producer = self.facts.table_read_base_value(access)?;
+            let previous = std::mem::replace(&mut self.register_operand, false);
+            let base = self.expr(
+                &access.base,
+                before,
+                layout.base.slot(),
+                None,
+                false,
+                true,
+                Some(producer),
+            );
+            self.register_operand = previous;
+            base?
         } else {
             self.register_operand(
                 &access.base,
@@ -662,7 +745,7 @@ impl FrameBuilder<'_> {
                 .is_some_and(|key| key == home && key.slot() < self.base);
             let key_slot =
                 slot + usize::from(!direct_base || self.dialect == DecompileDialect::Luau);
-            if !direct_key && home != HomeSlotKey::new(key_slot, 0) {
+            if !direct_key && home.slot() != key_slot {
                 return None;
             }
             if self.dialect == DecompileDialect::Luau
@@ -680,11 +763,41 @@ impl FrameBuilder<'_> {
             {
                 // 原 GETUPVAL 只供本次索引使用，仍在 key_slot 重发；base 已在上方验证。
                 access.key.clone()
+            } else if let Some((producer, preparation)) =
+                self.facts.table_key_value_preparation(access)
+                && preparation == home
+                && {
+                    let prepared = match &access.key {
+                        HirExpr::LocalRef(local) => {
+                            self.definition(*local, before).and_then(|index| {
+                                scalar_local(self.run[index]).map(|(_, value)| value)
+                            })
+                        }
+                        value => Some(value),
+                    };
+                    prepared.is_some_and(|value| {
+                        tables::literal_rk(value)
+                            && self.literal_uses_rk(value, Some((&access.sources, false)))
+                                == Some(false)
+                    })
+                }
+            {
+                // 池满后的 key 仍在原高槽 LOADK/LOADBOOL；沿唯一 use→Def
+                // 消费尚未树化的准备 local，不把它误判成应保留的普通 COPY。
+                self.expr(
+                    &access.key,
+                    before,
+                    key_slot,
+                    None,
+                    false,
+                    true,
+                    Some(producer),
+                )?
             } else {
                 self.register_operand(&access.key, before, key_slot)?
             }
         } else {
-            if !self.native?.constants_fit_rk
+            if self.literal_uses_rk(&access.key, Some((&access.sources, false))) != Some(true)
                 || !matches!(
                     access.key,
                     HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)
@@ -734,8 +847,10 @@ impl FrameBuilder<'_> {
             | HirExpr::String(_) => None,
             HirExpr::TableAccess(access) => self.register_lookup(access, before, slot),
             HirExpr::GlobalRef(global)
-                if self.facts.global_read_frame(global, self.dialect)
-                    != Some(HomeSlotKey::new(slot, 0)) =>
+                if self
+                    .facts
+                    .global_read_frame(global, self.dialect)
+                    .is_none_or(|home| home.slot() != slot) =>
             {
                 None
             }
@@ -766,15 +881,18 @@ impl FrameBuilder<'_> {
         before: usize,
         slot: usize,
     ) -> Option<HirExpr> {
-        let result = HomeSlotKey::new(slot, 0);
-        if !self.native?.constants_fit_rk
-            || self.facts.operation_result_home(binary.source_site?) != Some(result)
-            || self.native?.barred.contains(&result)
+        let result = self.facts.operation_result_home(binary.source_site?)?;
+        if result.slot() != slot
+            || (self.native?.barred.contains(&result)
+                && !self
+                    .facts
+                    .operation_result_reference_unaliased(binary.source_site?))
             || self.native?.closed.contains(&result)
         {
             return None;
         }
         let layout = self.facts.native_binary_layout(binary)?;
+        let sources = crate::hir::common::HirOperationSources::Single(binary.source_site?);
         let direct = |value: &HirExpr, home| {
             self.direct_home(value)
                 .is_some_and(|actual| Some(actual) == home && actual.slot() < self.base)
@@ -783,6 +901,9 @@ impl FrameBuilder<'_> {
         let rhs_low = direct(&binary.rhs, layout.rhs);
         let constant = |value: &HirExpr| matches!(value, HirExpr::Integer(_) | HirExpr::Number(_));
         let lhs = if layout.lhs.is_none() && constant(&binary.lhs) {
+            if self.literal_uses_rk(&binary.lhs, Some((&sources, false))) != Some(true) {
+                return None;
+            }
             binary.lhs.clone()
         } else {
             if !lhs_low && layout.lhs != Some(result) {
@@ -821,12 +942,52 @@ impl FrameBuilder<'_> {
         };
         let rhs_slot = slot + usize::from(!lhs_low && layout.lhs.is_some());
         let rhs = if layout.rhs.is_none() && constant(&binary.rhs) {
+            if self.literal_uses_rk(&binary.rhs, Some((&sources, true))) != Some(true) {
+                return None;
+            }
             binary.rhs.clone()
         } else {
             if !rhs_low && layout.rhs != Some(HomeSlotKey::new(rhs_slot, 0)) {
                 return None;
             }
-            self.register_operand(&binary.rhs, before, rhs_slot)?
+            let prepared = match &binary.rhs {
+                HirExpr::LocalRef(local) => self
+                    .definition(*local, before)
+                    .and_then(|index| scalar_local(self.run[index]))
+                    .map_or(&binary.rhs, |(_, value)| value),
+                value => value,
+            };
+            if !rhs_low
+                && constant(prepared)
+                && matches!(
+                    self.dialect,
+                    DecompileDialect::Lua51 | DecompileDialect::Lua52 | DecompileDialect::Lua53
+                )
+            {
+                if self.literal_uses_rk(prepared, Some((&sources, true))) != Some(false) {
+                    return None;
+                }
+                let (producer, home) = self
+                    .facts
+                    .operation_input_preparation(binary.source_site?, prepared)?;
+                if Some(home) != layout.rhs {
+                    return None;
+                }
+                let previous = std::mem::replace(&mut self.register_operand, false);
+                let rebuilt = self.expr(
+                    &binary.rhs,
+                    before,
+                    rhs_slot,
+                    None,
+                    false,
+                    true,
+                    Some(producer),
+                );
+                self.register_operand = previous;
+                rebuilt?
+            } else {
+                self.register_operand(&binary.rhs, before, rhs_slot)?
+            }
         };
         Some(HirExpr::Binary(Box::new(
             crate::hir::common::HirBinaryExpr {

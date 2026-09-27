@@ -75,7 +75,9 @@ pub(in crate::hir::simplify) fn restore(
                     .collect::<Vec<_>>();
                 let candidate = plan(
                     NativeFrameContext {
+                        rk_literals: None,
                         expanded_callees: None,
+                        retired_roots: None,
                         proto,
                         barred: &restrictions.barred,
                         closed: &restrictions.closed,

@@ -617,3 +617,157 @@ fn debug_identity_homes(
             Some(homes)
         })
 }
+
+/// 循环入口的 nil 声明与 phi 共用同一物理帧；稀疏 phi 省略的槽由 VM 入口清零。
+/// 显式 LOADNIL 只接回连续且尚无 debug/capture 身份的组。恢复完整低槽区后，
+/// 每个 exact-home 写仍落在原 cell；高槽 CALL/SETLIST 才能验证自己的源码声明前缀。
+pub(in crate::hir::simplify) fn restore_entry_frame(
+    proto: &mut HirProto,
+    facts: &mut ProtoPromotionFacts,
+) -> bool {
+    let base = proto.params.len() + usize::from(proto.vararg_param_local.is_some());
+    let mut seeds = BTreeMap::new();
+    let mut homes = BTreeSet::new();
+    let mut prefix_len = 0;
+    for stmt in &proto.body.stmts {
+        let HirStmt::Assign(assign) = stmt else {
+            break;
+        };
+        if assign.values.tail.is_some()
+            || assign.values.fixed.len() != assign.targets.len()
+            || assign.initializer_merge_transaction.is_some()
+            || assign.generic_for_initializer_producer.is_some()
+            || assign.generic_for_dispatch_release.is_some()
+            || assign.method_rewrite_transaction.is_some()
+        {
+            break;
+        }
+        let mut additions = Vec::new();
+        for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+            let HirLValue::Temp(temp) = target else {
+                break;
+            };
+            let Some(home) = facts.trusted_temp_home_slot(*temp) else {
+                break;
+            };
+            if home.slot() < base || home != HomeSlotKey::new(home.slot(), 0) {
+                break;
+            }
+            match value {
+                HirExpr::Nil if !homes.contains(&home) => {}
+                HirExpr::TempRef(source) if seeds.get(source) == Some(&home) => {}
+                _ => break,
+            }
+            additions.push((*temp, home));
+        }
+        if additions.len() != assign.targets.len() {
+            break;
+        }
+        for (temp, home) in additions {
+            seeds.insert(temp, home);
+            homes.insert(home);
+        }
+        prefix_len += 1;
+    }
+    if homes.len() < 2 || !seeds.keys().any(|temp| facts.is_loop_carrier_temp(*temp)) {
+        return false;
+    }
+    let end = homes.last().unwrap().slot() + 1;
+    // 只省略未读槽的 Entry phi 才能用 VM 入口 nil 填补空缺；显式初始化必须连续。
+    if end >= crate::SOURCE_LOCAL_LIMIT
+        || (end - base != homes.len()
+            && !seeds.keys().all(|temp| facts.is_entry_nil_phi_temp(*temp)))
+    {
+        return false;
+    }
+    // 既有 debug/closure cell 不能按物理槽合并。当前只承接未声明的匿名入口区。
+    if (0..proto.local_count).any(|index| {
+        facts
+            .trusted_local_home_slot(LocalId(index))
+            .is_some_and(|home| (base..end).contains(&home.slot()))
+    }) {
+        return false;
+    }
+    let mut members = BTreeMap::new();
+    for index in 0..proto.temp_count {
+        let temp = TempId(index);
+        let Some(home) = facts.trusted_temp_home_slot(temp) else {
+            continue;
+        };
+        if !(base..end).contains(&home.slot()) {
+            continue;
+        }
+        if !facts
+            .complete_temp_definition_write_homes(temp)
+            .iter()
+            .copied()
+            .eq([home])
+        {
+            continue;
+        }
+        if home != HomeSlotKey::new(home.slot(), 0)
+            || proto
+                .temp_debug_locals
+                .get(index)
+                .is_some_and(Option::is_some)
+            || proto
+                .temp_debug_scopes
+                .get(index)
+                .is_some_and(Option::is_some)
+        {
+            return false;
+        }
+        members.insert(temp, home);
+    }
+    if !seeds.keys().all(|temp| members.contains_key(temp)) {
+        return false;
+    }
+    let mut captures =
+        super::CaptureCollector::new(crate::hir::common::HirCaptureMode::ByReference);
+    visit::visit_stmts(&proto.body.stmts, &mut captures);
+    if captures
+        .bindings
+        .temps
+        .iter()
+        .any(|temp| members.contains_key(temp))
+    {
+        return false;
+    }
+    let start = proto.local_count;
+    let locals: Vec<_> = (0..end - base)
+        .map(|offset| LocalId(start + offset))
+        .collect();
+    let mapping: BTreeMap<_, _> = members
+        .iter()
+        .map(|(&temp, home)| (temp, locals[home.slot() - base]))
+        .collect();
+    proto.local_count += locals.len();
+    proto.local_debug_hints.resize(proto.local_count, None);
+    proto.local_debug_scopes.resize(proto.local_count, None);
+    for (offset, &local) in locals.iter().enumerate() {
+        facts.record_local_home_slot(local, HomeSlotKey::new(base + offset, 0));
+        proto.inline_dispositions.preserve_local(
+            local,
+            crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix,
+        );
+    }
+    for (&temp, &local) in &mapping {
+        facts.record_entry_nil_phi_promotion(temp, local);
+        facts.record_temp_to_local_merge(temp, local);
+        if proto.physical_root_temps.remove(&temp) {
+            proto.physical_root_locals.insert(local);
+        }
+        proto.inline_dispositions.promote_temp_to_local(temp, local);
+    }
+    super::rewrite::bindings(proto, &mapping);
+    let values = vec![HirExpr::Nil; locals.len()].into();
+    proto.body.stmts.splice(
+        ..prefix_len,
+        [HirStmt::LocalDecl(Box::new(HirLocalDecl {
+            bindings: locals,
+            values,
+            initializer_merge_transaction: None,
+        }))],
+    );
+    true
+}

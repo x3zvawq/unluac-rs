@@ -82,6 +82,7 @@ fn collapse_live_boolean_materialization_shells_in_block(
             }
 
             block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
+                luau_function_declaration: false,
                 luau_compound_global: false,
                 upvalue_write_source: None,
                 is_phi_transfer: false,

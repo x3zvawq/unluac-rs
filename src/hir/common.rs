@@ -1137,6 +1137,8 @@ pub struct HirGlobalDecl {
 /// 普通赋值。
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirAssign {
+    /// 已验证的 Luau 具名函数声明：先创建闭包再求目标，AST 必须保留声明语法。
+    pub(crate) luau_function_declaration: bool,
     /// 已证明的 Luau 全局复合赋值帧。values 仍保留完整二元式及全局读取，
     /// 后层必须发射复合语法，不能把原同槽读取改成普通 RHS 的额外 scratch。
     pub(crate) luau_compound_global: bool,
@@ -1314,6 +1316,8 @@ pub struct HirIf {
     pub cond: HirExpr,
     /// 原 branch 的空臂或已知常量条件仍拥有 TEST，不能按值域或相同分支删除。
     pub(crate) preserves_empty_test: bool,
+    /// 宽常量池要求两臂保持已恢复的发射顺序，否则 RK 会改变临时槽覆盖。
+    pub(crate) preserves_arm_order: bool,
     pub then_block: HirBlock,
     pub else_block: Option<HirBlock>,
 }
@@ -1330,6 +1334,8 @@ pub struct HirWhile {
 pub struct HirRepeat {
     pub body: HirBlock,
     pub cond: HirExpr,
+    /// 条件承载原字节码检查；即使已知恒真，也不能按合成单次包装删除。
+    pub preserves_condition: bool,
     /// 针对这个 repeat 条件边界、在最终 HIR 上证明的生命周期事实。
     ///
     /// 这里只回答“哪些正文词法 binding 的 VM/HIR root 可以在执行条件前结束”；它不

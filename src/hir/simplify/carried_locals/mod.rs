@@ -59,6 +59,7 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
     proto: &mut HirProto,
     promotion_facts: &mut ProtoPromotionFacts,
     expr_safety: HirExprSafety,
+    dialect: crate::decompile::DecompileDialect,
 ) -> bool {
     let restored_copies = restore_phi_copy_writes(proto, promotion_facts);
     let preserved_bindings = collect_preserved_bindings(proto);
@@ -79,10 +80,15 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
         expr_safety,
     };
     let identity_facts = HandoffIdentityFacts::new(proto, promotion_facts, preserved_bindings);
-    let coalesced =
-        coalesce::coalesce_disjoint_temps(proto, promotion_facts, &identity_facts, expr_safety);
+    let coalesced = coalesce::coalesce_disjoint_temps(
+        proto,
+        promotion_facts,
+        &identity_facts,
+        expr_safety,
+        dialect,
+    );
     let mentions = BindingMentionIndex::new(&proto.body.stmts);
-    branch_copies_changed
+    let changed = branch_copies_changed
         | restored_copies
         | coalesced
         | snapshots_changed
@@ -95,7 +101,9 @@ pub(super) fn collapse_carried_local_handoffs_in_proto(
             &control_facts,
             &mut BTreeSet::new(),
             &mut mentions.blocks(),
-        )
+        );
+    promotion_facts.finish_consumed_local_bindings();
+    changed
 }
 
 /// 自定义后序遍历：先递归处理子块（同时把外层 binding 引用集传下去），再在当前块做
@@ -330,6 +338,7 @@ struct HandoffIdentityFacts {
     for_bindings: BTreeSet<LocalId>,
     physical_roots: BTreeSet<CarryBinding>,
     reference_captured: BTreeSet<CarryBinding>,
+    value_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
     preserved: BTreeSet<CarryBinding>,
     call_preparations: BTreeSet<(CarryBinding, CarryBinding)>,
@@ -365,6 +374,7 @@ impl HandoffIdentityFacts {
                 )
                 .collect(),
             reference_captured: collector.reference_captured,
+            value_captured: collector.value_captured,
             to_be_closed: collector.to_be_closed,
             preserved,
             call_preparations: promotion_facts
@@ -486,6 +496,7 @@ fn collect_preserved_bindings(proto: &HirProto) -> BTreeSet<CarryBinding> {
 struct HandoffIdentityCollector {
     for_bindings: BTreeSet<LocalId>,
     reference_captured: BTreeSet<CarryBinding>,
+    value_captured: BTreeSet<CarryBinding>,
     to_be_closed: BTreeSet<CarryBinding>,
 }
 
@@ -509,10 +520,15 @@ impl HirVisitor<'_> for HandoffIdentityCollector {
     }
 
     fn visit_capture(&mut self, capture: &crate::hir::HirCapture) {
-        if capture.mode == crate::hir::HirCaptureMode::ByReference
-            && let Some(binding) = carry_binding_from_capture(capture.binding)
-        {
-            self.reference_captured.insert(binding);
+        if let Some(binding) = carry_binding_from_capture(capture.binding) {
+            match capture.mode {
+                crate::hir::HirCaptureMode::ByReference => {
+                    self.reference_captured.insert(binding);
+                }
+                crate::hir::HirCaptureMode::ByValue => {
+                    self.value_captured.insert(binding);
+                }
+            }
         }
     }
 }

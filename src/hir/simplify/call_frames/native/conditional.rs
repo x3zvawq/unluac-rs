@@ -1,4 +1,4 @@
-//! 在原共同结果帧中恢复 Luau 条件选值，避免合流 carrier 抬高调用的源码前缀。
+//! 在原结果帧中恢复 Boolean 物化和 Luau 条件选值，避免合流 carrier 抬高源码前缀。
 //! 分支内的准备事件由 FrameBuilder 消费，整个选择及后继条件由同一 native preview 提交。
 
 use super::*;
@@ -7,7 +7,11 @@ use crate::hir::common::{
 };
 use crate::hir::visit::for_each_nested_block;
 
-pub(super) fn collect(context: NativeFrameContext<'_>, facts: &ProtoPromotionFacts) -> Vec<Plan> {
+pub(super) fn collect(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+) -> Vec<Plan> {
     let mut reads = BTreeMap::new();
     visit_stmts(
         &context.proto.body.stmts,
@@ -29,6 +33,7 @@ pub(super) fn collect(context: NativeFrameContext<'_>, facts: &ProtoPromotionFac
     collect_block(
         context,
         facts,
+        dialect,
         &context.proto.body,
         &reads,
         &original_nil,
@@ -38,9 +43,14 @@ pub(super) fn collect(context: NativeFrameContext<'_>, facts: &ProtoPromotionFac
     plans
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "共享事实与 DFS 坐标贯穿同一次条件帧收集"
+)]
 fn collect_block(
     context: NativeFrameContext<'_>,
     facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
     block: &HirBlock,
     reads: &BTreeMap<LocalId, usize>,
     original_nil: &BTreeSet<LocalId>,
@@ -52,14 +62,25 @@ fn collect_block(
         starts.push(*cursor);
         *cursor += 1;
         for_each_nested_block(stmt, &mut |child| {
-            collect_block(context, facts, child, reads, original_nil, cursor, plans);
+            collect_block(
+                context,
+                facts,
+                dialect,
+                child,
+                reads,
+                original_nil,
+                cursor,
+                plans,
+            );
         });
         if matches!(stmt, HirStmt::Repeat(_)) {
             *cursor += 1;
         }
     }
     for (index, window) in block.stmts.windows(3).enumerate() {
-        if let Some(mut plan) = condition_plan(context, facts, window, reads, original_nil) {
+        if dialect == DecompileDialect::Luau
+            && let Some(mut plan) = condition_plan(context, facts, window, reads, original_nil)
+        {
             plan.start = starts[index];
             plan.sink = starts[index + 2];
             plan.removed = (plan.start..plan.sink).collect();
@@ -76,15 +97,28 @@ fn collect_block(
             plans.push(plan);
         }
     }
+    let mut preparation_start = 0;
     for (index, window) in block.stmts.windows(2).enumerate() {
-        if let Some(mut plan) = initializer_plan(context, facts, window, original_nil) {
-            plan.start = starts[index];
-            plan.sink = plan.start;
+        if index > 0
+            && !matches!(
+                block.stmts[index - 1],
+                HirStmt::Assign(_) | HirStmt::LocalDecl(_)
+            )
+        {
+            preparation_start = index;
+        }
+        let preparation = &block.stmts[preparation_start..index];
+        if let Some(mut plan) =
+            initializer_plan(context, facts, dialect, preparation, window, original_nil)
+        {
+            plan.start = starts[preparation_start + plan.start];
+            plan.sink = starts[index];
             let end = starts.get(index + 2).copied().unwrap_or(*cursor);
-            plan.removed = (starts[index + 1]..end).collect();
+            plan.removed = (plan.start..end).filter(|id| *id != plan.sink).collect();
             // 两臂只有已树化的结果写，声明本身留在原词法位置。
-            plan.replayed_effects.clone_from(&plan.removed);
+            plan.replayed_effects = (starts[index + 1]..end).collect();
             plans.push(plan);
+            preparation_start = index + 1;
         }
     }
 }
@@ -92,26 +126,36 @@ fn collect_block(
 fn initializer_plan(
     context: NativeFrameContext<'_>,
     facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    preparation: &[HirStmt],
     window: &[HirStmt],
     original_nil: &BTreeSet<LocalId>,
 ) -> Option<Plan> {
-    let [HirStmt::LocalDecl(decl), HirStmt::If(select)] = window else {
+    let [previous, HirStmt::If(select)] = window else {
         return None;
     };
-    let [result] = decl.bindings.as_slice() else {
-        return None;
+    let (result, empty, declaration) = match previous {
+        HirStmt::LocalDecl(decl)
+            if decl.bindings.len() == 1 && decl.initializer_merge_transaction.is_none() =>
+        {
+            (decl.bindings[0], decl.values.is_empty(), true)
+        }
+        HirStmt::Assign(assign) if assign.initializer_merge_transaction.is_none() => {
+            let (local, _) = scalar_local(previous)?;
+            (local, false, false)
+        }
+        _ => return None,
     };
+    let result = &result;
     let base = facts.trusted_local_home_slot(*result)?;
-    if !decl.values.is_empty()
-        || decl.initializer_merge_transaction.is_some()
-        || original_nil.contains(result)
+    if original_nil.contains(result)
         || select.preserves_empty_test
         || context.barred.contains(&base)
         || context.closed.contains(&base)
     {
         return None;
     }
-    if let Some(scope) = context.proto.local_debug_scopes[result.index()] {
+    if declaration && let Some(scope) = context.proto.local_debug_scopes[result.index()] {
         let initializer = context.proto.debug_scopes[scope]?.initializer_phi?;
         // 原来已生效的空声明仍独立保留；只有 scope 自身从该合流结果开始才恢复 initializer。
         if facts.promoted_local_for_temp(initializer) != Some(*result)
@@ -119,6 +163,63 @@ fn initializer_plan(
         {
             return None;
         }
+    }
+    // 原比较与 Boolean 合流在同一结果槽重发，声明身份保持不动。
+    // 与普通 boolean-shells 不同，这里由完整帧预览核对 operand scratch 和后缀根。
+    if let HirExpr::Binary(binary) = &select.cond
+        && let Some(temp) = facts.comparison_result_temp(binary)
+        && facts.promoted_local_for_temp(temp) == Some(*result)
+        && facts.trusted_temp_home_slot(temp) == Some(base)
+    {
+        let boolean_arm = |block: &HirBlock| {
+            let [HirStmt::Assign(assign)] = block.stmts.as_slice() else {
+                return None;
+            };
+            match (
+                assign.targets.as_slice(),
+                assign.values.fixed.as_slice(),
+                &assign.values.tail,
+            ) {
+                ([HirLValue::Local(target)], [HirExpr::Boolean(value)], None)
+                    if target == result =>
+                {
+                    Some(*value)
+                }
+                _ => None,
+            }
+        };
+        if boolean_arm(&select.then_block) == Some(true)
+            && boolean_arm(select.else_block.as_ref()?) == Some(false)
+        {
+            let mut run = preparation.iter().collect::<Vec<_>>();
+            if !empty {
+                run.push(previous);
+            }
+            let mut builder = frame_builder(context, &run, facts, dialect, base.slot())?;
+            let value = builder.expr(
+                &select.cond,
+                run.len(),
+                base.slot(),
+                None,
+                false,
+                true,
+                None,
+            )?;
+            if (builder.first_event.is_some() || !empty) && builder.next_event != run.len() {
+                return None;
+            }
+            let mut plan = value_plan(base, value);
+            plan.start = builder.first_event.unwrap_or(run.len());
+            if declaration {
+                plan.result_locals.push(*result);
+            } else {
+                plan.assignment_targets.push(HirLValue::Local(*result));
+            }
+            return Some(plan);
+        }
+    }
+    if dialect != DecompileDialect::Luau || !empty {
+        return None;
     }
     let test_home = match &select.cond {
         HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
@@ -156,6 +257,7 @@ fn initializer_plan(
         arm(select.else_block.as_ref()?)?,
     );
     let mut plan = value_plan(base, value);
+    plan.start = preparation.len();
     plan.result_locals.push(*result);
     Some(plan)
 }
@@ -218,6 +320,8 @@ fn native_value(condition: &HirExpr, truthy: HirExpr, falsy: HirExpr) -> HirExpr
 
 fn value_plan(base: HomeSlotKey, value: HirExpr) -> Plan {
     Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: 0,
         sink: 0,
         base,

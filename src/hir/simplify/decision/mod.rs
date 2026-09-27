@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 mod eliminate;
+mod eliminate_control;
 mod eliminate_materialize;
 mod eliminate_state;
 mod helpers;
@@ -363,7 +364,51 @@ pub(in crate::hir) fn collapse_value_decision_expr(
     safety: HirExprSafety,
     root_ends: impl Fn(&HirDecisionNode) -> bool,
 ) -> Option<HirExpr> {
+    let preserves_boolean_test = topology.topological_nodes().any(|node| {
+        node.test_source == crate::hir::HirDecisionTestSource::Value
+            && matches!(node.test, HirExpr::Boolean(_))
+    });
+    let mut expr = collapse_value_decision_shape(topology, safety, root_ends)?;
+    if preserves_boolean_test {
+        // 原 Decision 仍 TEST 已物化的 Boolean；表达式化只改变控制的表示，
+        // 不能让后续布尔转换把这次显式检查消掉。
+        let mut pending = vec![&mut expr];
+        while let Some(value) = pending.pop() {
+            if let HirExpr::LogicalOr(or) = value
+                && matches!(or.rhs, HirExpr::Boolean(false))
+                && let HirExpr::LogicalAnd(and) = &mut or.lhs
+                && matches!(and.rhs, HirExpr::Boolean(true))
+            {
+                or.preserves_boolean_prewrite = true;
+                and.preserves_boolean_prewrite = true;
+            }
+            if let HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) = value {
+                pending.push(&mut logical.lhs);
+                pending.push(&mut logical.rhs);
+            }
+        }
+    }
+    Some(expr)
+}
+
+fn collapse_value_decision_shape(
+    topology: &DecisionFacts<'_>,
+    safety: HirExprSafety,
+    root_ends: impl Fn(&HirDecisionNode) -> bool,
+) -> Option<HirExpr> {
     let decision = topology.decision();
+
+    // Boolean 结果的共享出口先按控制边归约；提前把 true/false 改成
+    // CurrentValue 会打散共同出口，迫使后层制造丢失原槽身份的临时声明。
+    // 所有测试与恢复结果都必须是 Boolean，不能把任意 truthy 值当作 true。
+    if topology
+        .topological_nodes()
+        .all(|node| expr_is_boolean_valued(&node.test))
+        && let Some(expr) = short_circuit::collapse_condition_graph(topology, safety)
+        && expr_is_boolean_valued(&expr)
+    {
+        return Some(expr);
+    }
 
     if !topology.has_shared_nodes()
         && let Some(expr) = collapse_linear_value_chain(decision)

@@ -287,19 +287,19 @@ const PASS_DESCRIPTORS: &[PassDescriptor<HirInvalidation>] = &[
         invalidates: &[TablePattern, TempChain, LocalBinding, BlockStructure],
     },
     PassDescriptor {
-        name: "lower-fixed-table-batches",
-        phase: PassPhase::Final,
-        depends_on: HIR_SHAPE_INPUTS,
-        // SETLIST 展开会丢失原 Batch 身份；完整原帧及其 Normal consumers 稳定后再降低。
-        invalidates: &[TablePattern, TempChain, LocalBinding],
-    },
-    PassDescriptor {
         name: "source-frame-materializations",
         phase: PassPhase::Final,
         depends_on: HIR_SHAPE_INPUTS,
         // 词法事务可能同时消费 CALL 准备，暴露循环入口 guard；须交还 Normal
         // consumers 收敛，不能在调度结束后才产生新的表达式和控制形状。
         invalidates: &[TempChain, LocalBinding, BlockStructure, TablePattern],
+    },
+    PassDescriptor {
+        name: "lower-fixed-table-batches",
+        phase: PassPhase::Final,
+        depends_on: HIR_SHAPE_INPUTS,
+        // SETLIST 展开会丢失原 Batch 身份；完整原帧及其 Normal consumers 稳定后再降低。
+        invalidates: &[TablePattern, TempChain, LocalBinding],
     },
     PassDescriptor {
         name: "parameter-return-frames",
@@ -333,6 +333,13 @@ pub(super) fn simplify_hir(
     dialect: DecompileDialect,
     dump_config: &PassDumpConfig,
 ) -> Result<(), crate::decompile::DecompileError> {
+    // 入口状态的源码槽须先于 COPY 内联固定；否则原低槽写会变成分支末尾的
+    // phi 交接，高槽构造器再也无法证明自己的完整 freereg 前缀。
+    for proto in &mut module.protos {
+        if let Some(facts) = promotion_facts.get_mut(proto.id.index()) {
+            locals::restore_entry_frame(proto, facts);
+        }
+    }
     let mut empty_facts = ProtoPromotionFacts::default();
     let safety = HirExprSafety::for_dialect(dialect);
     let mut effect_snapshot = None;
@@ -348,7 +355,7 @@ pub(super) fn simplify_hir(
             let changed = timings.record(name, || {
                 // 空候选 pass 不需要 closure-effects；先判定适用性，避免其它 pass
                 // 改写后为没有建表工作的模块反复重建整模块效果快照。
-                if matches!(index, 3 | 18)
+                if matches!(index, 3 | 19)
                     && !module.protos.iter().any(|proto| {
                         table_constructors::block_has_table_constructor_candidate(&proto.body)
                     })
@@ -358,7 +365,7 @@ pub(super) fn simplify_hir(
                 if index == 17 {
                     return call_frames::restore_expanded_frames(module, promotion_facts, dialect);
                 }
-                let effects = (matches!(index, 3 | 15 | 16 | 18)
+                let effects = (matches!(index, 3 | 15 | 16 | 19)
                     || index == 4 && dialect == DecompileDialect::Luau)
                     .then(|| {
                         effect_snapshot.get_or_insert_with(|| {
@@ -438,7 +445,7 @@ pub(super) fn simplify_hir(
                         10 => debug_scopes::materialize_tail_debug_scopes_in_proto(proto, dialect),
                         11 => close_scopes::materialize_tbc_close_scopes_in_proto(proto, safety),
                         12 => carried_locals::collapse_carried_local_handoffs_in_proto(
-                            proto, facts, safety,
+                            proto, facts, safety, dialect,
                         ),
                         13 => dead_temps::remove_dead_temp_materializations_in_proto(
                             proto,
@@ -448,13 +455,13 @@ pub(super) fn simplify_hir(
                         ),
                         14 => dead_labels::remove_unused_labels_in_proto(proto),
                         16 => unreachable!("native frames require one immutable module snapshot"),
-                        18 => table_constructors::stabilize_table_constructors_in_proto(
+                        19 => table_constructors::stabilize_table_constructors_in_proto(
                             proto,
                             facts,
                             roots(),
                             table_constructors::TableConstructorStage::LowerFixedBatches,
                         ),
-                        19 => source_frames::restore_materializations(
+                        18 => source_frames::restore_materializations(
                             proto,
                             facts,
                             dialect,

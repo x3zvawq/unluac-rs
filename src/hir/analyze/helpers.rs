@@ -13,6 +13,7 @@ use crate::hir::common::{
 
 pub(super) fn assign_stmt(targets: Vec<HirLValue>, values: impl Into<HirValuePack>) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
+        luau_function_declaration: false,
         luau_compound_global: false,
         upvalue_write_source: None,
         is_phi_transfer: false,
@@ -56,6 +57,7 @@ pub(super) fn branch_stmt(
     HirStmt::If(Box::new(HirIf {
         cond,
         preserves_empty_test: false,
+        preserves_arm_order: false,
         then_block,
         else_block,
     }))

@@ -125,6 +125,7 @@ pub(super) fn try_collapse_guarded_local_update(
         _ => return false,
     };
     block.stmts[index] = HirStmt::Assign(Box::new(HirAssign {
+        luau_function_declaration: false,
         luau_compound_global: false,
         upvalue_write_source: None,
         is_phi_transfer: false,

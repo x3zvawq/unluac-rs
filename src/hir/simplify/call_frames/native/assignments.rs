@@ -126,6 +126,8 @@ pub(super) fn lookup_pack(
     }
     Some((
         Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: entries[0].id,
             sink: entries.last()?.id,
             base,
@@ -261,6 +263,8 @@ pub(super) fn global_arithmetic(
         return None;
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: preparation.map_or(sink.id, |entry| entry.id),
         sink: sink.id,
         base: home,
@@ -277,7 +281,7 @@ pub(super) fn global_arithmetic(
     })
 }
 
-fn plain_copy(stmt: &HirStmt) -> bool {
+pub(super) fn plain_copy(stmt: &HirStmt) -> bool {
     match stmt {
         HirStmt::Assign(assign) => {
             !assign.is_phi_transfer
@@ -302,7 +306,7 @@ pub(super) fn copy_value_initializer(
     let HirStmt::LocalDecl(decl) = first.stmt else {
         return None;
     };
-    let ([owner], [HirExpr::LocalRef(_) | HirExpr::ParamRef(_)], None) = (
+    let ([owner], [input], None) = (
         decl.bindings.as_slice(),
         decl.values.fixed.as_slice(),
         &decl.values.tail,
@@ -310,13 +314,30 @@ pub(super) fn copy_value_initializer(
         return None;
     };
     let (target, value) = scalar_local(last.stmt)?;
+    let completed_result = matches!(input, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
+        && *value == HirExpr::LocalRef(*owner);
+    if !completed_result && !matches!(input, HirExpr::LocalRef(_) | HirExpr::ParamRef(_)) {
+        return None;
+    }
+    let value = if completed_result { input } else { value };
+    // 原 COPY 可在完整值树之后写回已有低槽；结果身份仍由同一
+    // ValueDecision 的最终 COPY 给出，不能把赋值伪装成高槽的新声明。
+    let writeback = facts.value_result_copy(result).is_some_and(|copy| {
+        matches!(last.stmt, HirStmt::Assign(_))
+            && copy.source_home == home
+            && copy.target_home.slot() < home.slot()
+            && facts.promoted_local_for_temp(copy.target) == Some(target)
+            && facts.trusted_local_home_slot(target) == Some(copy.target_home)
+    });
     if !plain_copy(first.stmt)
         || !plain_copy(last.stmt)
         || !matches!(value, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_))
-        || facts.promoted_local_for_temp(initial) != Some(*owner)
-        || facts.promoted_local_for_temp(result) != Some(target)
+        || completed_result && !writeback
+        || facts.promoted_local_for_temp(if completed_result { result } else { initial })
+            != Some(*owner)
+        || !writeback && facts.promoted_local_for_temp(result) != Some(target)
         || facts.trusted_local_home_slot(*owner) != Some(home)
-        || facts.trusted_local_home_slot(target) != Some(home)
+        || !writeback && facts.trusted_local_home_slot(target) != Some(home)
         || context.barred.contains(&home)
         || context.closed.contains(&home)
         || context.proto.local_debug_hints[owner.index()].is_some()
@@ -326,18 +347,42 @@ pub(super) fn copy_value_initializer(
     }
     let run = [first.stmt];
     let mut builder = frame_builder(context, &run, facts, DecompileDialect::Luau, home.slot())?;
-    let value = builder.luau_copy_value(value, 1, initial, home)?;
+    let value = if completed_result {
+        // 前一轮已把预写收进结果 RHS 时，原低槽 COPY 仍属于同一事务；
+        // 不保留高槽临时声明，也不把 RHS 改到低槽提前求值。
+        let copy = facts.value_result_copy(result)?;
+        builder.result_move = Some((*owner, 0, BTreeSet::from([copy.target_home])));
+        if !builder.homes_match(*owner, 0, home.slot(), None, Some(result))
+            || matches!(context.proto.inline_dispositions.local(*owner),
+                crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                    if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix
+                        && *reason != HirInlineRetentionReason::BooleanValueContext))
+        {
+            return None;
+        }
+        let value = builder.luau_logical_value(value, 0, home)?;
+        builder.finish_event(0)?;
+        value
+    } else {
+        builder.luau_copy_value(value, 1, initial, home)?
+    };
     if builder.first_event != Some(0) || builder.next_event != 1 {
         return None;
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: first.id,
         sink: last.id,
         base: home,
         values: vec![value].into(),
-        result_locals: vec![target],
+        result_locals: if writeback { Vec::new() } else { vec![target] },
         discarded_result: None,
-        assignment_targets: Vec::new(),
+        assignment_targets: if writeback {
+            vec![HirLValue::Local(target)]
+        } else {
+            Vec::new()
+        },
         luau_compound_global: false,
         indexed_target: None,
         continuing_root: None,
@@ -347,44 +392,46 @@ pub(super) fn copy_value_initializer(
     })
 }
 
-pub(super) struct NilPair {
+pub(super) struct ScalarPair<'a> {
     pub(super) left: LocalId,
     pub(super) right: LocalId,
     pub(super) copied_input: Option<LocalId>,
     pub(super) base: HomeSlotKey,
+    pub(super) literal_input: Option<&'a HirExpr>,
+    pub(super) tail: HirExpr,
 }
 
-/// nil 尾项的并列赋值仍在原高槽准备首项，再写第二项和首项；完整前缀不得移动。
-pub(super) fn nil_pair(
+/// 字面量尾项的并列赋值仍在原高槽准备首项，再写第二项和首项；完整前缀不得移动。
+pub(super) fn scalar_pair(
     context: NativeFrameContext<'_>,
     dialect: DecompileDialect,
-    frames: &BTreeMap<LocalId, Option<NilPair>>,
+    frames: &BTreeMap<LocalId, Option<ScalarPair<'_>>>,
     first: FlatStmt<'_>,
     second: FlatStmt<'_>,
     last: FlatStmt<'_>,
 ) -> Option<Plan> {
-    let HirStmt::LocalDecl(decl) = first.stmt else {
-        return None;
-    };
-    let ([snapshot], [value], None) = (
-        decl.bindings.as_slice(),
-        decl.values.fixed.as_slice(),
-        &decl.values.tail,
-    ) else {
-        return None;
-    };
-    let &NilPair {
+    // 前一调用的结果槽可在同批帧恢复中退休，当前高槽快照因而也可能
+    // 仍呈 Assign。原三个 Def 和完整 preview 共同核对其写域及后缀身份。
+    let (snapshot, value) = scalar_local(first.stmt)?;
+    let frame = frames.get(&snapshot)?.as_ref()?;
+
+    let ScalarPair {
         left,
         right,
         copied_input,
         base,
-    } = frames.get(snapshot)?.as_ref()?;
+        literal_input,
+        ..
+    } = *frame;
+    let tail = &frame.tail;
     // 候选拒绝[TargetConstraint]：PUC 的双 nil 会改用批量 LOADNIL，不能假定
     // 仍覆盖原高槽；旧值快照则与 JIT 一样先 MOVE 到原准备槽。Luau 另有写回协议。
     if dialect == DecompileDialect::Luau
-        || (copied_input.is_none() && dialect != DecompileDialect::Luajit)
+        || (literal_input == Some(&HirExpr::Nil)
+            && matches!(tail, HirExpr::Nil)
+            && dialect != DecompileDialect::Luajit)
         || match (copied_input, value) {
-            (None, HirExpr::Nil) => false,
+            (None, value) => literal_input != Some(value),
             (Some(input), HirExpr::LocalRef(local)) => input != *local,
             _ => true,
         }
@@ -397,11 +444,11 @@ pub(super) fn nil_pair(
         || second.id != first.id + 1
         || last.id != second.id + 1
         || left == right
-        || [left, right].contains(snapshot)
+        || [left, right].contains(&snapshot)
         || context.closed.contains(&base)
         || context.proto.local_debug_hints[snapshot.index()].is_some()
         || context.proto.local_debug_scopes[snapshot.index()].is_some()
-        || matches!(context.proto.inline_dispositions.local(*snapshot),
+        || matches!(context.proto.inline_dispositions.local(snapshot),
             crate::hir::common::HirInlineDisposition::Preserve(reasons)
                 if reasons.iter().any(|reason| *reason != HirInlineRetentionReason::PhysicalFramePrefix))
     {
@@ -412,19 +459,21 @@ pub(super) fn nil_pair(
         return None;
     };
     if second_write.targets.as_slice() != [HirLValue::Local(right)]
-        || second_write.values.fixed.as_slice() != [HirExpr::Nil]
+        || second_write.values.fixed.as_slice() != std::slice::from_ref(tail)
         || second_write.values.tail.is_some()
         || first_write.targets.as_slice() != [HirLValue::Local(left)]
-        || first_write.values.fixed.as_slice() != [HirExpr::LocalRef(*snapshot)]
+        || first_write.values.fixed.as_slice() != [HirExpr::LocalRef(snapshot)]
         || first_write.values.tail.is_some()
     {
         return None;
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: first.id,
         sink: last.id,
         base,
-        values: vec![value.clone(), HirExpr::Nil].into(),
+        values: vec![value.clone(), tail.clone()].into(),
         result_locals: Vec::new(),
         discarded_result: None,
         assignment_targets: vec![HirLValue::Local(left), HirLValue::Local(right)],
@@ -535,6 +584,8 @@ fn luau_plan(
         .map(|write| facts.promoted_local_for_temp(write.target))
         .collect::<Option<BTreeSet<_>>>()?;
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: entries[0].id,
         sink: entries.last()?.id,
         base: frame.base,
@@ -647,6 +698,8 @@ pub(super) fn parallel(
         .collect();
     Some((
         Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: entries[first].id,
             sink: entries.last()?.id,
             base: frame.base,
@@ -666,4 +719,122 @@ pub(super) fn parallel(
         },
         end,
     ))
+}
+
+/// PUC 的末级 GETTABLE 写低槽目标；高槽 base 准备仍按原 Def 在赋值 RHS 内求值。
+pub(super) fn lookup_result(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    run: &[&HirStmt],
+    target: &HirLValue,
+    access: &crate::hir::common::HirTableAccess,
+) -> Option<Plan> {
+    let result = facts.table_read_result_home(access)?;
+    let target_home = match target {
+        HirLValue::Local(local) => facts.trusted_local_home_slot(*local),
+        HirLValue::Param(param) => facts.trusted_param_home_slot(*param),
+        _ => return None,
+    };
+    if target_home != Some(result) || context.closed.contains(&result) {
+        return None;
+    }
+    let layout = facts.native_table_read_layout(access);
+    let upvalue_key = facts.upvalue_table_read_key(access);
+    let frame = layout
+        .map(|layout| {
+            layout
+                .key
+                .filter(|key| {
+                    key.slot() > result.slot()
+                        && key.slot() + 1 == layout.base.slot()
+                        && facts.table_key_preparation(access) == Some(*key)
+                })
+                .unwrap_or(layout.base)
+        })
+        .or_else(|| upvalue_key.map(|(_, home)| home))?;
+    if frame.slot() <= result.slot() {
+        return None;
+    }
+    let mut builder = frame_builder(context, run, facts, dialect, frame.slot())?;
+    let (base, key) = if let Some((producer, home)) = upvalue_key {
+        let key = builder.expr(
+            &access.key,
+            run.len(),
+            home.slot(),
+            None,
+            false,
+            true,
+            Some(producer),
+        )?;
+        (access.base.clone(), key)
+    } else {
+        let layout = layout?;
+        let producer = facts.table_read_base_value(access)?;
+        // Lua 5.4 的动态上值索引先准备 key，再在其上方读取 base。
+        // 5.1 的寄存器 base 则先于 key；按原准备布局重放，而非固定先读 base。
+        let early_key = if layout.key == Some(frame) && frame != layout.base {
+            if layout.base.slot() != frame.slot() + 1 {
+                return None;
+            }
+            Some(builder.register_operand(&access.key, run.len(), frame.slot())?)
+        } else {
+            None
+        };
+        let base = builder.expr(
+            &access.base,
+            run.len(),
+            layout.base.slot(),
+            None,
+            false,
+            true,
+            Some(producer),
+        )?;
+        let key = if let Some(key) = early_key {
+            key
+        } else if let Some(home) = layout.key {
+            if builder.direct_home(&access.key) == Some(home) && home.slot() < layout.base.slot() {
+                access.key.clone()
+            } else {
+                if home.slot() != layout.base.slot() + 1 {
+                    return None;
+                }
+                builder.register_operand(&access.key, run.len(), home.slot())?
+            }
+        } else {
+            if !context.constants_fit_rk || !tables::literal_rk(&access.key) {
+                return None;
+            }
+            access.key.clone()
+        };
+        (base, key)
+    };
+    let start = builder.first_event?;
+    if builder.next_event != run.len() {
+        return None;
+    }
+    Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
+        start,
+        sink: run.len(),
+        base: frame,
+        values: vec![HirExpr::TableAccess(Box::new(
+            crate::hir::common::HirTableAccess {
+                base,
+                key,
+                ..access.clone()
+            },
+        ))]
+        .into(),
+        result_locals: Vec::new(),
+        discarded_result: None,
+        assignment_targets: vec![target.clone()],
+        luau_compound_global: false,
+        indexed_target: None,
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        replayed_effects: Vec::new(),
+        removed: Vec::new(),
+    })
 }

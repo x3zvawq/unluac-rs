@@ -246,7 +246,9 @@ fn write_block(output: &mut String, indent: &str, block: &HirBlock) {
                 let _ = writeln!(
                     output,
                     "{indent}assign{} {} = {}",
-                    if assign.luau_compound_global {
+                    if assign.luau_function_declaration {
+                        "[luau-function-declaration]"
+                    } else if assign.luau_compound_global {
                         "[luau-compound-global]"
                     } else {
                         ""

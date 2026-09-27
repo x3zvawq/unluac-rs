@@ -285,7 +285,7 @@ fn pack_tail_for_open_def(
     let instr = lowering.proto.instrs.get(open_def.instr.index())?;
     match instr {
         LowInstr::Call(call) if matches!(call.results, ResultPack::Open(_)) => {
-            let method_key = lower_method_key(lowering, call.method_name);
+            let method_key = lower_method_key(lowering, open_def.instr, call.method_name);
             let callee = if single_eval {
                 expr_for_reg_use_single_eval_with_call_policy(
                     lowering,
@@ -318,13 +318,13 @@ fn pack_tail_for_open_def(
                 } else {
                     lower_value_pack(lowering, open_def.block, open_def.instr, call.args)
                 },
-                method: matches!(call.kind, CallKind::Method).into(),
+                method: lower_call_method(lowering, open_def.instr, call.kind),
                 fastcall: match call.kind {
                     CallKind::FastCall(args) => Some(args),
                     CallKind::Normal | CallKind::Method => None,
                 },
                 method_key,
-                callee_root_handoff: lower_call_root_handoff(lowering, open_def.instr, call.kind),
+                callee_root_handoff: lower_call_root_handoff(lowering, open_def.instr),
                 method_rewrite_transaction: None,
                 plain_method_syntax: false,
                 boolean_prewrite_arguments: Vec::new(),
@@ -355,8 +355,16 @@ fn reg_in_range(range: crate::transformer::RegRange, reg: Reg) -> bool {
 
 pub(super) fn lower_method_key(
     lowering: &ProtoLowering<'_>,
+    instr: InstrRef,
     method_name: Option<MethodNameHint>,
 ) -> Option<crate::LuaString> {
+    if let Some(protocol) = lowering
+        .promotion_facts
+        .method_setup_protocol_for_call(instr)
+        .and_then(|id| lowering.promotion_facts.method_setup_protocol(id))
+    {
+        return Some(protocol.method_key.clone());
+    }
     let const_ref = method_name?.const_ref;
     match lowering.proto.constants.get(const_ref.index()) {
         Some(RawLiteralConst::String(value)) => Some(raw_lua_string(value)),
@@ -364,16 +372,25 @@ pub(super) fn lower_method_key(
     }
 }
 
-pub(super) fn lower_call_root_handoff(
+pub(super) fn lower_call_method(
     lowering: &ProtoLowering<'_>,
     instr: InstrRef,
     kind: CallKind,
-) -> Option<HirCallRootHandoff> {
-    match kind {
-        CallKind::Method => lowering
+) -> crate::hir::common::HirMethodCall {
+    (kind == CallKind::Method
+        || lowering
             .promotion_facts
             .method_setup_protocol_for_call(instr)
-            .map(HirCallRootHandoff::MethodCallee),
-        CallKind::Normal | CallKind::FastCall(_) => None,
-    }
+            .is_some())
+    .into()
+}
+
+pub(super) fn lower_call_root_handoff(
+    lowering: &ProtoLowering<'_>,
+    instr: InstrRef,
+) -> Option<HirCallRootHandoff> {
+    lowering
+        .promotion_facts
+        .method_setup_protocol_for_call(instr)
+        .map(HirCallRootHandoff::MethodCallee)
 }

@@ -1,5 +1,5 @@
 //! 把连续 nil 初始化接回同槽的合流声明，保留原写入位置与物理根。
-//! 只合并无观察者的匿名 seed；debug/capture 身份和有实际求值的间隔不参与。
+//! 只合并无读取的匿名 seed；debug/capture 身份和原槽被覆盖的间隔不参与。
 
 use super::*;
 use crate::hir::common::{HirInlineDisposition, HirInlineRetentionReason};
@@ -64,13 +64,68 @@ impl HirRewritePass for Restore<'_> {
         let mut seeds = BTreeMap::new();
         let mut replacements = Vec::new();
         let mut removed = BTreeSet::new();
+        let mut assigned = BTreeSet::new();
         for (index, stmt) in block.stmts.iter().enumerate() {
-            let HirStmt::LocalDecl(decl) = stmt else {
+            // 同块高槽调用可以跨过低槽 nil 声明：不移动初始化或 COPY，只恢复
+            // 被 SSA 拆开的同一源码槽。控制路径、未知调用布局和同槽写则终止候选。
+            if !matches!(
+                stmt,
+                HirStmt::LocalDecl(_) | HirStmt::Assign(_) | HirStmt::CallStmt(_)
+            ) {
                 seeds.clear();
+                continue;
+            }
+            struct Calls<'a> {
+                facts: &'a ProtoPromotionFacts,
+                floor: Option<usize>,
+            }
+            impl crate::hir::visit::HirVisitor<'_> for Calls<'_> {
+                fn visit_call(&mut self, call: &crate::hir::common::HirCallExpr) {
+                    let floor = self
+                        .facts
+                        .native_call_layout(call)
+                        .map_or(0, |layout| layout.home.slot());
+                    self.floor = Some(self.floor.map_or(floor, |old| old.min(floor)));
+                }
+            }
+            let mut calls = Calls {
+                facts: self.facts,
+                floor: None,
+            };
+            crate::hir::visit::visit_stmts(std::slice::from_ref(stmt), &mut calls);
+            if let Some(floor) = calls.floor {
+                drop(seeds.split_off(&crate::hir::promotion::HomeSlotKey::new(floor, 0)));
+            }
+            let HirStmt::LocalDecl(decl) = stmt else {
+                crate::hir::visit::visit_stmt_header(
+                    stmt,
+                    &mut crate::hir::simplify::mention::BindingWriteCollector(|binding| {
+                        let homes = match binding {
+                            crate::hir::common::HirBinding::Local(local) => {
+                                self.facts.complete_local_definition_write_homes(local)
+                            }
+                            crate::hir::common::HirBinding::Temp(temp) => {
+                                self.facts.complete_temp_definition_write_homes(temp)
+                            }
+                            _ => return,
+                        };
+                        for home in homes.iter() {
+                            seeds.remove(home);
+                        }
+                    }),
+                );
                 continue;
             };
             let [local] = decl.bindings.as_slice() else {
-                seeds.clear();
+                for local in &decl.bindings {
+                    for home in self
+                        .facts
+                        .complete_local_definition_write_homes(*local)
+                        .iter()
+                    {
+                        seeds.remove(home);
+                    }
+                }
                 continue;
             };
             let Some(home) = self.facts.trusted_local_home_slot(*local) else {
@@ -86,15 +141,34 @@ impl HirRewritePass for Restore<'_> {
                 if !self.mentioned.contains(local) {
                     seeds.insert(home, (index, *local));
                 }
-            } else if decl.values.is_empty() {
+            } else if decl.values.is_empty()
+                || matches!(
+                    (decl.values.fixed.as_slice(), &decl.values.tail),
+                    ([HirExpr::LocalRef(_) | HirExpr::ParamRef(_)], None)
+                ) && self
+                    .facts
+                    .complete_local_definition_write_homes(*local)
+                    .iter()
+                    .copied()
+                    .eq([home])
+            {
                 if let Some((seed_index, seed)) = seeds.remove(&home) {
                     replacements.push((seed_index, *local));
-                    removed.insert(index);
+                    if decl.values.is_empty() {
+                        removed.insert(index);
+                    } else {
+                        assigned.insert(index);
+                    }
                     self.merges.push((seed, *local));
                 }
             } else {
-                // 候选拒绝[SemanticBarrier:EvaluationOrder]：只跨过无读取的 nil 声明。
-                seeds.clear();
+                for home in self
+                    .facts
+                    .complete_local_definition_write_homes(*local)
+                    .iter()
+                {
+                    seeds.remove(home);
+                }
             }
         }
         for (index, target) in replacements {
@@ -103,12 +177,35 @@ impl HirRewritePass for Restore<'_> {
             };
             decl.bindings[0] = target;
         }
+        for index in &assigned {
+            let HirStmt::LocalDecl(decl) = &mut block.stmts[*index] else {
+                unreachable!()
+            };
+            block.stmts[*index] = HirStmt::Assign(Box::new(HirAssign {
+                luau_function_declaration: false,
+                targets: decl
+                    .bindings
+                    .iter()
+                    .copied()
+                    .map(HirLValue::Local)
+                    .collect(),
+                values: std::mem::take(&mut decl.values),
+                luau_compound_global: false,
+                upvalue_write_source: None,
+                is_phi_transfer: false,
+                parallel_nil_frame: None,
+                initializer_merge_transaction: None,
+                generic_for_initializer_producer: None,
+                generic_for_dispatch_release: None,
+                method_rewrite_transaction: None,
+            }));
+        }
         let mut index = 0;
         block.stmts.retain(|_| {
             let keep = !removed.contains(&index);
             index += 1;
             keep
         });
-        !removed.is_empty()
+        !removed.is_empty() || !assigned.is_empty()
     }
 }

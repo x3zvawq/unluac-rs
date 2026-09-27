@@ -44,6 +44,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             // PolicyBoundary：原 TEST 即使读取已知常量也不是合成控制壳；两臂相同
             // 不能授权 value folding 将它改成恒值后再消除。
             if_stmt.preserves_empty_test = preserves_test;
+            if_stmt.preserves_arm_order = self.lowering.proto.constants.len() >= 256;
         }
         stmts.push(branch);
         Ok(stmts)

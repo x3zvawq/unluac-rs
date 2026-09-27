@@ -41,7 +41,7 @@ pub(super) fn lower_generic_for_dispatch_results(
 struct ExactInitializerProducer {
     instr: InstrRef,
     protocol_start: usize,
-    outputs: Vec<TempId>,
+    outputs: Vec<HirLValue>,
 }
 
 /// 从 frozen iterator reaching defs 一次发布 initializer producer ownership 与 call operand
@@ -112,9 +112,7 @@ fn stamp_initializer_transaction(
                         .targets
                         .iter()
                         .zip(&producer.outputs)
-                        .all(|(target, output)| {
-                            matches!(target, HirLValue::Temp(actual) if actual == output)
-                        }))
+                        .all(|(target, output)| target == output))
                 .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -195,29 +193,39 @@ fn exact_initializer_producer(
     {
         return None;
     }
+    let mut outputs = Vec::with_capacity(defs.len());
     for (offset, &def) in defs.iter().enumerate() {
         let temp = lowering.bindings.fixed_temps[def.index()];
         let reg = Reg(first_reg + offset);
+        let target = lowering
+            .bindings
+            .lvalue_for_reg_result(preheader, reg, temp);
+        let value = lowering.bindings.expr_for_fixed_def(preheader, reg, temp);
+        // 未来同槽捕获可使某个控制结果提前成为 Local；仍按原 Def 和当前
+        // 读写绑定签发 occurrence，不能因混合 Temp/Local 丢掉整组协议。
+        let matches = match (&target, &value) {
+            (HirLValue::Temp(target), HirExpr::TempRef(value)) => {
+                target == value && *target == temp
+            }
+            (HirLValue::Local(target), HirExpr::LocalRef(value)) => {
+                target == value && !lowering.dataflow.reference_capture_may_be_open(reg, instr)
+            }
+            _ => false,
+        };
         if lowering.dataflow.def_reg(def) != reg
             || lowering.dataflow.instr_def_for_reg(instr, reg) != Some(def)
             || generic_for_initializer_value(lowering, preheader, protocol, reg)
                 != SsaValue::Def(def)
-            || lowering.bindings.expr_for_fixed_def(preheader, reg, temp) != HirExpr::TempRef(temp)
-            || lowering
-                .bindings
-                .lvalue_for_reg_result(preheader, reg, temp)
-                != HirLValue::Temp(temp)
+            || !matches
         {
             return None;
         }
+        outputs.push(target);
     }
     Some(ExactInitializerProducer {
         instr,
         protocol_start: first_reg - protocol_start,
-        outputs: defs
-            .iter()
-            .map(|def| lowering.bindings.fixed_temps[def.index()])
-            .collect(),
+        outputs,
     })
 }
 

@@ -29,7 +29,7 @@ pub enum PassPhase {
     /// 如果执行后产出新 invalidation，会触发 Normal pass 再次收敛。
     Deferred,
     /// 最终阶段：Normal/Deferred 联合稳定后才执行，避免提前降低仍可消费的事实。
-    /// 产生变化后同样计入总轮数并回到 Normal，不另设或重置收敛预算。
+    /// 首个改写后立即回到 Normal，再审理后续 Final；不另设或重置收敛预算。
     Final,
 }
 
@@ -227,6 +227,11 @@ where
             &mut newly_dirty,
             run_pass,
         );
+        // Final 的后续 pass 可能不可逆地降低事实；先让前层消费刚恢复的
+        // 作用域/表达式，不能在同一轮先丢掉它们仍需要的 SETLIST 等来源。
+        if phase == PassPhase::Final && round_changed {
+            break;
+        }
     }
 
     // 本轮结束：dirty set 只保留新产出的 tag

@@ -100,7 +100,8 @@ pub(super) fn require_suffix_frames(
                     _ => return None,
                 }?;
                 let result = facts.operation_result_temp(source)?;
-                if plan.result_locals.as_slice() != [local]
+                if !(plan.result_locals.as_slice() == [local]
+                    || plan.assignment_targets.as_slice() == [HirLValue::Local(local)])
                     || facts.promoted_local_for_temp(result) != Some(local)
                 {
                     return None;
@@ -178,7 +179,9 @@ pub(super) fn require_suffix_frames(
 fn closure_initializers(proto: &HirProto, facts: &ProtoPromotionFacts) -> BTreeMap<usize, TempId> {
     let restrictions = frame_restrictions(proto, facts);
     let context = NativeFrameContext {
+        rk_literals: None,
         expanded_callees: None,
+        retired_roots: None,
         proto,
         barred: &restrictions.barred,
         closed: &restrictions.closed,

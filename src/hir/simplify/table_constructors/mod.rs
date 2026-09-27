@@ -372,7 +372,7 @@ impl HirRewritePass for TableConstructorPass<'_> {
                     self.promotion_facts,
                     &stmt_ids,
                     &private_overwrites,
-                    constructor_writes.fixed_batch_producers(binding_id),
+                    constructor_writes.field_producers(binding_id),
                     self.value_facts,
                     &mut scratch,
                 );
@@ -1005,6 +1005,7 @@ impl TableConstructorPass<'_> {
                             .checked_add(u32::try_from(offset).expect("SETLIST offset fits u32"))
                             .expect("SETLIST index overflow");
                         HirStmt::Assign(Box::new(HirAssign {
+                            luau_function_declaration: false,
                             luau_compound_global: false,
                             upvalue_write_source: None,
                             is_phi_transfer: false,

@@ -387,6 +387,7 @@ impl<'a> AstLowerer<'a> {
                 vec![AstStmt::If(Box::new(AstIf {
                     cond: self.lower_expr(proto_index, &if_stmt.cond)?,
                     preserves_empty_test: if_stmt.preserves_empty_test,
+                    preserves_arm_order: if_stmt.preserves_arm_order,
                     then_block: self.lower_block(
                         proto_index,
                         &if_stmt.then_block,
@@ -439,6 +440,7 @@ impl<'a> AstLowerer<'a> {
                     vec![AstStmt::Repeat(Box::new(AstRepeat {
                         body,
                         cond: self.lower_expr(proto_index, &repeat_stmt.cond)?,
+                        preserves_condition: repeat_stmt.preserves_condition,
                         lifetime: repeat_stmt.lifetime.clone(),
                     }))],
                     1,

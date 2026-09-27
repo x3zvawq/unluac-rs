@@ -719,8 +719,17 @@ fn apply_candidate(
     promotion_facts: &mut ProtoPromotionFacts,
 ) {
     let result = CarryBinding::Local(candidate.result);
+    promotion_facts.record_consumed_local_binding(
+        candidate.result,
+        match candidate.state {
+            CarryBinding::Local(local) => crate::hir::HirBinding::Local(local),
+            CarryBinding::Param(param) => crate::hir::HirBinding::Param(param),
+            CarryBinding::Temp(temp) => crate::hir::HirBinding::Temp(temp),
+        },
+    );
     if let Some(values) = candidate.initializer {
         block.stmts[candidate.declaration] = HirStmt::Assign(Box::new(HirAssign {
+            luau_function_declaration: false,
             luau_compound_global: false,
             upvalue_write_source: None,
             is_phi_transfer: false,

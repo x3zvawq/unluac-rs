@@ -147,7 +147,9 @@ pub(super) fn prepare_body(
     let restrictions = frame_restrictions(proto, facts);
     let context = NativeFrameContext {
         proto,
+        rk_literals: None,
         expanded_callees: None,
+        retired_roots: None,
         barred: &restrictions.barred,
         closed: &restrictions.closed,
         callee_aliases: &restrictions.callee_aliases,

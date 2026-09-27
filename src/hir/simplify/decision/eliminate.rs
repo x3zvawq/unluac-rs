@@ -194,6 +194,9 @@ fn eliminate_stmt(
         }
         HirStmt::If(mut if_stmt) => {
             let mut cond_changed = eliminate_condition_expr(&mut if_stmt.cond, safety);
+            if let Some(stmts) = super::eliminate_control::materialize_control(&if_stmt) {
+                return (stmts, true);
+            }
             if expr_contains_eliminable_decision(&if_stmt.cond) {
                 let condition = mem::replace(&mut if_stmt.cond, HirExpr::Nil);
                 let (flag, condition_scope) = materialize_condition_flag(condition, state, safety);
@@ -220,6 +223,7 @@ fn eliminate_stmt(
                 let (flag, condition_scope) = materialize_condition_flag(condition, state, safety);
                 let exit_guard = HirStmt::If(Box::new(crate::hir::common::HirIf {
                     preserves_empty_test: false,
+                    preserves_arm_order: false,
                     cond: HirExpr::LocalRef(flag).negate(),
                     then_block: HirBlock {
                         stmts: vec![HirStmt::Break],
@@ -506,6 +510,7 @@ fn materialize_condition_into_flag(
         "condition extraction must eliminate every Decision"
     );
     prefix.push(HirStmt::Assign(Box::new(crate::hir::common::HirAssign {
+        luau_function_declaration: false,
         luau_compound_global: false,
         upvalue_write_source: None,
         is_phi_transfer: false,

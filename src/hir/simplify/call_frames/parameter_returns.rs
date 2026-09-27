@@ -181,7 +181,9 @@ fn restore_call_value(
     }
     let mut builder = native::frame_builder(
         NativeFrameContext {
+            rk_literals: None,
             expanded_callees: None,
+            retired_roots: None,
             proto,
             barred: &restrictions.barred,
             closed: &restrictions.closed,
@@ -392,6 +394,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
             then_block,
             else_block,
             preserves_empty_test,
+            preserves_arm_order,
         } = *branch;
         let (mut then_tree, mut else_tree) = match (early, tail) {
             (Some(true), Some(tail)) => (fold(then_block, changed), fold(tail, changed)),
@@ -403,7 +406,8 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
         };
         // 常量真值在 else 时反转控制极性，仍保留原检查和两臂写回；
         // 不根据条件路径把未知值宣称为恒真，也不单独消除返回 COPY。
-        if matches!((&then_tree, &else_tree),
+        if !preserves_arm_order
+            && matches!((&then_tree, &else_tree),
             (Tree::Value { truthy, ret: left, .. }, Tree::Value { truthy: Some(true), ret: right, .. })
                 if *truthy != Some(true) && left.frame_source == right.frame_source)
         {
@@ -461,6 +465,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
             let mut stmts = vec![HirStmt::If(Box::new(if then_returns {
                 HirIf {
                     preserves_empty_test,
+                    preserves_arm_order,
                     cond,
                     then_block: returned,
                     else_block: had_else.then(HirBlock::default),
@@ -468,6 +473,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
             } else {
                 HirIf {
                     preserves_empty_test,
+                    preserves_arm_order,
                     cond,
                     then_block: HirBlock::default(),
                     else_block: Some(returned),
@@ -479,6 +485,7 @@ fn fold(mut block: HirBlock, changed: &mut bool) -> Tree {
         return Tree::Block(HirBlock {
             stmts: vec![HirStmt::If(Box::new(HirIf {
                 preserves_empty_test,
+                preserves_arm_order,
                 cond,
                 then_block: then_tree.into_block(),
                 else_block: Some(else_tree.into_block()),

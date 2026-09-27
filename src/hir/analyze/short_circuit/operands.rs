@@ -2,7 +2,6 @@
 //! 操作数的单次消费、控制域和 phi 身份由前层证明，这里只组合表达式森林。
 
 use super::*;
-use crate::hir::rewrite::replace_temp_in_expr;
 use crate::structure::{SsaValue, ValueDecisionNodePlan};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -71,11 +70,17 @@ pub(super) fn build_value_operands(
             for &child in &consumers[index] {
                 let value = values[child].take()?;
                 let replacement = HirExpr::Decision(Box::new(value));
-                let temp = *lowering
-                    .bindings
-                    .phi_temps
-                    .get(plan.operands[child].phi.index())?;
-                if replace_temp_in_expr(&mut test, temp, &replacement) != 1 {
+                // 读取位置已把部分 phi 映射为参数/循环 binding；替换相同的读取身份，
+                // 不能假定已冻结的 SSA phi 在 HIR 中仍是 phi_temps 的临时引用。
+                let read = super::super::exprs::expr_for_ssa_value_in_block(
+                    lowering,
+                    node.block,
+                    SsaValue::Phi(plan.operands[child].phi),
+                )?;
+                let binding = crate::hir::HirBinding::from_expr(&read)?;
+                if crate::hir::rewrite::replace_binding_in_expr(&mut test, binding, &replacement)
+                    != 1
+                {
                     return None;
                 }
             }

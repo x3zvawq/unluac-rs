@@ -276,8 +276,18 @@ fn lower_condition_subjects(
                             expr: replacement,
                         }));
                     }
-                    let temp = *lowering.bindings.phi_temps.get(value.phi.index())?;
-                    if replace_temp_in_expr(&mut expr, temp, &replacement) != 1 {
+                    let read = super::super::exprs::expr_for_ssa_value_in_block(
+                        lowering,
+                        node.block,
+                        crate::structure::SsaValue::Phi(value.phi),
+                    )?;
+                    let binding = crate::hir::HirBinding::from_expr(&read)?;
+                    if crate::hir::rewrite::replace_binding_in_expr(
+                        &mut expr,
+                        binding,
+                        &replacement,
+                    ) != 1
+                    {
                         return None;
                     }
                     if let Some(def) = value.forwarded_callee {

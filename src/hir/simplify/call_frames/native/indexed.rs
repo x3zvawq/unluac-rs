@@ -6,6 +6,183 @@
 use super::*;
 use crate::hir::common::{HirAssign, HirBinaryOpKind, HirExpr, HirTableAccess};
 
+/// 并列 nil 字段写先保存全部左值，再一次准备 LOADNIL，最后逆序写回。
+/// 每个目标快照及 RHS 成员都消费原 use→Def，不能拆开后改变元方法前的根覆盖。
+pub(super) fn parallel_preparations(
+    context: NativeFrameContext<'_>,
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    entries: &[Option<FlatStmt<'_>>],
+    preparation_end: usize,
+) -> Option<(Plan, usize)> {
+    if dialect != DecompileDialect::Lua51 {
+        return None;
+    }
+    let group = nil_argument_group(entries.get(preparation_end)?.as_ref()?.stmt, facts);
+    let first_write = preparation_end + usize::from(group.is_some());
+    let width = group.as_ref().map_or(2, |group| group.len());
+    let end = first_write + width - 1;
+    let writes = entries
+        .get(first_write..=end)?
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()?;
+    fn parse(stmt: &HirStmt) -> Option<(&HirTableAccess, &HirExpr)> {
+        let HirStmt::Assign(assign) = stmt else {
+            return None;
+        };
+        let ([HirLValue::TableAccess(access)], [value], None) = (
+            assign.targets.as_slice(),
+            assign.values.fixed.as_slice(),
+            &assign.values.tail,
+        ) else {
+            return None;
+        };
+        assignments::plain_copy(stmt).then_some((access.as_ref(), value))
+    }
+    let (first, first_value) = parse(writes.last()?.stmt)?;
+    let (last, last_value) = parse(writes.first()?.stmt)?;
+    if HirBinding::from_expr(first_value).is_none()
+        || HirBinding::from_expr(last_value).is_none()
+        || facts.native_table_write_layout(first)?.value?.slot() + width - 1
+            != facts.native_table_write_layout(last)?.value?.slot()
+    {
+        return None;
+    }
+    let base = facts.native_table_write_layout(first)?.base;
+    // 先排除普通字段写；只有相邻写回确实属于同一并列帧时才索引准备区。
+    let run = entries[..first_write]
+        .iter()
+        .map(|entry| entry.map(|entry| entry.stmt))
+        .collect::<Option<Vec<_>>>()?;
+    let mut builder = frame_builder(context, &run, facts, dialect, base.slot())?;
+    let mut targets = Vec::with_capacity(writes.len());
+    let mut next = base.slot();
+    let mut rhs = Vec::with_capacity(width);
+    for (offset, write) in writes.iter().rev().enumerate() {
+        let (access, value) = parse(write.stmt)?;
+        let layout = facts.native_table_write_layout(access)?;
+        let (producer, home) = if let Some(group) = &group {
+            let temp = group[offset];
+            if *value != HirExpr::TempRef(temp) {
+                return None;
+            }
+            facts.table_nil_batch_preparation(access)?
+        } else {
+            let prepared = match HirBinding::from_expr(value) {
+                Some(binding) => run
+                    .iter()
+                    .rev()
+                    .find_map(|stmt| {
+                        scalar_binding(stmt).filter(|(written, _)| *written == binding)
+                    })
+                    .map(|(_, value)| value)?,
+                None => value,
+            };
+            facts.table_write_value_preparation(access, prepared)?
+        };
+        if layout.value != Some(home) || layout.base.slot() != next {
+            return None;
+        }
+        rhs.push((value, producer, home));
+        let (binding, prepared) = HirBinding::from_expr(&access.base).and_then(|binding| {
+            run[..preparation_end]
+                .iter()
+                .rev()
+                .find_map(|stmt| scalar_binding(stmt).filter(|(written, _)| *written == binding))
+        })?;
+        let (producer, home) = facts.table_write_base_preparation(access, prepared)?;
+        if home != layout.base
+            || !match binding {
+                HirBinding::Temp(temp) => temp == producer,
+                HirBinding::Local(local) => facts.promoted_local_for_temp(producer) == Some(local),
+                _ => false,
+            }
+        {
+            return None;
+        }
+        let target = builder.expr(
+            &access.base,
+            preparation_end,
+            next,
+            None,
+            false,
+            true,
+            Some(producer),
+        )?;
+        next += 1;
+        let key = if let Some(home) = layout.key {
+            if home.slot() != next {
+                return None;
+            }
+            let previous = builder.register_operand;
+            builder.register_operand = true;
+            let key = builder.expr(&access.key, preparation_end, next, None, false, true, None)?;
+            builder.register_operand = previous;
+            if builder.literal_uses_rk(&key, Some((&access.sources, false))) != Some(false) {
+                return None;
+            }
+            next += 1;
+            key
+        } else {
+            if builder.literal_uses_rk(&access.key, Some((&access.sources, false))) != Some(true) {
+                return None;
+            }
+            access.key.clone()
+        };
+        targets.push(HirLValue::TableAccess(Box::new(HirTableAccess {
+            base: target,
+            key,
+            ..access.clone()
+        })));
+    }
+    let mut values = Vec::with_capacity(width);
+    for (offset, (value, producer, home)) in rhs.into_iter().enumerate() {
+        if home.slot() != next + offset {
+            return None;
+        }
+        values.push(builder.expr(
+            value,
+            run.len(),
+            next + offset,
+            None,
+            false,
+            true,
+            Some(producer),
+        )?);
+    }
+    let start = builder.first_event?;
+    if builder.next_event != run.len() {
+        return None;
+    }
+    Some((
+        Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
+            start: entries[start]?.id,
+            sink: writes.last()?.id,
+            base,
+            values: values.into(),
+            result_locals: Vec::new(),
+            discarded_result: None,
+            assignment_targets: targets,
+            luau_compound_global: false,
+            indexed_target: None,
+            continuing_root: None,
+            retained_copies: Vec::new(),
+            replayed_effects: writes[..writes.len() - 1]
+                .iter()
+                .map(|entry| entry.id)
+                .collect(),
+            removed: entries[start..end]
+                .iter()
+                .map(|entry| entry.unwrap().id)
+                .collect(),
+        },
+        end,
+    ))
+}
+
 /// Luau 并列固定字段写先连续准备 RHS，再按源码顺序写回；两个准备槽须一起退休。
 pub(super) fn parallel_literals(
     context: NativeFrameContext<'_>,
@@ -70,6 +247,8 @@ pub(super) fn parallel_literals(
         return None;
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: first.id,
         sink: write_second.id,
         base,
@@ -189,6 +368,8 @@ pub(super) fn parallel_copies(
         }
     }
     let mut plan = Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: first.id,
         sink: last.id,
         base: home,
@@ -274,6 +455,30 @@ fn prepared_parallel_targets(
     ))
 }
 
+// SETTABLE 的输入 Def 只证明原快照身份，并不证明源码仍会在同一时点读取 cell。
+// 5.2/5.3 直接写上值表使用 SETTABUP；5.4+ 动态 key 在 key 之后快照目标，
+// 整数 SETI 则在 RHS 之前快照，字符串 SETTABUP 仍在 RHS 之后读取 cell。
+// 显式提前保存的上值表必须继续作为独立 local，不能套用其它方言的左值准备顺序。
+fn snapshot_matches_target(
+    source: &HirExpr,
+    home: HomeSlotKey,
+    key: Option<HomeSlotKey>,
+    key_expr: &HirExpr,
+    dialect: DecompileDialect,
+) -> bool {
+    if !matches!(source, HirExpr::UpvalueRef(_)) {
+        return true;
+    }
+    match dialect {
+        DecompileDialect::Lua52 | DecompileDialect::Lua53 => false,
+        DecompileDialect::Lua54 | DecompileDialect::Lua55 => {
+            key.is_some_and(|key| home.slot().abs_diff(key.slot()) == 1)
+                || (key.is_none() && matches!(key_expr, HirExpr::Integer(_)))
+        }
+        _ => true,
+    }
+}
+
 /// 仅用于识别完整赋值候选；原结果槽、RK 与左值准备仍由 plan 验证。
 pub(super) fn is_rhs_candidate(value: &HirExpr) -> bool {
     matches!(
@@ -292,18 +497,20 @@ pub(super) fn is_rhs_candidate(value: &HirExpr) -> bool {
             | HirExpr::LocalRef(_)
             | HirExpr::ParamRef(_)
             | HirExpr::UpvalueRef(_)
+            | HirExpr::GlobalRef(_)
     )
 }
 
 pub(super) fn is_candidate(assign: &HirAssign) -> bool {
-    matches!(
-        (
-            assign.targets.as_slice(),
-            assign.values.fixed.as_slice(),
-            &assign.values.tail
-        ),
-        ([HirLValue::TableAccess(_)], [_], None)
-    )
+    !assign.luau_function_declaration
+        && matches!(
+            (
+                assign.targets.as_slice(),
+                assign.values.fixed.as_slice(),
+                &assign.values.tail
+            ),
+            ([HirLValue::TableAccess(_)], [_], None)
+        )
 }
 
 pub(super) fn plan(
@@ -314,15 +521,17 @@ pub(super) fn plan(
     assign: &HirAssign,
     rhs_live_after: bool,
 ) -> Option<Plan> {
-    if !context.constants_fit_rk {
-        return None;
-    }
     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
         return None;
     };
     let [value] = assign.values.fixed.as_slice() else {
         return None;
     };
+    if !rhs_live_after
+        && let Some(plan) = function_declaration(context, run, facts, dialect, access, value)
+    {
+        return Some(plan);
+    }
     if let Some(plan) = prepared_field_target(context, run, facts, dialect, access, value) {
         return Some(plan);
     }
@@ -353,6 +562,33 @@ pub(super) fn plan(
         }
         value => (value, None),
     };
+    if !context.constants_fit_rk && dialect != DecompileDialect::Luau {
+        let key = HirBinding::from_expr(&access.key)
+            .and_then(|binding| {
+                run.iter().rev().find_map(|stmt| {
+                    scalar_binding(stmt)
+                        .filter(|(written, _)| *written == binding)
+                        .map(|(_, value)| value)
+                })
+            })
+            .unwrap_or(&access.key);
+        let layout = register_layout?;
+        // 字面 key 核对 RK/LOADK；动态 key 必须保留原寄存器输入，内部常量
+        // 再由共享表达式 builder 逐层核对，不能因整个池较大而拒绝无 RK 的目标。
+        if dialect == DecompileDialect::Luajit
+            || if tables::literal_rk(key) {
+                context.literal_uses_rk(key, Some((&access.sources, false)), dialect)
+                    != Some(layout.key.is_none())
+            } else {
+                layout.key.is_none()
+            }
+            || (tables::literal_rk(rhs)
+                && context.literal_uses_rk(rhs, Some((&access.sources, true)), dialect)
+                    != Some(layout.value.is_none()))
+        {
+            return None;
+        }
+    }
     // 候选拒绝[SemanticBarrier:BindingIdentity]：待退休的 RHS 值版本仍被后缀读取。
     // 现成低槽 RHS 不在本事务删除范围内；不能因此阻止其独立 key/base 准备。
     if result_local.is_some() && rhs_live_after {
@@ -360,7 +596,8 @@ pub(super) fn plan(
     }
     // 动态 key 后的字面量也有原 LOAD Def；Luau 与 JIT 都须保留其 RHS 槽，
     // 不能只接受固定字段，或误套用 PUC 的 RK 常量布局。
-    let prepared_literal = (matches!(dialect, DecompileDialect::Luajit | DecompileDialect::Luau)
+    let prepared_literal = ((matches!(dialect, DecompileDialect::Luajit | DecompileDialect::Luau)
+        || !context.constants_fit_rk)
         && tables::literal_rk(rhs))
     .then(|| facts.table_write_value_preparation(access, rhs))
     .flatten();
@@ -398,7 +635,10 @@ pub(super) fn plan(
         && direct_rhs_home.is_none()
         && !(matches!(
             rhs,
-            HirExpr::Call(_) | HirExpr::TableAccess(_) | HirExpr::Closure(_)
+            HirExpr::Call(_)
+                | HirExpr::TableAccess(_)
+                | HirExpr::Closure(_)
+                | HirExpr::TableConstructor(_)
         ) || matches!(rhs, HirExpr::Binary(binary) if matches!(binary.op, HirBinaryOpKind::Concat | HirBinaryOpKind::Add | HirBinaryOpKind::Sub | HirBinaryOpKind::Mul | HirBinaryOpKind::Div | HirBinaryOpKind::Mod | HirBinaryOpKind::Pow)))
     {
         return None;
@@ -435,9 +675,12 @@ pub(super) fn plan(
                 | HirExpr::Number(_)
                 | HirExpr::String(_)
         );
-    if !(matches!(rhs, HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Concat)
+    if !(matches!(rhs, HirExpr::Binary(binary) if matches!(binary.op, HirBinaryOpKind::Concat | HirBinaryOpKind::Add | HirBinaryOpKind::Sub | HirBinaryOpKind::Mul | HirBinaryOpKind::Div | HirBinaryOpKind::Mod | HirBinaryOpKind::Pow))
         || matches!(rhs, HirExpr::Call(_))
-        || matches!(rhs, HirExpr::TableConstructor(_) | HirExpr::TableAccess(_))
+        || matches!(
+            rhs,
+            HirExpr::TableConstructor(_) | HirExpr::TableAccess(_) | HirExpr::GlobalRef(_)
+        )
         || comparison.is_some()
         || direct_rhs_home.is_some()
         || literal_rhs
@@ -472,6 +715,12 @@ pub(super) fn plan(
                 };
                 source
             }
+            HirExpr::GlobalRef(global) => {
+                let crate::hir::common::HirOperationSources::Single(source) = global.sources else {
+                    return None;
+                };
+                source
+            }
             HirExpr::TableConstructor(table) => {
                 let crate::hir::common::HirOperationSources::Single(source) = table.sources else {
                     return None;
@@ -483,12 +732,6 @@ pub(super) fn plan(
         Some(facts.operation_result_temp(source)?)
     };
     let key_home = key_home?;
-    if let Some(result) = result
-        && (facts.trusted_temp_home_slot(result) != value_home
-            || value_home != Some(HomeSlotKey::new(key_home.slot() + 1, 0)))
-    {
-        return None;
-    }
     let direct_base = match &access.base {
         HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
         HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
@@ -497,33 +740,83 @@ pub(super) fn plan(
     .filter(|home| {
         register_layout.is_some_and(|layout| *home == layout.base) && home.slot() < key_home.slot()
     });
-    // 低槽 local/param 是 SETTABLE 的直接操作数；高槽上值快照必须消费其唯一原 GETUPVAL。
-    let snapshot = if let HirExpr::LocalRef(local) = access.base {
-        run.iter()
-            .rposition(|stmt| scalar_local(stmt).is_some_and(|(target, _)| target == local))
-            .and_then(|index| {
-                let (_, value @ HirExpr::UpvalueRef(_)) = scalar_local(run[index])? else {
-                    return None;
+    // 动态 key 前的全局/上值目标快照同样由原 SETTABLE use-to-Def 识别。
+    // Temp 与 Local 只是当前物化状态，不能因此漏掉同一段左值准备。
+    let snapshot = match &access.base {
+        HirExpr::TempRef(_) | HirExpr::LocalRef(_) => run
+            .iter()
+            .rev()
+            .find_map(|stmt| {
+                let (binding, source) = scalar_binding(stmt)?;
+                let matches = match (&access.base, binding) {
+                    (HirExpr::TempRef(read), HirBinding::Temp(write)) => *read == write,
+                    (HirExpr::LocalRef(read), HirBinding::Local(write)) => *read == write,
+                    _ => false,
                 };
-                let (producer, home) = facts.table_write_base_preparation(access, value)?;
-                (register_layout.is_some_and(|layout| home == layout.base)
-                    && facts.promoted_local_for_temp(producer) == Some(local))
-                .then_some((producer, home))
+                matches.then_some((binding, source))
             })
-    } else if matches!(access.base, HirExpr::UpvalueRef(_)) && register_layout.is_some() {
-        facts.table_write_base_preparation(access, &access.base)
-    } else {
-        None
+            .and_then(|(binding, source)| {
+                if !matches!(
+                    source,
+                    HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) | HirExpr::TableAccess(_)
+                ) {
+                    return None;
+                }
+                let (producer, home) = facts.table_write_base_preparation(access, source)?;
+                let same_definition = match binding {
+                    HirBinding::Temp(temp) => temp == producer,
+                    HirBinding::Local(local) => {
+                        facts.promoted_local_for_temp(producer) == Some(local)
+                    }
+                    _ => false,
+                };
+                (same_definition
+                    && register_layout.is_some_and(|layout| home == layout.base)
+                    && snapshot_matches_target(source, home, Some(key_home), &access.key, dialect))
+                .then_some((producer, home, matches!(source, HirExpr::UpvalueRef(_))))
+            }),
+        HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) | HirExpr::TableAccess(_)
+            if register_layout.is_some() =>
+        {
+            facts
+                .table_write_base_preparation(access, &access.base)
+                .filter(|(_, home)| {
+                    snapshot_matches_target(
+                        &access.base,
+                        *home,
+                        Some(key_home),
+                        &access.key,
+                        dialect,
+                    )
+                })
+                .map(|(producer, home)| {
+                    (
+                        producer,
+                        home,
+                        matches!(access.base, HirExpr::UpvalueRef(_)),
+                    )
+                })
+        }
+        _ => None,
     };
-    let base = if let Some((_, home)) = snapshot {
+
+    let rhs_slot = snapshot.map_or(key_home.slot(), |(_, home, _)| {
+        home.slot().max(key_home.slot())
+    }) + 1;
+    if let Some(result) = result
+        && (facts.trusted_temp_home_slot(result) != value_home
+            || value_home != Some(HomeSlotKey::new(rhs_slot, 0)))
+    {
+        return None;
+    }
+    let base = if let Some((_, home, _)) = snapshot {
         if key_home == HomeSlotKey::new(home.slot() + 1, 0) {
             home
         } else if matches!(dialect, DecompileDialect::Lua54 | DecompileDialect::Lua55)
-            && (literal_rhs || direct_rhs_home.is_some())
             && home == HomeSlotKey::new(key_home.slot() + 1, 0)
         {
             // key 的 CALL 先占 free slot，随后 GETUPVAL 在其上一槽准备目标；
-            // RHS 没有新增 scratch，整个事务从 key 槽开始，仍在 key 后读取目标。
+            // RHS 从目标上一槽开始，整个事务仍从 key 槽按原顺序验证。
             key_home
         } else {
             return None;
@@ -542,11 +835,11 @@ pub(super) fn plan(
     // Lua 5.1/JIT/Luau 在 key 之前保存上值目标；5.4+ 的动态索引先计算 key，随后
     // GETUPVAL 保存目标。SETTABUP 则始终在 RHS 后读取 cell，不生成快照。
     // 因而 log[#log+1]=f() 中 __len 与 f 改写同名 log cell 时，不能只凭名字合并读取。
-    let early_base = if matches!(
-        dialect,
-        DecompileDialect::Lua51 | DecompileDialect::Luajit | DecompileDialect::Luau
-    ) {
-        if let Some((producer, home)) = snapshot {
+    let early_base = if snapshot.is_some_and(|(_, home, upvalue)| {
+        home.slot() < key_home.slot()
+            && !(upvalue && matches!(dialect, DecompileDialect::Lua54 | DecompileDialect::Lua55))
+    }) {
+        if let Some((producer, home, _)) = snapshot {
             Some(builder.expr(
                 &access.base,
                 run.len(),
@@ -583,7 +876,7 @@ pub(super) fn plan(
     builder.indexed_key_base = None;
     let target_base = if let Some(base) = early_base {
         base
-    } else if let Some((producer, home)) = snapshot {
+    } else if let Some((producer, home, _)) = snapshot {
         builder.expr(
             &access.base,
             run.len(),
@@ -625,7 +918,18 @@ pub(super) fn plan(
                 true,
                 result,
             )?,
-            HirExpr::Binary(binary) => builder.concat(binary, run.len(), value_home?.slot())?,
+            HirExpr::Binary(binary) if binary.op == HirBinaryOpKind::Concat => {
+                builder.concat(binary, run.len(), value_home?.slot())?
+            }
+            HirExpr::Binary(_) => builder.expr(
+                rhs,
+                run.len(),
+                value_home?.slot(),
+                None,
+                false,
+                true,
+                result,
+            )?,
             HirExpr::Call(call) => HirExpr::Call(Box::new(builder.call(
                 call,
                 run.len(),
@@ -635,15 +939,17 @@ pub(super) fn plan(
             )?)),
             // 字段 RHS 同样在 key 后的相邻槽读取；完整 lookup 由共享 builder 验证，
             // 不先冻结 key 声明再把其后续同槽值连成一个 Local 身份。
-            HirExpr::TableConstructor(_) | HirExpr::TableAccess(_) => builder.expr(
-                rhs,
-                run.len(),
-                value_home?.slot(),
-                None,
-                false,
-                true,
-                result,
-            )?,
+            HirExpr::TableConstructor(_) | HirExpr::TableAccess(_) | HirExpr::GlobalRef(_) => {
+                builder.expr(
+                    rhs,
+                    run.len(),
+                    value_home?.slot(),
+                    None,
+                    false,
+                    true,
+                    result,
+                )?
+            }
             _ => return None,
         }
     };
@@ -653,6 +959,8 @@ pub(super) fn plan(
         return None;
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start,
         sink: run.len(),
         base,
@@ -673,7 +981,103 @@ pub(super) fn plan(
     })
 }
 
-/// 固定字段的 RHS 已在低槽，只收回目标表的原 CALL/读取准备，不重发或提前读取 RHS。
+/// Luau 的具名字段函数先创建闭包，再读取全局目标；这是声明帧，不能重发为普通赋值。
+fn function_declaration(
+    context: NativeFrameContext<'_>,
+    run: &[&HirStmt],
+    facts: &ProtoPromotionFacts,
+    dialect: DecompileDialect,
+    access: &HirTableAccess,
+    value: &HirExpr,
+) -> Option<Plan> {
+    if dialect != DecompileDialect::Luau || !context.constants_fit_rk {
+        return None;
+    }
+    let HirExpr::LocalRef(local) = value else {
+        return None;
+    };
+    let layout = facts.native_table_write_layout(access)?;
+    let base = layout.value?;
+    if layout.key.is_some()
+        || layout.base != HomeSlotKey::new(base.slot() + 1, 0)
+        || !matches!(&access.key, HirExpr::String(key)
+            if key.as_utf8().is_some_and(|name| dialect.is_identifier_name(name)))
+    {
+        return None;
+    }
+    let mut builder = frame_builder(context, run, facts, dialect, base.slot())?;
+    let definition = builder.definition(*local, run.len())?;
+    let (_, HirExpr::Closure(closure)) = scalar_local(run[definition])? else {
+        return None;
+    };
+    let source = closure.source_site?;
+    let producer = facts.operation_result_temp(source)?;
+    if facts.operation_result_home(source) != Some(base) {
+        return None;
+    }
+    let prepared = match &access.base {
+        HirExpr::LocalRef(target) => scalar_local(run[builder.definition(*target, run.len())?])?.1,
+        target => target,
+    };
+    let HirExpr::GlobalRef(global) = prepared else {
+        return None;
+    };
+    if !global
+        .key
+        .as_utf8()
+        .is_some_and(|name| dialect.is_identifier_name(name))
+    {
+        return None;
+    }
+    let (target_producer, target_home) = facts.table_write_base_preparation(access, prepared)?;
+    if target_home != layout.base {
+        return None;
+    }
+    let closure = builder.expr(
+        value,
+        run.len(),
+        base.slot(),
+        None,
+        false,
+        true,
+        Some(producer),
+    )?;
+    let target = builder.expr(
+        &access.base,
+        run.len(),
+        target_home.slot(),
+        None,
+        false,
+        true,
+        Some(target_producer),
+    )?;
+    let start = builder.first_event?;
+    if builder.next_event != run.len() || !matches!(target, HirExpr::GlobalRef(_)) {
+        return None;
+    }
+    Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: true,
+        start,
+        sink: run.len(),
+        base,
+        values: vec![closure].into(),
+        result_locals: Vec::new(),
+        discarded_result: None,
+        assignment_targets: Vec::new(),
+        luau_compound_global: false,
+        indexed_target: Some(HirTableAccess {
+            base: target,
+            ..access.clone()
+        }),
+        continuing_root: None,
+        retained_copies: Vec::new(),
+        replayed_effects: Vec::new(),
+        removed: Vec::new(),
+    })
+}
+
+/// key 与 RHS 已在低槽时，只收回目标表的原 CALL/读取准备，读取仍在原写入点。
 fn prepared_field_target(
     context: NativeFrameContext<'_>,
     run: &[&HirStmt],
@@ -688,13 +1092,24 @@ fn prepared_field_target(
         HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param)?,
         _ => return None,
     };
-    if layout.key.is_some()
+    let key_preserved = match &access.key {
+        HirExpr::LocalRef(local) => facts.trusted_local_home_slot(*local),
+        HirExpr::ParamRef(param) => facts.trusted_param_home_slot(*param),
+        HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_) => {
+            // 大函数的常量池上界不能代替该字段的原 RK 输入证明。
+            if context.literal_uses_rk(&access.key, Some((&access.sources, false)), dialect)
+                != Some(true)
+            {
+                return None;
+            }
+            None
+        }
+        _ => return None,
+    };
+    if layout.key != key_preserved
+        || key_preserved.is_some_and(|key| key.slot() >= layout.base.slot())
         || layout.value != Some(value_home)
         || value_home.slot() >= layout.base.slot()
-        || !matches!(
-            access.key,
-            HirExpr::String(_) | HirExpr::Integer(_) | HirExpr::Number(_)
-        )
     {
         return None;
     }
@@ -722,6 +1137,8 @@ fn prepared_field_target(
         return None;
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start,
         sink: run.len(),
         base: home,
@@ -765,8 +1182,12 @@ fn scalar_rhs(
         }
         (layout.key, layout.value)
     };
-    let prepared_upvalue = if matches!(rhs, HirExpr::UpvalueRef(_))
-        && !matches!(dialect, DecompileDialect::Luau | DecompileDialect::Luajit)
+    let prepared_value = if (matches!(rhs, HirExpr::UpvalueRef(_))
+        && !matches!(dialect, DecompileDialect::Luau | DecompileDialect::Luajit))
+        || ((matches!(dialect, DecompileDialect::Luau | DecompileDialect::Luajit)
+            || !context.constants_fit_rk)
+            && tables::literal_rk(rhs)
+            && value_home.is_some())
     {
         let (producer, home) = facts.table_write_value_preparation(access, rhs)?;
         if Some(home) != value_home {
@@ -777,14 +1198,12 @@ fn scalar_rhs(
         None
     };
     let source = match rhs {
-        HirExpr::UpvalueRef(_) if prepared_upvalue.is_some() => None,
+        HirExpr::UpvalueRef(_) if prepared_value.is_some() => None,
         HirExpr::Closure(closure) => Some(closure.source_site?),
-        HirExpr::TableConstructor(table) if dialect == DecompileDialect::Luau => {
-            match table.sources {
-                crate::hir::common::HirOperationSources::Single(source) => Some(source),
-                _ => return None,
-            }
-        }
+        HirExpr::TableConstructor(table) => match table.sources {
+            crate::hir::common::HirOperationSources::Single(source) => Some(source),
+            _ => return None,
+        },
         HirExpr::Call(call) => Some(call.source_site?),
         HirExpr::Binary(binary)
             if matches!(
@@ -800,6 +1219,10 @@ fn scalar_rhs(
         {
             Some(binary.source_site?)
         }
+        HirExpr::GlobalRef(global) => match global.sources {
+            crate::hir::common::HirOperationSources::Single(source) => Some(source),
+            _ => return None,
+        },
         HirExpr::TableAccess(read) => match read.sources {
             crate::hir::common::HirOperationSources::Single(source) => Some(source),
             _ => return None,
@@ -809,8 +1232,7 @@ fn scalar_rhs(
         | HirExpr::Integer(_)
         | HirExpr::Number(_)
         | HirExpr::String(_)
-            if (value_home.is_none() && result_local.is_none())
-                || (dialect == DecompileDialect::Luau && value_home.is_some()) =>
+            if (value_home.is_none() && result_local.is_none()) || prepared_value.is_some() =>
         {
             None
         }
@@ -836,6 +1258,22 @@ fn scalar_rhs(
     // 全局表的 GETGLOBAL/GETTABUP 快照遵守同一合同，仍先读取目标再创建字段闭包。
     let snapshot = match &access.base {
         _ if layout.is_none() => None,
+        HirExpr::TempRef(temp) => builder.temp_definitions.get(temp).and_then(|&index| {
+            let (
+                HirBinding::Temp(definition),
+                source @ (HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_)),
+            ) = scalar_binding(run[index])?
+            else {
+                return None;
+            };
+            let (producer, home) = facts.table_write_base_preparation(access, source)?;
+            // 尚未提升的左值快照与 Local 使用同一 use→Def 证明；不另建
+            // 源码声明，否则该 scratch 会阻断后继复用同槽的构造器。
+            (definition == *temp
+                && producer == *temp
+                && snapshot_matches_target(source, home, key_home, &access.key, dialect))
+            .then_some((producer, home))
+        }),
         HirExpr::LocalRef(local) => builder.definition(*local, run.len()).and_then(|index| {
             let (
                 _,
@@ -845,18 +1283,21 @@ fn scalar_rhs(
                 return None;
             };
             let (producer, home) = facts.table_write_base_preparation(access, source)?;
-            (facts.promoted_local_for_temp(producer) == Some(*local)).then_some((producer, home))
+            (facts.promoted_local_for_temp(producer) == Some(*local)
+                && snapshot_matches_target(source, home, key_home, &access.key, dialect))
+            .then_some((producer, home))
         }),
-        HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) => {
-            facts.table_write_base_preparation(access, &access.base)
-        }
+        HirExpr::TableAccess(_) | HirExpr::UpvalueRef(_) | HirExpr::GlobalRef(_) => facts
+            .table_write_base_preparation(access, &access.base)
+            .filter(|(_, home)| {
+                snapshot_matches_target(&access.base, *home, key_home, &access.key, dialect)
+            }),
         _ => None,
     };
     let base = if let Some((_, home)) = snapshot {
         let layout = layout?;
         if home != layout.base
-            || value_home
-                .is_some_and(|value_home| value_home != HomeSlotKey::new(home.slot() + 1, 0))
+            || value_home.is_some_and(|value_home| value_home.slot() != home.slot() + 1)
         {
             return None;
         }
@@ -921,7 +1362,7 @@ fn scalar_rhs(
             None,
             false,
             true,
-            prepared_upvalue
+            prepared_value
                 .or_else(|| source.and_then(|source| facts.operation_result_temp(source))),
         );
         builder.register_operand = previous;
@@ -938,7 +1379,7 @@ fn scalar_rhs(
                     None,
                     false,
                     true,
-                    prepared_upvalue,
+                    prepared_value,
                 )?
             }
             HirExpr::Closure(_) | HirExpr::TableConstructor(_) => builder.expr(
@@ -978,6 +1419,8 @@ fn scalar_rhs(
         return None;
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start,
         sink: run.len(),
         base,

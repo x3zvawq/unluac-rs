@@ -43,6 +43,13 @@ pub(super) fn lvalue(node: &mut HirLValue, mapping: &BTreeMap<TempId, LocalId>) 
     walk::rewrite_lvalue(node, &mut TempLocalRewrite { mapping })
 }
 
+pub(super) fn bindings(
+    proto: &mut crate::hir::common::HirProto,
+    mapping: &BTreeMap<TempId, LocalId>,
+) {
+    walk::rewrite_proto(proto, &mut TempLocalRewrite { mapping });
+}
+
 struct TempLocalRewrite<'a> {
     mapping: &'a BTreeMap<TempId, LocalId>,
 }

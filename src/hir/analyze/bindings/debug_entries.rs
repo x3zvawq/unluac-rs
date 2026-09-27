@@ -20,12 +20,28 @@ pub(super) fn allocate_debug_entry_bindings(
         .signature
         .has_vararg_param_reg
         .then_some(Reg(param_count));
-    let mut declarations = Vec::new();
+    let mut declarations = BTreeMap::new();
     let mut scope_targets = BTreeMap::new();
 
     for fact in structure.debug_bindings().accepted() {
-        let Some(SsaValue::Entry(reg)) = fact.value.ssa() else {
-            continue;
+        let reg = match fact.value.ssa() {
+            Some(SsaValue::Entry(reg)) => reg,
+            Some(SsaValue::Phi(phi)) if fact.start_pc == 0 && proto.clears_entry_scratch => {
+                let Some(phi) = structure.plan().phi_plan(phi) else {
+                    continue;
+                };
+                if !phi
+                    .incomings
+                    .iter()
+                    .any(|incoming| incoming.value == SsaValue::Entry(phi.reg))
+                {
+                    continue;
+                }
+                // 循环头位于入口时 debug 初始身份可由 phi 承载；其 Entry 边仍是
+                // 同一个 VM nil cell，后续回边不是另一次源码声明。
+                phi.reg
+            }
+            _ => continue,
         };
         if fact.start_pc != 0 || Some(reg) == vararg_reg {
             continue;
@@ -44,11 +60,11 @@ pub(super) fn allocate_debug_entry_bindings(
             *local_count += 1;
             local_debug_hints.push(Some(decode_raw_string(&debug_local.name)));
             entry_local_regs.insert(reg, local);
-            declarations.push(local);
+            declarations.insert(reg, local);
             local
         };
         scope_targets.insert(fact.scope, BoundSlotTarget::Local(local));
     }
 
-    (declarations, scope_targets)
+    (declarations.into_values().collect(), scope_targets)
 }

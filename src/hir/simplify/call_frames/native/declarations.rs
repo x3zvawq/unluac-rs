@@ -95,6 +95,8 @@ pub(super) fn collect_debug_groups(
                 builder.finish_event(index)?;
             }
             (builder.first_event == Some(0) && builder.next_event == run.len()).then_some(Plan {
+                prefix_at_sink: false,
+                luau_function_declaration: false,
                 start: entries[0].id,
                 sink: entries.last()?.id,
                 base,
@@ -266,6 +268,8 @@ pub(super) fn collect_upvalue_literals(
             continue;
         }
         plans.push(Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: first_id,
             sink: flat[end - 1].unwrap().id,
             base,
@@ -340,6 +344,8 @@ fn entry_nil_upvalues(
         .collect::<Vec<_>>();
     Some((
         Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: writes[0].0,
             sink,
             base,
@@ -459,6 +465,8 @@ pub(super) fn collect_comparisons(
         // 每个比较仍向自己的低槽写 Boolean，全部 operand 借用同一个组末 scratch。
         // 结果声明不退休；后续根、debug 身份与前缀由整批 native preview 核对。
         plans.push(Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: flat[start].unwrap().id,
             sink: flat[end].unwrap().id,
             base,
@@ -533,7 +541,7 @@ pub(super) fn collect(
     flat: &[Option<FlatStmt<'_>>],
     empty: &BTreeSet<usize>,
     ends: &BTreeMap<usize, usize>,
-    arguments: &BTreeSet<LocalId>,
+    arguments: &BTreeSet<usize>,
 ) -> Vec<Plan> {
     if dialect != DecompileDialect::Luau {
         return Vec::new();
@@ -602,7 +610,7 @@ pub(super) fn collect(
             let home = HomeSlotKey::new(base.slot() + offset, 0);
             if facts.trusted_local_home_slot(local) != Some(home)
                 || facts.allocation_result_home(table) != Some(home)
-                || arguments.contains(&local)
+                || arguments.contains(&next)
             {
                 break;
             }
@@ -656,6 +664,8 @@ pub(super) fn collect(
             continue;
         }
         plans.push(Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: flat[start].unwrap().id,
             sink: flat[end].unwrap().id,
             base,
@@ -947,6 +957,8 @@ fn call_plan(
     }
     let sink = *ids.last()?;
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: ids[first],
         sink,
         base,

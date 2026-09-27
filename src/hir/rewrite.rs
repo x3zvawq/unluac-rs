@@ -27,6 +27,34 @@ pub(crate) fn replace_temp_in_expr(
     SingleReplacement { temp, replacement }.expr(expr)
 }
 
+/// 消费调用方已证明的读取身份；参数或循环 binding 不一定使用 TempRef。
+pub(crate) fn replace_binding_in_expr(
+    expr: &mut HirExpr,
+    binding: HirBinding,
+    replacement: &HirExpr,
+) -> usize {
+    BindingReplacement {
+        binding,
+        replacement,
+    }
+    .expr(expr)
+}
+
+struct BindingReplacement<'a> {
+    binding: HirBinding,
+    replacement: &'a HirExpr,
+}
+
+impl Substitution for BindingReplacement<'_> {
+    fn replace_temp(&mut self, temp: TempId) -> Option<(HirExpr, usize)> {
+        self.replace_binding(HirBinding::Temp(temp))
+    }
+
+    fn replace_binding(&mut self, binding: HirBinding) -> Option<(HirExpr, usize)> {
+        (binding == self.binding).then(|| (self.replacement.clone(), 1))
+    }
+}
+
 pub(crate) fn replace_temp_in_stmt(stmt: &mut HirStmt, temp: TempId, replacement: &HirExpr) {
     SingleReplacement { temp, replacement }.stmt(stmt);
 }
@@ -77,9 +105,16 @@ impl Substitution for ReplacementDag<'_> {
 trait Substitution {
     fn replace_temp(&mut self, temp: TempId) -> Option<(HirExpr, usize)>;
 
+    fn replace_binding(&mut self, binding: HirBinding) -> Option<(HirExpr, usize)> {
+        match binding {
+            HirBinding::Temp(temp) => self.replace_temp(temp),
+            _ => None,
+        }
+    }
+
     fn expr(&mut self, expr: &mut HirExpr) -> usize {
-        if let HirExpr::TempRef(temp) = expr
-            && let Some((replacement, count)) = self.replace_temp(*temp)
+        if let Some(binding) = HirBinding::from_expr(expr)
+            && let Some((replacement, count)) = self.replace_binding(binding)
         {
             *expr = replacement;
             return count;

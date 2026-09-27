@@ -696,7 +696,10 @@ fn dominating_cell_initializers(
         key
     };
     for phi in structure.plan().phis() {
-        let Some(SsaValue::Def(input)) = phi.loop_carried().map(|carried| carried.input) else {
+        let Some(carried) = phi.loop_carried() else {
+            continue;
+        };
+        let SsaValue::Def(input) = carried.input else {
             continue;
         };
         let header = cfg.blocks[phi.block.index()].instrs.start;
@@ -705,7 +708,16 @@ fn dominating_cell_initializers(
         if dataflow.def_reg(input) == phi.reg
             && key_at(phi.reg, initial) == key
             && let Some(group) = groups.get_mut(&key)
+            && structure
+                .plan()
+                .region_for_block(cfg.instr_to_block[group.start])
+                .is_some_and(|region| structure.plan().region_contains(carried.owner, region))
+            && group
+                .source_init
+                .is_none_or(|source| source <= initial.index())
         {
+            // 只有循环内的 reaching 写才需要追溯 carried 入口；循环结束后复用同槽的
+            // 新 cell 不属于该 phi，debug 声明也不能被较早的临时写吞并。
             // 第一次捕获可能读取循环内的更新 Def；cell 的声明仍属于 carried phi
             // 已证明的唯一入口。下方继续核对支配、未激活及全部写域，不按槽号回扫首写。
             group.start = group.start.min(initial.index());

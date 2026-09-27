@@ -1439,6 +1439,7 @@ pub(super) fn materialize_generic_for_dispatch_root_releases(
                     })
                 });
                 new_stmts.push(HirStmt::Assign(Box::new(HirAssign {
+                    luau_function_declaration: false,
                     luau_compound_global: false,
                     upvalue_write_source: None,
                     is_phi_transfer: false,

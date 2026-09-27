@@ -539,6 +539,25 @@ fn inline_temps_in_block(
     let mut callee_materialized_at = None;
     let mut adjacent_changed = false;
 
+    // 反向内联可能先吞掉 COPY；在改写前保存低槽 GETTABLE 的写回义务。
+    // 这次写入由 carried-local/索引帧恢复，不能随 callee COPY 迁到高槽。
+    for pair in block.stmts.windows(2) {
+        if let Some((temp, HirExpr::TableAccess(_))) = pair[0].scalar_temp_assignment()
+            && let Some((target, HirExpr::TempRef(source))) = pair[1].scalar_temp_assignment()
+            && *source == temp
+            && facts
+                .trusted_temp_home_slot(temp)
+                .zip(facts.trusted_temp_home_slot(target))
+                .is_some_and(|(source, destination)| source.slot() < destination.slot())
+        {
+            changed |= workspace
+                .inline_dispositions
+                .preserve_temp(temp, HirInlineRetentionReason::PhysicalFramePrefix);
+            workspace.physical_root_temps[temp.index()] = true;
+            workspace.new_physical_root_temps.insert(temp);
+        }
+    }
+
     let mut earlier = std::mem::take(&mut block.stmts)
         .into_iter()
         .enumerate()
@@ -575,8 +594,23 @@ fn inline_temps_in_block(
                 .preserve_temp(temp, HirInlineRetentionReason::CapturedValueEpoch);
         }
         if let Some((temp, value)) = stmt.scalar_temp_assignment()
+            && kept_rev
+                .last()
+                .is_some_and(|next| occupies_branch_call_prefix(temp, value, next, facts))
+        {
+            // 后续 locals/inline-exprs 也必须消费同一前缀义务；单轮拒绝内联不足以保留身份。
+            changed |= workspace
+                .inline_dispositions
+                .preserve_temp(temp, HirInlineRetentionReason::PhysicalFramePrefix);
+            workspace.physical_root_temps[temp.index()] = true;
+            workspace.new_physical_root_temps.insert(temp);
+        }
+        if let Some((temp, value)) = stmt.scalar_temp_assignment()
             // 候选拒绝[SemanticBarrier:TableShape]：regress_471 的常量字段会触发模板裁尾，改变 #table。
             && !preserves_table_initialization
+            // LayerBoundary：GETTABLE 的结果覆盖属于原 SETLIST 缓冲帧；
+            // 独立内联会丢失这次写回，固定批次 owner 也无法再原位降低。
+            && !kept_rev.last().is_some_and(|next| set_list_needs_lookup_frame(next, temp, value))
             // 候选拒绝[SemanticBarrier:Lifetime]：被 physical-root lifetime 标记的 call/lookup 结果仍承担 VM root；提前删除会改变对象存活期（regress_356）。
             && !physical_root_lifetimes[index]
             && !workspace
@@ -625,7 +659,8 @@ fn inline_temps_in_block(
             // 是它下方仍存活的输入声明；保留两槽事实供源码帧 owner 同批恢复。
             && !occupies_unary_input_prefix(temp, value, next_stmt, facts)
             // 候选拒绝[LayerBoundary]：参数 COPY 的来源 CALL 保留独立结果槽，交完整帧消费。
-            // CLOSURE 的原分配槽也不能改挂到 callee COPY；否则 locals 会把闭包声明
+            // GETTABLE 的低槽写回和 CLOSURE 的原分配槽不能改挂到异槽 COPY；
+            // 索引帧需先恢复原目标身份，再消费调用准备。否则 locals 会把声明
             // 提升到调用 scratch，后续帧无法证明原声明前缀和两槽生命周期。
             // 候选拒绝[SemanticBarrier:Lifetime]：前层签发的 copy root 也不能改挂到异槽定义。
             // 647 的副本被用作 callee 后覆写，源槽仍跨 GC 存活；同值不代表同生命周期。
@@ -634,6 +669,18 @@ fn inline_temps_in_block(
                         && facts.trusted_temp_home_slot(temp) != facts.trusted_temp_home_slot(target)
                         && (facts.is_scope_end_copy_root_temp(temp)
                             || matches!(value, HirExpr::Closure(_))
+                            || (matches!(value, HirExpr::TableAccess(_))
+                                && facts.trusted_temp_home_slot(temp).zip(facts.trusted_temp_home_slot(target))
+                                    .is_some_and(|(source, destination)| source.slot() < destination.slot()))
+                            // 值决策预写仍占据原结果槽；移到高槽 COPY 会遗留低槽
+                            // 预写，且让后续 CALL 的声明前缀永久缺一格。
+                            || (workspace.dialect == DecompileDialect::Luau
+                                && (facts.boolean_value_prewrite(temp).is_some()
+                                || facts.copy_value_prewrite(temp).is_some()
+                                || matches!(value, HirExpr::Binary(binary)
+                                    if facts.comparison_result_temp(binary) == Some(temp)))
+                                && facts.trusted_temp_home_slot(temp).zip(facts.trusted_temp_home_slot(target))
+                                    .is_some_and(|(source, destination)| source.slot() < destination.slot()))
                             || (matches!(value, HirExpr::Call(_))
                                 && facts.temp_is_transferred_call_argument(target)))
                 })
@@ -921,6 +968,13 @@ impl CapturedSlotSnapshots {
             .get(stmt_index)
             .and_then(|snapshot_index| self.snapshots.get(*snapshot_index))
     }
+}
+
+fn set_list_needs_lookup_frame(stmt: &HirStmt, temp: TempId, value: &HirExpr) -> bool {
+    let HirStmt::TableSetList(batch) = stmt else {
+        return false;
+    };
+    matches!(value, HirExpr::TableAccess(_)) && batch.values.fixed.contains(&HirExpr::TempRef(temp))
 }
 
 /// 物理 root 终点只证明源程序的后缀；目标还需要 constructor 的强引用载体。
@@ -1456,6 +1510,39 @@ impl PureInlineContext<'_> {
             remove_live_use(self.live_use_counts, temp);
         }
     }
+}
+
+fn occupies_branch_call_prefix(
+    temp: TempId,
+    value: &HirExpr,
+    sink: &HirStmt,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    let (HirExpr::Call(call), HirStmt::If(branch)) = (value, sink) else {
+        return false;
+    };
+    fn reads_predicate_input(condition: &HirExpr, temp: TempId) -> bool {
+        match condition {
+            HirExpr::LogicalAnd(logical) | HirExpr::LogicalOr(logical) => {
+                reads_predicate_input(&logical.lhs, temp)
+                    || reads_predicate_input(&logical.rhs, temp)
+            }
+            HirExpr::Unary(unary) if unary.op == crate::hir::HirUnaryOpKind::Not => {
+                reads_predicate_input(&unary.expr, temp)
+            }
+            _ => matches!(comparison_operand(condition).unwrap_or(condition),
+                HirExpr::TempRef(input) if *input == temp),
+        }
+    }
+    // 已先求值的结果也可能位于短路树的后继测试；树化条件不结束其原前缀身份。
+    if !reads_predicate_input(&branch.cond, temp) || facts.fixed_call_result(call, 0) != Some(temp)
+    {
+        return false;
+    }
+    let Some(home) = facts.trusted_temp_home_slot(temp) else {
+        return false;
+    };
+    super::source_frames::branch_entry_requires_prefix(branch, home, facts)
 }
 
 fn occupies_unary_input_prefix(
@@ -2234,6 +2321,11 @@ fn inline_materialization_runs(
                 facts,
                 captured_slots_before_stmt,
             );
+            if set_list_needs_lookup_frame(&rewritten_sink, temp, value) {
+                // LayerBoundary：整批构造器尚未接管前，保留 GETTABLE 的原结果写。
+                complete_run = false;
+                break;
+            }
             if matches!(value, HirExpr::Call(_))
                 && stmt_stores_temp_in_table(&rewritten_sink, temp)
                 && !call_result_can_enter_set_list(temp, &rewritten_sink, uses, facts)

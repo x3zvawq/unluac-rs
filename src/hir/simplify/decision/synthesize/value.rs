@@ -228,26 +228,26 @@ pub(super) fn structured_candidates(
         super::super::logical_and(subject.clone(), truthy_expr.clone()),
         falsy_expr.clone(),
     ));
-    candidates.push(super::super::logical_or(
-        super::super::logical_and(subject.clone(), truthy_expr.clone()),
-        super::super::logical_and(subject.clone().negate(), falsy_expr.clone()),
-    ));
+    // 候选拒绝[SemanticBarrier:ControlFlow]：值域验证不能授权重复 subject，
+    // 或把一般分支叶值变成新的 guard。只尝试原条件的一次正/反向选择。
     candidates.push(super::super::logical_or(
         super::super::logical_and(not_subject.clone(), falsy_expr.clone()),
         truthy_expr.clone(),
     ));
-    candidates.push(super::super::logical_or(
-        super::super::logical_and(not_subject.clone(), falsy_expr.clone()),
-        super::super::logical_and(subject.clone(), truthy_expr.clone()),
-    ));
-    candidates.push(super::super::logical_and(
-        super::super::logical_or(subject.clone(), falsy_expr.clone()),
-        truthy_expr.clone(),
-    ));
-    candidates.push(super::super::logical_and(
-        super::super::logical_or(not_subject, truthy_expr),
-        falsy_expr,
-    ));
+    // nil/false 出口可直接承担短路失败值，目标编译器无需重测这个常量叶。
+    // 例如 cond ? nil : false 可用 (cond or false) and nil 保留一次原判断。
+    if matches!(falsy_expr, HirExpr::Nil | HirExpr::Boolean(false)) {
+        candidates.push(super::super::logical_and(
+            super::super::logical_or(subject.clone(), falsy_expr.clone()),
+            truthy_expr.clone(),
+        ));
+    }
+    if matches!(truthy_expr, HirExpr::Nil | HirExpr::Boolean(false)) {
+        candidates.push(super::super::logical_and(
+            super::super::logical_or(not_subject, truthy_expr),
+            falsy_expr,
+        ));
+    }
     candidates
 }
 

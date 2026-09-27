@@ -291,8 +291,8 @@ macro_rules! traverse_hir_stmt_children {
                 );
             }
             crate::hir::HirStmt::Assign(assign) => {
-                for $lvalue in assign.targets.$iter() {
-                    $on_lvalue
+                if !assign.luau_function_declaration {
+                    for $lvalue in assign.targets.$iter() { $on_lvalue }
                 }
                 crate::hir::traverse::traverse_hir_value_pack_children!(
                     assign.values,
@@ -300,6 +300,9 @@ macro_rules! traverse_hir_stmt_children {
                     expr($expr) => $on_expr
                     $(, call($tail_call) => $on_tail_call)?
                 );
+                if assign.luau_function_declaration {
+                    for $lvalue in assign.targets.$iter() { $on_lvalue }
+                }
             }
             crate::hir::HirStmt::LocalRootRelease($release) => $on_release,
             crate::hir::HirStmt::TableSetList(set_list) => {

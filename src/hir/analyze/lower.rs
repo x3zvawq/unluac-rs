@@ -200,6 +200,7 @@ pub(super) struct ProtoLowering<'a> {
     pub(super) dataflow: &'a DataflowFacts,
     pub(super) structure: &'a ReadyStructureFacts,
     pub(super) promotion_facts: &'a ProtoPromotionFacts,
+    pub(super) emission: &'a HirEmissionFacts<'a>,
     pub(super) child_refs: &'a [HirProtoRef],
     pub(super) bindings: ProtoBindings,
     pub(super) self_value_capture_locals: BTreeMap<InstrRef, LocalId>,
@@ -622,7 +623,6 @@ fn lower_proto_one(
         &mut bindings,
         &mut promotion_facts,
     );
-    drop(emission);
     super::method_setups::record_method_setup_protocols(
         proto,
         dataflow,
@@ -734,6 +734,7 @@ fn lower_proto_one(
         dataflow,
         structure,
         promotion_facts: &promotion_facts,
+        emission: &emission,
         child_refs: &child_refs,
         bindings,
         self_value_capture_locals,

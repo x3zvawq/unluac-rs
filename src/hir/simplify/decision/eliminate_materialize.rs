@@ -246,6 +246,11 @@ pub(super) fn extract_assign(
     state: &mut EliminationState<'_>,
     safety: HirExprSafety,
 ) -> (Vec<HirStmt>, HirAssign, bool) {
+    if assign.luau_function_declaration {
+        // 此合同只容纳 Closure 与全局字段目标，没有待物化的 Decision；
+        // 普通赋值的 leading-target 提取会反转其闭包先求值顺序。
+        return (Vec::new(), assign, false);
+    }
     let luau_compound_global = assign.luau_compound_global;
     let upvalue_write_source = assign.upvalue_write_source;
     let is_phi_transfer = assign.is_phi_transfer;
@@ -295,6 +300,7 @@ pub(super) fn extract_assign(
     (
         prefix,
         HirAssign {
+            luau_function_declaration: false,
             luau_compound_global,
             upvalue_write_source: (!changed).then_some(upvalue_write_source).flatten(),
             is_phi_transfer,
@@ -434,6 +440,7 @@ fn materialize_logical_expr_into_target(
     };
     stmts.push(HirStmt::If(Box::new(HirIf {
         preserves_empty_test: false,
+        preserves_arm_order: false,
         cond: guard,
         then_block,
         else_block: None,
@@ -468,7 +475,15 @@ fn materialize_decision_node(
     let captures_current = matches!(node.truthy, HirDecisionTarget::CurrentValue)
         || matches!(node.falsy, HirDecisionTarget::CurrentValue);
     let (mut prefix, prepared_test) = prepare_pure_expr(node.test.clone(), state, safety);
-    let (cond, current_value) = if captures_current {
+    let (cond, current_value) = if captures_current
+        && matches!(
+            prepared_test,
+            HirExpr::LocalRef(_) | HirExpr::TempRef(_) | HirExpr::ParamRef(_)
+        ) {
+        // CurrentValue 边直接接终端赋值，中间没有其它求值；已有 binding 本身就是
+        // 被测试的快照。额外 synthetic local 会占用并不存在的源码槽。
+        (prepared_test.clone(), Some(prepared_test))
+    } else if captures_current {
         let current_local = state.alloc_local();
         prefix.push(local_decl_with_value(current_local, prepared_test));
         (
@@ -529,6 +544,7 @@ fn materialize_decision_node(
 
     prefix.push(HirStmt::If(Box::new(HirIf {
         preserves_empty_test: false,
+        preserves_arm_order: false,
         cond,
         then_block,
         else_block,
@@ -549,10 +565,17 @@ fn materialize_decision_target(
         HirDecisionTarget::Node(next_ref) => {
             materialize_decision_node(decision, next_ref.index(), target, state, safety)
         }
-        HirDecisionTarget::CurrentValue => vec![assign_stmt(
-            target,
-            current_value.cloned().unwrap_or_else(|| node.test.clone()),
-        )],
+        HirDecisionTarget::CurrentValue => {
+            let value = current_value.cloned().unwrap_or_else(|| node.test.clone());
+            if matches!((&target, &value),
+                (HirLValue::Local(left), HirExpr::LocalRef(right)) if left == right)
+                || matches!((&target, &value),
+                    (HirLValue::Temp(left), HirExpr::TempRef(right)) if left == right)
+            {
+                return Vec::new();
+            }
+            vec![assign_stmt(target, value)]
+        }
         HirDecisionTarget::Expr(expr) => {
             if matches!((&target, expr),
                 (HirLValue::Local(left), HirExpr::LocalRef(right)) if left == right)
@@ -1049,6 +1072,7 @@ fn local_decl_with_value(local: LocalId, value: HirExpr) -> HirStmt {
 
 fn assign_stmt(target: HirLValue, value: HirExpr) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
+        luau_function_declaration: false,
         luau_compound_global: false,
         upvalue_write_source: None,
         is_phi_transfer: false,

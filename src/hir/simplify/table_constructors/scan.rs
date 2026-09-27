@@ -41,11 +41,12 @@ pub(super) struct ConstructorRegion<'a> {
 ///
 /// 空表 seed 只有在后面存在同 binding 的 record 或 SETLIST 时才需要扫描中间 producer；
 /// 以最后位置作为 horizon，既允许跨过其他 seed，又能在线性预处理后排除独立 seed 的后缀扫描。
-/// 固定批次的 Temp 角色同时来自现存 SETLIST pack 与 Promotion home；它允许 scanner
-/// 认识原 CONST/COPY 等准备写，不代表能删除旧根，提交仍需完整生命周期事务。
+/// 字段 Temp 角色来自原 SETTABLE 操作数或 SETLIST pack 与 Promotion home；
+/// 常量池溢出 RK 后的 LOADK 也属于字段准备。角色识别不授予删除旧根的许可，
+/// 提交仍需完整生命周期事务。
 pub(super) struct ConstructorWriteIndex {
     last_write: Vec<Option<usize>>,
-    fixed_batch_producers: BTreeMap<BindingId, BTreeSet<TempId>>,
+    field_producers: BTreeMap<BindingId, BTreeSet<TempId>>,
 }
 
 impl ConstructorWriteIndex {
@@ -56,7 +57,7 @@ impl ConstructorWriteIndex {
     ) -> Self {
         let mut index = Self {
             last_write: vec![None; binding_index.len()],
-            fixed_batch_producers: BTreeMap::new(),
+            field_producers: BTreeMap::new(),
         };
         for (stmt_id, stmt) in stmts.iter().enumerate() {
             if let Some(binding) = keyed_write_binding(stmt) {
@@ -64,6 +65,22 @@ impl ConstructorWriteIndex {
                     .id_of(binding)
                     .expect("table record binding should be indexed");
                 index.last_write[binding_id] = Some(stmt_id);
+                if let Some((_, access, value)) = keyed_write_parts(stmt)
+                    && let Some(layout) = facts.native_table_write_layout(access)
+                {
+                    for (operand, home) in [(&access.key, layout.key), (value, layout.value)] {
+                        if let HirExpr::TempRef(temp) = operand
+                            && home.is_some()
+                            && facts.trusted_temp_home_slot(*temp) == home
+                        {
+                            index
+                                .field_producers
+                                .entry(binding_id)
+                                .or_default()
+                                .insert(*temp);
+                        }
+                    }
+                }
             } else if let Some(binding) = table_set_list_binding(stmt) {
                 let binding_id = binding_index
                     .id_of(binding)
@@ -78,25 +95,21 @@ impl ConstructorWriteIndex {
                 }) else {
                     continue;
                 };
-                index
-                    .fixed_batch_producers
-                    .entry(binding_id)
-                    .or_default()
-                    .extend(
-                        batch
-                            .values
-                            .fixed
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(offset, value)| {
-                                let HirExpr::TempRef(temp) = value else {
-                                    return None;
-                                };
-                                (facts.trusted_temp_home_slot(*temp)?.slot()
-                                    == owner_home.slot() + offset + 1)
-                                    .then_some(*temp)
-                            }),
-                    );
+                index.field_producers.entry(binding_id).or_default().extend(
+                    batch
+                        .values
+                        .fixed
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(offset, value)| {
+                            let HirExpr::TempRef(temp) = value else {
+                                return None;
+                            };
+                            (facts.trusted_temp_home_slot(*temp)?.slot()
+                                == owner_home.slot() + offset + 1)
+                                .then_some(*temp)
+                        }),
+                );
             }
         }
         index
@@ -106,8 +119,8 @@ impl ConstructorWriteIndex {
         self.last_write[binding_id].is_some_and(|last| last > stmt_id)
     }
 
-    pub(super) fn fixed_batch_producers(&self, binding_id: BindingId) -> Option<&BTreeSet<TempId>> {
-        self.fixed_batch_producers.get(&binding_id)
+    pub(super) fn field_producers(&self, binding_id: BindingId) -> Option<&BTreeSet<TempId>> {
+        self.field_producers.get(&binding_id)
     }
 }
 
@@ -183,7 +196,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
     promotion_facts: &ProtoPromotionFacts,
     stmt_ids: &[usize],
     private_overwrites: &BTreeSet<usize>,
-    fixed_batch_producers: Option<&BTreeSet<TempId>>,
+    field_producers: Option<&BTreeSet<TempId>>,
     value_facts: &ReturnValueFacts,
     scratch: &mut RebuildScratch,
 ) -> Option<ConstructorRegion<'a>> {
@@ -263,7 +276,7 @@ pub(super) fn try_rebuild_constructor_region<'a>(
             preserved_identity_bindings,
             promotion_facts,
             private_overwrites.contains(&stmt_ids[index]),
-            fixed_batch_producers,
+            field_producers,
             value_facts,
             &mut steps,
         ) {
@@ -559,6 +572,9 @@ fn keyed_write_parts(
     let HirStmt::Assign(assign) = stmt else {
         return None;
     };
+    if assign.luau_function_declaration {
+        return None;
+    }
     let [HirLValue::TableAccess(access)] = assign.targets.as_slice() else {
         return None;
     };
@@ -585,7 +601,7 @@ fn producer_steps<'a>(
     preserved_identity_bindings: &BindingSlots<bool>,
     promotion_facts: &ProtoPromotionFacts,
     private_overwrite: bool,
-    fixed_batch_producers: Option<&BTreeSet<TempId>>,
+    field_producers: Option<&BTreeSet<TempId>>,
     value_facts: &ReturnValueFacts,
     steps: &mut Vec<RegionStep<'a>>,
 ) -> Option<(Vec<TableBinding>, ProducerSourcePreservation)> {
@@ -647,9 +663,9 @@ fn producer_steps<'a>(
                 };
                 *temp
             });
-            let native_batch = fixed_batch_producers
+            let native_field = field_producers
                 .is_some_and(|producers| temps.clone().all(|temp| producers.contains(&temp)));
-            if !(native_batch
+            if !(native_field
                 || assign.targets.len() == 1
                     && matches!(
                         assign.values.fixed.as_slice(),

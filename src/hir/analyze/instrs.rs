@@ -12,8 +12,8 @@
 
 use super::exprs::{
     expr_for_const, expr_for_reg_use, expr_for_value_operand, global_key_for_access,
-    lower_binary_op, lower_call_root_handoff, lower_closure_capture, lower_closure_expr,
-    lower_composite_factory_expr, lower_method_key, lower_raw_table_get_expr,
+    lower_binary_op, lower_call_method, lower_call_root_handoff, lower_closure_capture,
+    lower_closure_expr, lower_composite_factory_expr, lower_method_key, lower_raw_table_get_expr,
     lower_raw_table_set_call, lower_table_access_expr, lower_table_access_target, lower_unary_op,
     lower_upvalue_operand_expr, lower_upvalue_operand_target, lower_value_pack,
 };
@@ -506,7 +506,7 @@ pub(super) fn lower_terminal_instr(
                 .then_some(instr_ref),
         )]),
         LowInstr::TailCall(tail_call) => {
-            let method_key = lower_method_key(lowering, tail_call.method_name);
+            let method_key = lower_method_key(lowering, instr_ref, tail_call.method_name);
             let callee = expr_for_reg_use(lowering, block, instr_ref, tail_call.callee);
             Some(vec![return_stmt(
                 HirValuePack::expanding(
@@ -521,18 +521,14 @@ pub(super) fn lower_terminal_instr(
                         frame_root_ends: Vec::new(),
                         callee,
                         args: lower_value_pack(lowering, block, instr_ref, tail_call.args),
-                        method: matches!(tail_call.kind, CallKind::Method).into(),
+                        method: lower_call_method(lowering, instr_ref, tail_call.kind),
                         fastcall: match tail_call.kind {
                             CallKind::FastCall(args) => Some(args),
                             CallKind::Normal | CallKind::Method => None,
                         },
                         method_key,
                         // 尾调用保留 SELF 双端身份，原 owner 不为它签发 post-call 根。
-                        callee_root_handoff: lower_call_root_handoff(
-                            lowering,
-                            instr_ref,
-                            tail_call.kind,
-                        ),
+                        callee_root_handoff: lower_call_root_handoff(lowering, instr_ref),
                         method_rewrite_transaction: None,
                         plain_method_syntax: false,
                         boolean_prewrite_arguments: Vec::new(),
@@ -650,7 +646,7 @@ fn lower_call_expr(
     instr_ref: InstrRef,
     call: &crate::transformer::CallInstr,
 ) -> HirCallExpr {
-    let method_key = lower_method_key(lowering, call.method_name);
+    let method_key = lower_method_key(lowering, instr_ref, call.method_name);
     let callee = expr_for_reg_use(lowering, block, instr_ref, call.callee);
     HirCallExpr {
         required_luau_inlining: None,
@@ -662,13 +658,13 @@ fn lower_call_expr(
         frame_root_ends: lowering.promotion_facts.call_frame_root_ends(instr_ref),
         callee,
         args: lower_value_pack(lowering, block, instr_ref, call.args),
-        method: matches!(call.kind, CallKind::Method).into(),
+        method: lower_call_method(lowering, instr_ref, call.kind),
         fastcall: match call.kind {
             CallKind::FastCall(args) => Some(args),
             CallKind::Normal | CallKind::Method => None,
         },
         method_key,
-        callee_root_handoff: lower_call_root_handoff(lowering, instr_ref, call.kind),
+        callee_root_handoff: lower_call_root_handoff(lowering, instr_ref),
         method_rewrite_transaction: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),

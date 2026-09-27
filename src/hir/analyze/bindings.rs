@@ -225,7 +225,7 @@ pub(super) fn build_bindings(
         &mut local_debug_hints,
     );
 
-    let captured_slots = collect_captured_slot_targets(
+    let mut captured_slots = collect_captured_slot_targets(
         CapturedSlotInputs {
             proto,
             cfg,
@@ -578,6 +578,14 @@ pub(super) fn build_bindings(
     // 显式 nil、根作用域字面量或 MOVE 声明已有原位置与 source scope。后续内层写和外层读共用该身份，
     // 不能等 block-local promotion 把它们分开后，再由 AST 给跨块 temp 补另一份声明。
     // 捕获槽仍由原 cell owner 分配；这里不接管其快照或 CLOSE 协议。
+    let plan = structure.plan();
+    let mut single_pass_regions = vec![None; plan.regions().len()];
+    for &region in plan.region_postorder().iter().rev() {
+        let parent = plan.region(region).and_then(RegionPlan::parent);
+        single_pass_regions[region.index()] = parent
+            .and_then(|parent| single_pass_regions[parent.index()])
+            .or_else(|| plan.single_pass_for_region(region).map(|_| region));
+    }
     let mut debug_initializer_decls = BTreeMap::new();
     let mut debug_preheader_targets = BTreeMap::new();
     let mut declared_local_home_slots = Vec::new();
@@ -675,7 +683,27 @@ pub(super) fn build_bindings(
             &proto.debug_locals[fact.scope].name,
         )));
         debug_scope_targets.insert(fact.scope, BoundSlotTarget::Local(local));
-        debug_initializer_decls.insert(temp, local);
+        let outer_owner = plan
+            .region_for_block(block)
+            .and_then(|region| single_pass_regions[region.index()])
+            .and_then(|region| {
+                let (_, fence) = plan.single_pass_for_region(region)?;
+                let continuation = cfg.blocks[fence.continuation.index()].instrs.start.index();
+                // 人工 repeat 壳不能缩短跨越其出口的 debug 身份；初始化仍在原指令执行。
+                // 原 debug 区间只在壳内的声明继续留在原位置，不能扩大其资源生命周期。
+                (fact.end_instr.is_none_or(|end| end.index() > continuation))
+                    .then(|| plan.region(region).and_then(RegionPlan::parent))
+                    .flatten()
+            });
+        if let Some(owner) = outer_owner {
+            captured_slots
+                .region_local_decls
+                .entry(owner)
+                .or_default()
+                .push(local);
+        } else {
+            debug_initializer_decls.insert(temp, local);
+        }
         if matches!(fact.value.ssa(), Some(SsaValue::Phi(_))) {
             debug_preheader_targets.insert(temp, BoundSlotTarget::Local(local));
         }

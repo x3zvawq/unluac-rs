@@ -25,6 +25,7 @@ enum PreparedValue {
     Binary(InstrRef),
     Upvalue(UpvalueId),
     Nil,
+    NilBatch,
     Boolean(bool),
     Integer(i64),
     Number(f64),
@@ -47,6 +48,10 @@ pub(super) struct TablePreparation {
 }
 
 impl OperandPreparation {
+    pub(super) fn is_nil_batch_member(&self) -> bool {
+        matches!(self.value, PreparedValue::NilBatch)
+    }
+
     pub(super) fn matches(&self, value: &HirExpr) -> bool {
         match (&self.value, value) {
             (PreparedValue::Call(read), HirExpr::Call(call)) => {
@@ -147,6 +152,9 @@ pub(super) fn collect(
         LowInstr::LoadBool(load) => PreparedValue::Boolean(load.value),
         // 单槽 LOADNIL 可以作为比较准备重发；批量清槽还携带其它写域，不能借此拆开。
         LowInstr::LoadNil(load) if load.dst.start == reg && load.dst.len == 1 => PreparedValue::Nil,
+        // 发布批次成员身份，但不让单项 matches(Nil) 接受；只有完整 LOADNIL
+        // 事务可消费它，避免其它算术/比较消费者拆掉同指令的剩余写域。
+        LowInstr::LoadNil(_) => PreparedValue::NilBatch,
         LowInstr::LoadInteger(load) => PreparedValue::Integer(load.value),
         LowInstr::LoadNumber(load) => PreparedValue::Number(load.value),
         LowInstr::LoadConst(load) => match &proto.constants[load.value.index()] {

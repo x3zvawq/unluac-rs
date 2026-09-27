@@ -30,13 +30,36 @@ pub(super) enum DeadTempStage {
     Final,
 }
 
-struct PendingBooleanPrewrites<'a> {
+struct PendingFrameInputs<'a> {
     facts: &'a ProtoPromotionFacts,
     stage: DeadTempStage,
     temps: BTreeSet<TempId>,
+    global_keys: BTreeSet<TempId>,
 }
 
-impl HirVisitor<'_> for PendingBooleanPrewrites<'_> {
+impl HirVisitor<'_> for PendingFrameInputs<'_> {
+    fn visit_stmt(&mut self, stmt: &HirStmt) {
+        if self.stage == DeadTempStage::BeforeNativeFrames
+            && let Some((temp, value)) = stmt.scalar_temp_assignment()
+            && matches!(
+                value,
+                HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_) | HirExpr::String(_)
+            )
+        {
+            // 未读常量可能占据后继完整帧的低槽前缀；由声明事务先审理，
+            // Final 再清理未被消费的写，不能在前缀证明前丢失原初始化。
+            self.temps.insert(temp);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &HirExpr) {
+        if let HirExpr::GlobalRef(global) = expr
+            && let Some(temp) = self.facts.global_read_key_preparation(global)
+        {
+            self.global_keys.insert(temp);
+        }
+    }
+
     fn visit_call(&mut self, call: &crate::hir::common::HirCallExpr) {
         if self.stage == DeadTempStage::BeforeNativeFrames {
             self.temps.extend(
@@ -65,10 +88,11 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
                 VisibleHomeWrites::new(promotion_facts),
             ),
         ),
-        PendingBooleanPrewrites {
+        PendingFrameInputs {
             facts: promotion_facts,
             stage,
             temps: BTreeSet::new(),
+            global_keys: BTreeSet::new(),
         },
     );
     visit::visit_stmts(&proto.body.stmts, &mut inputs);
@@ -109,7 +133,9 @@ pub(super) fn remove_dead_temp_materializations_in_proto(
             .map(TempId)
             .filter(|temp| proto.inline_dispositions.temp(*temp).must_preserve()),
     );
-    protected_temps.extend(pending.temps);
+    // 全局名已消费其原 key，不能把同一 LOADK 再登记为独立前缀候选。
+    // 这里只撤销延期；debug、根覆盖及实际读取仍由下方原清理条件核对。
+    protected_temps.extend(pending.temps.difference(&pending.global_keys).copied());
     if stage == DeadTempStage::BeforeNativeFrames {
         protected_temps.extend(promotion_facts.parallel_target_seeds());
         // 原无读 nil 仍可能是紧邻全局读取的低槽声明前缀，先交完整 scope 事务。

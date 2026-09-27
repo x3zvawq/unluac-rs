@@ -504,6 +504,8 @@ pub(super) fn invocation(
     sink: usize,
 ) -> Plan {
     Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start,
         sink,
         base,

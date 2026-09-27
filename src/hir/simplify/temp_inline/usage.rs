@@ -71,6 +71,7 @@ impl TempUseScratch {
         struct Definitions {
             counts: Vec<usize>,
             boolean_values: Vec<bool>,
+            literal_booleans: Vec<bool>,
             predicates: Vec<bool>,
             copies: Vec<Vec<TempId>>,
             predicate_occurrences: BTreeSet<usize>,
@@ -86,10 +87,13 @@ impl TempUseScratch {
                 if let Some((temp, value)) = stmt.scalar_temp_assignment() {
                     if let HirExpr::TempRef(source) = value {
                         self.copies[temp.index()].push(*source);
-                    } else if !matches!(value, HirExpr::Boolean(_))
-                        && crate::hir::simplify::expr_facts::expr_is_boolean_valued(value)
-                    {
-                        self.boolean_values[temp.index()] = true;
+                    } else if crate::hir::simplify::expr_facts::expr_is_boolean_valued(value) {
+                        if matches!(value, HirExpr::Boolean(_)) {
+                            self.literal_booleans[temp.index()] =
+                                matches!(value, HirExpr::Boolean(true));
+                        } else {
+                            self.boolean_values[temp.index()] = true;
+                        }
                     }
                 }
                 match stmt {
@@ -140,6 +144,7 @@ impl TempUseScratch {
         let mut definitions = Definitions {
             counts: vec![0; temp_count],
             boolean_values: vec![false; temp_count],
+            literal_booleans: vec![false; temp_count],
             predicates: vec![false; temp_count],
             copies: vec![Vec::new(); temp_count],
             predicate_occurrences: BTreeSet::new(),
@@ -151,6 +156,23 @@ impl TempUseScratch {
             .enumerate()
             .filter_map(|(index, value)| value.then_some(TempId(index)))
             .collect::<Vec<_>>();
+        let mut literal_predicates = definitions.predicates.clone();
+        let mut literal_pending = pending.clone();
+        // true 直接进入谓词会被目标编译器当成无条件路径，丢掉原 LOAD/TEST；
+        // false 谓词仍会重发 LOAD/TEST，不在这里额外物化其 scratch 声明。
+        // 直接 LOAD/TEST 及唯一 COPY 链持有原声明前缀；多定义的 phi 叶 Boolean
+        // 则是比较物化协议，必须留给 Decision/完整帧消费，不能逐叶冻结。
+        while let Some(source) = literal_pending.pop() {
+            if definitions.counts[source.index()] != 1 {
+                continue;
+            }
+            for &copy in &definitions.copies[source.index()] {
+                if !literal_predicates[copy.index()] {
+                    literal_predicates[copy.index()] = true;
+                    literal_pending.push(copy);
+                }
+            }
+        }
         while let Some(source) = pending.pop() {
             for &copy in &definitions.copies[source.index()] {
                 if !definitions.predicates[copy.index()] {
@@ -163,7 +185,15 @@ impl TempUseScratch {
             .boolean_values
             .into_iter()
             .zip(definitions.predicates)
-            .map(|(value, predicate)| value && predicate)
+            .zip(
+                definitions
+                    .literal_booleans
+                    .into_iter()
+                    .zip(literal_predicates),
+            )
+            .map(|((value, predicate), (literal, literal_predicate))| {
+                value && predicate || literal && literal_predicate
+            })
             .collect();
         Self {
             definition_counts: definitions.counts,

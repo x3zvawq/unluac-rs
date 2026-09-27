@@ -1,10 +1,8 @@
-//! 从 low IR 与 SSA 认领 method setup producer/call 协议。
+//! 从原 SELF/NAMECALL 与 SSA 认领方法准备及调用的配对协议。
 //!
-//! `CallKind::Method` 只说明调用来自方言 method 协议；这里进一步把 callee 的唯一
-//! `GetTableKind::Method` reaching-def、receiver 首参和 raw key 配成一个完整协议。最终
-//! HIR 是否仍可删除 producer，由 simplify 在所有形状与生命周期改写收敛后另行证明。
-//! TAILCALL 同样保留 setup 双端身份，但不签发返回当前帧后的旧 callee 根接管。
-//! callee 槽的旧值消费 Dataflow 的覆盖身份；这里只收紧同块协议边界，不重扫定义与 open 写。
+//! 参数跨分支后，顺序 lowering 的 method 提示可能已失效；唯一 reaching-def、
+//! 同一 receiver 首参和原 key 仍可证明配对。协议不授权删除准备值，完整帧消费者
+//! 继续验证实际求值顺序、槽位与生命周期；TAILCALL 不签发返回后的旧 callee 根交接。
 
 use super::lower::ProtoBindings;
 use crate::hir::promotion::ProtoPromotionFacts;
@@ -30,7 +28,7 @@ pub(super) fn record_method_setup_protocols(
                 }
                 _ => return None,
             };
-            if kind != CallKind::Method {
+            if matches!(kind, CallKind::FastCall(_)) {
                 return None;
             }
             let call_ref = crate::transformer::InstrRef(index);
@@ -54,7 +52,7 @@ pub(super) fn record_method_setup_protocols(
             };
             if get.kind != crate::transformer::GetTableKind::Method
                 || get.dst != callee
-                || method_name?.const_ref != method_key
+                || method_name.is_some_and(|hint| hint.const_ref != method_key)
                 || dataflow.use_value(get_ref, receiver) != dataflow.use_value(call_ref, first_arg)
                 || dataflow
                     .def_phi_uses
@@ -97,20 +95,36 @@ pub(super) fn record_method_setup_protocols(
             let RawLiteralConst::String(raw_key) = proto.constants.get(method_key.index())? else {
                 return None;
             };
+            // SELF 的参数 COPY 可在提升前消失；保留原 receiver 的 SSA 值来源，
+            // 后层不能把已退休的 COPY Def 当成 receiver local 的 producer。
+            let receiver_temp =
+                match dataflow.canonical_move_value(dataflow.use_value(get_ref, receiver)) {
+                    Some(SsaValue::Def(def)) => bindings.fixed_temps.get(def.index()).copied(),
+                    _ => None,
+                };
             Some((
                 call_ref,
                 get_ref,
                 bindings.fixed_temps[result_def.index()],
+                receiver_temp,
                 prior_callee_root_temp,
                 crate::LuaString::from_raw(raw_key),
             ))
         })
         .for_each(
-            |(call_ref, get_ref, callee_temp, prior_callee_root_temp, method_key)| {
+            |(
+                call_ref,
+                get_ref,
+                callee_temp,
+                receiver_temp,
+                prior_callee_root_temp,
+                method_key,
+            )| {
                 facts.record_method_setup_protocol(
                     call_ref,
                     get_ref,
                     callee_temp,
+                    receiver_temp,
                     prior_callee_root_temp,
                     method_key,
                 );

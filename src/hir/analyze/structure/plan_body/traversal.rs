@@ -221,6 +221,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         outer.push(HirStmt::Repeat(Box::new(HirRepeat {
                             body: self.finish_emission(region, prefix)?,
                             cond: HirExpr::Boolean(true),
+                            preserves_condition: false,
                             lifetime: Default::default(),
                         })));
                         prefix = outer;
@@ -271,6 +272,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                         outer.push(HirStmt::Repeat(Box::new(HirRepeat {
                             body: self.finish_emission(region, prefix)?,
                             cond: HirExpr::Boolean(true),
+                            preserves_condition: false,
                             lifetime: Default::default(),
                         })));
                         prefix = outer;

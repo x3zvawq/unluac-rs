@@ -213,6 +213,7 @@ impl<'a> AstLowerer<'a> {
         proto_index: usize,
         assign: &HirAssign,
     ) -> Result<Vec<AstStmt>, AstLowerError> {
+        let function_declaration = assign.luau_function_declaration;
         let preserve_parallel_nil = assign.preserves_parallel_nil();
         let assign = AstAssign {
             targets: assign
@@ -229,6 +230,28 @@ impl<'a> AstLowerer<'a> {
             luau_compound_global: assign.luau_compound_global,
             method_rewrite_transaction: assign.method_rewrite_transaction,
         };
+        if function_declaration {
+            if self.target.version == DecompileDialect::Luau
+                && let ([AstLValue::FieldAccess(target)], [AstExpr::FunctionExpr(function)]) =
+                    (assign.targets.as_slice(), assign.values.as_slice())
+                && let AstExpr::Var(root @ AstNameRef::Global(_)) = &target.base
+            {
+                return Ok(vec![AstStmt::FunctionDecl(Box::new(
+                    crate::ast::AstFunctionDecl {
+                        target: crate::ast::AstFunctionName::Plain(crate::ast::AstNamePath {
+                            root: root.clone(),
+                            fields: vec![target.field.clone()],
+                        }),
+                        global_declaration: false,
+                        func: function.as_ref().clone(),
+                    },
+                ))]);
+            }
+            return Err(AstLowerError::ResidualHir {
+                proto: proto_index,
+                kind: "invalid function declaration frame",
+            });
+        }
         if assign.luau_compound_global {
             if self.target.version != DecompileDialect::Luau {
                 return Err(AstLowerError::UnsupportedFeature {

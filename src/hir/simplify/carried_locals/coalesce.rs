@@ -10,7 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hir::common::{
-    HirAssign, HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, LocalId, TempId,
+    HirAssign, HirBinding, HirBlock, HirCallExpr, HirExpr, HirLValue, HirProto, HirStmt, LocalId,
+    TempId,
 };
 use crate::hir::expr_safety::HirExprSafety;
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
@@ -31,6 +32,7 @@ pub(super) fn coalesce_disjoint_temps(
     facts: &mut ProtoPromotionFacts,
     identity: &HandoffIdentityFacts,
     safety: HirExprSafety,
+    dialect: crate::decompile::DecompileDialect,
 ) -> bool {
     let mut blocked = BTreeSet::new();
     for binding in identity
@@ -45,14 +47,12 @@ pub(super) fn coalesce_disjoint_temps(
         };
         blocked.extend(homes.iter().copied());
     }
-    for &local in identity.debug.iter().chain(&identity.for_bindings) {
-        blocked.extend(facts.complete_local_home_slots(local).iter().copied());
-    }
     let mut groups = BTreeMap::<HomeSlotKey, Vec<CarryBinding>>::new();
     // 值决策折叠后，根块中已有声明与后续同槽逻辑更新可能各自提升为 Local。
     // 更新不必紧邻或读取旧值；声明仍支配整个根块后缀，旧快照能否共存由下方
     // 整图干扰证明判断。不把声明前的 Temp 归入后置 owner，也不删除原初始化。
     let mut local_updates = BTreeMap::new();
+    let mut definition_preserving_updates = BTreeSet::new();
     let mut empty_carried = BTreeSet::new();
     let mut initialized_owners = BTreeMap::new();
     let mut copy_owners = BTreeMap::new();
@@ -71,11 +71,27 @@ pub(super) fn coalesce_disjoint_temps(
                     let HirStmt::LocalDecl(decl) = child else {
                         return;
                     };
-                    let ([target], [HirExpr::LocalRef(source)], None) = (
+                    let ([target], [value], None) = (
                         decl.bindings.as_slice(),
                         decl.values.fixed.as_slice(),
                         &decl.values.tail,
                     ) else {
+                        return;
+                    };
+                    if let HirExpr::TableAccess(access) = value
+                        && decl.initializer_merge_transaction.is_none()
+                        && let Some(home) = facts.trusted_local_home_slot(*target)
+                        && let Some(&seed) = copy_owners.get(&home)
+                        && facts.table_read_result_local(access) == Some(*target)
+                        && facts.table_read_result_home(access) == Some(home)
+                        && seed != *target
+                    {
+                        // 原 GETTABLE 覆盖根块中已声明的 carrier；保留计算位置，
+                        // 只恢复这次写回身份。旧值快照与协议干扰继续由整图证明排除。
+                        local_updates.insert(*target, (seed, home));
+                        definition_preserving_updates.insert(*target);
+                    }
+                    let HirExpr::LocalRef(source) = value else {
                         return;
                     };
                     if decl.initializer_merge_transaction.is_none()
@@ -148,6 +164,62 @@ pub(super) fn coalesce_disjoint_temps(
         {
             local_updates.insert(*target, (seed, home));
         }
+    }
+    // 子块中的 seed 同样支配其词法后缀；for 的 iterator 准备可夹在 seed
+    // 与 carrier COPY 之间，因此不能只识别相邻声明。只收集本块已声明的同槽
+    // 身份，捕获、协议及旧值快照仍交给下面统一的整图证明。
+    let mut scoped_updates = Vec::new();
+    let mut scoped_temps = BTreeMap::new();
+    let mut phi_inputs = BTreeSet::new();
+    let mut literal_writes = BTreeSet::new();
+    let temp_reads = collect_temp_reads_in_proto(proto);
+    ScopedCarrierDeclarations {
+        facts,
+        updates: &mut scoped_updates,
+        temp_owners: &mut scoped_temps,
+        phi_inputs: &mut phi_inputs,
+        literal_writes: &mut literal_writes,
+        candidate: |seed, target, empty| {
+            if carrier_locals.contains(&target)
+                && let Some(home) = facts.trusted_local_home_slot(seed)
+                && facts.trusted_local_home_slot(target) == Some(home)
+            {
+                local_updates.insert(target, (seed, home));
+                if empty {
+                    empty_carried.insert(target);
+                }
+            }
+        },
+    }
+    .block(&proto.body, &mut BTreeMap::new());
+    // Boolean initializer 的入口写由完整值帧消费；不能先接到前一代 local，
+    // 否则它会反过来阻止前一帧退休其 scratch 声明。
+    let mut pending_value_locals = BTreeSet::new();
+    for (initial, _, _, _) in facts.boolean_value_prewrites() {
+        literal_writes.remove(&initial);
+        pending_value_locals.extend(facts.promoted_local_for_temp(initial));
+    }
+    // PUC/JIT 回调还可经 debug.setlocal 改写非捕获值；显式写分析不覆盖该入口。
+    let inert = (dialect == crate::decompile::DecompileDialect::Luau
+        && (scoped_updates.iter().any(|&(_, _, inert_only)| inert_only)
+            || literal_writes.iter().any(|temp| {
+                !temp_reads.contains(temp) && scoped_temps.get(temp).is_some_and(Option::is_some)
+            })))
+    .then(|| super::super::object_flow::gc_inert_bindings(proto, safety));
+    for (seed, target, inert_only) in scoped_updates {
+        // 低槽 COPY 合并可能改变后续临时帧覆盖的根；只有两代都是非资源值时，
+        // 才能在保留原写入的前提下交给普通活跃性证明。
+        if inert_only
+            && (pending_value_locals.contains(&target)
+                || !inert.as_ref().is_some_and(|bindings| {
+                    bindings.contains(&HirBinding::Local(seed))
+                        && bindings.contains(&HirBinding::Local(target))
+                }))
+        {
+            continue;
+        }
+        local_updates.insert(target, (seed, facts.trusted_local_home_slot(seed).unwrap()));
+        definition_preserving_updates.insert(target);
     }
     // 入口直线声明支配后面的整个函数体，可作为跨 goto carrier 的词法 owner。
     // Temp 只认回此前缀中的 owner。根块逻辑更新的 Local 交接另行收集；loop-carrier
@@ -245,18 +317,72 @@ pub(super) fn coalesce_disjoint_temps(
         }
         local_only_homes.insert(home);
     }
-    let local_groups = groups
+    // 显式 phi 写回将循环/分支 Temp 连到既有声明；同槽本身不构成身份。
+    // 每次读写都必须处于同一声明的词法后缀，随后仍由整图活跃性排除快照干扰。
+    let mut definition_preserving_temps = BTreeSet::new();
+    for (temp, owner) in scoped_temps {
+        let Some(owner) = owner else { continue };
+        let inert_write = literal_writes.contains(&temp)
+            && !temp_reads.contains(&temp)
+            && inert.as_ref().is_some_and(|bindings| {
+                bindings.contains(&HirBinding::Temp(temp))
+                    && bindings.contains(&HirBinding::Local(owner))
+            });
+        if !phi_inputs.contains(&temp) && !inert_write {
+            continue;
+        }
+        let home = facts.trusted_local_home_slot(owner).unwrap();
+        let group = groups
+            .entry(home)
+            .or_insert_with(|| vec![CarryBinding::Local(owner)]);
+        if group.first() == Some(&CarryBinding::Local(owner)) {
+            group.push(CarryBinding::Temp(temp));
+            definition_preserving_temps.insert(temp);
+            local_only_homes.insert(home);
+        } else {
+            blocked.insert(home);
+        }
+    }
+    let scoped_groups = groups
         .iter()
-        // 纯 Local 的逻辑更新和 COPY 交接都只合并组内身份。此前 CALL 的参数 Def
-        // 即使曾使用同一槽，也不随本次改写退休；协议屏障应按成员而非槽号扩散。
         .filter(|(home, _)| local_only_homes.contains(home))
-        .map(|(&home, group)| {
-            (
-                home,
-                group.iter().filter_map(|binding| binding.local()).collect(),
-            )
+        .map(|(&home, group)| (home, group.iter().copied().collect::<BTreeSet<_>>()))
+        .collect::<BTreeMap<_, _>>();
+    for &local in identity.debug.iter().chain(&identity.for_bindings) {
+        // 源码身份只保护候选成员；已退出的 for/debug 声明复用同槽，不应封锁
+        // 另一组 Local 的归并。引用捕获/TBC 的 may-alias 保护仍按整个 home 生效。
+        block_binding_homes(
+            CarryBinding::Local(local),
+            facts,
+            &scoped_groups,
+            &mut blocked,
+        );
+    }
+    // ByValue 捕获也冻结来源身份；合并后的后续写会迫使 Lua 编译器改成引用
+    // 捕获，使旧闭包观察新值。GC-inert 只证明值域，不能替代这份快照义务。
+    for &binding in &identity.value_captured {
+        block_binding_homes(binding, facts, &scoped_groups, &mut blocked);
+    }
+    // 原 GETTABLE 写回和合流空声明都只认回已声明 carrier；不移除实际定义或
+    // 求值，按 source/Def 索引的准备协议仍有效。空声明的首次有效写另经 CFG 验证。
+    let definition_preserving_homes = scoped_groups
+        .iter()
+        .filter_map(|(&home, locals)| {
+            (locals.len() > 1
+                && locals
+                    .iter()
+                    .filter(|local| groups[&home].first() != Some(*local))
+                    .all(|binding| match binding {
+                        CarryBinding::Local(local) => {
+                            definition_preserving_updates.contains(local)
+                                || empty_carried.contains(local)
+                        }
+                        CarryBinding::Temp(temp) => definition_preserving_temps.contains(temp),
+                        CarryBinding::Param(_) => false,
+                    }))
+            .then_some(home)
         })
-        .collect::<BTreeMap<_, BTreeSet<_>>>();
+        .collect::<BTreeSet<_>>();
     let retained_entry_local = |local| {
         facts.trusted_local_home_slot(local).is_some_and(|home| {
             groups
@@ -264,12 +390,27 @@ pub(super) fn coalesce_disjoint_temps(
                 .is_some_and(|bindings| bindings.first() == Some(&CarryBinding::Local(local)))
         })
     };
+
     for &binding in &identity.preserved {
+        if let CarryBinding::Temp(temp) = binding
+            && facts
+                .promoted_local_for_temp(temp)
+                .and_then(|local| facts.trusted_local_home_slot(local))
+                .is_some_and(|home| definition_preserving_homes.contains(&home))
+            && matches!(proto.inline_dispositions.temp(temp),
+                crate::hir::common::HirInlineDisposition::Preserve(reasons)
+                if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix))
+        {
+            continue;
+        }
         if let CarryBinding::Local(local) = binding
-            && retained_entry_local(local)
+            && (retained_entry_local(local)
+                || facts
+                    .trusted_local_home_slot(local)
+                    .is_some_and(|home| definition_preserving_homes.contains(&home)))
             && facts
                 .trusted_local_home_slot(local)
-                .is_some_and(|home| local_groups.contains_key(&home))
+                .is_some_and(|home| scoped_groups.contains_key(&home))
             && matches!(proto.inline_dispositions.local(local),
                 crate::hir::common::HirInlineDisposition::Preserve(reasons)
                 if reasons.iter().all(|reason| *reason == crate::hir::common::HirInlineRetentionReason::PhysicalFramePrefix))
@@ -277,16 +418,19 @@ pub(super) fn coalesce_disjoint_temps(
             // owner 的声明及原槽保持不动，后续同槽 COPY 不破坏前缀保留义务。
             continue;
         }
-        block_binding_homes(binding, facts, &local_groups, &mut blocked);
+        block_binding_homes(binding, facts, &scoped_groups, &mut blocked);
     }
+
     visit::visit_proto(
         proto,
         &mut ProtocolHomes {
             facts,
-            local_groups: &local_groups,
+            scoped_groups: &scoped_groups,
+            definition_preserving_homes: &definition_preserving_homes,
             blocked: &mut blocked,
         },
     );
+
     for &binding in &identity.physical_roots {
         let local = match binding {
             CarryBinding::Local(local) => Some(local),
@@ -294,7 +438,10 @@ pub(super) fn coalesce_disjoint_temps(
             CarryBinding::Param(_) => None,
         };
         if local.is_some_and(|local| {
-            retained_entry_local(local)
+            (retained_entry_local(local)
+                || facts
+                    .trusted_local_home_slot(local)
+                    .is_some_and(|home| definition_preserving_homes.contains(&home)))
                 && binding_home_slot(binding, facts) == facts.trusted_local_home_slot(local)
         }) {
             // 候选接受[RootOwnerPreserved]：入口声明、初始化及 root 标记均留在原处；
@@ -302,26 +449,37 @@ pub(super) fn coalesce_disjoint_temps(
             // 快照与新值同时被读取，不能把任意物理根移入另一个 carrier。
             continue;
         }
-        block_binding_homes(binding, facts, &local_groups, &mut blocked);
+        block_binding_homes(binding, facts, &scoped_groups, &mut blocked);
     }
+
     for temp in (0..proto.temp_count).map(TempId) {
-        // scope-end producer 已提升为保留的入口 local 时，合并只让后续 phi 写回
-        // 该 owner，原 root 声明仍在。不能让不再出现的旧 temp 身份封锁整个 home。
+        // scope-end producer 或 COPY 的旧根已提升为保留的入口 local 时，
+        // 合并只让同槽 phi 写回该 owner，原声明与覆盖点均不动；不能让已退出
+        // HIR 的旧 Temp 身份封锁整个 home。其它 endpoint 仍是根生命周期屏障。
         let retained_root = facts
             .promoted_local_for_temp(temp)
             .is_some_and(retained_entry_local);
-        if (facts.is_scope_end_copy_root_temp(temp) && !retained_root)
-            || facts.is_copy_root_endpoint(temp, |_| true)
+        if (facts.is_scope_end_copy_root_temp(temp) || facts.is_copy_root_endpoint(temp, |_| true))
+            && !retained_root
+            && !facts
+                .trusted_temp_home_slot(temp)
+                .is_some_and(|home| definition_preserving_homes.contains(&home))
             || proto
                 .temp_debug_locals
                 .get(temp.index())
                 .is_some_and(Option::is_some)
         {
-            block_binding_homes(CarryBinding::Temp(temp), facts, &local_groups, &mut blocked);
+            block_binding_homes(
+                CarryBinding::Temp(temp),
+                facts,
+                &scoped_groups,
+                &mut blocked,
+            );
         }
     }
+
     // 无读者的写入留给 dead-temps；吸收到活跃 carrier 会使它们失去独立死写身份。
-    for temp in collect_temp_reads_in_proto(proto) {
+    for temp in temp_reads {
         if let Some(home) = facts.trusted_temp_home_slot(temp)
             && !blocked.contains(&home)
             && !local_only_homes.contains(&home)
@@ -381,6 +539,7 @@ pub(super) fn coalesce_disjoint_temps(
             event
         })
         .collect::<Vec<_>>();
+
     graph.solve_backward(BTreeSet::new(), union_bindings, |id, _, live| {
         let event = &events[id.index()];
         for &local in &event.empty_carried {
@@ -449,6 +608,18 @@ pub(super) fn coalesce_disjoint_temps(
             }
         }
     }
+    local_bindings.extend(rewrites.iter().filter_map(|(source, target)| {
+        if let (CarryBinding::Temp(temp), CarryBinding::Local(local)) = (*source, *target) {
+            Some((temp, local))
+        } else {
+            None
+        }
+    }));
+    merged.retain(|temp| {
+        !facts
+            .trusted_temp_home_slot(*temp)
+            .is_some_and(|home| definition_preserving_homes.contains(&home))
+    });
     facts.retire_coalesced_definition_facts(&merged);
     // 独占 producer 的证书须退休，原 Def 落在哪个 Local 的身份映射则随改写保留。
     // 完整帧仍按具体 source site、值版本和写域验证，不能把身份合并误作原操作消失。
@@ -476,6 +647,157 @@ pub(super) fn coalesce_disjoint_temps(
             promotion_facts: facts,
         },
     )
+}
+
+struct ScopedCarrierDeclarations<'a, F> {
+    facts: &'a ProtoPromotionFacts,
+    updates: &'a mut Vec<(LocalId, LocalId, bool)>,
+    temp_owners: &'a mut BTreeMap<TempId, Option<LocalId>>,
+    phi_inputs: &'a mut BTreeSet<TempId>,
+    literal_writes: &'a mut BTreeSet<TempId>,
+    candidate: F,
+}
+
+impl<F: FnMut(LocalId, LocalId, bool)> ScopedCarrierDeclarations<'_, F> {
+    fn block(&mut self, block: &HirBlock, owners: &mut BTreeMap<HomeSlotKey, LocalId>) {
+        let mut previous = Vec::new();
+        for stmt in &block.stmts {
+            let mut touches = BTreeSet::new();
+            visit::visit_stmt_header(
+                stmt,
+                &mut BindingReadCollector(|binding| {
+                    if let crate::hir::common::HirBinding::Temp(temp) = binding {
+                        touches.insert(temp);
+                    }
+                }),
+            );
+            visit::visit_stmt_header(
+                stmt,
+                &mut BindingWriteCollector(|binding| {
+                    if let crate::hir::common::HirBinding::Temp(temp) = binding {
+                        touches.insert(temp);
+                    }
+                }),
+            );
+            for temp in touches {
+                let owner = self
+                    .facts
+                    .trusted_temp_home_slot(temp)
+                    .and_then(|home| owners.get(&home).copied());
+                self.temp_owners
+                    .entry(temp)
+                    .and_modify(|old| {
+                        if *old != owner {
+                            *old = None;
+                        }
+                    })
+                    .or_insert(owner);
+            }
+            if let HirStmt::Assign(assign) = stmt
+                && assign.is_phi_transfer
+                && assign.values.tail.is_none()
+            {
+                for (target, value) in assign.targets.iter().zip(&assign.values.fixed) {
+                    if let (HirLValue::Local(local), HirExpr::TempRef(temp)) = (target, value)
+                        && self
+                            .facts
+                            .trusted_local_home_slot(*local)
+                            .is_some_and(|home| {
+                                self.facts.trusted_temp_home_slot(*temp) == Some(home)
+                                    && owners.get(&home) == Some(local)
+                            })
+                    {
+                        self.phi_inputs.insert(*temp);
+                    }
+                }
+            }
+            // 原低槽未读标量覆盖仍须发出；两代值都 GC-inert 时可认回已有
+            // owner，保留写入位置。其它无读 Temp 留给源码帧恢复独立声明。
+            if let Some((temp, HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_))) =
+                stmt.scalar_temp_assignment()
+            {
+                self.literal_writes.insert(temp);
+            }
+            if let HirStmt::LocalDecl(decl) = stmt
+                && decl.initializer_merge_transaction.is_none()
+            {
+                if let ([target], [HirExpr::LocalRef(source)], None) = (
+                    decl.bindings.as_slice(),
+                    decl.values.fixed.as_slice(),
+                    &decl.values.tail,
+                ) && self
+                    .facts
+                    .trusted_local_home_slot(*source)
+                    .is_some_and(|home| owners.get(&home) == Some(source))
+                {
+                    (self.candidate)(*source, *target, false);
+                }
+                if let ([target], [value], None) = (
+                    decl.bindings.as_slice(),
+                    decl.values.fixed.as_slice(),
+                    &decl.values.tail,
+                ) && let Some(home) = self.facts.trusted_local_home_slot(*target)
+                    && let Some(&seed) = owners.get(&home)
+                    && seed != *target
+                {
+                    let high_copy = matches!(value, HirExpr::LocalRef(source)
+                        if self.facts.trusted_local_home_slot(*source)
+                            .is_some_and(|input| input.slot() > home.slot()));
+                    let binding_copy = matches!(value, HirExpr::LocalRef(_) | HirExpr::ParamRef(_));
+                    let mut reads_seed = false;
+                    if matches!(value, HirExpr::LogicalAnd(_) | HirExpr::LogicalOr(_)) {
+                        visit::visit_expr(
+                            value,
+                            &mut BindingReadCollector(|binding| {
+                                reads_seed |=
+                                    binding == crate::hir::common::HirBinding::Local(seed);
+                            }),
+                        );
+                    }
+                    let literal = matches!(
+                        value,
+                        HirExpr::Boolean(_)
+                            | HirExpr::Integer(_)
+                            | HirExpr::Number(_)
+                            | HirExpr::String(_)
+                    );
+                    if binding_copy || reads_seed || literal {
+                        self.updates
+                            .push((seed, *target, !high_copy && !reads_seed));
+                    }
+                }
+                for &target in &decl.bindings {
+                    let Some(home) = self.facts.trusted_local_home_slot(target) else {
+                        continue;
+                    };
+                    if decl.values.is_empty() {
+                        if let Some(&seed) = owners.get(&home) {
+                            (self.candidate)(seed, target, true);
+                        }
+                    } else {
+                        previous.push((home, owners.insert(home, target)));
+                    }
+                }
+            }
+            if let HirStmt::LocalRootRelease(local) = stmt
+                && let Some(home) = self.facts.trusted_local_home_slot(*local)
+            {
+                previous.push((home, owners.remove(&home)));
+            }
+            if matches!(stmt, HirStmt::Goto(_) | HirStmt::Label(_)) {
+                break;
+            }
+            visit::for_each_nested_block(stmt, &mut |child| self.block(child, owners));
+        }
+        // 外层声明支配子块，兄弟分支的局部 owner 则不能沿 DFS 泄漏。
+        for (home, old) in previous.into_iter().rev() {
+            if let Some(local) = old {
+                owners.insert(home, local);
+            } else {
+                owners.remove(&home);
+            }
+        }
+    }
 }
 
 struct AdjacentCarrierSeeds<F>(F);
@@ -543,6 +865,7 @@ fn restore_local_update_assignments(
             && let Some(&CarryBinding::Local(target)) = rewrites.get(&CarryBinding::Local(*local))
         {
             *stmt = HirStmt::Assign(Box::new(HirAssign {
+                luau_function_declaration: false,
                 luau_compound_global: false,
                 upvalue_write_source: None,
                 is_phi_transfer: false,
@@ -678,7 +1001,7 @@ fn prune_entry_carrier_seeds(
 fn block_binding_homes(
     binding: CarryBinding,
     facts: &ProtoPromotionFacts,
-    local_groups: &BTreeMap<HomeSlotKey, BTreeSet<LocalId>>,
+    scoped_groups: &BTreeMap<HomeSlotKey, BTreeSet<CarryBinding>>,
     blocked: &mut BTreeSet<HomeSlotKey>,
 ) {
     let (homes, local) = match binding {
@@ -690,24 +1013,34 @@ fn block_binding_homes(
         ),
     };
     blocked.extend(homes.iter().copied().filter(|home| {
-        local_groups
-            .get(home)
-            .is_none_or(|group| local.is_some_and(|local| group.contains(&local)))
+        scoped_groups.get(home).is_none_or(|group| {
+            group.contains(&binding)
+                || local.is_some_and(|local| group.contains(&CarryBinding::Local(local)))
+        })
     }));
 }
 
 struct ProtocolHomes<'a> {
     facts: &'a ProtoPromotionFacts,
-    local_groups: &'a BTreeMap<HomeSlotKey, BTreeSet<LocalId>>,
+    scoped_groups: &'a BTreeMap<HomeSlotKey, BTreeSet<CarryBinding>>,
+    definition_preserving_homes: &'a BTreeSet<HomeSlotKey>,
     blocked: &'a mut BTreeSet<HomeSlotKey>,
 }
 
 impl ProtocolHomes<'_> {
     fn protect(&mut self, temp: TempId) {
+        if self
+            .facts
+            .promoted_local_for_temp(temp)
+            .and_then(|local| self.facts.trusted_local_home_slot(local))
+            .is_some_and(|home| self.definition_preserving_homes.contains(&home))
+        {
+            return;
+        }
         block_binding_homes(
             CarryBinding::Temp(temp),
             self.facts,
-            self.local_groups,
+            self.scoped_groups,
             self.blocked,
         );
     }
@@ -744,16 +1077,12 @@ impl HirVisitor<'_> for ProtocolHomes<'_> {
             visit::visit_stmts(
                 std::slice::from_ref(stmt),
                 &mut BindingReadCollector(|binding| {
-                    let homes = match binding {
-                        crate::hir::common::HirBinding::Temp(temp) => {
-                            self.facts.complete_temp_home_slots(temp)
-                        }
-                        crate::hir::common::HirBinding::Local(local) => {
-                            self.facts.complete_local_home_slots(local)
-                        }
-                        _ => return,
-                    };
-                    self.blocked.extend(homes.iter().copied());
+                    if let Some(binding) = carry_binding_from_capture(binding)
+                        && binding_home_slot(binding, self.facts)
+                            .is_none_or(|home| !self.definition_preserving_homes.contains(&home))
+                    {
+                        block_binding_homes(binding, self.facts, self.scoped_groups, self.blocked);
+                    }
                 }),
             );
         }

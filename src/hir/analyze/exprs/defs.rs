@@ -329,7 +329,7 @@ fn expr_for_fixed_call(
         return None;
     }
 
-    let method_key = lower_method_key(lowering, call.method_name);
+    let method_key = lower_method_key(lowering, instr_ref, call.method_name);
     let callee = expr_for_reg_use_single_eval_with_call_policy(
         lowering,
         block,
@@ -348,13 +348,13 @@ fn expr_for_fixed_call(
         frame_root_ends: lowering.promotion_facts.call_frame_root_ends(instr_ref),
         callee,
         args: lower_value_pack_single_eval(lowering, block, instr_ref, call.args),
-        method: matches!(call.kind, CallKind::Method).into(),
+        method: lower_call_method(lowering, instr_ref, call.kind),
         fastcall: match call.kind {
             CallKind::FastCall(args) => Some(args),
             CallKind::Normal | CallKind::Method => None,
         },
         method_key,
-        callee_root_handoff: lower_call_root_handoff(lowering, instr_ref, call.kind),
+        callee_root_handoff: lower_call_root_handoff(lowering, instr_ref),
         method_rewrite_transaction: None,
         plain_method_syntax: false,
         boolean_prewrite_arguments: Vec::new(),

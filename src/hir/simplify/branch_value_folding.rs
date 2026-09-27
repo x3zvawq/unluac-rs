@@ -73,6 +73,69 @@ struct BranchValuePass<'a> {
 
 impl HirRewritePass for BranchValuePass<'_> {
     fn rewrite_block(&mut self, block: &mut HirBlock) -> bool {
+        let mut parameter_changed = false;
+        for stmt in &mut block.stmts {
+            let HirStmt::If(branch) = stmt else { continue };
+            if branch.preserves_empty_test {
+                continue;
+            }
+            let [HirStmt::Assign(truthy)] = branch.then_block.stmts.as_slice() else {
+                continue;
+            };
+            let Some(falsy) = branch.else_block.as_ref() else {
+                continue;
+            };
+            let [HirStmt::Assign(falsy)] = falsy.stmts.as_slice() else {
+                continue;
+            };
+            let [HirLValue::Param(param)] = truthy.targets.as_slice() else {
+                continue;
+            };
+            if falsy.targets != truthy.targets
+                || [truthy, falsy].iter().any(|assign| {
+                    assign.initializer_merge_transaction.is_some()
+                        || assign.generic_for_initializer_producer.is_some()
+                        || assign.generic_for_dispatch_release.is_some()
+                        || assign.method_rewrite_transaction.is_some()
+                        || assign.parallel_nil_frame.is_some()
+                })
+            {
+                continue;
+            }
+            let ([yes], [no], None, None) = (
+                truthy.values.fixed.as_slice(),
+                falsy.values.fixed.as_slice(),
+                &truthy.values.tail,
+                &falsy.values.tail,
+            ) else {
+                continue;
+            };
+            // 参数声明已存在；纯字面量分支仍在同一槽覆盖，不改变条件读取或根窗口。
+            // 有求值的 RHS 需要调用帧证明，不能借选值形状移动其 scratch 写入。
+            if ![yes, no].iter().all(|value| {
+                matches!(
+                    value,
+                    HirExpr::Boolean(_) | HirExpr::Integer(_) | HirExpr::Number(_)
+                )
+            }) {
+                continue;
+            }
+            let Some(value) = finalize_branch_value_targets(
+                &branch.cond,
+                HirDecisionTarget::Expr(yes.clone()),
+                HirDecisionTarget::Expr(no.clone()),
+                self.safety,
+            ) else {
+                continue;
+            };
+            *stmt = HirStmt::Assign(Box::new(HirAssign {
+                luau_function_declaration: false,
+                targets: vec![HirLValue::Param(*param)],
+                values: HirValuePack::fixed(vec![value]),
+                ..truthy.as_ref().clone()
+            }));
+            parameter_changed = true;
+        }
         let goto_changed =
             fold_branch_value_goto_labels_in_block(&mut block.stmts, self.label_refs);
         let nil_decision_changed = fold_nil_fallback_decision_locals_in_block(
@@ -87,7 +150,11 @@ impl HirRewritePass for BranchValuePass<'_> {
             self.local_scope_facts,
             self.safety,
         );
-        goto_changed || nil_decision_changed || nil_fallback_changed || local_changed
+        parameter_changed
+            || goto_changed
+            || nil_decision_changed
+            || nil_fallback_changed
+            || local_changed
     }
 }
 
@@ -178,9 +245,11 @@ fn fold_nil_fallback_decision_locals_in_block(
             index + 1,
             HirStmt::If(Box::new(HirIf {
                 preserves_empty_test: false,
+                preserves_arm_order: false,
                 cond: nil_check_for_local(rewrite.target),
                 then_block: HirBlock {
                     stmts: vec![HirStmt::Assign(Box::new(HirAssign {
+                        luau_function_declaration: false,
                         luau_compound_global: false,
                         upvalue_write_source: None,
                         is_phi_transfer: false,
@@ -314,6 +383,48 @@ fn collapsible_bound_assignment(
     let [HirStmt::Assign(truthy)] = if_.then_block.stmts.as_slice() else {
         return None;
     };
+    if if_.else_block.is_none()
+        && let Some(binding @ BranchValueBinding::Local(local)) = single_assign_binding(truthy)
+        && let Some(value) = single_assign_value(truthy, binding)
+        && matches!(
+            value,
+            HirExpr::Nil
+                | HirExpr::Boolean(_)
+                | HirExpr::Integer(_)
+                | HirExpr::Number(_)
+                | HirExpr::String(_)
+        )
+        && truthy.initializer_merge_transaction.is_none()
+        && truthy.generic_for_initializer_producer.is_none()
+        && truthy.generic_for_dispatch_release.is_none()
+        && truthy.method_rewrite_transaction.is_none()
+    {
+        let (subject, is_or) = match &if_.cond {
+            HirExpr::LocalRef(target) if *target == local => (&if_.cond, false),
+            HirExpr::Unary(unary)
+                if unary.op == crate::hir::HirUnaryOpKind::Not
+                    && unary.expr == HirExpr::LocalRef(local) =>
+            {
+                (&unary.expr, true)
+            }
+            _ => return None,
+        };
+        // 未选中的边沿用同一 binding；字面量末写没有额外求值或 root 观察点。
+        // TEST 与选中路径的覆盖均保留，不按结果是否被读取删除这次检查。
+        let logical = Box::new(crate::hir::HirLogicalExpr {
+            preserves_boolean_prewrite: false,
+            lhs: subject.clone(),
+            rhs: value.clone(),
+        });
+        return Some(assign_binding_value(
+            binding,
+            if is_or {
+                HirExpr::LogicalOr(logical)
+            } else {
+                HirExpr::LogicalAnd(logical)
+            },
+        ));
+    }
     let [HirStmt::Assign(falsy)] = if_.else_block.as_ref()?.stmts.as_slice() else {
         return None;
     };
@@ -518,6 +629,7 @@ fn fold_nil_fallback_alias_locals_in_block(
         }));
         stmts[index + 1] = HirStmt::If(Box::new(HirIf {
             preserves_empty_test: false,
+            preserves_arm_order: false,
             cond: nil_check_for_local(rewrite.target),
             then_block: rewrite.then_block,
             else_block: None,
@@ -1232,6 +1344,7 @@ fn single_assign_binding(assign: &HirAssign) -> Option<BranchValueBinding> {
 
 fn assign_binding_value(binding: BranchValueBinding, value: HirExpr) -> HirStmt {
     HirStmt::Assign(Box::new(HirAssign {
+        luau_function_declaration: false,
         luau_compound_global: false,
         upvalue_write_source: None,
         is_phi_transfer: false,

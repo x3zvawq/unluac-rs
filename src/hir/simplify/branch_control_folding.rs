@@ -719,11 +719,18 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt, safety: HirExprSafet
     let HirStmt::If(outer) = tail else {
         return false;
     };
-    if !matches!(outer.then_block.stmts.as_slice(), [HirStmt::Break]) {
+    let inverted = outer.then_block.stmts.is_empty()
+        && outer
+            .else_block
+            .as_ref()
+            .is_some_and(|block| matches!(block.stmts.as_slice(), [HirStmt::Break]));
+    if !inverted && !matches!(outer.then_block.stmts.as_slice(), [HirStmt::Break]) {
         return false;
     }
 
-    let (nested_else, moved_cond) = if let Some(else_block) = &outer.else_block {
+    let (nested_else, moved_cond) = if inverted {
+        (false, &outer.cond)
+    } else if let Some(else_block) = &outer.else_block {
         let [HirStmt::If(nested)] = else_block.stmts.as_slice() else {
             return false;
         };
@@ -757,8 +764,22 @@ fn fold_trailing_repeat_break_condition(stmt: &mut HirStmt, safety: HirExprSafet
         let Some(HirStmt::If(guard)) = repeat_stmt.body.stmts.pop() else {
             unreachable!("validated repeat tail must remain an if");
         };
-        guard.cond
+        if inverted {
+            // 尾部出口允许两种极性；只在消费 repeat 条件时转换，避免留到
+            // AST 翻转后使再编译在尾 guard 与短路 latch 之间往返。
+            match guard.cond {
+                HirExpr::Unary(unary)
+                    if unary.op == HirUnaryOpKind::Not && unary.source_site.is_none() =>
+                {
+                    unary.expr
+                }
+                cond => cond.negate(),
+            }
+        } else {
+            guard.cond
+        }
     };
+    repeat_stmt.preserves_condition = true;
     let rhs = std::mem::replace(&mut repeat_stmt.cond, HirExpr::Boolean(false));
     let folded = HirExpr::LogicalOr(Box::new(HirLogicalExpr {
         preserves_boolean_prewrite: false,
@@ -960,7 +981,7 @@ fn naturalize_if_polarity(stmt: &mut HirStmt) -> bool {
     }
 
     let [positive, negative] = condition_not_costs(&if_stmt.cond);
-    if negative < positive {
+    if negative < positive && !if_stmt.preserves_arm_order {
         if_stmt.cond =
             normalize_condition_context(std::mem::replace(&mut if_stmt.cond, HirExpr::Nil), true);
         std::mem::swap(&mut if_stmt.then_block, else_block);
@@ -1353,6 +1374,7 @@ fn fold_same_target_goto_guards(stmts: &mut Vec<HirStmt>) -> bool {
                     preserves_boolean_prewrite: false,
                 }));
                 previous.preserves_empty_test |= next.preserves_empty_test;
+                previous.preserves_arm_order |= next.preserves_arm_order;
                 changed = true;
                 continue;
             }

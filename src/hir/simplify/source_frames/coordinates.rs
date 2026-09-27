@@ -88,3 +88,27 @@ pub(in crate::hir::simplify) fn compact(
         !removed[index]
     });
 }
+
+/// 各词法 owner 的排他末端；repeat 条件仍属于 body，须包含其额外坐标。
+pub(in crate::hir::simplify) fn owner_ends(block: &HirBlock, count: usize) -> Vec<usize> {
+    fn scan(block: &HirBlock, cursor: &mut usize, ends: &mut [usize]) {
+        let owner = *cursor;
+        for stmt in &block.stmts {
+            *cursor += 1;
+            if let HirStmt::Repeat(repeat) = stmt {
+                let body_owner = *cursor;
+                scan(&repeat.body, cursor, ends);
+                *cursor += 1;
+                ends[body_owner] = *cursor;
+            } else {
+                for_each_nested_block(stmt, &mut |child| scan(child, cursor, ends));
+            }
+        }
+        if owner < ends.len() {
+            ends[owner] = *cursor;
+        }
+    }
+    let mut ends = vec![0; count];
+    scan(block, &mut 0, &mut ends);
+    ends
+}

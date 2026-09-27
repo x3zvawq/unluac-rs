@@ -50,6 +50,8 @@ pub(super) fn constant_comparisons(
         if builder.expr(&call.callee, 0, frame.home.slot(), None, true, false, Some(frame.callee))? != call.callee
             || !context.callee_aliases.accepts(&call.callee) { return None; }
         let mut plan = Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: index, sink: index, base: frame.home, values: vec![HirExpr::Call(Box::new(call.clone()))].into(),
             result_locals: Vec::new(), discarded_result: None, assignment_targets: Vec::new(),
             luau_compound_global: false, indexed_target: None, continuing_root: None,
@@ -617,6 +619,7 @@ pub(super) fn preserve_updates(proto: &mut HirProto, facts: &mut ProtoPromotionF
             })));
         } else {
             statements.push(HirStmt::Assign(Box::new(HirAssign {
+                luau_function_declaration: false,
                 luau_compound_global: false,
                 upvalue_write_source: None,
                 is_phi_transfer: false,

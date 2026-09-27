@@ -20,13 +20,58 @@ use crate::hir::common::{
     HirBinding, HirBlock, HirInlineRetentionReason, HirLValue, HirProto, HirStmt, LocalId, TempId,
 };
 use crate::hir::promotion::{HomeSlotKey, ProtoPromotionFacts};
-use crate::hir::simplify::mention::BindingReadCollector;
+use crate::hir::simplify::mention::{BindingReadCollector, BindingWriteCollector};
 use crate::hir::visit::{HirVisitor, visit_stmts};
 
 pub(super) mod coordinates;
 mod materializations;
-pub(super) use materializations::close_gc_inert_terminal_prefix;
-pub(super) use materializations::{pending_nil_prefix_temps, restore_materializations};
+pub(super) use materializations::{close_gc_inert_terminal_prefix, indexed_assignment_frame};
+pub(super) use materializations::{
+    pending_nil_prefix_temps, restore_materializations, restore_split_nil_declarations,
+};
+
+/// 臂首原 CALL 及其准备写均位于条件输入之上时，该输入仍占据声明前缀。
+/// 只检查连续准备区；任何低槽写或控制结构都会结束本次证明。
+pub(super) fn branch_entry_requires_prefix(
+    branch: &crate::hir::common::HirIf,
+    home: HomeSlotKey,
+    facts: &ProtoPromotionFacts,
+) -> bool {
+    std::iter::once(&branch.then_block)
+        .chain(branch.else_block.as_ref())
+        .any(|block| {
+            for stmt in &block.stmts {
+                let (call, target) = match stmt {
+                    HirStmt::CallStmt(stmt) => (Some(&stmt.call), None),
+                    _ => {
+                        let Some((binding, value)) = super::call_frames::scalar_binding(stmt)
+                        else {
+                            return false;
+                        };
+                        let target = match binding {
+                            HirBinding::Temp(temp) => facts.trusted_temp_home_slot(temp),
+                            HirBinding::Local(local) => facts.trusted_local_home_slot(local),
+                            _ => None,
+                        };
+                        let call = match value {
+                            crate::hir::common::HirExpr::Call(call) => Some(call.as_ref()),
+                            _ => None,
+                        };
+                        (call, target)
+                    }
+                };
+                if let Some(call) = call {
+                    return facts
+                        .native_call_layout(call)
+                        .is_some_and(|frame| frame.home.slot() > home.slot());
+                }
+                if target.is_none_or(|target| target.slot() <= home.slot()) {
+                    return false;
+                }
+            }
+            false
+        })
+}
 
 /// 候选除原 freereg 外，还可要求特定低槽身份在开始前已声明；不能借后缀新声明替代。
 pub(super) struct PrefixRequest {
@@ -38,7 +83,9 @@ pub(super) struct PrefixRequest {
 /// 例如循环体内的错位帧不阻止退出该作用域后验证外层帧。消费者撤回计划后仍须
 /// 重建预览并整批验证，不能把这个快照中的其它成功请求直接当作提交许可。
 /// 区间覆盖本次请求窗口；扫描可能在最后请求处结束，不用于查询任意后续坐标。
+#[derive(Debug)]
 pub(super) struct PrefixFailures {
+    dependent_owners: BTreeSet<usize>,
     rejected: BTreeMap<usize, usize>,
     invalid_from: Option<usize>,
 }
@@ -46,6 +93,7 @@ pub(super) struct PrefixFailures {
 impl PrefixFailures {
     pub(super) fn invalid_from(index: usize) -> Self {
         Self {
+            dependent_owners: BTreeSet::new(),
             rejected: BTreeMap::new(),
             invalid_from: Some(index),
         }
@@ -57,16 +105,25 @@ impl PrefixFailures {
             .map(|(&start, _)| start)
             .into_iter()
             .chain(self.invalid_from)
+            .chain(self.dependent_owners.iter().copied())
             .min()
             .expect("prefix failure contains a rejected request or invalid suffix")
     }
 
     pub(super) fn rejects(&self, start: usize) -> bool {
-        self.rejected
-            .range(..=start)
-            .next_back()
-            .is_some_and(|(_, &end)| start < end)
+        self.dependent_owners.contains(&start)
+            || self
+                .rejected
+                .range(..=start)
+                .next_back()
+                .is_some_and(|(_, &end)| start < end)
             || self.invalid_from.is_some_and(|index| start >= index)
+    }
+
+    /// 声明恢复只依赖实际使用其前缀的请求；兄弟作用域的失败不能扩散到整个 DFS 后缀。
+    pub(super) fn with_dependent_owners(mut self, owners: impl IntoIterator<Item = usize>) -> Self {
+        self.dependent_owners.extend(owners);
+        self
     }
 
     /// 后缀帧属于更早的根退休事务时，将其失败归回该 owner，不能局部接受依赖链。
@@ -252,15 +309,42 @@ pub(super) fn validate_prefixes(
             header_slots += 1;
         }
     }
-    let mut read_temps = BTreeSet::new();
-    visit_stmts(
-        &proto.body.stmts,
-        &mut BindingReadCollector(|binding| {
-            if let HirBinding::Temp(temp) = binding {
-                read_temps.insert(temp);
+    struct GlobalKeys<'a> {
+        facts: &'a ProtoPromotionFacts,
+        keys: BTreeMap<TempId, crate::LuaString>,
+        reads: BTreeSet<TempId>,
+    }
+    impl HirVisitor<'_> for GlobalKeys<'_> {
+        fn visit_expr(&mut self, expr: &crate::hir::common::HirExpr) {
+            match expr {
+                crate::hir::common::HirExpr::GlobalRef(global) => {
+                    if let Some(temp) = self.facts.global_read_key_preparation(global) {
+                        self.keys.insert(temp, global.key.clone());
+                    }
+                }
+                crate::hir::common::HirExpr::TempRef(temp) => {
+                    self.reads.insert(*temp);
+                }
+                _ => {}
             }
-        }),
-    );
+        }
+    }
+    let mut global_keys = GlobalKeys {
+        facts,
+        keys: BTreeMap::new(),
+        reads: BTreeSet::new(),
+    };
+    coordinates::visit(&proto.body, &mut 0, &mut |index, kind, stmt| {
+        if kind == coordinates::PointKind::Statement && removed.get(index) == Some(&false) {
+            crate::hir::visit::visit_stmt_header(stmt, &mut global_keys);
+        }
+    });
+    global_keys.keys.retain(|temp, _| {
+        !global_keys.reads.contains(temp)
+            && proto.temp_debug_locals[temp.index()].is_none()
+            && proto.temp_debug_scopes[temp.index()].is_none()
+    });
+    let temp_scopes = TemporaryScopes::new(&proto.body, removed);
     let mut scan = PrefixScan {
         facts,
         removed,
@@ -275,7 +359,8 @@ pub(super) fn validate_prefixes(
         rejected: BTreeMap::new(),
         scope_rejected: None,
         unproven_prefix: false,
-        read_temps,
+        temp_scopes,
+        global_keys: global_keys.keys,
         scan_suffix,
     };
     let invalid_from = scan.block(&proto.body).err();
@@ -292,11 +377,146 @@ pub(super) fn validate_prefixes(
             }
         }
         Err(PrefixFailures {
+            dependent_owners: BTreeSet::new(),
             rejected,
             invalid_from,
         })
     } else {
         Ok(scan.preserved)
+    }
+}
+
+/// Temp 尚未物化时，只污染其所有读写的最小公共词法作用域。
+/// 用倍增祖先求 LCA，避免深层输入反复向根扫描；每轮改写后重新建立索引。
+struct TemporaryScopes {
+    shared: BTreeSet<usize>,
+}
+
+impl TemporaryScopes {
+    fn new(body: &HirBlock, removed: &[bool]) -> Self {
+        struct Scope {
+            entry: usize,
+            depth: usize,
+            ancestors: Vec<usize>,
+        }
+        struct Builder<'a> {
+            removed: &'a [bool],
+            scopes: Vec<Scope>,
+            owners: BTreeMap<TempId, usize>,
+            first: BTreeMap<TempId, (usize, usize)>,
+            shared: BTreeSet<TempId>,
+            cursor: usize,
+        }
+        impl Builder<'_> {
+            fn ancestor(&self, scope: usize, power: usize) -> usize {
+                self.scopes[scope]
+                    .ancestors
+                    .get(power)
+                    .copied()
+                    .unwrap_or(0)
+            }
+            fn common(&self, mut left: usize, mut right: usize) -> usize {
+                if self.scopes[left].depth < self.scopes[right].depth {
+                    std::mem::swap(&mut left, &mut right);
+                }
+                let difference = self.scopes[left].depth - self.scopes[right].depth;
+                for power in 0..usize::BITS as usize {
+                    if difference & (1usize << power) != 0 {
+                        left = self.ancestor(left, power);
+                    }
+                }
+                if left == right {
+                    return left;
+                }
+                for power in (0..self.scopes[left].ancestors.len()).rev() {
+                    let a = self.ancestor(left, power);
+                    let b = self.ancestor(right, power);
+                    if a != b {
+                        left = a;
+                        right = b;
+                    }
+                }
+                self.ancestor(left, 0)
+            }
+            fn block(&mut self, block: &HirBlock, parent: Option<usize>, entry: usize) {
+                let scope = self.scopes.len();
+                let depth = parent.map_or(0, |parent| self.scopes[parent].depth + 1);
+                let mut ancestors = vec![parent.unwrap_or(0)];
+                let mut power = 1;
+                while (1usize << power) <= depth {
+                    ancestors.push(self.ancestor(ancestors[power - 1], power - 1));
+                    power += 1;
+                }
+                self.scopes.push(Scope {
+                    entry,
+                    depth,
+                    ancestors,
+                });
+                for stmt in &block.stmts {
+                    let statement = self.cursor;
+                    self.cursor += 1;
+                    if self.removed.get(statement) == Some(&true) {
+                        crate::hir::visit::for_each_nested_block(stmt, &mut |child| {
+                            coordinates::visit(child, &mut self.cursor, &mut |_, _, _| {})
+                        });
+                        self.cursor += usize::from(matches!(stmt, HirStmt::Repeat(_)));
+                        continue;
+                    }
+                    let mut record = |binding| {
+                        if let HirBinding::Temp(temp) = binding {
+                            self.first.entry(temp).or_insert((scope, statement));
+                            let owner = self.owners.get(&temp).copied();
+                            let merged = owner.map_or(scope, |owner| self.common(owner, scope));
+                            if owner.is_some_and(|owner| owner != scope) {
+                                self.shared.insert(temp);
+                            }
+                            self.owners.insert(temp, merged);
+                        }
+                    };
+                    crate::hir::visit::visit_stmt_header(
+                        stmt,
+                        &mut BindingReadCollector(&mut record),
+                    );
+                    crate::hir::visit::visit_stmt_header(
+                        stmt,
+                        &mut BindingWriteCollector(&mut record),
+                    );
+                    crate::hir::visit::for_each_nested_block(stmt, &mut |child| {
+                        self.block(child, Some(scope), statement)
+                    });
+                    self.cursor += usize::from(matches!(stmt, HirStmt::Repeat(_)));
+                }
+            }
+        }
+        let mut builder = Builder {
+            removed,
+            scopes: Vec::new(),
+            owners: BTreeMap::new(),
+            first: BTreeMap::new(),
+            shared: BTreeSet::new(),
+            cursor: 0,
+        };
+        builder.block(body, None, 0);
+        Self {
+            shared: builder
+                .shared
+                .iter()
+                .map(|temp| {
+                    let owner = builder.owners[temp];
+                    let (mut first, statement) = builder.first[temp];
+                    if first == owner {
+                        return statement;
+                    }
+                    let distance = builder.scopes[first].depth - builder.scopes[owner].depth - 1;
+                    for power in 0..usize::BITS as usize {
+                        if distance & (1usize << power) != 0 {
+                            first = builder.ancestor(first, power);
+                        }
+                    }
+                    builder.scopes[first].entry
+                })
+                .collect(),
+        }
     }
 }
 
@@ -314,7 +534,8 @@ struct PrefixScan<'a> {
     rejected: BTreeMap<usize, usize>,
     scope_rejected: Option<usize>,
     unproven_prefix: bool,
-    read_temps: BTreeSet<TempId>,
+    temp_scopes: TemporaryScopes,
+    global_keys: BTreeMap<TempId, crate::LuaString>,
     scan_suffix: bool,
 }
 
@@ -362,6 +583,7 @@ impl PrefixScan<'_> {
             }
             let index = self.cursor;
             self.cursor += 1;
+            self.unproven_prefix |= self.temp_scopes.shared.contains(&index);
             if !self.check_request(index) {
                 self.scope_rejected.get_or_insert(index);
             }
@@ -412,8 +634,11 @@ impl PrefixScan<'_> {
                 continue;
             }
             let mut has_temp = false;
+
             let mut reads = BindingReadCollector(|binding| {
-                has_temp |= matches!(binding, HirBinding::Temp(_));
+                if let HirBinding::Temp(_) = binding {
+                    has_temp = true;
+                }
             });
             if matches!(
                 stmt,
@@ -426,16 +651,23 @@ impl PrefixScan<'_> {
             } else {
                 visit_stmts(std::slice::from_ref(stmt), &mut reads);
             }
-            if has_temp {
-                return Err(index);
-            }
+
+            // 同块 Temp 的最终声明尚未知，只阻止该作用域内的候选；退出子块后，
+            // 不把它错误传播为外层后缀的未知前缀。跨块使用仍须先恢复身份。
+            self.unproven_prefix |= has_temp;
             match stmt {
                 HirStmt::LocalDecl(decl) => {
                     for &local in &decl.bindings {
                         let slot = self.header_slots + self.locals.len();
                         if !self.declared.insert(local) {
-                            return Err(index);
+                            // 同一身份重复声明使当前候选无效，但不会改变父块的声明栈。
+                            // 记录本块失败并占住未证明的源码槽，继续收集独立兄弟块的请求。
+                            self.scope_rejected.get_or_insert(index);
+                            self.unproven_prefix = true;
+                            self.locals.push(None);
+                            continue;
                         }
+
                         self.unproven_prefix |= self
                             .facts
                             .trusted_local_home_slot(local)
@@ -450,15 +682,15 @@ impl PrefixScan<'_> {
                 HirStmt::NumericFor(for_) => {
                     let frame = self.facts.numeric_for_body_frame(for_).ok_or(index)?;
                     let loop_start = self.locals.len();
+                    let loop_unproven = self.unproven_prefix;
                     for &home in &frame.controls[..frame.controls_len] {
-                        if home.slot() != self.header_slots + self.locals.len() {
-                            return Err(index);
-                        }
+                        self.unproven_prefix |=
+                            home.slot() != self.header_slots + self.locals.len();
                         self.locals.push(None);
                     }
-                    if frame.binding_slot != self.header_slots + self.locals.len()
-                        || !self.declared.insert(for_.binding)
-                    {
+                    self.unproven_prefix |=
+                        frame.binding_slot != self.header_slots + self.locals.len();
+                    if !self.declared.insert(for_.binding) {
                         return Err(index);
                     }
                     if !self.preserved.contains(&for_.binding) {
@@ -467,20 +699,21 @@ impl PrefixScan<'_> {
                     self.locals.push(Some(for_.binding));
                     self.block(&for_.body)?;
                     self.leave_scope(loop_start);
+                    self.unproven_prefix = loop_unproven;
                 }
                 HirStmt::GenericFor(for_) => {
                     let frame = self.facts.generic_for_body_frame(for_).ok_or(index)?;
                     let loop_start = self.locals.len();
+                    let loop_unproven = self.unproven_prefix;
                     for &home in &frame.controls {
-                        if home.slot() != self.header_slots + self.locals.len() {
-                            return Err(index);
-                        }
+                        self.unproven_prefix |=
+                            home.slot() != self.header_slots + self.locals.len();
                         self.locals.push(None);
                     }
                     for (&local, &home) in for_.bindings.iter().zip(&frame.bindings) {
-                        if home.slot() != self.header_slots + self.locals.len()
-                            || !self.declared.insert(local)
-                        {
+                        self.unproven_prefix |=
+                            home.slot() != self.header_slots + self.locals.len();
+                        if !self.declared.insert(local) {
                             return Err(index);
                         }
                         if !self.preserved.contains(&local) {
@@ -492,6 +725,7 @@ impl PrefixScan<'_> {
                         .extend(std::iter::repeat_n(None, frame.binding_padding));
                     self.block(&for_.body)?;
                     self.leave_scope(loop_start);
+                    self.unproven_prefix = loop_unproven;
                 }
                 HirStmt::If(if_) => {
                     self.block(&if_.then_block)?;
@@ -506,18 +740,30 @@ impl PrefixScan<'_> {
                 }
                 HirStmt::Assign(assign)
                     if assign.targets.iter().all(|target| match target {
-                        HirLValue::Temp(temp) => !self.read_temps.contains(temp),
+                        HirLValue::Temp(_) => true,
                         HirLValue::Local(local) => self.declared.contains(local),
                         _ => true,
                     }) =>
                 {
-                    // 无读取或捕获的 Temp 不会为后续使用跨块提升声明，因此未知
-                    // 占槽只影响当前词法作用域。读取集合覆盖最后一个帧请求之后，
-                    // 防止提前结束扫描而漏掉后缀逃逸；有使用的 Temp 仍拒绝整个后缀。
-                    self.unproven_prefix |= assign
-                        .targets
-                        .iter()
-                        .any(|target| matches!(target, HirLValue::Temp(_)));
+                    // 全函数 use/write scope 分析包含请求窗口之后的读取；只有不跨块
+                    // 的 Temp 才能把未知声明效果限制在当前词法作用域。
+                    // 环境读取已拥有这个确切的字符串 key；它不会再产生独立源码声明。
+                    // 仍被显式读取或带 debug 身份的 Temp 不借用该许可。
+                    let represented_key =
+                        stmt.scalar_temp_assignment().is_some_and(|(temp, value)| {
+                            matches!(value, crate::hir::common::HirExpr::String(key)
+                            if self.global_keys.get(&temp) == Some(key))
+                        });
+                    self.unproven_prefix |= !represented_key
+                        && assign
+                            .targets
+                            .iter()
+                            .any(|target| matches!(target, HirLValue::Temp(_)));
+                }
+                HirStmt::TableSetList(_) => {
+                    // 残余批次尚未获得完整源码帧；它的临时声明影响当前块后缀，
+                    // 不影响兄弟作用域。不能把尚待恢复的 SETLIST 当成跨块未知身份。
+                    self.unproven_prefix = true;
                 }
                 HirStmt::GlobalDecl(_)
                 | HirStmt::CallStmt(_)

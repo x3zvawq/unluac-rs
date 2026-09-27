@@ -204,6 +204,7 @@ pub(in crate::hir::simplify) fn restore(
             .map_or(prepared_proto, |(proto, _)| proto);
         let draft = branch_arguments(scalar_proto, facts);
         let proto = draft.as_ref().map_or(scalar_proto, |(proto, _)| proto);
+
         // 根候选仍不跨控制边界取输入；提交与普通帧统一使用共享 DFS 坐标。
         if proto.body.stmts.iter().any(|stmt| {
             !matches!(
@@ -264,7 +265,9 @@ pub(in crate::hir::simplify) fn restore(
         }
         let restrictions = frame_restrictions(proto, facts);
         let context = NativeFrameContext {
+            rk_literals: None,
             expanded_callees: Some(&callees),
+            retired_roots: None,
             proto,
             barred: &restrictions.barred,
             closed: &restrictions.closed,
@@ -443,6 +446,7 @@ pub(in crate::hir::simplify) fn restore(
                     if binary.source_site.is_some_and(|site| captured_updates.contains(&site)))
             }));
         }
+
         let Some(first) = first else {
             continue;
         };
@@ -602,23 +606,30 @@ fn branch_arguments(
     proto: &HirProto,
     facts: &ProtoPromotionFacts,
 ) -> Option<(HirProto, Vec<(usize, usize)>)> {
-    let mut reads = BTreeMap::<LocalId, usize>::new();
+    let mut reads = BTreeMap::<LocalId, Vec<usize>>::new();
+    let mut definitions = BTreeMap::<LocalId, Vec<usize>>::new();
     let mut write_counts = BTreeMap::<LocalId, usize>::new();
-    visit_stmts(
-        &proto.body.stmts,
-        &mut (
-            BindingReadCollector(|binding| {
-                if let HirBinding::Local(local) = binding {
-                    *reads.entry(local).or_default() += 1;
-                }
-            }),
-            BindingWriteCollector(|binding| {
-                if let HirBinding::Local(local) = binding {
-                    *write_counts.entry(local).or_default() += 1;
-                }
-            }),
-        ),
-    );
+    for (index, stmt) in proto.body.stmts.iter().enumerate() {
+        visit_stmts(
+            std::slice::from_ref(stmt),
+            &mut (
+                BindingReadCollector(|binding| {
+                    if let HirBinding::Local(local) = binding {
+                        reads.entry(local).or_default().push(index);
+                    }
+                }),
+                BindingWriteCollector(|binding| {
+                    if let HirBinding::Local(local) = binding {
+                        *write_counts.entry(local).or_default() += 1;
+                    }
+                }),
+            ),
+        );
+        // 只有根块上的无条件定义才结束旧值；分支内的单臂写不能截断后缀读取。
+        if let Some((local, _)) = scalar_local(stmt) {
+            definitions.entry(local).or_default().push(index);
+        }
+    }
     let original_nil = facts
         .nil_write_groups()
         .flatten()
@@ -669,6 +680,25 @@ fn branch_arguments(
             let initial_local = facts.promoted_local_for_temp(prewrite.initial)?;
             let initial = *writes.get(&initial_local)?;
             let (value, branch_writes) = branch_argument_value(branch, target, initial_local)?;
+            // 同一 Local 可承接多个原值版本；这里只统计预写至下一次覆盖之间的
+            // 读取，不能借更早/更晚版本的消费者拒绝本次唯一参数。索引在上方一次建立。
+            let end = definitions
+                .get(&target)
+                .and_then(|sites| {
+                    sites
+                        .get(sites.partition_point(|&site| site <= call_index))
+                        .copied()
+                })
+                .unwrap_or(proto.body.stmts.len());
+            let begin = if target == initial_local {
+                initial
+            } else {
+                index
+            };
+            let uses = reads.get(&target).map_or(0, |sites| {
+                sites.partition_point(|&site| site < end)
+                    - sites.partition_point(|&site| site < begin)
+            });
             if prewrite.initial_value
                 || !prewrite.reference_uncaptured
                 || facts.trusted_local_home_slot(initial_local) != Some(prewrite.home)
@@ -677,7 +707,7 @@ fn branch_arguments(
                     scalar_local(&proto.body.stmts[initial]),
                     Some((_, HirExpr::Boolean(false)))
                 )
-                || reads.get(&target) != Some(&1)
+                || uses != 1
                 || proto.local_debug_hints[target.index()].is_some()
                 || proto.local_debug_scopes[target.index()].is_some()
                 || proto.inline_dispositions.local(target).must_preserve()
@@ -826,6 +856,8 @@ fn standalone_initializer_frame(
             return None;
         }
         return Some(Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: index,
             sink: index,
             base: home,
@@ -887,6 +919,8 @@ fn standalone_initializer_frame(
         _ => return None,
     }
     Some(Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start: index,
         sink: index,
         base,
@@ -1181,6 +1215,8 @@ fn indexed_candidate<'a>(
     builder.finish_event(sink)?;
     Some((
         Plan {
+            prefix_at_sink: false,
+            luau_function_declaration: false,
             start: seed,
             sink,
             base,
@@ -1358,6 +1394,8 @@ fn invocation_plan(
 ) -> Plan {
     prepare_invocation(callee, &mut call, input);
     Plan {
+        prefix_at_sink: false,
+        luau_function_declaration: false,
         start,
         sink,
         base,

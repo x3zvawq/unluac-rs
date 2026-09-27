@@ -249,6 +249,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             stmts.push(HirStmt::Repeat(Box::new(HirRepeat {
                 body: self.finish_emission(region, loop_body)?,
                 cond: HirExpr::Boolean(false),
+                preserves_condition: false,
                 lifetime: Default::default(),
             })));
         } else {
@@ -402,6 +403,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
             let mut stmts = PlannedBlock::from(vec![HirStmt::Repeat(Box::new(HirRepeat {
                 body: self.finish_emission(region, body_stmts)?,
                 cond: exit_cond,
+                preserves_condition: true,
                 lifetime: Default::default(),
             }))]);
             if !final_stage.is_empty() {
@@ -432,6 +434,7 @@ impl<'a, 'b> PlanBodyLowerer<'a, 'b> {
                 HirRepeat {
                     body: self.finish_emission(region, body_stmts)?,
                     cond: HirExpr::Boolean(false),
+                    preserves_condition: false,
                     lifetime: Default::default(),
                 },
             ))]));
