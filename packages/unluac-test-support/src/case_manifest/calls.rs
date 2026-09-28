@@ -293,9 +293,15 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     ),
     LuaCaseDefinition::new(
         "tests/case_calls/method_06_method_chain_live_receiver.lua",
-        &["closure", "method-chain"],
-        "method sugar不能删除后续被done closure读取的button。",
-        &[LuaCaseConfiguration::new(PUC_LUA_51)],
+        &["closure", "method-chain", "constructor", "multiret"],
+        "保留活跃 receiver 身份，构造器参数不截断 SELF 链，延迟闭包和尾部数组保持求值顺序。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_calls/method_07_hint_open_arg_call.lua",

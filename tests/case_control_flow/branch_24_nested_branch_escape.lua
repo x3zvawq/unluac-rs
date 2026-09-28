@@ -62,3 +62,17 @@ for i = 0, 7 do
     assert(result == expected_result and trace == expected_trace)
     print("nested-escape-order", i, result, trace)
 end
+
+-- 已选短路两臂各自闭合后，不保留 single-pass 的作用域及结果交棒。
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[repeat]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[empty-local]] [[0]] [[@proto=2]]
+-- unluac: expect-ast-count [[local-binding]] [[3]] [[@proto=2]]
+-- unluac: expect-contains [[return result, trace]] [[@debug=retained]]
+
+-- debug 初始化应归属原声明，不能留下独立空声明和 CALL 中转。
+-- unluac: expect-contains [[local a =]] [[@debug=retained]]
+-- unluac: expect-contains [[local b = math.floor(]] [[@debug=retained]]
+-- unluac: expect-contains [[local result, trace = observed(]] [[@debug=retained]]
+-- 各臂的一次并列写回消费原准备槽，避免反序单写在回编译中交替出现。
+-- unluac: expect-ast-count [[assign]] [[4]] [[@proto=0]]

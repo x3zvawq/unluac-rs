@@ -1,8 +1,14 @@
--- 互斥同形读取合并保留全部原 GETTABLE 来源；不同 scratch 槽不能借一支许可。
+-- 两条原路径即使读取相同字段，也须保留各自的条件检查，不能变成 Boolean 中转链。
 -- unluac: expect-not-contains [[unresolved]]
 -- unluac: expect-not-contains [[unluac error]]
--- unluac: expect-not-contains [[if p1_0 then]]
--- unluac: expect-contains [[if p2_0 then]]
+-- unluac: expect-contains [[if p1_0 then]] [[@debug=stripped]]
+-- unluac: expect-contains [[if p2_0 then]] [[@debug=stripped]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]]
+-- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=2]] [[@debug=retained]]
+-- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@debug=stripped]]
+-- unluac: expect-not-contains [[not not]]
+-- unluac: expect-ast-count [[repeat]] [[2]]
+-- unluac: expect-contains [[local padding = 0]] [[@debug=retained]]
 local function matching(flag, box)
     repeat
         if flag then

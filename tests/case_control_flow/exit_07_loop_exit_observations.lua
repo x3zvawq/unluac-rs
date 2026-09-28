@@ -71,3 +71,29 @@ for mask = 0, 7 do
     assert(trace == want_trace)
     print("common_15#1", mask, value, trace)
 end
+
+-- numeric-for 的零次迭代保留初值；正常结束与提前 break 分别消费自己的状态。
+-- unluac: expect-ast-count [[goto]] [[0]]
+-- unluac: expect-ast-count [[label]] [[0]]
+local function choose(groups, count)
+    local selected = 0
+    local remaining = count
+    for i = 1, #groups do
+        selected = i
+        if remaining <= groups[i] then break end
+        remaining = remaining - groups[i]
+    end
+    return selected, remaining
+end
+local selections = {
+    { {}, 7, 0, 7 },
+    { { 2, 3, 4 }, 1, 1, 1 },
+    { { 2, 3, 4 }, 4, 2, 2 },
+    { { 2, 3, 4 }, 8, 3, 3 },
+    { { 2, 3, 4 }, 12, 3, 3 },
+}
+for _, selection in ipairs(selections) do
+    local selected, remaining = choose(selection[1], selection[2])
+    assert(selected == selection[3] and remaining == selection[4])
+    print("for exit state", selected, remaining)
+end

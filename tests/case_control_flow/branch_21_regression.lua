@@ -101,8 +101,28 @@ local function test_degenerate_guard(b)
     end
 end
 
+-- 原样例的两个函数不能只定义不执行；观察完整 lookup/CALL 链的实参和跳过路径。
+function GetHomelandMgr()
+    return { IsCommunityMember = tonumber }
+end
+function IsActivityOn(id)
+    return id == 936
+end
+
 test_shared_subjects()
 test_adjacent_sinks()
+f({ dwID = "2", SetTimer = print })
+f({ dwID = "0", SetTimer = error })
+f({ dwID = "none", SetTimer = error })
+repro({ dwID = "3", SetTimer = print })
+repro({ dwID = "0", SetTimer = error })
 test_self_assign()
 test_impure_or()
 test_degenerate_guard(true)
+
+-- 完整调用链不拆成 callee/字段/结果交棒；一般赋值分支不增加布尔选值壳。
+-- unluac: expect-count [[GetHomelandMgr().IsCommunityMember(]] [[2]]
+-- unluac: expect-not-contains [[(not (not ]]
+-- unluac: expect-count [[print("common_06_boolean_regression#3",]] [[1]]
+-- unluac: expect-count [[print("common_06_boolean_regression#4",]] [[1]]
+-- unluac: expect-contains [[local unused = 1]] [[@debug=retained]]

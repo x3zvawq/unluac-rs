@@ -25,6 +25,10 @@ local function append()
 end
 
 -- 显式快照必须始终写旧目标，不能跟随 RHS 更换的同名 cell。
+-- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=3]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=3]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=3]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-min [[local-decl]] [[1]] [[@proto=3]] [[@dialect=lua5.5]]
 local function explicit_snapshot()
     local chosen = target
     local index = #target + 1

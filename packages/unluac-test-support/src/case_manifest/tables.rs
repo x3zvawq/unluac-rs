@@ -218,8 +218,9 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
             "call-frame",
             "loop-carried",
             "eval-order",
+            "capture",
         ],
-        "循环携带绑定与列表 iterator 初始化共同恢复，保留字段读取顺序和列表值。",
+        "iterator 与分支 carrier 认回原 owner 后恢复列表初始化，保留动态左值读取顺序及后续同槽捕获。",
         &[
             LuaCaseConfiguration::new(ALL_DIALECTS),
             LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
@@ -273,14 +274,20 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_tables/order_02_table_constructor_field_order.lua",
         &["field-order", "metamethod", "snapshot"],
-        "pending整数key保持binding快照与元方法求值顺序。",
-        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
+        "构造器保留字段与一元/二元求值顺序、嵌套调用和开放尾宽度，以及复用槽的值版本、分支前缀与 receiver 交接。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/setlist_03_table_setlist_trailing_short_circuit.lua",
         &["setlist", "short-circuit"],
-        "SETLIST尾部短路producer折回构造器且false转0。",
-        &[LuaCaseConfiguration::new(LUA_51_AND_LUAU)],
+        "SETLIST 的尾部及中间短路值共享构造事务，保留条件调用顺序、元素宽度与真假选择。",
+        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/setlist_04_table_setlist_nested_producer.lua",
@@ -468,8 +475,8 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_tables/setlist_10_open_constructor_multiple_setlists.lua",
         &["multi-return", "open-constructor", "setlist", "wide-table"],
-        "验证固定SETLIST批次之后的最终开放批次仍折叠成单个table constructor。",
-        &[LuaCaseConfiguration::new(&[LuaCaseDialect::Lua54])],
+        "跨批 SETLIST 与开放尾恢复为构造器，验证宽记录数组越过 RK 边界后仍保留字段加载。",
+        &[LuaCaseConfiguration::new(ALL_DIALECTS)],
     ),
     LuaCaseDefinition::new(
         "tests/case_tables/capacity_01_indexed_array_capacity.lua",

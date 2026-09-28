@@ -71,4 +71,8 @@ local function run(a, b, c, xs)
     return x
 end
 
-print("regress_112_luau_continue_merge_state_owner#1", run(true, true, false, {}))
+-- 正常退出的尾部定义必须先于结果合流；提前 break 则绕过这份 tail。
+local normal = run(true, true, false, {})
+local early = run(true, false, false, {[0] = true})
+assert(normal == 0 and early == 0)
+print("regress_112_luau_continue_merge_state_owner#1", normal, early)

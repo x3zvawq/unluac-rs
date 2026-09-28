@@ -6,7 +6,8 @@
 -- unluac: expect-not-contains [[unluac error]]
 -- unluac: expect-contains [[r1_0 = r1_0 + 1]]
 -- unluac: expect-contains [[local r0_0]]
--- unluac: expect-contains [[local r0_3 = r0_0]]
+-- 循环退出后直接观察原状态，不为合流结果额外复制一个 local。
+-- unluac: expect-contains [[assert(r0_0 == 4)]]
 local x = 0
 while true do
     if x == 1 then

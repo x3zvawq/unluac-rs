@@ -72,12 +72,53 @@ for enabled = 0, 1 do
 end
 
 -- unluac: expect-not-contains [[goto ]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]]
--- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]]
--- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=1]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=9]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=2]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[if]] [[0]] [[@proto=8]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=4]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=6]] [[@dialect=luajit]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.1]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.2]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.3]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.4]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=lua5.5]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=luau]]
+-- unluac: expect-ast-count [[call]] [[1]] [[@proto=5]] [[@dialect=luajit]]
 -- Luau 的原返回帧直接承接短路值，不应逐轮增加 flag 的局部转交。
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=1]] [[@dialect=luau]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=2]] [[@dialect=luau]]
 -- unluac: expect-ast-count [[local-binding]] [[1]] [[@proto=3]] [[@dialect=luau]]
 -- unluac: expect-ast-count [[local-binding]] [[0]] [[@proto=4]] [[@dialect=luau]]
+
+-- 参数写回的 phi 已经是 ParamRef，内嵌比较仍须在原消费点替换一次。
+local function comparison_writeback(value, x, y)
+    value = x < y
+    value = value and 1 or 0
+    return value
+end
+for x = 0, 2 do
+    for y = 0, 2 do
+        local actual = comparison_writeback("old", x, y)
+        assert(actual == (x < y and 1 or 0))
+        print("parameter operand", x, y, actual)
+    end
+end
+-- unluac: expect-not-contains [[unluac error]]
+-- unluac: expect-contains [[value = x < y]] [[@debug=retained]]
+-- unluac: expect-contains [[value = value and 1 or 0]] [[@debug=retained]]

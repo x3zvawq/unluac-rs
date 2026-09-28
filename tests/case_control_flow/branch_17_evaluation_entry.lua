@@ -2,6 +2,7 @@
 -- unluac: expect-ast-min [[numeric-for]] [[1]]
 -- unluac: expect-ast-count [[numeric-for]] [[7]]
 -- unluac: expect-ast-min [[if]] [[1]]
+-- unluac: expect-ast-count [[do-block]] [[0]] [[@proto=2]]
 local weak = setmetatable({}, {__mode = "v"})
 local calls = 0
 local left_reads = 0
@@ -26,6 +27,7 @@ setmetatable(_G, {__index = function(_, key)
         return weak[1]
     end
 end})
+assert(condition_entry_unmatched == nil)
 local function nested_call()
     for index = make(), 1, 1 do error("entered") end
     do

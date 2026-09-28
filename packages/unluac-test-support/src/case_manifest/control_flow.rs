@@ -1326,10 +1326,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_15_luau_alternative_read_sources.lua",
         &["alternative", "lookup-count", "scratch"],
-        "互斥同形GETTABLE可合并，scratch不同则必须保留if。",
+        "互斥GETTABLE保留各自原检查，控制Decision不引入Boolean中转，原repeat条件不按单次包装删除。",
         &[
             LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
                 luau_optimization_level: Some(0),
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY).with_options(LuaCaseOptions {
+                luau_optimization_level: Some(0),
+                retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -1381,9 +1388,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["comparison", "evaluation-order", "gc", "numeric-for"],
         "七种if条件操作数在跳过数值for及scope释放之后求值，覆盖嵌套call、全局、四类比较、参数和table key的entry准备。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_GE_54),
+            LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_GE_54).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -1484,18 +1495,28 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_19_shared_repeat_short_exit.lua",
         &["break", "exhaustive", "nested-repeat", "short-circuit"],
-        "共享入口的所有内层出口先汇入外层短路尾条件，完整枚举a/b/c/d四布尔量防止末叶归属错误。",
+        "共享入口的内层出口先汇入外层短路尾条件；普通 if/elseif 的共享 continuation 与臂内 return 分别保留。",
         &[
-            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS),
-            LuaCaseConfiguration::new(LUAU_ONLY).with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(LUAU_ONLY)
+                .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
+                .with_options(LuaCaseOptions {
+                    recompile_rounds: Some(3),
+                    ..LuaCaseOptions::DEFAULT
+                }),
             LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
             LuaCaseConfiguration::new(LUAU_ONLY)
                 .with_variants(LUAU_ALL_OPTIMIZATION_VARIANTS)
                 .with_options(LuaCaseOptions {
                     retain_debug: true,
+                    recompile_rounds: Some(3),
                     ..LuaCaseOptions::DEFAULT
                 }),
         ],
@@ -1544,7 +1565,17 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         "tests/case_control_flow/branch_21_regression.lua",
         &["degenerate-guard", "inline", "short-circuit", "side-effect"],
         "收纳共享主语、相邻sink、自赋值壳、副作用or和退化TEST guard五类已知布尔恢复回归。",
-        &[LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS)],
+        &[
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+            LuaCaseConfiguration::new(ALL_NON_LUAU_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
     ),
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_22_conditions.lua",
@@ -1605,7 +1636,7 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
         "tests/case_control_flow/branch_23_stale_transfer_requirement.lua",
         &["path-condition", "short-circuit", "exit-requirement"],
-        "HIR 删除矛盾分支后退役过期 goto 要求，Lua 5.1 Strict 仍生成可执行源码。",
+        "保留原矛盾条件及其分支，结构恢复的机械跳转不泄漏到 Lua 5.1 Strict 源码。",
         &[
             LuaCaseConfiguration::new(PUC_LUA_51),
             LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
@@ -1619,9 +1650,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["early-return", "short-circuit", "forward-guard"],
         "嵌套前导退出折入外层条件，八种布尔组合保留返回值与后继分支。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],
@@ -1631,9 +1666,13 @@ pub(super) const CASES: &[LuaCaseDefinition] = &[
         &["short-circuit", "forward-guard", "shared-tail"],
         "交替成功与失败 guard 保留条件选择及共同尾部的一次执行。",
         &[
-            LuaCaseConfiguration::new(PUC_LUA_51),
+            LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
+                recompile_rounds: Some(3),
+                ..LuaCaseOptions::DEFAULT
+            }),
             LuaCaseConfiguration::new(PUC_LUA_51).with_options(LuaCaseOptions {
                 retain_debug: true,
+                recompile_rounds: Some(3),
                 ..LuaCaseOptions::DEFAULT
             }),
         ],

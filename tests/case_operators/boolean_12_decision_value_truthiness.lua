@@ -1,5 +1,6 @@
 -- regress_48_decision_value_truthiness#1: value context 不能使用 condition-only truthiness 简化
--- unluac: expect-contains [[return not not p1_0]]
+-- 原 LOADBOOL true 后仍有 TEST，不能按常量值域消掉这次显式检查。
+-- unluac: expect-contains [[return p1_0 and true or false]]
 
 local function normalize(value)
     return (value and true) or false

@@ -11,6 +11,8 @@
 -- unluac: expect-contains [[return setmetatable({ value = number }, {]] [[@debug=retained]]
 -- unluac: expect-ast-count [[local-decl]] [[2]] [[@proto=5]] [[@dialect=lua5.4]]
 -- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=lua5.4]]
+-- Luau 循环头的 FASTCALL 和循环内的索引调用链共享原控制槽，只声明累加器。
+-- unluac: expect-ast-count [[local-decl]] [[1]] [[@proto=9]] [[@dialect=luau]]
 
 local events = {}
 
