@@ -1,6 +1,6 @@
 {
   "name": "unluac-web",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "private": true,
   "description": "Web interface for the unluac Lua decompiler.",
   "type": "module",
