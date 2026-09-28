@@ -1,16 +1,7 @@
-//! 固定寄存器的 canonical pruned SSA 构建。
+//! 构建固定寄存器的 canonical pruned SSA。
 //!
-//! 本文件消费 CFG、支配/DF 事实、真实 instruction use/must-def 与活跃集合，统一产出
-//! `Entry/Def/Phi` 身份、稀疏 block 快照、指令 use 和双向 use graph。它不识别
-//! branch/loop/short-circuit，也不决定 HIR lvalue；这些语义归属由 Structure/HIR 消费
-//! SSA 事实后完成。
-//! phi 放置与 rename 共享正式 Def 表及寄存器/指令索引，不另建 Reg 分组或复制身份配对。
-//! trivial phi 收敛后冻结直接值根；compact/remap 只查询该结果，不再次追踪替换图。
-//! use 索引完成后冻结 phi 分量与递归身份，后续短路/循环分析共享同一 canonical 图事实。
-//!
-//! 输入形状：两条分支分别写 r2，随后 merge 读取 r2。
-//! 输出形状：merge 上一个 pruned phi，读取点直接引用 `SsaValue::Phi`，两条 incoming
-//! 分别指向对应 `Def`，不再另跑 reaching-def 与 reaching-value 固定点。
+//! 消费 CFG、支配、指令读写和活跃集合，发布 Entry/Def/Phi、块快照及双向 use graph；
+//! 源码控制和绑定归属由 Structure/HIR 决定。
 
 use super::super::common::{InstrUseValues, PhiId, PhiIncoming, SsaRegMap, UseSite};
 use super::*;

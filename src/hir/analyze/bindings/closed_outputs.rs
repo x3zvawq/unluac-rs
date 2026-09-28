@@ -1,12 +1,6 @@
-//! 为已证明 CLOSE 窗口的低槽闭包输出接回原 nil 声明。
+//! 将 CLOSE 窗口的低槽闭包输出接回原 nil 声明。
 //!
-//! 窗口来自 capture owner，定义、读取和根区间来自 Dataflow，父级发射位置来自
-//! HirEmissionFacts。这里只分配绑定候选，不重建 CFG 或把高槽 CLOSURE scratch 合并到
-//! holder。省略 LOADNIL 的入口只消费原 Def 覆盖 Entry(nil) 的证明，不伪造初始化 Temp。
-//! 例如 `local f; do local x=1; f=function() return x end; x=2 end; use(f)`
-//! 的 f 保留在原 nil 位置，避免块外 Temp 在 AST 被提前到整个函数入口。
-//! 候选只覆盖向前 CFG 中的非循环单块窗口，且 holder 的最后定义一直保活到返回；
-//! 其它覆盖、Phi、捕获或源作用域仍由已有 owner 处理。
+//! 消费 capture 窗口、Dataflow 根事实与 HIR 发射位置，发布绑定候选，保留原初始化归属。
 
 use super::*;
 

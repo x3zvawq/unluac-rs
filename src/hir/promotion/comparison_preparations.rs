@@ -1,11 +1,6 @@
-//! 保存比较操作数树化前的一次原准备身份。
+//! 保留比较输入树化前的原准备写入身份。
 //!
-//! Dataflow 的比较 use→Def 证明哪次 GETUPVAL/字面量写入先于对侧普通 CALL 的准备。
-//! 例如 `captured == f()` 的 GETUPVAL r0 与 CALL r1，或 `1000 < tonumber(f())`
-//! 的 LOADI r0 与外层 CALL r1；内联成 UpvalueRef/字面量后不能再用值或槽号猜回该次写。
-//! 本模块只发布单用、同块、同 epoch 的准备证书；完整源码前缀和词法末端仍由
-//! source_frames 验证，不把准备写等同于提前释放旧对象。每条比较只查两个原 use，
-//! 不扫描后缀，也不按 UpvalueId 合并不同读取。
+//! 消费 Dataflow 的 use/Def、home 和 epoch，发布单次准备证书；完整源码前缀由帧 owner 验证。
 
 use crate::hir::common::TempId;
 use crate::structure::{Cfg, DataflowFacts, SsaValue};

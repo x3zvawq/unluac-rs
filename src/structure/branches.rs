@@ -1,15 +1,6 @@
-//! 这个文件实现共享分支候选提取。
+//! 从 CFG 与 GraphFacts 提取共享分支候选和区域事实。
 //!
-//! 它依赖 CFG/GraphFacts 已经提供好的 branch 边和后支配信息，负责回答
-//! “这个 block 更像哪种 branch 形态”，以及后续多个 pass 共用的 branch-region 事实。
-//! 它不会越权做短路、scope 或最终 HIR 结构决策。
-//!
-//! 例子：
-//! - `if cond then ... end` 会产出 `BranchKind::IfThen`
-//! - `if cond then ... else ... end` 会产出 `BranchKind::IfElse`
-//! - `if not cond then return end; ...` 这种守卫形状会被标成 `BranchKind::Guard`
-//! - loop 内嵌套 early return 把严格后支配点推到 synthetic exit 时，单臂归属
-//!   仍由 dominance frontier 的真实汇入关系证明，不直接猜 if/else
+//! 供短路、scope 和最终结构计划消费，不决定 HIR 语法。
 
 use std::collections::{BTreeMap, BTreeSet};
 

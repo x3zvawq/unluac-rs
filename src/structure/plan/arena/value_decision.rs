@@ -1,4 +1,4 @@
-//! value-decision payload 与 arc 的最终冻结。输入 canonical SSA、condition DAG 和 edge plans，输出值决策节点、arc 与 phi ownership 索引；不负责普通 branch lowering。例如短路值合流会把每条叶子路径冻结成唯一 arc transfer。
+//! value-decision payload 与 arc 的最终冻结。输入 canonical SSA、condition DAG 和 edge plans，输出值决策节点、arc 与 phi ownership 索引；不负责普通 branch lowering。
 
 use super::*;
 

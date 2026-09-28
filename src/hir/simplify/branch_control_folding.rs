@@ -1,9 +1,6 @@
-//! 清理空/常量分支、公共复制尾部和前向 goto 壳，并恢复 repeat 尾部条件。
+//! 整理 HIR 中的机械分支、跳转包装与 repeat 尾部条件。
 //!
-//! 消费当前 HIR 的 If/Goto/Label、词法入口与目标方言安全事实，不重新解释 CFG；
-//! 同一 binding 选值仍由 branch_value_folding 先处理。
-//! 例如 if false then body end 可删除，if true then body end 则须保留 body
-//! 的词法作用域；有事件的条件仍在原位置求值。
+//! 消费当前控制结构、词法入口和方言安全事实，保留原操作；同一 binding 的选值由专属 pass 处理。
 
 mod alternative_arms;
 

@@ -1,21 +1,6 @@
 //! HIR/AST 共用的失效标签与事实消费顺序调度器。
 //!
-//! pass 通过 depends_on/invalidates 声明形状依赖，调度器管理执行与收敛，不拥有
-//! 表达式改写或生命周期证明。consumer 还可要求更早的 owner 在消费前保持最新；
-//! 例如 temp-inline 暴露 constructor 后，locals 不能先合并其不同 SSA producer。
-//!
-//! owner 在本轮输入失效时即时刷新，其它 pass 保持阶段及相对执行顺序；不需要重复
-//! 登记同一 pass，也不把身份消费推迟到所有不相关改写完成之后。
-//!
-//! ## 核心概念
-//!
-//! - **Tag**：一组粗粒度变化标签（如 `StatementAdjacency`、`TempChain`），由各层自行定义。
-//! - **Phase**：可选的阶段分区。标记为 `Deferred` 的 pass 只在所有 `Normal` pass
-//!   收敛后才执行；如果 `Deferred` pass 又产出新 invalidation，会触发 `Normal` pass 重跑。
-//!   `Final` 等这两个阶段均稳定后才消费不可逆的高层事实；有变化仍回到同一收敛循环。
-//! - **收敛**：当一轮遍历中没有任何 pass 返回 `changed=true` 时收敛。
-//! - **上限**：达到轮数上限不等于收敛；调用层必须把它作为显式错误处理，不能继续消费
-//!   可能仍处于中间态的产物。
+//! 消费 pass 的依赖、失效和阶段声明，维护 owner 刷新与收敛状态；改写及语义证明归各 pass。
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -52,6 +37,7 @@ pub trait InvalidationTag: Copy + Eq + Ord + fmt::Debug + 'static {
 }
 
 /// fixed-point 调度的终止状态。
+/// LimitExceeded 表示尚未收敛，调用层必须拒绝继续消费中间产物。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidationConvergence {
     Converged,

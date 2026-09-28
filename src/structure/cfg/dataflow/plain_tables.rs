@@ -1,10 +1,6 @@
-//! 在原始基本块内证明尚未暴露的新表读取不会进入元方法。
+//! 证明原基本块内尚未暴露的新表访问性质。
 //!
-//! NewTable 是唯一事实源；寄存器覆盖、外部使用和可见 debug binding 的用户代码观察
-//! 会结束证明。跨块合流暂不传播，后层只消费具体读取的证书，不从 constructor 源码形状
-//! 重建逃逸。例如 `local ids={DS.AP,DS.SH}; return ids[1],ids[2]` 中，初始化期间 ids
-//! 尚不属于活动 source scope，后续自身的普通读取不会凭空成为 GC 回调。
-//! DebugScope 按维护地图只保护保留的 source identity；未命名临时数字槽不充当逃逸来源。
+//! 消费 NewTable、原使用及 debug 身份，发布具体读取的无元方法证书。
 
 use super::*;
 

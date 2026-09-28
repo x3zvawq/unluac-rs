@@ -1,4 +1,4 @@
-//! 提供 AST 一元/二元操作符文本和括号清理；依赖 AST common 枚举，不负责表达式递归；例如把 LogicalAnd 映射为 and。
+//! 提供 AST 一元/二元操作符文本和括号清理；依赖 AST common 枚举，不负责表达式递归。
 
 pub(super) fn format_unary_op(op: super::super::common::AstUnaryOpKind) -> &'static str {
     match op {

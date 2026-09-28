@@ -1,4 +1,4 @@
-//! 透明 forwarding route 的构建、绑定与冻结。输入连续 CFG edge 路径和语义 owner，输出共享 route arena 与每条入口的稳定引用；不负责推断 break/continue。例如多个入口共享 jump 后缀时只保存一次物理 next 链。
+//! 透明 forwarding route 的构建、绑定与冻结。输入连续 CFG edge 路径和语义 owner，输出共享 route arena 与每条入口的稳定引用；不负责推断 break/continue。
 
 use super::*;
 

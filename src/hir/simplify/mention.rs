@@ -1,12 +1,6 @@
-//! HIR simplify 里的 binding/temp 提及查询。
+//! HIR simplify 共用的 binding/temp 提及与资源身份收集。
 //!
-//! 多个 pass 都需要回答“某段 HIR 是否还引用某个 local/temp”以及“某条语句是否写入
-//! temp”。这些问题属于只读树遍历，不应散落在各个 pass 里各写一套 visitor。
-//! 本模块只提供语法树提及事实，不判断 carried-local、branch-value 等业务形状。
-//! 直接读取统一发布 HirBinding，home 投影消费 Promotion 的完整可能集合；例如 closure
-//! capture 只读取父 binding，upvalue 不占当前 frame 的槽，不能从名字或局部编号推断 home。
-//! collector 可按查询点组成 tuple，一次收集同一快照的模式与资源身份；例如引用捕获、
-//! 按值捕获和直接 TBC temp 分别输出，不能把它们合成一种跨改写有效的绑定事实。
+//! 消费共享 visitor 和 Promotion 的 home 查询，发布当前快照的只读事实。
 
 use std::collections::{BTreeMap, BTreeSet};
 

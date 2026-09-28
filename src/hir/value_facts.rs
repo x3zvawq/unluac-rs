@@ -1,10 +1,6 @@
 //! HIR 表达式正常完成后的共享抽象值事实。
 //!
-//! 当前语法投影到共享 LuaValueFacts；真假选择与结果种类由 value_semantics 统一解释。
-//! Decision 沿显式边合流，CurrentValue 使用当前 test 的结果而不重新求值。
-//! 例如 unknown and false 只能返回 nil/false，不能因此把 nil 当成 boolean。
-//! 常量锚定值不依赖临时栈根；动态对象另占一类。本模块不证明事件可删除、binding
-//! 在跨调用后不变或物理 home 可释放；路径假设的有效性由调用者证明。
+//! 将当前语法投影到 LuaValueFacts；路径假设由调用方证明，结果事实不授权移动求值或删除根。
 
 use super::common::{HirBinaryOpKind, HirDecisionExpr, HirDecisionTarget, HirExpr, HirUnaryOpKind};
 

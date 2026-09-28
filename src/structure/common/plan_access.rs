@@ -1,4 +1,4 @@
-//! 提供冻结 StructurePlan 的查询 API 与 forward-route 迭代器；依赖 plan/navigation/terminator/value 子模块，不负责 evidence 候选；例如按 region、edge、phi 和 loop id 查询最终计划。
+//! 提供冻结 StructurePlan 的查询 API 与 forward-route 迭代器；依赖 plan/navigation/terminator/value 子模块，不负责 evidence 候选。
 
 use super::*;
 

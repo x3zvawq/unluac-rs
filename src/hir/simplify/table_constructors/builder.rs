@@ -1,14 +1,7 @@
-//! 这个子模块承载 `HirTableConstructor` rebuild 时的 builder 状态机。
+//! 维护 HIR 表构造器重建时的字段布局状态。
 //!
-//! rebuild 主流程只关心 region step 如何 flush；字段顺序、数组下标推进、整数 record
-//! 是否可以暂存为未来 array slot，则属于构造器内部状态。本文件只维护这些 builder
-//! 规则，不扫描语句，也不决定哪些语句可以进入构造器 region。
-//!
-//! 输入形状：已有构造器字段 + 后续 array / record / set-list 值。
-//! 输出形状：按 Lua 构造器语义重新排序后的 `HirTableConstructor`。未来整数键只有在后续
-//! 写入可证明不别名时才能晋升为 array；open list 覆盖已有后缀时先降回显式整数字段。
-//! 完整模板初始化消费 lower 标记的隐式位置：Luau 默认零值和 LuaJIT TDUP nil hash
-//! marker 与原同键写只对应一个源码字段，实际写仍全部按原顺序输出，避免重复占位或改序。
+//! 消费已有字段及已获准的后续写入，输出保留写入语义和原初始化事实的构造器；
+//! 区域选择与语句扫描由调用方负责。
 
 use std::collections::BTreeMap;
 

@@ -1,9 +1,6 @@
-//! 归一化 debug local 的槽位身份，并冻结按寄存器查询活动 source scope 的边界。
+//! 归一化 debug local 槽位与活动 source scope 查询。
 //!
-//! 原始调试表的顺序决定 PUC Lua/LuaJIT 活动局部的寄存器 rank；Luau 显式槽位不重推。
-//! scope 身份始终是归一化表下标，重叠项仍返回表中第一个 source scope，不改成最近声明。
-//! 例如同一寄存器的 scope#0=[2,8)、scope#1=[4,10)，查询 6 返回 #0，查询 8 返回 #1。
-//! 下游只读该集合；名字解码、SSA 归属和最终源码命名不属于这里。
+//! 消费原调试表，发布稳定 scope 身份；SSA 归属和最终命名由后层负责。
 
 use std::{
     collections::{BTreeMap, BTreeSet},

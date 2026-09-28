@@ -1,8 +1,6 @@
-//! 收敛 fallback block 中的 seed 复制、多目标 alias 和更新后交接。
+//! 收敛 fallback block 中的复制及状态交接。
 //!
-//! 消费当前块的 temp-touch、goto 边界与父模块冻结的身份保护，证明同 home/epoch
-//! 后原子改写 seed 和 suffix；不负责递归或 label/goto mesh 的全局等价类收敛。
-//! 例如 assign t=s; ... t=t+1 在原 s 不再被分别观察时，可归回 s 的状态写入。
+//! 消费当前块的使用、跳转与身份保护事实，原子改写 seed 和后缀。
 
 use std::collections::{BTreeMap, BTreeSet};
 

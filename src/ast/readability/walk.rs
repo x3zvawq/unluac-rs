@@ -1,11 +1,6 @@
-//! 这个文件提供 AST readability pass 共享的递归 walker。
+//! AST Readability 共用的递归改写骨架。
 //!
-//! 很多 readability pass 只是“递归遍历整棵 AST，然后在局部 block/stmt/expr 上做
-//! 保守重写”。如果每个 pass 都各自维护一套 `block/stmt/lvalue/call/expr` 骨架，
-//! 新 AST 节点一加，或者遍历边界一改，就要在一堆文件里同步返工。这里把纯遍历
-//! 样板收成共享设施，让 pass 更专注在“当前节点要不要改写”。repeat body 通过专用
-//! hook 暴露同作用域的 until 条件，避免块级分析漏掉正文之后的读取。带状态遍历只保存
-//! 当前层的回退位置；例如子域新增 global 名字后退出，不复制祖先映射，也不污染 sibling。
+//! 统一节点顺序、词法状态和 repeat 条件边界，候选证明由各 pass 负责。
 
 use crate::ast::common::{
     AstBlock, AstCallKind, AstExpr, AstFunctionExpr, AstLValue, AstModule, AstStmt,

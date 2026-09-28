@@ -1,17 +1,6 @@
-//! 这个子模块负责 decision synthesis 的抽象值域和等价性验证上下文。
+//! Decision synthesis 共用的抽象值域、原子身份与等价验证上下文。
 //!
-//! 它依赖前面已经规范化的 HIR decision 表达式，用 canonical multi-valued decision
-//! diagram 表达候选在完整抽象环境中的值，不会物化环境笛卡尔积，也不会在这里决定哪种
-//! 源码形状更可读。当前 synthesis grammar 只观察 truthiness、与 primitive literal 的稳定
-//! equality 和最终返回身份；域包含全部 literal equality class 及两个 fresh truthy symbol，
-//! 足以给任意不同的非 literal 结果构造区分赋值。若将来接纳 dynamic-dynamic equality 或
-//! ordering，必须先扩展该 small-model 证明。
-//!
-//! 例如：`temp == nil` 会成为以 `temp` 为变量的共享多值分支；整数与浮点数的判等按 Lua
-//! 数值语义计算，而 terminal 仍保留两种结果身份。Decision 的 `CurrentValue` 始终绑定当前
-//! node 已求出的 test diagram，不会重求值或跨节点复用。
-//! 原子键同时供验证域收集、求值和形状成本使用；例如 `a and 1LL or 2LL` 中的
-//! LuaJIT 常量不能在值验证时合法、在成本模型中却没有对应身份。
+//! 消费规范化 HIR，验证候选在受支持抽象语义中的结果；源码形状选择由综合器负责。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -578,6 +567,7 @@ fn build_domain(decision: &HirDecisionExpr, safety: HirExprSafety) -> Vec<Abstra
 /// 动态值只会参与 truthiness、与原始字面量的稳定 equality，以及作为最终原值返回；两个
 /// fresh truthy symbol 足以区分任意两个非字面量结果。数值字面量则必须补齐所有 `==`
 /// 相等但结果身份不同的表示，特别是 Integer/Number 双表示与正负零。
+/// 若综合语法扩展到动态值之间的 equality 或 ordering，须先扩展这个代表域证明。
 pub(super) fn build_validation_domain(
     literals: &BTreeSet<AbstractValue>,
     safety: HirExprSafety,

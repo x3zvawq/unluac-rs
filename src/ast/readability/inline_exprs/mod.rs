@@ -1,9 +1,6 @@
-//! 将合法 AST 中的机械 local 别名收回使用点，受展示复杂度和求值证明约束。
+//! 将 AST 中的机械 local 别名收回使用点。
 //!
-//! 消费 binding/use、capture 与表达式安全事实，支持单项别名、稳定副本和完整调用
-//! 准备 run；原生 temp 的语义内联仍由 HIR 负责。
-//! 例如 local f=callee; f(x) 可在读取时点与身份证明成立时收成 callee(x)。
-//! 具体候选、使用站点和 run 的接受边界分别由各子模块维护。
+//! 消费 binding、capture 与表达式安全事实，保持求值语义并控制展示复杂度。
 
 mod candidate;
 mod eval_order;

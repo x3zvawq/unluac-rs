@@ -1,10 +1,6 @@
-//! 恢复普通调用、构造器和控制头的完整源码帧，并原子验证声明身份。
+//! 组织普通调用、构造器和控制头的完整源码帧恢复。
 //!
-//! 调用树、Def 版本及槽距由共享 FrameBuilder 核对，源码低槽前缀由 prefix owner
-//! 核对。本模块组织候选与整批预览，使准备写、结果写回和后继声明恢复一起提交；
-//! 不以值相等或零返回推断物理根已经退休。
-//! 例如先后复用同一匿名 callee local 的两次调用，必须连同后缀读写一起验证，
-//! 不能只按第一次调用的布局删除声明。
+//! 共享 builder 与 prefix owner 提供证明，本模块原子提交准备写、结果与后继声明事务。
 
 use super::*;
 use crate::hir::common::{HirBinding, HirInlineRetentionReason, HirLocalDecl, TempId};

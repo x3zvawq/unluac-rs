@@ -1,9 +1,6 @@
-//! 分析正常返回包、callee 身份和显式 binding 写入的值域，供 HIR 消费者查询。
+//! 分析正常返回包、callee 身份与 binding 写入的值域。
 //!
-//! 复用 HIR CFG、显式 capture 和 LuaValueFacts，保留返回值的槽与数量；
-//! 缺失 binding 表示未知，不能当作空 holder 集。摘要随 HIR 改写失效，
-//! 不授权删除调用、重排 lookup/COPY 或缩短物理根。
-//! 例如 f(change_f()) 的 callee 在参数求值前快照，仍调用原先取得的 f。
+//! 消费共享 HIR 图、capture 和 LuaValueFacts，发布随 HIR 改写失效的摘要。
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};

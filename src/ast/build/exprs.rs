@@ -1,9 +1,6 @@
-//! 将 HIR 表达式、左值和 value pack 降低为合法目标 AST。
+//! 将 HIR 表达式、左值和 value pack 降低为目标 AST。
 //!
-//! 消费 HIR 已分开的标量/pack tail、capture 及构造器分配事实，负责语法选择，
-//! 不从 Call/VarArg 外形补多值语义，也不重建闭包根证明。
-//! 例如可能暴露额外返回值的固定尾调用用 SingleValue 保持宽度，open tail 保持展开；
-//! record key 则按目标方言选择命名字段或显式索引语法。
+//! 消费 HIR 的值宽度、capture 和构造器分配事实，选择合法语法。
 
 use std::collections::BTreeSet;
 

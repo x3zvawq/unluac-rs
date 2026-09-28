@@ -1,9 +1,6 @@
-//! 扫描连续 HIR 语句，发布构造器 seed、字段、SETLIST 和 producer 步骤。
+//! 从连续 HIR 语句识别构造器 seed、字段与 producer。
 //!
-//! 消费当前赋值形状、binding 摘要与 Promotion 来源，形成 ConstructorRegion；
-//! 本模块只识别和证明候选，不直接改树。rebuild/commit 消费同一类型化角色，
-//! 不从语句位置重新推导字段来源。
-//! 例如 local t={}; t.x=1; t.y=2 被投影为一个 seed 和两次 record 写。
+//! 消费 binding 摘要和 Promotion 来源，发布 typed ConstructorRegion，供重建和提交使用。
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};

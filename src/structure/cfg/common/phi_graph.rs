@@ -1,8 +1,6 @@
-//! canonical phi 图的分量、传播顺序与递归身份。
+//! canonical phi 图的共享分量、传播顺序与递归身份。
 //!
-//! SSA 完成 compact/remap 和 use 索引后一次冻结；这里不依赖区域或循环语法。
-//! 例如 p 依赖 q、q 依赖 p 时两者同属递归分量；单独的 p = phi(p, def)
-//! 也递归，不能因 consumer 索引省略直接自边而丢掉该事实。
+//! 消费最终 SSA 及 use 索引，向结构和值分析发布与源码区域无关的图事实。
 
 use super::{PhiCandidate, PhiId, SsaValue};
 

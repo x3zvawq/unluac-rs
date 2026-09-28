@@ -1,9 +1,6 @@
-//! 恢复原 LOADNIL 批次、闭包声明及槽复用所需的词法末端。
+//! 恢复原声明批次、闭包和槽复用所需的词法边界。
 //!
-//! 消费 Promotion 的原定义组与源码前缀事实，在完整帧收敛后批量预览声明和作用域；
-//! 不从 HIR 名字、逻辑死值或单个声明起点猜物理生命周期。
-//! 例如 do local v=lookup end; local function f() ... end; f() 中，
-//! 原 CLOSURE 复用 v 的槽时，必须同时恢复 do 末端，避免 v 活过 f 内的 GC 观察。
+//! 消费 Promotion 与源码前缀证明，批量预览并提交声明及作用域。
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};

@@ -1,4 +1,4 @@
-//! 编排 case-test 命令、筛选 case、启动 worker 并汇总结果；依赖 reporter/worker，不负责参数解析细节；例如并行运行同一主题的源码并统计失败分类。
+//! 编排 case-test 命令、筛选 case、启动 worker 并汇总结果；依赖 reporter/worker，不负责参数解析细节。
 
 use super::*;
 

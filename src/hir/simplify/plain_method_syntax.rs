@@ -1,9 +1,6 @@
-//! 为普通字段调用签发最终冒号语法许可，不生成原 SELF 身份。
+//! 为普通字段调用签发最终冒号语法许可。
 //!
-//! 返回值 owner 证明当前字段必为新表中的闭包，Promotion 核对原 lookup/CALL 槽。
-//! `local r=factory(); r.m(r)` 可写成 `local r=factory(); r:m()`；receiver 声明及
-//! 原根保留，GETFIELD 与 SELF 的差别只发生在无观察的字段查找内部。此步位于所有
-//! HIR 改写之后，AST build 消费许可，不由 AST 重建表逃逸或读取物理寄存器。
+//! 消费返回值分析与 Promotion 帧事实，供 AST build 使用；不伪造原 SELF 身份。
 
 use super::object_flow::ReturnValueFacts;
 use super::walk::{HirRewritePass, rewrite_proto};

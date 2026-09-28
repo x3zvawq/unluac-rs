@@ -1,16 +1,7 @@
-//! `decompile_rich` 的结构化返回类型。
+//! WASM 桥接层的结构化返回类型与转换。
 //!
-//! 这些 DTO 是 WASM 桥接层专用的投影类型，从 `DecompileState` 中提取前端
-//! 可视化所需的数据子集并序列化为 JSON。核心库类型不带 `Serialize`，因此
-//! 在这一层做转换可以保持核心库零 serde 依赖。
-//!
-//! 主要暴露：
-//! - proto 树元数据（名称、行号、参数、upvalue 数等）
-//! - 每个 proto 的 CFG（block + edge + 人类可读指令文本）
-//! - 反编译生成的源码
-//!
-//! 输入：`DecompileResult`
-//! 输出：`WasmRichResult` → JSON
+//! 从 DecompileResult 投影 proto 元数据、CFG 和生成源码，序列化为前端使用的 JSON；
+//! 核心库不承担这些展示 DTO 或 serde 依赖。
 
 use serde::Serialize;
 

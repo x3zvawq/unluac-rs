@@ -1,9 +1,6 @@
-//! 合并互斥且语义结构完全相同的分支，保留所有读取来源。
+//! 合并互斥的同构分支操作，保留全部原读取来源。
 //!
-//! 这里仅撤销用于选择同一操作的外层条件；条件求值/控制入口/声明身份仍由 branch-control
-//! 原事务检查。读取的 base、key、metamethod 与 method 协议必须相同，只有 sources 可不同。
-//! 例如 `if p then if t[k] then break end else if t[k] then break end end` 合并为一次读取，
-//! 结果槽与输入布局仍由 Promotion 对两处 GETTABLE 求交，不继承任一分支的单点许可。
+//! 消费父事务的条件、入口与声明证明，发布仍须满足各原操作许可的共享表达式。
 
 use crate::hir::common::{HirBlock, HirExpr, HirOperationSources};
 use crate::hir::simplify::walk::{HirRewritePass, rewrite_block};

@@ -1,11 +1,6 @@
 //! HIR 构建与 simplify 共用的定点表达式替换。
 //!
-//! 调用方先证明替换合法，本模块只消费 single 或 substitution DAG，按共享 HIR 子节点
-//! 定义替换并返回次数。它不重建 reaching-def、root lifetime 或协议归属。
-//! single 不进入刚插入的值；DAG 按活动路径展开，成本随实际输出增长，不反复扫描 sink。
-//! 例如 `t2 -> t1 -> value` 的批量替换产生 value 并计两次，单次 `t2 -> t1` 只计一次。
-//! capture 只替换父级绑定身份；pack tail 保持 Call/VarArg 宽度。赋值目标的替换次数和
-//! generic-for iterator 的前后区间分别交给原有 producer 失效规则，不互相代替。
+//! 消费已获准的单次替换或 substitution DAG，保持 capture 和 value-pack 的类型边界。
 
 use std::collections::{BTreeMap, BTreeSet};
 

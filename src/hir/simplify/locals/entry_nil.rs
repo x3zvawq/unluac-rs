@@ -1,15 +1,6 @@
-//! 裁剪 Structure 为同槽 `Entry(nil)` region-result phi 物化出的冗余 nil 边写入。
+//! 删除 Structure 为 Entry(nil) region-result 物化的冗余 nil 边写入。
 //!
-//! 候选必须来自 promotion 保留的 direct canonical phi provenance。分析以可信的
-//! `(slot, close epoch)` 为身份，消费一次共享 HIR CFG 和每个事件的求值/写入事实，
-//! 用四状态位集合求不动点。构图时只为候选写入保存节点 ID 对应的词法路径；收敛后才
-//! 在原 HIR 上一次性提交删除，不用地址或后序树匹配重建语句身份。
-//! reference capture 本身不会让 `nil = nil` 变得可观察，但 capture 逃逸后的调用或
-//! `__close` 可能回写该 cell，因此会把值状态降为 unknown。共享图解析内部跳转与回边，
-//! 来自候选区域外的 label 引用注入 unknown 入口，不把入口 nil 传播给外部到达路径，
-//! 也不因后置跳转丢弃此前干净路径上的证明。
-//! capture 直接按父级绑定查询可能 home；例如已知 home-free 的 Local 不暴露入口槽，
-//! 未知 home 仍保守视为可能别名，不从临时表达式树重新识别捕获身份。
+//! 消费 canonical phi provenance、物理身份与共享 HIR 控制流，证明原 nil 状态仍有效后提交。
 
 use std::collections::{BTreeMap, BTreeSet};
 

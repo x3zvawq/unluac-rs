@@ -1,9 +1,6 @@
 //! 在完整源码帧中恢复索引、比较和算术输入准备。
 //!
-//! 消费 Promotion 的原结果及操作数布局，由共享 FrameBuilder 验证 Def 写域、
-//! 事件顺序和声明身份，不从表达式外形推断暂存槽或根退休权限。
-//! 例如 root.nodes[keys[2]].value 必须保持 base 与动态 key 的原求值次序和覆盖点；
-//! 各 VM 的内嵌常量及寄存器操作数在对应路径中核对。
+//! 消费 Promotion 的原定义与布局，由共享 FrameBuilder 验证事件顺序和声明身份。
 
 use super::*;
 use crate::hir::common::HirTableAccess;

@@ -1,4 +1,4 @@
-//! 分析共享退出 continuation、早退 binding scope 与 loop value merge；依赖透明跳转和 phi 事实，不负责候选分组；例如收敛多条 cleanup exit 到同一 continuation。
+//! 分析共享退出 continuation、早退 binding scope 与 loop value merge；依赖透明跳转和 phi 事实，不负责候选分组。
 
 use super::*;
 

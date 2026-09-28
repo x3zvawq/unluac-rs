@@ -1,8 +1,6 @@
-//! Doc -> String 渲染器。
+//! 将 Doc 布局渲染为最终源码字符串。
 //!
-//! 这里的实现刻意保持轻量：只做稳定换行和缩进，不引入复杂回溯。
-//! 当前项目的布局需求主要集中在列表、表构造器和函数体块级结构，这套 renderer
-//! 足以支撑第一版 Generate。
+//! 消费缩进和行宽选项，保持 emitter 已确定的语法结构。
 
 use super::common::GenerateOptions;
 use super::doc::Doc;

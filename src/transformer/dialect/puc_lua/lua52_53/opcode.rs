@@ -1,4 +1,4 @@
-//! 将 Lua 5.2/5.3 opcode dispatch 降低为共享 LowInstr；依赖 adapter、环境和跳转辅助，不负责 proto 递归；例如处理 EXTRAARG、环境访问、goto/for 与调用协议。
+//! 将 Lua 5.2/5.3 opcode dispatch 降低为共享 LowInstr；依赖 adapter、环境和跳转辅助，不负责 proto 递归。
 
 use super::*;
 

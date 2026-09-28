@@ -1,4 +1,4 @@
-//! 安装 phi plans、认领 region/condition/branch/loop 输入并标记 disposition；依赖各结构 payload，不负责跨区域 owner 传播；例如将 branch result 认领为 RegionResult。
+//! 安装 phi plans、认领 region/condition/branch/loop 输入并标记 disposition；依赖各结构 payload，不负责跨区域 owner 传播。
 
 use super::*;
 

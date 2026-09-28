@@ -1,10 +1,6 @@
-//! 这个子模块负责从 HIR 闭包结构里提取 capture provenance。
+//! 从 HIR 闭包提取 Naming 所需的 capture provenance。
 //!
-//! 它依赖 HIR 已经恢复好的 closure/capture 形状，只回答“子函数的 upvalue 来自哪里”，
-//! 不会在这里分配最终名字。节点与 value pack 的遍历由共享 HIR visitor 提供，
-//! 本层只消费 closure 回调，不另行展开 HIR 子节点或进入 child proto。
-//! 例如：子闭包捕获某个 local 时，这里会记录它对应的捕获来源链。
-//! 稳定 closure hook 允许借用 HIR 的原始 capture 切片，不再为每次 occurrence 复制 binding。
+//! 消费共享 visitor 与显式 capture，发布父子绑定来源，不分配最终名字。
 
 use crate::hir::visit::{HirVisitor, visit_proto};
 use crate::hir::{HirCapture, HirClosureExpr, HirModule, HirProtoRef};

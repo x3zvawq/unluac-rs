@@ -9,7 +9,7 @@
 | --- | --- |
 | 层的输入输出、子阶段、pass 职责、生产消费关系与失效边界 | `docs/design/` 对应章节 |
 | 跨层身份、协议、不变量与错误边界 | 事实所属层的设计章节；消费者链接引用 |
-| 候选树形、具体 guard、方言槽距、算法步骤与提交细节 | 对应类型、函数或代码分支附近的注释；文件头只概述模块职责与必要边界 |
+| 候选树形、具体 guard、方言槽距、算法与提交原因 | 对应类型、函数或代码分支附近的 why 注释；文件头只描述职责、输入输出与必要边界 |
 | 被保护的运行行为与可读性结构 | 已注册 Lua 样例及其断言；配置与标签按测试协议维护 |
 | 本次改动、验证结果与未完成范围 | 本次任务交付；临时 dump、报告放 `tmp/` |
 
@@ -31,15 +31,13 @@ bytes ──→ Parser ──→ Transformer ──→ Structure ──→ HIR �
 | `src/decompile/state.rs` | 阶段枚举 `DecompileStage` + 状态容器 `DecompileState` |
 | `src/decompile/contracts.rs` | 层间稳定类型别名（`CfgGraph`、`HirChunk` 等） |
 | `src/decompile/options.rs` | 顶层选项 `DecompileOptions` 与 `DebugOptions`，统一默认值补齐 |
-| `src/debug.rs` | 跨层 debug 公共类型、聚焦工具与 `define_stage_dump!` 宏 |
+| `src/debug/mod.rs` | 跨层 debug 公共类型、聚焦工具与 `define_stage_dump!` 宏 |
 | `src/scheduler.rs` | HIR Simplify 与 AST Readability 共用的 invalidation-driven 调度器 |
 | `src/graph.rs` / `src/graph/` | 各层共用的 DFS、SCC、支配算法与词法 label 引用索引，身份和快照仍由各层持有 |
 | `src/recovery.rs` | Structure/HIR proto 级失败事实与最后完成产物合同 |
 
-`graph::LabelReferenceIndex` 消费各层提供的顶层语句 label/goto 集合，保留来源位置的首尾，
-按目标位置建立区间索引，以对数时间判断目标区间是否有来自允许范围之外的引用。
-这是词法引用事实，不按运行可达性裁剪；目标是否包含嵌套 label、允许哪些来源由消费者明确。
-语句位置或跳转改变后必须重建快照，不能跨层沿用旧位置或用它替代执行 CFG。
+共享图与引用查询只解释调用方提供的当前快照，不替代各层的控制和词法语义。
+图边、语句位置或跳转改变后，相关事实必须失效，不能跨层沿用旧身份。
 
 ## 分层文档
 

@@ -1,4 +1,4 @@
-//! 计算 shared-closure 组的词法 scope envelope；依赖 StructurePlan containment，不负责 dominance；例如要求 owner scope 同时包含最左和最右 capture site。
+//! 计算 shared-closure 组的词法 scope envelope；依赖 StructurePlan containment，不负责 dominance。
 
 use super::*;
 

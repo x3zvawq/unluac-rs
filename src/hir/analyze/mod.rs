@@ -1,8 +1,6 @@
-//! 这个文件承载 HIR 初始恢复的主入口。
+//! HIR 初始恢复的模块入口。
 //!
-//! 外层文件只负责声明 analyze 子模块、组织跨 proto 的递归入口，并把目录内真正的
-//! lowering 能力串起来。这样 `src/hir/analyze` 和 `src/hir/simplify` 的外层形状就会
-//! 保持一致，后续继续拆分实现时也更容易定位“入口”与“细节”。
+//! 组织跨 proto 构造并串联表达式、绑定和结构 lowering，输出 HIR module。
 
 mod artifact_recovery;
 mod bindings;

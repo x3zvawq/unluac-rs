@@ -1,10 +1,6 @@
-//! 保持完整条件 initializer 留在高槽的原输入根，直到原覆盖或 frame exit。
+//! 保留完整 initializer 的高槽输入根直到原覆盖或 frame exit。
 //!
-//! Promotion 提供 canonical 覆盖端点，FrameBuilder 证明整条计划重发原事件，prefix
-//! owner 核对未吸收声明的实际源码槽。这里只在一次后缀扫描中连接这些证明，不重建 CFG。
-//! 例如 `local n=({make()}) and 7 or 7; local v=poll()+1` 必须同时恢复 poll 的高槽帧；
-//! 拆成低槽 callee 声明会在 poll 观察前覆盖表根。未知观察或控制转移拒绝整个依赖事务。
-//! FASTCALL 的 fallback callee 写不是所有路径的覆盖，不消费它来关闭待保留根。
+//! 消费 Promotion、FrameBuilder 与 prefix owner 的证明，连接后缀依赖并验证完整事务。
 
 use super::*;
 use crate::hir::common::HirOperationSources;

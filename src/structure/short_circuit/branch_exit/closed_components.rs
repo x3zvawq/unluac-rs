@@ -1,4 +1,4 @@
-//! 枚举闭合 branch/loop 控制分量并形成 DAG 候选入口；依赖 CFG、支配与 branch 索引，不负责弧细化；例如合并共享 connector 的闭合分支分量。
+//! 枚举闭合 branch/loop 控制分量并形成 DAG 候选入口；依赖 CFG、支配与 branch 索引，不负责弧细化。
 
 use super::*;
 

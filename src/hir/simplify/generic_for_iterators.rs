@@ -1,16 +1,6 @@
-//! 把 generic-for 的 VM 初始化序列收回完整 source value pack。
+//! 将 generic-for 的 VM 初始化序列恢复为完整源码值包。
 //!
-//! Lua 5.4+ 除 iterator/state/control 外还会物化第 4 个 closing value；前置固定表达式
-//! 与最终多返回调用又可能拆成多条赋值。这里优先按 GenericFor 已记录的完整源码 pack
-//! 一次接管初始化序列；若 closing value 已经更早求值，则只额外收回紧邻循环头的匿名
-//! 单次 `nil` run，不跨语句移动其它表达式。
-//!
-//! 输入：`t0 = next; t1,t2,t3 = factory()<exact:3>; GenericFor(t0,t1,t2,t3)`
-//! 输出：`GenericFor(next, factory()<open>)`
-//! 输入：`t1,t2 = nil,nil; GenericFor(t0,t1,t2,t3)`
-//! 输出：`GenericFor(t0,nil,nil,t3)`
-//! direct closure producer 保留为独立 local function；child proto 的体量无法由 HIR
-//! 表达式复杂度概括，不应恢复成 loop head 内的多行匿名函数。
+//! 消费 GenericFor 的已知 pack 与 closing value 事实，保留原求值、关闭和绑定语义。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

@@ -1,9 +1,6 @@
-//! 清理没有读取者的 HIR 临时赋值，并保留仍承担物理槽覆盖职责的写入。
+//! 清理未读的 HIR 临时赋值，保留必要的物理槽覆盖。
 //!
-//! 消费目标方言的表达式安全事实、promotion 的 home/entry-nil 和 root 退休证书；
-//! 无读取不代表没有 GC root、capture 或 debug 身份，不能仅凭 use-count 删写。
-//! 例如原槽已证为 entry nil 时，根前缀的 t=false 可删除；覆盖未知旧值则须保留
-//! 原物理写入。完整调用帧尚需消费的准备写留到 Final 阶段再清理。
+//! 消费表达式安全性、home 和根退休证明，无读取本身不构成删除许可。
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,10 +1,6 @@
-//! 这个子模块负责把缺失的 global decl 插回事实层确定的 gate 激活点。
+//! 将已确定的缺失 global 声明插回原 gate 激活位置。
 //!
-//! 它依赖 `facts` 已经判定好的 missing globals，只负责插入 AST `GlobalDecl`，不会重新
-//! 计算哪些名字该声明成 const 或 none。
-//! 例如：块内首次写 `installer` 且未声明时，这里会在约束该访问的既有 gate 后补
-//! `global installer`；外层 gate 已生效时才放在当前 block 前缀。
-//! 若上层已经决定要落成 collective gate，这里也只负责把 `global *` 这个 AST 节点造出来。
+//! 消费 facts 和 collective 选择结果，不重新判断名字属性或声明必要性。
 
 use crate::ast::AstGlobalAttr;
 use crate::ast::common::{

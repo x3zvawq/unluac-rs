@@ -1,9 +1,6 @@
-//! 收回 AST 中已经带原 method 协议证明的 receiver/callee 别名。
+//! 收回已带原 method 协议证明的 receiver/callee 别名。
 //!
-//! 消费显式 method key、binding/use 和求值前缀事实；普通 obj.method(obj) 的
-//! 同值外形不证明 SELF 协议，不能据此改为只读取一次 receiver 的冒号调用。
-//! 例如 local r=expr; local f=r.method; f(r) 在原协议及删除证明成立时
-//! 可恢复为 expr:method()；嵌套调用和循环使用点还须保留原求值时点。
+//! 消费显式 method key、binding/use 与求值事实，发布获准的冒号调用。
 
 use super::super::binding_flow::{BindingUseIndex, BindingWriteIndex, MutableSnapshotNames};
 use super::super::expr_analysis::is_stable_context_expr;

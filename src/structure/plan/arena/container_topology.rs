@@ -1,4 +1,4 @@
-//! container 拓扑排序与同尺寸冲突消解。输入候选集合和 preorder ranges，输出父子拓扑；不负责物化 RegionPlan。例如同块 value decision 与 branch 会按语义优先级形成唯一 owner。
+//! container 拓扑排序与同尺寸冲突消解。输入候选集合和 preorder ranges，输出父子拓扑；不负责物化 RegionPlan。
 
 use super::*;
 

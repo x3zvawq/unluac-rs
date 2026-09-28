@@ -1,12 +1,7 @@
-//! HIR -> AST build 阶段入口。
+//! 将 HIR 已恢复的控制结构、绑定和值包降低为目标方言 AST。
 //!
-//! 这里调度合法语法模式与逐节点机械 lowering，依赖 HIR 已经完成控制结构、binding 和
-//! value-pack 的语义恢复；前层退出要求也只读取 `HirProto::exit_requirements`，不会旁路访问
-//! StructureFacts。这里不会通过相邻语句重组来补 HIR 丢失的多值或求值顺序事实，也不会把
-//! 没有等价源码语义的残余 HIR 节点拆成表面合法的 AST。
-//! LocalRootRelease 已由 HIR 证明只结束旧源码根，在此生成 local 清零，不回推 VM 覆写。
-//! 单绑定闭包的自捕获必须生成 local function，使 binding 在初始化前可见；普通
-//! `local f = function() ... end` 的 RHS 不在 f 的词法域内，不能留给可选 sugar 修正。
+//! 消费 HIR 的退出要求与 provenance，组织语法模式和逐节点 lowering；
+//! 控制流恢复、多值语义与生命周期证明由 HIR 持有。
 
 mod analysis;
 mod exprs;

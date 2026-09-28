@@ -1,10 +1,6 @@
-//! 当前 AST 语句快照的词法跳转与 repeat 支配事实。
+//! 分析当前 AST 的词法跳转、落空与支配关系。
 //!
-//! label/goto 和结构化语句决定本层实际边，共享图算法只负责支配计算，不读取前层 CFG。
-//! 例如 `if skip then goto tail end; handoff; ::tail::` 的 handoff 不支配尾端，不能
-//! 据此删除旧 root carrier。嵌套语句仍投影到顶层 owner，其内部交接路径由候选另行证明。
-//! 跳转集合与落空摘要通过共享 traverse 骨架一次后序归约；表达式和 child function
-//! 不参与当前函数的语句边，父块消费子块摘要，不再向下重扫 label/goto。
+//! 消费当前函数的语句结构，供 Readability 查询；不读取前层 CFG 或进入 child function。
 
 use std::collections::BTreeMap;
 

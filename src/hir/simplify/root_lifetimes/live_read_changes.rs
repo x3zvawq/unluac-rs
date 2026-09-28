@@ -1,11 +1,6 @@
-//! 为当前仍绑定的 temp 调度下一条直属语句读写边界。
+//! 调度活动 temp 的下一条语句读写边界。
 //!
-//! 事件位置和活读判定来自同一不可变 HIR 快照的 TempUseEvents；本层不推导 VM home，
-//! 也不保存每个 temp 的完整未来变化表。每个活动 alias 至多保留一个待处理边界，
-//! 移除或重新绑定时撤销旧项，避免旧 value 的事件影响新 value。
-//! 例如 `a = lookup; use(a); a = other` 只逐次查询 a 的下一读写位置；
-//! 同一语句可能既读又写，必须比较该语句前后的既有活读结果，而不能把写入直接当死亡。
-//! Call 与 Lookup 分别传入读取后和读取前的边界，本层不合并两种观察时序。
+//! 消费同一快照的 TempUseEvents，供 Call/Lookup owner 按各自观察时序维护活读状态。
 
 use super::{BTreeMap, BTreeSet, TempId, TempUseEvents};
 

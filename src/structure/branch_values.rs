@@ -1,14 +1,6 @@
-//! 这个文件提取普通 branch 的值合流候选。
+//! 从 CFG、GraphFacts 和 Dataflow 提取普通分支的值合流事实。
 //!
-//! 这个 pass 依赖 CFG / GraphFacts / Dataflow 已经给好的 branch 骨架和 phi 事实，
-//! 负责把“结构臂归属 + HIR 真正要用的 canonical SSA 身份”一次性前移到 StructureFacts。
-//! 它不会越权做 decision/alias 最终选择，那一步仍留给 HIR。
-//!
-//! 例子：
-//! - `if cond then x = 1 else x = 2 end` 会把 merge phi 记录成
-//!   `then_arm = {preds, values_of_1}`、`else_arm = {preds, values_of_2}`
-//! - 这样 HIR 只消费 `then/else` 两臂已经分好的 SSA values，不再自己回头拆
-//!   `phi.incoming`
+//! 向 StructureFacts 发布结构臂归属及 canonical SSA 身份，最终值表达式由 HIR 决定。
 
 use std::collections::{BTreeMap, BTreeSet};
 

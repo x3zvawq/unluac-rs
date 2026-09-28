@@ -1,9 +1,6 @@
-//! 将已证明的词法生命周期投影为 low 指令区间，供 plan body 原子物化。
+//! 将已证明的词法生命周期投影为 Low-IR 指令窗口。
 //!
-//! 消费 Structure 的 cleanup/debug 边界、SSA/root 与冻结发射域，验证唯一入口、
-//! 出口及值是否逃出窗口，不从 HIR 或 AST 外形猜作用域。
-//! 例如 local object={}; use(object); debug-end 可恢复为 do 块；debug end
-//! 只表示源码槽复用边界，不证明 VM 已清空旧根。
+//! 消费 cleanup/debug 边界、SSA/root 与冻结发射域，供 plan body 原子物化作用域。
 
 use std::ops::Range;
 

@@ -1,11 +1,6 @@
-//! 按 HIR 实际闭包引用后序构造函数体，避免把词法 proto 深度压到 AST lowering 调用栈。
+//! 按 HIR 实际闭包引用构造 AST 函数体及其构造事实。
 //!
-//! HIR visitor 提供当前快照的引用，detached child 只在诊断恢复中参与。函数体和失败结果
-//! 都留到原 closure occurrence 消费，捕获元数据仍由该 occurrence 的 lowering 负责。
-//! 例如 `return function() return function() end end` 从内到外移动已构造的 body，
-//! 不为每层复制整棵子树；同一 proto 的多个实际 occurrence 才需要复制独立 AST。
-//! 首次访问可达 proto 时一并冻结 hoist 与命名变参引用，后续消费不再回扫 HIR；
-//! 依赖 Vec 保留重复 occurrence 并直接交给 DFS，不为未使用的 proto 构造语法事实。
+//! 保留原 closure occurrence 的捕获与错误归属，诊断恢复另处理 detached child。
 
 use crate::hir::{HirModule, TempId};
 

@@ -1,11 +1,7 @@
-//! HIR 共享对象流：稳定 binding、aggregate identity、逃逸与 closure effect 的正向传播。
+//! HIR 共用的 binding、对象持有、逃逸与闭包效果分析。
 //!
-//! 消费 HIR 控制流图及显式 capture，不重建 VM 寄存器。fresh table 的内部存储仅传播
-//! 持有关系，真正外部调用/存储才使可达对象逃逸；例如 a={}; b={}; a.x=b 不等于 sink(b)。
-//! repeat endpoint 与构造器原根窗口共同消费此模型和模块入口提供的 child 效果快照；
-//! 物理覆盖终点仍由root_lifetimes发布，局部消费者不得重造终点或另一份调用效果。
-//! binding 状态只存正向 root 与非空对象集合，缺项就是该域的空值；未知 collectable
-//! 单独记录，不能随空 holder 清除。例如 `object=nil` 清除持有者，但不撤销已经发生的逃逸。
+//! 消费共享 HIR 图及当前 capture 摘要，为构造器和 repeat 端点提供正向状态；
+//! 物理根覆盖终点由 root_lifetimes 持有。
 
 mod closure_effects;
 mod fields;

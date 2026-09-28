@@ -1,8 +1,6 @@
-//! 合并机械拆开的声明与初始化，并将 hoisted local 下沉到实际使用的作用域。
+//! 合并机械拆开的声明与初始化，并下沉 hoisted local。
 //!
-//! 消费 AST binding/use 和词法控制流事实，保持声明对读写的支配及原求值顺序。
-//! 例如 local a; a=f() 可合成 local a=f()；仍在分支外被读取或写入的声明不能
-//! 只沉入某个分支。单次别名内联属于 inline-exprs，不在这里提前固化成多目标声明。
+//! 消费 binding/use 和词法控制流事实，保持声明支配及原求值顺序。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

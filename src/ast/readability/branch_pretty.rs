@@ -1,9 +1,6 @@
-//! 将合法 AST 条件语句整理为更直接的源码形状。
+//! 整理合法 AST 条件语句的源码形状。
 //!
-//! 消费已有 binding/capture 与控制流事实，处理 guard flatten、then/else 极性
-//! 和 repeat 尾部条件；不补 HIR 语义或重新恢复错误控制流。
-//! 例如 if not c then a() else b() end 可交换为 if c then b() else a() end，
-//! 涉及声明、退出及嵌套循环的情况仍须保持原作用域和控制 owner。
+//! 消费 binding、capture 与控制流事实，保留原作用域和控制 owner。
 
 use super::super::common::{
     AstBlock, AstExpr, AstIf, AstLocalAttr, AstLogicalExpr, AstModule, AstRepeat, AstReturn,

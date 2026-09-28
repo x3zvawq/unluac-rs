@@ -1,4 +1,4 @@
-//! 构造常规及退化 numeric/generic-for 循环候选；依赖 natural domain 与 VM 指令状态，不负责 body scope 精化；例如恢复无自身回边的 generic-for owner。
+//! 构造常规及退化 numeric/generic-for 循环候选；依赖 natural domain 与 VM 指令状态，不负责 body scope 精化。
 
 use super::*;
 

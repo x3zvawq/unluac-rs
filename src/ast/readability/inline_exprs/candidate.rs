@@ -1,8 +1,6 @@
-//! 这个子模块负责 `inline_exprs` pass 的候选识别和策略分类。
+//! 识别 inline-exprs 候选并分类其策略。
 //!
-//! 它依赖 AST 当前的赋值/local 形状与表达式分析，只回答“这一句能否当作 inline 候选”，
-//! 不会在这里改写 use site。
-//! 例如：`local r0 = print` 会在这里被识别成一个可继续审查的 local alias 候选。
+//! 消费当前 AST 声明、赋值与表达式事实，使用点证明及替换由其它子模块负责。
 
 use super::super::super::common::{
     AstBindingRef, AstCallKind, AstExpr, AstLocalAttr, AstLocalDecl, AstLocalOrigin, AstStmt,

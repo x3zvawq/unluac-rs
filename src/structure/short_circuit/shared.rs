@@ -1,15 +1,6 @@
-//! 这个文件承载 short-circuit 提取时共用的 CFG 辅助规则。
+//! 短路候选提取共用的 CFG 查询与条件规则。
 //!
-//! 比如线性跟随、真值边翻译、无环检查都同时服务 branch-exit 和 value-merge 两类
-//! 候选；把它们集中起来可以避免两个 pass 各自养一套近似状态机。
-//!
-//! 它依赖 CFG / GraphFacts 已提供的图查询与 low 指令分类，只表达短路提取
-//! 两边都共享的“小规则”，不会越权判断最终源码语法。
-//!
-//! 例子：
-//! - `LinearFollowCtx` 会沿着只剩 jump/fallthrough 的垫片 block 继续跟到下一个判断头
-//! - `truthy_falsy_targets` 会把 branch 的真假边统一翻成短路里的 truthy/falsy 目标
-//! - `short_circuit_nodes_are_acyclic` 会挡住有环图，避免后层再替结构层兜底
+//! 消费 GraphFacts 和 Low-IR 分类，为 branch-exit、value-merge 提供一致的图边界。
 
 use std::collections::{BTreeMap, BTreeSet};
 

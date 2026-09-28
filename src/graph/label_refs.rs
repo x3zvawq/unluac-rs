@@ -1,10 +1,6 @@
-//! 当前语句快照的词法 label 引用索引，不解释运行可达性或 Structured CFG。
+//! 当前语句快照的词法 label 引用索引。
 //!
-//! 各层提供顶层 owner 内的 label 与 goto 集合，索引保留每个 label 的有序来源位置，
-//! 并用来源极值按目标 owner 建立区间树。区间内任一 label 的来源越出允许范围，即存在外部入边。
-//! 例如 owner 0 的 goto 指向 owner 3 的 label，则目标区间 [2,4) 有来自前缀的入边。
-//! 查询某个来源区间内是否存在 goto 时读取精确位置：来源 0、4 不能证明 [1,4) 有入边。
-//! 同一 label 在多个 owner 中出现时，每个位置都保留该来源事实；不在这里猜词法合法性。
+//! 消费各 owner 的 label/goto 集合，提供来源区间查询，不推断执行可达性。
 
 use std::collections::BTreeSet;
 use std::ops::Range;

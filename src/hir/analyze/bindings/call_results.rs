@@ -1,12 +1,6 @@
-//! 为未读的固定 CALL 结果恢复原槽复用前的词法末端。
+//! 恢复未读固定 CALL 结果在原槽复用前的词法窗口。
 //!
-//! 单结果接收仍影响 VM 帧，不能改成忽略结果。Dataflow 证明准备区的全部定义均不活出，
-//! 后继原 callee 准备立即覆盖结果槽时，把完整准备和 CALL 放入独立窗口：
-//! `do local result=seed(args) end; callback(true)`，避免 locals 把 result 接到更晚的
-//! 同槽表分配，抬高中间 CALL 的空闲槽。这里只分配身份和窗口，调用表达式与源码前缀
-//! 仍由现有 native frame owner 验证；不提前清空结果、不改写 CALL 的接收宽度。
-//! 每个块按 CALL/cleanup 分割准备区，每条指令和定义使用至多检查一次；跨前次 CALL
-//! 的高槽依赖、open/capture 和未单独发射的范围不借此重建。
+//! 消费 Dataflow 的准备区与结果定义，发布绑定身份和窗口；完整调用帧由原 owner 验证。
 
 use super::*;
 use crate::hir::promotion::ProtoPromotionFacts;

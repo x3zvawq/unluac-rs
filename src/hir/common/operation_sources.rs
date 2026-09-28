@@ -1,9 +1,6 @@
-//! 保留互斥表达式合并后的全部原操作来源。
+//! 保存互斥表达式合并后的完整原操作来源。
 //!
-//! 来源由原 NEWTABLE/GETTABLE/SETTABLE lowering 发布；改写 owner 先证明形状与求值轨迹，再合并来源。
-//! 例如 `(a and {}) or (b and {})` 的共享尾仍须同时满足两处分配的物理许可。
-//! 合并用持久 DAG，不逐次复制已有集合；查询和 proto remap 按共享节点去重，避免
-//! 重复展开或递归栈。未知分支保留在域内，不能借其它已知分支取得原槽证明。
+//! lowering 发布来源，改写 owner 证明轨迹后合并；查询保留未知来源，避免签发不完整许可。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

@@ -1,9 +1,6 @@
 //! 按 Lua 值语义整理 HIR 逻辑表达式和条件。
 //!
-//! 消费 short-circuit/decision 已恢复的表达式与共享值域、安全性事实，消除机械
-//! 重复及合成 NOT 链；原字节码的显式运算保留，不重新分析 CFG 或改写一般控制结构。
-//! Lua 的 and/or 返回原操作数，因此 x and x 只有在 x 可稳定重复求值时才可折为 x，
-//! 未知值的偶数 NOT 链仍需保留两层布尔转换。具体恒等式的证明放在对应归约处。
+//! 消费已恢复的表达式与共享值域、安全性事实，消除机械重复并保留原显式运算。
 
 use super::expr_facts::{expr_is_boolean_valued, expr_truthiness};
 use super::walk::{HirRewritePass, rewrite_proto};

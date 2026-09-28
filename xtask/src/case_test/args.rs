@@ -1,4 +1,4 @@
-//! 解析 case-test CLI/环境选项并执行过滤与显示辅助；依赖 Options，不负责运行进程；例如校验 jobs/timeout 非零及 progress/color 模式。
+//! 解析 case-test CLI/环境选项并执行过滤与显示辅助；依赖 Options，不负责运行进程。
 
 use super::*;
 

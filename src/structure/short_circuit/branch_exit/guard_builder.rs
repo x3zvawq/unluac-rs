@@ -1,4 +1,4 @@
-//! 用显式任务状态构建 guard branch-exit DAG；依赖 CFG/branch candidates 与稠密节点索引，不负责线性链推断；例如解析嵌套 guard 的真假出口。
+//! 用显式任务状态构建 guard branch-exit DAG；依赖 CFG/branch candidates 与稠密节点索引，不负责线性链推断。
 
 use super::*;
 

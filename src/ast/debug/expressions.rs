@@ -1,4 +1,4 @@
-//! 格式化 AST 表达式、lvalue、call 与函数参数；依赖操作符和渲染名称，不负责遍历 proto 树；例如保持复杂字面量和 method call 的可读结构。
+//! 格式化 AST 表达式、lvalue、call 与函数参数；依赖操作符和渲染名称，不负责遍历 proto 树。
 
 use super::*;
 

@@ -1,14 +1,8 @@
-//! HIR 层共享的子节点遍历宏。
+//! HIR 子节点结构与访问角色的共享遍历宏。
 //!
-//! 和 `ast::traverse` 同一套思路：把"一个 HIR 节点有哪些子节点需要递归"这件
-//! 结构事实收成参数化宏，不同 pass 只需要提供回调就能得到完整的 child dispatch。
-//!
-//! 原先只在 `hir::simplify` 内部使用，现在提升到 `hir` 层面让 naming 等模块也能共享。
-//! 可变遍历不会把 value-pack tail 暴露成 `&mut HirExpr`：固定值仍按普通表达式遍历，
-//! tail 只能进入 Call 内部，因而任何 pass 都无法把其根节点改成非 Call/VarArg。
-//! closure 边保留完整 capture，不把 ByReference cell 与 ByValue snapshot 都降成普通读取。
-//! source-only root release 单独暴露 LocalId；可变遍历可更新身份，不能降成 VM home 写。
+//! 调用方提供回调；本模块统一 value-pack、capture 和 source-only root release 的遍历边界。
 
+// 可变 tail 只暴露 Call 内部，避免回调把开放尾包的根替换成非 Call/VarArg 表达式。
 macro_rules! traverse_hir_value_pack_children {
     (
         $pack:expr,

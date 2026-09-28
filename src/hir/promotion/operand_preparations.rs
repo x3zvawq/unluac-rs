@@ -1,14 +1,7 @@
-//! 保留操作输入树化前的原 CALL、读取、Boolean 运算与字面量准备事实。
+//! 保留操作输入树化前的原准备写入身份。
 //!
-//! Dataflow 的 use→Def 将读取绑定到其消费者，而非给同名上值一个全局 home。
-//! 例如 GETUPVAL r0 后原位 LEN r0，输入内联为 `#captured` 后仍能证明先写 r0；
-//! 后续元方法或 CALL 的物理根义务由完整帧 owner 验证，不由这个入口证书提前退休。
-//! 固定单返回 CALL 的准备只发布原输入 Def/home；`poll()+1` 与 `-poll()` 的高槽
-//! 调用、低槽结果及后缀根义务由完整 initializer 一起消费。
-//! 每次只查一个原 use 和其唯一 Def，比较、一元/二元、CONCAT 首项及动态索引
-//! 共用相同身份和 epoch 检查。高槽 key 先于低槽 base 时，完整索引 owner 另保留两者顺序。
-//! SETTABLE 目标若来自 GETTABLE，证书绑定精确读取来源且仅有这一个 use；
-//! 多次使用的表变量不会误作可删除的目标快照，字段树的输入布局仍由帧 owner 逐层核对。
+//! 消费 Dataflow 的 use/Def、home 与 epoch，为完整帧 owner 发布来源证书；
+//! 证书本身不授权删除 producer 或提前退休物理根。
 
 use crate::hir::common::{HirExpr, TempId, UpvalueId};
 use crate::parser::RawLiteralConst;

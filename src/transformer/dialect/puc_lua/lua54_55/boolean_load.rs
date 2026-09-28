@@ -1,4 +1,4 @@
-//! 降低 Lua 5.4/5.5 的布尔常量及 LFALSESKIP；依赖跳转目标校验，不负责其他常量；例如为 LFALSESKIP 同时发射 false 与跳过下一指令的边。
+//! 降低 Lua 5.4/5.5 的布尔常量及 LFALSESKIP；依赖跳转目标校验，不负责其他常量。
 
 use super::*;
 

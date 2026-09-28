@@ -1,15 +1,6 @@
-//! 这个子模块负责把“缺失 global 声明”收成最小 collective gate。
+//! 为 Lua 5.5 现有 global gate 选择等价的 collective 声明形式。
 //!
-//! 在 Lua 5.5 里，已有 AST gate 会约束后缀中的 global 访问；当逐名声明与 collective
-//! gate 都能表达该约束时，这里的 owner 只处理 AST 级 canonical 选择，不声称恢复原源码形状：
-//! - 优先把终端语句尾巴收成最小 `do + global *` / `global<const> *`
-//! - 它不会去猜 block 外是否也存在同一批 global
-//! - 也不会跨越 label/goto 之类高风险控制流去硬包一层 `do`
-//! - repeat suffix 只有在 until 条件仍能看到所需 binding、且局部根/close 生命周期不变时才包裹
-//!
-//! 例子：
-//! - `local ok = ...; local left = math.max(...); return left`
-//!   会被收成 `local ok = ...; do global<const> *; local left = ...; return left end`
+//! 消费当前 AST 的词法、绑定与生命周期事实，生成局部声明作用域；不推断原源码形状。
 
 use std::{collections::BTreeSet, ops::ControlFlow};
 

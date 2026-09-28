@@ -1,4 +1,4 @@
-//! loop containment 与控制目标的稠密查询索引。输入最终 RegionArena 和 LoopPartitions，输出 block/edge 到最内层 loop、break/continue owner 及传播 break 的映射；不负责修改候选。例如 edge 分类可 O(1) 判断 source 是否离开最内层 loop。
+//! loop containment 与控制目标的稠密查询索引。输入最终 RegionArena 和 LoopPartitions，输出 block/edge 到最内层 loop、break/continue owner 及传播 break 的映射；不负责修改候选。
 
 use super::*;
 

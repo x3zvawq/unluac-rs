@@ -1,4 +1,4 @@
-//! 选择并证明值短路判定 DAG；依赖 SSA、phi 与闭合性证据，不负责普通布尔条件；例如筛除结果定义逃逸的 and/or value merge。
+//! 选择并证明值短路判定 DAG；依赖 SSA、phi 与闭合性证据，不负责普通布尔条件。
 
 use super::*;
 use crate::structure::cfg::EvaluationDependency;

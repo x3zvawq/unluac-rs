@@ -1,4 +1,4 @@
-//! 分类 if/else、guard、透明跳转与 soft merge；依赖 CFG 后支配事实，不负责候选细化；例如为无显式 merge 的终止 arm 找到局部软合流。
+//! 分类 if/else、guard、透明跳转与 soft merge；依赖 CFG 后支配事实，不负责候选细化。
 
 use super::*;
 

@@ -1,12 +1,6 @@
-//! 保存固定定义写入前的物理值身份，独立于 pruned SSA 的表达式 use graph。
+//! 保存固定定义写入前的物理值身份。
 //!
-//! SSA 入口快照是已有 canonical 身份的边界；缺失的 dead-in 槽按 `(block, reg)`
-//! 建共享查询图，所有路径一致才发布旧值，不为物理覆盖增加表达式 phi/use。
-//! 例如循环后穿过几个不读状态的分支再 `state = nil`，仍能关联原 carried phi；
-//! 不同旧值合流或 open result 覆盖则未知。这里只证明覆盖关系，不分配 HIR local。
-//!
-//! 指令按块扫描一次，查询节点最多从未到达到已知、再到未知，各边最多传播两次；
-//! 多个定义共用入口查询，不按定义反复回扫指令前缀或整个 CFG。
+//! 消费 CFG 与 canonical SSA 边界，发布覆盖关系；不向表达式 use graph 增加 phi 或 use。
 
 use std::collections::{BTreeMap, VecDeque};
 

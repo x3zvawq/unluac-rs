@@ -1,4 +1,4 @@
-//! 枚举 guard、线性与 if/else branch-exit 条件候选；依赖 branch 表和闭合 interior 过滤，不负责临时 DAG 节点构造；例如选择最长的无副作用线性条件链。
+//! 枚举 guard、线性与 if/else branch-exit 条件候选；依赖 branch 表和闭合 interior 过滤，不负责临时 DAG 节点构造。
 
 use super::*;
 

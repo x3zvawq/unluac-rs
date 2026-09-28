@@ -1,4 +1,4 @@
-//! 解析并校验源码中的可读性与结构合同指令；依赖 manifest/StructureFacts，不负责执行 Lua；例如检查生成源码包含、顺序及 loop protocol。
+//! 解析并校验源码中的可读性与结构合同指令；依赖 manifest/StructureFacts，不负责执行 Lua。
 
 use std::collections::BTreeMap;
 

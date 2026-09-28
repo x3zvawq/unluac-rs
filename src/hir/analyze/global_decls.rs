@@ -1,15 +1,6 @@
-//! 这个文件恢复 Lua 5.5 `global` 初始化协议，并冻结协议在 HIR 中的唯一 owner。
+//! 从 Low-IR 与 SSA 恢复 Lua 5.5 global 初始化协议。
 //!
-//! 编译器先完整求值 RHS，再按源码 target 的逆序发出 `GETTABLE / ERRNNIL / SETTABLE`。
-//! 单结果调用可连同唯一 target 由调用指令直接认领；其它标量结果由完整 target run
-//! 认领，并在 HIR 中保留原有 value carrier。多结果调用只有在全部 result 与 target
-//! item 都能由 SSA 唯一配对时才整体认领，避免部分声明改变写入顺序或 GC root 生命周期。
-//! 本模块不根据普通 global 写入猜声明，也不处理声明合并或展示 sugar。
-//! 协议中的原始名字只作为 VM 常量身份保留；它能否作为目标 Lua 方言的声明标识符，
-//! 由 AST lowering 统一验证，HIR 不依赖 AST 语法规则。
-//!
-//! 输入形状：`CALL fixed(r0) + GETTABLE + ERRNNIL + SETTABLE`。
-//! 输出形状：一个 owner 覆盖完整区间的 typed `HirStmt::GlobalDecl` 协议。
+//! 发布覆盖完整协议的 typed HIR 声明及唯一 owner；标识符合法性和展示形式由 AST 处理。
 
 use crate::parser::RawLiteralConst;
 use crate::structure::{Cfg, DataflowFacts, DefId, InstrRange, SsaValue};

@@ -1,9 +1,6 @@
-//! 当前函数的名字访问谓词，消费共享 visitor 发布的角色并在首次命中时停止。
+//! 当前 AST 函数体的名字访问查询。
 //!
-//! 集合引用包括声明、读写与显式 capture；例如 `local x=...` 的 x
-//! 已在集合中时，不再遍历 initializer。函数 target 的身份来自同一名字事件，child body
-//! 不属于当前函数，不能把 child 的同号 binding 当作外层引用。
-//! reads 只计 Read，uses 计 Read/Capture；赋值查询只计 Write，不能混入声明角色。
+//! 消费共享 visitor 的声明、读写和 capture 角色，不进入 child body。
 
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;

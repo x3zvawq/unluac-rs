@@ -1,12 +1,6 @@
-//! 这个子模块把 Structure 冻结的 condition/value-decision DAG 逐节点降低成 HIR decision。
+//! 将 Structure 冻结的 condition/value-decision DAG 降低为 HIR Decision。
 //!
-//! 节点 identity、真假连边和终端出口都由 `ConditionPlan` 给出；这里不再读取 raw
-//! candidate、重选候选或截断控制图。入口 block 的 prefix 由结构 lowering 显式发射，
-//! 其余被折叠节点使用单次求值表达式，避免引用不会单独发射的中间 temp。入口 prefix
-//! 里的匿名稳定字面量允许直接成为 value leaf；动态值和源码 binding 仍引用已发射身份。
-//! LuaJIT 的比较可触发 cdata __eq；两条物理终端已在同一结果槽写入 true/false 时，
-//! 直接返回该次比较的 Boolean 值。例如 `not ok and value == 9` 不必先拆成 if，
-//! 也不需要把比较声明为可重复求值。这里只消费冻结的终端身份，不为合成谓词猜写槽。
+//! 消费节点身份、连边、出口与原操作来源，保留单次求值和终端值身份。
 
 use super::*;
 use crate::hir::rewrite::replace_temp_in_expr;

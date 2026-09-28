@@ -1,9 +1,6 @@
-//! 计算每个程序点之前物理槽是否可能仍有开放的引用捕获。
+//! 分析各程序点之前可能开放的引用捕获槽。
 //!
-//! 消费 Transformer 的 Capture/Close 与共享 CFG；不从 HIR closure 文本重建路径。
-//! Capture 建立开放 cell，覆盖槽值不关闭 cell，Close 则终止它。例如先 `f(t.x)`、后在
-//! 同一寄存器建立捕获 local，不能把未来的捕获当作先前参数槽仍属于 caller 的证据。
-//! 先汇总块内生成与关闭，再传播单调的入口 may 位；每块最多入队一次，回边也参与合流。
+//! 消费 Transformer 的 Capture/Close 与共享 CFG，发布物理 cell 活动事实。
 
 use super::{CaptureSource, Cfg, LowInstr, LoweredProto, Reg, VecDeque};
 

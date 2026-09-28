@@ -1,12 +1,6 @@
-//! 这个子模块是 `global_decl_pretty` pass 的 scoped 重写入口。
+//! 协调 global 声明的作用域内重写与可见性维护。
 //!
-//! 它依赖 `facts/insert/merge` 和共享 scoped walker，只负责在 block 作用域链上协调
-//! merge + 可见 global 集维护，不会在这里重写普通表达式 sugar。
-//! 例如：singleton seed local + `global` handoff 会在这里先合并；Lua 5.5 的 missing
-//! global 声明只会在当前作用域已有 AST `GlobalDecl`/global-function gate 时，从词法观测
-//! 推导满足该 gate 的等价声明，并放回原激活点。前层未发布显式 gate 时不发明声明。repeat
-//! body 与 until condition 的 missing observation 分开结算，因为 suffix 内的新 `do` gate
-//! 不会扩展到条件。
+//! 消费当前 AST 的显式 gate 和各子模块发布的声明事实，不凭普通全局访问发明 gate。
 
 use super::super::ReadabilityContext;
 use super::super::walk::{ScopedAstRewritePass, rewrite_module_scoped};

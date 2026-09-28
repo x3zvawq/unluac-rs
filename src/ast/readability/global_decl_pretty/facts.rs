@@ -1,11 +1,6 @@
-//! 这个子模块负责 `global_decl_pretty` pass 的事实收集。
+//! 收集当前 AST block 的显式 global gate 与访问事实。
 //!
-//! 它依赖共享 visitor 的 block pruning 在一次遍历里收集“当前 block 的显式 global、直属
-//! 闭包写入、当前 block 的读写观测”，不会把普通子 block 的 gate 提升到父作用域，也不会
-//! 在这里直接插入或合并声明。观测还会记录它位于当前 block 首个显式 gate 的前后，避免
-//! 把隐式 `global *` 区域误算成受后续声明约束。
-//! 例如：块里读到 `print`、写到 `installer` 时，这里会分别记成常量/可写观测；
-//! 如果块里显式出现了 `global *`，这里也会把 collective gate 作为正式作用域事实留下来。
+//! 消费共享 visitor 的作用域边界，向声明整理发布带激活位置的观测，不直接改写 AST。
 
 use std::collections::{BTreeMap, BTreeSet};
 

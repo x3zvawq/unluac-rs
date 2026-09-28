@@ -1,4 +1,4 @@
-//! 识别并分配结构化 continue 边所有权；依赖 loop/branch 候选与图事实，不负责循环形态推导；例如识别经共享 backedge pad 的提前下一轮。
+//! 识别并分配结构化 continue 边所有权；依赖 loop/branch 候选与图事实，不负责循环形态推导。
 
 use super::*;
 

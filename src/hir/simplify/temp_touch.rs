@@ -1,13 +1,6 @@
-//! 这个文件承载 temp 引用检测相关的纯查询工具。
+//! 提供 HIR temp 的只读 read/touch 查询及出现位置索引。
 //!
-//! 独立表达式、语句片段与 proto 的一次性查询在这里按明确的 read/touch 角色收集。
-//! `carried_locals` 的当前改写快照仍由 `TempTouchIndex` 发布直属语句位置；locals 与
-//! root 分析的递归快照则消费共享 RootEventIndex，不在这里重建每层后代集合。
-//!
-//! 这些查询都是只读的，不会修改 HIR 结构。位置事实直接发布到共享 PositionIndex，
-//! 不先复制每条语句的集合再转置或计数。按 temp 建立的 occurrence index 让候选扩张
-//! 只访问真实 touch 语句，不必为每个定义重复扫描完整后缀。touch 包含 Temp lvalue 写入，
-//! 不能替代只读取表达式的 read 查询；两者都遵守共享 visitor 的 capture 绑定投影。
+//! 消费当前表达式或语句快照；递归根分析和 locals 的共享事件由 RootEventIndex 持有。
 
 use std::collections::BTreeSet;
 

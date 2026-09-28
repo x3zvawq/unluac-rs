@@ -1,9 +1,6 @@
-//! 收敛相邻 seed/carried local 的单目标交接。
+//! 证明并收敛相邻 seed 与 carried local 的单目标交接。
 //!
-//! 消费父模块的 capture/TBC/home 保护与结构化路径事实，仅在 seed 不再可观察、
-//! carried 的读取受交接写支配时合并身份；反向或多目标写回由其它 owner 处理。
-//! 例如 local s=1; local c; c=s; print(c) 可收成 local s=1; print(s)，
-//! 但 print(c) 位于 c=s 之前时必须保留原 nil 读取。
+//! 消费父模块的身份保护与路径事实，保留可观察的旧状态。
 
 use std::collections::BTreeMap;
 

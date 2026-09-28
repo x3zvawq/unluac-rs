@@ -1,10 +1,6 @@
-//! 这个子模块负责回收“局部别名 + method call”形成的调用链。
+//! 回收局部别名形成的方法调用链。
 //!
-//! 它依赖 binding-flow 已统计好的使用次数，只处理纯机械 alias 链，不会越权推断新的
-//! 函数 sugar。
-//! 例如：`local x = obj:first(); x:finish()` 会在这里尝试折回
-//! `obj:first():finish()`。
-//! 无用声明由前置 cleanup/fixed-point 删除；这里不跨越其它语句寻找链段。
+//! 消费 binding-flow 与当前相邻语句，保持别名和调用的求值语义。
 
 use super::super::binding_flow::BindingUseIndex;
 use crate::ast::common::{

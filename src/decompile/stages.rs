@@ -1,12 +1,7 @@
-//! 这个文件承载主反编译 pipeline 的阶段调度表。
+//! 主反编译流水线的阶段调度表。
 //!
-//! `pipeline.rs` 只负责创建一次调用的状态与上下文；这里维护固定阶段顺序，统一处理
-//! 阶段 timing、完成标记、target-stage 停止点和 debug dump 分派。阶段表直接用模块路径绑定
-//! `DecompileStage` 与对应层主体入口，调度循环只按表调用，不再手写阶段 match。
-//!
-//! 这种拆分保留了“固定阶段枚举 + 强类型槽位”的可排错性，同时让 Structure / AST
-//! 自己调度内部子步骤。Generate 相关 warning 也在 Generate 阶段内基于最终 AST
-//! 产物计算，不再由 AST 内部步骤提前返回计划对象。
+//! 消费单次调用的状态与选项，统一阶段顺序、完成标记、停止点、计时和 dump 分派；
+//! 各层自行组织内部步骤并发布产物。
 
 use super::error::DecompileError;
 use super::options::DebugOptions;

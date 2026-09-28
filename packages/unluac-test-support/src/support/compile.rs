@@ -1,4 +1,4 @@
-//! 构造反编译选项并调用各方言编译器生成 suite artifact；依赖 manifest 和 toolchain，不负责输出比较；例如编译临时生成的 Lua 源码。
+//! 构造反编译选项并调用各方言编译器生成 suite artifact；依赖 manifest 和 toolchain，不负责输出比较。
 
 use super::*;
 

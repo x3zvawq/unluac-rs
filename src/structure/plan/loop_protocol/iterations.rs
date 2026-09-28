@@ -1,4 +1,4 @@
-//! 冻结和校验迭代边处置及其值可用性；依赖 CFG、SSA 和最终边计划，不负责 loop 语法形态；例如区分 latch、backedge 和绕过 tail 的 continue。
+//! 冻结和校验迭代边处置及其值可用性；依赖 CFG、SSA 和最终边计划，不负责 loop 语法形态。
 
 use super::*;
 

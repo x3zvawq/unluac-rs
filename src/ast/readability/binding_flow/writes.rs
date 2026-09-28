@@ -1,11 +1,6 @@
-//! 当前 AST 语句快照的名字写入位置索引。
+//! 当前 AST 语句快照的名字写入与重绑定位置索引。
 //!
-//! 同一顶层语句的嵌套赋值只登记一个位置；按语句顺序构建稀疏有序表，区间查询不再
-//! 为每个候选遍历整个后缀。名字保留 Param/Upvalue 等身份，binding 查询只做 typed 投影。
-//! 例如 `local a=x; if p then x=y end; use(a)` 中 x 的写入属于 if 的顶层位置。
-//! 普通 local/for binder 的初始化不是对已有名字赋值；local function 的递归声明单独
-//! 登记，删除声明的 consumer 可查询重绑定，不能把它混入 inline 的后续赋值证明。
-//! 不进入 child function；闭包潜在写入仍由 capture metadata 的 owner 负责。
+//! 消费共享访问角色，供区间查询使用；不进入 child function 或推断闭包潜在写入。
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;

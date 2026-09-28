@@ -1,4 +1,4 @@
-//! 编排最终 phi ownership、收集稠密边动作并提供 canonical copy 查询；依赖冻结 StructurePlan，不负责转发链求值；例如把唯一 incoming 写入对应 EdgePlan。
+//! 编排最终 phi ownership、收集稠密边动作并提供 canonical copy 查询；依赖冻结 StructurePlan，不负责转发链求值。
 
 use super::*;
 

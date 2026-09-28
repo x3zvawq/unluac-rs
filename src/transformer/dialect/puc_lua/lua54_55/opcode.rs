@@ -1,4 +1,4 @@
-//! 将 Lua 5.4/5.5 opcode dispatch 降低为共享 LowInstr；依赖 adapter 和 ProtoLowerer 辅助，不负责 chunk 递归；例如处理 TBC、metamethod helper 与 for 协议。
+//! 将 Lua 5.4/5.5 opcode dispatch 降低为共享 LowInstr；依赖 adapter 和 ProtoLowerer 辅助，不负责 chunk 递归。
 
 use super::*;
 

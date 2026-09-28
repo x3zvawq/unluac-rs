@@ -1,4 +1,4 @@
-//! 定位 pinned Lua 工具、管理 artifact 路径并执行子进程；依赖仓库布局和文件系统，不负责测试语义；例如按方言选择 luac/luau-compile。
+//! 定位 pinned Lua 工具、管理 artifact 路径并执行子进程；依赖仓库布局和文件系统，不负责测试语义。
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! 重叠 loop evidence 的规范化。输入同 header 或嵌套候选，输出无重复的最终 loop inputs 与必要 residual islands；不负责 region 物化。例如同一控制身份的候选会合并 backedge、value merge 与 continuation 事实。
+//! 重叠 loop evidence 的规范化。输入同 header 或嵌套候选，输出无重复的最终 loop inputs 与必要 residual islands；不负责 region 物化。
 
 use super::*;
 

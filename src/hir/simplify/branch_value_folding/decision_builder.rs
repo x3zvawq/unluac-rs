@@ -1,14 +1,6 @@
-//! raw temp branch-value 树的单次 Decision 构建器。
+//! 将已证明为同一 binding 选值的 raw temp 分支树构造成 HIR Decision。
 //!
-//! Structure/HIR lowering 可能把一条长短路值链展开成多层 `assign guard; if guard`。
-//! 父 pass 已证明候选只为同一 binding 选值；这里一次遍历整棵树，增量携带 local/temp
-//! 引用事实并建立 root-first Decision，最后只做一次 value finalize。它不会决定候选是否
-//! 能跨出根语句，也不会处理 local 壳或 goto/label 壳。
-//!
-//! 例子：`t0=a; if t0 then out=t0 else t1=b; if t1 ... end end` 会先建成两个 Decision
-//! 节点，再一次收敛为 `out = a or b or ...`，而不是每深入一层重扫和 clone 已构造子树。
-//! 无事件且 GC-inert 的叶值可带同 home 的机械 copy；消费 Promotion 的槽身份并保留最终
-//! 覆盖点，例如 `a=true; out=a` 不能因 root endpoint 的存在被迫先物化成可变 local。
+//! 消费父 pass 的候选与 Promotion 来源事实，发布完整值决策；跨语句许可由父 pass 持有。
 
 use std::collections::BTreeSet;
 

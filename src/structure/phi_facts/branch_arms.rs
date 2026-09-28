@@ -1,4 +1,4 @@
-//! 将 branch phi incoming 汇入 then/else arm 的值集合；依赖支配与数据流，不负责 branch 候选选择；例如区分 entry value 与 arm 内更新值。
+//! 将 branch phi incoming 汇入 then/else arm 的值集合；依赖支配与数据流，不负责 branch 候选选择。
 
 use super::*;
 

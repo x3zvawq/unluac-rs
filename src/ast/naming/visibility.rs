@@ -1,9 +1,6 @@
 //! 按最终 AST 定义位置查询已分配名字的外层可见性。
 //!
-//! lexical 发布绑定的有效区间，父函数完成 NameMap 后才把区间关联到最终名字。
-//! 同名区间合并为不相交集合，查询不再复制或遍历祖先绑定；例如 `do local a;
-//! f = function() end end; g = function() end` 只让 f 的参数避让 a。
-//! 名字仍按 HIR proto 顺序分配，因此区间必须支持任意顺序插入。
+//! 消费 lexical 区间与父函数 NameMap，供参数和局部命名避让。
 
 use std::collections::BTreeMap;
 use std::ops::Range;

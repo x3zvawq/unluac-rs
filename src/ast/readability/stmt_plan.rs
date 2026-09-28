@@ -1,11 +1,6 @@
-//! 这个文件提供 Readability block 重建时的所有权转移计划。
+//! Readability block 重建的所有权转移计划。
 //!
-//! pass 可以先借用完整旧 block 做 lookahead 与 use 分析，只记录需要保留的原语句索引
-//! 和已经提交的局部改写；分析结束后再一次性 move 原语句，避免 clone 深层 closure 子树。
-//! 这里不判断任何 pass 语义，也不参与 trial/rollback。
-//!
-//! 例子：`[Original(0), Rewritten(stmt), Original(3)]` 会保留旧语句 0、跳过被改写
-//! 覆盖的中间语句，再接上旧语句 3。
+//! 记录已确定的原语句保留与局部改写，统一移交输出；语义证明由 pass 持有。
 
 use super::super::common::AstStmt;
 

@@ -1,12 +1,6 @@
-//! GraphFacts 层的稳定事实与树查询。
+//! GraphFacts 的稳定事实模型与共享树查询。
 //!
-//! 这里负责支配树、后支配树、SCC、backedge、natural loop 这些“已经脱离原始 CFG 结构、
-//! 但仍属于通用图分析”的事实。StructureFacts/HIR 只应该调这些查询接口，不应再回头
-//! 自己揉 parent 数组、重新实现最近公共祖先或重复扫描图判断环。NaturalLoopForest
-//! 额外冻结 loop parent、innermost owner 和 direct block，供后层按 ancestor iterator 查询。
-//! SCC 同时保留拓扑身份与 condensation 前驱；例如 `entry -> a -> b -> a` 中 a/b
-//! 共用一个成环身份，捕获写后分析直接查询该身份，不再另建 block-to-SCC 映射。
-//! 迭代支配边界统一扩展已有定义与合流种子；值活性、Close 出口及虚拟入口仍由消费者决定。
+//! 向结构分析和 HIR 提供支配、后支配、SCC 与自然循环关系，统一通用图事实的访问边界。
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ops::Range;

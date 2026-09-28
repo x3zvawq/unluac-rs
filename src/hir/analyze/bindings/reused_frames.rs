@@ -1,15 +1,7 @@
-//! 在原 numeric-for header 复用低槽前，恢复已闭合的直线声明帧。
+//! 恢复 numeric-for header 复用低槽前已经闭合的声明帧。
 //!
-//! 事实来自冻结 for 协议、Dataflow 的固定定义/使用和共享求值起点查询；不推断循环次数，
-//! 不把逻辑 binding Def 当作无条件物理清零。例：`do local a,b,c,t=false,false,false,{};
-//! weak[1]=t end; for i=header(arg()) ... end` 保留四个原槽，在 header 首求值前结束 do，
-//! 让参数查找、CALL 和 FORPREP 各自在原位置观察或覆盖旧根，而不是提前生成 nil。
-//! 这里只接受入口直线帧：首次定义按原槽递增，后续同槽写仍属于该窗口，所有高槽使用
-//! 和 Phi 都不逃出；低槽前缀限参数及单写常量。窗口内 CALL/open/capture 不借此改址。
-//! 窗口前已由紧邻 SETUPVAL 发布的无名闭包准备不属于声明帧；它仍在原位置创建和写入。
-//! 例如先发布 `clear=function() parameter=nil end`，再进入上面的 do，不能把闭包的
-//! scratch home 与随后 a 的 debug scope 合成一个窗口，也不能把参数 capture 移进 do。
-//! 每个 preheader 只处理一次，全部绑定和不交叉边界先证明，再一起发布；后层不重建原槽。
+//! 消费冻结的 for 协议、Dataflow 与共享求值起点，发布绑定和词法窗口；
+//! 物理覆盖仍由原操作承担。
 
 use super::*;
 use crate::hir::promotion::ProtoPromotionFacts;

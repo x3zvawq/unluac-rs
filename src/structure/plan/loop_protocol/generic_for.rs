@@ -1,4 +1,4 @@
-//! 提取并校验 generic-for header/prep/source 指令协议；依赖 lowered 指令与 terminator，不负责通用循环值分析；例如匹配 TFORCALL/TFORLOOP 组合。
+//! 提取并校验 generic-for header/prep/source 指令协议；依赖 lowered 指令与 terminator，不负责通用循环值分析。
 
 use super::*;
 

@@ -1,4 +1,4 @@
-//! 解析 capture identity、构建 composite factory 并检查 dominance envelope；依赖匹配组件与图事实，不负责词法 scope；例如确认 owner 支配全部 replacement。
+//! 解析 capture identity、构建 composite factory 并检查 dominance envelope；依赖匹配组件与图事实，不负责词法 scope。
 
 use super::*;
 

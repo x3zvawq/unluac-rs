@@ -1,8 +1,6 @@
-//! 提取直接流向整体真假出口的短路条件链。
+//! 提取直接流向整体真假出口的短路条件候选。
 //!
-//! 消费 branch 候选、支配/后支配与共享线性跟随规则，发布条件出口候选；
-//! 不拆 phi，不承担 value-merge 的值来源分类。
-//! 例如 if a or b then body() end 的真出口进入 body，假出口直接跳过。
+//! 消费分支、支配及共享图查询，值合流来源由 value-merge 负责。
 
 use std::collections::{BTreeMap, BTreeSet};
 

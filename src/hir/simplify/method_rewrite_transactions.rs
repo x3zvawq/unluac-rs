@@ -1,10 +1,6 @@
-//! 在 HIR fixed point 之后签发 method lookup/call 的双端原子改写事务。
+//! 在 HIR 收敛后签发 method lookup/call 的原子改写事务。
 //!
-//! low IR/SSA 只提供 method setup 的原始协议和 canonical callee definition；本模块在
-//! 最终 HIR 上再次证明 producer/call occurrence、旧 target 根与稳定 alias-chain co-holder。AST 只会
-//! 收到不透明 token，不接触 temp、home 或 reaching-def 事实。
-//! 别名状态按实际 local 写入退休直接边，不按每条语句重查所有历史 alias：
-//! `b=c; a=b; c=other` 只结束 b→c，a→b 保持有效，链查询在缺失边处停止。
+//! 消费原方法协议与最终 HIR 使用、别名和根事实，向 AST 发布不透明许可。
 
 use std::collections::{BTreeMap, BTreeSet};
 

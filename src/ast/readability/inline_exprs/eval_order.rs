@@ -1,12 +1,6 @@
-//! 相邻单候选和多候选 run 搬运前的求值顺序证明。
+//! 证明 inline 候选搬入使用点后的求值顺序与循环求值语境。
 //!
-//! inline 会把声明 RHS 搬进 sink。这里把可观察 RHS 与 binding 值快照当成有序事件，
-//! 递归展开它们之间的依赖，并要求这些事件仍是 sink 的同序前缀；任一 retained 有序
-//! 声明或 sink 自身的状态事件都会形成屏障。table lvalue 的写入发生在 RHS 之后，只有
-//! base/key 自身的事件构成前缀；method lookup 则位于 receiver 与显式参数之间。
-//! 循环头还要求搬入 RHS 无事件且循环不变：递归展开已删除候选，外部 local/param
-//! 必须未捕获并且循环体没有直接写入；未知读取和可能触发元方法的运算一律拒绝。
-//! 合法顺序声明的候选依赖只会指向更早语句；递归环表示上游破坏了 binding 不变量。
+//! 消费候选依赖、binding 快照和当前 AST 的事件事实，向单项及连续候选提供搬运许可。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -239,6 +233,7 @@ fn loop_header_rhs_is_invariant(
     }
 }
 
+// 搬入的有序 RHS 和 binding 快照必须仍是 sink 的同序前缀；只比较总事件数不足以证明顺序。
 struct EvalPrefixCollector<'a> {
     values: &'a BTreeMap<AstBindingRef, &'a AstExpr>,
     ordered: BTreeSet<AstBindingRef>,
@@ -299,6 +294,7 @@ impl EvalPrefixCollector<'_> {
     }
 
     fn lvalue(&mut self, value: &AstLValue) {
+        // 表写入发生在 RHS 之后，前缀只包含 base/key 求值，不能在此把写本身当屏障。
         if self.blocked {
             return;
         }
@@ -322,6 +318,7 @@ impl EvalPrefixCollector<'_> {
             }
             AstCallKind::MethodCall(call) => {
                 self.expr(&call.receiver, WalkMode::Sink);
+                // method lookup 位于 receiver 与显式参数之间，不能让参数越过该观察点。
                 self.barrier();
                 self.exprs(&call.args, WalkMode::Sink);
             }

@@ -1,4 +1,4 @@
-//! 将 AST block/statement 写成稳定 debug 文本；依赖表达式格式器和渲染名称，不负责 focus 选择；例如打印 if/loop/table assignment 的树形快照。
+//! 将 AST block/statement 写成稳定 debug 文本；依赖表达式格式器和渲染名称，不负责 focus 选择。
 
 use super::*;
 

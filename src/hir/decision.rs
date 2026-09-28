@@ -1,14 +1,6 @@
-//! HIR Decision 的结构合同、共享节点查询与表达式化入口。
+//! HIR Decision 的结构合同、共享查询与表达式化入口。
 //!
-//! `Decision` 是 HIR 内部为了保住共享短路子图而引入的中间形态，但它到底什么时候
-//! 能安全折回普通表达式，不能让 analyze 和 simplify 各自维护一套规则。这里把
-//! 那条共享入口固定下来，避免两边因为局部实现分叉而把同一棵决策图恢复成两种风格。
-//! DAG identity、可达性和无环性属于 HIR 节点合同；值域与改写者共用此校验，不能让
-//! 共享语义查询依赖某个 simplify pass 才能解释 Node/CurrentValue 的输入合法性。
-//! 校验同时发布借用当前节点的拓扑顺序和共享性；例如两臂汇入同一个 tail，值分析按
-//! 逆拓扑先算 tail 再合流两臂，payload 按正序传播可达边，不重新排序或按 id 搜索节点。
-//! 首次 lowering 可为当前节点快照提供原根终点 query；归约当场消费，失败不发布许可，
-//! 组合后的 test 也不能继承单个 producer 的证明。后续快照只能使用自身仍有效的事实。
+//! 为 analyze、simplify 和值分析统一节点合法性与当前快照事实，避免各消费者重建 DAG。
 
 use crate::hir::common::{HirDecisionExpr, HirDecisionNodeRef, HirDecisionTarget, HirExpr};
 use crate::hir::expr_safety::HirExprSafety;

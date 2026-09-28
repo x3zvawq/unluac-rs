@@ -1,9 +1,6 @@
-//! HIR 后处理收敛入口：按变化标签调度 pass，并提供同一次执行的模块事实快照。
+//! HIR 后处理的收敛入口与模块事实管理。
 //!
-//! 闭包效果由当前 HIR 的显式 child/capture 身份统一汇总，构造器与 repeat root
-//! 消费同一份摘要，任一 pass 改写 HIR 后失效。例如只读 capture 的调用
-//! 不应被消费者重新解释为写入，未改写的连续 pass 也不必重复分析 child。
-//! 此处负责摘要刷新和 pass 调度，不重新证明 VM 寄存器或源码改写合同。
+//! 按失效标签调度 pass，共享当前 HIR 的闭包效果摘要；改写后刷新快照。
 
 mod boolean_shells;
 mod branch_control_folding;

@@ -1,12 +1,6 @@
-//! 为 lookup 和动态运算结果的共享值身份维护别名、全局来源与无后续活读的观察窗口。
+//! 维护 lookup 和动态运算结果的共享值身份、别名与观察窗口。
 //!
-//! temp 的读写顺序消费当前 RootLifetimeFacts；identity 与 alias 的建立、退休仍由父层
-//! collector 证明。本层记录其来源和反向别名，整值退休只访问这些别名已证明的 home，
-//! 不推断 VM home，也不合并不同 home 的 root 生命周期。例如
-//! `a = lookup; b = a; gc(); use(b)` 中两个 home 共享一次活读事实；覆盖 b 后的 GC 是否
-//! 保护 a，则由 a 的建立位置与该 identity 的零活读窗口共同决定。
-//! 观察只发生在语句写入前：读写事件的状态变化从下一语句生效，映射修改也从 index + 1
-//! 生效。只保存已关闭零窗口中的最后观察，因为 collector 只向前查询当前 root 的后缀。
+//! 消费当前 RootLifetimeFacts 及父层身份证明，供独立 home 的根退休查询。
 
 use super::live_read_changes::LiveReadChanges;
 use super::{
@@ -14,6 +8,7 @@ use super::{
     TempId, TempUseEvents,
 };
 
+// 观察发生在本语句写入前；alias 的增删从 index + 1 生效，不能回溯改变当前观察。
 pub(super) struct ScalarValues<'a> {
     pub(super) by_temp: BTreeMap<TempId, ScalarValueId>,
     states: Vec<ValueObservations>,

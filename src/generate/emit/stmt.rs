@@ -1,9 +1,6 @@
-//! 这个子模块负责把 AST 语句序列化成目标 Lua 源码片段。
+//! 将最终 AST 语句序列化为目标 Lua 的 Doc 片段。
 //!
-//! 它依赖 AST build/Readability/Naming 已经把语句形状和名字准备好，只负责逐类发射，
-//! 不会在这里补猜缺失的 binding 或 global/function sugar；但已有的 plain local field
-//! declaration 可以在身份条件满足时选择等价的赋值拼写。
-//! 例如：`AstStmt::GlobalDecl` 只有 AST 上确实存在时才会在这里输出对应声明。
+//! 消费稳定语句、Naming 和语法许可，保留已有声明与绑定身份。
 
 use crate::ast::pretty::is_default_numeric_for_step_for_target;
 use crate::ast::{

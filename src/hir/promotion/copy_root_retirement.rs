@@ -1,9 +1,6 @@
-//! 为独立 COPY holder 签发跨控制流的物理根退休时序。
+//! 为独立 COPY holder 证明跨控制流的物理根退休时序。
 //!
-//! 消费 CFG、Dataflow 写集合与 RootObservation，区分纯覆盖前退休和可观察求值
-//! 写回后退休；不重建循环语法或调用协议，值的最后读取不等于物理生命周期结束。
-//! 例如循环 body 的 MOVE 跨回边经过全局查找后才被 LOADK 覆盖，holder 必须
-//! 活过查找，不能在 body 末端提前释放。
+//! 消费 CFG、Dataflow 写集合与 RootObservation，区分求值前后覆盖责任。
 
 use super::*;
 

@@ -1,12 +1,6 @@
-//! 这个子模块负责 temp-inline pass 的定义与使用计数摘要。
+//! 收集 temp-inline 所需的定义、读取和谓词边界摘要。
 //!
-//! 它依赖 HIR 当前 stmt 序列，只记录 temp 的定义数量、debug 身份与语句树中的读取次数，
-//! 子节点顺序由共享 HIR visitor 提供；读取摘要保留 temp 首次出现顺序，索引容量直接
-//! 消费 bindings 发布的编号域。capture 两种模式都计入父级绑定引用，不进入子 proto。
-//! 不会在这里改写任何节点。例如 `t0 = a.b` 的读取计数为一时，inline owner 可继续审查
-//! 该定义的求值顺序与生命周期，不能仅凭计数删除它。
-//! 同次遍历保留 Boolean 值进入谓词的边界：`v=not not f(); if v` 的原值存储
-//! 不等于 `if f()`；copy 依赖逆向传播到原 producer，不用最后一个 copy 替代旧槽覆盖。
+//! 消费当前 HIR 与共享 visitor，保留 debug 和 capture 身份，供内联 owner 审查。
 
 use super::*;
 

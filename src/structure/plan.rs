@@ -1,12 +1,6 @@
-//! 这个文件把 Structure 内部 evidence 收敛成可按稠密索引查询的执行计划。
+//! 将 Structure evidence 收敛为唯一、可查询的执行计划。
 //!
-//! evidence 提取允许 branch、loop 与 irreducible region 重叠；这里为每个 block、edge、
-//! phi incoming 与 cleanup 选择唯一 disposition。HIR 只消费冻结结果，不能再按 header
-//! 或临时 map 的覆盖顺序重选候选。
-//!
-//! 输入形状：一个 branch region 与多入口 SCC 在部分 block 上重叠。
-//! 输出形状：SCC membership 与直接 owner 分开；其中可规约 header 仍归 `Branch/Loop`，
-//! 其余成员归 `Unstructured`，每条 CFG edge 同时得到唯一 owner。
+//! 冻结 block、edge、phi incoming 与 cleanup 的归属，供 HIR 直接消费。
 
 mod arena;
 pub(in crate::structure) use arena::freeze_condition;

@@ -1,10 +1,6 @@
-//! 从入口快照与完整 global 协议证明局部词法环境，保持普通 upvalue 的真实身份。
+//! 从入口快照与 global 协议证明局部词法环境身份。
 //!
-//! 这里消费 Low-IR/SSA 的唯一 Def，不根据 `_ENV` debug 名字把任意表升级为根环境。
-//! 例如 `local _ENV = env; global a,b = maker()()` 保留原 GETUPVAL 或参数 MOVE 的局部槽和声明，
-//! 只给该 binding 发布固定语义名称；不新增包装或把 maker 的其它 upvalue 当作环境。
-//! 当前领取直线、单写、无子闭包的入口快照；根环境混用、回边、重绑定或捕获需要独立
-//! 的词法环境范围证明，不能让后层用变量名或访问形状重新猜测。
+//! 消费 Low-IR/SSA 的唯一来源，发布 binding 的环境角色，不根据 debug 名字推断环境。
 
 use super::*;
 use crate::transformer::UpvalueOperand;

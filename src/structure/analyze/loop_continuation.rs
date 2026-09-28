@@ -1,4 +1,4 @@
-//! 推导循环 continuation、空 return 出口与线性退出尾；依赖循环候选和 CFG，不负责循环形态识别；例如识别共享 cleanup 后的空返回。
+//! 推导循环 continuation、空 return 出口与线性退出尾；依赖循环候选和 CFG，不负责循环形态识别。
 
 use super::*;
 

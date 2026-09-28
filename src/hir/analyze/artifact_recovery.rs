@@ -1,12 +1,6 @@
-//! 这个文件负责 HIR proto 失败时撤销预留的 composite artifact，并重映射稳定引用。
+//! 在 HIR proto 恢复失败时撤销预留的 composite artifact，并重映射稳定引用。
 //!
-//! shared-closure composite 必须在 owner 与 physical children 之间预留，Naming 才能按父先子后
-//! 分配 upvalue 名。若 owner 随后降低失败，不能把不可达空 composite 留在 arena，也不能只删除
-//! `Vec` 元素而让已完成 child subtree 的 `HirProtoRef` 悬空。本模块只执行这次严格逆变换；它依赖
-//! analyze 已构造的 HIR artifact，不决定哪些错误允许恢复，也不改写任何 HIR 语义节点。
-//!
-//! 例如 `owner#0, composite#1, child#2` 的 owner 失败后，会删除 `#1`，把 child 及其 body 中的
-//! closure 引用统一改为 `#1`；任何仍指向被删除区间的引用都返回 typed error，而不是静默重绑。
+//! 消费已构造的 HIR artifact，保持 arena 引用一致性；错误恢复策略由调用方决定。
 
 use crate::hir::HirLowerError;
 use crate::hir::common::{HirExpr, HirProtoRef};

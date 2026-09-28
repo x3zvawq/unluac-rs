@@ -1,12 +1,6 @@
-//! 这个子模块负责把 branch terminator 的谓词和操作数降成 HIR 条件表达式。
+//! 将 Transformer 的 BranchCond 降低为 HIR 条件及其操作来源。
 //!
-//! 它依赖 Transformer 已经解析好的 `BranchCond`，只回答“条件本身长什么样”，不会在这里
-//! 决定 if/while/短路结构应该怎么组织。
-//! 例如：`if not r0 then ...` 会先在这里得到 `not r0` 的表达式形式。
-//! Subject 同时签发原 operand / 合成 predicate 来源：比较结果虽为 Boolean，
-//! 条件跳转本身并不证明发生过 Boolean 值写回，后续 Decision 不能混用这两种事实。
-//! 原右侧快照早于左侧 CALL 时，使用显式 Gt/Ge 保存准备顺序。例如原 `global > f()`
-//! 的 VM 谓词是 LT(call_result, global_snapshot)；HIR 不能强制留下占槽到分支内的别名。
+//! 保留原操作数准备顺序，区分条件谓词与 Boolean 值写回；结构组织由上层负责。
 
 use super::*;
 use crate::hir::common::{HirSourceSite, TempId};

@@ -1,4 +1,4 @@
-//! 消费循环语法分区、值阶段与并行复制；依赖 loop payload 和块计划，不负责普通区域遍历；例如发射 for preheader 或 latch epilogue。
+//! 消费循环语法分区、值阶段与并行复制；依赖 loop payload 和块计划，不负责普通区域遍历。
 
 use super::*;
 

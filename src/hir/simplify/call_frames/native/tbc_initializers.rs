@@ -1,11 +1,6 @@
-//! 在 close 作用域建立前恢复资源的完整初始化帧。
+//! 在资源作用域建立前恢复完整初始化帧。
 //!
-//! TBC origin 与原 CALL 结果/home 来自 Promotion；紧邻声明由 HIR 的 TBC 配对查询确认。
-//! 例如 `f=setmetatable; a={}; m={}; local r=f(a,m); TBC r`，初始化发生在资源
-//! 激活前，可以整体恢复为 `local r=setmetatable({}, {}); TBC r`。结果声明与激活
-//! 位置不变，不能把已激活资源的读取当作普通临时值消费。这里仅处理同 home 唯一的
-//! 注册点，其他资源、capture、原帧写域和后缀声明仍由共享 builder/preview 核对。
-//! 每个互不重叠的直线准备区只尝试一次，所有候选共用一次声明/前缀批量提交。
+//! 消费 TBC origin、原 CALL 结果与 HIR 声明配对，保留资源的初始化和激活位置。
 
 use super::*;
 use crate::hir::common::HirTbcDeclaration;

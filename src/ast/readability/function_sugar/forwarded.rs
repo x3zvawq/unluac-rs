@@ -1,10 +1,6 @@
-//! 这个子模块负责吸收“先放进 local，再立刻转发出去”的函数壳。
+//! 吸收局部函数创建后立即转发的机械声明。
 //!
-//! 它依赖 binding-flow、可写 capture 快照和 capture provenance 已确认这个局部只是纯
-//! 转发壳，不会越权把真正有闭包依赖的 local function 折叠掉，也不会把可变 lvalue
-//! 地址的读取搬到 closure 分配之前。
-//! 例如：`local f = function() ... end; t.f = f` 会在这里尝试合成 `function t.f() ... end`。
-//! 删除许可先消费已有身份与 capture 事实；sink 识别借用函数，成功后才构造一次输出。
+//! 消费 binding-flow 与 capture provenance，保留闭包依赖和地址求值顺序。
 
 use super::super::binding_flow::{BindingUseIndex, MutableSnapshotNames};
 use super::super::expr_analysis::is_stable_context_expr;

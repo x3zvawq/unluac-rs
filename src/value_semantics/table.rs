@@ -1,12 +1,6 @@
-//! HIR/AST 共用的表分配容量与索引式模板初始化规则。
+//! HIR/AST 共用的表分配容量与模板初始化约束。
 //!
-//! 两层只投影自己的表达式语法，不互相构建表达式树。这里区分编译期常量与运行时
-//! 值；正常结果为 number 不代表编译器能把它放入模板。该规则不授权移动求值或根。
-//! 分类保守包含后续 pass 可折叠的比较/短路表达式，不声称目标编译器一定折叠。
-//! 例如 `{a,1<2,c}` 的比较可能变成 true，Indexed 分配因此仍需运行时操作数。
-//! `TableInitializationConstraint` 统一 Indexed 的模板禁入与已有 Template 的数组边界、hash 键身份；消费者
-//! 只投影字段与下标。精确容量查询与运行时操作数查询共用常量规则，不重建原始布局。
-//! Template 使用包含索引 0 的精确槽数，避免误把原零索引项当作新模板键。
+//! 消费各层的字段语法投影和原分配事实，区分编译期常量与运行时值；不授权移动求值或根。
 
 pub(crate) mod allocation;
 
@@ -64,6 +58,7 @@ impl TableTemplateKey {
 pub(crate) enum TableInitializationConstraint<'a> {
     Runtime,
     Template {
+        /// 包含索引 0 的原槽数，不能把零索引模板与无数组模板视为同一容量。
         array_slots: u32,
         hash_keys: &'a std::collections::BTreeSet<TableTemplateKey>,
     },
@@ -83,6 +78,7 @@ pub(crate) enum TableRuntimeOperand {
 
 /// 字段中的哪一个操作数必须保持运行时读取，才能保持原分配与扩容时点。
 /// 原模板外的新静态键还会改变 hash 压力，不能根据源码数组字段数排除它。
+/// 例如把 `{a, x, c}` 中的 x 替换为常量可能触发模板序列化，裁掉尾部 nil 槽。
 pub(crate) fn runtime_table_operand<E: TableExpression>(
     constraint: TableInitializationConstraint<'_>,
     field: TableFieldRef<'_, E>,

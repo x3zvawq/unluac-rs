@@ -1,9 +1,6 @@
-//! 在原 CFG 上冻结由字面量 SSA 定义证明不可执行的边。
+//! 冻结原 CFG 中由字面量定义证明不可执行的边。
 //!
-//! CFG 保留所有物理分支，值域只裁掉真值已确定的边，不改变结构恢复身份。比如
-//! `if false then f() end` 中的 CALL 不会污染之后 scratch 的物理残值；参数、phi、
-//! 可被引用捕获改写的槽仍走双边。一次边分类和可达遍历，不能为每个覆盖点重扫 CFG。
-//! 寄存器字面量只跨同块无观察区间：回调可通过 debug.setlocal 改写槽，SSA 值不够证明真值。
+//! 消费 SSA 与观察事实，供物理状态分析查询；保留原控制结构身份。
 
 use super::super::common::{EdgeKind, InstrUseValues};
 use super::*;

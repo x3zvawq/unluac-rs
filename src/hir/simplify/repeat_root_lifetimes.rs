@@ -1,13 +1,7 @@
-//! repeat 条件端点的生命周期事实发布器。
+//! 发布 repeat 条件端点的生命周期事实。
 //!
-//! 消费 object_flow 的 binding/aggregate/closure 正向状态以及 Promotion 的物理 home，
-//! 不独立解释对象流或 VM 槽。例如 body 中已逃逸 table 仍被 local 持有，且 until 可执行
-//! 用户代码时，保留该 root；未逃逸 aggregate 可以获得当前端点的缩短许可。
-//! 同时发布 proto-wide physical-root 集合和 repeat-specific may_end_before_condition，
-//! AST 只消费这些事实并证明自身候选的词法/控制合法性。
-//! 共享图为 repeat 条件发布节点 ID 与稀疏语句路径；首次可达时准备当前快照不变的
-//! binding/home/条件观察事实，回边只更新端点许可。不可达 repeat 仍安装空证书，
-//! 避免沿用旧快照的许可；提交器消费原路径，不用 payload 地址关联可变树。
+//! 消费 object_flow 与 Promotion，向 AST 提供当前快照的物理根及条件前缩短许可；
+//! AST 继续证明自身改写的词法和控制合法性。
 
 use crate::hir::HirBinding;
 

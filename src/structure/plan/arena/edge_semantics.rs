@@ -1,4 +1,6 @@
-//! 最终 CFG edge 的语义分类。输入 loop query、forward routes、syntax arms 与 residual evidence，为每条 edge 选择唯一 owner/transfer；不负责 phi copy。例如 VM-for exit 与祖先 single-pass break 共边时仍由内层 for owner发射外层 transfer；从 VM-for body 回到外层 retry header 的 residual edge 则保留显式 goto，不能降成祖先的隐式 loopback。
+//! 冻结最终 CFG edge 的唯一 owner 与 transfer。
+//!
+//! 消费 loop、forward route、syntax arm 和 residual evidence，值复制由专属 owner 处理。
 
 use super::*;
 

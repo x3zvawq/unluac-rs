@@ -1,8 +1,6 @@
-//! 按已有 method 调用提示选择函数声明风格，独立证明隐式 self 的词法合法性。
+//! 按已有调用提示选择函数声明风格。
 //!
-//! HIR 投影的参数身份决定能否改名；当前 AST 决定是否遮蔽自由 self。调用名仅是展示
-//! 提示，不证明 receiver/closure 的对象身份。例如其它位置使用 :add() 时，无命名冲突的
-//! `function box.add(p, n)` 可写成 `function box:add(n)`，首参身份和数量均不变。
+//! 消费 HIR 参数身份与最终 AST 可见性，保持隐式 self 的词法合法性。
 
 use std::{collections::BTreeSet, ops::ControlFlow};
 

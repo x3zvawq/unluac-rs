@@ -1,4 +1,4 @@
-//! branch payload 的最终冻结。输入选定 condition、edge plan 与 branch evidence，输出唯一 BranchPlanData；不负责重新选择 condition。例如真假出口会在这里对齐 then polarity 与 continuation。
+//! branch payload 的最终冻结。输入选定 condition、edge plan 与 branch evidence，输出唯一 BranchPlanData；不负责重新选择 condition。
 
 use super::*;
 

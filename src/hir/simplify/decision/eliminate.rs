@@ -1,13 +1,6 @@
-//! 残余 `Decision` 线性化 pass 的 block / stmt 遍历入口。
+//! 残余 Decision 线性化的 block/statement 遍历入口。
 //!
-//! `Decision` 适合作为 HIR 内部恢复共享短路子图时的过渡表示，但不应该继续流到 AST。
-//! 这个文件只负责按语句顺序遍历 block，并把表达式抽取、值物化和条件消除委托给
-//! `eliminate_materialize.rs`；它不重新识别 Decision DAG。If/While 条件无法纯表达式化时，
-//! 这里用短作用域物化 truthiness，确保原值根在 branch/body 前释放。
-//!
-//! 例子：
-//! - 输入：`local x = Decision(...)`
-//! - 输出：`local x; if ... then x = ... else x = ... end`
+//! 将表达式抽取与值物化委托给专属子模块，输出可进入 AST 的普通 HIR 语句。
 
 use std::mem;
 

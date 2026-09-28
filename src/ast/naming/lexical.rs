@@ -1,9 +1,6 @@
-//! 从最终 AST 声明顺序发布 Naming 的 closure 定义点与 binding 可见区间。
+//! 从最终 AST 发布闭包定义点与 binding 可见区间。
 //!
-//! Readability 会改变声明形状，因此区间以最终 AST 词法作用域为准，不复用 HIR 块树。
-//! 每个 binding 仅由声明函数发布一次，子函数持有自己的 preorder 定义点，不复制祖先
-//! binding。例如 `local x; f = function() end; local y; g = function() end` 中，x 的
-//! 区间覆盖 f/g，y 只覆盖 g；区间随后与声明函数的最终名字关联，供参数避让查询。
+//! 消费当前声明和词法作用域，供 Naming 关联最终名字；不复用已经过时的 HIR 块树。
 
 use std::ops::Range;
 

@@ -1,9 +1,6 @@
-//! 这个子模块负责把 singleton seed local handoff 合并成更自然的 global decl 形状。
+//! 将 singleton seed 交接合并为 global 声明。
 //!
-//! 它消费当前 AST 快照的使用次数和最后 mention 位置，并保留 HIR rewrite authority/origin。
-//! 候选只接受相邻的一对 seed/global；后续同属性 handoff 仍是原多目标 run 的拒绝边界。
-//! 例如 `local seed = value; global g = seed` 可折成 `global g = value`，原语句在判断
-//! 完成后统一移交，失败候选不复制整个后缀或嵌套子树。
+//! 消费当前使用、提及与 rewrite authority，保留原声明来源。
 
 use std::collections::BTreeMap;
 

@@ -1,9 +1,6 @@
-//! 将 analyze 阶段的物理来源与协议事实带给 HIR simplify。
+//! 向 HIR simplify 传递 analyze 已证明的物理来源与协议事实。
 //!
-//! 消费 Dataflow 的 Def/phi、root observation 及 Transformer 的 close 边界，
-//! 保存 temp 的 home、捕获身份和原操作来源；不重新恢复结构，也不作为公开 HIR API。
-//! 例如 t0 与 t7 同属 (slot 0, epoch 0) 时可由 locals 复用绑定，close 后的 epoch 1
-//! 必须独立。合并不同 home 后失效单一来源的正向证明，可能 home 集仍服务负向保护。
+//! 消费 Dataflow、root observation 和 close 边界，保存 home、capture 与原操作身份。
 
 mod call_roots;
 mod comparison_preparations;

@@ -1,9 +1,6 @@
-//! 这个子模块负责把构造器生产者内联进字段值。
+//! 将获准的构造器 producer 内联到字段使用点。
 //!
-//! 它依赖 `bindings` 已经识别好的同一绑定和 pending producer 列表，只尝试安全内联字段/
-//! callee/access-base 值，不会在这里决定整段 region 的分段边界。
-//! producer 只有一个消费 owner；内联同时记录其求值事件，region builder 证明事件顺序
-//! 未变后才提交。例如：`local v = f(); t.x = v` 只在 `f()` 仍位于同一事件位置时折叠。
+//! 消费 binding 与 pending producer，发布替换和事件记录；完整顺序由 region builder 验证。
 
 use crate::hir::common::{
     HirBinaryExpr, HirBlock, HirCallExpr, HirDecisionExpr, HirDecisionTarget, HirExpr,

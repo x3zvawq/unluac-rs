@@ -1,9 +1,6 @@
-//! 提供 HIR 及其消费者共享的只读 visitor 和短路查询。
+//! HIR 共用的只读 visitor 与短路查询。
 //!
-//! 子节点关系统一来自 HIR traverse 宏，collector 只解释自己需要的事件；作用域限
-//! 当前 proto，closure 仅投影父级 capture，不进入 child body 重建事实。
-//! 例如 x=f(t); return t 可收集 callee 与两次 temp 引用；这些语法引用不等同于
-//! 运行可达性。需要共享遍历的独立 collector 可组成 tuple。
+//! 子节点由 traverse 统一定义，closure 只投影父级 capture，不进入 child body。
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirCapture, HirClosureExpr, HirDecisionExpr, HirExpr, HirLValue,

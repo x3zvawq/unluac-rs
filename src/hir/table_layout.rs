@@ -1,14 +1,6 @@
-//! 索引式建表的运行时操作数约束。
+//! 将 HIR 表字段投影为共享初始化约束，并保留必需的运行时操作数。
 //!
-//! HIR lowering 已保留 Indexed/Template 分配事实；本模块判断候选常量替换是否把运行时
-//! 字段变成编译器模板初始化。`local x=true; {a,x,c}` 必须保留运行时 x，否则
-//! 模板序列化会裁掉尾部 nil 槽并改变数组容量。保留结论随原 binding 进入 AST，
-//! 不让 AST 读取 TNEW/TDUP 或重新分析原始寄存器。
-//! 构造区域吸收常量后也由本模块保持运行时读取：例如 `{a,1<2,c}` 折叠后生成
-//! `local x=true; {a,x,c}`。只物化无事件的字面量叶子，不提前执行字段运算或调用。
-//! 已有模板同样遵守原容量：`local x=true; {true,a,x}` 不能把 x 放入第 3 个模板槽。
-//! 本层只投影字段位置；操作数约束和候选容量查询由共享 table 语义拥有。
-//! 原始 hash 键集合随分配保留；`{true,[5]=x}` 中的运行时 x 不能成为新的稀疏模板项。
+//! 消费原 Indexed/Template 分配事实，向 AST 传递绑定要求；容量规则由共享 table 语义持有。
 
 use super::common::{HirBinaryOpKind, HirExpr, HirStmt, HirTableField, HirUnaryOpKind, TempId};
 use super::rewrite::replace_temp_in_expr;

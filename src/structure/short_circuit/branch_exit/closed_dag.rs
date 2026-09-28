@@ -1,4 +1,4 @@
-//! 构建、跟随并冻结闭合控制 DAG 及 condition arc；依赖稠密 workspace 与 SSA 逃逸检查，不负责候选枚举；例如证明 connector 只服务当前 DAG。
+//! 构建、跟随并冻结闭合控制 DAG 及 condition arc；依赖稠密 workspace 与 SSA 逃逸检查，不负责候选枚举。
 
 use super::*;
 

@@ -1,12 +1,6 @@
-//! carried-local handoff seed 的形状解析与 seed 语句重写。
+//! 解析 carried-local handoff seed，并提供局部 seed 重写。
 //!
-//! 这个模块只把当前语句识别成可折叠的 seed：纯别名、单目标 local/temp handoff、
-//! 更新后 handoff，以及边界入口处的直接写回。它不检查 suffix 是否安全、不触碰外层
-//! temp 活跃性，也不执行整段 rewrite；这些策略条件由 `handoffs.rs` 统一判断。
-//!
-//! 例子：
-//! - 输入 seed：`assign tA, tB, keep = sA, sB, 0`
-//! - 输出事实：`tA -> sA`、`tB -> sB`，并保留 `keep = 0`
+//! 消费当前语句，发布交接身份与剩余赋值；完整后缀和生命周期证明归 handoffs。
 
 use std::collections::BTreeSet;
 

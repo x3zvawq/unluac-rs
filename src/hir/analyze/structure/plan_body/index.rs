@@ -1,4 +1,4 @@
-//! 构建计划 lowering 的稠密反向索引与吸收动作缓存；依赖最终 StructurePlan/SSA，不负责发射 HIR；例如预计算 region 输入和 canonical Move 来源。
+//! 构建计划 lowering 的稠密反向索引与吸收动作缓存；依赖最终 StructurePlan/SSA，不负责发射 HIR。
 
 use super::*;
 

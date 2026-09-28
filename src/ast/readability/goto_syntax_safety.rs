@@ -1,12 +1,6 @@
-//! 终止语句之后仍需保留 sibling 时的块尾语法合法化。
+//! 为块尾终止语句之后仍有 sibling 的 AST 补齐合法语法作用域。
 //!
-//! Lua 要求 `return`/`break`/`continue` 位于所属语法块的尾部。island 的
-//! terminal target 会在后面留下 label；branch-control 也会按项目策略保留
-//! 不可达的 debug/diagnostic sibling。本 pass 在 cleanup 完成后查看最终相邻关系，
-//! 只把非末尾终止语句包进窄 `do ... end`，不重建 HIR 控制 owner。
-//!
-//! 例如 `break; local kept` 会生成 `do break end; local kept`；本就在 block
-//! 尾部的 `break` 保持不变。
+//! 消费 cleanup 后的最终相邻关系，保留原控制 owner 与后续语句。
 
 use super::super::common::{AstBlock, AstModule, AstStmt};
 use super::ReadabilityContext;

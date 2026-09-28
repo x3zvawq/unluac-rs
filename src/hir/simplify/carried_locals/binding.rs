@@ -1,10 +1,6 @@
-//! carried-local pass 的 binding 表示与 rewrite 工具。
+//! carried-local 共用的 binding 表示、home 查询与引用重写。
 //!
-//! 主模块负责识别 handoff 是否能把后半段状态认回原 binding；这个模块统一表示
-//! param/local/temp，提供精确 `(slot, close epoch)` 查询，并把 binding 引用批量改写到目标；
-//! rewrite 同时把异槽或未知来源污染传播到目标 provenance。它不判断某个控制流 handoff
-//! 是否安全，也不把 local compaction 策略冒充物理同槽证明。例如上层先证明 `t3` 与
-//! `l1` 是同一机械状态，再用这里的 rewrite 把 `t3` 引用收回 `l1`。
+//! 消费已经证明的身份交接，更新引用及 provenance；路径等价证明由各 owner 持有。
 
 use std::collections::{BTreeMap, BTreeSet};
 

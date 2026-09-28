@@ -1,14 +1,6 @@
-//! 这个子模块负责 `inline_exprs` pass 的 use-site 重写。
+//! 将已经获准的 inline 候选替换到 AST 使用点。
 //!
-//! 它依赖 `candidate` 已经给好的候选类型和策略，只在允许的位置替换引用，不会回头重判
-//! 候选本身是否安全。
-//! 例如：`local r0 = print; r0(1)` 选中后，会在这里把调用位点改成 `print(1)`。
-//! mechanical run 的顶层 return 复用候选层的单值表达式集合；extended call run 在
-//! 非尾 return 复用候选集合并由 run 级事件前缀约束顺序，index 则保留跨调用的 key root。
-//! local initializer 中的裸调用已经被赋值收窄为单值；移入最终调用参数时用
-//! `SingleValue` 保留该宽度，避免重新变成开放多返回值。
-//! 表字段消费 HIR 原始分配事实，并由共享规则判断候选 Lua 语法是否引入模板；
-//! `local x=2; return {a,x+3,c}` 不能内联成常量运算后改变 Indexed 分配方式。
+//! 消费候选策略和 HIR 保留的值宽度、表分配事实，保持原求值与初始化语义。
 
 use crate::decompile::ReadabilityOptions;
 

@@ -1,4 +1,4 @@
-//! 提供 PUC-Lua 寄存器/常量操作数、调用 pack、proto 组装和跳转边界辅助；依赖 parser raw proto 与 lowering state，不负责 opcode family 分派；例如解析 RK 常量、构造 open result pack 并校验 jump target。
+//! 提供 PUC-Lua 寄存器/常量操作数、调用 pack、proto 组装和跳转边界辅助；依赖 parser raw proto 与 lowering state，不负责 opcode family 分派。
 
 use std::sync::Arc;
 

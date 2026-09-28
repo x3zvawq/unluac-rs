@@ -1,4 +1,4 @@
-//! 沿 forward route 合成 phi copy 批次并解析透明 Move；依赖 SSA 和 route 顺序，不负责决定 owner；例如折叠多跳转发后的最终 incoming 值。
+//! 沿 forward route 合成 phi copy 批次并解析透明 Move；依赖 SSA 和 route 顺序，不负责决定 owner。
 
 use super::*;
 

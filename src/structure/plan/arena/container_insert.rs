@@ -1,4 +1,4 @@
-//! 候选插入与 residual 归一化。输入是已经冻结边界的 container specs，输出唯一 containment 插入结果；不负责重判 branch/loop 语义。例如 branch arm 与 loop part 的集合关系会在这里转换成插入位置。
+//! 候选插入与 residual 归一化。输入是已经冻结边界的 container specs，输出唯一 containment 插入结果；不负责重判 branch/loop 语义。
 
 use super::*;
 

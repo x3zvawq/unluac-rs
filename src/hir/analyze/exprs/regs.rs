@@ -1,8 +1,6 @@
-//! 这个子模块负责把寄存器读取解释成 local/temp/entry 值引用。
+//! 将寄存器读取降低为 HIR local、temp 或入口值引用。
 //!
-//! 它依赖 Dataflow 的 `use_values` 和 bindings 层已经分配好的 temp/local 身份，不会在这里
-//! 重新做 SSA 合流判定。
-//! 例如：某条指令读取 `r0`，若对应唯一 `TempId`，这里会直接降成 `TempRef(t0)`。
+//! 消费 Dataflow 的 use_values 与已分配的绑定身份。
 
 use super::*;
 use crate::hir::HirUnresolvedExpr;

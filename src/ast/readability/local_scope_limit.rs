@@ -1,14 +1,7 @@
-//! 为超大函数里的短生命周期 local 补充有限词法作用域。
+//! 为超大函数的短生命周期 local 恢复有限词法作用域。
 //!
-//! 本 pass 依赖 Deferred 阶段已经稳定的语句相邻关系和 binding mention，不补 HIR 事实，
-//! 也不为减少 local 做可能改变调用或比较顺序的跨语句内联。它沿词法树
-//! 携带外层 local 预算，把短生命周期、无属性的声明分批放入 `do ... end`；带属性 local
-//! 与 label/goto 边界保持原状。例如同一函数内 240 个顺序临时声明会变成若干个最多 64
-//! 个 local 的 `do` 块，而闭包捕获或后续仍读取的 binding 会把作用域延长到最后 mention。
-//! repeat body 中被 until 条件读取的 local 必须留在正文直属作用域，不能包进 `do`。
-//! Lua 5.5 的 global 声明由 `global-decl-pretty` 负责 block 级补全；本 pass 不新增
-//! global 访问，只缩短连续区间，并通过 invalidation 让该 owner 在下一 Deferred 固定点
-//! 修复新边界。因此 global 语句不再是永久 scope barrier。
+//! 消费 Deferred 阶段的 binding mention 与稳定语句结构，生成保留绑定和控制边界的 do 块；
+//! 新边界引起的 global 可见性由 global-decl-pretty 维护。
 
 use std::collections::BTreeMap;
 

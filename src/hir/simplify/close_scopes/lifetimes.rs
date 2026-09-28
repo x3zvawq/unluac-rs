@@ -1,12 +1,6 @@
-//! 从共享 HIR CFG 投影显式资源的活跃程序点，保留 Structure 发布的 origin 身份。
+//! 从共享 HIR CFG 投影显式资源的活跃程序点与候选范围。
 //!
-//! 范围只是一份候选：may 活跃点给出末端，must 活跃点检查范围内的求值事件。
-//! 例如 `TBC a; if x then goto out end; Close(a); side; ::out::` 中 side 不属于 a；
-//! goto 只消费目标实际跨过的 cleanup 事件，不用 must-active barrier 的补集推断关闭。
-//! 本模块不重建 CFG、寄存器覆盖或 loop cleanup 协议，也不直接删除 Close。
-//! 求值事件按顶层位置累计总数，origin 只索引可接受事件；相同 owner 的多个 typed event
-//! 分别计数。候选以区间计数相等证明 must 覆盖，不逐候选重扫整张事件表。
-//! 事件的根层位置在共享图构建时投影到节点索引；不另走语句树建立地址到位置的关联。
+//! 保留 Structure 的 origin 身份，供 close-scopes 证明覆盖；不直接改写 Close。
 
 use super::super::lexical_cfg::{HirFlowGraph, HirFlowNodeKind};
 use super::{ScopeCandidate, paired_return_cleanup};

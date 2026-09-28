@@ -1,8 +1,6 @@
-//! 删除 HIR 中没有 goto 引用且不再承担 cleanup 边界的机械标签。
+//! 删除无 goto 引用且不再承担 cleanup 边界的机械标签。
 //!
-//! 消费当前 label 引用与 pending TBC/Close 事实，不合并 block 或改写跳转目标。
-//! 例如无人引用的 ::L1:: 可删除；仍是 close-scopes active-set 边界的标签，
-//! 须等对应资源协议消费后再清理。
+//! 消费当前跳转引用与资源事实，保持控制和作用域结构。
 
 use std::collections::BTreeSet;
 

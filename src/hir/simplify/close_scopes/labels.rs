@@ -1,9 +1,6 @@
-//! 当前 HIR 块的直属 label 位置与资源活跃区间，不重建 CFG 或 TBC 数据流。
+//! 索引当前 HIR 块直属 label 的资源活动边界。
 //!
-//! HirLabel 携带 Structure 冻结的 active-set；索引用 label 序号保留每个 origin 的
-//! 出现位置，供作用域候选验证连续性。嵌套 label 属于自己的词法 owner，不计入这里。
-//! 例如 active、inactive、active 不能用单一 Lua 块表达；active、active、inactive
-//! 的终点是第三个 label，全部 active 时则只证明到最后一个 label 后。
+//! 消费 Structure 冻结的 active-set，供作用域候选验证连续性，不重建 TBC 数据流。
 
 use std::{cell::OnceCell, ops::Range};
 

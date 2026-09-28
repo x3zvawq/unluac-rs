@@ -1,17 +1,6 @@
-//! 这个文件放 StructureFacts 共享图辅助函数。
+//! StructureFacts 共用的只读图查询。
 //!
-//! 它们都只读 CFG / graph facts，不掺杂具体候选语义，目的是让 branch/loop/
-//! short-circuit/scope 等模块共享一套稳定的小工具。
-//!
-//! 它依赖 CFG / GraphFacts 已经提供好的 block、edge、支配关系和可达性，只表达
-//! “共享图查询”本身，不越权决定某个候选最终是不是 `if/while/and-or`。
-//!
-//! 例子：
-//! - `collect_region_entry_edges` 会把“区域外进入区域内”的所有边统一收出来，供
-//!   goto/irreducible 共用
-//! - `collect_region_exit_edges` 会把“区域内流向区域外”的边统一收出来，供
-//!   goto/region exit 共用
-//! - `is_reducible_region` 会回答“除 header 外，区域内 block 是否只被区域内前驱进入”
+//! 消费 CFG 与 GraphFacts，提供区域出入边和可规约性等基础事实，具体候选由各 owner 判断。
 
 use std::collections::{BTreeSet, VecDeque};
 

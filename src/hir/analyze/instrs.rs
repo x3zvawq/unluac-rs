@@ -1,14 +1,7 @@
-//! low-IR 普通指令与非循环控制终结到 HIR 语句的直接 lowering。
+//! 将普通 Low-IR 指令与非循环终结指令直接降低为 HIR 语句。
 //!
-//! 这个模块只处理“单条指令如何发射 HIR 语句”：普通赋值、调用、返回、vararg 和
-//! set-list。它依赖 `ProtoLowering` 中已经准备好的 CFG / Dataflow /
-//! StructureFacts / binding 映射，不重新识别 block 结构，也不接管 numeric/generic-for
-//! 控制协议；这些 terminator 只能由 StructurePlan 选中的 loop owner 消费。
-//! LuaJIT 没有精确 Lua 拼写的 `TypeGuard` 只保留带位置与效果说明的 residual；本模块不
-//! 猜测可覆盖的 helper 语义，严格模式仍由后续 residual 合同拒绝。
-//!
-//! 输入形状：`CALL r0 ...` + 指令 def 映射，或已由 global protocol owner 认领的指令区间。
-//! 输出形状：`t0 = f(args)`、`f(args)`，或 typed `HirStmt::GlobalDecl`。
+//! 消费已准备的 Dataflow、绑定与协议归属；循环控制由 StructurePlan 的 loop owner 处理，
+//! 无法表达的操作保留为 typed residual。
 
 use super::exprs::{
     expr_for_const, expr_for_reg_use, expr_for_value_operand, global_key_for_access,

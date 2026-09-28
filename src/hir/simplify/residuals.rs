@@ -1,8 +1,6 @@
-//! HIR 收敛后的退出事实。
+//! 发布 HIR 收敛后的残余节点与控制语法要求。
 //!
-//! 消费共享 HIR visitor 统计仍存在的 Decision/Unresolved 与控制语法；不读取 Structure。
-//! 例如不可达 goto 已被 HIR 删除，原先从 Structure 带入的 goto 要求也应在这里退役，
-//! 不能迫使 AST 根据过期要求拒绝 Lua 5.1。失败 proto 与 unresolved 诊断仍保留原证据。
+//! 消费当前 HIR，保留失败诊断证据并退役已经消失的前层要求。
 
 use crate::hir::common::{HirControlFlowFeature, HirExitRequirement};
 use crate::hir::visit::{HirVisitor, visit_block};

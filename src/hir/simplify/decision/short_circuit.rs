@@ -1,9 +1,6 @@
-//! 沿 Decision 共享连边归约短路子图，保持每个 test 的单次求值。
+//! 沿 Decision 共享连边归约短路子图。
 //!
-//! 消费 HIR Decision 的节点与 continuation 身份，仅将唯一入边的 child 移入 parent；
-//! 不先复制成树，也不靠纯表达式代数猜调用顺序或物理根终点。
-//! 例如 a ? (b ? d : (c ? d : e)) : e 可先合并 b or c，再归约外层值链，
-//! 共同出口保留原身份与极性。
+//! 消费节点与 continuation 身份，保持各 test 的单次求值及原根边界。
 
 use crate::hir::common::{
     HirDecisionNode, HirDecisionTarget, HirDecisionTestSource, HirExpr, HirUnaryExpr,

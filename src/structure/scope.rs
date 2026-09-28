@@ -1,8 +1,6 @@
-//! 提取词法 scope 计划并为显式 cleanup 确定唯一 owner。
+//! 提取词法 scope 并确定显式 cleanup 的唯一 owner。
 //!
-//! 消费 graph facts、Close/TBC 与结构候选，向 HIR 发布 entry/exit/close-point
-//! 及 CleanupDisposition，不在这里物化最终 do/loop 语法。
-//! 例如含 Close 的 block 发布对应词法边界，不含 cleanup 的普通分支不产生空 scope。
+//! 消费图、资源及结构候选，向 HIR 发布边界与清理处置。
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},

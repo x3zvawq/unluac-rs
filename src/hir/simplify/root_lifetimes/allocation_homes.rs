@@ -1,11 +1,6 @@
-//! 按物理 home 索引分配对象的独立根事务与该槽中的别名。
+//! 按物理 home 索引分配对象的独立根事务与别名。
 //!
-//! 分配身份使用当前 block 快照中最初 constructor 的语句位置，home 来自 Promotion；
-//! 本层只维护 collector 已证明的 copy/overwrite，不反查别名或重建 VM 协议。
-//! 例如 a={}、b=a 后两个 home 共享 site；覆盖 a 只取走 a 的 owner 与别名，b 仍保留。
-//! 同 site 再写回已有 home 延续原 producer，不能把一次 SSA copy 当成新的生命周期。
-//! 参数交接撤销值别名，保留已有 owner 的精确覆盖责任；交接后的同值写回开启新 epoch。
-//! 该身份不跨改写发布，也不是表容量/模板 provenance 或可能重复赋值的 TempId。
+//! 消费 collector 已证明的 copy/overwrite，保持原 producer 身份与各槽生命周期。
 
 use super::{AllocationHomeOwner, BTreeMap, BTreeSet, HomeSlotKey, TempId};
 

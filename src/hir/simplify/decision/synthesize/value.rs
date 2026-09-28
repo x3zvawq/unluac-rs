@@ -1,8 +1,6 @@
-//! 这个子模块负责把 decision expression 直接综合回值表达式。
+//! 将已满足综合约束的 Decision 恢复为值表达式。
 //!
-//! 它依赖 `domain` 的等价性环境和 `safety` 的约束，只在整棵 decision 真能等价表达成
-//! 一个值时才返回结果，不会在这里兜底伪造分支。
-//! 例如：`cond ? x : y` 这类纯值 decision 会在这里尝试还原成逻辑值表达式。
+//! 消费 domain 的等价验证与 safety 的许可，无法证明时保留原决策。
 
 use std::collections::BTreeMap;
 

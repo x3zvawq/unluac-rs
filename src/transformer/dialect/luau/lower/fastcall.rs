@@ -1,4 +1,4 @@
-//! 处理不发射 low-IR 的 Luau 标记与 FASTCALL 前缀；依赖 fallback CALL 协议，不负责普通 CALL lowering；例如冻结 FASTCALL3 的三个直接参数。
+//! 处理不发射 low-IR 的 Luau 标记与 FASTCALL 前缀；依赖 fallback CALL 协议，不负责普通 CALL lowering。
 
 use super::*;
 

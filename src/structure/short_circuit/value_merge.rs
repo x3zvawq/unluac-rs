@@ -1,9 +1,6 @@
-//! 提取在 merge block 合成结果值的短路 DAG，并发布叶值来源。
+//! 提取结果值合流的短路 DAG 与叶值来源。
 //!
-//! 消费 branch 骨架、Dataflow phi 与共享图规则，将 incoming 关系前移为
-//! StructureFacts；最终表达式或赋值语法仍由 HIR 决定。
-//! 例如 (a and b) or (c and d) 可以共享 continuation，无须压成线性条件链；
-//! 递归 phi 的身份由 Dataflow 提供，不在本层重算。
+//! 消费 branch、Dataflow phi 和共享图事实，向 StructurePlan 发布候选。
 
 use std::collections::{BTreeMap, BTreeSet};
 

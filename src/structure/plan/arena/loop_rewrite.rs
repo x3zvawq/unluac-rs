@@ -1,4 +1,4 @@
-//! 条件 continue 与循环 escape 的结构改写。输入复合 condition、loop partitions 和方言能力，输出明确的 continue/break arm domains 与 forward routes；不负责最终 edge 分类。例如无原生 continue 的目标会把 guard 改写为包住 body tail 的 branch。
+//! 条件 continue 与循环 escape 的结构改写。输入复合 condition、loop partitions 和方言能力，输出明确的 continue/break arm domains 与 forward routes；不负责最终 edge 分类。
 
 use super::*;
 

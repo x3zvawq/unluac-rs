@@ -1,8 +1,6 @@
-//! 校验 closure capture 与 local 声明顺序的 AST 层间合同。
+//! 校验 AST 中 capture 与 local 声明的层间合同。
 //!
-//! HIR 必须在 ByReference closure 之前声明对应 local，readability 只能保留或收缩已有
-//! 词法关系，不能通过前移声明修复错误 binding。这里在 AST build 与 readability 出口复用
-//! 同一校验：允许 `local function f()` 的同语句 self capture，拒绝同 block 的后置声明。
+//! 消费显式 binding 身份及词法顺序，供 AST build 和 Readability 出口共享。
 
 use std::collections::BTreeMap;
 

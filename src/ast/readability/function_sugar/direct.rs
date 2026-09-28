@@ -1,9 +1,6 @@
-//! 这个子模块负责最直接的 function sugar 降糖。
+//! 将直接函数声明或赋值整理为 function 语法。
 //!
-//! 它依赖 AST build 已经保留好的合法声明/赋值形状，只把“右值就是函数表达式”的语句改成
-//! `function ... end` 形式，不会处理转发壳或 method alias。
-//! 例如：`local f = function() end` 会在这里变成 `local function f() end`。
-//! 共享声明 target 查询只投影名字与方言限制；函数内容由获准的直接/转发 owner 复制。
+//! 消费 AST build 的合法节点与目标方言限制，转发壳和 method alias 由各自 owner 处理。
 
 use super::super::binding_flow::MutableSnapshotNames;
 use super::forwarded::lvalue_prefix_can_move_before_closure;

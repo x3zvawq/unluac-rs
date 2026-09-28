@@ -1,9 +1,6 @@
-//! 最终 AST 的 goto/label 词法作用域校验。
+//! 校验最终 AST 的 goto/label 词法作用域。
 //!
-//! Readability 可能移动或物化 local，因此只有在它收敛后，才能按最终源码形状判断
-//! goto 是否跳进了新的 local（尤其是 `<close>`）作用域。每个函数独立建 block tree 与
-//! 持久化 local-scope tree；label 只对同函数的同层/子 block 可见，且目标 local 集合
-//! 必须是源 local 集合的子集。
+//! 消费 Readability 后的声明和跳转位置，报告不合法的跨作用域进入。
 
 use std::collections::BTreeMap;
 

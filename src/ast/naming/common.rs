@@ -1,8 +1,6 @@
-//! 这个文件集中声明 Naming 层共享的数据结构。
+//! Naming 各子阶段共用的数据结构。
 //!
-//! Naming 自身分成 evidence、lexical、hint、allocation 等多个关注点，
-//! 但它们会共同读写一套稳定的类型定义。把这些共享类型放在这里，可以避免
-//! 每个子模块都从 `assign.rs` 反向依赖，后续继续拆分时边界也更稳定。
+//! 承载捕获证据、词法可见性、命名提示与最终分配的接口类型。
 
 use std::collections::{BTreeMap, BTreeSet};
 

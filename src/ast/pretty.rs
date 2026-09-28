@@ -1,8 +1,6 @@
-//! AST 输出层共享的不改变求值顺序的语法简写。
+//! AST 输出层共用的语法简写查询。
 //!
-//! 比较方向由 HIR 的原操作数准备事实决定，debug / generate 按 AST 原左右发射，
-//! 不根据表达式复杂度换向。例如 `lookup < callback()` 的两次观察不能被调换。
-//! 本模块仅处理 `not (a == b)` 的 `a ~= b` 形式及 numeric-for 默认步长省略。
+//! 消费现有表达式，提供不改变求值顺序的比较拼写与 numeric-for 步长形式。
 
 use super::common::{AstBinaryOpKind, AstExpr, AstUnaryExpr, AstUnaryOpKind};
 use crate::decompile::DecompileDialect;

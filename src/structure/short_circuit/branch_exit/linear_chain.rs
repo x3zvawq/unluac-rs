@@ -1,4 +1,4 @@
-//! 索引线性条件链、推断统一出口并冻结节点目标；依赖 branch successor 与安全块约束，不负责闭合 DAG；例如将末端真假 target 分类为 Node 或 Exit。
+//! 索引线性条件链、推断统一出口并冻结节点目标；依赖 branch successor 与安全块约束，不负责闭合 DAG。
 
 use super::*;
 

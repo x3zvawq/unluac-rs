@@ -1,10 +1,6 @@
-//! 当前语句快照的 inline 候选属性、RHS 与连续段事实。
+//! 为 inline 的连续候选共享当前语句快照事实。
 //!
-//! 候选识别归 candidate；这里一次保留识别结果，供失败后从下一句重试的各类 run
-//! 消费者复用。原始语句在 plan 提交前不变，索引不适用于改写后的 sink 或新语句列表。
-//! 例如 `local a=x; local b=f(a); return b` 的两个起点共享终点 2，而起点 0 的
-//! 后续 call-result 是位置 1。声明身份、debug 来源与 initializer root 属性保留自
-//! candidate 的识别结果；RHS 借用原快照，不克隆表达式，也不用于逐步改写中的 stable-copy。
+//! 消费 candidate 的识别结果，供各起点查询；索引仅在计划提交前有效。
 
 use crate::graph::PositionIndex;
 use std::cell::OnceCell;

@@ -1,4 +1,4 @@
-//! 对测试专用 Lua 5.1 chunk 执行受控跳转补丁；依赖格式边界检查，不负责生产解析器；例如构造普通源码难以触发的 unsupported island。
+//! 对测试专用 Lua 5.1 chunk 执行受控跳转补丁；依赖格式边界检查，不负责生产解析器。
 
 pub(super) fn patch_lua51_main_jump(
     chunk: &mut [u8],

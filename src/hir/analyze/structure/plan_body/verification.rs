@@ -1,4 +1,4 @@
-//! 在 HIR 发射前核对 condition/value/SSA binding 合同；依赖最终 payload 与 binding 表，不负责结构发现；例如验证 edge copy 的 canonical SSA 来源。
+//! 在 HIR 发射前核对 condition/value/SSA binding 合同；依赖最终 payload 与 binding 表，不负责结构发现。
 
 use super::*;
 

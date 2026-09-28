@@ -1,9 +1,6 @@
-//! 将构造器尾部连续安装的方法/字段函数收回函数 sugar。
+//! 将构造器尾部连续安装的函数恢复为字段函数形式。
 //!
-//! 消费合法 AST、前缀 alias 与可写 capture 快照，只处理终端构造器的连续接线，
-//! 不推断任意跨语句数据流。
-//! 例如 local t={}; t.pick=function(...) end; return t 在证明成立时可收成
-//! local t={pick=function(...) end}; return t。
+//! 消费合法 AST、alias 与 capture 事实，保留原构造和安装顺序。
 
 use std::collections::{BTreeMap, BTreeSet};
 

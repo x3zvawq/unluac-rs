@@ -1,14 +1,6 @@
-//! 统一 NewTable 的语句与单次表达式入口，保留分配方式和模板初始值。
+//! 将 NewTable 的分配方式、常量模板和 source site 降低为 HIR 构造器事实。
 //!
-//! Transformer 已区分各 VM 的预分配与模板复制；这里仅把常量身份映射为 HIR
-//! 字段，不再读取 raw opcode。模板中的 nil 数组槽与 hash 项也属于初始化事实，
-//! 例如 TDUP {nil, nil, true} 不能变成空表后的一条 [3] 写入。
-//! 同次降低同时发布原 hash 键身份；后续构造区域融合后，不能从 fields 猜哪些键属于模板。
-//! 分配保留原 source site，跨字段重建仍能查询该时点的 home 和开放引用状态。
-//! 键成员索引在此建立并共享；JIT 原子模板的 hash 按稳定 key 身份发布，数组保持原顺序。
-//! hash dump 次序受 VM 随机散列影响，不是字段求值顺序；后续运行时写入仍保持事件顺序。
-//! 模板数组槽数包含索引 0，不能把只有零索引的模板和没有数组的模板合并为同一个容量。
-//! Luau 的动态模板项以数值 0 预置；这里保留初值和原键，后续真实写入由构造区域消费。
+//! 消费 Transformer 的初始化协议，为后续构造区域提供字段与原键身份。
 
 use crate::hir::common::{
     HirExpr, HirRecordField, HirTableAllocation, HirTableConstructor, HirTableField,
@@ -62,6 +54,7 @@ pub(in crate::hir::analyze) fn expr_for_new_table(
             hash_bits: *hash_bits,
         },
         TableAllocation::Template(template) => {
+            // nil 槽也属于原模板容量；省略它们会把 TDUP 初始化变成运行时稀疏写入。
             for (index, constant) in template.array.iter().enumerate() {
                 let value = expr_for_const(proto, *constant);
                 if index == 0 {

@@ -1,8 +1,6 @@
-//! 收回 alias 内联后才暴露的原始字面量比较和布尔逻辑壳。
+//! 整理 alias 内联后暴露的字面量比较和布尔包装。
 //!
-//! 这里只使用 `expr_analysis` 的严格常量与无事件证明；动态访问、元方法、跨数值表示和
-//! 会创建可观察对象的 truthy 结果都保留原形状。`not` 可在操作数 truthiness 已知且整次
-//! 求值可删除时归一，不改写循环/分支 owner。
+//! 消费共享常量与无事件证明，保留原操作和可观察求值。
 
 use super::super::common::{AstExpr, AstModule, AstTargetDialect, AstUnaryOpKind};
 use super::ReadabilityContext;

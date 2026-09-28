@@ -1,13 +1,6 @@
-//! 函数入口或原调用返回后未进入普通 SSA 的物理槽残值。
+//! 分析函数入口与调用返回后未进入普通 SSA 的物理槽残值。
 //!
-//! CALL（包括 Ignore）可让 callee 的值留在 caller 高槽；逻辑 reaching value 仍是 Entry
-//! 不代表该槽仍为 nil。入口只在 Transformer 明确证明 VM 清槽时为空；否则非参数槽
-//! 从未知残值开始。本域记录这些残值，以及后续 fixed Def 覆盖它的责任，
-//! 不创建逻辑 Def，也不推导源码 local。例如 CALL r4 后两路 MOVE r6,r0 合流，后面的
-//! GETTABLE r6 可在 __index 中观察旧槽；两路 MOVE 的物理覆盖不能因同值 phi 而丢弃。
-//!
-//! 复用有限寄存器域与稠密集合；先按基本块冻结 gen/keep，再沿共享 CFG 求 may-union。
-//! 回边只重算块摘要，收敛后一次遍历记录原写入；不会为每个 Def 重扫路径或后缀。
+//! 消费 VM 清槽、调用及固定写入事实，发布残值与覆盖责任；不创建逻辑 Def 或源码 local。
 
 use super::liveness::DenseRegSet;
 use super::*;

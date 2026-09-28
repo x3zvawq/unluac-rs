@@ -1,4 +1,4 @@
-//! 构建 case runner 并消费 Cargo 返回的 executable identity，枚举 case、调度 worker、处理超时并解析机器输出；依赖子进程与 channel，不负责终端渲染；例如杀死超时 case 并归一化失败详情。
+//! 构建 case runner 并消费 Cargo 返回的 executable identity，枚举 case、调度 worker、处理超时并解析机器输出；依赖子进程与 channel，不负责终端渲染。
 
 use super::*;
 use wait_timeout::ChildExt;

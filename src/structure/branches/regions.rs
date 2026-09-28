@@ -1,4 +1,4 @@
-//! 为已选 branch 计算 arm 区域并建立稠密 branch 索引；依赖图事实和 loop 边界，不负责 one-arm 形态判断；例如收集 then/else frontier。
+//! 为已选 branch 计算 arm 区域并建立稠密 branch 索引；依赖图事实和 loop 边界，不负责 one-arm 形态判断。
 
 use super::*;
 

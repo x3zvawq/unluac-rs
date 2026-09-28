@@ -1,9 +1,6 @@
-//! 冻结 CALL 的 caller 槽交接、结果覆盖与 dispatch 终点事实。
+//! 冻结 CALL 的 caller 槽交接、结果覆盖与 dispatch 终点。
 //!
-//! 消费 Dataflow 调用边界、canonical Def 与完整覆盖 frontier，分别保留布局、
-//! 值版本及捕获状态；实际 producer 删除仍由 HIR 求值顺序 owner 证明。
-//! 例如 f(owner) 的参数槽可交给 callee，owner 的原低槽不随参数 COPY 交出。
-//! 同值的 callee/receiver 准备与结果写回仍是不同物理事件。
+//! 消费 Dataflow、canonical Def 与覆盖 frontier，供 HIR 完整事务验证使用。
 
 use super::*;
 use crate::hir::common::HirCallArgumentRoot;

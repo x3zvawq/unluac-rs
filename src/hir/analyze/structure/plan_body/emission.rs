@@ -1,10 +1,6 @@
-//! 在私有 plan lowering 结果中传递已证明的词法边界，拼接完成后才物化 HIR block。
+//! 在 plan lowering 结果间传递已证明的词法边界，并物化 HIR block。
 //!
-//! scope 身份来自 bindings.lexical_scopes 的索引；位置由 low 指令实际发射点记录，
-//! 不从 HIR 表达式、寄存器名称或节点地址重建。比如 `local t={}; if p then ... end;
-//! use(t); scope-end` 的开始和结束可以由不同 region 发射，再由共同 Sequence 包成 do。
-//! 这里只保持语句与边界顺序，不证明跨控制流窗口是否合法；嵌入分支、循环等独立
-//! 语法块前，调用方必须完成相应拼接并通过 finish 检查所有边界已经闭合。
+//! 消费 binding scope 身份与实际发射点，保持语句及边界顺序；窗口合法性由前层证明。
 
 use std::collections::BTreeSet;
 

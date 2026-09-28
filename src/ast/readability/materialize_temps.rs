@@ -1,17 +1,6 @@
-//! 这个文件负责把最终仍然泄漏到 AST 层的 temp 身份物化成保守 synthetic local。
+//! 将最终 AST 中仍残留的 temp 物化为 synthetic local。
 //!
-//! 理想情况下，前层应该尽量在 HIR/AST build 阶段就把源码绑定恢复干净；但如果某些
-//! temp 直到 Readability 结束前仍然存在，这里会把它们显式落成 AST 自己的
-//! synthetic local，避免 Generate 再去猜。它不会把 temp 强行美化成本地源码变量，
-//! 只负责把“无法继续隐藏的 temp”稳定表达出来。
-//!
-//! 例子：
-//! - `t0 = f(); return t0` 会物化成一个 synthetic local，再由后续 pass/Generate
-//!   稳定输出，而不是把裸 `t0` 留到最终代码
-//! - 命名 vararg、capture binding、函数名路径里残留的 temp 也会一起收成
-//!   synthetic local 身份
-//! - 物化只改变可读性状态，`HirTemp(temp)` 显式保留 HIR 身份；repeat/capture 消费方
-//!   直接查询该来源，不能把 AST 自建的同号 local 当作原 temp
+//! 保留 HirTemp 来源身份，供后续命名和生成消费；源码绑定恢复仍由前层负责。
 
 use super::super::common::{
     AstBindingRef, AstExpr, AstFunctionExpr, AstFunctionName, AstLValue, AstModule, AstNameRef,

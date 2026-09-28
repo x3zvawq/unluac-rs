@@ -1,4 +1,4 @@
-//! 已选结构 payload 的压缩与 condition 冻结。输入 region arena、edge plans 和候选 evidence，输出紧凑的 branch/loop/condition arenas 及旧到新 ID 映射；不负责值决策 arc。例如被 containment 选中的 condition 会在这里获得稳定节点与值索引。
+//! 已选结构 payload 的压缩与 condition 冻结。输入 region arena、edge plans 和候选 evidence，输出紧凑的 branch/loop/condition arenas 及旧到新 ID 映射；不负责值决策 arc。
 
 use super::*;
 

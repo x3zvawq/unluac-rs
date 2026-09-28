@@ -1,12 +1,6 @@
-//! 把显式 TBC 清理事件原子地物化为 HIR 词法块，AST 不重建底层 cleanup 协议。
+//! 将显式 TBC 清理事件原子地物化为 HIR 词法块。
 //!
-//! TBC/Close/label 的 origin 与返回事务来自前层；共享 HIR CFG 发布当前求值位置的活跃事实。
-//! 例如 `TBC a; Close(a); side()` 恢复为 `do local a <close> ... end; side()`，
-//! 而同一原始 Return 的 cleanup 保持返回结果先求值、后关闭的顺序。
-//! 候选只记录区间与 cleanup 选择条件；覆盖、活跃点和嵌套分量通过后，才统一发布所有权。
-//! 重建按原始位置移动节点，逐项退休已接管的 origins，整条 Close 全部退休后才删除。
-//! 直属 cleanup、label、binding 活动各自建立位置索引；嵌套 cleanup 按 origin 汇入外层位置，
-//! 不让物理槽复用混淆资源身份，也不逐候选复制相同关闭位置或重扫完整语句树。
+//! 消费前层的 origin、返回事务与共享 HIR 活跃事实，发布资源作用域和已接管的 cleanup。
 
 use std::{
     cell::OnceCell,

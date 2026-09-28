@@ -1,17 +1,6 @@
-//! carried binding 读取与 mention 事实的只读收集器。
+//! 收集 carried binding 的读取与提及事实，供交接证明查询。
 //!
-//! 读取事实用于判断 handoff seed 是否只依赖单个 carried 状态、suffix 是否仍观察旧
-//! binding；mention 事实同时覆盖直接左值，用于保护子块之外仍存活的 source/target。
-//! 它不判断写入安全性，也不执行 rewrite。
-//! 存在性查询复用这些身份集合，不统计出现次数；只声明 binding 的字段不属于读取或
-//! 直接左值。capture 值遵循共享 HIR visitor 的遍历边界，仍计入对应身份集合。
-//! 递归保护使用一次快照中的语句先序区间：每个 header 只收集一次，父语句的区间包含
-//! 全部子块；它不表示执行顺序。后序 owner 只在子块未改写时复用该快照，否则重建。
-//! 例如 `do use(x) end; use(x)` 的两条语句均提及 x，查询第一条之外仍能找到 x。
-//!
-//! 例子：
-//! - 输入表达式：`state + 1`
-//! - 输出事实：读取了唯一 carried binding `state`
+//! 消费共享 HIR visitor；位置索引只描述当前语句快照，改写后的子域须重新建立事实。
 
 use std::{collections::BTreeSet, ops::Range};
 

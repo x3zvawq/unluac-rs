@@ -1,9 +1,6 @@
-//! 把等价的字符串索引与 constructor key 收敛成字段形式。
+//! 将合法字符串索引和构造器键整理为字段语法。
 //!
-//! `obj["name"]` 和 `obj.name` 在 `name` 是合法标识符时语义等价。
-//! 这里尽早把它规整成字段访问，是为了让后续的 alias inline / method sugar
-//! 都能直接面对更稳定的 AST 形状，而不是各自重复理解字符串索引。
-//! 构造器裸键还会影响目标编译器的分配选择，须消费 HIR 原分配的命名许可。
+//! 消费目标标识符规则与 HIR 分配许可，为后续 Readability 提供统一访问形状。
 
 use crate::ast::DecompileDialect;
 

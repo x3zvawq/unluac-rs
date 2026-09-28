@@ -1,8 +1,6 @@
 //! simplify 对共享 HIR 值域的查询入口。
 //!
-//! 结果种类与短路合流由 value_facts 统一解释；此处仅注入目标 VM 比较事实及已证明
-//! 稳定的路径假设。例如 guard 成立时 guard or fallback 恒真，但不授权跨过修改 guard
-//! 的调用，也不把正常返回的值事实当成求值可删除证明。
+//! 注入目标方言及当前有效的路径假设；正常结果事实不等于求值可删除证明。
 
 use crate::hir::common::HirExpr;
 use crate::hir::expr_safety::HirExprSafety;

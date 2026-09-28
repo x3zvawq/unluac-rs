@@ -1,9 +1,6 @@
-//! 在完整源码帧中重放表分配、字段求值及 SETLIST 暂存区。
+//! 在完整源码帧中恢复表分配、字段求值和 SETLIST 暂存区。
 //!
-//! 构造器 owner 提供字段/批次角色，Promotion 提供原操作槽，FrameBuilder 统一
-//! 核对 Def 版本与事件顺序；字段持有值不代表原 scratch 根可以提前退休。
-//! 例如 t={}; v=f(); SETLIST t(v,g()...) 必须保留原固定缓冲与开放尾，
-//! 各 VM 的分配方式和槽布局在对应构造路径中验证。
+//! 消费构造器步骤与 Promotion 原槽事实，由共享 FrameBuilder 核对写入和事件顺序。
 
 use super::*;
 use crate::hir::common::{HirBinding, HirRecordField};

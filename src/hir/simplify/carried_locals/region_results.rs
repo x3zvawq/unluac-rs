@@ -1,15 +1,6 @@
-//! 结构化 region result 与既有状态 binding 的交棒收敛。
+//! 证明结构化 region result 能否复用既有状态 binding，并提交身份交接。
 //!
-//! StructurePlan 会为 branch/loop result 保留独立 SSA 身份。提升到 HIR 后，这类身份
-//! 可能表现为 `local result; if ... result = state ... end`，或在每个 loop break 前把
-//! carried state 复制到 result temp。只有所有能抵达后缀的路径都完整定义 result，
-//! 并能证明同一 home slot，或证明动态 repeat 的匿名 result 在每个出口都只是 state 的
-//! 精确副本时，result 才能安全复用原 local/param；reference capture、外部入口与独立状态
-//! 写入都会阻止该折叠。By-value capture 由创建点的 reaching relation 验证；proto 级资源
-//! 身份门还拒绝 TBC 和 reference-capture raw-home may-alias；
-//! 与改写两端 possible-home 不相交的 cleanup 会原位保留，不会伪装成整个 region 的屏障；
-//! self-contained goto/label 由 owner-wide lexical CFG 证明；跨 owner transfer 只在其
-//! relation 会让目标观察错误 result/state epoch 时保留原形。
+//! 消费 Structure/HIR 的结果、home、capture 和共享控制流事实，保持各出口可观察状态。
 
 use std::collections::{BTreeMap, BTreeSet};
 

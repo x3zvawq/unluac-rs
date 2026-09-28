@@ -1,4 +1,4 @@
-//! 循环分区构建。输入 LoopPlanInput、图事实与方言能力，输出 preheader/control/body/continuation 和 break/continue routes；不负责 HIR 语法选择。例如 repeat 会把安全 condition blocks 纳入 control，并把真实退出留在 owner 外。
+//! 循环分区构建。输入 LoopPlanInput、图事实与方言能力，输出 preheader/control/body/continuation 和 break/continue routes；不负责 HIR 语法选择。
 
 use super::*;
 

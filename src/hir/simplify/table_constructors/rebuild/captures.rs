@@ -1,9 +1,6 @@
-//! 校验构造器 producer 移除后，closure 的直接 capture 仍有物化绑定。
+//! 校验构造器改写后 closure 的直接 capture 仍有物化绑定。
 //!
-//! 字段表达式的子节点只由共享 HIR 查询遍历；capture 边消费 BindingIndex 与本事务的
-//! materialization 计数，不把它改成一般表达式提及，也不展开绑定定义或子 proto。
-//! 例如字段 closure 捕获的 Local 若只由被删除 producer 声明，则拒绝该构造器事务；
-//! 参数及 upvalue 的存活不由本事务签发。这里不重建字段顺序或 capture 来源。
+//! 消费 BindingIndex 与当前事务，不重新推断 capture 来源或展开 child proto。
 
 use super::super::bindings::binding_from_identity;
 use super::*;

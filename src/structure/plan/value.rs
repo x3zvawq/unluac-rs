@@ -1,9 +1,6 @@
-//! 冻结 canonical phi 的逐输入处置，并发布由最终处置证明的循环状态身份。
+//! 冻结 canonical phi 的逐输入处置及循环状态身份。
 //!
-//! 唯一 RegionInput 与至少一个同 owner 的 LoopCarried 才形成 carried phi；例如
-//! `x = 0; while test() do x = step(x) end` 的入口值和循环 owner 在此确定。
-//! HIR 可以决定如何分配 binding，但不能重新遍历 incoming 选择结构 owner。
-//! 证明只保存输入槽位，查询从同一 canonical incoming 读取 owner/value，不复制身份。
+//! 消费最终 owner 和原 incoming，向 HIR 发布唯一值转移归属。
 
 use super::{RegionId, RegionPlan};
 use crate::structure::{BlockRef, EdgeRef, PhiId, SsaValue, StructurePlan};

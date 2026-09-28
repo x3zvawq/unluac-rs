@@ -1,8 +1,6 @@
-//! 这个子模块负责把短路候选里的 header branch 直接降成 HIR 测试表达式。
+//! 将短路 header 降低为单次求值的 HIR 条件主体。
 //!
-//! 它依赖 CFG 末尾 branch terminator 和前面的 branch-subject lowering，只提供“单次求值的
-//! 条件主体长什么样”，不会在这里决定整段结构该如何收束。
-//! 例如：短路 header 的 `Branch(Truthy r0)` 会先在这里得到 `r0` 这个测试表达式。
+//! 消费冻结的 branch terminator 与 operand 来源，整段结构由决策 lowering 组织。
 
 use super::*;
 

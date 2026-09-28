@@ -1,13 +1,6 @@
-//! 这个文件实现 LuaJIT bytecode 到统一 low-IR 的 lowering。
+//! 将 LuaJIT bytecode 降低为统一 Low-IR。
 //!
-//! 第一阶段目标是把 LuaJIT 2.1 编出来的常见 opcode 子集稳定映射成现有 low-IR：
-//! - calls/returns/vararg 用 LuaJIT 自己的 B/C 约定解释；
-//! - compare/test + helper JMP 直接压成结构化 branch；
-//! - LOOP/ILOOP 只当 targetable marker，JLOOP 这类 runtime patch opcode 直接拒绝；
-//! - ISTYPE/ISNUM 保留内建 guard 与可能的原槽规范化，不猜普通 Lua helper；
-//! - method setup 由 split `MOV + TGETS/TGETV` 协议还原，并在这里冻结 receiver snapshot；
-//! - 写入和绕过 setup 的外部入边会使 method hint 失效，后层不再猜冒号调用；
-//! - TNEW 发布完整分配布局；TDUP 的模板常量与 nil 占位由一条 NewTable 原子初始化。
+//! 解释原调用、分支、方法准备和表分配协议，冻结后层所需的来源事实并报告不支持的编码。
 
 use std::sync::Arc;
 

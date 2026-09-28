@@ -1,10 +1,6 @@
-//! 这个子模块负责把固定 operand、常量池项和表访问骨架降成基础 HIR 表达式。
+//! 将 operand、常量和表访问降低为基础 HIR 表达式。
 //!
-//! 它依赖 Transformer 已经给好的 operand 形状、Dataflow 的 use/def 事实和常量池，不会
-//! 越权去恢复短路结构或 merge 来源。
-//! 例如：`GETTABLE r0, r1, "x"` 会先在这里变成 `r1["x"]` 对应的访问
-//! 表达式骨架；已证明的 `_ENV[key]` 则无论 key 能否写成裸标识符，都保留为
-//! raw-byte `HirGlobalRef`，并保留原读取来源供物理帧查询；目标语法合法性留给 AST 验证。
+//! 消费 Transformer 与 Dataflow 事实，保留全局引用及原读取来源；语法合法性由 AST 判断。
 
 use super::*;
 

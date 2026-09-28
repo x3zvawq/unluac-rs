@@ -1,4 +1,4 @@
-//! 冻结 repeat 的 staged result 与 native/break 退出合同；依赖终端边动作和外层 loop 所有权，不负责其他 loop kind；例如决定尾分支是否可直接保留 repeat。
+//! 冻结 repeat 的 staged result 与 native/break 退出合同；依赖终端边动作和外层 loop 所有权，不负责其他 loop kind。
 
 use super::*;
 

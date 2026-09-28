@@ -1,4 +1,4 @@
-//! 循环词法 arm、正常尾部与透明 pad 的证明。输入 CFG、loop domain 和 scope barriers，输出 lexical arms、normal tail 与可转发 exit routes；不负责创建 RegionPlan。例如 while 的共享尾只有在 normal/early 出口合同闭合时才会冻结。
+//! 循环词法 arm、正常尾部与透明 pad 的证明。输入 CFG、loop domain 和 scope barriers，输出 lexical arms、normal tail 与可转发 exit routes；不负责创建 RegionPlan。
 
 use super::*;
 

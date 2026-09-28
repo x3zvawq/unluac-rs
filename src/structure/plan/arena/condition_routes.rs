@@ -1,4 +1,4 @@
-//! loop condition route 与构建前 edge 规范化。输入 selected condition、RegionArena 和 CFG，输出对齐后的 condition route 与 branch-tail continue；不负责最终 transfer 分类或值动作时序。例如 repeat 经纯 jump pad 回 header 时会把完整 route 冻结进 condition arc。
+//! loop condition route 与构建前 edge 规范化。输入 selected condition、RegionArena 和 CFG，输出对齐后的 condition route 与 branch-tail continue；不负责最终 transfer 分类或值动作时序。
 
 use super::*;
 

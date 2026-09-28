@@ -1,10 +1,6 @@
-//! method alias 的当前 AST 候选证明与单点提交。
+//! 证明并提交当前 AST 的 method alias 使用点改写。
 //!
-//! owner 查询和正式改写共用借用计划，只有提交才复制 AST。这里证明当前 sink 的求值位置、
-//! 首匹配路径及前缀稳定性；binding 删除与 VM 根生命周期仍由 method_alias 消费已有事实。
-//! 例如 `local r=source; sink(r.m(r))` 保存 sink 中首参数的路径，许可后一次提交为
-//! `sink(source:m())`；`effect() + r.m(r)` 的不稳定前缀则使整次候选拒绝。
-//! 路径和替换物借用同一不可变快照，不跨 Normal/Deferred 阶段或其他 AST 改写缓存。
+//! 计划借用同一不可变快照，绑定删除与根生命周期证明由 method_alias 持有。
 
 use std::ops::ControlFlow;
 

@@ -1,9 +1,6 @@
-//! 在已选定的互斥控制域内，为一个物理 home 冻结无观察覆盖前沿。
+//! 在指定控制域内证明物理 home 的无观察覆盖前沿。
 //!
-//! 作用域和 home 由 Structure 的最终 ValueDecision owner 提供；覆盖、观察和原 epoch
-//! 只消费 Dataflow。每块入口只求解一次，Leaf/Join 共享完整 Def 前沿，不逐 test 复制尾集合。
-//! 例如 `TEST r; TEST a; MOVE r,x / MOVE r,y` 可跨中间 TEST 证明两路覆盖；GETTABLE
-//! 覆写自身若可观察旧根则拒绝，离开域前未覆盖或可一直停留的无覆盖循环也拒绝。
+//! 消费最终 ValueDecision owner 与 Dataflow，发布可共享的原 Def 覆盖事实。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

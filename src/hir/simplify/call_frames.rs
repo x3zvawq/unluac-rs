@@ -1,16 +1,6 @@
-//! 在 HIR 收尾把完整原调用帧恢复为表达式，统一普通调用和终端方法链的槽/事件核对。
+//! 将完整原调用帧恢复为 HIR 表达式，统一普通调用与方法链的帧证明。
 //!
-//! Promotion 以原 HirSourceSite 发布 callee Def、参数起点和固定/开放结果包；方法另消费
-//! 原 SELF 双端协议。共享 FrameBuilder 逐定义版本、逐 home、逐事件树化，不从 AST
-//! 反推寄存器，也不把零返回假定为旧 callee 必然覆写。普通非终端调用还必须核对
-//! 整个源码低槽声明前缀，并通过 PhysicalFramePrefix 保留已有身份及其声明起点。普通帧由
-//! Deferred 调度处理，声明 epoch 改变后交还构造器 owner；缺少完整前缀证明的方法帧
-//! 仍由最终终端事务独立处理。
-//! 例如 `p=print; c=table.concat; p("x",c(t))` 原子恢复成原生嵌套调用，可避免
-//! 多出的低槽 local 抬高后续 GC 的 caller top；`print(obj:make():next())` 则由
-//! 同一 builder 消费原方法 receiver/参数槽，终端边界维持其既有独立合同。
-//! CONCAT 输入按各自原值版本核对写域；同一 Local 承接拼接结果后附带的低槽 MOVE，
-//! 仍属于输出责任，不应使原输入 COPY 被永久物化并在每轮重编译中增长。
+//! 消费 Promotion 的定义、参数、结果及方法协议，并与源码声明前缀 owner 协作提交。
 
 mod fastcalls;
 mod logical;

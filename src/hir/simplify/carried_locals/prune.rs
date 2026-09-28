@@ -1,9 +1,6 @@
-//! 裁剪 carried-local 收敛后已证明冗余的赋值。
+//! 删除 carried-local 收敛后已证明冗余的赋值。
 //!
-//! 消费 handoff owner 的身份保护与局部路径事实，处理自复制、空赋值及重复快照，
-//! 不以值相等代替物理写入证明。原调用准备 COPY 留给完整调用帧 owner。
-//! 例如 local t=v; if c then t=v end 在路径上没有相关写入时可只保留初值；
-//! dead loop-carrier mirror 的分量删除另有完整 same-home 事务。
+//! 消费交接 owner 的身份和路径证明，保留仍承担物理写入责任的操作。
 
 use std::collections::{BTreeMap, BTreeSet};
 

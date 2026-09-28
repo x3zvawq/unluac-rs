@@ -1,9 +1,6 @@
-//! 提供 HIR simplify 共用的递归改写骨架。
+//! HIR simplify 共用的递归改写骨架。
 //!
-//! HirRewritePass 提供 block/stmt/expr 等回调，统一子节点顺序和遍历边界；具体
-//! 候选、语义证明与事实有效性仍由各 pass 负责。自带 block rebuild 的 pass 可只用
-//! nested-block helper，不必复制整套递归。
-//! 例如 logical_simplify 使用表达式及条件回调，dead_labels 在 block 回调中删标签。
+//! 为 pass 提供一致的子节点顺序与回调边界，具体证明和事实有效性由调用方维护。
 
 use crate::hir::common::{
     HirBlock, HirCallExpr, HirDecisionExpr, HirExpr, HirLValue, HirProto, HirStmt,

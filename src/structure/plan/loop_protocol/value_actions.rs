@@ -1,4 +1,4 @@
-//! 分类并冻结循环前后、body 与 latch 的值复制动作；依赖 canonical phi copy，不负责 repeat 专属 staging；例如把 VM 控制值与用户可见 carried 值分开。
+//! 分类并冻结循环前后、body 与 latch 的值复制动作；依赖 canonical phi copy，不负责 repeat 专属 staging。
 
 use super::*;
 

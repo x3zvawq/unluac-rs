@@ -1,16 +1,6 @@
-//! 这个文件负责清理已经没有源码意义的机械 AST 壳。
+//! 清理 AST 中已经失去源码意义的机械语法包装。
 //!
-//! 它依赖前面的结构恢复和 readability pass 已经把真正需要保留的局部作用域、
-//! 控制流和显式 return 暴露出来；这里专门删除“只剩形式意义”的 do-end、空 local、
-//! 以及 chunk/function 结尾的无值 return。尾部 do-end 的作用域证明显式区分普通
-//! block 出口和 repeat 的 `until` 条件：前者与父 block 同时退出，后者仍会在父域中
-//! 求值。它不会越权合并业务语句，也不会把仍有词法意义的块错误拍平。
-//!
-//! 例子：
-//! - `do print(x) end` 会在内部没有局部作用域意义时折成 `print(x)`
-//! - `local t0` 这种只剩机械 temp 壳、且没有值也没有使用的声明会被删除
-//! - 未使用的 recovered `local t0 = side_effect()` 会保留为 `side_effect()` 调用
-//! - 函数尾部的 `return` 会在没有返回值时被去掉
+//! 消费当前作用域、绑定与控制流事实，保留仍有词法意义或可观察求值的节点。
 
 use std::collections::{BTreeMap, BTreeSet};
 

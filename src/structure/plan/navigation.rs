@@ -1,13 +1,6 @@
-//! 最终 region containment、CFG 端点关系与源码布局完成位置的共享索引。
+//! 最终 region containment、CFG 端点与源码正常完成关系的共享索引。
 //!
-//! parent/Euler 事实来自最终 arena；完成路径只穿过 Sequence/island 的末项与
-//! structured owner 的语法子区，不能用任意 descendant 代替正常完成。比如
-//! `Branch { then: island [A, B] }; C` 中 A -> C 必须保留显式跳转，只有 B 能
-//! 从 island 落底后结束 branch。这里不替代 loop 的 break/continue/条件出口分类。
-//! 构建时先冻结不依赖 sibling 顺序的拓扑供 layout 排序，排序完成后才冻结完成路径；
-//! RegionArena 只发布 finish_layout 返回的最终索引。
-//! reachable block 按最终 owner 的 Euler 位置只存一份，子树查询借用连续区间；
-//! 例如 island 直接拥有的块与其 structured child 的块共同属于 island，不能只枚举 Block 节点。
+//! 消费最终 arena 与布局，发布区域导航和完成位置查询；循环 transfer 分类由原 owner 持有。
 
 use crate::structure::{BlockRef, Cfg, EdgeRef, StructurePlan};
 
@@ -291,6 +284,7 @@ impl RegionNavigation {
                     }
                 }
                 RegionPlan::Unstructured { layout, .. } => {
+                    // island [A, B] 只有 B 落底才算正常完成；A 到外层后继仍需显式跳转。
                     empty[region.index()] = true;
                     for item in layout.iter().rev() {
                         match *item {

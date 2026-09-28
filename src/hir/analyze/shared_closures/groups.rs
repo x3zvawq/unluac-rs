@@ -1,4 +1,4 @@
-//! 收集可复用 shared-closure 组与 owner template 入口；依赖 lowered closure identity，不负责递归模板匹配；例如拒绝同 shared id 指向不同 child proto。
+//! 收集可复用 shared-closure 组与 owner template 入口；依赖 lowered closure identity，不负责递归模板匹配。
 
 use super::*;
 

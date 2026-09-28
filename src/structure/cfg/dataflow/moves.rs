@@ -1,9 +1,6 @@
-//! 在最终 SSA 快照上冻结透明 Move 的语义值根。
+//! 从最终 SSA 冻结透明 Move 的语义值根。
 //!
-//! 输入是 compact/remap 后的 instruction use 与 Def 身份；例如 `r1 = r0; r2 = r1`
-//! 的两个 Move 都指向 r0 的原值，遇到 Phi 则停止。它不证明物理 home 或快照可延后读取，
-//! 也不解释 Structure 的 forwarded action。不可达 Move 缺少 use 时只让该查询失败，
-//! 不能让未被任何消费者使用的指令阻止整个 proto 分析。
+//! 消费指令 use 和 Def 身份，不证明物理 home 或读取时点可移动。
 
 use super::super::common::InstrUseValues;
 use super::*;

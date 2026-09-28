@@ -1,12 +1,6 @@
-//! 最终 readability AST 的只读指标收集。
+//! 从最终 Readability AST 收集结构指标，供同一 case 的断言共享。
 //!
-//! 这里的事实来自 `DecompileState::readability`，不从生成文本猜测 local、函数或控制流。
-//! 全模块计数包含所有 child function；`@proto=N` 则只计该 proto 自身的函数体，不进入其
-//! child function。例如根 proto#0 声明一个 child proto#1，root 的 `function` 为 1，
-//! 但 proto#0 不计 child body 中的 `if`，proto#1 才计该 `if`。一次遍历同时建立全模块和
-//! 各 proto 的指标，供同一 case 的多个 AST 断言复用。
-//! repeat 条件的局部绑定关系使用当前循环直属声明的身份集，不把显示名称或子函数同号
-//! Local 当作条件来源；例如 `repeat local done = step() until done` 计一个绑定。
+//! 全模块指标覆盖 child function；按 proto 查询只统计该函数体，绑定按身份区分。
 
 use std::collections::{BTreeMap, BTreeSet};
 

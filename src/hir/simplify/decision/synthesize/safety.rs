@@ -1,8 +1,6 @@
-//! 这个子模块负责 decision synthesis 的语法安全门槛。
+//! 判断当前 HIR 是否满足 Decision synthesis 的语法安全要求。
 //!
-//! 它依赖 HIR 表达式当前的节点种类，只回答“这个 decision/expr 能不能安全参与综合”，
-//! 不会在这里做成本比较或可读性排序。
-//! 例如：含副作用调用的表达式会在这里被拒绝参与综合。
+//! 为综合器发布参与许可，成本比较与源码形式选择由其它子模块负责。
 
 use crate::hir::common::{HirDecisionExpr, HirDecisionTarget, HirExpr};
 use crate::hir::expr_safety::HirExprSafety;

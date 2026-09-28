@@ -1,9 +1,6 @@
-//! 将为同一 binding 选值的分支树和 fallback label/goto 壳收回 HIR 值语义。
+//! 将为同一 binding 选值的分支及跳转结构恢复为 HIR 值语义。
 //!
-//! 消费已有 branch、binding 与词法入口事实；raw Temp 的完整树交给 Decision builder，
-//! Local 保留逐层证明边界，表达式归一交给 logical-simplify，不重新解释 CFG。
-//! 例如 local x; if c then x="a" else x="b" end 可恢复为 local x=c and "a" or "b"。
-//! nil-only fallback 仍须区分 nil 与 false，不能直接改成 or。
+//! 消费已有 binding 和词法入口事实，表达式归一由 logical-simplify 负责。
 
 use std::collections::{BTreeMap, BTreeSet};
 

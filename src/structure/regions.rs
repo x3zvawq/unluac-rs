@@ -1,12 +1,6 @@
-//! 这个文件实现区域事实提取。
+//! 从不可规约 SCC 提取区域成员与出入边事实。
 //!
-//! 可规约的 loop/branch 已由各自候选和 StructurePlan 表达；这里仅把不可规约 SCC
-//! 收敛为 `RegionFact`，供后续 HIR 查询 entry/exit 与成员边界。
-//! 它不会重复保存线性块或可结构化区域，也不会越权恢复最终语法。
-//!
-//! 例子：
-//! - 一个自然循环或普通 if/else 不会再额外产出 RegionFact
-//! - 一个多入口 SCC 会产出一条 RegionFact
+//! 向最终结构计划发布 RegionFact，可规约的 loop/branch 仍由各自 owner 表达。
 
 use crate::structure::Cfg;
 

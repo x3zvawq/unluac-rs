@@ -1,17 +1,6 @@
-//! eliminate-decisions pass 的表达式抽取与值物化通道。
+//! 将残余 Decision 和短路值表达式降低为普通 HIR 表达式或语句前缀。
 //!
-//! 这个模块负责把残余 `Decision` / 短路值表达式转成普通 HIR 语句：可证明为纯值的
-//! Decision 会折回表达式；仍需要保持共享/短路语义的表达式会物化为 `local + if + assign`。
-//! 它依赖 `decision/mod.rs` 已提供的 collapse/simplify 谓词和 `EliminationState` 的 local
-//! 分配能力，但不遍历 block，也不决定 statement 层面的重写顺序。
-//!
-//! 例子：
-//! - 输入：`target = Decision(a ? b : c)`
-//! - 输出：`if a then target = b else target = c end`
-//! - 两臂相同或 truthiness 已知时，只有可安全丢弃的 test 才能删除控制壳
-//! - 后项产生 statement prefix 时，先快照此前仍待求值的同级表达式
-//! - Decision 的现存目标只在选中终端值后写入；例如 `x = d ? next : x` 可直接
-//!   还原条件赋值。逻辑值物化会先写中间值，仍需独立 carrier，不能提前覆盖旧 root/cell。
+//! 消费决策归约证明与物化状态，保留共享求值、写入时点和值根生命周期。
 
 use std::mem;
 

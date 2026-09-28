@@ -1,4 +1,4 @@
-//! 分割 natural-loop 域并匹配 numeric-for latch；依赖支配/SCC 与 lowered 指令，不负责最终循环语法；例如把同 header 多回边归为一个控制身份。
+//! 分割 natural-loop 域并匹配 numeric-for latch；依赖支配/SCC 与 lowered 指令，不负责最终循环语法。
 
 use super::*;
 

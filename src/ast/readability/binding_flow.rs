@@ -1,17 +1,7 @@
-//! 这个文件集中承载 AST readability 里的局部 binding 流分析工具。
+//! 当前 AST 函数体的共享 binding 读取、提及与使用查询。
 //!
-//! 这些 pass 经常需要回答同一类问题：
-//! - 某个 binding 在一段语句里还会不会再被读取？
-//! - 某个语句实际提到了哪些 binding（包括赋值目标这种 mention，而不只是读取）？
-//! - 某个语句/块会不会提前引用一组待下沉的 hoisted local？
-//! - 某个 binding 在当前函数体里一共被用了几次？
-//! - repeat body 之后的 until 条件会不会继续读取正文 local？
-//!
-//! 这里故意把“当前函数体”作为边界，不继续钻进嵌套函数体。
-//! 原因是 HIR-origin LocalId 与已物化 HirTemp 仍按函数局部编号，跨闭包继续统计
-//! 很容易把不同函数里碰巧同号的 binding 错算成同一个变量。
-//! 但 `FunctionExpr.captured_bindings` 是闭包创建时对当前词法 binding 的显式引用，
-//! 必须按当前语句的一次使用统计，否则后续 pass 可能误删仍被闭包持有的局部。
+//! 消费共享 visitor 的名字角色及显式 capture，供 Readability 判断词法依赖；
+//! 不进入使用独立编号的 child function。
 
 mod refs;
 mod writes;

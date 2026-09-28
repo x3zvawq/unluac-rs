@@ -1,15 +1,6 @@
-//! 收集闭包捕获槽目标、声明区域与 capture 后写入；依赖 CFG、slot epoch 和 region tree，
-//! 不负责 temp 映射；loop body 块直接借用 Structure 的 containment 索引；例如把同一槽
-//! 的不同时代分成独立 local。capture 后写入按 slot/epoch 批量消费 GraphFacts 的 SCC
-//! 拓扑与前驱；例如无环块内先写后捕获不需要写回，回边上的同一次静态写则可能再次执行。
-//! CLOSE 窗口还区分互斥分支的独立 cell 激活；两个分支都在 r2 捕获并关闭自己的 value，
-//! 不能仅因物理 epoch 相同就共用只在 then 声明的 LocalId。未关闭的共同外层 cell 不拆分。
-//! 共同 cell 的初始化若支配所有捕获与后续写，直接以该写声明；后续 Phi 不另造 nil carrier。
-//! 同一遍捕获枚举也保留全部 capture home 和已接受 debug scope；例如旧 r2 cell 关闭后，
-//! 新的未捕获 `next_first` 可沿自己的 nil 声明绑定，不能被旧 epoch 的捕获永久阻止。
-//! RETURN/TAILCALL 的非 TBC 关闭由同源的紧邻终结指令承接 activation，不恢复成提前结束的 do；
-//! 例如 `local x=1; local f=function() return x end; return f` 保持函数作用域及返回求值。
-//! 显式 CLOSE 和资源 cleanup 仍沿原词法窗口处理，不能借终端关闭放宽普通 scope 边界。
+//! 为闭包捕获槽恢复声明身份、活动窗口及捕获后写入事实。
+//!
+//! 消费 CFG、slot epoch、debug scope 与共享区域/图查询，供 HIR 绑定分配使用。
 
 use super::*;
 use crate::structure::SccId;

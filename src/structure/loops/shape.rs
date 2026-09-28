@@ -1,4 +1,4 @@
-//! 推断 loop kind、source bindings、body scope 与初步 value merge；依赖 CFG/SSA 和候选域，不负责共享退出路径；例如区分 while/repeat/for 的控制前缀。
+//! 推断 loop kind、source bindings、body scope 与初步 value merge；依赖 CFG/SSA 和候选域，不负责共享退出路径。
 
 use super::*;
 

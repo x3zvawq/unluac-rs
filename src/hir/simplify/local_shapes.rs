@@ -1,12 +1,6 @@
-//! 这个文件集中放置 HIR simplify 阶段跨 pass 复用的 local 形状判断。
+//! HIR simplify 跨 pass 共用的 local 形状查询。
 //!
-//! 它只描述局部绑定在 HIR 语句和左值里的机械形态，不负责做 branch-value、
-//! temp 提升或布尔壳折叠决策。这样各 pass 可以共享同一套基础判断，同时保留各自的
-//! 语义 owner。
-//!
-//! 例子：
-//! - `local l0` → `Some(l0)`
-//! - `local l0 = f()` → `Some((l0, f()))`，绑定与固定单值 RHS 由同一次识别发布。
+//! 将当前声明、赋值和左值投影为绑定及固定单值信息；候选接受证明由消费者负责。
 
 use crate::hir::common::{HirExpr, HirStmt, LocalId};
 

@@ -1,10 +1,6 @@
-//! 当前 HIR 块直属 cleanup 的位置与覆盖阈值，供资源边界消费者共享。
+//! 索引当前 HIR 块直属 cleanup 的位置与覆盖范围。
 //!
-//! 独立 Close(r) 覆盖不小于 r 的槽位；区间摘要支持最后覆盖点与连续 cleanup 前缀查询。
-//! 嵌套 cleanup 属于不同词法 owner，不进入这里。独立 Close(0) 同样是覆盖阈值 0；
-//! frame cleanup 只有与原始 Return/TailCall 身份配对才提供终结事实，不能按槽位猜测。
-//! 候选只保存范围选择条件，通过分量检查后才一次发布所有权并集，不逐候选复制位置。
-//! 例如多个嵌套 TBC 共用一串 Close(2) 时，每个候选仅保存一个条件，重建只消费一份位置集。
+//! 消费 Close 和原终结身份，供资源作用域 owner 查询，不推断嵌套词法域。
 
 use std::{
     collections::{BTreeSet, BinaryHeap},

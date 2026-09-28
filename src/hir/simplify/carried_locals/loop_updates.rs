@@ -1,9 +1,6 @@
-//! 将循环中的 next -> carried 机械写回收敛为原状态绑定。
+//! 将循环中的机械 next 写回认回原 carried 状态。
 //!
-//! 消费结构化 loop、binding mention/capture/TBC 与 Promotion 的精确 home；
-//! 不重建循环归属，也不跨不同物理槽移动状态。
-//! 例如 next=carried+1; carried=next 在身份和路径证明成立时可直接更新 carried；
-//! 中间存在读取、提前退出或 repeat 条件时，由对应事务证明整个消费区。
+//! 消费结构化循环、binding 与 Promotion 身份，证明完整消费区后提交。
 
 use std::collections::{BTreeMap, BTreeSet};
 

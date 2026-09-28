@@ -1,11 +1,6 @@
-//! 在共享 HIR 控制流上合并不干扰的同槽 carrier，并认回入口 local。
+//! 在共享 HIR 控制流上合并不干扰的同槽 carrier。
 //!
-//! 来源身份由 Promotion 的 exact home 给出，后向活跃性只证明当前 HIR 是否仍需同时保存
-//! 不同快照。不能由同槽直接推出可替换，也不能在 AST 按名字猜测原寄存器。
-//! 例如不可规约区域的 `a=x; ::L:: b=a+1; a=b; goto L` 可以共用一个 carrier；若后续
-//! 同时读取 a、b，或一次并行赋值写入两者，则整个 home 组保留独立身份。
-//! debug、捕获、TBC、for 与显式 Preserve 域不参与此事务。物理根只有保留入口声明的
-//! 原 owner 才能接收同槽写回；先完成整图证明，再通过既有 rewrite/provenance 通道提交。
+//! 消费 Promotion 身份与当前活跃性，保留源码声明和资源边界后提交绑定复用。
 
 use std::collections::{BTreeMap, BTreeSet};
 

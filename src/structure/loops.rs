@@ -1,9 +1,6 @@
-//! 从 CFG、GraphFacts、Dataflow 和 low-IR 提取共享循环候选。
+//! 从 CFG、GraphFacts、Dataflow 与 Low-IR 提取循环候选。
 //!
-//! 发布循环形态 hint、源码 binding、merge incoming 和控制转移归属，供 HIR 直接
-//! 消费；最终 while/repeat/for 语法不在这里决定。各类循环的细化与出口证明见子模块。
-//! 例如 NumericForInit/Loop 产生 NumericForLike 及用户寄存器绑定；普通 while
-//! 只提供循环形态与 incoming 事实，不伪造 for binding。
+//! 发布循环形态、绑定和控制转移证据，最终计划由 StructurePlan 冻结。
 
 use std::collections::{BTreeMap, BTreeSet};
 

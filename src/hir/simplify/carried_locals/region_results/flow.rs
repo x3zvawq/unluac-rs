@@ -1,15 +1,6 @@
-//! 路径敏感地消除机械 result -> carried state 交棒。
+//! 在共享 HIR 控制流上证明 result 到 carried state 的路径敏感交接。
 //!
-//! Structure/HIR 已经提供结构化分支与循环、binding 的 `(slot, close epoch)`、capture 和
-//! source debug 身份；这里在这些事实之上证明两个 HIR binding 只是同一物理状态的阶段性
-//! 名称，不重新推断 CFG owner，也不移动或复制 RHS。证明只接受同一精确 home-slot，并沿
-//! 共享 HIR 图的可达路径跟踪 `Unproduced/Pending/Synced`；Decision 的全部 test/target 读取按并集
-//! 保守验证。入口验证与 topology 在同一区域的候选间共享，关系域消费 typed event 而不建边；外部入口、
-//! 未同步的外跳与 Unresolved 保留原形。cleanup 只有在 possible-home 与改写端点相交时
-//! 才由 proto 级身份门拒绝，不相交的 cleanup 原位保留。
-//!
-//! 例如 `local r; if c then r = s + 1 else r = s + 2 end; s = r` 会收成两臂直接更新
-//! `s`；若任一路在同步前读取旧 `s`、跳出循环，或随后仍读取已经被消费的 `r`，则整项拒绝。
+//! 消费已有 binding/home、typed event 与区域入口事实，发布关系证明；不重建控制 owner。
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,10 +1,6 @@
-//! 编排 carried-local 交接收敛，将机械 seed/update 身份认回原状态绑定。
+//! 编排 carried-local 交接收敛，将机械身份认回原状态绑定。
 //!
-//! 消费 promotion、binding mention 与资源身份事实，负责后序遍历、外层活跃性保护
-//! 和各 handoff owner 的调度；具体证明与提交分别位于 adjacent、handoffs、
-//! loop_updates、region_results 和 prune，不在入口重建它们的规则。
-//! 例如 local s=1; local c; c=s; use(c) 在身份及路径证明成立时可收成
-//! local s=1; use(s)，仍被外层或闭包观察的状态不得合并。
+//! 消费 Promotion 与使用、资源事实，维护递归域和外层活跃性；具体证明由各交接 owner 持有。
 
 mod adjacent;
 mod binding;

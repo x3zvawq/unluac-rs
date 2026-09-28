@@ -1,13 +1,6 @@
-//! low-IR 指令的寄存器读写与副作用摘要。
+//! 将 Transformer 冻结的指令语义投影为寄存器读写与副作用摘要。
 //!
-//! 这里把 Transformer 已冻结的单条指令语义投影成 canonical SSA 和后续移动安全性所需的
-//! 稠密事实，并一次性冻结观察期间的 caller root 边界；例如 TFORCALL 只消费三个固定
-//! 输入，未产生的 result 槽不属于其存活前缀证明。下游不能从读写集合重新解释调用协议。
-//! 本层不识别控制结构，也不根据 opcode 外形猜隐式 owner。例如可能原槽转换的
-//! `TypeGuard` 同时读取并定义 subject，而纯类型检查只保留读取。
-//! 比较分支虽不写回 Boolean，仍可通过 __eq/__lt/__le 观察整个原 frame；truthiness
-//! 分支不具有这类事件。这里尚无 operand 抽象值，不把与 primitive 比较当成无元方法。
-//! 固定读写先顺序收集，再一次排序去重并冻结；不在逐项插入时搬移有序集合。
+//! 为 SSA 和移动安全性分析发布调用及观察期间的根边界，不识别源码控制结构。
 
 use super::*;
 use crate::structure::StructureError;
@@ -234,6 +227,8 @@ pub(super) fn compute_side_effect_summary(
             summary.add_tag(EffectTag::Metamethod);
             summary.add_tag(EffectTag::MayThrow);
         }
+        // 比较即使不写 Boolean 结果，也可能通过 __eq/__lt/__le 观察原 frame；
+        // truthiness 没有这类事件，此处也尚无操作数值域可排除元方法。
         LowInstr::Branch(branch)
             if matches!(branch.cond.subject, BranchSubject::Compare { .. }) =>
         {

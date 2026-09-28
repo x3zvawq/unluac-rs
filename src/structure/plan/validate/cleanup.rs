@@ -1,4 +1,4 @@
-//! 校验作用域清理动作和关闭范围；依赖 lowered 指令、边计划与 scope payload，不负责推导清理；例如核对 TBC/CLOSE 的离开边。
+//! 校验作用域清理动作和关闭范围；依赖 lowered 指令、边计划与 scope payload，不负责推导清理。
 
 use super::*;
 

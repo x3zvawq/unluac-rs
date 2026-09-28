@@ -1,16 +1,6 @@
-//! 保留原 Fresh 闭包按值捕获的标量初始化语境。
+//! 保留 Luau 原 Fresh 闭包按值捕获的标量初始化语境。
 //!
-//! Luau 的常量传播会删除 capture，使原 NEWCLOSURE 变为共享闭包。本 owner 消费原
-//! closure/capture、SSA 与入口片段，给数值 initializer 发布独立的源码约束；它不把
-//! 标量值域当作删除许可，也不伪造合成 GETVARARGS/分支的原操作来源。
-//! 当前接受零固定参数入口：number 写 r0，首个 Fresh closure 写 r1。非 vararg 有限数值使用
-//! 相反数的十进制字符串取负；LOADK r1 / MINUS r0 r1 不分配、不调用元方法、不检查 GC，
-//! closure 写 r1 及 CAPTURE VAL 后两槽恢复原布局，随后直接返回，新增字符串不改变后缀短 K 指令。
-//! 原 vararg 入口的固定首值读取和前向 truthiness 分支不检查 GC，原 vararg 区仍持有复制值。
-//! 再生后的同值 phi
-//! 按所有 SSA 输入求证，再原子收回整个无观察前缀，不逐分支叠加新屏障。
-//! 例如原 `local n=7; return function() return n end` 保留一次数值 capture initializer，
-//! HIR/AST 直到发射都不能把它替换成普通 7。ByRef、额外声明/事件不签证。
+//! 消费 closure/capture、SSA 和入口片段，为 HIR 发布不能被常量传播替代的源码约束。
 
 use std::collections::BTreeSet;
 
@@ -148,6 +138,8 @@ fn prove_entry(lowering: &ProtoLowering<'_>) -> Option<EntryProof> {
     }
     let site = InstrRef(index);
     let number = captured_number(lowering, lowering.dataflow.use_value(site, Reg(0)))?;
+    // 普通数值字面量会被 Luau 传播进闭包，删除按值 capture 并把 Fresh 变成共享闭包。
+    // 保留原 vararg 读取或数值字符串取负，使初始化仍在 closure 前占据原 r0/r1 布局。
     let initializer = if proto.signature.is_vararg {
         HirCaptureInitializer::FirstVararg(number)
     } else {

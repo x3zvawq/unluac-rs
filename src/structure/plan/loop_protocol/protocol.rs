@@ -1,4 +1,4 @@
-//! 按 loop kind 冻结 while/repeat/numeric-for/generic-for VM 协议；依赖块终结器和区域完成端口，不负责 phi 值动作；例如核对 for header/preheader 指令身份。
+//! 按 loop kind 冻结 while/repeat/numeric-for/generic-for VM 协议；依赖块终结器和区域完成端口，不负责 phi 值动作。
 
 use super::*;
 

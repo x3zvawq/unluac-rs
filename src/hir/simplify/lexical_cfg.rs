@@ -1,9 +1,6 @@
-//! 提供当前 HIR 区域共享的控制流图与 block-local 词法查询。
+//! 发布当前 HIR 区域共享的控制流图与词法查询。
 //!
-//! HirFlowGraph 统一解释 label/goto、最近循环的 break/continue 和 for 分派事件；
-//! LexicalCfg 从同一图投影 successor、外部出口及支配关系，不重复解释控制结构。
-//! 例如子块的 goto outer 连接到外层标签；自含回环仅通过真实可达出口影响后缀。
-//! 图及节点坐标只对当前树快照有效，不提供 reaching-def 或 root-lifetime 证明。
+//! 统一解释结构化控制和 label/goto，供消费者查询边及支配关系；仅对当前树快照有效。
 
 use std::{
     cell::OnceCell,

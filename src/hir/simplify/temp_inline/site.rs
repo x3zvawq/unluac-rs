@@ -1,13 +1,6 @@
-//! 这个子模块负责 temp-inline pass 的站点分类。
+//! 分类 temp 在当前 HIR 中的使用站点与求值语境。
 //!
-//! 它依赖 HIR 当前语句/表达式形状，只回答某个 temp 首次被消费的位置属于 direct、callee、
-//! condition 还是 loop-head，不会在这里执行内联。无环 Decision 只把唯一入口节点的
-//! test 当作必达 condition；其它节点和 target 仍是条件执行的 nested site。条件区域和
-//! 循环重复区域向所有子表达式传播，不能被 call/index 等展示站位覆盖。table constructor
-//! 的分配发生在首字段之前，因此即使字段必达，也会作为独立求值顺序屏障。method 协议
-//! 已经证明 callee base 与隐式首参是同一次 receiver 求值，因此这里把这两个结构引用
-//! 合并视为 call 所在的单一站点；普通点调用仍分别扫描 callee 与参数。
-//! 例如：`r0(1)` 会把 `r0` 标成 `CallCallee`，`r0:m()` 则把 receiver 标成 call 所在站点。
+//! 消费表达式结构、Decision 和方法协议，供内联 owner 判断搬运边界；不执行替换。
 
 use super::*;
 use crate::hir::decision::analyze_decision;
@@ -621,6 +614,7 @@ fn find_site_in_expr(expr: &HirExpr, temp: TempId, site: InlineSite) -> Option<I
         HirExpr::Decision(decision) => find_site_in_decision(decision, temp, site),
         HirExpr::Call(call) => find_site_in_call(call, temp, site),
         HirExpr::TableConstructor(table) => {
+            // 分配发生在首字段之前，即使字段必达也不能把外部求值跨过分配。
             let child_site = site.nested();
             table
                 .fields
@@ -675,6 +669,7 @@ fn find_site_in_decision(
     outer_site: InlineSite,
 ) -> Option<InlineSite> {
     analyze_decision(decision);
+    // 只有入口 test 必达，其余节点与终端值均受条件控制，不能继承无条件使用站点。
     let entry_index = decision.entry.index();
     let entry = &decision.nodes[entry_index];
     let entry_site = match outer_site {

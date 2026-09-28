@@ -1,4 +1,4 @@
-//! 按冻结的 VM loop protocol 降低 while/repeat/for；依赖循环分区和边计划，不负责重新识别循环；例如处理 repeat 尾条件与 normal-tail。
+//! 按冻结的 VM loop protocol 降低 while/repeat/for；依赖循环分区和边计划，不负责重新识别循环。
 
 use super::*;
 

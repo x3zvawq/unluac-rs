@@ -1,12 +1,6 @@
-//! eliminate-decisions pass 的物化状态。
+//! 管理 Decision 线性化所需的 synthetic local 分配状态。
 //!
-//! 这个模块只保存最终线性化 `Decision` 时需要追加到 proto 的 synthetic local 分配状态。
-//! 它不决定哪些表达式需要物化，也不生成语句；这些由 `eliminate.rs` 的遍历入口和
-//! `eliminate_materialize.rs` 的物化通道负责。
-//!
-//! 例子：
-//! - 输入形状：`x = Decision(...)`
-//! - 输出形状：递增 proto 的 Local 编号域，返回新身份暂存短路值；元数据由入口补齐。
+//! 向物化通道提供新身份；候选选择和语句构造由调用方负责。
 
 use crate::hir::common::LocalId;
 

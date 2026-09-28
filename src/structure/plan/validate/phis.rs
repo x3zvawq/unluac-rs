@@ -1,9 +1,6 @@
-//! 补充最终发布时的 phi 诊断、控制目标与输入证书合同。
+//! 补充最终发布时的 phi 诊断、控制目标与输入证书校验。
 //!
-//! 本入口位于 validate_phi_ownership 成功之后；其已校验的 phi 身份、incoming、
-//! 反向索引与 canonical edge copies 在后续 loop protocol/emission 冻结中不再修改。
-//! 这里只补最终要求，不再次重建那些索引。例如 unresolved 的唯一诊断必须仍指向
-//! 同一 phi 位置，实际 incoming edge 必须进入该 phi 的 block。
+//! 消费已经通过 ownership 验证的 phi 事实，不重建其稳定索引。
 
 use super::*;
 

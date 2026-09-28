@@ -1,4 +1,4 @@
-//! 将 Luau opcode dispatch 降低为共享 LowInstr；依赖 ProtoLowerer 的协议辅助，不负责 chunk 递归和最终映射校验；例如处理多字 AUX、跳转、for 与 closure capture。
+//! 将 Luau opcode dispatch 降低为共享 LowInstr；依赖 ProtoLowerer 的协议辅助，不负责 chunk 递归和最终映射校验。
 
 use super::*;
 

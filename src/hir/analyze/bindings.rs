@@ -1,9 +1,6 @@
 //! 将 Dataflow 定义与 Structure 证据映射为 HIR 稳定绑定。
 //!
-//! 消费前层发布的 loop binding、debug scope、capture 与词法槽事实，分配 LocalId
-//! 或复用参数身份；不回扫 CFG/low-IR 猜循环形状。
-//! 例如 NumericForLike + LoopSourceBindings::Numeric(rX) 直接为用户循环变量
-//! 建立 local，hidden control 不成为可写源码变量。
+//! 消费 loop、debug scope、capture 与词法槽事实，分配 LocalId 或复用参数身份。
 
 use std::collections::{BTreeMap, BTreeSet};
 

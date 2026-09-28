@@ -1,13 +1,7 @@
-//! AST build 所需的当前 HIR 语法事实查询。
+//! 收集最终 HIR 快照中 AST 构造所需的语法事实。
 //!
-//! 遍历子节点和多返回 tail 的责任归 HIR visitor；这里仅收集剩余 temp 的首次出现顺序、
-//! `<close>` 声明配对、实际闭包依赖和命名变参的真实引用，避免重新解释 HIR 树结构。
-//! 例如 `t = call(); use(t)` 只给 t 分配一次 hoist 声明；相邻 exact assignment/TBC
-//! 已能直接语法化为 `<close>` 声明时，整组 sibling temp 都不应再被提前声明。
-//! ProtoBodies 在首次访问可达 proto 时请求同一最终 HIR 快照的全部构造事实；遍历完成
-//! 才按完整排除集合发布 hoist 列表，避免早遇见的引用遗漏后续 TBC 配对。查询不发出
-//! lowering 错误，缺失命名变参身份和 child body 错误仍在原 closure occurrence 处理。
-//! continue 查询只回答当前 loop 的语法化需求，嵌套 loop 使用自己的 label owner。
+//! 消费共享 HIR visitor 与显式绑定、资源及闭包身份，发布 temp 声明、TBC 配对、
+//! 闭包依赖和命名变参引用；具体语法错误由原 lowering 位置报告。
 
 use std::collections::BTreeSet;
 

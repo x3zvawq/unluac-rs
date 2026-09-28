@@ -1,16 +1,6 @@
-//! 这个文件实现 CFG 之上的第一层图事实分析。
+//! 从 CFG 构建共享 GraphFacts。
 //!
-//! 它只消费 CFG 的 block、edge 与可达性，使用正反向共享的非递归 DFS 和
-//! Lengauer-Tarjan 算法建立支配树/后支配树，再推导 dominance frontier、backedge
-//! 与按 header 合并的 natural loop；结构化 if/loop 的源码级判断仍然留给后续
-//! StructureFacts。同一 header 的所有回边共用一次多源反向 worklist，不会按回边重复
-//! 扫描前驱图。
-//!
-//! 例子：菱形 `entry -> then/else -> merge` 会产出 `idom(merge) = entry`，反向分析
-//! 同一张图则产出两臂的共同后支配点 `merge`。这里不会因为该形状“像 if”就创建
-//! branch 候选，也不会把不可达 block 接入任一支配树。
-//! SCC 的第二轮反图遍历按拓扑序签发身份，成员、成环与 condensation 前驱一并冻结，
-//! 后层无需根据 CFG 重建这些事实。
+//! 发布支配、后支配、SCC、回边和自然循环关系，源码结构候选由后续分析持有。
 
 use std::collections::{BTreeSet, VecDeque};
 

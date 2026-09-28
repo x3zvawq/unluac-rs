@@ -1,9 +1,6 @@
 //! 源码帧事务共用的快照坐标与词法遍历。
 //!
-//! 普通语句使用先序入口点；repeat 另在 body 之后保留一个 condition 点，条件仍属于
-//! body 的词法 owner。读取、预览修改与删除必须消费同一坐标，不能混用普通 HIR visitor
-//! 的语句编号。例如 `repeat local f=g until f()` 先访问 local，再访问 until 的调用帧；
-//! 本模块只定义位置，不证明路径、槽位或生命期，也不让帧跨分支/循环边界树化。
+//! 统一语句及 repeat 条件位置，供读取、预览和提交消费同一坐标；不证明槽位或生命周期。
 
 use crate::hir::common::{HirBlock, HirStmt};
 use crate::hir::simplify::walk::for_each_nested_block_mut;

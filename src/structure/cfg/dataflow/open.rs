@@ -1,13 +1,7 @@
-//! 多返回值尾包的 transient SSA 分析。
+//! 分析多返回值尾包的来源、固定前缀与活跃性。
 //!
-//! open result pack 的实际宽度由后续消费点和所有可达来源共同决定，不能塞进固定寄存器
-//! SSA。这里消费 CFG、支配事实和 instruction open-use/must-def，内部建立独立 pack phi，
-//! 最终投影函数入口尾包、真实 `OpenDefId` 来源、分层 fixed-prefix uses 与 open
-//! liveness；它不把 pack phi 暴露给 Structure/HIR，也不参与源码结构选择。
-//!
-//! 输入形状：两条路径分别产生 `call()` 的 open results，merge 后从 r3 起消费 open pack。
-//! 输出形状：消费点保留两条 `OpenDefId` 与可能的 `Entry`；所有来源共同具有的 fixed
-//! prefix 才进入 SSA use，路径条件下可能读取的更宽 prefix 只进入 liveness。
+//! 消费 CFG、支配和 open-use/must-def，向 Dataflow 发布真实 OpenDefId 与入口尾包事实；
+//! 内部 pack phi 不进入 Structure/HIR。
 
 use super::*;
 use crate::structure::{EdgeRef, OpenDef, OpenDefId, OpenUseSources};

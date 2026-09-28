@@ -1,8 +1,6 @@
-//! 这个子模块负责把单一来源的 `DefId` 解释成可直接复用的 HIR 值表达式。
+//! 将唯一来源的 DefId 降低为可复用的 HIR 值。
 //!
-//! 它依赖 Dataflow 已确认的 def/block/instr 身份，只在“一个 def 稳定对应一个值”时返回
-//! 结果，不会越权为多来源 merge 伪造表达式。
-//! 例如：单一 `NewTable` 定义会在这里直接变成空表构造器表达式。
+//! 消费 Dataflow 的定义身份，不为多来源 merge 推测表达式。
 
 use super::*;
 use crate::transformer::GetTableKind;

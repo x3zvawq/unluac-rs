@@ -1,9 +1,6 @@
-//! Region arena 的构建与物化。输入规范化 container/loop partitions，输出 containment tree、direct block owner 与导航索引；不负责冻结 edge transfer。例如 structured child 会先物化，再嵌入最小 residual island。
-//! branch 的整体单入口与各 arm 的词法入口分别证明；`if c then A else ... goto A end`
-//! 中 A 不能因自支配而成为 then 子作用域，必须由 residual 控制保留共享入口。
-//! `::retry:: for value in iter do ... goto retry end` 会形成等域的外层 retry natural loop
-//! 与内层 VM-for；只有 residual、preheader、continuation 和外层 body 分区共同证明这层
-//! 语义嵌套时，才允许两个 loop container 共享物理 block 集。
+//! 从规范化 container 与 loop partitions 构建 Region arena。
+//!
+//! 发布 containment tree、直接 block owner 与导航，edge transfer 由后续阶段冻结。
 
 use super::*;
 pub(super) fn build_regions(

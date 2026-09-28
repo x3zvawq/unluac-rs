@@ -1,9 +1,6 @@
-//! FASTCALL 固定前缀及 VARARG 尾在完整帧树中的统一准备协议。
+//! 恢复完整帧树中的 FASTCALL 参数与开放尾准备协议。
 //!
-//! Promotion 提供 builtin、direct/COPY 掩码和原调用槽；共享 builder 按原顺序消费
-//! 参数、fallback lookup 与 dispatch，外层 native owner 再验证声明前缀和生命周期。
-//! 例如 `table.insert(t, tonumber("1"))` 的内层开放结果仍是 FASTCALL，不能交给
-//! 普通 CALL 的 callee-first 入口；独立调用与嵌套调用共用同一证明，不重建第二份事实。
+//! 消费 Promotion 的 builtin 和原槽事实，由共享 FrameBuilder 提供统一帧证明。
 
 use super::*;
 use crate::hir::common::TempId;

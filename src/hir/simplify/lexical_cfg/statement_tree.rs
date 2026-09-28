@@ -1,16 +1,6 @@
-//! 当前 HIR 快照的独占词法语句树，用于递归改写前一次投影并传递原始子域。
+//! 为当前 HIR 快照发布共享词法语句树与控制 owner 查询。
 //!
-//! 子块顺序复用 HIR 的 `for_each_nested_block`，不进入表达式或 child proto。
-//! 每条语句只保存连续先序区间和直属子块 ID，每个 block 只保存直属语句 ID；
-//! 回调在语句入口借用原 HIR 收集事件，发布的树不保留 HIR 引用、路径副本或后代集合。
-//! ID 只标识这次快照；改写方通过原语句位置和子块位置传递未改写子域，不能拿它查询新树。
-//!
-//! break/continue 的归属是最近的词法 loop owner，不是 VM 边或运行可达性证明。
-//! 例如 `while flag do if stop then break end end` 的完整 while 子树包含该转移的 owner，
-//! 而其中 if 子树不包含。break 的实际 successor 在 while 外，不能据此把完整循环
-//! 误判为外跳。构建时向上传递最小 owner 排名，并保存各语句的外跳结论和每个 block 的
-//! 直属外跳前缀计数；任意连续语句区间直接查询其 owner，不重建循环嵌套关系。
-//! label/goto 及其它边界仍由各消费者判定，不把整图的 label 校验错误域带入这里。
+//! 消费语句子块结构，不进入表达式或 child proto；语句身份只对对应的未改写子域有效。
 
 use std::ops::Range;
 

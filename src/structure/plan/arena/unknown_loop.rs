@@ -1,4 +1,4 @@
-//! effectful unknown-loop 条件的结构归一化。输入 loop partition 与 branch evidence，输出可冻结的 guard/body 边界；不负责后层 HIR 兜底。例如带副作用的 header guard 会改写为 loop body 内的一臂 branch。
+//! effectful unknown-loop 条件的结构归一化。输入 loop partition 与 branch evidence，输出可冻结的 guard/body 边界；不负责后层 HIR 兜底。
 
 use super::*;
 

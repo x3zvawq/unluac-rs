@@ -1,4 +1,4 @@
-//! 传播并合并 region value owner、安装 unresolved requirement 并验证 phi arena；依赖区域树和 use 图，不负责生成 HIR；例如选择最具体的结构化 owner。
+//! 传播并合并 region value owner、安装 unresolved requirement 并验证 phi arena；依赖区域树和 use 图，不负责生成 HIR。
 
 use super::*;
 

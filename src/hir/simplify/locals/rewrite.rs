@@ -1,12 +1,6 @@
-//! 这个文件负责 `locals` pass 内部的 temp -> local 引用改写。
+//! 按 locals 已确定的 TempId 到 LocalId 映射重写 HIR 引用。
 //!
-//! `locals` 的主文件决定哪些 temp 可以提升、何时复用已经被 closure 捕获的 local；
-//! 本文件只消费已经确定的 `TempId -> LocalId` 映射，把表达式、左值、table 构造器和
-//! closure capture 里的引用改成对应 local。它不会重新判断某个 temp 是否应该提升，
-//! 也不会跨语句寻找新的绑定关系。
-//!
-//! 输入形状：`t2 = t1 + 1`，且主 pass 已确认 `t1 -> l0`。
-//! 输出形状：`t2 = l0 + 1`。
+//! 覆盖表达式、左值、构造器与 capture；绑定提升和复用策略由主 pass 决定。
 
 use std::collections::BTreeMap;
 

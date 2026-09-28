@@ -1,9 +1,6 @@
-//! 汇总 if/else 合流和直线词法块输出的必写 temp，供 locals 建立稳定绑定。
+//! 为 locals 发布分支与词法块输出的必写 temp。
 //!
-//! 消费 HirFlowGraph、当前 HIR 事件和 RootEventBlock，只计算 must-write 与
-//! read-before-def，不自行解析控制边，也不分配 local 或改写语句。
-//! 例如 if c then t=a else t=b end; use(t) 报告候选 t，主 pass 再在 if 前
-//! 建立空 local；候选必须保证该声明能支配全部读取。
+//! 消费共享 HIR 图和语句事件，提供 must-write 与 read-before-def，不分配或改写 binding。
 
 use std::collections::BTreeSet;
 

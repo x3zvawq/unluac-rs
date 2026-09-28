@@ -1,4 +1,4 @@
-//! 分类 postdom/reachable/terminal/loop-bounded 的 one-arm 分支；依赖 BranchIndex 与 loop 出口，不负责普通 if/else；例如识别 for 退出边界内的条件 guard。
+//! 分类 postdom/reachable/terminal/loop-bounded 的 one-arm 分支；依赖 BranchIndex 与 loop 出口，不负责普通 if/else。
 
 use super::*;
 

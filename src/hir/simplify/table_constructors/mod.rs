@@ -1,9 +1,6 @@
-//! 把连续的建表、字段写和 SETLIST 片段恢复为 HIR TableConstructor。
+//! 将连续建表与字段写入恢复为 HIR TableConstructor。
 //!
-//! scanner 提供带类型的构造步骤，binding/root 分析验证使用与保留要求，rebuild/commit
-//! 消费同一计划完成改写；不会根据最终字段外形重新猜分配方式或原暂存槽。
-//! 例如 t={}; t.x=1; t.y=2 在表未逃逸、依赖及身份证明成立时可收成 t={x=1,y=2}。
-//! record key 保持 HIR 表达式，命名字段语法由后层决定。
+//! 消费 scanner、binding/root 分析和原分配事实，通过同一计划重建并提交构造器。
 
 mod bindings;
 mod builder;

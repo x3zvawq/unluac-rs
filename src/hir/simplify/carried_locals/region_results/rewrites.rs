@@ -1,4 +1,4 @@
-//! 收集 break assignment、推导 carried binding 重写并校验 home slot/capture；依赖 slot ownership，不负责并行赋值拆分；例如拒绝跨捕获槽的别名重写。
+//! 收集 break assignment、推导 carried binding 重写并校验 home slot/capture；依赖 slot ownership，不负责并行赋值拆分。
 
 use super::*;
 

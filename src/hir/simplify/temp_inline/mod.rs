@@ -1,10 +1,6 @@
-//! 将 HIR 中单次消费的临时值收回表达式，并编排调用准备区的整体内联。
+//! 将单次消费的 HIR 临时值收回表达式，并组织完整调用准备区内联。
 //!
-//! 消费 use-count、promotion、capture、root-lifetime 与求值区域事实，证明 producer
-//! 移入使用点后仍保持原求值顺序、值宽度和身份。具体站点由 site/use_sites 判定，
-//! 逻辑表达式归一交给 logical-simplify，无读临时值的删除交给 dead-temps。
-//! 例如 callee=f; arg=g(); callee(arg) 必须整体恢复为 f(g())，
-//! 不能单独延后 callee 的读取。
+//! 消费使用、来源、capture、根及求值语境事实，保留原值宽度和身份。
 
 mod site;
 mod usage;

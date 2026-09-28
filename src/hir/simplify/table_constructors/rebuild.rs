@@ -1,9 +1,6 @@
-//! 这个子模块负责把扫描得到的 region steps 重建回表构造器。
+//! 将已扫描的构造区域重建为表构造器。
 //!
-//! 它依赖 `scan` 产出的带 producer 投影与字段/batch 引用的 step 和安全内联结果，按顺序 flush
-//! 片段，不会回头重新判定哪个 stmt 属于候选 region。
-//! 例如：一串 `record/setlist/producer` step 会在这里重新拼成 `HirTableConstructor`；
-//! producer、record key/value 的求值事件序列不一致时，整个推测事务回滚。
+//! 消费 typed steps 与安全内联结果，保留字段及 producer 事件顺序。
 
 use std::collections::VecDeque;
 

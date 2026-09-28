@@ -1,4 +1,4 @@
-//! 降低边转移、清理、phi copy 与循环值动作；依赖最终 EdgePlan/requirements，不负责目标标签布局；例如发射 break/continue/goto 前后的动作。
+//! 降低边转移、清理、phi copy 与循环值动作；依赖最终 EdgePlan/requirements，不负责目标标签布局。
 
 use super::*;
 

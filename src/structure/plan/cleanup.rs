@@ -1,8 +1,6 @@
-//! 保存原始 cleanup 指令的唯一执行位置及物理入边事件。
+//! 保存原 cleanup 的执行位置与物理入边事件。
 //!
-//! origin 来自 Structure 的 CFG may-flow；本模块不恢复 HIR 词法作用域。
-//! 例如两条入边分别携带 A 和空集，汇合处 Close(A) 分别冻结为 Close(A) 和无事件，
-//! 原指令只保留 label 锚点，不因另一条相同 origin 的 Close 存在而丢失自己的执行。
+//! 消费 Structure 的 origin may-flow，发布清理处置；HIR 再恢复词法作用域。
 
 use super::{RegionId, ScopePlanId};
 

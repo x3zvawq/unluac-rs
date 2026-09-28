@@ -1,14 +1,7 @@
-//! 在递归入口冻结语句事件，根分析与 locals 的读取、touch、控制头查询共用原始域。
+//! 为根分析和 locals 发布共享语句事件索引。
 //!
-//! 物理 home 来自 Promotion；读写、参数交接和 callee 来自 HIR header，词法域来自
-//! HirStmtTree。先序位置只用于集合查询，不代表求值顺序；消费者把后代事件投影回
-//! 直属语句，例如 `repeat t = f(t) until p(t)` 的所有 t 读写属于同一观察时点。
-//! reads 只需成员关系，writes/参数 token 保留次数：同语句的两个写入也不能证明唯一来源。
-//! 不复制后代集合，不进入 child proto，也不跨改写复用快照。改写后的块拥有相同索引，
-//! 与未改写的共享子域使用同一套查询。
-//! 潜在观察由入口固定的 HirExprSafety 与 HirEvalEffects 发布，显式 GC fence 另按别名解析。
-//! local 事件保留原逻辑域：LocalDecl/Local lvalue/release 是写，loop binding 元数据不是写。
-//! 例如 `local x=f(); side(); use(x)` 的候选必须读取完整后缀，不能从遇见 f 的位置才建状态。
+//! 消费 Promotion、HIR header 与词法语句树，提供当前快照的读取、写入及观察查询；
+//! 位置区间不代表求值顺序，也不跨改写复用。
 
 use std::{collections::BTreeMap, ops::Range};
 
@@ -48,6 +41,7 @@ struct LocalEvents {
 
 #[derive(Default)]
 pub(super) struct TempEvents {
+    // 读取只查询成员关系；写入与参数交接保留次数，避免把同语句多次事件误证为唯一来源。
     pub(super) reads: Vec<usize>,
     pub(super) writes: Vec<usize>,
     pub(super) argument_transfers: Vec<usize>,

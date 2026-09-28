@@ -1,16 +1,7 @@
-//! 在原 source scope 结束处交接独立副本根，分开源码身份与额外保活身份。
+//! 恢复独立副本根的源码绑定、词法窗口与保活身份交接。
 //!
-//! scope 与定义来自 Structure/Bindings，窗口控制闭合来自 GraphFacts，精确退休来自
-//! Promotion。不能把命名 copy 的 nil 声明提到函数入口；也不能在声明处复制隐藏根，
-//! 否则 scope 内 debug.setlocal(copy,nil) 后仍会多保活旧值。这里在已证明的 scope 末端
-//! 才读取当前 copy：`do local copy=owner; inspect(); holder=copy end`，后层无需重建边界。
-//! 原 debug 末端可能含 goto 或不可达尾部；可发射末端消费共享 emission 投影，
-//! 再在实际窗口上校验闭合、覆盖与 cleanup，不让原始 PC 代替运行生命周期。
-//! 无 debug 的原 nil 初始化也可拥有独立副本：只认同块的直接覆盖 Def、唯一原 nil
-//! 退休点与块内读取，不把回边进入后尚未初始化的额外 holder 提前到函数入口。
-//! COPY 只向已有低槽交接后，NEWTABLE 在原槽覆盖它时，独立结束 COPY 声明；
-//! `do local snapshot=alias; target=snapshot end; source={}` 允许分配继续使用原 freereg，
-//! 不能把 snapshot 与新表接成活动 local 后让分配额外使用更高 scratch。
+//! 消费 Structure/Bindings 的 scope、Dataflow 的定义及 Promotion 的退休事实，
+//! 向 lowering 发布明确边界，区分源码身份结束与物理根退休。
 
 use super::*;
 use crate::hir::HirLowerError;
@@ -474,6 +465,8 @@ pub(in crate::hir::analyze) fn bind_copy_root_holders(
     clippy::too_many_arguments,
     reason = "身份交接借用同一 lowering 的发射与生命周期事实"
 )]
+/// holder 只在原 scope 末端接收当前 copy；提前复制会在 debug.setlocal 清空 copy 后
+/// 仍额外保活旧值，因此声明身份与保活身份必须在已证明的端点交接。
 pub(in crate::hir::analyze) fn bind_copy_root_scopes(
     proto: &LoweredProto,
     cfg: &Cfg,

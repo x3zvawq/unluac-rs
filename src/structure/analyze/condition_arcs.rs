@@ -1,4 +1,4 @@
-//! 为直接条件候选合成弧证据并执行副作用/定义逃逸检查；依赖 CFG 与 SSA，不负责候选排序；例如截断包含未吸收副作用的条件尾。
+//! 为直接条件候选合成弧证据并执行副作用/定义逃逸检查；依赖 CFG 与 SSA，不负责候选排序。
 
 use super::*;
 use crate::structure::cfg::EvaluationDependency;

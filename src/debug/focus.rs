@@ -1,8 +1,6 @@
-//! 为各 dump 层提供统一的 proto 聚焦、限深展开计划和 summary 格式。
+//! 各 dump 层共用的 proto 聚焦与限深展开计划。
 //!
-//! 各层传入自身 proto 树并提供业务字段，本模块统一前序调试身份及可见/省略节点，
-//! 不转换业务 proto id。这样各层对同一焦点和深度使用一致的展开边界。
-//! 例如选择 proto 1、深度 0 时，完整显示 1，其子树只显示 summary。
+//! 消费 proto 树和调试选项，发布可见节点及省略摘要，不转换业务 proto 身份。
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

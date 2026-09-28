@@ -1,4 +1,4 @@
-//! 内联由 branch 独占的条件 scratch 并提取 assignment values；依赖纯表达式/使用计数，不负责 break rewrite；例如把临时 local 条件折回 if cond。
+//! 内联由 branch 独占的条件 scratch 并提取 assignment values；依赖纯表达式/使用计数，不负责 break rewrite。
 
 use super::*;
 

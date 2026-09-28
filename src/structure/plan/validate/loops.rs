@@ -1,4 +1,4 @@
-//! 校验循环 payload、分区与 break/continue 边；依赖循环区域及 CFG，不负责发现循环候选；例如核对 normal-tail 与 continuation 的边界。
+//! 校验循环 payload、分区与 break/continue 边；依赖循环区域及 CFG，不负责发现循环候选。
 
 use super::*;
 

@@ -1,12 +1,6 @@
-//! 这个模块定义各层调试能力共享的公共契约。
+//! 各层调试能力共用的选项、聚焦与着色入口。
 //!
-//! 之所以把 `detail / filters` 这类类型单独提出来，是为了让 parser、
-//! transformer/structure 和主 pipeline 共享同一套调试开关，同时避免低层反向
-//! 依赖 `decompile` 模块。
-//!
-//! 着色引擎在 `colorize` 子模块中；跨层共享的「聚焦 proto + 限深展开」模型
-//! 在 `focus` 子模块中，每一层 dump 通过同一套 helper 决定哪些 proto 完整输出、
-//! 哪些以 summary 行占位。
+//! 低层与主流水线共享这些契约，无需反向依赖 decompile。
 
 #[cfg(any(feature = "decompile-debug", feature = "timing-report"))]
 mod colorize;

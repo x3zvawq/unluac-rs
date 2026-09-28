@@ -1,19 +1,17 @@
-//! PUC/Luau 表预分配事实及候选源码的容量查询。
+//! 保存 PUC/Luau 表预分配事实，并查询候选源码所需容量。
 //!
-//! Transformer 解码原 NEWTABLE 的数组/hash 容量，并保存编译器数组计数的取整规则；
-//! HIR 只比较候选字段所需容量，不读取 opcode 或猜目标版本。Lua 5.1–5.3 使用浮点
-//! 字节数组计数，5.4–5.5/Luau 使用精确计数。hash 节点数统一向上取二次幂。
-//! 例如空表逐项写满三个槽会扩到四槽，不能换成预分配三槽的 `{a,b,c}`；调用方随后
-//! 清空两端时，两种布局可以产生不同的 #table。批次写入协议仍由 SETLIST 的 owner 证明。
-//! Luau 的候选容量还区分命名字段、显式数字键与开放尾部；两层只投影语法，
-//! 不重新推测原始分配。例如四个 bracket 字段再写第五键，不能融合成八节点的新模板。
+//! Transformer 提供原容量与计数规则，后层投影字段进行比较；批次写入协议由 SETLIST owner 证明。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArraySizing {
+    /// Lua 5.1–5.3 的浮点字节计数，容量可能因编码取整而扩大。
     FloatingByte,
+    /// Lua 5.4–5.5 与 Luau 的精确数组计数。
     Exact,
 }
 
+/// 原预分配容量影响后续扩容及 #table，不能仅按最终字段值等价替换。
+/// 例如逐项写入三个槽可能扩到四槽，与直接预分配三个槽的构造器不同。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TablePreallocation {
     pub array_capacity: u32,

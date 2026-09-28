@@ -1,14 +1,6 @@
-//! 查询冻结 Structure plan 中仍由 HIR 单独发射的指令域与词法 owner。
+//! 将冻结的 StructurePlan 投影为 HIR 独立发射域与词法 owner 查询。
 //!
-//! region 父子关系、条件和值判定的 header、循环协议均由 Structure 发布；这里仅投影
-//! HIR lowering 的消费边界，不重新分析 CFG，也不把已吸收的表达式节点当作独立语句。
-//! 例如 `a and b()` 的后续条件块进入 decision expression，只有 header 前缀逐指令
-//! 发射；需要在精确 low 位置恢复作用域或 root 退休时，必须先排除这些非 header 位置。
-//! 本查询不包含 HIR global declaration 等后续批量发射协议，它们仍需保护内部边界。
-//! 源码 scope 的原始结束 PC 与可发射交接点分别保留：CFG 排除不可达尾部，冻结的
-//! 无求值 Jump 允许在普通前缀末端交接；有求值的终结器不能据此提前结束来源身份。
-//! 每个 proto 的 lowering 在绑定分配前建立一次投影，词法窗口、copy-root 退休和
-//! 来源身份交接共同借用；这些消费者不改变 plan，最后一次查询后释放索引。
+//! 供当前 proto 的 lowering 共享原 scope 与实际发射边界；索引仅在该 plan 不变时有效。
 
 use std::collections::BTreeSet;
 use std::ops::Range;

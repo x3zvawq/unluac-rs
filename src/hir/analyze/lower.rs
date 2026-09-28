@@ -1,11 +1,7 @@
-//! 这个文件承载 HIR 初始恢复里真正的 lowering 内核。
+//! HIR 初始恢复的 proto 构造与共享 lowering 上下文。
 //!
-//! 外层 [analyze.rs](/Users/x3zvawq/workspace/unluac-rs/src/hir/analyze/mod.rs) 只负责组织模块和
-//! 暴露主入口，这里集中放 proto 递归构造和共享 lowering 上下文。final edge 的 phi
-//! copy 由 plan 执行器消费；单条 low-IR 指令到 HIR 语句的映射由 `instrs.rs` 负责，
-//! captured Luau shared closure 的词法 factory 由 `shared_closures.rs` 先冻结，再由这里
-//! 预留并填充 synthetic proto；Structure 已证明的控制流需求/unresolved requirement 也在这里
-//! 蒸馏为不含 CFG/SSA/VM 类型的 HIR 退出事实，目标语法是否合法仍由 AST 判断。
+//! 消费冻结的 StructurePlan、绑定和闭包事实，构造 HIR artifact 与退出要求；
+//! 指令和结构发射由对应子模块执行。
 
 use std::collections::{BTreeMap, BTreeSet};
 

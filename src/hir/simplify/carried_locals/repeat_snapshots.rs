@@ -1,9 +1,6 @@
-//! 收回 repeat 尾部只为承接最终状态而生成的临时快照。
+//! 收回 repeat 尾部承接最终状态的机械快照。
 //!
-//! 只处理一条可证明的局部形状：body 末尾先计算 `temp = repeatable(local)`，紧接着
-//! `local = temp`，循环后的唯一消费者是 `return temp`。中间没有 break/continue/goto，
-//! 因而把第一条赋值直接改成 `local = repeatable(local)` 不会改变任何可观察求值点；
-//! 捕获、`<close>` 和 debug temp 也会阻断该规则。
+//! 消费当前循环、绑定与使用事实，保留求值点和循环外可观察状态。
 
 use std::collections::{BTreeMap, BTreeSet};
 

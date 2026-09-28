@@ -1,10 +1,6 @@
-//! 为 HIR call、allocation、lookup 和 copy 建立物理根生命周期与覆盖配对。
+//! 为调用、分配、lookup 和 copy 建立物理根生命周期与覆盖配对。
 //!
-//! 逻辑上没有读取的值仍可能在原 stack home 中充当 GC root。本模块消费 Promotion
-//! 冻结的 producer、home 和端点，并结合当前 HIR 事件证明配对；不从相邻语句猜 VM 协议。
-//! 例如 object=make(); f(object) 的参数副本可交给 callee，object 的独立低槽根
-//! 仍须活到自己的覆盖点。消费者只能在保持完整覆盖事务时消除物化。
-//! RootLifetimeFacts 属于当前语句快照，借用期间不得改写对应树。
+//! 消费 Promotion 的原来源及当前 HIR 事件，供完整改写事务查询；事实仅对当前快照有效。
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,4 +1,4 @@
-//! 迭代遍历区域树并调度子区域 lowering；依赖共享 lowerer 索引，不负责具体分支/循环语法；例如用任务栈降低深层 Sequence。
+//! 迭代遍历区域树并调度子区域 lowering；依赖共享 lowerer 索引，不负责具体分支/循环语法。
 
 use super::*;
 use crate::hir::promotion::ImplicitRootScopeFence;

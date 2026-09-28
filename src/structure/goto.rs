@@ -1,16 +1,7 @@
-//! 这个文件实现必须保留跳转的结构约束。
+//! 冻结结构候选尚不能吸收的跳转证据。
 //!
-//! 它依赖 loop/branch/irreducible region 已经给出的结构候选，负责把这些候选明确
-//! 吞不掉的边提前冻结为残余 transfer evidence，避免 HIR/AST 再去临时猜
-//! “这里是不是还要保留 label/goto”。
-//! 它不会越权决定最终 `goto/label` 语法，只表达“哪些跳转现在还不能被结构化吸收”。
-//!
-//! 例子：
-//! - `break` 或 `continue` 形状如果提前跳出了当前 loop body，会被记成
-//!   `UnstructuredBreakLike / UnstructuredContinueLike`
-//! - same-header 内层 loop 的结构化出口自然汇入外层条件时，不会误记成 continue
-//! - 多层嵌套 loop 共用一份 `block -> candidate owner` 索引，入口边与 backedge owner
-//!   不会为每个候选重新展开完整 membership 集合
+//! 消费 loop、branch 和不可规约区域关系，向最终计划提供 residual transfer 约束；
+//! 具体 goto/label 语法由后层表达。
 
 use std::collections::BTreeSet;
 

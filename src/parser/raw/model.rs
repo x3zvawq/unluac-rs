@@ -1,12 +1,6 @@
-//! 这个文件定义 parser raw 层的跨 dialect 通用模型。
+//! Parser raw 层跨方言共用的 chunk、proto、指令来源与字面量模型。
 //!
-//! 这些结构表达后续阶段都会消费的稳定事实，例如 chunk/proto/instruction/source
-//! origin 和保留位模式的宿主字面量；具体 opcode、operand 和 dialect extra 只通过 wrapper 字段挂接进来，
-//! 避免公共模型被某个版本的协议细节撑大。
-//! `RawString` 的原始字节和解码文本都是不可变共享 payload，raw tree 和后续层的
-//! Clone 只复制所有权，不复制字符串内容；公共字面量池也在解析后冻结为共享切片。
-//! Luau 的平铺 proto 还通过 `Arc` 保留共享
-//! 子图，避免把同一个 lexical proto 展开成指数级树。
+//! 保存原始编码事实及共享 payload，具体 opcode 和方言扩展由各自 wrapper 承载。
 
 use std::{collections::HashMap, sync::Arc};
 

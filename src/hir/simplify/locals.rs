@@ -1,9 +1,6 @@
-//! 把跨语句存活的 temp 链提升为源码 local，并收敛函数入口的参数别名。
+//! 将跨语句存活的 temp 链提升为源码 local，并收敛入口参数别名。
 //!
-//! 消费 promotion 的 home、close epoch、capture/debug 身份及物理根事实，
-//! 为同一存活链建立稳定绑定；只在后续单个站点消费的中转值仍留给内联或构造器 owner。
-//! 例如同一槽和 close epoch 的多个 SSA 版本可写回同一 local；close 后复用该槽
-//! 属于新的词法身份，不能继续写入旧闭包 cell。
+//! 消费 Promotion 的 home、epoch、capture/debug 与根事实，建立稳定绑定。
 
 mod branch_merge;
 mod entry_nil;

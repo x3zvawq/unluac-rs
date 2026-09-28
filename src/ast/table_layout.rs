@@ -1,9 +1,6 @@
-//! 将当前 AST 字段语法投影到共享模板初始化规则。
+//! 将当前 AST 字段投影到共享表初始化约束。
 //!
-//! 分配方式由 HIR 传入；这里只证明 AST 候选会否引入模板常量。例如把字段里的
-//! `left + 3` 改成 `2 + 3` 会触发编译器常量折叠，必须与 producer 删除一起拒绝。
-//! 已有模板的容量来自 HIR；这里只提供字段位置，不从当前常量反推原分配。
-//! 原 hash 键身份同样来自 HIR；命名字段只投影其字节身份，不重建模板键集合。
+//! 消费 HIR 的分配容量与原键身份，供 AST 改写检查候选布局。
 
 use super::common::{
     AstBinaryOpKind, AstExpr, AstTableConstructor, AstTableField, AstTableKey, AstUnaryOpKind,

@@ -1,10 +1,6 @@
-//! 这个子模块负责 Generate 层共享的语法细节格式化。
+//! Generate 共用的括号、字面量和标签格式化。
 //!
-//! 它依赖 AST 运算符、目标方言和引号策略，只回答括号、字面量和标签这些稳定语法细节，
-//! 不会在这里改变表达式语义。
-//! 例如：当子表达式优先级不足时，这里会决定是否补上一层括号。
-//! 字符串源码只消费 LuaString 的原始字节：GBK 的 D6 D0 不能借展示视图变成 UTF-8 的 E4 B8 AD，
-//! 应发射为字节转义；原字节本身为 UTF-8 时才可直接输出文本或长括号字面量。
+//! 消费 AST 运算符、目标方言及文本选项，字符串始终以 LuaString 原始字节为准。
 
 use crate::LuaString;
 use crate::ast::{AstBinaryOpKind, AstGlobalAttr, AstGlobalBinding, AstLabelId};

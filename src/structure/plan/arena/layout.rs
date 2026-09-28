@@ -1,4 +1,4 @@
-//! region layout edge、label 与方言 requirement 的冻结。输入 containment/navigation 与 edge plans，输出自然布局事实、label placement 和 required features；不负责 edge 语义分类。例如跨 island 的非自然边会要求显式 goto label。
+//! region layout edge、label 与方言 requirement 的冻结。输入 containment/navigation 与 edge plans，输出自然布局事实、label placement 和 required features；不负责 edge 语义分类。
 
 use super::*;
 

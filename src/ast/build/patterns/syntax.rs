@@ -1,9 +1,6 @@
-//! 将 HIR 已证明的相邻 TBC 声明配对落成目标方言的 `<close>` 语法。
+//! 将 HIR 已证明的 TBC 声明配对降低为目标方言的 close 声明。
 //!
-//! 绑定身份与 exact value-pack 配对消费 `HirToBeClosed::declaration`；这里负责方言能力、
-//! 值包 lowering 和语法属性，不重建 SSA、寄存器或资源 scope。缺失声明补全和声明合并
-//! 仍属于 Readability，`global` 则直接消费 HIR typed 声明。
-//! 例如 `t0, t1 = exact_call(); TBC t1` 生成整组 local，只有 t1 带 `<close>`。
+//! 消费显式绑定与 value-pack 身份，不重建资源协议或作用域。
 
 use crate::hir::{HirExpr, HirLValue, HirStmt, HirTbcDeclaration};
 

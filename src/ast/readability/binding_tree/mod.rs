@@ -1,8 +1,6 @@
-//! 当前函数体内 AST binding 树遍历的共享 helper。
+//! 查询 AST binding 在当前函数体中的源码上下文。
 //!
-//! 这里只判断 binding 在调用参数、存储目标等源码上下文中的位置；通用名字访问
-//! 查询由 `binding_flow` 持有，并消费共享 visitor 的 Read/Write/Capture 角色。
-//! 例如 `t[x] = y` 的 x 是地址读取，不能当作被写入的 binding。
+//! 通用名字访问由 binding_flow 持有，这里补充调用参数、存储目标等位置关系。
 
 use crate::ast::common::{
     AstBindingRef, AstCallKind, AstExpr, AstLValue, AstStmt, AstTableField, AstTableKey,

@@ -1,10 +1,6 @@
-//! 词法 child-first 闭包效果摘要：把 child upvalue 的写入、逃逸、返回与调用投影到父级。
+//! 将 child upvalue 的写入、逃逸、返回和调用效果投影到父级。
 //!
-//! capture 直接查询当前 binding 状态；嵌套返回 closure 的效果仍逐层投影到父域。
-//! 消费显式 capture 对应和共享 HIR CFG；例如 factory 返回读取 u0 的 closure，
-//! 调用方获得对应 capture 效果，不靠函数文本或参数位置猜测。对象存活由父模块消费摘要。
-//! 并行赋值只暂存本次 RHS 与索引目标的投影，统一读取写入前状态；例如 a,b=b,a
-//! 交换来源后再提交，不复制无关 binding 或已经累积的效果。合流直接记录集合增长。
+//! 消费显式 capture 与共享 HIR 图，发布当前模块快照的闭包效果摘要。
 
 use crate::hir::HirBinding;
 

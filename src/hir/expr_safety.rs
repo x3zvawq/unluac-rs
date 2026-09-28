@@ -1,10 +1,6 @@
-//! HIR 求值事件与表达式安全性的共享判断。
+//! HIR analyze 和 simplify 共用的求值事件与表达式安全查询。
 //!
-//! HIR analyze 和 simplify 都会判断某个表达式是否能被挪动或折进别的表达式。
-//! 这个文件只放跨 pass 共用、和具体恢复策略无关的谓词，避免求值序规则散落后漂移。
-//! 原始值比较使用共享 `LuaValueSemantics`；本文件只负责 HIR 求值事件和 root relevance。
-//! 方言固定的表达式槽能力同样在入口发布：例如 PUC 5.1 CONCAT 保留最右 operand，
-//! 不代表中间 operand 或后续表达式仍拥有同一 root。
+//! 消费目标方言与当前表达式；原始值比较由 LuaValueSemantics 统一解释。
 
 use super::common::{
     HirBinaryOpKind, HirCallExpr, HirCaptureMode, HirExpr, HirLValue, HirStmt, HirUnaryOpKind,

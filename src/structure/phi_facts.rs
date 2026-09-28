@@ -1,9 +1,6 @@
-//! 为 StructureFacts 统一翻译 Dataflow phi 的 incoming 与值身份。
+//! 为 Structure 统一投影 Dataflow phi 的 incoming 与值身份。
 //!
-//! branch、loop、short-circuit 共用 Dataflow 的 canonical SSA 与 def 元数据，
-//! 不各自重建 merge 语义；最终 HIR 表达式及语法选择不属于本模块。
-//! 例如 branch merge 按 then/else 分组 incoming，loop merge 按循环成员关系分组，
-//! 后续 plan 再确定各输入承担的 carried、copy 或 region-result 职责。
+//! 供 branch、loop 和短路候选共享，最终处置由 plan 持有。
 
 use std::collections::{BTreeSet, VecDeque};
 

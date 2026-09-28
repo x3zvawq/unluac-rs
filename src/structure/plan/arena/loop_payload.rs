@@ -1,4 +1,6 @@
-//! loop payload 与 VM control edge 的最终冻结。输入 loop partition、edge plans、TBC flow 和 loop evidence，证明资源退出边界并输出 LoopPlanData、传播 break 与 syntax edge roles；不负责发现循环候选。例如 numeric-for 的 body/exit/backedge 会被一次写入控制合同；正常出口还需跨分叉保持本轮资源时，则不能签发 break owner。
+//! 冻结 loop payload 与 VM control edge 合同。
+//!
+//! 消费分区、edge plan、TBC flow 和循环证据，发布资源退出、传播 break 与语法边角色。
 
 use super::*;
 

@@ -1,12 +1,6 @@
-//! 按 call 值身份共享别名、活读和观察代表，物理 home 仍各自持有释放事务。
+//! 按调用结果的值身份共享别名、活读与观察代表。
 //!
-//! 身份和 home 来自父层的 copy/overwrite 证明，活读变化消费共享语句事件，不重建 VM 协议。
-//! 例如 `a = f(); b = a; c = b` 只保存一次三个别名；覆盖 a 只结束 a 的事务，
-//! b、c 仍可选出另一个根。观察优先选择已观察的最低 home，否则选择最低可用 home。
-//! 潜在事件排除仅由显式 GC 证明的 copy home；显式 fence 另记是否已物化当前代表。
-//! 不符合根保护资格的 home 仍传播确值身份，但不参与观察代表选择或签发释放事务。
-//! 参数交接后撤销该 home 的值别名与观察代表，只保留原 owner 的固定覆写责任；
-//! 后续同值 COPY 是新的写入 epoch，不能据旧记录推断 callee 尚未改变此槽。
+//! 消费父层的 copy/overwrite 证明及共享语句事件，各物理 home 仍独立持有释放事务。
 
 use super::live_read_changes::LiveReadChanges;
 use super::{ActiveCallRoot, BTreeMap, BTreeSet, CallValueId, HomeSlotKey, TempId, TempUseEvents};
