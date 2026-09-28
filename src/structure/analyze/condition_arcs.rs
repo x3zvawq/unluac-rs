@@ -294,57 +294,22 @@ pub(super) fn block_has_unabsorbed_effects(
     let Some(predicate) = range.last() else {
         return true;
     };
-    workspace
-        .pending
-        .extend(dataflow.evaluation_inputs(predicate));
-    while let Some(value) = workspace.pending.pop() {
-        match value {
-            EvaluationDependency::Value(super::super::SsaValue::Entry(_)) => {}
-            EvaluationDependency::Value(super::super::SsaValue::Def(def)) => {
-                let Some(stamp) = workspace.def_epochs.get_mut(def.index()) else {
-                    return true;
-                };
-                if *stamp == workspace.epoch {
-                    continue;
-                }
-                *stamp = workspace.epoch;
-                let Some(definition) = dataflow.defs.get(def.index()) else {
-                    return true;
-                };
-                workspace
-                    .pending
-                    .push(EvaluationDependency::Instruction(definition.instr));
-            }
-            EvaluationDependency::Instruction(instr) => {
-                let Some(needed) = workspace.needed_instr_epochs.get_mut(instr.index()) else {
-                    return true;
-                };
-                if *needed == workspace.epoch {
-                    continue;
-                }
-                *needed = workspace.epoch;
-                workspace.pending.extend(dataflow.evaluation_inputs(instr));
-            }
-            EvaluationDependency::Value(super::super::SsaValue::Phi(phi)) => {
-                let Some(stamp) = workspace.phi_epochs.get_mut(phi.index()) else {
-                    return true;
-                };
-                if *stamp == workspace.epoch {
-                    continue;
-                }
-                *stamp = workspace.epoch;
-                let Some(phi) = dataflow.phi_candidate(phi) else {
-                    return true;
-                };
-                workspace.pending.extend(
-                    phi.incoming
-                        .iter()
-                        .map(|incoming| EvaluationDependency::Value(incoming.value)),
-                );
-            }
-        }
+    if !super::dependencies::mark_region_dependencies(
+        cfg,
+        dataflow,
+        |candidate| candidate == block,
+        super::dependencies::DependencyMarks {
+            instructions: &mut workspace.needed_instr_epochs,
+            defs: &mut workspace.def_epochs,
+            phis: &mut workspace.phi_epochs,
+            epoch: workspace.epoch,
+        },
+        &mut workspace.pending,
+        dataflow.evaluation_inputs(predicate),
+        |_| false,
+    ) {
+        return true;
     }
-
     (range.start.index()..predicate.index()).any(|index| {
         // 候选拒绝[SemanticBarrier:NamedRootWrite]：和值判定共享原 local 写入边界，
         // 不能在 value DAG 被拒绝后由 condition DAG 再吸收同一写入（regress_578）。

@@ -717,17 +717,18 @@ pub(super) fn mark_value_decision_common_dependencies(
     scratch: &mut ValueDecisionCandidateScratch,
     root: super::super::SsaValue,
 ) -> bool {
-    mark_value_decision_dependencies(
+    super::dependencies::mark_region_dependencies(
         cfg,
         dataflow,
-        &scratch.block_epochs,
-        scratch.group_epoch,
-        &mut scratch.common_needed_instr_epochs,
-        &mut scratch.common_dependency_def_epochs,
-        &mut scratch.common_dependency_phi_epochs,
-        scratch.group_epoch,
+        |block| scratch.block_epochs.get(block.index()).copied() == Some(scratch.group_epoch),
+        super::dependencies::DependencyMarks {
+            instructions: &mut scratch.common_needed_instr_epochs,
+            defs: &mut scratch.common_dependency_def_epochs,
+            phis: &mut scratch.common_dependency_phi_epochs,
+            epoch: scratch.group_epoch,
+        },
         &mut scratch.pending_values,
-        root,
+        [EvaluationDependency::Value(root)],
         |_| false,
     )
 }
@@ -738,17 +739,18 @@ pub(super) fn mark_value_decision_result_dependencies(
     scratch: &mut ValueDecisionCandidateScratch,
     root: super::super::SsaValue,
 ) -> bool {
-    mark_value_decision_dependencies(
+    super::dependencies::mark_region_dependencies(
         cfg,
         dataflow,
-        &scratch.block_epochs,
-        scratch.group_epoch,
-        &mut scratch.result_needed_instr_epochs,
-        &mut scratch.result_dependency_def_epochs,
-        &mut scratch.result_dependency_phi_epochs,
-        scratch.result_epoch,
+        |block| scratch.block_epochs.get(block.index()).copied() == Some(scratch.group_epoch),
+        super::dependencies::DependencyMarks {
+            instructions: &mut scratch.result_needed_instr_epochs,
+            defs: &mut scratch.result_dependency_def_epochs,
+            phis: &mut scratch.result_dependency_phi_epochs,
+            epoch: scratch.result_epoch,
+        },
         &mut scratch.pending_values,
-        root,
+        [EvaluationDependency::Value(root)],
         // common 已成功覆盖同一控制域；required 指令预先排除了 common 闭包，
         // 不必把这些指令再标入当前 result，也不能消费失败 group 的部分标记。
         |value| match value {
@@ -769,92 +771,4 @@ pub(super) fn mark_value_decision_result_dependencies(
             super::super::SsaValue::Entry(_) => false,
         },
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn mark_value_decision_dependencies(
-    cfg: &Cfg,
-    dataflow: &DataflowFacts,
-    block_epochs: &[usize],
-    block_epoch: usize,
-    needed_instr_epochs: &mut [usize],
-    dependency_def_epochs: &mut [usize],
-    dependency_phi_epochs: &mut [usize],
-    dependency_epoch: usize,
-    pending_values: &mut Vec<EvaluationDependency>,
-    root: super::super::SsaValue,
-    already_proven: impl Fn(super::super::SsaValue) -> bool,
-) -> bool {
-    pending_values.clear();
-    pending_values.push(EvaluationDependency::Value(root));
-    while let Some(dependency) = pending_values.pop() {
-        if matches!(dependency, EvaluationDependency::Value(value) if already_proven(value)) {
-            continue;
-        }
-        match dependency {
-            EvaluationDependency::Value(super::super::SsaValue::Entry(_)) => {}
-            EvaluationDependency::Value(super::super::SsaValue::Def(def)) => {
-                let Some(stamp) = dependency_def_epochs.get_mut(def.index()) else {
-                    return false;
-                };
-                if *stamp == dependency_epoch {
-                    continue;
-                }
-                *stamp = dependency_epoch;
-                let Some(definition) = dataflow.defs.get(def.index()) else {
-                    return false;
-                };
-                pending_values.push(EvaluationDependency::Instruction(definition.instr));
-            }
-            EvaluationDependency::Instruction(instr) => {
-                let Some(block) = cfg.instr_to_block.get(instr.index()) else {
-                    return false;
-                };
-                if block_epochs.get(block.index()).copied() != Some(block_epoch) {
-                    continue;
-                }
-                let Some(needed) = needed_instr_epochs.get_mut(instr.index()) else {
-                    return false;
-                };
-                if *needed == dependency_epoch {
-                    continue;
-                }
-                *needed = dependency_epoch;
-                pending_values.extend(dataflow.evaluation_inputs(instr));
-            }
-            EvaluationDependency::Value(super::super::SsaValue::Phi(phi)) => {
-                let Some(stamp) = dependency_phi_epochs.get_mut(phi.index()) else {
-                    return false;
-                };
-                if *stamp == dependency_epoch {
-                    continue;
-                }
-                *stamp = dependency_epoch;
-                let Some(phi) = dataflow.phi_candidate(phi) else {
-                    return false;
-                };
-                // 候选入口上的 phi 是显式 RegionInput。继续展开它的历史
-                // incoming 不仅越过当前控制域，也会让连续 value-decision
-                // 沿整条 SSA 链重复回溯。
-                if block_epochs.get(phi.block.index()).copied() != Some(block_epoch)
-                    || phi.incoming.iter().any(|incoming| {
-                        incoming
-                            .edge
-                            .and_then(|edge| cfg.edges.get(edge.index()))
-                            .is_none_or(|edge| {
-                                block_epochs.get(edge.from.index()).copied() != Some(block_epoch)
-                            })
-                    })
-                {
-                    continue;
-                }
-                pending_values.extend(
-                    phi.incoming
-                        .iter()
-                        .map(|incoming| EvaluationDependency::Value(incoming.value)),
-                );
-            }
-        }
-    }
-    true
 }

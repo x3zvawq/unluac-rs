@@ -2,6 +2,18 @@
 use super::*;
 pub(super) const CASES: &[LuaCaseDefinition] = &[
     LuaCaseDefinition::new(
+        "tests/case_stress/controlflow_10_sequential_ssa_history.lua",
+        &["condition", "home-slot", "phi", "scale", "sibling"],
+        "512个顺序条件读取前次合流并写回同一状态；两种起点遍历两臂，核对调用次数及顺序，不反复展开历史SSA或重建继承映射。",
+        &[
+            LuaCaseConfiguration::new(ALL_DIALECTS),
+            LuaCaseConfiguration::new(ALL_DIALECTS).with_options(LuaCaseOptions {
+                retain_debug: true,
+                ..LuaCaseOptions::DEFAULT
+            }),
+        ],
+    ),
+    LuaCaseDefinition::new(
         "tests/case_stress/controlflow_01_luau_repeat_shared_nested_loop_tail.lua",
         &["continue", "nested-loop", "repeat"],
         "在多层 for/while/repeat 压力图中保持外层 repeat 分支与嵌套 for 的共享 tail。",

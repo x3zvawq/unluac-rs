@@ -8,15 +8,14 @@
 mod branch_merge;
 mod entry_nil;
 pub(super) use entry_nil::restore_entry_frame;
+mod mapping;
 mod nil_initializers;
 mod param_alias;
 mod rewrite;
 mod root_scopes;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    rc::Rc,
-};
+use mapping::LocalMapping;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::label_refs::{count_label_references, stmt_has_label_or_goto};
 use super::lexical_cfg::LexicalCfg;
@@ -109,12 +108,12 @@ pub(super) fn promote_temps_to_locals_in_proto_with_facts(
             debug_scope_locals: &mut debug_scope_locals,
             compact_home_slots,
         };
-        let empty_mapping = Rc::new(BTreeMap::new());
+        let mut empty_mapping = LocalMapping::default();
         promote_block(
             &mut ctx,
             &mut proto.body,
             event_index.root(),
-            &empty_mapping,
+            &mut empty_mapping,
             &BTreeMap::new(),
             &|_| false,
         )
@@ -275,10 +274,7 @@ enum MoveHomeRelation {
 
 struct PromotionResult {
     changed: bool,
-    trailing_mapping: LocalMapping,
 }
-
-type LocalMapping = Rc<BTreeMap<TempId, LocalId>>;
 
 struct PromotionGroup {
     temps: BTreeSet<TempId>,
@@ -456,7 +452,7 @@ fn promote_block(
     ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
     event_block: RootEventBlock<'_>,
-    inherited: &LocalMapping,
+    mapping: &mut LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> PromotionResult {
@@ -465,7 +461,7 @@ fn promote_block(
         ctx,
         block,
         event_block,
-        inherited,
+        mapping,
         inherited_sticky_slots,
         outer_uses_temp,
         BlockProtection {
@@ -479,14 +475,14 @@ fn promote_block(
 struct BlockProtection<'a> {
     current_plan_temps: &'a BTreeSet<TempId>,
     descendant_temps: &'a BTreeSet<TempId>,
-    trailing_root_condition: Option<&'a HirExpr>,
+    trailing_root_condition: Option<&'a mut HirExpr>,
 }
 
 fn promote_block_with_protection(
     ctx: &mut PromotionCtx<'_>,
     block: &mut HirBlock,
     event_block: RootEventBlock<'_>,
-    inherited: &LocalMapping,
+    mapping: &mut LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
     protection: BlockProtection<'_>,
@@ -495,7 +491,7 @@ fn promote_block_with_protection(
         .extend(collect_call_result_local_roots(
             &block.stmts,
             event_block,
-            protection.trailing_root_condition,
+            protection.trailing_root_condition.as_deref(),
             ctx.safety,
         ));
 
@@ -505,7 +501,7 @@ fn promote_block_with_protection(
         ctx,
         block,
         event_block,
-        inherited.as_ref(),
+        mapping,
         inherited_sticky_slots,
         &block_uses_outer_temp,
     );
@@ -535,7 +531,8 @@ fn promote_block_with_protection(
         .collect::<BTreeSet<_>>();
 
     let mut changed = !plans.is_empty();
-    let mut mapping = Rc::clone(inherited);
+    let checkpoint = mapping.checkpoint();
+    let inherited_len = mapping.bindings().len();
     let mut current_slot_locals = inherited_sticky_slots.clone();
     let mut active_sticky_slots = inherited_sticky_slots.clone();
     let original_stmts = std::mem::take(&mut block.stmts);
@@ -579,16 +576,15 @@ fn promote_block_with_protection(
             } else {
                 for plan in plans {
                     if let Some(anchor_stmt) =
-                        rewrite_plan_anchor_stmt(plan, mapping.as_ref(), &stmt)
+                        rewrite_plan_anchor_stmt(plan, mapping.bindings(), &stmt)
                     {
                         rewritten.push(anchor_stmt);
                     }
                 }
             }
-            let mapping = Rc::make_mut(&mut mapping);
             for plan in plans {
                 for temp in &plan.temps {
-                    mapping.insert(*temp, plan.local);
+                    mapping.insert(*temp, plan.local, ctx);
                 }
                 if let Some(slot) = plan.home_slot
                     && matches!(plan.action, PromotionAction::AllocateLocal)
@@ -602,7 +598,7 @@ fn promote_block_with_protection(
             &stmt,
             ctx.facts,
             &current_slot_locals,
-            |temp| mapping.get(&temp).copied(),
+            |temp| mapping.bindings().get(&temp).copied(),
             ctx.temp_debug_scopes,
             ctx.local_debug_scopes,
             &mut active_sticky_slots,
@@ -628,7 +624,7 @@ fn promote_block_with_protection(
         let stmt_changed = rewrite_stmt(
             ctx,
             &mut stmt,
-            &mapping,
+            mapping,
             &active_sticky_slots,
             &child_uses_outer_temp,
             event_block.stmt(index),
@@ -672,16 +668,17 @@ fn promote_block_with_protection(
     // 互递归前向引用修补：closure capture 可能引用在当前语句之后才被提升的 temp，
     // 第一次遍历时该 temp 还不在 mapping 里。用最终映射对 closure capture 做一次
     // 定向重写，避免留下悬空的 TempRef。
-    if mapping.len() > inherited.len() {
+    if mapping.bindings().len() > inherited_len {
         for stmt in &mut block.stmts {
-            rewrite::forward_capture_refs(stmt, mapping.as_ref());
+            rewrite::forward_capture_refs(stmt, mapping.bindings());
         }
     }
 
-    PromotionResult {
-        changed,
-        trailing_mapping: mapping,
+    if let Some(condition) = protection.trailing_root_condition {
+        changed |= rewrite::expr(condition, mapping.bindings());
     }
+    mapping.rollback(checkpoint);
+    PromotionResult { changed }
 }
 
 /// 新资源的声明与 TBC activation 是同一入口事务；释放旧根必须在完整入口之后。
@@ -783,10 +780,11 @@ fn collect_plans(
     ctx: &mut PromotionCtx<'_>,
     block: &HirBlock,
     event_block: RootEventBlock<'_>,
-    inherited: &BTreeMap<TempId, LocalId>,
+    inherited_mapping: &LocalMapping,
     inherited_sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
 ) -> Vec<PromotionPlan> {
+    let inherited = inherited_mapping.bindings();
     let label_flow_boundary = block.stmts.iter().position(stmt_has_label_or_goto);
     let linear_prefix_end = label_flow_boundary.unwrap_or(block.stmts.len());
     let lifetime_stmts = &block.stmts[..linear_prefix_end];
@@ -891,36 +889,6 @@ fn collect_plans(
         }),
         safety: ctx.safety,
     };
-    // 外层匿名绑定可承接原 MOVE 的同槽覆盖；一次汇总其全部版本，避免每个候选重扫映射。
-    let mut inherited_homes = BTreeMap::<LocalId, Option<HomeSlotKey>>::new();
-    for (&temp, &local) in inherited {
-        let home = facts.trusted_temp_home_slot(temp).filter(|_| {
-            !ctx.identity_sensitive_temps.contains(&temp)
-                && !ctx.identity_sensitive_locals.contains(&local)
-                && ctx
-                    .local_debug_hints
-                    .get(local.index())
-                    .is_none_or(Option::is_none)
-                && ctx
-                    .local_debug_scopes
-                    .get(local.index())
-                    .is_none_or(Option::is_none)
-                && temp_debug_locals
-                    .get(temp.index())
-                    .is_none_or(Option::is_none)
-                && temp_debug_scopes
-                    .get(temp.index())
-                    .is_none_or(Option::is_none)
-        });
-        inherited_homes
-            .entry(local)
-            .and_modify(|known| {
-                if *known != home {
-                    *known = None;
-                }
-            })
-            .or_insert(home);
-    }
     let mut reserved_temps = BTreeSet::new();
     let mut reserved_alias_indices = BTreeSet::new();
     // 当前词法身份独立于 compaction 资格：受保护的 debug local 仍须接收后续同 scope 清零。
@@ -1756,7 +1724,7 @@ fn collect_plans(
                     // 不能仅凭同槽前驱接入外层 local 后遗失块内的释放点。
                     (!has_label_flow
                         && !force_physical_root_local
-                        && inherited_homes.get(&local) == Some(&Some(home))
+                        && inherited_mapping.reusable_home(local, ctx) == Some(home)
                         && debug_hint_for_temp_group(temp_debug_locals, &group).is_none()
                         && debug_scope_for_temp_group(temp_debug_scopes, &group).is_none()
                         && group
@@ -2931,7 +2899,7 @@ fn plan_replaces_original_stmt(plan: &PromotionPlan) -> bool {
 fn rewrite_stmt(
     ctx: &mut PromotionCtx<'_>,
     stmt: &mut HirStmt,
-    mapping: &LocalMapping,
+    mapping: &mut LocalMapping,
     sticky_slots: &BTreeMap<HomeSlotKey, LocalId>,
     outer_uses_temp: &dyn Fn(TempId) -> bool,
     event_stmt: RootEventStmt<'_>,
@@ -2939,34 +2907,34 @@ fn rewrite_stmt(
     match stmt {
         HirStmt::LocalRootRelease(_) => false,
         HirStmt::LocalDecl(local_decl) => {
-            rewrite::value_pack(&mut local_decl.values, mapping.as_ref())
+            rewrite::value_pack(&mut local_decl.values, mapping.bindings())
         }
         HirStmt::GlobalDecl(global_decl) => {
-            rewrite::value_pack(&mut global_decl.values, mapping.as_ref())
+            rewrite::value_pack(&mut global_decl.values, mapping.bindings())
         }
         HirStmt::Assign(assign) => {
             let mut targets_changed = false;
             for target in &mut assign.targets {
-                targets_changed |= rewrite::lvalue(target, mapping.as_ref());
+                targets_changed |= rewrite::lvalue(target, mapping.bindings());
             }
             // 提升只替换 Temp 的绑定身份，producer occurrence 与 iterator span 不变。
             // 后续消费仍核对两端的实际 binding、home 和完整帧，不能按槽重新猜回 token。
-            let values_changed = rewrite::value_pack(&mut assign.values, mapping.as_ref());
+            let values_changed = rewrite::value_pack(&mut assign.values, mapping.bindings());
             targets_changed || values_changed
         }
         HirStmt::TableSetList(set_list) => {
-            let base_changed = rewrite::expr(&mut set_list.base, mapping.as_ref());
-            let values_changed = rewrite::value_pack(&mut set_list.values, mapping.as_ref());
+            let base_changed = rewrite::expr(&mut set_list.base, mapping.bindings());
+            let values_changed = rewrite::value_pack(&mut set_list.values, mapping.bindings());
             base_changed || values_changed
         }
-        HirStmt::ErrNil(err_nil) => rewrite::expr(&mut err_nil.value, mapping.as_ref()),
+        HirStmt::ErrNil(err_nil) => rewrite::expr(&mut err_nil.value, mapping.bindings()),
         HirStmt::ToBeClosed(to_be_closed) => {
-            rewrite::expr(&mut to_be_closed.value, mapping.as_ref())
+            rewrite::expr(&mut to_be_closed.value, mapping.bindings())
         }
-        HirStmt::CallStmt(call_stmt) => rewrite::call_expr(&mut call_stmt.call, mapping.as_ref()),
-        HirStmt::Return(ret) => rewrite::value_pack(&mut ret.values, mapping.as_ref()),
+        HirStmt::CallStmt(call_stmt) => rewrite::call_expr(&mut call_stmt.call, mapping.bindings()),
+        HirStmt::Return(ret) => rewrite::value_pack(&mut ret.values, mapping.bindings()),
         HirStmt::If(if_stmt) => {
-            let cond_changed = rewrite::expr(&mut if_stmt.cond, mapping.as_ref());
+            let cond_changed = rewrite::expr(&mut if_stmt.cond, mapping.bindings());
             let then_changed = promote_block(
                 ctx,
                 &mut if_stmt.then_block,
@@ -2990,7 +2958,7 @@ fn rewrite_stmt(
             cond_changed || then_changed || else_changed
         }
         HirStmt::While(while_stmt) => {
-            let cond_changed = rewrite::expr(&mut while_stmt.cond, mapping.as_ref());
+            let cond_changed = rewrite::expr(&mut while_stmt.cond, mapping.bindings());
             // while 条件在每轮 body 之前重新读取；body 内的回边 alias 不能吞掉条件状态。
             let condition_temps = collect_temp_refs_in_expr(&while_stmt.cond);
             let body_changed = promote_block_with_protection(
@@ -3025,17 +2993,15 @@ fn rewrite_stmt(
                 BlockProtection {
                     current_plan_temps: &BTreeSet::new(),
                     descendant_temps: &condition_temps,
-                    trailing_root_condition: Some(&repeat_stmt.cond),
+                    trailing_root_condition: Some(&mut repeat_stmt.cond),
                 },
             );
-            let cond_changed =
-                rewrite::expr(&mut repeat_stmt.cond, body_result.trailing_mapping.as_ref());
-            body_result.changed || cond_changed
+            body_result.changed
         }
         HirStmt::NumericFor(numeric_for) => {
-            let start_changed = rewrite::expr(&mut numeric_for.start, mapping.as_ref());
-            let limit_changed = rewrite::expr(&mut numeric_for.limit, mapping.as_ref());
-            let step_changed = rewrite::expr(&mut numeric_for.step, mapping.as_ref());
+            let start_changed = rewrite::expr(&mut numeric_for.start, mapping.bindings());
+            let limit_changed = rewrite::expr(&mut numeric_for.limit, mapping.bindings());
+            let step_changed = rewrite::expr(&mut numeric_for.step, mapping.bindings());
             let body_changed = promote_block(
                 ctx,
                 &mut numeric_for.body,
@@ -3050,7 +3016,8 @@ fn rewrite_stmt(
         HirStmt::GenericFor(generic_for) => {
             // 同一已证明的 Temp -> Local 映射同步作用于 producer 与 iterator；
             // 纯身份提升不撤销 occurrence。普通表达式改写仍走 rewrite_iterator。
-            let iterator_changed = rewrite::value_pack(&mut generic_for.iterator, mapping.as_ref());
+            let iterator_changed =
+                rewrite::value_pack(&mut generic_for.iterator, mapping.bindings());
             let body_changed = promote_block(
                 ctx,
                 &mut generic_for.body,

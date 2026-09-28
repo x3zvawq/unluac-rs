@@ -33,6 +33,7 @@ use super::{
 mod condition_arcs;
 mod conditions;
 mod debug_bindings;
+mod dependencies;
 mod final_input;
 mod loop_continuation;
 mod value_decisions;
